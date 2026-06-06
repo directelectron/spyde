@@ -41,14 +41,19 @@ class _DaskClusterWorker(QObject):
         if self._stopped:
             return
         try:
+            # Start with 1 worker so the client is usable immediately (~300ms),
+            # then scale to full count in the background while the app loads.
             cluster = LocalCluster(
-                n_workers=self.n_workers,
+                n_workers=1,
                 threads_per_worker=self.threads_per_worker,
             )
             client = Client(cluster)
             n_gpus = _probe_gpus()
             gpu_worker_address = "gpu_available" if n_gpus > 0 else None
             self.finished.emit(cluster, client, gpu_worker_address)
+            # Scale up after the client signal is delivered
+            if self.n_workers > 1:
+                cluster.scale(self.n_workers)
         except Exception as e:
             self.error.emit(e)
 

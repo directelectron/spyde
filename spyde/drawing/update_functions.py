@@ -117,20 +117,35 @@ def update_from_navigation_selection(
                 #make checkerboard pattern to indicate loading
                 current_img[::2, ::2] = 0
         else:
-            # Always return the future...
+            # Cancel stale work from the previous position before requesting new data.
+            # 1. Cancel the old shm-write future so workers aren't blocked on it.
+            old_fut = getattr(child, "_pending_shm_future", None)
+            if old_fut is not None and not old_fut.done():
+                try:
+                    old_fut.cancel()
+                except Exception:
+                    pass
+
+            # 2. Cancel pending surrounding-block prefetch futures — they are
+            #    low-priority but still consume worker slots.  The new core-block
+            #    request will re-prefetch the right neighbours after it completes.
+            cached_arr = getattr(current_signal, "cached_dask_array", None)
+            if cached_arr is not None and hasattr(cached_arr, "cancel_surrounding"):
+                cached_arr.cancel_surrounding()
+
             current_img = current_signal._get_cache_dask_chunk(
                 indices, get_result=get_result, return_future=True,
             )
             if cache_in_shared_memory and _SHARED_MEMORY_SUPPORTED:
                 # Pre-create the shm segment in the GUI process before submitting,
-                # so the worker subprocess can open it by name.  The worker opens,
-                # writes, and closes its own handle; the GUI holds its handle open
-                # until close_plot() — the OS keeps the mapping alive while any
-                # handle remains open.
+                # so the worker subprocess can open it by name.
                 _ = child.shared_memory  # lazy creation
                 shared_arr_name = f"plot_buffer{id(child)}"
+                # priority=10 puts this ahead of surrounding-block prefetch tasks
+                # (which are submitted at default priority=0 by CachedDaskArray).
                 fut = child.main_window.dask_manager.client.submit(
-                    write_shared_array, current_img, shared_arr_name
+                    write_shared_array, current_img, shared_arr_name,
+                    priority=10,
                 )
                 child._pending_shm_future = fut
                 current_img = fut
