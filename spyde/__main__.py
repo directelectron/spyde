@@ -1,6 +1,7 @@
 from __future__ import annotations
 import sys
 import os
+import json
 from collections import deque
 from typing import Union
 from functools import partial
@@ -30,7 +31,7 @@ from spyde.live.particle_scanning import ParticleScanControlWidget
 from spyde.live.stage_control_widget import StageControlWidget
 from spyde.live.stem_control_widget import StemControlWidget
 from spyde.live.reference_control_widget import ReferenceControlWidget
-from spyde.misc.dialogs import DatasetSizeDialog, CreateDataDialog, MovieExportDialog
+from spyde.misc.dialogs import DatasetSizeDialog, CreateDataDialog, MovieExportDialog, WorkflowViewDialog
 from spyde.drawing.plots.plot import Plot
 from spyde.drawing.plots.plot_window import PlotWindow
 from spyde.signal_tree import BaseSignalTree
@@ -45,7 +46,7 @@ from spyde.dock_manager import DockManager
 from spyde.mdi_manager import MDIManager
 from spyde.drawing.signal_tree_presenter import build_axes_groups, build_metadata_dict
 
-SUPPORTED_EXTS = (".hspy", ".mrc", ".tif", ".tiff", ".de5")  # extend as needed
+SUPPORTED_EXTS = (".hspy", ".zspy", ".mrc", ".tif", ".tiff", ".de5")  # extend as needed
 
 
 class StartupTimer:
@@ -360,6 +361,23 @@ class MainWindow(QMainWindow):
             action = example_data.addAction(n)
             action.triggered.connect(partial(self.load_example_data, n))
 
+        save_action = QAction("Save", self)
+        save_action.setShortcut("Ctrl+S")
+        save_action.triggered.connect(self.save_current_signal)
+        file_menu.addAction(save_action)
+
+        file_menu.addSeparator()
+
+        save_workflow_action = QAction("Save Workflow...", self)
+        save_workflow_action.triggered.connect(self.save_workflow)
+        file_menu.addAction(save_workflow_action)
+
+        apply_workflow_action = QAction("Apply Workflow...", self)
+        apply_workflow_action.triggered.connect(self.apply_workflow)
+        file_menu.addAction(apply_workflow_action)
+
+        file_menu.addSeparator()
+
         export_file = QAction("Export Current Signal...", self)
         export_file.triggered.connect(self.export_current_signal)
         file_menu.addAction(export_file)
@@ -391,6 +409,187 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Error", "No active plot window to export from.")
             return
         MovieExportDialog(plot=plot, parent=self).exec()
+
+    # ── Save current signal ──────────────────────────────────────────────────
+
+    def _current_signal(self):
+        """Return the HyperSpy signal currently displayed in the active plot, or None."""
+        plot = self._active_plot()
+        if not isinstance(plot, Plot):
+            return None
+        if plot.plot_state is None:
+            return None
+        return plot.plot_state.current_signal
+
+    def save_current_signal(self):
+        """File → Save: write the currently displayed signal to .hspy or .zspy."""
+        signal = self._current_signal()
+        if signal is None:
+            QMessageBox.warning(self, "Save", "No active signal to save.")
+            return
+
+        suggested = ""
+        title = signal.metadata.get_item("General.title", default="")
+        if title:
+            suggested = title.replace(" ", "_") + ".hspy"
+
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Signal",
+            suggested,
+            "HyperSpy Files (*.hspy);;Zarr Files (*.zspy);;All Files (*)",
+        )
+        if not path:
+            return
+
+        try:
+            import dask
+            with dask.config.set(scheduler="synchronous"):
+                signal.save(path, overwrite=True)
+        except Exception as e:
+            QMessageBox.critical(self, "Save failed", str(e))
+            return
+
+        QMessageBox.information(self, "Saved", f"Signal saved to:\n{path}")
+
+    # ── Workflow save / apply ────────────────────────────────────────────────
+
+    def _workflow_steps_for_signal(self, signal) -> list[dict] | None:
+        """
+        Walk the signal tree to find the node for *signal* and collect the
+        ordered chain of transformations from root → that node.
+
+        Returns a list of step dicts, or None if the node isn't found.
+        """
+        for tree in self.signal_trees:
+            node = tree.get_node(signal)
+            if node is None:
+                continue
+            # Collect path from node back to root
+            steps = []
+            current = node
+            while current is not None and current.parent is not None:
+                step = {
+                    "transformation": current.transformation or current.name,
+                    "args": list(current.args),
+                    "kwargs": current.kwargs,
+                }
+                steps.append(step)
+                current = current.parent
+            steps.reverse()
+            return steps
+        return None
+
+    def save_workflow(self):
+        """File → Save Workflow: serialize the transformation chain to a JSON file."""
+        signal = self._current_signal()
+        if signal is None:
+            QMessageBox.warning(self, "Save Workflow", "No active signal to derive a workflow from.")
+            return
+
+        steps = self._workflow_steps_for_signal(signal)
+        if steps is None:
+            QMessageBox.warning(self, "Save Workflow", "Could not locate signal in any signal tree.")
+            return
+        if not steps:
+            QMessageBox.information(self, "Save Workflow", "This signal has no transformations — it is the root signal.")
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Workflow",
+            "workflow.json",
+            "Workflow Files (*.json);;All Files (*)",
+        )
+        if not path:
+            return
+
+        workflow = {"version": 1, "steps": steps}
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(workflow, fh, indent=2, default=str)
+        except Exception as e:
+            QMessageBox.critical(self, "Save Workflow failed", str(e))
+            return
+
+        QMessageBox.information(self, "Saved", f"Workflow ({len(steps)} step(s)) saved to:\n{path}")
+
+    def apply_workflow(self):
+        """File → Apply Workflow: load a workflow JSON and apply it to the active signal."""
+        signal = self._current_signal()
+        if signal is None:
+            QMessageBox.warning(self, "Apply Workflow", "Open a signal first, then apply a workflow to it.")
+            return
+
+        # Find which tree owns this signal so we can call add_transformation
+        owning_tree = None
+        for tree in self.signal_trees:
+            if tree.get_node(signal) is not None:
+                owning_tree = tree
+                break
+        if owning_tree is None:
+            QMessageBox.warning(self, "Apply Workflow", "Could not locate signal in any signal tree.")
+            return
+
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Workflow",
+            "",
+            "Workflow Files (*.json);;All Files (*)",
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                workflow = json.load(fh)
+        except Exception as e:
+            QMessageBox.critical(self, "Load Workflow failed", str(e))
+            return
+
+        steps = workflow.get("steps", [])
+        if not steps:
+            QMessageBox.information(self, "Apply Workflow", "The workflow file contains no steps.")
+            return
+
+        # Show a preview dialog so the user can confirm before applying
+        dlg = WorkflowViewDialog(steps=steps, parent=self)
+        if dlg.exec() != WorkflowViewDialog.DialogCode.Accepted:
+            return
+
+        # Apply each step in sequence; each step's output becomes the input of the next
+        current_signal = signal
+        errors = []
+        for step in steps:
+            transformation = step.get("transformation")
+            kwargs = step.get("kwargs", {})
+            if not transformation:
+                continue
+            try:
+                current_signal = owning_tree.add_transformation(
+                    current_signal,
+                    method=transformation,
+                    **kwargs,
+                )
+                if current_signal is None:
+                    errors.append(f"'{transformation}' returned None — stopping.")
+                    break
+            except Exception as e:
+                errors.append(f"'{transformation}': {e}")
+                break
+
+        if errors:
+            QMessageBox.warning(
+                self,
+                "Workflow errors",
+                "Workflow stopped early:\n" + "\n".join(errors),
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "Workflow applied",
+                f"Applied {len(steps)} transformation(s) to the signal.",
+            )
 
     ### Handling Recent File opens ###
 
@@ -553,8 +752,8 @@ class MainWindow(QMainWindow):
     def open_file(self):
         self.file_dialog = QFileDialog()
         self.file_dialog.setFileMode(QtWidgets.QFileDialog.FileMode.ExistingFiles)
-        self.file_dialog.setNameFilter("Supported Files (*.hspy *.mrc *.tif *.tiff);;"
-                                       "Hyperspy Files (*.hspy);;"
+        self.file_dialog.setNameFilter("Supported Files (*.hspy *.zspy *.mrc *.tif *.tiff);;"
+                                       "HyperSpy Files (*.hspy *.zspy);;"
                                        "mrc Files (*.mrc);;"
                                        "TIFF Files (*.tif *.tiff)")
 

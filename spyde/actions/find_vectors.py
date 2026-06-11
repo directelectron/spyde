@@ -27,7 +27,7 @@ import time
 from typing import Optional
 
 import numpy as np
-from scipy.ndimage import center_of_mass, gaussian_filter, maximum_filter
+from scipy.ndimage import gaussian_filter, maximum_filter
 from scipy.fft import rfft2, irfft2, next_fast_len
 
 from spyde.drawing.toolbars.toolbar import RoundedToolBar
@@ -37,6 +37,12 @@ _DISK_FFT_CACHE: dict = {}
 
 # ── Module-level guard (one caret per toolbar) ─────────────────────────────────
 _FV_BUILT_TOOLBARS: set = set()
+
+# Maximum peaks per frame in GPU subpixel output buffer
+MAX_PEAKS: int = 512
+
+# Cache of device-side disk kernel arrays keyed by kernel_r
+_gpu_disk_cache: dict = {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -313,13 +319,16 @@ def _find_vectors_single_frame(
     win_std = np.sqrt(win_var)
 
     # --- Step 3: normalise ---
-    # Where the local window std is zero the region is flat — no real peak can
-    # exist there, so score is 0.  Flooring with 1e-8 would inflate these to
-    # arbitrary large values after dividing a non-zero numerator.
+    # Floor win_std at 1% of the frame's global std before multiplying by t_std.
+    # This prevents near-zero denominators in sparse/flat regions (where nav-space
+    # blur can smear a tiny amount of intensity into an otherwise empty background,
+    # causing win_std ≈ 0 and a falsely inflated NXCORR score).  The 1% fraction
+    # is small enough that it has no effect in regions with genuine local variation.
+    global_std = float(frame.std()) or 1.0
+    denom_floor = 0.01 * global_std * t_std
     numerator = xcorr / n - win_mean * t_mean
-    denom = win_std * t_std
-    valid = denom >= 1e-8
-    raw_corr = np.where(valid, numerator / np.where(valid, denom, 1.0), 0.0).astype(np.float32)
+    denom = np.maximum(win_std * t_std, denom_floor)
+    raw_corr = (numerator / denom).astype(np.float32)
     np.clip(raw_corr, -1.0, 1.0, out=raw_corr)
 
     if beamstop_mask is not None and beamstop_mask.any():
@@ -421,186 +430,774 @@ def _auto_params(frame: np.ndarray) -> dict:
         sigma=1.0,
         kernel_radius=r_px,
         threshold=0.5,
-        min_distance=max(1, 2 * r_px),
+        min_distance=max(1, r_px // 2),
         subpixel=True,
     )
 
 
 def _nav_chunk_size(
-    sigma: float, max_ram_mb: float = 200, sig_shape: tuple = (256, 256)
+    sigma: float, max_ram_mb: float = 200, sig_shape: tuple = (256, 256),
+    vram_mb: float = 0.0,
 ) -> int:
-    """Compute the nav chunk size so the ghost-padded chunk fits within max_ram_mb."""
+    """
+    Compute the nav chunk size so the ghost-padded chunk fits within the memory budget.
+
+    When vram_mb > 0 (GPU path) the budget is VRAM, allowing much larger chunks and
+    fewer Dask task dispatches.  For CPU the budget is max_ram_mb.
+    """
     depth = int(np.ceil(3 * sigma))
     sig_pixels = sig_shape[0] * sig_shape[1]
-    max_padded = int(np.sqrt(max_ram_mb * 1e6 / (sig_pixels * 4)))
+    budget = vram_mb if vram_mb > 0 else max_ram_mb
+    max_padded = int(np.sqrt(budget * 1e6 / (sig_pixels * 4)))
     return max(depth + 1, max_padded - 2 * depth)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Worker-side chunk function (module-level so it is picklable)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _worker_find_vectors_chunk(
-    full_data,          # numpy array (the full dataset, local on the worker)
-    y0, y1, x0, x1,    # nav 2D chunk bounds within nav_2d
-    depth_px,           # reflect-pad depth in nav dims
-    n_nav_y, n_nav_x,   # full nav grid size (for padding clamps)
-    sigma_tuple,        # gaussian_filter sigma tuple (all dims)
-    kernel_r,           # disk radius in pixels
-    threshold,          # NXCORR threshold
-    min_dist,           # min peak separation in pixels
-    subpixel,           # subpixel CoM refinement
-    beamstop_mask,      # (ky, kx) bool array or None
-):
-    """
-    Run on a dask.distributed worker that already holds `full_data`.
-
-    Slices a reflect-padded nav chunk, blurs it, peak-finds every frame, and
-    returns only the compact results — no bulk data leaves the worker.
-
-    Returns
-    -------
-    count_2d  : (cy, cx) int32  — peaks per probe position
-    peaks_out : list of (N_i, 3) float32 arrays, one per position in raster order
-                columns: [ky_px, kx_px, nxcorr_value]
-    """
-    import numpy as _np
-    from scipy.ndimage import gaussian_filter as _gf
-
-    # Reflect-pad in nav dims with boundary clamps
-    py0 = max(0, y0 - depth_px); py1 = min(n_nav_y, y1 + depth_px)
-    px0 = max(0, x0 - depth_px); px1 = min(n_nav_x, x1 + depth_px)
-
-    # Slice and blur (all local — zero TCP)
-    chunk_raw = _np.asarray(full_data[py0:py1, px0:px1], dtype=_np.float32)
-    chunk_blurred = _gf(chunk_raw, sigma=sigma_tuple)
-
-    # Trim to valid region
-    vy0 = y0 - py0; vy1 = vy0 + (y1 - y0)
-    vx0 = x0 - px0; vx1 = vx0 + (x1 - x0)
-    chunk_valid = chunk_blurred[vy0:vy1, vx0:vx1]  # (cy, cx, ky, kx)
-    cy, cx = chunk_valid.shape[:2]
-    sig_shape = chunk_valid.shape[2:]
-
-    # Pre-compute disk FFT and stats once per chunk call
-    from scipy.fft import next_fast_len as _nfl, rfft2 as _rfft2, irfft2 as _irfft2
-    from scipy.ndimage import maximum_filter as _mf
-
-    kH = 2 * kernel_r + 1
-    kW = kH
-    _n = kH * kW
-    disk = _np.zeros((kH, kW), dtype=_np.float32)
-    yy, xx = _np.ogrid[-kernel_r: kernel_r + 1, -kernel_r: kernel_r + 1]
-    disk[yy ** 2 + xx ** 2 <= kernel_r ** 2] = 1.0
-    disk /= disk.sum()
-    t_mean = float(disk.mean())
-    t_std = float(_np.sqrt(_np.sum((disk - t_mean) ** 2) / _n))
-
-    ky, kx = sig_shape
-    pH = _nfl(ky + 2 * kernel_r); pW = _nfl(kx + 2 * kernel_r)
-    d_buf = _np.zeros((pH, pW), dtype=_np.float32)
-    d_buf[:kH, :kW] = disk
-    disk_fft = _rfft2(d_buf)
-
-    count_2d = _np.zeros((cy, cx), dtype=_np.int32)
-    peaks_out = []  # one entry per position (ly, lx) in raster order
-
-    for ly in range(cy):
-        for lx in range(cx):
-            frame = chunk_valid[ly, lx]
-
-            # NXCORR
-            padded_full = _np.pad(frame, kernel_r, mode="reflect")
-            buf = _np.zeros((pH, pW), dtype=_np.float32)
-            buf[:ky + 2*kernel_r, :kx + 2*kernel_r] = padded_full
-            xcorr = _irfft2(_rfft2(buf) * disk_fft.conj())[:ky, :kx].astype(_np.float32)
-
-            cum1 = _np.empty((ky + 2*kernel_r + 1, kx + 2*kernel_r + 1), dtype=_np.float32)
-            cum1[0, :] = 0.0; cum1[:, 0] = 0.0
-            cum1[1:, 1:] = _np.cumsum(_np.cumsum(padded_full, axis=0), axis=1)
-            cum2 = _np.empty_like(cum1)
-            cum2[0, :] = 0.0; cum2[:, 0] = 0.0
-            cum2[1:, 1:] = _np.cumsum(_np.cumsum(padded_full ** 2, axis=0), axis=1)
-
-            ws1 = (cum1[kH:ky+kH, kW:kx+kW] - cum1[0:ky, kW:kx+kW]
-                   - cum1[kH:ky+kH, 0:kx] + cum1[0:ky, 0:kx])
-            ws2 = (cum2[kH:ky+kH, kW:kx+kW] - cum2[0:ky, kW:kx+kW]
-                   - cum2[kH:ky+kH, 0:kx] + cum2[0:ky, 0:kx])
-            win_mean = ws1 / _n
-            win_var = ws2 / _n - win_mean ** 2
-            _np.maximum(win_var, 0.0, out=win_var)
-            win_std = _np.sqrt(win_var)
-            numerator = xcorr / _n - win_mean * t_mean
-            denom = win_std * t_std
-            _np.maximum(denom, 1e-8, out=denom)
-            raw_corr = _np.clip(numerator / denom, -1.0, 1.0).astype(_np.float32)
-
-            if beamstop_mask is not None and beamstop_mask.any():
-                raw_corr[beamstop_mask] = -1.0
-
-            # Peak detection
-            if not (raw_corr >= threshold).any():
-                peaks_out.append(_np.zeros((0, 3), dtype=_np.float32))
-                continue
-
-            min_d = int(min_dist)
-            local_max = _mf(raw_corr, size=2 * min_d + 1)
-            peaks_mask = (raw_corr == local_max) & (raw_corr >= threshold)
-            if beamstop_mask is not None and beamstop_mask.any():
-                peaks_mask &= ~beamstop_mask
-            peaks_px = _np.argwhere(peaks_mask)
-
-            if len(peaks_px) == 0:
-                peaks_out.append(_np.zeros((0, 3), dtype=_np.float32))
-                continue
-
-            # Greedy NMS
-            if len(peaks_px) > 1:
-                intensities = raw_corr[peaks_px[:, 0], peaks_px[:, 1]]
-                order = _np.argsort(-intensities)
-                peaks_px = peaks_px[order]
-                kept = _np.ones(len(peaks_px), dtype=bool)
-                min_d2 = min_d * min_d
-                for i in range(len(peaks_px)):
-                    if not kept[i]:
-                        continue
-                    dy = peaks_px[i + 1:, 0] - peaks_px[i, 0]
-                    dx = peaks_px[i + 1:, 1] - peaks_px[i, 1]
-                    kept[i + 1:][(dy * dy + dx * dx) <= min_d2] = False
-                peaks_px = peaks_px[kept]
-
-            # Subpixel CoM
-            if subpixel and len(peaks_px) > 0:
-                half = 2
-                out = _np.empty((len(peaks_px), 3), dtype=_np.float32)
-                for i, (py, px) in enumerate(peaks_px):
-                    y0p = max(0, int(py) - half); y1p = min(ky, int(py) + half + 1)
-                    x0p = max(0, int(px) - half); x1p = min(kx, int(px) + half + 1)
-                    patch = raw_corr[y0p:y1p, x0p:x1p]
-                    s = float(patch.sum())
-                    if s > 0:
-                        wy = patch.sum(axis=1); wx = patch.sum(axis=0)
-                        dy = float(_np.dot(_np.arange(len(wy), dtype=_np.float32), wy)) / s
-                        dx = float(_np.dot(_np.arange(len(wx), dtype=_np.float32), wx)) / s
-                    else:
-                        dy, dx = float(py) - y0p, float(px) - x0p
-                    out[i] = [y0p + dy, x0p + dx, raw_corr[int(py), int(px)]]
-                peaks_arr = out
-            else:
-                peaks_arr = _np.column_stack([
-                    peaks_px.astype(_np.float32),
-                    raw_corr[peaks_px[:, 0], peaks_px[:, 1]],
-                ])
-
-            count_2d[ly, lx] = len(peaks_arr)
-            peaks_out.append(peaks_arr)
-
-    return count_2d, peaks_out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Batch compute
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ── GPU kernels (numba.cuda) ──────────────────────────────────────────────────
+# These are defined at module level so numba can JIT-compile them once and
+# reuse across calls.  All three are guarded: if numba is not installed or
+# CUDA is not available the try/except in _find_vectors_batch_gpu catches the
+# ImportError / CudaSupportError and returns None so the caller falls back to
+# the CPU path transparently.
+
+try:
+    from numba import cuda as _numba_cuda
+    import math as _math
+
+    # ── Separable 1D Gaussian blur along one nav axis ─────────────────────────
+    # Two passes (nav_y then nav_x) replace scipy.ndimage.gaussian_filter.
+    # Input/output: float32 (N_nav_y, N_nav_x, KY, KX).
+    # Each thread handles one (iy, ix, ky, kx) element.
+    # kern: 1D Gaussian weights, length = 2*radius+1, pre-normalised.
+    # radius: half-width of the kernel in nav pixels.
+    # axis: 0 = blur along nav_y, 1 = blur along nav_x.
+
+    @_numba_cuda.jit
+    def _gaussian_blur_1d_kernel(src, dst, kern, radius, axis):
+        ix  = _numba_cuda.blockIdx.x * _numba_cuda.blockDim.x + _numba_cuda.threadIdx.x
+        iy  = _numba_cuda.blockIdx.y * _numba_cuda.blockDim.y + _numba_cuda.threadIdx.y
+        kxy = _numba_cuda.blockIdx.z  # flattened signal pixel index
+
+        NY = src.shape[0]
+        NX = src.shape[1]
+        KY = src.shape[2]
+        KX = src.shape[3]
+
+        if iy >= NY or ix >= NX:
+            return
+        ky_i = kxy // KX
+        kx_i = kxy  % KX
+        if ky_i >= KY:
+            return
+
+        acc = 0.0
+        klen = 2 * radius + 1
+        if axis == 0:
+            for k in range(klen):
+                src_y = iy + k - radius
+                if src_y < 0:
+                    src_y = -src_y
+                elif src_y >= NY:
+                    src_y = 2 * NY - src_y - 2
+                acc += kern[k] * src[src_y, ix, ky_i, kx_i]
+        else:
+            for k in range(klen):
+                src_x = ix + k - radius
+                if src_x < 0:
+                    src_x = -src_x
+                elif src_x >= NX:
+                    src_x = 2 * NX - src_x - 2
+                acc += kern[k] * src[iy, src_x, ky_i, kx_i]
+
+        dst[iy, ix, ky_i, kx_i] = acc
+
+    @_numba_cuda.jit
+    def _nxcorr_kernel(
+        frames_padded, disk, raw_corr, global_stds,
+        n_disk, t_mean, t_std, kr, kr_win, threshold, H, W,
+    ):
+        """
+        Window-normalised cross-correlation kernel.
+
+        frames_padded : float32 (N, H+2*kr_win, W+2*kr_win)
+        disk          : float32 (2*kr+1, 2*kr+1)
+        raw_corr      : float32 (N, H, W)  — output
+        global_stds   : float32 (N,)
+        """
+        out_x = _numba_cuda.blockIdx.x * _numba_cuda.blockDim.x + _numba_cuda.threadIdx.x
+        out_y = _numba_cuda.blockIdx.y * _numba_cuda.blockDim.y + _numba_cuda.threadIdx.y
+        n     = _numba_cuda.blockIdx.z
+
+        if out_x >= W or out_y >= H:
+            return
+
+        PW = W + 2 * kr_win  # padded width (unused in indexing but kept for clarity)
+
+        # ── Cross-correlation: convolve disk over padded frame ────────────────
+        disk_h = 2 * kr + 1
+        disk_w = 2 * kr + 1
+        xcorr = 0.0
+        for dr in range(disk_h):
+            for dc in range(disk_w):
+                py = out_y + kr_win + dr - kr
+                px = out_x + kr_win + dc - kr
+                val = frames_padded[n, py, px]
+                xcorr += disk[dr, dc] * val
+
+        # ── Window statistics: loop over (2*kr_win+1)^2 neighbourhood ────────
+        win_size = 2 * kr_win + 1
+        sum1 = 0.0
+        sum2 = 0.0
+        for dr in range(win_size):
+            for dc in range(win_size):
+                v = frames_padded[n, out_y + dr, out_x + dc]
+                sum1 += v
+                sum2 += v * v
+
+        n_win = win_size * win_size
+        win_mean = sum1 / n_win
+        win_var = sum2 / n_win - win_mean * win_mean
+        if win_var < 0.0:
+            win_var = 0.0
+        win_std = _math.sqrt(win_var)
+
+        # ── Normalise ─────────────────────────────────────────────────────────
+        denom_floor = 0.01 * global_stds[n] * t_std
+        denom = win_std * t_std
+        if denom < denom_floor:
+            denom = denom_floor
+        num = xcorr / n_disk - win_mean * t_mean
+
+        if denom >= 1e-8:
+            score = num / denom
+            if score > 1.0:
+                score = 1.0
+            elif score < -1.0:
+                score = -1.0
+        else:
+            score = 0.0
+
+        raw_corr[n, out_y, out_x] = score
+
+    @_numba_cuda.jit
+    def _local_max_kernel(raw_corr, peak_mask, threshold, min_d, H, W):
+        """
+        Mark pixels that are local maxima above threshold within ±min_d.
+
+        raw_corr  : float32 (N, H, W)
+        peak_mask : uint8   (N, H, W)  — output (1=peak, 0=not)
+        """
+        out_x = _numba_cuda.blockIdx.x * _numba_cuda.blockDim.x + _numba_cuda.threadIdx.x
+        out_y = _numba_cuda.blockIdx.y * _numba_cuda.blockDim.y + _numba_cuda.threadIdx.y
+        n     = _numba_cuda.blockIdx.z
+
+        if out_x >= W or out_y >= H:
+            return
+
+        center = raw_corr[n, out_y, out_x]
+        if center < threshold:
+            peak_mask[n, out_y, out_x] = 0
+            return
+
+        # Check all neighbours within ±min_d; suppress if any are strictly greater
+        y0 = out_y - min_d
+        if y0 < 0:
+            y0 = 0
+        y1 = out_y + min_d
+        if y1 >= H:
+            y1 = H - 1
+        x0 = out_x - min_d
+        if x0 < 0:
+            x0 = 0
+        x1 = out_x + min_d
+        if x1 >= W:
+            x1 = W - 1
+
+        is_max = 1
+        for ny in range(y0, y1 + 1):
+            for nx in range(x0, x1 + 1):
+                if raw_corr[n, ny, nx] > center:
+                    is_max = 0
+                    break
+            if is_max == 0:
+                break
+
+        peak_mask[n, out_y, out_x] = is_max
+
+    @_numba_cuda.jit
+    def _subpixel_com_kernel(raw_corr, peak_mask, peaks_out, n_peaks, half_win, H, W):
+        """
+        Centre-of-mass subpixel refinement for detected peaks.
+
+        raw_corr  : float32 (N, H, W)
+        peak_mask : uint8   (N, H, W)
+        peaks_out : float32 (N, MAX_PEAKS, 3)  — [ky_subpx, kx_subpx, score]
+        n_peaks   : int32   (N,)               — atomic counter per frame
+        """
+        out_x = _numba_cuda.blockIdx.x * _numba_cuda.blockDim.x + _numba_cuda.threadIdx.x
+        out_y = _numba_cuda.blockIdx.y * _numba_cuda.blockDim.y + _numba_cuda.threadIdx.y
+        n     = _numba_cuda.blockIdx.z
+
+        if out_x >= W or out_y >= H:
+            return
+        if peak_mask[n, out_y, out_x] == 0:
+            return
+
+        # Claim a slot atomically
+        slot = _numba_cuda.atomic.add(n_peaks, n, 1)
+        max_peaks = peaks_out.shape[1]
+        if slot >= max_peaks:
+            return  # overflow guard — silently discard
+
+        # CoM window bounds
+        y0 = out_y - half_win
+        if y0 < 0:
+            y0 = 0
+        y1 = out_y + half_win + 1
+        if y1 > H:
+            y1 = H
+        x0 = out_x - half_win
+        if x0 < 0:
+            x0 = 0
+        x1 = out_x + half_win + 1
+        if x1 > W:
+            x1 = W
+
+        s  = 0.0
+        sy = 0.0
+        sx = 0.0
+        for py in range(y0, y1):
+            for px in range(x0, x1):
+                v = raw_corr[n, py, px]
+                s  += v
+                sy += py * v
+                sx += px * v
+
+        if s > 0.0:
+            fy = sy / s
+            fx = sx / s
+        else:
+            fy = float(out_y)
+            fx = float(out_x)
+
+        peaks_out[n, slot, 0] = fy
+        peaks_out[n, slot, 1] = fx
+        peaks_out[n, slot, 2] = raw_corr[n, out_y, out_x]
+
+    _GPU_KERNELS_AVAILABLE = True
+
+except Exception:
+    _GPU_KERNELS_AVAILABLE = False
+
+
+def _find_vectors_batch_gpu(
+    blurred_block,
+    kernel_r,
+    threshold,
+    min_dist,
+    subpixel,
+    beamstop_mask,
+    disk_d,
+    disk_stats,
+):
+    """
+    GPU-accelerated batch vector finding using numba.cuda.
+
+    Parameters
+    ----------
+    blurred_block : CPU float32 ndarray (..., H, W)
+        Nav-blurred diffraction patterns; any number of leading nav dims.
+    kernel_r : int
+        Disk kernel radius in pixels.
+    threshold : float
+        NXCORR threshold.
+    min_dist : int
+        Minimum peak separation in pixels.
+    subpixel : bool
+        Whether to apply CoM subpixel refinement.
+    beamstop_mask : (H, W) bool ndarray | None
+        Pixels to exclude.
+    disk_d : device array | None
+        Pre-uploaded float32 disk kernel for this kernel_r.  If None the
+        function uploads it and stores it in _gpu_disk_cache.
+    disk_stats : (n_disk, t_mean, t_std)
+        Pre-computed disk statistics (same values as in the CPU path).
+
+    Returns
+    -------
+    object ndarray of shape nav_shape, each element (N_peaks, 3) float32,
+    or None if CUDA is unavailable / any error occurs (caller falls back to CPU).
+    """
+    try:
+        from numba import cuda as _cuda
+    except ImportError:
+        return None
+    if not _cuda.is_available():
+        return None
+    if not _GPU_KERNELS_AVAILABLE:
+        return None
+
+    try:
+        n_disk, t_mean, t_std = disk_stats
+        n_disk  = np.int32(n_disk)
+        t_mean  = np.float32(t_mean)
+        t_std   = np.float32(t_std)
+        kr      = np.int32(kernel_r)
+        kr_win  = np.int32(kernel_r + 1)   # kernel_window_pad = 1, same as CPU
+        thr     = np.float32(threshold)
+        min_d   = np.int32(min_dist)
+
+        nav_shape = blurred_block.shape[:-2]
+        H, W = int(blurred_block.shape[-2]), int(blurred_block.shape[-1])
+        iH, iW = np.int32(H), np.int32(W)
+        N = int(np.prod(nav_shape)) if len(nav_shape) > 0 else 1
+
+        # Flatten to (N, H, W) float32
+        frames = blurred_block.reshape(N, H, W).astype(np.float32)
+
+        # Apply beamstop mask fill on CPU before H2D
+        if beamstop_mask is not None and beamstop_mask.any():
+            fill_vals = []
+            for i in range(N):
+                unmasked = frames[i][~beamstop_mask]
+                fill = float(unmasked.mean()) if unmasked.size > 0 else 0.0
+                fill_vals.append(fill)
+            for i in range(N):
+                frames[i][beamstop_mask] = fill_vals[i]
+
+        # Per-frame global std (on CPU before H2D)
+        global_stds = frames.std(axis=(-1, -2)).astype(np.float32)
+        # Guard against all-zero frames
+        global_stds[global_stds == 0.0] = 1.0
+
+        # Reflect-pad each frame by kr_win on all sides
+        frames_padded = np.pad(
+            frames,
+            ((0, 0), (int(kr_win), int(kr_win)), (int(kr_win), int(kr_win))),
+            mode="reflect",
+        ).astype(np.float32)
+
+        # Upload to device
+        frames_d       = _cuda.to_device(frames_padded)
+        global_stds_d  = _cuda.to_device(global_stds)
+
+        # Disk kernel — upload once per kernel_r, then reuse
+        if disk_d is None:
+            disk_cpu = _make_disk(kernel_r)
+            disk_d   = _cuda.to_device(disk_cpu)
+            _gpu_disk_cache[kernel_r] = disk_d
+
+        # Allocate output arrays on device
+        raw_corr_d  = _cuda.device_array((N, H, W), dtype=np.float32)
+        peak_mask_d = _cuda.device_array((N, H, W), dtype=np.uint8)
+
+        # Grid / block configuration
+        bx, by = 16, 16
+        grid = (
+            int(np.ceil(W / bx)),
+            int(np.ceil(H / by)),
+            N,
+        )
+        block = (bx, by, 1)
+
+        import warnings as _w
+        with _w.catch_warnings():
+            _w.simplefilter("ignore")  # suppress numba low-occupancy warnings for small chunks
+
+            _nxcorr_kernel[grid, block](
+                frames_d, disk_d, raw_corr_d, global_stds_d,
+                n_disk, t_mean, t_std, kr, kr_win, thr, iH, iW,
+            )
+
+            _local_max_kernel[grid, block](
+                raw_corr_d, peak_mask_d, thr, min_d, iH, iW,
+            )
+
+            if subpixel:
+                peaks_out_d = _cuda.device_array((N, MAX_PEAKS, 3), dtype=np.float32)
+                n_peaks_d   = _cuda.to_device(np.zeros(N, dtype=np.int32))
+                half_win    = np.int32(2)
+                _subpixel_com_kernel[grid, block](
+                    raw_corr_d, peak_mask_d, peaks_out_d, n_peaks_d, half_win, iH, iW,
+                )
+
+        if subpixel:
+            peaks_out = peaks_out_d.copy_to_host()
+            n_peaks   = n_peaks_d.copy_to_host()
+        else:
+            peak_mask = peak_mask_d.copy_to_host()
+            raw_corr  = raw_corr_d.copy_to_host()
+
+        # Build per-frame result list, then run greedy NMS (CPU — very fast,
+        # typically <30 peaks per frame)
+        result_flat = np.empty(N, dtype=object)
+        min_d2 = int(min_dist) * int(min_dist)
+
+        for i in range(N):
+            if subpixel:
+                np_i   = int(n_peaks[i])
+                np_i   = min(np_i, MAX_PEAKS)
+                if np_i == 0:
+                    result_flat[i] = np.zeros((0, 3), dtype=np.float32)
+                    continue
+                frame_peaks = peaks_out[i, :np_i, :].copy()  # (np_i, 3): [ky, kx, score]
+            else:
+                pm  = peak_mask[i]   # (H, W) uint8
+                rc  = raw_corr[i]    # (H, W) float32
+                yx  = np.argwhere(pm > 0)
+                if len(yx) == 0:
+                    result_flat[i] = np.zeros((0, 3), dtype=np.float32)
+                    continue
+                scores = rc[yx[:, 0], yx[:, 1]]
+                frame_peaks = np.column_stack([yx.astype(np.float32), scores])
+
+            # Apply beamstop mask exclusion (on surviving peaks)
+            if beamstop_mask is not None and beamstop_mask.any() and len(frame_peaks) > 0:
+                ky_px = frame_peaks[:, 0].astype(int)
+                kx_px = frame_peaks[:, 1].astype(int)
+                np.clip(ky_px, 0, H - 1, out=ky_px)
+                np.clip(kx_px, 0, W - 1, out=kx_px)
+                keep = ~beamstop_mask[ky_px, kx_px]
+                frame_peaks = frame_peaks[keep]
+
+            if len(frame_peaks) == 0:
+                result_flat[i] = np.zeros((0, 3), dtype=np.float32)
+                continue
+
+            # Greedy NMS (matches CPU path)
+            if len(frame_peaks) > 1:
+                order = np.argsort(-frame_peaks[:, 2])
+                frame_peaks = frame_peaks[order]
+                kept = np.ones(len(frame_peaks), dtype=bool)
+                for j in range(len(frame_peaks)):
+                    if not kept[j]:
+                        continue
+                    dy = frame_peaks[j + 1:, 0] - frame_peaks[j, 0]
+                    dx = frame_peaks[j + 1:, 1] - frame_peaks[j, 1]
+                    too_close = (dy * dy + dx * dx) <= min_d2
+                    kept[j + 1:][too_close] = False
+                frame_peaks = frame_peaks[kept]
+
+            result_flat[i] = frame_peaks.astype(np.float32)
+
+        result = result_flat.reshape(nav_shape) if len(nav_shape) > 0 else result_flat
+        return result
+
+    except Exception:
+        return None
+
+
+def _find_vectors_chunk(
+    ghost_block: np.ndarray,
+    depth_px: int,
+    nav_dim: int,
+    sigma: float,
+    kernel_r: int,
+    threshold: float,
+    min_dist: int,
+    subpixel: bool,
+    beamstop_mask,
+    disk_fft,
+    disk_stats,
+) -> np.ndarray:
+    """
+    Full pipeline for one ghost-padded nav chunk.
+
+    Passed to dask.array.map_overlap with trim=False.  Receives the ghost-padded
+    block from map_overlap, does everything on GPU when available:
+
+        CPU → [H2D] → GPU blur (nav-space Gaussian, real-space separable)
+                     → NXCORR kernel (xcorr + window stats + normalise)
+                     → local-max kernel (NMS)
+                     → subpixel CoM kernel
+                     → [D2H sparse peaks]
+        → pack into (nav_y, nav_x, MAX_PEAKS, 3) NaN-padded float32
+
+    Falls back to scipy + CPU per-frame loop if CUDA is unavailable.
+
+    The ghost zone covers depth_px = ceil(3σ) nav rows/cols on each edge.
+    The blur uses these ghost rows so chunk-boundary blur values are correct;
+    we trim them back before NXCORR so no ghost pixels appear in the output.
+
+    For 5D (nav_dim=3) the leading dimension is time; we process each t-slice
+    as an independent 4D block and stack into (t, ny, nx, MAX_PEAKS, 3).
+
+    Returns
+    -------
+    float32 ndarray (nav_y, nav_x, MAX_PEAKS, 3)          [4D]
+                 or (t, nav_y, nav_x, MAX_PEAKS, 3)        [5D]
+    """
+    # ── Try GPU path ──────────────────────────────────────────────────────────
+    if _GPU_KERNELS_AVAILABLE:
+        try:
+            from numba import cuda as _cuda
+            if _cuda.is_available():
+                return _find_vectors_chunk_gpu(
+                    ghost_block, depth_px, nav_dim, sigma,
+                    kernel_r, threshold, min_dist, subpixel,
+                    beamstop_mask, disk_stats,
+                )
+        except Exception:
+            pass
+
+    # ── CPU fallback ──────────────────────────────────────────────────────────
+    from scipy.ndimage import gaussian_filter as _gf
+
+    sigma_tuple = tuple([0.0] * (nav_dim - 2) + [sigma, sigma, 0.0, 0.0])
+    blurred = _gf(ghost_block.astype(np.float32), sigma=sigma_tuple)
+
+    # Trim ghost zones
+    trim = [slice(None)] * ghost_block.ndim
+    for d in range(nav_dim):
+        s = blurred.shape[d]
+        lo = depth_px if depth_px < s else 0
+        hi = s - depth_px if depth_px < s else s
+        trim[d] = slice(lo, hi)
+    blurred = blurred[tuple(trim)]
+
+    nav_shape = blurred.shape[:nav_dim]
+    ny, nx = nav_shape[-2:]
+
+    def _cpu_block(b4d):
+        out = np.full((b4d.shape[0], b4d.shape[1], MAX_PEAKS, 3), np.nan, dtype=np.float32)
+        flat = b4d.reshape(-1, b4d.shape[2], b4d.shape[3])
+        for i, frame in enumerate(flat):
+            iy, ix = divmod(i, b4d.shape[1])
+            _, _, peaks = _find_vectors_single_frame(
+                frame, kernel_r, threshold, min_dist,
+                subpixel=subpixel, beamstop_mask=beamstop_mask,
+                _disk_fft=disk_fft, _disk_stats=disk_stats,
+            )
+            n = min(len(peaks), MAX_PEAKS)
+            if n > 0:
+                out[iy, ix, :n, :] = peaks[:n]
+        return out
+
+    if nav_dim == 2:
+        return _cpu_block(blurred)
+    else:
+        n_lead = nav_shape[0]
+        out = np.full((n_lead, ny, nx, MAX_PEAKS, 3), np.nan, dtype=np.float32)
+        for t in range(n_lead):
+            out[t] = _cpu_block(blurred[t])
+        return out
+
+
+def _find_vectors_chunk_gpu(
+    ghost_block: np.ndarray,
+    depth_px: int,
+    nav_dim: int,
+    sigma: float,
+    kernel_r: int,
+    threshold: float,
+    min_dist: int,
+    subpixel: bool,
+    beamstop_mask,
+    disk_stats,
+) -> np.ndarray:
+    """
+    GPU implementation of _find_vectors_chunk.
+
+    Single H2D transfer of the ghost-padded block, then entirely on-device:
+      1. Separable Gaussian blur in nav-space (two 1D kernel passes)
+      2. Trim ghost zones (device-side slice — no copy)
+      3. NXCORR + local-max + subpixel kernels
+      4. D2H only the sparse padded peak result
+
+    For 5D, processes each t-slice sequentially on GPU (same device context).
+    """
+    from numba import cuda as _cuda
+
+    block_f32 = ghost_block.astype(np.float32)
+    nav_shape_ghost = block_f32.shape[:nav_dim]
+    KY, KX = block_f32.shape[-2], block_f32.shape[-1]
+
+    # ── Pre-compute 1D Gaussian kernel (CPU, tiny) ────────────────────────────
+    if sigma > 0:
+        radius = int(np.ceil(3 * sigma))
+        xs = np.arange(-radius, radius + 1, dtype=np.float32)
+        kern_cpu = np.exp(-0.5 * (xs / sigma) ** 2).astype(np.float32)
+        kern_cpu /= kern_cpu.sum()
+    else:
+        radius = 0
+        kern_cpu = np.ones(1, dtype=np.float32)
+    kern_d = _cuda.to_device(kern_cpu)
+
+    # ── Upload disk kernel once per kernel_r ──────────────────────────────────
+    if kernel_r not in _gpu_disk_cache:
+        _gpu_disk_cache[kernel_r] = _cuda.to_device(_make_disk(kernel_r))
+    disk_d = _gpu_disk_cache[kernel_r]
+
+    n_disk, t_mean, t_std = disk_stats
+    n_disk = np.int32(n_disk)
+    t_mean = np.float32(t_mean)
+    t_std  = np.float32(t_std)
+    kr     = np.int32(kernel_r)
+    kr_win = np.int32(kernel_r + 1)
+    thr    = np.float32(threshold)
+    min_d  = np.int32(min_dist)
+
+    def _process_4d(block4d_cpu):
+        """Full GPU pipeline for one (ny_ghost, nx_ghost, KY, KX) block."""
+        NY_g, NX_g = block4d_cpu.shape[0], block4d_cpu.shape[1]
+
+        # H2D — single transfer of the ghost-padded block
+        src_d = _cuda.to_device(block4d_cpu)
+        tmp_d = _cuda.device_array_like(src_d)
+
+        # ── Gaussian blur: two separable 1D passes ────────────────────────────
+        # Grid: x=NX, y=NY, z=KY*KX
+        bx, by = 16, 16
+        import warnings as _w
+        with _w.catch_warnings():
+            _w.simplefilter("ignore")
+            if sigma > 0:
+                grid_blur = (
+                    int(np.ceil(NX_g / bx)),
+                    int(np.ceil(NY_g / by)),
+                    KY * KX,
+                )
+                block_blur = (bx, by, 1)
+                _gaussian_blur_1d_kernel[grid_blur, block_blur](
+                    src_d, tmp_d, kern_d, np.int32(radius), np.int32(0)
+                )  # blur along nav_y into tmp
+                _gaussian_blur_1d_kernel[grid_blur, block_blur](
+                    tmp_d, src_d, kern_d, np.int32(radius), np.int32(1)
+                )  # blur along nav_x back into src_d
+                blurred_d = src_d
+            else:
+                blurred_d = src_d  # no blur needed
+
+        # ── Trim ghost zones (device-side slice — zero-copy view) ─────────────
+        lo = depth_px
+        hi_y = NY_g - depth_px
+        hi_x = NX_g - depth_px
+        if lo >= hi_y or lo >= hi_x:
+            lo = 0; hi_y = NY_g; hi_x = NX_g
+        valid_d = blurred_d[lo:hi_y, lo:hi_x, :, :]
+        NY, NX = valid_d.shape[0], valid_d.shape[1]
+        N = NY * NX
+        iH, iW = np.int32(KY), np.int32(KX)
+
+        # ── Reshape to (N, KY, KX) for NXCORR kernels ────────────────────────
+        flat_d = valid_d.reshape(N, KY, KX)
+
+        # Apply beamstop fill on GPU slice (CPU side, negligible for mask)
+        if beamstop_mask is not None and beamstop_mask.any():
+            flat_cpu = flat_d.copy_to_host()
+            for i in range(N):
+                unmasked = flat_cpu[i][~beamstop_mask]
+                fill = float(unmasked.mean()) if unmasked.size > 0 else 0.0
+                flat_cpu[i][beamstop_mask] = fill
+            flat_d = _cuda.to_device(flat_cpu)
+
+        # Per-frame global std for denom_floor
+        flat_cpu_for_std = flat_d.copy_to_host()
+        global_stds = flat_cpu_for_std.std(axis=(-1, -2)).astype(np.float32)
+        global_stds[global_stds == 0.0] = 1.0
+        global_stds_d = _cuda.to_device(global_stds)
+
+        # Reflect-pad each frame by kr_win for NXCORR window stats
+        pad = int(kr_win)
+        frames_padded_cpu = np.pad(
+            flat_cpu_for_std,
+            ((0, 0), (pad, pad), (pad, pad)),
+            mode="reflect",
+        ).astype(np.float32)
+        frames_d = _cuda.to_device(frames_padded_cpu)
+
+        raw_corr_d  = _cuda.device_array((N, KY, KX), dtype=np.float32)
+        peak_mask_d = _cuda.device_array((N, KY, KX), dtype=np.uint8)
+
+        grid_px = (int(np.ceil(KX / 16)), int(np.ceil(KY / 16)), N)
+        blk_px  = (16, 16, 1)
+
+        with _w.catch_warnings():
+            _w.simplefilter("ignore")
+            _nxcorr_kernel[grid_px, blk_px](
+                frames_d, disk_d, raw_corr_d, global_stds_d,
+                n_disk, t_mean, t_std, kr, kr_win, thr, iH, iW,
+            )
+            _local_max_kernel[grid_px, blk_px](
+                raw_corr_d, peak_mask_d, thr, min_d, iH, iW,
+            )
+            if subpixel:
+                peaks_out_d = _cuda.device_array((N, MAX_PEAKS, 3), dtype=np.float32)
+                n_peaks_d   = _cuda.to_device(np.zeros(N, dtype=np.int32))
+                _subpixel_com_kernel[grid_px, blk_px](
+                    raw_corr_d, peak_mask_d, peaks_out_d, n_peaks_d,
+                    np.int32(2), iH, iW,
+                )
+
+        # D2H — only sparse results
+        if subpixel:
+            peaks_out = peaks_out_d.copy_to_host()
+            n_peaks   = n_peaks_d.copy_to_host()
+        else:
+            peak_mask = peak_mask_d.copy_to_host()
+            raw_corr  = raw_corr_d.copy_to_host()
+
+        # Pack into (NY, NX, MAX_PEAKS, 3) NaN-padded
+        out = np.full((NY, NX, MAX_PEAKS, 3), np.nan, dtype=np.float32)
+        min_d2 = int(min_dist) * int(min_dist)
+        for i in range(N):
+            iy, ix = divmod(i, NX)
+            if subpixel:
+                np_i = min(int(n_peaks[i]), MAX_PEAKS)
+                frame_peaks = peaks_out[i, :np_i].copy() if np_i > 0 else None
+            else:
+                yx = np.argwhere(peak_mask[i] > 0)
+                if len(yx) == 0:
+                    continue
+                scores = raw_corr[i][yx[:, 0], yx[:, 1]]
+                frame_peaks = np.column_stack([yx.astype(np.float32), scores])
+
+            if frame_peaks is None or len(frame_peaks) == 0:
+                continue
+
+            # Beamstop exclusion on surviving peaks
+            if beamstop_mask is not None and beamstop_mask.any():
+                ky_px = np.clip(frame_peaks[:, 0].astype(int), 0, KY - 1)
+                kx_px = np.clip(frame_peaks[:, 1].astype(int), 0, KX - 1)
+                frame_peaks = frame_peaks[~beamstop_mask[ky_px, kx_px]]
+
+            # Greedy NMS
+            if len(frame_peaks) > 1:
+                order = np.argsort(-frame_peaks[:, 2])
+                frame_peaks = frame_peaks[order]
+                kept = np.ones(len(frame_peaks), dtype=bool)
+                for j in range(len(frame_peaks)):
+                    if not kept[j]:
+                        continue
+                    dy = frame_peaks[j+1:, 0] - frame_peaks[j, 0]
+                    dx = frame_peaks[j+1:, 1] - frame_peaks[j, 1]
+                    kept[j+1:][(dy*dy + dx*dx) <= min_d2] = False
+                frame_peaks = frame_peaks[kept]
+
+            n = min(len(frame_peaks), MAX_PEAKS)
+            if n > 0:
+                out[iy, ix, :n, :] = frame_peaks[:n]
+
+        return out
+
+    # ── Dispatch: 4D or 5D ────────────────────────────────────────────────────
+    if nav_dim == 2:
+        return _process_4d(block_f32)
+    else:
+        n_lead = nav_shape_ghost[0]
+        KY2, KX2 = block_f32.shape[-2], block_f32.shape[-1]
+        # Ghost block is (t, ny_ghost, nx_ghost, KY, KX) for 5D
+        ny_ghost = nav_shape_ghost[1]
+        nx_ghost = nav_shape_ghost[2]
+        ny = max(1, ny_ghost - 2 * depth_px)
+        nx = max(1, nx_ghost - 2 * depth_px)
+        out5 = np.full((n_lead, ny, nx, MAX_PEAKS, 3), np.nan, dtype=np.float32)
+        for t in range(n_lead):
+            out5[t] = _process_4d(block_f32[t])
+        return out5
 
 
 def _do_compute_vectors(
@@ -611,39 +1208,31 @@ def _do_compute_vectors(
     stopped_flag=None,
 ):
     """
-    Single-pass batch compute — pure numpy, no dask round-trips.
+    Batch compute via dask.array.map_overlap.
 
-    Key design: materialize the signal data to a numpy array **once** before
-    the loop.  This eliminates two major sources of latency that appeared when
-    using dask.array.map_overlap + per-chunk .compute():
+    Nav-space Gaussian blur is applied with ghost zones (depth=ceil(3σ)) so
+    chunk boundaries are handled correctly, then _find_vectors_single_frame
+    is applied to every pattern.  Results are collected as a flat buffer with
+    per-position offsets.
 
-      1. da.from_array on a large numpy array calls dask.base.tokenize() which
-         hashes the entire array (~1 s for a 1 GB dataset).
-      2. Each blurred_lazy[slice].compute() call traverses a 270-task graph and,
-         when using dask.distributed, incurs TCP serialization round-trips for
-         every chunk (~2-5 s overhead per chunk on localhost).
-
-    Instead we:
-      - Materialize data to float32 numpy once (zero-copy if already numpy/float32).
-      - Iterate nav chunks manually, reflect-padding each chunk with scipy.
-      - Run NXCORR peak-finding on each frame inline — no dask scheduler involved.
-
-    Nav-space Gaussian blur is applied per chunk with reflect boundary padding
-    of depth=ceil(3σ) on each edge so chunk boundaries are handled correctly
-    (equivalent to dask.array.map_overlap's ghost zones).
+    signal.data may be a numpy array or a lazy dask array.  For numpy inputs
+    map_overlap operates on a trivially-chunked array (one chunk = full nav
+    block) so no data is copied.  NEVER call .compute() on the full dataset.
 
     Parameters
     ----------
     shm_name : str | None
-        Pre-existing float32 SharedMemory segment of size nav_2d_shape.
-        Written live as each chunk finishes.
+        Pre-existing float32 SharedMemory segment written live per chunk.
     on_chunk_done : callable(nav_slice_2d, count_subarray) | None
-        Called from this thread after each nav chunk completes.
+        Called after the full compute completes (shm update path).
     stopped_flag : list[bool] | None
-        If stopped_flag[0] becomes True, the loop exits after the current chunk.
+        Checked after map_overlap returns; early-exit not supported mid-compute.
     """
-    import itertools
-    from spyde.signals.diffraction_vectors import SpyDEDiffractionVectors
+    import functools
+    import dask.array as da
+    from spyde.signals.diffraction_vectors import (
+        N_COLS, COL_KX, COL_KY, COL_TIME, COL_INTENSITY, SpyDEDiffractionVectors
+    )
 
     nav_dim = signal.axes_manager.navigation_dimension
     sig_dim = signal.axes_manager.signal_dimension
@@ -652,42 +1241,6 @@ def _do_compute_vectors(
 
     sigma = float(params["sigma"])
     depth_px = int(np.ceil(3 * sigma))
-    # sigma_tuple: blur only the nav dimensions, not the signal dimensions
-    sigma_tuple = tuple([0.0] * (nav_dim - 2) + [sigma, sigma] + [0.0] * sig_dim)
-
-    chunk_nav = _nav_chunk_size(sigma, max_ram_mb=200, sig_shape=sig_shape)
-
-    # ── Resolve the data — never pull the full dataset over TCP ──────────────
-    # signal.data may be:
-    #   (a) numpy array — already local, use directly
-    #   (b) dask.array.Array (lazy) — keep lazy, use client.submit per chunk
-    #   (c) dask.distributed.Future — data is on a worker; use client.submit
-    #       so work runs on that worker, only small results return
-    #
-    # In ALL cases we must NOT call raw.result() or raw.compute() on the full
-    # dataset — that would pull hundreds of GB across TCP or into RAM.
-    raw = signal.data
-    from dask.distributed import Future as _DistFuture
-    import dask.array as _da
-
-    _is_numpy = isinstance(raw, np.ndarray)
-    _is_dask = isinstance(raw, _da.Array)
-    _is_future = isinstance(raw, _DistFuture) or (not _is_numpy and not _is_dask and hasattr(raw, 'result'))
-
-    # Derive shape without materialising
-    if _is_numpy:
-        numpy_data = raw.astype(np.float32) if raw.dtype != np.float32 else raw
-        nav_shape_full = numpy_data.shape[:nav_dim]
-    elif _is_dask:
-        nav_shape_full = raw.shape[:nav_dim]
-    else:
-        # Future: shape is not directly available, read from axes_manager
-        nav_shape_full = tuple(
-            signal.axes_manager.navigation_shape[::-1]
-        )  # HS stores (nx, ny), data stored (ny, nx)
-    nav_2d_shape = nav_shape_full[-2:]
-    n_nav_y, n_nav_x = nav_2d_shape
-    n_patterns = n_nav_y * n_nav_x
 
     kernel_r = int(params["kernel_radius"])
     threshold = float(params["threshold"])
@@ -699,203 +1252,179 @@ def _do_compute_vectors(
     kx_scale = float(sig_ax[0].scale)
     kx_offset = float(sig_ax[0].offset)
 
-    # Pre-compute disk FFT and statistics once — reused for every frame.
-    pH = next_fast_len(sig_shape[0] + 2 * kernel_r)
-    pW = next_fast_len(sig_shape[1] + 2 * kernel_r)
-    disk_fft = _get_disk_fft(kernel_r, pH, pW)
+    # ── Chunk size: larger chunks on GPU to amortise Dask scheduling overhead ─
+    # On GPU the bottleneck is H2D latency (~1 ms) not RAM, so we use as many
+    # patterns per chunk as fit in available VRAM (leaving 2 GB headroom).
+    # On CPU we stay within max_ram_mb.
+    vram_mb = 0.0
+    if _GPU_KERNELS_AVAILABLE:
+        try:
+            from numba import cuda as _nc
+            if _nc.is_available():
+                mem = _nc.current_context().get_memory_info()
+                # leave 2 GB headroom for working buffers (raw_corr, peak_mask, etc.)
+                vram_mb = max(0.0, mem.free / 1e6 - 2048)
+        except Exception:
+            pass
+    chunk_nav = _nav_chunk_size(sigma, max_ram_mb=200, sig_shape=sig_shape,
+                                vram_mb=vram_mb)
+
+    raw = signal.data
+    nav_shape_full = raw.shape[:nav_dim]
+    nav_2d_shape = nav_shape_full[-2:]
+    n_nav_y, n_nav_x = nav_2d_shape
+
+    # Disk stats: passed to chunk_fn so workers don't recompute them.
     _disk = _make_disk(kernel_r)
     _n = _disk.shape[0] * _disk.shape[1]
     _t_mean = float(_disk.mean())
     _t_std = float(np.sqrt(np.sum((_disk - _t_mean) ** 2) / _n))
     disk_stats = (_n, _t_mean, _t_std)
+    # CPU fallback also needs disk_fft
+    pH = next_fast_len(sig_shape[0] + 2 * kernel_r)
+    pW = next_fast_len(sig_shape[1] + 2 * kernel_r)
+    disk_fft = _get_disk_fft(kernel_r, pH, pW)
 
-    # ── Chunk boundaries (shared by both paths) ───────────────────────────────
-    def _chunk_ranges(dim_size):
-        starts = list(range(0, dim_size, chunk_nav))
-        return [(s, min(s + chunk_nav, dim_size)) for s in starts]
+    # ── Build chunked dask array ──────────────────────────────────────────────
+    nav_chunks_tuple = tuple(chunk_nav for _ in range(nav_dim))
+    sig_chunks_tuple = tuple(s for s in raw.shape[nav_dim:])
+    if isinstance(raw, np.ndarray):
+        da_data = da.from_array(raw.astype(np.float32),
+                                chunks=nav_chunks_tuple + sig_chunks_tuple)
+    else:
+        da_data = raw.rechunk(nav_chunks_tuple + sig_chunks_tuple)
 
-    chunks_y = _chunk_ranges(n_nav_y)
-    chunks_x = _chunk_ranges(n_nav_x)
+    # ── Build the map_overlap graph ───────────────────────────────────────────
+    # trim=False: chunk_fn receives the full ghost-padded block and handles
+    # trimming itself so the blur can use all ghost rows for correct boundaries.
+    # drop_axis removes (ky, kx); new_axis adds (MAX_PEAKS, 3).
+    # Output: (nav_y, nav_x, MAX_PEAKS, 3) [4D] or (t, ny, nx, MAX_PEAKS, 3) [5D].
+    depth_dict = {i: depth_px for i in range(nav_dim)}
+    sig_axes_idx = list(range(nav_dim, nav_dim + sig_dim))
+    new_axes_idx = list(range(nav_dim, nav_dim + 2))
+    out_chunks = da_data.chunks[:nav_dim] + ((MAX_PEAKS,), (3,))
+
+    chunk_fn = functools.partial(
+        _find_vectors_chunk,
+        depth_px=depth_px,
+        nav_dim=nav_dim,
+        sigma=sigma,
+        kernel_r=kernel_r,
+        threshold=threshold,
+        min_dist=min_dist,
+        subpixel=subpixel,
+        beamstop_mask=beamstop_mask,
+        disk_fft=disk_fft,
+        disk_stats=disk_stats,
+    )
+
+    # Annotate with GPU resource so the Dask distributed scheduler routes chunk
+    # tasks to workers started with --resources GPU=1.  Best-effort — silently
+    # ignored if no GPU workers are registered or no distributed client is active.
+    import dask
+    with dask.annotate(resources={"GPU": 1}):
+        peaks_padded = da.map_overlap(
+            chunk_fn,
+            da_data,
+            depth=depth_dict,
+            boundary="reflect",
+            dtype=np.float32,
+            trim=False,
+            drop_axis=sig_axes_idx,
+            new_axis=new_axes_idx,
+            chunks=out_chunks,
+        )
+
+    result_padded = peaks_padded.compute()
+
+    if stopped_flag is not None and stopped_flag[0]:
+        return None
+
+    # ── Unpack padded result into flat buffer ─────────────────────────────────
+    # result_padded shape: (nav_y, nav_x, MAX_PEAKS, 3)  [4D]
+    #                   or (t, nav_y, nav_x, MAX_PEAKS, 3) [5D]
+    # Valid peaks have finite ky (col 0); NaN-padded slots are ignored.
+    def _count_valid(arr_mp3):
+        """Number of finite rows in (MAX_PEAKS, 3) — first NaN ends the run."""
+        valid = np.isfinite(arr_mp3[:, 0])
+        return int(valid.sum())
+
     if nav_dim == 2:
-        chunk_combos = list(itertools.product(chunks_y, chunks_x))
+        N_total = sum(
+            _count_valid(result_padded[iy, ix])
+            for iy in range(n_nav_y) for ix in range(n_nav_x)
+        )
+        flat_buffer = np.zeros((N_total, N_COLS), dtype=np.float32)
+        flat_buffer[:, COL_TIME] = -1.0
+        cursor = 0
+        for iy in range(n_nav_y):
+            for ix in range(n_nav_x):
+                slot = result_padded[iy, ix]          # (MAX_PEAKS, 3)
+                valid = np.isfinite(slot[:, 0])
+                peaks = slot[valid]
+                n = len(peaks)
+                if n == 0:
+                    continue
+                flat_buffer[cursor:cursor+n, 0] = ix
+                flat_buffer[cursor:cursor+n, 1] = iy
+                flat_buffer[cursor:cursor+n, COL_KX] = peaks[:, 1] * kx_scale + kx_offset
+                flat_buffer[cursor:cursor+n, COL_KY] = peaks[:, 0] * ky_scale + ky_offset
+                flat_buffer[cursor:cursor+n, COL_INTENSITY] = peaks[:, 2]
+                cursor += n
     else:
         leading_size = nav_shape_full[0]
-        chunk_combos = [
-            (t, cy, cx)
+        N_total = sum(
+            _count_valid(result_padded[t, iy, ix])
             for t in range(leading_size)
-            for cy in chunks_y
-            for cx in chunks_x
-        ]
+            for iy in range(n_nav_y) for ix in range(n_nav_x)
+        )
+        flat_buffer = np.zeros((N_total, N_COLS), dtype=np.float32)
+        cursor = 0
+        for t in range(leading_size):
+            for iy in range(n_nav_y):
+                for ix in range(n_nav_x):
+                    slot = result_padded[t, iy, ix]    # (MAX_PEAKS, 3)
+                    valid = np.isfinite(slot[:, 0])
+                    peaks = slot[valid]
+                    n = len(peaks)
+                    if n == 0:
+                        continue
+                    flat_buffer[cursor:cursor+n, 0] = ix
+                    flat_buffer[cursor:cursor+n, 1] = iy
+                    flat_buffer[cursor:cursor+n, COL_KX] = peaks[:, 1] * kx_scale + kx_offset
+                    flat_buffer[cursor:cursor+n, COL_KY] = peaks[:, 0] * ky_scale + ky_offset
+                    flat_buffer[cursor:cursor+n, COL_TIME] = float(t)
+                    flat_buffer[cursor:cursor+n, COL_INTENSITY] = peaks[:, 2]
+                    cursor += n
 
-    # ── Shared memory handle ──────────────────────────────────────────────────
-    shm_handle = None
-    if shm_name is not None:
-        from multiprocessing import shared_memory as _shm_mod
-        try:
-            shm_handle = _shm_mod.SharedMemory(name=shm_name, create=False)
-            shm_buf = np.ndarray(nav_2d_shape, dtype=np.float32, buffer=shm_handle.buf)
-        except Exception:
-            shm_handle = None
-            shm_buf = None
-    else:
-        shm_buf = None
-
-    peaks_by_pos = [None] * n_patterns
-    count_map = np.zeros(nav_2d_shape, dtype=np.int32)
-
-    def _write_chunk_results(y0, y1, x0, x1, count_2d, peaks_list):
-        """Unpack one chunk's results into count_map and peaks_by_pos."""
-        cy, cx = count_2d.shape
-        raster_idx = 0
-        for ly in range(cy):
-            for lx in range(cx):
-                iy, ix = y0 + ly, x0 + lx
-                peaks = peaks_list[raster_idx]
-                raster_idx += 1
-                flat_idx = iy * n_nav_x + ix
-                peaks_by_pos[flat_idx] = peaks
-                count_map[iy, ix] = len(peaks)
-        nav_2d_slices = (slice(y0, y1), slice(x0, x1))
-        if shm_buf is not None:
+    # ── Live shm / progress callback ──────────────────────────────────────────
+    if shm_name is not None or on_chunk_done is not None:
+        count_map = np.zeros(nav_2d_shape, dtype=np.int32)
+        if nav_dim == 2:
+            for iy in range(n_nav_y):
+                for ix in range(n_nav_x):
+                    count_map[iy, ix] = _count_valid(result_padded[iy, ix])
+        else:
+            for iy in range(n_nav_y):
+                for ix in range(n_nav_x):
+                    count_map[iy, ix] = sum(
+                        _count_valid(result_padded[t, iy, ix])
+                        for t in range(leading_size)
+                    )
+        if shm_name is not None:
+            from multiprocessing import shared_memory as _shm_mod
             try:
-                shm_buf[nav_2d_slices] = count_map[nav_2d_slices].astype(np.float32)
+                shm_handle = _shm_mod.SharedMemory(name=shm_name, create=False)
+                shm_buf = np.ndarray(nav_2d_shape, dtype=np.float32, buffer=shm_handle.buf)
+                shm_buf[:] = count_map.astype(np.float32)
+                shm_handle.close()
             except Exception:
                 pass
         if on_chunk_done is not None:
-            try:
-                on_chunk_done(nav_2d_slices, count_map[nav_2d_slices].copy())
-            except Exception:
-                pass
+            on_chunk_done((slice(None), slice(None)), count_map)
 
-    # ── Path A: numpy — run peak-finding in this thread ───────────────────────
-    if _is_numpy:
-        for combo in chunk_combos:
-            if stopped_flag is not None and stopped_flag[0]:
-                break
-            if nav_dim == 2:
-                (y0, y1), (x0, x1) = combo
-                py0 = max(0, y0 - depth_px); py1 = min(n_nav_y, y1 + depth_px)
-                px0 = max(0, x0 - depth_px); px1 = min(n_nav_x, x1 + depth_px)
-                chunk_raw = numpy_data[py0:py1, px0:px1]
-            else:
-                t, (y0, y1), (x0, x1) = combo
-                py0 = max(0, y0 - depth_px); py1 = min(n_nav_y, y1 + depth_px)
-                px0 = max(0, x0 - depth_px); px1 = min(n_nav_x, x1 + depth_px)
-                chunk_raw = numpy_data[t, py0:py1, px0:px1]
-
-            chunk_blurred = gaussian_filter(chunk_raw.astype(np.float32), sigma=sigma_tuple)
-            vy0 = y0 - py0; vy1 = vy0 + (y1 - y0)
-            vx0 = x0 - px0; vx1 = vx0 + (x1 - x0)
-            chunk_valid = chunk_blurred[vy0:vy1, vx0:vx1]
-            cy, cx = chunk_valid.shape[:2]
-
-            count_2d = np.zeros((cy, cx), dtype=np.int32)
-            peaks_list = []
-            for ly in range(cy):
-                for lx in range(cx):
-                    _, _, peaks = _find_vectors_single_frame(
-                        chunk_valid[ly, lx].astype(np.float32),
-                        kernel_r, threshold, min_dist,
-                        subpixel=subpixel, beamstop_mask=beamstop_mask,
-                        _disk_fft=disk_fft, _disk_stats=disk_stats,
-                    )
-                    count_2d[ly, lx] = len(peaks)
-                    peaks_list.append(peaks)
-
-            _write_chunk_results(y0, y1, x0, x1, count_2d, peaks_list)
-
-    # ── Path B: lazy dask or distributed Future — submit to worker ────────────
-    else:
-        # Get the distributed client from main_window
-        client = getattr(main_window, 'dask_manager', None)
-        client = getattr(client, 'client', None) if client else None
-
-        # Convert dask array or Future to a single Future on the worker.
-        # For a dask.array, client.compute() submits the graph and returns a
-        # Future pointing to the result ON the worker — no data comes back yet.
-        # For an already-computed Future, just use it directly.
-        if _is_dask:
-            data_future = client.compute(raw.astype(np.float32))
-        else:
-            data_future = raw  # already a Future on a worker
-
-        # Submit each chunk as a separate task to the worker that holds data_future.
-        # dask.distributed routes client.submit(fn, future, ...) to the worker
-        # holding `future`, so the slice is purely local — zero TCP for bulk data.
-        # Only the small result (count_2d + peaks_list, ~170KB per chunk) returns.
-        # Map future -> (y0,y1,x0,x1) for O(1) lookup in the completion loop
-        fut_to_coords = {}
-        for combo in chunk_combos:
-            if nav_dim == 2:
-                (y0, y1), (x0, x1) = combo
-            else:
-                _, (y0, y1), (x0, x1) = combo  # ignore t for now (4D path)
-            fut = client.submit(
-                _worker_find_vectors_chunk,
-                data_future,
-                y0, y1, x0, x1,
-                depth_px, n_nav_y, n_nav_x,
-                sigma_tuple, kernel_r, threshold, min_dist, subpixel,
-                beamstop_mask,
-                pure=False,
-            )
-            fut_to_coords[fut] = (y0, y1, x0, x1)
-
-        # Collect results as they complete — live shm updates happen here
-        from dask.distributed import as_completed as _as_completed
-        for fut in _as_completed(list(fut_to_coords)):
-            if stopped_flag is not None and stopped_flag[0]:
-                break
-            y0, y1, x0, x1 = fut_to_coords[fut]
-            count_2d, peaks_list = fut.result()
-            _write_chunk_results(y0, y1, x0, x1, count_2d, peaks_list)
-
-    if shm_handle is not None:
-        try:
-            shm_handle.close()
-        except Exception:
-            pass
-
-    # ── Pack into CSR flat buffer ─────────────────────────────────────────────
-    counts_flat = count_map.reshape(-1).astype(np.int64)
-    offsets = np.zeros(n_patterns + 1, dtype=np.int64)
-    np.cumsum(counts_flat, out=offsets[1:])
-    N_total = int(offsets[-1])
-    flat_buffer = np.zeros((N_total, 5), dtype=np.float32)
-
-    if N_total > 0:
-        # Concatenate all peak arrays in raster order and compute nav coords
-        # for the whole buffer in one vectorised pass — O(N_total) numpy ops,
-        # no Python loop over nav positions.
-        all_peaks = []
-        nav_x_col = np.empty(N_total, dtype=np.float32)
-        nav_y_col = np.empty(N_total, dtype=np.float32)
-        for flat_idx in range(n_patterns):
-            peaks = peaks_by_pos[flat_idx]
-            if peaks is None or len(peaks) == 0:
-                continue
-            s, e = offsets[flat_idx], offsets[flat_idx + 1]
-            if e <= s:
-                continue
-            iy, ix = divmod(flat_idx, n_nav_x)
-            nav_x_col[s:e] = ix
-            nav_y_col[s:e] = iy
-            all_peaks.append((s, e, peaks))
-
-        # Bulk-write peak data for each run — still a loop but only over
-        # non-empty positions and purely numpy slices inside.
-        for s, e, peaks in all_peaks:
-            flat_buffer[s:e, 2] = peaks[:, 1] * kx_scale + kx_offset  # kx_data
-            flat_buffer[s:e, 3] = peaks[:, 0] * ky_scale + ky_offset  # ky_data
-            flat_buffer[s:e, 4] = peaks[:, 2]                          # intensity
-
-        flat_buffer[:, 0] = nav_x_col
-        flat_buffer[:, 1] = nav_y_col
-
-    return SpyDEDiffractionVectors(
+    return SpyDEDiffractionVectors.from_arrays(
         flat_buffer=flat_buffer,
-        offsets=offsets,
-        nav_shape=nav_2d_shape,
         full_nav_shape=nav_shape_full,
         sig_shape=sig_shape,
         sig_axes=sig_ax,
@@ -938,6 +1467,133 @@ def _update_scatter(circ_item, plus_item, vecs, iy: int, ix: int, r_base: float)
     spots_p = [{"pos": s["pos"]} for s in spots_c]
     circ_item.setData(spots_c)
     plus_item.setData(spots_p)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Live Virtual Vector Imaging caret
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _add_vvi_caret(vecs, new_tree, nav_plot, sig_ax_ref):
+    """
+    Install a live virtual-image caret on the signal plot of `new_tree`.
+
+    Places two concentric CircleROIs (outer=blue, inner=cyan) on the signal
+    (diffraction) plot.  On every drag, recomputes the virtual image using
+    the GPU (virtual_image_from_roi_gpu) when available, otherwise falls back
+    to the direct numpy path.  For 5D datasets uses nav_offsets[0] to isolate
+    the current time frame in O(1) before the distance test.
+
+    The result is a live HAADF/BF-style virtual image that updates at
+    ~5-20 ms per drag event for typical datasets.
+    """
+    from pyqtgraph import CircleROI, mkPen
+    from PySide6 import QtCore as _QC
+
+    if not new_tree.signal_plots:
+        return
+    sig_plot = new_tree.signal_plots[0]
+
+    # ── Initial ROI geometry ─────────────────────────────────────────────────
+    # Place outer ROI at 3× kernel radius, inner at 0 (filled disk by default)
+    r_outer_data = vecs.kernel_radius_data * 3.0
+    r_inner_data = 0.0
+
+    # Centre in signal data coords
+    if sig_ax_ref is not None:
+        cx0 = float(sig_ax_ref[0].offset + sig_ax_ref[0].scale * sig_ax_ref[0].size / 2)
+        cy0 = float(sig_ax_ref[1].offset + sig_ax_ref[1].scale * sig_ax_ref[1].size / 2)
+    else:
+        cx0 = cy0 = 0.0
+
+    def _make_circle_roi(cx, cy, r, pen):
+        return CircleROI(
+            pos=(cx - r, cy - r),
+            size=(2 * r, 2 * r),
+            pen=pen,
+            removable=False,
+        )
+
+    roi_outer = _make_circle_roi(cx0, cy0, r_outer_data, mkPen("c", width=2))
+    roi_inner = _make_circle_roi(cx0, cy0, r_inner_data + 1e-6, mkPen("y", width=1.5))
+    roi_inner.setVisible(False)  # hidden until user explicitly enables annulus
+
+    sig_plot.addItem(roi_outer)
+    sig_plot.addItem(roi_inner)
+
+    # Keep latest levels for consistent display during drag
+    _levels = [None]
+    _inner_active = [False]
+
+    # ── Update function ──────────────────────────────────────────────────────
+    def _recompute_vvi():
+        # Read ROI centres and radii from data-unit positions
+        def _roi_centre_radius(roi):
+            pos = roi.pos()
+            size = roi.size()
+            cx = float(pos.x() + size.x() / 2)
+            cy = float(pos.y() + size.y() / 2)
+            r = float(size.x() / 2)
+            return cx, cy, r
+
+        cx, cy, r_out = _roi_centre_radius(roi_outer)
+        r_in = 0.0
+        if _inner_active[0] and roi_inner.isVisible():
+            _, _, r_in = _roi_centre_radius(roi_inner)
+            r_in = min(r_in, r_out * 0.99)
+
+        # For 5D datasets read the current time index from the signal tree
+        t_cur = None
+        if vecs.n_time > 0:
+            try:
+                t_cur = int(new_tree.root.axes_manager.indices[0])
+            except Exception:
+                t_cur = None
+
+        # GPU path when available; falls back to CPU automatically
+        img = vecs.virtual_image_from_roi_gpu(cx, cy, r_out, r_in, t=t_cur,
+                                              intensity_weighted=True)
+
+        finite = img[img > 0]
+        if finite.size > 0:
+            hi = float(finite.max())
+            lo = 0.0
+            _levels[0] = (lo, hi if hi > lo else lo + 1)
+
+        lvl = _levels[0] if _levels[0] is not None else (0.0, 1.0)
+        nav_plot.image_item.setImage(img, autoLevels=False, levels=lvl)
+
+    # Throttle: at most one recompute per 30 ms while dragging
+    _timer = _QC.QTimer()
+    _timer.setInterval(30)
+    _timer.setSingleShot(True)
+    _timer.timeout.connect(_recompute_vvi)
+
+    def _schedule():
+        _timer.start()
+
+    roi_outer.sigRegionChanged.connect(_schedule)
+    roi_inner.sigRegionChanged.connect(_schedule)
+
+    # ── Inner ring toggle ────────────────────────────────────────────────────
+    # Double-click outer ROI to toggle the inner exclusion ring
+    def _toggle_inner(ev=None):
+        active = not _inner_active[0]
+        _inner_active[0] = active
+        roi_inner.setVisible(active)
+        _recompute_vvi()
+
+    roi_outer.sigClicked = getattr(roi_outer, "sigClicked", None)
+    try:
+        roi_outer.sigClicked.connect(_toggle_inner)
+    except Exception:
+        pass
+
+    # Initial render
+    _recompute_vvi()
+
+    # Store refs on the tree so they aren't GC'd
+    new_tree._vvi_rois = (roi_outer, roi_inner)
+    new_tree._vvi_timer = _timer
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1423,7 +2079,42 @@ def find_diffraction_vectors(
         )
         compute_btn.setEnabled(True)
 
+        # ── 3. Build KDTree in background, then add live VVI caret ───────────
+        # Upload flat_buffer to GPU (preferred) or fall back to CPU.
+        # Done off the GUI thread; caret is installed once ready.
+        def _build_tree_and_install():
+            gpu_ok = vecs.upload_to_gpu()
+            if not gpu_ok:
+                vecs.build_kdtree()  # CPU fallback for small ROIs
+            _QC.QMetaObject.invokeMethod(
+                relay, "_install_vvi_caret",
+                _QC.Qt.ConnectionType.QueuedConnection,
+            )
+
+        # Store refs needed by the deferred install
+        relay._vvi_vecs = vecs
+        relay._vvi_new_tree = new_tree
+        relay._vvi_nav_plot_ref = nav_plot_ref2
+        relay._vvi_sig_ax = sig_ax_ref
+
+        import threading as _threading
+        _threading.Thread(target=_build_tree_and_install, daemon=True).start()
+
     relay.compute_done.connect(_on_compute_done)
+
+    # ── Live virtual image caret (installed after KDTree is ready) ────────────
+    def _install_vvi_caret():
+        vecs = relay._vvi_vecs
+        new_tree = relay._vvi_new_tree
+        nav_plot = relay._vvi_nav_plot_ref
+        sig_ax_ref = relay._vvi_sig_ax
+        if nav_plot is None or not new_tree.signal_plots:
+            return
+        _add_vvi_caret(vecs, new_tree, nav_plot, sig_ax_ref)
+
+    # Attach as a slot so QMetaObject.invokeMethod can reach it
+    _VectorRelay._install_vvi_caret = _QC.Slot()(_install_vvi_caret)
+    relay._install_vvi_caret = _install_vvi_caret
 
     # ── Show-correlation toggle ───────────────────────────────────────────────
     def _on_show_corr_changed(checked):
@@ -1564,14 +2255,7 @@ def find_diffraction_vectors(
         state["_compute_shm"] = shm  # keep alive
 
         # ── Create result tree immediately ─────────────────────────────────────
-        # Independent copy of the 4D signal (fresh axes_manager, independent cursor)
-        try:
-            raw_data = sig_ref.data
-            if hasattr(raw_data, 'result'):
-                raw_data = raw_data.result()
-            new_sig = sig_ref._deepcopy_with_new_data(raw_data)
-        except Exception:
-            new_sig = sig_ref._deepcopy_with_new_data(sig_ref.data)
+        new_sig = sig_ref._deepcopy_with_new_data(sig_ref.data)
 
         new_sig.metadata.General.title = (
             sig_ref.metadata.get_item("General.title", "Signal") + " — Vectors"

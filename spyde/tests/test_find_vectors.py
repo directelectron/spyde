@@ -42,15 +42,15 @@ def _blurred_frame(shape=(128, 128), peaks=None, sigma=1.5):
 def _make_vecs(nav_shape=(4, 4), n_per_pos=3):
     nav_y, nav_x = nav_shape
     n_nav = nav_y * nav_x
-    counts = np.full(n_nav, n_per_pos, dtype=np.int64)
-    offsets = np.zeros(n_nav + 1, dtype=np.int64)
-    np.cumsum(counts, out=offsets[1:])
-    N = int(offsets[-1])
-    flat = np.random.rand(N, 5).astype(np.float32)
-    return SpyDEDiffractionVectors(
+    N = n_nav * n_per_pos
+    flat = np.random.rand(N, 6).astype(np.float32)
+    # Fill nav coords so _build_nav_offsets works correctly
+    nav_idx = np.repeat(np.arange(n_nav, dtype=np.int64), n_per_pos)
+    flat[:, 0] = (nav_idx % nav_x).astype(np.float32)   # nav_x
+    flat[:, 1] = (nav_idx // nav_x).astype(np.float32)  # nav_y
+    flat[:, 4] = -1.0  # time: 4D
+    return SpyDEDiffractionVectors.from_arrays(
         flat_buffer=flat,
-        offsets=offsets,
-        nav_shape=nav_shape,
         full_nav_shape=nav_shape,
         sig_shape=(128, 128),
         sig_axes=None,
@@ -347,7 +347,7 @@ def test_at_correct_row_count():
     vecs = _make_vecs((3, 3), n_per_pos=4)
     for iy in range(3):
         for ix in range(3):
-            assert vecs.at(iy, ix).shape == (4, 5)
+            assert vecs.at(iy, ix).shape == (4, 6)
 
 
 def test_kxy_at_correct_columns():
@@ -365,14 +365,14 @@ def test_count_map_shape_and_values():
 def test_to_dense_shape_and_cache():
     vecs = _make_vecs((2, 3), n_per_pos=5)
     d1 = vecs.to_dense()
-    assert d1.shape == (2, 3, 5, 5)
+    assert d1.shape == (2, 3, 5, 6)
     d2 = vecs.to_dense()
     assert d1 is d2
 
 
 def test_flatten_full_buffer():
     vecs = _make_vecs((2, 2), n_per_pos=3)
-    assert vecs.flatten().shape == (12, 5)
+    assert vecs.flatten().shape == (12, 6)
 
 
 def test_from_ragged_roundtrip():

@@ -4,6 +4,7 @@ import subprocess
 
 from PySide6 import QtCore
 from PySide6.QtCore import QObject, Signal, Slot
+import psutil
 
 from dask.distributed import Client, LocalCluster
 
@@ -40,22 +41,35 @@ class _DaskClusterWorker(QObject):
     def start(self):
         if self._stopped:
             return
-        try:
-            # Start with 1 worker so the client is usable immediately (~300ms),
-            # then scale to full count in the background while the app loads.
-            cluster = LocalCluster(
-                n_workers=1,
-                threads_per_worker=self.threads_per_worker,
-            )
-            client = Client(cluster)
-            n_gpus = _probe_gpus()
-            gpu_worker_address = "gpu_available" if n_gpus > 0 else None
-            self.finished.emit(cluster, client, gpu_worker_address)
-            # Scale up after the client signal is delivered
-            if self.n_workers > 1:
-                cluster.scale(self.n_workers)
-        except Exception as e:
-            self.error.emit(e)
+        # Pre-calculate per-worker memory based on the *final* worker count.
+        # Without this, LocalCluster(n_workers=1) assigns 100% of RAM to the
+        # first worker; scaled-up workers inherit that same spec, so each one
+        # claims the full system memory instead of 1/n_workers of it.
+        # Reserve ~80 % of RAM (matching Dask's own default headroom) and
+        # divide by the target worker count.
+        total_mem = psutil.virtual_memory().total
+        memory_per_worker = int(total_mem * 0.80) // max(self.n_workers, 1)
+        logger.info(
+            "Dask memory per worker: %.1f GB (total=%.1f GB, workers=%d)",
+            memory_per_worker / 1024**3,
+            total_mem / 1024**3,
+            self.n_workers,
+        )
+
+        # Start with 1 worker so the client is usable immediately (~300ms),
+        # then scale to full count in the background while the app loads.
+        cluster = LocalCluster(
+            n_workers=1,
+            threads_per_worker=self.threads_per_worker,
+            memory_limit=memory_per_worker,
+        )
+        client = Client(cluster)
+        n_gpus = _probe_gpus()
+        gpu_worker_address = "gpu_available" if n_gpus > 0 else None
+        self.finished.emit(cluster, client, gpu_worker_address)
+        # Scale up after the client signal is delivered
+        if self.n_workers > 1:
+            cluster.scale(self.n_workers)
 
     @Slot()
     def stop(self):

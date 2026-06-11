@@ -50,7 +50,7 @@ class TestFindVectorsAlgorithm:
 
         assert isinstance(vecs, SpyDEDiffractionVectors)
         assert vecs.nav_shape == (4, 4)
-        assert vecs.flat_buffer.shape[1] == 5
+        assert vecs.flat_buffer.shape[1] == 6
 
     def test_peaks_found_at_known_positions(self, stem_4d_dataset):
         """Both bright spots (centre disk + corner spot) are detected in pixel coords."""
