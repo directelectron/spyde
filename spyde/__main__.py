@@ -700,28 +700,37 @@ class MainWindow(QMainWindow):
                 kwargs.pop("navigation_shape")
                 kwargs.pop("chunks")
             print("Loading signal from file:", file_path, "with kwargs:", kwargs)
-            # tifffile-backed lazy arrays embed an open BufferedReader that
-            # cannot be pickled by Dask's distributed scheduler.  Load the
-            # TIFF eagerly and then convert to a serializable dask array via
-            # as_lazy(), which calls da.from_array on the in-memory numpy data.
-            is_tiff = file_path.lower().endswith((".tif", ".tiff"))
-            if is_tiff:
-                tiff_kwargs = {k: v for k, v in kwargs.items() if k != "lazy"}
-                signal = hs.load(file_path, lazy=False, **tiff_kwargs)
-                signal = signal.as_lazy()
-            else:
-                signal = hs.load(file_path, **kwargs)
-            # fix MRC loading in rsciio.
-            if (signal.axes_manager.signal_dimension + signal.axes_manager.navigation_dimension) == 2:
-                signal = signal.transpose(2)
-            if kwargs.get("lazy", False) or is_tiff:
-                if signal.axes_manager.navigation_dimension == 1:
-                    signal.cache_pad = 3
-                elif signal.axes_manager.navigation_dimension == 2:
-                    signal.cache_pad = 2
-            print("Signal loaded:", signal)
-            print("Signal shape:", signal.data.shape)
-            print("Signal Chunks:", signal.data.chunks)
+            import os as _os
+            self.statusBar().showMessage(
+                f"Loading {_os.path.basename(file_path)}…")
+            QApplication.setOverrideCursor(Qt.CursorShape.BusyCursor)
+            try:
+                # tifffile-backed lazy arrays embed an open BufferedReader that
+                # cannot be pickled by Dask's distributed scheduler.  Load the
+                # TIFF eagerly and then convert to a serializable dask array via
+                # as_lazy(), which calls da.from_array on the in-memory numpy data.
+                is_tiff = file_path.lower().endswith((".tif", ".tiff"))
+                if is_tiff:
+                    tiff_kwargs = {k: v for k, v in kwargs.items() if k != "lazy"}
+                    signal = hs.load(file_path, lazy=False, **tiff_kwargs)
+                    signal = signal.as_lazy()
+                else:
+                    signal = hs.load(file_path, **kwargs)
+                # fix MRC loading in rsciio.
+                if (signal.axes_manager.signal_dimension + signal.axes_manager.navigation_dimension) == 2:
+                    signal = signal.transpose(2)
+                if kwargs.get("lazy", False) or is_tiff:
+                    if signal.axes_manager.navigation_dimension == 1:
+                        signal.cache_pad = 3
+                    elif signal.axes_manager.navigation_dimension == 2:
+                        signal.cache_pad = 2
+                print("Signal loaded:", signal)
+                print("Signal shape:", signal.data.shape)
+                print("Signal Chunks:", signal.data.chunks)
+            finally:
+                # Load done (or failed); drop our wait cursor. add_signal sets
+                # its own around the tree build.
+                QApplication.restoreOverrideCursor()
             self.add_signal(signal)
             try:
                 self._add_to_recent(file_path)
@@ -755,25 +764,27 @@ class MainWindow(QMainWindow):
         """
         print("Creating Signal Tree for signal")
 
-        # If Dask client is not ready, show a waiting message and check until it is
-        if self.dask_manager.client is None:
-            message_box = QtWidgets.QMessageBox(self)
-            message_box.setWindowTitle("Please wait")
-            message_box.setText("Dask client is still initializing. Please wait…")
-            message_box.setStandardButtons(QtWidgets.QMessageBox.StandardButton.NoButton)
-            message_box.setModal(False)
-            message_box.show()
-
-            while self.dask_manager.client is None:
-                QApplication.processEvents()
-            message_box.hide()
-            message_box.close()
-
-
-        signal_tree = BaseSignalTree(
-            root_signal=signal, main_window=self, distributed_client=self.dask_manager.client,
-            selector_type=selector_type, navigator_override=navigator_override,
-        )
+        # Wait for the Dask client if it's still starting — but without the old
+        # modal "Please wait" dialog that made the app feel frozen. A wait
+        # cursor + status message keeps it responsive (events still pump) and
+        # explains the delay. add_signal stays synchronous, which the
+        # programmatic/open paths and tests rely on.
+        QApplication.setOverrideCursor(Qt.CursorShape.BusyCursor)
+        try:
+            if self.dask_manager.client is None:
+                self.statusBar().showMessage(
+                    "Starting compute backend… your data will open shortly.")
+                while self.dask_manager.client is None:
+                    QApplication.processEvents()
+            self.statusBar().showMessage("Opening signal…")
+            signal_tree = BaseSignalTree(
+                root_signal=signal, main_window=self,
+                distributed_client=self.dask_manager.client,
+                selector_type=selector_type, navigator_override=navigator_override,
+            )
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.statusBar().clearMessage()
         self.signal_trees.append(signal_tree)
         print("Signal Tree Created")
         if navigators is not None:
