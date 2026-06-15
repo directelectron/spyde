@@ -160,7 +160,7 @@ class MovieExportDialog(QDialog):
         out_row = QHBoxLayout()
         self.out_label = QLabel("Output: (not selected)")
         out_row.addWidget(self.out_label)
-        self.choose_btn = QPushButton("Choose...")
+        self.choose_btn = QPushButton("Choose…")
         self.choose_btn.clicked.connect(self._choose_output)
         out_row.addWidget(self.choose_btn)
         out_row_widget = QWidget()

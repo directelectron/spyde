@@ -136,10 +136,53 @@ class Plot(PlotItem):
         ]
 
     def set_colormap(self, colormap: str):
-        """Set the colormap for the image item."""
+        """Set the colormap for the image item (re-applies display gamma)."""
         cmap = COLORMAPS.get(colormap, COLORMAPS["gray"])
         self.image_item.setColorMap(cmap)
         self.plot_state.colormap = colormap
+        gamma = getattr(self.plot_state, "gamma", 1.0)
+        if abs(gamma - 1.0) > 1e-3:
+            self.set_gamma(gamma)
+
+    @staticmethod
+    def _robust_levels(img: np.ndarray) -> tuple:
+        """Auto-contrast levels: data min → 99.5th percentile.
+
+        The top 0.5 % of values are treated as outliers (e.g. the direct
+        beam in a diffraction pattern) so a handful of hot pixels doesn't
+        compress everything else to black.
+        """
+        try:
+            sy = max(1, img.shape[0] // 512)
+            sx = max(1, img.shape[1] // 512)
+            data = np.asarray(img[::sy, ::sx], dtype=np.float64)
+            data = data[np.isfinite(data)]
+            if data.size == 0:
+                return 0.0, 1.0
+            mn = float(data.min())
+            mx = float(np.percentile(data, 99.5))
+            if mx <= mn:
+                mx = float(data.max())
+            if mx <= mn:
+                mx = mn + 1.0
+            return mn, mx
+        except Exception:
+            return 0.0, 1.0
+
+    def set_gamma(self, gamma: float):
+        """Apply display gamma by warping the colormap's lookup table."""
+        gamma = float(min(max(float(gamma), 0.05), 20.0))
+        self.plot_state.gamma = gamma
+        cmap = COLORMAPS.get(
+            getattr(self.plot_state, "colormap", "gray"), COLORMAPS["gray"]
+        )
+        lut = cmap.getLookupTable(nPts=256)
+        if abs(gamma - 1.0) > 1e-3:
+            idx = np.clip(
+                (np.linspace(0.0, 1.0, 256) ** gamma) * 255.0, 0, 255
+            ).astype(np.intp)
+            lut = lut[idx]
+        self.image_item.setLookupTable(lut)
 
     def enable_scale_bar(self, enabled: bool = True):
         """Enable or disable an auto-updating horizontal scale bar."""
@@ -713,11 +756,11 @@ class Plot(PlotItem):
             elapsed = time.perf_counter() - start_time
             print(f"setImage took {elapsed * 1000:.2f}ms")
             if self.needs_auto_level and img is not None:
-                mn, mx = self.image_item.quickMinMax()
+                mn, mx = self._robust_levels(img)
                 self.image_item.setLevels((mn, mx))
                 self.plot_state.max_level = mx
                 self.plot_state.min_level = mn
-                self.plot_state.max_percentile = 100.0
+                self.plot_state.max_percentile = 99.5
                 self.plot_state.min_percentile = 0.0
                 self.needs_auto_level = False
             if self._needs_hide_updating_text and self._updating_text is not None:

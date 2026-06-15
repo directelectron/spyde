@@ -1,10 +1,13 @@
 from typing import Optional, Dict, Any, List
 from PySide6 import QtWidgets, QtGui, QtCore
 
+from spyde.qt.style import SmoothButton
 
-class RoundedButton(QtWidgets.QPushButton):
+
+class RoundedButton(SmoothButton):
     """
-    Minimal styled push button with optional icon and text.
+    Minimal styled push button with optional icon and text — borderless
+    dark fill, painted with antialiased rounded corners by SmoothButton.
     """
 
     def __init__(
@@ -14,36 +17,25 @@ class RoundedButton(QtWidgets.QPushButton):
         tooltip: Optional[str] = None,
         parent: Optional[QtWidgets.QWidget] = None,
     ):
-        super().__init__(parent)
+        super().__init__(
+            text or "",
+            parent,
+            fill="rgba(30,30,30,230)",
+            fill_hover="rgba(40,40,40,230)",
+            fill_pressed="rgba(50,50,50,230)",
+            border=None,
+            font_px=None,  # keep the app font (matches the old QSS look)
+            margin=2,
+        )
 
         self.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
         self.setIconSize(QtCore.QSize(18, 18))
         self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
 
-        if text:
-            self.setText(text)
         if icon_path:
             self.setIcon(QtGui.QIcon(icon_path))
         if tooltip:
             self.setToolTip(tooltip)
-
-        # Consistent hover/pressed background for push buttons
-        self.setStyleSheet(
-            "QPushButton {"
-            "  border: none;"
-            "  background-color: rgba(30, 30, 30, 230);"
-            "  color: #ffffff;"
-            "  margin: 2px;"
-            "  padding: 4px 8px;"
-            "  border-radius: 6px;"
-            "}"
-            "QPushButton:hover {"
-            "  background-color: rgba(40, 40, 40, 230);"
-            "}"
-            "QPushButton:pressed {"
-            "  background-color: rgba(50, 50, 50, 230);"
-            "}"
-        )
 
 
 class ButtonTree(QtWidgets.QWidget):

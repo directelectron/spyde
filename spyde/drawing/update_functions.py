@@ -110,6 +110,27 @@ def update_from_navigation_selection(
     if not selector.is_integrating:
         indices = np.mean(indices, axis=0).astype(int)
 
+    # Clamp nav indices to the data's leading-axis sizes. The signal behind a
+    # plot can change (e.g. set_signal_type, or swapping current_signal) while a
+    # selector still holds positions from the previous, larger nav grid — the
+    # subsequent data[...] index would raise IndexError. Clamping keeps the
+    # display valid until the selector catches up to the new shape.
+    try:
+        data_shape = current_signal.data.shape
+        idx_arr = np.asarray(indices)
+        if idx_arr.size and len(data_shape):
+            # Last axis holds the per-point coordinates (one per leading data
+            # axis); clamp each coordinate to its axis size.
+            ncoord = idx_arr.shape[-1] if idx_arr.ndim else 1
+            limits = np.array(
+                [data_shape[i] - 1 for i in range(min(ncoord, len(data_shape)))],
+                dtype=idx_arr.dtype,
+            )
+            if limits.size == ncoord:
+                indices = np.clip(idx_arr, 0, limits)
+    except Exception:
+        pass
+
     if current_signal._lazy:
         if isinstance(current_signal.data[0], Future):
             current_img = np.ones(current_signal.axes_manager.signal_shape, dtype=np.int8)
@@ -150,8 +171,7 @@ def update_from_navigation_selection(
                 child._pending_shm_future = fut
                 current_img = fut
     else:
-
-        tuple_inds = tuple([indices[ind] for ind in np.arange(len(indices))])
+        tuple_inds = tuple(indices[ind] for ind in np.arange(len(indices)))
         if len(tuple_inds) == 1:
             current_img = current_signal.data[tuple_inds]
         else:

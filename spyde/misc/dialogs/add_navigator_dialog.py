@@ -33,7 +33,7 @@ class AddNavigator(QDialog):
 
         layout = QVBoxLayout(self)
 
-        self.load_btn = QPushButton("Load from file", self)
+        self.load_btn = QPushButton("Load from File", self)
         self.select_btn = QPushButton("Select Signal", self)
 
         layout.addWidget(self.load_btn)

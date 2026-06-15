@@ -324,6 +324,9 @@ class CreateDataDialog(QDialog):
                     size, chunks=("auto", "auto", -1, -1), dtype=dtype
                 )
                 s = self._wrap_lazy_signal2d(data)
+                # 4D STEM is diffraction data: type it so diffraction-gated
+                # actions (Virtual Imaging, Orientation Mapping) are offered
+                s.set_signal_type("electron_diffraction")
                 navigator_1 = hs.signals.Signal2D(
                     np.random.random(s.axes_manager.navigation_shape)
                 )  # random navigator data
@@ -364,4 +367,8 @@ class CreateDataDialog(QDialog):
         )
         size = tuple(s for s in size if s > 1)
         data = self._rand_array(size, chunks=self._auto_chunks(len(size)), dtype=dtype)
-        return self._wrap_lazy_signal2d(data), None
+        s = self._wrap_lazy_signal2d(data)
+        if len(size) >= 4:
+            # 4D/5D STEM stacks are diffraction data (see 4D STEM tab)
+            s.set_signal_type("electron_diffraction")
+        return s, None

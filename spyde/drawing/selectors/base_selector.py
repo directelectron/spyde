@@ -281,17 +281,16 @@ class IntegratingSelectorMixin:
         self.layout = QtWidgets.QHBoxLayout()
         self.widget = QtWidgets.QWidget()
 
-        self.integrate_button = QtWidgets.QPushButton("Integrate")
+        # Shared theme: checked = orange accent (active/armed) with
+        # hover/pressed feedback, painted with antialiased corners.
+        from spyde.qt.style import make_button
+        self.integrate_button = make_button("Integrate")
         self.integrate_button.setCheckable(True)
-        self.live_button = QtWidgets.QPushButton("Live")
+        self.live_button = make_button("Live")
         self.live_button.setCheckable(True)
         self.live_button.setChecked(True)
         self.live_button.toggled.connect(self.on_live_toggled)
         self.layout.addWidget(self.live_button)
-        # Turn buttons red while pressed
-        _red_btn_style = "QPushButton:checked { background-color: red; }"
-        self.live_button.setStyleSheet(_red_btn_style)
-        self.integrate_button.setStyleSheet(_red_btn_style)
 
         self.integrate_button.setChecked(False)
         self.integrate_button.update()

@@ -31,11 +31,12 @@ class ControlDockWidget(QDockWidget):
         self.setMinimumHeight(150)
         self.setVisible(False)
         self.setContentsMargins(5, 5, 5, 5)
+        # Dark theme (was a light-theme leftover: #f0f0f0 in a #141414 app)
         self.setStyleSheet(
             """
             QDockWidget {
-                background-color: #f0f0f0;
-                border: 1px solid #ccc;
+                background-color: #141414;
+                border: 1px solid rgba(255,255,255,40);
             }
             """
         )

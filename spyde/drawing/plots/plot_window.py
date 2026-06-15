@@ -106,6 +106,14 @@ class PlotWindow(FramelessSubWindow):
         self._commit_connection = None  # type: QtCore.QMetaObject.Connection | None
         self.owner_plot_window = None  # type: "PlotWindow | None"
         self.controlling_action = None  # type: QtGui.QAction | None
+        # Action-owned windows (IPF, VI previews, …) set this to intercept the
+        # title-bar X: QMdiSubWindow.closeEvent would close the inner container
+        # widget, leaving a bare title bar if the action later re-shows the
+        # window. The callable hides/untoggles instead of destroying.
+        self.on_close_request = None  # type: callable | None
+        # Optional gate consulted by MDIManager._update_3state_visibility:
+        # when set, the window is only auto-shown if it returns True.
+        self.visibility_gate = None  # type: callable | None
 
         # Debounce toolbar repositioning: coalesce rapid moveEvent/resizeEvent
         # calls (every pixel of drag) into a single reposition at the end.
@@ -130,6 +138,20 @@ class PlotWindow(FramelessSubWindow):
     def set_stop_fn(self, fn: callable) -> None:
         """Wire a stop/cancel function and show the title-bar Stop button."""
         btn = self.title_bar.stop_button
+        try:
+            btn.clicked.disconnect()
+        except Exception:
+            pass
+        btn.clicked.connect(fn)
+        btn.show()
+
+    def set_compute_fn(self, fn: callable) -> None:
+        """Wire a compute function and show the title-bar Compute button.
+
+        Sits beside Commit so actions can offer compute-on-demand from the
+        plot itself rather than from their caret popout.
+        """
+        btn = self.title_bar.compute_button
         try:
             btn.clicked.disconnect()
         except Exception:
@@ -571,29 +593,29 @@ class PlotWindow(FramelessSubWindow):
 
     def close_window(self):
         """Close the plot window and clean up toolbars and selectors."""
+        # Mark as torn down so action bindings never re-show this shell
+        # (QMdiSubWindow close hides the inner container; re-showing the
+        # subwindow afterwards would display only the title bar).
+        self._spyde_closed = True
         for plot in self.plots:
             plot.close_plot()
 
-        # if part of a nav plot manager close everything below it in the plot_windows tree
-        if self.multiplot_manager is not None:
-            logger.info(
-                "Closing all plots in the multiplot manager... This closes associated Signal + Navigation"
-                "plots all at once..."
-            )
-            print(self.multiplot_manager.plot_windows)
-            level, children = self.multiplot_manager.get_plot_window_level(
+        # Tree-level teardown is owned by the MDIManager: closing a navigator
+        # (level-1 window) tears down the WHOLE tree — every signal/preview
+        # window, toolbars, selectors — via close_signal_tree. Action-spawned
+        # previews (VI, IPF, vector-OM maps) all carry .signal_tree so they are
+        # included; the old level==1 path missed them. The _spyde_tree_teardown
+        # guard prevents infinite recursion when close_signal_tree calls us back.
+        if (self.multiplot_manager is not None
+                and not getattr(self, "_spyde_tree_teardown", False)):
+            level, _children = self.multiplot_manager.get_plot_window_level(
                 plot_window=self
             )
-            # close all plots in the children recursively
-            print("closing the children:", children, "level:", level)
-            print("current plot windows:", self)
-
-            for child in children:
-                child.close()
-            if level == 1:  # close out thi signal as well...
-                self.main_window.signal_trees.remove(self.signal_tree)
-                self.signal_tree.close()
-            logger.info("Removed signal tree from main window.")
+            if level == 1 and self.signal_tree is not None:
+                mdi = getattr(self.main_window, "mdi_manager", None)
+                if mdi is not None:
+                    mdi.close_signal_tree(self.signal_tree)
+                    return  # the manager closed us (and everything else)
 
         logger.info("Closing parent selector if exists")
         if self.parent_selector is not None:
@@ -616,5 +638,9 @@ class PlotWindow(FramelessSubWindow):
                 pass
 
     def closeEvent(self, ev: QtGui.QCloseEvent) -> None:
+        if callable(self.on_close_request):
+            ev.ignore()
+            self.on_close_request()
+            return
         self.close_window()
         super().closeEvent(ev)

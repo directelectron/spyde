@@ -249,6 +249,30 @@ class PlotState:
                 tb.close()
                 setattr(self, attr, None)
 
+    def rebuild_toolbars(self) -> None:
+        """
+        Tear down and rebuild the side toolbars from TOOLBAR_ACTIONS.
+
+        Needed when the action filter inputs change after construction —
+        e.g. ``set_signal_type`` retypes ``current_signal``, which can add
+        or remove signal-class-gated actions (Virtual Imaging, Orientation
+        Mapping). Action state held in the old toolbars (carets, ROIs) is
+        discarded.
+        """
+        was_visible = any(
+            tb is not None and tb.isVisible()
+            for tb in (
+                self.toolbar_right,
+                self.toolbar_left,
+                self.toolbar_top,
+                self.toolbar_bottom,
+            )
+        )
+        self.close()
+        self._initialize_toolbars()
+        if was_visible:
+            self.show_toolbars()
+
 
 class MultiImageManager:
     """The MultiImageManager manages multiple images within a single plotting context.

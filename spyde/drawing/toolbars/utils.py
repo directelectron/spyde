@@ -14,14 +14,27 @@ def _opposite_side(side: str) -> str:
 def _bind_action_to_plot_item(
         action: Optional[QtGui.QAction], item: Union[QtWidgets.QGraphicsItem, QtWidgets.QWidget]
 ) -> None:
-    """Bind action toggle/trigger to plot item visibility."""
+    """Bind action toggle/trigger to plot item visibility.
+
+    Items/windows that have been torn down (PlotWindow.close_window sets
+    ``_spyde_closed``) must never be re-shown: a closed QMdiSubWindow keeps a
+    live shell whose inner container is hidden, so setVisible(True) would
+    display only the title bar.
+    """
     if action is None:
         return
 
+    def _set_visible(it, visible: bool) -> None:
+        if getattr(it, "_spyde_closed", False):
+            return
+        it.setVisible(visible)
+
     if action.isCheckable():
-        action.toggled.connect(lambda checked, it=item: it.setVisible(checked))
+        action.toggled.connect(lambda checked, it=item: _set_visible(it, checked))
     else:
-        action.triggered.connect(lambda _, it=item: it.setVisible(not it.isVisible()))
+        action.triggered.connect(
+            lambda _, it=item: _set_visible(it, not it.isVisible())
+        )
 
 
 def _set_initial_item_visibility(
@@ -41,7 +54,7 @@ def _sync_plot_items_visibility(
     """Sync plot items visibility with action state."""
     for item in data.get("plot_items", {}).values():
         try:
-            if action and action.isCheckable():
+            if action and action.isCheckable() and not getattr(item, "_spyde_closed", False):
                 item.setVisible(action.isChecked())
         except Exception:
             pass

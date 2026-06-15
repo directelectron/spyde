@@ -3,6 +3,8 @@ from typing import Optional, Callable
 from PySide6 import QtWidgets, QtCore, QtGui
 from PySide6.QtGui import Qt
 
+from spyde.qt.style import ACCENT_SOFT
+
 from typing import TYPE_CHECKING
 while TYPE_CHECKING:
     from spyde.drawing.plots.plot import Plot
@@ -117,12 +119,11 @@ class StylizedToolBar(QtWidgets.QToolBar):
             "QToolButton:pressed {"
             "  background-color: rgba(255, 255, 255, 64);"
             "}"
-            "QToolButton:checked {"
-            "  background-color: rgba(255, 255, 255, 40);"
-            "}"
-            "QAction:checked {"
-            "  background-color: rgba(255, 255, 255, 40);"
-            "}"
+            # checked = soft orange accent so an active tool reads as active
+            # (plain white would be indistinguishable from hover)
+            f"QToolButton:checked {{"
+            f"  background-color: {ACCENT_SOFT};"
+            f"}}"
         )
         self.setMovable(moveable)
 

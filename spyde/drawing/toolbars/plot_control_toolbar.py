@@ -32,6 +32,20 @@ def resolve_icon_path(icon_value: str) -> str:
     return str((base / icon_value).resolve())
 
 
+_SIGNAL_CLASS_CACHE: dict[str, type] = {}
+
+
+def _resolve_signal_class(path: str) -> type:
+    """Import and cache a signal class from a dotted path (e.g.
+    ``pyxem.signals.Diffraction2D``)."""
+    cls = _SIGNAL_CLASS_CACHE.get(path)
+    if cls is None:
+        module_path, _, attr = path.rpartition(".")
+        cls = getattr(importlib.import_module(module_path), attr)
+        _SIGNAL_CLASS_CACHE[path] = cls
+    return cls
+
+
 def get_toolbar_actions_for_plot(
     plot_state: "PlotState",
 ) -> tuple[
@@ -63,14 +77,41 @@ def get_toolbar_actions_for_plot(
 
     for action, meta in TOOLBAR_ACTIONS["functions"].items():
         signal_types = meta.get("signal_types")
+        exclude_signal_types = meta.get("exclude_signal_types")
+        signal_class = meta.get("signal_class")
+        requires_vectors = meta.get("requires_vectors", False)
         plot_dim = meta.get("plot_dim", [1, 2])
         navigation_only = meta.get("navigation")
         params = meta.get("parameters", {})
 
-        plot_signal_type = plot_state.current_signal._signal_type
+        signal = plot_state.current_signal
+        plot_signal_type = signal._signal_type
+
+        # requires_vectors: action only shows once the plot's signal tree has
+        # diffraction_vectors attached (set after Find Vectors completes).
+        # PlotState.rebuild_toolbars() re-runs this filter at that point.
+        tree = getattr(plot_state.plot, "signal_tree", None)
+        has_vectors = getattr(tree, "diffraction_vectors", None) is not None
 
         add_action = (
             (signal_types is None or plot_signal_type in signal_types)
+            # exclude_signal_types: keep an action OFF a signal_type even though
+            # it would match signal_class by isinstance. Matched on the
+            # _signal_type STRING so it covers lazy+eager variants uniformly
+            # (LazyDiffractionVectorsImage is NOT a subclass of the eager one,
+            # but both share the signal_type) — the dense diffraction actions
+            # use this to stay off the vectors-result image.
+            and (
+                exclude_signal_types is None
+                or plot_signal_type not in exclude_signal_types
+            )
+            # signal_class gates by isinstance, so subclasses qualify too
+            # (e.g. ElectronDiffraction2D passes a Diffraction2D gate)
+            and (
+                signal_class is None
+                or isinstance(signal, _resolve_signal_class(signal_class))
+            )
+            and (not requires_vectors or has_vectors)
             and (plot_state.dimensions in plot_dim)
             and (
                 navigation_only is None

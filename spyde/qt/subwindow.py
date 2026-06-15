@@ -2,6 +2,10 @@ from PySide6 import QtCore, QtWidgets
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QCursor, QIcon
 from spyde.drawing.toolbars.plot_control_toolbar import resolve_icon_path
+from spyde.qt.style import (
+    RADIUS, GOOD, GOOD_HOVER, DANGER, DANGER_HOVER, ACCENT, ACCENT_BORDER,
+    SmoothButton,
+)
 
 # New imports for painting/tinting
 from PySide6 import QtGui
@@ -35,7 +39,7 @@ class FramelessSubWindow(QtWidgets.QMdiSubWindow):
             "QPushButton {"
             "  background-color: transparent;"
             "  border: none;"
-            "  border-radius: 4px;"
+            f"  border-radius: {RADIUS};"
             "}"
             "QPushButton:hover {"
             "  background-color: rgba(255,255,255,18);"
@@ -57,27 +61,39 @@ class FramelessSubWindow(QtWidgets.QMdiSubWindow):
         self._status_placeholder.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.title_bar_layout.addWidget(self._status_placeholder)
 
-        self.title_bar.commit_button = QtWidgets.QPushButton("Commit", self.title_bar)
-        self.title_bar.commit_button.setFixedHeight(18)
-        self.title_bar.commit_button.setStyleSheet(
-            "QPushButton { color: white; background-color: rgba(80,160,80,180); "
-            "border: 1px solid rgba(255,255,255,60); border-radius: 8px; padding: 0 4px; "
-            "font-size: 11px; }"
-            "QPushButton:disabled { background-color: rgba(80,80,80,120); color: rgba(255,255,255,80); }"
-            "QPushButton:hover { background-color: rgba(100,200,100,200); }"
+        self.title_bar.compute_button = SmoothButton(
+            "Compute", self.title_bar,
+            fill=ACCENT, fill_hover=ACCENT_BORDER, fill_pressed=ACCENT_BORDER,
+            fill_disabled="rgba(80,80,80,120)",
+            border="rgba(255,255,255,60)",
+            text_disabled="rgba(255,255,255,80)",
+            font_px=11,
         )
+        self.title_bar.compute_button.setFixedHeight(18)
+        self.title_bar.compute_button.hide()
+        self.title_bar_layout.addWidget(self.title_bar.compute_button)
+
+        self.title_bar.commit_button = SmoothButton(
+            "Commit", self.title_bar,
+            fill=GOOD, fill_hover=GOOD_HOVER, fill_pressed=GOOD_HOVER,
+            fill_disabled="rgba(80,80,80,120)",
+            border="rgba(255,255,255,60)",
+            text_disabled="rgba(255,255,255,80)",
+            font_px=11,
+        )
+        self.title_bar.commit_button.setFixedHeight(18)
         self.title_bar.commit_button.hide()
         self.title_bar_layout.addWidget(self.title_bar.commit_button)
 
-        self.title_bar.stop_button = QtWidgets.QPushButton("Stop", self.title_bar)
-        self.title_bar.stop_button.setFixedHeight(18)
-        self.title_bar.stop_button.setStyleSheet(
-            "QPushButton { color: white; background-color: rgba(180,60,60,180); "
-            "border: 1px solid rgba(255,255,255,60); border-radius: 8px; padding: 0 4px; "
-            "font-size: 11px; }"
-            "QPushButton:disabled { background-color: rgba(80,80,80,120); color: rgba(255,255,255,80); }"
-            "QPushButton:hover { background-color: rgba(220,80,80,200); }"
+        self.title_bar.stop_button = SmoothButton(
+            "Stop", self.title_bar,
+            fill=DANGER, fill_hover=DANGER_HOVER, fill_pressed=DANGER_HOVER,
+            fill_disabled="rgba(80,80,80,120)",
+            border="rgba(255,255,255,60)",
+            text_disabled="rgba(255,255,255,80)",
+            font_px=11,
         )
+        self.title_bar.stop_button.setFixedHeight(18)
         self.title_bar.stop_button.hide()
         self.title_bar_layout.addWidget(self.title_bar.stop_button)
 

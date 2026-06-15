@@ -8,6 +8,7 @@ if TYPE_CHECKING:
     from spyde.drawing.plots.plot import Plot
 
 from spyde.drawing.toolbars.toolbar import RoundedToolBar
+from spyde.qt.style import ACCENT_SOFT
 
 class PopoutToolBar(RoundedToolBar):
     """
@@ -77,12 +78,10 @@ class PopoutToolBar(RoundedToolBar):
             "QToolButton:pressed {"
             "  background-color: rgba(255, 255, 255, 64);"
             "}"
-            "QToolButton:checked {"
-            "  background-color: rgba(255, 255, 255, 40);"
-            "}"
-            "QAction:checked {"
-            "  background-color: rgba(255, 255, 255, 40);"
-            "}"
+            # checked = soft orange accent, same as RoundedToolBar
+            f"QToolButton:checked {{"
+            f"  background-color: {ACCENT_SOFT};"
+            f"}}"
         )
 
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)

@@ -1,6 +1,5 @@
 from typing import TYPE_CHECKING, Optional
 from PySide6 import QtCore, QtGui, QtWidgets
-from spyde.drawing.toolbars.floating_button_trees import RoundedButton
 from pyqtgraph import RectROI
 import numpy as np
 
@@ -30,11 +29,8 @@ class FileDropWidget(QtWidgets.QWidget):
         self._label.setStyleSheet("color: rgba(255,255,255,150); font-size: 10px;")
         layout.addWidget(self._label)
 
-        self._browse_btn = QtWidgets.QPushButton("Browse...", self)
-        self._browse_btn.setStyleSheet(
-            "QPushButton { color: white; background-color: rgba(255,255,255,30); "
-            "border: 1px solid black; }"
-        )
+        from spyde.qt.style import make_button
+        self._browse_btn = make_button("Browse…", self)
         self._browse_btn.clicked.connect(self._on_browse)
         layout.addWidget(self._browse_btn)
 
@@ -193,27 +189,20 @@ class CaretGroup(QtWidgets.QGroupBox):
             stack     — QStackedWidget; call stack.addWidget(page) for each tab
             select_fn — callable(index) that switches tabs and calls on_tab_changed
         """
-        BTN_OFF = (
-            "QPushButton { color: rgba(255,255,255,160); background: rgba(255,255,255,15); "
-            "border: 1px solid rgba(255,255,255,40); padding: 2px 4px; font-size: 9px; "
-            "border-radius: 0px; }"
-        )
-        BTN_ON = (
-            "QPushButton { color: white; background: rgba(100,160,255,180); "
-            "border: 1px solid rgba(120,180,255,200); padding: 2px 4px; font-size: 9px; "
-            "border-radius: 0px; font-weight: bold; }"
-        )
+        from spyde.qt.style import SmoothButton
 
         step_bar = QtWidgets.QWidget(parent)
         step_bar.setFixedWidth(width)
         sb_h = QtWidgets.QHBoxLayout(step_bar)
         sb_h.setContentsMargins(0, 0, 0, 0)
-        sb_h.setSpacing(1)
+        sb_h.setSpacing(3)
 
         step_btns = []
         for label in tab_labels:
-            b = QtWidgets.QPushButton(label, step_bar)
-            b.setStyleSheet(BTN_OFF)
+            # Checkable SmoothButton: antialiased rounded corners + accent
+            # checked fill, same as every other button in the app.
+            b = SmoothButton(label, step_bar, font_px=9)
+            b.setCheckable(True)
             b.setSizePolicy(
                 QtWidgets.QSizePolicy.Policy.Expanding,
                 QtWidgets.QSizePolicy.Policy.Fixed,
@@ -227,7 +216,7 @@ class CaretGroup(QtWidgets.QGroupBox):
 
         def select_fn(idx: int):
             for i, b in enumerate(step_btns):
-                b.setStyleSheet(BTN_ON if i == idx else BTN_OFF)
+                b.setChecked(i == idx)
             stack.setCurrentIndex(idx)
             if callable(on_tab_changed) and idx != _current_idx[0]:
                 _current_idx[0] = idx
@@ -506,8 +495,8 @@ class CaretParams(CaretGroup):
                 if default in options:
                     editor.setCurrentText(str(default))
             elif dtype == "button":
-                editor = QtWidgets.QPushButton(item.get("label", name), row_widget)
-                editor.setStyleSheet("QPushButton { color: white; background-color: rgba(255,255,255,30); border: 1px solid black; }")
+                from spyde.qt.style import make_button as _make_btn
+                editor = _make_btn(item.get("label", name), row_widget)
                 callback = item.get("callback")
                 if callable(callback):
                     editor.clicked.connect(callback)
@@ -515,9 +504,9 @@ class CaretParams(CaretGroup):
                 # Two buttons side-by-side in one row; no label.
                 # "buttons": [{"key": k, "label": l, "callback": fn}, ...]
                 buttons_def = item.get("buttons", [])
+                from spyde.qt.style import make_button as _make_row_btn
                 for btn_def in buttons_def:
-                    btn = QtWidgets.QPushButton(btn_def.get("label", btn_def.get("key", "")), row_widget)
-                    btn.setStyleSheet("QPushButton { color: white; background-color: rgba(255,255,255,30); border: 1px solid black; }")
+                    btn = _make_row_btn(btn_def.get("label", btn_def.get("key", "")), row_widget)
                     cb = btn_def.get("callback")
                     if callable(cb):
                         btn.clicked.connect(cb)
@@ -630,20 +619,21 @@ class CaretParams(CaretGroup):
             # Add row to main layout
             self._params_layout.addWidget(row_widget)
 
-        # Submit button
-        self.submit_button = RoundedButton(text="Submit", parent=self)
+        # Submit button — same shared theme as every other popout button
+        from spyde.qt.style import make_button
+        self.submit_button = make_button("Submit", parent=self)
         self._params_layout.addWidget(self.submit_button)
 
         # Layout/style wiring
         layout = self.layout()
         layout.setContentsMargins(2, 2, 2, 2)
         self.submit_button.clicked.connect(self._on_submit_clicked)
+        from spyde.qt.style import INPUT_QSS
         self.setStyleSheet(
             "QGroupBox { border: none; color: white; } "
             "QLabel { background-color: transparent; color: white; } "
-            "QLineEdit { color: white; background-color: rgba(255, 255, 255, 40); border: 1px solid black; } "
-            "QComboBox { color: white; background-color: rgba(255, 255, 255, 30); border: 1px solid black; } "
-            "QPushButton { color: white; }"
+            + INPUT_QSS
+            + " QPushButton { color: white; }"
         )
         self.toolbar = toolbar
         self.function = function

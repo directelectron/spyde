@@ -13,6 +13,7 @@ from pyqtgraph import functions as fn
 from pyqtgraph.Point import Point
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 from pyqtgraph import AxisItem
+from pyqtgraph import BarGraphItem
 from pyqtgraph import GradientEditorItem
 from pyqtgraph import GraphicsWidget
 from pyqtgraph import LinearRegionItem
@@ -21,6 +22,42 @@ from pyqtgraph import ViewBox
 from pyqtgraph import GraphicsView
 
 __all__ = ["HistogramLUTItem", "HistogramLUTWidget"]
+
+
+class _GammaCurveItem(PlotCurveItem):
+    """Gamma transfer line — drag it vertically to change gamma.
+
+    The drag point (x, y) is normalised inside the current (min, max, height)
+    box; gamma solves y_norm = x_norm**gamma at that point, so the curve
+    follows the cursor wherever it is grabbed.
+    """
+
+    sigGammaDrag = QtCore.Signal(float)  # new gamma value
+
+    def __init__(self, get_levels, get_height, **kwargs):
+        super().__init__(**kwargs)
+        self._get_levels = get_levels
+        self._get_height = get_height
+        self.setClickable(True, width=12)
+        self.setCursor(QtCore.Qt.CursorShape.SizeVerCursor)
+
+    def mouseDragEvent(self, ev):
+        if ev.button() != QtCore.Qt.MouseButton.LeftButton:
+            ev.ignore()
+            return
+        ev.accept()
+        try:
+            mn, mx = self._get_levels()
+            h = float(self._get_height())
+        except Exception:
+            return
+        if mx <= mn or h <= 0:
+            return
+        pos = ev.pos()  # item coords == view (data) coords
+        nx = min(max((pos.x() - mn) / (mx - mn), 0.05), 0.95)
+        ny = min(max(pos.y() / h, 0.02), 0.98)
+        gamma = float(np.log(ny) / np.log(nx))
+        self.sigGammaDrag.emit(min(max(gamma, 0.05), 20.0))
 
 
 class HistogramLUTItem(GraphicsWidget):
@@ -90,6 +127,7 @@ class HistogramLUTItem(GraphicsWidget):
     sigLookupTableChanged = QtCore.Signal(object)
     sigLevelsChanged = QtCore.Signal(object)
     sigLevelChangeFinished = QtCore.Signal(object)
+    sigGammaChanged = QtCore.Signal(object)
 
     def __init__(
         self,
@@ -100,11 +138,17 @@ class HistogramLUTItem(GraphicsWidget):
         orientation="vertical",
         autoLevel=True,
         constantLevel=False,
+        show_gradient=True,
     ):
         GraphicsWidget.__init__(self)
         self.bins = None
         self.counts = None
         self.lut = None
+        self._show_gradient = bool(show_gradient)
+        # Bar-chart + gamma UI only in the horizontal mono configuration
+        # (the Plot Control dock); vertical falls back to the curve look.
+        self._use_bars = orientation == "horizontal"
+        self.gamma = 1.0
         self.imageItem = lambda: None  # fake a dead weakref
         self.levelMode = levelMode
         self.orientation = orientation
@@ -125,6 +169,15 @@ class HistogramLUTItem(GraphicsWidget):
             self.vb.setMaximumWidth(152)
             self.vb.setMinimumWidth(45)
             self.vb.setMouseEnabled(x=False, y=True)
+        elif self._use_bars:
+            # Bar-chart mode: the histogram view is fixed in place — the
+            # range is set from the image data on every redraw, never by
+            # mouse pan/zoom.
+            self.vb.setMaximumHeight(152)
+            self.vb.setMinimumHeight(45)
+            self.vb.setMouseEnabled(x=False, y=False)
+            self.vb.setMenuEnabled(False)
+            self.vb.setDefaultPadding(0.0)
         else:
             self.vb.setMaximumHeight(152)
             self.vb.setMinimumHeight(45)
@@ -178,27 +231,55 @@ class HistogramLUTItem(GraphicsWidget):
         for region in self.regions:
             region.setZValue(1000)
             self.vb.addItem(region)
-            region.lines[0].addMarker("<|", 0.5)
-            region.lines[1].addMarker("|>", 0.5)
+            if region is not self.region:
+                # arrow markers only on the rgba per-channel regions; the
+                # mono region uses clean unadorned drag lines
+                region.lines[0].addMarker("<|", 0.5)
+                region.lines[1].addMarker("|>", 0.5)
             region.sigRegionChanged.connect(self.regionChanging)
             region.sigRegionChangeFinished.connect(self.regionChanged)
 
-        # gradient position to axis orientation
-        ax = {"left": "right", "right": "left", "top": "bottom", "bottom": "top"}[
-            self.gradientPosition
-        ]
-        self.axis = AxisItem(ax, linkView=self.vb, maxTickLength=-10, parent=self)
+        # Clean styling for the mono min/max drag lines — same orange as the
+        # gamma transfer line, with a horizontal-drag cursor.
+        try:
+            self.region.setBrush(fn.mkBrush(255, 200, 80, 8))
+        except Exception:
+            pass
+        for line in self.region.lines:
+            line.setPen(fn.mkPen(255, 200, 80, 220, width=1.5))
+            line.setHoverPen(fn.mkPen(255, 225, 130, 255, width=2.0))
+            line.setCursor(QtCore.Qt.CursorShape.SizeHorCursor)
 
-        # axis / viewbox / gradient order in the grid
-        avg = (0, 1, 2) if self.gradientPosition in {"right", "bottom"} else (2, 1, 0)
-        if self.orientation == "vertical":
-            self.layout.addItem(self.axis, 0, avg[0])
-            self.layout.addItem(self.vb, 0, avg[1])
-            self.layout.addItem(self.gradient, 0, avg[2])
+        if not self._show_gradient and self.orientation == "horizontal":
+            # Clean dock layout: bars on top, slim axis underneath.
+            self.axis = AxisItem("bottom", linkView=self.vb,
+                                 maxTickLength=-6, parent=self)
+            self.layout.addItem(self.vb, 0, 0)
+            self.layout.addItem(self.axis, 1, 0)
         else:
-            self.layout.addItem(self.axis, avg[0], 0)
-            self.layout.addItem(self.vb, avg[1], 0)
-            self.layout.addItem(self.gradient, avg[2], 0)
+            # gradient position to axis orientation
+            ax = {"left": "right", "right": "left", "top": "bottom",
+                  "bottom": "top"}[self.gradientPosition]
+            self.axis = AxisItem(ax, linkView=self.vb, maxTickLength=-10,
+                                 parent=self)
+
+            # axis / viewbox / gradient order in the grid
+            avg = ((0, 1, 2) if self.gradientPosition in {"right", "bottom"}
+                   else (2, 1, 0))
+            if self.orientation == "vertical":
+                self.layout.addItem(self.axis, 0, avg[0])
+                self.layout.addItem(self.vb, 0, avg[1])
+                if self._show_gradient:
+                    self.layout.addItem(self.gradient, 0, avg[2])
+            else:
+                self.layout.addItem(self.axis, avg[0], 0)
+                self.layout.addItem(self.vb, avg[1], 0)
+                if self._show_gradient:
+                    self.layout.addItem(self.gradient, avg[2], 0)
+        if not self._show_gradient:
+            # colormap is owned by the Plot (Colormap combo); keep the
+            # gradient object alive for API compatibility but never shown
+            self.gradient.hide()
 
         self.gradient.setFlag(self.gradient.GraphicsItemFlag.ItemStacksBehindParent)
         self.vb.setFlag(self.gradient.GraphicsItemFlag.ItemStacksBehindParent)
@@ -219,6 +300,29 @@ class HistogramLUTItem(GraphicsWidget):
             if self.orientation == "vertical":
                 plot.setRotation(90)
             self.vb.addItem(plot)
+
+        # Proper bar-chart histogram (mono, horizontal) + gamma transfer line
+        self.bar_item = None
+        self.gamma_curve = None
+        self._disp_hmax = 1.0  # y-scale of the view (outlier-clipped)
+        if self._use_bars:
+            self.bar_item = BarGraphItem(
+                x=[0.0], height=[0.0], width=1.0,
+                # neutral bars so the orange level lines / gamma curve (the
+                # app accent) stay the interactive layer that pops
+                brush=fn.mkBrush(190, 190, 190, 120), pen=None,
+            )
+            self.bar_item.setZValue(0)
+            self.vb.addItem(self.bar_item)
+
+            self.gamma_curve = _GammaCurveItem(
+                get_levels=lambda: self.region.getRegion(),
+                get_height=self._hist_height,
+                pen=fn.mkPen(255, 200, 80, 230, width=1.6), antialias=True,
+            )
+            self.gamma_curve.setZValue(900)
+            self.vb.addItem(self.gamma_curve)
+            self.gamma_curve.sigGammaDrag.connect(self._on_gamma_dragged)
 
         self.fillHistogram(fillHistogram)
         self._showRegions()
@@ -273,6 +377,8 @@ class HistogramLUTItem(GraphicsWidget):
         # paint the bounding edges of the region item and gradient item with lines
         # connecting them
         if self.levelMode != "mono" or not self.region.isVisible():
+            return
+        if not self._show_gradient:
             return
 
         pen = self.region.lines[0].pen
@@ -367,6 +473,10 @@ class HistogramLUTItem(GraphicsWidget):
         self.sigLookupTableChanged.emit(self)
 
     def _setImageLookupTable(self):
+        if not self._show_gradient:
+            # The Plot owns the LUT (Colormap combo + gamma); clearing it
+            # here would stomp the colormap on every image rebind.
+            return
         if self.gradient.isLookupTrivial():
             self.imageItem().setLookupTable(None)
         else:
@@ -391,12 +501,14 @@ class HistogramLUTItem(GraphicsWidget):
     def regionChanged(self):
         if self.imageItem() is not None:
             self.imageItem().setLevels(self.getLevels())
+        self._update_gamma_curve()
         self.sigLevelChangeFinished.emit(self)
 
     @QtCore.Slot()
     def regionChanging(self):
         if self.imageItem() is not None:
             self.imageItem().setLevels(self.getLevels())
+        self._update_gamma_curve()
         self.update()
         self.sigLevelsChanged.emit(self)
 
@@ -432,19 +544,55 @@ class HistogramLUTItem(GraphicsWidget):
         min_percentile = self._pendingImageChange.get("min_percentile", None)
         max_percentile = self._pendingImageChange.get("max_percentile", None)
 
+        # getHistogram indexes image.shape[1]; a non-2D image (e.g. a plot's
+        # signal was swapped/retyped under the histogram, leaving a stale 1-D
+        # image) would raise IndexError. Skip until a 2-D image is bound.
+        _img = self.imageItem().image if self.imageItem() is not None else None
+        if _img is None or getattr(_img, "ndim", 0) < 2:
+            return
+
         if self.levelMode == "mono":
             for plt in self.plots[1:]:
                 plt.setVisible(False)
-            self.plots[0].setVisible(True)
             # plot one histogram for all image data
             profiler = debug.Profiler()
-            h = self.imageItem().getHistogram()
+            if self.bar_item is not None:
+                # modest bin count so the bars read as a bar chart, not as
+                # gappy needles
+                h = self.imageItem().getHistogram(bins=128)
+            else:
+                h = self.imageItem().getHistogram()
             self.bins = h[0]
             self.counts = h[1]
             profiler("get histogram")
             if h[0] is None:
                 return
-            self.plot.setData(*h)
+            if self.bar_item is not None:
+                self.plots[0].setVisible(False)
+                bins = np.asarray(h[0], dtype=float)
+                counts = np.asarray(h[1], dtype=float)
+                binw = float(bins[1] - bins[0]) if len(bins) > 1 else 1.0
+                self.bar_item.setOpts(x=bins + binw / 2.0, height=counts,
+                                      width=binw)
+                # min/max drag lines can never leave the image's data range
+                lo = float(bins[0])
+                hi = float(bins[-1]) + binw
+                self.region.setBounds([lo, hi])
+                # Fixed view, refit on every image redraw. The top 0.5 % of
+                # bar heights are treated as outliers so one dominant bin
+                # (e.g. a zero peak) doesn't squash the rest of the chart.
+                if counts.size:
+                    ymax = float(np.percentile(counts, 99.5))
+                    if ymax <= 0:
+                        ymax = float(counts.max()) or 1.0
+                else:
+                    ymax = 1.0
+                self._disp_hmax = ymax
+                self.vb.setXRange(lo, hi, padding=0.01)
+                self.vb.setYRange(0.0, ymax * 1.05, padding=0.0)
+            else:
+                self.plots[0].setVisible(True)
+                self.plot.setData(*h)
             profiler("set plot")
             if autoLevel:
                 mn = h[0][0]
@@ -458,6 +606,8 @@ class HistogramLUTItem(GraphicsWidget):
             else:
                 mn, mx = self.imageItem().getLevels()
                 self.region.setRegion([float(mn), float(mx)])
+            self._sanitize_levels()
+            self._update_gamma_curve()
         else:
             # plot one histogram for each channel
             self.plots[0].setVisible(False)
@@ -498,11 +648,10 @@ class HistogramLUTItem(GraphicsWidget):
             return None
 
         cumsum = np.cumsum(self.counts)
-        print(cumsum)
         total = cumsum[-1]
-        print(total)
+        if total <= 0:
+            return None
         low_idx = np.searchsorted(cumsum, (min_percentile / 100.0) * total)
-        print(low_idx)
         high_idx = np.searchsorted(cumsum, (max_percentile / 100.0) * total)
 
         min_level = self.bins[low_idx] if low_idx < len(self.bins) else self.bins[-1]
@@ -530,6 +679,89 @@ class HistogramLUTItem(GraphicsWidget):
         )
 
         return (min_percentile, max_percentile)
+
+    def _sanitize_levels(self):
+        """Reset the min/max lines when the current levels are useless.
+
+        Stale levels (e.g. the PlotState default 0..1 against 0..4000 data,
+        or levels carried over from another image) end up clamped into a
+        sliver at the edge of the new range — the lines look compressed at
+        the bottom and the image is washed out. Detect that and fall back to
+        robust auto levels (min → 99.5th percentile, bright outliers like the
+        direct beam excluded).
+        """
+        if self.bar_item is None or self.bins is None or len(self.bins) < 2:
+            return
+        lo = float(self.bins[0])
+        hi = float(self.bins[-1]) + float(self.bins[1] - self.bins[0])
+        span = hi - lo
+        if span <= 0:
+            return
+        try:
+            mn, mx = self.region.getRegion()
+        except Exception:
+            return
+        # Reset only clearly-broken levels: degenerate, fully outside the
+        # data range, or a <0.1% sliver (the stale-default case). A user's
+        # deliberately narrow contrast window stays untouched.
+        usable = (
+            mx > mn
+            and mx > lo
+            and mn < hi
+            and (mx - mn) >= 0.001 * span
+        )
+        if usable:
+            return
+        levels = self.percentile2levels(0.0, 99.5)
+        if levels is None:
+            return
+        mn2, mx2 = float(levels[0]), float(levels[1])
+        if mx2 <= mn2:
+            mn2, mx2 = lo, hi
+        self.region.setRegion([mn2, mx2])
+        if self.imageItem() is not None:
+            self.imageItem().setLevels((mn2, mx2))
+
+    # ── Gamma transfer line ───────────────────────────────────────────────────
+
+    def _hist_height(self):
+        """Display height the gamma curve spans (outlier-clipped y-scale)."""
+        h = float(getattr(self, "_disp_hmax", 1.0))
+        return h if h > 0 else 1.0
+
+    def _update_gamma_curve(self):
+        """Redraw the gamma transfer line between the current min/max levels.
+
+        For gamma == 1 this is the diagonal from (min, 0) to (max, top);
+        other gammas bow the line. Drag the line vertically to set gamma.
+        """
+        # getattr: region signals can fire during __init__ before the gamma
+        # items are constructed
+        if getattr(self, "gamma_curve", None) is None or self.counts is None:
+            return
+        try:
+            mn, mx = self.region.getRegion()
+        except Exception:
+            return
+        mn, mx = float(mn), float(mx)
+        if mx <= mn:
+            return
+        hmax = self._hist_height()
+        x = np.linspace(mn, mx, 128)
+        y = ((x - mn) / (mx - mn)) ** self.gamma * hmax
+        self.gamma_curve.setData(x, y)
+
+    def _on_gamma_dragged(self, gamma):
+        self.gamma = float(gamma)
+        self._update_gamma_curve()
+        self.sigGammaChanged.emit(self)
+
+    def set_gamma(self, gamma, emit=False):
+        """Set the display gamma (clamped) and update the transfer line."""
+        self.gamma = float(min(max(float(gamma), 0.05), 20.0))
+        self._update_gamma_curve()
+        if emit:
+            self.sigGammaChanged.emit(self)
 
     def getLevels(self):
         """Return the min and max levels.

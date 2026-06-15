@@ -117,6 +117,8 @@ functions:
     description: Creates a virtual image from the 4D-STEM data.
     icon: drawing/toolbars/icons/virtual_image_color.svg
     function: spyde.actions.pyxem.virtual_imaging
+    signal_class: pyxem.signals.Diffraction2D
+    exclude_signal_types: [spyde_diffraction_vectors_image]
     plot_dim: [ 2]
     toolbar_side: bottom
     navigation: False
@@ -146,6 +148,8 @@ functions:
     description: Run template matching orientation mapping on a 4D-STEM dataset.
     icon: drawing/toolbars/icons/orientation_mapping.svg
     function: spyde.actions.pyxem.orientation_mapping
+    signal_class: pyxem.signals.Diffraction2D
+    exclude_signal_types: [spyde_diffraction_vectors_image]
     plot_dim: [2]
     toolbar_side: bottom
     navigation: False
@@ -154,6 +158,33 @@ functions:
     description: Find diffraction vectors using window-normalized cross-correlation with a flat disk kernel.
     icon: drawing/toolbars/icons/peak_finding.svg
     function: spyde.actions.find_vectors.find_diffraction_vectors
+    signal_class: pyxem.signals.Diffraction2D
+    exclude_signal_types: [spyde_diffraction_vectors_image]
+    plot_dim: [2]
+    toolbar_side: bottom
+    navigation: False
+    toggle: True
+  Vector Virtual Imaging:
+    description: Build virtual images from diffraction vectors (intensity-weighted, kernel-radius disks). Add multiple with +.
+    icon: drawing/toolbars/icons/virtual_image_color.svg
+    function: spyde.actions.vector_virtual_imaging.vector_virtual_imaging
+    signal_types: [spyde_diffraction_vectors_image]
+    plot_dim: [2]
+    toolbar_side: bottom
+    navigation: False
+    toggle: True
+    submenu: True
+    subfunctions:
+      add_vector_virtual_image:
+        name: Add Vector Virtual Image
+        description: Add a vector virtual image with a circular ROI.
+        icon: drawing/toolbars/icons/virtual_imaging.svg
+        function: spyde.actions.vector_virtual_imaging.add_vector_virtual_image
+  Vector Orientation Mapping:
+    description: Orientation + strain mapping from diffraction vectors (sparse point-set fit). Live refine under the crosshair.
+    icon: drawing/toolbars/icons/orientation_mapping.svg
+    function: spyde.actions.vector_orientation_action.vector_orientation_mapping
+    signal_types: [spyde_diffraction_vectors_image]
     plot_dim: [2]
     toolbar_side: bottom
     navigation: False
