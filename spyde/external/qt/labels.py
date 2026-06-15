@@ -40,18 +40,13 @@ class EditableLabel(QtWidgets.QWidget):
         self._label.clicked.connect(self._start_editing)
         self._line_edit.editingFinished.connect(self._finish_editing)
 
-        # Hover styling via QSS for label only
+        # Themed to match the rest of the app (accent hover + shared input look)
+        # rather than the old hardcoded bluish tint. Tokens live in qt.style.
+        from spyde.qt.style import EDITABLE_LABEL_QSS, INPUT_QSS
         self._label.setObjectName("editableLabelPart")
         self._label.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
-        self._label.setStyleSheet(
-            "QLabel#editableLabelPart {"
-            "  border-radius: 4px;"
-            "  padding: 1px;"
-            "}"
-            "QLabel#editableLabelPart:hover {"
-            "  background-color: rgba(231, 241, 255, 0.12);"
-            "}"
-        )
+        self._label.setStyleSheet(EDITABLE_LABEL_QSS)
+        self._line_edit.setStyleSheet(INPUT_QSS)
 
         self.previous_text = text
 

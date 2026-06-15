@@ -5,7 +5,8 @@ from PySide6 import QtCore, QtWidgets
 from PySide6.QtCore import QObject, Slot, Qt
 
 from spyde.drawing.colormaps import COLORMAPS
-from spyde.drawing.signal_tree_presenter import build_axes_groups, build_metadata_dict
+from spyde.drawing.signal_tree_presenter import (
+    build_axes_groups, build_metadata_groups)
 from spyde.external.pyqtgraph.histogram_widget import HistogramLUTWidget, HistogramLUTItem
 from spyde.live.camera_control_widget import CameraControlWidget
 from spyde.live.control_dock_widget import ControlDockWidget
@@ -287,40 +288,9 @@ class DockManager(QObject):
                 del item
         if not hasattr(plot, "signal_tree") or plot.signal_tree is None:
             return
-        metadata_dict = build_metadata_dict(plot.signal_tree)
-        for subsection, items in metadata_dict.items():
-            group = QtWidgets.QGroupBox(str(subsection))
-            group.setSizePolicy(
-                QtWidgets.QSizePolicy.Policy.Expanding,
-                QtWidgets.QSizePolicy.Policy.Fixed,
-            )
-            group.setFixedHeight(120)
-            group_layout = QtWidgets.QVBoxLayout(group)
-            group_layout.setContentsMargins(6, 6, 6, 6)
-            group_layout.setSpacing(0)
-            scroll = QtWidgets.QScrollArea()
-            scroll.setWidgetResizable(True)
-            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-            scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-            container = QtWidgets.QWidget()
-            grid = QtWidgets.QGridLayout(container)
-            grid.setContentsMargins(0, 0, 0, 0)
-            grid.setHorizontalSpacing(12)
-            grid.setVerticalSpacing(4)
-            for row, (key, value) in enumerate((items or {}).items()):
-                key_label = QtWidgets.QLabel(f"{key}:")
-                value_label = QtWidgets.QLabel(f"{value}")
-                key_label.setStyleSheet("font-size: 10px;")
-                value_label.setStyleSheet("font-size: 10px;")
-                key_label.setAlignment(
-                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-                )
-                grid.addWidget(key_label, row, 0)
-                grid.addWidget(value_label, row, 1)
-            grid.setColumnStretch(0, 0)
-            grid.setColumnStretch(1, 1)
-            scroll.setWidget(container)
-            group_layout.addWidget(scroll)
+        # Themed, editable metadata groups (same EditableLabel widget as the
+        # Plot Axes panel) — consistent with the rest of the sidebar.
+        for group in build_metadata_groups(plot.signal_tree):
             self.metadata_layout.addWidget(group)
 
     def _update_axes_panel(self, plot: "Plot") -> None:

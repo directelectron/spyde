@@ -61,10 +61,10 @@ def build_axes_groups(
         grid.setHorizontalSpacing(6)
         grid.setVerticalSpacing(2)
 
-        header_style = "font-size: 9px; font-weight: 600;"
+        from spyde.qt.style import PANEL_HEADER_QSS
         for col, label in enumerate(["Name", "Scale", "Offset", "Units"]):
             h = QtWidgets.QLabel(label)
-            h.setStyleSheet(header_style)
+            h.setStyleSheet(PANEL_HEADER_QSS)
             if col == 0:
                 h.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             grid.addWidget(h, 0, col)
@@ -76,7 +76,6 @@ def build_axes_groups(
             units_edit = EditableLabel(str(axis.units))
 
             for w in (name_edit, scale_edit, offset_edit, units_edit):
-                w.setStyleSheet("font-size: 8px;")
                 w.setFixedWidth(72)
                 w.setFixedHeight(18)
 
@@ -122,18 +121,92 @@ def build_metadata_dict(signal_tree: "BaseSignalTree") -> dict[str, dict[str, st
     for subsection, props in METADATA_WIDGET_CONFIG["metadata_widget"].items():
         subsections[subsection] = {}
         for prop, value in props.items():
-            if "key" in value:
-                current_value = signal_tree.root.metadata.get_item(
-                    item_path=value["key"], default=value.get("default", "--")
-                )
-            elif "attr" in value:
-                current_value = signal_tree.get_nested_attr(value["attr"])
-            elif "function" in value:
-                fun = signal_tree.get_nested_attr(value["function"])
-                current_value = fun() if callable(fun) else "--"
-            else:
-                current_value = "--"
+            current_value, _ = _read_metadata_prop(signal_tree, value)
             subsections[subsection][prop] = (
                 f"{current_value} {value.get('units', '')}".strip()
             )
     return subsections
+
+
+def _read_metadata_prop(signal_tree: "BaseSignalTree", value: dict):
+    """Resolve one metadata-config entry to (value, key). `key` is the metadata
+    item path if the prop is writable, else None (attr/function props are
+    derived and read-only)."""
+    if "key" in value:
+        return (
+            signal_tree.root.metadata.get_item(
+                item_path=value["key"], default=value.get("default", "--")
+            ),
+            value["key"],
+        )
+    if "attr" in value:
+        return signal_tree.get_nested_attr(value["attr"]), None
+    if "function" in value:
+        fun = signal_tree.get_nested_attr(value["function"])
+        return (fun() if callable(fun) else "--"), None
+    return "--", None
+
+
+def _on_metadata_edit(signal_tree, key, units, line_edit, text=""):
+    """Write an edited metadata field back onto the tree root's metadata. The
+    units suffix is display-only, so strip it before storing the raw value."""
+    raw = line_edit.text().strip()
+    if units and raw.endswith(units):
+        raw = raw[: -len(units)].strip()
+    signal_tree.root.metadata.set_item(key, raw)
+
+
+def build_metadata_groups(signal_tree: "BaseSignalTree") -> list[QtWidgets.QGroupBox]:
+    """Build themed Metadata QGroupBoxes whose values reuse the same editable,
+    selectable EditableLabel widget as the Plot Axes panel. `key`-backed props
+    are editable (write straight back to metadata); derived attr/function props
+    render as plain (non-editable) values so they read consistently but can't be
+    mangled."""
+    from spyde.qt.style import PANEL_HEADER_QSS
+    groups: list[QtWidgets.QGroupBox] = []
+    for subsection, props in METADATA_WIDGET_CONFIG["metadata_widget"].items():
+        group = QtWidgets.QGroupBox(str(subsection))
+        group.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Preferred, QtWidgets.QSizePolicy.Policy.Fixed
+        )
+        v = QtWidgets.QVBoxLayout(group)
+        v.setContentsMargins(4, 4, 4, 4)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setMaximumHeight(160)
+        container = QtWidgets.QWidget()
+        grid = QtWidgets.QGridLayout(container)
+        grid.setContentsMargins(4, 2, 4, 2)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(2)
+        for row, (prop, cfg) in enumerate((props or {}).items()):
+            current_value, key = _read_metadata_prop(signal_tree, cfg)
+            units = cfg.get("units", "")
+            display = f"{current_value} {units}".strip()
+
+            key_label = QtWidgets.QLabel(f"{prop}:")
+            key_label.setStyleSheet(PANEL_HEADER_QSS)
+            key_label.setAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            )
+            grid.addWidget(key_label, row, 0)
+
+            value_widget = EditableLabel(display)
+            value_widget.setFixedHeight(18)
+            if key is not None:
+                value_widget.editingFinished.connect(
+                    partial(_on_metadata_edit, signal_tree, key, units, value_widget)
+                )
+            else:
+                # derived / read-only: keep the themed label look but don't
+                # offer an edit affordance.
+                value_widget._label.clicked.disconnect()
+            grid.addWidget(value_widget, row, 1)
+
+        grid.setColumnStretch(0, 0)
+        grid.setColumnStretch(1, 1)
+        scroll.setWidget(container)
+        v.addWidget(scroll)
+        groups.append(group)
+    return groups

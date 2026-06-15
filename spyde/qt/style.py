@@ -178,6 +178,21 @@ SLIDER_QSS = (
 
 LABEL_QSS = f"color: {TEXT}; font-size: {FONT_SMALL};"
 
+# EditableLabel: the click-to-edit field used by the Plot Axes + Metadata
+# panels. Themed to match the rest of the sidebar — accent-tinted hover on the
+# label, the shared input look while editing.
+EDITABLE_LABEL_QSS = (
+    f"QLabel#editableLabelPart {{ color: {TEXT}; font-size: {FONT_SMALL}; "
+    f"border-radius: {RADIUS_INPUT}; padding: 1px 3px; }}"
+    f"QLabel#editableLabelPart:hover {{ background-color: {ACCENT_SOFT}; }}"
+)
+
+# Section header inside the sidebar panels (e.g. the Name/Scale/Offset/Units
+# column titles, metadata subsection captions).
+PANEL_HEADER_QSS = (
+    f"color: {TEXT_DIM}; font-size: {FONT_SMALL}; font-weight: 600;"
+)
+
 # ── Application stylesheet ────────────────────────────────────────────────────
 # Single global QSS applied by MainWindow at startup. Everything is built
 # from the tokens above so the whole app — docks, dialogs, menus, live
