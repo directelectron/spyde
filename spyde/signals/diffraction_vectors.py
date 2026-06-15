@@ -111,6 +111,84 @@ def _build_nav_offsets(
 
 
 @dataclass
+class _AxisLite:
+    """Minimal axis record so vectors loaded from disk can be rendered
+    without HyperSpy axes objects (duck-types .scale/.offset/.size/.units/.name)."""
+    scale: float = 1.0
+    offset: float = 0.0
+    size: int = 0
+    units: str = ""
+    name: str = ""
+
+
+def _render_disks_block(
+    rows: np.ndarray,
+    block_nav_shape: tuple,
+    sig_hw: tuple,
+    x_scale: float,
+    x_offset: float,
+    y_scale: float,
+    y_offset: float,
+    radius_px: float,
+    origin: tuple,
+) -> np.ndarray:
+    """
+    Rasterise diffraction vectors into dense frames of flat disks.
+
+    Module-level (not a method) so dask tasks pickle only the small `rows`
+    slice, never the whole SpyDEDiffractionVectors object.
+
+    Parameters
+    ----------
+    rows : (N, 6) flat-buffer rows whose nav coords fall inside this block
+    block_nav_shape : nav shape of the block — (ny, nx) or (nt, ny, nx)
+    sig_hw : (H, W) frame shape in pixels
+    x_scale, x_offset, y_scale, y_offset : signal-axis calibration
+        (kx ↔ frame column via axis 0, ky ↔ frame row via axis 1)
+    radius_px : disk radius in pixels (the detection kernel radius)
+    origin : global nav index of the block's first position (same length as
+        block_nav_shape) — used to localise each row's nav coords
+
+    Each vector is drawn as a filled disk whose value is the vector's
+    intensity; overlapping disks keep the max.
+    """
+    H, W = int(sig_hw[0]), int(sig_hw[1])
+    out = np.zeros(tuple(int(s) for s in block_nav_shape) + (H, W), dtype=np.float32)
+    if rows is None or len(rows) == 0:
+        return out
+
+    r = max(1, int(round(radius_px)))
+    yy, xx = np.ogrid[-r: r + 1, -r: r + 1]
+    disk = (yy * yy + xx * xx) <= r * r
+
+    nd = len(block_nav_shape)
+    iy = rows[:, COL_NAV_Y].astype(np.int64) - int(origin[-2])
+    ix = rows[:, COL_NAV_X].astype(np.int64) - int(origin[-1])
+    if nd == 3:
+        it = rows[:, COL_TIME].astype(np.int64)
+        it = np.where(it < 0, 0, it) - int(origin[0])
+    cy = np.rint((rows[:, COL_KY] - y_offset) / y_scale).astype(np.int64)
+    cx = np.rint((rows[:, COL_KX] - x_offset) / x_scale).astype(np.int64)
+    inten = rows[:, COL_INTENSITY]
+
+    for i in range(len(rows)):
+        fy0, fx0 = int(cy[i]) - r, int(cx[i]) - r
+        fy1, fx1 = fy0 + 2 * r + 1, fx0 + 2 * r + 1
+        gy0, gx0 = max(0, fy0), max(0, fx0)
+        gy1, gx1 = min(H, fy1), min(W, fx1)
+        if gy0 >= gy1 or gx0 >= gx1:
+            continue
+        pos = (int(it[i]), int(iy[i]), int(ix[i])) if nd == 3 else (int(iy[i]), int(ix[i]))
+        # rows are pre-sliced to this block, but guard against stragglers
+        if any(p < 0 or p >= s for p, s in zip(pos, block_nav_shape)):
+            continue
+        d = disk[gy0 - fy0: gy1 - fy0, gx0 - fx0: gx1 - fx0]
+        sub = out[pos][gy0:gy1, gx0:gx1]
+        np.maximum(sub, np.where(d, np.float32(inten[i]), np.float32(0.0)), out=sub)
+    return out
+
+
+@dataclass
 class SpyDEDiffractionVectors:
     """
     Flat-buffer CSR storage for diffraction vectors across a scan.
@@ -369,6 +447,37 @@ class SpyDEDiffractionVectors:
         buf = self._frame_slice(t) if t is not None else self.flat_buffer
         return self._vvi_on_buf(buf, cx, cy, r_outer, r_inner, intensity_weighted).reshape(self.nav_shape)
 
+    def _vvi_rect_on_buf(self, buf, x0, x1, y0, y1, intensity_weighted):
+        """Core rectangular VVI on a sub-buffer. Returns flat (nav_y*nav_x,)."""
+        nav_y, nav_x = self.nav_shape
+        out = np.zeros(nav_y * nav_x, dtype=np.float32)
+        if len(buf) == 0:
+            return out
+        kx = buf[:, COL_KX]; ky = buf[:, COL_KY]
+        mask = (kx >= x0) & (kx < x1) & (ky >= y0) & (ky < y1)
+        if mask.any():
+            flat_nav = (buf[mask, COL_NAV_Y].astype(np.int32) * nav_x
+                        + buf[mask, COL_NAV_X].astype(np.int32))
+            if intensity_weighted:
+                np.add.at(out, flat_nav, buf[mask, COL_INTENSITY])
+            else:
+                np.add.at(out, flat_nav, 1.0)
+        return out
+
+    def virtual_image_from_rect(
+        self, x0: float, y0: float, x1: float, y1: float,
+        t: Optional[int] = None, intensity_weighted: bool = True,
+    ) -> np.ndarray:
+        """Build a (nav_y, nav_x) virtual image for a rectangular detector ROI
+        spanning kx in [x0, x1), ky in [y0, y1) (calibrated Å⁻¹)."""
+        if len(self.flat_buffer) == 0:
+            return np.zeros(self.nav_shape, dtype=np.float32)
+        lo_x, hi_x = (x0, x1) if x0 <= x1 else (x1, x0)
+        lo_y, hi_y = (y0, y1) if y0 <= y1 else (y1, y0)
+        buf = self._frame_slice(t) if t is not None else self.flat_buffer
+        return self._vvi_rect_on_buf(
+            buf, lo_x, hi_x, lo_y, hi_y, intensity_weighted).reshape(self.nav_shape)
+
     def virtual_image_series(
         self,
         cx: float,
@@ -622,6 +731,141 @@ class SpyDEDiffractionVectors:
         kxy = self.kxy_at(iy, ix)
         r_scene = self.kernel_radius_data * 2
         return [{"pos": (float(ky), float(kx)), "size": r_scene} for kx, ky in kxy]
+
+    # ── Rendering (visualise without the original dataset) ───────────────────
+
+    def render_frame(self, iy: int, ix: int, t: Optional[int] = None) -> np.ndarray:
+        """
+        (H, W) float32 frame at (iy, ix): each vector drawn as a flat disk of
+        its intensity (radius = detection kernel radius).
+        t=None renders vectors from all time steps at that position.
+        """
+        rows = self.at(iy, ix) if t is None else self.at_t(iy, ix, t)
+        H = int(self.sig_axes[1].size)
+        W = int(self.sig_axes[0].size)
+        return _render_disks_block(
+            rows, (1, 1), (H, W),
+            float(self.sig_axes[0].scale), float(self.sig_axes[0].offset),
+            float(self.sig_axes[1].scale), float(self.sig_axes[1].offset),
+            self.kernel_radius_px,
+            (int(iy), int(ix)),
+        )[0, 0]
+
+    def to_rendered_dask(self, nav_chunk: int = 32):
+        """
+        Lazy dask array of rendered disk frames shaped like the source dataset:
+        (nav_y, nav_x, H, W) for 4D, (n_t, nav_y, nav_x, H, W) for 5D.
+
+        Each block task embeds only the small flat-buffer slice it needs, so
+        building the graph never touches the original signal data and each
+        frame is rendered on demand — this is what lets a saved vector file
+        "look like" a 4D dataset without the raw data.
+        """
+        import dask
+        import dask.array as da
+
+        ny, nx = self.nav_shape
+        H = int(self.sig_axes[1].size)
+        W = int(self.sig_axes[0].size)
+        calib = (
+            float(self.sig_axes[0].scale), float(self.sig_axes[0].offset),
+            float(self.sig_axes[1].scale), float(self.sig_axes[1].offset),
+        )
+        n_t = self.n_time
+        x_off = self.nav_offsets[-1]
+        render = dask.delayed(_render_disks_block, pure=True)
+
+        def _rows(t, ys, ye, xs, xe):
+            # Within one nav row iy, columns [xs, xe) are contiguous in the
+            # CSR flat buffer — one O(1) slice per row.
+            base = (t * ny) if n_t else 0
+            parts = []
+            for iy in range(ys, ye):
+                row0 = (base + iy) * nx
+                s = int(x_off[row0 + xs])
+                e = int(x_off[row0 + xe])
+                if e > s:
+                    parts.append(self.flat_buffer[s:e])
+            return np.concatenate(parts) if parts else self.flat_buffer[:0]
+
+        def _grid(t):
+            row_arrays = []
+            for ys in range(0, ny, nav_chunk):
+                ye = min(ny, ys + nav_chunk)
+                col_arrays = []
+                for xs in range(0, nx, nav_chunk):
+                    xe = min(nx, xs + nav_chunk)
+                    if n_t:
+                        bshape = (1, ye - ys, xe - xs)
+                        origin = (t, ys, xs)
+                    else:
+                        bshape = (ye - ys, xe - xs)
+                        origin = (ys, xs)
+                    blk = render(
+                        _rows(t, ys, ye, xs, xe), bshape, (H, W),
+                        *calib, self.kernel_radius_px, origin,
+                    )
+                    col_arrays.append(
+                        da.from_delayed(blk, shape=tuple(bshape) + (H, W), dtype=np.float32)
+                    )
+                row_arrays.append(da.concatenate(col_arrays, axis=2 if n_t else 1))
+            return da.concatenate(row_arrays, axis=1 if n_t else 0)
+
+        if n_t:
+            return da.concatenate([_grid(t) for t in range(n_t)], axis=0)
+        return _grid(0)
+
+    # ── Save / load ───────────────────────────────────────────────────────────
+
+    def save(self, path: str) -> None:
+        """
+        Save to a compressed .npz — small and self-contained (flat buffer +
+        calibration), no raw dataset.  Reload with SpyDEDiffractionVectors.load().
+        """
+        import json
+        axes_meta = [
+            dict(
+                scale=float(ax.scale), offset=float(ax.offset),
+                size=int(ax.size),
+                units=str(getattr(ax, "units", "") or ""),
+                name=str(getattr(ax, "name", "") or ""),
+            )
+            for ax in self.sig_axes
+        ]
+        meta = dict(params=self.params, sig_axes=axes_meta)
+        np.savez_compressed(
+            path,
+            flat_buffer=self.flat_buffer,
+            full_nav_shape=np.asarray(self.full_nav_shape, dtype=np.int64),
+            sig_shape=np.asarray(self.sig_shape, dtype=np.int64),
+            kernel_radius_px=np.float64(self.kernel_radius_px),
+            kernel_radius_data=np.float64(self.kernel_radius_data),
+            meta_json=np.frombuffer(
+                json.dumps(meta, default=str).encode("utf-8"), dtype=np.uint8
+            ),
+        )
+
+    @classmethod
+    def load(cls, path: str) -> "SpyDEDiffractionVectors":
+        """Load vectors saved with save(). sig_axes come back as _AxisLite records."""
+        import json
+        with np.load(path) as z:
+            flat_buffer = z["flat_buffer"].astype(np.float32)
+            full_nav_shape = tuple(int(v) for v in z["full_nav_shape"])
+            sig_shape = tuple(int(v) for v in z["sig_shape"])
+            kr_px = float(z["kernel_radius_px"])
+            kr_data = float(z["kernel_radius_data"])
+            meta = json.loads(bytes(z["meta_json"]).decode("utf-8"))
+        sig_axes = [_AxisLite(**a) for a in meta.get("sig_axes", [])]
+        return cls.from_arrays(
+            flat_buffer=flat_buffer,
+            full_nav_shape=full_nav_shape,
+            sig_shape=sig_shape,
+            sig_axes=sig_axes,
+            kernel_radius_px=kr_px,
+            kernel_radius_data=kr_data,
+            params=meta.get("params", {}) or {},
+        )
 
     # ── Constructors ──────────────────────────────────────────────────────────
 
