@@ -493,9 +493,6 @@ class Plot(PlotItem):
         If the new_data is a Future, the update will be deferred until the Future is complete, the update
         will be handled by the event loop instead.
         """
-        print("Updating plot data", new_data, " force=", force)
-
-
         #  This is just a workaround as hyperspy doesn't currently handle Future arrays.
         # TODO: Remove this when hyperspy supports Future arrays.
         if isinstance(new_data, np.ndarray) and isinstance(new_data[0], Future):
@@ -515,7 +512,6 @@ class Plot(PlotItem):
             self.needs_update_range = True
             self.needs_auto_level = True
             self._needs_hide_updating_text = True
-        print("Setting current data to:", new_data)
         self.current_data = new_data
         if isinstance(new_data, Future) and not force:
             pass
@@ -524,11 +520,9 @@ class Plot(PlotItem):
                 self.current_data = new_data.result()
                 self.update()
             except FutureCancelledError:
-                print("Future was cancelled, cannot update plot data.")
                 pass
         else:
             self.update()
-        print("Plot data updated.")
 
     def add_fft_selector(self):
         """Add an FFT selector to the plot."""
@@ -722,8 +716,6 @@ class Plot(PlotItem):
                 else self.current_data
             )
             axis = self.plot_state.current_signal.axes_manager.signal_axes[0].axis
-            print("Updating 1D plot with axis:", axis)
-            print("Data shape:", current_data)
             self.line_item.setData(axis, current_data)
 
             if self._needs_hide_updating_text and self._updating_text is not None:
@@ -745,16 +737,11 @@ class Plot(PlotItem):
                 else self.current_data
             )
 
-            print("Setting image data with img", img)
-
-            start_time = time.perf_counter()
             if img.dtype == np.int16:
                 img = img.astype(np.uint16)
             self.image_item.setImage(
                 img, levels=(self.plot_state.min_level, self.plot_state.max_level),autoDownsample=True
             )
-            elapsed = time.perf_counter() - start_time
-            print(f"setImage took {elapsed * 1000:.2f}ms")
             if self.needs_auto_level and img is not None:
                 mn, mx = self._robust_levels(img)
                 self.image_item.setLevels((mn, mx))

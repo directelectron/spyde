@@ -348,7 +348,6 @@ class IntegratingSelectorMixin:
         """
         Start the timer to delay the update.
         """
-        print("Updating Data")
         if self.is_live:
             if ev is None:
                 self.selector.delayed_update_data()

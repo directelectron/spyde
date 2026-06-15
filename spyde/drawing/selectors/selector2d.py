@@ -99,7 +99,6 @@ class CrosshairSelector(BaseSelector):
         x = int(np.round(center_pixel.x()))
         y = int(np.round(center_pixel.y()))
         indices = np.array([[x, y]])
-        print("Selected Indices (Crosshair):", indices)
         return indices
 
     def add_linked_roi(self, plot: "Plot"):

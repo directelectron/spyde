@@ -214,7 +214,6 @@ class FramelessSubWindow(QtWidgets.QMdiSubWindow):
                 continue
             if subwin._snap_state:
                 occupied.add(subwin._snap_state)
-        print("occupied zones:", occupied)
         return occupied
 
     def _calculate_snap_zone(self, local_pos: QtCore.QPoint, mdi_rect: QtCore.QRect) -> str:
