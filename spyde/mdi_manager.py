@@ -258,6 +258,7 @@ class MDIManager(QObject):
                 if not pw.isVisible():
                     pw.show()
                 pw.setGraphicsEffect(None)
+                pw.raise_()        # focused tree comes to the front
             elif same_tree and not action_wants_visible:
                 pw.hide()
             elif is_action_preview and not pw.isVisible():
@@ -266,16 +267,19 @@ class MDIManager(QObject):
                 # unexpectedly close live preview windows.
                 pass
             elif is_action_preview:
-                # Dim but do not hide visible action-preview windows from other trees
+                # Dim AND send to the back: out-of-focus trees recede both in
+                # opacity and z-order so the active tree's windows read clearly.
                 effect = QGraphicsOpacityEffect(pw)
                 effect.setOpacity(0.65)
                 pw.setGraphicsEffect(effect)
+                pw.lower()
             else:
                 if not pw.isVisible():
                     pw.show()
                 effect = QGraphicsOpacityEffect(pw)
                 effect.setOpacity(0.65)
                 pw.setGraphicsEffect(effect)
+                pw.lower()
 
     # ── Drag-and-drop event filter ───────────────────────────────────────────
 
