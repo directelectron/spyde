@@ -59,6 +59,12 @@ def _reset_window(win: MainWindow) -> MainWindow:
 
     win.plot_subwindows.clear()
     win.signal_trees.clear()
+    # Drop the dock-panel rebuild memo: id()s of freed trees/signals can be
+    # reused across tests, which would otherwise let a stale key falsely skip a
+    # rebuild for a brand-new (same-id) signal.
+    dm = getattr(win, "dock_manager", None)
+    if dm is not None:
+        dm._panels_built_for = None
 
     # removeSubWindow actually removes from subWindowList(); closeAllSubWindows only hides
     for sw in list(win.mdi_area.subWindowList()):

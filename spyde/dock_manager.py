@@ -41,6 +41,9 @@ class DockManager(QObject):
         self.signal_type_combo: QtWidgets.QComboBox | None = None
         self.btn_set_signal_type: QtWidgets.QPushButton | None = None
         self._signal_type_plot: "Plot" | None = None
+        # Memo of the (tree, signal, is_navigator) the side panels were last
+        # built for, so re-activating the same plot doesn't rebuild them.
+        self._panels_built_for: tuple | None = None
 
         self._build_plot_control_dock()
         self._build_instrument_control_dock()
@@ -181,12 +184,20 @@ class DockManager(QObject):
         if plot_state is not None and self.cmap_selector is not None:
             self.cmap_selector.setCurrentText(plot_state.colormap)
 
-        # Metadata and axes panels
+        # Metadata / axes / signal-type panels. These fully rebuild their
+        # widgets, which is wasteful when re-activating windows of the same
+        # tree/signal (a common click pattern). Skip the rebuild when the
+        # (tree, signal, is_navigator) the panels were last built for is
+        # unchanged; _on_set_signal_type invalidates the memo when it retypes.
         st = getattr(window, "signal_tree", None)
-        if st is not None:
-            self._update_metadata_panel(plot)
-        self._update_axes_panel(plot)
-        self._update_signal_type_panel(plot)
+        cur_sig = getattr(plot_state, "current_signal", None)
+        panel_key = (id(st), id(cur_sig), bool(getattr(plot, "is_navigator", False)))
+        if panel_key != getattr(self, "_panels_built_for", None):
+            if st is not None:
+                self._update_metadata_panel(plot)
+            self._update_axes_panel(plot)
+            self._update_signal_type_panel(plot)
+            self._panels_built_for = panel_key
 
     # ── Signal Type panel ────────────────────────────────────────────────────
 
@@ -273,6 +284,9 @@ class DockManager(QObject):
         plot_state.rebuild_toolbars()
         self._update_signal_type_panel(plot)
         self._update_metadata_panel(plot)
+        # The signal's class changed in place; force the next activation to
+        # rebuild the panels rather than hit the unchanged-key fast path.
+        self._panels_built_for = None
         self.main_window.statusBar().showMessage(
             f"Signal type set to {type(signal).__name__}", 5000
         )
