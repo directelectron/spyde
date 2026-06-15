@@ -680,17 +680,12 @@ def _czb_build_manual_page(caret, toolbar, manual_state, width):
             manual_state["selected_idx"] = None
             _czb_refresh(toolbar, manual_state)
 
-    delete_btn = QtWidgets.QPushButton("Delete Selected")
-    delete_btn.setStyleSheet(
-        "QPushButton { color: white; background: rgba(255,255,255,30); border: 1px solid black; }"
-    )
+    from spyde.qt.style import make_button as _czb_btn
+    delete_btn = _czb_btn("Delete Selected")
     delete_btn.clicked.connect(_delete_selected)
     vlay.addWidget(delete_btn)
 
-    clear_btn = QtWidgets.QPushButton("Clear All Points")
-    clear_btn.setStyleSheet(
-        "QPushButton { color: white; background: rgba(255,255,255,30); border: 1px solid black; }"
-    )
+    clear_btn = _czb_btn("Clear All Points")
 
     def _clear():
         manual_state["control_points"] = []
@@ -700,10 +695,7 @@ def _czb_build_manual_page(caret, toolbar, manual_state, width):
     clear_btn.clicked.connect(_clear)
     vlay.addWidget(clear_btn)
 
-    submit_btn = QtWidgets.QPushButton("Submit")
-    submit_btn.setStyleSheet(
-        "QPushButton { color: white; background: rgba(255,255,255,30); border: 1px solid black; }"
-    )
+    submit_btn = _czb_btn("Submit")
     submit_btn.clicked.connect(lambda: _czb_submit(toolbar, manual_state))
     vlay.addWidget(submit_btn)
 
@@ -851,15 +843,18 @@ def add_virtual_image(
 
     action_name = f"Virtual Image ({color})"
 
-    # Per-VI mutable state
-    _live_enabled = [True]
+    # Per-VI mutable state.
+    # Live recompute stays OFF: launching a large dask graph on every ROI move
+    # makes the app appear frozen — the user computes on demand via the
+    # title-bar Compute button instead.
+    _live_enabled = [False]
     _cached_mask = [None]
     _cached_roi = [None]
     _timer_holder = []  # progress poll timer
     _generation = [0]
 
     def _on_compute_clicked():
-        # Compute button always fires this VI regardless of live flag.
+        # Title-bar Compute button fires this VI regardless of live flag.
         # _compute_one is defined below; this defers the lookup so it works.
         _compute_one(action_name)
 
@@ -876,14 +871,6 @@ def add_virtual_image(
             "default": "mean",
             "options": ["mean", "FEM Omega", "COM"],
         },
-        "live_compute_row": {
-            "name": "",
-            "type": "button_row",
-            "buttons": [
-                {"key": "live_button", "label": "Live (ON)", "callback": lambda: _toggle_live()},
-                {"key": "compute_button", "label": "Compute", "callback": _on_compute_clicked},
-            ],
-        },
     }
 
     action, params_caret_box = toolbar.add_action(
@@ -894,7 +881,10 @@ def add_virtual_image(
         parameters=params,
     )
 
+    # Compute/Commit live on the preview window's title bar; the caret only
+    # holds detector parameters, so its Submit button is redundant.
     try:
+        params_caret_box.submit_button.hide()
         if hasattr(params_caret_box, "finalize_layout"):
             params_caret_box.finalize_layout()
     except Exception:
@@ -923,6 +913,8 @@ def add_virtual_image(
 
     indicator = ComputeStatusIndicator(color=color)
     virtual_plot_window.set_compute_indicator(indicator)
+    # Compute sits beside Commit on the preview window's title bar.
+    virtual_plot_window.set_compute_fn(_on_compute_clicked)
 
     toolbar.parent_toolbar.register_action_plot_window(
         action_name="Virtual Imaging",
@@ -1204,12 +1196,6 @@ def add_virtual_image(
         _schedule_batch_recompute()
 
     roi.sigRegionChangeFinished.connect(_on_roi_finished)
-
-    def _toggle_live():
-        live_btn = params_caret_box.get_parameter_widget("live_button")
-        _live_enabled[0] = not _live_enabled[0]
-        if live_btn is not None:
-            live_btn.setText("Live (ON)" if _live_enabled[0] else "Live (OFF)")
 
     def _do_commit():
         if _cached_mask[0] is None:
@@ -1701,40 +1687,10 @@ def _compute_reciprocal_radius(signal) -> float:
 
 
 def _make_slider_row(parent, label_text, min_val, max_val, default, decimals=2, suffix=""):
-    """Return (row_widget, spinbox, slider) for a labelled float slider+spinbox row."""
-    from PySide6 import QtWidgets as _QW, QtCore as _QC
-    SCALE = 10 ** decimals
-    row = _QW.QWidget(parent)
-    h = _QW.QHBoxLayout(row)
-    h.setContentsMargins(0, 0, 0, 0)
-    h.setSpacing(4)
-    lbl = _QW.QLabel(label_text, row)
-    lbl.setStyleSheet("color: white; font-size: 10px;")
-    spin = _QW.QDoubleSpinBox(row)
-    spin.setRange(min_val, max_val)
-    spin.setDecimals(decimals)
-    spin.setSingleStep(10 ** -decimals)
-    spin.setValue(default)
-    spin.setFixedWidth(72 if suffix else 64)
-    if suffix:
-        spin.setSuffix(suffix)
-    spin.setStyleSheet(
-        "QDoubleSpinBox { color: white; background: rgba(255,255,255,40); "
-        "border: 1px solid black; font-size: 10px; }"
-    )
-    slider = _QW.QSlider(_QC.Qt.Orientation.Horizontal, row)
-    slider.setRange(int(min_val * SCALE), int(max_val * SCALE))
-    slider.setValue(int(default * SCALE))
-    def _spin_to_slider(v, _s=slider, _sc=SCALE):
-        _s.blockSignals(True); _s.setValue(int(v * _sc)); _s.blockSignals(False)
-    def _slider_to_spin(v, _sp=spin, _sc=SCALE):
-        _sp.blockSignals(True); _sp.setValue(v / _sc); _sp.blockSignals(False)
-    spin.valueChanged.connect(_spin_to_slider)
-    slider.valueChanged.connect(_slider_to_spin)
-    h.addWidget(lbl)
-    h.addWidget(slider, 1)
-    h.addWidget(spin)
-    return row, spin, slider
+    """Return (row_widget, spinbox, slider) — shared theme implementation."""
+    from spyde.qt.style import make_slider_row
+    return make_slider_row(parent, label_text, min_val, max_val, default,
+                           decimals, suffix)
 
 
 # Module-level set of toolbar ids that have already had the OM caret built.
@@ -1782,6 +1738,8 @@ def orientation_mapping(
         "run_btn": [None],
         "normalize_templates": [False],
         "ipf_mask_circles": [],   # list of [cx, cy, r] in IPF stereographic coords
+        "active_step": [0],       # current wizard tab; IPF window only shows on 2 (Refine)
+        "ipf_user_closed": [False],  # user pressed X on the IPF window; cleared on re-entering Refine
         "matching_cache": [None],  # pre-computed slices+templates from _build_matching_cache
         "refit_generation": [0],   # incremented on each schedule; threads skip stale runs
         "gen_relay": [None],       # kept alive so queued signal survives until GUI thread delivers it
@@ -1805,25 +1763,14 @@ def orientation_mapping(
 
     layout = caret.layout()
 
-    # ── Helper builders ────────────────────────────────────────────────────────
+    # ── Helper builders — shared theme factories (spyde/qt/style.py) ─────────
     W = 240
-
-    def _lbl(text, parent):
-        l = _QW.QLabel(text, parent)
-        l.setStyleSheet("color: white; font-size: 10px;")
-        l.setWordWrap(True)
-        return l
-
-    def _btn(text, parent, enabled=True):
-        b = _QW.QPushButton(text, parent)
-        b.setEnabled(enabled)
-        b.setStyleSheet(
-            "QPushButton { color: white; background: rgba(255,255,255,30); "
-            "border: 1px solid rgba(255,255,255,60); padding: 3px 6px; }"
-            "QPushButton:disabled { color: rgba(255,255,255,60); "
-            "background: rgba(255,255,255,10); }"
-        )
-        return b
+    from spyde.qt.style import (
+        CHECKBOX_QSS as _chk_qss,
+        make_label as _lbl,
+        make_button as _btn,
+        make_double_spin as _make_spin,
+    )
 
     def _hrow(*widgets):
         w = _QW.QWidget()
@@ -1836,19 +1783,15 @@ def orientation_mapping(
         return w
 
     def _spin(parent, lo, hi, val, dec, suf=""):
-        s = _QW.QDoubleSpinBox(parent)
-        s.setRange(lo, hi); s.setValue(val); s.setDecimals(dec)
-        if suf: s.setSuffix(suf)
-        s.setFixedWidth(72)
-        s.setStyleSheet(
-            "QDoubleSpinBox { color: white; background: rgba(255,255,255,40); "
-            "border: 1px solid rgba(255,255,255,60); font-size: 10px; }"
-        )
-        return s
+        return _make_spin(parent, lo, hi, val, dec, suf)
 
     # ── CheckButtonGroup-style step selector ───────────────────────────────────
     def _on_om_tab_changed(idx):
+        state["active_step"][0] = idx
         on_refine = idx == 2
+        if on_refine:
+            # Re-entering Refine forgets a previous X-press on the IPF window
+            state["ipf_user_closed"][0] = False
         ipf_w = state["ipf_widget"][0]
         if ipf_w is not None:
             ipf_w.show() if on_refine else ipf_w.hide()
@@ -1893,7 +1836,7 @@ def orientation_mapping(
     p2 = _QW.QWidget(); v2 = _QW.QVBoxLayout(p2); v2.setContentsMargins(4, 4, 4, 4); v2.setSpacing(4)
     gamma_row, gamma_s, gamma_sl = _make_slider_row(p2, "Gamma", 0.1, 1.5, 1.0, decimals=2)
     # Min intensity as percentage of brightest spot (0–100%)
-    min_i_row, min_i_s, min_i_sl = _make_slider_row(p2, "Min intens.", 0.0, 100.0, 10.0, decimals=1, suffix="%")
+    min_i_row, min_i_s, min_i_sl = _make_slider_row(p2, "Min intensity", 0.0, 100.0, 10.0, decimals=1, suffix="%")
     # Scale: start at signal scale, allow ±10%
     sc_lo = round(sig_scale * 0.9, 6)
     sc_hi = round(sig_scale * 1.1, 6)
@@ -1901,7 +1844,7 @@ def orientation_mapping(
     scale_row, scale_s, scale_sl = _make_slider_row(p2, "Scale", sc_lo, sc_hi, sig_scale, decimals=sc_step_dec)
     norm_chk = _QW.QCheckBox("Normalize templates", p2)
     norm_chk.setChecked(False)
-    norm_chk.setStyleSheet("QCheckBox { color: white; font-size: 10px; }")
+    norm_chk.setStyleSheet(_chk_qss)
     refine_lbl = _lbl("Generate library first.", p2)
     for r in [gamma_row, min_i_row, scale_row]:
         r.setEnabled(False)
@@ -1913,16 +1856,21 @@ def orientation_mapping(
     v2.addWidget(norm_chk)
     stack.addWidget(p2)
 
-    # ── Page 3: Run ───────────────────────────────────────────────────────────
+    # ── Page 3: Run (batch compute → orientation map + IPF window) ───────────
     p3 = _QW.QWidget(); v3 = _QW.QVBoxLayout(p3); v3.setContentsMargins(4, 4, 4, 4); v3.setSpacing(4)
     run_lbl = _lbl("", p3)
-    run_btn_w = _btn("Submit", p3, enabled=False)
+    nbest_s = _spin(p3, 1, 20, 5, 0)
+    run_btn_w = _btn("Compute Map", p3, enabled=False)
+    om_save_btn = _btn("Save Orientations…", p3, enabled=False)
     v3.addWidget(_lbl("Run full orientation mapping on the dataset.", p3))
+    v3.addWidget(_hrow(_lbl("Best matches kept:", p3), nbest_s))
     v3.addWidget(run_btn_w)
+    v3.addWidget(om_save_btn)
     v3.addWidget(run_lbl)
     stack.addWidget(p3)
     state["run_status"][0] = run_lbl
     state["run_btn"][0] = run_btn_w
+    state["om_result"] = [None]
 
     layout.addWidget(step_bar)
     layout.addWidget(stack)
@@ -1933,6 +1881,22 @@ def orientation_mapping(
     # caret shows with correct geometry on the first click.
     om_action = toolbar._find_action(action_name)
     if om_action is not None:
+        # Scope the refine overlays (scatter, circle ROI, IPF window) to the
+        # action: toggling the caret off must hide them, toggling back on
+        # restores whatever the active wizard tab needs.
+        def _on_om_action_toggled(checked):
+            on_refine = checked and state["active_step"][0] == 2
+            ipf_w = state["ipf_widget"][0]
+            if ipf_w is not None:
+                ipf_w.setVisible(on_refine and not state["ipf_user_closed"][0])
+            sc = state["scatter_item"][0]
+            if sc is not None:
+                sc.setVisible(on_refine)
+            roi = state["circle_roi"][0]
+            if roi is not None:
+                roi.setVisible(on_refine)
+
+        om_action.toggled.connect(_on_om_action_toggled)
         om_action.setChecked(True)
     pos_fn = toolbar.action_widgets.get(action_name, {}).get("position_fn")
     if pos_fn is not None:
@@ -2079,6 +2043,25 @@ def orientation_mapping(
         _mw_size = main_window.size()
         _ipf_side = min(_mw_size.width(), _mw_size.height()) // 4
         ipf_plot_window.resize(_ipf_side, _ipf_side)
+
+        # Scope the IPF window to this action: without owner/controlling_action
+        # the MDI 3-state visibility logic force-shows it on every same-tree
+        # activation, so it could never stay hidden.
+        ipf_plot_window.owner_plot_window = plot.plot_window
+        ipf_plot_window.controlling_action = toolbar._find_action(action_name)
+        ipf_plot_window.visibility_gate = lambda: (
+            state["active_step"][0] == 2 and not state["ipf_user_closed"][0]
+        )
+
+        def _on_ipf_close_request():
+            # X on the IPF window hides it for the rest of this Refine visit;
+            # destroying it would leave a bare title-bar shell when the wizard
+            # re-shows it (QMdiSubWindow close hides the inner container).
+            state["ipf_user_closed"][0] = True
+            ipf_plot_window.hide()
+
+        ipf_plot_window.on_close_request = _on_ipf_close_request
+
         main_window._auto_position_near_owner(ipf_plot_window)
         state["ipf_widget"][0] = ipf_plot_window
         ipf_plot_window.hide()  # shown by _select_step(2)
@@ -2341,6 +2324,8 @@ def orientation_mapping(
                     mask |= dist2 <= r ** 2
                 if mask.any():
                     _rot_mask = mask
+            # Batch compute (Run page) uses the same mask the refine view shows
+            state["rot_mask"] = _rot_mask
 
             def _run():
                 if state["refit_generation"][0] != my_gen:
@@ -2411,7 +2396,727 @@ def orientation_mapping(
 
         _schedule()
 
-    run_btn_w.clicked.connect(lambda: _do_run_fit(state))
+    # ── Batch compute: find_vectors-style workflow ────────────────────────────
+    # Compute Map → chunked dispatch with the IPF-RGB orientation map painting
+    # in live → lightweight result window: orientation map (navigator, left) +
+    # per-phase IPFs with the current position's orientations (signal, right).
+
+    class _OMRelay(_QC.QObject):
+        done = _QC.Signal(object, object)   # SpyDEOrientationMap, new_tree
+        failed = _QC.Signal(str)
+
+    # No Qt parent: state keeps the reference (toolbar may be a test double)
+    om_relay = _OMRelay()
+    state["om_relay"] = om_relay
+
+    def _om_read_selection(signal_plot, new_tree, nav_shape_2d):
+        """
+        Current navigator selection driving the result signal plot.
+
+        Returns ("point", iy, ix) for crosshair-style selectors, or
+        ("roi", ys, xs) slices when the selector spans a region
+        (Integrate mode) — the IPF then shows ALL points in the ROI.
+        """
+        ny, nx = nav_shape_2d
+        try:
+            selector = signal_plot.plot_window.parent_selector
+            if selector is not None:
+                method = getattr(selector, "get_selected_indices", None) \
+                    or getattr(selector, "_get_selected_indices", None)
+                raw_idx = np.asarray(method())
+                if raw_idx.ndim == 2 and len(raw_idx) >= 2:
+                    lo = np.floor(raw_idx.min(axis=0)).astype(int)
+                    hi = np.ceil(raw_idx.max(axis=0)).astype(int)
+                    if int((hi - lo).max()) >= 1:  # region, not a point
+                        y0 = int(np.clip(lo[0], 0, ny - 1))
+                        y1 = int(np.clip(hi[0], 0, ny - 1))
+                        x0 = int(np.clip(lo[1], 0, nx - 1))
+                        x1 = int(np.clip(hi[1], 0, nx - 1))
+                        return ("roi", slice(y0, y1 + 1), slice(x0, x1 + 1))
+                idx = np.mean(np.atleast_2d(raw_idx), axis=0).astype(int)
+                iy = int(np.clip(idx[0], 0, ny - 1))
+                ix = int(np.clip(idx[1], 0, nx - 1))
+                return ("point", iy, ix)
+            nav_idx = new_tree.root.axes_manager.indices
+            return ("point", int(nav_idx[1]), int(nav_idx[0]))
+        except Exception:
+            return ("point", 0, 0)
+
+    def _om_letter_icon(text):
+        from PySide6 import QtGui as _QG
+        pm = _QG.QPixmap(22, 22)
+        pm.fill(_QC.Qt.GlobalColor.transparent)
+        p = _QG.QPainter(pm)
+        p.setPen(_QG.QPen(_QG.QColor("white")))
+        f = p.font()
+        f.setBold(True)
+        f.setPointSize(9 if len(text) > 1 else 11)
+        p.setFont(f)
+        p.drawText(pm.rect(), _QC.Qt.AlignmentFlag.AlignCenter, text)
+        p.end()
+        return _QG.QIcon(pm)
+
+    def _build_ipf_result_widget(om):
+        """
+        Result view for the orientation map's signal window.
+
+        Page 0: side-by-side 2D IPF panels (one per phase) with the current
+        position's candidates (best solid, runners-up faded), or all points
+        in the ROI when the navigator selector is in Integrate mode.
+        Page 1: reduced 3D view — fundamental-sector outline on a minimal
+        sphere; the marker is a point PLUS a tangent arrow encoding the
+        in-plane rotation the 2D IPF cannot show.
+
+        Exposed API (used by the navigation hook and toolbar actions):
+        _update_position(iy, ix), _update_roi(ys, xs),
+        _set_direction("x"|"y"|"z"), _set_3d(bool), _gl_available.
+        """
+        import pyqtgraph as _pg
+        from spyde.signals.orientation_map import ipf_triangle_xy
+
+        view_state = {"direction": "z", "pos": (0, 0), "roi": None}
+
+        stacked = _QW.QStackedWidget()
+
+        # ── Page 0: 2D IPF panels ─────────────────────────────────────────────
+        page2d = _QW.QWidget()
+        h = _QW.QHBoxLayout(page2d)
+        h.setContentsMargins(2, 2, 2, 2)
+        h.setSpacing(4)
+
+        best_items, rest_items, roi_items = [], [], []
+        for i in range(om.n_phases):
+            panel = _QW.QWidget()
+            pv = _QW.QVBoxLayout(panel)
+            pv.setContentsMargins(0, 0, 0, 0)
+            pv.setSpacing(2)
+            title = _QW.QLabel(om.phases[i].get("name", f"phase {i}"))
+            title.setStyleSheet("color: white; font-size: 10px;")
+            title.setAlignment(_QC.Qt.AlignmentFlag.AlignHCenter)
+            pw = _pg.PlotWidget()
+            pw.setBackground("k")
+            pw.hideAxis("bottom")
+            pw.hideAxis("left")
+            pw.setAspectLocked(True)
+            try:
+                edges, label_xy, labels = ipf_triangle_xy(om.orix_phase(i))
+                pw.plot(edges[:, 0], edges[:, 1],
+                        pen=_pg.mkPen("w", width=1.5))
+                for (lx, ly), txt in zip(label_xy, labels):
+                    ti = _pg.TextItem(txt, color="w", anchor=(0.5, 0.5))
+                    ti.setPos(float(lx), float(ly))
+                    pw.addItem(ti)
+            except Exception as exc:
+                print(f"IPF triangle for phase {i} failed: {exc}")
+            roi_sc = _pg.ScatterPlotItem(
+                symbol="o", size=4, pen=None,
+                brush=_pg.mkBrush(80, 180, 255, 60),
+            )
+            rest = _pg.ScatterPlotItem(
+                symbol="o", size=6, pen=None,
+                brush=_pg.mkBrush(255, 255, 255, 70),
+            )
+            best = _pg.ScatterPlotItem(
+                symbol="o", size=11,
+                pen=_pg.mkPen("w", width=1.5),
+                brush=_pg.mkBrush(255, 60, 60, 220),
+            )
+            pw.addItem(roi_sc)
+            pw.addItem(rest)
+            pw.addItem(best)
+            pv.addWidget(title)
+            pv.addWidget(pw)
+            h.addWidget(panel)
+            best_items.append(best)
+            rest_items.append(rest)
+            roi_items.append(roi_sc)
+
+        stacked.addWidget(page2d)
+
+        # ── Page 1: reduced 3D view (lazy, requires PyOpenGL) ─────────────────
+        gl_state = {"view": None, "scatter": None, "tangent": None,
+                    "roi_scatter": None}
+        try:
+            import pyqtgraph.opengl as _gl  # noqa: F401
+            gl_available = True
+        except Exception:
+            gl_available = False
+
+        def _ensure_gl():
+            if gl_state["view"] is not None or not gl_available:
+                return gl_state["view"]
+            import pyqtgraph.opengl as gl
+            from orix.projections import StereographicProjection  # noqa
+            view = gl.GLViewWidget()
+            view.setBackgroundColor("k")
+            view.setCameraPosition(distance=3.0)
+            # Minimal sphere context: three great circles
+            t = np.linspace(0, 2 * np.pi, 120)
+            for circle in (
+                np.stack([np.cos(t), np.sin(t), 0 * t], axis=1),
+                np.stack([np.cos(t), 0 * t, np.sin(t)], axis=1),
+                np.stack([0 * t, np.cos(t), np.sin(t)], axis=1),
+            ):
+                view.addItem(gl.GLLinePlotItem(
+                    pos=circle.astype(np.float32),
+                    color=(0.35, 0.35, 0.35, 1.0), width=1.0,
+                    antialias=True,
+                ))
+            # Fundamental-sector outline of phase 0 (context for the marker)
+            try:
+                sector = om.orix_phase(0).point_group.fundamental_sector
+                from pyxem.signals.indexation_results import (
+                    _closed_edges_in_hemisphere,
+                )
+                edges3 = _closed_edges_in_hemisphere(sector.edges, sector)
+                view.addItem(gl.GLLinePlotItem(
+                    pos=edges3.data.reshape(-1, 3).astype(np.float32),
+                    color=(1.0, 1.0, 1.0, 1.0), width=2.0, antialias=True,
+                ))
+            except Exception as exc:
+                print(f"3D sector outline failed: {exc}")
+            gl_state["roi_scatter"] = gl.GLScatterPlotItem(
+                pos=np.zeros((1, 3), np.float32), size=3.0,
+                color=(0.3, 0.7, 1.0, 0.45),
+            )
+            gl_state["roi_scatter"].setVisible(False)
+            gl_state["scatter"] = gl.GLScatterPlotItem(
+                pos=np.zeros((1, 3), np.float32), size=10.0,
+                color=(1.0, 0.25, 0.25, 1.0),
+            )
+            gl_state["tangent"] = gl.GLLinePlotItem(
+                pos=np.zeros((2, 3), np.float32),
+                color=(1.0, 0.85, 0.2, 1.0), width=3.0, antialias=True,
+            )
+            view.addItem(gl_state["roi_scatter"])
+            view.addItem(gl_state["scatter"])
+            view.addItem(gl_state["tangent"])
+            gl_state["view"] = view
+            stacked.addWidget(view)
+            return view
+
+        # ── Refresh logic ─────────────────────────────────────────────────────
+        def _refresh_point():
+            iy, ix = view_state["pos"]
+            d = view_state["direction"]
+            try:
+                xy, pidx, _corr = om.ipf_xy(iy, ix, direction=d)
+            except Exception:
+                return
+            for i in range(om.n_phases):
+                best_items[i].setData([])
+                rest_items[i].setData([])
+                roi_items[i].setData([])
+            p0 = int(pidx[0])
+            best_items[p0].setData([{"pos": (float(xy[0, 0]),
+                                             float(xy[0, 1]))}])
+            for k in range(1, om.n_best):
+                pk = int(pidx[k])
+                rest_items[pk].addPoints(
+                    [{"pos": (float(xy[k, 0]), float(xy[k, 1]))}]
+                )
+            if gl_state["view"] is not None:
+                try:
+                    v, tang, _p = om.ipf_xyz(iy, ix, direction=d)
+                    gl_state["scatter"].setData(
+                        pos=v[np.newaxis].astype(np.float32))
+                    arrow = np.stack([v, v + 0.3 * tang]).astype(np.float32)
+                    gl_state["tangent"].setData(pos=arrow)
+                    gl_state["scatter"].setVisible(True)
+                    gl_state["tangent"].setVisible(True)
+                    gl_state["roi_scatter"].setVisible(False)
+                except Exception as exc:
+                    print(f"3D marker failed: {exc}")
+
+        def _refresh_roi():
+            roi = view_state["roi"]
+            if roi is None:
+                return
+            ys, xs = roi
+            d = view_state["direction"]
+            for i in range(om.n_phases):
+                best_items[i].setData([])
+                rest_items[i].setData([])
+                try:
+                    xy, _c = om.ipf_xy_roi(ys, xs, phase=i, best_only=False,
+                                           direction=d)
+                    roi_items[i].setData(pos=xy)
+                except Exception:
+                    roi_items[i].setData([])
+            if gl_state["view"] is not None:
+                try:
+                    from orix.quaternion import Rotation
+                    from spyde.signals.orientation_map import \
+                        _direction_vector
+                    q = om.quats[ys, xs].reshape(-1, 4)
+                    if len(q) > 20000:
+                        q = q[::int(np.ceil(len(q) / 20000))]
+                    vec = (Rotation(q) * _direction_vector(d))
+                    vec = vec.in_fundamental_sector(
+                        om.orix_phase(0).point_group)
+                    gl_state["roi_scatter"].setData(
+                        pos=vec.unit.data.reshape(-1, 3).astype(np.float32))
+                    gl_state["roi_scatter"].setVisible(True)
+                    gl_state["scatter"].setVisible(False)
+                    gl_state["tangent"].setVisible(False)
+                except Exception as exc:
+                    print(f"3D ROI scatter failed: {exc}")
+
+        def _refresh():
+            if view_state["roi"] is not None:
+                _refresh_roi()
+            else:
+                _refresh_point()
+
+        # ── Public API ────────────────────────────────────────────────────────
+        def _update_position(iy, ix):
+            view_state["pos"] = (int(iy), int(ix))
+            view_state["roi"] = None
+            _refresh()
+
+        def _update_roi(ys, xs):
+            view_state["roi"] = (ys, xs)
+            _refresh()
+
+        def _set_direction(d):
+            view_state["direction"] = str(d).lower()
+            _refresh()
+
+        def _set_3d(on):
+            if on and gl_available:
+                _ensure_gl()
+                stacked.setCurrentIndex(1)
+                _refresh()
+            else:
+                stacked.setCurrentIndex(0)
+
+        stacked._update_position = _update_position
+        stacked._update_roi = _update_roi
+        stacked._set_direction = _set_direction
+        stacked._set_3d = _set_3d
+        stacked._gl_available = gl_available
+        return stacked
+
+    def _on_om_map_done(om, new_tree):
+        try:
+            poll_t = state.get("_om_poll_timer")
+            if poll_t is not None:
+                poll_t.stop()
+            state["om_result"][0] = om
+            new_tree.orientation_map = om
+            om_save_btn.setEnabled(True)
+            nav_shape_2d = om.nav_shape
+
+            # Final authoritative orientation map + machinery-friendly data
+            nav_plot_obj = None
+            nav_pws = list(new_tree.navigator_plot_manager.plot_windows.keys())
+            if nav_pws:
+                nav_plots = new_tree.navigator_plot_manager.plots.get(
+                    nav_pws[0], [])
+                if nav_plots:
+                    nav_plot_obj = nav_plots[0]
+                    nav_plot_obj.image_item.setImage(
+                        om.ipf_color_map("z"), autoLevels=False,
+                        levels=(0, 255),
+                    )
+            try:
+                nav_list = new_tree.navigator_signals.get("base")
+                if nav_list:
+                    nav_list[-1].data = om.correlation_map()
+            except Exception:
+                pass
+
+            # Final authoritative X/Y/Z panels (replace the live preview)
+            xyz_items = state.get("_om_xyz_items", [])
+            for di, direction in enumerate(("x", "y", "z")):
+                if di < len(xyz_items):
+                    try:
+                        xyz_items[di].setImage(
+                            om.ipf_color_map(direction),
+                            autoLevels=False, levels=(0, 255),
+                        )
+                    except Exception:
+                        pass
+
+            # Swap the result signal plot for the per-phase IPF panels
+            ipf_widget = _build_ipf_result_widget(om)
+            for sp in new_tree.signal_plots:
+                pwin = sp.plot_window
+                try:
+                    pwin.plot_widget.hide()
+                    pwin.container.layout().addWidget(ipf_widget)
+                except Exception as exc:
+                    print(f"IPF widget swap failed: {exc}")
+
+                def _make_hook(orig_ud, signal_plot):
+                    def _hooked(new_data, force=False):
+                        try:
+                            orig_ud(new_data, force=force)
+                        except Exception:
+                            pass
+                        sel = _om_read_selection(signal_plot, new_tree,
+                                                 nav_shape_2d)
+                        if sel[0] == "roi":
+                            ipf_widget._update_roi(sel[1], sel[2])
+                        else:
+                            ipf_widget._update_position(sel[1], sel[2])
+                    return _hooked
+
+                sp.update_data = _make_hook(sp.update_data, sp)
+
+            # ── View controls on the RIGHT toolbar of the IPF window ─────────
+            # (convention: processing actions live on the bottom toolbar,
+            # view controls on the right one)
+            try:
+                ps = new_tree.signal_plots[0].plot_state
+                tb_r = ps.toolbar_right
+                dir_actions = {}
+                state_3d = [False]
+
+                def _apply_direction(d):
+                    ipf_widget._set_direction(d)
+                    try:
+                        if nav_plot_obj is not None:
+                            nav_plot_obj.image_item.setImage(
+                                om.ipf_color_map(d), autoLevels=False,
+                                levels=(0, 255),
+                            )
+                    except Exception:
+                        pass
+                    for dd, act in dir_actions.items():
+                        act.blockSignals(True)
+                        act.setChecked(dd == d)
+                        act.blockSignals(False)
+
+                for d in ("x", "y", "z"):
+                    act, _w = tb_r.add_action(
+                        f"IPF direction {d.upper()}",
+                        _om_letter_icon(d.upper()),
+                        (lambda tb, action_name=None, _d=d:
+                         _apply_direction(_d)),
+                        False, None, None,
+                    )
+                    act.setCheckable(True)
+                    dir_actions[d] = act
+                dir_actions["z"].setChecked(True)
+
+                def _toggle_3d(tb, action_name=None):
+                    state_3d[0] = not state_3d[0]
+                    try:
+                        ipf_widget._set_3d(state_3d[0])
+                    except Exception as exc:
+                        # GLViewWidget creation can fail even with PyOpenGL
+                        # installed (drivers, remote desktop); report instead
+                        # of silently doing nothing.
+                        state_3d[0] = False
+                        run_lbl.setText(f"3D view failed: {exc}")
+                    act3d.blockSignals(True)
+                    act3d.setChecked(state_3d[0])
+                    act3d.blockSignals(False)
+
+                act3d, _w3 = tb_r.add_action(
+                    "3D IPF (in-plane rotation)", _om_letter_icon("3D"),
+                    _toggle_3d, False, None, None,
+                )
+                # Checkable purely for visual feedback; _toggle_3d owns state.
+                act3d.setCheckable(True)
+                if not ipf_widget._gl_available:
+                    act3d.setEnabled(False)
+                    act3d.setToolTip("Install PyOpenGL for the 3D IPF view")
+                tb_r.set_size()
+                tb_r.show()
+            except Exception as exc:
+                print(f"IPF toolbar wiring failed: {exc}")
+
+            ipf_widget._update_position(nav_shape_2d[0] // 2,
+                                        nav_shape_2d[1] // 2)
+            run_lbl.setText("✓ Done")
+        except Exception as exc:
+            import traceback as _tb
+            _tb.print_exc()
+            run_lbl.setText(f"Result display error: {exc}")
+        finally:
+            run_btn_w.setEnabled(True)
+
+    def _on_om_map_failed(msg):
+        poll_t = state.get("_om_poll_timer")
+        if poll_t is not None:
+            poll_t.stop()
+        run_lbl.setText(msg)
+        run_btn_w.setEnabled(True)
+
+    om_relay.done.connect(_on_om_map_done)
+    om_relay.failed.connect(_on_om_map_failed)
+
+    def _on_compute_map_clicked():
+        import hyperspy.api as hs
+        import dask.array as da
+        from spyde.drawing.update_functions import (
+            ensure_live_buffer, read_live_buffer,
+        )
+        from spyde.drawing.selectors import CrosshairSelector
+        from spyde.actions.find_vectors import _copy_nav_axes_to
+        from spyde.actions.orientation_compute import _do_compute_orientations
+
+        if state["sim"][0] is None:
+            run_lbl.setText("Generate library first.")
+            return
+        sim_val = state["sim"][0]
+        sig_ref = state["signal"]
+        nav_dim = sig_ref.axes_manager.navigation_dimension
+        if nav_dim != 2:
+            run_lbl.setText("2D navigation only (for now).")
+            return
+
+        run_btn_w.setEnabled(False)
+        run_lbl.setText("Computing…")
+
+        params = dict(
+            n_best=int(nbest_s.value()),
+            gamma=float(state["gamma"][0]),
+            normalize_templates=bool(state["normalize_templates"][0]),
+            rot_mask=state.get("rot_mask"),
+        )
+        nav_shape_2d = tuple(sig_ref.data.shape[:nav_dim])
+        shm_name = f"spyde_om_{id(plot)}"
+        # 9 channels: live IPF RGB for X, Y, Z stacked channel-wise
+        shm = ensure_live_buffer(nav_shape_2d + (9,), shm_name)
+        state["_om_shm"] = shm  # keep alive
+
+        # Lightweight result tree: lazy placeholder root + count-free
+        # navigator override (no signal copy, no navigator recompute).
+        data_shape = sig_ref.data.shape
+        nav_chunks = tuple(min(32, int(s)) for s in data_shape[:nav_dim])
+        placeholder = da.zeros(
+            data_shape, chunks=nav_chunks + tuple(data_shape[nav_dim:]),
+            dtype=np.float32,
+        )
+        new_sig = sig_ref._deepcopy_with_new_data(placeholder)
+        if not new_sig._lazy:
+            new_sig._lazy = True
+            new_sig._assign_subclass()
+        new_sig.metadata.General.title = (
+            sig_ref.metadata.get_item("General.title", "Signal")
+            + " — Orientations"
+        )
+        nav_sig = hs.signals.BaseSignal(
+            np.zeros(nav_shape_2d, dtype=np.float32)
+        ).T
+        nav_sig.metadata.General.title = "Orientation map"
+        _copy_nav_axes_to(sig_ref, nav_sig)
+
+        main_window.add_signal(new_sig, selector_type=CrosshairSelector,
+                               navigator_override=nav_sig)
+        new_tree = main_window.signal_trees[-1]
+
+        nav_pws = list(new_tree.navigator_plot_manager.plot_windows.keys())
+        nav_plot_ref = [None]
+        nav_pw_ref = [None]
+        if nav_pws:
+            nav_pw_ref[0] = nav_pws[0]
+            nav_plots = new_tree.navigator_plot_manager.plots.get(
+                nav_pws[0], [])
+            if nav_plots:
+                nav_plot_ref[0] = nav_plots[0]
+        if nav_plot_ref[0] is not None:
+            nav_plot_ref[0].image_item.setImage(
+                np.zeros(nav_shape_2d + (3,), dtype=np.uint8),
+                autoLevels=False, levels=(0, 255),
+            )
+
+        # ── Live IPF X/Y/Z window: three navigator-linked panels ─────────────
+        # All three maps paint in chunk-by-chunk during the compute; the
+        # panels share the navigator's coordinate frame, mirror its crosshair
+        # and clicking any panel moves the navigation position.
+        import pyqtgraph as _pg_xyz
+        xyz_win = main_window.add_plot_window(
+            is_navigator=False, signal_tree=new_tree,
+        )
+        xyz_win.setWindowTitle("IPF X / Y / Z")
+        xyz_win.owner_plot_window = nav_pw_ref[0]
+        _mw_sz = main_window.size()
+        _panel = max(180, min(_mw_sz.width(), _mw_sz.height()) // 5)
+        xyz_win.resize(3 * _panel, _panel + 60)
+        _xyz_glw = _pg_xyz.GraphicsLayoutWidget()
+        _xyz_glw.setBackground("k")
+        xyz_items = []
+        xyz_plots = []
+        _nav_tr = None
+        if nav_plot_ref[0] is not None:
+            try:
+                _nav_tr = nav_plot_ref[0].image_item.transform()
+            except Exception:
+                _nav_tr = None
+        for _col, _dname in enumerate(("X", "Y", "Z")):
+            _p = _xyz_glw.addPlot(row=0, col=_col, title=_dname)
+            _p.hideAxis("bottom")
+            _p.hideAxis("left")
+            _p.setAspectLocked(True)
+            _img = _pg_xyz.ImageItem(
+                np.zeros(nav_shape_2d + (3,), dtype=np.uint8))
+            if _nav_tr is not None:
+                # same pixel→data transform as the navigator so the panels
+                # live in navigator coordinates
+                _img.setTransform(_nav_tr)
+            _p.addItem(_img)
+            xyz_items.append(_img)
+            xyz_plots.append(_p)
+        # pan/zoom the three panels together
+        for _p in xyz_plots[1:]:
+            _p.vb.setXLink(xyz_plots[0].vb)
+            _p.vb.setYLink(xyz_plots[0].vb)
+        xyz_win.plot_widget.setParent(None)
+        xyz_win.container.layout().addWidget(_xyz_glw)
+        main_window._auto_position_near_owner(xyz_win)
+        # X hides (never destroys) so the live poll keeps a valid target;
+        # a destroyed shell would come back as a bare title bar.
+        _xyz_closed = [False]
+        xyz_win.visibility_gate = lambda: not _xyz_closed[0]
+
+        def _xyz_close():
+            _xyz_closed[0] = True
+            xyz_win.hide()
+
+        xyz_win.on_close_request = _xyz_close
+        state["_om_xyz_items"] = xyz_items
+        state["_om_xyz_win"] = xyz_win
+
+        # Crosshair link: mirror the result tree's navigator selector in every
+        # panel, and let a click in any panel move the navigation position
+        # (which drives the per-phase IPF result window).
+        try:
+            _xyz_sel = new_tree.signal_plots[0].plot_window.parent_selector
+        except Exception:
+            _xyz_sel = None
+        if _xyz_sel is not None and hasattr(_xyz_sel, "roi"):
+            _markers = []
+            for _p in xyz_plots:
+                _vl = _pg_xyz.InfiniteLine(
+                    angle=90, movable=False,
+                    pen=_pg_xyz.mkPen(255, 255, 255, 150, width=1.0))
+                _hl = _pg_xyz.InfiniteLine(
+                    angle=0, movable=False,
+                    pen=_pg_xyz.mkPen(255, 255, 255, 150, width=1.0))
+                _vl.setZValue(50)
+                _hl.setZValue(50)
+                _p.addItem(_vl)
+                _p.addItem(_hl)
+                _markers.append((_vl, _hl))
+
+            def _sync_xyz_markers(*_a, _sel=_xyz_sel, _mk=_markers):
+                try:
+                    pos = _sel.roi.pos()
+                    size = _sel.roi.size()
+                    cx = pos.x() + size[0] / 2.0
+                    cy = pos.y() + size[1] / 2.0
+                except Exception:
+                    return
+                for vl, hl in _mk:
+                    vl.setPos(cx)
+                    hl.setPos(cy)
+
+            _xyz_sel.roi.sigRegionChanged.connect(_sync_xyz_markers)
+            _sync_xyz_markers()
+
+            def _on_xyz_click(ev, _sel=_xyz_sel, _plots=xyz_plots):
+                if ev.button() != _QC.Qt.MouseButton.LeftButton:
+                    return
+                for p in _plots:
+                    vb = p.vb
+                    if vb.sceneBoundingRect().contains(ev.scenePos()):
+                        pt = vb.mapSceneToView(ev.scenePos())
+                        size = _sel.roi.size()
+                        _sel.roi.setPos(pt.x() - size[0] / 2.0,
+                                        pt.y() - size[1] / 2.0)
+                        break
+
+            _xyz_glw.scene().sigMouseClicked.connect(_on_xyz_click)
+
+        _stopped = [False]
+        old_poll = state.get("_om_poll_timer")
+        if old_poll is not None:
+            old_poll.stop()
+            old_poll.deleteLater()
+        poll_timer = _QC.QTimer(toolbar)
+        poll_timer.setInterval(150)
+        state["_om_poll_timer"] = poll_timer
+
+        def _poll():
+            nav_p = nav_plot_ref[0]
+            if nav_p is None:
+                return
+            arr = read_live_buffer(nav_shape_2d + (9,), shm_name)
+            finite = np.isfinite(arr)
+            if not finite.any():
+                return
+            disp = np.clip(np.nan_to_num(arr), 0, 255).astype(np.uint8)
+            # Navigator shows the Z map; the XYZ window shows all three.
+            nav_p.image_item.setImage(disp[..., 6:9], autoLevels=False,
+                                      levels=(0, 255))
+            for di, img in enumerate(state.get("_om_xyz_items", [])):
+                img.setImage(disp[..., 3 * di:3 * di + 3],
+                             autoLevels=False, levels=(0, 255))
+            pct = 100.0 * float(finite[..., 0].mean())
+            run_lbl.setText(f"Computing… {pct:.0f}%")
+
+        poll_timer.timeout.connect(_poll)
+        poll_timer.start()
+
+        def _stop():
+            _stopped[0] = True
+            poll_timer.stop()
+            run_btn_w.setEnabled(True)
+            run_lbl.setText("Stopped.")
+
+        if nav_pw_ref[0] is not None:
+            nav_pw_ref[0].set_stop_fn(_stop)
+
+        cache_snapshot = state["matching_cache"][0]
+
+        def _run():
+            try:
+                om = _do_compute_orientations(
+                    sig_ref, sim_val, params, main_window, None,
+                    shm_name=shm_name, stopped_flag=_stopped,
+                    cache=cache_snapshot,
+                )
+                if _stopped[0] or om is None:
+                    return
+                if nav_pw_ref[0] is not None:
+                    _QC.QMetaObject.invokeMethod(
+                        nav_pw_ref[0], "hide_stop_button",
+                        _QC.Qt.ConnectionType.QueuedConnection,
+                    )
+                om_relay.done.emit(om, new_tree)
+            except Exception as exc:
+                import traceback
+                traceback.print_exc()
+                if nav_pw_ref[0] is not None:
+                    _QC.QMetaObject.invokeMethod(
+                        nav_pw_ref[0], "hide_stop_button",
+                        _QC.Qt.ConnectionType.QueuedConnection,
+                    )
+                om_relay.failed.emit(f"Error: {exc}")
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_om_save_clicked():
+        om = state["om_result"][0]
+        if om is None:
+            return
+        path, _ = _QW.QFileDialog.getSaveFileName(
+            caret, "Save Orientation Map", "", "SpyDE Orientations (*.npz)"
+        )
+        if not path:
+            return
+        try:
+            om.save(path)
+            run_lbl.setText(f"Saved to {path}")
+        except Exception as exc:
+            run_lbl.setText(f"Save failed: {exc}")
+
+    om_save_btn.clicked.connect(_on_om_save_clicked)
+    run_btn_w.clicked.connect(_on_compute_map_clicked)
 
 
 def _do_run_fit(state):
