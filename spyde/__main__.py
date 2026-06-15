@@ -202,6 +202,38 @@ class MainWindow(QMainWindow):
             self.app.aboutToQuit.connect(self.dask_manager.shutdown)
             self.app.aboutToQuit.connect(self._shutdown_update_thread)
 
+        # Custom dark title bar (Windows only; no-op elsewhere / offscreen).
+        # Replaces the white native Win10 bar and hosts the menu plus the
+        # Collapse Sidebar / Organize Windows controls.
+        self._spyde_titlebar = None
+        from spyde.qt.title_bar import install_custom_titlebar
+        bar = install_custom_titlebar(self)
+        if bar is not None:
+            bar.collapse_btn.clicked.connect(self._toggle_sidebar)
+            bar.organize_btn.clicked.connect(self.tile_active_windows)
+
+    def _toggle_sidebar(self):
+        """Collapse / restore the Plot Control sidebar from the title bar."""
+        self.dock_manager.toggle_plot_control()
+
+    def nativeEvent(self, event_type, message):
+        """Frameless-window hit-testing on Windows so the OS still handles
+        edge-resize, snap and Aero shadow (delegated to title_bar). No-op when
+        the custom title bar isn't installed."""
+        if (getattr(self, "_spyde_titlebar", None) is not None
+                and event_type == b"windows_generic_MSG"):
+            try:
+                import ctypes
+                msg = ctypes.wintypes.MSG.from_address(int(message))
+                if msg.message == 0x0084:        # WM_NCHITTEST
+                    from spyde.qt.title_bar import handle_win_nchittest
+                    ht = handle_win_nchittest(self, message)
+                    if ht is not None:
+                        return True, ht
+            except Exception:
+                pass
+        return super().nativeEvent(event_type, message)
+
     @QtCore.Slot()
     def _on_dask_ready(self):
         print("MainWindow: Dask ready.")
