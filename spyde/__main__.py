@@ -44,7 +44,6 @@ from spyde.drawing.colormaps import COLORMAPS
 from spyde.dask_manager import DaskManager
 from spyde.dock_manager import DockManager
 from spyde.mdi_manager import MDIManager
-from spyde.drawing.signal_tree_presenter import build_axes_groups, build_metadata_dict
 from spyde.qt.style import APP_QSS
 
 SUPPORTED_EXTS = (".hspy", ".zspy", ".mrc", ".tif", ".tiff", ".de5")  # extend as needed
@@ -835,80 +834,6 @@ class MainWindow(QMainWindow):
             plot_manager=plot_manager,
             signal_tree=signal_tree,
         )
-
-    def update_metadata_widget(self, plot: Plot) -> None:
-        """Rebuild metadata panel for the active Plot's signal tree."""
-        if self.metadata_layout is None:
-            return
-        while self.metadata_layout.count():
-            item = self.metadata_layout.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.deleteLater()
-            else:
-                del item
-
-        if hasattr(plot, "signal_tree"):
-            metadata_dict = build_metadata_dict(plot.signal_tree)
-            for subsection, items in metadata_dict.items():
-                group = QtWidgets.QGroupBox(str(subsection))
-                group.setSizePolicy(
-                    QtWidgets.QSizePolicy.Policy.Expanding,
-                    QtWidgets.QSizePolicy.Policy.Fixed,
-                )
-                group.setFixedHeight(120)
-                group_layout = QtWidgets.QVBoxLayout(group)
-                group_layout.setContentsMargins(6, 6, 6, 6)
-                group_layout.setSpacing(0)
-                scroll = QtWidgets.QScrollArea()
-                scroll.setWidgetResizable(True)
-                scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-                scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-                container = QtWidgets.QWidget()
-                grid = QtWidgets.QGridLayout(container)
-                grid.setContentsMargins(0, 0, 0, 0)
-                grid.setHorizontalSpacing(12)
-                grid.setVerticalSpacing(4)
-                for row, (key, value) in enumerate((items or {}).items()):
-                    key_label = QtWidgets.QLabel(f"{key}:")
-                    value_label = QtWidgets.QLabel(f"{value}")
-                    key_label.setStyleSheet("font-size: 10px;")
-                    value_label.setStyleSheet("font-size: 10px;")
-                    key_label.setAlignment(
-                        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-                    )
-                    grid.addWidget(key_label, row, 0)
-                    grid.addWidget(value_label, row, 1)
-                grid.setColumnStretch(0, 0)
-                grid.setColumnStretch(1, 1)
-                scroll.setWidget(container)
-                group_layout.addWidget(scroll)
-                self.metadata_layout.addWidget(group)
-
-    def update_axes_widget(self, window: "Plot") -> None:
-        """
-        Update the axes widget based on the active window.
-
-        The Axes widget displays the navigation axes for the entire
-        Signal Tree (as they are shared) and the signal axes for the
-        current active signal in the window.
-        """
-        if self.axes_layout is None:
-            return
-        while self.axes_layout.count():
-            item = self.axes_layout.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.deleteLater()
-            else:
-                del item
-
-        if hasattr(window, "signal_tree") and window.signal_tree is not None:
-            plot_state = window.plot_state
-            current_signal = plot_state.current_signal if plot_state else None
-            groups = build_axes_groups(window.signal_tree, current_signal, window)
-            for group in groups:
-                self.axes_layout.addWidget(group)
 
     def set_cursor_readout(
         self, x=None, y=None, xpix=None, ypix=None, value=None

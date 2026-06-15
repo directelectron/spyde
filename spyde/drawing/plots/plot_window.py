@@ -84,9 +84,11 @@ class PlotWindow(FramelessSubWindow):
         # Use a QVBoxLayout with zero margins/spacing so the plot fills the subwindow.
         self.container = QtWidgets.QWidget()
         self.container.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, True)
-        # make it opaque so the border contrast is obvious
-        # light grey color
-        self.container.setStyleSheet("background-color: rgba(211, 211, 211, 170);")
+        # Thin themed frame around the plot (was an opaque light-grey block that
+        # clashed with the dark theme). The 1px container margins below show it
+        # as a subtle border.
+        from spyde.qt.style import BORDER_FAINT
+        self.container.setStyleSheet(f"background-color: {BORDER_FAINT};")
         container_layout = QtWidgets.QVBoxLayout(self.container)
         container_layout.setContentsMargins(1, 0, 1, 1)
         container_layout.setSpacing(0)

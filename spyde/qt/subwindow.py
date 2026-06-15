@@ -4,7 +4,7 @@ from PySide6.QtGui import QCursor, QIcon
 from spyde.drawing.toolbars.plot_control_toolbar import resolve_icon_path
 from spyde.qt.style import (
     RADIUS, GOOD, GOOD_HOVER, DANGER, DANGER_HOVER, ACCENT, ACCENT_BORDER,
-    SmoothButton,
+    TEXT, SmoothButton,
 )
 
 # New imports for painting/tinting
@@ -99,7 +99,7 @@ class FramelessSubWindow(QtWidgets.QMdiSubWindow):
 
         self.title_label = QtWidgets.QLabel("", self.title_bar)
         self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.title_label.setStyleSheet("color: #ffffff;")
+        self.title_label.setStyleSheet(f"color: {TEXT};")
         self.title_bar_layout.addWidget(self.title_label, stretch=1)
 
         self.minimize_button = QtWidgets.QPushButton(self.title_bar)

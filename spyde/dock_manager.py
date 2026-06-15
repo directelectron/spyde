@@ -55,9 +55,10 @@ class DockManager(QObject):
         )
         self.dock_widget.setBaseSize(mw.width() // 6, mw.height() // 6)
 
+        from spyde.qt.style import SURFACE_PANEL
         main_widget = QtWidgets.QWidget()
         main_widget.setAutoFillBackground(True)
-        main_widget.setStyleSheet("background-color: #141414;")
+        main_widget.setStyleSheet(f"background-color: {SURFACE_PANEL};")
         layout = QtWidgets.QVBoxLayout(main_widget)
 
         display_group = QtWidgets.QGroupBox("Plot Display Controls")

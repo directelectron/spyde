@@ -26,7 +26,8 @@ class FileDropWidget(QtWidgets.QWidget):
         ext_hint = ", ".join(self._extensions) if self._extensions else "any"
         self._label = QtWidgets.QLabel(f"Drop {ext_hint} file(s) here", self)
         self._label.setWordWrap(True)
-        self._label.setStyleSheet("color: rgba(255,255,255,150); font-size: 10px;")
+        from spyde.qt.style import LABEL_QSS
+        self._label.setStyleSheet(LABEL_QSS)
         layout.addWidget(self._label)
 
         from spyde.qt.style import make_button

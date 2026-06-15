@@ -261,8 +261,28 @@ APP_QSS = (
         f"QToolTip {{ color: {TEXT}; background-color: {SURFACE_RAISED}; "
         f"border: 1px solid {BORDER}; }}"
         # Generic text containers stay transparent over dark surfaces
-        f"QLabel, QGroupBox {{ color: {TEXT}; "
-        f"background-color: transparent; }}"
+        f"QLabel {{ color: {TEXT}; background-color: transparent; }}"
+        # Group boxes: faint rounded frame + dim title, matching the panels.
+        # (Previously unstyled, so they fell back to the heavy Fusion border.)
+        f"QGroupBox {{ color: {TEXT}; background-color: transparent; "
+        f"border: 1px solid {BORDER_FAINT}; border-radius: {RADIUS}; "
+        f"margin-top: 8px; padding: 6px 4px 4px 4px; }}"
+        f"QGroupBox::title {{ subcontrol-origin: margin; left: 8px; "
+        f"padding: 0 4px; color: {TEXT_DIM}; font-size: {FONT_SMALL}; "
+        f"font-weight: 600; }}"
+        # Progress bars (dialogs / long-op feedback) in the accent colour.
+        f"QProgressBar {{ background: {FILL_INPUT}; border: 1px solid {BORDER}; "
+        f"border-radius: {RADIUS_INPUT}; height: 6px; text-align: center; "
+        f"color: {TEXT}; font-size: {FONT_SMALL}; }}"
+        f"QProgressBar::chunk {{ background: {ACCENT}; "
+        f"border-radius: {RADIUS_INPUT}; }}"
+        # Tab widgets (carets, multi-panel dialogs).
+        f"QTabWidget::pane {{ border: 1px solid {BORDER_FAINT}; "
+        f"border-radius: {RADIUS_INPUT}; }}"
+        f"QTabBar::tab {{ background: transparent; color: {TEXT_DIM}; "
+        f"padding: 4px 10px; border-radius: {RADIUS_INPUT}; }}"
+        f"QTabBar::tab:hover {{ background: {FILL_HOVER}; color: {TEXT}; }}"
+        f"QTabBar::tab:selected {{ background: {ACCENT_SOFT}; color: {TEXT}; }}"
     )
 )
 
