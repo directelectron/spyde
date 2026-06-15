@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+.venv2/
+venv/
+
+# IDE / editor
+.idea/
+.vscode/
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# Stray output / scratch
+*regression_output.txt
+test_*.txt
+test_output*.txt
+test_results.txt
+test_summary.txt
+test_std*.txt
+verify_*.png
+verify_*.py
+compare_nav_blur_methods.py
