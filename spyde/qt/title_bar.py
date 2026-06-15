@@ -174,25 +174,71 @@ def install_custom_titlebar(main_window: "QtWidgets.QMainWindow") -> "SpydeTitle
     main_window.setMenuWidget(bar)
     main_window._spyde_titlebar = bar
 
-    # Extend the DWM frame by 1px so Windows keeps drawing the drop shadow and
-    # honours snap/Aero for our otherwise-frameless window.
-    try:
-        import ctypes
-        from ctypes import wintypes
-        hwnd = int(main_window.winId())
-        margins = wintypes.RECT(1, 1, 1, 1)
-        ctypes.windll.dwmapi.DwmExtendFrameIntoClientArea(
-            hwnd, ctypes.byref(margins))
-    except Exception:
-        pass
+    _enable_native_frame_behaviour(main_window)
     return bar
 
 
-# Win32 hit-test result codes.
+def _enable_native_frame_behaviour(main_window) -> None:
+    """Restore native resize/snap/shadow on an otherwise-frameless window.
+
+    FramelessWindowHint makes Qt strip WS_THICKFRAME from the window style, and
+    *without that style Windows will not resize the window even when
+    WM_NCHITTEST returns HTLEFT/HTTOP/etc.* — which is why only a fallback
+    bottom-right grip worked. Re-add WS_THICKFRAME (the sizing border) and
+    WS_CAPTION (enables Aero snap/maximise animations) at the Win32 level, then
+    extend the DWM frame 1px so the drop shadow is drawn. Our WM_NCHITTEST
+    handler then drives resizing from every edge. Windows-only; silently skips
+    elsewhere.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        hwnd = int(main_window.winId())
+        GWL_STYLE = -16
+        WS_THICKFRAME = 0x00040000
+        WS_CAPTION = 0x00C00000
+        WS_MAXIMIZEBOX = 0x00010000
+
+        user32 = ctypes.windll.user32
+        # 64-bit safe Get/SetWindowLongPtr
+        get_long = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)
+        set_long = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
+        style = get_long(hwnd, GWL_STYLE)
+        style |= WS_THICKFRAME | WS_CAPTION | WS_MAXIMIZEBOX
+        set_long(hwnd, GWL_STYLE, style)
+
+        margins = wintypes.RECT(1, 1, 1, 1)
+        ctypes.windll.dwmapi.DwmExtendFrameIntoClientArea(
+            hwnd, ctypes.byref(margins))
+
+        # Force a non-client recalc so the new style takes effect immediately.
+        SWP_FLAGS = 0x0002 | 0x0001 | 0x0020 | 0x0004  # NOMOVE|NOSIZE|FRAMECHANGED|NOZORDER
+        user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, SWP_FLAGS)
+    except Exception:
+        pass
+
+
+# Win32 messages / hit-test result codes.
+WM_NCCALCSIZE = 0x0083
+WM_NCHITTEST = 0x0084
 _HTCLIENT = 1
 _HTCAPTION = 2
 _HTLEFT, _HTRIGHT, _HTTOP, _HTBOTTOM = 10, 11, 12, 15
 _HTTOPLEFT, _HTTOPRIGHT, _HTBOTTOMLEFT, _HTBOTTOMRIGHT = 13, 14, 16, 17
+
+
+def handle_win_nccalcsize(message_ptr) -> bool:
+    """WM_NCCALCSIZE: claim the whole window as client area so the native
+    title bar / frame isn't drawn, while WS_THICKFRAME/WS_CAPTION stay set for
+    native resize + snap. Returning True (handled, result 0) does this.
+
+    We don't shrink the client rect, so our custom title bar fills to the top
+    edge. The resize border lives in WM_NCHITTEST instead.
+    """
+    return True
 
 
 def handle_win_nchittest(main_window, message_ptr):

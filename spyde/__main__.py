@@ -216,16 +216,26 @@ class MainWindow(QMainWindow):
         self.dock_manager.toggle_plot_control()
 
     def nativeEvent(self, event_type, message):
-        """Frameless-window hit-testing on Windows so the OS still handles
+        """Frameless-window native handling on Windows so the OS still does
         edge-resize, snap and Aero shadow (delegated to title_bar). No-op when
-        the custom title bar isn't installed."""
+        the custom title bar isn't installed.
+
+        - WM_NCCALCSIZE: claim the full window as client area (hides the native
+          frame while keeping WS_THICKFRAME for native resize/snap).
+        - WM_NCHITTEST: report the resize edges / draggable caption.
+        """
         if (getattr(self, "_spyde_titlebar", None) is not None
                 and event_type == b"windows_generic_MSG"):
             try:
                 import ctypes
+                from spyde.qt.title_bar import (
+                    WM_NCCALCSIZE, WM_NCHITTEST,
+                    handle_win_nccalcsize, handle_win_nchittest)
                 msg = ctypes.wintypes.MSG.from_address(int(message))
-                if msg.message == 0x0084:        # WM_NCHITTEST
-                    from spyde.qt.title_bar import handle_win_nchittest
+                if msg.message == WM_NCCALCSIZE and msg.wParam:
+                    if handle_win_nccalcsize(message):
+                        return True, 0
+                elif msg.message == WM_NCHITTEST:
                     ht = handle_win_nchittest(self, message)
                     if ht is not None:
                         return True, ht
