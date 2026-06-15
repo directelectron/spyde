@@ -30,8 +30,9 @@ from spyde.qt.style import (
 
 _ICONS = (Path(__file__).resolve().parent / "assets" / "icons").as_posix()
 
-# Resize border thickness (px) used by the native hit-test.
-_BORDER = 6
+# Resize border thickness (px) used by the native hit-test. A bit generous so
+# every edge is comfortable to grab, not just the corners.
+_BORDER = 8
 _TITLEBAR_H = 32
 
 
@@ -81,21 +82,11 @@ class SpydeTitleBar(QtWidgets.QWidget):
         )
 
         lay = QtWidgets.QHBoxLayout(self)
-        lay.setContentsMargins(8, 0, 0, 0)
+        lay.setContentsMargins(6, 0, 0, 0)
         lay.setSpacing(4)
 
-        # App glyph + title
-        icon_path = Path(__file__).resolve().parents[1] / "Spyde.svg"
-        if icon_path.exists():
-            glyph = QtWidgets.QLabel()
-            glyph.setPixmap(QtGui.QIcon(icon_path.as_posix()).pixmap(16, 16))
-            lay.addWidget(glyph)
-        title = QtWidgets.QLabel("SpyDE")
-        title.setStyleSheet(
-            f"color: {TEXT}; font-size: {FONT_SMALL}; font-weight: 600;")
-        lay.addWidget(title)
-
-        # Embedded menu bar (transparent so it sits on the dark bar)
+        # Menu bar at the far left (no app glyph/title — keep the bar clean).
+        # Transparent so it sits on the dark bar.
         menubar.setStyleSheet(
             f"QMenuBar {{ background: transparent; color: {TEXT_DIM}; }}"
             f"QMenuBar::item {{ background: transparent; padding: 4px 8px; }}"
@@ -114,7 +105,8 @@ class SpydeTitleBar(QtWidgets.QWidget):
             "Organize Windows", "organize.svg", self)
         lay.addWidget(self.collapse_btn)
         lay.addWidget(self.organize_btn)
-        lay.addSpacing(6)
+        # Clear separation between the feature buttons and the window controls.
+        lay.addSpacing(24)
 
         # Window controls
         self.min_btn = _WinButton("minimize.svg", self)
