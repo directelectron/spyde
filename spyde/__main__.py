@@ -44,7 +44,7 @@ from spyde.drawing.colormaps import COLORMAPS
 from spyde.dask_manager import DaskManager
 from spyde.dock_manager import DockManager
 from spyde.mdi_manager import MDIManager
-from spyde.qt.style import APP_QSS
+from spyde.qt.style import APP_QSS, SURFACE_CANVAS
 
 SUPPORTED_EXTS = (".hspy", ".zspy", ".mrc", ".tif", ".tiff", ".de5")  # extend as needed
 
@@ -119,7 +119,7 @@ class MainWindow(QMainWindow):
         )
         # create an MDI area
         self.mdi_area = QtWidgets.QMdiArea()
-        self.mdi_area.setBackground(QBrush(QColor("#0d0d0d")))
+        self.mdi_area.setBackground(QBrush(QColor(SURFACE_CANVAS)))
         self.setCentralWidget(self.mdi_area)
 
         # settings and recent menu
@@ -161,7 +161,7 @@ class MainWindow(QMainWindow):
                     # Single source of truth for the theme: spyde/qt/style.py
                     self.app.setStyleSheet(APP_QSS)
         else:
-            self.mdi_area.setStyleSheet("background-color: #0d0d0d;")
+            self.mdi_area.setStyleSheet(f"background-color: {SURFACE_CANVAS};")
 
         self.current_selected_signal_tree = None  # type: Union[BaseSignalTree, None]
         self._pending_navigator_assignment = None
