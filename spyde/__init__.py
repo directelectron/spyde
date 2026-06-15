@@ -10,9 +10,10 @@ with files(__package__).joinpath("metadata_widget.yaml").open(
     "r", encoding="utf-8"
 ) as f:
     METADATA_WIDGET_CONFIG = yaml.safe_load(f)
-print(METADATA_WIDGET_CONFIG)
 
-__all__ = ["TOOLBAR_ACTIONS", "METADATA_WIDGET_CONFIG"]
+from spyde._version import __version__
+
+__all__ = ["TOOLBAR_ACTIONS", "METADATA_WIDGET_CONFIG", "__version__"]
 
 
 def _register_signal_extensions() -> None:
@@ -39,6 +40,3 @@ def _register_signal_extensions() -> None:
 
 
 _register_signal_extensions()
-
-
-__version__ = "0.0.1"

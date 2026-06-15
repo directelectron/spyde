@@ -38,7 +38,7 @@ dependencies = [
     "torch",
 ]
 description = "DE Visualization tool based on HyperSpy"
-version = "0.0.1"
+dynamic = ["version"]
 keywords = [
     "EELS",
     "STEM",
@@ -50,6 +50,10 @@ keywords = [
 ]
 name = "spyde"
 requires-python = ">=3.10"
+
+[tool.setuptools.dynamic]
+# Single source of truth: spyde/_version.py (a tiny no-import module).
+version = {attr = "spyde._version.__version__"}
 
 [tool.uv]
 # When running via the PyCrucible launcher, install only core dependencies —
