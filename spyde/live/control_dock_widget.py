@@ -31,14 +31,11 @@ class ControlDockWidget(QDockWidget):
         self.setMinimumHeight(150)
         self.setVisible(False)
         self.setContentsMargins(5, 5, 5, 5)
-        # Dark theme (was a light-theme leftover: #f0f0f0 in a #141414 app)
+        # Dark theme, from the shared tokens (was a hardcoded dark block).
+        from spyde.qt.style import SURFACE_PANEL, BORDER_FAINT
         self.setStyleSheet(
-            """
-            QDockWidget {
-                background-color: #141414;
-                border: 1px solid rgba(255,255,255,40);
-            }
-            """
+            f"QDockWidget {{ background-color: {SURFACE_PANEL}; "
+            f"border: 1px solid {BORDER_FAINT}; }}"
         )
         # Create a central widget to hold the layout
         central_widget = QWidget()

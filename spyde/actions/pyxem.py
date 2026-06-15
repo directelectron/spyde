@@ -11,6 +11,7 @@ from pyqtgraph import RectROI, CircleROI, mkPen
 from spyde.drawing.toolbars.toolbar import RoundedToolBar
 from spyde.drawing.toolbars.plot_control_toolbar import resolve_icon_path
 from spyde.external.pyqtgraph.ring_roi import RingROI
+from spyde.qt.style import LABEL_QSS
 from diffsims.generators.simulation_generator import SimulationGenerator
 from orix.sampling import get_sample_reduced_fundamental
 
@@ -663,12 +664,12 @@ def _czb_build_manual_page(caret, toolbar, manual_state, width):
         "Click a point on the map, then click\n"
         "'Delete Selected' to remove it."
     )
-    info.setStyleSheet("color: white; font-size: 10px;")
+    info.setStyleSheet(LABEL_QSS)
     info.setWordWrap(True)
     vlay.addWidget(info)
 
     count_lbl = QtWidgets.QLabel("Points: 0")
-    count_lbl.setStyleSheet("color: white; font-size: 10px;")
+    count_lbl.setStyleSheet(LABEL_QSS)
     vlay.addWidget(count_lbl)
     manual_state["count_label"] = count_lbl
 
@@ -2491,7 +2492,7 @@ def orientation_mapping(
             pv.setContentsMargins(0, 0, 0, 0)
             pv.setSpacing(2)
             title = _QW.QLabel(om.phases[i].get("name", f"phase {i}"))
-            title.setStyleSheet("color: white; font-size: 10px;")
+            title.setStyleSheet(LABEL_QSS)
             title.setAlignment(_QC.Qt.AlignmentFlag.AlignHCenter)
             pw = _pg.PlotWidget()
             pw.setBackground("k")
