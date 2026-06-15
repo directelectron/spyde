@@ -45,6 +45,7 @@ from spyde.dask_manager import DaskManager
 from spyde.dock_manager import DockManager
 from spyde.mdi_manager import MDIManager
 from spyde.drawing.signal_tree_presenter import build_axes_groups, build_metadata_dict
+from spyde.qt.style import APP_QSS
 
 SUPPORTED_EXTS = (".hspy", ".zspy", ".mrc", ".tif", ".tiff", ".de5")  # extend as needed
 
@@ -158,61 +159,8 @@ class MainWindow(QMainWindow):
             if sys.platform != "darwin":
                 QtWidgets.QApplication.setStyle("Fusion")
                 with log_startup_time("Apply application stylesheet"):
-                    self.app.setStyleSheet(
-                        """
-                        QMdiArea { background: #0d0d0d; }             /* background: very dark */
-                        QMainWindow { background-color: #0d0d0d; }
-                        QDockWidget, QDockWidget > QWidget { background-color: #141414; color: #ffffff; } /* dock: slightly lighter */
-                        QDockWidget#plotControlDock > QWidget { background-color: #141414; }
-                        QDockWidget::title { background-color: #141414; color: #ffffff; padding: 2px; }
-                        QMenuBar { background-color: #1d1d1d; color: #ffffff; } /* header: lighter than dock */
-                        QMenuBar::item { background-color: transparent; color: #ffffff; }
-                        QStatusBar { background-color: #1d1d1d; color: #ffffff; } /* footer: same as header */
-
-                        /* Dialogs */
-                        QDialog, QMessageBox, QFileDialog { background-color: #141414; color: #ffffff; }
-                        QDialog > QWidget, QMessageBox > QWidget, QFileDialog QWidget { background-color: #141414; color: #ffffff; }
-
-                        /* Dialog buttons */
-                        QDialog QPushButton, QMessageBox QPushButton, QFileDialog QPushButton {
-                            background-color: #1e1e1e;
-                            color: #ffffff;
-                            border: 1px solid #2a2a2a;
-                            padding: 4px 8px;
-                        }
-                        QDialog QPushButton:hover, QMessageBox QPushButton:hover, QFileDialog QPushButton:hover {
-                            background-color: #2a2a2a;
-                        }
-
-                        /* Inputs */
-                        QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QPlainTextEdit, QTextEdit,
-                        QDateEdit, QTimeEdit, QDateTimeEdit {
-                            color: #ffffff;
-                            background-color: #1a1a1a;
-                            border: 1px solid #2a2a2a;
-                        }
-
-                        /* Views inside dialogs (file lists, trees, tables) */
-                        QListView, QTreeView, QTableView {
-                            background-color: #1a1a1a;
-                            color: #ffffff;
-                            alternate-background-color: #151515;
-                            selection-background-color: #2a2a2a;
-                            selection-color: #ffffff;
-                        }
-                        QHeaderView::section {
-                            background-color: #1d1d1d;
-                            color: #ffffff;
-                            border: 0px;
-                            padding: 4px;
-                        }
-
-                        QLabel, QGroupBox, QPushButton, QComboBox, QLineEdit, QSpinBox, QCheckBox {
-                            color: #ffffff;
-                            background-color: transparent;
-                        }
-                        """
-                    )
+                    # Single source of truth for the theme: spyde/qt/style.py
+                    self.app.setStyleSheet(APP_QSS)
         else:
             self.mdi_area.setStyleSheet("background-color: #0d0d0d;")
 
@@ -762,7 +710,8 @@ class MainWindow(QMainWindow):
             if file_paths:
                 self._create_signals(file_paths)
 
-    def add_signal(self, signal, navigators=None, selector_type=None) -> None:
+    def add_signal(self, signal, navigators=None, selector_type=None,
+                   navigator_override=None) -> None:
         """Add a signal to the main window.
 
         This will "plant" a new seed for a signal tree and set up the associated plots.
@@ -779,7 +728,7 @@ class MainWindow(QMainWindow):
         if self.dask_manager.client is None:
             message_box = QtWidgets.QMessageBox(self)
             message_box.setWindowTitle("Please wait")
-            message_box.setText("Dask client is still initializing. Please wait...")
+            message_box.setText("Dask client is still initializing. Please wait…")
             message_box.setStandardButtons(QtWidgets.QMessageBox.StandardButton.NoButton)
             message_box.setModal(False)
             message_box.show()
@@ -792,7 +741,7 @@ class MainWindow(QMainWindow):
 
         signal_tree = BaseSignalTree(
             root_signal=signal, main_window=self, distributed_client=self.dask_manager.client,
-            selector_type=selector_type,
+            selector_type=selector_type, navigator_override=navigator_override,
         )
         self.signal_trees.append(signal_tree)
         print("Signal Tree Created")

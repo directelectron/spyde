@@ -124,7 +124,7 @@ class DaskManager(QObject):
         self._client = client
         self._gpu_worker_address = gpu_worker_address
         print(f"Dask cluster ready. Dashboard: {client.dashboard_link}")
-        worker_keys = list(client.scheduler_info()["workers"].keys())
+        worker_keys = list(client.scheduler_info(n_workers=-1)["workers"].keys())
         heavy = worker_keys[1:]
         self._heavy_compute_workers = heavy if heavy else None
         self._dask_thread.quit()

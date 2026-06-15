@@ -1,0 +1,13 @@
+signals:
+  DiffractionVectorsImage:
+    signal_type: spyde_diffraction_vectors_image
+    signal_dimension: 2
+    dtype: real
+    lazy: False
+    module: spyde.signals.diffraction_vectors_image
+  LazyDiffractionVectorsImage:
+    signal_type: spyde_diffraction_vectors_image
+    signal_dimension: 2
+    dtype: real
+    lazy: True
+    module: spyde.signals.diffraction_vectors_image

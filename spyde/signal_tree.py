@@ -75,6 +75,7 @@ class BaseSignalTree:
         main_window: "MainWindow",
         distributed_client=None,
         selector_type=None,
+        navigator_override: BaseSignal = None,
     ):
 
         # The root signal of the tree
@@ -97,8 +98,14 @@ class BaseSignalTree:
         self._pending_nav_dask = None  # type: da.Array | None
 
         # set up the navigator plots:
-        print("Initializing navigator for root signal: ", root_signal)
-        navigator = self._initialize_navigator(root_signal)
+        if navigator_override is not None:
+            # Caller supplies a ready-made navigator (e.g. a vector count map)
+            # — skip the sum-over-signal-axes compute of the full dataset.
+            print("Using navigator override for root signal: ", navigator_override)
+            navigator = self._preprocess_navigator(navigator_override)
+        else:
+            print("Initializing navigator for root signal: ", root_signal)
+            navigator = self._initialize_navigator(root_signal)
         print("Navigator initialized: ", navigator)
         self.navigator_signals["base"] = navigator
 
@@ -577,7 +584,18 @@ class BaseSignalTree:
         return new_signal
 
     def close(self):
-        """Clean up resources associated with the signal tree."""
-        signals = self.signals()
-        for s in signals:
-            del s
+        """Release references held by the tree. The plot WINDOWS (and their
+        toolbars/selectors) are torn down by MDIManager.close_signal_tree, which
+        is the authority; this just drops the tree's own bookkeeping so nothing
+        lingers. Safe to call once the windows are closed."""
+        self.signal_plots = []
+        self.navigator_signals = {}
+        self.navigator_plot_manager = None
+        # drop the attached results so they can be GC'd
+        for attr in ("diffraction_vectors", "orientation_map",
+                     "vector_orientation"):
+            if hasattr(self, attr):
+                try:
+                    setattr(self, attr, None)
+                except Exception:
+                    pass

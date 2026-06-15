@@ -70,6 +70,49 @@ class MDIManager(QObject):
         self.plot_subwindows.append(pw)
         return pw
 
+    def windows_for_tree(self, tree: "BaseSignalTree") -> list["PlotWindow"]:
+        """Every plot window belonging to a signal tree — its navigator/signal
+        plots AND any action-spawned previews (VI previews, IPF, vector-OM maps),
+        which all carry .signal_tree. The single source of truth for what must be
+        torn down when the tree goes away."""
+        return [pw for pw in list(self.plot_subwindows)
+                if getattr(pw, "signal_tree", None) is tree]
+
+    def close_signal_tree(self, tree: "BaseSignalTree") -> None:
+        """Authoritatively tear down a whole signal tree: every associated plot
+        window (and its toolbars/PlotStates/selectors), then the tree itself.
+
+        This is the ONE place that does the tree-level bookkeeping. PlotWindow
+        close paths delegate here so closing any window of a tree (e.g. the
+        navigator) removes the entire graph rather than orphaning previews,
+        toolbars, or the tree entry. Idempotent + re-entrancy guarded.
+        """
+        if tree is None or getattr(tree, "_spyde_closing", False):
+            return
+        tree._spyde_closing = True
+        try:
+            for pw in self.windows_for_tree(tree):
+                try:
+                    # tell the window not to re-trigger tree teardown
+                    pw._spyde_tree_teardown = True
+                    pw.close_window()
+                except Exception:
+                    import logging
+                    logging.getLogger(__name__).exception(
+                        "close_signal_tree: window close failed")
+            # release any tree-held resources (toolbars are closed per-window)
+            try:
+                tree.close()
+            except Exception:
+                pass
+            if tree in self.signal_trees:
+                self.signal_trees.remove(tree)
+            if (getattr(self.main_window, "current_selected_signal_tree", None)
+                    is tree):
+                self.main_window.current_selected_signal_tree = None
+        finally:
+            tree._spyde_closing = False
+
     def active_plot(self) -> "Plot | None":
         sub = self.mdi_area.activeSubWindow()
         from spyde.drawing.plots.plot_window import PlotWindow
@@ -191,6 +234,8 @@ class MDIManager(QObject):
     def _update_3state_visibility(self, window: "PlotWindow") -> None:
         active_tree = window.signal_tree
         for pw in self.plot_subwindows:
+            if getattr(pw, "_spyde_closed", False):
+                continue
             same_tree = pw.signal_tree is active_tree
             is_action_preview = pw.owner_plot_window is not None
             action = getattr(pw, "controlling_action", None)
@@ -203,6 +248,12 @@ class MDIManager(QObject):
                 # clear the stale reference and treat as no controlling action.
                 pw.controlling_action = None
                 action_wants_visible = True
+            gate = getattr(pw, "visibility_gate", None)
+            if action_wants_visible and callable(gate):
+                try:
+                    action_wants_visible = bool(gate())
+                except Exception:
+                    pass
             if same_tree and action_wants_visible:
                 if not pw.isVisible():
                     pw.show()
