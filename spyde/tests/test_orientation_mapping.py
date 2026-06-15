@@ -168,7 +168,7 @@ def test_get_best_fit_spots_returns_valid_coords():
     )
 
     cache = _build_matching_cache(s, sim)
-    coords, intensities = _get_best_fit_spots(
+    coords, intensities, ipf_xy, ipf_heatmap = _get_best_fit_spots(
         s, sim, nav_indices=(0, 0), gamma=0.5, max_radius=max_radius,
         matching_cache=cache,
     )
@@ -177,9 +177,10 @@ def test_get_best_fit_spots_returns_valid_coords():
     assert len(intensities) == len(coords), "coords and intensities length mismatch"
     assert np.all(intensities >= 0), "Intensities should be non-negative"
     assert len(coords) > 0, "Expected at least one spot"
+    assert len(ipf_xy) == 2
 
     # Second call with same cache returns same result
-    coords2, intensities2 = _get_best_fit_spots(
+    coords2, intensities2, _, _ = _get_best_fit_spots(
         s, sim, nav_indices=(0, 0), gamma=0.5, max_radius=max_radius,
         matching_cache=cache,
     )
@@ -215,7 +216,7 @@ def test_get_best_fit_spots_sped_ag():
 
     cache = _build_matching_cache(s, sim)
     # Test the problematic nav position that triggered "Index 104 out of bounds"
-    coords, intensities = _get_best_fit_spots(
+    coords, intensities, _ipf_xy, _heat = _get_best_fit_spots(
         s, sim, nav_indices=(104, 32), gamma=0.5, max_radius=max_radius,
         matching_cache=cache,
     )

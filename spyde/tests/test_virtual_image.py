@@ -385,16 +385,16 @@ class TestVirtualImageLivePreview:
         )
         assert roi not in nav.items, "ROI should not be on the navigator plot"
 
-    def test_roi_move_updates_preview_image(self, qtbot, stem_4d_dataset):
-        """Moving the ROI must produce a rendered image in the preview plot's image_item."""
+    def test_compute_updates_preview_image(self, qtbot, stem_4d_dataset):
+        """Computing must produce a rendered image in the preview plot's image_item."""
         win = stem_4d_dataset["window"]
         tb, vi_widget, action_name, caret_box, roi, preview_window = _add_virtual_detector(qtbot, win)
 
         assert preview_window is not None
         preview_plot = preview_window.plots[0]
 
-        # Trigger computation by emitting sigRegionChangeFinished
-        roi.sigRegionChangeFinished.emit(roi)
+        # Live recompute is off; trigger via the title-bar Compute button
+        preview_window.title_bar.compute_button.click()
 
         # Wait until the future resolves and the image is rendered
         qtbot.waitUntil(
@@ -418,8 +418,8 @@ class TestVirtualImageLivePreview:
         assert preview_window is not None
         preview_plot = preview_window.plots[0]
 
-        # First position — emit and wait for result
-        roi.sigRegionChangeFinished.emit(roi)
+        # First position — compute and wait for result
+        preview_window.title_bar.compute_button.click()
         qtbot.waitUntil(
             lambda: (
                 preview_plot.current_data is not None
@@ -429,14 +429,14 @@ class TestVirtualImageLivePreview:
         )
         first_image = preview_plot.image_item.image.copy()
 
-        # Move ROI to a substantially different position and trigger again
+        # Move ROI to a substantially different position and compute again
         old_pos = roi.pos()
         sig_plot = win.plots[1]  # diffraction plot
         image_item = sig_plot.image_item
         # Move ~30% of image width
         shift = image_item.width() * 0.3
         roi.setPos(old_pos.x() + shift, old_pos.y() + shift)
-        roi.sigRegionChangeFinished.emit(roi)
+        preview_window.title_bar.compute_button.click()
 
         qtbot.waitUntil(
             lambda: (
@@ -453,7 +453,7 @@ class TestVirtualImageLivePreview:
         )
 
     def test_indicator_transitions_idle_computing_done(self, qtbot, stem_4d_dataset):
-        """ComputeStatusIndicator must go idle→computing after ROI emit, then done."""
+        """ComputeStatusIndicator must go idle→computing after Compute, then done."""
         win = stem_4d_dataset["window"]
         tb, vi_widget, action_name, caret_box, roi, preview_window = _add_virtual_detector(qtbot, win)
 
@@ -463,7 +463,7 @@ class TestVirtualImageLivePreview:
 
         assert indicator._state == "idle", f"Expected idle before computation, got {indicator._state}"
 
-        roi.sigRegionChangeFinished.emit(roi)
+        preview_window.title_bar.compute_button.click()
         qtbot.waitUntil(lambda: indicator._state == "computing", timeout=2000)
 
         qtbot.waitUntil(lambda: indicator._state in ("done", "idle"), timeout=10000)
@@ -495,18 +495,14 @@ class TestVirtualImageLivePreview:
         assert roi.isVisible(), "ROI should be visible after toggling Virtual Imaging ON again"
         assert preview_window.isVisible(), "Preview window should be visible after toggling ON again"
 
-    def test_live_off_roi_move_does_not_trigger_computation(self, qtbot, stem_4d_dataset):
-        """With Live toggled OFF, moving the ROI must NOT trigger a new computation."""
+    def test_roi_move_does_not_trigger_computation(self, qtbot, stem_4d_dataset):
+        """Live recompute is permanently off: moving the ROI must NOT launch a
+        dask graph (computing on every drag made the app appear frozen)."""
         win = stem_4d_dataset["window"]
         tb, vi_widget, action_name, caret_box, roi, preview_window = _add_virtual_detector(qtbot, win)
 
         assert preview_window is not None
         preview_plot = preview_window.plots[0]
-
-        # Toggle live off
-        live_btn = caret_box.get_parameter_widget("live_button")
-        live_btn.click()
-        qtbot.wait(100)
 
         initial_data = preview_plot.current_data  # None — no computation yet
 
@@ -515,24 +511,21 @@ class TestVirtualImageLivePreview:
         qtbot.wait(2000)
 
         assert preview_plot.current_data is initial_data, (
-            "Computation was triggered even though Live mode is OFF"
+            "Computation was triggered by an ROI move (live should be off)"
         )
 
-    def test_compute_button_triggers_one_computation_when_live_off(self, qtbot, stem_4d_dataset):
-        """With Live OFF, the Compute button must trigger exactly one computation."""
+    def test_title_bar_compute_button_triggers_one_computation(self, qtbot, stem_4d_dataset):
+        """The title-bar Compute button must trigger the VI computation."""
         win = stem_4d_dataset["window"]
         tb, vi_widget, action_name, caret_box, roi, preview_window = _add_virtual_detector(qtbot, win)
 
         assert preview_window is not None
         preview_plot = preview_window.plots[0]
 
-        # Toggle live off first
-        live_btn = caret_box.get_parameter_widget("live_button")
-        live_btn.click()
-        qtbot.wait(100)
-
-        # Click Compute
-        compute_btn = caret_box.get_parameter_widget("compute_button")
+        compute_btn = preview_window.title_bar.compute_button
+        assert compute_btn.isVisibleTo(preview_window.title_bar), (
+            "Title-bar Compute button is not shown on the VI preview window"
+        )
         compute_btn.click()
 
         qtbot.waitUntil(
@@ -547,20 +540,19 @@ class TestVirtualImageLivePreview:
         assert img is not None, "No image rendered after pressing Compute"
         assert img.ndim == 2
 
-    def test_live_and_compute_buttons_are_in_same_row(self, qtbot, stem_4d_dataset):
-        """Live and Compute buttons must be side-by-side in the same parent widget."""
-        from PySide6.QtWidgets import QPushButton
+    def test_compute_and_commit_buttons_side_by_side(self, qtbot, stem_4d_dataset):
+        """Compute and Commit live together on the preview title bar; the
+        caret's Submit button is hidden (redundant)."""
         win = stem_4d_dataset["window"]
         tb, vi_widget, action_name, caret_box, roi, preview_window = _add_virtual_detector(qtbot, win)
 
-        live_btn = caret_box.get_parameter_widget("live_button")
-        compute_btn = caret_box.get_parameter_widget("compute_button")
-        assert live_btn is not None, "live_button not found in caret box"
-        assert compute_btn is not None, "compute_button not found in caret box"
-        assert isinstance(live_btn, QPushButton)
-        assert isinstance(compute_btn, QPushButton)
-        assert live_btn.parent() is compute_btn.parent(), (
-            "Live and Compute buttons are not in the same row widget"
+        title_bar = preview_window.title_bar
+        assert title_bar.compute_button.parent() is title_bar
+        assert title_bar.commit_button.parent() is title_bar
+        assert title_bar.compute_button.isVisibleTo(title_bar)
+        assert title_bar.commit_button.isVisibleTo(title_bar)
+        assert not caret_box.submit_button.isVisibleTo(caret_box), (
+            "Caret Submit button should be hidden — Commit handles it"
         )
 
     def test_roi_type_switch_removes_old_roi_from_plot(self, qtbot, stem_4d_dataset):
@@ -599,7 +591,7 @@ class TestVirtualImageCommit:
         tb, vi_widget, action_name, caret_box, roi, preview_window = _add_virtual_detector(qtbot, win)
         preview_plot = preview_window.plots[0]
 
-        roi.sigRegionChangeFinished.emit(roi)
+        preview_window.title_bar.compute_button.click()
         qtbot.waitUntil(
             lambda: (
                 preview_plot.current_data is not None

@@ -12,9 +12,20 @@ from PySide6.QtTest import QTest
 import os
 
 CIF_PATH = os.path.join(os.path.dirname(__file__), "Silver__0011135.cif")
-pytestmark = pytest.mark.skipif(
-    not os.path.exists(CIF_PATH), reason="Silver CIF not found"
-)
+
+# This end-to-end test loads real sped_ag data and runs the full orientation
+# mapping template-matching compute, then drives live plot rendering. Under the
+# offscreen Qt platform (CI) the pyqtgraph GraphicsView paint layer segfaults at
+# the C++ level when rendering the OM result — a native crash that can't be
+# caught in Python — so it only runs with a real display.
+_OFFSCREEN = os.environ.get("QT_QPA_PLATFORM", "") == "offscreen"
+pytestmark = [
+    pytest.mark.skipif(not os.path.exists(CIF_PATH), reason="Silver CIF not found"),
+    pytest.mark.skipif(
+        _OFFSCREEN,
+        reason="OM live render segfaults under offscreen Qt; needs a real display",
+    ),
+]
 
 
 def _wait_for_spots(scatter, qtbot, timeout=15000):
@@ -43,14 +54,23 @@ def test_om_spots_update_on_crosshair_move_and_gamma_change(qtbot, stem_4d_datas
     from spyde.drawing.toolbars.caret_group import FileDropWidget
 
     win = stem_4d_dataset["window"]
-    plots = win.plots
-    sig_plot = next(p for p in plots if not p.is_navigator)
-    toolbar = sig_plot.plot_state.toolbar_bottom
 
-    # Replace synthetic signal with sped_ag then open wizard
+    # Load sped_ag as a real signal so the plot, histogram, selectors and
+    # navigator are all built for its shape. Hot-swapping plot_state.current_signal
+    # leaves those bound to the fixture's (different-shaped) data and corrupts
+    # rendering on the next paint/update.
+    from spyde.drawing.selectors import CrosshairSelector
     s = sped_ag()
     s.set_signal_type("electron_diffraction")
-    sig_plot.plot_state.current_signal = s
+    n_before = len(win.signal_trees)
+    win.add_signal(s, selector_type=CrosshairSelector)
+    qtbot.waitUntil(lambda: len(win.signal_trees) > n_before, timeout=10000)
+    tree = win.signal_trees[-1]
+    sig_plot = next(p for p in tree.signal_plots if not p.is_navigator)
+    toolbar = sig_plot.plot_state.toolbar_bottom
+    # Let the new plot's initial async data load settle before driving OM.
+    qtbot.wait(500)
+    QtWidgets.QApplication.processEvents()
 
     _OM_BUILT_TOOLBARS.discard(id(toolbar))
     om_action = next(a for a in toolbar.actions() if a.text() == "Orientation Mapping")
