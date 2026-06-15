@@ -209,7 +209,7 @@ class MainWindow(QMainWindow):
         bar = install_custom_titlebar(self)
         if bar is not None:
             bar.collapse_btn.clicked.connect(self._toggle_sidebar)
-            bar.organize_btn.clicked.connect(self.tile_active_windows)
+            bar.organize_btn.clicked.connect(self.organize_active_windows)
 
     def _toggle_sidebar(self):
         """Collapse / restore the Plot Control sidebar from the title bar."""
@@ -831,6 +831,11 @@ class MainWindow(QMainWindow):
 
     def tile_active_windows(self) -> None:
         self.mdi_manager.tile_active_windows()
+
+    def organize_active_windows(self) -> None:
+        """Title-bar "Organize": reposition windows into a grid, keep their
+        sizes (unlike Tile, which resizes them)."""
+        self.mdi_manager.organize_active_windows()
 
     def add_plot_window(
         self,

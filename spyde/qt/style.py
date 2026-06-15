@@ -33,6 +33,9 @@ SURFACE_CANVAS = "#0d0d0d"
 SURFACE_PANEL = "#141414"
 SURFACE_BAR = "#1d1d1d"
 SURFACE_RAISED = "#1e1e1e"
+# The main-window custom title bar — a touch lighter than the panels/menus so
+# it reads as a distinct top strip rather than blending into the sidebar.
+SURFACE_TITLEBAR = "#262626"
 
 TEXT = "white"
 TEXT_DIM = "rgba(255,255,255,160)"

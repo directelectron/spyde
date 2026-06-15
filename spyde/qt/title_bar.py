@@ -24,7 +24,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
 
 from spyde.qt.style import (
-    SURFACE_BAR, TEXT, TEXT_DIM, BORDER_FAINT, FILL_HOVER, DANGER_HOVER,
+    SURFACE_TITLEBAR, TEXT, TEXT_DIM, BORDER_FAINT, FILL_HOVER, DANGER_HOVER,
     ACCENT_SOFT, FONT_SMALL,
 )
 
@@ -51,19 +51,18 @@ class _WinButton(QtWidgets.QPushButton):
         )
 
 
-def _feature_button(text: str, icon_name: str | None, parent) -> QtWidgets.QToolButton:
-    """A small flat labelled button for the title-bar feature actions."""
+def _feature_button(tooltip: str, icon_name: str, parent) -> QtWidgets.QToolButton:
+    """A small flat icon-only button for the title-bar feature actions."""
     btn = QtWidgets.QToolButton(parent)
-    btn.setText(text)
-    if icon_name:
-        btn.setIcon(QtGui.QIcon(f"{_ICONS}/{icon_name}"))
-        btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+    btn.setIcon(QtGui.QIcon(f"{_ICONS}/{icon_name}"))
+    btn.setIconSize(QtCore.QSize(16, 16))
+    btn.setToolTip(tooltip)
+    btn.setFixedSize(_TITLEBAR_H, _TITLEBAR_H)
     btn.setCursor(Qt.CursorShape.PointingHandCursor)
     btn.setStyleSheet(
-        f"QToolButton {{ color: {TEXT_DIM}; background: transparent; "
-        f"border: none; border-radius: 4px; padding: 2px 8px; "
-        f"font-size: {FONT_SMALL}; }}"
-        f"QToolButton:hover {{ color: {TEXT}; background: {ACCENT_SOFT}; }}"
+        f"QToolButton {{ background: transparent; border: none; "
+        f"border-radius: 4px; }}"
+        f"QToolButton:hover {{ background: {ACCENT_SOFT}; }}"
     )
     return btn
 
@@ -77,7 +76,7 @@ class SpydeTitleBar(QtWidgets.QWidget):
         self.setObjectName("spydeTitleBar")
         self.setFixedHeight(_TITLEBAR_H)
         self.setStyleSheet(
-            f"#spydeTitleBar {{ background: {SURFACE_BAR}; "
+            f"#spydeTitleBar {{ background: {SURFACE_TITLEBAR}; "
             f"border-bottom: 1px solid {BORDER_FAINT}; }}"
         )
 
@@ -108,11 +107,11 @@ class SpydeTitleBar(QtWidgets.QWidget):
 
         lay.addStretch(1)
 
-        # Feature buttons
-        self.collapse_btn = _feature_button("Collapse Sidebar", "navigator.svg"
-                                            if (Path(_ICONS) / "navigator.svg").exists()
-                                            else None, self)
-        self.organize_btn = _feature_button("Organize Windows", None, self)
+        # Feature buttons (icon-only, tooltip on hover)
+        self.collapse_btn = _feature_button(
+            "Collapse Sidebar", "sidebar.svg", self)
+        self.organize_btn = _feature_button(
+            "Organize Windows", "organize.svg", self)
         lay.addWidget(self.collapse_btn)
         lay.addWidget(self.organize_btn)
         lay.addSpacing(6)
@@ -176,18 +175,11 @@ def install_custom_titlebar(main_window: "QtWidgets.QMainWindow") -> "SpydeTitle
     main_window.setWindowFlags(
         main_window.windowFlags() | Qt.WindowType.FramelessWindowHint)
 
-    # Put the bar at the top of the central area. QMainWindow already owns the
-    # menu bar slot; we instead host everything in a wrapper so the bar spans
-    # the full width above the existing central widget.
-    old_central = main_window.takeCentralWidget()
-    wrapper = QtWidgets.QWidget(main_window)
-    v = QtWidgets.QVBoxLayout(wrapper)
-    v.setContentsMargins(0, 0, 0, 0)
-    v.setSpacing(0)
-    v.addWidget(bar)
-    if old_central is not None:
-        v.addWidget(old_central, 1)
-    main_window.setCentralWidget(wrapper)
+    # Occupy the menu-bar slot: that strip spans the FULL window width above
+    # both the dock areas and the central widget — i.e. exactly where a real
+    # title bar sits. (Wrapping only the central widget left the bar beside the
+    # Plot Control dock, so the window buttons looked offset from it.)
+    main_window.setMenuWidget(bar)
     main_window._spyde_titlebar = bar
 
     # Extend the DWM frame by 1px so Windows keeps drawing the drop shadow and

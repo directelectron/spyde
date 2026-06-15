@@ -127,16 +127,21 @@ class MDIManager(QObject):
             return None
         return sub
 
-    def tile_active_windows(self) -> None:
+    def _active_tree_windows(self):
+        """Visible subwindows belonging to the active subwindow's signal tree."""
         from spyde.drawing.plots.plot_window import PlotWindow
         active = self.mdi_area.activeSubWindow()
         if not isinstance(active, PlotWindow):
-            return
+            return []
         active_tree = active.signal_tree
-        shown = [
+        return [
             pw for pw in self.plot_subwindows
             if pw.signal_tree is active_tree and pw.isVisible()
         ]
+
+    def tile_active_windows(self) -> None:
+        """Tile (resize + position) the active tree's windows into a grid."""
+        shown = self._active_tree_windows()
         n = len(shown)
         if n == 0:
             return
@@ -155,6 +160,30 @@ class MDIManager(QObject):
                 cell_w,
                 cell_h,
             )
+
+    def organize_active_windows(self) -> None:
+        """Arrange the active tree's windows into a non-overlapping grid WITHOUT
+        resizing them — each keeps its current size, only its position changes.
+        Laid out left-to-right, top-to-bottom; rows advance by the tallest
+        window so far and wrap when they'd overflow the MDI width."""
+        shown = self._active_tree_windows()
+        if not shown:
+            return
+        mdi_rect = self.mdi_area.rect()
+        margin = 6
+        x = margin
+        y = margin
+        row_h = 0
+        for pw in shown:
+            w, h = pw.width(), pw.height()
+            # wrap to a new row if this window would overflow the right edge
+            if x > margin and x + w + margin > mdi_rect.width():
+                x = margin
+                y += row_h + margin
+                row_h = 0
+            pw.move(x, y)
+            x += w + margin
+            row_h = max(row_h, h)
 
     def register_navigator_drag_payload(self, signal, nav_manager) -> str:
         token = uuid4().hex

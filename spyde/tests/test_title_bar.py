@@ -46,6 +46,55 @@ class TestTitleBar:
         assert fired == {"collapse": 1, "organize": 1}
         win.close()
 
+    def test_feature_buttons_are_icon_only(self):
+        win, bar = _win_with_bar()
+        # SVG icons, no text label, tooltips for discoverability
+        assert not bar.collapse_btn.icon().isNull()
+        assert not bar.organize_btn.icon().isNull()
+        assert bar.collapse_btn.text() == ""
+        assert bar.organize_btn.text() == ""
+        assert bar.collapse_btn.toolTip() == "Collapse Sidebar"
+        assert bar.organize_btn.toolTip() == "Organize Windows"
+        win.close()
+
+
+class TestOrganizeWindows:
+    """organize_active_windows repositions but must NOT resize (unlike tile)."""
+
+    def test_organize_preserves_sizes(self, monkeypatch):
+        _app()
+        from spyde.mdi_manager import MDIManager
+        mdi = QMdiArea()
+        mdi.resize(1000, 800)
+
+        class _FakeWin:
+            def __init__(self, w, h):
+                self._w, self._h = w, h
+                self._x, self._y = 0, 0
+            def width(self):
+                return self._w
+            def height(self):
+                return self._h
+            def move(self, x, y):
+                self._x, self._y = x, y
+            def isVisible(self):
+                return True
+
+        wins = [_FakeWin(300, 200), _FakeWin(250, 150), _FakeWin(400, 300)]
+        mgr = MDIManager.__new__(MDIManager)   # skip __init__ (needs MainWindow)
+        mgr.mdi_area = mdi
+        monkeypatch.setattr(mgr, "_active_tree_windows", lambda: wins)
+
+        mgr.organize_active_windows()
+
+        # sizes unchanged
+        assert [(w.width(), w.height()) for w in wins] == [
+            (300, 200), (250, 150), (400, 300)]
+        # all moved to a non-negative, non-overlapping-ish layout (first at origin
+        # margin, second to its right)
+        assert wins[0]._x >= 0 and wins[0]._y >= 0
+        assert wins[1]._x > wins[0]._x  # laid left-to-right
+
     def test_maximize_toggles(self):
         win, bar = _win_with_bar()
         win.show()
