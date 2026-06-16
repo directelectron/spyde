@@ -97,12 +97,17 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           pycrucible --embed . --output dist/SpyDE.exe
 
-      - name: Inject Windows icon
+      # Non-fatal: the portable exe is the secondary artifact, and the
+      # PyCrucible-format icon injection can break when PyCrucible changes its
+      # exe layout. Don't let it block the primary NSIS installer below.
+      - name: Inject Windows icon (portable, best-effort)
         if: runner.os == 'Windows'
+        continue-on-error: true
         run: python tools/inject_icon.py dist/SpyDE.exe spyde/Spyde.ico
 
       - name: Package Windows portable artifact
         if: runner.os == 'Windows'
+        continue-on-error: true
         run: |
           Copy-Item create_shortcut.ps1    dist\create_shortcut.ps1
           Compress-Archive `
