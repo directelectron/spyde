@@ -117,3 +117,27 @@ def test_ensure_backend_noop_when_correct(monkeypatch):
                         lambda: {"needs_gpu_wheel": False, "accelerated": True})
     res = gpu_setup.ensure_backend()
     assert res["ran"] is False and res["ok"] is True
+
+
+# ── uv-managed install detection ─────────────────────────────────────────────
+
+def test_is_uv_managed_detects_lock(tmp_path, monkeypatch):
+    import spyde.updater as up
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+    (tmp_path / "uv.lock").write_text("# lock\n")
+    monkeypatch.setattr(up, "_install_root", lambda: str(tmp_path))
+    assert up.is_uv_managed() is True
+
+
+def test_is_uv_managed_false_without_lock(tmp_path, monkeypatch):
+    import spyde.updater as up
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+    monkeypatch.setattr(up, "_install_root", lambda: str(tmp_path))
+    assert up.is_uv_managed() is False
+
+
+def test_apply_uv_sync_no_root(monkeypatch):
+    import spyde.updater as up
+    monkeypatch.setattr(up, "_install_root", lambda: None)
+    res = up.apply_uv_sync()
+    assert res["ok"] is False

@@ -467,6 +467,8 @@ class MainWindow(QMainWindow):
             skipped = self.settings.value("updates/skip_version", "", type=str)
             if silent and skipped == info.latest:
                 return
+            from spyde.updater import is_uv_managed
+            can_apply = is_uv_managed()
             box = QMessageBox(self)
             box.setWindowTitle("Update Available")
             box.setText(
@@ -474,16 +476,23 @@ class MainWindow(QMainWindow):
                 f"(you have {info.current}).")
             if info.notes:
                 box.setDetailedText(info.notes)
-            get_btn = box.addButton("Get Update", QMessageBox.AcceptRole)
+            if can_apply:
+                get_btn = box.addButton("Install & Restart",
+                                        QMessageBox.AcceptRole)
+            else:
+                get_btn = box.addButton("Get Update", QMessageBox.AcceptRole)
             box.addButton("Remind Me Later", QMessageBox.RejectRole)
             skip_btn = box.addButton("Skip This Version",
                                      QMessageBox.DestructiveRole)
             box.exec()
             clicked = box.clickedButton()
             if clicked is get_btn:
-                import webbrowser
-                webbrowser.open(info.url or
-                                "https://github.com/CSSFrancis/spyde/releases")
+                if can_apply:
+                    self._apply_update(info)
+                else:
+                    import webbrowser
+                    webbrowser.open(info.url or
+                                    "https://github.com/CSSFrancis/spyde/releases")
             elif clicked is skip_btn:
                 self.settings.setValue("updates/skip_version", info.latest)
 
@@ -500,6 +509,15 @@ class MainWindow(QMainWindow):
 
         import threading
         threading.Thread(target=_run, daemon=True).start()
+
+    def _apply_update(self, info) -> None:
+        """Open the in-app applier (uv-managed installs only)."""
+        from spyde.misc.dialogs.update_dialog import UpdateApplyDialog
+        from spyde.updater import GITHUB_REPO
+        tag = info.latest
+        # GitHub source archive for the tag → unpacked over the install root.
+        src_zip = f"https://github.com/{GITHUB_REPO}/archive/refs/tags/{tag}.zip"
+        UpdateApplyDialog(tag, src_zip, parent=self).exec()
 
     def export_current_signal(self):
         plot = self._active_plot()
