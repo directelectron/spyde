@@ -1,67 +1,65 @@
+from __future__ import annotations
+
+import threading
 import time
-
-import numpy as np
-from PySide6 import QtCore
-
 from typing import Callable, Optional, Set, Dict
 
+import numpy as np
+from psygnal import Signal
 from dask.distributed import Future
+
 from spyde.drawing.update_functions import read_shared_array
 
-class PlotUpdateWorker(QtCore.QObject):
+
+class PlotUpdateWorker:
     """
     Worker that periodically scans plots for completed Dask Futures and emits results.
-    Runs in its own thread; GUI updates happen via a signal on the main thread.
+    Runs in a daemon thread; callers connect to signals to receive results.
+
+    Thread safety note: emit() is called from the background thread.  Slots that
+    touch the IPC layer should be thread-safe (e.g. use a queue or asyncio
+    run_coroutine_threadsafe); slots that mutate anyplotlib figures are fine
+    because anyplotlib's _push() is GIL-protected.
     """
 
-    plot_ready = QtCore.Signal(object, object, object)  # (plot, result, fid)
-    signal_ready = QtCore.Signal(object, object, object)  # (signal, result)
-    debug_print = QtCore.Signal(str)  # debug messages routed to main thread
+    plot_ready = Signal(object, object, object)   # (plot, result, future)
+    signal_ready = Signal(object, object, object) # (signal, result, plot)
+    debug_print = Signal(str)
 
     def __init__(
         self,
-        get_plots_callable: Callable[[], list["Plot"]],
+        get_plots_callable: Callable[[], list],
         interval_ms: int = 2,
-        parent: Optional[QtCore.QObject] = None,
     ) -> None:
-        super().__init__(parent)
-        self._seen_plots: Dict[int:int] = dict()
+        self._seen_plots: Dict[int, int] = {}
         self._get_plots = get_plots_callable
-        self._timer = QtCore.QTimer(self)
-        self._timer.setInterval(interval_ms)
-        self._timer.timeout.connect(self._check)
-        self._seen: Set[int] = set()  # prevent duplicate emits for the same Future
-        # Flag used to request a clean shutdown from outside the worker thread
-        self._quit_requested = False
+        self._interval = interval_ms / 1000.0
+        self._seen: Set[int] = set()
+        self._running = False
+        self._thread: threading.Thread | None = None
 
-    @QtCore.Slot()
     def start(self) -> None:
-        """Start polling in the worker thread."""
-        self._quit_requested = False
-        if not self._timer.isActive():
-            self._timer.start()
+        """Start the polling loop in a daemon thread."""
+        self._running = True
+        self._thread = threading.Thread(
+            target=self._loop, daemon=True, name="plot-update-worker"
+        )
+        self._thread.start()
 
-    @QtCore.Slot()
     def stop(self) -> None:
-        """
-        Request the worker to stop.
-
-        Note:
-            This slot runs in the worker's thread (when invoked via queued connection).
-            Call it from other threads using QtCore.QMetaObject.invokeMethod or a signal.
-        """
-        self._quit_requested = True
-        if self._timer.isActive():
-            self._timer.stop()
+        """Request the worker to stop. Returns immediately; thread exits on next tick."""
+        self._running = False
         self._seen.clear()
 
-    @QtCore.Slot()
-    def _check(self) -> None:
-        if self._quit_requested:
-            if self._timer.isActive():
-                self._timer.stop()
-            return
+    def _loop(self) -> None:
+        while self._running:
+            try:
+                self._check()
+            except Exception:
+                pass
+            time.sleep(self._interval)
 
+    def _check(self) -> None:
         try:
             plots = self._get_plots() or []
         except Exception:
@@ -71,14 +69,14 @@ class PlotUpdateWorker(QtCore.QObject):
             self._maybe_emit_plot_ready(plot)
             self._maybe_emit_signal_ready(plot)
 
-    def _maybe_emit_plot_ready(self, plot: "Plot") -> None:
+    def _maybe_emit_plot_ready(self, plot) -> None:
         try:
             fut = getattr(plot, "current_data", None)
             self._maybe_emit_future(fut, self.plot_ready.emit, plot)
         except Exception:
             pass
 
-    def _maybe_emit_signal_ready(self, plot: "Plot") -> None:
+    def _maybe_emit_signal_ready(self, plot) -> None:
         try:
             sig = getattr(plot.plot_state, "current_signal", None)
             if sig is None:
@@ -99,28 +97,30 @@ class PlotUpdateWorker(QtCore.QObject):
     def _maybe_emit_future(
         self,
         fut: Optional[Future],
-        emitter: Callable[[object, object, Optional[object]], None],
-        plot: Optional["Plot"] = None,
+        emitter: Callable,
+        plot=None,
+        extra=None,
     ) -> None:
         if not isinstance(fut, Future) or not fut.done():
             return
         fid = id(fut)
-        if fid in self._seen and self._seen_plots.get(fid, None) == id(plot):
+        if fid in self._seen and self._seen_plots.get(fid) == id(plot):
             return
         self._seen.add(fid)
         self._seen_plots[fid] = id(plot)
         try:
-            self.debug_print.emit(f"Emitting Future, {fut.key} for plot: {plot}")
+            self.debug_print.emit(f"Emitting Future {fut.key} for plot: {plot}")
             if "write_shared_array" in fut.key and plot is not None:
-                start_read = time.time()
+                start = time.time()
                 result = read_shared_array(plot.shared_memory)
-                self.debug_print.emit(f"Read shared array in {(time.time() - start_read)*1000:.2f} ms")
+                self.debug_print.emit(f"Read shared array in {(time.time()-start)*1000:.2f} ms")
             else:
-                start_transfer = time.time()
+                start = time.time()
                 result = fut.result()
-                self.debug_print.emit(f"Transferred Future over TCP in {(time.time() - start_transfer)*1000:.2f} ms")
+                self.debug_print.emit(f"Transferred Future over TCP in {(time.time()-start)*1000:.2f} ms")
         except Exception as e:
             result = e
-        # Pass the future object itself (not id) so on_plot_future_ready can use
-        # identity comparison (`is`) — avoids id()-reuse false positives from GC.
-        emitter(plot, result, fut)
+        if extra is not None:
+            emitter(plot, result, fut)
+        else:
+            emitter(plot, result, fut)

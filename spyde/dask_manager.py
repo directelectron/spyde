@@ -1,9 +1,9 @@
 from __future__ import annotations
 import logging
 import subprocess
+import threading
 
-from PySide6 import QtCore
-from PySide6.QtCore import QObject, Signal, Slot
+from psygnal import Signal
 import psutil
 
 from dask.distributed import Client, LocalCluster
@@ -27,70 +27,20 @@ def _probe_gpus() -> int:
         return 0
 
 
-class _DaskClusterWorker(QObject):
-    finished = Signal(object, object, object)  # cluster, client, gpu_worker_address
-    error = Signal(Exception)
-
-    def __init__(self, n_workers: int, threads_per_worker: int, parent=None):
-        super().__init__(parent)
-        self.n_workers = n_workers
-        self.threads_per_worker = threads_per_worker
-        self._stopped = False
-
-    @Slot()
-    def start(self):
-        if self._stopped:
-            return
-        # Pre-calculate per-worker memory based on the *final* worker count.
-        # Without this, LocalCluster(n_workers=1) assigns 100% of RAM to the
-        # first worker; scaled-up workers inherit that same spec, so each one
-        # claims the full system memory instead of 1/n_workers of it.
-        # Reserve ~80 % of RAM (matching Dask's own default headroom) and
-        # divide by the target worker count.
-        total_mem = psutil.virtual_memory().total
-        memory_per_worker = int(total_mem * 0.80) // max(self.n_workers, 1)
-        logger.info(
-            "Dask memory per worker: %.1f GB (total=%.1f GB, workers=%d)",
-            memory_per_worker / 1024**3,
-            total_mem / 1024**3,
-            self.n_workers,
-        )
-
-        # Start with 1 worker so the client is usable immediately (~300ms),
-        # then scale to full count in the background while the app loads.
-        cluster = LocalCluster(
-            n_workers=1,
-            threads_per_worker=self.threads_per_worker,
-            memory_limit=memory_per_worker,
-        )
-        client = Client(cluster)
-        n_gpus = _probe_gpus()
-        gpu_worker_address = "gpu_available" if n_gpus > 0 else None
-        self.finished.emit(cluster, client, gpu_worker_address)
-        # Scale up after the client signal is delivered
-        if self.n_workers > 1:
-            cluster.scale(self.n_workers)
-
-    @Slot()
-    def stop(self):
-        self._stopped = True
-
-
-class DaskManager(QObject):
+class DaskManager:
     """Owns the Dask LocalCluster and Client lifecycle."""
 
-    ready = Signal()  # emitted once the client is available
+    ready = Signal()
+    error = Signal(str)
 
-    def __init__(self, n_workers: int, threads_per_worker: int, parent=None):
-        super().__init__(parent)
+    def __init__(self, n_workers: int, threads_per_worker: int):
         self._client: Client | None = None
         self._cluster: LocalCluster | None = None
         self._gpu_worker_address: str | None = None
         self._heavy_compute_workers: list[str] | None = None
         self._n_workers = n_workers
         self._threads_per_worker = threads_per_worker
-        self._dask_thread: QtCore.QThread | None = None
-        self._dask_worker: _DaskClusterWorker | None = None
+        self._thread: threading.Thread | None = None
 
     @property
     def client(self) -> Client | None:
@@ -106,36 +56,45 @@ class DaskManager(QObject):
 
     def start(self) -> None:
         """Start the Dask cluster in a background thread."""
-        self._dask_thread = QtCore.QThread(self)
-        self._dask_worker = _DaskClusterWorker(
-            n_workers=self._n_workers,
-            threads_per_worker=self._threads_per_worker,
-        )
-        self._dask_worker.moveToThread(self._dask_thread)
-        self._dask_thread.started.connect(self._dask_worker.start)
-        self._dask_worker.finished.connect(self._on_dask_ready)
-        self._dask_worker.error.connect(self._on_dask_error)
-        self._dask_thread.finished.connect(self._dask_worker.deleteLater)
-        self._dask_thread.start()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="dask-startup")
+        self._thread.start()
 
-    @Slot(object, object, object)
-    def _on_dask_ready(self, cluster, client, gpu_worker_address=None):
-        self._cluster = cluster
-        self._client = client
-        self._gpu_worker_address = gpu_worker_address
-        print(f"Dask cluster ready. Dashboard: {client.dashboard_link}")
-        worker_keys = list(client.scheduler_info(n_workers=-1)["workers"].keys())
-        heavy = worker_keys[1:]
-        self._heavy_compute_workers = heavy if heavy else None
-        self._dask_thread.quit()
-        self._dask_thread.wait(2000)
-        self.ready.emit()
+    def _run(self) -> None:
+        try:
+            total_mem = psutil.virtual_memory().total
+            memory_per_worker = int(total_mem * 0.80) // max(self._n_workers, 1)
+            logger.info(
+                "Dask memory per worker: %.1f GB (total=%.1f GB, workers=%d)",
+                memory_per_worker / 1024**3,
+                total_mem / 1024**3,
+                self._n_workers,
+            )
 
-    @Slot(Exception)
-    def _on_dask_error(self, exc):
-        print(f"Failed to start Dask cluster: {exc}")
-        self._dask_thread.quit()
-        self._dask_thread.wait(2000)
+            cluster = LocalCluster(
+                n_workers=1,
+                threads_per_worker=self._threads_per_worker,
+                memory_limit=memory_per_worker,
+            )
+            client = Client(cluster)
+            n_gpus = _probe_gpus()
+            gpu_worker_address = "gpu_available" if n_gpus > 0 else None
+
+            self._cluster = cluster
+            self._client = client
+            self._gpu_worker_address = gpu_worker_address
+            print(f"Dask cluster ready. Dashboard: {client.dashboard_link}")
+
+            worker_keys = list(client.scheduler_info(n_workers=-1)["workers"].keys())
+            heavy = worker_keys[1:]
+            self._heavy_compute_workers = heavy if heavy else None
+
+            if self._n_workers > 1:
+                cluster.scale(self._n_workers)
+
+            self.ready.emit()
+        except Exception as exc:
+            logger.exception("Failed to start Dask cluster")
+            self.error.emit(str(exc))
 
     def shutdown(self) -> None:
         """Gracefully shut down the Dask client and cluster."""

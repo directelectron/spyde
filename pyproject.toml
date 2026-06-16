@@ -26,15 +26,11 @@ dependencies = [
     "hyperspy@git+https://github.com/cssfrancis/hyperspy.git@slice-integrate2",
     "rosettasciio@git+https://github.com/cssfrancis/rosettasciio.git@improve_mrc",
     "pyxem",
-    "PySide6",
     "imageio-ffmpeg",
-    "pyqtgraph",
     "imagecodecs",
+    "psygnal>=0.10.0",
+    "anyplotlib@file:///Users/carterfrancis/PycharmProjects/anyplotlib",
     # GPU-accelerated batched compute (vector orientation mapping, etc.).
-    # torch gives one API across CUDA / Apple-MPS / CPU — the default PyPI
-    # wheel is CUDA-enabled on Win/Linux and MPS-enabled on macOS arm64, and
-    # falls back to (still-batched) CPU everywhere. For a specific CUDA version
-    # install the matching wheel from the pytorch index separately.
     "torch",
 ]
 description = "DE Visualization tool based on HyperSpy"
@@ -113,7 +109,7 @@ tests = [
     "pytest>=3.6",
     "setuptools_scm",
     "pytest-cov",
-    "pytest-qt",
+    "playwright>=1.40.0",
     "sphinx_gallery",
     "tifffile",
 ]
