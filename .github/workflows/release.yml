@@ -18,15 +18,18 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            artifact_name: SpyDE-windows.zip
-            artifact_path: dist/SpyDE-windows.zip
+            artifact_name: SpyDE-windows
+            # installer (primary) + portable (offline fallback)
+            artifact_path: |
+              dist/SpyDE-Setup-*.exe
+              dist/SpyDE-portable-windows.zip
 
           - os: macos-latest
-            artifact_name: SpyDE.dmg
+            artifact_name: SpyDE-macos
             artifact_path: dist/SpyDE.dmg
 
           - os: ubuntu-latest
-            artifact_name: SpyDE.AppImage
+            artifact_name: SpyDE-linux
             artifact_path: dist/SpyDE.AppImage
 
     steps:
@@ -64,6 +67,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[tests]"
 
+      - name: Stamp build info
+        run: python tools/write_build_info.py --channel stable
+
       - name: Install PyCrucible
         run: pip install pycrucible
 
@@ -81,13 +87,31 @@ jobs:
         if: runner.os == 'Windows'
         run: python tools/inject_icon.py dist/SpyDE.exe spyde/Spyde.ico
 
-      - name: Package Windows artifacts
+      - name: Package Windows portable artifact
         if: runner.os == 'Windows'
         run: |
           Copy-Item create_shortcut.ps1    dist\create_shortcut.ps1
           Compress-Archive `
             -Path dist\SpyDE.exe, dist\create_shortcut.ps1 `
-            -DestinationPath dist\SpyDE-windows.zip -Force
+            -DestinationPath dist\SpyDE-portable-windows.zip -Force
+
+      # ── Windows uv-managed installer (NSIS) ───────────────────────────────
+      - name: Install installer build deps (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          pip install pyinstaller
+          choco install nsis -y --no-progress
+
+      - name: Stage installer payload (Windows)
+        if: runner.os == 'Windows'
+        run: python tools/build_installer_payload.py
+
+      - name: Build NSIS installer (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          $v = python -c "import spyde._version as v; print(v.__version__)"
+          & "$env:ProgramFiles (x86)\NSIS\makensis.exe" /DVERSION=$v installer\spyde.nsi
+          if (-not (Test-Path "dist\SpyDE-Setup-$v.exe")) { exit 1 }
 
       # ── macOS ─────────────────────────────────────────────────────────────
       - name: Build (macOS)
@@ -136,10 +160,36 @@ jobs:
       contents: write      # required to create/edit a Release
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist/
+
+      - name: Flatten artifact directories
+        run: |
+          mkdir -p dist/release
+          find dist -type f \( -name 'SpyDE-Setup-*.exe' -o \
+            -name 'SpyDE-portable-windows.zip' -o -name 'SpyDE.dmg' -o \
+            -name 'SpyDE.AppImage' \) -exec cp {} dist/release/ \;
+          ls -la dist/release
+
+      - name: Generate update manifest (latest.json)
+        run: |
+          python tools/write_manifest.py --channel stable \
+            --out dist/release/latest.json \
+            --notes-url "https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}" \
+            --asset "windows-installer=https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$(basename dist/release/SpyDE-Setup-*.exe)" \
+            --asset "windows-portable=https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/SpyDE-portable-windows.zip" \
+            --asset "macos=https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/SpyDE.dmg" \
+            --asset "linux=https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/SpyDE.AppImage"
 
       - name: Create GitHub Release and upload artifacts
         uses: softprops/action-gh-release@v2
@@ -149,19 +199,19 @@ jobs:
             ## SpyDE ${{ github.ref_name }}
 
             ### Downloads
-            | Platform | File |
-            |----------|------|
-            | Windows  | `SpyDE-windows.zip` |
-            | macOS    | `SpyDE.dmg` |
-            | Linux    | `SpyDE.AppImage` |
+            | Platform | File | Notes |
+            |----------|------|-------|
+            | Windows  | `SpyDE-Setup-*.exe` | **Installer** (recommended) — per-user, no admin |
+            | Windows  | `SpyDE-portable-windows.zip` | Portable / offline (no install) |
+            | macOS    | `SpyDE.dmg` | |
+            | Linux    | `SpyDE.AppImage` | |
 
             ### Installation
-            **Windows:**
-            1. Extract `SpyDE-windows.zip`
-            2. Run `create_shortcut.ps1` once to create a branded desktop/Start-Menu shortcut
-            3. Launch via the shortcut (or run `SpyDE.exe` directly)
+            **Windows:** run `SpyDE-Setup-*.exe`. First launch sets up the
+            environment (incl. the GPU-correct PyTorch via uv) — give it a moment.
+            Updates are checked automatically; install from Help → Check for Updates.
 
-            **macOS:** Open `SpyDE.dmg`, drag SpyDE to Applications.
+            **macOS:** open `SpyDE.dmg`, drag SpyDE to Applications.
 
             **Linux:** `chmod +x SpyDE.AppImage && ./SpyDE.AppImage`
 
@@ -171,8 +221,6 @@ jobs:
             git push origin v0.1.0
             ```
           files: |
-            dist/SpyDE-windows.zip/SpyDE-windows.zip
-            dist/SpyDE.dmg/SpyDE.dmg
-            dist/SpyDE.AppImage/SpyDE.AppImage
+            dist/release/*
           fail_on_unmatched_files: true
           generate_release_notes: true
