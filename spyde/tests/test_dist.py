@@ -92,6 +92,31 @@ def test_check_finds_newer(monkeypatch):
     assert info.url == "u1"
 
 
+def test_check_channels(monkeypatch):
+    import io
+    import json
+    import spyde.updater as up
+
+    releases = [
+        {"tag_name": "v0.1.0", "html_url": "s"},
+        {"tag_name": "v0.2.0-rc.1", "prerelease": True, "html_url": "b"},
+    ]
+
+    class _Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(up.urllib.request, "urlopen",
+                        lambda req, timeout=0: _Resp(json.dumps(releases).encode()))
+    monkeypatch.setattr(up, "_current_version", lambda: "0.1.0")
+    # stable ignores the rc (already latest); beta offers it
+    assert up.check(channel="stable").available is False
+    beta = up.check(channel="beta")
+    assert beta.available is True and beta.latest == "v0.2.0-rc.1"
+
+
 # ── gpu_setup ────────────────────────────────────────────────────────────────
 
 def test_gpu_detect_shape():

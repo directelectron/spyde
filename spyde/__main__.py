@@ -408,6 +408,17 @@ class MainWindow(QMainWindow):
             lambda: self.check_for_updates(silent=False))
         help_menu.addAction(check_updates_action)
 
+        # Update channel: stable (final releases only) vs beta (incl. pre-releases)
+        channel_menu = help_menu.addMenu("Update Channel")
+        cur_channel = self.settings.value("updates/channel", "stable", type=str)
+        self._channel_group = QtGui.QActionGroup(self)
+        for ch in ("stable", "beta"):
+            act = QAction(ch.capitalize(), self, checkable=True)
+            act.setChecked(ch == cur_channel)
+            act.triggered.connect(partial(self._set_update_channel, ch))
+            self._channel_group.addAction(act)
+            channel_menu.addAction(act)
+
         gpu_status_action = QAction("GPU Status…", self)
         gpu_status_action.triggered.connect(self.show_gpu_status)
         help_menu.addAction(gpu_status_action)
@@ -417,6 +428,12 @@ class MainWindow(QMainWindow):
         about_action = QAction("About SpyDE", self)
         about_action.triggered.connect(self.show_about)
         help_menu.addAction(about_action)
+
+    def _set_update_channel(self, channel: str) -> None:
+        self.settings.setValue("updates/channel", channel)
+        # Clear a skipped-version pin so switching channels re-prompts.
+        self.settings.remove("updates/skip_version")
+        self.statusBar().showMessage(f"Update channel set to {channel}.", 4000)
 
     def show_gpu_status(self):
         from spyde.misc.dialogs.gpu_status_dialog import GpuStatusDialog
@@ -498,10 +515,12 @@ class MainWindow(QMainWindow):
 
         relay.done.connect(_present)
 
+        channel = self.settings.value("updates/channel", "stable", type=str)
+
         def _run():
             try:
                 from spyde.updater import check
-                relay.done.emit(check())
+                relay.done.emit(check(channel=channel))
             except Exception as e:
                 from spyde.updater import UpdateInfo
                 relay.done.emit(UpdateInfo(

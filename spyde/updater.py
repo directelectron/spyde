@@ -94,7 +94,11 @@ def _current_channel() -> str:
 
 
 def check(channel: Optional[str] = None, timeout: float = 6.0) -> UpdateInfo:
-    """Query GitHub Releases for a newer version. Network-only, never raises."""
+    """Query GitHub Releases for a newer version. Network-only, never raises.
+
+    channel: "stable" (only final releases) or "beta" (newest of stable +
+    pre-releases). When None, falls back to the build channel.
+    """
     current = _current_version()
     channel = channel or _current_channel()
     try:
