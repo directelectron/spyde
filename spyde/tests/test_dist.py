@@ -166,3 +166,25 @@ def test_apply_uv_sync_no_root(monkeypatch):
     monkeypatch.setattr(up, "_install_root", lambda: None)
     res = up.apply_uv_sync()
     assert res["ok"] is False
+
+
+def test_install_kind_uv_managed(tmp_path, monkeypatch):
+    import spyde.updater as up
+    (tmp_path / "pyproject.toml").write_text("x")
+    (tmp_path / "uv.lock").write_text("x")
+    monkeypatch.setattr(up, "_install_root", lambda: str(tmp_path))
+    assert up.install_kind() == "uv-managed"
+
+
+def test_install_kind_pypi(monkeypatch):
+    import spyde.updater as up
+    monkeypatch.setattr(up, "is_uv_managed", lambda: False)
+    monkeypatch.setattr(up, "is_pypi_install", lambda: True)
+    assert up.install_kind() == "pypi"
+
+
+def test_install_kind_portable(monkeypatch):
+    import spyde.updater as up
+    monkeypatch.setattr(up, "is_uv_managed", lambda: False)
+    monkeypatch.setattr(up, "is_pypi_install", lambda: False)
+    assert up.install_kind() == "portable"

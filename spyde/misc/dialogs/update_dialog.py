@@ -125,3 +125,51 @@ class UpdateApplyDialog(QtWidgets.QDialog):
         app = QtWidgets.QApplication.instance()
         if app is not None:
             app.quit()
+
+
+class PyPIUpgradeDialog(QtWidgets.QDialog):
+    """Upgrade a PyPI-installed SpyDE via uv/pip (future PyPI release path)."""
+    _line = QtCore.Signal(str)
+    _done = QtCore.Signal(bool, str)
+
+    def __init__(self, tag: str, prerelease: bool = False, parent=None):
+        super().__init__(parent)
+        self._prerelease = prerelease
+        self.setWindowTitle(f"Upgrade to SpyDE {tag}")
+        self.setMinimumWidth(460)
+        v = QtWidgets.QVBoxLayout(self)
+        v.setContentsMargins(12, 12, 12, 12)
+        v.setSpacing(8)
+        v.addWidget(QtWidgets.QLabel(
+            f"Upgrading SpyDE to {tag} via uv/pip. Restart when it finishes."))
+        self._log = QtWidgets.QPlainTextEdit(readOnly=True)
+        self._log.setMaximumHeight(200)
+        self._log.setStyleSheet(
+            f"background: {SURFACE_PANEL}; border: 1px solid {BORDER_FAINT};")
+        v.addWidget(self._log)
+        row = QtWidgets.QHBoxLayout()
+        self._start = make_button("Upgrade Now", self)
+        self._close = make_button("Close", self)
+        row.addWidget(self._start)
+        row.addStretch(1)
+        row.addWidget(self._close)
+        v.addLayout(row)
+        self._start.clicked.connect(self._on_start)
+        self._close.clicked.connect(self.reject)
+        self._line.connect(self._log.appendPlainText)
+        self._done.connect(self._on_done)
+
+    def _on_start(self):
+        self._start.setEnabled(False)
+        self._line.emit("Upgrading…")
+
+        def _run():
+            res = updater.apply_pypi_upgrade(
+                prerelease=self._prerelease, progress=self._line.emit)
+            self._done.emit(res.get("ok", False), res.get("message", "done"))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_done(self, ok: bool, message: str):
+        self._line.emit("")
+        self._line.emit(message)

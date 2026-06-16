@@ -155,6 +155,72 @@ def _install_root() -> Optional[str]:
     return None
 
 
+def install_kind() -> str:
+    """How SpyDE is installed: 'uv-managed' | 'pypi' | 'portable'.
+
+    Drives the update mechanism: uv-managed → fetch+uv-sync; pypi → uv/pip
+    upgrade; portable → open the download page. Future-proofs a PyPI release.
+    """
+    if is_uv_managed():
+        return "uv-managed"
+    if is_pypi_install():
+        return "pypi"
+    return "portable"
+
+
+def is_pypi_install() -> bool:
+    """True when spyde is a regular site-packages install (pip/uv pip), i.e. has
+    dist metadata and is NOT an editable/uv-managed checkout."""
+    try:
+        import importlib.metadata as im
+        dist = im.distribution("spyde")
+        # editable installs expose a direct_url with "editable": true
+        try:
+            import json
+            durl = dist.read_text("direct_url.json")
+            if durl and json.loads(durl).get("dir_info", {}).get("editable"):
+                return False
+        except Exception:
+            pass
+        return not is_uv_managed()
+    except Exception:
+        return False
+
+
+def apply_pypi_upgrade(prerelease: bool = False, progress=None) -> dict:
+    """Upgrade a PyPI-installed SpyDE via uv (falls back to pip).
+
+    Reserved for the future PyPI release path: ``uv pip install --upgrade
+    [--prerelease=allow] spyde`` into the running interpreter. Returns
+    {"ok","message"}."""
+    import shutil
+    import subprocess
+    uv = os.environ.get("SPYDE_UV") or shutil.which("uv")
+    if uv is not None:
+        cmd = [uv, "pip", "install", "--python", sys.executable, "--upgrade"]
+        if prerelease:
+            cmd += ["--prerelease=allow"]
+        cmd += ["--torch-backend=auto", "spyde"]
+    else:
+        cmd = [sys.executable, "-m", "pip", "install", "--upgrade"]
+        if prerelease:
+            cmd += ["--pre"]
+        cmd += ["spyde"]
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1)
+        for line in proc.stdout:
+            if progress is not None:
+                progress(line.rstrip())
+        proc.wait(timeout=3600)
+        ok = proc.returncode == 0
+        return {"ok": ok, "message": "Upgraded — restart SpyDE"
+                if ok else f"upgrade exited {proc.returncode}"}
+    except Exception as e:
+        return {"ok": False, "message": f"upgrade failed: {e}"}
+
+
 def apply_uv_sync(progress=None) -> dict:
     """Update the uv-managed install in place: ``uv sync`` against the (already
     updated) pyproject/lock. Returns {"ok","message"}. The caller is expected to

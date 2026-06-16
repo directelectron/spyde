@@ -484,8 +484,9 @@ class MainWindow(QMainWindow):
             skipped = self.settings.value("updates/skip_version", "", type=str)
             if silent and skipped == info.latest:
                 return
-            from spyde.updater import is_uv_managed
-            can_apply = is_uv_managed()
+            from spyde.updater import install_kind
+            kind = install_kind()
+            can_apply = kind in ("uv-managed", "pypi")
             box = QMessageBox(self)
             box.setWindowTitle("Update Available")
             box.setText(
@@ -504,8 +505,10 @@ class MainWindow(QMainWindow):
             box.exec()
             clicked = box.clickedButton()
             if clicked is get_btn:
-                if can_apply:
+                if kind == "uv-managed":
                     self._apply_update(info)
+                elif kind == "pypi":
+                    self._apply_pypi_update(info)
                 else:
                     import webbrowser
                     webbrowser.open(info.url or
@@ -537,6 +540,13 @@ class MainWindow(QMainWindow):
         # GitHub source archive for the tag → unpacked over the install root.
         src_zip = f"https://github.com/{GITHUB_REPO}/archive/refs/tags/{tag}.zip"
         UpdateApplyDialog(tag, src_zip, parent=self).exec()
+
+    def _apply_pypi_update(self, info) -> None:
+        """Upgrade a PyPI-installed SpyDE via uv/pip (future PyPI release path)."""
+        from spyde.misc.dialogs.update_dialog import PyPIUpgradeDialog
+        channel = self.settings.value("updates/channel", "stable", type=str)
+        PyPIUpgradeDialog(info.latest, prerelease=(channel == "beta"),
+                          parent=self).exec()
 
     def export_current_signal(self):
         plot = self._active_plot()
