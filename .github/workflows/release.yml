@@ -67,8 +67,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[tests]"
 
+      # rc/beta/alpha tags → beta channel; bare vX.Y.Z → stable.
+      - name: Determine channel
+        id: chan
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if echo "$tag" | grep -Eq '(rc|alpha|beta|-a\.|-b\.)'; then
+            echo "channel=beta" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "channel=stable" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Stamp build info
-        run: python tools/write_build_info.py --channel stable
+        run: python tools/write_build_info.py --channel ${{ steps.chan.outputs.channel }} --version ${{ github.ref_name }}
 
       - name: Install PyCrucible
         run: pip install pycrucible
@@ -158,6 +172,19 @@ jobs:
         with:
           path: dist/
 
+      - name: Determine channel
+        id: chan
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if echo "$tag" | grep -Eq '(rc|alpha|beta|-a\.|-b\.)'; then
+            echo "channel=beta" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "channel=stable" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Flatten artifact directories
         run: |
           mkdir -p dist/release
@@ -168,7 +195,7 @@ jobs:
 
       - name: Generate update manifest (latest.json)
         run: |
-          python tools/write_manifest.py --channel stable \
+          python tools/write_manifest.py --channel ${{ steps.chan.outputs.channel }} \
             --out dist/release/latest.json \
             --notes-url "https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}" \
             --asset "windows-installer=https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$(basename dist/release/SpyDE-Setup-*.exe)" \
@@ -180,6 +207,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           name: SpyDE ${{ github.ref_name }}
+          prerelease: ${{ steps.chan.outputs.prerelease }}
           body: |
             ## SpyDE ${{ github.ref_name }}
 

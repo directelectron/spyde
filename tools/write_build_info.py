@@ -40,9 +40,12 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--channel", default=None,
                     choices=["stable", "beta", "dev"])
+    ap.add_argument("--version", default=None,
+                    help="override the stamped version (e.g. the git tag, "
+                         "with any leading 'v' stripped)")
     args = ap.parse_args()
 
-    version = _version()
+    version = (args.version or _version()).lstrip("v")
     channel = args.channel or (
         "beta" if any(t in version for t in ("rc", "a", "b", "dev")) else "stable")
     sha = _git_sha()
