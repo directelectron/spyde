@@ -211,6 +211,14 @@ class MainWindow(QMainWindow):
             bar.collapse_btn.clicked.connect(self._toggle_sidebar)
             bar.organize_btn.clicked.connect(self.organize_active_windows)
 
+        # Check for updates shortly after startup (non-blocking, silent unless
+        # an update is found). Disable via SPYDE_NO_UPDATE_CHECK or QSettings.
+        if (self.app is not None
+                and not os.environ.get("SPYDE_NO_UPDATE_CHECK")
+                and self.settings.value("updates/check_on_startup", True, type=bool)):
+            QtCore.QTimer.singleShot(
+                2500, lambda: self.check_for_updates(silent=True))
+
     def _toggle_sidebar(self):
         """Collapse / restore the Plot Control sidebar from the title bar."""
         self.dock_manager.toggle_plot_control()
@@ -391,6 +399,107 @@ class MainWindow(QMainWindow):
         tile_action.triggered.connect(self.tile_active_windows)
         tile_action.setShortcut("Ctrl+T")
         view_menu.addAction(tile_action)
+
+        # Add Help Menu
+        help_menu = menubar.addMenu("Help")
+
+        check_updates_action = QAction("Check for Updates…", self)
+        check_updates_action.triggered.connect(
+            lambda: self.check_for_updates(silent=False))
+        help_menu.addAction(check_updates_action)
+
+        gpu_status_action = QAction("GPU Status…", self)
+        gpu_status_action.triggered.connect(self.show_gpu_status)
+        help_menu.addAction(gpu_status_action)
+
+        help_menu.addSeparator()
+
+        about_action = QAction("About SpyDE", self)
+        about_action.triggered.connect(self.show_about)
+        help_menu.addAction(about_action)
+
+    def show_gpu_status(self):
+        from spyde.misc.dialogs.gpu_status_dialog import GpuStatusDialog
+        GpuStatusDialog(parent=self).exec()
+
+    def show_about(self):
+        from spyde._build_info import build_info
+        from spyde import gpu_setup
+        info = build_info()
+        try:
+            backend = gpu_setup.detect()["backend"].upper()
+        except Exception:
+            backend = "?"
+        QMessageBox.about(
+            self, "About SpyDE",
+            f"<b>SpyDE</b> {info['version']}<br>"
+            f"build {info['git_sha']} · {info['channel']}<br>"
+            f"compute backend: {backend}<br><br>"
+            "Visualization &amp; analysis for electron microscopy "
+            "(TEM / STEM / 4D-STEM / EELS).")
+
+    def check_for_updates(self, silent: bool = False) -> None:
+        """Check GitHub Releases for a newer version on a worker thread.
+
+        silent=True (startup): only surfaces a prompt if an update is found and
+        the user hasn't skipped that version. silent=False (Help menu): always
+        reports the outcome.
+        """
+        class _Relay(QtCore.QObject):
+            done = QtCore.Signal(object)
+        relay = _Relay(self)
+        self._update_relay = relay
+
+        def _present(info):
+            from spyde.updater import UpdateInfo  # noqa: F401
+            if info.error and not silent:
+                QMessageBox.information(
+                    self, "Check for Updates",
+                    f"Could not check for updates.\n\n{info.error}")
+                return
+            if not info.available:
+                if not silent:
+                    QMessageBox.information(
+                        self, "Check for Updates",
+                        f"SpyDE {info.current} is up to date.")
+                return
+            # An update is available.
+            skipped = self.settings.value("updates/skip_version", "", type=str)
+            if silent and skipped == info.latest:
+                return
+            box = QMessageBox(self)
+            box.setWindowTitle("Update Available")
+            box.setText(
+                f"SpyDE {info.latest} is available "
+                f"(you have {info.current}).")
+            if info.notes:
+                box.setDetailedText(info.notes)
+            get_btn = box.addButton("Get Update", QMessageBox.AcceptRole)
+            box.addButton("Remind Me Later", QMessageBox.RejectRole)
+            skip_btn = box.addButton("Skip This Version",
+                                     QMessageBox.DestructiveRole)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is get_btn:
+                import webbrowser
+                webbrowser.open(info.url or
+                                "https://github.com/CSSFrancis/spyde/releases")
+            elif clicked is skip_btn:
+                self.settings.setValue("updates/skip_version", info.latest)
+
+        relay.done.connect(_present)
+
+        def _run():
+            try:
+                from spyde.updater import check
+                relay.done.emit(check())
+            except Exception as e:
+                from spyde.updater import UpdateInfo
+                relay.done.emit(UpdateInfo(
+                    available=False, current="?", error=str(e)))
+
+        import threading
+        threading.Thread(target=_run, daemon=True).start()
 
     def export_current_signal(self):
         plot = self._active_plot()
