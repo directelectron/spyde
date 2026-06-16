@@ -113,36 +113,21 @@ jobs:
           & "$env:ProgramFiles (x86)\NSIS\makensis.exe" /DVERSION=$v installer\spyde.nsi
           if (-not (Test-Path "dist\SpyDE-Setup-$v.exe")) { exit 1 }
 
-      # ── macOS ─────────────────────────────────────────────────────────────
-      - name: Build (macOS)
+      # ── macOS: uv-managed .app → .dmg (icon.icns bundled) ─────────────────
+      - name: Build macOS app + dmg
         if: runner.os == 'macOS'
         run: |
           mkdir -p dist
-          pycrucible --embed . --output dist/SpyDE
-
-      - name: Package macOS .app → .dmg
-        if: runner.os == 'macOS'
-        run: |
           brew install create-dmg || true
-          create-dmg \
-            --volname "SpyDE" \
-            --volicon "spyde/icon.icns" \
-            --window-pos 200 120 \
-            --window-size 600 400 \
-            --icon-size 128 \
-            --icon "SpyDE" 175 190 \
-            --app-drop-link 425 190 \
-            "dist/SpyDE.dmg" \
-            "dist/SpyDE" || \
-          hdiutil create -volname SpyDE -srcfolder dist/SpyDE \
-            -ov -format UDZO dist/SpyDE.dmg
+          python tools/build_macos_app.py
 
-      # ── Linux ─────────────────────────────────────────────────────────────
-      - name: Build (Linux)
+      # ── Linux: uv-managed AppImage (Spyde.png icon + .desktop) ────────────
+      - name: Build Linux AppImage
         if: runner.os == 'Linux'
         run: |
           mkdir -p dist
-          pycrucible --embed . --output dist/SpyDE.AppImage
+          sudo apt-get install -y --no-install-recommends rsync
+          python tools/build_linux_appimage.py
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
