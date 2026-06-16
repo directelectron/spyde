@@ -41,6 +41,34 @@ pycrucible build
 ```
 Release builds are triggered by pushing a version tag: `git tag v0.1.0 && git push origin v0.1.0`
 
+## Distribution, Installer & Updates
+
+Two delivery paths (see `DISTRIBUTION_PLAN.md`):
+- **uv-managed installer (primary, Windows):** NSIS installer (`installer/spyde.nsi`)
+  ships the project + bundled `uv` + a launcher stub to `%LOCALAPPDATA%\Programs\SpyDE`
+  (per-user, no admin). `installer/launch.py` runs `uv sync --frozen --torch-backend=auto`
+  on first run / after the lock changes, then `uv run main.py`. CI stages the payload
+  with `tools/build_installer_payload.py`.
+- **Portable single-exe (fallback):** the existing PyCrucible self-contained artifact.
+
+Key modules:
+- **Version is single-sourced** in `spyde/_version.py`; `pyproject.toml` reads it via
+  setuptools dynamic version and `__init__` re-exports `__version__`. Bump that one line to release.
+- `spyde/_build_info.py` carries version/sha/channel/build-date; CI stamps it via
+  `tools/write_build_info.py` (dev checkout falls back to live git resolution).
+- `spyde/updater.py`: `check()` against GitHub Releases (tolerant semver, skips
+  pre-releases on `stable`); `is_uv_managed()` + `apply_uv_sync()` for in-place updates.
+  Startup check fires 2.5s after launch (silent unless an update exists; disable via
+  `SPYDE_NO_UPDATE_CHECK` or the QSettings toggle). Help → Check for Updates is the manual path.
+- `spyde/gpu_setup.py`: `detect()`/`verify()`/`diagnostics()` and `ensure_backend()`
+  (reinstalls the GPU-correct torch wheel via `uv pip install --torch-backend=auto`
+  when an accelerator exists but torch is CPU-only). Help → GPU Status surfaces it;
+  output must stay **cp1252-safe** (no unicode glyphs — they crash the Windows console).
+- `tools/write_manifest.py` publishes `latest.json` with each release.
+
+**Testing:** `spyde/tests/test_dist.py` covers version/build-info/updater-semver/gpu-setup
+(offline, mocked network + uv). No Qt fixture needed.
+
 ## Dependencies
 
 Key non-PyPI dependencies installed from custom forks:

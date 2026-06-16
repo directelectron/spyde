@@ -83,6 +83,13 @@ Keep Option B's single-exe as a fallback "portable" download.
 
 ## 4. Concrete deliverables (phased)
 
+> **Implementation status (2026-06-15):** Phases 0–4 landed on branch
+> `installer-and-updates`. Code-signing (Phase 3 follow-up) and the macOS/Linux
+> installers + offline-cache bundle remain open (see checkboxes). Windows
+> NSIS installer, uv-managed launcher, update check + in-app apply, GPU setup +
+> Status dialog, version single-sourcing, and CI wiring are done.
+
+
 ### Phase 0 — Foundations (low risk, do first)
 - [ ] Single-source version (`__version__` → pyproject dynamic).
 - [ ] `spyde/_build_info.py` written at build time (version, git sha, channel,
