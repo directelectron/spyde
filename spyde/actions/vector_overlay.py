@@ -49,91 +49,87 @@ def _navigator_selectors_for(tree, dp_plot):
     return out or list(npm.all_navigation_selectors)
 
 
-class _SingleGroupVisibility:
-    """Show/hide mixin for overlays with ONE marker group (``_offsets_for`` →
-    offsets, ``_push`` → one arg). The overlay still tracks the navigator while
-    hidden (so re-showing draws the CURRENT frame), it just doesn't draw."""
+class _DPOverlay:
+    """Base for a single circle-marker overlay that tracks the navigator.
+
+    Subclasses set ``dp_plot``, ``name``, ``_color``, ``_radius_px`` (and call
+    ``_calibrate(sig_axes)`` if they convert calibrated kx,ky → pixels) and
+    implement ``_offsets_for(iy, ix) -> (N, 2)`` image-pixel offsets. All the
+    chrome — attach + navigator wiring + push + show/hide + remove — lives here.
+
+    While hidden the overlay still TRACKS the navigator (``_last_iyix`` updates),
+    it just doesn't draw, so re-showing redraws the current frame.
+    """
 
     _hidden = False
     _last_iyix = (0, 0)
+    name = "overlay"
+    _color = "#ff3030"
+    _radius_px = 4.0
 
-    def set_visible(self, visible: bool) -> None:
-        self._hidden = not bool(visible)
-        iy, ix = self._last_iyix
-        if self._hidden:
-            self._push(np.zeros((0, 2), dtype=np.float32))
-        else:
-            self._push(self._offsets_for(iy, ix))
-
-
-class VectorOverlay(_SingleGroupVisibility):
-    """A live circle-marker overlay bound to a DP plot and its navigator."""
-
-    def __init__(self, dp_plot, vecs, *, color="#ff3030", name="found_vectors",
-                 radius_px=None):
-        self.dp_plot = dp_plot
-        self.vecs = vecs
-        self.name = name
-        self._selectors: list = []
-        self._mg = None
-
-        sig_axes = vecs.sig_axes
+    def _calibrate(self, sig_axes) -> None:
         self._x_scale = float(sig_axes[0].scale) or 1.0
         self._x_off = float(sig_axes[0].offset)
         self._y_scale = float(sig_axes[1].scale) or 1.0
         self._y_off = float(sig_axes[1].offset)
-        if radius_px is None:
-            radius_px = getattr(vecs, "kernel_radius_px", 4.0)
-        self._radius_px = max(2.0, float(radius_px))
-        self._color = color
 
-    # ── geometry ──────────────────────────────────────────────────────────
-    def _offsets_for(self, iy, ix) -> np.ndarray:
-        try:
-            kxy = np.asarray(self.vecs.kxy_at(iy, ix), dtype=np.float64)
-        except Exception:
+    def _to_px(self, xy) -> np.ndarray:
+        """Calibrated (kx, ky) → image-pixel offsets — the convention anyplotlib
+        ``transform="data"`` markers use (no axis scale/offset)."""
+        xy = np.asarray(xy, dtype=np.float64)
+        if xy.size == 0:
             return np.zeros((0, 2), dtype=np.float32)
-        if kxy.size == 0:
-            return np.zeros((0, 2), dtype=np.float32)
-        mx = (kxy[:, 0] - self._x_off) / self._x_scale
-        my = (kxy[:, 1] - self._y_off) / self._y_scale
+        mx = (xy[:, 0] - self._x_off) / self._x_scale
+        my = (xy[:, 1] - self._y_off) / self._y_scale
         return np.column_stack([mx, my]).astype(np.float32)
 
-    # ── attach / update ─────────────────────────────────────────────────────
+    def _offsets_for(self, iy, ix) -> np.ndarray:   # pragma: no cover
+        raise NotImplementedError
+
+    def _marker_kwargs(self, offsets) -> dict:
+        return {"offsets": offsets}
+
     def attach(self, tree):
         plot2d = getattr(self.dp_plot, "_plot2d", None)
         if plot2d is None:
             return self
         self._mg = plot2d.add_circles(
             np.zeros((0, 2), dtype=np.float32), name=self.name,
-            radius=self._radius_px, edgecolors=self._color, facecolors=None,
+            radius=float(self._radius_px), edgecolors=self._color, facecolors=None,
             linewidths=1.5, alpha=1.0, transform="data",
         )
         self._selectors = _navigator_selectors_for(tree, self.dp_plot)
+        seeded = False
         for sel in self._selectors:
             sel.index_hooks.append(self._on_indices)
-            # Seed from the selector's last-known position so the markers appear
-            # immediately, not only after the first move.
+            # Seed from the last-known position so markers appear immediately.
             if sel.current_indices is not None:
                 self._on_indices(sel.current_indices)
-        if not self._selectors:
-            self._push(self._offsets_for(0, 0))
+                seeded = True
+        if not seeded:
+            self._push(self._offsets_for(*self._last_iyix))
         return self
 
     def _on_indices(self, indices):
-        iy, ix = _indices_to_iyix(indices)
-        self._last_iyix = (iy, ix)
-        if self._hidden:
-            return
-        self._push(self._offsets_for(iy, ix))
+        self._last_iyix = _indices_to_iyix(indices)
+        if not self._hidden:
+            self._push(self._offsets_for(*self._last_iyix))
 
     def _push(self, offsets):
         if self._mg is None:
             return
         try:
-            self._mg.set(offsets=offsets)
+            self._mg.set(**self._marker_kwargs(offsets))
         except Exception:
-            pass
+            try:
+                self._mg.set(offsets=offsets)
+            except Exception:
+                pass
+
+    def set_visible(self, visible: bool) -> None:
+        self._hidden = not bool(visible)
+        empty = np.zeros((0, 2), dtype=np.float32)
+        self._push(empty if self._hidden else self._offsets_for(*self._last_iyix))
 
     def remove(self):
         for sel in self._selectors:
@@ -150,6 +146,29 @@ class VectorOverlay(_SingleGroupVisibility):
             self._mg = None
 
 
+class VectorOverlay(_DPOverlay):
+    """A live found-vectors circle overlay bound to a DP plot and its navigator."""
+
+    def __init__(self, dp_plot, vecs, *, color="#ff3030", name="found_vectors",
+                 radius_px=None):
+        self.dp_plot = dp_plot
+        self.vecs = vecs
+        self.name = name
+        self._color = color
+        self._mg = None
+        self._selectors = []
+        self._calibrate(vecs.sig_axes)
+        if radius_px is None:
+            radius_px = getattr(vecs, "kernel_radius_px", 4.0)
+        self._radius_px = max(2.0, float(radius_px))
+
+    def _offsets_for(self, iy, ix) -> np.ndarray:
+        try:
+            return self._to_px(self.vecs.kxy_at(iy, ix))
+        except Exception:
+            return np.zeros((0, 2), dtype=np.float32)
+
+
 def attach_vector_overlay(dp_plot, vecs, tree, *, color="#ff3030",
                           name="found_vectors", radius_px=None) -> VectorOverlay:
     """Add a live found-vectors marker overlay to ``dp_plot`` and wire it to the
@@ -158,7 +177,7 @@ def attach_vector_overlay(dp_plot, vecs, tree, *, color="#ff3030",
                          radius_px=radius_px).attach(tree)
 
 
-class OrientationOverlay(_SingleGroupVisibility):
+class OrientationOverlay(_DPOverlay):
     """Overlay the best-matching template's simulated spots on the DP, live.
 
     Re-runs single-pattern template matching (via the prebuilt matching cache,
@@ -188,13 +207,8 @@ class OrientationOverlay(_SingleGroupVisibility):
         # Serialise matching: nav-move (selector thread) and refine-slider
         # (dispatch thread) both call pyxem's numba matcher, whose default
         # workqueue layer is NOT thread-safe under concurrent calls.
-        self._match_lock = __import__("threading").Lock()
-
-        sig_axes = signal.axes_manager.signal_axes
-        self._x_scale = float(sig_axes[0].scale) or 1.0
-        self._x_off = float(sig_axes[0].offset)
-        self._y_scale = float(sig_axes[1].scale) or 1.0
-        self._y_off = float(sig_axes[1].offset)
+        self._match_lock = threading.Lock()
+        self._calibrate(signal.axes_manager.signal_axes)
 
     def set_refine_params(self, **params) -> None:
         """Live-update the Refine sliders (gamma / scale / min-intensity /
@@ -235,56 +249,7 @@ class OrientationOverlay(_SingleGroupVisibility):
             return np.zeros((0, 2), dtype=np.float32)
         if coords is None or len(coords) == 0:
             return np.zeros((0, 2), dtype=np.float32)
-        mx = (coords[:, 0] - self._x_off) / self._x_scale
-        my = (coords[:, 1] - self._y_off) / self._y_scale
-        return np.column_stack([mx, my]).astype(np.float32)
-
-    def attach(self, tree):
-        plot2d = getattr(self.dp_plot, "_plot2d", None)
-        if plot2d is None:
-            return self
-        self._mg = plot2d.add_circles(
-            np.zeros((0, 2), dtype=np.float32), name=self.name,
-            radius=self._radius_px, edgecolors=self._color, facecolors=None,
-            linewidths=1.5, alpha=1.0, transform="data",
-        )
-        self._selectors = _navigator_selectors_for(tree, self.dp_plot)
-        for sel in self._selectors:
-            sel.index_hooks.append(self._on_indices)
-            if sel.current_indices is not None:
-                self._on_indices(sel.current_indices)
-        if not self._selectors:
-            self._push(self._offsets_for(0, 0))
-        return self
-
-    def _on_indices(self, indices):
-        iy, ix = _indices_to_iyix(indices)
-        self._last_iyix = (iy, ix)
-        if self._hidden:
-            return
-        self._push(self._offsets_for(iy, ix))
-
-    def _push(self, offsets):
-        if self._mg is None:
-            return
-        try:
-            self._mg.set(offsets=offsets)
-        except Exception:
-            pass
-
-    def remove(self):
-        for sel in self._selectors:
-            try:
-                sel.index_hooks.remove(self._on_indices)
-            except ValueError:
-                pass
-        self._selectors = []
-        if self._mg is not None:
-            try:
-                self._mg.remove()
-            except Exception:
-                pass
-            self._mg = None
+        return self._to_px(coords)
 
 
 def attach_orientation_overlay(dp_plot, signal, sim, matching_cache, tree, *,
@@ -299,7 +264,7 @@ def attach_orientation_overlay(dp_plot, signal, sim, matching_cache, tree, *,
     ).attach(tree)
 
 
-class FindVectorsPreviewOverlay:
+class FindVectorsPreviewOverlay(_DPOverlay):
     """Live found-peaks preview on the DP, BEFORE the batch compute.
 
     Qt parity: the Find-Vectors caret drew a red scatter that re-ran
@@ -324,10 +289,14 @@ class FindVectorsPreviewOverlay:
         self.subpixel = bool(subpixel)
         self.name = name
         self._color = color
+        self._radius_px = max(1, int(kernel_radius))
         self._mg = None
-        self._selectors: list = []
-        self._last_iyix = (0, 0)
+        self._selectors = []
         self._lock = threading.Lock()
+
+    # The peak radius tracks the (live-tunable) kernel radius on every push.
+    def _marker_kwargs(self, offsets) -> dict:
+        return {"offsets": offsets, "radius": float(self.kernel_radius)}
 
     def set_params(self, **p) -> None:
         """Live-update the tuning sliders and redraw at the current crosshair."""

@@ -1,0 +1,13 @@
+{
+  "name": "spyde-root",
+  "private": true,
+  "description": "Root delegator — the Electron app lives in electron/.",
+  "scripts": {
+    "dev": "npm --prefix electron run dev",
+    "build": "npm --prefix electron run build",
+    "preview": "npm --prefix electron run preview",
+    "test": "npm --prefix electron test",
+    "install:electron": "npm --prefix electron install",
+    "postinstall": "npm --prefix electron install"
+  }
+}
