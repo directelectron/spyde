@@ -349,63 +349,8 @@ class FindVectorsPreviewOverlay(_DPOverlay):
         # peaks = [ky_row, kx_col, value] in PIXELS → markers (x=col=kx, y=row=ky).
         return np.column_stack([peaks[:, 1], peaks[:, 0]]).astype(np.float32)
 
-    # ── attach / update ─────────────────────────────────────────────────────
-    def attach(self, tree):
-        plot2d = getattr(self.dp_plot, "_plot2d", None)
-        if plot2d is None:
-            return self
-        self._mg = plot2d.add_circles(
-            np.zeros((0, 2), dtype=np.float32), name=self.name,
-            radius=float(self.kernel_radius), edgecolors=self._color,
-            facecolors=None, linewidths=1.5, alpha=1.0, transform="data",
-        )
-        self._selectors = _navigator_selectors_for(tree, self.dp_plot)
-        seeded = False
-        for sel in self._selectors:
-            sel.index_hooks.append(self._on_indices)
-            if sel.current_indices is not None:
-                self._on_indices(sel.current_indices)
-                seeded = True
-        # Always render the preview immediately, even if no selector has fired
-        # yet (current_indices is None until the first navigator move) — the Qt
-        # caret showed peaks the moment you opened it.
-        if not seeded:
-            iy, ix = self._last_iyix
-            self._push(self._offsets_for(iy, ix))
-        return self
 
-    def _on_indices(self, indices):
-        iy, ix = _indices_to_iyix(indices)
-        self._last_iyix = (iy, ix)
-        self._push(self._offsets_for(iy, ix))
-
-    def _push(self, offsets):
-        if self._mg is None:
-            return
-        try:
-            self._mg.set(offsets=offsets, radius=float(self.kernel_radius))
-        except Exception:
-            try:
-                self._mg.set(offsets=offsets)
-            except Exception:
-                pass
-
-    def remove(self):
-        for sel in self._selectors:
-            try:
-                sel.index_hooks.remove(self._on_indices)
-            except ValueError:
-                pass
-        self._selectors = []
-        if self._mg is not None:
-            try:
-                self._mg.remove()
-            except Exception:
-                pass
-            self._mg = None
-
-
-class VectorOrientationOverlay:
+class VectorOrientationOverlay(_DPOverlay):
     """Live Vector-Orientation refine preview: the FITTED template (green) over
     the MEASURED vectors (red) on the vectors diffraction pattern, tracking the
     navigator (Qt parity — the vector-OM Refine scatter).
@@ -430,38 +375,24 @@ class VectorOrientationOverlay:
         self._last_iyix = (0, 0)
         self._hidden = False
         self._lock = threading.Lock()
-
-        sig_axes = vecs.sig_axes
-        self._x_scale = float(sig_axes[0].scale) or 1.0
-        self._x_off = float(sig_axes[0].offset)
-        self._y_scale = float(sig_axes[1].scale) or 1.0
-        self._y_off = float(sig_axes[1].offset)
+        self._calibrate(vecs.sig_axes)
         if radius_px is None:
             radius_px = getattr(vecs, "kernel_radius_px", 4.0)
         self._radius_px = max(2.0, float(radius_px))
 
     def set_params(self, **params) -> None:
         self.params.update({k: v for k, v in params.items() if v is not None})
-        iy, ix = self._last_iyix
         if not self._hidden:
-            self._push(*self._offsets_for(iy, ix))
+            self._push(*self._offsets_for(*self._last_iyix))
 
+    # Two marker groups (measured + template) → override the single-group chrome.
     def set_visible(self, visible: bool) -> None:
         self._hidden = not bool(visible)
         if self._hidden:
             empty = np.zeros((0, 2), dtype=np.float32)
             self._push(empty, empty)
         else:
-            iy, ix = self._last_iyix
-            self._push(*self._offsets_for(iy, ix))
-
-    def _to_px(self, xy) -> np.ndarray:
-        xy = np.asarray(xy, dtype=np.float64)
-        if xy.size == 0:
-            return np.zeros((0, 2), dtype=np.float32)
-        mx = (xy[:, 0] - self._x_off) / self._x_scale
-        my = (xy[:, 1] - self._y_off) / self._y_scale
-        return np.column_stack([mx, my]).astype(np.float32)
+            self._push(*self._offsets_for(*self._last_iyix))
 
     def _offsets_for(self, iy, ix):
         from spyde.actions.vector_orientation import (
