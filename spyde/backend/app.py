@@ -11,9 +11,39 @@ import os
 import sys
 
 
+def _prewarm_anyplotlib() -> None:
+    """Warm anyplotlib's one-time costs off the critical path: the first
+    `subplots`+`imshow` (~120 ms of module/JIT init) and the shared-ESM bundle
+    write. Runs in a daemon thread so it never blocks startup; the first real
+    dataset-load figures are then fast."""
+    def _warm() -> None:
+        try:
+            import numpy as np
+            import anyplotlib as apl
+            from anyplotlib.embed import build_standalone_html
+            fig, ax = apl.subplots(1, 1)
+            a = ax[0][0] if isinstance(ax, list) else ax
+            a.imshow(np.zeros((4, 4), dtype="float32"))
+            build_standalone_html(fig, fig_id="prewarm", resizable=False)
+            try:
+                from spyde.drawing.plots.plot import _shared_esm_url
+                esm = str(getattr(fig, "_esm", "") or "")
+                if esm:
+                    _shared_esm_url(esm)   # write the shared bundle to disk now
+            except Exception:
+                pass
+        except Exception:
+            pass
+    import threading
+    threading.Thread(target=_warm, daemon=True, name="anyplotlib-prewarm").start()
+
+
 async def _main() -> None:
-    from spyde.backend.ipc import read_messages, emit, emit_status
+    from spyde.backend.ipc import read_messages, emit, emit_status, redirect_stray_stdout
     from spyde.backend.session import Session
+
+    # Keep stdout exclusively for the PLOTAPP protocol; stray prints → stderr.
+    redirect_stray_stdout()
 
     cpu_count = os.cpu_count() or 4
     if cpu_count < 4:
@@ -26,7 +56,16 @@ async def _main() -> None:
         threads = 4
 
     session = Session(n_workers=workers, threads_per_worker=threads)
-    session.start_dask()
+
+    # Tests (and headless smoke runs) skip the heavy Dask cluster.
+    if os.environ.get("SPYDE_NO_DASK") != "1":
+        session.start_dask()
+
+    # Prewarm: the FIRST anyplotlib figure pays a one-time ~120 ms cost (module
+    # init + first imshow) and the shared-ESM bundle write. Do it off-thread at
+    # startup so the first dataset-load windows aren't slow. (Warm windows are
+    # ~50 ms; this moves the cold cost off the user's critical path.)
+    _prewarm_anyplotlib()
 
     emit({"type": "ready"})
 
@@ -36,6 +75,10 @@ async def _main() -> None:
         try:
             if msg_type == "action":
                 session.dispatch_action(msg)
+            elif msg_type == "figure_event":
+                _dispatch_figure_event(msg)
+            elif msg_type == "resize":
+                _resize_figure(msg)
             elif msg_type == "quit":
                 break
             else:
@@ -45,6 +88,25 @@ async def _main() -> None:
             emit_error(str(e))
 
     session.shutdown()
+
+
+def _dispatch_figure_event(msg: dict) -> None:
+    """Forward a frontend interaction event to the anyplotlib figure."""
+    fig_id = msg.get("fig_id")
+    event_json = msg.get("event_json")
+    if fig_id is None or event_json is None:
+        return
+    import anyplotlib._electron as _ael
+    _ael.dispatch_event(fig_id, event_json)
+
+
+def _resize_figure(msg: dict) -> None:
+    """Apply an MDI subwindow resize to the anyplotlib figure layout."""
+    fig_id = msg.get("fig_id")
+    if fig_id is None:
+        return
+    import anyplotlib._electron as _ael
+    _ael.resize_figure(fig_id, int(msg.get("width", 600)), int(msg.get("height", 400)))
 
 
 def run() -> None:

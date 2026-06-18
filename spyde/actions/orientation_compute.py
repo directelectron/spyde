@@ -134,6 +134,91 @@ def sim_phases_list(sim):
     return [phases]
 
 
+def best_match_spots(pattern_data, sim, matching_cache, *, gamma: float = 0.5,
+                     max_radius: float | None = None,
+                     normalize_templates: bool = True,
+                     scale_override: float | None = None,
+                     original_scale: float | None = None,
+                     min_intensity: float = 0.0) -> np.ndarray:
+    """Simulated diffraction spots (Å⁻¹, centred on the direct beam) for the
+    best-matching template of a SINGLE pattern.
+
+    Qt-free port of ``actions.pyxem._get_best_fit_spots`` fast path (the matching
+    cache makes it ~5 ms/call) — used to overlay the matched template on the live
+    diffraction pattern as the navigator moves. Returns an ``(N, 2)`` array of
+    ``[kx, ky]`` spot coordinates; the same flip/rotate/mirror as
+    ``vectors_from_orientation_map`` so the spots line up with the data.
+
+    Refine knobs (Qt "3 Refine" tab): ``scale_override`` rescales the template
+    coords by ``scale_override/original_scale`` (correct a miscalibrated camera
+    length); ``min_intensity`` (0–1, fraction of the brightest spot) drops faint
+    spots.
+    """
+    from pyxem.utils.indexation_utils import _mixed_matching_lib_to_polar
+    from pyxem.utils._azimuthal_integrations import _slice_radial_integrate
+
+    slices = matching_cache["slices"]
+    factors = matching_cache["factors"]
+    factors_slice = matching_cache["factors_slice"]
+    r_tmpl = matching_cache["r_templates"]
+    theta_tmpl = matching_cache["theta_templates"]
+    int_norm = matching_cache["intensities_norm"]
+    integrated = matching_cache["integrated"]
+    NR, NA = matching_cache["NR"], matching_cache["NA"]
+
+    pattern_data = np.asarray(pattern_data, dtype=float)
+    polar = _slice_radial_integrate(
+        pattern_data, factors, factors_slice, slices, NR, NA, mean=True
+    )
+    polar = np.nan_to_num(polar ** gamma).T.astype(float)   # (NA, NR)
+
+    int_templates = int_norm if normalize_templates else matching_cache["intensities_raw"]
+    result = _mixed_matching_lib_to_polar(
+        polar,
+        integrated_templates=integrated,
+        r_templates=r_tmpl,
+        theta_templates=theta_tmpl,
+        intensities_templates=int_templates,
+        n_keep=None, frac_keep=1.0, n_best=integrated.shape[0], transpose=False,
+    )
+    row = result[0]                       # best match (sorted desc by corr)
+    lib_idx = int(row[0])
+    rot_idx = int(row[2])
+    mirror = float(row[3])
+
+    _rot, _phase_idx, coords_dv = sim.get_simulation(lib_idx)
+    raw = coords_dv.data[:, :2].copy().astype(float)
+    inten = np.array(coords_dv.intensity, dtype=float)
+
+    # vectors_from_orientation_map: flip y, rotate by mirror*angle, negate, mirror*y
+    angle_deg = rot_idx / NA * 360.0 - 180.0
+    a = np.deg2rad(mirror * angle_deg)
+    cos_a, sin_a = np.cos(a), np.sin(a)
+    rx = raw[:, 0]; ry = -raw[:, 1]
+    kx = rx * cos_a - ry * sin_a
+    ky = rx * sin_a + ry * cos_a
+    kx, ky = -kx, -ky
+    ky = mirror * ky
+    coords = np.stack([kx, ky], axis=1)
+
+    # Scale refine: rescale template coords to where spots actually land.
+    if scale_override and original_scale:
+        coords = coords * (float(scale_override) / float(original_scale))
+
+    # Min-intensity refine: drop spots fainter than a fraction of the brightest.
+    if min_intensity > 0.0 and len(inten) > 0:
+        imax = float(inten.max()) or 1.0
+        keep = (inten / imax) >= float(min_intensity)
+        coords = coords[keep]
+        inten = inten[keep]
+
+    if max_radius is not None and len(coords) > 0:
+        keep = np.sqrt(coords[:, 0] ** 2 + coords[:, 1] ** 2) <= max_radius
+        coords = coords[keep]
+        inten = inten[keep]
+    return coords
+
+
 def resolve_quaternions(result4: np.ndarray, template_quats: np.ndarray
                         ) -> np.ndarray:
     """

@@ -1,0 +1,589 @@
+/**
+ * SpyDEContext.tsx — React context for the SpyDE Python backend state.
+ *
+ * Listens for PLOTAPP: messages, maintains the window/figure registry,
+ * toolbar configs, and status, and re-renders the MDI when things change.
+ */
+import React, {
+  createContext, useContext, useEffect, useReducer, useRef,
+} from 'react'
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+export interface ParamSpec {
+  name?: string
+  type?: string                 // 'enum' | 'number' | 'int' | 'float' | 'bool' | 'file' | ...
+  default?: unknown
+  options?: string[]
+  min?: number                  // when min & max given, a numeric param renders a slider
+  max?: number
+  step?: number
+  extensions?: string[]         // for type 'file' (e.g. ['.cif'])
+  tab?: string                  // optional caret tab this param belongs to
+  // Show this row only when another param currently equals `value`.
+  display_condition?: { parameter: string; value: unknown }
+}
+export interface SubAction {
+  name: string
+  icon: string
+  label?: string
+  toggle: boolean
+  parameters: Record<string, ParamSpec>
+}
+export interface ToolbarAction {
+  name: string
+  icon: string
+  side: 'left' | 'right' | 'top' | 'bottom'
+  toggle: boolean
+  parameters: Record<string, ParamSpec>
+  subfunctions?: SubAction[]
+}
+
+export interface SpyDEWindow {
+  windowId: number
+  title: string
+  isNavigator: boolean
+  figures: SpyDEFigure[]        // may be multiple iframes in one SubWindow
+  toolbarActions: ToolbarAction[]
+  visible: boolean
+  aspect?: number               // image width/height — sizes the window so the
+                                // image fills it (no aspect-letterbox / misaligned selector)
+}
+
+export interface SpyDEFigure {
+  figId: string
+  windowId: number
+  filePath: string | null       // null until HTML is written to disk
+  title: string
+  isNavigator: boolean
+  view?: string                 // "3d" for the IPF 3-D explorer figure (2D/3D toggle)
+}
+
+export type MetadataDict = Record<string, Record<string, string>>
+export interface Histogram {
+  counts: number[]
+  edges: number[]
+  vmin: number
+  vmax: number
+}
+
+export interface SelectorInfo { windowId: number; mode: 'crosshair' | 'integrate'; title: string }
+export interface SubItem { name: string; color: string; vtype?: string; calculation?: string }
+export interface TreeNode { name: string; signal_id: number; children: TreeNode[] }
+export interface AxisRow {
+  index: number
+  name: string
+  size: number
+  scale: number | null
+  offset: number | null
+  units: string
+  navigate: boolean
+}
+
+interface State {
+  windows: Map<number, SpyDEWindow>
+  figures: Map<string, SpyDEFigure>
+  metadata: Map<number, MetadataDict>
+  histograms: Map<number, Histogram>
+  selectors: Map<number, SelectorInfo>
+  signalTrees: Map<number, TreeNode>
+  signalTreeActive: Map<number, number>   // windowId → active node signal_id
+  axes: Map<number, AxisRow[]>
+  activeActions: Map<number, Set<string>>   // windowId → action names with live output
+  subItems: Map<number, Map<string, SubItem[]>>  // windowId → action → dynamic chips
+  status: string
+  ready: boolean
+  dashboardUrl: string | null
+  activeWindowId: number | null
+  streamLines: Array<{ text: string; kind: 'stdout' | 'stderr' }>
+}
+
+type Action =
+  | { type: 'READY'; dashboardUrl?: string }
+  | { type: 'STATUS'; text: string }
+  | { type: 'FIGURE'; windowId: number; figId: string; fileUrl: string | null; title: string; isNavigator: boolean; aspect?: number; view?: string }
+  | { type: 'TOOLBAR_CONFIG'; windowId: number; plotId: number; actions: ToolbarAction[] }
+  | { type: 'WINDOW_VISIBILITY'; windowId: number; visible: boolean }
+  | { type: 'WINDOW_CLOSED'; windowId: number }
+  | { type: 'SET_ACTIVE'; windowId: number }
+  | { type: 'METADATA'; windowIds: number[]; metadata: MetadataDict }
+  | { type: 'AXES'; windowIds: number[]; axes: AxisRow[] }
+  | { type: 'ACTION_ACTIVE'; windowId: number; name: string; active: boolean }
+  | { type: 'SUB_ITEM'; windowId: number; action: string; name: string; color: string; vtype?: string; calculation?: string; active: boolean }
+  | { type: 'HISTOGRAM'; windowId: number; histogram: Histogram }
+  | { type: 'SELECTOR_INFO'; info: SelectorInfo }
+  | { type: 'SIGNAL_TREE'; windowId: number; tree: TreeNode; activeSignalId?: number }
+  | { type: 'STREAM'; text: string; kind: 'stdout' | 'stderr' }
+
+function spydeReducer(state: State, action: Action): State {
+  switch (action.type) {
+    case 'READY':
+      return {
+        ...state,
+        ready: true,
+        dashboardUrl: action.dashboardUrl ?? null,
+        status: 'Ready',
+      }
+
+    case 'STATUS':
+      return { ...state, status: action.text }
+
+    case 'FIGURE': {
+      // The main process already wrote the HTML to disk and gave us a file:// URL.
+      const figure: SpyDEFigure = {
+        figId: action.figId,
+        windowId: action.windowId,
+        filePath: action.fileUrl,
+        title: action.title,
+        isNavigator: action.isNavigator,
+        view: action.view,
+      }
+
+      const newFigures = new Map(state.figures)
+      newFigures.set(action.figId, figure)
+
+      // Attach figure to its window (create window record if needed)
+      const newWindows = new Map(state.windows)
+      if (!newWindows.has(action.windowId)) {
+        newWindows.set(action.windowId, {
+          windowId: action.windowId,
+          title: action.title,
+          isNavigator: action.isNavigator,
+          figures: [],
+          toolbarActions: [],
+          visible: true,
+        })
+      }
+      const win = { ...newWindows.get(action.windowId)! }
+      win.figures = [...win.figures.filter(f => f.figId !== action.figId), figure]
+      // A secondary view figure (e.g. the IPF 3-D explorer, view="3d") must NOT
+      // rename the window or flip its navigator flag — those belong to the
+      // primary figure.
+      if (!action.view) {
+        win.title = action.title
+        win.isNavigator = action.isNavigator
+        if (action.aspect && action.aspect > 0) win.aspect = action.aspect
+      }
+      newWindows.set(action.windowId, win)
+
+      // Default the active (sidebar-controlled) window to the first signal panel.
+      const activeWindowId = state.activeWindowId ??
+        (action.isNavigator ? null : action.windowId)
+
+      return { ...state, windows: newWindows, figures: newFigures, activeWindowId }
+    }
+
+    case 'TOOLBAR_CONFIG': {
+      // toolbar_config can arrive BEFORE the figure message that creates the
+      // window (PlotState emits it at construction). Upsert so it's never
+      // dropped — the figure later fills in title/figures on the same record.
+      const newWindows = new Map(state.windows)
+      const existing = newWindows.get(action.windowId)
+      newWindows.set(action.windowId, {
+        windowId: action.windowId,
+        title: existing?.title ?? 'Plot',
+        isNavigator: existing?.isNavigator ?? false,
+        figures: existing?.figures ?? [],
+        toolbarActions: action.actions,
+        visible: existing?.visible ?? true,
+      })
+      return { ...state, windows: newWindows }
+    }
+
+    case 'WINDOW_VISIBILITY': {
+      const newWindows = new Map(state.windows)
+      const win = newWindows.get(action.windowId)
+      if (win) {
+        newWindows.set(action.windowId, { ...win, visible: action.visible })
+      }
+      return { ...state, windows: newWindows }
+    }
+
+    case 'WINDOW_CLOSED': {
+      const newWindows = new Map(state.windows)
+      newWindows.delete(action.windowId)
+      // Drop ALL per-window state so e.g. the Navigator Selector toggle and the
+      // histogram/metadata/axes for a closed window don't linger in the dock.
+      const drop = <V,>(m: Map<number, V>) => {
+        if (!m.has(action.windowId)) return m
+        const n = new Map(m); n.delete(action.windowId); return n
+      }
+      const activeWindowId = state.activeWindowId === action.windowId
+        ? (newWindows.size ? [...newWindows.keys()][0] : null)
+        : state.activeWindowId
+      return {
+        ...state,
+        windows: newWindows,
+        selectors: drop(state.selectors),
+        histograms: drop(state.histograms),
+        metadata: drop(state.metadata),
+        axes: drop(state.axes),
+        signalTrees: drop(state.signalTrees),
+        signalTreeActive: drop(state.signalTreeActive),
+        activeActions: drop(state.activeActions),
+        subItems: drop(state.subItems),
+        activeWindowId,
+      }
+    }
+
+    case 'SET_ACTIVE':
+      return { ...state, activeWindowId: action.windowId }
+
+    case 'METADATA': {
+      const metadata = new Map(state.metadata)
+      for (const wid of action.windowIds) metadata.set(wid, action.metadata)
+      return { ...state, metadata }
+    }
+
+    case 'AXES': {
+      const axes = new Map(state.axes)
+      for (const wid of action.windowIds) axes.set(wid, action.axes)
+      return { ...state, axes }
+    }
+
+    case 'ACTION_ACTIVE': {
+      const activeActions = new Map(state.activeActions)
+      const set = new Set(activeActions.get(action.windowId) ?? [])
+      if (action.active) set.add(action.name)
+      else set.delete(action.name)
+      activeActions.set(action.windowId, set)
+      return { ...state, activeActions }
+    }
+
+    case 'SUB_ITEM': {
+      const subItems = new Map(state.subItems)
+      const byAction = new Map(subItems.get(action.windowId) ?? new Map<string, SubItem[]>())
+      const list = (byAction.get(action.action) ?? []).filter(i => i.name !== action.name)
+      if (action.active) list.push({
+        name: action.name, color: action.color,
+        vtype: action.vtype, calculation: action.calculation,
+      })
+      byAction.set(action.action, list)
+      subItems.set(action.windowId, byAction)
+      return { ...state, subItems }
+    }
+
+    case 'HISTOGRAM': {
+      const histograms = new Map(state.histograms)
+      histograms.set(action.windowId, action.histogram)
+      return { ...state, histograms }
+    }
+
+    case 'SELECTOR_INFO': {
+      const selectors = new Map(state.selectors)
+      selectors.set(action.info.windowId, action.info)
+      return { ...state, selectors }
+    }
+
+    case 'SIGNAL_TREE': {
+      const signalTrees = new Map(state.signalTrees)
+      signalTrees.set(action.windowId, action.tree)
+      const signalTreeActive = new Map(state.signalTreeActive)
+      if (action.activeSignalId != null) signalTreeActive.set(action.windowId, action.activeSignalId)
+      return { ...state, signalTrees, signalTreeActive }
+    }
+
+    case 'STREAM':
+      return {
+        ...state,
+        streamLines: [...state.streamLines.slice(-500), { text: action.text, kind: action.kind }],
+      }
+
+    default:
+      return state
+  }
+}
+
+// ── Context ───────────────────────────────────────────────────────────────────
+
+interface SpyDEContextValue {
+  state: State
+  iframeRefs: React.MutableRefObject<Map<string, HTMLIFrameElement>>
+  // Latest awi_state per figure (key → value). Replayed when an iframe loads so
+  // data/selectors pushed before the iframe was listening aren't lost (the
+  // "black image" race).
+  latestStates: React.MutableRefObject<Map<string, Map<string, unknown>>>
+  sendAction: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
+  setActiveWindow: (windowId: number) => void
+  replayState: (figId: string) => void
+}
+
+const SpyDEContext = createContext<SpyDEContextValue | null>(null)
+
+export function SpyDEProvider({ children }: { children: React.ReactNode }) {
+  const [state, dispatch] = useReducer(spydeReducer, {
+    windows: new Map(),
+    figures: new Map(),
+    metadata: new Map(),
+    histograms: new Map(),
+    selectors: new Map(),
+    signalTrees: new Map(),
+    signalTreeActive: new Map(),
+    axes: new Map(),
+    activeActions: new Map(),
+    subItems: new Map(),
+    status: 'Starting…',
+    ready: false,
+    dashboardUrl: null,
+    activeWindowId: null,
+    streamLines: [],
+  })
+
+  const iframeRefs = useRef<Map<string, HTMLIFrameElement>>(new Map())
+  const latestStates = useRef<Map<string, Map<string, unknown>>>(new Map())
+
+  // Post every stored state for a figure to its iframe (called on iframe load).
+  const replayState = (figId: string) => {
+    const iframe = iframeRefs.current.get(figId)
+    const states = latestStates.current.get(figId)
+    if (!iframe?.contentWindow || !states) return
+    for (const [key, value] of states) {
+      iframe.contentWindow.postMessage({ type: 'awi_state', key, value }, '*')
+    }
+  }
+
+  // ── Python → Renderer message dispatch ──────────────────────────────────
+
+  useEffect(() => {
+    const handleMessage = (msg: Record<string, unknown>) => {
+      const t = msg.type as string
+      switch (t) {
+        case 'ready':
+          dispatch({ type: 'READY', dashboardUrl: msg.dashboard as string | undefined })
+          break
+
+        case 'status':
+          dispatch({ type: 'STATUS', text: msg.text as string })
+          break
+
+        case 'error':
+          dispatch({ type: 'STATUS', text: `⚠ ${msg.text}` })
+          break
+
+        case 'figure': {
+          // Normal path: main process wrote the HTML and gave us file_url.
+          // Test path: html is injected directly → fall back to a data URL.
+          let fileUrl = (msg.file_url as string) ?? null
+          if (!fileUrl && msg.html) {
+            fileUrl = 'data:text/html;charset=utf-8,' +
+              encodeURIComponent(msg.html as string)
+          }
+          dispatch({
+            type: 'FIGURE',
+            windowId: msg.window_id as number,
+            figId: msg.fig_id as string,
+            fileUrl,
+            title: (msg.title as string) || 'Plot',
+            isNavigator: (msg.is_navigator as boolean) || false,
+            aspect: msg.aspect as number | undefined,
+            view: msg.view as string | undefined,
+          })
+          break
+        }
+
+        case 'toolbar_config':
+          dispatch({
+            type: 'TOOLBAR_CONFIG',
+            windowId: msg.window_id as number,
+            plotId: msg.plot_id as number,
+            actions: (msg.toolbar_actions as ToolbarAction[]) || [],
+          })
+          break
+
+        case 'window_visibility':
+          dispatch({
+            type: 'WINDOW_VISIBILITY',
+            windowId: msg.window_id as number,
+            visible: msg.visible as boolean,
+          })
+          break
+
+        case 'window_closed':
+          dispatch({ type: 'WINDOW_CLOSED', windowId: msg.window_id as number })
+          break
+
+        case 'state_update':
+          // Forward anyplotlib state to the iframe AND remember it, so it can
+          // be replayed if/when the iframe (re)loads after this arrived.
+          {
+            const figId = msg.fig_id as string
+            const key = msg.key as string
+            if (!latestStates.current.has(figId)) {
+              latestStates.current.set(figId, new Map())
+            }
+            latestStates.current.get(figId)!.set(key, msg.value)
+            const iframe = iframeRefs.current.get(figId)
+            iframe?.contentWindow?.postMessage(
+              { type: 'awi_state', key, value: msg.value },
+              '*',
+            )
+          }
+          break
+
+        case 'metadata':
+          dispatch({
+            type: 'METADATA',
+            windowIds: (msg.window_ids as number[]) ?? [],
+            metadata: (msg.metadata as MetadataDict) ?? {},
+          })
+          break
+
+        case 'axes_info':
+          dispatch({
+            type: 'AXES',
+            windowIds: (msg.window_ids as number[]) ?? [],
+            axes: (msg.axes as AxisRow[]) ?? [],
+          })
+          break
+
+        case 'action_active':
+          dispatch({
+            type: 'ACTION_ACTIVE',
+            windowId: msg.window_id as number,
+            name: msg.name as string,
+            active: msg.active as boolean,
+          })
+          break
+
+        case 'sub_item':
+          dispatch({
+            type: 'SUB_ITEM',
+            windowId: msg.window_id as number,
+            action: msg.action as string,
+            name: msg.name as string,
+            color: (msg.color as string) ?? '#89b4fa',
+            vtype: msg.vtype as string | undefined,
+            calculation: msg.calculation as string | undefined,
+            active: msg.active as boolean,
+          })
+          break
+
+        case 'histogram':
+          dispatch({
+            type: 'HISTOGRAM',
+            windowId: msg.window_id as number,
+            histogram: {
+              counts: (msg.counts as number[]) ?? [],
+              edges: (msg.edges as number[]) ?? [],
+              vmin: msg.vmin as number,
+              vmax: msg.vmax as number,
+            },
+          })
+          break
+
+        case 'selector_info':
+          dispatch({
+            type: 'SELECTOR_INFO',
+            info: {
+              windowId: msg.window_id as number,
+              mode: (msg.mode as 'crosshair' | 'integrate') ?? 'crosshair',
+              title: (msg.title as string) ?? 'Navigator',
+            },
+          })
+          break
+
+        case 'signal_tree':
+          if (msg.tree) {
+            dispatch({
+              type: 'SIGNAL_TREE',
+              windowId: msg.window_id as number,
+              tree: msg.tree as TreeNode,
+              activeSignalId: msg.active_signal_id as number | undefined,
+            })
+          }
+          break
+
+        case 'dask_ready':
+          dispatch({ type: 'READY', dashboardUrl: msg.dashboard as string | undefined })
+          break
+      }
+    }
+
+    window.electron.onMessage(handleMessage)
+
+    // Expose test injection hook for Playwright tests
+    ;(window as Record<string, unknown>)['_spyde_test_inject'] = handleMessage
+
+    // Test hook: return the parsed overlay widgets of a figure's latest panel
+    // state, so a test can post the awi_event a selector would post (without
+    // pixel-perfect mouse grabbing of a tiny handle).
+    ;(window as Record<string, unknown>)['_spyde_test_widgets'] = (figId: string) => {
+      const states = latestStates.current.get(figId)
+      if (!states) return []
+      const widgets: Array<{ panel_id: string; id: string; type: string; data: Record<string, unknown> }> = []
+      for (const [key, value] of states) {
+        if (!key.startsWith('panel_') || !key.endsWith('_json')) continue
+        const panelId = key.slice('panel_'.length, -'_json'.length)
+        try {
+          const d = JSON.parse(value as string)
+          for (const w of d.overlay_widgets ?? []) {
+            widgets.push({ panel_id: panelId, id: w.id, type: w.type, data: w })
+          }
+        } catch { /* */ }
+      }
+      return widgets
+    }
+
+    // Test hook: a cheap signature of a figure's latest image data (length +
+    // sampled chars of the base64 image), so a test can detect that the image
+    // actually changed without decoding the canvas.
+    ;(window as Record<string, unknown>)['_spyde_test_image_sig'] = (figId: string) => {
+      const states = latestStates.current.get(figId)
+      if (!states) return ''
+      // Hash the FULL base64 image so a change anywhere in the frame is detected
+      // (a prefix slice misses bright pixels deeper in the buffer).
+      const hash = (s: string) => {
+        let h = 5381
+        for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0
+        return h
+      }
+      let sig = ''
+      for (const [key, value] of states) {
+        if (!key.startsWith('panel_')) continue
+        try {
+          const d = JSON.parse(value as string)
+          const b64 = d.image_b64 || ''
+          sig += `${key}:${b64.length}:${hash(b64)}|`
+        } catch { /* */ }
+      }
+      return sig
+    }
+
+    window.electron.onStream((text, kind) => {
+      dispatch({ type: 'STREAM', text, kind })
+    })
+
+    // Forward iframe events to Python
+    const onMessage = (e: MessageEvent) => {
+      if (e.data?.type === 'awi_event' && e.data.figId) {
+        window.electron.figureEvent(e.data.figId, e.data.data)
+      }
+    }
+    window.addEventListener('message', onMessage)
+    return () => {
+      window.removeEventListener('message', onMessage)
+      delete (window as Record<string, unknown>)['_spyde_test_inject']
+    }
+  }, [])
+
+  const sendAction = (
+    action: string,
+    payload: Record<string, unknown> = {},
+    windowId?: number,
+  ) => window.electron.action(action, payload, windowId)
+
+  const setActiveWindow = (windowId: number) =>
+    dispatch({ type: 'SET_ACTIVE', windowId })
+
+  return (
+    <SpyDEContext.Provider value={{ state, iframeRefs, latestStates, sendAction, setActiveWindow, replayState }}>
+      {children}
+    </SpyDEContext.Provider>
+  )
+}
+
+export function useSpyDE(): SpyDEContextValue {
+  const ctx = useContext(SpyDEContext)
+  if (!ctx) throw new Error('useSpyDE must be used inside SpyDEProvider')
+  return ctx
+}

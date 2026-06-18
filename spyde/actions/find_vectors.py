@@ -30,7 +30,13 @@ import numpy as np
 from scipy.ndimage import gaussian_filter, maximum_filter
 from scipy.fft import rfft2, irfft2, next_fast_len
 
-from spyde.drawing.toolbars.toolbar import RoundedToolBar
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # Qt — only needed as a type hint on the legacy Qt entry point. Importing it
+    # at runtime would pull PySide6 into the Qt-free Electron backend (which
+    # reuses this module's compute core), so keep it deferred.
+    from spyde.drawing.toolbars.toolbar import RoundedToolBar
 
 # Cache of pre-computed disk FFTs keyed by (radius, padded_H, padded_W)
 _DISK_FFT_CACHE: dict = {}

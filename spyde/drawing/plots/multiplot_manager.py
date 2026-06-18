@@ -1,9 +1,11 @@
+from __future__ import annotations
+
 from typing import TYPE_CHECKING, List, Dict, Tuple, Optional
 
 if TYPE_CHECKING:
     from spyde.signal_tree import BaseSignalTree
-    from spyde.__main__ import MainWindow
-    from spyde.drawing.selectors import BaseSelector, IntegratingSelector2D
+    from spyde.backend.session import Session
+    from spyde.drawing.selectors import BaseSelector
     from spyde.drawing.plots.plot import Plot
     from spyde.drawing.plots.plot_window import PlotWindow
 
@@ -15,107 +17,97 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _plot_window_dims(plot_window: "PlotWindow") -> int:
+    """Derive the displayed dimensionality of a PlotWindow's current plot.
+
+    Prefer the active plot state's ``dimensions``; if that's missing or 0
+    (e.g. a fully-reduced navigator image), fall back to the displayed
+    signal's ``signal_dimension``.
+    """
+    try:
+        plot = plot_window.current_plot_item
+        state = plot.plot_state
+        if state is not None and state.dimensions:
+            return state.dimensions
+        return state.current_signal.axes_manager.signal_dimension
+    except Exception:
+        return 2
+
+
 class MultiplotManager:
-    """
-    A class to manage multiple `Plot` instances for navigation plots.
+    """Manages multiple Plot instances for navigation plots in a signal tree."""
 
-    There is only one `NavigationPlotManager` per `BaseSignalTree`. If we want to suplex
-    multiple navigation plots. For example Time and Temperature in an in situ experiment,
-    the selectors remain linked.
-
-    Parameters
-    ----------
-    main_window : MainWindow
-        The main window of the application.
-    """
-
-    def __init__(self, main_window: "MainWindow", signal_tree: "BaseSignalTree",
-                 selector_type=None):
-        self.main_window = main_window  # type: MainWindow
-
-        # For managing the navigation plots and the associated plot windows...
-        self.plots = {}  # type: Dict["PlotWindow":List[Plot]]
-        self.plot_windows = {}  # type: Dict["PlotWindow":Dict["PlotWindow"]]
-        # all the navigation selectors on some plot window
-        # Navigation selectors are linked across all navigation plots on the same Plot Window
-        self.navigation_selectors = {}  # type: Dict["PlotWindow", List[BaseSelector]]
-
-        self.signal_tree = signal_tree  # type: BaseSignalTree
-
-        self.navigation_depth = 1  # type: int # depth of navigation signals
+    def __init__(
+        self,
+        signal_tree: "BaseSignalTree",
+        selector_type=None,
+        # Accept both 'session' (new) and 'main_window' (legacy) for compat
+        session: "Session | None" = None,
+        main_window=None,
+    ):
+        self.session = session or main_window
+        self.plots: Dict["PlotWindow", List["Plot"]] = {}
+        self.plot_windows: Dict["PlotWindow", Dict] = {}
+        self.navigation_selectors: Dict["PlotWindow", List["BaseSelector"]] = {}
+        self.signal_tree = signal_tree
+        self.navigation_depth = 1
 
         if self.nav_dim < 1:
             raise ValueError(
-                "NavigationPlotManager requires at least 1 navigation dimension."
+                "MultiplotManager requires at least 1 navigation dimension."
             )
         elif self.nav_dim < 3:
-            nav_plot_window = self.main_window.add_plot_window(
+            nav_plot_window = self.session.add_plot_window(
                 is_navigator=True, plot_manager=self, signal_tree=self.signal_tree
             )
             nav_plot = nav_plot_window.add_new_plot()
-            self.plot_windows[nav_plot_window] = (
-                {}
-            )  # single plot window with no children...
-            self.plots[nav_plot_window] = [
-                nav_plot,
-            ]
+            self.plot_windows[nav_plot_window] = {}
+            self.plots[nav_plot_window] = [nav_plot]
             self.navigation_selectors[nav_plot_window] = []
-            # Add navigation manager states for each navigation signal
             for signal in self.signal_tree.navigator_signals.values():
                 self.add_plot_states_for_navigation_signals(signal)
-            # create plot states for the nav plot
             self.add_navigation_selector_and_signal_plot(
                 nav_plot_window, selector_type=selector_type
             )
 
         elif self.nav_dim < 5:
-            # create two plot windows
             self.navigation_depth = 2
-            plot_window = self.main_window.add_plot_window(
+            plot_window = self.session.add_plot_window(
                 is_navigator=True, plot_manager=self, signal_tree=self.signal_tree
             )
             nav_plot_1d = plot_window.add_new_plot()
             self.plot_windows[plot_window] = {}
             self.plots[plot_window] = [nav_plot_1d]
             self.navigation_selectors[plot_window] = []
-            # Add navigation manager states for each navigation signal
             for signal in self.signal_tree.navigator_signals.values():
                 self.add_plot_states_for_navigation_signals(signal)
-
             new_window = self.add_navigation_selector_and_signal_plot(plot_window)
-
             self.add_navigation_selector_and_signal_plot(new_window)
 
     @property
     def all_navigation_selectors(self) -> List["BaseSelector"]:
-        """Return a list of all navigation selectors managed by this NavigationPlotManager."""
         selectors = []
         for sel_list in self.navigation_selectors.values():
             selectors.extend(sel_list)
         return selectors
 
-    def add_plot_states_for_navigation_signals(self, signals: List[BaseSignal]):
-        """Add navigation plot states for a list of signals.
-        Parameters
-        ----------
-        signals : List[BaseSignal]
-            The signals for which to add the navigation states.
-        """
-        # go level by level adding states
-        print("Adding navigation plot states for signals:", signals)
-        print(self.plot_windows)
+    def add_plot_states_for_navigation_signals(self, signals: List[BaseSignal]) -> None:
         for plot_window in self.plot_windows:
             for plot in self.plots[plot_window]:
-                print("Adding navigation plot state for plot:", plot)
-                dim = signals[0].axes_manager.navigation_dimension
+                # The navigator image is displayed via its *signal* axes (a 2D
+                # navigator → an imshow; a 1D navigator → a line). That displayed
+                # dimensionality is what both the figure type and the selector
+                # choice must key off of — not navigation_dimension (which is 0
+                # for a fully-reduced navigator image).
+                dim = signals[0].axes_manager.signal_dimension
                 plot.add_plot_state(
                     signal=signals[0],
                     dimensions=dim,
                     dynamic=False,
                 )
             if len(signals) > 1:
-                for sub_plot_windows in self.plot_windows[plot_window]:
-                    for plot in self.plots[sub_plot_windows]:
+                for sub_plot_window in self.plot_windows[plot_window]:
+                    for plot in self.plots.get(sub_plot_window, []):
                         dim = signals[1].axes_manager.signal_dimension
                         plot.add_plot_state(
                             signal=signals[1],
@@ -124,38 +116,19 @@ class MultiplotManager:
                         )
 
     @property
-    def navigation_signals(self) -> dict[str:BaseSignal]:
-        """Return a list of navigation signals managed by this NavigationPlotManager."""
+    def navigation_signals(self) -> dict:
         return self.signal_tree.navigator_signals
 
     @property
     def nav_dim(self) -> int:
-        """
-        Get the number of navigation dimensions in the signal tree.
-        """
         return self.signal_tree.nav_dim
 
     def get_plot_window_level(
         self, plot_window: "PlotWindow"
     ) -> Tuple[int, Optional[dict]]:
-        """
-        Get the level of a PlotWindow in the navigation hierarchy and return its immediate
-        parent's children dictionary so it can be edited.
-
-        Returns
-        -------
-        (level, parent_children_dict)
-            level : int
-                0 for top-level, 1 for first child, etc.
-            parent_children_dict : dict or None
-                The nested dictionary in `self.plot_windows` whose keys include `plot_window`
-                (i.e. the immediate parent's children mapping), or None if `plot_window` is top-level.
-        """
         level = 1
         current_window = plot_window
-        children_dictionary = self.plot_windows.get(
-            plot_window, None
-        )  # type: Optional[dict]
+        children_dictionary = self.plot_windows.get(plot_window, None)
         while True:
             parent_found = False
             for pw, children in self.plot_windows.items():
@@ -173,64 +146,41 @@ class MultiplotManager:
     def add_navigation_selector_and_signal_plot(
         self, plot_window: "PlotWindow", selector_type=None
     ) -> "PlotWindow":
-        """
-        Add a Selector (or Multi-selector) to a PlotWindow.  This will add a selector to all the
-        Plots in one PlotWindow. Creating one Child Plot.
-
-        """
         from spyde.drawing.selectors import (
             IntegratingSelector1D,
-            IntegratingSelector2D,
+            IntegratingSSelector2D,
             BaseSelector,
         )
 
-        # if the plot is a navigator then all the Plots in the window have to have the same
-        # size...
-        dim = plot_window.dimensions
+        dim = _plot_window_dims(plot_window)
 
-        print(
-            "Adding navigation selector to plot window:", plot_window, " with dim:", dim
-        )
         if dim == 1 and selector_type is None:
             selector_type = IntegratingSelector1D
         elif dim == 2 and selector_type is None:
-            selector_type = IntegratingSelector2D
+            selector_type = IntegratingSSelector2D
         elif selector_type is not None and not (
             isinstance(selector_type, type) and issubclass(selector_type, BaseSelector)
         ):
             raise ValueError("selector_type must be a BaseSelector subclass.")
 
-        window_level, children_dict = self.get_plot_window_level(
-            plot_window=plot_window
-        )
-        print("Plot window level:", window_level, " children dict:", children_dict)
-        print(self.plot_windows)
-        print(self.navigation_depth)
-        if window_level < self.navigation_depth:
-            is_navigator = True
-        else:
-            is_navigator = False
+        window_level, children_dict = self.get_plot_window_level(plot_window=plot_window)
+        is_navigator = window_level < self.navigation_depth
 
         if plot_window not in self.navigation_selectors:
             self.navigation_selectors[plot_window] = []
 
-        window = self.main_window.add_plot_window(
+        window = self.session.add_plot_window(
             is_navigator=is_navigator,
             plot_manager=self,
             signal_tree=self.signal_tree,
         )
 
-        # add a new level to the children dictionary
         children_dict[window] = {}
 
         child = window.add_new_plot()
-        # create plot states for the child plot
         if window not in self.plots:
             self.plots[window] = []
         self.plots[window].append(child)
-
-        # Parent should be all the plots in the plot window
-        parent = plot_window.current_plot_item
 
         selector = selector_type(
             parent=plot_window,
@@ -242,62 +192,60 @@ class MultiplotManager:
         self.navigation_selectors[plot_window].append(selector)
         plot_window.last_used_selector = selector
 
+        # Register the selector so the right-dock toggle can switch it between
+        # crosshair (point) and integrating (region) modes, and tell the dock
+        # it exists. Composite selectors start in crosshair mode.
+        try:
+            mode = "integrate" if getattr(selector, "is_integrating", False) else "crosshair"
+            self.session.register_nav_selector(plot_window.window_id, selector)
+            from spyde.backend.ipc import emit
+            emit({
+                "type": "selector_info",
+                "window_id": plot_window.window_id,
+                "mode": mode,
+                "title": "Navigator",
+            })
+        except Exception:
+            pass
+
         if is_navigator:
             for signal in self.signal_tree.navigator_signals.values():
                 self.add_plot_states_for_navigation_signals(signal)
         else:
             self.signal_tree.create_plot_states(plot=child)
 
-        logger.info("Added Child plot states: ", child.plot_states)
-        # Auto range...
         selector.update_data()
-        child.update_data(child.current_data, force=False)
-        logger.info("Auto-ranging child plot")
-        child.getViewBox().autoRange()
+        if child.current_data is not None:
+            child.update_data(child.current_data)
         self.signal_tree.signal_plots.append(child)
         child.needs_auto_level = True
-        logger.info("Added navigation selector and signal plot:", selector, child)
         return window
 
     @property
     def all_plot_windows(self) -> List["PlotWindow"]:
-        """ Get all plot windows associated with this signal tree, including navigation plot windows and toolbar plot windows.
-        Returns
-        -------
-        List[PlotWindow]
-            A list of all plot windows managed by this MultiplotManager.
-        """
-        windows = [] # type: List["PlotWindow"]
+        windows: List["PlotWindow"] = []
 
-        def collect_windows(windows_dict):
-            """Recursively collect all plot windows from nested dictionary."""
+        def collect_windows(windows_dict: dict) -> None:
             for win, children in windows_dict.items():
                 if win not in windows:
                     windows.append(win)
                 if children:
                     collect_windows(children)
 
-        # Collect all navigation plot windows
         collect_windows(self.plot_windows)
 
-        # Collect toolbar plot windows from signal tree.
-        # Iterate over a snapshot to avoid mutating the list mid-loop;
-        # guard against windows that have no PlotState (e.g. virtual preview windows).
         for win in list(windows):
-            if win.current_plot_state is None:
+            plot = getattr(win, "current_plot_item", None)
+            state = getattr(plot, "plot_state", None) if plot else None
+            if state is None:
                 continue
-            tr = win.current_plot_state.toolbar_right
-            tl = win.current_plot_state.toolbar_left
-            tb = win.current_plot_state.toolbar_bottom
-            tt = win.current_plot_state.toolbar_top
-            for toolbar in [tr, tl, tb, tt]:
-                if toolbar is not None and toolbar.plot_windows is not None:
-                    for item in toolbar.plot_windows:
-                        # toolbar.plot_windows contains (name, window) tuples
-                        if isinstance(item, tuple):
-                            windows.append(item[1])
-                        else:
-                            windows.append(item)
+            for toolbar in [
+                state.toolbar_right, state.toolbar_left,
+                state.toolbar_bottom, state.toolbar_top,
+            ]:
+                plot_windows_attr = getattr(toolbar, "plot_windows", None)
+                if plot_windows_attr is None:
+                    continue
+                for item in plot_windows_attr:
+                    windows.append(item[1] if isinstance(item, tuple) else item)
         return windows
-
-

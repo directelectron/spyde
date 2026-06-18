@@ -33,6 +33,25 @@ _DEFAULT_EXAMPLE_NAMES = (
     "fe_multi_phase_grains",
 )
 
+# Staged-wizard actions → "module.function". All share the (session, plot,
+# payload) signature, so `dispatch_action` routes them through one lazy-import
+# branch instead of a copy-pasted elif per handler.
+_STAGED_HANDLERS = {
+    "om_generate_library": "spyde.actions.orientation_action.om_generate_library",
+    "om_refine":           "spyde.actions.orientation_action.om_refine",
+    "om_run":              "spyde.actions.orientation_action.om_run",
+    "fv_preview":          "spyde.actions.find_vectors_action.fv_preview",
+    "fv_tune":             "spyde.actions.find_vectors_action.fv_tune",
+    "fv_run":              "spyde.actions.find_vectors_action.fv_run",
+    "fv_stop":             "spyde.actions.find_vectors_action.fv_stop",
+    "vom_generate_library": "spyde.actions.vector_orientation_om.vom_generate_library",
+    "vom_run":             "spyde.actions.vector_orientation_om.vom_run",
+    "czb_auto":            "spyde.actions.center_zero_beam.czb_auto",
+    "czb_manual_start":    "spyde.actions.center_zero_beam.czb_manual_start",
+    "czb_manual":          "spyde.actions.center_zero_beam.czb_manual",
+    "czb_manual_stop":     "spyde.actions.center_zero_beam.czb_manual_stop",
+}
+
 
 class Session:
     """
@@ -47,6 +66,10 @@ class Session:
         self._plots: list[Plot] = []  # all open Plot objects (anyplotlib-backed)
         self._next_window_id = 0
         self._recent_files: list[str] = []
+        self._example_temp_paths: list[str] = []  # temp .zspy dirs to clean up
+        # (src_window_id, action_name) -> {"selector", "out_wids"} so deselecting
+        # a toolbar action can hide the output window + ROI it created.
+        self._action_artifacts: dict[tuple[int, str], dict] = {}
         self.current_selected_signal_tree = None
 
         # MDI manager
@@ -139,13 +162,57 @@ class Session:
             if loader is None:
                 emit_error(f"Unknown example dataset: {name}")
                 return
-            sig = loader()
+            sig = self._load_example_lazy(loader)
             self._add_signal(sig, source_path=None)
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             emit_error(f"Failed to load example {name}: {e}")
 
-    def _add_signal(self, signal: BaseSignal, source_path: str | None = None) -> None:
-        """Create a signal tree + plots for a loaded signal."""
+    def _load_example_lazy(self, loader) -> BaseSignal:
+        """Load a pyxem example as a LAZY (Dask-backed) signal.
+
+        pyxem example loaders forward ``**kwargs`` to ``hs.load``, so passing
+        ``lazy=True`` reads the already-downloaded file straight off disk as a
+        dask array — no eager 668 MB materialise, no zspy re-save. Falls back to
+        an in-place ``as_lazy()`` wrap only if a loader doesn't honour ``lazy``.
+        """
+        for kwargs in ({"allow_download": True, "lazy": True}, {"lazy": True}):
+            try:
+                sig = loader(**kwargs)
+            except TypeError:
+                continue
+            return sig if getattr(sig, "_lazy", False) else sig.as_lazy()
+        # Loader doesn't accept those kwargs at all → eager once, wrap lazy.
+        try:
+            sig = loader(allow_download=True)
+        except TypeError:
+            sig = loader()
+        return sig if getattr(sig, "_lazy", False) else sig.as_lazy()
+
+    def _to_lazy(self, sig: BaseSignal, name: str) -> BaseSignal:
+        """Return a lazy (Dask-backed) version of an in-memory *sig* via an
+        in-place ``as_lazy()`` wrap (no disk round-trip)."""
+        if getattr(sig, "_lazy", False):
+            return sig
+        try:
+            return sig.as_lazy()
+        except Exception:
+            return sig
+
+    def _add_signal(
+        self,
+        signal: BaseSignal,
+        source_path: str | None = None,
+        navigator_override: BaseSignal | None = None,
+        selector_type=None,
+    ):
+        """Create a signal tree + plots for a loaded signal. Returns the tree.
+
+        ``navigator_override`` supplies a pre-built navigator (e.g. a vectors
+        count-map) so the base navigator is NOT recomputed from the full
+        dataset — essential for the breaking transformations (Find Vectors).
+        """
         from spyde.signal_tree import BaseSignalTree
         from spyde.drawing.plots.plot import Plot
 
@@ -154,6 +221,8 @@ class Session:
             root_signal=signal,
             session=self,
             distributed_client=client,
+            selector_type=selector_type,
+            navigator_override=navigator_override,
         )
         self.signal_trees.append(tree)
 
@@ -164,7 +233,37 @@ class Session:
         if title is None and source_path:
             title = os.path.splitext(os.path.basename(source_path))[0]
 
+        # Emit metadata + axes for the sidebar, tagged with this tree's windows.
+        try:
+            from spyde.metadata_extract import build_metadata_dict
+            emit({
+                "type": "metadata",
+                "window_ids": self._tree_window_ids(tree),
+                "metadata": build_metadata_dict(tree),
+            })
+        except Exception as e:
+            print(f"metadata emit failed: {e}")
+        self._emit_axes(tree)
+
         emit_status(f"Loaded: {title or 'Signal'}")
+        return tree
+
+    def _tree_window_ids(self, tree) -> list[int]:
+        return sorted({
+            p.window_id for p in self._plots
+            if getattr(p, "signal_tree", None) is tree and p.window_id is not None
+        })
+
+    def _emit_axes(self, tree) -> None:
+        try:
+            from spyde.metadata_extract import build_axes_list
+            emit({
+                "type": "axes_info",
+                "window_ids": self._tree_window_ids(tree),
+                "axes": build_axes_list(tree),
+            })
+        except Exception as e:
+            print(f"axes emit failed: {e}")
 
     # ── Plot / window management ───────────────────────────────────────────────
 
@@ -181,6 +280,144 @@ class Session:
             signal_tree=signal_tree,
             plot_manager=plot_manager,
         )
+
+    def register_nav_selector(self, window_id: int, selector) -> None:
+        """Track a navigator's composite selector by its window id so the dock
+        can toggle its crosshair/integration mode."""
+        if not hasattr(self, "_nav_selectors"):
+            self._nav_selectors = {}
+        self._nav_selectors[window_id] = selector
+
+    def set_selector_mode(self, window_id: int, integrate: bool) -> None:
+        """Switch a navigator selector between crosshair and integrating mode."""
+        sel = getattr(self, "_nav_selectors", {}).get(window_id)
+        if sel is None or not hasattr(sel, "set_integrating"):
+            return
+        try:
+            sel.set_integrating(bool(integrate))
+            emit({
+                "type": "selector_info",
+                "window_id": window_id,
+                "mode": "integrate" if integrate else "crosshair",
+                "title": "Navigator",
+            })
+        except Exception as e:
+            print(f"set_selector_mode failed: {e}")
+
+    def _select_signal_node(self, plot, signal_id) -> None:
+        """Switch *plot* to display the signal-tree node with the given id
+        (emitted by toggle_signal_tree as id(node.signal))."""
+        if plot is None or signal_id is None:
+            return
+        for sig in list(getattr(plot, "plot_states", {}).keys()):
+            if id(sig) == signal_id:
+                plot.set_plot_state(sig)
+                self._reemit_signal_tree(plot)
+                emit({"type": "status", "text": "Switched signal node"})
+                return
+
+    def _reemit_signal_tree(self, plot) -> None:
+        """Re-push the workflow tree for *plot* (refreshes after a new node is
+        added by a transform, and highlights the active node). No-op if the tree
+        isn't available yet."""
+        tree = getattr(plot, "signal_tree", None) if plot is not None else None
+        root_node = getattr(tree, "root_node", None) if tree is not None else None
+        if root_node is None:
+            return
+
+        def node_to_dict(node):
+            return {
+                "name": node.name, "signal_id": id(node.signal),
+                "children": [node_to_dict(c) for c in node.children.values()],
+            }
+        try:
+            active = id(plot.plot_state.current_signal)
+        except Exception:
+            active = None
+        emit({
+            "type": "signal_tree", "window_id": getattr(plot, "window_id", None),
+            "tree": node_to_dict(root_node), "active_signal_id": active, "visible": True,
+        })
+
+    def _set_axis(self, plot, payload: dict) -> None:
+        """Edit one axis property of the active window's root signal and
+        recalibrate every plot in its tree. Writes back to the real
+        axes_manager so the change is reflected in the dataset."""
+        if plot is None:
+            return
+        tree = getattr(plot, "signal_tree", None)
+        if tree is None:
+            return
+        index = payload.get("index")
+        field = payload.get("field")
+        value = payload.get("value")
+        if index is None or field not in ("name", "units", "scale", "offset"):
+            return
+        try:
+            axes = tree.root.axes_manager._axes
+            if not (0 <= int(index) < len(axes)):
+                return
+            ax = axes[int(index)]
+            if field in ("scale", "offset"):
+                try:
+                    setattr(ax, field, float(value))
+                except (TypeError, ValueError):
+                    return  # ignore non-numeric input mid-typing
+            else:
+                setattr(ax, field, str(value))
+        except Exception as e:
+            print(f"set_axis failed: {e}")
+            return
+
+        # Recalibrate: re-push every plot in the tree (re-reads the axes →
+        # updated scale bar / extent) and re-emit the table + metadata.
+        for p in list(self._plots):
+            if getattr(p, "signal_tree", None) is tree:
+                try:
+                    p.update()
+                except Exception:
+                    pass
+        self._emit_axes(tree)
+        try:
+            from spyde.metadata_extract import build_metadata_dict
+            emit({
+                "type": "metadata",
+                "window_ids": self._tree_window_ids(tree),
+                "metadata": build_metadata_dict(tree),
+            })
+        except Exception:
+            pass
+
+    def _update_vi(self, window_id: int, name: str, params: dict) -> None:
+        """A per-VI caret edit — apply new detector params and recompute that
+        virtual image live."""
+        art = self._action_artifacts.get((window_id, name))
+        if not art:
+            return
+        act = art.get("action")
+        if act is not None and hasattr(act, "update_live_params"):
+            act.update_live_params(params)
+            # A detector-type change rebuilds the selector — refresh the ref so
+            # removal closes the current ROI.
+            new_sel = getattr(act, "_selector", None)
+            if new_sel is not None:
+                art["selector"] = new_sel
+        # Keep the source plot's VI list + the renderer chip in sync.
+        src = self._plot_by_window_id(window_id)
+        item = None
+        for it in getattr(src, "_vi_items", []) or []:
+            if it.get("name") == name:
+                it.update({k: v for k, v in params.items()})
+                item = it
+                break
+        if item is not None:
+            emit({
+                "type": "sub_item", "window_id": window_id,
+                "action": item.get("parent_action", "Virtual Imaging"),
+                "name": name, "color": item.get("color"),
+                "vtype": item.get("type"), "calculation": item.get("calculation"),
+                "active": True,
+            })
 
     def register_plot(self, plot: "Plot") -> None:
         self._plots.append(plot)
@@ -219,6 +456,139 @@ class Session:
         except Exception as e:
             print(f"Failed to update signal: {e}")
 
+    def _load_test_data(self) -> None:
+        """Load a synthetic 4D-STEM dataset (no file, no Dask, no download).
+
+        Test-only entry point so Playwright can exercise the full live
+        navigator→signal interaction deterministically. Each nav position has a
+        distinct single bright pixel so a selector move produces a visibly
+        different diffraction pattern.
+        """
+        import numpy as np
+        nav, sig = (8, 8), (32, 32)
+        data = np.zeros(nav + sig, dtype=np.float32)
+        for i in range(nav[0]):
+            for j in range(nav[1]):
+                data[i, j, (i * 4) % 32, (j * 4) % 32] = 255.0
+                data[i, j, 16, 16] = 60.0  # faint common center
+        s = hs.signals.Signal2D(data)
+        try:
+            s.set_signal_type("electron_diffraction")
+        except Exception:
+            pass
+        self._add_signal(s, source_path="test_data")
+
+    def _load_test_data_lazy(self) -> None:
+        """Synthetic LAZY 4D-STEM data — exercises the lazy+Dask path (Future
+        compute, worker-thread display) that the eager `_load_test_data` doesn't.
+        The central disk intensity varies per nav position so a virtual image of
+        it is clearly structured (not uniform/black)."""
+        import numpy as np
+        nav, sig = (8, 8), (32, 32)
+        yy, xx = np.mgrid[0:32, 0:32]
+        disk = ((xx - 16) ** 2 + (yy - 16) ** 2 <= 20).astype(np.float32)
+        data = np.zeros(nav + sig, dtype=np.float32)
+        for i in range(nav[0]):
+            for j in range(nav[1]):
+                data[i, j] = disk * (50.0 + i * 15.0 + j * 10.0)
+        s = hs.signals.Signal2D(data).as_lazy()
+        try:
+            s.set_signal_type("electron_diffraction")
+        except Exception:
+            pass
+        # CALIBRATE the signal axes (scale != 1, beam-centred). This is the real
+        # scenario that exposed the "VI is just black" mask bug — anyplotlib ROI
+        # widgets report PIXEL coords, so the detector mask must be built in pixel
+        # space, not physical units. A scale=1 dataset hides that class of bug, so
+        # the lazy test data is deliberately calibrated to guard against it.
+        for ax in s.axes_manager.signal_axes:
+            ax.scale = 0.1
+            ax.offset = -(ax.size / 2.0) * 0.1
+            ax.units = "1/nm"
+        self._add_signal(s, source_path="test_data_lazy")
+
+    def _load_test_vectors(self) -> None:
+        """Test-only: load a small calibrated 4D-STEM stack (two disks per
+        pattern) and run Find Diffraction Vectors on it, so the vectors-image
+        window opens cleanly (no picker, no wizard occlusion). Lets Playwright
+        exercise the downstream vector actions (Vector Virtual Imaging / Vector
+        Orientation Mapping) E2E."""
+        import numpy as np
+        import hyperspy.api as hs
+        nav, sig = (6, 6), (32, 32)
+        yy, xx = np.mgrid[0:32, 0:32]
+        # Four disks per pattern (≥4 vectors) so the downstream Vector
+        # Orientation per-pattern fit actually runs (not skipped for too-few).
+        spots = [(16, 16), (23, 9), (8, 21), (22, 24)]
+        pat = np.zeros(sig, dtype=np.float32)
+        for sxx, syy in spots:
+            pat += ((xx - sxx) ** 2 + (yy - syy) ** 2 <= 7).astype(np.float32)
+        data = np.zeros(nav + sig, dtype=np.float32)
+        for i in range(nav[0]):
+            for j in range(nav[1]):
+                data[i, j] = pat * 100.0
+        s = hs.signals.Signal2D(data)
+        try:
+            s.set_signal_type("electron_diffraction")
+        except Exception:
+            pass
+        for ax in s.axes_manager.signal_axes:
+            ax.scale = 0.1
+            ax.offset = -(ax.size / 2.0) * 0.1
+            ax.units = "1/nm"
+        self._add_signal(s, source_path="test_vectors")
+
+        src = next((p for p in self._plots
+                    if not p.is_navigator and p.plot_state is not None), None)
+        if src is None:
+            emit_error("load_test_vectors: no active signal")
+            return
+        from spyde.actions.context import ActionContext
+        from spyde.actions.find_vectors_action import find_diffraction_vectors
+        ctx = ActionContext(plot=src, params={}, action_name="Find Diffraction Vectors")
+        find_diffraction_vectors(
+            ctx, sigma=1.0, kernel_radius=5, threshold=0.4,
+            min_distance=3, subpixel=True,
+        )
+
+    def _run_test_orientation(self, plot) -> None:
+        """Test-only Orientation Mapping with a built-in Al phase (no CIF dialog),
+        so the full OM workflow can be exercised E2E (incl. lazy data) without a
+        file picker. Mirrors `orientation_action.orientation_mapping`."""
+        src = plot or next(
+            (p for p in self._plots if not p.is_navigator and p.plot_state is not None),
+            None,
+        )
+        if src is None:
+            emit_error("run_test_orientation: no active signal")
+            return
+        tree = getattr(src, "signal_tree", None)
+        if tree is None:
+            emit_error("run_test_orientation: no signal tree")
+            return
+
+        def _work():
+            try:
+                from orix.crystal_map import Phase
+                from diffpy.structure import Atom, Lattice, Structure
+                from spyde.actions.orientation_action import run_orientation
+                structure = Structure(
+                    atoms=[Atom("Al", [0, 0, 0])],
+                    lattice=Lattice(4.05, 4.05, 4.05, 90, 90, 90),
+                )
+                phase = Phase(name="Al", space_group=225, structure=structure)
+                run_orientation(
+                    self, tree.root, tree, [phase],
+                    dict(accelerating_voltage=200.0, resolution=8.0),
+                    dict(n_best=3, gamma=0.5), src_dp_plot=src,
+                )
+            except Exception as e:
+                import traceback
+                emit_error(f"run_test_orientation failed: {e}")
+                print(traceback.format_exc())
+
+        threading.Thread(target=_work, daemon=True, name="test-orientation").start()
+
     # ── Action dispatch ────────────────────────────────────────────────────────
 
     def dispatch_action(self, msg: dict) -> None:
@@ -229,7 +599,40 @@ class Session:
 
         plot = self._plot_by_window_id(window_id) if window_id is not None else None
 
-        if action == "open_file":
+        if action == "load_test_data":
+            self._load_test_data()
+        elif action == "load_test_data_lazy":
+            self._load_test_data_lazy()
+        elif action == "load_test_vectors":
+            self._load_test_vectors()
+        elif action in _STAGED_HANDLERS:
+            # Staged-wizard handlers (Orientation / Find-Vectors / Vector-OM /
+            # Center-Zero-Beam) share the (session, plot, payload) signature and
+            # are imported lazily so their heavy deps load only on first use.
+            import importlib
+            mod, fn = _STAGED_HANDLERS[action].rsplit(".", 1)
+            getattr(importlib.import_module(mod), fn)(self, plot, payload)
+        elif action == "run_test_orientation":
+            # Test-only: run Orientation Mapping with a built-in Al phase (no CIF
+            # dialog) on the active signal, so the E2E workflow can be driven
+            # headlessly / in Playwright on lazy data.
+            self._run_test_orientation(plot)
+        elif action == "set_selector_mode":
+            self.set_selector_mode(window_id, bool(payload.get("integrate")))
+        elif action == "select_signal_node":
+            self._select_signal_node(plot, payload.get("signal_id"))
+        elif action == "set_axis":
+            self._set_axis(plot, payload)
+        elif action == "set_overlay":
+            self._set_overlay(plot, payload.get("name"),
+                              bool(payload.get("visible", True)))
+        elif action == "set_action_active":
+            self._set_action_active(
+                window_id, payload.get("name"), bool(payload.get("active"))
+            )
+        elif action == "update_vi":
+            self._update_vi(window_id, payload.get("name"), payload.get("params", {}))
+        elif action == "open_file":
             self.open_file(payload["path"])
         elif action == "load_example":
             self.load_example_data(payload["name"])
@@ -245,8 +648,135 @@ class Session:
             self._resize_figure(window_id, payload.get("width"), payload.get("height"))
         elif action == "figure_event":
             self._dispatch_figure_event(window_id, payload.get("event_json"))
+        elif action == "toolbar_action":
+            self._dispatch_toolbar_action(
+                plot, payload.get("name"), payload.get("params", {})
+            )
         else:
             print(f"Unknown action: {action}")
+
+    def _dispatch_toolbar_action(self, plot, name: str, params: dict) -> None:
+        """Invoke a YAML-configured toolbar action by name on *plot*.
+
+        The action function is resolved from TOOLBAR_ACTIONS and called with an
+        ActionContext, so the same functions that ran under the Qt toolbar run
+        here unchanged.  Parameter values collected by the Electron parameter
+        panel arrive in *params* and are forwarded as kwargs.
+        """
+        if plot is None or not name:
+            emit_error("Toolbar action: no active plot or action name")
+            return
+
+        # Actions whose modules still carry the Qt/interactive implementation and
+        # haven't been ported to the host-agnostic template yet. Clicking them
+        # gives a clear message instead of a confusing Qt-without-QApplication
+        # traceback. (Virtual Imaging / FFT / Line Profile / Rebin ARE ported.)
+        NOT_YET_PORTED: set = set()
+        if name in NOT_YET_PORTED:
+            emit_error(f"'{name}' is not yet available in the Electron build.")
+            return
+
+        try:
+            import importlib
+            from spyde import TOOLBAR_ACTIONS
+            from spyde.actions.context import ActionContext
+
+            meta = TOOLBAR_ACTIONS["functions"].get(name)
+            if meta is None:
+                # Sub-toolbar action (e.g. "add_virtual_image") — search the
+                # subfunctions of every top-level action.
+                for parent in TOOLBAR_ACTIONS["functions"].values():
+                    subs = parent.get("subfunctions", {}) or {}
+                    if name in subs:
+                        meta = subs[name]
+                        break
+            if meta is None:
+                emit_error(f"Unknown toolbar action: {name}")
+                return
+            module_path, _, attr = meta["function"].rpartition(".")
+            target = getattr(importlib.import_module(module_path), attr)
+            ctx = ActionContext(plot=plot, params=params, action_name=name)
+
+            # A target may be either an Action subclass (template style) or a
+            # plain function (legacy style). Both receive the same ActionContext.
+            from spyde.actions.action import Action
+            if isinstance(target, type) and issubclass(target, Action):
+                result = target(ctx).run(**params)
+            else:
+                result = target(ctx, action_name=name, **params)
+            self._track_action_artifacts(plot, name, result)
+        except Exception as e:
+            import traceback
+            emit_error(f"Action '{name}' failed: {e}")
+            print(traceback.format_exc())
+
+    def _track_action_artifacts(self, src_plot, name: str, result) -> None:
+        """Remember the selector + output windows a RegionAction created so the
+        toolbar can mark the action 'active' and hide them again on deselect."""
+        if result is None or not hasattr(result, "active_children"):
+            return
+        src_wid = getattr(src_plot, "window_id", None)
+        if src_wid is None:
+            return
+        out_wids = sorted({
+            c.window_id for c in getattr(result, "active_children", [])
+            if getattr(c, "window_id", None) is not None
+        })
+        self._action_artifacts[(src_wid, name)] = {"selector": result, "out_wids": out_wids}
+        emit({"type": "action_active", "window_id": src_wid, "name": name, "active": True})
+
+    def _set_overlay(self, plot, name: str, visible: bool) -> None:
+        """Show/hide the live DP overlay(s) tied to a toolbar action — the marker
+        overlay is only drawn while its action (caret) is SELECTED. The overlay
+        still tracks the navigator while hidden, so re-selecting redraws the
+        current frame."""
+        tree = getattr(plot, "signal_tree", None) if plot is not None else None
+        if tree is None or not name:
+            return
+        overlays = []
+        if name == "Find Diffraction Vectors":
+            overlays.append(getattr(tree, "_vector_overlay", None))
+        elif name == "Orientation Mapping":
+            overlays.append(getattr(tree, "_orientation_overlay", None))
+            wiz = getattr(tree, "_om_wizard", None)
+            if wiz:
+                overlays.append(wiz.get("overlay"))
+        elif name == "Vector Orientation Mapping":
+            wiz = getattr(tree, "_vom_wizard", None)
+            if wiz:
+                overlays.append(wiz.get("overlay"))
+        for ov in overlays:
+            if ov is not None and hasattr(ov, "set_visible"):
+                try:
+                    ov.set_visible(visible)
+                except Exception:
+                    pass
+
+    def _set_action_active(self, window_id: int, name: str, active: bool) -> None:
+        """Deselecting an action hides the output window + ROI selector it made
+        (Qt parity: an unchecked toolbar action removes its artifacts)."""
+        key = (window_id, name)
+        art = self._action_artifacts.get(key)
+        if active or art is None:
+            return
+        # Closing each output plot also cleans its source ROI (parent_selector).
+        for wid in art.get("out_wids", []):
+            p = self._plot_by_window_id(wid)
+            if p is not None:
+                self._close_plot(p)
+        try:
+            art["selector"].close()
+        except Exception:
+            pass
+        self._action_artifacts.pop(key, None)
+        emit({"type": "action_active", "window_id": window_id, "name": name, "active": False})
+        # If this was a virtual-image chip, drop it from the source plot's list
+        # and tell the sub-toolbar to remove the chip.
+        src = self._plot_by_window_id(window_id)
+        if src is not None and hasattr(src, "_vi_items"):
+            src._vi_items = [it for it in src._vi_items if it.get("name") != name]
+        emit({"type": "sub_item", "window_id": window_id,
+              "action": "Virtual Imaging", "name": name, "active": False})
 
     def _plot_by_window_id(self, window_id: int):
         for p in self._plots:
@@ -289,26 +819,117 @@ class Session:
     def _close_window(self, window_id: int) -> None:
         plot = self._plot_by_window_id(window_id)
         if plot is None:
+            # Backend already dropped it (or never had it) — still tell the
+            # renderer to remove the window so the UI doesn't get stuck.
+            emit({"type": "window_closed", "window_id": window_id})
             return
         try:
             tree = getattr(plot, "signal_tree", None)
-            if tree is not None:
+            if tree is None:
+                self._close_plot(plot)
+                return
+            # Scoping (per spec): the NAVIGATOR's X closes the whole tree (all
+            # signals share its dataset); a signal window's X closes ONLY that
+            # signal (and its selectors / action popouts). A lone signal plot
+            # with no navigator falls through to closing its tree once empty.
+            if getattr(plot, "is_navigator", False):
                 self._close_tree(tree)
             else:
-                plot.close()
-                self.unregister_plot(plot)
+                self._close_signal_plot(plot, tree)
         except Exception as e:
             print(f"close_window failed: {e}")
+
+    def _close_plot(self, plot) -> None:
+        """Tear down a single plot and tell the renderer to drop its window."""
+        wid = getattr(plot, "window_id", None)
+        self._cleanup_plot_selectors(plot)
+        try:
+            plot.close()
+        finally:
+            self.unregister_plot(plot)
+        self._forget_window(wid)
+
+    def _close_signal_plot(self, plot, tree) -> None:
+        """Close a single non-navigator signal window, leaving the rest of the
+        tree open. Cleans up the plot's selectors / source ROI, then drops the
+        tree entirely if nothing is left open."""
+        self._close_plot(plot)
+        try:
+            if plot in getattr(tree, "signal_plots", []):
+                tree.signal_plots.remove(plot)
+        except Exception:
+            pass
+        # If no windows of this tree remain open, retire the tree.
+        remaining = [p for p in self._plots if getattr(p, "signal_tree", None) is tree]
+        if not remaining and tree in self.signal_trees:
+            try:
+                tree.close()
+            except Exception:
+                pass
+            self.signal_trees.remove(tree)
+
+    def _cleanup_plot_selectors(self, plot) -> None:
+        """Close any selectors owned by / driving this plot, so closing a virtual
+        image (etc.) also removes its source ROI from the parent plot."""
+        # The selector on the PARENT plot that drives this output window.
+        try:
+            pw = getattr(plot, "plot_window", None)
+            parent_sel = getattr(pw, "parent_selector", None)
+            if parent_sel is not None and hasattr(parent_sel, "close"):
+                parent_sel.close()
+        except Exception:
+            pass
+        # Selectors living on this plot itself.
+        try:
+            state = getattr(plot, "plot_state", None)
+            for attr in ("plot_selectors", "signal_tree_selectors"):
+                for sel in list(getattr(state, attr, []) or []):
+                    if hasattr(sel, "close"):
+                        try:
+                            sel.close()
+                        except Exception:
+                            pass
+        except Exception:
+            pass
 
     def _close_tree(self, tree: "BaseSignalTree") -> None:
         if tree not in self.signal_trees:
             return
+        # Collect every plot/window belonging to this tree BEFORE teardown.
+        plots = [p for p in self._plots if getattr(p, "signal_tree", None) is tree]
+        window_ids = sorted({
+            p.window_id for p in plots if getattr(p, "window_id", None) is not None
+        })
         try:
             tree.close()
         except Exception:
             pass
-        self.signal_trees.remove(tree)
-        emit({"type": "windows_closed", "tree_id": id(tree)})
+        for p in plots:
+            self._cleanup_plot_selectors(p)
+            try:
+                p.close()
+            except Exception:
+                pass
+            self.unregister_plot(p)
+        if tree in self.signal_trees:
+            self.signal_trees.remove(tree)
+        for wid in window_ids:
+            self._forget_window(wid)
+
+    def _forget_window(self, window_id: int | None) -> None:
+        """Drop per-window backend state and tell the renderer to remove it."""
+        if window_id is None:
+            return
+        if hasattr(self, "_nav_selectors"):
+            self._nav_selectors.pop(window_id, None)
+        # Drop any action-artifact entries that source from or output to this
+        # window so a re-run starts clean and a closed output isn't "active".
+        for k in [k for k, v in self._action_artifacts.items()
+                  if k[0] == window_id or window_id in v.get("out_wids", [])]:
+            self._action_artifacts.pop(k, None)
+            # Tell the source window's toolbar to un-highlight the action.
+            emit({"type": "action_active", "window_id": k[0], "name": k[1], "active": False})
+        emit({"type": "window_closed", "window_id": window_id})
 
     def _resize_figure(self, window_id: int, width: int | None, height: int | None) -> None:
         plot = self._plot_by_window_id(window_id)
@@ -368,3 +989,10 @@ class Session:
     def shutdown(self) -> None:
         self._plot_worker.stop()
         self.dask_manager.shutdown()
+        for tmpdir in self._example_temp_paths:
+            try:
+                import shutil
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            except Exception:
+                pass
+        self._example_temp_paths.clear()

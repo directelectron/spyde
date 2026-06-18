@@ -120,7 +120,12 @@ class PlotUpdateWorker:
                 self.debug_print.emit(f"Transferred Future over TCP in {(time.time()-start)*1000:.2f} ms")
         except Exception as e:
             result = e
+        # signal_ready passes the owning plot as `extra` → emit (signal, result,
+        # plot). plot_ready has no extra → emit (plot, result, future). The old
+        # code ignored `extra` and always passed the future as the 3rd arg, so
+        # `_on_signal_ready` got a Future where it expected the plot
+        # ("'Future' object has no attribute 'parent_selector'").
         if extra is not None:
-            emitter(plot, result, fut)
+            emitter(plot, result, extra)
         else:
             emitter(plot, result, fut)

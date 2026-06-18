@@ -27,13 +27,47 @@ from typing import Any
 
 _stdout_lock = threading.Lock()
 
+# Capture the *real* stdout at import time. This is the dedicated protocol
+# channel; emit() always writes here even after stray prints are redirected.
+_PROTOCOL_OUT = sys.stdout
+
+
+def redirect_stray_stdout() -> None:
+    """Send all `print()` output to stderr so it can never interleave with the
+    PLOTAPP protocol on stdout, while keeping BOTH protocol emitters — spyde's
+    own ``emit`` and anyplotlib's ``_electron.emit`` — pointed at the real
+    stdout protocol channel.
+
+    anyplotlib._electron.emit writes to ``sys.stdout`` dynamically, so simply
+    redirecting sys.stdout would send its state_update/event_json messages to
+    stderr (where the runner never parses them). We therefore monkeypatch
+    anyplotlib's emit to share spyde's locked protocol channel, then redirect
+    sys.stdout so stray prints go to stderr.
+
+    Call once at backend startup, after _PROTOCOL_OUT is captured.
+    """
+    try:
+        import anyplotlib._electron as _ael
+
+        def _shared_emit(obj: dict) -> None:
+            line = "PLOTAPP:" + json.dumps(obj, default=str) + "\n"
+            with _stdout_lock:
+                _PROTOCOL_OUT.write(line)
+                _PROTOCOL_OUT.flush()
+
+        _ael.emit = _shared_emit
+    except Exception:
+        pass
+
+    sys.stdout = sys.stderr
+
 
 def emit(obj: dict[str, Any]) -> None:
-    """Write a PLOTAPP: message to stdout (thread-safe)."""
+    """Write a PLOTAPP: message to the protocol channel (thread-safe)."""
     line = "PLOTAPP:" + json.dumps(obj, default=str) + "\n"
     with _stdout_lock:
-        sys.stdout.write(line)
-        sys.stdout.flush()
+        _PROTOCOL_OUT.write(line)
+        _PROTOCOL_OUT.flush()
 
 
 def emit_status(text: str) -> None:

@@ -10,7 +10,6 @@ with files(__package__).joinpath("metadata_widget.yaml").open(
     "r", encoding="utf-8"
 ) as f:
     METADATA_WIDGET_CONFIG = yaml.safe_load(f)
-print(METADATA_WIDGET_CONFIG)
 
 __all__ = ["TOOLBAR_ACTIONS", "METADATA_WIDGET_CONFIG"]
 

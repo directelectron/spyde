@@ -30,6 +30,7 @@ dependencies = [
     "imagecodecs",
     "psygnal>=0.10.0",
     "anyplotlib@file:///Users/carterfrancis/PycharmProjects/anyplotlib",
+    "pyyaml",
     # GPU-accelerated batched compute (vector orientation mapping, etc.).
     "torch",
 ]
@@ -138,6 +139,10 @@ spyde = "spyde.__main__:main"
 spyde = "spyde"
 
 [tool.pytest.ini_options]
+# Qt-free pytest suite for the Electron/anyplotlib backend. The legacy pytest-qt
+# tests under spyde/tests/ import PySide6 + the removed MainWindow and are not
+# collected; they're being superseded by these + the Playwright suite (electron/).
+testpaths = ["spyde/tests/migrated"]
 markers = [
     "gpu: tests requiring a physical NVIDIA GPU",
     "slow: slow tests (e.g. real template-library generation)",

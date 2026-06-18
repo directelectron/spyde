@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from functools import partial
@@ -18,6 +19,8 @@ if TYPE_CHECKING:
     from spyde.drawing.plots.plot_states import PlotState
     from spyde.drawing.plots.multiplot_manager import MultiplotManager
     from spyde.backend.session import Session
+
+logger = logging.getLogger(__name__)
 
 
 class BaseSignalTree:
@@ -48,24 +51,31 @@ class BaseSignalTree:
 
         self.navigator_signals: dict[str, BaseSignal] = {}
         self.root_node = SignalNode(signal=root_signal, name="root", parent=None)
-        self.client = distributed_client
+        self._client_override = distributed_client
         self._selector_type = selector_type
         self._pending_nav_dask: da.Array | None = None
 
         if navigator_override is not None:
-            print("Using navigator override for root signal:", navigator_override)
             navigator = self._preprocess_navigator(navigator_override)
         else:
-            print("Initializing navigator for root signal:", root_signal)
             navigator = self._initialize_navigator(root_signal)
-        print("Navigator initialized:", navigator)
         self.navigator_signals["base"] = navigator
 
         self.signal_plots: list[Plot] = []
         self.navigator_plot_manager: "MultiplotManager | None" = None
 
         self._initialize_initial_plots()
-        print("Created Signal Tree with root signal:", self.root)
+        logger.debug("Created signal tree with root %s", self.root)
+
+    @property
+    def client(self):
+        """The Dask distributed client — read LIVE from the session's
+        DaskManager so a tree created *before* the cluster finished starting
+        still picks it up (the cluster takes ~10 s; examples load sooner). Falls
+        back to the override passed at construction."""
+        mgr = getattr(self.session, "dask_manager", None) if self.session else None
+        live = getattr(mgr, "client", None) if mgr is not None else None
+        return live if live is not None else self._client_override
 
     def open(self) -> None:
         """Called by Session after construction to open MDI windows."""
@@ -121,11 +131,40 @@ class BaseSignalTree:
 
         nav_dask = self._pending_nav_dask
         self._pending_nav_dask = None
-        if nav_dask is None or self.client is None:
+        if nav_dask is None:
+            return
+
+        nav_signals = self.navigator_signals.get("base")
+        nav_plot_windows = list(self.navigator_plot_manager.plot_windows.keys())
+        if not nav_plot_windows:
+            return
+        nav_pw = nav_plot_windows[0]
+        nav_plots = self.navigator_plot_manager.plots.get(nav_pw, [])
+        if not nav_plots:
+            return
+        nav_plot = nav_plots[0]
+        nav_shape = tuple(nav_dask.shape)
+
+        # No cluster yet (it takes ~10 s to start; examples load sooner): compute
+        # the navigator on a BACKGROUND thread with the threaded scheduler so the
+        # already-displayed window fills in without blocking, and without waiting
+        # for the distributed client.
+        if self.client is None:
+            nav_plot.current_data = np.full(nav_shape, np.nan, dtype=np.float32)
+
+            def _bg_nav(_dask=nav_dask, _plot=nav_plot, _sig=nav_signals):
+                try:
+                    arr = np.asarray(_dask.compute()).astype(np.float32)
+                    _plot.needs_auto_level = True
+                    _plot.set_data(arr)
+                    if _sig:
+                        _sig[0].data = arr
+                except Exception:
+                    pass
+            threading.Thread(target=_bg_nav, daemon=True, name="nav-threaded").start()
             return
 
         # Cancel the single monolithic future submitted by _preprocess_navigator
-        nav_signals = self.navigator_signals.get("base")
         if nav_signals:
             old_future = nav_signals[0].data
             from dask.distributed import Future as _Future
@@ -135,16 +174,6 @@ class BaseSignalTree:
                 except Exception:
                     pass
 
-        nav_plot_windows = list(self.navigator_plot_manager.plot_windows.keys())
-        if not nav_plot_windows:
-            return
-        nav_pw = nav_plot_windows[0]
-        nav_plots = self.navigator_plot_manager.plots.get(nav_pw, [])
-        if not nav_plots:
-            return
-        nav_plot = nav_plots[0]
-
-        nav_shape = tuple(nav_dask.shape)
         shm_name = f"spyde_nav_{id(nav_plot)}"
 
         shm = ensure_live_buffer(nav_shape, shm_name)
@@ -233,31 +262,37 @@ class BaseSignalTree:
         ):
             navigator = signal.sum(signal.axes_manager.signal_axes).T
             if navigator._lazy:
-                nav_dask = navigator.data
-                self._pending_nav_dask = nav_dask
-                navigator.data = self.client.compute(
-                    nav_dask, priority=-10, workers=heavy_workers
-                )
+                navigator.data = self._compute_navigator(navigator.data, heavy_workers)
             return [navigator, signal]
 
         elif signal.axes_manager.signal_dimension > 2:
             signal = signal.transpose(2)
             navigator = signal.sum(signal.axes_manager.signal_axes).T
             if navigator._lazy:
-                nav_dask = navigator.data
-                self._pending_nav_dask = nav_dask
-                navigator.data = self.client.compute(
-                    nav_dask, priority=-10, workers=heavy_workers
-                )
+                navigator.data = self._compute_navigator(navigator.data, heavy_workers)
             return [navigator, signal]
 
         if signal._lazy:
-            nav_dask = signal.data
-            self._pending_nav_dask = nav_dask
-            signal.data = self.client.compute(
-                nav_dask, priority=-10, workers=heavy_workers
-            )
+            signal.data = self._compute_navigator(signal.data, heavy_workers)
         return [signal]
+
+    def _compute_navigator(self, nav_dask: da.Array, heavy_workers):
+        """Kick off computing the (small) navigator image — NEVER blocking.
+
+        The display must not wait on the navigator compute (tree ``__init__``
+        runs on the load thread and emits the windows right after this). So we
+        always stash ``nav_dask`` and return immediately:
+
+        * with a distributed client → submit a Future (progressive per-chunk
+          compute replaces it for the live navigator-on-load);
+        * without a client (cluster still starting, or headless) → return a NaN
+          placeholder; ``_start_progressive_nav_compute`` computes it on a
+          BACKGROUND thread (threaded scheduler) so init isn't blocked.
+        """
+        self._pending_nav_dask = nav_dask
+        if self.client is not None:
+            return self.client.compute(nav_dask, priority=-10, workers=heavy_workers)
+        return np.full(tuple(nav_dask.shape), np.nan, dtype=np.float32)
 
     def add_navigator_signal(self, name: str, signal: BaseSignal) -> None:
         signal = self._preprocess_navigator(signal)

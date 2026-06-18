@@ -1,0 +1,205 @@
+"""
+center_zero_beam.py — Electron-native Center Zero Beam (two-tab parity).
+
+Mirrors the Qt action (``pyxem.center_zero_beam`` / ``..._setup``):
+
+  Automatic — pyxem ``get_direct_beam_position(method, half_square_width)`` →
+              optional linear-plane flat field → ``center_direct_beam`` → a
+              "Centered" child node (the current DP updates in place).
+  Manual    — drop a draggable crosshair on the DP at the zero beam, Apply a
+              CONSTANT shift (``centre − picked``) → "Centered (Manual)" node.
+
+No Qt: the heavy Qt caret lives in ``pyxem.py``; this module is import-safe in
+the Electron backend (mirrors the find_vectors / orientation split).
+"""
+from __future__ import annotations
+
+import threading
+
+import numpy as np
+
+from spyde.backend.ipc import emit, emit_status, emit_error
+from spyde.actions.context import src_plot_tree as _src_plot_tree, current_signal as _current_signal
+
+DEFAULTS = dict(method="center_of_mass", half_square_width=0, make_flat_field=False)
+_CROSS_COLOR = "#ffcc00"
+
+
+def _display(src, tree, new_signal) -> None:
+    """Switch the source DP to display the new (centered) node and re-slice from
+    the navigator so the centered frame shows immediately. ``add_transformation``
+    only REGISTERS the new PlotState; switching the view is a separate step."""
+    try:
+        src.set_plot_state(new_signal)
+    except Exception:
+        pass
+    npm = getattr(tree, "navigator_plot_manager", None)
+    if npm is None:
+        return
+    for sels in getattr(npm, "navigation_selectors", {}).values():
+        for sel in sels:
+            try:
+                sel.delayed_update_data(force=True)
+            except Exception:
+                pass
+
+
+def center_zero_beam(ctx, action_name: str = "Center Zero Beam", **kwargs):
+    """Parent toolbar action — a no-op; the Electron toolbar opens the staged
+    Center-Zero-Beam wizard (Automatic / Manual) which drives the ``czb_*``
+    handlers."""
+    return None
+
+
+def czb_auto(session, plot, payload) -> None:
+    """Automatic tab: estimate the beam position per pattern and centre it."""
+    src, tree = _src_plot_tree(session, plot)
+    signal = _current_signal(src)
+    if src is None or tree is None or signal is None:
+        emit_error("Center Zero Beam: no active dataset")
+        return
+    method = str(payload.get("method", DEFAULTS["method"]))
+    hw = int(payload.get("half_square_width", 0) or 0)
+    flat = bool(payload.get("make_flat_field", False))
+    emit_status("Centering zero beam…")
+
+    def _work():
+        try:
+            try:
+                signal.set_signal_type("electron_diffraction")
+            except Exception:
+                pass
+            kw = {"method": method, "lazy_output": False}
+            if hw > 0:
+                kw["half_square_width"] = hw
+            shifts = signal.get_direct_beam_position(**kw)
+            if getattr(shifts, "_lazy", False):
+                shifts.compute()
+            if flat:
+                try:
+                    lp = shifts.get_linear_plane()
+                    if lp is not None:
+                        shifts = lp
+                except Exception as e:
+                    import logging
+                    logging.getLogger(__name__).debug("flat-field plane failed: %s", e)
+            new = tree.add_transformation(
+                parent_signal=signal, method="center_direct_beam",
+                node_name="Centered", shifts=shifts, inplace=False,
+            )
+            if new is None:
+                emit_error("Center Zero Beam: centering failed")
+                return
+            _display(src, tree, new)
+            try:
+                session._reemit_signal_tree(src)
+            except Exception:
+                pass
+            emit_status("Zero beam centered")
+            emit({"type": "czb_done",
+                  "window_id": getattr(src, "window_id", None), "mode": "auto"})
+        except Exception as e:
+            import traceback
+            emit_error(f"Center Zero Beam (auto) failed: {e}")
+            print(traceback.format_exc())
+
+    threading.Thread(target=_work, daemon=True, name="czb-auto").start()
+
+
+def czb_manual_start(session, plot, payload) -> None:
+    """Manual tab: drop a draggable crosshair at the centre of the DP for the
+    user to drag onto the zero beam."""
+    src, tree = _src_plot_tree(session, plot)
+    signal = _current_signal(src)
+    plot2d = getattr(src, "_plot2d", None) if src is not None else None
+    if plot2d is None or signal is None:
+        return
+    sig_ax = signal.axes_manager.signal_axes
+    w, h = int(sig_ax[0].size), int(sig_ax[1].size)
+    _czb_manual_stop_obj(tree)   # replace any prior crosshair
+    try:
+        cross = plot2d.add_crosshair_widget(cx=w / 2.0, cy=h / 2.0, color=_CROSS_COLOR)
+        tree._czb_cross = cross
+        emit_status("Drag the crosshair onto the zero beam, then Apply")
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).debug("czb crosshair add failed: %s", e)
+
+
+def _czb_manual_stop_obj(tree) -> None:
+    cross = getattr(tree, "_czb_cross", None) if tree is not None else None
+    if cross is not None:
+        try:
+            cross.hide()
+        except Exception:
+            pass
+        tree._czb_cross = None
+
+
+def czb_manual_stop(session, plot, payload=None) -> None:
+    """Caret closed / left the Manual tab → remove the crosshair."""
+    _src, tree = _src_plot_tree(session, plot)
+    _czb_manual_stop_obj(tree)
+
+
+def czb_manual(session, plot, payload) -> None:
+    """Manual tab Apply: centre by the picked crosshair position (constant shift
+    ``centre − picked`` over the whole scan)."""
+    src, tree = _src_plot_tree(session, plot)
+    signal = _current_signal(src)
+    if src is None or tree is None or signal is None:
+        emit_error("Center Zero Beam: no active dataset")
+        return
+    cross = getattr(tree, "_czb_cross", None)
+    if cross is not None:
+        cx, cy = float(cross.cx), float(cross.cy)
+    else:
+        cx, cy = payload.get("cx"), payload.get("cy")
+    if cx is None or cy is None:
+        emit_error("Center Zero Beam: place the crosshair first")
+        return
+
+    def _work():
+        try:
+            import hyperspy.api as hs
+            try:
+                signal.set_signal_type("electron_diffraction")
+            except Exception:
+                pass
+            am = signal.axes_manager
+            sig_ax = am.signal_axes
+            w, h = int(sig_ax[0].size), int(sig_ax[1].size)
+            # shift convention matches get_direct_beam_position: (centre − beam),
+            # [x=col, y=row] in pixels.
+            sx, sy = (w / 2.0 - float(cx)), (h / 2.0 - float(cy))
+            nav_shape = tuple(int(n) for n in am.navigation_shape)[::-1]  # (ny, nx)
+            data = np.zeros(nav_shape + (2,), dtype=np.float32)
+            data[..., 0] = sx
+            data[..., 1] = sy
+            shifts = hs.signals.Signal1D(data)
+            for i, ax in enumerate(am.navigation_axes):
+                oax = shifts.axes_manager.navigation_axes[i]
+                oax.scale, oax.offset = ax.scale, ax.offset
+                oax.units, oax.name = ax.units, ax.name
+            new = tree.add_transformation(
+                parent_signal=signal, method="center_direct_beam",
+                node_name="Centered (Manual)", shifts=shifts, inplace=False,
+            )
+            if new is None:
+                emit_error("Center Zero Beam: centering failed")
+                return
+            _display(src, tree, new)
+            try:
+                session._reemit_signal_tree(src)
+            except Exception:
+                pass
+            _czb_manual_stop_obj(tree)
+            emit_status("Zero beam centered (manual)")
+            emit({"type": "czb_done",
+                  "window_id": getattr(src, "window_id", None), "mode": "manual"})
+        except Exception as e:
+            import traceback
+            emit_error(f"Center Zero Beam (manual) failed: {e}")
+            print(traceback.format_exc())
+
+    threading.Thread(target=_work, daemon=True, name="czb-manual").start()

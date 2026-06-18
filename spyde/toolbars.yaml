@@ -27,10 +27,9 @@ functions:
   FFT:
     description: Applies Fast Fourier Transform to the data based on the current selected area.
     icon: drawing/toolbars/icons/fft.svg
-    function: spyde.actions.base.add_fft_selector
+    function: spyde.actions.fft_action.FFTAction
     plot_dim: [ 2 ]
     toolbar_side: right
-    toggle: True
   Select Navigator:
     description: Selects the navigator for the data view.
     icon: drawing/toolbars/icons/navigator.svg
@@ -65,105 +64,145 @@ functions:
     navigation: False
     toggle: True
   Center Zero Beam:
-    description: Centers the zero beam in diffraction patterns.
+    description: Centers the zero beam in diffraction patterns (Automatic / Manual).
     icon: drawing/toolbars/icons/center_zero_beam.svg
-    function: spyde.actions.pyxem.center_zero_beam
-    setup_function: spyde.actions.pyxem.center_zero_beam_setup
+    function: spyde.actions.center_zero_beam.center_zero_beam
+    signal_class: pyxem.signals.Diffraction2D
+    exclude_signal_types: [spyde_diffraction_vectors_image]
     plot_dim: [ 2 ]
     toolbar_side: bottom
     navigation: False
     toggle: True
-    parameters:
-      method:
-        name: Method
-        type: enum
-        default: 'blur'
-        options:
-          - cross_correlate
-          - center_of_mass
-          - blur
-          - interpolate
-      sigma:
-        name: Sigma
-        type: float
-        default: 2.0
-        display_condition:
-          parameter: method
-          value: blur
-      min_cc_disk_radius:
-        name: Min CC Disk Radius
-        type: int
-        default: 5
-        display_condition:
-          parameter: method
-          value: cross_correlate
-      max_cc_disk_radius:
-        name: Max CC Disk Radius
-        type: int
-        default: 15
-        display_condition:
-            parameter: method
-            value: cross_correlate
-      signal_slice:
-        name: Signal Slice
-        type: RectangleSelector
-        position: centered
-        size: .2
-      make_flat_field:
-        name: Make Flat Field
-        type: bool
-        default: False
   Virtual Imaging:
-    description: Creates a virtual image from the 4D-STEM data.
+    description: Creates virtual images from the 4D-STEM data. Add multiple with +.
     icon: drawing/toolbars/icons/virtual_image_color.svg
-    function: spyde.actions.pyxem.virtual_imaging
+    function: spyde.actions.virtual_image.virtual_imaging
     signal_class: pyxem.signals.Diffraction2D
     exclude_signal_types: [spyde_diffraction_vectors_image]
     plot_dim: [ 2]
     toolbar_side: bottom
     navigation: False
-    toggle: True
     submenu: True
     subfunctions:
       add_virtual_image:
         name: Add Virtual Image
-        description: Adds a virtual image from the 4D-STEM data.
-        icon: drawing/toolbars/icons/zoom.svg
-        function: spyde.actions.pyxem.add_virtual_image
+        description: Add a virtual image with a colour-cycled detector ROI.
+        icon: drawing/toolbars/icons/virtual_imaging.svg
+        function: spyde.actions.virtual_image.add_virtual_image
+        parameters:
+          type:
+            name: Detector Type
+            type: enum
+            default: disk
+            options: [annular, disk, rectangle]
+          calculation:
+            name: Calculation
+            type: enum
+            default: mean
+            options: [mean, sum]
   Line Profile:
     description: Extract a 1D line profile from the current 2D plot.
     icon: drawing/toolbars/icons/line_profile.svg
-    function: spyde.actions.line_profile.line_profile_action
+    function: spyde.actions.line_profile_action.LineProfileAction
     plot_dim: [2]
     toolbar_side: bottom
-    toggle: True
-    submenu: True
-    subfunctions:
-      add_line_profile:
-        name: Add Line Profile
-        description: Add a line profile ROI to the plot.
-        icon: drawing/toolbars/icons/line_profile.svg
-        function: spyde.actions.line_profile.add_line_profile
   Orientation Mapping:
     description: Run template matching orientation mapping on a 4D-STEM dataset.
     icon: drawing/toolbars/icons/orientation_mapping.svg
-    function: spyde.actions.pyxem.orientation_mapping
+    function: spyde.actions.orientation_action.orientation_mapping
     signal_class: pyxem.signals.Diffraction2D
     exclude_signal_types: [spyde_diffraction_vectors_image]
     plot_dim: [2]
     toolbar_side: bottom
     navigation: False
-    toggle: True
+    parameters:
+      cif_path:
+        name: Crystal (.cif)
+        type: file
+        extensions: [.cif]
+        default: ""
+        tab: Load
+      accelerating_voltage:
+        name: Voltage (kV)
+        type: float
+        default: 200.0
+        tab: Load
+      resolution:
+        name: Angle res (°)
+        type: float
+        default: 1.0
+        min: 0.1
+        max: 10.0
+        step: 0.1
+        tab: Library
+      minimum_intensity:
+        name: Min intensity
+        type: float
+        default: 0.0001
+        min: 0.0
+        max: 0.05
+        step: 0.0005
+        tab: Library
+      gamma:
+        name: Gamma
+        type: float
+        default: 0.5
+        min: 0.1
+        max: 1.5
+        step: 0.05
+        tab: Refine
+      normalize_templates:
+        name: Normalize templates
+        type: bool
+        default: False
+        tab: Refine
+      n_best:
+        name: N Best
+        type: int
+        default: 5
+        min: 1
+        max: 20
+        tab: Run
   Find Diffraction Vectors:
     description: Find diffraction vectors using window-normalized cross-correlation with a flat disk kernel.
     icon: drawing/toolbars/icons/peak_finding.svg
-    function: spyde.actions.find_vectors.find_diffraction_vectors
+    function: spyde.actions.find_vectors_action.find_diffraction_vectors
     signal_class: pyxem.signals.Diffraction2D
     exclude_signal_types: [spyde_diffraction_vectors_image]
     plot_dim: [2]
     toolbar_side: bottom
     navigation: False
-    toggle: True
+    parameters:
+      sigma:
+        name: Nav Blur σ
+        type: float
+        default: 1.0
+        min: 0.0
+        max: 5.0
+        step: 0.1
+      kernel_radius:
+        name: Disk Radius
+        type: int
+        default: 5
+        min: 1
+        max: 30
+      threshold:
+        name: Threshold
+        type: float
+        default: 0.5
+        min: 0.0
+        max: 1.0
+        step: 0.05
+      min_distance:
+        name: Min Distance
+        type: int
+        default: 5
+        min: 1
+        max: 30
+      subpixel:
+        name: Subpixel
+        type: bool
+        default: True
   Vector Virtual Imaging:
     description: Build virtual images from diffraction vectors (intensity-weighted, kernel-radius disks). Add multiple with +.
     icon: drawing/toolbars/icons/virtual_image_color.svg
@@ -180,10 +219,21 @@ functions:
         description: Add a vector virtual image with a circular ROI.
         icon: drawing/toolbars/icons/virtual_imaging.svg
         function: spyde.actions.vector_virtual_imaging.add_vector_virtual_image
+        parameters:
+          type:
+            name: Detector shape
+            type: enum
+            default: disk
+            options: [disk, annular, rectangle]
+          calculation:
+            name: Weighting
+            type: enum
+            default: intensity
+            options: [intensity, count]
   Vector Orientation Mapping:
     description: Orientation + strain mapping from diffraction vectors (sparse point-set fit). Live refine under the crosshair.
     icon: drawing/toolbars/icons/orientation_mapping.svg
-    function: spyde.actions.vector_orientation_action.vector_orientation_mapping
+    function: spyde.actions.vector_orientation_om.vector_orientation_mapping
     signal_types: [spyde_diffraction_vectors_image]
     plot_dim: [2]
     toolbar_side: bottom

@@ -99,13 +99,28 @@ def update_from_navigation_selection(
         Whether to compute the result immediately (for Dask arrays). Always False for using
         dask distributed futures.
     cache_in_shared_memory : bool
-        Whether to cache the result in shared memory. This bypasses TCP transfer
-        with distributed futures but requires that the child process can access the
-        shared memory (e.g., same machine). Default is False.
+        Whether to write the result into a per-plot shared-memory buffer instead
+        of transferring it over TCP (default True — the optimized distributed →
+        shared-memory → plot pipeline, ported from the Qt app). The reused buffer
+        is race-safe because ``_on_plot_ready`` only applies the result of the
+        LATEST future (``plot.current_data is future``) and stale futures are
+        cancelled before the next request — superseded/torn reads are dropped.
     """
     # get the data from the signal tree based on the current indices
 
     current_signal = child.plot_state.current_signal
+
+    # anyplotlib displays the navigator image un-transposed (imshow convention:
+    # data axis 0 = rows = y = iy, axis 1 = cols = x = ix). The selector reports
+    # widget coords (cx = column, cy = row), i.e. (x, y) order. pyqtgraph used to
+    # display transposed, so the Qt index math indexed data[(cx, cy)] directly and
+    # was correct THERE. With anyplotlib we must swap (x, y) → (y, x) so the
+    # selected DP is data[iy, ix] — otherwise clicking a real-space pixel shows a
+    # transposed/wrong diffraction pattern (and IndexError-then-clamp on a
+    # non-square scan). Only the 2-D spatial nav case is transposed.
+    indices = np.asarray(indices)
+    if indices.ndim >= 1 and indices.shape[-1] == 2:
+        indices = indices[..., ::-1]
 
     if not selector.is_integrating:
         indices = np.mean(indices, axis=0).astype(int)
@@ -154,12 +169,21 @@ def update_from_navigation_selection(
             if cached_arr is not None and hasattr(cached_arr, "cancel_surrounding"):
                 cached_arr.cancel_surrounding()
 
+            # IN-CHUNK vs CROSS-CHUNK. `return_future=False` + `force_compute=False`
+            # makes the cache return a NUMPY array immediately when the chunk is
+            # already cached (an in-chunk move), and only a Future when the chunk
+            # isn't loaded yet (a boundary crossing). This is the key to a live
+            # drag: a cached frame is displayed SYNCHRONOUSLY, so fast in-chunk
+            # moves all paint — instead of every frame being forced through the
+            # async future/worker round-trip and then dropped by the latest-future
+            # staleness guard (which left the plot frozen until the drag stopped).
             current_img = current_signal._get_cache_dask_chunk(
-                indices, get_result=get_result, return_future=True,
+                indices, get_result=False, return_future=False,
             )
-            if cache_in_shared_memory and _SHARED_MEMORY_SUPPORTED:
-                # Pre-create the shm segment in the GUI process before submitting,
-                # so the worker subprocess can open it by name.
+            if isinstance(current_img, Future) and cache_in_shared_memory and _SHARED_MEMORY_SUPPORTED:
+                # CROSS-CHUNK (cache miss): the chunk is loading on a worker. Route
+                # the result through the shared-memory buffer (the optimized path);
+                # the PlotUpdateWorker reads it when the future completes.
                 _ = child.shared_memory  # lazy creation
                 shared_arr_name = f"plot_buffer{id(child)}"
                 # priority=10 puts this ahead of surrounding-block prefetch tasks
@@ -171,11 +195,23 @@ def update_from_navigation_selection(
                 child._pending_shm_future = fut
                 current_img = fut
     else:
-        tuple_inds = tuple(indices[ind] for ind in np.arange(len(indices)))
-        if len(tuple_inds) == 1:
-            current_img = current_signal.data[tuple_inds]
+        # Eager (in-RAM) slice. `indices` is either a single nav point (1-D,
+        # from a crosshair after the mean-reduce above) or a list of nav points
+        # (2-D, from an integrating region). A single point yields one signal
+        # frame directly; multiple points are averaged frame-wise.
+        #
+        # NB: the old `tuple(indices[i] ...)` form conflated "number of nav
+        # coordinates" with "number of points to average", which collapsed a
+        # 2-D-navigation diffraction pattern to 1-D. The Qt app never hit this
+        # because it always loaded lazily (the Future branch above); eager
+        # example datasets do.
+        idx = np.asarray(indices)
+        if idx.ndim <= 1:
+            point = tuple(int(v) for v in np.atleast_1d(idx))
+            current_img = current_signal.data[point]
         else:
-            current_img = np.mean(current_signal.data[tuple_inds], axis=0)
+            sl = tuple(idx[:, k].astype(int) for k in range(idx.shape[1]))
+            current_img = current_signal.data[sl].mean(axis=0)
     return current_img
 
 
@@ -389,6 +425,132 @@ def read_live_buffer(nav_shape: tuple, shm_name: str) -> np.ndarray:
         return arr
     except Exception:
         return np.full(nav_shape, np.nan, dtype=np.float32)
+
+
+def stream_progressive_to_plot(plot, result_array, client, *, name="vi"):
+    """Progressively compute a nav-shaped ``result_array`` and live-update
+    ``plot`` as chunks land — so virtual images / FFTs fill in instead of
+    blocking until the whole compute finishes.
+
+    Mirrors the navigator's progressive compute (``compute_with_live_buffer`` +
+    a poll loop that pushes partial frames). Any prior stream on ``plot`` is
+    stopped first (ROI moves restart the compute). Returns the initial
+    NaN-filled display array so the caller's selector can push a blank frame
+    immediately; the poll loop then streams in the partial results.
+
+    With ``client is None`` the helper falls back to a synchronous one-shot
+    compute (no chunks) — still correct, just not progressive.
+    """
+    import threading
+    import time as _time
+    from psygnal import Signal
+
+    nav_shape = tuple(result_array.shape)
+
+    # Tear down any in-flight stream on this plot before starting a new one.
+    _stop_progressive_stream(plot)
+
+    if client is None:
+        # Synchronous: no chunks land over time, so DON'T start a poll thread —
+        # it races with the selector's own `update_data(blank)` (which runs right
+        # after this returns) and the output ends up clobbered back to the blank
+        # frame (the "virtual image is just black" bug). Compute and return the
+        # real data so the caller's selector pushes it.
+        try:
+            return np.asarray(result_array.compute(), dtype=np.float32)
+        except Exception:
+            return np.zeros(nav_shape, dtype=np.float32)
+
+    shm_name = f"spyde_{name}_{id(plot)}"
+    shm = ensure_live_buffer(nav_shape, shm_name)
+
+    # Blank frame shown immediately while the stream fills in (zeros, not NaN,
+    # so the first push is a clean black frame rather than an all-NaN level calc).
+    initial = np.zeros(nav_shape, dtype=np.float32)
+    stop = threading.Event()
+
+    # Marshal chunk writes off the Dask callback thread via a psygnal relay
+    # (slot runs on the emitting thread; writing shm is GIL-safe).
+    class _ChunkRelay:
+        chunk_ready = Signal(object, object)
+
+    relay = _ChunkRelay()
+
+    def _write_chunk(chunk_result, nav_slices, _shape=nav_shape):
+        try:
+            buf = np.ndarray(_shape, dtype=np.float32, buffer=shm.buf)
+            buf[nav_slices] = np.asarray(chunk_result, dtype=np.float32)
+        except Exception:
+            pass
+
+    relay.chunk_ready.connect(_write_chunk)
+
+    def _on_chunk(chunk_result, nav_slices):
+        relay.chunk_ready.emit(chunk_result, nav_slices)
+
+    future = compute_with_live_buffer(
+        result_array, nav_shape, client, shm_name, on_chunk_done=_on_chunk
+    )
+
+    levels = [None]
+
+    def _poll_loop():
+        while not stop.is_set():
+            try:
+                arr = read_live_buffer(nav_shape, shm_name)
+                finite = arr[np.isfinite(arr)]
+                if finite.size > 0:
+                    lo, hi = float(finite.min()), float(finite.max())
+                    if levels[0] is None:
+                        levels[0] = (lo, hi if hi > lo else lo + 1)
+                    elif hi > levels[0][1]:
+                        levels[0] = (levels[0][0], hi)
+                    plot.set_data(arr, levels=levels[0])
+            except Exception:
+                pass
+            if future.done():
+                break
+            _time.sleep(0.1)
+        # Final push of the completed buffer.
+        try:
+            arr = read_live_buffer(nav_shape, shm_name)
+            if np.isfinite(arr).any():
+                plot.set_data(arr, levels=levels[0])
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_poll_loop, daemon=True, name=f"{name}-poll")
+    t.start()
+
+    plot._progressive_stream = {
+        "future": future, "stop": stop, "shm": shm, "thread": t, "relay": relay,
+    }
+    return initial
+
+
+def _stop_progressive_stream(plot) -> None:
+    """Stop and clean up any progressive stream previously started on ``plot``."""
+    st = getattr(plot, "_progressive_stream", None)
+    if not st:
+        return
+    try:
+        st["stop"].set()
+    except Exception:
+        pass
+    try:
+        fut = st.get("future")
+        if fut is not None and hasattr(fut, "cancel"):
+            fut.cancel()
+    except Exception:
+        pass
+    try:
+        shm = st.get("shm")
+        if shm is not None:
+            shm.close()
+            shm.unlink()
+    except Exception:
+        pass
+    plot._progressive_stream = None
 
 
 def compute_line_profile_kernel(

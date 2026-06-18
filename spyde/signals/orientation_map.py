@@ -169,6 +169,43 @@ class SpyDEOrientationMap:
             rgb[mask] = np.clip(colors * 255.0, 0, 255).astype(np.uint8)
         return rgb
 
+    def ipf_sphere_points(self, direction: str = "z", max_points: int = 20000):
+        """Per-position reduced crystal directions ON THE UNIT SPHERE + their IPF
+        colour, for the 3-D IPF explorer (anyplotlib ``scatter3d``).
+
+        Returns ``(xyz (M, 3) float32, rgb (M, 3) uint8)`` for the best match at
+        every position: ``xyz`` is ``(rotation · direction)`` folded into the
+        point group's fundamental sector (the same point the 2-D IPF shows, but
+        kept in 3-D), ``rgb`` is the matching IPF colour. Uniformly subsampled to
+        ``max_points`` so a large scan stays interactive.
+        """
+        from orix.plot import IPFColorKeyTSL
+        from orix.quaternion import Orientation, Rotation
+
+        best_phase = self.phase_idx[..., 0].reshape(-1)
+        best_q = self.quats[..., 0, :].reshape(-1, 4)
+        d = _direction_vector(direction)
+        xyz = np.full((best_q.shape[0], 3), np.nan, dtype=np.float32)
+        rgb = np.zeros((best_q.shape[0], 3), dtype=np.uint8)
+        for i in range(self.n_phases):
+            mask = best_phase == i
+            if not mask.any():
+                continue
+            pg = self.orix_phase(i).point_group
+            rot = Rotation(best_q[mask])
+            v = (rot * d).in_fundamental_sector(pg)
+            xyz[mask] = np.asarray(v.data, dtype=np.float32)
+            key = IPFColorKeyTSL(pg.laue, direction=d)
+            colors = key.orientation2color(Orientation(rot, symmetry=pg))
+            rgb[mask] = np.clip(colors * 255.0, 0, 255).astype(np.uint8)
+
+        valid = np.isfinite(xyz).all(axis=1)
+        xyz, rgb = xyz[valid], rgb[valid]
+        if len(xyz) > max_points:
+            stride = int(np.ceil(len(xyz) / max_points))
+            xyz, rgb = xyz[::stride], rgb[::stride]
+        return xyz, rgb
+
     def correlation_map(self) -> np.ndarray:
         """(ny, nx) float32 best-match correlation."""
         return np.ascontiguousarray(self.corr[..., 0])

@@ -1,49 +1,54 @@
-import time
+"""
+base_selector.py — BaseSelector using anyplotlib widgets.
 
-from pyqtgraph import LinearRegionItem, RectROI, LineROI, ROI
+Replaces the pyqtgraph ROI-based selectors.  Each selector wraps an
+anyplotlib interactive widget and uses its callback events to drive
+slice-and-update of child plots.
+"""
+from __future__ import annotations
 
-from PySide6 import QtCore, QtWidgets, QtGui
+import threading
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Union
+
 import numpy as np
-
-import pyqtgraph as pg
-import logging
-
-from typing import TYPE_CHECKING, Union, List
 
 from spyde.drawing.selectors.utils import broadcast_rows_cartesian
 
+if TYPE_CHECKING:
+    from spyde.drawing.plots.plot import Plot
+    from spyde.drawing.plots.plot_window import PlotWindow
 
-Logger = logging.getLogger(__name__)
+
+class _StubWidget:
+    """Shim so sidebar code that calls widget.hide() doesn't raise."""
+    def hide(self) -> None: pass
+    def show(self) -> None: pass
+    def setVisible(self, v: bool) -> None: pass
+
 
 class BaseSelector:
     """
-    Base class for selectors.
+    Base class for anyplotlib-backed selectors.
 
     Parameters
     ----------
-    parent : Plot
-        The parent plot item to which the selector will be added.
-    child : Plot | None
-        An optional child plot item to which the selector will send updates when the selection
-        moves.
-    update_function : callable | None
-        An optional function to call when the selection. This is a function that takes a BaseSelector instance
-        (self) and the selected indices as arguments and then performs the update on the child plot.
-        If the function returns a da.Future, the update timer will start and wait for the future to complete
-        before updating the child plot.
-    width : int
-        The width of the selector lines.
-    color : str
-        The color of the selector lines.
-    hover_color : str
-        The color of the selector lines when hovered.
+    parent : Plot | PlotWindow
+        The data-source plot.
+    children : Plot | list[Plot]
+        Child plots that receive sliced data when the selector moves.
+    update_function : callable | list[callable]
+        Called as ``fn(selector, child_plot, indices)`` → new data for child.
+    live_delay : int
+        Debounce delay in milliseconds before dispatching the update.
+    multi_selector : bool
+        If True, chain-compose with upstream selectors.
     """
 
     def __init__(
         self,
         parent: Union["PlotWindow", "Plot"],
         children: Union["Plot", List["Plot"]],
-        update_function: Union[callable, List[callable]],
+        update_function: Union[Callable, List[Callable]],
         width: int = 3,
         color: str = "green",
         hover_color: str = "red",
@@ -51,307 +56,195 @@ class BaseSelector:
         resize_on_move: bool = False,
         multi_selector: bool = False,
     ):
+        self.parent = parent
+        self.color = color
+        self.hover_color = hover_color
+        # Used as a THROTTLE interval (see update_data). Enforce a sane minimum so
+        # a continuous drag submits at most ~25 computes/sec instead of one per
+        # mouse event (~60/sec) — the latter floods Dask with superseded futures
+        # and the navigator stutters / new chunks don't paint while loading.
+        self.live_delay = max(float(live_delay), 40.0) / 1000.0  # ms → s
+        self.multi_selector = multi_selector
 
-        # the parent plot (data source) and the child plot (where the data is plotted)
-        # a selector can have multiple children.
-        self.parent = parent  # type: Union[PlotWindow, Plot]
         if not isinstance(children, list):
-            self.children = {children: update_function}  # type: dict[Plot, callable]
-            self.active_children = [
-                children,
-            ]  # type: list[Plot]
-            children.plot_window.parent_selector = self
-            # children.parent_selector = self
-
+            self.children: Dict["Plot", Callable] = {children: update_function}
+            self.active_children: List["Plot"] = [children]
+            if hasattr(children, "plot_window") and children.plot_window is not None:
+                children.plot_window.parent_selector = self
         else:
-            self.children = {}  # type: dict[Plot, callable]
-            for child, function in zip(children, update_function):
-                self.children[child] = function
-                child.parent_selector = self
+            self.children = {}
+            self.active_children = []
+            for child, fn in zip(children, update_function):
+                self.children[child] = fn
+                self.active_children.append(child)
+                if hasattr(child, "parent_selector"):
+                    child.parent_selector = self
 
-        # Create a pen for the selector
-        self.roi_pen = pg.mkPen(color=color, width=width)  # type: pg.mkPen
-        self.handlePen = pg.mkPen(color=color, width=width)  # type: pg.mkPen
-        self.hoverPen = pg.mkPen(color=hover_color, width=width)  # type: pg.mkPen
-        self.handleHoverPen = pg.mkPen(color=hover_color, width=width)  # type: pg.mkPen
-
-        # The widget which is added to the sidebar to control things like updating, if the selector is
-        # live or if the selector should integrate.
-        self.widget = QtWidgets.QWidget()  # type: QtWidgets.QWidget
-        self.layout = QtWidgets.QHBoxLayout(self.widget)  # type: QtWidgets.QHBoxLayout
+        # No Qt widget — stub so sidebar compatibility shims don't break
+        self.widget = _StubWidget()
         self.is_integrating = False
+        self.current_indices: np.ndarray | None = None
+        self.linked_selectors: list = []
 
-        # The current selection
-        self.current_indices = None
+        # Hooks fired (with the new indices) whenever the selection changes —
+        # used by feature overlays (e.g. Find Vectors / Orientation markers) to
+        # redraw on the signal plot as the navigator moves. Each is called
+        # ``hook(indices)``; exceptions are swallowed so one bad overlay can't
+        # break navigation.
+        self.index_hooks: list = []
 
-        self.update_timer = QtCore.QTimer()  # type: QtCore.QTimer
-        self.update_timer.setInterval(
-            live_delay
-        )  # To make things smoother we delay how fast we update the plots
-        self.update_timer.setSingleShot(True)
-        self.update_timer.timeout.connect(self.delayed_update_data)
+        # anyplotlib widget (set by subclasses)
+        self.roi = None   # Alias for the anyplotlib Widget
+        self._widget = None  # type: anyplotlib Widget
+
+        # Debounce: timer replaced by threading.Timer
+        self._pending_timer: threading.Timer | None = None
         self.update_function = update_function
         self._last_size_sig = None
-        self.roi = None  # type: pg.ROI | None
-        self.linked_selectors = []  # type: List[ROI]
-        self.multi_selector = multi_selector
-        self.timer = None
 
-    def apply_transform_to_selector(self, transform: QtGui.QTransform):
-        """
-        Apply a transformation to the selector.
-        """
-        if self.roi is not None:
-            self.roi.resetTransform()
-            self.roi.setTransform(transform)
+    # ── Indexing ──────────────────────────────────────────────────────────────
 
-    def _get_selected_indices_from_upstream(self):
-        """
-        Get the selected indices from upstream selectors.
-        """
-        indices_list = []
-        for parent_selector in self.upstream_selectors():
-            indices = parent_selector._get_selected_indices_and_clip()
-            indices_list.append(indices)
-        return indices_list
+    def _get_selected_indices(self) -> np.ndarray:
+        raise NotImplementedError("Subclasses must implement _get_selected_indices.")
 
-
-    def get_selected_indices(self):
-        """Get the currently selected indices from the selector."""
-        if self.multi_selector:
-            upstream_indices = self._get_selected_indices_from_upstream()
-            current_indices = self._get_selected_indices_and_clip()
-            combo = upstream_indices + [current_indices]
-            return broadcast_rows_cartesian(*combo)
-        else:
-            return self._get_selected_indices_and_clip()
-
-    @property
-    def current_plot(self) -> Union["Plot", None]:
-        """
-        Get the current plot.
-        """
-        from spyde.drawing.plots.plot_window import PlotWindow
-        from spyde.drawing.plots.plot import Plot
-        if isinstance(self.parent, Plot):
-            return self.parent
-        elif isinstance(self.parent, PlotWindow):
-            return self.parent.current_plot_item
-        else:
-            return None
-
-    def _get_selected_indices_and_clip(self):
-        """
-        Get the selected indices and clip them to the data shape.
-        """
+    def _get_selected_indices_and_clip(self) -> np.ndarray:
         indices = self._get_selected_indices()
-        axes_manager = self.current_plot.plot_state.current_signal.axes_manager
-        # Selectors on navigator plots operate in navigation space; selectors on
-        # pure signal plots (no navigation axes) operate in signal space.
+        plot = self.current_plot
+        if plot is None or plot.plot_state is None:
+            return indices
+        axes_manager = plot.plot_state.current_signal.axes_manager
         if axes_manager.navigation_dimension > 0:
             clip_shape = axes_manager.navigation_shape
         else:
             clip_shape = axes_manager.signal_shape
-        clipped_indices = np.clip(indices, 0, np.array(clip_shape) - 1)
-        return clipped_indices
+        # Region selectors (circle/annular) encode geometry rows whose column
+        # count doesn't match the nav/signal dimensionality — clipping is
+        # meaningless there, so only clip true index arrays.
+        idx = np.asarray(indices)
+        if idx.ndim == 2 and idx.shape[-1] == len(clip_shape):
+            return np.clip(idx, 0, np.array(clip_shape) - 1)
+        return idx
 
-    def _get_selected_indices(self):
-        """
-        Placeholder method to be implemented in subclasses.
-        """
-        raise NotImplementedError(
-            "Subclasses must implement _get_selected_indices method."
-        )
+    def get_selected_indices(self) -> np.ndarray:
+        if self.multi_selector:
+            upstream = [s._get_selected_indices_and_clip()
+                        for s in self.upstream_selectors()]
+            current = self._get_selected_indices_and_clip()
+            return broadcast_rows_cartesian(*(upstream + [current]))
+        return self._get_selected_indices_and_clip()
 
-    def upstream_selectors(self):
-        """
-        Get a list of upstream selectors.
-        """
+    @property
+    def current_plot(self) -> "Plot | None":
+        from spyde.drawing.plots.plot_window import PlotWindow
+        from spyde.drawing.plots.plot import Plot
+        if isinstance(self.parent, Plot):
+            return self.parent
+        if isinstance(self.parent, PlotWindow):
+            return self.parent.current_plot_item
+        return None
+
+    def upstream_selectors(self) -> list:
         selectors = []
         current = self.parent
-        while (
-            hasattr(current, "parent_selector") and current.parent_selector is not None
-        ):
+        while hasattr(current, "parent_selector") and current.parent_selector is not None:
             selectors.append(current.parent_selector)
             current = current.parent_selector.parent
         return selectors
 
-    def update_data(self, ev=None):
-        """Start the timer to delay the update."""
-        if ev is None:
-            self.delayed_update_data()
-        else:
-            self.update_timer.start()
+    # ── Update dispatch ───────────────────────────────────────────────────────
 
-    def delayed_update_data(self, force: bool = False, update_contrast: bool = False):
-        """Perform the actual update if the indices have not changed."""
-        indices = self.get_selected_indices()
-        if not np.array_equal(indices, self.current_indices) or force:
-            for child in self.children:
-                new_data = self.children[child](self, child, indices)
-                child.update_data(new_data)
-                if update_contrast:
-                    child.needs_auto_level = True
-                # update all plots downstream of the child
-                if (
-                    child.multiplot_manager is not None
-                    and child.plot_window
-                    in child.multiplot_manager.navigation_selectors
-                ):
-                    for child_selector in child.multiplot_manager.navigation_selectors[
-                        child.plot_window
-                    ]:
-                        child_selector.delayed_update_data()
-            self.current_indices = indices
+    def update_data(self, ev=None) -> None:
+        """Trigger a THROTTLED update.
 
-    # Helper: compute a compact signature of the current selector size
-    def _size_signature(self):
-        sel = getattr(self, "selector", None)
-        if isinstance(sel, LinearRegionItem):
-            region = sel.getRegion()
-            width = float(abs(region[1] - region[0]))
-            return (round(width, 6),)
-        if isinstance(sel, RectROI):
-            s = sel.size()
-            return (int(round(s.x())), int(round(s.y())))
-        if isinstance(sel, LineROI):
-            # approximate by length of the line
-            p1, p2 = sel.pos(), sel.pos() + sel.size()
-            dx, dy = float(p2.x() - p1.x()), float(p2.y() - p1.y())
-            length = (dx * dx + dy * dy) ** 0.5
-            return (round(length, 6),)
-        return None
+        Coalesce rapid drag events: if a fire is already scheduled in this window,
+        do nothing (the timer reads the LATEST widget position when it fires). A
+        plain debounce (cancel + restart on every move) with a tiny delay instead
+        fires once per mouse event, swamping Dask with a compute per event — so a
+        lazy navigator drag clogs and the new chunk paints poorly. Throttling
+        bounds it to ~1 compute / live_delay while still tracking the cursor.
+        """
+        if self._pending_timer is not None:
+            return
+        self._pending_timer = threading.Timer(
+            self.live_delay, self._throttled_fire
+        )
+        self._pending_timer.daemon = True
+        self._pending_timer.start()
 
-    # Helper: autorange a child plot based on its dimension
-    def _autorange_child_plot(self, child_plot):
+    def _throttled_fire(self) -> None:
+        self._pending_timer = None
+        self.delayed_update_data()
+
+    def delayed_update_data(self, force: bool = False, update_contrast: bool = False) -> None:
+        """Perform the actual data update if indices changed."""
+        self._pending_timer = None
         try:
-            vb = child_plot.getViewBox()
+            indices = self.get_selected_indices()
         except Exception:
             return
-        dim = getattr(getattr(child_plot, "plot_state", None), "dimensions", None)
-        if dim == 1:
-            vb.setAspectLocked(False)
-        vb.enableAutoRange(x=True, y=True)
-        vb.autoRange()
+        if not np.array_equal(indices, self.current_indices) or force:
+            for child, fn in self.children.items():
+                try:
+                    new_data = fn(self, child, indices)
+                    child.update_data(new_data)
+                    if update_contrast:
+                        child.needs_auto_level = True
+                    if (child.multiplot_manager is not None
+                            and child.plot_window in child.multiplot_manager.navigation_selectors):
+                        for child_sel in child.multiplot_manager.navigation_selectors[child.plot_window]:
+                            child_sel.delayed_update_data()
+                except Exception as e:
+                    import logging
+                    logging.getLogger(__name__).debug("selector update failed: %s", e)
+            for hook in self.index_hooks:
+                try:
+                    hook(indices)
+                except Exception as e:
+                    import logging
+                    logging.getLogger(__name__).debug("index hook failed: %s", e)
+            self.current_indices = indices
 
-    # Called when the user finishes a region change; only auto-range on size changes
-    def _on_region_change_finished(self):
-        new_sig = self._size_signature()
-        size_changed = new_sig != self._last_size_sig
-        if size_changed or self._last_size_sig is None:
-            for child in self.children.keys():
-                self._autorange_child_plot(child)
-            self._last_size_sig = new_sig
+    # ── Visibility ─────────────────────────────────────────────────────────────
 
-    def add_linked_roi(self, plot: "Plot"):
-        """
-        Add the selector to a new plot.
-        """
+    def add_linked_roi(self, plot: "Plot") -> None:
         pass
 
-    def move_selector(self, key: QtCore.Qt.Key):
-        """
-        Move the selector based on the key pressed.
-        """
-        pass
+    def hide(self) -> None:
+        if self._widget is not None:
+            try:
+                self._widget.hide()
+            except Exception:
+                pass
 
-    def close(self):
-        """
-        Clean up the selector.
-        """
+    def show(self) -> None:
+        if self._widget is not None:
+            try:
+                self._widget.show()
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        if self._pending_timer is not None:
+            self._pending_timer.cancel()
         self.hide()
-        for linked in self.linked_selectors:
-            for plot in self.parent.plots:
-                if linked in plot.items:
-                    plot.removeItem(linked)
-
-    def hide(self):
-        """
-        Hide the selector.
-        """
-        for linked in self.linked_selectors:
-            linked.hide()
-
-        if self.roi is not None:
-            self.roi.hide()
+        # A bare widget.hide() only emits a targeted event that a later full
+        # repaint overwrites, so the ROI lingers. Re-push the panel so the
+        # hidden selector actually disappears (e.g. when its output window is
+        # closed). Matches set_integrating's _force_overlay_repaint.
+        try:
+            get = getattr(self, "_get_plot2d", None) or getattr(self, "_get_plot1d", None)
+            if get is not None:
+                panel = get()
+                if panel is not None:
+                    panel._push()
+        except Exception:
+            pass
 
 
 class IntegratingSelectorMixin:
-    def __init__(self, *args, **kwargs):
-        self.layout = QtWidgets.QHBoxLayout()
-        self.widget = QtWidgets.QWidget()
+    """Mixin that provides integrate-over-region behaviour."""
+    is_integrating: bool = False
 
-        # Shared theme: checked = orange accent (active/armed) with
-        # hover/pressed feedback, painted with antialiased corners.
-        from spyde.qt.style import make_button
-        self.integrate_button = make_button("Integrate")
-        self.integrate_button.setCheckable(True)
-        self.live_button = make_button("Live")
-        self.live_button.setCheckable(True)
-        self.live_button.setChecked(True)
-        self.live_button.toggled.connect(self.on_live_toggled)
-        self.layout.addWidget(self.live_button)
-
-        self.integrate_button.setChecked(False)
-        self.integrate_button.update()
-        self.integrate_button.toggled.connect(self.on_integrate_toggled)
-        self.integrate_button.pressed.connect(self.on_integrate_pressed)
-        self.layout.addWidget(self.integrate_button)
-        self.widget.setLayout(self.layout)
-        self.size_limits = (1, 15, 1, 15)
-        self.selector = None # type: BaseSelector | None
-
-    def on_integrate_toggled(self, checked):
-        print("Integrate Toggled")
-        print(self.is_live)
-        if self.is_live:
-            self.is_integrating = checked
-            self.selector.delayed_update_data(force=True, update_contrast=True)
-
-    def on_integrate_pressed(self):
-        if not self.is_live:
-            # fire off the integration
-            print("Computing!")
-            self.selector.delayed_update_data(force=True, update_contrast=True)
-
-    @property
-    def is_live(self):
-        return self.live_button.isChecked()
-
-    @property
-    def is_integrating(self):
-        return self.integrate_button.isChecked()
-
-    @is_integrating.setter
-    def is_integrating(self, value: bool):
-        self.integrate_button.setChecked(value)
-
-
-    def on_live_toggled(self, checked):
-        if checked:
-            self.integrate_button.setText("Integrate")
-            self.integrate_button.setCheckable(True)
-            self.integrate_button.setChecked(self.is_integrating)
-            # TODO: Need to set selection to some default small region for live mode
-            self.size_limits = (1, 15, 1, 15)
-            # update the plot
-            self.selector.delayed_update_data(force=True, update_contrast=True)
-
-        else:
-            self.integrate_button.setText("Compute")
-            self.is_integrating = True
-            self.integrate_button.setCheckable(False)
-            # self.size_limits = (1, self.limits[1], 1, self.limits[3])
-            # don't need to update the plot here.
-
-    def update_data(self, ev=None):
-        """
-        Start the timer to delay the update.
-        """
-        if self.is_live:
-            if ev is None:
-                self.selector.delayed_update_data()
-            else:
-                Logger.log(level=logging.INFO, msg="Restarting Timer")
-                self.update_timer.start()
-
+    def set_integrating(self, enabled: bool) -> None:
+        self.is_integrating = enabled
+        self.delayed_update_data(force=True)
