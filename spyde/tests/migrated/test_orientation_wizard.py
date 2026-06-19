@@ -80,13 +80,16 @@ class TestOrientationWizard:
             assert _wait(lambda: overlay.scale_override is not None)
 
             # ── Compute Map (reuses the built library) ───────────────────────
+            # The IPF window now opens BLANK up front (progressive live fill-in)
+            # and the orientation map is attached when the compute finishes.
             before = len(session.signal_trees)
             om_run(session, src, {"n_best": 3, "gamma": 0.5,
                                   "normalize_templates": False})
             assert _wait(lambda: len(session.signal_trees) == before + 1,
                          timeout=60), "IPF window never opened"
             otree = session.signal_trees[-1]
-            assert getattr(otree, "orientation_map", None) is not None
+            assert _wait(lambda: getattr(otree, "orientation_map", None) is not None,
+                         timeout=60), "orientation map never attached"
         finally:
             session.shutdown()
 

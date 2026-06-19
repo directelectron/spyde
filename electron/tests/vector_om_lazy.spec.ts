@@ -59,7 +59,12 @@ test.beforeAll(async () => {
     () => document.querySelectorAll('[data-testid="subwindow"]').length >= 4,
     { timeout: 60_000 },
   )
-  await page.waitForTimeout(2500)
+  // Find Vectors runs on a background thread AFTER the windows open — wait for it
+  // to finish attaching `diffraction_vectors` (else Generate Library races it and
+  // errors "run Find Diffraction Vectors first").
+  await expect(page.getByTestId('status-text'))
+    .toContainText('Found', { timeout: 60_000 })
+  await page.waitForTimeout(1500)
 })
 
 test.afterAll(async () => { await app?.close() })
@@ -80,8 +85,10 @@ test('Vector Orientation Mapping: Generate → Compute opens IPF + strain window
   // 2 Library → Generate (real diffsims library).
   await page.getByTestId('vom-tab-Library').click()
   await page.getByTestId('vom-generate').click()
+  // "library ready" is transient — on synthetic data the field fit completes
+  // immediately and advances the status to "live IPF ready". Accept either.
   await expect(page.getByTestId('status-text'))
-    .toContainText('library ready', { timeout: 60_000 })
+    .toContainText(/library ready|live IPF ready/, { timeout: 60_000 })
 
   // Generating the library activates the LIVE refine overlay: the measured
   // vectors (red) + the fitted template (green) appear on the vectors DP.
@@ -90,22 +97,49 @@ test('Vector Orientation Mapping: Generate → Compute opens IPF + strain window
   }).toBeGreaterThan(0)
   expect(await colorPixels('red')).toBeGreaterThan(0)
 
-  // 3 Run → Compute Maps → IPF-Z + εxx/εyy/εxy = 4 new windows.
+  // Generate also fits the WHOLE field on the GPU and opens the live IPF
+  // heatmap (the orientation map appears while you refine — the "super nice" bit).
+  await expect(
+    page.getByTestId('subwindow').filter({ hasText: 'Orientation' }).first(),
+  ).toBeVisible({ timeout: 150_000 })
+
+  // 3 Refine → the live single-pattern fit streams a strain readout to the
+  // Refine tab (Qt parity), and the strain-cap slider re-fits live.
+  await page.getByTestId('vom-tab-Refine').click()
+  await expect(page.getByTestId('vom-strain-readout'))
+    .toContainText('εxx', { timeout: 30_000 })
+
+  // 4 Run → reuses the field, adds ONE unified Strain window (IPF already shown).
   const before = await page.getByTestId('subwindow').count()
   await page.getByTestId('vom-tab-Run').click()
   await page.getByTestId('vom-compute').click()
   await expect.poll(() => page.getByTestId('subwindow').count(), {
-    timeout: 120_000, message: 'orientation/strain windows never opened',
-  }).toBeGreaterThanOrEqual(before + 4)
-  await expect(
-    page.getByTestId('subwindow').filter({ hasText: 'Orientation' }).first(),
-  ).toBeVisible({ timeout: 10_000 })
-  await expect(
-    page.getByTestId('subwindow').filter({ hasText: 'εxx' }).first(),
-  ).toBeVisible({ timeout: 10_000 })
+    timeout: 120_000, message: 'strain window never opened',
+  }).toBeGreaterThanOrEqual(before + 1)
 
-  // The IPF orientation window has the 2D/3D explorer toggle.
-  const toggle = page.getByTestId(/^ipf-view-toggle-/).first()
-  await expect(toggle).toBeVisible({ timeout: 15_000 })
-  await page.getByTestId(/^ipf-view-3d-/).first().click()
+  // The Strain window holds the unified chip strip: εxx / εyy / εxy as views of
+  // one window. εxx is selected by default; ⌘-click εyy asks the backend to
+  // rebuild ONE figure with the two views as side-by-side anyplotlib axes.
+  await expect(page.getByTestId(/^view-chip-εxx-/).first()).toBeVisible({ timeout: 15_000 })
+  await expect(page.getByTestId(/^view-chip-εyy-/).first()).toBeVisible()
+  await expect(page.getByTestId(/^view-chip-εxy-/).first()).toBeVisible()
+  const strainWin = page.getByTestId('subwindow')
+    .filter({ has: page.getByTestId(/^view-chip-εxx-/) }).first()
+  await page.getByTestId(/^view-chip-εyy-/).first().click({ modifiers: ['Meta'] })
+  // The combined side-by-side figure (title "εxx / εyy") arrives and is shown —
+  // a single iframe with two axes, not two iframes.
+  await expect(strainWin.locator('iframe[title="εxx / εyy"]')).toBeVisible({ timeout: 30_000 })
+  await expect.poll(() =>
+    strainWin.locator('iframe:visible').count(), { timeout: 5_000 },
+  ).toBe(1)
+  await page.waitForTimeout(800)   // let the two anyplotlib axes paint
+  await strainWin.screenshot({ path: join(__dirname, '..', 'vom_combined_strain.png') })
+
+  // The IPF orientation (vector-OM) window also carries the 2D/3D explorer
+  // toggle + X/Y/Z (the actual 3-D switch is exercised in orientation_lazy.spec;
+  // here the result windows cascade so the toggle can be covered — assert it's
+  // wired, i.e. present on the vector-OM IPF window).
+  const ipfWin = page.getByTestId('subwindow').filter({ hasText: 'Orientation' }).first()
+  await expect(ipfWin.getByTestId(/^ipf-view-toggle-/)).toBeVisible({ timeout: 15_000 })
+  await expect(ipfWin.getByTestId(/^ipf-view-3d-/)).toBeVisible()
 })

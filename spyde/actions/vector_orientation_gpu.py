@@ -33,6 +33,13 @@ from spyde.actions.vector_orientation import (
     DEFAULTS, TemplateLibrary, VectorOrientationResult,
 )
 
+import warnings as _warnings
+# torch's MPS irfft reuses an internal out-tensor and emits a benign deprecation
+# UserWarning ("An output with one or more elements was resized…") — the result
+# is correct; silence it so it doesn't spam the console on every coarse seed.
+_warnings.filterwarnings(
+    "ignore", message=".*output with one or more elements was resized.*")
+
 
 def select_device():
     """Best available torch device: CUDA (NVIDIA) → MPS (Apple Silicon) → CPU.

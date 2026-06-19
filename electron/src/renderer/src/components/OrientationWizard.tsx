@@ -10,6 +10,8 @@
  */
 import React from 'react'
 import { WizardShell, TabRow, Field, NumInput, Slider, Check, S } from './WizardShell'
+import { useCifRecents, RecentCifs } from './CifRecents'
+import { CodPicker } from './CodPicker'
 
 const TABS = ['Load', 'Library', 'Refine', 'Run'] as const
 type Tab = typeof TABS[number]
@@ -21,28 +23,46 @@ interface Props {
   onClose: () => void
 }
 
+// Per-window wizard state kept OUTSIDE the component so the built library isn't
+// "lost" (forcing a ~1 min regenerate) when you step away and the caret unmounts.
+interface OmSaved {
+  tab: Tab; cifs: string[]; voltage: number; resolution: number; minInt: number
+  gamma: number; refineMinInt: number; normalize: boolean; nBest: number; libReady: boolean
+}
+const _omStore = new Map<number, OmSaved>()
+
 export function OrientationWizard({ openUp, windowId, sendAction, onClose }: Props) {
-  const [tab, setTab] = React.useState<Tab>('Load')
-  const [cifs, setCifs] = React.useState<string[]>([])   // multi-phase: one per phase
-  const [voltage, setVoltage] = React.useState(200)
-  const [resolution, setResolution] = React.useState(1.0)
-  const [minInt, setMinInt] = React.useState(0.0001)
-  const [gamma, setGamma] = React.useState(0.5)
-  const [refineMinInt, setRefineMinInt] = React.useState(0)
-  const [normalize, setNormalize] = React.useState(false)
-  const [nBest, setNBest] = React.useState(5)
-  const [libReady, setLibReady] = React.useState(false)
-  const [status, setStatus] = React.useState('Load a .cif crystal to begin.')
+  const saved = _omStore.get(windowId)
+  const [tab, setTab] = React.useState<Tab>(saved?.tab ?? 'Load')
+  const [cifs, setCifs] = React.useState<string[]>(saved?.cifs ?? [])   // multi-phase: one per phase
+  const [voltage, setVoltage] = React.useState(saved?.voltage ?? 200)
+  const [resolution, setResolution] = React.useState(saved?.resolution ?? 1.0)
+  const [minInt, setMinInt] = React.useState(saved?.minInt ?? 0.0001)
+  const [gamma, setGamma] = React.useState(saved?.gamma ?? 1.0)
+  const [refineMinInt, setRefineMinInt] = React.useState(saved?.refineMinInt ?? 0)
+  const [normalize, setNormalize] = React.useState(saved?.normalize ?? false)
+  const [nBest, setNBest] = React.useState(saved?.nBest ?? 5)
+  const [libReady, setLibReady] = React.useState(saved?.libReady ?? false)
+  const [status, setStatus] = React.useState(
+    saved?.libReady ? 'Library ready — move the crosshair to refine, or Compute Map.'
+                    : 'Load a .cif crystal to begin.')
+
+  React.useEffect(() => {
+    _omStore.set(windowId, { tab, cifs, voltage, resolution, minInt, gamma, refineMinInt, normalize, nBest, libReady })
+  }, [windowId, tab, cifs, voltage, resolution, minInt, gamma, refineMinInt, normalize, nBest, libReady])
 
   const refineTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null)
+  const { recents, remember } = useCifRecents()
   const base = (p: string) => p.split(/[/\\]/).pop() || p
 
+  const addCif = (path: string) => {
+    setCifs(c => c.includes(path) ? c : [...c, path])
+    remember(path)
+    setStatus('Crystal added — add more phases or generate the library.')
+  }
   const pickCif = async () => {
     const path = await window.electron.pickFile({ name: 'Crystal (.cif)', extensions: ['cif'] })
-    if (path) {
-      setCifs(c => c.includes(path) ? c : [...c, path])
-      setStatus('Crystal added — add more phases or generate the library.')
-    }
+    if (path) addCif(path)
   }
   const generate = () => {
     if (!cifs.length) { setStatus('Add a .cif first.'); return }
@@ -76,7 +96,12 @@ export function OrientationWizard({ openUp, windowId, sendAction, onClose }: Pro
       {tab === 'Load' && (
         <div style={S.page}>
           <label style={S.lbl}>Crystal phases (.cif)</label>
-          <button data-testid="om-pick-cif" style={S.fileBtn} onClick={pickCif}>＋ Add crystal (.cif)</button>
+          <div style={{ display: 'flex', gap: 6, alignItems: 'stretch' }}>
+            <button data-testid="om-pick-cif" style={{ ...S.fileBtn, flex: 1, alignSelf: 'auto' }}
+              onClick={pickCif}>＋ From file</button>
+            <CodPicker windowId={windowId} sendAction={sendAction} onCif={addCif} />
+          </div>
+          <RecentCifs recents={recents} exclude={cifs} onPick={addCif} />
           <div data-testid="om-cif-list" style={S.cifList}>
             {cifs.length === 0
               ? <span style={S.hint}>No phases yet — add at least one.</span>

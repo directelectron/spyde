@@ -71,9 +71,15 @@ def _make_vectors_tree(session):
 
 
 class TestVectorOrientationOM:
-    def test_generate_then_run(self):
+    def test_generate_then_run(self, monkeypatch):
         from spyde.backend.session import Session
         from spyde.actions.vector_orientation_om import vom_generate_library, vom_run
+        # Force the CPU fit path: this exercises the WIRING (handlers → result →
+        # windows). The batched-torch GPU path is validated separately (subprocess
+        # GPU test + the sped_ag benchmark) — running torch autograd under pytest
+        # is slow (cold JIT) and segfaults on Windows+CUDA.
+        import spyde.actions.vector_orientation_gpu as _gpu
+        monkeypatch.setattr(_gpu, "select_device", lambda: None)
         session = Session(n_workers=1, threads_per_worker=1)
         try:
             vtree = _make_vectors_tree(session)
@@ -90,18 +96,36 @@ class TestVectorOrientationOM:
                 "template library never built"
             assert len(vtree._vom_wizard["lib"].spots_xy) > 0
 
-            # ── Compute Maps → IPF-Z + 3 strain windows ─────────────────────
+            # Generate now ALSO fits the whole field and opens the live IPF
+            # heatmap window (Qt parity — the orientation map appears while you
+            # refine, before Compute Maps).
+            assert _wait(lambda: getattr(vtree, "_vom_field", None) is not None,
+                         timeout=90), "live field fit / IPF heatmap never produced"
+            assert any(getattr(t, "vector_orientation", None) is not None
+                       for t in session.signal_trees), "no IPF heatmap window"
+
+            # ── Compute Maps → reuses the field, adds ONE unified Strain window
+            #    (εxx is its signal plot; εyy / εxy are chip-selectable view
+            #    figures emitted into the same window, not new signal trees) ──
             n_before = len(session.signal_trees)
             vom_run(session, vplot, {"strain_cap": 0.05, "smooth": False})
-            # 4 new trees: IPF-Z + εxx + εyy + εxy.
-            assert _wait(lambda: len(session.signal_trees) >= n_before + 4,
-                         timeout=90), "orientation/strain windows never opened"
+            assert _wait(lambda: len(session.signal_trees) >= n_before + 1,
+                         timeout=90), "strain window never opened"
             ipf_tree = next((t for t in session.signal_trees
                              if getattr(t, "vector_orientation", None) is not None), None)
             assert ipf_tree is not None
             res = ipf_tree.vector_orientation
             assert res.nav_shape == tuple(vtree.diffraction_vectors.nav_shape)
             assert res.strain.shape[-1] == 3
+
+            # The unified Strain window tags its signal plot as the εxx chip view
+            # (εyy / εxy ride along as extra view figures in the same window).
+            strain_tree = next((t for t in session.signal_trees
+                                if "Strain" in t.root.metadata.get_item(
+                                    "General.title", "")), None)
+            assert strain_tree is not None, "no unified Strain window"
+            sp = next(iter(getattr(strain_tree, "signal_plots", [])), None)
+            assert sp is not None and getattr(sp, "view_label", None) == "εxx"
         finally:
             session.shutdown()
 
@@ -132,6 +156,43 @@ class TestVectorOrientationOM:
                 assert tmpl.shape[1] == 2     # a fitted template was produced
         finally:
             session.shutdown()
+
+    def test_fit_field_prefers_gpu_then_falls_back(self, monkeypatch):
+        """`_fit_field` must dispatch the BATCHED GPU path first (Qt parity — the
+        serial CPU fit is ~30 min on a real 13k-pattern scan) and fall back to CPU
+        only when torch is unavailable or the GPU fit raises."""
+        import spyde.actions.vector_orientation_om as vom
+        import spyde.actions.vector_orientation_gpu as gpu
+        import spyde.actions.vector_orientation as cpu
+
+        class _Vecs:
+            nav_shape = (4, 5)
+        calls = []
+
+        # (1) GPU available + succeeds → CPU never called.
+        monkeypatch.setattr(gpu, "torch_available", lambda: True)
+        monkeypatch.setattr(gpu, "select_device", lambda: type("D", (), {"type": "mps"})())
+        monkeypatch.setattr(gpu, "compute_vector_orientation_gpu",
+                            lambda *a, **k: (calls.append("gpu"), "RESULT")[1])
+        monkeypatch.setattr(cpu, "compute_vector_orientation",
+                            lambda *a, **k: calls.append("cpu"))
+        assert vom._fit_field(_Vecs(), object(), {}) == "RESULT"
+        assert calls == ["gpu"]
+
+        # (2) GPU raises → CPU fallback runs.
+        calls.clear()
+        monkeypatch.setattr(gpu, "compute_vector_orientation_gpu",
+                            lambda *a, **k: (calls.append("gpu"), (_ for _ in ()).throw(RuntimeError("boom")))[1])
+        monkeypatch.setattr(cpu, "compute_vector_orientation",
+                            lambda *a, **k: (calls.append("cpu"), "CPU_RESULT")[1])
+        assert vom._fit_field(_Vecs(), object(), {}) == "CPU_RESULT"
+        assert calls == ["gpu", "cpu"]
+
+        # (3) torch unavailable → straight to CPU.
+        calls.clear()
+        monkeypatch.setattr(gpu, "torch_available", lambda: False)
+        assert vom._fit_field(_Vecs(), object(), {}) == "CPU_RESULT"
+        assert calls == ["cpu"]
 
     def test_run_without_library_errors_gracefully(self):
         from spyde.backend.session import Session

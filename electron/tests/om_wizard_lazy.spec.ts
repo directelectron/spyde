@@ -58,6 +58,16 @@ test('staged wizard: Generate Library → Compute Map opens the IPF window (lazy
   await expect(page.getByTestId('status-text'))
     .toContainText('library ready', { timeout: 60_000 })
 
+  // 3 Refine → Generate also opens the live IPF correlation-heatmap window (one
+  // triangle per phase), painted with the current pattern's per-orientation
+  // correlation. It tracks the navigator and double-click limits the region.
+  const refineWin = page.getByTestId('subwindow').filter({ hasText: 'IPF Refine' }).first()
+  await expect(refineWin).toBeVisible({ timeout: 30_000 })
+  // It carries a real figure iframe (the heatmap), not a blank window.
+  await expect(refineWin.locator('iframe').first()).toBeVisible()
+  await page.waitForTimeout(1500)
+  await page.screenshot({ path: join(__dirname, '..', 'om_refine_ipf.png') })
+
   // 4 Run → Compute Map → a new IPF-Z window opens.
   const before = await page.getByTestId('subwindow').count()
   await page.getByTestId('om-tab-Run').click()
