@@ -1674,13 +1674,32 @@ def _find_vectors_chunk(
     def _cpu_block(b4d):
         out = np.full((b4d.shape[0], b4d.shape[1], MAX_PEAKS, 3), np.nan, dtype=np.float32)
         flat = b4d.reshape(-1, b4d.shape[2], b4d.shape[3])
-        for i, frame in enumerate(flat):
+        # Fast path: batch the whole block's NXCORR on the torch GPU (Apple-MPS on
+        # a MacBook, CUDA otherwise). Reached when the numba.cuda kernels above
+        # aren't available — exactly the Mac case the user wants accelerated. The
+        # surface + peak set match the numpy reference to float precision (the GPU
+        # only accelerates the correlation; peak detection stays identical).
+        peaks_list = None
+        try:
+            from spyde.actions.find_vectors_torch import (
+                torch_gpu_device, find_vectors_torch_batch)
+            if torch_gpu_device() is not None:
+                peaks_list = find_vectors_torch_batch(
+                    flat, kernel_r, threshold, min_dist,
+                    subpixel=subpixel, beamstop_mask=beamstop_mask)
+        except Exception as _e:
+            print(f"[find_vectors] torch GPU path failed ({_e}); CPU per-frame")
+            peaks_list = None
+        if peaks_list is None:
+            peaks_list = [
+                _find_vectors_single_frame(
+                    frame, kernel_r, threshold, min_dist,
+                    subpixel=subpixel, beamstop_mask=beamstop_mask,
+                    _disk_fft=disk_fft, _disk_stats=disk_stats)[2]
+                for frame in flat
+            ]
+        for i, peaks in enumerate(peaks_list):
             iy, ix = divmod(i, b4d.shape[1])
-            _, _, peaks = _find_vectors_single_frame(
-                frame, kernel_r, threshold, min_dist,
-                subpixel=subpixel, beamstop_mask=beamstop_mask,
-                _disk_fft=disk_fft, _disk_stats=disk_stats,
-            )
             n = min(len(peaks), MAX_PEAKS)
             if n > 0:
                 out[iy, ix, :n, :] = peaks[:n]

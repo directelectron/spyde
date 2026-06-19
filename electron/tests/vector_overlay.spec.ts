@@ -38,25 +38,23 @@ test.afterAll(async () => { await app?.close() })
 // figure iframe — the overlay markers are #ff3030; the grayscale DP/navigator
 // never are. Scanning all frames is robust to which frame is the DP (a
 // per-window `locator('iframe')` can resolve to a stale/empty contentFrame).
+const COUNT_RED = () => {
+  let r = 0
+  for (const c of Array.from(document.querySelectorAll('canvas')) as HTMLCanvasElement[]) {
+    const ctx = c.getContext('2d')
+    if (!ctx || !c.width || !c.height) continue
+    const d = ctx.getImageData(0, 0, c.width, c.height).data
+    for (let p = 0; p < d.length; p += 4) {
+      if (d[p] > 120 && d[p + 1] < 80 && d[p + 2] < 80) r++
+    }
+  }
+  return r
+}
+
 async function redPixels(): Promise<number> {
   let total = 0
   for (const frame of page.frames()) {
-    let red = 0
-    try {
-      red = await frame.evaluate(() => {
-        let r = 0
-        for (const c of Array.from(document.querySelectorAll('canvas')) as HTMLCanvasElement[]) {
-          const ctx = c.getContext('2d')
-          if (!ctx || !c.width || !c.height) continue
-          const d = ctx.getImageData(0, 0, c.width, c.height).data
-          for (let p = 0; p < d.length; p += 4) {
-            if (d[p] > 120 && d[p + 1] < 80 && d[p + 2] < 80) r++
-          }
-        }
-        return r
-      })
-    } catch { /* detached/cross-origin frame — skip */ }
-    total += red
+    try { total += await frame.evaluate(COUNT_RED) } catch { /* detached frame */ }
   }
   return total
 }
@@ -88,18 +86,22 @@ test('live preview + found-vector overlay as red markers on the diffraction patt
   await expect.poll(() => redPixels(), {
     timeout: 30_000, message: 'no vector markers overlaid on the DP after compute',
   }).toBeGreaterThan(0)
+  const afterCompute = await redPixels()   // source overlay + result-window overlay
 
-  // Deselecting the action (closing the caret) HIDES the overlay.
+  // Deselecting the action (closing the caret) HIDES the SOURCE-DP overlay. The
+  // vectors RESULT window keeps its OWN markers (its display, independent of the
+  // source action), so total red DROPS but need not reach 0. Measure relative.
   await page.getByTestId('fv-close').click()
   await expect.poll(() => redPixels(), {
-    timeout: 15_000, message: 'overlay did not hide when the action was deselected',
-  }).toBe(0)
+    timeout: 15_000, message: 'source overlay did not hide when the action was deselected',
+  }).toBeLessThan(afterCompute)
+  const afterHide = await redPixels()
 
-  // Reselecting the action shows it again.
+  // Reselecting the action shows the source overlay again → red rises back.
   await sig.getByTestId('subwindow-titlebar').hover()
   await sig.getByTestId('action-btn-Find Diffraction Vectors').click()
   await expect(page.getByTestId('find-vectors-wizard')).toBeVisible()
   await expect.poll(() => redPixels(), {
-    timeout: 20_000, message: 'overlay did not reappear when reselected',
-  }).toBeGreaterThan(0)
+    timeout: 20_000, message: 'source overlay did not reappear when reselected',
+  }).toBeGreaterThan(afterHide)
 })

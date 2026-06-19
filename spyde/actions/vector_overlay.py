@@ -35,6 +35,19 @@ def _indices_to_iyix(indices):
     return iy, ix
 
 
+def _clip_to_bounds(px, W, H, slack=8.0):
+    """Drop marker offsets that fall outside the detector (with a small ``slack``
+    so edge disks still show). Find Vectors can emit a few spurious peaks far
+    outside the frame (sub-pixel refinement / ghost-cell artifacts) whose
+    calibrated coords map to pixel positions like 24000 — drawing a circle there
+    litters the plot with off-screen / giant arcs."""
+    if px is None or len(px) == 0:
+        return px
+    m = ((px[:, 0] >= -slack) & (px[:, 0] <= (W - 1) + slack) &
+         (px[:, 1] >= -slack) & (px[:, 1] <= (H - 1) + slack))
+    return px[m]
+
+
 def _navigator_selectors_for(tree, dp_plot):
     """Navigator selectors that drive ``dp_plot`` (so the overlay tracks the same
     navigation that updates the DP image)."""
@@ -158,15 +171,23 @@ class VectorOverlay(_DPOverlay):
         self._mg = None
         self._selectors = []
         self._calibrate(vecs.sig_axes)
+        self._W = int(vecs.sig_axes[0].size)
+        self._H = int(vecs.sig_axes[1].size)
         if radius_px is None:
             radius_px = getattr(vecs, "kernel_radius_px", 4.0)
-        self._radius_px = max(2.0, float(radius_px))
+        # Cap to a small fraction of the detector so the circles can never swamp
+        # the pattern (e.g. on a tiny/degenerate frame a fixed px radius looks
+        # enormous); the disk it outlines is `kernel_radius_px` so this is the
+        # detection radius for normal data.
+        cap = max(4.0, 0.08 * min(self._W, self._H))
+        self._radius_px = float(np.clip(float(radius_px), 2.0, cap))
 
     def _offsets_for(self, iy, ix) -> np.ndarray:
         try:
-            return self._to_px(self.vecs.kxy_at(iy, ix))
+            px = self._to_px(self.vecs.kxy_at(iy, ix))
         except Exception:
             return np.zeros((0, 2), dtype=np.float32)
+        return _clip_to_bounds(px, self._W, self._H)
 
 
 def attach_vector_overlay(dp_plot, vecs, tree, *, color="#ff3030",
@@ -362,11 +383,13 @@ class VectorOrientationOverlay(_DPOverlay):
     """
 
     def __init__(self, dp_plot, vecs, lib, params=None, *,
-                 color_meas="#ff3030", color_tmpl="#30ff60", radius_px=None):
+                 color_meas="#ff3030", color_tmpl="#30ff60", radius_px=None,
+                 on_fit=None):
         self.dp_plot = dp_plot
         self.vecs = vecs
         self.lib = lib
         self.params = dict(params or {})
+        self.on_fit = on_fit          # callback(fit_or_None) for the Refine readout
         self.name_meas = "vom_measured"
         self.name_tmpl = "vom_template"
         self._mg_meas = None
@@ -394,6 +417,13 @@ class VectorOrientationOverlay(_DPOverlay):
         else:
             self._push(*self._offsets_for(*self._last_iyix))
 
+    def _emit_fit(self, fit) -> None:
+        if self.on_fit is not None:
+            try:
+                self.on_fit(fit)
+            except Exception:
+                pass
+
     def _offsets_for(self, iy, ix):
         from spyde.actions.vector_orientation import (
             fit_pattern, project_spots, DEFAULTS, COL_KX, COL_KY, COL_INTENSITY,
@@ -401,12 +431,15 @@ class VectorOrientationOverlay(_DPOverlay):
         try:
             rows = np.asarray(self.vecs.at(iy, ix))
         except Exception:
+            self._emit_fit(None)
             return np.zeros((0, 2), np.float32), np.zeros((0, 2), np.float32)
         if rows.size == 0:
+            self._emit_fit(None)
             return np.zeros((0, 2), np.float32), np.zeros((0, 2), np.float32)
         meas_xy = rows[:, [COL_KX, COL_KY]].astype(np.float64)
         meas_px = self._to_px(meas_xy)
         if len(rows) < 4:
+            self._emit_fit(None)
             return meas_px, np.zeros((0, 2), np.float32)
 
         mI = rows[:, COL_INTENSITY].astype(np.float64)
@@ -415,9 +448,12 @@ class VectorOrientationOverlay(_DPOverlay):
             with self._lock:
                 fit = fit_pattern(meas_xy, mI, self.lib, P)
         except Exception:
+            self._emit_fit(None)
             return meas_px, np.zeros((0, 2), np.float32)
         if fit is None:
+            self._emit_fit(None)
             return meas_px, np.zeros((0, 2), np.float32)
+        self._emit_fit(fit)
 
         p7 = np.zeros(7, np.float64)
         p7[0] = float(fit.theta)
@@ -486,11 +522,13 @@ class VectorOrientationOverlay(_DPOverlay):
                 setattr(self, attr, None)
 
 
-def attach_vector_orientation_overlay(dp_plot, vecs, lib, tree, *, params=None
-                                      ) -> VectorOrientationOverlay:
+def attach_vector_orientation_overlay(dp_plot, vecs, lib, tree, *, params=None,
+                                      on_fit=None) -> VectorOrientationOverlay:
     """Add a live Vector-Orientation refine overlay (red measured vectors + green
-    fitted template) to ``dp_plot``, wired to ``tree``'s navigator selectors."""
-    return VectorOrientationOverlay(dp_plot, vecs, lib, params=params).attach(tree)
+    fitted template) to ``dp_plot``, wired to ``tree``'s navigator selectors.
+    ``on_fit(fit_or_None)`` fires after each fit for the Refine strain readout."""
+    return VectorOrientationOverlay(dp_plot, vecs, lib, params=params,
+                                    on_fit=on_fit).attach(tree)
 
 
 def attach_find_vectors_preview(dp_plot, signal, tree, *, sigma=1.0,

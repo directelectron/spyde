@@ -42,6 +42,25 @@ export function FindVectorsWizard({ openUp, windowId, sendAction, onClose }: Pro
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // Adopt the backend's auto-estimated disk radius (Qt parity) the first time it
+  // arrives, then re-run the preview with it. The user can still override.
+  const autoApplied = React.useRef(false)
+  React.useEffect(() => {
+    const onAuto = (e: Event) => {
+      const d = (e as CustomEvent).detail as Record<string, unknown>
+      if (d.window_id != null && d.window_id !== windowId) return
+      if (autoApplied.current) return
+      autoApplied.current = true
+      if (typeof d.kernel_radius === 'number') setRadius(d.kernel_radius)
+      if (typeof d.min_distance === 'number') setMinDist(d.min_distance)
+      setStatus(`Disk radius auto-set to ${d.kernel_radius} px from the pattern.`)
+      tune()
+    }
+    window.addEventListener('spyde:fv_auto_params', onAuto)
+    return () => window.removeEventListener('spyde:fv_auto_params', onAuto)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [windowId])
+
   // Debounced live tune — dispatch on slider settle so matches don't flood.
   const tune = () => {
     if (tuneTimer.current) clearTimeout(tuneTimer.current)

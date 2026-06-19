@@ -17,11 +17,12 @@ MEMORY: `_do_compute_vectors` uses `dask.array.map_overlap` and NEVER calls
 from __future__ import annotations
 
 import threading
+import time
 
 import numpy as np
 import hyperspy.api as hs
 
-from spyde.backend.ipc import emit_status, emit_error
+from spyde.backend.ipc import emit, emit_status, emit_error
 from spyde.actions.context import src_plot_tree as _src_plot_tree
 from spyde.actions.find_vectors import _do_compute_vectors, _copy_nav_axes_to
 
@@ -111,9 +112,34 @@ def _start_batch(session, plot, src_tree, p: dict):
     emit_status("Finding diffraction vectors…")
     src_dp_plot = plot   # overlay the found vectors on the live DP we ran from
 
+    # ── Progressive (live) count map: the compute writes per-chunk vector counts
+    #    into a shared-memory buffer as chunks finish; a poller paints them into
+    #    the count-map navigator so it fills in live instead of all-at-the-end.
+    from spyde.drawing.update_functions import ensure_live_buffer, read_live_buffer
+    shm_name = f"spyde_fv_{id(plot)}"
+    try:
+        shm = ensure_live_buffer(nav_shape_2d, shm_name)
+    except Exception:
+        shm, shm_name = None, None
+    stop_poll = [False]
+
+    def _poller():
+        nav_plot = _first_nav_plot(new_tree)
+        while not stop_poll[0]:
+            try:
+                arr = read_live_buffer(nav_shape_2d, shm_name)
+                if nav_plot is not None and np.isfinite(arr).any():
+                    nav_plot.needs_auto_level = True
+                    nav_plot.set_data(np.nan_to_num(arr).astype(np.float32))
+            except Exception:
+                pass
+            time.sleep(0.35)
+
     def _work():
         try:
-            vecs = _do_compute_vectors(src, p, main_window=session, signal_tree=src_tree)
+            vecs = _do_compute_vectors(src, p, main_window=session,
+                                       signal_tree=src_tree, shm_name=shm_name)
+            stop_poll[0] = True                      # final paint owns the nav plot
             if vecs is None:
                 emit_error("Find Vectors: compute returned no result")
                 return
@@ -123,7 +149,17 @@ def _start_batch(session, plot, src_tree, p: dict):
             import traceback
             emit_error(f"Find Vectors failed: {e}")
             print(traceback.format_exc())
+        finally:
+            stop_poll[0] = True
+            if shm is not None:
+                try:
+                    shm.close()
+                    shm.unlink()
+                except Exception:
+                    pass
 
+    if shm_name is not None:
+        threading.Thread(target=_poller, daemon=True, name="fv-poll").start()
     threading.Thread(target=_work, daemon=True, name="find-vectors").start()
     return None
 
@@ -152,6 +188,15 @@ def _finalize(tree, vecs) -> None:
     """Swap the placeholder for vectors-rendered frames, attach the vectors,
     fill the count-map navigator, and unlock the vector toolbar actions."""
     tree.root.data = vecs.to_rendered_dask()
+    # The signal plot's CachedDaskArray captured the OLD placeholder array when
+    # the window first rendered (zeros). Drop it so navigation renders the new
+    # disk frames — otherwise the result window stays black (Qt parity: the
+    # computed-vectors window shows each position's vectors as flat disks).
+    try:
+        tree.root.cached_dask_array = None
+        tree.root._clear_cache_dask_data()
+    except Exception:
+        pass
     tree.diffraction_vectors = vecs
 
     count_map = vecs.count_map().astype(np.float32)
@@ -163,19 +208,80 @@ def _finalize(tree, vecs) -> None:
         except Exception:
             pass
 
-    # Re-slice the signal plot from the new (rendered) root + re-send the
-    # toolbar config so the now-available vector actions appear.
+    # Re-send the toolbar config so the now-available vector actions appear.
     for sp in list(getattr(tree, "signal_plots", [])):
         try:
+            sp.needs_auto_level = True
             state = getattr(sp, "plot_state", None)
             if state is not None and hasattr(state, "_send_toolbar_config"):
                 state._send_toolbar_config()
         except Exception:
             pass
-    _refresh_signal_from_navigator(tree)
+    _install_render_display(tree, vecs)
+    _overlay_on_result(tree, vecs)
 
     total = int(count_map.sum())
     emit_status(f"Found {total} diffraction vectors")
+
+
+def _install_render_display(tree, vecs) -> None:
+    """Drive the result window's signal plot by rendering vectors frames
+    IN-PROCESS on every navigator move (Qt parity) — ``render_frame`` is an O(1)
+    CSR slice. This REPLACES the navigator's slice function so navigation never
+    touches the lazy ``to_rendered_dask`` root, whose chunks are delivered
+    asynchronously (Future → shared-memory) and can leave the window black on
+    real distributed data. Each navigated position now paints its disks
+    synchronously, exactly like the Qt ``_make_hooked`` update."""
+    from spyde.actions.vector_overlay import _indices_to_iyix
+    H = int(vecs.sig_axes[1].size)
+    W = int(vecs.sig_axes[0].size)
+
+    def _fn(selector, child, indices):
+        iy, ix = _indices_to_iyix(indices)
+        try:
+            return vecs.render_frame(iy, ix)
+        except Exception:
+            return np.zeros((H, W), dtype=np.float32)
+
+    sig_plots = set(getattr(tree, "signal_plots", []))
+    npm = getattr(tree, "navigator_plot_manager", None)
+    touched = set()
+    if npm is not None:
+        for sel in getattr(npm, "all_navigation_selectors", []):
+            for child in list(getattr(sel, "children", {}).keys()):
+                if child in sig_plots:
+                    sel.children[child] = _fn
+                    child.needs_auto_level = True
+                    touched.add(sel)
+    for sel in touched:
+        try:
+            sel.delayed_update_data(force=True)
+        except Exception:
+            pass
+    if not touched:                      # fallback: the lazy nav path
+        _refresh_signal_from_navigator(tree)
+
+
+def _overlay_on_result(tree, vecs) -> None:
+    """Overlay the found vectors as red circle markers on the RESULT window's
+    rendered diffraction pattern, tracking its count-map navigator (Qt parity:
+    the computed-vectors window drew red circles over the rendered disks).
+    Replaces any prior overlay so re-running doesn't stack markers."""
+    from spyde.actions.vector_overlay import attach_vector_overlay
+    old = getattr(tree, "_result_vector_overlay", None)
+    if old is not None:
+        try:
+            old.remove()
+        except Exception:
+            pass
+        tree._result_vector_overlay = None
+    for sp in list(getattr(tree, "signal_plots", [])):
+        try:
+            tree._result_vector_overlay = attach_vector_overlay(sp, vecs, tree)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).debug(
+                "result vector overlay attach failed: %s", e)
 
 
 def _first_nav_plot(tree):
@@ -237,6 +343,11 @@ def fv_preview(session, plot, payload) -> None:
                 kernel_radius=p["kernel_radius"], threshold=p["threshold"],
                 min_distance=p["min_distance"], subpixel=p["subpixel"],
             )
+            # Qt parity: estimate the disk radius from the data (once) so the
+            # wizard's defaults match the pattern instead of a fixed 5.
+            if not getattr(tree, "_fv_auto_sent", False):
+                tree._fv_auto_sent = True
+                _emit_auto_params(src, tree)
             emit_status("Find Vectors: tune the parameters — peaks preview under "
                         "the crosshair, then Compute")
         except Exception as e:
@@ -244,6 +355,32 @@ def fv_preview(session, plot, payload) -> None:
             logging.getLogger(__name__).debug("fv_preview attach failed: %s", e)
 
     threading.Thread(target=_work, daemon=True, name="fv-preview").start()
+
+
+def _emit_auto_params(plot, tree) -> None:
+    """Estimate the diffraction-disk radius (Qt's LoG blob detection) from a
+    representative pattern and emit it so the wizard seeds its sliders — matching
+    Qt, which auto-sizes per dataset rather than using a fixed radius."""
+    try:
+        from spyde.actions.find_vectors import _auto_params
+        root = tree.root
+        nav_dim = root.axes_manager.navigation_dimension
+        nav_shape = tuple(root.data.shape[:nav_dim])
+        idx = tuple(int(s) // 2 for s in nav_shape)        # centre pattern
+        frame = root.data[idx]
+        if hasattr(frame, "compute"):                      # lazy: one small frame
+            frame = frame.compute()
+        frame = np.asarray(frame, dtype=np.float32)
+        if frame.ndim != 2:
+            return
+        ap = _auto_params(frame)
+        emit({"type": "fv_auto_params",
+              "window_id": getattr(plot, "window_id", None),
+              "kernel_radius": int(ap["kernel_radius"]),
+              "min_distance": int(ap["min_distance"])})
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).debug("fv auto-params failed: %s", e)
 
 
 def fv_tune(session, plot, payload) -> None:
