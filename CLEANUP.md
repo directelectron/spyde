@@ -66,12 +66,22 @@ PY
 > tooling hook blocks heredocs, paste the body into `scripts/_inv1.py` and run
 > `uv run python scripts/_inv1.py` instead.
 
-**INV-2 — the Qt-free test suite is green** (the liveness oracle — if a deletion
+**INV-2 — the Qt-free test suite is green** (THE liveness oracle — if a deletion
 broke something live, a migrated test goes red):
 
 ```bash
 uv run pytest spyde/tests/migrated/ -q -p no:cacheprovider   # ~2–3 min, must be all-pass
 ```
+
+> ⚠️ Live actions have **two** entry points, not one — trust INV-2 over static
+> grep: (a) the 7 string handlers in `session.py`; (b) the **YAML-wired actions**
+> in `spyde/toolbars.yaml`, `spyde/actions/hyper_signal_actions/*.yaml`,
+> `spyde/actions/plot_actions/*.yaml` (modules: `base`, `center_zero_beam`,
+> `fft_action`, `find_vectors_action`, `line_profile_action`, `orientation_action`,
+> `vector_orientation_om`, `vector_virtual_imaging`, `virtual_image`). A module
+> reachable from either — including via a **lazy** import inside an action that
+> only fires at runtime — is LIVE even though INV-1 (import-only) shows it Qt-free.
+> This is how `line_profile` was caught.
 
 **INV-3 — the backend boots** (import the entry, don't spawn a UI):
 
@@ -127,8 +137,15 @@ git rm -r spyde/qt spyde/live spyde/misc spyde/external/pyqtgraph spyde/external
 
 ```bash
 git rm spyde/_qt_main_legacy.py spyde/qt_scrapper.py spyde/_conftest_legacy.py \
-       spyde/dock_manager.py spyde/mdi_manager.py spyde/metadata_extract.py
+       spyde/dock_manager.py
 ```
+> ✅ Verified: `dock_manager.py` is imported only by the two legacy files (dead).
+> ⚠️ Do **NOT** delete `spyde/mdi_manager.py` or `spyde/metadata_extract.py` —
+> both are **live and Qt-free**. `session.__init__` instantiates `MDIManager`
+> (the Qt-free window abstraction; `PlotWindow` *replaces* `QMdiSubWindow`, it is
+> not Qt), and `session` calls `metadata_extract.build_metadata_dict/_axes_list`
+> for the dock. (`metadata_extract`'s only "PySide6" is a docstring; importing it
+> pulls no Qt.)
 
 **Batch 3c — the Qt drawing layer (toolbars + presenter):**
 
@@ -146,12 +163,16 @@ you: delete, run it, and if a test errors on import, revert that one file.)
 **Batch 3d — the dead Qt action modules:**
 
 ```bash
-git rm spyde/actions/pyxem.py spyde/actions/line_profile.py \
-       spyde/actions/line_profile_action.py spyde/actions/vector_orientation_action.py
+git rm spyde/actions/vector_orientation_action.py   # the dead pyqtgraph caret
 ```
-⚠️ `line_profile_action.py` — confirm it isn't a live handler first:
-`grep -rn "line_profile" spyde/backend/session.py`. If a handler references it,
-it must be ported (a line-profile Electron action), not deleted — pause and flag.
+> ✅ Verified dead: `vector_orientation_action` is only named in comments; the
+> live path is `vector_orientation_om.py`.
+> ⚠️ **`pyxem.py`, `line_profile.py`, `line_profile_action.py` are NOT dead.**
+> `line_profile_action` is wired in `spyde/toolbars.yaml` (a LIVE entry point —
+> see §1) and lazy-imports the Qt `line_profile.py`, which imports
+> `pyxem._start_progress_poll` + pyqtgraph + PySide6. Deleting them turns
+> `test_template_actions::test_line_profile_opens_output_window` red. These are
+> **Phase-6 de-Qt targets** (§4b), not deletions.
 
 After 3a–3d: run INV-1/2/3, then the **E2E smoke**. Commit each batch separately,
 e.g. `git commit -m "chore(qt): remove dead Qt UI packages (qt/ live/ misc/ external/)"`.
@@ -180,6 +201,31 @@ e.g. `git commit -m "chore(qt): remove dead Qt UI packages (qt/ live/ misc/ exte
 Repeat the same liveness check for any other module flagged by
 `grep -rln "PySide6\|pyqtgraph" spyde/actions --include=*.py` that turns out to be
 live-with-lazy-Qt.
+
+### 4b. De-Qt the live line-profile action (`line_profile.py` + `pyxem.py`)
+
+`line_profile_action.py` (live, YAML-wired) lazy-imports `line_profile.py`, which
+is a **pyqtgraph LineROI widget** that also pulls `pyxem._start_progress_poll` and
+`spyde.qt.compute_status_indicator`. This is the last live action still on Qt.
+
+1. **Extract the Qt-free helper:** `pyxem.py` is ~3.2k lines of mostly-dead Qt
+   UI; the only thing live code needs from it is `_start_progress_poll`. Move that
+   (and any pure-compute helpers `line_profile.py` uses) into a Qt-free module
+   (e.g. `spyde/actions/_progress.py`), repoint the import. Confirm with
+   `uv run python -c "import sys,importlib; importlib.import_module('spyde.actions.line_profile_action'); ..."`
+   style INV-1.
+2. **Port the line-profile UI to the action template** the way the other actions
+   were (Electron/anyplotlib `RegionAction`), so `line_profile.py` no longer needs
+   pyqtgraph/PySide6/`spyde.qt`. The migrated test
+   `test_template_actions::test_line_profile_opens_output_window` is the gate.
+3. Once `grep -c "PySide6\|pyqtgraph\|spyde.qt" spyde/actions/line_profile.py` → 0
+   and `find_vectors.py` is trimmed (§4), **`pyxem.py` is fully dead** — delete it
+   — and **`spyde/qt/` has no importer** — delete it:
+   ```bash
+   git rm spyde/actions/pyxem.py
+   git rm -r spyde/qt
+   ```
+   Gate: INV-1/2/3 + E2E + `grep -rn "PySide6\|pyqtgraph" spyde --include=*.py | grep -v /tests/` → empty.
 
 ---
 
