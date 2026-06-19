@@ -28,6 +28,12 @@ interface Props {
   onGestureEnd?: (id: string) => void
   /** A nudge applied by a stuck partner's drag: apply (dx,dy) when nonce changes. */
   groupNudge?: { dx: number; dy: number; nonce: number }
+  /** An absolute rect pushed by a stuck partner's RESIZE (linked dim + follow). */
+  rectOverride?: { x: number; y: number; w: number; h: number; nonce: number }
+  /** Live resize → host links the shared dimension across the stick group. */
+  onStuckResize?: (id: string, w: number, h: number) => void
+  /** A vigorous back-and-forth "shake" → break the stick group apart. */
+  onShake?: (id: string) => void
   /** True when this window belongs to a stick group (shows a small link badge). */
   stuck?: boolean
 }
@@ -79,12 +85,15 @@ export function SubWindow({
   toolbarActions, onClose, onFocus, onResize, onAction,
   zIndex, windowId, children,
   peers, reportGeom, onStuckMove, onGestureEnd, groupNudge, stuck,
+  rectOverride, onStuckResize, onShake,
 }: Props) {
   const [maximized, setMaximized] = useState(false)
   const [pos, setPos] = useState({ x: initialX, y: initialY })
   const [size, setSize] = useState({ width: initialW, height: initialH })
   const [busy, setBusy] = useState(false)   // dragging or resizing → shield on
   const posRef = useRef(pos); posRef.current = pos
+  // Honour a manually-set size from now on (don't re-adopt the backend default).
+  const userResized = useRef(false)
 
   // Report live geometry so the host can edge-snap + move stick groups.
   React.useEffect(() => {
@@ -97,10 +106,19 @@ export function SubWindow({
     setPos(p => ({ x: Math.max(0, p.x + groupNudge.dx), y: Math.max(0, p.y + groupNudge.dy) }))
   }, [groupNudge?.nonce])  // eslint-disable-line react-hooks/exhaustive-deps
 
+  // A stuck partner RESIZED → adopt the rect it computed for us (linked
+  // dimension + follow the shared edge so we stay touching, never overlapping).
+  React.useEffect(() => {
+    if (!rectOverride) return
+    userResized.current = true
+    setPos({ x: rectOverride.x, y: rectOverride.y })
+    setSize({ width: rectOverride.w, height: rectOverride.h })
+    onResize(id, rectOverride.w, rectOverride.h)   // re-fit the figure to the new box
+  }, [rectOverride?.nonce])  // eslint-disable-line react-hooks/exhaustive-deps
+
   // Adopt a new default size when the backend supplies it (e.g. the navigator's
   // image aspect arrives just after the window opens) — but never fight a size
   // the user has set by hand.
-  const userResized = useRef(false)
   React.useEffect(() => {
     if (!userResized.current) setSize({ width: initialW, height: initialH })
   }, [initialW, initialH])
@@ -123,6 +141,8 @@ export function SubWindow({
     | { kind: 'resize'; px: number; py: number; w: number; h: number }
     | null
   >(null)
+  // Horizontal direction-reversal tracking for the shake-to-break gesture.
+  const shake = useRef({ dir: 0, count: 0, t0: 0, lastX: 0 })
 
   const hasToolbar = toolbarActions.length > 0
   const headerH = TITLE_H   // toolbar is now a right-edge rail, not a top bar
@@ -134,11 +154,27 @@ export function SubWindow({
     onFocus(id)
     try { (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId) } catch { /* */ }
     gesture.current = { kind: 'drag', px: e.clientX, py: e.clientY, ox: pos.x, oy: pos.y }
+    shake.current = { dir: 0, count: 0, t0: performance.now(), lastX: e.clientX }
     setBusy(true)
+  }
+  // Count rapid horizontal reversals — a vigorous shake breaks the stick group.
+  const detectShake = (clientX: number) => {
+    const sh = shake.current
+    const dd = clientX - sh.lastX
+    if (Math.abs(dd) < 7) return
+    const dir = Math.sign(dd)
+    if (sh.dir !== 0 && dir !== sh.dir) {
+      const now = performance.now()
+      if (now - sh.t0 > 900) { sh.count = 0; sh.t0 = now }
+      if (++sh.count >= 5) { onShake?.(id); sh.count = 0 }
+    }
+    sh.dir = dir
+    sh.lastX = clientX
   }
   const onTitleMove = (e: React.PointerEvent) => {
     const g = gesture.current
     if (!g || g.kind !== 'drag') return
+    if (onShake) detectShake(e.clientX)
     let nx = Math.max(0, g.ox + (e.clientX - g.px))
     let ny = Math.max(0, g.oy + (e.clientY - g.py))
     if (peers?.current) {
@@ -163,10 +199,12 @@ export function SubWindow({
   const onResizeMove = (e: React.PointerEvent) => {
     const g = gesture.current
     if (!g || g.kind !== 'resize') return
-    setSize({
-      width: Math.max(MIN_W, g.w + (e.clientX - g.px)),
-      height: Math.max(MIN_H, g.h + (e.clientY - g.py)),
-    })
+    const w = Math.max(MIN_W, g.w + (e.clientX - g.px))
+    const h = Math.max(MIN_H, g.h + (e.clientY - g.py))
+    setSize({ width: w, height: h })
+    // Tell the host so it links the shared dimension across the stick group
+    // (and slides partners to follow the moving edge → they never overlap).
+    onStuckResize?.(id, w, h)
   }
 
   const endGesture = (e: React.PointerEvent) => {

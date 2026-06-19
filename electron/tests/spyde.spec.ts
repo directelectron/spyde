@@ -612,6 +612,45 @@ test('Orientation Mapping opens the staged wizard and drives the staged actions'
   }).toEqual(['om_generate_library', 'om_refine', 'om_run'])
 })
 
+test('CIF picker remembers recents and re-selects them across reopen', async () => {
+  await page.evaluate(() => localStorage.removeItem('spyde:cif-recents'))
+  await app.evaluate(({ ipcMain }) => {
+    ipcMain.removeHandler('spyde:pick-file')
+    ipcMain.handle('spyde:pick-file', async () => '/tmp/Quartz.cif')
+  })
+  await inject({
+    type: 'toolbar_config', window_id: 1, plot_id: 1,
+    toolbar_actions: [{
+      name: 'Orientation Mapping', icon: '', side: 'left', toggle: false,
+      subfunctions: [], parameters: { gamma: { name: 'Gamma', type: 'float', default: 0.5 } },
+    }],
+  })
+  await inject({ type: 'figure', window_id: 1, fig_id: 'sig',
+    html: '<html><body>s</body></html>', title: 'Diffraction', is_navigator: false })
+
+  // Pick a .cif → added to the phase list AND remembered.
+  await reveal()
+  await page.getByTestId('action-btn-Orientation Mapping').click()
+  await expect(page.getByTestId('orientation-wizard')).toBeVisible()
+  await page.getByTestId('om-pick-cif').click()
+  await expect(page.getByTestId('om-cif-list')).toContainText('Quartz.cif')
+
+  // Close + reopen → the wizard persists its loaded phases, so Quartz is still in
+  // the list (and correctly NOT offered as a "recent" chip while it's loaded).
+  await page.getByTestId('om-close').click()
+  await page.getByTestId('action-btn-Orientation Mapping').click()
+  await expect(page.getByTestId('orientation-wizard')).toBeVisible()
+  await expect(page.getByTestId('om-cif-list')).toContainText('Quartz.cif')
+
+  // Remove it → now it's remembered but not loaded, so the quick-select "Recent"
+  // chip appears; clicking it re-selects the crystal without a file dialog.
+  await page.getByTestId('om-cif-remove-Quartz.cif').click()
+  const chip = page.getByTestId('cif-recent-Quartz.cif')
+  await expect(chip).toBeVisible()
+  await chip.click()
+  await expect(page.getByTestId('om-cif-list')).toContainText('Quartz.cif')
+})
+
 test('an active action highlights, and clicking it deselects to hide output', async () => {
   await trackActions()
   await inject({

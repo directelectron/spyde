@@ -163,6 +163,13 @@ class Plot:
         # Scale bar state
         self._scale_bar_enabled = False
 
+        # Unified view-bar tagging: when this plot is one of a window's named
+        # views (e.g. an IPF-Z map or a strain εxx map) the figure carries a
+        # chip label + representation kind so the frontend can build the
+        # chip-strip selector. None = an ordinary (untagged) figure.
+        self.view_label: str | None = None
+        self.view_kind: str = "2d"
+
         # Window ID (set when registered with MDIManager)
         self.window_id: int | None = (
             getattr(plot_window, "window_id", None)
@@ -225,6 +232,8 @@ class Plot:
             except Exception:
                 nav_aspect = None
 
+        self._figure_html = html
+        self._figure_aspect = nav_aspect
         emit({
             "type": "figure",
             "fig_id": self.fig_id,
@@ -233,6 +242,24 @@ class Plot:
             "title": title or ("Navigator" if self.is_navigator else "Signal"),
             "is_navigator": self.is_navigator,
             "aspect": nav_aspect,
+            "view_label": self.view_label,
+            "view_kind": self.view_kind if self.view_label else None,
+        })
+
+    def set_view_tag(self, label: str, kind: str = "2d") -> None:
+        """Tag this plot's figure as a named view (chip ``label`` + ``kind``) and
+        RE-EMIT the figure message so the frontend's chip strip picks it up. The
+        iframe is keyed by fig_id, so the metadata updates without a reload."""
+        from spyde.backend.ipc import emit
+        self.view_label = label
+        self.view_kind = kind
+        if self.fig_id is None or getattr(self, "_figure_html", None) is None:
+            return
+        emit({
+            "type": "figure", "fig_id": self.fig_id, "window_id": self.window_id,
+            "html": self._figure_html, "title": label, "is_navigator": False,
+            "aspect": getattr(self, "_figure_aspect", None),
+            "view_label": label, "view_kind": kind,
         })
 
     # ── Public display interface ───────────────────────────────────────────────

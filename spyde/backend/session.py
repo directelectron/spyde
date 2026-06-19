@@ -36,6 +36,27 @@ _DEFAULT_EXAMPLE_NAMES = (
 # Staged-wizard actions → "module.function". All share the (session, plot,
 # payload) signature, so `dispatch_action` routes them through one lazy-import
 # branch instead of a copy-pasted elif per handler.
+# pyxem ships some examples with a half-scale reciprocal calibration; the legacy
+# app corrected these per-dataset (so the kx/ky axes + scale bar read in Å⁻¹
+# correctly). Restore that override on example load.
+_EXAMPLE_CALIBRATION = {
+    # sped_ag: pyxem default scale/offset are exactly half the true values.
+    "sped_ag": dict(scale=0.00668207597 * 4, offset=-0.374196254 * 4),
+}
+
+
+def _apply_example_calibration(sig, name: str) -> None:
+    cal = _EXAMPLE_CALIBRATION.get(name)
+    if cal is None:
+        return
+    try:
+        for ax in sig.axes_manager.signal_axes:
+            ax.scale = cal["scale"]
+            ax.offset = cal["offset"]
+    except Exception:
+        pass
+
+
 _STAGED_HANDLERS = {
     "om_generate_library": "spyde.actions.orientation_action.om_generate_library",
     "om_refine":           "spyde.actions.orientation_action.om_refine",
@@ -45,7 +66,13 @@ _STAGED_HANDLERS = {
     "fv_run":              "spyde.actions.find_vectors_action.fv_run",
     "fv_stop":             "spyde.actions.find_vectors_action.fv_stop",
     "vom_generate_library": "spyde.actions.vector_orientation_om.vom_generate_library",
+    "vom_refine":          "spyde.actions.vector_orientation_om.vom_refine",
     "vom_run":             "spyde.actions.vector_orientation_om.vom_run",
+    "ipf_set_direction":   "spyde.actions.ipf_view.ipf_set_direction",
+    "tile_views":          "spyde.actions.views.tile_views",
+    "set_composition":     "spyde.actions.composition.set_composition",
+    "cod_search":          "spyde.actions.composition.cod_search",
+    "cod_pick":            "spyde.actions.composition.cod_pick",
     "czb_auto":            "spyde.actions.center_zero_beam.czb_auto",
     "czb_manual_start":    "spyde.actions.center_zero_beam.czb_manual_start",
     "czb_manual":          "spyde.actions.center_zero_beam.czb_manual",
@@ -163,6 +190,7 @@ class Session:
                 emit_error(f"Unknown example dataset: {name}")
                 return
             sig = self._load_example_lazy(loader)
+            _apply_example_calibration(sig, name)
             self._add_signal(sig, source_path=None)
         except Exception as e:
             import traceback
@@ -244,6 +272,11 @@ class Session:
         except Exception as e:
             print(f"metadata emit failed: {e}")
         self._emit_axes(tree)
+        try:
+            from spyde.actions.composition import emit_composition
+            emit_composition(tree, self._tree_window_ids(tree))
+        except Exception as e:
+            print(f"composition emit failed: {e}")
 
         emit_status(f"Loaded: {title or 'Signal'}")
         return tree

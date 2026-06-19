@@ -57,9 +57,12 @@ export interface SpyDEFigure {
   title: string
   isNavigator: boolean
   view?: string                 // "3d" for the IPF 3-D explorer figure (2D/3D toggle)
+  viewLabel?: string            // chip text for the unified view selector (εxx, VDF, IPF X…)
+  viewKind?: string             // "2d" | "3d" — representation kind of this named view
 }
 
 export type MetadataDict = Record<string, Record<string, string>>
+export interface Composition { elements: string[]; percentages: Record<string, number> }
 export interface Histogram {
   counts: number[]
   edges: number[]
@@ -89,6 +92,8 @@ interface State {
   signalTrees: Map<number, TreeNode>
   signalTreeActive: Map<number, number>   // windowId → active node signal_id
   axes: Map<number, AxisRow[]>
+  composition: Map<number, Composition>     // windowId → sample elements + percentages
+  ipfKey: Map<number, string>               // windowId → IPF colour-key triangle (PNG data URL)
   activeActions: Map<number, Set<string>>   // windowId → action names with live output
   subItems: Map<number, Map<string, SubItem[]>>  // windowId → action → dynamic chips
   status: string
@@ -101,12 +106,14 @@ interface State {
 type Action =
   | { type: 'READY'; dashboardUrl?: string }
   | { type: 'STATUS'; text: string }
-  | { type: 'FIGURE'; windowId: number; figId: string; fileUrl: string | null; title: string; isNavigator: boolean; aspect?: number; view?: string }
+  | { type: 'FIGURE'; windowId: number; figId: string; fileUrl: string | null; title: string; isNavigator: boolean; aspect?: number; view?: string; viewLabel?: string; viewKind?: string }
   | { type: 'TOOLBAR_CONFIG'; windowId: number; plotId: number; actions: ToolbarAction[] }
   | { type: 'WINDOW_VISIBILITY'; windowId: number; visible: boolean }
   | { type: 'WINDOW_CLOSED'; windowId: number }
   | { type: 'SET_ACTIVE'; windowId: number }
   | { type: 'METADATA'; windowIds: number[]; metadata: MetadataDict }
+  | { type: 'COMPOSITION'; windowIds: number[]; composition: Composition }
+  | { type: 'IPF_KEY'; windowId: number; dataUrl: string }
   | { type: 'AXES'; windowIds: number[]; axes: AxisRow[] }
   | { type: 'ACTION_ACTIVE'; windowId: number; name: string; active: boolean }
   | { type: 'SUB_ITEM'; windowId: number; action: string; name: string; color: string; vtype?: string; calculation?: string; active: boolean }
@@ -137,6 +144,8 @@ function spydeReducer(state: State, action: Action): State {
         title: action.title,
         isNavigator: action.isNavigator,
         view: action.view,
+        viewLabel: action.viewLabel,
+        viewKind: action.viewKind,
       }
 
       const newFigures = new Map(state.figures)
@@ -155,7 +164,18 @@ function spydeReducer(state: State, action: Action): State {
         })
       }
       const win = { ...newWindows.get(action.windowId)! }
-      win.figures = [...win.figures.filter(f => f.figId !== action.figId), figure]
+      // Replace by id; AND a new secondary view replaces the window's previous
+      // figure of that same `view` (the IPF X/Y/Z selector re-emits the 3-D
+      // explorer and the density heatmap with fresh fig ids — view="3d"/"density");
+      // AND a new named view (view_label) replaces the prior figure with that same
+      // label (re-running strain/IPF emits fresh fig ids — don't stack chips).
+      win.figures = [
+        ...win.figures.filter(f => f.figId !== action.figId
+          && !(action.view != null && f.view === action.view)
+          && !(action.viewLabel != null && f.viewLabel === action.viewLabel
+               && f.figId !== action.figId)),
+        figure,
+      ]
       // A secondary view figure (e.g. the IPF 3-D explorer, view="3d") must NOT
       // rename the window or flip its navigator flag — those belong to the
       // primary figure.
@@ -218,6 +238,8 @@ function spydeReducer(state: State, action: Action): State {
         histograms: drop(state.histograms),
         metadata: drop(state.metadata),
         axes: drop(state.axes),
+        composition: drop(state.composition),
+        ipfKey: drop(state.ipfKey),
         signalTrees: drop(state.signalTrees),
         signalTreeActive: drop(state.signalTreeActive),
         activeActions: drop(state.activeActions),
@@ -233,6 +255,18 @@ function spydeReducer(state: State, action: Action): State {
       const metadata = new Map(state.metadata)
       for (const wid of action.windowIds) metadata.set(wid, action.metadata)
       return { ...state, metadata }
+    }
+
+    case 'COMPOSITION': {
+      const composition = new Map(state.composition)
+      for (const wid of action.windowIds) composition.set(wid, action.composition)
+      return { ...state, composition }
+    }
+
+    case 'IPF_KEY': {
+      const ipfKey = new Map(state.ipfKey)
+      ipfKey.set(action.windowId, action.dataUrl)
+      return { ...state, ipfKey }
     }
 
     case 'AXES': {
@@ -315,6 +349,8 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     windows: new Map(),
     figures: new Map(),
     metadata: new Map(),
+    composition: new Map(),
+    ipfKey: new Map(),
     histograms: new Map(),
     selectors: new Map(),
     signalTrees: new Map(),
@@ -377,6 +413,8 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
             isNavigator: (msg.is_navigator as boolean) || false,
             aspect: msg.aspect as number | undefined,
             view: msg.view as string | undefined,
+            viewLabel: msg.view_label as string | undefined,
+            viewKind: msg.view_kind as string | undefined,
           })
           break
         }
@@ -418,6 +456,25 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
               '*',
             )
           }
+          break
+
+        case 'ipf_key':
+          dispatch({
+            type: 'IPF_KEY',
+            windowId: msg.window_id as number,
+            dataUrl: msg.data_url as string,
+          })
+          break
+
+        case 'composition':
+          dispatch({
+            type: 'COMPOSITION',
+            windowIds: (msg.window_ids as number[]) ?? [],
+            composition: {
+              elements: (msg.elements as string[]) ?? [],
+              percentages: (msg.percentages as Record<string, number>) ?? {},
+            },
+          })
           break
 
         case 'metadata':
@@ -495,6 +552,18 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
 
         case 'dask_ready':
           dispatch({ type: 'READY', dashboardUrl: msg.dashboard as string | undefined })
+          break
+
+        // Wizard-scoped events (live fit readout + library-ready). Re-broadcast
+        // as DOM CustomEvents so the relevant caret component can subscribe
+        // without threading them through the global reducer.
+        case 'vom_fit':
+        case 'vom_library_ready':
+        case 'om_library_ready':
+        case 'fv_auto_params':
+        case 'cod_results':
+        case 'cod_cif_ready':
+          window.dispatchEvent(new CustomEvent(`spyde:${t}`, { detail: msg }))
           break
       }
     }

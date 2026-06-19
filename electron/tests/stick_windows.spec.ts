@@ -68,4 +68,27 @@ test('windows edge-snap, stick after a dwell, and move as a group', async () => 
   expect(aAfter.x - aBefore.x).toBeGreaterThan(40)   // A moved
   expect(bAfter.x - bBefore.x).toBeGreaterThan(40)   // B moved WITH it
   expect(bAfter.y - bBefore.y).toBeGreaterThan(15)   // …in both axes
+
+  // Resize A TALLER → B (joined by the side) links its HEIGHT and stays edge-
+  // touching (never overlapping).
+  const aH0 = (await a.boundingBox())!.height
+  const rh = (await a.getByTestId('resize-handle').boundingBox())!
+  await page.mouse.move(rh.x + 4, rh.y + 4)
+  await page.mouse.down()
+  await page.mouse.move(rh.x + 4, rh.y + 4 + 80, { steps: 12 })
+  await page.mouse.up()
+  const aR = (await a.boundingBox())!
+  const bR = (await b.boundingBox())!
+  expect(aR.height).toBeGreaterThan(aH0 + 40)                 // A grew
+  expect(Math.abs(bR.height - aR.height)).toBeLessThan(8)     // B's height LINKED
+  expect(Math.abs(bR.x - (aR.x + aR.width))).toBeLessThan(10) // still touching, no overlap
+
+  // Shaking A vigorously breaks the stick group apart — the link badge vanishes.
+  const at = (await a.getByTestId('subwindow-titlebar').boundingBox())!
+  const cx = at.x + 40, cy = at.y + at.height / 2
+  await page.mouse.move(cx, cy)
+  await page.mouse.down()
+  for (let i = 0; i < 9; i++) await page.mouse.move(cx + (i % 2 ? -34 : 34), cy, { steps: 2 })
+  await page.mouse.up()
+  await expect(page.getByTestId('stuck-badge')).toHaveCount(0, { timeout: 4_000 })
 })
