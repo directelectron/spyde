@@ -32,6 +32,10 @@ test.beforeAll(async () => {
 
 test.afterAll(async () => { await app?.close() })
 
+// The OM compute (CIF→library build + numba-JIT'd template match over the lazy
+// dataset) is slow and variable on a cold run — give it a generous budget.
+test.setTimeout(180_000)
+
 test('orientation mapping runs on lazy data and opens the IPF map window', async () => {
   const before = await page.getByTestId('subwindow').count()
   await page.evaluate(() => window.electron.action('run_test_orientation', {}))
@@ -39,7 +43,7 @@ test('orientation mapping runs on lazy data and opens the IPF map window', async
   // The IPF-Z orientation-map window opens once compute finishes (library build
   // + template match over the lazy dataset).
   await expect.poll(() => page.getByTestId('subwindow').count(), {
-    timeout: 90_000, message: 'orientation IPF window never opened',
+    timeout: 150_000, message: 'orientation IPF window never opened',
   }).toBeGreaterThan(before)
 
   // Its title marks it as the orientation (IPF-Z) result.
@@ -53,4 +57,13 @@ test('orientation mapping runs on lazy data and opens the IPF map window', async
   await expect(toggle).toBeVisible({ timeout: 15_000 })
   await page.getByTestId(/^ipf-view-3d-/).first().click()
   await expect(page.getByTestId(/^ipf-view-3d-/).first()).toBeVisible()
+
+  // The native IPF density heatmap (inverse pole density function) is also
+  // attached → a "PDF" toggle (view:"density"). Switching to it shows the
+  // density iframe; screenshot it for the inverse-pole-density-function view.
+  const pdf = page.getByTestId(/^ipf-view-density-/).first()
+  await expect(pdf).toBeVisible({ timeout: 20_000 })
+  await pdf.click()
+  await page.waitForTimeout(1500)
+  await page.screenshot({ path: join(__dirname, '..', 'ipf_density.png') })
 })

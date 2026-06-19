@@ -39,13 +39,34 @@ class TestIpf3D:
         assert np.allclose(norms, 1.0, atol=1e-3)
         assert rgb.dtype == np.uint8
 
+    def test_ipf_key_data_url(self):
+        # The colour-key triangle legend rasterises to a PNG data URL.
+        from spyde.actions.ipf_view import ipf_key_data_url
+        url = ipf_key_data_url(_al_orientation_map(), "z")
+        assert url.startswith("data:image/png;base64,")
+        assert len(url) > 2000                      # a real raster, not empty
+
+    def test_emit_ipf_key_message(self):
+        import spyde.backend.ipc as ipc
+        from spyde.actions.ipf_view import emit_ipf_key
+        captured, orig = [], ipc.emit
+        ipc.emit = lambda m: captured.append(m)
+        try:
+            assert emit_ipf_key(77, _al_orientation_map(), "z") is True
+        finally:
+            ipc.emit = orig
+        keys = [m for m in captured if m.get("type") == "ipf_key"]
+        assert keys and keys[-1]["window_id"] == 77
+        assert keys[-1]["data_url"].startswith("data:image/png")
+
     def test_build_3d_figure_html(self):
         om = _al_orientation_map()
         xyz, rgb = om.ipf_sphere_points("z")
         from spyde.actions.ipf_view import build_ipf_3d_figure
-        fig, fig_id, html = build_ipf_3d_figure(xyz, rgb)
+        fig, fig_id, html, p3d = build_ipf_3d_figure(xyz, rgb)
         assert isinstance(html, str) and len(html) > 500
         assert isinstance(fig_id, str) and fig_id
+        assert p3d is not None                       # the live Plot3D (for set_highlight)
 
     def test_emit_3d_figure_message(self):
         # emit_ipf_3d posts a `figure` message tagged view="3d".

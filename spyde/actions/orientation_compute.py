@@ -16,10 +16,19 @@ everything here is unit-testable headless.
 from __future__ import annotations
 
 import functools
+import threading
 import time
 from typing import Optional
 
 import numpy as np
+
+# pyxem's numba template matcher (``_mixed_matching_lib_to_polar`` /
+# ``_slice_radial_integrate`` / ``get_slices2d``) uses a workqueue layer that is
+# NOT thread-safe under concurrent calls — running two matches at once segfaults.
+# Several callers run on different threads at once (the live refine spot overlay,
+# the live IPF correlation heatmap, and the whole-field compute), so EVERY pyxem
+# matcher call must serialise through this one global lock.
+PYXEM_LOCK = threading.RLock()
 
 from spyde.signals.orientation_map import (
     SpyDEOrientationMap, phase_to_dict,
@@ -71,20 +80,21 @@ def build_matching_cache(signal, sim) -> dict:
     )
 
     NR, NA = 100, 360
-    slices, factors, factors_slice, radial_range = \
-        signal.calibration.get_slices2d(NR, NA)
+    with PYXEM_LOCK:        # pyxem geometry + template build is not thread-safe
+        slices, factors, factors_slice, radial_range = \
+            signal.calibration.get_slices2d(NR, NA)
 
-    r0, r1 = float(radial_range[0]), float(radial_range[1])
-    radial_axis = r0 + (r1 - r0) / NR * np.arange(NR)
-    azim_axis = np.linspace(-np.pi, np.pi, NA, endpoint=False)
+        r0, r1 = float(radial_range[0]), float(radial_range[1])
+        radial_axis = r0 + (r1 - r0) / NR * np.arange(NR)
+        azim_axis = np.linspace(-np.pi, np.pi, NA, endpoint=False)
 
-    r_templates, theta_templates, intensities_templates = \
-        sim.polar_flatten_simulations(
-            radial_axes=radial_axis, azimuthal_axes=azim_axis,
+        r_templates, theta_templates, intensities_templates = \
+            sim.polar_flatten_simulations(
+                radial_axes=radial_axis, azimuthal_axes=azim_axis,
+            )
+        integrated = _get_integrated_polar_templates(
+            NR, r_templates, intensities_templates, True
         )
-    integrated = _get_integrated_polar_templates(
-        NR, r_templates, intensities_templates, True
-    )
     intensities_raw = intensities_templates.copy().astype(float)
     intensities_norm = _norm_rows(intensities_raw.copy())
 
@@ -167,20 +177,20 @@ def best_match_spots(pattern_data, sim, matching_cache, *, gamma: float = 0.5,
     NR, NA = matching_cache["NR"], matching_cache["NA"]
 
     pattern_data = np.asarray(pattern_data, dtype=float)
-    polar = _slice_radial_integrate(
-        pattern_data, factors, factors_slice, slices, NR, NA, mean=True
-    )
-    polar = np.nan_to_num(polar ** gamma).T.astype(float)   # (NA, NR)
-
     int_templates = int_norm if normalize_templates else matching_cache["intensities_raw"]
-    result = _mixed_matching_lib_to_polar(
-        polar,
-        integrated_templates=integrated,
-        r_templates=r_tmpl,
-        theta_templates=theta_tmpl,
-        intensities_templates=int_templates,
-        n_keep=None, frac_keep=1.0, n_best=integrated.shape[0], transpose=False,
-    )
+    with PYXEM_LOCK:        # serialise pyxem's numba matcher (not thread-safe)
+        polar = _slice_radial_integrate(
+            pattern_data, factors, factors_slice, slices, NR, NA, mean=True
+        )
+        polar = np.nan_to_num(polar ** gamma).T.astype(float)   # (NA, NR)
+        result = _mixed_matching_lib_to_polar(
+            polar,
+            integrated_templates=integrated,
+            r_templates=r_tmpl,
+            theta_templates=theta_tmpl,
+            intensities_templates=int_templates,
+            n_keep=None, frac_keep=1.0, n_best=integrated.shape[0], transpose=False,
+        )
     row = result[0]                       # best match (sorted desc by corr)
     lib_idx = int(row[0])
     rot_idx = int(row[2])
@@ -327,18 +337,19 @@ def _match_chunk(
     for iy in range(ny):
         for ix in range(nx):
             pattern = np.asarray(block[iy, ix], dtype=float)
-            polar = _slice_radial_integrate(
-                pattern, factors, factors_slice, slices, NR, NA, mean=True
-            )
-            polar = np.nan_to_num(polar ** gamma).T.astype(float)
-            result = _mixed_matching_lib_to_polar(
-                polar,
-                integrated_templates=integrated,
-                r_templates=r_tmpl,
-                theta_templates=theta_tmpl,
-                intensities_templates=int_templates,
-                n_keep=None, frac_keep=1.0, n_best=k, transpose=False,
-            )
+            with PYXEM_LOCK:        # serialise pyxem's numba matcher (not thread-safe)
+                polar = _slice_radial_integrate(
+                    pattern, factors, factors_slice, slices, NR, NA, mean=True
+                )
+                polar = np.nan_to_num(polar ** gamma).T.astype(float)
+                result = _mixed_matching_lib_to_polar(
+                    polar,
+                    integrated_templates=integrated,
+                    r_templates=r_tmpl,
+                    theta_templates=theta_tmpl,
+                    intensities_templates=int_templates,
+                    n_keep=None, frac_keep=1.0, n_best=k, transpose=False,
+                )
             rows = np.atleast_2d(result)[:k]
             lib = rows[:, 0].astype(int)
             if mask_idx is not None:
@@ -444,15 +455,6 @@ def _do_compute_orientations(
         client = getattr(getattr(main_window, "dask_manager", None),
                          "client", None)
 
-    # Big read-only payloads: scatter once per cluster instead of pickling
-    # them into every task.
-    cache_arg = cache
-    if client is not None:
-        try:
-            cache_arg = client.scatter(cache, broadcast=True)
-        except Exception:
-            cache_arg = cache
-
     chunk_fn = functools.partial(
         _match_chunk,
         n_best=n_best,
@@ -467,53 +469,70 @@ def _do_compute_orientations(
     )
 
     sig_axes_idx = list(range(nav_dim, nav_dim + sig_dim))
-    result_da = da.map_blocks(
-        chunk_fn,
-        da_data,
-        cache_arg,
-        dtype=np.float32,
-        drop_axis=sig_axes_idx,
-        new_axis=[nav_dim, nav_dim + 1],
-        chunks=da_data.chunks[:nav_dim] + ((n_best,), (4,)),
-        meta=np.empty((0,) * (nav_dim + 2), dtype=np.float32),
-    )
+
+    def _build(cache_obj):
+        # The big read-only matching cache is passed as a map_blocks arg; when
+        # distributed it's a scattered Future (shared once), else the inline dict.
+        return da.map_blocks(
+            chunk_fn, da_data, cache_obj, dtype=np.float32,
+            drop_axis=sig_axes_idx, new_axis=[nav_dim, nav_dim + 1],
+            chunks=da_data.chunks[:nav_dim] + ((n_best,), (4,)),
+            meta=np.empty((0,) * (nav_dim + 2), dtype=np.float32),
+        )
+
     print(f"[orientation] graph built in {time.time() - tic:.1f} s "
           f"({len(template_quats)} templates, n_best={n_best})")
-
     if stopped_flag is not None and stopped_flag[0]:
         return None
 
-    # ── Submit ────────────────────────────────────────────────────────────────
-    tic = time.time()
-    if client is not None:
-        from spyde.compute_dispatch import split_workers_for_gpu, \
-            dispatch_chunks
-        gpu_addrs, cpu_addrs = split_workers_for_gpu(client)
-        if gpu_addrs and cpu_addrs:
-            result4 = dispatch_chunks(
-                client, result_da, nav_dim, gpu_addrs, cpu_addrs,
-                stopped_flag=stopped_flag, fill_value=0.0,
-                label="orientation",
-            )
-            if result4 is None:
-                return None
-        else:
-            future = client.compute(result_da)
-            while not future.done():
-                if stopped_flag is not None and stopped_flag[0]:
-                    try:
-                        future.cancel()
-                    except Exception:
-                        pass
-                    return None
-                time.sleep(0.1)
-            result4 = future.result()
-    else:
+    def _threaded():
         # Pin the threaded scheduler: a bare .compute() silently runs on any
         # ambient distributed Client (dask makes a live Client the global
-        # default), changing where — and with what thread count — the
-        # matcher's parallel tie-breaking executes.
-        result4 = result_da.compute(scheduler="threads")
+        # default), changing where — and with what thread count — the matcher's
+        # parallel tie-breaking executes. Also the resilient in-process fallback.
+        return _build(cache).compute(scheduler="threads")
+
+    # ── Submit ────────────────────────────────────────────────────────────────
+    tic = time.time()
+    result4 = None
+    if client is not None:
+        # Scatter the cache (broadcast) so it isn't pickled into every task.
+        try:
+            cache_arg = client.scatter(cache, broadcast=True)
+        except Exception:
+            cache_arg = cache
+        try:
+            from spyde.compute_dispatch import split_workers_for_gpu, dispatch_chunks
+            gpu_addrs, cpu_addrs = split_workers_for_gpu(client)
+            if gpu_addrs and cpu_addrs:
+                result4 = dispatch_chunks(
+                    client, _build(cache_arg), nav_dim, gpu_addrs, cpu_addrs,
+                    stopped_flag=stopped_flag, fill_value=0.0, label="orientation",
+                )
+                if result4 is None:
+                    return None
+            else:
+                future = client.compute(_build(cache_arg))
+                while not future.done():
+                    if stopped_flag is not None and stopped_flag[0]:
+                        try:
+                            future.cancel()
+                        except Exception:
+                            pass
+                        return None
+                    time.sleep(0.1)
+                result4 = future.result()
+        except Exception as e:
+            # A worker dying mid-compute loses the scattered cache and cancels the
+            # graph (FutureCancelledError / KilledWorker). Recover by recomputing
+            # in-process on the threaded scheduler — slower, but it always finishes.
+            if stopped_flag is not None and stopped_flag[0]:
+                return None
+            print(f"[orientation] distributed compute failed ({type(e).__name__}: {e}); "
+                  f"falling back to in-process threaded compute…")
+            result4 = _threaded()
+    else:
+        result4 = _threaded()
     print(f"[orientation] matched {nav_shape[0] * nav_shape[1]} patterns "
           f"in {time.time() - tic:.1f} s")
 

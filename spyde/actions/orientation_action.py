@@ -13,6 +13,7 @@ memory-safe (per-chunk slices only; never computes the full dataset).
 from __future__ import annotations
 
 import threading
+import time
 
 import numpy as np
 import hyperspy.api as hs
@@ -20,7 +21,7 @@ import hyperspy.api as hs
 from spyde.backend.ipc import emit, emit_status, emit_error
 from spyde.actions.context import src_plot_tree as _src_plot_tree
 
-DEFAULTS = dict(accelerating_voltage=200.0, resolution=1.0, n_best=5, gamma=0.5,
+DEFAULTS = dict(accelerating_voltage=200.0, resolution=1.0, n_best=5, gamma=1.0,
                 minimum_intensity=1e-4)
 
 
@@ -107,19 +108,15 @@ def run_orientation(session, src, src_tree, phases, sim_params, match_params,
         minimum_intensity=float(sim_params.get("minimum_intensity", 1e-4)),
         reciprocal_radius=_reciprocal_radius(src),
     )
-    gamma = float(match_params.get("gamma", 0.5))
+    gamma = float(match_params.get("gamma", DEFAULTS["gamma"]))
     emit_status("Orientation: matching templates…")
-    om = _do_compute_orientations(
-        src, sim,
-        dict(n_best=match_params.get("n_best", 5),
-             gamma=gamma,
-             normalize_templates=bool(match_params.get("normalize_templates", True))),
-        main_window=session, signal_tree=src_tree,
-    )
+    om = _compute_with_live_ipf(
+        session, src, src_tree, sim,
+        dict(n_best=match_params.get("n_best", 5), gamma=gamma,
+             normalize_templates=bool(match_params.get("normalize_templates", True))))
     if om is None:
         emit_error("Orientation: compute returned no result")
         return None
-    _build_ipf_window(session, src, om)
     _overlay_template_on_source(src_tree, src_dp_plot, src, sim, gamma)
     emit_status("Orientation map complete")
     return om
@@ -151,31 +148,100 @@ def _overlay_template_on_source(src_tree, dp_plot, src, sim, gamma) -> None:
         logging.getLogger(__name__).debug("orientation overlay attach failed: %s", e)
 
 
-def _build_ipf_window(session, src, om) -> None:
-    """Open a window showing the IPF-Z orientation map (RGB) and attach the map."""
-    ipf = om.ipf_color_map(direction="z")        # (ny, nx, 3) uint8
-    ny, nx = om.nav_shape
+def _open_refine_ipf(session, dp_plot, signal, sim, cache, tree):
+    """Open the live per-phase IPF correlation-heatmap window for refine and wire
+    a controller to the navigator. Returns the controller (or None)."""
+    try:
+        from spyde.actions.ipf_refine import build_phase_ipf
+        from spyde.actions.ipf_refine_render import (
+            build_refine_figure, emit_refine_window, RefineIpfController,
+        )
+        infos = build_phase_ipf(sim)
+        if not infos:
+            return None
+        _fig, fig_id, html, panels = build_refine_figure(infos)
+        base = signal.metadata.get_item("General.title", "Signal")
+        emit_refine_window(session, fig_id, html, title=f"{base} — IPF Refine")
+        return RefineIpfController(
+            dp_plot, signal, sim, cache, infos, panels,
+            gamma=DEFAULTS["gamma"], normalize=False).attach(tree)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).debug("refine IPF window failed: %s", e)
+        return None
 
+
+def _create_blank_ipf_window(session, src, ny, nx):
+    """Open a blank IPF-Z window up front (for the progressive fill-in)."""
     new_sig = hs.signals.Signal2D(np.zeros((ny, nx), dtype=np.float32))
     base = src.metadata.get_item("General.title", "Signal")
     new_sig.metadata.General.title = f"{base} — Orientation (IPF-Z)"
+    return session._add_signal(new_sig)
 
-    tree = session._add_signal(new_sig)
+
+def _finalize_ipf_window(tree, om) -> None:
+    """Paint the final IPF-Z map, attach the map + 3-D explorer + point selector."""
     tree.orientation_map = om
-
+    ipf = om.ipf_color_map(direction="z")        # (ny, nx, 3) uint8
     for sp in list(getattr(tree, "signal_plots", [])):
         try:
             sp.needs_auto_level = True
             sp.set_data(ipf)   # RGB → Plot._set_array routes it to anyplotlib
         except Exception:
             pass
-
-    # Add the 3-D IPF explorer as a second figure → the window gets a 2D/3D toggle.
     try:
-        from spyde.actions.ipf_view import attach_ipf_3d
+        from spyde.actions.ipf_view import attach_ipf_3d, attach_ipf_point_selector
         attach_ipf_3d(tree, om, direction="z")
+        attach_ipf_point_selector(tree, om, "z")
     except Exception:
         pass
+
+
+def _compute_with_live_ipf(session, src, src_tree, sim, params):
+    """Dense orientation match with a PROGRESSIVE IPF: open the IPF-Z window blank
+    up front, poll the per-chunk shared-memory buffer to fill the map in live (Qt
+    live-buffer parity), then finalize. Returns the SpyDEOrientationMap (or None).
+    """
+    from spyde.actions.orientation_compute import _do_compute_orientations
+    from spyde.drawing.update_functions import ensure_live_buffer, read_live_buffer
+    nav_dim = src.axes_manager.navigation_dimension
+    ny, nx = tuple(int(s) for s in src.data.shape[:nav_dim])[-2:]
+    om_tree = _create_blank_ipf_window(session, src, ny, nx)
+    shm_name = f"spyde_om_{id(src)}"
+    try:
+        shm = ensure_live_buffer((ny, nx, 9), shm_name)
+    except Exception:
+        shm, shm_name = None, None
+    stop_poll = [False]
+
+    def _poller():
+        sp = next(iter(getattr(om_tree, "signal_plots", []) or []), None)
+        while not stop_poll[0]:
+            try:
+                z = read_live_buffer((ny, nx, 9), shm_name)[..., 6:9]   # Z RGB
+                if sp is not None and np.isfinite(z).any():
+                    sp.needs_auto_level = True
+                    sp.set_data(np.nan_to_num(z).clip(0, 255).astype(np.uint8))
+            except Exception:
+                pass
+            time.sleep(0.4)
+
+    if shm_name is not None:
+        threading.Thread(target=_poller, daemon=True, name="om-poll").start()
+    try:
+        om = _do_compute_orientations(src, sim, params, main_window=session,
+                                      signal_tree=src_tree, shm_name=shm_name)
+    finally:
+        stop_poll[0] = True
+        if shm is not None:
+            try:
+                shm.close()
+                shm.unlink()
+            except Exception:
+                pass
+    if om is not None:
+        _finalize_ipf_window(om_tree, om)
+    return om
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -225,19 +291,34 @@ def om_generate_library(session, plot, payload) -> None:
                     old["overlay"].remove()
                 except Exception:
                     pass
-            # The live refine overlay (single-pattern best-match) is single-phase;
-            # skip it for multi-phase libraries — the whole-field Run is multi-phase.
+            # Build the matching cache once (used by both the single-pattern
+            # best-match overlay AND the per-phase IPF correlation heatmap).
+            cache = build_matching_cache(src_root, sim)
+
+            # The single-pattern best-match SPOT overlay is single-phase; skip it
+            # for multi-phase (the whole-field Run handles multi-phase).
             overlay = None
-            cache = None
             if len(phases) == 1:
-                cache = build_matching_cache(src_root, sim)
                 overlay = attach_orientation_overlay(
                     src, src_root, sim, cache, tree,
-                    gamma=0.5, max_radius=recip_r, normalize_templates=False,
+                    gamma=DEFAULTS["gamma"], max_radius=recip_r, normalize_templates=False,
                 )
+
+            # Live IPF correlation-heatmap window (one triangle per phase): updates
+            # as the navigator moves; double-click a triangle to limit the refined
+            # IPF region. Multi-phase elegantly → multiple triangles.
+            refine_ipf = _open_refine_ipf(session, src, src_root, sim, cache, tree)
+
+            old_ipf = getattr(getattr(tree, "_om_wizard", None) or {}, "get", lambda *_: None)("refine_ipf")
+            if old_ipf is not None:
+                try:
+                    old_ipf.remove()
+                except Exception:
+                    pass
+
             tree._om_wizard = {
                 "phases": phases, "sim": sim, "cache": cache, "overlay": overlay,
-                "voltage": voltage, "recip_r": recip_r,
+                "refine_ipf": refine_ipf, "voltage": voltage, "recip_r": recip_r,
             }
             n_ph = len(phases)
             extra = "move the crosshair to refine" if n_ph == 1 else f"{n_ph} phases"
@@ -257,21 +338,32 @@ def om_refine(session, plot, payload) -> None:
     sliders → redraw the matched template at the current crosshair position."""
     src, tree = _src_plot_tree(session, plot)
     wiz = getattr(tree, "_om_wizard", None) if tree is not None else None
-    if not wiz or wiz.get("overlay") is None:
+    if not wiz or (wiz.get("overlay") is None and wiz.get("refine_ipf") is None):
         return
 
     def _work():
-        try:
-            wiz["overlay"].set_refine_params(
-                gamma=payload.get("gamma"),
-                scale_override=payload.get("scale_override"),
-                min_intensity=payload.get("min_intensity"),
-                normalize_templates=payload.get("normalize_templates"),
-            )
-            wiz["refine"] = dict(payload)
-        except Exception as e:
-            import logging
-            logging.getLogger(__name__).debug("om_refine failed: %s", e)
+        if wiz.get("overlay") is not None:
+            try:
+                wiz["overlay"].set_refine_params(
+                    gamma=payload.get("gamma"),
+                    scale_override=payload.get("scale_override"),
+                    min_intensity=payload.get("min_intensity"),
+                    normalize_templates=payload.get("normalize_templates"),
+                )
+                wiz["refine"] = dict(payload)
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).debug("om_refine failed: %s", e)
+        # The IPF heatmap follows the same gamma / normalize knobs (and exists for
+        # multi-phase too, where the spot overlay does not).
+        rip = wiz.get("refine_ipf")
+        if rip is not None:
+            try:
+                rip.set_refine_params(gamma=payload.get("gamma"),
+                                      normalize=payload.get("normalize_templates"))
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).debug("refine ipf params failed: %s", e)
 
     threading.Thread(target=_work, daemon=True, name="om-refine").start()
 
@@ -292,16 +384,12 @@ def om_run(session, plot, payload) -> None:
 
     def _work():
         try:
-            from spyde.actions.orientation_compute import _do_compute_orientations
-            om = _do_compute_orientations(
-                tree.root, sim,
-                dict(n_best=n_best, gamma=gamma, normalize_templates=normalize),
-                main_window=session, signal_tree=tree,
-            )
+            om = _compute_with_live_ipf(
+                session, tree.root, tree, sim,
+                dict(n_best=n_best, gamma=gamma, normalize_templates=normalize))
             if om is None:
                 emit_error("Orientation: compute returned no result")
                 return
-            _build_ipf_window(session, tree.root, om)
             emit_status("Orientation map complete")
         except Exception as e:
             import traceback

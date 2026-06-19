@@ -28,8 +28,10 @@ def _as_orientation_map(result):
     return result
 
 
-def build_ipf_3d_figure(xyz: np.ndarray, rgb: np.ndarray):
-    """Build the 3-D IPF scatter figure → ``(fig, fig_id, html)``."""
+def build_ipf_3d_figure(xyz: np.ndarray, rgb: np.ndarray, highlight=None):
+    """Build the 3-D IPF scatter figure → ``(fig, fig_id, html)``. If
+    ``highlight`` is a 3-vector, draw a large black-ringed white marker there (the
+    orientation of the pixel picked by the map's point selector)."""
     import anyplotlib as apl
     import anyplotlib._electron as _electron
     from spyde.drawing.plots.plot import finalize_figure_html
@@ -47,16 +49,26 @@ def build_ipf_3d_figure(xyz: np.ndarray, rgb: np.ndarray):
         p3d.set_sphere(1.0)
     except Exception:
         pass
+    if highlight is not None:
+        try:
+            p3d.set_highlight(float(highlight[0]), float(highlight[1]),
+                              float(highlight[2]), color="#ffffff", size=11)
+        except Exception:
+            pass
 
     fig_id = _electron.register(fig)
     html = finalize_figure_html(fig, fig_id)
     _ALIVE.append(fig)
-    return fig, fig_id, html
+    return fig, fig_id, html, p3d
 
 
-def emit_ipf_3d(window_id: int, result, direction: str = "z") -> bool:
+def emit_ipf_3d(window_id: int, result, direction: str = "z",
+                highlight_iyix=None, tree=None) -> bool:
     """Compute the sphere points from *result* and emit a ``view="3d"`` figure for
-    *window_id*. Returns True if a 3-D figure was emitted (False if no points)."""
+    *window_id*. ``highlight_iyix=(iy,ix)`` marks that pixel's orientation. When a
+    ``tree`` is given the live ``Plot3D`` is cached on ``tree._ipf_p3d`` so a later
+    point-pick updates the highlight IN PLACE (camera preserved) instead of
+    re-emitting. Returns True if a figure was emitted."""
     from spyde.backend.ipc import emit
 
     om = _as_orientation_map(result)
@@ -69,7 +81,18 @@ def emit_ipf_3d(window_id: int, result, direction: str = "z") -> bool:
     if xyz is None or len(xyz) == 0:
         return False
 
-    _fig, fig_id, html = build_ipf_3d_figure(np.asarray(xyz), np.asarray(rgb))
+    highlight = None
+    if highlight_iyix is not None:
+        try:
+            iy, ix = int(highlight_iyix[0]), int(highlight_iyix[1])
+            highlight = om.ipf_xyz(iy, ix, 0, direction)[0]      # the sphere point
+        except Exception:
+            highlight = None
+
+    _fig, fig_id, html, p3d = build_ipf_3d_figure(
+        np.asarray(xyz), np.asarray(rgb), highlight=highlight)
+    if tree is not None:
+        tree._ipf_p3d = p3d
     emit({
         "type": "figure", "fig_id": fig_id, "window_id": window_id,
         "html": html, "title": "IPF (3D)", "is_navigator": False, "view": "3d",
@@ -77,10 +100,146 @@ def emit_ipf_3d(window_id: int, result, direction: str = "z") -> bool:
     return True
 
 
+def ipf_key_data_url(result, direction: str = "z") -> str:
+    """Rasterise the IPF colour-KEY triangle (orix ``IPFColorKeyTSL.plot`` — the
+    standard stereographic fundamental-sector legend, e.g. cubic [001]/[101]/[111])
+    to a transparent-background PNG data URL. This is the legend the matplotlib /
+    pyxem IPF plots show next to the map; the triangle is the crystal-direction
+    colour key (same for sample X/Y/Z)."""
+    import base64
+    import io
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from orix.plot import IPFColorKeyTSL
+    from spyde.signals.orientation_map import _direction_vector
+
+    om = _as_orientation_map(result)
+    phase = om.orix_phase(0)                       # primary phase's point group
+    key = IPFColorKeyTSL(phase.point_group.laue, direction=_direction_vector(direction))
+    fig = key.plot(return_figure=True)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=96, bbox_inches="tight", transparent=True)
+    plt.close(fig)
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{b64}"
+
+
+def emit_ipf_key(window_id: int, result, direction: str = "z") -> bool:
+    """Emit the IPF colour-key triangle legend for *window_id* (shown pinned in a
+    corner of the IPF map)."""
+    from spyde.backend.ipc import emit
+    try:
+        url = ipf_key_data_url(result, direction)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).debug("ipf key raster failed: %s", e)
+        return False
+    emit({"type": "ipf_key", "window_id": int(window_id), "data_url": url})
+    return True
+
+
 def attach_ipf_3d(tree, result, direction: str = "z") -> bool:
-    """Add the 3-D IPF view to *tree*'s IPF window (its first signal plot)."""
+    """Add the 3-D IPF view + the colour-key triangle legend to *tree*'s IPF
+    window (its first signal plot)."""
     sp = next(iter(getattr(tree, "signal_plots", []) or []), None)
     wid = getattr(sp, "window_id", None)
     if wid is None:
         return False
-    return emit_ipf_3d(wid, result, direction)
+    tree._ipf_result = result          # remember it for X/Y/Z re-colouring
+    emit_ipf_key(wid, result, direction)
+    ok = emit_ipf_3d(wid, result, direction, tree=tree)
+    try:                               # native IPDF density heatmap (3rd toggle)
+        from spyde.actions.ipf_density import emit_ipf_density
+        emit_ipf_density(wid, result, direction)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).debug("ipf density attach failed: %s", e)
+    return ok
+
+
+def attach_ipf_point_selector(tree, result, direction: str = "z") -> None:
+    """Add a white crosshair POINT SELECTOR to the IPF map's first plot. Picking a
+    pixel re-emits the 3-D IPF sphere with that orientation marked — the "pick on
+    the map, see it on the IPF legend" interaction."""
+    sp = next(iter(getattr(tree, "signal_plots", []) or []), None)
+    plot2d = getattr(sp, "_plot2d", None) if sp is not None else None
+    wid = getattr(sp, "window_id", None)
+    if plot2d is None or wid is None:
+        return
+    try:
+        ny, nx = int(result.nav_shape[0]), int(result.nav_shape[1])
+        widget = plot2d.add_crosshair_widget(color="#ffffff")
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).debug("ipf point selector init failed: %s", e)
+        return
+    tree._ipf_picker = widget
+    tree._ipf_result = result
+
+    def _on_pick(event=None):
+        try:
+            ix = int(round(float(widget.cx)))
+            iy = int(round(float(widget.cy)))
+        except Exception:
+            return
+        if not (0 <= iy < ny and 0 <= ix < nx):
+            return
+        res = getattr(tree, "_ipf_result", result)
+        d = getattr(tree, "_ipf_direction", direction)
+        p3d = getattr(tree, "_ipf_p3d", None)
+        if p3d is not None:
+            # Camera-preserving: move the highlight on the existing 3-D figure in
+            # place (a view-only push) rather than rebuilding the whole sphere.
+            try:
+                v = _as_orientation_map(res).ipf_xyz(iy, ix, 0, d)[0]
+                p3d.set_highlight(float(v[0]), float(v[1]), float(v[2]),
+                                  color="#ffffff", size=11)
+                return
+            except Exception:
+                pass
+        emit_ipf_3d(wid, res, d, (iy, ix), tree=tree)   # fallback: rebuild
+
+    try:
+        widget.add_event_handler(_on_pick, "pointer_up")
+    except Exception:
+        pass
+
+
+def ipf_set_direction(session, plot, payload) -> None:
+    """Re-colour an IPF window's 2-D map AND its 3-D explorer by sample direction
+    x | y | z (the IPF axis selector). The orientation result is cached on the
+    tree by ``attach_ipf_3d``; works for raw-OM (`orientation_map`) and vector-OM
+    (`vector_orientation`)."""
+    direction = str(payload.get("direction", "z")).lower()
+    if direction not in ("x", "y", "z"):
+        return
+    tree = getattr(plot, "signal_tree", None)
+    if tree is None:
+        return
+    result = (getattr(tree, "_ipf_result", None)
+              or getattr(tree, "orientation_map", None)
+              or getattr(tree, "vector_orientation", None))
+    if result is None:
+        return
+    try:
+        om = _as_orientation_map(result)
+        ipf = om.ipf_color_map(direction)                 # (ny,nx,3) uint8
+        for sp in list(getattr(tree, "signal_plots", [])):
+            try:
+                sp.needs_auto_level = True
+                sp.set_data(ipf)
+            except Exception:
+                pass
+        tree._ipf_direction = direction
+        wid = getattr(plot, "window_id", None)
+        if wid is not None:
+            emit_ipf_3d(wid, result, direction, tree=tree)   # frontend replaces the old 3-D
+            try:                                              # refresh density heatmap too
+                from spyde.actions.ipf_density import emit_ipf_density
+                emit_ipf_density(wid, result, direction)
+            except Exception:
+                pass
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).debug("ipf_set_direction failed: %s", e)
