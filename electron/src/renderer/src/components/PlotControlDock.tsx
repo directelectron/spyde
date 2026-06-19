@@ -7,6 +7,7 @@
 import React from 'react'
 import { useSpyDE } from '../kernel/SpyDEContext'
 import type { TreeNode, AxisRow } from '../kernel/SpyDEContext'
+import { CompositionPanel } from './CompositionPanel'
 
 // Compact workflow tree: each step is a row with a depth guide-rail, a node dot,
 // and the step name. The active (displayed) node is highlighted. Hovering tints
@@ -293,6 +294,15 @@ export function PlotControlDock() {
             onPick={(id) => activeId != null && sendAction('select_signal_node', { signal_id: id }, activeId)}
           />
         </div>
+      )}
+
+      {/* 3.5 Composition (sample elements + atomic % → HyperSpy metadata) */}
+      {win && (
+        <CompositionPanel
+          activeId={activeId}
+          composition={activeId != null ? state.composition.get(activeId) : undefined}
+          sendAction={sendAction}
+        />
       )}
 
       {/* 4. Metadata — two columns to save vertical space */}
