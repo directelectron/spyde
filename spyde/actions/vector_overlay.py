@@ -20,9 +20,12 @@ Coordinate system (the subtle part):
 """
 from __future__ import annotations
 
+import logging
 import threading
 
 import numpy as np
+
+log = logging.getLogger(__name__)
 
 
 def _indices_to_iyix(indices):
@@ -136,8 +139,8 @@ class _DPOverlay:
         except Exception:
             try:
                 self._mg.set(offsets=offsets)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("pushing overlay marker offsets failed: %s", e)
 
     def set_visible(self, visible: bool) -> None:
         self._hidden = not bool(visible)
@@ -146,16 +149,14 @@ class _DPOverlay:
 
     def remove(self):
         for sel in self._selectors:
-            try:
+            if self._on_indices in sel.index_hooks:
                 sel.index_hooks.remove(self._on_indices)
-            except ValueError:
-                pass
         self._selectors = []
         if self._mg is not None:
             try:
                 self._mg.remove()
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("removing overlay marker group failed: %s", e)
             self._mg = None
 
 
@@ -421,8 +422,8 @@ class VectorOrientationOverlay(_DPOverlay):
         if self.on_fit is not None:
             try:
                 self.on_fit(fit)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("on_fit overlay callback failed: %s", e)
 
     def _offsets_for(self, iy, ix):
         from spyde.actions.vector_orientation import (
@@ -502,23 +503,21 @@ class VectorOrientationOverlay(_DPOverlay):
                 continue
             try:
                 mg.set(offsets=off)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("pushing meas/tmpl marker offsets failed: %s", e)
 
     def remove(self):
         for sel in self._selectors:
-            try:
+            if self._on_indices in sel.index_hooks:
                 sel.index_hooks.remove(self._on_indices)
-            except ValueError:
-                pass
         self._selectors = []
         for attr in ("_mg_meas", "_mg_tmpl"):
             mg = getattr(self, attr, None)
             if mg is not None:
                 try:
                     mg.remove()
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("removing meas/tmpl marker group failed: %s", e)
                 setattr(self, attr, None)
 
 

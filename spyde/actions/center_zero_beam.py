@@ -14,12 +14,15 @@ the Electron backend (mirrors the find_vectors / orientation split).
 """
 from __future__ import annotations
 
+import logging
 import threading
 
 import numpy as np
 
 from spyde.backend.ipc import emit, emit_status, emit_error
 from spyde.actions.context import src_plot_tree as _src_plot_tree, current_signal as _current_signal
+
+log = logging.getLogger(__name__)
 
 DEFAULTS = dict(method="center_of_mass", half_square_width=0, make_flat_field=False)
 _CROSS_COLOR = "#ffcc00"
@@ -31,8 +34,8 @@ def _display(src, tree, new_signal) -> None:
     only REGISTERS the new PlotState; switching the view is a separate step."""
     try:
         src.set_plot_state(new_signal)
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("switching source plot to centered node failed: %s", e)
     npm = getattr(tree, "navigator_plot_manager", None)
     if npm is None:
         return
@@ -40,8 +43,8 @@ def _display(src, tree, new_signal) -> None:
         for sel in sels:
             try:
                 sel.delayed_update_data(force=True)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("re-slicing navigator after centering failed: %s", e)
 
 
 def center_zero_beam(ctx, action_name: str = "Center Zero Beam", **kwargs):
@@ -67,8 +70,8 @@ def czb_auto(session, plot, payload) -> None:
         try:
             try:
                 signal.set_signal_type("electron_diffraction")
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("set_signal_type(electron_diffraction) failed: %s", e)
             kw = {"method": method, "lazy_output": False}
             if hw > 0:
                 kw["half_square_width"] = hw
@@ -81,8 +84,7 @@ def czb_auto(session, plot, payload) -> None:
                     if lp is not None:
                         shifts = lp
                 except Exception as e:
-                    import logging
-                    logging.getLogger(__name__).debug("flat-field plane failed: %s", e)
+                    log.debug("flat-field plane failed: %s", e)
             new = tree.add_transformation(
                 parent_signal=signal, method="center_direct_beam",
                 node_name="Centered", shifts=shifts, inplace=False,
@@ -93,8 +95,8 @@ def czb_auto(session, plot, payload) -> None:
             _display(src, tree, new)
             try:
                 session._reemit_signal_tree(src)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("re-emitting signal tree after centering failed: %s", e)
             emit_status("Zero beam centered")
             emit({"type": "czb_done",
                   "window_id": getattr(src, "window_id", None), "mode": "auto"})
@@ -122,8 +124,7 @@ def czb_manual_start(session, plot, payload) -> None:
         tree._czb_cross = cross
         emit_status("Drag the crosshair onto the zero beam, then Apply")
     except Exception as e:
-        import logging
-        logging.getLogger(__name__).debug("czb crosshair add failed: %s", e)
+        log.debug("czb crosshair add failed: %s", e)
 
 
 def _czb_manual_stop_obj(tree) -> None:
@@ -131,8 +132,8 @@ def _czb_manual_stop_obj(tree) -> None:
     if cross is not None:
         try:
             cross.hide()
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("hiding czb crosshair failed: %s", e)
         tree._czb_cross = None
 
 
@@ -164,8 +165,8 @@ def czb_manual(session, plot, payload) -> None:
             import hyperspy.api as hs
             try:
                 signal.set_signal_type("electron_diffraction")
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("set_signal_type(electron_diffraction) failed: %s", e)
             am = signal.axes_manager
             sig_ax = am.signal_axes
             w, h = int(sig_ax[0].size), int(sig_ax[1].size)
@@ -191,8 +192,8 @@ def czb_manual(session, plot, payload) -> None:
             _display(src, tree, new)
             try:
                 session._reemit_signal_tree(src)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("re-emitting signal tree after centering failed: %s", e)
             _czb_manual_stop_obj(tree)
             emit_status("Zero beam centered (manual)")
             emit({"type": "czb_done",

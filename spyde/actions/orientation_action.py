@@ -12,6 +12,7 @@ memory-safe (per-chunk slices only; never computes the full dataset).
 """
 from __future__ import annotations
 
+import logging
 import threading
 import time
 
@@ -20,6 +21,8 @@ import hyperspy.api as hs
 
 from spyde.backend.ipc import emit, emit_status, emit_error
 from spyde.actions.context import src_plot_tree as _src_plot_tree
+
+log = logging.getLogger(__name__)
 
 DEFAULTS = dict(accelerating_voltage=200.0, resolution=1.0, n_best=5, gamma=1.0,
                 minimum_intensity=1e-4)
@@ -134,8 +137,8 @@ def _overlay_template_on_source(src_tree, dp_plot, src, sim, gamma) -> None:
     if old is not None:
         try:
             old.remove()
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("removing prior orientation overlay failed: %s", e)
     try:
         cache = build_matching_cache(src, sim)
         src_tree._orientation_overlay = attach_orientation_overlay(
@@ -144,8 +147,7 @@ def _overlay_template_on_source(src_tree, dp_plot, src, sim, gamma) -> None:
             normalize_templates=True,
         )
     except Exception as e:
-        import logging
-        logging.getLogger(__name__).debug("orientation overlay attach failed: %s", e)
+        log.debug("orientation overlay attach failed: %s", e)
 
 
 def _open_refine_ipf(session, dp_plot, signal, sim, cache, tree):
@@ -166,8 +168,7 @@ def _open_refine_ipf(session, dp_plot, signal, sim, cache, tree):
             dp_plot, signal, sim, cache, infos, panels,
             gamma=DEFAULTS["gamma"], normalize=False).attach(tree)
     except Exception as e:
-        import logging
-        logging.getLogger(__name__).debug("refine IPF window failed: %s", e)
+        log.debug("refine IPF window failed: %s", e)
         return None
 
 
@@ -187,14 +188,14 @@ def _finalize_ipf_window(tree, om) -> None:
         try:
             sp.needs_auto_level = True
             sp.set_data(ipf)   # RGB → Plot._set_array routes it to anyplotlib
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("painting IPF map onto signal plot failed: %s", e)
     try:
         from spyde.actions.ipf_view import attach_ipf_3d, attach_ipf_point_selector
         attach_ipf_3d(tree, om, direction="z")
         attach_ipf_point_selector(tree, om, "z")
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("attaching 3-D IPF explorer failed: %s", e)
 
 
 def _compute_with_live_ipf(session, src, src_tree, sim, params):
@@ -222,8 +223,8 @@ def _compute_with_live_ipf(session, src, src_tree, sim, params):
                 if sp is not None and np.isfinite(z).any():
                     sp.needs_auto_level = True
                     sp.set_data(np.nan_to_num(z).clip(0, 255).astype(np.uint8))
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("live IPF poll paint failed: %s", e)
             time.sleep(0.4)
 
     if shm_name is not None:
@@ -237,8 +238,8 @@ def _compute_with_live_ipf(session, src, src_tree, sim, params):
             try:
                 shm.close()
                 shm.unlink()
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("cleaning up OM live-buffer shared memory failed: %s", e)
     if om is not None:
         _finalize_ipf_window(om_tree, om)
     return om
@@ -289,8 +290,8 @@ def om_generate_library(session, plot, payload) -> None:
             if old is not None and old.get("overlay") is not None:
                 try:
                     old["overlay"].remove()
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("removing prior OM wizard overlay failed: %s", e)
             # Build the matching cache once (used by both the single-pattern
             # best-match overlay AND the per-phase IPF correlation heatmap).
             cache = build_matching_cache(src_root, sim)
@@ -313,8 +314,8 @@ def om_generate_library(session, plot, payload) -> None:
             if old_ipf is not None:
                 try:
                     old_ipf.remove()
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("removing prior refine IPF window failed: %s", e)
 
             tree._om_wizard = {
                 "phases": phases, "sim": sim, "cache": cache, "overlay": overlay,
