@@ -77,6 +77,14 @@ class StrainController:
         update_strain_view(self.p, self.field, component, self.glyph)
 
 
+# ── toolbar entry (ActionContext convention: fn(ctx, ...)) ────────────────────
+
+def strain_mapping(ctx, action_name: str = "Strain Mapping", **params) -> None:
+    """Toolbar entry on a Find-Vectors result — open the interactive strain
+    window (one-shot; the live reference crosshair + component toggle take over)."""
+    strain_run(ctx.session, ctx.plot, {})
+
+
 # ── staged handlers (session.py dispatch: fn(session, plot, payload)) ──────────
 
 def strain_run(session, plot, payload) -> None:

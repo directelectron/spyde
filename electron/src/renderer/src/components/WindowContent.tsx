@@ -11,6 +11,7 @@ interface Props {
 
 // The reserved view_label of the backend-built side-by-side comparison figure.
 const TILED = '__tiled__'
+const STRAIN_LABEL: Record<string, string> = { exx: 'εxx', eyy: 'εyy', exy: 'εxy', omega: 'ω' }
 
 // A window's content area: the unified "view" selector + the figure it shows.
 //
@@ -47,8 +48,14 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction, ipfKey
   }, [figs])
   const hasChips = labels.length >= 2
 
+  // Strain window: one figure carrying the component list → an εxx/εyy/εxy/ω
+  // toggle that swaps the shown component in place (strain_set_component).
+  const strainFig = useMemo(() => figs.find(f => f.strainComponents && f.strainComponents.length), [figs])
+  const strainComponents = strainFig?.strainComponents
+
   const [mode, setMode] = useState<'2d' | '3d' | 'density'>('2d')
   const [dir, setDir] = useState<'x' | 'y' | 'z'>('z')
+  const [strainComp, setStrainComp] = useState('exx')
 
   // Fall back to the 2-D map if the active mode's figure disappears (e.g. a
   // result re-run before the 3-D / density figure re-arrives).
@@ -117,7 +124,7 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction, ipfKey
     return () => { cancelAnimationFrame(raf); ro.disconnect() }
   }, [shownId, iframeRefs])
 
-  const showBar = hasChips || has3d
+  const showBar = hasChips || has3d || !!strainComponents
 
   return (
     <div style={styles.root}>
@@ -150,6 +157,15 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction, ipfKey
                 <button key={d} data-testid={`ipf-dir-${d}-${id}`}
                   onClick={() => { setDir(d); sendAction('ipf_set_direction', { direction: d }, win.windowId) }}
                   style={d === dir ? styles.btnActive : styles.btn}>{d.toUpperCase()}</button>
+              ))}
+            </div>
+          )}
+          {strainComponents && (
+            <div style={styles.group} data-testid={`strain-toggle-${id}`}>
+              {strainComponents.map(c => (
+                <button key={c} data-testid={`strain-comp-${c}-${id}`}
+                  onClick={() => { setStrainComp(c); sendAction('strain_set_component', { component: c }, win.windowId) }}
+                  style={c === strainComp ? styles.btnActive : styles.btn}>{STRAIN_LABEL[c] ?? c}</button>
               ))}
             </div>
           )}

@@ -59,6 +59,7 @@ export interface SpyDEFigure {
   view?: string                 // "3d" for the IPF 3-D explorer figure (2D/3D toggle)
   viewLabel?: string            // chip text for the unified view selector (εxx, VDF, IPF X…)
   viewKind?: string             // "2d" | "3d" — representation kind of this named view
+  strainComponents?: string[]   // ["exx","eyy","exy","omega"] → the strain component toggle
 }
 
 export type MetadataDict = Record<string, Record<string, string>>
@@ -106,7 +107,7 @@ interface State {
 type Action =
   | { type: 'READY'; dashboardUrl?: string }
   | { type: 'STATUS'; text: string }
-  | { type: 'FIGURE'; windowId: number; figId: string; fileUrl: string | null; title: string; isNavigator: boolean; aspect?: number; view?: string; viewLabel?: string; viewKind?: string }
+  | { type: 'FIGURE'; windowId: number; figId: string; fileUrl: string | null; title: string; isNavigator: boolean; aspect?: number; view?: string; viewLabel?: string; viewKind?: string; strainComponents?: string[] }
   | { type: 'TOOLBAR_CONFIG'; windowId: number; plotId: number; actions: ToolbarAction[] }
   | { type: 'WINDOW_VISIBILITY'; windowId: number; visible: boolean }
   | { type: 'WINDOW_CLOSED'; windowId: number }
@@ -146,6 +147,7 @@ function spydeReducer(state: State, action: Action): State {
         view: action.view,
         viewLabel: action.viewLabel,
         viewKind: action.viewKind,
+        strainComponents: action.strainComponents,
       }
 
       const newFigures = new Map(state.figures)
@@ -415,6 +417,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
             view: msg.view as string | undefined,
             viewLabel: msg.view_label as string | undefined,
             viewKind: msg.view_kind as string | undefined,
+            strainComponents: msg.strain_components as string[] | undefined,
           })
           break
         }

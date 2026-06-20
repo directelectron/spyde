@@ -239,3 +239,12 @@ functions:
     toolbar_side: bottom
     navigation: False
     toggle: True
+
+  Strain Mapping:
+    description: Strain mapping from diffraction vectors (−g=g, centre-robust lattice fit). Drag the cyan reference crosshair to pick the unstrained region; toggle εxx/εyy/εxy/ω. Ellipse glyphs show the principal strains.
+    icon: drawing/toolbars/icons/strain.svg
+    function: spyde.actions.strain_action.strain_mapping
+    signal_types: [spyde_diffraction_vectors_image]
+    plot_dim: [2]
+    toolbar_side: bottom
+    navigation: False
