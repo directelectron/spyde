@@ -16,11 +16,14 @@ MEMORY: `_do_compute_vectors` uses `dask.array.map_overlap` and NEVER calls
 """
 from __future__ import annotations
 
+import logging
 import threading
 import time
 
 import numpy as np
 import hyperspy.api as hs
+
+log = logging.getLogger(__name__)
 
 from spyde.backend.ipc import emit, emit_status, emit_error
 from spyde.actions.context import src_plot_tree as _src_plot_tree
@@ -40,8 +43,8 @@ def _coerce(params: dict) -> dict:
             continue
         try:
             p[k] = bool(v) if isinstance(default, bool) else type(default)(v)
-        except (TypeError, ValueError):
-            pass
+        except (TypeError, ValueError) as e:
+            log.debug("find-vectors param %r=%r not coercible, using default: %s", k, v, e)
     return p
 
 
@@ -72,8 +75,8 @@ def _start_batch(session, plot, src_tree, p: dict):
     if prev is not None:
         try:
             prev.remove()
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("dropping find-vectors preview failed: %s", e)
         src_tree._fv_preview = None
 
     # ── Build the result tree up front: a lazy zero placeholder with the
@@ -95,8 +98,8 @@ def _start_batch(session, plot, src_tree, p: dict):
         new_sig._assign_subclass()
     try:
         new_sig.set_signal_type("spyde_diffraction_vectors_image")
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("set_signal_type(diffraction_vectors_image) failed: %s", e)
     base_title = src.metadata.get_item("General.title", "Signal")
     new_sig.metadata.General.title = f"{base_title} — Vectors"
 
@@ -131,8 +134,8 @@ def _start_batch(session, plot, src_tree, p: dict):
                 if nav_plot is not None and np.isfinite(arr).any():
                     nav_plot.needs_auto_level = True
                     nav_plot.set_data(np.nan_to_num(arr).astype(np.float32))
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("live count-map poll paint failed: %s", e)
             time.sleep(0.35)
 
     def _work():
@@ -146,17 +149,16 @@ def _start_batch(session, plot, src_tree, p: dict):
             _finalize(new_tree, vecs)
             _overlay_on_source(src_tree, src_dp_plot, vecs)
         except Exception as e:
-            import traceback
             emit_error(f"Find Vectors failed: {e}")
-            print(traceback.format_exc())
+            log.exception("Find Vectors compute failed")
         finally:
             stop_poll[0] = True
             if shm is not None:
                 try:
                     shm.close()
                     shm.unlink()
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("shared-memory cleanup failed: %s", e)
 
     if shm_name is not None:
         threading.Thread(target=_poller, daemon=True, name="fv-poll").start()
@@ -175,13 +177,12 @@ def _overlay_on_source(src_tree, dp_plot, vecs) -> None:
     if old is not None:
         try:
             old.remove()
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("removing prior vector overlay failed: %s", e)
     try:
         src_tree._vector_overlay = attach_vector_overlay(dp_plot, vecs, src_tree)
     except Exception as e:
-        import logging
-        logging.getLogger(__name__).debug("vector overlay attach failed: %s", e)
+        log.debug("vector overlay attach failed: %s", e)
 
 
 def _finalize(tree, vecs) -> None:
@@ -195,8 +196,8 @@ def _finalize(tree, vecs) -> None:
     try:
         tree.root.cached_dask_array = None
         tree.root._clear_cache_dask_data()
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("clearing stale cached dask array failed: %s", e)
     tree.diffraction_vectors = vecs
 
     count_map = vecs.count_map().astype(np.float32)
@@ -205,8 +206,8 @@ def _finalize(tree, vecs) -> None:
         try:
             nav_plot.needs_auto_level = True
             nav_plot.set_data(count_map)
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("painting final count map onto navigator failed: %s", e)
 
     # Re-send the toolbar config so the now-available vector actions appear.
     for sp in list(getattr(tree, "signal_plots", [])):
@@ -215,8 +216,8 @@ def _finalize(tree, vecs) -> None:
             state = getattr(sp, "plot_state", None)
             if state is not None and hasattr(state, "_send_toolbar_config"):
                 state._send_toolbar_config()
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("re-sending toolbar config after find-vectors failed: %s", e)
     _install_render_display(tree, vecs)
     _overlay_on_result(tree, vecs)
 
@@ -240,7 +241,8 @@ def _install_render_display(tree, vecs) -> None:
         iy, ix = _indices_to_iyix(indices)
         try:
             return vecs.render_frame(iy, ix)
-        except Exception:
+        except Exception as e:
+            log.debug("render_frame(%d, %d) failed, showing blank: %s", iy, ix, e)
             return np.zeros((H, W), dtype=np.float32)
 
     sig_plots = set(getattr(tree, "signal_plots", []))
@@ -256,8 +258,8 @@ def _install_render_display(tree, vecs) -> None:
     for sel in touched:
         try:
             sel.delayed_update_data(force=True)
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("forcing navigator re-slice after find-vectors failed: %s", e)
     if not touched:                      # fallback: the lazy nav path
         _refresh_signal_from_navigator(tree)
 
@@ -272,8 +274,8 @@ def _overlay_on_result(tree, vecs) -> None:
     if old is not None:
         try:
             old.remove()
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("removing prior vector overlay failed: %s", e)
         tree._result_vector_overlay = None
     for sp in list(getattr(tree, "signal_plots", [])):
         try:
@@ -305,8 +307,8 @@ def _refresh_signal_from_navigator(tree) -> None:
         for sel in selectors:
             try:
                 sel.delayed_update_data(force=True)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("navigator re-slice (lazy fallback) failed: %s", e)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -336,8 +338,8 @@ def fv_preview(session, plot, payload) -> None:
             if old is not None:
                 try:
                     old.remove()
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("dropping prior find-vectors preview failed: %s", e)
             tree._fv_preview = attach_find_vectors_preview(
                 src, tree.root, tree, sigma=p["sigma"],
                 kernel_radius=p["kernel_radius"], threshold=p["threshold"],
@@ -422,6 +424,6 @@ def fv_stop(session, plot, payload=None) -> None:
     if prev is not None:
         try:
             prev.remove()
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("removing find-vectors preview on stop failed: %s", e)
         tree._fv_preview = None
