@@ -13,7 +13,11 @@ No Qt.
 """
 from __future__ import annotations
 
+import logging
+
 import numpy as np
+
+log = logging.getLogger(__name__)
 
 # Keep figures alive past the emit so they are not garbage-collected while the
 # iframe is still mounted (the _electron registry holds a weak association only).
@@ -47,14 +51,14 @@ def build_ipf_3d_figure(xyz: np.ndarray, rgb: np.ndarray, highlight=None):
     )
     try:
         p3d.set_sphere(1.0)
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("setting IPF sphere failed: %s", e)
     if highlight is not None:
         try:
             p3d.set_highlight(float(highlight[0]), float(highlight[1]),
                               float(highlight[2]), color="#ffffff", size=11)
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("setting IPF highlight failed: %s", e)
 
     fig_id = _electron.register(fig)
     html = finalize_figure_html(fig, fig_id)
@@ -196,14 +200,14 @@ def attach_ipf_point_selector(tree, result, direction: str = "z") -> None:
                 p3d.set_highlight(float(v[0]), float(v[1]), float(v[2]),
                                   color="#ffffff", size=11)
                 return
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("in-place IPF highlight failed, rebuilding: %s", e)
         emit_ipf_3d(wid, res, d, (iy, ix), tree=tree)   # fallback: rebuild
 
     try:
         widget.add_event_handler(_on_pick, "pointer_up")
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("wiring IPF point-selector pick handler failed: %s", e)
 
 
 def ipf_set_direction(session, plot, payload) -> None:
@@ -229,8 +233,8 @@ def ipf_set_direction(session, plot, payload) -> None:
             try:
                 sp.needs_auto_level = True
                 sp.set_data(ipf)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("painting IPF map for new direction failed: %s", e)
         tree._ipf_direction = direction
         wid = getattr(plot, "window_id", None)
         if wid is not None:
@@ -238,8 +242,8 @@ def ipf_set_direction(session, plot, payload) -> None:
             try:                                              # refresh density heatmap too
                 from spyde.actions.ipf_density import emit_ipf_density
                 emit_ipf_density(wid, result, direction)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("refreshing IPF density heatmap failed: %s", e)
     except Exception as e:
         import logging
         logging.getLogger(__name__).debug("ipf_set_direction failed: %s", e)

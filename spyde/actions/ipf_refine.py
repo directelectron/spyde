@@ -15,7 +15,11 @@ Qt — only orix / pyxem.signals / scipy / matplotlib(Agg).
 """
 from __future__ import annotations
 
+import logging
+
 import numpy as np
+
+log = logging.getLogger(__name__)
 
 GRID_N = 96      # heatmap raster resolution per phase
 
@@ -95,12 +99,12 @@ def build_phase_ipf(sim) -> list[dict]:
             weights = np.hstack((bary, 1 - bary.sum(1, keepdims=True)))
             verts = v
             outside = ~inside_hull
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("Delaunay barycentric setup failed (using fallback): %s", e)
         try:                                              # also clip to the triangle polygon
             outside = outside | (~Path(tri_xy).contains_points(flat))
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("triangle-polygon clip failed: %s", e)
 
         infos.append(dict(
             phase_index=p,

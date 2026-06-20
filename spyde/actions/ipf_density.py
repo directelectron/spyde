@@ -13,9 +13,15 @@ No Qt.
 """
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 
 from spyde.actions.ipf_view import _as_orientation_map
+
+# NB: named `logger` (not `log`) — build_ipf_density_figure has a `log: bool`
+# param for log-scale density that would otherwise shadow a module-level `log`.
+logger = logging.getLogger(__name__)
 
 # Keep figures alive past the emit (the _electron registry holds only a weak ref).
 _ALIVE: list = []
@@ -85,8 +91,8 @@ def build_ipf_density_figure(result, direction: str = "z", *,
         if len(pidxs) > 1:
             try:
                 ax.set_title(str(getattr(phase, "name", "") or f"phase {pidx}"))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("set_title on IPF density panel failed: %s", e)
 
     fig_id = _electron.register(fig)
     html = finalize_figure_html(fig, fig_id)
@@ -101,8 +107,7 @@ def emit_ipf_density(window_id: int, result, direction: str = "z", **kw) -> bool
     try:
         _fig, fig_id, html = build_ipf_density_figure(result, direction, **kw)
     except Exception as e:
-        import logging
-        logging.getLogger(__name__).debug("ipf density build failed: %s", e)
+        logger.debug("ipf density build failed: %s", e)
         return False
     emit({
         "type": "figure", "fig_id": fig_id, "window_id": int(window_id),

@@ -18,9 +18,13 @@ fully-native panel is wanted.
 """
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 
 from spyde.actions.ipf_refine import interp_grid
+
+log = logging.getLogger(__name__)
 
 # Keep figures alive past the emit (the _electron registry holds a weak ref).
 _ALIVE: list = []
@@ -87,12 +91,12 @@ def build_refine_figure(infos: list[dict]):
         p = ax.imshow(rgba, axes=[gx, gy], origin="upper")
         try:
             ax.set_axis_off()
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("set_axis_off on refine panel failed: %s", e)
         try:
             ax.set_title(str(info["name"]))
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("set_title on refine panel failed: %s", e)
         panels.append({"plot2d": p, "info": info})
 
     fig_id = _electron.register(fig)
@@ -115,8 +119,8 @@ def update_panels(panels, corr_global, circles_per_phase, best_xy_per_phase=None
             cmap=cmap)
         try:
             panel["plot2d"].set_data(rgba)
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("updating refine panel raster failed: %s", e)
 
 
 def best_xy_for(infos, best_lib_idx: int):
@@ -242,13 +246,11 @@ class RefineIpfController:
 
         try:
             panel["plot2d"].add_event_handler(_on_dbl, "double_click")
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("wiring refine panel double-click failed: %s", e)
 
     def remove(self):
         for sel in self._selectors:
-            try:
+            if self._on_indices in sel.index_hooks:
                 sel.index_hooks.remove(self._on_indices)
-            except (ValueError, Exception):
-                pass
         self._selectors = []
