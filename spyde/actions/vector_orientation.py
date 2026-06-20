@@ -820,8 +820,8 @@ def compute_vector_orientation_chunked(
 
     if stopped_flag is not None and stopped_flag[0]:
         return None
-    print(f"[vector-orientation] matched {ny * nx} patterns in "
-          f"{time.time() - tic:.1f} s")
+    log.debug("[vector-orientation] matched %d patterns in %.1f s",
+              ny * nx, time.time() - tic)
 
     # Unpack the (ny, nx, 12) assembly.
     quats = np.nan_to_num(packed[..., 0:4], nan=0.0).astype(np.float32)

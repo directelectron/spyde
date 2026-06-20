@@ -1,5 +1,8 @@
+import logging
 from importlib.resources import files
 import yaml
+
+log = logging.getLogger(__name__)
 
 # Load the configuration .yaml files at package initialization
 
@@ -34,7 +37,7 @@ def _register_signal_extensions() -> None:
         for name, info in (spec.get("signals") or {}).items():
             ALL_EXTENSIONS["signals"].setdefault(name, info)
     except Exception as exc:  # never block import on a registration hiccup
-        print(f"SpyDE signal-extension registration skipped: {exc}")
+        log.warning("SpyDE signal-extension registration skipped: %s", exc)
 
 
 _register_signal_extensions()

@@ -251,9 +251,9 @@ def dispatch_chunks(
                                 int(w_info[a].get("nthreads", 1))
                                 for a in new_cpu if a in w_info
                             ) + 2)
-                            print(
-                                f"[{label}] dispatcher lanes refreshed: "
-                                f"GPU={len(new_gpu)} CPU={len(new_cpu)} workers"
+                            log.debug(
+                                "[%s] dispatcher lanes refreshed: GPU=%d CPU=%d workers",
+                                label, len(new_gpu), len(new_cpu),
                             )
                             while (outstanding["cpu"] < caps["cpu"]
                                    and pending):
@@ -309,9 +309,8 @@ def dispatch_chunks(
 
     _cleanup(cancel_outstanding=False)
     dt = max(time.time() - t0, 1e-9)
-    print(
-        f"[{label}] dispatcher done: {state['lane_done']['gpu']} GPU + "
-        f"{state['lane_done']['cpu']} CPU chunks in {dt:.1f} s "
-        f"({n_total / dt:.2f} chunks/s)"
+    log.debug(
+        "[%s] dispatcher done: %d GPU + %d CPU chunks in %.1f s (%.2f chunks/s)",
+        label, state['lane_done']['gpu'], state['lane_done']['cpu'], dt, n_total / dt,
     )
     return result

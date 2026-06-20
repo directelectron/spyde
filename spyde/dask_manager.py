@@ -82,7 +82,7 @@ class DaskManager:
             self._cluster = cluster
             self._client = client
             self._gpu_worker_address = gpu_worker_address
-            print(f"Dask cluster ready. Dashboard: {client.dashboard_link}")
+            logger.info("Dask cluster ready. Dashboard: %s", client.dashboard_link)
 
             worker_keys = list(client.scheduler_info(n_workers=-1)["workers"].keys())
             heavy = worker_keys[1:]
@@ -103,7 +103,7 @@ class DaskManager:
         import multiprocessing as mp
         import gc
 
-        print("Shutting down Dask cluster and client...")
+        logger.info("Shutting down Dask cluster and client...")
         for name in ("distributed", "distributed.comm", "distributed.comm.tcp"):
             lg = _logging.getLogger(name)
             lg.setLevel(_logging.CRITICAL)

@@ -88,9 +88,8 @@ def orientation_mapping(ctx, action_name: str = "Orientation Mapping",
             run_orientation(session, src, src_tree, [phase], sim_params,
                             match_params, src_dp_plot=src_dp_plot)
         except Exception as e:
-            import traceback
             emit_error(f"Orientation Mapping failed: {e}")
-            print(traceback.format_exc())
+            log.exception("Orientation Mapping failed")
 
     threading.Thread(target=_work, daemon=True, name="orientation").start()
     return None
@@ -327,9 +326,8 @@ def om_generate_library(session, plot, payload) -> None:
             emit({"type": "om_library_ready", "window_id": getattr(src, "window_id", None),
                   "n_templates": n_templates})
         except Exception as e:
-            import traceback
             emit_error(f"Generate Library failed: {e}")
-            print(traceback.format_exc())
+            log.exception("Generate Library failed")
 
     threading.Thread(target=_work, daemon=True, name="om-generate-library").start()
 
@@ -393,8 +391,7 @@ def om_run(session, plot, payload) -> None:
                 return
             emit_status("Orientation map complete")
         except Exception as e:
-            import traceback
             emit_error(f"Compute Map failed: {e}")
-            print(traceback.format_exc())
+            log.exception("Compute Map failed")
 
     threading.Thread(target=_work, daemon=True, name="om-run").start()

@@ -90,7 +90,7 @@ async def _main() -> None:
             elif msg_type == "quit":
                 break
             else:
-                print(f"[backend] unknown message type: {msg_type}")
+                log.warning("[backend] unknown message type: %s", msg_type)
         except Exception as e:
             from spyde.backend.ipc import emit_error
             emit_error(str(e))

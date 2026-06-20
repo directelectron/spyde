@@ -151,7 +151,7 @@ def _pinned_pool_get(shape, dtype):
         with _gpu_pool_lock:
             _pinned_alloc_bytes[0] -= nbytes
         _pinned_failed[0] = True
-        print("[find_vectors] pinned allocation failed — using pageable H2D")
+        log.debug("[find_vectors] pinned allocation failed — using pageable H2D")
         return None
 
 
@@ -1644,12 +1644,12 @@ def _find_vectors_chunk(
                         # The first CUDA touch in a fresh dask worker thread
                         # can fail transiently (driver init / cache-load
                         # race) — settles immediately after.  Retry once.
-                        print(f"[find_vectors] GPU attempt failed on {_wname} ({exc!r}) — retrying")
+                        log.warning("[find_vectors] GPU attempt failed on %s (%r) — retrying", _wname, exc)
                         time.sleep(0.5)
                     else:
                         # A silent fallback hides real throughput problems.
                         import traceback as _tb
-                        print(f"[find_vectors] GPU path failed on {_wname} ({exc!r}) — falling back to CPU")
+                        log.warning("[find_vectors] GPU path failed on %s (%r) — falling back to CPU", _wname, exc)
                         _tb.print_exc()
 
     # ── CPU fallback ──────────────────────────────────────────────────────────
@@ -1691,7 +1691,7 @@ def _find_vectors_chunk(
                     flat, kernel_r, threshold, min_dist,
                     subpixel=subpixel, beamstop_mask=beamstop_mask)
         except Exception as _e:
-            print(f"[find_vectors] torch GPU path failed ({_e}); CPU per-frame")
+            log.warning("[find_vectors] torch GPU path failed (%s); CPU per-frame", _e)
             peaks_list = None
         if peaks_list is None:
             peaks_list = [
@@ -1721,7 +1721,7 @@ def _find_vectors_chunk(
         core_shape = (n_lead, ny, nx)
     find_ms = (time.perf_counter() - t_find) * 1e3
     total_ms = (time.perf_counter() - t_start) * 1e3
-    print(
+    log.debug(
         f"[find_vectors] CPU chunk core={tuple(int(s) for s in core_shape)} "
         f"sig=({ghost_block.shape[-2]},{ghost_block.shape[-1]}) "
         f"blur={blur_ms:.0f}ms find={find_ms:.0f}ms total={total_ms:.0f}ms"
@@ -1896,7 +1896,7 @@ def _find_vectors_chunk_gpu(*args, **kwargs) -> np.ndarray:
                         with _gpu_exec_lock:
                             _gpu_warmup_probe()
                     if attempt:
-                        print(f"[find_vectors] GPU warmup succeeded on attempt {attempt + 1}")
+                        log.debug("[find_vectors] GPU warmup succeeded on attempt %d", attempt + 1)
                     _gpu_warmed[0] = True
                     break
                 except Exception as exc:
@@ -2126,8 +2126,8 @@ def _find_vectors_chunk_gpu_impl(
                 # Don't retry CuPy on every chunk of this process
                 _cupy_state["ok"] = False
                 nx_path[0] = "numba"
-                print(f"[find_vectors] CuPy NXCORR failed ({exc!r}) — "
-                      f"falling back to numba kernels")
+                log.warning("[find_vectors] CuPy NXCORR failed (%r) — "
+                            "falling back to numba kernels", exc)
 
         if raw_corr_obj is None:
             with _w.catch_warnings():
@@ -2307,7 +2307,7 @@ def _find_vectors_chunk_gpu_impl(
 
     total_ms = (time.perf_counter() - t_start) * 1e3
     if stage_timing:
-        print(
+        log.debug(
             f"[find_vectors] GPU chunk core={tuple(int(s) for s in core_shape)} sig=({KY},{KX}) "
             f"path={nx_path[0]} "
             + " ".join(f"{k}={v * 1e3:.0f}ms" for k, v in timings.items())
@@ -2315,7 +2315,7 @@ def _find_vectors_chunk_gpu_impl(
         )
     else:
         # Without per-stage syncs only host-blocking stages are meaningful.
-        print(
+        log.debug(
             f"[find_vectors] GPU chunk core={tuple(int(s) for s in core_shape)} sig=({KY},{KX}) "
             f"path={nx_path[0]} "
             f"stage={timings['stage'] * 1e3:.0f}ms h2d={timings['h2d'] * 1e3:.0f}ms "
@@ -2570,11 +2570,11 @@ def _do_compute_vectors(
         if nav_ok and sig_ok:
             da_data = raw
         else:
-            print(f"Rechunking to {nav_chunks_tuple} and {sig_chunks_tuple}")
+            log.debug("Rechunking to %s and %s", nav_chunks_tuple, sig_chunks_tuple)
             da_data = raw.rechunk(nav_chunks_tuple + sig_chunks_tuple)
 
     toc  = time.time()
-    print(f"Prepared dask array with chunks {da_data.chunks} in {toc - tic:.1f} s")
+    log.debug("Prepared dask array with chunks %s in %.1f s", da_data.chunks, toc - tic)
 
     # ── Build the map_overlap graph ───────────────────────────────────────────
     # trim=False: chunk_fn receives the full ghost-padded block and handles
@@ -2650,7 +2650,7 @@ def _do_compute_vectors(
             meta=np.empty((0,) * (nav_dim + 2), dtype=np.float32),
         )
     toc = time.time()
-    print(f"Built Dask graph with map_overlap in {toc - tic:.1f} s")
+    log.debug("Built Dask graph with map_overlap in %.1f s", toc - tic)
 
     # ── Live count map: write per-chunk counts into shm from the graph ───────
     # A passthrough map_blocks stage counts finite peaks per nav position and
@@ -2675,7 +2675,7 @@ def _do_compute_vectors(
     if stopped_flag is not None and stopped_flag[0]:
         return None
 
-    print("computing...")
+    log.debug("computing...")
     tic = time.time()
     if client is not None:
         # GPU-aware dual-lane dispatcher when the cluster has a designated
@@ -2683,7 +2683,7 @@ def _do_compute_vectors(
         # faster) GPU worker, so we place per-chunk futures ourselves.
         gpu_addrs, cpu_addrs = _split_workers_for_gpu(client)
         if gpu_addrs and cpu_addrs:
-            print(
+            log.debug(
                 f"[find_vectors] dispatcher lanes: "
                 f"GPU={len(gpu_addrs)} worker(s), CPU={len(cpu_addrs)} worker(s)"
             )
@@ -2711,7 +2711,7 @@ def _do_compute_vectors(
         # This computes the small padded-peaks output, never the raw dataset.
         result_padded = counted.compute(scheduler="threads")
     toc = time.time()
-    print(f"Computed vectors in {toc - tic:.1f} s")
+    log.debug("Computed vectors in %.1f s", toc - tic)
 
     if stopped_flag is not None and stopped_flag[0]:
         return None

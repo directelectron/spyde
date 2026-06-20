@@ -483,8 +483,8 @@ def _do_compute_orientations(
             meta=np.empty((0,) * (nav_dim + 2), dtype=np.float32),
         )
 
-    print(f"[orientation] graph built in {time.time() - tic:.1f} s "
-          f"({len(template_quats)} templates, n_best={n_best})")
+    log.debug("[orientation] graph built in %.1f s (%d templates, n_best=%d)",
+              time.time() - tic, len(template_quats), n_best)
     if stopped_flag is not None and stopped_flag[0]:
         return None
 
@@ -531,13 +531,14 @@ def _do_compute_orientations(
             # in-process on the threaded scheduler — slower, but it always finishes.
             if stopped_flag is not None and stopped_flag[0]:
                 return None
-            print(f"[orientation] distributed compute failed ({type(e).__name__}: {e}); "
-                  f"falling back to in-process threaded compute…")
+            log.warning("[orientation] distributed compute failed (%s: %s); "
+                        "falling back to in-process threaded compute…",
+                        type(e).__name__, e)
             result4 = _threaded()
     else:
         result4 = _threaded()
-    print(f"[orientation] matched {nav_shape[0] * nav_shape[1]} patterns "
-          f"in {time.time() - tic:.1f} s")
+    log.debug("[orientation] matched %d patterns in %.1f s",
+              nav_shape[0] * nav_shape[1], time.time() - tic)
 
     if stopped_flag is not None and stopped_flag[0]:
         return None

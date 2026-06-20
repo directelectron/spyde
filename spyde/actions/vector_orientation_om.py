@@ -135,9 +135,8 @@ def vom_generate_library(session, plot, payload) -> None:
                 emit_status("Vector Orientation: live IPF ready — refine, or "
                             "Compute Maps for the strain maps")
         except Exception as e:
-            import traceback
             emit_error(f"Generate Library failed: {e}")
-            print(traceback.format_exc())
+            log.exception("Generate Library failed")
 
     threading.Thread(target=_work, daemon=True, name="vom-generate-library").start()
 
@@ -259,9 +258,8 @@ def vom_run(session, plot, payload) -> None:
                                   with_ipf=with_ipf)
             emit_status("Vector Orientation map complete")
         except Exception as e:
-            import traceback
             emit_error(f"Compute Maps failed: {e}")
-            print(traceback.format_exc())
+            log.exception("Compute Maps failed")
 
     threading.Thread(target=_work, daemon=True, name="vom-run").start()
 

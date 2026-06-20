@@ -101,9 +101,8 @@ def czb_auto(session, plot, payload) -> None:
             emit({"type": "czb_done",
                   "window_id": getattr(src, "window_id", None), "mode": "auto"})
         except Exception as e:
-            import traceback
             emit_error(f"Center Zero Beam (auto) failed: {e}")
-            print(traceback.format_exc())
+            log.exception("Center Zero Beam (auto) failed")
 
     threading.Thread(target=_work, daemon=True, name="czb-auto").start()
 
@@ -199,8 +198,7 @@ def czb_manual(session, plot, payload) -> None:
             emit({"type": "czb_done",
                   "window_id": getattr(src, "window_id", None), "mode": "manual"})
         except Exception as e:
-            import traceback
             emit_error(f"Center Zero Beam (manual) failed: {e}")
-            print(traceback.format_exc())
+            log.exception("Center Zero Beam (manual) failed")
 
     threading.Thread(target=_work, daemon=True, name="czb-manual").start()

@@ -126,7 +126,7 @@ class Session:
         )
         self._plot_worker.plot_ready.connect(self._on_plot_ready)
         self._plot_worker.signal_ready.connect(self._on_signal_ready)
-        self._plot_worker.debug_print.connect(lambda msg: print(msg))
+        self._plot_worker.debug_print.connect(lambda msg: log.debug(msg))
         self._plot_worker.start()
 
         # Settings
@@ -278,13 +278,13 @@ class Session:
                 "metadata": build_metadata_dict(tree),
             })
         except Exception as e:
-            print(f"metadata emit failed: {e}")
+            log.warning("metadata emit failed: %s", e)
         self._emit_axes(tree)
         try:
             from spyde.actions.composition import emit_composition
             emit_composition(tree, self._tree_window_ids(tree))
         except Exception as e:
-            print(f"composition emit failed: {e}")
+            log.warning("composition emit failed: %s", e)
 
         emit_status(f"Loaded: {title or 'Signal'}")
         return tree
@@ -304,7 +304,7 @@ class Session:
                 "axes": build_axes_list(tree),
             })
         except Exception as e:
-            print(f"axes emit failed: {e}")
+            log.warning("axes emit failed: %s", e)
 
     # ── Plot / window management ───────────────────────────────────────────────
 
@@ -343,7 +343,7 @@ class Session:
                 "title": "Navigator",
             })
         except Exception as e:
-            print(f"set_selector_mode failed: {e}")
+            log.warning("set_selector_mode failed: %s", e)
 
     def _select_signal_node(self, plot, signal_id) -> None:
         """Switch *plot* to display the signal-tree node with the given id
@@ -407,7 +407,7 @@ class Session:
             else:
                 setattr(ax, field, str(value))
         except Exception as e:
-            print(f"set_axis failed: {e}")
+            log.warning("set_axis failed: %s", e)
             return
 
         # Recalibrate: re-push every plot in the tree (re-reads the axes →
@@ -475,7 +475,7 @@ class Session:
 
     def _on_plot_ready(self, plot, result, future) -> None:
         if isinstance(result, Exception):
-            print(f"Plot update failed: {result}")
+            log.warning("Plot update failed: %s", result)
             return
         try:
             if plot.current_data is not future:
@@ -483,11 +483,11 @@ class Session:
             plot.current_data = result
             plot.update()
         except Exception as e:
-            print(f"Failed to update plot: {e}")
+            log.warning("Failed to update plot: %s", e)
 
     def _on_signal_ready(self, signal, result, plot) -> None:
         if isinstance(result, Exception):
-            print(f"Signal update failed: {result}")
+            log.warning("Signal update failed: %s", result)
             return
         try:
             signal.data = result
@@ -495,7 +495,7 @@ class Session:
             signal._assign_subclass()
             plot.parent_selector.delayed_update_data(update_contrast=True, force=True)
         except Exception as e:
-            print(f"Failed to update signal: {e}")
+            log.warning("Failed to update signal: %s", e)
 
     def _load_test_data(self) -> None:
         """Load a synthetic 4D-STEM dataset (no file, no Dask, no download).
@@ -624,9 +624,8 @@ class Session:
                     dict(n_best=3, gamma=0.5), src_dp_plot=src,
                 )
             except Exception as e:
-                import traceback
                 emit_error(f"run_test_orientation failed: {e}")
-                print(traceback.format_exc())
+                log.exception("run_test_orientation failed")
 
         threading.Thread(target=_work, daemon=True, name="test-orientation").start()
 
@@ -694,7 +693,7 @@ class Session:
                 plot, payload.get("name"), payload.get("params", {})
             )
         else:
-            print(f"Unknown action: {action}")
+            log.warning("Unknown action: %s", action)
 
     def _dispatch_toolbar_action(self, plot, name: str, params: dict) -> None:
         """Invoke a YAML-configured toolbar action by name on *plot*.
@@ -747,9 +746,8 @@ class Session:
                 result = target(ctx, action_name=name, **params)
             self._track_action_artifacts(plot, name, result)
         except Exception as e:
-            import traceback
             emit_error(f"Action '{name}' failed: {e}")
-            print(traceback.format_exc())
+            log.exception("Action '%s' failed", name)
 
     def _track_action_artifacts(self, src_plot, name: str, result) -> None:
         """Remember the selector + output windows a RegionAction created so the
@@ -847,7 +845,7 @@ class Session:
         try:
             plot.set_colormap(name)
         except Exception as e:
-            print(f"set_colormap failed: {e}")
+            log.warning("set_colormap failed: %s", e)
 
     def _set_clim(self, plot, vmin, vmax) -> None:
         if plot is None:
@@ -855,7 +853,7 @@ class Session:
         try:
             plot.set_clim(vmin, vmax)
         except Exception as e:
-            print(f"set_clim failed: {e}")
+            log.warning("set_clim failed: %s", e)
 
     def _close_window(self, window_id: int) -> None:
         plot = self._plot_by_window_id(window_id)
@@ -878,7 +876,7 @@ class Session:
             else:
                 self._close_signal_plot(plot, tree)
         except Exception as e:
-            print(f"close_window failed: {e}")
+            log.warning("close_window failed: %s", e)
 
     def _close_plot(self, plot) -> None:
         """Tear down a single plot and tell the renderer to drop its window."""
@@ -982,7 +980,7 @@ class Session:
             if fig_id is not None:
                 _el.resize_figure(fig_id, int(width), int(height))
         except Exception as e:
-            print(f"resize_figure failed: {e}")
+            log.warning("resize_figure failed: %s", e)
 
     def _dispatch_figure_event(self, window_id: int, event_json: str | None) -> None:
         if event_json is None:
@@ -996,7 +994,7 @@ class Session:
             if fig_id is not None:
                 _el.dispatch_event(fig_id, event_json)
         except Exception as e:
-            print(f"dispatch_figure_event failed: {e}")
+            log.warning("dispatch_figure_event failed: %s", e)
 
     # ── Settings & recent files ────────────────────────────────────────────────
 
