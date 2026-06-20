@@ -160,7 +160,9 @@ class BaseSignalTree:
                     if _sig:
                         _sig[0].data = arr
                 except Exception:
-                    pass
+                    # Primary (threaded) navigator load — a failure here leaves a
+                    # blank navigator, so surface the traceback rather than hide it.
+                    logger.exception("threaded navigator compute failed")
             threading.Thread(target=_bg_nav, daemon=True, name="nav-threaded").start()
             return
 
@@ -171,8 +173,8 @@ class BaseSignalTree:
             if isinstance(old_future, _Future):
                 try:
                     self.client.cancel(old_future)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("cancelling prior navigator future failed: %s", e)
 
         shm_name = f"spyde_nav_{id(nav_plot)}"
 
@@ -195,8 +197,9 @@ class BaseSignalTree:
             try:
                 buf = np.ndarray(_shape, dtype=np.float32, buffer=_shm.buf)
                 buf[nav_slices] = chunk_result.astype(np.float32)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("writing navigator chunk %r to shm failed: %s",
+                             nav_slices, e)
 
         relay.chunk_ready.connect(_write_chunk)
 
@@ -233,8 +236,8 @@ class BaseSignalTree:
                             if hi > _nav_levels[0][1]:
                                 _nav_levels[0] = (_nav_levels[0][0], hi)
                         nav_plot.set_data(arr, levels=_nav_levels[0])
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("navigator poll paint failed: %s", e)
                 time.sleep(0.1)
 
         t = threading.Thread(target=_poll_loop, daemon=True, name="nav-poll")
@@ -446,5 +449,5 @@ class BaseSignalTree:
             if hasattr(self, attr):
                 try:
                     setattr(self, attr, None)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("clearing tree attr %r on close failed: %s", attr, e)

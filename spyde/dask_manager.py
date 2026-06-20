@@ -127,8 +127,8 @@ class DaskManager:
                 except Exception:
                     try:
                         client.close()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("Dask client close failed during shutdown: %s", e)
             finally:
                 self._client = None
 
@@ -137,16 +137,16 @@ class DaskManager:
             try:
                 try:
                     cluster.scale(0)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("scaling Dask cluster to 0 failed: %s", e)
                 try:
                     cluster.close(timeout="2s")
                 except TypeError:
                     cluster.close(timeout=2)
                 except Exception:
                     cluster.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Dask cluster close failed during shutdown: %s", e)
             finally:
                 self._cluster = None
 
@@ -156,14 +156,15 @@ class DaskManager:
                 try:
                     child.terminate()
                     child.join(timeout=0.5)
-                except Exception:
+                except Exception as e:
+                    logger.debug("terminating worker %r failed, killing: %s", child, e)
                     try:
                         child.kill()
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+                    except Exception as e2:
+                        logger.debug("killing worker %r failed: %s", child, e2)
+        except Exception as e:
+            logger.debug("reaping Dask worker children failed: %s", e)
         try:
             gc.collect()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("gc.collect() during Dask shutdown failed: %s", e)
