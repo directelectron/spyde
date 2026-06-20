@@ -59,6 +59,7 @@ export interface SpyDEFigure {
   view?: string                 // "3d" for the IPF 3-D explorer figure (2D/3D toggle)
   viewLabel?: string            // chip text for the unified view selector (εxx, VDF, IPF X…)
   viewKind?: string             // "2d" | "3d" — representation kind of this named view
+  strainComponents?: string[]   // ["exx","eyy","exy","omega"] → the strain component toggle
 }
 
 export type MetadataDict = Record<string, Record<string, string>>
@@ -94,6 +95,7 @@ interface State {
   axes: Map<number, AxisRow[]>
   composition: Map<number, Composition>     // windowId → sample elements + percentages
   ipfKey: Map<number, string>               // windowId → IPF colour-key triangle (PNG data URL)
+  strainRings: Map<number, { rings: number[]; selected: number[] }>   // windowId → strain ring selection
   activeActions: Map<number, Set<string>>   // windowId → action names with live output
   subItems: Map<number, Map<string, SubItem[]>>  // windowId → action → dynamic chips
   status: string
@@ -106,7 +108,7 @@ interface State {
 type Action =
   | { type: 'READY'; dashboardUrl?: string }
   | { type: 'STATUS'; text: string }
-  | { type: 'FIGURE'; windowId: number; figId: string; fileUrl: string | null; title: string; isNavigator: boolean; aspect?: number; view?: string; viewLabel?: string; viewKind?: string }
+  | { type: 'FIGURE'; windowId: number; figId: string; fileUrl: string | null; title: string; isNavigator: boolean; aspect?: number; view?: string; viewLabel?: string; viewKind?: string; strainComponents?: string[] }
   | { type: 'TOOLBAR_CONFIG'; windowId: number; plotId: number; actions: ToolbarAction[] }
   | { type: 'WINDOW_VISIBILITY'; windowId: number; visible: boolean }
   | { type: 'WINDOW_CLOSED'; windowId: number }
@@ -114,6 +116,7 @@ type Action =
   | { type: 'METADATA'; windowIds: number[]; metadata: MetadataDict }
   | { type: 'COMPOSITION'; windowIds: number[]; composition: Composition }
   | { type: 'IPF_KEY'; windowId: number; dataUrl: string }
+  | { type: 'STRAIN_RINGS'; windowId: number; rings: number[]; selected: number[] }
   | { type: 'AXES'; windowIds: number[]; axes: AxisRow[] }
   | { type: 'ACTION_ACTIVE'; windowId: number; name: string; active: boolean }
   | { type: 'SUB_ITEM'; windowId: number; action: string; name: string; color: string; vtype?: string; calculation?: string; active: boolean }
@@ -146,6 +149,7 @@ function spydeReducer(state: State, action: Action): State {
         view: action.view,
         viewLabel: action.viewLabel,
         viewKind: action.viewKind,
+        strainComponents: action.strainComponents,
       }
 
       const newFigures = new Map(state.figures)
@@ -240,6 +244,7 @@ function spydeReducer(state: State, action: Action): State {
         axes: drop(state.axes),
         composition: drop(state.composition),
         ipfKey: drop(state.ipfKey),
+        strainRings: drop(state.strainRings),
         signalTrees: drop(state.signalTrees),
         signalTreeActive: drop(state.signalTreeActive),
         activeActions: drop(state.activeActions),
@@ -267,6 +272,12 @@ function spydeReducer(state: State, action: Action): State {
       const ipfKey = new Map(state.ipfKey)
       ipfKey.set(action.windowId, action.dataUrl)
       return { ...state, ipfKey }
+    }
+
+    case 'STRAIN_RINGS': {
+      const strainRings = new Map(state.strainRings)
+      strainRings.set(action.windowId, { rings: action.rings, selected: action.selected })
+      return { ...state, strainRings }
     }
 
     case 'AXES': {
@@ -351,6 +362,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     metadata: new Map(),
     composition: new Map(),
     ipfKey: new Map(),
+    strainRings: new Map(),
     histograms: new Map(),
     selectors: new Map(),
     signalTrees: new Map(),
@@ -415,6 +427,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
             view: msg.view as string | undefined,
             viewLabel: msg.view_label as string | undefined,
             viewKind: msg.view_kind as string | undefined,
+            strainComponents: msg.strain_components as string[] | undefined,
           })
           break
         }
@@ -456,6 +469,15 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
               '*',
             )
           }
+          break
+
+        case 'strain_rings':
+          dispatch({
+            type: 'STRAIN_RINGS',
+            windowId: msg.window_id as number,
+            rings: (msg.rings as number[]) ?? [],
+            selected: (msg.selected as number[]) ?? [],
+          })
           break
 
         case 'ipf_key':

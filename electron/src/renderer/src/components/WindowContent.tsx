@@ -7,10 +7,12 @@ interface Props {
   replayState: (figId: string) => void
   sendAction: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
   ipfKey?: string   // IPF colour-key triangle (PNG data URL) — legend for IPF windows
+  strainRings?: { rings: number[]; selected: number[] }   // strain reflection-ring selection
 }
 
 // The reserved view_label of the backend-built side-by-side comparison figure.
 const TILED = '__tiled__'
+const STRAIN_LABEL: Record<string, string> = { exx: 'εxx', eyy: 'εyy', exy: 'εxy', omega: 'ω' }
 
 // A window's content area: the unified "view" selector + the figure it shows.
 //
@@ -30,7 +32,7 @@ const TILED = '__tiled__'
 // All iframes stay MOUNTED; only the active one is shown (instant switch). A
 // ResizeObserver keeps the visible figure sized to its box (the single sizing
 // authority — handles window resize and the view-bar height).
-export function WindowContent({ win, iframeRefs, replayState, sendAction, ipfKey }: Props) {
+export function WindowContent({ win, iframeRefs, replayState, sendAction, ipfKey, strainRings }: Props) {
   const id = String(win.windowId)
   const figs = win.figures
 
@@ -47,8 +49,14 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction, ipfKey
   }, [figs])
   const hasChips = labels.length >= 2
 
+  // Strain window: one figure carrying the component list → an εxx/εyy/εxy/ω
+  // toggle that swaps the shown component in place (strain_set_component).
+  const strainFig = useMemo(() => figs.find(f => f.strainComponents && f.strainComponents.length), [figs])
+  const strainComponents = strainFig?.strainComponents
+
   const [mode, setMode] = useState<'2d' | '3d' | 'density'>('2d')
   const [dir, setDir] = useState<'x' | 'y' | 'z'>('z')
+  const [strainComp, setStrainComp] = useState('exx')
 
   // Fall back to the 2-D map if the active mode's figure disappears (e.g. a
   // result re-run before the 3-D / density figure re-arrives).
@@ -117,7 +125,7 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction, ipfKey
     return () => { cancelAnimationFrame(raf); ro.disconnect() }
   }, [shownId, iframeRefs])
 
-  const showBar = hasChips || has3d
+  const showBar = hasChips || has3d || !!strainComponents
 
   return (
     <div style={styles.root}>
@@ -151,6 +159,47 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction, ipfKey
                   onClick={() => { setDir(d); sendAction('ipf_set_direction', { direction: d }, win.windowId) }}
                   style={d === dir ? styles.btnActive : styles.btn}>{d.toUpperCase()}</button>
               ))}
+            </div>
+          )}
+          {strainComponents && (
+            <div style={styles.group} data-testid={`strain-toggle-${id}`}>
+              {strainComponents.map(c => (
+                <button key={c} data-testid={`strain-comp-${c}-${id}`}
+                  onClick={() => { setStrainComp(c); sendAction('strain_set_component', { component: c }, win.windowId) }}
+                  style={c === strainComp ? styles.btnActive : styles.btn}>{STRAIN_LABEL[c] ?? c}</button>
+              ))}
+              <span style={{ width: 6 }} />
+              {/* reference: the live crosshair region (relative) or a CIF spacing (absolute). */}
+              <button data-testid={`strain-ref-region-${id}`} style={styles.btn}
+                title="Reference = the cyan crosshair region (relative strain)"
+                onClick={() => sendAction('strain_set_cif', {}, win.windowId)}>Region</button>
+              <button data-testid={`strain-ref-cif-${id}`} style={styles.btn}
+                title="Absolute strain from a CIF's ideal spacing"
+                onClick={async () => {
+                  const p = await window.electron.pickFile({ name: 'Crystal (.cif)', extensions: ['cif'] })
+                  if (p) sendAction('strain_set_cif', { cif_path: p }, win.windowId)
+                }}>CIF…</button>
+              {/* reflection-ring selection: click a ring to include/exclude it from the fit. */}
+              {strainRings && strainRings.rings.length > 1 && (
+                <>
+                  <span style={{ width: 6 }} />
+                  {strainRings.rings.map((g, i) => {
+                    const on = strainRings.selected.includes(i)
+                    return (
+                      <button key={i} data-testid={`strain-ring-${i}-${id}`}
+                        title={`Reflection ring |g|=${g} Å⁻¹ — click to ${on ? 'exclude' : 'include'}`}
+                        onClick={() => {
+                          const next = on ? strainRings.selected.filter(s => s !== i)
+                                          : [...strainRings.selected, i]
+                          sendAction('strain_set_rings',
+                            { selected: next.length ? next : strainRings.rings.map((_, k) => k) },
+                            win.windowId)
+                        }}
+                        style={on ? styles.btnActive : styles.btn}>{`R${i + 1}`}</button>
+                    )
+                  })}
+                </>
+              )}
             </div>
           )}
         </div>

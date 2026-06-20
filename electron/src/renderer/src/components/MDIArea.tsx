@@ -307,6 +307,7 @@ export function MDIArea() {
               replayState={replayState}
               sendAction={sendAction}
               ipfKey={state.ipfKey.get(win.windowId)}
+              strainRings={state.strainRings.get(win.windowId)}
             />
           </SubWindow>
         )
