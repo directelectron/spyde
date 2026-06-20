@@ -1,20 +1,21 @@
 """
-ipf_refine_render.py — render the per-phase IPF correlation heatmap triangles for
-the OM refine step, one anyplotlib figure (subplots(1, n_phases)).
+ipf_refine_render.py — the per-phase IPF correlation heatmap triangles for the OM
+refine step, drawn **natively** with anyplotlib ``PlotXY`` (no matplotlib raster).
 
-Each phase panel's CONTENT (heatmap + triangle outline + corner labels +
-best-match marker + mask circles) is composed with matplotlib-Agg into an RGBA
-raster and shown through an anyplotlib ``imshow`` — so it (a) updates live via
-``set_data`` as the navigator moves and (b) reports ``double_click`` events in
-IPF data coords (for the region-limiting mask). One panel per phase.
+One ``subplots(1, n_phases)`` figure; each phase panel is a data-coordinate axis
+(``ax.axes2d``) holding, in z-order:
 
-NOTE: this panel is the one place SpyDE still composes a frame with matplotlib
-rather than native anyplotlib primitives. anyplotlib *can* draw it natively
-(imshow + add_polygons/add_texts/add_points/add_circles), but its marker overlays
-use IMAGE-PIXEL coords (not the stereographic data axis), so the triangle/labels/
-circles need a stereo→pixel transform + a y-flip + a double-click inverse to line
-up. The matplotlib raster sidesteps that and renders pixel-correct; revisit if a
-fully-native panel is wanted.
+* the heatmap — one polygon per inside-sector grid cell (built ONCE, clipped to
+  the curved sector via ``clip_path``); the live update just re-pushes the
+  per-cell **face colours** (``MarkerGroup.set(facecolors=…)``) so the geometry
+  and z-order are stable and each navigator move is a single push;
+* the mask circles (region-restriction), updated in place via ``vertices_list``;
+* the white triangle outline + ``[hkl]`` corner labels (static);
+* the red best-match marker (a scatter point), updated via ``offsets``.
+
+Everything is in stereographic DATA coordinates (like ``ipf_density``), so the
+triangle / labels / markers line up with the heatmap with no pixel transform, and
+``double_click`` reports the IPF data coords used for the mask.
 """
 from __future__ import annotations
 
@@ -29,75 +30,103 @@ log = logging.getLogger(__name__)
 # Keep figures alive past the emit (the _electron registry holds a weak ref).
 _ALIVE: list = []
 
+# "fire" (black→red→white) is anyplotlib's correlation-friendly map, same as the
+# IPF density heatmap. (anyplotlib's "inferno" is a wrong black→blue ramp.)
+_CMAP = "fire"
 
-def render_panel_rgba(vals: np.ndarray, info: dict, *, circles=(), best_xy=None,
-                      size_px: int = 300, cmap: str = "inferno") -> np.ndarray:
-    """A full IPF-heatmap panel → (size, size, 4) uint8 RGBA (row 0 = TOP)."""
-    import matplotlib
-    matplotlib.use("Agg")
-    from matplotlib.backends.backend_agg import FigureCanvasAgg
-    from matplotlib.figure import Figure
-    from matplotlib.patches import Circle
 
+def _lut(cmap: str = _CMAP) -> np.ndarray:
+    from anyplotlib._utils import _build_colormap_lut
+    return np.asarray(_build_colormap_lut(cmap))      # (256, 3)
+
+
+def _hex(rgb) -> str:
+    r, g, b = (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _mesh_geometry(info: dict):
+    """Quad polygons (data coords) for every inside-sector grid cell + their
+    ``(i, j)`` grid indices (so live updates colour them in the same order)."""
+    n = int(info["grid_n"])
     mins, maxs = info["mins"], info["maxs"]
-    fig = Figure(figsize=(size_px / 100.0, size_px / 100.0), dpi=100)
-    FigureCanvasAgg(fig)
-    fig.patch.set_alpha(0.0)
-    ax = fig.add_axes([0.02, 0.02, 0.96, 0.96])
-    ax.set_axis_off()
-    ax.set_xlim(mins[0], maxs[0])
-    ax.set_ylim(mins[1], maxs[1])
-    ax.set_aspect("equal")
-
-    ax.imshow(vals, extent=[mins[0], maxs[0], mins[1], maxs[1]], origin="lower",
-              cmap=cmap, vmin=0.0, vmax=1.0, interpolation="bilinear", zorder=0)
-    tri = info["tri_xy"]
-    ax.plot(tri[:, 0], tri[:, 1], color="white", lw=1.4, zorder=4)
-    for (lx, ly), txt in zip(info["label_xy"], info["labels"]):
-        ax.text(lx, ly, txt, color="white", ha="center", va="center",
-                fontsize=9, fontweight="bold", zorder=5)
-    for cx, cy, r in circles:
-        ax.add_patch(Circle((cx, cy), r, fc="#00e5ff", alpha=0.18, zorder=2))
-        ax.add_patch(Circle((cx, cy), r, fill=False, ec="#00e5ff", lw=1.6, zorder=3))
-    if best_xy is not None:
-        ax.plot([best_xy[0]], [best_xy[1]], marker="o", ms=9,
-                mec="white", mfc="#ff3030", mew=1.4, zorder=6)
-
-    fig.canvas.draw()
-    return np.asarray(fig.canvas.buffer_rgba()).copy()
+    ex = np.linspace(float(mins[0]), float(maxs[0]), n + 1)
+    ey = np.linspace(float(mins[1]), float(maxs[1]), n + 1)
+    outside = np.asarray(info["outside"]).reshape(n, n)
+    verts, cells = [], []
+    for i in range(n):
+        for j in range(n):
+            if outside[i, j]:
+                continue
+            verts.append([[ex[j], ey[i]], [ex[j + 1], ey[i]],
+                          [ex[j + 1], ey[i + 1]], [ex[j], ey[i + 1]]])
+            cells.append((i, j))
+    return verts, np.asarray(cells, dtype=int).reshape(-1, 2)
 
 
-def _gx_gy(info, h, w):
-    # imshow row 0 = TOP = max y, so y_axis descends; origin='upper'.
-    return (np.linspace(info["mins"][0], info["maxs"][0], w),
-            np.linspace(info["maxs"][1], info["mins"][1], h))
+def _cell_colors(vals: np.ndarray, cells: np.ndarray, lut: np.ndarray) -> list:
+    """Per-cell hex colours for the (grid_n, grid_n) [0,1] correlation grid."""
+    if cells.size == 0:
+        return []
+    v = np.clip(np.nan_to_num(vals[cells[:, 0], cells[:, 1]]), 0.0, 1.0)
+    idx = np.clip(np.round(v * 255).astype(int), 0, 255)
+    return [_hex(c) for c in lut[idx]]
 
 
-def build_refine_figure(infos: list[dict]):
+def _circle_polys(circles, k: int = 40) -> list:
+    """Mask circles → closed N-gon vertex lists (data coords)."""
+    if not circles:
+        return []
+    th = np.linspace(0.0, 2.0 * np.pi, k, endpoint=False)
+    cos, sin = np.cos(th), np.sin(th)
+    return [np.column_stack([cx + r * cos, cy + r * sin]).tolist()
+            for cx, cy, r in circles]
+
+
+def build_refine_figure(infos: list[dict], *, cmap: str = _CMAP):
     """Build the multi-phase refine figure. Returns ``(fig, fig_id, html,
-    panels)`` where ``panels[i] = {plot2d, info}`` (one per phase)."""
+    panels)`` where each panel carries the live marker groups to update."""
     import anyplotlib as apl
     import anyplotlib._electron as _electron
     from spyde.drawing.plots.plot import finalize_figure_html
 
+    lut = _lut(cmap)
+    blank = _hex(lut[0])
     n = max(1, len(infos))
     fig, axes = apl.subplots(1, n)
     arr = np.array(axes, dtype=object).ravel()
+
     panels = []
     for ax, info in zip(arr, infos):
-        blank = np.full((info["grid_n"], info["grid_n"]), np.nan)
-        rgba = render_panel_rgba(blank, info)
-        gx, gy = _gx_gy(info, rgba.shape[0], rgba.shape[1])
-        p = ax.imshow(rgba, axes=[gx, gy], origin="upper")
-        try:
-            ax.set_axis_off()
-        except Exception as e:
-            log.debug("set_axis_off on refine panel failed: %s", e)
-        try:
-            ax.set_title(str(info["name"]))
-        except Exception as e:
-            log.debug("set_title on refine panel failed: %s", e)
-        panels.append({"plot2d": p, "info": info})
+        mins, maxs = info["mins"], info["maxs"]
+        xy = ax.axes2d(xlim=(float(mins[0]), float(maxs[0])),
+                       ylim=(float(mins[1]), float(maxs[1])), aspect="equal")
+
+        verts, cells = _mesh_geometry(info)
+        faces = [blank] * len(verts)
+        # Heatmap (bottom): one polygon per inside-sector cell, clipped to the
+        # curved sector boundary; only its face colours change per frame.
+        mesh = xy.add_polygons(verts, facecolors=faces, edgecolors=faces,
+                               alpha=1.0, linewidths=0.4, clip_path=info["tri_xy"])
+        # Mask circles (above the heatmap, below the outline).
+        circ = xy.add_polygons([], facecolors="#00e5ff", edgecolors="#00e5ff",
+                               alpha=0.18, linewidths=1.6)
+        # Static sector outline + corner labels.
+        tri = np.asarray(info["tri_xy"], float)
+        xy.plot(tri[:, 0], tri[:, 1], color="#ffffff", linewidth=1.4)
+        for (lx, ly), txt in zip(np.asarray(info["label_xy"], float), info["labels"]):
+            xy.text(float(lx), float(ly), str(txt), color="#ffffff", fontsize=11)
+        # Best-match marker (top), initially empty. s = marker radius in px.
+        best = xy.scatter([], [], s=9, c="#ff3030", edgecolors="#ffffff")
+
+        if len(infos) > 1:
+            try:
+                ax.set_title(str(info["name"]))
+            except Exception as e:
+                log.debug("set_title on refine panel failed: %s", e)
+
+        panels.append({"xy": xy, "plot2d": xy, "info": info, "mesh": mesh,
+                       "cells": cells, "circle_grp": circ, "best": best, "lut": lut})
 
     fig_id = _electron.register(fig)
     html = finalize_figure_html(fig, fig_id)
@@ -106,21 +135,31 @@ def build_refine_figure(infos: list[dict]):
 
 
 def update_panels(panels, corr_global, circles_per_phase, best_xy_per_phase=None,
-                  *, cmap: str = "inferno") -> None:
-    """Re-render every phase panel from the current correlation + mask circles."""
+                  *, cmap: str = _CMAP) -> None:
+    """Re-colour every phase panel from the current correlation + mask circles
+    (in place — the polygon geometry and z-order are fixed)."""
     best_xy_per_phase = best_xy_per_phase or {}
     for panel in panels:
         info = panel["info"]
         vals = interp_grid(corr_global, info)
-        rgba = render_panel_rgba(
-            vals, info,
-            circles=circles_per_phase.get(info["phase_index"], []),
-            best_xy=best_xy_per_phase.get(info["phase_index"]),
-            cmap=cmap)
+        colors = _cell_colors(vals, panel["cells"], panel["lut"])
         try:
-            panel["plot2d"].set_data(rgba)
+            panel["mesh"].set(facecolors=colors, edgecolors=colors)
         except Exception as e:
-            log.debug("updating refine panel raster failed: %s", e)
+            log.debug("updating refine heatmap colours failed: %s", e)
+
+        bxy = best_xy_per_phase.get(info["phase_index"])
+        try:
+            panel["best"].set(
+                offsets=[[float(bxy[0]), float(bxy[1])]] if bxy is not None else [])
+        except Exception as e:
+            log.debug("updating refine best-match marker failed: %s", e)
+
+        try:
+            panel["circle_grp"].set(
+                vertices_list=_circle_polys(circles_per_phase.get(info["phase_index"], [])))
+        except Exception as e:
+            log.debug("updating refine mask circles failed: %s", e)
 
 
 def best_xy_for(infos, best_lib_idx: int):
@@ -146,12 +185,13 @@ def emit_refine_window(session, fig_id: str, html: str, *, title: str = "IPF Ref
 class RefineIpfController:
     """Drives the live per-phase IPF correlation heatmaps during refine: on every
     navigator move (and gamma/normalize change) it re-matches the current pattern
-    and repaints each phase's triangle; a double-click on a panel adds/removes a
+    and recolours each phase's triangle; a double-click on a panel adds/removes a
     mask circle that LIMITS which orientations the match considers (``rot_mask``).
     """
 
     def __init__(self, dp_plot, signal, sim, cache, infos, panels, *,
                  gamma: float = 1.0, normalize: bool = False):
+        import threading
         from spyde.actions.orientation_compute import template_tables
         self.dp_plot = dp_plot
         self.signal = signal
@@ -164,7 +204,7 @@ class RefineIpfController:
         self.n_templates = int(template_tables(sim)[0].shape[0])
         self.circles = {info["phase_index"]: [] for info in infos}   # per-phase masks
         self._last_iyix = (0, 0)
-        self._lock = __import__("threading").Lock()
+        self._lock = threading.Lock()
         self._selectors: list = []
 
     def attach(self, tree):
@@ -213,8 +253,7 @@ class RefineIpfController:
                 update_panels(self.panels, corr, self.circles,
                               best_xy_for(self.infos, int(best[0])))
             except Exception as e:
-                import logging
-                logging.getLogger(__name__).debug("refine ipf recompute failed: %s", e)
+                log.debug("refine ipf recompute failed: %s", e)
 
     def toggle_circle(self, phase_index: int, x: float, y: float) -> None:
         """Double-click action: remove the mask circle the click lands in, else
@@ -245,7 +284,7 @@ class RefineIpfController:
                 self.toggle_circle(pidx, float(x), float(y))
 
         try:
-            panel["plot2d"].add_event_handler(_on_dbl, "double_click")
+            panel["xy"].add_event_handler(_on_dbl, "double_click")
         except Exception as e:
             log.debug("wiring refine panel double-click failed: %s", e)
 

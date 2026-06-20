@@ -11,7 +11,9 @@ refine considers (``rot_mask``) — useful to lock onto a known orientation fami
 Multi-phase libraries get one triangle per phase.
 
 The heavy maths mirrors ``actions.pyxem`` (the Qt refine widget) but imports no
-Qt — only orix / pyxem.signals / scipy / matplotlib(Agg).
+Qt — only orix / pyxem.signals / scipy (+ ``matplotlib.path.Path`` for the
+point-in-triangle test, geometry only). The heatmap itself is rendered natively
+by :mod:`ipf_refine_render` (anyplotlib ``PlotXY`` — no matplotlib raster).
 """
 from __future__ import annotations
 
@@ -175,31 +177,6 @@ def interp_grid(corr_global: np.ndarray, info: dict, *, vmax: float | None = Non
     vals = np.clip(vals, 0.0, 1.0)
     vals[info["outside"]] = np.nan
     return vals.reshape(n, n)
-
-
-def heatmap_rgba(corr_global: np.ndarray, info: dict, *, cmap: str = "inferno",
-                 vmax: float | None = None) -> np.ndarray:
-    """(GRID, GRID, 4) uint8 RGBA: this phase's per-template correlation
-    interpolated over the triangle (transparent outside). Row 0 = TOP (stereo y
-    up), so it overlays a data-coord triangle with ``origin='lower'``-style flip
-    handled by the caller's extent."""
-    import matplotlib
-
-    c = corr_global[info["lib_idx"]]
-    vmax = float(c.max()) if vmax is None else float(vmax)
-    vmax = vmax if vmax > 0 else 1.0
-    cn = np.clip(c / vmax, 0.0, 1.0)
-
-    n = info["grid_n"]
-    if info["verts"] is not None and info["weights"] is not None:
-        vals = (cn[info["verts"]] * info["weights"]).sum(axis=1)
-    else:
-        vals = np.zeros(n * n)
-    vals = np.clip(vals, 0.0, 1.0).reshape(n, n)
-
-    rgba = (matplotlib.colormaps[cmap](vals) * 255).astype(np.uint8)
-    rgba[..., 3] = np.where(info["outside"].reshape(n, n), 0, 255)
-    return rgba
 
 
 def rot_mask_from_circles(infos: list[dict], circles_per_phase: dict,

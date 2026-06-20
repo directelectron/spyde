@@ -61,20 +61,30 @@ class TestIpfRefine:
         assert corr.max() > 0 and np.isfinite(corr).all()
         assert int(best[0]) == int(np.argmax(corr))   # best row == argmax template
 
-    def test_heatmap_rgba_paints_triangle(self):
+    def test_native_heatmap_colours_vary(self):
+        """The native PlotXY render paints one polygon per inside-sector cell and
+        colours them by correlation — a real heatmap (varied), not flat."""
         from spyde.actions import ipf_refine
+        from spyde.actions.ipf_refine_render import (
+            build_refine_figure, update_panels, best_xy_for, _mesh_geometry,
+        )
         s, sim, cache, _n = _lib()
         infos = ipf_refine.build_phase_ipf(sim)
-        corr, _ = ipf_refine.match_correlations(np.asarray(s.data[0, 0], float),
-                                                sim, cache, gamma=0.5)
-        rgba = ipf_refine.heatmap_rgba(corr, infos[0])
-        assert rgba.shape == (ipf_refine.GRID_N, ipf_refine.GRID_N, 4)
-        assert rgba.dtype == np.uint8
-        opaque = rgba[..., 3] == 255
-        assert opaque.any() and (~opaque).any()        # some triangle, some transparent
-        # the painted region has colour variation (a real heatmap, not flat)
-        rgb = rgba[..., :3][opaque]
-        assert int(rgb.max()) - int(rgb.min()) > 30
+        corr, best = ipf_refine.match_correlations(
+            np.asarray(s.data[0, 0], float), sim, cache, gamma=0.5)
+
+        _fig, _fid, _html, panels = build_refine_figure(infos)
+        # the mesh covers the inside-sector cells (some cells, not the whole grid)
+        verts, cells = _mesh_geometry(infos[0])
+        assert 0 < len(cells) < ipf_refine.GRID_N ** 2
+
+        update_panels(panels, corr, {i["phase_index"]: [] for i in infos},
+                      best_xy_for(infos, int(best[0])))
+        faces = panels[0]["mesh"]._data.get("facecolors")
+        assert faces is not None and len(faces) == len(cells)
+        assert len(set(faces)) > 3                      # colour variation
+        # the best-match marker got placed
+        assert len(np.asarray(panels[0]["best"]._data.get("offsets"))) == 1
 
     def test_rot_mask_from_circles_restricts(self):
         from spyde.actions import ipf_refine
