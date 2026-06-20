@@ -17,6 +17,7 @@ this module is import-safe in the Electron backend.
 """
 from __future__ import annotations
 
+import logging
 import threading
 
 import numpy as np
@@ -24,6 +25,8 @@ import hyperspy.api as hs
 
 from spyde.backend.ipc import emit, emit_status, emit_error
 from spyde.actions.context import src_plot_tree as _src_plot_tree
+
+log = logging.getLogger(__name__)
 
 DEFAULTS = dict(
     accelerating_voltage=200.0,
@@ -69,8 +72,8 @@ def vom_generate_library(session, plot, payload) -> None:
     try:
         from spyde.actions.vector_orientation_gpu import warmup_autograd
         warmup_autograd()
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("CUDA autograd warmup failed: %s", e)
 
     def _work():
         try:
@@ -97,8 +100,8 @@ def vom_generate_library(session, plot, payload) -> None:
             if old is not None and old.get("overlay") is not None:
                 try:
                     old["overlay"].remove()
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("removing prior vom overlay failed: %s", e)
             wid = getattr(src, "window_id", None)
             try:
                 from spyde.actions.vector_overlay import attach_vector_orientation_overlay
@@ -232,8 +235,8 @@ def vom_run(session, plot, payload) -> None:
     try:
         from spyde.actions.vector_orientation_gpu import warmup_autograd
         warmup_autograd()
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("CUDA autograd warmup failed: %s", e)
 
     def _work():
         try:
@@ -313,8 +316,8 @@ def _build_result_windows(session, src, result, *, smooth=False, with_ipf=True) 
                 if levels is not None:
                     sp.set_clim(*levels)
                 sp.set_data(data)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("painting vom window signal plot failed: %s", e)
         return tree
 
     if with_ipf:
@@ -327,8 +330,8 @@ def _build_result_windows(session, src, result, *, smooth=False, with_ipf=True) 
             from spyde.actions.ipf_view import attach_ipf_3d, attach_ipf_point_selector
             attach_ipf_3d(otree, result, direction="z")
             attach_ipf_point_selector(otree, result, "z")
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("attaching 3-D IPF explorer to vom result failed: %s", e)
 
     # ── Strain: ONE window with εxx / εyy / εxy as chip-selectable views (the
     #    unified chip-strip selector — ⌘-click to tile + compare). εxx is the

@@ -16,11 +16,14 @@ everything here is unit-testable headless.
 from __future__ import annotations
 
 import functools
+import logging
 import threading
 import time
 from typing import Optional
 
 import numpy as np
+
+log = logging.getLogger(__name__)
 
 # pyxem's numba template matcher (``_mixed_matching_lib_to_polar`` /
 # ``_slice_radial_integrate`` / ``get_slices2d``) uses a workqueue layer that is
@@ -377,8 +380,8 @@ def _match_chunk(
                 del buf
             finally:
                 shm.close()
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("live IPF preview shm write failed: %s", e)
 
     return out
 
@@ -517,8 +520,8 @@ def _do_compute_orientations(
                     if stopped_flag is not None and stopped_flag[0]:
                         try:
                             future.cancel()
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            log.debug("cancelling orientation compute future failed: %s", e)
                         return None
                     time.sleep(0.1)
                 result4 = future.result()
@@ -567,7 +570,7 @@ def _do_compute_orientations(
                 del buf
             finally:
                 shm.close()
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("final IPF preview shm write failed: %s", e)
 
     return om

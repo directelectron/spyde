@@ -21,6 +21,7 @@ reuse the dense OM library generation in `orientation_compute.py`.
 """
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
@@ -28,6 +29,8 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 from spyde.signals.diffraction_vectors import COL_KX, COL_KY, COL_INTENSITY
+
+log = logging.getLogger(__name__)
 
 
 # Pose vector layout: [theta, a00, a01, a10, a11, tx, ty]
@@ -592,8 +595,8 @@ def _vector_chunk(rows_list, lib, params, warm_start,
                 del full
             finally:
                 sh.close()
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("live vector-orientation block preview write failed: %s", e)
     # pack fit fields: quat(4) corr(1) phase(1) strain(3) residual(1)
     # friedel(1) n_matched(1) = 12
     packed = np.full((ny, nx, 12), np.nan, np.float32)
@@ -791,8 +794,8 @@ def compute_vector_orientation_chunked(
                 for f in futures:
                     try:
                         f.cancel()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.debug("cancelling vector-orientation future failed: %s", e)
                 return None
             blk, pk = fut.result()
             y0, y1, x0, x1 = blk

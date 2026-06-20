@@ -23,12 +23,15 @@ soft-assign + no-match sink, intensity weighted) so GPU and CPU agree.
 """
 from __future__ import annotations
 
+import logging
 import time
 from typing import Optional
 
 import numpy as np
 
 from spyde.signals.diffraction_vectors import COL_KX, COL_KY, COL_INTENSITY
+
+log = logging.getLogger(__name__)
 from spyde.actions.vector_orientation import (
     DEFAULTS, TemplateLibrary, VectorOrientationResult,
 )
@@ -123,8 +126,8 @@ def warmup_autograd() -> None:
             x = torch.zeros(1, device="cuda", requires_grad=True)
             (x * 2).sum().backward()
         _AUTOGRAD_WARMED = True
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("CUDA autograd warmup skipped: %s", e)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -549,8 +552,8 @@ def _live_preview(si, shm_name, eps, cap, ny, nx, theta, best_t, valid_bool, lib
             buf[..., 0] = np.where(valid2d, 0.0, np.nan).astype(np.float32)
         finally:
             sh.close()
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("live vector-orientation preview write failed: %s", e)
 
 
 def _write_final_preview(shm_name, ny, nx, res: VectorOrientationResult):
@@ -564,5 +567,5 @@ def _write_final_preview(shm_name, ny, nx, res: VectorOrientationResult):
             buf[..., 9:12] = res.strain
         finally:
             sh.close()
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("final vector-orientation preview write failed: %s", e)
