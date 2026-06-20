@@ -457,32 +457,62 @@ def _get_disk_fft(radius: int, H: int, W: int) -> np.ndarray:
     return _DISK_FFT_CACHE[key]
 
 
-def _subpixel_com(
-    corr: np.ndarray, peaks_px: np.ndarray, half_win: int = 2
-) -> np.ndarray:
-    """Center-of-mass subpixel refinement within ±half_win of each integer peak."""
+def _subpixel_parabola(corr: np.ndarray, peaks_px: np.ndarray) -> np.ndarray:
+    """3-point parabolic sub-pixel peak interpolation ON the NXCORR surface.
+
+    The peak position stays defined by the (window-normalised) cross-correlation
+    — we just locate the surface's sub-pixel vertex by fitting a parabola through
+    the peak and its two neighbours in each axis. This is the standard, low-bias
+    subpixel estimator (and matches the torch GPU path), unlike the previous
+    window centre-of-mass which barely moved off the integer pixel.
+
+    Returns ``(N, 2)`` float32 ``[ky_subpx, kx_subpx]``.
+    """
     H, W = corr.shape
-    out = np.empty((len(peaks_px), 3), dtype=np.float32)
-    for i, (py, px) in enumerate(peaks_px):
-        y0 = max(0, int(py) - half_win)
-        y1 = min(H, int(py) + half_win + 1)
-        x0 = max(0, int(px) - half_win)
-        x1 = min(W, int(px) + half_win + 1)
-        patch = corr[y0:y1, x0:x1]
-        if patch.size == 0:
-            out[i] = [py, px, float(corr[int(py), int(px)])]
-            continue
-        s = float(patch.sum())
-        if s > 0:
-            wy = patch.sum(axis=1)
-            wx = patch.sum(axis=0)
-            dy = float(np.dot(np.arange(len(wy), dtype=np.float32), wy)) / s
-            dx = float(np.dot(np.arange(len(wx), dtype=np.float32), wx)) / s
-        else:
-            dy, dx = float(py) - y0, float(px) - x0
-        out[i, 0] = y0 + dy
-        out[i, 1] = x0 + dx
-        out[i, 2] = float(corr[int(py), int(px)])
+    out = peaks_px.astype(np.float32).copy()
+    for i in range(len(peaks_px)):
+        py, px = int(peaks_px[i, 0]), int(peaks_px[i, 1])
+        if 0 < py < H - 1:
+            a, b, c = float(corr[py - 1, px]), float(corr[py, px]), float(corr[py + 1, px])
+            den = a - 2.0 * b + c
+            if den != 0.0:
+                out[i, 0] = py + min(1.0, max(-1.0, 0.5 * (a - c) / den))
+        if 0 < px < W - 1:
+            a, b, c = float(corr[py, px - 1]), float(corr[py, px]), float(corr[py, px + 1])
+            den = a - 2.0 * b + c
+            if den != 0.0:
+                out[i, 1] = px + min(1.0, max(-1.0, 0.5 * (a - c) / den))
+    return out
+
+
+def _sample_raw_bilinear(frame: np.ndarray, ys, xs) -> np.ndarray:
+    """Bilinear sample of the (experimental) frame at sub-pixel positions.
+
+    This is the RAW disk intensity in the original image at each peak — what
+    virtual imaging / orientation weighting want — as opposed to the NXCORR
+    score (which is ≈1 for every well-matched disk regardless of brightness)."""
+    H, W = frame.shape
+    ys = np.clip(np.asarray(ys, dtype=np.float64), 0.0, H - 1.0001)
+    xs = np.clip(np.asarray(xs, dtype=np.float64), 0.0, W - 1.0001)
+    y0 = np.floor(ys).astype(np.intp)
+    x0 = np.floor(xs).astype(np.intp)
+    fy = (ys - y0).astype(np.float32)
+    fx = (xs - x0).astype(np.float32)
+    f = frame.astype(np.float32, copy=False)
+    v = ((1 - fy) * ((1 - fx) * f[y0, x0] + fx * f[y0, x0 + 1])
+         + fy * ((1 - fx) * f[y0 + 1, x0] + fx * f[y0 + 1, x0 + 1]))
+    return v.astype(np.float32)
+
+
+def _with_raw_intensity(frame: np.ndarray, peaks: np.ndarray) -> np.ndarray:
+    """Overwrite a peak set's value column (col 2) with the raw frame intensity
+    at each peak — keeping the NXCORR-derived position. For the GPU/torch paths,
+    which return correlation scores."""
+    peaks = np.asarray(peaks, dtype=np.float32)
+    if peaks.size == 0:
+        return peaks.reshape(-1, 3)
+    out = peaks.copy()
+    out[:, 2] = _sample_raw_bilinear(frame, peaks[:, 0], peaks[:, 1])
     return out
 
 
@@ -518,7 +548,11 @@ def _find_vectors_single_frame(
     kernel_radius : disk kernel radius in pixels
     threshold : NXCORR threshold in (-1, 1); 0.3-0.5 typical
     min_distance : minimum peak separation in pixels
-    subpixel : if True, apply CoM subpixel refinement
+    subpixel : if True, refine each peak to the parabolic (3-point) vertex of
+        the NXCORR surface.  The stored value column (intensity) is always the
+        RAW experimental frame intensity sampled bilinearly at the peak — not
+        the correlation score — so virtual imaging / weighting see true disk
+        brightness.
     beamstop_mask : (ky, kx) bool — masked pixels excluded before correlation
     kernel_window_pad : extra pixels added to the window radius used for
         computing local mean/std (not the correlation template).  A pad of 1
@@ -667,12 +701,15 @@ def _find_vectors_single_frame(
     if len(peaks_px) == 0:
         return corr_map, raw_corr, np.zeros((0, 3), dtype=np.float32)
 
+    # Position from the NXCORR surface (parabolic sub-pixel vertex when enabled);
+    # INTENSITY from the raw experimental frame at that position (not the corr
+    # score, which is ≈1 for every matched disk).
     if subpixel:
-        peaks = _subpixel_com(raw_corr, peaks_px)
+        pos = _subpixel_parabola(raw_corr, peaks_px)
     else:
-        peaks = np.column_stack(
-            [peaks_px.astype(np.float32), raw_corr[peaks_px[:, 0], peaks_px[:, 1]]]
-        )
+        pos = peaks_px.astype(np.float32)
+    intens = _sample_raw_bilinear(frame, pos[:, 0], pos[:, 1])
+    peaks = np.column_stack([pos, intens]).astype(np.float32)
     return corr_map, raw_corr, peaks
 
 
@@ -1468,6 +1505,10 @@ def _find_vectors_batch_gpu(
         # typically <30 peaks per frame)
         result_flat = np.empty(N, dtype=object)
         min_d2 = int(min_dist) * int(min_dist)
+        # Host frames for raw-intensity sampling (the GPU kernel stores the corr
+        # score; NMS below uses it, then we overwrite the value with the raw
+        # experimental intensity at each peak — matching the CPU path).
+        host_frames = blurred_block.reshape(-1, H, W)
 
         for i in range(N):
             if subpixel:
@@ -1519,7 +1560,7 @@ def _find_vectors_batch_gpu(
                     kept[j + 1:][too_close] = False
                 frame_peaks = frame_peaks[kept]
 
-            result_flat[i] = frame_peaks.astype(np.float32)
+            result_flat[i] = _with_raw_intensity(host_frames[i], frame_peaks)
 
         result = result_flat.reshape(nav_shape) if len(nav_shape) > 0 else result_flat
         return result
@@ -1690,6 +1731,10 @@ def _find_vectors_chunk(
                 peaks_list = find_vectors_torch_batch(
                     flat, kernel_r, threshold, min_dist,
                     subpixel=subpixel, beamstop_mask=beamstop_mask)
+                # torch returns NXCORR positions + correlation score; replace the
+                # value column with the raw frame intensity at each peak.
+                peaks_list = [_with_raw_intensity(flat[i], p)
+                              for i, p in enumerate(peaks_list)]
         except Exception as _e:
             log.warning("[find_vectors] torch GPU path failed (%s); CPU per-frame", _e)
             peaks_list = None
@@ -2242,6 +2287,7 @@ def _find_vectors_chunk_gpu_impl(
         t0 = time.perf_counter()
         out = np.full((NY, NX, MAX_PEAKS, 3), np.nan, dtype=np.float32)
         min_d2 = int(min_dist) * int(min_dist)
+        host_frames = block4d_cpu.reshape(-1, KY, KX)   # raw frames for intensity
         for i in range(N):
             iy, ix = divmod(i, NX)
             if subpixel:
@@ -2281,6 +2327,9 @@ def _find_vectors_chunk_gpu_impl(
                     kept[j+1:][(dy*dy + dx*dx) <= min_d2] = False
                 frame_peaks = frame_peaks[kept]
 
+            # Value column → raw experimental intensity at each peak (after NMS,
+            # which used the corr score, matching the CPU path).
+            frame_peaks = _with_raw_intensity(host_frames[i], frame_peaks)
             n = min(len(frame_peaks), MAX_PEAKS)
             if n > 0:
                 out[iy, ix, :n, :] = frame_peaks[:n]

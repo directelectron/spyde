@@ -488,15 +488,19 @@ def test_no_full_compute_via_tracemalloc():
     )
 
 
-def test_intensity_column_between_neg1_and_1():
-    """NXCORR output is in [-1, 1] — intensity column (col 4) must stay in range."""
+def test_intensity_column_is_raw_frame_intensity():
+    """The stored intensity is the RAW experimental frame intensity at each peak
+    (for virtual imaging etc.), NOT the NXCORR score — so it is bounded by the
+    frame's own min/max, not [-1, 1]."""
     sig = _make_lazy_4d(nav=(4, 4), sig=(32, 32))
     vecs = _do_compute_vectors(sig, _params(), None, None)
     if len(vecs.flat_buffer) == 0:
         pytest.skip("No vectors found")
     intensities = vecs.flat_buffer[:, 5]  # COL_INTENSITY
-    assert intensities.min() >= -1.0 - 1e-5
-    assert intensities.max() <= 1.0 + 1e-5
+    fmin = float(np.asarray(sig.data).min())
+    fmax = float(np.asarray(sig.data).max())
+    assert intensities.min() >= fmin - 1e-4
+    assert intensities.max() <= fmax + 1e-4
 
 
 def test_reproducible_with_same_params():

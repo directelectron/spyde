@@ -23,7 +23,6 @@ from spyde.actions.find_vectors import (
     _find_vectors_single_frame,
     _make_disk,
     _nav_chunk_size,
-    _subpixel_com,
 )
 from spyde.signals.diffraction_vectors import SpyDEDiffractionVectors
 
