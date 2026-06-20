@@ -45,10 +45,10 @@ def read_composition(tree) -> tuple[list[str], dict[str, float]]:
         for k, v in items.items():
             try:
                 percentages[str(k)] = float(v)
-            except (TypeError, ValueError):
-                pass
-    except Exception:
-        pass
+            except (TypeError, ValueError) as e:
+                log.debug("composition value %r=%r not numeric, skipping: %s", k, v, e)
+    except Exception as e:
+        log.debug("parsing composition metadata failed: %s", e)
     return [str(e) for e in elements], percentages
 
 

@@ -15,7 +15,11 @@ any selected subset.
 """
 from __future__ import annotations
 
+import logging
+
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 # Keep emitted figures alive past the emit (the registry holds a weak ref only).
 _ALIVE: list = []
@@ -55,8 +59,8 @@ def _imshow_view(ax, image, cmap, levels):
     if levels is not None:
         try:
             p.set_clim(float(levels[0]), float(levels[1]))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("set_clim on view image failed: %s", e)
     return p
 
 
@@ -84,8 +88,7 @@ def emit_view_figure(window_id: int, image, label: str, *, kind: str = "2d",
         })
         return fig_id
     except Exception as e:
-        import logging
-        logging.getLogger(__name__).debug("emit_view_figure(%s) failed: %s", label, e)
+        logger.debug("emit_view_figure(%s) failed: %s", label, e)
         return None
 
 
@@ -108,8 +111,8 @@ def _link_crosshairs(widgets) -> None:
                         continue
                     try:
                         w.set(cx=cx, cy=cy)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("linking tiled crosshair failed: %s", e)
             finally:
                 state["busy"] = False
         return handler
@@ -119,8 +122,8 @@ def _link_crosshairs(widgets) -> None:
         for et in ("pointer_up", "pointer_settled"):
             try:
                 w.add_event_handler(h, et)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("wiring tiled crosshair %s handler failed: %s", et, e)
 
 
 def build_tiled_figure(window_id: int, labels):
@@ -148,13 +151,13 @@ def build_tiled_figure(window_id: int, labels):
         p = _imshow_view(ax, image, cmap, levels)
         try:
             ax.set_title(label)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("set_title on tiled view failed: %s", e)
         try:
             h, w = np.asarray(image).shape[:2]
             widgets.append(p.add_crosshair_widget(cx=w / 2.0, cy=h / 2.0))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("adding crosshair to tiled view failed: %s", e)
     _link_crosshairs(widgets)
 
     fig_id = _electron.register(fig)

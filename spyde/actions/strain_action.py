@@ -9,7 +9,11 @@ map in place. No Qt.
 """
 from __future__ import annotations
 
+import logging
+
 import numpy as np
+
+log = logging.getLogger(__name__)
 
 _COMPONENTS = ("exx", "eyy", "exy", "omega")
 _TITLES = {"exx": "εxx", "eyy": "εyy", "exy": "εxy", "omega": "ω"}
@@ -55,8 +59,7 @@ class StrainController:
                                                           color="#00e5ff")
             self._crosshair.add_event_handler(self._on_pick, "pointer_up")
         except Exception as e:
-            import logging
-            logging.getLogger(__name__).debug("strain crosshair attach failed: %s", e)
+            log.debug("strain crosshair attach failed: %s", e)
         return self
 
     # ── reference + ring selection (both modes flow through ref_vectors) ──────
@@ -90,8 +93,8 @@ class StrainController:
             emit({"type": "strain_rings", "window_id": int(self.window_id),
                   "rings": [round(float(g), 4) for g in self.rings],
                   "selected": sorted(self.selected_rings), "cif": bool(self.cif_mode)})
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("emitting strain_rings failed: %s", e)
 
     def _on_pick(self, event=None):
         try:

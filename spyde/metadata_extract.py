@@ -8,9 +8,12 @@ use it without pulling in PySide6.
 """
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 from spyde import METADATA_WIDGET_CONFIG
+
+log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from spyde.signal_tree import BaseSignalTree
@@ -93,6 +96,6 @@ def build_metadata_dict(signal_tree: "BaseSignalTree") -> dict[str, dict[str, st
             "Shape": shape,
             "Dtype": str(getattr(getattr(sig, "data", None), "dtype", "—")),
         }
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("building Dataset metadata subsection failed: %s", e)
     return subsections

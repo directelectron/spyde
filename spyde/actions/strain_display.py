@@ -13,9 +13,13 @@ No Qt. Host-agnostic (Electron + Jupyter).
 """
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 
 from spyde.actions.strain_mapping import StrainField, principal_strain
+
+logger = logging.getLogger(__name__)
 
 _ALIVE: list = []
 
@@ -82,8 +86,8 @@ def build_strain_figure(field: StrainField, *, component: str = "exx",
     p = ax.imshow(np.nan_to_num(cmap_data, nan=0.0).astype(np.float32), cmap=cmap)
     try:
         p.set_clim(-v, v)                       # diverging, centred on zero strain
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("set_clim on strain map failed: %s", e)
 
     glyph_group = None
     if glyphs:
@@ -118,13 +122,13 @@ def update_strain_view(p, field: StrainField, component: str, glyph_group, *,
     try:
         p.set_data(np.nan_to_num(data, nan=0.0).astype(np.float32))
         p.set_clim(-v, v)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("updating strain map data failed: %s", e)
     if glyph_group is not None:
         ny, nx = field.nav_shape
         step = glyph_step or max(1, int(round(max(ny, nx) / 16)))
         offs, wid, hei, ang = _glyph_ellipses(field, step=step, amp=glyph_amp)
         try:
             glyph_group.set(offsets=offs, widths=wid, heights=hei, angles=ang)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("updating strain glyphs failed: %s", e)

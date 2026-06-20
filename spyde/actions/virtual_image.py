@@ -14,10 +14,14 @@ selector choice are action-specific.
 """
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 
 from spyde.actions.action import RegionAction
 from spyde.actions.masks import widget_to_mask
+
+log = logging.getLogger(__name__)
 
 
 class VirtualImageAction(RegionAction):
@@ -63,8 +67,8 @@ class VirtualImageAction(RegionAction):
             shape = tuple(reversed(nav_shape))[-2:]   # numpy order, last 2 nav dims
             if len(shape) == 2 and all(s > 0 for s in shape):
                 return hs.signals.Signal2D(np.zeros(shape, dtype=np.float32))
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("building VI placeholder from nav shape failed: %s", e)
         return super().placeholder_signal()
 
     def _virtual_image_array(self, signal, selector, **params):
@@ -103,8 +107,8 @@ class VirtualImageAction(RegionAction):
                 try:
                     if not prev.done():
                         prev.cancel()
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("cancelling prior VI future failed: %s", e)
             fut = client.compute(vi)
             self._prev_vi_future = fut
             return fut

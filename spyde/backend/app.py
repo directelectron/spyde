@@ -7,8 +7,11 @@ Electron), routes them to Session, and lets Session push replies via stdout.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import sys
+
+log = logging.getLogger(__name__)
 
 
 def _prewarm_anyplotlib() -> None:
@@ -30,10 +33,10 @@ def _prewarm_anyplotlib() -> None:
                 esm = str(getattr(fig, "_esm", "") or "")
                 if esm:
                     _shared_esm_url(esm)   # write the shared bundle to disk now
-            except Exception:
-                pass
-        except Exception:
-            pass
+            except Exception as e:
+                log.debug("prewarm shared-ESM write failed: %s", e)
+        except Exception as e:
+            log.debug("anyplotlib prewarm failed: %s", e)
     import threading
     threading.Thread(target=_warm, daemon=True, name="anyplotlib-prewarm").start()
 

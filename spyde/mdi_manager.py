@@ -8,9 +8,12 @@ IPC messages when windows are opened/closed/focused.
 """
 from __future__ import annotations
 
+import logging
 import math
 from typing import TYPE_CHECKING
 from uuid import uuid4
+
+log = logging.getLogger(__name__)
 
 from psygnal import Signal
 
@@ -84,13 +87,11 @@ class MDIManager:
                     pw._spyde_tree_teardown = True
                     pw.close_window()
                 except Exception:
-                    import logging
-                    logging.getLogger(__name__).exception(
-                        "close_signal_tree: window close failed")
+                    log.exception("close_signal_tree: window close failed")
             try:
                 tree.close()
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("close_signal_tree: tree.close() failed: %s", e)
             if tree in self.signal_trees:
                 self.signal_trees.remove(tree)
             if (getattr(self.session, "current_selected_signal_tree", None) is tree):

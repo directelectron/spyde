@@ -21,9 +21,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sys
 import threading
 from typing import Any
+
+# Logging goes to stderr (default), never the PLOTAPP stdout protocol channel.
+log = logging.getLogger(__name__)
 
 _stdout_lock = threading.Lock()
 
@@ -56,8 +60,8 @@ def redirect_stray_stdout() -> None:
                 _PROTOCOL_OUT.flush()
 
         _ael.emit = _shared_emit
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("redirecting anyplotlib emit to shared protocol channel failed: %s", e)
 
     sys.stdout = sys.stderr
 
@@ -105,4 +109,4 @@ async def read_messages(loop: asyncio.AbstractEventLoop | None = None):
         try:
             yield json.loads(line)
         except json.JSONDecodeError:
-            pass
+            log.debug("skipping non-JSON line from frontend: %r", line[:200])
