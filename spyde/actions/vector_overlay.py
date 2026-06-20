@@ -82,6 +82,11 @@ class _DPOverlay:
     name = "overlay"
     _color = "#ff3030"
     _radius_px = 4.0
+    # How the per-position compute runs (see live_overlay.LiveOverlayEngine):
+    # "sync" for cheap overlays (immediate), "thread"/"future" for heavy ones so
+    # the compute never holds the navigator's serialised update lock.
+    _overlay_mode = "sync"
+    _engine = None
 
     def _calibrate(self, sig_axes) -> None:
         self._x_scale = float(sig_axes[0].scale) or 1.0
@@ -114,6 +119,7 @@ class _DPOverlay:
             radius=float(self._radius_px), edgecolors=self._color, facecolors=None,
             linewidths=1.5, alpha=1.0, transform="data",
         )
+        self._engine = self._make_engine(tree)
         self._selectors = _navigator_selectors_for(tree, self.dp_plot)
         seeded = False
         for sel in self._selectors:
@@ -123,13 +129,31 @@ class _DPOverlay:
                 self._on_indices(sel.current_indices)
                 seeded = True
         if not seeded:
-            self._push(self._offsets_for(*self._last_iyix))
+            self._engine.request(*self._last_iyix)
         return self
+
+    def _make_engine(self, tree):
+        """Build the reactive-overlay engine: re-run ``_offsets_for`` off the
+        navigator thread on each move and push the result. Subclasses with a
+        multi-group payload override ``_render_payload``."""
+        from spyde.drawing.live_overlay import LiveOverlayEngine
+        client = None
+        if self._overlay_mode == "future":
+            client = getattr(tree, "client", None)
+        return LiveOverlayEngine(
+            self._offsets_for, self._render_payload,
+            mode=self._overlay_mode, client=client, name=self.name,
+        )
+
+    def _render_payload(self, payload) -> None:
+        """Render a computed payload (default: a single offsets array)."""
+        if not self._hidden:
+            self._push(payload)
 
     def _on_indices(self, indices):
         self._last_iyix = _indices_to_iyix(indices)
-        if not self._hidden:
-            self._push(self._offsets_for(*self._last_iyix))
+        if self._engine is not None and not self._hidden:
+            self._engine.request(*self._last_iyix)
 
     def _push(self, offsets):
         if self._mg is None:
@@ -144,10 +168,17 @@ class _DPOverlay:
 
     def set_visible(self, visible: bool) -> None:
         self._hidden = not bool(visible)
-        empty = np.zeros((0, 2), dtype=np.float32)
-        self._push(empty if self._hidden else self._offsets_for(*self._last_iyix))
+        if self._hidden:
+            self._push(np.zeros((0, 2), dtype=np.float32))
+        elif self._engine is not None:
+            self._engine.request(*self._last_iyix)      # recompute current frame
+        else:
+            self._push(self._offsets_for(*self._last_iyix))
 
     def remove(self):
+        if self._engine is not None:
+            self._engine.stop()
+            self._engine = None
         for sel in self._selectors:
             if self._on_indices in sel.index_hooks:
                 sel.index_hooks.remove(self._on_indices)
@@ -299,6 +330,11 @@ class FindVectorsPreviewOverlay(_DPOverlay):
     is sliced and ``.compute()``-ed for lazy data — never the full dataset.
     """
 
+    # Per-frame peak finding does a blocking .compute() on a small nav window —
+    # run it OFF the navigator thread so it never holds the serialised update
+    # lock (which would gate the diffraction image at the peak-find rate).
+    _overlay_mode = "thread"
+
     def __init__(self, dp_plot, signal, *, sigma=1.0, kernel_radius=5,
                  threshold=0.5, min_distance=5, subpixel=True,
                  color="#ff3030", name="fv_preview"):
@@ -332,8 +368,12 @@ class FindVectorsPreviewOverlay(_DPOverlay):
             self.min_distance = max(1, int(p["min_distance"]))
         if "subpixel" in p and p["subpixel"] is not None:
             self.subpixel = bool(p["subpixel"])
+        # Redraw at the current crosshair via the engine (off the caller thread).
         iy, ix = self._last_iyix
-        self._push(self._offsets_for(iy, ix))
+        if self._engine is not None:
+            self._engine.request(iy, ix)
+        else:
+            self._push(self._offsets_for(iy, ix))
 
     # ── geometry ──────────────────────────────────────────────────────────────
     def _blurred_frame(self, iy, ix) -> np.ndarray:
@@ -415,6 +455,8 @@ class VectorOrientationOverlay(_DPOverlay):
         if self._hidden:
             empty = np.zeros((0, 2), dtype=np.float32)
             self._push(empty, empty)
+        elif self._engine is not None:
+            self._engine.request(*self._last_iyix)
         else:
             self._push(*self._offsets_for(*self._last_iyix))
 
@@ -478,6 +520,16 @@ class VectorOrientationOverlay(_DPOverlay):
             radius=self._radius_px, edgecolors="#30ff60", facecolors=None,
             linewidths=1.5, alpha=1.0, transform="data",
         )
+        # Synchronous (inline) on purpose: the pose fit (fit_pattern) is only
+        # ~tens of ms (it doesn't block on a .compute() like the peak preview),
+        # and it touches a process-global resource that is NOT safe to run from
+        # a worker thread concurrently with a direct call. The engine in "sync"
+        # mode keeps the unified workflow without that hazard.
+        from spyde.drawing.live_overlay import LiveOverlayEngine
+        self._engine = LiveOverlayEngine(
+            self._offsets_for, lambda payload: self._push(*payload),
+            mode="sync", name=self.name_meas,
+        )
         self._selectors = _navigator_selectors_for(tree, self.dp_plot)
         seeded = False
         for sel in self._selectors:
@@ -486,16 +538,14 @@ class VectorOrientationOverlay(_DPOverlay):
                 self._on_indices(sel.current_indices)
                 seeded = True
         if not seeded:
-            iy, ix = self._last_iyix
-            self._push(*self._offsets_for(iy, ix))
+            self._engine.request(*self._last_iyix)
         return self
 
     def _on_indices(self, indices):
         iy, ix = _indices_to_iyix(indices)
         self._last_iyix = (iy, ix)
-        if self._hidden:
-            return
-        self._push(*self._offsets_for(iy, ix))
+        if self._engine is not None and not self._hidden:
+            self._engine.request(iy, ix)
 
     def _push(self, meas, tmpl):
         for mg, off in ((self._mg_meas, meas), (self._mg_tmpl, tmpl)):
@@ -507,6 +557,9 @@ class VectorOrientationOverlay(_DPOverlay):
                 log.debug("pushing meas/tmpl marker offsets failed: %s", e)
 
     def remove(self):
+        if self._engine is not None:
+            self._engine.stop()
+            self._engine = None
         for sel in self._selectors:
             if self._on_indices in sel.index_hooks:
                 sel.index_hooks.remove(self._on_indices)
