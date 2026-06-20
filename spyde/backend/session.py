@@ -7,6 +7,7 @@ All communication with Electron goes through ipc.emit().
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 from typing import TYPE_CHECKING, Any
@@ -17,6 +18,8 @@ from hyperspy.signal import BaseSignal
 from spyde.backend.ipc import emit, emit_status, emit_error, emit_progress
 from spyde.dask_manager import DaskManager
 from spyde.workers.plot_update_worker import PlotUpdateWorker
+
+log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from spyde.signal_tree import BaseSignalTree
@@ -53,8 +56,8 @@ def _apply_example_calibration(sig, name: str) -> None:
         for ax in sig.axes_manager.signal_axes:
             ax.scale = cal["scale"]
             ax.offset = cal["offset"]
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("applying calibration to signal axes failed: %s", e)
 
 
 _STAGED_HANDLERS = {
@@ -412,8 +415,8 @@ class Session:
             if getattr(p, "signal_tree", None) is tree:
                 try:
                     p.update()
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("re-emitting plot update failed: %s", e)
         self._emit_axes(tree)
         try:
             from spyde.metadata_extract import build_metadata_dict
@@ -422,8 +425,8 @@ class Session:
                 "window_ids": self._tree_window_ids(tree),
                 "metadata": build_metadata_dict(tree),
             })
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("re-emitting metadata failed: %s", e)
 
     def _update_vi(self, window_id: int, name: str, params: dict) -> None:
         """A per-VI caret edit — apply new detector params and recompute that
@@ -511,8 +514,8 @@ class Session:
         s = hs.signals.Signal2D(data)
         try:
             s.set_signal_type("electron_diffraction")
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("set_signal_type(electron_diffraction) on synthetic data failed: %s", e)
         self._add_signal(s, source_path="test_data")
 
     def _load_test_data_lazy(self) -> None:
@@ -531,8 +534,8 @@ class Session:
         s = hs.signals.Signal2D(data).as_lazy()
         try:
             s.set_signal_type("electron_diffraction")
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("set_signal_type(electron_diffraction) on synthetic data failed: %s", e)
         # CALIBRATE the signal axes (scale != 1, beam-centred). This is the real
         # scenario that exposed the "VI is just black" mask bug — anyplotlib ROI
         # widgets report PIXEL coords, so the detector mask must be built in pixel
@@ -567,8 +570,8 @@ class Session:
         s = hs.signals.Signal2D(data)
         try:
             s.set_signal_type("electron_diffraction")
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("set_signal_type(electron_diffraction) on synthetic data failed: %s", e)
         for ax in s.axes_manager.signal_axes:
             ax.scale = 0.1
             ax.offset = -(ax.size / 2.0) * 0.1
@@ -786,8 +789,8 @@ class Session:
             if ov is not None and hasattr(ov, "set_visible"):
                 try:
                     ov.set_visible(visible)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("toggling overlay visibility failed: %s", e)
 
     def _set_action_active(self, window_id: int, name: str, active: bool) -> None:
         """Deselecting an action hides the output window + ROI selector it made
@@ -803,8 +806,8 @@ class Session:
                 self._close_plot(p)
         try:
             art["selector"].close()
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("closing action selector failed: %s", e)
         self._action_artifacts.pop(key, None)
         emit({"type": "action_active", "window_id": window_id, "name": name, "active": False})
         # If this was a virtual-image chip, drop it from the source plot's list
@@ -894,15 +897,15 @@ class Session:
         try:
             if plot in getattr(tree, "signal_plots", []):
                 tree.signal_plots.remove(plot)
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("removing plot from tree.signal_plots failed: %s", e)
         # If no windows of this tree remain open, retire the tree.
         remaining = [p for p in self._plots if getattr(p, "signal_tree", None) is tree]
         if not remaining and tree in self.signal_trees:
             try:
                 tree.close()
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("retiring tree on last window close failed: %s", e)
             self.signal_trees.remove(tree)
 
     def _cleanup_plot_selectors(self, plot) -> None:
@@ -914,8 +917,8 @@ class Session:
             parent_sel = getattr(pw, "parent_selector", None)
             if parent_sel is not None and hasattr(parent_sel, "close"):
                 parent_sel.close()
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("closing parent selector failed: %s", e)
         # Selectors living on this plot itself.
         try:
             state = getattr(plot, "plot_state", None)
@@ -924,10 +927,10 @@ class Session:
                     if hasattr(sel, "close"):
                         try:
                             sel.close()
-                        except Exception:
-                            pass
-        except Exception:
-            pass
+                        except Exception as e:
+                            log.debug("closing plot selector failed: %s", e)
+        except Exception as e:
+            log.debug("iterating plot selectors for cleanup failed: %s", e)
 
     def _close_tree(self, tree: "BaseSignalTree") -> None:
         if tree not in self.signal_trees:
@@ -939,14 +942,14 @@ class Session:
         })
         try:
             tree.close()
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("closing tree in _close_tree failed: %s", e)
         for p in plots:
             self._cleanup_plot_selectors(p)
             try:
                 p.close()
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("closing plot in _close_tree failed: %s", e)
             self.unregister_plot(p)
         if tree in self.signal_trees:
             self.signal_trees.remove(tree)
@@ -1015,8 +1018,8 @@ class Session:
         self._settings["recent_files"] = self._recent_files[:20]
         try:
             self._save_settings()
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("saving recent-files settings failed: %s", e)
 
     def get_recent_files(self) -> list[str]:
         return list(self._recent_files[:20])
@@ -1030,6 +1033,6 @@ class Session:
             try:
                 import shutil
                 shutil.rmtree(tmpdir, ignore_errors=True)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("removing example temp dir %s failed: %s", tmpdir, e)
         self._example_temp_paths.clear()
