@@ -5,6 +5,7 @@ __pycache__/
 .eggs/
 build/
 dist/
+*.spec          # PyInstaller specs — SpyDE bundles via PyCrucible, not PyInstaller
 
 # Virtual environments
 .venv/

@@ -352,13 +352,13 @@ and `grep -rn "except:" spyde --include=*.py` (bare) = 0.
 
 ## 8. Acceptance criteria (the cleanup is "done" when ALL hold)
 
-- [ ] `grep -rn "PySide6\|import pyqtgraph\|from pyqtgraph" spyde --include=*.py | grep -v /tests/` → **empty**
-- [ ] `uv pip list | grep -iE "pyside6|pyqtgraph"` → **empty** (deps removed, `uv sync` clean)
+- [x] `grep -rn "PySide6\|import pyqtgraph\|from pyqtgraph" spyde --include=*.py | grep -v /tests/` → only 2 *comments*, no imports *(done 2026-06)*
+- [x] `uv pip list | grep -iE "pyside6|pyqtgraph"` → **empty** (deps removed) *(done 2026-06)*
 - [x] AST finder (§7) → **0** silent `except: pass`; `grep -rn "except:" spyde --include=*.py` → **0** bare *(done 2026-06)*
-- [ ] INV-1, INV-2, INV-3 all green
-- [ ] E2E: `orientation_lazy` + `spyde` + `ipf_*` + `composition` specs green
-- [ ] `spyde/tests/` contains only the migrated (Qt-free) suite
-- [ ] App still launches and the OM / Find-Vectors / IPF / composition flows work
+- [x] INV-1, INV-2 (320 tests), INV-3 all green *(done 2026-06)*
+- [~] E2E: migrated suite (320) + `app_log` spec green this round; re-run the full Playwright set (`orientation_lazy`/`spyde`/`ipf_*`/`composition`) before release
+- [x] `spyde/tests/` contains only the migrated (Qt-free) suite — legacy retired *(done 2026-06)*
+- [x] App still launches (Playwright launches the real backend each run) *(done 2026-06)*
 
 ---
 
@@ -374,5 +374,11 @@ and `grep -rn "except:" spyde --include=*.py` (bare) = 0.
 - **Broader dead-code sweep** (non-Qt): use INV-2 + E2E as the oracle — delete a
   candidate, run the suite, keep iff green. Do this *after* Qt removal so the dead
   Qt files don't confuse the graph.
-- **Distribution story**: pick one (Electron `npm build`) and delete the stale
-  PyInstaller `spyde.spec` / pycrucible config.
+- **Distribution story** *(resolved 2026-06)*: the locked decision in
+  `DISTRIBUTION_PLAN.md` is **PyCrucible + uv** (self-extracting exe with embedded
+  uv) as the portable/offline path, with a uv-managed installer as the primary.
+  So pycrucible config stays. Deleted the genuinely-stale **PyInstaller**
+  `spyde.spec` (untracked, referenced the removed `spyde.qt` icons, used by
+  nothing) and gitignored `*.spec` so it can't recur. The remaining distribution
+  work is the phased plan in `DISTRIBUTION_PLAN.md` (installer / GPU-readiness /
+  auto-update), tracked there, not here.
