@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from typing import Callable, Optional, Set, Dict
@@ -9,6 +10,8 @@ from psygnal import Signal
 from dask.distributed import Future
 
 from spyde.drawing.update_functions import read_shared_array
+
+log = logging.getLogger(__name__)
 
 
 class PlotUpdateWorker:
@@ -55,8 +58,8 @@ class PlotUpdateWorker:
         while self._running:
             try:
                 self._check()
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("plot-update worker tick failed: %s", e)
             time.sleep(self._interval)
 
     def _check(self) -> None:
@@ -73,8 +76,8 @@ class PlotUpdateWorker:
         try:
             fut = getattr(plot, "current_data", None)
             self._maybe_emit_future(fut, self.plot_ready.emit, plot)
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("emit plot_ready failed: %s", e)
 
     def _maybe_emit_signal_ready(self, plot) -> None:
         try:
@@ -83,8 +86,8 @@ class PlotUpdateWorker:
                 return
             fut = self._future_from_signal(sig)
             self._maybe_emit_future(fut, self.signal_ready.emit, sig, plot)
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("emit signal_ready failed: %s", e)
 
     def _future_from_signal(self, sig) -> Optional[Future]:
         data = getattr(sig, "data", None)

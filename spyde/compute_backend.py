@@ -11,11 +11,14 @@ adapter so the same interface works.
 from __future__ import annotations
 
 import concurrent.futures
+import logging
 import threading
 from typing import Callable, Any, Iterable
 
 import dask
 import dask.array as da
+
+log = logging.getLogger(__name__)
 
 
 class _DistributedFutureAdapter:
@@ -38,8 +41,8 @@ class _DistributedFutureAdapter:
     def cancel(self):
         try:
             self._f.cancel()
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("cancelling distributed future failed: %s", e)
 
     def add_done_callback(self, fn: Callable) -> None:
         # dask callbacks receive the dask future; wrap so fn gets this adapter
@@ -184,8 +187,10 @@ class ComputeBackend:
                     def _cb(f):
                         try:
                             on_chunk_done(f.result(), nav_slices)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            # Live-preview callback; the whole-array future
+                            # re-raises a genuine chunk error on the commit path.
+                            log.debug("chunk callback %r failed: %s", nav_slices, e)
                     return _cb
                 fut.add_done_callback(_make_cb(_slices))
 

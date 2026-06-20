@@ -29,11 +29,14 @@ from __future__ import annotations
 import collections
 import functools
 import itertools
+import logging
 import os
 import threading
 import time
 
 import numpy as np
+
+log = logging.getLogger(__name__)
 
 
 def split_workers_for_gpu(client) -> tuple:
@@ -258,8 +261,10 @@ def dispatch_chunks(
                                 _submit_next("cpu")
                                 if outstanding["cpu"] == before:
                                     break
-            except Exception:
-                pass
+            except Exception as e:
+                # Submission hiccup — the stall watchdog below still fires the
+                # user-facing error if dispatch genuinely makes no progress.
+                log.debug("dispatcher submit pass failed: %s", e)
         with lock:
             stalled = bool(futures) and (
                 time.time() - state["last_progress"] > stall_timeout_s
@@ -286,13 +291,13 @@ def dispatch_chunks(
             for fut in outstanding_futs:
                 try:
                     fut.cancel()
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("cancelling outstanding dispatch future failed: %s", e)
         for fut in held:
             try:
                 fut.release()
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("releasing held dispatch future failed: %s", e)
 
     if stopped_flag is not None and stopped_flag[0]:
         _cleanup(cancel_outstanding=True)
