@@ -282,6 +282,25 @@ is a **pyqtgraph LineROI widget** that also pulls `pyxem._start_progress_poll` a
 
 ## 7. Eliminate error-hiding `except`s
 
+> **STATUS: DONE (2026-06).** All silent `except … : pass` in live source are
+> gone — **176 → 0** (AST finder below = 0). Converted module-by-module, one
+> commit each, compute/data-path modules first and UI-glue last, exactly as the
+> process prescribes. Every handler now either logs (`log.debug`, or
+> `log.warning`/`log.exception` where a swallow would otherwise erase a
+> user-visible failure — e.g. `write_shared_array`, the threaded navigator load),
+> let-raises, or is a narrow membership guard (the `except ValueError: pass` on
+> `list.remove` became `if x in lst`). Two latent bugs surfaced and were handled:
+>
+> - **`log` vs `logger` shadow** — `ipf_density.build_ipf_density_figure` takes a
+>   `log: bool` param that shadows a module-level `log`, so `log.debug(...)` would
+>   crash *only when the except fired*. Module loggers in plotting modules are now
+>   named `logger`. Guard added: `_scan_logger_shadow.py` (AST check, 0 hits). See
+>   the `logger-name-shadow` memory.
+> - **anyplotlib `Axes.set_title` doesn't exist** — several multi-panel titles
+>   (`ipf_density`, `ipf_refine_render`, `views`) were wrapped in `except: pass`
+>   and so *silently never rendered*. Now logged; the real fix is to add
+>   `set_title` to anyplotlib (tracked in §9).
+
 228 of 457 `except` handlers (49%) are silent `except … : pass` — they hide real
 failures. Fix systematically; **never** leave a bare swallow.
 
@@ -335,7 +354,7 @@ and `grep -rn "except:" spyde --include=*.py` (bare) = 0.
 
 - [ ] `grep -rn "PySide6\|import pyqtgraph\|from pyqtgraph" spyde --include=*.py | grep -v /tests/` → **empty**
 - [ ] `uv pip list | grep -iE "pyside6|pyqtgraph"` → **empty** (deps removed, `uv sync` clean)
-- [ ] AST finder (§7) → **0** silent `except: pass`; `grep -rn "except:" spyde --include=*.py` → **0** bare
+- [x] AST finder (§7) → **0** silent `except: pass`; `grep -rn "except:" spyde --include=*.py` → **0** bare *(done 2026-06)*
 - [ ] INV-1, INV-2, INV-3 all green
 - [ ] E2E: `orientation_lazy` + `spyde` + `ipf_*` + `composition` specs green
 - [ ] `spyde/tests/` contains only the migrated (Qt-free) suite
