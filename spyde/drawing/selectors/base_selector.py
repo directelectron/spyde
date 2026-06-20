@@ -102,6 +102,15 @@ class BaseSelector:
 
         # Debounce: timer replaced by threading.Timer
         self._pending_timer: threading.Timer | None = None
+        # Serialise the update path. The throttle fires from overlapping
+        # threading.Timer threads, and forced refreshes arrive from other
+        # threads too; without this, concurrent delayed_update_data calls race
+        # the per-child future cancel/submit (update_from_navigation_selection)
+        # and current_data, so the image future is cancelled/superseded while
+        # the synchronous overlay still paints — the navigator "freezes on the
+        # previous frame" while peak preview keeps updating. One nav update in
+        # flight at a time, latest position wins. See test_navigator_race.
+        self._update_lock = threading.RLock()
         self.update_function = update_function
         self._last_size_sig = None
 
@@ -179,31 +188,38 @@ class BaseSelector:
         self.delayed_update_data()
 
     def delayed_update_data(self, force: bool = False, update_contrast: bool = False) -> None:
-        """Perform the actual data update if indices changed."""
+        """Perform the actual data update if indices changed.
+
+        Serialised via ``_update_lock`` so overlapping throttle fires / forced
+        refreshes can't race the per-child future cancel/submit — one navigator
+        update runs at a time, and the latest position wins (a queued fire
+        re-reads the current widget position and the changed-indices guard skips
+        it if nothing moved)."""
         self._pending_timer = None
-        try:
-            indices = self.get_selected_indices()
-        except Exception:
-            return
-        if not np.array_equal(indices, self.current_indices) or force:
-            for child, fn in self.children.items():
-                try:
-                    new_data = fn(self, child, indices)
-                    child.update_data(new_data)
-                    if update_contrast:
-                        child.needs_auto_level = True
-                    if (child.multiplot_manager is not None
-                            and child.plot_window in child.multiplot_manager.navigation_selectors):
-                        for child_sel in child.multiplot_manager.navigation_selectors[child.plot_window]:
-                            child_sel.delayed_update_data()
-                except Exception as e:
-                    logger.debug("selector update failed: %s", e)
-            for hook in self.index_hooks:
-                try:
-                    hook(indices)
-                except Exception as e:
-                    logger.debug("index hook failed: %s", e)
-            self.current_indices = indices
+        with self._update_lock:
+            try:
+                indices = self.get_selected_indices()
+            except Exception:
+                return
+            if not np.array_equal(indices, self.current_indices) or force:
+                for child, fn in self.children.items():
+                    try:
+                        new_data = fn(self, child, indices)
+                        child.update_data(new_data)
+                        if update_contrast:
+                            child.needs_auto_level = True
+                        if (child.multiplot_manager is not None
+                                and child.plot_window in child.multiplot_manager.navigation_selectors):
+                            for child_sel in child.multiplot_manager.navigation_selectors[child.plot_window]:
+                                child_sel.delayed_update_data()
+                    except Exception as e:
+                        logger.debug("selector update failed: %s", e)
+                for hook in self.index_hooks:
+                    try:
+                        hook(indices)
+                    except Exception as e:
+                        logger.debug("index hook failed: %s", e)
+                self.current_indices = indices
 
     # ── Visibility ─────────────────────────────────────────────────────────────
 

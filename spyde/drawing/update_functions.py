@@ -6,8 +6,10 @@ called on the move or change events of a selector.
 
 """
 
+import contextlib
 import logging
 import sys
+import threading
 import numpy as np
 import dask
 import dask.array as da
@@ -17,6 +19,35 @@ from distributed import Future
 from scipy import fft
 
 log = logging.getLogger(__name__)
+
+# Guards get-or-create of the per-signal cache lock below.
+_CACHE_LOCK_GUARD = threading.Lock()
+
+
+def _cache_lock_ctx(signal):
+    """A per-signal lock guarding the ``CachedDaskArray`` critical section
+    (cancel → cancel_surrounding → get_chunk → submit) in
+    :func:`update_from_navigation_selection`.
+
+    The cache's block bookkeeping (``core_cached_blocks`` / ``surrounding_*``)
+    and its chunk futures are mutated/cancelled there with no internal lock. Two
+    navigator updates that share one signal's cache must not run it concurrently:
+    one thread cancelling a stale ``write_shared_array`` future (or surrounding
+    prefetch) while another promotes that block surrounding→core and submits a
+    ``get_inds`` on top of it cancels the block future its dependents need — so
+    the image future dies and the frame never loads. Serialising this section
+    keeps the greedy future-cancel correct. (Per-selector serialisation already
+    covers a single navigator; this also covers two selectors on one signal.)
+    """
+    with _CACHE_LOCK_GUARD:
+        lk = getattr(signal, "_spyde_nav_cache_lock", None)
+        if lk is None:
+            lk = threading.Lock()
+            try:
+                signal._spyde_nav_cache_lock = lk
+            except Exception:
+                lk = None
+    return lk if lk is not None else contextlib.nullcontext()
 
 from typing import TYPE_CHECKING
 
@@ -160,47 +191,53 @@ def update_from_navigation_selection(
                 #make checkerboard pattern to indicate loading
                 current_img[::2, ::2] = 0
         else:
-            # Cancel stale work from the previous position before requesting new data.
-            # 1. Cancel the old shm-write future so workers aren't blocked on it.
-            old_fut = getattr(child, "_pending_shm_future", None)
-            if old_fut is not None and not old_fut.done():
-                try:
-                    old_fut.cancel()
-                except Exception as e:
-                    log.debug("cancelling stale shm-write future failed: %s", e)
+            # Atomic per-signal cache section: the cancel + cancel_surrounding +
+            # get_chunk + submit below mutate/cancel the shared CachedDaskArray's
+            # block futures, which has no internal lock. Without this, overlapping
+            # navigator updates cancel a chunk future that a dependent
+            # get_inds/write_shared_array future needs → image never loads.
+            with _cache_lock_ctx(current_signal):
+                # Cancel stale work from the previous position before requesting new data.
+                # 1. Cancel the old shm-write future so workers aren't blocked on it.
+                old_fut = getattr(child, "_pending_shm_future", None)
+                if old_fut is not None and not old_fut.done():
+                    try:
+                        old_fut.cancel()
+                    except Exception as e:
+                        log.debug("cancelling stale shm-write future failed: %s", e)
 
-            # 2. Cancel pending surrounding-block prefetch futures — they are
-            #    low-priority but still consume worker slots.  The new core-block
-            #    request will re-prefetch the right neighbours after it completes.
-            cached_arr = getattr(current_signal, "cached_dask_array", None)
-            if cached_arr is not None and hasattr(cached_arr, "cancel_surrounding"):
-                cached_arr.cancel_surrounding()
+                # 2. Cancel pending surrounding-block prefetch futures — they are
+                #    low-priority but still consume worker slots.  The new core-block
+                #    request will re-prefetch the right neighbours after it completes.
+                cached_arr = getattr(current_signal, "cached_dask_array", None)
+                if cached_arr is not None and hasattr(cached_arr, "cancel_surrounding"):
+                    cached_arr.cancel_surrounding()
 
-            # IN-CHUNK vs CROSS-CHUNK. `return_future=False` + `force_compute=False`
-            # makes the cache return a NUMPY array immediately when the chunk is
-            # already cached (an in-chunk move), and only a Future when the chunk
-            # isn't loaded yet (a boundary crossing). This is the key to a live
-            # drag: a cached frame is displayed SYNCHRONOUSLY, so fast in-chunk
-            # moves all paint — instead of every frame being forced through the
-            # async future/worker round-trip and then dropped by the latest-future
-            # staleness guard (which left the plot frozen until the drag stopped).
-            current_img = current_signal._get_cache_dask_chunk(
-                indices, get_result=False, return_future=False,
-            )
-            if isinstance(current_img, Future) and cache_in_shared_memory and _SHARED_MEMORY_SUPPORTED:
-                # CROSS-CHUNK (cache miss): the chunk is loading on a worker. Route
-                # the result through the shared-memory buffer (the optimized path);
-                # the PlotUpdateWorker reads it when the future completes.
-                _ = child.shared_memory  # lazy creation
-                shared_arr_name = f"plot_buffer{id(child)}"
-                # priority=10 puts this ahead of surrounding-block prefetch tasks
-                # (which are submitted at default priority=0 by CachedDaskArray).
-                fut = child.main_window.dask_manager.client.submit(
-                    write_shared_array, current_img, shared_arr_name,
-                    priority=10,
+                # IN-CHUNK vs CROSS-CHUNK. `return_future=False` + `force_compute=False`
+                # makes the cache return a NUMPY array immediately when the chunk is
+                # already cached (an in-chunk move), and only a Future when the chunk
+                # isn't loaded yet (a boundary crossing). This is the key to a live
+                # drag: a cached frame is displayed SYNCHRONOUSLY, so fast in-chunk
+                # moves all paint — instead of every frame being forced through the
+                # async future/worker round-trip and then dropped by the latest-future
+                # staleness guard (which left the plot frozen until the drag stopped).
+                current_img = current_signal._get_cache_dask_chunk(
+                    indices, get_result=False, return_future=False,
                 )
-                child._pending_shm_future = fut
-                current_img = fut
+                if isinstance(current_img, Future) and cache_in_shared_memory and _SHARED_MEMORY_SUPPORTED:
+                    # CROSS-CHUNK (cache miss): the chunk is loading on a worker. Route
+                    # the result through the shared-memory buffer (the optimized path);
+                    # the PlotUpdateWorker reads it when the future completes.
+                    _ = child.shared_memory  # lazy creation
+                    shared_arr_name = f"plot_buffer{id(child)}"
+                    # priority=10 puts this ahead of surrounding-block prefetch tasks
+                    # (which are submitted at default priority=0 by CachedDaskArray).
+                    fut = child.main_window.dask_manager.client.submit(
+                        write_shared_array, current_img, shared_arr_name,
+                        priority=10,
+                    )
+                    child._pending_shm_future = fut
+                    current_img = fut
     else:
         # Eager (in-RAM) slice. `indices` is either a single nav point (1-D,
         # from a crosshair after the mean-reduce above) or a list of nav points
