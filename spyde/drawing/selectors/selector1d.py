@@ -80,8 +80,8 @@ class InfiniteLineSelector(BaseSelector):
             scale, offset = _signal_axis(self)
             try:
                 self._widget.x = float(self._widget.x) + shift_x * scale
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("translating line selector failed: %s", e)
 
 
 class LinearRegionSelector(BaseSelector):
@@ -147,8 +147,8 @@ class LinearRegionSelector(BaseSelector):
             try:
                 self._widget.x0 = float(self._widget.x0) + shift_x * scale
                 self._widget.x1 = float(self._widget.x1) + shift_x * scale
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("translating region selector failed: %s", e)
 
 
 class IntegratingSelector1D(IntegratingSelectorMixin):
@@ -182,15 +182,15 @@ class IntegratingSelector1D(IntegratingSelectorMixin):
         if self._linear_region_selector._widget is not None:
             try:
                 self._linear_region_selector._widget.hide()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("hiding region selector on init failed: %s", e)
         # Reflect the initial hidden region in the panel overlay state.
         try:
             plot1d = self._inf_line_selector._get_plot1d()
             if plot1d is not None:
                 plot1d._push()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("pushing 1-D panel overlay state failed: %s", e)
 
     def __getattr__(self, name):
         """Delegate undefined attributes to the active sub-selector."""
@@ -216,25 +216,25 @@ class IntegratingSelector1D(IntegratingSelectorMixin):
             if self._inf_line_selector._widget is not None:
                 try:
                     self._inf_line_selector._widget.hide()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("hiding line selector widget failed: %s", e)
             if self._linear_region_selector._widget is not None:
                 try:
                     self._linear_region_selector._widget.show()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("showing region selector widget failed: %s", e)
             self.selector = self._linear_region_selector
         else:
             if self._linear_region_selector._widget is not None:
                 try:
                     self._linear_region_selector._widget.hide()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("hiding region selector widget failed: %s", e)
             if self._inf_line_selector._widget is not None:
                 try:
                     self._inf_line_selector._widget.show()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("showing line selector widget failed: %s", e)
             self.selector = self._inf_line_selector
         self.is_integrating = enabled
         # Force a full panel re-push so the new widget visibility is reflected in
@@ -243,8 +243,8 @@ class IntegratingSelector1D(IntegratingSelectorMixin):
             plot1d = self._inf_line_selector._get_plot1d()
             if plot1d is not None:
                 plot1d._push()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("pushing 1-D panel overlay state failed: %s", e)
         self.selector.delayed_update_data(force=True)
 
     def hide(self) -> None:

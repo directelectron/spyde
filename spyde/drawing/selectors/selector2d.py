@@ -67,8 +67,8 @@ class CrosshairSelector(BaseSelector):
             try:
                 self._widget.cx = float(self._widget.cx) + shift_x
                 self._widget.cy = float(self._widget.cy) + shift_y
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("translating crosshair selector failed: %s", e)
 
 
 class RectangleSelector(BaseSelector):
@@ -134,8 +134,8 @@ class RectangleSelector(BaseSelector):
             try:
                 self._widget.x = float(self._widget.x) + shift_x
                 self._widget.y = float(self._widget.y) + shift_y
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("translating rectangle selector failed: %s", e)
 
 
 class CircleSelector(BaseSelector):
@@ -272,8 +272,8 @@ class IntegratingSSelector2D(IntegratingSelectorMixin):
         if self._rect_selector._widget is not None:
             try:
                 self._rect_selector._widget.hide()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("hiding rectangle selector on init failed: %s", e)
         # Reflect the initial hidden rectangle in the panel overlay state.
         self._force_overlay_repaint()
 
@@ -311,33 +311,33 @@ class IntegratingSSelector2D(IntegratingSelectorMixin):
             plot2d = self._crosshair_selector._get_plot2d()
             if plot2d is not None:
                 plot2d._push()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("pushing 2-D panel overlay state failed: %s", e)
 
     def set_integrating(self, enabled: bool) -> None:
         if enabled:
             if self._crosshair_selector._widget is not None:
                 try:
                     self._crosshair_selector._widget.hide()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("hiding crosshair selector failed: %s", e)
             if self._rect_selector._widget is not None:
                 try:
                     self._rect_selector._widget.show()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("showing rectangle selector failed: %s", e)
             self.selector = self._rect_selector
         else:
             if self._rect_selector._widget is not None:
                 try:
                     self._rect_selector._widget.hide()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("hiding rectangle selector failed: %s", e)
             if self._crosshair_selector._widget is not None:
                 try:
                     self._crosshair_selector._widget.show()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("showing crosshair selector failed: %s", e)
             self.selector = self._crosshair_selector
         self.is_integrating = enabled
         self._force_overlay_repaint()

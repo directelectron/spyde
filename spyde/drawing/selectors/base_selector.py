@@ -7,12 +7,15 @@ slice-and-update of child plots.
 """
 from __future__ import annotations
 
+import logging
 import threading
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Union
 
 import numpy as np
 
 from spyde.drawing.selectors.utils import broadcast_rows_cartesian
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from spyde.drawing.plots.plot import Plot
@@ -194,14 +197,12 @@ class BaseSelector:
                         for child_sel in child.multiplot_manager.navigation_selectors[child.plot_window]:
                             child_sel.delayed_update_data()
                 except Exception as e:
-                    import logging
-                    logging.getLogger(__name__).debug("selector update failed: %s", e)
+                    logger.debug("selector update failed: %s", e)
             for hook in self.index_hooks:
                 try:
                     hook(indices)
                 except Exception as e:
-                    import logging
-                    logging.getLogger(__name__).debug("index hook failed: %s", e)
+                    logger.debug("index hook failed: %s", e)
             self.current_indices = indices
 
     # ── Visibility ─────────────────────────────────────────────────────────────
@@ -213,15 +214,15 @@ class BaseSelector:
         if self._widget is not None:
             try:
                 self._widget.hide()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("hiding selector widget failed: %s", e)
 
     def show(self) -> None:
         if self._widget is not None:
             try:
                 self._widget.show()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("showing selector widget failed: %s", e)
 
     def close(self) -> None:
         if self._pending_timer is not None:
@@ -237,8 +238,8 @@ class BaseSelector:
                 panel = get()
                 if panel is not None:
                     panel._push()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("re-pushing panel on selector close failed: %s", e)
 
 
 class IntegratingSelectorMixin:
