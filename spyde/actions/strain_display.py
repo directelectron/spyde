@@ -85,14 +85,16 @@ def build_strain_figure(field: StrainField, *, component: str = "exx",
     except Exception:
         pass
 
+    glyph_group = None
     if glyphs:
         ny, nx = field.nav_shape
         step = glyph_step or max(1, int(round(max(ny, nx) / 16)))
         offs, wid, hei, ang = _glyph_ellipses(field, step=step, amp=glyph_amp)
         if len(offs):
-            p.add_ellipses(offs, wid, hei, name="strain_glyphs", angles=ang,
-                           facecolors=None, edgecolors="#ffffff", linewidths=1.3,
-                           alpha=0.0)
+            glyph_group = p.add_ellipses(offs, wid, hei, name="strain_glyphs",
+                                         angles=ang, facecolors=None,
+                                         edgecolors="#ffffff", linewidths=1.3,
+                                         alpha=0.0)
 
     if ref_yx is not None:
         ry, rx = int(ref_yx[0]), int(ref_yx[1])
@@ -103,4 +105,26 @@ def build_strain_figure(field: StrainField, *, component: str = "exx",
     fig_id = _electron.register(fig)
     html = finalize_figure_html(fig, fig_id)
     _ALIVE.append(fig)
-    return fig, fig_id, html, p
+    return fig, fig_id, html, p, glyph_group
+
+
+def update_strain_view(p, field: StrainField, component: str, glyph_group, *,
+                       vmax: float | None = None, glyph_step: int | None = None,
+                       glyph_amp: float = 60.0) -> None:
+    """Live-update an existing strain plot in place: swap the component map (with
+    a fresh symmetric colour limit) and re-draw the principal-strain glyphs."""
+    data = _component_map(field, component)
+    v = float(vmax) if vmax is not None else _auto_vmax(data)
+    try:
+        p.set_data(np.nan_to_num(data, nan=0.0).astype(np.float32))
+        p.set_clim(-v, v)
+    except Exception:
+        pass
+    if glyph_group is not None:
+        ny, nx = field.nav_shape
+        step = glyph_step or max(1, int(round(max(ny, nx) / 16)))
+        offs, wid, hei, ang = _glyph_ellipses(field, step=step, amp=glyph_amp)
+        try:
+            glyph_group.set(offsets=offs, widths=wid, heights=hei, angles=ang)
+        except Exception:
+            pass
