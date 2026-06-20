@@ -94,14 +94,22 @@ def fit_pattern_strain(g_meas: np.ndarray, g_ref: np.ndarray, *, tol: float):
     sol, *_ = np.linalg.lstsq(A, G_meas, rcond=None)
     T = sol[:2, :].T                                           # 2×2: g_meas ≈ T·g_ref + t
 
-    # Polar decomposition T = R · U (U = (TᵀT)^½, the rotation-free right stretch).
+    # Report REAL-SPACE lattice strain, not reciprocal: the measured g map as
+    # g = F⁻ᵀ·g_ref, so the real-space deformation gradient is F = T⁻ᵀ. This makes
+    # a stretched lattice POSITIVE strain (its diffraction vectors are smaller) —
+    # the physical convention.
+    try:
+        F = np.linalg.inv(T).T
+    except np.linalg.LinAlgError:
+        return None
+    # Polar decomposition F = R · U (U = (FᵀF)^½, the rotation-free right stretch).
     # Strain = U − I; the rotation lives in R — so a finite lattice rotation is
     # NOT mistaken for strain (matches the vector-OM convention).
-    w, V = np.linalg.eigh(T.T @ T)
+    w, V = np.linalg.eigh(F.T @ F)
     U = (V * np.sqrt(np.clip(w, 0.0, None))) @ V.T
     e = U - np.eye(2)
     try:
-        R = T @ np.linalg.inv(U)
+        R = F @ np.linalg.inv(U)
         omega = float(np.arctan2(R[1, 0], R[0, 0]))
     except np.linalg.LinAlgError:
         omega = 0.0
@@ -109,17 +117,53 @@ def fit_pattern_strain(g_meas: np.ndarray, g_ref: np.ndarray, *, tol: float):
     return float(e[0, 0]), float(e[1, 1]), float(e[0, 1]), omega, float(coverage)
 
 
-def compute_strain_field(vecs, ref_yx, *, tol: float | None = None) -> StrainField:
-    """Strain field of ``vecs`` (a ``SpyDEDiffractionVectors``) measured against
-    the lattice at the reference pixel ``ref_yx = (ry, rx)``.
+def cif_g_families(phase, *, min_dspacing: float = 0.7) -> np.ndarray:
+    """Allowed reflection |g| families (1/Å, ascending) of an orix ``Phase`` —
+    structure-factor-filtered so fcc/bcc-forbidden rings are excluded."""
+    from diffsims.crystallography import ReciprocalLatticeVector
+    rlv = ReciprocalLatticeVector.from_min_dspacing(phase, min_dspacing=min_dspacing)
+    rlv.sanitise_phase()
+    rlv.calculate_structure_factor()
+    F = np.abs(np.asarray(rlv.structure_factor))
+    g = np.asarray(rlv.gspacing)
+    allowed = (g > 0) & (F > 1e-3 * (F.max() or 1.0))
+    return np.unique(np.round(g[allowed], 4))
 
-    The reference pixel is unstrained **by construction** (ε = 0 there). ``tol``
-    (reciprocal units) is the ±g match radius; defaults to ¼ of the reference
-    lattice's nearest-neighbour spacing.
+
+def snap_reference_to_cif(sample_g, families, *, tol_frac: float = 0.2) -> np.ndarray:
+    """Build an ABSOLUTE reference lattice from a measured vector set: keep each
+    vector's direction but snap its magnitude to the nearest CIF |g| family
+    (within ``tol_frac``). Strain is then measured against the ideal spacing —
+    so a flat region is not needed (the −g=g family identity from the DP scale)."""
+    sample_g = np.asarray(sample_g, dtype=float).reshape(-1, 2)
+    families = np.asarray(families, dtype=float)
+    mag = np.linalg.norm(sample_g, axis=1)
+    out = []
+    for v, m in zip(sample_g, mag):
+        if m <= 0 or families.size == 0:
+            continue
+        j = int(np.argmin(np.abs(families - m)))
+        if abs(families[j] - m) / m <= tol_frac:
+            out.append(v / m * families[j])
+    return np.asarray(out, dtype=float).reshape(-1, 2)
+
+
+def compute_strain_field(vecs, ref_yx=None, *, ref_vectors=None,
+                         tol: float | None = None) -> StrainField:
+    """Strain field of ``vecs`` (a ``SpyDEDiffractionVectors``) measured against a
+    reference lattice — either the vectors at reference pixel ``ref_yx = (ry, rx)``
+    (relative strain; ε = 0 there by construction) OR an explicit ``ref_vectors``
+    set, e.g. the CIF-snapped absolute reference (absolute strain).
+
+    ``tol`` (reciprocal units) is the ±g match radius; defaults to ¼ of the
+    reference lattice's nearest-neighbour spacing.
     """
     ny, nx = vecs.nav_shape
-    ry, rx = int(ref_yx[0]), int(ref_yx[1])
-    g_ref = np.asarray(vecs.kxy_at(ry, rx), dtype=float).reshape(-1, 2)
+    if ref_vectors is not None:
+        g_ref = np.asarray(ref_vectors, dtype=float).reshape(-1, 2)
+    else:
+        ry, rx = int(ref_yx[0]), int(ref_yx[1])
+        g_ref = np.asarray(vecs.kxy_at(ry, rx), dtype=float).reshape(-1, 2)
     if tol is None:
         nn = _median_nn(g_ref)
         tol = 0.25 * nn if nn > 0 else np.inf

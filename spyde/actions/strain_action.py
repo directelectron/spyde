@@ -38,6 +38,7 @@ class StrainController:
         self.ref_yx = (int(ref_yx[0]), int(ref_yx[1]))
         self.field = None
         self._crosshair = None
+        self._ref_vectors = None        # set → CIF absolute reference; None → region
 
     def attach(self):
         from spyde.actions.strain_mapping import compute_strain_field
@@ -63,10 +64,27 @@ class StrainController:
             self.set_reference(ry, rx)
 
     def set_reference(self, ry: int, rx: int) -> None:
+        """Region mode: the crosshair picks an unstrained pixel (relative strain)."""
         from spyde.actions.strain_mapping import compute_strain_field
         from spyde.actions.strain_display import update_strain_view
         self.ref_yx = (int(ry), int(rx))
+        self._ref_vectors = None                    # crosshair → back to region mode
         self.field = compute_strain_field(self.vecs, self.ref_yx)
+        update_strain_view(self.p, self.field, self.component, self.glyph)
+
+    def set_cif_reference(self, phase) -> None:
+        """CIF mode: snap the reference pixel's vectors to the phase's ideal |g|
+        families → absolute strain (no unstrained region needed)."""
+        from spyde.actions.strain_mapping import (
+            cif_g_families, snap_reference_to_cif, compute_strain_field)
+        from spyde.actions.strain_display import update_strain_view
+        fam = cif_g_families(phase)
+        sample = self.vecs.kxy_at(*self.ref_yx)
+        ref_vectors = snap_reference_to_cif(sample, fam)
+        if len(ref_vectors) < 2:
+            return
+        self._ref_vectors = ref_vectors
+        self.field = compute_strain_field(self.vecs, ref_vectors=ref_vectors)
         update_strain_view(self.p, self.field, self.component, self.glyph)
 
     def set_component(self, component: str) -> None:
@@ -119,3 +137,24 @@ def strain_set_component(session, plot, payload) -> None:
     ctrl = getattr(tree, "_strain_controller", None) if tree is not None else None
     if ctrl is not None:
         ctrl.set_component(str(payload.get("component", "exx")))
+
+
+def strain_set_cif(session, plot, payload) -> None:
+    """Set the absolute reference from a CIF (``payload['cif_path']``) — the
+    reflection family is guessed from the measured |g| vs the CIF's ideal spacings.
+    Passing no path reverts to the region (crosshair) reference."""
+    tree = getattr(plot, "signal_tree", None)
+    ctrl = getattr(tree, "_strain_controller", None) if tree is not None else None
+    if ctrl is None:
+        return
+    cif_path = payload.get("cif_path")
+    if not cif_path:
+        ry, rx = ctrl.ref_yx
+        ctrl.set_reference(ry, rx)                  # back to region mode
+        return
+    try:
+        from orix.crystal_map import Phase
+        ctrl.set_cif_reference(Phase.from_cif(cif_path))
+    except Exception as e:
+        from spyde.backend.ipc import emit_error
+        emit_error(f"Strain CIF reference failed: {e}")

@@ -15,8 +15,12 @@ G_REF = np.array([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0],
                   [1.0, 1.0], [1.0, -1.0], [-1.0, 1.0], [-1.0, -1.0]])
 
 
-def _strained(T, g=G_REF, *, offset=(0.0, 0.0)):
-    return (g @ np.asarray(T).T) + np.asarray(offset)
+def _strained(F, g=G_REF, *, offset=(0.0, 0.0)):
+    """Measured reciprocal vectors of a lattice under REAL deformation ``F``:
+    g_meas = (F⁻ᵀ)·g_ref (+ DP-centre offset). So the fit must recover ``F``'s
+    real-space strain (a stretched real lattice ⇒ positive ε)."""
+    T = np.linalg.inv(np.asarray(F, dtype=float)).T          # reciprocal transform
+    return (g @ T.T) + np.asarray(offset)
 
 
 class TestStrainFit:
@@ -87,6 +91,43 @@ class TestStrainField:
         assert abs(abs(theta[0]) - np.deg2rad(45)) < 1e-6
 
 
+class TestCifReference:
+    def _al_phase(self):
+        from orix.crystal_map import Phase
+        from diffpy.structure import Atom, Lattice, Structure
+        st = Structure(atoms=[Atom("Al", [0, 0, 0])],
+                       lattice=Lattice(4.05, 4.05, 4.05, 90, 90, 90))
+        return Phase(name="Al", space_group=225, structure=st)
+
+    def test_families_exclude_forbidden(self):
+        from spyde.actions.strain_mapping import cif_g_families
+        fam = cif_g_families(self._al_phase(), min_dspacing=0.9)
+        assert np.any(np.abs(fam - np.sqrt(3) / 4.05) < 2e-3)   # {111} allowed
+        assert np.any(np.abs(fam - 2.0 / 4.05) < 2e-3)          # {200} allowed
+        assert not np.any(np.abs(fam - 1.0 / 4.05) < 2e-3)      # {100} forbidden (fcc)
+
+    def test_snap_corrects_magnitude_to_ideal(self):
+        from spyde.actions.strain_mapping import cif_g_families, snap_reference_to_cif
+        fam = cif_g_families(self._al_phase(), min_dspacing=0.9)
+        g = float(fam[np.argmin(np.abs(fam - np.sqrt(3) / 4.05))])
+        meas = np.array([[1, 0], [0, 1], [-1, 0], [0, -1]], float) * (g * 1.02)
+        ref = snap_reference_to_cif(meas, fam)
+        assert len(ref) == 4
+        assert np.allclose(np.linalg.norm(ref, axis=1), g, atol=1e-3)
+
+    def test_cif_reference_gives_absolute_strain(self):
+        # No flat region needed: snap to the ideal CIF spacing → absolute strain.
+        from spyde.actions.strain_mapping import (
+            cif_g_families, snap_reference_to_cif, fit_pattern_strain)
+        fam = cif_g_families(self._al_phase(), min_dspacing=0.6)
+        g = float(fam[np.argmin(np.abs(fam - np.sqrt(3) / 4.05))])
+        dirs = np.array([[1, 0], [0, 1], [-1, 0], [0, -1]], float) * g
+        meas = _strained(np.diag([1.01, 0.99]), g=dirs)         # real +1% x, −1% y
+        ref = snap_reference_to_cif(meas, fam)                  # ideal magnitudes
+        exx, eyy, exy, omega, cov = fit_pattern_strain(meas, ref, tol=0.05)
+        assert abs(exx - 0.01) < 3e-3 and abs(eyy + 0.01) < 3e-3
+
+
 class TestStrainDisplay:
     def _field(self, ny=12, nx=12):
         rng = np.random.RandomState(0)
@@ -152,6 +193,34 @@ class TestStrainAction:
         ctrl.set_component("eyy")                       # toggle — no error
         ctrl.set_reference(2, 3)                        # move reference — recompute
         assert ctrl.ref_yx == (2, 3) and ctrl.component == "eyy"
+
+    def test_controller_cif_reference_then_region(self):
+        import anyplotlib as apl
+        from orix.crystal_map import Phase
+        from diffpy.structure import Atom, Lattice, Structure
+        from spyde.actions.strain_action import StrainController
+
+        st = Structure(atoms=[Atom("Al", [0, 0, 0])],
+                       lattice=Lattice(4.05, 4.05, 4.05, 90, 90, 90))
+        phase = Phase(name="Al", space_group=225, structure=st)
+        g111 = float(np.sqrt(3) / 4.05)
+        dirs = np.array([[1, 0], [0, 1], [-1, 0], [0, -1]], float) * g111
+
+        class _V:
+            nav_shape = (4, 4)
+            def kxy_at(self, iy, ix):
+                return dirs * (1.0 + 0.004 * ix)        # mild strain gradient
+            def count_map(self):
+                return np.ones((4, 4), int)
+
+        fig, ax = apl.subplots()
+        p = ax.imshow(np.zeros((4, 4), "f4"))
+        ctrl = StrainController(_V(), p, None, ref_yx=(0, 0))
+        ctrl.set_cif_reference(phase)                   # absolute CIF reference
+        assert ctrl._ref_vectors is not None and len(ctrl._ref_vectors) >= 2
+        assert ctrl.field is not None and ctrl.field.nav_shape == (4, 4)
+        ctrl.set_reference(2, 2)                         # crosshair → region mode
+        assert ctrl._ref_vectors is None
 
     def test_strain_run_without_vectors_errors(self):
         import spyde.backend.ipc as ipc

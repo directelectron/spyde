@@ -167,6 +167,17 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction, ipfKey
                   onClick={() => { setStrainComp(c); sendAction('strain_set_component', { component: c }, win.windowId) }}
                   style={c === strainComp ? styles.btnActive : styles.btn}>{STRAIN_LABEL[c] ?? c}</button>
               ))}
+              <span style={{ width: 6 }} />
+              {/* reference: the live crosshair region (relative) or a CIF spacing (absolute). */}
+              <button data-testid={`strain-ref-region-${id}`} style={styles.btn}
+                title="Reference = the cyan crosshair region (relative strain)"
+                onClick={() => sendAction('strain_set_cif', {}, win.windowId)}>Region</button>
+              <button data-testid={`strain-ref-cif-${id}`} style={styles.btn}
+                title="Absolute strain from a CIF's ideal spacing"
+                onClick={async () => {
+                  const p = await window.electron.pickFile({ name: 'Crystal (.cif)', extensions: ['cif'] })
+                  if (p) sendAction('strain_set_cif', { cif_path: p }, win.windowId)
+                }}>CIF…</button>
             </div>
           )}
         </div>
