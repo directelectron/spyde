@@ -150,9 +150,21 @@ git rm spyde/_qt_main_legacy.py spyde/qt_scrapper.py spyde/_conftest_legacy.py \
 **Batch 3c — the Qt drawing layer (toolbars + presenter):**
 
 ```bash
-git rm -r spyde/drawing/toolbars
+git rm spyde/drawing/toolbars/caret_group.py spyde/drawing/toolbars/toolbar.py \
+       spyde/drawing/toolbars/popout_toolbar.py spyde/drawing/toolbars/stylized_toolbar.py \
+       spyde/drawing/toolbars/floating_button_trees.py spyde/drawing/toolbars/utils.py
 git rm spyde/drawing/signal_tree_presenter.py
 ```
+> ⚠️ **`spyde/drawing/toolbars/` is NOT all dead.** Do **NOT** `git rm -r` the
+> whole dir — it also holds LIVE, Qt-free assets that the running app needs:
+> `plot_control_toolbar.py` (`get_toolbar_config_for_plot` — builds the per-window
+> toolbar action list emitted by `plot_states._send_toolbar_config`; without it
+> EVERY toolbar action button vanishes), `__init__.py`, and `icons/*.svg`
+> (referenced by `toolbars.yaml`). Delete only the six Qt modules above. (Both
+> were over-deleted once and restored — neither headless nor the smoke E2Es catch
+> it, because migrated tests don't render the toolbar and the smoke specs don't
+> click toolbar action buttons. A `vector_*_lazy` / `strain_lazy` E2E that clicks
+> an `action-btn-*` is the guard.)
 ⚠️ Then verify the rest of `spyde/drawing/plots/` is Qt-free and live:
 `grep -rn "PySide6\|pyqtgraph\|QMdiSubWindow\|QWidget" spyde/drawing/plots/`.
 If `plot_window.py` / `multiplot_manager.py` / `plot_states.py` import Qt **and**
