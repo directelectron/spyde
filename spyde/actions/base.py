@@ -9,10 +9,13 @@ the controls and sends back parameter values.
 """
 from __future__ import annotations
 
+import logging
 from functools import partial
 from typing import TYPE_CHECKING
 
 import numpy as np
+
+log = logging.getLogger(__name__)
 import hyperspy.api as hs
 
 from spyde.drawing.update_functions import get_fft
@@ -29,8 +32,8 @@ def _emit(obj: dict) -> None:
     try:
         from spyde.backend.ipc import emit
         emit(obj)
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("IPC emit of %r failed: %s", obj.get("type"), e)
 
 
 # ── View actions ────────────────────────────────────────────────────────────
@@ -142,8 +145,8 @@ def toggle_signal_tree(toolbar: "ActionContext", action_name="", toggle=None,
     active = None
     try:
         active = id(toolbar.plot.plot_state.current_signal)
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("resolving active signal id failed: %s", e)
     _emit({
         "type": "signal_tree",
         "window_id": toolbar.plot.window_id,

@@ -27,10 +27,13 @@ Usage from the toolbar dispatcher is identical — it builds an
 """
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import hyperspy.api as hs
+
+log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from spyde.actions.context import ActionContext
@@ -187,22 +190,22 @@ class RegionAction(Action):
         try:
             ph = np.asarray(self.placeholder_signal().data, dtype=np.float32)
             out_plot.set_data(ph)
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("painting action output placeholder failed: %s", e)
 
         # Tag the output window so the renderer can label/colour it.
         try:
             out_window.vi_color = self.roi_color
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("tagging output window colour failed: %s", e)
         self._out_plot = out_plot
         selector = self._make_selector(out_plot)
         self._selector = selector
         # Trigger an initial compute so the output isn't blank.
         try:
             selector.delayed_update_data(force=True)
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("initial action compute failed: %s", e)
         return selector
 
     def _make_selector(self, out_plot):
@@ -244,15 +247,15 @@ class RegionAction(Action):
             if sel is not None:
                 try:
                     sel.close()   # removes the old ROI (hide + panel repaint)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("closing old ROI on detector-shape change failed: %s", e)
             self._selector = self._make_selector(self._out_plot)
             try:
                 self._selector.delayed_update_data(force=True, update_contrast=True)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("recompute after ROI swap failed: %s", e)
         elif sel is not None:
             try:
                 sel.delayed_update_data(force=True, update_contrast=True)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("recompute after param change failed: %s", e)

@@ -216,8 +216,8 @@ class Plot:
                 title = self.signal_tree.root.metadata.get_item(
                     "General.title", default=""
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("reading plot title from metadata failed: %s", e)
 
         # Navigator: report the real-space image aspect (width/height) so the
         # frontend sizes the window to it. Without this, a wide scan (e.g. sped_ag
@@ -533,8 +533,8 @@ class Plot:
             if n > 0:
                 # 8 bytes/elem (float64 worst case) + header/margin; 1 MB floor.
                 return max(n * 8 + 8192, 1 << 20)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("frame-size probe failed, using 4 MB shm fallback: %s", e)
         return 4 << 20  # 4 MB fallback when the frame size isn't known yet
 
     @property
@@ -593,22 +593,22 @@ class Plot:
         try:
             from spyde.drawing.update_functions import _stop_progressive_stream
             _stop_progressive_stream(self)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("stopping progressive stream on plot close failed: %s", e)
         if self.session is not None:
             self.session.unregister_plot(self)
         if self._shared_memory is not None:
             try:
                 self._shared_memory.close()
                 self._shared_memory.unlink()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("releasing plot shared memory on close failed: %s", e)
             self._shared_memory = None
         if self.fig_id is not None:
             try:
                 del _electron._figures[self.fig_id]
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("dropping figure registry entry on close failed: %s", e)
 
     def hide(self) -> None:
         from spyde.backend.ipc import emit

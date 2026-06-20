@@ -10,9 +10,12 @@ state becomes active.
 """
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, List, Optional
 
 from hyperspy.signal import BaseSignal
+
+log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from spyde.drawing.plots.plot import Plot
@@ -116,8 +119,8 @@ class PlotState:
                 "plot_id": id(self.plot),
                 "toolbar_actions": config,
             })
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("sending toolbar config failed: %s", e)
 
     # ── Visibility ─────────────────────────────────────────────────────────────
 
@@ -128,8 +131,8 @@ class PlotState:
         try:
             from spyde.backend.ipc import emit
             emit({"type": "toolbars_show", "window_id": window_id, "plot_id": id(self.plot)})
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("emitting toolbars_show failed: %s", e)
 
     def hide_toolbars(self) -> None:
         window_id = getattr(getattr(self.plot, "plot_window", None), "window_id", None)
@@ -138,8 +141,8 @@ class PlotState:
         try:
             from spyde.backend.ipc import emit
             emit({"type": "toolbars_hide", "window_id": window_id, "plot_id": id(self.plot)})
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("emitting toolbars_hide failed: %s", e)
 
     def update_toolbars(self) -> None:
         self._send_toolbar_config()

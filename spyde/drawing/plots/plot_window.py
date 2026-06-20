@@ -146,8 +146,8 @@ class PlotWindow:
         if effect is not None:
             try:
                 opacity = effect.opacity()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("reading graphics-effect opacity failed: %s", e)
         from spyde.backend.ipc import emit
         emit({"type": "window_opacity", "window_id": self.window_id, "opacity": opacity})
 
@@ -160,8 +160,8 @@ class PlotWindow:
         for plot in list(self.plots):
             try:
                 plot.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("closing child plot on window close failed: %s", e)
         self.plots.clear()
         if (self.session is not None
                 and hasattr(self.session, "mdi_manager")
@@ -171,8 +171,8 @@ class PlotWindow:
                     pw for pw in self.session.mdi_manager.plot_subwindows
                     if pw is not self
                 ]
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("removing window from mdi_manager registry failed: %s", e)
         from spyde.backend.ipc import emit
         emit({"type": "window_closed", "window_id": self.window_id})
 

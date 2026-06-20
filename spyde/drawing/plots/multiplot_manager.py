@@ -205,8 +205,8 @@ class MultiplotManager:
                 "mode": mode,
                 "title": "Navigator",
             })
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("emitting navigator selector_info failed: %s", e)
 
         if is_navigator:
             for signal in self.signal_tree.navigator_signals.values():
