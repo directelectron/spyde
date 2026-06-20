@@ -1,0 +1,113 @@
+"""
+strain_action.py — the interactive strain-mapping action.
+
+Runs strain on a Find-Vectors result (``tree.diffraction_vectors``), opens the
+component-map + ellipse-glyph window, and attaches a **draggable reference
+crosshair**: moving it picks the unstrained region and recomputes the whole
+strain field live. A component toggle (εxx / εyy / εxy / ω) swaps the displayed
+map in place. No Qt.
+"""
+from __future__ import annotations
+
+import numpy as np
+
+_COMPONENTS = ("exx", "eyy", "exy", "omega")
+_TITLES = {"exx": "εxx", "eyy": "εyy", "exy": "εxy", "omega": "ω"}
+
+
+def _default_reference(vecs) -> tuple:
+    """A sensible unstrained reference: the pixel with the most vectors (the
+    best-determined local lattice)."""
+    try:
+        cm = np.asarray(vecs.count_map())
+        iy, ix = np.unravel_index(int(np.argmax(cm)), cm.shape)
+        return int(iy), int(ix)
+    except Exception:
+        return 0, 0
+
+
+class StrainController:
+    """Owns the live strain window: recomputes the field when the reference
+    crosshair moves and swaps the shown component on toggle."""
+
+    def __init__(self, vecs, plot2d, glyph_group, *, component="exx", ref_yx=(0, 0)):
+        self.vecs = vecs
+        self.p = plot2d
+        self.glyph = glyph_group
+        self.component = component
+        self.ref_yx = (int(ref_yx[0]), int(ref_yx[1]))
+        self.field = None
+        self._crosshair = None
+
+    def attach(self):
+        from spyde.actions.strain_mapping import compute_strain_field
+        self.field = compute_strain_field(self.vecs, self.ref_yx)
+        try:
+            ry, rx = self.ref_yx
+            self._crosshair = self.p.add_crosshair_widget(cx=float(rx), cy=float(ry),
+                                                          color="#00e5ff")
+            self._crosshair.add_event_handler(self._on_pick, "pointer_up")
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).debug("strain crosshair attach failed: %s", e)
+        return self
+
+    def _on_pick(self, event=None):
+        try:
+            rx = int(round(float(self._crosshair.cx)))
+            ry = int(round(float(self._crosshair.cy)))
+        except Exception:
+            return
+        ny, nx = self.vecs.nav_shape
+        if 0 <= ry < ny and 0 <= rx < nx and (ry, rx) != self.ref_yx:
+            self.set_reference(ry, rx)
+
+    def set_reference(self, ry: int, rx: int) -> None:
+        from spyde.actions.strain_mapping import compute_strain_field
+        from spyde.actions.strain_display import update_strain_view
+        self.ref_yx = (int(ry), int(rx))
+        self.field = compute_strain_field(self.vecs, self.ref_yx)
+        update_strain_view(self.p, self.field, self.component, self.glyph)
+
+    def set_component(self, component: str) -> None:
+        from spyde.actions.strain_display import update_strain_view
+        if component not in _COMPONENTS or self.field is None:
+            return
+        self.component = component
+        update_strain_view(self.p, self.field, component, self.glyph)
+
+
+# ── staged handlers (session.py dispatch: fn(session, plot, payload)) ──────────
+
+def strain_run(session, plot, payload) -> None:
+    """Open the interactive strain window for the active Find-Vectors result."""
+    from spyde.backend.ipc import emit, emit_error
+    from spyde.actions.strain_mapping import compute_strain_field
+    from spyde.actions.strain_display import build_strain_figure
+
+    tree = getattr(plot, "signal_tree", None)
+    vecs = getattr(tree, "diffraction_vectors", None) if tree is not None else None
+    if vecs is None:
+        emit_error("Strain mapping needs a Find Vectors result (no diffraction vectors).")
+        return
+
+    ref_yx = _default_reference(vecs)
+    field = compute_strain_field(vecs, ref_yx)
+    _fig, fig_id, html, p, glyph = build_strain_figure(field, component="exx")
+
+    wid = session.next_window_id()
+    emit({"type": "figure", "fig_id": fig_id, "window_id": int(wid),
+          "html": html, "title": "Strain (εxx)", "is_navigator": False,
+          "strain_components": list(_COMPONENTS)})
+
+    ctrl = StrainController(vecs, p, glyph, component="exx", ref_yx=ref_yx)
+    ctrl.attach()
+    tree._strain_controller = ctrl
+
+
+def strain_set_component(session, plot, payload) -> None:
+    """Component toggle (εxx / εyy / εxy / ω) → swap the shown map in place."""
+    tree = getattr(plot, "signal_tree", None)
+    ctrl = getattr(tree, "_strain_controller", None) if tree is not None else None
+    if ctrl is not None:
+        ctrl.set_component(str(payload.get("component", "exx")))

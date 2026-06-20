@@ -99,7 +99,7 @@ class TestStrainDisplay:
 
     def test_build_strain_figure_map_glyphs_and_ref(self):
         from spyde.actions.strain_display import build_strain_figure
-        fig, fid, html, p = build_strain_figure(
+        fig, fid, html, p, g = build_strain_figure(
             self._field(), component="exx", ref_yx=(1, 1), glyph_step=3)
         assert isinstance(fid, str) and fid and isinstance(html, str) and len(html) > 500
         types = {m["type"] for m in p.list_markers()}
@@ -109,6 +109,60 @@ class TestStrainDisplay:
     def test_each_component_builds(self):
         from spyde.actions.strain_display import build_strain_figure
         for comp in ("exx", "eyy", "exy", "omega"):
-            fig, fid, html, p = build_strain_figure(
+            fig, fid, html, p, g = build_strain_figure(
                 self._field(), component=comp, glyphs=False)
             assert fid and "ellipses" not in {m["type"] for m in p.list_markers()}
+
+
+class _MockVecsCM(_MockVecs):
+    """_MockVecs + count_map (for the default-reference pick)."""
+    def __init__(self, nav_shape, T_of, npk=8):
+        super().__init__(nav_shape, T_of)
+        self._npk = npk
+
+    def count_map(self):
+        return np.full(self.nav_shape, self._npk, dtype=int)
+
+
+class TestStrainAction:
+    def test_strain_run_emits_window_and_attaches_controller(self):
+        import spyde.backend.ipc as ipc
+        from spyde.actions.strain_action import strain_run
+
+        vecs = _MockVecsCM((6, 6), lambda iy, ix: np.array([[1 + 0.01 * ix, 0.0],
+                                                            [0.0, 1.0]]))
+        tree = type("T", (), {"diffraction_vectors": vecs})()
+        plot = type("P", (), {"signal_tree": tree})()
+        session = type("S", (), {"_w": 0,
+                                 "next_window_id": lambda self: setattr(self, "_w", self._w + 1) or self._w})()
+
+        cap, orig = [], ipc.emit
+        ipc.emit = lambda m: cap.append(m)
+        try:
+            strain_run(session, plot, {})
+        finally:
+            ipc.emit = orig
+
+        figs = [m for m in cap if m.get("type") == "figure"]
+        assert figs and "Strain" in figs[-1]["title"]
+        assert figs[-1]["strain_components"] == ["exx", "eyy", "exy", "omega"]
+
+        ctrl = getattr(tree, "_strain_controller", None)
+        assert ctrl is not None and ctrl.field is not None
+        ctrl.set_component("eyy")                       # toggle — no error
+        ctrl.set_reference(2, 3)                        # move reference — recompute
+        assert ctrl.ref_yx == (2, 3) and ctrl.component == "eyy"
+
+    def test_strain_run_without_vectors_errors(self):
+        import spyde.backend.ipc as ipc
+        from spyde.actions.strain_action import strain_run
+        tree = type("T", (), {"diffraction_vectors": None})()
+        plot = type("P", (), {"signal_tree": tree})()
+        cap, orig = [], ipc.emit
+        ipc.emit = lambda m: cap.append(m)
+        try:
+            strain_run(object(), plot, {})
+        finally:
+            ipc.emit = orig
+        assert not [m for m in cap if m.get("type") == "figure"]
+        assert any(m.get("type") == "error" for m in cap)
