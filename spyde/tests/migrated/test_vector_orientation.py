@@ -142,6 +142,56 @@ class TestFit:
         fit = self._fit(g[:2], I[:2], g, I, seed_angle=0.0)
         assert fit is None
 
+    @staticmethod
+    def _project(fit, g):
+        """Physical observable: where the fit places the template spots
+        (M·g + t). Gauge-invariant — unlike theta/affine individually, which
+        share the flat M = A·Rot(theta) gauge direction."""
+        p7 = np.zeros(7)
+        p7[0] = fit.theta
+        p7[1:5] = np.asarray(fit.affine, float).reshape(-1)
+        p7[5:7] = np.asarray(fit.translation, float)
+        return vo.project_spots(p7, g)
+
+    def test_intensity_scale_invariant(self):
+        """The stored vector intensity is now RAW image counts (~1e4), not the
+        ~1 NXCORR score. The soft-assign sink gating is tuned for O(1) weights,
+        so fit_pattern normalises each pattern to unit mean — making the fit
+        invariant to the absolute intensity scale. Scaling all intensities by
+        1e4 must reproduce the same fit (this FAILED before the normalisation:
+        conf=raw/(raw+sink) saturated to 1 and the no-match sink stopped
+        gating, biasing strain + predicted positions).
+
+        Compared on the gauge-invariant observables (strain, matched count, and
+        the predicted spot positions) — theta/affine individually share a flat
+        gauge direction and drift at float level, so are not compared raw."""
+        g, I = _template()
+        theta = np.deg2rad(-8.0)
+        strain = np.array([[0.02, 0.0], [0.0, 0.015]])
+        v, vI = _apply(g, I, theta, strain, noise=0.006,
+                       drop=0.2, spurious=4, seed=2)        # gating matters here
+        f_unit = self._fit(v, vI, g, I, seed_angle=theta + np.deg2rad(2))
+        f_raw = self._fit(v, vI * 1e4, g, I, seed_angle=theta + np.deg2rad(2))
+        assert f_unit is not None and f_raw is not None
+        assert f_raw.n_matched == f_unit.n_matched
+        assert np.allclose(f_raw.strain, f_unit.strain, atol=1e-4), \
+            (f_raw.strain, f_unit.strain)
+        assert np.allclose(self._project(f_raw, g), self._project(f_unit, g),
+                           atol=1e-3)
+
+    def test_robust_at_raw_count_scale(self):
+        """Sanity: with raw-count intensities (~1e4) and missing+spurious peaks,
+        the strain is still recovered — i.e. the sink gating still opts out
+        unmatched template spots after normalisation."""
+        g, I = _template()
+        theta = np.deg2rad(-8.0)
+        strain = np.array([[0.02, 0.0], [0.0, 0.015]])
+        v, vI = _apply(g, I, theta, strain, noise=0.006,
+                       drop=0.2, spurious=4, seed=2)
+        fit = self._fit(v, vI * 1e4, g, I, seed_angle=theta + np.deg2rad(2))
+        assert fit is not None
+        assert np.abs(fit.strain - strain).max() < 0.03, fit.strain
+
 
 class TestFriedelQC:
     """Friedel g/−g asymmetry: low for symmetric strain, high when one of a

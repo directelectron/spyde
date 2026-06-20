@@ -311,6 +311,16 @@ def fit_pattern(meas_xy: np.ndarray, meas_I: np.ndarray,
         return None
     meas_xy = np.asarray(meas_xy, dtype=np.float64)
     meas_I = np.asarray(meas_I, dtype=np.float64)
+    # Scale-invariant weighting. The stored intensity is now RAW image counts
+    # (~1e4 on a real detector) so virtual imaging sees true disk brightness —
+    # but the soft-assign no-match sink (conf = raw/(raw+sink), fixed sink) is
+    # tuned for O(1) weights and would saturate (every template spot reads as
+    # "matched") at raw-count scale. Normalise each pattern to unit mean so OM
+    # behaviour is independent of detector gain / absolute counts. (Same per-
+    # pattern mean is applied on the GPU path in _pack_patterns, so they agree.)
+    _mI_mean = float(meas_I.mean()) if meas_I.size else 0.0
+    if _mI_mean > 0.0:
+        meas_I = meas_I / _mI_mean
 
     if seed is not None:
         candidates = [seed]

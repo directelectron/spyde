@@ -163,6 +163,12 @@ def _pack_patterns(vectors, t, device, dtype):
             xy[i, :n, 1] = rows[:, COL_KY]
             inten[i, :n] = rows[:, COL_INTENSITY]
             mask[i, :n] = True
+    # Per-pattern unit-mean normalisation — the stored intensity is RAW image
+    # counts (for virtual imaging); the soft-assign sink gating expects O(1)
+    # weights. Mirrors the CPU fit_pattern normalisation so CPU/GPU agree.
+    pcnt = mask.sum(axis=1).astype(np.float32)            # (P,)
+    pmean = inten.sum(axis=1) / np.maximum(pcnt, 1.0)     # mean over real rows
+    inten = inten / np.maximum(pmean, 1e-12)[:, None]
     return (
         torch.as_tensor(xy, device=device, dtype=dtype),
         torch.as_tensor(inten, device=device, dtype=dtype),
