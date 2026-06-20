@@ -22,6 +22,7 @@ Nav-space Gaussian blur uses two paths:
 from __future__ import annotations
 
 import functools
+import logging
 import threading
 import time
 from typing import Optional
@@ -29,6 +30,8 @@ from typing import Optional
 import numpy as np
 from scipy.ndimage import gaussian_filter, maximum_filter
 from scipy.fft import rfft2, irfft2, next_fast_len
+
+log = logging.getLogger(__name__)
 
 from typing import TYPE_CHECKING
 
@@ -81,8 +84,8 @@ def _gpu_pool_cap() -> int:
             from numba import cuda as _cuda
             _free, total = _cuda.current_context().get_memory_info()
             cap = int(total * 0.5)
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("VRAM probe failed, using default GPU pool cap: %s", e)
         _gpu_pool_max_bytes[0] = cap
     return _gpu_pool_max_bytes[0]
 
@@ -1798,8 +1801,8 @@ def _interprocess_warmup_lock():
                 if time.time() - os.path.getmtime(path) > 120.0:
                     os.remove(path)
                     continue
-            except OSError:
-                pass
+            except OSError as e:
+                log.debug("stale-lock check on %s failed: %s", path, e)
             if time.time() > deadline:
                 break  # give up on locking rather than deadlock
             time.sleep(0.1)
@@ -1810,8 +1813,8 @@ def _interprocess_warmup_lock():
             try:
                 os.close(fd)
                 os.remove(path)
-            except OSError:
-                pass
+            except OSError as e:
+                log.debug("releasing lock file %s failed: %s", path, e)
 
 
 def _reset_gpu_state():
@@ -1821,8 +1824,8 @@ def _reset_gpu_state():
     try:
         from numba import cuda as _cuda
         _cuda.close()
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("numba CUDA context teardown failed: %s", e)
     with _gpu_pool_lock:
         _gpu_buffer_pool.clear()
         _gpu_pool_bytes[0] = 0
@@ -2436,8 +2439,8 @@ def _count_chunk_to_shm(
             del region, buf
         finally:
             shm.close()
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("live count-map shm update for block failed: %s", e)
     return block
 
 
@@ -2696,8 +2699,8 @@ def _do_compute_vectors(
                 if stopped_flag is not None and stopped_flag[0]:
                     try:
                         future.cancel()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.debug("cancelling find-vectors compute future failed: %s", e)
                     return None
                 time.sleep(0.1)
             result_padded = future.result()
@@ -2750,8 +2753,8 @@ def _do_compute_vectors(
                 shm_buf = np.ndarray(nav_2d_shape, dtype=np.float32, buffer=shm_handle.buf)
                 shm_buf[:] = count_map.astype(np.float32)
                 shm_handle.close()
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("final count-map shm write to %s failed: %s", shm_name, e)
         if on_chunk_done is not None:
             on_chunk_done((slice(None), slice(None)), count_map)
 

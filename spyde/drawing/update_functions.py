@@ -6,6 +6,7 @@ called on the move or change events of a selector.
 
 """
 
+import logging
 import sys
 import numpy as np
 import dask
@@ -14,6 +15,8 @@ import distributed
 from distributed import Future
 
 from scipy import fft
+
+log = logging.getLogger(__name__)
 
 from typing import TYPE_CHECKING
 
@@ -45,13 +48,15 @@ def write_shared_array(data, shared_arr_name):
         target_arr = np.ndarray(data.shape, dtype=data.dtype, buffer=shm.buf[offset:])
         target_arr[:] = data
     except Exception:
-        pass
+        # A failed write means the plot reads a stale/blank shm frame — surface
+        # it (workers log to their own stream) rather than silently mispaint.
+        log.warning("write_shared_array(%s) failed", shared_arr_name, exc_info=True)
     finally:
         if shm is not None:
             try:
                 shm.close()
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("closing shared-memory %s failed: %s", shared_arr_name, e)
 
 
 def read_shared_array(shm):
@@ -143,8 +148,10 @@ def update_from_navigation_selection(
             )
             if limits.size == ncoord:
                 indices = np.clip(idx_arr, 0, limits)
-    except Exception:
-        pass
+    except Exception as e:
+        # Couldn't clamp (unexpected shape) — proceed with raw indices; a real
+        # out-of-range index then surfaces as an IndexError downstream.
+        log.debug("clamping nav indices failed: %s", e)
 
     if current_signal._lazy:
         if isinstance(current_signal.data[0], Future):
@@ -159,8 +166,8 @@ def update_from_navigation_selection(
             if old_fut is not None and not old_fut.done():
                 try:
                     old_fut.cancel()
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("cancelling stale shm-write future failed: %s", e)
 
             # 2. Cancel pending surrounding-block prefetch futures — they are
             #    low-priority but still consume worker slots.  The new core-block
@@ -334,8 +341,10 @@ def compute_with_live_buffer(
                 buf = np.ndarray(nav_shape, dtype=np.float32, buffer=shm.buf)
                 buf[:] = result.astype(np.float32)
                 shm.close()
-            except Exception:
-                pass
+            except Exception as e:
+                # Live-buffer write is display-only; _SyncResult still returns the
+                # real computed array, so a failure just skips the live preview.
+                log.debug("synchronous live-buffer write to %s failed: %s", shm_name, e)
 
         class _SyncResult:
             def result(self): return result
@@ -370,8 +379,10 @@ def compute_with_live_buffer(
                 chunk_result = f.result()
                 if on_chunk_done is not None:
                     on_chunk_done(chunk_result, nav_slices)
-            except Exception:
-                pass
+            except Exception as e:
+                # This is the live-preview path only; a genuinely failed chunk
+                # re-raises when the commit path calls full_future.result().
+                log.debug("live chunk callback for %r failed: %s", nav_slices, e)
         return _cb
 
     if on_chunk_done is not None:
@@ -480,8 +491,9 @@ def stream_progressive_to_plot(plot, result_array, client, *, name="vi"):
         try:
             buf = np.ndarray(_shape, dtype=np.float32, buffer=shm.buf)
             buf[nav_slices] = np.asarray(chunk_result, dtype=np.float32)
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("writing progressive chunk %r to %s failed: %s",
+                      nav_slices, shm_name, e)
 
     relay.chunk_ready.connect(_write_chunk)
 
@@ -506,8 +518,8 @@ def stream_progressive_to_plot(plot, result_array, client, *, name="vi"):
                     elif hi > levels[0][1]:
                         levels[0] = (levels[0][0], hi)
                     plot.set_data(arr, levels=levels[0])
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("progressive %s poll paint failed: %s", name, e)
             if future.done():
                 break
             _time.sleep(0.1)
@@ -516,8 +528,8 @@ def stream_progressive_to_plot(plot, result_array, client, *, name="vi"):
             arr = read_live_buffer(nav_shape, shm_name)
             if np.isfinite(arr).any():
                 plot.set_data(arr, levels=levels[0])
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("progressive %s final paint failed: %s", name, e)
 
     t = threading.Thread(target=_poll_loop, daemon=True, name=f"{name}-poll")
     t.start()
@@ -535,21 +547,21 @@ def _stop_progressive_stream(plot) -> None:
         return
     try:
         st["stop"].set()
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("signalling progressive-stream stop failed: %s", e)
     try:
         fut = st.get("future")
         if fut is not None and hasattr(fut, "cancel"):
             fut.cancel()
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("cancelling progressive-stream future failed: %s", e)
     try:
         shm = st.get("shm")
         if shm is not None:
             shm.close()
             shm.unlink()
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("cleaning up progressive-stream shared memory failed: %s", e)
     plot._progressive_stream = None
 
 
