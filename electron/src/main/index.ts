@@ -7,8 +7,9 @@ import { tmpdir } from 'os'
 import { writeFileSync } from 'fs'
 import {
   startSpyDE, sendAction, sendFigureEvent, sendResize,
-  stopSpyDE, resolveSpyDECommand,
+  stopSpyDE,
 } from './runner'
+import { resolvePythonEnv } from './pythonEnv'
 
 let win: BrowserWindow | null = null
 
@@ -46,18 +47,36 @@ function createWindow(): BrowserWindow {
 
 // ── App lifecycle ─────────────────────────────────────────────────────────────
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   // The whole app chrome is dark; force prefers-color-scheme: dark so the
   // anyplotlib figures (which auto-theme off it) render in dark mode to match.
   nativeTheme.themeSource = 'dark'
 
   createWindow()
 
-  // Resolve and start the SpyDE Python backend.
-  // __dirname is electron/out/main → three levels up is the repo root, where
-  // spyde's pyproject.toml lives (so `uv run` resolves the right environment).
+  // Resolve (and on first packaged run, create via `uv sync`) the Python
+  // sidecar env, then start the backend.
+  // __dirname is electron/out/main → three levels up is the repo root (dev),
+  // where spyde's pyproject.toml lives (so `uv run` resolves the right env).
   const projectRoot = join(__dirname, '..', '..', '..')
-  const cmd = resolveSpyDECommand(projectRoot)
+  const { cmd, cwd } = await resolvePythonEnv({
+    isPackaged: app.isPackaged,
+    resourcesPath: process.resourcesPath,
+    projectRoot,
+    userData: app.getPath('userData'),
+    onProgress: (line) => {
+      process.stderr.write(`[uv] ${line}`)
+      // Surface first-run env setup in the UI (the stream/log channel).
+      win?.webContents.send('spyde:stream', line, 'stderr')
+      win?.webContents.send('spyde:message', { type: 'status', text: 'Setting up Python environment…' })
+    },
+  }).catch((err) => {
+    const msg = `Python environment setup failed: ${err?.message ?? err}`
+    console.error(`[spyde] ${msg}`)
+    win?.webContents.send('spyde:message', { type: 'error', text: msg })
+    // Fall back to dev-style launch so a broken bundle is still diagnosable.
+    return { cmd: ['uv', 'run', 'python', '-m', 'spyde'], cwd: projectRoot }
+  })
 
   startSpyDE(cmd, {
     onMessage: (msg) => {
@@ -82,7 +101,7 @@ app.whenReady().then(() => {
       process[kind === 'stderr' ? 'stderr' : 'stdout'].write(`[spyde] ${text}`)
       win?.webContents.send('spyde:stream', text, kind)
     },
-  }, projectRoot)
+  }, cwd)
 
   buildMenu()
 

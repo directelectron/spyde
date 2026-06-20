@@ -1,0 +1,60 @@
+# electron-builder — packages the SpyDE Electron app together with a uv-managed
+# Python sidecar (DISTRIBUTION_PLAN.md "Option A"). See electron/PACKAGING.md.
+#
+# The Electron app is the shell; the Python backend (spyde) runs as a sidecar
+# spawned over stdio. The installer stays small: it ships `uv` + the project
+# source + uv.lock as extraResources, and the venv (with the GPU-correct torch
+# wheel) is built on first run via `uv sync` into the user's data dir.
+appId: com.directelectron.spyde
+productName: SpyDE
+copyright: © Direct Electron
+
+directories:
+  output: dist
+  buildResources: build
+
+# The compiled app (electron-vite output) + package manifest. node_modules are
+# pulled in automatically by electron-builder for production deps.
+files:
+  - out/**/*
+  - package.json
+  - "!**/*.map"
+
+# The Python sidecar payload — staged by scripts/bundle-python.mjs BEFORE the
+# build (npm run dist does this). Lands at <app resources>/python at runtime,
+# read by src/main/pythonEnv.ts.
+extraResources:
+  - from: resources/python
+    to: python
+    filter: ["**/*"]
+
+mac:
+  category: public.app-category.education
+  target: [dmg]
+  # Unsigned for now — Gatekeeper will warn; see PACKAGING.md for the
+  # sign+notarize follow-up (needs an Apple Developer ID).
+  identity: null
+
+win:
+  target: [nsis]
+
+# Per-user NSIS installer: no admin, Start-Menu + desktop shortcuts, uninstaller,
+# user-chosen install dir.
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+
+linux:
+  target: [AppImage]
+  category: Science
+
+# Where electron-updater looks for new releases. NOTE: this only configures the
+# *update check* — nothing here publishes. Cutting a release is a deliberate,
+# separate step (and not wired into CI yet).
+publish:
+  provider: github
+  owner: directelectron
+  repo: spyde

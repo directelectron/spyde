@@ -10,82 +10,53 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  # The backend is Qt-free now (Electron + anyplotlib); no QT_QPA / X11 needed.
   MPLBACKEND: agg
-  QT_QPA_PLATFORM: offscreen
-  QTWEBENGINE_DISABLE_SANDBOX: "1"
-  QTWEBENGINE_CHROMIUM_FLAGS: "--no-sandbox --disable-gpu --disable-software-rasterizer"
-  PYTEST_ADDOPTS: "--timeout=500 -vv -s --durations=10"
-  PIP_DISABLE_PIP_VERSION_CHECK: "1"
-  PIP_PROGRESS_BAR: "off"
+  PYTEST_ADDOPTS: "--timeout=600 -vv --durations=10"
 
 jobs:
-  build-with-pip:
-    name: ${{ matrix.os }}-py${{ matrix.python-version }}${{ matrix.LABEL }}
+  test:
+    name: ${{ matrix.os }}-py${{ matrix.python-version }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        python-version: ["3.10", "3.11", "3.12", "3.13"]  # avoid 3.13 if hangs persist
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      # uv everywhere (project rule). Resolves the git-pinned hyperspy /
+      # rosettasciio / anyplotlib forks + the CPU torch wheel from the lock.
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
         with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-          cache-dependency-path: |
-            pyproject.toml
-            setup.cfg
-            setup.py
-            requirements*.txt
+          enable-cache: true
 
-      - name: Install dependencies and package
-        shell: bash
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install (locked) + tests extra
+        run: uv sync --frozen --extra tests --python ${{ matrix.python-version }}
+
+      - name: Versions
         run: |
-          python -m pip install -U pip wheel setuptools
-          pip install -U --prefer-binary -e '.[tests]'
-          pip install -U pytest-cov pytest-timeout
+          uv run python -V
+          uv pip list
 
+      # The single canonical Qt-free suite (testpaths=spyde/tests/migrated).
+      # GPU tests skip themselves without CUDA/MPS. No display server required.
+      - name: Run tests
+        run: uv run pytest spyde/tests/migrated --cov=spyde --cov-report=xml
 
-      - name: Display Python, pip and package versions
-        run: |
-          python -V
-          pip -V
-          pip list
-
-      # yaml
-      - name: Install Qt/X11 runtime (Linux)
-        if: matrix.os == 'ubuntu-latest'
-        shell: bash
-        run: |
-          set -euxo pipefail
-          sudo apt-get update
-          # Handle time64 rename on Ubuntu 24.04+
-          if apt-cache show libasound2t64 >/dev/null 2>&1; then
-            ALSA_PKG=libasound2t64
-          else
-            ALSA_PKG=libasound2
-          fi
-          sudo apt-get install -y --no-install-recommends \
-            libegl1 libgl1 libglib2.0-0 libxkbcommon-x11-0 libxrender1 libxi6 \
-            libnss3 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
-            libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xfixes0 \
-            libxcb-xinerama0 xvfb "$ALSA_PKG"
-
-      - name: Run tests (Linux)
-        if: matrix.os == 'ubuntu-latest'
-        run: xvfb-run -a --server-args="-screen 0 1920x1080x24" pytest --cov=spyde --cov-report=xml
-
-      - name: Run tests (non-Linux)
-        if: matrix.os != 'ubuntu-latest'
-        run: pytest --cov=spyde --cov-report=xml
-
-      - name: Upload coverage reports to Codecov
-        if: ${{ github.repository_owner == 'spyde' }}
+      - name: Upload coverage to Codecov
+        if: ${{ github.repository_owner == 'directelectron' }}
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
+
+# NOTE: packaging the desktop app (electron-builder + the uv Python sidecar) is a
+# separate, tag-triggered release workflow — see electron/PACKAGING.md. It is not
+# wired here because it needs per-OS signing secrets / vendored uv binaries.

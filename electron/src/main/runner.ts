@@ -6,7 +6,6 @@
  */
 import { spawn, ChildProcess } from 'child_process'
 import { createInterface } from 'readline'
-import { join } from 'path'
 
 export interface SpyDEHandlers {
   onMessage: (msg: Record<string, unknown>) => void
@@ -76,20 +75,4 @@ export function sendResize(figId: string, width: number, height: number): void {
 export function stopSpyDE(): void {
   proc?.kill()
   proc = null
-}
-
-/** Resolve the Python command to use for launching SpyDE. */
-export function resolveSpyDECommand(projectRoot: string): string[] {
-  // In development: use uv run from the repo root
-  // In production bundle: use the bundled python
-  const bundledPython = join(projectRoot, 'python', '.venv', 'bin', 'python')
-  try {
-    const { existsSync } = require('fs')
-    if (existsSync(bundledPython)) {
-      return [bundledPython, '-m', 'spyde']
-    }
-  } catch { /* */ }
-
-  // Fall back to uv run (development)
-  return ['uv', 'run', 'python', '-m', 'spyde']
 }
