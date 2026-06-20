@@ -48,6 +48,11 @@ async def _main() -> None:
     # Keep stdout exclusively for the PLOTAPP protocol; stray prints → stderr.
     redirect_stray_stdout()
 
+    # Stream logging records to the Electron app-log panel (level switchable at
+    # runtime from the frontend). Installed after stdout is the protocol channel.
+    from spyde.backend.log_stream import install as _install_log_stream
+    _install_log_stream(level="INFO")
+
     cpu_count = os.cpu_count() or 4
     if cpu_count < 4:
         workers, threads = 1, 1

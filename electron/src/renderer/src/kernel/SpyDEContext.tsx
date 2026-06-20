@@ -71,6 +71,9 @@ export interface Histogram {
   vmax: number
 }
 
+/** One application-log record streamed from the Python backend. */
+export interface LogEntry { level: string; name: string; msg: string; time: number }
+
 export interface SelectorInfo { windowId: number; mode: 'crosshair' | 'integrate'; title: string }
 export interface SubItem { name: string; color: string; vtype?: string; calculation?: string }
 export interface TreeNode { name: string; signal_id: number; children: TreeNode[] }
@@ -103,6 +106,8 @@ interface State {
   dashboardUrl: string | null
   activeWindowId: number | null
   streamLines: Array<{ text: string; kind: 'stdout' | 'stderr' }>
+  logEntries: LogEntry[]          // application-log records (the log panel)
+  logLevel: string                // current backend verbosity (DEBUG…CRITICAL)
 }
 
 type Action =
@@ -124,6 +129,9 @@ type Action =
   | { type: 'SELECTOR_INFO'; info: SelectorInfo }
   | { type: 'SIGNAL_TREE'; windowId: number; tree: TreeNode; activeSignalId?: number }
   | { type: 'STREAM'; text: string; kind: 'stdout' | 'stderr' }
+  | { type: 'LOG'; entry: LogEntry }
+  | { type: 'LOG_BACKFILL'; entries: LogEntry[] }
+  | { type: 'LOG_LEVEL'; level: string }
 
 function spydeReducer(state: State, action: Action): State {
   switch (action.type) {
@@ -334,6 +342,15 @@ function spydeReducer(state: State, action: Action): State {
         streamLines: [...state.streamLines.slice(-500), { text: action.text, kind: action.kind }],
       }
 
+    case 'LOG':
+      return { ...state, logEntries: [...state.logEntries.slice(-999), action.entry] }
+
+    case 'LOG_BACKFILL':
+      return { ...state, logEntries: action.entries.slice(-1000) }
+
+    case 'LOG_LEVEL':
+      return { ...state, logLevel: action.level }
+
     default:
       return state
   }
@@ -375,6 +392,8 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     dashboardUrl: null,
     activeWindowId: null,
     streamLines: [],
+    logEntries: [],
+    logLevel: 'INFO',
   })
 
   const iframeRefs = useRef<Map<string, HTMLIFrameElement>>(new Map())
@@ -574,6 +593,21 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
 
         case 'dask_ready':
           dispatch({ type: 'READY', dashboardUrl: msg.dashboard as string | undefined })
+          break
+
+        case 'log':
+          dispatch({ type: 'LOG', entry: {
+            level: String(msg.level), name: String(msg.name),
+            msg: String(msg.msg), time: Number(msg.time),
+          } })
+          break
+
+        case 'log_backfill':
+          dispatch({ type: 'LOG_BACKFILL', entries: (msg.entries as LogEntry[]) ?? [] })
+          break
+
+        case 'log_level':
+          dispatch({ type: 'LOG_LEVEL', level: String(msg.level) })
           break
 
         // Wizard-scoped events (live fit readout + library-ready). Re-broadcast

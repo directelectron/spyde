@@ -1,8 +1,15 @@
 import React from 'react'
 import { useSpyDE } from '../kernel/SpyDEContext'
 
-export function StatusBar() {
-  const { state, sendAction } = useSpyDE()
+export function StatusBar({ logOpen, onToggleLog }: {
+  logOpen?: boolean
+  onToggleLog?: () => void
+}) {
+  const { state } = useSpyDE()
+  // Badge unseen warnings/errors so problems are noticeable while the log is hidden.
+  const problems = state.logEntries.filter(
+    (e) => e.level === 'WARNING' || e.level === 'ERROR' || e.level === 'CRITICAL',
+  ).length
 
   return (
     <div style={styles.bar}>
@@ -17,6 +24,15 @@ export function StatusBar() {
           Dask dashboard ↗
         </button>
       )}
+      <button
+        data-testid="toggle-log"
+        style={{ ...styles.btn, ...(logOpen ? styles.btnActive : null) }}
+        onClick={onToggleLog}
+        title={logOpen ? 'Hide application log' : 'Show application log'}
+      >
+        Log
+        {problems > 0 && <span style={styles.badge} data-testid="log-badge">{problems}</span>}
+      </button>
       <button
         style={styles.btn}
         onClick={() => window.electron.openFile()}
@@ -43,8 +59,15 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: 12, cursor: 'pointer', padding: 0,
   },
   btn: {
+    display: 'inline-flex', alignItems: 'center', gap: 6,
     background: '#313244', border: 'none', color: '#cdd6f4',
     fontSize: 12, cursor: 'pointer', padding: '2px 10px',
     borderRadius: 4,
+  },
+  btnActive: { background: '#45475a', color: '#89b4fa' },
+  badge: {
+    fontSize: 10, lineHeight: '14px', minWidth: 14, textAlign: 'center',
+    color: '#11111b', background: '#f9e2af', borderRadius: 8, padding: '0 4px',
+    fontWeight: 700,
   },
 }

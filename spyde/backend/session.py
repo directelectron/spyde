@@ -84,6 +84,7 @@ _STAGED_HANDLERS = {
     "czb_manual_start":    "spyde.actions.center_zero_beam.czb_manual_start",
     "czb_manual":          "spyde.actions.center_zero_beam.czb_manual",
     "czb_manual_stop":     "spyde.actions.center_zero_beam.czb_manual_stop",
+    "set_log_level":       "spyde.backend.log_stream.set_log_level",
 }
 
 

@@ -3,9 +3,11 @@ import { SpyDEProvider } from './kernel/SpyDEContext'
 import { MDIArea } from './components/MDIArea'
 import { PlotControlDock } from './components/PlotControlDock'
 import { StatusBar } from './components/StatusBar'
+import { LogPanel } from './components/LogPanel'
 
 export function App() {
   const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [logOpen, setLogOpen] = useState(false)
   return (
     <SpyDEProvider>
       <div style={styles.root}>
@@ -14,7 +16,8 @@ export function App() {
           <MDIArea />
           {sidebarOpen && <PlotControlDock />}
         </div>
-        <StatusBar />
+        <LogPanel open={logOpen} onClose={() => setLogOpen(false)} />
+        <StatusBar logOpen={logOpen} onToggleLog={() => setLogOpen(v => !v)} />
       </div>
     </SpyDEProvider>
   )
