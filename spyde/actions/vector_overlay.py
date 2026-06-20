@@ -368,12 +368,14 @@ class FindVectorsPreviewOverlay(_DPOverlay):
             self.min_distance = max(1, int(p["min_distance"]))
         if "subpixel" in p and p["subpixel"] is not None:
             self.subpixel = bool(p["subpixel"])
-        # Redraw at the current crosshair via the engine (off the caller thread).
+        # Redraw at the current crosshair SYNCHRONOUSLY: a slider tweak is a
+        # deliberate, one-off action that wants instant feedback, and it isn't
+        # the perf-critical path (that's the navigator drag, which stays async
+        # via the engine). Going through the single-flight engine worker here
+        # would queue the redraw behind in-flight navigation computes on a busy
+        # cluster, so a param change can appear not to update.
         iy, ix = self._last_iyix
-        if self._engine is not None:
-            self._engine.request(iy, ix)
-        else:
-            self._push(self._offsets_for(iy, ix))
+        self._push(self._offsets_for(iy, ix))
 
     # ── geometry ──────────────────────────────────────────────────────────────
     def _blurred_frame(self, iy, ix) -> np.ndarray:
