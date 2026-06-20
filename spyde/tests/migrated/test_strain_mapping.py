@@ -216,11 +216,25 @@ class TestStrainAction:
         fig, ax = apl.subplots()
         p = ax.imshow(np.zeros((4, 4), "f4"))
         ctrl = StrainController(_V(), p, None, ref_yx=(0, 0))
+        ctrl.attach()
         ctrl.set_cif_reference(phase)                   # absolute CIF reference
-        assert ctrl._ref_vectors is not None and len(ctrl._ref_vectors) >= 2
+        assert ctrl.cif_mode is True
         assert ctrl.field is not None and ctrl.field.nav_shape == (4, 4)
         ctrl.set_reference(2, 2)                         # crosshair → region mode
-        assert ctrl._ref_vectors is None
+        assert ctrl.cif_mode is False
+
+    def test_controller_ring_selection(self):
+        import anyplotlib as apl
+        from spyde.actions.strain_action import StrainController
+        # reference = G_REF (two rings: |g|=1 and |g|=√2).
+        vecs = _MockVecsCM((4, 4), lambda iy, ix: np.eye(2))
+        fig, ax = apl.subplots()
+        p = ax.imshow(np.zeros((4, 4), "f4"))
+        ctrl = StrainController(vecs, p, None, ref_yx=(0, 0))
+        ctrl.attach()
+        assert len(ctrl.rings) == 2 and ctrl.selected_rings == {0, 1}
+        ctrl.set_rings([0])                             # keep only the inner ring
+        assert ctrl.selected_rings == {0} and ctrl.field is not None
 
     def test_strain_run_without_vectors_errors(self):
         import spyde.backend.ipc as ipc

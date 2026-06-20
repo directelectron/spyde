@@ -30,19 +30,25 @@ class StrainController:
     """Owns the live strain window: recomputes the field when the reference
     crosshair moves and swaps the shown component on toggle."""
 
-    def __init__(self, vecs, plot2d, glyph_group, *, component="exx", ref_yx=(0, 0)):
+    def __init__(self, vecs, plot2d, glyph_group, *, window_id=None,
+                 component="exx", ref_yx=(0, 0)):
         self.vecs = vecs
         self.p = plot2d
         self.glyph = glyph_group
+        self.window_id = window_id
         self.component = component
         self.ref_yx = (int(ref_yx[0]), int(ref_yx[1]))
         self.field = None
         self._crosshair = None
-        self._ref_vectors = None        # set → CIF absolute reference; None → region
+        self.cif_mode = False
+        self._g_ref_full = None          # current full reference vector set
+        self.rings = []                  # ring |g| (ascending)
+        self._ring_idx = None            # per-ref-vector ring index
+        self.selected_rings = set()      # enabled ring indices (use all by default)
 
     def attach(self):
-        from spyde.actions.strain_mapping import compute_strain_field
-        self.field = compute_strain_field(self.vecs, self.ref_yx)
+        self._set_full_reference(self.vecs.kxy_at(*self.ref_yx))
+        self._recompute()
         try:
             ry, rx = self.ref_yx
             self._crosshair = self.p.add_crosshair_widget(cx=float(rx), cy=float(ry),
@@ -52,6 +58,40 @@ class StrainController:
             import logging
             logging.getLogger(__name__).debug("strain crosshair attach failed: %s", e)
         return self
+
+    # ── reference + ring selection (both modes flow through ref_vectors) ──────
+    def _set_full_reference(self, g_ref) -> None:
+        from spyde.actions.strain_mapping import group_rings
+        self._g_ref_full = np.asarray(g_ref, dtype=float).reshape(-1, 2)
+        self.rings, self._ring_idx = group_rings(self._g_ref_full)
+        self.selected_rings = set(range(len(self.rings)))      # use all
+        self._emit_rings()
+
+    def _selected_reference(self):
+        if self._ring_idx is None or len(self.selected_rings) >= len(self.rings):
+            return self._g_ref_full
+        keep = np.array([i in self.selected_rings for i in self._ring_idx], dtype=bool)
+        return self._g_ref_full[keep]
+
+    def _recompute(self) -> None:
+        from spyde.actions.strain_mapping import compute_strain_field
+        from spyde.actions.strain_display import update_strain_view
+        ref = self._selected_reference()
+        if ref is None or len(ref) < 2:
+            return
+        self.field = compute_strain_field(self.vecs, ref_vectors=ref)
+        update_strain_view(self.p, self.field, self.component, self.glyph)
+
+    def _emit_rings(self) -> None:
+        if self.window_id is None:
+            return
+        try:
+            from spyde.backend.ipc import emit
+            emit({"type": "strain_rings", "window_id": int(self.window_id),
+                  "rings": [round(float(g), 4) for g in self.rings],
+                  "selected": sorted(self.selected_rings), "cif": bool(self.cif_mode)})
+        except Exception:
+            pass
 
     def _on_pick(self, event=None):
         try:
@@ -65,27 +105,27 @@ class StrainController:
 
     def set_reference(self, ry: int, rx: int) -> None:
         """Region mode: the crosshair picks an unstrained pixel (relative strain)."""
-        from spyde.actions.strain_mapping import compute_strain_field
-        from spyde.actions.strain_display import update_strain_view
         self.ref_yx = (int(ry), int(rx))
-        self._ref_vectors = None                    # crosshair → back to region mode
-        self.field = compute_strain_field(self.vecs, self.ref_yx)
-        update_strain_view(self.p, self.field, self.component, self.glyph)
+        self.cif_mode = False
+        self._set_full_reference(self.vecs.kxy_at(*self.ref_yx))
+        self._recompute()
 
     def set_cif_reference(self, phase) -> None:
         """CIF mode: snap the reference pixel's vectors to the phase's ideal |g|
         families → absolute strain (no unstrained region needed)."""
-        from spyde.actions.strain_mapping import (
-            cif_g_families, snap_reference_to_cif, compute_strain_field)
-        from spyde.actions.strain_display import update_strain_view
-        fam = cif_g_families(phase)
-        sample = self.vecs.kxy_at(*self.ref_yx)
-        ref_vectors = snap_reference_to_cif(sample, fam)
-        if len(ref_vectors) < 2:
+        from spyde.actions.strain_mapping import cif_g_families, snap_reference_to_cif
+        snapped = snap_reference_to_cif(self.vecs.kxy_at(*self.ref_yx), cif_g_families(phase))
+        if len(snapped) < 2:
             return
-        self._ref_vectors = ref_vectors
-        self.field = compute_strain_field(self.vecs, ref_vectors=ref_vectors)
-        update_strain_view(self.p, self.field, self.component, self.glyph)
+        self.cif_mode = True
+        self._set_full_reference(snapped)
+        self._recompute()
+
+    def set_rings(self, selected) -> None:
+        """Peak selection: keep only the chosen reflection rings in the fit."""
+        sel = set(int(i) for i in selected)
+        self.selected_rings = sel or set(range(len(self.rings)))
+        self._recompute()
 
     def set_component(self, component: str) -> None:
         from spyde.actions.strain_display import update_strain_view
@@ -126,7 +166,7 @@ def strain_run(session, plot, payload) -> None:
           "html": html, "title": "Strain (εxx)", "is_navigator": False,
           "strain_components": list(_COMPONENTS)})
 
-    ctrl = StrainController(vecs, p, glyph, component="exx", ref_yx=ref_yx)
+    ctrl = StrainController(vecs, p, glyph, window_id=wid, component="exx", ref_yx=ref_yx)
     ctrl.attach()
     tree._strain_controller = ctrl
 
@@ -158,3 +198,12 @@ def strain_set_cif(session, plot, payload) -> None:
     except Exception as e:
         from spyde.backend.ipc import emit_error
         emit_error(f"Strain CIF reference failed: {e}")
+
+
+def strain_set_rings(session, plot, payload) -> None:
+    """Peak selection: ``payload['selected']`` = the reflection-ring indices to
+    keep in the fit (empty/missing → use all)."""
+    tree = getattr(plot, "signal_tree", None)
+    ctrl = getattr(tree, "_strain_controller", None) if tree is not None else None
+    if ctrl is not None:
+        ctrl.set_rings(payload.get("selected", []))

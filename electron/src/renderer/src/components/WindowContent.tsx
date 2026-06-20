@@ -7,6 +7,7 @@ interface Props {
   replayState: (figId: string) => void
   sendAction: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
   ipfKey?: string   // IPF colour-key triangle (PNG data URL) — legend for IPF windows
+  strainRings?: { rings: number[]; selected: number[] }   // strain reflection-ring selection
 }
 
 // The reserved view_label of the backend-built side-by-side comparison figure.
@@ -31,7 +32,7 @@ const STRAIN_LABEL: Record<string, string> = { exx: 'εxx', eyy: 'εyy', exy: '�
 // All iframes stay MOUNTED; only the active one is shown (instant switch). A
 // ResizeObserver keeps the visible figure sized to its box (the single sizing
 // authority — handles window resize and the view-bar height).
-export function WindowContent({ win, iframeRefs, replayState, sendAction, ipfKey }: Props) {
+export function WindowContent({ win, iframeRefs, replayState, sendAction, ipfKey, strainRings }: Props) {
   const id = String(win.windowId)
   const figs = win.figures
 
@@ -178,6 +179,27 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction, ipfKey
                   const p = await window.electron.pickFile({ name: 'Crystal (.cif)', extensions: ['cif'] })
                   if (p) sendAction('strain_set_cif', { cif_path: p }, win.windowId)
                 }}>CIF…</button>
+              {/* reflection-ring selection: click a ring to include/exclude it from the fit. */}
+              {strainRings && strainRings.rings.length > 1 && (
+                <>
+                  <span style={{ width: 6 }} />
+                  {strainRings.rings.map((g, i) => {
+                    const on = strainRings.selected.includes(i)
+                    return (
+                      <button key={i} data-testid={`strain-ring-${i}-${id}`}
+                        title={`Reflection ring |g|=${g} Å⁻¹ — click to ${on ? 'exclude' : 'include'}`}
+                        onClick={() => {
+                          const next = on ? strainRings.selected.filter(s => s !== i)
+                                          : [...strainRings.selected, i]
+                          sendAction('strain_set_rings',
+                            { selected: next.length ? next : strainRings.rings.map((_, k) => k) },
+                            win.windowId)
+                        }}
+                        style={on ? styles.btnActive : styles.btn}>{`R${i + 1}`}</button>
+                    )
+                  })}
+                </>
+              )}
             </div>
           )}
         </div>

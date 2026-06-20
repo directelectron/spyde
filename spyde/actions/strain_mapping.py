@@ -148,6 +148,26 @@ def snap_reference_to_cif(sample_g, families, *, tol_frac: float = 0.2) -> np.nd
     return np.asarray(out, dtype=float).reshape(-1, 2)
 
 
+def group_rings(g_vectors, *, rel_tol: float = 0.06):
+    """Cluster a vector set into reflection rings by |g|. Returns
+    ``(ring_g ascending, ring_index per vector)`` — for peak/ring selection
+    (use all rings, or toggle a ring out of the fit)."""
+    g = np.asarray(g_vectors, dtype=float).reshape(-1, 2)
+    mag = np.linalg.norm(g, axis=1)
+    rings: list[float] = []
+    idx = np.full(len(g), -1, dtype=int)
+    for i in np.argsort(mag):
+        m = float(mag[i])
+        if m <= 0:
+            continue
+        hit = next((r for r, rg in enumerate(rings) if abs(m - rg) / rg <= rel_tol), None)
+        if hit is None:
+            rings.append(m)
+            hit = len(rings) - 1
+        idx[i] = hit
+    return np.asarray(rings, dtype=float), idx
+
+
 def compute_strain_field(vecs, ref_yx=None, *, ref_vectors=None,
                          tol: float | None = None) -> StrainField:
     """Strain field of ``vecs`` (a ``SpyDEDiffractionVectors``) measured against a

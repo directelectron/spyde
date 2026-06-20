@@ -71,6 +71,7 @@ _STAGED_HANDLERS = {
     "strain_run":          "spyde.actions.strain_action.strain_run",
     "strain_set_component": "spyde.actions.strain_action.strain_set_component",
     "strain_set_cif":      "spyde.actions.strain_action.strain_set_cif",
+    "strain_set_rings":    "spyde.actions.strain_action.strain_set_rings",
     "ipf_set_direction":   "spyde.actions.ipf_view.ipf_set_direction",
     "tile_views":          "spyde.actions.views.tile_views",
     "set_composition":     "spyde.actions.composition.set_composition",
