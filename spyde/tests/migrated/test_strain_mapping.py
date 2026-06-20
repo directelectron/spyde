@@ -85,3 +85,30 @@ class TestStrainField:
         e1, e2, theta = principal_strain(np.array([0.0]), np.array([0.0]), np.array([0.01]))
         assert abs(e1[0] - 0.01) < 1e-9 and abs(e2[0] + 0.01) < 1e-9
         assert abs(abs(theta[0]) - np.deg2rad(45)) < 1e-6
+
+
+class TestStrainDisplay:
+    def _field(self, ny=12, nx=12):
+        rng = np.random.RandomState(0)
+        return StrainField(
+            (0.01 * rng.rand(ny, nx)).astype("f4"),
+            (-0.01 * rng.rand(ny, nx)).astype("f4"),
+            (0.005 * rng.rand(ny, nx)).astype("f4"),
+            (0.01 * rng.rand(ny, nx)).astype("f4"),
+            np.ones((ny, nx), "f4"))
+
+    def test_build_strain_figure_map_glyphs_and_ref(self):
+        from spyde.actions.strain_display import build_strain_figure
+        fig, fid, html, p = build_strain_figure(
+            self._field(), component="exx", ref_yx=(1, 1), glyph_step=3)
+        assert isinstance(fid, str) and fid and isinstance(html, str) and len(html) > 500
+        types = {m["type"] for m in p.list_markers()}
+        assert "ellipses" in types          # principal-strain glyphs
+        assert "lines" in types             # the reference crosshair
+
+    def test_each_component_builds(self):
+        from spyde.actions.strain_display import build_strain_figure
+        for comp in ("exx", "eyy", "exy", "omega"):
+            fig, fid, html, p = build_strain_figure(
+                self._field(), component=comp, glyphs=False)
+            assert fid and "ellipses" not in {m["type"] for m in p.list_markers()}
