@@ -440,7 +440,7 @@ class SpyDEDiffractionVectors:
         r_outer : outer radius
         r_inner : inner radius (0 = filled disk)
         t       : time step index (5D only); None = all frames
-        intensity_weighted : sum NXCORR intensities (True) or count (False)
+        intensity_weighted : sum raw disk intensities (True) or count (False)
         """
         if len(self.flat_buffer) == 0:
             return np.zeros(self.nav_shape, dtype=np.float32)
