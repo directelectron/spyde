@@ -5,6 +5,7 @@ The peak should land on the disk centre (sub-pixel), and the stored intensity
 should track the raw disk intensity — not the correlation score.
 """
 import numpy as np
+import pytest
 
 from spyde.actions.find_vectors import _find_vectors_single_frame
 
@@ -81,3 +82,51 @@ class TestSubpixelAccuracy:
         order_found = np.argsort(ints)
         assert list(order_true) == list(order_found), (
             f"intensity not monotonic in disk amplitude: amps={amps} ints={ints}")
+
+
+def _gauss(cy, cx, size=64, s=2.2):
+    """A SHARP, unique-peak Gaussian blob (unlike a flat-topped disk, whose
+    correlation surface plateaus and makes argmax tie-break ambiguously)."""
+    f = np.zeros((size, size), np.float32)
+    yy, xx = np.mgrid[0:size, 0:size]
+    f += np.exp(-(((yy - cy) ** 2 + (xx - cx) ** 2) / (2 * s * s))).astype(np.float32)
+    return f
+
+
+class TestSubpixelUnbiased:
+    """On a clean (non-plateau) peak the sub-pixel estimate must be UNBIASED to
+    a fraction of a pixel — tight enough to catch a half-pixel coordinate
+    convention slip, which the 1.25px logistic-disk tolerance above would hide.
+    (A real investigation: the apparent 'disks slightly off' turned out to be a
+    half-pixel imshow EXTENT in a diagnostic plot, not the compute — anyplotlib
+    renders image pixel i and a data marker at i both at the pixel centre.)"""
+
+    def test_subpixel_unbiased_on_gaussian(self):
+        ey, ex = [], []
+        for fy, fx in [(0.0, 0.0), (0.3, -0.3), (0.5, 0.5), (-0.4, 0.2), (0.7, -0.6)]:
+            cy, cx = 32 + fy, 32 + fx
+            _c, _rc, p = _find_vectors_single_frame(
+                _gauss(cy, cx), kernel_radius=5, threshold=0.3,
+                min_distance=8, subpixel=True)
+            j = int(np.argmax(p[:, 2]))
+            ey.append(float(p[j, 0] - cy))
+            ex.append(float(p[j, 1] - cx))
+        ey, ex = np.array(ey), np.array(ex)
+        assert np.abs(ey).max() < 0.15 and np.abs(ex).max() < 0.15, (ey, ex)
+        # no SYSTEMATIC bias — a half-pixel offset would show as a ~0.5 mean
+        assert abs(ey.mean()) < 0.05 and abs(ex.mean()) < 0.05, (ey.mean(), ex.mean())
+
+    def test_integer_peak_matches_skimage(self):
+        """The NXCORR peak pixel must equal skimage.match_template (the reference
+        the implementation claims equivalence to) — i.e. correctly centred."""
+        match_template = pytest.importorskip("skimage.feature").match_template
+        from spyde.actions.find_vectors import _make_disk
+        templ = _make_disk(5)
+        for cy, cx in [(30, 30), (25, 40), (33, 27)]:
+            f = _gauss(cy, cx)
+            sk = match_template(f, templ, pad_input=True)
+            sy, sx = np.unravel_index(int(np.argmax(sk)), sk.shape)
+            _c, rc, _p = _find_vectors_single_frame(
+                f, kernel_radius=5, threshold=0.3, min_distance=8, subpixel=False)
+            iy, ix = np.unravel_index(int(np.argmax(rc)), rc.shape)
+            assert (iy, ix) == (sy, sx), f"code {(iy, ix)} != skimage {(sy, sx)}"

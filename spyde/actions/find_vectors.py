@@ -594,7 +594,13 @@ def _find_vectors_single_frame(
 
     # --- Step 1: cross-correlation numerator via FFT ---
     # xcorr[y,x] = sum_u T(u) * I(y+u)   (unnormalised, in raw intensity units)
-    xcorr = irfft2(rfft2(buf) * _disk_fft.conj())[:H, :W].astype(np.float32)
+    # NB: pass s=(pH, pW) explicitly. Without it irfft2 infers the last-axis
+    # length as 2*(n-1), which is WRONG when pW is odd (next_fast_len can return
+    # an odd value, e.g. 112+2*5 -> 125 for sped_ag) — it reconstructs width
+    # pW-1 and the correlation is computed with the wrong period, shifting every
+    # peak in X by a fraction of a pixel. (Even widths were unaffected, which is
+    # why this only showed on real detector sizes.)
+    xcorr = irfft2(rfft2(buf) * _disk_fft.conj(), s=(pH, pW))[:H, :W].astype(np.float32)
 
     # --- Step 2: window statistics via integral images ---
     # The statistics window uses kr_win = kr + kernel_window_pad so it samples
