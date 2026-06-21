@@ -36,7 +36,8 @@ interface VomFit {
 // (a ~1 min rebuild) just because the React caret was torn down and remounted.
 interface VomSaved {
   tab: Tab; cif: string; voltage: number; resolution: number; minInt: number
-  strainCap: number; tolerance: number; smooth: boolean; libReady: boolean
+  strainCap: number; tolerance: number; gamma: number; kPow: number
+  smooth: boolean; libReady: boolean
 }
 const _vomStore = new Map<number, VomSaved>()
 
@@ -49,6 +50,8 @@ export function VectorOrientationWizard({ openUp, windowId, sendAction, onClose 
   const [minInt, setMinInt] = React.useState(saved?.minInt ?? 0.0001)
   const [strainCap, setStrainCap] = React.useState(saved?.strainCap ?? 5.0)   // %
   const [tolerance, setTolerance] = React.useState(saved?.tolerance ?? 4.0)   // % (sink bandwidth)
+  const [gamma, setGamma] = React.useState(saved?.gamma ?? 50)                // % → 0..1 intensity compression
+  const [kPow, setKPow] = React.useState(saved?.kPow ?? 0)                    // high-k lever-arm exponent
   const [smooth, setSmooth] = React.useState(saved?.smooth ?? true)
   const [libReady, setLibReady] = React.useState(saved?.libReady ?? false)
   const [fit, setFit] = React.useState<VomFit | null>(null)
@@ -58,8 +61,8 @@ export function VectorOrientationWizard({ openUp, windowId, sendAction, onClose 
 
   // Persist the state for this window on every change so reopening restores it.
   React.useEffect(() => {
-    _vomStore.set(windowId, { tab, cif, voltage, resolution, minInt, strainCap, tolerance, smooth, libReady })
-  }, [windowId, tab, cif, voltage, resolution, minInt, strainCap, tolerance, smooth, libReady])
+    _vomStore.set(windowId, { tab, cif, voltage, resolution, minInt, strainCap, tolerance, gamma, kPow, smooth, libReady })
+  }, [windowId, tab, cif, voltage, resolution, minInt, strainCap, tolerance, gamma, kPow, smooth, libReady])
 
   const refineTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null)
   const { recents, remember } = useCifRecents()
@@ -93,17 +96,21 @@ export function VectorOrientationWizard({ openUp, windowId, sendAction, onClose 
     setTab('Refine')
   }
 
-  // Debounced live refine — strain cap & tolerance are sent as fractions.
-  const refine = (next: Partial<{ strainCap: number; tolerance: number }>) => {
+  // Debounced live refine — strain cap & tolerance are sent as fractions;
+  // gamma (intensity compression) as a 0..1 fraction; k_power as-is.
+  const refine = (next: Partial<{ strainCap: number; tolerance: number; gamma: number; kPow: number }>) => {
     const cap = next.strainCap ?? strainCap, tol = next.tolerance ?? tolerance
+    const g = next.gamma ?? gamma, k = next.kPow ?? kPow
     if (refineTimer.current) clearTimeout(refineTimer.current)
     refineTimer.current = setTimeout(() => {
-      sendAction('vom_refine', { strain_cap: cap / 100, sink_bw: tol / 100 }, windowId)
+      sendAction('vom_refine',
+        { strain_cap: cap / 100, sink_bw: tol / 100, gamma: g / 100, k_power: k }, windowId)
     }, 120)
   }
   const compute = () => {
     setStatus('Computing orientation + strain maps…')
-    sendAction('vom_run', { strain_cap: strainCap / 100, sink_bw: tolerance / 100, smooth }, windowId)
+    sendAction('vom_run', { strain_cap: strainCap / 100, sink_bw: tolerance / 100,
+      gamma: gamma / 100, k_power: kPow, smooth }, windowId)
   }
 
   const pct = (v?: number) => (v === undefined ? '—' : `${(v * 100).toFixed(2)}%`)
@@ -149,6 +156,17 @@ export function VectorOrientationWizard({ openUp, windowId, sendAction, onClose 
             <Slider testid="vom-tolerance" value={tolerance} min={0.5} max={8} step={0.1}
               onChange={(n) => { setTolerance(n); refine({ tolerance: n }) }} />
           </Field>
+          <Field label="Intensity γ">
+            <Slider testid="vom-gamma" value={gamma} min={0} max={100} step={1}
+              onChange={(n) => { setGamma(n); refine({ gamma: n }) }} />
+          </Field>
+          <Field label="High-k weight">
+            <Slider testid="vom-kpower" value={kPow} min={0} max={2} step={0.1}
+              onChange={(n) => { setKPow(n); refine({ kPow: n }) }} />
+          </Field>
+          <div style={S.hint}>γ compresses peak intensity (low γ = let dim high-k
+            reflections drive the orientation); High-k weight adds an explicit
+            |g| lever-arm. Defaults γ=0.5, high-k=0.</div>
           <div data-testid="vom-strain-readout" style={S.hint}>
             {fit && fit.ok
               ? `εxx=${pct(fit.exx)}  εyy=${pct(fit.eyy)}  εxy=${pct(fit.exy)}  ·  resid=${fit.residual?.toFixed(4)}  matched=${fit.matched}`

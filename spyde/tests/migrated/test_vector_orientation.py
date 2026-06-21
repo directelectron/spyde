@@ -192,6 +192,28 @@ class TestFit:
         assert fit is not None
         assert np.abs(fit.strain - strain).max() < 0.03, fit.strain
 
+    def test_recovers_strain_across_weightings(self):
+        """The reflection-weighting knobs (gamma intensity compression, k_power
+        |g| lever-arm) must each leave the fit able to recover a known strain —
+        i.e. no weighting setting breaks convergence. Also asserts the knobs are
+        actually plumbed into fit_pattern: a strong vs weak setting gives a
+        DIFFERENT pose on data where the weighting matters (missing+spurious)."""
+        g, I = _template()
+        theta = np.deg2rad(6.0)
+        strain = np.array([[0.025, 0.0], [0.0, 0.01]])
+        v, vI = _apply(g, I, theta, strain, noise=0.005, drop=0.15, spurious=3, seed=9)
+        poses = {}
+        for gamma, kpow in [(1.0, 0.0), (0.5, 0.0), (0.5, 1.0), (0.0, 0.0)]:
+            fit = self._fit(v, vI, g, I, seed_angle=theta + np.deg2rad(2),
+                            gamma=gamma, k_power=kpow)
+            assert fit is not None, (gamma, kpow)
+            assert np.abs(fit.strain - strain).max() < 0.02, (gamma, kpow, fit.strain)
+            poses[(gamma, kpow)] = self._project(fit, g)
+        # gamma=1 (intensity) vs gamma=0 (uniform) must differ → gamma is applied
+        assert not np.allclose(poses[(1.0, 0.0)], poses[(0.0, 0.0)], atol=1e-4)
+        # k_power=1 vs k_power=0 must differ → the lever arm is applied
+        assert not np.allclose(poses[(0.5, 1.0)], poses[(0.5, 0.0)], atol=1e-4)
+
 
 class TestFriedelQC:
     """Friedel g/−g asymmetry: low for symmetric strain, high when one of a

@@ -130,6 +130,9 @@ def vom_generate_library(session, plot, payload) -> None:
             if field is not None:
                 tree._vom_field = field
                 tree._vom_field_cap = DEFAULTS["strain_cap"]
+                # Field cached with default weights → (strain_cap, gamma, k_power,
+                # sink_bw); Compute re-fits only if the Refine tab changed any.
+                tree._vom_field_sig = (DEFAULTS["strain_cap"], None, None, None)
                 tree._vom_wizard["field"] = field
                 _build_ipf_heatmap(session, root, field)
                 emit_status("Vector Orientation: live IPF ready — refine, or "
@@ -190,12 +193,10 @@ def vom_refine(session, plot, payload) -> None:
     if not wiz or wiz.get("overlay") is None:
         return
     params = {}
-    if payload.get("strain_cap") is not None:
-        params["strain_cap"] = float(payload["strain_cap"])
-        wiz["strain_cap"] = params["strain_cap"]
-    if payload.get("sink_bw") is not None:
-        params["sink_bw"] = float(payload["sink_bw"])
-        wiz["sink_bw"] = params["sink_bw"]
+    for key in ("strain_cap", "sink_bw", "gamma", "k_power"):
+        if payload.get(key) is not None:
+            params[key] = float(payload[key])
+            wiz[key] = params[key]
 
     def _work():
         try:
@@ -226,6 +227,14 @@ def vom_run(session, plot, payload) -> None:
     fit_params = dict(strain_cap=strain_cap)
     if sink_bw is not None:
         fit_params["sink_bw"] = float(sink_bw)
+    # Reflection-weighting knobs (gamma / |g| lever-arm) from the Refine tab.
+    for key in ("gamma", "k_power"):
+        val = payload.get(key, wiz.get(key))
+        if val is not None:
+            fit_params[key] = float(val)
+    # Signature for the Generate-time field cache: re-fit if any weight changed.
+    fit_sig = (strain_cap, fit_params.get("gamma"), fit_params.get("k_power"),
+               fit_params.get("sink_bw"))
     emit_status("Vector Orientation: fitting the field…")
 
     # Initialise the CUDA autograd engine on THIS (dispatch) thread before the
@@ -243,8 +252,8 @@ def vom_run(session, plot, payload) -> None:
             # nothing material changed — Compute Maps is then instant and just
             # adds the strain windows next to the existing IPF heatmap.
             cached = getattr(tree, "_vom_field", None)
-            reuse = cached is not None and abs(
-                float(getattr(tree, "_vom_field_cap", -1)) - strain_cap) < 1e-9
+            reuse = cached is not None and (
+                getattr(tree, "_vom_field_sig", None) == fit_sig)
             if reuse:
                 result, with_ipf = cached, False
             else:

@@ -230,14 +230,16 @@ def _affine_from_logstrain(eps, cap):
     return S, torch.stack([exx, eyy, exy], -1)
 
 
-def _batched_cost(theta, eps, tvec, g, gI, gmask, v, vI, vmask,
+def _batched_cost(theta, eps, tvec, g, gW, gmask, v, vI, vmask,
                   sigma, sink_bw, cap):
     """Per-pattern soft-assign + sink cost. Returns (P,) cost.
 
-    Mirrors vector_orientation._residual: each template spot is pulled to its
-    intensity-weighted soft-nearest MEASURED vector; the sink lets unmatched
-    template spots opt out. Summed (squared, gI*conf weighted) over template
-    spots per pattern.
+    Mirrors vector_orientation._residual exactly: each template spot is pulled to
+    its soft-nearest MEASURED vector; the sink lets unmatched template spots opt
+    out. The squared residual is weighted by ``gW·conf`` where ``gW`` is the
+    precomputed per-spot weight (gI**gamma)·(|g|**k_power) — so high-k (large
+    lever arm) reflections dominate the orientation — and ``vI`` is the
+    gamma-compressed, unit-mean-normalised measured intensity.
     """
     import torch
     S, _ = _affine_from_logstrain(eps, cap)               # (P,2,2)
@@ -256,7 +258,7 @@ def _batched_cost(theta, eps, tvec, g, gI, gmask, v, vI, vmask,
     sink = float(np.exp(-(sink_bw ** 2) / (2 * sigma ** 2)))
     conf = raw / (raw + sink)                              # (P, Mg)
     sqdiff = ((p - target) ** 2).sum(-1)                   # (P, Mg)
-    wgt = gI * conf * gmask.to(gI.dtype)                   # (P, Mg)
+    wgt = gW * conf * gmask.to(gW.dtype)                   # (P, Mg)
     return (sqdiff * wgt).sum(-1)
 
 
@@ -388,6 +390,22 @@ def compute_vector_orientation_gpu(
     # trip a CUDA illegal-access on some torch/driver combos.
     valid = valid_bool.to(dt)
 
+    # ── Reflection weighting (mirrors vector_orientation.fit_pattern) ─────────
+    gamma = float(P_params["gamma"])
+    kpow = float(P_params["k_power"])
+    # gamma-compress the measured intensity, re-normalise to unit mean per
+    # pattern (over valid entries) so the fixed-bandwidth sink still gates.
+    vmask_f = vmask.to(dt)
+    vI_g = vI.clamp_min(0.0) ** gamma
+    vmean = (vI_g * vmask_f).sum(-1) / vmask_f.sum(-1).clamp_min(1.0)
+    vI_ref = vI_g / vmean[:, None].clamp_min(1e-12)
+    # template per-spot weight: gamma-compressed intensity × |g|**k_power lever
+    # arm (high-k reflections drive the precise orientation). Coarse seed uses
+    # only the gamma-compressed intensity (no lever arm → low-k robust).
+    gnorm = torch.sqrt((g ** 2).sum(-1))                  # (T, Mmax)
+    gI_g = gI.clamp_min(0.0) ** gamma
+    gW = gI_g * (gnorm ** kpow)                           # (T, Mmax)
+
     def _report(frac):
         if progress is not None:
             progress(int(frac * total_pat), total_pat)
@@ -396,7 +414,7 @@ def compute_vector_orientation_gpu(
     if stopped_flag is not None and stopped_flag[0]:
         return None
     best_t, best_a, _ = _coarse_seed_batched(
-        g, gI, gmask, v, vI, vmask, n_seed_angles, sched[0])
+        g, gI_g, gmask, v, vI_g, vmask, n_seed_angles, sched[0])
     _report(0.25)
 
     # The stretch S is SPD-bounded (I+E within ±cap), so it cannot represent the
@@ -411,6 +429,7 @@ def compute_vector_orientation_gpu(
     gp = g[best_t]            # (P, Mmax, 2)
     gIp = gI[best_t]
     gmp = gmask[best_t]
+    gWp = gW[best_t]          # (P, Mmax) gamma·lever-arm weight
 
     # ── 2. Batched refine (Adam over the sigma anneal) ──────────────────────
     theta = best_a.clone().requires_grad_(True)
@@ -436,8 +455,8 @@ def compute_vector_orientation_gpu(
                 if stopped_flag is not None and stopped_flag[0]:
                     return None
                 opt.zero_grad()
-                cost = _batched_cost(theta, eps, tvec, gp, gIp, gmp,
-                                     v, vI, vmask, float(sigma), sink_bw, cap)
+                cost = _batched_cost(theta, eps, tvec, gp, gWp, gmp,
+                                     v, vI_ref, vmask, float(sigma), sink_bw, cap)
                 (cost * valid).sum().backward()
                 if not fit_strain and eps.grad is not None:
                     eps.grad.zero_()      # freeze strain during the rigid stage

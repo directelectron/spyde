@@ -52,6 +52,21 @@ DEFAULTS = dict(
     n_seed=1,               # coarse-search candidate branches to refine
     coarse_NR=100,
     coarse_NA=360,
+    # Reflection weighting (see §"weighting" below). The refine weights each
+    # template spot's positional residual by  (gI**gamma) * (|g|**k_power) * conf:
+    #   gamma   compresses intensity (like the raw-OM gamma) so the bright
+    #           low-k beams don't dominate — and a bright spurious peak can't
+    #           drag a spot as hard. gamma=1 → full intensity, 0 → ignore it.
+    #   k_power adds an explicit reciprocal lever-arm: a small mis-orientation
+    #           moves a |g| spot by ~|g|, so high-k reflections pin the ANGLE
+    #           more tightly. Default 0 because the squared lever arm is ALREADY
+    #           implicit — the residual of a |g| spot scales with |g|, so with
+    #           gamma<1 (flatter weights) the high-k reflections naturally
+    #           dominate the orientation without an explicit boost. On sped_ag
+    #           k_power>0 didn't improve agreement with the full-pattern OM; it's
+    #           exposed for datasets with unusually clean high-k peaks.
+    gamma=0.5,
+    k_power=0.0,
 )
 
 
@@ -180,15 +195,20 @@ def project_strain_bound(A: np.ndarray, cap: float = 0.05) -> np.ndarray:
     return U @ np.diag(sv) @ Vt
 
 
-def _residual(params, g, gI, v, vI, sigma, sink_bw, cap, pen):
+def _residual(params, g, gW, v, vI, sigma, sink_bw, cap, pen):
     """LM residual: template→measured soft-assign + sink + strain-band penalty.
 
     Template→measured (each template spot pulled to its soft-nearest measured
     vector) means the affine can't shrink templates to a point — every template
     spot must land on data. The sink lets template spots with no measured
-    support (missing reflections) opt out; weighting by measured intensity makes
-    spurious low-I peaks contribute little. The penalty band keeps singular
+    support (missing reflections) opt out. The penalty band keeps singular
     values of A within [1±cap] so LM never explores the collapse.
+
+    ``gW`` is the per-template-spot weight  (gI**gamma)·(|g|**k_power)  (built in
+    fit_pattern) and ``vI`` the per-pattern unit-mean-normalised  meas_I**gamma .
+    The squared residual is weighted by ``gW·conf`` (conf the soft-match gate) so
+    a high-k reflection — large lever arm — dominates the orientation while the
+    intensity compression keeps a bright spurious peak from hijacking a spot.
     """
     p = project_spots(params, g)                          # (M, 2)
     d2 = ((p[:, None, :] - v[None, :, :]) ** 2).sum(-1)   # (M, Nv)
@@ -198,7 +218,9 @@ def _residual(params, g, gI, v, vI, sigma, sink_bw, cap, pen):
     target = (wn[..., None] * v[None, :, :]).sum(1)       # soft-nearest measured
     sink = np.exp(-(sink_bw ** 2) / (2 * sigma ** 2))
     conf = raw / (raw + sink)                             # matched-ness in [0,1)
-    r_match = ((p - target) * (np.sqrt(gI) * conf)[:, None]).ravel()
+    # weight the squared residual by gW·conf → residual scaled by sqrt(gW·conf)
+    # (linear in conf, matching the GPU _batched_cost exactly).
+    r_match = ((p - target) * np.sqrt(gW * conf)[:, None]).ravel()
 
     A = params[_P_A].reshape(2, 2)
     sv = np.linalg.svd(A, compute_uv=False)
@@ -322,10 +344,19 @@ def fit_pattern(meas_xy: np.ndarray, meas_I: np.ndarray,
     if _mI_mean > 0.0:
         meas_I = meas_I / _mI_mean
 
+    gamma = float(P["gamma"])
+    kpow = float(P["k_power"])
+    # Soft-assign weight for the refine: gamma-compress the measured intensity,
+    # then re-normalise to unit mean so the fixed-bandwidth sink still gates.
+    meas_I_w = meas_I ** gamma
+    _mw = float(meas_I_w.mean()) if meas_I_w.size else 0.0
+    if _mw > 0.0:
+        meas_I_w = meas_I_w / _mw
+
     if seed is not None:
         candidates = [seed]
     elif lib.cache:
-        candidates = coarse_seed(meas_xy, meas_I, lib, P["n_seed"])
+        candidates = coarse_seed(meas_xy, meas_I, lib, P["n_seed"], gamma=gamma)
     else:
         # No coarse cache (e.g. a single-template library): seed every template
         # at angle 0 and let the refine pick the best by residual. Fine for tiny
@@ -339,12 +370,16 @@ def fit_pattern(meas_xy: np.ndarray, meas_I: np.ndarray,
         gI = np.asarray(lib.spots_I[bt], dtype=np.float64)
         if len(g) < 3:
             continue
+        # per-spot weight: intensity (gamma-compressed) × reciprocal lever arm.
+        # |g|**k_power hands the precise orientation to the high-k reflections.
+        gnorm = np.sqrt((g ** 2).sum(1))
+        gW = (gI ** gamma) * (gnorm ** kpow)
         p0 = np.array([seed_angle, 1, 0, 0, 1, 0, 0], dtype=np.float64)
         nfev = 0
         for sigma in P["sigma_schedule"]:
             sol = least_squares(
                 _residual, p0, method="lm", max_nfev=P["max_nfev"],
-                args=(g, gI, meas_xy, meas_I, sigma, P["sink_bw"], cap,
+                args=(g, gW, meas_xy, meas_I_w, sigma, P["sink_bw"], cap,
                       P["strain_penalty"]),
             )
             p0 = sol.x
