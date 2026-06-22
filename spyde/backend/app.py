@@ -85,6 +85,19 @@ async def _main() -> None:
     # Keep stdout exclusively for the PLOTAPP protocol; stray prints → stderr.
     redirect_stray_stdout()
 
+    # Guarantee Dask workers die with this process. The backend is an Electron
+    # subprocess; if it is force-killed / crashes / Electron dies, the normal
+    # shutdown() never runs and the cluster's worker+nanny grandchildren orphan
+    # (every run leaked ~n_workers idle python.exe). A Windows kill-on-close Job
+    # Object makes the OS reap the whole process tree no matter how we exit.
+    # Installed BEFORE the cluster starts so workers inherit the job. No-op /
+    # best-effort off Windows — the graceful shutdown() path below still runs.
+    try:
+        from spyde.backend.process_guard import install_kill_on_close
+        install_kill_on_close()
+    except Exception as e:
+        log.debug("process guard install failed: %s", e)
+
     # Stream logging records to the Electron app-log panel (level switchable at
     # runtime from the frontend). Installed after stdout is the protocol channel.
     from spyde.backend.log_stream import install as _install_log_stream

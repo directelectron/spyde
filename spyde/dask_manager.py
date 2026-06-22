@@ -151,6 +151,7 @@ class DaskManager:
                 self._cluster = None
 
         time.sleep(0.5)
+        # Reap multiprocessing children we own directly.
         try:
             for child in mp.active_children():
                 try:
@@ -164,6 +165,26 @@ class DaskManager:
                         logger.debug("killing worker %r failed: %s", child, e2)
         except Exception as e:
             logger.debug("reaping Dask worker children failed: %s", e)
+        # Dask spawns each worker under a NANNY process, so the real worker is a
+        # GRANDCHILD that mp.active_children() never lists. Walk the full process
+        # subtree via psutil and reap anything still alive, so a graceful quit
+        # doesn't leak workers even without the OS job-object guard.
+        try:
+            me = psutil.Process()
+            kids = me.children(recursive=True)
+            for c in kids:
+                try:
+                    c.terminate()
+                except Exception as e:
+                    logger.debug("terminating subprocess %s failed: %s", c.pid, e)
+            gone, alive = psutil.wait_procs(kids, timeout=1.0)
+            for c in alive:
+                try:
+                    c.kill()
+                except Exception as e:
+                    logger.debug("killing surviving subprocess %s failed: %s", c.pid, e)
+        except Exception as e:
+            logger.debug("reaping Dask process subtree failed: %s", e)
         try:
             gc.collect()
         except Exception as e:
