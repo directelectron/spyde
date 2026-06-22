@@ -153,9 +153,10 @@ def find_vectors_torch_batch(
         raise RuntimeError("no torch GPU device available")
     kr, md, thr = int(kernel_radius), int(min_distance), float(threshold)
     frames = np.asarray(frames, np.float32)
-    if beamstop_mask is not None and np.any(beamstop_mask):
-        frames = frames.copy()
-        frames[:, beamstop_mask] = 0.0
+    # Beam stop = PEAK REJECTION, not an image edit. Do NOT zero/fill the masked
+    # pixels (a fill creates a sharp step the correlator scores as rim spots).
+    # The NXCORR score is forced to -1 inside the mask below, which (with the
+    # >= threshold peak gate) drops every detection there with no artificial edge.
     N = frames.shape[0]
 
     # EVERYTHING on the GPU: NXCORR → local-max (maximum_filter equivalent via
@@ -250,8 +251,9 @@ def find_vectors_dog_torch_batch(
     ``G(σ₁)−G(σ₂)``, MAD-normalised absolute-SNR threshold, local-max + quadratic
     subpixel) but runs the WHOLE nav block in one batched pass — two separable
     Gaussian blurs, a max-pool local max, and a single ``nonzero`` extraction.
-    The masked beam-stop region is background-filled with the σ₂ blur (no step).
-    Returns a list of N ``(Ni,3)`` ``[ky, kx, snr]`` arrays.
+    The beam-stop region is left UNMODIFIED (no fill — a fill creates a step the
+    band-pass fires on); peaks inside the mask are dropped and the rim is excluded
+    from the SNR scale. Returns a list of N ``(Ni,3)`` ``[ky, kx, snr]`` arrays.
     """
     import torch
     import torch.nn.functional as F
@@ -265,13 +267,14 @@ def find_vectors_dog_torch_batch(
 
     with _GPU_LOCK:
         f = torch.as_tensor(np.ascontiguousarray(frames), device=dev)
-        g2 = _sep_blur_torch(f, sigma2, dev)
+        # Beam stop = PEAK REJECTION, not an image edit. Do NOT fill the masked
+        # pixels (a fill introduces a step the band-pass fires on). Run the DoG on
+        # the UNMODIFIED frame; `excl_t` only excludes the rim from the robust SNR
+        # scale and drops peaks inside the mask below — no artificial edge.
         excl_t = None
         if beamstop_mask is not None and np.any(beamstop_mask):
             excl_t = torch.as_tensor(np.ascontiguousarray(beamstop_mask), device=dev)
-            # background-fill the stop with the wide blur (no signal->0 step)
-            f = torch.where(excl_t[None], g2, f)
-            g2 = _sep_blur_torch(f, sigma2, dev)     # re-blur after fill
+        g2 = _sep_blur_torch(f, sigma2, dev)
         g1 = _sep_blur_torch(f, sigma1, dev)
         resp = g1 - g2                                # (N,H,W)
 

@@ -572,10 +572,12 @@ def _find_vectors_single_frame(
     kr = int(kernel_radius)
     H, W = frame.shape
 
-    if beamstop_mask is not None and beamstop_mask.any():
-        fill = float(frame[~beamstop_mask].mean()) if (~beamstop_mask).any() else 0.0
-        frame = frame.copy()
-        frame[beamstop_mask] = fill
+    # Beam stop = a PEAK-REJECTION region, NOT an image edit. Do NOT fill the
+    # masked pixels: a fill creates a sharp step at the mask boundary that the
+    # disk correlator scores as bright spots along the rim. Run NXCORR on the
+    # UNMODIFIED frame; below we force the score to -1 inside the mask and drop
+    # any peaks there, so the stop region contributes no detections without
+    # introducing an artificial edge.
 
     # Reflect-pad the frame by kr on each side so peaks near edges are detected
     # correctly.  Then zero-extend to the next FFT-efficient size.
@@ -842,10 +844,11 @@ def _find_vectors_single_frame_dog(
     NXCORR disk on this kind of data).  Both Gaussians are real-space separable
     convolutions — no FFT.
 
-    Beam stop: masked pixels are **background-filled** with the σ₂ blur (NOT
-    zero-filled).  Zeroing makes a hard signal→0 step at the mask edge and the
-    band-pass fires on it; filling with the smooth background removes the step.
-    Detections inside the (optionally further-dilated) mask are excluded.
+    Beam stop is a **peak-rejection region, not an image edit**: the frame is
+    left UNMODIFIED (no fill/zero — any fill creates a step at the mask edge that
+    the band-pass fires on as spurious rim spots). Detections inside the
+    (optionally further-dilated) mask are dropped, and the masked rim is excluded
+    from the robust SNR scale so it can't inflate the MAD.
 
     Threshold is an **absolute band-pass SNR**: ``response / (1.4826·MAD)`` of the
     response, so it is intensity-independent (like the NXCORR [-1,1] score) and
@@ -861,13 +864,15 @@ def _find_vectors_single_frame_dog(
     f = np.asarray(frame, dtype=np.float32)
     H, W = f.shape
 
+    # Beam stop = a PEAK-REJECTION region, NOT an image edit. We deliberately do
+    # NOT fill/zero the masked pixels: filling introduces a sharp intensity step
+    # at the mask boundary that the band-pass itself fires on (spurious bright
+    # spots along the rim). Instead the detector runs on the UNMODIFIED frame and
+    # any peak landing inside the (dilated) mask is dropped below. `excl` is also
+    # used to exclude the rim from the robust SNR scale so it can't inflate MAD.
     excl = None
     if beamstop_mask is not None and beamstop_mask.any():
         excl = _dilate_mask(beamstop_mask, bs_dilate) if bs_dilate else beamstop_mask
-        # background-fill the stop with the wide blur so no step is introduced
-        bg_fill = gaussian_filter(f, sigma2)
-        f = f.copy()
-        f[excl] = bg_fill[excl]
 
     k1 = _gauss_kernel_1d(sigma1)
     k2 = _gauss_kernel_1d(sigma2)
@@ -1697,15 +1702,12 @@ def _find_vectors_batch_gpu(
         # Flatten to (N, H, W) float32
         frames = blurred_block.reshape(N, H, W).astype(np.float32)
 
-        # Apply beamstop mask fill on CPU before H2D
-        if beamstop_mask is not None and beamstop_mask.any():
-            fill_vals = []
-            for i in range(N):
-                unmasked = frames[i][~beamstop_mask]
-                fill = float(unmasked.mean()) if unmasked.size > 0 else 0.0
-                fill_vals.append(fill)
-            for i in range(N):
-                frames[i][beamstop_mask] = fill_vals[i]
+        # Beam stop = a PEAK-REJECTION region, NOT an image edit. We do NOT fill
+        # the masked pixels: a fill creates a sharp step at the mask boundary that
+        # the correlator scores as bright rim spots. The detector runs on the
+        # UNMODIFIED frame and peaks inside the mask are dropped below (the same
+        # post-detection exclusion the CPU path uses), so the stop contributes no
+        # detections without introducing an artificial edge.
 
         # Per-frame global std (on CPU before H2D)
         global_stds = frames.std(axis=(-1, -2)).astype(np.float32)
@@ -2501,21 +2503,12 @@ def _find_vectors_chunk_gpu_impl(
                 src_d, frames_d, np.int32(lo), np.int32(lo), np.int32(NX), iH, iW
             )
 
-            # Beamstop fill: per-frame unmasked mean on device, tiny D2H
-            if have_mask:
-                sums_d = _gpu_pool_get((N,), np.float32)
-                sumsq_d = _gpu_pool_get((N,), np.float32)
-                _frame_reduce_kernel[N, 256, stream](
-                    frames_d, mask_d, np.int32(1), sums_d, sumsq_d,
-                    np.int32(HW), iW,
-                )
-                sums_host = sums_d.copy_to_host(stream=stream)
-                stream.synchronize()
-                fills = (sums_host / n_unmasked).astype(np.float32)
-                _beamstop_fill_kernel[grid_px, blk_px, stream](
-                    frames_d, mask_d, _cuda.to_device(fills, stream=stream),
-                    iH, iW,
-                )
+            # Beam stop = PEAK REJECTION, not an image edit. We intentionally do
+            # NOT fill the masked pixels here (a fill creates a sharp boundary
+            # step the correlator scores as rim spots). The frame is left
+            # UNMODIFIED; peaks inside the mask are dropped after detection (see
+            # the `~beamstop_mask` exclusion below), so the stop contributes no
+            # detections without an artificial edge.
         _sync_if_timing()
         timings["stats"] += time.perf_counter() - t0
 

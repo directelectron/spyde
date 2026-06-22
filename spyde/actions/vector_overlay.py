@@ -646,12 +646,11 @@ class FindVectorsPreviewOverlay(_DPOverlay):
             yi = np.clip(np.round(offsets[:, 1]).astype(int), 0, m.shape[0] - 1)
             xi = np.clip(np.round(offsets[:, 0]).astype(int), 0, m.shape[1] - 1)
             under = int(m[yi, xi].sum())
-        log.debug("[fv-preview] compute nav=(%s,%s) method=%s npeaks=%d under_mask=%d "
-                  "frame[%s] beamstop=%s(thr_dil=%s) show_transform=%s response=%s",
-                  iy, ix, self.method, len(offsets), under, _stats(frame),
-                  "yes" if m is not None else "no",
-                  getattr(self, "beamstop_dilate", "?"),
-                  self.show_transform, "yes" if response is not None else "no")
+        log.info("[fv-preview] COMPUTE nav=(%s,%s) method=%s thr=%.3g md=%d kr=%d "
+                 "npeaks=%d under_mask=%d beamstop=%s show_transform=%s",
+                 iy, ix, self.method, self.threshold, self.min_distance,
+                 self.kernel_radius, len(offsets), under,
+                 "yes" if m is not None else "no", self.show_transform)
         return {"offsets": offsets, "response": response}
 
     def _render_payload(self, payload) -> None:

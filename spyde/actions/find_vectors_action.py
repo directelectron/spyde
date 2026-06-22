@@ -415,16 +415,24 @@ def fv_tune(session, plot, payload) -> None:
     the current crosshair position."""
     src, tree = _src_plot_tree(session, plot)
     prev = getattr(tree, "_fv_preview", None) if tree is not None else None
-    log.debug("[fv-tune] received payload=%s preview=%s",
-              payload, "present" if prev is not None else "MISSING")
+    coerced = _coerce(payload)
+    log.info("[fv-tune] RECV plot=%s tree=%s preview=%s | thr=%s md=%s kr=%s method=%s",
+             getattr(plot, "window_id", None), tree is not None,
+             "present" if prev is not None else "MISSING",
+             coerced.get("threshold"), coerced.get("min_distance"),
+             coerced.get("kernel_radius"), coerced.get("method"))
     if prev is None:
+        log.info("[fv-tune] DROPPED — no _fv_preview on tree (params not applied)")
         return
 
     def _work():
         try:
-            prev.set_params(**_coerce(payload))
+            prev.set_params(**coerced)
+            log.info("[fv-tune] set_params APPLIED thr=%s md=%s kr=%s",
+                     coerced.get("threshold"), coerced.get("min_distance"),
+                     coerced.get("kernel_radius"))
         except Exception as e:
-            log.debug("fv_tune set_params failed: %s", e)
+            log.exception("[fv-tune] set_params FAILED: %s", e)
 
     threading.Thread(target=_work, daemon=True, name="fv-tune").start()
 
