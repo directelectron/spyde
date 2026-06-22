@@ -47,10 +47,15 @@ export function LogPanel({ open, onClose }: { open: boolean; onClose: () => void
     [state.logEntries, clearAt],
   )
 
-  // Auto-scroll to the newest line while the user is parked at the bottom.
+  // Auto-scroll to the newest line while the user is parked at the bottom —
+  // but NOT while a text selection is active in the log (auto-scrolling would
+  // collapse/yank the user's selection as new records stream in).
   useEffect(() => {
     const el = bodyRef.current
-    if (el && followRef.current) el.scrollTop = el.scrollHeight
+    if (!el || !followRef.current) return
+    const sel = window.getSelection?.()
+    const selectingHere = sel && !sel.isCollapsed && el.contains(sel.anchorNode)
+    if (!selectingHere) el.scrollTop = el.scrollHeight
   }, [rows.length, open])
 
   const onScroll = () => {
@@ -61,6 +66,21 @@ export function LogPanel({ open, onClose }: { open: boolean; onClose: () => void
 
   const onLevel = (e: React.ChangeEvent<HTMLSelectElement>) =>
     sendAction('set_log_level', { level: e.target.value })
+
+  // Copy the visible log as plain text (tab-separated, one record per line).
+  const [copied, setCopied] = useState(false)
+  const onCopy = async () => {
+    const text = rows
+      .map((e) => `${clock(e.time)}\t${e.level}\t${shortName(e.name)}\t${e.msg}`)
+      .join('\n')
+    try {
+      await navigator.clipboard.writeText(text)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1200)
+    } catch {
+      // clipboard API unavailable (rare in Electron) — no-op
+    }
+  }
 
   if (!open) return null
 
@@ -79,6 +99,14 @@ export function LogPanel({ open, onClose }: { open: boolean; onClose: () => void
         >
           {LEVELS.map((l) => <option key={l} value={l}>{l}</option>)}
         </select>
+        <button
+          data-testid="log-copy"
+          style={styles.btn}
+          onClick={onCopy}
+          title="Copy the visible log to the clipboard"
+        >
+          {copied ? 'Copied' : 'Copy'}
+        </button>
         <button
           data-testid="log-clear"
           style={styles.btn}
@@ -164,6 +192,9 @@ const styles: Record<string, React.CSSProperties> = {
     padding: '6px 10px',
     fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
     fontSize: 11.5, lineHeight: 1.5,
+    // Explicitly selectable: the app shell may set user-select:none globally
+    // (drag regions / chrome), which would otherwise block selecting log text.
+    userSelect: 'text', WebkitUserSelect: 'text', cursor: 'text',
   },
   empty: { color: '#6c7086', fontStyle: 'italic', padding: '8px 0' },
   row: { display: 'flex', gap: 8, whiteSpace: 'pre-wrap', wordBreak: 'break-word' },

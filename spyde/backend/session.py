@@ -180,11 +180,58 @@ class Session:
             name=f"load-{name}",
         ).start()
 
+    @staticmethod
+    def _signal_spanning_chunks(sig, nav_chunk: int = 32):
+        """Chunks for a lazy 2-D-signal dataset where each chunk holds WHOLE
+        signal frames (``-1`` on the signal axes) and a small contiguous nav
+        block.  Returns a ``chunks`` tuple to re-load with, or None if the
+        dataset isn't a navigated 2-D-signal or its signal axes are already
+        whole.
+
+        Why: RosettaSciIO auto-chunks a 4-D MRC as a balanced cube (e.g.
+        (90,90,90,90)) that SPLITS the signal axes — so reading one diffraction
+        pattern ``data[iy,ix]`` pulls a 131 MB chunk spanning 90x90 nav
+        positions and partial frames.  Whole-signal chunks make single-frame
+        navigator access read one contiguous chunk, and the navigator sum is
+        uniform across chunk boundaries."""
+        try:
+            am = sig.axes_manager
+            nav_dim = am.navigation_dimension
+            sig_dim = am.signal_dimension
+            data = sig.data
+            if sig_dim != 2 or nav_dim < 1 or not hasattr(data, "chunks"):
+                return None
+            # Signal axes already whole (one chunk each)? nothing to do.
+            sig_chunks = data.chunks[nav_dim:]
+            if all(len(c) == 1 for c in sig_chunks):
+                return None
+            nav_shape = data.shape[:nav_dim]
+            nav = tuple(min(nav_chunk, int(n)) for n in nav_shape)
+            return nav + (-1,) * sig_dim
+        except Exception as e:
+            log.debug("computing signal-spanning chunks failed: %s", e)
+            return None
+
     def _load_file_thread(self, path: str) -> None:
         try:
             signal = hs.load(path, lazy=True)
             if not isinstance(signal, list):
                 signal = [signal]
+            # Re-load with whole-signal chunks when the reader split the signal
+            # axes (cheap: a lazy reload only rebuilds the dask graph, ~0 s — it
+            # does NOT read or shuffle data, unlike a rechunk()).
+            for i, sig in enumerate(signal):
+                ch = self._signal_spanning_chunks(sig)
+                if ch is not None:
+                    try:
+                        reloaded = hs.load(path, lazy=True, chunks=ch)
+                        signal = reloaded if isinstance(reloaded, list) else [reloaded]
+                        log.debug("re-loaded %s with whole-signal chunks %s",
+                                  os.path.basename(path), ch)
+                    except Exception as e:
+                        log.debug("re-load with signal-spanning chunks failed "
+                                  "(%s); using reader default", e)
+                    break
             # File read done — clear the busy flag (a nav-shape prompt or the
             # opened windows take over from here).
             emit({"type": "loading", "busy": False, "text": ""})
@@ -461,6 +508,17 @@ class Session:
         except Exception as e:
             log.debug("metadata re-emit after signal-type change failed: %s", e)
         self._emit_signal_type(tree)
+        # Re-send the toolbar config: available actions are gated on the signal
+        # class / signal_type (toolbars.yaml signal_class / signal_types), so a
+        # type change must refresh the toolbar (e.g. diffraction actions appear
+        # when the signal becomes electron_diffraction).
+        for sp in list(getattr(tree, "signal_plots", []) or []):
+            try:
+                st = getattr(sp, "plot_state", None)
+                if st is not None and hasattr(st, "_send_toolbar_config"):
+                    st._send_toolbar_config()
+            except Exception as e:
+                log.debug("re-sending toolbar after signal-type change failed: %s", e)
 
     def _tree_window_ids(self, tree) -> list[int]:
         return sorted({
@@ -619,16 +677,18 @@ class Session:
             log.debug("re-emitting metadata failed: %s", e)
 
     def _set_offset_crosshair(self, plot, payload: dict) -> None:
-        """Toggle a draggable crosshair on the SIGNAL plot that live-sets the two
-        signal-axis offsets so the crosshair position reads (0, 0).
+        """Toggle a draggable "set origin" crosshair on the ACTIVE plot.
 
-        payload {"on": True}  → drop the crosshair at the current data origin and
-                                update offsets as it moves.
+        The crosshair edits the offsets of the axes the active plot is drawn
+        against, so it reads (0, 0) at the crosshair position:
+          • signal plot    → the two SIGNAL axes' offsets
+          • navigator plot → the two NAVIGATION axes' offsets
+        Offsets are in real (calibrated) units; the tool starts at the current
+        origin so it begins at the existing offset.
+
+        payload {"on": True}  → drop the crosshair and update offsets as it moves.
                 {"on": False} → remove the crosshair.
-
-        This is the calibration "set the origin" tool: the user drags the
-        crosshair onto the feature that should be (0,0) (e.g. the direct beam,
-        even when it sits behind a beam stop) and both offsets follow live."""
+        """
         if plot is None:
             return
         tree = getattr(plot, "signal_tree", None)
@@ -637,23 +697,45 @@ class Session:
         on = bool(payload.get("on", False))
         plot2d = getattr(plot, "_plot2d", None)
 
-        # always clear any existing crosshair first (idempotent)
-        old = getattr(tree, "_offset_cross", None)
+        # always clear any existing crosshair first (idempotent). Keyed per-plot
+        # so a signal-plot tool and a navigator-plot tool don't clobber each
+        # other; store on the plot, not the shared tree.
+        old = getattr(plot, "_offset_cross", None)
         if old is not None:
+            # remove_widget() deletes the widget AND re-pushes the panel, so the
+            # crosshair disappears on the FIRST toggle-off. A bare widget.hide()
+            # only emits a targeted event that a later repaint overwrites, so the
+            # ROI lingered until a second click (the reported "needs 2x").
             try:
-                old.hide()
+                if plot2d is not None and hasattr(plot2d, "remove_widget"):
+                    plot2d.remove_widget(old)
+                else:
+                    old.hide()
             except Exception as e:
-                log.debug("hiding offset crosshair failed: %s", e)
-            tree._offset_cross = None
+                log.debug("removing offset crosshair failed: %s", e)
+                try:
+                    old.hide()
+                except Exception:
+                    pass
+            plot._offset_cross = None
         if not on:
             return
         if plot2d is None:
             return
 
-        sig_ax = tree.root.axes_manager.signal_axes
-        if len(sig_ax) < 2:
+        # The axes the ACTIVE plot is drawn against: navigation axes for a
+        # navigator, signal axes otherwise (mirrors Plot._axes_info / scale bar).
+        try:
+            if getattr(plot, "is_navigator", False):
+                edit_ax = tree.root.axes_manager.navigation_axes
+            else:
+                edit_ax = plot.plot_state.current_signal.axes_manager.signal_axes
+        except Exception as e:
+            log.debug("offset crosshair axes lookup failed: %s", e)
             return
-        ax_x, ax_y = sig_ax[0], sig_ax[1]
+        if len(edit_ax) < 2:
+            return
+        ax_x, ax_y = edit_ax[0], edit_ax[1]
         w, h = int(ax_x.size), int(ax_y.size)
         # Start the crosshair on the pixel that is currently the origin
         # (data == 0): pixel = -offset/scale, expressed back in data coords for
@@ -672,7 +754,7 @@ class Session:
         except Exception as e:
             log.debug("offset crosshair add failed: %s", e)
             return
-        tree._offset_cross = cross
+        plot._offset_cross = cross
 
         # Capture the calibration at toggle-on time as the FIXED reference for
         # converting the widget's data coords → pixel.  The widget reports data
@@ -697,17 +779,18 @@ class Session:
                 log.debug("offset crosshair update failed: %s", e)
                 return
             # Live: re-emit the axes table so the dock shows the new offsets as
-            # the user drags.  Defer the full plot re-push (which rewrites the
+            # the user drags.  Defer the HOST-plot re-push (which rewrites the
             # displayed extent, and would shift the widget under the cursor) to
-            # pointer-up so dragging stays smooth.
+            # pointer-up so dragging stays smooth.  Only the host plot is
+            # re-pushed — NOT every plot in the tree: re-pushing a navigator that
+            # is progressively filling clobbers its live buffer, and editing one
+            # plot's axes doesn't change the other's calibration.
             self._emit_axes(tree)
             if final:
-                for p in list(self._plots):
-                    if getattr(p, "signal_tree", None) is tree:
-                        try:
-                            p.update()
-                        except Exception as e:
-                            log.debug("re-pushing plot after offset set failed: %s", e)
+                try:
+                    plot.update()
+                except Exception as e:
+                    log.debug("re-pushing host plot after offset set failed: %s", e)
                 # The displayed extent now reflects the new offset, so the widget
                 # sits at data coord 0.  Re-anchor the reference to the new
                 # calibration so a SUBSEQUENT drag is interpreted correctly.
@@ -721,8 +804,10 @@ class Session:
             cross.add_event_handler(_on_event, "pointer_move", "pointer_up")
         except Exception as e:
             log.debug("offset crosshair handler bind failed: %s", e)
-        # apply once so the starting position is reflected immediately
-        _apply(final=True)
+        # Emit the current axes once so the dock reflects the starting state, but
+        # do NOT mutate the offset at toggle-on: the crosshair already starts at
+        # the existing origin, so the offset is unchanged until the user drags.
+        self._emit_axes(tree)
 
     def _update_vi(self, window_id: int, name: str, params: dict) -> None:
         """A per-VI caret edit — apply new detector params and recompute that
@@ -769,12 +854,16 @@ class Session:
     # ── Plot update callbacks ──────────────────────────────────────────────────
 
     def _on_plot_ready(self, plot, result, future) -> None:
+        # A superseded future (newer navigator position already in flight) is no
+        # longer the one the plot wants — drop its result silently. This also
+        # covers the cancelled/torn shared-memory read, whose result is a
+        # ValueError; it's expected under the latest-wins model, not an error.
+        if plot.current_data is not future:
+            return
         if isinstance(result, Exception):
-            log.warning("Plot update failed: %s", result)
+            log.debug("Plot update skipped (stale/torn read): %s", result)
             return
         try:
-            if plot.current_data is not future:
-                return
             plot.current_data = result
             plot.update()
         except Exception as e:

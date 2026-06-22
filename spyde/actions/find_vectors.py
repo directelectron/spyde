@@ -757,14 +757,19 @@ def detect_beamstop(mean_pattern: np.ndarray, *, frac: float = 0.15,
     return _dilate_mask(mask, dilate)
 
 
-def _auto_beamstop_from_signal(signal, nav_dim: int, *, max_samples: int = 400,
+def _auto_beamstop_from_signal(signal, nav_dim: int, *, max_samples: int = 64,
                                dilate: int = 5) -> Optional[np.ndarray]:
-    """Detect the beam stop from a SPARSE sample of patterns (memory-safe).
+    """Detect the beam stop from a small sample of patterns (memory-safe + FAST).
 
-    A physical beam stop is static across the scan, so averaging a few hundred
-    evenly-spaced patterns reproduces it cleanly.  We stride the flattened nav
-    grid so at most ``max_samples`` frames are read; for lazy data only those
-    small slices are ``.compute()``-ed — never the whole dataset.
+    A physical beam stop is STATIC across the scan, so a few dozen frames
+    reproduce it cleanly. The previous version read ~400 frames one-by-one
+    (`flat[i].compute()` per frame); on a chunked lazy MRC each such read decodes
+    the WHOLE enclosing chunk (e.g. 134 MB for a 32x32x256x256 chunk) just to
+    pull one frame — so it re-read many GB and was painfully slow.
+
+    Instead we take ONE contiguous nav block sized to a single storage chunk and
+    mean it in a single `.compute()` (one chunk read). The stop is everywhere, so
+    a corner block is representative.
     """
     raw = signal.data
     nav_shape = raw.shape[:nav_dim]
@@ -775,19 +780,31 @@ def _auto_beamstop_from_signal(signal, nav_dim: int, *, max_samples: int = 400,
     if n_nav == 0:
         return None
     flat = raw.reshape((n_nav,) + tuple(sig_shape))
-    step = max(1, n_nav // max_samples)
-    idxs = range(0, n_nav, step)
-    acc = np.zeros(sig_shape, dtype=np.float64)
-    count = 0
-    for i in idxs:
-        frame = flat[i]
-        if hasattr(frame, "compute"):
-            frame = frame.compute()
-        acc += np.asarray(frame, dtype=np.float64)
-        count += 1
-    if count == 0:
+
+    # A single contiguous slice → one chunk read for lazy data. Align to the
+    # stored chunking when available so we touch exactly one chunk.
+    take = min(max_samples, n_nav)
+    try:
+        chunks0 = getattr(flat, "chunks", None)
+        if chunks0:
+            take = min(take, int(chunks0[0][0]))   # first nav-chunk length
+    except Exception:
+        pass
+    take = max(1, take)
+    block = flat[:take]                              # (take, ky, kx) view
+    if hasattr(block, "compute"):
+        # local threaded scheduler — not the distributed cluster (shares the
+        # navigator's CachedDaskArray; its cancel_surrounding would kill the
+        # read). See CLAUDE.md Live-Display Core Patterns.
+        try:
+            block = block.compute(scheduler="threads")
+        except Exception:
+            block = np.asarray(block.compute())
+    block = np.asarray(block, dtype=np.float64)
+    if block.size == 0:
         return None
-    return detect_beamstop(acc / count, dilate=dilate)
+    mean_pattern = block.mean(axis=0)
+    return detect_beamstop(mean_pattern, dilate=dilate)
 
 
 # ── Difference-of-Gaussians (DoG) blob detector ────────────────────────────────
@@ -931,13 +948,18 @@ DEFAULT_DOG_THRESHOLD = 10.0
 
 
 def _find_peaks_single_frame(frame, params, *, beamstop_mask=None,
-                             _disk_fft=None, _disk_stats=None):
+                             _disk_fft=None, _disk_stats=None,
+                             with_response=False):
     """Dispatch a single frame to the configured detector, returning peaks
     ``(N,3)`` ``[ky, kx, intensity]``.  ``params`` is the find-vectors param
-    dict (``method`` selects ``nxcorr`` or ``dog``)."""
+    dict (``method`` selects ``nxcorr`` or ``dog``).
+
+    ``with_response=True`` returns ``(peaks, response_map)`` where response_map is
+    the detector's transformed image — the DoG band-pass SNR or the NXCORR
+    correlation surface — for the "show transform" preview toggle."""
     method = str(params.get("method", METHOD_NXCORR)).lower()
     if method == METHOD_DOG:
-        return _find_vectors_single_frame_dog(
+        out = _find_vectors_single_frame_dog(
             frame,
             float(params.get("dog_sigma1", DEFAULT_DOG_SIGMA1)),
             float(params.get("dog_sigma2", DEFAULT_DOG_SIGMA2)),
@@ -945,16 +967,19 @@ def _find_peaks_single_frame(frame, params, *, beamstop_mask=None,
             int(params.get("min_distance", 3)),
             subpixel=bool(params.get("subpixel", True)),
             beamstop_mask=beamstop_mask,
-        )[2]
-    return _find_vectors_single_frame(
-        frame,
-        int(params.get("kernel_radius", 5)),
-        float(params.get("threshold", 0.5)),
-        int(params.get("min_distance", 5)),
-        subpixel=bool(params.get("subpixel", True)),
-        beamstop_mask=beamstop_mask,
-        _disk_fft=_disk_fft, _disk_stats=_disk_stats,
-    )[2]
+        )
+    else:
+        out = _find_vectors_single_frame(
+            frame,
+            int(params.get("kernel_radius", 5)),
+            float(params.get("threshold", 0.5)),
+            int(params.get("min_distance", 5)),
+            subpixel=bool(params.get("subpixel", True)),
+            beamstop_mask=beamstop_mask,
+            _disk_fft=_disk_fft, _disk_stats=_disk_stats,
+        )
+    # out = (corr_map_thresholded, raw_response, peaks)
+    return (out[2], out[1]) if with_response else out[2]
 
 
 def _estimate_disk_radius(frame: np.ndarray) -> int:
@@ -2894,6 +2919,11 @@ def _do_compute_vectors(
     subpixel = bool(params.get("subpixel", True))
     dog_sigma1 = float(params.get("dog_sigma1", DEFAULT_DOG_SIGMA1))
     dog_sigma2 = float(params.get("dog_sigma2", DEFAULT_DOG_SIGMA2))
+    log.debug("[do_compute_vectors] START method=%s thr=%s md=%s sigma=%s "
+              "nav_dim=%s sig_shape=%s lazy=%s beamstop=%s", method, threshold,
+              min_dist, sigma, nav_dim, tuple(sig_shape),
+              getattr(signal, "_lazy", "?"),
+              beamstop_mask is not None)
 
     ky_scale = float(sig_ax[1].scale)
     ky_offset = float(sig_ax[1].offset)
@@ -3166,6 +3196,10 @@ def _do_compute_vectors(
                 log.debug("final count-map shm write to %s failed: %s", shm_name, e)
         if on_chunk_done is not None:
             on_chunk_done((slice(None), slice(None)), count_map)
+
+    log.debug("[do_compute_vectors] DONE: %d vectors over %s nav positions "
+              "(%.2f per pattern)", N_total, int(np.prod(nav_shape_full)),
+              N_total / max(1, int(np.prod(nav_shape_full))))
 
     return SpyDEDiffractionVectors.from_arrays(
         flat_buffer=flat_buffer,

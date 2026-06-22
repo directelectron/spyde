@@ -283,6 +283,59 @@ class Plot:
         self.current_data = data
         self._set_array(data, levels=levels)
 
+    def set_transform_active(self, active: bool) -> None:
+        """Enter/leave Find-Vectors transform view. While active, the navigator's
+        raw-frame paint to this plot is suppressed (the overlay drives the image
+        via :meth:`set_transform_image`)."""
+        self._fv_transform_active = bool(active)
+        logger.debug("[plot] transform-view lock %s (window %s)",
+                     "ACTIVE" if active else "released", self.window_id)
+
+    def set_transform_image(self, data: np.ndarray, levels=None) -> None:
+        """Paint the detector transform image, bypassing the transform-view lock
+        (this is the one paint allowed while the lock is on)."""
+        self._fv_paint_token = True
+        try:
+            self.current_data = data
+            self._set_array(data, levels=levels)
+        finally:
+            self._fv_paint_token = False
+
+    def set_overlay_mask(self, mask: "np.ndarray | None",
+                         color: str = "#ff4444", alpha: float = 0.4) -> None:
+        """Draw (or clear) a translucent boolean mask over the displayed image.
+
+        Used to show the detected beam-stop region during Find-Vectors. The mask
+        is composited client-side in the anyplotlib iframe — no recompute, no
+        new image push. Pass ``mask=None`` to clear it.
+
+        The mask must match the displayed image's (H, W); if it doesn't (e.g. a
+        stale beam-stop from a different signal), the overlay is cleared rather
+        than raising.
+        """
+        if self._plot2d is None:
+            return
+        try:
+            if mask is None:
+                self._plot2d.set_overlay_mask(None, color=color, alpha=alpha)
+                logger.debug("[plot] overlay mask cleared (window %s)",
+                             self.window_id)
+                return
+            arr = np.asarray(mask)
+            h = self._plot2d._state.get("image_height")
+            w = self._plot2d._state.get("image_width")
+            if h and w and arr.shape != (h, w):
+                logger.debug(
+                    "[plot] overlay mask shape %s != image %sx%s — clearing",
+                    arr.shape, h, w)
+                self._plot2d.set_overlay_mask(None, color=color, alpha=alpha)
+                return
+            self._plot2d.set_overlay_mask(arr, color=color, alpha=alpha)
+            logger.debug("[plot] overlay mask set: %d px (window %s)",
+                         int(np.count_nonzero(arr)), self.window_id)
+        except Exception as e:
+            logger.debug("[plot] set_overlay_mask failed: %s", e)
+
     def _axes_info(self, data: np.ndarray):
         """Return (axes, units) for the displayed 2-D image from the current
         signal's signal axes, so anyplotlib draws a calibrated scale bar.
@@ -320,6 +373,44 @@ class Plot:
     def _set_array(self, data: np.ndarray, levels=None) -> None:
         dims = data.ndim
 
+        # Transform-view lock: while the Find-Vectors preview shows the DoG /
+        # correlation image on this signal plot, the navigator's RAW-frame paint
+        # must not overwrite it. The overlay sets `_fv_transform_active` and
+        # paints through `set_transform_image` (which sets `_fv_paint_token` to
+        # bypass this guard); every other paint of a navigated frame is dropped
+        # so the navigator move recomputes the transform (via the overlay's
+        # index hook) instead of flashing the raw pattern back.
+        if (getattr(self, "_fv_transform_active", False)
+                and not getattr(self, "_fv_paint_token", False)
+                and dims == 2 and self._is_navigated_frame()):
+            logger.debug("[plot-paint] SIG suppressed raw frame (transform-view "
+                         "lock active) shape=%s", tuple(data.shape))
+            return
+
+        # Hold the previous frame instead of flashing a degenerate one.
+        #
+        # On a cross-chunk navigator move over the distributed cluster, the new
+        # diffraction pattern arrives via the shared-memory buffer; a torn/early
+        # read of that reused buffer (or a transient loading placeholder) can be
+        # all-zeros, which paints as a black flash. For a NAVIGATED DP we already
+        # hold contrast across frames, so an all-zero frame is never a real
+        # pattern — drop it and keep the last good image until a valid frame
+        # lands (the latest-future guard then paints the correct one). Guarded to
+        # navigated frames only: a genuinely empty output (blank VI/FFT) must
+        # still paint.
+        try:
+            if (dims == 2 and self._last_levels is not None
+                    and self._is_navigated_frame() and data.size):
+                # all-zeros torn/early shm read, OR the int8 "loading" checkerboard
+                # placeholder (values 0/1) — neither is a real pattern.
+                if not np.any(data) or (
+                        data.dtype == np.int8 and float(data.max()) <= 1):
+                    logger.debug("[plot-paint] SIG held degenerate frame (zeros/"
+                                 "checkerboard) — no flash")
+                    return
+        except Exception as e:
+            logger.debug("zero-frame hold check failed: %s", e)
+
         # RGB(A) image (H, W, 3|4) — e.g. an IPF orientation map. anyplotlib
         # renders it directly; there are no scalar levels / histogram.
         if dims == 3 and data.shape[-1] in (3, 4):
@@ -333,6 +424,10 @@ class Plot:
         if dims == 2 and self._plot2d is not None:
             if self.needs_auto_level:
                 # New data / explicit request → recompute contrast + histogram.
+                if (self._is_navigated_frame() and self._last_levels is not None
+                        and logger.isEnabledFor(logging.DEBUG)):
+                    logger.debug("[plot-paint] SIG RE-AUTO-LEVEL on navigated frame "
+                                 "(was %s) — this is a contrast flash", self._last_levels)
                 vmin, vmax = self._robust_levels(data)
                 self.needs_auto_level = False
                 self._emit_histogram(data, vmin, vmax)
@@ -351,27 +446,53 @@ class Plot:
                 self._emit_histogram(data, vmin, vmax)
             self._last_levels = (vmin, vmax)
             axes, units = self._axes_info(data)
+            # Pass the display range to set_data so the image + contrast land in a
+            # SINGLE push. Splitting them (set_data then set_clim) pushed twice:
+            # the first frame showed the image stretched over its raw data range
+            # (wrong contrast), the second corrected it — a one-frame flash on
+            # every navigator move / threshold tick. clim= makes it atomic.
+            clim = (vmin, vmax)
             if axes is not None:
                 self._plot2d.set_data(data.astype(np.float32),
-                                      x_axis=axes[0], y_axis=axes[1], units=units)
+                                      x_axis=axes[0], y_axis=axes[1], units=units,
+                                      clim=clim)
                 # set_data updates x_axis/units but does NOT recompute scale_x/
                 # scale_y from the new axes — so the auto scale bar would size off
-                # the stale init scale. set_extent recomputes the physical scale.
-                try:
-                    self._plot2d.set_extent(axes[0], axes[1])
-                except Exception as e:
-                    logger.debug("set_extent failed: %s", e)
+                # the stale init scale. set_extent recomputes it, BUT it pushes
+                # again; skip it when the extent is unchanged (every navigated
+                # frame shares the same axes) so we keep ONE push per frame.
+                ext_key = (float(axes[0][0]), float(axes[0][-1]),
+                           float(axes[1][0]), float(axes[1][-1]), int(data.shape[0]),
+                           int(data.shape[1]))
+                if ext_key != getattr(self, "_last_extent_key", None):
+                    self._last_extent_key = ext_key
+                    try:
+                        self._plot2d.set_extent(axes[0], axes[1])
+                    except Exception as e:
+                        logger.debug("set_extent failed: %s", e)
             else:
-                self._plot2d.set_data(data.astype(np.float32))
-            self._plot2d.set_clim(vmin, vmax)
+                self._plot2d.set_data(data.astype(np.float32), clim=clim)
+            if logger.isEnabledFor(logging.DEBUG):
+                try:
+                    a = np.asarray(data, dtype=np.float64)
+                    logger.debug(
+                        "[plot-paint] %s shape=%s mean=%.3g std=%.3g min=%.3g "
+                        "max=%.3g clim=(%.3g,%.3g) navigated=%s",
+                        "NAV" if self.is_navigator else "SIG", tuple(a.shape),
+                        a.mean(), a.std(), a.min(), a.max(), vmin, vmax,
+                        self._is_navigated_frame())
+                except Exception:
+                    pass
         elif dims == 1 and self._plot1d is not None:
             self._plot1d.set_data(data)
 
-    def _emit_histogram(self, data: np.ndarray, vmin: float, vmax: float) -> None:
+    def _emit_histogram(self, data: np.ndarray, vmin: float, vmax: float,
+                        threshold: float = None) -> None:
         """Send a histogram of the current image to the sidebar for this window.
 
         Only emitted on auto-level (new data / contrast), not on every selector
-        drag, so it doesn't flood the channel.
+        drag, so it doesn't flood the channel. ``threshold`` (when given) draws a
+        dotted marker line on the histogram (the Find-Vectors detector threshold).
         """
         if self.window_id is None:
             return
@@ -381,14 +502,20 @@ class Plot:
                 return
             counts, edges = np.histogram(finite, bins=64)
             from spyde.backend.ipc import emit
-            emit({
+            msg = {
                 "type": "histogram",
                 "window_id": self.window_id,
                 "counts": counts.astype(int).tolist(),
                 "edges": [float(e) for e in edges],
                 "vmin": float(vmin),
                 "vmax": float(vmax),
-            })
+            }
+            # threshold marker: None clears it (raw view), a value draws the line
+            msg["threshold"] = None if threshold is None else float(threshold)
+            emit(msg)
+            logger.debug("[plot] histogram emit window=%s vmin=%.3g vmax=%.3g "
+                         "threshold=%s n=%d", self.window_id, vmin, vmax,
+                         msg["threshold"], int(finite.size))
         except Exception as e:
             logger.debug("histogram emit failed: %s", e)
 

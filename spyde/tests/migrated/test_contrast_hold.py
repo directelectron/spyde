@@ -37,7 +37,11 @@ def _bare_plot(nav_dim: int):
     clims: list[tuple[float, float]] = []
 
     class _FakeP2D:
-        def set_data(self, data, **k): pass
+        # clim now arrives via set_data(clim=...) in a single push (no flash);
+        # keep set_clim too for any path that still calls it.
+        def set_data(self, data, clim=None, **k):
+            if clim is not None:
+                clims.append((float(clim[0]), float(clim[1])))
         def set_clim(self, lo, hi): clims.append((float(lo), float(hi)))
 
     p._ensure_figure = lambda dims: setattr(p, "_plot2d", _FakeP2D())
@@ -82,3 +86,31 @@ class TestContrastHold:
         assert p._last_levels == (10.0, 50.0)
         Plot._set_array(p, _BRIGHT)
         assert clims[-1] == (10.0, 50.0)
+
+    def test_navigated_frame_holds_on_zero_frame(self):
+        # A torn/early shared-memory read on a cross-chunk move can be all-zeros;
+        # for a navigated DP it must be DROPPED (keep the last good frame), not
+        # painted as a black flash.
+        p, clims = _bare_plot(nav_dim=2)
+        Plot._set_array(p, _BRIGHT)
+        n_before = len(clims)
+        Plot._set_array(p, np.zeros((16, 16), np.float32))
+        assert len(clims) == n_before, "all-zero frame painted (black flash)"
+
+    def test_navigated_frame_holds_on_checkerboard_placeholder(self):
+        # The int8 0/1 "loading" checkerboard placeholder must also be held.
+        p, clims = _bare_plot(nav_dim=2)
+        Plot._set_array(p, _BRIGHT)
+        n_before = len(clims)
+        cb = np.ones((16, 16), np.int8); cb[::2, ::2] = 0
+        Plot._set_array(p, cb)
+        assert len(clims) == n_before, "checkerboard placeholder painted (flash)"
+
+    def test_output_plot_still_paints_blank_frame(self):
+        # The guard is navigated-only: a genuinely blank OUTPUT (VI/FFT) must
+        # still paint (not be mistaken for a torn read).
+        p, clims = _bare_plot(nav_dim=0)
+        Plot._set_array(p, _BRIGHT)
+        n_before = len(clims)
+        Plot._set_array(p, np.zeros((16, 16), np.float32))
+        assert len(clims) > n_before, "blank output frame was wrongly dropped"

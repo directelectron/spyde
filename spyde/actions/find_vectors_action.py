@@ -36,6 +36,7 @@ from spyde.actions.find_vectors import _do_compute_vectors, _copy_nav_axes_to
 DEFAULTS: dict = dict(
     sigma=1.0, kernel_radius=5, threshold=0.5, min_distance=5, subpixel=True,
     method="nxcorr", dog_sigma1=0.8, dog_sigma2=2.0, beamstop_auto=False,
+    beamstop_dilate=5, show_transform=False,
 )
 
 # Per-method threshold default applied when the user switches method without
@@ -346,6 +347,10 @@ def fv_preview(session, plot, payload) -> None:
         emit_error("Find Vectors needs a 4D-STEM dataset (2-D nav + 2-D signal)")
         return
     p = _coerce(payload)
+    log.debug("[fv-preview] ATTACH method=%s thr=%s show_transform=%s beamstop=%s "
+              "data.shape=%s lazy=%s", p["method"], p["threshold"],
+              p.get("show_transform"), p.get("beamstop_auto"),
+              tuple(tree.root.data.shape), getattr(tree.root, "_lazy", "?"))
 
     def _work():
         try:
@@ -362,7 +367,8 @@ def fv_preview(session, plot, payload) -> None:
                 min_distance=p["min_distance"], subpixel=p["subpixel"],
                 method=p["method"], dog_sigma1=p["dog_sigma1"],
                 dog_sigma2=p["dog_sigma2"],
-                beamstop_mask=_preview_beamstop(tree, p),
+                beamstop_auto=bool(p.get("beamstop_auto")),
+                show_transform=p["show_transform"],
             )
             # Qt parity: estimate the disk radius from the data (once) so the
             # wizard's defaults match the pattern instead of a fixed 5.
@@ -376,26 +382,6 @@ def fv_preview(session, plot, payload) -> None:
             logging.getLogger(__name__).debug("fv_preview attach failed: %s", e)
 
     threading.Thread(target=_work, daemon=True, name="fv-preview").start()
-
-
-def _preview_beamstop(tree, p):
-    """Beam-stop mask for the live preview, cached on the tree. Detected from a
-    sparse sample of the dataset (memory-safe) only when the user enabled
-    beamstop_auto; None otherwise."""
-    if not p.get("beamstop_auto"):
-        return None
-    cached = getattr(tree, "_fv_beamstop", None)
-    if cached is not None:
-        return cached
-    try:
-        from spyde.actions.find_vectors import _auto_beamstop_from_signal
-        nav_dim = tree.root.axes_manager.navigation_dimension
-        mask = _auto_beamstop_from_signal(tree.root, nav_dim)
-        tree._fv_beamstop = mask
-        return mask
-    except Exception as e:
-        log.debug("preview beam-stop detection failed: %s", e)
-        return None
 
 
 def _emit_auto_params(plot, tree) -> None:
@@ -429,6 +415,8 @@ def fv_tune(session, plot, payload) -> None:
     the current crosshair position."""
     src, tree = _src_plot_tree(session, plot)
     prev = getattr(tree, "_fv_preview", None) if tree is not None else None
+    log.debug("[fv-tune] received payload=%s preview=%s",
+              payload, "present" if prev is not None else "MISSING")
     if prev is None:
         return
 
@@ -436,8 +424,7 @@ def fv_tune(session, plot, payload) -> None:
         try:
             prev.set_params(**_coerce(payload))
         except Exception as e:
-            import logging
-            logging.getLogger(__name__).debug("fv_tune failed: %s", e)
+            log.debug("fv_tune set_params failed: %s", e)
 
     threading.Thread(target=_work, daemon=True, name="fv-tune").start()
 
@@ -453,13 +440,19 @@ def fv_run(session, plot, payload) -> None:
     if am.signal_dimension != 2 or am.navigation_dimension < 2:
         emit_error("Find Vectors needs a 4D-STEM dataset (2-D nav + 2-D signal)")
         return
-    _start_batch(session, src, tree, _coerce(payload))
+    p = _coerce(payload)
+    log.debug("[fv-run] COMPUTE full dataset method=%s thr=%s md=%s "
+              "kr=%s dog=(%s,%s) beamstop=%s", p["method"], p["threshold"],
+              p["min_distance"], p["kernel_radius"], p["dog_sigma1"],
+              p["dog_sigma2"], p.get("beamstop_auto"))
+    _start_batch(session, src, tree, p)
 
 
 def fv_stop(session, plot, payload=None) -> None:
     """Caret closed: remove the live preview overlay."""
     src, tree = _src_plot_tree(session, plot)
     prev = getattr(tree, "_fv_preview", None) if tree is not None else None
+    log.debug("[fv-stop] removing preview=%s", prev is not None)
     if prev is not None:
         try:
             prev.remove()

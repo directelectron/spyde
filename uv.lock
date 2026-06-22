@@ -31,7 +31,7 @@ wheels = [
 [[package]]
 name = "anyplotlib"
 version = "0.1.0"
-source = { git = "https://github.com/CSSFrancis/anyplotlib.git?rev=main#a50ed934cf7ade4ea1f387840d2a500099110685" }
+source = { git = "https://github.com/CSSFrancis/anyplotlib.git?rev=main#3cbbf3d48c193ae8d89f6c621f8c562fdb0448a6" }
 dependencies = [
     { name = "anywidget" },
     { name = "colorcet" },

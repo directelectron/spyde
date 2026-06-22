@@ -93,8 +93,17 @@ class PlotUpdateWorker:
         data = getattr(sig, "data", None)
         if isinstance(data, Future):
             return data
-        if isinstance(data, (list, tuple, np.ndarray)) and data and isinstance(data[0], Future):
-            return data[0]
+        # NB: `and data` on an ndarray with >1 element raises "truth value of an
+        # array is ambiguous" — check length explicitly. A lazy signal whose
+        # data is a length-1 object array holding a Future is the case we want
+        # (a plain numeric ndarray has data[0] that isn't a Future → None).
+        if isinstance(data, (list, tuple, np.ndarray)) and len(data) > 0:
+            try:
+                first = data[0]
+            except Exception:
+                return None
+            if isinstance(first, Future):
+                return data[0]
         return None
 
     def _maybe_emit_future(
@@ -106,6 +115,15 @@ class PlotUpdateWorker:
     ) -> None:
         if not isinstance(fut, Future) or not fut.done():
             return
+        # A CANCELLED future is also done() — but its shared-memory buffer was
+        # never written (the write task was cancelled by a newer navigator
+        # update under the latest-wins model), so reading it yields an empty
+        # dtype header ("Data type '' not understood"). Skip cancelled futures.
+        try:
+            if fut.cancelled():
+                return
+        except Exception:
+            pass
         fid = id(fut)
         if fid in self._seen and self._seen_plots.get(fid) == id(plot):
             return

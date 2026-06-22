@@ -69,6 +69,7 @@ export interface Histogram {
   edges: number[]
   vmin: number
   vmax: number
+  threshold?: number | null   // dotted marker line (Find-Vectors detector threshold)
 }
 
 /** One application-log record streamed from the Python backend. */
@@ -599,6 +600,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
               edges: (msg.edges as number[]) ?? [],
               vmin: msg.vmin as number,
               vmax: msg.vmax as number,
+              threshold: (msg.threshold as number | null) ?? null,
             },
           })
           break

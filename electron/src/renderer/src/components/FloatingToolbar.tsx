@@ -98,6 +98,12 @@ export function FloatingToolbar({
 
   React.useEffect(() => {
     if (!openName) return
+    // Wizards (Find Diffraction Vectors, Orientation, …) are STATEFUL tools that
+    // stay open until explicitly closed via their ✕ or by toggling the toolbar
+    // button. They must survive interacting with OTHER windows — e.g. moving the
+    // navigator selector to preview a new pattern — so an outside click does not
+    // close them. Plain param popouts still dismiss on an outside click.
+    if (WIZARD_ACTIONS.has(openName)) return
     const onDown = (e: MouseEvent) => {
       const target = e.target as Node
       if (rootRef.current?.contains(target)) return   // inside the toolbar/caret

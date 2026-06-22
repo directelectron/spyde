@@ -96,8 +96,15 @@ def read_shared_array(shm):
     # Read dtype length
     dtype_length = int.from_bytes(buffer[offset:offset+4], byteorder='little')
     offset += 4
+    # An unwritten buffer (e.g. a cancelled write_shared_array future the worker
+    # tried to read anyway) has a zero-length / empty dtype header — np.dtype('')
+    # then raises "Data type '' not understood". Treat it as "no data yet".
+    if dtype_length <= 0 or dtype_length > 32:
+        raise ValueError("shared-memory buffer not yet written (empty dtype header)")
     # Read dtype
     dtype_str = bytes(buffer[offset:offset+dtype_length]).decode('utf-8')
+    if not dtype_str:
+        raise ValueError("shared-memory buffer not yet written (empty dtype)")
     dtype = np.dtype(dtype_str)
     offset += dtype_length
     # Read ndim
@@ -197,6 +204,14 @@ def update_from_navigation_selection(
             # navigator updates cancel a chunk future that a dependent
             # get_inds/write_shared_array future needs → image never loads.
             with _cache_lock_ctx(current_signal):
+                # If a NEWER navigator position superseded us while we waited for
+                # this lock, do NOT cancel/submit: our cancel_surrounding() would
+                # kill the latest position's in-flight chunk future ("get_inds …
+                # lost dependencies"), and our own future would be stale anyway.
+                # Bail and let the latest body own the cache + the paint.
+                if hasattr(selector, "is_stale_body") and selector.is_stale_body():
+                    return None
+
                 # Cancel stale work from the previous position before requesting new data.
                 # 1. Cancel the old shm-write future so workers aren't blocked on it.
                 old_fut = getattr(child, "_pending_shm_future", None)

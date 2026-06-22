@@ -17,13 +17,16 @@ interface ShellProps {
   status: string
   statusTestid: string
   children: React.ReactNode
+  width?: number          // override the default box width (e.g. 2-column wizards)
 }
 
 export function WizardShell({
   testid, title, openUp, onClose, closeTestid, status, statusTestid, children,
+  width,
 }: ShellProps) {
   return (
-    <div data-testid={testid} style={{ ...(openUp ? S.popUp : S.pop), ...S.box }}>
+    <div data-testid={testid}
+      style={{ ...(openUp ? S.popUp : S.pop), ...S.box, ...(width ? { width } : {}) }}>
       <div style={S.head}>
         <span style={S.title}>{title}</span>
         <button data-testid={closeTestid} style={S.close} onClick={onClose}>✕</button>
@@ -76,7 +79,7 @@ export function Slider({ value, min, max, step, onChange, fmt, testid }: {
   return (
     <div style={S.sliderRow}>
       <input data-testid={testid} type="range" min={min} max={max} step={step} value={value}
-        style={{ width: 104 }} onChange={(e) => onChange(Number(e.target.value))} />
+        style={{ flex: 1, minWidth: 40 }} onChange={(e) => onChange(Number(e.target.value))} />
       <span style={S.sliderVal}>{fmt ? fmt(value) : value}</span>
     </div>
   )

@@ -222,6 +222,10 @@ functions:
         name: Mask beam stop
         type: bool
         default: False
+      show_transform:
+        name: Show transform
+        type: bool
+        default: False
       subpixel:
         name: Subpixel
         type: bool

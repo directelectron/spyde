@@ -28,6 +28,18 @@ import numpy as np
 log = logging.getLogger(__name__)
 
 
+def _stats(arr) -> str:
+    """Compact mean/std/min/max/shape summary for debug logging of image data."""
+    try:
+        a = np.asarray(arr, dtype=np.float64)
+        if a.size == 0:
+            return "empty"
+        return (f"shape={tuple(a.shape)} mean={a.mean():.3g} std={a.std():.3g} "
+                f"min={a.min():.3g} max={a.max():.3g}")
+    except Exception:
+        return "??"
+
+
 def _indices_to_iyix(indices):
     """A navigator crosshair reports ``[[ix, iy]]`` (cx=column=nav-x,
     cy=row=nav-y). Return ``(iy, ix)`` for the vectors' ``at(iy, ix)``."""
@@ -61,8 +73,19 @@ def _navigator_selectors_for(tree, dp_plot):
     for sel in npm.all_navigation_selectors:
         if dp_plot in getattr(sel, "active_children", []):
             out.append(sel)
-    # Fall back to all navigator selectors if none claim this plot directly.
-    return out or list(npm.all_navigation_selectors)
+    out = out or list(npm.all_navigation_selectors)
+    # Dedup: a composite navigator selector (IntegratingSSelector2D) exposes its
+    # crosshair AND rectangle sub-selectors; registering the overlay hook on both
+    # fires it twice per nav move (double compute → transform image flashes).
+    # Keep one selector per parent (or per identity).
+    seen, uniq = set(), []
+    for sel in out:
+        key = id(getattr(sel, "parent", sel) or sel)
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(sel)
+    return uniq
 
 
 class _DPOverlay:
@@ -123,7 +146,11 @@ class _DPOverlay:
         self._selectors = _navigator_selectors_for(tree, self.dp_plot)
         seeded = False
         for sel in self._selectors:
-            sel.index_hooks.append(self._on_indices)
+            # Guard against a double-register (re-attach / two selectors sharing a
+            # plot): the same hook firing twice means two computes per nav move
+            # and the transform image flashing between them.
+            if self._on_indices not in sel.index_hooks:
+                sel.index_hooks.append(self._on_indices)
             # Seed from the last-known position so markers appear immediately.
             if sel.current_indices is not None:
                 self._on_indices(sel.current_indices)
@@ -152,6 +179,9 @@ class _DPOverlay:
 
     def _on_indices(self, indices):
         self._last_iyix = _indices_to_iyix(indices)
+        log.debug("[overlay:%s] nav move -> (%s,%s) engine=%s hidden=%s",
+                  self.name, self._last_iyix[0], self._last_iyix[1],
+                  self._engine is not None, self._hidden)
         if self._engine is not None and not self._hidden:
             self._engine.request(*self._last_iyix)
 
@@ -330,15 +360,17 @@ class FindVectorsPreviewOverlay(_DPOverlay):
     is sliced and ``.compute()``-ed for lazy data — never the full dataset.
     """
 
-    # Per-frame peak finding does a blocking .compute() on a small nav window —
-    # run it OFF the navigator thread so it never holds the serialised update
-    # lock (which would gate the diffraction image at the peak-find rate).
+    # Everything (peaks AND the transform image) is computed off the navigator
+    # thread via the shared LiveOverlayEngine and rendered when ready, with the
+    # in-flight compute cancelled when a newer position/param arrives — the SAME
+    # greedy future-cancel / latest-wins pipeline the navigator image uses. No
+    # bespoke threads, no synchronous recompute in set_params.
     _overlay_mode = "thread"
 
     def __init__(self, dp_plot, signal, *, sigma=1.0, kernel_radius=5,
                  threshold=0.5, min_distance=5, subpixel=True,
                  method="nxcorr", dog_sigma1=0.8, dog_sigma2=2.0,
-                 beamstop_mask=None,
+                 beamstop_mask=None, show_transform=False,
                  color="#ff3030", name="fv_preview"):
         self.dp_plot = dp_plot
         self.signal = signal
@@ -351,16 +383,35 @@ class FindVectorsPreviewOverlay(_DPOverlay):
         self.dog_sigma1 = float(dog_sigma1)
         self.dog_sigma2 = float(dog_sigma2)
         self.beamstop_mask = beamstop_mask
+        # When True the dp plot shows the detector's TRANSFORMED image (DoG
+        # band-pass / NXCORR correlation) instead of the raw pattern, so the
+        # user sees what the peak finder sees. _raw_levels saves the plot's
+        # contrast so it can be restored when toggled off.
+        self.show_transform = bool(show_transform)
+        self._raw_levels = None
         self.name = name
         self._color = color
         self._radius_px = max(1, int(kernel_radius))
         self._mg = None
         self._selectors = []
         self._lock = threading.Lock()
+        # beam-stop auto-detect runs async (see _request_beamstop)
+        self._beamstop_wanted = beamstop_mask is not None
+        self._beamstop_scanning = False
+        self.beamstop_dilate = 5
 
-    # The peak radius tracks the (live-tunable) kernel radius on every push.
+    def _marker_radius(self) -> float:
+        """Circle radius for the markers, in pixels. For NXCORR it's the disk
+        kernel radius. For DoG the natural spot scale is the σ₁ band-pass: a
+        Gaussian of width σ has a blob radius ≈ √2·σ (where the LoG/DoG response
+        peaks), so draw circles of ~√2·σ₁ to outline the detected spot size."""
+        if self.method == "dog":
+            return max(1.0, float(np.sqrt(2.0) * self.dog_sigma1))
+        return float(self.kernel_radius)
+
+    # The peak radius tracks the (live-tunable) detector scale on every push.
     def _marker_kwargs(self, offsets) -> dict:
-        return {"offsets": offsets, "radius": float(self.kernel_radius)}
+        return {"offsets": offsets, "radius": self._marker_radius()}
 
     def set_params(self, **p) -> None:
         """Live-update the tuning sliders and redraw at the current crosshair."""
@@ -380,14 +431,110 @@ class FindVectorsPreviewOverlay(_DPOverlay):
             self.dog_sigma1 = float(p["dog_sigma1"])
         if p.get("dog_sigma2") is not None:
             self.dog_sigma2 = float(p["dog_sigma2"])
-        # Redraw at the current crosshair SYNCHRONOUSLY: a slider tweak is a
-        # deliberate, one-off action that wants instant feedback, and it isn't
-        # the perf-critical path (that's the navigator drag, which stays async
-        # via the engine). Going through the single-flight engine worker here
-        # would queue the redraw behind in-flight navigation computes on a busy
-        # cluster, so a param change can appear not to update.
-        iy, ix = self._last_iyix
-        self._push(self._offsets_for(iy, ix))
+        if p.get("beamstop_dilate") is not None:
+            new_dil = max(0, int(p["beamstop_dilate"]))
+            if new_dil != getattr(self, "beamstop_dilate", 5):
+                self.beamstop_dilate = new_dil
+                # dilation is a cheap maximum_filter on the CACHED raw mask — the
+                # static stop is NOT re-detected. Only re-dilate if it's on.
+                if getattr(self, "_beamstop_wanted", False):
+                    self._apply_dilation()
+        if "beamstop_auto" in p and p["beamstop_auto"] is not None:
+            want = bool(p["beamstop_auto"])
+            self._beamstop_wanted = want
+            if want:
+                # non-blocking: kicks off the ~400-frame scan on a bg thread the
+                # first time and applies + re-renders when it lands. Must NOT
+                # block set_params (it runs on the live-tune path).
+                self._request_beamstop()
+            else:
+                self.beamstop_mask = None
+                self._push_mask_overlay()           # clears the overlay
+        if "show_transform" in p and p["show_transform"] is not None:
+            new_show = bool(p["show_transform"])
+            if new_show != self.show_transform:
+                # enter/leave transform view: the lock suppresses the navigator's
+                # raw-frame paint so the overlay owns the image while on.
+                log.debug("[fv-preview] transform view %s -> %s (lock %s)",
+                          self.show_transform, new_show,
+                          "ON" if new_show else "OFF")
+                if hasattr(self.dp_plot, "set_transform_active"):
+                    self.dp_plot.set_transform_active(new_show)
+                if not new_show:
+                    self._restore_raw_frame()  # toggled OFF → put the raw DP back
+            self.show_transform = new_show
+        log.debug("[fv-preview] set_params method=%s thr=%.3g md=%d sig=%.2g "
+                  "dog=(%.2g,%.2g) beamstop=%s show_transform=%s keys=%s",
+                  self.method, self.threshold, self.min_distance, self.sigma,
+                  self.dog_sigma1, self.dog_sigma2,
+                  "yes" if self.beamstop_mask is not None else "no",
+                  self.show_transform, sorted(p.keys()))
+        # A param change is just another reason to recompute the current frame —
+        # route it through the SAME engine (latest-wins, cancellable) as a
+        # navigator move. No synchronous recompute, no extra thread.
+        if self._engine is not None:
+            self._engine.request(*self._last_iyix)
+
+    def _apply_dilation(self) -> None:
+        """Dilate the cached UNDILATED beam-stop mask to the current radius — a
+        cheap maximum_filter, NO re-scan. The detection (reading frames) ran once;
+        the static stop never needs re-detecting just to change the dilation."""
+        raw = getattr(self, "_beamstop_raw", None)
+        if raw is None:
+            self.beamstop_mask = None
+            self._push_mask_overlay()
+            return
+        from spyde.actions.find_vectors import _dilate_mask
+        r = int(getattr(self, "beamstop_dilate", 5))
+        self.beamstop_mask = _dilate_mask(raw, r) if r > 0 else raw
+        self._push_mask_overlay()
+
+    def _push_mask_overlay(self) -> None:
+        """Show the current beam-stop mask as a translucent overlay on the DP
+        plot (client-side composite in the anyplotlib iframe — no recompute).
+        Cleared when the mask is None or the beam stop is toggled off."""
+        dp = getattr(self, "dp_plot", None)
+        if dp is None or not hasattr(dp, "set_overlay_mask"):
+            return
+        mask = self.beamstop_mask if getattr(self, "_beamstop_wanted", False) else None
+        try:
+            dp.set_overlay_mask(mask, color="#ff8a3d", alpha=0.35)
+        except Exception as e:
+            log.debug("[fv-preview] push mask overlay failed: %s", e)
+
+    def _request_beamstop(self) -> None:
+        """Detect the beam stop ONCE (cached), then dilate cheaply on demand.
+
+        The slow part is reading frames off the (multi-GB lazy) dataset — done a
+        SINGLE time on a bg thread and cached as the UNDILATED mask. Changing the
+        dilation radius just re-runs a maximum_filter on the cache (instant), it
+        does NOT re-scan. Must not block set_params (runs on the live-tune path)."""
+        if hasattr(self, "_beamstop_raw"):
+            self._apply_dilation()                  # cached → just (re)dilate
+            return
+        if getattr(self, "_beamstop_scanning", False):
+            return                                  # a scan is already in flight
+        self._beamstop_scanning = True
+
+        def _scan():
+            try:
+                from spyde.actions.find_vectors import _auto_beamstop_from_signal
+                nav_dim = self.signal.axes_manager.navigation_dimension
+                # dilate=0 → the raw (undilated) stop mask; we dilate locally.
+                raw = _auto_beamstop_from_signal(self.signal, nav_dim, dilate=0)
+            except Exception as e:
+                logger.debug("preview beam-stop detection failed: %s", e)
+                raw = None
+            self._beamstop_raw = raw                # may be None (no stop found)
+            self._beamstop_scanning = False
+            log.debug("[fv-preview] beam-stop scan done: raw=%s",
+                      "none" if raw is None else f"{int(raw.sum())}px")
+            if getattr(self, "_beamstop_wanted", False):
+                self._apply_dilation()
+                if self._engine is not None:
+                    self._engine.request(*self._last_iyix)
+
+        threading.Thread(target=_scan, daemon=True, name="fv-beamstop").start()
 
     # ── geometry ──────────────────────────────────────────────────────────────
     def _blurred_frame(self, iy, ix) -> np.ndarray:
@@ -400,8 +547,21 @@ class FindVectorsPreviewOverlay(_DPOverlay):
         y0, y1 = max(0, iy - r), min(ny, iy + r + 1)
         x0, x1 = max(0, ix - r), min(nx, ix + r + 1)
         block = data[y0:y1, x0:x1]
-        if hasattr(block, "compute"):          # lazy: only this small window
-            block = block.compute()
+        if hasattr(block, "compute"):
+            # Compute this tiny window on the LOCAL threaded scheduler, NOT the
+            # distributed cluster. The navigator drives the same lazy signal's
+            # CachedDaskArray and aggressively cancels surrounding-block futures
+            # (cancel_surrounding); a distributed preview slice shares those
+            # block futures, so a navigator move cancels the preview's chunk
+            # mid-read → "get_inds … cancelled for reason: lost dependencies"
+            # and the preview stops updating. The local scheduler reads the slice
+            # independently and is unaffected by the navigator's cancels.
+            try:
+                block = block.compute(scheduler="threads")
+            except Exception:
+                # Fall back to whatever default the array carries (e.g. already
+                # in-RAM numpy via a Future-backed slice) rather than failing.
+                block = np.asarray(block.compute())
         block = np.asarray(block, dtype=np.float32)
         if r > 0 and self.sigma > 0:
             from scipy.ndimage import gaussian_filter
@@ -409,7 +569,47 @@ class FindVectorsPreviewOverlay(_DPOverlay):
             block = gaussian_filter(block, sigma=sig_tuple)
         return block[iy - y0, ix - x0]
 
-    def _offsets_for(self, iy, ix) -> np.ndarray:
+    def remove(self):
+        # leaving the preview must release the transform lock so the navigator
+        # can paint raw frames again.
+        if hasattr(self.dp_plot, "set_transform_active"):
+            try:
+                self.dp_plot.set_transform_active(False)
+            except Exception as e:
+                log.debug("releasing transform lock on remove failed: %s", e)
+        # clear the beam-stop overlay so it doesn't linger after the wizard closes
+        if hasattr(self.dp_plot, "set_overlay_mask"):
+            try:
+                self.dp_plot.set_overlay_mask(None)
+            except Exception as e:
+                log.debug("clearing mask overlay on remove failed: %s", e)
+        super().remove()
+
+    def _restore_raw_frame(self) -> None:
+        """Re-display the raw diffraction pattern after the transform toggle is
+        turned off — re-slice the current crosshair frame and push it back via
+        the PLOT (sets current_data so it persists)."""
+        if not hasattr(self.dp_plot, "set_data"):
+            return
+        try:
+            iy, ix = self._last_iyix
+            frame = self._blurred_frame(iy, ix)
+            finite = frame[np.isfinite(frame)]
+            levels = ((float(finite.min()), float(finite.max()))
+                      if finite.size else None)
+            self.dp_plot.needs_auto_level = True
+            self.dp_plot.set_data(np.asarray(frame, dtype=np.float32), levels=levels)
+            log.debug("[fv-preview] restored RAW frame nav=(%s,%s) %s",
+                      iy, ix, _stats(frame))
+        except Exception as e:
+            log.debug("restoring raw frame after transform toggle failed: %s", e)
+
+    # ── one compute → one payload → one render, all via the engine ─────────────
+    def _offsets_for(self, iy, ix):
+        """The engine's compute. Returns a payload dict {offsets, response} so a
+        SINGLE cancellable compute produces both the peak markers AND (when
+        requested) the transformed image. No side-effects on the plot here —
+        rendering happens in _render_payload (which may run on a worker thread)."""
         from spyde.actions.find_vectors import _find_peaks_single_frame
         try:
             frame = self._blurred_frame(iy, ix)
@@ -419,15 +619,79 @@ class FindVectorsPreviewOverlay(_DPOverlay):
                 subpixel=self.subpixel, dog_sigma1=self.dog_sigma1,
                 dog_sigma2=self.dog_sigma2,
             )
-            with self._lock:
+            if self.show_transform:
+                peaks, response = _find_peaks_single_frame(
+                    frame, params, beamstop_mask=self.beamstop_mask,
+                    with_response=True)
+            else:
                 peaks = _find_peaks_single_frame(
                     frame, params, beamstop_mask=self.beamstop_mask)
-        except Exception:
-            return np.zeros((0, 2), dtype=np.float32)
+                response = None
+        except Exception as e:
+            log.debug("[fv-preview] compute FAILED nav=(%s,%s): %r", iy, ix, e)
+            return {"offsets": np.zeros((0, 2), np.float32), "response": None}
+
         if peaks is None or len(peaks) == 0:
-            return np.zeros((0, 2), dtype=np.float32)
-        # peaks = [ky_row, kx_col, value] in PIXELS → markers (x=col=kx, y=row=ky).
-        return np.column_stack([peaks[:, 1], peaks[:, 0]]).astype(np.float32)
+            offsets = np.zeros((0, 2), np.float32)
+        else:
+            # peaks=[ky_row, kx_col, val] px → markers (x=col=kx, y=row=ky).
+            offsets = np.column_stack([peaks[:, 1], peaks[:, 0]]).astype(np.float32)
+        log.debug("[fv-preview] compute nav=(%s,%s) method=%s npeaks=%d frame[%s] "
+                  "beamstop=%s show_transform=%s response=%s",
+                  iy, ix, self.method, len(offsets), _stats(frame),
+                  "yes" if self.beamstop_mask is not None else "no",
+                  self.show_transform, "yes" if response is not None else "no")
+        return {"offsets": offsets, "response": response}
+
+    def _render_payload(self, payload) -> None:
+        """Render the compute payload: the transformed image (if any) THEN the
+        markers on top. Runs latest-wins via the engine; safe on a worker thread
+        (set_data / marker push are GIL-protected)."""
+        if self._hidden or not isinstance(payload, dict):
+            log.debug("[fv-preview] render SKIPPED (hidden=%s dict=%s)",
+                      self._hidden, isinstance(payload, dict))
+            return
+        response = payload.get("response")
+        offsets = payload.get("offsets", np.zeros((0, 2), np.float32))
+        if (self.show_transform and response is not None
+                and hasattr(self.dp_plot, "set_transform_image")):
+            try:
+                r = np.asarray(response, dtype=np.float32)
+                finite = r[np.isfinite(r)]
+                # Contrast window: floor = the detector threshold, ceiling = the
+                # response's robust max — the two are INDEPENDENT. The earlier bug
+                # tied the ceiling to the threshold (hi = threshold + 1 when the
+                # 99.5%ile fell below threshold), so nudging the threshold blew the
+                # window open and washed the image to white (the reported flash).
+                # For NXCORR the response is in [-1, 1] so a FIXED ceiling of 1.0
+                # is the stablest choice (never moves frame-to-frame); for DoG SNR
+                # use the 99th-percentile max (no fixed scale). The floor is the
+                # threshold, clamped just under the ceiling.
+                if self.method == "dog":
+                    hi = float(np.percentile(finite, 99.0)) if finite.size else 1.0
+                else:
+                    hi = 1.0                       # NXCORR score ceiling, fixed
+                lo = float(self.threshold)
+                if lo >= hi:
+                    lo = hi - 1e-3                 # keep a non-degenerate window
+                self.dp_plot.needs_auto_level = False
+                self.dp_plot.set_transform_image(r, levels=(lo, hi))
+                if hasattr(self.dp_plot, "_emit_histogram"):
+                    self.dp_plot._emit_histogram(r, lo, hi, threshold=float(self.threshold))
+                log.debug("[fv-preview] render TRANSFORM %s clim=(%.3g,%.3g) "
+                          "threshold=%.3g + %d markers", _stats(r), lo, hi,
+                          float(self.threshold), len(offsets))
+            except Exception as e:
+                log.debug("[fv-preview] render transform failed: %s", e)
+        else:
+            log.debug("[fv-preview] render MARKERS-only n=%d (show_transform=%s "
+                      "response=%s)", len(offsets), self.show_transform,
+                      response is not None)
+        # Re-assert the beam-stop overlay AFTER the image paint: the image dims
+        # are now set, and set_data does not clear the mask so this is just a
+        # cheap state re-push (idempotent if the mask is unchanged).
+        self._push_mask_overlay()
+        self._push(offsets)
 
 
 class VectorOrientationOverlay(_DPOverlay):
@@ -605,12 +869,17 @@ def attach_find_vectors_preview(dp_plot, signal, tree, *, sigma=1.0,
                                 kernel_radius=5, threshold=0.5, min_distance=5,
                                 subpixel=True, method="nxcorr", dog_sigma1=0.8,
                                 dog_sigma2=2.0, beamstop_mask=None,
+                                beamstop_auto=False, show_transform=False,
                                 color="#ff3030") -> FindVectorsPreviewOverlay:
     """Add a live found-peaks preview overlay to ``dp_plot``, wired to the
     navigator selectors of ``tree``. Returns the :class:`FindVectorsPreviewOverlay`."""
-    return FindVectorsPreviewOverlay(
+    ov = FindVectorsPreviewOverlay(
         dp_plot, signal, sigma=sigma, kernel_radius=kernel_radius,
         threshold=threshold, min_distance=min_distance, subpixel=subpixel,
         method=method, dog_sigma1=dog_sigma1, dog_sigma2=dog_sigma2,
-        beamstop_mask=beamstop_mask, color=color,
+        beamstop_mask=beamstop_mask, show_transform=show_transform, color=color,
     ).attach(tree)
+    if beamstop_auto:
+        ov._beamstop_wanted = True
+        ov._request_beamstop()        # async; applies + re-renders when ready
+    return ov

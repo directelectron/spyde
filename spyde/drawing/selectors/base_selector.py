@@ -102,15 +102,27 @@ class BaseSelector:
 
         # Debounce: timer replaced by threading.Timer
         self._pending_timer: threading.Timer | None = None
-        # Serialise the update path. The throttle fires from overlapping
-        # threading.Timer threads, and forced refreshes arrive from other
-        # threads too; without this, concurrent delayed_update_data calls race
-        # the per-child future cancel/submit (update_from_navigation_selection)
-        # and current_data, so the image future is cancelled/superseded while
-        # the synchronous overlay still paints — the navigator "freezes on the
-        # previous frame" while peak preview keeps updating. One nav update in
-        # flight at a time, latest position wins. See test_navigator_race.
-        self._update_lock = threading.RLock()
+        # Latest-position-wins, future-cancel model (NOT a long lock).
+        #
+        # A previous version held an RLock across the WHOLE update body — but the
+        # body calls the per-child update fn, which can block for 100s of ms on a
+        # compute. With two signals / selectors live at once that lock stays held
+        # across the slow compute and STALLS every other update: the navigator
+        # flashes but the image won't track the crosshair (the lock isn't free).
+        #
+        # Instead we follow the greedy future-cancel workflow the distributed
+        # path was built for: each fire bumps a generation counter; the update
+        # body runs UNLOCKED so a newer fire starts immediately and (via
+        # update_from_navigation_selection) cancels the in-flight future and
+        # submits its own. A body only commits its result (current_indices +
+        # index hooks) if it is still the latest generation — a superseded body
+        # drops its now-stale work. The short per-signal cache lock
+        # (_cache_lock_ctx) still serialises just the cancel+submit critical
+        # section, and the "plot.current_data is future" guard drops stale
+        # frames. See test_navigator_race.
+        self._gen_lock = threading.Lock()
+        self._update_gen = 0
+        self._fn_gen = 0          # generation of the body currently in fn()
         self.update_function = update_function
         self._last_size_sig = None
 
@@ -233,39 +245,74 @@ class BaseSelector:
         self._pending_timer = None
         self.delayed_update_data()
 
+    def is_stale_body(self) -> bool:
+        """True when the update body currently running ``fn`` has been superseded
+        by a newer navigator position. Used by the cache critical section to skip
+        cancelling/submitting on behalf of a stale position (which would cancel
+        the latest position's in-flight chunk future)."""
+        return self._fn_gen != self._update_gen
+
     def delayed_update_data(self, force: bool = False, update_contrast: bool = False) -> None:
         """Perform the actual data update if indices changed.
 
-        Serialised via ``_update_lock`` so overlapping throttle fires / forced
-        refreshes can't race the per-child future cancel/submit — one navigator
-        update runs at a time, and the latest position wins (a queued fire
-        re-reads the current widget position and the changed-indices guard skips
-        it if nothing moved)."""
+        Latest-position-wins (no long lock): bump a generation counter, run the
+        per-child update fn UNLOCKED (so a newer fire can start and supersede
+        this one through the future-cancel path), and only commit the result if
+        this body is still the latest generation. The per-signal cache lock
+        inside the update fn serialises the short cancel+submit section; this
+        method never blocks a concurrent selector across a slow compute."""
         self._pending_timer = None
-        with self._update_lock:
-            try:
-                indices = self.get_selected_indices()
-            except Exception:
+        try:
+            indices = self.get_selected_indices()
+        except Exception:
+            return
+
+        # Reserve this update's generation. A staleness check against it after
+        # the (slow, unlocked) child compute lets a newer fire win.
+        with self._gen_lock:
+            if np.array_equal(indices, self.current_indices) and not force:
                 return
-            if not np.array_equal(indices, self.current_indices) or force:
-                for child, fn in self.children.items():
-                    try:
-                        new_data = fn(self, child, indices)
-                        child.update_data(new_data)
-                        if update_contrast:
-                            child.needs_auto_level = True
-                        if (child.multiplot_manager is not None
-                                and child.plot_window in child.multiplot_manager.navigation_selectors):
-                            for child_sel in child.multiplot_manager.navigation_selectors[child.plot_window]:
-                                child_sel.delayed_update_data()
-                    except Exception as e:
-                        logger.debug("selector update failed: %s", e)
-                for hook in self.index_hooks:
-                    try:
-                        hook(indices)
-                    except Exception as e:
-                        logger.debug("index hook failed: %s", e)
-                self.current_indices = indices
+            self._update_gen += 1
+            my_gen = self._update_gen
+
+        for child, fn in self.children.items():
+            # A newer fire started while we were working — its future-cancel has
+            # already superseded ours; drop this stale body.
+            if my_gen != self._update_gen:
+                return
+            # Let the child fn (update_from_navigation_selection) re-check, INSIDE
+            # its cache lock, that we are still the latest before it cancels
+            # surrounding blocks + submits — otherwise a stale body's
+            # cancel_surrounding() races and kills the LATEST position's future
+            # ("get_inds cancelled: lost dependencies"). See test_navigator_race.
+            self._fn_gen = my_gen
+            try:
+                new_data = fn(self, child, indices)
+                # None == the body detected it was superseded inside fn and
+                # skipped the cache touch; do NOT clobber current_data (that would
+                # drop the latest future's pending result).
+                if new_data is None:
+                    return
+                child.update_data(new_data)
+                if update_contrast:
+                    child.needs_auto_level = True
+                if (child.multiplot_manager is not None
+                        and child.plot_window in child.multiplot_manager.navigation_selectors):
+                    for child_sel in child.multiplot_manager.navigation_selectors[child.plot_window]:
+                        child_sel.delayed_update_data()
+            except Exception as e:
+                logger.debug("selector update failed: %s", e)
+
+        # Commit only if still latest — otherwise the newer fire owns the state.
+        with self._gen_lock:
+            if my_gen != self._update_gen:
+                return
+            for hook in self.index_hooks:
+                try:
+                    hook(indices)
+                except Exception as e:
+                    logger.debug("index hook failed: %s", e)
+            self.current_indices = indices
 
     # ── Visibility ─────────────────────────────────────────────────────────────
 

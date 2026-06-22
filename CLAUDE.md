@@ -141,6 +141,88 @@ The 5D path slices by time index first (`raw[t, ...]`), producing a 4D chunk —
 - Dask client startup is asynchronous. `MainWindow` uses a `wait loop + QApplication.processEvents()` before submitting compute work, not a blocking join.
 - Navigator drag cancels stale futures before submitting new ones (frees workers immediately rather than queuing).
 
+## Live-Display Core Patterns (DO NOT "CLEAN UP" — they look hacky but every alternative tried is worse)
+
+These three patterns are load-bearing for interactive performance. They look like
+poor design and invite refactoring into something "proper" (a queue, a lock, a
+rechunk, a direct return). **Every such attempt has made the app much worse**
+(frozen navigators, stalled updates, multi-GB shuffles). Touch them only with a
+benchmark on a real multi-GB scan and a specific reproduced bug — never on
+aesthetic grounds.
+
+### 1. Storage-aligned chunking — span the FULL signal dimension; never rechunk live
+
+A 4D/5D-STEM dataset must be chunked so **each chunk holds whole signal frames**:
+`(small_nav, small_nav, full_ky, full_kx)` (e.g. `(32, 32, 256, 256)`). The
+navigator displays one diffraction pattern via `data[iy, ix]`, so a chunk that
+**splits the signal axes** (RosettaSciIO's default auto-chunk is a balanced cube
+like `(90,90,90,90)`) forces reading a 131 MB chunk spanning 90×90 nav positions
+and *partial* frames to show one pattern — and the navigator sum is wrong/seamed
+at chunk boundaries (partial-signal sums).
+
+- **Fix at LOAD time**: `hs.load(path, lazy=True, chunks=(32,32,-1,-1))` — a lazy
+  reload only rebuilds the dask graph (~0 s), it does NOT read or move data.
+  `Session._signal_spanning_chunks` computes this and `_load_file_thread` reloads
+  when the reader split the signal axes.
+- **NEVER call `.rechunk()` on the full dataset to fix chunking** — that shuffles
+  the entire multi-GB array through the scheduler. Storage-chunk *alignment* (load
+  with the right chunks) beats any after-the-fact rechunk; see `benchmarks.md`
+  (419 s vs 184 s when a "better" rechunk misaligned the ghost blocks).
+- Batch computes (`_do_compute_vectors`, orientation) keep the stored chunking
+  when it's already usable rather than rechunking to a theoretical optimum.
+
+### 2. Navigator updates = greedy future-cancel, latest-position-wins — NOT a lock
+
+The navigator→signal update path must be **non-blocking**. On each selector move
+it submits a Dask future and **cancels the stale in-flight one**; the latest
+position wins. The plot applies only the result of its current future
+(`plot.current_data is future` staleness guard).
+
+- **Do NOT serialise this with a lock held across the compute.** A previous
+  `BaseSelector._update_lock` (RLock around the whole update body) held across the
+  per-child compute and STALLED live tracking the moment two signals/selectors
+  were active — the navigator flashed but wouldn't follow the crosshair. It was
+  replaced with a generation counter (`_gen_lock` short, `_update_gen`): the body
+  runs unlocked so a newer fire supersedes the in-flight one via the future-cancel;
+  a body commits `current_indices`/hooks only if still the latest generation.
+- The ONLY lock here is the short per-signal `_cache_lock_ctx`
+  (`update_functions.py`) guarding the `CachedDaskArray` cancel+submit critical
+  section (its block bookkeeping has no internal lock). That's a few µs, not a
+  compute. Keep it; don't widen it.
+- **A STALE body must not touch the cache.** Because bodies run concurrently
+  (latest-wins), a superseded body that reaches the cache lock would run
+  `cancel_surrounding()` and cancel the **latest** position's in-flight chunk
+  future → a storm of `get_inds … cancelled: lost dependencies` and the final
+  crosshair frame never paints. So `update_from_navigation_selection` re-checks
+  `selector.is_stale_body()` INSIDE the cache lock and returns `None` (skip, no
+  cancel, no submit) if superseded; `delayed_update_data` treats a `None` return
+  as "skip" and does NOT clobber `current_data`. `_fn_gen`/`is_stale_body` carry
+  the running body's generation. Test: `test_stale_body_skips_cache_cancel`.
+- A **cancelled** future is `done()` but its work never ran — never read its
+  result/buffer (the worker skips `fut.cancelled()`; `read_shared_array` rejects an
+  empty/torn buffer; `_on_plot_ready` drops stale results silently). This is
+  expected churn under latest-wins, not an error.
+- Tests pin the contract: `test_navigator_race.py` (slow update must not block a
+  newer one; stale result must not clobber), `test_shm_read_robust.py`.
+
+### 3. Fast shared-memory display path — bypass TCP for the navigator image
+
+For the distributed path, a chunk result is written into a per-plot **shared-memory
+buffer** (`write_shared_array` / `read_shared_array`) and the `PlotUpdateWorker`
+reads it locally when the future completes — instead of transferring the array over
+the Dask TCP comm. This is the optimized navigator/VI pipeline ported from the Qt
+app; the reused buffer is race-safe because only the LATEST future's result is
+applied (staleness guard) and stale futures are cancelled first. The progressive
+navigator (`signal_tree._start_progressive_nav_compute` +
+`compute_with_live_buffer`) paints per-chunk into this buffer so a multi-GB
+navigator fills top-to-bottom instead of blanking until the whole sum finishes.
+
+- Don't replace the shm path with `future.result()` over TCP "for simplicity" —
+  it's measurably slower on real scans and was deliberately built this way.
+- Compute navigator display levels from the FULL accumulated finite data
+  (robust 2–98% percentiles), with a final uniform repaint when the fill
+  completes — per-chunk min/max levels make the contrast jump at chunk seams.
+
 ## GPU Computing
 
 The hot paths (vector finding, vector orientation mapping) are GPU-accelerated. The stack present in the dev env: `torch` (+CUDA), `cupy`, `numba.cuda`. Guard every GPU path with an availability check (`torch.cuda.is_available()`) and keep a working CPU fallback — CI and many user machines have no GPU.

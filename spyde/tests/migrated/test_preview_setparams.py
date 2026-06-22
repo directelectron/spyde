@@ -1,6 +1,7 @@
-"""Regression: tuning Find-Vectors params (set_params) must re-render the live
-preview peaks IMMEDIATELY even when the navigator hasn't moved — a slider tweak
-is synchronous (instant feedback), while the navigator drag stays async.
+"""Regression: tuning Find-Vectors params (set_params) re-renders the live
+preview peaks even when the navigator hasn't moved. A slider tweak is just
+another reason to recompute the current frame, routed through the SAME async
+latest-wins engine as a navigator move (no bespoke synchronous path).
 """
 import time
 
@@ -48,17 +49,24 @@ def _make_overlay():
     return ov
 
 
-def test_set_params_rerenders_peaks_synchronously():
+def _wait_render(ov, n_before, timeout=2.0):
+    t0 = time.time()
+    while time.time() - t0 < timeout and len(ov._mg.offsets) <= n_before:
+        time.sleep(0.01)
+    return len(ov._mg.offsets) > n_before
+
+
+def test_set_params_rerenders_peaks():
     ov = _make_overlay()
     try:
         n_before = len(ov._mg.offsets)
         ov.set_params(min_distance=2)             # close peaks resolved → many
-        assert len(ov._mg.offsets) == n_before + 1, \
-            "set_params did not re-render immediately (synchronously)"
+        assert _wait_render(ov, n_before), "set_params did not re-render"
         n_close = len(ov._mg.offsets[-1])
 
+        n_mid = len(ov._mg.offsets)
         ov.set_params(min_distance=30)            # merge → few
-        assert len(ov._mg.offsets) == n_before + 2
+        assert _wait_render(ov, n_mid)
         n_far = len(ov._mg.offsets[-1])
 
         assert n_close > 0

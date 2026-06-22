@@ -185,11 +185,33 @@ class BaseSignalTree:
                         acc[nav_slices] = block
                         finite = acc[np.isfinite(acc)]
                         if finite.size:
-                            lo, hi = float(finite.min()), float(finite.max())
-                            levels[0] = (lo, hi if hi > lo else lo + 1)
+                            # Robust percentile levels (2–98%), computed over ALL
+                            # painted-so-far data — NOT raw min/max, which a single
+                            # bright outlier in one chunk yanks around so the
+                            # contrast (and apparent chunk-boundary brightness)
+                            # jumps as each chunk lands. Percentiles keep the
+                            # stretch stable across the progressive fill.
+                            lo, hi = np.percentile(finite, (2.0, 98.0))
+                            levels[0] = (float(lo), float(hi) if hi > lo else float(lo) + 1)
                         if _stop.is_set():
                             return
                         _plot.set_data(acc.copy(), levels=levels[0])
+                    # Final uniform repaint: now that every chunk is in, set the
+                    # definitive levels over the whole image so no transient
+                    # per-chunk stretch remains visible at a boundary, and emit a
+                    # histogram so the navigator gets a Plot-Control histogram /
+                    # contrast handles (set_data with explicit levels otherwise
+                    # skips _emit_histogram, leaving the navigator histogram-less).
+                    if not _stop.is_set():
+                        finite = acc[np.isfinite(acc)]
+                        if finite.size:
+                            lo, hi = np.percentile(finite, (2.0, 98.0))
+                            lvl = (float(lo), float(hi) if hi > lo else float(lo) + 1)
+                            _plot.set_data(acc.copy(), levels=lvl)
+                            try:
+                                _plot._emit_histogram(acc, lvl[0], lvl[1])
+                            except Exception as e:
+                                logger.debug("navigator histogram emit failed: %s", e)
                     if _sig:
                         _sig[0].data = acc
                 except Exception:

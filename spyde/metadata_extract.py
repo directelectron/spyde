@@ -11,6 +11,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+import numpy as np
+
 from spyde import METADATA_WIDGET_CONFIG
 
 log = logging.getLogger(__name__)
@@ -92,10 +94,26 @@ def build_metadata_dict(signal_tree: "BaseSignalTree") -> dict[str, dict[str, st
         nav = " × ".join(str(int(s)) for s in am.navigation_shape) or "—"
         sg = " × ".join(str(int(s)) for s in am.signal_shape) or "—"
         shape = f"nav {nav} · sig {sg}" if nav != "—" else f"sig {sg}"
-        subsections["Dataset"] = {
+        data = getattr(sig, "data", None)
+        ds = {
             "Shape": shape,
-            "Dtype": str(getattr(getattr(sig, "data", None), "dtype", "—")),
+            "Dtype": str(getattr(data, "dtype", "—")),
         }
+        # Chunking — only meaningful for lazy (dask) data. Show the per-chunk
+        # block size + size in MB so an oversized / signal-split chunking (the
+        # navigator-killing default on some MRC readers) is visible at a glance.
+        chunksize = getattr(data, "chunksize", None)
+        if chunksize is not None:
+            try:
+                itemsize = data.dtype.itemsize
+                mb = float(np.prod(chunksize)) * itemsize / 1e6
+                ds["Chunks"] = " × ".join(str(int(c)) for c in chunksize) + f"  ({mb:.0f} MB)"
+                ds["Lazy"] = "yes"
+            except Exception as e:
+                log.debug("formatting chunk info failed: %s", e)
+        else:
+            ds["Lazy"] = "no"
+        subsections["Dataset"] = ds
     except Exception as e:
         log.debug("building Dataset metadata subsection failed: %s", e)
     return subsections

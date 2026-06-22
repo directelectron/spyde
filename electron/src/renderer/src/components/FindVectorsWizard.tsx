@@ -41,18 +41,22 @@ export function FindVectorsWizard({ openUp, windowId, sendAction, onClose }: Pro
   const [minDist, setMinDist] = React.useState(5)
   const [subpixel, setSubpixel] = React.useState(true)
   const [beamstop, setBeamstop] = React.useState(false)
+  const [beamstopDilate, setBeamstopDilate] = React.useState(5)
+  const [showTransform, setShowTransform] = React.useState(false)
   const [status, setStatus] = React.useState('Tune the parameters — peaks preview under the crosshair.')
 
   const tuneTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null)
   // Live refs so the debounced tune always sends the latest of EVERY control.
-  const vals = React.useRef({ method, sigma, radius, sigma1, sigma2, threshold, minDist, subpixel, beamstop })
-  vals.current = { method, sigma, radius, sigma1, sigma2, threshold, minDist, subpixel, beamstop }
+  const vals = React.useRef({ method, sigma, radius, sigma1, sigma2, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform })
+  vals.current = { method, sigma, radius, sigma1, sigma2, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform }
   const params = () => ({
     method: vals.current.method,
     sigma: vals.current.sigma, kernel_radius: vals.current.radius,
     dog_sigma1: vals.current.sigma1, dog_sigma2: vals.current.sigma2,
     threshold: vals.current.threshold, min_distance: vals.current.minDist,
     subpixel: vals.current.subpixel, beamstop_auto: vals.current.beamstop,
+    beamstop_dilate: vals.current.beamstopDilate,
+    show_transform: vals.current.showTransform,
   })
 
   // Start the live preview when the caret opens; tear it down when it closes.
@@ -106,45 +110,73 @@ export function FindVectorsWizard({ openUp, windowId, sendAction, onClose }: Pro
 
   return (
     <WizardShell testid="find-vectors-wizard" title="Find Diffraction Vectors" openUp={openUp}
-      onClose={onClose} closeTestid="fv-close" status={status} statusTestid="fv-status">
+      onClose={onClose} closeTestid="fv-close" status={status} statusTestid="fv-status"
+      width={320}>
       <div style={S.hint}>Move the crosshair on the navigator to preview the found peaks.</div>
       <Field label="Method">
         <Select testid="fv-method" value={method} options={METHODS} onChange={onMethod} />
       </Field>
-      <Field label="Nav Blur σ">
-        <Slider testid="fv-sigma" value={sigma} min={0} max={5} step={0.1}
-          onChange={live(setSigma)} fmt={(n) => n.toFixed(1)} />
-      </Field>
-      {!isDog && (
-        <Field label="Disk Radius">
-          <Slider testid="fv-radius" value={radius} min={1} max={30} step={1} onChange={live(setRadius)} />
-        </Field>
-      )}
-      {isDog && (
-        <>
-          <Field label="DoG σ₁ (spot)">
-            <Slider testid="fv-dog-sigma1" value={sigma1} min={0.4} max={3} step={0.1}
-              onChange={live(setSigma1)} fmt={(n) => n.toFixed(1)} />
-          </Field>
-          <Field label="DoG σ₂ (bg)">
-            <Slider testid="fv-dog-sigma2" value={sigma2} min={1} max={6} step={0.1}
-              onChange={live(setSigma2)} fmt={(n) => n.toFixed(1)} />
-          </Field>
-        </>
-      )}
-      <Field label={isDog ? 'Threshold (SNR)' : 'Threshold'}>
-        <Slider testid="fv-threshold" value={threshold}
-          min={0} max={isDog ? 30 : 1} step={isDog ? 0.5 : 0.05}
-          onChange={live(setThreshold)} fmt={(n) => (isDog ? n.toFixed(1) : n.toFixed(2))} />
-      </Field>
-      <Field label="Min Distance">
-        <Slider testid="fv-mindist" value={minDist} min={1} max={30} step={1} onChange={live(setMinDist)} />
-      </Field>
-      <Check testid="fv-beamstop" checked={beamstop} onChange={live(setBeamstop)}
-        label="Mask beam stop (auto)" />
-      <Check testid="fv-subpixel" checked={subpixel} onChange={live(setSubpixel)}
-        label="Subpixel refinement" />
+      <div style={gridStyle}>
+        <Cell label="Nav Blur σ">
+          <Slider testid="fv-sigma" value={sigma} min={0} max={5} step={0.1}
+            onChange={live(setSigma)} fmt={(n) => n.toFixed(1)} />
+        </Cell>
+        {!isDog && (
+          <Cell label="Disk Radius">
+            <Slider testid="fv-radius" value={radius} min={1} max={30} step={1} onChange={live(setRadius)} />
+          </Cell>
+        )}
+        {isDog && (
+          <>
+            <Cell label="DoG σ₁ (spot)">
+              <Slider testid="fv-dog-sigma1" value={sigma1} min={0.4} max={3} step={0.1}
+                onChange={live(setSigma1)} fmt={(n) => n.toFixed(1)} />
+            </Cell>
+            <Cell label="DoG σ₂ (bg)">
+              <Slider testid="fv-dog-sigma2" value={sigma2} min={1} max={6} step={0.1}
+                onChange={live(setSigma2)} fmt={(n) => n.toFixed(1)} />
+            </Cell>
+          </>
+        )}
+        <Cell label={isDog ? 'Threshold (SNR)' : 'Threshold'}>
+          <Slider testid="fv-threshold" value={threshold}
+            min={0} max={isDog ? 30 : 1} step={isDog ? 0.5 : 0.05}
+            onChange={live(setThreshold)} fmt={(n) => (isDog ? n.toFixed(1) : n.toFixed(2))} />
+        </Cell>
+        <Cell label="Min Distance">
+          <Slider testid="fv-mindist" value={minDist} min={1} max={30} step={1} onChange={live(setMinDist)} />
+        </Cell>
+        {beamstop && (
+          <Cell label="Beam-stop dilate">
+            <Slider testid="fv-beamstop-dilate" value={beamstopDilate} min={0} max={20} step={1}
+              onChange={live(setBeamstopDilate)} />
+          </Cell>
+        )}
+      </div>
+      <div style={gridStyle}>
+        <Check testid="fv-beamstop" checked={beamstop} onChange={live(setBeamstop)}
+          label="Mask beam stop" />
+        <Check testid="fv-show-transform" checked={showTransform} onChange={live(setShowTransform)}
+          label={isDog ? 'Show DoG' : 'Show corr.'} />
+        <Check testid="fv-subpixel" checked={subpixel} onChange={live(setSubpixel)}
+          label="Subpixel" />
+      </div>
       <button data-testid="fv-compute" style={S.primary} onClick={compute}>Compute</button>
     </WizardShell>
   )
+}
+
+const gridStyle: React.CSSProperties = {
+  display: 'grid', gridTemplateColumns: '1fr 1fr', columnGap: 10, rowGap: 6,
+}
+const cellStyle: React.CSSProperties = {
+  display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0,
+}
+
+// A labelled control as a compact stacked cell (label above control) for the
+// two-column grid. MUST be module-scope, NOT defined inside the component —
+// a component defined inline is a new type every render, so React remounts the
+// sliders on each keystroke and they lose their drag ("sliders don't work").
+function Cell({ label, children }: { label: string; children: React.ReactNode }) {
+  return <div style={cellStyle}><label style={S.lbl}>{label}</label>{children}</div>
 }

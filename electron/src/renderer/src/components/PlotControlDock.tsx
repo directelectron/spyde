@@ -177,8 +177,9 @@ function AxesTable({ axes, onEdit, offsetPick, onToggleOffsetPick }:
   )
 }
 
-function Histogram({ counts, edges, vmin, vmax, onClim }:
+function Histogram({ counts, edges, vmin, vmax, threshold, onClim }:
   { counts: number[]; edges: number[]; vmin: number; vmax: number
+    threshold?: number | null
     onClim: (mn: number, mx: number) => void }) {
   if (!counts.length) return null
   const max = Math.max(...counts) || 1
@@ -239,6 +240,12 @@ function Histogram({ counts, edges, vmin, vmax, onClim }:
           const h = (c / max) * (H - 4)
           return <rect key={i} x={i * bw} y={H - h} width={Math.max(1, bw - 0.5)} height={h} fill="#89b4fa" />
         })}
+        {/* Find-Vectors detector threshold: dotted orange line (in image units) */}
+        {threshold != null && threshold >= lo && threshold <= hi && (
+          <line data-testid="hist-threshold" x1={xOf(threshold)} y1={0}
+            x2={xOf(threshold)} y2={H} stroke="#ffae57" strokeWidth={1.5}
+            strokeDasharray="3 3" />
+        )}
         {handle('min', vmin)}
         {handle('max', vmax)}
       </svg>
@@ -319,7 +326,8 @@ export function PlotControlDock() {
         <div style={styles.section} data-testid="histogram-section">
           <div style={styles.label}>Histogram</div>
           {hist
-            ? <Histogram counts={hist.counts} edges={hist.edges} vmin={vmin} vmax={vmax} onClim={onClim} />
+            ? <Histogram counts={hist.counts} edges={hist.edges} vmin={vmin} vmax={vmax}
+                threshold={hist.threshold} onClim={onClim} />
             : <div style={styles.empty} data-testid="histogram-empty">—</div>}
           <div style={styles.hint}>drag the handles to set contrast</div>
         </div>
