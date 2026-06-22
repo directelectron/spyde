@@ -28,6 +28,48 @@ LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 _handler: "IPCLogHandler | None" = None
 
 
+# Map a logger name to a short, stable AREA tag so the log panel can group and
+# filter by subsystem (the user copies only the relevant area's lines). Ordered
+# longest/most-specific prefix first; first match wins. Extend freely as new
+# subsystems get their own loggers.
+_AREA_RULES = (
+    ("spyde.dask_manager", "dask"),
+    ("spyde.compute_backend", "dask"),
+    ("spyde.drawing.update_functions", "navigator"),
+    ("spyde.drawing.selectors", "navigator"),
+    ("spyde.drawing.plots", "plots"),
+    ("spyde.drawing.live_overlay", "overlay"),
+    ("spyde.drawing", "drawing"),
+    ("spyde.signal_tree", "navigator"),
+    ("spyde.actions.find_vectors", "vectors"),
+    ("spyde.actions.vector_orientation", "orientation"),
+    ("spyde.actions.orientation", "orientation"),
+    ("spyde.actions", "actions"),
+    ("spyde.signals", "signals"),
+    ("spyde.workers", "workers"),
+    ("spyde.backend", "backend"),
+    ("spyde.mdi_manager", "ui"),
+    ("spyde.qt", "ui"),
+    ("spyde.live", "instrument"),
+    ("spyde", "spyde"),
+    ("distributed", "dask"),
+    ("dask", "dask"),
+    ("hyperspy", "hyperspy"),
+    ("rsciio", "io"),
+    ("pyxem", "pyxem"),
+)
+
+
+def _area_for(name: str) -> str:
+    """Short subsystem tag for a logger name (e.g. 'navigator', 'dask')."""
+    for prefix, area in _AREA_RULES:
+        if name == prefix or name.startswith(prefix + "."):
+            return area
+    # Fall back to the top-level package so unmapped third-party loggers still
+    # get a usable, filterable tag instead of nothing.
+    return name.split(".", 1)[0] or "other"
+
+
 def _coerce_level(level) -> int:
     if isinstance(level, int):
         return level
@@ -56,6 +98,7 @@ class IPCLogHandler(logging.Handler):
             "type": "log",
             "level": record.levelname,
             "name": record.name,
+            "area": _area_for(record.name),
             "msg": msg,
             "time": record.created,
         }

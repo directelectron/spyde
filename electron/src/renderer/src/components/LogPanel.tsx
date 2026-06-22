@@ -6,7 +6,7 @@
  * verbosity and backfills recent history.
  */
 import React, { useEffect, useMemo, useRef, useState } from 'react'
-import { useSpyDE, LogEntry } from '../kernel/SpyDEContext'
+import { useSpyDE, type LogEntry } from '../kernel/SpyDEContext'
 
 const LEVELS = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'] as const
 
@@ -30,9 +30,28 @@ function shortName(name: string): string {
   return name.startsWith('spyde.') ? name.slice('spyde.'.length) : name
 }
 
+// Derive a short area tag from an entry, falling back to the logger name's
+// leading segment if the backend didn't tag it (older records / third party).
+function areaOf(e: LogEntry): string {
+  if (e.area) return e.area
+  const n = e.name.startsWith('spyde.') ? e.name.slice(6) : e.name
+  return n.split('.')[0] || 'other'
+}
+
+// Stable per-area colour so a given subsystem reads the same across the log.
+const AREA_COLORS = ['#89b4fa', '#a6e3a1', '#f9e2af', '#fab387', '#f5c2e7',
+  '#94e2d5', '#cba6f7', '#eba0ac', '#74c7ec', '#b4befe']
+function areaColor(area: string): string {
+  let h = 0
+  for (let i = 0; i < area.length; i++) h = (h * 31 + area.charCodeAt(i)) | 0
+  return AREA_COLORS[Math.abs(h) % AREA_COLORS.length]
+}
+
 export function LogPanel({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { state, sendAction } = useSpyDE()
   const [clearAt, setClearAt] = useState(0)        // hide entries older than this
+  const [query, setQuery] = useState('')           // free-text search filter
+  const [areaFilter, setAreaFilter] = useState('') // '' = all areas
   const bodyRef = useRef<HTMLDivElement>(null)
   const followRef = useRef(true)                   // auto-scroll unless user scrolled up
 
@@ -42,10 +61,25 @@ export function LogPanel({ open, onClose }: { open: boolean; onClose: () => void
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open])
 
-  const rows = useMemo(
-    () => state.logEntries.filter((e) => e.time >= clearAt),
-    [state.logEntries, clearAt],
-  )
+  // All areas present in the current buffer, for the area dropdown.
+  const areas = useMemo(() => {
+    const s = new Set<string>()
+    for (const e of state.logEntries) s.add(areaOf(e))
+    return Array.from(s).sort()
+  }, [state.logEntries])
+
+  const rows = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    return state.logEntries.filter((e) => {
+      if (e.time < clearAt) return false
+      if (areaFilter && areaOf(e) !== areaFilter) return false
+      if (q) {
+        const hay = `${e.level} ${e.name} ${areaOf(e)} ${e.msg}`.toLowerCase()
+        if (!hay.includes(q)) return false
+      }
+      return true
+    })
+  }, [state.logEntries, clearAt, query, areaFilter])
 
   // Auto-scroll to the newest line while the user is parked at the bottom —
   // but NOT while a text selection is active in the log (auto-scrolling would
@@ -71,7 +105,7 @@ export function LogPanel({ open, onClose }: { open: boolean; onClose: () => void
   const [copied, setCopied] = useState(false)
   const onCopy = async () => {
     const text = rows
-      .map((e) => `${clock(e.time)}\t${e.level}\t${shortName(e.name)}\t${e.msg}`)
+      .map((e) => `${clock(e.time)}\t${e.level}\t[${areaOf(e)}]\t${shortName(e.name)}\t${e.msg}`)
       .join('\n')
     try {
       await navigator.clipboard.writeText(text)
@@ -89,6 +123,25 @@ export function LogPanel({ open, onClose }: { open: boolean; onClose: () => void
       <div style={styles.header}>
         <span style={styles.title}>Application Log</span>
         <span style={styles.count} data-testid="log-count">{rows.length}</span>
+        <input
+          data-testid="log-search"
+          style={styles.search}
+          type="text"
+          placeholder="Search logs…"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          title="Filter visible log lines (matches level, logger, area, and message)"
+        />
+        <select
+          data-testid="log-area-select"
+          style={styles.select}
+          value={areaFilter}
+          onChange={(e) => setAreaFilter(e.target.value)}
+          title="Show only one subsystem's logs"
+        >
+          <option value="">All areas</option>
+          {areas.map((a) => <option key={a} value={a}>{a}</option>)}
+        </select>
         <span style={{ flex: 1 }} />
         <label style={styles.levelLabel}>Level</label>
         <select
@@ -130,20 +183,28 @@ export function LogPanel({ open, onClose }: { open: boolean; onClose: () => void
         {rows.length === 0 ? (
           <div style={styles.empty} data-testid="log-empty">No log records at this level yet.</div>
         ) : (
-          rows.map((e, i) => <LogRow key={i} entry={e} />)
+          rows.map((e, i) => <LogRow key={i} entry={e} onPickArea={setAreaFilter} />)
         )}
       </div>
     </div>
   )
 }
 
-function LogRow({ entry }: { entry: LogEntry }) {
+function LogRow({ entry, onPickArea }: { entry: LogEntry; onPickArea: (a: string) => void }) {
   const color = LEVEL_COLOR[entry.level] ?? '#cdd6f4'
+  const area = areaOf(entry)
   return (
-    <div style={styles.row} data-testid="log-row" data-level={entry.level}>
+    <div style={styles.row} data-testid="log-row" data-level={entry.level} data-area={area}>
       <span style={styles.time}>{clock(entry.time)}</span>
       <span style={{ ...styles.level, color }}>{entry.level.padEnd(8)}</span>
-      <span style={styles.name}>{shortName(entry.name)}</span>
+      <span
+        style={{ ...styles.area, color: areaColor(area) }}
+        data-testid="log-area-chip"
+        title={`Filter to “${area}”  (logger: ${entry.name})`}
+        onClick={() => onPickArea(area)}
+      >
+        {area}
+      </span>
       <span style={{ ...styles.msg, color: entry.level === 'DEBUG' ? '#9399b2' : '#cdd6f4' }}>
         {entry.msg}
       </span>
@@ -179,6 +240,11 @@ const styles: Record<string, React.CSSProperties> = {
     border: '1px solid #313244', borderRadius: 4, padding: '3px 6px',
     fontSize: 12,
   },
+  search: {
+    background: '#1e1e2e', color: '#cdd6f4',
+    border: '1px solid #313244', borderRadius: 4, padding: '3px 8px',
+    fontSize: 12, width: 200,
+  },
   btn: {
     background: '#313244', border: 'none', color: '#cdd6f4',
     fontSize: 12, cursor: 'pointer', padding: '3px 10px', borderRadius: 4,
@@ -200,6 +266,9 @@ const styles: Record<string, React.CSSProperties> = {
   row: { display: 'flex', gap: 8, whiteSpace: 'pre-wrap', wordBreak: 'break-word' },
   time: { color: '#6c7086', flexShrink: 0 },
   level: { flexShrink: 0, whiteSpace: 'pre', fontWeight: 600 },
-  name: { color: '#7f849c', flexShrink: 0 },
+  area: {
+    flexShrink: 0, fontWeight: 600, cursor: 'pointer',
+    minWidth: 72, whiteSpace: 'pre',
+  },
   msg: { flex: 1, whiteSpace: 'pre-wrap' },
 }
