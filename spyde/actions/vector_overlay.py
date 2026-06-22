@@ -636,10 +636,21 @@ class FindVectorsPreviewOverlay(_DPOverlay):
         else:
             # peaks=[ky_row, kx_col, val] px → markers (x=col=kx, y=row=ky).
             offsets = np.column_stack([peaks[:, 1], peaks[:, 0]]).astype(np.float32)
-        log.debug("[fv-preview] compute nav=(%s,%s) method=%s npeaks=%d frame[%s] "
-                  "beamstop=%s show_transform=%s response=%s",
-                  iy, ix, self.method, len(offsets), _stats(frame),
-                  "yes" if self.beamstop_mask is not None else "no",
+        # Diagnostic: count returned peaks that fall on a masked pixel. If this is
+        # ever > 0 the BACKEND mask exclusion is wrong; if it's 0 but circles still
+        # appear over the brown overlay, the mismatch is in the RENDERER (marker vs
+        # mask coordinate/orientation), not the detector.
+        under = -1
+        m = self.beamstop_mask
+        if m is not None and len(offsets):
+            yi = np.clip(np.round(offsets[:, 1]).astype(int), 0, m.shape[0] - 1)
+            xi = np.clip(np.round(offsets[:, 0]).astype(int), 0, m.shape[1] - 1)
+            under = int(m[yi, xi].sum())
+        log.debug("[fv-preview] compute nav=(%s,%s) method=%s npeaks=%d under_mask=%d "
+                  "frame[%s] beamstop=%s(thr_dil=%s) show_transform=%s response=%s",
+                  iy, ix, self.method, len(offsets), under, _stats(frame),
+                  "yes" if m is not None else "no",
+                  getattr(self, "beamstop_dilate", "?"),
                   self.show_transform, "yes" if response is not None else "no")
         return {"offsets": offsets, "response": response}
 

@@ -2966,8 +2966,8 @@ wheels = [
 
 [[package]]
 name = "rosettasciio"
-version = "0.14.dev4407+gce24e8bec"
-source = { git = "https://github.com/cssfrancis/rosettasciio.git?rev=improve_mrc#ce24e8bec3f054ad4c1be5098d12b5a7db7a9974" }
+version = "0.14.dev4411+gab4f4562c"
+source = { git = "https://github.com/cssfrancis/rosettasciio.git?rev=win32-binary-read#ab4f4562c62c1bf5130c5c9a1999929c7b7c5b35" }
 dependencies = [
     { name = "dask", extra = ["array"] },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -3735,7 +3735,7 @@ requires-dist = [
     { name = "pytest-rerunfailures", marker = "extra == 'tests'" },
     { name = "pyxem" },
     { name = "pyyaml" },
-    { name = "rosettasciio", git = "https://github.com/cssfrancis/rosettasciio.git?rev=improve_mrc" },
+    { name = "rosettasciio", git = "https://github.com/cssfrancis/rosettasciio.git?rev=win32-binary-read" },
     { name = "scikit-image" },
     { name = "scipy" },
     { name = "setuptools-scm", marker = "extra == 'tests'" },

@@ -24,7 +24,7 @@ dependencies = [
     "distributed",
     "dask",
     "hyperspy@git+https://github.com/cssfrancis/hyperspy.git@slice-integrate2",
-    "rosettasciio@git+https://github.com/cssfrancis/rosettasciio.git@improve_mrc",
+    "rosettasciio@git+https://github.com/cssfrancis/rosettasciio.git@win32-binary-read",
     "pyxem",
     "imageio-ffmpeg",
     "imagecodecs",
