@@ -223,6 +223,7 @@ export function PlotControlDock() {
   const navSelectors = Array.from(state.selectors.values())
   const tree = activeId != null ? state.signalTrees.get(activeId) : undefined
   const axes = activeId != null ? state.axes.get(activeId) : undefined
+  const sigType = activeId != null ? state.signalTypes.get(activeId) : undefined
 
   const onAxisEdit = (index: number, field: string, value: string) => {
     if (activeId == null) return
@@ -233,6 +234,13 @@ export function PlotControlDock() {
     if (activeId == null) return
     sendAction('set_colormap', { name: e.target.value }, activeId)
   }
+
+  const onSignalType = (e: React.ChangeEvent<HTMLSelectElement>) => {
+    if (activeId == null) return
+    sendAction('set_signal_type', { signal_type: e.target.value }, activeId)
+  }
+  // Human label for a HyperSpy signal_type (the empty type = a generic signal).
+  const sigTypeLabel = (t: string) => t === '' ? 'Generic (none)' : t
 
   // Display range (clim) is driven by dragging the histogram handles. A manual
   // override holds while the user drags; it resets when fresh data (a new
@@ -283,7 +291,25 @@ export function PlotControlDock() {
         </div>
       )}
 
-      {/* 3. Workflow (signal-tree node switcher — the steps taken) */}
+      {/* 3. Signal type (HyperSpy signal_type — re-casts the signal class) */}
+      {win && sigType && (
+        <div style={styles.section} data-testid="signal-type-section">
+          <label style={styles.label} htmlFor="sigtype">Signal type</label>
+          <select
+            id="sigtype"
+            data-testid="signal-type-select"
+            style={styles.select}
+            value={sigType.current}
+            onChange={onSignalType}
+          >
+            {sigType.options.map(t => (
+              <option key={t} value={t}>{sigTypeLabel(t)}</option>
+            ))}
+          </select>
+        </div>
+      )}
+
+      {/* 4. Workflow (signal-tree node switcher — the steps taken) */}
       {win && tree && (
         <div style={styles.section} data-testid="signal-tree">
           <div style={styles.label}>Workflow</div>
