@@ -29,10 +29,18 @@ from spyde.backend.ipc import emit, emit_status, emit_error
 from spyde.actions.context import src_plot_tree as _src_plot_tree
 from spyde.actions.find_vectors import _do_compute_vectors, _copy_nav_axes_to
 
-# Defaults mirror the old Qt CaretGroup sliders.
+# Defaults mirror the old Qt CaretGroup sliders, plus the DoG band-pass method
+# (better for small 2-3 px spots / beam-stopped data — see the 3 nm benchmark).
+# `threshold` is shared but means different things per method: NXCORR uses an
+# [-1,1] correlation score (~0.5); DoG uses an absolute band-pass SNR (~10).
 DEFAULTS: dict = dict(
     sigma=1.0, kernel_radius=5, threshold=0.5, min_distance=5, subpixel=True,
+    method="nxcorr", dog_sigma1=0.8, dog_sigma2=2.0, beamstop_auto=False,
 )
+
+# Per-method threshold default applied when the user switches method without
+# having explicitly set a threshold for it.
+_METHOD_THRESHOLD = {"nxcorr": 0.5, "dog": 10.0}
 
 
 def _coerce(params: dict) -> dict:
@@ -45,6 +53,14 @@ def _coerce(params: dict) -> dict:
             p[k] = bool(v) if isinstance(default, bool) else type(default)(v)
         except (TypeError, ValueError) as e:
             log.debug("find-vectors param %r=%r not coercible, using default: %s", k, v, e)
+    p["method"] = str(p.get("method", "nxcorr")).lower()
+    if p["method"] not in _METHOD_THRESHOLD:
+        p["method"] = "nxcorr"
+    # DoG uses an SNR threshold on a different scale than NXCORR's [-1,1] score;
+    # if the caller left threshold at the NXCORR default while asking for DoG,
+    # substitute the DoG default so the first preview isn't empty/flooded.
+    if (params.get("threshold") in (None, "")) and p["method"] == "dog":
+        p["threshold"] = _METHOD_THRESHOLD["dog"]
     return p
 
 
@@ -344,6 +360,9 @@ def fv_preview(session, plot, payload) -> None:
                 src, tree.root, tree, sigma=p["sigma"],
                 kernel_radius=p["kernel_radius"], threshold=p["threshold"],
                 min_distance=p["min_distance"], subpixel=p["subpixel"],
+                method=p["method"], dog_sigma1=p["dog_sigma1"],
+                dog_sigma2=p["dog_sigma2"],
+                beamstop_mask=_preview_beamstop(tree, p),
             )
             # Qt parity: estimate the disk radius from the data (once) so the
             # wizard's defaults match the pattern instead of a fixed 5.
@@ -357,6 +376,26 @@ def fv_preview(session, plot, payload) -> None:
             logging.getLogger(__name__).debug("fv_preview attach failed: %s", e)
 
     threading.Thread(target=_work, daemon=True, name="fv-preview").start()
+
+
+def _preview_beamstop(tree, p):
+    """Beam-stop mask for the live preview, cached on the tree. Detected from a
+    sparse sample of the dataset (memory-safe) only when the user enabled
+    beamstop_auto; None otherwise."""
+    if not p.get("beamstop_auto"):
+        return None
+    cached = getattr(tree, "_fv_beamstop", None)
+    if cached is not None:
+        return cached
+    try:
+        from spyde.actions.find_vectors import _auto_beamstop_from_signal
+        nav_dim = tree.root.axes_manager.navigation_dimension
+        mask = _auto_beamstop_from_signal(tree.root, nav_dim)
+        tree._fv_beamstop = mask
+        return mask
+    except Exception as e:
+        log.debug("preview beam-stop detection failed: %s", e)
+        return None
 
 
 def _emit_auto_params(plot, tree) -> None:

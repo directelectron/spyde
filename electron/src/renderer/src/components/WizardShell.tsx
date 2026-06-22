@@ -82,6 +82,22 @@ export function Slider({ value, min, max, step, onChange, fmt, testid }: {
   )
 }
 
+export function Select<T extends string>({ value, options, onChange, testid }: {
+  value: T
+  options: readonly { value: T; label: string }[]
+  onChange: (v: T) => void
+  testid: string
+}) {
+  return (
+    <select data-testid={testid} value={value} style={S.sel}
+      onChange={(e) => onChange(e.target.value as T)}>
+      {options.map((o) => (
+        <option key={o.value} value={o.value}>{o.label}</option>
+      ))}
+    </select>
+  )
+}
+
 export function Check({ checked, onChange, label, testid }: {
   checked: boolean; onChange: (b: boolean) => void; label: string; testid: string
 }) {

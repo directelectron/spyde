@@ -66,19 +66,22 @@ const COLORMAPS = [
 
 // Click-to-edit cell (Qt-like): shows the value as text; click turns it into an
 // input that commits on blur/Enter and reverts on Escape. Avoids the "wall of
-// always-on input boxes" look.
-function EditableCell({ value, editable, onCommit, testid }:
-  { value: string; editable: boolean; onCommit: (v: string) => void; testid: string }) {
+// always-on input boxes" look. ``display`` is the (possibly rounded) text shown
+// when not editing; editing always exposes the full-precision ``value``.
+function EditableCell({ value, display, editable, onCommit, testid }:
+  { value: string; display?: string; editable: boolean
+    onCommit: (v: string) => void; testid: string }) {
   const [editing, setEditing] = React.useState(false)
   const [draft, setDraft] = React.useState(value)
   React.useEffect(() => { if (!editing) setDraft(value) }, [value, editing])
+  const shown = display ?? value
 
   if (!editable) return <span style={styles.axCellRO} data-testid={testid}>—</span>
   if (!editing) {
     return (
       <span data-testid={testid} style={styles.axText} title="click to edit"
         onClick={() => { setDraft(value); setEditing(true) }}>
-        {value === '' ? <span style={styles.axPlaceholder}>—</span> : value}
+        {shown === '' ? <span style={styles.axPlaceholder}>—</span> : shown}
       </span>
     )
   }
@@ -100,43 +103,77 @@ function EditableCell({ value, editable, onCommit, testid }:
 // to the dataset's axes_manager (which re-pushes every plot → the change shows in
 // the plot immediately). The dataset SHAPE lives in the Metadata panel now, so
 // there's no size column here.
-function AxesTable({ axes, onEdit }:
-  { axes: AxisRow[]; onEdit: (index: number, field: string, value: string) => void }) {
+function AxesTable({ axes, onEdit, offsetPick, onToggleOffsetPick }:
+  { axes: AxisRow[]; onEdit: (index: number, field: string, value: string) => void
+    offsetPick: boolean; onToggleOffsetPick: () => void }) {
   const txt = (ax: AxisRow, field: keyof AxisRow) => {
     const v = ax[field]
     return v == null ? '' : String(v)
   }
+  // Display scale/offset rounded to 2 dp (full precision shows on click-to-edit).
+  // Very small / large magnitudes fall back to 2-sig-fig exponential so a tiny
+  // calibration (e.g. 0.0042 Å⁻¹/px) doesn't render as "0.00".
+  const disp = (ax: AxisRow, field: keyof AxisRow) => {
+    if (field !== 'scale' && field !== 'offset') return undefined
+    const v = ax[field]
+    if (v == null) return undefined
+    const n = Number(v)
+    if (!Number.isFinite(n)) return undefined
+    if (n !== 0 && Math.abs(n) < 0.01) return n.toExponential(1)
+    return n.toFixed(2)
+  }
+  const hasSignal = axes.some((ax) => !ax.navigate)
   return (
-    <table data-testid="axes-table" style={styles.axTable}>
-      <thead>
-        <tr style={styles.axHeadRow}>
-          <th style={styles.axTh}></th>
-          <th style={styles.axTh}>name</th>
-          <th style={styles.axTh}>scale</th>
-          <th style={styles.axTh}>offset</th>
-          <th style={styles.axTh}>units</th>
-        </tr>
-      </thead>
-      <tbody>
-        {axes.map((ax) => (
-          <tr key={ax.index} data-testid={`axis-row-${ax.index}`}>
-            <td style={styles.axRole} title={ax.navigate ? 'navigation' : 'signal'}>
-              {ax.navigate ? 'nav' : 'sig'}
-            </td>
-            {(['name', 'scale', 'offset', 'units'] as const).map((field) => (
-              <td key={field} style={styles.axTd}>
-                <EditableCell
-                  testid={`axis-${ax.index}-${field}`}
-                  value={txt(ax, field)}
-                  editable={field === 'name' || field === 'units' || ax[field] != null}
-                  onCommit={(v) => onEdit(ax.index, field, v)}
-                />
-              </td>
-            ))}
+    <>
+      <table data-testid="axes-table" style={styles.axTable}>
+        <thead>
+          <tr style={styles.axHeadRow}>
+            <th style={styles.axTh}></th>
+            <th style={styles.axTh}>name</th>
+            <th style={styles.axTh}>scale</th>
+            <th style={styles.axTh}>
+              <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                offset
+                {hasSignal && (
+                  <button
+                    data-testid="offset-pick-toggle"
+                    title="Set origin: drag a crosshair on the image to mark (0,0)"
+                    onClick={onToggleOffsetPick}
+                    style={offsetPick ? styles.offPickOn : styles.offPick}
+                  >+</button>
+                )}
+              </span>
+            </th>
+            <th style={styles.axTh}>units</th>
           </tr>
-        ))}
-      </tbody>
-    </table>
+        </thead>
+        <tbody>
+          {axes.map((ax) => (
+            <tr key={ax.index} data-testid={`axis-row-${ax.index}`}>
+              <td style={styles.axRole} title={ax.navigate ? 'navigation' : 'signal'}>
+                {ax.navigate ? 'nav' : 'sig'}
+              </td>
+              {(['name', 'scale', 'offset', 'units'] as const).map((field) => (
+                <td key={field} style={styles.axTd}>
+                  <EditableCell
+                    testid={`axis-${ax.index}-${field}`}
+                    value={txt(ax, field)}
+                    display={disp(ax, field)}
+                    editable={field === 'name' || field === 'units' || ax[field] != null}
+                    onCommit={(v) => onEdit(ax.index, field, v)}
+                  />
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {offsetPick && (
+        <div style={styles.hint} data-testid="offset-pick-hint">
+          Drag the orange crosshair onto the (0,0) point — offsets update live.
+        </div>
+      )}
+    </>
   )
 }
 
@@ -147,7 +184,7 @@ function Histogram({ counts, edges, vmin, vmax, onClim }:
   const max = Math.max(...counts) || 1
   const lo = edges[0], hi = edges[edges.length - 1]
   const span = hi - lo || 1
-  const W = 216, H = 84
+  const W = 276, H = 84
   const bw = W / counts.length
   const xOf = (v: number) => ((v - lo) / span) * W
   const vOf = (x: number) => lo + (Math.max(0, Math.min(W, x)) / W) * span
@@ -228,6 +265,19 @@ export function PlotControlDock() {
   const onAxisEdit = (index: number, field: string, value: string) => {
     if (activeId == null) return
     sendAction('set_axis', { index, field, value }, activeId)
+  }
+
+  // "Set origin" crosshair tool: toggles a draggable crosshair on the signal
+  // plot whose position the backend turns into the signal-axis offsets live.
+  const [offsetPick, setOffsetPick] = React.useState(false)
+  // Drop the tool when the active window changes (the crosshair lives on that
+  // window's plot).
+  React.useEffect(() => { setOffsetPick(false) }, [activeId])
+  const onToggleOffsetPick = () => {
+    if (activeId == null) return
+    const next = !offsetPick
+    setOffsetPick(next)
+    sendAction('set_offset_crosshair', { on: next }, activeId)
   }
 
   const onColormap = (e: React.ChangeEvent<HTMLSelectElement>) => {
@@ -354,7 +404,8 @@ export function PlotControlDock() {
       {win && axes && axes.length > 0 && (
         <div style={styles.section} data-testid="axes-section">
           <div style={styles.label}>Axes</div>
-          <AxesTable axes={axes} onEdit={onAxisEdit} />
+          <AxesTable axes={axes} onEdit={onAxisEdit}
+            offsetPick={offsetPick} onToggleOffsetPick={onToggleOffsetPick} />
         </div>
       )}
 
@@ -388,7 +439,7 @@ export function PlotControlDock() {
 
 const styles: Record<string, React.CSSProperties> = {
   dock: {
-    width: 240, flexShrink: 0,
+    width: 300, flexShrink: 0,
     height: '100%',
     background: '#181825',
     borderLeft: '1px solid #313244',
@@ -467,4 +518,16 @@ const styles: Record<string, React.CSSProperties> = {
     overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
   },
   axPlaceholder: { color: '#45475a' },
+  // "+" origin-pick toggle in the offset header — matches the orange on-plot
+  // crosshair when active so the two read as the same tool.
+  offPick: {
+    border: '1px solid #45475a', background: '#1e1e2e', color: '#a6adc8',
+    borderRadius: 3, width: 14, height: 14, lineHeight: '12px', fontSize: 11,
+    padding: 0, cursor: 'pointer', fontWeight: 700,
+  },
+  offPickOn: {
+    border: '1px solid #ffae57', background: '#ffae57', color: '#11111b',
+    borderRadius: 3, width: 14, height: 14, lineHeight: '12px', fontSize: 11,
+    padding: 0, cursor: 'pointer', fontWeight: 700,
+  },
 }

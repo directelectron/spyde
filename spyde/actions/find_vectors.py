@@ -719,6 +719,244 @@ def _find_vectors_single_frame(
     return corr_map, raw_corr, peaks
 
 
+def _dilate_mask(mask: np.ndarray, r: int) -> np.ndarray:
+    """Binary-dilate a 2D mask by ``r`` px (used to swallow the beam-stop rim)."""
+    if mask is None or r <= 0:
+        return mask
+    return maximum_filter(mask.astype(np.uint8), size=2 * int(r) + 1) > 0
+
+
+def detect_beamstop(mean_pattern: np.ndarray, *, frac: float = 0.15,
+                    dilate: int = 5) -> Optional[np.ndarray]:
+    """Auto-detect a physical beam stop from a scan-mean / navigator pattern.
+
+    A beam stop blocks electrons, so in the time-averaged pattern it is a stable,
+    connected **low-intensity** region.  We threshold at ``frac`` of the mean and
+    keep the result, then **dilate by ``dilate`` px** — crucially, the brightest
+    feature in a beam-stopped frame is the diffraction halo (the "rim") hugging
+    the stop edge, NOT the occluded core, so the mask must extend a few px past
+    the geometric stop to keep peak finders off the rim (benchmarked: ~5 px
+    removes the rim with no loss of real spots).
+
+    Returns a (H, W) bool mask, or ``None`` if no plausible stop is found
+    (a featureless / no-stop pattern thresholds to almost nothing or almost
+    everything).
+    """
+    m = np.asarray(mean_pattern, dtype=np.float64)
+    if m.ndim != 2 or m.size == 0:
+        return None
+    mean_val = float(m.mean())
+    if mean_val <= 0:
+        return None
+    mask = m < (mean_val * frac)
+    f = mask.mean()
+    # Reject degenerate masks: nothing (no stop) or almost everything (a blank
+    # / near-empty pattern, where "< 0.15*mean" catches the whole background).
+    if f < 0.001 or f > 0.45:
+        return None
+    return _dilate_mask(mask, dilate)
+
+
+def _auto_beamstop_from_signal(signal, nav_dim: int, *, max_samples: int = 400,
+                               dilate: int = 5) -> Optional[np.ndarray]:
+    """Detect the beam stop from a SPARSE sample of patterns (memory-safe).
+
+    A physical beam stop is static across the scan, so averaging a few hundred
+    evenly-spaced patterns reproduces it cleanly.  We stride the flattened nav
+    grid so at most ``max_samples`` frames are read; for lazy data only those
+    small slices are ``.compute()``-ed — never the whole dataset.
+    """
+    raw = signal.data
+    nav_shape = raw.shape[:nav_dim]
+    sig_shape = raw.shape[nav_dim:]
+    if len(sig_shape) != 2:
+        return None
+    n_nav = int(np.prod(nav_shape))
+    if n_nav == 0:
+        return None
+    flat = raw.reshape((n_nav,) + tuple(sig_shape))
+    step = max(1, n_nav // max_samples)
+    idxs = range(0, n_nav, step)
+    acc = np.zeros(sig_shape, dtype=np.float64)
+    count = 0
+    for i in idxs:
+        frame = flat[i]
+        if hasattr(frame, "compute"):
+            frame = frame.compute()
+        acc += np.asarray(frame, dtype=np.float64)
+        count += 1
+    if count == 0:
+        return None
+    return detect_beamstop(acc / count, dilate=dilate)
+
+
+# ── Difference-of-Gaussians (DoG) blob detector ────────────────────────────────
+# Cache of separable 1D Gaussian kernels keyed by rounded sigma.
+@functools.lru_cache(maxsize=64)
+def _gauss_kernel_1d(sigma: float) -> np.ndarray:
+    """Normalised 1D Gaussian kernel truncated at 3σ (matches scipy default)."""
+    s = float(sigma)
+    if s <= 0:
+        return np.array([1.0], dtype=np.float32)
+    r = max(1, int(round(3.0 * s)))
+    x = np.arange(-r, r + 1, dtype=np.float32)
+    k = np.exp(-(x * x) / (2.0 * s * s))
+    k /= k.sum()
+    return k.astype(np.float32)
+
+
+def _find_vectors_single_frame_dog(
+    frame: np.ndarray,
+    sigma1: float,
+    sigma2: float,
+    threshold: float,
+    min_distance: int,
+    *,
+    subpixel: bool = True,
+    beamstop_mask: Optional[np.ndarray] = None,
+    bs_dilate: int = 0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Difference-of-Gaussians band-pass blob detector for small (2-3 px) spots.
+
+    ``response = G(σ₁)*I − G(σ₂)*I`` (σ₁<σ₂) is the band-pass matched to a small
+    Gaussian spot: it removes both pixel noise (≤σ₁) and the smooth diffuse
+    background / beam tails (≥σ₂) in one separable real-space pass, so a faint
+    spot stands out without a radius-matched template (the failure mode of the
+    NXCORR disk on this kind of data).  Both Gaussians are real-space separable
+    convolutions — no FFT.
+
+    Beam stop: masked pixels are **background-filled** with the σ₂ blur (NOT
+    zero-filled).  Zeroing makes a hard signal→0 step at the mask edge and the
+    band-pass fires on it; filling with the smooth background removes the step.
+    Detections inside the (optionally further-dilated) mask are excluded.
+
+    Threshold is an **absolute band-pass SNR**: ``response / (1.4826·MAD)`` of the
+    response, so it is intensity-independent (like the NXCORR [-1,1] score) and
+    does not collapse on blank frames the way a per-frame-max-relative threshold
+    would.  Typical values 3-8.
+
+    Returns ``(corr_map, response_snr, peaks)`` mirroring
+    :func:`_find_vectors_single_frame` so all overlay / batch code is unchanged.
+    ``peaks`` is ``(N, 3)`` float32 ``[ky, kx, raw_intensity]``.
+    """
+    from scipy.ndimage import correlate1d
+
+    f = np.asarray(frame, dtype=np.float32)
+    H, W = f.shape
+
+    excl = None
+    if beamstop_mask is not None and beamstop_mask.any():
+        excl = _dilate_mask(beamstop_mask, bs_dilate) if bs_dilate else beamstop_mask
+        # background-fill the stop with the wide blur so no step is introduced
+        bg_fill = gaussian_filter(f, sigma2)
+        f = f.copy()
+        f[excl] = bg_fill[excl]
+
+    k1 = _gauss_kernel_1d(sigma1)
+    k2 = _gauss_kernel_1d(sigma2)
+    # separable real-space blur (reflect boundary, like the batch nav blur)
+    g1 = correlate1d(correlate1d(f, k1, axis=0, mode="reflect"), k1, axis=1, mode="reflect")
+    g2 = correlate1d(correlate1d(f, k2, axis=0, mode="reflect"), k2, axis=1, mode="reflect")
+    resp = g1 - g2
+
+    # absolute SNR normalisation via median absolute deviation (robust to spots)
+    # Robust SNR scale from UNMASKED pixels only: the bright beam-stop rim, even
+    # after background-fill, leaves a strong band-pass response in a thin ring at
+    # the mask edge; including it would inflate the MAD and bury faint real spots.
+    stat_src = resp[~excl] if excl is not None else resp.ravel()
+    med = float(np.median(stat_src))
+    mad = float(np.median(np.abs(stat_src - med)))
+    scale = 1.4826 * mad
+    if scale <= 1e-12:
+        # near-zero MAD: a (near-)flat band-pass (low-texture frame). Fall back
+        # to the std, then to the response peak, so the SNR stays finite and a
+        # lone spot on a flat field is still detectable rather than div-by-zero.
+        scale = float(stat_src.std())
+    if scale <= 1e-12:
+        scale = float(np.abs(stat_src).max()) or 1.0
+    snr = ((resp - med) / scale).astype(np.float32)
+    if excl is not None:
+        snr[excl] = 0.0
+
+    corr_map = np.where(snr >= threshold, snr, 0.0).astype(np.float32)
+
+    if not (snr >= threshold).any():
+        return corr_map, snr, np.zeros((0, 3), dtype=np.float32)
+
+    min_d = int(min_distance)
+    local_max = maximum_filter(snr, size=2 * min_d + 1)
+    peaks_mask = (snr == local_max) & (snr >= threshold)
+    if excl is not None:
+        peaks_mask &= ~excl
+
+    peaks_px = np.argwhere(peaks_mask)
+    if len(peaks_px) > 1:
+        inten = snr[peaks_px[:, 0], peaks_px[:, 1]]
+        order = np.argsort(-inten)
+        peaks_px = peaks_px[order]
+        kept = np.ones(len(peaks_px), dtype=bool)
+        min_d2 = min_d * min_d
+        for i in range(len(peaks_px)):
+            if not kept[i]:
+                continue
+            dy = peaks_px[i + 1:, 0] - peaks_px[i, 0]
+            dx = peaks_px[i + 1:, 1] - peaks_px[i, 1]
+            kept[i + 1:][(dy * dy + dx * dx) <= min_d2] = False
+        peaks_px = peaks_px[kept]
+
+    if len(peaks_px) == 0:
+        return corr_map, snr, np.zeros((0, 3), dtype=np.float32)
+
+    if subpixel:
+        pos = _subpixel_parabola(snr, peaks_px)
+    else:
+        pos = peaks_px.astype(np.float32)
+    # intensity column = RAW experimental frame brightness (for virtual imaging /
+    # orientation weighting), sampled at the sub-pixel position — same convention
+    # as the NXCORR path.
+    intens = _sample_raw_bilinear(np.asarray(frame, dtype=np.float32), pos[:, 0], pos[:, 1])
+    peaks = np.column_stack([pos, intens]).astype(np.float32)
+    return corr_map, snr, peaks
+
+
+# Method names accepted across the find-vectors stack.
+METHOD_NXCORR = "nxcorr"
+METHOD_DOG = "dog"
+DEFAULT_DOG_SIGMA1 = 0.8
+DEFAULT_DOG_SIGMA2 = 2.0
+# Absolute band-pass SNR (response / 1.4826·MAD).  ~10 balances recall/precision
+# on real small-spot data (benchmarked on the 3 nm DESEMCam scan); raise toward
+# 15 for cleaner / fewer peaks, lower toward 6 for more recall.
+DEFAULT_DOG_THRESHOLD = 10.0
+
+
+def _find_peaks_single_frame(frame, params, *, beamstop_mask=None,
+                             _disk_fft=None, _disk_stats=None):
+    """Dispatch a single frame to the configured detector, returning peaks
+    ``(N,3)`` ``[ky, kx, intensity]``.  ``params`` is the find-vectors param
+    dict (``method`` selects ``nxcorr`` or ``dog``)."""
+    method = str(params.get("method", METHOD_NXCORR)).lower()
+    if method == METHOD_DOG:
+        return _find_vectors_single_frame_dog(
+            frame,
+            float(params.get("dog_sigma1", DEFAULT_DOG_SIGMA1)),
+            float(params.get("dog_sigma2", DEFAULT_DOG_SIGMA2)),
+            float(params.get("threshold", DEFAULT_DOG_THRESHOLD)),
+            int(params.get("min_distance", 3)),
+            subpixel=bool(params.get("subpixel", True)),
+            beamstop_mask=beamstop_mask,
+        )[2]
+    return _find_vectors_single_frame(
+        frame,
+        int(params.get("kernel_radius", 5)),
+        float(params.get("threshold", 0.5)),
+        int(params.get("min_distance", 5)),
+        subpixel=bool(params.get("subpixel", True)),
+        beamstop_mask=beamstop_mask,
+        _disk_fft=_disk_fft, _disk_stats=_disk_stats,
+    )[2]
+
+
 def _estimate_disk_radius(frame: np.ndarray) -> int:
     """
     Estimate the diffraction disk radius in pixels from a single pattern.
@@ -1616,6 +1854,86 @@ def _gpu_task_allowed() -> bool:
         return name == "1"  # non-integer worker names: single GPU worker
 
 
+def _nav_blur_trim(ghost_block, depth_px, nav_dim, sigma):
+    """Nav-space Gaussian blur (sigma over the 2 spatial nav dims, 0 elsewhere)
+    of a ghost-padded block, then trim the ghost zones.  Shared by the NXCORR CPU
+    fallback and the DoG path."""
+    from scipy.ndimage import gaussian_filter as _gf
+    sigma_tuple = tuple([0.0] * (nav_dim - 2) + [sigma, sigma, 0.0, 0.0])
+    blurred = _gf(np.asarray(ghost_block, dtype=np.float32), sigma=sigma_tuple)
+    trim = [slice(None)] * ghost_block.ndim
+    for d in (nav_dim - 2, nav_dim - 1):
+        s = blurred.shape[d]
+        lo = depth_px if depth_px < s else 0
+        hi = s - depth_px if depth_px < s else s
+        trim[d] = slice(lo, hi)
+    return blurred[tuple(trim)]
+
+
+def _dog_block(b4d, sigma1, sigma2, threshold, min_dist, subpixel, beamstop_mask):
+    """Run the DoG detector on a (ny, nx, KY, KX) block → NaN-padded
+    (ny, nx, MAX_PEAKS, 3).  Batches on the torch GPU when available; otherwise
+    the numpy per-frame core."""
+    out = np.full((b4d.shape[0], b4d.shape[1], MAX_PEAKS, 3), np.nan, dtype=np.float32)
+    flat = b4d.reshape(-1, b4d.shape[2], b4d.shape[3])
+    peaks_list = None
+    try:
+        from spyde.actions.find_vectors_torch import (
+            torch_gpu_device, find_vectors_dog_torch_batch)
+        if torch_gpu_device() is not None:
+            peaks_list = find_vectors_dog_torch_batch(
+                flat, sigma1, sigma2, threshold, min_dist,
+                subpixel=subpixel, beamstop_mask=beamstop_mask)
+            # GPU returns the SNR in col 2; replace with raw frame intensity.
+            peaks_list = [_with_raw_intensity(flat[i], p)
+                          for i, p in enumerate(peaks_list)]
+    except Exception as _e:
+        log.warning("[find_vectors] torch DoG GPU path failed (%s); CPU per-frame", _e)
+        peaks_list = None
+    if peaks_list is None:
+        peaks_list = [
+            _find_vectors_single_frame_dog(
+                frame, sigma1, sigma2, threshold, min_dist,
+                subpixel=subpixel, beamstop_mask=beamstop_mask)[2]
+            for frame in flat
+        ]
+    for i, peaks in enumerate(peaks_list):
+        iy, ix = divmod(i, b4d.shape[1])
+        n = min(len(peaks), MAX_PEAKS)
+        if n > 0:
+            out[iy, ix, :n, :] = peaks[:n]
+    return out
+
+
+def _find_vectors_chunk_dog(
+    ghost_block, depth_px, nav_dim, sigma,
+    sigma1, sigma2, threshold, min_dist, subpixel, beamstop_mask,
+):
+    """DoG variant of _find_vectors_chunk: nav-blur + trim, then per-frame DoG
+    band-pass (GPU-batched when torch CUDA is present).  Same output structure
+    as the NXCORR chunk fn."""
+    t_start = time.perf_counter()
+    blurred = _nav_blur_trim(ghost_block, depth_px, nav_dim, sigma)
+    nav_shape = blurred.shape[:nav_dim]
+    ny, nx = nav_shape[-2:]
+    if nav_dim == 2:
+        result = _dog_block(blurred, sigma1, sigma2, threshold, min_dist,
+                            subpixel, beamstop_mask)
+        core_shape = result.shape[:2]
+    else:
+        n_lead = nav_shape[0]
+        out = np.full((n_lead, ny, nx, MAX_PEAKS, 3), np.nan, dtype=np.float32)
+        for t in range(n_lead):
+            out[t] = _dog_block(blurred[t], sigma1, sigma2, threshold, min_dist,
+                                subpixel, beamstop_mask)
+        result = out
+        core_shape = (n_lead, ny, nx)
+    log.debug("[find_vectors] DoG chunk core=%s total=%.0fms",
+              tuple(int(s) for s in core_shape),
+              (time.perf_counter() - t_start) * 1e3)
+    return result
+
+
 def _find_vectors_chunk(
     ghost_block: np.ndarray,
     depth_px: int,
@@ -1628,6 +1946,9 @@ def _find_vectors_chunk(
     beamstop_mask,
     disk_fft,
     disk_stats,
+    method: str = METHOD_NXCORR,
+    dog_sigma1: float = DEFAULT_DOG_SIGMA1,
+    dog_sigma2: float = DEFAULT_DOG_SIGMA2,
 ) -> np.ndarray:
     """
     Full pipeline for one ghost-padded nav chunk.
@@ -1665,6 +1986,18 @@ def _find_vectors_chunk(
         if nav_dim == 2:
             return np.empty((0, 0, MAX_PEAKS, 3), dtype=np.float32)
         return np.empty((0, 0, 0, MAX_PEAKS, 3), dtype=np.float32)
+
+    # ── DoG band-pass detector ────────────────────────────────────────────────
+    # The numba-CUDA NXCORR kernels below are disk-matched-filter specific, so
+    # DoG takes its own route: nav-blur + trim (CPU), then the per-frame
+    # band-pass batched on the torch GPU (Pascal CUDA) when available, numpy
+    # otherwise.  Both share the same nav-blur as NXCORR.
+    if str(method).lower() == METHOD_DOG:
+        return _find_vectors_chunk_dog(
+            ghost_block, depth_px, nav_dim, sigma,
+            dog_sigma1, dog_sigma2, threshold, min_dist, subpixel,
+            beamstop_mask,
+        )
 
     # ── Try GPU path ──────────────────────────────────────────────────────────
     if _GPU_KERNELS_AVAILABLE and _gpu_task_allowed():
@@ -2554,10 +2887,13 @@ def _do_compute_vectors(
     sigma = float(params["sigma"])
     depth_px = int(np.ceil(3 * sigma))
 
+    method = str(params.get("method", METHOD_NXCORR)).lower()
     kernel_r = int(params["kernel_radius"])
     threshold = float(params["threshold"])
     min_dist = int(params["min_distance"])
     subpixel = bool(params.get("subpixel", True))
+    dog_sigma1 = float(params.get("dog_sigma1", DEFAULT_DOG_SIGMA1))
+    dog_sigma2 = float(params.get("dog_sigma2", DEFAULT_DOG_SIGMA2))
 
     ky_scale = float(sig_ax[1].scale)
     ky_offset = float(sig_ax[1].offset)
@@ -2580,6 +2916,21 @@ def _do_compute_vectors(
     # Ghost depth cannot exceed the spatial nav extent (map_overlap rejects
     # depth > axis size); tiny grids just lose cross-boundary blur support.
     depth_px = max(0, min(depth_px, min(nav_2d_shape) - 1))
+
+    # ── Auto beam-stop detection ──────────────────────────────────────────────
+    # When no mask was supplied and the user asked for one (or it's requested by
+    # default), detect a physical beam stop from a SPARSE sample of patterns
+    # (never the full dataset — memory rule).  The stop is static, so a few
+    # hundred frames give a clean low-intensity mask; dilated to clear the rim.
+    if beamstop_mask is None and params.get("beamstop_auto", False):
+        try:
+            beamstop_mask = _auto_beamstop_from_signal(signal, nav_dim)
+            if beamstop_mask is not None:
+                log.debug("[find_vectors] auto beam-stop: %d px masked",
+                          int(beamstop_mask.sum()))
+        except Exception as e:
+            log.debug("[find_vectors] auto beam-stop detection failed: %s", e)
+            beamstop_mask = None
 
     # Disk stats: passed to chunk_fn so workers don't recompute them.
     _disk = _make_disk(kernel_r)
@@ -2658,6 +3009,9 @@ def _do_compute_vectors(
         beamstop_mask=beamstop_mask,
         disk_fft=disk_fft,
         disk_stats=disk_stats,
+        method=method,
+        dog_sigma1=dog_sigma1,
+        dog_sigma2=dog_sigma2,
     )
 
     # Resolve the distributed client up front — needed both to decide on GPU

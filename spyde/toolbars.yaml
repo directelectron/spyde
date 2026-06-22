@@ -164,7 +164,7 @@ functions:
         max: 20
         tab: Run
   Find Diffraction Vectors:
-    description: Find diffraction vectors using window-normalized cross-correlation with a flat disk kernel.
+    description: Find diffraction vectors via window-normalized cross-correlation (flat disk) or a Difference-of-Gaussians band-pass (small spots / beam-stopped data).
     icon: drawing/toolbars/icons/peak_finding.svg
     function: spyde.actions.find_vectors_action.find_diffraction_vectors
     signal_class: pyxem.signals.Diffraction2D
@@ -173,6 +173,11 @@ functions:
     toolbar_side: bottom
     navigation: False
     parameters:
+      method:
+        name: Method
+        type: enum
+        default: nxcorr
+        choices: [nxcorr, dog]
       sigma:
         name: Nav Blur σ
         type: float
@@ -186,12 +191,26 @@ functions:
         default: 5
         min: 1
         max: 30
+      dog_sigma1:
+        name: DoG σ₁ (spot)
+        type: float
+        default: 0.8
+        min: 0.4
+        max: 3.0
+        step: 0.1
+      dog_sigma2:
+        name: DoG σ₂ (bg)
+        type: float
+        default: 2.0
+        min: 1.0
+        max: 6.0
+        step: 0.1
       threshold:
         name: Threshold
         type: float
         default: 0.5
         min: 0.0
-        max: 1.0
+        max: 30.0
         step: 0.05
       min_distance:
         name: Min Distance
@@ -199,6 +218,10 @@ functions:
         default: 5
         min: 1
         max: 30
+      beamstop_auto:
+        name: Mask beam stop
+        type: bool
+        default: False
       subpixel:
         name: Subpixel
         type: bool

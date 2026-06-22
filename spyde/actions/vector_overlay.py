@@ -337,6 +337,8 @@ class FindVectorsPreviewOverlay(_DPOverlay):
 
     def __init__(self, dp_plot, signal, *, sigma=1.0, kernel_radius=5,
                  threshold=0.5, min_distance=5, subpixel=True,
+                 method="nxcorr", dog_sigma1=0.8, dog_sigma2=2.0,
+                 beamstop_mask=None,
                  color="#ff3030", name="fv_preview"):
         self.dp_plot = dp_plot
         self.signal = signal
@@ -345,6 +347,10 @@ class FindVectorsPreviewOverlay(_DPOverlay):
         self.threshold = float(threshold)
         self.min_distance = int(min_distance)
         self.subpixel = bool(subpixel)
+        self.method = str(method).lower()
+        self.dog_sigma1 = float(dog_sigma1)
+        self.dog_sigma2 = float(dog_sigma2)
+        self.beamstop_mask = beamstop_mask
         self.name = name
         self._color = color
         self._radius_px = max(1, int(kernel_radius))
@@ -368,6 +374,12 @@ class FindVectorsPreviewOverlay(_DPOverlay):
             self.min_distance = max(1, int(p["min_distance"]))
         if "subpixel" in p and p["subpixel"] is not None:
             self.subpixel = bool(p["subpixel"])
+        if p.get("method") is not None:
+            self.method = str(p["method"]).lower()
+        if p.get("dog_sigma1") is not None:
+            self.dog_sigma1 = float(p["dog_sigma1"])
+        if p.get("dog_sigma2") is not None:
+            self.dog_sigma2 = float(p["dog_sigma2"])
         # Redraw at the current crosshair SYNCHRONOUSLY: a slider tweak is a
         # deliberate, one-off action that wants instant feedback, and it isn't
         # the perf-critical path (that's the navigator drag, which stays async
@@ -398,14 +410,18 @@ class FindVectorsPreviewOverlay(_DPOverlay):
         return block[iy - y0, ix - x0]
 
     def _offsets_for(self, iy, ix) -> np.ndarray:
-        from spyde.actions.find_vectors import _find_vectors_single_frame
+        from spyde.actions.find_vectors import _find_peaks_single_frame
         try:
             frame = self._blurred_frame(iy, ix)
+            params = dict(
+                method=self.method, kernel_radius=self.kernel_radius,
+                threshold=self.threshold, min_distance=self.min_distance,
+                subpixel=self.subpixel, dog_sigma1=self.dog_sigma1,
+                dog_sigma2=self.dog_sigma2,
+            )
             with self._lock:
-                _, _, peaks = _find_vectors_single_frame(
-                    frame, self.kernel_radius, self.threshold, self.min_distance,
-                    subpixel=self.subpixel,
-                )
+                peaks = _find_peaks_single_frame(
+                    frame, params, beamstop_mask=self.beamstop_mask)
         except Exception:
             return np.zeros((0, 2), dtype=np.float32)
         if peaks is None or len(peaks) == 0:
@@ -587,11 +603,14 @@ def attach_vector_orientation_overlay(dp_plot, vecs, lib, tree, *, params=None,
 
 def attach_find_vectors_preview(dp_plot, signal, tree, *, sigma=1.0,
                                 kernel_radius=5, threshold=0.5, min_distance=5,
-                                subpixel=True, color="#ff3030") -> FindVectorsPreviewOverlay:
+                                subpixel=True, method="nxcorr", dog_sigma1=0.8,
+                                dog_sigma2=2.0, beamstop_mask=None,
+                                color="#ff3030") -> FindVectorsPreviewOverlay:
     """Add a live found-peaks preview overlay to ``dp_plot``, wired to the
     navigator selectors of ``tree``. Returns the :class:`FindVectorsPreviewOverlay`."""
     return FindVectorsPreviewOverlay(
         dp_plot, signal, sigma=sigma, kernel_radius=kernel_radius,
         threshold=threshold, min_distance=min_distance, subpixel=subpixel,
-        color=color,
+        method=method, dog_sigma1=dog_sigma1, dog_sigma2=dog_sigma2,
+        beamstop_mask=beamstop_mask, color=color,
     ).attach(tree)

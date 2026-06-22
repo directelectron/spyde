@@ -203,3 +203,131 @@ def find_vectors_torch_batch(
         if bounds[i + 1] > bounds[i]:
             out[i] = res[bounds[i]:bounds[i + 1]].astype(np.float32)
     return out
+
+
+_DOG_KERN: dict = {}    # (device, round(sigma,3)) -> 1D Gaussian tensor
+
+
+def _gauss1d_torch(sigma: float, device):
+    """Cached normalised 1D Gaussian kernel (truncated 3σ) on ``device``."""
+    import torch
+    key = (str(device), round(float(sigma), 3))
+    k = _DOG_KERN.get(key)
+    if k is None:
+        r = max(1, int(round(3.0 * sigma)))
+        x = torch.arange(-r, r + 1, device=device, dtype=torch.float32)
+        k = torch.exp(-(x * x) / (2.0 * sigma * sigma))
+        k = k / k.sum()
+        _DOG_KERN[key] = k
+    return k
+
+
+def _sep_blur_torch(f, sigma, device):
+    """Separable real-space Gaussian blur of (N,H,W) via two conv1d passes
+    (reflect padding), matching scipy.ndimage.gaussian_filter."""
+    import torch
+    import torch.nn.functional as F
+    k = _gauss1d_torch(sigma, device)
+    r = (k.numel() - 1) // 2
+    x = f[:, None]                                            # (N,1,H,W)
+    # blur along H (rows): pad H, conv with (1,1,K,1)
+    x = F.pad(x, (0, 0, r, r), mode="reflect")
+    x = F.conv2d(x, k.view(1, 1, -1, 1))
+    # blur along W (cols): pad W, conv with (1,1,1,K)
+    x = F.pad(x, (r, r, 0, 0), mode="reflect")
+    x = F.conv2d(x, k.view(1, 1, 1, -1))
+    return x.squeeze(1)                                       # (N,H,W)
+
+
+def find_vectors_dog_torch_batch(
+    frames: np.ndarray, sigma1: float, sigma2: float, threshold: float,
+    min_distance: int, *, subpixel: bool = True,
+    beamstop_mask: Optional[np.ndarray] = None, device=None,
+):
+    """Batched Difference-of-Gaussians blob finder on the GPU.
+
+    Mirrors :func:`find_vectors._find_vectors_single_frame_dog` (band-pass
+    ``G(σ₁)−G(σ₂)``, MAD-normalised absolute-SNR threshold, local-max + quadratic
+    subpixel) but runs the WHOLE nav block in one batched pass — two separable
+    Gaussian blurs, a max-pool local max, and a single ``nonzero`` extraction.
+    The masked beam-stop region is background-filled with the σ₂ blur (no step).
+    Returns a list of N ``(Ni,3)`` ``[ky, kx, snr]`` arrays.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    dev = device or torch_gpu_device()
+    if dev is None:
+        raise RuntimeError("no torch GPU device available")
+    md, thr = int(min_distance), float(threshold)
+    frames = np.asarray(frames, np.float32)
+    N, H, W = frames.shape
+
+    with _GPU_LOCK:
+        f = torch.as_tensor(np.ascontiguousarray(frames), device=dev)
+        g2 = _sep_blur_torch(f, sigma2, dev)
+        excl_t = None
+        if beamstop_mask is not None and np.any(beamstop_mask):
+            excl_t = torch.as_tensor(np.ascontiguousarray(beamstop_mask), device=dev)
+            # background-fill the stop with the wide blur (no signal->0 step)
+            f = torch.where(excl_t[None], g2, f)
+            g2 = _sep_blur_torch(f, sigma2, dev)     # re-blur after fill
+        g1 = _sep_blur_torch(f, sigma1, dev)
+        resp = g1 - g2                                # (N,H,W)
+
+        # robust per-frame absolute SNR via median + MAD, over UNMASKED pixels
+        # only (the bright beam-stop rim would otherwise inflate the MAD).
+        if excl_t is not None:
+            big = resp.max().detach() + 1.0
+            stat = resp.masked_fill(excl_t[None], float("nan"))
+            flat = stat.reshape(N, -1)
+            med = flat.nanmedian(dim=1).values.view(N, 1, 1)
+            mad = (stat - med).abs().reshape(N, -1).nanmedian(dim=1).values.view(N, 1, 1)
+        else:
+            flat = resp.reshape(N, -1)
+            med = flat.median(dim=1).values.view(N, 1, 1)
+            mad = (resp - med).abs().reshape(N, -1).median(dim=1).values.view(N, 1, 1)
+        scale = 1.4826 * mad
+        # std fallback where MAD ~ 0 (near-flat / low-texture frame)
+        std = resp.reshape(N, -1).std(dim=1, unbiased=False).view(N, 1, 1)
+        scale = torch.where(scale > 1e-6, scale, std).clamp_min(1e-6)
+        snr = (resp - med) / scale
+        if excl_t is not None:
+            snr = snr.masked_fill(excl_t[None], 0.0)
+
+        # local maxima ≥ threshold separated by min_distance (tie-break ramp,
+        # same trick as the NXCORR path so a flat plateau yields one peak).
+        ramp = (torch.arange(H * W, device=dev, dtype=torch.float32)
+                .reshape(1, H, W) * (1e-4 / float(H * W)))
+        snr_t = snr + ramp
+        pooled = F.max_pool2d(snr_t[:, None], kernel_size=2 * md + 1, stride=1,
+                              padding=md).squeeze(1)
+        mask = (snr_t >= pooled) & (snr >= thr)
+        if excl_t is not None:
+            mask = mask & ~excl_t[None]
+
+        idx = mask.nonzero(as_tuple=False)
+        if idx.numel() == 0:
+            return [np.zeros((0, 3), np.float32) for _ in range(N)]
+        nn, yy, xx = idx[:, 0], idx[:, 1], idx[:, 2]
+        vals = snr[nn, yy, xx]
+        if subpixel:
+            # hw=1 (3x3 fit) for DoG: spots are small (~3 px FWHM), so a 5x5
+            # window reaches into the curved flanks and biases the vertex
+            # (~0.08 px error vs ~0.02 px at hw=1, matching the CPU parabola).
+            dy, dx = _fit_peaks_quadratic(snr, nn, yy, xx, dev, hw=1)
+            py = yy.to(torch.float32) + dy
+            px = xx.to(torch.float32) + dx
+        else:
+            py, px = yy.to(torch.float32), xx.to(torch.float32)
+        res = torch.stack([py, px, vals], dim=1).to("cpu").numpy()
+        frame_ids = nn.to("cpu").numpy()
+
+    out = [np.zeros((0, 3), np.float32) for _ in range(N)]
+    order = np.argsort(frame_ids, kind="stable")
+    res, frame_ids = res[order], frame_ids[order]
+    bounds = np.searchsorted(frame_ids, np.arange(N + 1))
+    for i in range(N):
+        if bounds[i + 1] > bounds[i]:
+            out[i] = res[bounds[i]:bounds[i + 1]].astype(np.float32)
+    return out

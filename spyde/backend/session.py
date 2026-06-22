@@ -572,9 +572,25 @@ class Session:
             if not (0 <= int(index) < len(axes)):
                 return
             ax = axes[int(index)]
-            if field in ("scale", "offset"):
+            if field == "scale":
                 try:
-                    setattr(ax, field, float(value))
+                    new_scale = float(value)
+                except (TypeError, ValueError):
+                    return  # ignore non-numeric input mid-typing
+                # Keep the ORIGIN PIXEL fixed when the scale changes: the pixel
+                # where data == 0 is pixel0 = -offset/scale; to pin that same
+                # pixel under the new scale, offset must scale with it:
+                #   offset_new = offset_old * (scale_new / scale_old).
+                # So the (0,0) point (e.g. the crosshair-marked centre) does not
+                # drift when the user recalibrates the pixel size.
+                old_scale = float(ax.scale)
+                old_offset = float(ax.offset)
+                ax.scale = new_scale
+                if old_scale != 0.0:
+                    ax.offset = old_offset * (new_scale / old_scale)
+            elif field == "offset":
+                try:
+                    ax.offset = float(value)
                 except (TypeError, ValueError):
                     return  # ignore non-numeric input mid-typing
             else:
@@ -601,6 +617,112 @@ class Session:
             })
         except Exception as e:
             log.debug("re-emitting metadata failed: %s", e)
+
+    def _set_offset_crosshair(self, plot, payload: dict) -> None:
+        """Toggle a draggable crosshair on the SIGNAL plot that live-sets the two
+        signal-axis offsets so the crosshair position reads (0, 0).
+
+        payload {"on": True}  → drop the crosshair at the current data origin and
+                                update offsets as it moves.
+                {"on": False} → remove the crosshair.
+
+        This is the calibration "set the origin" tool: the user drags the
+        crosshair onto the feature that should be (0,0) (e.g. the direct beam,
+        even when it sits behind a beam stop) and both offsets follow live."""
+        if plot is None:
+            return
+        tree = getattr(plot, "signal_tree", None)
+        if tree is None:
+            return
+        on = bool(payload.get("on", False))
+        plot2d = getattr(plot, "_plot2d", None)
+
+        # always clear any existing crosshair first (idempotent)
+        old = getattr(tree, "_offset_cross", None)
+        if old is not None:
+            try:
+                old.hide()
+            except Exception as e:
+                log.debug("hiding offset crosshair failed: %s", e)
+            tree._offset_cross = None
+        if not on:
+            return
+        if plot2d is None:
+            return
+
+        sig_ax = tree.root.axes_manager.signal_axes
+        if len(sig_ax) < 2:
+            return
+        ax_x, ax_y = sig_ax[0], sig_ax[1]
+        w, h = int(ax_x.size), int(ax_y.size)
+        # Start the crosshair on the pixel that is currently the origin
+        # (data == 0): pixel = -offset/scale, expressed back in data coords for
+        # the widget.  If the data origin is off-image, fall back to the centre.
+        def _origin_data():
+            sx, ox = float(ax_x.scale), float(ax_x.offset)
+            sy, oy = float(ax_y.scale), float(ax_y.offset)
+            pxi = (-ox / sx) if sx else w / 2.0
+            pyi = (-oy / sy) if sy else h / 2.0
+            if not (0 <= pxi <= w and 0 <= pyi <= h):
+                pxi, pyi = w / 2.0, h / 2.0
+            return pxi * sx + ox, pyi * sy + oy
+        cx0, cy0 = _origin_data()
+        try:
+            cross = plot2d.add_crosshair_widget(cx=cx0, cy=cy0, color="#ffae57")
+        except Exception as e:
+            log.debug("offset crosshair add failed: %s", e)
+            return
+        tree._offset_cross = cross
+
+        # Capture the calibration at toggle-on time as the FIXED reference for
+        # converting the widget's data coords → pixel.  The widget reports data
+        # coords under whatever offset is current, but we mutate the offset every
+        # move; deriving the pixel from the live (mutating) offset would feed back
+        # and drift.  Anchoring to the reference offset keeps a stationary
+        # crosshair mapping to a stationary pixel across repeated applies.
+        ref = {"sx": float(ax_x.scale), "ox": float(ax_x.offset),
+               "sy": float(ax_y.scale), "oy": float(ax_y.offset)}
+
+        def _apply(final: bool):
+            # Recover the PIXEL the crosshair sits on (using the reference
+            # calibration), then set each offset so that pixel maps to data 0:
+            # offset_new = -pixel * scale.  Stable across repeated move events.
+            try:
+                sx, sy = ref["sx"], ref["sy"]
+                px = (float(cross.cx) - ref["ox"]) / sx if sx else 0.0
+                py = (float(cross.cy) - ref["oy"]) / sy if sy else 0.0
+                ax_x.offset = -px * sx
+                ax_y.offset = -py * sy
+            except Exception as e:
+                log.debug("offset crosshair update failed: %s", e)
+                return
+            # Live: re-emit the axes table so the dock shows the new offsets as
+            # the user drags.  Defer the full plot re-push (which rewrites the
+            # displayed extent, and would shift the widget under the cursor) to
+            # pointer-up so dragging stays smooth.
+            self._emit_axes(tree)
+            if final:
+                for p in list(self._plots):
+                    if getattr(p, "signal_tree", None) is tree:
+                        try:
+                            p.update()
+                        except Exception as e:
+                            log.debug("re-pushing plot after offset set failed: %s", e)
+                # The displayed extent now reflects the new offset, so the widget
+                # sits at data coord 0.  Re-anchor the reference to the new
+                # calibration so a SUBSEQUENT drag is interpreted correctly.
+                ref["ox"], ref["oy"] = float(ax_x.offset), float(ax_y.offset)
+
+        def _on_event(event=None):
+            etype = getattr(event, "type", None) or getattr(event, "name", None)
+            _apply(final=(etype == "pointer_up"))
+
+        try:
+            cross.add_event_handler(_on_event, "pointer_move", "pointer_up")
+        except Exception as e:
+            log.debug("offset crosshair handler bind failed: %s", e)
+        # apply once so the starting position is reflected immediately
+        _apply(final=True)
 
     def _update_vi(self, window_id: int, name: str, params: dict) -> None:
         """A per-VI caret edit — apply new detector params and recompute that
@@ -836,6 +958,8 @@ class Session:
             self._select_signal_node(plot, payload.get("signal_id"))
         elif action == "set_axis":
             self._set_axis(plot, payload)
+        elif action == "set_offset_crosshair":
+            self._set_offset_crosshair(plot, payload)
         elif action == "set_overlay":
             self._set_overlay(plot, payload.get("name"),
                               bool(payload.get("visible", True)))

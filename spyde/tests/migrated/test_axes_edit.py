@@ -53,3 +53,33 @@ class TestAxesEdit:
             assert "Shape" in md[-1]["metadata"]["Dataset"]
         finally:
             session.shutdown()
+
+    def test_scale_edit_preserves_origin_pixel(self):
+        """Changing scale rescales the offset so the (0,0) data point stays on
+        the SAME pixel — recalibrating pixel size must not move the marked
+        origin / crosshair centre."""
+        import hyperspy.api as hs
+        from spyde.backend.session import Session
+        session = Session(n_workers=1, threads_per_worker=1)
+        try:
+            s = hs.signals.Signal2D(np.zeros((4, 5, 20, 20), np.float32))
+            s.set_signal_type("electron_diffraction")
+            # _axes order is nav-first; signal kx is index 3 (matches the test
+            # above). Configure that axis so the edit targets it.
+            s.axes_manager._axes[3].scale = 0.1
+            s.axes_manager._axes[3].offset = -1.0   # origin pixel = 1.0/0.1 = 10
+            session._add_signal(s)
+            time.sleep(0.3)
+            plot = _signal_plot(session)
+            axx = plot.signal_tree.root.axes_manager._axes[3]
+            origin_px = -float(axx.offset) / float(axx.scale)
+            assert abs(origin_px - 10.0) < 1e-9
+
+            # double the scale → offset should double so origin pixel stays 10
+            session._set_axis(plot, {"index": 3, "field": "scale", "value": "0.2"})
+            assert abs(float(axx.scale) - 0.2) < 1e-9
+            assert abs(float(axx.offset) - (-2.0)) < 1e-9
+            new_origin_px = -float(axx.offset) / float(axx.scale)
+            assert abs(new_origin_px - origin_px) < 1e-9
+        finally:
+            session.shutdown()
