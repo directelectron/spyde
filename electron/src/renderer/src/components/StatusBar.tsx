@@ -1,6 +1,14 @@
 import React from 'react'
 import { useSpyDE } from '../kernel/SpyDEContext'
 
+// One-time keyframes for the loading spinner (renderer has no global CSS file).
+if (typeof document !== 'undefined' && !document.getElementById('spyde-spin-kf')) {
+  const el = document.createElement('style')
+  el.id = 'spyde-spin-kf'
+  el.textContent = '@keyframes spyde-spin { to { transform: rotate(360deg) } }'
+  document.head.appendChild(el)
+}
+
 export function StatusBar({ logOpen, onToggleLog }: {
   logOpen?: boolean
   onToggleLog?: () => void
@@ -11,10 +19,15 @@ export function StatusBar({ logOpen, onToggleLog }: {
     (e) => e.level === 'WARNING' || e.level === 'ERROR' || e.level === 'CRITICAL',
   ).length
 
+  const busy = state.loading.busy
+
   return (
     <div style={styles.bar}>
+      {/* Spinner during a long file read so the cold-cache load of a big file
+          doesn't look hung. */}
+      {busy && <span data-testid="loading-spinner" style={styles.spinner} aria-label="Loading" />}
       <span style={styles.text} data-testid="status-text">
-        {state.status}
+        {busy && state.loading.text ? state.loading.text : state.status}
       </span>
       {state.dashboardUrl && (
         <button
@@ -54,6 +67,11 @@ const styles: Record<string, React.CSSProperties> = {
     userSelect: 'none',
   },
   text: { fontSize: 12, color: '#a6adc8', flex: 1 },
+  spinner: {
+    width: 12, height: 12, borderRadius: '50%', flexShrink: 0,
+    border: '2px solid #45475a', borderTopColor: '#89b4fa',
+    animation: 'spyde-spin 0.8s linear infinite',
+  },
   link: {
     background: 'none', border: 'none', color: '#89b4fa',
     fontSize: 12, cursor: 'pointer', padding: 0,

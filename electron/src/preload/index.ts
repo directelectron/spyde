@@ -21,6 +21,10 @@ contextBridge.exposeInMainWorld('electron', {
   onOpenDashboard: (cb: () => void) =>
     ipcRenderer.on('spyde:open_dashboard', () => cb()),
 
+  /** Launch a guided tour by id (from the Help menu). */
+  onStartGuide: (cb: (id: string) => void) =>
+    ipcRenderer.on('spyde:start_guide', (_, id: string) => cb(id)),
+
   // ── Renderer → Python ─────────────────────────────────────────────────────
 
   /** Send a toolbar/menu action to Python. */

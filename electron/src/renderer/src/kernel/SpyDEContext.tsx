@@ -108,6 +108,20 @@ interface State {
   streamLines: Array<{ text: string; kind: 'stdout' | 'stderr' }>
   logEntries: LogEntry[]          // application-log records (the log panel)
   logLevel: string                // current backend verbosity (DEBUG…CRITICAL)
+  navShapePrompt: NavShapePrompt | null   // pending scan-shape/step-size dialog
+  loading: { busy: boolean; text: string }   // long file-read busy indicator
+  signalTypes: Map<number, { current: string; options: string[] }>   // windowId → signal-type info
+}
+
+// Backend `nav_shape_prompt`: confirm the scan grid + step size before opening a
+// navigated dataset (4D-STEM / stack). Mirrors NavShapeDialog's prop type.
+export interface NavShapePrompt {
+  nav_shape: number[]
+  n_patterns: number
+  signal_shape: number[]
+  scale: number
+  units: string
+  filename: string
 }
 
 type Action =
@@ -126,6 +140,9 @@ type Action =
   | { type: 'ACTION_ACTIVE'; windowId: number; name: string; active: boolean }
   | { type: 'SUB_ITEM'; windowId: number; action: string; name: string; color: string; vtype?: string; calculation?: string; active: boolean }
   | { type: 'HISTOGRAM'; windowId: number; histogram: Histogram }
+  | { type: 'NAV_SHAPE_PROMPT'; prompt: NavShapePrompt | null }
+  | { type: 'LOADING'; busy: boolean; text: string }
+  | { type: 'SIGNAL_TYPE'; windowIds: number[]; current: string; options: string[] }
   | { type: 'SELECTOR_INFO'; info: SelectorInfo }
   | { type: 'SIGNAL_TREE'; windowId: number; tree: TreeNode; activeSignalId?: number }
   | { type: 'STREAM'; text: string; kind: 'stdout' | 'stderr' }
@@ -351,6 +368,19 @@ function spydeReducer(state: State, action: Action): State {
     case 'LOG_LEVEL':
       return { ...state, logLevel: action.level }
 
+    case 'NAV_SHAPE_PROMPT':
+      return { ...state, navShapePrompt: action.prompt }
+
+    case 'LOADING':
+      return { ...state, loading: { busy: action.busy, text: action.text } }
+
+    case 'SIGNAL_TYPE': {
+      const signalTypes = new Map(state.signalTypes)
+      for (const wid of action.windowIds)
+        signalTypes.set(wid, { current: action.current, options: action.options })
+      return { ...state, signalTypes }
+    }
+
     default:
       return state
   }
@@ -368,6 +398,7 @@ interface SpyDEContextValue {
   sendAction: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
   setActiveWindow: (windowId: number) => void
   replayState: (figId: string) => void
+  clearNavShapePrompt: () => void
 }
 
 const SpyDEContext = createContext<SpyDEContextValue | null>(null)
@@ -394,6 +425,9 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     streamLines: [],
     logEntries: [],
     logLevel: 'INFO',
+    navShapePrompt: null,
+    loading: { busy: false, text: '' },
+    signalTypes: new Map(),
   })
 
   const iframeRefs = useRef<Map<string, HTMLIFrameElement>>(new Map())
@@ -569,6 +603,23 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
           })
           break
 
+        case 'nav_shape_prompt':
+          dispatch({ type: 'NAV_SHAPE_PROMPT', prompt: msg as unknown as NavShapePrompt })
+          break
+
+        case 'loading':
+          dispatch({ type: 'LOADING', busy: Boolean(msg.busy), text: String(msg.text ?? '') })
+          break
+
+        case 'signal_type_info':
+          dispatch({
+            type: 'SIGNAL_TYPE',
+            windowIds: (msg.window_ids as number[]) ?? [],
+            current: String(msg.current ?? ''),
+            options: (msg.options as string[]) ?? [],
+          })
+          break
+
         case 'selector_info':
           dispatch({
             type: 'SELECTOR_INFO',
@@ -700,8 +751,10 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
   const setActiveWindow = (windowId: number) =>
     dispatch({ type: 'SET_ACTIVE', windowId })
 
+  const clearNavShapePrompt = () => dispatch({ type: 'NAV_SHAPE_PROMPT', prompt: null })
+
   return (
-    <SpyDEContext.Provider value={{ state, iframeRefs, latestStates, sendAction, setActiveWindow, replayState }}>
+    <SpyDEContext.Provider value={{ state, iframeRefs, latestStates, sendAction, setActiveWindow, replayState, clearNavShapePrompt }}>
       {children}
     </SpyDEContext.Provider>
   )

@@ -145,20 +145,53 @@ class BaseSignalTree:
         nav_plot = nav_plots[0]
         nav_shape = tuple(nav_dask.shape)
 
-        # No cluster yet (it takes ~10 s to start; examples load sooner): compute
-        # the navigator on a BACKGROUND thread with the threaded scheduler so the
-        # already-displayed window fills in without blocking, and without waiting
-        # for the distributed client.
+        # No cluster yet (it takes ~10 s to start; examples load sooner, and a
+        # huge MRC's navigator sum can take minutes): compute the navigator on a
+        # BACKGROUND thread with the threaded scheduler so the already-displayed
+        # window stays interactive (crosshair works) while it fills in.
+        #
+        # Compute PER NAV-CHUNK and paint after each, so the navigator fills
+        # PROGRESSIVELY (top-to-bottom) instead of staying blank until the whole
+        # multi-GB sum finishes — that "blank navigator that never fills" was the
+        # symptom on the large Windows scan.
         if self.client is None:
-            nav_plot.current_data = np.full(nav_shape, np.nan, dtype=np.float32)
+            import itertools
 
-            def _bg_nav(_dask=nav_dask, _plot=nav_plot, _sig=nav_signals):
+            placeholder = np.full(nav_shape, np.nan, dtype=np.float32)
+            nav_plot.current_data = placeholder
+            # Stop flag so the thread bails out cleanly on tree/session shutdown
+            # instead of painting onto a torn-down plot.
+            stop = threading.Event()
+            self._nav_stop = stop
+
+            def _bg_nav(_dask=nav_dask, _plot=nav_plot, _sig=nav_signals,
+                        _shape=nav_shape, _stop=stop):
                 try:
-                    arr = np.asarray(_dask.compute()).astype(np.float32)
-                    _plot.needs_auto_level = True
-                    _plot.set_data(arr)
+                    acc = np.full(_shape, np.nan, dtype=np.float32)
+                    levels = [None]
+                    # Walk the navigation chunk grid; compute + paint each block.
+                    axes_ranges = []
+                    for axis_chunks in _dask.chunks[: len(_shape)]:
+                        pos, start = [], 0
+                        for size in axis_chunks:
+                            pos.append((start, size))
+                            start += size
+                        axes_ranges.append(pos)
+                    for combo in itertools.product(*axes_ranges):
+                        if _stop.is_set():
+                            return
+                        nav_slices = tuple(slice(s, s + n) for s, n in combo)
+                        block = np.asarray(_dask[nav_slices].compute()).astype(np.float32)
+                        acc[nav_slices] = block
+                        finite = acc[np.isfinite(acc)]
+                        if finite.size:
+                            lo, hi = float(finite.min()), float(finite.max())
+                            levels[0] = (lo, hi if hi > lo else lo + 1)
+                        if _stop.is_set():
+                            return
+                        _plot.set_data(acc.copy(), levels=levels[0])
                     if _sig:
-                        _sig[0].data = arr
+                        _sig[0].data = acc
                 except Exception:
                     # Primary (threaded) navigator load — a failure here leaves a
                     # blank navigator, so surface the traceback rather than hide it.

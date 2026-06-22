@@ -1,6 +1,5 @@
 {
   "compilerOptions": {
-    "composite": true,
     "target": "ESNext",
     "module": "ESNext",
     "moduleResolution": "bundler",
@@ -8,9 +7,8 @@
     "strict": true,
     "skipLibCheck": true,
     "lib": ["ESNext", "DOM"],
-    "types": [],
     "baseUrl": ".",
     "paths": { "@guides/*": ["../guides/*"] }
   },
-  "include": ["src/renderer/src/**/*", "../guides/**/*"]
+  "include": ["src/**/*", "../guides/**/*"]
 }

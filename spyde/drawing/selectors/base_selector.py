@@ -116,6 +116,52 @@ class BaseSelector:
 
     # ── Indexing ──────────────────────────────────────────────────────────────
 
+    def _display_axes(self):
+        """The (x_axis, y_axis) HyperSpy axes the parent plot is drawn against,
+        in widget-coordinate order (axis 0 = x = columns, axis 1 = y = rows).
+
+        The plot's image is rendered with these axes' CALIBRATION (scale +
+        offset + units), so the interactive widget reports its position in their
+        DATA coordinates — e.g. nanometres for a 3 nm-step navigator. Returns
+        ``None`` when calibration is unavailable (then coords are pixel
+        indices already)."""
+        plot = self.current_plot
+        if plot is None or getattr(plot, "plot_state", None) is None:
+            return None
+        try:
+            sig = plot.plot_state.current_signal
+            sig_axes = sig.axes_manager.signal_axes
+            # anyplotlib draws against signal_axes (for a navigator plot these
+            # ARE the navigation axes). signal_axes is in (x, y) order.
+            if len(sig_axes) >= 2:
+                return sig_axes[0], sig_axes[1]
+        except Exception as e:
+            logger.debug("reading display axes for index mapping failed: %s", e)
+        return None
+
+    def _data_to_index(self, value_x: float, value_y: float) -> tuple[int, int]:
+        """Convert a widget position in DATA coordinates to integer array
+        indices, dividing out the displayed axes' scale/offset:
+        ``index = round((value - offset) / scale)``.
+
+        With unit scale and zero offset (the synthetic fixtures, and any
+        uncalibrated image) this is just ``round(value)`` — so the change is a
+        no-op there and only corrects calibrated images, where using the raw
+        data coordinate as an index loads the WRONG pixel (the 3 nm-step bug)."""
+        axes = self._display_axes()
+        if axes is None:
+            return int(round(value_x)), int(round(value_y))
+        x_ax, y_ax = axes
+        try:
+            sx = float(getattr(x_ax, "scale", 1.0)) or 1.0
+            sy = float(getattr(y_ax, "scale", 1.0)) or 1.0
+            ox = float(getattr(x_ax, "offset", 0.0))
+            oy = float(getattr(y_ax, "offset", 0.0))
+            return int(round((value_x - ox) / sx)), int(round((value_y - oy) / sy))
+        except Exception as e:
+            logger.debug("data→index conversion failed: %s", e)
+            return int(round(value_x)), int(round(value_y))
+
     def _get_selected_indices(self) -> np.ndarray:
         raise NotImplementedError("Subclasses must implement _get_selected_indices.")
 

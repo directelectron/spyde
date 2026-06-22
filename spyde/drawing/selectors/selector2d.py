@@ -55,8 +55,10 @@ class CrosshairSelector(BaseSelector):
     def _get_selected_indices(self) -> np.ndarray:
         if self._widget is None:
             return np.array([[0, 0]])
-        cx = int(round(float(self._widget.cx)))
-        cy = int(round(float(self._widget.cy)))
+        # Widget cx/cy are in the displayed image's DATA coordinates (axis units,
+        # e.g. nm); convert to array indices via the axes' scale/offset so a
+        # calibrated (e.g. 3 nm-step) navigator selects the right pixel.
+        cx, cy = self._data_to_index(float(self._widget.cx), float(self._widget.cy))
         return np.array([[cx, cy]])
 
     def add_linked_roi(self, plot: "Plot") -> None:
@@ -117,8 +119,11 @@ class RectangleSelector(BaseSelector):
         w = float(self._widget.w)
         h = float(self._widget.h)
 
-        x0, x1 = int(round(x)), int(round(x + w))
-        y0, y1 = int(round(y)), int(round(y + h))
+        # Convert the rectangle's data-coordinate bounds to array indices using
+        # the displayed axes' scale/offset (same calibration fix as the
+        # crosshair) so an integrating ROI sums the right pixels.
+        x0, y0 = self._data_to_index(x, y)
+        x1, y1 = self._data_to_index(x + w, y + h)
 
         x_indices = np.arange(x0, max(x0 + 1, x1), dtype=int)
         y_indices = np.arange(y0, max(y0 + 1, y1), dtype=int)

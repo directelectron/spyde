@@ -41,6 +41,43 @@ def _prewarm_anyplotlib() -> None:
     threading.Thread(target=_warm, daemon=True, name="anyplotlib-prewarm").start()
 
 
+def _prewarm_io() -> None:
+    """Warm the file-I/O + diffraction stacks off the critical path.
+
+    The FIRST ``hs.load`` of a session lazily imports the RosettaSciIO readers +
+    format machinery (~6 s here, longer on a cold disk), and the first
+    ``_add_signal`` pulls in pyxem (~2 s). Without prewarming, the first file the
+    user opens pays all of that on the load thread — the window sits on
+    "Reading …" for many seconds and looks hung (the dialog/windows only appear
+    once those imports finish). Do it once at startup in a daemon thread so the
+    first real open is instant. Idempotent: Python caches the modules, so the
+    user's later ``hs.load`` just reuses them."""
+    def _warm() -> None:
+        import tempfile, os as _os
+        try:
+            import numpy as np
+            import hyperspy.api as hs
+            # A tiny real round-trip forces the hspy/zspy reader import path that
+            # the first user load would otherwise pay for.
+            tmp = _os.path.join(tempfile.gettempdir(), "spyde_prewarm.hspy")
+            try:
+                hs.signals.Signal2D(np.zeros((2, 2), dtype="float32")).save(tmp, overwrite=True)
+                hs.load(tmp, lazy=True)
+            finally:
+                try:
+                    _os.remove(tmp)
+                except OSError:
+                    pass
+        except Exception as e:
+            log.debug("io prewarm (hyperspy) failed: %s", e)
+        try:
+            import pyxem  # noqa: F401  — first import is ~2 s; warm it now.
+        except Exception as e:
+            log.debug("io prewarm (pyxem) failed: %s", e)
+    import threading
+    threading.Thread(target=_warm, daemon=True, name="io-prewarm").start()
+
+
 async def _main() -> None:
     from spyde.backend.ipc import read_messages, emit, emit_status, redirect_stray_stdout
     from spyde.backend.session import Session
@@ -74,6 +111,9 @@ async def _main() -> None:
     # startup so the first dataset-load windows aren't slow. (Warm windows are
     # ~50 ms; this moves the cold cost off the user's critical path.)
     _prewarm_anyplotlib()
+    # Warm the file-reader + pyxem imports too, so the FIRST file open isn't slow
+    # (the "stuck on Reading…" until a second load — really first-call import lag).
+    _prewarm_io()
 
     emit({"type": "ready"})
 

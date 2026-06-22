@@ -12,6 +12,7 @@ import os
 import threading
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import hyperspy.api as hs
 from hyperspy.signal import BaseSignal
 
@@ -159,12 +160,24 @@ class Session:
             emit_error(f"Unsupported file type: {ext}")
             return
 
-        emit_status(f"Loading {os.path.basename(path)}…")
+        # A large file's lazy load is a one-time cold-cache disk read (reading the
+        # header + building the dask graph for an 11 GB MRC can take tens of
+        # seconds the FIRST time; the OS cache makes the next open instant). Say
+        # so, and flag a busy state so the frontend can show a spinner instead of
+        # looking hung. Emit the busy flag FIRST so it paints before the read.
+        try:
+            size_gb = os.path.getsize(path) / 1e9
+        except OSError:
+            size_gb = 0.0
+        name = os.path.basename(path)
+        hint = " (first open of a large file can take a while)" if size_gb >= 1 else ""
+        emit({"type": "loading", "busy": True, "text": f"Reading {name}…{hint}"})
+        emit_status(f"Reading {name}…{hint}")
         threading.Thread(
             target=self._load_file_thread,
             args=(path,),
             daemon=True,
-            name=f"load-{os.path.basename(path)}",
+            name=f"load-{name}",
         ).start()
 
     def _load_file_thread(self, path: str) -> None:
@@ -172,12 +185,119 @@ class Session:
             signal = hs.load(path, lazy=True)
             if not isinstance(signal, list):
                 signal = [signal]
+            # File read done — clear the busy flag (a nav-shape prompt or the
+            # opened windows take over from here).
+            emit({"type": "loading", "busy": False, "text": ""})
+            # A single navigated signal (e.g. a 4D-STEM MRC scan) → let the user
+            # confirm/override the navigation shape and set the real step size
+            # (calibration) before opening. Everything else opens directly.
+            if len(signal) == 1 and self._wants_nav_prompt(signal[0]):
+                self._prompt_nav_shape(signal[0], path)
+                return
             for sig in signal:
                 self._add_signal(sig, source_path=path)
             self._add_recent(path)
             emit({"type": "recent_files", "paths": self._recent_files[:20]})
         except Exception as e:
+            emit({"type": "loading", "busy": False, "text": ""})
             emit_error(f"Failed to load {os.path.basename(path)}: {e}")
+
+    @staticmethod
+    def _wants_nav_prompt(sig: BaseSignal) -> bool:
+        """True for a signal where confirming the scan shape + step size is
+        useful: a 2-D-signal dataset that is either already navigated (4D-STEM)
+        or a flat stack of images (nav-dim 1) that the user may want to fold into
+        a 2-D scan grid."""
+        try:
+            am = sig.axes_manager
+            return am.signal_dimension == 2 and am.navigation_dimension >= 1
+        except Exception:
+            return False
+
+    def _prompt_nav_shape(self, sig: BaseSignal, path: str) -> None:
+        """Stash the loaded (lazy) signal and ask the frontend to confirm the
+        navigation shape + step size. The reply arrives as the
+        ``confirm_nav_shape`` action → :meth:`_confirm_nav_shape`."""
+        am = sig.axes_manager
+        nav_shape = list(am.navigation_shape)          # (x, y[, …]) display order
+        n_patterns = int(np.prod(nav_shape)) if nav_shape else 0
+        nav_axes = am.navigation_axes
+        scale = float(nav_axes[0].scale) if nav_axes else 1.0
+        units = (nav_axes[0].units if nav_axes else "") or ""
+        if units in ("<undefined>",):
+            units = ""
+        self._pending_load = (sig, path)
+        emit({
+            "type": "nav_shape_prompt",
+            "nav_shape": nav_shape,        # inferred (display x, y) order
+            "n_patterns": n_patterns,      # total frames → factor options for a stack
+            "signal_shape": list(am.signal_shape),
+            "scale": scale,
+            "units": units or "nm",
+            "filename": os.path.basename(path),
+        })
+
+    def _confirm_nav_shape(self, payload: dict) -> None:
+        """Apply the user's chosen navigation shape + step size to the stashed
+        signal, then open it. ``nav_shape`` is in display (x, y) order; an empty
+        / null shape means 'keep as loaded'."""
+        pending = getattr(self, "_pending_load", None)
+        if pending is None:
+            return
+        sig, path = pending
+        self._pending_load = None
+        try:
+            nav_shape = payload.get("nav_shape") or None      # display (x, y) order
+            step = payload.get("step_size")
+            units = payload.get("units") or "nm"
+            sig = self._apply_nav_shape(sig, nav_shape, step, units)
+        except Exception as e:
+            emit_error(f"Could not apply navigation shape: {e}")
+            # Fall back to opening the signal as-loaded so the user isn't stuck.
+        self._add_signal(sig, source_path=path)
+        self._add_recent(path)
+        emit({"type": "recent_files", "paths": self._recent_files[:20]})
+
+    @staticmethod
+    def _apply_nav_shape(sig: BaseSignal, nav_shape, step, units):
+        """Reshape the navigation space to ``nav_shape`` (display x,y order) if it
+        differs from the current shape, and calibrate the navigation axes to
+        ``step``/``units``. Lazy-safe: the reshape is a dask-array view — the data
+        is never materialised."""
+        am = sig.axes_manager
+        cur = list(am.navigation_shape)
+        if nav_shape and [int(n) for n in nav_shape] != cur:
+            # HyperSpy data layout is (nav reversed) + signal. nav_shape is
+            # display (x, y), so the data's nav block is its reverse → (…, y, x).
+            new_nav_data = tuple(reversed([int(n) for n in nav_shape]))
+            sig_data = tuple(reversed([int(s) for s in am.signal_shape]))
+            total_nav = int(np.prod(new_nav_data))
+            cur_total = int(np.prod(cur)) if cur else 0
+            if cur_total and total_nav != cur_total:
+                raise ValueError(
+                    f"nav shape {tuple(nav_shape)} ({total_nav} frames) ≠ "
+                    f"{cur_total} frames in the data"
+                )
+            reshaped = sig.data.reshape(new_nav_data + sig_data)
+            # Build a fresh signal of the same class so axes/metadata are
+            # consistent with the new shape (rather than poking axes_manager).
+            new = sig.__class__(reshaped)
+            if getattr(sig, "_lazy", False) and not getattr(new, "_lazy", False):
+                new = new.as_lazy()
+            try:
+                new.metadata = sig.metadata.deepcopy()
+                stype = sig.metadata.get_item("Signal.signal_type", "")
+                if stype:
+                    new.set_signal_type(stype)
+            except Exception as e:
+                log.debug("carrying metadata across reshape failed: %s", e)
+            sig, am = new, new.axes_manager
+        # Calibrate the navigation axes' step size + units.
+        if step:
+            for ax in am.navigation_axes:
+                ax.scale = float(step)
+                ax.units = units
+        return sig
 
     def load_example_data(self, name: str) -> None:
         import pyxem.data as _pxd
@@ -280,6 +400,7 @@ class Session:
         except Exception as e:
             log.warning("metadata emit failed: %s", e)
         self._emit_axes(tree)
+        self._emit_signal_type(tree)
         try:
             from spyde.actions.composition import emit_composition
             emit_composition(tree, self._tree_window_ids(tree))
@@ -288,6 +409,58 @@ class Session:
 
         emit_status(f"Loaded: {title or 'Signal'}")
         return tree
+
+    # Signal types offered in the sidebar dropdown (HyperSpy/pyxem). "" = the
+    # generic BaseSignal/Signal2D with no specialised type.
+    _SIGNAL_TYPES = (
+        "",
+        "electron_diffraction",
+        "diffraction",
+        "electron_microscope",
+        "EELS",
+        "EDS_TEM",
+        "EDS_SEM",
+        "hologram",
+    )
+
+    def _emit_signal_type(self, tree) -> None:
+        """Tell the sidebar the active signal's current HyperSpy ``signal_type``
+        and the list of types it can be switched to."""
+        try:
+            stype = tree.root.metadata.get_item("Signal.signal_type", default="") or ""
+            emit({
+                "type": "signal_type_info",
+                "window_ids": self._tree_window_ids(tree),
+                "current": stype,
+                "options": list(self._SIGNAL_TYPES),
+            })
+        except Exception as e:
+            log.warning("signal_type emit failed: %s", e)
+
+    def _set_signal_type(self, plot, signal_type: str) -> None:
+        """Apply a new HyperSpy ``signal_type`` to the active plot's current
+        signal (re-casts the signal class), then re-emit metadata/axes/type so
+        the sidebar + downstream actions reflect the change."""
+        if plot is None or getattr(plot, "signal_tree", None) is None:
+            return
+        tree = plot.signal_tree
+        try:
+            sig = plot.plot_state.current_signal if plot.plot_state else tree.root
+            sig.set_signal_type(signal_type or "")
+        except Exception as e:
+            emit_error(f"Could not set signal type to {signal_type!r}: {e}")
+            return
+        # Re-broadcast the dependent sidebar panels.
+        try:
+            from spyde.metadata_extract import build_metadata_dict
+            emit({
+                "type": "metadata",
+                "window_ids": self._tree_window_ids(tree),
+                "metadata": build_metadata_dict(tree),
+            })
+        except Exception as e:
+            log.debug("metadata re-emit after signal-type change failed: %s", e)
+        self._emit_signal_type(tree)
 
     def _tree_window_ids(self, tree) -> list[int]:
         return sorted({
@@ -674,6 +847,10 @@ class Session:
             self._update_vi(window_id, payload.get("name"), payload.get("params", {}))
         elif action == "open_file":
             self.open_file(payload["path"])
+        elif action == "confirm_nav_shape":
+            self._confirm_nav_shape(payload)
+        elif action == "set_signal_type":
+            self._set_signal_type(plot, payload.get("signal_type", ""))
         elif action == "load_example":
             self.load_example_data(payload["name"])
         elif action == "save_signal":
