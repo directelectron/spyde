@@ -43,10 +43,16 @@ for (const f of ['pyproject.toml', 'uv.lock']) {
 //    test suite and caches to keep the payload small.
 cpSync(join(repoRoot, 'spyde'), join(outDir, 'spyde'), {
   recursive: true,
-  filter: (src) =>
-    !src.includes(`${'spyde'}/tests`) &&
-    !src.includes('__pycache__') &&
-    !src.endsWith('.pyc'),
+  filter: (src) => {
+    // Normalise separators: cpSync hands back backslash paths on Windows, so a
+    // hard-coded "spyde/tests" check would silently fail to exclude the tests.
+    const p = src.replaceAll('\\', '/')
+    return (
+      !p.includes('/spyde/tests') &&
+      !p.includes('__pycache__') &&
+      !p.endsWith('.pyc')
+    )
+  },
 })
 log('staged spyde/ source')
 

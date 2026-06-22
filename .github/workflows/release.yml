@@ -1,15 +1,22 @@
 name: Release
 
 # Fires only when a version tag (e.g. v0.1.0) is pushed.
-# Every platform builds in parallel; the Release is created only when all
-# three pass so users never see a partial release.
+# Builds the Electron desktop app (with the uv-managed Python sidecar — see
+# electron/PACKAGING.md, DISTRIBUTION_PLAN.md "Option A") on each platform in
+# parallel. The GitHub Release is created only when all three legs pass so users
+# never see a partial release.
+#
+# Each installer stays small: it ships `uv` + the project source + uv.lock as
+# extraResources; the venv (with the GPU-correct torch wheel) is built on the
+# user's machine on first launch via `uv sync`. torch is NOT baked into the
+# artifact.
 on:
   push:
     tags:
       - "v*"
 
 jobs:
-  # ── Build SpyDE on each platform ──────────────────────────────────────────
+  # ── Build the Electron app + staged Python sidecar on each platform ─────────
   build:
     name: Build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -18,116 +25,63 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            artifact_name: SpyDE-windows.zip
-            artifact_path: dist/SpyDE-windows.zip
-
+            # electron-builder (nsis) emits "SpyDE Setup <version>.exe".
+            artifact_glob: electron/dist/*.exe
           - os: macos-latest
-            artifact_name: SpyDE.dmg
-            artifact_path: dist/SpyDE.dmg
-
+            artifact_glob: electron/dist/*.dmg
           - os: ubuntu-latest
-            artifact_name: SpyDE.AppImage
-            artifact_path: dist/SpyDE.AppImage
+            artifact_glob: electron/dist/*.AppImage
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+      # ── Node (Electron frontend + electron-builder) ──────────────────────────
+      - name: Set up Node
+        uses: actions/setup-node@v4
         with:
-          python-version: "3.12"
+          node-version: "20"
 
-      # Cache pip downloads to speed up repeat builds.
-      - name: Cache pip
-        uses: actions/cache@v4
+      # ── uv (vendored into the installer as the Python sidecar bootstrapper) ──
+      # bundle-python.mjs copies the `uv` on PATH into the payload when
+      # electron/vendor/uv/<platform>/ is absent, so installing uv here is what
+      # populates the shipped binary.
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
         with:
-          path: |
-            ~/.cache/pip
-            ~/AppData/Local/pip/Cache
-          key: pip-${{ matrix.os }}-${{ hashFiles('pyproject.toml') }}
-          restore-keys: |
-            pip-${{ matrix.os }}-
+          enable-cache: true
 
-      # Linux needs a display server for PySide6 imports during bundling.
-      - name: Install Linux system dependencies
+      # AppImage tooling needs FUSE on the runner.
+      - name: Install Linux packaging deps
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y --no-install-recommends \
-            libgl1 libglib2.0-0 libxcb-icccm4 libxcb-image0 \
-            libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 \
-            libxcb-xinerama0 libxcb-xfixes0 xvfb fuse libfuse2
+          sudo apt-get install -y --no-install-recommends fuse libfuse2
 
-      - name: Install spyde and all dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[tests]"
+      - name: Install Electron dependencies
+        working-directory: electron
+        run: npm ci
 
-      - name: Install PyCrucible
-        run: pip install pycrucible
-
-      # ── Windows ───────────────────────────────────────────────────────────
-      # tools/inject_icon.py safely injects the .ico by stripping the runner,
-      # applying rcedit to only that portion, then re-assembling the exe so
-      # PyCrucible's appended zip payload is never touched.
-      - name: Build (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          pycrucible --embed . --output dist/SpyDE.exe
-
-      - name: Inject Windows icon
-        if: runner.os == 'Windows'
-        run: python tools/inject_icon.py dist/SpyDE.exe spyde/Spyde.ico
-
-      - name: Package Windows artifacts
-        if: runner.os == 'Windows'
-        run: |
-          Copy-Item create_shortcut.ps1    dist\create_shortcut.ps1
-          Compress-Archive `
-            -Path dist\SpyDE.exe, dist\create_shortcut.ps1 `
-            -DestinationPath dist\SpyDE-windows.zip -Force
-
-      # ── macOS ─────────────────────────────────────────────────────────────
-      - name: Build (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          mkdir -p dist
-          pycrucible --embed . --output dist/SpyDE
-
-      - name: Package macOS .app → .dmg
-        if: runner.os == 'macOS'
-        run: |
-          brew install create-dmg || true
-          create-dmg \
-            --volname "SpyDE" \
-            --volicon "spyde/icon.icns" \
-            --window-pos 200 120 \
-            --window-size 600 400 \
-            --icon-size 128 \
-            --icon "SpyDE" 175 190 \
-            --app-drop-link 425 190 \
-            "dist/SpyDE.dmg" \
-            "dist/SpyDE" || \
-          hdiutil create -volname SpyDE -srcfolder dist/SpyDE \
-            -ov -format UDZO dist/SpyDE.dmg
-
-      # ── Linux ─────────────────────────────────────────────────────────────
-      - name: Build (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          mkdir -p dist
-          pycrucible --embed . --output dist/SpyDE.AppImage
+      # Build renderer/main → stage the Python sidecar payload → electron-builder.
+      # (npm run dist runs build + bundle:python + electron-builder; see
+      # electron/package.json.) Unsigned for now — signing secrets are a
+      # follow-up (PACKAGING.md "What's intentionally deferred").
+      - name: Build desktop app
+        working-directory: electron
+        run: npm run dist
+        env:
+          # Don't let electron-builder try to publish; we attach artifacts in the
+          # release job below from the matrix outputs instead.
+          EP_PRE_RELEASE: "false"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
-          path: ${{ matrix.artifact_path }}
+          name: spyde-${{ runner.os }}
+          path: ${{ matrix.artifact_glob }}
           if-no-files-found: error
 
-  # ── Publish a GitHub Release with all three artifacts ─────────────────────
+  # ── Publish a GitHub Release with all platform artifacts ────────────────────
   release:
     name: Publish GitHub Release
     runs-on: ubuntu-latest
@@ -148,31 +102,27 @@ jobs:
           body: |
             ## SpyDE ${{ github.ref_name }}
 
+            Desktop app (Electron) with a uv-managed Python backend. The
+            installer is small — the analysis environment (incl. the GPU-correct
+            PyTorch wheel) is set up on **first launch**, which needs a network
+            connection and may take a few minutes. Later launches are instant.
+
+            > ⚠️ Unsigned for now: Windows SmartScreen / macOS Gatekeeper will
+            > warn on first run. On Windows choose "More info → Run anyway"; on
+            > macOS right-click the app → Open.
+
             ### Downloads
             | Platform | File |
             |----------|------|
-            | Windows  | `SpyDE-windows.zip` |
-            | macOS    | `SpyDE.dmg` |
-            | Linux    | `SpyDE.AppImage` |
-
-            ### Installation
-            **Windows:**
-            1. Extract `SpyDE-windows.zip`
-            2. Run `create_shortcut.ps1` once to create a branded desktop/Start-Menu shortcut
-            3. Launch via the shortcut (or run `SpyDE.exe` directly)
-
-            **macOS:** Open `SpyDE.dmg`, drag SpyDE to Applications.
-
-            **Linux:** `chmod +x SpyDE.AppImage && ./SpyDE.AppImage`
+            | Windows  | `SpyDE Setup *.exe` (NSIS installer) |
+            | macOS    | `SpyDE-*.dmg` |
+            | Linux    | `SpyDE-*.AppImage` |
 
             ### To trigger a new release
             ```bash
             git tag v0.1.0
             git push origin v0.1.0
             ```
-          files: |
-            dist/SpyDE-windows.zip/SpyDE-windows.zip
-            dist/SpyDE.dmg/SpyDE.dmg
-            dist/SpyDE.AppImage/SpyDE.AppImage
+          files: dist/**/*
           fail_on_unmatched_files: true
           generate_release_notes: true
