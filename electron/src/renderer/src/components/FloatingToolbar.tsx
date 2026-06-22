@@ -26,6 +26,19 @@ const WIZARD_ACTIONS = new Set([
   'Center Zero Beam',
 ])
 
+/**
+ * Turn an OS filesystem path into a valid file:// URL. The Python backend sends
+ * native icon paths, which on Windows are `C:\…\icon.svg` — a bare
+ * `file://C:\…` is malformed (backslashes + drive letter), so the icons never
+ * loaded there. Normalise separators and prefix the drive with the extra slash
+ * Windows file URLs require.
+ */
+function fileUrl(p: string): string {
+  const fwd = p.replace(/\\/g, '/')
+  // Windows absolute path (drive letter) → file:///C:/…  ; POSIX → file:///…
+  return /^[a-zA-Z]:\//.test(fwd) ? `file:///${fwd}` : `file://${fwd}`
+}
+
 // Actions that draw a live marker overlay on the DP. The overlay is shown only
 // while the action's caret is selected, and hidden when it's deselected.
 const OVERLAY_ACTIONS = new Set([
@@ -154,7 +167,7 @@ export function FloatingToolbar({
           onClick={(e) => click(a, e)}
         >
           {a.icon && a.icon.endsWith('.svg')
-            ? <img src={`file://${a.icon}`} width={18} height={18} alt={a.name} />
+            ? <img src={fileUrl(a.icon)} width={18} height={18} alt={a.name} />
             : <span style={{ fontSize: 10 }}>{a.name.slice(0, 4)}</span>}
         </button>
       ))}

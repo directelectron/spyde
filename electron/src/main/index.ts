@@ -3,6 +3,7 @@
  */
 import { app, BrowserWindow, dialog, ipcMain, Menu, shell, nativeTheme } from 'electron'
 import { join } from 'path'
+import { pathToFileURL } from 'url'
 import { tmpdir } from 'os'
 import { writeFileSync } from 'fs'
 import {
@@ -12,6 +13,31 @@ import {
 import { resolvePythonEnv } from './pythonEnv'
 
 let win: BrowserWindow | null = null
+
+// Messages from the Python backend can arrive before the renderer has finished
+// loading and registered its ipcRenderer listener. webContents.send() drops
+// anything sent before the frame is ready, which silently swallowed the FIRST
+// message after a quiet period — e.g. the nav_shape_prompt when opening a file
+// (the dialog then only appeared once a LATER load pushed more messages). Buffer
+// until the renderer signals ready, then flush in order.
+let rendererReady = false
+const pendingMessages: Array<Record<string, unknown>> = []
+
+function sendToRenderer(msg: Record<string, unknown>): void {
+  if (rendererReady && win && !win.isDestroyed()) {
+    win.webContents.send('spyde:message', msg)
+  } else {
+    pendingMessages.push(msg)
+  }
+}
+
+function flushPendingMessages(): void {
+  rendererReady = true
+  if (!win || win.isDestroyed()) return
+  for (const msg of pendingMessages.splice(0)) {
+    win.webContents.send('spyde:message', msg)
+  }
+}
 
 // ── Window creation ──────────────────────────────────────────────────────────
 
@@ -29,6 +55,14 @@ function createWindow(): BrowserWindow {
       nodeIntegration: false,
       webSecurity: false,   // needed so iframes can load file:// HTML
     },
+  })
+
+  // Once the renderer frame has loaded (and its ipcRenderer listener is live),
+  // flush any messages the backend emitted during startup. A fresh reload resets
+  // the gate so buffered messages aren't sent to a frame that's tearing down.
+  win.webContents.on('did-finish-load', flushPendingMessages)
+  win.webContents.on('did-start-navigation', (_e, _url, isInPlace, isMainFrame) => {
+    if (isMainFrame && !isInPlace) rendererReady = false
   })
 
   if (process.env['ELECTRON_RENDERER_URL']) {
@@ -68,12 +102,12 @@ app.whenReady().then(async () => {
       process.stderr.write(`[uv] ${line}`)
       // Surface first-run env setup in the UI (the stream/log channel).
       win?.webContents.send('spyde:stream', line, 'stderr')
-      win?.webContents.send('spyde:message', { type: 'status', text: 'Setting up Python environment…' })
+      sendToRenderer({ type: 'status', text: 'Setting up Python environment…' })
     },
   }).catch((err) => {
     const msg = `Python environment setup failed: ${err?.message ?? err}`
     console.error(`[spyde] ${msg}`)
-    win?.webContents.send('spyde:message', { type: 'error', text: msg })
+    sendToRenderer({ type: 'error', text: msg })
     // Fall back to dev-style launch so a broken bundle is still diagnosable.
     return { cmd: ['uv', 'run', 'python', '-m', 'spyde'], cwd: projectRoot }
   })
@@ -86,7 +120,10 @@ app.whenReady().then(async () => {
         const figPath = join(tmpdir(), `spyde_fig_${String(msg.fig_id)}.html`)
         try {
           writeFileSync(figPath, msg.html as string, 'utf8')
-          msg = { ...msg, file_url: `file://${figPath}`, html: undefined }
+          // pathToFileURL produces a valid file URL on every OS — a bare
+          // `file://${figPath}` is malformed on Windows (backslashes + drive
+          // letter: `file://C:\…`), so the figure iframe never loaded there.
+          msg = { ...msg, file_url: pathToFileURL(figPath).href, html: undefined }
         } catch { /* leave msg as-is on failure */ }
       }
       // Echo key lifecycle messages to the dev terminal so backend health is
@@ -94,7 +131,7 @@ app.whenReady().then(async () => {
       if (msg.type === 'ready' || msg.type === 'dask_ready' || msg.type === 'error') {
         console.log(`[spyde backend] ${msg.type}: ${msg.text ?? msg.dashboard ?? ''}`)
       }
-      win?.webContents.send('spyde:message', msg)
+      sendToRenderer(msg)
     },
     onStream: (text, kind) => {
       // Forward to the renderer AND surface in the dev terminal.
@@ -187,6 +224,11 @@ function buildMenu(): void {
     {
       label: 'Help',
       submenu: [
+        {
+          label: 'Guided Tour: Finding Diffraction Vectors',
+          click: () => win?.webContents.send('spyde:start_guide', 'find-vectors'),
+        },
+        { type: 'separator' },
         {
           label: 'Dask Dashboard',
           click: () => win?.webContents.send('spyde:open_dashboard'),

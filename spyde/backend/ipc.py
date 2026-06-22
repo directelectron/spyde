@@ -36,6 +36,13 @@ _stdout_lock = threading.Lock()
 _PROTOCOL_OUT = sys.stdout
 
 
+def _write_line(line: str) -> None:
+    """Write one protocol line, flushed immediately (thread-safe)."""
+    with _stdout_lock:
+        _PROTOCOL_OUT.write(line)
+        _PROTOCOL_OUT.flush()
+
+
 def redirect_stray_stdout() -> None:
     """Send all `print()` output to stderr so it can never interleave with the
     PLOTAPP protocol on stdout, while keeping BOTH protocol emitters — spyde's
@@ -54,10 +61,7 @@ def redirect_stray_stdout() -> None:
         import anyplotlib._electron as _ael
 
         def _shared_emit(obj: dict) -> None:
-            line = "PLOTAPP:" + json.dumps(obj, default=str) + "\n"
-            with _stdout_lock:
-                _PROTOCOL_OUT.write(line)
-                _PROTOCOL_OUT.flush()
+            _write_line("PLOTAPP:" + json.dumps(obj, default=str) + "\n")
 
         _ael.emit = _shared_emit
     except Exception as e:
@@ -67,11 +71,9 @@ def redirect_stray_stdout() -> None:
 
 
 def emit(obj: dict[str, Any]) -> None:
-    """Write a PLOTAPP: message to the protocol channel (thread-safe)."""
-    line = "PLOTAPP:" + json.dumps(obj, default=str) + "\n"
-    with _stdout_lock:
-        _PROTOCOL_OUT.write(line)
-        _PROTOCOL_OUT.flush()
+    """Write a PLOTAPP: message to the protocol channel (thread-safe, flushed
+    immediately from any thread)."""
+    _write_line("PLOTAPP:" + json.dumps(obj, default=str) + "\n")
 
 
 def emit_status(text: str) -> None:
@@ -91,19 +93,39 @@ async def read_messages(loop: asyncio.AbstractEventLoop | None = None):
     Async generator that yields parsed JSON dicts from stdin.
     Each line on stdin must be a valid JSON object.
     Exits when stdin closes.
+
+    Implementation note (cross-platform): stdin is read on a dedicated daemon
+    thread that pushes raw lines into an ``asyncio.Queue``, rather than via
+    ``loop.connect_read_pipe(sys.stdin)`` — the latter raises
+    ``OSError: [WinError 6] The handle is invalid`` under Windows'
+    ``ProactorEventLoop`` (it can't register a console/pipe stdin handle with the
+    IOCP), which silently broke every Electron→backend message on Windows. A
+    blocking ``readline`` on a thread works identically on Windows, macOS, Linux.
     """
     if loop is None:
         loop = asyncio.get_event_loop()
 
-    reader = asyncio.StreamReader()
-    protocol = asyncio.StreamReaderProtocol(reader)
-    await loop.connect_read_pipe(lambda: protocol, sys.stdin)
+    q: asyncio.Queue[str | None] = asyncio.Queue()
+
+    def _pump() -> None:
+        try:
+            while True:
+                raw = sys.stdin.readline()
+                if not raw:   # EOF — pipe closed by Electron
+                    break
+                loop.call_soon_threadsafe(q.put_nowait, raw)
+        except Exception as e:
+            log.debug("stdin pump stopped: %s", e)
+        finally:
+            loop.call_soon_threadsafe(q.put_nowait, None)
+
+    threading.Thread(target=_pump, daemon=True, name="spyde-stdin-pump").start()
 
     while True:
-        line_bytes = await reader.readline()
-        if not line_bytes:
+        raw = await q.get()
+        if raw is None:   # EOF sentinel
             break
-        line = line_bytes.decode("utf-8", errors="replace").strip()
+        line = raw.strip()
         if not line:
             continue
         try:
