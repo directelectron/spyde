@@ -1222,6 +1222,40 @@ class Session:
             log.debug("set_signal_type on chunked lazy data failed: %s", e)
         self._add_signal(s, source_path="test_data_lazy_chunked")
 
+    def _load_test_data_si_grains(self) -> None:
+        """Test-only: BUNDLED synthetic Si-grains 4-D STEM (pyxem.data.si_grains —
+        6×6 nav × 128×128 signal, generated on the fly, NO download). Unlike the
+        featureless-disk fixtures it has a real reciprocal lattice with crisp
+        spots, so the orientation overlay's matched template lands on actual
+        peaks — the offline/CI counterpart to sped_ag for OM/overlay tests."""
+        import pyxem.data as pxd
+        s = pxd.si_grains()
+        try:
+            s.set_signal_type("electron_diffraction")
+        except Exception as e:
+            log.debug("set_signal_type on si_grains failed: %s", e)
+        # Centre the beam in pixel space (the bundled data carries offset=0, i.e.
+        # k=0 at pixel 0); the overlay/matcher map k→px via (k-offset)/scale, so a
+        # centred offset puts the direct beam mid-detector like a real scan.
+        for ax in s.axes_manager.signal_axes:
+            ax.offset = -(ax.size / 2.0) * float(ax.scale)
+        self._add_signal(s, source_path="test_data_si_grains")
+
+    def _load_test_data_sped_ag(self) -> None:
+        """Test-only: load the REAL sped_ag 4-D STEM scan (pyxem.data.sped_ag —
+        208×64 patterns of 112×112, a strained Ag SPED dataset with genuine
+        diffraction spots). Unlike the synthetic disk fixtures this has a real
+        reciprocal lattice, so the orientation overlay's matched-template spots
+        land on actual diffraction peaks — needed to SEE the overlay working
+        (not just render). Downloads on first use (pooch-cached)."""
+        import pyxem.data as pxd
+        s = pxd.sped_ag(allow_download=True)
+        try:
+            s.set_signal_type("electron_diffraction")
+        except Exception as e:
+            log.debug("set_signal_type on sped_ag failed: %s", e)
+        self._add_signal(s, source_path="test_data_sped_ag")
+
     def _test_nav_drag(self, targets: list) -> None:
         """Test-only: drive the navigator crosshair through a list of (x, y) nav
         cells server-side and report, per move, whether the SIGNAL plot's painted
@@ -1330,14 +1364,30 @@ class Session:
             min_distance=3, subpixel=True,
         )
 
-    def _run_test_orientation(self, plot) -> None:
-        """Test-only Orientation Mapping with a built-in Al phase (no CIF dialog),
-        so the full OM workflow can be exercised E2E (incl. lazy data) without a
-        file picker. Mirrors `orientation_action.orientation_mapping`."""
+    def _run_test_orientation(self, plot, payload=None) -> None:
+        """Test-only Orientation Mapping with a built-in phase (no CIF dialog), so
+        the full OM workflow can be exercised E2E (incl. lazy data) without a file
+        picker. Mirrors `orientation_action.orientation_mapping`.
+
+        The phase MUST match the loaded data or the match fails (black IPF, no
+        overlay). ``payload={"phase": "si"|"ag"}`` selects it; default Si, since
+        the primary test dataset is the bundled ``si_grains`` scan. Use "ag" for a
+        real ``sped_ag`` load."""
+        payload = payload or {}
         src = plot or next(
             (p for p in self._plots if not p.is_navigator and p.plot_state is not None),
             None,
         )
+        # The overlay must land on the SIGNAL diffraction pattern, not the
+        # navigator. If the action arrived from the navigator window (or no plot
+        # was passed and the first match was a navigator), fall back to the first
+        # non-navigator signal plot so src_dp_plot is always the DP.
+        if src is not None and getattr(src, "is_navigator", False):
+            src = next(
+                (p for p in self._plots
+                 if not p.is_navigator and p.plot_state is not None),
+                None,
+            )
         if src is None:
             emit_error("run_test_orientation: no active signal")
             return
@@ -1351,11 +1401,26 @@ class Session:
                 from orix.crystal_map import Phase
                 from diffpy.structure import Atom, Lattice, Structure
                 from spyde.actions.orientation_action import run_orientation
-                structure = Structure(
-                    atoms=[Atom("Al", [0, 0, 0])],
-                    lattice=Lattice(4.05, 4.05, 4.05, 90, 90, 90),
-                )
-                phase = Phase(name="Al", space_group=225, structure=structure)
+                which = str(payload.get("phase", "si")).lower()
+                if which == "ag":
+                    # FCC silver (a=4.0853 Å) — matches the real sped_ag scan.
+                    structure = Structure(
+                        atoms=[Atom("Ag", [0, 0, 0]), Atom("Ag", [.5, .5, 0]),
+                               Atom("Ag", [.5, 0, .5]), Atom("Ag", [0, .5, .5])],
+                        lattice=Lattice(4.0853, 4.0853, 4.0853, 90, 90, 90),
+                    )
+                    phase = Phase(name="Ag", space_group=225, structure=structure)
+                else:
+                    # Diamond-cubic silicon (a=5.4307 Å) — matches the bundled
+                    # si_grains test scan so the template lands on its real spots.
+                    structure = Structure(
+                        atoms=[Atom("Si", [0, 0, 0]), Atom("Si", [.5, .5, 0]),
+                               Atom("Si", [.5, 0, .5]), Atom("Si", [0, .5, .5]),
+                               Atom("Si", [.25, .25, .25]), Atom("Si", [.75, .75, .25]),
+                               Atom("Si", [.75, .25, .75]), Atom("Si", [.25, .75, .75])],
+                        lattice=Lattice(5.4307, 5.4307, 5.4307, 90, 90, 90),
+                    )
+                    phase = Phase(name="Si", space_group=227, structure=structure)
                 run_orientation(
                     self, tree.root, tree, [phase],
                     dict(accelerating_voltage=200.0, resolution=8.0),
@@ -1383,6 +1448,10 @@ class Session:
             self._load_test_data_lazy()
         elif action == "load_test_data_lazy_chunked":
             self._load_test_data_lazy_chunked()
+        elif action == "load_test_data_si_grains":
+            self._load_test_data_si_grains()
+        elif action == "load_test_data_sped_ag":
+            self._load_test_data_sped_ag()
         elif action == "test_nav_drag":
             # Run on a BACKGROUND thread: the drag loop sleeps/polls, and if it ran
             # on the main asyncio thread it would block loop.call_soon_threadsafe —
@@ -1401,10 +1470,10 @@ class Session:
             mod, fn = _STAGED_HANDLERS[action].rsplit(".", 1)
             getattr(importlib.import_module(mod), fn)(self, plot, payload)
         elif action == "run_test_orientation":
-            # Test-only: run Orientation Mapping with a built-in Al phase (no CIF
+            # Test-only: run Orientation Mapping with a built-in phase (no CIF
             # dialog) on the active signal, so the E2E workflow can be driven
-            # headlessly / in Playwright on lazy data.
-            self._run_test_orientation(plot)
+            # headlessly / in Playwright. payload={"phase":"si"|"ag"} (default si).
+            self._run_test_orientation(plot, payload)
         elif action == "set_selector_mode":
             self.set_selector_mode(window_id, bool(payload.get("integrate")))
         elif action == "select_signal_node":

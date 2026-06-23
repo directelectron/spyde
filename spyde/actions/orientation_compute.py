@@ -147,6 +147,60 @@ def sim_phases_list(sim):
     return [phases]
 
 
+def _pyxem_template_arrays(sim):
+    """Per-template stacked arrays for ``vectors_from_orientation_map``, built
+    once per ``sim`` (cached on the sim object). Mirrors
+    ``OrientationMap.get_simulation_arrays``: object arrays of each template's
+    ``data`` / ``hkl`` / ``intensity`` plus the phase-dict list and phase index.
+
+    Returns ``None`` if the phase has no space group (``phase2dict`` can't run),
+    so the caller can fall back to the inlined 2-D transform."""
+    cached = getattr(sim, "_spyde_pyxem_arrays", None)
+    if cached is not None:
+        return cached
+    from pyxem.utils.indexation_utils import phase2dict
+    n = sim.rotations.size if hasattr(sim.rotations, "size") else len(sim.rotations)
+    phases = list(sim_phases_list(sim))
+    try:
+        phases_dicts = [phase2dict(p) for p in phases]
+    except Exception:
+        sim._spyde_pyxem_arrays = None
+        return None
+    data = np.empty(n, dtype=object)
+    hkl = np.empty(n, dtype=object)
+    inten = np.empty(n, dtype=object)
+    for k in range(n):
+        dv = sim.get_simulation(k)[2]
+        data[k] = np.asarray(dv.data)
+        h = getattr(dv, "hkl", None)
+        hkl[k] = np.asarray(h) if h is not None else np.zeros((len(dv.data), 3))
+        inten[k] = np.asarray(dv.intensity, float)
+    # Single-phase libraries (the only OM path here) → all templates phase 0.
+    phase_index = np.zeros(n, dtype=int)
+    out = (data, hkl, inten, phases_dicts, phase_index)
+    sim._spyde_pyxem_arrays = out
+    return out
+
+
+def _template_spots_pyxem(sim, lib_idx, angle_deg, mirror):
+    """Displayed (kx, ky) spots for one matched template via pyxem's exact
+    ``vectors_from_orientation_map`` (3-D crystal rotation). Returns ``None`` if
+    the reference can't be built (no space group) so the caller falls back."""
+    arrays = _pyxem_template_arrays(sim)
+    if arrays is None:
+        return None
+    from pyxem.signals.indexation_results import vectors_from_orientation_map
+    data, hkl, inten, phases_dicts, phase_index = arrays
+    # pyxem result row layout: [lib_index, correlation, in_plane_deg, mirror].
+    row = np.array([[int(lib_idx), 1.0, float(angle_deg), float(mirror)]])
+    with PYXEM_LOCK:        # orix Rotation / phase build is not thread-safe
+        vec = vectors_from_orientation_map(
+            row, data, phases_dicts, phase_index, hkl, inten,
+            n_best_index=0, return_object=True,
+        )
+    return np.asarray(vec.data[:, :2], dtype=float)
+
+
 def best_match_spots(pattern_data, sim, matching_cache, *, gamma: float = 0.5,
                      max_radius: float | None = None,
                      normalize_templates: bool = True,
@@ -200,26 +254,40 @@ def best_match_spots(pattern_data, sim, matching_cache, *, gamma: float = 0.5,
     mirror = float(row[3])
 
     _rot, _phase_idx, coords_dv = sim.get_simulation(lib_idx)
-    raw = coords_dv.data[:, :2].copy().astype(float)
     inten = np.array(coords_dv.intensity, dtype=float)
 
-    # vectors_from_orientation_map: flip y, rotate by mirror*angle, negate, mirror*y
+    # Generate the displayed spots via pyxem's AUTHORITATIVE transform
+    # (vectors_from_orientation_map), which rotates the template as a 3-D CRYSTAL
+    # rotation (`~rotation * vectors.to_miller()`) — NOT a planar 2-D rotation.
+    # A hand-rolled 2-D rotation port agrees with it only for special angles; for
+    # a general in-plane rotation the two diverge (an x- or y-mirror, depending
+    # on the orientation), which rendered the green matched-template overlay as
+    # the left-right MIRROR of the real diffraction spots (reported 2026-06-23).
     angle_deg = rot_idx / NA * 360.0 - 180.0
-    a = np.deg2rad(mirror * angle_deg)
-    cos_a, sin_a = np.cos(a), np.sin(a)
-    rx = raw[:, 0]; ry = -raw[:, 1]
-    kx = rx * cos_a - ry * sin_a
-    ky = rx * sin_a + ry * cos_a
-    kx, ky = -kx, -ky
-    ky = mirror * ky
-    coords = np.stack([kx, ky], axis=1)
+    coords = _template_spots_pyxem(sim, lib_idx, angle_deg, mirror)
+    if coords is None:
+        # Phase lacks a space group (phase2dict can't run) → fall back to the
+        # 2-D port. Pyxem's display convention, inlined: flip y, rotate by
+        # mirror*angle, negate, mirror*y.
+        raw = coords_dv.data[:, :2].copy().astype(float)
+        a = np.deg2rad(mirror * angle_deg)
+        cos_a, sin_a = np.cos(a), np.sin(a)
+        rx = raw[:, 0]; ry = -raw[:, 1]
+        kx = rx * cos_a - ry * sin_a
+        ky = rx * sin_a + ry * cos_a
+        kx, ky = -kx, -ky
+        ky = mirror * ky
+        coords = np.stack([kx, ky], axis=1)
 
     # Scale refine: rescale template coords to where spots actually land.
     if scale_override and original_scale:
         coords = coords * (float(scale_override) / float(original_scale))
 
     # Min-intensity refine: drop spots fainter than a fraction of the brightest.
-    if min_intensity > 0.0 and len(inten) > 0:
+    # vectors_from_orientation_map keeps the template's spot order, so `inten`
+    # (template-order intensities) aligns with `coords` row-for-row; guard on the
+    # count in case a future pyxem ever culls spots.
+    if min_intensity > 0.0 and len(inten) == len(coords) > 0:
         imax = float(inten.max()) or 1.0
         keep = (inten / imax) >= float(min_intensity)
         coords = coords[keep]

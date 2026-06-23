@@ -16,6 +16,42 @@
 /** Where the callout bubble sits relative to its anchored element. */
 export type Placement = 'top' | 'bottom' | 'left' | 'right' | 'center'
 
+/**
+ * How a guide step is REACHED when generating screenshots automatically (the
+ * `guide_screenshots.spec.ts` Playwright run walks these). A guide with `drive`
+ * blocks is both documentation AND an executable screenplay, so the docs media
+ * never drifts from the real UI. Purely optional: steps without `drive` are just
+ * screenshotted in the current state. Waits are SIGNAL-based (a backend message,
+ * a subwindow count, a non-black canvas) so slow operations are handled without
+ * brittle fixed sleeps.
+ */
+export interface GuideDrive {
+  /** What to do to reach this step. Defaults to 'none' (screenshot as-is). */
+  action?: 'none' | 'click' | 'hover' | 'backend'
+  /** Element to act on for click/hover. Defaults to the step's `anchor`. */
+  testid?: string
+  /** Backend test-only action name for action:'backend' (e.g. run_test_orientation). */
+  backend?: string
+  /** What to wait for AFTER the action, before screenshotting. */
+  waitFor?: {
+    /** At least N subwindows exist. */
+    subwindows?: number
+    /** A `data-testid` element is visible. */
+    visible?: string
+    /** Any canvas shows the colour (markers landed): 'bright' | 'red' | 'green'. */
+    pixels?: 'bright' | 'red' | 'green'
+  }
+  /** Per-step wait budget (ms) for the `waitFor` signal. Default 60000. */
+  timeoutMs?: number
+  /** Small last-resort settle (ms) after the wait, for paint to flush. Default 0. */
+  settleMs?: number
+  /**
+   * What to screenshot: 'page' (whole window, default) or a `data-testid` whose
+   * subwindow is cropped (e.g. the signal window for an overlay close-up).
+   */
+  shotTarget?: 'page' | string
+}
+
 export interface GuideStep {
   /**
    * Stable selector for the UI element this step is about. Prefer a
@@ -32,9 +68,15 @@ export interface GuideStep {
   placement?: Placement
   /**
    * Screenshot for the WEB rendering (path relative to the guide's media dir).
-   * Optional — the in-app tour spotlights the live UI and ignores this.
+   * Optional — the in-app tour spotlights the live UI and ignores this. The
+   * `guide_screenshots.spec.ts` run WRITES this file (docs-site media dir).
    */
   image?: string
+  /**
+   * Optional: how to reach this step when auto-generating screenshots. Omit for
+   * a step that is just captured in the current state. See {@link GuideDrive}.
+   */
+  drive?: GuideDrive
 }
 
 export interface Guide {
