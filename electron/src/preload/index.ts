@@ -47,6 +47,13 @@ contextBridge.exposeInMainWorld('electron', {
     return () => ipcRenderer.removeListener('spyde:start_guide', h)
   },
 
+  /** Open the in-app Load Stack dialog (from the File menu). Returns an unsubscribe fn. */
+  onOpenStackDialog: (cb: () => void) => {
+    const h = () => cb()
+    ipcRenderer.on('spyde:open_stack_dialog', h)
+    return () => ipcRenderer.removeListener('spyde:open_stack_dialog', h)
+  },
+
   // ── Renderer → Python ─────────────────────────────────────────────────────
 
   /** Send a toolbar/menu action to Python. */
@@ -65,6 +72,10 @@ contextBridge.exposeInMainWorld('electron', {
   /** Pick a file and return its path (for action params, e.g. a .cif). */
   pickFile: (opts: { name?: string; extensions?: string[] }): Promise<string | null> =>
     ipcRenderer.invoke('spyde:pick-file', opts),
+
+  /** Multi-select picker that RETURNS the chosen paths (for the Load Stack dialog). */
+  pickFiles: (opts?: { name?: string; extensions?: string[] }): Promise<string[]> =>
+    ipcRenderer.invoke('spyde:pick-files', opts),
 
   /** Forward an interaction event from an anyplotlib iframe to Python. */
   figureEvent: (figId: string, eventJson: string) =>

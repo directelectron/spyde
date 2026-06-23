@@ -13,7 +13,7 @@ export function StatusBar({ logOpen, onToggleLog }: {
   logOpen?: boolean
   onToggleLog?: () => void
 }) {
-  const { state } = useSpyDE()
+  const { state, openStackDialog } = useSpyDE()
   // Badge unseen warnings/errors so problems are noticeable while the log is hidden.
   const problems = state.logEntries.filter(
     (e) => e.level === 'WARNING' || e.level === 'ERROR' || e.level === 'CRITICAL',
@@ -51,6 +51,14 @@ export function StatusBar({ logOpen, onToggleLog }: {
         onClick={() => window.electron.openFile()}
       >
         Open…
+      </button>
+      <button
+        data-testid="open-stack"
+        style={styles.btn}
+        onClick={openStackDialog}
+        title="Combine several datasets into one stack"
+      >
+        Stack…
       </button>
     </div>
   )

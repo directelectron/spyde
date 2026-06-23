@@ -5,7 +5,7 @@
  * toolbar configs, and status, and re-renders the MDI when things change.
  */
 import React, {
-  createContext, useContext, useEffect, useReducer, useRef,
+  createContext, useContext, useEffect, useReducer, useRef, useState,
 } from 'react'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -400,6 +400,10 @@ interface SpyDEContextValue {
   setActiveWindow: (windowId: number) => void
   replayState: (figId: string) => void
   clearNavShapePrompt: () => void
+  // Load Stack dialog (renderer-only UI state, opened from the File menu).
+  stackDialogOpen: boolean
+  openStackDialog: () => void
+  closeStackDialog: () => void
 }
 
 const SpyDEContext = createContext<SpyDEContextValue | null>(null)
@@ -433,6 +437,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
 
   const iframeRefs = useRef<Map<string, HTMLIFrameElement>>(new Map())
   const latestStates = useRef<Map<string, Map<string, unknown>>>(new Map())
+  const [stackDialogOpen, setStackDialogOpen] = useState(false)
 
   // Post every stored state for a figure to its iframe (called on iframe load).
   const replayState = (figId: string) => {
@@ -731,6 +736,11 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
       dispatch({ type: 'STREAM', text, kind })
     })
 
+    // File → Load Stack… opens the in-app reorderable StackDialog.
+    const disposeStackDialog = window.electron.onOpenStackDialog(() =>
+      setStackDialogOpen(true),
+    )
+
     // Forward iframe events to Python
     const onMessage = (e: MessageEvent) => {
       if (e.data?.type === 'awi_event' && e.data.figId) {
@@ -744,6 +754,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
       // every message dispatched twice, growing over time → doubled logs + lag).
       disposeMessage?.()
       disposeStream?.()
+      disposeStackDialog?.()
       window.removeEventListener('message', onMessage)
       delete (window as Record<string, unknown>)['_spyde_test_inject']
     }
@@ -759,9 +770,11 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     dispatch({ type: 'SET_ACTIVE', windowId })
 
   const clearNavShapePrompt = () => dispatch({ type: 'NAV_SHAPE_PROMPT', prompt: null })
+  const openStackDialog = () => setStackDialogOpen(true)
+  const closeStackDialog = () => setStackDialogOpen(false)
 
   return (
-    <SpyDEContext.Provider value={{ state, iframeRefs, latestStates, sendAction, setActiveWindow, replayState, clearNavShapePrompt }}>
+    <SpyDEContext.Provider value={{ state, iframeRefs, latestStates, sendAction, setActiveWindow, replayState, clearNavShapePrompt, stackDialogOpen, openStackDialog, closeStackDialog }}>
       {children}
     </SpyDEContext.Provider>
   )

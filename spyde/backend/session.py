@@ -376,6 +376,172 @@ class Session:
                 ax.units = units
         return sig
 
+    def open_stack(self, paths: "list[str]") -> None:
+        """Stack several same-shaped datasets (e.g. a series of 4D-STEM MRC scans)
+        into a single dataset with ONE extra leading navigation axis (a generic
+        index 0,1,2,…). Files are stacked in the order given (selection order).
+
+        Each file is loaded lazily and its per-file ``_info.txt`` (scan shape +
+        calibration, handled by the MRC reader) is honoured. If the files don't all
+        share the same nav/signal shape they are cropped to the common minimum and
+        the user is warned. Everything stays lazy — a dask stack is a graph op, no
+        data is read or materialised here."""
+        paths = [p for p in (paths or []) if p]
+        if len(paths) < 2:
+            emit_error("Load Stack needs at least two files.")
+            return
+        bad = [p for p in paths
+               if os.path.splitext(p)[1].lower() not in SUPPORTED_EXTS
+               or not os.path.isfile(p)]
+        if bad:
+            emit_error(f"Cannot stack — missing/unsupported: "
+                       f"{', '.join(os.path.basename(b) for b in bad)}")
+            return
+        names = [os.path.basename(p) for p in paths]
+        emit({"type": "loading", "busy": True,
+              "text": f"Stacking {len(paths)} files…"})
+        emit_status(f"Stacking {len(paths)} files…")
+        threading.Thread(
+            target=self._load_stack_thread,
+            args=(paths, names),
+            daemon=True,
+            name=f"load-stack-{len(paths)}",
+        ).start()
+
+    def _load_stack_thread(self, paths: "list[str]", names: "list[str]") -> None:
+        import dask.array as da
+        try:
+            sigs = []
+            for p in paths:
+                s = hs.load(p, lazy=True)
+                if isinstance(s, list):
+                    if len(s) != 1:
+                        raise ValueError(
+                            f"{os.path.basename(p)} holds {len(s)} signals; "
+                            "stack only supports single-signal files."
+                        )
+                    s = s[0]
+                # Re-load with whole-signal chunks if the reader split the signal
+                # axes — a lazy reload is ~0 s (rebuilds the graph, no data move),
+                # and stacking members that are ALREADY signal-spanning-chunked
+                # avoids ever rechunking the (huge) 5-D stack afterward. See the
+                # "storage-aligned chunking — never rechunk live" rule in CLAUDE.md.
+                ch = self._signal_spanning_chunks(s)
+                if ch is not None:
+                    try:
+                        r = hs.load(p, lazy=True, chunks=ch)
+                        s = r[0] if isinstance(r, list) else r
+                    except Exception as e:
+                        log.debug("stack member %s signal-chunk reload failed: %s",
+                                  os.path.basename(p), e)
+                sigs.append(s)
+
+            # All members must share the SAME ndim/axis layout to stack coherently.
+            ndims = {s.data.ndim for s in sigs}
+            if len(ndims) != 1:
+                raise ValueError(
+                    "Files have different dimensionality "
+                    f"({sorted(ndims)}); cannot stack."
+                )
+            ref_am = sigs[0].axes_manager
+            if ref_am.signal_dimension != 2:
+                raise ValueError(
+                    "Load Stack expects 2-D-signal datasets (e.g. 4D-STEM); "
+                    f"got signal_dimension={ref_am.signal_dimension}."
+                )
+
+            # Crop every member to the common (minimum) shape per axis, warning if
+            # any file actually had to be cropped. Shapes are full array shapes
+            # (nav-reversed + signal), so a per-axis min keeps axes aligned.
+            shapes = [tuple(int(d) for d in s.data.shape) for s in sigs]
+            common = tuple(min(dim) for dim in zip(*shapes))
+            cropped_files = []
+            for i, s in enumerate(sigs):
+                if shapes[i] != common:
+                    cropped_files.append(names[i])
+                    slicer = tuple(slice(0, c) for c in common)
+                    sigs[i] = s.__class__(s.data[slicer])
+                    if getattr(s, "_lazy", False) and not getattr(sigs[i], "_lazy", False):
+                        sigs[i] = sigs[i].as_lazy()
+            if cropped_files:
+                emit_status(
+                    f"Stack: cropped {len(cropped_files)} file(s) to common "
+                    f"shape {common}: {', '.join(cropped_files)}"
+                )
+                log.warning("Load Stack cropped to common shape %s: %s",
+                            common, cropped_files)
+
+            # Stack the dask arrays along a NEW leading axis (becomes the slowest
+            # navigation axis). da.stack on lazy arrays is a pure graph op.
+            arrs = [s.data for s in sigs]
+            stacked = da.stack(arrs, axis=0)
+
+            # Build a fresh signal of the members' class so the signal axes + type
+            # carry over; the new leading axis defaults to a generic index.
+            ref = sigs[0]
+            new = ref.__class__(stacked)
+            if not getattr(new, "_lazy", False):
+                new = new.as_lazy()
+            try:
+                new.metadata = ref.metadata.deepcopy()
+                stype = ref.metadata.get_item("Signal.signal_type", "")
+                if stype:
+                    new.set_signal_type(stype)
+            except Exception as e:
+                log.debug("carrying metadata onto stack failed: %s", e)
+
+            # Copy each EXISTING navigation/signal axis's calibration from the
+            # reference (the new leading stack axis keeps its default index scale).
+            # new nav axes are the old nav axes shifted by one (the stack axis is
+            # navigation axis 0 in hyperspy's reversed nav order → display-last).
+            try:
+                self._carry_axes_from_reference(new, ref)
+            except Exception as e:
+                log.debug("carrying axis calibration onto stack failed: %s", e)
+
+            # NOTE: do NOT rechunk the stacked 5-D array here — that would shuffle
+            # the whole multi-GB stack. Members were already reloaded with
+            # signal-spanning chunks above, and da.stack adds a size-1 chunk on the
+            # new leading axis, so the stack is navigator-friendly out of the box.
+
+            emit({"type": "loading", "busy": False, "text": ""})
+
+            # Open directly — NO nav-shape prompt. Each member's _info.txt already
+            # gave the correct scan shape + calibration (carried over above); the
+            # only new axis is the stack index, which is intentionally a generic
+            # 0,1,2,… (the user can rename/calibrate it in the Axes dock). Running
+            # the single-file prompt here would also wrongly stamp the scan step
+            # onto the stack axis (it calibrates every nav axis).
+            self._add_signal(new, source_path=paths[0])
+            emit_status(
+                f"Stacked {len(paths)} files → "
+                f"{tuple(new.axes_manager.navigation_shape)} nav "
+                f"× {tuple(new.axes_manager.signal_shape)} signal"
+            )
+        except Exception as e:
+            emit({"type": "loading", "busy": False, "text": ""})
+            emit_error(f"Failed to stack files: {e}")
+
+    @staticmethod
+    def _carry_axes_from_reference(new: BaseSignal, ref: BaseSignal) -> None:
+        """Copy scale/offset/units/name from the reference member's axes onto the
+        matching axes of the stacked signal. The stack added ONE leading axis
+        (hyperspy navigation axis index 0), so each reference axis maps to the
+        new signal's axis at the next higher index."""
+        new_axes = list(new.axes_manager._axes)
+        ref_axes = list(ref.axes_manager._axes)
+        # new_axes[0] is the stack axis (leave as default index). The remaining
+        # new axes line up 1:1 with the reference's axes, in order.
+        for ref_ax, new_ax in zip(ref_axes, new_axes[1:]):
+            try:
+                new_ax.scale = ref_ax.scale
+                new_ax.offset = ref_ax.offset
+                new_ax.units = ref_ax.units
+                if getattr(ref_ax, "name", None):
+                    new_ax.name = ref_ax.name
+            except Exception:
+                pass
+
     def load_example_data(self, name: str) -> None:
         import pyxem.data as _pxd
 
@@ -1204,6 +1370,8 @@ class Session:
             self._update_vi(window_id, payload.get("name"), payload.get("params", {}))
         elif action == "open_file":
             self.open_file(payload["path"])
+        elif action == "open_stack":
+            self.open_stack(payload.get("paths") or [])
         elif action == "confirm_nav_shape":
             self._confirm_nav_shape(payload)
         elif action == "set_signal_type":

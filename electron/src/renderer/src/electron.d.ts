@@ -7,10 +7,12 @@ declare global {
       onTile: (cb: () => void) => () => void
       onOpenDashboard: (cb: () => void) => () => void
       onStartGuide: (cb: (id: string) => void) => () => void
+      onOpenStackDialog: (cb: () => void) => () => void
       action: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
       openFile: () => Promise<void>
       saveDialog: () => Promise<void>
       pickFile: (opts: { name?: string; extensions?: string[] }) => Promise<string | null>
+      pickFiles: (opts?: { name?: string; extensions?: string[] }) => Promise<string[]>
       figureEvent: (figId: string, eventJson: string) => void
       resizeFigure: (figId: string, width: number, height: number) => void
       openExternal: (url: string) => void

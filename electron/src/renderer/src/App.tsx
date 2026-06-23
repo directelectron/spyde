@@ -6,6 +6,7 @@ import { StatusBar } from './components/StatusBar'
 import { LogPanel } from './components/LogPanel'
 import { Tour } from './components/Tour'
 import { NavShapeGate } from './components/NavShapeGate'
+import { StackGate } from './components/StackGate'
 import { GUIDES, getGuide, type Guide } from '@guides/index'
 
 export function App() {
@@ -41,6 +42,9 @@ export function App() {
       {/* Scan-shape/step-size confirm dialog — reads the pending prompt from the
           SpyDE context (so injected test messages reach it too). */}
       <NavShapeGate />
+      {/* Load Stack dialog — reorderable list of datasets to combine into one
+          5D stack; opened from File → Load Stack…. */}
+      <StackGate />
     </SpyDEProvider>
   )
 }

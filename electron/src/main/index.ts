@@ -188,6 +188,12 @@ function buildMenu(): void {
             }
           },
         },
+        {
+          label: 'Load Stack…',
+          // Opens the in-app StackDialog (reorderable list of datasets) rather
+          // than the native picker — the user adds/reorders there, then confirms.
+          click: () => win?.webContents.send('spyde:open_stack_dialog'),
+        },
         { type: 'separator' },
         {
           label: 'Save Signal…',
@@ -272,6 +278,20 @@ ipcMain.handle('spyde:open-file', async () => {
       sendAction('open_file', { path: p })
     }
   }
+})
+
+/** Multi-select file picker that RETURNS the chosen paths to the renderer (does
+ *  NOT auto-open). Used by the StackDialog's "Add datasets…" tile. */
+ipcMain.handle('spyde:pick-files', async (_e, opts?: { name?: string; extensions?: string[] }) => {
+  const exts = (opts?.extensions ?? ['hspy', 'zspy', 'mrc', 'tif', 'tiff', 'de5']).map((e) =>
+    e.replace(/^\./, ''),
+  )
+  const result = await dialog.showOpenDialog(win!, {
+    title: 'Add datasets to the stack',
+    properties: ['openFile', 'multiSelections'],
+    filters: [{ name: opts?.name ?? 'EM Data', extensions: exts }],
+  })
+  return result.canceled ? [] : result.filePaths
 })
 
 /** Pick a file and RETURN its path to the renderer (for action params, e.g. a
