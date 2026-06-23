@@ -174,8 +174,20 @@ class _DPOverlay:
             if sel.current_indices is not None:
                 self._on_indices(sel.current_indices)
                 seeded = True
+        # ALWAYS seed the engine, even when no selector had a committed position
+        # yet (navigator hasn't painted) or none were found. Without this the
+        # overlay sat blank until a *future* nav move — the silent failure that
+        # made the matched-template markers never appear in a fresh view. The
+        # hooks above are still registered, so a later nav move refreshes it.
         if not seeded:
             self._engine.request(*self._last_iyix)
+        if not self._selectors:
+            log.warning("[overlay:%s] attached with NO navigator selectors — "
+                        "markers will not track the navigator until one exists",
+                        self.name)
+        else:
+            log.debug("[overlay:%s] attached on %d selector(s), seeded=%s",
+                      self.name, len(self._selectors), seeded)
         return self
 
     def _make_engine(self, tree):
@@ -352,8 +364,14 @@ class OrientationOverlay(_DPOverlay):
                     original_scale=self._x_scale,
                     min_intensity=self.min_intensity,
                 )
-        except Exception:
+        except Exception as e:
+            # Don't swallow blind: a failed match must be distinguishable from a
+            # genuine no-spots result (it hid a silent overlay failure once).
+            log.debug("[overlay:orient] best_match_spots FAILED nav=(%s,%s): %r",
+                      iy, ix, e)
             return np.zeros((0, 2), dtype=np.float32)
+        n = 0 if coords is None else len(coords)
+        log.debug("[overlay:orient] nav=(%s,%s) -> %d spots", iy, ix, n)
         if coords is None or len(coords) == 0:
             return np.zeros((0, 2), dtype=np.float32)
         return self._to_px(coords)

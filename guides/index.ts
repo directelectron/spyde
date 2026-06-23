@@ -4,11 +4,15 @@
  */
 import type { Guide } from './types'
 import { findVectorsGuide } from './find-vectors'
+import { virtualImagingGuide } from './virtual-imaging'
+import { orientationGuide } from './orientation'
 
-export type { Guide, GuideStep, Placement } from './types'
+export type { Guide, GuideStep, GuideDrive, Placement } from './types'
 
 export const GUIDES: Guide[] = [
   findVectorsGuide,
+  virtualImagingGuide,
+  orientationGuide,
 ]
 
 export function getGuide(id: string): Guide | undefined {

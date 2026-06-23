@@ -17,12 +17,27 @@ export default defineConfig({
     // _electronPath is resolved at test setup time in the fixture
     trace: 'on-first-retry',
     screenshot: 'only-on-failure',
+    video: 'retain-on-failure',
   },
 
   projects: [
     {
+      // CI / default tier: synthetic + bundled data only, no network. Excludes
+      // the real-data specs (*.real.spec.ts) and the screenshot generator, which
+      // need downloaded pyxem datasets.
       name: 'electron',
       testMatch: '**/*.spec.ts',
+      testIgnore: ['**/*.real.spec.ts', '**/guide_screenshots.spec.ts'],
+    },
+    {
+      // Local / nightly tier: real pyxem datasets + per-step screenshot
+      // generation. Opt-in — run with `SPYDE_E2E_REAL=1 npx playwright test
+      // --project=electron-real`. Longer per-test budget (downloads + heavy
+      // compute) and one retry stripped (real runs are expensive).
+      name: 'electron-real',
+      testMatch: ['**/*.real.spec.ts', '**/guide_screenshots.spec.ts'],
+      timeout: 600_000,
+      retries: 0,
     },
   ],
 })

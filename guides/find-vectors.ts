@@ -33,6 +33,11 @@ export const findVectorsGuide: Guide = {
         'the crosshair on the navigator updates the pattern live.',
       placement: 'center',
       image: 'mdi-two-windows.png',
+      // Screenshot setup: load the dataset and wait for both windows.
+      drive: {
+        action: 'backend', backend: 'load_test_data_si_grains',
+        waitFor: { subwindows: 2 }, timeoutMs: 120_000, settleMs: 1500,
+      },
     },
     {
       anchor: 'floating-toolbar',
@@ -43,6 +48,8 @@ export const findVectorsGuide: Guide = {
         'live here.',
       placement: 'top',
       image: 'floating-toolbar.png',
+      // Reveal the toolbar by hovering the signal window's titlebar.
+      drive: { action: 'hover', testid: 'subwindow-titlebar' },
     },
     {
       anchor: 'action-btn-Find Diffraction Vectors',
@@ -53,6 +60,10 @@ export const findVectorsGuide: Guide = {
         'tune parameters and see the detected peaks immediately.',
       placement: 'top',
       image: 'find-vectors-button.png',
+      drive: {
+        action: 'click', testid: 'action-btn-Find Diffraction Vectors',
+        waitFor: { visible: 'find-vectors-wizard' },
+      },
     },
     {
       anchor: 'find-vectors-wizard',
@@ -65,6 +76,8 @@ export const findVectorsGuide: Guide = {
         'marked but noise is not.',
       placement: 'left',
       image: 'find-vectors-wizard.png',
+      // Wait for the live preview to actually mark peaks (red), then shoot.
+      drive: { waitFor: { pixels: 'red' }, timeoutMs: 30_000 },
     },
     {
       anchor: 'fv-compute',
@@ -76,6 +89,11 @@ export const findVectorsGuide: Guide = {
         'signal tree.',
       placement: 'top',
       image: 'find-vectors-compute.png',
+      // Capture the wizard at the moment Compute is pressed (status bar shows
+      // progress). We do NOT wait for the full-scan compute to finish here — it
+      // is the slow stage and can run long; the result window is asserted by
+      // find_vectors_workflow.spec.ts instead.
+      drive: { action: 'click', testid: 'fv-compute', settleMs: 1500 },
     },
     {
       anchor: 'status-text',
@@ -85,6 +103,7 @@ export const findVectorsGuide: Guide = {
         'ready. From here you can run **Vector Virtual Imaging** or **Vector ' +
         'Orientation Mapping** on them.',
       placement: 'top',
+      image: 'find-vectors-done.png',
     },
   ],
 }
