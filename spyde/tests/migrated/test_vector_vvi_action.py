@@ -126,3 +126,71 @@ class TestVectorVVICompute:
         a = vecs.virtual_image_from_rect(-1, -1, 1, 1)
         b = vecs.virtual_image_from_rect(1, 1, -1, -1)   # corners swapped
         assert np.array_equal(a, b)
+
+
+def _make_vecs_5d():
+    """A 5-D (stack, y, x, ky, kx) vectors object."""
+    nt, ny, nx, ky, kx = 2, 4, 4, 32, 32
+    data = np.zeros((nt, ny, nx, ky, kx), dtype=np.float32)
+    data[:, :, :, 14:18, 14:18] = 100.0
+    s = hs.signals.Signal2D(da.from_array(data, chunks=(1, 2, 2, ky, kx)))
+    for ax in s.axes_manager.signal_axes:
+        ax.scale = 0.01
+        ax.offset = -ky * 0.005
+    v = _do_compute_vectors(s, _params(), None, None)
+    if len(v.flat_buffer) == 0:
+        pytest.skip("No vectors found")
+    return v
+
+
+class _DiskWidget:
+    """Minimal anyplotlib-circle-ROI stand-in for the action's reduce()."""
+    def __init__(self, cx, cy, r):
+        self.cx, self.cy, self.r = cx, cy, r
+        self._data = {"r": r}
+
+
+class TestVectorVVI5D:
+    """Regression: making the vector VI return a 3-D series for a 5-D stack broke
+    the action (the RegionAction output is a single non-navigable plot, so a 3-D
+    result can't display → 'breaks everything'). reduce() must return a 2-D image
+    for the CURRENT stack slice and must not raise."""
+
+    def _action_for(self, vecs, parked_stack=1):
+        from spyde.actions.vector_virtual_imaging import VectorVirtualImageAction
+        sig = _vectors_image()                       # the displayed vectors image
+        tree = _FakeTree()
+        tree.diffraction_vectors = vecs
+        # root carries the stack index the source navigator is parked on.
+        tree.root = types.SimpleNamespace(
+            axes_manager=types.SimpleNamespace(indices=(parked_stack, 0, 0)))
+        plot = _FakePlot(sig, tree)
+        # signal_tree/signal/plot are read-only properties → drive them via ctx.
+        ctx = types.SimpleNamespace(plot=plot, params={})
+        act = VectorVirtualImageAction(ctx)
+        return act, sig
+
+    def test_reduce_returns_2d_current_slice_for_stack(self):
+        vecs = _make_vecs_5d()
+        assert vecs.n_time == 2
+        act, sig = self._action_for(vecs)
+        sel = types.SimpleNamespace(
+            roi=_DiskWidget(cx=16, cy=16, r=8))         # pixel-space ROI on centre
+        img = act.reduce(sig, sel, None, calculation="intensity")
+        assert img is not None
+        assert img.ndim == 2                            # NOT a 3-D series
+        assert tuple(img.shape) == vecs.nav_shape       # (y, x)
+
+    def test_current_t_reads_source_index(self):
+        vecs = _make_vecs_5d()
+        act, _ = self._action_for(vecs, parked_stack=1)
+        assert act._current_t() == 1                    # the parked stack slice
+
+    def test_current_t_none_for_4d(self):
+        vecs = _make_vecs()                             # 4-D
+        sig = _vectors_image()
+        tree = _FakeTree(); tree.diffraction_vectors = vecs
+        plot = _FakePlot(sig, tree)
+        from spyde.actions.vector_virtual_imaging import VectorVirtualImageAction
+        act = VectorVirtualImageAction(types.SimpleNamespace(plot=plot, params={}))
+        assert act._current_t() is None

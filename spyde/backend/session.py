@@ -146,6 +146,7 @@ class Session:
         self.signal_trees: list[BaseSignalTree] = []
         self._plots: list[Plot] = []  # all open Plot objects (anyplotlib-backed)
         self._next_window_id = 0
+        self._active_window_id: int | None = None  # focused window (for save etc.)
         self._recent_files: list[str] = []
         self._example_temp_paths: list[str] = []  # temp .zspy dirs to clean up
         # (src_window_id, action_name) -> {"selector", "out_wids"} so deselecting
@@ -307,8 +308,14 @@ class Session:
             emit({"type": "loading", "busy": False, "text": ""})
             # A single navigated signal (e.g. a 4D-STEM MRC scan) → let the user
             # confirm/override the navigation shape and set the real step size
-            # (calibration) before opening. Everything else opens directly.
-            if len(signal) == 1 and self._wants_nav_prompt(signal[0]):
+            # (calibration) before opening. But a SELF-DESCRIBING HyperSpy format
+            # (.zspy/.zarr/.hspy) was written by us with correct axes — its shape
+            # and calibration are already right, so open it straight away (no
+            # prompt). The prompt is only for raw formats (.mrc/.tif) where the
+            # scan grid is ambiguous.
+            if (len(signal) == 1
+                    and not self._is_self_describing(path)
+                    and self._wants_nav_prompt(signal[0])):
                 self._prompt_nav_shape(signal[0], path)
                 return
             for sig in signal:
@@ -318,6 +325,13 @@ class Session:
         except Exception as e:
             emit({"type": "loading", "busy": False, "text": ""})
             emit_error(f"Failed to load {os.path.basename(path)}: {e}")
+
+    @staticmethod
+    def _is_self_describing(path: str) -> bool:
+        """True for HyperSpy-native formats that store full axes (shape +
+        calibration) — .zspy/.zarr/.hspy. These reload with correct dimensions, so
+        the scan-shape prompt (for ambiguous raw .mrc/.tif) should be skipped."""
+        return _path_ext(path) in (".zspy", ".zarr", ".hspy")
 
     @staticmethod
     def _wants_nav_prompt(sig: BaseSignal) -> bool:
@@ -1418,6 +1432,10 @@ class Session:
             self._set_signal_type(plot, payload.get("signal_type", ""))
         elif action == "load_example":
             self.load_example_data(payload["name"])
+        elif action == "set_active":
+            wid = payload.get("window_id", window_id)
+            if wid is not None:
+                self._active_window_id = wid
         elif action == "save_signal":
             self._save_signal(payload.get("path"), plot)
         elif action == "set_colormap":
@@ -1565,13 +1583,33 @@ class Session:
                 return p
         return None
 
+    def _resolve_save_plot(self, plot):
+        """Pick the plot to save: the one passed (from its window), else the
+        active window's, else the sole signal plot. The File→Save menu sends no
+        window id (it can't know the focused window), so fall back gracefully."""
+        if plot is not None:
+            return plot
+        if self._active_window_id is not None:
+            p = self._plot_by_window_id(self._active_window_id)
+            if p is not None:
+                return p
+        # Last resort: if exactly one plot carries a signal, save that.
+        with_sig = [p for p in self._plots
+                    if getattr(getattr(p, "plot_state", None), "current_signal", None)
+                    is not None]
+        return with_sig[0] if len(with_sig) == 1 else None
+
     def _save_signal(self, path: str | None, plot) -> None:
-        if plot is None or path is None:
-            emit_error("Save: no active plot or path")
+        if path is None:
+            emit_error("Save: no path given")
+            return
+        plot = self._resolve_save_plot(plot)
+        if plot is None:
+            emit_error("Save: click a signal window first, then Save.")
             return
         signal = getattr(getattr(plot, "plot_state", None), "current_signal", None)
         if signal is None:
-            emit_error("Save: no signal in active plot")
+            emit_error("Save: no signal in the active window")
             return
         # Default to the .zspy Zarr folder store: if the user typed a name with no
         # extension (or an unknown one), append .zspy rather than letting hyperspy
@@ -1579,12 +1617,44 @@ class Session:
         _WRITABLE_EXTS = (".zspy", ".hspy", ".zarr", ".tif", ".tiff")
         if _path_ext(path) not in _WRITABLE_EXTS:
             path = path + ".zspy"
+
+        name = os.path.basename(path)
+        # Saving a lazy multi-GB dataset to Zarr is a real compute (it reads the
+        # whole array). Run it OFF the asyncio event loop so the UI stays live,
+        # and show a busy indicator (start → finish) — the "nice save dialog".
+        emit({"type": "loading", "busy": True, "text": f"Saving {name}…"})
+        emit_status(f"Saving {name}…")
+        threading.Thread(
+            target=self._save_signal_thread,
+            args=(signal, path, name),
+            daemon=True,
+            name=f"save-{name}",
+        ).start()
+
+    def _save_signal_thread(self, signal, path: str, name: str) -> None:
         try:
             import dask
-            with dask.config.set(scheduler="synchronous"):
-                signal.save(path, overwrite=True)
+            # Prefer the distributed cluster when the data is lazy and a client is
+            # up — the store runs on the workers (true off-load, progress visible
+            # on the dashboard) instead of the GUI process. Otherwise a threaded
+            # local save. Either way this is on a daemon thread, never the loop.
+            client = getattr(self.dask_manager, "client", None)
+            is_lazy = bool(getattr(signal, "_lazy", False))
+            t0 = time.time()
+            if is_lazy and client is not None:
+                # hyperspy writes the Zarr store lazily; computing under the
+                # distributed scheduler dispatches the chunk writes to workers.
+                with dask.config.set(scheduler=client):
+                    signal.save(path, overwrite=True)
+            else:
+                with dask.config.set(scheduler="synchronous"):
+                    signal.save(path, overwrite=True)
+            dt = time.time() - t0
+            emit({"type": "loading", "busy": False, "text": ""})
             emit({"type": "saved", "path": path})
+            emit_status(f"Saved {name} ({dt:.1f}s)")
         except Exception as e:
+            emit({"type": "loading", "busy": False, "text": ""})
             emit_error(f"Save failed: {e}")
 
     def _set_colormap(self, plot, name: str | None) -> None:

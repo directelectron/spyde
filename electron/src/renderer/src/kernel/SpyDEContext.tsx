@@ -766,8 +766,12 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     windowId?: number,
   ) => window.electron.action(action, payload, windowId)
 
-  const setActiveWindow = (windowId: number) =>
+  const setActiveWindow = (windowId: number) => {
     dispatch({ type: 'SET_ACTIVE', windowId })
+    // Tell the backend too, so window-less actions (e.g. the File→Save menu,
+    // which can't know the focused window) can resolve the active plot.
+    window.electron.action('set_active', { window_id: windowId }, windowId)
+  }
 
   const clearNavShapePrompt = () => dispatch({ type: 'NAV_SHAPE_PROMPT', prompt: null })
   const openStackDialog = () => setStackDialogOpen(true)
