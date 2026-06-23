@@ -384,6 +384,15 @@ class Plot:
             return False
 
     def _set_array(self, data: np.ndarray, levels=None) -> None:
+        # Never try to paint a Future or a Future-bearing object array (a lazy
+        # navigator's data before its progressive compute lands) — anyplotlib's
+        # set_data does np.asarray(data, dtype=float), which raises on a Future.
+        if not isinstance(data, np.ndarray) or data.dtype == object:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("[plot] _set_array skipped non-numeric data %s (win=%s)",
+                             type(data).__name__ if not isinstance(data, np.ndarray)
+                             else f"object-ndarray{data.shape}", self.window_id)
+            return
         dims = data.ndim
 
         # Transform-view lock: while the Find-Vectors preview shows the DoG /
@@ -658,7 +667,14 @@ class Plot:
         # pushed later by the progressive compute, so only push real arrays.
         if not new_state.dynamic:
             data = getattr(new_state.current_signal, "data", None)
-            if isinstance(data, np.ndarray) and data.ndim == dims:
+            # Require a REAL numeric array. A lazy navigator's data can be a dask
+            # Future (distributed nav compute) — or, subtly, a length-1 OBJECT
+            # ndarray *wrapping* a Future (shape (1,), ndim 1, dtype=object). Both
+            # must be skipped here (the progressive nav compute paints the result
+            # later); painting them sends a Future into anyplotlib's
+            # np.asarray(data, dtype=float) → "float() argument ... not 'Future'".
+            if (isinstance(data, np.ndarray) and data.ndim == dims
+                    and data.dtype != object):
                 self.current_data = data
                 self.needs_auto_level = True
                 self.update()

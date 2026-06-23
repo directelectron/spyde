@@ -182,6 +182,24 @@ class IntegratingSelector1D(IntegratingSelectorMixin):
         self.children = self._inf_line_selector.children
         self.active_children = self._inf_line_selector.active_children
 
+        # CRITICAL: point each child window's parent_selector at the COMPOSITE
+        # (self), not at one of the two inner selectors. Each inner selector's
+        # __init__ set children.plot_window.parent_selector = <inner>, and the
+        # LinearRegionSelector (constructed second) WON — so a downstream selector
+        # walking upstream_selectors() found the hidden region selector instead of
+        # the active crosshair, composed the wrong index, and never tracked this
+        # axis. (5-D bug: moving the time axis updated the real-space image but not
+        # the DP.) The composite delegates _get_selected_indices to the ACTIVE
+        # sub-selector, so resolving upstream to `self` is what makes the chain
+        # see the live position. Mirrors IntegratingSSelector2D, which already
+        # does this.
+        for child in self.active_children:
+            pw = getattr(child, "plot_window", None)
+            if pw is not None:
+                pw.parent_selector = self
+            elif hasattr(child, "parent_selector"):
+                child.parent_selector = self
+
         self._inf_line_selector.is_integrating = False
         self._linear_region_selector.is_integrating = True
         self.selector = self._inf_line_selector

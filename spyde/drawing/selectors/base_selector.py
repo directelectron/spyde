@@ -377,11 +377,11 @@ class BaseSelector:
             return
         self.current_indices = indices
 
-        # TEMP (ungated): trace each selector's computed indices + how many
-        # children/chained selectors it drives, to debug the 5-D time→DP chain.
-        logger.debug("[NAV-IDX] %s indices=%s force=%s nchildren=%d multi=%s",
-                     type(self).__name__, np.asarray(indices).tolist(), force,
-                     len(self.children), self.multi_selector)
+        # Per-frame index trace — gated (fires on every move).
+        if _NAV_TIMING:
+            logger.debug("[NAV-IDX] %s indices=%s force=%s nchildren=%d multi=%s",
+                         type(self).__name__, np.asarray(indices).tolist(), force,
+                         len(self.children), self.multi_selector)
 
         for child, fn in self.children.items():
             try:
@@ -391,22 +391,27 @@ class BaseSelector:
                 child.update_data(new_data)
                 if update_contrast:
                     child.needs_auto_level = True
-                # TEMP (ungated): does this update CHAIN to a downstream navigator?
+                # Chain to a downstream navigator (5-D: time → spatial → DP). The
+                # gate is True when this child's window is itself a navigator with
+                # its own selectors.
                 mm = child.multiplot_manager
                 gate = (mm is not None
                         and child.plot_window in mm.navigation_selectors)
-                logger.debug("[CHAIN] %s updated child win=%s gate=%s nav_keys=%s",
-                             type(self).__name__, getattr(child, "window_id", None),
-                             gate,
-                             [getattr(k, "window_id", None) for k in mm.navigation_selectors]
-                             if mm else None)
+                if _NAV_TIMING:
+                    logger.debug("[CHAIN] %s updated child win=%s gate=%s",
+                                 type(self).__name__,
+                                 getattr(child, "window_id", None), gate)
                 if gate:
                     downstream = mm.navigation_selectors[child.plot_window]
-                    logger.debug("[CHAIN]  → re-firing %d downstream selector(s): %s",
-                                 len(downstream),
-                                 [type(s).__name__ for s in downstream])
                     for child_sel in downstream:
-                        child_sel.delayed_update_data()
+                        # force=True: an UPSTREAM navigator moved, so the downstream
+                        # selector's composed index (which includes our new
+                        # position) changed even though ITS OWN widget didn't.
+                        # Without force, _run_update's dup short-circuit can decide
+                        # "same widget position → skip" and the deeper plot (the DP
+                        # in a 5-D stack) never recomputes — the bug where moving
+                        # the time axis updated the real-space image but not the DP.
+                        child_sel.delayed_update_data(force=True)
             except Exception as e:
                 logger.debug("selector update failed: %s", e)
 
