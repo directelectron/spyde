@@ -284,25 +284,60 @@ class BaseSignalTree:
         _stop = threading.Event()
         self._nav_stop = _stop
 
+        def _paint_from_buffer():
+            arr = read_live_buffer(nav_shape, shm_name)
+            finite = arr[np.isfinite(arr)]
+            if finite.size > 0:
+                lo, hi = float(finite.min()), float(finite.max())
+                if _nav_levels[0] is None:
+                    _nav_levels[0] = (lo, hi if hi > lo else lo + 1)
+                elif hi > _nav_levels[0][1]:
+                    _nav_levels[0] = (_nav_levels[0][0], hi)
+                nav_plot.set_data(arr, levels=_nav_levels[0])
+
         def _poll_loop():
+            # Paint, THEN check done — and ALWAYS do a final paint after the loop.
+            # The old code broke on future.done() at the top of the loop, so the
+            # last chunks that landed in the shm buffer between the final 0.1 s
+            # poll and completion were never painted → HOLES in the navigator.
+            # (The virtual-image progressive poll never had holes precisely because
+            # it does this final read; see stream_progressive_to_plot.)
             while not _stop.is_set():
-                if future.done():
-                    break
                 try:
-                    arr = read_live_buffer(nav_shape, shm_name)
-                    finite = arr[np.isfinite(arr)]
-                    if finite.size > 0:
-                        if _nav_levels[0] is None:
-                            lo, hi = float(finite.min()), float(finite.max())
-                            _nav_levels[0] = (lo, hi if hi > lo else lo + 1)
-                        else:
-                            lo, hi = float(finite.min()), float(finite.max())
-                            if hi > _nav_levels[0][1]:
-                                _nav_levels[0] = (_nav_levels[0][0], hi)
-                        nav_plot.set_data(arr, levels=_nav_levels[0])
+                    _paint_from_buffer()
                 except Exception as e:
                     logger.debug("navigator poll paint failed: %s", e)
+                if future.done():
+                    break
                 time.sleep(0.1)
+            if _stop.is_set():
+                return
+            # Final repaint of the COMPLETED navigator. The per-chunk shm writes
+            # race the whole-array `future` (separate computations — the chunk
+            # add_done_callbacks can still be pending when future.done() is True),
+            # so the chunk-built buffer may miss the last slice(s) → holes. The
+            # navigator is small (nav-shaped, ~MB), so paint the AUTHORITATIVE
+            # full result directly — guaranteed complete, no hole possible. Fall
+            # back to the buffer if the result isn't fetchable.
+            try:
+                res = future.result()
+                arr = np.asarray(res, dtype=np.float32)
+                if arr.shape == tuple(nav_shape):
+                    finite = arr[np.isfinite(arr)]
+                    if finite.size > 0:
+                        lo, hi = float(finite.min()), float(finite.max())
+                        lv = (_nav_levels[0] if _nav_levels[0] is not None
+                              else (lo, hi if hi > lo else lo + 1))
+                        nav_plot.set_data(arr, levels=lv)
+                else:
+                    _paint_from_buffer()
+            except Exception as e:
+                logger.debug("navigator final result paint failed (%s); "
+                             "falling back to buffer", e)
+                try:
+                    _paint_from_buffer()
+                except Exception as e2:
+                    logger.debug("navigator final buffer paint failed: %s", e2)
 
         t = threading.Thread(target=_poll_loop, daemon=True, name="nav-poll")
         t.start()

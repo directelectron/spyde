@@ -22,6 +22,20 @@
       }
       :focus { outline: none; }
       * { -webkit-tap-highlight-color: transparent; }
+
+      /* Dark-themed scrollbars (Chromium) — the default white bars looked wrong
+         against the dark UI. Catppuccin Mocha surfaces: track = surface0, thumb
+         = surface1/overlay0 on hover. */
+      * { scrollbar-color: #45475a #1e1e2e; scrollbar-width: thin; }
+      ::-webkit-scrollbar { width: 11px; height: 11px; }
+      ::-webkit-scrollbar-track { background: #1e1e2e; }
+      ::-webkit-scrollbar-thumb {
+        background: #45475a;
+        border-radius: 6px;
+        border: 2px solid #1e1e2e;   /* inset so the thumb reads as a pill */
+      }
+      ::-webkit-scrollbar-thumb:hover { background: #585b70; }
+      ::-webkit-scrollbar-corner { background: #1e1e2e; }
     </style>
   </head>
   <body>

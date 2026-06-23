@@ -987,18 +987,20 @@ class Session:
             return
         ax_x, ax_y = edit_ax[0], edit_ax[1]
         w, h = int(ax_x.size), int(ax_y.size)
-        # Start the crosshair on the pixel that is currently the origin
-        # (data == 0): pixel = -offset/scale, expressed back in data coords for
-        # the widget.  If the data origin is off-image, fall back to the centre.
-        def _origin_data():
+        # Start the crosshair on the PIXEL that is currently the origin
+        # (data == 0): pixel = -offset/scale. anyplotlib's 2-D widget takes
+        # pixel coordinates directly (it does NOT apply the axis scale/offset),
+        # so we hand it the pixel, not a data coord. If the origin is off-image,
+        # fall back to the image centre.
+        def _origin_pixel():
             sx, ox = float(ax_x.scale), float(ax_x.offset)
             sy, oy = float(ax_y.scale), float(ax_y.offset)
             pxi = (-ox / sx) if sx else w / 2.0
             pyi = (-oy / sy) if sy else h / 2.0
             if not (0 <= pxi <= w and 0 <= pyi <= h):
                 pxi, pyi = w / 2.0, h / 2.0
-            return pxi * sx + ox, pyi * sy + oy
-        cx0, cy0 = _origin_data()
+            return pxi, pyi
+        cx0, cy0 = _origin_pixel()
         try:
             cross = plot2d.add_crosshair_widget(cx=cx0, cy=cy0, color="#ffae57")
         except Exception as e:
@@ -1006,23 +1008,21 @@ class Session:
             return
         plot._offset_cross = cross
 
-        # Capture the calibration at toggle-on time as the FIXED reference for
-        # converting the widget's data coords → pixel.  The widget reports data
-        # coords under whatever offset is current, but we mutate the offset every
-        # move; deriving the pixel from the live (mutating) offset would feed back
-        # and drift.  Anchoring to the reference offset keeps a stationary
-        # crosshair mapping to a stationary pixel across repeated applies.
-        ref = {"sx": float(ax_x.scale), "ox": float(ax_x.offset),
-               "sy": float(ax_y.scale), "oy": float(ax_y.offset)}
+        # Capture the scale at toggle-on time as the FIXED reference. The widget
+        # reports its position in PIXELS (unaffected by the offset we mutate each
+        # move), so there's no offset feedback to anchor against — only the scale
+        # matters for offset_new = -pixel * scale. Kept as a dict for symmetry
+        # with the per-move apply below.
+        ref = {"sx": float(ax_x.scale), "sy": float(ax_y.scale)}
 
         def _apply(final: bool):
-            # Recover the PIXEL the crosshair sits on (using the reference
-            # calibration), then set each offset so that pixel maps to data 0:
-            # offset_new = -pixel * scale.  Stable across repeated move events.
+            # The crosshair's cx/cy ARE the pixel it sits on (image-pixel coords);
+            # set each offset so that pixel maps to data 0: offset_new =
+            # -pixel * scale. Stable across repeated move events.
             try:
                 sx, sy = ref["sx"], ref["sy"]
-                px = (float(cross.cx) - ref["ox"]) / sx if sx else 0.0
-                py = (float(cross.cy) - ref["oy"]) / sy if sy else 0.0
+                px = float(cross.cx)
+                py = float(cross.cy)
                 ax_x.offset = -px * sx
                 ax_y.offset = -py * sy
             except Exception as e:
@@ -1041,10 +1041,10 @@ class Session:
                     plot.update()
                 except Exception as e:
                     log.debug("re-pushing host plot after offset set failed: %s", e)
-                # The displayed extent now reflects the new offset, so the widget
-                # sits at data coord 0.  Re-anchor the reference to the new
-                # calibration so a SUBSEQUENT drag is interpreted correctly.
-                ref["ox"], ref["oy"] = float(ax_x.offset), float(ax_y.offset)
+                # No reference re-anchor needed: the widget reports ABSOLUTE pixel
+                # coordinates, which the host-plot re-push (a relabel of the
+                # axes) leaves unchanged. A subsequent drag's offset is computed
+                # from the new absolute pixel directly.
 
         def _on_event(event=None):
             etype = getattr(event, "type", None) or getattr(event, "name", None)

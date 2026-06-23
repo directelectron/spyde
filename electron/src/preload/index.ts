@@ -4,6 +4,11 @@
 import { contextBridge, ipcRenderer } from 'electron'
 
 contextBridge.exposeInMainWorld('electron', {
+  // OS platform ('darwin' | 'win32' | 'linux') — the renderer uses this to lay
+  // out the custom title bar (macOS traffic lights on the left vs Windows
+  // titleBarOverlay buttons on the right).
+  platform: process.platform,
+
   // ── Python → Renderer ─────────────────────────────────────────────────────
 
   // Each on* returns an UNSUBSCRIBE function. The renderer registers these in a
@@ -65,6 +70,12 @@ contextBridge.exposeInMainWorld('electron', {
 
   /** Open a native file picker (result sent directly to Python). */
   openFile: (): Promise<void> => ipcRenderer.invoke('spyde:open-file'),
+
+  /** Open a .zspy/.zarr DIRECTORY store (folder picker → load). */
+  openZarrFolder: (): Promise<void> => ipcRenderer.invoke('spyde:open-zarr-folder'),
+
+  /** Quit the app (custom title-bar menu replaces native File→Quit). */
+  quit: (): Promise<void> => ipcRenderer.invoke('spyde:quit'),
 
   /** Open a native save dialog. */
   saveDialog: (): Promise<void> => ipcRenderer.invoke('spyde:save-dialog'),

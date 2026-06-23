@@ -7,6 +7,7 @@ import { LogPanel } from './components/LogPanel'
 import { Tour } from './components/Tour'
 import { NavShapeGate } from './components/NavShapeGate'
 import { StackGate } from './components/StackGate'
+import { MenuBar } from './components/MenuBar'
 import { GUIDES, getGuide, type Guide } from '@guides/index'
 
 export function App() {
@@ -123,11 +124,25 @@ function AppBar({ sidebarOpen, onToggleSidebar, onStartGuide }: {
   onStartGuide: (g: Guide) => void
 }) {
   const [hover, setHover] = useState(false)
+  const isMac = window.electron?.platform === 'darwin'
   return (
-    <div data-testid="app-bar" style={styles.appBar}>
-      <div style={styles.brand}>
-        <span style={styles.logoDot} />
-        <span style={styles.appTitle}>SpyDE</span>
+    <div
+      data-testid="app-bar"
+      style={{
+        ...styles.appBar,
+        // macOS: clear the traffic-light buttons (top-left). Windows/Linux: the
+        // native min/max/close are an overlay on the RIGHT (titleBarOverlay), so
+        // pad the right instead and keep the logo flush left.
+        paddingLeft: isMac ? 84 : 12,
+        paddingRight: isMac ? 8 : 146,
+      }}
+    >
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, ...noDrag }}>
+        <div style={styles.brand}>
+          <span style={styles.logoDot} />
+          <span style={styles.appTitle}>SpyDE</span>
+        </div>
+        <MenuBar onStartGuide={onStartGuide} />
       </div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 2, ...noDrag }}>
         <HelpButton onStartGuide={onStartGuide} />
@@ -168,8 +183,7 @@ const styles: Record<string, React.CSSProperties> = {
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingLeft: 84,   // clear the macOS traffic lights
-    paddingRight: 8,
+    // paddingLeft/Right set inline per-platform (traffic lights vs overlay).
     background: 'linear-gradient(#1c1c2b, #181825)',
     borderBottom: '1px solid #2a2a3c',
     ...drag,

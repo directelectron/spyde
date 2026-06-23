@@ -223,27 +223,19 @@ class BaseSelector:
         return None
 
     def _data_to_index(self, value_x: float, value_y: float) -> tuple[int, int]:
-        """Convert a widget position in DATA coordinates to integer array
-        indices, dividing out the displayed axes' scale/offset:
-        ``index = round((value - offset) / scale)``.
+        """Convert a 2-D widget position to integer array indices.
 
-        With unit scale and zero offset (the synthetic fixtures, and any
-        uncalibrated image) this is just ``round(value)`` — so the change is a
-        no-op there and only corrects calibrated images, where using the raw
-        data coordinate as an index loads the WRONG pixel (the 3 nm-step bug)."""
-        axes = self._display_axes()
-        if axes is None:
-            return int(round(value_x)), int(round(value_y))
-        x_ax, y_ax = axes
-        try:
-            sx = float(getattr(x_ax, "scale", 1.0)) or 1.0
-            sy = float(getattr(y_ax, "scale", 1.0)) or 1.0
-            ox = float(getattr(x_ax, "offset", 0.0))
-            oy = float(getattr(y_ax, "offset", 0.0))
-            return int(round((value_x - ox) / sx)), int(round((value_y - oy) / sy))
-        except Exception as e:
-            logger.debug("data→index conversion failed: %s", e)
-            return int(round(value_x)), int(round(value_y))
+        anyplotlib's 2-D overlay widgets (crosshair / rectangle) report their
+        position in IMAGE-PIXEL coordinates — the widget math in figure_esm.js
+        (``_canvasToImg2d`` / ``_imgToCanvas2d``) is pure image pixels and never
+        applies the axes' ``scale``/``offset`` (only the 1-D widgets use data
+        coords). So the widget value IS already the array index; just round it.
+
+        Do NOT divide by the axes' scale/offset here: that double-corrects a
+        calibrated scan (a 3 nm-step navigator would map the right pixel to the
+        wrong frame). The displayed axis calibration only drives the scale bar /
+        tooltip, not the widget readback."""
+        return int(round(value_x)), int(round(value_y))
 
     def _get_selected_indices(self) -> np.ndarray:
         raise NotImplementedError("Subclasses must implement _get_selected_indices.")

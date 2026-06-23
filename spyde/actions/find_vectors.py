@@ -504,15 +504,58 @@ def _sample_raw_bilinear(frame: np.ndarray, ys, xs) -> np.ndarray:
     return v.astype(np.float32)
 
 
-def _with_raw_intensity(frame: np.ndarray, peaks: np.ndarray) -> np.ndarray:
+def _disk_mean_intensity(frame: np.ndarray, ys, xs, radius: float) -> np.ndarray:
+    """Mean of the (experimental) frame over a small DISK of ``radius`` px around
+    each peak — a robust per-disk brightness for virtual imaging / weighting.
+
+    Why not a single bilinear point (the old ``_sample_raw_bilinear`` used for the
+    intensity column): a 1-pixel sample is dominated by shot noise and by exactly
+    where the sub-pixel centre landed, so the stored "intensity" jumps sharply
+    frame-to-frame even when the underlying disk brightness is smooth — which
+    shows up as BANDING/stripes in an intensity-weighted virtual image. Averaging
+    over the disk (the same footprint the peak represents) removes that: the
+    value tracks true disk brightness and varies continuously between neighbours.
+
+    Falls back to a bilinear point sample when radius < 1 (degenerate)."""
+    ys = np.asarray(ys, dtype=np.float64)
+    xs = np.asarray(xs, dtype=np.float64)
+    r = int(max(0, round(float(radius))))
+    if r < 1 or ys.size == 0:
+        return _sample_raw_bilinear(frame, ys, xs)
+    H, W = frame.shape
+    f = frame.astype(np.float32, copy=False)
+    # Offsets covering the disk footprint once (shared across all peaks).
+    oy, ox = np.mgrid[-r:r + 1, -r:r + 1]
+    inside = (oy * oy + ox * ox) <= r * r
+    oy, ox = oy[inside], ox[inside]                      # (K,) disk offsets
+    cy = np.rint(ys).astype(np.intp)[:, None] + oy[None]  # (N, K)
+    cx = np.rint(xs).astype(np.intp)[:, None] + ox[None]
+    valid = (cy >= 0) & (cy < H) & (cx >= 0) & (cx < W)   # clip at frame edges
+    cy = np.clip(cy, 0, H - 1)
+    cx = np.clip(cx, 0, W - 1)
+    samp = f[cy, cx]
+    samp = np.where(valid, samp, np.nan)
+    # nanmean over the disk → robust to edge clipping; all-nan (shouldn't happen)
+    # falls back to 0.
+    with np.errstate(invalid="ignore"):
+        out = np.nanmean(samp, axis=1)
+    return np.nan_to_num(out, nan=0.0).astype(np.float32)
+
+
+def _with_raw_intensity(frame: np.ndarray, peaks: np.ndarray,
+                        radius: float = 0.0) -> np.ndarray:
     """Overwrite a peak set's value column (col 2) with the raw frame intensity
     at each peak — keeping the NXCORR-derived position. For the GPU/torch paths,
-    which return correlation scores."""
+    which return correlation scores. ``radius`` > 0 → robust disk-mean intensity
+    (recommended; avoids the single-pixel banding); 0 → legacy bilinear point."""
     peaks = np.asarray(peaks, dtype=np.float32)
     if peaks.size == 0:
         return peaks.reshape(-1, 3)
     out = peaks.copy()
-    out[:, 2] = _sample_raw_bilinear(frame, peaks[:, 0], peaks[:, 1])
+    if radius and radius >= 1:
+        out[:, 2] = _disk_mean_intensity(frame, peaks[:, 0], peaks[:, 1], radius)
+    else:
+        out[:, 2] = _sample_raw_bilinear(frame, peaks[:, 0], peaks[:, 1])
     return out
 
 
@@ -716,7 +759,10 @@ def _find_vectors_single_frame(
         pos = _subpixel_parabola(raw_corr, peaks_px)
     else:
         pos = peaks_px.astype(np.float32)
-    intens = _sample_raw_bilinear(frame, pos[:, 0], pos[:, 1])
+    # Disk-MEAN brightness over the kernel footprint (robust), not a single
+    # sub-pixel sample — a 1-px value swings frame-to-frame and bands an
+    # intensity-weighted virtual image. See _disk_mean_intensity.
+    intens = _disk_mean_intensity(frame, pos[:, 0], pos[:, 1], kernel_radius)
     peaks = np.column_stack([pos, intens]).astype(np.float32)
     return corr_map, raw_corr, peaks
 
@@ -934,9 +980,13 @@ def _find_vectors_single_frame_dog(
     else:
         pos = peaks_px.astype(np.float32)
     # intensity column = RAW experimental frame brightness (for virtual imaging /
-    # orientation weighting), sampled at the sub-pixel position — same convention
-    # as the NXCORR path.
-    intens = _sample_raw_bilinear(np.asarray(frame, dtype=np.float32), pos[:, 0], pos[:, 1])
+    # orientation weighting). Disk-MEAN over the spot footprint (radius ≈ σ₂, the
+    # band-pass outer scale), NOT a single sub-pixel sample — a 1-px value swings
+    # frame-to-frame and bands an intensity-weighted virtual image (see
+    # _disk_mean_intensity). Same convention as the NXCORR path now.
+    intens = _disk_mean_intensity(
+        np.asarray(frame, dtype=np.float32), pos[:, 0], pos[:, 1],
+        max(1.0, np.ceil(sigma2)))
     peaks = np.column_stack([pos, intens]).astype(np.float32)
     return corr_map, snr, peaks
 
@@ -1831,7 +1881,8 @@ def _find_vectors_batch_gpu(
                     kept[j + 1:][too_close] = False
                 frame_peaks = frame_peaks[kept]
 
-            result_flat[i] = _with_raw_intensity(host_frames[i], frame_peaks)
+            result_flat[i] = _with_raw_intensity(host_frames[i], frame_peaks,
+                                                 radius=kernel_r)
 
         result = result_flat.reshape(nav_shape) if len(nav_shape) > 0 else result_flat
         return result
@@ -1911,8 +1962,10 @@ def _dog_block(b4d, sigma1, sigma2, threshold, min_dist, subpixel, beamstop_mask
             peaks_list = find_vectors_dog_torch_batch(
                 flat, sigma1, sigma2, threshold, min_dist,
                 subpixel=subpixel, beamstop_mask=beamstop_mask)
-            # GPU returns the SNR in col 2; replace with raw frame intensity.
-            peaks_list = [_with_raw_intensity(flat[i], p)
+            # GPU returns the SNR in col 2; replace with raw frame intensity
+            # (disk-mean over ~σ₂ footprint — robust, avoids per-frame banding).
+            _r = max(1.0, float(np.ceil(sigma2)))
+            peaks_list = [_with_raw_intensity(flat[i], p, radius=_r)
                           for i, p in enumerate(peaks_list)]
     except Exception as _e:
         log.warning("[find_vectors] torch DoG GPU path failed (%s); CPU per-frame", _e)
@@ -2098,8 +2151,9 @@ def _find_vectors_chunk(
                     flat, kernel_r, threshold, min_dist,
                     subpixel=subpixel, beamstop_mask=beamstop_mask)
                 # torch returns NXCORR positions + correlation score; replace the
-                # value column with the raw frame intensity at each peak.
-                peaks_list = [_with_raw_intensity(flat[i], p)
+                # value column with the raw frame intensity at each peak (disk-mean
+                # over the kernel footprint — robust, avoids per-frame banding).
+                peaks_list = [_with_raw_intensity(flat[i], p, radius=kernel_r)
                               for i, p in enumerate(peaks_list)]
         except Exception as _e:
             log.warning("[find_vectors] torch GPU path failed (%s); CPU per-frame", _e)
@@ -2685,8 +2739,10 @@ def _find_vectors_chunk_gpu_impl(
                 frame_peaks = frame_peaks[kept]
 
             # Value column → raw experimental intensity at each peak (after NMS,
-            # which used the corr score, matching the CPU path).
-            frame_peaks = _with_raw_intensity(host_frames[i], frame_peaks)
+            # which used the corr score, matching the CPU path). Disk-mean over the
+            # kernel footprint — robust, avoids the per-frame single-pixel banding.
+            frame_peaks = _with_raw_intensity(host_frames[i], frame_peaks,
+                                              radius=kernel_r)
             n = min(len(frame_peaks), MAX_PEAKS)
             if n > 0:
                 out[iy, ix, :n, :] = frame_peaks[:n]

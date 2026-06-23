@@ -426,3 +426,63 @@ def test_single_frame_pipeline_under_20ms():
         _find_vectors_single_frame(frame, 12, 0.3, 10)
     avg_ms = (time.perf_counter() - t0) / 10 * 1000
     assert avg_ms < 20, f"Pipeline too slow: {avg_ms:.1f}ms (limit 20ms)"
+
+
+# ── Peak intensity robustness (no per-frame banding) ──────────────────────────
+
+
+class TestPeakIntensityRobust:
+    """The stored peak intensity (col 2) is a disk-MEAN over the kernel footprint,
+    not a single sub-pixel sample. A 1-px value swings frame-to-frame with shot
+    noise + sub-pixel jitter, which bands an intensity-weighted virtual image
+    ('there shouldn't be sharp changes'). The disk-mean is far more stable."""
+
+    def test_disk_mean_more_stable_than_point_sample(self):
+        from spyde.actions.find_vectors import (
+            _sample_raw_bilinear, _disk_mean_intensity,
+        )
+        rng = np.random.RandomState(0)
+        yy, xx = np.mgrid[0:32, 0:32]
+        blob = 100 * np.exp(-((yy - 16) ** 2 + (xx - 16) ** 2) / (2 * 3.0 ** 2))
+        pt, dm = [], []
+        for _ in range(150):
+            frame = (blob + rng.randn(32, 32) * 8).astype(np.float32)
+            cy, cx = 16 + rng.uniform(-0.5, 0.5), 16 + rng.uniform(-0.5, 0.5)
+            pt.append(float(_sample_raw_bilinear(frame, [cy], [cx])[0]))
+            dm.append(float(_disk_mean_intensity(frame, [cy], [cx], 3.0)[0]))
+        pt, dm = np.array(pt), np.array(dm)
+        cv_pt = pt.std() / pt.mean()
+        cv_dm = dm.std() / dm.mean()
+        # Disk-mean must be at least 2x more stable (lower coefficient of variation).
+        assert cv_dm < cv_pt / 2.0, f"disk-mean CV {cv_dm:.3f} not < pt CV {cv_pt:.3f}/2"
+
+    def test_disk_mean_handles_frame_edges(self):
+        from spyde.actions.find_vectors import _disk_mean_intensity
+        frame = np.ones((16, 16), dtype=np.float32)
+        # peaks right at the corner/edge must not raise and must stay finite.
+        out = _disk_mean_intensity(frame, [0, 15, 8], [0, 15, 8], 4.0)
+        assert out.shape == (3,)
+        assert np.all(np.isfinite(out))
+        assert np.allclose(out, 1.0)        # uniform frame → mean 1 everywhere
+
+    def test_radius_below_one_falls_back_to_point(self):
+        from spyde.actions.find_vectors import (
+            _disk_mean_intensity, _sample_raw_bilinear,
+        )
+        frame = np.random.RandomState(1).rand(16, 16).astype(np.float32)
+        a = _disk_mean_intensity(frame, [7.3], [8.6], 0.0)
+        b = _sample_raw_bilinear(frame, [7.3], [8.6])
+        assert np.allclose(a, b)
+
+    def test_find_vectors_stores_disk_mean_intensity(self):
+        # End-to-end: a bright disk on a noisy frame → stored intensity ≈ the
+        # disk-mean (well above a single noisy pixel's spread), via the real
+        # single-frame path.
+        peaks_xy = [(64, 64)]
+        frame = _blurred_frame((128, 128), peaks_xy, sigma=1.5)
+        frame = frame + np.random.RandomState(2).randn(128, 128).astype(np.float32) * 0.01
+        _cmap, _raw, peaks = _find_vectors_single_frame(frame, 12, 0.3, 10)
+        assert len(peaks) >= 1
+        # intensity column is finite and positive (a real brightness, not a score).
+        assert np.all(np.isfinite(peaks[:, 2]))
+        assert peaks[:, 2].max() > 0

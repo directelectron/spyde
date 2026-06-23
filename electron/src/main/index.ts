@@ -51,7 +51,17 @@ function createWindow(): BrowserWindow {
     height: 900,
     minWidth: 900,
     minHeight: 600,
-    titleBarStyle: 'hiddenInset',
+    // ONE custom dark title bar on every platform (no native bar stacked on top
+    // of ours — the Windows "two header bars" bug came from 'hiddenInset', which
+    // is macOS-only and left the native Windows frame in place).
+    //  - macOS: 'hidden' keeps the traffic-light buttons overlaid top-left.
+    //  - Windows/Linux: 'hidden' + titleBarOverlay draws native, DARK-THEMED
+    //    min/max/close buttons top-right (OS handles hit-test/snap), so we don't
+    //    hand-roll window controls.
+    titleBarStyle: 'hidden',
+    ...(process.platform !== 'darwin'
+      ? { titleBarOverlay: { color: '#181825', symbolColor: '#cdd6f4', height: 38 } }
+      : {}),
     backgroundColor: '#11111b',
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
@@ -302,6 +312,20 @@ ipcMain.handle('spyde:open-file', async () => {
     }
   }
 })
+
+/** Open a .zspy/.zarr DIRECTORY store (folder picker → load). */
+ipcMain.handle('spyde:open-zarr-folder', async () => {
+  const result = await dialog.showOpenDialog(win!, {
+    title: 'Open a .zspy / .zarr dataset folder',
+    properties: ['openDirectory', 'multiSelections'],
+  })
+  if (!result.canceled) {
+    for (const p of result.filePaths) sendAction('open_file', { path: p })
+  }
+})
+
+/** Quit the app (custom-titlebar menu has no native File→Quit on Win/Linux). */
+ipcMain.handle('spyde:quit', () => app.quit())
 
 /** Multi-select file picker that RETURNS the chosen paths to the renderer (does
  *  NOT auto-open). Used by the StackDialog's "Add datasets…" tile. */

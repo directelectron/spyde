@@ -2,6 +2,7 @@
 declare global {
   interface Window {
     electron: {
+      platform: string
       onMessage: (cb: (msg: Record<string, unknown>) => void) => () => void
       onStream: (cb: (text: string, kind: 'stdout' | 'stderr') => void) => () => void
       onTile: (cb: () => void) => () => void
@@ -10,6 +11,8 @@ declare global {
       onOpenStackDialog: (cb: () => void) => () => void
       action: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
       openFile: () => Promise<void>
+      openZarrFolder: () => Promise<void>
+      quit: () => Promise<void>
       saveDialog: () => Promise<void>
       pickFile: (opts: { name?: string; extensions?: string[] }) => Promise<string | null>
       pickFiles: (opts?: { name?: string; extensions?: string[] }) => Promise<string[]>

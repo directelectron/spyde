@@ -214,3 +214,51 @@ class TestProgressiveNavigator:
             )
         finally:
             session.shutdown()
+
+    def test_navigator_has_no_holes_when_complete(self, monkeypatch):
+        """The FINAL navigator must be hole-free (no leftover NaN). Holes came
+        from the distributed poll loop breaking on future.done() before a final
+        paint, and from chunk shm-writes racing the whole-array future. The fix
+        paints the authoritative result on completion. Here we assert the
+        end-state completeness on the (deterministic) threaded path; the
+        distributed path now paints future.result() which is complete by
+        construction."""
+        monkeypatch.setenv("SPYDE_NO_DASK", "1")
+        from spyde.drawing.plots.plot import Plot
+        last_finite = [0]
+        last_size = [0]
+        orig = Plot.set_data
+
+        def _track(self, data, *a, **k):
+            try:
+                if getattr(self, "is_navigator", False):
+                    arr = np.asarray(data)
+                    last_finite[0] = int(np.isfinite(arr).sum())
+                    last_size[0] = int(arr.size)
+            except Exception:
+                pass
+            return orig(self, data, *a, **k)
+
+        monkeypatch.setattr(Plot, "set_data", _track)
+
+        session = _make_session()
+        try:
+            ny = nx = 12
+            base = np.arange(ny * nx * 8 * 8, dtype=np.float32).reshape(ny, nx, 8, 8)
+            arr = da.from_array(base, chunks=(4, 4, 8, 8))   # 3×3 nav chunk grid
+            s = hs.signals.Signal2D(arr).as_lazy()
+            s.set_signal_type("electron_diffraction")
+            session._add_signal(s, source_path=None)
+
+            # Wait for the fill to complete (last paint covers every pixel).
+            for _ in range(80):
+                if last_size[0] and last_finite[0] >= ny * nx:
+                    break
+                time.sleep(0.1)
+            assert last_size[0] == ny * nx, "navigator size unexpected"
+            assert last_finite[0] == ny * nx, (
+                f"navigator left {ny*nx - last_finite[0]} NaN holes "
+                f"({last_finite[0]}/{ny*nx} finite)"
+            )
+        finally:
+            session.shutdown()
