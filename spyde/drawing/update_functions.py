@@ -201,16 +201,30 @@ def update_from_navigation_selection(
             log.debug("NAV-DEBUG enter logging failed: %s", _e)
 
     # anyplotlib displays the navigator image un-transposed (imshow convention:
-    # data axis 0 = rows = y = iy, axis 1 = cols = x = ix). The selector reports
-    # widget coords (cx = column, cy = row), i.e. (x, y) order. pyqtgraph used to
-    # display transposed, so the Qt index math indexed data[(cx, cy)] directly and
-    # was correct THERE. With anyplotlib we must swap (x, y) → (y, x) so the
-    # selected DP is data[iy, ix] — otherwise clicking a real-space pixel shows a
-    # transposed/wrong diffraction pattern (and IndexError-then-clamp on a
-    # non-square scan). Only the 2-D spatial nav case is transposed.
+    # data axis 0 = rows = y = iy, axis 1 = cols = x = ix). The 2-D spatial
+    # selector reports widget coords (cx = column, cy = row), i.e. (x, y) order,
+    # so the SPATIAL pair must be swapped (x, y) → (y, x) to index data[iy, ix] —
+    # otherwise a real-space pixel shows a transposed/wrong diffraction pattern
+    # (and IndexError-then-clamp on a non-square scan).
+    #
+    # For a chained multi-navigator (a 5-D stack: outer index axis → spatial
+    # scan → DP), the combined row is (outer…, x, y) — the outer navigator
+    # coordinate(s) come FIRST (broadcast_rows_cartesian puts upstream selectors
+    # first) and are ALREADY in data order; only the spatial (x, y) pair from the
+    # innermost crosshair is in widget order. So swap just the LAST TWO columns,
+    # not the whole row (reversing the whole row would scramble the stack axis
+    # against x — the cause of "clamped [0,525,169] -> [0,299,169]" on a 5-D
+    # stack: x=525 wrongly bounded by the y-axis). The swap applies whenever the
+    # innermost navigator is 2-D spatial (signal_dimension == 2).
     indices = np.asarray(indices)
-    if indices.ndim >= 1 and indices.shape[-1] == 2:
-        indices = indices[..., ::-1]
+    _has_spatial_nav = False
+    try:
+        _has_spatial_nav = current_signal.axes_manager.signal_dimension == 2
+    except Exception:
+        _has_spatial_nav = indices.ndim >= 1 and indices.shape[-1] == 2
+    if _has_spatial_nav and indices.ndim >= 1 and indices.shape[-1] >= 2:
+        indices = indices.copy()
+        indices[..., -2:] = indices[..., -2:][..., ::-1]
 
     if not selector.is_integrating:
         indices = np.mean(indices, axis=0).astype(int)

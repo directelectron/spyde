@@ -347,6 +347,27 @@ class SpyDEDiffractionVectors:
         """(N, 2) [kx, ky] at (iy, ix) across all time steps."""
         return self.at(iy, ix)[:, COL_KX:COL_KY + 1]
 
+    def at_nav(self, iy: int, ix: int, lead: tuple = ()) -> np.ndarray:
+        """(N, 6) slice at the FULL nav position.
+
+        ``lead`` holds the outer nav coords above the 2-D scan (e.g. the stack /
+        time index of a 5-D dataset), in outermost-first data order. With no lead
+        this is :meth:`at` (all outer steps for 4-D); with a lead it is the single
+        ``(*lead, iy, ix)`` position — the right behaviour when a 5-D stack's
+        navigator is parked on one slice."""
+        lead = tuple(int(v) for v in (lead or ()))
+        if not lead:
+            return self.at(iy, ix)
+        # full_nav_shape is (outer…, nav_y, nav_x); the lead fills the outer dims.
+        if len(lead) != len(self.full_nav_shape) - 2:
+            # Mismatch (e.g. stale higher-grid position) → fall back to all-steps.
+            return self.at(iy, ix)
+        return self._slice_flat((*lead, iy, ix))
+
+    def kxy_at_nav(self, iy: int, ix: int, lead: tuple = ()) -> np.ndarray:
+        """(N, 2) [kx, ky] at the full nav position (see :meth:`at_nav`)."""
+        return self.at_nav(iy, ix, lead)[:, COL_KX:COL_KY + 1]
+
     def intensities_at(self, iy: int, ix: int) -> np.ndarray:
         return self.at(iy, ix)[:, COL_INTENSITY]
 
@@ -365,6 +386,20 @@ class SpyDEDiffractionVectors:
         # x_off has length n_t * nav_y * nav_x + 1
         counts_all = np.diff(x_off).reshape(self.n_time, nav_y, nav_x)
         return counts_all.sum(axis=0).astype(np.int32)
+
+    def count_map_series(self) -> np.ndarray:
+        """(n_outer, nav_y, nav_x) int32 — per-slice vector count map.
+
+        For 4-D (no outer dim) returns (1, nav_y, nav_x). The outer axis is the
+        stack / time dimension; this is the natural navigator for a 5-D stack
+        (scrub the stack axis → that slice's spatial counts)."""
+        nav_y, nav_x = self.nav_shape
+        x_off = self.nav_offsets[-1]
+        if self.n_time == 0:
+            counts = np.diff(x_off).reshape(1, nav_y, nav_x)
+        else:
+            counts = np.diff(x_off).reshape(self.n_time, nav_y, nav_x)
+        return counts.astype(np.int32)
 
     def count_map_at_t(self, t: int) -> np.ndarray:
         """(nav_y, nav_x) int32 — vector count at time step t."""
@@ -509,6 +544,30 @@ class SpyDEDiffractionVectors:
                 buf = self._frame_slice(t)
                 out[t] = self._vvi_on_buf(buf, cx, cy, r_outer, r_inner, intensity_weighted)
 
+        return out.reshape(n_t, nav_y, nav_x)
+
+    def virtual_image_series_rect(
+        self, x0: float, y0: float, x1: float, y1: float,
+        intensity_weighted: bool = True,
+    ) -> np.ndarray:
+        """(n_outer, nav_y, nav_x) rectangular-ROI virtual image series.
+
+        Per-slice analogue of :meth:`virtual_image_from_rect`; for 4-D returns
+        (1, nav_y, nav_x)."""
+        nav_y, nav_x = self.nav_shape
+        n_t = max(1, self.n_time)
+        out = np.zeros((n_t, nav_y * nav_x), dtype=np.float32)
+        if len(self.flat_buffer) == 0:
+            return out.reshape(n_t, nav_y, nav_x)
+        lo_x, hi_x = (x0, x1) if x0 <= x1 else (x1, x0)
+        lo_y, hi_y = (y0, y1) if y0 <= y1 else (y1, y0)
+        if self.n_time == 0:
+            out[0] = self._vvi_rect_on_buf(
+                self.flat_buffer, lo_x, hi_x, lo_y, hi_y, intensity_weighted)
+        else:
+            for t in range(self.n_time):
+                out[t] = self._vvi_rect_on_buf(
+                    self._frame_slice(t), lo_x, hi_x, lo_y, hi_y, intensity_weighted)
         return out.reshape(n_t, nav_y, nav_x)
 
     # ── KDTree path (CPU fallback for small ROIs) ─────────────────────────────

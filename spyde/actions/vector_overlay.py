@@ -42,12 +42,30 @@ def _stats(arr) -> str:
 
 def _indices_to_iyix(indices):
     """A navigator crosshair reports ``[[ix, iy]]`` (cx=column=nav-x,
-    cy=row=nav-y). Return ``(iy, ix)`` for the vectors' ``at(iy, ix)``."""
+    cy=row=nav-y). Return ``(iy, ix)`` for the vectors' ``at(iy, ix)`` — the
+    SPATIAL pair (last two nav coords). For a higher-D navigator (e.g. a 5-D
+    stack: ``[stack, ix, iy]``) the extra leading coords are dropped here; the
+    caller reads them via :func:`_indices_lead_nav`."""
     idx = np.asarray(indices)
     if idx.ndim >= 2:
         idx = idx[0]
-    ix, iy = int(idx[0]), int(idx[1])
+    # The last two coords are the spatial (x, y) pair from the innermost
+    # crosshair; anything before them is a higher-level navigator (stack) index.
+    ix, iy = int(idx[-2]), int(idx[-1])
     return iy, ix
+
+
+def _indices_lead_nav(indices):
+    """Return the LEADING navigation coords (everything before the spatial x,y
+    pair) as a tuple, in data-axis order — e.g. ``(stack,)`` for a 5-D stack, or
+    ``()`` for a plain 4-D scan. These index the navigation axes ABOVE the 2-D
+    scan and are sliced as fixed positions before the spatial window."""
+    idx = np.asarray(indices)
+    if idx.ndim >= 2:
+        idx = idx[0]
+    if idx.shape[-1] <= 2:
+        return ()
+    return tuple(int(v) for v in idx[:-2])
 
 
 def _clip_to_bounds(px, W, H, slack=8.0):
@@ -102,6 +120,7 @@ class _DPOverlay:
 
     _hidden = False
     _last_iyix = (0, 0)
+    _lead_nav: tuple = ()   # leading nav coords above the 2-D scan (e.g. stack idx)
     name = "overlay"
     _color = "#ff3030"
     _radius_px = 4.0
@@ -179,8 +198,11 @@ class _DPOverlay:
 
     def _on_indices(self, indices):
         self._last_iyix = _indices_to_iyix(indices)
-        log.debug("[overlay:%s] nav move -> (%s,%s) engine=%s hidden=%s",
-                  self.name, self._last_iyix[0], self._last_iyix[1],
+        # Leading navigation coords above the 2-D scan (e.g. the stack index of a
+        # 5-D stack); sliced as fixed positions in _blurred_frame.
+        self._lead_nav = _indices_lead_nav(indices)
+        log.debug("[overlay:%s] nav move -> lead=%s (%s,%s) engine=%s hidden=%s",
+                  self.name, self._lead_nav, self._last_iyix[0], self._last_iyix[1],
                   self._engine is not None, self._hidden)
         if self._engine is not None and not self._hidden:
             self._engine.request(*self._last_iyix)
@@ -246,7 +268,9 @@ class VectorOverlay(_DPOverlay):
 
     def _offsets_for(self, iy, ix) -> np.ndarray:
         try:
-            px = self._to_px(self.vecs.kxy_at(iy, ix))
+            # Show the CURRENT stack/time slice only (lead = the outer nav coords),
+            # not every slice overlaid — matches the DP being viewed.
+            px = self._to_px(self.vecs.kxy_at_nav(iy, ix, lead=self._lead_nav))
         except Exception:
             return np.zeros((0, 2), dtype=np.float32)
         return _clip_to_bounds(px, self._W, self._H)
@@ -538,10 +562,27 @@ class FindVectorsPreviewOverlay(_DPOverlay):
 
     # ── geometry ──────────────────────────────────────────────────────────────
     def _blurred_frame(self, iy, ix) -> np.ndarray:
-        """Nav-space Gaussian blur matching the batch (``sigma`` over nav dims,
-        0 over signal dims). Slice a small nav window of radius ``ceil(3σ)``
-        around (iy,ix), blur it, and return the centre frame."""
+        """Nav-space Gaussian blur matching the batch (``sigma`` over the 2-D scan
+        dims, 0 over signal dims). Slice a small nav window of radius ``ceil(3σ)``
+        around (iy,ix), blur it, and return the centre frame.
+
+        For a higher-D navigator (5-D stack), the leading nav axes (``_lead_nav``,
+        e.g. the stack index) are sliced at their FIXED current position first, so
+        the spatial window + blur operate on the selected stack's 2-D scan exactly
+        as for a plain 4-D dataset."""
         data = self.signal.data
+        # Drop the leading (non-spatial) nav axes at their current index, so the
+        # remaining array is (y, x, *signal) — the 4-D-style layout the rest of
+        # this method assumes. ``_lead_nav`` is in data-axis order.
+        lead = tuple(int(v) for v in (self._lead_nav or ()))
+        nav_dim = 2 + len(lead)
+        if lead:
+            sig_ndim = data.ndim - nav_dim
+            # Clamp each leading index to its axis (a stale higher-grid position
+            # mustn't IndexError; matches the navigator's own clamp).
+            lead = tuple(min(max(0, v), int(data.shape[i]) - 1)
+                         for i, v in enumerate(lead))
+            data = data[lead]   # fancy/scalar index of the leading axes
         ny, nx = int(data.shape[0]), int(data.shape[1])
         r = int(np.ceil(3 * self.sigma)) if self.sigma > 0 else 0
         y0, y1 = max(0, iy - r), min(ny, iy + r + 1)

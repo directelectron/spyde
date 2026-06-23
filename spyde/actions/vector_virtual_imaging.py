@@ -59,6 +59,26 @@ class VectorVirtualImageAction(VirtualImageAction):
             "rectangle": RectangleSelector,
         }.get(params.get("type", "disk"), CircleSelector)
 
+    def _is_stack(self) -> bool:
+        vecs = getattr(self.signal_tree, "diffraction_vectors", None)
+        return vecs is not None and getattr(vecs, "n_time", 0) > 0
+
+    def placeholder_signal(self):
+        """For a 5-D stack the vector VI is itself a STACK: a (n_stack, nav_y,
+        nav_x) navigable image (scrub the stack axis to see each slice's VI). The
+        placeholder must be 3-D so the result window builds a navigator. For 4-D
+        fall back to the 2-D nav image of the base class."""
+        if self._is_stack():
+            import hyperspy.api as hs
+            vecs = self.signal_tree.diffraction_vectors
+            n_t = int(vecs.n_time)
+            ny, nx = (int(s) for s in vecs.nav_shape)
+            if n_t > 0 and ny > 0 and nx > 0:
+                return hs.signals.Signal2D(
+                    np.zeros((n_t, ny, nx), dtype=np.float32)
+                )
+        return super().placeholder_signal()
+
     def _current_t(self):
         vecs = getattr(self.signal_tree, "diffraction_vectors", None)
         if vecs is None or getattr(vecs, "n_time", 0) <= 0:
@@ -84,7 +104,10 @@ class VectorVirtualImageAction(VirtualImageAction):
         sx, ox = float(sig_axes[0].scale), float(sig_axes[0].offset)
         sy, oy = float(sig_axes[1].scale), float(sig_axes[1].offset)
         weighted = params.get("calculation", "intensity") != "count"
-        t = self._current_t()
+        # 5-D stack → return the FULL (n_stack, nav_y, nav_x) series so the output
+        # is a navigable stack of virtual images (one per slice), not just the
+        # current slice. 4-D → a single 2-D nav image.
+        stack = self._is_stack()
         data = getattr(widget, "_data", {})
 
         try:
@@ -93,8 +116,12 @@ class VectorVirtualImageAction(VirtualImageAction):
                 y0 = float(widget.y) * sy + oy
                 x1 = (float(widget.x) + float(widget.w)) * sx + ox
                 y1 = (float(widget.y) + float(widget.h)) * sy + oy
-                img = vecs.virtual_image_from_rect(
-                    x0, y0, x1, y1, t=t, intensity_weighted=weighted)
+                if stack:
+                    img = vecs.virtual_image_series_rect(
+                        x0, y0, x1, y1, intensity_weighted=weighted)
+                else:
+                    img = vecs.virtual_image_from_rect(
+                        x0, y0, x1, y1, t=None, intensity_weighted=weighted)
             else:                                            # disk / annulus
                 cx = float(widget.cx) * sx + ox
                 cy = float(widget.cy) * sy + oy
@@ -104,8 +131,12 @@ class VectorVirtualImageAction(VirtualImageAction):
                 else:
                     r_out = float(widget.r) * sx
                     r_in = 0.0
-                img = vecs.virtual_image_from_roi_gpu(
-                    cx, cy, r_out, r_in, t=t, intensity_weighted=weighted)
+                if stack:
+                    img = vecs.virtual_image_series(
+                        cx, cy, r_out, r_in, intensity_weighted=weighted)
+                else:
+                    img = vecs.virtual_image_from_roi_gpu(
+                        cx, cy, r_out, r_in, t=None, intensity_weighted=weighted)
         except Exception:
             return None
         return np.asarray(img, dtype=np.float32)

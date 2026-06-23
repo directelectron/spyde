@@ -143,10 +143,22 @@ def _start_batch(session, plot, src_tree, p: dict):
         shm, shm_name = None, None
     stop_poll = [False]
 
+    def _spatial_nav_plot():
+        """The navigator plot whose displayed shape is the 2-D spatial grid
+        (nav_shape_2d). For a 5-D stack _first_nav_plot may be the OUTER (1-D
+        stack) plot — painting the 2-D live count map there leaves the spatial
+        navigator black, which is the bug. Match on shape; fall back to first."""
+        want = tuple(int(s) for s in nav_shape_2d)
+        for npl in _all_nav_plots(new_tree):
+            cur = getattr(npl, "current_data", None)
+            if hasattr(cur, "shape") and tuple(cur.shape) == want:
+                return npl
+        return _first_nav_plot(new_tree)
+
     def _poller():
-        nav_plot = _first_nav_plot(new_tree)
         while not stop_poll[0]:
             try:
+                nav_plot = _spatial_nav_plot()
                 arr = read_live_buffer(nav_shape_2d, shm_name)
                 if nav_plot is not None and np.isfinite(arr).any():
                     nav_plot.needs_auto_level = True
@@ -217,14 +229,38 @@ def _finalize(tree, vecs) -> None:
         log.debug("clearing stale cached dask array failed: %s", e)
     tree.diffraction_vectors = vecs
 
-    count_map = vecs.count_map().astype(np.float32)
-    nav_plot = _first_nav_plot(tree)
-    if nav_plot is not None:
+    # Paint the count map onto the SPATIAL (2-D) navigator plot. For a 5-D stack
+    # the navigator is multi-level; _first_nav_plot may return the OUTER (1-D
+    # stack) plot, and a 2-D count map painted there mismatches → the navigator
+    # stays black. Find the nav plot whose displayed shape is the 2-D spatial grid
+    # and paint that one; for a stack use the current slice's per-slice counts so
+    # it's meaningful (not the stack-summed map).
+    spatial_2d = vecs.nav_shape                                  # (nav_y, nav_x)
+    if vecs.n_time > 0:
+        count_map = vecs.count_map_at_t(0).astype(np.float32)    # slice 0 to start
+    else:
+        count_map = vecs.count_map().astype(np.float32)
+    painted = False
+    for nav_plot in _all_nav_plots(tree):
         try:
+            cur = getattr(nav_plot, "current_data", None)
+            exp = tuple(cur.shape) if hasattr(cur, "shape") else None
+            if exp is not None and tuple(exp) != tuple(spatial_2d):
+                continue   # not the 2-D spatial plot (e.g. the 1-D stack nav)
             nav_plot.needs_auto_level = True
             nav_plot.set_data(count_map)
+            painted = True
         except Exception as e:
             log.debug("painting final count map onto navigator failed: %s", e)
+    if not painted:
+        # Fallback: paint the first nav plot (4-D, or shape unknown).
+        np0 = _first_nav_plot(tree)
+        if np0 is not None:
+            try:
+                np0.needs_auto_level = True
+                np0.set_data(count_map)
+            except Exception as e:
+                log.debug("fallback count-map paint failed: %s", e)
 
     # Re-send the toolbar config so the now-available vector actions appear.
     for sp in list(getattr(tree, "signal_plots", [])):
@@ -238,7 +274,7 @@ def _finalize(tree, vecs) -> None:
     _install_render_display(tree, vecs)
     _overlay_on_result(tree, vecs)
 
-    total = int(count_map.sum())
+    total = int(len(vecs.flat_buffer))   # total over ALL slices, not one slice
     emit_status(f"Found {total} diffraction vectors")
 
 
@@ -250,16 +286,21 @@ def _install_render_display(tree, vecs) -> None:
     asynchronously (Future → shared-memory) and can leave the window black on
     real distributed data. Each navigated position now paints its disks
     synchronously, exactly like the Qt ``_make_hooked`` update."""
-    from spyde.actions.vector_overlay import _indices_to_iyix
+    from spyde.actions.vector_overlay import _indices_to_iyix, _indices_lead_nav
     H = int(vecs.sig_axes[1].size)
     W = int(vecs.sig_axes[0].size)
 
     def _fn(selector, child, indices):
         iy, ix = _indices_to_iyix(indices)
+        # 5-D stack: the leading nav coord is the stack/time index → render that
+        # slice's disks (t=). 4-D: lead=() → t=None (all, i.e. the single slice).
+        lead = _indices_lead_nav(indices)
+        t = int(lead[0]) if lead else None
         try:
-            return vecs.render_frame(iy, ix)
+            return vecs.render_frame(iy, ix, t=t)
         except Exception as e:
-            log.debug("render_frame(%d, %d) failed, showing blank: %s", iy, ix, e)
+            log.debug("render_frame(%s, %s, t=%s) failed, showing blank: %s",
+                      iy, ix, t, e)
             return np.zeros((H, W), dtype=np.float32)
 
     sig_plots = set(getattr(tree, "signal_plots", []))
@@ -312,6 +353,18 @@ def _first_nav_plot(tree):
         if plots:
             return plots[0]
     return None
+
+
+def _all_nav_plots(tree):
+    """All navigator plots across every navigator window (a 5-D stack has more
+    than one: an outer stack navigator + the 2-D spatial count map)."""
+    npm = getattr(tree, "navigator_plot_manager", None)
+    if npm is None:
+        return []
+    out = []
+    for pw in list(npm.plot_windows.keys()):
+        out.extend(npm.plots.get(pw, []))
+    return out
 
 
 def _refresh_signal_from_navigator(tree) -> None:
