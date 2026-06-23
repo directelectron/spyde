@@ -402,19 +402,17 @@ class SpyDEDiffractionVectors:
         return counts.astype(np.int32)
 
     def count_map_at_t(self, t: int) -> np.ndarray:
-        """(nav_y, nav_x) int32 — vector count at time step t."""
-        nav_y, nav_x = self.nav_shape
+        """(nav_y, nav_x) int32 — vector count at time step t.
+
+        The innermost offsets (``nav_offsets[-1]``) hold one entry per
+        (t, iy, ix) leaf + 1, so ``diff`` reshaped to (n_t, nav_y, nav_x) is the
+        per-slice count map directly — just index t. (The previous version tried
+        to walk ``nav_offsets[0]`` as ROW indices, but that level stores cumulative
+        VECTOR counts, so ``y_off[6583263]`` went out of bounds on real data.)"""
         if self.n_time == 0:
             return self.count_map()
-        # Walk t → y slice of the innermost offsets
-        y_off = self.nav_offsets[-2]          # (n_t * nav_y + 1,)
-        y_start = int(self.nav_offsets[0][t])
-        y_end   = int(self.nav_offsets[0][t + 1])
-        x_off   = self.nav_offsets[-1]        # (n_t * nav_y * nav_x + 1,)
-        x_start = int(y_off[y_start])
-        x_end   = int(y_off[y_end])
-        counts = np.diff(x_off[x_start: x_end + 1]).reshape(nav_y, nav_x)
-        return counts.astype(np.int32)
+        t = int(np.clip(t, 0, self.n_time - 1))
+        return self.count_map_series()[t]
 
     def flatten(self) -> np.ndarray:
         """Return the full (N_total, 6) flat buffer."""

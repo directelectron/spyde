@@ -13,6 +13,7 @@ declare global {
       saveDialog: () => Promise<void>
       pickFile: (opts: { name?: string; extensions?: string[] }) => Promise<string | null>
       pickFiles: (opts?: { name?: string; extensions?: string[] }) => Promise<string[]>
+      pickFolders: () => Promise<string[]>
       figureEvent: (figId: string, eventJson: string) => void
       resizeFigure: (figId: string, width: number, height: number) => void
       openExternal: (url: string) => void

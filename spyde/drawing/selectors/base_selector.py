@@ -377,12 +377,11 @@ class BaseSelector:
             return
         self.current_indices = indices
 
-        # Per-frame trace — gated behind SPYDE_NAV_TIMING (fires on every move,
-        # floods the IPC log at DEBUG). After the dup short-circuit, so each line
-        # is a genuine new position.
-        if _NAV_TIMING:
-            logger.debug("[NAV-IDX] indices=%s force=%s selector=%s",
-                         np.asarray(indices).tolist(), force, type(self).__name__)
+        # TEMP (ungated): trace each selector's computed indices + how many
+        # children/chained selectors it drives, to debug the 5-D time→DP chain.
+        logger.debug("[NAV-IDX] %s indices=%s force=%s nchildren=%d multi=%s",
+                     type(self).__name__, np.asarray(indices).tolist(), force,
+                     len(self.children), self.multi_selector)
 
         for child, fn in self.children.items():
             try:
@@ -392,16 +391,21 @@ class BaseSelector:
                 child.update_data(new_data)
                 if update_contrast:
                     child.needs_auto_level = True
-                logger.debug(f"Delayed update Data, child={child}, position = {self.current_indices}")
-                gate = (child.multiplot_manager is not None
-                        and child.plot_window in child.multiplot_manager.navigation_selectors)
-                logger.debug(f"Delayed update Data, gate={gate}, multiplot_manager={child.multiplot_manager},"
-                             f" navigation_selectors={child.multiplot_manager.navigation_selectors if child.multiplot_manager else None}, "
-                             f"plot_window={child.plot_window}")
-                if (child.multiplot_manager is not None
-                        and child.plot_window in child.multiplot_manager.navigation_selectors):
-                    for child_sel in child.multiplot_manager.navigation_selectors[child.plot_window]:
-                        logger.debug(f"Delayed update Data, selector={child_sel}, position = {self.current_indices}")
+                # TEMP (ungated): does this update CHAIN to a downstream navigator?
+                mm = child.multiplot_manager
+                gate = (mm is not None
+                        and child.plot_window in mm.navigation_selectors)
+                logger.debug("[CHAIN] %s updated child win=%s gate=%s nav_keys=%s",
+                             type(self).__name__, getattr(child, "window_id", None),
+                             gate,
+                             [getattr(k, "window_id", None) for k in mm.navigation_selectors]
+                             if mm else None)
+                if gate:
+                    downstream = mm.navigation_selectors[child.plot_window]
+                    logger.debug("[CHAIN]  → re-firing %d downstream selector(s): %s",
+                                 len(downstream),
+                                 [type(s).__name__ for s in downstream])
+                    for child_sel in downstream:
                         child_sel.delayed_update_data()
             except Exception as e:
                 logger.debug("selector update failed: %s", e)

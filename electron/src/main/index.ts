@@ -189,6 +189,23 @@ function buildMenu(): void {
           },
         },
         {
+          label: 'Open Zarr Folder (.zspy)…',
+          // .zspy / .zarr are Zarr DIRECTORY stores, not files — the native
+          // file picker can't select them (and on Windows a dialog can't mix
+          // file + folder modes), so this uses a directory picker.
+          click: async () => {
+            const result = await dialog.showOpenDialog(win!, {
+              title: 'Open a .zspy / .zarr dataset folder',
+              properties: ['openDirectory', 'multiSelections'],
+            })
+            if (!result.canceled) {
+              for (const p of result.filePaths) {
+                sendAction('open_file', { path: p })
+              }
+            }
+          },
+        },
+        {
           label: 'Load Stack…',
           // Opens the in-app StackDialog (reorderable list of datasets) rather
           // than the native picker — the user adds/reorders there, then confirms.
@@ -200,7 +217,13 @@ function buildMenu(): void {
           accelerator: 'CmdOrCtrl+S',
           click: async () => {
             const result = await dialog.showSaveDialog(win!, {
-              filters: [{ name: 'HyperSpy', extensions: ['hspy'] }],
+              // Default to .zspy (Zarr folder store — lazy, chunked, the format
+              // SpyDE prefers); .hspy still available as a secondary option.
+              defaultPath: 'signal.zspy',
+              filters: [
+                { name: 'Zarr (.zspy)', extensions: ['zspy'] },
+                { name: 'HyperSpy (.hspy)', extensions: ['hspy'] },
+              ],
             })
             if (!result.canceled && result.filePath) {
               sendAction('save_signal', { path: result.filePath })
@@ -294,6 +317,16 @@ ipcMain.handle('spyde:pick-files', async (_e, opts?: { name?: string; extensions
   return result.canceled ? [] : result.filePaths
 })
 
+/** Multi-select DIRECTORY picker (for .zspy / .zarr Zarr stores, which are
+ *  folders not files — Windows can't mix file + folder selection in one dialog). */
+ipcMain.handle('spyde:pick-folders', async () => {
+  const result = await dialog.showOpenDialog(win!, {
+    title: 'Add .zspy / .zarr folders to the stack',
+    properties: ['openDirectory', 'multiSelections'],
+  })
+  return result.canceled ? [] : result.filePaths
+})
+
 /** Pick a file and RETURN its path to the renderer (for action params, e.g. a
  *  .cif crystal structure) — does NOT auto-open it as a dataset. */
 ipcMain.handle('spyde:pick-file', async (_e, opts: { name?: string; extensions?: string[] }) => {
@@ -308,7 +341,12 @@ ipcMain.handle('spyde:pick-file', async (_e, opts: { name?: string; extensions?:
 /** Save dialog. */
 ipcMain.handle('spyde:save-dialog', async () => {
   const result = await dialog.showSaveDialog(win!, {
-    filters: [{ name: 'HyperSpy', extensions: ['hspy'] }],
+    // Default to .zspy (Zarr folder store); .hspy available as a fallback.
+    defaultPath: 'signal.zspy',
+    filters: [
+      { name: 'Zarr (.zspy)', extensions: ['zspy'] },
+      { name: 'HyperSpy (.hspy)', extensions: ['hspy'] },
+    ],
   })
   if (!result.canceled && result.filePath) {
     sendAction('save_signal', { path: result.filePath })

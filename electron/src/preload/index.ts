@@ -77,6 +77,9 @@ contextBridge.exposeInMainWorld('electron', {
   pickFiles: (opts?: { name?: string; extensions?: string[] }): Promise<string[]> =>
     ipcRenderer.invoke('spyde:pick-files', opts),
 
+  /** Multi-select DIRECTORY picker (RETURNS paths) — for .zspy/.zarr folders. */
+  pickFolders: (): Promise<string[]> => ipcRenderer.invoke('spyde:pick-folders'),
+
   /** Forward an interaction event from an anyplotlib iframe to Python. */
   figureEvent: (figId: string, eventJson: string) =>
     ipcRenderer.send('spyde:figure-event', figId, eventJson),

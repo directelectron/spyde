@@ -34,6 +34,45 @@ if TYPE_CHECKING:
 
 SUPPORTED_EXTS = (".hspy", ".zspy", ".mrc", ".tif", ".tiff", ".de5")
 
+# Extensions whose "file" is actually a DIRECTORY (a Zarr store). `.zspy` (and a
+# bare `.zarr`) is a nested-group folder, not a single file — so `os.path.isfile`
+# is False and `os.path.getsize` raises on it. Treat these as a present dataset
+# when the directory exists.
+_DIR_DATASET_EXTS = (".zspy", ".zarr")
+
+
+def _path_ext(path: str) -> str:
+    """Lowercased extension, working for both files and `.zspy`/`.zarr` dirs."""
+    return os.path.splitext(path)[1].lower()
+
+
+def _is_supported_dataset_path(path: str) -> bool:
+    """True if ``path`` is a loadable dataset — a regular file, OR a directory
+    store (`.zspy`/`.zarr`). A plain `os.path.isfile` wrongly rejects the latter."""
+    ext = _path_ext(path)
+    if ext in _DIR_DATASET_EXTS:
+        return os.path.isdir(path)
+    return os.path.isfile(path)
+
+
+def _dataset_size_bytes(path: str) -> float:
+    """Size in bytes — `os.path.getsize` for a file; a (bounded) recursive walk for
+    a `.zspy`/`.zarr` directory store (used only to decide the 'large file' hint,
+    so a best-effort sum is fine)."""
+    try:
+        if os.path.isdir(path):
+            total = 0
+            for root, _dirs, files in os.walk(path):
+                for f in files:
+                    try:
+                        total += os.path.getsize(os.path.join(root, f))
+                    except OSError:
+                        pass
+            return float(total)
+        return float(os.path.getsize(path))
+    except OSError:
+        return 0.0
+
 _DEFAULT_EXAMPLE_NAMES = (
     "mgo_nanocrystals",
     "small_ptychography",
@@ -181,13 +220,17 @@ class Session:
     # ── File operations ────────────────────────────────────────────────────────
 
     def open_file(self, path: str) -> None:
-        """Load a HyperSpy-compatible file and open it in the MDI."""
-        if not os.path.isfile(path):
-            emit_error(f"File not found: {path}")
-            return
-        ext = os.path.splitext(path)[1].lower()
+        """Load a HyperSpy-compatible file and open it in the MDI.
+
+        ``path`` may be a regular file OR a directory store (``.zspy``/``.zarr``,
+        which are Zarr nested-group folders, not single files)."""
+        ext = _path_ext(path)
         if ext not in SUPPORTED_EXTS:
             emit_error(f"Unsupported file type: {ext}")
+            return
+        if not _is_supported_dataset_path(path):
+            kind = "Folder" if ext in _DIR_DATASET_EXTS else "File"
+            emit_error(f"{kind} not found: {path}")
             return
 
         # A large file's lazy load is a one-time cold-cache disk read (reading the
@@ -195,10 +238,7 @@ class Session:
         # seconds the FIRST time; the OS cache makes the next open instant). Say
         # so, and flag a busy state so the frontend can show a spinner instead of
         # looking hung. Emit the busy flag FIRST so it paints before the read.
-        try:
-            size_gb = os.path.getsize(path) / 1e9
-        except OSError:
-            size_gb = 0.0
+        size_gb = _dataset_size_bytes(path) / 1e9
         name = os.path.basename(path)
         hint = " (first open of a large file can take a while)" if size_gb >= 1 else ""
         emit({"type": "loading", "busy": True, "text": f"Reading {name}…{hint}"})
@@ -391,8 +431,8 @@ class Session:
             emit_error("Load Stack needs at least two files.")
             return
         bad = [p for p in paths
-               if os.path.splitext(p)[1].lower() not in SUPPORTED_EXTS
-               or not os.path.isfile(p)]
+               if _path_ext(p) not in SUPPORTED_EXTS
+               or not _is_supported_dataset_path(p)]
         if bad:
             emit_error(f"Cannot stack — missing/unsupported: "
                        f"{', '.join(os.path.basename(b) for b in bad)}")
@@ -1533,6 +1573,12 @@ class Session:
         if signal is None:
             emit_error("Save: no signal in active plot")
             return
+        # Default to the .zspy Zarr folder store: if the user typed a name with no
+        # extension (or an unknown one), append .zspy rather than letting hyperspy
+        # guess or error. A writable extension the user explicitly chose is kept.
+        _WRITABLE_EXTS = (".zspy", ".hspy", ".zarr", ".tif", ".tiff")
+        if _path_ext(path) not in _WRITABLE_EXTS:
+            path = path + ".zspy"
         try:
             import dask
             with dask.config.set(scheduler="synchronous"):
