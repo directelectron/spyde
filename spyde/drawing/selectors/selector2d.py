@@ -5,7 +5,11 @@ import logging
 import numpy as np
 from typing import TYPE_CHECKING, Union, List
 
-from spyde.drawing.selectors.base_selector import BaseSelector, IntegratingSelectorMixin
+from spyde.drawing.selectors.base_selector import (
+    BaseSelector,
+    IntegratingSelectorMixin,
+    event_handler_fn,
+)
 
 if TYPE_CHECKING:
     from spyde.drawing.plots.plot import Plot
@@ -41,7 +45,8 @@ class CrosshairSelector(BaseSelector):
             try:
                 self._widget = plot2d.add_crosshair_widget(color=self.color)
                 self.roi = self._widget
-                self._widget.add_event_handler(self._on_pointer_up, "pointer_move", "pointer_up")
+                self._event_cb = event_handler_fn(self._on_pointer_up)
+                self._widget.add_event_handler(self._event_cb, "pointer_move", "pointer_up")
             except Exception as e:
                 logger.debug("CrosshairSelector widget init failed: %s", e)
 
@@ -100,7 +105,8 @@ class RectangleSelector(BaseSelector):
             try:
                 self._widget = plot2d.add_rectangle_widget(color=self.color)
                 self.roi = self._widget
-                self._widget.add_event_handler(self._on_pointer_up, "pointer_move", "pointer_up")
+                self._event_cb = event_handler_fn(self._on_pointer_up)
+                self._widget.add_event_handler(self._event_cb, "pointer_move", "pointer_up")
             except Exception as e:
                 logger.debug("RectangleSelector widget init failed: %s", e)
 
@@ -158,7 +164,8 @@ class CircleSelector(BaseSelector):
             try:
                 self._widget = plot2d.add_circle_widget(color=self.color)
                 self.roi = self._widget
-                self._widget.add_event_handler(self._on_pointer_up, "pointer_move", "pointer_up")
+                self._event_cb = event_handler_fn(self._on_pointer_up)
+                self._widget.add_event_handler(self._event_cb, "pointer_move", "pointer_up")
             except Exception as e:
                 logger.debug("CircleSelector widget init failed: %s", e)
 
@@ -197,7 +204,8 @@ class AnnularSelector(BaseSelector):
             try:
                 self._widget = plot2d.add_annular_widget(color=self.color)
                 self.roi = self._widget
-                self._widget.add_event_handler(self._on_pointer_up, "pointer_move", "pointer_up")
+                self._event_cb = event_handler_fn(self._on_pointer_up)
+                self._widget.add_event_handler(self._event_cb, "pointer_move", "pointer_up")
             except Exception as e:
                 logger.debug("AnnularSelector widget init failed: %s", e)
 

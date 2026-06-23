@@ -145,6 +145,14 @@ class BaseSignalTree:
         nav_plot = nav_plots[0]
         nav_shape = tuple(nav_dask.shape)
 
+
+        logger.debug(
+            "NAV-DEBUG _start_progressive_nav_compute: path=%s nav_shape=%s "
+            "chunks=%s client=%s",
+            "THREADED (no client)" if self.client is None else "DISTRIBUTED",
+            nav_shape, nav_dask.chunks, type(self.client).__name__,
+        )
+
         # No cluster yet (it takes ~10 s to start; examples load sooner, and a
         # huge MRC's navigator sum can take minutes): compute the navigator on a
         # BACKGROUND thread with the threaded scheduler so the already-displayed
@@ -181,6 +189,7 @@ class BaseSignalTree:
                         if _stop.is_set():
                             return
                         nav_slices = tuple(slice(s, s + n) for s, n in combo)
+                        logger.debug("NAV-DEBUG threaded nav chunk %s computing", nav_slices)
                         block = np.asarray(_dask[nav_slices].compute()).astype(np.float32)
                         acc[nav_slices] = block
                         finite = acc[np.isfinite(acc)]
@@ -349,7 +358,17 @@ class BaseSignalTree:
         """
         self._pending_nav_dask = nav_dask
         if self.client is not None:
+            logger.debug(
+                "NAV-DEBUG _compute_navigator: DISTRIBUTED path (client=%s) "
+                "nav_dask.shape=%s chunks=%s heavy_workers=%s",
+                getattr(self.client, "scheduler", None) and self.client.scheduler.address,
+                tuple(nav_dask.shape), nav_dask.chunks, heavy_workers,
+            )
             return self.client.compute(nav_dask, priority=-10, workers=heavy_workers)
+        logger.debug(
+            "NAV-DEBUG _compute_navigator: NO CLIENT -> threaded background path "
+            "will run; nav_dask.shape=%s chunks=%s", tuple(nav_dask.shape), nav_dask.chunks,
+        )
         return np.full(tuple(nav_dask.shape), np.nan, dtype=np.float32)
 
     def add_navigator_signal(self, name: str, signal: BaseSignal) -> None:

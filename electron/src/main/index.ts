@@ -23,9 +23,13 @@ let win: BrowserWindow | null = null
 let rendererReady = false
 const pendingMessages: Array<Record<string, unknown>> = []
 
+function rendererAlive(): boolean {
+  return !!win && !win.isDestroyed() && !win.webContents.isDestroyed()
+}
+
 function sendToRenderer(msg: Record<string, unknown>): void {
-  if (rendererReady && win && !win.isDestroyed()) {
-    win.webContents.send('spyde:message', msg)
+  if (rendererReady && rendererAlive()) {
+    win!.webContents.send('spyde:message', msg)
   } else {
     pendingMessages.push(msg)
   }
@@ -33,9 +37,9 @@ function sendToRenderer(msg: Record<string, unknown>): void {
 
 function flushPendingMessages(): void {
   rendererReady = true
-  if (!win || win.isDestroyed()) return
+  if (!rendererAlive()) return
   for (const msg of pendingMessages.splice(0)) {
-    win.webContents.send('spyde:message', msg)
+    win!.webContents.send('spyde:message', msg)
   }
 }
 
@@ -136,7 +140,12 @@ app.whenReady().then(async () => {
     onStream: (text, kind) => {
       // Forward to the renderer AND surface in the dev terminal.
       process[kind === 'stderr' ? 'stderr' : 'stdout'].write(`[spyde] ${text}`)
-      win?.webContents.send('spyde:stream', text, kind)
+      // Guard: at teardown the backend stream can still emit a chunk after the
+      // window/webContents is destroyed → "TypeError: Object has been destroyed".
+      // Only forward to a live webContents.
+      if (win && !win.isDestroyed() && !win.webContents.isDestroyed()) {
+        win.webContents.send('spyde:stream', text, kind)
+      }
     },
   }, cwd)
 

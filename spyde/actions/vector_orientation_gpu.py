@@ -363,11 +363,12 @@ def compute_vector_orientation_gpu(
     progress(done, total) is called a handful of times (seed, each anneal
     stage, decode) so the GUI can show coarse progress + paint the live buffer.
 
-    on_yield (if given) is called after each anneal stage. The whole fit is
-    short (~1-2s) and MUST run on the GUI/main thread — torch's CUDA autograd
-    backward segfaults off the main thread on Windows — so the caller passes
-    ``QApplication.processEvents`` here to keep the UI responsive and let the
-    shm-preview poll timer paint partial results.
+    on_yield (if given) is called after each anneal stage (and every ~12 refine
+    steps). The whole fit is short (~1-2s) and MUST run on the main thread —
+    torch's CUDA autograd backward segfaults off the main thread on Windows — so
+    the caller passes a yield callback that pumps the event loop / flushes pending
+    work here to keep the UI responsive and let the shm-preview poll paint partial
+    results.
     """
     import torch
     P_params = {**DEFAULTS, **(params or {})}

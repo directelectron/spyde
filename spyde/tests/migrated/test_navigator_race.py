@@ -1,30 +1,22 @@
 """
-Reproduction: the navigator update path is not mutually exclusive.
+Navigator update model: a SINGLE serial dispatcher thread runs every selector
+update one at a time (the Qt event-loop equivalent). This removes the concurrency
+that used to race hyperspy's CachedDaskArray block bookkeeping
+("ValueError: (i, j) is not in list") — so there is NO per-signal cache lock and
+no generation/stale-body machinery anymore. Latest-wins is handled by the
+dispatcher coalescing repeated submissions for a selector into one pending job.
 
-`BaseSelector.update_data` throttles with `threading.Timer` (a NEW thread per
-fire), and `delayed_update_data` can block for 100s of ms inside a slow update
-(in the app: the Find-Vectors peak-preview index-hook does a synchronous
-`block.compute()` per frame). So two fires run `delayed_update_data` CONCURRENTLY
-and race the per-child future cancel/submit in
-`update_from_navigation_selection` (and `Plot.update_data`'s `current_data`),
-both unlocked. The image's async future gets cancelled/superseded while the
-synchronous overlay markers keep painting — "the overlay updates but the
-underlying image freezes on the previous frame" (the reported, distributed-Dask
-symptom).
-
-This is the "future-cancel greedy workflow isn't being followed": the greedy
-cancel assumes ONE navigator update in flight; the throttle + a slow update
-break that. The fix serialises `delayed_update_data` so the body (and its
-cancel/submit) runs one at a time, latest position wins.
-
-`test_delayed_update_is_mutually_exclusive` is expected to FAIL before the fix.
+These tests pin that contract:
+  * updates never run concurrently (the cache call is never re-entered),
+  * a burst of positions ends on the LAST one,
+  * a newer submission supersedes an older queued one (it isn't computed twice).
 """
 import threading
 import time
 
 import numpy as np
 
-from spyde.drawing.selectors.base_selector import BaseSelector
+from spyde.drawing.selectors.base_selector import BaseSelector, _nav_dispatcher
 
 
 class _RecorderChild:
@@ -54,178 +46,50 @@ class _PositionSelector(BaseSelector):
         return self._pos
 
 
-def test_slow_update_does_not_block_newer_one():
-    """A slow in-flight update must NOT stall a newer fire (latest-wins, no long
-    lock).  The previous design serialised the whole body with an RLock, so a
-    slow compute held the lock and froze every other update — with two signals
-    live the navigator flashed but never tracked the crosshair.  The new model
-    lets the newer fire run immediately and supersede the stale one."""
-    child = _RecorderChild()
-    first = {"flag": True}
-    in_body = threading.Event()
-    release = threading.Event()
-    second_ran = threading.Event()
-
-    def slice_fn(sel, ch, indices):
-        if first["flag"]:
-            first["flag"] = False
-            in_body.set()
-            release.wait(timeout=2.0)   # first fire blocks here
-        else:
-            second_ran.set()             # second fire reaches the body
-        return np.asarray(indices).copy()
-
-    sel = _PositionSelector(child, slice_fn)
-
-    sel.set_pos(1, 1)
-    t1 = threading.Thread(target=lambda: sel.delayed_update_data(force=True))
-    t1.start()
-    assert in_body.wait(timeout=2.0), "first update never entered its body"
-
-    # Fire 2 while fire 1 is blocked. It must NOT wait for fire 1 to finish.
-    sel.set_pos(2, 2)
-    t2 = threading.Thread(target=lambda: sel.delayed_update_data(force=True))
-    t2.start()
-    assert second_ran.wait(timeout=1.0), (
-        "newer update blocked behind the slow in-flight one — the update path is "
-        "holding a lock across the compute and stalls live tracking."
-    )
-    t2.join(timeout=2.0)
-    # Latest position won.
-    assert np.array_equal(sel.current_indices, np.array([[2, 2]]))
-
-    # The slow, now-stale first body finishes but must NOT clobber the newer
-    # committed indices.
-    release.set()
-    t1.join(timeout=2.0)
-    assert np.array_equal(sel.current_indices, np.array([[2, 2]])), (
-        "the stale (superseded) update overwrote the latest position"
-    )
+def _wait_idle(timeout=2.0):
+    """Wait until the dispatcher has drained its pending queue."""
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        with _nav_dispatcher._lock:
+            empty = not _nav_dispatcher._pending
+        if empty:
+            time.sleep(0.05)   # let the in-flight job finish
+            return
+        time.sleep(0.01)
 
 
-def test_cache_critical_section_is_serialized():
-    """The cache cancel/get_chunk/submit section of
-    update_from_navigation_selection must not run concurrently for one signal.
-
-    Two overlapping updates would mutate the shared CachedDaskArray block lists
-    and cancel each other's chunk futures — and a cancelled chunk future kills
-    the dependent get_inds/write_shared_array futures (the image freezes on the
-    previous frame). This drives two updates at the same signal and asserts the
-    critical section is entered one at a time.
-    """
-    from spyde.drawing import update_functions as uf
-
+def test_updates_run_serially_never_concurrently():
+    """The dispatcher must run selector update bodies ONE AT A TIME — the whole
+    point (so the cache is never re-entered). Drive many selectors at once and
+    assert the per-update body never overlaps itself."""
     meter = {"active": 0, "max": 0}
     mlock = threading.Lock()
-    first = {"flag": True}
-    entered = threading.Event()
-    release = threading.Event()
 
-    class _Cache:
-        def cancel_surrounding(self):
-            pass
-
-    class _Signal:
-        _lazy = True
-        cached_dask_array = _Cache()
-        data = np.zeros((4, 4, 8, 8), dtype=np.float32)
-
-        def _get_cache_dask_chunk(self, indices, get_result=False, return_future=False):
+    def slice_fn(sel, ch, indices):
+        with mlock:
+            meter["active"] += 1
+            meter["max"] = max(meter["max"], meter["active"])
+        try:
+            time.sleep(0.01)   # widen the window for any overlap to show
+            return np.asarray(indices).copy()
+        finally:
             with mlock:
-                meter["active"] += 1
-                meter["max"] = max(meter["max"], meter["active"])
-            try:
-                if first["flag"]:
-                    first["flag"] = False
-                    entered.set()
-                    release.wait(timeout=2.0)
-                return np.zeros((8, 8), dtype=np.float32)   # numpy → no submit branch
-            finally:
-                with mlock:
-                    meter["active"] -= 1
+                meter["active"] -= 1
 
-    sig = _Signal()
+    selectors = [_PositionSelector(_RecorderChild(), slice_fn) for _ in range(6)]
+    for i, sel in enumerate(selectors):
+        sel.set_pos(i, i)
+        sel.delayed_update_data(force=True)
+    _wait_idle()
 
-    class _PS:
-        current_signal = sig
-
-    class _Child:
-        plot_state = _PS()
-        _pending_shm_future = None
-
-        def update_data(self, d):
-            pass
-
-    class _Sel:
-        is_integrating = False
-
-    child, sel = _Child(), _Sel()
-
-    def call():
-        uf.update_from_navigation_selection(sel, child, np.array([[1, 1]]))
-
-    t1 = threading.Thread(target=call)
-    t1.start()
-    assert entered.wait(timeout=2.0), "first cache update never ran"
-
-    t2 = threading.Thread(target=call)
-    t2.start()
-    time.sleep(0.15)   # t2 must block on the cache lock, not enter the section
-
-    peak = meter["max"]
-    release.set()
-    t1.join(timeout=2.0)
-    t2.join(timeout=2.0)
-
-    assert peak == 1, (
-        f"the cache critical section ran {peak}x concurrently — overlapping "
-        "navigator updates can cancel a chunk future that the dependent "
-        "get_inds/write_shared_array futures need, freezing the image."
+    assert meter["max"] == 1, (
+        f"update bodies ran {meter['max']}x concurrently — the dispatcher is not "
+        "serial, so the cache can be raced"
     )
-
-
-def test_stale_body_skips_cache_cancel():
-    """A superseded body must NOT cancel_surrounding() — that kills the LATEST
-    position's in-flight chunk future ('get_inds … lost dependencies'). When the
-    selector reports the body is stale, update_from_navigation_selection returns
-    immediately without touching the cache."""
-    from spyde.drawing import update_functions as uf
-
-    cancels = {"n": 0}
-
-    class _Cache:
-        def cancel_surrounding(self):
-            cancels["n"] += 1
-
-    class _Signal:
-        _lazy = True
-        cached_dask_array = _Cache()
-        data = np.zeros((4, 4, 8, 8), dtype=np.float32)
-
-        def _get_cache_dask_chunk(self, indices, **k):
-            raise AssertionError("stale body must not request a chunk")
-
-    class _PS:
-        current_signal = _Signal()
-
-    class _Child:
-        plot_state = _PS()
-        _pending_shm_future = None
-        def update_data(self, d): pass
-
-    class _StaleSel:
-        is_integrating = False
-        def is_stale_body(self):           # always stale
-            return True
-
-    out = uf.update_from_navigation_selection(_StaleSel(), _Child(),
-                                              np.array([[1, 1]]))
-    assert out is None, "stale body should return None (skip, no paint)"
-    assert cancels["n"] == 0, "stale body cancelled surrounding blocks (kills latest future)"
 
 
 def test_latest_position_wins_under_burst():
-    """After a burst of position changes the child must end on the LAST one."""
+    """After a burst of positions on one selector the child ends on the LAST."""
     child = _RecorderChild()
 
     def slow_slice_fn(sel, ch, indices):
@@ -233,17 +97,54 @@ def test_latest_position_wins_under_burst():
         return np.asarray(indices).copy()
 
     sel = _PositionSelector(child, slow_slice_fn)
-
-    threads = []
     for i in range(1, 6):
         sel.set_pos(i, i)
         sel.delayed_update_data(force=True)
-    for t in threads:
-        t.join(timeout=2.0)
+    _wait_idle()
 
-    time.sleep(0.2)
     assert child.current_data is not None
     last = np.asarray(child.current_data).reshape(-1)[:2]
-    assert tuple(last) == (5, 5), (
-        f"child ended on {tuple(last)}, not the last position (5, 5)."
-    )
+    assert tuple(last) == (5, 5), f"child ended on {tuple(last)}, not (5, 5)"
+
+
+def test_newer_submission_coalesces_older_one():
+    """Submitting a selector again while a job is queued REPLACES the pending job
+    (latest-wins) rather than running both — so a fast drag doesn't compute every
+    intermediate position. We block the dispatcher on the first job, queue two
+    more positions, then release; only the LAST queued position should compute
+    after the blocker."""
+    child = _RecorderChild()
+    computed = []
+    first = {"flag": True}
+    in_first = threading.Event()
+    release = threading.Event()
+
+    def fn(sel, ch, indices):
+        pos = tuple(np.asarray(indices).reshape(-1)[:2])
+        if first["flag"]:
+            first["flag"] = False
+            in_first.set()
+            release.wait(timeout=2.0)
+        computed.append(pos)
+        return np.asarray(indices).copy()
+
+    sel = _PositionSelector(child, fn)
+
+    # Job 1 — occupies the dispatcher and blocks at the gate.
+    sel.set_pos(1, 1)
+    sel.delayed_update_data(force=True)
+    assert in_first.wait(timeout=2.0), "first job never ran"
+
+    # While blocked, queue two more — the 2nd should overwrite the 1st pending.
+    sel.set_pos(2, 2)
+    sel.delayed_update_data(force=True)
+    sel.set_pos(3, 3)
+    sel.delayed_update_data(force=True)
+
+    release.set()
+    _wait_idle()
+
+    # The blocker (1,1) computed, then ONLY the latest queued (3,3) — not (2,2).
+    assert (1, 1) in computed
+    assert (3, 3) in computed
+    assert (2, 2) not in computed, f"stale intermediate position computed: {computed}"

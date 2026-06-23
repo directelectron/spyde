@@ -33,13 +33,24 @@ class PlotUpdateWorker:
         self,
         get_plots_callable: Callable[[], list],
         interval_ms: int = 2,
+        dispatch: "Callable[[Callable], None] | None" = None,
     ) -> None:
-        self._seen_plots: Dict[int, int] = {}
         self._get_plots = get_plots_callable
         self._interval = interval_ms / 1000.0
-        self._seen: Set[int] = set()
+        # Dedup set of (future.key, id(plot)) already emitted — see _maybe_emit_future.
+        self._seen: Set[tuple] = set()
         self._running = False
         self._thread: threading.Thread | None = None
+        import os
+        self._emit_timing = os.environ.get("SPYDE_NAV_TIMING") == "1"
+        # Marshal the result-application onto the MAIN thread. The poll thread only
+        # detects "future done" and reads the (already-computed) shm/result; the
+        # actual plot.update()/set_data()/push MUST run on the main thread, exactly
+        # like the Qt app marshaled plot_ready via a queued signal/slot. Without
+        # this the push happens on the poll thread and races the main loop's own
+        # figure pushes. `dispatch(fn)` schedules fn() on the main thread (e.g.
+        # loop.call_soon_threadsafe); None → run inline (tests / no loop).
+        self._dispatch = dispatch
 
     def start(self) -> None:
         """Start the polling loop in a daemon thread."""
@@ -115,30 +126,54 @@ class PlotUpdateWorker:
     ) -> None:
         if not isinstance(fut, Future) or not fut.done():
             return
-        # A CANCELLED future is also done() — but its shared-memory buffer was
-        # never written (the write task was cancelled by a newer navigator
-        # update under the latest-wins model), so reading it yields an empty
-        # dtype header ("Data type '' not understood"). Skip cancelled futures.
+        # NB: do NOT skip cancelled futures here. The QT worker didn't, and the
+        # shared-memory buffer is read defensively (read_shared_array rejects an
+        # empty/torn header) — a cancelled future whose shm was already written
+        # still yields a valid frame, and one whose shm wasn't yields a harmless
+        # ValueError that _on_plot_ready drops. Skipping ALL cancelled futures
+        # silently dropped EVERY distributed DP frame (hyperspy's cache GC-cancels
+        # the write's get_inds dependency), so the diffraction pattern never
+        # painted on the distributed path.
+        # Dedup by the future's DASK KEY (unique per submission), not id(fut).
+        # id() reuses freed addresses: under a fast crosshair drag, futures are
+        # created and GC'd rapidly, so a BRAND-NEW write_shared_array future can
+        # be handed the same id() as an already-"seen" one → it was wrongly
+        # skipped and never emitted → the diffraction pattern froze mid-drag while
+        # the nav-update side kept logging fast timings. The key is content-stable
+        # and collision-free. Track per (key, plot) so the same chunk re-displayed
+        # on two plots still emits for each.
         try:
-            if fut.cancelled():
-                return
+            fkey = fut.key
         except Exception:
-            pass
-        fid = id(fut)
-        if fid in self._seen and self._seen_plots.get(fid) == id(plot):
+            fkey = id(fut)
+        seen_key = (fkey, id(plot))
+        if seen_key in self._seen:
             return
-        self._seen.add(fid)
-        self._seen_plots[fid] = id(plot)
+        self._seen.add(seen_key)
+        # Bound the dedup set so a long session doesn't grow it without limit
+        # (keys are unique per submission, so it would otherwise grow forever).
+        if len(self._seen) > 4096:
+            self._seen.clear()
         try:
-            self.debug_print.emit(f"Emitting Future {fut.key} for plot: {plot}")
             if "write_shared_array" in fut.key and plot is not None:
-                start = time.time()
+                start = time.perf_counter()
+                # Read the plot's single shared-memory buffer (the frame this
+                # future wrote). A frame clobbered by a newer overlapping write is
+                # dropped by the latest-wins staleness guard in _on_plot_ready, so
+                # reading the single buffer is correct.
                 result = read_shared_array(plot.shared_memory)
-                self.debug_print.emit(f"Read shared array in {(time.time()-start)*1000:.2f} ms")
+                _ms = (time.perf_counter() - start) * 1e3
             else:
-                start = time.time()
+                start = time.perf_counter()
                 result = fut.result()
-                self.debug_print.emit(f"Transferred Future over TCP in {(time.time()-start)*1000:.2f} ms")
+                _ms = (time.perf_counter() - start) * 1e3
+            # Per-frame timing is a hot path during a drag: emitting a log line
+            # for EVERY painted frame floods the stdout IPC pipe (shared with the
+            # figure pushes) and itself adds lag. Off unless SPYDE_NAV_TIMING=1.
+            if self._emit_timing:
+                self.debug_print.emit(
+                    f"NAV-DEBUG worker: delivered {fut.key} in {_ms:.2f} ms"
+                )
         except Exception as e:
             result = e
         # signal_ready passes the owning plot as `extra` → emit (signal, result,
@@ -146,7 +181,14 @@ class PlotUpdateWorker:
         # code ignored `extra` and always passed the future as the 3rd arg, so
         # `_on_signal_ready` got a Future where it expected the plot
         # ("'Future' object has no attribute 'parent_selector'").
+        # The shm read / fut.result() above already happened (fast, off-thread).
+        # Marshal only the APPLY (plot.update → set_data → push) onto the main
+        # thread so it doesn't race the main loop's own figure pushes.
         if extra is not None:
-            emitter(plot, result, extra)
+            call = lambda: emitter(plot, result, extra)
         else:
-            emitter(plot, result, fut)
+            call = lambda: emitter(plot, result, fut)
+        if self._dispatch is not None:
+            self._dispatch(call)
+        else:
+            call()

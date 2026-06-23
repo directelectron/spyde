@@ -5,7 +5,11 @@ import logging
 import numpy as np
 from typing import TYPE_CHECKING, Union, List
 
-from spyde.drawing.selectors.base_selector import BaseSelector, IntegratingSelectorMixin
+from spyde.drawing.selectors.base_selector import (
+    BaseSelector,
+    IntegratingSelectorMixin,
+    event_handler_fn,
+)
 
 if TYPE_CHECKING:
     from spyde.drawing.plots.plot import Plot
@@ -53,7 +57,8 @@ class InfiniteLineSelector(BaseSelector):
                 plot1d._push()
                 self._widget = widget
                 self.roi = widget
-                widget.add_event_handler(self._on_pointer_up, "pointer_move", "pointer_up")
+                self._event_cb = event_handler_fn(self._on_pointer_up)
+                widget.add_event_handler(self._event_cb, "pointer_move", "pointer_up")
             except Exception as e:
                 logger.debug("InfiniteLineSelector widget init failed: %s", e)
 
@@ -112,7 +117,8 @@ class LinearRegionSelector(BaseSelector):
                 plot1d._push()
                 self._widget = widget
                 self.roi = widget
-                widget.add_event_handler(self._on_pointer_up, "pointer_move", "pointer_up")
+                self._event_cb = event_handler_fn(self._on_pointer_up)
+                widget.add_event_handler(self._event_cb, "pointer_move", "pointer_up")
             except Exception as e:
                 logger.debug("LinearRegionSelector widget init failed: %s", e)
 

@@ -10,6 +10,7 @@ import contextlib
 import logging
 import sys
 import threading
+import time
 import numpy as np
 import dask
 import dask.array as da
@@ -55,8 +56,16 @@ if TYPE_CHECKING:
     from spyde.drawing.selectors import BaseSelector
     from spyde.drawing.plots.plot import Plot
 from multiprocessing import shared_memory
+import os as _os
 
 _SHARED_MEMORY_SUPPORTED = True
+
+# Per-frame navigator diagnostics ('NAV-DEBUG enter' / timing) fire on EVERY
+# crosshair move. At DEBUG with a fast drag they flood the stdout IPC pipe
+# (shared with figure pushes) and add visible lag. Gate them behind an opt-in
+# env flag so a normal DEBUG session stays responsive; set SPYDE_NAV_TIMING=1
+# to turn the navigator trace back on.
+_NAV_TIMING = _os.environ.get("SPYDE_NAV_TIMING") == "1"
 
 def write_shared_array(data, shared_arr_name):
     dtype_bytes = data.dtype.str.encode('utf-8')
@@ -153,6 +162,44 @@ def update_from_navigation_selection(
 
     current_signal = child.plot_state.current_signal
 
+    # Per-frame trace — gated behind SPYDE_NAV_TIMING because it fires on EVERY
+    # crosshair move and floods the IPC log/panel at DEBUG (which itself adds lag).
+    if _NAV_TIMING:
+        log.debug(f"update_from_navigation_selection: indicies = {indices}, current_signal = {current_signal}, "
+                  f"selector = {selector}, child = {child}, get_result = {get_result},"
+                  f" cache_in_shared_memory = {cache_in_shared_memory}")
+
+    # ── NAV-DEBUG ───────────────────────────────────────────────────────────
+    # Diagnostics for the "second signal" reports: IndexError on the DP update
+    # and threaded-vs-distributed cache path. Opt-in (SPYDE_NAV_TIMING=1) because
+    # it fires per crosshair move and floods the IPC log at DEBUG.
+    if _NAV_TIMING and log.isEnabledFor(logging.DEBUG):
+        try:
+            _cache = getattr(current_signal, "cached_dask_array", None)
+            _cli = getattr(_cache, "client", None) if _cache is not None else None
+            _cli_set = getattr(_cache, "_client", None) is not None if _cache is not None else None
+            _cli_kind = (
+                "distributed" if (_cli is not None and type(_cli).__name__ == "Client")
+                else ("THREADED/none" if _cli is None else type(_cli).__name__)
+            )
+            _dshape = getattr(getattr(current_signal, "data", None), "shape", None)
+            log.debug(
+                "NAV-DEBUG enter: sig=%s lazy=%s data.shape=%s nav_shape=%s "
+                "sig_shape=%s raw_indices=%s integrating=%s cache.client=%s "
+                "cache._client_set=%s",
+                getattr(current_signal, "_signal_type", type(current_signal).__name__),
+                getattr(current_signal, "_lazy", None),
+                _dshape,
+                tuple(current_signal.axes_manager.navigation_shape),
+                tuple(current_signal.axes_manager.signal_shape),
+                np.asarray(indices).tolist(),
+                getattr(selector, "is_integrating", None),
+                _cli_kind,
+                _cli_set,
+            )
+        except Exception as _e:
+            log.debug("NAV-DEBUG enter logging failed: %s", _e)
+
     # anyplotlib displays the navigator image un-transposed (imshow convention:
     # data axis 0 = rows = y = iy, axis 1 = cols = x = ix). The selector reports
     # widget coords (cx = column, cy = row), i.e. (x, y) order. pyqtgraph used to
@@ -168,24 +215,55 @@ def update_from_navigation_selection(
     if not selector.is_integrating:
         indices = np.mean(indices, axis=0).astype(int)
 
-    # Clamp nav indices to the data's leading-axis sizes. The signal behind a
-    # plot can change (e.g. set_signal_type, or swapping current_signal) while a
+    # Clamp nav indices to the leading (navigation) axis sizes. The signal behind
+    # a plot can change (e.g. set_signal_type, or loading a SECOND signal) while a
     # selector still holds positions from the previous, larger nav grid — the
-    # subsequent data[...] index would raise IndexError. Clamping keeps the
-    # display valid until the selector catches up to the new shape.
+    # subsequent data[...] index would raise IndexError ("Index N out of bounds
+    # for axis 0 with size N"). Clamping keeps the display valid until the
+    # selector catches up to the new shape.
+    #
+    # Use the data array's leading-axis sizes as the AUTHORITATIVE per-coordinate
+    # bound. `indices` here is (y, x, …) order (post-transpose), matching the data
+    # axes; data_shape's leading nav axes are (ny, nx, …). A distributed signal's
+    # `.data` may be a Future (no `.shape`) — fall back to axes_manager then.
     try:
-        data_shape = current_signal.data.shape
+        data_obj = current_signal.data
+        data_shape = getattr(data_obj, "shape", None)
+        if data_shape is None:
+            # Future / unshaped — derive the nav-axis sizes from the axes manager
+            # (navigation_shape is (x, y, …); reverse to (…, y, x) array order).
+            nav_shape_xy = tuple(current_signal.axes_manager.navigation_shape)
+            data_shape = tuple(reversed(nav_shape_xy))
         idx_arr = np.asarray(indices)
         if idx_arr.size and len(data_shape):
             # Last axis holds the per-point coordinates (one per leading data
             # axis); clamp each coordinate to its axis size.
             ncoord = idx_arr.shape[-1] if idx_arr.ndim else 1
-            limits = np.array(
-                [data_shape[i] - 1 for i in range(min(ncoord, len(data_shape)))],
-                dtype=idx_arr.dtype,
-            )
+            n = min(ncoord, len(data_shape))
+            limits = np.array([data_shape[i] - 1 for i in range(n)], dtype=idx_arr.dtype)
+            before = idx_arr.copy()
             if limits.size == ncoord:
                 indices = np.clip(idx_arr, 0, limits)
+            else:
+                # ncoord != available bounds: clamp the coordinates we CAN bound
+                # rather than skipping entirely (the old code skipped, which let
+                # the IndexError through on a mismatched/changed signal).
+                clamped = idx_arr.copy()
+                if idx_arr.ndim == 1:
+                    clamped[:n] = np.clip(idx_arr[:n], 0, limits)
+                else:
+                    clamped[..., :n] = np.clip(idx_arr[..., :n], 0, limits)
+                indices = clamped
+                log.debug(
+                    "NAV-DEBUG clamp ncoord=%d != bounds=%d; partial-clamped "
+                    "data_shape=%s", ncoord, limits.size, data_shape,
+                )
+            if log.isEnabledFor(logging.DEBUG) and not np.array_equal(before, np.asarray(indices)):
+                log.debug(
+                    "NAV-DEBUG clamped out-of-range nav index %s -> %s "
+                    "(data_shape=%s) — selector held a stale/larger-grid position",
+                    before.tolist(), np.asarray(indices).tolist(), data_shape,
+                )
     except Exception as e:
         # Couldn't clamp (unexpected shape) — proceed with raw indices; a real
         # out-of-range index then surfaces as an IndexError downstream.
@@ -198,61 +276,100 @@ def update_from_navigation_selection(
                 #make checkerboard pattern to indicate loading
                 current_img[::2, ::2] = 0
         else:
-            # Atomic per-signal cache section: the cancel + cancel_surrounding +
-            # get_chunk + submit below mutate/cancel the shared CachedDaskArray's
-            # block futures, which has no internal lock. Without this, overlapping
-            # navigator updates cancel a chunk future that a dependent
-            # get_inds/write_shared_array future needs → image never loads.
-            with _cache_lock_ctx(current_signal):
-                # If a NEWER navigator position superseded us while we waited for
-                # this lock, do NOT cancel/submit: our cancel_surrounding() would
-                # kill the latest position's in-flight chunk future ("get_inds …
-                # lost dependencies"), and our own future would be stale anyway.
-                # Bail and let the latest body own the cache + the paint.
-                if hasattr(selector, "is_stale_body") and selector.is_stale_body():
-                    return None
+            # ── RESPONSIVE PATH (restored from the original Qt design) ──────────
+            # The simple, fast pipeline (the original Qt design): ask the cache
+            # for a FUTURE (return_future=True), submit one write_shared_array task
+            # on it, and let the PlotUpdateWorker poll-and-paint. return_future=True
+            # also keeps it correct — it returns the freshly-built get_inds future
+            # immediately and never takes hyperspy get_index's blocking
+            # `np.all(done) → future.result()` branch (the old "lost dependencies"
+            # churn).
+            #
+            # NO cache lock here: every navigator update runs on the single serial
+            # _nav_dispatcher thread (see base_selector), so this function is never
+            # re-entered concurrently and the cache's block bookkeeping can't be
+            # raced ("ValueError: (i, j) is not in list"). That removed the lock
+            # that was stalling the drag.
+            #
+            # NOTE: do NOT cancel the previous shm-write future. The writes run on
+            # the serial nav-dispatcher and are cheap (one 128×128 frame); under a
+            # fast drag, cancelling the in-flight write before it finishes left the
+            # shared buffer holding an OLD frame, so the worker kept reading the
+            # same stale DP (the painted stats froze while indices changed). Let
+            # each write complete; the per-future staleness guard in _on_plot_ready
+            # still drops superseded frames so only the latest paints.
 
-                # Cancel stale work from the previous position before requesting new data.
-                # 1. Cancel the old shm-write future so workers aren't blocked on it.
-                old_fut = getattr(child, "_pending_shm_future", None)
-                if old_fut is not None and not old_fut.done():
-                    try:
-                        old_fut.cancel()
-                    except Exception as e:
-                        log.debug("cancelling stale shm-write future failed: %s", e)
+            # CRITICAL: pin the cache's distributed client to OUR cluster's client
+            # BEFORE asking it for the chunk future. CachedDaskArray.client falls
+            # back to dask.distributed.get_client() when _client is unset — but this
+            # runs on the nav-dispatcher thread (a plain threading.Thread, not a
+            # Dask worker), where get_client() raises ValueError → returns None →
+            # the cache silently does a SYNCHRONOUS threaded compute. That's why no
+            # tasks appear in the dashboard and the DP shows a stale frame: the
+            # get_inds future was never submitted to the real scheduler. Setting
+            # _client makes every get_inds run on the cluster (visible + cancellable
+            # + the write_shared_array below submits to the SAME client).
+            cached_arr = getattr(current_signal, "cached_dask_array", None)
+            try:
+                _dm = getattr(child.main_window, "dask_manager", None)
+                _live_client = getattr(_dm, "client", None) if _dm is not None else None
+                if cached_arr is not None and _live_client is not None:
+                    cached_arr._client = _live_client
+            except Exception as _e:
+                log.debug("pinning cache client failed: %s", _e)
 
-                # 2. Cancel pending surrounding-block prefetch futures — they are
-                #    low-priority but still consume worker slots.  The new core-block
-                #    request will re-prefetch the right neighbours after it completes.
-                cached_arr = getattr(current_signal, "cached_dask_array", None)
-                if cached_arr is not None and hasattr(cached_arr, "cancel_surrounding"):
-                    cached_arr.cancel_surrounding()
+            # NOTE: cancel_surrounding() REMOVED here. It cancels the cache's
+            # surrounding-block prefetch futures — but the get_inds future we are
+            # about to submit depends on a CORE block that the cache's block
+            # bookkeeping can release/evict on the very next move; combined with
+            # cancelling, that left EVERY get_inds (and its dependent
+            # write_shared_array) in state `cancelled`, so the DP never painted the
+            # new frame (the buffer kept the last frame that happened to survive).
+            # Observed directly via the [LIFE] trace: getinds=…(cancelled)
+            # write=…(cancelled) on every move, including the final resting one.
+            # Letting the prefetch futures live costs a little worker memory but
+            # keeps the core get_inds alive long enough to compute and write.
 
-                # IN-CHUNK vs CROSS-CHUNK. `return_future=False` + `force_compute=False`
-                # makes the cache return a NUMPY array immediately when the chunk is
-                # already cached (an in-chunk move), and only a Future when the chunk
-                # isn't loaded yet (a boundary crossing). This is the key to a live
-                # drag: a cached frame is displayed SYNCHRONOUSLY, so fast in-chunk
-                # moves all paint — instead of every frame being forced through the
-                # async future/worker round-trip and then dropped by the latest-future
-                # staleness guard (which left the plot frozen until the drag stopped).
-                current_img = current_signal._get_cache_dask_chunk(
-                    indices, get_result=False, return_future=False,
+            current_img = current_signal._get_cache_dask_chunk(
+                indices, get_result=get_result, return_future=True,
+            )
+
+            if (isinstance(current_img, Future)
+                    and cache_in_shared_memory and _SHARED_MEMORY_SUPPORTED):
+                # DISTRIBUTED: route the future's result through the plot's single
+                # shared-memory buffer (the optimized DP path: avoids the slow TCP
+                # round-trip of the frame). The worker reads this buffer when the
+                # future completes. Overlapping writes during a fast drag are safe:
+                # only the LATEST future's result is applied (_on_plot_ready
+                # staleness guard), so a frame clobbered by a newer write was going
+                # to be dropped anyway. (Single buffer — do NOT add a per-future
+                # ring; that caused an infinite re-emit loop. See CLAUDE.md §2/§4.)
+                shared_arr_name = child.shared_memory.name
+                # priority=10 puts this ahead of surrounding-block prefetch tasks
+                # (which are submitted at default priority=0 by CachedDaskArray).
+                fut = child.main_window.dask_manager.client.submit(
+                    write_shared_array, current_img, shared_arr_name,
+                    priority=10,
                 )
-                if isinstance(current_img, Future) and cache_in_shared_memory and _SHARED_MEMORY_SUPPORTED:
-                    # CROSS-CHUNK (cache miss): the chunk is loading on a worker. Route
-                    # the result through the shared-memory buffer (the optimized path);
-                    # the PlotUpdateWorker reads it when the future completes.
-                    _ = child.shared_memory  # lazy creation
-                    shared_arr_name = f"plot_buffer{id(child)}"
-                    # priority=10 puts this ahead of surrounding-block prefetch tasks
-                    # (which are submitted at default priority=0 by CachedDaskArray).
-                    fut = child.main_window.dask_manager.client.submit(
-                        write_shared_array, current_img, shared_arr_name,
-                        priority=10,
-                    )
-                    child._pending_shm_future = fut
-                    current_img = fut
+                # Hold the get_inds future ALIVE until its write completes. When the
+                # only client-side reference to a Future is dropped (the old
+                # `current_img = fut` reassign), distributed sends release-key to the
+                # scheduler; if the write task hasn't yet pulled its dependency, the
+                # get_inds task is cancelled → write cancelled. Stash it on the plot,
+                # keyed by the write future, and drop it when the write finishes.
+                _giF = current_img
+                child._inflight_getinds = getattr(child, "_inflight_getinds", {})
+                child._inflight_getinds[fut.key] = _giF
+                def _release_giF(f, _plot=child, _wkey=fut.key):
+                    try:
+                        _plot._inflight_getinds.pop(_wkey, None)
+                    except Exception:
+                        pass
+                try:
+                    fut.add_done_callback(_release_giF)
+                except Exception:
+                    pass
+                current_img = fut
     else:
         # Eager (in-RAM) slice. `indices` is either a single nav point (1-D,
         # from a crosshair after the mean-reduce above) or a list of nav points
@@ -265,12 +382,22 @@ def update_from_navigation_selection(
         # because it always loaded lazily (the Future branch above); eager
         # example datasets do.
         idx = np.asarray(indices)
-        if idx.ndim <= 1:
-            point = tuple(int(v) for v in np.atleast_1d(idx))
-            current_img = current_signal.data[point]
-        else:
-            sl = tuple(idx[:, k].astype(int) for k in range(idx.shape[1]))
-            current_img = current_signal.data[sl].mean(axis=0)
+        try:
+            if idx.ndim <= 1:
+                point = tuple(int(v) for v in np.atleast_1d(idx))
+                current_img = current_signal.data[point]
+            else:
+                sl = tuple(idx[:, k].astype(int) for k in range(idx.shape[1]))
+                current_img = current_signal.data[sl].mean(axis=0)
+        except Exception:
+            log.exception(
+                "NAV-DEBUG eager index RAISED: indices=%s data.shape=%s "
+                "nav_shape=%s — the second-signal IndexError",
+                idx.tolist(),
+                getattr(getattr(current_signal, "data", None), "shape", None),
+                tuple(current_signal.axes_manager.navigation_shape),
+            )
+            raise
     return current_img
 
 

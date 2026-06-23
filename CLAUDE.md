@@ -4,76 +4,68 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-SpyDE is a PySide6 GUI application for visualizing and analyzing electron microscopy data (TEM, STEM, Cryo EM, 4D STEM, EELS). It wraps HyperSpy and PyXEM with a custom MDI (Multiple Document Interface) window system, Dask-based parallel computing, and a signal transformation tree.
+SpyDE is a desktop application for visualizing and analyzing electron microscopy data (TEM, STEM, Cryo EM, 4D STEM, EELS). The UI is an **Electron + React/TypeScript** frontend; the compute/data engine is a **Python backend** (`spyde/backend/`) that the Electron main process spawns as a subprocess and talks to over stdin/stdout JSON lines (the `PLOTAPP:` protocol from `anyplotlib._electron`). Plots are rendered by **anyplotlib** (figures embedded as HTML in the renderer), not by a native Qt widget. It wraps HyperSpy and PyXEM, with Dask-based parallel computing and a signal transformation tree.
+
+> **History note:** SpyDE began as a PySide6/pyqtgraph Qt app and was migrated to the Electron/anyplotlib architecture above. The old Qt code (`QMainWindow`, `QMdiArea`, `QThread`, pyqtgraph widgets, `spyde/qt/`) is **gone** — if you see "Qt"/"pyqtgraph" in a comment or an older memory, it's historical. Patterns described as "ported from the Qt app" mean the *algorithm/approach* was carried over, not the framework.
 
 ## Commands
 
-**Install for development:**
+**Install the Python backend (dev):**
 ```bash
-pip install -e ".[tests]"
+pip install -e ".[tests]"   # or: uv pip install -e ".[tests]"
 ```
 
-**Run the app:**
+**Install the Electron frontend (dev):**
 ```bash
-spyde
-# or
-python -m spyde
+cd electron && npm install
 ```
 
-**Run tests:**
-```bash
-pytest spyde/tests/
-```
+**Run the app (dev):** from `electron/`, `npm run dev` (electron-vite; spawns the Python backend as a subprocess). Running `python -m spyde` alone launches only the **backend** (asyncio stdin/stdout loop) — useful for debugging the backend, but there's no UI without Electron.
 
-**Run a single test file:**
+**Run the Python tests** (Qt-free, build a real `Session`):
 ```bash
-pytest spyde/tests/test_actions.py
+pytest spyde/tests/migrated/                                   # whole suite
+pytest spyde/tests/migrated/test_navigator_race.py             # one file
+pytest spyde/tests/migrated/test_navigator_race.py::TestNavigatorRace::test_x   # one test
 ```
+Slow benchmarks live in `spyde/tests/benchmark_*.py` — run directly (`python -m spyde.tests.benchmark_<name>`), not under pytest.
 
-**Run a single test:**
-```bash
-pytest spyde/tests/test_actions.py::test_function_name
-```
+**Run the Electron e2e (Playwright):** from `electron/`, `npm test` (or `npm run test:build` to build first).
 
-**Build distributable (Windows/macOS/Linux):**
-```bash
-pycrucible build
-```
-Release builds are triggered by pushing a version tag: `git tag v0.1.0 && git push origin v0.1.0`
+**Build distributable:** from `electron/`, `npm run dist` (electron-vite build + `bundle:python` + electron-builder). See `electron/electron-builder.yml` and `DISTRIBUTION_PLAN.md`.
 
 ## Dependencies
 
-Key non-PyPI dependencies installed from custom forks:
-- `hyperspy` → `github.com/cssfrancis/hyperspy@slice-integrate2`
-- `rosettasciio` → `github.com/cssfrancis/rosettasciio@improve_mrc`
+Python deps are in `pyproject.toml`. Key non-PyPI deps from custom forks (check `pyproject.toml` for the exact pinned branch — they move):
+- `hyperspy` → `github.com/cssfrancis/hyperspy@slice-integrate2` (the navigator `CachedDaskArray` / `get_index` fixes live here — see Live-Display §4)
+- `rosettasciio` → `github.com/cssfrancis/rosettasciio@win32-binary-read`
 
-Supported file extensions: `.hspy`, `.mrc`, `.tif`, `.tiff`, `.de5`
+Frontend deps (Electron, React, electron-vite, Playwright) are in `electron/package.json`.
+
+Supported file extensions: `.hspy`, `.zspy`, `.mrc`, `.tif`, `.tiff`, `.de5` (see `SUPPORTED_EXTS` in `session.py`).
 
 ## Architecture
 
 ### Entry Points
-- `spyde/__main__.py` → `main()`: Creates `QApplication` + `MainWindow`
-- `main.py` (root): PyCrucible launcher wrapper that calls `spyde.__main__.main()`
+- `spyde/__main__.py` → `main()`: calls `multiprocessing.freeze_support()` then `spyde.backend.app.run()` (the asyncio backend). The Electron main process spawns this as a subprocess.
+- `spyde/backend/app.py` → `run()` / `_main()`: the asyncio event loop that **replaces** `QApplication.exec()`. Reads JSON messages from stdin, dispatches them to the `Session`, and writes figure/stream messages to stdout.
+- `main.py` (root): PyCrucible/frozen-app launcher wrapper (also calls `freeze_support()`) that delegates to `spyde.__main__.main()`.
+- `electron/src/{main,preload,renderer}`: the Electron app — `main` (Node process, spawns Python + bridges IPC), `preload` (contextBridge), `renderer` (React/TS UI, the log panel, figure iframes).
 
-### MainWindow (`spyde/__main__.py`)
-The central `QMainWindow` (~1500 lines). Contains:
-- **MDI area** (`QMdiArea`): hosts `PlotWindow` subwindows
-- **Dask** `LocalCluster` + `Client`: initialized in a background thread on startup
-- **`PlotUpdateWorker`**: polls Dask futures on a background thread; emits results to update plots on the GUI thread
-- **Dock widgets**: Plot Control (right), Instrument Control (left, for live microscopy)
-- **`signal_trees`**: list of `BaseSignalTree` instances tracking all open datasets
+### Session (`spyde/backend/session.py`)
+`Session` is the Python-side coordinator (the old `MainWindow`'s role, minus Qt). It owns: the signal trees, the Dask cluster (via `DaskManager`), plot registration (`_plots`), file I/O, and action dispatch. All communication to Electron goes through `spyde/backend/ipc.py` `emit()`. It marshals worker results back onto the asyncio main thread via `set_main_loop()` + `_dispatch_to_main()`. Tests construct a `Session` directly.
 
 ### Signal Tree (`spyde/signal_tree.py`)
 `BaseSignalTree` tracks a DAG of signal transformations. Each node is a HyperSpy `BaseSignal` with associated `Plot`(s). Non-breaking transformations (e.g. filtering, centering) update the current plot in-place; breaking transformations (e.g. azimuthal integration) create new branches. Users can navigate the tree to compare states.
 
 ### Drawing Layer (`spyde/drawing/`)
-- `plots/plot.py`: `Plot` — wraps a pyqtgraph `ImageItem`/`PlotItem` with colormap, histogram, and navigator linkage
-- `plots/plot_window.py`: `PlotWindow` — `QMdiSubWindow` containing one or more `Plot`s
-- `plots/plot_states.py`: state machine governing how navigator and signal plots synchronize
-- `plots/multiplot_manager.py`: manages multi-panel layouts
-- `selectors/`: 1D and 2D ROI selectors (wrappers around pyqtgraph ROIs) used to slice the HyperSpy navigation space
-- `toolbars/`: `PlotControlToolbar`, floating button bars, caret groups for UI controls
-- `update_functions.py`: pure functions that compute what data to display given the current plot state
+- `plots/plot.py`: `Plot` — wraps an **anyplotlib** figure (`anyplotlib._electron`); pushes image/line data to the embedded HTML view. Holds the per-plot shared-memory buffer and `current_data`.
+- `plots/plot_window.py`: `PlotWindow` — a logical container for one or more `Plot`s (the renderer lays these out; there is no `QMdiSubWindow`).
+- `plots/plot_states.py`: state machine governing how navigator and signal plots synchronize.
+- `plots/multiplot_manager.py`: manages multi-panel layouts; `navigation_selectors` maps a navigator `PlotWindow` → its selectors.
+- `selectors/`: 1D and 2D ROI/crosshair selectors (wrappers around **anyplotlib interactive widgets**) used to slice the HyperSpy navigation space. `base_selector.py` holds the `_NavDispatcher` (see Live-Display §2) and `event_handler_fn`.
+- `toolbars/`: toolbar/button-bar/caret config that the renderer renders.
+- `update_functions.py`: functions that compute what data to display given the current plot state (incl. `update_from_navigation_selection`, the navigator→DP path).
 
 ### Actions (`spyde/actions/`)
 - `base.py`: base action framework; defines `NAVIGATOR_DRAG_MIME` for drag-and-drop between plots
@@ -89,13 +81,10 @@ The central `QMainWindow` (~1500 lines). Contains:
 Key methods: `.submit()`, `.compute()`, `.compute_chunks_progressive()` (streaming chunk results). Callers never import Dask directly; switch modes by swapping the backend instance.
 
 ### Workers (`spyde/workers/`)
-- `plot_update_worker.py`: runs on a `QThread`; polls `dask.distributed.Future` objects and emits signals to update `Plot` objects on the Qt main thread
+- `plot_update_worker.py`: `PlotUpdateWorker` runs on a **plain daemon thread** (not a `QThread`); polls `dask.distributed.Future` objects, reads the completed result (from the per-plot shm buffer for the navigator path), and **marshals the apply onto the asyncio main thread** via the `dispatch` callback (`loop.call_soon_threadsafe`) → `Session._on_plot_ready` / `_on_signal_ready`. It emits via `psygnal` signals, not Qt signals.
 
 ### Live Instrument Control (`spyde/live/`)
-WIP widgets for live microscope control: camera, stage, STEM, TEM, particle scanning, reference. Housed in `ControlDockWidget`.
-
-### Qt Utilities (`spyde/qt/`)
-Shared Qt widgets and helpers. `spyde/qt/shared.py` contains `open_window()` and `create_data()` used by tests.
+WIP modules for live microscope control: camera, stage, STEM, TEM, particle scanning, reference.
 
 ### Signals (`spyde/signals/`)
 - `diffraction_vectors.py`: `SpyDEDiffractionVectors` — GPU-optimized CSR flat-buffer container for ragged diffraction vectors. Stores `(nav_x, nav_y, kx, ky, intensity)` with an offsets array (row-pointers). Key methods: `.at()`, `.kxy_at()`, `.count_map()`, `.to_dense()` (cached), `.to_pyxem()`, `.cluster()`, `.get_strain_maps()`.
@@ -104,24 +93,26 @@ Shared Qt widgets and helpers. `spyde/qt/shared.py` contains `open_window()` and
 - `vector_orientation.py`: CPU reference — per-pattern scipy-LM fit of pose `(θ, A, t)` where `v ≈ A·Rot(θ)·g_template + t`. `_residual` (soft-assign + no-match sink + strain-band penalty) is the cost both paths must agree on. Strain via polar decomposition of `M = A·Rot(θ)`.
 - `vector_orientation_gpu.py`: **the production path** — fits the *whole field at once* on the GPU (batched torch + Adam), no dask, no per-pattern loop. The vectors and library are tiny, so the entire scan is one batched optimisation. `compute_vector_orientation_gpu()` is dispatched first when `gpu_available()`; CPU is the fallback. On SpEd Ag (13k patterns × 1081 templates) it runs in ~8s. See the GPU Computing section for the non-obvious constraints baked into it.
 
-### External (`spyde/external/`)
-- `pyqtgraph/histogram_widget.py`: customized `HistogramLUTWidget`/`HistogramLUTItem` extending pyqtgraph's histogram
+### Backend IPC / logging (`spyde/backend/`)
+- `ipc.py`: `emit()` / `emit_status` / `emit_error` / `emit_progress` — write JSON messages to stdout for the Electron main process to relay to the renderer.
+- `log_stream.py`: tags each log record with a subsystem `area` (`_area_for` / `_AREA_RULES`) and streams it to the renderer's Log panel (which has search + area filter).
+- `process_guard.py`: reaps orphaned Dask worker subprocesses on exit (Windows Job Object).
 
 ## Testing
 
-Tests use `pytest-qt` with a real `QApplication`. Fixtures in `spyde/conftest.py` create a `MainWindow` with synthetic data:
+Tests are **Qt-free** (no `pytest-qt`, no `QApplication`). They build a real `Session` (with a 1-worker Dask cluster) and assert on the JSON messages it emits + the signal-tree/plot state. Fixtures live in `spyde/tests/migrated/conftest.py`:
 
-| Fixture | Data type | Expected subwindows |
+| Fixture | Data | Yields |
 |---|---|---|
-| `window` | empty | 0 |
-| `tem_2d_dataset` | 2D image | 1 |
-| `insitu_tem_2d_dataset` | TEM + time | 2 |
-| `stem_4d_dataset` | 4D STEM | 2 |
-| `stem_5d_dataset` | 5D STEM | 3 |
+| `window` | empty session | `{window: Session, signal_trees, plots, messages}` |
+| `tem_2d_dataset` | 2D image | same dict |
+| `stem_4d_dataset` | 4D STEM (2D nav, 2D signal) | same dict |
 
-Fixtures yield a dict with keys `window`, `mdi_area`, `subwindows`, `signal_trees`. On Linux CI, tests run under `xvfb-run` with `QT_QPA_PLATFORM=offscreen`.
+`captured_messages` monkeypatches `ipc.emit` (bound into `session.py` at import) to capture outgoing messages. `window["window"]` is the `Session`; `window["plots"]` is `session._plots`. Each fixture calls `session.shutdown()` on teardown.
 
-The conftest uses a **session-scoped window** (`_session_window`) with a **per-test reset** (`_reset_window()`) that closes subwindows and clears tracking lists between tests — avoids paying Dask/Qt startup cost per test. `spyde/qt/shared.py` provides `open_window()`, `create_data()`, and `wait_until(predicate, timeout)` for test helpers. Tests are written as classes with methods (e.g. `class TestActions` → `def test_center_direct_beam`).
+- **`torch`-CUDA work segfaults under the pytest process on Windows** (harness interaction, not a code bug — fine in the real app / plain Python). Run GPU correctness tests in a **subprocess** that prints a JSON result and `os._exit(0)` after (see `test_vector_orientation_gpu.py`). GUI-wiring tests that exercise the path should force the CPU branch (`monkeypatch gpu_available → False`).
+- Distributed repros that spin a real `LocalCluster(processes=True)` likewise need a subprocess and won't run inside an agent sandbox — run them yourself (e.g. `uv run python -m spyde.tests.repro_write_cancelled`).
+- Tests are written as classes with methods (e.g. `class TestActions` → `def test_center_direct_beam`).
 
 ## Memory Safety Rule: Never Materialise Large Datasets
 
@@ -137,9 +128,9 @@ The 5D path slices by time index first (`raw[t, ...]`), producing a 4D chunk —
 
 ## Thread Safety Constraints
 
-- Qt UI updates must happen on the main thread. Workers (e.g. `PlotUpdateWorker`) communicate back via Qt signals, never direct method calls.
-- Dask client startup is asynchronous. `MainWindow` uses a `wait loop + QApplication.processEvents()` before submitting compute work, not a blocking join.
-- Navigator drag cancels stale futures before submitting new ones (frees workers immediately rather than queuing).
+- UI/figure updates must happen on the **asyncio main thread**. Background workers (e.g. `PlotUpdateWorker`, the `_NavDispatcher`) must marshal their results back via `Session._dispatch_to_main` (`loop.call_soon_threadsafe`) — never push to a `Plot`/emit IPC directly from the worker thread.
+- Dask cluster startup is asynchronous (`DaskManager` builds it on a background thread and signals `ready` / `workers_ready`). Don't block the main loop waiting for it; submit compute only once a client exists.
+- All navigator updates run serially on the single `_NavDispatcher` thread (latest-position-wins coalescing), so the hyperspy cache is never re-entered concurrently — no lock needed. See Live-Display §2 and §4.
 
 ## Live-Display Core Patterns (DO NOT "CLEAN UP" — they look hacky but every alternative tried is worse)
 
@@ -171,37 +162,36 @@ at chunk boundaries (partial-signal sums).
 - Batch computes (`_do_compute_vectors`, orientation) keep the stored chunking
   when it's already usable rather than rechunking to a theoretical optimum.
 
-### 2. Navigator updates = greedy future-cancel, latest-position-wins — NOT a lock
+### 2. Navigator updates = ONE serial dispatcher + latest-position-wins — NOT a lock, NOT per-update threads
 
-The navigator→signal update path must be **non-blocking**. On each selector move
-it submits a Dask future and **cancels the stale in-flight one**; the latest
-position wins. The plot applies only the result of its current future
-(`plot.current_data is future` staleness guard).
+The navigator→signal update path must be **non-blocking** AND **non-concurrent**.
+Every selector update runs on a single dedicated daemon thread, `_NavDispatcher`
+(`base_selector.py`): `submit(selector)` coalesces by `id(selector)` (a newer
+position replaces the queued one), and the worker runs one `_run_update` at a time.
+The plot applies only the result of its current future (`plot.current_data is
+future` staleness guard in `_on_plot_ready`), so superseded frames are dropped.
 
-- **Do NOT serialise this with a lock held across the compute.** A previous
-  `BaseSelector._update_lock` (RLock around the whole update body) held across the
-  per-child compute and STALLED live tracking the moment two signals/selectors
-  were active — the navigator flashed but wouldn't follow the crosshair. It was
-  replaced with a generation counter (`_gen_lock` short, `_update_gen`): the body
-  runs unlocked so a newer fire supersedes the in-flight one via the future-cancel;
-  a body commits `current_indices`/hooks only if still the latest generation.
-- The ONLY lock here is the short per-signal `_cache_lock_ctx`
-  (`update_functions.py`) guarding the `CachedDaskArray` cancel+submit critical
-  section (its block bookkeeping has no internal lock). That's a few µs, not a
-  compute. Keep it; don't widen it.
-- **A STALE body must not touch the cache.** Because bodies run concurrently
-  (latest-wins), a superseded body that reaches the cache lock would run
-  `cancel_surrounding()` and cancel the **latest** position's in-flight chunk
-  future → a storm of `get_inds … cancelled: lost dependencies` and the final
-  crosshair frame never paints. So `update_from_navigation_selection` re-checks
-  `selector.is_stale_body()` INSIDE the cache lock and returns `None` (skip, no
-  cancel, no submit) if superseded; `delayed_update_data` treats a `None` return
-  as "skip" and does NOT clobber `current_data`. `_fn_gen`/`is_stale_body` carry
-  the running body's generation. Test: `test_stale_body_skips_cache_cancel`.
+- **Why one thread, not per-update `threading.Timer`s:** concurrent updates raced
+  hyperspy's `CachedDaskArray` block bookkeeping (`ValueError: (i, j) is not in
+  list`). The serial dispatcher removes the concurrency at the source — so the
+  cache is never re-entered and **no lock is needed**. (Earlier designs — an RLock
+  held across the compute, then a generation counter `_gen_lock`/`_update_gen`/
+  `is_stale_body`, then a `_cache_lock_ctx` — are all GONE. Don't reintroduce them.)
+- `_run_update` commits `current_indices` **up front** then short-circuits an
+  identical position, because the widget fires `pointer_move` + `pointer_up` =
+  two submits per release.
+- **Settle re-fire:** during a fast drag the in-flight futures get cancelled by
+  latest-wins; `update_data` (re)arms ONE trailing timer (`_settle_timer`) that
+  fires a single `force=True` update once motion stops, so the resting frame
+  computes even if the user just holds still mid-drag. It has NO in-flight gate, so
+  it cannot wedge.
+- **Do NOT add self-pacing or a buffer ring** (skip-while-in-flight, per-future shm
+  slots). Both were tried; both made it worse — a wedged gate / an infinite
+  ~6-frame re-emit loop. Single shm buffer + serial dispatcher + latest-wins is it.
 - A **cancelled** future is `done()` but its work never ran — never read its
-  result/buffer (the worker skips `fut.cancelled()`; `read_shared_array` rejects an
-  empty/torn buffer; `_on_plot_ready` drops stale results silently). This is
-  expected churn under latest-wins, not an error.
+  result/buffer (`read_shared_array` rejects an empty/torn buffer; `_on_plot_ready`
+  drops superseded/torn results silently). Some churn is expected under latest-wins.
+  But if EVERY get_inds/write future ends `cancelled`, that's the bug in §4 — fix it.
 - Tests pin the contract: `test_navigator_race.py` (slow update must not block a
   newer one; stale result must not clobber), `test_shm_read_robust.py`.
 
@@ -210,9 +200,11 @@ position wins. The plot applies only the result of its current future
 For the distributed path, a chunk result is written into a per-plot **shared-memory
 buffer** (`write_shared_array` / `read_shared_array`) and the `PlotUpdateWorker`
 reads it locally when the future completes — instead of transferring the array over
-the Dask TCP comm. This is the optimized navigator/VI pipeline ported from the Qt
-app; the reused buffer is race-safe because only the LATEST future's result is
-applied (staleness guard) and stale futures are cancelled first. The progressive
+the Dask TCP comm. This optimized navigator/VI pipeline's *approach* was carried
+over from the original Qt app; the reused single buffer is race-safe because only
+the LATEST future's result is applied (the `plot.current_data is future` staleness
+guard in `_on_plot_ready`) — a frame clobbered by a newer write was going to be
+dropped anyway. (Do NOT add a per-future buffer ring; see §2/§4.) The progressive
 navigator (`signal_tree._start_progressive_nav_compute` +
 `compute_with_live_buffer`) paints per-chunk into this buffer so a multi-GB
 navigator fills top-to-bottom instead of blanking until the whole sum finishes.
@@ -223,6 +215,50 @@ navigator fills top-to-bottom instead of blanking until the whole sum finishes.
   (robust 2–98% percentiles), with a final uniform repaint when the fill
   completes — per-chunk min/max levels make the contrast jump at chunk seams.
 
+### 4. **The DP-stuck-on-a-stale-frame trap (cost a brutal multi-hour session — DO NOT re-derive)**
+
+**Symptom:** dragging the navigator, the diffraction pattern (signal plot) freezes
+on one frame; you may also see nothing in the Dask dashboard. The selector reports
+changing indices and distinct `write_shared_array` futures fire per move, but
+`[plot-paint] SIG` shows the **same content hash** every frame. It "used to work."
+
+**There are TWO independent causes and you must fix BOTH. Diagnose, don't guess —
+the path is: selector → `_run_update` → `update_from_navigation_selection` →
+`CachedDaskArray.get_index(return_future=True)` (get_inds future) →
+`client.submit(write_shared_array, get_inds_fut, …)` → shm → `PlotUpdateWorker` →
+`_on_plot_ready`. Add `[plot-paint] hash=`, then a `[LIFE]` done-callback logging
+`getinds_fut.status` + `write_fut.status`. If both are `cancelled`, it's the two
+causes below. If the get_inds future is a NUMPY array (not a Future), it's the
+ambient-client cause alone.**
+
+1. **`CachedDaskArray._client` must be pinned to `DaskManager.client`.** The
+   `.client` property falls back to `dask.distributed.get_client()` when `_client`
+   is unset. Navigator updates run on the **`_NavDispatcher` thread** (a plain
+   `threading.Thread`, not a Dask worker) where `get_client()` raises → returns
+   `None` → the cache does a **silent synchronous threaded compute** (no dashboard
+   tasks; `return_future=True` returns a numpy array, not a future; flapping
+   client across threads corrupts the cached block state). FIX in
+   `update_from_navigation_selection`, BEFORE `_get_cache_dask_chunk`:
+   `cached_arr._client = child.main_window.dask_manager.client`.
+
+2. **Do NOT `cancel_surrounding()` before the chunk request, and HOLD the get_inds
+   future alive until its write lands.** Two things were cancelling EVERY get_inds
+   (and its dependent `write_shared_array`) → state `cancelled` → the buffer kept
+   the last surviving frame: (a) `cancel_surrounding()` cancels prefetch block
+   futures, cascading into the core block the in-flight get_inds depends on —
+   **removed that call**; (b) `current_img = fut` dropped the only client-side ref
+   to the get_inds future, so distributed sent release-key and cancelled it before
+   the write pulled its dependency — **now stashed on `plot._inflight_getinds[fut.key]`
+   and released in the write's done-callback**. A cancelled future is `done()` but
+   never ran; its shm write never happened.
+
+Repros: `spyde/tests/repro_cache_client_thread.py` (prints `cache.client=THREADED/none`
+from a timer thread) and `spyde/tests/repro_write_cancelled.py` (write future ends
+`cancelled`). **Do NOT "fix" this with a buffer ring or self-pacing on `update_data`
+— both were tried, both made it worse (infinite 6-frame re-emit loop / wedged
+gate). Single shm buffer + serial dispatcher + latest-wins + the two fixes above is
+the working design.**
+
 ## GPU Computing
 
 The hot paths (vector finding, vector orientation mapping) are GPU-accelerated. The stack present in the dev env: `torch` (+CUDA), `cupy`, `numba.cuda`. Guard every GPU path with an availability check (`torch.cuda.is_available()`) and keep a working CPU fallback — CI and many user machines have no GPU.
@@ -232,9 +268,9 @@ The hot paths (vector finding, vector orientation mapping) are GPU-accelerated. 
 **Avoid per-item Python loops around tiny kernels.** The original coarse seed looped templates × angles in Python (hundreds of thousands of tiny kernel launches) → **289s** for a realistic library. Rewriting it as a polar-histogram angular cross-correlation (one batched FFT, no Python loop) → **1.6s**. When a GPU step is slow, the cause is almost always a Python loop launching small kernels or a blown-up intermediate tensor — not the arithmetic. Reach for FFTs / matmuls / `scatter_add_` over explicit loops, and **chunk the batch dimension** to bound the largest intermediate (e.g. the `(P,T,n_a)` correlation is chunked over patterns) rather than materialising it whole (a full `(P,T,…)` tensor OOMs).
 
 **Windows + torch-CUDA-autograd gotchas (hard-won):**
-- `backward()` segfaults when run off the **main thread** under CUDA on Windows. The GPU orientation fit therefore runs **inline on the GUI/main thread** (it's only ~1-2s of compute) with an `on_yield=QApplication.processEvents` callback so the UI stays responsive; it is *not* offloaded to a worker thread. The CPU fallback (numpy/scipy) is thread-safe and *does* run on a worker.
+- `backward()` segfaults when run off the **main thread** under CUDA on Windows. The GPU orientation fit therefore runs **inline on the main thread** (it's only ~1-2s of compute) with an `on_yield` callback (pumps the event loop / flushes pending work) so the UI stays responsive; it is *not* offloaded to a worker thread. The CPU fallback (numpy/scipy) is thread-safe and *does* run on a worker.
 - Pin backward to the calling thread with `torch.autograd.set_multithreading_enabled(False)` around the refine loop.
-- Yield to Qt *inside* the step loop (every ~12 steps), not just per anneal stage — otherwise the window freezes for seconds and the progress bar appears stuck. Drive the progress label from the compute's own `progress(done,total)` callback; do not derive % from a lagging live-preview cell count.
+- Yield *inside* the step loop (every ~12 steps), not just per anneal stage — otherwise the window freezes for seconds and the progress bar appears stuck. Drive the progress label from the compute's own `progress(done,total)` callback; do not derive % from a lagging live-preview cell count.
 
 **Numerical traps that only show on real/strained data** (unit tests on uniform synthetic data won't catch these):
 - *Rotation-branch ambiguity*: a centrosymmetric diffraction pattern is invariant under 180°, so the seed may pick θ≈±180° where an SPD-bounded stretch can't fit → garbage strain. Collapse the seed angle into `(−π/2, π/2]`.

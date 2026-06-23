@@ -73,7 +73,7 @@ export interface Histogram {
 }
 
 /** One application-log record streamed from the Python backend. */
-export interface LogEntry { level: string; name: string; msg: string; time: number }
+export interface LogEntry { level: string; name: string; area?: string; msg: string; time: number }
 
 export interface SelectorInfo { windowId: number; mode: 'crosshair' | 'integrate'; title: string }
 export interface SubItem { name: string; color: string; vtype?: string; calculation?: string }
@@ -677,7 +677,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
       }
     }
 
-    window.electron.onMessage(handleMessage)
+    const disposeMessage = window.electron.onMessage(handleMessage)
 
     // Expose test injection hook for Playwright tests
     ;(window as Record<string, unknown>)['_spyde_test_inject'] = handleMessage
@@ -727,7 +727,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
       return sig
     }
 
-    window.electron.onStream((text, kind) => {
+    const disposeStream = window.electron.onStream((text, kind) => {
       dispatch({ type: 'STREAM', text, kind })
     })
 
@@ -739,6 +739,11 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     }
     window.addEventListener('message', onMessage)
     return () => {
+      // MUST remove the ipcRenderer listeners (StrictMode runs this effect twice
+      // in dev; without cleanup the second run stacks a duplicate listener →
+      // every message dispatched twice, growing over time → doubled logs + lag).
+      disposeMessage?.()
+      disposeStream?.()
       window.removeEventListener('message', onMessage)
       delete (window as Record<string, unknown>)['_spyde_test_inject']
     }

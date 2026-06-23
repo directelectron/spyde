@@ -7,8 +7,10 @@ slice-and-update of child plots.
 """
 from __future__ import annotations
 
+import functools
 import logging
 import threading
+import time
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Union
 
 import numpy as np
@@ -16,6 +18,86 @@ import numpy as np
 from spyde.drawing.selectors.utils import broadcast_rows_cartesian
 
 logger = logging.getLogger(__name__)
+
+import os as _os
+# Per-frame navigator trace logs are gated behind this (they fire on every
+# crosshair move and flood the IPC log/panel at DEBUG, which adds real lag).
+_NAV_TIMING = _os.environ.get("SPYDE_NAV_TIMING") == "1"
+
+
+class _NavDispatcher:
+    """A single serial worker thread that runs ALL navigator selector updates,
+    one at a time — recreating the Qt app's behaviour, where every selector
+    update ran on the one GUI event loop and never overlapped.
+
+    Why this exists: the Electron port fired each update on its OWN
+    ``threading.Timer`` thread, so updates ran CONCURRENTLY and raced hyperspy's
+    CachedDaskArray block bookkeeping (``ValueError: (i, j) is not in list``).
+    The fix was a per-signal lock around the cache call — but that lock then
+    serialised the work in a way that STALLED the drag. Running every update on
+    one dedicated thread removes the concurrency at the source: no race, so no
+    lock, and the cache call is never re-entered. The drag stays responsive
+    because the dispatcher is LATEST-WINS — a newer update for a selector
+    replaces any still-queued older one (coalescing), exactly like the throttle
+    intended.
+
+    Per (selector, kwargs) we keep at most ONE pending job; submitting again
+    overwrites it. The worker pulls the current job, runs it to completion, then
+    looks for the next. So at any instant the in-flight job is the latest the
+    user asked for, and stale intermediate positions are dropped without ever
+    being computed.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._pending: "dict[int, tuple]" = {}   # selector id -> (selector, kwargs)
+        self._wake = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="nav-dispatch", daemon=True
+        )
+        self._thread.start()
+
+    def submit(self, selector, **kwargs) -> None:
+        """Queue (or replace) this selector's pending update. Latest wins."""
+        with self._lock:
+            self._pending[id(selector)] = (selector, kwargs)
+        self._wake.set()
+
+    def _run(self) -> None:
+        while True:
+            self._wake.wait()
+            # Drain everything currently pending; new submissions that arrive
+            # while we run are picked up on the next loop (their wake re-fires).
+            with self._lock:
+                jobs = list(self._pending.values())
+                self._pending.clear()
+                self._wake.clear()
+            for selector, kwargs in jobs:
+                try:
+                    selector._run_update(**kwargs)
+                except Exception as e:
+                    logger.debug("nav dispatch update failed: %s", e)
+
+
+# One dispatcher for the whole process — the single serial lane all navigator
+# updates flow through (the Qt event-loop equivalent).
+_nav_dispatcher = _NavDispatcher()
+
+
+def event_handler_fn(method: Callable) -> Callable:
+    """Wrap a BOUND METHOD in a plain function for ``add_event_handler``.
+
+    anyplotlib's ``add_event_handler`` does ``fn._event_types = …`` on the
+    handler (callbacks.py), but a Python *bound method* is read-only and can't
+    take attributes → ``'method' object has no attribute '_event_types'``, so the
+    whole selector widget fails to init (no crosshair/rectangle, dead navigator).
+    A module-level function wrapper accepts the attribute. The caller MUST keep a
+    reference to the returned wrapper (e.g. store it on the selector) or it (and
+    anyplotlib's weak callback registration) may be garbage-collected."""
+    @functools.wraps(method)
+    def _handler(*args, **kwargs):
+        return method(*args, **kwargs)
+    return _handler
 
 if TYPE_CHECKING:
     from spyde.drawing.plots.plot import Plot
@@ -100,29 +182,18 @@ class BaseSelector:
         self.roi = None   # Alias for the anyplotlib Widget
         self._widget = None  # type: anyplotlib Widget
 
-        # Debounce: timer replaced by threading.Timer
-        self._pending_timer: threading.Timer | None = None
-        # Latest-position-wins, future-cancel model (NOT a long lock).
-        #
-        # A previous version held an RLock across the WHOLE update body — but the
-        # body calls the per-child update fn, which can block for 100s of ms on a
-        # compute. With two signals / selectors live at once that lock stays held
-        # across the slow compute and STALLS every other update: the navigator
-        # flashes but the image won't track the crosshair (the lock isn't free).
-        #
-        # Instead we follow the greedy future-cancel workflow the distributed
-        # path was built for: each fire bumps a generation counter; the update
-        # body runs UNLOCKED so a newer fire starts immediately and (via
-        # update_from_navigation_selection) cancels the in-flight future and
-        # submits its own. A body only commits its result (current_indices +
-        # index hooks) if it is still the latest generation — a superseded body
-        # drops its now-stale work. The short per-signal cache lock
-        # (_cache_lock_ctx) still serialises just the cancel+submit critical
-        # section, and the "plot.current_data is future" guard drops stale
-        # frames. See test_navigator_race.
-        self._gen_lock = threading.Lock()
-        self._update_gen = 0
-        self._fn_gen = 0          # generation of the body currently in fn()
+        # Throttle: drop ROI/crosshair drag events that arrive within live_delay
+        # of the last fire (the dispatcher reads the latest position when it
+        # runs). All updates then run serially on the single _nav_dispatcher
+        # thread, so there is NO concurrency to guard — no generation counters,
+        # no per-signal cache lock. Latest-wins is handled by the dispatcher
+        # coalescing repeated submissions for this selector into one pending job.
+        self._last_fire_t = 0.0
+        # Settle re-fire: a single trailing timer, (re)armed on every move and
+        # cancelled by the next move, that fires ONE forced update once motion
+        # stops. See update_data — it guarantees the resting frame computes even
+        # though every intermediate future got cancelled by latest-wins.
+        self._settle_timer: threading.Timer | None = None
         self.update_function = update_function
         self._last_size_sig = None
 
@@ -224,95 +295,123 @@ class BaseSelector:
     # ── Update dispatch ───────────────────────────────────────────────────────
 
     def update_data(self, ev=None) -> None:
-        """Trigger a THROTTLED update.
+        """Trigger a navigator update on the single serial dispatcher.
 
-        Coalesce rapid drag events: if a fire is already scheduled in this window,
-        do nothing (the timer reads the LATEST widget position when it fires). A
-        plain debounce (cancel + restart on every move) with a tiny delay instead
-        fires once per mouse event, swamping Dask with a compute per event — so a
-        lazy navigator drag clogs and the new chunk paints poorly. Throttling
-        bounds it to ~1 compute / live_delay while still tracking the cursor.
+        Every selector move just queues the LATEST position on the dispatcher
+        (coalescing: a newer submit replaces any still-queued one for this
+        selector). The dispatcher runs one update at a time, and the per-future
+        staleness guard in ``_on_plot_ready`` drops any frame that a newer
+        position has already superseded — so the DP always converges on the
+        cursor's final position without us tracking in-flight frames here.
+
+        This mirrors the proven Qt design: submit-latest + drop-stale. The earlier
+        Electron port added self-pacing (skip while a frame is in flight, then a
+        trailing re-fire) on top of this, which created a self-perpetuating timer
+        loop that re-emitted the same handful of shm buffers forever — removed.
+
+        Settle re-fire: during a fast drag, every intermediate get_inds /
+        write_shared_array future is CANCELLED by the next move (latest-wins +
+        hyperspy's cache GC dropping its deps), so they never compute a real frame
+        — the buffer keeps the last frame that happened to survive. When motion
+        stops (including just holding still mid-drag, no mouse-up), nothing
+        re-submits the resting position, so the DP is stuck on that stale frame
+        even though a single re-fire would resolve it. We therefore (re)arm ONE
+        trailing timer here; the next move cancels it, and when the user finally
+        rests it fires a single FORCED update for the resting position. Because no
+        newer move follows, that future is not cancelled and paints. This timer has
+        NO in-flight gate (unlike the removed self-pacing), so it cannot wedge.
         """
-        if self._pending_timer is not None:
-            return
-        self._pending_timer = threading.Timer(
-            self.live_delay, self._throttled_fire
-        )
-        self._pending_timer.daemon = True
-        self._pending_timer.start()
+        _nav_dispatcher.submit(self)
+        self._arm_settle()
 
-    def _throttled_fire(self) -> None:
-        self._pending_timer = None
-        self.delayed_update_data()
+    def _arm_settle(self) -> None:
+        """(Re)arm the single settle timer — fires one forced update once motion
+        stops (see update_data). Cancelled and replaced by the next move."""
+        t = self._settle_timer
+        if t is not None:
+            t.cancel()
+        # Wait a touch longer than live_delay (already in SECONDS) so a continuing
+        # drag always cancels this before it fires; ~120 ms of stillness = settled.
+        delay = max(0.12, (self.live_delay or 0.0) + 0.1)
+        nt = threading.Timer(delay, self._settle_fire)
+        nt.daemon = True
+        self._settle_timer = nt
+        nt.start()
 
-    def is_stale_body(self) -> bool:
-        """True when the update body currently running ``fn`` has been superseded
-        by a newer navigator position. Used by the cache critical section to skip
-        cancelling/submitting on behalf of a stale position (which would cancel
-        the latest position's in-flight chunk future)."""
-        return self._fn_gen != self._update_gen
+    def _settle_fire(self) -> None:
+        """Motion has stopped — force one final update for the resting position so
+        the frame that all the cancelled in-flight futures never produced actually
+        computes and paints. force=True bypasses the dup short-circuit in
+        _run_update (an earlier move already committed current_indices here)."""
+        self._settle_timer = None
+        _nav_dispatcher.submit(self, force=True)
 
     def delayed_update_data(self, force: bool = False, update_contrast: bool = False) -> None:
-        """Perform the actual data update if indices changed.
+        """Public entry point: queue an update on the single serial dispatcher.
 
-        Latest-position-wins (no long lock): bump a generation counter, run the
-        per-child update fn UNLOCKED (so a newer fire can start and supersede
-        this one through the future-cancel path), and only commit the result if
-        this body is still the latest generation. The per-signal cache lock
-        inside the update fn serialises the short cancel+submit section; this
-        method never blocks a concurrent selector across a slow compute."""
-        self._pending_timer = None
+        All navigator updates run on ONE worker thread (the Qt event-loop
+        equivalent), so they never overlap and the cache is never re-entered —
+        hence no per-signal cache lock is needed. Latest-wins: a newer submission
+        for this selector replaces any still-queued one."""
+        _nav_dispatcher.submit(self, force=force, update_contrast=update_contrast)
+
+    def _run_update(self, force: bool = False, update_contrast: bool = False) -> None:
+        """The actual update body — ALWAYS runs on the dispatcher thread, one at a
+        time. Because nothing else can be running an update concurrently, the
+        cache call inside ``fn`` is safe without a lock and the generation /
+        stale-body gymnastics are unnecessary (a superseded position was already
+        dropped from the dispatcher's pending slot before it ever ran)."""
         try:
             indices = self.get_selected_indices()
         except Exception:
             return
 
-        # Reserve this update's generation. A staleness check against it after
-        # the (slow, unlocked) child compute lets a newer fire win.
-        with self._gen_lock:
-            if np.array_equal(indices, self.current_indices) and not force:
-                return
-            self._update_gen += 1
-            my_gen = self._update_gen
+        # Short-circuit a repeat of the SAME position. anyplotlib fires BOTH
+        # pointer_move and pointer_up for a single release, so one interaction
+        # produces two submits with identical indices; without this they'd both
+        # recompute the same frame. Commit current_indices UP FRONT (not at the
+        # end) so the duplicate skips here even if it runs back-to-back before the
+        # body finishes. force=True bypasses (repaint after a signal/contrast
+        # change at an unchanged position).
+        if np.array_equal(indices, self.current_indices) and not force:
+            return
+        self.current_indices = indices
+
+        # Per-frame trace — gated behind SPYDE_NAV_TIMING (fires on every move,
+        # floods the IPC log at DEBUG). After the dup short-circuit, so each line
+        # is a genuine new position.
+        if _NAV_TIMING:
+            logger.debug("[NAV-IDX] indices=%s force=%s selector=%s",
+                         np.asarray(indices).tolist(), force, type(self).__name__)
 
         for child, fn in self.children.items():
-            # A newer fire started while we were working — its future-cancel has
-            # already superseded ours; drop this stale body.
-            if my_gen != self._update_gen:
-                return
-            # Let the child fn (update_from_navigation_selection) re-check, INSIDE
-            # its cache lock, that we are still the latest before it cancels
-            # surrounding blocks + submits — otherwise a stale body's
-            # cancel_surrounding() races and kills the LATEST position's future
-            # ("get_inds cancelled: lost dependencies"). See test_navigator_race.
-            self._fn_gen = my_gen
             try:
                 new_data = fn(self, child, indices)
-                # None == the body detected it was superseded inside fn and
-                # skipped the cache touch; do NOT clobber current_data (that would
-                # drop the latest future's pending result).
                 if new_data is None:
-                    return
+                    continue
                 child.update_data(new_data)
                 if update_contrast:
                     child.needs_auto_level = True
+                logger.debug(f"Delayed update Data, child={child}, position = {self.current_indices}")
+                gate = (child.multiplot_manager is not None
+                        and child.plot_window in child.multiplot_manager.navigation_selectors)
+                logger.debug(f"Delayed update Data, gate={gate}, multiplot_manager={child.multiplot_manager},"
+                             f" navigation_selectors={child.multiplot_manager.navigation_selectors if child.multiplot_manager else None}, "
+                             f"plot_window={child.plot_window}")
                 if (child.multiplot_manager is not None
                         and child.plot_window in child.multiplot_manager.navigation_selectors):
                     for child_sel in child.multiplot_manager.navigation_selectors[child.plot_window]:
+                        logger.debug(f"Delayed update Data, selector={child_sel}, position = {self.current_indices}")
                         child_sel.delayed_update_data()
             except Exception as e:
                 logger.debug("selector update failed: %s", e)
 
-        # Commit only if still latest — otherwise the newer fire owns the state.
-        with self._gen_lock:
-            if my_gen != self._update_gen:
-                return
-            for hook in self.index_hooks:
-                try:
-                    hook(indices)
-                except Exception as e:
-                    logger.debug("index hook failed: %s", e)
-            self.current_indices = indices
+        # Fire index hooks (overlays) with the committed position.
+        for hook in self.index_hooks:
+            try:
+                hook(indices)
+            except Exception as e:
+                logger.debug("index hook failed: %s", e)
 
     # ── Visibility ─────────────────────────────────────────────────────────────
 
@@ -334,9 +433,15 @@ class BaseSelector:
                 logger.debug("showing selector widget failed: %s", e)
 
     def close(self) -> None:
-        if self._pending_timer is not None:
-            self._pending_timer.cancel()
         self.hide()
+        # Stop a pending settle re-fire so it can't submit against a closed plot.
+        t = getattr(self, "_settle_timer", None)
+        if t is not None:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+            self._settle_timer = None
         # A bare widget.hide() only emits a targeted event that a later full
         # repaint overwrites, so the ROI lingers. Re-push the panel so the
         # hidden selector actually disappears (e.g. when its output window is

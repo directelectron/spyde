@@ -6,24 +6,46 @@ import { contextBridge, ipcRenderer } from 'electron'
 contextBridge.exposeInMainWorld('electron', {
   // ── Python → Renderer ─────────────────────────────────────────────────────
 
-  /** Listen for any PLOTAPP: message from Python (persistent listener). */
-  onMessage: (cb: (msg: Record<string, unknown>) => void) =>
-    ipcRenderer.on('spyde:message', (_, msg) => cb(msg)),
+  // Each on* returns an UNSUBSCRIBE function. The renderer registers these in a
+  // useEffect; without cleanup, React StrictMode's double-invoke (and any HMR /
+  // re-mount) would stack duplicate ipcRenderer listeners, so every message gets
+  // dispatched 2×, 3×, … and the app's logs/updates appear doubled and degrade
+  // over time. Returning a disposer lets the effect remove the exact listener.
 
-  /** Listen for raw stdout/stderr lines from Python. */
-  onStream: (cb: (text: string, kind: 'stdout' | 'stderr') => void) =>
-    ipcRenderer.on('spyde:stream', (_, text, kind) => cb(text, kind)),
+  /** Listen for any PLOTAPP: message from Python. Returns an unsubscribe fn. */
+  onMessage: (cb: (msg: Record<string, unknown>) => void) => {
+    const h = (_: unknown, msg: Record<string, unknown>) => cb(msg)
+    ipcRenderer.on('spyde:message', h)
+    return () => ipcRenderer.removeListener('spyde:message', h)
+  },
 
-  /** Window tile command from menu. */
-  onTile: (cb: () => void) => ipcRenderer.on('spyde:tile', () => cb()),
+  /** Listen for raw stdout/stderr lines from Python. Returns an unsubscribe fn. */
+  onStream: (cb: (text: string, kind: 'stdout' | 'stderr') => void) => {
+    const h = (_: unknown, text: string, kind: 'stdout' | 'stderr') => cb(text, kind)
+    ipcRenderer.on('spyde:stream', h)
+    return () => ipcRenderer.removeListener('spyde:stream', h)
+  },
 
-  /** Open Dask dashboard command from menu. */
-  onOpenDashboard: (cb: () => void) =>
-    ipcRenderer.on('spyde:open_dashboard', () => cb()),
+  /** Window tile command from menu. Returns an unsubscribe fn. */
+  onTile: (cb: () => void) => {
+    const h = () => cb()
+    ipcRenderer.on('spyde:tile', h)
+    return () => ipcRenderer.removeListener('spyde:tile', h)
+  },
 
-  /** Launch a guided tour by id (from the Help menu). */
-  onStartGuide: (cb: (id: string) => void) =>
-    ipcRenderer.on('spyde:start_guide', (_, id: string) => cb(id)),
+  /** Open Dask dashboard command from menu. Returns an unsubscribe fn. */
+  onOpenDashboard: (cb: () => void) => {
+    const h = () => cb()
+    ipcRenderer.on('spyde:open_dashboard', h)
+    return () => ipcRenderer.removeListener('spyde:open_dashboard', h)
+  },
+
+  /** Launch a guided tour by id (from the Help menu). Returns an unsubscribe fn. */
+  onStartGuide: (cb: (id: string) => void) => {
+    const h = (_: unknown, id: string) => cb(id)
+    ipcRenderer.on('spyde:start_guide', h)
+    return () => ipcRenderer.removeListener('spyde:start_guide', h)
+  },
 
   // ── Renderer → Python ─────────────────────────────────────────────────────
 

@@ -15,10 +15,11 @@ export function App() {
 
   // The Help menu (main process) can launch a guide by id via spyde:start-guide.
   useEffect(() => {
-    window.electron?.onStartGuide?.((id: string) => {
+    const dispose = window.electron?.onStartGuide?.((id: string) => {
       const g = getGuide(id)
       if (g) setTour(g)
     })
+    return () => dispose?.()
   }, [])
 
   return (

@@ -100,8 +100,20 @@ async def _main() -> None:
 
     # Stream logging records to the Electron app-log panel (level switchable at
     # runtime from the frontend). Installed after stdout is the protocol channel.
+    # SPYDE_LOG_LEVEL overrides the initial level (used by E2E tests / debugging).
     from spyde.backend.log_stream import install as _install_log_stream
-    _install_log_stream(level="INFO")
+    _init_level = os.environ.get("SPYDE_LOG_LEVEL", "INFO")
+    _install_log_stream(level=_init_level)
+
+    # When a level is forced via env (tests), also tee logs to STDERR so a
+    # parent process (Playwright) can capture the [REDRAW]/NAV-DEBUG trace —
+    # stderr is NOT the PLOTAPP protocol channel (stdout is). No-op normally.
+    if "SPYDE_LOG_LEVEL" in os.environ:
+        _h = logging.StreamHandler(sys.stderr)
+        _h.setLevel(getattr(logging, _init_level.upper(), logging.INFO))
+        _h.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
+        logging.getLogger().addHandler(_h)
+        logging.getLogger().setLevel(getattr(logging, _init_level.upper(), logging.INFO))
 
     cpu_count = os.cpu_count() or 4
     if cpu_count < 4:
@@ -131,6 +143,8 @@ async def _main() -> None:
     emit({"type": "ready"})
 
     loop = asyncio.get_event_loop()
+    # Let the plot poller marshal result-applies onto this (main) thread.
+    session.set_main_loop(loop)
     async for msg in read_messages(loop):
         msg_type = msg.get("type")
         try:

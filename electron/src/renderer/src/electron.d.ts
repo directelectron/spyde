@@ -2,11 +2,11 @@
 declare global {
   interface Window {
     electron: {
-      onMessage: (cb: (msg: Record<string, unknown>) => void) => void
-      onStream: (cb: (text: string, kind: 'stdout' | 'stderr') => void) => void
-      onTile: (cb: () => void) => void
-      onOpenDashboard: (cb: () => void) => void
-      onStartGuide: (cb: (id: string) => void) => void
+      onMessage: (cb: (msg: Record<string, unknown>) => void) => () => void
+      onStream: (cb: (text: string, kind: 'stdout' | 'stderr') => void) => () => void
+      onTile: (cb: () => void) => () => void
+      onOpenDashboard: (cb: () => void) => () => void
+      onStartGuide: (cb: (id: string) => void) => () => void
       action: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
       openFile: () => Promise<void>
       saveDialog: () => Promise<void>

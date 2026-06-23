@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import threading
+import time
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -21,6 +22,11 @@ from spyde.dask_manager import DaskManager
 from spyde.workers.plot_update_worker import PlotUpdateWorker
 
 log = logging.getLogger(__name__)
+
+# Per-frame navigator/redraw trace logs ([REDRAW2] APPLY/DROP) are gated behind
+# this — they fire on every painted frame and flood the IPC log at DEBUG. Match
+# the same env switch used in base_selector / update_functions / plot_update_worker.
+_NAV_TIMING = os.environ.get("SPYDE_NAV_TIMING") == "1"
 
 if TYPE_CHECKING:
     from spyde.signal_tree import BaseSignalTree
@@ -120,10 +126,15 @@ class Session:
         self.dask_manager.ready.connect(self._on_dask_ready)
         self.dask_manager.error.connect(self._on_dask_error)
 
-        # Plot update poller
+        # Plot update poller. `dispatch` marshals the result-APPLY onto the main
+        # asyncio thread (set later via set_main_loop, once the loop exists) — the
+        # poll thread only detects done futures + reads shm; plot.update()/push
+        # runs on the main thread, like the Qt app's queued plot_ready slot.
+        self._main_loop = None
         self._plot_worker = PlotUpdateWorker(
             get_plots_callable=lambda: list(self._plots),
             interval_ms=5,
+            dispatch=self._dispatch_to_main,
         )
         self._plot_worker.plot_ready.connect(self._on_plot_ready)
         self._plot_worker.signal_ready.connect(self._on_signal_ready)
@@ -140,6 +151,25 @@ class Session:
 
     def start_dask(self) -> None:
         self.dask_manager.start()
+
+    def set_main_loop(self, loop) -> None:
+        """Register the main asyncio loop so the plot poller can marshal the
+        result-apply onto this (main) thread. Call from app._main once the loop
+        is running."""
+        self._main_loop = loop
+
+    def _dispatch_to_main(self, fn) -> None:
+        """Schedule fn() on the main asyncio thread (the plot poller calls this to
+        apply a finished future's result). Falls back to running inline if no loop
+        is registered yet (early startup / tests)."""
+        loop = self._main_loop
+        if loop is not None:
+            try:
+                loop.call_soon_threadsafe(fn)
+                return
+            except Exception as e:
+                log.debug("dispatch_to_main failed, running inline: %s", e)
+        fn()
 
     def _on_dask_ready(self) -> None:
         emit_status("Dask cluster ready")
@@ -854,18 +884,27 @@ class Session:
     # ── Plot update callbacks ──────────────────────────────────────────────────
 
     def _on_plot_ready(self, plot, result, future) -> None:
-        # A superseded future (newer navigator position already in flight) is no
-        # longer the one the plot wants — drop its result silently. This also
-        # covers the cancelled/torn shared-memory read, whose result is a
-        # ValueError; it's expected under the latest-wins model, not an error.
+        # Runs on the MAIN thread (marshaled from the poll worker via
+        # _dispatch_to_main). A superseded future (newer navigator position already
+        # in flight) is no longer the one the plot wants — drop its result silently.
+        # This also covers a torn shared-memory read, whose result is a ValueError;
+        # it's expected under the latest-wins model, not an error.
         if plot.current_data is not future:
+            if _NAV_TIMING:
+                log.debug("[REDRAW2] DROP win=%s (current_data superseded "
+                          "future %s)", getattr(plot, "window_id", None),
+                          getattr(future, "key", None))
             return
         if isinstance(result, Exception):
-            log.debug("Plot update skipped (stale/torn read): %s", result)
+            log.debug("[REDRAW2] DROP win=%s (exception/torn read): %s",
+                      getattr(plot, "window_id", None), result)
             return
         try:
             plot.current_data = result
             plot.update()
+            if _NAV_TIMING:
+                log.debug("[REDRAW2] APPLY win=%s future=%s",
+                          getattr(plot, "window_id", None), getattr(future, "key", None))
         except Exception as e:
             log.warning("Failed to update plot: %s", e)
 
@@ -877,7 +916,14 @@ class Session:
             signal.data = result
             signal._lazy = False
             signal._assign_subclass()
-            plot.parent_selector.delayed_update_data(update_contrast=True, force=True)
+            sel = getattr(plot, "parent_selector", None)
+            if sel is not None:
+                sel.delayed_update_data(update_contrast=True, force=True)
+            else:
+                # No selector (e.g. a navigatorless plot, or selector init failed)
+                # — just repaint with the freshly computed data.
+                plot.needs_auto_level = True
+                plot.update()
         except Exception as e:
             log.warning("Failed to update signal: %s", e)
 
@@ -931,6 +977,94 @@ class Session:
             ax.offset = -(ax.size / 2.0) * 0.1
             ax.units = "1/nm"
         self._add_signal(s, source_path="test_data_lazy")
+
+    def _load_test_data_lazy_chunked(self) -> None:
+        """Test-only: LAZY 4D-STEM with MULTIPLE navigation chunks, so a crosshair
+        drag crosses chunk boundaries and exercises the real distributed
+        future→shm→PlotUpdateWorker→paint path (the in-chunk synthetic 8×8 is one
+        chunk and never round-trips a worker). Each nav position has a single
+        bright pixel at a position that varies with (iy, ix), so a frame change is
+        unambiguous. nav=(24,24), signal=(32,32), nav chunks of 8 → a 3×3 chunk
+        grid; signal axes span the full frame (storage-aligned)."""
+        import numpy as np
+        import dask.array as da
+        ny, nx, ky, kx = 24, 24, 32, 32
+        data = np.zeros((ny, nx, ky, kx), dtype=np.float32)
+        for i in range(ny):
+            for j in range(nx):
+                data[i, j, (i * 1) % ky, (j * 1) % kx] = 255.0
+                data[i, j, 16, 16] = 60.0  # faint common centre
+        dask_data = da.from_array(data, chunks=(8, 8, ky, kx))  # 3×3 nav chunk grid
+        s = hs.signals.Signal2D(dask_data).as_lazy()
+        try:
+            s.set_signal_type("electron_diffraction")
+        except Exception as e:
+            log.debug("set_signal_type on chunked lazy data failed: %s", e)
+        self._add_signal(s, source_path="test_data_lazy_chunked")
+
+    def _test_nav_drag(self, targets: list) -> None:
+        """Test-only: drive the navigator crosshair through a list of (x, y) nav
+        cells server-side and report, per move, whether the SIGNAL plot's painted
+        data actually changed. Bypasses the iframe widget harness so a Playwright
+        test can deterministically exercise the distributed future→shm→worker→
+        paint path. Emits {"type":"nav_drag_result", ...}.
+
+        For each target: set the crosshair widget position, fire the selector,
+        then poll the signal plot's current_data (the painted numpy frame) until
+        it changes or a timeout. Records CHANGED / NO-CHANGE + the DP's argmax so
+        we can see WHICH frame painted.
+        """
+        import time as _time
+        try:
+            tree = self.signal_trees[-1] if self.signal_trees else None
+            if tree is None or tree.navigator_plot_manager is None:
+                emit({"type": "nav_drag_result", "error": "no navigator tree"})
+                return
+            mgr = tree.navigator_plot_manager
+            pw = next(iter(mgr.navigation_selectors.keys()))
+            sel = mgr.navigation_selectors[pw][0]
+            cross = getattr(sel, "_crosshair_selector", sel)
+            child = next(iter(sel.children.keys()))
+
+            def _frame_sig():
+                d = getattr(child, "current_data", None)
+                if isinstance(d, np.ndarray) and d.size:
+                    return (int(d.argmax()), float(d.sum()))
+                return None
+
+            def _cd_kind():
+                d = getattr(child, "current_data", None)
+                return type(d).__name__
+
+            results = []
+            prev = _frame_sig()
+            for (x, y) in targets:
+                try:
+                    cross._widget.cx = float(x)
+                    cross._widget.cy = float(y)
+                except Exception as e:
+                    results.append({"x": x, "y": y, "changed": False, "err": str(e)})
+                    continue
+                sel.delayed_update_data(force=True)
+                cur = prev
+                t_end = _time.monotonic() + 3.0
+                while _time.monotonic() < t_end:
+                    cur = _frame_sig()
+                    if cur is not None and cur != prev:
+                        break
+                    _time.sleep(0.03)
+                changed = cur is not None and cur != prev
+                results.append({"x": x, "y": y, "changed": bool(changed),
+                                "sig": cur, "prev": prev, "cd_kind": _cd_kind()})
+                prev = cur
+            n_changed = sum(1 for r in results if r.get("changed"))
+            emit({"type": "nav_drag_result", "total": len(targets),
+                  "changed": n_changed, "results": results})
+            log.info("[REDRAW] test_nav_drag: %d/%d moves changed the DP",
+                     n_changed, len(targets))
+        except Exception as e:
+            log.exception("test_nav_drag failed")
+            emit({"type": "nav_drag_result", "error": str(e)})
 
     def _load_test_vectors(self) -> None:
         """Test-only: load a small calibrated 4D-STEM stack (two disks per
@@ -1027,6 +1161,16 @@ class Session:
             self._load_test_data()
         elif action == "load_test_data_lazy":
             self._load_test_data_lazy()
+        elif action == "load_test_data_lazy_chunked":
+            self._load_test_data_lazy_chunked()
+        elif action == "test_nav_drag":
+            # Run on a BACKGROUND thread: the drag loop sleeps/polls, and if it ran
+            # on the main asyncio thread it would block loop.call_soon_threadsafe —
+            # i.e. the very main-thread applies it's trying to observe.
+            threading.Thread(
+                target=self._test_nav_drag, args=(payload.get("targets") or [],),
+                daemon=True, name="test-nav-drag",
+            ).start()
         elif action == "load_test_vectors":
             self._load_test_vectors()
         elif action in _STAGED_HANDLERS:

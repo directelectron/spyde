@@ -149,9 +149,18 @@ class Plot:
         self.plot_state: "PlotState | None" = None
         self.plot_states: Dict = {}
 
-        # Shared memory for large arrays (allocated lazily)
+        # Shared memory for the navigator→DP fast path (allocated lazily). ONE
+        # buffer per plot: the navigator update submits a write_shared_array future
+        # that writes the latest frame here, and the poll worker reads it locally
+        # when the future completes (bypassing the slow TCP transfer of the frame).
+        # Overlapping writes during a fast drag are fine — only the LATEST future's
+        # result is applied (the staleness guard in _on_plot_ready), so a frame
+        # clobbered by a newer write was going to be dropped anyway.
         self._shared_memory: SharedMemory | None = None
-        self._pending_shm_future = None
+        # write_future.key -> get_inds Future, held alive until the write lands so
+        # client-side GC doesn't release the get_inds dep and cancel the chain
+        # (see update_from_navigation_selection).
+        self._inflight_getinds: Dict = {}
 
         # anyplotlib figure + plot objects
         self._fig: apl.Figure | None = None
@@ -271,6 +280,10 @@ class Plot:
             return
         if isinstance(data, np.ndarray):
             self._set_array(data)
+        elif logger.isEnabledFor(logging.DEBUG):
+            logger.debug("[REDRAW] update() NO-OP: current_data is %s, not ndarray "
+                         "(win=%s) — nothing painted", type(data).__name__,
+                         self.window_id)
 
     def update_data(self, data_or_future) -> None:
         """Set current_data (may be ndarray or dask Future)."""
@@ -383,8 +396,8 @@ class Plot:
         if (getattr(self, "_fv_transform_active", False)
                 and not getattr(self, "_fv_paint_token", False)
                 and dims == 2 and self._is_navigated_frame()):
-            logger.debug("[plot-paint] SIG suppressed raw frame (transform-view "
-                         "lock active) shape=%s", tuple(data.shape))
+            logger.debug("[REDRAW] _set_array DROPPED (transform-view lock) win=%s "
+                         "shape=%s", self.window_id, tuple(data.shape))
             return
 
         # Hold the previous frame instead of flashing a degenerate one.
@@ -405,8 +418,9 @@ class Plot:
                 # placeholder (values 0/1) — neither is a real pattern.
                 if not np.any(data) or (
                         data.dtype == np.int8 and float(data.max()) <= 1):
-                    logger.debug("[plot-paint] SIG held degenerate frame (zeros/"
-                                 "checkerboard) — no flash")
+                    logger.debug("[REDRAW] _set_array DROPPED (degenerate zeros/"
+                                 "checkerboard) win=%s dtype=%s", self.window_id,
+                                 data.dtype)
                     return
         except Exception as e:
             logger.debug("zero-frame hold check failed: %s", e)
@@ -475,12 +489,17 @@ class Plot:
             if logger.isEnabledFor(logging.DEBUG):
                 try:
                     a = np.asarray(data, dtype=np.float64)
+                    # Content fingerprint: if this CHANGES per frame, distinct
+                    # images ARE being pushed to set_data (so a "frozen" display is
+                    # downstream — the iframe/render). If it REPEATS while the
+                    # crosshair moves, the SAME frame is being re-applied (the data
+                    # path is delivering stale frames).
+                    _h = int(a.tobytes().__hash__() & 0xFFFFFF) if a.size else 0
                     logger.debug(
-                        "[plot-paint] %s shape=%s mean=%.3g std=%.3g min=%.3g "
-                        "max=%.3g clim=(%.3g,%.3g) navigated=%s",
+                        "[plot-paint] %s shape=%s hash=%06x mean=%.3g std=%.3g "
+                        "max=%.3g navigated=%s",
                         "NAV" if self.is_navigator else "SIG", tuple(a.shape),
-                        a.mean(), a.std(), a.min(), a.max(), vmin, vmax,
-                        self._is_navigated_frame())
+                        _h, a.mean(), a.std(), a.max(), self._is_navigated_frame())
                 except Exception:
                     pass
         elif dims == 1 and self._plot1d is not None:
@@ -672,6 +691,17 @@ class Plot:
                 create=True,
                 size=self._buffer_nbytes(),
             )
+        # The frame can grow (signal-type / shape change) after the buffer was
+        # first sized — grow it so write_shared_array doesn't overflow.
+        nbytes = self._buffer_nbytes()
+        if self._shared_memory.size < nbytes:
+            try:
+                self._shared_memory.close(); self._shared_memory.unlink()
+            except Exception as e:
+                logger.debug("growing plot shm buffer failed to free old: %s", e)
+            self._shared_memory = SharedMemory(
+                name=f"plot_buffer{id(self)}", create=True, size=nbytes,
+            )
         return self._shared_memory
 
     # ── Toolbar / selector helpers ────────────────────────────────────────────
@@ -724,6 +754,11 @@ class Plot:
             logger.debug("stopping progressive stream on plot close failed: %s", e)
         if self.session is not None:
             self.session.unregister_plot(self)
+        # Drop any held get_inds futures (let the scheduler release them).
+        try:
+            self._inflight_getinds.clear()
+        except Exception:
+            pass
         if self._shared_memory is not None:
             try:
                 self._shared_memory.close()

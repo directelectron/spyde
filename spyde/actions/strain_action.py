@@ -57,7 +57,9 @@ class StrainController:
             ry, rx = self.ref_yx
             self._crosshair = self.p.add_crosshair_widget(cx=float(rx), cy=float(ry),
                                                           color="#00e5ff")
-            self._crosshair.add_event_handler(self._on_pick, "pointer_up")
+            from spyde.drawing.selectors.base_selector import event_handler_fn
+            self._pick_cb = event_handler_fn(self._on_pick)
+            self._crosshair.add_event_handler(self._pick_cb, "pointer_up")
         except Exception as e:
             log.debug("strain crosshair attach failed: %s", e)
         return self
