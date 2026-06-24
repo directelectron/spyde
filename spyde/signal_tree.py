@@ -379,30 +379,28 @@ class BaseSignalTree:
         return [signal]
 
     def _compute_navigator(self, nav_dask: da.Array, heavy_workers):
-        """Kick off computing the (small) navigator image — NEVER blocking.
+        """Stash the navigator sum for the progressive compute — NEVER blocking.
 
         The display must not wait on the navigator compute (tree ``__init__``
-        runs on the load thread and emits the windows right after this). So we
-        always stash ``nav_dask`` and return immediately:
+        runs on the load thread and emits the windows right after this), so we
+        only stash ``nav_dask`` and return a NaN placeholder. The single
+        authoritative compute is owned by ``_start_progressive_nav_compute``
+        (per-chunk progressive, for BOTH the distributed and threaded paths).
 
-        * with a distributed client → submit a Future (progressive per-chunk
-          compute replaces it for the live navigator-on-load);
-        * without a client (cluster still starting, or headless) → return a NaN
-          placeholder; ``_start_progressive_nav_compute`` computes it on a
-          BACKGROUND thread (threaded scheduler) so init isn't blocked.
+        Do NOT submit a monolithic ``client.compute(nav_dask)`` here: it would
+        start the full navigator sum on the cluster, then
+        ``_start_progressive_nav_compute`` immediately cancels it and resubmits
+        the same sum per-chunk — and the cancel races the already-running
+        compute, so the sum runs TWICE on the cluster (visible as a duplicate
+        task graph on the Dask dashboard). Deferring to the progressive path is
+        the one-and-only compute.
         """
         self._pending_nav_dask = nav_dask
-        if self.client is not None:
-            logger.debug(
-                "NAV-DEBUG _compute_navigator: DISTRIBUTED path (client=%s) "
-                "nav_dask.shape=%s chunks=%s heavy_workers=%s",
-                getattr(self.client, "scheduler", None) and self.client.scheduler.address,
-                tuple(nav_dask.shape), nav_dask.chunks, heavy_workers,
-            )
-            return self.client.compute(nav_dask, priority=-10, workers=heavy_workers)
         logger.debug(
-            "NAV-DEBUG _compute_navigator: NO CLIENT -> threaded background path "
-            "will run; nav_dask.shape=%s chunks=%s", tuple(nav_dask.shape), nav_dask.chunks,
+            "NAV-DEBUG _compute_navigator: stashed nav sum (%s); progressive "
+            "compute owns it. shape=%s chunks=%s heavy_workers=%s",
+            "DISTRIBUTED" if self.client is not None else "THREADED",
+            tuple(nav_dask.shape), nav_dask.chunks, heavy_workers,
         )
         return np.full(tuple(nav_dask.shape), np.nan, dtype=np.float32)
 

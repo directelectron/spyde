@@ -11,3 +11,9 @@ signals:
     dtype: real
     lazy: True
     module: spyde.signals.diffraction_vectors_image
+  DenseDiffractionVectors:
+    signal_type: spyde_dense_diffraction_vectors
+    signal_dimension: 1
+    dtype: real
+    lazy: False
+    module: spyde.signals.dense_diffraction_vectors

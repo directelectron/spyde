@@ -13,6 +13,12 @@ COL_TIME      = 4   # -1.0 for 4D datasets (no time axis)
 COL_INTENSITY = 5
 N_COLS        = 6
 
+# Canonical, positional names for the flat_buffer columns — the single source of
+# truth for "what is in column k". Written into a saved file's metadata
+# (like pyxem's DiffractionVectors2D `VectorMetadata.column_names`) so an external
+# reader can interpret the dense (N, 6) buffer without SpyDE on the path.
+COLUMN_NAMES = ("nav_x", "nav_y", "kx", "ky", "time", "intensity")
+
 
 def _build_nav_offsets(
     flat_buffer: np.ndarray,
@@ -247,6 +253,11 @@ class SpyDEDiffractionVectors:
     # Legacy single-level offsets for 4D backward compat (None for 5D+)
     offsets: Optional[np.ndarray] = field(default=None)
     params:  dict = field(default_factory=dict)
+    # Navigation-axis (scan-step) calibration, outermost-first. Duck-typed
+    # axis records (e.g. _AxisLite). Optional: the Find-Vectors path copies these
+    # from the source signal onto the result tree, but standalone save/load needs
+    # them carried with the vectors so the reloaded scan grid is calibrated.
+    nav_axes: object = field(default_factory=list)
     _dense_cache: Optional[np.ndarray] = field(default=None, repr=False)
     _kdtree:      Optional[object]     = field(default=None, repr=False)
     _gpu_buffer:  Optional[object]     = field(default=None, repr=False)  # torch.Tensor on CUDA

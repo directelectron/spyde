@@ -3303,6 +3303,17 @@ def _do_compute_vectors(
               "(%.2f per pattern)", N_total, int(np.prod(nav_shape_full)),
               N_total / max(1, int(np.prod(nav_shape_full))))
 
+    # Snapshot the scan-step (navigation) calibration as lightweight axis records
+    # so a saved/loaded vectors file reconstructs a calibrated scan grid without
+    # the source dataset (the live Find-Vectors path still copies these from the
+    # source onto the result tree; this is for the standalone round-trip).
+    from spyde.signals.diffraction_vectors import _AxisLite
+    nav_ax = [
+        _AxisLite(scale=float(ax.scale), offset=float(ax.offset),
+                  size=int(ax.size), units=str(getattr(ax, "units", "") or ""),
+                  name=str(getattr(ax, "name", "") or ""))
+        for ax in signal.axes_manager.navigation_axes
+    ]
     return SpyDEDiffractionVectors.from_arrays(
         flat_buffer=flat_buffer,
         full_nav_shape=nav_shape_full,
@@ -3311,6 +3322,7 @@ def _do_compute_vectors(
         kernel_radius_px=float(kernel_r),
         kernel_radius_data=float(kernel_r) * sig_ax[0].scale,
         params=dict(params),
+        nav_axes=nav_ax,
     )
 
 

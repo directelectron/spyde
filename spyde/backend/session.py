@@ -251,6 +251,27 @@ class Session:
             name=f"load-{name}",
         ).start()
 
+    def _open_if_dense_vectors(self, sig, path: str) -> bool:
+        """If *sig* is a saved dense-vectors carrier, reconstruct the vectors and
+        open a Find-Vectors result tree. Returns True if it handled the file."""
+        try:
+            from spyde.signals.dense_diffraction_vectors import (
+                is_dense_vectors_signal, from_dense_signal,
+            )
+            if not is_dense_vectors_signal(sig):
+                return False
+            vecs = from_dense_signal(sig)
+            from spyde.actions.find_vectors_action import build_vectors_result_tree
+            title = sig.metadata.get_item("General.title", default=None) \
+                or os.path.splitext(os.path.basename(path))[0]
+            build_vectors_result_tree(self, vecs, title=title)
+            emit_status(f"Loaded {int(len(vecs.flat_buffer))} diffraction vectors")
+            return True
+        except Exception as e:
+            emit_error(f"Failed to load diffraction vectors: {e}")
+            log.exception("dense-vectors load failed for %s", path)
+            return True   # we recognised it; don't fall through to image open
+
     @staticmethod
     def _signal_spanning_chunks(sig, nav_chunk: int = 32):
         """Chunks for a lazy 2-D-signal dataset where each chunk holds WHOLE
@@ -306,6 +327,14 @@ class Session:
             # File read done — clear the busy flag (a nav-shape prompt or the
             # opened windows take over from here).
             emit({"type": "loading", "busy": False, "text": ""})
+            # A saved diffraction-vectors result (dense flat-buffer carrier, see
+            # spyde.signals.dense_diffraction_vectors) reopens as a Find-Vectors
+            # result tree — reconstruct the vectors and rebuild the rendered-disk
+            # window with the vector toolbar actions, NOT as raw image data.
+            if len(signal) == 1 and self._open_if_dense_vectors(signal[0], path):
+                self._add_recent(path)
+                emit({"type": "recent_files", "paths": self._recent_files[:20]})
+                return
             # A single navigated signal (e.g. a 4D-STEM MRC scan) → let the user
             # confirm/override the navigation shape and set the real step size
             # (calibration) before opening. But a SELF-DESCRIBING HyperSpy format
@@ -1668,6 +1697,16 @@ class Session:
                     is not None]
         return with_sig[0] if len(with_sig) == 1 else None
 
+    @staticmethod
+    def _vectors_for_plot(plot):
+        """The :class:`SpyDEDiffractionVectors` attached to *plot*'s tree, or None.
+
+        A Find-Vectors result tree carries ``tree.diffraction_vectors``; this is
+        how Save knows to write the dense vectors carrier instead of the rendered
+        image, and lets any vector-aware code reach the result from a plot."""
+        tree = getattr(plot, "signal_tree", None)
+        return getattr(tree, "diffraction_vectors", None) if tree is not None else None
+
     def _save_signal(self, path: str | None, plot) -> None:
         if path is None:
             emit_error("Save: no path given")
@@ -1680,6 +1719,16 @@ class Session:
         if signal is None:
             emit_error("Save: no signal in the active window")
             return
+        # A Find-Vectors result window's signal is the lazy RENDERED-disk image
+        # (to_rendered_dask). Saving THAT would compute + serialise every rendered
+        # frame (huge, slow) and lose the actual vectors. Instead save the dense
+        # vectors carrier (flat buffer + calibration) — tiny, instant, lossless,
+        # and reloads back into a vectors result tree. Detect via the tree's
+        # attached `diffraction_vectors`.
+        vecs = self._vectors_for_plot(plot)
+        if vecs is not None:
+            from spyde.signals.dense_diffraction_vectors import to_dense_signal
+            signal = to_dense_signal(vecs)
         # Default to the .zspy Zarr folder store: if the user typed a name with no
         # extension (or an unknown one), append .zspy rather than letting hyperspy
         # guess or error. A writable extension the user explicitly chose is kept.

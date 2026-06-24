@@ -219,14 +219,89 @@ def _overlay_on_source(src_tree, dp_plot, vecs) -> None:
         log.debug("vector overlay attach failed: %s", e)
 
 
+def _apply_axes_from_vecs(new_sig, nav_sig, vecs) -> None:
+    """Calibrate the result signal's nav + signal axes from the vectors' stored
+    axis records (used when there's no source signal — i.e. loading a saved
+    vectors file)."""
+    nav_axes = list(getattr(vecs, "nav_axes", []) or [])
+    sig_axes = list(getattr(vecs, "sig_axes", []) or [])
+
+    def _set(axes, recs):
+        for ax, rec in zip(axes, recs):
+            try:
+                ax.scale = float(rec.scale)
+                ax.offset = float(rec.offset)
+                ax.units = str(getattr(rec, "units", "") or "")
+                ax.name = str(getattr(rec, "name", "") or "")
+            except Exception as e:
+                log.debug("applying axis calibration failed: %s", e)
+
+    # new_sig nav axes are in axes-manager order (matches navigation_axes order
+    # used to build nav_axes); signal axes likewise.
+    _set(new_sig.axes_manager.navigation_axes, nav_axes)
+    _set(new_sig.axes_manager.signal_axes, sig_axes)
+    _set(nav_sig.axes_manager.navigation_axes, nav_axes)
+
+
+def build_vectors_result_tree(session, vecs, title: str = "Diffraction Vectors"):
+    """Build a Find-Vectors *result tree* from a reconstructed
+    :class:`SpyDEDiffractionVectors`, with no source dataset.
+
+    This is the load-side twin of the tree the toolbar Find-Vectors action builds:
+    a lazy zero-placeholder image (signal_type ``spyde_diffraction_vectors_image``)
+    + a count-map navigator override, with ``tree.diffraction_vectors`` attached
+    and the render-on-demand display wired (``vecs.render_frame`` per nav move).
+    Used by Save→Load round-trip so a saved ``.zspy`` vectors file reopens exactly
+    like a fresh Find-Vectors result (vector toolbar actions unlocked, calibrated
+    scan grid, rendered disks).
+    """
+    import dask.array as da
+    from spyde.drawing.selectors import CrosshairSelector
+
+    full_nav_shape = tuple(int(s) for s in vecs.full_nav_shape)
+    H = int(vecs.sig_axes[1].size)
+    W = int(vecs.sig_axes[0].size)
+    sig_hw = (H, W)
+    data_shape = full_nav_shape + sig_hw
+    nav_chunks = tuple(min(32, int(s)) for s in full_nav_shape)
+    placeholder = da.zeros(
+        data_shape, chunks=nav_chunks + sig_hw, dtype=np.float32,
+    )
+    new_sig = hs.signals.Signal2D(placeholder).as_lazy()
+    try:
+        new_sig.set_signal_type("spyde_diffraction_vectors_image")
+    except Exception as e:
+        log.debug("set_signal_type(diffraction_vectors_image) failed: %s", e)
+    new_sig.metadata.General.title = title
+
+    nav_sig = hs.signals.BaseSignal(
+        np.zeros(full_nav_shape, dtype=np.float32)).T
+    nav_sig.metadata.General.title = "Vector count map"
+
+    _apply_axes_from_vecs(new_sig, nav_sig, vecs)
+
+    tree = session._add_signal(
+        new_sig, navigator_override=nav_sig, selector_type=CrosshairSelector,
+    )
+    _finalize(tree, vecs)
+    return tree
+
+
 def _finalize(tree, vecs) -> None:
-    """Swap the placeholder for vectors-rendered frames, attach the vectors,
-    fill the count-map navigator, and unlock the vector toolbar actions."""
-    tree.root.data = vecs.to_rendered_dask()
-    # The signal plot's CachedDaskArray captured the OLD placeholder array when
-    # the window first rendered (zeros). Drop it so navigation renders the new
-    # disk frames — otherwise the result window stays black (Qt parity: the
-    # computed-vectors window shows each position's vectors as flat disks).
+    """Attach the vectors, fill the count-map navigator, wire the render-on-demand
+    display, and unlock the vector toolbar actions.
+
+    The result window's frames are produced on every navigator move by
+    ``vecs.render_frame`` (an O(1) CSR slice; see ``_install_render_display``) —
+    NOT by reading the signal's lazy data. So the root keeps its cheap zero
+    placeholder array (right shape/axes for the window) and we never build or
+    store the lazy ``to_rendered_dask`` graph. That graph was vestigial here (the
+    render-display path overrides the navigator slice function) and its async
+    Future→shm delivery could leave frames stale; dropping it removes that lag and
+    is what makes Save tiny (we serialise the vectors, not rendered frames)."""
+    # The signal plot's CachedDaskArray captured the placeholder array when the
+    # window first rendered (zeros). Drop it so the render-display re-slice paints
+    # the disk frames instead of the cached zeros.
     try:
         tree.root.cached_dask_array = None
         tree.root._clear_cache_dask_data()
