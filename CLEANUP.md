@@ -294,7 +294,7 @@ is a **pyqtgraph LineROI widget** that also pulls `pyxem._start_progress_poll` a
 > - **`log` vs `logger` shadow** — `ipf_density.build_ipf_density_figure` takes a
 >   `log: bool` param that shadows a module-level `log`, so `log.debug(...)` would
 >   crash *only when the except fired*. Module loggers in plotting modules are now
->   named `logger`. Guard added: `_scan_logger_shadow.py` (AST check, 0 hits). See
+>   named `logger`. Guard added: `tools/scan_logger_shadow.py` (AST check, 0 hits). See
 >   the `logger-name-shadow` memory.
 > - **anyplotlib `Axes.set_title` doesn't exist** — several multi-panel titles
 >   (`ipf_density`, `ipf_refine_render`, `views`) were wrapped in `except: pass`
