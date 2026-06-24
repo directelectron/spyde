@@ -98,7 +98,7 @@ spyde = [
     "*.ico",
     "*.icns",
     "*.svg",
-    "qt/assets/icons/*.svg",
+    "drawing/toolbars/icons/*.svg",
     "actions/hyper_signal_actions/*.yaml",
     "actions/plot_actions/*.yaml",
 ]
@@ -118,7 +118,6 @@ doc = [
     "sphinx",
     "pydata_sphinx_theme",
     "sphinx-gallery",
-    "pytest-qt",
     "sphinx_design",
 ]
 
