@@ -451,7 +451,7 @@ class Plot:
                         and logger.isEnabledFor(logging.DEBUG)):
                     logger.debug("[plot-paint] SIG RE-AUTO-LEVEL on navigated frame "
                                  "(was %s) — this is a contrast flash", self._last_levels)
-                vmin, vmax = self._robust_levels(data)
+                vmin, vmax = self._robust_levels(data, signal=not self.is_navigator)
                 self.needs_auto_level = False
                 self._emit_histogram(data, vmin, vmax)
             elif levels is not None:
@@ -465,7 +465,7 @@ class Plot:
                 # look wrong as the detector ROI moved).
                 vmin, vmax = self._last_levels
             else:
-                vmin, vmax = self._robust_levels(data)
+                vmin, vmax = self._robust_levels(data, signal=not self.is_navigator)
                 self._emit_histogram(data, vmin, vmax)
             self._last_levels = (vmin, vmax)
             axes, units = self._axes_info(data)
@@ -548,7 +548,12 @@ class Plot:
             logger.debug("histogram emit failed: %s", e)
 
     @staticmethod
-    def _robust_levels(img: np.ndarray) -> tuple:
+    def _robust_levels(img: np.ndarray, signal: bool = False) -> tuple:
+        """Robust display range. For a *signal* (diffraction) plot the central
+        beam is orders of magnitude brighter than the diffraction spots, so a
+        99.5% upper clip still saturates everything but the beam. Use a tighter
+        2–99% band there so the faint spots are visible; navigator/VI images keep
+        the wide min–99.5% range (they have no saturating central spike)."""
         try:
             sy = max(1, img.shape[0] // 512)
             sx = max(1, img.shape[1] // 512) if img.ndim > 1 else 1
@@ -557,8 +562,12 @@ class Plot:
             data = data[np.isfinite(data)]
             if data.size == 0:
                 return 0.0, 1.0
-            mn = float(data.min())
-            mx = float(np.percentile(data, 99.5))
+            if signal:
+                mn = float(np.percentile(data, 2.0))
+                mx = float(np.percentile(data, 99.0))
+            else:
+                mn = float(data.min())
+                mx = float(np.percentile(data, 99.5))
             if mx <= mn:
                 mx = float(data.max())
             if mx <= mn:
