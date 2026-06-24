@@ -916,6 +916,7 @@ def _find_vectors_single_frame_dog(
     # spots along the rim). Instead the detector runs on the UNMODIFIED frame and
     # any peak landing inside the (dilated) mask is dropped below. `excl` is also
     # used to exclude the rim from the robust SNR scale so it can't inflate MAD.
+
     excl = None
     if beamstop_mask is not None and beamstop_mask.any():
         excl = _dilate_mask(beamstop_mask, bs_dilate) if bs_dilate else beamstop_mask
@@ -979,11 +980,6 @@ def _find_vectors_single_frame_dog(
         pos = _subpixel_parabola(snr, peaks_px)
     else:
         pos = peaks_px.astype(np.float32)
-    # intensity column = RAW experimental frame brightness (for virtual imaging /
-    # orientation weighting). Disk-MEAN over the spot footprint (radius ≈ σ₂, the
-    # band-pass outer scale), NOT a single sub-pixel sample — a 1-px value swings
-    # frame-to-frame and bands an intensity-weighted virtual image (see
-    # _disk_mean_intensity). Same convention as the NXCORR path now.
     intens = _disk_mean_intensity(
         np.asarray(frame, dtype=np.float32), pos[:, 0], pos[:, 1],
         max(1.0, np.ceil(sigma2)))
@@ -1507,26 +1503,8 @@ try:
         sum1 = _nb_f32(0.0)
         sum2 = _nb_f32(0.0)
         for dr in range(win_size):
-            py = out_y + dr - kr_win
-            if py < 0:
-                py = -py
-            elif py >= H:
-                py = 2 * H - py - 2
-            if py < 0:
-                py = 0
-            elif py >= H:
-                py = H - 1
             for dc in range(win_size):
-                px = out_x + dc - kr_win
-                if px < 0:
-                    px = -px
-                elif px >= W:
-                    px = 2 * W - px - 2
-                if px < 0:
-                    px = 0
-                elif px >= W:
-                    px = W - 1
-                v = frames[n, py, px]
+                v = frames[n, out_y + dr, out_x + dc]
                 sum1 += v
                 sum2 += v * v
 
@@ -2698,9 +2676,24 @@ def _find_vectors_chunk_gpu_impl(
         t0 = time.perf_counter()
         out = np.full((NY, NX, MAX_PEAKS, 3), np.nan, dtype=np.float32)
         min_d2 = int(min_dist) * int(min_dist)
-        host_frames = block4d_cpu.reshape(-1, KY, KX)   # raw frames for intensity
+        # Raw frames for intensity sampling. `block4d_cpu` is the FULL ghost
+        # block (NY_g x NX_g), but the device section trimmed the ghost zone:
+        # peak index i in [0, N) is over the CORE grid (NY x NX) starting at
+        # (lo, lo). Index the ghost block at the core-shifted position, else
+        # intensities are read from the wrong frame and grow more misaligned
+        # per core row — chunk-aligned intensity tearing (positions stay
+        # correct). Only bites when depth_px > 0 (nav blur on), so sigma=0
+        # tests don't catch it.
+        NY_g_local, NX_g_local = block4d_cpu.shape[0], block4d_cpu.shape[1]
+        # Mirror the device section's trim bounds (see _device_section): lo is
+        # the ghost depth, with the same too-small-block fallback to 0.
+        lo = depth_px
+        if lo >= NY_g_local - depth_px or lo >= NX_g_local - depth_px:
+            lo = 0
+        host_frames = block4d_cpu.reshape(-1, KY, KX)
         for i in range(N):
             iy, ix = divmod(i, NX)
+            host_i = (iy + lo) * NX_g_local + (ix + lo)
             if subpixel:
                 np_i = min(int(n_peaks[i]), MAX_PEAKS)
                 frame_peaks = peaks_out[i, :np_i].copy() if np_i > 0 else None
@@ -2733,15 +2726,15 @@ def _find_vectors_chunk_gpu_impl(
                 for j in range(len(frame_peaks)):
                     if not kept[j]:
                         continue
-                    dy = frame_peaks[j+1:, 0] - frame_peaks[j, 0]
-                    dx = frame_peaks[j+1:, 1] - frame_peaks[j, 1]
-                    kept[j+1:][(dy*dy + dx*dx) <= min_d2] = False
+                    dy = frame_peaks[j + 1:, 0] - frame_peaks[j, 0]
+                    dx = frame_peaks[j + 1:, 1] - frame_peaks[j, 1]
+                    kept[j + 1:][(dy * dy + dx * dx) <= min_d2] = False
                 frame_peaks = frame_peaks[kept]
 
             # Value column → raw experimental intensity at each peak (after NMS,
             # which used the corr score, matching the CPU path). Disk-mean over the
             # kernel footprint — robust, avoids the per-frame single-pixel banding.
-            frame_peaks = _with_raw_intensity(host_frames[i], frame_peaks,
+            frame_peaks = _with_raw_intensity(host_frames[host_i], frame_peaks,
                                               radius=kernel_r)
             n = min(len(frame_peaks), MAX_PEAKS)
             if n > 0:
@@ -2832,6 +2825,68 @@ def _compact_padded_chunk(arr: np.ndarray) -> np.ndarray:
 
 
 
+def _compute_chunks_with_live_counts(
+    client, result_array, nav_dim, on_chunk_done, stopped_flag=None,
+):
+    """Single-lane distributed compute with a live per-chunk preview.
+
+    Submits one Future per nav chunk (so chunks land progressively, each with
+    its correct global nav slice) and calls ``on_chunk_done(nav_slices, chunk)``
+    from the Dask done-callback thread as each completes — mirroring the VI
+    progressive path.  Assembles the full padded result and returns it, or
+    ``None`` if stopped.  Used when there is exactly one compute lane but a live
+    count map is wanted; the dual-lane GPU dispatcher handles its own case.
+    """
+    import itertools
+
+    nav_chunks = result_array.chunks[:nav_dim]
+    axes_ranges = []
+    for axis_chunks in nav_chunks:
+        positions, start = [], 0
+        for size in axis_chunks:
+            positions.append((start, size))
+            start += size
+        axes_ranges.append(positions)
+    trailing = (slice(None),) * (result_array.ndim - nav_dim)
+
+    result = np.full(result_array.shape, np.nan, dtype=result_array.dtype)
+    futures = []
+    chunk_slices = []
+    for combo in itertools.product(*axes_ranges):
+        nav_sl = tuple(slice(s, s + n) for s, n in combo)
+        fut = client.compute(result_array[nav_sl + trailing])
+        futures.append(fut)
+        chunk_slices.append(nav_sl)
+
+    for fut, nav_sl in zip(futures, chunk_slices):
+        def _cb(f, _sl=nav_sl):
+            try:
+                block = f.result()
+            except Exception as e:
+                log.debug("live-count chunk %r failed: %s", _sl, e)
+                return
+            result[_sl + trailing] = block
+            try:
+                on_chunk_done(_sl, block)
+            except Exception as e:
+                log.debug("on_chunk_done for %r failed: %s", _sl, e)
+        fut.add_done_callback(_cb)
+
+    pending = list(futures)
+    while pending:
+        if stopped_flag is not None and stopped_flag[0]:
+            for fut in pending:
+                try:
+                    fut.cancel()
+                except Exception as e:
+                    log.debug("cancelling live-count future failed: %s", e)
+            return None
+        pending = [f for f in pending if not f.done()]
+        if pending:
+            time.sleep(0.05)
+    return result
+
+
 def _dispatch_chunks_gpu_aware(
     client,
     result_array,
@@ -2839,6 +2894,7 @@ def _dispatch_chunks_gpu_aware(
     gpu_addrs: list,
     cpu_addrs: list,
     stopped_flag=None,
+    on_chunk_done=None,
 ):
     """Greedy dual-lane chunk dispatch — shared implementation in
     compute_dispatch; vectors-specific NaN-slot compaction via postprocess."""
@@ -2846,64 +2902,8 @@ def _dispatch_chunks_gpu_aware(
     return dispatch_chunks(
         client, result_array, nav_dim, gpu_addrs, cpu_addrs,
         stopped_flag=stopped_flag, postprocess=_compact_padded_chunk,
-        fill_value=np.nan, label="find_vectors",
+        fill_value=np.nan, label="find_vectors", on_chunk_done=on_chunk_done,
     )
-
-
-def _count_chunk_to_shm(
-    block: np.ndarray,
-    block_info=None,
-    shm_name: str = None,
-    nav_2d_shape: tuple = None,
-    nav_dim: int = 2,
-) -> np.ndarray:
-    """
-    Passthrough map_blocks stage over the padded-peaks array.
-
-    Counts finite peaks per nav position in this block and writes them into
-    the live shared-memory count buffer at the block's global location, so
-    the GUI (polling the buffer) sees the count image fill in chunk by chunk
-    while the batch compute runs.  The block itself is returned unchanged.
-
-    Runs on dask workers (threads or local subprocesses) — SharedMemory is
-    attached by name, writes are best-effort and never raise.
-
-    For 5D the buffer is NaN-initialised; chunks at different time indices
-    accumulate into the same (y, x) region, treating NaN as "not written yet".
-    """
-    # Meta-inference calls pass empty blocks / no block_info — do nothing.
-    if block_info is None or not isinstance(block_info, dict) or 0 not in block_info:
-        return block
-    try:
-        loc = block_info[0]["array-location"]
-    except Exception:
-        return block
-
-    try:
-        counts = np.isfinite(block[..., 0]).sum(axis=-1).astype(np.float32)
-        if nav_dim == 3 and counts.ndim == 3:
-            counts_2d = counts.sum(axis=0)
-        else:
-            counts_2d = counts
-        ys, xs = loc[nav_dim - 2], loc[nav_dim - 1]
-
-        from multiprocessing import shared_memory as _shm_mod
-        shm = _shm_mod.SharedMemory(name=shm_name, create=False)
-        try:
-            buf = np.ndarray(nav_2d_shape, dtype=np.float32, buffer=shm.buf)
-            region = buf[ys[0]:ys[1], xs[0]:xs[1]]
-            if nav_dim == 3:
-                buf[ys[0]:ys[1], xs[0]:xs[1]] = (
-                    np.where(np.isfinite(region), region, 0.0) + counts_2d
-                )
-            else:
-                buf[ys[0]:ys[1], xs[0]:xs[1]] = counts_2d
-            del region, buf
-        finally:
-            shm.close()
-    except Exception as e:
-        log.debug("live count-map shm update for block failed: %s", e)
-    return block
 
 
 def _do_compute_vectors(
@@ -3098,8 +3098,35 @@ def _do_compute_vectors(
     client = None
     if signal_tree is not None:
         client = getattr(signal_tree, "client", None)
-    if client is None and main_window is not None:
-        client = getattr(getattr(main_window, "dask_manager", None), "client", None)
+    dask_manager = getattr(main_window, "dask_manager", None) if main_window else None
+    if client is None and dask_manager is not None:
+        client = getattr(dask_manager, "client", None)
+
+    # The cluster is built asynchronously on a background thread, so an early
+    # Find Vectors run can arrive before `client` exists.  In the live app
+    # (a dask_manager is present) WAIT for it — we run on a worker thread, so
+    # blocking here doesn't freeze the UI — rather than silently degrading to
+    # the local threaded scheduler below (slow, no GPU, no progressive preview;
+    # that path is meant only for the no-cluster unit-test case).
+    #
+    # Exception: when Dask is disabled (SPYDE_NO_DASK=1, the migrated-test mode)
+    # the DaskManager exists but is never started, so its client stays None
+    # forever.  Don't wait there — fall straight through to the threaded
+    # scheduler, which is exactly the no-cluster path that mode wants.
+    import os
+    if os.environ.get("SPYDE_NO_DASK") == "1":
+        dask_manager = None
+    if client is None and dask_manager is not None:
+        log.debug("[find_vectors] waiting for Dask client to come up…")
+        deadline = time.time() + 180.0
+        while client is None and time.time() < deadline:
+            if stopped_flag is not None and stopped_flag[0]:
+                return None
+            time.sleep(0.1)
+            client = getattr(dask_manager, "client", None)
+        if client is None:
+            log.warning("[find_vectors] Dask client never came up — "
+                        "falling back to local threaded compute")
 
     # Only annotate with the GPU resource when at least one worker actually
     # advertises it.  Annotating without such workers leaves every chunk task
@@ -3140,24 +3167,38 @@ def _do_compute_vectors(
     toc = time.time()
     log.debug("Built Dask graph with map_overlap in %.1f s", toc - tic)
 
-    # ── Live count map: write per-chunk counts into shm from the graph ───────
-    # A passthrough map_blocks stage counts finite peaks per nav position and
-    # writes them into the shared-memory buffer as each chunk task finishes,
-    # so the GUI can poll the buffer and watch the count image fill in live.
+    # ── Live count map: count + write each chunk from the CLIENT side ────────
+    # Counting/writing happens HERE in the client process — driven by an
+    # on_chunk_done(nav_slices, block) callback as each chunk's result lands —
+    # NOT inside the dask graph.  An in-graph map_blocks stage reading
+    # block_info["array-location"] writes to the WRONG location on the
+    # GPU-aware path: that dispatcher slices the array per-chunk, so each
+    # sub-array's block location resets to (0, 0) and every chunk clobbers the
+    # top-left of the buffer.  The global nav slice the callback receives is
+    # always correct, and the write stays on the client (no worker-subprocess
+    # shm write → no Windows teardown access-violation; cf. the VI path).
     if shm_name is not None:
-        counted = da.map_blocks(
-            functools.partial(
-                _count_chunk_to_shm,
-                shm_name=shm_name,
-                nav_2d_shape=tuple(nav_2d_shape),
-                nav_dim=nav_dim,
-            ),
-            peaks_padded,
-            dtype=np.float32,
-            meta=np.empty((0,) * peaks_padded.ndim, dtype=np.float32),
-        )
+        from multiprocessing import shared_memory as _shm_mod
+
+        def _live_count_chunk(nav_slices, block):
+            """Count finite peaks per nav position in this chunk's result and
+            write them to the live shm buffer at the chunk's GLOBAL location.
+            ``nav_slices`` indexes only the nav axes; ``block`` is the padded
+            (nav…, n_peaks, cols) chunk result.  Best-effort, never raises."""
+            try:
+                counts = np.isfinite(block[..., 0]).sum(axis=-1).astype(np.float32)
+                shm = _shm_mod.SharedMemory(name=shm_name, create=False)
+                try:
+                    buf = np.ndarray(tuple(nav_shape_full), dtype=np.float32,
+                                     buffer=shm.buf)
+                    buf[tuple(nav_slices)] = counts
+                finally:
+                    shm.close()
+            except Exception as e:
+                log.debug("live count-map shm write for %r failed: %s",
+                          nav_slices, e)
     else:
-        counted = peaks_padded
+        _live_count_chunk = None
 
     # ── Submit as a dask future — only this (background) thread blocks ───────
     if stopped_flag is not None and stopped_flag[0]:
@@ -3176,13 +3217,24 @@ def _do_compute_vectors(
                 f"GPU={len(gpu_addrs)} worker(s), CPU={len(cpu_addrs)} worker(s)"
             )
             result_padded = _dispatch_chunks_gpu_aware(
-                client, counted, nav_dim, gpu_addrs, cpu_addrs,
+                client, peaks_padded, nav_dim, gpu_addrs, cpu_addrs,
+                stopped_flag=stopped_flag, on_chunk_done=_live_count_chunk,
+            )
+            if result_padded is None:
+                return None
+        elif _live_count_chunk is not None:
+            # Single-lane distributed path WITH a live preview: submit one
+            # future per nav chunk so chunks land (and paint) progressively,
+            # each with its correct global slice — same mechanism as the VI
+            # progressive path (compute_with_live_buffer).
+            result_padded = _compute_chunks_with_live_counts(
+                client, peaks_padded, nav_dim, _live_count_chunk,
                 stopped_flag=stopped_flag,
             )
             if result_padded is None:
                 return None
         else:
-            future = client.compute(counted)
+            future = client.compute(peaks_padded)
             while not future.done():
                 if stopped_flag is not None and stopped_flag[0]:
                     try:
@@ -3197,7 +3249,7 @@ def _do_compute_vectors(
         # pinned explicitly — a bare .compute() silently runs on any ambient
         # distributed Client (dask's global default when one exists).
         # This computes the small padded-peaks output, never the raw dataset.
-        result_padded = counted.compute(scheduler="threads")
+        result_padded = peaks_padded.compute(scheduler="threads")
     toc = time.time()
     log.debug("Computed vectors in %.1f s", toc - tic)
 
@@ -3230,16 +3282,17 @@ def _do_compute_vectors(
 
     # ── Final shm write / completion callback ─────────────────────────────────
     if shm_name is not None or on_chunk_done is not None:
-        counts_2d = valid.sum(axis=-1)
-        if nav_dim == 3:
-            counts_2d = counts_2d.sum(axis=0)
-        count_map = counts_2d.astype(np.int32)
+        # counts_full has shape nav_shape_full: (n_y, n_x) for 4D or
+        # (n_t, n_y, n_x) for 5D — matches the buffer allocated by the action.
+        counts_full = valid.sum(axis=-1)
+        count_map = (counts_full.sum(axis=0) if nav_dim == 3
+                     else counts_full).astype(np.int32)
         if shm_name is not None:
             from multiprocessing import shared_memory as _shm_mod
             try:
                 shm_handle = _shm_mod.SharedMemory(name=shm_name, create=False)
-                shm_buf = np.ndarray(nav_2d_shape, dtype=np.float32, buffer=shm_handle.buf)
-                shm_buf[:] = count_map.astype(np.float32)
+                shm_buf = np.ndarray(nav_shape_full, dtype=np.float32, buffer=shm_handle.buf)
+                shm_buf[:] = counts_full.astype(np.float32)
                 shm_handle.close()
             except Exception as e:
                 log.debug("final count-map shm write to %s failed: %s", shm_name, e)

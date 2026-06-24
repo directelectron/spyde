@@ -138,7 +138,10 @@ def _start_batch(session, plot, src_tree, p: dict):
     from spyde.drawing.update_functions import ensure_live_buffer, read_live_buffer
     shm_name = f"spyde_fv_{id(plot)}"
     try:
-        shm = ensure_live_buffer(nav_shape_2d, shm_name)
+        # Allocate the buffer with the FULL nav shape so 5D data gets a 3D
+        # buffer (n_t, n_y, n_x); the compute's per-chunk callback writes each
+        # chunk to its correct (t, y, x) location without time-axis collapsing.
+        shm = ensure_live_buffer(nav_shape_full, shm_name)
     except Exception:
         shm, shm_name = None, None
     stop_poll = [False]
@@ -159,10 +162,12 @@ def _start_batch(session, plot, src_tree, p: dict):
         while not stop_poll[0]:
             try:
                 nav_plot = _spatial_nav_plot()
-                arr = read_live_buffer(nav_shape_2d, shm_name)
-                if nav_plot is not None and np.isfinite(arr).any():
+                arr = read_live_buffer(nav_shape_full, shm_name)
+                # For 5D (3D buffer), show the t=0 slice on the spatial navigator.
+                display = arr[0] if arr.ndim == 3 else arr
+                if nav_plot is not None and np.isfinite(display).any():
                     nav_plot.needs_auto_level = True
-                    nav_plot.set_data(np.nan_to_num(arr).astype(np.float32))
+                    nav_plot.set_data(np.nan_to_num(display).astype(np.float32))
             except Exception as e:
                 log.debug("live count-map poll paint failed: %s", e)
             time.sleep(0.35)

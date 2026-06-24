@@ -89,6 +89,7 @@ def dispatch_chunks(
     stall_timeout_s: float = 600.0,
     submit_batch: int = 8,
     label: str = "dispatch",
+    on_chunk_done=None,
 ):
     """
     Compute `result_array` (a dask array with nav dims leading) chunk by
@@ -98,6 +99,14 @@ def dispatch_chunks(
         Applied on the worker to each chunk's result before transfer (e.g.
         trimming NaN padding).  May shorten axis -2; the assembly writes the
         result into slots [0:n) of that axis, the rest keeps `fill_value`.
+    on_chunk_done : callable(nav_slices, chunk_result) | None
+        Called from the Dask done-callback thread as each chunk lands, with
+        the chunk's GLOBAL nav slice (a tuple of slices into the full nav
+        grid) and the chunk's (post-processed) result.  Used to drive a live
+        preview from the client side — counting/writing happens here, NOT in
+        the dask graph, so the global location is always correct (slicing the
+        array per-chunk resets block_info to local coords).  Must be
+        thread-safe and never raise; exceptions are swallowed.
 
     Returns the assembled ndarray, or None when stopped via stopped_flag.
     Raises the first task exception encountered.
@@ -194,6 +203,13 @@ def dispatch_chunks(
             n_found = chunk_result.shape[-2]
             result[chunk_slices[idx] + (slice(0, n_found), slice(None))] = \
                 chunk_result
+            if on_chunk_done is not None:
+                # Live preview: hand the caller this chunk's GLOBAL nav slice
+                # and its result so it can paint/write shm at the right place.
+                try:
+                    on_chunk_done(chunk_slices[idx], chunk_result)
+                except Exception as e:
+                    log.debug("[%s] on_chunk_done failed: %s", label, e)
         except Exception as exc:
             with lock:
                 futures.discard(fut)

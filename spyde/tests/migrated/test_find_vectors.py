@@ -486,3 +486,34 @@ class TestPeakIntensityRobust:
         # intensity column is finite and positive (a real brightness, not a score).
         assert np.all(np.isfinite(peaks[:, 2]))
         assert peaks[:, 2].max() > 0
+
+    def test_gpu_pack_ghost_to_core_frame_index(self):
+        """Regression: the GPU _process_4d device section trims the ghost zone,
+        so peak index i (over the NY x NX *core* grid) must map to the ghost
+        block frame at (iy+lo, ix+lo). Indexing the un-trimmed ghost block with
+        a bare core i samples the WRONG frame for intensity — positions stay
+        correct, intensity tears in chunk-aligned blocks (only when depth_px>0,
+        which is why sigma=0 tests miss it). This guards the index arithmetic
+        the fix depends on without needing CUDA.
+        """
+        depth_px = 2
+        NY_g, NX_g = 8, 10
+        NY, NX = NY_g - 2 * depth_px, NX_g - 2 * depth_px
+        lo = depth_px
+        if lo >= NY_g - depth_px or lo >= NX_g - depth_px:
+            lo = 0
+        KY = KX = 4
+        # Each frame's mean uniquely encodes its (gy, gx) in the ghost block.
+        block = np.zeros((NY_g, NX_g, KY, KX), np.float32)
+        for gy in range(NY_g):
+            for gx in range(NX_g):
+                block[gy, gx] = gy * 100 + gx
+        host_frames = block.reshape(-1, KY, KX)
+        for i in range(NY * NX):
+            iy, ix = divmod(i, NX)
+            want = (iy + lo) * 100 + (ix + lo)
+            host_i = (iy + lo) * NX_g + (ix + lo)
+            assert host_frames[host_i].mean() == want
+            # The old (buggy) bare-i indexing must disagree off the first row.
+            if iy > 0:
+                assert host_frames[i].mean() != want

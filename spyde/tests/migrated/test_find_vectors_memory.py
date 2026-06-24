@@ -422,6 +422,60 @@ def test_on_chunk_done_count_subarray_matches_final():
     )
 
 
+def test_live_count_chunk_writes_global_location():
+    """The progressive live count path writes each chunk's counts to its GLOBAL
+    nav location in the shm buffer — the bug that prompted the rewrite was the
+    in-graph node writing every chunk to (0,0) on the GPU-aware path.
+
+    Drive ``_compute_chunks_with_live_counts`` with a synchronous fake client so
+    it runs under pytest (no real cluster); the callback writes counts into a
+    plain ndarray standing in for the shm buffer, and the final result must
+    match what a one-shot compute of the same array produces — at the RIGHT
+    positions, not piled into the corner.
+    """
+    from spyde.actions.find_vectors import _compute_chunks_with_live_counts
+
+    # A nav-shaped padded-peaks-like array: (ny, nx, n_peaks, cols).  Distinct
+    # finite-peak counts per nav position so a corner-clobbering bug is obvious.
+    ny, nx, n_peaks, cols = 6, 6, 4, 3
+    arr = np.full((ny, nx, n_peaks, cols), np.nan, dtype=np.float32)
+    expected_counts = np.zeros((ny, nx), dtype=np.float32)
+    for iy in range(ny):
+        for ix in range(nx):
+            k = (iy + ix) % n_peaks + 1        # 1..n_peaks finite peaks
+            arr[iy, ix, :k, :] = 1.0
+            expected_counts[iy, ix] = k
+    da_arr = da.from_array(arr, chunks=(3, 3, n_peaks, cols))   # 2x2 nav chunks
+
+    class _SyncFuture:
+        def __init__(self, value): self._v = value; self._cbs = []
+        def result(self): return self._v
+        def done(self): return True
+        def add_done_callback(self, cb): cb(self)
+        def cancel(self): pass
+
+    class _SyncClient:
+        def compute(self, dask_obj, **kw):
+            return _SyncFuture(np.asarray(dask_obj.compute()))
+
+    buf = np.full((ny, nx), np.nan, dtype=np.float32)
+    seen_slices = []
+
+    def _live(nav_slices, block):
+        seen_slices.append(nav_slices)
+        buf[nav_slices] = np.isfinite(block[..., 0]).sum(axis=-1)
+
+    result = _compute_chunks_with_live_counts(
+        _SyncClient(), da_arr, nav_dim=2, on_chunk_done=_live,
+    )
+
+    # Every chunk landed at its global slice, covering the whole grid once.
+    assert len(seen_slices) == 4
+    np.testing.assert_array_equal(buf, expected_counts)
+    # The assembled result equals the source (no chunk written to the wrong place).
+    np.testing.assert_array_equal(np.nan_to_num(result), np.nan_to_num(arr))
+
+
 def test_dask_path_produces_correct_nav_shape():
     """Dask path produces correct nav_shape and non-negative counts."""
     nav = (12, 12)
