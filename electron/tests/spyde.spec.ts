@@ -833,6 +833,26 @@ test('dragging the histogram max handle sends set_clim', async () => {
   expect((last.payload as any).vmax).toBeLessThan(90)
 })
 
+test('the histogram max handle can be pushed above the data max (>100%)', async () => {
+  await trackActions()
+  await openFourD()
+  // data range is [0,100]; start vmax at the data max.
+  await inject({ type: 'histogram', window_id: 1, counts: [1, 5, 3, 1], edges: [0, 25, 50, 75, 100], vmin: 10, vmax: 100 })
+  const handle = page.getByTestId('hist-max-handle')
+  const box = (await handle.boundingBox())!
+  // Drag the max handle RIGHT, past the data-max marker → vmax should exceed 100
+  // (darkens the image; the headroom axis allows above-range contrast).
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2)
+  await page.mouse.down()
+  await page.mouse.move(box.x + 80, box.y + box.height / 2, { steps: 6 })
+  await page.mouse.up()
+  const sent = await sentActions()
+  const climCalls = sent.filter((s: any) => s.action === 'set_clim' && s.windowId === 1)
+  expect(climCalls.length, 'no set_clim sent on drag').toBeGreaterThan(0)
+  const last = climCalls[climCalls.length - 1]
+  expect((last.payload as any).vmax, 'vmax should exceed the data max').toBeGreaterThan(100)
+})
+
 // ── Histogram + metadata (reported missing) ───────────────────────────────────
 
 test('sidebar renders a histogram for the active window', async () => {

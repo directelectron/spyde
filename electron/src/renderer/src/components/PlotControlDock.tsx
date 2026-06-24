@@ -184,11 +184,19 @@ function Histogram({ counts, edges, vmin, vmax, threshold, onClim }:
   if (!counts.length) return null
   const max = Math.max(...counts) || 1
   const lo = edges[0], hi = edges[edges.length - 1]
-  const span = hi - lo || 1
+  const dataSpan = hi - lo || 1
+  // Draw an axis that extends PAST the data max so the upper-contrast handle can
+  // be pulled above 100% (darkens the image). Headroom = 2× the data span beyond
+  // the data max; also stretch to cover a held vmax (e.g. a brighter frame in a
+  // 5-D series whose contrast was carried over). The bars only span [lo, hi].
+  const axLo = lo
+  const axHi = Math.max(hi + 2 * dataSpan, vmax + 0.05 * dataSpan)
+  const span = axHi - axLo || 1
   const W = 276, H = 84
-  const bw = W / counts.length
-  const xOf = (v: number) => ((v - lo) / span) * W
-  const vOf = (x: number) => lo + (Math.max(0, Math.min(W, x)) / W) * span
+  const bw = (dataSpan / span) * W / counts.length
+  // No right-edge clamp: dragging past the drawn area maps to values > data max.
+  const xOf = (v: number) => ((v - axLo) / span) * W
+  const vOf = (x: number) => axLo + (Math.max(0, x) / W) * span
   const fmt = (v: number) => (Math.abs(v) >= 1000 || (v !== 0 && Math.abs(v) < 0.01))
     ? v.toExponential(1) : v.toFixed(2)
 
@@ -240,6 +248,12 @@ function Histogram({ counts, edges, vmin, vmax, threshold, onClim }:
           const h = (c / max) * (H - 4)
           return <rect key={i} x={i * bw} y={H - h} width={Math.max(1, bw - 0.5)} height={h} fill="#89b4fa" />
         })}
+        {/* data-max marker: dragging the max handle to the RIGHT of this line
+            pushes the upper clim above the data range (image gets darker). */}
+        {xOf(hi) < W && (
+          <line data-testid="hist-datamax" x1={xOf(hi)} y1={0} x2={xOf(hi)} y2={H}
+            stroke="#585b70" strokeWidth={1} strokeDasharray="2 2" />
+        )}
         {/* Find-Vectors detector threshold: dotted orange line (in image units) */}
         {threshold != null && threshold >= lo && threshold <= hi && (
           <line data-testid="hist-threshold" x1={xOf(threshold)} y1={0}
