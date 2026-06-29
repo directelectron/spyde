@@ -73,6 +73,23 @@ class MDIManager:
         })
         return pw
 
+    def remove_plot_window(self, window_id: int | None) -> None:
+        """Drop the tracked PlotWindow(s) for a closed window_id.
+
+        add_plot_window() appends every PlotWindow to plot_subwindows; without
+        this prune the list grows unbounded as windows are opened and closed.
+        Called from Session._forget_window during teardown.
+        """
+        if window_id is None:
+            return
+        self.plot_subwindows = [
+            pw for pw in self.plot_subwindows
+            if getattr(pw, "window_id", None) != window_id
+        ]
+        if self._active_pw is not None and getattr(self._active_pw, "window_id", None) == window_id:
+            self._active_pw = None
+            self._active_plot = None
+
     def windows_for_tree(self, tree: "BaseSignalTree") -> list["PlotWindow"]:
         return [pw for pw in list(self.plot_subwindows)
                 if getattr(pw, "signal_tree", None) is tree]

@@ -1897,6 +1897,11 @@ class Session:
             return
         if hasattr(self, "_nav_selectors"):
             self._nav_selectors.pop(window_id, None)
+        # Prune the MDIManager's PlotWindow tracking so closed windows don't leak.
+        try:
+            self.mdi_manager.remove_plot_window(window_id)
+        except Exception as e:
+            log.debug("pruning plot window from MDIManager failed: %s", e)
         # Drop any action-artifact entries that source from or output to this
         # window so a re-run starts clean and a closed output isn't "active".
         for k in [k for k, v in self._action_artifacts.items()
