@@ -28,7 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         # Full history + tags so setuptools_scm derives a real version
-        # (a shallow checkout has no tags → 0.0.postN.devN).
+        # (a shallow checkout has no tags -> 0.0.postN.devN).
         with:
           fetch-depth: 0
 
