@@ -112,6 +112,7 @@ interface State {
   navShapePrompt: NavShapePrompt | null   // pending scan-shape/step-size dialog
   loading: { busy: boolean; text: string }   // long file-read busy indicator
   signalTypes: Map<number, { current: string; options: string[] }>   // windowId → signal-type info
+  backendExited: { code: number | null } | null   // set when the Python sidecar dies; surfaces a blocking banner
 }
 
 // Backend `nav_shape_prompt`: confirm the scan grid + step size before opening a
@@ -150,6 +151,7 @@ type Action =
   | { type: 'LOG'; entry: LogEntry }
   | { type: 'LOG_BACKFILL'; entries: LogEntry[] }
   | { type: 'LOG_LEVEL'; level: string }
+  | { type: 'BACKEND_EXITED'; code: number | null }
 
 function spydeReducer(state: State, action: Action): State {
   switch (action.type) {
@@ -382,6 +384,9 @@ function spydeReducer(state: State, action: Action): State {
       return { ...state, signalTypes }
     }
 
+    case 'BACKEND_EXITED':
+      return { ...state, backendExited: { code: action.code }, ready: false, status: 'Backend stopped' }
+
     default:
       return state
   }
@@ -433,6 +438,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     navShapePrompt: null,
     loading: { busy: false, text: '' },
     signalTypes: new Map(),
+    backendExited: null,
   })
 
   const iframeRefs = useRef<Map<string, HTMLIFrameElement>>(new Map())
@@ -465,6 +471,12 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
 
         case 'error':
           dispatch({ type: 'STATUS', text: `⚠ ${msg.text}` })
+          break
+
+        case 'backend_exited':
+          // The Python sidecar died (synthesised by runner.ts, not a PLOTAPP line).
+          // Surface a blocking banner — every sendAction after this no-ops.
+          dispatch({ type: 'BACKEND_EXITED', code: (msg.code as number | null) ?? null })
           break
 
         case 'figure': {
@@ -780,7 +792,37 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
   return (
     <SpyDEContext.Provider value={{ state, iframeRefs, latestStates, sendAction, setActiveWindow, replayState, clearNavShapePrompt, stackDialogOpen, openStackDialog, closeStackDialog }}>
       {children}
+      {state.backendExited && <BackendExitedOverlay code={state.backendExited.code} />}
     </SpyDEContext.Provider>
+  )
+}
+
+// Blocking, non-dismissable overlay shown when the Python analysis backend dies.
+// Without this the UI silently freezes (every sendAction no-ops). Restart is a
+// follow-up; for 0.1.0 we make the death visible and tell the user to relaunch.
+function BackendExitedOverlay({ code }: { code: number | null }) {
+  return (
+    <div style={{
+      position: 'fixed', inset: 0, zIndex: 99999,
+      background: 'rgba(0,0,0,0.78)', display: 'flex',
+      alignItems: 'center', justifyContent: 'center', userSelect: 'text',
+    }}>
+      <div style={{
+        maxWidth: 460, padding: '28px 32px', borderRadius: 10,
+        background: '#1e1e2e', border: '1px solid #f38ba8',
+        color: '#cdd6f4', fontFamily: 'system-ui, sans-serif', textAlign: 'center',
+      }}>
+        <div style={{ fontSize: 18, fontWeight: 600, color: '#f38ba8', marginBottom: 10 }}>
+          Analysis backend stopped
+        </div>
+        <div style={{ fontSize: 14, lineHeight: 1.5 }}>
+          The Python process powering SpyDE exited
+          {code != null ? <> (exit code <code>{code}</code>)</> : null}.
+          Compute and file operations are unavailable. Please restart SpyDE.
+          Check the Log panel for details.
+        </div>
+      </div>
+    </div>
   )
 }
 

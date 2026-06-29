@@ -45,6 +45,11 @@ export function startSpyDE(
   proc.on('close', (code) => {
     proc = null
     handlers.onStream(`[SpyDE exited with code ${code}]\n`, 'stderr')
+    // Surface the death to the renderer so the UI doesn't silently freeze —
+    // every sendAction() after this no-ops (proc is null), so without this the
+    // user gets no indication the analysis backend stopped. Routed through the
+    // same onMessage path as a synthetic message (not a PLOTAPP: line).
+    handlers.onMessage({ type: 'backend_exited', code })
   })
 }
 
