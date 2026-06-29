@@ -87,3 +87,12 @@ git push origin v0.1.0
 ```
 
 See [`.github/workflows/release.yml`](.github/workflows/release.yml).
+
+
+License
+-------
+
+SpyDE is licensed under the **GNU General Public License v3.0 or later**
+(GPL-3.0-or-later); see [`LICENSE`](LICENSE) for the full text. SpyDE builds on
+[HyperSpy](https://hyperspy.org) and [PyXEM](https://pyxem.org), which are
+themselves distributed under the GPL, so the combined work is GPL-licensed.

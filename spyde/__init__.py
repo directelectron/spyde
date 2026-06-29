@@ -43,4 +43,9 @@ def _register_signal_extensions() -> None:
 _register_signal_extensions()
 
 
-__version__ = "0.0.1"
+from importlib.metadata import version, PackageNotFoundError
+
+try:
+    __version__ = version("spyde")
+except PackageNotFoundError:
+    __version__ = "0.0.0+unknown"
