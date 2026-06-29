@@ -31,13 +31,17 @@ wheels = [
 [[package]]
 name = "anyplotlib"
 version = "0.1.0"
-source = { git = "https://github.com/CSSFrancis/anyplotlib.git?rev=3cbbf3d48c193ae8d89f6c621f8c562fdb0448a6#3cbbf3d48c193ae8d89f6c621f8c562fdb0448a6" }
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anywidget" },
     { name = "colorcet" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "traitlets" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c2/6f/a1c15d29891e42e22bef95b8c8fe772ca0c66094e45973e4fabd0e5aafe6/anyplotlib-0.1.0.tar.gz", hash = "sha256:31a5084bd504c291022012e4a4f2f6494f44fd5f4067f7b80807558a99775050", size = 1191045, upload-time = "2026-06-29T20:18:16.439Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3c/93/351475bbd314e6545b30cfc7d4e26421e6e8f0f142df35786d43bd437c2a/anyplotlib-0.1.0-py3-none-any.whl", hash = "sha256:a1192e60229b1c0505ee60190c9a130acb54a86206ce46cde2632a430ac8e050", size = 193960, upload-time = "2026-06-29T20:18:14.644Z" },
 ]
 
 [[package]]
@@ -3692,7 +3696,7 @@ tests = [
 
 [package.metadata]
 requires-dist = [
-    { name = "anyplotlib", git = "https://github.com/CSSFrancis/anyplotlib.git?rev=3cbbf3d48c193ae8d89f6c621f8c562fdb0448a6" },
+    { name = "anyplotlib", specifier = ">=0.1.0" },
     { name = "bokeh" },
     { name = "dask" },
     { name = "distributed" },
