@@ -49,18 +49,14 @@ from spyde.actions.find_vectors.gpu_runtime import (
     _reset_gpu_state,
     _stream_ptr,
 )
-from spyde.actions.find_vectors.kernels import (
-    _GPU_KERNELS_AVAILABLE,
-    _convert_f32_kernel,
-    _frame_reduce_kernel,
-    _gaussian_blur_1d_kernel,
-    _local_max_kernel,
-    _nxcorr_fft_cupy,
-    _nxcorr_reflect_kernel,
-    _nxcorr_tiled_kernel,
-    _subpixel_parabola_kernel,
-    _trim_copy_kernel,
-)
+# Import the kernels MODULE (always importable), not the individual @cuda.jit
+# kernel names — those are defined only when numba imports successfully, so a
+# top-level `from .kernels import _foo_kernel` would raise ImportError on a
+# no-numba/no-GPU machine and kill the whole package (breaking the CPU fallback).
+# The kernels are referenced as `_kernels.<name>` at call time, always behind the
+# `_GPU_KERNELS_AVAILABLE` guard. `_nxcorr_fft_cupy` is module-level/always-defined.
+from spyde.actions.find_vectors import kernels as _kernels
+from spyde.actions.find_vectors.kernels import _GPU_KERNELS_AVAILABLE, _nxcorr_fft_cupy
 
 log = logging.getLogger(__name__)
 
@@ -530,7 +526,7 @@ def _find_vectors_chunk_gpu_impl(
                 raw_d = _gpu_pool_get(block4d_cpu.shape, block4d_cpu.dtype)
                 raw_d.copy_to_device(block4d_cpu, stream=stream)
                 src_d = _gpu_pool_get(block4d_cpu.shape, np.float32)
-                _convert_f32_kernel[grid_sig_nav, (bx, by, 1), stream](raw_d, src_d)
+                _kernels._convert_f32_kernel[grid_sig_nav, (bx, by, 1), stream](raw_d, src_d)
             else:
                 src_d = _gpu_pool_get(block4d_cpu.shape, np.float32)
                 src_d.copy_to_device(block4d_cpu, stream=stream)
@@ -545,10 +541,10 @@ def _find_vectors_chunk_gpu_impl(
                 tmp_d = _gpu_pool_get(block4d_cpu.shape, np.float32)
                 grid_blur = grid_sig_nav
                 block_blur = (bx, by, 1)
-                _gaussian_blur_1d_kernel[grid_blur, block_blur, stream](
+                _kernels._gaussian_blur_1d_kernel[grid_blur, block_blur, stream](
                     src_d, tmp_d, kern_d, np.int32(radius), np.int32(0)
                 )  # blur along nav_y into tmp
-                _gaussian_blur_1d_kernel[grid_blur, block_blur, stream](
+                _kernels._gaussian_blur_1d_kernel[grid_blur, block_blur, stream](
                     tmp_d, src_d, kern_d, np.int32(radius), np.int32(1)
                 )  # blur along nav_x back into src_d
         _sync_if_timing()
@@ -575,7 +571,7 @@ def _find_vectors_chunk_gpu_impl(
             # Compact the trimmed core into contiguous (N, KY, KX) frames —
             # device-to-device; the strided ghost view never touches the host.
             frames_d = _gpu_pool_get((N, KY, KX), np.float32)
-            _trim_copy_kernel[grid_px, blk_px, stream](
+            _kernels._trim_copy_kernel[grid_px, blk_px, stream](
                 src_d, frames_d, np.int32(lo), np.int32(lo), np.int32(NX), iH, iW
             )
 
@@ -614,7 +610,7 @@ def _find_vectors_chunk_gpu_impl(
                 if sums_d is None:
                     sums_d = _gpu_pool_get((N,), np.float32)
                     sumsq_d = _gpu_pool_get((N,), np.float32)
-                _frame_reduce_kernel[N, 256, stream](
+                _kernels._frame_reduce_kernel[N, 256, stream](
                     frames_d, mask_d, np.int32(0), sums_d, sumsq_d,
                     np.int32(HW), iW,
                 )
@@ -631,12 +627,12 @@ def _find_vectors_chunk_gpu_impl(
                 # Tiled shared-memory kernel when the halo fits the 64x64
                 # tile (kr_win <= 24); naive reflected-index kernel beyond.
                 if int(kr_win) <= 24:
-                    _nxcorr_tiled_kernel[grid_px, blk_px, stream](
+                    _kernels._nxcorr_tiled_kernel[grid_px, blk_px, stream](
                         frames_d, disk_d, raw_corr_d, global_stds_d,
                         n_disk, t_mean, t_std, kr, kr_win, iH, iW,
                     )
                 else:
-                    _nxcorr_reflect_kernel[grid_px, blk_px, stream](
+                    _kernels._nxcorr_reflect_kernel[grid_px, blk_px, stream](
                         frames_d, disk_d, raw_corr_d, global_stds_d,
                         n_disk, t_mean, t_std, kr, kr_win, iH, iW,
                     )
@@ -652,7 +648,7 @@ def _find_vectors_chunk_gpu_impl(
             # raw_corr_obj is a numba device array or a CuPy array — numba
             # kernels accept both via the CUDA array interface, and both were
             # produced on `stream`, so ordering is preserved.
-            _local_max_kernel[grid_px, blk_px, stream](
+            _kernels._local_max_kernel[grid_px, blk_px, stream](
                 raw_corr_obj, peak_mask_d, thr, min_d, iH, iW,
             )
             if subpixel:
@@ -663,7 +659,7 @@ def _find_vectors_chunk_gpu_impl(
                 # Parabolic vertex (matches the CPU/torch subpixel) — more
                 # accurate than the old centre-of-mass kernel, which was the
                 # least-accurate of the three subpixel paths.
-                _subpixel_parabola_kernel[grid_px, blk_px, stream](
+                _kernels._subpixel_parabola_kernel[grid_px, blk_px, stream](
                     raw_corr_obj, peak_mask_d, peaks_out_d, n_peaks_d,
                     iH, iW,
                 )
