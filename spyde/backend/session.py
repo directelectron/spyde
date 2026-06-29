@@ -186,6 +186,11 @@ class Session:
             os.path.expanduser("~"), ".spyde", "settings.json"
         )
         self._settings: dict[str, Any] = self._load_settings()
+        # Restore the persisted recent-files list (capped to match _add_recent).
+        try:
+            self._recent_files = list(self._settings.get("recent_files", []))[:20]
+        except Exception as e:
+            log.debug("restoring recent files from settings failed: %s", e)
 
     # ── Startup ────────────────────────────────────────────────────────────────
 
