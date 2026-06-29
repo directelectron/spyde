@@ -3003,7 +3003,10 @@ def _do_compute_vectors(
     # hundred frames give a clean low-intensity mask; dilated to clear the rim.
     if beamstop_mask is None and params.get("beamstop_auto", False):
         try:
-            beamstop_mask = _auto_beamstop_from_signal(signal, nav_dim)
+            beamstop_dilate = int(params.get("beamstop_dilate", 5))
+            beamstop_mask = _auto_beamstop_from_signal(
+                signal, nav_dim, dilate=beamstop_dilate
+            )
             if beamstop_mask is not None:
                 log.debug("[find_vectors] auto beam-stop: %d px masked",
                           int(beamstop_mask.sum()))
