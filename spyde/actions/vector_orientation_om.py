@@ -25,6 +25,7 @@ import hyperspy.api as hs
 
 from spyde.backend.ipc import emit, emit_status, emit_error
 from spyde.actions.context import src_plot_tree as _src_plot_tree
+from spyde.actions._common import reciprocal_radius as _reciprocal_radius
 
 log = logging.getLogger(__name__)
 
@@ -37,9 +38,6 @@ DEFAULTS = dict(
 )
 
 
-def _reciprocal_radius(signal) -> float:
-    ax = signal.axes_manager.signal_axes
-    return float(min(a.scale * a.size / 2.0 for a in ax))
 
 
 def vector_orientation_mapping(ctx, action_name: str = "Vector Orientation Mapping", **kwargs):

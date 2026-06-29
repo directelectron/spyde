@@ -14,10 +14,9 @@ import threading
 
 import numpy as np
 
-log = logging.getLogger(__name__)
+from spyde.actions._common import STRAIN_COMPONENTS as _COMPONENTS
 
-_COMPONENTS = ("exx", "eyy", "exy", "omega")
-_TITLES = {"exx": "εxx", "eyy": "εyy", "exy": "εxy", "omega": "ω"}
+log = logging.getLogger(__name__)
 
 
 def _default_reference(vecs) -> tuple:

@@ -11,6 +11,7 @@ from __future__ import annotations
 import numpy as np
 
 from spyde.actions.action import RegionAction
+from spyde.actions._common import widget_region
 
 
 class LineProfileAction(RegionAction):
@@ -29,18 +30,7 @@ class LineProfileAction(RegionAction):
         if not isinstance(img, np.ndarray) or img.ndim != 2:
             return None
 
-        widget = getattr(selector, "roi", None)
-        if widget is not None and hasattr(widget, "_data") and "w" in widget._data:
-            x0 = int(round(float(widget.x)))
-            y0 = int(round(float(widget.y)))
-            x1 = int(round(float(widget.x) + float(widget.w)))
-            y1 = int(round(float(widget.y) + float(widget.h)))
-            x0, x1 = sorted((max(0, x0), min(img.shape[1], x1)))
-            y0, y1 = sorted((max(0, y0), min(img.shape[0], y1)))
-            region = img[y0:y1, x0:x1]
-        else:
-            region = img
-
+        region = widget_region(selector, img)
         if region.size == 0:
             return None
 
