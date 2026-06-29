@@ -704,12 +704,12 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     const testHooksEnabled = import.meta.env.DEV || !window.electron?.isPackaged
     if (testHooksEnabled) {
       // Expose test injection hook for Playwright tests
-      ;(window as Record<string, unknown>)['_spyde_test_inject'] = handleMessage
+      window._spyde_test_inject = handleMessage
 
       // Test hook: return the parsed overlay widgets of a figure's latest panel
       // state, so a test can post the awi_event a selector would post (without
       // pixel-perfect mouse grabbing of a tiny handle).
-      ;(window as Record<string, unknown>)['_spyde_test_widgets'] = (figId: string) => {
+      window._spyde_test_widgets = (figId: string) => {
         const states = latestStates.current.get(figId)
         if (!states) return []
         const widgets: Array<{ panel_id: string; id: string; type: string; data: Record<string, unknown> }> = []
@@ -729,7 +729,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
       // Test hook: a cheap signature of a figure's latest image data (length +
       // sampled chars of the base64 image), so a test can detect that the image
       // actually changed without decoding the canvas.
-      ;(window as Record<string, unknown>)['_spyde_test_image_sig'] = (figId: string) => {
+      window._spyde_test_image_sig = (figId: string) => {
         const states = latestStates.current.get(figId)
         if (!states) return ''
         // Hash the FULL base64 image so a change anywhere in the frame is detected
@@ -777,9 +777,9 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
       disposeStackDialog?.()
       window.removeEventListener('message', onMessage)
       if (testHooksEnabled) {
-        delete (window as Record<string, unknown>)['_spyde_test_inject']
-        delete (window as Record<string, unknown>)['_spyde_test_widgets']
-        delete (window as Record<string, unknown>)['_spyde_test_image_sig']
+        delete window._spyde_test_inject
+        delete window._spyde_test_widgets
+        delete window._spyde_test_image_sig
       }
     }
   }, [])
