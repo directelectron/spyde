@@ -69,8 +69,6 @@ Supported file extensions: `.hspy`, `.zspy`, `.mrc`, `.tif`, `.tiff`, `.de5` (se
 
 ### Actions (`spyde/actions/`)
 - `base.py`: base action framework; defines `NAVIGATOR_DRAG_MIME` for drag-and-drop between plots
-- `hyper_signal_actions/`: YAML-configured HyperSpy signal transformation actions (filtering, FFT, azimuthal integration, etc.)
-- `plot_actions/`: YAML-configured plot manipulation actions (colormap, zoom, export, etc.)
 - `pyxem.py`: PyXEM-specific diffraction processing actions
 
 ### Compute Backend (`spyde/compute_backend.py`)
@@ -288,5 +286,3 @@ The hot paths (vector finding, vector orientation mapping) are GPU-accelerated. 
 ## Configuration Files
 
 - `spyde/*.yaml`: loaded at import time in `spyde/__init__.py` (toolbar and metadata widget configs)
-- `spyde/actions/hyper_signal_actions/*.yaml`: declare available signal actions
-- `spyde/actions/plot_actions/*.yaml`: declare available plot actions

@@ -104,8 +104,6 @@ spyde = [
     "*.icns",
     "*.svg",
     "drawing/toolbars/icons/*.svg",
-    "actions/hyper_signal_actions/*.yaml",
-    "actions/plot_actions/*.yaml",
 ]
 
 [project.optional-dependencies]
