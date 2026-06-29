@@ -177,6 +177,27 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
 })
 
+// Tear the backend down on EVERY quit path, not just when the last window
+// closes (e.g. macOS Cmd-Q, the File→Quit menu role, an app.quit() from IPC).
+// stopSpyDE() is idempotent + null-safe, so overlapping with window-all-closed
+// is harmless. Without this the Python sidecar (and its Dask workers) could
+// outlive the UI on those paths.
+app.on('before-quit', () => stopSpyDE())
+
+// A console SIGINT/SIGTERM (Ctrl-C in `npm run dev`, or a parent killing us)
+// bypasses the normal Electron quit events, so kill the backend explicitly then
+// exit. Guard against double-registration under HMR with `.once` semantics via
+// a flag is unnecessary here — main is evaluated once per process.
+for (const sig of ['SIGINT', 'SIGTERM'] as const) {
+  process.on(sig, () => {
+    stopSpyDE()
+    app.quit()
+    // Give the graceful-quit write + tree-kill a moment, then hard-exit so the
+    // signal isn't swallowed if Electron's own teardown stalls.
+    setTimeout(() => process.exit(0), 2000)
+  })
+}
+
 // ── Application menu ──────────────────────────────────────────────────────────
 
 function buildMenu(): void {
