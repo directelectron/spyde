@@ -28,6 +28,19 @@ log = logging.getLogger(__name__)
 # the same env switch used in base_selector / update_functions / plot_update_worker.
 _NAV_TIMING = os.environ.get("SPYDE_NAV_TIMING") == "1"
 
+# Test-only actions (load synthetic/example data, scripted nav-drag, headless
+# orientation) are reachable from the renderer and download real datasets. They
+# back the Playwright e2e suite, which runs the UNPACKED app, but must NOT be
+# exposed in a shipped (packaged) build. The Electron main process sets
+# SPYDE_PACKAGED=1 only when app.isPackaged (index.ts) and the backend inherits
+# it (runner.ts), so: enabled in dev + e2e, disabled in production.
+_TEST_ACTIONS_ENABLED = os.environ.get("SPYDE_PACKAGED") != "1"
+_TEST_ACTIONS = frozenset({
+    "load_test_data", "load_test_data_lazy", "load_test_data_lazy_chunked",
+    "load_test_data_si_grains", "load_test_data_sped_ag", "test_nav_drag",
+    "load_test_vectors", "run_test_orientation",
+})
+
 if TYPE_CHECKING:
     from spyde.signal_tree import BaseSignalTree
     from spyde.drawing.plots.plot import Plot
@@ -1475,6 +1488,10 @@ class Session:
         window_id = msg.get("window_id")
 
         plot = self._plot_by_window_id(window_id) if window_id is not None else None
+
+        if action in _TEST_ACTIONS and not _TEST_ACTIONS_ENABLED:
+            log.warning("ignoring test-only action %r in a packaged build", action)
+            return
 
         if action == "load_test_data":
             self._load_test_data()
