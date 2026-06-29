@@ -18,15 +18,11 @@ import logging
 import numpy as np
 
 from spyde.actions.strain_mapping import StrainField, principal_strain
+from spyde.actions._common import STRAIN_TITLES as _COMPONENTS
 
 logger = logging.getLogger(__name__)
 
 _ALIVE: list = []
-
-# Diverging colormap (colorcet alias → matplotlib-free) centred on zero strain.
-_COMPONENTS = {
-    "exx": "εxx", "eyy": "εyy", "exy": "εxy", "omega": "ω",
-}
 
 
 def _component_map(field: StrainField, component: str) -> np.ndarray:
