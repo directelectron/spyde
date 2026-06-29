@@ -3,6 +3,7 @@ declare global {
   interface Window {
     electron: {
       platform: string
+      isPackaged: boolean
       onMessage: (cb: (msg: Record<string, unknown>) => void) => () => void
       onStream: (cb: (text: string, kind: 'stdout' | 'stderr') => void) => () => void
       onTile: (cb: () => void) => () => void

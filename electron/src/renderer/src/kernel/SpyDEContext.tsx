@@ -696,52 +696,60 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
 
     const disposeMessage = window.electron.onMessage(handleMessage)
 
-    // Expose test injection hook for Playwright tests
-    ;(window as Record<string, unknown>)['_spyde_test_inject'] = handleMessage
+    // Test-only window hooks (Playwright e2e). NEVER attached in a packaged
+    // production build: a production renderer must not expose a generic message
+    // injector / state inspectors on `window`. Gated TRUE in dev (`npm run dev`)
+    // and under the e2e (which launches the BUILT bundle by path → app.isPackaged
+    // is false → preload's isPackaged is false), FALSE only in `npm run dist`.
+    const testHooksEnabled = import.meta.env.DEV || !window.electron?.isPackaged
+    if (testHooksEnabled) {
+      // Expose test injection hook for Playwright tests
+      ;(window as Record<string, unknown>)['_spyde_test_inject'] = handleMessage
 
-    // Test hook: return the parsed overlay widgets of a figure's latest panel
-    // state, so a test can post the awi_event a selector would post (without
-    // pixel-perfect mouse grabbing of a tiny handle).
-    ;(window as Record<string, unknown>)['_spyde_test_widgets'] = (figId: string) => {
-      const states = latestStates.current.get(figId)
-      if (!states) return []
-      const widgets: Array<{ panel_id: string; id: string; type: string; data: Record<string, unknown> }> = []
-      for (const [key, value] of states) {
-        if (!key.startsWith('panel_') || !key.endsWith('_json')) continue
-        const panelId = key.slice('panel_'.length, -'_json'.length)
-        try {
-          const d = JSON.parse(value as string)
-          for (const w of d.overlay_widgets ?? []) {
-            widgets.push({ panel_id: panelId, id: w.id, type: w.type, data: w })
-          }
-        } catch { /* */ }
+      // Test hook: return the parsed overlay widgets of a figure's latest panel
+      // state, so a test can post the awi_event a selector would post (without
+      // pixel-perfect mouse grabbing of a tiny handle).
+      ;(window as Record<string, unknown>)['_spyde_test_widgets'] = (figId: string) => {
+        const states = latestStates.current.get(figId)
+        if (!states) return []
+        const widgets: Array<{ panel_id: string; id: string; type: string; data: Record<string, unknown> }> = []
+        for (const [key, value] of states) {
+          if (!key.startsWith('panel_') || !key.endsWith('_json')) continue
+          const panelId = key.slice('panel_'.length, -'_json'.length)
+          try {
+            const d = JSON.parse(value as string)
+            for (const w of d.overlay_widgets ?? []) {
+              widgets.push({ panel_id: panelId, id: w.id, type: w.type, data: w })
+            }
+          } catch { /* */ }
+        }
+        return widgets
       }
-      return widgets
-    }
 
-    // Test hook: a cheap signature of a figure's latest image data (length +
-    // sampled chars of the base64 image), so a test can detect that the image
-    // actually changed without decoding the canvas.
-    ;(window as Record<string, unknown>)['_spyde_test_image_sig'] = (figId: string) => {
-      const states = latestStates.current.get(figId)
-      if (!states) return ''
-      // Hash the FULL base64 image so a change anywhere in the frame is detected
-      // (a prefix slice misses bright pixels deeper in the buffer).
-      const hash = (s: string) => {
-        let h = 5381
-        for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0
-        return h
+      // Test hook: a cheap signature of a figure's latest image data (length +
+      // sampled chars of the base64 image), so a test can detect that the image
+      // actually changed without decoding the canvas.
+      ;(window as Record<string, unknown>)['_spyde_test_image_sig'] = (figId: string) => {
+        const states = latestStates.current.get(figId)
+        if (!states) return ''
+        // Hash the FULL base64 image so a change anywhere in the frame is detected
+        // (a prefix slice misses bright pixels deeper in the buffer).
+        const hash = (s: string) => {
+          let h = 5381
+          for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0
+          return h
+        }
+        let sig = ''
+        for (const [key, value] of states) {
+          if (!key.startsWith('panel_')) continue
+          try {
+            const d = JSON.parse(value as string)
+            const b64 = d.image_b64 || ''
+            sig += `${key}:${b64.length}:${hash(b64)}|`
+          } catch { /* */ }
+        }
+        return sig
       }
-      let sig = ''
-      for (const [key, value] of states) {
-        if (!key.startsWith('panel_')) continue
-        try {
-          const d = JSON.parse(value as string)
-          const b64 = d.image_b64 || ''
-          sig += `${key}:${b64.length}:${hash(b64)}|`
-        } catch { /* */ }
-      }
-      return sig
     }
 
     const disposeStream = window.electron.onStream((text, kind) => {
@@ -768,7 +776,11 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
       disposeStream?.()
       disposeStackDialog?.()
       window.removeEventListener('message', onMessage)
-      delete (window as Record<string, unknown>)['_spyde_test_inject']
+      if (testHooksEnabled) {
+        delete (window as Record<string, unknown>)['_spyde_test_inject']
+        delete (window as Record<string, unknown>)['_spyde_test_widgets']
+        delete (window as Record<string, unknown>)['_spyde_test_image_sig']
+      }
     }
   }, [])
 

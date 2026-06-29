@@ -100,6 +100,12 @@ app.whenReady().then(async () => {
   // anyplotlib figures (which auto-theme off it) render in dark mode to match.
   nativeTheme.themeSource = 'dark'
 
+  // Tell the preload whether this is a packaged production app, so the renderer
+  // can gate test-only hooks. `app.isPackaged` is only readable in the main
+  // process; forward it via an env var the preload reads. Set BEFORE the window
+  // (and thus the preload) loads.
+  if (app.isPackaged) process.env.SPYDE_PACKAGED = '1'
+
   createWindow()
 
   // Resolve (and on first packaged run, create via `uv sync`) the Python

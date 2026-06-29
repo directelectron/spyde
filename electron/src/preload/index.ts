@@ -9,6 +9,14 @@ contextBridge.exposeInMainWorld('electron', {
   // titleBarOverlay buttons on the right).
   platform: process.platform,
 
+  // True only in an electron-builder–packaged production app. The main process
+  // sets SPYDE_PACKAGED=1 from `app.isPackaged` before the window loads. Dev
+  // (`npm run dev`) and the Playwright e2e (which launches the BUILT bundle by
+  // path, not a packaged app) leave it unset → false. The renderer uses this to
+  // gate test-only window hooks OFF in production while keeping them live in dev
+  // and e2e.
+  isPackaged: process.env.SPYDE_PACKAGED === '1',
+
   // ── Python → Renderer ─────────────────────────────────────────────────────
 
   // Each on* returns an UNSUBSCRIBE function. The renderer registers these in a
