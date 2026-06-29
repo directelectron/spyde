@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 
-from spyde.backend.ipc import emit
+from spyde.backend import ipc
 
 log = logging.getLogger(__name__)
 
@@ -20,7 +20,7 @@ class AxesEditorMixin:
     def _emit_axes(self, tree) -> None:
         try:
             from spyde.metadata_extract import build_axes_list
-            emit({
+            ipc.emit({
                 "type": "axes_info",
                 "window_ids": self._tree_window_ids(tree),
                 "axes": build_axes_list(tree),
@@ -85,7 +85,7 @@ class AxesEditorMixin:
         self._emit_axes(tree)
         try:
             from spyde.metadata_extract import build_metadata_dict
-            emit({
+            ipc.emit({
                 "type": "metadata",
                 "window_ids": self._tree_window_ids(tree),
                 "metadata": build_metadata_dict(tree),

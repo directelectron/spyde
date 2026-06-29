@@ -20,6 +20,7 @@ from hyperspy.signal import BaseSignal
 from spyde.backend.ipc import emit, emit_status, emit_error, emit_progress
 from spyde.backend._session_axes import AxesEditorMixin
 from spyde.backend._session_testharness import TestHarnessMixin
+from spyde.backend._session_windows import WindowManagerMixin
 from spyde.dask_manager import DaskManager
 from spyde.workers.plot_update_worker import PlotUpdateWorker
 
@@ -149,7 +150,7 @@ _STAGED_HANDLERS = {
 }
 
 
-class Session(AxesEditorMixin, TestHarnessMixin):
+class Session(AxesEditorMixin, TestHarnessMixin, WindowManagerMixin):
     """
     Top-level coordinator.  One instance per app lifetime.
 
@@ -930,17 +931,6 @@ class Session(AxesEditorMixin, TestHarnessMixin):
                 "active": True,
             })
 
-    def register_plot(self, plot: "Plot") -> None:
-        self._plots.append(plot)
-
-    def unregister_plot(self, plot: "Plot") -> None:
-        self._plots = [p for p in self._plots if p is not plot]
-
-    def next_window_id(self) -> int:
-        wid = self._next_window_id
-        self._next_window_id += 1
-        return wid
-
     # ── Plot update callbacks ──────────────────────────────────────────────────
 
     def _on_plot_ready(self, plot, result, future) -> None:
@@ -1205,12 +1195,6 @@ class Session(AxesEditorMixin, TestHarnessMixin):
         emit({"type": "sub_item", "window_id": window_id,
               "action": "Virtual Imaging", "name": name, "active": False})
 
-    def _plot_by_window_id(self, window_id: int):
-        for p in self._plots:
-            if getattr(p, "window_id", None) == window_id:
-                return p
-        return None
-
     def _resolve_save_plot(self, plot):
         """Pick the plot to save: the one passed (from its window), else the
         active window's, else the sole signal plot. The File→Save menu sends no
@@ -1320,152 +1304,6 @@ class Session(AxesEditorMixin, TestHarnessMixin):
             plot.set_clim(vmin, vmax)
         except Exception as e:
             log.warning("set_clim failed: %s", e)
-
-    def _close_window(self, window_id: int) -> None:
-        plot = self._plot_by_window_id(window_id)
-        if plot is None:
-            # Backend already dropped it (or never had it) — still tell the
-            # renderer to remove the window so the UI doesn't get stuck.
-            emit({"type": "window_closed", "window_id": window_id})
-            return
-        try:
-            tree = getattr(plot, "signal_tree", None)
-            if tree is None:
-                self._close_plot(plot)
-                return
-            # Scoping (per spec): the NAVIGATOR's X closes the whole tree (all
-            # signals share its dataset); a signal window's X closes ONLY that
-            # signal (and its selectors / action popouts). A lone signal plot
-            # with no navigator falls through to closing its tree once empty.
-            if getattr(plot, "is_navigator", False):
-                self._close_tree(tree)
-            else:
-                self._close_signal_plot(plot, tree)
-        except Exception as e:
-            log.warning("close_window failed: %s", e)
-
-    def _close_plot(self, plot) -> None:
-        """Tear down a single plot and tell the renderer to drop its window."""
-        wid = getattr(plot, "window_id", None)
-        self._cleanup_plot_selectors(plot)
-        try:
-            plot.close()
-        finally:
-            self.unregister_plot(plot)
-        self._forget_window(wid)
-
-    def _close_signal_plot(self, plot, tree) -> None:
-        """Close a single non-navigator signal window, leaving the rest of the
-        tree open. Cleans up the plot's selectors / source ROI, then drops the
-        tree entirely if nothing is left open."""
-        self._close_plot(plot)
-        try:
-            if plot in getattr(tree, "signal_plots", []):
-                tree.signal_plots.remove(plot)
-        except Exception as e:
-            log.debug("removing plot from tree.signal_plots failed: %s", e)
-        # If no windows of this tree remain open, retire the tree.
-        remaining = [p for p in self._plots if getattr(p, "signal_tree", None) is tree]
-        if not remaining and tree in self.signal_trees:
-            try:
-                tree.close()
-            except Exception as e:
-                log.debug("retiring tree on last window close failed: %s", e)
-            self.signal_trees.remove(tree)
-
-    def _cleanup_plot_selectors(self, plot) -> None:
-        """Close any selectors owned by / driving this plot, so closing a virtual
-        image (etc.) also removes its source ROI from the parent plot."""
-        # The selector on the PARENT plot that drives this output window.
-        try:
-            pw = getattr(plot, "plot_window", None)
-            parent_sel = getattr(pw, "parent_selector", None)
-            if parent_sel is not None and hasattr(parent_sel, "close"):
-                parent_sel.close()
-        except Exception as e:
-            log.debug("closing parent selector failed: %s", e)
-        # Selectors living on this plot itself.
-        try:
-            state = getattr(plot, "plot_state", None)
-            for attr in ("plot_selectors", "signal_tree_selectors"):
-                for sel in list(getattr(state, attr, []) or []):
-                    if hasattr(sel, "close"):
-                        try:
-                            sel.close()
-                        except Exception as e:
-                            log.debug("closing plot selector failed: %s", e)
-        except Exception as e:
-            log.debug("iterating plot selectors for cleanup failed: %s", e)
-
-    def _close_tree(self, tree: "BaseSignalTree") -> None:
-        if tree not in self.signal_trees:
-            return
-        # Collect every plot/window belonging to this tree BEFORE teardown.
-        plots = [p for p in self._plots if getattr(p, "signal_tree", None) is tree]
-        window_ids = sorted({
-            p.window_id for p in plots if getattr(p, "window_id", None) is not None
-        })
-        try:
-            tree.close()
-        except Exception as e:
-            log.debug("closing tree in _close_tree failed: %s", e)
-        for p in plots:
-            self._cleanup_plot_selectors(p)
-            try:
-                p.close()
-            except Exception as e:
-                log.debug("closing plot in _close_tree failed: %s", e)
-            self.unregister_plot(p)
-        if tree in self.signal_trees:
-            self.signal_trees.remove(tree)
-        for wid in window_ids:
-            self._forget_window(wid)
-
-    def _forget_window(self, window_id: int | None) -> None:
-        """Drop per-window backend state and tell the renderer to remove it."""
-        if window_id is None:
-            return
-        if hasattr(self, "_nav_selectors"):
-            self._nav_selectors.pop(window_id, None)
-        # Prune the MDIManager's PlotWindow tracking so closed windows don't leak.
-        try:
-            self.mdi_manager.remove_plot_window(window_id)
-        except Exception as e:
-            log.debug("pruning plot window from MDIManager failed: %s", e)
-        # Drop any action-artifact entries that source from or output to this
-        # window so a re-run starts clean and a closed output isn't "active".
-        for k in [k for k, v in self._action_artifacts.items()
-                  if k[0] == window_id or window_id in v.get("out_wids", [])]:
-            self._action_artifacts.pop(k, None)
-            # Tell the source window's toolbar to un-highlight the action.
-            emit({"type": "action_active", "window_id": k[0], "name": k[1], "active": False})
-        emit({"type": "window_closed", "window_id": window_id})
-
-    def _resize_figure(self, window_id: int, width: int | None, height: int | None) -> None:
-        plot = self._plot_by_window_id(window_id)
-        if plot is None or width is None or height is None:
-            return
-        try:
-            import anyplotlib._electron as _el
-            fig_id = getattr(plot, "fig_id", None)
-            if fig_id is not None:
-                _el.resize_figure(fig_id, int(width), int(height))
-        except Exception as e:
-            log.warning("resize_figure failed: %s", e)
-
-    def _dispatch_figure_event(self, window_id: int, event_json: str | None) -> None:
-        if event_json is None:
-            return
-        plot = self._plot_by_window_id(window_id)
-        if plot is None:
-            return
-        try:
-            import anyplotlib._electron as _el
-            fig_id = getattr(plot, "fig_id", None)
-            if fig_id is not None:
-                _el.dispatch_event(fig_id, event_json)
-        except Exception as e:
-            log.warning("dispatch_figure_event failed: %s", e)
 
     # ── Settings & recent files ────────────────────────────────────────────────
 

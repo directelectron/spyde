@@ -17,7 +17,8 @@ import threading
 import numpy as np
 import hyperspy.api as hs
 
-from spyde.backend.ipc import emit, emit_error
+from spyde.backend import ipc
+from spyde.backend.ipc import emit_error
 
 log = logging.getLogger(__name__)
 
@@ -148,7 +149,7 @@ class TestHarnessMixin:
         try:
             tree = self.signal_trees[-1] if self.signal_trees else None
             if tree is None or tree.navigator_plot_manager is None:
-                emit({"type": "nav_drag_result", "error": "no navigator tree"})
+                ipc.emit({"type": "nav_drag_result", "error": "no navigator tree"})
                 return
             mgr = tree.navigator_plot_manager
             pw = next(iter(mgr.navigation_selectors.keys()))
@@ -188,13 +189,13 @@ class TestHarnessMixin:
                                 "sig": cur, "prev": prev, "cd_kind": _cd_kind()})
                 prev = cur
             n_changed = sum(1 for r in results if r.get("changed"))
-            emit({"type": "nav_drag_result", "total": len(targets),
+            ipc.emit({"type": "nav_drag_result", "total": len(targets),
                   "changed": n_changed, "results": results})
             log.info("[REDRAW] test_nav_drag: %d/%d moves changed the DP",
                      n_changed, len(targets))
         except Exception as e:
             log.exception("test_nav_drag failed")
-            emit({"type": "nav_drag_result", "error": str(e)})
+            ipc.emit({"type": "nav_drag_result", "error": str(e)})
 
     def _load_test_vectors(self) -> None:
         """Test-only: load a small calibrated 4D-STEM stack (two disks per
