@@ -1373,6 +1373,68 @@ try:
         peaks_out[n, slot, 2] = raw_corr[n, out_y, out_x]
 
     @_CUDA_JIT()
+    def _subpixel_parabola_kernel(raw_corr, peak_mask, peaks_out, n_peaks, H, W):
+        """3-point parabolic subpixel refinement — the GPU port of the CPU
+        ``_subpixel_parabola``. Fits a parabola through the peak and its two
+        neighbours on each axis of the NXCORR surface and locates the vertex.
+        This is the standard low-bias subpixel estimator and matches the CPU /
+        torch paths; centre-of-mass (the old default here) is less accurate.
+
+        raw_corr  : float32 (N, H, W)
+        peak_mask : uint8   (N, H, W)
+        peaks_out : float32 (N, MAX_PEAKS, 3)  — [ky_subpx, kx_subpx, score]
+        n_peaks   : int32   (N,)               — atomic counter per frame
+        """
+        out_x = _numba_cuda.blockIdx.x * _numba_cuda.blockDim.x + _numba_cuda.threadIdx.x
+        out_y = _numba_cuda.blockIdx.y * _numba_cuda.blockDim.y + _numba_cuda.threadIdx.y
+        n     = _numba_cuda.blockIdx.z
+
+        if out_x >= W or out_y >= H:
+            return
+        if peak_mask[n, out_y, out_x] == 0:
+            return
+
+        slot = _numba_cuda.atomic.add(n_peaks, n, 1)
+        max_peaks = peaks_out.shape[1]
+        if slot >= max_peaks:
+            return  # overflow guard — silently discard
+
+        fy = float(out_y)
+        fx = float(out_x)
+
+        # Parabolic vertex along Y (rows). Mirror the CPU clamp to [-1, 1].
+        if 0 < out_y < H - 1:
+            a = raw_corr[n, out_y - 1, out_x]
+            b = raw_corr[n, out_y, out_x]
+            c = raw_corr[n, out_y + 1, out_x]
+            den = a - 2.0 * b + c
+            if den != 0.0:
+                d = 0.5 * (a - c) / den
+                if d > 1.0:
+                    d = 1.0
+                elif d < -1.0:
+                    d = -1.0
+                fy = out_y + d
+
+        # Parabolic vertex along X (cols).
+        if 0 < out_x < W - 1:
+            a = raw_corr[n, out_y, out_x - 1]
+            b = raw_corr[n, out_y, out_x]
+            c = raw_corr[n, out_y, out_x + 1]
+            den = a - 2.0 * b + c
+            if den != 0.0:
+                d = 0.5 * (a - c) / den
+                if d > 1.0:
+                    d = 1.0
+                elif d < -1.0:
+                    d = -1.0
+                fx = out_x + d
+
+        peaks_out[n, slot, 0] = fy
+        peaks_out[n, slot, 1] = fx
+        peaks_out[n, slot, 2] = raw_corr[n, out_y, out_x]
+
+    @_CUDA_JIT()
     def _trim_copy_kernel(src, dst, lo_y, lo_x, NXc, H, W):
         """
         Compact the ghost-trimmed core of a blurred (NY_g, NX_g, KY, KX) block
@@ -1788,9 +1850,10 @@ def _find_vectors_batch_gpu(
             if subpixel:
                 peaks_out_d = _cuda.device_array((N, MAX_PEAKS, 3), dtype=np.float32)
                 n_peaks_d   = _cuda.to_device(np.zeros(N, dtype=np.int32))
-                half_win    = np.int32(2)
-                _subpixel_com_kernel[grid, block](
-                    raw_corr_d, peak_mask_d, peaks_out_d, n_peaks_d, half_win, iH, iW,
+                # Parabolic vertex (matches CPU/torch) — more accurate than the
+                # old centre-of-mass kernel.
+                _subpixel_parabola_kernel[grid, block](
+                    raw_corr_d, peak_mask_d, peaks_out_d, n_peaks_d, iH, iW,
                 )
 
         if subpixel:
@@ -2616,9 +2679,12 @@ def _find_vectors_chunk_gpu_impl(
                 n_peaks_d = _gpu_pool_get((N,), np.int32)
                 n_peaks_d.copy_to_device(np.zeros(N, dtype=np.int32),
                                          stream=stream)
-                _subpixel_com_kernel[grid_px, blk_px, stream](
+                # Parabolic vertex (matches the CPU/torch subpixel) — more
+                # accurate than the old centre-of-mass kernel, which was the
+                # least-accurate of the three subpixel paths.
+                _subpixel_parabola_kernel[grid_px, blk_px, stream](
                     raw_corr_obj, peak_mask_d, peaks_out_d, n_peaks_d,
-                    np.int32(2), iH, iW,
+                    iH, iW,
                 )
         _sync_if_timing()
         timings["peaks"] += time.perf_counter() - t0
