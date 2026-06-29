@@ -35,6 +35,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        # Full history + tags so setuptools_scm derives the real version from the
+        # pushed v* tag (a shallow checkout has no tags → 0.0.postN.devN).
+        with:
+          fetch-depth: 0
 
       # ── Node (Electron frontend + electron-builder) ──────────────────────────
       - name: Set up Node
