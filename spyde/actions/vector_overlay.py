@@ -565,7 +565,7 @@ class FindVectorsPreviewOverlay(_DPOverlay):
                 # dilate=0 → the raw (undilated) stop mask; we dilate locally.
                 raw = _auto_beamstop_from_signal(self.signal, nav_dim, dilate=0)
             except Exception as e:
-                logger.debug("preview beam-stop detection failed: %s", e)
+                log.debug("preview beam-stop detection failed: %s", e)
                 raw = None
             self._beamstop_raw = raw                # may be None (no stop found)
             self._beamstop_scanning = False
