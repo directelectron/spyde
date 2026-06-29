@@ -106,10 +106,13 @@ jobs:
         working-directory: electron
         run: npx playwright install --with-deps chromium
 
-      # test:build = electron-vite build && playwright test (default project).
+      # test:build = electron-vite build && playwright test. Pin --project=electron
+      # so ONLY the synthetic/bundled-data project runs; without it Playwright runs
+      # every project, including the heavy real-data 'electron-real' (pyxem
+      # downloads + screenshot writes) that is meant to be opt-in.
       - name: Run Electron e2e
         working-directory: electron
-        run: xvfb-run --auto-servernum npm run test:build
+        run: xvfb-run --auto-servernum npm run test:build -- --project=electron
 
       - name: Upload Playwright report
         if: ${{ always() }}
