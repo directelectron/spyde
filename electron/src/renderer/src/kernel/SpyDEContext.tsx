@@ -7,6 +7,7 @@
 import React, {
   createContext, useContext, useEffect, useReducer, useRef, useState,
 } from 'react'
+import { asPlotAppMessage } from './protocol'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -458,15 +459,19 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
   // ── Python → Renderer message dispatch ──────────────────────────────────
 
   useEffect(() => {
-    const handleMessage = (msg: Record<string, unknown>) => {
-      const t = msg.type as string
-      switch (t) {
+    const handleMessage = (raw: Record<string, unknown>) => {
+      // Narrow the raw IPC payload into the discriminated PlotAppMessage union;
+      // the `switch (msg.type)` below then narrows each field per-variant, so the
+      // handlers read typed fields instead of casting them one-by-one.
+      const msg = asPlotAppMessage(raw)
+      switch (msg.type) {
         case 'ready':
-          dispatch({ type: 'READY', dashboardUrl: msg.dashboard as string | undefined })
+        case 'dask_ready':
+          dispatch({ type: 'READY', dashboardUrl: msg.dashboard })
           break
 
         case 'status':
-          dispatch({ type: 'STATUS', text: msg.text as string })
+          dispatch({ type: 'STATUS', text: msg.text })
           break
 
         case 'error':
@@ -476,29 +481,29 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'backend_exited':
           // The Python sidecar died (synthesised by runner.ts, not a PLOTAPP line).
           // Surface a blocking banner — every sendAction after this no-ops.
-          dispatch({ type: 'BACKEND_EXITED', code: (msg.code as number | null) ?? null })
+          dispatch({ type: 'BACKEND_EXITED', code: msg.code ?? null })
           break
 
         case 'figure': {
           // Normal path: main process wrote the HTML and gave us file_url.
           // Test path: html is injected directly → fall back to a data URL.
-          let fileUrl = (msg.file_url as string) ?? null
+          let fileUrl = msg.file_url ?? null
           if (!fileUrl && msg.html) {
             fileUrl = 'data:text/html;charset=utf-8,' +
-              encodeURIComponent(msg.html as string)
+              encodeURIComponent(msg.html)
           }
           dispatch({
             type: 'FIGURE',
-            windowId: msg.window_id as number,
-            figId: msg.fig_id as string,
+            windowId: msg.window_id,
+            figId: msg.fig_id,
             fileUrl,
-            title: (msg.title as string) || 'Plot',
-            isNavigator: (msg.is_navigator as boolean) || false,
-            aspect: msg.aspect as number | undefined,
-            view: msg.view as string | undefined,
-            viewLabel: msg.view_label as string | undefined,
-            viewKind: msg.view_kind as string | undefined,
-            strainComponents: msg.strain_components as string[] | undefined,
+            title: msg.title || 'Plot',
+            isNavigator: msg.is_navigator || false,
+            aspect: msg.aspect,
+            view: msg.view,
+            viewLabel: msg.view_label,
+            viewKind: msg.view_kind,
+            strainComponents: msg.strain_components,
           })
           break
         }
@@ -506,30 +511,30 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'toolbar_config':
           dispatch({
             type: 'TOOLBAR_CONFIG',
-            windowId: msg.window_id as number,
-            plotId: msg.plot_id as number,
-            actions: (msg.toolbar_actions as ToolbarAction[]) || [],
+            windowId: msg.window_id,
+            plotId: msg.plot_id,
+            actions: msg.toolbar_actions || [],
           })
           break
 
         case 'window_visibility':
           dispatch({
             type: 'WINDOW_VISIBILITY',
-            windowId: msg.window_id as number,
-            visible: msg.visible as boolean,
+            windowId: msg.window_id,
+            visible: msg.visible,
           })
           break
 
         case 'window_closed':
-          dispatch({ type: 'WINDOW_CLOSED', windowId: msg.window_id as number })
+          dispatch({ type: 'WINDOW_CLOSED', windowId: msg.window_id })
           break
 
         case 'state_update':
           // Forward anyplotlib state to the iframe AND remember it, so it can
           // be replayed if/when the iframe (re)loads after this arrived.
           {
-            const figId = msg.fig_id as string
-            const key = msg.key as string
+            const figId = msg.fig_id
+            const key = msg.key
             if (!latestStates.current.has(figId)) {
               latestStates.current.set(figId, new Map())
             }
@@ -545,27 +550,27 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'strain_rings':
           dispatch({
             type: 'STRAIN_RINGS',
-            windowId: msg.window_id as number,
-            rings: (msg.rings as number[]) ?? [],
-            selected: (msg.selected as number[]) ?? [],
+            windowId: msg.window_id,
+            rings: msg.rings ?? [],
+            selected: msg.selected ?? [],
           })
           break
 
         case 'ipf_key':
           dispatch({
             type: 'IPF_KEY',
-            windowId: msg.window_id as number,
-            dataUrl: msg.data_url as string,
+            windowId: msg.window_id,
+            dataUrl: msg.data_url,
           })
           break
 
         case 'composition':
           dispatch({
             type: 'COMPOSITION',
-            windowIds: (msg.window_ids as number[]) ?? [],
+            windowIds: msg.window_ids ?? [],
             composition: {
-              elements: (msg.elements as string[]) ?? [],
-              percentages: (msg.percentages as Record<string, number>) ?? {},
+              elements: msg.elements ?? [],
+              percentages: msg.percentages ?? {},
             },
           })
           break
@@ -573,57 +578,57 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'metadata':
           dispatch({
             type: 'METADATA',
-            windowIds: (msg.window_ids as number[]) ?? [],
-            metadata: (msg.metadata as MetadataDict) ?? {},
+            windowIds: msg.window_ids ?? [],
+            metadata: msg.metadata ?? {},
           })
           break
 
         case 'axes_info':
           dispatch({
             type: 'AXES',
-            windowIds: (msg.window_ids as number[]) ?? [],
-            axes: (msg.axes as AxisRow[]) ?? [],
+            windowIds: msg.window_ids ?? [],
+            axes: msg.axes ?? [],
           })
           break
 
         case 'action_active':
           dispatch({
             type: 'ACTION_ACTIVE',
-            windowId: msg.window_id as number,
-            name: msg.name as string,
-            active: msg.active as boolean,
+            windowId: msg.window_id,
+            name: msg.name,
+            active: msg.active,
           })
           break
 
         case 'sub_item':
           dispatch({
             type: 'SUB_ITEM',
-            windowId: msg.window_id as number,
-            action: msg.action as string,
-            name: msg.name as string,
-            color: (msg.color as string) ?? '#89b4fa',
-            vtype: msg.vtype as string | undefined,
-            calculation: msg.calculation as string | undefined,
-            active: msg.active as boolean,
+            windowId: msg.window_id,
+            action: msg.action,
+            name: msg.name,
+            color: msg.color ?? '#89b4fa',
+            vtype: msg.vtype,
+            calculation: msg.calculation,
+            active: msg.active,
           })
           break
 
         case 'histogram':
           dispatch({
             type: 'HISTOGRAM',
-            windowId: msg.window_id as number,
+            windowId: msg.window_id,
             histogram: {
-              counts: (msg.counts as number[]) ?? [],
-              edges: (msg.edges as number[]) ?? [],
-              vmin: msg.vmin as number,
-              vmax: msg.vmax as number,
-              threshold: (msg.threshold as number | null) ?? null,
+              counts: msg.counts ?? [],
+              edges: msg.edges ?? [],
+              vmin: msg.vmin,
+              vmax: msg.vmax,
+              threshold: msg.threshold ?? null,
             },
           })
           break
 
         case 'nav_shape_prompt':
-          dispatch({ type: 'NAV_SHAPE_PROMPT', prompt: msg as unknown as NavShapePrompt })
+          dispatch({ type: 'NAV_SHAPE_PROMPT', prompt: msg })
           break
 
         case 'loading':
@@ -633,9 +638,9 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'signal_type_info':
           dispatch({
             type: 'SIGNAL_TYPE',
-            windowIds: (msg.window_ids as number[]) ?? [],
+            windowIds: msg.window_ids ?? [],
             current: String(msg.current ?? ''),
-            options: (msg.options as string[]) ?? [],
+            options: msg.options ?? [],
           })
           break
 
@@ -643,9 +648,9 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
           dispatch({
             type: 'SELECTOR_INFO',
             info: {
-              windowId: msg.window_id as number,
-              mode: (msg.mode as 'crosshair' | 'integrate') ?? 'crosshair',
-              title: (msg.title as string) ?? 'Navigator',
+              windowId: msg.window_id,
+              mode: msg.mode ?? 'crosshair',
+              title: msg.title ?? 'Navigator',
             },
           })
           break
@@ -654,15 +659,11 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
           if (msg.tree) {
             dispatch({
               type: 'SIGNAL_TREE',
-              windowId: msg.window_id as number,
-              tree: msg.tree as TreeNode,
-              activeSignalId: msg.active_signal_id as number | undefined,
+              windowId: msg.window_id,
+              tree: msg.tree,
+              activeSignalId: msg.active_signal_id,
             })
           }
-          break
-
-        case 'dask_ready':
-          dispatch({ type: 'READY', dashboardUrl: msg.dashboard as string | undefined })
           break
 
         case 'log':
@@ -673,7 +674,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
           break
 
         case 'log_backfill':
-          dispatch({ type: 'LOG_BACKFILL', entries: (msg.entries as LogEntry[]) ?? [] })
+          dispatch({ type: 'LOG_BACKFILL', entries: msg.entries ?? [] })
           break
 
         case 'log_level':
@@ -689,7 +690,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'fv_auto_params':
         case 'cod_results':
         case 'cod_cif_ready':
-          window.dispatchEvent(new CustomEvent(`spyde:${t}`, { detail: msg }))
+          window.dispatchEvent(new CustomEvent(`spyde:${msg.type}`, { detail: msg }))
           break
       }
     }
