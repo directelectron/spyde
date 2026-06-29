@@ -549,6 +549,22 @@ class BaseSignalTree:
         """Release tree-held resources. Plot windows are torn down by Session."""
         if hasattr(self, "_nav_stop"):
             self._nav_stop.set()
+        # Release the progressive-navigator shared-memory segment (created in
+        # _start_progressive_nav_compute via ensure_live_buffer). Without this it
+        # leaks for the lifetime of the process on every tree close.
+        nav_shm = getattr(self, "_nav_shm", None)
+        if nav_shm is not None:
+            try:
+                nav_shm.close()
+            except Exception as e:
+                logger.debug("closing navigator shm on close failed: %s", e)
+            try:
+                nav_shm.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                logger.debug("unlinking navigator shm on close failed: %s", e)
+            self._nav_shm = None
         self.signal_plots = []
         self.navigator_signals = {}
         self.navigator_plot_manager = None
