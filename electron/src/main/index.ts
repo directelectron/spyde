@@ -5,7 +5,7 @@ import { app, BrowserWindow, dialog, ipcMain, Menu, shell, nativeTheme, net, pro
 import { join, basename } from 'path'
 import { pathToFileURL } from 'url'
 import { tmpdir } from 'os'
-import { existsSync, writeFileSync } from 'fs'
+import { existsSync, realpathSync, writeFileSync } from 'fs'
 import {
   startSpyDE, sendAction, sendFigureEvent, sendResize,
   stopSpyDE,
@@ -28,9 +28,17 @@ let win: BrowserWindow | null = null
 // to `file://` is blocked by web security — which is the whole point).
 const FIG_SCHEME = 'spyde-fig'
 const FIG_HOST = 'figures'
+const ICON_HOST = 'icons'
 // Only ever serve the two kinds of files SpyDE itself writes to tmp; anything
 // else (path traversal, arbitrary reads) is refused.
 const FIG_NAME_RE = /^spyde_(?:fig_[\w.-]+\.html|figure_esm_[0-9a-f]+\.js)$/
+// Toolbar icons are package assets (absolute paths from the Python backend's
+// resolve_icon_path). With webSecurity enabled the renderer's http://localhost
+// (dev) origin can't load file:// <img> subresources, so icons are served via
+// this scheme instead. Guard: the resolved real path must be an .svg/.png that
+// lives under a ".../spyde/.../icons/" directory — no arbitrary reads.
+const ICON_EXT_RE = /\.(svg|png)$/i
+const ICON_CONTAINMENT_RE = /[/\\]spyde[/\\](?:.*[/\\])?icons[/\\][^/\\]+$/i
 
 protocol.registerSchemesAsPrivileged([
   { scheme: FIG_SCHEME, privileges: { standard: true, secure: true, supportFetchAPI: true } },
@@ -54,6 +62,22 @@ function resolveFigPath(reqUrl: string): string | null {
 /** A `spyde-fig://figures/<name>` URL for a temp file basename. */
 function figUrl(name: string): string {
   return `${FIG_SCHEME}://${FIG_HOST}/${encodeURIComponent(name)}`
+}
+
+/** Map a `spyde-fig://icons/<abs-path>` request to a package icon file. Serves
+ *  only an .svg/.png whose REAL path lives under a spyde ".../icons/" directory;
+ *  realpath collapses any `..`/symlink before the containment + extension check. */
+function resolveIconPath(reqUrl: string): string | null {
+  let u: URL
+  try { u = new URL(reqUrl) } catch { return null }
+  if (u.host !== ICON_HOST) return null
+  // pathname is "/<percent-encoded-absolute-path>"; strip the leading slash.
+  const raw = decodeURIComponent(u.pathname.replace(/^\//, ''))
+  if (!raw || !ICON_EXT_RE.test(raw) || !existsSync(raw)) return null
+  let real: string
+  try { real = realpathSync(raw) } catch { return null }
+  if (!ICON_CONTAINMENT_RE.test(real) || !ICON_EXT_RE.test(real)) return null
+  return real
 }
 
 // Messages from the Python backend can arrive before the renderer has finished
@@ -148,7 +172,10 @@ app.whenReady().then(async () => {
   // scheme registration near the top). Refuses anything outside the temp-dir
   // basename allowlist.
   protocol.handle(FIG_SCHEME, async (request) => {
-    const filePath = resolveFigPath(request.url)
+    const host = (() => { try { return new URL(request.url).host } catch { return '' } })()
+    const filePath = host === ICON_HOST
+      ? resolveIconPath(request.url)
+      : resolveFigPath(request.url)
     if (!filePath) return new Response('Not found', { status: 404 })
     return net.fetch(pathToFileURL(filePath).href)
   })

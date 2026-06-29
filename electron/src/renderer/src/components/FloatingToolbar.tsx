@@ -27,16 +27,16 @@ const WIZARD_ACTIONS = new Set([
 ])
 
 /**
- * Turn an OS filesystem path into a valid file:// URL. The Python backend sends
- * native icon paths, which on Windows are `C:\…\icon.svg` — a bare
- * `file://C:\…` is malformed (backslashes + drive letter), so the icons never
- * loaded there. Normalise separators and prefix the drive with the extra slash
- * Windows file URLs require.
+ * Turn an OS filesystem path into a `spyde-fig://icons/<path>` URL. The Python
+ * backend sends native icon paths (absolute package-asset paths). We can't load
+ * them as raw `file://` <img> subresources because webSecurity is enabled and
+ * the dev renderer runs on an http://localhost origin (Chromium blocks file://
+ * subresources from http origins). The main process serves them through the
+ * privileged spyde-fig scheme, validating the path is a real .svg/.png under a
+ * spyde ".../icons/" directory (see resolveIconPath in main/index.ts).
  */
 function fileUrl(p: string): string {
-  const fwd = p.replace(/\\/g, '/')
-  // Windows absolute path (drive letter) → file:///C:/…  ; POSIX → file:///…
-  return /^[a-zA-Z]:\//.test(fwd) ? `file:///${fwd}` : `file://${fwd}`
+  return `spyde-fig://icons/${encodeURIComponent(p)}`
 }
 
 // Actions that draw a live marker overlay on the DP. The overlay is shown only
