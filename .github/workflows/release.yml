@@ -55,6 +55,12 @@ jobs:
         with:
           enable-cache: true
 
+      # Fail fast on a drifted lock: the installer bundles pyproject.toml +
+      # uv.lock and resolves the venv on the USER's first launch, so an
+      # out-of-sync lock would ship a broken installer that only fails for them.
+      - name: Verify uv.lock is in sync with pyproject.toml
+        run: uv lock --check
+
       # AppImage tooling needs FUSE on the runner.
       - name: Install Linux packaging deps
         if: runner.os == 'Linux'
