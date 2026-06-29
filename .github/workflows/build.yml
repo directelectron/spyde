@@ -61,6 +61,29 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
 
+  # ── Renderer/main TypeScript typecheck ─────────────────────────────────────
+  # Pure TS compile (tsc --noEmit) of the Electron main + renderer. No Python /
+  # display server needed, so it's a fast standalone job that gates the PR.
+  typecheck:
+    name: electron-typecheck (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Electron dependencies
+        working-directory: electron
+        run: npm ci
+
+      - name: Typecheck (tsc --noEmit)
+        working-directory: electron
+        run: npm run typecheck
+
   # ── Electron e2e (Playwright) ──────────────────────────────────────────────
   # Runs the DEFAULT 'electron' project only (synthetic + bundled data, no
   # network). The opt-in 'electron-real' project (real pyxem downloads + the
