@@ -387,4 +387,22 @@ ipcMain.on('spyde:resize', (_, figId: string, width: number, height: number) =>
   sendResize(figId, width, height)
 )
 
-ipcMain.on('open-external', (_, url: string) => shell.openExternal(url))
+// Only hand a URL to the OS if it parses AND uses a protocol we trust. Without
+// this, the renderer (or any compromised iframe content posting through it)
+// could ask the OS to open arbitrary `file:`, custom-scheme, or `javascript:`
+// URLs — a classic shell.openExternal abuse. Allowlist web + mail only.
+const OPEN_EXTERNAL_ALLOWED = new Set(['https:', 'http:', 'mailto:'])
+ipcMain.on('open-external', (_, url: string) => {
+  let parsed: URL
+  try {
+    parsed = new URL(url)
+  } catch {
+    console.warn(`[spyde] open-external rejected unparseable URL: ${url}`)
+    return
+  }
+  if (!OPEN_EXTERNAL_ALLOWED.has(parsed.protocol)) {
+    console.warn(`[spyde] open-external rejected disallowed protocol: ${parsed.protocol}`)
+    return
+  }
+  shell.openExternal(parsed.href)
+})
