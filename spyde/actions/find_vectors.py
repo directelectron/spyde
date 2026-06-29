@@ -1122,10 +1122,9 @@ def _nav_chunk_size(
 
 # ── GPU kernels (numba.cuda) ──────────────────────────────────────────────────
 # These are defined at module level so numba can JIT-compile them once and
-# reuse across calls.  All three are guarded: if numba is not installed or
-# CUDA is not available the try/except in _find_vectors_batch_gpu catches the
-# ImportError / CudaSupportError and returns None so the caller falls back to
-# the CPU path transparently.
+# reuse across calls.  They are guarded: if numba is not installed or CUDA is
+# not available the try/except below sets _GPU_KERNELS_AVAILABLE = False so the
+# caller falls back to the CPU path transparently.
 
 try:
     from numba import cuda as _numba_cuda
@@ -1196,76 +1195,6 @@ try:
                 acc += kern[k] * src[iy, src_x, ky_i, kx_i]
 
         dst[iy, ix, ky_i, kx_i] = acc
-
-    @_CUDA_JIT()
-    def _nxcorr_kernel(
-        frames_padded, disk, raw_corr, global_stds,
-        n_disk, t_mean, t_std, kr, kr_win, threshold, H, W,
-    ):
-        """
-        Window-normalised cross-correlation kernel.
-
-        frames_padded : float32 (N, H+2*kr_win, W+2*kr_win)
-        disk          : float32 (2*kr+1, 2*kr+1)
-        raw_corr      : float32 (N, H, W)  — output
-        global_stds   : float32 (N,)
-        """
-        out_x = _numba_cuda.blockIdx.x * _numba_cuda.blockDim.x + _numba_cuda.threadIdx.x
-        out_y = _numba_cuda.blockIdx.y * _numba_cuda.blockDim.y + _numba_cuda.threadIdx.y
-        n     = _numba_cuda.blockIdx.z
-
-        if out_x >= W or out_y >= H:
-            return
-
-        PW = W + 2 * kr_win  # padded width (unused in indexing but kept for clarity)
-
-        # ── Cross-correlation: convolve disk over padded frame ────────────────
-        disk_h = 2 * kr + 1
-        disk_w = 2 * kr + 1
-        # float32 accumulator — a 0.0 literal would type as float64, which
-        # Pascal-class GPUs execute at 1/32 the float32 rate
-        xcorr = _nb_f32(0.0)
-        for dr in range(disk_h):
-            for dc in range(disk_w):
-                py = out_y + kr_win + dr - kr
-                px = out_x + kr_win + dc - kr
-                val = frames_padded[n, py, px]
-                xcorr += disk[dr, dc] * val
-
-        # ── Window statistics: loop over (2*kr_win+1)^2 neighbourhood ────────
-        win_size = 2 * kr_win + 1
-        sum1 = _nb_f32(0.0)
-        sum2 = _nb_f32(0.0)
-        for dr in range(win_size):
-            for dc in range(win_size):
-                v = frames_padded[n, out_y + dr, out_x + dc]
-                sum1 += v
-                sum2 += v * v
-
-        n_win = win_size * win_size
-        win_mean = sum1 / n_win
-        win_var = sum2 / n_win - win_mean * win_mean
-        if win_var < 0.0:
-            win_var = 0.0
-        win_std = _math.sqrt(win_var)
-
-        # ── Normalise ─────────────────────────────────────────────────────────
-        denom_floor = 0.01 * global_stds[n] * t_std
-        denom = win_std * t_std
-        if denom < denom_floor:
-            denom = denom_floor
-        num = xcorr / n_disk - win_mean * t_mean
-
-        if denom >= 1e-8:
-            score = num / denom
-            if score > 1.0:
-                score = 1.0
-            elif score < -1.0:
-                score = -1.0
-        else:
-            score = 0.0
-
-        raw_corr[n, out_y, out_x] = score
 
     @_CUDA_JIT()
     def _local_max_kernel(raw_corr, peak_mask, threshold, min_d, H, W):
@@ -1516,7 +1445,7 @@ try:
         """
         Window-normalised cross-correlation on UNPADDED frames.
 
-        Replaces _nxcorr_kernel + the host-side reflect-pad: out-of-bounds taps
+        Folds the host-side reflect-pad into the kernel: out-of-bounds taps
         are reflected in-index (same convention as np.pad mode="reflect" and
         the separable blur kernel), so the blurred frames never leave the
         device between blur and correlation.
@@ -1725,211 +1654,6 @@ try:
 
 except Exception:
     _GPU_KERNELS_AVAILABLE = False
-
-
-def _find_vectors_batch_gpu(
-    blurred_block,
-    kernel_r,
-    threshold,
-    min_dist,
-    subpixel,
-    beamstop_mask,
-    disk_d,
-    disk_stats,
-):
-    """
-    GPU-accelerated batch vector finding using numba.cuda.
-
-    Parameters
-    ----------
-    blurred_block : CPU float32 ndarray (..., H, W)
-        Nav-blurred diffraction patterns; any number of leading nav dims.
-    kernel_r : int
-        Disk kernel radius in pixels.
-    threshold : float
-        NXCORR threshold.
-    min_dist : int
-        Minimum peak separation in pixels.
-    subpixel : bool
-        Whether to apply CoM subpixel refinement.
-    beamstop_mask : (H, W) bool ndarray | None
-        Pixels to exclude.
-    disk_d : device array | None
-        Pre-uploaded float32 disk kernel for this kernel_r.  If None the
-        function uploads it and stores it in _gpu_disk_cache.
-    disk_stats : (n_disk, t_mean, t_std)
-        Pre-computed disk statistics (same values as in the CPU path).
-
-    Returns
-    -------
-    object ndarray of shape nav_shape, each element (N_peaks, 3) float32,
-    or None if CUDA is unavailable / any error occurs (caller falls back to CPU).
-    """
-    try:
-        from numba import cuda as _cuda
-    except ImportError:
-        return None
-    if not _cuda.is_available():
-        return None
-    if not _GPU_KERNELS_AVAILABLE:
-        return None
-
-    try:
-        n_disk, t_mean, t_std = disk_stats
-        n_disk  = np.int32(n_disk)
-        t_mean  = np.float32(t_mean)
-        t_std   = np.float32(t_std)
-        kr      = np.int32(kernel_r)
-        kr_win  = np.int32(kernel_r + 1)   # kernel_window_pad = 1, same as CPU
-        thr     = np.float32(threshold)
-        min_d   = np.int32(min_dist)
-
-        nav_shape = blurred_block.shape[:-2]
-        H, W = int(blurred_block.shape[-2]), int(blurred_block.shape[-1])
-        iH, iW = np.int32(H), np.int32(W)
-        N = int(np.prod(nav_shape)) if len(nav_shape) > 0 else 1
-
-        # Flatten to (N, H, W) float32
-        frames = blurred_block.reshape(N, H, W).astype(np.float32)
-
-        # Beam stop = a PEAK-REJECTION region, NOT an image edit. We do NOT fill
-        # the masked pixels: a fill creates a sharp step at the mask boundary that
-        # the correlator scores as bright rim spots. The detector runs on the
-        # UNMODIFIED frame and peaks inside the mask are dropped below (the same
-        # post-detection exclusion the CPU path uses), so the stop contributes no
-        # detections without introducing an artificial edge.
-
-        # Per-frame global std (on CPU before H2D)
-        global_stds = frames.std(axis=(-1, -2)).astype(np.float32)
-        # Guard against all-zero frames
-        global_stds[global_stds == 0.0] = 1.0
-
-        # Reflect-pad each frame by kr_win on all sides
-        frames_padded = np.pad(
-            frames,
-            ((0, 0), (int(kr_win), int(kr_win)), (int(kr_win), int(kr_win))),
-            mode="reflect",
-        ).astype(np.float32)
-
-        # Upload to device
-        frames_d       = _cuda.to_device(frames_padded)
-        global_stds_d  = _cuda.to_device(global_stds)
-
-        # Disk kernel — upload once per kernel_r, then reuse
-        if disk_d is None:
-            disk_cpu = _make_disk(kernel_r)
-            disk_d   = _cuda.to_device(disk_cpu)
-            _gpu_disk_cache[kernel_r] = disk_d
-
-        # Allocate output arrays on device
-        raw_corr_d  = _cuda.device_array((N, H, W), dtype=np.float32)
-        peak_mask_d = _cuda.device_array((N, H, W), dtype=np.uint8)
-
-        # Grid / block configuration
-        bx, by = 16, 16
-        grid = (
-            int(np.ceil(W / bx)),
-            int(np.ceil(H / by)),
-            N,
-        )
-        block = (bx, by, 1)
-
-        import warnings as _w
-        with _w.catch_warnings():
-            _w.simplefilter("ignore")  # suppress numba low-occupancy warnings for small chunks
-
-            _nxcorr_kernel[grid, block](
-                frames_d, disk_d, raw_corr_d, global_stds_d,
-                n_disk, t_mean, t_std, kr, kr_win, thr, iH, iW,
-            )
-
-            _local_max_kernel[grid, block](
-                raw_corr_d, peak_mask_d, thr, min_d, iH, iW,
-            )
-
-            if subpixel:
-                peaks_out_d = _cuda.device_array((N, MAX_PEAKS, 3), dtype=np.float32)
-                n_peaks_d   = _cuda.to_device(np.zeros(N, dtype=np.int32))
-                # Parabolic vertex (matches CPU/torch) — more accurate than the
-                # old centre-of-mass kernel.
-                _subpixel_parabola_kernel[grid, block](
-                    raw_corr_d, peak_mask_d, peaks_out_d, n_peaks_d, iH, iW,
-                )
-
-        if subpixel:
-            peaks_out = peaks_out_d.copy_to_host()
-            n_peaks   = n_peaks_d.copy_to_host()
-        else:
-            peak_mask = peak_mask_d.copy_to_host()
-            raw_corr  = raw_corr_d.copy_to_host()
-
-        # Build per-frame result list, then run greedy NMS (CPU — very fast,
-        # typically <30 peaks per frame)
-        result_flat = np.empty(N, dtype=object)
-        min_d2 = int(min_dist) * int(min_dist)
-        # Host frames for raw-intensity sampling (the GPU kernel stores the corr
-        # score; NMS below uses it, then we overwrite the value with the raw
-        # experimental intensity at each peak — matching the CPU path).
-        host_frames = blurred_block.reshape(-1, H, W)
-
-        for i in range(N):
-            if subpixel:
-                np_i   = int(n_peaks[i])
-                np_i   = min(np_i, MAX_PEAKS)
-                if np_i == 0:
-                    result_flat[i] = np.zeros((0, 3), dtype=np.float32)
-                    continue
-                frame_peaks = peaks_out[i, :np_i, :].copy()  # (np_i, 3): [ky, kx, score]
-            else:
-                pm  = peak_mask[i]   # (H, W) uint8
-                rc  = raw_corr[i]    # (H, W) float32
-                yx  = np.argwhere(pm > 0)
-                if len(yx) == 0:
-                    result_flat[i] = np.zeros((0, 3), dtype=np.float32)
-                    continue
-                scores = rc[yx[:, 0], yx[:, 1]]
-                frame_peaks = np.column_stack([yx.astype(np.float32), scores])
-
-            # Apply beamstop mask exclusion (on surviving peaks)
-            if beamstop_mask is not None and beamstop_mask.any() and len(frame_peaks) > 0:
-                ky_px = frame_peaks[:, 0].astype(int)
-                kx_px = frame_peaks[:, 1].astype(int)
-                np.clip(ky_px, 0, H - 1, out=ky_px)
-                np.clip(kx_px, 0, W - 1, out=kx_px)
-                keep = ~beamstop_mask[ky_px, kx_px]
-                frame_peaks = frame_peaks[keep]
-
-            if len(frame_peaks) == 0:
-                result_flat[i] = np.zeros((0, 3), dtype=np.float32)
-                continue
-
-            # Greedy NMS (matches CPU path)
-            if len(frame_peaks) > 1:
-                # Deterministic order: the GPU subpixel kernel fills slots via
-                # atomics in arbitrary order, so tie-break equal scores by
-                # position to keep results reproducible run-to-run.
-                order = np.lexsort(
-                    (frame_peaks[:, 1], frame_peaks[:, 0], -frame_peaks[:, 2])
-                )
-                frame_peaks = frame_peaks[order]
-                kept = np.ones(len(frame_peaks), dtype=bool)
-                for j in range(len(frame_peaks)):
-                    if not kept[j]:
-                        continue
-                    dy = frame_peaks[j + 1:, 0] - frame_peaks[j, 0]
-                    dx = frame_peaks[j + 1:, 1] - frame_peaks[j, 1]
-                    too_close = (dy * dy + dx * dx) <= min_d2
-                    kept[j + 1:][too_close] = False
-                frame_peaks = frame_peaks[kept]
-
-            result_flat[i] = _with_raw_intensity(host_frames[i], frame_peaks,
-                                                 radius=kernel_r)
-
-        result = result_flat.reshape(nav_shape) if len(nav_shape) > 0 else result_flat
-        return result
-
-    except Exception:
-        return None
 
 
 def _gpu_task_allowed() -> bool:
