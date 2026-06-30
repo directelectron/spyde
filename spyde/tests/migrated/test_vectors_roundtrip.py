@@ -182,8 +182,9 @@ class TestSessionRoundTrip:
             saved["path"] = path
 
         monkeypatch.setattr(session, "_save_signal_thread", fake_thread)
-        # _save_signal spawns a thread; patch Thread to run inline.
-        import spyde.backend.session as sm
+        # _save_signal lives in FileLoaderMixin (_session_files) and spawns a
+        # thread; patch that module's Thread to run inline.
+        import spyde.backend._session_files as sm
         monkeypatch.setattr(sm.threading, "Thread",
                             lambda target, args, daemon, name: type(
                                 "T", (), {"start": lambda self: target(*args)})())
