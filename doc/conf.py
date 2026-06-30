@@ -58,6 +58,9 @@ sphinx_gallery_conf = {
     "backreferences_dir": "spyde",
     "doc_module": ("spyde",),
     "reference_url": {"spyde": None},
-    "image_scrapers": ("spyde.qt_scrapper.qt_sg_scraper",),
+    # Default matplotlib scraper. (The old "spyde.qt_scrapper.qt_sg_scraper"
+    # captured screenshots of the retired Qt MainWindow; that module is gone
+    # now that the UI is Electron/anyplotlib.)
+    "image_scrapers": ("matplotlib",),
     "capture_repr": (),  # Disable text output capture
 }

@@ -101,8 +101,13 @@ class TestVectorOrientationOM:
             # refine, before Compute Maps).
             assert _wait(lambda: getattr(vtree, "_vom_field", None) is not None,
                          timeout=90), "live field fit / IPF heatmap never produced"
-            assert any(getattr(t, "vector_orientation", None) is not None
-                       for t in session.signal_trees), "no IPF heatmap window"
+            # The IPF heatmap tree is created AFTER _vom_field is set (the worker
+            # sets _vom_field, then calls _build_ipf_heatmap which sets
+            # .vector_orientation). Poll for it rather than asserting immediately —
+            # on slow runners the worker is still between those two steps here.
+            assert _wait(lambda: any(getattr(t, "vector_orientation", None) is not None
+                                     for t in session.signal_trees),
+                         timeout=90), "no IPF heatmap window"
 
             # ── Compute Maps → reuses the field, adds ONE unified Strain window
             #    (εxx is its signal plot; εyy / εxy are chip-selectable view
