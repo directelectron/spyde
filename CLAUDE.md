@@ -34,6 +34,8 @@ Slow benchmarks live in `spyde/tests/benchmark_*.py` — run directly (`python -
 
 **Build distributable:** from `electron/`, `npm run dist` (electron-vite build + `bundle:python` + electron-builder). See `electron/electron-builder.yml` and `DISTRIBUTION_PLAN.md`.
 
+**Commits:** do NOT add Claude/AI as a co-author. Commit messages must not include a `Co-Authored-By: Claude …` (or `Claude-Session`) trailer. (Enforced via `includeCoAuthoredBy: false` + empty `attribution` in `~/.claude/settings.json`.)
+
 ## Dependencies
 
 Python deps are in `pyproject.toml`. Key non-PyPI deps from custom forks (check `pyproject.toml` for the exact pinned branch — they move):
