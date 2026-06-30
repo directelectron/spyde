@@ -125,12 +125,22 @@ class TestVectorOrientationOM:
 
             # The unified Strain window tags its signal plot as the εxx chip view
             # (εyy / εxy ride along as extra view figures in the same window).
-            strain_tree = next((t for t in session.signal_trees
-                                if "Strain" in t.root.metadata.get_item(
-                                    "General.title", "")), None)
-            assert strain_tree is not None, "no unified Strain window"
-            sp = next(iter(getattr(strain_tree, "signal_plots", [])), None)
-            assert sp is not None and getattr(sp, "view_label", None) == "εxx"
+            def _strain_tree():
+                return next((t for t in session.signal_trees
+                             if "Strain" in t.root.metadata.get_item(
+                                 "General.title", "")), None)
+
+            # The Strain tree is added (passing the wait above) BEFORE the worker
+            # tags its signal plot's view_label "εxx" (_build_result_windows adds
+            # the tree, then calls sp.set_view_tag). Poll for the tagged plot
+            # rather than reading view_label immediately — on slow runners the
+            # tag hasn't landed yet at this point.
+            def _strain_sp():
+                st = _strain_tree()
+                return next(iter(getattr(st, "signal_plots", [])), None) if st else None
+
+            assert _wait(lambda: getattr(_strain_sp(), "view_label", None) == "εxx",
+                         timeout=90), "Strain window εxx view never tagged"
         finally:
             session.shutdown()
 

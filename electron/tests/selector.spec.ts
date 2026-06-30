@@ -283,13 +283,14 @@ test('axes table renders and editing scale writes back (real backend)', async ()
 
   // Edit axis 0 scale: click the cell text → it becomes an input. After commit
   // the backend writes it to the real axes_manager and re-emits axes_info, so the
-  // cell snaps to the normalised float ("2.50" → 2.5). That round trip to Python
-  // and back proves the write-back.
+  // cell re-renders the round-tripped value. The display formats the scale to 2dp
+  // (PlotControlDock fmt = n.toFixed(2)), so "2.50" → "2.50". That round trip to
+  // Python and back proves the write-back.
   await page.getByTestId('axis-0-scale').click()
   const scale0 = page.getByTestId('axis-0-scale-input')
   await scale0.fill('2.50')
   await scale0.blur()
-  await expect(page.getByTestId('axis-0-scale')).toHaveText('2.5', { timeout: 10_000 })
+  await expect(page.getByTestId('axis-0-scale')).toHaveText('2.50', { timeout: 10_000 })
 })
 
 test('Virtual Imaging: Add (real backend) creates a VI + lists a colored chip', async () => {
