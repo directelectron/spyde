@@ -68,8 +68,9 @@ def build_strain_figure(field: StrainField, *, component: str = "exx",
                         ref_yx=None, glyph_step: int | None = None,
                         glyph_amp: float = 60.0, vmax: float | None = None,
                         cmap: str = "coolwarm", glyphs: bool = True):
-    """Build the strain view → ``(fig, fig_id, html, plot2d)``. ``plot2d`` is
-    returned so a controller can live-update the data / glyphs / reference."""
+    """Build the strain view → ``(fig, fig_id, html, plot2d, glyph_group)``.
+    ``plot2d`` and ``glyph_group`` are returned so a controller can live-update
+    the component map / ellipse glyphs / reference crosshair."""
     import anyplotlib as apl
     import anyplotlib._electron as _electron
     from spyde.drawing.plots.plot import finalize_figure_html
