@@ -5,7 +5,7 @@ import { app, BrowserWindow, dialog, ipcMain, Menu, shell, nativeTheme, net, pro
 import { join, basename } from 'path'
 import { pathToFileURL } from 'url'
 import { tmpdir } from 'os'
-import { existsSync, realpathSync, writeFileSync } from 'fs'
+import { existsSync, realpathSync, writeFileSync, rmSync } from 'fs'
 import {
   startSpyDE, sendAction, sendFigureEvent, sendResize,
   stopSpyDE,
@@ -88,6 +88,18 @@ function resolveIconPath(reqUrl: string): string | null {
 // until the renderer signals ready, then flush in order.
 let rendererReady = false
 const pendingMessages: Array<Record<string, unknown>> = []
+
+// Figure HTML files written to tmpdir (served via spyde-fig://). Tracked so we
+// can remove them on quit — otherwise a long session with many re-rendered
+// figures leaves spyde_fig_*.html accumulating in the OS temp dir.
+const figTmpFiles = new Set<string>()
+
+function cleanupFigTmpFiles(): void {
+  for (const p of figTmpFiles) {
+    try { rmSync(p, { force: true }) } catch { /* best-effort temp cleanup */ }
+  }
+  figTmpFiles.clear()
+}
 
 function rendererAlive(): boolean {
   return !!win && !win.isDestroyed() && !win.webContents.isDestroyed()
@@ -221,6 +233,7 @@ app.whenReady().then(async () => {
       if (msg.type === 'figure' && msg.html && msg.fig_id) {
         const figName = `spyde_fig_${String(msg.fig_id)}.html`
         const figPath = join(tmpdir(), figName)
+        figTmpFiles.add(figPath)   // tracked for cleanup on quit
         try {
           // The Python side embeds a dynamic `import("file://…/spyde_figure_esm_*.js")`
           // for the shared JS bundle. A secure-scheme page can't import a
@@ -266,6 +279,7 @@ app.whenReady().then(async () => {
 
 app.on('window-all-closed', () => {
   stopSpyDE()
+  cleanupFigTmpFiles()
   if (process.platform !== 'darwin') app.quit()
 })
 
@@ -274,7 +288,7 @@ app.on('window-all-closed', () => {
 // stopSpyDE() is idempotent + null-safe, so overlapping with window-all-closed
 // is harmless. Without this the Python sidecar (and its Dask workers) could
 // outlive the UI on those paths.
-app.on('before-quit', () => stopSpyDE())
+app.on('before-quit', () => { stopSpyDE(); cleanupFigTmpFiles() })
 
 // A console SIGINT/SIGTERM (Ctrl-C in `npm run dev`, or a parent killing us)
 // bypasses the normal Electron quit events, so kill the backend explicitly then
@@ -283,6 +297,7 @@ app.on('before-quit', () => stopSpyDE())
 for (const sig of ['SIGINT', 'SIGTERM'] as const) {
   process.on(sig, () => {
     stopSpyDE()
+    cleanupFigTmpFiles()
     app.quit()
     // Give the graceful-quit write + tree-kill a moment, then hard-exit so the
     // signal isn't swallowed if Electron's own teardown stalls.
