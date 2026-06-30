@@ -111,6 +111,7 @@ spyde = [
 tests = [
     "pytest-instafail",
     "pytest-rerunfailures",
+    "pytest-timeout",
     "pytest>=3.6",
     "setuptools_scm",
     "pytest-cov",
