@@ -104,42 +104,112 @@ def emit_ipf_3d(window_id: int, result, direction: str = "z",
     return True
 
 
-def ipf_key_data_url(result, direction: str = "z") -> str:
-    """Rasterise the IPF colour-KEY triangle (orix ``IPFColorKeyTSL.plot`` — the
-    standard stereographic fundamental-sector legend, e.g. cubic [001]/[101]/[111])
-    to a transparent-background PNG data URL. This is the legend the matplotlib /
-    pyxem IPF plots show next to the map; the triangle is the crystal-direction
-    colour key (same for sample X/Y/Z)."""
-    import base64
-    import io
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+def _ipf_key_color_grid(phase, direction: str, n: int):
+    """Build the IPF colour-KEY raster over the fundamental sector → ``(xc, yc,
+    colors, xy_edges, label_xy, labels)``.
+
+    ``xc``/``yc`` are the ``(n+1, n+1)`` cell-CORNER stereographic grids (for
+    ``pcolormesh``); ``colors`` is the ``(n, n)`` array of ``#rrggbb`` strings —
+    the orix IPF colour at each cell-centre direction, masked (``""``) outside the
+    fundamental sector so the mesh clips itself to the triangle.
+    """
+    import numpy as np
     from orix.plot import IPFColorKeyTSL
-    from spyde.signals.orientation_map import _direction_vector
+    from orix.projections import InverseStereographicProjection
+
+    from spyde.signals.orientation_map import _direction_vector, ipf_triangle_xy
+
+    key = IPFColorKeyTSL(phase.point_group.laue,
+                         direction=_direction_vector(direction))
+    dck = key.direction_color_key
+    sector = phase.point_group.laue.fundamental_sector
+
+    xy_edges, label_xy, labels = ipf_triangle_xy(phase)
+    ex, ey = np.asarray(xy_edges)[:, 0], np.asarray(xy_edges)[:, 1]
+    xmin, xmax = float(ex.min()), float(ex.max())
+    ymin, ymax = float(ey.min()), float(ey.max())
+
+    # Cell-corner grids (n+1) and cell-centre grids (n) for the colour eval.
+    xe = np.linspace(xmin, xmax, n + 1)
+    ye = np.linspace(ymin, ymax, n + 1)
+    xc, yc = np.meshgrid(xe, ye)
+    cx = 0.5 * (xe[:-1] + xe[1:])
+    cy = 0.5 * (ye[:-1] + ye[1:])
+    CX, CY = np.meshgrid(cx, cy)
+
+    inv = InverseStereographicProjection()
+    v = inv.xy2vector(CX.ravel(), CY.ravel())
+    inside = np.asarray(v < sector).reshape(CX.shape)        # fundamental sector
+    rgb = np.asarray(dck.direction2color(v)).reshape(CX.shape + (3,))
+    rgb8 = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
+
+    colors = np.empty(CX.shape, dtype=object)
+    for i in range(CX.shape[0]):
+        for j in range(CX.shape[1]):
+            if inside[i, j]:
+                r, g, b = rgb8[i, j]
+                colors[i, j] = f"#{r:02x}{g:02x}{b:02x}"
+            else:
+                colors[i, j] = ""                            # skipped by pcolormesh
+    masked = np.ma.masked_array(colors, mask=~inside)
+    return xc, yc, masked, np.asarray(xy_edges), np.asarray(label_xy), labels
+
+
+def build_ipf_key_figure(result, direction: str = "z", *, n: int = 120):
+    """Build the IPF colour-KEY triangle legend as a NATIVE anyplotlib figure →
+    ``(fig, fig_id, html)``.
+
+    The standard stereographic fundamental-sector colour key (e.g. cubic
+    [001]/[101]/[111]) rendered with the same anyplotlib primitives as
+    :func:`spyde.actions.ipf_density.build_ipf_density_figure` — a ``pcolormesh``
+    quad mesh whose per-cell face colours come directly from the orix IPF colour
+    key (``direction2color``), clipped to the curved sector boundary, with the
+    white sector outline and the ``[hkl]`` corner labels. Same key for sample
+    X/Y/Z (it's the crystal-direction colour map)."""
+    import anyplotlib as apl
+    import anyplotlib._electron as _electron
+
+    from spyde.actions.ipf_density import _sector_limits
+    from spyde.drawing.plots.plot import finalize_figure_html
 
     om = _as_orientation_map(result)
     phase = om.orix_phase(0)                       # primary phase's point group
-    key = IPFColorKeyTSL(phase.point_group.laue, direction=_direction_vector(direction))
-    fig = key.plot(return_figure=True)
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=96, bbox_inches="tight", transparent=True)
-    plt.close(fig)
-    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-    return f"data:image/png;base64,{b64}"
+
+    xc, yc, colors, xy_edges, label_xy, labels = _ipf_key_color_grid(
+        phase, direction, n)
+    xlim, ylim = _sector_limits(xy_edges)
+
+    fig, axes = apl.subplots(1, 1)
+    ax = axes[0][0] if isinstance(axes, list) else axes
+    xy = ax.axes2d(xlim=xlim, ylim=ylim, aspect="equal")
+    # `colors` is an array of CSS colour strings → pcolormesh draws each cell with
+    # that exact face colour (the direct-RGB path); clip to the sector boundary.
+    xy.pcolormesh(xc, yc, colors, clip_path=xy_edges)
+    xy.plot(xy_edges[:, 0], xy_edges[:, 1], color="#ffffff", linewidth=1.5)
+    for (lx, ly), txt in zip(np.asarray(label_xy, dtype=float), labels):
+        xy.text(float(lx), float(ly), str(txt), color="#ffffff", fontsize=12)
+
+    fig_id = _electron.register(fig)
+    html = finalize_figure_html(fig, fig_id)
+    _ALIVE.append(fig)
+    return fig, fig_id, html
 
 
 def emit_ipf_key(window_id: int, result, direction: str = "z") -> bool:
-    """Emit the IPF colour-key triangle legend for *window_id* (shown pinned in a
-    corner of the IPF map)."""
+    """Emit the IPF colour-key triangle legend for *window_id* as a native
+    anyplotlib ``view="ipf_key"`` figure (pinned in a corner of the IPF map)."""
     from spyde.backend.ipc import emit
     try:
-        url = ipf_key_data_url(result, direction)
+        _fig, fig_id, html = build_ipf_key_figure(result, direction)
     except Exception as e:
         import logging
-        logging.getLogger(__name__).debug("ipf key raster failed: %s", e)
+        logging.getLogger(__name__).debug("ipf key figure failed: %s", e)
         return False
-    emit({"type": "ipf_key", "window_id": int(window_id), "data_url": url})
+    emit({
+        "type": "figure", "fig_id": fig_id, "window_id": int(window_id),
+        "html": html, "title": "IPF colour key", "is_navigator": False,
+        "view": "ipf_key",
+    })
     return True
 
 

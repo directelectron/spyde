@@ -95,12 +95,6 @@ export interface StrainRingsMessage extends MsgBase {
   selected?: number[]
 }
 
-export interface IpfKeyMessage extends MsgBase {
-  type: 'ipf_key'
-  window_id: number
-  data_url: string
-}
-
 export interface CompositionMessage extends MsgBase {
   type: 'composition'
   window_ids?: number[]
@@ -224,7 +218,6 @@ export type PlotAppMessage =
   | WindowClosedMessage
   | StateUpdateMessage
   | StrainRingsMessage
-  | IpfKeyMessage
   | CompositionMessage
   | MetadataMessage
   | AxesInfoMessage

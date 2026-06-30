@@ -7,13 +7,9 @@
  */
 import { test, expect, _electron as electron, ElectronApplication, Page } from '@playwright/test'
 import { join } from 'path'
-import { readFileSync } from 'fs'
 
 let app: ElectronApplication
 let page: Page
-
-const KEY_URL = 'data:image/png;base64,' +
-  readFileSync(join(__dirname, 'fixtures', 'ipf_key.png')).toString('base64')
 
 const map = (bg: string) =>
   `<!doctype html><html><body style="margin:0;height:100vh;background:${bg}"></body></html>`
@@ -48,8 +44,13 @@ test('IPF colour-key triangle shows on the 2-D map, hides in 3-D', async () => {
     type: 'figure', window_id: 1, fig_id: 'ipf3d',
     html: map('#111'), title: 'IPF (3D)', is_navigator: false, view: '3d',
   })
-  // The backend emits the colour-key triangle for this window.
-  await inject({ type: 'ipf_key', window_id: 1, data_url: KEY_URL })
+  // The backend emits the colour-key triangle as a native anyplotlib figure
+  // (view="ipf_key") for this window.
+  await inject({
+    type: 'figure', window_id: 1, fig_id: 'ipfkey',
+    html: map('#222'), title: 'IPF colour key', is_navigator: false,
+    view: 'ipf_key',
+  })
 
   // Legend pinned over the 2-D map.
   await expect(page.getByTestId('ipf-key-1')).toBeVisible()

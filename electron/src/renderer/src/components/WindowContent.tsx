@@ -6,7 +6,6 @@ interface Props {
   iframeRefs: React.MutableRefObject<Map<string, HTMLIFrameElement>>
   replayState: (figId: string) => void
   sendAction: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
-  ipfKey?: string   // IPF colour-key triangle (PNG data URL) — legend for IPF windows
   strainRings?: { rings: number[]; selected: number[] }   // strain reflection-ring selection
 }
 
@@ -32,7 +31,7 @@ const STRAIN_LABEL: Record<string, string> = { exx: 'εxx', eyy: 'εyy', exy: '�
 // All iframes stay MOUNTED; only the active one is shown (instant switch). A
 // ResizeObserver keeps the visible figure sized to its box (the single sizing
 // authority — handles window resize and the view-bar height).
-export function WindowContent({ win, iframeRefs, replayState, sendAction, ipfKey, strainRings }: Props) {
+export function WindowContent({ win, iframeRefs, replayState, sendAction, strainRings }: Props) {
   const id = String(win.windowId)
   const figs = win.figures
 
@@ -40,6 +39,9 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction, ipfKey
   const has3d = !!fig3d
   const figDensity = useMemo(() => figs.find(f => f.view === 'density'), [figs])
   const hasDensity = !!figDensity
+  // The IPF colour-key triangle legend — a native anyplotlib figure pinned in
+  // the corner of the 2-D map (not a switchable view).
+  const figIpfKey = useMemo(() => figs.find(f => f.view === 'ipf_key'), [figs])
   const tiledFig = useMemo(() => figs.find(f => f.viewLabel === TILED), [figs])
   // Unique chip labels in stable first-seen order (the tiled figure is not a chip).
   const labels = useMemo(() => {
@@ -104,7 +106,7 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction, ipfKey
     if (hasDensity && mode === 'density' && figDensity) return figDensity
     if (multi && tiledFig) return tiledFig                     // anyplotlib N-axis compare
     if (hasChips) return [...figs].reverse().find(f => f.viewLabel === selected[0]) ?? null
-    return figs.find(f => f.view !== '3d' && f.view !== 'density' && f.viewLabel !== TILED) ?? figs[0] ?? null
+    return figs.find(f => f.view !== '3d' && f.view !== 'density' && f.view !== 'ipf_key' && f.viewLabel !== TILED) ?? figs[0] ?? null
   }, [has3d, mode, fig3d, hasDensity, figDensity, multi, tiledFig, hasChips, selected, figs])
 
   const shownId = shownFig?.figId
@@ -206,7 +208,7 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction, ipfKey
       )}
 
       <div ref={boxRef} data-testid={`figure-box-${id}`} style={styles.box}>
-        {figs.map(fig => (
+        {figs.filter(f => f.view !== 'ipf_key').map(fig => (
           <iframe
             key={fig.figId}
             ref={el => {
@@ -227,10 +229,26 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction, ipfKey
             data-testid={`figure-${fig.figId}`}
           />
         ))}
-        {/* IPF colour-key triangle legend, pinned in the corner of the 2-D map
-            (the stereographic fundamental-sector key matplotlib/pyxem show). */}
-        {ipfKey && mode === '2d' && (
-          <img src={ipfKey} alt="IPF colour key" data-testid={`ipf-key-${id}`} style={styles.ipfKey} />
+        {/* IPF colour-key triangle legend — a native anyplotlib figure pinned in
+            the corner of the 2-D map (the stereographic fundamental-sector key
+            matplotlib/pyxem show), only over the RGB map (mode==='2d'). */}
+        {figIpfKey && mode === '2d' && (
+          <iframe
+            key={figIpfKey.figId}
+            ref={el => {
+              if (el) iframeRefs.current.set(figIpfKey.figId, el)
+              else iframeRefs.current.delete(figIpfKey.figId)
+            }}
+            src={figIpfKey.filePath ?? undefined}
+            onLoad={(e) => {
+              replayState(figIpfKey.figId)
+              const el = e.currentTarget
+              window.electron.resizeFigure(figIpfKey.figId, Math.max(80, el.clientWidth), Math.max(80, el.clientHeight))
+            }}
+            style={styles.ipfKey}
+            title={figIpfKey.title}
+            data-testid={`ipf-key-${id}`}
+          />
         )}
       </div>
     </div>
@@ -251,9 +269,9 @@ const styles: Record<string, React.CSSProperties> = {
   },
   box: { flex: 1, minHeight: 0, position: 'relative' },
   ipfKey: {
-    position: 'absolute', right: 6, bottom: 6, width: 104, height: 'auto',
-    pointerEvents: 'none', zIndex: 4,
-    background: 'rgba(24,24,37,0.72)', borderRadius: 6, padding: 3,
+    position: 'absolute', right: 6, bottom: 6, width: 132, height: 120,
+    border: 'none', zIndex: 4,
+    background: 'rgba(24,24,37,0.72)', borderRadius: 6,
   },
   frame: {
     position: 'absolute', inset: 0, width: '100%', height: '100%',

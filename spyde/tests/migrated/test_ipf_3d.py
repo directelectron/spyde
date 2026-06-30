@@ -39,14 +39,17 @@ class TestIpf3D:
         assert np.allclose(norms, 1.0, atol=1e-3)
         assert rgb.dtype == np.uint8
 
-    def test_ipf_key_data_url(self):
-        # The colour-key triangle legend rasterises to a PNG data URL.
-        from spyde.actions.ipf_view import ipf_key_data_url
-        url = ipf_key_data_url(_al_orientation_map(), "z")
-        assert url.startswith("data:image/png;base64,")
-        assert len(url) > 2000                      # a real raster, not empty
+    def test_build_ipf_key_figure(self):
+        # The colour-key triangle legend builds as a native anyplotlib figure.
+        from spyde.actions.ipf_view import build_ipf_key_figure
+        fig, fig_id, html = build_ipf_key_figure(_al_orientation_map(), "z")
+        assert isinstance(fig_id, str) and fig_id
+        assert isinstance(html, str) and "<body>" in html
+        assert len(html) > 2000                      # a real figure, not empty
 
     def test_emit_ipf_key_message(self):
+        # emit_ipf_key posts a `figure` message tagged view="ipf_key" (the legend
+        # is now a native anyplotlib figure, not a matplotlib PNG data URL).
         import spyde.backend.ipc as ipc
         from spyde.actions.ipf_view import emit_ipf_key
         captured, orig = [], ipc.emit
@@ -55,9 +58,10 @@ class TestIpf3D:
             assert emit_ipf_key(77, _al_orientation_map(), "z") is True
         finally:
             ipc.emit = orig
-        keys = [m for m in captured if m.get("type") == "ipf_key"]
-        assert keys and keys[-1]["window_id"] == 77
-        assert keys[-1]["data_url"].startswith("data:image/png")
+        figs = [m for m in captured if m.get("type") == "figure"
+                and m.get("view") == "ipf_key"]
+        assert figs and figs[-1]["window_id"] == 77
+        assert "<body>" in figs[-1]["html"]
 
     def test_build_3d_figure_html(self):
         om = _al_orientation_map()

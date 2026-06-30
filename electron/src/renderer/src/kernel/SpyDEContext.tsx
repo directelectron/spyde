@@ -99,7 +99,6 @@ interface State {
   signalTreeActive: Map<number, number>   // windowId → active node signal_id
   axes: Map<number, AxisRow[]>
   composition: Map<number, Composition>     // windowId → sample elements + percentages
-  ipfKey: Map<number, string>               // windowId → IPF colour-key triangle (PNG data URL)
   strainRings: Map<number, { rings: number[]; selected: number[] }>   // windowId → strain ring selection
   activeActions: Map<number, Set<string>>   // windowId → action names with live output
   subItems: Map<number, Map<string, SubItem[]>>  // windowId → action → dynamic chips
@@ -137,7 +136,6 @@ type Action =
   | { type: 'SET_ACTIVE'; windowId: number }
   | { type: 'METADATA'; windowIds: number[]; metadata: MetadataDict }
   | { type: 'COMPOSITION'; windowIds: number[]; composition: Composition }
-  | { type: 'IPF_KEY'; windowId: number; dataUrl: string }
   | { type: 'STRAIN_RINGS'; windowId: number; rings: number[]; selected: number[] }
   | { type: 'AXES'; windowIds: number[]; axes: AxisRow[] }
   | { type: 'ACTION_ACTIVE'; windowId: number; name: string; active: boolean }
@@ -272,7 +270,6 @@ function spydeReducer(state: State, action: Action): State {
         metadata: drop(state.metadata),
         axes: drop(state.axes),
         composition: drop(state.composition),
-        ipfKey: drop(state.ipfKey),
         strainRings: drop(state.strainRings),
         signalTrees: drop(state.signalTrees),
         signalTreeActive: drop(state.signalTreeActive),
@@ -295,12 +292,6 @@ function spydeReducer(state: State, action: Action): State {
       const composition = new Map(state.composition)
       for (const wid of action.windowIds) composition.set(wid, action.composition)
       return { ...state, composition }
-    }
-
-    case 'IPF_KEY': {
-      const ipfKey = new Map(state.ipfKey)
-      ipfKey.set(action.windowId, action.dataUrl)
-      return { ...state, ipfKey }
     }
 
     case 'STRAIN_RINGS': {
@@ -420,7 +411,6 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     figures: new Map(),
     metadata: new Map(),
     composition: new Map(),
-    ipfKey: new Map(),
     strainRings: new Map(),
     histograms: new Map(),
     selectors: new Map(),
@@ -553,14 +543,6 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
             windowId: msg.window_id,
             rings: msg.rings ?? [],
             selected: msg.selected ?? [],
-          })
-          break
-
-        case 'ipf_key':
-          dispatch({
-            type: 'IPF_KEY',
-            windowId: msg.window_id,
-            dataUrl: msg.data_url,
           })
           break
 
