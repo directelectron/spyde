@@ -6,7 +6,6 @@ interface Props {
   iframeRefs: React.MutableRefObject<Map<string, HTMLIFrameElement>>
   replayState: (figId: string) => void
   sendAction: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
-  strainRings?: { rings: number[]; selected: number[] }   // strain reflection-ring selection
 }
 
 // The reserved view_label of the backend-built side-by-side comparison figure.
@@ -31,7 +30,7 @@ const STRAIN_LABEL: Record<string, string> = { exx: 'εxx', eyy: 'εyy', exy: '�
 // All iframes stay MOUNTED; only the active one is shown (instant switch). A
 // ResizeObserver keeps the visible figure sized to its box (the single sizing
 // authority — handles window resize and the view-bar height).
-export function WindowContent({ win, iframeRefs, replayState, sendAction, strainRings }: Props) {
+export function WindowContent({ win, iframeRefs, replayState, sendAction }: Props) {
   const id = String(win.windowId)
   const figs = win.figures
 
@@ -59,6 +58,7 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction, strain
   const [mode, setMode] = useState<'2d' | '3d' | 'density'>('2d')
   const [dir, setDir] = useState<'x' | 'y' | 'z'>('z')
   const [strainComp, setStrainComp] = useState('exx')
+  const [strainMethod, setStrainMethod] = useState<'region' | 'cif'>('region')
 
   // Fall back to the 2-D map if the active mode's figure disappears (e.g. a
   // result re-run before the 3-D / density figure re-arrives).
@@ -171,37 +171,32 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction, strain
                   style={c === strainComp ? styles.btnActive : styles.btn}>{STRAIN_LABEL[c] ?? c}</button>
               ))}
               <span style={{ width: 6 }} />
-              {/* reference: the live crosshair region (relative) or a CIF spacing (absolute). */}
-              <button data-testid={`strain-ref-region-${id}`} style={styles.btn}
-                title="Reference = the cyan crosshair region (relative strain)"
-                onClick={() => sendAction('strain_set_cif', {}, win.windowId)}>Region</button>
-              <button data-testid={`strain-ref-cif-${id}`} style={styles.btn}
-                title="Absolute strain from a CIF's ideal spacing"
-                onClick={async () => {
-                  const p = await window.electron.pickFile({ name: 'Crystal (.cif)', extensions: ['cif'] })
-                  if (p) sendAction('strain_set_cif', { cif_path: p }, win.windowId)
-                }}>CIF…</button>
-              {/* reflection-ring selection: click a ring to include/exclude it from the fit. */}
-              {strainRings && strainRings.rings.length > 1 && (
-                <>
-                  <span style={{ width: 6 }} />
-                  {strainRings.rings.map((g, i) => {
-                    const on = strainRings.selected.includes(i)
-                    return (
-                      <button key={i} data-testid={`strain-ring-${i}-${id}`}
-                        title={`Reflection ring |g|=${g} Å⁻¹ — click to ${on ? 'exclude' : 'include'}`}
-                        onClick={() => {
-                          const next = on ? strainRings.selected.filter(s => s !== i)
-                                          : [...strainRings.selected, i]
-                          sendAction('strain_set_rings',
-                            { selected: next.length ? next : strainRings.rings.map((_, k) => k) },
-                            win.windowId)
-                        }}
-                        style={on ? styles.btnActive : styles.btn}>{`R${i + 1}`}</button>
-                    )
-                  })}
-                </>
-              )}
+              {/* Reference-method caret: Region (relative, crosshair pixel) or
+                  CIF (absolute, from a crystal's ideal spacings). Picking CIF
+                  prompts for the file; the fit uses every reference spot (zero
+                  beam excluded) automatically. */}
+              <select data-testid={`strain-method-${id}`} style={styles.select}
+                title="Strain reference method"
+                value={strainMethod}
+                onChange={async (e) => {
+                  const m = e.target.value as 'region' | 'cif'
+                  setStrainMethod(m)
+                  if (m === 'cif') {
+                    const p = await window.electron.pickFile({ name: 'Crystal (.cif)', extensions: ['cif'] })
+                    if (p) sendAction('strain_set_method', { method: 'cif', cif_path: p }, win.windowId)
+                    else setStrainMethod('region')   // cancelled the picker → stay on Region
+                  } else {
+                    sendAction('strain_set_method', { method: 'region' }, win.windowId)
+                  }
+                }}>
+                <option value="region">Region (relative)</option>
+                <option value="cif">CIF (absolute)…</option>
+              </select>
+              <span style={{ width: 6 }} />
+              {/* Submit: freeze the current strain field as a new SignalTree. */}
+              <button data-testid={`strain-submit-${id}`} style={styles.btnPrimary}
+                title="Commit the current strain field as a new signal tree"
+                onClick={() => sendAction('strain_commit', {}, win.windowId)}>Submit</button>
             </div>
           )}
         </div>
@@ -292,5 +287,13 @@ const styles: Record<string, React.CSSProperties> = {
   btnActive: {
     background: '#89b4fa', border: 'none', color: '#11111b', cursor: 'pointer',
     fontSize: 10, fontWeight: 600, padding: '2px 7px', borderRadius: 4,
+  },
+  btnPrimary: {
+    background: '#fab387', border: 'none', color: '#11111b', cursor: 'pointer',
+    fontSize: 10, fontWeight: 700, padding: '2px 9px', borderRadius: 4,
+  },
+  select: {
+    background: '#181825', color: '#cdd6f4', border: '1px solid #313244',
+    borderRadius: 4, fontSize: 10, fontWeight: 600, padding: '2px 4px', cursor: 'pointer',
   },
 }

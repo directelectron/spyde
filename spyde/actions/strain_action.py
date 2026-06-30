@@ -30,9 +30,34 @@ def _default_reference(vecs) -> tuple:
         return 0, 0
 
 
+# window_id → live StrainController. The strain window is created from a bare
+# `figure` message (not a registered Plot in session._plots), so the staged
+# strain_* handlers can't resolve it via _plot_by_window_id — they look it up
+# here instead. Registered in strain_run, cleared is harmless (small + leaks
+# nothing heavy beyond the controller, which the source tree also references).
+_CONTROLLERS: "dict[int, StrainController]" = {}
+
+
+def _zero_beam_filtered(g_ref) -> np.ndarray:
+    """Reference spots with the central/direct (zero) beam removed.
+
+    The zero beam (|g|≈0) carries no lattice information and would pin the fit's
+    translation/centroid, so it's excluded from every strain reference. Threshold
+    = 25% of the median nonzero |g| (well below the first ring, above numerical
+    noise at the centre)."""
+    g = np.asarray(g_ref, dtype=float).reshape(-1, 2)
+    if len(g) == 0:
+        return g
+    mag = np.linalg.norm(g, axis=1)
+    nz = mag[mag > 0]
+    thresh = 0.25 * float(np.median(nz)) if nz.size else 0.0
+    return g[mag > thresh]
+
+
 class StrainController:
     """Owns the live strain window: recomputes the field when the reference
-    crosshair moves and swaps the shown component on toggle."""
+    crosshair moves, swaps the shown component on toggle, switches the reference
+    method (Region/CIF), and commits the current field as a new SignalTree."""
 
     def __init__(self, vecs, plot2d, *, window_id=None,
                  component="exx", ref_yx=(0, 0), session=None):
@@ -45,18 +70,17 @@ class StrainController:
         self.field = None
         self._crosshair = None
         self.cif_mode = False
-        self._g_ref_full = None          # current full reference vector set
-        self.rings = []                  # ring |g| (ascending)
-        self._ring_idx = None            # per-ref-vector ring index
-        self.selected_rings = set()      # enabled ring indices (use all by default)
+        self._g_ref_full = None          # current reference vector set (zero-beam removed)
         self._recompute_gen = 0          # latest-wins guard for async recomputes
 
     def attach(self):
         self._set_full_reference(self.vecs.kxy_at(*self.ref_yx))
+        if self.window_id is not None:
+            _CONTROLLERS[int(self.window_id)] = self
         # Skip the initial recompute when the field was already computed by the
         # caller (_build_window pre-populates ctrl.field and the figure already
         # shows it) — recomputing here would run the full per-pixel fit a second
-        # time on window open. Later ref/ring/CIF interactions still call
+        # time on window open. Later ref/CIF/method interactions still call
         # _recompute() directly.
         if self.field is None:
             self._recompute()
@@ -71,19 +95,13 @@ class StrainController:
             log.debug("strain crosshair attach failed: %s", e)
         return self
 
-    # ── reference + ring selection (both modes flow through ref_vectors) ──────
+    # ── reference (Region crosshair pixel, or CIF-snapped absolute) ───────────
     def _set_full_reference(self, g_ref) -> None:
-        from spyde.actions.strain_mapping import group_rings
-        self._g_ref_full = np.asarray(g_ref, dtype=float).reshape(-1, 2)
-        self.rings, self._ring_idx = group_rings(self._g_ref_full)
-        self.selected_rings = set(range(len(self.rings)))      # use all
-        self._emit_rings()
+        # Use every reference spot EXCEPT the zero beam (see _zero_beam_filtered).
+        self._g_ref_full = _zero_beam_filtered(g_ref)
 
     def _selected_reference(self):
-        if self._ring_idx is None or len(self.selected_rings) >= len(self.rings):
-            return self._g_ref_full
-        keep = np.array([i in self.selected_rings for i in self._ring_idx], dtype=bool)
-        return self._g_ref_full[keep]
+        return self._g_ref_full
 
     def _recompute(self) -> None:
         """Recompute the full strain field OFF the asyncio main thread.
@@ -129,17 +147,6 @@ class StrainController:
 
         threading.Thread(target=_work, daemon=True, name="strain-recompute").start()
 
-    def _emit_rings(self) -> None:
-        if self.window_id is None:
-            return
-        try:
-            from spyde.backend.ipc import emit
-            emit({"type": "strain_rings", "window_id": int(self.window_id),
-                  "rings": [round(float(g), 4) for g in self.rings],
-                  "selected": sorted(self.selected_rings), "cif": bool(self.cif_mode)})
-        except Exception as e:
-            log.debug("emitting strain_rings failed: %s", e)
-
     def _on_pick(self, event=None):
         try:
             rx = int(round(float(self._crosshair.cx)))
@@ -162,16 +169,11 @@ class StrainController:
         families → absolute strain (no unstrained region needed)."""
         from spyde.actions.strain_mapping import cif_g_families, snap_reference_to_cif
         snapped = snap_reference_to_cif(self.vecs.kxy_at(*self.ref_yx), cif_g_families(phase))
+        snapped = _zero_beam_filtered(snapped)
         if len(snapped) < 2:
             return
         self.cif_mode = True
-        self._set_full_reference(snapped)
-        self._recompute()
-
-    def set_rings(self, selected) -> None:
-        """Peak selection: keep only the chosen reflection rings in the fit."""
-        sel = set(int(i) for i in selected)
-        self.selected_rings = sel or set(range(len(self.rings)))
+        self._g_ref_full = snapped
         self._recompute()
 
     def set_component(self, component: str) -> None:
@@ -180,6 +182,15 @@ class StrainController:
             return
         self.component = component
         update_strain_view(self.p, self.field, component)
+
+    def commit(self) -> None:
+        """Freeze the current strain field as a NEW SignalTree — εxx is the signal
+        plot, εyy / εxy / ω ride along as chip-selectable view figures (same shape
+        as the Vector-OM result window). The live window stays open for tuning."""
+        if self.field is None or self.session is None:
+            return
+        from spyde.actions._common import STRAIN_TITLES
+        _commit_strain_tree(self.session, self.vecs, self.field, STRAIN_TITLES)
 
 
 # ── toolbar entry (ActionContext convention: fn(ctx, ...)) ────────────────────
@@ -190,7 +201,72 @@ def strain_mapping(ctx, action_name: str = "Strain Mapping", **params) -> None:
     strain_run(ctx.session, ctx.plot, {})
 
 
+# ── commit: freeze the live field as a new SignalTree ─────────────────────────
+
+def _commit_strain_tree(session, vecs, field, titles) -> None:
+    """Add a new SignalTree carrying the strain field — εxx is the signal plot,
+    εyy / εxy / ω are chip-selectable view figures (mirrors the Vector-OM result
+    window via spyde.actions.views)."""
+    import hyperspy.api as hs
+    from spyde.actions.views import emit_view_figure, register_views
+
+    ny, nx = field.nav_shape
+    base = "Strain"
+    comps = [(titles["exx"], field.exx), (titles["eyy"], field.eyy),
+             (titles["exy"], field.exy), (titles["omega"], field.omega)]
+    mats = [(lbl, np.nan_to_num(np.asarray(m, np.float32))) for lbl, m in comps]
+    finite = [float(np.nanmax(np.abs(m))) for _, m in mats if np.isfinite(m).any()]
+    lim = (max(finite) if finite else 1.0) or 1.0
+
+    new_sig = hs.signals.Signal2D(mats[0][1].copy())
+    new_sig.metadata.General.title = base
+    tree = session._add_signal(new_sig)
+    sp = next(iter(getattr(tree, "signal_plots", [])), None)
+    if sp is not None:
+        sp.needs_auto_level = False
+        try:
+            sp.set_clim(-lim, lim)
+            sp.set_data(mats[0][1])
+        except Exception as e:
+            log.debug("painting committed strain signal plot failed: %s", e)
+        try:
+            sp.set_view_tag(titles["exx"], "2d")
+        except Exception as e:
+            log.debug("tagging committed strain view failed: %s", e)
+        wid = getattr(sp, "window_id", None)
+        if wid is not None:
+            register_views(wid, mats, levels=(-lim, lim))
+            for lbl, m in mats[1:]:
+                emit_view_figure(wid, m, lbl, kind="2d", levels=(-lim, lim))
+    return tree
+
+
+# ── toolbar entry (ActionContext convention: fn(ctx, ...)) ────────────────────
+
+def strain_mapping(ctx, action_name: str = "Strain Mapping", **params) -> None:
+    """Toolbar entry on a Find-Vectors result — open the interactive strain
+    window (one-shot; the live reference crosshair + component toggle take over)."""
+    strain_run(ctx.session, ctx.plot, params or {})
+
+
 # ── staged handlers (session.py dispatch: fn(session, plot, payload)) ──────────
+
+def _ctrl_for(session, plot, payload):
+    """Resolve the live StrainController for an action message.
+
+    The strain window is a bare `figure` (not a registered Plot), so
+    _plot_by_window_id → None and the plot-based lookup fails. Resolve by
+    window_id from the module registry first; fall back to the source tree."""
+    wid = payload.get("window_id")
+    if wid is None and plot is not None:
+        wid = getattr(plot, "window_id", None)
+    if wid is not None:
+        ctrl = _CONTROLLERS.get(int(wid))
+        if ctrl is not None:
+            return ctrl
+    tree = getattr(plot, "signal_tree", None)
+    return getattr(tree, "_strain_controller", None) if tree is not None else None
+
 
 def strain_run(session, plot, payload) -> None:
     """Open the interactive strain window for the active Find-Vectors result.
@@ -243,37 +319,38 @@ def strain_run(session, plot, payload) -> None:
 
 def strain_set_component(session, plot, payload) -> None:
     """Component toggle (εxx / εyy / εxy / ω) → swap the shown map in place."""
-    tree = getattr(plot, "signal_tree", None)
-    ctrl = getattr(tree, "_strain_controller", None) if tree is not None else None
+    ctrl = _ctrl_for(session, plot, payload)
     if ctrl is not None:
         ctrl.set_component(str(payload.get("component", "exx")))
 
 
-def strain_set_cif(session, plot, payload) -> None:
-    """Set the absolute reference from a CIF (``payload['cif_path']``) — the
-    reflection family is guessed from the measured |g| vs the CIF's ideal spacings.
-    Passing no path reverts to the region (crosshair) reference."""
-    tree = getattr(plot, "signal_tree", None)
-    ctrl = getattr(tree, "_strain_controller", None) if tree is not None else None
+def strain_set_method(session, plot, payload) -> None:
+    """Reference-method caret: 'region' (relative, crosshair pixel) or 'cif'
+    (absolute, from a crystal's ideal spacings; needs payload['cif_path'])."""
+    ctrl = _ctrl_for(session, plot, payload)
     if ctrl is None:
         return
-    cif_path = payload.get("cif_path")
-    if not cif_path:
+    method = str(payload.get("method", "region"))
+    if method == "cif":
+        cif_path = payload.get("cif_path")
+        if not cif_path:
+            return                                  # CIF chosen but no file yet
+        try:
+            from orix.crystal_map import Phase
+            ctrl.set_cif_reference(Phase.from_cif(cif_path))
+        except Exception as e:
+            from spyde.backend.ipc import emit_error
+            emit_error(f"Strain CIF reference failed: {e}")
+    else:
         ry, rx = ctrl.ref_yx
-        ctrl.set_reference(ry, rx)                  # back to region mode
-        return
-    try:
-        from orix.crystal_map import Phase
-        ctrl.set_cif_reference(Phase.from_cif(cif_path))
-    except Exception as e:
+        ctrl.set_reference(ry, rx)                  # region (relative) mode
+
+
+def strain_commit(session, plot, payload) -> None:
+    """Submit: freeze the current strain field as a new SignalTree."""
+    ctrl = _ctrl_for(session, plot, payload)
+    if ctrl is None:
         from spyde.backend.ipc import emit_error
-        emit_error(f"Strain CIF reference failed: {e}")
-
-
-def strain_set_rings(session, plot, payload) -> None:
-    """Peak selection: ``payload['selected']`` = the reflection-ring indices to
-    keep in the fit (empty/missing → use all)."""
-    tree = getattr(plot, "signal_tree", None)
-    ctrl = getattr(tree, "_strain_controller", None) if tree is not None else None
-    if ctrl is not None:
-        ctrl.set_rings(payload.get("selected", []))
+        emit_error("No live strain field to submit.")
+        return
+    ctrl.commit()

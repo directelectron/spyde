@@ -88,13 +88,6 @@ export interface StateUpdateMessage extends MsgBase {
   value: unknown
 }
 
-export interface StrainRingsMessage extends MsgBase {
-  type: 'strain_rings'
-  window_id: number
-  rings?: number[]
-  selected?: number[]
-}
-
 export interface CompositionMessage extends MsgBase {
   type: 'composition'
   window_ids?: number[]
@@ -217,7 +210,6 @@ export type PlotAppMessage =
   | WindowVisibilityMessage
   | WindowClosedMessage
   | StateUpdateMessage
-  | StrainRingsMessage
   | CompositionMessage
   | MetadataMessage
   | AxesInfoMessage

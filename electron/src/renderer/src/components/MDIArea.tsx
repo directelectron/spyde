@@ -160,7 +160,6 @@ export function MDIArea() {
               iframeRefs={iframeRefs}
               replayState={replayState}
               sendAction={sendAction}
-              strainRings={state.strainRings.get(win.windowId)}
             />
           </SubWindow>
         )

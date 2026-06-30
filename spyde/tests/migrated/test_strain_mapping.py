@@ -278,18 +278,54 @@ class TestStrainAction:
         ctrl.set_reference(2, 2)                         # crosshair → region mode
         assert ctrl.cif_mode is False
 
-    def test_controller_ring_selection(self):
+    def test_reference_excludes_zero_beam(self):
+        # The reference uses every spot EXCEPT the central/direct (zero) beam.
         import anyplotlib as apl
         from spyde.actions.strain_action import StrainController
-        # reference = G_REF (two rings: |g|=1 and |g|=√2).
-        vecs = _MockVecsCM((4, 4), lambda iy, ix: np.eye(2))
+
+        # G_REF (4 ring spots) + a zero-beam point at the centre.
+        with_zero = np.vstack([G_REF, [[0.0, 0.0]]])
+
+        class _V:
+            nav_shape = (4, 4)
+            def kxy_at(self, iy, ix):
+                return with_zero
+            def count_map(self):
+                return np.ones((4, 4), int)
+
         fig, ax = apl.subplots()
         p = ax.imshow(np.zeros((4, 4), "f4"))
-        ctrl = StrainController(vecs, p, ref_yx=(0, 0))
+        ctrl = StrainController(_V(), p, ref_yx=(0, 0))
         ctrl.attach()
-        assert len(ctrl.rings) == 2 and ctrl.selected_rings == {0, 1}
-        ctrl.set_rings([0])                             # keep only the inner ring
-        assert ctrl.selected_rings == {0} and ctrl.field is not None
+        ref = ctrl._selected_reference()
+        # The zero beam was dropped; all kept spots have |g| > 0.
+        assert len(ref) == len(G_REF)
+        assert np.all(np.linalg.norm(ref, axis=1) > 0)
+
+    def test_commit_makes_new_signal_tree(self, window):
+        # Submit freezes the live field as a new SignalTree (εxx signal plot +
+        # εyy/εxy/ω view figures).
+        import anyplotlib as apl
+        from spyde.actions.strain_action import StrainController, strain_commit
+        session = window["window"]
+        n_before = len(session.signal_trees)
+
+        vecs = _MockVecsCM((4, 4), lambda iy, ix: np.array([[1 + 0.01 * ix, 0.0],
+                                                            [0.0, 1.0]]))
+        from spyde.actions.strain_mapping import compute_strain_field
+        fig, ax = apl.subplots()
+        p = ax.imshow(np.zeros((4, 4), "f4"))
+        ctrl = StrainController(vecs, p, window_id=4242, ref_yx=(0, 0),
+                                session=session)
+        ctrl.field = compute_strain_field(vecs, (0, 0))   # pre-set like strain_run
+        ctrl.attach()                                     # registers in _CONTROLLERS (skips recompute)
+        assert ctrl.field is not None
+        # Dispatch by window_id (the strain window is not a registered Plot, so
+        # plot is None — the handler resolves the controller from the registry).
+        strain_commit(session, None, {"window_id": 4242})
+        assert len(session.signal_trees) == n_before + 1
+        new_tree = session.signal_trees[-1]
+        assert "Strain" in new_tree.root.metadata.get_item("General.title", "")
 
     def test_strain_run_without_vectors_errors(self):
         import spyde.backend.ipc as ipc

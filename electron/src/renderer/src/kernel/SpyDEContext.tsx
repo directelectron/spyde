@@ -99,7 +99,6 @@ interface State {
   signalTreeActive: Map<number, number>   // windowId → active node signal_id
   axes: Map<number, AxisRow[]>
   composition: Map<number, Composition>     // windowId → sample elements + percentages
-  strainRings: Map<number, { rings: number[]; selected: number[] }>   // windowId → strain ring selection
   activeActions: Map<number, Set<string>>   // windowId → action names with live output
   subItems: Map<number, Map<string, SubItem[]>>  // windowId → action → dynamic chips
   status: string
@@ -136,7 +135,6 @@ type Action =
   | { type: 'SET_ACTIVE'; windowId: number }
   | { type: 'METADATA'; windowIds: number[]; metadata: MetadataDict }
   | { type: 'COMPOSITION'; windowIds: number[]; composition: Composition }
-  | { type: 'STRAIN_RINGS'; windowId: number; rings: number[]; selected: number[] }
   | { type: 'AXES'; windowIds: number[]; axes: AxisRow[] }
   | { type: 'ACTION_ACTIVE'; windowId: number; name: string; active: boolean }
   | { type: 'SUB_ITEM'; windowId: number; action: string; name: string; color: string; vtype?: string; calculation?: string; active: boolean }
@@ -270,7 +268,6 @@ function spydeReducer(state: State, action: Action): State {
         metadata: drop(state.metadata),
         axes: drop(state.axes),
         composition: drop(state.composition),
-        strainRings: drop(state.strainRings),
         signalTrees: drop(state.signalTrees),
         signalTreeActive: drop(state.signalTreeActive),
         activeActions: drop(state.activeActions),
@@ -292,12 +289,6 @@ function spydeReducer(state: State, action: Action): State {
       const composition = new Map(state.composition)
       for (const wid of action.windowIds) composition.set(wid, action.composition)
       return { ...state, composition }
-    }
-
-    case 'STRAIN_RINGS': {
-      const strainRings = new Map(state.strainRings)
-      strainRings.set(action.windowId, { rings: action.rings, selected: action.selected })
-      return { ...state, strainRings }
     }
 
     case 'AXES': {
@@ -411,7 +402,6 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     figures: new Map(),
     metadata: new Map(),
     composition: new Map(),
-    strainRings: new Map(),
     histograms: new Map(),
     selectors: new Map(),
     signalTrees: new Map(),
@@ -535,15 +525,6 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
               '*',
             )
           }
-          break
-
-        case 'strain_rings':
-          dispatch({
-            type: 'STRAIN_RINGS',
-            windowId: msg.window_id,
-            rings: msg.rings ?? [],
-            selected: msg.selected ?? [],
-          })
           break
 
         case 'composition':

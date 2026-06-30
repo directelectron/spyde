@@ -57,4 +57,16 @@ test('Strain Mapping: opens the strain window with a live component toggle', asy
   for (const c of ['eyy', 'exy', 'omega']) {
     await expect(swin.getByTestId(new RegExp(`^strain-comp-${c}-`))).toBeVisible()
   }
+
+  // The reference-method caret (Region / CIF) and the Submit button are present.
+  await expect(swin.getByTestId(/^strain-method-/)).toBeVisible()
+  const submit = swin.getByTestId(/^strain-submit-/)
+  await expect(submit).toBeVisible()
+
+  // Submit freezes the field as a NEW committed signal tree → one more window.
+  const beforeCommit = await page.getByTestId('subwindow').count()
+  await submit.click()
+  await expect.poll(() => page.getByTestId('subwindow').count(), {
+    timeout: 30_000, message: 'Submit did not open a committed strain window',
+  }).toBeGreaterThan(beforeCommit)
 })
