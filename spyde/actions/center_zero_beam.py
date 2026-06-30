@@ -9,8 +9,9 @@ Mirrors the Qt action (``pyxem.center_zero_beam`` / ``..._setup``):
   Manual    — drop a draggable crosshair on the DP at the zero beam, Apply a
               CONSTANT shift (``centre − picked``) → "Centered (Manual)" node.
 
-No Qt: the heavy Qt caret lives in ``pyxem.py``; this module is import-safe in
-the Electron backend (mirrors the find_vectors / orientation split).
+No Qt: this is the Electron-native action; it is import-safe in the backend
+(mirrors the find_vectors / orientation split). The old pyqtgraph caret was
+removed in the Qt-removal cleanup.
 """
 from __future__ import annotations
 

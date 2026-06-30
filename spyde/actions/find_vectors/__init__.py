@@ -1,15 +1,11 @@
 """
 find_vectors — Find Diffraction Vectors compute package for SpyDE.
 
-Adds a caret popout to 4D/5D-STEM signal plots that:
-  1. Lets the user tune real-space Gaussian σ (≤2 px), disk kernel radius (linked
-     to a draggable CircleROI on the pattern), correlation threshold,
-     min-distance separation, and subpixel CoM refinement.
-  2. Overlays peak markers (+) and circles directly on the signal plot, updating
-     live every time the navigator moves.
-  3. Optionally swaps the signal image for the correlation map via a checkbox.
-  4. On "Compute" runs the full batch pipeline and adds a DiffractionVectors
-     node to the signal tree.
+The Qt-free compute core for Find Vectors on 4D/5D-STEM data: nav-space Gaussian
+blur, disk-template NXCORR (or DoG band-pass), peak detection with subpixel
+refinement, and a batch pipeline that adds a DiffractionVectors node to the
+signal tree. The interactive UI (tuning carets, live preview overlay) lives in
+``find_vectors_action`` / ``vector_overlay``; this package is pure compute.
 
 Nav-space Gaussian blur uses two paths:
   - Live preview: NavBlurCache — async per-chunk blur that piggybacks on
@@ -33,17 +29,6 @@ find_vectors_neural, benchmarks, tests) import via
 """
 
 from __future__ import annotations
-
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    # Qt — only needed as a type hint on the legacy Qt entry point. Importing it
-    # at runtime would pull PySide6 into the Qt-free Electron backend (which
-    # reuses this module's compute core), so keep it deferred.
-    from spyde.drawing.toolbars.toolbar import RoundedToolBar  # noqa: F401
-
-# ── Module-level guard (one caret per toolbar) ─────────────────────────────────
-_FV_BUILT_TOOLBARS: set = set()
 
 # ── Public API re-exports (see module docstring) ──────────────────────────────
 from spyde.actions.find_vectors.gpu_runtime import (  # noqa: E402,F401

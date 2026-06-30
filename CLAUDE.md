@@ -69,7 +69,8 @@ Supported file extensions: `.hspy`, `.zspy`, `.mrc`, `.tif`, `.tiff`, `.de5` (se
 
 ### Actions (`spyde/actions/`)
 - `base.py`: base action framework; defines `NAVIGATOR_DRAG_MIME` for drag-and-drop between plots
-- `pyxem.py`: PyXEM-specific diffraction processing actions
+- `find_vectors/`: Qt-free Find-Vectors compute package (split from the former monolith — see its `__init__` docstring); `find_vectors_action.py` / `vector_overlay.py` are the interactive wiring
+- `_common.py`: small shared helpers (`reciprocal_radius`, strain component constants, `widget_region`)
 
 ### Compute Backend (`spyde/compute_backend.py`)
 `ComputeBackend` provides a uniform `concurrent.futures.Future`-compatible interface over two modes:

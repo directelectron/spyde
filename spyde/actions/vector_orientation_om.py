@@ -12,8 +12,9 @@ Staged handlers (mirroring `om_generate_library` / `om_run`):
                          per-template g-vector library, cache on the tree.
   vom_run              — fit every position → IPF-Z + 3 strain map windows.
 
-No Qt: the heavy Qt caret lives in `vector_orientation_action.py` (pyqtgraph);
-this module is import-safe in the Electron backend.
+No Qt: this is the Electron-native staged action; it is import-safe in the
+backend. The old pyqtgraph caret (vector_orientation_action.py) was removed in
+the Qt-removal cleanup.
 """
 from __future__ import annotations
 
