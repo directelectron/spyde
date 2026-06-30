@@ -11,6 +11,7 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering",
     "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
 ]
@@ -146,7 +147,9 @@ spyde = "spyde"
 # compute/contract nets consolidated here; sped_ag timing lives in benchmark_*.py,
 # run manually. The Playwright suite under electron/ covers the UI.)
 testpaths = ["spyde/tests/migrated"]
+addopts = "--strict-markers"
 markers = [
     "gpu: tests requiring a physical NVIDIA GPU",
     "slow: slow tests (e.g. real template-library generation)",
+    "network: tests that make a live network request (e.g. COD lookup)",
 ]
