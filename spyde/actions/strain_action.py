@@ -54,7 +54,13 @@ class StrainController:
 
     def attach(self):
         self._set_full_reference(self.vecs.kxy_at(*self.ref_yx))
-        self._recompute()
+        # Skip the initial recompute when the field was already computed by the
+        # caller (_build_window pre-populates ctrl.field and the figure already
+        # shows it) — recomputing here would run the full per-pixel fit a second
+        # time on window open. Later ref/ring/CIF interactions still call
+        # _recompute() directly.
+        if self.field is None:
+            self._recompute()
         try:
             ry, rx = self.ref_yx
             self._crosshair = self.p.add_crosshair_widget(cx=float(rx), cy=float(ry),
