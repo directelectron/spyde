@@ -34,11 +34,10 @@ class StrainController:
     """Owns the live strain window: recomputes the field when the reference
     crosshair moves and swaps the shown component on toggle."""
 
-    def __init__(self, vecs, plot2d, glyph_group, *, window_id=None,
+    def __init__(self, vecs, plot2d, *, window_id=None,
                  component="exx", ref_yx=(0, 0), session=None):
         self.vecs = vecs
         self.p = plot2d
-        self.glyph = glyph_group
         self.window_id = window_id
         self.session = session
         self.component = component
@@ -109,7 +108,7 @@ class StrainController:
         if session is None or getattr(session, "_dispatch_to_main", None) is None:
             # No event loop to marshal back to (e.g. tests) — run inline.
             self.field = compute_strain_field(self.vecs, ref_vectors=ref)
-            update_strain_view(self.p, self.field, self.component, self.glyph)
+            update_strain_view(self.p, self.field, self.component)
             return
 
         def _work():
@@ -124,7 +123,7 @@ class StrainController:
                 if gen != self._recompute_gen:
                     return
                 self.field = field
-                update_strain_view(self.p, self.field, self.component, self.glyph)
+                update_strain_view(self.p, self.field, self.component)
 
             session._dispatch_to_main(_apply)
 
@@ -180,7 +179,7 @@ class StrainController:
         if component not in _COMPONENTS or self.field is None:
             return
         self.component = component
-        update_strain_view(self.p, self.field, component, self.glyph)
+        update_strain_view(self.p, self.field, component)
 
 
 # ── toolbar entry (ActionContext convention: fn(ctx, ...)) ────────────────────
@@ -212,12 +211,12 @@ def strain_run(session, plot, payload) -> None:
     ref_yx = _default_reference(vecs)
 
     def _build_window(field):
-        _fig, fig_id, html, p, glyph = build_strain_figure(field, component="exx")
+        _fig, fig_id, html, p = build_strain_figure(field, component="exx")
         wid = session.next_window_id()
         emit({"type": "figure", "fig_id": fig_id, "window_id": int(wid),
               "html": html, "title": "Strain (εxx)", "is_navigator": False,
               "strain_components": list(_COMPONENTS)})
-        ctrl = StrainController(vecs, p, glyph, window_id=wid, component="exx",
+        ctrl = StrainController(vecs, p, window_id=wid, component="exx",
                                 ref_yx=ref_yx, session=session)
         ctrl.field = field
         ctrl.attach()

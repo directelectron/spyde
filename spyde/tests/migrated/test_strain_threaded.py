@@ -96,16 +96,16 @@ class TestStrainThreaded:
         applied = threading.Event()
         apply_thread = {}
 
-        ctrl = StrainController(_Vecs(), p, None, ref_yx=(0, 0),
+        ctrl = StrainController(_Vecs(), p, ref_yx=(0, 0),
                                 session=loop_session)
 
         # Wrap update_strain_view so we can observe WHICH thread applies + signal.
         import spyde.actions.strain_display as sd
         orig = sd.update_strain_view
 
-        def _spy(plot, field, component, glyph):
+        def _spy(plot, field, component):
             apply_thread["name"] = threading.current_thread().name
-            orig(plot, field, component, glyph)
+            orig(plot, field, component)
             applied.set()
 
         sd.update_strain_view = _spy
@@ -126,7 +126,7 @@ class TestStrainThreaded:
         interaction must NOT apply its stale result (latest-wins)."""
         fig, ax = apl.subplots()
         p = ax.imshow(np.zeros((4, 4), "f4"))
-        ctrl = StrainController(_Vecs(), p, None, ref_yx=(0, 0),
+        ctrl = StrainController(_Vecs(), p, ref_yx=(0, 0),
                                 session=loop_session)
         # Establish the reference set so _recompute() actually fits (otherwise it
         # short-circuits on len(ref) < 2). Done BEFORE the mocks are installed.
@@ -156,9 +156,9 @@ class TestStrainThreaded:
         import spyde.actions.strain_display as sd
         orig_apply = sd.update_strain_view
 
-        def _count_apply(plot, field, component, glyph):
+        def _count_apply(plot, field, component):
             applies.append(field)
-            orig_apply(plot, field, component, glyph)
+            orig_apply(plot, field, component)
 
         sm.compute_strain_field = _slow
         sd.update_strain_view = _count_apply

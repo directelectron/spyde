@@ -91,6 +91,62 @@ class TestStrainField:
         assert abs(abs(theta[0]) - np.deg2rad(45)) < 1e-6
 
 
+def _real_vecs(ny, nx, T_of, *, noise=0.0, seed=0):
+    """A real SpyDEDiffractionVectors 4D container (so the CSR/vectorized strain
+    path is exercised, not the _MockVecs loop fallback)."""
+    from spyde.signals.diffraction_vectors import SpyDEDiffractionVectors, N_COLS
+    rng = np.random.default_rng(seed)
+    rows, offsets = [], [0]
+    for iy in range(ny):
+        for ix in range(nx):
+            g = _strained(T_of(iy, ix))
+            if noise:
+                g = g + rng.normal(0.0, noise, g.shape)
+            for kx, ky in g:
+                rows.append([ix, iy, kx, ky, -1.0, 1.0])
+            offsets.append(len(rows))
+    flat = np.asarray(rows, dtype=np.float32).reshape(-1, N_COLS)
+    off = np.asarray(offsets, dtype=np.int64)
+    return SpyDEDiffractionVectors(
+        flat_buffer=flat, nav_offsets=[np.arange(ny + 1) * nx, off],
+        nav_shape=(ny, nx), full_nav_shape=(ny, nx), sig_shape=(64, 64),
+        sig_axes=None, kernel_radius_px=1.0, kernel_radius_data=1.0, offsets=off)
+
+
+class TestStrainFieldVectorized:
+    """The whole-field vectorized path (real CSR container) must match the
+    per-pixel scipy loop bit-for-bit and recover known strain."""
+
+    def _T_of(self, iy, ix):
+        return np.array([[1.0 + 0.01 * ix / 8.0, 0.003],
+                         [0.003, 1.0 - 0.005 * iy / 8.0]])
+
+    def test_vectorized_matches_loop(self):
+        from spyde.actions.strain_mapping import (
+            _compute_strain_field_loop, _median_nn,
+        )
+        v = _real_vecs(8, 8, self._T_of, noise=0.002, seed=3)
+        ref = np.asarray(v.kxy_at(0, 0), float).reshape(-1, 2)
+        nn = _median_nn(ref)
+        tol = 0.25 * nn if nn > 0 else np.inf
+
+        vec = compute_strain_field(v, ref_vectors=ref)       # CSR → vectorized
+        loop = _compute_strain_field_loop(v, ref, tol, 8, 8)  # per-pixel reference
+        for name in ("exx", "eyy", "exy", "omega", "coverage"):
+            a, b = getattr(vec, name), getattr(loop, name)
+            assert np.allclose(a, b, atol=1e-5, equal_nan=True), f"{name} mismatch"
+
+    def test_recovers_known_gradient(self):
+        v = _real_vecs(6, 10, lambda iy, ix: np.array([[1.0 + 0.01 * ix, 0.0],
+                                                       [0.0, 1.0]]))
+        field = compute_strain_field(v, (0, 0))
+        assert field.nav_shape == (6, 10)
+        assert abs(field.exx[0, 0]) < 1e-4                    # reference unstrained
+        assert field.exx[0, 9] > field.exx[0, 1] > field.exx[0, 0]   # gradient
+        assert np.allclose(field.exx[3, :], field.exx[0, :], atol=1e-5)  # no y dep
+        assert np.nanmax(field.coverage) == 1.0
+
+
 class TestCifReference:
     def _al_phase(self):
         from orix.crystal_map import Phase
@@ -138,20 +194,19 @@ class TestStrainDisplay:
             (0.01 * rng.rand(ny, nx)).astype("f4"),
             np.ones((ny, nx), "f4"))
 
-    def test_build_strain_figure_map_glyphs_and_ref(self):
+    def test_build_strain_figure_map_and_ref(self):
         from spyde.actions.strain_display import build_strain_figure
-        fig, fid, html, p, g = build_strain_figure(
-            self._field(), component="exx", ref_yx=(1, 1), glyph_step=3)
+        fig, fid, html, p = build_strain_figure(
+            self._field(), component="exx", ref_yx=(1, 1))
         assert isinstance(fid, str) and fid and isinstance(html, str) and len(html) > 500
         types = {m["type"] for m in p.list_markers()}
-        assert "ellipses" in types          # principal-strain glyphs
+        assert "ellipses" not in types      # glyph overlay removed
         assert "lines" in types             # the reference crosshair
 
     def test_each_component_builds(self):
         from spyde.actions.strain_display import build_strain_figure
         for comp in ("exx", "eyy", "exy", "omega"):
-            fig, fid, html, p, g = build_strain_figure(
-                self._field(), component=comp, glyphs=False)
+            fig, fid, html, p = build_strain_figure(self._field(), component=comp)
             assert fid and "ellipses" not in {m["type"] for m in p.list_markers()}
 
 
@@ -215,7 +270,7 @@ class TestStrainAction:
 
         fig, ax = apl.subplots()
         p = ax.imshow(np.zeros((4, 4), "f4"))
-        ctrl = StrainController(_V(), p, None, ref_yx=(0, 0))
+        ctrl = StrainController(_V(), p, ref_yx=(0, 0))
         ctrl.attach()
         ctrl.set_cif_reference(phase)                   # absolute CIF reference
         assert ctrl.cif_mode is True
@@ -230,7 +285,7 @@ class TestStrainAction:
         vecs = _MockVecsCM((4, 4), lambda iy, ix: np.eye(2))
         fig, ax = apl.subplots()
         p = ax.imshow(np.zeros((4, 4), "f4"))
-        ctrl = StrainController(vecs, p, None, ref_yx=(0, 0))
+        ctrl = StrainController(vecs, p, ref_yx=(0, 0))
         ctrl.attach()
         assert len(ctrl.rings) == 2 and ctrl.selected_rings == {0, 1}
         ctrl.set_rings([0])                             # keep only the inner ring
