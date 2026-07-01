@@ -362,19 +362,51 @@ class StrainSelectionOverlay(_DPOverlay):
         # Reference spots (calibrated kx,ky) + per-spot selected mask.
         rs = np.zeros((0, 2)) if ref_spots is None else np.asarray(ref_spots, float)
         self.ref_spots = rs.reshape(-1, 2)
+        # Start with NOTHING marked — the user picks which spots drive the fit
+        # (Qt/UX request: don't assume every reflection at a fresh reference
+        # pixel is wanted).
         if selected is None:
-            self.selected = np.ones(len(self.ref_spots), dtype=bool)
+            self.selected = np.zeros(len(self.ref_spots), dtype=bool)
         else:
             self.selected = np.asarray(selected, dtype=bool).reshape(-1)
 
     # ── public API (the controller drives these) ──────────────────────────────
     def set_reference(self, ref_yx, ref_spots, selected=None) -> None:
-        """New reference pixel: replace the reference spots (and selection)."""
+        """New reference pixel: replace the reference spots. If ``selected`` is
+        not given explicitly, CARRY FORWARD the current selection: for every
+        spot the user had marked, keep it selected at the new pixel if a peak
+        still exists within ``match_radius_px`` of its old (calibrated)
+        position — the same "nearest peak within radius" rule the displacement
+        arrows use. This is what lets marked peaks survive a reference-crosshair
+        move instead of resetting every time."""
+        new_ref_spots = np.asarray(ref_spots, float).reshape(-1, 2)
+        if selected is not None:
+            new_selected = np.asarray(selected, bool).reshape(-1)
+        else:
+            new_selected = self._carry_forward_selection(new_ref_spots)
         self.ref_yx = (int(ref_yx[0]), int(ref_yx[1]))
-        self.ref_spots = np.asarray(ref_spots, float).reshape(-1, 2)
-        self.selected = (np.ones(len(self.ref_spots), bool) if selected is None
-                         else np.asarray(selected, bool).reshape(-1))
+        self.ref_spots = new_ref_spots
+        self.selected = new_selected
         self._redraw()
+
+    def _carry_forward_selection(self, new_ref_spots: np.ndarray) -> np.ndarray:
+        """Map the CURRENTLY selected spots onto ``new_ref_spots`` by nearest
+        neighbour within ``match_radius_px`` (calibrated units) — a marked peak
+        stays marked as the reference moves, as long as a peak is still there."""
+        n_new = len(new_ref_spots)
+        old_marked = self.ref_spots[self.selected] if len(self.ref_spots) else np.zeros((0, 2))
+        if n_new == 0 or len(old_marked) == 0:
+            return np.zeros(n_new, dtype=bool)
+        # Radius in calibrated units — the pixel match radius converted via the
+        # axis scale (same convention as the displacement-arrow matching).
+        r2 = (self.match_radius_px * max(abs(self._x_scale), abs(self._y_scale))) ** 2
+        new_selected = np.zeros(n_new, dtype=bool)
+        for ox, oy in old_marked:
+            d2 = (new_ref_spots[:, 0] - ox) ** 2 + (new_ref_spots[:, 1] - oy) ** 2
+            j = int(np.argmin(d2))
+            if d2[j] <= r2:
+                new_selected[j] = True
+        return new_selected
 
     def set_match_radius(self, r_px: float) -> None:
         self.match_radius_px = max(1.0, float(r_px))

@@ -353,6 +353,97 @@ class TestStrainAction:
         assert len(ref) == len(G_REF)
         assert np.all(np.linalg.norm(ref, axis=1) > 0)
 
+    def test_component_toggle_resolves_controller_via_dispatch_window_id(self, window):
+        """strain_set_component (and every other strain_* caret action) is
+        wired to the STRAIN MAP window's id, sent as the IPC dispatch's own
+        top-level window_id — NOT nested inside the payload dict (the
+        renderer's sendAction(action, payload, windowId) keeps them separate).
+        The strain window is a bare `figure`, not a registered Plot, so
+        `plot` is None and _ctrl_for can only resolve via
+        payload["window_id"] — dispatch_action must inject it there itself."""
+        from spyde.actions.strain_action import StrainController, _CONTROLLERS
+        from spyde.actions.strain_mapping import compute_strain_field
+        session = window["window"]
+
+        vecs = _MockVecsCM((4, 4), lambda iy, ix: np.array([[1 + 0.01 * ix, 0.0],
+                                                            [0.0, 1.0]]))
+        import anyplotlib as apl
+        fig, ax = apl.subplots()
+        p = ax.imshow(np.zeros((4, 4), "f4"))
+        ctrl = StrainController(vecs, p, window_id=777, ref_yx=(0, 0), session=session)
+        ctrl.field = compute_strain_field(vecs, (0, 0))
+        ctrl.attach()
+        assert _CONTROLLERS[777] is ctrl
+        assert ctrl.component == "exx"
+
+        # Exactly how the renderer sends it: payload has NO window_id key.
+        session.dispatch_action({
+            "action": "strain_set_component", "window_id": 777,
+            "payload": {"component": "eyy"},
+        })
+        assert ctrl.component == "eyy"
+
+    def test_reference_window_gets_distinguishing_title(self):
+        """The dedicated reference window otherwise inherits the tree's root
+        title (e.g. "— Vectors") — IDENTICAL to the Find-Vectors result window
+        it sits on top of (freshly opened, so focused/topmost). That made the
+        found-vectors red circles look like they vanished when strain opened;
+        they were just hidden under a same-titled window. Give it its own
+        title so it's obviously a different window."""
+        import spyde.backend.ipc as ipc
+        from spyde.actions.strain_action import StrainController
+
+        class _FakeSelector:
+            def __init__(self, child):
+                self.active_children = [child]
+                self.index_hooks = []
+                class _W:
+                    cx = cy = 0.0
+                self._widget = _W()
+            def update_data(self):
+                pass
+
+        class _FakeRefPlot:
+            """Stands in for the real spyde Plot wrapper (fig_id/_figure_html/
+            window_id) that _rename_ref_window reads from."""
+            def __init__(self, window_id):
+                self.window_id = window_id
+                self.fig_id = "fake-fig-id"
+                self._figure_html = "<html>fake</html>"
+
+        class _FakeWindow:
+            def __init__(self, plot):
+                self.current_plot_item = plot
+
+        class _FakeNPM:
+            def __init__(self, ref_plot):
+                self.plot_windows = {object(): {}}
+                self.navigation_selectors = {}
+                self._ref_plot = ref_plot
+
+            def add_navigation_selector_and_signal_plot(self, nav_window, color=None):
+                sel = _FakeSelector(self._ref_plot)
+                self.navigation_selectors[nav_window] = [sel]
+                return _FakeWindow(self._ref_plot)
+
+        ref_plot = _FakeRefPlot(window_id=555)
+        vecs = _MockVecsCM((4, 4), lambda iy, ix: np.array([[1.0, 0.0], [0.0, 1.0]]))
+        npm = _FakeNPM(ref_plot)
+        tree = type("T", (), {"navigator_plot_manager": npm, "signal_plots": []})()
+
+        cap, orig = [], ipc.emit
+        ipc.emit = lambda m: cap.append(m)
+        try:
+            ctrl = StrainController(vecs, object(), ref_yx=(0, 0), src_tree=tree)
+            ctrl._attach_reference_selector()
+        finally:
+            ipc.emit = orig
+
+        fig_msgs = [m for m in cap if m.get("type") == "figure" and m.get("window_id") == 555]
+        assert fig_msgs, "no figure re-emit for the reference window"
+        assert fig_msgs[-1]["title"] == "Strain Reference"
+        assert fig_msgs[-1]["fig_id"] == "fake-fig-id"
+
     def test_reference_selector_uses_distinct_color_and_suppresses_toolbar(self):
         """The dedicated reference crosshair must be visually distinguishable
         from the main navigator crosshair (default green) — a different color
@@ -513,11 +604,13 @@ class TestStrainSelectionOverlay:
         ov.attach(tree=type("T", (), {"navigator_plot_manager": None})())
         return ov, dp._plot2d
 
-    def test_reference_pixel_shows_selected_circles(self):
+    def test_reference_pixel_starts_with_nothing_selected(self):
         ov, p2d = self._overlay()
-        # On the reference pixel all 3 spots are selected (green), none excluded.
-        assert len(p2d.groups["strain_selected"].kw["offsets"]) == 3
-        assert len(p2d.groups["strain_excluded"].kw["offsets"]) == 0
+        # Fresh reference pixel: NOTHING marked yet (the user picks) — all 3
+        # spots show as excluded (grey), none selected (green).
+        assert len(p2d.groups["strain_selected"].kw["offsets"]) == 0
+        assert len(p2d.groups["strain_excluded"].kw["offsets"]) == 3
+        assert ov.selected.sum() == 0
 
     def test_click_handler_listens_on_double_click(self):
         # A single click is ambiguous with panning on an anyplotlib 2-D panel,
@@ -529,16 +622,17 @@ class TestStrainSelectionOverlay:
     def test_click_toggles_selection_and_fires_callback(self):
         hits = []
         ov, p2d = self._overlay(on_toggle=lambda: hits.append(1))
-        # Double-click at the CALIBRATED position of the spot at (5,0) → toggle it OFF.
+        assert ov.selected.sum() == 0           # nothing selected initially
+        # Double-click at the CALIBRATED position of the spot at (5,0) → mark it.
         p2d.handler(_Evt(5.0, 0.0))
         assert hits == [1]
-        assert ov.selected.sum() == 2          # one dropped
-        assert len(p2d.groups["strain_selected"].kw["offsets"]) == 2
-        assert len(p2d.groups["strain_excluded"].kw["offsets"]) == 1
-        assert len(ov.selected_reference()) == 2
-        # Click it again → back ON.
+        assert ov.selected.sum() == 1
+        assert len(p2d.groups["strain_selected"].kw["offsets"]) == 1
+        assert len(p2d.groups["strain_excluded"].kw["offsets"]) == 2
+        assert len(ov.selected_reference()) == 1
+        # Click it again → back OFF.
         p2d.handler(_Evt(5.0, 0.0))
-        assert ov.selected.sum() == 3
+        assert ov.selected.sum() == 0
 
     def test_click_hit_test_is_scale_independent(self):
         # A trivial scale=1/offset=0 axis makes calibrated units == pixel
@@ -555,10 +649,11 @@ class TestStrainSelectionOverlay:
         # (very different) pixel position.
         p2d.handler(_Evt(5.0, 0.0))
         assert hits == [1]
-        assert ov.selected.sum() == 2
+        assert ov.selected.sum() == 1
 
     def test_off_reference_draws_displacement_arrows(self):
         ov, p2d = self._overlay()
+        ov.selected[:] = True                  # mark all 3 spots to drive arrows
         ov._last_iyix = (1, 1)                 # move off the reference pixel
         ov._redraw()
         arrows = p2d.groups["strain_displacement"].kw
@@ -568,6 +663,44 @@ class TestStrainSelectionOverlay:
         assert np.allclose(arrows["V"], -0.3, atol=1e-5)
         # And the circle groups are cleared off-reference.
         assert len(p2d.groups["strain_selected"].kw["offsets"]) == 0
+
+    def test_selection_carries_forward_when_reference_moves(self):
+        """Marking peaks, then moving the reference crosshair, must KEEP those
+        peaks marked at their new positions (matched by nearest-within-
+        match_radius, like the displacement arrows) — not reset to a fresh
+        all-or-nothing selection every move."""
+        ov, p2d = self._overlay()
+        # Mark the spot at (5, 0) and (0, 5); leave (-5, 0) unmarked.
+        p2d.handler(_Evt(5.0, 0.0))
+        p2d.handler(_Evt(0.0, 5.0))
+        assert ov.selected.sum() == 2
+
+        # New reference pixel: the same 3 spots, each shifted by a small amount
+        # (a real strain gradient would nudge them slightly) — well within the
+        # 3.0 px match_radius used by _overlay().
+        new_ref = np.array([[5.2, 0.1], [0.1, 5.2], [-4.9, -0.1]])
+        ov.set_reference((1, 1), new_ref)
+
+        # The two previously-marked spots are marked again (matched to their
+        # new positions); the never-marked third spot stays unmarked.
+        assert ov.selected.sum() == 2
+        marked = ov.selected_reference()
+        assert len(marked) == 2
+        # Confirm it's specifically the (5.2,0.1)/(0.1,5.2) pair, not (-4.9,-0.1).
+        assert not any(np.allclose(m, [-4.9, -0.1]) for m in marked)
+
+    def test_selection_carry_forward_drops_peak_outside_match_radius(self):
+        """A marked peak with NO successor within match_radius at the new
+        reference pixel is dropped (not carried forward to some unrelated
+        spot) — it simply becomes unmarked."""
+        ov, p2d = self._overlay()
+        p2d.handler(_Evt(5.0, 0.0))             # mark the (5,0) spot
+        assert ov.selected.sum() == 1
+
+        # New reference: no spot anywhere near (5,0) (match_radius_px=3.0).
+        new_ref = np.array([[50.0, 50.0], [0.0, 5.0], [-5.0, 0.0]])
+        ov.set_reference((1, 1), new_ref)
+        assert ov.selected.sum() == 0
 
     def test_strain_run_without_vectors_errors(self):
         import spyde.backend.ipc as ipc

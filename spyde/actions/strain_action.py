@@ -155,6 +155,25 @@ class StrainController:
         # Vectors, Strain Mapping, etc. would be meaningless here and just
         # clutter a window the user isn't meant to drive actions from).
         self._suppress_toolbar(self._ref_plot)
+        # Give it a title distinct from the tree's other windows (it otherwise
+        # inherits the tree's root title, e.g. "— Vectors" — IDENTICAL to the
+        # Find-Vectors result window it sits on top of, freshly opened and
+        # focused, so the found-vectors red circles look like they vanished
+        # when they're just hidden underneath this same-titled window).
+        self._rename_ref_window("Strain Reference")
+
+    def _rename_ref_window(self, title: str) -> None:
+        plot = self._ref_plot
+        fig_id = getattr(plot, "fig_id", None)
+        html = getattr(plot, "_figure_html", None)
+        if plot is None or fig_id is None or html is None:
+            return
+        try:
+            from spyde.backend.ipc import emit
+            emit({"type": "figure", "fig_id": fig_id, "window_id": plot.window_id,
+                  "html": html, "title": title, "is_navigator": False})
+        except Exception as e:
+            log.debug("renaming strain reference window failed: %s", e)
 
     @staticmethod
     def _suppress_toolbar(plot) -> None:
