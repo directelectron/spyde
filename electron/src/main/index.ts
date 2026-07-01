@@ -1,11 +1,11 @@
 /**
  * index.ts — Electron main process for SpyDE.
  */
-import { app, BrowserWindow, dialog, ipcMain, Menu, shell, nativeTheme } from 'electron'
-import { join } from 'path'
+import { app, BrowserWindow, dialog, ipcMain, Menu, shell, nativeTheme, net, protocol } from 'electron'
+import { join, basename } from 'path'
 import { pathToFileURL } from 'url'
 import { tmpdir } from 'os'
-import { writeFileSync } from 'fs'
+import { existsSync, realpathSync, writeFileSync, rmSync } from 'fs'
 import {
   startSpyDE, sendAction, sendFigureEvent, sendResize,
   stopSpyDE,
@@ -13,6 +13,72 @@ import {
 import { resolvePythonEnv } from './pythonEnv'
 
 let win: BrowserWindow | null = null
+
+// ── Figure protocol ───────────────────────────────────────────────────────────
+//
+// Figures are anyplotlib-generated HTML written to the OS temp dir and shown in
+// iframes. They used to load via raw `file://` URLs, which required app-wide
+// `webSecurity: false` (it disables same-origin policy EVERYWHERE, not just for
+// figures). Instead we serve them through a dedicated, locked-down custom scheme
+// (`spyde-fig://`) so `webSecurity` can stay at its secure default (true).
+//
+// The scheme is registered as a STANDARD + SECURE + fetch-capable origin so the
+// figure page (origin `spyde-fig://figures`) can dynamic-`import()` its sibling
+// JS bundle under the SAME origin (cross-scheme module import from a secure page
+// to `file://` is blocked by web security — which is the whole point).
+const FIG_SCHEME = 'spyde-fig'
+const FIG_HOST = 'figures'
+const ICON_HOST = 'icons'
+// Only ever serve the two kinds of files SpyDE itself writes to tmp; anything
+// else (path traversal, arbitrary reads) is refused.
+const FIG_NAME_RE = /^spyde_(?:fig_[\w.-]+\.html|figure_esm_[0-9a-f]+\.js)$/
+// Toolbar icons are package assets (absolute paths from the Python backend's
+// resolve_icon_path). With webSecurity enabled the renderer's http://localhost
+// (dev) origin can't load file:// <img> subresources, so icons are served via
+// this scheme instead. Guard: the resolved real path must be an .svg/.png that
+// lives under a ".../spyde/.../icons/" directory — no arbitrary reads.
+const ICON_EXT_RE = /\.(svg|png)$/i
+const ICON_CONTAINMENT_RE = /[/\\]spyde[/\\](?:.*[/\\])?icons[/\\][^/\\]+$/i
+
+protocol.registerSchemesAsPrivileged([
+  { scheme: FIG_SCHEME, privileges: { standard: true, secure: true, supportFetchAPI: true } },
+])
+
+/** Map a `spyde-fig://figures/<name>` request to its temp-dir file, with a strict
+ *  basename allowlist (no traversal, no arbitrary reads). */
+function resolveFigPath(reqUrl: string): string | null {
+  let u: URL
+  try { u = new URL(reqUrl) } catch { return null }
+  if (u.host !== FIG_HOST) return null
+  const name = basename(decodeURIComponent(u.pathname))
+  if (!FIG_NAME_RE.test(name)) return null
+  const full = join(tmpdir(), name)
+  // basename() already strips any `..`; double-check the resolved file actually
+  // lives directly in tmpdir and exists before serving.
+  if (join(tmpdir(), basename(full)) !== full || !existsSync(full)) return null
+  return full
+}
+
+/** A `spyde-fig://figures/<name>` URL for a temp file basename. */
+function figUrl(name: string): string {
+  return `${FIG_SCHEME}://${FIG_HOST}/${encodeURIComponent(name)}`
+}
+
+/** Map a `spyde-fig://icons/<abs-path>` request to a package icon file. Serves
+ *  only an .svg/.png whose REAL path lives under a spyde ".../icons/" directory;
+ *  realpath collapses any `..`/symlink before the containment + extension check. */
+function resolveIconPath(reqUrl: string): string | null {
+  let u: URL
+  try { u = new URL(reqUrl) } catch { return null }
+  if (u.host !== ICON_HOST) return null
+  // pathname is "/<percent-encoded-absolute-path>"; strip the leading slash.
+  const raw = decodeURIComponent(u.pathname.replace(/^\//, ''))
+  if (!raw || !ICON_EXT_RE.test(raw) || !existsSync(raw)) return null
+  let real: string
+  try { real = realpathSync(raw) } catch { return null }
+  if (!ICON_CONTAINMENT_RE.test(real) || !ICON_EXT_RE.test(real)) return null
+  return real
+}
 
 // Messages from the Python backend can arrive before the renderer has finished
 // loading and registered its ipcRenderer listener. webContents.send() drops
@@ -22,6 +88,18 @@ let win: BrowserWindow | null = null
 // until the renderer signals ready, then flush in order.
 let rendererReady = false
 const pendingMessages: Array<Record<string, unknown>> = []
+
+// Figure HTML files written to tmpdir (served via spyde-fig://). Tracked so we
+// can remove them on quit — otherwise a long session with many re-rendered
+// figures leaves spyde_fig_*.html accumulating in the OS temp dir.
+const figTmpFiles = new Set<string>()
+
+function cleanupFigTmpFiles(): void {
+  for (const p of figTmpFiles) {
+    try { rmSync(p, { force: true }) } catch { /* best-effort temp cleanup */ }
+  }
+  figTmpFiles.clear()
+}
 
 function rendererAlive(): boolean {
   return !!win && !win.isDestroyed() && !win.webContents.isDestroyed()
@@ -67,7 +145,9 @@ function createWindow(): BrowserWindow {
       preload: join(__dirname, '../preload/index.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      webSecurity: false,   // needed so iframes can load file:// HTML
+      // webSecurity stays at its secure default (true). Figures load via the
+      // dedicated `spyde-fig://` scheme (registered above), not raw file://, so
+      // same-origin policy is NOT disabled app-wide anymore.
     },
   })
 
@@ -100,6 +180,24 @@ app.whenReady().then(async () => {
   // anyplotlib figures (which auto-theme off it) render in dark mode to match.
   nativeTheme.themeSource = 'dark'
 
+  // Serve figure HTML/JS through the locked-down `spyde-fig://` scheme (see the
+  // scheme registration near the top). Refuses anything outside the temp-dir
+  // basename allowlist.
+  protocol.handle(FIG_SCHEME, async (request) => {
+    const host = (() => { try { return new URL(request.url).host } catch { return '' } })()
+    const filePath = host === ICON_HOST
+      ? resolveIconPath(request.url)
+      : resolveFigPath(request.url)
+    if (!filePath) return new Response('Not found', { status: 404 })
+    return net.fetch(pathToFileURL(filePath).href)
+  })
+
+  // Tell the preload whether this is a packaged production app, so the renderer
+  // can gate test-only hooks. `app.isPackaged` is only readable in the main
+  // process; forward it via an env var the preload reads. Set BEFORE the window
+  // (and thus the preload) loads.
+  if (app.isPackaged) process.env.SPYDE_PACKAGED = '1'
+
   createWindow()
 
   // Resolve (and on first packaged run, create via `uv sync`) the Python
@@ -129,15 +227,28 @@ app.whenReady().then(async () => {
   startSpyDE(cmd, {
     onMessage: (msg) => {
       // Figure HTML must be written to disk here in the main process (the
-      // renderer is a browser sandbox with no fs). Forward a file:// URL.
+      // renderer is a browser sandbox with no fs). It's served back to the
+      // iframe through the locked-down `spyde-fig://` scheme (NOT raw file://),
+      // so app-wide webSecurity can stay enabled.
       if (msg.type === 'figure' && msg.html && msg.fig_id) {
-        const figPath = join(tmpdir(), `spyde_fig_${String(msg.fig_id)}.html`)
+        const figName = `spyde_fig_${String(msg.fig_id)}.html`
+        const figPath = join(tmpdir(), figName)
+        figTmpFiles.add(figPath)   // tracked for cleanup on quit
         try {
-          writeFileSync(figPath, msg.html as string, 'utf8')
-          // pathToFileURL produces a valid file URL on every OS — a bare
-          // `file://${figPath}` is malformed on Windows (backslashes + drive
-          // letter: `file://C:\…`), so the figure iframe never loaded there.
-          msg = { ...msg, file_url: pathToFileURL(figPath).href, html: undefined }
+          // The Python side embeds a dynamic `import("file://…/spyde_figure_esm_*.js")`
+          // for the shared JS bundle. A secure-scheme page can't import a
+          // file:// module (cross-scheme), so rewrite that import to the SAME
+          // spyde-fig:// origin (the bundle is served by the same handler). The
+          // basename allowlist on the handler still gates which file is read.
+          // The path separator before the filename is `/` on posix and an
+          // escaped `\\` on Windows (Python JSON-escapes the backslashes), so
+          // capture the basename irrespective of separators.
+          const html = (msg.html as string).replace(
+            /import\(\s*["']file:\/\/.*?(spyde_figure_esm_[0-9a-f]+\.js)["']\s*\)/g,
+            (_m, name: string) => `import(${JSON.stringify(figUrl(name))})`,
+          )
+          writeFileSync(figPath, html, 'utf8')
+          msg = { ...msg, file_url: figUrl(figName), html: undefined }
         } catch { /* leave msg as-is on failure */ }
       }
       // Echo key lifecycle messages to the dev terminal so backend health is
@@ -168,8 +279,31 @@ app.whenReady().then(async () => {
 
 app.on('window-all-closed', () => {
   stopSpyDE()
+  cleanupFigTmpFiles()
   if (process.platform !== 'darwin') app.quit()
 })
+
+// Tear the backend down on EVERY quit path, not just when the last window
+// closes (e.g. macOS Cmd-Q, the File→Quit menu role, an app.quit() from IPC).
+// stopSpyDE() is idempotent + null-safe, so overlapping with window-all-closed
+// is harmless. Without this the Python sidecar (and its Dask workers) could
+// outlive the UI on those paths.
+app.on('before-quit', () => { stopSpyDE(); cleanupFigTmpFiles() })
+
+// A console SIGINT/SIGTERM (Ctrl-C in `npm run dev`, or a parent killing us)
+// bypasses the normal Electron quit events, so kill the backend explicitly then
+// exit. Guard against double-registration under HMR with `.once` semantics via
+// a flag is unnecessary here — main is evaluated once per process.
+for (const sig of ['SIGINT', 'SIGTERM'] as const) {
+  process.on(sig, () => {
+    stopSpyDE()
+    cleanupFigTmpFiles()
+    app.quit()
+    // Give the graceful-quit write + tree-kill a moment, then hard-exit so the
+    // signal isn't swallowed if Electron's own teardown stalls.
+    setTimeout(() => process.exit(0), 2000)
+  })
+}
 
 // ── Application menu ──────────────────────────────────────────────────────────
 
@@ -387,4 +521,22 @@ ipcMain.on('spyde:resize', (_, figId: string, width: number, height: number) =>
   sendResize(figId, width, height)
 )
 
-ipcMain.on('open-external', (_, url: string) => shell.openExternal(url))
+// Only hand a URL to the OS if it parses AND uses a protocol we trust. Without
+// this, the renderer (or any compromised iframe content posting through it)
+// could ask the OS to open arbitrary `file:`, custom-scheme, or `javascript:`
+// URLs — a classic shell.openExternal abuse. Allowlist web + mail only.
+const OPEN_EXTERNAL_ALLOWED = new Set(['https:', 'http:', 'mailto:'])
+ipcMain.on('open-external', (_, url: string) => {
+  let parsed: URL
+  try {
+    parsed = new URL(url)
+  } catch {
+    console.warn(`[spyde] open-external rejected unparseable URL: ${url}`)
+    return
+  }
+  if (!OPEN_EXTERNAL_ALLOWED.has(parsed.protocol)) {
+    console.warn(`[spyde] open-external rejected disallowed protocol: ${parsed.protocol}`)
+    return
+  }
+  shell.openExternal(parsed.href)
+})

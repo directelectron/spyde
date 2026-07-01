@@ -18,6 +18,18 @@ import time
 from spyde.drawing.selectors.base_selector import BaseSelector, _nav_dispatcher
 
 
+def _wait(pred, timeout=5.0, interval=0.01):
+    """Poll until pred() is truthy or timeout. Timer-driven assertions can't use a
+    fixed sleep — a loaded CI runner starves the daemon timer thread, so a tight
+    sleep+assert flakes. Poll instead."""
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if pred():
+            return True
+        time.sleep(interval)
+    return bool(pred())
+
+
 class _StubChild:
     plot_window = None
 
@@ -46,8 +58,7 @@ class TestThrottle:
         runs = []
         sel._run_update = lambda *a, **k: runs.append(1)  # type: ignore[assignment]
         sel.update_data()
-        time.sleep(0.05)
-        assert sum(runs) >= 1                 # the move reached _run_update
+        assert _wait(lambda: sum(runs) >= 1)  # the move reached _run_update
 
     def test_burst_coalesces_while_dispatcher_is_busy(self):
         # The serialisation guarantee: while one update is running, a BURST of
@@ -86,11 +97,12 @@ class TestThrottle:
         # A trailing settle timer is armed so a resting frame re-fires once.
         assert sel._settle_timer is not None
 
-        time.sleep(0.05 + 0.1 + 0.05)
-        # After the quiet period the settle timer fired and cleared itself.
-        assert sel._settle_timer is None
+        # After the quiet period the settle timer fires and clears itself. Poll
+        # rather than sleep-then-assert: under CI load the daemon timer thread can
+        # take far longer than its nominal 0.05 s delay to run.
+        assert _wait(lambda: sel._settle_timer is None)
         # The settle fire forces one extra run (force=True) on top of the move(s).
-        assert sum(runs) >= 1
+        assert _wait(lambda: sum(runs) >= 1)
 
     def test_dispatcher_is_a_single_shared_lane(self):
         # All selectors share one dispatcher thread (the serialisation point that

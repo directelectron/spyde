@@ -6,8 +6,6 @@ interface Props {
   iframeRefs: React.MutableRefObject<Map<string, HTMLIFrameElement>>
   replayState: (figId: string) => void
   sendAction: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
-  ipfKey?: string   // IPF colour-key triangle (PNG data URL) — legend for IPF windows
-  strainRings?: { rings: number[]; selected: number[] }   // strain reflection-ring selection
 }
 
 // The reserved view_label of the backend-built side-by-side comparison figure.
@@ -32,7 +30,7 @@ const STRAIN_LABEL: Record<string, string> = { exx: 'εxx', eyy: 'εyy', exy: '�
 // All iframes stay MOUNTED; only the active one is shown (instant switch). A
 // ResizeObserver keeps the visible figure sized to its box (the single sizing
 // authority — handles window resize and the view-bar height).
-export function WindowContent({ win, iframeRefs, replayState, sendAction, ipfKey, strainRings }: Props) {
+export function WindowContent({ win, iframeRefs, replayState, sendAction }: Props) {
   const id = String(win.windowId)
   const figs = win.figures
 
@@ -40,6 +38,9 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction, ipfKey
   const has3d = !!fig3d
   const figDensity = useMemo(() => figs.find(f => f.view === 'density'), [figs])
   const hasDensity = !!figDensity
+  // The IPF colour-key triangle legend — a native anyplotlib figure pinned in
+  // the corner of the 2-D map (not a switchable view).
+  const figIpfKey = useMemo(() => figs.find(f => f.view === 'ipf_key'), [figs])
   const tiledFig = useMemo(() => figs.find(f => f.viewLabel === TILED), [figs])
   // Unique chip labels in stable first-seen order (the tiled figure is not a chip).
   const labels = useMemo(() => {
@@ -104,7 +105,7 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction, ipfKey
     if (hasDensity && mode === 'density' && figDensity) return figDensity
     if (multi && tiledFig) return tiledFig                     // anyplotlib N-axis compare
     if (hasChips) return [...figs].reverse().find(f => f.viewLabel === selected[0]) ?? null
-    return figs.find(f => f.view !== '3d' && f.view !== 'density' && f.viewLabel !== TILED) ?? figs[0] ?? null
+    return figs.find(f => f.view !== '3d' && f.view !== 'density' && f.view !== 'ipf_key' && f.viewLabel !== TILED) ?? figs[0] ?? null
   }, [has3d, mode, fig3d, hasDensity, figDensity, multi, tiledFig, hasChips, selected, figs])
 
   const shownId = shownFig?.figId
@@ -162,51 +163,22 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction, ipfKey
             </div>
           )}
           {strainComponents && (
+            // The strain MAP window's component toggle (εxx/εyy/εxy/ω). Reference
+            // method, spot selection, match radius, and Submit live in the Strain
+            // caret (StrainWizard) on the source pattern, not here.
             <div style={styles.group} data-testid={`strain-toggle-${id}`}>
               {strainComponents.map(c => (
                 <button key={c} data-testid={`strain-comp-${c}-${id}`}
                   onClick={() => { setStrainComp(c); sendAction('strain_set_component', { component: c }, win.windowId) }}
                   style={c === strainComp ? styles.btnActive : styles.btn}>{STRAIN_LABEL[c] ?? c}</button>
               ))}
-              <span style={{ width: 6 }} />
-              {/* reference: the live crosshair region (relative) or a CIF spacing (absolute). */}
-              <button data-testid={`strain-ref-region-${id}`} style={styles.btn}
-                title="Reference = the cyan crosshair region (relative strain)"
-                onClick={() => sendAction('strain_set_cif', {}, win.windowId)}>Region</button>
-              <button data-testid={`strain-ref-cif-${id}`} style={styles.btn}
-                title="Absolute strain from a CIF's ideal spacing"
-                onClick={async () => {
-                  const p = await window.electron.pickFile({ name: 'Crystal (.cif)', extensions: ['cif'] })
-                  if (p) sendAction('strain_set_cif', { cif_path: p }, win.windowId)
-                }}>CIF…</button>
-              {/* reflection-ring selection: click a ring to include/exclude it from the fit. */}
-              {strainRings && strainRings.rings.length > 1 && (
-                <>
-                  <span style={{ width: 6 }} />
-                  {strainRings.rings.map((g, i) => {
-                    const on = strainRings.selected.includes(i)
-                    return (
-                      <button key={i} data-testid={`strain-ring-${i}-${id}`}
-                        title={`Reflection ring |g|=${g} Å⁻¹ — click to ${on ? 'exclude' : 'include'}`}
-                        onClick={() => {
-                          const next = on ? strainRings.selected.filter(s => s !== i)
-                                          : [...strainRings.selected, i]
-                          sendAction('strain_set_rings',
-                            { selected: next.length ? next : strainRings.rings.map((_, k) => k) },
-                            win.windowId)
-                        }}
-                        style={on ? styles.btnActive : styles.btn}>{`R${i + 1}`}</button>
-                    )
-                  })}
-                </>
-              )}
             </div>
           )}
         </div>
       )}
 
       <div ref={boxRef} data-testid={`figure-box-${id}`} style={styles.box}>
-        {figs.map(fig => (
+        {figs.filter(f => f.view !== 'ipf_key').map(fig => (
           <iframe
             key={fig.figId}
             ref={el => {
@@ -227,10 +199,26 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction, ipfKey
             data-testid={`figure-${fig.figId}`}
           />
         ))}
-        {/* IPF colour-key triangle legend, pinned in the corner of the 2-D map
-            (the stereographic fundamental-sector key matplotlib/pyxem show). */}
-        {ipfKey && mode === '2d' && (
-          <img src={ipfKey} alt="IPF colour key" data-testid={`ipf-key-${id}`} style={styles.ipfKey} />
+        {/* IPF colour-key triangle legend — a native anyplotlib figure pinned in
+            the corner of the 2-D map (the stereographic fundamental-sector key
+            matplotlib/pyxem show), only over the RGB map (mode==='2d'). */}
+        {figIpfKey && mode === '2d' && (
+          <iframe
+            key={figIpfKey.figId}
+            ref={el => {
+              if (el) iframeRefs.current.set(figIpfKey.figId, el)
+              else iframeRefs.current.delete(figIpfKey.figId)
+            }}
+            src={figIpfKey.filePath ?? undefined}
+            onLoad={(e) => {
+              replayState(figIpfKey.figId)
+              const el = e.currentTarget
+              window.electron.resizeFigure(figIpfKey.figId, Math.max(80, el.clientWidth), Math.max(80, el.clientHeight))
+            }}
+            style={styles.ipfKey}
+            title={figIpfKey.title}
+            data-testid={`ipf-key-${id}`}
+          />
         )}
       </div>
     </div>
@@ -251,9 +239,9 @@ const styles: Record<string, React.CSSProperties> = {
   },
   box: { flex: 1, minHeight: 0, position: 'relative' },
   ipfKey: {
-    position: 'absolute', right: 6, bottom: 6, width: 104, height: 'auto',
-    pointerEvents: 'none', zIndex: 4,
-    background: 'rgba(24,24,37,0.72)', borderRadius: 6, padding: 3,
+    position: 'absolute', right: 6, bottom: 6, width: 132, height: 120,
+    border: 'none', zIndex: 4,
+    background: 'rgba(24,24,37,0.72)', borderRadius: 6,
   },
   frame: {
     position: 'absolute', inset: 0, width: '100%', height: '100%',
@@ -274,5 +262,13 @@ const styles: Record<string, React.CSSProperties> = {
   btnActive: {
     background: '#89b4fa', border: 'none', color: '#11111b', cursor: 'pointer',
     fontSize: 10, fontWeight: 600, padding: '2px 7px', borderRadius: 4,
+  },
+  btnPrimary: {
+    background: '#fab387', border: 'none', color: '#11111b', cursor: 'pointer',
+    fontSize: 10, fontWeight: 700, padding: '2px 9px', borderRadius: 4,
+  },
+  select: {
+    background: '#181825', color: '#cdd6f4', border: '1px solid #313244',
+    borderRadius: 4, fontSize: 10, fontWeight: 600, padding: '2px 4px', cursor: 'pointer',
   },
 }

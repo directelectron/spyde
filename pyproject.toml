@@ -11,7 +11,9 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
 ]
 dependencies = [
     "numpy>=1.20.0",
@@ -23,19 +25,20 @@ dependencies = [
     "sympy",
     "distributed",
     "dask",
-    "hyperspy@git+https://github.com/cssfrancis/hyperspy.git@slice-integrate2",
-    "rosettasciio@git+https://github.com/cssfrancis/rosettasciio.git@win32-binary-read",
+    "hyperspy@git+https://github.com/cssfrancis/hyperspy.git@f314cf42aa16a06d82449cd8dc8c8f57df2e3e72",
+    "rosettasciio@git+https://github.com/cssfrancis/rosettasciio.git@ab4f4562c62c1bf5130c5c9a1999929c7b7c5b35",
     "pyxem",
     "imageio-ffmpeg",
     "imagecodecs",
     "psygnal>=0.10.0",
-    "anyplotlib@git+https://github.com/CSSFrancis/anyplotlib.git@main",
+    "anyplotlib>=0.1.0",
     "pyyaml",
     # GPU-accelerated batched compute (vector orientation mapping, etc.).
     "torch",
 ]
 description = "DE Visualization tool based on HyperSpy"
-version = "0.0.1"
+dynamic = ["version"]
+license = {text = "GPL-3.0-or-later"}
 keywords = [
     "EELS",
     "STEM",
@@ -87,6 +90,9 @@ exclude = [
     "dist/**/*",
 ]
 
+[tool.setuptools_scm]
+version_scheme = "no-guess-dev"
+
 [tool.setuptools.packages.find]
 include = ["spyde*", "spyde.*"]
 where = ["."]
@@ -99,14 +105,13 @@ spyde = [
     "*.icns",
     "*.svg",
     "drawing/toolbars/icons/*.svg",
-    "actions/hyper_signal_actions/*.yaml",
-    "actions/plot_actions/*.yaml",
 ]
 
 [project.optional-dependencies]
 tests = [
     "pytest-instafail",
     "pytest-rerunfailures",
+    "pytest-timeout",
     "pytest>=3.6",
     "setuptools_scm",
     "pytest-cov",
@@ -143,7 +148,9 @@ spyde = "spyde"
 # compute/contract nets consolidated here; sped_ag timing lives in benchmark_*.py,
 # run manually. The Playwright suite under electron/ covers the UI.)
 testpaths = ["spyde/tests/migrated"]
+addopts = "--strict-markers"
 markers = [
     "gpu: tests requiring a physical NVIDIA GPU",
     "slow: slow tests (e.g. real template-library generation)",
+    "network: tests that make a live network request (e.g. COD lookup)",
 ]

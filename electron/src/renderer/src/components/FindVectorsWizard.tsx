@@ -66,6 +66,12 @@ export function FindVectorsWizard({ openUp, windowId, sendAction, onClose }: Pro
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // Cancel any pending debounced tune on unmount so fv_tune can't fire at a
+  // torn-down preview after the wizard closes mid-debounce.
+  React.useEffect(() => () => {
+    if (tuneTimer.current) clearTimeout(tuneTimer.current)
+  }, [])
+
   // Adopt the backend's auto-estimated disk radius (Qt parity) the first time it
   // arrives, then re-run the preview with it. The user can still override.
   const autoApplied = React.useRef(false)

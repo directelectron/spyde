@@ -140,6 +140,9 @@ test('Vector Orientation Mapping: Generate → Compute opens IPF + strain window
   // here the result windows cascade so the toggle can be covered — assert it's
   // wired, i.e. present on the vector-OM IPF window).
   const ipfWin = page.getByTestId('subwindow').filter({ hasText: 'Orientation' }).first()
-  await expect(ipfWin.getByTestId(/^ipf-view-toggle-/)).toBeVisible({ timeout: 15_000 })
-  await expect(ipfWin.getByTestId(/^ipf-view-3d-/)).toBeVisible()
+  // The 2D/3D toggle appears only once the IPF 3-D explorer figure arrives —
+  // that figure is generated after the heavy OM compute, so allow generous time
+  // on a loaded CI runner (15s was too tight and flaked).
+  await expect(ipfWin.getByTestId(/^ipf-view-toggle-/)).toBeVisible({ timeout: 60_000 })
+  await expect(ipfWin.getByTestId(/^ipf-view-3d-/)).toBeVisible({ timeout: 15_000 })
 })

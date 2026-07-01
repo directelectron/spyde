@@ -7,6 +7,7 @@
 import React, {
   createContext, useContext, useEffect, useReducer, useRef, useState,
 } from 'react'
+import { asPlotAppMessage } from './protocol'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -98,8 +99,6 @@ interface State {
   signalTreeActive: Map<number, number>   // windowId → active node signal_id
   axes: Map<number, AxisRow[]>
   composition: Map<number, Composition>     // windowId → sample elements + percentages
-  ipfKey: Map<number, string>               // windowId → IPF colour-key triangle (PNG data URL)
-  strainRings: Map<number, { rings: number[]; selected: number[] }>   // windowId → strain ring selection
   activeActions: Map<number, Set<string>>   // windowId → action names with live output
   subItems: Map<number, Map<string, SubItem[]>>  // windowId → action → dynamic chips
   status: string
@@ -112,6 +111,7 @@ interface State {
   navShapePrompt: NavShapePrompt | null   // pending scan-shape/step-size dialog
   loading: { busy: boolean; text: string }   // long file-read busy indicator
   signalTypes: Map<number, { current: string; options: string[] }>   // windowId → signal-type info
+  backendExited: { code: number | null } | null   // set when the Python sidecar dies; surfaces a blocking banner
 }
 
 // Backend `nav_shape_prompt`: confirm the scan grid + step size before opening a
@@ -135,8 +135,6 @@ type Action =
   | { type: 'SET_ACTIVE'; windowId: number }
   | { type: 'METADATA'; windowIds: number[]; metadata: MetadataDict }
   | { type: 'COMPOSITION'; windowIds: number[]; composition: Composition }
-  | { type: 'IPF_KEY'; windowId: number; dataUrl: string }
-  | { type: 'STRAIN_RINGS'; windowId: number; rings: number[]; selected: number[] }
   | { type: 'AXES'; windowIds: number[]; axes: AxisRow[] }
   | { type: 'ACTION_ACTIVE'; windowId: number; name: string; active: boolean }
   | { type: 'SUB_ITEM'; windowId: number; action: string; name: string; color: string; vtype?: string; calculation?: string; active: boolean }
@@ -150,6 +148,7 @@ type Action =
   | { type: 'LOG'; entry: LogEntry }
   | { type: 'LOG_BACKFILL'; entries: LogEntry[] }
   | { type: 'LOG_LEVEL'; level: string }
+  | { type: 'BACKEND_EXITED'; code: number | null }
 
 function spydeReducer(state: State, action: Action): State {
   switch (action.type) {
@@ -269,8 +268,6 @@ function spydeReducer(state: State, action: Action): State {
         metadata: drop(state.metadata),
         axes: drop(state.axes),
         composition: drop(state.composition),
-        ipfKey: drop(state.ipfKey),
-        strainRings: drop(state.strainRings),
         signalTrees: drop(state.signalTrees),
         signalTreeActive: drop(state.signalTreeActive),
         activeActions: drop(state.activeActions),
@@ -292,18 +289,6 @@ function spydeReducer(state: State, action: Action): State {
       const composition = new Map(state.composition)
       for (const wid of action.windowIds) composition.set(wid, action.composition)
       return { ...state, composition }
-    }
-
-    case 'IPF_KEY': {
-      const ipfKey = new Map(state.ipfKey)
-      ipfKey.set(action.windowId, action.dataUrl)
-      return { ...state, ipfKey }
-    }
-
-    case 'STRAIN_RINGS': {
-      const strainRings = new Map(state.strainRings)
-      strainRings.set(action.windowId, { rings: action.rings, selected: action.selected })
-      return { ...state, strainRings }
     }
 
     case 'AXES': {
@@ -382,6 +367,9 @@ function spydeReducer(state: State, action: Action): State {
       return { ...state, signalTypes }
     }
 
+    case 'BACKEND_EXITED':
+      return { ...state, backendExited: { code: action.code }, ready: false, status: 'Backend stopped' }
+
     default:
       return state
   }
@@ -404,6 +392,10 @@ interface SpyDEContextValue {
   stackDialogOpen: boolean
   openStackDialog: () => void
   closeStackDialog: () => void
+  // MDIArea registers its tile-all-windows function here so StatusBar's
+  // "Tile" button can trigger it without threading window-layout state (which
+  // lives in MDIArea's local refs) through the shared context.
+  tileWindowsRef: React.MutableRefObject<(() => void) | null>
 }
 
 const SpyDEContext = createContext<SpyDEContextValue | null>(null)
@@ -414,8 +406,6 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     figures: new Map(),
     metadata: new Map(),
     composition: new Map(),
-    ipfKey: new Map(),
-    strainRings: new Map(),
     histograms: new Map(),
     selectors: new Map(),
     signalTrees: new Map(),
@@ -433,10 +423,12 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     navShapePrompt: null,
     loading: { busy: false, text: '' },
     signalTypes: new Map(),
+    backendExited: null,
   })
 
   const iframeRefs = useRef<Map<string, HTMLIFrameElement>>(new Map())
   const latestStates = useRef<Map<string, Map<string, unknown>>>(new Map())
+  const tileWindowsRef = useRef<(() => void) | null>(null)
   const [stackDialogOpen, setStackDialogOpen] = useState(false)
 
   // Post every stored state for a figure to its iframe (called on iframe load).
@@ -452,41 +444,51 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
   // ── Python → Renderer message dispatch ──────────────────────────────────
 
   useEffect(() => {
-    const handleMessage = (msg: Record<string, unknown>) => {
-      const t = msg.type as string
-      switch (t) {
+    const handleMessage = (raw: Record<string, unknown>) => {
+      // Narrow the raw IPC payload into the discriminated PlotAppMessage union;
+      // the `switch (msg.type)` below then narrows each field per-variant, so the
+      // handlers read typed fields instead of casting them one-by-one.
+      const msg = asPlotAppMessage(raw)
+      switch (msg.type) {
         case 'ready':
-          dispatch({ type: 'READY', dashboardUrl: msg.dashboard as string | undefined })
+        case 'dask_ready':
+          dispatch({ type: 'READY', dashboardUrl: msg.dashboard })
           break
 
         case 'status':
-          dispatch({ type: 'STATUS', text: msg.text as string })
+          dispatch({ type: 'STATUS', text: msg.text })
           break
 
         case 'error':
           dispatch({ type: 'STATUS', text: `⚠ ${msg.text}` })
           break
 
+        case 'backend_exited':
+          // The Python sidecar died (synthesised by runner.ts, not a PLOTAPP line).
+          // Surface a blocking banner — every sendAction after this no-ops.
+          dispatch({ type: 'BACKEND_EXITED', code: msg.code ?? null })
+          break
+
         case 'figure': {
           // Normal path: main process wrote the HTML and gave us file_url.
           // Test path: html is injected directly → fall back to a data URL.
-          let fileUrl = (msg.file_url as string) ?? null
+          let fileUrl = msg.file_url ?? null
           if (!fileUrl && msg.html) {
             fileUrl = 'data:text/html;charset=utf-8,' +
-              encodeURIComponent(msg.html as string)
+              encodeURIComponent(msg.html)
           }
           dispatch({
             type: 'FIGURE',
-            windowId: msg.window_id as number,
-            figId: msg.fig_id as string,
+            windowId: msg.window_id,
+            figId: msg.fig_id,
             fileUrl,
-            title: (msg.title as string) || 'Plot',
-            isNavigator: (msg.is_navigator as boolean) || false,
-            aspect: msg.aspect as number | undefined,
-            view: msg.view as string | undefined,
-            viewLabel: msg.view_label as string | undefined,
-            viewKind: msg.view_kind as string | undefined,
-            strainComponents: msg.strain_components as string[] | undefined,
+            title: msg.title || 'Plot',
+            isNavigator: msg.is_navigator || false,
+            aspect: msg.aspect,
+            view: msg.view,
+            viewLabel: msg.view_label,
+            viewKind: msg.view_kind,
+            strainComponents: msg.strain_components,
           })
           break
         }
@@ -494,30 +496,30 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'toolbar_config':
           dispatch({
             type: 'TOOLBAR_CONFIG',
-            windowId: msg.window_id as number,
-            plotId: msg.plot_id as number,
-            actions: (msg.toolbar_actions as ToolbarAction[]) || [],
+            windowId: msg.window_id,
+            plotId: msg.plot_id,
+            actions: msg.toolbar_actions || [],
           })
           break
 
         case 'window_visibility':
           dispatch({
             type: 'WINDOW_VISIBILITY',
-            windowId: msg.window_id as number,
-            visible: msg.visible as boolean,
+            windowId: msg.window_id,
+            visible: msg.visible,
           })
           break
 
         case 'window_closed':
-          dispatch({ type: 'WINDOW_CLOSED', windowId: msg.window_id as number })
+          dispatch({ type: 'WINDOW_CLOSED', windowId: msg.window_id })
           break
 
         case 'state_update':
           // Forward anyplotlib state to the iframe AND remember it, so it can
           // be replayed if/when the iframe (re)loads after this arrived.
           {
-            const figId = msg.fig_id as string
-            const key = msg.key as string
+            const figId = msg.fig_id
+            const key = msg.key
             if (!latestStates.current.has(figId)) {
               latestStates.current.set(figId, new Map())
             }
@@ -530,30 +532,13 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
           }
           break
 
-        case 'strain_rings':
-          dispatch({
-            type: 'STRAIN_RINGS',
-            windowId: msg.window_id as number,
-            rings: (msg.rings as number[]) ?? [],
-            selected: (msg.selected as number[]) ?? [],
-          })
-          break
-
-        case 'ipf_key':
-          dispatch({
-            type: 'IPF_KEY',
-            windowId: msg.window_id as number,
-            dataUrl: msg.data_url as string,
-          })
-          break
-
         case 'composition':
           dispatch({
             type: 'COMPOSITION',
-            windowIds: (msg.window_ids as number[]) ?? [],
+            windowIds: msg.window_ids ?? [],
             composition: {
-              elements: (msg.elements as string[]) ?? [],
-              percentages: (msg.percentages as Record<string, number>) ?? {},
+              elements: msg.elements ?? [],
+              percentages: msg.percentages ?? {},
             },
           })
           break
@@ -561,57 +546,57 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'metadata':
           dispatch({
             type: 'METADATA',
-            windowIds: (msg.window_ids as number[]) ?? [],
-            metadata: (msg.metadata as MetadataDict) ?? {},
+            windowIds: msg.window_ids ?? [],
+            metadata: msg.metadata ?? {},
           })
           break
 
         case 'axes_info':
           dispatch({
             type: 'AXES',
-            windowIds: (msg.window_ids as number[]) ?? [],
-            axes: (msg.axes as AxisRow[]) ?? [],
+            windowIds: msg.window_ids ?? [],
+            axes: msg.axes ?? [],
           })
           break
 
         case 'action_active':
           dispatch({
             type: 'ACTION_ACTIVE',
-            windowId: msg.window_id as number,
-            name: msg.name as string,
-            active: msg.active as boolean,
+            windowId: msg.window_id,
+            name: msg.name,
+            active: msg.active,
           })
           break
 
         case 'sub_item':
           dispatch({
             type: 'SUB_ITEM',
-            windowId: msg.window_id as number,
-            action: msg.action as string,
-            name: msg.name as string,
-            color: (msg.color as string) ?? '#89b4fa',
-            vtype: msg.vtype as string | undefined,
-            calculation: msg.calculation as string | undefined,
-            active: msg.active as boolean,
+            windowId: msg.window_id,
+            action: msg.action,
+            name: msg.name,
+            color: msg.color ?? '#89b4fa',
+            vtype: msg.vtype,
+            calculation: msg.calculation,
+            active: msg.active,
           })
           break
 
         case 'histogram':
           dispatch({
             type: 'HISTOGRAM',
-            windowId: msg.window_id as number,
+            windowId: msg.window_id,
             histogram: {
-              counts: (msg.counts as number[]) ?? [],
-              edges: (msg.edges as number[]) ?? [],
-              vmin: msg.vmin as number,
-              vmax: msg.vmax as number,
-              threshold: (msg.threshold as number | null) ?? null,
+              counts: msg.counts ?? [],
+              edges: msg.edges ?? [],
+              vmin: msg.vmin,
+              vmax: msg.vmax,
+              threshold: msg.threshold ?? null,
             },
           })
           break
 
         case 'nav_shape_prompt':
-          dispatch({ type: 'NAV_SHAPE_PROMPT', prompt: msg as unknown as NavShapePrompt })
+          dispatch({ type: 'NAV_SHAPE_PROMPT', prompt: msg })
           break
 
         case 'loading':
@@ -621,9 +606,9 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'signal_type_info':
           dispatch({
             type: 'SIGNAL_TYPE',
-            windowIds: (msg.window_ids as number[]) ?? [],
+            windowIds: msg.window_ids ?? [],
             current: String(msg.current ?? ''),
-            options: (msg.options as string[]) ?? [],
+            options: msg.options ?? [],
           })
           break
 
@@ -631,9 +616,9 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
           dispatch({
             type: 'SELECTOR_INFO',
             info: {
-              windowId: msg.window_id as number,
-              mode: (msg.mode as 'crosshair' | 'integrate') ?? 'crosshair',
-              title: (msg.title as string) ?? 'Navigator',
+              windowId: msg.window_id,
+              mode: msg.mode ?? 'crosshair',
+              title: msg.title ?? 'Navigator',
             },
           })
           break
@@ -642,15 +627,11 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
           if (msg.tree) {
             dispatch({
               type: 'SIGNAL_TREE',
-              windowId: msg.window_id as number,
-              tree: msg.tree as TreeNode,
-              activeSignalId: msg.active_signal_id as number | undefined,
+              windowId: msg.window_id,
+              tree: msg.tree,
+              activeSignalId: msg.active_signal_id,
             })
           }
-          break
-
-        case 'dask_ready':
-          dispatch({ type: 'READY', dashboardUrl: msg.dashboard as string | undefined })
           break
 
         case 'log':
@@ -661,7 +642,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
           break
 
         case 'log_backfill':
-          dispatch({ type: 'LOG_BACKFILL', entries: (msg.entries as LogEntry[]) ?? [] })
+          dispatch({ type: 'LOG_BACKFILL', entries: msg.entries ?? [] })
           break
 
         case 'log_level':
@@ -677,59 +658,67 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'fv_auto_params':
         case 'cod_results':
         case 'cod_cif_ready':
-          window.dispatchEvent(new CustomEvent(`spyde:${t}`, { detail: msg }))
+          window.dispatchEvent(new CustomEvent(`spyde:${msg.type}`, { detail: msg }))
           break
       }
     }
 
     const disposeMessage = window.electron.onMessage(handleMessage)
 
-    // Expose test injection hook for Playwright tests
-    ;(window as Record<string, unknown>)['_spyde_test_inject'] = handleMessage
+    // Test-only window hooks (Playwright e2e). NEVER attached in a packaged
+    // production build: a production renderer must not expose a generic message
+    // injector / state inspectors on `window`. Gated TRUE in dev (`npm run dev`)
+    // and under the e2e (which launches the BUILT bundle by path → app.isPackaged
+    // is false → preload's isPackaged is false), FALSE only in `npm run dist`.
+    const testHooksEnabled = import.meta.env.DEV || !window.electron?.isPackaged
+    if (testHooksEnabled) {
+      // Expose test injection hook for Playwright tests
+      window._spyde_test_inject = handleMessage
 
-    // Test hook: return the parsed overlay widgets of a figure's latest panel
-    // state, so a test can post the awi_event a selector would post (without
-    // pixel-perfect mouse grabbing of a tiny handle).
-    ;(window as Record<string, unknown>)['_spyde_test_widgets'] = (figId: string) => {
-      const states = latestStates.current.get(figId)
-      if (!states) return []
-      const widgets: Array<{ panel_id: string; id: string; type: string; data: Record<string, unknown> }> = []
-      for (const [key, value] of states) {
-        if (!key.startsWith('panel_') || !key.endsWith('_json')) continue
-        const panelId = key.slice('panel_'.length, -'_json'.length)
-        try {
-          const d = JSON.parse(value as string)
-          for (const w of d.overlay_widgets ?? []) {
-            widgets.push({ panel_id: panelId, id: w.id, type: w.type, data: w })
-          }
-        } catch { /* */ }
+      // Test hook: return the parsed overlay widgets of a figure's latest panel
+      // state, so a test can post the awi_event a selector would post (without
+      // pixel-perfect mouse grabbing of a tiny handle).
+      window._spyde_test_widgets = (figId: string) => {
+        const states = latestStates.current.get(figId)
+        if (!states) return []
+        const widgets: Array<{ panel_id: string; id: string; type: string; data: Record<string, unknown> }> = []
+        for (const [key, value] of states) {
+          if (!key.startsWith('panel_') || !key.endsWith('_json')) continue
+          const panelId = key.slice('panel_'.length, -'_json'.length)
+          try {
+            const d = JSON.parse(value as string)
+            for (const w of d.overlay_widgets ?? []) {
+              widgets.push({ panel_id: panelId, id: w.id, type: w.type, data: w })
+            }
+          } catch { /* */ }
+        }
+        return widgets
       }
-      return widgets
-    }
 
-    // Test hook: a cheap signature of a figure's latest image data (length +
-    // sampled chars of the base64 image), so a test can detect that the image
-    // actually changed without decoding the canvas.
-    ;(window as Record<string, unknown>)['_spyde_test_image_sig'] = (figId: string) => {
-      const states = latestStates.current.get(figId)
-      if (!states) return ''
-      // Hash the FULL base64 image so a change anywhere in the frame is detected
-      // (a prefix slice misses bright pixels deeper in the buffer).
-      const hash = (s: string) => {
-        let h = 5381
-        for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0
-        return h
+      // Test hook: a cheap signature of a figure's latest image data (length +
+      // sampled chars of the base64 image), so a test can detect that the image
+      // actually changed without decoding the canvas.
+      window._spyde_test_image_sig = (figId: string) => {
+        const states = latestStates.current.get(figId)
+        if (!states) return ''
+        // Hash the FULL base64 image so a change anywhere in the frame is detected
+        // (a prefix slice misses bright pixels deeper in the buffer).
+        const hash = (s: string) => {
+          let h = 5381
+          for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0
+          return h
+        }
+        let sig = ''
+        for (const [key, value] of states) {
+          if (!key.startsWith('panel_')) continue
+          try {
+            const d = JSON.parse(value as string)
+            const b64 = d.image_b64 || ''
+            sig += `${key}:${b64.length}:${hash(b64)}|`
+          } catch { /* */ }
+        }
+        return sig
       }
-      let sig = ''
-      for (const [key, value] of states) {
-        if (!key.startsWith('panel_')) continue
-        try {
-          const d = JSON.parse(value as string)
-          const b64 = d.image_b64 || ''
-          sig += `${key}:${b64.length}:${hash(b64)}|`
-        } catch { /* */ }
-      }
-      return sig
     }
 
     const disposeStream = window.electron.onStream((text, kind) => {
@@ -756,7 +745,11 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
       disposeStream?.()
       disposeStackDialog?.()
       window.removeEventListener('message', onMessage)
-      delete (window as Record<string, unknown>)['_spyde_test_inject']
+      if (testHooksEnabled) {
+        delete window._spyde_test_inject
+        delete window._spyde_test_widgets
+        delete window._spyde_test_image_sig
+      }
     }
   }, [])
 
@@ -778,9 +771,39 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
   const closeStackDialog = () => setStackDialogOpen(false)
 
   return (
-    <SpyDEContext.Provider value={{ state, iframeRefs, latestStates, sendAction, setActiveWindow, replayState, clearNavShapePrompt, stackDialogOpen, openStackDialog, closeStackDialog }}>
+    <SpyDEContext.Provider value={{ state, iframeRefs, latestStates, sendAction, setActiveWindow, replayState, clearNavShapePrompt, stackDialogOpen, openStackDialog, closeStackDialog, tileWindowsRef }}>
       {children}
+      {state.backendExited && <BackendExitedOverlay code={state.backendExited.code} />}
     </SpyDEContext.Provider>
+  )
+}
+
+// Blocking, non-dismissable overlay shown when the Python analysis backend dies.
+// Without this the UI silently freezes (every sendAction no-ops). Restart is a
+// follow-up; for 0.1.0 we make the death visible and tell the user to relaunch.
+function BackendExitedOverlay({ code }: { code: number | null }) {
+  return (
+    <div style={{
+      position: 'fixed', inset: 0, zIndex: 99999,
+      background: 'rgba(0,0,0,0.78)', display: 'flex',
+      alignItems: 'center', justifyContent: 'center', userSelect: 'text',
+    }}>
+      <div style={{
+        maxWidth: 460, padding: '28px 32px', borderRadius: 10,
+        background: '#1e1e2e', border: '1px solid #f38ba8',
+        color: '#cdd6f4', fontFamily: 'system-ui, sans-serif', textAlign: 'center',
+      }}>
+        <div style={{ fontSize: 18, fontWeight: 600, color: '#f38ba8', marginBottom: 10 }}>
+          Analysis backend stopped
+        </div>
+        <div style={{ fontSize: 14, lineHeight: 1.5 }}>
+          The Python process powering SpyDE exited
+          {code != null ? <> (exit code <code>{code}</code>)</> : null}.
+          Compute and file operations are unavailable. Please restart SpyDE.
+          Check the Log panel for details.
+        </div>
+      </div>
+    </div>
   )
 }
 

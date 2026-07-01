@@ -130,6 +130,8 @@ async def _main() -> None:
     # Tests (and headless smoke runs) skip the heavy Dask cluster.
     if os.environ.get("SPYDE_NO_DASK") != "1":
         session.start_dask()
+    else:
+        session.skip_dask()    # open the dask-ready gate; no cluster will start
 
     # Prewarm: the FIRST anyplotlib figure pays a one-time ~120 ms cost (module
     # init + first imshow) and the shared-ESM bundle write. Do it off-thread at

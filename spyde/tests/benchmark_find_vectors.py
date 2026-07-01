@@ -150,7 +150,7 @@ def test_bench_phase1_plain_corr(sped_subset):
 
 def test_bench_phase2_nxcorr(sped_subset):
     """Window-normalised cross-correlation -- output in [-1,1], threshold meaningful."""
-    from spyde.actions.find_vectors import _make_disk, _subpixel_com
+    from spyde.actions.find_vectors import _make_disk
     from scipy.ndimage import maximum_filter
     _, _, frame = sped_subset
 

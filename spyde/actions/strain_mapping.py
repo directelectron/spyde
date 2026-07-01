@@ -168,6 +168,61 @@ def group_rings(g_vectors, *, rel_tol: float = 0.06):
     return np.asarray(rings, dtype=float), idx
 
 
+def _strain_from_T(T: np.ndarray):
+    """Vectorized strain decomposition of a stack of 2×2 deformations.
+
+    ``T`` is ``(P, 2, 2)`` (g_meas ≈ T·g_ref). Returns ``(exx, eyy, exy, omega)``
+    each ``(P,)``, with NaN where T is singular. This is the batched, closed-form
+    equivalent of the per-pixel ``inv/eigh/polar`` block in :func:`fit_pattern_strain`
+    — a real 2×2 symmetric eigendecomposition has a closed form, so no Python loop
+    or per-matrix ``eigh`` is needed.
+    """
+    a, b = T[:, 0, 0], T[:, 0, 1]
+    c, d = T[:, 1, 0], T[:, 1, 1]
+    det = a * d - b * c
+    bad = ~np.isfinite(det) | (np.abs(det) < 1e-12)
+    det_safe = np.where(bad, 1.0, det)
+    # F = inv(T).T  → real-space deformation gradient (see fit_pattern_strain).
+    inv = np.empty_like(T)
+    inv[:, 0, 0], inv[:, 0, 1] = d / det_safe, -b / det_safe
+    inv[:, 1, 0], inv[:, 1, 1] = -c / det_safe, a / det_safe
+    F = np.transpose(inv, (0, 2, 1))
+
+    # M = FᵀF (symmetric, SPD). Closed-form right stretch U = M^½ and strain U − I.
+    f00, f01 = F[:, 0, 0], F[:, 0, 1]
+    f10, f11 = F[:, 1, 0], F[:, 1, 1]
+    m00 = f00 * f00 + f10 * f10
+    m01 = f00 * f01 + f10 * f11
+    m11 = f01 * f01 + f11 * f11
+    tr, dt = m00 + m11, m00 * m11 - m01 * m01
+    disc = np.sqrt(np.clip(tr * tr - 4.0 * dt, 0.0, None))
+    l1 = 0.5 * (tr + disc)            # eigenvalues of M (= squared stretches)
+    l2 = 0.5 * (tr - disc)
+    s1, s2 = np.sqrt(np.clip(l1, 0.0, None)), np.sqrt(np.clip(l2, 0.0, None))
+    # U = s1·P1 + s2·P2 where P1,P2 are the eigen-projectors of M. For a 2×2
+    # symmetric M this collapses to U = (M + sqrt(dt)·I) / (s1 + s2)   [since
+    # M^½ has det = sqrt(dt) and trace = s1+s2], avoiding eigenvector assembly.
+    sdt = np.sqrt(np.clip(dt, 0.0, None))
+    denom = s1 + s2
+    denom_safe = np.where(denom < 1e-12, 1.0, denom)
+    u00 = (m00 + sdt) / denom_safe
+    u01 = m01 / denom_safe
+    u11 = (m11 + sdt) / denom_safe
+    exx = u00 - 1.0
+    eyy = u11 - 1.0
+    exy = u01
+    # R = F·U⁻¹ ; ω = atan2(R10, R00). U⁻¹ = [[u11,-u01],[-u01,u00]]/det(U).
+    udet = u00 * u11 - u01 * u01
+    udet_safe = np.where(np.abs(udet) < 1e-12, 1.0, udet)
+    r00 = (f00 * u11 - f01 * u01) / udet_safe
+    r10 = (f10 * u11 - f11 * u01) / udet_safe
+    omega = np.arctan2(r10, r00)
+
+    for arr in (exx, eyy, exy, omega):
+        arr[bad] = np.nan
+    return exx, eyy, exy, omega
+
+
 def compute_strain_field(vecs, ref_yx=None, *, ref_vectors=None,
                          tol: float | None = None) -> StrainField:
     """Strain field of ``vecs`` (a ``SpyDEDiffractionVectors``) measured against a
@@ -177,6 +232,12 @@ def compute_strain_field(vecs, ref_yx=None, *, ref_vectors=None,
 
     ``tol`` (reciprocal units) is the ±g match radius; defaults to ¼ of the
     reference lattice's nearest-neighbour spacing.
+
+    Fits EVERY nav pixel in one vectorized pass (one global KDTree match + batched
+    per-pixel normal-equation solve + closed-form 2×2 polar decomposition) rather
+    than a per-pixel Python ``scipy`` loop — the loop ran ~13k tiny lstsq/eigh
+    calls on a real scan and made the strain window take seconds. The 5-D (time)
+    case falls back to the per-pixel reference path (rare; kxy_at aggregates time).
     """
     ny, nx = vecs.nav_shape
     if ref_vectors is not None:
@@ -188,18 +249,121 @@ def compute_strain_field(vecs, ref_yx=None, *, ref_vectors=None,
         nn = _median_nn(g_ref)
         tol = 0.25 * nn if nn > 0 else np.inf
 
+    # Vectorized path needs the flat CSR layout with one segment per (iy, ix); a
+    # 5-D dataset's innermost offsets are per (t, iy, ix), so fall back there.
+    flat = getattr(vecs, "flat_buffer", None)
+    offs = getattr(vecs, "nav_offsets", None)
+    n_time = getattr(vecs, "n_time", 0)
+    if (flat is None or offs is None or n_time != 0 or len(g_ref) < 2):
+        return _compute_strain_field_loop(vecs, g_ref, tol, ny, nx)
+
+    return _compute_strain_field_vectorized(flat, offs[-1], g_ref, tol, ny, nx)
+
+
+def _compute_strain_field_loop(vecs, g_ref, tol, ny, nx) -> StrainField:
+    """Per-pixel reference path (5-D / non-CSR / degenerate reference)."""
     exx = np.full((ny, nx), np.nan, dtype=np.float32)
     eyy = np.full((ny, nx), np.nan, dtype=np.float32)
     exy = np.full((ny, nx), np.nan, dtype=np.float32)
     omega = np.full((ny, nx), np.nan, dtype=np.float32)
     cov = np.zeros((ny, nx), dtype=np.float32)
-
     for iy in range(ny):
         for ix in range(nx):
             r = fit_pattern_strain(vecs.kxy_at(iy, ix), g_ref, tol=tol)
             if r is not None:
                 exx[iy, ix], eyy[iy, ix], exy[iy, ix], omega[iy, ix], cov[iy, ix] = r
     return StrainField(exx, eyy, exy, omega, cov)
+
+
+def _compute_strain_field_vectorized(flat_buffer, x_off, g_ref, tol, ny, nx) -> StrainField:
+    """Whole-field strain in one pass — see :func:`compute_strain_field`.
+
+    Mirrors :func:`fit_pattern_strain` exactly, batched over all P = ny·nx pixels:
+    per-pixel mean-centre → one ±g (Friedel) KDTree match for every vector at once
+    → per-pixel affine normal equations (AᵀA, AᵀB) via scatter-add → batched 3×3
+    solve → closed-form 2×2 polar decomposition.
+    """
+    from scipy.spatial import cKDTree
+
+    P = ny * nx
+    from spyde.signals.diffraction_vectors import COL_KX, COL_KY
+    kxy = np.ascontiguousarray(flat_buffer[:, COL_KX:COL_KY + 1], dtype=float)  # (Ntot, 2)
+    x_off = np.asarray(x_off)
+    counts = np.diff(x_off[:P + 1]).astype(np.int64)                # vectors per pixel
+    Ntot = int(x_off[P])
+    kxy = kxy[:Ntot]
+    # Per-vector owning pixel id (segment id from the CSR row pointers).
+    pix = np.repeat(np.arange(P), counts)
+
+    # Per-pixel mean-centre (the −g=g centroid removal in fit_pattern_strain).
+    sums = np.zeros((P, 2)); np.add.at(sums, pix, kxy)
+    cnt = np.maximum(counts, 1)[:, None]
+    centroids = sums / cnt
+    kc = kxy - centroids[pix]                                        # centred measured
+
+    g_ref = g_ref - g_ref.mean(axis=0)                              # centred reference
+    ref_aug = np.vstack([g_ref, -g_ref])                           # (2M, 2), Friedel
+    src_idx = np.concatenate([np.arange(len(g_ref))] * 2)          # back to ref id
+
+    # One KDTree match for EVERY measured vector across the whole scan.
+    d, idx = cKDTree(ref_aug).query(kc, distance_upper_bound=tol)
+    ok = np.isfinite(d)
+    pid = pix[ok]
+    Gr = ref_aug[idx[ok]]                                           # (K, 2) matched ref
+    Gm = kc[ok]                                                     # (K, 2) measured
+
+    # Per-pixel affine normal equations for [gx,gy,1]·M = g_meas. Accumulate the
+    # six unique AᵀA entries + the AᵀB (3×2) via scatter-add keyed by pixel.
+    ax, ay = Gr[:, 0], Gr[:, 1]
+    AtA = np.zeros((P, 3, 3))
+    AtB = np.zeros((P, 3, 2))
+    # AᵀA = Σ [ax,ay,1]ᵀ[ax,ay,1]
+    np.add.at(AtA[:, 0, 0], pid, ax * ax)
+    np.add.at(AtA[:, 0, 1], pid, ax * ay)
+    np.add.at(AtA[:, 0, 2], pid, ax)
+    np.add.at(AtA[:, 1, 1], pid, ay * ay)
+    np.add.at(AtA[:, 1, 2], pid, ay)
+    np.add.at(AtA[:, 2, 2], pid, np.ones_like(ax))
+    AtA[:, 1, 0] = AtA[:, 0, 1]
+    AtA[:, 2, 0] = AtA[:, 0, 2]
+    AtA[:, 2, 1] = AtA[:, 1, 2]
+    np.add.at(AtB[:, 0, :], pid, ax[:, None] * Gm)
+    np.add.at(AtB[:, 1, :], pid, ay[:, None] * Gm)
+    np.add.at(AtB[:, 2, :], pid, Gm)
+
+    # Matched ref count + distinct-ref coverage per pixel.
+    matched = np.zeros(P, dtype=np.int64); np.add.at(matched, pid, 1)
+    # Coverage = #distinct reference reflections matched / len(g_ref).
+    cov = np.zeros((ny, nx), dtype=np.float32)
+    if len(pid):
+        ref_of = src_idx[idx[ok]]
+        seen = {}
+        # distinct (pixel, ref) pairs → count per pixel (small K; vectorized via unique)
+        pairs = pid.astype(np.int64) * len(g_ref) + ref_of
+        upairs = np.unique(pairs)
+        dpix = (upairs // len(g_ref)).astype(np.int64)
+        dcov = np.zeros(P, dtype=np.float32); np.add.at(dcov, dpix, 1.0)
+        cov = (dcov / len(g_ref)).reshape(ny, nx)
+
+    # A pixel is well-posed only with ≥2 matches AND a non-collinear, invertible
+    # normal matrix. Solve all good pixels' 3×3 systems at once.
+    exx = np.full(P, np.nan); eyy = np.full(P, np.nan)
+    exy = np.full(P, np.nan); omega = np.full(P, np.nan)
+    detAtA = np.linalg.det(AtA)
+    good = (matched >= 2) & np.isfinite(detAtA) & (np.abs(detAtA) > 1e-12)
+    if good.any():
+        sol = np.linalg.solve(AtA[good], AtB[good])                # (G, 3, 2): rows = M
+        T = np.transpose(sol[:, :2, :], (0, 2, 1))                 # (G, 2, 2): g≈T·g_ref
+        gx, gy, gz, gw = _strain_from_T(T)
+        exx[good], eyy[good], exy[good], omega[good] = gx, gy, gz, gw
+
+    return StrainField(
+        exx.reshape(ny, nx).astype(np.float32),
+        eyy.reshape(ny, nx).astype(np.float32),
+        exy.reshape(ny, nx).astype(np.float32),
+        omega.reshape(ny, nx).astype(np.float32),
+        cov.astype(np.float32),
+    )
 
 
 def principal_strain(exx: np.ndarray, eyy: np.ndarray, exy: np.ndarray):

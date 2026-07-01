@@ -21,6 +21,7 @@ import hyperspy.api as hs
 
 from spyde.backend.ipc import emit, emit_status, emit_error
 from spyde.actions.context import src_plot_tree as _src_plot_tree
+from spyde.actions._common import reciprocal_radius as _reciprocal_radius
 
 log = logging.getLogger(__name__)
 
@@ -38,12 +39,6 @@ def _count_templates(sim) -> int:
         return int(np.asarray(rots.data).reshape(-1, 4).shape[0])
     except Exception:
         return 0
-
-
-def _reciprocal_radius(signal) -> float:
-    """Max reciprocal radius from the signal-axis calibration."""
-    sig_axes = signal.axes_manager.signal_axes
-    return float(min(ax.scale * ax.size / 2.0 for ax in sig_axes))
 
 
 def orientation_mapping(ctx, action_name: str = "Orientation Mapping",

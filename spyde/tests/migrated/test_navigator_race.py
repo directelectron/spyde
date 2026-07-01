@@ -102,6 +102,17 @@ def test_latest_position_wins_under_burst():
         sel.delayed_update_data(force=True)
     _wait_idle()
 
+    # Poll for the outcome rather than trusting _wait_idle's fixed settle sleep:
+    # the queue can be empty while the LAST job is still running its slow_slice_fn
+    # + apply, which on a loaded CI runner outlasts that sleep.
+    def _landed_on_5():
+        cd = child.current_data
+        return cd is not None and tuple(np.asarray(cd).reshape(-1)[:2]) == (5, 5)
+
+    end = time.monotonic() + 3.0
+    while time.monotonic() < end and not _landed_on_5():
+        time.sleep(0.01)
+
     assert child.current_data is not None
     last = np.asarray(child.current_data).reshape(-1)[:2]
     assert tuple(last) == (5, 5), f"child ended on {tuple(last)}, not (5, 5)"
@@ -143,6 +154,12 @@ def test_newer_submission_coalesces_older_one():
 
     release.set()
     _wait_idle()
+
+    # Poll until both expected positions have computed — _wait_idle can return
+    # between the blocker's append and the coalesced job's append under load.
+    end = time.monotonic() + 3.0
+    while time.monotonic() < end and not ((1, 1) in computed and (3, 3) in computed):
+        time.sleep(0.01)
 
     # The blocker (1,1) computed, then ONLY the latest queued (3,3) — not (2,2).
     assert (1, 1) in computed

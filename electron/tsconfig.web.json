@@ -8,9 +8,13 @@
     "strict": true,
     "skipLibCheck": true,
     "lib": ["ESNext", "DOM"],
-    "types": [],
+    "types": ["vite/client"],
     "baseUrl": ".",
-    "paths": { "@guides/*": ["../guides/*"] }
+    "paths": {
+      "@guides/*": ["../guides/*"],
+      "react": ["./node_modules/@types/react"],
+      "react/jsx-runtime": ["./node_modules/@types/react/jsx-runtime"]
+    }
   },
   "include": ["src/renderer/src/**/*", "../guides/**/*"]
 }

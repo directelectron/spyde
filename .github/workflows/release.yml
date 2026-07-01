@@ -35,6 +35,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        # Full history + tags so setuptools_scm derives the real version from the
+        # pushed v* tag (a shallow checkout has no tags -> 0.0.postN.devN).
+        with:
+          fetch-depth: 0
 
       # ── Node (Electron frontend + electron-builder) ──────────────────────────
       - name: Set up Node
@@ -50,6 +54,12 @@ jobs:
         uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
+
+      # Fail fast on a drifted lock: the installer bundles pyproject.toml +
+      # uv.lock and resolves the venv on the USER's first launch, so an
+      # out-of-sync lock would ship a broken installer that only fails for them.
+      - name: Verify uv.lock is in sync with pyproject.toml
+        run: uv lock --check
 
       # AppImage tooling needs FUSE on the runner.
       - name: Install Linux packaging deps

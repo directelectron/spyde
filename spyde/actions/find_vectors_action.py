@@ -172,6 +172,13 @@ def _start_batch(session, plot, src_tree, p: dict):
                 log.debug("live count-map poll paint failed: %s", e)
             time.sleep(0.35)
 
+    # Marks the batch as in-flight so a downstream action opened in the gap
+    # (e.g. Strain Mapping) can tell "still computing, keep waiting" apart from
+    # "nothing is running, give up" instead of guessing off a fixed timeout —
+    # see StrainController's self-wait in strain_action.strain_run.
+    new_tree._fv_batch_running = True
+    src_tree._fv_batch_running = True
+
     def _work():
         try:
             vecs = _do_compute_vectors(src, p, main_window=session,
@@ -187,6 +194,8 @@ def _start_batch(session, plot, src_tree, p: dict):
             log.exception("Find Vectors compute failed")
         finally:
             stop_poll[0] = True
+            new_tree._fv_batch_running = False
+            src_tree._fv_batch_running = False
             if shm is not None:
                 try:
                     shm.close()
@@ -382,6 +391,12 @@ def _install_render_display(tree, vecs) -> None:
             log.debug("render_frame(%s, %s, t=%s) failed, showing blank: %s",
                       iy, ix, t, e)
             return np.zeros((H, W), dtype=np.float32)
+
+    # Stash the render fn so a LATER-added navigator selector (e.g. "Add Selector"
+    # or the Strain reference crosshair) can be wired to render disks too, instead
+    # of slicing the lazy zero placeholder and painting black. See
+    # MultiplotManager.add_navigation_selector_and_signal_plot.
+    tree._render_frame_fn = _fn
 
     sig_plots = set(getattr(tree, "signal_plots", []))
     npm = getattr(tree, "navigator_plot_manager", None)

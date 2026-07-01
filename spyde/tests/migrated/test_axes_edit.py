@@ -32,13 +32,16 @@ class TestAxesEdit:
             tree = plot.signal_tree
 
             captured = []
-            orig = sess_mod.emit          # session.py binds `emit` at import
-            sess_mod.emit = lambda m: captured.append(m)
+            # _set_axis lives in the AxesEditorMixin (_session_axes) and emits via
+            # ipc.emit; patch that single channel to capture its messages.
+            import spyde.backend.ipc as ipc_mod
+            orig = ipc_mod.emit
+            ipc_mod.emit = lambda m: captured.append(m)
             try:
                 # Edit signal-axis 3 (kx) scale → 0.25.
                 session._set_axis(plot, {"index": 3, "field": "scale", "value": "0.25"})
             finally:
-                sess_mod.emit = orig
+                ipc_mod.emit = orig
 
             # Written to the real axes_manager (immediate, in-memory).
             assert abs(float(tree.root.axes_manager._axes[3].scale) - 0.25) < 1e-9

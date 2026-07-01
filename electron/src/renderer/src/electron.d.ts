@@ -3,6 +3,7 @@ declare global {
   interface Window {
     electron: {
       platform: string
+      isPackaged: boolean
       onMessage: (cb: (msg: Record<string, unknown>) => void) => () => void
       onStream: (cb: (text: string, kind: 'stdout' | 'stderr') => void) => () => void
       onTile: (cb: () => void) => () => void
@@ -21,6 +22,14 @@ declare global {
       resizeFigure: (figId: string, width: number, height: number) => void
       openExternal: (url: string) => void
     }
+
+    // Test-only hooks attached by the renderer for Playwright e2e (DEV /
+    // non-packaged builds only — never in `npm run dist`). See SpyDEContext.tsx.
+    _spyde_test_inject?: (msg: Record<string, unknown>) => void
+    _spyde_test_widgets?: (
+      figId: string,
+    ) => Array<{ panel_id: string; id: string; type: string; data: Record<string, unknown> }>
+    _spyde_test_image_sig?: (figId: string) => string
   }
 }
 

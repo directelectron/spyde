@@ -144,7 +144,7 @@ class MultiplotManager:
         return level, children_dictionary
 
     def add_navigation_selector_and_signal_plot(
-        self, plot_window: "PlotWindow", selector_type=None
+        self, plot_window: "PlotWindow", selector_type=None, *, color: str | None = None
     ) -> "PlotWindow":
         from spyde.drawing.selectors import (
             IntegratingSelector1D,
@@ -182,11 +182,13 @@ class MultiplotManager:
             self.plots[window] = []
         self.plots[window].append(child)
 
+        selector_kwargs = {} if color is None else {"color": color}
         selector = selector_type(
             parent=plot_window,
             children=child,
             multi_selector=True,
             update_function=update_from_navigation_selection,
+            **selector_kwargs,
         )
 
         self.navigation_selectors[plot_window].append(selector)
@@ -213,6 +215,14 @@ class MultiplotManager:
                 self.add_plot_states_for_navigation_signals(signal)
         else:
             self.signal_tree.create_plot_states(plot=child)
+            # Vectors-image tree: its lazy root is a zero placeholder; the disks
+            # are produced by render_frame, wired onto the ORIGINAL selectors at
+            # finalize. A selector added later (this one) would slice the zeros and
+            # paint black — so re-apply the stored render hook for its child too.
+            render_fn = getattr(self.signal_tree, "_render_frame_fn", None)
+            if render_fn is not None:
+                selector.children[child] = render_fn
+                child.needs_auto_level = True
 
         selector.update_data()
         if child.current_data is not None:

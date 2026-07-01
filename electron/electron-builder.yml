@@ -51,9 +51,12 @@ linux:
   target: [AppImage]
   category: Science
 
-# Where electron-updater looks for new releases. NOTE: this only configures the
-# *update check* — nothing here publishes. Cutting a release is a deliberate,
-# separate step (and not wired into CI yet).
+# Tells electron-builder where release artifacts live (GitHub Releases) and emits
+# the channel metadata (latest.yml) alongside them. NOTE: this only configures the
+# artifact target — nothing here publishes automatically. Cutting a release is a
+# deliberate, tag-triggered step (release.yml). In-app auto-update is not wired for
+# 0.1.0 (the electron-updater dependency was removed); add it back here + in main
+# when implementing update checks.
 publish:
   provider: github
   owner: directelectron

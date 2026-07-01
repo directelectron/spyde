@@ -210,7 +210,17 @@ class DaskManager:
                 n_up, self._n_workers, time.monotonic() - t_workers, _elapsed(),
             )
 
-            worker_keys = list(client.scheduler_info(n_workers=-1)["workers"].keys())
+            # scheduler_info can momentarily return a dict WITHOUT a "workers" key
+            # (or with none registered yet) — never let that KeyError abort startup,
+            # which left the cluster with the scheduler up but 0 workers (loads then
+            # hung forever waiting on a worker). Tolerate it: no heavy split, the
+            # navigator/compute still run on whatever workers exist.
+            try:
+                info = client.scheduler_info(n_workers=-1) or {}
+                worker_keys = list((info.get("workers") or {}).keys())
+            except Exception as e:
+                logger.warning("[dask] scheduler_info failed (t+%s): %s", _elapsed(), e)
+                worker_keys = []
             heavy = worker_keys[1:]
             self._heavy_compute_workers = heavy if heavy else None
             logger.info(

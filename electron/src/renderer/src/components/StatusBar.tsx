@@ -13,7 +13,8 @@ export function StatusBar({ logOpen, onToggleLog }: {
   logOpen?: boolean
   onToggleLog?: () => void
 }) {
-  const { state, openStackDialog } = useSpyDE()
+  const { state, openStackDialog, tileWindowsRef } = useSpyDE()
+  const hasWindows = Array.from(state.windows.values()).some(w => w.visible)
   // Badge unseen warnings/errors so problems are noticeable while the log is hidden.
   const problems = state.logEntries.filter(
     (e) => e.level === 'WARNING' || e.level === 'ERROR' || e.level === 'CRITICAL',
@@ -45,6 +46,15 @@ export function StatusBar({ logOpen, onToggleLog }: {
       >
         Log
         {problems > 0 && <span style={styles.badge} data-testid="log-badge">{problems}</span>}
+      </button>
+      <button
+        data-testid="tile-windows"
+        style={{ ...styles.btn, ...(hasWindows ? null : styles.btnDisabled) }}
+        disabled={!hasWindows}
+        onClick={() => tileWindowsRef.current?.()}
+        title="Arrange all windows into a grid"
+      >
+        Tile
       </button>
       <button
         style={styles.btn}
@@ -91,6 +101,7 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: 4,
   },
   btnActive: { background: '#45475a', color: '#89b4fa' },
+  btnDisabled: { color: '#585b70', cursor: 'default' },
   badge: {
     fontSize: 10, lineHeight: '14px', minWidth: 14, textAlign: 'center',
     color: '#11111b', background: '#f9e2af', borderRadius: 8, padding: '0 4px',

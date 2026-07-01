@@ -213,9 +213,11 @@ def _rot_mat(theta):
 
 
 def _affine_from_logstrain(eps, cap):
-    """eps (P,3) [exx,eyy,exy] (pre-clamp, in log space) → (P,2,2) symmetric
-    stretch S = expm(E) with |strain| bounded by cap via tanh. Symmetric
-    positive-definite by construction, so no reflection / collapse possible."""
+    """eps (P,3) [exx,eyy,exy] (pre-clamp) → (P,2,2) symmetric stretch
+    S = I + E (small-strain approximation, NOT the matrix exponential — within
+    ±cap it is cheaper than expm and stays symmetric positive-definite), with
+    |strain| bounded by cap via tanh. SPD by construction, so no reflection /
+    collapse possible."""
     import torch
     b = cap * torch.tanh(eps)             # bounded symmetric-strain components
     exx, eyy, exy = b[:, 0], b[:, 1], b[:, 2]

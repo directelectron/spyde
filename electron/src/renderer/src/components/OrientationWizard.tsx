@@ -52,6 +52,11 @@ export function OrientationWizard({ openUp, windowId, sendAction, onClose }: Pro
   }, [windowId, tab, cifs, voltage, resolution, minInt, gamma, refineMinInt, normalize, nBest, libReady])
 
   const refineTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Cancel any pending debounced refine on unmount so om_refine can't fire at a
+  // torn-down preview after the wizard closes mid-debounce.
+  React.useEffect(() => () => {
+    if (refineTimer.current) clearTimeout(refineTimer.current)
+  }, [])
   const { recents, remember } = useCifRecents()
   const base = (p: string) => p.split(/[/\\]/).pop() || p
 

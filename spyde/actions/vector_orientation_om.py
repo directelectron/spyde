@@ -12,8 +12,9 @@ Staged handlers (mirroring `om_generate_library` / `om_run`):
                          per-template g-vector library, cache on the tree.
   vom_run              — fit every position → IPF-Z + 3 strain map windows.
 
-No Qt: the heavy Qt caret lives in `vector_orientation_action.py` (pyqtgraph);
-this module is import-safe in the Electron backend.
+No Qt: this is the Electron-native staged action; it is import-safe in the
+backend. The old pyqtgraph caret (vector_orientation_action.py) was removed in
+the Qt-removal cleanup.
 """
 from __future__ import annotations
 
@@ -25,6 +26,7 @@ import hyperspy.api as hs
 
 from spyde.backend.ipc import emit, emit_status, emit_error
 from spyde.actions.context import src_plot_tree as _src_plot_tree
+from spyde.actions._common import reciprocal_radius as _reciprocal_radius
 
 log = logging.getLogger(__name__)
 
@@ -37,9 +39,6 @@ DEFAULTS = dict(
 )
 
 
-def _reciprocal_radius(signal) -> float:
-    ax = signal.axes_manager.signal_axes
-    return float(min(a.scale * a.size / 2.0 for a in ax))
 
 
 def vector_orientation_mapping(ctx, action_name: str = "Vector Orientation Mapping", **kwargs):
