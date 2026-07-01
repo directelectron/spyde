@@ -11,6 +11,10 @@ import {
   stopSpyDE,
 } from './runner'
 import { resolvePythonEnv } from './pythonEnv'
+import {
+  initUpdater, checkForUpdates, downloadUpdate, quitAndInstall,
+  readUpdateChannel, setUpdateChannel, getLastUpdateStatus, updatesSupported,
+} from './updater'
 
 let win: BrowserWindow | null = null
 
@@ -123,12 +127,28 @@ function flushPendingMessages(): void {
 
 // ── Window creation ──────────────────────────────────────────────────────────
 
+// App icon (window/taskbar in dev + unpackaged runs; on packaged Win/macOS the
+// OS instead shows the icon electron-builder baked into the exe/app bundle at
+// build time — see electron-builder.yml's icon: fields — but Linux and dev
+// mode both read this BrowserWindow option, so it's still needed here).
+// Dev: __dirname is electron/out/main → three levels up is the repo root,
+// where the icon lives (spyde/Spyde.png) — same navigation pythonEnv's
+// projectRoot uses. Packaged: bundle-python.mjs stages the WHOLE spyde/
+// source tree (icons included, only tests/__pycache__ excluded) into
+// <app resources>/python/spyde/, so the identical file is right there too.
+function resolveAppIcon(): string {
+  const packaged = join(process.resourcesPath, 'python', 'spyde', 'Spyde.png')
+  if (app.isPackaged && existsSync(packaged)) return packaged
+  return join(__dirname, '..', '..', '..', 'spyde', 'Spyde.png')
+}
+
 function createWindow(): BrowserWindow {
   win = new BrowserWindow({
     width: 1400,
     height: 900,
     minWidth: 900,
     minHeight: 600,
+    icon: resolveAppIcon(),
     // ONE custom dark title bar on every platform (no native bar stacked on top
     // of ours — the Windows "two header bars" bug came from 'hiddenInset', which
     // is macOS-only and left the native Windows frame in place).
@@ -199,6 +219,11 @@ app.whenReady().then(async () => {
   if (app.isPackaged) process.env.SPYDE_PACKAGED = '1'
 
   createWindow()
+
+  // Wire autoUpdater events now that there's a window to report them to. Does
+  // NOT check yet — the startup check below fires a few seconds later so it
+  // doesn't compete with the Python sidecar coming up.
+  initUpdater(win!, app.getPath('userData'))
 
   // Resolve (and on first packaged run, create via `uv sync`) the Python
   // sidecar env, then start the backend.
@@ -271,6 +296,11 @@ app.whenReady().then(async () => {
   }, cwd)
 
   buildMenu()
+
+  // Startup check (locked decision: startup + manual, not silent background
+  // auto-download). Delayed so it doesn't compete with the Python sidecar's
+  // own startup work for network/CPU on a slow first launch.
+  setTimeout(() => checkForUpdates(), 5000)
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
@@ -419,6 +449,15 @@ function buildMenu(): void {
           label: 'GitHub',
           click: () => shell.openExternal('https://github.com/cssfrancis/spyde'),
         },
+        { type: 'separator' },
+        {
+          label: 'Check for Updates…',
+          click: () => win?.webContents.send('spyde:open_update_dialog'),
+        },
+        {
+          label: 'GPU Status…',
+          click: () => win?.webContents.send('spyde:open_gpu_status_dialog'),
+        },
       ],
     },
   ])
@@ -539,4 +578,34 @@ ipcMain.on('open-external', (_, url: string) => {
     return
   }
   shell.openExternal(parsed.href)
+})
+
+// ── Update / GPU-status IPC ───────────────────────────────────────────────────
+
+/** Manual "Check Now" from the update dialog. Result arrives async via the
+ *  spyde:update-status push channel (checking -> available/not-available). */
+ipcMain.on('spyde:check-for-updates', () => checkForUpdates())
+
+/** User clicked "Download" in the update dialog. */
+ipcMain.on('spyde:download-update', () => downloadUpdate())
+
+/** User clicked "Restart to Install" once the update finished downloading. */
+ipcMain.on('spyde:quit-and-install', () => quitAndInstall())
+
+/** Current channel + whether this build even supports auto-update (dev/e2e
+ *  builds have no app-update.yml, so the dialog can say so instead of
+ *  silently doing nothing). */
+ipcMain.handle('spyde:get-update-info', () => ({
+  channel: readUpdateChannel(),
+  supported: updatesSupported(),
+  status: getLastUpdateStatus(),
+  appVersion: app.getVersion(),
+}))
+
+/** Channel radio in the update dialog — persisted Electron-side (updater.ts)
+ *  AND mirrored into ~/.spyde/settings.json via the Python action so it's
+ *  visible/debuggable from that side too. */
+ipcMain.on('spyde:set-update-channel', (_, channel: 'stable' | 'beta') => {
+  setUpdateChannel(channel)
+  sendAction('set_update_channel', { channel })
 })

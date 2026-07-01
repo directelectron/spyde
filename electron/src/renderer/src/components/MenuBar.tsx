@@ -27,7 +27,7 @@ type Item =
   | { separator: true }
 
 export function MenuBar({ onStartGuide }: { onStartGuide: (g: Guide) => void }) {
-  const { sendAction, openStackDialog, state } = useSpyDE()
+  const { sendAction, openStackDialog, openUpdateDialog, openGpuStatusDialog, state } = useSpyDE()
   const [open, setOpen] = useState<string | null>(null)
   const barRef = useRef<HTMLDivElement>(null)
 
@@ -72,6 +72,9 @@ export function MenuBar({ onStartGuide }: { onStartGuide: (g: Guide) => void }) 
         onClick: () => state.dashboardUrl && window.electron.openExternal(state.dashboardUrl),
       },
       { label: 'GitHub ↗', onClick: () => window.electron.openExternal('https://github.com/cssfrancis/spyde') },
+      { separator: true },
+      { label: 'Check for Updates…', onClick: () => openUpdateDialog() },
+      { label: 'GPU Status…', onClick: () => openGpuStatusDialog() },
     ],
   }
 

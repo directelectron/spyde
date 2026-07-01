@@ -197,6 +197,7 @@ export interface WizardEventMessage extends MsgBase {
     | 'fv_auto_params'
     | 'cod_results'
     | 'cod_cif_ready'
+    | 'gpu_status_result'
 }
 
 /** The discriminated union the renderer dispatches over. */

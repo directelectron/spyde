@@ -119,6 +119,13 @@ class Session(
             self._recent_files = list(self._settings.get("recent_files", []))[:20]
         except Exception as e:
             log.debug("restoring recent files from settings failed: %s", e)
+        # update_channel/skip_version mirror the Electron-side updater's choice
+        # here so they're inspectable/debuggable from the Python side too (the
+        # Electron main process is the one that actually acts on them).
+        self._update_channel: str = (
+            self._settings.get("update_channel") if self._settings.get("update_channel") in ("stable", "beta")
+            else "stable"
+        )
 
     # ── Startup ────────────────────────────────────────────────────────────────
 
@@ -452,6 +459,24 @@ class Session(
         except Exception as e:
             log.debug("saving recent-files settings failed: %s", e)
 
+    def set_update_channel(self, channel: str) -> None:
+        """Persist the update channel ('stable' or 'beta') to settings.json.
+
+        This mirrors the choice the Electron main process's autoUpdater
+        actually acts on (electron/src/main/updater.ts) — kept here too so the
+        preference is visible/debuggable from the Python side and survives a
+        settings.json inspection independent of Electron's own storage.
+        """
+        if channel not in ("stable", "beta"):
+            log.warning("ignoring invalid update_channel %r", channel)
+            return
+        self._update_channel = channel
+        self._settings["update_channel"] = channel
+        try:
+            self._save_settings()
+        except Exception as e:
+            log.debug("saving update_channel setting failed: %s", e)
+
     def get_recent_files(self) -> list[str]:
         return list(self._recent_files[:20])
 
@@ -467,3 +492,10 @@ class Session(
             except Exception as e:
                 log.debug("removing example temp dir %s failed: %s", tmpdir, e)
         self._example_temp_paths.clear()
+
+
+# ── staged handler (dispatch_action's _STAGED_HANDLERS: fn(session, plot, payload)) ──
+
+def dispatch_set_update_channel(session: Session, plot, payload: dict) -> None:
+    """Renderer's channel radio (stable/beta) -> persist to settings.json."""
+    session.set_update_channel(str(payload.get("channel", "stable")))

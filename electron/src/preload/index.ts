@@ -67,6 +67,27 @@ contextBridge.exposeInMainWorld('electron', {
     return () => ipcRenderer.removeListener('spyde:open_stack_dialog', h)
   },
 
+  /** Open the "Check for Updates" dialog (from the Help menu). Returns an unsubscribe fn. */
+  onOpenUpdateDialog: (cb: () => void) => {
+    const h = () => cb()
+    ipcRenderer.on('spyde:open_update_dialog', h)
+    return () => ipcRenderer.removeListener('spyde:open_update_dialog', h)
+  },
+
+  /** Open the "GPU Status" dialog (from the Help menu). Returns an unsubscribe fn. */
+  onOpenGpuStatusDialog: (cb: () => void) => {
+    const h = () => cb()
+    ipcRenderer.on('spyde:open_gpu_status_dialog', h)
+    return () => ipcRenderer.removeListener('spyde:open_gpu_status_dialog', h)
+  },
+
+  /** electron-updater's check/download/install progress. Returns an unsubscribe fn. */
+  onUpdateStatus: (cb: (status: Record<string, unknown>) => void) => {
+    const h = (_: unknown, status: Record<string, unknown>) => cb(status)
+    ipcRenderer.on('spyde:update-status', h)
+    return () => ipcRenderer.removeListener('spyde:update-status', h)
+  },
+
   // ── Renderer → Python ─────────────────────────────────────────────────────
 
   /** Send a toolbar/menu action to Python. */
@@ -108,4 +129,27 @@ contextBridge.exposeInMainWorld('electron', {
     ipcRenderer.send('spyde:resize', figId, width, height),
 
   openExternal: (url: string) => ipcRenderer.send('open-external', url),
+
+  // ── Updates / GPU status ──────────────────────────────────────────────────
+
+  /** Current channel, whether this build supports auto-update, last known
+   *  status, and the running app's version (for the "About" section). */
+  getUpdateInfo: (): Promise<{
+    channel: 'stable' | 'beta'
+    supported: boolean
+    status: Record<string, unknown>
+    appVersion: string
+  }> => ipcRenderer.invoke('spyde:get-update-info'),
+
+  /** Manual "Check Now". Result arrives via onUpdateStatus. */
+  checkForUpdates: () => ipcRenderer.send('spyde:check-for-updates'),
+
+  /** Start downloading a detected update. Progress arrives via onUpdateStatus. */
+  downloadUpdate: () => ipcRenderer.send('spyde:download-update'),
+
+  /** Quit and install a downloaded update. */
+  quitAndInstallUpdate: () => ipcRenderer.send('spyde:quit-and-install'),
+
+  /** Flip the update channel (stable/beta). */
+  setUpdateChannel: (channel: 'stable' | 'beta') => ipcRenderer.send('spyde:set-update-channel', channel),
 })

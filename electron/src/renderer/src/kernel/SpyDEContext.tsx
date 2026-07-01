@@ -392,6 +392,14 @@ interface SpyDEContextValue {
   stackDialogOpen: boolean
   openStackDialog: () => void
   closeStackDialog: () => void
+  // Check for Updates / GPU Status dialogs (renderer-only UI state, opened
+  // from the Help menu — both the native menu and MenuBar.tsx's HTML one).
+  updateDialogOpen: boolean
+  openUpdateDialog: () => void
+  closeUpdateDialog: () => void
+  gpuStatusDialogOpen: boolean
+  openGpuStatusDialog: () => void
+  closeGpuStatusDialog: () => void
   // MDIArea registers its tile-all-windows function here so StatusBar's
   // "Tile" button can trigger it without threading window-layout state (which
   // lives in MDIArea's local refs) through the shared context.
@@ -430,6 +438,8 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
   const latestStates = useRef<Map<string, Map<string, unknown>>>(new Map())
   const tileWindowsRef = useRef<(() => void) | null>(null)
   const [stackDialogOpen, setStackDialogOpen] = useState(false)
+  const [updateDialogOpen, setUpdateDialogOpen] = useState(false)
+  const [gpuStatusDialogOpen, setGpuStatusDialogOpen] = useState(false)
 
   // Post every stored state for a figure to its iframe (called on iframe load).
   const replayState = (figId: string) => {
@@ -658,6 +668,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'fv_auto_params':
         case 'cod_results':
         case 'cod_cif_ready':
+        case 'gpu_status_result':
           window.dispatchEvent(new CustomEvent(`spyde:${msg.type}`, { detail: msg }))
           break
       }
@@ -730,6 +741,15 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
       setStackDialogOpen(true),
     )
 
+    // Help → Check for Updates… / GPU Status… (native menu; MenuBar.tsx's HTML
+    // dropdown on Windows/Linux calls openUpdateDialog/openGpuStatusDialog directly).
+    const disposeUpdateDialog = window.electron.onOpenUpdateDialog(() =>
+      setUpdateDialogOpen(true),
+    )
+    const disposeGpuStatusDialog = window.electron.onOpenGpuStatusDialog(() =>
+      setGpuStatusDialogOpen(true),
+    )
+
     // Forward iframe events to Python
     const onMessage = (e: MessageEvent) => {
       if (e.data?.type === 'awi_event' && e.data.figId) {
@@ -744,6 +764,8 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
       disposeMessage?.()
       disposeStream?.()
       disposeStackDialog?.()
+      disposeUpdateDialog?.()
+      disposeGpuStatusDialog?.()
       window.removeEventListener('message', onMessage)
       if (testHooksEnabled) {
         delete window._spyde_test_inject
@@ -769,9 +791,19 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
   const clearNavShapePrompt = () => dispatch({ type: 'NAV_SHAPE_PROMPT', prompt: null })
   const openStackDialog = () => setStackDialogOpen(true)
   const closeStackDialog = () => setStackDialogOpen(false)
+  const openUpdateDialog = () => setUpdateDialogOpen(true)
+  const closeUpdateDialog = () => setUpdateDialogOpen(false)
+  const openGpuStatusDialog = () => setGpuStatusDialogOpen(true)
+  const closeGpuStatusDialog = () => setGpuStatusDialogOpen(false)
 
   return (
-    <SpyDEContext.Provider value={{ state, iframeRefs, latestStates, sendAction, setActiveWindow, replayState, clearNavShapePrompt, stackDialogOpen, openStackDialog, closeStackDialog, tileWindowsRef }}>
+    <SpyDEContext.Provider value={{
+      state, iframeRefs, latestStates, sendAction, setActiveWindow, replayState, clearNavShapePrompt,
+      stackDialogOpen, openStackDialog, closeStackDialog,
+      updateDialogOpen, openUpdateDialog, closeUpdateDialog,
+      gpuStatusDialogOpen, openGpuStatusDialog, closeGpuStatusDialog,
+      tileWindowsRef,
+    }}>
       {children}
       {state.backendExited && <BackendExitedOverlay code={state.backendExited.code} />}
     </SpyDEContext.Provider>

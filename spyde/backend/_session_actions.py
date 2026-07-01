@@ -68,6 +68,8 @@ _STAGED_HANDLERS = {
     "czb_manual":          "spyde.actions.center_zero_beam.czb_manual",
     "czb_manual_stop":     "spyde.actions.center_zero_beam.czb_manual_stop",
     "set_log_level":       "spyde.backend.log_stream.set_log_level",
+    "get_gpu_status":      "spyde.actions.gpu_status.get_gpu_status",
+    "set_update_channel":  "spyde.backend.session.dispatch_set_update_channel",
 }
 
 

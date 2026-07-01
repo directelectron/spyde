@@ -23,6 +23,8 @@ npm install            # picks up electron-builder + electron-updater
 npm run dist           # build renderer/main → stage python → electron-builder
 # or, unpacked (faster, for smoke-testing the bundle):
 npm run dist:dir
+# CI publishes with:
+npm run dist -- --publish always
 ```
 
 Artifacts land in `electron/dist/`. The installer is small (~tens of MB) — it
@@ -39,17 +41,36 @@ does **not** contain torch/numpy; those are fetched by `uv sync` on first run.
 3. On success a `.spyde-lock-hash` stamp is written; later launches skip the
    sync unless `uv.lock` changed (→ an update re-syncs only what changed).
 
+## Auto-update + beta channel
+
+Wired via `electron-updater` (`electron/src/main/updater.ts`):
+
+- **Channel**: `vX.Y.Z` tags publish to `stable`; any prerelease suffix
+  (`-rc.N`/`-beta.N`/`-alpha.N`) publishes to `beta` and is marked as a GitHub
+  prerelease (`.github/workflows/release.yml`'s `channel` job). The user picks
+  stable/beta in Help → Check for Updates…; the choice is persisted to
+  `userData/update-channel.json` (Electron side) and mirrored into
+  `~/.spyde/settings.json` via the `set_update_channel` staged action (Python
+  side, for visibility/debugging).
+- **Flow**: startup check (~5s after launch) + manual "Check Now". Downloads
+  are NOT automatic — `autoDownload = false`, so the user clicks "Download"
+  then "Restart to Install" once it's ready. No silent background updates.
+- **GPU Status**: Help → GPU Status… surfaces the existing
+  `vector_orientation_gpu.select_device()`/`gpu_unavailable_reason()`
+  diagnostics via a `get_gpu_status` staged action — no new detection logic,
+  just a UI window onto what already existed.
+- **CI**: `release.yml`'s `build` job runs `electron-builder --publish always`
+  against a draft release `prepare-release` creates up front (avoids
+  electron-builder's concurrent-matrix-publish duplicate-draft race), so
+  `latest.yml`/`latest-mac.yml`/`latest-linux.yml` are generated and attached.
+  `finalize` un-drafts the release once all 3 platform legs succeed.
+
 ## What's intentionally deferred (follow-ups)
 
 - **Code signing / notarization.** Shipping unsigned for now (Gatekeeper /
   SmartScreen will warn — see `DISTRIBUTION_PLAN.md §5`). Wire Apple Developer
   ID + Windows EV cert into CI when procured; `mac.identity: null` removes the
   ad-hoc signing attempt meanwhile.
-- **Auto-update.** `electron-updater` is a dependency and `electron-builder.yml`
-  has a GitHub `publish` block, but the update **check/apply** is not wired into
-  the main process yet (needs a published release feed to test). Add
-  `autoUpdater.checkForUpdatesAndNotify()` + a "Check for Updates" menu item
-  once the first release is cut.
 - **Offline bundle.** The "portable" PyCrucible single-exe (torch baked in)
   remains the air-gapped fallback per the locked decision; this uv-managed
   installer is the primary path.

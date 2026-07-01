@@ -10,6 +10,9 @@ declare global {
       onOpenDashboard: (cb: () => void) => () => void
       onStartGuide: (cb: (id: string) => void) => () => void
       onOpenStackDialog: (cb: () => void) => () => void
+      onOpenUpdateDialog: (cb: () => void) => () => void
+      onOpenGpuStatusDialog: (cb: () => void) => () => void
+      onUpdateStatus: (cb: (status: Record<string, unknown>) => void) => () => void
       action: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
       openFile: () => Promise<void>
       openZarrFolder: () => Promise<void>
@@ -21,6 +24,16 @@ declare global {
       figureEvent: (figId: string, eventJson: string) => void
       resizeFigure: (figId: string, width: number, height: number) => void
       openExternal: (url: string) => void
+      getUpdateInfo: () => Promise<{
+        channel: 'stable' | 'beta'
+        supported: boolean
+        status: Record<string, unknown>
+        appVersion: string
+      }>
+      checkForUpdates: () => void
+      downloadUpdate: () => void
+      quitAndInstallUpdate: () => void
+      setUpdateChannel: (channel: 'stable' | 'beta') => void
     }
 
     // Test-only hooks attached by the renderer for Playwright e2e (DEV /
