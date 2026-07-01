@@ -58,7 +58,6 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction }: Prop
   const [mode, setMode] = useState<'2d' | '3d' | 'density'>('2d')
   const [dir, setDir] = useState<'x' | 'y' | 'z'>('z')
   const [strainComp, setStrainComp] = useState('exx')
-  const [strainMethod, setStrainMethod] = useState<'region' | 'cif'>('region')
 
   // Fall back to the 2-D map if the active mode's figure disappears (e.g. a
   // result re-run before the 3-D / density figure re-arrives).
@@ -164,39 +163,15 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction }: Prop
             </div>
           )}
           {strainComponents && (
+            // The strain MAP window's component toggle (εxx/εyy/εxy/ω). Reference
+            // method, spot selection, match radius, and Submit live in the Strain
+            // caret (StrainWizard) on the source pattern, not here.
             <div style={styles.group} data-testid={`strain-toggle-${id}`}>
               {strainComponents.map(c => (
                 <button key={c} data-testid={`strain-comp-${c}-${id}`}
                   onClick={() => { setStrainComp(c); sendAction('strain_set_component', { component: c }, win.windowId) }}
                   style={c === strainComp ? styles.btnActive : styles.btn}>{STRAIN_LABEL[c] ?? c}</button>
               ))}
-              <span style={{ width: 6 }} />
-              {/* Reference-method caret: Region (relative, crosshair pixel) or
-                  CIF (absolute, from a crystal's ideal spacings). Picking CIF
-                  prompts for the file; the fit uses every reference spot (zero
-                  beam excluded) automatically. */}
-              <select data-testid={`strain-method-${id}`} style={styles.select}
-                title="Strain reference method"
-                value={strainMethod}
-                onChange={async (e) => {
-                  const m = e.target.value as 'region' | 'cif'
-                  setStrainMethod(m)
-                  if (m === 'cif') {
-                    const p = await window.electron.pickFile({ name: 'Crystal (.cif)', extensions: ['cif'] })
-                    if (p) sendAction('strain_set_method', { method: 'cif', cif_path: p }, win.windowId)
-                    else setStrainMethod('region')   // cancelled the picker → stay on Region
-                  } else {
-                    sendAction('strain_set_method', { method: 'region' }, win.windowId)
-                  }
-                }}>
-                <option value="region">Region (relative)</option>
-                <option value="cif">CIF (absolute)…</option>
-              </select>
-              <span style={{ width: 6 }} />
-              {/* Submit: freeze the current strain field as a new SignalTree. */}
-              <button data-testid={`strain-submit-${id}`} style={styles.btnPrimary}
-                title="Commit the current strain field as a new signal tree"
-                onClick={() => sendAction('strain_commit', {}, win.windowId)}>Submit</button>
             </div>
           )}
         </div>

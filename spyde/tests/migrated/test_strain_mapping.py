@@ -249,6 +249,57 @@ class TestStrainAction:
         ctrl.set_reference(2, 3)                        # move reference — recompute
         assert ctrl.ref_yx == (2, 3) and ctrl.component == "eyy"
 
+    def test_strict_mode_double_mount_builds_only_one_controller(self):
+        """React StrictMode mounts the wizard TWICE synchronously (mount →
+        cleanup → remount) on every open, firing strain_run, strain_stop,
+        strain_run right in a row — before either strain_run's worker thread
+        has finished (see strain_run's _strain_run_gen comment). Both calls
+        must NOT end up building a live StrainController: the generation
+        counter should let only the LATEST strain_run's window survive."""
+        import threading
+        import spyde.backend.ipc as ipc
+        from spyde.actions.strain_action import strain_run, strain_stop, _CONTROLLERS
+
+        vecs = _MockVecsCM((6, 6), lambda iy, ix: np.array([[1 + 0.01 * ix, 0.0],
+                                                            [0.0, 1.0]]))
+        tree = type("T", (), {"diffraction_vectors": vecs})()
+        plot = type("P", (), {"signal_tree": tree})()
+
+        class _Session:
+            _w = 0
+            signal_trees: list = []
+            def next_window_id(self):
+                self._w += 1
+                return self._w
+            def _dispatch_to_main(self, fn):
+                fn()      # inline, like the real Session with a registered loop
+
+        session = _Session()
+
+        cap, orig = [], ipc.emit
+        ipc.emit = lambda m: cap.append(m)
+        try:
+            # The exact StrictMode sequence: run, stop, run — all synchronous,
+            # before any of strain_run's background "strain-run" threads land.
+            strain_run(session, plot, {})
+            strain_stop(session, plot, {})
+            strain_run(session, plot, {})
+            # Let both strain_run compute threads finish and dispatch back.
+            for t in threading.enumerate():
+                if t.name == "strain-run":
+                    t.join(timeout=5.0)
+        finally:
+            ipc.emit = orig
+
+        fig_msgs = [m for m in cap if m.get("type") == "figure"]
+        # Exactly one strain-map window's figure must have been emitted and
+        # left registered — not two.
+        assert len(fig_msgs) == 1, f"expected 1 strain figure, got {len(fig_msgs)}"
+        ctrl = getattr(tree, "_strain_controller", None)
+        assert ctrl is not None
+        assert len(_CONTROLLERS) == 1
+        assert _CONTROLLERS[ctrl.window_id] is ctrl
+
     def test_controller_cif_reference_then_region(self):
         import anyplotlib as apl
         from orix.crystal_map import Phase
@@ -302,6 +353,69 @@ class TestStrainAction:
         assert len(ref) == len(G_REF)
         assert np.all(np.linalg.norm(ref, axis=1) > 0)
 
+    def test_reference_selector_uses_distinct_color_and_suppresses_toolbar(self):
+        """The dedicated reference crosshair must be visually distinguishable
+        from the main navigator crosshair (default green) — a different color
+        — and its linked DP window must have NO toolbar (it exists solely to
+        host the crosshair + the click-to-select overlay, not to run actions)."""
+        import anyplotlib as apl
+        import spyde.backend.ipc as ipc
+        from spyde.actions.strain_action import StrainController
+
+        class _FakeSelector:
+            def __init__(self, child):
+                self.active_children = [child]
+                self.index_hooks = []
+                class _W:
+                    cx = cy = 0.0
+                self._widget = _W()
+            def update_data(self):
+                pass
+
+        class _FakeWindow:
+            def __init__(self, plot):
+                self.current_plot_item = plot
+                self.window_id = plot.window_id
+
+        class _FakeNPM:
+            """Records the color passed to add_navigation_selector_and_signal_plot,
+            mirroring MultiplotManager's contract without the full plot stack."""
+            def __init__(self, ref_plot):
+                self.plot_windows = {object(): {}}
+                self.navigation_selectors = {}
+                self.seen_color = None
+                self._ref_plot = ref_plot
+
+            def add_navigation_selector_and_signal_plot(self, nav_window, color=None):
+                self.seen_color = color
+                sel = _FakeSelector(self._ref_plot)
+                self.navigation_selectors[nav_window] = [sel]
+                return _FakeWindow(self._ref_plot)
+
+        fig, ax = apl.subplots()
+        ref_p = ax.imshow(np.zeros((4, 4), "f4"))
+        ref_p.window_id = 999
+
+        vecs = _MockVecsCM((4, 4), lambda iy, ix: np.array([[1.0, 0.0], [0.0, 1.0]]))
+        npm = _FakeNPM(ref_p)
+        tree = type("T", (), {"navigator_plot_manager": npm, "signal_plots": []})()
+
+        cap, orig = [], ipc.emit
+        ipc.emit = lambda m: cap.append(m)
+        try:
+            ctrl = StrainController(vecs, ax.imshow(np.zeros((4, 4), "f4")),
+                                    ref_yx=(0, 0), src_tree=tree)
+            ctrl._attach_reference_selector()
+        finally:
+            ipc.emit = orig
+
+        assert npm.seen_color == StrainController._REF_CROSSHAIR_COLOR
+        assert npm.seen_color != "green"     # distinct from the main nav crosshair
+
+        toolbar_msgs = [m for m in cap if m.get("type") == "toolbar_config"
+                        and m.get("window_id") == 999]
+        assert toolbar_msgs and toolbar_msgs[-1]["toolbar_actions"] == []
+
     def test_commit_makes_new_signal_tree(self, window):
         # Submit freezes the live field as a new SignalTree (εxx signal plot +
         # εyy/εxy/ω view figures).
@@ -326,6 +440,134 @@ class TestStrainAction:
         assert len(session.signal_trees) == n_before + 1
         new_tree = session.signal_trees[-1]
         assert "Strain" in new_tree.root.metadata.get_item("General.title", "")
+
+
+class _Axis:
+    def __init__(self, scale=1.0, offset=0.0, size=64):
+        self.scale, self.offset, self.size = scale, offset, size
+
+
+class _Group:
+    """Records the last marker push for one group."""
+    def __init__(self):
+        self.kw = {}
+    def set(self, **kw):
+        self.kw.update(kw)
+    def remove(self):
+        pass
+
+
+class _Plot2D:
+    """Minimal anyplotlib Plot2D stand-in: records circle/arrow groups + the
+    click handler so a test can fire a synthetic click."""
+    def __init__(self):
+        self.groups = {}
+        self.handler = None
+        self.handler_events: tuple = ()
+    def add_circles(self, offsets, name=None, **kw):
+        g = _Group(); g.kw["offsets"] = offsets; self.groups[name] = g; return g
+    def add_arrows(self, offsets, U, V, name=None, **kw):
+        g = _Group(); g.kw.update(offsets=offsets, U=U, V=V); self.groups[name] = g; return g
+    def add_event_handler(self, fn, *events):
+        self.handler = fn
+        self.handler_events = events
+
+
+class _OverlayVecs:
+    """vecs with sig_axes + kxy_at_nav for the selection overlay."""
+    def __init__(self, ref_spots, frame_peaks, *, scale=1.0, offset=0.0):
+        self.sig_axes = [_Axis(scale=scale, offset=offset),
+                         _Axis(scale=scale, offset=offset)]
+        self.kernel_radius_px = 4.0
+        self.nav_shape = (3, 3)
+        self._ref = np.asarray(ref_spots, float)
+        self._frame = np.asarray(frame_peaks, float)
+    def kxy_at_nav(self, iy, ix, lead=()):
+        return self._ref if (iy, ix) == (0, 0) else self._frame
+
+
+class _Evt:
+    """A real anyplotlib ``double_click`` Event only ever carries xdata/ydata
+    (the calibrated data-space coordinate) — there is NO img_x/img_y field on
+    the Python Event dataclass (see callbacks.py). _on_click hit-tests
+    directly against self.ref_spots (already calibrated kx,ky), so tests pass
+    the CALIBRATED click position here, not a pixel position."""
+    def __init__(self, xdata, ydata):
+        self.xdata, self.ydata = xdata, ydata
+
+
+class TestStrainSelectionOverlay:
+    """The interactive reference-spot selection + displacement overlay
+    (green/grey circles on the reference pixel; arrows off it)."""
+
+    def _overlay(self, on_toggle=None, *, scale=1.0, offset=0.0):
+        from spyde.actions.vector_overlay import StrainSelectionOverlay
+        ref = np.array([[0.0, 0.0], [5.0, 0.0], [0.0, 5.0], [-5.0, 0.0]])  # incl. zero beam
+        frame = ref + np.array([0.4, -0.3])                               # shifted peaks
+        vecs = _OverlayVecs(ref, frame, scale=scale, offset=offset)
+        dp = type("DP", (), {"_plot2d": _Plot2D()})()
+        ov = StrainSelectionOverlay(dp, vecs, ref_yx=(0, 0),
+                                    ref_spots=ref[1:],   # zero beam already excluded by ctrl
+                                    match_radius_px=3.0, on_toggle=on_toggle)
+        # attach without a tree → no navigator selectors, but groups + handler wire up.
+        ov.attach(tree=type("T", (), {"navigator_plot_manager": None})())
+        return ov, dp._plot2d
+
+    def test_reference_pixel_shows_selected_circles(self):
+        ov, p2d = self._overlay()
+        # On the reference pixel all 3 spots are selected (green), none excluded.
+        assert len(p2d.groups["strain_selected"].kw["offsets"]) == 3
+        assert len(p2d.groups["strain_excluded"].kw["offsets"]) == 0
+
+    def test_click_handler_listens_on_double_click(self):
+        # A single click is ambiguous with panning on an anyplotlib 2-D panel,
+        # so pick/toggle interactions use "double_click" — same as the
+        # anyplotlib Particle Picker example (add_event_handler(fn, "double_click")).
+        ov, p2d = self._overlay()
+        assert "double_click" in p2d.handler_events
+
+    def test_click_toggles_selection_and_fires_callback(self):
+        hits = []
+        ov, p2d = self._overlay(on_toggle=lambda: hits.append(1))
+        # Double-click at the CALIBRATED position of the spot at (5,0) → toggle it OFF.
+        p2d.handler(_Evt(5.0, 0.0))
+        assert hits == [1]
+        assert ov.selected.sum() == 2          # one dropped
+        assert len(p2d.groups["strain_selected"].kw["offsets"]) == 2
+        assert len(p2d.groups["strain_excluded"].kw["offsets"]) == 1
+        assert len(ov.selected_reference()) == 2
+        # Click it again → back ON.
+        p2d.handler(_Evt(5.0, 0.0))
+        assert ov.selected.sum() == 3
+
+    def test_click_hit_test_is_scale_independent(self):
+        # A trivial scale=1/offset=0 axis makes calibrated units == pixel
+        # units by coincidence — the real bug this guards against (comparing
+        # a calibrated click position against pixel-space markers) was
+        # invisible under exactly that coincidence. Use a realistic
+        # calibration (e.g. 0.01 Å⁻¹/px, offset -0.64, like a real diffraction
+        # pattern's kx/ky axes) so the hit-test must genuinely work in
+        # calibrated space, not just line up by luck.
+        hits = []
+        ov, p2d = self._overlay(on_toggle=lambda: hits.append(1),
+                                scale=0.01, offset=-0.64)
+        # The spot at calibrated (5.0, 0.0) — click exactly there, NOT at its
+        # (very different) pixel position.
+        p2d.handler(_Evt(5.0, 0.0))
+        assert hits == [1]
+        assert ov.selected.sum() == 2
+
+    def test_off_reference_draws_displacement_arrows(self):
+        ov, p2d = self._overlay()
+        ov._last_iyix = (1, 1)                 # move off the reference pixel
+        ov._redraw()
+        arrows = p2d.groups["strain_displacement"].kw
+        # 3 selected spots each match a shifted frame peak within radius → 3 arrows.
+        assert len(arrows["offsets"]) == 3
+        assert np.allclose(arrows["U"], 0.4, atol=1e-5)
+        assert np.allclose(arrows["V"], -0.3, atol=1e-5)
+        # And the circle groups are cleared off-reference.
+        assert len(p2d.groups["strain_selected"].kw["offsets"]) == 0
 
     def test_strain_run_without_vectors_errors(self):
         import spyde.backend.ipc as ipc

@@ -20,10 +20,11 @@ import { OrientationWizard } from './OrientationWizard'
 import { FindVectorsWizard } from './FindVectorsWizard'
 import { VectorOrientationWizard } from './VectorOrientationWizard'
 import { CenterZeroBeamWizard } from './CenterZeroBeamWizard'
+import { StrainWizard } from './StrainWizard'
 
 const WIZARD_ACTIONS = new Set([
   'Orientation Mapping', 'Find Diffraction Vectors', 'Vector Orientation Mapping',
-  'Center Zero Beam',
+  'Center Zero Beam', 'Strain Mapping',
 ])
 
 /**
@@ -198,6 +199,12 @@ export function FloatingToolbar({
       )}
       {openAction && openAction.name === 'Center Zero Beam' && (
         <CenterZeroBeamWizard
+          openUp={openUp} windowId={windowId} sendAction={sendAction}
+          onClose={() => setOpenName(null)}
+        />
+      )}
+      {openAction && openAction.name === 'Strain Mapping' && (
+        <StrainWizard
           openUp={openUp} windowId={windowId} sendAction={sendAction}
           onClose={() => setOpenName(null)}
         />

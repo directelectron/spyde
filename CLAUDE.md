@@ -115,6 +115,20 @@ Tests are **Qt-free** (no `pytest-qt`, no `QApplication`). They build a real `Se
 - Distributed repros that spin a real `LocalCluster(processes=True)` likewise need a subprocess and won't run inside an agent sandbox — run them yourself (e.g. `uv run python -m spyde.tests.repro_write_cancelled`).
 - Tests are written as classes with methods (e.g. `class TestActions` → `def test_center_direct_beam`).
 
+## Verify by RUNNING THE APP — headless tests + typecheck are NOT verification
+
+**A passing pytest suite and a clean `tsc` do NOT mean a UI feature works. They mean the code is structurally sound. They cannot see: duplicate windows piling up, a caret that never tears down, an overlay that draws in the wrong colour, a second window that never opens, a control that silently no-ops.** Any feature that adds/removes windows, draws overlays, toggles on an action, or wires the renderer↔backend MUST be verified by launching the real Electron app, driving it, and **looking at a screenshot** before you claim it works. The screenshot IS the test. If you have not looked at the pixels, say "built + headless-tested, needs your eyes" — never "it works."
+
+**Do NOT hand-roll a launcher.** A proven, signal-based Playwright harness already exists — copy it, don't reinvent it (repeatedly writing throwaway `_electron` probe scripts with blind `waitForTimeout`s wasted an entire session and mis-diagnosed the harness's own noise as app bugs).
+
+- **Harness:** `electron/tests/_harness.cjs` — `launchApp({dask:true, env})` waits for `[spyde backend] ready` + `dask_ready`; gives `backend.waitForLog`/`waitForMessage`, `waitForSubwindowCount`, `countColorPixels`, and `assertNoJsErrors`. **Copy the shape of `find_vectors_workflow.spec.ts`** (real Dask + bundled-synthetic data) for anything vectors/strain/orientation.
+- **Load real-ish data the way a user does:** `backendAction(page, 'load_test_data_si_grains')` (bundled synthetic, crisp reciprocal lattice — find-vectors can actually detect spots) or `load_example {name}` (Examples menu; `zrnb_precipitate` etc., needs download+dask). `load_test_data*`/`load_test_vectors` are the fast bundled paths.
+- **Screenshot each stage** to `electron/<name>_shots/NN-step.png` and Read them. A blank/black frame is a failure to launch or a stale placeholder, not success.
+- **Backend `emit`/`emit_error`/`emit_status` do NOT reach Playwright stdout** (they're the `PLOTAPP:` line protocol, consumed by the main process). To see a backend error, either read `ctx.backend.logBuffer` at the end of the test, or set `SPYDE_LOG_LEVEL=WARNING` in `launchApp({env})` so `logging` tees to stderr (which the harness captures). Watching plain stdout for a status string will silently miss the error.
+- **Run:** `npx playwright test tests/<spec>.spec.ts --project=electron --reporter=line --retries=0`. Kill strays first if flaky (`Get-Process electron,python | Stop-Process -Force`), but don't over-attribute flakiness to the app — a polluted local env (repeated relaunches, leftover processes) produces slow dask / port contention that is YOUR test setup, not a real bug. On this dev box a healthy `LocalCluster` scheduler starts in ~1 s.
+
+**The find-vectors→downstream timing trap (this WILL bite):** `find_diffraction_vectors` opens its result window EARLY (count-map placeholder) but attaches `tree.diffraction_vectors` only when the streaming batch **finishes** (`_finalize`, which also emits `"Found N diffraction vectors"`). An action that needs the vectors (Strain, Vector VI, Vector OM) can fire in the gap and find `diffraction_vectors=None` on a tree that gets it seconds later. Don't gate a test on a fixed sleep; wait for the real completion signal (the `"Found"` status, or poll the attribute), and make the *backend handler self-wait* for the attach so the real app is robust too (see `strain_run`'s wait-then-rerun on a worker thread).
+
 ## Memory Safety Rule: Never Materialise Large Datasets
 
 **`_do_compute_vectors` in `spyde/actions/find_vectors.py` must NEVER call `.compute()` or `.result()` on the full signal dataset.** Doing so loads hundreds of GB into RAM.

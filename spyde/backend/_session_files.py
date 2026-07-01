@@ -186,6 +186,9 @@ class FileLoaderMixin:
 
     def _load_file_thread(self, path: str) -> None:
         try:
+            # Wait for the Dask cluster (see _load_example_thread) — a file opened
+            # during startup queues here rather than racing ahead with no client.
+            self._await_dask()
             signal = hs.load(path, lazy=True)
             if not isinstance(signal, list):
                 signal = [signal]
@@ -518,6 +521,10 @@ class FileLoaderMixin:
 
     def _load_example_thread(self, name: str) -> None:
         try:
+            # Wait for the Dask cluster before registering the signal — _add_signal
+            # builds the navigator compute, which needs the client. A load fired
+            # during startup queues here instead of racing ahead with a None client.
+            self._await_dask()
             import pyxem.data as _pxd
             loader = getattr(_pxd, name, None)
             if loader is None:

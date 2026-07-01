@@ -17,6 +17,14 @@ interface Props {
   zIndex: number
   windowId: number
   children: React.ReactNode
+  // Live layout coordination with MDIArea (all optional so older callers/tests
+  // that don't pass them still work with sane defaults).
+  areaSize?: { w: number; h: number }
+  otherRects?: Rect[]
+  onLiveRect?: (id: string, rect: Rect) => void
+  // Bumped by MDIArea's Tile action: a new `gen` forces this rect to be
+  // adopted even if the user had manually moved/resized the window.
+  forced?: { gen: number; rect: Rect }
 }
 
 export interface Rect { x: number; y: number; w: number; h: number }
@@ -24,6 +32,75 @@ export interface Rect { x: number; y: number; w: number; h: number }
 const TITLE_H = 32
 const MIN_W = 300
 const MIN_H = 200
+// Distance (px) within which a dragged/resized edge snaps to another window's
+// edge or to the area bounds.
+const SNAP_DIST = 10
+// However close to the edge the user drags, at least this many px of the
+// titlebar must stay reachable within the visible area.
+const MIN_VISIBLE_TITLEBAR = 40
+
+// Snap a moving window's position against other windows' edges + the area
+// bounds: for each axis, if any candidate target edge is within SNAP_DIST of
+// the corresponding moving edge, pull the whole rect flush to it.
+function snapPosition(
+  x: number, y: number, w: number, h: number,
+  others: Rect[], areaW: number, areaH: number,
+): { x: number; y: number } {
+  const xTargets: number[] = [0, areaW - w]
+  const yTargets: number[] = [0, areaH - h]
+  for (const o of others) {
+    xTargets.push(o.x, o.x - w, o.x + o.w, o.x + o.w - w)
+    yTargets.push(o.y, o.y - h, o.y + o.h, o.y + o.h - h)
+  }
+  let sx = x, sy = y, bestDx = SNAP_DIST, bestDy = SNAP_DIST
+  for (const t of xTargets) {
+    const d = Math.abs(x - t)
+    if (d < bestDx) { bestDx = d; sx = t }
+  }
+  for (const t of yTargets) {
+    const d = Math.abs(y - t)
+    if (d < bestDy) { bestDy = d; sy = t }
+  }
+  return { x: sx, y: sy }
+}
+
+// Snap a resizing window's bottom-right corner against other windows' facing
+// edges + the area bounds, independently per axis.
+function snapSize(
+  x: number, y: number, w: number, h: number,
+  others: Rect[], areaW: number, areaH: number,
+): { w: number; h: number } {
+  const rightTargets: number[] = [areaW]
+  const bottomTargets: number[] = [areaH]
+  for (const o of others) {
+    rightTargets.push(o.x, o.x + o.w)
+    bottomTargets.push(o.y, o.y + o.h)
+  }
+  let sw = w, sh = h, bestDw = SNAP_DIST, bestDh = SNAP_DIST
+  for (const t of rightTargets) {
+    const d = Math.abs((x + w) - t)
+    if (d < bestDw) { bestDw = d; sw = t - x }
+  }
+  for (const t of bottomTargets) {
+    const d = Math.abs((y + h) - t)
+    if (d < bestDh) { bestDh = d; sh = t - y }
+  }
+  return { w: Math.max(MIN_W, sw), h: Math.max(MIN_H, sh) }
+}
+
+// Clamp so the titlebar (the only drag handle) is always at least partly
+// reachable within the visible area — a window can never be dragged fully off
+// screen and become unrecoverable.
+function clampToVisible(x: number, y: number, w: number, areaW: number, areaH: number): { x: number; y: number } {
+  const minX = -w + MIN_VISIBLE_TITLEBAR
+  const maxX = areaW - MIN_VISIBLE_TITLEBAR
+  const minY = 0
+  const maxY = Math.max(0, areaH - TITLE_H)
+  return {
+    x: Math.min(Math.max(x, minX), Math.max(minX, maxX)),
+    y: Math.min(Math.max(y, minY), maxY),
+  }
+}
 
 // Self-contained MDI subwindow. We do NOT use react-rnd: its
 // getDerivedStateFromProps calls a dev `log()` that references `process`, which
@@ -36,6 +113,7 @@ export function SubWindow({
   id, title, initialX, initialY, initialW, initialH,
   toolbarActions, onClose, onFocus, onResize, onAction,
   zIndex, windowId, children,
+  areaSize, otherRects, onLiveRect, forced,
 }: Props) {
   const [maximized, setMaximized] = useState(false)
   const [pos, setPos] = useState({ x: initialX, y: initialY })
@@ -50,6 +128,24 @@ export function SubWindow({
   React.useEffect(() => {
     if (!userResized.current) setSize({ width: initialW, height: initialH })
   }, [initialW, initialH])
+
+  // Tile (or any other forced-layout action) bumps `forced.gen` — adopt its
+  // rect unconditionally, overriding a manual move/resize.
+  const lastForcedGen = useRef<number | null>(null)
+  React.useEffect(() => {
+    if (!forced || forced.gen === lastForcedGen.current) return
+    lastForcedGen.current = forced.gen
+    userResized.current = true
+    setPos({ x: forced.rect.x, y: forced.rect.y })
+    setSize({ width: forced.rect.w, height: forced.rect.h })
+  }, [forced])
+
+  // Report the live rect on every change so MDIArea can snap OTHER windows
+  // against this one's current position/size (not just its rest position) and
+  // so a freshly-opened window's free-slot search sees real sizes.
+  React.useEffect(() => {
+    onLiveRect?.(id, { x: pos.x, y: pos.y, w: size.width, h: size.height })
+  }, [id, pos.x, pos.y, size.width, size.height, onLiveRect])
 
   // The floating toolbar sits BELOW the window and reveals on hover (over the
   // window or the toolbar itself). A short hide delay covers the gap between the
@@ -72,6 +168,9 @@ export function SubWindow({
 
   const hasToolbar = toolbarActions.length > 0
   const headerH = TITLE_H   // toolbar is now a right-edge rail, not a top bar
+  const areaW = areaSize?.w ?? 4000   // generous fallback so clamping is a no-op
+  const areaH = areaSize?.h ?? 4000   // if MDIArea hasn't measured yet
+  const others = otherRects ?? []
 
   // ── Drag (title bar) ────────────────────────────────────────────────────────
   const onTitleDown = (e: React.PointerEvent) => {
@@ -85,9 +184,11 @@ export function SubWindow({
   const onTitleMove = (e: React.PointerEvent) => {
     const g = gesture.current
     if (!g || g.kind !== 'drag') return
-    const nx = Math.max(0, g.ox + (e.clientX - g.px))
-    const ny = Math.max(0, g.oy + (e.clientY - g.py))
-    setPos({ x: nx, y: ny })
+    const rawX = g.ox + (e.clientX - g.px)
+    const rawY = g.oy + (e.clientY - g.py)
+    const snapped = snapPosition(rawX, rawY, size.width, size.height, others, areaW, areaH)
+    const clamped = clampToVisible(snapped.x, snapped.y, size.width, areaW, areaH)
+    setPos(clamped)
   }
 
   // ── Resize (corner handle) ──────────────────────────────────────────────────
@@ -103,9 +204,10 @@ export function SubWindow({
   const onResizeMove = (e: React.PointerEvent) => {
     const g = gesture.current
     if (!g || g.kind !== 'resize') return
-    const w = Math.max(MIN_W, g.w + (e.clientX - g.px))
-    const h = Math.max(MIN_H, g.h + (e.clientY - g.py))
-    setSize({ width: w, height: h })
+    const rawW = Math.max(MIN_W, g.w + (e.clientX - g.px))
+    const rawH = Math.max(MIN_H, g.h + (e.clientY - g.py))
+    const snapped = snapSize(pos.x, pos.y, rawW, rawH, others, areaW, areaH)
+    setSize({ width: snapped.w, height: snapped.h })
   }
 
   const endGesture = (e: React.PointerEvent) => {

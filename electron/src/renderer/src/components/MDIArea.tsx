@@ -4,16 +4,27 @@ import type { Rect } from './SubWindow'
 import { WindowContent } from './WindowContent'
 import { useSpyDE } from '../kernel/SpyDEContext'
 
+// Tiling: near-square grid (rows x cols) sized to fit `n` windows, cols first
+// so wide areas get more columns than rows.
+function tileGrid(n: number, areaW: number, areaH: number): { cols: number; rows: number } {
+  if (n <= 0) return { cols: 1, rows: 1 }
+  const targetCols = Math.max(1, Math.round(Math.sqrt(n * (areaW / Math.max(areaH, 1)))))
+  const cols = Math.max(1, Math.min(n, targetCols))
+  const rows = Math.max(1, Math.ceil(n / cols))
+  return { cols, rows }
+}
+
 // The initial size a window opens at — square-ish by default, or matched to the
-// backend-reported image aspect so the figure fills it (no letterbox).
+// backend-reported image aspect so the figure fills it (no letterbox). Kept
+// deliberately compact so more windows fit on screen before overlapping.
 function windowSize(aspect?: number): { w: number; h: number } {
   const TITLE = 32
   if (aspect && aspect > 0) {
-    const innerH = Math.round(Math.min(360, Math.max(150, 560 / Math.max(aspect, 0.0001))))
-    const innerW = Math.round(Math.min(760, Math.max(220, innerH * aspect)))
+    const innerH = Math.round(Math.min(300, Math.max(130, 460 / Math.max(aspect, 0.0001))))
+    const innerW = Math.round(Math.min(620, Math.max(190, innerH * aspect)))
     return { w: innerW, h: innerH + TITLE }
   }
-  return { w: 400, h: 392 }
+  return { w: 340, h: 320 }
 }
 
 function overlaps(a: Rect, b: Rect, gap = 10): boolean {
@@ -40,12 +51,27 @@ function findFreeSlot(w: number, h: number, taken: Rect[], areaW: number, areaH:
 }
 
 export function MDIArea() {
-  const { state, iframeRefs, sendAction, setActiveWindow, replayState } = useSpyDE()
+  const { state, iframeRefs, sendAction, setActiveWindow, replayState, tileWindowsRef } = useSpyDE()
   const [focusOrder, setFocusOrder] = useState<string[]>([])
 
   // Initial placement assigned to each window once (kept stable so re-renders
   // never fight a window the user has dragged).
   const placedRef = useRef<Map<string, { x: number; y: number }>>(new Map())
+  // Window ids placed for the first time THIS render pass, drained by the
+  // focus-on-open effect below.
+  const newWindowIdsRef = useRef<string[]>([])
+  // Live rect (position+size) of every window, updated continuously while
+  // dragging/resizing (not just at rest) — snapping and the free-slot search
+  // need the CURRENT layout, including windows mid-drag.
+  const liveRectsRef = useRef<Map<string, Rect>>(new Map())
+  const handleLiveRect = useCallback((id: string, rect: Rect) => {
+    liveRectsRef.current.set(id, rect)
+  }, [])
+  // Forced layout (from Tile): bumping the generation makes every SubWindow
+  // adopt its forced rect even if the user had manually resized/moved it.
+  const [forced, setForced] = useState<{ gen: number; rects: Map<string, Rect> }>(
+    { gen: 0, rects: new Map() },
+  )
   const areaRef = useRef<HTMLDivElement>(null)
   const [areaSize, setAreaSize] = useState({ w: 1280, h: 820 })
   useEffect(() => {
@@ -97,6 +123,40 @@ export function MDIArea() {
   // no-op kept only to satisfy SubWindow's required onResize prop.
   const handleResize = useCallback((_id: string, _w: number, _h: number) => {}, [])
 
+  // Tile: arrange every VISIBLE window into a near-square grid filling the
+  // area. An explicit user action (the "Tile" button), so it overrides
+  // manually-placed/sized windows — unlike the automatic free-slot placement
+  // on open, which never fights a window the user has touched.
+  const tileWindows = useCallback(() => {
+    const ids = Array.from(state.windows.values()).filter(w => w.visible).map(w => String(w.windowId))
+    if (ids.length === 0) return
+    const areaW = areaRef.current?.clientWidth || areaSize.w
+    const areaH = areaRef.current?.clientHeight || areaSize.h
+    const { cols, rows } = tileGrid(ids.length, areaW, areaH)
+    const M = 8
+    const cellW = Math.floor((areaW - M * (cols + 1)) / cols)
+    const cellH = Math.floor((areaH - M * (rows + 1)) / rows)
+    const rects = new Map<string, Rect>()
+    ids.forEach((id, i) => {
+      const col = i % cols
+      const row = Math.floor(i / cols)
+      const rect = {
+        x: M + col * (cellW + M),
+        y: M + row * (cellH + M),
+        w: Math.max(220, cellW),
+        h: Math.max(150, cellH),
+      }
+      rects.set(id, rect)
+      placedRef.current.set(id, { x: rect.x, y: rect.y })
+    })
+    setForced(prev => ({ gen: prev.gen + 1, rects }))
+  }, [state.windows, areaSize])
+
+  useEffect(() => {
+    tileWindowsRef.current = tileWindows
+    return () => { tileWindowsRef.current = null }
+  }, [tileWindowsRef, tileWindows])
+
   const handleAction = useCallback((action: string, windowId: number, params: Record<string, unknown> = {}) => {
     // Toolbar buttons map to the generic toolbar_action dispatcher in Python,
     // which resolves the YAML-configured action function by name.
@@ -107,14 +167,17 @@ export function MDIArea() {
 
   // Assign each window a non-overlapping initial position. Already-placed windows
   // keep their slot; NEW windows are packed into the first free gap — so result
-  // windows don't bury each other.
+  // windows don't bury each other. Uses each window's CURRENT live rect (which
+  // reflects manual resizes) when known, so a new window's free-slot search
+  // doesn't land on top of a window the user has enlarged.
   const placements = new Map<string, { x: number; y: number }>()
   const taken: Rect[] = []
   for (const win of visibleWindows) {
     const id = String(win.windowId)
     const placed = placedRef.current.get(id)
     if (!placed) continue
-    const { w, h } = windowSize(win.aspect)
+    const live = liveRectsRef.current.get(id)
+    const { w, h } = live ? { w: live.w, h: live.h } : windowSize(win.aspect)
     taken.push({ x: placed.x, y: placed.y, w, h })
     placements.set(id, placed)
   }
@@ -130,7 +193,20 @@ export function MDIArea() {
     placedRef.current.set(id, slot)
     placements.set(id, slot)
     taken.push({ ...slot, w, h })
+    newWindowIdsRef.current.push(id)
   }
+
+  // A freshly-opened window (e.g. a backend-initiated result window like the
+  // Strain map, opened without the user clicking it) must land on TOP —
+  // otherwise it stays at the unfocused base z-index and an existing window's
+  // iframe can cover its controls, making them unclickable even though the new
+  // window is visually "there". Matches normal desktop window-open behaviour.
+  useEffect(() => {
+    if (newWindowIdsRef.current.length === 0) return
+    const ids = newWindowIdsRef.current
+    newWindowIdsRef.current = []
+    setFocusOrder(prev => [...prev.filter(x => !ids.includes(x)), ...ids])
+  })
 
   return (
     <div ref={areaRef} data-testid="mdi-area" style={styles.area}>
@@ -138,6 +214,10 @@ export function MDIArea() {
         const id = String(win.windowId)
         const pos = placements.get(id) ?? { x: 40, y: 40 }
         const { w: initW, h: initH } = windowSize(win.aspect)
+        const otherRects = visibleWindows
+          .filter(w => String(w.windowId) !== id)
+          .map(w => liveRectsRef.current.get(String(w.windowId)))
+          .filter((r): r is Rect => r != null)
         return (
           <SubWindow
             key={id}
@@ -154,6 +234,10 @@ export function MDIArea() {
             onResize={handleResize}
             onAction={handleAction}
             zIndex={getZ(id)}
+            areaSize={{ w: areaW, h: areaH }}
+            otherRects={otherRects}
+            onLiveRect={handleLiveRect}
+            forced={forced.rects.has(id) ? { gen: forced.gen, rect: forced.rects.get(id)! } : undefined}
           >
             <WindowContent
               win={win}

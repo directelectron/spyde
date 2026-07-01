@@ -54,6 +54,9 @@ _STAGED_HANDLERS = {
     "strain_run":          "spyde.actions.strain_action.strain_run",
     "strain_set_component": "spyde.actions.strain_action.strain_set_component",
     "strain_set_method":   "spyde.actions.strain_action.strain_set_method",
+    "strain_set_match_radius": "spyde.actions.strain_action.strain_set_match_radius",
+    "strain_set_overlay":  "spyde.actions.strain_action.strain_set_overlay",
+    "strain_stop":         "spyde.actions.strain_action.strain_stop",
     "strain_commit":       "spyde.actions.strain_action.strain_commit",
     "ipf_set_direction":   "spyde.actions.ipf_view.ipf_set_direction",
     "tile_views":          "spyde.actions.views.tile_views",
@@ -105,6 +108,15 @@ class ActionRouterMixin:
             # Staged-wizard handlers (Orientation / Find-Vectors / Vector-OM /
             # Center-Zero-Beam) share the (session, plot, payload) signature and
             # are imported lazily so their heavy deps load only on first use.
+            # Ensure window_id is always reachable via payload too: some staged
+            # windows (e.g. the Strain map) are bare `figure` messages, not a
+            # registered Plot, so `plot` above is None and a handler can only
+            # resolve its target via payload["window_id"] — the renderer sends
+            # windowId as the dispatch's own top-level field, not nested in the
+            # payload object, so without this a caret button that only carries
+            # e.g. {component: "eyy"} silently resolved to nothing.
+            if "window_id" not in payload and window_id is not None:
+                payload = {**payload, "window_id": window_id}
             import importlib
             mod, fn = _STAGED_HANDLERS[action].rsplit(".", 1)
             getattr(importlib.import_module(mod), fn)(self, plot, payload)
@@ -242,7 +254,11 @@ class ActionRouterMixin:
             return
         overlays = []
         if name == "Find Diffraction Vectors":
+            # Two overlays: the SOURCE-DP one (_vector_overlay) and the one on the
+            # RESULT vectors-image window (_result_vector_overlay). The user clicks
+            # the action on EITHER window, so toggle both.
             overlays.append(getattr(tree, "_vector_overlay", None))
+            overlays.append(getattr(tree, "_result_vector_overlay", None))
         elif name == "Orientation Mapping":
             overlays.append(getattr(tree, "_orientation_overlay", None))
             wiz = getattr(tree, "_om_wizard", None)

@@ -257,11 +257,11 @@ class IntegratingSSelector2D(IntegratingSelectorMixin):
         super().__init__()
         self._rect_selector = RectangleSelector(
             parent, children, update_function,
-            live_delay=live_delay, multi_selector=multi_selector,
+            live_delay=live_delay, multi_selector=multi_selector, **kwargs,
         )
         self._crosshair_selector = CrosshairSelector(
             parent, children, update_function,
-            live_delay=live_delay, multi_selector=multi_selector,
+            live_delay=live_delay, multi_selector=multi_selector, **kwargs,
         )
         self.parent = parent
 

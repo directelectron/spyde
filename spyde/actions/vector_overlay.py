@@ -174,6 +174,24 @@ class _DPOverlay:
             if sel.current_indices is not None:
                 self._on_indices(sel.current_indices)
                 seeded = True
+            elif not seeded:
+                # current_indices is only committed by _run_update, which the
+                # navigator's initial update_data() dispatches ASYNCHRONOUSLY on
+                # the nav-dispatch thread — a caret opened right after load can
+                # beat that dispatch, leaving current_indices None here. Read the
+                # widget's position directly (synchronous, no dispatch needed) so
+                # the preview seeds at the ACTUAL crosshair position instead of
+                # the (0,0) class default — without this the preview showed
+                # peaks for the wrong corner until the user's next click/drag
+                # forced a real _on_indices call.
+                try:
+                    idx = sel._get_selected_indices_and_clip()
+                    if idx is not None:
+                        self._on_indices(idx)
+                        seeded = True
+                except Exception as e:
+                    log.debug("[overlay:%s] reading live selector position for "
+                              "seeding failed: %s", self.name, e)
         # ALWAYS seed the engine, even when no selector had a committed position
         # yet (navigator hasn't painted) or none were found. Without this the
         # overlay sat blank until a *future* nav move — the silent failure that
@@ -294,6 +312,296 @@ def attach_vector_overlay(dp_plot, vecs, tree, *, color="#ff3030",
     navigator selectors of ``tree``. Returns the :class:`VectorOverlay`."""
     return VectorOverlay(dp_plot, vecs, color=color, name=name,
                          radius_px=radius_px).attach(tree)
+
+
+class StrainSelectionOverlay(_DPOverlay):
+    """Interactive reference-spot selection + per-spot displacement overlay for
+    Strain Mapping, on the DP (signal) plot.
+
+    Two modes, keyed off whether the navigator sits on the reference pixel:
+
+    * **On the reference pixel** — the reference reflections are drawn as circles:
+      GREEN = selected (used in the fit), grey = excluded. Double-clicking a
+      circle toggles its selection (``on_toggle`` fires so the controller re-fits).
+    * **Off the reference pixel** — for each SELECTED reference spot, the nearest
+      measured peak in the current frame (within ``match_radius`` px) is found and
+      an arrow is drawn from the reference spot → that peak (the local
+      displacement). Unmatched spots are skipped.
+
+    The reference spots come from the controller (zero beam already removed). The
+    selection mask lives here and is the single source of truth for "which
+    reference vectors drive the strain fit".
+    """
+
+    _SEL_COLOR = "#30ff60"      # green = selected
+    _EXC_COLOR = "#6c7086"      # grey  = excluded
+    _ARROW_COLOR = "#fab387"    # orange displacement arrows
+
+    def __init__(self, dp_plot, vecs, *, ref_yx=(0, 0), ref_spots=None,
+                 selected=None, match_radius_px=6.0, radius_px=None,
+                 on_toggle=None):
+        self.dp_plot = dp_plot
+        self.vecs = vecs
+        self.name = "strain_select"
+        self.ref_yx = (int(ref_yx[0]), int(ref_yx[1]))
+        self.on_toggle = on_toggle              # callback() after a click toggle
+        self._mg_sel = None
+        self._mg_exc = None
+        self._mg_arrow = None
+        self._click_cb = None
+        self._selectors = []
+        self._last_iyix = self.ref_yx
+        self._calibrate(vecs.sig_axes)
+        self._W = int(vecs.sig_axes[0].size)
+        self._H = int(vecs.sig_axes[1].size)
+        if radius_px is None:
+            radius_px = getattr(vecs, "kernel_radius_px", 4.0)
+        cap = max(4.0, 0.08 * min(self._W, self._H))
+        self._radius_px = float(np.clip(float(radius_px), 2.0, cap))
+        self.match_radius_px = float(match_radius_px)
+        # Reference spots (calibrated kx,ky) + per-spot selected mask.
+        rs = np.zeros((0, 2)) if ref_spots is None else np.asarray(ref_spots, float)
+        self.ref_spots = rs.reshape(-1, 2)
+        if selected is None:
+            self.selected = np.ones(len(self.ref_spots), dtype=bool)
+        else:
+            self.selected = np.asarray(selected, dtype=bool).reshape(-1)
+
+    # ── public API (the controller drives these) ──────────────────────────────
+    def set_reference(self, ref_yx, ref_spots, selected=None) -> None:
+        """New reference pixel: replace the reference spots (and selection)."""
+        self.ref_yx = (int(ref_yx[0]), int(ref_yx[1]))
+        self.ref_spots = np.asarray(ref_spots, float).reshape(-1, 2)
+        self.selected = (np.ones(len(self.ref_spots), bool) if selected is None
+                         else np.asarray(selected, bool).reshape(-1))
+        self._redraw()
+
+    def set_match_radius(self, r_px: float) -> None:
+        self.match_radius_px = max(1.0, float(r_px))
+        self._redraw()
+
+    def selected_reference(self) -> np.ndarray:
+        """The selected reference spots (calibrated) — what the fit should use."""
+        if len(self.ref_spots) == 0:
+            return self.ref_spots
+        return self.ref_spots[self.selected]
+
+    # ── attach / draw ─────────────────────────────────────────────────────────
+    def attach(self, tree):
+        plot2d = getattr(self.dp_plot, "_plot2d", None)
+        if plot2d is None:
+            return self
+        self._mg_exc = plot2d.add_circles(
+            np.zeros((0, 2), np.float32), name="strain_excluded",
+            radius=self._radius_px, edgecolors=self._EXC_COLOR, facecolors=None,
+            linewidths=1.3, alpha=0.9, transform="data")
+        self._mg_sel = plot2d.add_circles(
+            np.zeros((0, 2), np.float32), name="strain_selected",
+            radius=self._radius_px, edgecolors=self._SEL_COLOR, facecolors=None,
+            linewidths=2.0, alpha=1.0, transform="data")
+        self._mg_arrow = plot2d.add_arrows(
+            np.zeros((0, 2), np.float32), np.zeros(0), np.zeros(0),
+            name="strain_displacement", edgecolors=self._ARROW_COLOR,
+            linewidths=1.6, transform="data")
+        # Click on the DP → hit-test against reference spots → toggle selection.
+        # A single click is ambiguous with panning on a 2-D anyplotlib panel (its
+        # own pan/click disambiguation is an internal implementation detail that
+        # has shifted between anyplotlib versions — see the Particle Picker
+        # example, which uses "double_click" for exactly this kind of discrete
+        # pick/toggle interaction: https://cssfrancis.github.io/anyplotlib/dev/
+        # auto_examples/Interactive/plot_particle_picker.html). Match that.
+        from spyde.drawing.selectors.base_selector import event_handler_fn
+        self._click_cb = event_handler_fn(self._on_click)
+        try:
+            plot2d.add_event_handler(self._click_cb, "double_click")
+            log.debug("[strain-select] double_click handler registered on plot2d=%r", plot2d)
+        except Exception as e:
+            log.debug("strain selection click handler attach failed: %s", e)
+        # Track the navigator so we can switch ref-spots ↔ displacement arrows.
+        self._selectors = _navigator_selectors_for(tree, self.dp_plot)
+        for sel in self._selectors:
+            if self._on_indices not in sel.index_hooks:
+                sel.index_hooks.append(self._on_indices)
+            if sel.current_indices is not None:
+                self._last_iyix = _indices_to_iyix(sel.current_indices)
+        log.debug("[strain-select] attach ref_yx=%s last_iyix=%s n_ref_spots=%d "
+                  "n_selectors=%d radius_px=%.2f", self.ref_yx, self._last_iyix,
+                  len(self.ref_spots), len(self._selectors), self._radius_px)
+        self._redraw()
+        return self
+
+    def _on_indices(self, indices):
+        self._last_iyix = _indices_to_iyix(indices)
+        log.debug("[strain-select] nav move -> last_iyix=%s on_ref_pixel=%s",
+                  self._last_iyix, self._on_reference_pixel())
+        self._redraw()
+
+    def _on_reference_pixel(self) -> bool:
+        return tuple(self._last_iyix) == tuple(self.ref_yx)
+
+    def _redraw(self) -> None:
+        if self._hidden or self._mg_sel is None:
+            log.debug("[strain-select] redraw SKIPPED hidden=%s mg_sel=%s",
+                      self._hidden, self._mg_sel is not None)
+            return
+        empty = np.zeros((0, 2), np.float32)
+        if self._on_reference_pixel():
+            # Reference pixel: clickable selected (green) / excluded (grey) spots.
+            sel_px = self._to_px(self.ref_spots[self.selected]) if len(self.ref_spots) else empty
+            exc_px = self._to_px(self.ref_spots[~self.selected]) if len(self.ref_spots) else empty
+            sel_px = _clip_to_bounds(sel_px, self._W, self._H)
+            exc_px = _clip_to_bounds(exc_px, self._W, self._H)
+            self._set(self._mg_sel, offsets=sel_px)
+            self._set(self._mg_exc, offsets=exc_px)
+            self._set_arrows(empty, np.zeros(0), np.zeros(0))
+            log.debug("[strain-select] redraw ON-REF selected=%d excluded=%d",
+                      len(sel_px), len(exc_px))
+        else:
+            # Off-reference: arrows from each SELECTED ref spot → nearest frame peak.
+            tails, U, V = self._displacements()
+            self._set(self._mg_sel, offsets=empty)
+            self._set(self._mg_exc, offsets=empty)
+            self._set_arrows(tails, U, V)
+            log.debug("[strain-select] redraw OFF-REF n_arrows=%d", len(tails))
+
+    def _displacements(self):
+        """For each selected reference spot, the nearest measured peak in the
+        current frame within match_radius (px). Returns (tails_px, U, V)."""
+        empty = np.zeros((0, 2), np.float32)
+        ref = self.ref_spots[self.selected] if len(self.ref_spots) else empty
+        if len(ref) == 0:
+            return empty, np.zeros(0), np.zeros(0)
+        ref_px = self._to_px(ref)
+        try:
+            iy, ix = self._last_iyix
+            meas_px = self._to_px(self.vecs.kxy_at_nav(iy, ix, lead=self._lead_nav))
+        except Exception:
+            return empty, np.zeros(0), np.zeros(0)
+        if len(meas_px) == 0:
+            return empty, np.zeros(0), np.zeros(0)
+        tails, U, V = [], [], []
+        r2 = self.match_radius_px ** 2
+        for rx, ry in ref_px:
+            d2 = (meas_px[:, 0] - rx) ** 2 + (meas_px[:, 1] - ry) ** 2
+            j = int(np.argmin(d2))
+            if d2[j] <= r2:
+                tails.append([rx, ry])
+                U.append(float(meas_px[j, 0] - rx))
+                V.append(float(meas_px[j, 1] - ry))
+        if not tails:
+            return empty, np.zeros(0), np.zeros(0)
+        return (np.asarray(tails, np.float32),
+                np.asarray(U, np.float32), np.asarray(V, np.float32))
+
+    def _on_click(self, event=None):
+        log.debug("[strain-select] _on_click FIRED event=%r on_ref_pixel=%s "
+                  "n_ref_spots=%d", event, self._on_reference_pixel(), len(self.ref_spots))
+        # Only toggle selection while sitting on the reference pixel.
+        if event is None:
+            log.debug("[strain-select] _on_click DROPPED: event is None")
+            return
+        if not self._on_reference_pixel():
+            log.debug("[strain-select] _on_click DROPPED: not on reference pixel "
+                      "(last_iyix=%s ref_yx=%s)", self._last_iyix, self.ref_yx)
+            return
+        if len(self.ref_spots) == 0:
+            log.debug("[strain-select] _on_click DROPPED: no reference spots")
+            return
+        try:
+            # anyplotlib's Event dataclass only ever carries xdata/ydata for a
+            # 2-D double_click (there is NO img_x/img_y field on the Python
+            # Event — that's a JS-payload-only key that anyplotlib's dataclass
+            # constructor silently drops). xdata/ydata are documented as
+            # "data-space coordinates" — but our `circles` markers are drawn
+            # with transform="data", which anyplotlib's drawMarkers2d renders
+            # via the SAME image-pixel path as `_imgToCanvas2d` (i.e. "data"
+            # here means image-PIXEL space, matching _to_px's convention — see
+            # anyplotlib_widget_pixel_coords memory). A calibrated diffraction
+            # pattern's xdata/ydata are its physical kx,ky (Å⁻¹/nm⁻¹), which is
+            # exactly the space self.ref_spots is ALREADY stored in — so hit-test
+            # directly in calibrated space instead of converting to pixels.
+            cx, cy = float(event.xdata), float(event.ydata)
+        except Exception as e:
+            log.debug("[strain-select] _on_click DROPPED: no xdata/ydata on event "
+                      "(%s); event attrs=%s", e,
+                      {k: getattr(event, k, None) for k in ("xdata", "ydata", "x", "y")})
+            return
+        d2 = (self.ref_spots[:, 0] - cx) ** 2 + (self.ref_spots[:, 1] - cy) ** 2
+        j = int(np.argmin(d2))
+        # Hit radius in CALIBRATED units: the pixel radius (+ a few px slack)
+        # converted via the axis scale (_x_scale/_y_scale from _calibrate).
+        hit_r_data = (self._radius_px + 4.0) * max(abs(self._x_scale), abs(self._y_scale))
+        log.debug("[strain-select] hit-test click=(%.4g,%.4g) nearest_spot=%s "
+                  "dist=%.4g hit_radius=%.4g", cx, cy, tuple(self.ref_spots[j]),
+                  float(np.sqrt(d2[j])), hit_r_data)
+        if d2[j] > hit_r_data ** 2:
+            log.debug("[strain-select] _on_click DROPPED: nearest spot outside hit radius")
+            return
+        self.selected[j] = not self.selected[j]
+        log.debug("[strain-select] TOGGLED spot idx=%d -> selected=%s (n_selected=%d/%d)",
+                  j, bool(self.selected[j]), int(self.selected.sum()), len(self.selected))
+        self._redraw()
+        if self.on_toggle is not None:
+            try:
+                self.on_toggle()
+            except Exception as e:
+                log.debug("strain selection on_toggle failed: %s", e)
+
+    # ── marker push helpers ────────────────────────────────────────────────────
+    def _set(self, mg, **kw) -> None:
+        if mg is None:
+            return
+        try:
+            mg.set(**kw)
+        except Exception as e:
+            log.debug("pushing strain selection markers failed: %s", e)
+
+    def _set_arrows(self, offsets, U, V) -> None:
+        if self._mg_arrow is None:
+            return
+        try:
+            self._mg_arrow.set(offsets=offsets, U=U, V=V)
+        except Exception as e:
+            log.debug("pushing strain displacement arrows failed: %s", e)
+
+    def set_visible(self, visible: bool) -> None:
+        self._hidden = not bool(visible)
+        if self._hidden:
+            empty = np.zeros((0, 2), np.float32)
+            self._set(self._mg_sel, offsets=empty)
+            self._set(self._mg_exc, offsets=empty)
+            self._set_arrows(empty, np.zeros(0), np.zeros(0))
+        else:
+            self._redraw()
+
+    def remove(self):
+        for sel in self._selectors:
+            if self._on_indices in sel.index_hooks:
+                sel.index_hooks.remove(self._on_indices)
+        self._selectors = []
+        # anyplotlib has no remove_event_handler; the click handler is made inert
+        # by clearing ref_spots so _on_click early-returns (and the groups below
+        # are gone). Drop our reference so the callback can be GC'd with us.
+        self.ref_spots = np.zeros((0, 2))
+        self._click_cb = None
+        for attr in ("_mg_sel", "_mg_exc", "_mg_arrow"):
+            mg = getattr(self, attr, None)
+            if mg is not None:
+                try:
+                    mg.remove()
+                except Exception as e:
+                    log.debug("removing strain marker group failed: %s", e)
+                setattr(self, attr, None)
+
+
+def attach_strain_selection_overlay(dp_plot, vecs, tree, *, ref_yx, ref_spots,
+                                    selected=None, match_radius_px=6.0,
+                                    on_toggle=None) -> StrainSelectionOverlay:
+    """Add the interactive strain reference-spot selection + displacement overlay
+    to ``dp_plot``, wired to ``tree``'s navigator. Returns the overlay."""
+    return StrainSelectionOverlay(
+        dp_plot, vecs, ref_yx=ref_yx, ref_spots=ref_spots, selected=selected,
+        match_radius_px=match_radius_px, on_toggle=on_toggle).attach(tree)
 
 
 class OrientationOverlay(_DPOverlay):

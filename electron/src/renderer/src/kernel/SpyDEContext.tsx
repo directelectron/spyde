@@ -392,6 +392,10 @@ interface SpyDEContextValue {
   stackDialogOpen: boolean
   openStackDialog: () => void
   closeStackDialog: () => void
+  // MDIArea registers its tile-all-windows function here so StatusBar's
+  // "Tile" button can trigger it without threading window-layout state (which
+  // lives in MDIArea's local refs) through the shared context.
+  tileWindowsRef: React.MutableRefObject<(() => void) | null>
 }
 
 const SpyDEContext = createContext<SpyDEContextValue | null>(null)
@@ -424,6 +428,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
 
   const iframeRefs = useRef<Map<string, HTMLIFrameElement>>(new Map())
   const latestStates = useRef<Map<string, Map<string, unknown>>>(new Map())
+  const tileWindowsRef = useRef<(() => void) | null>(null)
   const [stackDialogOpen, setStackDialogOpen] = useState(false)
 
   // Post every stored state for a figure to its iframe (called on iframe load).
@@ -766,7 +771,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
   const closeStackDialog = () => setStackDialogOpen(false)
 
   return (
-    <SpyDEContext.Provider value={{ state, iframeRefs, latestStates, sendAction, setActiveWindow, replayState, clearNavShapePrompt, stackDialogOpen, openStackDialog, closeStackDialog }}>
+    <SpyDEContext.Provider value={{ state, iframeRefs, latestStates, sendAction, setActiveWindow, replayState, clearNavShapePrompt, stackDialogOpen, openStackDialog, closeStackDialog, tileWindowsRef }}>
       {children}
       {state.backendExited && <BackendExitedOverlay code={state.backendExited.code} />}
     </SpyDEContext.Provider>

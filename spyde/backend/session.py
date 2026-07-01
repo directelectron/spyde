@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from typing import TYPE_CHECKING, Any
 
 from hyperspy.signal import BaseSignal
@@ -87,6 +88,11 @@ class Session(
         )
         self.dask_manager.ready.connect(self._on_dask_ready)
         self.dask_manager.error.connect(self._on_dask_error)
+        # Gate: set once the cluster is ready (or when dask is skipped). A file /
+        # example load fired before the cluster exists waits on this instead of
+        # racing ahead with a None client (which errored "Folder not found" /
+        # silently produced no navigator). See _await_dask.
+        self._dask_ready = threading.Event()
 
         # Plot update poller. `dispatch` marshals the result-APPLY onto the main
         # asyncio thread (set later via set_main_loop, once the loop exists) — the
@@ -119,6 +125,23 @@ class Session(
     def start_dask(self) -> None:
         self.dask_manager.start()
 
+    def skip_dask(self) -> None:
+        """Eager / no-dask mode (SPYDE_NO_DASK): the cluster never starts, so open
+        the gate immediately — a load must NOT wait forever for a `ready` that will
+        never fire."""
+        self._dask_ready.set()
+
+    def _await_dask(self, timeout: float = 120.0) -> bool:
+        """Block the calling (load) thread until the Dask cluster is ready, so a
+        file/example opened during startup waits for the cluster instead of racing
+        ahead with a None client. Returns True if ready, False on timeout. Safe in
+        no-dask mode (the gate is pre-set by skip_dask). Never call on the main
+        asyncio thread — only from the load worker threads."""
+        if self._dask_ready.is_set():
+            return True
+        emit_status("Waiting for the compute cluster to start…")
+        return self._dask_ready.wait(timeout)
+
     def set_main_loop(self, loop) -> None:
         """Register the main asyncio loop so the plot poller can marshal the
         result-apply onto this (main) thread. Call from app._main once the loop
@@ -139,6 +162,7 @@ class Session(
         fn()
 
     def _on_dask_ready(self) -> None:
+        self._dask_ready.set()           # release any load waiting on the cluster
         emit_status("Dask cluster ready")
         emit({"type": "dask_ready", "dashboard": self.dask_manager.client.dashboard_link})
 

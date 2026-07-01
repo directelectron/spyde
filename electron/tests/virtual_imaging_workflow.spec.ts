@@ -33,8 +33,12 @@ test('virtual image output window paints non-black', async () => {
   const sig = page.getByTestId('subwindow').filter({ hasNotText: 'Navigator' }).first()
   await sig.getByTestId('subwindow-title').click()
   await sig.getByTestId('subwindow-titlebar').hover()   // reveal toolbar
-  await sig.getByTestId('action-btn-Virtual Imaging').click()
-  await expect(page.getByTestId('sub-toolbar')).toBeVisible()
+  // Wait for the toolbar button to actually be revealed before clicking — on a
+  // loaded CI runner the hover-reveal lags, and clicking immediately times out.
+  const viBtn = sig.getByTestId('action-btn-Virtual Imaging')
+  await expect(viBtn).toBeVisible({ timeout: 30_000 })
+  await viBtn.click()
+  await expect(page.getByTestId('sub-toolbar')).toBeVisible({ timeout: 15_000 })
   await page.getByTestId('subaction-add_virtual_image').click()
 
   await expect(page.getByTestId('vi-icon-Virtual Image 1 (red)'))
