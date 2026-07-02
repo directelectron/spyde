@@ -176,3 +176,61 @@ def add_virtual_image(ctx, action_name: str = "Add Virtual Image", **params):
             "active": True,
         })
     return None   # tracked manually; don't let _track_action_artifacts re-track
+
+
+def vi_commit(session, plot, payload) -> None:
+    """Commit a live virtual image (raw OR vector) to its own SignalTree — the
+    standard Commit door (same pattern as strain). The live VI window + ROI
+    stay open for further tuning; the committed tree is an independent
+    snapshot that survives deselecting the action."""
+    from spyde.backend.ipc import emit_error, emit_status
+
+    name = (payload or {}).get("name")
+    src_wid = (payload or {}).get("window_id")
+    art = session._action_artifacts.get((src_wid, name)) if name else None
+    if not art:
+        emit_error(f"Commit: no live virtual image named {name!r}")
+        return
+    out_plot = None
+    for owid in art.get("out_wids", []):
+        p = session._plot_by_window_id(owid)
+        if p is not None:
+            out_plot = p
+            break
+    data = getattr(out_plot, "current_data", None) if out_plot is not None else None
+    if data is None or not hasattr(data, "__array__"):
+        emit_error("Commit: the virtual image hasn't finished computing yet")
+        return
+    data = np.asarray(data, dtype=np.float32)
+    if data.ndim != 2:
+        emit_error(f"Commit: unexpected virtual-image shape {data.shape}")
+        return
+
+    tree = getattr(plot, "signal_tree", None) if plot is not None else None
+    src_sig = getattr(tree, "root", None) if tree is not None else None
+    src_title = ""
+    if src_sig is not None:
+        src_title = src_sig.metadata.get_item("General.title", "") or ""
+
+    def _calibrate(new_tree):
+        """Copy the SOURCE's spatial nav-axis calibration onto the committed
+        image's signal axes (the VI output lives in navigation space)."""
+        if src_sig is None:
+            return
+        try:
+            nav_axes = list(src_sig.axes_manager.navigation_axes)[-2:]
+            sig_axes = list(new_tree.root.axes_manager.signal_axes)
+            for ax, ref in zip(sig_axes, nav_axes):
+                ax.scale, ax.offset = ref.scale, ref.offset
+                ax.units, ax.name = ref.units, ref.name
+        except Exception as e:
+            log.debug("calibrating committed VI axes failed: %s", e)
+
+    from spyde.actions.commit import commit_result_tree
+    commit_result_tree(
+        session, title=name or "Virtual Image", primary=data, levels=None,
+        provenance={"action": "Virtual Imaging", "item": name,
+                    "source_title": src_title},
+        on_tree=_calibrate,
+    )
+    emit_status(f"Committed {name} to a new signal tree")

@@ -408,6 +408,12 @@ class BaseSignalTree:
         signal = self._preprocess_navigator(signal)
         self.navigator_signals[name] = signal
         self.navigator_plot_manager.add_plot_states_for_navigation_signals(signal)
+        # Refresh the navigator chip strip (appears once there are ≥2).
+        try:
+            from spyde.actions.navigator_views import emit_navigator_options
+            emit_navigator_options(self)
+        except Exception as e:
+            logger.debug("navigator options emit failed: %s", e)
 
     def _initialize_navigator(self, signal: BaseSignal):
         if signal.axes_manager.navigation_dimension == 0:

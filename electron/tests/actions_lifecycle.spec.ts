@@ -44,6 +44,16 @@ test('requires_vectors gate + Commit-to-new-tree + caret teardown', async () => 
   const nWin = () => page.getByTestId('subwindow').count()
   const found = () =>
     (ctx.backend.logBuffer ?? []).some((l: string) => l.includes('Found'))
+  // Raise a window through the app's own focus channel (the spyde_focus
+  // message a figure click posts) — windows share z-levels now (no
+  // hover-raise), so a buried window's titlebar may itself be unclickable.
+  const raise = async (win: ReturnType<typeof page.getByTestId>) => {
+    const tid = await win.locator('iframe').first().getAttribute('data-testid')
+    const figId = tid!.replace('figure-', '')
+    await page.evaluate(
+      (id) => window.postMessage({ type: 'spyde_focus', figId: id }, '*'), figId)
+    await page.waitForTimeout(200)
+  }
   await page.screenshot({ path: join(SHOTS, '01-loaded.png') })
 
   // ── 1) Run Find Diffraction Vectors on the source DP.
@@ -108,8 +118,8 @@ test('requires_vectors gate + Commit-to-new-tree + caret teardown', async () => 
   await page.waitForTimeout(600)
   const vwin = page.getByTestId('subwindow')
     .filter({ has: page.getByTestId('action-btn-Strain Mapping') }).first()
-  await vwin.getByTestId('subwindow-titlebar').hover()   // raise above sibling toolbars
-  await vwin.getByTestId('subwindow-titlebar').click()
+  await raise(vwin)
+  await vwin.getByTestId('subwindow-titlebar').hover()
   const strainBtn = vwin.getByTestId('action-btn-Strain Mapping')
   const beforeStrain = await nWin()
   await strainBtn.click()
@@ -122,7 +132,9 @@ test('requires_vectors gate + Commit-to-new-tree + caret teardown', async () => 
   await page.screenshot({ path: join(SHOTS, '04-strain-live.png') })
 
   // ── 4) Commit → a NEW SignalTree window ("Strain") appears; the live
-  // window stays open (commit is non-destructive).
+  // window stays open (commit is non-destructive). The live strain windows
+  // opened focused ON TOP of the caret — raise the source window first.
+  await raise(vwin)
   await expect(page.getByTestId('strain-commit')).toBeVisible()
   await page.getByTestId('strain-commit').click()
   await expect.poll(nWin, {
@@ -140,8 +152,8 @@ test('requires_vectors gate + Commit-to-new-tree + caret teardown', async () => 
   // (controller close), the COMMITTED tree window survives.
   await page.mouse.move(640, 12)
   await page.waitForTimeout(600)
-  await vwin.getByTestId('subwindow-titlebar').hover()   // raise above sibling toolbars
-  await vwin.getByTestId('subwindow-titlebar').click()
+  await raise(vwin)
+  await vwin.getByTestId('subwindow-titlebar').hover()
   await strainBtn.click()
   await expect.poll(nWin, {
     timeout: 15_000, message: 'strain live windows not removed on toggle off',

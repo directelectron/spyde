@@ -113,13 +113,21 @@ class TransformAction(Action):
     def run(self, **params):
         resolved = self._resolved_params(params)
         kwargs = self.build_kwargs(self.signal, **resolved)
-        return self.signal_tree.add_transformation(
+        new = self.signal_tree.add_transformation(
             parent_signal=self.signal,
             method=self.method,
             function=self.function,
             node_name=self.node_name or self.name or None,
             **kwargs,
         )
+        # Switch the display to the new node and force a navigator re-slice —
+        # add_transformation only registers the PlotState, so without this the
+        # plot keeps showing the OLD data until the crosshair moves (the
+        # "Rebin didn't do anything" bug). Also refreshes the Workflow panel.
+        if new is not None:
+            from spyde.actions.lifecycle import show_tree_node
+            show_tree_node(self.plot, self.signal_tree, new)
+        return new
 
 
 class RegionAction(Action):

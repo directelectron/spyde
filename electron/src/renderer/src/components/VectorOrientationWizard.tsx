@@ -20,7 +20,7 @@ const TABS = ['Load', 'Library', 'Refine', 'Run'] as const
 type Tab = typeof TABS[number]
 
 interface Props {
-  openUp: boolean
+  caretPos: React.CSSProperties
   windowId: number
   sendAction: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
   onClose: () => void
@@ -42,7 +42,7 @@ interface VomSaved {
 }
 const _vomStore = new Map<number, VomSaved>()
 
-export function VectorOrientationWizard({ openUp, windowId, sendAction, onClose }: Props) {
+export function VectorOrientationWizard({ caretPos, windowId, sendAction, onClose }: Props) {
   const saved = _vomStore.get(windowId)
   const [tab, setTab] = React.useState<Tab>(saved?.tab ?? 'Load')
   const [cif, setCif] = React.useState(saved?.cif ?? '')
@@ -108,7 +108,7 @@ export function VectorOrientationWizard({ openUp, windowId, sendAction, onClose 
   const pct = (v?: number) => (v === undefined ? '—' : `${(v * 100).toFixed(2)}%`)
 
   return (
-    <WizardShell testid="vector-orientation-wizard" title="Vector Orientation Mapping" openUp={openUp}
+    <WizardShell testid="vector-orientation-wizard" title="Vector Orientation Mapping" posStyle={caretPos}
       onClose={onClose} closeTestid="vom-close" status={status} statusTestid="vom-status">
       <TabRow tabs={TABS} active={tab} onSelect={setTab} testid={(t) => `vom-tab-${t}`}
         locked={(t) => (t === 'Refine' || t === 'Run') && !libReady} />

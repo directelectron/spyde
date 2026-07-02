@@ -112,6 +112,12 @@ class TestHarnessMixin:
         different diffraction pattern.
         """
         import numpy as np
+        # set_signal_type("electron_diffraction") imports pyxem — don't race the
+        # startup prewarm's import (partially-initialized-module poisoning makes
+        # the cast silently fail, and every diffraction-gated toolbar action
+        # vanishes from the synthetic dataset).
+        from spyde.backend.heavy_imports import ensure_heavy_imports
+        ensure_heavy_imports()
         nav, sig = (8, 8), (32, 32)
         data = np.zeros(nav + sig, dtype=np.float32)
         for i in range(nav[0]):
@@ -131,6 +137,8 @@ class TestHarnessMixin:
         The central disk intensity varies per nav position so a virtual image of
         it is clearly structured (not uniform/black)."""
         import numpy as np
+        from spyde.backend.heavy_imports import ensure_heavy_imports
+        ensure_heavy_imports()   # see _load_test_data — don't race the prewarm
         nav, sig = (8, 8), (32, 32)
         yy, xx = np.mgrid[0:32, 0:32]
         disk = ((xx - 16) ** 2 + (yy - 16) ** 2 <= 20).astype(np.float32)
@@ -164,6 +172,8 @@ class TestHarnessMixin:
         grid; signal axes span the full frame (storage-aligned)."""
         import numpy as np
         import dask.array as da
+        from spyde.backend.heavy_imports import ensure_heavy_imports
+        ensure_heavy_imports()   # see _load_test_data — don't race the prewarm
         ny, nx, ky, kx = 24, 24, 32, 32
         data = np.zeros((ny, nx, ky, kx), dtype=np.float32)
         for i in range(ny):

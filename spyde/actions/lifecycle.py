@@ -197,6 +197,34 @@ def replace_tree_attr(tree, attr: str, factory: Callable[[], Any] | None):
     return new
 
 
+def show_tree_node(plot, tree, new_signal) -> None:
+    """Switch *plot* to display *new_signal* and re-slice from the navigator so
+    the new frame shows immediately — ``add_transformation`` only REGISTERS the
+    new PlotState; nothing else repaints until a selector event. Then re-emit
+    the signal tree so the Workflow panel reflects the change.
+
+    This is what makes a TransformAction (Rebin, Center Zero Beam, …) visibly
+    take effect without the user having to nudge the crosshair."""
+    try:
+        plot.set_plot_state(new_signal)
+    except Exception as e:
+        log.debug("switching plot to new node failed: %s", e)
+    npm = getattr(tree, "navigator_plot_manager", None)
+    if npm is not None:
+        for sels in getattr(npm, "navigation_selectors", {}).values():
+            for sel in sels:
+                try:
+                    sel.delayed_update_data(force=True)
+                except Exception as e:
+                    log.debug("re-slicing navigator after transform failed: %s", e)
+    session = getattr(plot, "session", None)
+    if session is not None and hasattr(session, "_reemit_signal_tree"):
+        try:
+            session._reemit_signal_tree(plot)
+        except Exception as e:
+            log.debug("re-emitting signal tree after transform failed: %s", e)
+
+
 def paint_signal_plots(tree, data, *, levels: tuple[float, float] | None = None) -> None:
     """Paint *data* onto every signal plot of *tree*. With *levels* the plot's
     contrast is locked to that range; otherwise it re-auto-levels."""

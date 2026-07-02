@@ -103,7 +103,8 @@ class ActionRouterMixin:
             # headlessly / in Playwright. payload={"phase":"si"|"ag"} (default si).
             self._run_test_orientation(plot, payload)
         elif action == "set_selector_mode":
-            self.set_selector_mode(window_id, bool(payload.get("integrate")))
+            self.set_selector_mode(window_id, bool(payload.get("integrate")),
+                                   payload.get("selector_id"))
         elif action == "select_signal_node":
             self._select_signal_node(plot, payload.get("signal_id"))
         elif action == "set_axis":
@@ -271,9 +272,20 @@ class ActionRouterMixin:
     def _set_action_active(self, window_id: int, name: str, active: bool) -> None:
         """Deselecting an action hides the output window + ROI selector it made
         (Qt parity: an unchecked toolbar action removes its artifacts)."""
+        if active:
+            return
         key = (window_id, name)
         art = self._action_artifacts.get(key)
-        if active or art is None:
+        if art is None:
+            # A PARENT action was deselected (e.g. the "Virtual Imaging"
+            # toolbar toggle, which has no artifact of its own): cascade to
+            # every live item added under it on this window. Committed trees
+            # are standalone SignalTrees and survive.
+            src = self._plot_by_window_id(window_id)
+            items = [it for it in (getattr(src, "_vi_items", []) or [])
+                     if it.get("parent_action", "Virtual Imaging") == name]
+            for it in items:
+                self._set_action_active(window_id, it.get("name"), False)
             return
         # Closing each output plot also cleans its source ROI (parent_selector).
         for wid in art.get("out_wids", []):
@@ -287,12 +299,17 @@ class ActionRouterMixin:
         self._action_artifacts.pop(key, None)
         ipc.emit({"type": "action_active", "window_id": window_id, "name": name, "active": False})
         # If this was a virtual-image chip, drop it from the source plot's list
-        # and tell the sub-toolbar to remove the chip.
+        # and tell its OWN sub-toolbar (raw or vector VI) to remove the chip.
         src = self._plot_by_window_id(window_id)
+        parent = "Virtual Imaging"
         if src is not None and hasattr(src, "_vi_items"):
+            for it in src._vi_items:
+                if it.get("name") == name:
+                    parent = it.get("parent_action", parent)
+                    break
             src._vi_items = [it for it in src._vi_items if it.get("name") != name]
         ipc.emit({"type": "sub_item", "window_id": window_id,
-                  "action": "Virtual Imaging", "name": name, "active": False})
+                  "action": parent, "name": name, "active": False})
 
     def _update_vi(self, window_id: int, name: str, params: dict) -> None:
         """A per-VI caret edit — apply new detector params and recompute that

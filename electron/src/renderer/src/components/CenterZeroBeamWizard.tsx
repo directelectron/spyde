@@ -16,13 +16,13 @@ const TABS = ['Automatic', 'Manual'] as const
 type Tab = typeof TABS[number]
 
 interface Props {
-  openUp: boolean
+  caretPos: React.CSSProperties
   windowId: number
   sendAction: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
   onClose: () => void
 }
 
-export function CenterZeroBeamWizard({ openUp, windowId, sendAction, onClose }: Props) {
+export function CenterZeroBeamWizard({ caretPos, windowId, sendAction, onClose }: Props) {
   const [tab, setTab] = React.useState<Tab>('Automatic')
   const [method, setMethod] = React.useState('center_of_mass')
   const [halfWidth, setHalfWidth] = React.useState(0)
@@ -38,6 +38,19 @@ export function CenterZeroBeamWizard({ openUp, windowId, sendAction, onClose }: 
     deps: [tab],
   })
 
+  // Automatic tab: outline the centering search window on the DP live as the
+  // half-width changes. Deferred one tick so it lands AFTER the lifecycle's
+  // (also deferred) czb_close when both fire in the same commit — otherwise
+  // the close would wipe the box we just drew. czb_close removes it.
+  React.useEffect(() => {
+    if (tab !== 'Automatic') return
+    const t = setTimeout(() => {
+      sendAction('czb_set_region', { half_square_width: halfWidth }, windowId)
+    }, 0)
+    return () => clearTimeout(t)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, halfWidth])
+
   const center = () => {
     setStatus('Centering…')
     sendAction('czb_run', { method, half_square_width: halfWidth, make_flat_field: flat }, windowId)
@@ -48,7 +61,7 @@ export function CenterZeroBeamWizard({ openUp, windowId, sendAction, onClose }: 
   }
 
   return (
-    <WizardShell testid="center-zero-beam-wizard" title="Center Zero Beam" openUp={openUp}
+    <WizardShell testid="center-zero-beam-wizard" title="Center Zero Beam" posStyle={caretPos}
       onClose={onClose} closeTestid="czb-close" status={status} statusTestid="czb-status">
       <TabRow tabs={TABS} active={tab} onSelect={setTab} testid={(t) => `czb-tab-${t}`} />
 

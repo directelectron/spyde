@@ -26,13 +26,13 @@ const METHODS = [
 type Method = typeof METHODS[number]['value']
 
 interface Props {
-  openUp: boolean
+  caretPos: React.CSSProperties
   windowId: number
   sendAction: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
   onClose: () => void
 }
 
-export function StrainWizard({ openUp, windowId, sendAction, onClose }: Props) {
+export function StrainWizard({ caretPos, windowId, sendAction, onClose }: Props) {
   const [method, setMethod] = React.useState<Method>('region')
   const [matchRadius, setMatchRadius] = React.useState(6)
   const [status, setStatus] = React.useState('Double-click reference spots to use/ignore; move the navigator to displace.')
@@ -65,7 +65,7 @@ export function StrainWizard({ openUp, windowId, sendAction, onClose }: Props) {
   }
 
   return (
-    <WizardShell testid="strain-wizard" title="Strain Mapping" openUp={openUp}
+    <WizardShell testid="strain-wizard" title="Strain Mapping" posStyle={caretPos}
       onClose={onClose} closeTestid="strain-close" status={status} statusTestid="strain-status">
       <div style={S.page}>
         <div style={S.hint}>

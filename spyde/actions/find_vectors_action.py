@@ -80,9 +80,11 @@ def find_diffraction_vectors(ctx, action_name: str = "Find Diffraction Vectors",
     return _start_batch(session, plot, src_tree, _coerce(params))
 
 
-def _start_batch(session, plot, src_tree, p: dict):
+def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = True):
     """Build the result window, then run the full-dataset compute on a background
-    thread. Shared by the toolbar one-shot and the staged-wizard ``fv_run``."""
+    thread. Shared by the toolbar one-shot and the staged-wizard ``fv_run``
+    (which passes ``overlay_visible=False`` — after Compute the source DP stays
+    clean; reopening the caret toggles the overlay back via ``set_overlay``)."""
     src = src_tree.root
     am = src.axes_manager
 
@@ -94,6 +96,13 @@ def _start_batch(session, plot, src_tree, p: dict):
         except Exception as e:
             log.debug("dropping find-vectors preview failed: %s", e)
         src_tree._fv_preview = None
+
+    # Drop the prior run's persistent source-DP overlay SYNCHRONOUSLY. The
+    # replace inside _overlay_on_source only runs at the TAIL of the async
+    # batch, so without this a second Compute leaves run 1's circles on the DP
+    # for the whole run — and a torn attach could stack a second marker group.
+    from spyde.actions.lifecycle import replace_tree_attr
+    replace_tree_attr(src_tree, "_vector_overlay", None)
 
     # ── Build the result tree up front: a lazy zero placeholder with the
     #    source's axes (so we never reference the raw dataset) + a zero
@@ -195,7 +204,8 @@ def _start_batch(session, plot, src_tree, p: dict):
                 return
             _finalize(new_tree, vecs)
             log.info("[fv-batch] finalized in %.1fs total", _time.monotonic() - t0)
-            _overlay_on_source(src_tree, src_dp_plot, vecs)
+            _overlay_on_source(src_tree, src_dp_plot, vecs,
+                               visible=overlay_visible)
         except Exception as e:
             emit_error(f"Find Vectors failed: {e}")
             log.exception("Find Vectors compute failed")
@@ -214,16 +224,25 @@ def _start_batch(session, plot, src_tree, p: dict):
     return None
 
 
-def _overlay_on_source(src_tree, dp_plot, vecs) -> None:
+def _overlay_on_source(src_tree, dp_plot, vecs, *, visible: bool = True) -> None:
     """Overlay the found vectors as live circle markers on the SOURCE diffraction
     pattern (Qt parity: peaks tracked the navigator). Replaces any prior overlay
-    from an earlier run so re-running Find Vectors doesn't stack markers."""
+    from an earlier run so re-running Find Vectors doesn't stack markers.
+
+    ``visible=False`` (the wizard path) attaches it hidden: the DP stays clean
+    after Compute, and reopening the Find Vectors caret shows it again via the
+    renderer's ``set_overlay`` toggle."""
     if dp_plot is None or src_tree is None:
         return
     from spyde.actions.lifecycle import replace_tree_attr
     from spyde.actions.vector_overlay import attach_vector_overlay
-    replace_tree_attr(src_tree, "_vector_overlay",
-                      lambda: attach_vector_overlay(dp_plot, vecs, src_tree))
+    ov = replace_tree_attr(src_tree, "_vector_overlay",
+                           lambda: attach_vector_overlay(dp_plot, vecs, src_tree))
+    if ov is not None and not visible:
+        try:
+            ov.set_visible(False)
+        except Exception as e:
+            log.debug("hiding source vector overlay failed: %s", e)
 
 
 def _apply_axes_from_vecs(new_sig, nav_sig, vecs) -> None:
@@ -534,6 +553,11 @@ def fv_open(session, plot, payload) -> None:
                 except Exception as e:
                     log.debug("dropping prior find-vectors preview failed: %s", e)
             tree._fv_preview = new_prev
+            # The live preview supersedes any persistent overlay from an
+            # earlier Compute — both drawing at once is exactly the
+            # "duplicated peaks" bug, so drop the old one here.
+            from spyde.actions.lifecycle import replace_tree_attr
+            replace_tree_attr(tree, "_vector_overlay", None)
             # Qt parity: estimate the disk radius from the data (once) so the
             # wizard's defaults match the pattern instead of a fixed 5.
             if not getattr(tree, "_fv_auto_sent", False):
@@ -619,7 +643,9 @@ def fv_run(session, plot, payload) -> None:
               "kr=%s dog=(%s,%s) beamstop=%s", p["method"], p["threshold"],
               p["min_distance"], p["kernel_radius"], p["dog_sigma1"],
               p["dog_sigma2"], p.get("beamstop_auto"))
-    _start_batch(session, src, tree, p)
+    # The wizard caret closes on Compute; attach the final source-DP overlay
+    # hidden so the pattern is clean until the caret is reopened.
+    _start_batch(session, src, tree, p, overlay_visible=False)
 
 
 def fv_close(session, plot, payload=None) -> None:

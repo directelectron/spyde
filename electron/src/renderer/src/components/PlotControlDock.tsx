@@ -278,8 +278,16 @@ export function PlotControlDock() {
   const win = activeId != null ? state.windows.get(activeId) : undefined
   const hist = activeId != null ? state.histograms.get(activeId) : undefined
   const meta = activeId != null ? state.metadata.get(activeId) : undefined
-  const navSelectors = Array.from(state.selectors.values())
   const tree = activeId != null ? state.signalTrees.get(activeId) : undefined
+  // Only the ACTIVE signal tree's selectors are listed — every window of a
+  // tree receives the same signal_tree payload, so two windows belong to the
+  // same tree iff their trees share a root signal_id. With no tree context
+  // (e.g. a bare result window is focused) fall back to showing all.
+  const activeTreeRoot = tree?.signal_id
+  const navSelectors = Array.from(state.selectors.values()).filter(s => {
+    if (activeTreeRoot == null) return true
+    return state.signalTrees.get(s.windowId)?.signal_id === activeTreeRoot
+  })
   const axes = activeId != null ? state.axes.get(activeId) : undefined
   const sigType = activeId != null ? state.signalTypes.get(activeId) : undefined
 
@@ -431,23 +439,30 @@ export function PlotControlDock() {
         </div>
       )}
 
-      {/* Navigator Selector (bottom) */}
+      {/* Navigator Selector (bottom) — one row per selector, with its colour dot */}
       {navSelectors.length > 0 && (
         <div style={styles.section} data-testid="selector-control">
           <div style={styles.label}>Navigator Selector</div>
           {navSelectors.map((s) => (
-            <div key={s.windowId} style={styles.toggleRow}>
+            <div key={s.selectorId ?? s.windowId} style={styles.toggleRow}>
+              <span
+                data-testid="selector-dot"
+                style={{ ...styles.selectorDot, background: s.color ?? '#00e676' }}
+                title={s.title ?? 'Navigator'}
+              />
               <button
                 data-testid="selector-crosshair"
                 style={s.mode === 'crosshair' ? styles.toggleActive : styles.toggle}
-                onClick={() => sendAction('set_selector_mode', { integrate: false }, s.windowId)}
+                onClick={() => sendAction('set_selector_mode',
+                  { integrate: false, selector_id: s.selectorId }, s.windowId)}
               >
                 ✛ Point
               </button>
               <button
                 data-testid="selector-integrate"
                 style={s.mode === 'integrate' ? styles.toggleActive : styles.toggle}
-                onClick={() => sendAction('set_selector_mode', { integrate: true }, s.windowId)}
+                onClick={() => sendAction('set_selector_mode',
+                  { integrate: true, selector_id: s.selectorId }, s.windowId)}
               >
                 ▭ Integrate
               </button>
@@ -510,7 +525,11 @@ const styles: Record<string, React.CSSProperties> = {
   metaVal: { color: '#cdd6f4', fontSize: 11, whiteSpace: 'nowrap',
              overflow: 'hidden', textOverflow: 'ellipsis' },
   hint: { fontSize: 10, color: '#6c7086', marginTop: 4 },
-  toggleRow: { display: 'flex', gap: 6 },
+  toggleRow: { display: 'flex', gap: 6, alignItems: 'center' },
+  selectorDot: {
+    width: 10, height: 10, borderRadius: '50%', flexShrink: 0,
+    border: '1px solid rgba(0,0,0,0.4)',
+  },
   toggle: {
     flex: 1, background: '#1e1e2e', color: '#a6adc8',
     border: '1px solid #313244', borderRadius: 4, padding: '4px 6px',

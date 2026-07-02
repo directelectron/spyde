@@ -1,6 +1,7 @@
 import React, { useCallback, useRef, useState } from 'react'
 import type { ToolbarAction } from '../kernel/SpyDEContext'
 import { FloatingToolbar } from './FloatingToolbar'
+import { WINDOW_DRAG_MIME } from '../kernel/dnd'
 
 interface Props {
   id: string
@@ -12,11 +13,19 @@ interface Props {
   toolbarActions: ToolbarAction[]
   onClose: (id: string) => void
   onFocus: (id: string) => void
+  onMinimize?: (id: string) => void
   onResize: (id: string, w: number, h: number) => void
   onAction: (action: string, windowId: number, params: Record<string, unknown>) => void
   zIndex: number
   windowId: number
   children: React.ReactNode
+  /** Minimized: keep the window (and its figure iframe) mounted but invisible —
+   *  it is listed in the MDI top bar and restored from there. */
+  hidden?: boolean
+  /** Navigator windows accept a dragged signal window on their titlebar —
+   *  the dropped signal becomes a named navigator of this window's tree. */
+  acceptSignalDrop?: boolean
+  onSignalDrop?: (sourceWindowId: number) => void
   // Live layout coordination with MDIArea (all optional so older callers/tests
   // that don't pass them still work with sane defaults).
   areaSize?: { w: number; h: number }
@@ -111,11 +120,13 @@ function clampToVisible(x: number, y: number, w: number, areaW: number, areaH: n
 // steal the native pointer and freeze the interaction).
 export function SubWindow({
   id, title, initialX, initialY, initialW, initialH,
-  toolbarActions, onClose, onFocus, onResize, onAction,
-  zIndex, windowId, children,
+  toolbarActions, onClose, onFocus, onMinimize, onResize, onAction,
+  zIndex, windowId, children, hidden = false,
+  acceptSignalDrop = false, onSignalDrop,
   areaSize, otherRects, onLiveRect, forced,
 }: Props) {
   const [maximized, setMaximized] = useState(false)
+  const [dropHover, setDropHover] = useState(false)
   const [pos, setPos] = useState({ x: initialX, y: initialY })
   const [size, setSize] = useState({ width: initialW, height: initialH })
   const [busy, setBusy] = useState(false)   // dragging or resizing → shield on
@@ -151,10 +162,6 @@ export function SubWindow({
   // window or the toolbar itself). A short hide delay covers the gap between the
   // window's bottom edge and the toolbar so moving toward it doesn't hide it.
   const [tbVisible, setTbVisible] = useState(false)
-  // True while the toolbar is ENGAGED (a caret/wizard open or an action live) —
-  // reported up by FloatingToolbar so the window stays raised while its caret
-  // is in use even when the cursor wanders elsewhere.
-  const [tbEngaged, setTbEngaged] = useState(false)
   const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const showToolbar = useCallback(() => {
     if (hideTimer.current) { clearTimeout(hideTimer.current); hideTimer.current = null }
@@ -171,7 +178,7 @@ export function SubWindow({
   >(null)
 
   const hasToolbar = toolbarActions.length > 0
-  const headerH = TITLE_H   // toolbar is now a right-edge rail, not a top bar
+  const headerH = TITLE_H
   const areaW = areaSize?.w ?? 4000   // generous fallback so clamping is a no-op
   const areaH = areaSize?.h ?? 4000   // if MDIArea hasn't measured yet
   const others = otherRects ?? []
@@ -180,6 +187,8 @@ export function SubWindow({
   const onTitleDown = (e: React.PointerEvent) => {
     if (maximized) return
     if ((e.target as HTMLElement).closest('button')) return  // let buttons click
+    // The signal-drag grip starts an HTML5 drag, not a window move.
+    if ((e.target as HTMLElement).closest('[data-testid="signal-drag-handle"]')) return
     onFocus(id)
     try { (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId) } catch { /* */ }
     gesture.current = { kind: 'drag', px: e.clientX, py: e.clientY, ox: pos.x, oy: pos.y }
@@ -227,18 +236,22 @@ export function SubWindow({
     ? { left: 0, top: 0, width: '100%', height: '100%' }
     : { left: pos.x, top: pos.y, width: size.width, height: size.height }
 
-  // The toolbar and its caret render INSIDE this window's stacking context, so
-  // an overlapping sibling window covers them — the toolbar "revealed" on hover
-  // but stayed buried until the user clicked to raise the window. While the
-  // toolbar is revealed or engaged, raise this window visually above siblings
-  // (temporary — the managed focus zIndex is untouched and it drops back on
-  // leave/close).
-  const raised = tbVisible || tbEngaged
+  // The toolbar (and its caret) render inside this window's stacking context,
+  // so they share the window's z-level — clicking the window/toolbar focuses
+  // it, which raises it via the managed focus z-order. (An always-on hover
+  // raise was tried and rejected: windows jumping above siblings on mere
+  // hover made the stacking feel random.)
+  const rect = maximized
+    ? { x: 0, y: 0, w: areaW, h: areaH }
+    : { x: pos.x, y: pos.y, w: size.width, h: size.height }
+  // The bar hangs below the window; fall back to inside the bottom edge only
+  // when there is no room below (maximized / dragged to the area bottom).
+  const barInside = maximized || rect.y + rect.h + 46 > areaH
 
   return (
     <div
       data-testid="subwindow"
-      style={{ ...styles.window, ...frame, zIndex: zIndex + (raised ? 1000 : 0) }}
+      style={{ ...styles.window, ...frame, zIndex, ...(hidden ? { display: 'none' } : {}) }}
       onMouseDown={() => onFocus(id)}
       onMouseEnter={showToolbar}
       onMouseLeave={hideToolbar}
@@ -247,17 +260,55 @@ export function SubWindow({
       <div
         className="spyde-titlebar"
         data-testid="subwindow-titlebar"
-        style={styles.titleBar}
+        style={{ ...styles.titleBar, ...(dropHover ? styles.titleBarDrop : {}) }}
         onPointerDown={onTitleDown}
         onPointerMove={onTitleMove}
         onPointerUp={endGesture}
         onPointerCancel={endGesture}
         onDoubleClick={() => setMaximized(m => !m)}
+        onDragOver={(e) => {
+          if (!acceptSignalDrop || !e.dataTransfer.types.includes(WINDOW_DRAG_MIME)) return
+          e.preventDefault()
+          e.dataTransfer.dropEffect = 'copy'
+          setDropHover(true)
+        }}
+        onDragLeave={() => setDropHover(false)}
+        onDrop={(e) => {
+          setDropHover(false)
+          if (!acceptSignalDrop) return
+          const raw = e.dataTransfer.getData(WINDOW_DRAG_MIME)
+          if (!raw) return
+          e.preventDefault()
+          const src = parseInt(raw, 10)
+          if (Number.isFinite(src) && src !== windowId) onSignalDrop?.(src)
+        }}
       >
         <span style={{ display: 'flex', alignItems: 'center', gap: 5, minWidth: 0 }}>
+          {/* Grip: drag this signal onto a navigator's titlebar to add it as a
+              named navigator (a plain titlebar drag still moves the window). */}
+          <span
+            data-testid="signal-drag-handle"
+            title="Drag onto a navigator to add this signal as a navigator"
+            draggable
+            onDragStart={(e) => {
+              e.dataTransfer.setData(WINDOW_DRAG_MIME, String(windowId))
+              e.dataTransfer.effectAllowed = 'copy'
+            }}
+            style={styles.dragHandle}
+          >⠿</span>
           <span data-testid="subwindow-title" style={styles.title}>{title}</span>
         </span>
         <div style={styles.controls}>
+          {onMinimize && (
+            <button
+              data-testid="minimize-btn"
+              style={styles.btn}
+              title="Minimize"
+              onClick={() => onMinimize(id)}
+            >
+              –
+            </button>
+          )}
           <button style={styles.btn} onClick={() => setMaximized(m => !m)}>
             {maximized ? '❐' : '□'}
           </button>
@@ -287,7 +338,9 @@ export function SubWindow({
           visible={tbVisible}
           onHoverShow={showToolbar}
           onHoverHide={hideToolbar}
-          onEngagedChange={setTbEngaged}
+          winRect={rect}
+          areaSize={{ w: areaW, h: areaH }}
+          inside={barInside}
         />
       )}
 
@@ -329,6 +382,11 @@ const styles: Record<string, React.CSSProperties> = {
     flexShrink: 0,
   },
   title: { fontSize: 12, color: '#cdd6f4', fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  titleBarDrop: { background: '#2a2a44', borderBottom: '1px solid #89b4fa' },
+  dragHandle: {
+    color: '#6c7086', fontSize: 11, cursor: 'grab', flexShrink: 0,
+    userSelect: 'none',
+  },
   controls: { display: 'flex', gap: 4 },
   btn: {
     background: 'none', border: 'none', color: '#6c7086',

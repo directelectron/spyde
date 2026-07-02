@@ -438,15 +438,21 @@ test('Find Diffraction Vectors opens the staged wizard (live preview + Compute)'
     .toContain('fv_open')
 
   // Nudge the threshold slider → debounced fv_tune (native value setter so
-  // React's onChange fires).
+  // React's onChange fires). Wait for the debounce to FIRE before computing —
+  // Compute closes the caret, and the unmount cancels any still-pending tune
+  // (fv_run carries the full params, so a pending tune is redundant then).
   await page.getByTestId('fv-threshold').evaluate((el: HTMLInputElement) => {
     const setter = Object.getOwnPropertyDescriptor(
       window.HTMLInputElement.prototype, 'value')!.set!
     setter.call(el, '0.3')
     el.dispatchEvent(new Event('input', { bubbles: true }))
   })
-  // Compute → fv_run.
+  await expect.poll(async () => (await sentActions()).map((s: any) => s.action))
+    .toContain('fv_tune')
+
+  // Compute → fv_run, and the caret collapses back into the toolbar button.
   await page.getByTestId('fv-compute').click()
+  await expect(page.getByTestId('find-vectors-wizard')).toBeHidden()
 
   await expect.poll(async () => {
     const names = (await sentActions()).map((s: any) => s.action)

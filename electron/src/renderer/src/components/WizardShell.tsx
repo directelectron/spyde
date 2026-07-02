@@ -11,7 +11,9 @@ import React from 'react'
 interface ShellProps {
   testid: string
   title: string
-  openUp: boolean
+  /** Placement style computed by FloatingToolbar (below the window, or floated
+   *  to the window's right/left when below would run off the MDI area). */
+  posStyle: React.CSSProperties
   onClose: () => void
   closeTestid: string
   status: string
@@ -21,12 +23,12 @@ interface ShellProps {
 }
 
 export function WizardShell({
-  testid, title, openUp, onClose, closeTestid, status, statusTestid, children,
+  testid, title, posStyle, onClose, closeTestid, status, statusTestid, children,
   width,
 }: ShellProps) {
   return (
     <div data-testid={testid}
-      style={{ ...(openUp ? S.popUp : S.pop), ...S.box, ...(width ? { width } : {}) }}>
+      style={{ ...posStyle, ...S.box, ...(width ? { width } : {}) }}>
       <div style={S.head}>
         <span style={S.title}>{title}</span>
         <button data-testid={closeTestid} style={S.close} onClick={onClose}>✕</button>
@@ -120,8 +122,6 @@ export const S: Record<string, React.CSSProperties> = {
     width: 240, zIndex: 14, color: '#cdd6f4', boxShadow: '0 8px 24px rgba(0,0,0,0.55)',
     display: 'flex', flexDirection: 'column', gap: 6,
   },
-  pop: { position: 'absolute', top: '100%', left: '50%', transform: 'translateX(-50%)', marginTop: 10 },
-  popUp: { position: 'absolute', bottom: '100%', left: '50%', transform: 'translateX(-50%)', marginBottom: 10 },
   head: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' },
   title: { fontSize: 11, fontWeight: 600, color: '#cdd6f4' },
   close: { background: 'none', border: 'none', color: '#6c7086', cursor: 'pointer', fontSize: 12 },

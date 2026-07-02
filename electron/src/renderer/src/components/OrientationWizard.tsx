@@ -18,7 +18,7 @@ const TABS = ['Load', 'Library', 'Refine', 'Run'] as const
 type Tab = typeof TABS[number]
 
 interface Props {
-  openUp: boolean
+  caretPos: React.CSSProperties
   windowId: number
   sendAction: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
   onClose: () => void
@@ -32,7 +32,7 @@ interface OmSaved {
 }
 const _omStore = new Map<number, OmSaved>()
 
-export function OrientationWizard({ openUp, windowId, sendAction, onClose }: Props) {
+export function OrientationWizard({ caretPos, windowId, sendAction, onClose }: Props) {
   const saved = _omStore.get(windowId)
   const [tab, setTab] = React.useState<Tab>(saved?.tab ?? 'Load')
   const [cifs, setCifs] = React.useState<string[]>(saved?.cifs ?? [])   // multi-phase: one per phase
@@ -88,7 +88,7 @@ export function OrientationWizard({ openUp, windowId, sendAction, onClose }: Pro
   }
 
   return (
-    <WizardShell testid="orientation-wizard" title="Orientation Mapping" openUp={openUp}
+    <WizardShell testid="orientation-wizard" title="Orientation Mapping" posStyle={caretPos}
       onClose={onClose} closeTestid="om-close" status={status} statusTestid="om-status">
       <TabRow tabs={TABS} active={tab} onSelect={setTab} testid={(t) => `om-tab-${t}`}
         locked={(t) => (t === 'Refine' || t === 'Run') && !libReady} />

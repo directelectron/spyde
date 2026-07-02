@@ -18,7 +18,7 @@ import { WizardShell, Field, Slider, Select, Check, S } from './WizardShell'
 import { useWizardLifecycle, useDebouncedAction, useWizardEvent } from './wizardHooks'
 
 interface Props {
-  openUp: boolean
+  caretPos: React.CSSProperties
   windowId: number
   sendAction: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
   onClose: () => void
@@ -32,19 +32,38 @@ const METHODS: readonly { value: Method; label: string }[] = [
 // Sensible threshold default per method (NXCORR score vs DoG SNR).
 const THR_DEFAULT: Record<Method, number> = { nxcorr: 0.5, dog: 10 }
 
-export function FindVectorsWizard({ openUp, windowId, sendAction, onClose }: Props) {
-  const [method, setMethod] = React.useState<Method>('nxcorr')
-  const [sigma, setSigma] = React.useState(1.0)
-  const [radius, setRadius] = React.useState(5)
-  const [sigma1, setSigma1] = React.useState(0.8)
-  const [sigma2, setSigma2] = React.useState(2.0)
-  const [threshold, setThreshold] = React.useState(0.5)
-  const [minDist, setMinDist] = React.useState(5)
-  const [subpixel, setSubpixel] = React.useState(true)
-  const [beamstop, setBeamstop] = React.useState(false)
-  const [beamstopDilate, setBeamstopDilate] = React.useState(5)
-  const [showTransform, setShowTransform] = React.useState(false)
+// Per-window tuned state kept OUTSIDE the component (like the OM/VOM wizards)
+// so the caret closing on Compute doesn't lose the tuning — reopening restores
+// the last-used parameters.
+interface FvSaved {
+  method: Method; sigma: number; radius: number; sigma1: number; sigma2: number
+  threshold: number; minDist: number; subpixel: boolean; beamstop: boolean
+  beamstopDilate: number; showTransform: boolean
+}
+const _fvStore = new Map<number, FvSaved>()
+
+export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: Props) {
+  const saved = _fvStore.get(windowId)
+  const [method, setMethod] = React.useState<Method>(saved?.method ?? 'nxcorr')
+  const [sigma, setSigma] = React.useState(saved?.sigma ?? 1.0)
+  const [radius, setRadius] = React.useState(saved?.radius ?? 5)
+  const [sigma1, setSigma1] = React.useState(saved?.sigma1 ?? 0.8)
+  const [sigma2, setSigma2] = React.useState(saved?.sigma2 ?? 2.0)
+  const [threshold, setThreshold] = React.useState(saved?.threshold ?? 0.5)
+  const [minDist, setMinDist] = React.useState(saved?.minDist ?? 5)
+  const [subpixel, setSubpixel] = React.useState(saved?.subpixel ?? true)
+  const [beamstop, setBeamstop] = React.useState(saved?.beamstop ?? false)
+  const [beamstopDilate, setBeamstopDilate] = React.useState(saved?.beamstopDilate ?? 5)
+  const [showTransform, setShowTransform] = React.useState(saved?.showTransform ?? false)
   const [status, setStatus] = React.useState('Tune the parameters — peaks preview under the crosshair.')
+
+  React.useEffect(() => {
+    _fvStore.set(windowId, {
+      method, sigma, radius, sigma1, sigma2, threshold, minDist, subpixel,
+      beamstop, beamstopDilate, showTransform,
+    })
+  }, [windowId, method, sigma, radius, sigma1, sigma2, threshold, minDist,
+      subpixel, beamstop, beamstopDilate, showTransform])
 
   // Live refs so the debounced tune always sends the latest of EVERY control.
   const vals = React.useRef({ method, sigma, radius, sigma1, sigma2, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform })
@@ -94,14 +113,17 @@ export function FindVectorsWizard({ openUp, windowId, sendAction, onClose }: Pro
   }
 
   const compute = () => {
-    setStatus('Finding diffraction vectors…')
     sendAction('fv_run', params(), windowId)
+    // Compute collapses the caret back into the toolbar button (its tuned
+    // state is kept in _fvStore). The unmount fires fv_close, which only
+    // drops the live preview — the batch keeps running.
+    onClose()
   }
 
   const isDog = method === 'dog'
 
   return (
-    <WizardShell testid="find-vectors-wizard" title="Find Diffraction Vectors" openUp={openUp}
+    <WizardShell testid="find-vectors-wizard" title="Find Diffraction Vectors" posStyle={caretPos}
       onClose={onClose} closeTestid="fv-close" status={status} statusTestid="fv-status"
       width={320}>
       <div style={S.hint}>Move the crosshair on the navigator to preview the found peaks.</div>

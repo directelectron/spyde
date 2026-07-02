@@ -155,6 +155,12 @@ export interface SignalTypeInfoMessage extends MsgBase {
 export interface SelectorInfoMessage extends MsgBase {
   type: 'selector_info'
   window_id: number
+  /** Stable per-selector key — one navigator window can carry several
+   *  selectors, each its own dock row. Absent in older emits (fall back to
+   *  window_id). */
+  selector_id?: number
+  /** The selector's widget colour (the dock row's dot). */
+  color?: string | null
   mode?: 'crosshair' | 'integrate'
   title?: string
 }
@@ -164,6 +170,15 @@ export interface SignalTreeMessage extends MsgBase {
   window_id: number
   tree?: TreeNode
   active_signal_id?: number
+}
+
+export interface NavigatorOptionsMessage extends MsgBase {
+  type: 'navigator_options'
+  window_id: number
+  /** Named navigators of the window's tree — the chip strip (shown when ≥2). */
+  names?: string[]
+  /** The navigator currently displayed on the live figure. */
+  current?: string | null
 }
 
 export interface LogMessage extends MsgBase {
@@ -222,6 +237,7 @@ export type PlotAppMessage =
   | SignalTypeInfoMessage
   | SelectorInfoMessage
   | SignalTreeMessage
+  | NavigatorOptionsMessage
   | LogMessage
   | LogBackfillMessage
   | LogLevelMessage

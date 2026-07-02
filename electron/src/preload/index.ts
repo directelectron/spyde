@@ -1,7 +1,7 @@
 /**
  * preload/index.ts — contextBridge API exposed to the renderer.
  */
-import { contextBridge, ipcRenderer } from 'electron'
+import { contextBridge, ipcRenderer, webUtils } from 'electron'
 
 contextBridge.exposeInMainWorld('electron', {
   // OS platform ('darwin' | 'win32' | 'linux') — the renderer uses this to lay
@@ -119,6 +119,16 @@ contextBridge.exposeInMainWorld('electron', {
 
   /** Multi-select DIRECTORY picker (RETURNS paths) — for .zspy/.zarr folders. */
   pickFolders: (): Promise<string[]> => ipcRenderer.invoke('spyde:pick-folders'),
+
+  /** OS path of a dropped File (sandboxed renderers have no File.path) —
+   *  powers drag-and-drop of datasets (incl. .zspy folders) onto the MDI. */
+  pathForFile: (file: File): string | null => {
+    try {
+      return webUtils.getPathForFile(file) || null
+    } catch {
+      return null
+    }
+  },
 
   /** Forward an interaction event from an anyplotlib iframe to Python. */
   figureEvent: (figId: string, eventJson: string) =>

@@ -175,6 +175,10 @@ class WindowManagerMixin:
         _figs_forget(window_id)
         if hasattr(self, "_nav_selectors"):
             self._nav_selectors.pop(window_id, None)
+        if hasattr(self, "_nav_selectors_by_id"):
+            for sid, (wid, _sel) in list(self._nav_selectors_by_id.items()):
+                if wid == window_id:
+                    self._nav_selectors_by_id.pop(sid, None)
         # Prune the MDIManager's PlotWindow tracking so closed windows don't leak.
         try:
             self.mdi_manager.remove_plot_window(window_id)

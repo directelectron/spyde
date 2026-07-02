@@ -30,22 +30,6 @@ functions:
     function: spyde.actions.fft_action.FFTAction
     plot_dim: [ 2 ]
     toolbar_side: right
-  Select Navigator:
-    description: Selects the navigator for the data view.
-    icon: drawing/toolbars/icons/navigator.svg
-    function: spyde.actions.base.toggle_navigation_plots
-    plot_dim: [ 1, 2 ]
-    toolbar_side: right
-    navigation: True
-    toggle: True
-  Navigate Signal Tree:
-    description: Navigate the signal tree structure.
-    icon: drawing/toolbars/icons/signal_tree.svg
-    function: spyde.actions.base.toggle_signal_tree
-    plot_dim: [ 1, 2 ]
-    toolbar_side: right
-    navigation: False
-    toggle: True
   Rebin:
     description: Rebin the signal data to reduce its size.
     icon: drawing/toolbars/icons/rebin.svg

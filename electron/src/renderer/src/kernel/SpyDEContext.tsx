@@ -76,7 +76,17 @@ export interface Histogram {
 /** One application-log record streamed from the Python backend. */
 export interface LogEntry { level: string; name: string; area?: string; msg: string; time: number }
 
-export interface SelectorInfo { windowId: number; mode: 'crosshair' | 'integrate'; title: string }
+export interface SelectorInfo {
+  windowId: number
+  mode: 'crosshair' | 'integrate'
+  title?: string
+  /** Per-selector key (a navigator can carry several selectors). */
+  selectorId?: number
+  /** Widget colour — the dock row's dot. */
+  color?: string
+}
+/** The named navigators a navigator window offers (its top chip strip). */
+export interface NavigatorOptions { names: string[]; current?: string | null }
 export interface SubItem { name: string; color: string; vtype?: string; calculation?: string }
 export interface TreeNode { name: string; signal_id: number; children: TreeNode[] }
 export interface AxisRow {
@@ -97,6 +107,7 @@ interface State {
   selectors: Map<number, SelectorInfo>
   signalTrees: Map<number, TreeNode>
   signalTreeActive: Map<number, number>   // windowId → active node signal_id
+  navigatorOptions: Map<number, NavigatorOptions>   // navigator windowId → named navigators
   axes: Map<number, AxisRow[]>
   composition: Map<number, Composition>     // windowId → sample elements + percentages
   activeActions: Map<number, Set<string>>   // windowId → action names with live output
@@ -144,6 +155,7 @@ type Action =
   | { type: 'SIGNAL_TYPE'; windowIds: number[]; current: string; options: string[] }
   | { type: 'SELECTOR_INFO'; info: SelectorInfo }
   | { type: 'SIGNAL_TREE'; windowId: number; tree: TreeNode; activeSignalId?: number }
+  | { type: 'NAVIGATOR_OPTIONS'; windowId: number; names: string[]; current?: string | null }
   | { type: 'STREAM'; text: string; kind: 'stdout' | 'stderr' }
   | { type: 'LOG'; entry: LogEntry }
   | { type: 'LOG_BACKFILL'; entries: LogEntry[] }
@@ -262,16 +274,22 @@ function spydeReducer(state: State, action: Action): State {
       const activeWindowId = state.activeWindowId === action.windowId
         ? (newWindows.size ? [...newWindows.keys()][0] : null)
         : state.activeWindowId
+      // Selectors are keyed by selector_id (not window id) — prune every row
+      // whose OWNING window closed.
+      const selectors = new Map(
+        [...state.selectors].filter(([, s]) => s.windowId !== action.windowId),
+      )
       return {
         ...state,
         windows: newWindows,
-        selectors: drop(state.selectors),
+        selectors,
         histograms: drop(state.histograms),
         metadata: drop(state.metadata),
         axes: drop(state.axes),
         composition: drop(state.composition),
         signalTrees: drop(state.signalTrees),
         signalTreeActive: drop(state.signalTreeActive),
+        navigatorOptions: drop(state.navigatorOptions),
         activeActions: drop(state.activeActions),
         subItems: drop(state.subItems),
         activeWindowId,
@@ -328,9 +346,20 @@ function spydeReducer(state: State, action: Action): State {
     }
 
     case 'SELECTOR_INFO': {
+      // Keyed by selector_id when present (one row PER SELECTOR); merged so a
+      // mode-only re-emit (set_selector_mode) keeps the title/colour from the
+      // creation-time message.
       const selectors = new Map(state.selectors)
-      selectors.set(action.info.windowId, action.info)
+      const key = action.info.selectorId ?? action.info.windowId
+      const prev = selectors.get(key)
+      selectors.set(key, { ...prev, ...action.info })
       return { ...state, selectors }
+    }
+
+    case 'NAVIGATOR_OPTIONS': {
+      const navigatorOptions = new Map(state.navigatorOptions)
+      navigatorOptions.set(action.windowId, { names: action.names, current: action.current })
+      return { ...state, navigatorOptions }
     }
 
     case 'SIGNAL_TREE': {
@@ -420,6 +449,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     selectors: new Map(),
     signalTrees: new Map(),
     signalTreeActive: new Map(),
+    navigatorOptions: new Map(),
     axes: new Map(),
     activeActions: new Map(),
     subItems: new Map(),
@@ -629,8 +659,12 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
             type: 'SELECTOR_INFO',
             info: {
               windowId: msg.window_id,
+              selectorId: msg.selector_id,
               mode: msg.mode ?? 'crosshair',
-              title: msg.title ?? 'Navigator',
+              // Omit absent fields so the reducer's merge keeps the
+              // creation-time title/colour on a mode-only re-emit.
+              ...(msg.title != null ? { title: msg.title } : {}),
+              ...(msg.color != null ? { color: msg.color } : {}),
             },
           })
           break
@@ -644,6 +678,15 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
               activeSignalId: msg.active_signal_id,
             })
           }
+          break
+
+        case 'navigator_options':
+          dispatch({
+            type: 'NAVIGATOR_OPTIONS',
+            windowId: msg.window_id,
+            names: msg.names ?? [],
+            current: msg.current,
+          })
           break
 
         case 'log':

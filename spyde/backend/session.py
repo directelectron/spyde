@@ -235,6 +235,15 @@ class Session(
             log.warning("metadata emit failed: %s", e)
         self._emit_axes(tree)
         self._emit_signal_type(tree)
+        # The Workflow panel is always-on: push the (initial, single-node) tree
+        # for every window of this tree right away — it grows with transforms.
+        self._reemit_signal_tree(tree)
+        # …and the navigator chip strip (shown once a tree has ≥2 navigators).
+        try:
+            from spyde.actions.navigator_views import emit_navigator_options
+            emit_navigator_options(tree)
+        except Exception as e:
+            log.debug("navigator options emit failed: %s", e)
         try:
             from spyde.actions.composition import emit_composition
             emit_composition(tree, self._tree_window_ids(tree))
@@ -330,45 +339,70 @@ class Session(
         )
 
     def register_nav_selector(self, window_id: int, selector) -> None:
-        """Track a navigator's composite selector by its window id so the dock
-        can toggle its crosshair/integration mode."""
+        """Track a navigator's selectors so the dock can toggle each between
+        crosshair and integration modes. The FIRST selector of a window stays
+        the window-keyed fallback (back-compat callers address by window id);
+        every selector is also addressable by its ``selector_id`` (the dock's
+        per-row key — one navigator can carry several selectors)."""
         if not hasattr(self, "_nav_selectors"):
             self._nav_selectors = {}
-        self._nav_selectors[window_id] = selector
+        if not hasattr(self, "_nav_selectors_by_id"):
+            self._nav_selectors_by_id = {}
+        self._nav_selectors.setdefault(window_id, selector)
+        self._nav_selectors_by_id[id(selector)] = (window_id, selector)
 
-    def set_selector_mode(self, window_id: int, integrate: bool) -> None:
-        """Switch a navigator selector between crosshair and integrating mode."""
-        sel = getattr(self, "_nav_selectors", {}).get(window_id)
+    def set_selector_mode(self, window_id: int, integrate: bool,
+                          selector_id: int | None = None) -> None:
+        """Switch a navigator selector between crosshair and integrating mode.
+        ``selector_id`` addresses one selector of a multi-selector navigator;
+        without it the window's first selector is used."""
+        sel = None
+        if selector_id is not None:
+            window_id, sel = getattr(self, "_nav_selectors_by_id", {}).get(
+                selector_id, (window_id, None))
+        if sel is None:
+            sel = getattr(self, "_nav_selectors", {}).get(window_id)
         if sel is None or not hasattr(sel, "set_integrating"):
             return
         try:
             sel.set_integrating(bool(integrate))
+            # No title here — the dock merges by selector_id and keeps the
+            # title/colour from the creation-time selector_info.
             emit({
                 "type": "selector_info",
                 "window_id": window_id,
+                "selector_id": id(sel),
+                "color": getattr(sel, "color", None),
                 "mode": "integrate" if integrate else "crosshair",
-                "title": "Navigator",
             })
         except Exception as e:
             log.warning("set_selector_mode failed: %s", e)
 
     def _select_signal_node(self, plot, signal_id) -> None:
-        """Switch *plot* to display the signal-tree node with the given id
-        (emitted by toggle_signal_tree as id(node.signal))."""
+        """Switch to the signal-tree node with the given id (the id(node.signal)
+        emitted in the signal_tree message). The pick can come from ANY of the
+        tree's windows (the Workflow panel shows the tree for navigators too),
+        so search all of the tree's signal plots for the one holding the node."""
         if plot is None or signal_id is None:
             return
-        for sig in list(getattr(plot, "plot_states", {}).keys()):
-            if id(sig) == signal_id:
-                plot.set_plot_state(sig)
-                self._reemit_signal_tree(plot)
-                emit({"type": "status", "text": "Switched signal node"})
-                return
+        tree = getattr(plot, "signal_tree", None)
+        cands = [plot] + list(getattr(tree, "signal_plots", []) or [])
+        for p in cands:
+            for sig in list(getattr(p, "plot_states", {}) or {}):
+                if id(sig) == signal_id:
+                    from spyde.actions.lifecycle import show_tree_node
+                    show_tree_node(p, tree, sig)
+                    emit({"type": "status", "text": "Switched signal node"})
+                    return
 
-    def _reemit_signal_tree(self, plot) -> None:
-        """Re-push the workflow tree for *plot* (refreshes after a new node is
-        added by a transform, and highlights the active node). No-op if the tree
-        isn't available yet."""
-        tree = getattr(plot, "signal_tree", None) if plot is not None else None
+    def _reemit_signal_tree(self, plot_or_tree) -> None:
+        """Push the workflow tree to EVERY window of the tree (signal plots and
+        navigators alike) so the dock's Workflow section is populated whichever
+        of the tree's windows has focus. Called on tree creation and after every
+        transform / node switch. No-op if the tree isn't available yet."""
+        tree = plot_or_tree
+        if tree is not None and not hasattr(tree, "root_node"):
+            tree = getattr(plot_or_tree, "signal_tree", None)
         root_node = getattr(tree, "root_node", None) if tree is not None else None
         if root_node is None:
             return
@@ -378,14 +412,27 @@ class Session(
                 "name": node.name, "signal_id": id(node.signal),
                 "children": [node_to_dict(c) for c in node.children.values()],
             }
-        try:
-            active = id(plot.plot_state.current_signal)
-        except Exception:
-            active = None
-        emit({
-            "type": "signal_tree", "window_id": getattr(plot, "window_id", None),
-            "tree": node_to_dict(root_node), "active_signal_id": active, "visible": True,
-        })
+
+        # Active node = what the tree's signal plot displays (prefer the plot
+        # we were called with when it has a state).
+        active = None
+        cands = ([plot_or_tree] if hasattr(plot_or_tree, "plot_state") else []) \
+            + list(getattr(tree, "signal_plots", []) or [])
+        for p in cands:
+            st = getattr(p, "plot_state", None)
+            sig = getattr(st, "current_signal", None) if st is not None else None
+            if sig is not None:
+                active = id(sig)
+                break
+        payload = node_to_dict(root_node)
+        window_ids = self._tree_window_ids(tree) or \
+            ([getattr(plot_or_tree, "window_id", None)]
+             if getattr(plot_or_tree, "window_id", None) is not None else [])
+        for wid in window_ids:
+            emit({
+                "type": "signal_tree", "window_id": wid,
+                "tree": payload, "active_signal_id": active, "visible": True,
+            })
 
     # ── Plot update callbacks ──────────────────────────────────────────────────
 
