@@ -130,7 +130,6 @@ def build_refine_figure(infos: list[dict], *, cmap: str = _CMAP):
 
     fig_id = _electron.register(fig)
     html = finalize_figure_html(fig, fig_id)
-    _ALIVE.append(fig)
     return fig, fig_id, html, panels
 
 
@@ -173,10 +172,12 @@ def best_xy_for(infos, best_lib_idx: int):
     return {}
 
 
-def emit_refine_window(session, fig_id: str, html: str, *, title: str = "IPF Refine"):
+def emit_refine_window(session, fig, fig_id: str, html: str, *, title: str = "IPF Refine"):
     """Emit the refine-heatmap figure to a fresh window. Returns the window id."""
     from spyde.backend.ipc import emit
+    from spyde.actions.figure_registry import keep_alive
     wid = session.next_window_id()
+    keep_alive(int(wid), fig)
     emit({"type": "figure", "fig_id": fig_id, "window_id": int(wid),
           "html": html, "title": title, "is_navigator": False})
     return int(wid)

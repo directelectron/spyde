@@ -157,10 +157,16 @@ def _open_refine_ipf(session, dp_plot, signal, sim, cache, tree):
             return None
         _fig, fig_id, html, panels = build_refine_figure(infos)
         base = signal.metadata.get_item("General.title", "Signal")
-        emit_refine_window(session, fig_id, html, title=f"{base} — IPF Refine")
-        return RefineIpfController(
+        wid = emit_refine_window(session, _fig, fig_id, html,
+                                 title=f"{base} — IPF Refine")
+        ctrl = RefineIpfController(
             dp_plot, signal, sim, cache, infos, panels,
             gamma=DEFAULTS["gamma"], normalize=False).attach(tree)
+        # Give the bare-figure refine window a dispatch/teardown identity so
+        # ✕-closing it unhooks the navigator controller (see registry.py).
+        if ctrl is not None:
+            session.register_window_controller(wid, ctrl)
+        return ctrl
     except Exception as e:
         log.debug("refine IPF window failed: %s", e)
         return None
@@ -168,10 +174,13 @@ def _open_refine_ipf(session, dp_plot, signal, sim, cache, tree):
 
 def _create_blank_ipf_window(session, src, ny, nx):
     """Open a blank IPF-Z window up front (for the progressive fill-in)."""
-    new_sig = hs.signals.Signal2D(np.zeros((ny, nx), dtype=np.float32))
+    from spyde.actions.commit import open_result_tree
     base = src.metadata.get_item("General.title", "Signal")
-    new_sig.metadata.General.title = f"{base} — Orientation (IPF-Z)"
-    return session._add_signal(new_sig)
+    return open_result_tree(
+        session, title=f"{base} — Orientation (IPF-Z)",
+        data=np.zeros((ny, nx), dtype=np.float32),
+        provenance={"action": "Orientation Mapping", "source_title": base},
+    )
 
 
 def _finalize_ipf_window(tree, om) -> None:

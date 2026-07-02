@@ -21,9 +21,6 @@ from __future__ import annotations
 import logging
 import threading
 
-import numpy as np
-import hyperspy.api as hs
-
 from spyde.backend.ipc import emit, emit_status, emit_error
 from spyde.actions.context import src_plot_tree as _src_plot_tree
 from spyde.actions._common import reciprocal_radius as _reciprocal_radius
@@ -146,24 +143,22 @@ def vom_generate_library(session, plot, payload) -> None:
 def _build_ipf_heatmap(session, src, result, title="Orientation (IPF-Z, live)"):
     """Open just the IPF-Z map window (the live refine heatmap) + its 3-D
     explorer. The strain windows are added later by Compute Maps."""
-    ny, nx = result.nav_shape
+    from spyde.actions.commit import commit_result_tree
     base = src.metadata.get_item("General.title", "Signal")
-    new_sig = hs.signals.Signal2D(np.zeros((ny, nx), dtype=np.float32))
-    new_sig.metadata.General.title = f"{base} — {title}"
-    tree = session._add_signal(new_sig)
-    tree.vector_orientation = result
-    try:
-        ipf = result.ipf_color_map("z")
-        for sp in list(getattr(tree, "signal_plots", [])):
-            sp.needs_auto_level = True
-            sp.set_data(ipf)
+
+    def _attach(tree):
         from spyde.actions.ipf_view import attach_ipf_3d, attach_ipf_point_selector
         attach_ipf_3d(tree, result, "z")
         attach_ipf_point_selector(tree, result, "z")
-    except Exception as e:
-        import logging
-        logging.getLogger(__name__).debug("ipf heatmap build failed: %s", e)
-    return tree
+
+    return commit_result_tree(
+        session, title=f"{base} — {title}",
+        primary=result.ipf_color_map("z"),
+        attrs={"vector_orientation": result},
+        provenance={"action": "Vector Orientation Mapping",
+                    "source_title": base},
+        on_tree=_attach,
+    )
 
 
 def _emit_vom_fit(window_id, fit) -> None:
@@ -307,55 +302,21 @@ def _fit_field(vecs, lib, params):
 
 
 def _build_result_windows(session, src, result, *, smooth=False, with_ipf=True) -> None:
-    """Open three strain windows (εxx/εyy/εxy) and — unless the live IPF heatmap
-    already exists (``with_ipf=False``) — an IPF-Z orientation window (RGB)."""
-    ny, nx = result.nav_shape
+    """Commit the fitted field: a strain window (εxx signal plot + εyy/εxy as
+    chip-selectable views) and — unless the live IPF heatmap already exists
+    (``with_ipf=False``) — an IPF-Z orientation window (RGB)."""
+    from spyde.actions.commit import commit_result_tree
     base = src.metadata.get_item("General.title", "Signal")
 
-    def _window(title, data, rgb=False, levels=None):
-        new_sig = hs.signals.Signal2D(np.zeros((ny, nx), dtype=np.float32))
-        new_sig.metadata.General.title = f"{base} — {title}"
-        tree = session._add_signal(new_sig)
-        for sp in list(getattr(tree, "signal_plots", [])):
-            try:
-                sp.needs_auto_level = True
-                if levels is not None:
-                    sp.set_clim(*levels)
-                sp.set_data(data)
-            except Exception as e:
-                log.debug("painting vom window signal plot failed: %s", e)
-        return tree
-
     if with_ipf:
-        ipf = result.ipf_color_map(direction="z")        # (ny, nx, 3) uint8
-        otree = _window("Orientation (IPF-Z)", ipf, rgb=True)
-        otree.vector_orientation = result
-        # 3-D IPF explorer as a second figure → the window gets a 2D/3D toggle,
-        # plus the point selector → 3-D highlight.
-        try:
-            from spyde.actions.ipf_view import attach_ipf_3d, attach_ipf_point_selector
-            attach_ipf_3d(otree, result, direction="z")
-            attach_ipf_point_selector(otree, result, "z")
-        except Exception as e:
-            log.debug("attaching 3-D IPF explorer to vom result failed: %s", e)
+        _build_ipf_heatmap(session, src, result, title="Orientation (IPF-Z)")
 
-    # ── Strain: ONE window with εxx / εyy / εxy as chip-selectable views (the
-    #    unified chip-strip selector — ⌘-click to tile + compare). εxx is the
-    #    window's signal plot; εyy / εxy are extra tagged view figures.
     strain = result.smoothed_strain() if smooth else result.strain
-    mats = [(lbl, np.nan_to_num(strain[..., i].astype(np.float32)))
-            for lbl, i in (("εxx", 0), ("εyy", 1), ("εxy", 2))]
-    finite = [float(np.nanmax(np.abs(m))) for _, m in mats if np.isfinite(m).any()]
-    lim = (max(finite) if finite else 1.0) or 1.0
-    stree = _window("Strain", mats[0][1], levels=(-lim, lim))
-    sp = next(iter(getattr(stree, "signal_plots", [])), None)
-    if sp is not None:
-        sp.set_view_tag("εxx", "2d")
-        wid = getattr(sp, "window_id", None)
-        if wid is not None:
-            from spyde.actions.views import emit_view_figure, register_views
-            # Stash every component so ⌘-tiling can rebuild a side-by-side
-            # (anyplotlib multi-axis) figure for any selected subset.
-            register_views(wid, mats, levels=(-lim, lim))
-            for lbl, m in mats[1:]:
-                emit_view_figure(wid, m, lbl, kind="2d", levels=(-lim, lim))
+    commit_result_tree(
+        session, title=f"{base} — Strain",
+        primary=strain[..., 0], primary_label="εxx",
+        views=[("εyy", strain[..., 1]), ("εxy", strain[..., 2])],
+        levels="auto_sym",
+        provenance={"action": "Vector Orientation Mapping",
+                    "source_title": base, "params": {"smooth": bool(smooth)}},
+    )

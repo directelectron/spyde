@@ -17,11 +17,9 @@ import logging
 
 import numpy as np
 
-log = logging.getLogger(__name__)
+from spyde.actions.figure_registry import keep_alive
 
-# Keep figures alive past the emit so they are not garbage-collected while the
-# iframe is still mounted (the _electron registry holds a weak association only).
-_ALIVE: list = []
+log = logging.getLogger(__name__)
 
 
 def _as_orientation_map(result):
@@ -62,7 +60,6 @@ def build_ipf_3d_figure(xyz: np.ndarray, rgb: np.ndarray, highlight=None):
 
     fig_id = _electron.register(fig)
     html = finalize_figure_html(fig, fig_id)
-    _ALIVE.append(fig)
     return fig, fig_id, html, p3d
 
 
@@ -95,6 +92,7 @@ def emit_ipf_3d(window_id: int, result, direction: str = "z",
 
     _fig, fig_id, html, p3d = build_ipf_3d_figure(
         np.asarray(xyz), np.asarray(rgb), highlight=highlight)
+    keep_alive(int(window_id), _fig)
     if tree is not None:
         tree._ipf_p3d = p3d
     emit({
@@ -191,7 +189,6 @@ def build_ipf_key_figure(result, direction: str = "z", *, n: int = 120):
 
     fig_id = _electron.register(fig)
     html = finalize_figure_html(fig, fig_id)
-    _ALIVE.append(fig)
     return fig, fig_id, html
 
 
@@ -205,6 +202,7 @@ def emit_ipf_key(window_id: int, result, direction: str = "z") -> bool:
         import logging
         logging.getLogger(__name__).debug("ipf key figure failed: %s", e)
         return False
+    keep_alive(int(window_id), _fig)
     emit({
         "type": "figure", "fig_id": fig_id, "window_id": int(window_id),
         "html": html, "title": "IPF colour key", "is_navigator": False,

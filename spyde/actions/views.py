@@ -19,10 +19,9 @@ import logging
 
 import numpy as np
 
-logger = logging.getLogger(__name__)
+from spyde.actions.figure_registry import keep_alive
 
-# Keep emitted figures alive past the emit (the registry holds a weak ref only).
-_ALIVE: list = []
+logger = logging.getLogger(__name__)
 
 # window_id → {"images": {label: np.ndarray}, "order": [label,...],
 #              "cmap": str, "levels": (lo, hi) | None}
@@ -80,7 +79,7 @@ def emit_view_figure(window_id: int, image, label: str, *, kind: str = "2d",
 
         fig_id = _electron.register(fig)
         html = finalize_figure_html(fig, fig_id)
-        _ALIVE.append(fig)
+        keep_alive(window_id, fig)
         emit({
             "type": "figure", "fig_id": fig_id, "window_id": window_id,
             "html": html, "title": label, "is_navigator": False,
@@ -162,7 +161,7 @@ def build_tiled_figure(window_id: int, labels):
 
     fig_id = _electron.register(fig)
     html = finalize_figure_html(fig, fig_id)
-    _ALIVE.append(fig)
+    keep_alive(int(window_id), fig)
     return fig, fig_id, html, sel
 
 

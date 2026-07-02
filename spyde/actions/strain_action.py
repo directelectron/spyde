@@ -327,14 +327,27 @@ class StrainController:
         self.component = component
         update_strain_view(self.p, self.field, component)
 
-    def commit(self) -> None:
+    def commit(self):
         """Freeze the current strain field as a NEW SignalTree — εxx is the signal
         plot, εyy / εxy / ω ride along as chip-selectable view figures (same shape
         as the Vector-OM result window). The live window stays open for tuning."""
         if self.field is None or self.session is None:
-            return
-        from spyde.actions._common import STRAIN_TITLES
-        _commit_strain_tree(self.session, self.vecs, self.field, STRAIN_TITLES)
+            return None
+        from spyde.actions._common import STRAIN_TITLES as titles
+        from spyde.actions.commit import commit_result_tree
+        f = self.field
+        return commit_result_tree(
+            self.session, title="Strain",
+            primary=f.exx, primary_label=titles["exx"],
+            views=[(titles["eyy"], f.eyy), (titles["exy"], f.exy),
+                   (titles["omega"], f.omega)],
+            levels="auto_sym",
+            provenance={
+                "action": "Strain Mapping",
+                "params": {"ref_yx": list(self.ref_yx), "cif_mode": self.cif_mode,
+                           "match_radius_px": self.match_radius_px},
+            },
+        )
 
     def remove(self) -> None:
         """Tear down EVERYTHING the action added: the selection overlay, the
@@ -370,46 +383,6 @@ class StrainController:
         # Drop the back-reference so a later open rebuilds cleanly.
         if self.src_tree is not None and getattr(self.src_tree, "_strain_controller", None) is self:
             self.src_tree._strain_controller = None
-
-
-# ── commit: freeze the live field as a new SignalTree ─────────────────────────
-
-def _commit_strain_tree(session, vecs, field, titles) -> None:
-    """Add a new SignalTree carrying the strain field — εxx is the signal plot,
-    εyy / εxy / ω are chip-selectable view figures (mirrors the Vector-OM result
-    window via spyde.actions.views)."""
-    import hyperspy.api as hs
-    from spyde.actions.views import emit_view_figure, register_views
-
-    ny, nx = field.nav_shape
-    base = "Strain"
-    comps = [(titles["exx"], field.exx), (titles["eyy"], field.eyy),
-             (titles["exy"], field.exy), (titles["omega"], field.omega)]
-    mats = [(lbl, np.nan_to_num(np.asarray(m, np.float32))) for lbl, m in comps]
-    finite = [float(np.nanmax(np.abs(m))) for _, m in mats if np.isfinite(m).any()]
-    lim = (max(finite) if finite else 1.0) or 1.0
-
-    new_sig = hs.signals.Signal2D(mats[0][1].copy())
-    new_sig.metadata.General.title = base
-    tree = session._add_signal(new_sig)
-    sp = next(iter(getattr(tree, "signal_plots", [])), None)
-    if sp is not None:
-        sp.needs_auto_level = False
-        try:
-            sp.set_clim(-lim, lim)
-            sp.set_data(mats[0][1])
-        except Exception as e:
-            log.debug("painting committed strain signal plot failed: %s", e)
-        try:
-            sp.set_view_tag(titles["exx"], "2d")
-        except Exception as e:
-            log.debug("tagging committed strain view failed: %s", e)
-        wid = getattr(sp, "window_id", None)
-        if wid is not None:
-            register_views(wid, mats, levels=(-lim, lim))
-            for lbl, m in mats[1:]:
-                emit_view_figure(wid, m, lbl, kind="2d", levels=(-lim, lim))
-    return tree
 
 
 # ── toolbar entry (ActionContext convention: fn(ctx, ...)) ────────────────────
@@ -535,6 +508,8 @@ def strain_run(session, plot, payload) -> None:
             return   # superseded by a strain_stop or a newer strain_run
         _fig, fig_id, html, p = build_strain_figure(field, component="exx")
         wid = session.next_window_id()
+        from spyde.actions.figure_registry import keep_alive
+        keep_alive(int(wid), _fig)
         emit({"type": "figure", "fig_id": fig_id, "window_id": int(wid),
               "html": html, "title": "Strain (εxx)", "is_navigator": False,
               "strain_components": list(_COMPONENTS)})

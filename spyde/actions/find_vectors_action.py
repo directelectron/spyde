@@ -113,20 +113,20 @@ def _start_batch(session, plot, src_tree, p: dict):
     if not new_sig._lazy:
         new_sig._lazy = True
         new_sig._assign_subclass()
-    try:
-        new_sig.set_signal_type("spyde_diffraction_vectors_image")
-    except Exception as e:
-        log.debug("set_signal_type(diffraction_vectors_image) failed: %s", e)
     base_title = src.metadata.get_item("General.title", "Signal")
-    new_sig.metadata.General.title = f"{base_title} — Vectors"
 
     nav_sig = hs.signals.BaseSignal(np.zeros(nav_shape_full, dtype=np.float32)).T
     nav_sig.metadata.General.title = "Vector count map"
     _copy_nav_axes_to(src, nav_sig)
 
     from spyde.drawing.selectors import CrosshairSelector
-    new_tree = session._add_signal(
-        new_sig, navigator_override=nav_sig, selector_type=CrosshairSelector,
+    from spyde.actions.commit import open_result_tree
+    new_tree = open_result_tree(
+        session, title=f"{base_title} — Vectors", signal=new_sig,
+        signal_type="spyde_diffraction_vectors_image",
+        navigator_override=nav_sig, selector_type=CrosshairSelector,
+        provenance={"action": "Find Diffraction Vectors",
+                    "source_title": base_title, "params": dict(p)},
     )
 
     emit_status("Finding diffraction vectors…")
@@ -277,11 +277,6 @@ def build_vectors_result_tree(session, vecs, title: str = "Diffraction Vectors")
         data_shape, chunks=nav_chunks + sig_hw, dtype=np.float32,
     )
     new_sig = hs.signals.Signal2D(placeholder).as_lazy()
-    try:
-        new_sig.set_signal_type("spyde_diffraction_vectors_image")
-    except Exception as e:
-        log.debug("set_signal_type(diffraction_vectors_image) failed: %s", e)
-    new_sig.metadata.General.title = title
 
     nav_sig = hs.signals.BaseSignal(
         np.zeros(full_nav_shape, dtype=np.float32)).T
@@ -289,8 +284,12 @@ def build_vectors_result_tree(session, vecs, title: str = "Diffraction Vectors")
 
     _apply_axes_from_vecs(new_sig, nav_sig, vecs)
 
-    tree = session._add_signal(
-        new_sig, navigator_override=nav_sig, selector_type=CrosshairSelector,
+    from spyde.actions.commit import open_result_tree
+    tree = open_result_tree(
+        session, title=title, signal=new_sig,
+        signal_type="spyde_diffraction_vectors_image",
+        navigator_override=nav_sig, selector_type=CrosshairSelector,
+        provenance={"action": "Find Diffraction Vectors", "source": "loaded"},
     )
     _finalize(tree, vecs)
     return tree

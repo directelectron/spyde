@@ -21,10 +21,9 @@ from spyde.actions.ipf_view import _as_orientation_map
 
 # NB: named `logger` (not `log`) — build_ipf_density_figure has a `log: bool`
 # param for log-scale density that would otherwise shadow a module-level `log`.
-logger = logging.getLogger(__name__)
+from spyde.actions.figure_registry import keep_alive
 
-# Keep figures alive past the emit (the _electron registry holds only a weak ref).
-_ALIVE: list = []
+logger = logging.getLogger(__name__)
 
 
 def _sector_limits(xy_edges: np.ndarray):
@@ -96,7 +95,6 @@ def build_ipf_density_figure(result, direction: str = "z", *,
 
     fig_id = _electron.register(fig)
     html = finalize_figure_html(fig, fig_id)
-    _ALIVE.append(fig)
     return fig, fig_id, html
 
 
@@ -109,6 +107,7 @@ def emit_ipf_density(window_id: int, result, direction: str = "z", **kw) -> bool
     except Exception as e:
         logger.debug("ipf density build failed: %s", e)
         return False
+    keep_alive(int(window_id), _fig)
     emit({
         "type": "figure", "fig_id": fig_id, "window_id": int(window_id),
         "html": html, "title": "IPF density", "is_navigator": False,
