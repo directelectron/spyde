@@ -16,7 +16,6 @@ removed in the Qt-removal cleanup.
 from __future__ import annotations
 
 import logging
-import threading
 
 import numpy as np
 
@@ -105,7 +104,8 @@ def czb_auto(session, plot, payload) -> None:
             emit_error(f"Center Zero Beam (auto) failed: {e}")
             log.exception("Center Zero Beam (auto) failed")
 
-    threading.Thread(target=_work, daemon=True, name="czb-auto").start()
+    from spyde.actions.lifecycle import run_on_worker
+    run_on_worker(session, _work, name="czb-auto")
 
 
 def czb_manual_start(session, plot, payload) -> None:
@@ -115,6 +115,8 @@ def czb_manual_start(session, plot, payload) -> None:
     signal = _current_signal(src)
     plot2d = getattr(src, "_plot2d", None) if src is not None else None
     if plot2d is None or signal is None:
+        emit_error("Center Zero Beam: no active diffraction plot to place the "
+                   "crosshair on")
         return
     sig_ax = signal.axes_manager.signal_axes
     w, h = int(sig_ax[0].size), int(sig_ax[1].size)
@@ -202,4 +204,5 @@ def czb_manual(session, plot, payload) -> None:
             emit_error(f"Center Zero Beam (manual) failed: {e}")
             log.exception("Center Zero Beam (manual) failed")
 
-    threading.Thread(target=_work, daemon=True, name="czb-manual").start()
+    from spyde.actions.lifecycle import run_on_worker
+    run_on_worker(session, _work, name="czb-manual")

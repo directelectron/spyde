@@ -258,7 +258,8 @@ class TestStrainAction:
         counter should let only the LATEST strain_run's window survive."""
         import threading
         import spyde.backend.ipc as ipc
-        from spyde.actions.strain_action import strain_run, strain_stop, _CONTROLLERS
+        from spyde.actions.strain_action import strain_run, strain_stop
+        from spyde.backend.session import Session as _RealSession
 
         vecs = _MockVecsCM((6, 6), lambda iy, ix: np.array([[1 + 0.01 * ix, 0.0],
                                                             [0.0, 1.0]]))
@@ -268,6 +269,11 @@ class TestStrainAction:
         class _Session:
             _w = 0
             signal_trees: list = []
+            # the real controller registry, bound onto the stub
+            register_window_controller = _RealSession.register_window_controller
+            controller_by_window_id = _RealSession.controller_by_window_id
+            def __init__(self):
+                self._window_controllers = {}
             def next_window_id(self):
                 self._w += 1
                 return self._w
@@ -297,8 +303,8 @@ class TestStrainAction:
         assert len(fig_msgs) == 1, f"expected 1 strain figure, got {len(fig_msgs)}"
         ctrl = getattr(tree, "_strain_controller", None)
         assert ctrl is not None
-        assert len(_CONTROLLERS) == 1
-        assert _CONTROLLERS[ctrl.window_id] is ctrl
+        assert len(session._window_controllers) == 1
+        assert session.controller_by_window_id(ctrl.window_id) is ctrl
 
     def test_controller_cif_reference_then_region(self):
         import anyplotlib as apl
@@ -361,7 +367,7 @@ class TestStrainAction:
         The strain window is a bare `figure`, not a registered Plot, so
         `plot` is None and _ctrl_for can only resolve via
         payload["window_id"] — dispatch_action must inject it there itself."""
-        from spyde.actions.strain_action import StrainController, _CONTROLLERS
+        from spyde.actions.strain_action import StrainController
         from spyde.actions.strain_mapping import compute_strain_field
         session = window["window"]
 
@@ -373,7 +379,7 @@ class TestStrainAction:
         ctrl = StrainController(vecs, p, window_id=777, ref_yx=(0, 0), session=session)
         ctrl.field = compute_strain_field(vecs, (0, 0))
         ctrl.attach()
-        assert _CONTROLLERS[777] is ctrl
+        assert session.controller_by_window_id(777) is ctrl
         assert ctrl.component == "exx"
 
         # Exactly how the renderer sends it: payload has NO window_id key.
@@ -523,7 +529,7 @@ class TestStrainAction:
         ctrl = StrainController(vecs, p, window_id=4242, ref_yx=(0, 0),
                                 session=session)
         ctrl.field = compute_strain_field(vecs, (0, 0))   # pre-set like strain_run
-        ctrl.attach()                                     # registers in _CONTROLLERS (skips recompute)
+        ctrl.attach()    # registers in session._window_controllers (skips recompute)
         assert ctrl.field is not None
         # Dispatch by window_id (the strain window is not a registered Plot, so
         # plot is None — the handler resolves the controller from the registry).

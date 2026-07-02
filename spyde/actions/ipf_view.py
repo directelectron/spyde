@@ -238,6 +238,8 @@ def attach_ipf_point_selector(tree, result, direction: str = "z") -> None:
     plot2d = getattr(sp, "_plot2d", None) if sp is not None else None
     wid = getattr(sp, "window_id", None)
     if plot2d is None or wid is None:
+        log.warning("IPF point selector skipped: the map window has no live "
+                    "2-D plot yet (plot2d=%r window_id=%r)", plot2d, wid)
         return
     try:
         ny, nx = int(result.nav_shape[0]), int(result.nav_shape[1])

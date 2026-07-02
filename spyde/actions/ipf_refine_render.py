@@ -289,6 +289,11 @@ class RefineIpfController:
         except Exception as e:
             log.debug("wiring refine panel double-click failed: %s", e)
 
+    def close(self):
+        """WindowController protocol — Session._forget_window calls this when
+        the refine window goes away (✕, wizard replaced, tree close)."""
+        self.remove()
+
     def remove(self):
         for sel in self._selectors:
             if self._on_indices in sel.index_hooks:

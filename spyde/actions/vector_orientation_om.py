@@ -19,7 +19,6 @@ the Qt-removal cleanup.
 from __future__ import annotations
 
 import logging
-import threading
 
 from spyde.backend.ipc import emit, emit_status, emit_error
 from spyde.actions.context import src_plot_tree as _src_plot_tree
@@ -35,7 +34,43 @@ DEFAULTS = dict(
     smooth=False,
 )
 
+from spyde.actions.wizard import WizardController
 
+
+class VomWizard(WizardController):
+    """Owns the Vector-Orientation wizard state: the .cif phase, the diffsims
+    simulation + per-template g-vector library, the live refine overlay on the
+    source DP, the Refine-tab weights, and the Generate-time field cache."""
+
+    key = "vom"
+
+    def __init__(self, session, tree, *, phase, sim, lib, overlay,
+                 voltage, recip_r, strain_cap, sink_bw=None):
+        super().__init__(session, tree)
+        self.phase = phase
+        self.sim = sim
+        self.lib = lib
+        self.overlay = overlay
+        self.voltage = voltage
+        self.recip_r = recip_r
+        self.strain_cap = strain_cap
+        self.sink_bw = sink_bw
+        self.gamma = None
+        self.k_power = None
+        self.field = None
+
+    def remove(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self.overlay is not None and hasattr(self.overlay, "remove"):
+            try:
+                self.overlay.remove()
+            except Exception as e:
+                log.debug("removing VOM wizard overlay failed: %s", e)
+        self.overlay = None
+        if getattr(self.tree, "_vom_wizard", None) is self:
+            self.tree._vom_wizard = None
 
 
 def vector_orientation_mapping(ctx, action_name: str = "Vector Orientation Mapping", **kwargs):
@@ -53,6 +88,13 @@ def vom_generate_library(session, plot, payload) -> None:
         emit_error("Vector Orientation: no active dataset")
         return
     if getattr(tree, "diffraction_vectors", None) is None:
+        # Find Vectors may still be attaching (its batch finalizes on a worker
+        # thread) — wait it out and re-dispatch instead of erroring in the gap.
+        from spyde.actions.lifecycle import wait_for_vectors
+        if wait_for_vectors(session, plot,
+                            lambda: vom_generate_library(session, plot, payload),
+                            what="Vector Orientation", strict=True):
+            return
         emit_error("Vector Orientation: run Find Diffraction Vectors first")
         return
     cif_path = payload.get("cif_path")
@@ -91,13 +133,14 @@ def vom_generate_library(session, plot, payload) -> None:
             # the measured vectors (red) under the crosshair (Qt parity). The
             # overlay's on_fit callback streams the strain/residual readout to
             # the wizard's Refine tab as the crosshair (or a slider) moves.
-            overlay = None
+            # A regenerated library replaces the previous wizard wholesale.
             old = getattr(tree, "_vom_wizard", None)
-            if old is not None and old.get("overlay") is not None:
+            if old is not None and hasattr(old, "remove"):
                 try:
-                    old["overlay"].remove()
+                    old.remove()
                 except Exception as e:
-                    log.debug("removing prior vom overlay failed: %s", e)
+                    log.debug("removing prior VOM wizard failed: %s", e)
+            overlay = None
             wid = getattr(src, "window_id", None)
             try:
                 from spyde.actions.vector_overlay import attach_vector_orientation_overlay
@@ -107,11 +150,12 @@ def vom_generate_library(session, plot, payload) -> None:
                 import logging
                 logging.getLogger(__name__).debug("vom overlay attach failed: %s", e)
 
-            tree._vom_wizard = {
-                "phase": phase, "sim": sim, "lib": lib, "overlay": overlay,
-                "voltage": voltage, "recip_r": recip_r,
-                "strain_cap": DEFAULTS["strain_cap"], "sink_bw": None,
-            }
+            wiz = VomWizard(
+                session, tree, phase=phase, sim=sim, lib=lib, overlay=overlay,
+                voltage=voltage, recip_r=recip_r,
+                strain_cap=DEFAULTS["strain_cap"], sink_bw=None,
+            )
+            tree._vom_wizard = wiz
             emit_status(f"Vector Orientation: library ready ({n_templates} templates) "
                         f"— computing live IPF map…")
             emit({"type": "vom_library_ready",
@@ -129,7 +173,7 @@ def vom_generate_library(session, plot, payload) -> None:
                 # Field cached with default weights → (strain_cap, gamma, k_power,
                 # sink_bw); Compute re-fits only if the Refine tab changed any.
                 tree._vom_field_sig = (DEFAULTS["strain_cap"], None, None, None)
-                tree._vom_wizard["field"] = field
+                wiz.field = field
                 _build_ipf_heatmap(session, root, field)
                 emit_status("Vector Orientation: live IPF ready — refine, or "
                             "Compute Maps for the strain maps")
@@ -137,7 +181,8 @@ def vom_generate_library(session, plot, payload) -> None:
             emit_error(f"Generate Library failed: {e}")
             log.exception("Generate Library failed")
 
-    threading.Thread(target=_work, daemon=True, name="vom-generate-library").start()
+    from spyde.actions.lifecycle import run_on_worker
+    run_on_worker(session, _work, name="vom-generate-library")
 
 
 def _build_ipf_heatmap(session, src, result, title="Orientation (IPF-Z, live)"):
@@ -184,22 +229,23 @@ def vom_refine(session, plot, payload) -> None:
     and streams the new strain readout via ``_emit_vom_fit``."""
     src, tree = _src_plot_tree(session, plot)
     wiz = getattr(tree, "_vom_wizard", None) if tree is not None else None
-    if not wiz or wiz.get("overlay") is None:
+    if wiz is None or wiz.overlay is None:
         return
     params = {}
     for key in ("strain_cap", "sink_bw", "gamma", "k_power"):
         if payload.get(key) is not None:
             params[key] = float(payload[key])
-            wiz[key] = params[key]
+            setattr(wiz, key, params[key])
 
     def _work():
         try:
-            wiz["overlay"].set_params(**params)
+            wiz.overlay.set_params(**params)
         except Exception as e:
             import logging
             logging.getLogger(__name__).debug("vom_refine failed: %s", e)
 
-    threading.Thread(target=_work, daemon=True, name="vom-refine").start()
+    from spyde.actions.lifecycle import run_on_worker
+    run_on_worker(session, _work, name="vom-refine")
 
 
 def vom_run(session, plot, payload) -> None:
@@ -207,23 +253,28 @@ def vom_run(session, plot, payload) -> None:
     already-built library → an IPF-Z window + εxx / εyy / εxy strain windows."""
     src, tree = _src_plot_tree(session, plot)
     wiz = getattr(tree, "_vom_wizard", None) if tree is not None else None
-    if not wiz or wiz.get("lib") is None:
+    if wiz is None or wiz.lib is None:
         emit_error("Compute Maps: generate the library first")
         return
     vecs = getattr(tree, "diffraction_vectors", None)
     if vecs is None:
+        from spyde.actions.lifecycle import wait_for_vectors
+        if wait_for_vectors(session, plot,
+                            lambda: vom_run(session, plot, payload),
+                            what="Compute Maps", strict=True):
+            return
         emit_error("Compute Maps: no diffraction vectors on this tree")
         return
-    lib = wiz["lib"]
+    lib = wiz.lib
     strain_cap = float(payload.get("strain_cap", DEFAULTS["strain_cap"]))
-    sink_bw = payload.get("sink_bw", wiz.get("sink_bw"))
+    sink_bw = payload.get("sink_bw", wiz.sink_bw)
     smooth = bool(payload.get("smooth", DEFAULTS["smooth"]))
     fit_params = dict(strain_cap=strain_cap)
     if sink_bw is not None:
         fit_params["sink_bw"] = float(sink_bw)
     # Reflection-weighting knobs (gamma / |g| lever-arm) from the Refine tab.
     for key in ("gamma", "k_power"):
-        val = payload.get(key, wiz.get(key))
+        val = payload.get(key, getattr(wiz, key, None))
         if val is not None:
             fit_params[key] = float(val)
     # Signature for the Generate-time field cache: re-fit if any weight changed.
@@ -264,7 +315,8 @@ def vom_run(session, plot, payload) -> None:
             emit_error(f"Compute Maps failed: {e}")
             log.exception("Compute Maps failed")
 
-    threading.Thread(target=_work, daemon=True, name="vom-run").start()
+    from spyde.actions.lifecycle import run_on_worker
+    run_on_worker(session, _work, name="vom-run")
 
 
 def _fit_field(vecs, lib, params):

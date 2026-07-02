@@ -115,8 +115,8 @@ def fv_batch_running(session) -> bool:
 
 
 def wait_for_vectors(session, plot, then: Callable[[], None], *, what: str,
-                     grace: float = 6.0, timeout: float = 300.0,
-                     status_every: float = 5.0) -> bool:
+                     strict: bool = False, grace: float = 6.0,
+                     timeout: float = 300.0, status_every: float = 5.0) -> bool:
     """Wait out the find-vectors attach gap, then re-dispatch.
 
     Find Vectors attaches ``tree.diffraction_vectors`` only when its batch
@@ -126,6 +126,12 @@ def wait_for_vectors(session, plot, then: Callable[[], None], *, what: str,
     waits up to *timeout* (with a periodic status ping); with nothing running
     it gives the brief post-attach window *grace* seconds, then errors.
 
+    ``strict=True`` fires only when the CLICKED plot's own tree gets vectors —
+    required when the caller's gate checks that tree specifically (Vector VI,
+    Vector OM), otherwise vectors on a *different* tree would fire ``then``
+    into the same gate and re-wait forever. The default (any-tree fallback)
+    matches handlers that resolve via :func:`resolve_vectors` (Strain).
+
     Returns True if a wait was started (the caller must return immediately);
     False when there is no event loop to wait on (bare test stubs) — the
     caller should emit its own error then.
@@ -134,11 +140,17 @@ def wait_for_vectors(session, plot, then: Callable[[], None], *, what: str,
     if getattr(session, "_dispatch_to_main", None) is None:
         return False
 
+    def _poll():
+        if strict:
+            t = getattr(plot, "signal_tree", None) if plot is not None else None
+            return getattr(t, "diffraction_vectors", None) if t is not None else None
+        return resolve_vectors(session, plot)[1]
+
     def _wait():
         waited = 0.0
         status_at = 0.0
         while True:
-            _, v = resolve_vectors(session, plot)
+            v = _poll()
             if v is not None:
                 session._dispatch_to_main(then)
                 return

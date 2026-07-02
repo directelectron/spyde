@@ -547,6 +547,11 @@ class BaseSignalTree:
 
     def close(self) -> None:
         """Release tree-held resources. Plot windows are torn down by Session."""
+        # Re-entrancy guard: closing the strain controller below closes its
+        # reference window, whose last-window teardown can re-enter close().
+        if getattr(self, "_spyde_closed", False):
+            return
+        self._spyde_closed = True
         if hasattr(self, "_nav_stop"):
             self._nav_stop.set()
         # Release the progressive-navigator shared-memory segment (created in
@@ -565,10 +570,41 @@ class BaseSignalTree:
             except Exception as e:
                 logger.debug("unlinking navigator shm on close failed: %s", e)
             self._nav_shm = None
+        # Interactive action state living on the tree: controllers and overlays
+        # own windows / navigator hooks — give them a real teardown; results,
+        # caches and back-references just drop so nothing leaks past the tree.
+        ctrl = getattr(self, "_strain_controller", None)
+        if ctrl is not None:
+            try:
+                ctrl.remove()
+            except Exception as e:
+                logger.debug("removing strain controller on tree close failed: %s", e)
+            self._strain_controller = None
+        for attr in ("_fv_preview", "_vector_overlay", "_result_vector_overlay",
+                     "_orientation_overlay"):
+            ov = getattr(self, attr, None)
+            if ov is not None and hasattr(ov, "remove"):
+                try:
+                    ov.remove()
+                except Exception as e:
+                    logger.debug("removing %s on tree close failed: %s", attr, e)
+            if hasattr(self, attr):
+                setattr(self, attr, None)
+        for wiz_attr in ("_om_wizard", "_vom_wizard"):
+            wiz = getattr(self, wiz_attr, None)
+            if wiz is not None and hasattr(wiz, "remove"):
+                try:
+                    wiz.remove()
+                except Exception as e:
+                    logger.debug("removing %s on tree close failed: %s", wiz_attr, e)
+            if hasattr(self, wiz_attr):
+                setattr(self, wiz_attr, None)
         self.signal_plots = []
         self.navigator_signals = {}
         self.navigator_plot_manager = None
-        for attr in ("diffraction_vectors", "orientation_map", "vector_orientation"):
+        for attr in ("diffraction_vectors", "orientation_map", "vector_orientation",
+                     "_vom_field", "_ipf_result", "_ipf_p3d", "_ipf_picker",
+                     "_render_frame_fn"):
             if hasattr(self, attr):
                 try:
                     setattr(self, attr, None)

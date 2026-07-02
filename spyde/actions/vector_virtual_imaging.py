@@ -320,7 +320,15 @@ def add_vector_virtual_image(ctx, action_name: str = "Add Vector Virtual Image",
     plot = ctx.plot
     session = ctx.session
     if getattr(getattr(plot, "signal_tree", None), "diffraction_vectors", None) is None:
+        # Find Vectors may still be attaching (its batch finalizes on a worker
+        # thread) — wait it out and re-dispatch instead of erroring in the gap.
         from spyde.backend.ipc import emit_error
+        from spyde.actions.lifecycle import wait_for_vectors
+        if wait_for_vectors(session, plot,
+                            lambda: add_vector_virtual_image(
+                                ctx, action_name=action_name, **params),
+                            what="Vector Virtual Imaging", strict=True):
+            return None
         emit_error("Vector Virtual Imaging: this signal has no diffraction vectors")
         return None
 

@@ -190,17 +190,30 @@ class ActionRouterMixin:
             # plain function (legacy style). Both receive the same ActionContext.
             from spyde.actions.action import Action
             if isinstance(target, type) and issubclass(target, Action):
-                result = target(ctx).run(**params)
+                inst = target(ctx)
+                result = inst.run(**params)
+                # Keep the Action instance with its artifacts so per-item caret
+                # edits (update_vi → update_live_params) can reach it.
+                self._track_action_artifacts(plot, name, result, action=inst)
             else:
                 result = target(ctx, action_name=name, **params)
-            self._track_action_artifacts(plot, name, result)
+                self._track_action_artifacts(plot, name, result)
         except Exception as e:
             emit_error(f"Action '{name}' failed: {e}")
             log.exception("Action '%s' failed", name)
+            # Un-light the toolbar button: the renderer may have optimistically
+            # marked a toggle action active on click; a failed action must not
+            # leave it lit with no backend artifact behind it.
+            wid = getattr(plot, "window_id", None)
+            if wid is not None and name:
+                ipc.emit({"type": "action_active", "window_id": wid,
+                          "name": name, "active": False})
 
-    def _track_action_artifacts(self, src_plot, name: str, result) -> None:
+    def _track_action_artifacts(self, src_plot, name: str, result, action=None) -> None:
         """Remember the selector + output windows a RegionAction created so the
-        toolbar can mark the action 'active' and hide them again on deselect."""
+        toolbar can mark the action 'active' and hide them again on deselect.
+        ``action`` (the Action instance) rides along so update_vi can call its
+        ``update_live_params``."""
         if result is None or not hasattr(result, "active_children"):
             return
         src_wid = getattr(src_plot, "window_id", None)
@@ -210,7 +223,10 @@ class ActionRouterMixin:
             c.window_id for c in getattr(result, "active_children", [])
             if getattr(c, "window_id", None) is not None
         })
-        self._action_artifacts[(src_wid, name)] = {"selector": result, "out_wids": out_wids}
+        art = {"selector": result, "out_wids": out_wids}
+        if action is not None:
+            art["action"] = action
+        self._action_artifacts[(src_wid, name)] = art
         ipc.emit({"type": "action_active", "window_id": src_wid, "name": name, "active": True})
 
     def _set_overlay(self, plot, name: str, visible: bool) -> None:
@@ -231,12 +247,12 @@ class ActionRouterMixin:
         elif name == "Orientation Mapping":
             overlays.append(getattr(tree, "_orientation_overlay", None))
             wiz = getattr(tree, "_om_wizard", None)
-            if wiz:
-                overlays.append(wiz.get("overlay"))
+            if wiz is not None:
+                overlays.append(getattr(wiz, "overlay", None))
         elif name == "Vector Orientation Mapping":
             wiz = getattr(tree, "_vom_wizard", None)
-            if wiz:
-                overlays.append(wiz.get("overlay"))
+            if wiz is not None:
+                overlays.append(getattr(wiz, "overlay", None))
         for ov in overlays:
             if ov is not None and hasattr(ov, "set_visible"):
                 try:

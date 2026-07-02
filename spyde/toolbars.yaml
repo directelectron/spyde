@@ -58,7 +58,7 @@ functions:
         name: Scale Y
         type: int
         default: 2
-    function: spyde.actions.base.rebin2d
+    function: spyde.actions.base.Rebin2DAction
     plot_dim: [ 2 ]
     toolbar_side: bottom
     navigation: False
@@ -235,6 +235,7 @@ functions:
     icon: drawing/toolbars/icons/virtual_image_color.svg
     function: spyde.actions.vector_virtual_imaging.vector_virtual_imaging
     signal_types: [spyde_diffraction_vectors_image]
+    requires_vectors: True
     plot_dim: [2]
     toolbar_side: bottom
     navigation: False
@@ -262,6 +263,7 @@ functions:
     icon: drawing/toolbars/icons/orientation_mapping.svg
     function: spyde.actions.vector_orientation_om.vector_orientation_mapping
     signal_types: [spyde_diffraction_vectors_image]
+    requires_vectors: True
     plot_dim: [2]
     toolbar_side: bottom
     navigation: False
@@ -272,6 +274,7 @@ functions:
     icon: drawing/toolbars/icons/strain.svg
     function: spyde.actions.strain_action.strain_mapping
     signal_types: [spyde_diffraction_vectors_image]
+    requires_vectors: True
     plot_dim: [2]
     toolbar_side: bottom
     navigation: False

@@ -18,6 +18,7 @@ import numpy as np
 log = logging.getLogger(__name__)
 import hyperspy.api as hs
 
+from spyde.actions.action import TransformAction
 from spyde.drawing.update_functions import get_fft
 from spyde.drawing.selectors import RectangleSelector
 
@@ -174,24 +175,21 @@ def select_signal_node(toolbar: "ActionContext", signal_id: int = None, *args, *
 
 # ── Rebin ────────────────────────────────────────────────────────────────────
 
-def rebin2d(toolbar: "ActionContext", scale_x: int = None, scale_y: int = None,
-            *args, **kwargs):
-    """Rebin the 2-D signal by (scale_x, scale_y)."""
-    if scale_x is None:
-        scale_x = int(toolbar.params.get("scale_x", 2))
-    if scale_y is None:
-        scale_y = int(toolbar.params.get("scale_y", 2))
+class Rebin2DAction(TransformAction):
+    """Rebin the 2-D signal by (scale_x, scale_y) — a TransformAction: the
+    template resolves the params, runs hyperspy ``rebin`` and adds the
+    "Binned" node (+ PlotState) to the SAME tree automatically."""
 
-    current_selected_signal = toolbar.plot.plot_state.current_signal
-    num_nav_axes = current_selected_signal.axes_manager.navigation_dimension
-    if current_selected_signal.axes_manager.signal_dimension != 2:
-        raise RuntimeError("Current signal is not 2D, cannot rebin2d.")
+    name = "Rebin"
+    method = "rebin"
+    node_name = "Binned"
+    parameters = {
+        "scale_x": {"default": 2},
+        "scale_y": {"default": 2},
+    }
 
-    scale = [1] * num_nav_axes + [scale_x, scale_y]
-
-    return toolbar.plot.signal_tree.add_transformation(
-        parent_signal=current_selected_signal,
-        method="rebin",
-        node_name="Binned",
-        scale=scale,
-    )
+    def build_kwargs(self, signal, scale_x=2, scale_y=2, **_):
+        if signal.axes_manager.signal_dimension != 2:
+            raise RuntimeError("Current signal is not 2D, cannot rebin2d.")
+        nav = signal.axes_manager.navigation_dimension
+        return {"scale": [1] * nav + [int(scale_x), int(scale_y)]}
