@@ -223,7 +223,7 @@ class _MockVecsCM(_MockVecs):
 class TestStrainAction:
     def test_strain_run_emits_window_and_attaches_controller(self):
         import spyde.backend.ipc as ipc
-        from spyde.actions.strain_action import strain_run
+        from spyde.actions.strain_action import strain_open
 
         vecs = _MockVecsCM((6, 6), lambda iy, ix: np.array([[1 + 0.01 * ix, 0.0],
                                                             [0.0, 1.0]]))
@@ -235,7 +235,7 @@ class TestStrainAction:
         cap, orig = [], ipc.emit
         ipc.emit = lambda m: cap.append(m)
         try:
-            strain_run(session, plot, {})
+            strain_open(session, plot, {})
         finally:
             ipc.emit = orig
 
@@ -251,14 +251,14 @@ class TestStrainAction:
 
     def test_strict_mode_double_mount_builds_only_one_controller(self):
         """React StrictMode mounts the wizard TWICE synchronously (mount →
-        cleanup → remount) on every open, firing strain_run, strain_stop,
-        strain_run right in a row — before either strain_run's worker thread
-        has finished (see strain_run's _strain_run_gen comment). Both calls
+        cleanup → remount) on every open, firing strain_open, strain_close,
+        strain_open right in a row — before either strain_open's worker thread
+        has finished (see strain_open's _strain_run_gen comment). Both calls
         must NOT end up building a live StrainController: the generation
-        counter should let only the LATEST strain_run's window survive."""
+        counter should let only the LATEST strain_open's window survive."""
         import threading
         import spyde.backend.ipc as ipc
-        from spyde.actions.strain_action import strain_run, strain_stop
+        from spyde.actions.strain_action import strain_open, strain_close
         from spyde.backend.session import Session as _RealSession
 
         vecs = _MockVecsCM((6, 6), lambda iy, ix: np.array([[1 + 0.01 * ix, 0.0],
@@ -286,11 +286,11 @@ class TestStrainAction:
         ipc.emit = lambda m: cap.append(m)
         try:
             # The exact StrictMode sequence: run, stop, run — all synchronous,
-            # before any of strain_run's background "strain-run" threads land.
-            strain_run(session, plot, {})
-            strain_stop(session, plot, {})
-            strain_run(session, plot, {})
-            # Let both strain_run compute threads finish and dispatch back.
+            # before any of strain_open's background "strain-run" threads land.
+            strain_open(session, plot, {})
+            strain_close(session, plot, {})
+            strain_open(session, plot, {})
+            # Let both strain_open compute threads finish and dispatch back.
             for t in threading.enumerate():
                 if t.name == "strain-run":
                     t.join(timeout=5.0)
@@ -528,7 +528,7 @@ class TestStrainAction:
         p = ax.imshow(np.zeros((4, 4), "f4"))
         ctrl = StrainController(vecs, p, window_id=4242, ref_yx=(0, 0),
                                 session=session)
-        ctrl.field = compute_strain_field(vecs, (0, 0))   # pre-set like strain_run
+        ctrl.field = compute_strain_field(vecs, (0, 0))   # pre-set like strain_open
         ctrl.attach()    # registers in session._window_controllers (skips recompute)
         assert ctrl.field is not None
         # Dispatch by window_id (the strain window is not a registered Plot, so
@@ -710,13 +710,13 @@ class TestStrainSelectionOverlay:
 
     def test_strain_run_without_vectors_errors(self):
         import spyde.backend.ipc as ipc
-        from spyde.actions.strain_action import strain_run
+        from spyde.actions.strain_action import strain_open
         tree = type("T", (), {"diffraction_vectors": None})()
         plot = type("P", (), {"signal_tree": tree})()
         cap, orig = [], ipc.emit
         ipc.emit = lambda m: cap.append(m)
         try:
-            strain_run(object(), plot, {})
+            strain_open(object(), plot, {})
         finally:
             ipc.emit = orig
         assert not [m for m in cap if m.get("type") == "figure"]

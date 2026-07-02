@@ -2,10 +2,10 @@
  * FindVectorsWizard.tsx — the Find-Diffraction-Vectors caret (Qt parity).
  *
  * Opening the caret starts a LIVE preview of the found peaks on the diffraction
- * pattern (`fv_preview`); the Method dropdown + parameter sliders re-run it
+ * pattern (`fv_open`); the Method dropdown + parameter sliders re-run it
  * (debounced `fv_tune`) and moving the navigator previews other patterns.
  * "Compute" (`fv_run`) runs the full-dataset batch → a new vectors window;
- * closing the caret tears the preview down (`fv_stop`).
+ * closing the caret tears the preview down (`fv_close`).
  *
  * Two detection methods:
  *   • NXCORR — window-normalised cross-correlation against a flat disk
@@ -15,6 +15,7 @@
  */
 import React from 'react'
 import { WizardShell, Field, Slider, Select, Check, S } from './WizardShell'
+import { useWizardLifecycle, useDebouncedAction, useWizardEvent } from './wizardHooks'
 
 interface Props {
   openUp: boolean
@@ -45,7 +46,6 @@ export function FindVectorsWizard({ openUp, windowId, sendAction, onClose }: Pro
   const [showTransform, setShowTransform] = React.useState(false)
   const [status, setStatus] = React.useState('Tune the parameters — peaks preview under the crosshair.')
 
-  const tuneTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null)
   // Live refs so the debounced tune always sends the latest of EVERY control.
   const vals = React.useRef({ method, sigma, radius, sigma1, sigma2, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform })
   vals.current = { method, sigma, radius, sigma1, sigma2, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform }
@@ -59,44 +59,30 @@ export function FindVectorsWizard({ openUp, windowId, sendAction, onClose }: Pro
     show_transform: vals.current.showTransform,
   })
 
-  // Start the live preview when the caret opens; tear it down when it closes.
-  React.useEffect(() => {
-    sendAction('fv_preview', params(), windowId)
-    return () => { sendAction('fv_stop', {}, windowId) }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  // Start the live preview when the caret opens; tear it down when it closes
+  // (StrictMode-safe: exactly one fv_open reaches the backend).
+  useWizardLifecycle({
+    windowId, sendAction,
+    openAction: 'fv_open', openPayload: params, closeAction: 'fv_close',
+  })
 
-  // Cancel any pending debounced tune on unmount so fv_tune can't fire at a
-  // torn-down preview after the wizard closes mid-debounce.
-  React.useEffect(() => () => {
-    if (tuneTimer.current) clearTimeout(tuneTimer.current)
-  }, [])
+  // Debounced live tune — dispatch on control settle so matches don't flood;
+  // a pending tune is cancelled on unmount so it can't hit a torn-down preview.
+  const sendTune = useDebouncedAction(sendAction, 'fv_tune', windowId)
+  const tune = () => sendTune(params)
+  const live = <T,>(set: (v: T) => void) => (v: T) => { set(v); tune() }
 
   // Adopt the backend's auto-estimated disk radius (Qt parity) the first time it
   // arrives, then re-run the preview with it. The user can still override.
   const autoApplied = React.useRef(false)
-  React.useEffect(() => {
-    const onAuto = (e: Event) => {
-      const d = (e as CustomEvent).detail as Record<string, unknown>
-      if (d.window_id != null && d.window_id !== windowId) return
-      if (autoApplied.current) return
-      autoApplied.current = true
-      if (typeof d.kernel_radius === 'number') setRadius(d.kernel_radius)
-      if (typeof d.min_distance === 'number') setMinDist(d.min_distance)
-      setStatus(`Disk radius auto-set to ${d.kernel_radius} px from the pattern.`)
-      tune()
-    }
-    window.addEventListener('spyde:fv_auto_params', onAuto)
-    return () => window.removeEventListener('spyde:fv_auto_params', onAuto)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [windowId])
-
-  // Debounced live tune — dispatch on control settle so matches don't flood.
-  const tune = () => {
-    if (tuneTimer.current) clearTimeout(tuneTimer.current)
-    tuneTimer.current = setTimeout(() => sendAction('fv_tune', params(), windowId), 120)
-  }
-  const live = <T,>(set: (v: T) => void) => (v: T) => { set(v); tune() }
+  useWizardEvent('spyde:fv_auto_params', windowId, (d) => {
+    if (autoApplied.current) return
+    autoApplied.current = true
+    if (typeof d.kernel_radius === 'number') setRadius(d.kernel_radius)
+    if (typeof d.min_distance === 'number') setMinDist(d.min_distance)
+    setStatus(`Disk radius auto-set to ${d.kernel_radius} px from the pattern.`)
+    tune()
+  })
 
   // Switching method resets the threshold to that method's natural scale and
   // re-runs the preview (NXCORR score and DoG SNR are not comparable numbers).

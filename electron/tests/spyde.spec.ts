@@ -428,9 +428,9 @@ test('Find Diffraction Vectors opens the staged wizard (live preview + Compute)'
   await page.getByTestId('action-btn-Find Diffraction Vectors').click()
   await expect(page.getByTestId('find-vectors-wizard')).toBeVisible()
 
-  // Opening the wizard starts the live preview (dispatches fv_preview).
+  // Opening the wizard starts the live preview (dispatches fv_open).
   await expect.poll(async () => (await sentActions()).map((s: any) => s.action))
-    .toContain('fv_preview')
+    .toContain('fv_open')
 
   // Nudge the threshold slider → debounced fv_tune (native value setter so
   // React's onChange fires).
@@ -445,8 +445,8 @@ test('Find Diffraction Vectors opens the staged wizard (live preview + Compute)'
 
   await expect.poll(async () => {
     const names = (await sentActions()).map((s: any) => s.action)
-    return ['fv_preview', 'fv_tune', 'fv_run'].filter(a => names.includes(a))
-  }).toEqual(['fv_preview', 'fv_tune', 'fv_run'])
+    return ['fv_open', 'fv_tune', 'fv_run'].filter(a => names.includes(a))
+  }).toEqual(['fv_open', 'fv_tune', 'fv_run'])
 })
 
 test('Vector Orientation Mapping opens the staged wizard and drives Generate→Compute', async () => {
@@ -501,16 +501,16 @@ test('Center Zero Beam opens the two-tab wizard and drives auto + manual', async
   await page.getByTestId('action-btn-Center Zero Beam').click()
   await expect(page.getByTestId('center-zero-beam-wizard')).toBeVisible()
 
-  // Automatic → Center dispatches czb_auto.
+  // Automatic → Center dispatches czb_run.
   await page.getByTestId('czb-center').click()
-  // Manual tab → czb_manual_start (crosshair); Apply → czb_manual.
+  // Manual tab → czb_open (crosshair); Apply → czb_pick.
   await page.getByTestId('czb-tab-Manual').click()
   await page.getByTestId('czb-apply').click()
 
   await expect.poll(async () => {
     const names = (await sentActions()).map((s: any) => s.action)
-    return ['czb_auto', 'czb_manual_start', 'czb_manual'].filter(a => names.includes(a))
-  }).toEqual(['czb_auto', 'czb_manual_start', 'czb_manual'])
+    return ['czb_run', 'czb_open', 'czb_pick'].filter(a => names.includes(a))
+  }).toEqual(['czb_run', 'czb_open', 'czb_pick'])
 })
 
 test('a caret with tabbed params shows only the active tab (Orientation-style)', async () => {

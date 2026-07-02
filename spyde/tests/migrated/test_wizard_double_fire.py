@@ -63,9 +63,9 @@ class TestFindVectorsPreviewDoubleFire:
         monkeypatch.setattr(vo, "attach_find_vectors_preview", _tracking)
 
         # The exact StrictMode sequence, synchronous, before any worker lands.
-        fva.fv_preview(session, plot, {})
-        fva.fv_stop(session, plot, {})
-        fva.fv_preview(session, plot, {})
+        fva.fv_open(session, plot, {})
+        fva.fv_close(session, plot, {})
+        fva.fv_open(session, plot, {})
         _join_threads("fv-preview")
         time.sleep(0.2)
 
@@ -76,6 +76,6 @@ class TestFindVectorsPreviewDoubleFire:
         assert getattr(tree, "_fv_preview", None) is alive[0]
 
         # And a final close cleans it up.
-        fva.fv_stop(session, plot, {})
+        fva.fv_close(session, plot, {})
         assert getattr(tree, "_fv_preview", None) is None
         assert all(ov._test_removed for ov in returned)

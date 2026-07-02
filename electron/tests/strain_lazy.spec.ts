@@ -56,7 +56,7 @@ test('Strain Mapping: caret opens, runs the field, and Submit commits a new tree
   await expect(page.getByTestId('strain-wizard')).toBeVisible({ timeout: 15_000 })
   await expect(page.getByTestId('strain-method')).toBeVisible()
   await expect(page.getByTestId('strain-match-radius')).toBeVisible()
-  await expect(page.getByTestId('strain-submit')).toBeVisible()
+  await expect(page.getByTestId('strain-commit')).toBeVisible()
 
   // Opening the caret runs the live field → a Strain map window opens with the
   // εxx/εyy/εxy/ω component toggle (component swap dispatches strain_set_component).
@@ -75,7 +75,7 @@ test('Strain Mapping: caret opens, runs the field, and Submit commits a new tree
 
   // Submit freezes the field as a NEW committed signal tree → one more window.
   const beforeCommit = await page.getByTestId('subwindow').count()
-  await page.getByTestId('strain-submit').click()
+  await page.getByTestId('strain-commit').click()
   await expect.poll(() => page.getByTestId('subwindow').count(), {
     timeout: 30_000, message: 'Submit did not open a committed strain window',
   }).toBeGreaterThan(beforeCommit)

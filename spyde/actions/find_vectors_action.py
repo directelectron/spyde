@@ -468,7 +468,7 @@ def _refresh_signal_from_navigator(tree) -> None:
 # preview overlay lives on the source tree as `_fv_preview`.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def fv_preview(session, plot, payload) -> None:
+def fv_open(session, plot, payload) -> None:
     """'Tune' step: attach the LIVE found-peaks preview to the source DP so the
     red circles update as you tune the sliders / move the navigator (Qt parity).
     Idempotent — replaces any existing preview."""
@@ -487,8 +487,8 @@ def fv_preview(session, plot, payload) -> None:
               tuple(tree.root.data.shape), getattr(tree.root, "_lazy", "?"))
 
     # Run/stop generation guard (React StrictMode mounts the wizard twice
-    # synchronously: fv_preview, fv_stop, fv_preview — before either worker
-    # lands). Bumped here BEFORE the worker spawns; fv_stop bumps it too, so a
+    # synchronously: fv_open, fv_close, fv_open — before either worker
+    # lands). Bumped here BEFORE the worker spawns; fv_close bumps it too, so a
     # superseded preview attach is dropped instead of stacking a second overlay.
     from spyde.actions.lifecycle import bump_generation, is_current
     gen = bump_generation(tree, "_fv_run_gen")
@@ -497,7 +497,7 @@ def fv_preview(session, plot, payload) -> None:
         try:
             from spyde.actions.vector_overlay import attach_find_vectors_preview
             if not is_current(tree, "_fv_run_gen", gen):
-                return                     # superseded by fv_stop / newer preview
+                return                     # superseded by fv_close / newer preview
             new_prev = attach_find_vectors_preview(
                 src, tree.root, tree, sigma=p["sigma"],
                 kernel_radius=p["kernel_radius"], threshold=p["threshold"],
@@ -507,7 +507,7 @@ def fv_preview(session, plot, payload) -> None:
                 beamstop_auto=bool(p.get("beamstop_auto")),
                 show_transform=p["show_transform"],
             )
-            # Superseded while attaching (fv_stop / a newer fv_preview bumped
+            # Superseded while attaching (fv_close / a newer fv_open bumped
             # the generation after the check above) → tear down what we just
             # attached instead of installing a stale overlay.
             if not is_current(tree, "_fv_run_gen", gen):
@@ -532,7 +532,7 @@ def fv_preview(session, plot, payload) -> None:
                         "the crosshair, then Compute")
         except Exception as e:
             import logging
-            logging.getLogger(__name__).debug("fv_preview attach failed: %s", e)
+            logging.getLogger(__name__).debug("fv_open attach failed: %s", e)
 
     from spyde.actions.lifecycle import run_on_worker
     run_on_worker(session, _work, name="fv-preview")
@@ -611,12 +611,12 @@ def fv_run(session, plot, payload) -> None:
     _start_batch(session, src, tree, p)
 
 
-def fv_stop(session, plot, payload=None) -> None:
+def fv_close(session, plot, payload=None) -> None:
     """Caret closed: remove the live preview overlay."""
     src, tree = _src_plot_tree(session, plot)
     if tree is not None:
-        # Invalidate any fv_preview still in flight FIRST (StrictMode fires
-        # preview/stop/preview synchronously — see fv_preview's gen guard).
+        # Invalidate any fv_open still in flight FIRST (StrictMode fires
+        # preview/stop/preview synchronously — see fv_open's gen guard).
         from spyde.actions.lifecycle import bump_generation
         bump_generation(tree, "_fv_run_gen")
     prev = getattr(tree, "_fv_preview", None) if tree is not None else None

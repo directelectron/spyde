@@ -390,7 +390,7 @@ class StrainController(WizardController):
 def strain_mapping(ctx, action_name: str = "Strain Mapping", **params) -> None:
     """Toolbar entry on a Find-Vectors result — open the interactive strain
     window (one-shot; the live reference crosshair + component toggle take over)."""
-    strain_run(ctx.session, ctx.plot, params or {})
+    strain_open(ctx.session, ctx.plot, params or {})
 
 
 # ── staged handlers (session.py dispatch: fn(session, plot, payload)) ──────────
@@ -414,7 +414,7 @@ def _ctrl_for(session, plot, payload):
     return getattr(tree, "_strain_controller", None) if tree is not None else None
 
 
-def strain_run(session, plot, payload) -> None:
+def strain_open(session, plot, payload) -> None:
     """Open the interactive strain window for the active Find-Vectors result.
 
     The initial full-field fit (compute_strain_field) is a per-pixel scipy loop
@@ -432,7 +432,7 @@ def strain_run(session, plot, payload) -> None:
         # or while a slow batch is still running — self-wait, then re-dispatch.
         # Without an event loop (bare handler tests) error immediately.
         if wait_for_vectors(session, plot,
-                            lambda: strain_run(session, plot, payload),
+                            lambda: strain_open(session, plot, payload),
                             what="Strain mapping"):
             return
         emit_error("Strain mapping needs a Find Vectors result (no diffraction vectors).")
@@ -447,14 +447,14 @@ def strain_run(session, plot, payload) -> None:
         return
 
     # Re-entrancy guard: React StrictMode mounts the wizard TWICE synchronously
-    # (mount → cleanup → remount) on every open, firing strain_run then
-    # strain_stop then strain_run again before either's worker thread has had a
+    # (mount → cleanup → remount) on every open, firing strain_open then
+    # strain_close then strain_open again before either's worker thread has had a
     # chance to set tree._strain_controller — so the "existing" check above
     # can't see the first call in flight and BOTH proceed, building two
     # StrainControllers (two reference crosshairs, two overlays, two windows).
     # The run/stop generation guard (lifecycle.bump_generation) — bumped
     # synchronously here, BEFORE spawning the compute thread — closes that
-    # race: strain_stop bumps it too (cancelling any in-flight run), and a
+    # race: strain_close bumps it too (cancelling any in-flight run), and a
     # stale generation's _build_window is dropped on arrival instead of
     # building a second live controller.
     from spyde.actions.lifecycle import bump_generation, is_current, run_on_worker
@@ -464,7 +464,7 @@ def strain_run(session, plot, payload) -> None:
 
     def _build_window(field):
         if not is_current(tree, "_strain_run_gen", gen):
-            return   # superseded by a strain_stop or a newer strain_run
+            return   # superseded by a strain_close or a newer strain_open
         _fig, fig_id, html, p = build_strain_figure(field, component="exx")
         wid = session.next_window_id()
         from spyde.actions.figure_registry import keep_alive
@@ -550,15 +550,15 @@ def strain_set_overlay(session, plot, payload) -> None:
         log.debug("strain set_overlay failed: %s", e)
 
 
-def strain_stop(session, plot, payload) -> None:
-    """Toggle the action OFF: remove EVERYTHING strain_run added — the strain-map
+def strain_close(session, plot, payload) -> None:
+    """Toggle the action OFF: remove EVERYTHING strain_open added — the strain-map
     window, the selection overlay, the nav hooks. The source DP/navigator stay."""
     # Bump the tree's run-generation FIRST, unconditionally — this invalidates
-    # any strain_run still in flight (its compute thread hasn't finished, so
+    # any strain_open still in flight (its compute thread hasn't finished, so
     # tree._strain_controller doesn't exist yet and _ctrl_for below finds
     # nothing to remove). Without this, React StrictMode's synchronous
-    # mount→cleanup→remount race (strain_run, strain_stop, strain_run, all
-    # before either worker thread lands) let BOTH strain_run calls build a
+    # mount→cleanup→remount race (strain_open, strain_close, strain_open, all
+    # before either worker thread lands) let BOTH strain_open calls build a
     # live controller — two reference crosshairs, two overlays, two windows.
     tree = getattr(plot, "signal_tree", None)
     if tree is None:

@@ -10,6 +10,7 @@
  */
 import React from 'react'
 import { WizardShell, TabRow, Field, NumInput, Slider, Check, S } from './WizardShell'
+import { useDebouncedAction } from './wizardHooks'
 import { useCifRecents, RecentCifs } from './CifRecents'
 import { CodPicker } from './CodPicker'
 
@@ -51,12 +52,9 @@ export function OrientationWizard({ openUp, windowId, sendAction, onClose }: Pro
     _omStore.set(windowId, { tab, cifs, voltage, resolution, minInt, gamma, refineMinInt, normalize, nBest, libReady })
   }, [windowId, tab, cifs, voltage, resolution, minInt, gamma, refineMinInt, normalize, nBest, libReady])
 
-  const refineTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null)
-  // Cancel any pending debounced refine on unmount so om_refine can't fire at a
-  // torn-down preview after the wizard closes mid-debounce.
-  React.useEffect(() => () => {
-    if (refineTimer.current) clearTimeout(refineTimer.current)
-  }, [])
+  // Debounced live refine — a pending refine is cancelled on unmount so
+  // om_refine can't fire at a torn-down preview mid-debounce.
+  const sendRefine = useDebouncedAction(sendAction, 'om_refine', windowId)
   const { recents, remember } = useCifRecents()
   const base = (p: string) => p.split(/[/\\]/).pop() || p
 
@@ -82,10 +80,7 @@ export function OrientationWizard({ openUp, windowId, sendAction, onClose }: Pro
   // Debounced live refine — dispatch on slider settle so matches don't flood.
   const refine = (next: Partial<{ gamma: number; refineMinInt: number; normalize: boolean }>) => {
     const g = next.gamma ?? gamma, mi = next.refineMinInt ?? refineMinInt, nm = next.normalize ?? normalize
-    if (refineTimer.current) clearTimeout(refineTimer.current)
-    refineTimer.current = setTimeout(() => {
-      sendAction('om_refine', { gamma: g, min_intensity: mi / 100, normalize_templates: nm }, windowId)
-    }, 120)
+    sendRefine(() => ({ gamma: g, min_intensity: mi / 100, normalize_templates: nm }))
   }
   const compute = () => {
     setStatus('Computing orientation map…')

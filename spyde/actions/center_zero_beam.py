@@ -54,7 +54,7 @@ def center_zero_beam(ctx, action_name: str = "Center Zero Beam", **kwargs):
     return None
 
 
-def czb_auto(session, plot, payload) -> None:
+def czb_run(session, plot, payload) -> None:
     """Automatic tab: estimate the beam position per pattern and centre it."""
     src, tree = _src_plot_tree(session, plot)
     signal = _current_signal(src)
@@ -108,7 +108,7 @@ def czb_auto(session, plot, payload) -> None:
     run_on_worker(session, _work, name="czb-auto")
 
 
-def czb_manual_start(session, plot, payload) -> None:
+def czb_open(session, plot, payload) -> None:
     """Manual tab: drop a draggable crosshair at the centre of the DP for the
     user to drag onto the zero beam."""
     src, tree = _src_plot_tree(session, plot)
@@ -139,13 +139,13 @@ def _czb_manual_stop_obj(tree) -> None:
         tree._czb_cross = None
 
 
-def czb_manual_stop(session, plot, payload=None) -> None:
+def czb_close(session, plot, payload=None) -> None:
     """Caret closed / left the Manual tab → remove the crosshair."""
     _src, tree = _src_plot_tree(session, plot)
     _czb_manual_stop_obj(tree)
 
 
-def czb_manual(session, plot, payload) -> None:
+def czb_pick(session, plot, payload) -> None:
     """Manual tab Apply: centre by the picked crosshair position (constant shift
     ``centre − picked`` over the whole scan)."""
     src, tree = _src_plot_tree(session, plot)
