@@ -25,6 +25,30 @@ from spyde.actions.context import src_plot_tree as _src_plot_tree, current_signa
 log = logging.getLogger(__name__)
 
 DEFAULTS = dict(method="center_of_mass", half_square_width=0, make_flat_field=False)
+
+# Declared parameter schema (single source of truth for every host — the
+# Electron CenterZeroBeamWizard.tsx caret mirrors the Automatic tab; the
+# Manual tab is a crosshair interaction, not a parameter). Same dict spec as
+# toolbars.yaml `parameters:`. CZB has no controller class (pure staged
+# handlers), so the schema lives module-level; resolved via
+# registry.wizard_parameters("czb").
+PARAMETERS = {
+    "method": {
+        "name": "Method", "type": "enum", "default": DEFAULTS["method"],
+        # everything pyxem get_direct_beam_position accepts
+        "choices": ["center_of_mass", "cross_correlate", "blur", "interpolate"],
+        "tab": "Automatic",
+    },
+    "half_square_width": {
+        "name": "Half window (px, 0=full)", "type": "int",
+        "default": DEFAULTS["half_square_width"], "min": 0, "max": 256,
+        "tab": "Automatic",
+    },
+    "make_flat_field": {
+        "name": "Plane-fit shifts", "type": "bool",
+        "default": DEFAULTS["make_flat_field"], "tab": "Automatic",
+    },
+}
 _CROSS_COLOR = "#ffcc00"
 
 

@@ -117,7 +117,13 @@ provenance stamped on `tree._commit_provenance` +
 1. Subclass `WizardController` (set `key`), write the staged handlers
    (`_template_action.py` shows the full open/close/commit set with every
    guard in place).
-2. Register the stages in `registry.STAGED_HANDLERS`.
+2. **Declare the parameter schema** — a `parameters` classattr on the
+   controller (same dict spec as the YAML `parameters:` blocks) and an entry
+   in `registry._WIZARD_SCHEMAS`, so any host (the Electron caret, a notebook
+   form, `spyde.api` docs) resolves it via `registry.wizard_parameters(key)`.
+   One source of truth; drift against handler `DEFAULTS` is caught by
+   `test_wizard_schemas.py`. (Three-host parity: `NOTEBOOK_PARITY_PLAN.md` §6.)
+3. Register the stages in `registry.STAGED_HANDLERS`.
 3. Add the caret component on the renderer (see §5) and, if it's opened from
    a toolbar button, a `toolbars.yaml` entry whose `function` is a no-op
    parent (the Electron toolbar opens the wizard; see

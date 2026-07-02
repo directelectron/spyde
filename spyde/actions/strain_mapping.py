@@ -26,6 +26,7 @@ No Qt. Host-agnostic (Electron + Jupyter).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 
@@ -38,10 +39,40 @@ class StrainField:
     exy: np.ndarray
     omega: np.ndarray          # lattice rotation (radians)
     coverage: np.ndarray       # fraction of reference reflections matched (0–1)
+    # Provenance record ({"action", "params", "spyde_version"}) — same dict
+    # convention as commit._stamp_provenance (script/app interchangeable).
+    provenance: Optional[dict] = None
 
     @property
     def nav_shape(self) -> tuple:
         return self.exx.shape
+
+
+def default_reference(vecs) -> tuple:
+    """A sensible unstrained reference: the pixel with the most vectors (the
+    best-determined local lattice)."""
+    try:
+        cm = np.asarray(vecs.count_map())
+        iy, ix = np.unravel_index(int(np.argmax(cm)), cm.shape)
+        return int(iy), int(ix)
+    except Exception:
+        return 0, 0
+
+
+def zero_beam_filtered(g_ref) -> np.ndarray:
+    """Reference spots with the central/direct (zero) beam removed.
+
+    The zero beam (|g|≈0) carries no lattice information and would pin the fit's
+    translation/centroid, so it's excluded from every strain reference. Threshold
+    = 25% of the median nonzero |g| (well below the first ring, above numerical
+    noise at the centre)."""
+    g = np.asarray(g_ref, dtype=float).reshape(-1, 2)
+    if len(g) == 0:
+        return g
+    mag = np.linalg.norm(g, axis=1)
+    nz = mag[mag > 0]
+    thresh = 0.25 * float(np.median(nz)) if nz.size else 0.0
+    return g[mag > thresh]
 
 
 def _median_nn(g: np.ndarray) -> float:

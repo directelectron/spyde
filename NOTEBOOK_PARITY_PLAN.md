@@ -1,6 +1,11 @@
 # Three-Host Action Parity — Design Plan (script ↔ Jupyter ↔ SpyDE)
 
-Status: proposed (2026-07-02)
+Status: Phase 1 groundwork LANDED (2026-07-02) — `spyde.api` (script layer,
+§5), wizard parameter schemas + `registry.wizard_parameters()` (§6a),
+`client=` kwarg on the batch cores, `provenance` on the four result objects,
+`spyde/signals` re-exports; guarded by `test_api_layer.py` (import-graph +
+headless smoke) and `test_wizard_schemas.py` (schema validity + DEFAULTS
+lock-step). Phases 2–5 (host seam, notebook session, wizards) not started.
 Owner: Carter Francis
 Related: `spyde/actions/README.md` (the action framework this builds on),
 `VECTOR_ORIENTATION_MAPPING_PLAN.md`, `DIFFRACTION_VECTORS_PLAN.md`

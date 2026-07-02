@@ -44,6 +44,49 @@ class VomWizard(WizardController):
 
     key = "vom"
 
+    # Declared parameter schema (single source of truth for every host — the
+    # Electron VectorOrientationWizard.tsx caret mirrors these; note the caret
+    # shows strain_cap/sink_bw/gamma as PERCENT sliders but dispatches the
+    # fractional values declared here). Same dict spec as toolbars.yaml.
+    parameters = {
+        "cif_path": {
+            "name": "Crystal (.cif)", "type": "file", "default": "",
+            "extensions": [".cif"], "tab": "Library",
+        },
+        "accelerating_voltage": {
+            "name": "Voltage (kV)", "type": "float", "default": 200.0,
+            "min": 20.0, "max": 1000.0, "tab": "Library",
+        },
+        "resolution": {
+            "name": "Angle res (°)", "type": "float", "default": 1.0,
+            "min": 0.1, "max": 10.0, "step": 0.1, "tab": "Library",
+        },
+        "minimum_intensity": {
+            "name": "Min intensity", "type": "float", "default": 1e-4,
+            "min": 0.0, "max": 0.05, "step": 0.0005, "tab": "Library",
+        },
+        "strain_cap": {
+            "name": "Strain cap", "type": "float", "default": 0.05,
+            "min": 0.005, "max": 0.20, "step": 0.005, "tab": "Refine",
+        },
+        "sink_bw": {
+            "name": "Tolerance (Å⁻¹)", "type": "float", "default": 0.04,
+            "min": 0.005, "max": 0.15, "step": 0.005, "tab": "Refine",
+        },
+        "gamma": {
+            "name": "Intensity γ", "type": "float", "default": 0.5,
+            "min": 0.0, "max": 1.0, "step": 0.05, "tab": "Refine",
+        },
+        "k_power": {
+            "name": "High-k weight", "type": "float", "default": 0.0,
+            "min": 0.0, "max": 2.0, "step": 0.25, "tab": "Refine",
+        },
+        "smooth": {
+            "name": "Smooth strain (TV)", "type": "bool", "default": False,
+            "tab": "Run",
+        },
+    }
+
     def __init__(self, session, tree, *, phase, sim, lib, overlay,
                  voltage, recip_r, strain_cap, sink_bw=None):
         super().__init__(session, tree)

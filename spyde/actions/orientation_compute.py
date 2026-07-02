@@ -462,11 +462,12 @@ def _do_compute_orientations(
     signal,
     sim,
     params: dict,
-    main_window,
-    signal_tree,
+    main_window=None,
+    signal_tree=None,
     shm_name: Optional[str] = None,
     stopped_flag=None,
     cache: Optional[dict] = None,
+    client=None,
 ) -> Optional[SpyDEOrientationMap]:
     """
     Batch orientation mapping over a (nav_y, nav_x, KY, KX) signal.
@@ -478,6 +479,9 @@ def _do_compute_orientations(
     distributed client with a designated GPU worker is reachable, single
     future otherwise, local scheduler without a client (tests).  NEVER
     computes the full dataset (per-chunk slices only).
+
+    An explicit ``client=`` wins over the in-app main_window/signal_tree
+    lookups (the spyde.api / script path).
     """
     import dask.array as da
 
@@ -519,8 +523,7 @@ def _do_compute_orientations(
             )
 
     # ── Client / lanes (shared helpers; same env policy as find_vectors) ─────
-    client = None
-    if signal_tree is not None:
+    if client is None and signal_tree is not None:
         client = getattr(signal_tree, "client", None)
     if client is None and main_window is not None:
         client = getattr(getattr(main_window, "dask_manager", None),

@@ -43,6 +43,17 @@ class WizardController:
     #: ``strain_*`` staged-action names.
     key: str = ""
 
+    #: Declared parameter schema — REQUIRED for every wizard. The same dict
+    #: spec as ``toolbars.yaml parameters:`` / ``Action.parameters`` (``type``
+    #: int/float/bool/enum/file, ``name``, ``default``, ``min``/``max``/
+    #: ``step``, ``choices``, ``tab``, ``extensions``), so any host — the
+    #: Electron caret or an auto-generated notebook form — can render the
+    #: wizard's controls from one source of truth. Resolved host-agnostically
+    #: via ``registry.wizard_parameters(key)``; completeness is enforced by
+    #: ``test_wizard_schemas.py``. (Three-host parity contract:
+    #: NOTEBOOK_PARITY_PLAN.md §6.)
+    parameters: dict = {}
+
     def __init__(self, session, tree):
         self.session = session
         self.tree = tree

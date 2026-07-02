@@ -258,6 +258,10 @@ class SpyDEDiffractionVectors:
     # from the source signal onto the result tree, but standalone save/load needs
     # them carried with the vectors so the reloaded scan grid is calibrated.
     nav_axes: object = field(default_factory=list)
+    # Provenance record ({"action", "params", "spyde_version"}) — the same dict
+    # convention commit._stamp_provenance uses, so scripted (spyde.api) results
+    # and committed trees carry interchangeable records.
+    provenance: Optional[dict] = field(default=None)
     _dense_cache: Optional[np.ndarray] = field(default=None, repr=False)
     _kdtree:      Optional[object]     = field(default=None, repr=False)
     _gpu_buffer:  Optional[object]     = field(default=None, repr=False)  # torch.Tensor on CUDA

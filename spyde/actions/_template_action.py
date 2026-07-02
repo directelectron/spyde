@@ -107,6 +107,17 @@ class TemplateRegionAction(RegionAction):
 class TemplateWizard(WizardController):
     key = "mywiz"
 
+    # REQUIRED: declare the wizard's parameter schema (the same dict spec as
+    # toolbars.yaml `parameters:`), and add the key to
+    # registry._WIZARD_SCHEMAS so every host resolves it via
+    # registry.wizard_parameters("mywiz"). Enforced by test_wizard_schemas.py.
+    parameters = {
+        "strength": {"name": "Strength", "type": "float", "default": 1.0,
+                     "min": 0.0, "max": 10.0, "step": 0.1},
+        "mode": {"name": "Mode", "type": "enum", "default": "fast",
+                 "choices": ["fast", "precise"]},
+    }
+
     def __init__(self, session, tree):
         super().__init__(session, tree)
         self.result = None              # the live result to commit

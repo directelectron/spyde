@@ -15,36 +15,15 @@ import numpy as np
 
 from spyde.actions._common import STRAIN_COMPONENTS as _COMPONENTS
 from spyde.actions.lifecycle import bump_generation, is_current
+# Pure reference physics lives in strain_mapping (shared with spyde.api so
+# scripted strain uses the SAME zero-beam filter + default-reference heuristic).
+from spyde.actions.strain_mapping import (
+    default_reference as _default_reference,
+    zero_beam_filtered as _zero_beam_filtered,
+)
 from spyde.actions.wizard import WizardController
 
 log = logging.getLogger(__name__)
-
-
-def _default_reference(vecs) -> tuple:
-    """A sensible unstrained reference: the pixel with the most vectors (the
-    best-determined local lattice)."""
-    try:
-        cm = np.asarray(vecs.count_map())
-        iy, ix = np.unravel_index(int(np.argmax(cm)), cm.shape)
-        return int(iy), int(ix)
-    except Exception:
-        return 0, 0
-
-
-def _zero_beam_filtered(g_ref) -> np.ndarray:
-    """Reference spots with the central/direct (zero) beam removed.
-
-    The zero beam (|g|≈0) carries no lattice information and would pin the fit's
-    translation/centroid, so it's excluded from every strain reference. Threshold
-    = 25% of the median nonzero |g| (well below the first ring, above numerical
-    noise at the centre)."""
-    g = np.asarray(g_ref, dtype=float).reshape(-1, 2)
-    if len(g) == 0:
-        return g
-    mag = np.linalg.norm(g, axis=1)
-    nz = mag[mag > 0]
-    thresh = 0.25 * float(np.median(nz)) if nz.size else 0.0
-    return g[mag > thresh]
 
 
 class StrainController(WizardController):
@@ -61,6 +40,28 @@ class StrainController(WizardController):
     (green) spots feed ``compute_strain_field``."""
 
     key = "strain"
+
+    # The wizard's declared parameter schema (single source of truth for every
+    # host — the Electron StrainWizard.tsx caret mirrors these; a notebook form
+    # renders them directly). Same dict spec as toolbars.yaml `parameters:`.
+    parameters = {
+        "component": {
+            "name": "Component", "type": "enum", "default": "exx",
+            "choices": list(_COMPONENTS),               # exx, eyy, exy, omega
+        },
+        "method": {
+            "name": "Reference", "type": "enum", "default": "region",
+            "choices": ["region", "cif"],
+        },
+        "cif_path": {
+            "name": "Crystal (.cif)", "type": "file", "default": "",
+            "extensions": [".cif"],
+        },
+        "match_radius_px": {
+            "name": "Match radius (px)", "type": "int", "default": 6,
+            "min": 1, "max": 30,
+        },
+    }
 
     def __init__(self, vecs, plot2d, *, window_id=None,
                  component="exx", ref_yx=(0, 0), session=None,

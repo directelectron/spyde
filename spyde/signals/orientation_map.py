@@ -116,6 +116,9 @@ class SpyDEOrientationMap:
     phases: List[dict]
     nav_axes: object = None
     params: dict = field(default_factory=dict)
+    # Provenance record ({"action", "params", "spyde_version"}) — same dict
+    # convention as commit._stamp_provenance (script/app interchangeable).
+    provenance: Optional[dict] = field(default=None)
     _phase_cache: dict = field(default_factory=dict, repr=False)
 
     # ── Basic properties ──────────────────────────────────────────────────────

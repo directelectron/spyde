@@ -90,3 +90,55 @@ def resolve_staged(name: str) -> Callable | None:
 def register_staged(name: str, dotted_path: str) -> None:
     """Register a staged action (``fn(session, plot, payload)``) by dotted path."""
     STAGED_HANDLERS[name] = dotted_path
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Wizard parameter schemas — the single host-agnostic lookup
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Every wizard declares its parameter schema in Python (a `parameters`
+# classattr on its WizardController, or a module-level PARAMETERS for
+# controller-less wizards), in the SAME dict spec as toolbars.yaml
+# `parameters:`. FV and OM keep their schema in toolbars.yaml (their carets
+# already render from it); this table maps each wizard key to wherever its
+# schema lives, so any host (an Electron panel, a notebook form generator, a
+# doc generator) resolves them uniformly. Completeness is enforced by
+# test_wizard_schemas.py. (Three-host parity: NOTEBOOK_PARITY_PLAN.md §6.)
+_WIZARD_SCHEMAS: dict[str, tuple[str, str]] = {
+    # key: (module, attribute) — attribute is a controller class (its
+    # `parameters`) or a dict.
+    "strain": ("spyde.actions.strain_action", "StrainController"),
+    "vom":    ("spyde.actions.vector_orientation_om", "VomWizard"),
+    "czb":    ("spyde.actions.center_zero_beam", "PARAMETERS"),
+    # YAML-declared (resolved from spyde.TOOLBAR_ACTIONS):
+    "fv":     ("__yaml__", "Find Diffraction Vectors"),
+    "om":     ("__yaml__", "Orientation Mapping"),
+}
+
+
+def _yaml_parameters(action_title: str) -> dict:
+    import spyde
+    for group in spyde.TOOLBAR_ACTIONS.values():
+        if isinstance(group, dict) and action_title in group:
+            return dict(group[action_title].get("parameters") or {})
+    return {}
+
+
+def wizard_parameters(key: str) -> dict:
+    """Return wizard ``key``'s declared parameter schema (a copy).
+
+    The uniform entry point for rendering a wizard's controls in ANY host —
+    same spec as toolbars.yaml ``parameters:`` (type/name/default/min/max/
+    step/choices/tab/extensions). Raises ``KeyError`` for unknown keys.
+    """
+    module, attr = _WIZARD_SCHEMAS[key]
+    if module == "__yaml__":
+        return _yaml_parameters(attr)
+    obj = getattr(importlib.import_module(module), attr)
+    schema = obj if isinstance(obj, dict) else getattr(obj, "parameters", {})
+    return dict(schema)
+
+
+def wizard_keys() -> list[str]:
+    """All wizard keys with a declared schema."""
+    return list(_WIZARD_SCHEMAS)
