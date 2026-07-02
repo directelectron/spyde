@@ -4,7 +4,9 @@ Everything a toolbar button, caret, or wizard does goes through this package.
 This document is the contract: the action shapes, the two dispatch paths, the
 lifecycle every action follows, and the step-by-step for adding a new one.
 Copyable skeletons live in [`_template_action.py`](_template_action.py) (kept
-compiling by `test_template_skeletons.py`).
+compiling by `test_template_skeletons.py`). The plan for running these same
+actions from scripts and Jupyter notebooks (function ↔ anywidget ↔ toolbar
+parity) lives in [`NOTEBOOK_PARITY_PLAN.md`](../../NOTEBOOK_PARITY_PLAN.md).
 
 ## 1. The action taxonomy
 
