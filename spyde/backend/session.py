@@ -17,7 +17,7 @@ from hyperspy.signal import BaseSignal
 from spyde.backend.ipc import emit, emit_status, emit_error, emit_progress
 from spyde.backend._session_axes import AxesEditorMixin
 from spyde.backend._session_actions import (
-    ActionRouterMixin, _STAGED_HANDLERS, _TEST_ACTIONS, _TEST_ACTIONS_ENABLED,
+    ActionRouterMixin, _TEST_ACTIONS, _TEST_ACTIONS_ENABLED,
 )
 from spyde.backend._session_files import (
     FileLoaderMixin,
@@ -37,9 +37,8 @@ log = logging.getLogger(__name__)
 # the same env switch used in base_selector / update_functions / plot_update_worker.
 _NAV_TIMING = os.environ.get("SPYDE_NAV_TIMING") == "1"
 
-# _TEST_ACTIONS / _TEST_ACTIONS_ENABLED and _STAGED_HANDLERS now live in
-# _session_actions (re-imported above so any `session._STAGED_HANDLERS` access
-# still resolves).
+# _TEST_ACTIONS / _TEST_ACTIONS_ENABLED live in _session_actions; the staged
+# action table lives in spyde.actions.registry (STAGED_HANDLERS).
 
 if TYPE_CHECKING:
     from spyde.signal_tree import BaseSignalTree
@@ -75,6 +74,10 @@ class Session(
         # (src_window_id, action_name) -> {"selector", "out_wids"} so deselecting
         # a toolbar action can hide the output window + ROI it created.
         self._action_artifacts: dict[tuple[int, str], dict] = {}
+        # window_id -> controller for windows that are NOT registered Plots
+        # (bare `figure` emits: strain map, IPF views…). See the WindowController
+        # protocol in spyde/actions/registry.py. _forget_window closes + evicts.
+        self._window_controllers: dict[int, object] = {}
         self.current_selected_signal_tree = None
 
         # MDI manager

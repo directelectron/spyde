@@ -5,9 +5,9 @@ The renderer→backend action router (``dispatch_action``), the YAML toolbar-act
 invoker (``_dispatch_toolbar_action``), action-artifact tracking, overlay
 visibility, action (de)activation, and per-VI caret edits.
 
-Module-level tables that belong to dispatch live here too: ``_STAGED_HANDLERS``
-(staged-wizard action → "module.function") and the ``_TEST_ACTIONS`` /
-``_TEST_ACTIONS_ENABLED`` packaged-build gate.
+The staged-action table lives in ``spyde.actions.registry`` (STAGED_HANDLERS);
+the ``_TEST_ACTIONS`` / ``_TEST_ACTIONS_ENABLED`` packaged-build gate lives
+here.
 
 The mixin only USES ``self.<attr>`` (``self._action_artifacts``, ``self._plots``
 …) and ``self.<method>`` (``self._plot_by_window_id``, ``self._close_plot``,
@@ -21,6 +21,7 @@ import threading
 
 from spyde.backend import ipc
 from spyde.backend.ipc import emit_error
+from spyde.actions.registry import STAGED_HANDLERS, resolve_staged
 
 log = logging.getLogger(__name__)
 
@@ -37,40 +38,8 @@ _TEST_ACTIONS = frozenset({
     "load_test_vectors", "run_test_orientation",
 })
 
-# Staged-wizard actions → "module.function". All share the (session, plot,
-# payload) signature, so `dispatch_action` routes them through one lazy-import
-# branch instead of a copy-pasted elif per handler.
-_STAGED_HANDLERS = {
-    "om_generate_library": "spyde.actions.orientation_action.om_generate_library",
-    "om_refine":           "spyde.actions.orientation_action.om_refine",
-    "om_run":              "spyde.actions.orientation_action.om_run",
-    "fv_preview":          "spyde.actions.find_vectors_action.fv_preview",
-    "fv_tune":             "spyde.actions.find_vectors_action.fv_tune",
-    "fv_run":              "spyde.actions.find_vectors_action.fv_run",
-    "fv_stop":             "spyde.actions.find_vectors_action.fv_stop",
-    "vom_generate_library": "spyde.actions.vector_orientation_om.vom_generate_library",
-    "vom_refine":          "spyde.actions.vector_orientation_om.vom_refine",
-    "vom_run":             "spyde.actions.vector_orientation_om.vom_run",
-    "strain_run":          "spyde.actions.strain_action.strain_run",
-    "strain_set_component": "spyde.actions.strain_action.strain_set_component",
-    "strain_set_method":   "spyde.actions.strain_action.strain_set_method",
-    "strain_set_match_radius": "spyde.actions.strain_action.strain_set_match_radius",
-    "strain_set_overlay":  "spyde.actions.strain_action.strain_set_overlay",
-    "strain_stop":         "spyde.actions.strain_action.strain_stop",
-    "strain_commit":       "spyde.actions.strain_action.strain_commit",
-    "ipf_set_direction":   "spyde.actions.ipf_view.ipf_set_direction",
-    "tile_views":          "spyde.actions.views.tile_views",
-    "set_composition":     "spyde.actions.composition.set_composition",
-    "cod_search":          "spyde.actions.composition.cod_search",
-    "cod_pick":            "spyde.actions.composition.cod_pick",
-    "czb_auto":            "spyde.actions.center_zero_beam.czb_auto",
-    "czb_manual_start":    "spyde.actions.center_zero_beam.czb_manual_start",
-    "czb_manual":          "spyde.actions.center_zero_beam.czb_manual",
-    "czb_manual_stop":     "spyde.actions.center_zero_beam.czb_manual_stop",
-    "set_log_level":       "spyde.backend.log_stream.set_log_level",
-    "get_gpu_status":      "spyde.actions.gpu_status.get_gpu_status",
-    "set_update_channel":  "spyde.backend.session.dispatch_set_update_channel",
-}
+# The staged-action table (STAGED_HANDLERS) lives in spyde.actions.registry so
+# that adding an action only touches the actions package (+ toolbars.yaml).
 
 
 class ActionRouterMixin:
@@ -106,7 +75,7 @@ class ActionRouterMixin:
             ).start()
         elif action == "load_test_vectors":
             self._load_test_vectors()
-        elif action in _STAGED_HANDLERS:
+        elif action in STAGED_HANDLERS:
             # Staged-wizard handlers (Orientation / Find-Vectors / Vector-OM /
             # Center-Zero-Beam) share the (session, plot, payload) signature and
             # are imported lazily so their heavy deps load only on first use.
@@ -119,9 +88,7 @@ class ActionRouterMixin:
             # e.g. {component: "eyy"} silently resolved to nothing.
             if "window_id" not in payload and window_id is not None:
                 payload = {**payload, "window_id": window_id}
-            import importlib
-            mod, fn = _STAGED_HANDLERS[action].rsplit(".", 1)
-            getattr(importlib.import_module(mod), fn)(self, plot, payload)
+            resolve_staged(action)(self, plot, payload)
         elif action == "run_test_orientation":
             # Test-only: run Orientation Mapping with a built-in phase (no CIF
             # dialog) on the active signal, so the E2E workflow can be driven

@@ -9,7 +9,7 @@ import os
 
 import pytest
 
-from spyde.backend._session_actions import _STAGED_HANDLERS
+from spyde.actions.registry import STAGED_HANDLERS
 
 
 def _isolate_settings(session, tmp_path):
@@ -72,7 +72,7 @@ class TestUpdateChannelSettings:
 
 class TestGpuStatusAction:
     def test_staged_handler_registered(self):
-        assert "get_gpu_status" in _STAGED_HANDLERS
+        assert "get_gpu_status" in STAGED_HANDLERS
 
     def test_emits_gpu_status_result(self, window):
         session = window["window"]

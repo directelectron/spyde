@@ -44,12 +44,25 @@ class WindowManagerMixin:
                 return p
         return None
 
+    def register_window_controller(self, window_id: int, controller) -> None:
+        """Give a non-Plot window (bare `figure` emit) a dispatch + teardown
+        identity. See the WindowController protocol in spyde/actions/registry.py.
+        _forget_window pops the controller and calls its close()."""
+        self._window_controllers[window_id] = controller
+
+    def controller_by_window_id(self, window_id: int | None):
+        if window_id is None:
+            return None
+        return self._window_controllers.get(window_id)
+
     def _close_window(self, window_id: int) -> None:
         plot = self._plot_by_window_id(window_id)
         if plot is None:
-            # Backend already dropped it (or never had it) — still tell the
-            # renderer to remove the window so the UI doesn't get stuck.
-            ipc.emit({"type": "window_closed", "window_id": window_id})
+            # A controller-backed window (strain map, IPF views…) has no Plot;
+            # _forget_window closes its controller and emits window_closed.
+            # Otherwise the backend already dropped it (or never had it) — still
+            # tell the renderer to remove the window so the UI doesn't get stuck.
+            self._forget_window(window_id)
             return
         try:
             tree = getattr(plot, "signal_tree", None)
@@ -148,6 +161,18 @@ class WindowManagerMixin:
         """Drop per-window backend state and tell the renderer to remove it."""
         if window_id is None:
             return
+        # A controller-backed window tears itself down through its controller
+        # (strain overlay + reference window, IPF nav hooks…), whatever the
+        # close path was (✕, tree close, wizard stop).
+        ctrl = self._window_controllers.pop(window_id, None)
+        if ctrl is not None and hasattr(ctrl, "close"):
+            try:
+                ctrl.close()
+            except Exception as e:
+                log.debug("window controller close failed: %s", e)
+        # Figures kept alive for this window (bare-figure emits) die with it.
+        from spyde.actions.figure_registry import forget_window as _figs_forget
+        _figs_forget(window_id)
         if hasattr(self, "_nav_selectors"):
             self._nav_selectors.pop(window_id, None)
         # Prune the MDIManager's PlotWindow tracking so closed windows don't leak.

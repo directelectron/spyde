@@ -39,7 +39,6 @@ class MDIManager:
     def __init__(self, session: "Session") -> None:
         self.session = session
         self.plot_subwindows: list["PlotWindow"] = []
-        self.signal_trees: list["BaseSignalTree"] = []
         self._navigator_drag_payloads: dict[str, dict] = {}
 
     # ── Public interface ───────────────────────────────────────────────────────
@@ -94,27 +93,9 @@ class MDIManager:
         return [pw for pw in list(self.plot_subwindows)
                 if getattr(pw, "signal_tree", None) is tree]
 
-    def close_signal_tree(self, tree: "BaseSignalTree") -> None:
-        if tree is None or getattr(tree, "_spyde_closing", False):
-            return
-        tree._spyde_closing = True
-        try:
-            for pw in self.windows_for_tree(tree):
-                try:
-                    pw._spyde_tree_teardown = True
-                    pw.close_window()
-                except Exception:
-                    log.exception("close_signal_tree: window close failed")
-            try:
-                tree.close()
-            except Exception as e:
-                log.debug("close_signal_tree: tree.close() failed: %s", e)
-            if tree in self.signal_trees:
-                self.signal_trees.remove(tree)
-            if (getattr(self.session, "current_selected_signal_tree", None) is tree):
-                self.session.current_selected_signal_tree = None
-        finally:
-            tree._spyde_closing = False
+    # NOTE: tree teardown is owned by Session._close_tree (WindowManagerMixin);
+    # the old close_signal_tree duplicate (and its never-populated signal_trees
+    # list) was removed — one teardown route only.
 
     def active_plot(self) -> "Plot | None":
         """Return the currently focused plot, or None."""
