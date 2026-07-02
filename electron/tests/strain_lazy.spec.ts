@@ -73,12 +73,39 @@ test('Strain Mapping: caret opens, runs the field, and Submit commits a new tree
   // and this click silently fails to land.
   await swin.getByTestId(/^strain-comp-eyy-/).click({ timeout: 10_000 })
 
-  // Submit freezes the field as a NEW committed signal tree → one more window.
+  // Commit freezes the field as a NEW committed signal tree → one more window,
+  // titled "Strain" (chip views must NOT retitle it — the ω-title regression).
   const beforeCommit = await page.getByTestId('subwindow').count()
   await page.getByTestId('strain-commit').click()
   await expect.poll(() => page.getByTestId('subwindow').count(), {
-    timeout: 30_000, message: 'Submit did not open a committed strain window',
+    timeout: 30_000, message: 'Commit did not open a committed strain window',
   }).toBeGreaterThan(beforeCommit)
+  const afterCommit = await page.getByTestId('subwindow').count()
+  // Exact title "Strain" — chip views must NOT retitle the committed window
+  // (regression: it ended up titled "ω" by the last-emitted view figure).
+  await expect(page.getByTestId('subwindow-title')
+    .filter({ hasText: /^Strain$/ }).first()).toBeVisible({ timeout: 15_000 })
+
+  // Toggle the caret OFF: the live strain-map + reference windows tear down
+  // (controller close via the window registry); the COMMITTED tree survives.
+  await vsig.getByTestId('subwindow-titlebar').click()
+  await vsig.getByTestId('subwindow-titlebar').hover()
+  await btn.click()
+  await expect.poll(() => page.getByTestId('subwindow').count(), {
+    timeout: 15_000, message: 'live strain windows not removed on toggle off',
+  }).toBe(before + (afterCommit - beforeCommit))
+  await expect(page.getByTestId('subwindow-title')
+    .filter({ hasText: /^Strain$/ }).first()).toBeVisible()  // committed tree survived
+
+  // Re-open → exactly ONE new set of live windows again (idempotent, no
+  // duplicate strain windows / controllers piling up).
+  const beforeReopen = await page.getByTestId('subwindow').count()
+  await vsig.getByTestId('subwindow-titlebar').hover()
+  await btn.click()
+  await expect(page.getByTestId('strain-wizard')).toBeVisible({ timeout: 15_000 })
+  await expect.poll(() => page.getByTestId('subwindow').count(), {
+    timeout: 60_000, message: 'strain map window never reopened',
+  }).toBe(beforeReopen + (beforeCommit - before))
 
   ctx.assertNoJsErrors()
 })

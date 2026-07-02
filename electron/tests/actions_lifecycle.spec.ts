@@ -47,12 +47,12 @@ test('requires_vectors gate + Commit-to-new-tree + caret teardown', async () => 
   await page.screenshot({ path: join(SHOTS, '01-loaded.png') })
 
   // ── 1) Run Find Diffraction Vectors on the source DP.
-  // NB '— Vectors' (the result windows' em-dash title), NOT bare 'Vectors' —
-  // the OPEN Find-Vectors wizard inside the source window contains the text
-  // "Find Diffraction Vectors", so a bare 'Vectors' filter would exclude the
-  // source window too while the caret is open.
+  // Select the source window by what it HAS (the FV action button), never by
+  // text negatives: hasNotText is case-insensitive substring, so the open FV
+  // wizard's own hint ("…on the navigator…") makes the source window match
+  // 'Navigator' and vanish from a negative filter.
   const sig = page.getByTestId('subwindow')
-    .filter({ hasNotText: 'Navigator' }).filter({ hasNotText: '— Vectors' }).first()
+    .filter({ has: page.getByTestId('action-btn-Find Diffraction Vectors') }).first()
   await sig.getByTestId('subwindow-title').click()
   await sig.getByTestId('subwindow-titlebar').hover()
   await sig.getByTestId('action-btn-Find Diffraction Vectors').click()
@@ -94,17 +94,22 @@ test('requires_vectors gate + Commit-to-new-tree + caret teardown', async () => 
 
   // Close the FV caret so it doesn't cover the strain caret.
   if (await page.getByTestId('fv-close').count()) {
+    await sig.getByTestId('subwindow-titlebar').hover()   // raise above sibling toolbars
     await sig.getByTestId('subwindow-titlebar').click()
-    await sig.getByTestId('subwindow-titlebar').hover()
     await page.getByTestId('fv-close').first().click()
     await page.waitForTimeout(500)
   }
 
   // ── 3) Open the Strain caret; wait for the live strain map window.
+  // Park the mouse on neutral ground first so the PREVIOUS window's revealed
+  // toolbar (which hangs below it, over this window's titlebar) hides —
+  // then hovering here raises THIS window above the siblings.
+  await page.mouse.move(640, 12)
+  await page.waitForTimeout(600)
   const vwin = page.getByTestId('subwindow')
     .filter({ has: page.getByTestId('action-btn-Strain Mapping') }).first()
+  await vwin.getByTestId('subwindow-titlebar').hover()   // raise above sibling toolbars
   await vwin.getByTestId('subwindow-titlebar').click()
-  await vwin.getByTestId('subwindow-titlebar').hover()
   const strainBtn = vwin.getByTestId('action-btn-Strain Mapping')
   const beforeStrain = await nWin()
   await strainBtn.click()
@@ -133,8 +138,10 @@ test('requires_vectors gate + Commit-to-new-tree + caret teardown', async () => 
 
   // ── 5) Close the caret: the live strain map + reference windows tear down
   // (controller close), the COMMITTED tree window survives.
+  await page.mouse.move(640, 12)
+  await page.waitForTimeout(600)
+  await vwin.getByTestId('subwindow-titlebar').hover()   // raise above sibling toolbars
   await vwin.getByTestId('subwindow-titlebar').click()
-  await vwin.getByTestId('subwindow-titlebar').hover()
   await strainBtn.click()
   await expect.poll(nWin, {
     timeout: 15_000, message: 'strain live windows not removed on toggle off',
