@@ -151,6 +151,10 @@ export function SubWindow({
   // window or the toolbar itself). A short hide delay covers the gap between the
   // window's bottom edge and the toolbar so moving toward it doesn't hide it.
   const [tbVisible, setTbVisible] = useState(false)
+  // True while the toolbar is ENGAGED (a caret/wizard open or an action live) —
+  // reported up by FloatingToolbar so the window stays raised while its caret
+  // is in use even when the cursor wanders elsewhere.
+  const [tbEngaged, setTbEngaged] = useState(false)
   const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const showToolbar = useCallback(() => {
     if (hideTimer.current) { clearTimeout(hideTimer.current); hideTimer.current = null }
@@ -223,10 +227,18 @@ export function SubWindow({
     ? { left: 0, top: 0, width: '100%', height: '100%' }
     : { left: pos.x, top: pos.y, width: size.width, height: size.height }
 
+  // The toolbar and its caret render INSIDE this window's stacking context, so
+  // an overlapping sibling window covers them — the toolbar "revealed" on hover
+  // but stayed buried until the user clicked to raise the window. While the
+  // toolbar is revealed or engaged, raise this window visually above siblings
+  // (temporary — the managed focus zIndex is untouched and it drops back on
+  // leave/close).
+  const raised = tbVisible || tbEngaged
+
   return (
     <div
       data-testid="subwindow"
-      style={{ ...styles.window, ...frame, zIndex }}
+      style={{ ...styles.window, ...frame, zIndex: zIndex + (raised ? 1000 : 0) }}
       onMouseDown={() => onFocus(id)}
       onMouseEnter={showToolbar}
       onMouseLeave={hideToolbar}
@@ -275,6 +287,7 @@ export function SubWindow({
           visible={tbVisible}
           onHoverShow={showToolbar}
           onHoverHide={hideToolbar}
+          onEngagedChange={setTbEngaged}
         />
       )}
 

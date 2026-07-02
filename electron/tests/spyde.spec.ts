@@ -122,8 +122,13 @@ test('focusing a figure iframe raises its window (click-to-front)', async () => 
   const zOf = (w: ReturnType<typeof page.getByTestId>) =>
     w.evaluate((el) => parseInt(getComputedStyle(el as HTMLElement).zIndex || '0', 10))
 
-  // Raise the navigator so the signal window is below it.
+  // Raise the navigator so the signal window is below it. Then park the mouse
+  // OFF both windows: a hovered window is deliberately raised above siblings
+  // while the pointer is over it (toolbar reveal), which would mask the
+  // FOCUS z-order this test is about.
   await navWin.getByTestId('subwindow-title').click()
+  await page.mouse.move(640, 12)          // top bar — outside every subwindow
+  await page.waitForTimeout(500)          // > the 350 ms toolbar-hide delay
   expect(await zOf(navWin)).toBeGreaterThan(await zOf(sigWin))
 
   // A pointerdown INSIDE the signal figure posts a `spyde_focus` message to the

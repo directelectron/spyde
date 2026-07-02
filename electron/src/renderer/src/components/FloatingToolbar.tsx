@@ -70,6 +70,9 @@ interface Props {
   visible?: boolean
   onHoverShow?: () => void
   onHoverHide?: () => void
+  /** Reports when the toolbar is ENGAGED (caret open / action live) so the
+   *  owning window can stay raised above overlapping siblings. */
+  onEngagedChange?: (engaged: boolean) => void
 }
 
 function defaultsOf(parameters: Record<string, ParamSpec>): Record<string, unknown> {
@@ -85,6 +88,7 @@ const hasPopout = (a: ToolbarAction) => hasParams(a) || hasSubs(a)
 
 export function FloatingToolbar({
   actions, windowId, onAction, visible = true, onHoverShow, onHoverHide,
+  onEngagedChange,
 }: Props) {
   const { state, sendAction } = useSpyDE()
   const [openName, setOpenName] = React.useState<string | null>(null)
@@ -96,6 +100,14 @@ export function FloatingToolbar({
   // otherwise reveal only on hover (over the window or the toolbar).
   const forced = openName !== null || live.size > 0
   const shownVisible = visible || forced
+
+  // Tell the owning window while the toolbar is engaged so it can stay raised
+  // above overlapping siblings (the caret renders in the window's stacking
+  // context and would otherwise be buried under a later-opened window).
+  React.useEffect(() => {
+    onEngagedChange?.(forced)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [forced])
 
   React.useEffect(() => {
     if (!openName) return
@@ -471,10 +483,14 @@ const subBase: React.CSSProperties = {
 
 const styles: Record<string, React.CSSProperties> = {
   bar: {
-    // BELOW the window (the window root is overflow:visible), centered, tracking
-    // it on move/resize. Reveal-on-hover is handled by the opacity/pointerEvents
-    // applied inline.
-    position: 'absolute', top: '100%', marginTop: 8, left: '50%',
+    // INSIDE the window, floating over the figure's bottom edge (video-player
+    // controls style), centered, tracking move/resize. Reveal-on-hover is
+    // handled by the opacity/pointerEvents applied inline. It deliberately
+    // does NOT hang outside the window: an overhanging bar sat exactly on the
+    // titlebar of whatever window was beneath, and (being hover-revealed)
+    // intercepted every pointer path into that window — both for users and
+    // for Playwright (see tests/README.md).
+    position: 'absolute', bottom: 6, left: '50%',
     transform: 'translateX(-50%)',
     display: 'flex', alignItems: 'center', gap: 2,
     background: 'rgba(24,24,37,0.92)', border: '1px solid #313244',
