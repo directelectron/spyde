@@ -11,25 +11,34 @@ from dask.distributed import Client, LocalCluster
 logger = logging.getLogger(__name__)
 
 
-def _neutralize_slow_net_io_counters(probe_timeout: float = 2.0) -> None:
+def _neutralize_slow_net_io_counters(probe_timeout: float = 2.0,
+                                     force: bool = False) -> None:
     """Work around a Windows hang where ``psutil.net_io_counters()`` blocks for
-    ~70s, freezing Dask cluster startup.
+    ~60-70s, freezing the Dask scheduler/worker EVENT LOOPS.
 
-    Dask's ``distributed.SystemMonitor`` (created inside ``Scheduler.__init__``)
-    calls ``psutil.net_io_counters()`` UNCONDITIONALLY at construction and on
-    every monitor tick — and it has NO dask-config switch to disable it (unlike
-    disk/cpu/gil). On this dev machine (AzureAD-joined, many virtual NICs) that
-    syscall enumerates network adapters and blocks ~72s in the Electron-spawned
-    backend process — the scheduler build hung there until something else kicked
-    the network stack (observed: opening the file dialog). Confirmed by a
-    faulthandler stack dump: SystemMonitor.__init__ → psutil.net_io_counters.
+    Dask's ``distributed.SystemMonitor`` (created inside ``Scheduler.__init__``
+    AND inside every ``Worker``) calls ``psutil.net_io_counters()``
+    UNCONDITIONALLY at construction and on every monitor tick — and it has NO
+    dask-config switch to disable it (unlike disk/cpu/gil). On this dev machine
+    (AzureAD-joined, many virtual NICs) that syscall enumerates network
+    adapters and blocks ~60-72s. Confirmed by a faulthandler stack dump:
+    SystemMonitor.__init__ → psutil.net_io_counters.
 
-    We probe the call once on a worker thread with a short timeout. If it's slow,
-    we monkeypatch ``psutil.net_io_counters`` to return the last good sample (or
-    zeros) instantly. The net-io numbers are dashboard-only telemetry, so a
-    static/zero value is harmless — we trade a graph nobody watches at startup
-    for a cluster that starts in seconds. If the probe is fast, we leave psutil
-    untouched. Idempotent.
+    THE HANG IS INTERMITTENT and each monitor tick re-enters the syscall, so a
+    blocked tick freezes the hosting event loop ~60-70s at a time ("scheduler
+    up in 60.0s" was observed WITH the old probe-gated version — the probe
+    passed once and Scheduler.__init__ still blocked a minute).
+
+    ``force=True`` skips the probe and always installs the stub — the ONLY
+    cost is dashboard net-io telemetry, while a false-negative probe (the
+    2s call succeeding once on a box where later ticks block) costs frozen
+    event loops. The backend/scheduler process uses force=True, and
+    ``_NetIoStubPlugin`` installs the same stub inside every WORKER process
+    (a monkeypatch here never reaches those). Idempotent.
+
+    NB: this hardening did NOT turn out to be the cause of the separate
+    "batch tasks sit unscheduled until client traffic arrives" stall (timings
+    identical before/after) — see the fv-batch stall investigation.
     """
     if getattr(psutil, "_spyde_net_io_patched", False):
         return
@@ -46,7 +55,7 @@ def _neutralize_slow_net_io_counters(probe_timeout: float = 2.0) -> None:
     t.start()
     t.join(timeout=probe_timeout)
 
-    if not t.is_alive() and "val" in result:
+    if not force and not t.is_alive() and "val" in result:
         # Fast and healthy — leave the real implementation in place.
         return
 
@@ -77,12 +86,45 @@ def _neutralize_slow_net_io_counters(probe_timeout: float = 2.0) -> None:
 
     psutil.net_io_counters = _fast_net_io_counters
     psutil._spyde_net_io_patched = True
-    logger.warning(
-        "[dask] psutil.net_io_counters() did not return within %.1fs — patched "
-        "it to a non-blocking stub so Dask's SystemMonitor can't freeze cluster "
-        "startup (net-io dashboard telemetry disabled; harmless).",
-        probe_timeout,
+    logger.info(
+        "[dask] psutil.net_io_counters() patched to a non-blocking stub so "
+        "Dask's SystemMonitor can't freeze the scheduler/worker event loops "
+        "(net-io dashboard telemetry disabled; harmless).",
     )
+
+
+try:
+    from distributed.diagnostics.plugin import WorkerPlugin as _WorkerPluginBase
+except Exception:                                    # pragma: no cover
+    _WorkerPluginBase = object
+
+
+class _WorkerTuningPlugin(_WorkerPluginBase):
+    """WorkerPlugin: per-worker-process environment fixes (workers are
+    separate processes — backend-side patches never reach them). Runs on
+    every worker start, including nanny respawns. (Must inherit WorkerPlugin
+    — distributed rejects duck-typed plugins.)
+
+    1. net-io stub: each worker's SystemMonitor ticks
+       ``psutil.net_io_counters()`` on its event loop; one blocked tick
+       freezes that worker (execution AND comms) for ~70 s.
+    2. timer unthrottle: workers inherit the hidden-Electron-child throttling
+       class, so their timer waits freeze the same way as the backend's (see
+       process_guard.unthrottle_windows_timers).
+    """
+
+    name = "spyde-worker-tuning"
+
+    def setup(self, worker=None):
+        _neutralize_slow_net_io_counters(force=True)
+        try:
+            from spyde.backend.process_guard import unthrottle_windows_timers
+            unthrottle_windows_timers()
+        except Exception as e:
+            logger.debug("worker timer unthrottle failed: %s", e)
+
+    def teardown(self, worker=None):
+        pass
 
 
 def _probe_gpus() -> int:
@@ -155,12 +197,14 @@ class DaskManager:
                 self._n_workers,
             )
 
-            # ROOT-CAUSE FIX for the ~72s cluster-startup stall on this Windows
-            # box: Dask's SystemMonitor (built inside Scheduler.__init__) calls
-            # psutil.net_io_counters(), which blocked ~72s in the Electron backend
-            # process (AzureAD-joined, many virtual NICs). Neutralize it BEFORE
-            # building the cluster. See _neutralize_slow_net_io_counters.
-            _neutralize_slow_net_io_counters()
+            # Hardening for the ~60-72s STARTUP stall on this Windows box:
+            # Dask's SystemMonitor (built inside Scheduler.__init__ and ticked
+            # on the scheduler's event loop) calls psutil.net_io_counters(),
+            # which can block ~60-72s (AzureAD-joined, many virtual NICs).
+            # force=True: the intermittent hang defeats the old 2s probe (it
+            # passed once, then Scheduler.__init__ still blocked 60s). Workers
+            # get the same stub via _NetIoStubPlugin below.
+            _neutralize_slow_net_io_counters(force=True)
 
             # Build the SCHEDULER first (n_workers=0) so the client + dashboard
             # come up fast, THEN spawn workers and let them register in the
@@ -178,12 +222,27 @@ class DaskManager:
                 time.monotonic() - t_sched, _elapsed(),
             )
             client = Client(cluster)
+            # Every worker process must stub net_io_counters too (its own
+            # SystemMonitor ticks it on the worker event loop) — registered
+            # BEFORE workers spawn so the plugin runs at each worker's startup.
+            try:
+                try:
+                    client.register_plugin(_WorkerTuningPlugin())
+                except AttributeError:   # older distributed
+                    client.register_worker_plugin(_WorkerTuningPlugin())
+            except Exception as e:
+                logger.warning("[dask] worker tuning plugin failed: %s", e)
             n_gpus = _probe_gpus()
             gpu_worker_address = "gpu_available" if n_gpus > 0 else None
 
             self._cluster = cluster
             self._client = client
             self._gpu_worker_address = gpu_worker_address
+            # NB frozen-task-delivery mitigation lives in
+            # compute_dispatch.poke_scheduler + the dispatcher/orchestrate
+            # no-progress watchdogs (a permanent 1 Hz keepalive here was tried
+            # in three variants and did NOT reliably unstick delivery — only
+            # the on-stall full-poke trio did; see repro_batch_stall.py).
 
             # Scheduler + client are usable NOW — report ready immediately so the
             # app stops waiting. Workers spawn next (logged with their own timing).

@@ -38,6 +38,19 @@ import numpy as np
 
 log = logging.getLogger(__name__)
 
+# Never-set event used as an interruptible sleep. MEASURED on the Windows/
+# Electron-spawned backend: `time.sleep(0.05)` in a poll loop froze for 15 s
+# (woken only by process I/O — timer coalescing of the hidden child process)
+# while `threading.Event.wait(timeout)` in the same process ticked exactly on
+# schedule 120/120 times. Poll loops that must make progress use this.
+_WAKE = threading.Event()
+
+
+def reliable_sleep(seconds: float) -> None:
+    """Sleep that keeps ticking on the throttled Electron-spawned backend
+    (Event.wait-based — see _WAKE). Use instead of time.sleep in poll loops."""
+    _WAKE.wait(seconds)
+
 
 def split_workers_for_gpu(client) -> tuple:
     """
@@ -75,6 +88,31 @@ def split_workers_for_gpu(client) -> tuple:
     if not gpu_addrs or not cpu_addrs:
         return [], []
     return gpu_addrs, cpu_addrs
+
+
+def poke_scheduler(client, label: str = "poke") -> None:
+    """Fire the empirically-proven "unstick" trio of client round-trips.
+
+    On this Windows/Electron-spawned backend, submitted tasks can sit
+    {waiting, processing} with every worker idle INDEFINITELY — task delivery
+    only resumes after certain client↔scheduler/worker traffic (measured with
+    _probe_fv_stall.spec.ts; standalone the same code is healthy, see
+    repro_batch_stall.py). No SINGLE call type unsticks it reliably
+    (stochastic across runs), but the full trio below did 4/4 times, ~4 s to
+    completion each. The stall watchdogs call this every few seconds while a
+    compute makes no progress — a no-op cost on a healthy cluster (it never
+    fires) and bounded staleness on this one.
+    """
+    try:
+        client.run_on_scheduler(
+            lambda dask_scheduler: {
+                s: sum(1 for t in dask_scheduler.tasks.values() if t.state == s)
+                for s in {t.state for t in dask_scheduler.tasks.values()}})
+        client.scheduler_info(n_workers=-1)
+        client.call_stack()
+        log.info("[%s] stall poke fired (scheduler+info+call_stack)", label)
+    except Exception as e:
+        log.debug("[%s] stall poke failed: %s", label, e)
 
 
 def dispatch_chunks(
@@ -248,9 +286,17 @@ def dispatch_chunks(
             done_event.set()
 
     last_lane_refresh = time.time()
+    last_poke = time.time()
     while not done_event.wait(timeout=0.5):
         if stopped_flag is not None and stopped_flag[0]:
             break
+        # No-progress watchdog poke (see poke_scheduler): on the frozen-
+        # delivery pathology, tasks sit assigned-but-undelivered until client
+        # traffic arrives — re-poke every 5 s of no progress until they move.
+        now = time.time()
+        if now - state["last_progress"] > 5.0 and now - last_poke > 5.0:
+            last_poke = now
+            poke_scheduler(client, label)
         # Lane refresh: fold in workers that registered after dispatch start
         if time.time() - last_lane_refresh > 5.0:
             last_lane_refresh = time.time()

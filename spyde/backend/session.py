@@ -155,7 +155,12 @@ class Session(
     def set_main_loop(self, loop) -> None:
         """Register the main asyncio loop so the plot poller can marshal the
         result-apply onto this (main) thread. Call from app._main once the loop
-        is running."""
+        is running.
+
+        NB the process's frozen-timer pathology (waits only wake on process
+        I/O — see runner.ts's backend tick) is healed by Electron's 0.5 Hz
+        stdin tick; an in-process wake ticker was tried and is useless here
+        because its own sleep freezes the same way."""
         self._main_loop = loop
 
     def _dispatch_to_main(self, fn) -> None:
@@ -188,10 +193,16 @@ class Session(
     ):
         """Create a signal tree + plots for a loaded signal. Returns the tree.
 
+        NB: callers on fresh threads must not race the startup prewarm's
+        hyperspy/pyxem import (partially-initialized-module poisoning) —
+        ensure_heavy_imports() below single-flights it.
+
         ``navigator_override`` supplies a pre-built navigator (e.g. a vectors
         count-map) so the base navigator is NOT recomputed from the full
         dataset — essential for the breaking transformations (Find Vectors).
         """
+        from spyde.backend.heavy_imports import ensure_heavy_imports
+        ensure_heavy_imports()
         from spyde.signal_tree import BaseSignalTree
         from spyde.drawing.plots.plot import Plot
 

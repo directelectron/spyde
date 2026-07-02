@@ -56,6 +56,8 @@ def _prewarm_io() -> None:
         import tempfile, os as _os
         try:
             import numpy as np
+            from spyde.backend.heavy_imports import ensure_heavy_imports
+            ensure_heavy_imports()   # single-flight (races the load threads)
             import hyperspy.api as hs
             # A tiny real round-trip forces the hspy/zspy reader import path that
             # the first user load would otherwise pay for.
@@ -84,6 +86,16 @@ async def _main() -> None:
 
     # Keep stdout exclusively for the PLOTAPP protocol; stray prints → stderr.
     redirect_stray_stdout()
+
+    # FIRST: real timer interrupts. Windows throttles timers for this hidden
+    # Electron child, freezing every timer-driven wait in the process (dask
+    # task delivery, poll loops) until I/O arrives — the "computes only finish
+    # when you click" bug. See process_guard.unthrottle_windows_timers.
+    try:
+        from spyde.backend.process_guard import unthrottle_windows_timers
+        unthrottle_windows_timers()
+    except Exception as e:
+        log.warning("timer unthrottle failed: %s", e)
 
     # Guarantee Dask workers die with this process. The backend is an Electron
     # subprocess; if it is force-killed / crashes / Electron dies, the normal

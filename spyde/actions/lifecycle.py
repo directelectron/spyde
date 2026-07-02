@@ -147,6 +147,7 @@ def wait_for_vectors(session, plot, then: Callable[[], None], *, what: str,
         return resolve_vectors(session, plot)[1]
 
     def _wait():
+        from spyde.compute_dispatch import reliable_sleep
         waited = 0.0
         status_at = 0.0
         while True:
@@ -164,7 +165,7 @@ def wait_for_vectors(session, plot, then: Callable[[], None], *, what: str,
             if waited >= timeout:
                 emit_error(f"{what} timed out waiting for diffraction vectors.")
                 return
-            time.sleep(0.1)
+            reliable_sleep(0.1)
             waited += 0.1
 
     threading.Thread(target=_wait, daemon=True, name="wait-vectors").start()
@@ -248,6 +249,7 @@ def live_fill_poller(shape: Sequence[int], shm_name: str | None,
     if shm_name is None:
         return stop
 
+    from spyde.compute_dispatch import reliable_sleep
     from spyde.drawing.update_functions import read_live_buffer
 
     def _poller():
@@ -256,7 +258,7 @@ def live_fill_poller(shape: Sequence[int], shm_name: str | None,
                 paint(read_live_buffer(tuple(shape), shm_name))
             except Exception as e:
                 log.debug("live-fill poll paint failed: %s", e)
-            time.sleep(interval)
+            reliable_sleep(interval)
 
     threading.Thread(target=_poller, daemon=True, name=name).start()
     return stop

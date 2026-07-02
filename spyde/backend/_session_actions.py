@@ -35,7 +35,7 @@ _TEST_ACTIONS_ENABLED = os.environ.get("SPYDE_PACKAGED") != "1"
 _TEST_ACTIONS = frozenset({
     "load_test_data", "load_test_data_lazy", "load_test_data_lazy_chunked",
     "load_test_data_si_grains", "load_test_data_sped_ag", "test_nav_drag",
-    "load_test_vectors", "run_test_orientation",
+    "load_test_vectors", "run_test_orientation", "dump_dask_state",
 })
 
 # The staged-action table (STAGED_HANDLERS) lives in spyde.actions.registry so
@@ -48,6 +48,12 @@ class ActionRouterMixin:
         action = msg.get("action")
         payload = msg.get("payload", {})
         window_id = msg.get("window_id")
+
+        if action == "tick":
+            # Electron's 0.5 Hz backend tick — its arrival on stdin is the
+            # point (it wakes this throttled process's frozen timer waits, incl.
+            # dask task delivery; see runner.ts). Nothing to do.
+            return
 
         plot = self._plot_by_window_id(window_id) if window_id is not None else None
 
@@ -75,6 +81,8 @@ class ActionRouterMixin:
             ).start()
         elif action == "load_test_vectors":
             self._load_test_vectors()
+        elif action == "dump_dask_state":
+            self._dump_dask_state(only=payload.get("only"))
         elif action in STAGED_HANDLERS:
             # Staged-wizard handlers (Orientation / Find-Vectors / Vector-OM /
             # Center-Zero-Beam) share the (session, plot, payload) signature and

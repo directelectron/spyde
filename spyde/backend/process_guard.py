@@ -25,6 +25,65 @@ import sys
 
 logger = logging.getLogger(__name__)
 
+
+def unthrottle_windows_timers() -> None:
+    """Ask Windows for real timer interrupts for THIS process (no-op off
+    Windows; idempotent; best-effort).
+
+    MEASURED pathology in the Electron-spawned backend (probe
+    ``_probe_fv_stall.spec.ts`` + ``repro_batch_stall.py``): OS timer waits do
+    not expire on schedule — a ``time.sleep(0.05)`` poll loop slept 15 s and
+    woke only when process I/O arrived; dask's timer-driven scheduler work
+    (task delivery to workers!) froze the same way, so distributed computes
+    only progressed when the user clicked something (stdin I/O). The SAME
+    code run from a console is healthy — Windows withholds timer interrupts
+    from the hidden Electron child (power throttling / timer coalescing).
+
+    Two knobs:
+    * ``SetProcessInformation(ProcessPowerThrottling)`` with EXECUTION_SPEED
+      and IGNORE_TIMER_RESOLUTION control bits CLEARED in the state mask —
+      explicitly opt this process OUT of EcoQoS speed throttling and OUT of
+      "ignore timer-resolution requests" (Win10 1709+).
+    * ``winmm.timeBeginPeriod(1)`` — request 1 ms timer interrupts, which the
+      opt-out above makes Windows actually honor.
+
+    Called at backend startup (app._main) and inside every Dask worker
+    process (dask_manager._WorkerTuningPlugin) — workers are children of this
+    hidden process and inherit the same throttling class.
+    """
+    if sys.platform != "win32":
+        return
+    import ctypes
+    from ctypes import wintypes
+    try:
+        class PROCESS_POWER_THROTTLING_STATE(ctypes.Structure):
+            _fields_ = [("Version", wintypes.ULONG),
+                        ("ControlMask", wintypes.ULONG),
+                        ("StateMask", wintypes.ULONG)]
+
+        PPT_CURRENT_VERSION = 1
+        PPT_EXECUTION_SPEED = 0x1
+        PPT_IGNORE_TIMER_RESOLUTION = 0x4
+        ProcessPowerThrottling = 4
+        state = PROCESS_POWER_THROTTLING_STATE(
+            PPT_CURRENT_VERSION,
+            PPT_EXECUTION_SPEED | PPT_IGNORE_TIMER_RESOLUTION,
+            0,   # both bits cleared = throttling OFF, honor timer resolution
+        )
+        ok = ctypes.windll.kernel32.SetProcessInformation(
+            ctypes.windll.kernel32.GetCurrentProcess(),
+            ProcessPowerThrottling, ctypes.byref(state), ctypes.sizeof(state))
+        logger.info("[timers] power-throttling opt-out: %s",
+                    "ok" if ok else "failed")
+    except Exception as e:
+        logger.info("[timers] power-throttling opt-out unavailable: %s", e)
+    try:
+        res = ctypes.windll.winmm.timeBeginPeriod(1)
+        logger.info("[timers] timeBeginPeriod(1) -> %s (0=ok)", res)
+    except Exception as e:
+        logger.info("[timers] timeBeginPeriod unavailable: %s", e)
+
+
 # Module-level so the job handle lives for the whole process lifetime. If it were
 # a local it would be garbage-collected, closing the handle and (because
 # KILL_ON_JOB_CLOSE) killing us immediately.

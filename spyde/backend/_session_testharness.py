@@ -24,6 +24,85 @@ log = logging.getLogger(__name__)
 
 
 class TestHarnessMixin:
+    def _dump_dask_state(self, only: str | None = None) -> None:
+        """Log a compact snapshot of the dask cluster's state at WARNING level
+        (so it lands in the Playwright harness's captured stderr even at
+        SPYDE_LOG_LEVEL=WARNING): scheduler task-state histogram, per-worker
+        executing/ready counts, and the call stacks of executing tasks.
+
+        THE debugging tool for "the compute looks stuck" reports — a spec (or
+        a human) fires `backendAction(page, 'dump_dask_state')` and reads the
+        [dask-state] lines from ctx.backend.logBuffer. Runs on a worker thread
+        (the client calls are sync round-trips; never block the main loop).
+
+        ``only`` restricts to a single call type ("scheduler" | "info" |
+        "call_stack") — used by the stall probe to isolate WHICH round-trip
+        unsticks frozen task delivery."""
+        def _work():
+            try:
+                dm = getattr(self, "dask_manager", None)
+                client = getattr(dm, "client", None) if dm is not None else None
+                if client is None:
+                    log.warning("[dask-state] no dask client (threaded mode?)")
+                    return
+                log.warning("[dask-state] client=%s scheduler=%s only=%s",
+                            client.status, client.scheduler.address, only)
+                # Loop-identity forensics: is the dask client/scheduler running
+                # on the app's MAIN asyncio loop (whose timers are dead unless
+                # stdin wakes it) instead of its own LoopRunner thread?
+                try:
+                    c_loop = getattr(getattr(client, "loop", None),
+                                     "asyncio_loop", None)
+                    main_loop = getattr(self, "_main_loop", None)
+                    sched = getattr(getattr(getattr(self, "dask_manager", None),
+                                            "_cluster", None), "scheduler", None)
+                    s_loop = getattr(getattr(sched, "loop", None),
+                                     "asyncio_loop", None)
+                    log.warning(
+                        "[dask-state] loops: client=%r scheduler=%r main=%r "
+                        "client_is_main=%s scheduler_is_main=%s",
+                        c_loop, s_loop, main_loop,
+                        c_loop is main_loop, s_loop is main_loop)
+                except Exception as e:
+                    log.warning("[dask-state] loop forensics failed: %s", e)
+                # Task-state histogram straight from the scheduler.
+                if only in (None, "scheduler"):
+                    try:
+                        counts = client.run_on_scheduler(
+                            lambda dask_scheduler: {
+                                s: sum(1 for t in dask_scheduler.tasks.values()
+                                       if t.state == s)
+                                for s in {t.state for t in
+                                          dask_scheduler.tasks.values()}})
+                    except Exception as e:
+                        counts = f"<unavailable: {e}>"
+                    log.warning("[dask-state] scheduler task states: %s", counts)
+                if only in (None, "info"):
+                    info = client.scheduler_info(n_workers=-1).get("workers", {})
+                    for addr, w in info.items():
+                        m = w.get("metrics", {})
+                        log.warning("[dask-state] worker %s executing=%s ready=%s "
+                                    "in_memory=%s cpu=%s%%", addr,
+                                    m.get("executing"), m.get("ready"),
+                                    m.get("in_memory"), m.get("cpu"))
+                if only in (None, "call_stack"):
+                    try:
+                        stacks = client.call_stack()
+                        if stacks:
+                            for addr, tasks in stacks.items():
+                                for key, frames in tasks.items():
+                                    log.warning("[dask-state] EXECUTING %s :: %s\n%s",
+                                                addr, key, "\n".join(frames[-6:]))
+                        else:
+                            log.warning("[dask-state] no tasks executing anywhere")
+                    except Exception as e:
+                        log.warning("[dask-state] call_stack failed: %s", e)
+                log.warning("[dask-state] dump(only=%s) complete", only)
+            except Exception as e:
+                log.warning("[dask-state] dump failed: %s", e)
+
+        threading.Thread(target=_work, daemon=True, name="dump-dask-state").start()
+
     def _load_test_data(self) -> None:
         """Load a synthetic 4D-STEM dataset (no file, no Dask, no download).
 
@@ -105,6 +184,8 @@ class TestHarnessMixin:
         featureless-disk fixtures it has a real reciprocal lattice with crisp
         spots, so the orientation overlay's matched template lands on actual
         peaks — the offline/CI counterpart to sped_ag for OM/overlay tests."""
+        from spyde.backend.heavy_imports import ensure_heavy_imports
+        ensure_heavy_imports()   # don't race the startup prewarm's pyxem import
         import pyxem.data as pxd
         s = pxd.si_grains()
         try:
