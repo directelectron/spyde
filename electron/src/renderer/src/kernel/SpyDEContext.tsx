@@ -205,10 +205,12 @@ function spydeReducer(state: State, action: Action): State {
                && f.figId !== action.figId)),
         figure,
       ]
-      // A secondary view figure (e.g. the IPF 3-D explorer, view="3d") must NOT
-      // rename the window or flip its navigator flag — those belong to the
-      // primary figure.
-      if (!action.view) {
+      // A secondary view figure (e.g. the IPF 3-D explorer, view="3d") or a
+      // named chip view (view_label — strain εyy/εxy/ω, committed-tree views)
+      // must NOT rename the window or flip its navigator flag — those belong
+      // to the primary figure. (Without the view_label guard a committed
+      // Strain window ended up titled "ω": the last-emitted chip view won.)
+      if (!action.view && !action.viewLabel) {
         win.title = action.title
         win.isNavigator = action.isNavigator
         if (action.aspect && action.aspect > 0) win.aspect = action.aspect

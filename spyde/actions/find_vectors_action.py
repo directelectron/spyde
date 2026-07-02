@@ -177,13 +177,24 @@ def _start_batch(session, plot, src_tree, p: dict):
 
     def _work():
         try:
+            # Timing logs at INFO so a "batch looks stuck" report can be
+            # localized from the app log: cluster compute vs finalize/paint.
+            # (Chronic symptom under investigation: the batch sometimes only
+            # completes after the user clicks a plot — i.e. after unrelated
+            # navigator traffic reaches the same dask client.)
+            import time as _time
+            t0 = _time.monotonic()
+            log.info("[fv-batch] compute starting (shm=%s)", shm_name)
             vecs = _do_compute_vectors(src, p, main_window=session,
                                        signal_tree=src_tree, shm_name=shm_name)
+            log.info("[fv-batch] compute returned in %.1fs (vecs=%s)",
+                     _time.monotonic() - t0, "none" if vecs is None else "ok")
             stop_poll()                              # final paint owns the nav plot
             if vecs is None:
                 emit_error("Find Vectors: compute returned no result")
                 return
             _finalize(new_tree, vecs)
+            log.info("[fv-batch] finalized in %.1fs total", _time.monotonic() - t0)
             _overlay_on_source(src_tree, src_dp_plot, vecs)
         except Exception as e:
             emit_error(f"Find Vectors failed: {e}")
