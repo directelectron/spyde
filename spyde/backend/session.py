@@ -96,6 +96,12 @@ class Session(
         # racing ahead with a None client (which errored "Folder not found" /
         # silently produced no navigator). See _await_dask.
         self._dask_ready = threading.Event()
+        # Tests and headless scripts construct Session directly, bypassing
+        # app.py's SPYDE_NO_DASK branch — honour the env var here too, or a
+        # load thread blocks _await_dask's full timeout on a cluster that will
+        # never start (the test_nav_shape_prompt "busy never cleared" CI hang).
+        if os.environ.get("SPYDE_NO_DASK") == "1":
+            self._dask_ready.set()
 
         # Plot update poller. `dispatch` marshals the result-APPLY onto the main
         # asyncio thread (set later via set_main_loop, once the loop exists) — the
