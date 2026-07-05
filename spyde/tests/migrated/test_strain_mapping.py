@@ -282,20 +282,42 @@ class TestStrainAction:
 
         session = _Session()
 
+        # Faithfully reproduce production timing: React StrictMode fires
+        # open → close → open SYNCHRONOUSLY, before any strain_open's worker
+        # finishes computing (that's the whole point of the generation guard).
+        # A fast CI runner (esp. macOS) can otherwise finish the FIRST worker's
+        # 6×6 compute before the main thread issues close/open #2 — building a
+        # gen-1 window that later races the gen-3 window (2 figures, a test
+        # flake, not a real bug). Gate the compute on a barrier the main thread
+        # releases only AFTER the full sequence is issued, so both workers
+        # ALWAYS land into the final generation like they do in the real app.
+        # strain_open imports compute_strain_field from strain_mapping at call
+        # time, so gate it there.
+        import spyde.actions.strain_mapping as _sm
+        released = threading.Event()
+        _real_compute = _sm.compute_strain_field
+
+        def _gated_compute(*a, **k):
+            released.wait(timeout=5.0)
+            return _real_compute(*a, **k)
+
         cap, orig = [], ipc.emit
         ipc.emit = lambda m: cap.append(m)
+        _sm.compute_strain_field = _gated_compute
         try:
             # The exact StrictMode sequence: run, stop, run — all synchronous,
             # before any of strain_open's background "strain-run" threads land.
             strain_open(session, plot, {})
             strain_close(session, plot, {})
             strain_open(session, plot, {})
+            released.set()   # now let both workers compute + dispatch back
             # Let both strain_open compute threads finish and dispatch back.
             for t in threading.enumerate():
                 if t.name == "strain-run":
                     t.join(timeout=5.0)
         finally:
             ipc.emit = orig
+            _sm.compute_strain_field = _real_compute
 
         fig_msgs = [m for m in cap if m.get("type") == "figure"]
         # Exactly one strain-map window's figure must have been emitted and
