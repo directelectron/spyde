@@ -152,20 +152,34 @@ class FileLoaderMixin:
             log.exception("dense-vectors load failed for %s", path)
             return True   # we recognised it; don't fall through to image open
 
-    @staticmethod
-    def _signal_spanning_chunks(sig, nav_chunk: int = 32):
+    # Target bytes per chunk for whole-signal-frame chunking. ~64 MB keeps a
+    # single-frame read cheap without a per-chunk explosion: a 128x128 uint16 DP
+    # (32 KB) packs ~2000 frames/chunk (capped at NAV_CHUNK_MAX below), while an
+    # 8k x 8k uint8/float frame (64-256 MB) forces exactly ONE frame per chunk.
+    _CHUNK_TARGET_BYTES = 64 << 20  # 64 MB
+    _NAV_CHUNK_MAX = 32             # never span more than this many nav positions
+
+    @classmethod
+    def _signal_spanning_chunks(cls, sig, nav_chunk: "int | None" = None):
         """Chunks for a lazy 2-D-signal dataset where each chunk holds WHOLE
         signal frames (``-1`` on the signal axes) and a small contiguous nav
         block.  Returns a ``chunks`` tuple to re-load with, or None if the
-        dataset isn't a navigated 2-D-signal or its signal axes are already
-        whole.
+        dataset isn't a navigated 2-D-signal or its chunking is already fine.
 
         Why: RosettaSciIO auto-chunks a 4-D MRC as a balanced cube (e.g.
         (90,90,90,90)) that SPLITS the signal axes — so reading one diffraction
         pattern ``data[iy,ix]`` pulls a 131 MB chunk spanning 90x90 nav
         positions and partial frames.  Whole-signal chunks make single-frame
         navigator access read one contiguous chunk, and the navigator sum is
-        uniform across chunk boundaries."""
+        uniform across chunk boundaries.
+
+        The nav-block size is **adapted to the frame byte size** so a chunk stays
+        near ``_CHUNK_TARGET_BYTES`` regardless of frame resolution. The old flat
+        ``nav_chunk=32`` was tuned for 128-256 px DP frames; for an in-situ movie
+        of 8k x 8k images it would make a 512 MB chunk (32 x 64 MB) and read half
+        a gigabyte to show one frame — see benchmarks.md "movie playback". Now a
+        big frame gets 1 frame/chunk, a small DP many. Pass ``nav_chunk`` to force
+        a value (tests)."""
         try:
             am = sig.axes_manager
             nav_dim = am.navigation_dimension
@@ -173,10 +187,26 @@ class FileLoaderMixin:
             data = sig.data
             if sig_dim != 2 or nav_dim < 1 or not hasattr(data, "chunks"):
                 return None
-            # Signal axes already whole (one chunk each)? nothing to do.
+
+            # Frame byte size drives the adaptive nav-block target.
+            sig_shape = data.shape[nav_dim:]
+            frame_bytes = int(np.prod(sig_shape)) * data.dtype.itemsize
+            if nav_chunk is None:
+                target = max(1, cls._CHUNK_TARGET_BYTES // max(1, frame_bytes))
+                nav_chunk = int(min(cls._NAV_CHUNK_MAX, target))
+
             sig_chunks = data.chunks[nav_dim:]
-            if all(len(c) == 1 for c in sig_chunks):
+            sig_whole = all(len(c) == 1 for c in sig_chunks)
+            # Current nav-block size (frames per chunk on the fastest-varying nav
+            # axis the reader split); used to decide if a re-chunk is warranted.
+            cur_nav0 = data.chunks[0][0] if data.chunks and data.chunks[0] else 1
+
+            # If the signal axes are ALREADY whole AND the reader's nav block is
+            # no bigger than our target, the chunking is fine — don't rebuild the
+            # graph for nothing (the common self-describing / already-good case).
+            if sig_whole and cur_nav0 <= nav_chunk:
                 return None
+
             nav_shape = data.shape[:nav_dim]
             nav = tuple(min(nav_chunk, int(n)) for n in nav_shape)
             return nav + (-1,) * sig_dim
