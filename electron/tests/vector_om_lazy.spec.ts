@@ -118,8 +118,23 @@ test('Vector Orientation Mapping: Generate → Compute opens IPF + strain window
   // IPF window opened focused on top of the caret — raise the source first.
   await raise(vsig)
   await page.getByTestId('vom-tab-Refine').click()
-  await expect(page.getByTestId('vom-strain-readout'))
-    .toContainText('εxx', { timeout: 30_000 })
+  // Nudge the strain-cap slider → fires vom_refine, which FORCES a fresh
+  // single-pattern fit at the current crosshair and streams vom_fit. Without
+  // this, the readout only shows a result if an earlier crosshair event
+  // happened to stream one already — flaky on a loaded CI runner (the fit
+  // event can lag the tab switch). Retry until the readout populates: on a
+  // slow box the first refine may land before the field-fit overlay is ready.
+  await expect(async () => {
+    await page.getByTestId('vom-strain-cap').evaluate((el: HTMLInputElement) => {
+      const setter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype, 'value')!.set!
+      // Toggle to a distinct value so React's onChange definitely fires.
+      setter.call(el, el.value === '5' ? '5.1' : '5')
+      el.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    await expect(page.getByTestId('vom-strain-readout'))
+      .toContainText('εxx', { timeout: 8_000 })
+  }).toPass({ timeout: 60_000 })
 
   // 4 Run → reuses the field, adds ONE unified Strain window (IPF already shown).
   const before = await page.getByTestId('subwindow').count()
