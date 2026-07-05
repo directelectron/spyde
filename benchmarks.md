@@ -328,3 +328,48 @@ detection F1 vs known spots (tuned to F1=1.0 on clean data):
   it). Gap ~1-2% F1; Gaussian keeps better sub-pixel precision (0.48 vs 0.63 px).
 - Verdict: keep Gaussian default; offer TV nav-denoise for low-dose data with
   sharp grain structure. Dose/microstructure-dependent, not a universal win.
+
+## In-situ movie playback — per-frame stage timings (Phase 0, 2026-07-05)
+
+`benchmark_movie_playback.py` on a **real Direct-Electron in-situ movie**
+`20251117_88074_run1_9104_movie.mrc` = **(3618, 4096, 4096) uint8**, 60.7 GB —
+a 3618-frame movie of **4k×4k image frames** (16.8 MB/frame), nav-dim 1 (time).
+This is the case the 4D-STEM-oriented live-display path was NOT built for.
+Frames sampled across the stack (crossing chunk boundaries); cold OS cache.
+
+| stage | mean ms | what |
+|---|---:|---|
+| `memmap`    |  44 | `np.memmap mm[t]` -> RAM — the proposed playback read |
+| `normalize` | 185 | -> uint8 (anyplotlib `set_data` / `_normalize_image`) |
+| `getinds`   | 251 | hyperspy `_get_cache_dask_chunk` — **the current live-display call** (threaded) |
+| `b64`       | 268 | + base64 encode (transport payload) |
+| `compute`   | 275 | dask `raw[t].compute()` (threaded) |
+| `json`      | 323 | + `json.dumps` PLOTAPP line (the full transport step) |
+
+Frame in RAM **16.8 MB**; transport payload (b64-in-JSON) **22.4 MB/frame**
+(scales to ~85 MB at 8k×8k).
+
+**Findings (these drive the rewrite):**
+- **Dask is the wrong tool for sequential movie reads.** `compute()` is **6.2×**
+  the raw memmap read (275 vs 44 ms) and the current live-display `getinds` call
+  is **~5.7×** (251 vs 44 ms) — because the reader auto-chunks 8 frames × full
+  4096² = a **128 MB chunk read per single frame**. The plan's `nav_chunk=32`
+  re-chunk would make it a **512 MB chunk** — worse. Confirms the "dask might be
+  an issue" suspicion; motivates the direct `np.memmap` playback read (Phase 2)
+  and per-frame-size-adaptive chunking (Phase 1).
+- **Transport dominates the rest.** normalize->b64->json is **185->268->323 ms**
+  and ships **22.4 MB/frame** of base64-in-JSON. Motivates the binary transport +
+  GPU-shader colormap (Phases 4-5, in anyplotlib).
+- **Current total ≈ getinds (251) + json transport (323) ≈ ~570 ms/frame -> under
+  2 fps** on a 4k movie. Target (memmap 44 + binary + GPU render) removes ~500 ms
+  of that. The ordering says: fix the read path AND the transport; normalize/LUT
+  moving to the GPU removes the ~185 ms normalize too.
+
+**Pure 8k×8k transport** (`--synthetic 8192`, no disk): normalize **729 ms** ->
+b64 **1037 ms** -> json **1288 ms**, payload **89.5 MB/frame** (67.1 MB frame in
+RAM). i.e. the transport chain ALONE is >1 s/frame (<1 fps) at 8k before any read
+or render — the base64-in-JSON-over-stdout scheme cannot carry an 8k movie. This
+is the hard case for the binary transport + GPU-shader colormap.
+
+Run: `.venv/Scripts/python spyde/tests/benchmark_movie_playback.py --frames 20`
+(`--path <file.mrc>`, or `--synthetic 8192` for pure 8k transport numbers).
