@@ -49,3 +49,10 @@ try:
     __version__ = version("spyde")
 except PackageNotFoundError:
     __version__ = "0.0.0+unknown"
+
+
+# The script-parity layer (`from spyde import api` / `spyde.api.find_vectors`).
+# Cheap: spyde.api defers every heavy import into its functions.
+from spyde import api  # noqa: E402,F401
+
+__all__ += ["api", "__version__"]

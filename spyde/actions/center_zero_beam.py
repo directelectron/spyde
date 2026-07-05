@@ -16,7 +16,6 @@ removed in the Qt-removal cleanup.
 from __future__ import annotations
 
 import logging
-import threading
 
 import numpy as np
 
@@ -26,26 +25,113 @@ from spyde.actions.context import src_plot_tree as _src_plot_tree, current_signa
 log = logging.getLogger(__name__)
 
 DEFAULTS = dict(method="center_of_mass", half_square_width=0, make_flat_field=False)
+
+# Declared parameter schema (single source of truth for every host — the
+# Electron CenterZeroBeamWizard.tsx caret mirrors the Automatic tab; the
+# Manual tab is a crosshair interaction, not a parameter). Same dict spec as
+# toolbars.yaml `parameters:`. CZB has no controller class (pure staged
+# handlers), so the schema lives module-level; resolved via
+# registry.wizard_parameters("czb").
+PARAMETERS = {
+    "method": {
+        "name": "Method", "type": "enum", "default": DEFAULTS["method"],
+        # everything pyxem get_direct_beam_position accepts
+        "choices": ["center_of_mass", "cross_correlate", "blur", "interpolate"],
+        "tab": "Automatic",
+    },
+    "half_square_width": {
+        "name": "Half window (px, 0=full)", "type": "int",
+        "default": DEFAULTS["half_square_width"], "min": 0, "max": 256,
+        "tab": "Automatic",
+    },
+    "make_flat_field": {
+        "name": "Plane-fit shifts", "type": "bool",
+        "default": DEFAULTS["make_flat_field"], "tab": "Automatic",
+    },
+}
 _CROSS_COLOR = "#ffcc00"
+_REGION_COLOR = "#ffcc00"    # the half_square_width centering window outline
+_FOUND_COLOR = "#a6e3a1"     # the found beam-centre marker
+
+
+def _czb_remove_region(tree) -> None:
+    mg = getattr(tree, "_czb_region_mg", None) if tree is not None else None
+    if mg is not None:
+        try:
+            mg.remove()
+        except Exception as e:
+            log.debug("removing czb region box failed: %s", e)
+        tree._czb_region_mg = None
+
+
+def _czb_remove_found(tree) -> None:
+    for mg in (getattr(tree, "_czb_found_mgs", None) or []) if tree is not None else []:
+        try:
+            mg.remove()
+        except Exception as e:
+            log.debug("removing czb found-centre marker failed: %s", e)
+    if tree is not None:
+        tree._czb_found_mgs = None
+
+
+def czb_set_region(session, plot, payload) -> None:
+    """Automatic tab: outline the centering search window (the centred
+    ``half_square_width`` box pyxem's ``get_direct_beam_position`` uses) live
+    on the DP so the user sees what region drives the fit. ``hw <= 0`` (full
+    frame) removes the box."""
+    src, tree = _src_plot_tree(session, plot)
+    signal = _current_signal(src)
+    plot2d = getattr(src, "_plot2d", None) if src is not None else None
+    if plot2d is None or signal is None or tree is None:
+        return
+    _czb_remove_region(tree)
+    hw = int(payload.get("half_square_width", 0) or 0)
+    if hw <= 0:
+        return
+    sig_ax = signal.axes_manager.signal_axes
+    w, h = int(sig_ax[0].size), int(sig_ax[1].size)
+    side = float(min(2 * hw, w, h))
+    try:
+        tree._czb_region_mg = plot2d.add_squares(
+            [[w / 2.0, h / 2.0]], [side], name="czb_region",
+            edgecolors=_REGION_COLOR, facecolors=None, linewidths=1.5, alpha=0.9,
+        )
+    except Exception as e:
+        log.debug("czb region box draw failed: %s", e)
+
+
+def _czb_show_found(src, tree, signal, beam_xy) -> None:
+    """Mark the found beam centre on the DP: a ring at the ORIGINAL beam
+    position (mean over the scan for Automatic; the picked spot for Manual)
+    plus a small cross at the target centre the pattern is now centred on."""
+    plot2d = getattr(src, "_plot2d", None) if src is not None else None
+    if plot2d is None or tree is None:
+        return
+    try:
+        _czb_remove_found(tree)
+        sig_ax = signal.axes_manager.signal_axes
+        w, h = int(sig_ax[0].size), int(sig_ax[1].size)
+        bx, by = float(beam_xy[0]), float(beam_xy[1])
+        arm = max(3.0, min(w, h) * 0.03)
+        mgs = [
+            plot2d.add_circles([[bx, by]], name="czb_found", radius=5,
+                               edgecolors=_FOUND_COLOR, facecolors=None,
+                               linewidths=2.0, alpha=0.95),
+            plot2d.add_lines(
+                [[[w / 2.0 - arm, h / 2.0], [w / 2.0 + arm, h / 2.0]],
+                 [[w / 2.0, h / 2.0 - arm], [w / 2.0, h / 2.0 + arm]]],
+                name="czb_centre", edgecolors=_FOUND_COLOR, linewidths=1.2),
+        ]
+        tree._czb_found_mgs = mgs
+    except Exception as e:
+        log.debug("czb found-centre marker failed: %s", e)
 
 
 def _display(src, tree, new_signal) -> None:
-    """Switch the source DP to display the new (centered) node and re-slice from
-    the navigator so the centered frame shows immediately. ``add_transformation``
-    only REGISTERS the new PlotState; switching the view is a separate step."""
-    try:
-        src.set_plot_state(new_signal)
-    except Exception as e:
-        log.debug("switching source plot to centered node failed: %s", e)
-    npm = getattr(tree, "navigator_plot_manager", None)
-    if npm is None:
-        return
-    for sels in getattr(npm, "navigation_selectors", {}).values():
-        for sel in sels:
-            try:
-                sel.delayed_update_data(force=True)
-            except Exception as e:
-                log.debug("re-slicing navigator after centering failed: %s", e)
+    """Switch the source DP to the new (centered) node, re-slice from the
+    navigator, and refresh the Workflow panel (the shared lifecycle helper)."""
+    from spyde.actions.lifecycle import show_tree_node
+    show_tree_node(src, tree, new_signal)
 
 
 def center_zero_beam(ctx, action_name: str = "Center Zero Beam", **kwargs):
@@ -55,7 +141,7 @@ def center_zero_beam(ctx, action_name: str = "Center Zero Beam", **kwargs):
     return None
 
 
-def czb_auto(session, plot, payload) -> None:
+def czb_run(session, plot, payload) -> None:
     """Automatic tab: estimate the beam position per pattern and centre it."""
     src, tree = _src_plot_tree(session, plot)
     signal = _current_signal(src)
@@ -94,10 +180,17 @@ def czb_auto(session, plot, payload) -> None:
                 emit_error("Center Zero Beam: centering failed")
                 return
             _display(src, tree, new)
+            # Mark where the beam was found (mean over the scan): shift
+            # convention is (centre − beam), so beam = centre − shift.
             try:
-                session._reemit_signal_tree(src)
+                s = np.asarray(shifts.data, dtype=np.float64)
+                sig_ax = signal.axes_manager.signal_axes
+                w, h = int(sig_ax[0].size), int(sig_ax[1].size)
+                beam = (w / 2.0 - float(np.nanmean(s[..., 0])),
+                        h / 2.0 - float(np.nanmean(s[..., 1])))
+                _czb_show_found(src, tree, signal, beam)
             except Exception as e:
-                log.debug("re-emitting signal tree after centering failed: %s", e)
+                log.debug("czb found-centre (auto) failed: %s", e)
             emit_status("Zero beam centered")
             emit({"type": "czb_done",
                   "window_id": getattr(src, "window_id", None), "mode": "auto"})
@@ -105,16 +198,19 @@ def czb_auto(session, plot, payload) -> None:
             emit_error(f"Center Zero Beam (auto) failed: {e}")
             log.exception("Center Zero Beam (auto) failed")
 
-    threading.Thread(target=_work, daemon=True, name="czb-auto").start()
+    from spyde.actions.lifecycle import run_on_worker
+    run_on_worker(session, _work, name="czb-auto")
 
 
-def czb_manual_start(session, plot, payload) -> None:
+def czb_open(session, plot, payload) -> None:
     """Manual tab: drop a draggable crosshair at the centre of the DP for the
     user to drag onto the zero beam."""
     src, tree = _src_plot_tree(session, plot)
     signal = _current_signal(src)
     plot2d = getattr(src, "_plot2d", None) if src is not None else None
     if plot2d is None or signal is None:
+        emit_error("Center Zero Beam: no active diffraction plot to place the "
+                   "crosshair on")
         return
     sig_ax = signal.axes_manager.signal_axes
     w, h = int(sig_ax[0].size), int(sig_ax[1].size)
@@ -137,13 +233,16 @@ def _czb_manual_stop_obj(tree) -> None:
         tree._czb_cross = None
 
 
-def czb_manual_stop(session, plot, payload=None) -> None:
-    """Caret closed / left the Manual tab → remove the crosshair."""
+def czb_close(session, plot, payload=None) -> None:
+    """Caret closed / left the Manual tab → remove the crosshair, the region
+    box, and the found-centre marker."""
     _src, tree = _src_plot_tree(session, plot)
     _czb_manual_stop_obj(tree)
+    _czb_remove_region(tree)
+    _czb_remove_found(tree)
 
 
-def czb_manual(session, plot, payload) -> None:
+def czb_pick(session, plot, payload) -> None:
     """Manual tab Apply: centre by the picked crosshair position (constant shift
     ``centre − picked`` over the whole scan)."""
     src, tree = _src_plot_tree(session, plot)
@@ -190,11 +289,8 @@ def czb_manual(session, plot, payload) -> None:
                 emit_error("Center Zero Beam: centering failed")
                 return
             _display(src, tree, new)
-            try:
-                session._reemit_signal_tree(src)
-            except Exception as e:
-                log.debug("re-emitting signal tree after centering failed: %s", e)
             _czb_manual_stop_obj(tree)
+            _czb_show_found(src, tree, signal, (float(cx), float(cy)))
             emit_status("Zero beam centered (manual)")
             emit({"type": "czb_done",
                   "window_id": getattr(src, "window_id", None), "mode": "manual"})
@@ -202,4 +298,5 @@ def czb_manual(session, plot, payload) -> None:
             emit_error(f"Center Zero Beam (manual) failed: {e}")
             log.exception("Center Zero Beam (manual) failed")
 
-    threading.Thread(target=_work, daemon=True, name="czb-manual").start()
+    from spyde.actions.lifecycle import run_on_worker
+    run_on_worker(session, _work, name="czb-manual")

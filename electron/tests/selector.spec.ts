@@ -343,6 +343,9 @@ test('navigator close button (real backend) removes EVERY window of the tree', a
   expect(await page.getByTestId('subwindow').count()).toBeGreaterThanOrEqual(2)
   // The Navigator Selector toggle is present while the tree is open.
   await expect(page.getByTestId('selector-control')).toBeVisible()
+  // Raise the navigator first — an overlapping sibling can cover its controls
+  // (windows share z-levels; there is no hover-raise).
+  await navSubwindow().getByTestId('subwindow-titlebar').click()
   await navSubwindow().getByTestId('close-btn').click()
   await expect(page.getByTestId('subwindow')).toHaveCount(0, { timeout: 15_000 })
   // …and it must disappear when the tree closes (per-window state is dropped).

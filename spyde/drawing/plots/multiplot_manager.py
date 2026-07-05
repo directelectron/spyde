@@ -16,6 +16,10 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Colours cycled across the selectors added to one navigator, so each selector
+# (and its linked signal window / dock row) is identifiable at a glance.
+SELECTOR_COLORS = ["#00e676", "#40c4ff", "#ff9100", "#e040fb", "#ffea00", "#ff5252"]
+
 
 def _plot_window_dims(plot_window: "PlotWindow") -> int:
     """Derive the displayed dimensionality of a PlotWindow's current plot.
@@ -169,6 +173,13 @@ class MultiplotManager:
         if plot_window not in self.navigation_selectors:
             self.navigation_selectors[plot_window] = []
 
+        # Cycle the palette so a second/third selector on the same navigator is
+        # visually distinct (explicit colours — e.g. strain's cyan reference
+        # crosshair — are honoured as-is).
+        if color is None:
+            n = len(self.navigation_selectors[plot_window])
+            color = SELECTOR_COLORS[n % len(SELECTOR_COLORS)]
+
         window = self.session.add_plot_window(
             is_navigator=is_navigator,
             plot_manager=self,
@@ -182,7 +193,7 @@ class MultiplotManager:
             self.plots[window] = []
         self.plots[window].append(child)
 
-        selector_kwargs = {} if color is None else {"color": color}
+        selector_kwargs = {"color": color}
         selector = selector_type(
             parent=plot_window,
             children=child,
@@ -196,16 +207,20 @@ class MultiplotManager:
 
         # Register the selector so the right-dock toggle can switch it between
         # crosshair (point) and integrating (region) modes, and tell the dock
-        # it exists. Composite selectors start in crosshair mode.
+        # it exists (one dock row PER SELECTOR, keyed by selector_id, with the
+        # selector's colour dot). Composite selectors start in crosshair mode.
         try:
             mode = "integrate" if getattr(selector, "is_integrating", False) else "crosshair"
+            idx = len(self.navigation_selectors[plot_window])
             self.session.register_nav_selector(plot_window.window_id, selector)
             from spyde.backend.ipc import emit
             emit({
                 "type": "selector_info",
                 "window_id": plot_window.window_id,
+                "selector_id": id(selector),
+                "color": color,
                 "mode": mode,
-                "title": "Navigator",
+                "title": "Navigator" if idx <= 1 else f"Navigator {idx}",
             })
         except Exception as e:
             logger.debug("emitting navigator selector_info failed: %s", e)

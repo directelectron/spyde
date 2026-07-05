@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
 
 import numpy as np
 import hyperspy.api as hs
@@ -81,9 +80,11 @@ def find_diffraction_vectors(ctx, action_name: str = "Find Diffraction Vectors",
     return _start_batch(session, plot, src_tree, _coerce(params))
 
 
-def _start_batch(session, plot, src_tree, p: dict):
+def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = True):
     """Build the result window, then run the full-dataset compute on a background
-    thread. Shared by the toolbar one-shot and the staged-wizard ``fv_run``."""
+    thread. Shared by the toolbar one-shot and the staged-wizard ``fv_run``
+    (which passes ``overlay_visible=False`` — after Compute the source DP stays
+    clean; reopening the caret toggles the overlay back via ``set_overlay``)."""
     src = src_tree.root
     am = src.axes_manager
 
@@ -95,6 +96,13 @@ def _start_batch(session, plot, src_tree, p: dict):
         except Exception as e:
             log.debug("dropping find-vectors preview failed: %s", e)
         src_tree._fv_preview = None
+
+    # Drop the prior run's persistent source-DP overlay SYNCHRONOUSLY. The
+    # replace inside _overlay_on_source only runs at the TAIL of the async
+    # batch, so without this a second Compute leaves run 1's circles on the DP
+    # for the whole run — and a torn attach could stack a second marker group.
+    from spyde.actions.lifecycle import replace_tree_attr
+    replace_tree_attr(src_tree, "_vector_overlay", None)
 
     # ── Build the result tree up front: a lazy zero placeholder with the
     #    source's axes (so we never reference the raw dataset) + a zero
@@ -113,20 +121,20 @@ def _start_batch(session, plot, src_tree, p: dict):
     if not new_sig._lazy:
         new_sig._lazy = True
         new_sig._assign_subclass()
-    try:
-        new_sig.set_signal_type("spyde_diffraction_vectors_image")
-    except Exception as e:
-        log.debug("set_signal_type(diffraction_vectors_image) failed: %s", e)
     base_title = src.metadata.get_item("General.title", "Signal")
-    new_sig.metadata.General.title = f"{base_title} — Vectors"
 
     nav_sig = hs.signals.BaseSignal(np.zeros(nav_shape_full, dtype=np.float32)).T
     nav_sig.metadata.General.title = "Vector count map"
     _copy_nav_axes_to(src, nav_sig)
 
     from spyde.drawing.selectors import CrosshairSelector
-    new_tree = session._add_signal(
-        new_sig, navigator_override=nav_sig, selector_type=CrosshairSelector,
+    from spyde.actions.commit import open_result_tree
+    new_tree = open_result_tree(
+        session, title=f"{base_title} — Vectors", signal=new_sig,
+        signal_type="spyde_diffraction_vectors_image",
+        navigator_override=nav_sig, selector_type=CrosshairSelector,
+        provenance={"action": "Find Diffraction Vectors",
+                    "source_title": base_title, "params": dict(p)},
     )
 
     emit_status("Finding diffraction vectors…")
@@ -135,7 +143,8 @@ def _start_batch(session, plot, src_tree, p: dict):
     # ── Progressive (live) count map: the compute writes per-chunk vector counts
     #    into a shared-memory buffer as chunks finish; a poller paints them into
     #    the count-map navigator so it fills in live instead of all-at-the-end.
-    from spyde.drawing.update_functions import ensure_live_buffer, read_live_buffer
+    from spyde.actions.lifecycle import live_fill_poller
+    from spyde.drawing.update_functions import ensure_live_buffer
     shm_name = f"spyde_fv_{id(plot)}"
     try:
         # Allocate the buffer with the FULL nav shape so 5D data gets a 3D
@@ -144,7 +153,6 @@ def _start_batch(session, plot, src_tree, p: dict):
         shm = ensure_live_buffer(nav_shape_full, shm_name)
     except Exception:
         shm, shm_name = None, None
-    stop_poll = [False]
 
     def _spatial_nav_plot():
         """The navigator plot whose displayed shape is the 2-D spatial grid
@@ -158,42 +166,51 @@ def _start_batch(session, plot, src_tree, p: dict):
                 return npl
         return _first_nav_plot(new_tree)
 
-    def _poller():
-        while not stop_poll[0]:
-            try:
-                nav_plot = _spatial_nav_plot()
-                arr = read_live_buffer(nav_shape_full, shm_name)
-                # For 5D (3D buffer), show the t=0 slice on the spatial navigator.
-                display = arr[0] if arr.ndim == 3 else arr
-                if nav_plot is not None and np.isfinite(display).any():
-                    nav_plot.needs_auto_level = True
-                    nav_plot.set_data(np.nan_to_num(display).astype(np.float32))
-            except Exception as e:
-                log.debug("live count-map poll paint failed: %s", e)
-            time.sleep(0.35)
+    def _paint(arr):
+        nav_plot = _spatial_nav_plot()
+        # For 5D (3D buffer), show the t=0 slice on the spatial navigator.
+        display = arr[0] if arr.ndim == 3 else arr
+        if nav_plot is not None and np.isfinite(display).any():
+            nav_plot.needs_auto_level = True
+            nav_plot.set_data(np.nan_to_num(display).astype(np.float32))
 
     # Marks the batch as in-flight so a downstream action opened in the gap
     # (e.g. Strain Mapping) can tell "still computing, keep waiting" apart from
     # "nothing is running, give up" instead of guessing off a fixed timeout —
-    # see StrainController's self-wait in strain_action.strain_run.
+    # see lifecycle.wait_for_vectors.
     new_tree._fv_batch_running = True
     src_tree._fv_batch_running = True
 
+    stop_poll = live_fill_poller(nav_shape_full, shm_name, _paint,
+                                 interval=0.35, name="fv-poll")
+
     def _work():
         try:
+            # Timing logs at INFO so a "batch looks stuck" report can be
+            # localized from the app log: cluster compute vs finalize/paint.
+            # (Chronic symptom under investigation: the batch sometimes only
+            # completes after the user clicks a plot — i.e. after unrelated
+            # navigator traffic reaches the same dask client.)
+            import time as _time
+            t0 = _time.monotonic()
+            log.info("[fv-batch] compute starting (shm=%s)", shm_name)
             vecs = _do_compute_vectors(src, p, main_window=session,
                                        signal_tree=src_tree, shm_name=shm_name)
-            stop_poll[0] = True                      # final paint owns the nav plot
+            log.info("[fv-batch] compute returned in %.1fs (vecs=%s)",
+                     _time.monotonic() - t0, "none" if vecs is None else "ok")
+            stop_poll()                              # final paint owns the nav plot
             if vecs is None:
                 emit_error("Find Vectors: compute returned no result")
                 return
             _finalize(new_tree, vecs)
-            _overlay_on_source(src_tree, src_dp_plot, vecs)
+            log.info("[fv-batch] finalized in %.1fs total", _time.monotonic() - t0)
+            _overlay_on_source(src_tree, src_dp_plot, vecs,
+                               visible=overlay_visible)
         except Exception as e:
             emit_error(f"Find Vectors failed: {e}")
             log.exception("Find Vectors compute failed")
         finally:
-            stop_poll[0] = True
+            stop_poll()
             new_tree._fv_batch_running = False
             src_tree._fv_batch_running = False
             if shm is not None:
@@ -203,29 +220,29 @@ def _start_batch(session, plot, src_tree, p: dict):
                 except Exception as e:
                     log.debug("shared-memory cleanup failed: %s", e)
 
-    if shm_name is not None:
-        threading.Thread(target=_poller, daemon=True, name="fv-poll").start()
     threading.Thread(target=_work, daemon=True, name="find-vectors").start()
     return None
 
 
-def _overlay_on_source(src_tree, dp_plot, vecs) -> None:
+def _overlay_on_source(src_tree, dp_plot, vecs, *, visible: bool = True) -> None:
     """Overlay the found vectors as live circle markers on the SOURCE diffraction
     pattern (Qt parity: peaks tracked the navigator). Replaces any prior overlay
-    from an earlier run so re-running Find Vectors doesn't stack markers."""
+    from an earlier run so re-running Find Vectors doesn't stack markers.
+
+    ``visible=False`` (the wizard path) attaches it hidden: the DP stays clean
+    after Compute, and reopening the Find Vectors caret shows it again via the
+    renderer's ``set_overlay`` toggle."""
     if dp_plot is None or src_tree is None:
         return
+    from spyde.actions.lifecycle import replace_tree_attr
     from spyde.actions.vector_overlay import attach_vector_overlay
-    old = getattr(src_tree, "_vector_overlay", None)
-    if old is not None:
+    ov = replace_tree_attr(src_tree, "_vector_overlay",
+                           lambda: attach_vector_overlay(dp_plot, vecs, src_tree))
+    if ov is not None and not visible:
         try:
-            old.remove()
+            ov.set_visible(False)
         except Exception as e:
-            log.debug("removing prior vector overlay failed: %s", e)
-    try:
-        src_tree._vector_overlay = attach_vector_overlay(dp_plot, vecs, src_tree)
-    except Exception as e:
-        log.debug("vector overlay attach failed: %s", e)
+            log.debug("hiding source vector overlay failed: %s", e)
 
 
 def _apply_axes_from_vecs(new_sig, nav_sig, vecs) -> None:
@@ -277,11 +294,6 @@ def build_vectors_result_tree(session, vecs, title: str = "Diffraction Vectors")
         data_shape, chunks=nav_chunks + sig_hw, dtype=np.float32,
     )
     new_sig = hs.signals.Signal2D(placeholder).as_lazy()
-    try:
-        new_sig.set_signal_type("spyde_diffraction_vectors_image")
-    except Exception as e:
-        log.debug("set_signal_type(diffraction_vectors_image) failed: %s", e)
-    new_sig.metadata.General.title = title
 
     nav_sig = hs.signals.BaseSignal(
         np.zeros(full_nav_shape, dtype=np.float32)).T
@@ -289,8 +301,12 @@ def build_vectors_result_tree(session, vecs, title: str = "Diffraction Vectors")
 
     _apply_axes_from_vecs(new_sig, nav_sig, vecs)
 
-    tree = session._add_signal(
-        new_sig, navigator_override=nav_sig, selector_type=CrosshairSelector,
+    from spyde.actions.commit import open_result_tree
+    tree = open_result_tree(
+        session, title=title, signal=new_sig,
+        signal_type="spyde_diffraction_vectors_image",
+        navigator_override=nav_sig, selector_type=CrosshairSelector,
+        provenance={"action": "Find Diffraction Vectors", "source": "loaded"},
     )
     _finalize(tree, vecs)
     return tree
@@ -482,7 +498,7 @@ def _refresh_signal_from_navigator(tree) -> None:
 # preview overlay lives on the source tree as `_fv_preview`.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def fv_preview(session, plot, payload) -> None:
+def fv_open(session, plot, payload) -> None:
     """'Tune' step: attach the LIVE found-peaks preview to the source DP so the
     red circles update as you tune the sliders / move the navigator (Qt parity).
     Idempotent — replaces any existing preview."""
@@ -500,16 +516,19 @@ def fv_preview(session, plot, payload) -> None:
               p.get("show_transform"), p.get("beamstop_auto"),
               tuple(tree.root.data.shape), getattr(tree.root, "_lazy", "?"))
 
+    # Run/stop generation guard (React StrictMode mounts the wizard twice
+    # synchronously: fv_open, fv_close, fv_open — before either worker
+    # lands). Bumped here BEFORE the worker spawns; fv_close bumps it too, so a
+    # superseded preview attach is dropped instead of stacking a second overlay.
+    from spyde.actions.lifecycle import bump_generation, is_current
+    gen = bump_generation(tree, "_fv_run_gen")
+
     def _work():
         try:
             from spyde.actions.vector_overlay import attach_find_vectors_preview
-            old = getattr(tree, "_fv_preview", None)
-            if old is not None:
-                try:
-                    old.remove()
-                except Exception as e:
-                    log.debug("dropping prior find-vectors preview failed: %s", e)
-            tree._fv_preview = attach_find_vectors_preview(
+            if not is_current(tree, "_fv_run_gen", gen):
+                return                     # superseded by fv_close / newer preview
+            new_prev = attach_find_vectors_preview(
                 src, tree.root, tree, sigma=p["sigma"],
                 kernel_radius=p["kernel_radius"], threshold=p["threshold"],
                 min_distance=p["min_distance"], subpixel=p["subpixel"],
@@ -518,6 +537,27 @@ def fv_preview(session, plot, payload) -> None:
                 beamstop_auto=bool(p.get("beamstop_auto")),
                 show_transform=p["show_transform"],
             )
+            # Superseded while attaching (fv_close / a newer fv_open bumped
+            # the generation after the check above) → tear down what we just
+            # attached instead of installing a stale overlay.
+            if not is_current(tree, "_fv_run_gen", gen):
+                try:
+                    new_prev.remove()
+                except Exception as e:
+                    log.debug("removing superseded fv preview failed: %s", e)
+                return
+            old = getattr(tree, "_fv_preview", None)
+            if old is not None and old is not new_prev:
+                try:
+                    old.remove()
+                except Exception as e:
+                    log.debug("dropping prior find-vectors preview failed: %s", e)
+            tree._fv_preview = new_prev
+            # The live preview supersedes any persistent overlay from an
+            # earlier Compute — both drawing at once is exactly the
+            # "duplicated peaks" bug, so drop the old one here.
+            from spyde.actions.lifecycle import replace_tree_attr
+            replace_tree_attr(tree, "_vector_overlay", None)
             # Qt parity: estimate the disk radius from the data (once) so the
             # wizard's defaults match the pattern instead of a fixed 5.
             if not getattr(tree, "_fv_auto_sent", False):
@@ -527,9 +567,10 @@ def fv_preview(session, plot, payload) -> None:
                         "the crosshair, then Compute")
         except Exception as e:
             import logging
-            logging.getLogger(__name__).debug("fv_preview attach failed: %s", e)
+            logging.getLogger(__name__).debug("fv_open attach failed: %s", e)
 
-    threading.Thread(target=_work, daemon=True, name="fv-preview").start()
+    from spyde.actions.lifecycle import run_on_worker
+    run_on_worker(session, _work, name="fv-preview")
 
 
 def _emit_auto_params(plot, tree) -> None:
@@ -582,7 +623,8 @@ def fv_tune(session, plot, payload) -> None:
         except Exception as e:
             log.exception("[fv-tune] set_params FAILED: %s", e)
 
-    threading.Thread(target=_work, daemon=True, name="fv-tune").start()
+    from spyde.actions.lifecycle import run_on_worker
+    run_on_worker(session, _work, name="fv-tune")
 
 
 def fv_run(session, plot, payload) -> None:
@@ -601,12 +643,19 @@ def fv_run(session, plot, payload) -> None:
               "kr=%s dog=(%s,%s) beamstop=%s", p["method"], p["threshold"],
               p["min_distance"], p["kernel_radius"], p["dog_sigma1"],
               p["dog_sigma2"], p.get("beamstop_auto"))
-    _start_batch(session, src, tree, p)
+    # The wizard caret closes on Compute; attach the final source-DP overlay
+    # hidden so the pattern is clean until the caret is reopened.
+    _start_batch(session, src, tree, p, overlay_visible=False)
 
 
-def fv_stop(session, plot, payload=None) -> None:
+def fv_close(session, plot, payload=None) -> None:
     """Caret closed: remove the live preview overlay."""
     src, tree = _src_plot_tree(session, plot)
+    if tree is not None:
+        # Invalidate any fv_open still in flight FIRST (StrictMode fires
+        # preview/stop/preview synchronously — see fv_open's gen guard).
+        from spyde.actions.lifecycle import bump_generation
+        bump_generation(tree, "_fv_run_gen")
     prev = getattr(tree, "_fv_preview", None) if tree is not None else None
     log.debug("[fv-stop] removing preview=%s", prev is not None)
     if prev is not None:

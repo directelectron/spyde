@@ -170,6 +170,50 @@ async function waitForSubwindowCount(page, n, timeout = 60_000) {
 }
 
 /**
+ * Wait for the vector actions to unlock — the REAL "diffraction_vectors
+ * attached" signal: the vector toolbar buttons are requires_vectors-gated, so
+ * they exist in the DOM only after find-vectors finalizes and re-sends the
+ * toolbar. (Do NOT wait on the "Found N diffraction vectors" status — it
+ * travels the PLOTAPP stdout protocol, invisible to the harness log buffer.)
+ */
+async function waitForVectorActions(page, timeout = 60_000) {
+  await page.waitForFunction(
+    () => document.querySelectorAll(
+      '[data-testid="action-btn-Strain Mapping"]').length > 0,
+    undefined, { timeout },
+  )
+}
+
+/**
+ * Load the bundled synthetic Find-Vectors RESULT tree (test-only backend
+ * action `load_test_vectors`): a 6×6 four-spot dataset run through Find
+ * Diffraction Vectors, vectors attached, vector actions unlocked. THE fast
+ * path (seconds, works under SPYDE_NO_DASK) for anything downstream of
+ * vectors — Strain / Vector VI / Vector OM specs should start here instead of
+ * paying the multi-minute distributed batch.
+ */
+async function loadTestVectors(page, timeout = 60_000) {
+  // backend-ready can land slightly before the stdin pump is live; settle
+  // first so the action isn't dropped (same pattern the lazy specs use).
+  await page.waitForTimeout(1500)
+  await backendAction(page, 'load_test_vectors')
+  await waitForSubwindowCount(page, 4, timeout)
+  await waitForVectorActions(page, timeout)
+}
+
+/**
+ * Log a dask scheduler/worker snapshot to the backend log at WARNING
+ * ([dask-state] lines in ctx.backend.logBuffer): task-state histogram,
+ * per-worker load, call stacks of executing tasks. Fire this whenever a
+ * compute "looks stuck" before giving up — its output localizes the stall
+ * (submission vs scheduling vs worker-side execution).
+ */
+async function dumpDaskState(page, settleMs = 2_000) {
+  await backendAction(page, 'dump_dask_state')
+  await page.waitForTimeout(settleMs)
+}
+
+/**
  * Count canvas pixels matching a colour across frames. kind:
  *  'bright' (any non-black), 'red' (#ff3030 markers), 'green' (#30ff60 matched
  *  template). The green test requires a non-trivial BLUE channel (b in ~60..160)
@@ -209,5 +253,8 @@ module.exports = {
   launchApp,
   backendAction,
   waitForSubwindowCount,
+  waitForVectorActions,
+  loadTestVectors,
+  dumpDaskState,
   countColorPixels,
 }

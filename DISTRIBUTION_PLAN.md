@@ -143,14 +143,14 @@ Keep Option B's single-exe as a fallback "portable" download.
 - **Microscope-PC constraints.** Often locked-down/offline/older GPUs — per-user
   install (no admin), offline bundle, and CPU fallback all matter here.
 
-## 6. Decisions (locked 2026-06-15)
+## 6. Decisions (locked 2026-06-15; update-channel superseded 2026-07-01)
 
 | Question | Decision |
 |---|---|
 | Architecture | **Both: uv-managed (primary) + portable single-exe (offline fallback).** Build the uv-managed installer as the main path; keep PyCrucible's self-contained exe as a "portable/offline" download for air-gapped microscope PCs. |
 | Windows installer | **NSIS** (.exe installer) — per-user, no-admin, Start-Menu + desktop shortcuts, Add/Remove entry, uninstaller. |
 | Code signing | **Ship unsigned for now**; document SmartScreen/Gatekeeper click-through. Wire signing into CI later when certs are procured (Win EV, Apple Developer). |
-| Update checking | **Startup check + manual.** Auto-check on launch with "skip this version" / "remind me later" (persisted in `~/.spyde/settings.json`), plus Help → Check for Updates. Single `stable` channel to start; beta channel deferred. |
+| Update checking | **Startup check + manual, WIRED (2026-07-01).** `electron-updater` checks on launch (~5s delay) and via Help → Check for Updates…; `autoDownload=false` — user clicks Download, then Restart to Install. **Beta channel is now live** (superseding the original "deferred" decision): tag suffix (`-rc.N`/`-beta.N`/`-alpha.N`) determines `stable` vs `beta`, selectable in the update dialog, persisted to `~/.spyde/settings.json` + an Electron-side `update-channel.json`. See `electron/PACKAGING.md` "Auto-update + beta channel". |
 | Offline bundle | In scope (Phase 4) — the "portable single-exe" doubles as the offline path; optionally also a uv-cache-seeded bundle. |
 
 ### Resulting build matrix

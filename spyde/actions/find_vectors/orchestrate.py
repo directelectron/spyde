@@ -158,7 +158,11 @@ def _compute_chunks_with_live_counts(
                 log.debug("on_chunk_done for %r failed: %s", _sl, e)
         fut.add_done_callback(_cb)
 
+    from spyde.compute_dispatch import poke_scheduler, reliable_sleep
     pending = list(futures)
+    n_done_prev = 0
+    last_progress = time.time()
+    last_poke = time.time()
     while pending:
         if stopped_flag is not None and stopped_flag[0]:
             for fut in pending:
@@ -168,8 +172,20 @@ def _compute_chunks_with_live_counts(
                     log.debug("cancelling live-count future failed: %s", e)
             return None
         pending = [f for f in pending if not f.done()]
+        n_done = len(futures) - len(pending)
+        now = time.time()
+        if n_done != n_done_prev:
+            n_done_prev = n_done
+            last_progress = now
+        elif now - last_progress > 5.0 and now - last_poke > 5.0:
+            # No-progress watchdog (frozen task delivery — see poke_scheduler).
+            last_poke = now
+            poke_scheduler(client, "find_vectors-live")
         if pending:
-            time.sleep(0.05)
+            # NB reliable_sleep, NOT time.sleep — time.sleep froze for 15 s on
+            # the throttled Electron-spawned backend, so this loop (and its
+            # watchdog above) never ran on schedule.
+            reliable_sleep(0.05)
     return result
 
 
@@ -193,11 +209,12 @@ def _dispatch_chunks_gpu_aware(
 
 
 def _do_compute_vectors(
-    signal, params: dict, main_window, signal_tree,
+    signal, params: dict, main_window=None, signal_tree=None,
     shm_name: str = None,
     beamstop_mask: np.ndarray = None,
     on_chunk_done=None,
     stopped_flag=None,
+    client=None,
 ):
     """
     Batch compute via dask.array.map_overlap.
@@ -229,6 +246,10 @@ def _do_compute_vectors(
     stopped_flag : list[bool] | None
         Polled while waiting on the future; setting it cancels the compute
         and returns None.
+    client : distributed.Client | None
+        Explicit Dask client (the spyde.api / script path). Takes precedence
+        over the in-app main_window/signal_tree lookups; with everything None
+        the compute falls back to the local threaded scheduler.
     """
     import functools
     import dask.array as da
@@ -383,9 +404,10 @@ def _do_compute_vectors(
     )
 
     # Resolve the distributed client up front — needed both to decide on GPU
-    # routing and to submit the future below.
-    client = None
-    if signal_tree is not None:
+    # routing and to submit the future below. An explicit `client=` argument
+    # wins (the spyde.api / script path); the main_window/signal_tree lookups
+    # are the in-app path.
+    if client is None and signal_tree is not None:
         client = getattr(signal_tree, "client", None)
     dask_manager = getattr(main_window, "dask_manager", None) if main_window else None
     if client is None and dask_manager is not None:
@@ -407,11 +429,12 @@ def _do_compute_vectors(
         dask_manager = None
     if client is None and dask_manager is not None:
         log.debug("[find_vectors] waiting for Dask client to come up…")
+        from spyde.compute_dispatch import reliable_sleep
         deadline = time.time() + 180.0
         while client is None and time.time() < deadline:
             if stopped_flag is not None and stopped_flag[0]:
                 return None
-            time.sleep(0.1)
+            reliable_sleep(0.1)
             client = getattr(dask_manager, "client", None)
         if client is None:
             log.warning("[find_vectors] Dask client never came up — "
@@ -523,7 +546,10 @@ def _do_compute_vectors(
             if result_padded is None:
                 return None
         else:
+            from spyde.compute_dispatch import poke_scheduler, reliable_sleep
             future = client.compute(peaks_padded)
+            t_wait = time.time()
+            last_poke = time.time()
             while not future.done():
                 if stopped_flag is not None and stopped_flag[0]:
                     try:
@@ -531,7 +557,12 @@ def _do_compute_vectors(
                     except Exception as e:
                         log.debug("cancelling find-vectors compute future failed: %s", e)
                     return None
-                time.sleep(0.1)
+                # No-progress watchdog (frozen task delivery — poke_scheduler).
+                now = time.time()
+                if now - t_wait > 5.0 and now - last_poke > 5.0:
+                    last_poke = now
+                    poke_scheduler(client, "find_vectors-monolithic")
+                reliable_sleep(0.1)
             result_padded = future.result()
     else:
         # No distributed client (e.g. unit tests): local threaded scheduler,

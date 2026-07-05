@@ -23,15 +23,9 @@ def _sig():
     return hs.signals.Signal2D(np.zeros((4, 4), dtype=np.float32))
 
 
-class _InlineThread:
-    """Run the worker inline so the handler's emit is observable synchronously."""
-    def __init__(self, target=None, daemon=None, **kw):
-        self._t = target
-
-    def start(self):
-        if self._t:
-            self._t()
-
+# (cod_search/cod_pick ride lifecycle.run_on_worker, which runs INLINE when the
+# session has no _dispatch_to_main — passing session=None below makes the
+# handler's emit observable synchronously, no thread stub needed.)
 
 # ── metadata round-trip ─────────────────────────────────────────────────────────
 class TestCompositionMetadata:
@@ -100,7 +94,6 @@ class TestCodNetwork:
         captured = []
         monkeypatch.setattr(comp, "emit", lambda m: captured.append(m))
         monkeypatch.setattr(comp, "emit_status", lambda *a, **k: None)
-        monkeypatch.setattr(comp.threading, "Thread", _InlineThread)
         monkeypatch.setattr(comp, "_cod_query", lambda els: [
             {"file": "9", "a": "4.08", "b": "4.08", "c": "4.08", "alpha": "90",
              "beta": "90", "gamma": "90", "sg": "Fm-3m", "sgNumber": "225",
@@ -118,7 +111,6 @@ class TestCodNetwork:
         captured = []
         monkeypatch.setattr(comp, "emit", lambda m: captured.append(m))
         monkeypatch.setattr(comp, "emit_status", lambda *a, **k: None)
-        monkeypatch.setattr(comp.threading, "Thread", _InlineThread)
 
         def _boom(_els):
             raise OSError("no network")

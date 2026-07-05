@@ -19,10 +19,9 @@ import logging
 
 import numpy as np
 
-logger = logging.getLogger(__name__)
+from spyde.actions.figure_registry import keep_alive
 
-# Keep emitted figures alive past the emit (the registry holds a weak ref only).
-_ALIVE: list = []
+logger = logging.getLogger(__name__)
 
 # window_id → {"images": {label: np.ndarray}, "order": [label,...],
 #              "cmap": str, "levels": (lo, hi) | None}
@@ -80,7 +79,7 @@ def emit_view_figure(window_id: int, image, label: str, *, kind: str = "2d",
 
         fig_id = _electron.register(fig)
         html = finalize_figure_html(fig, fig_id)
-        _ALIVE.append(fig)
+        keep_alive(window_id, fig)
         emit({
             "type": "figure", "fig_id": fig_id, "window_id": window_id,
             "html": html, "title": label, "is_navigator": False,
@@ -134,7 +133,13 @@ def build_tiled_figure(window_id: int, labels):
     if not data:
         return None
     # Preserve the window's canonical view order regardless of click order.
-    sel = [l for l in data["order"] if l in set(labels)]
+    # Match on NFC-normalised labels so a composed/decomposed Unicode mismatch
+    # (a label round-tripped through JSON/IPC) can't silently drop a view.
+    import unicodedata
+    def _nfc(s):
+        return unicodedata.normalize("NFC", s)
+    wanted = {_nfc(l) for l in labels}
+    sel = [l for l in data["order"] if _nfc(l) in wanted]
     pairs = [(l, data["images"][l]) for l in sel if l in data["images"]]
     if not pairs:
         return None
@@ -162,7 +167,7 @@ def build_tiled_figure(window_id: int, labels):
 
     fig_id = _electron.register(fig)
     html = finalize_figure_html(fig, fig_id)
-    _ALIVE.append(fig)
+    keep_alive(int(window_id), fig)
     return fig, fig_id, html, sel
 
 
@@ -195,6 +200,11 @@ def tile_views(session, plot, payload) -> None:
     if len(labels) < 2:
         return                      # a single view shows its own figure
     window_id = getattr(plot, "window_id", None)
+    if window_id is None:
+        # Bare-figure windows (the VOM unified strain window, IPF views) have
+        # no registered Plot, so dispatch resolves plot=None — fall back to the
+        # window id the dispatcher injects into every staged payload.
+        window_id = payload.get("window_id")
     if window_id is None:
         return
     emit_tiled_figure(int(window_id), labels)

@@ -7,6 +7,9 @@ import { LogPanel } from './components/LogPanel'
 import { Tour } from './components/Tour'
 import { NavShapeGate } from './components/NavShapeGate'
 import { StackGate } from './components/StackGate'
+import { UpdateGate } from './components/UpdateGate'
+import { GpuStatusGate } from './components/GpuStatusGate'
+import { UpdateBanner } from './components/UpdateBanner'
 import { MenuBar } from './components/MenuBar'
 import { GUIDES, getGuide, type Guide } from '@guides/index'
 
@@ -32,6 +35,7 @@ export function App() {
           onToggleSidebar={() => setSidebarOpen(v => !v)}
           onStartGuide={(g) => setTour(g)}
         />
+        <UpdateBanner />
         <div style={styles.body}>
           <MDIArea />
           {sidebarOpen && <PlotControlDock />}
@@ -46,6 +50,9 @@ export function App() {
       {/* Load Stack dialog — reorderable list of datasets to combine into one
           5D stack; opened from File → Load Stack…. */}
       <StackGate />
+      {/* Help → Check for Updates… / GPU Status… */}
+      <UpdateGate />
+      <GpuStatusGate />
     </SpyDEProvider>
   )
 }

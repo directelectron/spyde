@@ -17,7 +17,7 @@ from hyperspy.signal import BaseSignal
 from spyde.backend.ipc import emit, emit_status, emit_error, emit_progress
 from spyde.backend._session_axes import AxesEditorMixin
 from spyde.backend._session_actions import (
-    ActionRouterMixin, _STAGED_HANDLERS, _TEST_ACTIONS, _TEST_ACTIONS_ENABLED,
+    ActionRouterMixin, _TEST_ACTIONS, _TEST_ACTIONS_ENABLED,
 )
 from spyde.backend._session_files import (
     FileLoaderMixin,
@@ -37,9 +37,8 @@ log = logging.getLogger(__name__)
 # the same env switch used in base_selector / update_functions / plot_update_worker.
 _NAV_TIMING = os.environ.get("SPYDE_NAV_TIMING") == "1"
 
-# _TEST_ACTIONS / _TEST_ACTIONS_ENABLED and _STAGED_HANDLERS now live in
-# _session_actions (re-imported above so any `session._STAGED_HANDLERS` access
-# still resolves).
+# _TEST_ACTIONS / _TEST_ACTIONS_ENABLED live in _session_actions; the staged
+# action table lives in spyde.actions.registry (STAGED_HANDLERS).
 
 if TYPE_CHECKING:
     from spyde.signal_tree import BaseSignalTree
@@ -75,6 +74,10 @@ class Session(
         # (src_window_id, action_name) -> {"selector", "out_wids"} so deselecting
         # a toolbar action can hide the output window + ROI it created.
         self._action_artifacts: dict[tuple[int, str], dict] = {}
+        # window_id -> controller for windows that are NOT registered Plots
+        # (bare `figure` emits: strain map, IPF views…). See the WindowController
+        # protocol in spyde/actions/registry.py. _forget_window closes + evicts.
+        self._window_controllers: dict[int, object] = {}
         self.current_selected_signal_tree = None
 
         # MDI manager
@@ -93,6 +96,12 @@ class Session(
         # racing ahead with a None client (which errored "Folder not found" /
         # silently produced no navigator). See _await_dask.
         self._dask_ready = threading.Event()
+        # Tests and headless scripts construct Session directly, bypassing
+        # app.py's SPYDE_NO_DASK branch — honour the env var here too, or a
+        # load thread blocks _await_dask's full timeout on a cluster that will
+        # never start (the test_nav_shape_prompt "busy never cleared" CI hang).
+        if os.environ.get("SPYDE_NO_DASK") == "1":
+            self._dask_ready.set()
 
         # Plot update poller. `dispatch` marshals the result-APPLY onto the main
         # asyncio thread (set later via set_main_loop, once the loop exists) — the
@@ -119,6 +128,13 @@ class Session(
             self._recent_files = list(self._settings.get("recent_files", []))[:20]
         except Exception as e:
             log.debug("restoring recent files from settings failed: %s", e)
+        # update_channel/skip_version mirror the Electron-side updater's choice
+        # here so they're inspectable/debuggable from the Python side too (the
+        # Electron main process is the one that actually acts on them).
+        self._update_channel: str = (
+            self._settings.get("update_channel") if self._settings.get("update_channel") in ("stable", "beta")
+            else "stable"
+        )
 
     # ── Startup ────────────────────────────────────────────────────────────────
 
@@ -145,7 +161,12 @@ class Session(
     def set_main_loop(self, loop) -> None:
         """Register the main asyncio loop so the plot poller can marshal the
         result-apply onto this (main) thread. Call from app._main once the loop
-        is running."""
+        is running.
+
+        NB the process's frozen-timer pathology (waits only wake on process
+        I/O — see runner.ts's backend tick) is healed by Electron's 0.5 Hz
+        stdin tick; an in-process wake ticker was tried and is useless here
+        because its own sleep freezes the same way."""
         self._main_loop = loop
 
     def _dispatch_to_main(self, fn) -> None:
@@ -178,10 +199,16 @@ class Session(
     ):
         """Create a signal tree + plots for a loaded signal. Returns the tree.
 
+        NB: callers on fresh threads must not race the startup prewarm's
+        hyperspy/pyxem import (partially-initialized-module poisoning) —
+        ensure_heavy_imports() below single-flights it.
+
         ``navigator_override`` supplies a pre-built navigator (e.g. a vectors
         count-map) so the base navigator is NOT recomputed from the full
         dataset — essential for the breaking transformations (Find Vectors).
         """
+        from spyde.backend.heavy_imports import ensure_heavy_imports
+        ensure_heavy_imports()
         from spyde.signal_tree import BaseSignalTree
         from spyde.drawing.plots.plot import Plot
 
@@ -214,6 +241,15 @@ class Session(
             log.warning("metadata emit failed: %s", e)
         self._emit_axes(tree)
         self._emit_signal_type(tree)
+        # The Workflow panel is always-on: push the (initial, single-node) tree
+        # for every window of this tree right away — it grows with transforms.
+        self._reemit_signal_tree(tree)
+        # …and the navigator chip strip (shown once a tree has ≥2 navigators).
+        try:
+            from spyde.actions.navigator_views import emit_navigator_options
+            emit_navigator_options(tree)
+        except Exception as e:
+            log.debug("navigator options emit failed: %s", e)
         try:
             from spyde.actions.composition import emit_composition
             emit_composition(tree, self._tree_window_ids(tree))
@@ -309,45 +345,70 @@ class Session(
         )
 
     def register_nav_selector(self, window_id: int, selector) -> None:
-        """Track a navigator's composite selector by its window id so the dock
-        can toggle its crosshair/integration mode."""
+        """Track a navigator's selectors so the dock can toggle each between
+        crosshair and integration modes. The FIRST selector of a window stays
+        the window-keyed fallback (back-compat callers address by window id);
+        every selector is also addressable by its ``selector_id`` (the dock's
+        per-row key — one navigator can carry several selectors)."""
         if not hasattr(self, "_nav_selectors"):
             self._nav_selectors = {}
-        self._nav_selectors[window_id] = selector
+        if not hasattr(self, "_nav_selectors_by_id"):
+            self._nav_selectors_by_id = {}
+        self._nav_selectors.setdefault(window_id, selector)
+        self._nav_selectors_by_id[id(selector)] = (window_id, selector)
 
-    def set_selector_mode(self, window_id: int, integrate: bool) -> None:
-        """Switch a navigator selector between crosshair and integrating mode."""
-        sel = getattr(self, "_nav_selectors", {}).get(window_id)
+    def set_selector_mode(self, window_id: int, integrate: bool,
+                          selector_id: int | None = None) -> None:
+        """Switch a navigator selector between crosshair and integrating mode.
+        ``selector_id`` addresses one selector of a multi-selector navigator;
+        without it the window's first selector is used."""
+        sel = None
+        if selector_id is not None:
+            window_id, sel = getattr(self, "_nav_selectors_by_id", {}).get(
+                selector_id, (window_id, None))
+        if sel is None:
+            sel = getattr(self, "_nav_selectors", {}).get(window_id)
         if sel is None or not hasattr(sel, "set_integrating"):
             return
         try:
             sel.set_integrating(bool(integrate))
+            # No title here — the dock merges by selector_id and keeps the
+            # title/colour from the creation-time selector_info.
             emit({
                 "type": "selector_info",
                 "window_id": window_id,
+                "selector_id": id(sel),
+                "color": getattr(sel, "color", None),
                 "mode": "integrate" if integrate else "crosshair",
-                "title": "Navigator",
             })
         except Exception as e:
             log.warning("set_selector_mode failed: %s", e)
 
     def _select_signal_node(self, plot, signal_id) -> None:
-        """Switch *plot* to display the signal-tree node with the given id
-        (emitted by toggle_signal_tree as id(node.signal))."""
+        """Switch to the signal-tree node with the given id (the id(node.signal)
+        emitted in the signal_tree message). The pick can come from ANY of the
+        tree's windows (the Workflow panel shows the tree for navigators too),
+        so search all of the tree's signal plots for the one holding the node."""
         if plot is None or signal_id is None:
             return
-        for sig in list(getattr(plot, "plot_states", {}).keys()):
-            if id(sig) == signal_id:
-                plot.set_plot_state(sig)
-                self._reemit_signal_tree(plot)
-                emit({"type": "status", "text": "Switched signal node"})
-                return
+        tree = getattr(plot, "signal_tree", None)
+        cands = [plot] + list(getattr(tree, "signal_plots", []) or [])
+        for p in cands:
+            for sig in list(getattr(p, "plot_states", {}) or {}):
+                if id(sig) == signal_id:
+                    from spyde.actions.lifecycle import show_tree_node
+                    show_tree_node(p, tree, sig)
+                    emit({"type": "status", "text": "Switched signal node"})
+                    return
 
-    def _reemit_signal_tree(self, plot) -> None:
-        """Re-push the workflow tree for *plot* (refreshes after a new node is
-        added by a transform, and highlights the active node). No-op if the tree
-        isn't available yet."""
-        tree = getattr(plot, "signal_tree", None) if plot is not None else None
+    def _reemit_signal_tree(self, plot_or_tree) -> None:
+        """Push the workflow tree to EVERY window of the tree (signal plots and
+        navigators alike) so the dock's Workflow section is populated whichever
+        of the tree's windows has focus. Called on tree creation and after every
+        transform / node switch. No-op if the tree isn't available yet."""
+        tree = plot_or_tree
+        if tree is not None and not hasattr(tree, "root_node"):
+            tree = getattr(plot_or_tree, "signal_tree", None)
         root_node = getattr(tree, "root_node", None) if tree is not None else None
         if root_node is None:
             return
@@ -357,14 +418,27 @@ class Session(
                 "name": node.name, "signal_id": id(node.signal),
                 "children": [node_to_dict(c) for c in node.children.values()],
             }
-        try:
-            active = id(plot.plot_state.current_signal)
-        except Exception:
-            active = None
-        emit({
-            "type": "signal_tree", "window_id": getattr(plot, "window_id", None),
-            "tree": node_to_dict(root_node), "active_signal_id": active, "visible": True,
-        })
+
+        # Active node = what the tree's signal plot displays (prefer the plot
+        # we were called with when it has a state).
+        active = None
+        cands = ([plot_or_tree] if hasattr(plot_or_tree, "plot_state") else []) \
+            + list(getattr(tree, "signal_plots", []) or [])
+        for p in cands:
+            st = getattr(p, "plot_state", None)
+            sig = getattr(st, "current_signal", None) if st is not None else None
+            if sig is not None:
+                active = id(sig)
+                break
+        payload = node_to_dict(root_node)
+        window_ids = self._tree_window_ids(tree) or \
+            ([getattr(plot_or_tree, "window_id", None)]
+             if getattr(plot_or_tree, "window_id", None) is not None else [])
+        for wid in window_ids:
+            emit({
+                "type": "signal_tree", "window_id": wid,
+                "tree": payload, "active_signal_id": active, "visible": True,
+            })
 
     # ── Plot update callbacks ──────────────────────────────────────────────────
 
@@ -452,6 +526,24 @@ class Session(
         except Exception as e:
             log.debug("saving recent-files settings failed: %s", e)
 
+    def set_update_channel(self, channel: str) -> None:
+        """Persist the update channel ('stable' or 'beta') to settings.json.
+
+        This mirrors the choice the Electron main process's autoUpdater
+        actually acts on (electron/src/main/updater.ts) — kept here too so the
+        preference is visible/debuggable from the Python side and survives a
+        settings.json inspection independent of Electron's own storage.
+        """
+        if channel not in ("stable", "beta"):
+            log.warning("ignoring invalid update_channel %r", channel)
+            return
+        self._update_channel = channel
+        self._settings["update_channel"] = channel
+        try:
+            self._save_settings()
+        except Exception as e:
+            log.debug("saving update_channel setting failed: %s", e)
+
     def get_recent_files(self) -> list[str]:
         return list(self._recent_files[:20])
 
@@ -467,3 +559,10 @@ class Session(
             except Exception as e:
                 log.debug("removing example temp dir %s failed: %s", tmpdir, e)
         self._example_temp_paths.clear()
+
+
+# ── staged handler (dispatch_action's _STAGED_HANDLERS: fn(session, plot, payload)) ──
+
+def dispatch_set_update_channel(session: Session, plot, payload: dict) -> None:
+    """Renderer's channel radio (stable/beta) -> persist to settings.json."""
+    session.set_update_channel(str(payload.get("channel", "stable")))

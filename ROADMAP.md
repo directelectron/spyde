@@ -34,8 +34,12 @@ _Last updated: 2026-06-03_
 ### Print statement spam
 Every major code path (`pyxem.py`, `plot.py`, `signal_tree.py`) uses `print()` for debug output. This floods stdout and makes profiling harder. Replace with `logging.getLogger(__name__)` throughout.
 
-### Global toolbar guards
-`_FV_BUILT_TOOLBARS`, `_OM_BUILT_TOOLBARS`, and `_CZB_BUILT_TOOLBARS` are module-level sets that prevent duplicate caret builds. These survive across tests and break toolbar re-initialization if a plot is closed and re-opened. Should be keyed to the toolbar widget's lifetime (weak reference or cleanup hook).
+### Global toolbar guards — RESOLVED
+The `_FV/_OM/_CZB_BUILT_TOOLBARS` module-level sets are gone. Per-window state
+now lives in `session._window_controllers` / `spyde.actions.figure_registry`
+(evicted by `_forget_window`), and wizard double-fire is handled by the
+run/stop generation guard in `spyde.actions.lifecycle`. See
+`spyde/actions/README.md` for the action framework.
 
 ### Shared memory disabled on Windows
 `_SHARED_MEMORY_SUPPORTED = sys.platform != "win32"` in `update_functions.py`. Dask workers on Windows are separate processes and cannot share GUI-process memory. Data transfers fall back over TCP, which is slower. Worth benchmarking whether `threads` scheduler is faster than `processes` for the typical 4D STEM sizes users encounter.

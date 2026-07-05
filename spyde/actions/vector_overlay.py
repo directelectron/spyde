@@ -155,6 +155,11 @@ class _DPOverlay:
     def attach(self, tree):
         plot2d = getattr(self.dp_plot, "_plot2d", None)
         if plot2d is None:
+            # Not fatal (the overlay is cosmetic) but the user should know the
+            # markers never appeared instead of silently missing them.
+            log.warning("%s overlay skipped: target plot has no live 2-D plot "
+                        "yet (figure iframe not loaded?)",
+                        getattr(self, "name", type(self).__name__))
             return self
         self._mg = plot2d.add_circles(
             np.zeros((0, 2), dtype=np.float32), name=self.name,
@@ -422,6 +427,11 @@ class StrainSelectionOverlay(_DPOverlay):
     def attach(self, tree):
         plot2d = getattr(self.dp_plot, "_plot2d", None)
         if plot2d is None:
+            # Not fatal (the overlay is cosmetic) but the user should know the
+            # markers never appeared instead of silently missing them.
+            log.warning("%s overlay skipped: target plot has no live 2-D plot "
+                        "yet (figure iframe not loaded?)",
+                        getattr(self, "name", type(self).__name__))
             return self
         self._mg_exc = plot2d.add_circles(
             np.zeros((0, 2), np.float32), name="strain_excluded",
@@ -1200,6 +1210,11 @@ class VectorOrientationOverlay(_DPOverlay):
     def attach(self, tree):
         plot2d = getattr(self.dp_plot, "_plot2d", None)
         if plot2d is None:
+            # Not fatal (the overlay is cosmetic) but the user should know the
+            # markers never appeared instead of silently missing them.
+            log.warning("%s overlay skipped: target plot has no live 2-D plot "
+                        "yet (figure iframe not loaded?)",
+                        getattr(self, "name", type(self).__name__))
             return self
         self._mg_meas = plot2d.add_circles(
             np.zeros((0, 2), np.float32), name=self.name_meas,

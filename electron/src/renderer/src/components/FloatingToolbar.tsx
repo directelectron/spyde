@@ -1,8 +1,12 @@
 /**
  * FloatingToolbar.tsx — Electron port of the Qt floating plot toolbar.
  *
- * A rounded translucent bar floating over the bottom of a PlotWindow that tracks
- * it (parented to the window root). Mirrors Qt `RoundedToolBar`:
+ * A rounded translucent bar floating BELOW the owning PlotWindow that tracks it
+ * (parented to the window root, so it shares the window's z-level — an
+ * overlapping window that is above the window also covers its toolbar). It
+ * falls back to floating INSIDE the window's bottom edge only when there is no
+ * room below (maximized / dragged to the area bottom). Mirrors Qt
+ * `RoundedToolBar`:
  *   • actions with `parameters`   → a CaretParams popout (params + Run),
  *   • actions with `subfunctions` → a second floating sub-toolbar,
  *   • toggling is exclusive; an "active" (live-output) action highlights and
@@ -10,8 +14,9 @@
  *
  * Popouts are HORIZONTAL — params sit side-by-side so the panel grows WIDER, not
  * taller (Find Vectors' five params used to make a tall popout that ran off the
- * MDI). They open below the bar, but flip ABOVE when the window is near the
- * screen bottom so they're never clipped. Hovering an action highlights it.
+ * MDI). Carets prefer opening BELOW the bar (clear of the figure); when that
+ * would run off the MDI area they float to the window's right (or left), and
+ * snap back below as soon as the window is moved somewhere with room.
  */
 import React from 'react'
 import { useSpyDE } from '../kernel/SpyDEContext'
@@ -49,6 +54,11 @@ const OVERLAY_ACTIONS = new Set([
 const EMPTY = new Set<string>()
 const HIDDEN_ACTIONS = new Set(['Reset', 'Zoom In', 'Zoom Out'])
 
+export const BAR_H = 38     // bar box height (30px buttons + 2×3px padding + border)
+export const BAR_GAP = 6    // gap between the window's bottom edge and the bar
+const CARET_GAP = 10        // gap between the bar/window edge and an open caret
+type CaretPlacement = 'below' | 'right' | 'left'
+
 const STYLE_ID = 'spyde-toolbar-style'
 if (typeof document !== 'undefined' && !document.getElementById(STYLE_ID)) {
   const s = document.createElement('style')
@@ -70,6 +80,13 @@ interface Props {
   visible?: boolean
   onHoverShow?: () => void
   onHoverHide?: () => void
+  /** Live rect of the owning window in MDI-area coords (drives caret placement). */
+  winRect?: { x: number; y: number; w: number; h: number }
+  /** Current MDI-area size — carets must stay inside it (the area clips). */
+  areaSize?: { w: number; h: number }
+  /** True when the bar should sit INSIDE the window's bottom edge (maximized /
+   *  no room below the window). */
+  inside?: boolean
 }
 
 function defaultsOf(parameters: Record<string, ParamSpec>): Record<string, unknown> {
@@ -85,17 +102,47 @@ const hasPopout = (a: ToolbarAction) => hasParams(a) || hasSubs(a)
 
 export function FloatingToolbar({
   actions, windowId, onAction, visible = true, onHoverShow, onHoverHide,
+  winRect, areaSize, inside = false,
 }: Props) {
   const { state, sendAction } = useSpyDE()
   const [openName, setOpenName] = React.useState<string | null>(null)
-  const [openUp, setOpenUp] = React.useState(false)
+  const [placement, setPlacement] = React.useState<CaretPlacement>('below')
   const rootRef = React.useRef<HTMLDivElement>(null)
+  // Wrapper around the open caret (position: static, so it does NOT affect the
+  // caret's absolute positioning) used only to measure the caret's real size.
+  const caretWrapRef = React.useRef<HTMLDivElement>(null)
+  const caretBox = React.useRef<{ w: number; h: number } | null>(null)
   const live = state.activeActions.get(windowId) ?? EMPTY
 
   // Keep the toolbar shown while a popout/caret is open or an action is live —
   // otherwise reveal only on hover (over the window or the toolbar).
   const forced = openName !== null || live.size > 0
   const shownVisible = visible || forced
+
+  // Caret placement: prefer BELOW the bar (clear of the figure); if the caret
+  // would run off the bottom of the MDI area, float it to the window's RIGHT
+  // (or LEFT when there is no room right either). Runs after every render so
+  // it re-evaluates as the window moves/resizes or the caret's content changes
+  // height — a caret pushed to the side snaps back below as soon as there is
+  // room again.
+  const wr = winRect ?? { x: 0, y: 0, w: 0, h: 0 }
+  const area = areaSize ?? { w: 100000, h: 100000 }
+  React.useLayoutEffect(() => {
+    if (!openName) return
+    const el = caretWrapRef.current?.firstElementChild as HTMLElement | null
+    if (el) {
+      const r = el.getBoundingClientRect()
+      if (r.width > 0 && r.height > 0) caretBox.current = { w: r.width, h: r.height }
+    }
+    const cw = caretBox.current?.w ?? 240
+    const ch = caretBox.current?.h ?? 320
+    const belowTop = wr.y + wr.h + (inside ? 0 : BAR_H + BAR_GAP) + CARET_GAP
+    let next: CaretPlacement = 'below'
+    if (belowTop + ch > area.h) {
+      next = wr.x + wr.w + CARET_GAP + cw <= area.w ? 'right' : 'left'
+    }
+    setPlacement(p => (p === next ? p : next))
+  })
 
   React.useEffect(() => {
     if (!openName) return
@@ -132,8 +179,18 @@ export function FloatingToolbar({
   const shown = actions.filter(a => !HIDDEN_ACTIONS.has(a.name))
   if (!shown.length) return null
 
-  const click = (a: ToolbarAction, e: React.MouseEvent) => {
+  const click = (a: ToolbarAction) => {
     if (live.has(a.name)) {
+      sendAction('set_action_active', { name: a.name, active: false }, windowId)
+      setOpenName(null)
+      return
+    }
+    // Deselecting an OPEN sub-toolbar action with live items (Virtual
+    // Imaging / Vector VI) tears all its ROIs + output windows down (Qt
+    // parity: an unchecked action removes its artifacts). Committed trees
+    // are independent SignalTrees and survive.
+    const items = state.subItems.get(windowId)?.get(a.name) ?? []
+    if (openName === a.name && hasSubs(a) && items.length > 0) {
       sendAction('set_action_active', { name: a.name, active: false }, windowId)
       setOpenName(null)
       return
@@ -143,13 +200,23 @@ export function FloatingToolbar({
     if (!hasPopout(a) && !WIZARD_ACTIONS.has(a.name)) {
       onAction(a.name, windowId, {}); setOpenName(null); return
     }
-    // Flip the popout above the bar if there isn't room below on screen.
-    const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
-    setOpenUp(r.bottom + 150 > window.innerHeight)
+    // Opening a different caret: drop the stale size measurement so placement
+    // is recomputed from the new caret's real box.
+    if (openName !== a.name) caretBox.current = null
     setOpenName(openName === a.name ? null : a.name)
   }
 
   const openAction = shown.find(a => a.name === openName) || null
+
+  // Where the bar's TOP edge sits in window coords — carets are DOM children of
+  // the bar, so the side placements are expressed relative to it.
+  const barTopInWin = inside ? wr.h - BAR_H - BAR_GAP : wr.h + BAR_GAP
+  const caretPos: React.CSSProperties =
+    placement === 'below'
+      ? { position: 'absolute', top: '100%', left: '50%', transform: 'translateX(-50%)', marginTop: CARET_GAP }
+      : placement === 'right'
+        ? { position: 'absolute', top: -barTopInWin, left: '50%', marginLeft: wr.w / 2 + CARET_GAP, transform: 'none' }
+        : { position: 'absolute', top: -barTopInWin, right: '50%', marginRight: wr.w / 2 + CARET_GAP, left: 'auto', transform: 'none' }
 
   return (
     <div
@@ -159,6 +226,7 @@ export function FloatingToolbar({
       onMouseLeave={onHoverHide}
       style={{
         ...styles.bar,
+        ...(inside ? { bottom: BAR_GAP } : { top: '100%', marginTop: BAR_GAP }),
         opacity: shownVisible ? 1 : 0,
         pointerEvents: shownVisible ? 'auto' : 'none',
         transition: 'opacity 140ms ease',
@@ -170,8 +238,10 @@ export function FloatingToolbar({
           title={a.name}
           data-testid={`action-btn-${a.name}`}
           className="spyde-tb-btn"
-          style={(openName === a.name || live.has(a.name)) ? styles.btnActive : undefined}
-          onClick={(e) => click(a, e)}
+          style={(openName === a.name || live.has(a.name)
+            || (state.subItems.get(windowId)?.get(a.name)?.length ?? 0) > 0)
+            ? styles.btnActive : undefined}
+          onClick={() => click(a)}
         >
           {a.icon && a.icon.endsWith('.svg')
             ? <img src={fileUrl(a.icon)} width={18} height={18} alt={a.name} />
@@ -179,50 +249,56 @@ export function FloatingToolbar({
         </button>
       ))}
 
-      {openAction && openAction.name === 'Orientation Mapping' && (
-        <OrientationWizard
-          openUp={openUp} windowId={windowId} sendAction={sendAction}
-          onClose={() => setOpenName(null)}
-        />
-      )}
-      {openAction && openAction.name === 'Find Diffraction Vectors' && (
-        <FindVectorsWizard
-          openUp={openUp} windowId={windowId} sendAction={sendAction}
-          onClose={() => setOpenName(null)}
-        />
-      )}
-      {openAction && openAction.name === 'Vector Orientation Mapping' && (
-        <VectorOrientationWizard
-          openUp={openUp} windowId={windowId} sendAction={sendAction}
-          onClose={() => setOpenName(null)}
-        />
-      )}
-      {openAction && openAction.name === 'Center Zero Beam' && (
-        <CenterZeroBeamWizard
-          openUp={openUp} windowId={windowId} sendAction={sendAction}
-          onClose={() => setOpenName(null)}
-        />
-      )}
-      {openAction && openAction.name === 'Strain Mapping' && (
-        <StrainWizard
-          openUp={openUp} windowId={windowId} sendAction={sendAction}
-          onClose={() => setOpenName(null)}
-        />
-      )}
-      {openAction && !WIZARD_ACTIONS.has(openAction.name) && hasParams(openAction) && (
-        <ParamPopout
-          action={openAction} openUp={openUp}
-          onRun={(params) => { onAction(openAction.name, windowId, params); setOpenName(null) }}
-          onClose={() => setOpenName(null)}
-        />
-      )}
+      {/* Static wrapper (no box of its own) — lets the placement effect measure
+          the open caret without affecting its absolute positioning. */}
+      <div ref={caretWrapRef}>
+        {openAction && openAction.name === 'Orientation Mapping' && (
+          <OrientationWizard
+            caretPos={caretPos} windowId={windowId} sendAction={sendAction}
+            onClose={() => setOpenName(null)}
+          />
+        )}
+        {openAction && openAction.name === 'Find Diffraction Vectors' && (
+          <FindVectorsWizard
+            caretPos={caretPos} windowId={windowId} sendAction={sendAction}
+            onClose={() => setOpenName(null)}
+          />
+        )}
+        {openAction && openAction.name === 'Vector Orientation Mapping' && (
+          <VectorOrientationWizard
+            caretPos={caretPos} windowId={windowId} sendAction={sendAction}
+            onClose={() => setOpenName(null)}
+          />
+        )}
+        {openAction && openAction.name === 'Center Zero Beam' && (
+          <CenterZeroBeamWizard
+            caretPos={caretPos} windowId={windowId} sendAction={sendAction}
+            onClose={() => setOpenName(null)}
+          />
+        )}
+        {openAction && openAction.name === 'Strain Mapping' && (
+          <StrainWizard
+            caretPos={caretPos} windowId={windowId} sendAction={sendAction}
+            onClose={() => setOpenName(null)}
+          />
+        )}
+        {openAction && !WIZARD_ACTIONS.has(openAction.name) && hasParams(openAction) && (
+          <ParamPopout
+            action={openAction} caretPos={caretPos} below={placement === 'below'}
+            onRun={(params) => { onAction(openAction.name, windowId, params); setOpenName(null) }}
+            onClose={() => setOpenName(null)}
+          />
+        )}
+      </div>
       {openAction && !hasParams(openAction) && hasSubs(openAction) && (
         <SubToolbar
           action={openAction}
+          up={placement !== 'below'}
           items={state.subItems.get(windowId)?.get(openAction.name) ?? []}
           onSub={(sub) => { onAction(sub.name, windowId, defaultsOf(sub.parameters)) }}
           onUpdate={(name, params) => sendAction('update_vi', { name, params }, windowId)}
           onRemove={(itemName) => sendAction('set_action_active', { name: itemName, active: false }, windowId)}
+          onCommit={(itemName) => sendAction('vi_commit', { name: itemName }, windowId)}
         />
       )}
     </div>
@@ -235,9 +311,10 @@ function rowVisible(spec: ParamSpec, values: Record<string, unknown>): boolean {
   return String(values[c.parameter]) === String(c.value)
 }
 
-function ParamPopout({ action, openUp, onRun, onClose }: {
+function ParamPopout({ action, caretPos, below, onRun, onClose }: {
   action: ToolbarAction
-  openUp: boolean
+  caretPos: React.CSSProperties
+  below: boolean
   onRun: (params: Record<string, unknown>) => void
   onClose: () => void
 }) {
@@ -255,8 +332,11 @@ function ParamPopout({ action, openUp, onRun, onClose }: {
 
   return (
     <div data-testid="action-flyout"
-      style={{ ...(openUp ? styles.popoutUp : styles.popout), flexDirection: 'column', alignItems: 'stretch' }}>
-      <div style={openUp ? styles.caretDown : styles.caretUp} />
+      style={{
+        ...popBase, ...caretPos, flexDirection: 'column', alignItems: 'stretch',
+        ...(below ? { animation: 'spyde-pop 130ms ease-out' } : {}),
+      }}>
+      {below && <div style={styles.caretUp} />}
       <div style={styles.popHead}>
         <span style={styles.popTitle}>{action.name}</span>
         <button data-testid="action-flyout-close" style={styles.closeBtn} onClick={onClose}>✕</button>
@@ -288,23 +368,34 @@ function ParamPopout({ action, openUp, onRun, onClose }: {
 
 type ViItem = { name: string; color: string; vtype?: string; calculation?: string }
 
-/** The second floating toolbar (Qt PopoutToolBar), always BELOW the main bar: a
- *  "＋" to add, then one colour-coded detector-shape icon per virtual image.
- *  Clicking a VI icon opens its own parameter caret (detector type / calc). */
-function SubToolbar({ action, items, onSub, onUpdate, onRemove }: {
+/** The second floating toolbar (Qt PopoutToolBar), below the main bar (flips
+ *  above it when there is no room below the window): a "＋" to add, then one
+ *  colour-coded detector-shape icon per virtual image. Clicking a VI icon opens
+ *  its own parameter caret (detector type / calc). */
+function SubToolbar({ action, up, items, onSub, onUpdate, onRemove, onCommit }: {
   action: ToolbarAction
+  up: boolean
   items: ViItem[]
   onSub: (sub: SubAction) => void
   onUpdate: (name: string, params: Record<string, unknown>) => void
   onRemove: (name: string) => void
+  onCommit: (name: string) => void
 }) {
   const [openVi, setOpenVi] = React.useState<string | null>(null)
   const subs = action.subfunctions || []
   const paramSpec = subs[0]?.parameters ?? {}
 
+  // A freshly-added item opens its caret right away so the user sees the
+  // detector options for the ROI they just placed.
+  const prevCount = React.useRef(items.length)
+  React.useEffect(() => {
+    if (items.length > prevCount.current) setOpenVi(items[items.length - 1].name)
+    prevCount.current = items.length
+  }, [items])
+
   return (
-    <div data-testid="sub-toolbar" style={styles.subBar}>
-      <div style={styles.caretUpSub} />
+    <div data-testid="sub-toolbar" style={up ? styles.subBarUp : styles.subBar}>
+      <div style={up ? styles.caretDownSub : styles.caretUpSub} />
       {subs.map(sub => (
         <button
           key={sub.name}
@@ -331,6 +422,7 @@ function SubToolbar({ action, items, onSub, onUpdate, onRemove }: {
               item={it} spec={paramSpec}
               onChange={(params) => onUpdate(it.name, params)}
               onRemove={() => { onRemove(it.name); setOpenVi(null) }}
+              onCommit={() => onCommit(it.name)}
             />
           )}
         </div>
@@ -351,11 +443,12 @@ function ViShape({ type, color }: { type: string; color: string }) {
 }
 
 /** Per-VI parameter caret (detector type / calculation), opens below its icon. */
-function ViCaret({ item, spec, onChange, onRemove }: {
+function ViCaret({ item, spec, onChange, onRemove, onCommit }: {
   item: ViItem
   spec: Record<string, ParamSpec>
   onChange: (params: Record<string, unknown>) => void
   onRemove: () => void
+  onCommit: () => void
 }) {
   const values: Record<string, unknown> = { type: item.vtype, calculation: item.calculation }
   const params = Object.entries(spec)
@@ -379,6 +472,10 @@ function ViCaret({ item, spec, onChange, onRemove }: {
           </div>
         ))}
       </div>
+      {/* The standard Commit affordance (same as strain): freeze this virtual
+          image into its own SignalTree; the live ROI/window stay for tuning. */}
+      <button data-testid={`vi-commit-${item.name}`} style={styles.runBtn}
+        onClick={onCommit}>Commit to New Tree</button>
     </div>
   )
 }
@@ -471,10 +568,14 @@ const subBase: React.CSSProperties = {
 
 const styles: Record<string, React.CSSProperties> = {
   bar: {
-    // BELOW the window (the window root is overflow:visible), centered, tracking
-    // it on move/resize. Reveal-on-hover is handled by the opacity/pointerEvents
-    // applied inline.
-    position: 'absolute', top: '100%', marginTop: 8, left: '50%',
+    // Floats BELOW the window (inside it only as a no-room fallback — the
+    // vertical position is applied inline), centered, tracking move/resize.
+    // Reveal-on-hover is handled by the opacity/pointerEvents applied inline.
+    // The bar lives in the window's stacking context, so it shares the
+    // window's z-level: a sibling window stacked above also covers the bar,
+    // and a hidden bar (pointerEvents:none) never intercepts clicks headed
+    // for a window beneath.
+    position: 'absolute', left: '50%',
     transform: 'translateX(-50%)',
     display: 'flex', alignItems: 'center', gap: 2,
     background: 'rgba(24,24,37,0.92)', border: '1px solid #313244',
@@ -486,12 +587,9 @@ const styles: Record<string, React.CSSProperties> = {
     border: 'none', cursor: 'pointer', width: 30, height: 30, borderRadius: 6,
     display: 'flex', alignItems: 'center', justifyContent: 'center',
   },
-  popout: { ...popBase, top: '100%', marginTop: 10, animation: 'spyde-pop 130ms ease-out' },
-  popoutUp: { ...popBase, bottom: '100%', marginBottom: 10, animation: 'spyde-pop-up 130ms ease-out' },
   subBar: { ...subBase, top: '100%', marginTop: 10, animation: 'spyde-pop 130ms ease-out' },
   subBarUp: { ...subBase, bottom: '100%', marginBottom: 10, animation: 'spyde-pop-up 130ms ease-out' },
   caretUp: caret('up', POP_BG),
-  caretDown: caret('down', POP_BG),
   caretUpSub: caret('up', SUB_BG),
   caretDownSub: caret('down', SUB_BG),
   popHead: {

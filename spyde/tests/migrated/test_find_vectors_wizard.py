@@ -1,14 +1,14 @@
 """
 Staged Find-Diffraction-Vectors wizard backend (Qt parity):
 
-  fv_preview → attaches a LIVE found-peaks preview overlay to the source DP so
+  fv_open → attaches a LIVE found-peaks preview overlay to the source DP so
                red circles update as you tune the sliders / move the navigator.
   fv_tune    → live-updates the preview sliders (σ / kernel radius / threshold /
                min distance / subpixel) and redraws at the current crosshair —
                NO full-dataset compute.
   fv_run     → full-dataset batch with the tuned params → a new vectors-image
                window with `tree.diffraction_vectors` attached.
-  fv_stop    → removes the live preview overlay (caret closed).
+  fv_close    → removes the live preview overlay (caret closed).
 
 Memory safety: the preview only slices/computes a small nav window (radius
 ceil(3σ)) around the crosshair — never the full dataset (see
@@ -57,7 +57,7 @@ class TestFindVectorsWizard:
     def test_preview_tune_run(self):
         from spyde.backend.session import Session
         from spyde.actions.find_vectors_action import (
-            fv_preview, fv_tune, fv_run, fv_stop,
+            fv_open, fv_tune, fv_run, fv_close,
         )
         session = Session(n_workers=1, threads_per_worker=1)
         try:
@@ -67,7 +67,7 @@ class TestFindVectorsWizard:
             tree = src.signal_tree
 
             # ── Tune: start the live preview ─────────────────────────────────
-            fv_preview(session, src, {
+            fv_open(session, src, {
                 "sigma": 1.0, "kernel_radius": 5, "threshold": 0.4,
                 "min_distance": 3, "subpixel": True,
             })
@@ -112,7 +112,7 @@ class TestFindVectorsWizard:
 
     def test_stop_removes_preview(self):
         from spyde.backend.session import Session
-        from spyde.actions.find_vectors_action import fv_preview, fv_stop
+        from spyde.actions.find_vectors_action import fv_open, fv_close
         session = Session(n_workers=1, threads_per_worker=1)
         try:
             session._add_signal(_calibrated_diffraction_4d(scale=0.1))
@@ -120,13 +120,13 @@ class TestFindVectorsWizard:
             src = _signal_plot(session)
             tree = src.signal_tree
 
-            fv_preview(session, src, {"sigma": 1.0, "kernel_radius": 5,
+            fv_open(session, src, {"sigma": 1.0, "kernel_radius": 5,
                                       "threshold": 0.4, "min_distance": 3,
                                       "subpixel": True})
             assert _wait(lambda: getattr(tree, "_fv_preview", None) is not None)
             prev = tree._fv_preview
 
-            fv_stop(session, src, {})
+            fv_close(session, src, {})
             assert _wait(lambda: getattr(tree, "_fv_preview", None) is None)
             assert prev._mg is None                  # marker group removed
         finally:

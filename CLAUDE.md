@@ -69,10 +69,15 @@ Supported file extensions: `.hspy`, `.zspy`, `.mrc`, `.tif`, `.tiff`, `.de5` (se
 - `toolbars/`: toolbar/button-bar/caret config that the renderer renders.
 - `update_functions.py`: functions that compute what data to display given the current plot state (incl. `update_from_navigation_selection`, the navigator→DP path).
 
-### Actions (`spyde/actions/`)
-- `base.py`: base action framework; defines `NAVIGATOR_DRAG_MIME` for drag-and-drop between plots
-- `find_vectors/`: Qt-free Find-Vectors compute package (split from the former monolith — see its `__init__` docstring); `find_vectors_action.py` / `vector_overlay.py` are the interactive wiring
-- `_common.py`: small shared helpers (`reciprocal_radius`, strain component constants, `widget_region`)
+### Actions & toolbars (`spyde/actions/`)
+**Read `spyde/actions/README.md` before adding or changing an action** — it is the contract: the action taxonomy (View / TransformAction / RegionAction / Wizard / Commit), the TWO dispatch paths (YAML toolbar via `ActionContext`, staged wizard via `registry.STAGED_HANDLERS` with `<key>_open/_close/_tune/_run/_commit` verbs), the lifecycle + ownership map, and copyable skeletons (`_template_action.py`). Framework modules:
+- `action.py` / `wizard.py`: the template base classes (`TransformAction`, `RegionAction`, `WizardController`)
+- `registry.py`: staged-action table + the WindowController protocol (bare-figure windows register in `session._window_controllers`)
+- `lifecycle.py`: the shared basis set — `run_on_worker` (worker→main marshal), `bump_generation`/`is_current` (StrictMode/latest-wins guard), `wait_for_vectors` (the attach gap), `replace_tree_attr`, `paint_signal_plots`, `live_fill_poller`
+- `commit.py`: `open_result_tree` (early/progressive window) + `commit_result_tree` (THE Commit action: new SignalTree with chip views + provenance)
+- `figure_registry.py`: per-window figure keep-alive, evicted by `_forget_window`
+- `find_vectors/`: Qt-free Find-Vectors compute package (the model for splitting heavy compute); `find_vectors_action.py` / `vector_overlay.py` are the interactive wiring
+- `_common.py`: small shared helpers (`reciprocal_radius`, strain component constants, `widget_region`); `base.py` also defines `NAVIGATOR_DRAG_MIME`
 
 ### Compute Backend (`spyde/compute_backend.py`)
 `ComputeBackend` provides a uniform `concurrent.futures.Future`-compatible interface over two modes:
@@ -127,7 +132,7 @@ Tests are **Qt-free** (no `pytest-qt`, no `QApplication`). They build a real `Se
 - **Backend `emit`/`emit_error`/`emit_status` do NOT reach Playwright stdout** (they're the `PLOTAPP:` line protocol, consumed by the main process). To see a backend error, either read `ctx.backend.logBuffer` at the end of the test, or set `SPYDE_LOG_LEVEL=WARNING` in `launchApp({env})` so `logging` tees to stderr (which the harness captures). Watching plain stdout for a status string will silently miss the error.
 - **Run:** `npx playwright test tests/<spec>.spec.ts --project=electron --reporter=line --retries=0`. Kill strays first if flaky (`Get-Process electron,python | Stop-Process -Force`), but don't over-attribute flakiness to the app — a polluted local env (repeated relaunches, leftover processes) produces slow dask / port contention that is YOUR test setup, not a real bug. On this dev box a healthy `LocalCluster` scheduler starts in ~1 s.
 
-**The find-vectors→downstream timing trap (this WILL bite):** `find_diffraction_vectors` opens its result window EARLY (count-map placeholder) but attaches `tree.diffraction_vectors` only when the streaming batch **finishes** (`_finalize`, which also emits `"Found N diffraction vectors"`). An action that needs the vectors (Strain, Vector VI, Vector OM) can fire in the gap and find `diffraction_vectors=None` on a tree that gets it seconds later. Don't gate a test on a fixed sleep; wait for the real completion signal (the `"Found"` status, or poll the attribute), and make the *backend handler self-wait* for the attach so the real app is robust too (see `strain_run`'s wait-then-rerun on a worker thread).
+**The find-vectors→downstream timing trap (this WILL bite):** `find_diffraction_vectors` opens its result window EARLY (count-map placeholder) but attaches `tree.diffraction_vectors` only when the streaming batch **finishes** (`_finalize`, which also emits `"Found N diffraction vectors"` and re-sends the toolbar config — the vector actions are `requires_vectors`-gated so they appear only then). An action that needs the vectors can fire in the gap and find `diffraction_vectors=None` on a tree that gets it seconds later. Don't gate a test on a fixed sleep; wait for the real completion signal (the `"Found"` status, or poll the attribute). Backend handlers self-wait via `lifecycle.wait_for_vectors` (strain/VOM/vector-VI all do; use `strict=True` when the handler gates on the clicked plot's own tree).
 
 ## Memory Safety Rule: Never Materialise Large Datasets
 

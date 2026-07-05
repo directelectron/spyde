@@ -229,17 +229,219 @@ class AnnularSelector(BaseSelector):
         pass
 
 
-class LineSelector(BaseSelector):
-    """Line selector stub — no pyqtgraph LineROI equivalent in anyplotlib yet."""
+class LineProfileSelector(BaseSelector):
+    """Line-profile selector: the profile path is a LINE WIDGET — a 2-vertex
+    anyplotlib "polygon" widget, which the renderer draws as a solid segment
+    with a native control point at each end (drag a control point to move that
+    end). A DASHED marker line perpendicular to it at the midpoint shows the
+    integration WIDTH; the bare control point at its tip (an empty-text label
+    widget — just the handle dot, no extra chrome) drags to widen/narrow the
+    band. The two lines are linked: moving the profile line re-derives the
+    perpendicular and carries the width control along; moving the width
+    control re-derives the width and snaps back onto the perpendicular.
 
-    def __init__(self, parent, children, update_function, **kwargs):
-        super().__init__(parent, children, update_function)
+    (Only anyplotlib's *Python* ``PolygonWidget`` wrapper insists on ≥3
+    vertices — the JS renderer draws and hit-tests any count ≥2, so the line
+    widget is a bare ``Widget("polygon", …)`` registered the same way
+    ``add_polygon_widget`` does.)
+    """
+
+    def __init__(self, parent, children, update_function,
+                 live_delay: int = 2, multi_selector: bool = False, **kwargs):
+        super().__init__(parent, children, update_function,
+                         live_delay=live_delay, multi_selector=multi_selector,
+                         color=kwargs.get("color", "#ffd166"))
+        self._line = None    # the 2-vertex line widget (the solid profile path)
+        self._hw = None      # width control point (empty-label widget)
+        self._dash_mg = None
+        self.roi = None
+        self.width = 1.0     # integration width (px, across the line)
+        # Programmatic widget syncs fire the widgets' own pointer callbacks
+        # (Widget.set → callbacks.fire) — guard against re-entry.
+        self._syncing = False
+
+        plot2d = self._get_plot2d()
+        if plot2d is None:
+            return
+        try:
+            iw = float(plot2d._state.get("image_width") or 100)
+            ih = float(plot2d._state.get("image_height") or 100)
+            self.width = max(2.0, 0.1 * min(iw, ih))
+            self._line = self._add_line_widget(
+                plot2d, [[0.3 * iw, 0.5 * ih], [0.7 * iw, 0.5 * ih]])
+            mx, my, nx, ny = self._mid_and_normal()
+            self._hw = plot2d.add_label_widget(
+                x=mx + nx * self.width / 2.0, y=my + ny * self.width / 2.0,
+                text="", fontsize=1, color=self.color)
+            self.roi = self._line
+            self._cb_line = event_handler_fn(self._on_line_moved)
+            self._cb_width = event_handler_fn(self._on_width_moved)
+            self._line.add_event_handler(self._cb_line, "pointer_move", "pointer_up")
+            self._hw.add_event_handler(self._cb_width, "pointer_move", "pointer_up")
+            self._redraw()
+        except Exception as e:
+            logger.debug("LineProfileSelector widget init failed: %s", e)
+
+    def _add_line_widget(self, plot2d, vertices):
+        """Register a 2-vertex polygon widget (the draggable line segment)."""
+        from anyplotlib.widgets._base import Widget
+        w = Widget("polygon", lambda: None,
+                   vertices=[[float(x), float(y)] for x, y in vertices],
+                   color=self.color)
+        w._push_fn = plot2d._make_widget_push_fn(w)
+        plot2d._widgets[w.id] = w
+        plot2d._push()
+        return w
+
+    def _get_plot2d(self):
+        plot = self.current_plot
+        return getattr(plot, "_plot2d", None) if plot is not None else None
+
+    # ── Geometry ────────────────────────────────────────────────────────────────
+
+    @property
+    def endpoints(self) -> tuple[tuple[float, float], tuple[float, float]]:
+        v = self._line.vertices
+        return ((float(v[0][0]), float(v[0][1])),
+                (float(v[1][0]), float(v[1][1])))
+
+    def _mid_and_normal(self) -> tuple[float, float, float, float]:
+        """Midpoint + unit normal of the profile line (widget pixel coords)."""
+        (x0, y0), (x1, y1) = self.endpoints
+        dx, dy = x1 - x0, y1 - y0
+        length = float(np.hypot(dx, dy)) or 1.0
+        return (x0 + x1) / 2.0, (y0 + y1) / 2.0, -dy / length, dx / length
+
+    # ── Events ──────────────────────────────────────────────────────────────────
+
+    def _on_line_moved(self, event=None):
+        # The line moved — carry the width control along (same width, new
+        # perpendicular) and redraw the dashed width line.
+        if self._syncing:
+            return
+        self._syncing = True
+        try:
+            mx, my, nx, ny = self._mid_and_normal()
+            self._hw.set(x=mx + nx * self.width / 2.0,
+                         y=my + ny * self.width / 2.0)
+        except Exception as e:
+            logger.debug("repositioning width control point failed: %s", e)
+        finally:
+            self._syncing = False
+        self._redraw()
+        self.update_data()
+
+    def _on_width_moved(self, event=None):
+        # Width = 2 × the control point's projection onto the perpendicular;
+        # snap it back onto the perpendicular axis.
+        if self._syncing:
+            return
+        self._syncing = True
+        try:
+            mx, my, nx, ny = self._mid_and_normal()
+            px, py = float(self._hw.x) - mx, float(self._hw.y) - my
+            proj = px * nx + py * ny
+            self.width = max(1.0, 2.0 * abs(proj))
+            side = 1.0 if proj >= 0 else -1.0
+            self._hw.set(x=mx + side * nx * self.width / 2.0,
+                         y=my + side * ny * self.width / 2.0)
+        except Exception as e:
+            logger.debug("updating line-profile width failed: %s", e)
+        finally:
+            self._syncing = False
+        self._redraw()
+        self.update_data()
+
+    # ── Drawing ─────────────────────────────────────────────────────────────────
+
+    def _dash_segments(self) -> list:
+        """The dashed perpendicular as a run of short segments through the
+        midpoint (length = the integration width)."""
+        mx, my, nx, ny = self._mid_and_normal()
+        half = self.width / 2.0
+        dash, gap = 4.0, 3.0
+        segs = []
+        t = -half
+        while t < half:
+            t2 = min(t + dash, half)
+            segs.append([[mx + nx * t, my + ny * t], [mx + nx * t2, my + ny * t2]])
+            t = t2 + gap
+        return segs
+
+    def _redraw(self) -> None:
+        """Redraw the dashed width line (the solid line IS the widget — the
+        renderer draws it and its control points natively)."""
+        plot2d = self._get_plot2d()
+        if plot2d is None:
+            return
+        try:
+            if self._dash_mg is None:
+                self._dash_mg = plot2d.add_lines(
+                    self._dash_segments(), name=f"lp_dash_{id(self)}",
+                    edgecolors=self.color, linewidths=1.2)
+            else:
+                self._dash_mg.set(segments=self._dash_segments())
+        except Exception as e:
+            logger.debug("line-profile redraw failed: %s", e)
+
+    # ── BaseSelector contract ───────────────────────────────────────────────────
 
     def _get_selected_indices(self) -> np.ndarray:
-        return np.array([[0, 0]])
+        if self._line is None:
+            return np.array([[0, 0]])
+        (x0, y0), (x1, y1) = self.endpoints
+        # Geometry row (not an index grid) — ints so change-detection fires.
+        return np.array([[int(round(x0)), int(round(y0)),
+                          int(round(x1)), int(round(y1)),
+                          int(round(self.width))]])
 
     def add_linked_roi(self, plot: "Plot") -> None:
         pass
+
+    def translate_pixels(self, shift_x: int, shift_y: int) -> None:
+        if self._line is None:
+            return
+        try:
+            (x0, y0), (x1, y1) = self.endpoints
+            self._line.set(vertices=[[x0 + shift_x, y0 + shift_y],
+                                     [x1 + shift_x, y1 + shift_y]])
+        except Exception as e:
+            logger.debug("translating line-profile selector failed: %s", e)
+
+    def hide(self) -> None:
+        for wdg in (self._line, self._hw):
+            if wdg is not None:
+                try:
+                    wdg.hide()
+                except Exception as e:
+                    logger.debug("hiding line-profile widget failed: %s", e)
+        if self._dash_mg is not None:
+            try:
+                self._dash_mg.set(segments=[])
+            except Exception as e:
+                logger.debug("hiding line-profile dash failed: %s", e)
+
+    def show(self) -> None:
+        for wdg in (self._line, self._hw):
+            if wdg is not None:
+                try:
+                    wdg.show()
+                except Exception as e:
+                    logger.debug("showing line-profile widget failed: %s", e)
+        self._redraw()
+
+    def close(self) -> None:
+        if self._dash_mg is not None:
+            try:
+                self._dash_mg.remove()
+            except Exception as e:
+                logger.debug("removing line-profile dash failed: %s", e)
+        self._dash_mg = None
+        super().close()   # hides the widgets (our hide override) + panel push
+
+
+# Back-compat alias (the old stub's export name).
+LineSelector = LineProfileSelector
 
 
 class IntegratingSSelector2D(IntegratingSelectorMixin):

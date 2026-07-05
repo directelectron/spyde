@@ -49,6 +49,10 @@ class _FakeTree:
     diffraction_vectors = None
 
 
+class _FakeTreeWithVectors:
+    diffraction_vectors = object()      # any non-None value unlocks the gate
+
+
 def _signal2d():
     """Plain 4D diffraction signal (raw data)."""
     s = hs.signals.Signal2D(np.zeros((4, 4, 8, 8), dtype=np.float32))
@@ -71,15 +75,31 @@ class TestVectorVVIGating:
         assert "Vector Orientation Mapping" not in names
 
     def test_present_on_vectors_image(self):
-        plot = _FakePlot(_vectors_image(), _FakeTree())
+        plot = _FakePlot(_vectors_image(), _FakeTreeWithVectors())
         names = get_toolbar_actions_for_plot(plot.plot_state)[2]
         assert "Vector Virtual Imaging" in names
         assert "Vector Orientation Mapping" in names
 
+    def test_hidden_until_vectors_attach(self):
+        """requires_vectors: the vector actions stay hidden on the vectors-image
+        window while the batch is still computing (diffraction_vectors=None) and
+        appear when _finalize attaches them + re-sends the toolbar config."""
+        tree = _FakeTree()
+        plot = _FakePlot(_vectors_image(), tree)
+        before = get_toolbar_actions_for_plot(plot.plot_state)[2]
+        for name in ("Vector Virtual Imaging", "Vector Orientation Mapping",
+                     "Strain Mapping"):
+            assert name not in before, f"{name} must wait for the vectors attach"
+        tree.diffraction_vectors = object()          # the batch finalizes
+        after = get_toolbar_actions_for_plot(plot.plot_state)[2]
+        for name in ("Vector Virtual Imaging", "Vector Orientation Mapping",
+                     "Strain Mapping"):
+            assert name in after, f"{name} should appear once vectors attach"
+
     def test_dense_actions_excluded_on_vectors_image(self):
         # the vectors-result image is a Diffraction2D subclass, but the dense
         # diffraction actions must NOT appear on it.
-        plot = _FakePlot(_vectors_image(), _FakeTree())
+        plot = _FakePlot(_vectors_image(), _FakeTreeWithVectors())
         names = get_toolbar_actions_for_plot(plot.plot_state)[2]
         for dense in ("Virtual Imaging", "Orientation Mapping",
                       "Find Diffraction Vectors"):

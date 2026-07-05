@@ -12,6 +12,7 @@
  */
 import React from 'react'
 import { WizardShell, TabRow, Field, NumInput, Slider, Check, S } from './WizardShell'
+import { useDebouncedAction, useWizardEvent } from './wizardHooks'
 import { useCifRecents, RecentCifs } from './CifRecents'
 import { CodPicker } from './CodPicker'
 
@@ -19,7 +20,7 @@ const TABS = ['Load', 'Library', 'Refine', 'Run'] as const
 type Tab = typeof TABS[number]
 
 interface Props {
-  openUp: boolean
+  caretPos: React.CSSProperties
   windowId: number
   sendAction: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
   onClose: () => void
@@ -41,7 +42,7 @@ interface VomSaved {
 }
 const _vomStore = new Map<number, VomSaved>()
 
-export function VectorOrientationWizard({ openUp, windowId, sendAction, onClose }: Props) {
+export function VectorOrientationWizard({ caretPos, windowId, sendAction, onClose }: Props) {
   const saved = _vomStore.get(windowId)
   const [tab, setTab] = React.useState<Tab>(saved?.tab ?? 'Load')
   const [cif, setCif] = React.useState(saved?.cif ?? '')
@@ -64,25 +65,15 @@ export function VectorOrientationWizard({ openUp, windowId, sendAction, onClose 
     _vomStore.set(windowId, { tab, cif, voltage, resolution, minInt, strainCap, tolerance, gamma, kPow, smooth, libReady })
   }, [windowId, tab, cif, voltage, resolution, minInt, strainCap, tolerance, gamma, kPow, smooth, libReady])
 
-  const refineTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null)
-  // Cancel any pending debounced refine on unmount so vom_refine can't fire at a
-  // torn-down preview after the wizard closes mid-debounce.
-  React.useEffect(() => () => {
-    if (refineTimer.current) clearTimeout(refineTimer.current)
-  }, [])
+  // Debounced live refine — a pending refine is cancelled on unmount so
+  // vom_refine can't fire at a torn-down preview mid-debounce.
+  const sendRefine = useDebouncedAction(sendAction, 'vom_refine', windowId)
   const { recents, remember } = useCifRecents()
 
   // Live single-pattern fit readout streamed from the backend overlay.
-  React.useEffect(() => {
-    const onFit = (e: Event) => {
-      const d = (e as CustomEvent).detail as Record<string, unknown>
-      // Accept events with no window_id (null/undefined); only filter a mismatch.
-      if (d.window_id != null && d.window_id !== windowId) return
-      setFit(d as unknown as VomFit)
-    }
-    window.addEventListener('spyde:vom_fit', onFit)
-    return () => window.removeEventListener('spyde:vom_fit', onFit)
-  }, [windowId])
+  useWizardEvent('spyde:vom_fit', windowId, (d) => {
+    setFit(d as unknown as VomFit)
+  })
 
   const useCif = (path: string) => {
     setCif(path); remember(path); setStatus('Crystal loaded — generate the library.')
@@ -106,11 +97,7 @@ export function VectorOrientationWizard({ openUp, windowId, sendAction, onClose 
   const refine = (next: Partial<{ strainCap: number; tolerance: number; gamma: number; kPow: number }>) => {
     const cap = next.strainCap ?? strainCap, tol = next.tolerance ?? tolerance
     const g = next.gamma ?? gamma, k = next.kPow ?? kPow
-    if (refineTimer.current) clearTimeout(refineTimer.current)
-    refineTimer.current = setTimeout(() => {
-      sendAction('vom_refine',
-        { strain_cap: cap / 100, sink_bw: tol / 100, gamma: g / 100, k_power: k }, windowId)
-    }, 120)
+    sendRefine(() => ({ strain_cap: cap / 100, sink_bw: tol / 100, gamma: g / 100, k_power: k }))
   }
   const compute = () => {
     setStatus('Computing orientation + strain maps…')
@@ -121,7 +108,7 @@ export function VectorOrientationWizard({ openUp, windowId, sendAction, onClose 
   const pct = (v?: number) => (v === undefined ? '—' : `${(v * 100).toFixed(2)}%`)
 
   return (
-    <WizardShell testid="vector-orientation-wizard" title="Vector Orientation Mapping" openUp={openUp}
+    <WizardShell testid="vector-orientation-wizard" title="Vector Orientation Mapping" posStyle={caretPos}
       onClose={onClose} closeTestid="vom-close" status={status} statusTestid="vom-status">
       <TabRow tabs={TABS} active={tab} onSelect={setTab} testid={(t) => `vom-tab-${t}`}
         locked={(t) => (t === 'Refine' || t === 'Run') && !libReady} />

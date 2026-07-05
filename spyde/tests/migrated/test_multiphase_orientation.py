@@ -100,10 +100,10 @@ class TestMultiPhaseOrientation:
                 "resolution": 12.0, "minimum_intensity": 1e-4,
             })
             assert _wait(lambda: getattr(tree, "_om_wizard", None) is not None
-                         and tree._om_wizard.get("sim") is not None)
+                         and tree._om_wizard.sim is not None)
             wiz = tree._om_wizard
-            assert len(wiz["phases"]) == 2
+            assert len(wiz.phases) == 2
             # Live refine overlay is single-phase only → skipped for multi-phase.
-            assert wiz.get("overlay") is None
+            assert wiz.overlay is None
         finally:
             session.shutdown()

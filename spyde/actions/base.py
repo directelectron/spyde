@@ -18,6 +18,7 @@ import numpy as np
 log = logging.getLogger(__name__)
 import hyperspy.api as hs
 
+from spyde.actions.action import TransformAction
 from spyde.drawing.update_functions import get_fft
 from spyde.drawing.selectors import RectangleSelector
 
@@ -108,54 +109,10 @@ def add_fft_selector(toolbar: "ActionContext", action_name="", *args, **kwargs):
 
 
 # ── Toggle / navigation actions (UI emitted to Electron) ────────────────────
-
-def toggle_navigation_plots(toolbar: "ActionContext", action_name="", toggle=None,
-                            *args, **kwargs):
-    """Emit the available navigation signals so Electron can render a switcher."""
-    mgr = toolbar.plot.multiplot_manager
-    if mgr is None:
-        raise RuntimeError("Plot does not have a navigation plot manager.")
-
-    signal_options = mgr.navigation_signals
-    options = []
-    for name, signal in signal_options.items():
-        options.append({"name": name})
-
-    _emit({
-        "type": "navigation_options",
-        "window_id": toolbar.plot.window_id,
-        "action_name": action_name,
-        "options": options,
-        "visible": bool(toggle) if toggle is not None else True,
-    })
-
-
-def toggle_signal_tree(toolbar: "ActionContext", action_name="", toggle=None,
-                       *args, **kwargs):
-    """Emit the signal tree structure so Electron can render a node switcher."""
-    root_node = toolbar.plot.signal_tree.root_node
-
-    def node_to_dict(node) -> dict:
-        return {
-            "name": node.name,
-            "signal_id": id(node.signal),
-            "children": [node_to_dict(c) for c in node.children.values()],
-        }
-
-    active = None
-    try:
-        active = id(toolbar.plot.plot_state.current_signal)
-    except Exception as e:
-        log.debug("resolving active signal id failed: %s", e)
-    _emit({
-        "type": "signal_tree",
-        "window_id": toolbar.plot.window_id,
-        "action_name": action_name,
-        "tree": node_to_dict(root_node),
-        "active_signal_id": active,
-        "visible": bool(toggle) if toggle is not None else True,
-    })
-
+# (The old "Select Navigator" / "Navigate Signal Tree" toolbar toggles are
+# gone: navigators are switched via the chip strip on the navigator window,
+# and the Workflow tree is always shown in the right-hand dock — the session
+# pushes `signal_tree` messages on tree creation and after every transform.)
 
 def select_signal_node(toolbar: "ActionContext", signal_id: int = None, *args, **kwargs):
     """Switch the active plot to the signal node identified by signal_id.
@@ -174,24 +131,21 @@ def select_signal_node(toolbar: "ActionContext", signal_id: int = None, *args, *
 
 # ── Rebin ────────────────────────────────────────────────────────────────────
 
-def rebin2d(toolbar: "ActionContext", scale_x: int = None, scale_y: int = None,
-            *args, **kwargs):
-    """Rebin the 2-D signal by (scale_x, scale_y)."""
-    if scale_x is None:
-        scale_x = int(toolbar.params.get("scale_x", 2))
-    if scale_y is None:
-        scale_y = int(toolbar.params.get("scale_y", 2))
+class Rebin2DAction(TransformAction):
+    """Rebin the 2-D signal by (scale_x, scale_y) — a TransformAction: the
+    template resolves the params, runs hyperspy ``rebin`` and adds the
+    "Binned" node (+ PlotState) to the SAME tree automatically."""
 
-    current_selected_signal = toolbar.plot.plot_state.current_signal
-    num_nav_axes = current_selected_signal.axes_manager.navigation_dimension
-    if current_selected_signal.axes_manager.signal_dimension != 2:
-        raise RuntimeError("Current signal is not 2D, cannot rebin2d.")
+    name = "Rebin"
+    method = "rebin"
+    node_name = "Binned"
+    parameters = {
+        "scale_x": {"default": 2},
+        "scale_y": {"default": 2},
+    }
 
-    scale = [1] * num_nav_axes + [scale_x, scale_y]
-
-    return toolbar.plot.signal_tree.add_transformation(
-        parent_signal=current_selected_signal,
-        method="rebin",
-        node_name="Binned",
-        scale=scale,
-    )
+    def build_kwargs(self, signal, scale_x=2, scale_y=2, **_):
+        if signal.axes_manager.signal_dimension != 2:
+            raise RuntimeError("Current signal is not 2D, cannot rebin2d.")
+        nav = signal.axes_manager.navigation_dimension
+        return {"scale": [1] * nav + [int(scale_x), int(scale_y)]}

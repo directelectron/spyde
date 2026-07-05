@@ -223,7 +223,7 @@ class _MockVecsCM(_MockVecs):
 class TestStrainAction:
     def test_strain_run_emits_window_and_attaches_controller(self):
         import spyde.backend.ipc as ipc
-        from spyde.actions.strain_action import strain_run
+        from spyde.actions.strain_action import strain_open
 
         vecs = _MockVecsCM((6, 6), lambda iy, ix: np.array([[1 + 0.01 * ix, 0.0],
                                                             [0.0, 1.0]]))
@@ -235,7 +235,7 @@ class TestStrainAction:
         cap, orig = [], ipc.emit
         ipc.emit = lambda m: cap.append(m)
         try:
-            strain_run(session, plot, {})
+            strain_open(session, plot, {})
         finally:
             ipc.emit = orig
 
@@ -251,14 +251,15 @@ class TestStrainAction:
 
     def test_strict_mode_double_mount_builds_only_one_controller(self):
         """React StrictMode mounts the wizard TWICE synchronously (mount →
-        cleanup → remount) on every open, firing strain_run, strain_stop,
-        strain_run right in a row — before either strain_run's worker thread
-        has finished (see strain_run's _strain_run_gen comment). Both calls
+        cleanup → remount) on every open, firing strain_open, strain_close,
+        strain_open right in a row — before either strain_open's worker thread
+        has finished (see strain_open's _strain_run_gen comment). Both calls
         must NOT end up building a live StrainController: the generation
-        counter should let only the LATEST strain_run's window survive."""
+        counter should let only the LATEST strain_open's window survive."""
         import threading
         import spyde.backend.ipc as ipc
-        from spyde.actions.strain_action import strain_run, strain_stop, _CONTROLLERS
+        from spyde.actions.strain_action import strain_open, strain_close
+        from spyde.backend.session import Session as _RealSession
 
         vecs = _MockVecsCM((6, 6), lambda iy, ix: np.array([[1 + 0.01 * ix, 0.0],
                                                             [0.0, 1.0]]))
@@ -268,6 +269,11 @@ class TestStrainAction:
         class _Session:
             _w = 0
             signal_trees: list = []
+            # the real controller registry, bound onto the stub
+            register_window_controller = _RealSession.register_window_controller
+            controller_by_window_id = _RealSession.controller_by_window_id
+            def __init__(self):
+                self._window_controllers = {}
             def next_window_id(self):
                 self._w += 1
                 return self._w
@@ -276,20 +282,42 @@ class TestStrainAction:
 
         session = _Session()
 
+        # Faithfully reproduce production timing: React StrictMode fires
+        # open → close → open SYNCHRONOUSLY, before any strain_open's worker
+        # finishes computing (that's the whole point of the generation guard).
+        # A fast CI runner (esp. macOS) can otherwise finish the FIRST worker's
+        # 6×6 compute before the main thread issues close/open #2 — building a
+        # gen-1 window that later races the gen-3 window (2 figures, a test
+        # flake, not a real bug). Gate the compute on a barrier the main thread
+        # releases only AFTER the full sequence is issued, so both workers
+        # ALWAYS land into the final generation like they do in the real app.
+        # strain_open imports compute_strain_field from strain_mapping at call
+        # time, so gate it there.
+        import spyde.actions.strain_mapping as _sm
+        released = threading.Event()
+        _real_compute = _sm.compute_strain_field
+
+        def _gated_compute(*a, **k):
+            released.wait(timeout=5.0)
+            return _real_compute(*a, **k)
+
         cap, orig = [], ipc.emit
         ipc.emit = lambda m: cap.append(m)
+        _sm.compute_strain_field = _gated_compute
         try:
             # The exact StrictMode sequence: run, stop, run — all synchronous,
-            # before any of strain_run's background "strain-run" threads land.
-            strain_run(session, plot, {})
-            strain_stop(session, plot, {})
-            strain_run(session, plot, {})
-            # Let both strain_run compute threads finish and dispatch back.
+            # before any of strain_open's background "strain-run" threads land.
+            strain_open(session, plot, {})
+            strain_close(session, plot, {})
+            strain_open(session, plot, {})
+            released.set()   # now let both workers compute + dispatch back
+            # Let both strain_open compute threads finish and dispatch back.
             for t in threading.enumerate():
                 if t.name == "strain-run":
                     t.join(timeout=5.0)
         finally:
             ipc.emit = orig
+            _sm.compute_strain_field = _real_compute
 
         fig_msgs = [m for m in cap if m.get("type") == "figure"]
         # Exactly one strain-map window's figure must have been emitted and
@@ -297,8 +325,8 @@ class TestStrainAction:
         assert len(fig_msgs) == 1, f"expected 1 strain figure, got {len(fig_msgs)}"
         ctrl = getattr(tree, "_strain_controller", None)
         assert ctrl is not None
-        assert len(_CONTROLLERS) == 1
-        assert _CONTROLLERS[ctrl.window_id] is ctrl
+        assert len(session._window_controllers) == 1
+        assert session.controller_by_window_id(ctrl.window_id) is ctrl
 
     def test_controller_cif_reference_then_region(self):
         import anyplotlib as apl
@@ -361,7 +389,7 @@ class TestStrainAction:
         The strain window is a bare `figure`, not a registered Plot, so
         `plot` is None and _ctrl_for can only resolve via
         payload["window_id"] — dispatch_action must inject it there itself."""
-        from spyde.actions.strain_action import StrainController, _CONTROLLERS
+        from spyde.actions.strain_action import StrainController
         from spyde.actions.strain_mapping import compute_strain_field
         session = window["window"]
 
@@ -373,7 +401,7 @@ class TestStrainAction:
         ctrl = StrainController(vecs, p, window_id=777, ref_yx=(0, 0), session=session)
         ctrl.field = compute_strain_field(vecs, (0, 0))
         ctrl.attach()
-        assert _CONTROLLERS[777] is ctrl
+        assert session.controller_by_window_id(777) is ctrl
         assert ctrl.component == "exx"
 
         # Exactly how the renderer sends it: payload has NO window_id key.
@@ -522,8 +550,8 @@ class TestStrainAction:
         p = ax.imshow(np.zeros((4, 4), "f4"))
         ctrl = StrainController(vecs, p, window_id=4242, ref_yx=(0, 0),
                                 session=session)
-        ctrl.field = compute_strain_field(vecs, (0, 0))   # pre-set like strain_run
-        ctrl.attach()                                     # registers in _CONTROLLERS (skips recompute)
+        ctrl.field = compute_strain_field(vecs, (0, 0))   # pre-set like strain_open
+        ctrl.attach()    # registers in session._window_controllers (skips recompute)
         assert ctrl.field is not None
         # Dispatch by window_id (the strain window is not a registered Plot, so
         # plot is None — the handler resolves the controller from the registry).
@@ -704,13 +732,13 @@ class TestStrainSelectionOverlay:
 
     def test_strain_run_without_vectors_errors(self):
         import spyde.backend.ipc as ipc
-        from spyde.actions.strain_action import strain_run
+        from spyde.actions.strain_action import strain_open
         tree = type("T", (), {"diffraction_vectors": None})()
         plot = type("P", (), {"signal_tree": tree})()
         cap, orig = [], ipc.emit
         ipc.emit = lambda m: cap.append(m)
         try:
-            strain_run(object(), plot, {})
+            strain_open(object(), plot, {})
         finally:
             ipc.emit = orig
         assert not [m for m in cap if m.get("type") == "figure"]

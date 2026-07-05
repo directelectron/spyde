@@ -92,9 +92,9 @@ class TestVectorOrientationOM:
                 "resolution": 12.0, "minimum_intensity": 1e-4,
             })
             assert _wait(lambda: getattr(vtree, "_vom_wizard", None) is not None
-                         and vtree._vom_wizard.get("lib") is not None), \
+                         and vtree._vom_wizard.lib is not None), \
                 "template library never built"
-            assert len(vtree._vom_wizard["lib"].spots_xy) > 0
+            assert len(vtree._vom_wizard.lib.spots_xy) > 0
 
             # Generate now ALSO fits the whole field and opens the live IPF
             # heatmap window (Qt parity — the orientation map appears while you
@@ -156,9 +156,9 @@ class TestVectorOrientationOM:
                 "resolution": 12.0, "minimum_intensity": 1e-4,
             })
             assert _wait(lambda: getattr(vtree, "_vom_wizard", None) is not None
-                         and vtree._vom_wizard.get("overlay") is not None), \
+                         and vtree._vom_wizard.overlay is not None), \
                 "live refine overlay never attached"
-            ov = vtree._vom_wizard["overlay"]
+            ov = vtree._vom_wizard.overlay
             # Two marker groups: measured (red) + fitted template (green).
             assert ov._mg_meas is not None and ov._mg_tmpl is not None
             # At a position with ≥4 vectors: measured points drawn, template fit too.

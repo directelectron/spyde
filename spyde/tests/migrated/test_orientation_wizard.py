@@ -63,11 +63,11 @@ class TestOrientationWizard:
                 "resolution": 10.0, "minimum_intensity": 1e-4,
             })
             assert _wait(lambda: getattr(tree, "_om_wizard", None) is not None
-                         and tree._om_wizard.get("overlay") is not None), \
+                         and tree._om_wizard.overlay is not None), \
                 "library/overlay never became ready"
             wiz = tree._om_wizard
-            assert wiz["sim"] is not None and wiz["cache"] is not None
-            overlay = wiz["overlay"]
+            assert wiz.sim is not None and wiz.cache is not None
+            overlay = wiz.overlay
             assert overlay._mg is not None          # live template overlay attached
 
             # ── Refine: change gamma + normalize live ────────────────────────

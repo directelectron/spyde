@@ -1,10 +1,11 @@
 /**
  * vector_overlay.spec.ts — the Find-Diffraction-Vectors WIZARD must show a LIVE
- * found-peaks preview as you open it, then OVERLAY the final found vectors on
- * the live diffraction pattern after Compute (Qt parity). Launches the real
- * backend, loads lazy 4D data with a bright central disk, opens the wizard
- * (live preview → red markers), Computes, and asserts saturated-RED marker
- * pixels are present on the SOURCE DP canvas (the grayscale image has none).
+ * found-peaks preview as you open it. Compute collapses the caret, drops the
+ * preview, and leaves the SOURCE DP clean (the persistent overlay attaches
+ * hidden); the RESULT window draws its own markers. Reopening the caret brings
+ * the live preview back (a single marker set — no duplicated peaks). Launches
+ * the real backend, loads lazy 4D data with a bright central disk, and asserts
+ * on saturated-RED marker pixels (the grayscale image has none).
  */
 import { test, expect, _electron as electron, ElectronApplication, Page } from '@playwright/test'
 import { join } from 'path'
@@ -76,32 +77,31 @@ test('live preview + found-vector overlay as red markers on the diffraction patt
     timeout: 30_000, message: 'live preview drew no peak markers on the DP',
   }).toBeGreaterThan(0)
 
-  // Compute → a new vectors window opens and the persistent overlay stays on
-  // the source DP.
+  // Compute → the wizard caret COLLAPSES back into the toolbar button, the
+  // live preview is dropped, and a new vectors window opens. The SOURCE DP is
+  // left clean (the persistent overlay attaches hidden); the RESULT window
+  // draws its own markers once the vectors attach.
   const before = await page.getByTestId('subwindow').count()
   await page.getByTestId('fv-compute').click()
+  await expect(page.getByTestId('find-vectors-wizard')).toBeHidden()
   await expect.poll(() => page.getByTestId('subwindow').count(), {
     timeout: 60_000, message: 'vectors window never opened',
   }).toBeGreaterThan(before)
   await expect.poll(() => redPixels(), {
-    timeout: 30_000, message: 'no vector markers overlaid on the DP after compute',
+    timeout: 60_000, message: 'no vector markers on the RESULT window after compute',
   }).toBeGreaterThan(0)
-  const afterCompute = await redPixels()   // source overlay + result-window overlay
+  const resultOnly = await redPixels()   // result-window markers only
 
-  // Deselecting the action (closing the caret) HIDES the SOURCE-DP overlay. The
-  // vectors RESULT window keeps its OWN markers (its display, independent of the
-  // source action), so total red DROPS but need not reach 0. Measure relative.
-  await page.getByTestId('fv-close').click()
-  await expect.poll(() => redPixels(), {
-    timeout: 15_000, message: 'source overlay did not hide when the action was deselected',
-  }).toBeLessThan(afterCompute)
-  const afterHide = await redPixels()
-
-  // Reselecting the action shows the source overlay again → red rises back.
+  // Reopening the caret restores a live preview on the source DP (a SINGLE
+  // marker set — the preview supersedes the batch overlay, so peaks are never
+  // double-drawn) → red rises above the result-window-only level. Raise the
+  // source window first: the result window opened focused ON TOP of its
+  // toolbar (toolbar shares the window z-level by design).
+  await sig.getByTestId('subwindow-title').click()
   await sig.getByTestId('subwindow-titlebar').hover()
   await sig.getByTestId('action-btn-Find Diffraction Vectors').click()
   await expect(page.getByTestId('find-vectors-wizard')).toBeVisible()
   await expect.poll(() => redPixels(), {
-    timeout: 20_000, message: 'source overlay did not reappear when reselected',
-  }).toBeGreaterThan(afterHide)
+    timeout: 20_000, message: 'live preview did not reappear when reselected',
+  }).toBeGreaterThan(resultOnly)
 })

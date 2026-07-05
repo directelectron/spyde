@@ -1,5 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import type { SpyDEWindow, SpyDEFigure } from '../kernel/SpyDEContext'
+import { useSpyDE } from '../kernel/SpyDEContext'
+import { NAVIGATOR_DRAG_MIME } from '../kernel/dnd'
 
 interface Props {
   win: SpyDEWindow
@@ -33,6 +35,43 @@ const STRAIN_LABEL: Record<string, string> = { exx: 'εxx', eyy: 'εyy', exy: '�
 export function WindowContent({ win, iframeRefs, replayState, sendAction }: Props) {
   const id = String(win.windowId)
   const figs = win.figures
+  const { state } = useSpyDE()
+
+  // Navigator chip strip: a navigator window whose tree carries ≥2 NAMED
+  // navigators (base sum, vector count map, a dropped-in signal, …) lists them
+  // at the top — click switches the live navigator in place; SHIFT-click
+  // selects several, which the backend tiles side by side (linked pan/zoom +
+  // a duplicated crosshair per panel driving the real selector).
+  const navOpts = state.navigatorOptions.get(win.windowId)
+  const navNames = navOpts?.names ?? []
+  const hasNavChips = navNames.length >= 2
+  const [navSel, setNavSel] = useState<string[]>([])
+  useEffect(() => {
+    // Keep the selection a valid non-empty subset as navigators come and go.
+    setNavSel(prev => {
+      const valid = prev.filter(n => navNames.includes(n))
+      if (valid.length) return valid.length === prev.length ? prev : valid
+      const seed = navOpts?.current && navNames.includes(navOpts.current)
+        ? navOpts.current : navNames[0]
+      return seed ? [seed] : []
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [navNames.join('|')])
+  const navMulti = navSel.length >= 2
+
+  const onNavChip = (name: string, e: React.MouseEvent) => {
+    const tile = e.shiftKey || e.metaKey || e.ctrlKey
+    setNavSel(prev => {
+      let next: string[]
+      if (!tile) next = [name]
+      else if (prev.includes(name)) {
+        const rest = prev.filter(n => n !== name)
+        next = rest.length ? rest : prev
+      } else next = navNames.filter(n => prev.includes(n) || n === name)
+      if (next !== prev) sendAction('select_navigator', { names: next }, win.windowId)
+      return next
+    })
+  }
 
   const fig3d = useMemo(() => figs.find(f => f.view === '3d'), [figs])
   const has3d = !!fig3d
@@ -104,9 +143,10 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction }: Prop
     if (has3d && mode === '3d' && fig3d) return fig3d
     if (hasDensity && mode === 'density' && figDensity) return figDensity
     if (multi && tiledFig) return tiledFig                     // anyplotlib N-axis compare
+    if (navMulti && tiledFig) return tiledFig                  // tiled navigators
     if (hasChips) return [...figs].reverse().find(f => f.viewLabel === selected[0]) ?? null
     return figs.find(f => f.view !== '3d' && f.view !== 'density' && f.view !== 'ipf_key' && f.viewLabel !== TILED) ?? figs[0] ?? null
-  }, [has3d, mode, fig3d, hasDensity, figDensity, multi, tiledFig, hasChips, selected, figs])
+  }, [has3d, mode, fig3d, hasDensity, figDensity, multi, navMulti, tiledFig, hasChips, selected, figs])
 
   const shownId = shownFig?.figId
 
@@ -126,12 +166,31 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction }: Prop
     return () => { cancelAnimationFrame(raf); ro.disconnect() }
   }, [shownId, iframeRefs])
 
-  const showBar = hasChips || has3d || !!strainComponents
+  const showBar = hasChips || has3d || !!strainComponents || hasNavChips
 
   return (
     <div style={styles.root}>
       {showBar && (
         <div style={styles.bar} data-testid={`view-bar-${id}`}>
+          {hasNavChips && (
+            <div style={styles.chips} data-testid={`nav-chips-${id}`}>
+              {navNames.map(name => (
+                <button
+                  key={name}
+                  data-testid={`nav-chip-${name}-${id}`}
+                  onClick={(e) => onNavChip(name, e)}
+                  title="Click to show · Shift-click to tile · Drag out to make its own dataset"
+                  draggable
+                  onDragStart={(e) => {
+                    e.dataTransfer.setData(NAVIGATOR_DRAG_MIME,
+                      JSON.stringify({ windowId: win.windowId, name }))
+                    e.dataTransfer.effectAllowed = 'copy'
+                  }}
+                  style={navSel.includes(name) ? styles.chipActive : styles.chip}
+                >{name}</button>
+              ))}
+            </div>
+          )}
           {hasChips && (
             <div style={styles.chips} data-testid={`view-chips-${id}`}>
               {labels.map(label => (

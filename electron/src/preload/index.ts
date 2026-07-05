@@ -1,7 +1,7 @@
 /**
  * preload/index.ts — contextBridge API exposed to the renderer.
  */
-import { contextBridge, ipcRenderer } from 'electron'
+import { contextBridge, ipcRenderer, webUtils } from 'electron'
 
 contextBridge.exposeInMainWorld('electron', {
   // OS platform ('darwin' | 'win32' | 'linux') — the renderer uses this to lay
@@ -67,6 +67,27 @@ contextBridge.exposeInMainWorld('electron', {
     return () => ipcRenderer.removeListener('spyde:open_stack_dialog', h)
   },
 
+  /** Open the "Check for Updates" dialog (from the Help menu). Returns an unsubscribe fn. */
+  onOpenUpdateDialog: (cb: () => void) => {
+    const h = () => cb()
+    ipcRenderer.on('spyde:open_update_dialog', h)
+    return () => ipcRenderer.removeListener('spyde:open_update_dialog', h)
+  },
+
+  /** Open the "GPU Status" dialog (from the Help menu). Returns an unsubscribe fn. */
+  onOpenGpuStatusDialog: (cb: () => void) => {
+    const h = () => cb()
+    ipcRenderer.on('spyde:open_gpu_status_dialog', h)
+    return () => ipcRenderer.removeListener('spyde:open_gpu_status_dialog', h)
+  },
+
+  /** electron-updater's check/download/install progress. Returns an unsubscribe fn. */
+  onUpdateStatus: (cb: (status: Record<string, unknown>) => void) => {
+    const h = (_: unknown, status: Record<string, unknown>) => cb(status)
+    ipcRenderer.on('spyde:update-status', h)
+    return () => ipcRenderer.removeListener('spyde:update-status', h)
+  },
+
   // ── Renderer → Python ─────────────────────────────────────────────────────
 
   /** Send a toolbar/menu action to Python. */
@@ -99,6 +120,16 @@ contextBridge.exposeInMainWorld('electron', {
   /** Multi-select DIRECTORY picker (RETURNS paths) — for .zspy/.zarr folders. */
   pickFolders: (): Promise<string[]> => ipcRenderer.invoke('spyde:pick-folders'),
 
+  /** OS path of a dropped File (sandboxed renderers have no File.path) —
+   *  powers drag-and-drop of datasets (incl. .zspy folders) onto the MDI. */
+  pathForFile: (file: File): string | null => {
+    try {
+      return webUtils.getPathForFile(file) || null
+    } catch {
+      return null
+    }
+  },
+
   /** Forward an interaction event from an anyplotlib iframe to Python. */
   figureEvent: (figId: string, eventJson: string) =>
     ipcRenderer.send('spyde:figure-event', figId, eventJson),
@@ -108,4 +139,27 @@ contextBridge.exposeInMainWorld('electron', {
     ipcRenderer.send('spyde:resize', figId, width, height),
 
   openExternal: (url: string) => ipcRenderer.send('open-external', url),
+
+  // ── Updates / GPU status ──────────────────────────────────────────────────
+
+  /** Current channel, whether this build supports auto-update, last known
+   *  status, and the running app's version (for the "About" section). */
+  getUpdateInfo: (): Promise<{
+    channel: 'stable' | 'beta'
+    supported: boolean
+    status: Record<string, unknown>
+    appVersion: string
+  }> => ipcRenderer.invoke('spyde:get-update-info'),
+
+  /** Manual "Check Now". Result arrives via onUpdateStatus. */
+  checkForUpdates: () => ipcRenderer.send('spyde:check-for-updates'),
+
+  /** Start downloading a detected update. Progress arrives via onUpdateStatus. */
+  downloadUpdate: () => ipcRenderer.send('spyde:download-update'),
+
+  /** Quit and install a downloaded update. */
+  quitAndInstallUpdate: () => ipcRenderer.send('spyde:quit-and-install'),
+
+  /** Flip the update channel (stable/beta). */
+  setUpdateChannel: (channel: 'stable' | 'beta') => ipcRenderer.send('spyde:set-update-channel', channel),
 })

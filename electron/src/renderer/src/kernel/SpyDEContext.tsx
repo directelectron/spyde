@@ -76,7 +76,17 @@ export interface Histogram {
 /** One application-log record streamed from the Python backend. */
 export interface LogEntry { level: string; name: string; area?: string; msg: string; time: number }
 
-export interface SelectorInfo { windowId: number; mode: 'crosshair' | 'integrate'; title: string }
+export interface SelectorInfo {
+  windowId: number
+  mode: 'crosshair' | 'integrate'
+  title?: string
+  /** Per-selector key (a navigator can carry several selectors). */
+  selectorId?: number
+  /** Widget colour — the dock row's dot. */
+  color?: string
+}
+/** The named navigators a navigator window offers (its top chip strip). */
+export interface NavigatorOptions { names: string[]; current?: string | null }
 export interface SubItem { name: string; color: string; vtype?: string; calculation?: string }
 export interface TreeNode { name: string; signal_id: number; children: TreeNode[] }
 export interface AxisRow {
@@ -97,6 +107,7 @@ interface State {
   selectors: Map<number, SelectorInfo>
   signalTrees: Map<number, TreeNode>
   signalTreeActive: Map<number, number>   // windowId → active node signal_id
+  navigatorOptions: Map<number, NavigatorOptions>   // navigator windowId → named navigators
   axes: Map<number, AxisRow[]>
   composition: Map<number, Composition>     // windowId → sample elements + percentages
   activeActions: Map<number, Set<string>>   // windowId → action names with live output
@@ -144,6 +155,7 @@ type Action =
   | { type: 'SIGNAL_TYPE'; windowIds: number[]; current: string; options: string[] }
   | { type: 'SELECTOR_INFO'; info: SelectorInfo }
   | { type: 'SIGNAL_TREE'; windowId: number; tree: TreeNode; activeSignalId?: number }
+  | { type: 'NAVIGATOR_OPTIONS'; windowId: number; names: string[]; current?: string | null }
   | { type: 'STREAM'; text: string; kind: 'stdout' | 'stderr' }
   | { type: 'LOG'; entry: LogEntry }
   | { type: 'LOG_BACKFILL'; entries: LogEntry[] }
@@ -205,10 +217,12 @@ function spydeReducer(state: State, action: Action): State {
                && f.figId !== action.figId)),
         figure,
       ]
-      // A secondary view figure (e.g. the IPF 3-D explorer, view="3d") must NOT
-      // rename the window or flip its navigator flag — those belong to the
-      // primary figure.
-      if (!action.view) {
+      // A secondary view figure (e.g. the IPF 3-D explorer, view="3d") or a
+      // named chip view (view_label — strain εyy/εxy/ω, committed-tree views)
+      // must NOT rename the window or flip its navigator flag — those belong
+      // to the primary figure. (Without the view_label guard a committed
+      // Strain window ended up titled "ω": the last-emitted chip view won.)
+      if (!action.view && !action.viewLabel) {
         win.title = action.title
         win.isNavigator = action.isNavigator
         if (action.aspect && action.aspect > 0) win.aspect = action.aspect
@@ -260,16 +274,22 @@ function spydeReducer(state: State, action: Action): State {
       const activeWindowId = state.activeWindowId === action.windowId
         ? (newWindows.size ? [...newWindows.keys()][0] : null)
         : state.activeWindowId
+      // Selectors are keyed by selector_id (not window id) — prune every row
+      // whose OWNING window closed.
+      const selectors = new Map(
+        [...state.selectors].filter(([, s]) => s.windowId !== action.windowId),
+      )
       return {
         ...state,
         windows: newWindows,
-        selectors: drop(state.selectors),
+        selectors,
         histograms: drop(state.histograms),
         metadata: drop(state.metadata),
         axes: drop(state.axes),
         composition: drop(state.composition),
         signalTrees: drop(state.signalTrees),
         signalTreeActive: drop(state.signalTreeActive),
+        navigatorOptions: drop(state.navigatorOptions),
         activeActions: drop(state.activeActions),
         subItems: drop(state.subItems),
         activeWindowId,
@@ -326,9 +346,20 @@ function spydeReducer(state: State, action: Action): State {
     }
 
     case 'SELECTOR_INFO': {
+      // Keyed by selector_id when present (one row PER SELECTOR); merged so a
+      // mode-only re-emit (set_selector_mode) keeps the title/colour from the
+      // creation-time message.
       const selectors = new Map(state.selectors)
-      selectors.set(action.info.windowId, action.info)
+      const key = action.info.selectorId ?? action.info.windowId
+      const prev = selectors.get(key)
+      selectors.set(key, { ...prev, ...action.info })
       return { ...state, selectors }
+    }
+
+    case 'NAVIGATOR_OPTIONS': {
+      const navigatorOptions = new Map(state.navigatorOptions)
+      navigatorOptions.set(action.windowId, { names: action.names, current: action.current })
+      return { ...state, navigatorOptions }
     }
 
     case 'SIGNAL_TREE': {
@@ -392,6 +423,14 @@ interface SpyDEContextValue {
   stackDialogOpen: boolean
   openStackDialog: () => void
   closeStackDialog: () => void
+  // Check for Updates / GPU Status dialogs (renderer-only UI state, opened
+  // from the Help menu — both the native menu and MenuBar.tsx's HTML one).
+  updateDialogOpen: boolean
+  openUpdateDialog: () => void
+  closeUpdateDialog: () => void
+  gpuStatusDialogOpen: boolean
+  openGpuStatusDialog: () => void
+  closeGpuStatusDialog: () => void
   // MDIArea registers its tile-all-windows function here so StatusBar's
   // "Tile" button can trigger it without threading window-layout state (which
   // lives in MDIArea's local refs) through the shared context.
@@ -410,6 +449,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     selectors: new Map(),
     signalTrees: new Map(),
     signalTreeActive: new Map(),
+    navigatorOptions: new Map(),
     axes: new Map(),
     activeActions: new Map(),
     subItems: new Map(),
@@ -430,6 +470,8 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
   const latestStates = useRef<Map<string, Map<string, unknown>>>(new Map())
   const tileWindowsRef = useRef<(() => void) | null>(null)
   const [stackDialogOpen, setStackDialogOpen] = useState(false)
+  const [updateDialogOpen, setUpdateDialogOpen] = useState(false)
+  const [gpuStatusDialogOpen, setGpuStatusDialogOpen] = useState(false)
 
   // Post every stored state for a figure to its iframe (called on iframe load).
   const replayState = (figId: string) => {
@@ -617,8 +659,12 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
             type: 'SELECTOR_INFO',
             info: {
               windowId: msg.window_id,
+              selectorId: msg.selector_id,
               mode: msg.mode ?? 'crosshair',
-              title: msg.title ?? 'Navigator',
+              // Omit absent fields so the reducer's merge keeps the
+              // creation-time title/colour on a mode-only re-emit.
+              ...(msg.title != null ? { title: msg.title } : {}),
+              ...(msg.color != null ? { color: msg.color } : {}),
             },
           })
           break
@@ -632,6 +678,15 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
               activeSignalId: msg.active_signal_id,
             })
           }
+          break
+
+        case 'navigator_options':
+          dispatch({
+            type: 'NAVIGATOR_OPTIONS',
+            windowId: msg.window_id,
+            names: msg.names ?? [],
+            current: msg.current,
+          })
           break
 
         case 'log':
@@ -658,6 +713,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'fv_auto_params':
         case 'cod_results':
         case 'cod_cif_ready':
+        case 'gpu_status_result':
           window.dispatchEvent(new CustomEvent(`spyde:${msg.type}`, { detail: msg }))
           break
       }
@@ -730,6 +786,15 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
       setStackDialogOpen(true),
     )
 
+    // Help → Check for Updates… / GPU Status… (native menu; MenuBar.tsx's HTML
+    // dropdown on Windows/Linux calls openUpdateDialog/openGpuStatusDialog directly).
+    const disposeUpdateDialog = window.electron.onOpenUpdateDialog(() =>
+      setUpdateDialogOpen(true),
+    )
+    const disposeGpuStatusDialog = window.electron.onOpenGpuStatusDialog(() =>
+      setGpuStatusDialogOpen(true),
+    )
+
     // Forward iframe events to Python
     const onMessage = (e: MessageEvent) => {
       if (e.data?.type === 'awi_event' && e.data.figId) {
@@ -744,6 +809,8 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
       disposeMessage?.()
       disposeStream?.()
       disposeStackDialog?.()
+      disposeUpdateDialog?.()
+      disposeGpuStatusDialog?.()
       window.removeEventListener('message', onMessage)
       if (testHooksEnabled) {
         delete window._spyde_test_inject
@@ -769,9 +836,19 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
   const clearNavShapePrompt = () => dispatch({ type: 'NAV_SHAPE_PROMPT', prompt: null })
   const openStackDialog = () => setStackDialogOpen(true)
   const closeStackDialog = () => setStackDialogOpen(false)
+  const openUpdateDialog = () => setUpdateDialogOpen(true)
+  const closeUpdateDialog = () => setUpdateDialogOpen(false)
+  const openGpuStatusDialog = () => setGpuStatusDialogOpen(true)
+  const closeGpuStatusDialog = () => setGpuStatusDialogOpen(false)
 
   return (
-    <SpyDEContext.Provider value={{ state, iframeRefs, latestStates, sendAction, setActiveWindow, replayState, clearNavShapePrompt, stackDialogOpen, openStackDialog, closeStackDialog, tileWindowsRef }}>
+    <SpyDEContext.Provider value={{
+      state, iframeRefs, latestStates, sendAction, setActiveWindow, replayState, clearNavShapePrompt,
+      stackDialogOpen, openStackDialog, closeStackDialog,
+      updateDialogOpen, openUpdateDialog, closeUpdateDialog,
+      gpuStatusDialogOpen, openGpuStatusDialog, closeGpuStatusDialog,
+      tileWindowsRef,
+    }}>
       {children}
       {state.backendExited && <BackendExitedOverlay code={state.backendExited.code} />}
     </SpyDEContext.Provider>

@@ -445,6 +445,9 @@ class VectorOrientationResult:
     phases_meta: list
     nav_shape: tuple
     params: dict = field(default_factory=dict)
+    # Provenance record ({"action", "params", "spyde_version"}) — same dict
+    # convention as commit._stamp_provenance (script/app interchangeable).
+    provenance: Optional[dict] = None
 
     def strain_map(self, component: str = "exx") -> np.ndarray:
         idx = {"exx": 0, "eyy": 1, "exy": 2}[component]
@@ -767,7 +770,7 @@ def compute_vector_orientation_chunked(
     vectors, lib: TemplateLibrary, params: Optional[dict] = None,
     t: Optional[int] = None, warm_start: bool = False,
     main_window=None, signal_tree=None, shm_name: Optional[str] = None,
-    chunk: int = 16, stopped_flag=None, progress=None,
+    chunk: int = 16, stopped_flag=None, progress=None, client=None,
 ) -> Optional[VectorOrientationResult]:
     """
     Whole-field vector OM, parallelised across the cluster with a live preview —
@@ -787,9 +790,9 @@ def compute_vector_orientation_chunked(
     P = {**DEFAULTS, **(params or {})}
     ny, nx = vectors.nav_shape
 
-    # Client (same env policy as find_vectors / orientation_compute).
-    client = None
-    if signal_tree is not None:
+    # Client (same env policy as find_vectors / orientation_compute): an
+    # explicit client= wins; the main_window/signal_tree lookups are in-app.
+    if client is None and signal_tree is not None:
         client = getattr(signal_tree, "client", None)
     if client is None and main_window is not None:
         client = getattr(getattr(main_window, "dask_manager", None),

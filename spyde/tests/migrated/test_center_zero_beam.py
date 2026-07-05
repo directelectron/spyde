@@ -1,10 +1,10 @@
 """
 Center Zero Beam (Electron, two-tab parity).
 
-  Automatic — `czb_auto` estimates the beam position (pyxem
+  Automatic — `czb_run` estimates the beam position (pyxem
               `get_direct_beam_position`) and applies `center_direct_beam`, adding
               a "Centered" tree node; the displayed pattern becomes centred.
-  Manual    — `czb_manual_start` drops a draggable crosshair; `czb_manual`
+  Manual    — `czb_open` drops a draggable crosshair; `czb_pick`
               centres by the picked position (constant shift).
 """
 from __future__ import annotations
@@ -51,7 +51,7 @@ def _com(frame):
 class TestCenterZeroBeam:
     def test_auto_centers_beam(self):
         from spyde.backend.session import Session
-        from spyde.actions.center_zero_beam import czb_auto
+        from spyde.actions.center_zero_beam import czb_run
         session = Session(n_workers=1, threads_per_worker=1)
         try:
             session._add_signal(_off_center_4d(beam=(18, 14)))
@@ -59,7 +59,7 @@ class TestCenterZeroBeam:
             src = _signal_plot(session)
             before = src.plot_state.current_signal
 
-            czb_auto(session, src, {"method": "center_of_mass"})
+            czb_run(session, src, {"method": "center_of_mass"})
             assert _wait(lambda: src.plot_state.current_signal is not before,
                          timeout=20), "centering never produced a new signal"
             centered = src.plot_state.current_signal
@@ -76,7 +76,7 @@ class TestCenterZeroBeam:
 
     def test_manual_center_from_crosshair(self):
         from spyde.backend.session import Session
-        from spyde.actions.center_zero_beam import czb_manual_start, czb_manual
+        from spyde.actions.center_zero_beam import czb_open, czb_pick
         session = Session(n_workers=1, threads_per_worker=1)
         try:
             session._add_signal(_off_center_4d(beam=(18, 14)))
@@ -85,12 +85,12 @@ class TestCenterZeroBeam:
             tree = src.signal_tree
             before = src.plot_state.current_signal
 
-            czb_manual_start(session, src, {})
+            czb_open(session, src, {})
             assert getattr(tree, "_czb_cross", None) is not None
             # Simulate the user dragging the crosshair onto the beam (18, 14).
             tree._czb_cross.set(cx=18.0, cy=14.0)
 
-            czb_manual(session, src, {})
+            czb_pick(session, src, {})
             assert _wait(lambda: src.plot_state.current_signal is not before,
                          timeout=20), "manual centering never produced a new signal"
             centered = src.plot_state.current_signal

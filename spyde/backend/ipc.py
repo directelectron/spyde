@@ -101,18 +101,34 @@ async def read_messages(loop: asyncio.AbstractEventLoop | None = None):
     ``ProactorEventLoop`` (it can't register a console/pipe stdin handle with the
     IOCP), which silently broke every Electron→backend message on Windows. A
     blocking ``readline`` on a thread works identically on Windows, macOS, Linux.
+
+    Encoding note: we read the BINARY stream (``sys.stdin.buffer``) and decode
+    each line as UTF-8 ourselves. ``sys.stdin`` (the text layer) decodes with the
+    platform-default encoding — cp1252 on Windows — so a UTF-8 payload from
+    Electron carrying any non-ASCII character (e.g. ``εxx`` strain labels, the
+    ``Å`` unit) was mojibake'd: the bytes ``0xCE 0xB5`` (UTF-8 ``ε``) decoded to
+    ``Îµ`` and downstream string matches (tile_views' label lookup) silently
+    failed. Reading bytes + explicit UTF-8 decode is correct on every platform.
     """
     if loop is None:
         loop = asyncio.get_event_loop()
 
     q: asyncio.Queue[str | None] = asyncio.Queue()
+    # Prefer the raw byte stream; fall back to the text stream (some test
+    # harnesses replace sys.stdin with a StringIO that has no .buffer).
+    stream = getattr(sys.stdin, "buffer", None)
+    binary = stream is not None
+    if not binary:
+        stream = sys.stdin
 
     def _pump() -> None:
         try:
             while True:
-                raw = sys.stdin.readline()
+                raw = stream.readline()
                 if not raw:   # EOF — pipe closed by Electron
                     break
+                if binary:
+                    raw = raw.decode("utf-8", errors="replace")
                 loop.call_soon_threadsafe(q.put_nowait, raw)
         except Exception as e:
             log.debug("stdin pump stopped: %s", e)

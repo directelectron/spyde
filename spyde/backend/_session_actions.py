@@ -5,9 +5,9 @@ The renderer→backend action router (``dispatch_action``), the YAML toolbar-act
 invoker (``_dispatch_toolbar_action``), action-artifact tracking, overlay
 visibility, action (de)activation, and per-VI caret edits.
 
-Module-level tables that belong to dispatch live here too: ``_STAGED_HANDLERS``
-(staged-wizard action → "module.function") and the ``_TEST_ACTIONS`` /
-``_TEST_ACTIONS_ENABLED`` packaged-build gate.
+The staged-action table lives in ``spyde.actions.registry`` (STAGED_HANDLERS);
+the ``_TEST_ACTIONS`` / ``_TEST_ACTIONS_ENABLED`` packaged-build gate lives
+here.
 
 The mixin only USES ``self.<attr>`` (``self._action_artifacts``, ``self._plots``
 …) and ``self.<method>`` (``self._plot_by_window_id``, ``self._close_plot``,
@@ -21,6 +21,7 @@ import threading
 
 from spyde.backend import ipc
 from spyde.backend.ipc import emit_error
+from spyde.actions.registry import STAGED_HANDLERS, resolve_staged
 
 log = logging.getLogger(__name__)
 
@@ -34,41 +35,11 @@ _TEST_ACTIONS_ENABLED = os.environ.get("SPYDE_PACKAGED") != "1"
 _TEST_ACTIONS = frozenset({
     "load_test_data", "load_test_data_lazy", "load_test_data_lazy_chunked",
     "load_test_data_si_grains", "load_test_data_sped_ag", "test_nav_drag",
-    "load_test_vectors", "run_test_orientation",
+    "load_test_vectors", "run_test_orientation", "dump_dask_state",
 })
 
-# Staged-wizard actions → "module.function". All share the (session, plot,
-# payload) signature, so `dispatch_action` routes them through one lazy-import
-# branch instead of a copy-pasted elif per handler.
-_STAGED_HANDLERS = {
-    "om_generate_library": "spyde.actions.orientation_action.om_generate_library",
-    "om_refine":           "spyde.actions.orientation_action.om_refine",
-    "om_run":              "spyde.actions.orientation_action.om_run",
-    "fv_preview":          "spyde.actions.find_vectors_action.fv_preview",
-    "fv_tune":             "spyde.actions.find_vectors_action.fv_tune",
-    "fv_run":              "spyde.actions.find_vectors_action.fv_run",
-    "fv_stop":             "spyde.actions.find_vectors_action.fv_stop",
-    "vom_generate_library": "spyde.actions.vector_orientation_om.vom_generate_library",
-    "vom_refine":          "spyde.actions.vector_orientation_om.vom_refine",
-    "vom_run":             "spyde.actions.vector_orientation_om.vom_run",
-    "strain_run":          "spyde.actions.strain_action.strain_run",
-    "strain_set_component": "spyde.actions.strain_action.strain_set_component",
-    "strain_set_method":   "spyde.actions.strain_action.strain_set_method",
-    "strain_set_match_radius": "spyde.actions.strain_action.strain_set_match_radius",
-    "strain_set_overlay":  "spyde.actions.strain_action.strain_set_overlay",
-    "strain_stop":         "spyde.actions.strain_action.strain_stop",
-    "strain_commit":       "spyde.actions.strain_action.strain_commit",
-    "ipf_set_direction":   "spyde.actions.ipf_view.ipf_set_direction",
-    "tile_views":          "spyde.actions.views.tile_views",
-    "set_composition":     "spyde.actions.composition.set_composition",
-    "cod_search":          "spyde.actions.composition.cod_search",
-    "cod_pick":            "spyde.actions.composition.cod_pick",
-    "czb_auto":            "spyde.actions.center_zero_beam.czb_auto",
-    "czb_manual_start":    "spyde.actions.center_zero_beam.czb_manual_start",
-    "czb_manual":          "spyde.actions.center_zero_beam.czb_manual",
-    "czb_manual_stop":     "spyde.actions.center_zero_beam.czb_manual_stop",
-    "set_log_level":       "spyde.backend.log_stream.set_log_level",
-}
+# The staged-action table (STAGED_HANDLERS) lives in spyde.actions.registry so
+# that adding an action only touches the actions package (+ toolbars.yaml).
 
 
 class ActionRouterMixin:
@@ -77,6 +48,12 @@ class ActionRouterMixin:
         action = msg.get("action")
         payload = msg.get("payload", {})
         window_id = msg.get("window_id")
+
+        if action == "tick":
+            # Electron's 0.5 Hz backend tick — its arrival on stdin is the
+            # point (it wakes this throttled process's frozen timer waits, incl.
+            # dask task delivery; see runner.ts). Nothing to do.
+            return
 
         plot = self._plot_by_window_id(window_id) if window_id is not None else None
 
@@ -104,7 +81,9 @@ class ActionRouterMixin:
             ).start()
         elif action == "load_test_vectors":
             self._load_test_vectors()
-        elif action in _STAGED_HANDLERS:
+        elif action == "dump_dask_state":
+            self._dump_dask_state(only=payload.get("only"))
+        elif action in STAGED_HANDLERS:
             # Staged-wizard handlers (Orientation / Find-Vectors / Vector-OM /
             # Center-Zero-Beam) share the (session, plot, payload) signature and
             # are imported lazily so their heavy deps load only on first use.
@@ -117,16 +96,15 @@ class ActionRouterMixin:
             # e.g. {component: "eyy"} silently resolved to nothing.
             if "window_id" not in payload and window_id is not None:
                 payload = {**payload, "window_id": window_id}
-            import importlib
-            mod, fn = _STAGED_HANDLERS[action].rsplit(".", 1)
-            getattr(importlib.import_module(mod), fn)(self, plot, payload)
+            resolve_staged(action)(self, plot, payload)
         elif action == "run_test_orientation":
             # Test-only: run Orientation Mapping with a built-in phase (no CIF
             # dialog) on the active signal, so the E2E workflow can be driven
             # headlessly / in Playwright. payload={"phase":"si"|"ag"} (default si).
             self._run_test_orientation(plot, payload)
         elif action == "set_selector_mode":
-            self.set_selector_mode(window_id, bool(payload.get("integrate")))
+            self.set_selector_mode(window_id, bool(payload.get("integrate")),
+                                   payload.get("selector_id"))
         elif action == "select_signal_node":
             self._select_signal_node(plot, payload.get("signal_id"))
         elif action == "set_axis":
@@ -221,17 +199,30 @@ class ActionRouterMixin:
             # plain function (legacy style). Both receive the same ActionContext.
             from spyde.actions.action import Action
             if isinstance(target, type) and issubclass(target, Action):
-                result = target(ctx).run(**params)
+                inst = target(ctx)
+                result = inst.run(**params)
+                # Keep the Action instance with its artifacts so per-item caret
+                # edits (update_vi → update_live_params) can reach it.
+                self._track_action_artifacts(plot, name, result, action=inst)
             else:
                 result = target(ctx, action_name=name, **params)
-            self._track_action_artifacts(plot, name, result)
+                self._track_action_artifacts(plot, name, result)
         except Exception as e:
             emit_error(f"Action '{name}' failed: {e}")
             log.exception("Action '%s' failed", name)
+            # Un-light the toolbar button: the renderer may have optimistically
+            # marked a toggle action active on click; a failed action must not
+            # leave it lit with no backend artifact behind it.
+            wid = getattr(plot, "window_id", None)
+            if wid is not None and name:
+                ipc.emit({"type": "action_active", "window_id": wid,
+                          "name": name, "active": False})
 
-    def _track_action_artifacts(self, src_plot, name: str, result) -> None:
+    def _track_action_artifacts(self, src_plot, name: str, result, action=None) -> None:
         """Remember the selector + output windows a RegionAction created so the
-        toolbar can mark the action 'active' and hide them again on deselect."""
+        toolbar can mark the action 'active' and hide them again on deselect.
+        ``action`` (the Action instance) rides along so update_vi can call its
+        ``update_live_params``."""
         if result is None or not hasattr(result, "active_children"):
             return
         src_wid = getattr(src_plot, "window_id", None)
@@ -241,7 +232,10 @@ class ActionRouterMixin:
             c.window_id for c in getattr(result, "active_children", [])
             if getattr(c, "window_id", None) is not None
         })
-        self._action_artifacts[(src_wid, name)] = {"selector": result, "out_wids": out_wids}
+        art = {"selector": result, "out_wids": out_wids}
+        if action is not None:
+            art["action"] = action
+        self._action_artifacts[(src_wid, name)] = art
         ipc.emit({"type": "action_active", "window_id": src_wid, "name": name, "active": True})
 
     def _set_overlay(self, plot, name: str, visible: bool) -> None:
@@ -262,12 +256,12 @@ class ActionRouterMixin:
         elif name == "Orientation Mapping":
             overlays.append(getattr(tree, "_orientation_overlay", None))
             wiz = getattr(tree, "_om_wizard", None)
-            if wiz:
-                overlays.append(wiz.get("overlay"))
+            if wiz is not None:
+                overlays.append(getattr(wiz, "overlay", None))
         elif name == "Vector Orientation Mapping":
             wiz = getattr(tree, "_vom_wizard", None)
-            if wiz:
-                overlays.append(wiz.get("overlay"))
+            if wiz is not None:
+                overlays.append(getattr(wiz, "overlay", None))
         for ov in overlays:
             if ov is not None and hasattr(ov, "set_visible"):
                 try:
@@ -278,9 +272,20 @@ class ActionRouterMixin:
     def _set_action_active(self, window_id: int, name: str, active: bool) -> None:
         """Deselecting an action hides the output window + ROI selector it made
         (Qt parity: an unchecked toolbar action removes its artifacts)."""
+        if active:
+            return
         key = (window_id, name)
         art = self._action_artifacts.get(key)
-        if active or art is None:
+        if art is None:
+            # A PARENT action was deselected (e.g. the "Virtual Imaging"
+            # toolbar toggle, which has no artifact of its own): cascade to
+            # every live item added under it on this window. Committed trees
+            # are standalone SignalTrees and survive.
+            src = self._plot_by_window_id(window_id)
+            items = [it for it in (getattr(src, "_vi_items", []) or [])
+                     if it.get("parent_action", "Virtual Imaging") == name]
+            for it in items:
+                self._set_action_active(window_id, it.get("name"), False)
             return
         # Closing each output plot also cleans its source ROI (parent_selector).
         for wid in art.get("out_wids", []):
@@ -294,12 +299,17 @@ class ActionRouterMixin:
         self._action_artifacts.pop(key, None)
         ipc.emit({"type": "action_active", "window_id": window_id, "name": name, "active": False})
         # If this was a virtual-image chip, drop it from the source plot's list
-        # and tell the sub-toolbar to remove the chip.
+        # and tell its OWN sub-toolbar (raw or vector VI) to remove the chip.
         src = self._plot_by_window_id(window_id)
+        parent = "Virtual Imaging"
         if src is not None and hasattr(src, "_vi_items"):
+            for it in src._vi_items:
+                if it.get("name") == name:
+                    parent = it.get("parent_action", parent)
+                    break
             src._vi_items = [it for it in src._vi_items if it.get("name") != name]
         ipc.emit({"type": "sub_item", "window_id": window_id,
-                  "action": "Virtual Imaging", "name": name, "active": False})
+                  "action": parent, "name": name, "active": False})
 
     def _update_vi(self, window_id: int, name: str, params: dict) -> None:
         """A per-VI caret edit — apply new detector params and recompute that

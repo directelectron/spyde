@@ -3,6 +3,7 @@ import { SubWindow } from './SubWindow'
 import type { Rect } from './SubWindow'
 import { WindowContent } from './WindowContent'
 import { useSpyDE } from '../kernel/SpyDEContext'
+import { NAVIGATOR_DRAG_MIME } from '../kernel/dnd'
 
 // Tiling: near-square grid (rows x cols) sized to fit `n` windows, cols first
 // so wide areas get more columns than rows.
@@ -50,9 +51,16 @@ function findFreeSlot(w: number, h: number, taken: Rect[], areaW: number, areaH:
   return { x: M + (n % 6) * 30, y: M + (n % 6) * 30 }
 }
 
+// Vertical space reserved below each window row when tiling so the floating
+// toolbar (which hangs below the window) stays visible: bar height + gap.
+const TOOLBAR_RESERVE = 44
+
 export function MDIArea() {
   const { state, iframeRefs, sendAction, setActiveWindow, replayState, tileWindowsRef } = useSpyDE()
   const [focusOrder, setFocusOrder] = useState<string[]>([])
+  // Renderer-side minimize: minimized windows stay mounted (their figure
+  // iframes keep streaming) but are display:none and listed in the top bar.
+  const [minimized, setMinimized] = useState<Set<string>>(new Set())
 
   // Initial placement assigned to each window once (kept stable so re-renders
   // never fight a window the user has dragged).
@@ -115,8 +123,24 @@ export function MDIArea() {
   const handleClose = useCallback((id: string) => {
     const windowId = parseInt(id, 10)
     placedRef.current.delete(id)   // a reopened window gets a fresh free slot
+    setMinimized(prev => {
+      if (!prev.has(id)) return prev
+      const next = new Set(prev); next.delete(id); return next
+    })
     sendAction('close_window', {}, windowId)
   }, [sendAction])
+
+  const handleMinimize = useCallback((id: string) => {
+    setMinimized(prev => new Set(prev).add(id))
+    setFocusOrder(prev => prev.filter(x => x !== id))
+  }, [])
+
+  const handleRestore = useCallback((id: string) => {
+    setMinimized(prev => {
+      const next = new Set(prev); next.delete(id); return next
+    })
+    handleFocus(id)
+  }, [handleFocus])
 
   // Figure sizing is owned by WindowContent's ResizeObserver (it tracks the grid
   // box live across window-resize / tiling / view-bar height), so this is a
@@ -128,21 +152,25 @@ export function MDIArea() {
   // manually-placed/sized windows — unlike the automatic free-slot placement
   // on open, which never fights a window the user has touched.
   const tileWindows = useCallback(() => {
-    const ids = Array.from(state.windows.values()).filter(w => w.visible).map(w => String(w.windowId))
+    const ids = Array.from(state.windows.values())
+      .filter(w => w.visible && !minimized.has(String(w.windowId)))
+      .map(w => String(w.windowId))
     if (ids.length === 0) return
     const areaW = areaRef.current?.clientWidth || areaSize.w
     const areaH = areaRef.current?.clientHeight || areaSize.h
     const { cols, rows } = tileGrid(ids.length, areaW, areaH)
     const M = 8
     const cellW = Math.floor((areaW - M * (cols + 1)) / cols)
-    const cellH = Math.floor((areaH - M * (rows + 1)) / rows)
+    // Each row also reserves room for the floating toolbar hanging below its
+    // windows, so tiled windows never bury the row above's toolbar.
+    const cellH = Math.floor((areaH - (M + TOOLBAR_RESERVE) * rows - M) / rows)
     const rects = new Map<string, Rect>()
     ids.forEach((id, i) => {
       const col = i % cols
       const row = Math.floor(i / cols)
       const rect = {
         x: M + col * (cellW + M),
-        y: M + row * (cellH + M),
+        y: M + row * (cellH + M + TOOLBAR_RESERVE),
         w: Math.max(220, cellW),
         h: Math.max(150, cellH),
       }
@@ -150,7 +178,7 @@ export function MDIArea() {
       placedRef.current.set(id, { x: rect.x, y: rect.y })
     })
     setForced(prev => ({ gen: prev.gen + 1, rects }))
-  }, [state.windows, areaSize])
+  }, [state.windows, areaSize, minimized])
 
   useEffect(() => {
     tileWindowsRef.current = tileWindows
@@ -161,6 +189,37 @@ export function MDIArea() {
     // Toolbar buttons map to the generic toolbar_action dispatcher in Python,
     // which resolves the YAML-configured action function by name.
     sendAction('toolbar_action', { name: action, params }, windowId)
+  }, [sendAction])
+
+  // Drops onto the MDI background:
+  //  • a navigator chip → extract that navigator into its own signal tree,
+  //  • files (incl. .zspy folders) → open them like File→Open.
+  const onAreaDragOver = useCallback((e: React.DragEvent) => {
+    const types = e.dataTransfer.types
+    if (types.includes(NAVIGATOR_DRAG_MIME) || types.includes('Files')) {
+      e.preventDefault()
+      e.dataTransfer.dropEffect = 'copy'
+    }
+  }, [])
+  const onAreaDrop = useCallback((e: React.DragEvent) => {
+    const nav = e.dataTransfer.getData(NAVIGATOR_DRAG_MIME)
+    if (nav) {
+      e.preventDefault()
+      try {
+        const { windowId, name } = JSON.parse(nav) as { windowId: number; name: string }
+        if (name != null && windowId != null) sendAction('extract_navigator', { name }, windowId)
+      } catch { /* malformed payload — ignore */ }
+      return
+    }
+    if (e.dataTransfer.files.length > 0) {
+      e.preventDefault()
+      // Sandboxed renderers have no File.path — the preload resolves each
+      // File to its OS path via webUtils.getPathForFile.
+      const paths = Array.from(e.dataTransfer.files)
+        .map(f => window.electron.pathForFile?.(f))
+        .filter((p): p is string => !!p)
+      for (const path of paths) sendAction('open_file', { path })
+    }
   }, [sendAction])
 
   const visibleWindows = Array.from(state.windows.values()).filter(w => w.visible)
@@ -208,57 +267,107 @@ export function MDIArea() {
     setFocusOrder(prev => [...prev.filter(x => !ids.includes(x)), ...ids])
   })
 
-  return (
-    <div ref={areaRef} data-testid="mdi-area" style={styles.area}>
-      {visibleWindows.map((win) => {
-        const id = String(win.windowId)
-        const pos = placements.get(id) ?? { x: 40, y: 40 }
-        const { w: initW, h: initH } = windowSize(win.aspect)
-        const otherRects = visibleWindows
-          .filter(w => String(w.windowId) !== id)
-          .map(w => liveRectsRef.current.get(String(w.windowId)))
-          .filter((r): r is Rect => r != null)
-        return (
-          <SubWindow
-            key={id}
-            id={id}
-            windowId={win.windowId}
-            title={win.title}
-            initialX={pos.x}
-            initialY={pos.y}
-            initialW={initW}
-            initialH={initH}
-            toolbarActions={win.toolbarActions}
-            onClose={handleClose}
-            onFocus={handleFocus}
-            onResize={handleResize}
-            onAction={handleAction}
-            zIndex={getZ(id)}
-            areaSize={{ w: areaW, h: areaH }}
-            otherRects={otherRects}
-            onLiveRect={handleLiveRect}
-            forced={forced.rects.has(id) ? { gen: forced.gen, rect: forced.rects.get(id)! } : undefined}
-          >
-            <WindowContent
-              win={win}
-              iframeRefs={iframeRefs}
-              replayState={replayState}
-              sendAction={sendAction}
-            />
-          </SubWindow>
-        )
-      })}
+  const minimizedWins = visibleWindows.filter(w => minimized.has(String(w.windowId)))
 
-      {visibleWindows.length === 0 && (
-        <div style={styles.empty}>
-          {state.ready ? 'Open a file to begin' : state.status}
+  return (
+    <div style={styles.outer}>
+      {/* Top bar listing minimized windows — click a chip to restore. */}
+      {minimizedWins.length > 0 && (
+        <div data-testid="minimized-bar" style={styles.minBar}>
+          {minimizedWins.map(w => (
+            <button
+              key={w.windowId}
+              data-testid={`min-chip-${w.windowId}`}
+              style={styles.minChip}
+              title={w.title}
+              onClick={() => handleRestore(String(w.windowId))}
+            >
+              <span style={styles.minChipTitle}>{w.title}</span>
+            </button>
+          ))}
         </div>
       )}
+      <div
+        ref={areaRef}
+        data-testid="mdi-area"
+        style={styles.area}
+        onDragOver={onAreaDragOver}
+        onDrop={onAreaDrop}
+      >
+        {visibleWindows.map((win) => {
+          const id = String(win.windowId)
+          const pos = placements.get(id) ?? { x: 40, y: 40 }
+          const { w: initW, h: initH } = windowSize(win.aspect)
+          const otherRects = visibleWindows
+            .filter(w => String(w.windowId) !== id && !minimized.has(String(w.windowId)))
+            .map(w => liveRectsRef.current.get(String(w.windowId)))
+            .filter((r): r is Rect => r != null)
+          return (
+            <SubWindow
+              key={id}
+              id={id}
+              windowId={win.windowId}
+              title={win.title}
+              initialX={pos.x}
+              initialY={pos.y}
+              initialW={initW}
+              initialH={initH}
+              toolbarActions={win.toolbarActions}
+              onClose={handleClose}
+              onFocus={handleFocus}
+              onMinimize={handleMinimize}
+              onResize={handleResize}
+              onAction={handleAction}
+              zIndex={getZ(id)}
+              hidden={minimized.has(id)}
+              acceptSignalDrop={win.isNavigator}
+              onSignalDrop={(srcId) =>
+                sendAction('add_navigator_from_window', { source_window_id: srcId }, win.windowId)}
+              areaSize={{ w: areaW, h: areaH }}
+              otherRects={otherRects}
+              onLiveRect={handleLiveRect}
+              forced={forced.rects.has(id) ? { gen: forced.gen, rect: forced.rects.get(id)! } : undefined}
+            >
+              <WindowContent
+                win={win}
+                iframeRefs={iframeRefs}
+                replayState={replayState}
+                sendAction={sendAction}
+              />
+            </SubWindow>
+          )
+        })}
+
+        {visibleWindows.length === 0 && (
+          <div style={styles.empty}>
+            {state.ready ? 'Open a file to begin' : state.status}
+          </div>
+        )}
+      </div>
     </div>
   )
 }
 
 const styles: Record<string, React.CSSProperties> = {
+  outer: {
+    flex: 1,
+    display: 'flex', flexDirection: 'column',
+    minWidth: 0, minHeight: 0,
+  },
+  minBar: {
+    display: 'flex', alignItems: 'center', gap: 6,
+    padding: '4px 8px', flexShrink: 0,
+    background: '#181825', borderBottom: '1px solid #313244',
+  },
+  minChip: {
+    display: 'flex', alignItems: 'center', gap: 5,
+    background: '#1e1e2e', border: '1px solid #313244', borderRadius: 6,
+    color: '#cdd6f4', cursor: 'pointer', fontSize: 11, padding: '3px 10px',
+    maxWidth: 180,
+  },
+  minChipTitle: {
+    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+  },
   area: {
     flex: 1,
     position: 'relative',

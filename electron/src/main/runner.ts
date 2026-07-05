@@ -14,6 +14,7 @@ export interface SpyDEHandlers {
 }
 
 let proc: ChildProcess | null = null
+let tickTimer: ReturnType<typeof setInterval> | null = null
 
 export function startSpyDE(
   pythonCmd: string[],
@@ -27,6 +28,22 @@ export function startSpyDE(
     env: { ...process.env, PYTHONUNBUFFERED: '1' },
     stdio: ['pipe', 'pipe', 'pipe'],
   })
+
+  // BACKEND TICK (0.5 Hz): Windows throttles timer delivery to the hidden
+  // Python child so aggressively that its timer waits (time.sleep,
+  // Event.wait, event-loop timers — incl. dask's task-delivery flushes) can
+  // freeze INDEFINITELY, waking only when process I/O arrives. Measured
+  // end-to-end (spyde/tests/repro_batch_stall.py + _probe_fv_stall.spec.ts):
+  // distributed computes sat idle forever hands-off, and EVERY unstick
+  // followed a stdin message within ~4 s — a user click "fixing" it was this
+  // pipe write, not the click. Electron's own timers are healthy (foreground
+  // app), so this interval is reliable; the backend handles 'tick' as a
+  // silent no-op. Two lines of traffic per second, bounded staleness ~6 s.
+  if (tickTimer) clearInterval(tickTimer)
+  tickTimer = setInterval(() => {
+    try { sendAction('tick') } catch { /* backend gone — stop ticking */ }
+    if (!proc && tickTimer) { clearInterval(tickTimer); tickTimer = null }
+  }, 2000)
 
   const rl = createInterface({ input: proc.stdout! })
   rl.on('line', (line) => {
@@ -112,6 +129,7 @@ export function stopSpyDE(): void {
   }
   stopping = true
   proc = null  // every sendAction() after this no-ops; prevents re-entrant kills
+  if (tickTimer) { clearInterval(tickTimer); tickTimer = null }
 
   // 1. Ask the backend to quit gracefully (clean Dask shutdown).
   try {

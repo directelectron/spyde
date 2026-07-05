@@ -18,7 +18,6 @@ import json
 import logging
 import os
 import tempfile
-import threading
 import urllib.parse
 import urllib.request
 
@@ -191,7 +190,8 @@ def cod_search(session, plot, payload) -> None:
               "elements": elements, "results": results})
         emit_status(f"COD: {len(results)} structure(s) for {'-'.join(elements)}")
 
-    threading.Thread(target=_work, daemon=True).start()
+    from spyde.actions.lifecycle import run_on_worker
+    run_on_worker(session, _work, name="cod-search")
 
 
 def fetch_cod_cif(cod_id: str) -> str:
@@ -232,4 +232,5 @@ def cod_pick(session, plot, payload) -> None:
               "cod_id": str(cod_id), "path": path, "label": label})
         emit_status(f"Loaded structure {label}")
 
-    threading.Thread(target=_work, daemon=True).start()
+    from spyde.actions.lifecycle import run_on_worker
+    run_on_worker(session, _work, name="cod-pick")

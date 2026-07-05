@@ -20,8 +20,6 @@ from spyde.actions._common import STRAIN_TITLES as _COMPONENTS
 
 logger = logging.getLogger(__name__)
 
-_ALIVE: list = []
-
 
 def _component_map(field: StrainField, component: str) -> np.ndarray:
     return {
@@ -67,7 +65,6 @@ def build_strain_figure(field: StrainField, *, component: str = "exx",
 
     fig_id = _electron.register(fig)
     html = finalize_figure_html(fig, fig_id)
-    _ALIVE.append(fig)
     return fig, fig_id, html, p
 
 

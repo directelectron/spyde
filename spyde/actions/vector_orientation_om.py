@@ -19,10 +19,6 @@ the Qt-removal cleanup.
 from __future__ import annotations
 
 import logging
-import threading
-
-import numpy as np
-import hyperspy.api as hs
 
 from spyde.backend.ipc import emit, emit_status, emit_error
 from spyde.actions.context import src_plot_tree as _src_plot_tree
@@ -38,7 +34,86 @@ DEFAULTS = dict(
     smooth=False,
 )
 
+from spyde.actions.wizard import WizardController
 
+
+class VomWizard(WizardController):
+    """Owns the Vector-Orientation wizard state: the .cif phase, the diffsims
+    simulation + per-template g-vector library, the live refine overlay on the
+    source DP, the Refine-tab weights, and the Generate-time field cache."""
+
+    key = "vom"
+
+    # Declared parameter schema (single source of truth for every host — the
+    # Electron VectorOrientationWizard.tsx caret mirrors these; note the caret
+    # shows strain_cap/sink_bw/gamma as PERCENT sliders but dispatches the
+    # fractional values declared here). Same dict spec as toolbars.yaml.
+    parameters = {
+        "cif_path": {
+            "name": "Crystal (.cif)", "type": "file", "default": "",
+            "extensions": [".cif"], "tab": "Library",
+        },
+        "accelerating_voltage": {
+            "name": "Voltage (kV)", "type": "float", "default": 200.0,
+            "min": 20.0, "max": 1000.0, "tab": "Library",
+        },
+        "resolution": {
+            "name": "Angle res (°)", "type": "float", "default": 1.0,
+            "min": 0.1, "max": 10.0, "step": 0.1, "tab": "Library",
+        },
+        "minimum_intensity": {
+            "name": "Min intensity", "type": "float", "default": 1e-4,
+            "min": 0.0, "max": 0.05, "step": 0.0005, "tab": "Library",
+        },
+        "strain_cap": {
+            "name": "Strain cap", "type": "float", "default": 0.05,
+            "min": 0.005, "max": 0.20, "step": 0.005, "tab": "Refine",
+        },
+        "sink_bw": {
+            "name": "Tolerance (Å⁻¹)", "type": "float", "default": 0.04,
+            "min": 0.005, "max": 0.15, "step": 0.005, "tab": "Refine",
+        },
+        "gamma": {
+            "name": "Intensity γ", "type": "float", "default": 0.5,
+            "min": 0.0, "max": 1.0, "step": 0.05, "tab": "Refine",
+        },
+        "k_power": {
+            "name": "High-k weight", "type": "float", "default": 0.0,
+            "min": 0.0, "max": 2.0, "step": 0.25, "tab": "Refine",
+        },
+        "smooth": {
+            "name": "Smooth strain (TV)", "type": "bool", "default": False,
+            "tab": "Run",
+        },
+    }
+
+    def __init__(self, session, tree, *, phase, sim, lib, overlay,
+                 voltage, recip_r, strain_cap, sink_bw=None):
+        super().__init__(session, tree)
+        self.phase = phase
+        self.sim = sim
+        self.lib = lib
+        self.overlay = overlay
+        self.voltage = voltage
+        self.recip_r = recip_r
+        self.strain_cap = strain_cap
+        self.sink_bw = sink_bw
+        self.gamma = None
+        self.k_power = None
+        self.field = None
+
+    def remove(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self.overlay is not None and hasattr(self.overlay, "remove"):
+            try:
+                self.overlay.remove()
+            except Exception as e:
+                log.debug("removing VOM wizard overlay failed: %s", e)
+        self.overlay = None
+        if getattr(self.tree, "_vom_wizard", None) is self:
+            self.tree._vom_wizard = None
 
 
 def vector_orientation_mapping(ctx, action_name: str = "Vector Orientation Mapping", **kwargs):
@@ -56,6 +131,13 @@ def vom_generate_library(session, plot, payload) -> None:
         emit_error("Vector Orientation: no active dataset")
         return
     if getattr(tree, "diffraction_vectors", None) is None:
+        # Find Vectors may still be attaching (its batch finalizes on a worker
+        # thread) — wait it out and re-dispatch instead of erroring in the gap.
+        from spyde.actions.lifecycle import wait_for_vectors
+        if wait_for_vectors(session, plot,
+                            lambda: vom_generate_library(session, plot, payload),
+                            what="Vector Orientation", strict=True):
+            return
         emit_error("Vector Orientation: run Find Diffraction Vectors first")
         return
     cif_path = payload.get("cif_path")
@@ -94,13 +176,14 @@ def vom_generate_library(session, plot, payload) -> None:
             # the measured vectors (red) under the crosshair (Qt parity). The
             # overlay's on_fit callback streams the strain/residual readout to
             # the wizard's Refine tab as the crosshair (or a slider) moves.
-            overlay = None
+            # A regenerated library replaces the previous wizard wholesale.
             old = getattr(tree, "_vom_wizard", None)
-            if old is not None and old.get("overlay") is not None:
+            if old is not None and hasattr(old, "remove"):
                 try:
-                    old["overlay"].remove()
+                    old.remove()
                 except Exception as e:
-                    log.debug("removing prior vom overlay failed: %s", e)
+                    log.debug("removing prior VOM wizard failed: %s", e)
+            overlay = None
             wid = getattr(src, "window_id", None)
             try:
                 from spyde.actions.vector_overlay import attach_vector_orientation_overlay
@@ -110,11 +193,12 @@ def vom_generate_library(session, plot, payload) -> None:
                 import logging
                 logging.getLogger(__name__).debug("vom overlay attach failed: %s", e)
 
-            tree._vom_wizard = {
-                "phase": phase, "sim": sim, "lib": lib, "overlay": overlay,
-                "voltage": voltage, "recip_r": recip_r,
-                "strain_cap": DEFAULTS["strain_cap"], "sink_bw": None,
-            }
+            wiz = VomWizard(
+                session, tree, phase=phase, sim=sim, lib=lib, overlay=overlay,
+                voltage=voltage, recip_r=recip_r,
+                strain_cap=DEFAULTS["strain_cap"], sink_bw=None,
+            )
+            tree._vom_wizard = wiz
             emit_status(f"Vector Orientation: library ready ({n_templates} templates) "
                         f"— computing live IPF map…")
             emit({"type": "vom_library_ready",
@@ -132,7 +216,7 @@ def vom_generate_library(session, plot, payload) -> None:
                 # Field cached with default weights → (strain_cap, gamma, k_power,
                 # sink_bw); Compute re-fits only if the Refine tab changed any.
                 tree._vom_field_sig = (DEFAULTS["strain_cap"], None, None, None)
-                tree._vom_wizard["field"] = field
+                wiz.field = field
                 _build_ipf_heatmap(session, root, field)
                 emit_status("Vector Orientation: live IPF ready — refine, or "
                             "Compute Maps for the strain maps")
@@ -140,30 +224,29 @@ def vom_generate_library(session, plot, payload) -> None:
             emit_error(f"Generate Library failed: {e}")
             log.exception("Generate Library failed")
 
-    threading.Thread(target=_work, daemon=True, name="vom-generate-library").start()
+    from spyde.actions.lifecycle import run_on_worker
+    run_on_worker(session, _work, name="vom-generate-library")
 
 
 def _build_ipf_heatmap(session, src, result, title="Orientation (IPF-Z, live)"):
     """Open just the IPF-Z map window (the live refine heatmap) + its 3-D
     explorer. The strain windows are added later by Compute Maps."""
-    ny, nx = result.nav_shape
+    from spyde.actions.commit import commit_result_tree
     base = src.metadata.get_item("General.title", "Signal")
-    new_sig = hs.signals.Signal2D(np.zeros((ny, nx), dtype=np.float32))
-    new_sig.metadata.General.title = f"{base} — {title}"
-    tree = session._add_signal(new_sig)
-    tree.vector_orientation = result
-    try:
-        ipf = result.ipf_color_map("z")
-        for sp in list(getattr(tree, "signal_plots", [])):
-            sp.needs_auto_level = True
-            sp.set_data(ipf)
+
+    def _attach(tree):
         from spyde.actions.ipf_view import attach_ipf_3d, attach_ipf_point_selector
         attach_ipf_3d(tree, result, "z")
         attach_ipf_point_selector(tree, result, "z")
-    except Exception as e:
-        import logging
-        logging.getLogger(__name__).debug("ipf heatmap build failed: %s", e)
-    return tree
+
+    return commit_result_tree(
+        session, title=f"{base} — {title}",
+        primary=result.ipf_color_map("z"),
+        attrs={"vector_orientation": result},
+        provenance={"action": "Vector Orientation Mapping",
+                    "source_title": base},
+        on_tree=_attach,
+    )
 
 
 def _emit_vom_fit(window_id, fit) -> None:
@@ -189,22 +272,23 @@ def vom_refine(session, plot, payload) -> None:
     and streams the new strain readout via ``_emit_vom_fit``."""
     src, tree = _src_plot_tree(session, plot)
     wiz = getattr(tree, "_vom_wizard", None) if tree is not None else None
-    if not wiz or wiz.get("overlay") is None:
+    if wiz is None or wiz.overlay is None:
         return
     params = {}
     for key in ("strain_cap", "sink_bw", "gamma", "k_power"):
         if payload.get(key) is not None:
             params[key] = float(payload[key])
-            wiz[key] = params[key]
+            setattr(wiz, key, params[key])
 
     def _work():
         try:
-            wiz["overlay"].set_params(**params)
+            wiz.overlay.set_params(**params)
         except Exception as e:
             import logging
             logging.getLogger(__name__).debug("vom_refine failed: %s", e)
 
-    threading.Thread(target=_work, daemon=True, name="vom-refine").start()
+    from spyde.actions.lifecycle import run_on_worker
+    run_on_worker(session, _work, name="vom-refine")
 
 
 def vom_run(session, plot, payload) -> None:
@@ -212,23 +296,28 @@ def vom_run(session, plot, payload) -> None:
     already-built library → an IPF-Z window + εxx / εyy / εxy strain windows."""
     src, tree = _src_plot_tree(session, plot)
     wiz = getattr(tree, "_vom_wizard", None) if tree is not None else None
-    if not wiz or wiz.get("lib") is None:
+    if wiz is None or wiz.lib is None:
         emit_error("Compute Maps: generate the library first")
         return
     vecs = getattr(tree, "diffraction_vectors", None)
     if vecs is None:
+        from spyde.actions.lifecycle import wait_for_vectors
+        if wait_for_vectors(session, plot,
+                            lambda: vom_run(session, plot, payload),
+                            what="Compute Maps", strict=True):
+            return
         emit_error("Compute Maps: no diffraction vectors on this tree")
         return
-    lib = wiz["lib"]
+    lib = wiz.lib
     strain_cap = float(payload.get("strain_cap", DEFAULTS["strain_cap"]))
-    sink_bw = payload.get("sink_bw", wiz.get("sink_bw"))
+    sink_bw = payload.get("sink_bw", wiz.sink_bw)
     smooth = bool(payload.get("smooth", DEFAULTS["smooth"]))
     fit_params = dict(strain_cap=strain_cap)
     if sink_bw is not None:
         fit_params["sink_bw"] = float(sink_bw)
     # Reflection-weighting knobs (gamma / |g| lever-arm) from the Refine tab.
     for key in ("gamma", "k_power"):
-        val = payload.get(key, wiz.get(key))
+        val = payload.get(key, getattr(wiz, key, None))
         if val is not None:
             fit_params[key] = float(val)
     # Signature for the Generate-time field cache: re-fit if any weight changed.
@@ -269,7 +358,8 @@ def vom_run(session, plot, payload) -> None:
             emit_error(f"Compute Maps failed: {e}")
             log.exception("Compute Maps failed")
 
-    threading.Thread(target=_work, daemon=True, name="vom-run").start()
+    from spyde.actions.lifecycle import run_on_worker
+    run_on_worker(session, _work, name="vom-run")
 
 
 def _fit_field(vecs, lib, params):
@@ -307,55 +397,21 @@ def _fit_field(vecs, lib, params):
 
 
 def _build_result_windows(session, src, result, *, smooth=False, with_ipf=True) -> None:
-    """Open three strain windows (εxx/εyy/εxy) and — unless the live IPF heatmap
-    already exists (``with_ipf=False``) — an IPF-Z orientation window (RGB)."""
-    ny, nx = result.nav_shape
+    """Commit the fitted field: a strain window (εxx signal plot + εyy/εxy as
+    chip-selectable views) and — unless the live IPF heatmap already exists
+    (``with_ipf=False``) — an IPF-Z orientation window (RGB)."""
+    from spyde.actions.commit import commit_result_tree
     base = src.metadata.get_item("General.title", "Signal")
 
-    def _window(title, data, rgb=False, levels=None):
-        new_sig = hs.signals.Signal2D(np.zeros((ny, nx), dtype=np.float32))
-        new_sig.metadata.General.title = f"{base} — {title}"
-        tree = session._add_signal(new_sig)
-        for sp in list(getattr(tree, "signal_plots", [])):
-            try:
-                sp.needs_auto_level = True
-                if levels is not None:
-                    sp.set_clim(*levels)
-                sp.set_data(data)
-            except Exception as e:
-                log.debug("painting vom window signal plot failed: %s", e)
-        return tree
-
     if with_ipf:
-        ipf = result.ipf_color_map(direction="z")        # (ny, nx, 3) uint8
-        otree = _window("Orientation (IPF-Z)", ipf, rgb=True)
-        otree.vector_orientation = result
-        # 3-D IPF explorer as a second figure → the window gets a 2D/3D toggle,
-        # plus the point selector → 3-D highlight.
-        try:
-            from spyde.actions.ipf_view import attach_ipf_3d, attach_ipf_point_selector
-            attach_ipf_3d(otree, result, direction="z")
-            attach_ipf_point_selector(otree, result, "z")
-        except Exception as e:
-            log.debug("attaching 3-D IPF explorer to vom result failed: %s", e)
+        _build_ipf_heatmap(session, src, result, title="Orientation (IPF-Z)")
 
-    # ── Strain: ONE window with εxx / εyy / εxy as chip-selectable views (the
-    #    unified chip-strip selector — ⌘-click to tile + compare). εxx is the
-    #    window's signal plot; εyy / εxy are extra tagged view figures.
     strain = result.smoothed_strain() if smooth else result.strain
-    mats = [(lbl, np.nan_to_num(strain[..., i].astype(np.float32)))
-            for lbl, i in (("εxx", 0), ("εyy", 1), ("εxy", 2))]
-    finite = [float(np.nanmax(np.abs(m))) for _, m in mats if np.isfinite(m).any()]
-    lim = (max(finite) if finite else 1.0) or 1.0
-    stree = _window("Strain", mats[0][1], levels=(-lim, lim))
-    sp = next(iter(getattr(stree, "signal_plots", [])), None)
-    if sp is not None:
-        sp.set_view_tag("εxx", "2d")
-        wid = getattr(sp, "window_id", None)
-        if wid is not None:
-            from spyde.actions.views import emit_view_figure, register_views
-            # Stash every component so ⌘-tiling can rebuild a side-by-side
-            # (anyplotlib multi-axis) figure for any selected subset.
-            register_views(wid, mats, levels=(-lim, lim))
-            for lbl, m in mats[1:]:
-                emit_view_figure(wid, m, lbl, kind="2d", levels=(-lim, lim))
+    commit_result_tree(
+        session, title=f"{base} — Strain",
+        primary=strain[..., 0], primary_label="εxx",
+        views=[("εyy", strain[..., 1]), ("εxy", strain[..., 2])],
+        levels="auto_sym",
+        provenance={"action": "Vector Orientation Mapping",
+                    "source_title": base, "params": {"smooth": bool(smooth)}},
+    )

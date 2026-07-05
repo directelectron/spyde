@@ -44,6 +44,16 @@ test('Strain Mapping: caret opens, runs the field, and Submit commits a new tree
   // The vectors SIGNAL window carries the Strain Mapping action button.
   const vsig = page.getByTestId('subwindow')
     .filter({ has: page.getByTestId('action-btn-Strain Mapping') }).first()
+  // Raise a window through the app's own focus channel (the spyde_focus
+  // message a figure click posts) — windows share z-levels (no hover-raise),
+  // so a buried window's titlebar/caret may itself be unclickable.
+  const raise = async (win: typeof vsig) => {
+    const tid = await win.locator('iframe').first().getAttribute('data-testid')
+    await page.evaluate(
+      (id) => window.postMessage({ type: 'spyde_focus', figId: id }, '*'),
+      tid!.replace('figure-', ''))
+    await page.waitForTimeout(200)
+  }
   await vsig.getByTestId('subwindow-titlebar').click()    // raise
   await vsig.getByTestId('subwindow-titlebar').hover()    // reveal toolbar
   const btn = vsig.getByTestId('action-btn-Strain Mapping')
@@ -56,7 +66,7 @@ test('Strain Mapping: caret opens, runs the field, and Submit commits a new tree
   await expect(page.getByTestId('strain-wizard')).toBeVisible({ timeout: 15_000 })
   await expect(page.getByTestId('strain-method')).toBeVisible()
   await expect(page.getByTestId('strain-match-radius')).toBeVisible()
-  await expect(page.getByTestId('strain-submit')).toBeVisible()
+  await expect(page.getByTestId('strain-commit')).toBeVisible()
 
   // Opening the caret runs the live field → a Strain map window opens with the
   // εxx/εyy/εxy/ω component toggle (component swap dispatches strain_set_component).
@@ -73,12 +83,42 @@ test('Strain Mapping: caret opens, runs the field, and Submit commits a new tree
   // and this click silently fails to land.
   await swin.getByTestId(/^strain-comp-eyy-/).click({ timeout: 10_000 })
 
-  // Submit freezes the field as a NEW committed signal tree → one more window.
+  // Commit freezes the field as a NEW committed signal tree → one more window,
+  // titled "Strain" (chip views must NOT retitle it — the ω-title regression).
+  // The strain window is focused ON TOP of the caret — raise the source first.
+  await raise(vsig)
   const beforeCommit = await page.getByTestId('subwindow').count()
-  await page.getByTestId('strain-submit').click()
+  await page.getByTestId('strain-commit').click()
   await expect.poll(() => page.getByTestId('subwindow').count(), {
-    timeout: 30_000, message: 'Submit did not open a committed strain window',
+    timeout: 30_000, message: 'Commit did not open a committed strain window',
   }).toBeGreaterThan(beforeCommit)
+  const afterCommit = await page.getByTestId('subwindow').count()
+  // Exact title "Strain" — chip views must NOT retitle the committed window
+  // (regression: it ended up titled "ω" by the last-emitted view figure).
+  await expect(page.getByTestId('subwindow-title')
+    .filter({ hasText: /^Strain$/ }).first()).toBeVisible({ timeout: 15_000 })
+
+  // Toggle the caret OFF: the live strain-map + reference windows tear down
+  // (controller close via the window registry); the COMMITTED tree survives.
+  await raise(vsig)
+  await vsig.getByTestId('subwindow-titlebar').hover()
+  await btn.click()
+  await expect.poll(() => page.getByTestId('subwindow').count(), {
+    timeout: 15_000, message: 'live strain windows not removed on toggle off',
+  }).toBe(before + (afterCommit - beforeCommit))
+  await expect(page.getByTestId('subwindow-title')
+    .filter({ hasText: /^Strain$/ }).first()).toBeVisible()  // committed tree survived
+
+  // Re-open → exactly ONE new set of live windows again (idempotent, no
+  // duplicate strain windows / controllers piling up).
+  const beforeReopen = await page.getByTestId('subwindow').count()
+  await raise(vsig)
+  await vsig.getByTestId('subwindow-titlebar').hover()
+  await btn.click()
+  await expect(page.getByTestId('strain-wizard')).toBeVisible({ timeout: 15_000 })
+  await expect.poll(() => page.getByTestId('subwindow').count(), {
+    timeout: 60_000, message: 'strain map window never reopened',
+  }).toBe(beforeReopen + (beforeCommit - before))
 
   ctx.assertNoJsErrors()
 })

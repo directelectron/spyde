@@ -67,7 +67,6 @@ class PlotWindow:
         # Electron state
         self.visible: bool = True
         self._spyde_closed: bool = False
-        self._spyde_tree_teardown: bool = False
 
         # Compatibility: layout tracking
         self.previous_subplots_pos: dict = {}
@@ -164,8 +163,7 @@ class PlotWindow:
                 logger.debug("closing child plot on window close failed: %s", e)
         self.plots.clear()
         if (self.session is not None
-                and hasattr(self.session, "mdi_manager")
-                and not self._spyde_tree_teardown):
+                and hasattr(self.session, "mdi_manager")):
             try:
                 self.session.mdi_manager.plot_subwindows = [
                     pw for pw in self.session.mdi_manager.plot_subwindows

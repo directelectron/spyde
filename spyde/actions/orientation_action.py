@@ -13,8 +13,6 @@ memory-safe (per-chunk slices only; never computes the full dataset).
 from __future__ import annotations
 
 import logging
-import threading
-import time
 
 import numpy as np
 import hyperspy.api as hs
@@ -86,7 +84,8 @@ def orientation_mapping(ctx, action_name: str = "Orientation Mapping",
             emit_error(f"Orientation Mapping failed: {e}")
             log.exception("Orientation Mapping failed")
 
-    threading.Thread(target=_work, daemon=True, name="orientation").start()
+    from spyde.actions.lifecycle import run_on_worker
+    run_on_worker(session, _work, name="orientation")
     return None
 
 
@@ -125,23 +124,19 @@ def _overlay_template_on_source(src_tree, dp_plot, src, sim, gamma) -> None:
     Replaces any prior overlay so re-running doesn't stack markers."""
     if dp_plot is None or src_tree is None:
         return
+    from spyde.actions.lifecycle import replace_tree_attr
     from spyde.actions.orientation_compute import build_matching_cache
     from spyde.actions.vector_overlay import attach_orientation_overlay
-    old = getattr(src_tree, "_orientation_overlay", None)
-    if old is not None:
-        try:
-            old.remove()
-        except Exception as e:
-            log.debug("removing prior orientation overlay failed: %s", e)
-    try:
+
+    def _attach():
         cache = build_matching_cache(src, sim)
-        src_tree._orientation_overlay = attach_orientation_overlay(
+        return attach_orientation_overlay(
             dp_plot, src, sim, cache, src_tree,
             gamma=gamma, max_radius=_reciprocal_radius(src),
             normalize_templates=True,
         )
-    except Exception as e:
-        log.debug("orientation overlay attach failed: %s", e)
+
+    replace_tree_attr(src_tree, "_orientation_overlay", _attach)
 
 
 def _open_refine_ipf(session, dp_plot, signal, sim, cache, tree):
@@ -157,10 +152,16 @@ def _open_refine_ipf(session, dp_plot, signal, sim, cache, tree):
             return None
         _fig, fig_id, html, panels = build_refine_figure(infos)
         base = signal.metadata.get_item("General.title", "Signal")
-        emit_refine_window(session, fig_id, html, title=f"{base} — IPF Refine")
-        return RefineIpfController(
+        wid = emit_refine_window(session, _fig, fig_id, html,
+                                 title=f"{base} — IPF Refine")
+        ctrl = RefineIpfController(
             dp_plot, signal, sim, cache, infos, panels,
             gamma=DEFAULTS["gamma"], normalize=False).attach(tree)
+        # Give the bare-figure refine window a dispatch/teardown identity so
+        # ✕-closing it unhooks the navigator controller (see registry.py).
+        if ctrl is not None:
+            session.register_window_controller(wid, ctrl)
+        return ctrl
     except Exception as e:
         log.debug("refine IPF window failed: %s", e)
         return None
@@ -168,10 +169,13 @@ def _open_refine_ipf(session, dp_plot, signal, sim, cache, tree):
 
 def _create_blank_ipf_window(session, src, ny, nx):
     """Open a blank IPF-Z window up front (for the progressive fill-in)."""
-    new_sig = hs.signals.Signal2D(np.zeros((ny, nx), dtype=np.float32))
+    from spyde.actions.commit import open_result_tree
     base = src.metadata.get_item("General.title", "Signal")
-    new_sig.metadata.General.title = f"{base} — Orientation (IPF-Z)"
-    return session._add_signal(new_sig)
+    return open_result_tree(
+        session, title=f"{base} — Orientation (IPF-Z)",
+        data=np.zeros((ny, nx), dtype=np.float32),
+        provenance={"action": "Orientation Mapping", "source_title": base},
+    )
 
 
 def _finalize_ipf_window(tree, om) -> None:
@@ -197,8 +201,9 @@ def _compute_with_live_ipf(session, src, src_tree, sim, params):
     up front, poll the per-chunk shared-memory buffer to fill the map in live (Qt
     live-buffer parity), then finalize. Returns the SpyDEOrientationMap (or None).
     """
+    from spyde.actions.lifecycle import live_fill_poller
     from spyde.actions.orientation_compute import _do_compute_orientations
-    from spyde.drawing.update_functions import ensure_live_buffer, read_live_buffer
+    from spyde.drawing.update_functions import ensure_live_buffer
     nav_dim = src.axes_manager.navigation_dimension
     ny, nx = tuple(int(s) for s in src.data.shape[:nav_dim])[-2:]
     om_tree = _create_blank_ipf_window(session, src, ny, nx)
@@ -207,27 +212,22 @@ def _compute_with_live_ipf(session, src, src_tree, sim, params):
         shm = ensure_live_buffer((ny, nx, 9), shm_name)
     except Exception:
         shm, shm_name = None, None
-    stop_poll = [False]
 
-    def _poller():
-        sp = next(iter(getattr(om_tree, "signal_plots", []) or []), None)
-        while not stop_poll[0]:
-            try:
-                z = read_live_buffer((ny, nx, 9), shm_name)[..., 6:9]   # Z RGB
-                if sp is not None and np.isfinite(z).any():
-                    sp.needs_auto_level = True
-                    sp.set_data(np.nan_to_num(z).clip(0, 255).astype(np.uint8))
-            except Exception as e:
-                log.debug("live IPF poll paint failed: %s", e)
-            time.sleep(0.4)
+    sp = next(iter(getattr(om_tree, "signal_plots", []) or []), None)
 
-    if shm_name is not None:
-        threading.Thread(target=_poller, daemon=True, name="om-poll").start()
+    def _paint(buf):
+        z = buf[..., 6:9]                                    # Z RGB
+        if sp is not None and np.isfinite(z).any():
+            sp.needs_auto_level = True
+            sp.set_data(np.nan_to_num(z).clip(0, 255).astype(np.uint8))
+
+    stop_poll = live_fill_poller((ny, nx, 9), shm_name, _paint,
+                                 interval=0.4, name="om-poll")
     try:
         om = _do_compute_orientations(src, sim, params, main_window=session,
                                       signal_tree=src_tree, shm_name=shm_name)
     finally:
-        stop_poll[0] = True
+        stop_poll()
         if shm is not None:
             try:
                 shm.close()
@@ -241,8 +241,45 @@ def _compute_with_live_ipf(session, src, src_tree, sim, params):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Staged "wizard" workflow (Qt 4-tab parity): Generate Library → live Refine →
-# Compute Map. State lives on the source tree as `_om_wizard`.
+# Compute Map. State lives on the source tree as `_om_wizard` (an OmWizard).
 # ─────────────────────────────────────────────────────────────────────────────
+
+from spyde.actions.wizard import WizardController
+
+
+class OmWizard(WizardController):
+    """Owns the dense Orientation-Mapping wizard state: the diffsims library +
+    matching cache, the live best-match overlay on the source DP, and the
+    per-phase refine-IPF window controller."""
+
+    key = "om"
+
+    def __init__(self, session, tree, *, phases, sim, cache, overlay,
+                 refine_ipf, voltage, recip_r):
+        super().__init__(session, tree)
+        self.phases = phases
+        self.sim = sim
+        self.cache = cache
+        self.overlay = overlay
+        self.refine_ipf = refine_ipf
+        self.voltage = voltage
+        self.recip_r = recip_r
+        self.refine: dict = {}
+
+    def remove(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for attr in ("overlay", "refine_ipf"):
+            obj = getattr(self, attr, None)
+            if obj is not None and hasattr(obj, "remove"):
+                try:
+                    obj.remove()
+                except Exception as e:
+                    log.debug("removing OM wizard %s failed: %s", attr, e)
+            setattr(self, attr, None)
+        if getattr(self.tree, "_om_wizard", None) is self:
+            self.tree._om_wizard = None
 
 
 def om_generate_library(session, plot, payload) -> None:
@@ -280,12 +317,14 @@ def om_generate_library(session, plot, payload) -> None:
                                                min_int, recip_r)
             n_templates = _count_templates(sim)
 
+            # A regenerated library replaces the previous wizard wholesale —
+            # its overlay AND its refine-IPF window tear down together.
             old = getattr(tree, "_om_wizard", None)
-            if old is not None and old.get("overlay") is not None:
+            if old is not None and hasattr(old, "remove"):
                 try:
-                    old["overlay"].remove()
+                    old.remove()
                 except Exception as e:
-                    log.debug("removing prior OM wizard overlay failed: %s", e)
+                    log.debug("removing prior OM wizard failed: %s", e)
             # Build the matching cache once (used by both the single-pattern
             # best-match overlay AND the per-phase IPF correlation heatmap).
             cache = build_matching_cache(src_root, sim)
@@ -304,17 +343,11 @@ def om_generate_library(session, plot, payload) -> None:
             # IPF region. Multi-phase elegantly → multiple triangles.
             refine_ipf = _open_refine_ipf(session, src, src_root, sim, cache, tree)
 
-            old_ipf = getattr(getattr(tree, "_om_wizard", None) or {}, "get", lambda *_: None)("refine_ipf")
-            if old_ipf is not None:
-                try:
-                    old_ipf.remove()
-                except Exception as e:
-                    log.debug("removing prior refine IPF window failed: %s", e)
-
-            tree._om_wizard = {
-                "phases": phases, "sim": sim, "cache": cache, "overlay": overlay,
-                "refine_ipf": refine_ipf, "voltage": voltage, "recip_r": recip_r,
-            }
+            tree._om_wizard = OmWizard(
+                session, tree, phases=phases, sim=sim, cache=cache,
+                overlay=overlay, refine_ipf=refine_ipf,
+                voltage=voltage, recip_r=recip_r,
+            )
             n_ph = len(phases)
             extra = "move the crosshair to refine" if n_ph == 1 else f"{n_ph} phases"
             emit_status(f"Orientation: library ready ({n_templates} templates) — {extra}")
@@ -324,7 +357,8 @@ def om_generate_library(session, plot, payload) -> None:
             emit_error(f"Generate Library failed: {e}")
             log.exception("Generate Library failed")
 
-    threading.Thread(target=_work, daemon=True, name="om-generate-library").start()
+    from spyde.actions.lifecycle import run_on_worker
+    run_on_worker(session, _work, name="om-generate-library")
 
 
 def om_refine(session, plot, payload) -> None:
@@ -332,34 +366,35 @@ def om_refine(session, plot, payload) -> None:
     sliders → redraw the matched template at the current crosshair position."""
     src, tree = _src_plot_tree(session, plot)
     wiz = getattr(tree, "_om_wizard", None) if tree is not None else None
-    if not wiz or (wiz.get("overlay") is None and wiz.get("refine_ipf") is None):
+    if wiz is None or (wiz.overlay is None and wiz.refine_ipf is None):
         return
 
     def _work():
-        if wiz.get("overlay") is not None:
+        if wiz.overlay is not None:
             try:
-                wiz["overlay"].set_refine_params(
+                wiz.overlay.set_refine_params(
                     gamma=payload.get("gamma"),
                     scale_override=payload.get("scale_override"),
                     min_intensity=payload.get("min_intensity"),
                     normalize_templates=payload.get("normalize_templates"),
                 )
-                wiz["refine"] = dict(payload)
+                wiz.refine = dict(payload)
             except Exception as e:
                 import logging
                 logging.getLogger(__name__).debug("om_refine failed: %s", e)
         # The IPF heatmap follows the same gamma / normalize knobs (and exists for
         # multi-phase too, where the spot overlay does not).
-        rip = wiz.get("refine_ipf")
-        if rip is not None:
+        if wiz.refine_ipf is not None:
             try:
-                rip.set_refine_params(gamma=payload.get("gamma"),
-                                      normalize=payload.get("normalize_templates"))
+                wiz.refine_ipf.set_refine_params(
+                    gamma=payload.get("gamma"),
+                    normalize=payload.get("normalize_templates"))
             except Exception as e:
                 import logging
                 logging.getLogger(__name__).debug("refine ipf params failed: %s", e)
 
-    threading.Thread(target=_work, daemon=True, name="om-refine").start()
+    from spyde.actions.lifecycle import run_on_worker
+    run_on_worker(session, _work, name="om-refine")
 
 
 def om_run(session, plot, payload) -> None:
@@ -367,10 +402,10 @@ def om_run(session, plot, payload) -> None:
     library → IPF-Z window + attached map."""
     src, tree = _src_plot_tree(session, plot)
     wiz = getattr(tree, "_om_wizard", None) if tree is not None else None
-    if not wiz or wiz.get("sim") is None:
+    if wiz is None or wiz.sim is None:
         emit_error("Compute Map: generate the library first")
         return
-    sim = wiz["sim"]
+    sim = wiz.sim
     n_best = int(payload.get("n_best", DEFAULTS["n_best"]))
     gamma = float(payload.get("gamma", DEFAULTS["gamma"]))
     normalize = bool(payload.get("normalize_templates", False))
@@ -389,4 +424,5 @@ def om_run(session, plot, payload) -> None:
             emit_error(f"Compute Map failed: {e}")
             log.exception("Compute Map failed")
 
-    threading.Thread(target=_work, daemon=True, name="om-run").start()
+    from spyde.actions.lifecycle import run_on_worker
+    run_on_worker(session, _work, name="om-run")

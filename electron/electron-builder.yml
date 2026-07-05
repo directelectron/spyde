@@ -28,15 +28,21 @@ extraResources:
     to: python
     filter: ["**/*"]
 
+# Icons: the same set already used by the PyCrucible portable build
+# (crucible.toml) — single source of truth, referenced from ../spyde/ rather
+# than duplicated under electron/build/. electron-builder resolves relative to
+# this file's directory (electron/), so ../ reaches the repo root.
 mac:
   category: public.app-category.education
   target: [dmg]
+  icon: ../spyde/icon.icns
   # Unsigned for now — Gatekeeper will warn; see PACKAGING.md for the
   # sign+notarize follow-up (needs an Apple Developer ID).
   identity: null
 
 win:
   target: [nsis]
+  icon: ../spyde/Spyde.ico
 
 # Per-user NSIS installer: no admin, Start-Menu + desktop shortcuts, uninstaller,
 # user-chosen install dir.
@@ -50,13 +56,19 @@ nsis:
 linux:
   target: [AppImage]
   category: Science
+  # A single ≥512x512 source PNG — electron-builder generates the full Linux
+  # icon set from it. (It does NOT accept the macOS .iconset naming convention
+  # used by spyde/icon.iconset/ — that's icon_NxN.png; Linux wants bare NxN.png
+  # in a directory, or one source image like this.)
+  icon: ../spyde/Spyde.png
 
 # Tells electron-builder where release artifacts live (GitHub Releases) and emits
-# the channel metadata (latest.yml) alongside them. NOTE: this only configures the
-# artifact target — nothing here publishes automatically. Cutting a release is a
-# deliberate, tag-triggered step (release.yml). In-app auto-update is not wired for
-# 0.1.0 (the electron-updater dependency was removed); add it back here + in main
-# when implementing update checks.
+# the update-feed metadata (latest.yml / latest-mac.yml / latest-linux.yml)
+# alongside them — this is what electron-updater's autoUpdater reads at runtime
+# (electron/src/main/updater.ts). release.yml invokes electron-builder with
+# `--publish always` so these get generated and uploaded; this block alone does
+# NOT publish anything (a local `npm run dist` without --publish never touches
+# GitHub).
 publish:
   provider: github
   owner: directelectron

@@ -15,6 +15,20 @@ there is no version string to bump by hand.
   `actions/checkout@v4` with `fetch-depth: 0` (see `.github/workflows/{build,release}.yml`);
   a shallow clone has no tags and will produce a `0.0.postN.devN` wheel.
 
+## Update channel: tag shape controls stable vs beta
+
+`release.yml`'s `channel` job derives the channel from the pushed tag —
+this is what determines who electron-updater's `autoUpdater` offers the
+release to (see `electron/PACKAGING.md` "Auto-update + beta channel"):
+
+| Tag shape | Channel | GitHub prerelease flag |
+|---|---|---|
+| `vX.Y.Z` (e.g. `v0.2.0`) | `stable` | no |
+| `vX.Y.Z-rc.N` / `-beta.N` / `-alpha.N` (e.g. `v0.2.0-rc.1`) | `beta` | yes |
+
+Users opt into the beta channel from Help → Check for Updates… in the app;
+stable-channel users are never offered a beta build.
+
 ## Pre-release checklist
 
 Run from a clean checkout of the commit you intend to tag.
@@ -70,6 +84,8 @@ Run from a clean checkout of the commit you intend to tag.
 
 7. **Versions agree** — `electron/package.json` `version` should match the tag you
    are about to cut (it is set by hand; keep it in step with the Python tag).
+   `release.yml`'s `build` job now enforces this and fails the release if they
+   drift, but fix it before tagging rather than relying on that as your check.
 
 ## Cutting the release
 

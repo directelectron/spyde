@@ -131,7 +131,15 @@ class TestNavShapePrompt:
             p = tmp_path / "img.hspy"
             hs.signals.Signal2D(np.zeros((8, 8), dtype=np.float32)).save(str(p))
             session.open_file(str(p))
-            time.sleep(0.8)
+            # POLL for the clear — the load thread's first .hspy read imports
+            # the h5py reader stack, which takes seconds on a cold CI runner (a
+            # fixed short sleep flaked every CI OS while passing on dev boxes).
+            deadline = time.time() + 60.0
+            while time.time() < deadline:
+                loading = [m for m in captured_messages if m.get("type") == "loading"]
+                if any(not m.get("busy") for m in loading):
+                    break
+                time.sleep(0.1)
 
             loading = [m for m in captured_messages if m.get("type") == "loading"]
             assert any(m.get("busy") for m in loading), "no busy=True on open"
