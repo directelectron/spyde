@@ -73,6 +73,16 @@ test('Vector Orientation Mapping: Generate → Compute opens IPF + strain window
   // The vectors-image SIGNAL window carries the Vector Orientation Mapping action.
   const vsig = page.getByTestId('subwindow')
     .filter({ has: page.getByTestId('action-btn-Vector Orientation Mapping') }).first()
+  // Raise a window through the app's own focus channel — windows share
+  // z-levels (no hover-raise), so once the live IPF window opens focused on
+  // top, the wizard caret underneath is unclickable until its window is raised.
+  const raise = async (win: typeof vsig) => {
+    const tid = await win.locator('iframe').first().getAttribute('data-testid')
+    await page.evaluate(
+      (id) => window.postMessage({ type: 'spyde_focus', figId: id }, '*'),
+      tid!.replace('figure-', ''))
+    await page.waitForTimeout(200)
+  }
   await vsig.getByTestId('subwindow-titlebar').click()
   await vsig.getByTestId('subwindow-titlebar').hover()
   await vsig.getByTestId('action-btn-Vector Orientation Mapping').click()
@@ -104,7 +114,9 @@ test('Vector Orientation Mapping: Generate → Compute opens IPF + strain window
   ).toBeVisible({ timeout: 150_000 })
 
   // 3 Refine → the live single-pattern fit streams a strain readout to the
-  // Refine tab (Qt parity), and the strain-cap slider re-fits live.
+  // Refine tab (Qt parity), and the strain-cap slider re-fits live. The live
+  // IPF window opened focused on top of the caret — raise the source first.
+  await raise(vsig)
   await page.getByTestId('vom-tab-Refine').click()
   await expect(page.getByTestId('vom-strain-readout'))
     .toContainText('εxx', { timeout: 30_000 })
@@ -125,9 +137,14 @@ test('Vector Orientation Mapping: Generate → Compute opens IPF + strain window
   await expect(page.getByTestId(/^view-chip-εxy-/).first()).toBeVisible()
   const strainWin = page.getByTestId('subwindow')
     .filter({ has: page.getByTestId(/^view-chip-εxx-/) }).first()
-  await page.getByTestId(/^view-chip-εyy-/).first().click({ modifiers: ['Meta'] })
+  // ControlOrMeta: the chip multi-select accepts ⌘ OR Ctrl (onChip checks
+  // both); a raw Meta press is the OS key on Windows and doesn't reach the
+  // click event there.
+  await page.getByTestId(/^view-chip-εyy-/).first().click({ modifiers: ['ControlOrMeta'] })
   // The combined side-by-side figure (title "εxx / εyy") arrives and is shown —
-  // a single iframe with two axes, not two iframes.
+  // a single iframe with two axes, not two iframes. (The εxx/εyy labels
+  // round-trip through the JSON IPC unchanged — regression guard for the
+  // Windows cp1252 stdin-decode bug that mojibake'd non-ASCII payloads.)
   await expect(strainWin.locator('iframe[title="εxx / εyy"]')).toBeVisible({ timeout: 30_000 })
   await expect.poll(() =>
     strainWin.locator('iframe:visible').count(), { timeout: 5_000 },
@@ -136,13 +153,12 @@ test('Vector Orientation Mapping: Generate → Compute opens IPF + strain window
   await strainWin.screenshot({ path: join(__dirname, '..', 'vom_combined_strain.png') })
 
   // The IPF orientation (vector-OM) window also carries the 2D/3D explorer
-  // toggle + X/Y/Z (the actual 3-D switch is exercised in orientation_lazy.spec;
-  // here the result windows cascade so the toggle can be covered — assert it's
-  // wired, i.e. present on the vector-OM IPF window).
-  const ipfWin = page.getByTestId('subwindow').filter({ hasText: 'Orientation' }).first()
-  // The 2D/3D toggle appears only once the IPF 3-D explorer figure arrives —
-  // that figure is generated after the heavy OM compute, so allow generous time
-  // on a loaded CI runner (15s was too tight and flaked).
-  await expect(ipfWin.getByTestId(/^ipf-view-toggle-/)).toBeVisible({ timeout: 60_000 })
-  await expect(ipfWin.getByTestId(/^ipf-view-3d-/)).toBeVisible({ timeout: 15_000 })
+  // toggle + X/Y/Z. The result windows CASCADE, so an Orientation window (and
+  // its toggle) can be covered by a later window — assert the toggle is WIRED
+  // (present in the DOM), not visually on top. It appears only once the IPF
+  // 3-D explorer figure arrives, which is generated after the heavy OM compute,
+  // so allow generous time on a loaded CI runner.
+  await expect(page.getByTestId(/^ipf-view-toggle-/).first())
+    .toBeAttached({ timeout: 60_000 })
+  await expect(page.getByTestId(/^ipf-view-3d-/).first()).toBeAttached({ timeout: 15_000 })
 })

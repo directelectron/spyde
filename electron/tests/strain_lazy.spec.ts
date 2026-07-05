@@ -44,6 +44,16 @@ test('Strain Mapping: caret opens, runs the field, and Submit commits a new tree
   // The vectors SIGNAL window carries the Strain Mapping action button.
   const vsig = page.getByTestId('subwindow')
     .filter({ has: page.getByTestId('action-btn-Strain Mapping') }).first()
+  // Raise a window through the app's own focus channel (the spyde_focus
+  // message a figure click posts) — windows share z-levels (no hover-raise),
+  // so a buried window's titlebar/caret may itself be unclickable.
+  const raise = async (win: typeof vsig) => {
+    const tid = await win.locator('iframe').first().getAttribute('data-testid')
+    await page.evaluate(
+      (id) => window.postMessage({ type: 'spyde_focus', figId: id }, '*'),
+      tid!.replace('figure-', ''))
+    await page.waitForTimeout(200)
+  }
   await vsig.getByTestId('subwindow-titlebar').click()    // raise
   await vsig.getByTestId('subwindow-titlebar').hover()    // reveal toolbar
   const btn = vsig.getByTestId('action-btn-Strain Mapping')
@@ -75,6 +85,8 @@ test('Strain Mapping: caret opens, runs the field, and Submit commits a new tree
 
   // Commit freezes the field as a NEW committed signal tree → one more window,
   // titled "Strain" (chip views must NOT retitle it — the ω-title regression).
+  // The strain window is focused ON TOP of the caret — raise the source first.
+  await raise(vsig)
   const beforeCommit = await page.getByTestId('subwindow').count()
   await page.getByTestId('strain-commit').click()
   await expect.poll(() => page.getByTestId('subwindow').count(), {
@@ -88,7 +100,7 @@ test('Strain Mapping: caret opens, runs the field, and Submit commits a new tree
 
   // Toggle the caret OFF: the live strain-map + reference windows tear down
   // (controller close via the window registry); the COMMITTED tree survives.
-  await vsig.getByTestId('subwindow-titlebar').click()
+  await raise(vsig)
   await vsig.getByTestId('subwindow-titlebar').hover()
   await btn.click()
   await expect.poll(() => page.getByTestId('subwindow').count(), {
@@ -100,6 +112,7 @@ test('Strain Mapping: caret opens, runs the field, and Submit commits a new tree
   // Re-open → exactly ONE new set of live windows again (idempotent, no
   // duplicate strain windows / controllers piling up).
   const beforeReopen = await page.getByTestId('subwindow').count()
+  await raise(vsig)
   await vsig.getByTestId('subwindow-titlebar').hover()
   await btn.click()
   await expect(page.getByTestId('strain-wizard')).toBeVisible({ timeout: 15_000 })
