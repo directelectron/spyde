@@ -135,6 +135,59 @@ class TestPlayback:
         assert int(round(sel._widget.x)) == 1
         assert sel.fires == 1
 
+    def test_restart_does_not_desync_playing_state(self):
+        # play → play (restart): the superseded first clock exiting must NOT
+        # clobber _playing back to False while the second clock runs (the thread
+        # leak bug). After several rapid restarts, is_playing stays True and one
+        # pause() truly stops everything.
+        pb, sel = _controller(n=1000)
+        for _ in range(5):
+            pb.play(fps=60)
+            time.sleep(0.03)
+        # A superseded clock may have exited by now; state must still be "playing".
+        assert pb.is_playing is True
+        time.sleep(0.1)
+        assert pb.is_playing is True, "restart race clobbered _playing"
+        pb.pause()
+        assert pb.is_playing is False
+        fires = sel.fires
+        time.sleep(0.15)
+        assert sel.fires == fires, "a leaked clock thread kept advancing after pause"
+
+    def test_does_not_match_a_2d_rectangle_selector(self):
+        # A 2-D RectangleWidget has .x (x/y/w/h) and no .cx — the OLD heuristic
+        # false-matched it. It must NOT be picked as a time selector.
+        class _RectWidget:
+            def __init__(self):
+                self.x = 0.0; self.y = 0.0; self.w = 5.0; self.h = 5.0
+        class _RectSel:
+            def __init__(self):
+                self._widget = _RectWidget()
+                self.selector = self
+            def translate_pixels(self, dx, dy=0):
+                pass
+        assert MoviePlaybackController._is_time_selector(_RectSel()) is False
+
+    def test_matches_a_1d_line_and_range_selector(self):
+        class _VLine:
+            def __init__(self): self.x = 0.0
+        class _Range:
+            def __init__(self): self.x0 = 0.0; self.x1 = 3.0
+        class _Sel:
+            def __init__(self, w):
+                self._widget = w; self.selector = self
+            def translate_pixels(self, dx): pass
+        assert MoviePlaybackController._is_time_selector(_Sel(_VLine())) is True
+        assert MoviePlaybackController._is_time_selector(_Sel(_Range())) is True
+
+    def test_does_not_match_a_2d_crosshair(self):
+        class _Cross:
+            def __init__(self): self.cx = 0.0; self.cy = 0.0
+        class _Sel:
+            def __init__(self): self._widget = _Cross(); self.selector = self
+            def translate_pixels(self, dx, dy=0): pass
+        assert MoviePlaybackController._is_time_selector(_Sel()) is False
+
 
 class TestPlaybackSessionWiring:
     """The session exposes a lazy `playback` controller and routes the

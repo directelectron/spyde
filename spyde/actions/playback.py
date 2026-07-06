@@ -56,12 +56,30 @@ class MoviePlaybackController:
             if mgr is None:
                 continue
             for sel in mgr.all_navigation_selectors:
-                inner = getattr(sel, "selector", sel)
-                w = getattr(inner, "_widget", None) or getattr(sel, "_widget", None)
-                if (hasattr(sel, "translate_pixels") and w is not None
-                        and hasattr(w, "x") and not hasattr(w, "cx")):
+                if self._is_time_selector(sel):
                     return sel, tree
         return None, None
+
+    @staticmethod
+    def _is_time_selector(sel) -> bool:
+        """True for a 1-D (time/line/range) navigator selector — the movie's time
+        axis. Discriminate on the WIDGET TYPE, not attribute-sniffing: a 2-D
+        RectangleWidget also has ``.x`` and no ``.cx`` (it stores x/y/w/h), so the
+        old ``.x``-but-no-``.cx`` test false-matched a rectangle ROI. A 1-D
+        selector wraps an anyplotlib VLineWidget / RangeWidget; a 2-D crosshair
+        has ``.cx``; a rectangle has ``.w``/``.h``. Require ``translate_pixels``
+        (the frame-step API) AND a 1-D line/range widget."""
+        if not hasattr(sel, "translate_pixels"):
+            return False
+        inner = getattr(sel, "selector", sel)
+        w = getattr(inner, "_widget", None) or getattr(sel, "_widget", None)
+        if w is None:
+            return False
+        # 2-D widgets: crosshair (.cx/.cy) or rectangle (.w/.h) → not a time axis.
+        if hasattr(w, "cx") or hasattr(w, "cy") or hasattr(w, "w") or hasattr(w, "h"):
+            return False
+        # 1-D: a VLine has .x; a Range has .x0/.x1.
+        return hasattr(w, "x") or hasattr(w, "x0")
 
     def _n_frames(self, tree) -> int:
         try:
@@ -136,7 +154,6 @@ class MoviePlaybackController:
         self._thread = None
 
     def _run(self, stop: threading.Event) -> None:
-        import time as _time
         while not stop.is_set():
             sel, tree = self._time_selector()
             if sel is None:
@@ -161,14 +178,25 @@ class MoviePlaybackController:
                     logger.debug("playback step failed: %s", e)
                     break
                 self._fire(sel)
-            # Pace to the target fps. A slow frame read makes the effective rate
-            # lower (the read is synchronous on the dispatcher) — that's fine; we
-            # never queue ahead of the paint.
+            # Pace to the target fps. A slow frame read lowers the effective rate
+            # (the read is synchronous on the dispatcher); at high fps the
+            # dispatcher coalesces + drops stale positions, so playback SKIPS
+            # frames rather than pacing to render completion — fine for a scrubber.
             if stop.wait(1.0 / self.fps):
                 break
+        # Only clear _playing if WE are still the current clock. A play→play
+        # restart (or an auto-stop landing just after a new play()) must not let
+        # THIS (now superseded) thread clobber the newer thread's _playing=True —
+        # that desync leaked extra clock threads (the toggle saw paused mid-play
+        # and started another). Guard on our own stop event being the live one.
         with self._lock:
-            self._playing = False
-        self._emit_state()
+            if self._stop is stop:
+                self._playing = False
+                emit_now = True
+            else:
+                emit_now = False           # a newer clock owns the state now
+        if emit_now:
+            self._emit_state()
 
     def _fire(self, sel) -> None:
         try:
