@@ -113,3 +113,14 @@ class TestLodInSetArray:
         plot._set_array(frame)
         out = plot._plot2d.last["data"]
         assert out.shape == (128, 128)     # untouched
+
+    def test_navigator_image_not_decimated(self):
+        # A large NAVIGATOR image (e.g. a 4D-STEM real-space nav) must NOT be
+        # decimated — its 2-D selector maps clicks by displayed-pixel coords, so
+        # decimation would offset every nav selection by the stride.
+        plot = _make_plot((4096, 4096))
+        plot.is_navigator = True
+        frame = np.random.RandomState(3).rand(4096, 4096).astype(np.float32)
+        plot._set_array(frame)
+        out = plot._plot2d.last["data"]
+        assert out.shape == (4096, 4096)   # full-res, not decimated

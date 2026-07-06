@@ -479,8 +479,13 @@ class Plot:
         # decimated data (robust percentiles are unaffected by uniform striding),
         # and the axes are subsampled by the SAME stride below so the scale bar /
         # extent stay correct. A DP-sized frame has stride 1 (no change).
+        # NOT on a navigator image: a large 4D-STEM real-space navigator's 2-D
+        # selector maps clicks by DISPLAYED-pixel coordinates (image_width/height),
+        # so decimating it would offset every nav selection by the stride factor.
+        # Only signal frames (the DP / movie frame) are decimated — the case that
+        # actually needs it and where the selector isn't on this image.
         lod_stride = 1
-        if dims == 2:
+        if dims == 2 and not self.is_navigator:
             lod_stride = _lod_stride(data.shape[0], data.shape[1])
             if lod_stride > 1:
                 data = data[::lod_stride, ::lod_stride]
