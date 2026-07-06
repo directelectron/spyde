@@ -36,6 +36,14 @@ test('Log panel Profile button toggles per-frame timing and lines appear', async
       () => document.querySelectorAll('[data-testid="subwindow"]').length >= 2,
       { timeout: 180_000 },
     )
+    // Wait for the LARGE-file open to actually finish — the status bar shows
+    // "Reading …movie.mrc… (first open of a large file can take a while)" until
+    // the reader + initial navigator settle. Scrubbing before that reads nothing
+    // (empty navigator) → no profile lines. Wait for the busy text to clear.
+    await page.waitForFunction(
+      () => !/Reading .*\.mrc/i.test(document.body.textContent || ''),
+      { timeout: 300_000 },
+    )
     await page.waitForTimeout(3000)
 
     // Open the Log panel (the button is in the status bar) then click Profile.
