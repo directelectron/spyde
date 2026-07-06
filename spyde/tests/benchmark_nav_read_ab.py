@@ -162,23 +162,47 @@ def main() -> None:
         ("region-r2", _region_points(iy, ix, 2, ny, nx)),
     ]
 
-    print("| case | pts | match | getindex ms | submit ms |")
-    print("|---|---:|---|---:|---:|")
+    # The unified candidate: get_index with NO distributed client (synchronous
+    # numpy chunk cache — the SAME cache logic, minus the distributed hop),
+    # submitted to OUR pool for a cancellable async Future. Make sure the cache
+    # client is unset so get_index takes the synchronous cache path.
+    if getattr(sig, "cached_dask_array", None) is None:
+        _getindex(sig, [[iy, ix]])
+    if client is None:
+        try:
+            sig.cached_dask_array._client = None
+        except Exception:
+            pass
+
+    def _cached_read(inds):
+        # Runs get_index (synchronous cache path) inside a pool worker → a real
+        # cancellable Future. In the app this runs on the serial _NavDispatcher
+        # so the cache is never re-entered concurrently (CLAUDE.md §4).
+        return backend.submit(lambda i=inds: _getindex(sig, i))
+
+    print("| case | pts | match | getindex ms | submit_graph ms | cached_read ms |")
+    print("|---|---:|---|---:|---:|---:|")
     all_match = True
     for name, inds in cases:
         gi = _getindex(sig, inds)
         sg = backend.submit_graph(_submit_lazy(raw, inds)).result()
-        match = gi.shape == sg.shape and np.allclose(gi.astype(np.float64),
-                                                     sg.astype(np.float64), atol=1e-6)
+        cr = _cached_read(inds).result()
+        match = (gi.shape == sg.shape == cr.shape
+                 and np.allclose(gi.astype(np.float64), sg.astype(np.float64), atol=1e-6)
+                 and np.allclose(gi.astype(np.float64), cr.astype(np.float64), atol=1e-6))
         all_match = all_match and match
         gi_ms = _time(lambda inds=inds: _getindex(sig, inds))
         sg_ms = _time(lambda inds=inds: backend.submit_graph(
             _submit_lazy(raw, inds)).result())
+        cr_ms = _time(lambda inds=inds: _cached_read(inds).result())
         print(f"| {name} | {len(inds)} | {'OK' if match else 'MISMATCH'} | "
-              f"{gi_ms[0]:.1f} | {sg_ms[0]:.1f} |")
+              f"{gi_ms[0]:.1f} | {sg_ms[0]:.1f} | {cr_ms[0]:.1f} |")
 
     print()
     print(f"**Correctness:** {'all match' if all_match else 'MISMATCH — do NOT unify'}")
+    print("`cached_read` = get_index (no distributed client, synchronous chunk "
+          "cache) in our pool = cancellable Future + ~1 ms dwell-in-chunk hits, "
+          "no distributed overhead.")
 
     pool.shutdown(wait=False, cancel_futures=True)
     if client is not None:

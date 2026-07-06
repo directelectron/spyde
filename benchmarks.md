@@ -418,6 +418,30 @@ exactly — the region result is the un-rounded float64 mean, NOT cast to frame 
 - **Movie**: consecutive frames are in DIFFERENT chunks (1 frame/chunk), so the
   get_index chunk cache never helps; submit_graph's direct read wins (46 vs 251 ms).
 
-**Conclusion:** keep the distributed+shm+cache path for the 4D-STEM DP navigator;
-use submit_graph for the MOVIE navigator only. The Phase-2 read is chosen by which
-axis is navigated, not one-size-fits-all.
+**Conclusion (superseded — see below):** ~~keep distributed for DP, submit_graph for
+movie~~. A better unification exists.
+
+### The unified read: cached get_index MINUS distributed (2026-07-05)
+
+Key realisation (from reading `CachedDaskArray.get_index`): the numpy chunk cache
+that makes the DP navigator fast is **independent of the distributed scheduler**.
+With `self.client` unset, `get_index` takes a **synchronous** branch
+(`array_tools.py` ~L1067/1134) that caches blocks in numpy and slices/means them —
+the SAME cache logic, no distributed hop. Measured on the 4D-STEM scan with the
+cache client set to None: dwell-in-chunk **1.31 ms** (min 0.80), cross-chunk 45-100 ms.
+
+So `cached_read` = `get_index` (no distributed client, synchronous chunk cache)
+submitted to our own ThreadPoolExecutor gives a **cancellable async Future** AND the
+cache hits, with NO distributed overhead. A/B (`benchmark_nav_read_ab.py`):
+
+| case | distributed (today) | naive submit_graph | **cached_read (unified)** |
+|---|---:|---:|---:|
+| single DP | 1.6 ms | 25.0 ms | **1.0 ms** |
+| region (25 pts) | 2.3 ms | 52.9 ms | **1.5 ms** |
+
+All outputs match. This **unifies both navigators** on one path (cache logic kept,
+distributed dropped): 4D-STEM DP dwells in chunk → ~1 ms hits; a movie is 1
+frame/chunk → every move a ~46 ms cold read (already optimal). It's also SIMPLER
+than today — no shm buffer, no distributed-client pinning, no `_inflight_getinds`
+juggling — and must run on the serial `_NavDispatcher` (CLAUDE.md §4: the cache is
+not concurrency-safe; the dispatcher already serialises). This is the Phase-2 design.
