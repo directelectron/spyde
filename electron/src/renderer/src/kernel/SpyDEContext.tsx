@@ -574,6 +574,24 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
           }
           break
 
+        case 'state_update_binary':
+          // A raw image frame (pixels as a Uint8Array, no base64). Post it to the
+          // iframe as `awi_state_binary`; the figure ESM uses the ArrayBuffer as
+          // the texture/ImageData bytes directly (no atob). We do NOT stash it in
+          // latestStates (replay uses base64 keys); the next paint re-sends it.
+          {
+            const figId = msg.fig_id
+            const key = msg.key
+            const iframe = iframeRefs.current.get(figId)
+            const bytes = msg.buffer as Uint8Array
+            iframe?.contentWindow?.postMessage(
+              { type: 'awi_state_binary', key, header: msg.header, buffer: bytes },
+              '*',
+              bytes?.buffer ? [bytes.buffer] : [],   // TRANSFER the ArrayBuffer
+            )
+          }
+          break
+
         case 'composition':
           dispatch({
             type: 'COMPOSITION',

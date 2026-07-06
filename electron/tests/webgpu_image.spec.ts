@@ -49,6 +49,12 @@ test('WebGPU 2-D image path activates and renders a large movie frame', async ()
       () => document.querySelectorAll('[data-testid="subwindow"]').length >= 2,
       { timeout: 180_000 },
     )
+    // Wait for the large-file open to finish (status bar shows "Reading …mrc…"
+    // until the reader settles); scrubbing before that paints nothing.
+    await page.waitForFunction(
+      () => !/Reading .*\.mrc/i.test(document.body.textContent || ''),
+      { timeout: 300_000 },
+    )
     await page.waitForTimeout(3000)
     // Scrub to a mid-movie frame so a REAL 4k frame paints (the t=0 frame can be
     // dark/placeholder). draw2d then runs → the async GPU device resolves → the

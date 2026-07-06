@@ -283,6 +283,22 @@ app.whenReady().then(async () => {
       }
       sendToRenderer(msg)
     },
+    onBinary: (header, payload) => {
+      // A raw PLOTBIN image frame. Forward the header + the pixel bytes to the
+      // renderer as a structured-clone message; the payload rides as a Uint8Array
+      // (binary, no base64/JSON re-encode) so a large frame is cheap to transfer.
+      // Shaped like a state_update so the renderer routes it into the same figure
+      // by fig_id/key — just with `buffer` (bytes) instead of `value` (base64).
+      const buf = payload.buffer.slice(
+        payload.byteOffset, payload.byteOffset + payload.byteLength)
+      sendToRenderer({
+        type: 'state_update_binary',
+        fig_id: header.fig_id,
+        key: header.key,
+        header,
+        buffer: new Uint8Array(buf),
+      })
+    },
     onStream: (text, kind) => {
       // Forward to the renderer AND surface in the dev terminal.
       process[kind === 'stderr' ? 'stderr' : 'stdout'].write(`[spyde] ${text}`)

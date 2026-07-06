@@ -88,6 +88,14 @@ export interface StateUpdateMessage extends MsgBase {
   value: unknown
 }
 
+export interface StateUpdateBinaryMessage extends MsgBase {
+  type: 'state_update_binary'
+  fig_id: string
+  key: string
+  header: Record<string, unknown>
+  buffer: Uint8Array
+}
+
 export interface CompositionMessage extends MsgBase {
   type: 'composition'
   window_ids?: number[]
@@ -226,6 +234,7 @@ export type PlotAppMessage =
   | WindowVisibilityMessage
   | WindowClosedMessage
   | StateUpdateMessage
+  | StateUpdateBinaryMessage
   | CompositionMessage
   | MetadataMessage
   | AxesInfoMessage
