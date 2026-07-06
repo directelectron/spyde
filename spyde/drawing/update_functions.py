@@ -294,13 +294,6 @@ class _InteractiveActivity:
 _interactive_activity = _InteractiveActivity()
 
 
-# A single interactive read must never pull a huge block into RAM. A single frame
-# is fine (an 8k×8k uint16 = 128 MB); an integrating REGION reads a block of frames,
-# so cap the block so a pathological ROI (e.g. "integrate the whole scan") can't
-# blow up — above this we fall back to get_index (which streams/means chunk-wise).
-_DIRECT_READ_MAX_BYTES = 512 << 20   # 512 MB
-
-
 def _direct_read_frame(current_signal, selector, indices, prof):
     """Unified fast VIEW read: compute the requested nav slice DIRECTLY with the
     synchronous scheduler and return the ndarray — bypassing hyperspy's
@@ -319,14 +312,14 @@ def _direct_read_frame(current_signal, selector, indices, prof):
 
     Works on ANY lazy signal including DERIVED views (rebin / crop / rechunk / .zspy)
     — those have no ``CachedDaskArray`` at all, so the direct read is the only path
-    that serves them. Memory stays bounded: dask's slice optimisation reads only the
-    frame's dependencies (a single frame peaks ~1 frame even on a monolithic chunk),
-    and a region block is capped at ``_DIRECT_READ_MAX_BYTES``.
+    that serves them. Memory stays bounded: a single frame peaks ~1 frame even on a
+    monolithic chunk, and a region mean is accumulated INCREMENTALLY (one frame at a
+    time into a float sum) so peak stays ~1 frame regardless of region size — no cap.
 
     Returns None to fall through to the cached ``get_index`` read when it can't serve
-    the request (eager data, a too-large region block, or any failure) — a safety
-    net, not the primary path. Also primes the movie prefetcher + drives the profile
-    line so the caller doesn't repeat that work.
+    the request (eager data or any failure) — a safety net, not the primary path.
+    Also primes the movie prefetcher + drives the profile line so the caller doesn't
+    repeat that work.
 
     Concurrency: issued only from the serial ``_NavDispatcher`` thread; it never
     touches the ``CachedDaskArray`` bookkeeping, so the "(i,j) is not in list" hazard
@@ -344,24 +337,31 @@ def _direct_read_frame(current_signal, selector, indices, prof):
         frame_shape = data.shape[nav_dim:]
         frame_bytes = int(np.prod(frame_shape)) * item_bytes
 
+        is_region = idx.ndim > 1
         with prof.stage("read"):
-            if idx.ndim <= 1:
+            if not is_region:
                 # Single point (crosshair): one frame, native dtype.
                 point = tuple(int(v) for v in np.atleast_1d(idx))
                 frame = np.asarray(
                     data[point].compute(scheduler="synchronous"))
             else:
-                # Integrating region: N nav points → frame-wise mean. Guard the
-                # block size so a huge ROI can't materialise the dataset.
+                # Integrating region: N nav points → frame-wise mean, accumulated
+                # INCREMENTALLY (read one frame, add to a float accumulator, free
+                # it) so peak memory is ~ONE frame, not the whole block. Reading a
+                # 59-frame region as one vindex block peaked ~2 GB; incremental
+                # peaks ~1 frame at the SAME speed (it's disk-bound either way).
+                # No size cap needed — memory is bounded by construction.
+                coords = [idx[:, k].astype(int) for k in range(idx.shape[1])]
                 n_pts = int(idx.shape[0])
-                if n_pts * frame_bytes > _DIRECT_READ_MAX_BYTES:
-                    return None   # too big → let get_index stream it chunk-wise
-                # dask can't do n-d fancy indexing (`data[iy, ix]`); use .vindex,
-                # its pointwise-fancy-index equivalent, then mean over the points.
-                coords = tuple(idx[:, k].astype(int) for k in range(idx.shape[1]))
-                block = np.asarray(
-                    data.vindex[coords].compute(scheduler="synchronous"))
-                mean = block.mean(axis=0)
+                acc = None
+                for i in range(n_pts):
+                    pt = tuple(int(coords[k][i]) for k in range(len(coords)))
+                    f = np.asarray(data[pt].compute(scheduler="synchronous"))
+                    if acc is None:
+                        acc = f.astype(np.float64)
+                    else:
+                        acc += f
+                mean = acc / n_pts
                 # Parity with the old distributed region mean: round an integer
                 # source's fractional mean back to its dtype.
                 if np.issubdtype(data.dtype, np.integer):

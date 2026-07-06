@@ -17,7 +17,7 @@ import dask.array as da
 import hyperspy.api as hs
 
 from spyde.drawing.update_functions import (
-    _direct_read_frame, _DIRECT_READ_MAX_BYTES, NavProfile,
+    _direct_read_frame, NavProfile,
 )
 
 
@@ -97,14 +97,16 @@ class TestDirectReadRegion:
         expect = np.rint(data[[0, 0], [0, 1]].mean(axis=0)).astype(data.dtype)
         assert np.array_equal(direct, expect)
 
-    def test_oversized_region_falls_through(self):
-        # A region whose block would exceed the byte cap returns None so get_index
-        # streams it chunk-wise instead of materialising it.
-        s, data = _4dstem(nav=(4, 4), sig=(8, 8))
-        n_pts = _DIRECT_READ_MAX_BYTES // (8 * 8 * 2) + 10   # over the cap
-        pts = np.zeros((n_pts, 2), dtype=int)
+    def test_large_region_stays_bounded(self):
+        # A large region is read INCREMENTALLY (peak ~1 frame), so it no longer
+        # falls through — it's served directly and stays memory-bounded.
+        s, data = _4dstem(nav=(8, 8), sig=(32, 32))
+        pts = np.array([[iy, ix] for iy in range(8) for ix in range(8)])  # all 64
         out = _direct_read_frame(s, _Sel(integrating=True), pts, NavProfile("SIG"))
-        assert out is None
+        assert out is not None
+        expect = np.rint(
+            data.reshape(64, 32, 32).mean(axis=0)).astype(data.dtype)
+        assert np.array_equal(out, expect)
 
 
 class TestDirectReadDerivedViews:
