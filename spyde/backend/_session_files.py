@@ -194,6 +194,14 @@ class FileLoaderMixin:
             if nav_chunk is None:
                 target = max(1, cls._CHUNK_TARGET_BYTES // max(1, frame_bytes))
                 nav_chunk = int(min(cls._NAV_CHUNK_MAX, target))
+                # A MOVIE time navigator reads ONE frame per move and jumps around
+                # in time, so packing several frames per chunk (e.g. 4 for a 16 MB
+                # frame → a 64 MB read to show 1 frame) is wasted I/O — each move
+                # crosses a chunk. Force 1 frame/chunk for a movie so a scrub reads
+                # exactly the frame it shows. (A 4D-STEM DP navigator dwells within
+                # a chunk, so there the multi-frame pack is a genuine cache win.)
+                if cls._is_movie_time_axis(sig):
+                    nav_chunk = 1
 
             sig_chunks = data.chunks[nav_dim:]
             sig_whole = all(len(c) == 1 for c in sig_chunks)

@@ -43,14 +43,24 @@ class TestAdaptiveChunking:
         # nav block == 1 (256 MB frame > 64 MB target), signal axes whole.
         assert ch == (1, -1, -1)
 
-    def test_medium_frame_caps_at_target(self):
-        # 4k×4k uint8 = 16 MB/frame → 64/16 = 4 frames/chunk (signal split so it
-        # re-chunks).
-        s = _lazy_2d_signal(20, (4096, 4096), dtype=np.uint8,
-                            chunks=(20, 2048, 4096))
+    def test_medium_frame_byte_target_on_4dstem(self):
+        # A 4D-STEM scan (nav-dim 2, NOT a movie): 4k×4k uint8 = 16 MB/frame →
+        # 64/16 = 4 frames/chunk on each nav axis (multi-frame pack is a genuine
+        # cache win when the DP navigator dwells in-chunk).
+        arr = da.zeros((10, 12, 4096, 4096), dtype=np.uint8, chunks=(10, 12, 2048, 4096))
+        s = hs.signals.Signal2D(arr).as_lazy()
+        s.axes_manager.navigation_axes[0].name = "x"
         ch = Session._signal_spanning_chunks(s)
         assert ch is not None
-        assert ch == (4, -1, -1)
+        assert ch[:2] == (4, 4) and ch[-2:] == (-1, -1)
+
+    def test_large_movie_gets_one_frame_per_chunk(self):
+        # A MOVIE (nav-dim 1, large frames): each move reads one frame and jumps
+        # in time, so pack exactly 1 frame/chunk (NOT 4) — no wasted I/O per move.
+        s = _lazy_2d_signal(20, (4096, 4096), dtype=np.uint8,
+                            chunks=(20, 2048, 4096))   # nav-dim-1 large stack = movie
+        ch = Session._signal_spanning_chunks(s)
+        assert ch == (1, -1, -1)
 
     def test_small_dp_packs_many_but_capped(self):
         # 128×128 uint16 = 32 KB/frame → target would be ~2000, capped to 32.
@@ -61,21 +71,22 @@ class TestAdaptiveChunking:
         assert ch is not None
         assert ch == (32, -1, -1)   # _NAV_CHUNK_MAX
 
-    def test_whole_signal_and_small_nav_block_is_left_alone(self):
-        # Signal axes already whole AND the reader's nav block (2) is <= our
-        # target (4 for a 16 MB frame) → no rebuild.
+    def test_movie_whole_signal_multi_frame_block_is_recut_to_one(self):
+        # A movie whose reader already made whole signal frames but packed 2
+        # frames/chunk is recut to 1 (a movie's target is 1 frame/chunk).
         s = _lazy_2d_signal(20, (4096, 4096), dtype=np.uint8,
                             chunks=(2, 4096, 4096))
         ch = Session._signal_spanning_chunks(s)
-        assert ch is None
+        assert ch == (1, -1, -1)
 
-    def test_whole_signal_but_oversized_nav_block_is_recut(self):
-        # Signal axes whole but the reader packed 32 large frames per chunk
-        # (32 × 16 MB = 512 MB) — that's too big for one-frame reads, recut to 4.
-        s = _lazy_2d_signal(64, (4096, 4096), dtype=np.uint8,
-                            chunks=(32, 4096, 4096))
+    def test_4dstem_whole_signal_small_nav_block_left_alone(self):
+        # 4D-STEM (nav-dim 2, not a movie): signal axes whole AND the reader's
+        # nav block (2) <= the byte target (4 for a 16 MB frame) → no rebuild.
+        arr = da.zeros((10, 12, 4096, 4096), dtype=np.uint8, chunks=(2, 2, 4096, 4096))
+        s = hs.signals.Signal2D(arr).as_lazy()
+        s.axes_manager.navigation_axes[0].name = "x"
         ch = Session._signal_spanning_chunks(s)
-        assert ch == (4, -1, -1)
+        assert ch is None
 
     def test_2d_nav_4dstem_still_spans_signal(self):
         # A 4D-STEM scan (2 nav dims) with split signal axes still re-chunks to
