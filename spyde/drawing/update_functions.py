@@ -293,6 +293,101 @@ class _InteractiveActivity:
 # Process-wide: the navigator/VI fill yields the disk to active scrubbing.
 _interactive_activity = _InteractiveActivity()
 
+
+# A single interactive read must never pull a huge block into RAM. A single frame
+# is fine (an 8k×8k uint16 = 128 MB); an integrating REGION reads a block of frames,
+# so cap the block so a pathological ROI (e.g. "integrate the whole scan") can't
+# blow up — above this we fall back to get_index (which streams/means chunk-wise).
+_DIRECT_READ_MAX_BYTES = 512 << 20   # 512 MB
+
+
+def _direct_read_frame(current_signal, selector, indices, prof):
+    """Unified fast VIEW read: compute the requested nav slice DIRECTLY with the
+    synchronous scheduler and return the ndarray — bypassing hyperspy's
+    ``CachedDaskArray``/``get_index`` machinery, which adds ~160 ms/frame of pure
+    overhead and balloons to seconds on a cold miss. A direct
+    ``raw[idx].compute(scheduler="synchronous")`` of the same slice is ~2–30 ms and
+    byte-identical (profiled: movie 179→25 ms, 4D-STEM DP 10→2 ms, region 9→7 ms).
+
+    Handles BOTH navigator shapes, using the SAME index semantics as the eager
+    branch below:
+      * single point (``idx.ndim<=1``) — a movie frame OR a 4D-STEM diffraction
+        pattern: ``data[tuple(point)]`` → native dtype, no rounding.
+      * integrating region (``idx.ndim>1``, N nav points) — ``data[sl].mean(axis=0)``
+        rounded back to an integer source dtype (parity with the old distributed
+        ``weighted_mean_round_from_sums``).
+
+    Works on ANY lazy signal including DERIVED views (rebin / crop / rechunk / .zspy)
+    — those have no ``CachedDaskArray`` at all, so the direct read is the only path
+    that serves them. Memory stays bounded: dask's slice optimisation reads only the
+    frame's dependencies (a single frame peaks ~1 frame even on a monolithic chunk),
+    and a region block is capped at ``_DIRECT_READ_MAX_BYTES``.
+
+    Returns None to fall through to the cached ``get_index`` read when it can't serve
+    the request (eager data, a too-large region block, or any failure) — a safety
+    net, not the primary path. Also primes the movie prefetcher + drives the profile
+    line so the caller doesn't repeat that work.
+
+    Concurrency: issued only from the serial ``_NavDispatcher`` thread; it never
+    touches the ``CachedDaskArray`` bookkeeping, so the "(i,j) is not in list" hazard
+    (the reason that path had to be serial) does not apply here (CLAUDE.md §4)."""
+    try:
+        data = getattr(current_signal, "data", None)
+        # Needs a lazy dask array (has .compute + .chunks). Eager numpy is handled
+        # by the eager branch; a Future-bearing array is the loading placeholder.
+        if data is None or not hasattr(data, "compute") or not hasattr(data, "chunks"):
+            return None
+
+        idx = np.asarray(indices)
+        item_bytes = data.dtype.itemsize
+        nav_dim = current_signal.axes_manager.navigation_dimension
+        frame_shape = data.shape[nav_dim:]
+        frame_bytes = int(np.prod(frame_shape)) * item_bytes
+
+        with prof.stage("read"):
+            if idx.ndim <= 1:
+                # Single point (crosshair): one frame, native dtype.
+                point = tuple(int(v) for v in np.atleast_1d(idx))
+                frame = np.asarray(
+                    data[point].compute(scheduler="synchronous"))
+            else:
+                # Integrating region: N nav points → frame-wise mean. Guard the
+                # block size so a huge ROI can't materialise the dataset.
+                n_pts = int(idx.shape[0])
+                if n_pts * frame_bytes > _DIRECT_READ_MAX_BYTES:
+                    return None   # too big → let get_index stream it chunk-wise
+                # dask can't do n-d fancy indexing (`data[iy, ix]`); use .vindex,
+                # its pointwise-fancy-index equivalent, then mean over the points.
+                coords = tuple(idx[:, k].astype(int) for k in range(idx.shape[1]))
+                block = np.asarray(
+                    data.vindex[coords].compute(scheduler="synchronous"))
+                mean = block.mean(axis=0)
+                # Parity with the old distributed region mean: round an integer
+                # source's fractional mean back to its dtype.
+                if np.issubdtype(data.dtype, np.integer):
+                    mean = np.rint(mean).astype(data.dtype)
+                frame = mean
+        prof.set_frame(frame)
+
+        # Read-ahead for a MOVIE scrub (1-D time nav, single point): warm the OS
+        # page cache for the neighbouring frames off-thread. A 4D-STEM DP dwells in
+        # small in-RAM-cheap chunks and an integrating region has no single "next
+        # frame", so prefetch is movie-only.
+        with prof.stage("prefetch"):
+            try:
+                if nav_dim == 1 and idx.ndim <= 1:
+                    n_time = int(data.shape[0])
+                    center = int(np.atleast_1d(idx).ravel()[0])
+                    _movie_prefetcher.prime(data, center, n_time)
+            except Exception as _e:
+                log.debug("movie prefetch prime failed: %s", _e)
+        prof.done("direct")
+        return frame
+    except Exception as _e:
+        log.debug("direct-read failed, falling back to cached get_index: %s", _e)
+        return None
+
+
 def write_shared_array(data, shared_arr_name):
     dtype_bytes = data.dtype.str.encode('utf-8')
     dtype_length = len(dtype_bytes)
@@ -523,6 +618,21 @@ def update_from_navigation_selection(
             if current_img.ndim == 2:
                 #make checkerboard pattern to indicate loading
                 current_img[::2, ::2] = 0
+        elif (_direct := _direct_read_frame(
+                current_signal, selector, indices, _prof)) is not None:
+            # ── UNIFIED FAST VIEW READ: compute the slice DIRECTLY, bypass ──────
+            # get_index. For EVERY navigator (movie frame, 4D-STEM diffraction
+            # pattern, integrating region) hyperspy's CachedDaskArray adds ~160 ms
+            # of overhead per frame (block bookkeeping, ghost padding,
+            # surrounding-block prefetch, meshgrid indexing) and BALLOONS to seconds
+            # on a cold miss — while a plain raw[idx].compute(scheduler="synchronous")
+            # of the same slice is ~2–30 ms and byte-identical (profiled: movie
+            # 179→25 ms, DP 10→2 ms, region 9→7 ms). It also serves DERIVED views
+            # (rebin/crop/rechunk) that have no CachedDaskArray at all, and stays
+            # memory-bounded (dask reads only the frame's deps). _direct_read_frame
+            # did the read + prefetch + profile. get_index remains only as the
+            # fall-through safety net below (eager data / oversized region).
+            current_img = _direct
         else:
             # ── UNIFIED CACHED READ (synchronous, no distributed scheduler) ─────
             # This runs on the single serial _nav_dispatcher thread (see
@@ -588,7 +698,19 @@ def update_from_navigation_selection(
                     if (src_dtype is not None
                             and np.issubdtype(src_dtype, np.integer)
                             and np.issubdtype(current_img.dtype, np.floating)):
-                        current_img = np.rint(current_img).astype(src_dtype)
+                        # A SINGLE point (crosshair): get_index returns the frame's
+                        # own values as float64 — they are already EXACT integers,
+                        # so np.rint is a mathematical no-op. Skip it: plain astype
+                        # (truncation) gives the identical result at ~4x less cost
+                        # (~40 ms vs ~160 ms on a 4k frame — the movie-scrub hot
+                        # path; profiled). Only an INTEGRATING REGION produces
+                        # fractional means that actually need rounding.
+                        _idx0 = np.asarray(indices)
+                        single_point = (_idx0.ndim <= 1) or _idx0.shape[0] == 1
+                        if single_point:
+                            current_img = current_img.astype(src_dtype, copy=False)
+                        else:
+                            current_img = np.rint(current_img).astype(src_dtype)
                 except Exception as _e:
                     log.debug("nav frame round-to-dtype failed: %s", _e)
 
