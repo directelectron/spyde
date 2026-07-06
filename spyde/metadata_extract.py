@@ -116,4 +116,33 @@ def build_metadata_dict(signal_tree: "BaseSignalTree") -> dict[str, dict[str, st
         subsections["Dataset"] = ds
     except Exception as e:
         log.debug("building Dataset metadata subsection failed: %s", e)
+
+    # Movie fps / frame time: prefer the explicit metadata key (filled above), but
+    # if it's absent and the leading navigation axis is a calibrated TIME axis
+    # (an in-situ movie: name "time" / units in seconds), DERIVE fps = 1/scale and
+    # the frame time = scale so a calibrated movie shows real numbers instead of "--".
+    try:
+        movie = subsections.get("Movie / In-Situ")
+        if movie is not None:
+            sig = signal_tree.root
+            am = sig.axes_manager
+            if am.navigation_dimension >= 1:
+                ax = am.navigation_axes[0]
+                name = str(getattr(ax, "name", "") or "").strip().lower()
+                units = str(getattr(ax, "units", "") or "").strip().lower()
+                scale = float(getattr(ax, "scale", 0.0) or 0.0)
+                is_time = name in ("time", "t") or units in (
+                    "s", "sec", "secs", "second", "seconds")
+                # Only fill when the YAML key gave nothing (value starts with "--").
+                if is_time and scale > 0:
+                    per_frame_s = scale
+                    if units in ("ms", "millisecond", "milliseconds"):
+                        per_frame_s = scale / 1000.0
+                    if movie.get("FPS", "").startswith("--"):
+                        movie["FPS"] = f"{1.0 / per_frame_s:.3g} fps"
+                    if movie.get("Frame time", "").startswith("--"):
+                        movie["Frame time"] = f"{per_frame_s:.3g} s"
+    except Exception as e:
+        log.debug("deriving movie fps from time axis failed: %s", e)
+
     return subsections

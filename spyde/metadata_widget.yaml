@@ -24,6 +24,19 @@ metadata_widget:
         description: "The convergence angle of the electron beam."
         default: "--"
         units: "mrad"
+  Movie / In-Situ:
+    FPS:
+      key: "Acquisition_instrument.TEM.frames_per_second"
+      type: float
+      description: "Frames per second of an in-situ movie (from the DE reader)."
+      default: "--"
+      units: "fps"
+    Frame time:
+      key: "Acquisition_instrument.TEM.exposure_time"
+      type: float
+      description: "Per-frame exposure / integration time."
+      default: "--"
+      units: "s"
   Root Experiment Details:
     Name:
       key: "General.title"
