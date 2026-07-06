@@ -271,15 +271,13 @@ def update_from_navigation_selection(
     indices : array-like
         The indices selected by the selector.
     get_result : bool
-        Whether to compute the result immediately (for Dask arrays). Always False for using
-        dask distributed futures.
+        Only meaningful in the eager/placeholder branches; the lazy branch always
+        reads synchronously (see below). Kept for signature stability.
     cache_in_shared_memory : bool
-        Whether to write the result into a per-plot shared-memory buffer instead
-        of transferring it over TCP (default True — the optimized distributed →
-        shared-memory → plot pipeline, ported from the Qt app). The reused buffer
-        is race-safe because ``_on_plot_ready`` only applies the result of the
-        LATEST future (``plot.current_data is future``) and stale futures are
-        cancelled before the next request — superseded/torn reads are dropped.
+        DEPRECATED / NO-OP. The lazy nav read is now a synchronous cached read that
+        returns a numpy array directly (no distributed Future, no shared-memory
+        buffer — see §3 of CLAUDE.md Live-Display). This parameter no longer has any
+        effect; it remains only so existing callers don't break. Do not rely on it.
     """
     # Signal that the user is interacting NOW, so a heavy background disk fill
     # (the progressive navigator/VI sum) yields the disk to this frame read
@@ -439,11 +437,13 @@ def update_from_navigation_selection(
             # ("ValueError: (i, j) is not in list"); the dispatcher already
             # guarantees this is never re-entered concurrently, so no lock (§4).
             #
-            # Force the SYNCHRONOUS cache path: get_index falls back to
-            # dask.distributed.get_client() when _client is unset, which raises on
-            # this plain dispatcher thread → None → the synchronous numpy-cache
-            # branch. Pin it to None explicitly so we never accidentally hit the
-            # distributed branch (which would need a running cluster + round-trip).
+            # Force the SYNCHRONOUS cache path (fast: ~1-2 ms dwell-in-chunk hits
+            # vs ~16 ms distributed). Setting _client=None requests it, AND
+            # heavy_imports._patch_cached_dask_client makes the cache honour that
+            # (the fork's client property otherwise adopts the app's global default
+            # Client from this non-worker thread → a distributed round-trip on
+            # every move; the pin alone was a no-op — see that patch). A fresh
+            # nav cache starts with _client=None, so this is normally a re-assert.
             cached_arr = getattr(current_signal, "cached_dask_array", None)
             if cached_arr is not None:
                 try:

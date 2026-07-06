@@ -223,12 +223,21 @@ The navigator computes each signal frame **synchronously, right on the
 shared-memory buffer, no `PlotUpdateWorker` poll for the nav path.
 
 - **Why it's fast:** hyperspy's `CachedDaskArray` keeps the loaded chunk in a numpy
-  cache. With no client set, `get_index` takes its **synchronous** branch (cache the
-  block, then slice/mean it in numpy). A 4D-STEM DP navigator dwells *within* a nav
-  chunk → ~1 ms cache hits; an in-situ movie is 1 frame/chunk → each move is a small
-  cold read of just that frame. Measured competitive-to-faster than the old
-  distributed path, minus the scheduler round-trip (`benchmarks.md` "unified read",
-  and the A/B in `benchmark_nav_read_ab.py`).
+  cache. With **no client**, `get_index` takes its **synchronous** branch (cache the
+  block, then slice/mean it in numpy) — ~1–2 ms dwell-in-chunk hits vs ~16 ms for the
+  distributed round-trip (~100 ms cross-chunk). A 4D-STEM DP navigator dwells *within*
+  a nav chunk → fast hits; an in-situ movie is 1 frame/chunk → each move is a small
+  cold read of just that frame.
+- **CRITICAL — `_client = None` alone is NOT enough** (this was a silent
+  perf-only bug for a while). The fork's `CachedDaskArray.client` property, when
+  `_client is None`, falls back to `dask.distributed.get_client()`, which returns the
+  app's **process-global default `Client(cluster)`** from ANY thread (the
+  `_NavDispatcher` thread included — it does NOT raise). So the pin was a no-op with a
+  live cluster and every nav move still went distributed. `heavy_imports.
+  _patch_cached_dask_client()` (applied in `ensure_heavy_imports`) removes that
+  fallback so `_client = None` truly selects the synchronous branch. Tests never
+  caught it because they run `SPYDE_NO_DASK=1` (no default client). See
+  `test_cache_client_patch.py`; measured numbers in `benchmarks.md`.
 - **Latest-wins without cancellation:** the serial dispatcher coalesces by
   `id(selector)`, so a superseded position is dropped from the pending slot before it
   ever runs — no need to cancel an in-flight compute. A slow cold read blocks the
@@ -251,13 +260,15 @@ shared-memory buffer, no `PlotUpdateWorker` poll for the nav path.
 > **History (do NOT re-introduce):** the nav read USED to submit a distributed
 > `get_inds` future + `write_shared_array` into a per-plot shm buffer, polled by
 > `PlotUpdateWorker`. That path needed two hard-won fixes to avoid a DP frozen on a
-> stale frame — pinning `CachedDaskArray._client` to the cluster (else `get_client()`
-> raised on the dispatcher thread → silent sync compute) and holding the get_inds
-> future alive (`plot._inflight_getinds`) so distributed didn't release-key-cancel it.
-> Both are now MOOT: with no client the synchronous branch is the intended path, and
-> nothing is submitted to cancel. The retired repros (`repro_cache_client_thread.py`,
-> `repro_write_cancelled.py`) documented that dead machinery. Don't add a buffer ring
-> or self-pacing (tried, both worse: wedged gate / infinite ~6-frame re-emit).
+> stale frame — pinning `CachedDaskArray._client` to the cluster and holding the
+> get_inds future alive (`plot._inflight_getinds`) so distributed didn't
+> release-key-cancel it. Both are now MOOT: the read is serial + blocking, so nothing
+> is submitted to cancel and no future can be lost. The retired repros
+> (`repro_cache_client_thread.py`, `repro_write_cancelled.py`) documented that dead
+> machinery. Don't add a buffer ring or self-pacing (tried, both worse: wedged gate /
+> infinite ~6-frame re-emit). NB: the safety came from **seriality + blocking**, not
+> from which `get_index` branch runs — a serial blocking read is correct either way
+> (the `_client=None` patch just makes it also FAST; see §3).
 
 ## GPU Computing
 

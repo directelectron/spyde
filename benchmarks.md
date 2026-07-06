@@ -446,6 +446,29 @@ than today — no shm buffer, no distributed-client pinning, no `_inflight_getin
 juggling — and must run on the serial `_NavDispatcher` (CLAUDE.md §4: the cache is
 not concurrency-safe; the dispatcher already serialises). This is the Phase-2 design.
 
+### The `_client=None` pin needs a property patch to actually take effect (2026-07-06)
+
+A review caught that `cached_arr._client = None` **does not** force the synchronous
+cache branch when a real cluster is up (the app default). The fork's
+`CachedDaskArray.client` property, when `_client is None`, calls
+`dask.distributed.get_client()` — which returns the process-global default `Client`
+from any non-worker thread (it does NOT raise). So the nav read still went
+distributed in the app; only `SPYDE_NO_DASK=1` tests hit the sync branch.
+
+Measured on a real `LocalCluster` (default `Client`), 64×64×128² 4D-STEM, from a
+`nav-dispatch` thread:
+
+| | dwell-in-chunk | cross-chunk |
+|---|---:|---:|
+| `_client=None` alone (still distributed) | **~16 ms** | ~103 ms |
+| + `_patch_cached_dask_client()` (true sync) | **~2 ms** (min 0.7) | (one chunk read) |
+
+Fix: `heavy_imports._patch_cached_dask_client()` (applied in `ensure_heavy_imports`)
+makes `.client` honour `_client=None` (no `get_client()` fallback). Verified with a
+real cluster (2 ms dwell, correct frame) and in the app (DP nav 9/9 moves update).
+The RETIREMENT of the shm/cancel machinery was always safe — it came from
+**seriality + blocking**, not the branch; the patch just makes the read fast too.
+
 ### LOD decimation + read-ahead prefetch (Phase 3, 2026-07-05)
 
 Two wins for a large-movie scrub, both benchmark-driven on the real 4k movie:
