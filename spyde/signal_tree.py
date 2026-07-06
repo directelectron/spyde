@@ -127,6 +127,7 @@ class BaseSignalTree:
             compute_with_live_buffer,
             ensure_live_buffer,
             read_live_buffer,
+            _interactive_activity,
         )
 
         nav_dask = self._pending_nav_dask
@@ -188,6 +189,12 @@ class BaseSignalTree:
                     for combo in itertools.product(*axes_ranges):
                         if _stop.is_set():
                             return
+                        # Yield the disk to active scrubbing: for a large movie
+                        # this per-chunk sum reads the whole file, which otherwise
+                        # starves the crosshair's own frame read (the signal plot
+                        # freezes while the navigator fills). Pause briefly while
+                        # the user is actively moving; resume when they settle.
+                        _interactive_activity.wait_if_active()
                         nav_slices = tuple(slice(s, s + n) for s, n in combo)
                         logger.debug("NAV-DEBUG threaded nav chunk %s computing", nav_slices)
                         block = np.asarray(_dask[nav_slices].compute()).astype(np.float32)

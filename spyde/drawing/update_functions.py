@@ -139,6 +139,43 @@ class _MoviePrefetcher:
 # One prefetcher for the whole process (movie navigation is serial).
 _movie_prefetcher = _MoviePrefetcher()
 
+
+class _InteractiveActivity:
+    """Lets a heavy background disk reader (the progressive navigator/VI fill)
+    YIELD to interactive navigation. For a large movie the navigator sum reads the
+    WHOLE file from disk (tens of seconds); that read saturates disk bandwidth and
+    starves the crosshair's own per-frame read, so the signal plot appears frozen
+    while the navigator fills ("plot doesn't update while VI computes").
+
+    The nav read `poke()`s this on every move; the background fill calls
+    `wait_if_active()` between chunks, which blocks briefly while scrubbing is
+    recent so the interactive frame read gets the disk first. The fill is only
+    slowed while the user is actively moving — it resumes as soon as they pause."""
+
+    def __init__(self, quiet_s: float = 0.35) -> None:
+        self._quiet = quiet_s
+        self._last = 0.0            # monotonic time of the last interactive poke
+        self._lock = threading.Lock()
+
+    def poke(self) -> None:
+        with self._lock:
+            self._last = time.monotonic()
+
+    def wait_if_active(self, max_wait_s: float = 2.0) -> None:
+        """Block while interactive activity is recent (up to ``max_wait_s`` so a
+        continuous drag can't starve the fill forever)."""
+        deadline = time.monotonic() + max_wait_s
+        while True:
+            with self._lock:
+                idle = time.monotonic() - self._last
+            if idle >= self._quiet or time.monotonic() >= deadline:
+                return
+            time.sleep(0.05)
+
+
+# Process-wide: the navigator/VI fill yields the disk to active scrubbing.
+_interactive_activity = _InteractiveActivity()
+
 def write_shared_array(data, shared_arr_name):
     dtype_bytes = data.dtype.str.encode('utf-8')
     dtype_length = len(dtype_bytes)
@@ -230,6 +267,11 @@ def update_from_navigation_selection(
         LATEST future (``plot.current_data is future``) and stale futures are
         cancelled before the next request — superseded/torn reads are dropped.
     """
+    # Signal that the user is interacting NOW, so a heavy background disk fill
+    # (the progressive navigator/VI sum) yields the disk to this frame read
+    # instead of starving it — the "plot frozen while the VI computes" fix.
+    _interactive_activity.poke()
+
     # get the data from the signal tree based on the current indices
 
     current_signal = child.plot_state.current_signal
