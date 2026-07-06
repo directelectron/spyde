@@ -445,3 +445,29 @@ frame/chunk → every move a ~46 ms cold read (already optimal). It's also SIMPL
 than today — no shm buffer, no distributed-client pinning, no `_inflight_getinds`
 juggling — and must run on the serial `_NavDispatcher` (CLAUDE.md §4: the cache is
 not concurrency-safe; the dispatcher already serialises). This is the Phase-2 design.
+
+### Real-cluster (`--distributed`) A/B + a rounding gotcha (2026-07-05)
+
+Ran the A/B against a real `LocalCluster(processes=True)` (CLAUDE.md: won't run in
+an agent sandbox — run directly). Cold reads through the cluster:
+
+| case | distributed get_index | submit_graph | cached_read (no client) |
+|---|---:|---:|---:|
+| single | 13.3 ms | 23.9 ms | 18.9 ms |
+| region-25 | 26.8 ms | 48.6 ms | 25.2 ms |
+
+cached_read is competitive-to-better than the real distributed path even cold, and
+~1 ms on warm dwell-in-chunk hits (threaded run) — so unifying does NOT regress the
+DP navigator.
+
+**Gotcha (must handle when unifying): the two get_index branches round the
+integrating-region mean differently.**
+- Distributed branch → `weighted_mean_round_from_sums` → for INTEGER dtype,
+  `np.rint(mean).astype(dtype)` (rounded uint16, e.g. 106).
+- No-client branch → `np.mean(arrays)` → **float64**, un-rounded (106.444...).
+
+So a naive unify would change the DP navigator's region frames from rounded uint16
+to float64 (shifting contrast/levels). The unified read must reproduce the
+distributed rounding for integer data (round-to-dtype on the region mean). Small
+fix, but it's a real display-correctness constraint — noted for the Phase-2 rewire.
+(Single-frame reads match exactly; only the multi-point integrating region rounds.)

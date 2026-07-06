@@ -125,7 +125,10 @@ def main() -> None:
     args = ap.parse_args()
 
     path = args.path or _default_path()
-    sig = _load_4dstem(path)
+    # TWO independent loads so the distributed `getindex` column and the no-client
+    # `cached_read` column don't share a cache/client (they'd stomp each other).
+    sig = _load_4dstem(path)          # `getindex` column (client pinned if --distributed)
+    sig_nc = _load_4dstem(path)       # `cached_read` column — cache client stays None
     am = sig.axes_manager
     ny, nx = int(am.navigation_shape[1]), int(am.navigation_shape[0])
     raw = sig.data
@@ -140,15 +143,15 @@ def main() -> None:
         cluster = LocalCluster(n_workers=2, threads_per_worker=1, processes=True,
                                dashboard_address=None)
         client = Client(cluster)
-        # Pin the cache client like the app does.
-        _ = sig._get_cache_dask_chunk  # ensure attr exists
+        # Pin the `getindex` signal's cache client to the cluster, like the app.
         if getattr(sig, "cached_dask_array", None) is None:
             sig._get_cache_dask_chunk(np.array([[0, 0]]), get_result=True)
         try:
             sig.cached_dask_array._client = client
         except Exception:
             pass
-        print(f"distributed: {client}\n")
+        print(f"distributed: {client}  (getindex column uses the cluster; "
+              f"cached_read stays client=None)\n")
 
     pool = ThreadPoolExecutor(max_workers=2)
     backend = ComputeBackend(executor=pool)
@@ -162,23 +165,17 @@ def main() -> None:
         ("region-r2", _region_points(iy, ix, 2, ny, nx)),
     ]
 
-    # The unified candidate: get_index with NO distributed client (synchronous
-    # numpy chunk cache — the SAME cache logic, minus the distributed hop),
-    # submitted to OUR pool for a cancellable async Future. Make sure the cache
-    # client is unset so get_index takes the synchronous cache path.
-    if getattr(sig, "cached_dask_array", None) is None:
-        _getindex(sig, [[iy, ix]])
-    if client is None:
-        try:
-            sig.cached_dask_array._client = None
-        except Exception:
-            pass
+    # The unified candidate: get_index on sig_nc, whose cache client stays None →
+    # the synchronous numpy chunk cache branch (SAME cache logic, minus the
+    # distributed hop), submitted to OUR pool for a cancellable async Future.
+    _getindex(sig_nc, [[iy, ix]])   # build the cache (cold)
+    assert getattr(sig_nc.cached_dask_array, "_client", None) is None
 
     def _cached_read(inds):
-        # Runs get_index (synchronous cache path) inside a pool worker → a real
-        # cancellable Future. In the app this runs on the serial _NavDispatcher
-        # so the cache is never re-entered concurrently (CLAUDE.md §4).
-        return backend.submit(lambda i=inds: _getindex(sig, i))
+        # Runs get_index (synchronous cache path, client=None) inside a pool
+        # worker → a real cancellable Future. In the app this runs on the serial
+        # _NavDispatcher so the cache is never re-entered concurrently (§4).
+        return backend.submit(lambda i=inds: _getindex(sig_nc, i))
 
     print("| case | pts | match | getindex ms | submit_graph ms | cached_read ms |")
     print("|---|---:|---|---:|---:|---:|")
