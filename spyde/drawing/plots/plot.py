@@ -53,15 +53,23 @@ from spyde.backend.debug_flags import nav_profile_on as _nav_profile_on
 # frame (<= cap) is untouched. Crisp downscale/zoom is the GPU renderer's job
 # (Phases 4-5); this is the cheap nearest-neighbour LOD that makes 4k/8k scrub.
 _LOD_MAX_PX = 1536
+# Generous cap when the WebGPU renderer is active: it does colormap + zoom/upsample
+# on-device, so a higher-res frame gives real pixels to zoom into. The frame still
+# ships base64-in-JSON (transport is the remaining cost — full 4k ~147 ms encode vs
+# ~36 ms at 2048), so cap at ~2048 rather than full 8k every frame. A future binary
+# transport removes the encode cost and lets this go full-res.
+_LOD_MAX_PX_GPU = 2048
 
 
-def _lod_stride(h: int, w: int, max_px: int = _LOD_MAX_PX) -> int:
-    """Integer stride so max(h, w)//stride <= max_px (1 = no decimation)."""
+def _lod_stride(h: int, w: int, max_px: int = _LOD_MAX_PX, cap: "int | None" = None) -> int:
+    """Integer stride so max(h, w)//stride <= the cap (1 = no decimation). `cap`
+    overrides `max_px` when given (e.g. the generous GPU cap)."""
+    limit = cap if cap is not None else max_px
     longest = max(int(h), int(w))
-    if longest <= max_px:
+    if longest <= limit:
         return 1
     import math
-    return max(1, math.ceil(longest / max_px))
+    return max(1, math.ceil(longest / limit))
 
 
 _SUPERSCRIPTS = {
@@ -231,9 +239,14 @@ class Plot:
         self._axes = axes_obj[0][0] if isinstance(axes_obj, list) else axes_obj
 
         if dims == 2:
+            # gpu="auto": large scalar images render on the GPU (WebGPU texture +
+            # shader LUT + zoom/upsample); small images, RGB, and no-GPU machines
+            # fall back to Canvas2D transparently. The GPU handles downscale/zoom,
+            # so we can send FULL-res frames (no LOD decimation) when it's active.
             self._plot2d = self._axes.imshow(
                 np.zeros((10, 10), dtype=np.float32),
                 cmap=DEFAULT_COLORMAP,
+                gpu="auto",
             )
         else:
             self._plot1d = self._axes.plot(np.zeros(10))
@@ -499,10 +512,22 @@ class Plot:
         # so decimating it would offset every nav selection by the stride factor.
         # Only signal frames (the DP / movie frame) are decimated — the case that
         # actually needs it and where the selector isn't on this image.
+        #
+        # LOD cap is GENEROUS when the GPU path is active. WebGPU does colormap +
+        # zoom/upsample on-device, so a higher-res frame lets the user zoom into
+        # real pixels — but the frame still ships as base64-in-JSON (transport, not
+        # render, is the remaining cost: full 4k ≈ 147 ms to encode vs ~36 ms at
+        # 2048), so we cap at _LOD_MAX_PX_GPU (≈2048) rather than sending full 8k
+        # every frame. On no-GPU machines / CI the tighter Canvas2D cap
+        # (_LOD_MAX_PX) applies. (A later binary-transport change removes the encode
+        # cost and lets this go full-res.) gpu_active is the post-render echo, so
+        # the first frame uses the tight cap, then refines once the GPU activates.
+        gpu_on = bool(getattr(self._plot2d, "gpu_active", False))
         lod_stride = 1
         if dims == 2 and not self.is_navigator:
             _ls = _time.perf_counter() if _NAV_PROFILE else 0.0
-            lod_stride = _lod_stride(data.shape[0], data.shape[1])
+            lod_stride = _lod_stride(data.shape[0], data.shape[1],
+                                     cap=_LOD_MAX_PX_GPU if gpu_on else None)
             if lod_stride > 1:
                 data = data[::lod_stride, ::lod_stride]
             if _NAV_PROFILE:

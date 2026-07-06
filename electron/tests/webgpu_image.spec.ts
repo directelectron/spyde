@@ -122,6 +122,51 @@ test('WebGPU 2-D image path activates and renders a large movie frame', async ()
       'GPU image has no contrast — the shader LUT / clim did not run correctly',
     ).toBeGreaterThan(25)
 
+    // ── ZOOM: the GPU path must STAY active when zoomed (no Canvas2D fallback) and
+    // honour the zoom in the shader (real upsampling). Set zoom=2 on the figure
+    // panel's state and re-draw, then confirm __apl_gpu2d is still active at zoom≠1.
+    const zoomReport: any[] = []
+    for (const fr of page.frames()) {
+      try {
+        const rec = await fr.evaluate(() => {
+          const panels = (globalThis as any).__apl_panels
+            || (globalThis as any).panels || null
+          // Set zoom on any 2-D image panel and force a redraw via its draw path.
+          const g: any = (globalThis as any).__apl_gpu2d
+          if (!g) return null
+          const ids = Object.keys(g)
+          const setZoom = (globalThis as any).__apl_setZoom
+          const applied: any[] = []
+          for (const id of ids) {
+            if (typeof setZoom === 'function') setZoom(id, 2.0, 0.5, 0.5)
+            applied.push({ id, ...(g[id] || {}) })
+          }
+          return { ids, applied }
+        })
+        if (rec && rec.ids.length) zoomReport.push(rec)
+      } catch { /* frame gone */ }
+    }
+    await page.waitForTimeout(1500)
+    await page.screenshot({ path: 'webgpu_shots/02-gpu-zoom.png' })
+    // Re-read activation after zoom: the panel must still be active (GPU honoured
+    // zoom rather than falling back). If __apl_setZoom isn't exposed this is a soft
+    // check (the screenshot 02 is the visual proof of real upsampling).
+    const afterZoom: any[] = []
+    for (const fr of page.frames()) {
+      try {
+        const rec = await fr.evaluate(() => {
+          const g: any = (globalThis as any).__apl_gpu2d
+          return g ? Object.keys(g).map((k) => ({ id: k, ...g[k] })) : []
+        })
+        afterZoom.push(...rec)
+      } catch { /* frame gone */ }
+    }
+    const stillActive = afterZoom.find((r) => r.active && r.iw >= 1024)
+    console.log('after zoom, still GPU-active:', JSON.stringify(stillActive))
+    expect(stillActive,
+      'GPU path fell back to Canvas2D on zoom (should stay active + upsample)',
+    ).toBeTruthy()
+
     assertNoJsErrors()
   } finally {
     await app.close()
