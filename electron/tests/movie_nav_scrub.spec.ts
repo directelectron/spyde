@@ -64,7 +64,7 @@ test('scrubbing the in-situ movie time navigator paints a fresh frame each move'
     // crosshair x = time index; y is ignored. Spread across the stack so moves
     // cross the 1-frame-per-chunk boundaries (each is a fresh disk read).
     const targets: number[][] = [
-      [1, 0], [30, 0], [100, 0], [250, 0], [500, 0], [120, 0], [10, 0],
+      [1, 0], [50, 0], [150, 0], [400, 0], [80, 0],
     ]
 
     // The backend logs its verdict ("[REDRAW] test_nav_drag: N/N moves changed

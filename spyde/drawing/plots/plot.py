@@ -34,6 +34,26 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+# Level-of-detail cap for a displayed 2-D frame. A large in-situ movie frame
+# (e.g. 4096x4096) dwarfs any plot panel (~<1000 CSS px) and the base64-in-JSON
+# transport that carries it to the renderer (benchmarks.md: an 8k frame is ~90 MB
+# / ~1.3 s per push). Decimating an already-read frame in numpy is ~free (~1 ms)
+# and cuts the transport payload by the square of the stride, so we downsample any
+# frame whose longest side exceeds this before it goes over the wire. A DP-sized
+# frame (<= cap) is untouched. Crisp downscale/zoom is the GPU renderer's job
+# (Phases 4-5); this is the cheap nearest-neighbour LOD that makes 4k/8k scrub.
+_LOD_MAX_PX = 1536
+
+
+def _lod_stride(h: int, w: int, max_px: int = _LOD_MAX_PX) -> int:
+    """Integer stride so max(h, w)//stride <= max_px (1 = no decimation)."""
+    longest = max(int(h), int(w))
+    if longest <= max_px:
+        return 1
+    import math
+    return max(1, math.ceil(longest / max_px))
+
+
 _SUPERSCRIPTS = {
     "^{-1}": "⁻¹", "^-1": "⁻¹",
     "^{-2}": "⁻²", "^-2": "⁻²",
@@ -349,12 +369,17 @@ class Plot:
         except Exception as e:
             logger.debug("[plot] set_overlay_mask failed: %s", e)
 
-    def _axes_info(self, data: np.ndarray):
+    def _axes_info(self, data: np.ndarray, stride: int = 1):
         """Return (axes, units) for the displayed 2-D image from the current
         signal's signal axes, so anyplotlib draws a calibrated scale bar.
 
         The scale bar auto-renders whenever units are physical (not 'px') and a
         scale is present — matching the Qt scale-bar overlay.
+
+        ``stride`` is the LOD decimation applied to ``data`` before display; the
+        axis arrays are subsampled by the same stride so their length matches the
+        decimated frame and the calibration (physical extent) is preserved — the
+        scale bar reads the same nm span, just over fewer samples.
         """
         try:
             sig = self.plot_state.current_signal
@@ -365,7 +390,12 @@ class Plot:
             units = x_ax.units
             if not units or units in ("<undefined>", "px", ""):
                 return None, "px"
-            return [np.asarray(x_ax.axis), np.asarray(y_ax.axis)], _clean_units(units)
+            xa = np.asarray(x_ax.axis)
+            ya = np.asarray(y_ax.axis)
+            if stride > 1:
+                xa = xa[::stride]
+                ya = ya[::stride]
+            return [xa, ya], _clean_units(units)
         except Exception:
             return None, "px"
 
@@ -444,6 +474,17 @@ class Plot:
 
         self._ensure_figure(dims)
 
+        # ── Level-of-detail: decimate an oversized 2-D frame before it is
+        # serialised to the renderer. Contrast levels are computed on the
+        # decimated data (robust percentiles are unaffected by uniform striding),
+        # and the axes are subsampled by the SAME stride below so the scale bar /
+        # extent stay correct. A DP-sized frame has stride 1 (no change).
+        lod_stride = 1
+        if dims == 2:
+            lod_stride = _lod_stride(data.shape[0], data.shape[1])
+            if lod_stride > 1:
+                data = data[::lod_stride, ::lod_stride]
+
         if dims == 2 and self._plot2d is not None:
             if self.needs_auto_level:
                 # New data / explicit request → recompute contrast + histogram.
@@ -468,7 +509,7 @@ class Plot:
                 vmin, vmax = self._robust_levels(data, signal=not self.is_navigator)
                 self._emit_histogram(data, vmin, vmax)
             self._last_levels = (vmin, vmax)
-            axes, units = self._axes_info(data)
+            axes, units = self._axes_info(data, stride=lod_stride)
             # Pass the display range to set_data so the image + contrast land in a
             # SINGLE push. Splitting them (set_data then set_clim) pushed twice:
             # the first frame showed the image stretched over its raw data range
