@@ -373,3 +373,25 @@ is the hard case for the binary transport + GPU-shader colormap.
 
 Run: `.venv/Scripts/python spyde/tests/benchmark_movie_playback.py --frames 20`
 (`--path <file.mrc>`, or `--synthetic 8192` for pure 8k transport numbers).
+
+### Pooled sync-graph movie read: futures + cancel WITHOUT distributed (2026-07-05)
+
+The dilemma: the navigator needs **cancellable async futures** (latest-wins scrub)
+but the distributed scheduler's per-frame round-trip is slow (251 ms above), while
+the plain threaded `.compute()` is fast but blocking (no Future/cancel). Resolution
+(`repro_movie_scrub.py` on the real 4k movie; `ComputeBackend.submit_graph`): submit
+`lazy[t].compute(scheduler="synchronous")` to OUR ThreadPoolExecutor — the pool
+gives the real `concurrent.futures.Future` (cancel + done_callback), the synchronous
+scheduler walks the dask graph on that worker (no nested pool), no distributed hop.
+
+| property | distributed (today) | **submit_graph (pool+sync)** |
+|---|---|---|
+| per-frame latency | 251 ms | **46 ms** (min 20) |
+| cancel a queued scrub frame | yes | **yes (17/19 cancelled)** |
+| async done-callback paint | yes | **yes** |
+| scrub a lazy CROP (`inav/isig`) | yes | **yes, same path** (crop build 14.5 ms lazy; cropped frame read 48 ms) |
+
+So we keep the full dask graph (crop/rebin/zspy all read through one path) and own
+the async layer via the executor already in `ComputeBackend`. ~5.5x faster per frame
+than the current distributed live-display call, and crop-then-scrub is free. This is
+the basis for the Phase-2 movie navigator read.
