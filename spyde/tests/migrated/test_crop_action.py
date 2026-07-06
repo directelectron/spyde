@@ -43,6 +43,17 @@ class TestCropSlicing:
         c = _crop_signal(s, x0=10, x1=9999, y0=0, y1=0)   # x1 too big, y full
         assert c.data.shape == (20, 64, 54)      # x: 10..64, y: full
 
+    def test_start_at_zero_is_a_real_crop_not_full(self):
+        # y0=0, y1=15 must crop to the first 15 rows (only end<=0 means "full").
+        s = self._movie(frame=(64, 64))
+        c = _crop_signal(s, y0=0, y1=15)
+        assert c.data.shape == (20, 15, 64)
+
+    def test_all_zero_crop_is_a_noop(self):
+        s = self._movie()
+        c = _crop_signal(s)                 # every bound 0
+        assert c is s                       # returned unchanged, no new object
+
     def test_crop_preserves_values(self):
         # A real (eager) frame with a marker so we can check the crop window.
         data = np.zeros((4, 32, 32), dtype=np.float32)
@@ -62,18 +73,32 @@ class TestCropThroughAction:
         plot = next(p for p in session._plots
                     if not p.is_navigator and p.plot_state is not None)
         root = tree.root
-        n_before = len(tree.root_node.children) if hasattr(tree, "root_node") else None
 
-        act = CropAction.for_plot(plot, x0=2, x1=14, y0=2, y1=14)
+        # ASYMMETRIC box so an x/y transpose bug in the run() flow is caught:
+        # x 2..14 (=12 cols), y 4..10 (=6 rows) → signal_shape (12, 6).
+        act = CropAction.for_plot(plot, x0=2, x1=14, y0=4, y1=10)
         new = act.run()
         time.sleep(0.2)
 
         assert new is not None
-        # A new node whose signal is smaller than the parent on the signal axes.
-        assert tuple(new.axes_manager.signal_shape) == (12, 12)
+        assert tuple(new.axes_manager.signal_shape) == (12, 6)
         # Nav (scan) shape unchanged (no t-range given).
         assert tuple(new.axes_manager.navigation_shape) == \
             tuple(root.axes_manager.navigation_shape)
+
+    def test_run_keeps_a_lazy_movie_lazy(self, movie_dataset):
+        # The headline memory-safety claim, guarded through the real run() flow:
+        # cropping a LAZY movie stays a dask view (no materialise).
+        session = movie_dataset["window"]
+        plot = next(p for p in session._plots
+                    if not p.is_navigator and p.plot_state is not None)
+        act = CropAction.for_plot(plot, x0=4, x1=20, y0=6, y1=18)
+        new = act.run()
+        time.sleep(0.2)
+        assert new is not None
+        assert new._lazy is True
+        assert isinstance(new.data, da.Array), "cropped movie must stay lazy"
+        assert tuple(new.axes_manager.signal_shape) == (16, 12)
 
 
 class TestCropInToolbar:

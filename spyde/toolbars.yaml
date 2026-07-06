@@ -46,6 +46,7 @@ functions:
     plot_dim: [ 2 ]
     toolbar_side: bottom
     navigation: False
+    toggle: True
   Crop:
     description: Crop the dataset to a spatial (image) box and optional time range. Produces a smaller lazy dataset (no data copied). Leave a range at 0 to keep that axis whole.
     icon: drawing/toolbars/icons/crop.svg
@@ -78,7 +79,6 @@ functions:
         name: T end
         type: int
         default: 0
-    toggle: True
   Center Zero Beam:
     description: Centers the zero beam in diffraction patterns (Automatic / Manual).
     icon: drawing/toolbars/icons/center_zero_beam.svg

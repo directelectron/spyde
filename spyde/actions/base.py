@@ -164,13 +164,19 @@ def _crop_signal(signal, x0=0, x1=0, y0=0, y1=0, t0=0, t1=0, **_):
     leaves the nav axis whole and vice-versa.
 
     ``x0:x1`` / ``y0:y1`` are signal-axis (image column / row) pixel bounds;
-    ``t0:t1`` is the FIRST navigation axis (a movie's time / a scan's slow axis).
+    ``t0:t1`` is the FIRST navigation axis in DISPLAY order — a movie's time axis
+    (nav-dim 1) or, on a 4-D scan, the fast (x) scan axis. An ``end`` of 0 (the
+    default) means "keep the full extent" on that axis, so a pure spatial crop
+    leaves the nav axis whole; if every bound is 0 the signal is returned
+    UNCHANGED (no redundant node).
     """
     am = signal.axes_manager
     sig_shape = tuple(int(s) for s in am.signal_shape)   # (x, y) display order
     nav_shape = tuple(int(s) for s in am.navigation_shape)
 
     def _bounds(lo, hi, n):
+        # An `end` of 0 (or out of range) means "to the end". An inverted /
+        # degenerate box is clamped to a >=1-px slice rather than raising.
         lo = int(lo or 0)
         hi = int(hi or 0)
         if hi <= 0 or hi > n:
@@ -179,16 +185,21 @@ def _crop_signal(signal, x0=0, x1=0, y0=0, y1=0, t0=0, t1=0, **_):
         hi = max(lo + 1, min(hi, n))
         return lo, hi
 
+    want_spatial = any(int(v or 0) for v in (x0, x1, y0, y1))
+    want_time = bool(int(t0 or 0) or int(t1 or 0))
+    if not want_spatial and not want_time:
+        return signal          # all-zero crop → no-op, don't add a redundant node
+
     out = signal
-    if am.signal_dimension >= 2:
+    if am.signal_dimension >= 2 and want_spatial:
         sx0, sx1 = _bounds(x0, x1, sig_shape[0])
         sy0, sy1 = _bounds(y0, y1, sig_shape[1])
-        # isig indexes signal axes in display (x, y) order.
+        # isig indexes signal axes in display (x, y) order → X=columns, Y=rows.
         out = out.isig[sx0:sx1, sy0:sy1]
-    if am.navigation_dimension >= 1 and (int(t0 or 0) or int(t1 or 0)):
+    if am.navigation_dimension >= 1 and want_time:
         nt0, nt1 = _bounds(t0, t1, nav_shape[0])
-        # inav indexes the FIRST navigation axis (display order) — the movie time
-        # axis / the scan's slow axis.
+        # inav indexes the FIRST navigation axis (display order): a movie's time
+        # axis, or a 4-D scan's fast (x) axis.
         out = out.inav[nt0:nt1]
     return out
 
