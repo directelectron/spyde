@@ -33,6 +33,16 @@ if TYPE_CHECKING:
 import logging
 logger = logging.getLogger(__name__)
 
+import os as _os
+import time as _time
+# Per-frame PAINT profile (the transport/render half of a navigator update): set
+# SPYDE_NAV_PROFILE=1 to log one line per _set_array with the paint stages — LOD
+# decimate, contrast levels, and transport (anyplotlib set_data → base64 → stdout
+# emit, usually the dominant cost for a large frame). Pairs with the [NAV-PROFILE]
+# read line from update_functions so a "slow update" report shows the WHOLE
+# pipeline (read + paint). No-op unless the flag is set.
+_NAV_PROFILE = _os.environ.get("SPYDE_NAV_PROFILE") == "1"
+
 
 # Level-of-detail cap for a displayed 2-D frame. A large in-situ movie frame
 # (e.g. 4096x4096) dwarfs any plot panel (~<1000 CSS px) and the base64-in-JSON
@@ -414,6 +424,10 @@ class Plot:
             return False
 
     def _set_array(self, data: np.ndarray, levels=None) -> None:
+        # Paint-side per-frame profile (no-op unless SPYDE_NAV_PROFILE=1).
+        _p0 = _time.perf_counter() if _NAV_PROFILE else 0.0
+        _pt = {} if _NAV_PROFILE else None       # stage -> seconds
+        _in_shape = getattr(data, "shape", None)
         # Never try to paint a Future or a Future-bearing object array (a lazy
         # navigator's data before its progressive compute lands) — anyplotlib's
         # set_data does np.asarray(data, dtype=float), which raises on a Future.
@@ -486,11 +500,15 @@ class Plot:
         # actually needs it and where the selector isn't on this image.
         lod_stride = 1
         if dims == 2 and not self.is_navigator:
+            _ls = _time.perf_counter() if _NAV_PROFILE else 0.0
             lod_stride = _lod_stride(data.shape[0], data.shape[1])
             if lod_stride > 1:
                 data = data[::lod_stride, ::lod_stride]
+            if _NAV_PROFILE:
+                _pt["lod"] = _time.perf_counter() - _ls
 
         if dims == 2 and self._plot2d is not None:
+            _lv = _time.perf_counter() if _NAV_PROFILE else 0.0
             if self.needs_auto_level:
                 # New data / explicit request → recompute contrast + histogram.
                 if (self._is_navigated_frame() and self._last_levels is not None
@@ -514,6 +532,8 @@ class Plot:
                 vmin, vmax = self._robust_levels(data, signal=not self.is_navigator)
                 self._emit_histogram(data, vmin, vmax)
             self._last_levels = (vmin, vmax)
+            if _NAV_PROFILE:
+                _pt["levels"] = _time.perf_counter() - _lv
             axes, units = self._axes_info(data, stride=lod_stride)
             # Pass the display range to set_data so the image + contrast land in a
             # SINGLE push. Splitting them (set_data then set_clim) pushed twice:
@@ -521,6 +541,7 @@ class Plot:
             # (wrong contrast), the second corrected it — a one-frame flash on
             # every navigator move / threshold tick. clim= makes it atomic.
             clim = (vmin, vmax)
+            _st = _time.perf_counter() if _NAV_PROFILE else 0.0
             if axes is not None:
                 self._plot2d.set_data(data.astype(np.float32),
                                       x_axis=axes[0], y_axis=axes[1], units=units,
@@ -541,6 +562,19 @@ class Plot:
                         logger.debug("set_extent failed: %s", e)
             else:
                 self._plot2d.set_data(data.astype(np.float32), clim=clim)
+            if _NAV_PROFILE:
+                _pt["transport"] = _time.perf_counter() - _st
+                out_shape = tuple(data.shape)
+                lvl = "auto" if levels is None else "held"
+                stages = "  ".join(f"{k}={v*1e3:.1f}" for k, v in _pt.items())
+                # INFO so it reaches stderr / the Log panel for a "normal usage"
+                # report. total = whole _set_array; transport = the anyplotlib
+                # set_data(+extent) base64+stdout push (usually the biggest stage).
+                logger.info(
+                    "[PAINT-PROFILE] %s total=%.1fms  %s  in=%s out=%s lod=%d nav=%s",
+                    "NAV" if self.is_navigator else "SIG",
+                    (_time.perf_counter() - _p0) * 1e3, stages,
+                    _in_shape, out_shape, lod_stride, self.is_navigator)
             if logger.isEnabledFor(logging.DEBUG):
                 try:
                     a = np.asarray(data, dtype=np.float64)

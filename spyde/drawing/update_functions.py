@@ -67,6 +67,108 @@ _SHARED_MEMORY_SUPPORTED = True
 # to turn the navigator trace back on.
 _NAV_TIMING = _os.environ.get("SPYDE_NAV_TIMING") == "1"
 
+# Per-frame UPDATE PROFILE: set SPYDE_NAV_PROFILE=1 to log ONE compact timing line
+# per navigator update, at INFO (so it reaches stderr / the Log panel without full
+# DEBUG). It breaks the per-frame cost into stages — read (cache/disk), dtype
+# round, prefetch prime, LOD decimate, contrast levels, transport (anyplotlib
+# set_data → base64 → stdout emit) — so a "the update is slow" report shows exactly
+# WHICH stage dominates. Kept separate from _NAV_TIMING (which is the noisy
+# per-move index/cache trace). See NavProfile below.
+_NAV_PROFILE = _os.environ.get("SPYDE_NAV_PROFILE") == "1"
+
+
+class NavProfile:
+    """Accumulates per-stage timings for one navigator update and logs a single
+    compact line. No-op unless SPYDE_NAV_PROFILE=1, so it's free in normal use.
+
+    Usage:
+        prof = NavProfile("SIG", indices)
+        with prof.stage("read"): frame = ...
+        with prof.stage("transport"): plot.update_data(frame)
+        prof.done(extra="cache_hit")   # emits the line
+    """
+
+    __slots__ = ("_on", "_label", "_idx", "_stages", "_t0", "_frame_shape")
+
+    def __init__(self, label: str, indices=None) -> None:
+        self._on = _NAV_PROFILE
+        self._label = label
+        self._idx = None
+        self._stages: "list[tuple[str, float]]" = []
+        self._t0 = time.perf_counter() if self._on else 0.0
+        self._frame_shape = None
+        if self._on and indices is not None:
+            try:
+                self._idx = np.asarray(indices).ravel().tolist()
+            except Exception:
+                self._idx = None
+
+    def stage(self, name: str):
+        """Context manager timing one stage. Returns a nullcontext if profiling
+        is off, so callers pay nothing."""
+        if not self._on:
+            return contextlib.nullcontext()
+        return _StageTimer(self, name)
+
+    def _record(self, name: str, dt: float) -> None:
+        self._stages.append((name, dt))
+
+    def set_frame(self, arr) -> None:
+        if self._on:
+            self._frame_shape = getattr(arr, "shape", None)
+
+    def done(self, extra: str = "") -> None:
+        if not self._on:
+            return
+        total = (time.perf_counter() - self._t0) * 1e3
+        parts = "  ".join(f"{n}={dt*1e3:.1f}" for n, dt in self._stages)
+        idx = f" idx={self._idx}" if self._idx is not None else ""
+        shp = f" frame={self._frame_shape}" if self._frame_shape is not None else ""
+        ex = f" {extra}" if extra else ""
+        # INFO so a "report this during normal use" line reaches stderr / the Log
+        # panel. One line per update; the total plus the per-stage ms in order.
+        log.info("[NAV-PROFILE] %s total=%.1fms  %s%s%s%s",
+                 self._label, total, parts, idx, shp, ex)
+
+
+class _StageTimer:
+    __slots__ = ("_prof", "_name", "_t")
+
+    def __init__(self, prof: "NavProfile", name: str) -> None:
+        self._prof = prof
+        self._name = name
+        self._t = 0.0
+
+    def __enter__(self):
+        self._t = time.perf_counter()
+        return self
+
+    def __exit__(self, *exc):
+        self._prof._record(self._name, time.perf_counter() - self._t)
+        return False
+
+
+def _nav_cache_was_hit(signal, indices) -> bool:
+    """Best-effort: was the chunk for ``indices`` already resident in the signal's
+    CachedDaskArray before this read? A HIT is ~ms (numpy slice of a resident
+    block); a MISS reads the chunk off disk. Used only for the profile line —
+    returns False if it can't tell (no cache yet / probe failed), never raises.
+    Cheap and side-effect-free: it only inspects the cache's block-index list."""
+    if not _NAV_PROFILE:
+        return False
+    try:
+        cache = getattr(signal, "cached_dask_array", None)
+        if cache is None or not getattr(cache, "core_cached_block_inds", None):
+            return False
+        from hyperspy.misc.array_tools import _get_navigation_dimension_chunk_slice
+        nav_dim = len(signal.axes_manager.navigation_axes)
+        inds = np.asarray([row[:nav_dim] for row in np.atleast_2d(indices)])
+        core, _surr, _by = _get_navigation_dimension_chunk_slice(
+            inds, cache.array.chunks, cache.cache_padding)
+        return all(c in cache.core_cached_block_inds for c in core)
+    except Exception:
+        return False
+
 
 class _MoviePrefetcher:
     """Warm the OS page cache for the frames a movie scrub is about to reach.
@@ -284,6 +386,11 @@ def update_from_navigation_selection(
     # instead of starving it — the "plot frozen while the VI computes" fix.
     _interactive_activity.poke()
 
+    # Per-frame update profile (no-op unless SPYDE_NAV_PROFILE=1). Started here so
+    # its `total` covers the whole read (index prep → cache read → dtype → prefetch);
+    # the transport/paint half is timed separately in _run_update around update_data.
+    _prof = NavProfile(getattr(child, "window_id", "SIG"), indices)
+
     # get the data from the signal tree based on the current indices
 
     current_signal = child.plot_state.current_signal
@@ -451,10 +558,18 @@ def update_from_navigation_selection(
                 except Exception as _e:
                     log.debug("unsetting cache client failed: %s", _e)
 
-            current_img = current_signal._get_cache_dask_chunk(
-                indices, get_result=True,
-            )
-            current_img = np.asarray(current_img)
+            # Was this chunk already resident in the numpy cache? (a cache HIT is
+            # ~ms; a MISS reads the chunk off disk). Recorded for the profile so a
+            # slow report distinguishes "cold cross-chunk read" from "the cache is
+            # fast but something downstream is slow".
+            _cache_hit = _nav_cache_was_hit(current_signal, indices)
+
+            with _prof.stage("read"):
+                current_img = current_signal._get_cache_dask_chunk(
+                    indices, get_result=True,
+                )
+                current_img = np.asarray(current_img)
+            _prof.set_frame(current_img)
 
             # Dtype parity with the OLD distributed path. The synchronous cache
             # branch runs everything through np.mean, so it returns float64 for
@@ -466,14 +581,15 @@ def update_from_navigation_selection(
             # rounded integer mean for a region — so the DP navigator shows the
             # SAME uint16 frame (same memory + contrast) it did before. Float
             # sources keep their (un-rounded) mean. (benchmarks.md rounding gotcha.)
-            try:
-                src_dtype = getattr(current_signal.data, "dtype", None)
-                if (src_dtype is not None
-                        and np.issubdtype(src_dtype, np.integer)
-                        and np.issubdtype(current_img.dtype, np.floating)):
-                    current_img = np.rint(current_img).astype(src_dtype)
-            except Exception as _e:
-                log.debug("nav frame round-to-dtype failed: %s", _e)
+            with _prof.stage("dtype"):
+                try:
+                    src_dtype = getattr(current_signal.data, "dtype", None)
+                    if (src_dtype is not None
+                            and np.issubdtype(src_dtype, np.integer)
+                            and np.issubdtype(current_img.dtype, np.floating)):
+                        current_img = np.rint(current_img).astype(src_dtype)
+                except Exception as _e:
+                    log.debug("nav frame round-to-dtype failed: %s", _e)
 
             # Read-ahead prefetch for a MOVIE scrub: warm the OS page cache for
             # the next few frames so the following move finds them warm (~18 ms
@@ -482,17 +598,19 @@ def update_from_navigation_selection(
             # cache already covers neighbours, and an integrating region has no
             # single "next frame". Reads the RAW dask array (not the CachedDaskArray)
             # so it never races the nav read's cache (§4).
-            try:
-                am = current_signal.axes_manager
-                _idx = np.asarray(indices)
-                is_single = (not selector.is_integrating) or _idx.ndim <= 1
-                if (am.navigation_dimension == 1 and is_single
-                        and hasattr(current_signal.data, "shape")):
-                    n_time = int(current_signal.data.shape[0])
-                    center = int(np.atleast_1d(_idx).ravel()[0])
-                    _movie_prefetcher.prime(current_signal.data, center, n_time)
-            except Exception as _e:
-                log.debug("movie prefetch prime failed: %s", _e)
+            with _prof.stage("prefetch"):
+                try:
+                    am = current_signal.axes_manager
+                    _idx = np.asarray(indices)
+                    is_single = (not selector.is_integrating) or _idx.ndim <= 1
+                    if (am.navigation_dimension == 1 and is_single
+                            and hasattr(current_signal.data, "shape")):
+                        n_time = int(current_signal.data.shape[0])
+                        center = int(np.atleast_1d(_idx).ravel()[0])
+                        _movie_prefetcher.prime(current_signal.data, center, n_time)
+                except Exception as _e:
+                    log.debug("movie prefetch prime failed: %s", _e)
+            _prof.done("cache=" + ("hit" if _cache_hit else "MISS"))
     else:
         # Eager (in-RAM) slice. `indices` is either a single nav point (1-D,
         # from a crosshair after the mean-reduce above) or a list of nav points
@@ -506,12 +624,14 @@ def update_from_navigation_selection(
         # example datasets do.
         idx = np.asarray(indices)
         try:
-            if idx.ndim <= 1:
-                point = tuple(int(v) for v in np.atleast_1d(idx))
-                current_img = current_signal.data[point]
-            else:
-                sl = tuple(idx[:, k].astype(int) for k in range(idx.shape[1]))
-                current_img = current_signal.data[sl].mean(axis=0)
+            with _prof.stage("read"):
+                if idx.ndim <= 1:
+                    point = tuple(int(v) for v in np.atleast_1d(idx))
+                    current_img = current_signal.data[point]
+                else:
+                    sl = tuple(idx[:, k].astype(int) for k in range(idx.shape[1]))
+                    current_img = current_signal.data[sl].mean(axis=0)
+            _prof.set_frame(current_img)
         except Exception:
             log.exception(
                 "NAV-DEBUG eager index RAISED: indices=%s data.shape=%s "
@@ -521,6 +641,7 @@ def update_from_navigation_selection(
                 tuple(current_signal.axes_manager.navigation_shape),
             )
             raise
+        _prof.done("eager")
     return current_img
 
 
