@@ -290,100 +290,62 @@ def update_from_navigation_selection(
                 #make checkerboard pattern to indicate loading
                 current_img[::2, ::2] = 0
         else:
-            # ── RESPONSIVE PATH (restored from the original Qt design) ──────────
-            # The simple, fast pipeline (the original Qt design): ask the cache
-            # for a FUTURE (return_future=True), submit one write_shared_array task
-            # on it, and let the PlotUpdateWorker poll-and-paint. return_future=True
-            # also keeps it correct — it returns the freshly-built get_inds future
-            # immediately and never takes hyperspy get_index's blocking
-            # `np.all(done) → future.result()` branch (the old "lost dependencies"
-            # churn).
+            # ── UNIFIED CACHED READ (synchronous, no distributed scheduler) ─────
+            # This runs on the single serial _nav_dispatcher thread (see
+            # base_selector), one update at a time, latest-position-wins: a newer
+            # move overwrites the pending slot before a superseded one runs. So we
+            # compute the frame RIGHT HERE, synchronously, and return the numpy
+            # array — no distributed Future, no shared-memory buffer, no
+            # PlotUpdateWorker poll. `update_data` paints an ndarray immediately.
             #
-            # NO cache lock here: every navigator update runs on the single serial
-            # _nav_dispatcher thread (see base_selector), so this function is never
-            # re-entered concurrently and the cache's block bookkeeping can't be
-            # raced ("ValueError: (i, j) is not in list"). That removed the lock
-            # that was stalling the drag.
+            # The speed comes from hyperspy's CachedDaskArray numpy chunk cache:
+            # with the cache client UNSET, get_index takes its synchronous branch
+            # (caches the loaded block, then slices/means it in numpy). A DP
+            # navigator dwells within a nav chunk → ~1 ms cache hits; a movie is 1
+            # frame/chunk → each move is a ~cold read of just that frame. This
+            # matches the OLD distributed path's speed WITHOUT the scheduler
+            # round-trip, the shm buffer, the client pinning, or the
+            # _inflight_getinds juggling — see benchmarks.md "unified read".
             #
-            # NOTE: do NOT cancel the previous shm-write future. The writes run on
-            # the serial nav-dispatcher and are cheap (one 128×128 frame); under a
-            # fast drag, cancelling the in-flight write before it finishes left the
-            # shared buffer holding an OLD frame, so the worker kept reading the
-            # same stale DP (the painted stats froze while indices changed). Let
-            # each write complete; the per-future staleness guard in _on_plot_ready
-            # still drops superseded frames so only the latest paints.
-
-            # CRITICAL: pin the cache's distributed client to OUR cluster's client
-            # BEFORE asking it for the chunk future. CachedDaskArray.client falls
-            # back to dask.distributed.get_client() when _client is unset — but this
-            # runs on the nav-dispatcher thread (a plain threading.Thread, not a
-            # Dask worker), where get_client() raises ValueError → returns None →
-            # the cache silently does a SYNCHRONOUS threaded compute. That's why no
-            # tasks appear in the dashboard and the DP shows a stale frame: the
-            # get_inds future was never submitted to the real scheduler. Setting
-            # _client makes every get_inds run on the cluster (visible + cancellable
-            # + the write_shared_array below submits to the SAME client).
+            # Serial-only: the cache's block bookkeeping is not concurrency-safe
+            # ("ValueError: (i, j) is not in list"); the dispatcher already
+            # guarantees this is never re-entered concurrently, so no lock (§4).
+            #
+            # Force the SYNCHRONOUS cache path: get_index falls back to
+            # dask.distributed.get_client() when _client is unset, which raises on
+            # this plain dispatcher thread → None → the synchronous numpy-cache
+            # branch. Pin it to None explicitly so we never accidentally hit the
+            # distributed branch (which would need a running cluster + round-trip).
             cached_arr = getattr(current_signal, "cached_dask_array", None)
-            try:
-                _dm = getattr(child.main_window, "dask_manager", None)
-                _live_client = getattr(_dm, "client", None) if _dm is not None else None
-                if cached_arr is not None and _live_client is not None:
-                    cached_arr._client = _live_client
-            except Exception as _e:
-                log.debug("pinning cache client failed: %s", _e)
-
-            # NOTE: cancel_surrounding() REMOVED here. It cancels the cache's
-            # surrounding-block prefetch futures — but the get_inds future we are
-            # about to submit depends on a CORE block that the cache's block
-            # bookkeeping can release/evict on the very next move; combined with
-            # cancelling, that left EVERY get_inds (and its dependent
-            # write_shared_array) in state `cancelled`, so the DP never painted the
-            # new frame (the buffer kept the last frame that happened to survive).
-            # Observed directly via the [LIFE] trace: getinds=…(cancelled)
-            # write=…(cancelled) on every move, including the final resting one.
-            # Letting the prefetch futures live costs a little worker memory but
-            # keeps the core get_inds alive long enough to compute and write.
+            if cached_arr is not None:
+                try:
+                    cached_arr._client = None
+                except Exception as _e:
+                    log.debug("unsetting cache client failed: %s", _e)
 
             current_img = current_signal._get_cache_dask_chunk(
-                indices, get_result=get_result, return_future=True,
+                indices, get_result=True,
             )
+            current_img = np.asarray(current_img)
 
-            if (isinstance(current_img, Future)
-                    and cache_in_shared_memory and _SHARED_MEMORY_SUPPORTED):
-                # DISTRIBUTED: route the future's result through the plot's single
-                # shared-memory buffer (the optimized DP path: avoids the slow TCP
-                # round-trip of the frame). The worker reads this buffer when the
-                # future completes. Overlapping writes during a fast drag are safe:
-                # only the LATEST future's result is applied (_on_plot_ready
-                # staleness guard), so a frame clobbered by a newer write was going
-                # to be dropped anyway. (Single buffer — do NOT add a per-future
-                # ring; that caused an infinite re-emit loop. See CLAUDE.md §2/§4.)
-                shared_arr_name = child.shared_memory.name
-                # priority=10 puts this ahead of surrounding-block prefetch tasks
-                # (which are submitted at default priority=0 by CachedDaskArray).
-                fut = child.main_window.dask_manager.client.submit(
-                    write_shared_array, current_img, shared_arr_name,
-                    priority=10,
-                )
-                # Hold the get_inds future ALIVE until its write completes. When the
-                # only client-side reference to a Future is dropped (the old
-                # `current_img = fut` reassign), distributed sends release-key to the
-                # scheduler; if the write task hasn't yet pulled its dependency, the
-                # get_inds task is cancelled → write cancelled. Stash it on the plot,
-                # keyed by the write future, and drop it when the write finishes.
-                _giF = current_img
-                child._inflight_getinds = getattr(child, "_inflight_getinds", {})
-                child._inflight_getinds[fut.key] = _giF
-                def _release_giF(f, _plot=child, _wkey=fut.key):
-                    try:
-                        _plot._inflight_getinds.pop(_wkey, None)
-                    except Exception:
-                        pass
-                try:
-                    fut.add_done_callback(_release_giF)
-                except Exception:
-                    pass
-                current_img = fut
+            # Dtype parity with the OLD distributed path. The synchronous cache
+            # branch runs everything through np.mean, so it returns float64 for
+            # BOTH a single point and a region — but the distributed path returned
+            # the native frame dtype (single point → the raw frame; region →
+            # weighted_mean_round_from_sums, which ROUNDS an integer result back to
+            # its dtype). So for an INTEGER source, round the float64 back to the
+            # frame dtype: a no-op on a single point's values, and the correct
+            # rounded integer mean for a region — so the DP navigator shows the
+            # SAME uint16 frame (same memory + contrast) it did before. Float
+            # sources keep their (un-rounded) mean. (benchmarks.md rounding gotcha.)
+            try:
+                src_dtype = getattr(current_signal.data, "dtype", None)
+                if (src_dtype is not None
+                        and np.issubdtype(src_dtype, np.integer)
+                        and np.issubdtype(current_img.dtype, np.floating)):
+                    current_img = np.rint(current_img).astype(src_dtype)
+            except Exception as _e:
+                log.debug("nav frame round-to-dtype failed: %s", _e)
     else:
         # Eager (in-RAM) slice. `indices` is either a single nav point (1-D,
         # from a crosshair after the mean-reduce above) or a list of nav points
