@@ -32,9 +32,9 @@ metadata_widget:
       default: "--"
       units: "fps"
     Frame time:
-      key: "Acquisition_instrument.TEM.exposure_time"
+      key: "Acquisition_instrument.Detector.integration_time"
       type: float
-      description: "Per-frame exposure / integration time."
+      description: "Per-frame integration time (else derived from the time axis)."
       default: "--"
       units: "s"
   Root Experiment Details:

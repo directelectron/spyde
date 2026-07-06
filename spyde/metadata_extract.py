@@ -117,10 +117,12 @@ def build_metadata_dict(signal_tree: "BaseSignalTree") -> dict[str, dict[str, st
     except Exception as e:
         log.debug("building Dataset metadata subsection failed: %s", e)
 
-    # Movie fps / frame time: prefer the explicit metadata key (filled above), but
-    # if it's absent and the leading navigation axis is a calibrated TIME axis
-    # (an in-situ movie: name "time" / units in seconds), DERIVE fps = 1/scale and
-    # the frame time = scale so a calibrated movie shows real numbers instead of "--".
+    # Movie fps / frame time: prefer the explicit metadata key (filled above). If
+    # it's absent and the leading navigation axis is calibrated in a KNOWN time
+    # unit, DERIVE fps = 1/(scale in seconds) so a calibrated movie shows real
+    # numbers instead of "--". We require a recognised time UNIT (not just a
+    # "time"-ish name) and convert it to seconds — deriving from an unconvertible
+    # unit (or a bare uncalibrated name) would show a wrong fps, worse than "--".
     try:
         movie = subsections.get("Movie / In-Situ")
         if movie is not None:
@@ -128,20 +130,26 @@ def build_metadata_dict(signal_tree: "BaseSignalTree") -> dict[str, dict[str, st
             am = sig.axes_manager
             if am.navigation_dimension >= 1:
                 ax = am.navigation_axes[0]
-                name = str(getattr(ax, "name", "") or "").strip().lower()
                 units = str(getattr(ax, "units", "") or "").strip().lower()
                 scale = float(getattr(ax, "scale", 0.0) or 0.0)
-                is_time = name in ("time", "t") or units in (
-                    "s", "sec", "secs", "second", "seconds")
-                # Only fill when the YAML key gave nothing (value starts with "--").
-                if is_time and scale > 0:
-                    per_frame_s = scale
-                    if units in ("ms", "millisecond", "milliseconds"):
-                        per_frame_s = scale / 1000.0
-                    if movie.get("FPS", "").startswith("--"):
-                        movie["FPS"] = f"{1.0 / per_frame_s:.3g} fps"
-                    if movie.get("Frame time", "").startswith("--"):
-                        movie["Frame time"] = f"{per_frame_s:.3g} s"
+                # Unit → seconds factor. Covers every unit the loader treats as a
+                # movie time axis (_session_files._TIME_AXIS_UNITS); an unlisted
+                # unit yields no derivation (stays "--").
+                to_seconds = {
+                    "s": 1.0, "sec": 1.0, "secs": 1.0,
+                    "second": 1.0, "seconds": 1.0,
+                    "ms": 1e-3, "millisecond": 1e-3, "milliseconds": 1e-3,
+                    "us": 1e-6, "µs": 1e-6, "microsecond": 1e-6, "microseconds": 1e-6,
+                    "min": 60.0, "minute": 60.0, "minutes": 60.0,
+                }.get(units)
+                if to_seconds is not None and scale > 0:
+                    per_frame_s = scale * to_seconds
+                    if per_frame_s > 0:
+                        # Only fill when the YAML key gave nothing ("-- …").
+                        if movie.get("FPS", "").startswith("--"):
+                            movie["FPS"] = f"{1.0 / per_frame_s:.3g} fps"
+                        if movie.get("Frame time", "").startswith("--"):
+                            movie["Frame time"] = f"{per_frame_s:.3g} s"
     except Exception as e:
         log.debug("deriving movie fps from time axis failed: %s", e)
 

@@ -59,6 +59,37 @@ class TestMovieMetadata:
         md = build_metadata_dict(_Tree(_movie(units="ms", scale=50.0)))
         assert "20" in md["Movie / In-Situ"]["FPS"]
 
+    def test_microsecond_units_converted(self):
+        # 50 us/frame → 20000 fps (must NOT be mis-read as 0.02 fps / seconds).
+        md = build_metadata_dict(_Tree(_movie(units="us", scale=50.0)))
+        fps = md["Movie / In-Situ"]["FPS"]
+        assert "2e+04" in fps or "20000" in fps, fps
+
+    def test_minute_units_converted(self):
+        # 0.5 min/frame → 30 s/frame → 0.0333 fps (not 2 fps).
+        md = build_metadata_dict(_Tree(_movie(units="min", scale=0.5)))
+        movie = md["Movie / In-Situ"]
+        assert "0.0333" in movie["FPS"] or "0.033" in movie["FPS"], movie["FPS"]
+        assert "30" in movie["Frame time"], movie["Frame time"]
+
+    def test_unknown_time_unit_does_not_derive(self):
+        # A "time"-named axis with an unconvertible unit shows "--" rather than a
+        # wrong number (better to say nothing than lie).
+        md = build_metadata_dict(_Tree(_movie(name="time", units="frames", scale=2.0)))
+        assert md["Movie / In-Situ"]["FPS"].startswith("--")
+
+    def test_zero_scale_does_not_divide(self):
+        md = build_metadata_dict(_Tree(_movie(units="sec", scale=0.0)))
+        assert md["Movie / In-Situ"]["FPS"].startswith("--")
+
+    def test_explicit_key_wins_over_time_axis(self):
+        # BOTH a calibrated time axis AND an explicit fps key present → key wins.
+        s = _movie(name="time", units="sec", scale=0.1)   # would derive 10 fps
+        s.metadata.set_item("Acquisition_instrument.TEM.frames_per_second", 700.0)
+        md = build_metadata_dict(_Tree(s))
+        fps = md["Movie / In-Situ"]["FPS"]
+        assert "700" in fps and "10" not in fps.replace("700", ""), fps
+
     def test_explicit_fps_key_preferred(self):
         s = _movie(name="z", units="<undefined>", scale=1.0)   # not a time axis
         s.metadata.set_item("Acquisition_instrument.TEM.frames_per_second", 25.0)
