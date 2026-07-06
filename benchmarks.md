@@ -395,3 +395,29 @@ So we keep the full dask graph (crop/rebin/zspy all read through one path) and o
 the async layer via the executor already in `ComputeBackend`. ~5.5x faster per frame
 than the current distributed live-display call, and crop-then-scrub is free. This is
 the basis for the Phase-2 movie navigator read.
+
+### 4D-STEM DP nav A/B: DO NOT unify onto submit_graph (2026-07-05)
+
+Gate benchmark before unifying the 4D-STEM diffraction-pattern navigator onto
+submit_graph (`benchmark_nav_read_ab.py`, real 4D-STEM `20241219_29674_movie_movie.mrc`,
+300×648 nav × 128² DP). Correctness: submit_graph of `raw[iy,ix]` (single) /
+`raw[pts].mean(0)` **float64** (region) matches hyperspy `get_index(sum_data=True)`
+exactly — the region result is the un-rounded float64 mean, NOT cast to frame dtype.
+
+| case | current `get_index` | submit_graph |
+|---|---:|---:|
+| single point | **1.2 ms** | 24.6 ms |
+| region (25 pts, integrating) | **3.5 ms** | 52.0 ms |
+
+**The two navigator paths have OPPOSITE optimal strategies:**
+- **4D-STEM DP**: navigation dwells WITHIN a nav chunk (adjacent probe positions
+  share a 32×32 chunk). `get_index` caches the loaded chunk in numpy, so ~every move
+  is a ~1 ms cache hit. submit_graph re-walks the graph + re-reads from disk each
+  move (~24 ms) → **~15-20x slower**. Do NOT unify — it would badly regress the DP
+  live display (CLAUDE.md §1-4).
+- **Movie**: consecutive frames are in DIFFERENT chunks (1 frame/chunk), so the
+  get_index chunk cache never helps; submit_graph's direct read wins (46 vs 251 ms).
+
+**Conclusion:** keep the distributed+shm+cache path for the 4D-STEM DP navigator;
+use submit_graph for the MOVIE navigator only. The Phase-2 read is chosen by which
+axis is navigated, not one-size-fits-all.
