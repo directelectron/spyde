@@ -67,6 +67,78 @@ _SHARED_MEMORY_SUPPORTED = True
 # to turn the navigator trace back on.
 _NAV_TIMING = _os.environ.get("SPYDE_NAV_TIMING") == "1"
 
+
+class _MoviePrefetcher:
+    """Warm the OS page cache for the frames a movie scrub is about to reach.
+
+    A cold single-frame read of a large in-situ movie is disk-bound (~50 ms);
+    once the file pages are in the OS cache a re-read is ~18 ms (benchmarks.md).
+    After the navigator paints frame ``t`` this reads a few upcoming frames
+    (``t±1 … t±radius``) on a single background daemon thread, purely to trigger
+    the page-in — so a steady scrub/playback finds each next frame already warm.
+
+    Safety: it reads the **raw dask array directly**
+    (``raw[i].compute(scheduler="synchronous")``), NOT the ``CachedDaskArray`` the
+    navigator read uses — so it never touches hyperspy's (non-concurrency-safe)
+    cache bookkeeping (CLAUDE.md §4). The OS page cache it warms is process-global
+    and thread-safe. Latest-center-wins: a new ``prime`` replaces the pending
+    target set, so a fast scrub doesn't pile up stale reads.
+    """
+
+    def __init__(self, radius: int = 3) -> None:
+        self._radius = radius
+        self._lock = threading.Lock()
+        self._raw = None            # the raw dask array (movie frames)
+        self._center = 0
+        self._n = 0
+        self._pending = False
+        self._wake = threading.Event()
+        self._thread = None
+
+    def prime(self, raw, center: int, n_time: int) -> None:
+        """Queue a prefetch around ``center`` (latest-wins). No-op if disabled."""
+        with self._lock:
+            self._raw = raw
+            self._center = int(center)
+            self._n = int(n_time)
+            self._pending = True
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._run, name="movie-prefetch", daemon=True)
+                self._thread.start()
+        self._wake.set()
+
+    def _run(self) -> None:
+        while True:
+            self._wake.wait()
+            with self._lock:
+                self._wake.clear()
+                if not self._pending:
+                    continue
+                self._pending = False
+                raw, center, n = self._raw, self._center, self._n
+            if raw is None or n <= 0:
+                continue
+            # Read outward from the center: t+1, t-1, t+2, … to `radius`.
+            order = []
+            for d in range(1, self._radius + 1):
+                order.append(center + d)
+                order.append(center - d)
+            for i in order:
+                if self._wake.is_set():
+                    break               # a newer center arrived — abandon this set
+                if 0 <= i < n:
+                    try:
+                        # Touch the frame to page it into the OS cache. The result
+                        # is discarded; we only want the disk read to have happened.
+                        raw[int(i)].compute(scheduler="synchronous")
+                    except Exception as e:
+                        log.debug("movie prefetch of frame %d failed: %s", i, e)
+
+
+# One prefetcher for the whole process (movie navigation is serial).
+_movie_prefetcher = _MoviePrefetcher()
+
 def write_shared_array(data, shared_arr_name):
     dtype_bytes = data.dtype.str.encode('utf-8')
     dtype_length = len(dtype_bytes)
@@ -346,6 +418,25 @@ def update_from_navigation_selection(
                     current_img = np.rint(current_img).astype(src_dtype)
             except Exception as _e:
                 log.debug("nav frame round-to-dtype failed: %s", _e)
+
+            # Read-ahead prefetch for a MOVIE scrub: warm the OS page cache for
+            # the next few frames so the following move finds them warm (~18 ms
+            # vs ~50 ms cold — benchmarks.md). Only for a 1-D (time) navigator on
+            # a crosshair (single point): a 4D-STEM scan dwells in-chunk so its
+            # cache already covers neighbours, and an integrating region has no
+            # single "next frame". Reads the RAW dask array (not the CachedDaskArray)
+            # so it never races the nav read's cache (§4).
+            try:
+                am = current_signal.axes_manager
+                _idx = np.asarray(indices)
+                is_single = (not selector.is_integrating) or _idx.ndim <= 1
+                if (am.navigation_dimension == 1 and is_single
+                        and hasattr(current_signal.data, "shape")):
+                    n_time = int(current_signal.data.shape[0])
+                    center = int(np.atleast_1d(_idx).ravel()[0])
+                    _movie_prefetcher.prime(current_signal.data, center, n_time)
+            except Exception as _e:
+                log.debug("movie prefetch prime failed: %s", _e)
     else:
         # Eager (in-RAM) slice. `indices` is either a single nav point (1-D,
         # from a crosshair after the mean-reduce above) or a list of nav points

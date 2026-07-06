@@ -446,6 +446,26 @@ than today — no shm buffer, no distributed-client pinning, no `_inflight_getin
 juggling — and must run on the serial `_NavDispatcher` (CLAUDE.md §4: the cache is
 not concurrency-safe; the dispatcher already serialises). This is the Phase-2 design.
 
+### LOD decimation + read-ahead prefetch (Phase 3, 2026-07-05)
+
+Two wins for a large-movie scrub, both benchmark-driven on the real 4k movie:
+
+- **LOD (transport):** strided *reads* do NOT save disk I/O on a contiguous memmap
+  (`raw[t,::4,::4]` = 45 ms vs 47 ms full — the OS reads full pages regardless), but
+  decimating an already-read frame in numpy is ~1 ms and cuts the base64-in-JSON
+  transport (the dominant per-frame cost) by the square of the stride. So
+  `Plot._set_array` decimates any frame whose longest side > 1536 px (4096→1366,
+  stride 3; 8192→1366, stride 6) before the wire, subsampling the axes identically
+  to keep the scale bar calibrated. A DP frame (≤1536) is untouched.
+- **Prefetch (cold read):** a warm (already-paged) frame re-reads in ~18 ms vs ~50 ms
+  cold. `_MoviePrefetcher` reads t±1…t±3 on a background thread after each movie move
+  to warm the OS page cache, so a steady scrub finds the next frame warm. It reads the
+  RAW dask array (not the CachedDaskArray) so it never races the nav read's cache.
+
+Verified in the real app: movie scrub 5/5 moves repaint a fresh decimated 4k frame
+(scale bar correct) in ~23 s incl. cold load; LOD + prefetch coexist with no DP
+regression.
+
 ### Real-cluster (`--distributed`) A/B + a rounding gotcha (2026-07-05)
 
 Ran the A/B against a real `LocalCluster(processes=True)` (CLAUDE.md: won't run in
