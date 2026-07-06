@@ -31,15 +31,14 @@ export function startSpyDE(
   const [cmd, ...args] = pythonCmd
   proc = spawn(cmd, args, {
     cwd,   // run from the repo root so `uv run` finds spyde's pyproject.toml
-    // APL_BINARY_TRANSPORT: anyplotlib ships large image pixels as raw PLOTBIN
+    // APL_BINARY_TRANSPORT=1: anyplotlib ships large image pixels as raw PLOTBIN
     // binary frames (no base64/JSON) which this runner demuxes — see the stdout
-    // parser below. WIP: the framing + demux are solid (tested), but the
-    // render-side geom-merge still has a paint bug, so it's OFF by default until
-    // that's fixed. Set APL_BINARY_TRANSPORT=1 in the env to opt in for debugging.
+    // parser below. Verified end-to-end (pixel-correct via GPU readback); cuts the
+    // ~200 ms/frame base64+JSON+atob transport on a 4k movie. Set to "0" to force
+    // the base64 fallback.
     env: {
       ...process.env, PYTHONUNBUFFERED: '1',
-      ...(process.env.APL_BINARY_TRANSPORT
-        ? { APL_BINARY_TRANSPORT: process.env.APL_BINARY_TRANSPORT } : {}),
+      APL_BINARY_TRANSPORT: process.env.APL_BINARY_TRANSPORT ?? '1',
     },
     stdio: ['pipe', 'pipe', 'pipe'],
   })

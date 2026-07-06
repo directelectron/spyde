@@ -42,8 +42,10 @@ test('binary pixel transport is active and paints frames', async () => {
 
   // SpyDE sets APL_BINARY_TRANSPORT=1 for the backend itself (runner.ts); the
   // harness inherits it. Force it here too so the test is self-describing.
+  // SPYDE_LOG_LEVEL=INFO tees the "binary transport active" marker to stderr where
+  // the harness captures it.
   const { app, page, backend, assertNoJsErrors } = await launchApp({
-    dask: true, env: { APL_BINARY_TRANSPORT: '1' },
+    dask: true, env: { APL_BINARY_TRANSPORT: '1', SPYDE_LOG_LEVEL: 'INFO' },
   })
   try {
     await page.waitForTimeout(1500)
@@ -68,7 +70,7 @@ test('binary pixel transport is active and paints frames', async () => {
     // This is unambiguous proof the binary path is live (the base64 path never
     // emits it).
     const binLine = backend.logBuffer.find((l: string) =>
-      l.includes('[apl] binary transport active'))
+      l.includes('binary transport active: PLOTBIN'))
     console.log('backend binary marker:', binLine || '(none)')
     expect(binLine,
       'backend never emitted a PLOTBIN binary frame — binary transport not active',
