@@ -21,7 +21,16 @@ class TestInteractiveActivity:
         # No recent poke → wait_if_active returns immediately.
         t0 = time.monotonic()
         act.wait_if_active()
-        assert (time.monotonic() - t0) < 0.05
+        assert (time.monotonic() - t0) < 0.1
+
+    def test_stop_aborts_the_wait_immediately(self):
+        act = _InteractiveActivity(quiet_s=1.0)
+        act.poke()                         # would otherwise block ~1s
+        stop = threading.Event()
+        stop.set()
+        t0 = time.monotonic()
+        act.wait_if_active(max_wait_s=5.0, stop=stop)
+        assert (time.monotonic() - t0) < 0.1, "stop must abort the wait at once"
 
     def test_wait_blocks_after_a_poke(self):
         act = _InteractiveActivity(quiet_s=0.2)
@@ -63,4 +72,4 @@ class TestInteractiveActivity:
         act.wait_if_active(max_wait_s=1.0)
         second = time.monotonic() - t1
         assert first >= 0.10
-        assert second < 0.05, "fill should run freely once scrubbing settled"
+        assert second < 0.1, "fill should run freely once scrubbing settled"

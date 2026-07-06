@@ -141,16 +141,25 @@ _movie_prefetcher = _MoviePrefetcher()
 
 
 class _InteractiveActivity:
-    """Lets a heavy background disk reader (the progressive navigator/VI fill)
-    YIELD to interactive navigation. For a large movie the navigator sum reads the
-    WHOLE file from disk (tens of seconds); that read saturates disk bandwidth and
-    starves the crosshair's own per-frame read, so the signal plot appears frozen
-    while the navigator fills ("plot doesn't update while VI computes").
+    """Lets a heavy MAIN-PROCESS background disk reader YIELD to interactive
+    navigation. For a large movie the threaded navigator sum reads the WHOLE file
+    from disk on a background thread (tens of seconds); that read saturates disk
+    bandwidth and starves the crosshair's own per-frame read, so the signal plot
+    appears frozen while the navigator fills ("plot doesn't update while the
+    navigator computes").
 
     The nav read `poke()`s this on every move; the background fill calls
     `wait_if_active()` between chunks, which blocks briefly while scrubbing is
     recent so the interactive frame read gets the disk first. The fill is only
-    slowed while the user is actively moving — it resumes as soon as they pause."""
+    slowed while the user is actively moving — it resumes as soon as they pause.
+
+    Scope: this only helps a reader that (a) runs in THIS process and (b) has a
+    per-chunk loop to yield between — i.e. the THREADED progressive navigator fill
+    (`_bg_nav`, no-cluster path). The DISTRIBUTED progressive fill reads on the
+    Dask worker PROCESSES (a main-thread yield can't throttle them), and the
+    single-shot VI fallback (`stream_progressive_to_plot`, client is None) is one
+    blocking `.compute()` with nothing to yield between — neither is preempted by
+    this. Pass a stop event to abort the wait promptly on teardown if needed."""
 
     def __init__(self, quiet_s: float = 0.35) -> None:
         self._quiet = quiet_s
@@ -161,11 +170,16 @@ class _InteractiveActivity:
         with self._lock:
             self._last = time.monotonic()
 
-    def wait_if_active(self, max_wait_s: float = 2.0) -> None:
-        """Block while interactive activity is recent (up to ``max_wait_s`` so a
-        continuous drag can't starve the fill forever)."""
+    def wait_if_active(self, max_wait_s: float = 2.0, stop=None) -> None:
+        """Block while interactive activity is recent (up to ``max_wait_s`` PER
+        CALL so a continuous drag can't starve the fill forever — note the caller
+        loops this per chunk, so under a sustained drag the fill advances one chunk
+        per ``max_wait_s``). Returns immediately if ``stop`` is set, so a torn-down
+        fill aborts the wait at once instead of lingering up to ``max_wait_s``."""
         deadline = time.monotonic() + max_wait_s
         while True:
+            if stop is not None and stop.is_set():
+                return
             with self._lock:
                 idle = time.monotonic() - self._last
             if idle >= self._quiet or time.monotonic() >= deadline:

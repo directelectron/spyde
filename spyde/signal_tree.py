@@ -194,7 +194,10 @@ class BaseSignalTree:
                         # starves the crosshair's own frame read (the signal plot
                         # freezes while the navigator fills). Pause briefly while
                         # the user is actively moving; resume when they settle.
-                        _interactive_activity.wait_if_active()
+                        # Under a sustained drag this advances ~one chunk per the
+                        # wait cap (interaction wins, but the fill still finishes).
+                        # `stop` aborts the wait promptly on teardown.
+                        _interactive_activity.wait_if_active(stop=_stop)
                         nav_slices = tuple(slice(s, s + n) for s, n in combo)
                         logger.debug("NAV-DEBUG threaded nav chunk %s computing", nav_slices)
                         block = np.asarray(_dask[nav_slices].compute()).astype(np.float32)
