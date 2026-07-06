@@ -78,6 +78,7 @@ STAGED_HANDLERS: dict[str, str] = {
     "czb_set_region":      "spyde.actions.center_zero_beam.czb_set_region",
     "czb_close":           "spyde.actions.center_zero_beam.czb_close",
     "set_log_level":       "spyde.backend.log_stream.set_log_level",
+    "set_debug_flag":      "spyde.backend.debug_flags.set_debug_flag",
     "get_gpu_status":      "spyde.actions.gpu_status.get_gpu_status",
     "set_update_channel":  "spyde.backend.session.dispatch_set_update_channel",
 }

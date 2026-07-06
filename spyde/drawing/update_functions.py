@@ -67,19 +67,20 @@ _SHARED_MEMORY_SUPPORTED = True
 # to turn the navigator trace back on.
 _NAV_TIMING = _os.environ.get("SPYDE_NAV_TIMING") == "1"
 
-# Per-frame UPDATE PROFILE: set SPYDE_NAV_PROFILE=1 to log ONE compact timing line
-# per navigator update, at INFO (so it reaches stderr / the Log panel without full
-# DEBUG). It breaks the per-frame cost into stages — read (cache/disk), dtype
-# round, prefetch prime, LOD decimate, contrast levels, transport (anyplotlib
-# set_data → base64 → stdout emit) — so a "the update is slow" report shows exactly
-# WHICH stage dominates. Kept separate from _NAV_TIMING (which is the noisy
-# per-move index/cache trace). See NavProfile below.
-_NAV_PROFILE = _os.environ.get("SPYDE_NAV_PROFILE") == "1"
+# Per-frame UPDATE PROFILE: logs ONE compact timing line per navigator update, at
+# INFO (so it reaches the Log panel without full DEBUG). It breaks the per-frame
+# cost into stages — read (cache/disk), dtype round, prefetch prime, LOD decimate,
+# contrast levels, transport (anyplotlib set_data → base64 → stdout emit) — so a
+# "the update is slow" report shows exactly WHICH stage dominates. Toggle it LIVE
+# from the Log panel's "Profile" button (or SPYDE_NAV_PROFILE=1 at startup) — the
+# state lives in backend.debug_flags.nav_profile_on(), read fresh each frame. Kept
+# separate from _NAV_TIMING (the noisy per-move index/cache trace). See NavProfile.
+from spyde.backend.debug_flags import nav_profile_on as _nav_profile_on
 
 
 class NavProfile:
     """Accumulates per-stage timings for one navigator update and logs a single
-    compact line. No-op unless SPYDE_NAV_PROFILE=1, so it's free in normal use.
+    compact line. No-op unless nav profiling is on, so it's free in normal use.
 
     Usage:
         prof = NavProfile("SIG", indices)
@@ -91,7 +92,7 @@ class NavProfile:
     __slots__ = ("_on", "_label", "_idx", "_stages", "_t0", "_frame_shape")
 
     def __init__(self, label: str, indices=None) -> None:
-        self._on = _NAV_PROFILE
+        self._on = _nav_profile_on()
         self._label = label
         self._idx = None
         self._stages: "list[tuple[str, float]]" = []
@@ -154,7 +155,7 @@ def _nav_cache_was_hit(signal, indices) -> bool:
     block); a MISS reads the chunk off disk. Used only for the profile line —
     returns False if it can't tell (no cache yet / probe failed), never raises.
     Cheap and side-effect-free: it only inspects the cache's block-index list."""
-    if not _NAV_PROFILE:
+    if not _nav_profile_on():
         return False
     try:
         cache = getattr(signal, "cached_dask_array", None)

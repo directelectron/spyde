@@ -33,15 +33,15 @@ if TYPE_CHECKING:
 import logging
 logger = logging.getLogger(__name__)
 
-import os as _os
 import time as _time
-# Per-frame PAINT profile (the transport/render half of a navigator update): set
-# SPYDE_NAV_PROFILE=1 to log one line per _set_array with the paint stages — LOD
-# decimate, contrast levels, and transport (anyplotlib set_data → base64 → stdout
-# emit, usually the dominant cost for a large frame). Pairs with the [NAV-PROFILE]
-# read line from update_functions so a "slow update" report shows the WHOLE
-# pipeline (read + paint). No-op unless the flag is set.
-_NAV_PROFILE = _os.environ.get("SPYDE_NAV_PROFILE") == "1"
+# Per-frame PAINT profile (the transport/render half of a navigator update): logs
+# one line per _set_array with the paint stages — LOD decimate, contrast levels,
+# and transport (anyplotlib set_data → base64 → stdout emit, usually the dominant
+# cost for a large frame). Pairs with the [NAV-PROFILE] read line from
+# update_functions so a "slow update" report shows the WHOLE pipeline (read +
+# paint). Toggle live from the Log panel's "Profile" button; state lives in
+# backend.debug_flags (read fresh each frame). No-op when off.
+from spyde.backend.debug_flags import nav_profile_on as _nav_profile_on
 
 
 # Level-of-detail cap for a displayed 2-D frame. A large in-situ movie frame
@@ -424,7 +424,8 @@ class Plot:
             return False
 
     def _set_array(self, data: np.ndarray, levels=None) -> None:
-        # Paint-side per-frame profile (no-op unless SPYDE_NAV_PROFILE=1).
+        # Paint-side per-frame profile — read the live toggle once per frame.
+        _NAV_PROFILE = _nav_profile_on()
         _p0 = _time.perf_counter() if _NAV_PROFILE else 0.0
         _pt = {} if _NAV_PROFILE else None       # stage -> seconds
         _in_shape = getattr(data, "shape", None)
