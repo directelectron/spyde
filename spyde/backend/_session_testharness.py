@@ -258,12 +258,27 @@ class TestHarnessMixin:
                 d = getattr(child, "current_data", None)
                 return type(d).__name__
 
+            def _set_pos(sel_obj, x, y):
+                """Move the navigator widget to (x, y). A 2-D navigator crosshair
+                uses cx/cy; a 1-D (movie/time) navigator is an InfiniteLineSelector
+                wrapping a VLineWidget with a single .x — set that (y is ignored).
+                The composite IntegratingSelector1D delegates to its active inner
+                selector via .selector."""
+                inner = getattr(sel_obj, "selector", sel_obj)
+                w = getattr(inner, "_widget", None) or getattr(sel_obj, "_widget", None)
+                if w is None:
+                    raise RuntimeError("selector has no widget")
+                if hasattr(w, "cx"):          # 2-D crosshair
+                    w.cx = float(x)
+                    w.cy = float(y)
+                else:                          # 1-D VLineWidget (time axis)
+                    w.x = float(x)
+
             results = []
             prev = _frame_sig()
             for (x, y) in targets:
                 try:
-                    cross._widget.cx = float(x)
-                    cross._widget.cy = float(y)
+                    _set_pos(cross, x, y)
                 except Exception as e:
                     results.append({"x": x, "y": y, "changed": False, "err": str(e)})
                     continue

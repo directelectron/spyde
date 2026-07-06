@@ -275,15 +275,62 @@ class FileLoaderMixin:
         the scan-shape prompt (for ambiguous raw .mrc/.tif) should be skipped."""
         return _path_ext(path) in (".zspy", ".zarr", ".hspy")
 
-    @staticmethod
-    def _wants_nav_prompt(sig: BaseSignal) -> bool:
+    # Axis names identifying a MOVIE / sequential-stack leading axis (NOT a
+    # foldable spatial scan): a TIME axis (DE-MRC non-scanning movies →
+    # name="time", units="sec") OR a generic stack index (name "z"/"index"/
+    # "stack"/"frame"/"slice", which DE movies use). For any of these, folding
+    # the stack into a 2-D scan grid or stamping a spatial nm step is wrong.
+    _TIME_AXIS_NAMES = ("time", "t", "frame", "frames", "z", "index", "stack",
+                        "slice", "image", "images")
+    _TIME_AXIS_UNITS = ("s", "sec", "secs", "second", "seconds", "ms",
+                        "millisecond", "milliseconds", "us", "µs", "min", "minute")
+    # A movie frame is a real IMAGE; a raw 4D-STEM DP stack has small detector
+    # frames. Frames at least this size (either axis) are treated as movie images
+    # even if the axis name is uninformative — a fold-to-grid prompt on a
+    # 2048²+ "diffraction pattern" is never what the user wants.
+    _MOVIE_MIN_FRAME_PX = 1024
+
+    @classmethod
+    def _is_movie_time_axis(cls, sig: BaseSignal) -> bool:
+        """True when the dataset is an in-situ MOVIE / image stack: nav-dim 1 with
+        2-D image frames, whose single navigation axis is a time/stack axis (by
+        name or units) OR whose frames are large images (≥ _MOVIE_MIN_FRAME_PX).
+        Such a dataset opens straight as a movie — NOT folded into a 2-D scan grid,
+        and NOT given a spatial step on its sequence axis (the prompt does both)."""
+        try:
+            am = sig.axes_manager
+            if am.signal_dimension != 2 or am.navigation_dimension != 1:
+                return False
+            ax = am.navigation_axes[0]
+            name = str(getattr(ax, "name", "") or "").strip().lower()
+            units = str(getattr(ax, "units", "") or "").strip().lower()
+            if units in ("<undefined>",):
+                units = ""
+            if name in cls._TIME_AXIS_NAMES or units in cls._TIME_AXIS_UNITS:
+                return True
+            # Large image frames → a movie regardless of the (uninformative) name.
+            sh = tuple(int(s) for s in am.signal_shape)
+            return bool(sh) and max(sh) >= cls._MOVIE_MIN_FRAME_PX
+        except Exception:
+            return False
+
+    @classmethod
+    def _wants_nav_prompt(cls, sig: BaseSignal) -> bool:
         """True for a signal where confirming the scan shape + step size is
         useful: a 2-D-signal dataset that is either already navigated (4D-STEM)
         or a flat stack of images (nav-dim 1) that the user may want to fold into
-        a 2-D scan grid."""
+        a 2-D scan grid.
+
+        A calibrated in-situ MOVIE (nav-dim 1, time axis) is EXCLUDED — it opens
+        straight as a movie with its time navigator, no fold-to-grid prompt (which
+        would otherwise stamp a spatial nm step on the time axis)."""
         try:
             am = sig.axes_manager
-            return am.signal_dimension == 2 and am.navigation_dimension >= 1
+            if not (am.signal_dimension == 2 and am.navigation_dimension >= 1):
+                return False
+            if cls._is_movie_time_axis(sig):
+                return False
+            return True
         except Exception:
             return False
 

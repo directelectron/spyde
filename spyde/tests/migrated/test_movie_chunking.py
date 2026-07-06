@@ -100,6 +100,47 @@ class TestAdaptiveChunking:
         assert ch == (1, -1, -1)
 
 
+class TestMoviePromptSkip:
+    """A movie / image stack must NOT get the fold-into-scan-grid prompt (which
+    would stamp a spatial nm step on its sequence axis)."""
+
+    def _sig(self, n, frame, nav_name="z", nav_units="<undefined>"):
+        arr = da.zeros((n,) + frame, dtype=np.uint8, chunks=(1,) + frame)
+        s = hs.signals.Signal2D(arr).as_lazy()
+        ax = s.axes_manager.navigation_axes[0]
+        ax.name, ax.units = nav_name, nav_units
+        return s
+
+    def test_time_axis_movie_skips_prompt(self):
+        s = self._sig(50, (256, 256), nav_name="time", nav_units="sec")
+        assert Session._is_movie_time_axis(s) is True
+        assert Session._wants_nav_prompt(s) is False
+
+    def test_z_stack_skips_prompt(self):
+        # DE movies label the leading axis 'z', units undefined.
+        s = self._sig(977, (256, 256), nav_name="z")
+        assert Session._is_movie_time_axis(s) is True
+        assert Session._wants_nav_prompt(s) is False
+
+    def test_large_image_frames_skip_prompt_even_if_axis_unnamed(self):
+        s = self._sig(100, (4096, 4096), nav_name="")
+        assert Session._is_movie_time_axis(s) is True
+        assert Session._wants_nav_prompt(s) is False
+
+    def test_small_dp_stack_still_prompts(self):
+        # A flat 1-D stack of SMALL diffraction patterns with a scan-like axis
+        # name is still foldable into a grid → keep the prompt.
+        s = self._sig(400, (128, 128), nav_name="x")
+        assert Session._is_movie_time_axis(s) is False
+        assert Session._wants_nav_prompt(s) is True
+
+    def test_4dstem_scan_still_prompts(self):
+        arr = da.zeros((20, 128, 128), dtype=np.uint16, chunks=(1, 128, 128))
+        s = hs.signals.Signal2D(arr).as_lazy()
+        s.axes_manager.navigation_axes[0].name = "x"
+        assert Session._wants_nav_prompt(s) is True
+
+
 class TestMovieFixture:
     def test_movie_opens_with_1d_time_navigator(self, movie_dataset):
         session = movie_dataset["window"]
