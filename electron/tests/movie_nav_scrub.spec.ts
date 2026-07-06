@@ -45,7 +45,10 @@ test('scrubbing the in-situ movie time navigator paints a fresh frame each move'
   // process consumes, so it is NOT reliably visible to the test.
   const { app, page, backend, assertNoJsErrors } = await launchApp({
     dask: true,
-    env: { SPYDE_LOG_LEVEL: 'INFO' },
+    // DEBUG so the "[REDRAW] test_nav_drag" verdict AND the per-frame
+    // "[plot-paint] SIG hash=" lines (used to count distinct played frames) both
+    // tee to stderr where the harness log buffer captures them.
+    env: { SPYDE_LOG_LEVEL: 'DEBUG' },
   })
   try {
     // Load the real movie by path (the user's open-file path). A large first
@@ -87,6 +90,34 @@ test('scrubbing the in-situ movie time navigator paints a fresh frame each move'
       changed,
       `movie frame updated only ${changed}/${total} scrub moves — frozen/stale`,
     ).toBeGreaterThanOrEqual(total - 1)
+
+    // ── Playback: Play advances the time navigator on a frame clock ──────────
+    // Fire the backend `playback` action (play at 8 fps), let it run ~1.2 s
+    // (~8-10 frames), then pause and confirm the signal plot repainted distinct
+    // frames while playing. We count distinct [plot-paint] SIG content hashes
+    // captured from the backend log during the play window.
+    const hashesBefore = backend.logBuffer.filter((l: string) =>
+      l.includes('[plot-paint] SIG')).length
+    await backendAction(page, 'playback', { command: 'play', fps: 8 })
+    await page.waitForTimeout(1300)
+    await backendAction(page, 'playback', { command: 'pause' })
+    await page.waitForTimeout(200)
+    await page.screenshot({ path: 'movie_shots/02-movie-playing.png' })
+
+    const sigPaints = backend.logBuffer
+      .filter((l: string) => l.includes('[plot-paint] SIG'))
+      .slice(hashesBefore)
+    const hashes = new Set(
+      sigPaints.map((l: string) => (l.match(/hash=([0-9a-f]+)/) || [])[1]).filter(Boolean),
+    )
+    console.log(`\n===== PLAYBACK: ${sigPaints.length} SIG paints, ` +
+      `${hashes.size} distinct frames while playing =====`)
+    // Playback should have painted several DISTINCT frames (allow for a slower
+    // machine — at least 3 distinct frames in ~1.3 s of play).
+    expect(
+      hashes.size,
+      `playback painted only ${hashes.size} distinct frames — clock not advancing`,
+    ).toBeGreaterThanOrEqual(3)
 
     assertNoJsErrors()
   } finally {
