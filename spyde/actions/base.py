@@ -66,6 +66,41 @@ def add_selector(toolbar: "ActionContext", toggled=None, *args, **kwargs):
         mgr.add_navigation_selector_and_signal_plot(toolbar.plot_window)
 
 
+# ── Movie playback (on the 1-D time navigator) ───────────────────────────────
+
+def _session_of(toolbar: "ActionContext"):
+    return getattr(getattr(toolbar, "plot", None), "session", None)
+
+
+def play_pause(toolbar: "ActionContext", toggled=None, *args, **kwargs):
+    """Toggle movie playback: start the frame clock (or pause it). A toggle
+    action — ``toggled`` is the requested on/off state from the renderer."""
+    session = _session_of(toolbar)
+    if session is None:
+        return
+    pb = session.playback
+    if toggled is None:
+        pb.toggle(**{k: v for k, v in kwargs.items() if k in ("fps", "step", "loop")})
+    elif toggled:
+        pb.play(**{k: v for k, v in kwargs.items() if k in ("fps", "step", "loop")})
+    else:
+        pb.pause()
+
+
+def fast_forward(toolbar: "ActionContext", toggled=None, *args, **kwargs):
+    """Toggle fast playback — a larger frame step (default 5x)."""
+    session = _session_of(toolbar)
+    if session is None:
+        return
+    step = kwargs.get("step", 5)
+    fps = kwargs.get("fps")
+    pb = session.playback
+    if toggled is False:
+        pb.pause()
+    else:
+        pb.toggle(fps=fps, step=int(step) if step else 5)
+
+
 def add_fft_selector(toolbar: "ActionContext", action_name="", *args, **kwargs):
     """Add an FFT selector: a RectangleSelector on the parent that computes the
     FFT of the selected region into a new plot window."""

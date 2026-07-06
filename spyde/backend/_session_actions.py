@@ -126,6 +126,8 @@ class ActionRouterMixin:
             self.open_stack(payload.get("paths") or [])
         elif action == "confirm_nav_shape":
             self._confirm_nav_shape(payload)
+        elif action == "playback":
+            self._handle_playback(payload)
         elif action == "set_signal_type":
             self._set_signal_type(plot, payload.get("signal_type", ""))
         elif action == "load_example":
@@ -310,6 +312,53 @@ class ActionRouterMixin:
             src._vi_items = [it for it in src._vi_items if it.get("name") != name]
         ipc.emit({"type": "sub_item", "window_id": window_id,
                   "action": parent, "name": name, "active": False})
+
+    @property
+    def playback(self):
+        """Lazily-created movie playback controller (one per session)."""
+        pb = getattr(self, "_playback", None)
+        if pb is None:
+            from spyde.actions.playback import MoviePlaybackController
+            pb = MoviePlaybackController(self)
+            self._playback = pb
+        return pb
+
+    def _handle_playback(self, payload: dict) -> None:
+        """Play / pause / fast-forward the movie time navigator. Commands:
+        ``play`` / ``pause`` / ``toggle`` / ``step`` (single frame) / ``set_fps`` /
+        ``set_step`` / ``fast_forward`` (toggle at a higher step)."""
+        cmd = payload.get("command", "toggle")
+        pb = self.playback
+        fps = payload.get("fps")
+        step = payload.get("step")
+        loop = payload.get("loop")
+        if cmd == "play":
+            pb.play(fps=fps, step=step, loop=loop)
+        elif cmd == "pause":
+            pb.pause()
+        elif cmd == "toggle":
+            pb.toggle(fps=fps, step=step, loop=loop)
+        elif cmd == "fast_forward":
+            # Toggle playback at a larger step (default 5x) — a "faster" play.
+            pb.toggle(fps=fps, step=step if step is not None else 5, loop=loop)
+        elif cmd == "step":
+            self._playback_single_step(int(step or 1))
+        elif cmd == "set_fps" and fps is not None:
+            pb.set_fps(fps)
+        elif cmd == "set_step" and step is not None:
+            pb.set_step(step)
+
+    def _playback_single_step(self, delta: int) -> None:
+        """Advance the time navigator by ``delta`` frames once (keyboard step)."""
+        pb = self.playback
+        sel, _tree = pb._time_selector()
+        if sel is None:
+            return
+        try:
+            sel.translate_pixels(int(delta))
+            sel.delayed_update_data(force=True)
+        except Exception as e:
+            log.debug("playback single-step failed: %s", e)
 
     def _update_vi(self, window_id: int, name: str, params: dict) -> None:
         """A per-VI caret edit — apply new detector params and recompute that

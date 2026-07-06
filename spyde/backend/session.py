@@ -550,6 +550,12 @@ class Session(
     # ── Shutdown ───────────────────────────────────────────────────────────────
 
     def shutdown(self) -> None:
+        pb = getattr(self, "_playback", None)
+        if pb is not None:
+            try:
+                pb.shutdown()
+            except Exception as e:
+                log.debug("playback shutdown failed: %s", e)
         self._plot_worker.stop()
         self.dask_manager.shutdown()
         for tmpdir in self._example_temp_paths:
