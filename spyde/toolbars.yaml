@@ -46,6 +46,38 @@ functions:
     plot_dim: [ 2 ]
     toolbar_side: bottom
     navigation: False
+  Crop:
+    description: Crop the dataset to a spatial (image) box and optional time range. Produces a smaller lazy dataset (no data copied). Leave a range at 0 to keep that axis whole.
+    icon: drawing/toolbars/icons/crop.svg
+    function: spyde.actions.base.CropAction
+    plot_dim: [ 2 ]
+    toolbar_side: bottom
+    navigation: False
+    parameters:
+      x0:
+        name: X start
+        type: int
+        default: 0
+      x1:
+        name: X end
+        type: int
+        default: 0
+      y0:
+        name: Y start
+        type: int
+        default: 0
+      y1:
+        name: Y end
+        type: int
+        default: 0
+      t0:
+        name: T start
+        type: int
+        default: 0
+      t1:
+        name: T end
+        type: int
+        default: 0
     toggle: True
   Center Zero Beam:
     description: Centers the zero beam in diffraction patterns (Automatic / Manual).

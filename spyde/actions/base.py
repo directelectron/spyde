@@ -149,3 +149,67 @@ class Rebin2DAction(TransformAction):
             raise RuntimeError("Current signal is not 2D, cannot rebin2d.")
         nav = signal.axes_manager.navigation_dimension
         return {"scale": [1] * nav + [int(scale_x), int(scale_y)]}
+
+
+# ── Crop ─────────────────────────────────────────────────────────────────────
+
+def _crop_signal(signal, x0=0, x1=0, y0=0, y1=0, t0=0, t1=0, **_):
+    """Crop a 2-D-signal dataset to a spatial (image) box and, for a movie /
+    navigated dataset, an optional leading-nav (time/first-nav-axis) range.
+
+    All slicing is by PIXEL INDEX via hyperspy ``isig`` / ``inav`` — a lazy dask
+    view (a graph op, no materialise), so a huge in-situ movie is trimmed to a
+    smaller lazy movie with no data read (memory-safety rule respected). Empty /
+    zero ranges mean "keep the full extent" on that axis, so a pure spatial crop
+    leaves the nav axis whole and vice-versa.
+
+    ``x0:x1`` / ``y0:y1`` are signal-axis (image column / row) pixel bounds;
+    ``t0:t1`` is the FIRST navigation axis (a movie's time / a scan's slow axis).
+    """
+    am = signal.axes_manager
+    sig_shape = tuple(int(s) for s in am.signal_shape)   # (x, y) display order
+    nav_shape = tuple(int(s) for s in am.navigation_shape)
+
+    def _bounds(lo, hi, n):
+        lo = int(lo or 0)
+        hi = int(hi or 0)
+        if hi <= 0 or hi > n:
+            hi = n
+        lo = max(0, min(lo, n - 1))
+        hi = max(lo + 1, min(hi, n))
+        return lo, hi
+
+    out = signal
+    if am.signal_dimension >= 2:
+        sx0, sx1 = _bounds(x0, x1, sig_shape[0])
+        sy0, sy1 = _bounds(y0, y1, sig_shape[1])
+        # isig indexes signal axes in display (x, y) order.
+        out = out.isig[sx0:sx1, sy0:sy1]
+    if am.navigation_dimension >= 1 and (int(t0 or 0) or int(t1 or 0)):
+        nt0, nt1 = _bounds(t0, t1, nav_shape[0])
+        # inav indexes the FIRST navigation axis (display order) — the movie time
+        # axis / the scan's slow axis.
+        out = out.inav[nt0:nt1]
+    return out
+
+
+class CropAction(TransformAction):
+    """Crop the dataset to a spatial (image) box + optional time range — a
+    TransformAction that adds a lazy "Cropped" node to the SAME tree. Nothing is
+    materialised (isig/inav are dask-view slices), so a multi-GB movie crops for
+    free. Zero ranges keep the full extent on that axis."""
+
+    name = "Crop"
+    function = staticmethod(_crop_signal)
+    node_name = "Cropped"
+    parameters = {
+        "x0": {"default": 0},
+        "x1": {"default": 0},
+        "y0": {"default": 0},
+        "y1": {"default": 0},
+        "t0": {"default": 0},
+        "t1": {"default": 0},
+    }
+
+    def build_kwargs(self, signal, x0=0, x1=0, y0=0, y1=0, t0=0, t1=0, **_):
+        return {"x0": x0, "x1": x1, "y0": y0, "y1": y1, "t0": t0, "t1": t1}
