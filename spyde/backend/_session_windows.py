@@ -173,6 +173,14 @@ class WindowManagerMixin:
         # Figures kept alive for this window (bare-figure emits) die with it.
         from spyde.actions.figure_registry import forget_window as _figs_forget
         _figs_forget(window_id)
+        # A stacked 1-D navigator cursor keeps an index hook on the tree's real
+        # navigation selector — detach it so a closed window can't keep syncing.
+        cursor = getattr(self, "_stacked_nav_cursors", {}).pop(window_id, None)
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception as e:
+                log.debug("closing stacked nav cursor failed: %s", e)
         if hasattr(self, "_nav_selectors"):
             self._nav_selectors.pop(window_id, None)
         if hasattr(self, "_nav_selectors_by_id"):
