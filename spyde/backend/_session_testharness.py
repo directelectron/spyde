@@ -224,6 +224,54 @@ class TestHarnessMixin:
             log.debug("set_signal_type on sped_ag failed: %s", e)
         self._add_signal(s, source_path="test_data_sped_ag")
 
+    def _load_test_data_movie(self, payload: dict | None = None) -> None:
+        """Test-only: synthetic in-situ MOVIE (1-D time nav × LARGE 2-D frames) —
+        the GPU large-image consumer, with NO file and NO download so the
+        WebGPU/tile specs run everywhere. Frames are 2048² by default (≥1024
+        edge → anyplotlib tile mode via SpyDE's GpuTileBackend; >1 Mpx → the
+        WebGPU image path above GPU_IMAGE_THRESHOLD).
+
+        Frame content is designed for coordinate/parity assertions:
+          - x+y gradient + a bright TOP-LEFT block + dimmer BOTTOM-RIGHT block:
+            any flip / mirror / mis-registration of the render is visible;
+          - a bright vertical band whose position encodes the FRAME INDEX, so a
+            scrub visibly changes the frame (and a stale frame is detectable);
+          - a fine 2-px checkerboard patch at the centre: aliases to grey in the
+            downsampled overview, resolves in the crisp native detail tile.
+
+        Chunked 1 frame/chunk lazy, like a real .mrc in-situ movie (Live-Display
+        §3: each nav move is a small cold read of just that frame).
+        """
+        import numpy as np
+        import dask.array as da
+        from spyde.backend.heavy_imports import ensure_heavy_imports
+        ensure_heavy_imports()   # see _load_test_data — don't race the prewarm
+        payload = payload or {}
+        n = int(payload.get("size", 2048))
+        n_frames = int(payload.get("frames", 6))
+        yy, xx = np.mgrid[0:n, 0:n].astype(np.float32)
+        base = (xx / n) * 250.0 + (yy / n) * 250.0
+        base[(yy < n // 6) & (xx < n // 6)] = 1000.0          # TOP-LEFT block
+        base[(yy > 5 * n // 6) & (xx > 5 * n // 6)] = 800.0   # BOTTOM-RIGHT block
+        # Fine checkerboard patch (2-px pitch) in the centre quarter.
+        cb = slice(3 * n // 8, 5 * n // 8)
+        checker = (((xx[cb, cb] // 2).astype(np.int32)
+                    + (yy[cb, cb] // 2).astype(np.int32)) % 2) * 400.0 + 200.0
+        frames = np.empty((n_frames, n, n), dtype=np.uint16)
+        for t in range(n_frames):
+            f = base.copy()
+            f[cb, cb] = checker
+            x0 = (t + 1) * n // (n_frames + 2)
+            f[:, x0:x0 + n // 32] = 900.0                     # frame-index band
+            frames[t] = f.astype(np.uint16)
+        stack = da.from_array(frames, chunks=(1, n, n))       # 1 frame/chunk
+        s = hs.signals.Signal2D(stack).as_lazy()
+        for ax, unit in zip(s.axes_manager.signal_axes, ("nm", "nm")):
+            ax.scale = 0.5
+            ax.units = unit
+        s.set_signal_type("insitu")   # gates the Play/Fast Forward toolbar buttons
+        self._add_signal(s, source_path="test_data_movie")
+
     def _test_nav_drag(self, targets: list) -> None:
         """Test-only: drive the navigator crosshair through a list of (x, y) nav
         cells server-side and report, per move, whether the SIGNAL plot's painted
@@ -302,6 +350,89 @@ class TestHarnessMixin:
         except Exception as e:
             log.exception("test_nav_drag failed")
             ipc.emit({"type": "nav_drag_result", "error": str(e)})
+
+    def _test_region_scrub(self, payload: dict) -> None:
+        """Test-only: exercise the TIERED nav read's EXPENSIVE tier via an
+        integrating REGION. Switches the navigator to integrate mode, sets the
+        region widget oversized (to prove the extent cap clamps its geometry),
+        then scrubs the region to a couple of positions and reports, per move,
+        whether the SIGNAL plot's painted frame changed (an ndarray landed, i.e.
+        the async submit_graph read painted). Emits {"type":"region_scrub_result"}.
+        """
+        import time as _time
+        from spyde.drawing.selectors.base_selector import MAX_REGION_EXTENT_PER_DIM
+        try:
+            tree = self.signal_trees[-1] if self.signal_trees else None
+            if tree is None or tree.navigator_plot_manager is None:
+                ipc.emit({"type": "region_scrub_result", "error": "no navigator tree"})
+                return
+            mgr = tree.navigator_plot_manager
+            pw = next(iter(mgr.navigation_selectors.keys()))
+            sel = mgr.navigation_selectors[pw][0]
+            child = next(iter(sel.children.keys()))
+
+            # Switch to integrate mode → the region sub-selector becomes active.
+            sel.set_integrating(True)
+            region = getattr(sel, "selector", sel)
+            w = getattr(region, "_widget", None)
+            if w is None:
+                ipc.emit({"type": "region_scrub_result", "error": "no region widget"})
+                return
+
+            def _frame_sig():
+                d = getattr(child, "current_data", None)
+                if isinstance(d, np.ndarray) and d.size:
+                    return (int(d.argmax()), float(d.sum()))
+                return None
+
+            clamp_info = {}
+            results = []
+            prev = _frame_sig()
+            # A 1-D (movie/time) region uses x0/x1; a 2-D region uses x/y/w/h.
+            is_1d = hasattr(w, "x0")
+            positions = payload.get("positions") or ([[10], [40], [90]] if is_1d else [[3, 3], [20, 20]])
+            for pos in positions:
+                try:
+                    if is_1d:
+                        # Set an OVERSIZED span (60 indices) → must clamp to <=16.
+                        w.x0 = float(pos[0])
+                        w.x1 = float(pos[0]) + 60.0
+                    else:
+                        w.x = float(pos[0])
+                        w.y = float(pos[1])
+                        w.w = 60.0   # oversized → clamp to <=16
+                        w.h = 60.0
+                    region._clamp_extent()
+                except Exception as e:
+                    results.append({"pos": pos, "changed": False, "err": str(e)})
+                    continue
+                # Record the clamped extent for the first move.
+                if not clamp_info:
+                    if is_1d:
+                        clamp_info = {"span": abs(float(w.x1) - float(w.x0))}
+                    else:
+                        clamp_info = {"w": float(w.w), "h": float(w.h)}
+                sel.delayed_update_data(force=True)
+                cur = prev
+                t_end = _time.monotonic() + 5.0
+                while _time.monotonic() < t_end:
+                    cur = _frame_sig()
+                    if cur is not None and cur != prev:
+                        break
+                    _time.sleep(0.03)
+                changed = cur is not None and cur != prev
+                results.append({"pos": pos, "changed": bool(changed),
+                                "sig": cur, "prev": prev})
+                prev = cur
+            n_changed = sum(1 for r in results if r.get("changed"))
+            ipc.emit({"type": "region_scrub_result", "total": len(positions),
+                      "changed": n_changed, "clamp": clamp_info, "results": results,
+                      "cap": MAX_REGION_EXTENT_PER_DIM})
+            log.info("[REDRAW] test_region_scrub: %d/%d region moves painted; clamp=%s cap=%d",
+                     n_changed, len(positions), clamp_info, MAX_REGION_EXTENT_PER_DIM)
+        except Exception as e:
+            log.exception("test_region_scrub failed")
+            ipc.emit({"type": "region_scrub_result", "error": str(e)})
 
     def _load_test_vectors(self) -> None:
         """Test-only: load a small calibrated 4D-STEM stack (two disks per

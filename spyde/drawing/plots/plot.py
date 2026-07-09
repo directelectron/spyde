@@ -33,43 +33,68 @@ if TYPE_CHECKING:
 import logging
 logger = logging.getLogger(__name__)
 
+import threading as _threading
+
+
+class _NavPainter:
+    """A single serial daemon thread that PAINTS navigator frames off the
+    `_NavDispatcher` thread, newest-wins per plot.
+
+    Why: the nav READ must stay serial on the dispatcher (hyperspy cache safety),
+    but PAINTING a frame is a `set_data` → binary-uint8 → stdout write that can take
+    ~8–70 ms (transport of a large frame, or a cold chunk decode landing). Doing that
+    inline on the dispatcher BLOCKS reading the next slider position, so the slider
+    "catches" instead of tracking the cursor while the display lags behind. Moving
+    the paint here lets the dispatcher immediately read the LATEST position; a stale
+    frame queued behind a newer one is DROPPED (newest-wins) before it paints, so the
+    display converges on the cursor's final position.
+
+    This is NOT the retired read self-pacing/buffer-ring (those coalesced the READ
+    and made it worse). This is a newest-wins single-slot PAINT decouple — exactly
+    the "display lags, slider stays live" behaviour. stdout PLOTBIN writes stay
+    serialized because there is ONE painter thread. Latest-wins by `id(plot)`."""
+
+    def __init__(self) -> None:
+        self._lock = _threading.Lock()
+        self._pending: "dict[int, tuple]" = {}   # id(plot) -> (plot, ndarray)
+        self._wake = _threading.Event()
+        self._thread = _threading.Thread(
+            target=self._run, name="nav-paint", daemon=True)
+        self._thread.start()
+
+    def submit(self, plot, data) -> None:
+        """Queue (or replace) this plot's pending paint. Newest wins."""
+        with self._lock:
+            self._pending[id(plot)] = (plot, data)
+        self._wake.set()
+
+    def _run(self) -> None:
+        while True:
+            self._wake.wait()
+            with self._lock:
+                jobs = list(self._pending.values())
+                self._pending.clear()
+                self._wake.clear()
+            for plot, data in jobs:
+                try:
+                    plot.current_data = data
+                    plot._set_array(data)
+                except Exception as e:
+                    logger.debug("nav paint failed: %s", e)
+
+
+# One painter for the whole process — the single serial lane nav frames paint on.
+_nav_painter = _NavPainter()
+
 import time as _time
 # Per-frame PAINT profile (the transport/render half of a navigator update): logs
-# one line per _set_array with the paint stages — LOD decimate, contrast levels,
-# and transport (anyplotlib set_data → base64 → stdout emit, usually the dominant
-# cost for a large frame). Pairs with the [NAV-PROFILE] read line from
+# one line per _set_array with the paint stages — contrast levels and transport
+# (anyplotlib set_data → base64/binary → stdout emit, usually the dominant cost for a
+# large frame). Pairs with the [NAV-PROFILE] read line from
 # update_functions so a "slow update" report shows the WHOLE pipeline (read +
 # paint). Toggle live from the Log panel's "Profile" button; state lives in
 # backend.debug_flags (read fresh each frame). No-op when off.
 from spyde.backend.debug_flags import nav_profile_on as _nav_profile_on
-
-
-# Level-of-detail cap for a displayed 2-D frame. A large in-situ movie frame
-# (e.g. 4096x4096) dwarfs any plot panel (~<1000 CSS px) and the base64-in-JSON
-# transport that carries it to the renderer (benchmarks.md: an 8k frame is ~90 MB
-# / ~1.3 s per push). Decimating an already-read frame in numpy is ~free (~1 ms)
-# and cuts the transport payload by the square of the stride, so we downsample any
-# frame whose longest side exceeds this before it goes over the wire. A DP-sized
-# frame (<= cap) is untouched. Crisp downscale/zoom is the GPU renderer's job
-# (Phases 4-5); this is the cheap nearest-neighbour LOD that makes 4k/8k scrub.
-_LOD_MAX_PX = 1536
-# Generous cap when the WebGPU renderer is active: it does colormap + zoom/upsample
-# on-device, so a higher-res frame gives real pixels to zoom into. The frame still
-# ships base64-in-JSON (transport is the remaining cost — full 4k ~147 ms encode vs
-# ~36 ms at 2048), so cap at ~2048 rather than full 8k every frame. A future binary
-# transport removes the encode cost and lets this go full-res.
-_LOD_MAX_PX_GPU = 2048
-
-
-def _lod_stride(h: int, w: int, max_px: int = _LOD_MAX_PX, cap: "int | None" = None) -> int:
-    """Integer stride so max(h, w)//stride <= the cap (1 = no decimation). `cap`
-    overrides `max_px` when given (e.g. the generous GPU cap)."""
-    limit = cap if cap is not None else max_px
-    longest = max(int(h), int(w))
-    if longest <= limit:
-        return 1
-    import math
-    return max(1, math.ceil(longest / limit))
 
 
 _SUPERSCRIPTS = {
@@ -199,6 +224,23 @@ class Plot:
         # client-side GC doesn't release the get_inds dep and cancel the chain
         # (see update_from_navigation_selection).
         self._inflight_getinds: Dict = {}
+        # The single in-flight EXPENSIVE-tier navigator read for this plot (a
+        # cancellable submit_graph future). A newer nav position cancels it before
+        # submitting its own, so a slow region / derived-view read never blocks the
+        # serial dispatcher and a superseded frame is dropped (Live-Display §3
+        # tiered read). None when the current read is cheap/synchronous.
+        self._nav_future = None
+        # Per-plot LRU of decoded output nav-chunks for the synchronous read — makes
+        # dwelling within a chunk on a derived (rebin/crop/.zspy) view a ~0 ms numpy
+        # slice instead of re-decoding the whole source chunk every move. Cleared
+        # when the displayed node changes / on close. (Import here to avoid a
+        # module-load cycle: update_functions imports drawing types.)
+        from spyde.drawing.update_functions import _NavChunkCache
+        self._nav_chunk_cache = _NavChunkCache()
+        # GPU tile backend for a LARGE signal frame — reduces overview/detail tiles on
+        # the GPU. Lazily built on the first large frame (_maybe_gpu_tile); reset on a
+        # node switch / close so a new signal rebuilds it. None = not tiling yet.
+        self._gpu_tile_backend = None
 
         # anyplotlib figure + plot objects
         self._fig: apl.Figure | None = None
@@ -243,11 +285,19 @@ class Plot:
             # shader LUT + zoom/upsample); small images, RGB, and no-GPU machines
             # fall back to Canvas2D transparently. The GPU handles downscale/zoom,
             # so we can send FULL-res frames (no LOD decimation) when it's active.
+            # SPYDE_GPU_IMAGE=0 forces the Canvas2D path — the e2e GPU-parity spec
+            # uses it to render the CPU reference of the same scene.
+            import os as _os
+            _gpu_mode = ("off" if _os.environ.get("SPYDE_GPU_IMAGE", "")
+                         .lower() in ("0", "off", "false") else "auto")
             self._plot2d = self._axes.imshow(
                 np.zeros((10, 10), dtype=np.float32),
                 cmap=DEFAULT_COLORMAP,
-                gpu="auto",
+                gpu=_gpu_mode,
             )
+            # Viewport LOD is owned by anyplotlib's tile mode (set_data(tile="auto")):
+            # it emits view_changed to ITSELF and runs the overview + detail-tile loop
+            # internally. SpyDE no longer registers a view handler here.
         else:
             self._plot1d = self._axes.plot(np.zeros(10))
 
@@ -314,6 +364,67 @@ class Plot:
             "view_label": label, "view_kind": kind,
         })
 
+    # A LARGE signal frame (either edge ≥ this) is tiled by anyplotlib, but SpyDE
+    # supplies its OWN GpuTileBackend so the overview/detail reduction runs on the GPU
+    # (the CPU area-mean of a 4k frame is ~62 ms — the movie-scrub wall). Matches
+    # anyplotlib's own TILE_THRESHOLD so the gate agrees with what set_data would tile.
+    _GPU_TILE_MIN_EDGE = 1024
+
+    def _maybe_gpu_tile(self, data, clim, axes, units) -> bool:
+        """Route a LARGE signal frame through anyplotlib tile mode backed by a GPU
+        reducer. First large frame → enable_tile(GpuTileBackend); every subsequent one
+        → swap the backend source + update_tile_source (keeps zoom/detail). Returns
+        True if it took the tile path, False for a small frame (caller falls through to
+        the plain set_data)."""
+        if data.ndim != 2 or max(data.shape[:2]) < self._GPU_TILE_MIN_EDGE:
+            return False
+        p2 = self._plot2d
+        if p2 is None or not hasattr(p2, "enable_tile"):
+            return False
+        try:
+            from spyde.drawing.plots.gpu_tile_backend import GpuTileBackend
+            arr = np.ascontiguousarray(data)
+            vmin, vmax = clim
+            if getattr(self, "_gpu_tile_backend", None) is None:
+                # First large frame: build the GPU backend + enable tiling. Set the
+                # contrast BEFORE enable so the overview quantises over it, then apply
+                # the calibrated axes/extent (one push each; every later frame reuses
+                # the same axes so no re-push).
+                self._gpu_tile_backend = GpuTileBackend(arr, origin=p2._origin)
+                try:
+                    p2.set_clim(float(vmin), float(vmax))
+                except Exception:
+                    pass
+                p2.enable_tile(self._gpu_tile_backend, integration_method="mean")
+                if axes is not None:
+                    try:
+                        p2.set_extent(axes[0], axes[1])
+                        self._last_extent_key = (
+                            float(axes[0][0]), float(axes[0][-1]),
+                            float(axes[1][0]), float(axes[1][-1]),
+                            int(data.shape[0]), int(data.shape[1]))
+                    except Exception as e:
+                        logger.debug("gpu-tile set_extent failed: %s", e)
+                logger.info("[TILEDBG] GPU tile ENABLED win=%s frame=%s cuda=%s",
+                            self.window_id, arr.shape,
+                            self._gpu_tile_backend._torch is not None)
+            else:
+                # Subsequent frame (movie scrub): swap the GPU source + re-sample the
+                # overview/detail in place, keeping the zoom/subselection. Contrast is
+                # windowed in the LUT (see anyplotlib set_clim tile path) — a display-
+                # only move, so we don't re-quantise here.
+                self._gpu_tile_backend.set_array(arr)
+                if (vmin, vmax) != (self._plot2d._state.get("display_min"),
+                                    self._plot2d._state.get("display_max")):
+                    self._plot2d._state["display_min"] = float(vmin)
+                    self._plot2d._state["display_max"] = float(vmax)
+                p2.update_tile_source()
+            return True
+        except Exception as e:
+            logger.info("[TILEDBG] GPU tile path FAILED, falling back: %s", e)
+            self._gpu_tile_backend = None
+            return False
+
     # ── Public display interface ───────────────────────────────────────────────
 
     def update(self) -> None:
@@ -333,6 +444,15 @@ class Plot:
         self.current_data = data_or_future
         if isinstance(data_or_future, np.ndarray):
             self.update()
+
+    def enqueue_paint(self, data: np.ndarray) -> None:
+        """Paint an ndarray frame OFF the caller's thread via the serial newest-wins
+        painter (see _NavPainter). Used by the nav dispatcher so a slow paint doesn't
+        block reading the next slider position. current_data is set now (so a
+        concurrent read sees the latest intent); the painter sets it again + paints.
+        Newest-wins: a frame superseded before it paints is dropped."""
+        self.current_data = data
+        _nav_painter.submit(self, data)
 
     def set_data(self, data: np.ndarray, levels=None) -> None:
         """Directly push new array data (called from progressive compute poll)."""
@@ -392,17 +512,12 @@ class Plot:
         except Exception as e:
             logger.debug("[plot] set_overlay_mask failed: %s", e)
 
-    def _axes_info(self, data: np.ndarray, stride: int = 1):
+    def _axes_info(self, data: np.ndarray):
         """Return (axes, units) for the displayed 2-D image from the current
         signal's signal axes, so anyplotlib draws a calibrated scale bar.
 
         The scale bar auto-renders whenever units are physical (not 'px') and a
         scale is present — matching the Qt scale-bar overlay.
-
-        ``stride`` is the LOD decimation applied to ``data`` before display; the
-        axis arrays are subsampled by the same stride so their length matches the
-        decimated frame and the calibration (physical extent) is preserved — the
-        scale bar reads the same nm span, just over fewer samples.
         """
         try:
             sig = self.plot_state.current_signal
@@ -415,9 +530,6 @@ class Plot:
                 return None, "px"
             xa = np.asarray(x_ax.axis)
             ya = np.asarray(y_ax.axis)
-            if stride > 1:
-                xa = xa[::stride]
-                ya = ya[::stride]
             return [xa, ya], _clean_units(units)
         except Exception:
             return None, "px"
@@ -452,6 +564,26 @@ class Plot:
                              else f"object-ndarray{data.shape}", self.window_id)
             return
         dims = data.ndim
+
+        # DIAGNOSTIC: how much REAL detail is in the array handed to us? shape says
+        # 4096² but if a small 82² center crop has only ~36 distinct values the ARRAY
+        # is blocky (a low-res frame stored at 4096, not true 4k). Logs the crop's
+        # distinct-value count so we can tell the INITIAL frame from a SCRUBBED one —
+        # if only scrubbed frames are blocky, the nav read is the source, not tiling.
+        if dims == 2 and not self.is_navigator and min(data.shape) >= 200:
+            try:
+                cy, cx = data.shape[0] // 2, data.shape[1] // 2
+                crop = data[cy - 41:cy + 41, cx - 41:cx + 41]
+                logger.info(
+                    "[TILEDBG] _set_array IN win=%s shape=%s dtype=%s "
+                    "center82_distinct=%d full_distinct(sampled)=%d min=%.4g "
+                    "max=%.4g navigator=%s",
+                    self.window_id, tuple(data.shape), data.dtype,
+                    int(np.unique(crop).size),
+                    int(np.unique(data[::16, ::16]).size),
+                    float(data.min()), float(data.max()), self.is_navigator)
+            except Exception as _e:
+                logger.debug("tiledbg in-frame probe failed: %s", _e)
 
         # Transform-view lock: while the Find-Vectors preview shows the DoG /
         # correlation image on this signal plot, the navigator's RAW-frame paint
@@ -502,36 +634,11 @@ class Plot:
 
         self._ensure_figure(dims)
 
-        # ── Level-of-detail: decimate an oversized 2-D frame before it is
-        # serialised to the renderer. Contrast levels are computed on the
-        # decimated data (robust percentiles are unaffected by uniform striding),
-        # and the axes are subsampled by the SAME stride below so the scale bar /
-        # extent stay correct. A DP-sized frame has stride 1 (no change).
-        # NOT on a navigator image: a large 4D-STEM real-space navigator's 2-D
-        # selector maps clicks by DISPLAYED-pixel coordinates (image_width/height),
-        # so decimating it would offset every nav selection by the stride factor.
-        # Only signal frames (the DP / movie frame) are decimated — the case that
-        # actually needs it and where the selector isn't on this image.
-        #
-        # LOD cap is GENEROUS when the GPU path is active. WebGPU does colormap +
-        # zoom/upsample on-device, so a higher-res frame lets the user zoom into
-        # real pixels — but the frame still ships as base64-in-JSON (transport, not
-        # render, is the remaining cost: full 4k ≈ 147 ms to encode vs ~36 ms at
-        # 2048), so we cap at _LOD_MAX_PX_GPU (≈2048) rather than sending full 8k
-        # every frame. On no-GPU machines / CI the tighter Canvas2D cap
-        # (_LOD_MAX_PX) applies. (A later binary-transport change removes the encode
-        # cost and lets this go full-res.) gpu_active is the post-render echo, so
-        # the first frame uses the tight cap, then refines once the GPU activates.
-        gpu_on = bool(getattr(self._plot2d, "gpu_active", False))
-        lod_stride = 1
-        if dims == 2 and not self.is_navigator:
-            _ls = _time.perf_counter() if _NAV_PROFILE else 0.0
-            lod_stride = _lod_stride(data.shape[0], data.shape[1],
-                                     cap=_LOD_MAX_PX_GPU if gpu_on else None)
-            if lod_stride > 1:
-                data = data[::lod_stride, ::lod_stride]
-            if _NAV_PROFILE:
-                _pt["lod"] = _time.perf_counter() - _ls
+        # NO SpyDE-side level-of-detail / decimation. anyplotlib's tile mode owns ALL
+        # downscaling for a large frame: set_data(tile="auto") sends a downsampled
+        # overview as the base and streams a hi-res detail tile of the visible region
+        # on zoom/pan (native pixels, no full-frame transfer). We just hand it the full
+        # frame every time — no stride, no thumbnail copy, no native/display split.
 
         if dims == 2 and self._plot2d is not None:
             _lv = _time.perf_counter() if _NAV_PROFILE else 0.0
@@ -560,18 +667,30 @@ class Plot:
             self._last_levels = (vmin, vmax)
             if _NAV_PROFILE:
                 _pt["levels"] = _time.perf_counter() - _lv
-            axes, units = self._axes_info(data, stride=lod_stride)
-            # Pass the display range to set_data so the image + contrast land in a
-            # SINGLE push. Splitting them (set_data then set_clim) pushed twice:
-            # the first frame showed the image stretched over its raw data range
-            # (wrong contrast), the second corrected it — a one-frame flash on
-            # every navigator move / threshold tick. clim= makes it atomic.
+
+            # Hand the FULL frame to anyplotlib. A signal image uses tile="auto"
+            # (anyplotlib tiles it above its threshold: overview base + on-zoom detail
+            # tile, all downscaling on its side). A NAVIGATOR image must NOT tile — its
+            # 2-D selector maps clicks by displayed-pixel coords, so tile=False keeps a
+            # 1:1 full-frame image. The clim rides the SAME push (atomic, no contrast
+            # flash from a second set_clim).
+            tile_mode = False if self.is_navigator else "auto"
+            axes, units = self._axes_info(data)
             clim = (vmin, vmax)
             _st = _time.perf_counter() if _NAV_PROFILE else 0.0
+            # GPU tile backend: for a LARGE signal frame, do the overview/detail
+            # reduction on the GPU instead of the CPU (the ~62 ms numpy area-mean of a
+            # 4k frame is the movie-scrub wall). SpyDE injects its own TileBackend via
+            # enable_tile so anyplotlib keeps no torch dep. If the frame isn't big
+            # enough to tile (or it's a navigator), fall through to the plain set_data.
+            if (tile_mode == "auto"
+                    and self._maybe_gpu_tile(data, clim, axes, units)):
+                if _NAV_PROFILE:
+                    _pt["transport"] = _time.perf_counter() - _st
+                return
             if axes is not None:
-                self._plot2d.set_data(data.astype(np.float32),
-                                      x_axis=axes[0], y_axis=axes[1], units=units,
-                                      clim=clim)
+                self._plot2d.set_data(data, x_axis=axes[0], y_axis=axes[1],
+                                      units=units, clim=clim, tile=tile_mode)
                 # set_data updates x_axis/units but does NOT recompute scale_x/
                 # scale_y from the new axes — so the auto scale bar would size off
                 # the stale init scale. set_extent recomputes it, BUT it pushes
@@ -587,20 +706,19 @@ class Plot:
                     except Exception as e:
                         logger.debug("set_extent failed: %s", e)
             else:
-                self._plot2d.set_data(data.astype(np.float32), clim=clim)
+                self._plot2d.set_data(data, clim=clim, tile=tile_mode)
             if _NAV_PROFILE:
                 _pt["transport"] = _time.perf_counter() - _st
                 out_shape = tuple(data.shape)
-                lvl = "auto" if levels is None else "held"
                 stages = "  ".join(f"{k}={v*1e3:.1f}" for k, v in _pt.items())
                 # INFO so it reaches stderr / the Log panel for a "normal usage"
                 # report. total = whole _set_array; transport = the anyplotlib
                 # set_data(+extent) base64+stdout push (usually the biggest stage).
                 logger.info(
-                    "[PAINT-PROFILE] %s total=%.1fms  %s  in=%s out=%s lod=%d nav=%s",
+                    "[PAINT-PROFILE] %s total=%.1fms  %s  in=%s out=%s nav=%s",
                     "NAV" if self.is_navigator else "SIG",
                     (_time.perf_counter() - _p0) * 1e3, stages,
-                    _in_shape, out_shape, lod_stride, self.is_navigator)
+                    _in_shape, out_shape, self.is_navigator)
             if logger.isEnabledFor(logging.DEBUG):
                 try:
                     a = np.asarray(data, dtype=np.float64)
@@ -761,6 +879,14 @@ class Plot:
     def set_plot_state(self, signal) -> None:
         old_state = self.plot_state
         self.needs_auto_level = True
+        # The displayed node is changing — drop cached decoded chunks of the old
+        # node so they don't occupy the budget (keys are per-signal-id, so they'd
+        # never be returned for the new node anyway).
+        if self._nav_chunk_cache is not None:
+            self._nav_chunk_cache.clear()
+        # Rebuild the GPU tile backend for the new node (its logical size / dtype may
+        # differ; a stale backend would swap a mismatched frame into the old tiling).
+        self._gpu_tile_backend = None
 
         if old_state is not None:
             old_state.hide_toolbars()
@@ -890,6 +1016,20 @@ class Plot:
             self._inflight_getinds.clear()
         except Exception:
             pass
+        # Cancel any in-flight expensive-tier navigator read.
+        nf = self._nav_future
+        if nf is not None:
+            try:
+                nf.cancel()
+            except Exception:
+                pass
+            self._nav_future = None
+        # Release cached decoded chunks.
+        if self._nav_chunk_cache is not None:
+            try:
+                self._nav_chunk_cache.clear()
+            except Exception:
+                pass
         if self._shared_memory is not None:
             try:
                 self._shared_memory.close()

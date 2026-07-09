@@ -34,7 +34,9 @@ log = logging.getLogger(__name__)
 _TEST_ACTIONS_ENABLED = os.environ.get("SPYDE_PACKAGED") != "1"
 _TEST_ACTIONS = frozenset({
     "load_test_data", "load_test_data_lazy", "load_test_data_lazy_chunked",
-    "load_test_data_si_grains", "load_test_data_sped_ag", "test_nav_drag",
+    "load_test_data_si_grains", "load_test_data_sped_ag",
+    "load_test_data_movie", "test_nav_drag",
+    "test_region_scrub",
     "load_test_vectors", "run_test_orientation", "dump_dask_state",
 })
 
@@ -71,6 +73,8 @@ class ActionRouterMixin:
             self._load_test_data_si_grains()
         elif action == "load_test_data_sped_ag":
             self._load_test_data_sped_ag()
+        elif action == "load_test_data_movie":
+            self._load_test_data_movie(payload)
         elif action == "test_nav_drag":
             # Run on a BACKGROUND thread: the drag loop sleeps/polls, and if it ran
             # on the main asyncio thread it would block loop.call_soon_threadsafe —
@@ -78,6 +82,11 @@ class ActionRouterMixin:
             threading.Thread(
                 target=self._test_nav_drag, args=(payload.get("targets") or [],),
                 daemon=True, name="test-nav-drag",
+            ).start()
+        elif action == "test_region_scrub":
+            threading.Thread(
+                target=self._test_region_scrub, args=(payload,),
+                daemon=True, name="test-region-scrub",
             ).start()
         elif action == "load_test_vectors":
             self._load_test_vectors()

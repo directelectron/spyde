@@ -62,6 +62,23 @@ extra-index-url = []
 # `uv pip install --torch-backend=auto` flag is the manual equivalent.)
 torch-backend = "auto"
 
+# Explicit PyTorch CUDA wheel index. torch-backend="auto" wasn't selecting CUDA at
+# LOCK time on this box (it fell back to the CPU PyPI wheel), so pin torch's source to
+# the CUDA index directly — this survives `uv run`'s re-sync. cu124 wheels still ship
+# sm_61 (Pascal / TITAN X), so the GPU tile backend works on this dev machine.
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+# anyplotlib is co-developed in the sibling checkout — install it EDITABLE so
+# `uv run python -m spyde` (the Electron backend) picks up local edits to the
+# figure ESM / drawing layer without a reinstall. Without this, `uv run`
+# re-resolves anyplotlib to the published wheel and reverts any editable install.
+anyplotlib = { path = "../anyplotlib", editable = true }
+
 [tool.pycrucible]
 entrypoint = "main.py"
 

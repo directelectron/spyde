@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Union, List
 from spyde.drawing.selectors.base_selector import (
     BaseSelector,
     IntegratingSelectorMixin,
+    MAX_REGION_EXTENT_PER_DIM,
     event_handler_fn,
 )
 
@@ -115,7 +116,26 @@ class RectangleSelector(BaseSelector):
         return getattr(plot, "_plot2d", None) if plot is not None else None
 
     def _on_pointer_up(self, event):
+        self._clamp_extent()
         self.update_data()
+
+    def _clamp_extent(self) -> None:
+        """Cap the rectangle to MAX_REGION_EXTENT_PER_DIM image pixels on each
+        axis and write it back to the widget, so the ROI physically STOPS growing
+        at the cap (an integrating region can never accidentally sum a huge number
+        of nav positions). w/h are in image pixels, so the cap is a direct clamp.
+        Anchored at the widget's current x/y so dragging the far corner past the
+        cap just pins that edge."""
+        if self._widget is None:
+            return
+        try:
+            cap = float(MAX_REGION_EXTENT_PER_DIM)
+            if float(self._widget.w) > cap:
+                self._widget.w = cap
+            if float(self._widget.h) > cap:
+                self._widget.h = cap
+        except Exception as e:
+            logger.debug("clamping rectangle extent failed: %s", e)
 
     def _get_selected_indices(self) -> np.ndarray:
         if self._widget is None:
@@ -130,6 +150,12 @@ class RectangleSelector(BaseSelector):
         # array indices — see BaseSelector._data_to_index.
         x0, y0 = self._data_to_index(x, y)
         x1, y1 = self._data_to_index(x + w, y + h)
+
+        # Belt-and-suspenders: even if the widget geometry wasn't clamped (e.g. a
+        # programmatic set that bypassed _on_pointer_up), never emit more than
+        # MAX_REGION_EXTENT_PER_DIM indices per axis.
+        x1 = min(x1, x0 + MAX_REGION_EXTENT_PER_DIM)
+        y1 = min(y1, y0 + MAX_REGION_EXTENT_PER_DIM)
 
         x_indices = np.arange(x0, max(x0 + 1, x1), dtype=int)
         y_indices = np.arange(y0, max(y0 + 1, y1), dtype=int)

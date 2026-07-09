@@ -175,6 +175,22 @@ function createWindow(): BrowserWindow {
   // flush any messages the backend emitted during startup. A fresh reload resets
   // the gate so buffered messages aren't sent to a frame that's tearing down.
   win.webContents.on('did-finish-load', flushPendingMessages)
+
+  // Tee renderer + figure-IFRAME console messages to THIS terminal so a JS error
+  // (or a [TILEDBG-JS] tile-render log) is visible without opening DevTools and
+  // switching frame context. level: 0=log 1=warning 2=error 3=info. We surface
+  // warnings/errors always, and any message tagged [TILEDBG] so the tile diagnostics
+  // come through. `line`/`sourceId` pinpoint where a JS error was thrown.
+  win.webContents.on('console-message', (_e, level, message, line, sourceId) => {
+    const isTag = message.includes('[TILEDBG')
+    // A genuine JS error is level>=2 AND not one of our own [TILEDBG] warns (which
+    // come through at warning/error level depending on Electron version).
+    const isErr = level >= 2 && !isTag
+    if (!isErr && !isTag) return
+    const tag = isErr ? 'RENDERER-ERROR' : 'RENDERER'
+    const where = sourceId ? ` (${sourceId}:${line})` : ''
+    process.stderr.write(`[spyde ${tag}] ${message}${where}\n`)
+  })
   win.webContents.on('did-start-navigation', (_e, _url, isInPlace, isMainFrame) => {
     if (isMainFrame && !isInPlace) rendererReady = false
   })

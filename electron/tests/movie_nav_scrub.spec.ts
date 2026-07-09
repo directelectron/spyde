@@ -60,6 +60,14 @@ test('scrubbing the in-situ movie time navigator paints a fresh frame each move'
       () => document.querySelectorAll('[data-testid="subwindow"]').length >= 2,
       { timeout: 180_000 },
     )
+    // Wait for the large-file read to actually FINISH (status bar shows
+    // "Reading …mrc…" until the reader settles) — scrubbing before that races
+    // the cold open and the nav_drag verdict times out (same guard as
+    // viewport_detail / webgpu_image specs).
+    await page.waitForFunction(
+      () => !/Reading .*\.mrc/i.test(document.body.textContent || ''),
+      { timeout: 300_000 },
+    )
     await page.waitForTimeout(3000)   // initial nav render + first frame
     await page.screenshot({ path: 'movie_shots/00-movie-loaded.png' })
 
