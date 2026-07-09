@@ -36,7 +36,7 @@ _TEST_ACTIONS = frozenset({
     "load_test_data", "load_test_data_lazy", "load_test_data_lazy_chunked",
     "load_test_data_si_grains", "load_test_data_sped_ag",
     "load_test_data_movie", "test_nav_drag",
-    "test_region_scrub",
+    "test_region_scrub", "test_add_second_navigator",
     "load_test_vectors", "run_test_orientation", "dump_dask_state",
 })
 
@@ -75,6 +75,8 @@ class ActionRouterMixin:
             self._load_test_data_sped_ag()
         elif action == "load_test_data_movie":
             self._load_test_data_movie(payload)
+        elif action == "test_add_second_navigator":
+            self._test_add_second_navigator()
         elif action == "test_nav_drag":
             # Run on a BACKGROUND thread: the drag loop sleeps/polls, and if it ran
             # on the main asyncio thread it would block loop.call_soon_threadsafe —
@@ -334,28 +336,31 @@ class ActionRouterMixin:
 
     def _handle_playback(self, payload: dict) -> None:
         """Play / pause / fast-forward the movie time navigator. Commands:
-        ``play`` / ``pause`` / ``toggle`` / ``step`` (single frame) / ``set_fps`` /
-        ``set_step`` / ``fast_forward`` (toggle at a higher step)."""
+        ``play`` / ``pause`` / ``toggle`` (real-time on/off) / ``fast_forward``
+        (speed cycle 2→4→8→1) / ``step`` (single frame) / ``set_speed`` /
+        ``set_loop``. Playback is real-time (paced from the time axis), so there is
+        no ``fps``/``step`` speed control any more — ``speed`` is a 1/2/4/8x
+        multiplier and ``loop`` wraps at the end."""
         cmd = payload.get("command", "toggle")
         pb = self.playback
-        fps = payload.get("fps")
+        speed = payload.get("speed")
         step = payload.get("step")
         loop = payload.get("loop")
         if cmd == "play":
-            pb.play(fps=fps, step=step, loop=loop)
+            pb.play(speed=speed, loop=loop)
         elif cmd == "pause":
             pb.pause()
         elif cmd == "toggle":
-            pb.toggle(fps=fps, step=step, loop=loop)
+            pb.toggle(**({"speed": speed} if speed is not None else {}),
+                      **({"loop": loop} if loop is not None else {}))
         elif cmd == "fast_forward":
-            # Toggle playback at a larger step (default 5x) — a "faster" play.
-            pb.toggle(fps=fps, step=step if step is not None else 5, loop=loop)
+            pb.fast_forward(loop=loop)
         elif cmd == "step":
             self._playback_single_step(int(step or 1))
-        elif cmd == "set_fps" and fps is not None:
-            pb.set_fps(fps)
-        elif cmd == "set_step" and step is not None:
-            pb.set_step(step)
+        elif cmd == "set_speed" and speed is not None:
+            pb.set_speed(speed)
+        elif cmd == "set_loop" and loop is not None:
+            pb.set_loop(loop)
 
     def _playback_single_step(self, delta: int) -> None:
         """Advance the time navigator by ``delta`` frames once (keyboard step)."""

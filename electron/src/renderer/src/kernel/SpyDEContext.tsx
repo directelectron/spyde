@@ -123,6 +123,7 @@ interface State {
   loading: { busy: boolean; text: string }   // long file-read busy indicator
   signalTypes: Map<number, { current: string; options: string[] }>   // windowId → signal-type info
   backendExited: { code: number | null } | null   // set when the Python sidecar dies; surfaces a blocking banner
+  playback: { playing: boolean; speed: number; loop: boolean }   // movie playback clock (session-wide)
 }
 
 // Backend `nav_shape_prompt`: confirm the scan grid + step size before opening a
@@ -161,6 +162,7 @@ type Action =
   | { type: 'LOG_BACKFILL'; entries: LogEntry[] }
   | { type: 'LOG_LEVEL'; level: string }
   | { type: 'BACKEND_EXITED'; code: number | null }
+  | { type: 'PLAYBACK'; playing: boolean; speed: number; loop: boolean }
 
 function spydeReducer(state: State, action: Action): State {
   switch (action.type) {
@@ -362,6 +364,12 @@ function spydeReducer(state: State, action: Action): State {
       return { ...state, navigatorOptions }
     }
 
+    case 'PLAYBACK':
+      return {
+        ...state,
+        playback: { playing: action.playing, speed: action.speed, loop: action.loop },
+      }
+
     case 'SIGNAL_TREE': {
       const signalTrees = new Map(state.signalTrees)
       signalTrees.set(action.windowId, action.tree)
@@ -464,6 +472,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     loading: { busy: false, text: '' },
     signalTypes: new Map(),
     backendExited: null,
+    playback: { playing: false, speed: 1, loop: false },
   })
 
   const iframeRefs = useRef<Map<string, HTMLIFrameElement>>(new Map())
@@ -704,6 +713,18 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
             windowId: msg.window_id,
             names: msg.names ?? [],
             current: msg.current,
+          })
+          break
+
+        case 'playback_state':
+          // The movie clock changed state (play/pause, speed cycle, or an
+          // auto-stop at the movie end). Drives the Play toggle highlight + the
+          // Fast Forward "×N" speed badge.
+          dispatch({
+            type: 'PLAYBACK',
+            playing: Boolean(msg.playing),
+            speed: Number(msg.speed ?? 1),
+            loop: Boolean(msg.loop),
           })
           break
 

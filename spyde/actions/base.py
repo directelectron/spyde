@@ -72,33 +72,46 @@ def _session_of(toolbar: "ActionContext"):
     return getattr(getattr(toolbar, "plot", None), "session", None)
 
 
+def _bind_playback_tree(toolbar: "ActionContext", pb) -> None:
+    """Bias the shared clock toward the tree of the plot whose button was clicked,
+    so the RIGHT movie plays when several are open (falls back to a full scan)."""
+    tree = getattr(getattr(toolbar, "plot", None), "signal_tree", None)
+    if tree is not None:
+        pb.set_preferred_tree(tree)
+
+
 def play_pause(toolbar: "ActionContext", toggled=None, *args, **kwargs):
-    """Toggle movie playback: start the frame clock (or pause it). A toggle
-    action — ``toggled`` is the requested on/off state from the renderer."""
+    """Toggle real-time movie playback: start the wall-clock frame clock (or pause
+    it). A plain on/off toggle — pressing Play while fast-forwarding PAUSES (Fast
+    Forward owns the speed cycle). Real-time pacing is derived from the time axis'
+    scale/units, so no ``fps`` is passed; ``loop`` is still honoured."""
     session = _session_of(toolbar)
     if session is None:
         return
     pb = session.playback
+    _bind_playback_tree(toolbar, pb)
+    loop = kwargs.get("loop")
     if toggled is None:
-        pb.toggle(**{k: v for k, v in kwargs.items() if k in ("fps", "step", "loop")})
+        pb.toggle(**({"loop": loop} if loop is not None else {}))
     elif toggled:
-        pb.play(**{k: v for k, v in kwargs.items() if k in ("fps", "step", "loop")})
+        pb.play(**({"loop": loop} if loop is not None else {}))
     else:
         pb.pause()
 
 
 def fast_forward(toolbar: "ActionContext", toggled=None, *args, **kwargs):
-    """Toggle fast playback — a larger frame step (default 5x)."""
+    """Fast-forward = speed multiplier. Cycles 2x → 4x → 8x → back to 1x. Pressed
+    while stopped, starts playback at 2x; while playing, bumps the speed one notch
+    (staying at 1x after 8x)."""
     session = _session_of(toolbar)
     if session is None:
         return
-    step = kwargs.get("step", 5)
-    fps = kwargs.get("fps")
     pb = session.playback
+    _bind_playback_tree(toolbar, pb)
     if toggled is False:
         pb.pause()
     else:
-        pb.toggle(fps=fps, step=int(step) if step else 5)
+        pb.fast_forward(loop=kwargs.get("loop"))
 
 
 def add_fft_selector(toolbar: "ActionContext", action_name="", *args, **kwargs):

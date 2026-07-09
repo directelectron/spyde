@@ -189,6 +189,15 @@ export interface NavigatorOptionsMessage extends MsgBase {
   current?: string | null
 }
 
+export interface PlaybackStateMessage extends MsgBase {
+  type: 'playback_state'
+  /** True while the movie clock is running. */
+  playing: boolean
+  /** Current speed multiplier (1/2/4/8) — drives the Fast Forward "×N" badge. */
+  speed?: number
+  loop?: boolean
+}
+
 export interface LogMessage extends MsgBase {
   type: 'log'
   level: unknown
@@ -247,6 +256,7 @@ export type PlotAppMessage =
   | SelectorInfoMessage
   | SignalTreeMessage
   | NavigatorOptionsMessage
+  | PlaybackStateMessage
   | LogMessage
   | LogBackfillMessage
   | LogLevelMessage
