@@ -269,6 +269,7 @@ class FileLoaderMixin:
                 self._prompt_nav_shape(signal[0], path)
                 return
             for sig in signal:
+                self._maybe_set_insitu_signal_type(sig)
                 self._add_signal(sig, source_path=path)
             self._add_recent(path)
             ipc.emit({"type": "recent_files", "paths": self._recent_files[:20]})
@@ -341,6 +342,26 @@ class FileLoaderMixin:
             return True
         except Exception:
             return False
+
+    @classmethod
+    def _maybe_set_insitu_signal_type(cls, sig: BaseSignal) -> None:
+        """Tag a freshly-loaded signal as ``insitu`` (see spyde.signals.insitu)
+        when it's recognised as an in-situ MOVIE by the same
+        ``_is_movie_time_axis`` check that already decides chunking + skips the
+        nav-shape prompt for it — this reuses that existing movie-detection
+        condition rather than inventing a new heuristic. Typing it drives the
+        Play/Fast Forward toolbar gate (spyde/toolbars.yaml ``signal_types:
+        [insitu]``). No-op (best-effort) if the signal already carries a more
+        specific signal_type someone set deliberately, or on any error."""
+        try:
+            if not cls._is_movie_time_axis(sig):
+                return
+            current = str(getattr(sig, "_signal_type", "") or "")
+            if current and current != "insitu":
+                return
+            sig.set_signal_type("insitu")
+        except Exception as e:
+            log.debug("auto-tagging in-situ movie signal_type failed: %s", e)
 
     def _prompt_nav_shape(self, sig: BaseSignal, path: str) -> None:
         """Stash the loaded (lazy) signal and ask the frontend to confirm the
@@ -617,6 +638,7 @@ class FileLoaderMixin:
                 return
             sig = self._load_example_lazy(loader)
             _apply_example_calibration(sig, name)
+            self._maybe_set_insitu_signal_type(sig)
             self._add_signal(sig, source_path=None)
         except Exception as e:
             import traceback

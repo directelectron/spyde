@@ -7,5 +7,6 @@ code and are constructible + saveable standalone.
 """
 from spyde.signals.diffraction_vectors import SpyDEDiffractionVectors
 from spyde.signals.orientation_map import SpyDEOrientationMap
+from spyde.signals.insitu import InSitu, LazyInSitu
 
-__all__ = ["SpyDEDiffractionVectors", "SpyDEOrientationMap"]
+__all__ = ["SpyDEDiffractionVectors", "SpyDEOrientationMap", "InSitu", "LazyInSitu"]

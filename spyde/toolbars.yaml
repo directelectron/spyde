@@ -25,40 +25,28 @@ functions:
     navigation: True
     toolbar_side: right
   Play:
-    description: Play the movie — advance the time navigator on a frame clock. Toggle to pause.
+    description: Play the movie in real time — 1 s of playback = 1 s of experiment time (from the time-axis scale). Toggle to pause.
     icon: drawing/toolbars/icons/play.svg
     function: spyde.actions.base.play_pause
     plot_dim: [ 1 ]
     navigation: True
+    signal_types: [insitu]
     toggle: True
     toolbar_side: right
     parameters:
-      fps:
-        name: FPS
-        type: float
-        default: 10.0
-        min: 0.5
-        max: 60.0
-        step: 0.5
       loop:
         name: Loop
         type: bool
         default: False
   Fast Forward:
-    description: Fast-forward the movie — play at a larger frame step. Toggle to pause.
+    description: Fast-forward — cycle the playback speed 2x → 4x → 8x → 1x. Starts playback if stopped.
     icon: drawing/toolbars/icons/fastforward.svg
     function: spyde.actions.base.fast_forward
     plot_dim: [ 1 ]
     navigation: True
+    signal_types: [insitu]
     toggle: True
     toolbar_side: right
-    parameters:
-      step:
-        name: Step
-        type: int
-        default: 5
-        min: 2
-        max: 50
   FFT:
     description: Applies Fast Fourier Transform to the data based on the current selected area.
     icon: drawing/toolbars/icons/fft.svg

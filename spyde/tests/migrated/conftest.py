@@ -114,6 +114,7 @@ def movie_dataset(captured_messages):
     # A calibrated time axis (what the DE-MRC reader gives an in-situ movie).
     tax = s.axes_manager.navigation_axes[0]
     tax.name, tax.units, tax.scale = "time", "sec", 0.1
+    s.set_signal_type("insitu")   # gates the Play/Fast Forward toolbar buttons
     _load(session, s)
     yield {"window": session, "signal_trees": session.signal_trees,
            "plots": session._plots, "messages": captured_messages}
