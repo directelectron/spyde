@@ -269,8 +269,53 @@ class TestHarnessMixin:
         for ax, unit in zip(s.axes_manager.signal_axes, ("nm", "nm")):
             ax.scale = 0.5
             ax.units = unit
+        # CALIBRATE the TIME axis (like the DE-MRC reader gives an in-situ movie):
+        # 0.05 s/frame → real-time Play runs at 20 fps. Without this the axis keeps
+        # scale=1 (→ 1 fps) and the movie crawls; a calibrated axis exercises the
+        # real-time pacing path a real dataset takes.
+        tax = s.axes_manager.navigation_axes[0]
+        tax.name, tax.units, tax.scale = "time", "s", 0.05
         s.set_signal_type("insitu")   # gates the Play/Fast Forward toolbar buttons
         self._add_signal(s, source_path="test_data_movie")
+
+    def _test_add_second_navigator(self) -> None:
+        """Test-only: register a second NAMED 1-D navigator trace on the
+        in-situ MOVIE tree (root ``_signal_type == "insitu"``), so Playwright
+        can exercise the stacked-navigator chip strip
+        (``navigator_views._stack_navigators``) without needing a real second
+        navigator source. ``load_test_data_movie``'s synthetic movie only
+        ever gets one navigator ("base") — the chip strip needs
+        ``len(navigator_signals) >= 2`` to appear at all.
+
+        Targets the LAST loaded in-situ tree specifically (not just
+        ``signal_trees[-1]``) — a test may load other datasets (e.g. the
+        4D-STEM negative-gate fixture) after the movie, which would otherwise
+        make this add the trace to the WRONG (non-1-D-nav) tree and fail the
+        shape check in ``add_navigator_signal``.
+
+        Builds a simple sine trace over the same 1-D navigation shape as the
+        tree root (``add_navigator_signal`` enforces identical total shape),
+        named "trace", and re-emits the navigator chip options so the
+        renderer's chip strip shows up immediately.
+        """
+        import numpy as np
+        from hyperspy.signal import BaseSignal
+
+        try:
+            tree = next((t for t in reversed(self.signal_trees)
+                         if getattr(t.root, "_signal_type", None) == "insitu"), None)
+            if tree is None:
+                emit_error("test_add_second_navigator: no in-situ movie tree loaded")
+                return
+            n = int(tree.root.axes_manager.navigation_shape[0])
+            trace = 0.5 * np.sin(np.linspace(0, 4 * np.pi, n)) + 1.0
+            sig = BaseSignal(trace.astype(np.float32))
+            sig.axes_manager[0].name = "time"
+            tree.add_navigator_signal("trace", sig)
+            log.info("test_add_second_navigator: added 'trace' navigator (n=%d)", n)
+        except Exception as e:
+            log.exception("test_add_second_navigator failed")
+            emit_error(f"test_add_second_navigator failed: {e}")
 
     def _test_nav_drag(self, targets: list) -> None:
         """Test-only: drive the navigator crosshair through a list of (x, y) nav
@@ -307,20 +352,31 @@ class TestHarnessMixin:
                 return type(d).__name__
 
             def _set_pos(sel_obj, x, y):
-                """Move the navigator widget to (x, y). A 2-D navigator crosshair
-                uses cx/cy; a 1-D (movie/time) navigator is an InfiniteLineSelector
-                wrapping a VLineWidget with a single .x — set that (y is ignored).
-                The composite IntegratingSelector1D delegates to its active inner
-                selector via .selector."""
+                """Move the navigator widget to FRAME/CELL index (x, y). A 2-D
+                navigator crosshair uses cx/cy in IMAGE-PIXEL (index) coords; a 1-D
+                (movie/time) navigator is an InfiniteLineSelector wrapping a
+                VLineWidget whose ``.x`` is in DATA coordinates of the (possibly
+                calibrated) time axis — NOT the frame index. A real iframe drag
+                reports xdata in data coords, so we must convert the requested
+                frame index through the axis calibration (``x_data = offset +
+                index*scale``); setting ``w.x = index`` directly on a calibrated
+                axis (e.g. a movie's 0.05 s/frame time axis) lands the selector at
+                ``round(index/scale)``, which clips to the last frame and freezes
+                the navigator (see anyplotlib 2-D widget pixel-coords memo: 1-D
+                widgets use data coords, 2-D use pixels). The composite
+                IntegratingSelector1D delegates to its active inner selector via
+                ``.selector``."""
                 inner = getattr(sel_obj, "selector", sel_obj)
                 w = getattr(inner, "_widget", None) or getattr(sel_obj, "_widget", None)
                 if w is None:
                     raise RuntimeError("selector has no widget")
-                if hasattr(w, "cx"):          # 2-D crosshair
+                if hasattr(w, "cx"):          # 2-D crosshair (pixel/index coords)
                     w.cx = float(x)
                     w.cy = float(y)
-                else:                          # 1-D VLineWidget (time axis)
-                    w.x = float(x)
+                else:                          # 1-D VLineWidget — DATA coords
+                    from spyde.drawing.selectors.selector1d import _signal_axis
+                    scale, offset = _signal_axis(inner)
+                    w.x = offset + float(x) * scale
 
             results = []
             prev = _frame_sig()
@@ -390,13 +446,22 @@ class TestHarnessMixin:
             prev = _frame_sig()
             # A 1-D (movie/time) region uses x0/x1; a 2-D region uses x/y/w/h.
             is_1d = hasattr(w, "x0")
+            # 1-D range widget lives in DATA coords (like the VLine) — convert the
+            # requested frame-index positions through the axis calibration so a
+            # calibrated time axis (movie: 0.05 s/frame) doesn't clip everything to
+            # the last frame. 2-D region is in pixel/index coords.
+            _scale1d, _offset1d = (1.0, 0.0)
+            if is_1d:
+                from spyde.drawing.selectors.selector1d import _signal_axis
+                _scale1d, _offset1d = _signal_axis(region)
             positions = payload.get("positions") or ([[10], [40], [90]] if is_1d else [[3, 3], [20, 20]])
             for pos in positions:
                 try:
                     if is_1d:
                         # Set an OVERSIZED span (60 indices) → must clamp to <=16.
-                        w.x0 = float(pos[0])
-                        w.x1 = float(pos[0]) + 60.0
+                        x0d = _offset1d + float(pos[0]) * _scale1d
+                        w.x0 = x0d
+                        w.x1 = x0d + 60.0 * _scale1d
                     else:
                         w.x = float(pos[0])
                         w.y = float(pos[1])
@@ -406,10 +471,14 @@ class TestHarnessMixin:
                 except Exception as e:
                     results.append({"pos": pos, "changed": False, "err": str(e)})
                     continue
-                # Record the clamped extent for the first move.
+                # Record the clamped extent for the first move. The 1-D widget is
+                # in DATA units, so divide the span by the axis scale to report it
+                # in INDEX units — matching the index-based cap the spec asserts.
                 if not clamp_info:
                     if is_1d:
-                        clamp_info = {"span": abs(float(w.x1) - float(w.x0))}
+                        span_data = abs(float(w.x1) - float(w.x0))
+                        span_idx = span_data / abs(_scale1d) if _scale1d else span_data
+                        clamp_info = {"span": span_idx}
                     else:
                         clamp_info = {"w": float(w.w), "h": float(w.h)}
                 sel.delayed_update_data(force=True)
