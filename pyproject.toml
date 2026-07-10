@@ -31,7 +31,7 @@ dependencies = [
     "imageio-ffmpeg",
     "imagecodecs",
     "psygnal>=0.10.0",
-    "anyplotlib>=0.1.0",
+    "anyplotlib@git+https://github.com/CSSFrancis/anyplotlib.git@4686dd2fa0300d7bc806844c1bf6e02435c3966d",
     "pyyaml",
     # GPU-accelerated batched compute (vector orientation mapping, etc.).
     "torch",
@@ -66,18 +66,23 @@ torch-backend = "auto"
 # LOCK time on this box (it fell back to the CPU PyPI wheel), so pin torch's source to
 # the CUDA index directly — this survives `uv run`'s re-sync. cu124 wheels still ship
 # sm_61 (Pascal / TITAN X), so the GPU tile backend works on this dev machine.
+# The index is win32-only: it publishes no macOS wheels (CI mac runners must fall
+# back to the default PyPI torch), and Linux CI keeps the PyPI wheel it always had.
 [[tool.uv.index]]
 name = "pytorch-cu124"
 url = "https://download.pytorch.org/whl/cu124"
 explicit = true
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu124" }
-# anyplotlib is co-developed in the sibling checkout — install it EDITABLE so
-# `uv run python -m spyde` (the Electron backend) picks up local edits to the
-# figure ESM / drawing layer without a reinstall. Without this, `uv run`
-# re-resolves anyplotlib to the published wheel and reverts any editable install.
-anyplotlib = { path = "../anyplotlib", editable = true }
+torch = [
+    { index = "pytorch-cu124", marker = "sys_platform == 'win32'" },
+]
+# anyplotlib is co-developed in the sibling checkout. It is pinned to a git sha in
+# [project.dependencies] (same pattern as the hyperspy/rosettasciio forks) so CI and
+# fresh clones resolve without the sibling. When actively editing anyplotlib locally,
+# temporarily re-add the editable path override below (do NOT commit it — the path
+# doesn't exist on CI runners and breaks `uv sync --frozen`):
+# anyplotlib = { path = "../anyplotlib", editable = true }
 
 [tool.pycrucible]
 entrypoint = "main.py"
@@ -91,6 +96,8 @@ include = [
     "spyde/**/*.ico",
     "spyde/**/*.icns",
     "spyde/**/*.svg",
+    "spyde/models/weights/*.pt",
+    "spyde/models/weights/registry.json",
 ]
 exclude = [
     ".venv/**/*",
@@ -122,6 +129,8 @@ spyde = [
     "*.icns",
     "*.svg",
     "drawing/toolbars/icons/*.svg",
+    "models/weights/*.pt",
+    "models/weights/registry.json",
 ]
 
 [project.optional-dependencies]
