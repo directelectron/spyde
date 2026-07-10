@@ -1028,7 +1028,9 @@ class FindVectorsPreviewOverlay(_DPOverlay):
             params = dict(
                 method=self.method, kernel_radius=self.kernel_radius,
                 threshold=self.threshold, min_distance=self.min_distance,
-                subpixel=self.subpixel, model_id=self.model_id,
+                subpixel=self.subpixel,
+                # getattr: tests construct the overlay via __new__ (no __init__)
+                model_id=getattr(self, "model_id", None),
                 dog_sigma1=self.dog_sigma1, dog_sigma2=self.dog_sigma2,
             )
             if self.show_transform:
