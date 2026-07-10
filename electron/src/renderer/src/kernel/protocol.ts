@@ -198,6 +198,46 @@ export interface PlaybackStateMessage extends MsgBase {
   loop?: boolean
 }
 
+/** One entry of a `console_result`/`console_vars` value description. */
+export interface ConsoleVarKind {
+  name: string
+  kind?: string
+  shape?: number[] | null
+  dtype?: string | null
+  lazy?: boolean
+}
+
+export interface ConsoleResultMessage extends MsgBase {
+  type: 'console_result'
+  exec_id: number
+  ok: boolean
+  value_repr?: string | null
+  stdout?: string | null
+  error?: string | null
+  traceback?: string | null
+  duration_ms?: number
+  result?: ConsoleVarKind | null
+}
+
+/** One row of the console's live variable table (the result-chip strip). */
+export interface ConsoleVarEntry extends ConsoleVarKind {
+  source: 'signal' | 'assign' | 'out'
+  /** For source:"signal" entries — the MDI window(s) currently showing it, so
+   *  a dropped `SIGNAL_REF_DRAG_MIME` windowId can resolve to this var name. */
+  window_ids?: number[] | null
+}
+
+export interface ConsoleVarsMessage extends MsgBase {
+  type: 'console_vars'
+  vars: ConsoleVarEntry[]
+}
+
+export interface ConsoleCompletionsMessage extends MsgBase {
+  type: 'console_completions'
+  complete_id: number
+  matches: string[]
+}
+
 export interface LogMessage extends MsgBase {
   type: 'log'
   level: unknown
@@ -257,6 +297,9 @@ export type PlotAppMessage =
   | SignalTreeMessage
   | NavigatorOptionsMessage
   | PlaybackStateMessage
+  | ConsoleResultMessage
+  | ConsoleVarsMessage
+  | ConsoleCompletionsMessage
   | LogMessage
   | LogBackfillMessage
   | LogLevelMessage

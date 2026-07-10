@@ -76,6 +76,33 @@ export interface Histogram {
 /** One application-log record streamed from the Python backend. */
 export interface LogEntry { level: string; name: string; area?: string; msg: string; time: number }
 
+/** A console_result/console_vars value description (shape × dtype badge). */
+export interface ConsoleVarKind {
+  name: string
+  kind?: string
+  shape?: number[] | null
+  dtype?: string | null
+  lazy?: boolean
+}
+/** One row of the console's live variable table — the result-chip strip reads
+ *  the "assign"/"out" entries; "signal" entries resolve a dropped windowId to
+ *  its console variable name (drag-in from a SubWindow's console-ref grip). */
+export interface ConsoleVarEntry extends ConsoleVarKind {
+  source: 'signal' | 'assign' | 'out'
+  window_ids?: number[] | null
+}
+/** The console bar's last-executed-cell readout (the echo strip). */
+export interface ConsoleResult {
+  execId: number
+  ok: boolean
+  valueRepr: string
+  stdout: string
+  error: string
+  traceback: string
+  durationMs: number
+  result: ConsoleVarKind | null
+}
+
 export interface SelectorInfo {
   windowId: number
   mode: 'crosshair' | 'integrate'
@@ -124,6 +151,9 @@ interface State {
   signalTypes: Map<number, { current: string; options: string[] }>   // windowId → signal-type info
   backendExited: { code: number | null } | null   // set when the Python sidecar dies; surfaces a blocking banner
   playback: { playing: boolean; speed: number; loop: boolean }   // movie playback clock (session-wide)
+  consoleResult: ConsoleResult | null       // last-executed cell (the ConsoleBar echo strip)
+  consoleVars: ConsoleVarEntry[]            // live variable table (chips + signal-ref resolution)
+  consoleCompletions: { completeId: number; matches: string[] } | null
 }
 
 // Backend `nav_shape_prompt`: confirm the scan grid + step size before opening a
@@ -163,6 +193,9 @@ type Action =
   | { type: 'LOG_LEVEL'; level: string }
   | { type: 'BACKEND_EXITED'; code: number | null }
   | { type: 'PLAYBACK'; playing: boolean; speed: number; loop: boolean }
+  | { type: 'CONSOLE_RESULT'; result: ConsoleResult }
+  | { type: 'CONSOLE_VARS'; vars: ConsoleVarEntry[] }
+  | { type: 'CONSOLE_COMPLETIONS'; completeId: number; matches: string[] }
 
 function spydeReducer(state: State, action: Action): State {
   switch (action.type) {
@@ -370,6 +403,18 @@ function spydeReducer(state: State, action: Action): State {
         playback: { playing: action.playing, speed: action.speed, loop: action.loop },
       }
 
+    case 'CONSOLE_RESULT':
+      return { ...state, consoleResult: action.result }
+
+    case 'CONSOLE_VARS':
+      return { ...state, consoleVars: action.vars }
+
+    case 'CONSOLE_COMPLETIONS':
+      return {
+        ...state,
+        consoleCompletions: { completeId: action.completeId, matches: action.matches },
+      }
+
     case 'SIGNAL_TREE': {
       const signalTrees = new Map(state.signalTrees)
       signalTrees.set(action.windowId, action.tree)
@@ -473,10 +518,24 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     signalTypes: new Map(),
     backendExited: null,
     playback: { playing: false, speed: 1, loop: false },
+    consoleResult: null,
+    consoleVars: [],
+    consoleCompletions: null,
   })
 
   const iframeRefs = useRef<Map<string, HTMLIFrameElement>>(new Map())
   const latestStates = useRef<Map<string, Map<string, unknown>>>(new Map())
+  // Latest RAW BINARY frame per figure (key → {header, buffer}), mirroring
+  // latestStates but for PLOTBIN pushes. Without this, a figure whose FIRST
+  // real paint arrives as a binary frame before its iframe's onLoad fires (the
+  // common case for a console-created window, which — unlike a
+  // navigator-driven one — gets no organic second paint) stays permanently
+  // blank: postMessage to an unmounted iframe silently no-ops and, prior to
+  // this stash, replayState() had nothing to give it on load. Keeps only the
+  // LATEST frame per key (retained across postMessage's transfer, which
+  // detaches the original ArrayBuffer) — matches the "latest-wins" paint
+  // philosophy used throughout the nav/paint pipeline (see CLAUDE.md).
+  const latestBinaryStates = useRef<Map<string, Map<string, { header: unknown; buffer: Uint8Array }>>>(new Map())
   const tileWindowsRef = useRef<(() => void) | null>(null)
   const [stackDialogOpen, setStackDialogOpen] = useState(false)
   const [updateDialogOpen, setUpdateDialogOpen] = useState(false)
@@ -485,10 +544,25 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
   // Post every stored state for a figure to its iframe (called on iframe load).
   const replayState = (figId: string) => {
     const iframe = iframeRefs.current.get(figId)
+    if (!iframe?.contentWindow) return
     const states = latestStates.current.get(figId)
-    if (!iframe?.contentWindow || !states) return
-    for (const [key, value] of states) {
-      iframe.contentWindow.postMessage({ type: 'awi_state', key, value }, '*')
+    if (states) {
+      for (const [key, value] of states) {
+        iframe.contentWindow.postMessage({ type: 'awi_state', key, value }, '*')
+      }
+    }
+    const binStates = latestBinaryStates.current.get(figId)
+    if (binStates) {
+      for (const [key, { header, buffer }] of binStates) {
+        // Send a COPY (transfer detaches the buffer) — the stash must survive
+        // a later iframe remount (e.g. window re-tile / dev StrictMode).
+        const copy = buffer.slice()
+        iframe.contentWindow.postMessage(
+          { type: 'awi_state_binary', key, header, buffer: copy },
+          '*',
+          [copy.buffer],
+        )
+      }
     }
   }
 
@@ -586,13 +660,25 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'state_update_binary':
           // A raw image frame (pixels as a Uint8Array, no base64). Post it to the
           // iframe as `awi_state_binary`; the figure ESM uses the ArrayBuffer as
-          // the texture/ImageData bytes directly (no atob). We do NOT stash it in
-          // latestStates (replay uses base64 keys); the next paint re-sends it.
+          // the texture/ImageData bytes directly (no atob). ALSO stash a retained
+          // copy in latestBinaryStates (mirrors latestStates) so replayState() can
+          // recover a figure whose iframe wasn't mounted yet when this arrived —
+          // otherwise the postMessage below silently no-ops (no listener) and the
+          // frame is lost forever: a static (e.g. console-created) window that
+          // never repaints organically stayed permanently blank.
           {
             const figId = msg.fig_id
             const key = msg.key
-            const iframe = iframeRefs.current.get(figId)
             const bytes = msg.buffer as Uint8Array
+            if (bytes) {
+              if (!latestBinaryStates.current.has(figId)) {
+                latestBinaryStates.current.set(figId, new Map())
+              }
+              latestBinaryStates.current.get(figId)!.set(
+                key, { header: msg.header, buffer: bytes.slice() },
+              )
+            }
+            const iframe = iframeRefs.current.get(figId)
             iframe?.contentWindow?.postMessage(
               { type: 'awi_state_binary', key, header: msg.header, buffer: bytes },
               '*',
@@ -725,6 +811,34 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
             playing: Boolean(msg.playing),
             speed: Number(msg.speed ?? 1),
             loop: Boolean(msg.loop),
+          })
+          break
+
+        case 'console_result':
+          dispatch({
+            type: 'CONSOLE_RESULT',
+            result: {
+              execId: msg.exec_id,
+              ok: Boolean(msg.ok),
+              valueRepr: String(msg.value_repr ?? ''),
+              stdout: String(msg.stdout ?? ''),
+              error: String(msg.error ?? ''),
+              traceback: String(msg.traceback ?? ''),
+              durationMs: Number(msg.duration_ms ?? 0),
+              result: msg.result ?? null,
+            },
+          })
+          break
+
+        case 'console_vars':
+          dispatch({ type: 'CONSOLE_VARS', vars: msg.vars ?? [] })
+          break
+
+        case 'console_completions':
+          dispatch({
+            type: 'CONSOLE_COMPLETIONS',
+            completeId: msg.complete_id,
+            matches: msg.matches ?? [],
           })
           break
 

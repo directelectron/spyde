@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react'
 import { SpyDEProvider } from './kernel/SpyDEContext'
 import { MDIArea } from './components/MDIArea'
 import { PlotControlDock } from './components/PlotControlDock'
+import { ConsoleBar } from './components/ConsoleBar'
 import { StatusBar } from './components/StatusBar'
 import { LogPanel } from './components/LogPanel'
 import { Tour } from './components/Tour'
@@ -41,6 +42,7 @@ export function App() {
           {sidebarOpen && <PlotControlDock />}
         </div>
         <LogPanel open={logOpen} onClose={() => setLogOpen(false)} />
+        <ConsoleBar />
         <StatusBar logOpen={logOpen} onToggleLog={() => setLogOpen(v => !v)} />
       </div>
       {tour && <Tour guide={tour} onClose={() => setTour(null)} />}

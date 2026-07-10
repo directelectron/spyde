@@ -3,7 +3,7 @@ import { SubWindow } from './SubWindow'
 import type { Rect } from './SubWindow'
 import { WindowContent } from './WindowContent'
 import { useSpyDE } from '../kernel/SpyDEContext'
-import { NAVIGATOR_DRAG_MIME } from '../kernel/dnd'
+import { NAVIGATOR_DRAG_MIME, CONSOLE_VAR_DRAG_MIME } from '../kernel/dnd'
 
 // Tiling: near-square grid (rows x cols) sized to fit `n` windows, cols first
 // so wide areas get more columns than rows.
@@ -193,10 +193,12 @@ export function MDIArea() {
 
   // Drops onto the MDI background:
   //  • a navigator chip → extract that navigator into its own signal tree,
+  //  • a console result chip → open that console variable as a new window,
   //  • files (incl. .zspy folders) → open them like File→Open.
   const onAreaDragOver = useCallback((e: React.DragEvent) => {
     const types = e.dataTransfer.types
-    if (types.includes(NAVIGATOR_DRAG_MIME) || types.includes('Files')) {
+    if (types.includes(NAVIGATOR_DRAG_MIME) || types.includes(CONSOLE_VAR_DRAG_MIME)
+        || types.includes('Files')) {
       e.preventDefault()
       e.dataTransfer.dropEffect = 'copy'
     }
@@ -208,6 +210,15 @@ export function MDIArea() {
       try {
         const { windowId, name } = JSON.parse(nav) as { windowId: number; name: string }
         if (name != null && windowId != null) sendAction('extract_navigator', { name }, windowId)
+      } catch { /* malformed payload — ignore */ }
+      return
+    }
+    const consoleVar = e.dataTransfer.getData(CONSOLE_VAR_DRAG_MIME)
+    if (consoleVar) {
+      e.preventDefault()
+      try {
+        const { name } = JSON.parse(consoleVar) as { name: string }
+        if (name != null) sendAction('console_create_window', { name })
       } catch { /* malformed payload — ignore */ }
       return
     }

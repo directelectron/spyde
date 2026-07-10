@@ -1,7 +1,7 @@
 import React, { useCallback, useRef, useState } from 'react'
 import type { ToolbarAction } from '../kernel/SpyDEContext'
 import { FloatingToolbar } from './FloatingToolbar'
-import { WINDOW_DRAG_MIME } from '../kernel/dnd'
+import { WINDOW_DRAG_MIME, SIGNAL_REF_DRAG_MIME } from '../kernel/dnd'
 
 interface Props {
   id: string
@@ -187,8 +187,10 @@ export function SubWindow({
   const onTitleDown = (e: React.PointerEvent) => {
     if (maximized) return
     if ((e.target as HTMLElement).closest('button')) return  // let buttons click
-    // The signal-drag grip starts an HTML5 drag, not a window move.
+    // The signal-drag grips (navigator-add + console-ref) start an HTML5 drag,
+    // not a window move.
     if ((e.target as HTMLElement).closest('[data-testid="signal-drag-handle"]')) return
+    if ((e.target as HTMLElement).closest('[data-testid="console-ref-handle"]')) return
     onFocus(id)
     try { (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId) } catch { /* */ }
     gesture.current = { kind: 'drag', px: e.clientX, py: e.clientY, ox: pos.x, oy: pos.y }
@@ -296,6 +298,20 @@ export function SubWindow({
             }}
             style={styles.dragHandle}
           >⠿</span>
+          {/* Grip: drag this signal into the console input to insert its variable
+              name at the caret (resolved from the latest console_vars "signal"
+              rows by windowId). Distinct MIME/handle from the navigator grip
+              above — dropping this one on a navigator titlebar does nothing. */}
+          <span
+            data-testid="console-ref-handle"
+            title="Drag into the console to insert this signal's variable name"
+            draggable
+            onDragStart={(e) => {
+              e.dataTransfer.setData(SIGNAL_REF_DRAG_MIME, JSON.stringify({ windowId }))
+              e.dataTransfer.effectAllowed = 'copy'
+            }}
+            style={styles.consoleRefHandle}
+          >»</span>
           <span data-testid="subwindow-title" style={styles.title}>{title}</span>
         </span>
         <div style={styles.controls}>
@@ -385,6 +401,10 @@ const styles: Record<string, React.CSSProperties> = {
   titleBarDrop: { background: '#2a2a44', borderBottom: '1px solid #89b4fa' },
   dragHandle: {
     color: '#6c7086', fontSize: 11, cursor: 'grab', flexShrink: 0,
+    userSelect: 'none',
+  },
+  consoleRefHandle: {
+    color: '#89b4fa', fontSize: 11, fontWeight: 700, cursor: 'grab', flexShrink: 0,
     userSelect: 'none',
   },
   controls: { display: 'flex', gap: 4 },
