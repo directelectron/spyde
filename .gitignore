@@ -59,3 +59,14 @@ doc/sg_execution_times.rst
 
 # Local example data
 *.hspy
+
+# E2E screenshot output dirs (one per verification session; see CLAUDE.md
+# "Screenshot each stage to electron/<name>_shots/")
+electron/*_shots/
+
+# Local dev debris
+JSLog
+reports/
+.claude/
+tools/rcedit.exe
+spyde/*.svg.*.svg
