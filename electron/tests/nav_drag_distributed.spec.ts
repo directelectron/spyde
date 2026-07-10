@@ -73,7 +73,7 @@ async function figIdForWindow(isNav: boolean): Promise<string> {
   const n = await subs.count()
   for (let i = 0; i < n; i++) {
     const title = (await subs.nth(i).getByTestId('subwindow-title').textContent()) || ''
-    if (/navigator/i.test(title) === isNav) {
+    if (/^N-/.test(title) === isNav) {
       const tid = await subs.nth(i).locator('iframe').getAttribute('data-testid')
       return (tid || '').replace('figure-', '')
     }

@@ -249,6 +249,30 @@ async function countColorPixels(page, kind) {
   return total
 }
 
+/**
+ * Window pickers. The breadcrumb Pill replaced the old "<name> Navigator"
+ * title text with an S-/N- kind-prefix chip, so `filter({ hasText:
+ * 'Navigator' })` no longer distinguishes windows — select by prefix instead.
+ * Windows without a breadcrumb (bare figure windows, e.g. strain) match
+ * neither; pick those by their plain title text.
+ */
+function sigWindow(page) {
+  return page.getByTestId('subwindow')
+    .filter({ has: page.getByTestId('window-breadcrumb').filter({ hasText: /^S-/ }) })
+    .first()
+}
+
+function navWindow(page) {
+  return page.getByTestId('subwindow')
+    .filter({ has: page.getByTestId('window-breadcrumb').filter({ hasText: /^N-/ }) })
+    .first()
+}
+
+function navWindows(page) {
+  return page.getByTestId('subwindow')
+    .filter({ has: page.getByTestId('window-breadcrumb').filter({ hasText: /^N-/ }) })
+}
+
 module.exports = {
   launchApp,
   backendAction,
@@ -257,4 +281,7 @@ module.exports = {
   loadTestVectors,
   dumpDaskState,
   countColorPixels,
+  sigWindow,
+  navWindow,
+  navWindows,
 }

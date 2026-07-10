@@ -132,7 +132,7 @@ test('scrubbing the in-situ movie time navigator paints a fresh frame each move'
     // that log branch — verified the pixels DO change while 0 SIG lines are
     // logged), so counting those log lines under-reports. The pixel diff is
     // ground truth: the movie signal band moving = distinct frames on screen.
-    const sig = page.getByTestId('subwindow').filter({ hasNotText: 'Navigator' }).first()
+    const sig = page.getByTestId('subwindow').filter({ has: page.getByTestId('window-breadcrumb').filter({ hasText: /^S-/ }) }).first()
     await expect(sig).toBeVisible()
     const base = await sig.screenshot()
     await backendAction(page, 'playback', { command: 'play', loop: true })

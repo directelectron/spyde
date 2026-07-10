@@ -25,7 +25,7 @@ test.setTimeout(120_000)
 test('editing nav-axis units + scale recalibrates the navigator plot', async () => {
   const { page } = ctx
   // Focus the NAVIGATOR window so the dock's axes table + Workflow target it.
-  const navWin = page.getByTestId('subwindow').filter({ hasText: 'Navigator' }).first()
+  const navWin = page.getByTestId('subwindow').filter({ has: page.getByTestId('window-breadcrumb').filter({ hasText: /^N-/ }) }).first()
   await navWin.click()
   await page.waitForTimeout(500)
   await page.screenshot({ path: join(SHOTS, '01-before.png') })

@@ -47,7 +47,7 @@ test.describe('guide screenshots', () => {
               // Act within the signal (non-navigator) window when the target is a
               // per-window control (toolbar/titlebar/action button).
               const sig = page.getByTestId('subwindow')
-                .filter({ hasNotText: 'Navigator' }).first()
+                .filter({ has: page.getByTestId('window-breadcrumb').filter({ hasText: /^S-/ }) }).first()
               const scope = (await sig.count()) ? sig : page
               // Toolbar action buttons + sub-actions are hidden until the window
               // is hovered — reveal the floating toolbar first so the click lands.
@@ -78,7 +78,7 @@ test.describe('guide screenshots', () => {
           const dest = join(outDir, step.image)
           if (d?.shotTarget && d.shotTarget !== 'page') {
             const target = d.shotTarget === 'subwindow'
-              ? page.getByTestId('subwindow').filter({ hasNotText: 'Navigator' }).first()
+              ? page.getByTestId('subwindow').filter({ has: page.getByTestId('window-breadcrumb').filter({ hasText: /^S-/ }) }).first()
               : page.getByTestId(d.shotTarget).first()
             await target.screenshot({ path: dest })
           } else {

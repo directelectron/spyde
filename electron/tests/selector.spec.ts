@@ -44,7 +44,7 @@ async function frameForWindow(isNav: boolean): Promise<{ frame: Frame; box: { x:
   const n = await subs.count()
   for (let i = 0; i < n; i++) {
     const title = (await subs.nth(i).getByTestId('subwindow-title').textContent()) || ''
-    const matches = /navigator/i.test(title)
+    const matches = /^N-/.test(title)
     if (matches === isNav) {
       const handle = await subs.nth(i).locator('iframe').elementHandle()
       const frame = await handle!.contentFrame()
@@ -91,7 +91,7 @@ async function figIdForWindow(isNav: boolean): Promise<string> {
   const n = await subs.count()
   for (let i = 0; i < n; i++) {
     const title = (await subs.nth(i).getByTestId('subwindow-title').textContent()) || ''
-    if (/navigator/i.test(title) === isNav) {
+    if (/^N-/.test(title) === isNav) {
       const tid = await subs.nth(i).locator('iframe').getAttribute('data-testid')
       return (tid || '').replace('figure-', '')
     }
@@ -298,7 +298,7 @@ test('Virtual Imaging: Add (real backend) creates a VI + lists a colored chip', 
   // on the signal window, click "Add Virtual Image" → a new VI output window opens
   // AND a colour-coded chip appears in the sub-toolbar (the wired-up multi-VI).
   const sig = page.getByTestId('subwindow')
-    .filter({ hasNotText: 'Navigator' }).first()
+    .filter({ has: page.getByTestId('window-breadcrumb').filter({ hasText: /^S-/ }) }).first()
   await sig.getByTestId('subwindow-title').click()   // raise it
   const before = await page.getByTestId('subwindow').count()
 

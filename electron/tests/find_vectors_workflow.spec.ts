@@ -12,7 +12,7 @@
  */
 import { test, expect } from '@playwright/test'
 const {
-  launchApp, backendAction, waitForSubwindowCount, countColorPixels,
+  launchApp, backendAction, waitForSubwindowCount, countColorPixels, sigWindow,
 } = require('./_harness.cjs')
 
 let ctx: Awaited<ReturnType<typeof launchApp>>
@@ -35,7 +35,7 @@ test('live red-peak preview, then Compute opens the vectors window', async () =>
   const { page } = ctx
   const red = () => countColorPixels(page, 'red')
 
-  const sig = page.getByTestId('subwindow').filter({ hasNotText: 'Navigator' }).first()
+  const sig = sigWindow(page)
   await sig.getByTestId('subwindow-title').click()
 
   // No overlay yet → no saturated-red pixels on the grayscale DP.

@@ -313,7 +313,13 @@ export function SubWindow({
             events — so the empty titlebar space to its RIGHT still starts a window
             move. The pill itself stops propagation (via onPointerDown) so grabbing
             it starts an HTML5 drag, not a window move. */}
-        <span style={{ display: 'flex', alignItems: 'center', minWidth: 0 }}>
+        {/* data-testid=subwindow-title lives on THIS wrapper (not the fallback
+            span) so it resolves in every branch — pill, rename, or plain title.
+            A click here lands on the pill, whose stopPropagation only blocks
+            pointerdown; the root's onMouseDown focus/raise still fires. Specs
+            rely on it as the click-to-raise + title-text handle. */}
+        <span data-testid="subwindow-title"
+          style={{ display: 'flex', alignItems: 'center', minWidth: 0 }}>
           {renaming ? (
             <input
               data-testid="rename-input"
@@ -340,7 +346,7 @@ export function SubWindow({
               title="Drag to add a navigator, into the console to bind, or onto a navigator. Double-click the name to rename."
             />
           ) : (
-            <span data-testid="subwindow-title" style={styles.title}>{title}</span>
+            <span style={styles.title}>{title}</span>
           )}
         </span>
         <div style={styles.controls}>

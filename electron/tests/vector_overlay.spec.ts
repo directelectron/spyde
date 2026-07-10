@@ -61,7 +61,7 @@ async function redPixels(): Promise<number> {
 }
 
 test('live preview + found-vector overlay as red markers on the diffraction pattern', async () => {
-  const sig = page.getByTestId('subwindow').filter({ hasNotText: 'Navigator' }).first()
+  const sig = page.getByTestId('subwindow').filter({ has: page.getByTestId('window-breadcrumb').filter({ hasText: /^S-/ }) }).first()
   await sig.getByTestId('subwindow-title').click()
 
   // No overlay yet → no saturated-red pixels on the DP.

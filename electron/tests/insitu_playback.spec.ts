@@ -48,10 +48,10 @@ mkdirSync(SHOTS, { recursive: true })
 /** The navigator subwindow's title contains "Navigator" (project convention
  *  used across the e2e suite, e.g. find_vectors_workflow.spec.ts). */
 function navWindow(page: any) {
-  return page.getByTestId('subwindow').filter({ hasText: 'Navigator' }).first()
+  return page.getByTestId('subwindow').filter({ has: page.getByTestId('window-breadcrumb').filter({ hasText: /^N-/ }) }).first()
 }
 function signalWindow(page: any) {
-  return page.getByTestId('subwindow').filter({ hasNotText: 'Navigator' }).first()
+  return page.getByTestId('subwindow').filter({ has: page.getByTestId('window-breadcrumb').filter({ hasText: /^S-/ }) }).first()
 }
 
 async function shot(page: any, n: number, name: string) {
@@ -133,7 +133,7 @@ test('in-situ movie: Play/FF gate, real-time playback, fast-forward badge, ' +
     await waitForSubwindowCount(page, 4, 60_000)
     await page.waitForTimeout(2000)
     // Two trees are now open; the newest navigator window is the 4D-STEM one.
-    const navs = page.getByTestId('subwindow').filter({ hasText: 'Navigator' })
+    const navs = page.getByTestId('subwindow').filter({ has: page.getByTestId('window-breadcrumb').filter({ hasText: /^N-/ }) })
     const stemNav = navs.last()
     await stemNav.hover()
     await page.waitForTimeout(300)

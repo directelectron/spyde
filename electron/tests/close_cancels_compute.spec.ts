@@ -35,7 +35,7 @@ test.setTimeout(180_000)
 test('closing the navigator mid-Find-Vectors tears down cleanly', async () => {
   const { page } = ctx
 
-  const sig = page.getByTestId('subwindow').filter({ hasNotText: 'Navigator' }).first()
+  const sig = page.getByTestId('subwindow').filter({ has: page.getByTestId('window-breadcrumb').filter({ hasText: /^S-/ }) }).first()
   await sig.getByTestId('subwindow-title').click()
 
   // Start the full-scan compute via the wizard.
@@ -52,17 +52,20 @@ test('closing the navigator mid-Find-Vectors tears down cleanly', async () => {
   // cancels futures, then the source windows close. A renderer exception here
   // (stale figure, landing result on a torn-down tree) is the class of bug the
   // cancellation path could introduce.
-  const navWindow = page.getByTestId('subwindow').filter({ hasText: 'Navigator' }).first()
+  // Target the SOURCE tree's navigator — the early find-vectors result
+  // window has its own N- navigator ("… — Vectors") that may remain.
+  const navWindow = page.getByTestId('subwindow').filter({ has: page.getByTestId('window-breadcrumb').filter({ hasText: /^N-/ }) }).filter({ hasNotText: 'Vectors' }).first()
   await navWindow.getByTestId('subwindow-titlebar').hover()
   await navWindow.getByTestId('close-btn').click()
 
   // The source tree's Navigator + Signal windows are gone.
   await expect.poll(() => page.getByTestId('subwindow')
-    .filter({ hasText: 'Navigator' }).count(), {
+    .filter({ has: page.getByTestId('window-breadcrumb').filter({ hasText: /^N-/ }) }).filter({ hasNotText: 'Vectors' }).count(), {
     timeout: 30_000, message: 'closing the navigator did not remove it',
   }).toBe(0)
-  await expect(page.getByTestId('subwindow').filter({ hasText: 'Signal' }))
-    .toHaveCount(0)
+  await expect(page.getByTestId('subwindow')
+    .filter({ has: page.getByTestId('window-breadcrumb').filter({ hasText: /^S-/ }) })
+    .filter({ hasNotText: 'Vectors' })).toHaveCount(0)
 
   // Give any late compute callback a beat to try (and no-op / cancel) so a
   // crash from a landing result on a torn-down source tree would surface.
@@ -71,7 +74,7 @@ test('closing the navigator mid-Find-Vectors tears down cleanly', async () => {
   // The app must still be alive and responsive after the racy teardown.
   await backendAction(page, 'load_test_data_si_grains')
   await expect.poll(() => page.getByTestId('subwindow')
-    .filter({ hasText: 'Navigator' }).count(), {
+    .filter({ has: page.getByTestId('window-breadcrumb').filter({ hasText: /^N-/ }) }).filter({ hasNotText: 'Vectors' }).count(), {
     timeout: 120_000, message: 'app unresponsive after racy teardown',
   }).toBe(1)
 

@@ -21,7 +21,7 @@ const SHOTS = 'play_caret_shots'
 mkdirSync(SHOTS, { recursive: true })
 
 function navWindow(page: any) {
-  return page.getByTestId('subwindow').filter({ hasText: 'Navigator' }).first()
+  return page.getByTestId('subwindow').filter({ has: page.getByTestId('window-breadcrumb').filter({ hasText: /^N-/ }) }).first()
 }
 
 const ACTIVE_BG = 'rgb(137, 180, 250)'   // #89b4fa — a lit/active toolbar button
