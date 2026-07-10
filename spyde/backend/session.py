@@ -302,7 +302,21 @@ class Session(
             log.warning("composition emit failed: %s", e)
 
         emit_status(f"Loaded: {title or 'Signal'}")
+        self._notify_console_trees_changed()
         return tree
+
+    def _notify_console_trees_changed(self) -> None:
+        """Refresh the math console's signal bindings after a tree is added /
+        closed. Only pokes the console if it has ALREADY been created — never
+        force-creates the engine (and its heavy hyperspy import) just because a
+        dataset loaded. The refresh is posted onto the console thread, so this is a
+        cheap non-blocking call safe to make from the main thread OR a load thread."""
+        con = getattr(self, "_console", None)
+        if con is not None:
+            try:
+                con.refresh_bindings()
+            except Exception as e:
+                log.debug("console binding refresh failed: %s", e)
 
     # Signal types offered in the sidebar dropdown (HyperSpy/pyxem). "" = the
     # generic BaseSignal/Signal2D with no specialised type.
@@ -601,6 +615,12 @@ class Session(
                 pb.shutdown()
             except Exception as e:
                 log.debug("playback shutdown failed: %s", e)
+        con = getattr(self, "_console", None)
+        if con is not None:
+            try:
+                con.shutdown()
+            except Exception as e:
+                log.debug("console shutdown failed: %s", e)
         self._closed = True   # block compute_backend from recreating _nav_executor
         self._plot_worker.stop()
         if self._nav_executor is not None:

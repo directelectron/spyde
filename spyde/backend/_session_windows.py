@@ -108,6 +108,7 @@ class WindowManagerMixin:
             except Exception as e:
                 log.debug("retiring tree on last window close failed: %s", e)
             self.signal_trees.remove(tree)
+            self._notify_console_trees_changed()
 
     def _cleanup_plot_selectors(self, plot) -> None:
         """Close any selectors owned by / driving this plot, so closing a virtual
@@ -154,6 +155,7 @@ class WindowManagerMixin:
             self.unregister_plot(p)
         if tree in self.signal_trees:
             self.signal_trees.remove(tree)
+            self._notify_console_trees_changed()
         for wid in window_ids:
             self._forget_window(wid)
 

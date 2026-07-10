@@ -139,6 +139,16 @@ class ActionRouterMixin:
             self._confirm_nav_shape(payload)
         elif action == "playback":
             self._handle_playback(payload)
+        elif action == "console_exec":
+            self.console.submit_exec(
+                str(payload.get("code", "")), int(payload.get("exec_id", 0))
+            )
+        elif action == "console_create_window":
+            self.console.create_window(str(payload.get("name", "")))
+        elif action == "console_complete":
+            self.console.submit_complete(
+                str(payload.get("prefix", "")), int(payload.get("complete_id", 0))
+            )
         elif action == "set_signal_type":
             self._set_signal_type(plot, payload.get("signal_type", ""))
         elif action == "load_example":
@@ -333,6 +343,20 @@ class ActionRouterMixin:
             pb = MoviePlaybackController(self)
             self._playback = pb
         return pb
+
+    @property
+    def console(self):
+        """Lazily-created math-console execution engine (one per session).
+
+        Owns the persistent namespace + result registry and runs user cells on a
+        dedicated daemon thread (see spyde.backend.console). Created on first use
+        so an idle session pays nothing; shut down in Session.shutdown()."""
+        con = getattr(self, "_console", None)
+        if con is None:
+            from spyde.backend.console import ConsoleSession
+            con = ConsoleSession(self)
+            self._console = con
+        return con
 
     def _handle_playback(self, payload: dict) -> None:
         """Play / pause / fast-forward the movie time navigator. Commands:

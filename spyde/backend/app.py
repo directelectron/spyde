@@ -170,6 +170,11 @@ async def _main() -> None:
                 _resize_figure(msg)
             elif msg_type == "quit":
                 break
+            elif "command" in msg:
+                # Math-console commands arrive as flat {"command": "console_*", …}
+                # (the console IPC contract), not wrapped in a "type":"action"
+                # envelope. Route them straight to the session's console handler.
+                _dispatch_console(session, msg)
             else:
                 log.warning("[backend] unknown message type: %s", msg_type)
         except Exception as e:
@@ -177,6 +182,24 @@ async def _main() -> None:
             emit_error(str(e))
 
     session.shutdown()
+
+
+def _dispatch_console(session, msg: dict) -> None:
+    """Route a flat console command ({"command": "console_exec"|"console_create_window"|
+    "console_complete", …}) to the session's console engine. The engine queues the
+    work on its own daemon thread, so this returns immediately (the asyncio loop is
+    never blocked on user code)."""
+    command = msg.get("command")
+    if command == "console_exec":
+        session.console.submit_exec(str(msg.get("code", "")), int(msg.get("exec_id", 0)))
+    elif command == "console_create_window":
+        session.console.create_window(str(msg.get("name", "")))
+    elif command == "console_complete":
+        session.console.submit_complete(
+            str(msg.get("prefix", "")), int(msg.get("complete_id", 0))
+        )
+    else:
+        log.warning("[backend] unknown console command: %s", command)
 
 
 def _dispatch_figure_event(msg: dict) -> None:
