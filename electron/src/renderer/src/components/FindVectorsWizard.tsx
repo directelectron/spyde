@@ -7,7 +7,10 @@
  * "Compute" (`fv_run`) runs the full-dataset batch → a new vectors window;
  * closing the caret tears the preview down (`fv_close`).
  *
- * Two detection methods:
+ * Three detection methods:
+ *   • Neural — the SpotUNet disk detector (parameter-free disk size; threshold
+ *     is the model's confidence, ~0.3; Model dropdown selects a registry model,
+ *     populated by the `fv_models` payload). The default.
  *   • NXCORR — window-normalised cross-correlation against a flat disk
  *     (Disk Radius slider; threshold is a [-1,1] correlation score).
  *   • DoG — Difference-of-Gaussians band-pass, best for small (2-3 px) spots
@@ -24,19 +27,21 @@ interface Props {
   onClose: () => void
 }
 
-type Method = 'nxcorr' | 'dog'
+type Method = 'neural' | 'nxcorr' | 'dog'
 const METHODS: readonly { value: Method; label: string }[] = [
+  { value: 'neural', label: 'Neural (SpotUNet)' },
   { value: 'nxcorr', label: 'NXCORR (disk)' },
   { value: 'dog', label: 'DoG (small spots)' },
 ]
-// Sensible threshold default per method (NXCORR score vs DoG SNR).
-const THR_DEFAULT: Record<Method, number> = { nxcorr: 0.5, dog: 10 }
+// Sensible threshold default per method (neural confidence vs NXCORR score vs DoG SNR).
+const THR_DEFAULT: Record<Method, number> = { neural: 0.3, nxcorr: 0.5, dog: 10 }
 
 // Per-window tuned state kept OUTSIDE the component (like the OM/VOM wizards)
 // so the caret closing on Compute doesn't lose the tuning — reopening restores
 // the last-used parameters.
 interface FvSaved {
-  method: Method; sigma: number; radius: number; sigma1: number; sigma2: number
+  method: Method; modelId: string; sigma: number; radius: number
+  sigma1: number; sigma2: number
   threshold: number; minDist: number; subpixel: boolean; beamstop: boolean
   beamstopDilate: number; showTransform: boolean
 }
@@ -44,12 +49,14 @@ const _fvStore = new Map<number, FvSaved>()
 
 export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: Props) {
   const saved = _fvStore.get(windowId)
-  const [method, setMethod] = React.useState<Method>(saved?.method ?? 'nxcorr')
+  const [method, setMethod] = React.useState<Method>(saved?.method ?? 'neural')
+  const [modelId, setModelId] = React.useState(saved?.modelId ?? '')
+  const [models, setModels] = React.useState<readonly { value: string; label: string }[]>([])
   const [sigma, setSigma] = React.useState(saved?.sigma ?? 1.0)
   const [radius, setRadius] = React.useState(saved?.radius ?? 5)
   const [sigma1, setSigma1] = React.useState(saved?.sigma1 ?? 0.8)
   const [sigma2, setSigma2] = React.useState(saved?.sigma2 ?? 2.0)
-  const [threshold, setThreshold] = React.useState(saved?.threshold ?? 0.5)
+  const [threshold, setThreshold] = React.useState(saved?.threshold ?? 0.3)
   const [minDist, setMinDist] = React.useState(saved?.minDist ?? 5)
   const [subpixel, setSubpixel] = React.useState(saved?.subpixel ?? true)
   const [beamstop, setBeamstop] = React.useState(saved?.beamstop ?? false)
@@ -59,17 +66,17 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
 
   React.useEffect(() => {
     _fvStore.set(windowId, {
-      method, sigma, radius, sigma1, sigma2, threshold, minDist, subpixel,
+      method, modelId, sigma, radius, sigma1, sigma2, threshold, minDist, subpixel,
       beamstop, beamstopDilate, showTransform,
     })
-  }, [windowId, method, sigma, radius, sigma1, sigma2, threshold, minDist,
+  }, [windowId, method, modelId, sigma, radius, sigma1, sigma2, threshold, minDist,
       subpixel, beamstop, beamstopDilate, showTransform])
 
   // Live refs so the debounced tune always sends the latest of EVERY control.
-  const vals = React.useRef({ method, sigma, radius, sigma1, sigma2, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform })
-  vals.current = { method, sigma, radius, sigma1, sigma2, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform }
+  const vals = React.useRef({ method, modelId, sigma, radius, sigma1, sigma2, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform })
+  vals.current = { method, modelId, sigma, radius, sigma1, sigma2, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform }
   const params = () => ({
-    method: vals.current.method,
+    method: vals.current.method, model_id: vals.current.modelId,
     sigma: vals.current.sigma, kernel_radius: vals.current.radius,
     dog_sigma1: vals.current.sigma1, dog_sigma2: vals.current.sigma2,
     threshold: vals.current.threshold, min_distance: vals.current.minDist,
@@ -90,6 +97,21 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
   const sendTune = useDebouncedAction(sendAction, 'fv_tune', windowId)
   const tune = () => sendTune(params)
   const live = <T,>(set: (v: T) => void) => (v: T) => { set(v); tune() }
+
+  // Populate the Model dropdown from the backend registry. Requested ONCE on
+  // mount via a ref (sendAction must never be an effect dep — it's recreated
+  // every render and would re-fire the request in a loop).
+  const sendRef = React.useRef(sendAction)
+  sendRef.current = sendAction
+  React.useEffect(() => {
+    sendRef.current('fv_models', {}, windowId)
+  }, [windowId])
+  useWizardEvent('spyde:fv_models', windowId, (d) => {
+    const list = Array.isArray(d.models) ? (d.models as { id: string; label?: string }[]) : []
+    setModels(list.map((m) => ({ value: m.id, label: m.label ?? m.id })))
+    // '' = registry default; surface it as the concrete id once known.
+    if (!vals.current.modelId && typeof d.default === 'string') setModelId(d.default)
+  })
 
   // Adopt the backend's auto-estimated disk radius (Qt parity) the first time it
   // arrives, then re-run the preview with it. The user can still override.
@@ -121,6 +143,7 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
   }
 
   const isDog = method === 'dog'
+  const isNeural = method === 'neural'
 
   return (
     <WizardShell testid="find-vectors-wizard" title="Find Diffraction Vectors" posStyle={caretPos}
@@ -130,12 +153,18 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
       <Field label="Method">
         <Select testid="fv-method" value={method} options={METHODS} onChange={onMethod} />
       </Field>
+      {isNeural && models.length > 0 && (
+        <Field label="Model">
+          <Select testid="fv-model" value={modelId} options={models}
+            onChange={live(setModelId)} />
+        </Field>
+      )}
       <div style={gridStyle}>
         <Cell label="Nav Blur σ">
           <Slider testid="fv-sigma" value={sigma} min={0} max={5} step={0.1}
             onChange={live(setSigma)} fmt={(n) => n.toFixed(1)} />
         </Cell>
-        {!isDog && (
+        {!isDog && !isNeural && (
           <Cell label="Disk Radius">
             <Slider testid="fv-radius" value={radius} min={1} max={30} step={1} onChange={live(setRadius)} />
           </Cell>
@@ -152,7 +181,7 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
             </Cell>
           </>
         )}
-        <Cell label={isDog ? 'Threshold (SNR)' : 'Threshold'}>
+        <Cell label={isDog ? 'Threshold (SNR)' : isNeural ? 'Threshold (conf.)' : 'Threshold'}>
           <Slider testid="fv-threshold" value={threshold}
             min={0} max={isDog ? 30 : 1} step={isDog ? 0.5 : 0.05}
             onChange={live(setThreshold)} fmt={(n) => (isDog ? n.toFixed(1) : n.toFixed(2))} />
@@ -171,7 +200,7 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
         <Check testid="fv-beamstop" checked={beamstop} onChange={live(setBeamstop)}
           label="Mask beam stop" />
         <Check testid="fv-show-transform" checked={showTransform} onChange={live(setShowTransform)}
-          label={isDog ? 'Show DoG' : 'Show corr.'} />
+          label={isDog ? 'Show DoG' : isNeural ? 'Show heatmap' : 'Show corr.'} />
         <Check testid="fv-subpixel" checked={subpixel} onChange={live(setSubpixel)}
           label="Subpixel" />
       </div>
