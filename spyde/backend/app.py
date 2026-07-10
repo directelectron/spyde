@@ -153,6 +153,11 @@ async def _main() -> None:
     # Warm the file-reader + pyxem imports too, so the FIRST file open isn't slow
     # (the "stuck on Reading…" until a second load — really first-call import lag).
     _prewarm_io()
+    # Warm torch + the CUDA context: the GPU tile backend (first large signal
+    # frame) otherwise pays the ~3 s import ON THE PAINTER THREAD — much worse
+    # while the navigator fill saturates the disk (black signal panel).
+    from spyde.backend.heavy_imports import prewarm_torch_cuda
+    prewarm_torch_cuda()
 
     emit({"type": "ready"})
 

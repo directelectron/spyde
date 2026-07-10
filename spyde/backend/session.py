@@ -241,6 +241,7 @@ class Session(
         source_path: str | None = None,
         navigator_override: BaseSignal | None = None,
         selector_type=None,
+        enable_nav_sidecar: bool = True,
     ):
         """Create a signal tree + plots for a loaded signal. Returns the tree.
 
@@ -258,12 +259,18 @@ class Session(
         from spyde.drawing.plots.plot import Plot
 
         client = self.dask_manager.client
+        # Only a real on-disk origin enables the navigator sidecar cache
+        # (test/example loaders pass pseudo-paths like "test_data"; a STACK's
+        # navigator depends on every member, not just paths[0] → disabled).
+        disk_path = (source_path if enable_nav_sidecar and source_path
+                     and os.path.exists(source_path) else None)
         tree = BaseSignalTree(
             root_signal=signal,
             session=self,
             distributed_client=client,
             selector_type=selector_type,
             navigator_override=navigator_override,
+            source_path=disk_path,
         )
         self.signal_trees.append(tree)
 

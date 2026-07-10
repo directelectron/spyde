@@ -28,12 +28,18 @@ from anyplotlib.plot2d._tile_backend import _box_reduce, _nearest_resize
 
 
 def _torch_cuda():
-    """Return the torch module iff a CUDA device is really available, else None.
-    Import is lazy + guarded so a CPU-only env (this dev box ships torch+cpu) never
-    pays the import and always takes the numpy fallback."""
+    """Return the torch module iff the BACKGROUND prewarm already finished with a
+    usable CUDA device, else None — NEVER triggers the import itself. torch's
+    import is ~3 s idle and tens of seconds while the disk is saturated (e.g. the
+    navigator fill of a fresh 16 GB movie); paying it here — on the painter
+    thread, at the first large-frame paint — kept the signal panel black for the
+    whole stall. The first frames take the numpy fallback (~62 ms overview) and
+    ``set_array`` re-checks per frame, so the display upgrades to the GPU as soon
+    as the prewarm lands."""
     try:
-        import torch
-        if torch.cuda.is_available():
+        from spyde.backend.heavy_imports import torch_cuda_ready
+        if torch_cuda_ready():        # non-blocking; kicks the prewarm if needed
+            import torch              # already imported by the prewarm — instant
             return torch
     except Exception as e:  # torch missing / broken CUDA
         logger.debug("gpu tile backend: torch/cuda unavailable (%s)", e)
@@ -83,6 +89,16 @@ class GpuTileBackend:
         if a.ndim != 2:
             raise ValueError(f"GpuTileBackend needs a 2-D array, got {a.shape}")
         self._a = a
+        if self._torch is None:
+            # The backend may have been built before the background torch/CUDA
+            # prewarm finished (first frames ran on the numpy fallback) —
+            # upgrade to the GPU as soon as it's ready. Cheap once ready.
+            self._torch = _torch_cuda()
+            self._dev = (self._torch.device("cuda")
+                         if self._torch is not None else None)
+            if self._torch is not None:
+                logger.info("[TILEDBG] GPU tile backend upgraded to CUDA "
+                            "(prewarm landed)")
         self._upload()
 
     # ── TileBackend protocol ───────────────────────────────────────────────────

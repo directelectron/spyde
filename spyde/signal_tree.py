@@ -45,6 +45,7 @@ class BaseSignalTree:
         distributed_client=None,
         selector_type=None,
         navigator_override: BaseSignal = None,
+        source_path: "str | None" = None,
     ):
         self.root = root_signal
         self.session = session
@@ -54,11 +55,22 @@ class BaseSignalTree:
         self._client_override = distributed_client
         self._selector_type = selector_type
         self._pending_nav_dask: da.Array | None = None
+        # On-disk origin of the root signal (None for derived/test trees) —
+        # enables the navigator sidecar cache (spyde.nav_sidecar).
+        self.source_path = source_path
 
         if navigator_override is not None:
             navigator = self._preprocess_navigator(navigator_override)
         else:
-            navigator = self._initialize_navigator(root_signal)
+            # Only the BASE navigator (the root signal's own sum) may be served
+            # from / saved to the sidecar — an override (e.g. a vectors count
+            # map) or a later add_navigator_signal can share the nav shape but
+            # holds a DIFFERENT quantity.
+            self._sidecar_eligible = True
+            try:
+                navigator = self._initialize_navigator(root_signal)
+            finally:
+                self._sidecar_eligible = False
         self.navigator_signals["base"] = navigator
 
         self.signal_plots: list[Plot] = []
@@ -95,7 +107,7 @@ class BaseSignalTree:
                 selector_type=self._selector_type,
             )
             if self._pending_nav_dask is not None:
-                self._start_progressive_nav_compute()
+                self._start_nav_compute_after_first_frame()
         else:
             self.navigator_plot_manager = None
             self.add_signal_plot()
@@ -118,10 +130,60 @@ class BaseSignalTree:
 
     # ── Progressive navigator compute ─────────────────────────────────────────
 
-    def _start_progressive_nav_compute(self) -> None:
+    # How long to let the signal plot's FIRST frame win the disk before the
+    # navigator fill starts anyway. The frame read is ~0.1–2 s even cold; the
+    # timeout only matters if that read never lands (then the fill proceeds).
+    _FIRST_FRAME_WAIT_S = 6.0
+
+    def _start_nav_compute_after_first_frame(self) -> None:
+        """Start the progressive navigator fill only after the signal plot's
+        FIRST frame has painted (bounded by _FIRST_FRAME_WAIT_S).
+
+        On a cold large file the DISTRIBUTED fill reads the WHOLE dataset
+        across Dask worker processes — which `_interactive_activity` cannot
+        throttle (it only yields the in-process threaded fill) — while the
+        initial frame's own direct read was submitted to the dispatcher just
+        milliseconds earlier. That one frame loses the disk to hundreds of
+        chunk-sum reads and the signal panel sits black well into the fill
+        ("black until you move the navigator"). Reading it FIRST costs the fill
+        at most a couple of seconds; the frame gets the disk to itself.
+
+        The pending nav dask is consumed NOW (not at fire time) so a stash made
+        during the wait (e.g. add_navigator_signal) can't be mistaken for the
+        base navigator."""
+        nav_dask = self._pending_nav_dask
+        self._pending_nav_dask = None
+        if nav_dask is None:
+            return
+        stop = threading.Event()
+        self._nav_defer_stop = stop
+
+        def _wait_then_start():
+            deadline = time.monotonic() + self._FIRST_FRAME_WAIT_S
+            while time.monotonic() < deadline and not stop.is_set():
+                if any(isinstance(p.current_data, np.ndarray)
+                       for p in self.signal_plots):
+                    break
+                time.sleep(0.05)
+            if not stop.is_set():
+                try:
+                    self._start_progressive_nav_compute(nav_dask)
+                except Exception:
+                    # Session may be tearing down mid-wait; a blank navigator
+                    # beats an unhandled thread exception.
+                    logger.exception("deferred navigator fill failed to start")
+
+        threading.Thread(target=_wait_then_start, daemon=True,
+                         name="nav-defer").start()
+
+    def _start_progressive_nav_compute(self, nav_dask: "da.Array | None" = None) -> None:
         """
         Replace the single-future nav compute with a per-chunk progressive
         compute that live-updates the navigator image as chunks finish.
+
+        ``nav_dask`` is normally handed over by the deferral
+        (_start_nav_compute_after_first_frame, which consumed the stash up
+        front); falling back to the stash keeps direct calls working.
         """
         from spyde.drawing.update_functions import (
             compute_with_live_buffer,
@@ -130,8 +192,9 @@ class BaseSignalTree:
             _interactive_activity,
         )
 
-        nav_dask = self._pending_nav_dask
-        self._pending_nav_dask = None
+        if nav_dask is None:
+            nav_dask = self._pending_nav_dask
+            self._pending_nav_dask = None
         if nav_dask is None:
             return
 
@@ -186,6 +249,8 @@ class BaseSignalTree:
                             pos.append((start, size))
                             start += size
                         axes_ranges.append(pos)
+                    total_chunks = int(np.prod([len(r) for r in axes_ranges]))
+                    done_chunks = 0
                     for combo in itertools.product(*axes_ranges):
                         if _stop.is_set():
                             return
@@ -202,6 +267,8 @@ class BaseSignalTree:
                         logger.debug("NAV-DEBUG threaded nav chunk %s computing", nav_slices)
                         block = np.asarray(_dask[nav_slices].compute()).astype(np.float32)
                         acc[nav_slices] = block
+                        done_chunks += 1
+                        self._emit_nav_progress(done_chunks / max(1, total_chunks))
                         finite = acc[np.isfinite(acc)]
                         if finite.size:
                             # Robust percentile levels (2–98%), computed over ALL
@@ -233,6 +300,8 @@ class BaseSignalTree:
                                 logger.debug("navigator histogram emit failed: %s", e)
                     if _sig:
                         _sig[0].data = acc
+                    if not _stop.is_set():
+                        self._save_nav_sidecar(acc)
                 except Exception:
                     # Primary (threaded) navigator load — a failure here leaves a
                     # blank navigator, so surface the traceback rather than hide it.
@@ -297,6 +366,7 @@ class BaseSignalTree:
         def _paint_from_buffer():
             arr = read_live_buffer(nav_shape, shm_name)
             finite = arr[np.isfinite(arr)]
+            self._emit_nav_progress(finite.size / max(1, arr.size))
             if finite.size > 0:
                 lo, hi = float(finite.min()), float(finite.max())
                 if _nav_levels[0] is None:
@@ -339,6 +409,7 @@ class BaseSignalTree:
                         lv = (_nav_levels[0] if _nav_levels[0] is not None
                               else (lo, hi if hi > lo else lo + 1))
                         nav_plot.set_data(arr, levels=lv)
+                    self._save_nav_sidecar(arr)
                 else:
                     _paint_from_buffer()
             except Exception as e:
@@ -354,6 +425,35 @@ class BaseSignalTree:
         self._nav_poll_thread = t
 
     # ── Navigator processing ───────────────────────────────────────────────────
+
+    def _save_nav_sidecar(self, arr) -> None:
+        """Persist the COMPLETED navigator beside the source file (best-effort)
+        so the next open of this dataset skips the whole-file navigator read.
+        Called from the fill threads once the array is authoritative."""
+        path = self.source_path
+        if not path:
+            return
+        try:
+            from spyde.nav_sidecar import save_nav_sidecar
+            if save_nav_sidecar(path, np.asarray(arr)):
+                from spyde.backend.ipc import emit_status
+                emit_status("Navigator ready (cached for the next open)")
+        except Exception as e:
+            logger.debug("navigator sidecar save failed: %s", e)
+
+    def _emit_nav_progress(self, frac: float) -> None:
+        """Throttled status-bar progress for the navigator fill ("Computing
+        navigator… 35%") — a large file's fill reads the whole dataset (minutes)
+        and without a live number it reads as a hang. Emits on ≥5% steps only."""
+        try:
+            pct = int(max(0.0, min(1.0, frac)) * 100)
+            last = getattr(self, "_nav_progress_pct", -5)
+            if pct >= last + 5 or (pct >= 100 and last < 100):
+                self._nav_progress_pct = pct
+                from spyde.backend.ipc import emit_status
+                emit_status(f"Computing navigator… {pct}%")
+        except Exception as e:
+            logger.debug("navigator progress emit failed: %s", e)
 
     def _preprocess_navigator(self, signal: BaseSignal) -> List[BaseSignal]:
         heavy_workers = getattr(self.session.dask_manager, "heavy_workers", None)
@@ -404,7 +504,21 @@ class BaseSignalTree:
         compute, so the sum runs TWICE on the cluster (visible as a duplicate
         task graph on the Dask dashboard). Deferring to the progressive path is
         the one-and-only compute.
+
+        A matching navigator SIDECAR (saved beside the source file by a prior
+        fill — see spyde.nav_sidecar) short-circuits all of this: the whole-file
+        read is skipped and the cached array IS the navigator. Base navigator
+        only (``_sidecar_eligible``) — overrides/extra navigators can share the
+        shape but hold different quantities.
         """
+        if getattr(self, "_sidecar_eligible", False) and self.source_path:
+            from spyde.nav_sidecar import load_nav_sidecar
+            cached = load_nav_sidecar(self.source_path, tuple(nav_dask.shape))
+            if cached is not None:
+                logger.info("navigator loaded from sidecar for %s (shape=%s) — "
+                            "skipping the full-dataset compute",
+                            self.source_path, cached.shape)
+                return cached.astype(np.float32, copy=False)
         self._pending_nav_dask = nav_dask
         logger.debug(
             "NAV-DEBUG _compute_navigator: stashed nav sum (%s); progressive "
@@ -570,6 +684,8 @@ class BaseSignalTree:
         self._spyde_closed = True
         if hasattr(self, "_nav_stop"):
             self._nav_stop.set()
+        if hasattr(self, "_nav_defer_stop"):
+            self._nav_defer_stop.set()
         # Release the progressive-navigator shared-memory segment (created in
         # _start_progressive_nav_compute via ensure_live_buffer). Without this it
         # leaks for the lifetime of the process on every tree close.

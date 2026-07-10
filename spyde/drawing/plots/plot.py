@@ -383,6 +383,7 @@ class Plot:
             return False
         try:
             from spyde.drawing.plots.gpu_tile_backend import GpuTileBackend
+            _t0 = _time.perf_counter()
             arr = np.ascontiguousarray(data)
             vmin, vmax = clim
             if getattr(self, "_gpu_tile_backend", None) is None:
@@ -391,11 +392,17 @@ class Plot:
                 # the calibrated axes/extent (one push each; every later frame reuses
                 # the same axes so no re-push).
                 self._gpu_tile_backend = GpuTileBackend(arr, origin=p2._origin)
+                _t1 = _time.perf_counter()
                 try:
                     p2.set_clim(float(vmin), float(vmax))
                 except Exception:
                     pass
+                _t2 = _time.perf_counter()
                 p2.enable_tile(self._gpu_tile_backend, integration_method="mean")
+                logger.debug("[TILEDBG] tile timings: backend_ctor=%.1fms "
+                             "set_clim=%.1fms enable=%.1fms",
+                             (_t1 - _t0) * 1e3, (_t2 - _t1) * 1e3,
+                             (_time.perf_counter() - _t2) * 1e3)
                 if axes is not None:
                     try:
                         p2.set_extent(axes[0], axes[1])
@@ -570,11 +577,12 @@ class Plot:
         # is blocky (a low-res frame stored at 4096, not true 4k). Logs the crop's
         # distinct-value count so we can tell the INITIAL frame from a SCRUBBED one —
         # if only scrubbed frames are blocky, the nav read is the source, not tiling.
-        if dims == 2 and not self.is_navigator and min(data.shape) >= 200:
+        if (dims == 2 and not self.is_navigator and min(data.shape) >= 200
+                and logger.isEnabledFor(logging.DEBUG)):
             try:
                 cy, cx = data.shape[0] // 2, data.shape[1] // 2
                 crop = data[cy - 41:cy + 41, cx - 41:cx + 41]
-                logger.info(
+                logger.debug(
                     "[TILEDBG] _set_array IN win=%s shape=%s dtype=%s "
                     "center82_distinct=%d full_distinct(sampled)=%d min=%.4g "
                     "max=%.4g navigator=%s",
@@ -640,6 +648,10 @@ class Plot:
         # on zoom/pan (native pixels, no full-frame transfer). We just hand it the full
         # frame every time — no stride, no thumbnail copy, no native/display split.
 
+        _dbg = logger.isEnabledFor(logging.DEBUG)
+        if _dbg:
+            logger.debug("[TILEDBG] _set_array stage: pre-checks done (win=%s)",
+                         self.window_id)
         if dims == 2 and self._plot2d is not None:
             _lv = _time.perf_counter() if _NAV_PROFILE else 0.0
             if self.needs_auto_level:
@@ -667,6 +679,10 @@ class Plot:
             self._last_levels = (vmin, vmax)
             if _NAV_PROFILE:
                 _pt["levels"] = _time.perf_counter() - _lv
+            if _dbg:
+                logger.debug("[TILEDBG] _set_array stage: levels+histogram done "
+                             "(%.1fms, win=%s)",
+                             (_time.perf_counter() - _lv) * 1e3, self.window_id)
 
             # Hand the FULL frame to anyplotlib. A signal image uses tile="auto"
             # (anyplotlib tiles it above its threshold: overview base + on-zoom detail
@@ -687,6 +703,10 @@ class Plot:
                     and self._maybe_gpu_tile(data, clim, axes, units)):
                 if _NAV_PROFILE:
                     _pt["transport"] = _time.perf_counter() - _st
+                    stages = "  ".join(f"{k}={v*1e3:.1f}" for k, v in _pt.items())
+                    logger.info(
+                        "[PAINT-PROFILE] SIG-TILE total=%.1fms  %s  in=%s",
+                        (_time.perf_counter() - _p0) * 1e3, stages, _in_shape)
                 return
             if axes is not None:
                 self._plot2d.set_data(data, x_axis=axes[0], y_axis=axes[1],
@@ -749,7 +769,21 @@ class Plot:
         if self.window_id is None:
             return
         try:
-            finite = data[np.isfinite(data)]
+            # Subsample a large frame the same way _robust_levels does (≤ ~512²
+            # samples): a 64-bin histogram from 262k samples is display-identical
+            # to the full-frame one, while a full pass over a 16 M-px movie frame
+            # is memory-bandwidth-bound — measured 11.7 s (!) for this block while
+            # the navigator fill's worker processes saturated the machine (the
+            # signal panel sat black exactly that long). Integer frames skip the
+            # isfinite mask entirely (nothing to mask; it copies 16 MB for fun).
+            sub = data
+            if sub.ndim == 2 and max(sub.shape) > 512:
+                sub = sub[::max(1, sub.shape[0] // 512),
+                          ::max(1, sub.shape[1] // 512)]
+            if np.issubdtype(sub.dtype, np.integer):
+                finite = sub.ravel()
+            else:
+                finite = sub[np.isfinite(sub)]
             if finite.size == 0:
                 return
             counts, edges = np.histogram(finite, bins=64)

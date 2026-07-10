@@ -574,10 +574,11 @@ def _direct_read_frame(current_signal, selector, indices, prof, child=None):
         # not a display bug. Compare to the initial-load frame's count.
         try:
             _f = np.asarray(frame)
-            if _f.ndim == 2 and min(_f.shape) >= 200:
+            if _f.ndim == 2 and min(_f.shape) >= 200 \
+                    and log.isEnabledFor(logging.DEBUG):
                 _cy, _cx = _f.shape[0] // 2, _f.shape[1] // 2
                 _crop = _f[_cy - 41:_cy + 41, _cx - 41:_cx + 41]
-                log.warning(
+                log.debug(
                     "[TILEDBG] _direct_read_frame OFF-DISK shape=%s dtype=%s "
                     "center82_distinct=%d region=%s",
                     _f.shape, _f.dtype, int(np.unique(_crop).size), is_region)

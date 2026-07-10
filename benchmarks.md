@@ -514,3 +514,31 @@ to float64 (shifting contrast/levels). The unified read must reproduce the
 distributed rounding for integer data (round-to-dtype on the region mean). Small
 fix, but it's a real display-correctness constraint — noted for the Phase-2 rewire.
 (Single-frame reads match exactly; only the multi-point integrating region rounds.)
+
+### First paint of a 16 GB movie + navigator sidecar (2026-07-10)
+
+Repro: `D:\20251117_88075_run3 some growth_1236_movie.mrc` (977 x 4096 x 4096 uint8,
+16.8 MB frames), fresh open with a running distributed navigator fill.
+
+The signal panel sat BLACK long after the frame was read (`_set_array` entered at
+~2.5 s): stage-timestamping showed the first paint's auto-level block took
+**11.7 s** — `_emit_histogram` ran `np.isfinite` + `np.histogram` over the FULL
+16 M-px frame while the fill's worker processes saturated memory bandwidth.
+Subsampling the histogram input to ≤512² (like `_robust_levels`) + skipping the
+isfinite mask for integer dtypes: **11,660 ms → 22 ms**. Second stall: lazy
+`import torch` in `GpuTileBackend` on the painter thread (~3.3 s idle, worse under
+load; and a sys.modules poke at a MID-IMPORT torch blocks on the import lock —
+measured 11 s) → background `prewarm_torch_cuda()` at startup + flag-only
+readiness + numpy-first tile that upgrades to CUDA when the prewarm lands.
+
+End-to-end (first_paint_real_load.spec.ts, real file, dask):
+
+| stage | before | after |
+|---|---:|---:|
+| signal panel first content (fresh open, fill running) | never (until nav move / fill end) | **5.3 s** (0.5 s after windows) |
+| navigator on REOPEN (sidecar `<file>.spyde-nav.npz`) | ~52 s whole-file fill | **4.4 s** (real data at window-open) |
+| navigator fill (977 x 16.8 MB read) | ~52 s | ~52 s + "Computing navigator… N%" status |
+
+The fill is also DEFERRED until the signal plot's first frame lands
+(`_start_nav_compute_after_first_frame`) so the first frame wins the disk, and the
+completed fill writes the sidecar for the next open.

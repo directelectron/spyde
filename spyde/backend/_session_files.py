@@ -584,7 +584,7 @@ class FileLoaderMixin:
             # 0,1,2,… (the user can rename/calibrate it in the Axes dock). Running
             # the single-file prompt here would also wrongly stamp the scan step
             # onto the stack axis (it calibrates every nav axis).
-            self._add_signal(new, source_path=paths[0])
+            self._add_signal(new, source_path=paths[0], enable_nav_sidecar=False)
             emit_status(
                 f"Stacked {len(paths)} files → "
                 f"{tuple(new.axes_manager.navigation_shape)} nav "
