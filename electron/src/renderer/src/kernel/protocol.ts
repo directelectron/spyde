@@ -81,6 +81,14 @@ export interface WindowClosedMessage extends MsgBase {
   window_id: number
 }
 
+/** A lightweight rename — updates the header [Name] of every listed window's
+ *  tree WITHOUT re-emitting the figure (no iframe reload). */
+export interface WindowTitleMessage extends MsgBase {
+  type: 'window_title'
+  window_ids?: number[]
+  title?: string
+}
+
 export interface StateUpdateMessage extends MsgBase {
   type: 'state_update'
   fig_id: string
@@ -238,6 +246,36 @@ export interface ConsoleCompletionsMessage extends MsgBase {
   matches: string[]
 }
 
+/**
+ * Live-preview reply for a `console_preview` request (the eye-toggled
+ * thumbnail/sparkline/scalar). `preview_id` echoes the requester's id so the
+ * renderer can drop stale replies (newest-wins). `kind` selects the render:
+ *   • image      — `data_b64` is raw uint8 GRAYSCALE, row-major, length w*h
+ *   • sparkline  — `points` (≤512; `null` = a gap in the line)
+ *   • scalar     — `text` (a short repr)
+ *   • unavailable— `reason` (may be "" → render quietly / keep prior content)
+ */
+export interface ConsolePreviewResultMessage extends MsgBase {
+  type: 'console_preview_result'
+  preview_id: number
+  kind: 'image' | 'sparkline' | 'scalar' | 'unavailable'
+  w?: number
+  h?: number
+  data_b64?: string
+  points?: (number | null)[]
+  text?: string
+  shape?: number[] | null
+  dtype?: string | null
+  reason?: string
+  elapsed_ms?: number
+}
+
+/** A workflow-node bind completed; the backend assigned it `name`. */
+export interface ConsoleNodeBoundMessage extends MsgBase {
+  type: 'console_node_bound'
+  name: string
+}
+
 export interface LogMessage extends MsgBase {
   type: 'log'
   level: unknown
@@ -282,6 +320,7 @@ export type PlotAppMessage =
   | ToolbarConfigMessage
   | WindowVisibilityMessage
   | WindowClosedMessage
+  | WindowTitleMessage
   | StateUpdateMessage
   | StateUpdateBinaryMessage
   | CompositionMessage
@@ -300,6 +339,8 @@ export type PlotAppMessage =
   | ConsoleResultMessage
   | ConsoleVarsMessage
   | ConsoleCompletionsMessage
+  | ConsolePreviewResultMessage
+  | ConsoleNodeBoundMessage
   | LogMessage
   | LogBackfillMessage
   | LogLevelMessage

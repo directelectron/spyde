@@ -75,7 +75,11 @@ class AxesEditorMixin:
             return
 
         # Recalibrate: re-push every plot in the tree (re-reads the axes →
-        # updated scale bar / extent) and re-emit the table + metadata.
+        # updated scale bar / extent) and re-emit the table + metadata. A
+        # navigator plot reads the ROOT's navigation axes directly on repaint
+        # (Plot._axes_info / _axes_info_1d branch on is_navigator), so editing a
+        # navigation axis here reaches the navigator panel via this same re-push
+        # — no separate mirror onto the derived navigator signal is needed.
         for p in list(self._plots):
             if getattr(p, "signal_tree", None) is tree:
                 try:
@@ -92,6 +96,38 @@ class AxesEditorMixin:
             })
         except Exception as e:
             log.debug("re-emitting metadata failed: %s", e)
+
+    def _set_title(self, plot, payload: dict) -> None:
+        """Rename the dataset (the breadcrumb's [Name] segment). Writes the root
+        signal's ``General.title`` — shared by the signal AND navigator windows of
+        the tree — then re-applies the in-panel title strip and emits a
+        lightweight ``window_title`` update to every window of the tree (no figure
+        re-emit, so the iframe doesn't reload)."""
+        if plot is None:
+            return
+        tree = getattr(plot, "signal_tree", None)
+        if tree is None:
+            return
+        title = str(payload.get("title", "")).strip()
+        if not title:
+            return
+        try:
+            tree.root.metadata.set_item("General.title", title)
+        except Exception as e:
+            log.warning("set_title failed: %s", e)
+            return
+        # Re-apply the in-panel title strip on every plot of the tree.
+        for p in list(self._plots):
+            if getattr(p, "signal_tree", None) is tree:
+                try:
+                    p._apply_plot_title()
+                except Exception as e:
+                    log.debug("re-applying plot title failed: %s", e)
+        ipc.emit({
+            "type": "window_title",
+            "window_ids": self._tree_window_ids(tree),
+            "title": title,
+        })
 
     def _set_offset_crosshair(self, plot, payload: dict) -> None:
         """Toggle a draggable "set origin" crosshair on the ACTIVE plot.

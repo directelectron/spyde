@@ -2,8 +2,33 @@ import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { SubWindow } from './SubWindow'
 import type { Rect } from './SubWindow'
 import { WindowContent } from './WindowContent'
-import { useSpyDE } from '../kernel/SpyDEContext'
+import {
+  useSpyDE, type SpyDEWindow, type NavigatorOptions,
+} from '../kernel/SpyDEContext'
 import { NAVIGATOR_DRAG_MIME, CONSOLE_VAR_DRAG_MIME } from '../kernel/dnd'
+import { Pill, type PillSegment, type WindowPillPayload } from './Pill'
+
+// A compact breadcrumb for a window: a small S-/N- kind badge + the editable
+// dataset name, e.g. `S-my_scan` / `N-my_scan`. No trailing Root/nav segment —
+// kept short so the pill doesn't crowd the titlebar.
+function buildBreadcrumb(win: SpyDEWindow): PillSegment[] {
+  const name = win.title || (win.isNavigator ? 'Navigator' : 'Signal')
+  return [
+    { text: win.isNavigator ? 'N-' : 'S-', tone: 'muted', prefix: true },
+    { text: name, tone: 'accent', testid: 'breadcrumb-name' },
+  ]
+}
+
+function windowPayloadFor(
+  win: SpyDEWindow, navigatorOptions: Map<number, NavigatorOptions>,
+): WindowPillPayload {
+  const nav = win.isNavigator ? navigatorOptions.get(win.windowId) : undefined
+  return {
+    windowId: win.windowId,
+    isNavigator: win.isNavigator,
+    navName: nav?.current || nav?.names?.[0] || 'base',
+  }
+}
 
 // Tiling: near-square grid (rows x cols) sized to fit `n` windows, cols first
 // so wide areas get more columns than rows.
@@ -134,6 +159,12 @@ export function MDIArea() {
     setMinimized(prev => new Set(prev).add(id))
     setFocusOrder(prev => prev.filter(x => x !== id))
   }, [])
+
+  // Rename the dataset (double-click the breadcrumb Name). Sends set_title to the
+  // backend, which updates the shared root title on every window of the tree.
+  const handleRename = useCallback((windowId: number, name: string) => {
+    sendAction('set_title', { title: name }, windowId)
+  }, [sendAction])
 
   const handleRestore = useCallback((id: string) => {
     setMinimized(prev => {
@@ -282,19 +313,20 @@ export function MDIArea() {
 
   return (
     <div style={styles.outer}>
-      {/* Top bar listing minimized windows — click a chip to restore. */}
+      {/* Top bar listing minimized windows — the SAME breadcrumb pill as the
+          header. Click restores; it's also draggable (drop into MDI/console). */}
       {minimizedWins.length > 0 && (
         <div data-testid="minimized-bar" style={styles.minBar}>
           {minimizedWins.map(w => (
-            <button
+            <Pill
               key={w.windowId}
-              data-testid={`min-chip-${w.windowId}`}
-              style={styles.minChip}
-              title={w.title}
+              testid={`min-chip-${w.windowId}`}
+              size="sm"
+              segments={buildBreadcrumb(w)}
+              window={windowPayloadFor(w, state.navigatorOptions)}
+              title={`${w.title} — click to restore, drag to add/bind`}
               onClick={() => handleRestore(String(w.windowId))}
-            >
-              <span style={styles.minChipTitle}>{w.title}</span>
-            </button>
+            />
           ))}
         </div>
       )}
@@ -319,6 +351,9 @@ export function MDIArea() {
               id={id}
               windowId={win.windowId}
               title={win.title}
+              breadcrumb={buildBreadcrumb(win)}
+              windowPayload={windowPayloadFor(win, state.navigatorOptions)}
+              onRename={handleRename}
               initialX={pos.x}
               initialY={pos.y}
               initialW={initW}
@@ -369,15 +404,6 @@ const styles: Record<string, React.CSSProperties> = {
     display: 'flex', alignItems: 'center', gap: 6,
     padding: '4px 8px', flexShrink: 0,
     background: '#181825', borderBottom: '1px solid #313244',
-  },
-  minChip: {
-    display: 'flex', alignItems: 'center', gap: 5,
-    background: '#1e1e2e', border: '1px solid #313244', borderRadius: 6,
-    color: '#cdd6f4', cursor: 'pointer', fontSize: 11, padding: '3px 10px',
-    maxWidth: 180,
-  },
-  minChipTitle: {
-    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
   },
   area: {
     flex: 1,

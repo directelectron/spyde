@@ -145,24 +145,21 @@ test('math console: exec, chip drag-to-MDI, signal drag-in, mask, arithmetic, ' 
     await waitForSubwindowCount(page, 3, 60_000)
     await page.waitForTimeout(2000)
 
-    // Movie's Signal window: subwindow titles are generic ("Signal" /
-    // "Navigator"), not the dataset name — so identify it as the newest
-    // non-Navigator subwindow (the noise window from step 2 is titled "out1",
-    // distinct from the movie's default "Signal" title).
+    // Movie's Signal window: the compact breadcrumb pill reads "S-test_data_movie"
+    // (signal windows start "S-", navigators "N-"). Pick the newest signal window
+    // that isn't the noise window from step 2 (titled "out1").
     const movieSignalWindow = page.getByTestId('subwindow')
-      .filter({ hasNotText: 'Navigator' })
+      .filter({ has: page.getByTestId('window-breadcrumb').filter({ hasText: /^S-/ }) })
       .filter({ hasNotText: 'out1' })
       .last()
     await expect(movieSignalWindow).toBeVisible({ timeout: 15_000 })
-    const gripTestId = 'console-ref-handle'
-    // Scope the grip lookup to the movie signal window specifically, since
-    // multiple SubWindows each have their own grip with the same test id.
-    const grip = movieSignalWindow.getByTestId(gripTestId)
+    // The whole breadcrumb PILL is the signal's drag source (it sets the
+    // signal-ref MIME among others). Drag it into the console input.
+    const grip = movieSignalWindow.getByTestId('window-breadcrumb')
     await expect(grip).toBeVisible({ timeout: 10_000 })
 
-    // Give each SubWindow's grip a unique marker attribute so the in-page
-    // evaluate can target THIS window's grip specifically (data-testid is not
-    // unique across windows).
+    // Give this window's pill a unique marker so the in-page evaluate targets it
+    // specifically (data-testid is not unique across windows).
     await grip.evaluate((el: HTMLElement) => el.setAttribute('data-console-drag-src', '1'))
     await input.click()
     await input.fill('')
@@ -232,6 +229,22 @@ test('math console: exec, chip drag-to-MDI, signal drag-in, mask, arithmetic, ' 
     await waitForSubwindowCount(page, subwindowCountBeforeArith + 1, 30_000)
     await page.waitForTimeout(1500)
     await shot(page, ++shotN, 'arith-window-open')
+
+    // ── 4b. Chip removal: the hover-revealed × drops the result ─────────────
+    // console_remove_var → the backend drops out2 from namespace + registry →
+    // the refreshed console_vars removes the chip. The name must then be
+    // UNDEFINED in the namespace (exec it → NameError), proving a real remove,
+    // not a cosmetic hide.
+    await arithChip.hover()
+    await page.getByTestId('console-chip-remove-out2').click()
+    await expect(arithChip, 'out2 chip should disappear after clicking its ×')
+      .toHaveCount(0, { timeout: 10_000 })
+    await shot(page, ++shotN, 'chip-removed')
+    await input.fill('out2')
+    await input.press('Enter')
+    const removeErrorToggle = page.getByTestId('console-error-toggle')
+    await expect(removeErrorToggle, 'removed name must be undefined').toBeVisible({ timeout: 10_000 })
+    await expect(removeErrorToggle).toContainText('NameError')
 
     // ── 5. Error path: 1/0 → red echo, click-to-expand traceback ─────────────
     await input.fill('1/0')

@@ -103,6 +103,25 @@ export interface ConsoleResult {
   result: ConsoleVarKind | null
 }
 
+/**
+ * The console live-preview reply (eye-toggled thumbnail/sparkline/scalar) — the
+ * camelCase mirror of `ConsolePreviewResultMessage`. `previewId` gates
+ * newest-wins in ConsoleBar; `kind` selects the ConsolePreviewSlot render.
+ */
+export interface ConsolePreviewResult {
+  previewId: number
+  kind: 'image' | 'sparkline' | 'scalar' | 'unavailable'
+  w: number
+  h: number
+  dataB64: string
+  points: (number | null)[] | null
+  text: string
+  shape: number[] | null
+  dtype: string | null
+  reason: string
+  elapsedMs: number
+}
+
 export interface SelectorInfo {
   windowId: number
   mode: 'crosshair' | 'integrate'
@@ -154,6 +173,7 @@ interface State {
   consoleResult: ConsoleResult | null       // last-executed cell (the ConsoleBar echo strip)
   consoleVars: ConsoleVarEntry[]            // live variable table (chips + signal-ref resolution)
   consoleCompletions: { completeId: number; matches: string[] } | null
+  consolePreview: ConsolePreviewResult | null   // last live-preview reply (the eye-toggled slot)
 }
 
 // Backend `nav_shape_prompt`: confirm the scan grid + step size before opening a
@@ -171,6 +191,7 @@ type Action =
   | { type: 'READY'; dashboardUrl?: string }
   | { type: 'STATUS'; text: string }
   | { type: 'FIGURE'; windowId: number; figId: string; fileUrl: string | null; title: string; isNavigator: boolean; aspect?: number; view?: string; viewLabel?: string; viewKind?: string; strainComponents?: string[] }
+  | { type: 'WINDOW_TITLE'; windowId: number; title: string }
   | { type: 'TOOLBAR_CONFIG'; windowId: number; plotId: number; actions: ToolbarAction[] }
   | { type: 'WINDOW_VISIBILITY'; windowId: number; visible: boolean }
   | { type: 'WINDOW_CLOSED'; windowId: number }
@@ -196,6 +217,7 @@ type Action =
   | { type: 'CONSOLE_RESULT'; result: ConsoleResult }
   | { type: 'CONSOLE_VARS'; vars: ConsoleVarEntry[] }
   | { type: 'CONSOLE_COMPLETIONS'; completeId: number; matches: string[] }
+  | { type: 'CONSOLE_PREVIEW_RESULT'; preview: ConsolePreviewResult }
 
 function spydeReducer(state: State, action: Action): State {
   switch (action.type) {
@@ -269,6 +291,14 @@ function spydeReducer(state: State, action: Action): State {
         (action.isNavigator ? null : action.windowId)
 
       return { ...state, windows: newWindows, figures: newFigures, activeWindowId }
+    }
+
+    case 'WINDOW_TITLE': {
+      const win = state.windows.get(action.windowId)
+      if (!win || win.title === action.title) return state
+      const newWindows = new Map(state.windows)
+      newWindows.set(action.windowId, { ...win, title: action.title })
+      return { ...state, windows: newWindows }
     }
 
     case 'TOOLBAR_CONFIG': {
@@ -415,6 +445,9 @@ function spydeReducer(state: State, action: Action): State {
         consoleCompletions: { completeId: action.completeId, matches: action.matches },
       }
 
+    case 'CONSOLE_PREVIEW_RESULT':
+      return { ...state, consolePreview: action.preview }
+
     case 'SIGNAL_TREE': {
       const signalTrees = new Map(state.signalTrees)
       signalTrees.set(action.windowId, action.tree)
@@ -521,6 +554,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     consoleResult: null,
     consoleVars: [],
     consoleCompletions: null,
+    consolePreview: null,
   })
 
   const iframeRefs = useRef<Map<string, HTMLIFrameElement>>(new Map())
@@ -617,6 +651,16 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
           })
           break
         }
+
+        case 'window_title':
+          // Lightweight title update (a rename) — updates every listed window's
+          // header name WITHOUT re-emitting the figure (which would reload the
+          // iframe). window_ids covers the whole tree so the signal + navigator
+          // windows' shared [Name] segment both refresh.
+          for (const wid of (msg.window_ids || [])) {
+            dispatch({ type: 'WINDOW_TITLE', windowId: wid, title: msg.title || '' })
+          }
+          break
 
         case 'toolbar_config':
           dispatch({
@@ -842,6 +886,28 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
           })
           break
 
+        case 'console_preview_result':
+          // Live-preview reply (the eye-toggled slot). Kept in the reducer so
+          // ConsoleBar can gate newest-wins on preview_id; the camelCase mirror
+          // matches ConsolePreviewResult.
+          dispatch({
+            type: 'CONSOLE_PREVIEW_RESULT',
+            preview: {
+              previewId: Number(msg.preview_id ?? 0),
+              kind: (msg.kind as ConsolePreviewResult['kind']) ?? 'unavailable',
+              w: Number(msg.w ?? 0),
+              h: Number(msg.h ?? 0),
+              dataB64: String(msg.data_b64 ?? ''),
+              points: (msg.points as (number | null)[] | undefined) ?? null,
+              text: String(msg.text ?? ''),
+              shape: (msg.shape as number[] | null | undefined) ?? null,
+              dtype: (msg.dtype as string | null | undefined) ?? null,
+              reason: String(msg.reason ?? ''),
+              elapsedMs: Number(msg.elapsed_ms ?? 0),
+            },
+          })
+          break
+
         case 'log':
           dispatch({ type: 'LOG', entry: {
             level: String(msg.level), name: String(msg.name),
@@ -857,9 +923,10 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
           dispatch({ type: 'LOG_LEVEL', level: String(msg.level) })
           break
 
-        // Wizard-scoped events (live fit readout + library-ready). Re-broadcast
-        // as DOM CustomEvents so the relevant caret component can subscribe
-        // without threading them through the global reducer.
+        // Wizard-scoped events (live fit readout + library-ready) + the
+        // workflow-node bind ack. Re-broadcast as DOM CustomEvents so the
+        // relevant component (a caret; ConsoleBar for console_node_bound) can
+        // subscribe without threading them through the global reducer.
         case 'vom_fit':
         case 'vom_library_ready':
         case 'om_library_ready':
@@ -867,6 +934,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'cod_results':
         case 'cod_cif_ready':
         case 'gpu_status_result':
+        case 'console_node_bound':
           window.dispatchEvent(new CustomEvent(`spyde:${msg.type}`, { detail: msg }))
           break
       }

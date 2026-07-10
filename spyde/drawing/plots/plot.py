@@ -107,15 +107,20 @@ _SUPERSCRIPTS = {
 def _clean_units(u) -> str:
     """Turn a HyperSpy/LaTeX-ish units string into clean unicode for display.
 
-    e.g. ``$A^{-1}$`` → ``Å⁻¹`` (raw LaTeX showed literally in anyplotlib axis
-    labels / scale bar). Strips ``$`` math delimiters and braces, maps common
-    superscripts, and uses the reciprocal-ångström convention (A⁻¹ → Å⁻¹).
+    e.g. ``$A^{-1}$`` or pyxem's ``$\\AA^{-1}$`` → ``Å⁻¹`` (raw LaTeX showed
+    literally in anyplotlib axis labels / scale bar). Strips ``$`` math
+    delimiters and braces, expands the LaTeX ångström macro (``\\AA`` /
+    ``\\angstrom`` → ``Å``), maps common superscripts, and uses the
+    reciprocal-ångström convention (A⁻¹ → Å⁻¹).
     """
     s = str(u).strip().replace("$", "")
+    # LaTeX ångström macro(s) → the Å glyph, BEFORE the superscript/`A⁻¹` maps so
+    # pyxem's `$\AA^{-1}$` resolves to Å⁻¹ (not a literal backslash on the plot).
+    s = s.replace("\\AA", "Å").replace("\\angstrom", "Å").replace("\\text{Å}", "Å")
     for k, v in _SUPERSCRIPTS.items():
         s = s.replace(k, v)
     s = s.replace("{", "").replace("}", "")
-    s = s.replace("A⁻¹", "Å⁻¹")   # A⁻¹ → Å⁻¹
+    s = s.replace("A⁻¹", "Å⁻¹")   # bare A⁻¹ → Å⁻¹
     return s
 
 
@@ -168,8 +173,17 @@ def finalize_figure_html(fig, fig_id) -> str:
     except Exception as e:
         logger.debug("shared-esm optimization skipped: %s", e)
 
-    dark = ("<style>html,body{background:#1e1e2e !important;color-scheme:dark}"
-            "#widget-root{background:#1e1e2e !important}</style>")
+    # The standalone template pins html/body to the figure's INITIAL px size with
+    # overflow:hidden (sized for a fixed docs/notebook embed). SpyDE drives the
+    # size live via resize_figure (fig_width/height → the panels re-layout), so
+    # when the subwindow is dragged LARGER than that initial size the grown figure
+    # was clipped to the old body box. Make html/body/#widget-root fill the iframe
+    # (100%) so the figure always fills — and is never clipped by — the subwindow.
+    dark = ("<style>html,body{background:#1e1e2e !important;color-scheme:dark;"
+            "width:100% !important;height:100% !important;overflow:hidden}"
+            "#widget-root{background:#1e1e2e !important;"
+            "width:100% !important;height:100% !important;display:block !important}"
+            "</style>")
     focus = ("<script>window.addEventListener('pointerdown',function(){"
              "try{window.parent.postMessage({type:'spyde_focus',figId:%r},'*');}"
              "catch(e){}},true);</script>" % str(fig_id))
@@ -405,7 +419,11 @@ class Plot:
                              (_time.perf_counter() - _t2) * 1e3)
                 if axes is not None:
                     try:
-                        p2.set_extent(axes[0], axes[1])
+                        # set_extent carries the units so the tiled/GPU image
+                        # draws physical tick gutters + the scale bar (set_extent
+                        # sets has_axes=True). Without units here a calibrated
+                        # signal shows ticks but no scale bar.
+                        p2.set_extent(axes[0], axes[1], units=units)
                         self._last_extent_key = (
                             float(axes[0][0]), float(axes[0][-1]),
                             float(axes[1][0]), float(axes[1][-1]),
@@ -425,6 +443,22 @@ class Plot:
                                     self._plot2d._state.get("display_max")):
                     self._plot2d._state["display_min"] = float(vmin)
                     self._plot2d._state["display_max"] = float(vmax)
+                # Re-apply the calibrated axes ONLY when they actually changed
+                # (an Axes-editor edit of scale/offset/units) — the common movie
+                # scrub keeps the same extent and skips this so there's one push
+                # per frame. Without this, a scale/units edit on a tiled plot
+                # updates the model but the ticks/scale bar never move.
+                if axes is not None:
+                    ext_key = (float(axes[0][0]), float(axes[0][-1]),
+                               float(axes[1][0]), float(axes[1][-1]),
+                               int(data.shape[0]), int(data.shape[1]))
+                    if (ext_key != getattr(self, "_last_extent_key", None)
+                            or units != self._plot2d._state.get("units")):
+                        try:
+                            p2.set_extent(axes[0], axes[1], units=units)
+                            self._last_extent_key = ext_key
+                        except Exception as e:
+                            logger.debug("gpu-tile re-extent failed: %s", e)
                 p2.update_tile_source()
             return True
         except Exception as e:
@@ -519,27 +553,121 @@ class Plot:
         except Exception as e:
             logger.debug("[plot] set_overlay_mask failed: %s", e)
 
+    def _display_axes(self):
+        """The axis objects that calibrate THIS plot's displayed image.
+
+        A NAVIGATOR plot shows the navigation space, so its display axes are the
+        ROOT signal's *navigation* axes (the objects the Axes editor's set_axis
+        mutates) — NOT its current_signal's signal axes, which are a decoupled
+        copy on the derived `root.sum(signal_axes)` navigator signal that never
+        tracks later edits. Reading the root nav axes here is what makes a
+        nav-axis rename/rescale reach the navigator panel on the set_axis
+        re-push. A SIGNAL plot uses its current_signal's signal axes as before
+        (those ARE the mutated root/node axis objects). Mirrors the is_navigator
+        branch already in enable_scale_bar / _set_offset_crosshair."""
+        if self.is_navigator:
+            return list(self.signal_tree.root.axes_manager.navigation_axes)
+        return list(self.plot_state.current_signal.axes_manager.signal_axes)
+
     def _axes_info(self, data: np.ndarray):
-        """Return (axes, units) for the displayed 2-D image from the current
-        signal's signal axes, so anyplotlib draws a calibrated scale bar.
+        """Return (axes, units) for the displayed 2-D image from this plot's
+        display axes, so anyplotlib draws calibrated ticks + a scale bar.
 
         The scale bar auto-renders whenever units are physical (not 'px') and a
         scale is present — matching the Qt scale-bar overlay.
         """
         try:
-            sig = self.plot_state.current_signal
-            sig_axes = sig.axes_manager.signal_axes
-            if len(sig_axes) < 2 or data.ndim != 2:
+            axes = self._display_axes()
+            if len(axes) < 2 or data.ndim != 2:
                 return None, "px"
-            x_ax, y_ax = sig_axes[0], sig_axes[1]
-            units = x_ax.units
-            if not units or units in ("<undefined>", "px", ""):
+            x_ax, y_ax = axes[0], axes[1]
+            units = str(x_ax.units)
+            if units in ("<undefined>", "px", ""):
                 return None, "px"
             xa = np.asarray(x_ax.axis)
             ya = np.asarray(y_ax.axis)
             return [xa, ya], _clean_units(units)
         except Exception:
             return None, "px"
+
+    def _axes_info_1d(self, data: np.ndarray):
+        """Return (x_axis, x_units, y_label) for a displayed 1-D signal so the
+        anyplotlib line plot draws a calibrated x-axis + an x/y-axis label.
+
+        x-axis: the current signal's single signal axis (`.axis` gives the
+        expanded coordinate array; `.units`/`.name` label it). y-label: the
+        signal's `metadata.Signal.quantity` when set (hyperspy's convention),
+        else a generic "Intensity". Returns (None, "", y_label) when there's no
+        1-D signal so the caller falls back to an uncalibrated push.
+        """
+        y_label = "Intensity"
+        try:
+            sig = self.plot_state.current_signal
+            # Action-declared y-label wins (e.g. a line profile's "Intensity"),
+            # then the signal's own quantity metadata, then the default.
+            act_label = getattr(self, "_y_label_override", None)
+            if act_label:
+                y_label = str(act_label)
+            else:
+                try:
+                    q = sig.metadata.get_item("Signal.quantity", default="")
+                    if q:
+                        y_label = _clean_units(q)
+                except Exception:
+                    pass
+            # A 1-D NAVIGATOR (e.g. a movie's time axis) is calibrated by the
+            # ROOT's navigation axis, not the derived nav signal's copy — see
+            # _display_axes — so a nav-axis edit reaches the line plot.
+            axes = self._display_axes()
+            if len(axes) < 1 or data.ndim != 1:
+                return None, "", y_label
+            x_ax = axes[0]
+            # hyperspy uses a `<undefined>` sentinel object (str() == "<undefined>"
+            # but not == the string) for unset units/name — stringify before the
+            # "is it meaningful?" check so the sentinel is treated as empty.
+            units = str(x_ax.units)
+            x_units = ("" if units in ("<undefined>", "px", "")
+                       else _clean_units(units))
+            # Prefix the axis name when present ("Energy (eV)" style) so the
+            # label reads meaningfully; fall back to bare units.
+            name = str(getattr(x_ax, "name", "") or "")
+            if name and name not in ("<undefined>", ""):
+                x_units = (f"{name} ({x_units})" if x_units else name)
+            xa = np.asarray(x_ax.axis, dtype=float)
+            if xa.shape[0] != data.shape[0]:
+                # Axis/data length mismatch (e.g. a placeholder frame) — don't
+                # push a bad x-axis; keep the default 0..N-1.
+                return None, x_units, y_label
+            return xa, x_units, y_label
+        except Exception:
+            return None, "", y_label
+
+    def _plot_title(self) -> str:
+        """The dataset name to show as the panel title (drawn in anyplotlib's
+        always-reserved title strip). Reads the signal's General.title; empty
+        string means no title (the strip stays blank)."""
+        try:
+            sig = self.plot_state.current_signal
+            t = sig.metadata.get_item("General.title", default="")
+            return str(t or "")
+        except Exception:
+            return ""
+
+    def _apply_plot_title(self) -> None:
+        """Push the current signal's title into the anyplotlib panel so the name
+        renders inside the plot (not only on the Electron window chrome). Called
+        on figure creation / node switch — cheap, and safe to repeat."""
+        p2 = getattr(self, "_plot2d", None)
+        p1 = getattr(self, "_plot1d", None)
+        target = p2 if p2 is not None else p1
+        if target is None or not hasattr(target, "set_title"):
+            return
+        try:
+            title = self._plot_title()
+            if title != (target._state.get("title") or ""):
+                target.set_title(title)
+        except Exception as e:
+            logger.debug("applying plot title failed: %s", e)
 
     def _is_navigated_frame(self) -> bool:
         """True when this plot shows a frame sliced from a NAVIGATED dataset (a
@@ -641,6 +769,12 @@ class Plot:
             return
 
         self._ensure_figure(dims)
+
+        # Keep the dataset name in the panel's title strip. Cheap (a compare;
+        # only pushes when the title actually changed) and covers the case where
+        # the name was stamped AFTER the first set_plot_state (dynamic signal
+        # plots paint their first real frame later than the node switch).
+        self._apply_plot_title()
 
         # NO SpyDE-side level-of-detail / decimation. anyplotlib's tile mode owns ALL
         # downscaling for a large frame: set_data(tile="auto") sends a downsampled
@@ -756,7 +890,18 @@ class Plot:
                 except Exception:
                     pass
         elif dims == 1 and self._plot1d is not None:
-            self._plot1d.set_data(data)
+            # Calibrate the line plot from the signal's own axis: pass the x
+            # coordinate array + x-axis label (units/name) and a y-axis label so
+            # the panel shows real ticks and labels — and re-reads them every
+            # paint, so an Axes-editor edit (scale/offset/units) propagates via
+            # the existing p.update() re-push. Falls back to a bare push when
+            # there's no calibrated 1-D signal.
+            xa, x_units, y_label = self._axes_info_1d(data)
+            if xa is not None:
+                self._plot1d.set_data(data, x_axis=xa, units=x_units,
+                                      y_units=y_label)
+            else:
+                self._plot1d.set_data(data, units=x_units, y_units=y_label)
 
     def _emit_histogram(self, data: np.ndarray, vmin: float, vmax: float,
                         threshold: float = None) -> None:
@@ -935,6 +1080,9 @@ class Plot:
         dims = new_state.dimensions
         self._ensure_figure(dims)
         new_state.show_toolbars()
+        # Show the dataset name inside the panel (title strip), now that the
+        # active signal is known. Re-applied on every node switch.
+        self._apply_plot_title()
 
         # Static plots (e.g. the navigator image) display the signal's own data
         # directly. Dynamic plots (driven by a selector) are filled by the

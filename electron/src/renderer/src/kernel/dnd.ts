@@ -21,8 +21,13 @@
  *                        JSON {name}. Dropping it on the MDI area sends
  *                        `console_create_window` to open it as a new signal
  *                        window.
+ * WORKFLOW_NODE_DRAG_MIME — dragging a node from the Workflow tree (Plot Control
+ *                        dock); payload = JSON {windowId, signalId, name}.
+ *                        Dropping it on the ConsoleBar binds that tree node into
+ *                        the console namespace and inserts its variable name.
  */
 export const WINDOW_DRAG_MIME = 'application/x-spyde-window'
 export const NAVIGATOR_DRAG_MIME = 'application/x-spyde-navigator'
 export const SIGNAL_REF_DRAG_MIME = 'application/x-spyde-signal-ref'
 export const CONSOLE_VAR_DRAG_MIME = 'application/x-spyde-console-var'
+export const WORKFLOW_NODE_DRAG_MIME = 'application/x-spyde-workflow-node'

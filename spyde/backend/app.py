@@ -199,10 +199,17 @@ def _dispatch_console(session, msg: dict) -> None:
         session.console.submit_exec(str(msg.get("code", "")), int(msg.get("exec_id", 0)))
     elif command == "console_create_window":
         session.console.create_window(str(msg.get("name", "")))
+    elif command == "console_preview":
+        session.console.submit_preview(
+            str(msg.get("code", "")), int(msg.get("preview_id", 0)),
+            bool(msg.get("auto", True)),
+        )
     elif command == "console_complete":
         session.console.submit_complete(
             str(msg.get("prefix", "")), int(msg.get("complete_id", 0))
         )
+    elif command == "console_remove_var":
+        session.console.remove_var(str(msg.get("name", "")))
     else:
         log.warning("[backend] unknown console command: %s", command)
 

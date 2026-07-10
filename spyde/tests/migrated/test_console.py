@@ -539,3 +539,57 @@ class TestDispatchWiring:
         res = _wait_for(msgs, lambda m: m.get("type") == "console_result"
                         and m.get("exec_id") == 66)
         assert res is not None and res["value_repr"] == "42"
+
+
+# ── chip removal (the chip's × → console_remove_var) ─────────────────────────
+
+
+class TestRemoveVar:
+    def test_remove_assigned_var(self, window):
+        session, msgs = window["window"], window["messages"]
+        _exec(session, msgs, "a = 5")
+        _wait_vars(session, msgs, lambda c: any(v["name"] == "a" for v in c["vars"]))
+
+        session.console.remove_var("a")
+        cv = _wait_vars(session, msgs, lambda c: not any(
+            v["name"] == "a" for v in c["vars"]))
+        assert not any(v["name"] == "a" for v in cv["vars"])
+        # The name is really gone from the namespace, not just the chip list.
+        res = _exec(session, msgs, "a")
+        assert res is not None and not res["ok"]
+
+    def test_remove_out_chip(self, window):
+        session, msgs = window["window"], window["messages"]
+        _exec(session, msgs, "1 + 1")
+        cv = _wait_vars(session, msgs, lambda c: any(
+            v["source"] == "out" for v in c["vars"]))
+        out_name = next(v["name"] for v in cv["vars"] if v["source"] == "out")
+        session.console.remove_var(out_name)
+        cv = _wait_vars(session, msgs, lambda c: not any(
+            v["name"] == out_name for v in c["vars"]))
+        assert not any(v["name"] == out_name for v in cv["vars"])
+
+    def test_remove_signal_binding_noop(self, stem_4d_dataset):
+        """A signal binding is owned by its tree — the × must not be able to
+        unbind it (only registry names are removable)."""
+        session, msgs = stem_4d_dataset["window"], stem_4d_dataset["messages"]
+        _ = session.console
+        _wait_vars(session, msgs, lambda c: any(v["name"] == "s1" for v in c["vars"]))
+        session.console.remove_var("s1")
+        # Prove the remove was processed (queue drained) via a follow-up exec,
+        # then check s1 survived — both the chip and the evaluable binding.
+        res = _exec(session, msgs, "s1 is not None")
+        assert res is not None and res["ok"]
+        cv = _latest_vars(msgs)
+        assert any(v["name"] == "s1" and v["source"] == "signal" for v in cv["vars"])
+
+    def test_remove_via_action_dispatch(self, window):
+        """The renderer's sendAction path: action=console_remove_var."""
+        session, msgs = window["window"], window["messages"]
+        _exec(session, msgs, "b = 7")
+        _wait_vars(session, msgs, lambda c: any(v["name"] == "b" for v in c["vars"]))
+        session.dispatch_action({"action": "console_remove_var",
+                                 "payload": {"name": "b"}})
+        cv = _wait_vars(session, msgs, lambda c: not any(
+            v["name"] == "b" for v in c["vars"]))
+        assert not any(v["name"] == "b" for v in cv["vars"])

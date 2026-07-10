@@ -100,6 +100,24 @@ class ConsoleSession:
         # and window_ids resolution are cheap.
         self._bindings: dict[str, object] = {}   # name -> tree (source=="signal")
 
+        # Newest-wins guard for live previews. A plain int is read/written
+        # atomically under the GIL (no lock): submit_preview stamps the latest
+        # id, _do_preview no-ops if a newer preview (or an exec) has since bumped
+        # it. submit_exec resets it to -1 so a queued preview loses to the exec.
+        self._latest_preview_id = -1
+        # The most recent AUTO preview as (code, preview_id) — re-run when a
+        # navigator commits a new position (base_selector.NAV_CHANGE_HOOKS) so
+        # the thumbnail tracks the cursor. Cleared by an EMPTY-code preview (the
+        # frontend's "eye off / cell emptied" STOP) and by submit_exec.
+        # Tuple/None rebinds are GIL-atomic (no lock), same as
+        # _latest_preview_id.
+        self._last_auto_preview: "tuple[str, int] | None" = None
+        # Coalesce nav-change notifications: at most ONE nav_refresh queued at a
+        # time. A drag fires dozens of commits; each refresh re-reads the LIVE
+        # cursor when it runs, so dropped notifications lose nothing (the same
+        # latest-wins philosophy as the nav dispatcher itself).
+        self._nav_refresh_queued = False
+
         self._queue: "queue.Queue[tuple]" = queue.Queue()
         self._closed = False
         self._thread = threading.Thread(
@@ -109,6 +127,13 @@ class ConsoleSession:
         # Seed the namespace + expose current signals (posted onto the console
         # thread so the heavy hyperspy/dask import happens off the main loop).
         self._queue.put(("_init", None))
+        # Track the navigator so the live preview follows the cursor. Fired on
+        # the nav dispatcher thread; notify_nav_changed only enqueues (cheap).
+        try:
+            from spyde.drawing.selectors import base_selector
+            base_selector.NAV_CHANGE_HOOKS.append(self.notify_nav_changed)
+        except Exception:
+            log.debug("nav-change hook registration failed", exc_info=True)
 
     # ── public API (called from the main asyncio thread) ─────────────────────
 
@@ -116,7 +141,57 @@ class ConsoleSession:
         """Queue a cell for execution on the console thread (returns immediately)."""
         if self._closed:
             return
+        # An exec ALWAYS wins over any pending preview: reset the latest-preview
+        # id BEFORE the put so every preview queued before this exec sees a
+        # mismatched id in _do_preview and no-ops (stale). Set before enqueuing
+        # so a preview submitted concurrently can't slip its id in after. Also
+        # drop the nav-refresh expression — the cell the user just ran owns the
+        # console now; navigator moves must not resurrect the old preview.
+        self._latest_preview_id = -1
+        self._last_auto_preview = None
         self._queue.put(("exec", (code, exec_id)))
+
+    def submit_preview(self, code: str, preview_id: int, auto: bool) -> None:
+        """Queue a live preview of *code* on the console thread (returns
+        immediately). Previews share the SERIAL console queue, so the namespace
+        stays single-threaded (the module invariant) — a preview never runs
+        concurrently with an exec or another preview. ``_latest_preview_id`` is
+        stamped to *preview_id* so a superseded preview (a newer keystroke, or an
+        exec) is dropped as stale in _do_preview without ever computing.
+
+        An EMPTY code is the frontend's STOP signal (eye toggled off / cell
+        emptied): it clears the nav-refresh expression and evaluates nothing —
+        no reply is emitted."""
+        if self._closed:
+            return
+        pid = int(preview_id)
+        self._latest_preview_id = pid
+        if not code.strip():
+            self._last_auto_preview = None
+            return
+        if auto:
+            # Remember the expression so navigator moves re-run it (the preview
+            # slices at the live cursor — see notify_nav_changed). Explicit
+            # (Ctrl+Enter) one-shots are deliberately NOT nav-tracked: they may
+            # contain arbitrary calls and be expensive per evaluation.
+            self._last_auto_preview = (code, pid)
+        self._queue.put(("preview", (code, pid, bool(auto))))
+
+    def notify_nav_changed(self) -> None:
+        """A navigator selector committed a genuinely NEW position (called on
+        the nav dispatcher thread via ``base_selector.NAV_CHANGE_HOOKS``).
+        Re-run the last AUTO preview so the thumbnail tracks the cursor.
+
+        Coalesced: at most one refresh sits in the queue — the refresh re-reads
+        the live cursor when it actually runs, so folding a burst of moves into
+        one refresh loses nothing. Must stay cheap (enqueue only): it runs on
+        the dispatcher thread, in the navigator's hot path."""
+        if self._closed or self._last_auto_preview is None:
+            return
+        if self._nav_refresh_queued:
+            return
+        self._nav_refresh_queued = True
+        self._queue.put(("nav_refresh", None))
 
     def submit_complete(self, prefix: str, complete_id: int) -> None:
         """Queue a completion request (runs on the console thread so it reads the
@@ -124,6 +199,16 @@ class ConsoleSession:
         if self._closed:
             return
         self._queue.put(("complete", (prefix, complete_id)))
+
+    def remove_var(self, name: str) -> None:
+        """Remove a REGISTERED result chip (out<N> / assigned var) from the
+        namespace + registry and re-emit console_vars — the chip's (×) button
+        (the console_remove_var command). Only registry names are removable: a
+        signal binding is owned by its tree (closing the window is its
+        lifecycle), so an unknown / signal name no-ops."""
+        if self._closed or not name:
+            return
+        self._queue.put(("remove_var", str(name)))
 
     def create_window(self, name: str) -> None:
         """Materialise the namespace/registry variable *name* as a new signal
@@ -143,8 +228,41 @@ class ConsoleSession:
             return
         self._queue.put(("refresh", None))
 
+    def bind_node(self, plot, signal_id) -> None:
+        """Bind a specific WORKFLOW node (a mid-tree signal) into the console
+        namespace under a fresh ``node<N>`` name and re-emit console_vars — the
+        seam a Workflow-node → console drop uses. The node is resolved on the MAIN
+        thread (tree walk by ``id(signal)``) so we don't touch tree state off it;
+        the namespace mutation is posted to the console thread."""
+        if self._closed or signal_id is None:
+            return
+        tree = getattr(plot, "signal_tree", None)
+        if tree is None:
+            return
+        # Resolve the node's signal by id (SignalNode.signal_id == id(signal)).
+        target = None
+        node_name = "node"
+        try:
+            for node in tree.walk():
+                sig = getattr(node, "signal", None)
+                if sig is not None and id(sig) == int(signal_id):
+                    target = sig
+                    node_name = getattr(node, "name", "node") or "node"
+                    break
+        except Exception:
+            target = None
+        if target is None:
+            return
+        self._queue.put(("bind_node", (target, node_name)))
+
     def shutdown(self) -> None:
         self._closed = True
+        try:
+            from spyde.drawing.selectors import base_selector
+            if self.notify_nav_changed in base_selector.NAV_CHANGE_HOOKS:
+                base_selector.NAV_CHANGE_HOOKS.remove(self.notify_nav_changed)
+        except Exception:
+            pass
         self._queue.put(("_stop", None))
 
     # ── console worker thread ────────────────────────────────────────────────
@@ -164,10 +282,18 @@ class ConsoleSession:
                     self._emit_vars()
                 elif kind == "exec":
                     self._do_exec(*arg)
+                elif kind == "preview":
+                    self._do_preview(*arg)
+                elif kind == "nav_refresh":
+                    self._do_nav_refresh()
                 elif kind == "complete":
                     self._do_complete(*arg)
                 elif kind == "create_window":
                     self._do_create_window(arg)
+                elif kind == "remove_var":
+                    self._do_remove_var(arg)
+                elif kind == "bind_node":
+                    self._do_bind_node(*arg)
                 elif kind == "refresh":
                     self._sync_bindings()
                     self._emit_vars()
@@ -361,6 +487,44 @@ class ConsoleSession:
         if name not in self._chip_order:
             self._chip_order.append(name)
 
+    # ── live preview (display-only, never registers/echoes) ──────────────────
+
+    def _do_preview(self, code: str, preview_id: int, auto: bool) -> None:
+        """Evaluate a live preview of *code* and emit console_preview_result.
+
+        Unlike _do_exec, a preview is DISPLAY-ONLY: it never registers an
+        out<N>/assign chip, never mutates the registry, and never emits
+        console_result. It builds the lazy expression, slices ONE navigator frame
+        at the referenced signal's current cursor, cost-guards the culled graph,
+        and computes only that (see console_preview). Stale previews (a newer
+        keystroke or an exec has since bumped ``_latest_preview_id``) no-op so we
+        don't waste a compute on a position/expression the user has moved past."""
+        if preview_id != self._latest_preview_id:
+            return   # superseded by a newer preview or an exec → drop it
+        import time
+        t0 = time.perf_counter()
+        from spyde.backend import console_preview
+        payload = console_preview.evaluate_preview(self, code, auto=auto)
+        payload["type"] = "console_preview_result"
+        payload["preview_id"] = preview_id
+        payload["elapsed_ms"] = round((time.perf_counter() - t0) * 1000.0, 3)
+        self._dispatch(lambda: ipc.emit(payload))
+
+    def _do_nav_refresh(self) -> None:
+        """Re-evaluate the last AUTO preview at the (new) navigator position —
+        the console-thread half of notify_nav_changed. Clears the coalescing
+        flag FIRST so a nav move landing during this evaluation queues the next
+        refresh (rather than being silently swallowed). Re-emits with the SAME
+        preview_id, so the frontend's newest-wins intake accepts it in place."""
+        self._nav_refresh_queued = False
+        last = self._last_auto_preview
+        if last is None:
+            return
+        code, pid = last
+        if pid != self._latest_preview_id:
+            return   # user typed / ran a cell since — that flow owns the panel
+        self._do_preview(code, pid, True)
+
     # ── completion ───────────────────────────────────────────────────────────
 
     def _do_complete(self, prefix: str, complete_id: int) -> None:
@@ -426,6 +590,44 @@ class ConsoleSession:
         self._materialise(x, name=None, source_expr="show(...)")
         self._dispatch(lambda: ipc.emit_status("Opening console result…"))
         return None
+
+    def _do_bind_node(self, signal, node_name: str) -> None:
+        """Bind a workflow node's signal into the namespace under a fresh, valid
+        identifier derived from the node name (``node`` → ``node``, ``node_2`` on
+        collision), register it as an assign chip, and re-emit console_vars — the
+        Workflow-node → console drop. Runs on the console thread."""
+        base = _sanitize_identifier(node_name or "node", fallback="node")
+        reserved = {"np", "numpy", "da", "hs", "show"}
+        name = base
+        n = 2
+        # Don't collide with builtins, live bindings, or a DIFFERENT registered var.
+        while (name in reserved or name in self._bindings
+               or (name in self._registered and self._ns.get(name) is not signal)):
+            name = f"{base}_{n}"
+            n += 1
+        self._ns[name] = signal
+        self._register_assign(name)
+        self._emit_vars()
+        # Tell the renderer the bound name so it can insert it at the caret (the
+        # Workflow-node → console drop; previously the name never reached the
+        # frontend, so the drop bound the node but inserted nothing).
+        self._dispatch(lambda: ipc.emit({"type": "console_node_bound", "name": name}))
+        self._dispatch(lambda: ipc.emit_status(f"Console: bound {name}"))
+
+    def _do_remove_var(self, name: str) -> None:
+        """Handle console_remove_var (the chip's ×): drop a REGISTERED chip name
+        from the registry + namespace and re-emit console_vars. Runs on the
+        console thread. Signal bindings / unknown names no-op — the registry
+        membership check is the guard (chips only exist for out<N>/assign)."""
+        if name not in self._registered:
+            return
+        self._registered.pop(name, None)
+        try:
+            self._chip_order.remove(name)
+        except ValueError:
+            pass
+        self._ns.pop(name, None)
+        self._emit_vars()
 
     def _do_create_window(self, name: str) -> None:
         """Handle console_create_window: look up *name* in the registry/namespace

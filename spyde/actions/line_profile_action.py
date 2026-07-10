@@ -21,6 +21,7 @@ class LineProfileAction(RegionAction):
     name = "Line Profile"
     output_dims = 1
     output_node_name = "Line Profile"
+    output_y_label = "Intensity"
 
     def selector_for_params(self, **params):
         from spyde.drawing.selectors import LineProfileSelector

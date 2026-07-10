@@ -120,6 +120,8 @@ class ActionRouterMixin:
             self._select_signal_node(plot, payload.get("signal_id"))
         elif action == "set_axis":
             self._set_axis(plot, payload)
+        elif action == "set_title":
+            self._set_title(plot, payload)
         elif action == "set_offset_crosshair":
             self._set_offset_crosshair(plot, payload)
         elif action == "set_overlay":
@@ -145,10 +147,25 @@ class ActionRouterMixin:
             )
         elif action == "console_create_window":
             self.console.create_window(str(payload.get("name", "")))
+        elif action == "console_bind_node":
+            self.console.bind_node(plot, payload.get("signal_id"))
+        elif action == "console_bind_window":
+            # Ensure the console exists + is bound to this window's tree, then
+            # re-emit console_vars so the renderer can resolve the dropped
+            # window → its variable name (a signal-pill drop before the console
+            # was ever opened would otherwise find no bindings).
+            self.console.refresh_bindings()
+        elif action == "console_preview":
+            self.console.submit_preview(
+                str(payload.get("code", "")), int(payload.get("preview_id", 0)),
+                bool(payload.get("auto", True)),
+            )
         elif action == "console_complete":
             self.console.submit_complete(
                 str(payload.get("prefix", "")), int(payload.get("complete_id", 0))
             )
+        elif action == "console_remove_var":
+            self.console.remove_var(str(payload.get("name", "")))
         elif action == "set_signal_type":
             self._set_signal_type(plot, payload.get("signal_type", ""))
         elif action == "load_example":

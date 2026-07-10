@@ -91,6 +91,15 @@ class _NavDispatcher:
 # updates flow through (the Qt event-loop equivalent).
 _nav_dispatcher = _NavDispatcher()
 
+# Module-level hooks fired (no args, on the dispatcher thread) whenever ANY
+# selector commits a genuinely NEW position — the cross-cutting "navigation
+# changed" pub for listeners that aren't tied to one selector (the console's
+# live preview re-slices its expression at the new cursor). Unlike a selector's
+# per-instance ``index_hooks``, these need no registration per selector and are
+# NOT fired for force-only re-fires at an unchanged position (settle/contrast
+# repaints). Hooks must be cheap/non-blocking (enqueue, don't compute).
+NAV_CHANGE_HOOKS: list = []
+
 
 def event_handler_fn(method: Callable) -> Callable:
     """Wrap a BOUND METHOD in a plain function for ``add_event_handler``.
@@ -377,7 +386,8 @@ class BaseSelector:
         # end) so the duplicate skips here even if it runs back-to-back before the
         # body finishes. force=True bypasses (repaint after a signal/contrast
         # change at an unchanged position).
-        if np.array_equal(indices, self.current_indices) and not force:
+        changed = not np.array_equal(indices, self.current_indices)
+        if not changed and not force:
             return
         self.current_indices = indices
 
@@ -449,6 +459,16 @@ class BaseSelector:
                 hook(indices)
             except Exception as e:
                 logger.debug("index hook failed: %s", e)
+
+        # Notify the module-level listeners that the navigation position
+        # genuinely MOVED — skipped for force-only re-fires at an unchanged
+        # position, so a settle/contrast repaint doesn't re-trigger listeners.
+        if changed:
+            for hook in list(NAV_CHANGE_HOOKS):
+                try:
+                    hook()
+                except Exception as e:
+                    logger.debug("nav change hook failed: %s", e)
 
     # ── Visibility ─────────────────────────────────────────────────────────────
 

@@ -264,6 +264,24 @@ class Session(
         # navigator depends on every member, not just paths[0] → disabled).
         disk_path = (source_path if enable_nav_sidecar and source_path
                      and os.path.exists(source_path) else None)
+
+        # Resolve the dataset name and stamp it onto the signal BEFORE building the
+        # tree — the tree's constructor (_initialize_initial_plots) creates the
+        # plots and emits their `figure` messages, whose `title` field (the window
+        # header + breadcrumb Name) and in-panel title strip both read
+        # General.title. Stamping after would leave the header at the "Signal"/
+        # "Navigator" fallback even though we know the filename.
+        title = signal.metadata.get_item("General.title", default=None)
+        # hyperspy may return an empty string or a `<undefined>` sentinel for an
+        # unset title, not None — treat any of those as "no title".
+        if (title is None or str(title).strip() in ("", "<undefined>")) and source_path:
+            title = os.path.splitext(os.path.basename(source_path))[0]
+            if title:
+                try:
+                    signal.metadata.set_item("General.title", title)
+                except Exception as e:
+                    log.debug("stamping General.title failed: %s", e)
+
         tree = BaseSignalTree(
             root_signal=signal,
             session=self,
@@ -276,10 +294,6 @@ class Session(
 
         # Open the MDI windows for this tree
         tree.open()
-
-        title = signal.metadata.get_item("General.title", default=None)
-        if title is None and source_path:
-            title = os.path.splitext(os.path.basename(source_path))[0]
 
         # Emit metadata + axes for the sidebar, tagged with this tree's windows.
         try:
