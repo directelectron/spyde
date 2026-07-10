@@ -369,14 +369,17 @@ class ActionRouterMixin:
         pb = self.playback
         speed = payload.get("speed")
         step = payload.get("step")
+        # Playback always loops (the UI Loop toggle was removed); honour an
+        # explicit loop value if a caller still passes one, else default to True.
         loop = payload.get("loop")
+        if loop is None:
+            loop = True
         if cmd == "play":
             pb.play(speed=speed, loop=loop)
         elif cmd == "pause":
             pb.pause()
         elif cmd == "toggle":
-            pb.toggle(**({"speed": speed} if speed is not None else {}),
-                      **({"loop": loop} if loop is not None else {}))
+            pb.toggle(**({"speed": speed} if speed is not None else {}), loop=loop)
         elif cmd == "fast_forward":
             pb.fast_forward(loop=loop)
         elif cmd == "step":

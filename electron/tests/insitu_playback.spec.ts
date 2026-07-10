@@ -144,9 +144,10 @@ test('in-situ movie: Play/FF gate, real-time playback, fast-forward badge, ' +
     await shot(page, ++shotN, 'stem-no-play-ff')
 
     // ── 2. Real-time play (looped) — signal frame must change ────────────────
-    // Drive via the direct backend playback command (deterministic loop:true)
-    // rather than the toolbar toggle (whose default loop=false would auto-stop
-    // the 6-frame movie in ~0.3s at 20fps).
+    // Drive via the direct backend playback command (explicit loop:true) rather
+    // than the toolbar toggle. (The Play toolbar button now always loops too —
+    // its Loop param/caret was removed — but the direct command keeps this spec
+    // independent of the toolbar's focus-raise dance.)
     // Use the MOVIE signal window pinned in step 1a (robust against the 4D-STEM
     // signal window added by step 1b — `signalWindow(page).first()` would be
     // ambiguous now).

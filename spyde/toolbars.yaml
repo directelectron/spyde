@@ -25,7 +25,7 @@ functions:
     navigation: True
     toolbar_side: right
   Play:
-    description: Play the movie in real time — 1 s of playback = 1 s of experiment time (from the time-axis scale). Toggle to pause.
+    description: Play the movie in real time — 1 s of playback = 1 s of experiment time (from the time-axis scale). Loops; toggle to pause.
     icon: drawing/toolbars/icons/play.svg
     function: spyde.actions.base.play_pause
     plot_dim: [ 1 ]
@@ -33,11 +33,6 @@ functions:
     signal_types: [insitu]
     toggle: True
     toolbar_side: right
-    parameters:
-      loop:
-        name: Loop
-        type: bool
-        default: False
   Fast Forward:
     description: Fast-forward — cycle the playback speed 2x → 4x → 8x → 1x. Starts playback if stopped.
     icon: drawing/toolbars/icons/fastforward.svg

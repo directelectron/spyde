@@ -111,7 +111,9 @@ def run_orientation(session, src, src_tree, phases, sim_params, match_params,
         dict(n_best=match_params.get("n_best", 5), gamma=gamma,
              normalize_templates=bool(match_params.get("normalize_templates", True))))
     if om is None:
-        emit_error("Orientation: compute returned no result")
+        # None also means "cancelled" (tree closed mid-compute) — no error toast.
+        if not getattr(src_tree, "_spyde_closed", False):
+            emit_error("Orientation: compute returned no result")
         return None
     _overlay_template_on_source(src_tree, src_dp_plot, src, sim, gamma)
     emit_status("Orientation map complete")
@@ -223,11 +225,22 @@ def _compute_with_live_ipf(session, src, src_tree, sim, params):
 
     stop_poll = live_fill_poller((ny, nx, 9), shm_name, _paint,
                                  interval=0.4, name="om-poll")
+    # Cancellation: register a stopped_flag on the source tree AND the result
+    # (IPF) tree — closing either stops the dense match on the cluster instead
+    # of running the whole-field compute to completion.
+    stopped_flag = [False]
+    for _t in {id(src_tree): src_tree, id(om_tree): om_tree}.values():
+        if _t is not None and hasattr(_t, "register_cancel"):
+            _t.register_cancel(flag=stopped_flag)
     try:
         om = _do_compute_orientations(src, sim, params, main_window=session,
-                                      signal_tree=src_tree, shm_name=shm_name)
+                                      signal_tree=src_tree, shm_name=shm_name,
+                                      stopped_flag=stopped_flag)
     finally:
         stop_poll()
+        for _t in {id(src_tree): src_tree, id(om_tree): om_tree}.values():
+            if _t is not None and hasattr(_t, "unregister_cancel"):
+                _t.unregister_cancel(flag=stopped_flag)
         if shm is not None:
             try:
                 shm.close()
@@ -417,7 +430,10 @@ def om_run(session, plot, payload) -> None:
                 session, tree.root, tree, sim,
                 dict(n_best=n_best, gamma=gamma, normalize_templates=normalize))
             if om is None:
-                emit_error("Orientation: compute returned no result")
+                # None also means "cancelled" (tree closed mid-compute) — don't
+                # raise an error toast for a tree the user just closed.
+                if not getattr(tree, "_spyde_closed", False):
+                    emit_error("Orientation: compute returned no result")
                 return
             emit_status("Orientation map complete")
         except Exception as e:

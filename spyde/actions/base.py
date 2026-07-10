@@ -84,17 +84,16 @@ def play_pause(toolbar: "ActionContext", toggled=None, *args, **kwargs):
     """Toggle real-time movie playback: start the wall-clock frame clock (or pause
     it). A plain on/off toggle — pressing Play while fast-forwarding PAUSES (Fast
     Forward owns the speed cycle). Real-time pacing is derived from the time axis'
-    scale/units, so no ``fps`` is passed; ``loop`` is still honoured."""
+    scale/units. Playback ALWAYS loops (wraps to frame 0 at the end)."""
     session = _session_of(toolbar)
     if session is None:
         return
     pb = session.playback
     _bind_playback_tree(toolbar, pb)
-    loop = kwargs.get("loop")
     if toggled is None:
-        pb.toggle(**({"loop": loop} if loop is not None else {}))
+        pb.toggle(loop=True)
     elif toggled:
-        pb.play(**({"loop": loop} if loop is not None else {}))
+        pb.play(loop=True)
     else:
         pb.pause()
 
@@ -111,7 +110,7 @@ def fast_forward(toolbar: "ActionContext", toggled=None, *args, **kwargs):
     if toggled is False:
         pb.pause()
     else:
-        pb.fast_forward(loop=kwargs.get("loop"))
+        pb.fast_forward(loop=True)
 
 
 def add_fft_selector(toolbar: "ActionContext", action_name="", *args, **kwargs):

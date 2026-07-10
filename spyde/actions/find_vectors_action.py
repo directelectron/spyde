@@ -181,6 +181,14 @@ def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = Tr
     new_tree._fv_batch_running = True
     src_tree._fv_batch_running = True
 
+    # Cancellation: register a stopped_flag on BOTH trees (compute reads the
+    # source, results land on the new tree — closing either should stop it).
+    # _do_compute_vectors polls this flag and cancels its dask futures.
+    stopped_flag = [False]
+    for _t in {id(src_tree): src_tree, id(new_tree): new_tree}.values():
+        if hasattr(_t, "register_cancel"):
+            _t.register_cancel(flag=stopped_flag)
+
     stop_poll = live_fill_poller(nav_shape_full, shm_name, _paint,
                                  interval=0.35, name="fv-poll")
 
@@ -195,12 +203,16 @@ def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = Tr
             t0 = _time.monotonic()
             log.info("[fv-batch] compute starting (shm=%s)", shm_name)
             vecs = _do_compute_vectors(src, p, main_window=session,
-                                       signal_tree=src_tree, shm_name=shm_name)
+                                       signal_tree=src_tree, shm_name=shm_name,
+                                       stopped_flag=stopped_flag)
             log.info("[fv-batch] compute returned in %.1fs (vecs=%s)",
                      _time.monotonic() - t0, "none" if vecs is None else "ok")
             stop_poll()                              # final paint owns the nav plot
             if vecs is None:
-                emit_error("Find Vectors: compute returned no result")
+                # None also means "cancelled" (tree closed mid-compute) — stay
+                # quiet in that case; only surface an error for a real failure.
+                if not stopped_flag[0]:
+                    emit_error("Find Vectors: compute returned no result")
                 return
             _finalize(new_tree, vecs)
             log.info("[fv-batch] finalized in %.1fs total", _time.monotonic() - t0)
@@ -213,6 +225,9 @@ def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = Tr
             stop_poll()
             new_tree._fv_batch_running = False
             src_tree._fv_batch_running = False
+            for _t in {id(src_tree): src_tree, id(new_tree): new_tree}.values():
+                if hasattr(_t, "unregister_cancel"):
+                    _t.unregister_cancel(flag=stopped_flag)
             if shm is not None:
                 try:
                     shm.close()

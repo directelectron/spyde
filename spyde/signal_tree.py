@@ -76,8 +76,77 @@ class BaseSignalTree:
         self.signal_plots: list[Plot] = []
         self.navigator_plot_manager: "MultiplotManager | None" = None
 
+        # Cancellation registry: heavy actions register a stopped_flag (a 1-elem
+        # [False] list the compute cores already poll) and/or a live dask Future
+        # here so close() can STOP in-flight compute instead of letting it run to
+        # completion on the cluster. See _cancel_all_compute / register_cancel.
+        self._cancel_flags: list[list] = []
+        self._cancel_futures: list = []
+
         self._initialize_initial_plots()
         logger.debug("Created signal tree with root %s", self.root)
+
+    # ── Compute cancellation ──────────────────────────────────────────────────
+
+    def register_cancel(self, *, flag: "list | None" = None, future=None):
+        """Register an in-flight compute for cancellation on tree close.
+
+        ``flag`` is a 1-element ``[False]`` list the compute core polls (set to
+        ``True`` to request stop). ``future`` is a dask Future (or a
+        ``.cancel()``-able) to cancel outright. Returns ``flag`` (creating one
+        if not given) so callers can do ``flag = tree.register_cancel()`` and
+        pass it straight into the core. Already-closed trees flip the flag
+        immediately so a late registration can't outlive the tree."""
+        if flag is None:
+            flag = [False]
+        if getattr(self, "_spyde_closed", False):
+            # Tree already torn down — don't let this compute keep running.
+            flag[0] = True
+            if future is not None:
+                try:
+                    future.cancel()
+                except Exception as e:
+                    logger.debug("cancelling late-registered future failed: %s", e)
+            return flag
+        self._cancel_flags.append(flag)
+        if future is not None:
+            self._cancel_futures.append(future)
+        return flag
+
+    def unregister_cancel(self, *, flag=None, future=None) -> None:
+        """Drop a finished compute's flag/future so the registry doesn't grow
+        without bound across many runs on a long-lived tree."""
+        if flag is not None:
+            try:
+                self._cancel_flags.remove(flag)
+            except ValueError:
+                pass
+        if future is not None:
+            try:
+                self._cancel_futures.remove(future)
+            except ValueError:
+                pass
+
+    def _cancel_all_compute(self) -> None:
+        """Flip every registered stopped_flag and cancel every registered
+        future. Called FIRST in close() so the compute cores bail out on their
+        next poll and the cluster stops working on a tree that's going away."""
+        for flag in list(self._cancel_flags):
+            try:
+                flag[0] = True
+            except Exception as e:
+                logger.debug("setting cancel flag on close failed: %s", e)
+        client = self.client
+        for fut in list(self._cancel_futures):
+            try:
+                if client is not None:
+                    client.cancel(fut)
+                elif hasattr(fut, "cancel"):
+                    fut.cancel()
+            except Exception as e:
+                logger.debug("cancelling registered future on close failed: %s", e)
+        self._cancel_flags.clear()
+        self._cancel_futures.clear()
 
     @property
     def client(self):
@@ -349,9 +418,21 @@ class BaseSignalTree:
         def _on_chunk(chunk_result, nav_slices):
             relay.chunk_ready.emit(chunk_result, nav_slices)
 
+        # Register every nav future (per-chunk + whole-array) so a tree close
+        # mid-fill cancels them on the cluster instead of letting the whole
+        # dataset sum run to completion. Tracked locally too so the poll loop
+        # can unregister them all when the fill finishes normally.
+        nav_futures: list = []
+
+        def _register_nav_future(fut, _futs=nav_futures):
+            _futs.append(fut)
+            self.register_cancel(future=fut)
+
         future = compute_with_live_buffer(
-            nav_dask, nav_shape, self.client, shm_name, on_chunk_done=_on_chunk
+            nav_dask, nav_shape, self.client, shm_name,
+            on_chunk_done=_on_chunk, on_future=_register_nav_future,
         )
+        self._nav_futures = nav_futures
 
         if nav_signals:
             nav_signals[0].data = future
@@ -390,6 +471,10 @@ class BaseSignalTree:
                 if future.done():
                     break
                 time.sleep(0.1)
+            # The nav fill is over (done or stopped) — drop its futures from the
+            # cancel registry so it doesn't grow across reloads on a long tree.
+            for _f in list(nav_futures):
+                self.unregister_cancel(future=_f)
             if _stop.is_set():
                 return
             # Final repaint of the COMPLETED navigator. The per-chunk shm writes
@@ -682,6 +767,11 @@ class BaseSignalTree:
         if getattr(self, "_spyde_closed", False):
             return
         self._spyde_closed = True
+        # STOP in-flight compute FIRST: flip every registered stopped_flag and
+        # cancel every registered future so heavy actions (Find Vectors, dense
+        # OM, VOM, strain) and the distributed navigator/VI fills stop working
+        # on the cluster instead of running to completion after the tree closes.
+        self._cancel_all_compute()
         if hasattr(self, "_nav_stop"):
             self._nav_stop.set()
         if hasattr(self, "_nav_defer_stop"):

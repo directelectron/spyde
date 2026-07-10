@@ -1243,6 +1243,7 @@ def compute_with_live_buffer(
     client: distributed.Client,
     shm_name: str,
     on_chunk_done=None,
+    on_future=None,
 ) -> distributed.Future:
     """
     Progressive compute: submits one Future per nav chunk and calls
@@ -1263,6 +1264,10 @@ def compute_with_live_buffer(
                    update from the GUI side (via on_chunk_done)
     on_chunk_done : callable(chunk_result, nav_slices) | None
                    Called from a Dask callback thread as each chunk finishes.
+    on_future     : callable(future) | None
+                   Called synchronously with every Future created (per-chunk and
+                   the whole-array one) so the caller can register them for
+                   cancellation on teardown. Not called on the synchronous path.
     """
     import itertools
 
@@ -1309,6 +1314,11 @@ def compute_with_live_buffer(
         fut = client.compute(chunk_da)
         chunk_futures.append(fut)
         chunk_slices.append(slices)
+        if on_future is not None:
+            try:
+                on_future(fut)
+            except Exception as e:
+                log.debug("on_future(chunk) registration failed: %s", e)
 
     # Attach callbacks — run in Dask callback threads, must be thread-safe
     def _make_cb(fut, nav_slices):
@@ -1329,6 +1339,11 @@ def compute_with_live_buffer(
 
     # Return the whole-array future for progress indicator and commit path
     full_future = client.compute(result_array)
+    if on_future is not None:
+        try:
+            on_future(full_future)
+        except Exception as e:
+            log.debug("on_future(full) registration failed: %s", e)
     return full_future
 
 
