@@ -37,7 +37,7 @@ wheels = [
 [[package]]
 name = "anyplotlib"
 version = "0.1.0"
-source = { git = "https://github.com/CSSFrancis/anyplotlib.git?rev=4686dd2fa0300d7bc806844c1bf6e02435c3966d#4686dd2fa0300d7bc806844c1bf6e02435c3966d" }
+source = { git = "https://github.com/CSSFrancis/anyplotlib.git?rev=e49d29c55ea242aa31fd17d00721d6aeafdde6f4#e49d29c55ea242aa31fd17d00721d6aeafdde6f4" }
 dependencies = [
     { name = "anywidget" },
     { name = "colorcet" },
@@ -3807,7 +3807,7 @@ tests = [
 
 [package.metadata]
 requires-dist = [
-    { name = "anyplotlib", git = "https://github.com/CSSFrancis/anyplotlib.git?rev=4686dd2fa0300d7bc806844c1bf6e02435c3966d" },
+    { name = "anyplotlib", git = "https://github.com/CSSFrancis/anyplotlib.git?rev=e49d29c55ea242aa31fd17d00721d6aeafdde6f4" },
     { name = "bokeh" },
     { name = "dask" },
     { name = "distributed" },

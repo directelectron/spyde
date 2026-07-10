@@ -31,7 +31,7 @@ dependencies = [
     "imageio-ffmpeg",
     "imagecodecs",
     "psygnal>=0.10.0",
-    "anyplotlib@git+https://github.com/CSSFrancis/anyplotlib.git@4686dd2fa0300d7bc806844c1bf6e02435c3966d",
+    "anyplotlib@git+https://github.com/CSSFrancis/anyplotlib.git@e49d29c55ea242aa31fd17d00721d6aeafdde6f4",
     "pyyaml",
     # GPU-accelerated batched compute (vector orientation mapping, etc.).
     "torch",
