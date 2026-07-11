@@ -11,7 +11,7 @@
  */
 import { test, expect } from '@playwright/test'
 import { mkdirSync } from 'fs'
-const { launchApp, backendAction, sigWindow } = require('./_harness.cjs')
+const { launchApp, backendAction, sigWindow, backendErrorLines } = require('./_harness.cjs')
 
 test('binary pixel transport renders a live signal frame', async () => {
   test.setTimeout(120_000)
@@ -85,15 +85,10 @@ test('binary pixel transport renders a live signal frame', async () => {
     expect(after.nonBlack, 'signal panel blank after scrub').toBeGreaterThan(20)
     expect(after.hash, 'signal frame did not change across a navigator scrub').not.toBe(before.hash)
 
-    // No BACKEND errors surfaced to the log. `logBuffer` is an ARRAY of raw
-    // lines (harness API), so filter it directly — no .split. Exclude the benign
-    // Electron dev-mode "Security Warning (Insecure Content-Security-Policy)"
-    // renderer console notice, which carries the RENDERER-ERROR tag but is not a
-    // real error (present on every dev-server run); match Python backend errors
-    // (a real ERROR log line or a Traceback) instead.
-    const errs = (backend.logBuffer as string[]).filter(
-      (l) => /Traceback|\bERROR\b/.test(l) && !/Security Warning|Content-Security-Policy/.test(l),
-    )
+    // No REAL backend errors surfaced to the log (shared harness audit —
+    // excludes CSP warning, willReadFrequently, and Chromium process noise
+    // like the headless-CI bus.cc / viz_main_impl.cc ERROR spam).
+    const errs = backendErrorLines(backend)
     expect(errs, `backend errors:\n${errs.join('\n')}`).toHaveLength(0)
   } finally {
     await app.close()

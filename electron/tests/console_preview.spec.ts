@@ -27,7 +27,7 @@
  */
 import { test, expect } from '@playwright/test'
 import { mkdirSync } from 'fs'
-const { launchApp, backendAction, waitForSubwindowCount } = require('./_harness.cjs')
+const { launchApp, backendAction, waitForSubwindowCount, backendErrorLines } = require('./_harness.cjs')
 
 const SHOTS = 'console_shots'
 mkdirSync(SHOTS, { recursive: true })
@@ -376,11 +376,9 @@ test('console preview: persistent pills, word boundary, eye-toggle live preview,
 
     // ── 8. No renderer JS errors; scan backend log for real errors ─────────
     assertNoJsErrors()
-    const backendErrors = backend.logBuffer.filter((l: string) =>
-      /ERROR|Traceback/i.test(l)
-      && !/Content Security-Policy|Content Security/i.test(l)
-      && !/willReadFrequently/i.test(l),
-    )
+    // Shared harness audit (also excludes Chromium's headless-CI process
+    // noise — bus.cc / viz_main_impl.cc ERROR lines are not backend faults).
+    const backendErrors = backendErrorLines(backend)
     if (backendErrors.length) {
       console.log('backend log ERROR/Traceback lines:\n' + backendErrors.join('\n'))
     }

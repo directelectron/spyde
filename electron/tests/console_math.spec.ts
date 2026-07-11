@@ -24,7 +24,7 @@
  */
 import { test, expect } from '@playwright/test'
 import { mkdirSync } from 'fs'
-const { launchApp, backendAction, waitForSubwindowCount } = require('./_harness.cjs')
+const { launchApp, backendAction, waitForSubwindowCount, backendErrorLines } = require('./_harness.cjs')
 
 const SHOTS = 'console_shots'
 mkdirSync(SHOTS, { recursive: true })
@@ -275,15 +275,13 @@ test('math console: exec, chip drag-to-MDI, signal drag-in, mask, arithmetic, ' 
     // ── 7. No renderer JS errors; scan backend log for real errors ───────────
     assertNoJsErrors()
 
-    const backendErrors = backend.logBuffer.filter((l: string) =>
-      /ERROR|Traceback/i.test(l)
-      && !/Content Security-Policy|Content Security/i.test(l)
-      && !/willReadFrequently/i.test(l)
-      // The 1/0 ZeroDivisionError is EXPECTED user-code output captured by the
-      // console engine itself (not a backend fault) — it's carried in the
-      // console_result IPC payload, not logged at ERROR level, so no exclusion
-      // should be needed here; kept only as a defensive note.
-    )
+    // Shared harness audit (also excludes Chromium's headless-CI process
+    // noise — bus.cc / viz_main_impl.cc ERROR lines are not backend faults).
+    // The 1/0 ZeroDivisionError is EXPECTED user-code output captured by the
+    // console engine itself (not a backend fault) — it's carried in the
+    // console_result IPC payload, not logged at ERROR level, so no exclusion
+    // should be needed here; kept only as a defensive note.
+    const backendErrors = backendErrorLines(backend)
     if (backendErrors.length) {
       console.log('backend log ERROR/Traceback lines:\n' + backendErrors.join('\n'))
     }

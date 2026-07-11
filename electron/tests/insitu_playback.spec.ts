@@ -40,7 +40,7 @@
  */
 import { test, expect } from '@playwright/test'
 import { mkdirSync } from 'fs'
-const { launchApp, backendAction, waitForSubwindowCount } = require('./_harness.cjs')
+const { launchApp, backendAction, waitForSubwindowCount, backendErrorLines } = require('./_harness.cjs')
 
 const SHOTS = 'insitu_shots'
 mkdirSync(SHOTS, { recursive: true })
@@ -358,11 +358,10 @@ test('in-situ movie: Play/FF gate, real-time playback, fast-forward badge, ' +
     // dev-mode noise (the Electron CSP warning, Chromium's willReadFrequently
     // canvas perf hint from this spec's own getImageData pixel-diff probes).
     // Exclude those known-benign lines; a real backend Python
-    // exception/ERROR-level log line is still caught.
-    const backendErrors = backend.logBuffer.filter((l: string) =>
-      /ERROR|Traceback/i.test(l)
-      && !/Content Security-Policy|Content Security/i.test(l)
-      && !/willReadFrequently/i.test(l))
+    // exception/ERROR-level log line is still caught. Shared harness audit
+    // (also excludes Chromium's headless-CI process noise — bus.cc /
+    // viz_main_impl.cc ERROR lines are not backend faults).
+    const backendErrors = backendErrorLines(backend)
     if (backendErrors.length) {
       console.log('backend log ERROR/Traceback lines:\n' + backendErrors.join('\n'))
     }

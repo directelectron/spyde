@@ -274,6 +274,26 @@ function navWindows(page) {
 }
 
 /**
+ * REAL backend error lines from the log buffer — the "no errors surfaced"
+ * audit several specs end with. Matches Python ERROR/Traceback lines but
+ * excludes known-benign noise:
+ *  - the Electron dev-mode CSP "Security Warning" (tagged RENDERER-ERROR),
+ *  - Chromium's willReadFrequently canvas perf hint (our own pixel probes),
+ *  - CHROMIUM PROCESS stderr in `[pid:date:ERROR:file.cc(line)]` format —
+ *    on headless Linux CI this fires constantly (bus.cc dbus failures,
+ *    viz_main_impl.cc "Exiting GPU process", command_buffer_proxy_impl.cc)
+ *    and is infrastructure noise, not a SpyDE error. Python backend lines
+ *    never match that shape, so real errors still fail the audit.
+ */
+function backendErrorLines(backend) {
+  return backend.logBuffer.filter((l) =>
+    /ERROR|Traceback/i.test(l)
+    && !/Security Warning|Content.Security.Policy|Content Security/i.test(l)
+    && !/willReadFrequently/i.test(l)
+    && !/:(ERROR|FATAL):[a-z_0-9]+\.(cc|mm)\(\d+\)/.test(l))
+}
+
+/**
  * A safe point to GRAB the titlebar for a WINDOW-MOVE drag. The breadcrumb
  * pill (left side) is an HTML5 drag SOURCE that stops pointerdown — grabbing
  * it starts a DnD payload drag, NOT a window move. The window controls
@@ -306,4 +326,5 @@ module.exports = {
   navWindow,
   navWindows,
   titlebarGrabPoint,
+  backendErrorLines,
 }
