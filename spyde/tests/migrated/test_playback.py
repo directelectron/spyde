@@ -102,10 +102,13 @@ class TestPlayback:
         assert pb.is_playing is False
 
     def test_play_advances_frames(self):
-        # scale 0.02 s → 50 fps at 1×.
+        # scale 0.02 s → 50 fps at 1×. Poll rather than a fixed sleep: a starved
+        # CI runner (macOS) delivered only 2 timer ticks in 0.35 s.
         pb, sel = _controller(n=500, scale=0.02, units="s")
         assert pb.play() is True
-        time.sleep(0.35)
+        deadline = time.time() + 10.0
+        while sel.fires < 3 and time.time() < deadline:
+            time.sleep(0.02)
         pb.pause()
         assert sel.fires >= 3, f"expected several frames, got {sel.fires}"
         idx = int(round(sel._widget.x))
@@ -124,7 +127,9 @@ class TestPlayback:
     def test_stops_at_last_frame_without_loop(self):
         pb, sel = _controller(n=6, scale=0.005, units="s")   # tiny fast movie
         pb.play(loop=False)
-        time.sleep(0.5)                      # plenty of time to reach the end
+        deadline = time.time() + 10.0       # poll — CI-runner-speed independent
+        while pb.is_playing and time.time() < deadline:
+            time.sleep(0.02)
         assert pb.is_playing is False, "playback should stop at the last frame"
         assert int(round(sel._widget.x)) == 5, "should land ON the last frame"
 
@@ -195,7 +200,9 @@ class TestPlayback:
         # A movie with no usable scale still plays (at 10 fps) — never a no-op.
         pb, sel = _controller(n=500, scale=0.0, units="")
         assert pb.play() is True
-        time.sleep(0.3)
+        deadline = time.time() + 10.0       # poll — CI-runner-speed independent
+        while int(round(sel._widget.x)) <= 0 and time.time() < deadline:
+            time.sleep(0.02)
         pb.pause()
         assert int(round(sel._widget.x)) > 0
 
