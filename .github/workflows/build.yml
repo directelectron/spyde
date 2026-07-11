@@ -100,20 +100,24 @@ jobs:
   # Best-effort for now (continue-on-error): the e2e launches a real Electron app
   # + Dask LocalCluster and has not yet been validated green on a hosted runner.
   # Drop continue-on-error once it's confirmed stable in CI.
-  # Sharded ×2: the suite is deliberately serial WITHIN a run (one Electron +
+  # Sharded ×3: the suite is deliberately serial WITHIN a run (one Electron +
   # Dask cluster at a time — see playwright.config.ts), so wall-clock scales
   # only by splitting the spec files across independent runners. Each shard is
   # still fully serial, so the cluster-contention flakiness that forced
-  # workers:1 cannot recur across shards (separate VMs).
+  # workers:1 cannot recur across shards (separate VMs). Playwright balances
+  # shards by FILE COUNT, not duration — ×2 measured 22.7m vs 10.0m — so ×3
+  # keeps the worst shard under ~15m even while the known-failing specs pay
+  # retry + app-reboot tax (2026-07-11: 16 failing tests account for ~23 of
+  # the 33 spec-minutes; fixing them is the real speedup).
   e2e:
-    name: electron-e2e (ubuntu, shard ${{ matrix.shard }}/2)
+    name: electron-e2e (ubuntu, shard ${{ matrix.shard }}/3)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2]
+        shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -147,7 +151,7 @@ jobs:
       # downloads + screenshot writes) that is meant to be opt-in.
       - name: Run Electron e2e
         working-directory: electron
-        run: xvfb-run --auto-servernum npm run test:build -- --project=electron --shard=${{ matrix.shard }}/2
+        run: xvfb-run --auto-servernum npm run test:build -- --project=electron --shard=${{ matrix.shard }}/3
 
       - name: Upload Playwright report
         if: ${{ always() }}
