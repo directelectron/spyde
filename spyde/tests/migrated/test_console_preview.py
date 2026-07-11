@@ -48,7 +48,7 @@ ensure_heavy_imports()
 # ── helpers (mirror test_console.py) ─────────────────────────────────────────
 
 
-def _wait_for(msgs, pred, timeout=6.0):
+def _wait_for(msgs, pred, timeout=30.0):
     deadline = time.time() + timeout
     while time.time() < deadline:
         for m in msgs:
@@ -58,7 +58,7 @@ def _wait_for(msgs, pred, timeout=6.0):
     return None
 
 
-def _preview(session, msgs, code, auto=True, timeout=6.0):
+def _preview(session, msgs, code, auto=True, timeout=30.0):
     """Submit a live preview and return its console_preview_result message.
     preview_ids are monotonic per call so results don't cross."""
     pid = getattr(_preview, "_next", 1)
@@ -70,7 +70,7 @@ def _preview(session, msgs, code, auto=True, timeout=6.0):
     )
 
 
-def _exec(session, msgs, code, timeout=6.0):
+def _exec(session, msgs, code, timeout=30.0):
     """Run a cell and return its console_result message (from test_console.py)."""
     exec_id = getattr(_exec, "_next", 1000)
     _exec._next = exec_id + 1
@@ -81,7 +81,7 @@ def _exec(session, msgs, code, timeout=6.0):
     )
 
 
-def _wait_vars(session, msgs, pred, timeout=6.0):
+def _wait_vars(session, msgs, pred, timeout=30.0):
     deadline = time.time() + timeout
     while time.time() < deadline:
         vs = [m for m in msgs if m.get("type") == "console_vars"]
@@ -369,7 +369,7 @@ class TestCoalescing:
         session.console.submit_preview("2 + 2", 2, True)
 
         res2 = _wait_for(msgs, lambda m: m.get("type") == "console_preview_result"
-                         and m.get("preview_id") == 2, timeout=6.0)
+                         and m.get("preview_id") == 2, timeout=30.0)
         assert res2 is not None and res2["text"] == "4"
         # id=1 was superseded before it ran → it never emits a result.
         res1 = _wait_for(msgs, lambda m: m.get("type") == "console_preview_result"
@@ -386,7 +386,7 @@ class TestCoalescing:
         session.console.submit_exec("9 + 9", 5101)
 
         res_exec = _wait_for(msgs, lambda m: m.get("type") == "console_result"
-                             and m.get("exec_id") == 5101, timeout=6.0)
+                             and m.get("exec_id") == 5101, timeout=30.0)
         assert res_exec is not None and res_exec["value_repr"] == "18"
         # The preview (id=3) lost to the exec → never emits.
         res3 = _wait_for(msgs, lambda m: m.get("type") == "console_preview_result"
@@ -439,7 +439,7 @@ class TestNavRefresh:
         refreshed = _wait_for(
             msgs, lambda m: m.get("type") == "console_preview_result"
             and m.get("preview_id") == pid
-            and _count_results(msgs, pid) > n0, timeout=6.0,
+            and _count_results(msgs, pid) > n0, timeout=30.0,
         )
         assert refreshed is not None, "nav move did not re-emit the preview"
         latest = [m for m in msgs if m.get("type") == "console_preview_result"

@@ -31,7 +31,7 @@ dependencies = [
     "imageio-ffmpeg",
     "imagecodecs",
     "psygnal>=0.10.0",
-    "anyplotlib@git+https://github.com/CSSFrancis/anyplotlib.git@e49d29c55ea242aa31fd17d00721d6aeafdde6f4",
+    "anyplotlib>=0.2.0",
     "pyyaml",
     # GPU-accelerated batched compute (vector orientation mapping, etc.).
     "torch",
@@ -77,11 +77,12 @@ explicit = true
 torch = [
     { index = "pytorch-cu124", marker = "sys_platform == 'win32'" },
 ]
-# anyplotlib is co-developed in the sibling checkout. It is pinned to a git sha in
-# [project.dependencies] (same pattern as the hyperspy/rosettasciio forks) so CI and
-# fresh clones resolve without the sibling. When actively editing anyplotlib locally,
-# temporarily re-add the editable path override below (do NOT commit it — the path
-# doesn't exist on CI runners and breaks `uv sync --frozen`):
+# anyplotlib is co-developed in the sibling checkout but resolved from PyPI
+# (releases track this repo's needs). While an unreleased anyplotlib feature is
+# in flight, pin a git sha in [project.dependencies] (the hyperspy/rosettasciio
+# pattern). When actively editing anyplotlib locally, temporarily re-add the
+# editable path override below (do NOT commit it — the path doesn't exist on CI
+# runners and breaks `uv sync --frozen`):
 # anyplotlib = { path = "../anyplotlib", editable = true }
 
 [tool.pycrucible]
