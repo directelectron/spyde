@@ -5,7 +5,7 @@
  */
 import { test, expect } from '@playwright/test'
 import { join } from 'path'
-const { launchApp, backendAction, waitForSubwindowCount } = require('./_harness.cjs')
+const { launchApp, backendAction, waitForSubwindowCount, titlebarGrabPoint } = require('./_harness.cjs')
 
 const SHOTS = join(__dirname, '..', 'mdi_shots')
 let ctx: Awaited<ReturnType<typeof launchApp>>
@@ -58,13 +58,18 @@ test('window placement, snapping, titlebar visibility, and tile', async () => {
   const target = wins.nth(n - 2)
   const mover = wins.nth(n - 1)
   const targetBox = (await target.boundingBox())!
-  const moverBar = mover.getByTestId('subwindow-titlebar')
-  const moverBarBox = (await moverBar.boundingBox())!
+  const moverBox = (await mover.boundingBox())!
+  // Grab RIGHT of the breadcrumb pill (an HTML5 drag source that stops
+  // pointerdown — grabbing it starts a DnD payload, not a window move), and
+  // keep the drop math in window coords via the grab offset.
+  const grab = await titlebarGrabPoint(mover)
+  const grabOffX = grab.x - moverBox.x
+  const grabOffY = grab.y - moverBox.y
   const dropX = targetBox.x + targetBox.width + 4   // just within snap distance
   const dropY = targetBox.y + 20
-  await page.mouse.move(moverBarBox.x + 20, moverBarBox.y + 10)
+  await page.mouse.move(grab.x, grab.y)
   await page.mouse.down()
-  await page.mouse.move(dropX + 20, dropY + 10, { steps: 8 })
+  await page.mouse.move(dropX + grabOffX, dropY + grabOffY, { steps: 8 })
   await page.mouse.up()
   await page.waitForTimeout(300)
   const moverBoxAfter = (await mover.boundingBox())!
@@ -76,9 +81,8 @@ test('window placement, snapping, titlebar visibility, and tile', async () => {
   // 4) Drag a window far past the top-left corner — its titlebar must remain
   // at least partially visible (not fully off-screen).
   const edgeWin = wins.first()
-  const edgeBar = edgeWin.getByTestId('subwindow-titlebar')
-  const edgeBarBox = (await edgeBar.boundingBox())!
-  await page.mouse.move(edgeBarBox.x + 20, edgeBarBox.y + 10)
+  const edgeGrab = await titlebarGrabPoint(edgeWin)
+  await page.mouse.move(edgeGrab.x, edgeGrab.y)
   await page.mouse.down()
   await page.mouse.move(-500, -500, { steps: 8 })
   await page.mouse.up()

@@ -444,7 +444,10 @@ test('Find Diffraction Vectors opens the staged wizard (live preview + Compute)'
   await page.getByTestId('fv-threshold').evaluate((el: HTMLInputElement) => {
     const setter = Object.getOwnPropertyDescriptor(
       window.HTMLInputElement.prototype, 'value')!.set!
-    setter.call(el, '0.3')
+    // Must DIFFER from the default (0.3, the neural confidence default) —
+    // React's value tracker swallows the input event when the value is
+    // unchanged, so onChange (and the debounced fv_tune) would never fire.
+    setter.call(el, '0.45')
     el.dispatchEvent(new Event('input', { bubbles: true }))
   })
   await expect.poll(async () => (await sentActions()).map((s: any) => s.action))

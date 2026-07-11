@@ -273,6 +273,27 @@ function navWindows(page) {
     .filter({ has: page.getByTestId('window-breadcrumb').filter({ hasText: /^N-/ }) })
 }
 
+/**
+ * A safe point to GRAB the titlebar for a WINDOW-MOVE drag. The breadcrumb
+ * pill (left side) is an HTML5 drag SOURCE that stops pointerdown — grabbing
+ * it starts a DnD payload drag, NOT a window move. The window controls
+ * (minimize/maximize/close, ~90px) own the right edge. Return a point in the
+ * empty strip between the two.
+ */
+async function titlebarGrabPoint(win) {
+  const bar = win.getByTestId('subwindow-titlebar')
+  const bb = await bar.boundingBox()
+  if (!bb) throw new Error('titlebar has no bounding box')
+  let x = bb.x + bb.width / 2
+  const pill = win.getByTestId('window-breadcrumb')
+  if (await pill.count()) {
+    const pb = await pill.first().boundingBox()
+    if (pb) x = pb.x + pb.width + 20
+  }
+  x = Math.min(x, bb.x + bb.width - 110)
+  return { x, y: bb.y + bb.height / 2 }
+}
+
 module.exports = {
   launchApp,
   backendAction,
@@ -284,4 +305,5 @@ module.exports = {
   sigWindow,
   navWindow,
   navWindows,
+  titlebarGrabPoint,
 }

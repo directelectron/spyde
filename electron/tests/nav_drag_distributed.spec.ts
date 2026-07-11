@@ -98,15 +98,29 @@ test('crosshair drag across chunks updates the DP on the distributed path', asyn
     catch (e) { return 'send-failed: ' + String(e) }
   }, targets)
   console.log('action send:', sent)
-  // Poll the shared capture (filled by the beforeAll stdout grabber).
-  for (let i = 0; i < 180 && navDragResult === null; i++) await page.waitForTimeout(500)
-  const result = navDragResult ?? { error: 'timeout' }
 
-  console.log('\n===== NAV_DRAG_RESULT =====')
-  console.log(JSON.stringify(result, null, 2))
+  // The nav_drag_result PLOTAPP message is consumed INSIDE the Electron main
+  // process (relayed to the renderer over IPC — never re-printed to the
+  // process's own stdout, and not in index.ts's ready/dask_ready/error echo
+  // allowlist), so it structurally CANNOT reach this grabber — the same trap
+  // as console_preview_result. The backend's "[REDRAW] test_nav_drag: N/M
+  // moves changed" verdict goes through logging → stderr, which the main
+  // process DOES tee — wait for that line instead (the movie_nav_scrub /
+  // tiered_nav_read pattern).
+  let verdict: string | undefined
+  for (let i = 0; i < 180 && !verdict; i++) {
+    verdict = backendLines.find((l) => /test_nav_drag:\s*\d+\/\d+\s+moves changed/.test(l))
+    if (!verdict) await page.waitForTimeout(500)
+  }
 
-  expect(result.error, `nav_drag failed: ${result.error}`).toBeFalsy()
-  expect(result.changed,
-    `DP only updated ${result.changed}/${result.total} moves on the distributed ` +
+  console.log('\n===== NAV_DRAG VERDICT =====')
+  console.log(verdict ?? '(timeout — verdict line never appeared)')
+
+  expect(verdict, 'nav_drag verdict line never appeared in the backend log').toBeTruthy()
+  const m = verdict!.match(/test_nav_drag:\s*(\d+)\/(\d+)\s+moves changed/)!
+  const changed = Number(m[1])
+  const total = Number(m[2])
+  expect(changed,
+    `DP only updated ${changed}/${total} moves on the distributed ` +
     `path — frames dropped before paint`).toBeGreaterThanOrEqual(targets.length - 1)
 })

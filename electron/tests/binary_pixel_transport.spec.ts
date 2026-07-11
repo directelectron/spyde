@@ -11,7 +11,7 @@
  */
 import { test, expect } from '@playwright/test'
 import { mkdirSync } from 'fs'
-const { launchApp, backendAction } = require('./_harness.cjs')
+const { launchApp, backendAction, sigWindow } = require('./_harness.cjs')
 
 test('binary pixel transport renders a live signal frame', async () => {
   test.setTimeout(120_000)
@@ -40,11 +40,11 @@ test('binary pixel transport renders a live signal frame', async () => {
     // the first-paint race this spec exists to catch: without the fix the signal
     // panel was permanently blank (nonBlack ≈ 0) until an organic second paint.
     const signalBox = async () => {
-      const el = page.locator(
-        '[data-testid="subwindow"]:has([data-testid="subwindow-title"]:text-is("Signal"))',
-      )
-      await el.first().waitFor({ state: 'visible', timeout: 30_000 })
-      return el.first()
+      // Windows are picked by breadcrumb chip (S-/N-) — the old literal
+      // "Signal" title is gone since the breadcrumb-pill header.
+      const el = sigWindow(page)
+      await el.waitFor({ state: 'visible', timeout: 30_000 })
+      return el
     }
     const sampleSignal = async (): Promise<{ hash: string; nonBlack: number }> => {
       const png = await (await signalBox()).screenshot()
