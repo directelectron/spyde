@@ -6,6 +6,15 @@ export default defineConfig({
   timeout: 120_000,
   expect: { timeout: 15_000 },
   retries: 1,
+  // line: one timestamped row per test WITH its duration (the dot reporter made
+  // CI stalls unattributable — 9 silent minutes with no test name). html: the CI
+  // workflow uploads playwright-report/ as an artifact; without an html reporter
+  // that folder never exists and the upload is silently empty.
+  reporter: [['line'], ['html', { open: 'never' }]],
+  // Every spec file boots its own Electron + Python backend (~20s on a hosted
+  // runner), so file-level durations are THE optimization target — list all
+  // files slower than 30s in the summary, not just the default top 5.
+  reportSlowTests: { max: 0, threshold: 30_000 },
   // Several specs launch a REAL Electron app + Dask LocalCluster. Running them in
   // parallel made the cluster-ready handshake contend → intermittent flakiness
   // (om_wizard_lazy / vector_om_lazy / vector_vi_lazy / vi_lazy). Serialise the
