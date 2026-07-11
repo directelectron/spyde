@@ -183,6 +183,27 @@ async function openMovie(env: Record<string, string>) {
   const expectGpu = env.SPYDE_GPU_IMAGE !== '0'
   const ctx = await launchApp({ dask: true, env })
   const { page } = ctx
+  if (expectGpu) {
+    // Skip (don't fail) when the environment has no usable WebGPU device —
+    // hosted CI runners have no adapter, so __apl_gpu2d[..].active can never
+    // become true and the wait below burns its full 30s timeout twice per
+    // test. Probe EXACTLY like figure_esm's _gpuDevice(): adapter + device.
+    // Library-level GPU render math is CI-covered in anyplotlib's own
+    // test_gpu_parity_playwright.py (chromium + --enable-unsafe-webgpu).
+    const webgpu = await page.evaluate(async () => {
+      const g = (navigator as any).gpu
+      if (!g) return false
+      try {
+        const adapter = await g.requestAdapter()
+        if (!adapter) return false
+        return !!(await adapter.requestDevice())
+      } catch { return false }
+    })
+    if (!webgpu) {
+      await ctx.app.close().catch(() => {})
+      test.skip(true, 'no usable WebGPU adapter (software/CI runner) — GPU image path cannot activate')
+    }
+  }
   await page.waitForTimeout(1500)
   await backendAction(page, 'load_test_data_movie', {})
   await waitForSubwindowCount(page, 2, 120_000)
