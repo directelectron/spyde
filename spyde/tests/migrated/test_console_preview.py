@@ -309,6 +309,30 @@ class TestNavPositionResolution:
         target = inner if inner is not None else sel
         target.current_indices = value
 
+    def _move_all(self, session, tree, value):
+        """Set current_indices on EVERY selector bound to *tree* (selector
+        attachment is async — the resolver takes the first match, which may
+        not be the one a single-selector set touched on a slow runner)."""
+        for p in session._plots:
+            if getattr(p, "signal_tree", None) is tree:
+                sel = getattr(p, "parent_selector", None)
+                if sel is not None:
+                    self._set_indices(sel, value)
+
+    def _settle_cursor(self, session, tree, value, expect, timeout=30.0):
+        """Keep applying *value* to all selectors until the console's own
+        resolver reports *expect* (late selector attaches re-introduce state)."""
+        from spyde.backend.console_preview import _nav_indices_for
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            self._move_all(session, tree, value)
+            idx, _shape = _nav_indices_for(session.console, ["s1"])
+            got = None if idx is None else tuple(int(v) for v in np.ravel(idx))
+            if got == expect:
+                return True
+            time.sleep(0.05)
+        return False
+
     def test_thumbnail_reflects_cursor(self, window):
         session, msgs = window["window"], window["messages"]
         _ = session.console
@@ -317,11 +341,7 @@ class TestNavPositionResolution:
         _wait_vars(session, msgs, lambda c: any(v["name"] == "s1" for v in c["vars"]))
         tree = session.signal_trees[0]
 
-        sel = self._signal_selector(session, tree)
-        assert sel is not None, "no signal selector found"
-        # Move the cursor to nav position (iy=1, ix=2).
-        self._set_indices(sel, np.array([1, 2]))
-        assert tuple(int(v) for v in np.atleast_1d(sel.current_indices)) == (1, 2)
+        assert self._settle_cursor(session, tree, np.array([1, 2]), (1, 2)),             "cursor never settled at (1, 2)"
 
         res = _preview(session, msgs, "s1")
         assert res["kind"] == "image"
@@ -341,12 +361,10 @@ class TestNavPositionResolution:
         session._add_signal(sig, source_path=None)
         _wait_vars(session, msgs, lambda c: any(v["name"] == "s1" for v in c["vars"]))
         tree = session.signal_trees[0]
-        # Clear any resolved indices so _nav_indices_for returns (None, None).
-        for p in session._plots:
-            if getattr(p, "signal_tree", None) is tree:
-                sel = getattr(p, "parent_selector", None)
-                if sel is not None:
-                    self._set_indices(sel, None)
+        # Clear any resolved indices so _nav_indices_for returns (None, None) —
+        # keep clearing until the resolver agrees (a selector can attach late,
+        # already carrying an initial cursor).
+        assert self._settle_cursor(session, tree, None, None),             "selector indices never cleared"
 
         res = _preview(session, msgs, "s1")
         assert res["kind"] == "image"
@@ -423,9 +441,7 @@ class TestNavRefresh:
         _wait_vars(session, msgs, lambda c: any(v["name"] == "s1" for v in c["vars"]))
         tree = session.signal_trees[0]
         nav = TestNavPositionResolution()
-        sel = nav._signal_selector(session, tree)
-        assert sel is not None, "no signal selector found"
-        nav._set_indices(sel, np.array([0, 0]))
+        assert nav._settle_cursor(session, tree, np.array([0, 0]), (0, 0)),             "cursor never settled at (0, 0)"
 
         res = _preview(session, msgs, "s1", auto=True)
         assert res is not None and res["kind"] == "image"
@@ -434,7 +450,7 @@ class TestNavRefresh:
 
         # Navigator moves → the console re-runs the SAME preview (same id) at
         # the new cursor; the frontend's newest-wins intake accepts it in place.
-        nav._set_indices(sel, np.array([1, 2]))
+        assert nav._settle_cursor(session, tree, np.array([1, 2]), (1, 2)),             "cursor never settled at (1, 2)"
         session.console.notify_nav_changed()
         refreshed = _wait_for(
             msgs, lambda m: m.get("type") == "console_preview_result"
