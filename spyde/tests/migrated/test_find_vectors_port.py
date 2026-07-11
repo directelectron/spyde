@@ -58,7 +58,7 @@ class TestFindVectorsPort:
             session._dispatch_toolbar_action(
                 src_plot, "Find Diffraction Vectors",
                 {"sigma": 1.0, "kernel_radius": 5, "threshold": 0.4,
-                 "min_distance": 3, "subpixel": True},
+                 "min_distance": 3, "subpixel": True, "method": "nxcorr"},
             )
 
             # A new vectors tree appears immediately (placeholder), before compute.
@@ -92,7 +92,7 @@ class TestFindVectorsPort:
             session._dispatch_toolbar_action(
                 src_plot, "Find Diffraction Vectors",
                 {"sigma": 1.0, "kernel_radius": 5, "threshold": 0.4,
-                 "min_distance": 3, "subpixel": True},
+                 "min_distance": 3, "subpixel": True, "method": "nxcorr"},
             )
             assert _wait(lambda: getattr(session.signal_trees[-1],
                                          "diffraction_vectors", None) is not None)
@@ -107,7 +107,11 @@ class TestFindVectorsPort:
             sp = vtree.signal_plots[0]
             sel = next(s for s in vtree.navigator_plot_manager.all_navigation_selectors
                        if sp in s.children)
+            deadline = time.time() + 30.0    # render wiring installs async
             frame = sel.children[sp](sel, sp, np.array([[ix, iy]]))
+            while float(np.asarray(frame).max()) <= 0 and time.time() < deadline:
+                time.sleep(0.1)
+                frame = sel.children[sp](sel, sp, np.array([[ix, iy]]))
             assert float(np.asarray(frame).max()) > 0, "result window still renders zeros"
 
             # (b) A found-vectors overlay is attached to the result window and

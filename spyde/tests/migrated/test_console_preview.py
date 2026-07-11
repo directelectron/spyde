@@ -451,18 +451,30 @@ class TestNavRefresh:
         # Navigator moves → the console re-runs the SAME preview (same id) at
         # the new cursor; the frontend's newest-wins intake accepts it in place.
         assert nav._settle_cursor(session, tree, np.array([1, 2]), (1, 2)),             "cursor never settled at (1, 2)"
-        session.console.notify_nav_changed()
-        refreshed = _wait_for(
-            msgs, lambda m: m.get("type") == "console_preview_result"
-            and m.get("preview_id") == pid
-            and _count_results(msgs, pid) > n0, timeout=30.0,
-        )
-        assert refreshed is not None, "nav move did not re-emit the preview"
-        latest = [m for m in msgs if m.get("type") == "console_preview_result"
-                  and m.get("preview_id") == pid][-1]
-        # The refreshed thumbnail is the frame at the NEW cursor (1, 2).
-        img = _decode_image(latest)
-        assert np.array_equal(img, _decode_image(_pipeline_thumb(arr[1, 2])))
+        # Re-emit + content poll: a selector can attach LATE with a stale
+        # initial cursor and win the resolver scan between the settle and the
+        # console's re-run — keep re-pinning the cursor and re-notifying until
+        # the LATEST thumbnail is the frame at the new cursor. Stale
+        # intermediates are acceptable by design (newest-wins intake).
+        expected = _decode_image(_pipeline_thumb(arr[1, 2]))
+        deadline = time.time() + 30.0
+        img = None
+        while time.time() < deadline:
+            nav._move_all(session, tree, np.array([1, 2]))
+            session.console.notify_nav_changed()
+            _wait_for(
+                msgs, lambda m: m.get("type") == "console_preview_result"
+                and m.get("preview_id") == pid
+                and _count_results(msgs, pid) > n0, timeout=5.0,
+            )
+            results = [m for m in msgs if m.get("type") == "console_preview_result"
+                       and m.get("preview_id") == pid]
+            if len(results) > n0:
+                img = _decode_image(results[-1])
+                if np.array_equal(img, expected):
+                    break
+        assert _count_results(msgs, pid) > n0, "nav move did not re-emit the preview"
+        assert img is not None and np.array_equal(img, expected)
         assert not np.array_equal(img, _decode_image(_pipeline_thumb(arr[0, 0])))
 
     def test_stop_clears_nav_refresh(self, window):

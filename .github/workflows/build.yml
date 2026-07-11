@@ -1,7 +1,10 @@
 name: build
 
+# push is main-only: a PR branch already gets the pull_request run; the bare
+# `push:` trigger duplicated every matrix (2x cost, 2x flake surface).
 on:
   push:
+    branches: [main]
   pull_request:
     branches: [main]
 
