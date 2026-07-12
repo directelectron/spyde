@@ -1,0 +1,190 @@
+name: Prepare Release
+
+# Run manually from the Actions tab (same flow as anyplotlib's Prepare Release).
+# Creates a branch + PR that bumps electron/package.json — the ONE hand-set
+# version string in this repo (the Python version is derived from the git tag
+# by setuptools_scm, so there is nothing to bump on that side). release.yml
+# hard-fails when the pushed tag doesn't match electron/package.json (that
+# guard is exactly what killed the v0.1.0-rc.3 release); going through this
+# workflow makes the two agree by construction, because the PR tells you the
+# one tag that will pass.
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version component to bump"
+        required: true
+        type: choice
+        options:
+          - minor
+          - patch
+          - major
+          - rc       # increments the -rc.N counter on the current base version
+          - stable   # drops the -rc.N suffix: promote the current rc to stable
+      rc:
+        description: "Cut the bumped version as a release candidate (-rc.1; implied by bump=rc)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write        # push the release branch
+  pull-requests: write   # open the PR
+
+jobs:
+  prepare:
+    name: Prepare release PR
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # ── Compute the new version ──────────────────────────────────────────
+      # electron/package.json is the source of truth for the app's semver
+      # (electron-builder/electron-updater read it); the release tag must be
+      # v<that version>. Tag shapes and the stable/beta channel mapping are
+      # documented in RELEASING.md.
+      - name: Compute new version
+        id: version
+        env:
+          BUMP: ${{ inputs.bump }}
+          IS_RC: ${{ inputs.rc }}
+        run: |
+          CURRENT=$(node -p "require('./electron/package.json').version")
+          export CURRENT_VERSION="$CURRENT"
+
+          NEW_VERSION=$(python3 - <<'PYEOF'
+          import os, re, sys
+
+          current = os.environ["CURRENT_VERSION"]
+          bump    = os.environ["BUMP"]
+          is_rc   = os.environ["IS_RC"].lower() == "true"
+
+          m = re.match(r"^(\d+)\.(\d+)\.(\d+)(?:-rc\.(\d+))?$", current)
+          if not m:
+              sys.exit(f"unparseable current version: {current!r}")
+          major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
+          rc_n = int(m.group(4)) if m.group(4) else None
+
+          if bump == "major":
+              major, minor, patch = major + 1, 0, 0
+          elif bump == "minor":
+              minor, patch = minor + 1, 0
+          elif bump == "patch":
+              patch += 1
+          elif bump == "rc":
+              # Keep the same base; just walk the rc counter forward.
+              is_rc = True
+              rc_n  = (rc_n or 0) + 1
+          elif bump == "stable":
+              # Promote the current rc to its stable base version.
+              if rc_n is None:
+                  sys.exit(f"bump=stable but current version {current!r} has no -rc suffix")
+              is_rc = False
+
+          if is_rc:
+              if bump != "rc":
+                  rc_n = 1          # fresh rc series for the new base
+              print(f"{major}.{minor}.{patch}-rc.{rc_n}", end="")
+          else:
+              print(f"{major}.{minor}.{patch}", end="")
+          PYEOF
+          )
+
+          echo "new_version=$NEW_VERSION"     >> "$GITHUB_OUTPUT"
+          echo "tag=v$NEW_VERSION"            >> "$GITHUB_OUTPUT"
+          echo "branch=release/v$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Bumping (${BUMP}): $CURRENT → $NEW_VERSION"
+
+      - name: Fail if the tag already exists
+        run: |
+          if git ls-remote --tags origin "refs/tags/${{ steps.version.outputs.tag }}" | grep -q .; then
+            echo "::error::tag ${{ steps.version.outputs.tag }} already exists on origin"
+            exit 1
+          fi
+
+      # ── Pre-flight checks from RELEASING.md — fail HERE, not at release time ──
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      # A drifted lock ships an installer that only fails on the user's first
+      # launch (the venv is resolved from uv.lock on their machine).
+      - name: Verify uv.lock is in sync with pyproject.toml
+        run: uv lock --check
+
+      # Git deps must reference explicit SHAs or tags, never moving branches —
+      # otherwise the same installer resolves different code over time.
+      - name: Verify git dependencies are pinned to SHAs or tags
+        run: |
+          bad=$(grep -nE "git\+https" pyproject.toml | grep -vE '@[0-9a-f]{40}"|@v?[0-9]+(\.[0-9]+)+[^"]*"' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::unpinned git dependencies in pyproject.toml:"
+            echo "$bad"
+            exit 1
+          fi
+
+      # ── Bump the version ─────────────────────────────────────────────────
+      # npm version updates package.json AND package-lock.json together.
+      - name: Bump electron/package.json
+        working-directory: electron
+        run: npm version "${{ steps.version.outputs.new_version }}" --no-git-tag-version
+
+      # ── Commit and push ──────────────────────────────────────────────────
+      - name: Configure git
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit release changes
+        run: |
+          git checkout -b "${{ steps.version.outputs.branch }}"
+          git add electron/package.json electron/package-lock.json
+          git commit -m "chore: prepare release ${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.branch }}"
+
+      # ── Open pull request ────────────────────────────────────────────────
+      - name: Open pull request
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+          BRANCH: ${{ steps.version.outputs.branch }}
+        run: |
+          gh pr create \
+            --title "Release ${TAG}" \
+            --base  main \
+            --head  "${BRANCH}" \
+            --body  "## Release ${TAG}
+
+          > Auto-generated by the **Prepare Release** workflow.
+
+          ### What changed
+          - \`electron/package.json\` (+ lockfile) bumped to \`${TAG#v}\` — this is the
+            version electron-builder/electron-updater use, and \`release.yml\` refuses
+            to build a tag that doesn't match it
+          - Pre-flight checks passed: \`uv lock --check\`, git deps pinned to SHAs/tags
+
+          ### Review checklist
+          - [ ] Version is correct in \`electron/package.json\`
+          - [ ] Manual checks from RELEASING.md done on a real machine (GPU path,
+            distributed navigator, clean shutdown)
+          - [ ] CI passes
+
+          ### After merging
+          Tag **the merge commit on main** — the tag MUST be exactly \`${TAG}\`:
+          \`\`\`bash
+          git fetch origin
+          git tag ${TAG} origin/main
+          git push origin ${TAG}
+          \`\`\`
+          The tag push triggers \`release.yml\` (3-platform build → draft release →
+          publish once all legs pass)."

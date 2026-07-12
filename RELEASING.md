@@ -1,8 +1,10 @@
 # Releasing SpyDE
 
-The single checklist for cutting a SpyDE release. The version is **derived from
-the git tag** (`setuptools_scm`), so tagging is the act that sets the version —
-there is no version string to bump by hand.
+The single checklist for cutting a SpyDE release. The Python version is
+**derived from the git tag** (`setuptools_scm`), so tagging is the act that sets
+it. The one hand-maintained version string is `electron/package.json` — and the
+**Prepare Release** workflow (`.github/workflows/prepare_release.yml`) bumps it
+for you, so nothing is edited by hand in practice.
 
 ## Versioning model
 
@@ -82,17 +84,33 @@ Run from a clean checkout of the commit you intend to tag.
    - **Clean shutdown** — quit the app; confirm no orphaned `python.exe` / Dask
      worker processes remain (Task Manager / `ps`).
 
-7. **Versions agree** — `electron/package.json` `version` should match the tag you
-   are about to cut (it is set by hand; keep it in step with the Python tag).
-   `release.yml`'s `build` job now enforces this and fails the release if they
-   drift, but fix it before tagging rather than relying on that as your check.
+7. **Versions agree** — `electron/package.json` `version` must match the tag you
+   are about to cut. Don't bump it by hand: run the **Prepare Release** workflow
+   (below), which bumps it in a reviewable PR. `release.yml`'s `build` job
+   enforces the match and fails the release if they drift (this is exactly how
+   the `v0.1.0-rc.3` release died: tag `-rc.3`, package.json `0.1.0`).
 
 ## Cutting the release
 
-```bash
-git tag vX.Y.Z
-git push origin vX.Y.Z
-```
+1. **Run the Prepare Release workflow** (Actions tab → *Prepare Release* → *Run
+   workflow*). Pick the bump: `major` / `minor` / `patch` (optionally as an
+   `-rc.1` via the checkbox), `rc` (next `-rc.N` on the current base), or
+   `stable` (drop the `-rc` suffix — promote the current rc). It bumps
+   `electron/package.json` (+ lockfile), runs the lockfile/pin pre-flight
+   checks, and opens a `release/vX.Y.Z` PR.
+
+   > Exception: if `electron/package.json` already equals the version you want
+   > to tag (no bump needed), skip straight to tagging.
+
+2. **Review and merge the PR** — CI runs the full matrix on it.
+
+3. **Tag the merge commit with exactly the tag named in the PR** and push:
+
+   ```bash
+   git fetch origin
+   git tag vX.Y.Z origin/main
+   git push origin vX.Y.Z
+   ```
 
 The tag triggers `.github/workflows/release.yml`, which builds the Electron app +
 uv-managed Python sidecar on Windows / macOS / Linux in parallel and publishes a

@@ -123,7 +123,10 @@ jobs:
       # drift here would ship an installer electron-updater can't reason about
       # correctly (or a release that silently doesn't offer itself as an
       # update). Fail fast rather than publish a mismatched build.
+      # shell: bash is load-bearing — the windows-latest default is PowerShell,
+      # which can't parse this script (ParserError, killed the v0.1.0 run).
       - name: Verify electron/package.json version matches the pushed tag
+        shell: bash
         run: |
           pkg_version=$(node -p "require('./electron/package.json').version")
           tag_version="${{ needs.channel.outputs.version }}"
