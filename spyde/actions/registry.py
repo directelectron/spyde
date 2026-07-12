@@ -82,6 +82,22 @@ STAGED_HANDLERS: dict[str, str] = {
     "set_debug_flag":      "spyde.backend.debug_flags.set_debug_flag",
     "get_gpu_status":      "spyde.actions.gpu_status.get_gpu_status",
     "set_update_channel":  "spyde.backend.session.dispatch_set_update_channel",
+    # Report Builder (spyde/actions/report/) — the report sidebar's staged actions.
+    "report_new":              "spyde.actions.report.handlers.report_new",
+    "report_open":             "spyde.actions.report.handlers.report_open",
+    "report_save":             "spyde.actions.report.handlers.report_save",
+    "report_save_as_template": "spyde.actions.report.handlers.report_save_as_template",
+    "report_close":            "spyde.actions.report.handlers.report_close",
+    "report_add_cell":         "spyde.actions.report.handlers.report_add_cell",
+    "report_update_cell":      "spyde.actions.report.handlers.report_update_cell",
+    "report_remove_cell":      "spyde.actions.report.handlers.report_remove_cell",
+    "report_move_cell":        "spyde.actions.report.handlers.report_move_cell",
+    "report_set_caption":      "spyde.actions.report.handlers.report_set_caption",
+    "report_set_title":        "spyde.actions.report.handlers.report_set_title",
+    "report_add_figure":       "spyde.actions.report.handlers.report_add_figure",
+    "report_refresh_figure":   "spyde.actions.report.handlers.report_refresh_figure",
+    "report_snapshots":        "spyde.actions.report.handlers.report_snapshots",
+    "report_cell_from_window": "spyde.actions.report.handlers.report_cell_from_window",
 }
 
 
