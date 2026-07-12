@@ -174,7 +174,10 @@ def _build_interactive_figure_html(mgr, cell: Cell) -> "str | None":
         return None
     try:
         from spyde.actions.report.figure_builder import build_cell_figure
-        _fig, _fig_id, html_str = build_cell_figure(cell.spec, snap_map)
+        # standalone=True → the JS bundle is INLINED (no machine-local file:// ESM
+        # reference), so the sandboxed srcdoc iframe renders on any machine/browser.
+        _fig, _fig_id, html_str = build_cell_figure(
+            cell.spec, snap_map, standalone=True)
         return html_str
     except Exception as e:
         log.debug("interactive figure rebuild failed for cell %s: %s", cell.id, e)

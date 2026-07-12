@@ -164,32 +164,16 @@ def _shared_esm_url(esm: str) -> str:
     return "file://" + path
 
 
-def finalize_figure_html(fig, fig_id) -> str:
-    """Build the standalone HTML for an anyplotlib figure and apply SpyDE's shared
-    post-processing: swap the inlined JS bundle for the shared file URL (V8 code
-    cache), force dark mode (`#widget-root`), and add the click-to-front focus
-    relay. Shared by :meth:`Plot._ensure_figure` and the IPF 3-D figure builder."""
-    import json as _json
+def _apply_figure_html_shell(html: str, fig_id) -> str:
+    """SpyDE's dark-mode + fill-the-iframe + focus-relay post-processing, shared by
+    the live and standalone figure-HTML paths.
 
-    html = build_standalone_html(fig, fig_id=fig_id, resizable=False)
-    try:
-        esm = str(getattr(fig, "_esm", "") or "")
-        if esm:
-            embedded = _json.dumps(esm)
-            shared = _shared_esm_url(esm)
-            html = html.replace(
-                f"const esmSource = {embedded};", "const esmSource = null;", 1)
-            html = html.replace(
-                "import(blobUrl)", f"import({_json.dumps(shared)})", 1)
-    except Exception as e:
-        logger.debug("shared-esm optimization skipped: %s", e)
-
-    # The standalone template pins html/body to the figure's INITIAL px size with
-    # overflow:hidden (sized for a fixed docs/notebook embed). SpyDE drives the
-    # size live via resize_figure (fig_width/height → the panels re-layout), so
-    # when the subwindow is dragged LARGER than that initial size the grown figure
-    # was clipped to the old body box. Make html/body/#widget-root fill the iframe
-    # (100%) so the figure always fills — and is never clipped by — the subwindow.
+    The anyplotlib standalone template pins html/body to the figure's INITIAL px
+    size with overflow:hidden (sized for a fixed docs/notebook embed). SpyDE drives
+    the size live via resize_figure (fig_width/height → the panels re-layout), so
+    when the subwindow is dragged LARGER than that initial size the grown figure was
+    clipped to the old body box. Make html/body/#widget-root fill the iframe (100%)
+    so the figure always fills — and is never clipped by — the subwindow."""
     dark = ("<style>html,body{background:#1e1e2e !important;color-scheme:dark;"
             "width:100% !important;height:100% !important;overflow:hidden}"
             "#widget-root{background:#1e1e2e !important;"
@@ -199,6 +183,38 @@ def finalize_figure_html(fig, fig_id) -> str:
              "try{window.parent.postMessage({type:'spyde_focus',figId:%r},'*');}"
              "catch(e){}},true);</script>" % str(fig_id))
     return html.replace("<body>", dark + focus + "<body>", 1)
+
+
+def finalize_figure_html(fig, fig_id, *, standalone: bool = False) -> str:
+    """Build the standalone HTML for an anyplotlib figure and apply SpyDE's shared
+    post-processing: force dark mode (`#widget-root`) + fill-the-iframe sizing + the
+    click-to-front focus relay. Shared by :meth:`Plot._ensure_figure`, the IPF 3-D
+    figure builder, and the report figure builder.
+
+    ``standalone=False`` (default, the LIVE MDI path) also swaps the inlined JS
+    bundle for a shared ``file://`` URL so Chromium's V8 code cache is reused across
+    iframes (the "big drag" optimization) — but that file URL is machine-local and
+    is blocked inside a cross-origin/sandboxed ``srcdoc`` iframe. For a PORTABLE
+    EXPORT (the interactive report HTML), pass ``standalone=True`` to KEEP the ESM
+    fully inlined so the figure renders on any machine, in any browser, inside a
+    sandboxed iframe with no ``file://`` dependency."""
+    import json as _json
+
+    html = build_standalone_html(fig, fig_id=fig_id, resizable=False)
+    if not standalone:
+        try:
+            esm = str(getattr(fig, "_esm", "") or "")
+            if esm:
+                embedded = _json.dumps(esm)
+                shared = _shared_esm_url(esm)
+                html = html.replace(
+                    f"const esmSource = {embedded};", "const esmSource = null;", 1)
+                html = html.replace(
+                    "import(blobUrl)", f"import({_json.dumps(shared)})", 1)
+        except Exception as e:
+            logger.debug("shared-esm optimization skipped: %s", e)
+
+    return _apply_figure_html_shell(html, fig_id)
 
 
 class Plot:

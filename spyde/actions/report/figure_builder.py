@@ -249,13 +249,19 @@ def _grid_shape(spec):
     return 1, 1, None, None
 
 
-def build_cell_figure(spec, snapshots):
+def build_cell_figure(spec, snapshots, *, standalone: bool = False):
     """Render *spec* + *snapshots* → ``(fig, fig_id, html)``.
 
     ``snapshots`` is a ``{(panel_id, layer_id): ndarray}`` map (or, legacy, a single
     ndarray for a single-panel/single-layer cell). Builds the grid, each panel's
     base image + overlay layers + annotations, and callout insets, then materialises
-    the pixel tokens for a self-contained standalone embed."""
+    the pixel tokens for a self-contained standalone embed.
+
+    ``standalone=True`` (the interactive-EXPORT path) returns HTML with the JS
+    bundle fully INLINED — no machine-local ``file://`` ESM reference — so the
+    figure renders on any machine, in any browser, inside a sandboxed ``srcdoc``
+    iframe. ``standalone=False`` (default, the live report cell) keeps the shared
+    ``file://`` ESM optimization used by the MDI iframes."""
     import anyplotlib as apl
     import anyplotlib._electron as _electron
     from spyde.drawing.plots.plot import finalize_figure_html
@@ -312,7 +318,7 @@ def build_cell_figure(spec, snapshots):
     _resolve_pixels_for_standalone(fig)
 
     fig_id = _electron.register(fig)
-    html = finalize_figure_html(fig, fig_id)
+    html = finalize_figure_html(fig, fig_id, standalone=standalone)
     return fig, fig_id, html
 
 

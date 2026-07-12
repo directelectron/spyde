@@ -232,13 +232,6 @@ export function ReportSidebar() {
   const commitTitle = () => {
     setTitleEditing(false)
     const t = titleDraft.trim()
-    // CONTRACT NOTE: the Phase-1 backend contract lists no title-set action
-    // (report_set_caption exists; a title equivalent does not). The task DOES
-    // ask for a click-to-edit title, so we emit the natural `report_set_title`
-    // {title} — consistent with report_set_caption. It's a benign no-op until
-    // the backend adds the matching staged handler (resolve_staged returns None
-    // → the action is ignored, no error). Once the handler lands, this works
-    // with no renderer change.
     if (t && t !== (report?.title ?? '')) sendAction('report_set_title', { title: t })
   }
 
