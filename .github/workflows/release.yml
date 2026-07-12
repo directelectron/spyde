@@ -174,9 +174,16 @@ jobs:
       # electron-updater's autoUpdater reads at runtime — publish:false builds
       # never generate these files at all. Unsigned for now — signing secrets
       # are a follow-up (PACKAGING.md "What's intentionally deferred").
+      # -c.publish.owner/.repo pin the publish target to THE REPO THIS WORKFLOW
+      # RUNS IN — the same-repo assumption the draft-release design above already
+      # makes (GITHUB_TOKEN can't publish cross-repo anyway). Without the
+      # override, electron-builder.yml's static owner decides, and a value that
+      # doesn't match this repo 404s the whole build (v0.1.0 died publishing to
+      # the not-yet-existing directelectron org). Survives a future repo
+      # transfer with zero edits.
       - name: Build + publish desktop app
         working-directory: electron
-        run: npm run dist -- --publish always
+        run: npm run dist -- --publish always -c.publish.owner=${{ github.repository_owner }} -c.publish.repo=${{ github.event.repository.name }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
