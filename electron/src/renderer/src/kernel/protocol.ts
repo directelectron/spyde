@@ -61,6 +61,11 @@ export interface FigureMessage extends MsgBase {
   view_label?: string
   view_kind?: string
   strain_components?: string[]
+  /** When present + === "report", this figure belongs to a report figure cell
+   *  (routed to `reportFigures`, keyed by `cell_id`) — NOT the MDI windows. */
+  host?: string
+  /** The report cell id owning this figure (only set when host === "report"). */
+  cell_id?: string
 }
 
 export interface ToolbarConfigMessage extends MsgBase {
@@ -294,6 +299,57 @@ export interface LogLevelMessage extends MsgBase {
   level: unknown
 }
 
+// ── Report ─────────────────────────────────────────────────────────────────
+
+/** One cell of the report document (markdown text or an embedded figure). */
+export interface ReportCell {
+  id: string
+  cell_type: 'markdown' | 'figure'
+  /** markdown cells: the source text. */
+  source?: string
+  /** figure cells: the caption (alt text). */
+  caption?: string
+  /** figure cells: a template placeholder (dashed drop-zone, no figure yet). */
+  placeholder?: boolean
+  /** figure cells: the live figure id (null when its data is offline). */
+  fig_id?: string | null
+  /** figure cells: the SignalRef couldn't be rebound → show the baked PNG. */
+  data_offline?: boolean
+  /** figure cells: a data-URL PNG fallback (present only for offline cells). */
+  png?: string
+}
+
+/** The authoritative report document (mirrored by the renderer for editing). */
+export interface ReportDocState {
+  open: boolean
+  path: string | null
+  title: string
+  template: boolean
+  dirty: boolean
+  cells: ReportCell[]
+}
+
+/** Full report document — the backend re-broadcasts this on every change. */
+export interface ReportStateMessage extends MsgBase {
+  type: 'report_state'
+  report: ReportDocState
+}
+
+/** The backend needs a fresh PNG snapshot per listed cell before it can save.
+ *  The renderer harvests each via the figure iframe export protocol and replies
+ *  with `report_snapshots {token, images:{cell_id: dataUrl}}`. */
+export interface ReportNeedSnapshotsMessage extends MsgBase {
+  type: 'report_need_snapshots'
+  token: string
+  cells: Array<{ cell_id: string; fig_id: string }>
+}
+
+/** The report was written to disk at `path`. */
+export interface ReportSavedMessage extends MsgBase {
+  type: 'report_saved'
+  path: string
+}
+
 /**
  * Wizard-scoped events re-broadcast verbatim as DOM CustomEvents (the caret
  * components subscribe directly). The payload beyond `type` is consumer-defined,
@@ -345,6 +401,9 @@ export type PlotAppMessage =
   | LogMessage
   | LogBackfillMessage
   | LogLevelMessage
+  | ReportStateMessage
+  | ReportNeedSnapshotsMessage
+  | ReportSavedMessage
   | WizardEventMessage
 
 /**

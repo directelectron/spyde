@@ -120,6 +120,15 @@ contextBridge.exposeInMainWorld('electron', {
   /** Multi-select DIRECTORY picker (RETURNS paths) — for .zspy/.zarr folders. */
   pickFolders: (): Promise<string[]> => ipcRenderer.invoke('spyde:pick-folders'),
 
+  /** Report save dialog (RETURNS the chosen path or null) — for the Report
+   *  sidebar's Save/Save As. */
+  reportSaveDialog: (defaultName?: string): Promise<string | null> =>
+    ipcRenderer.invoke('report:save-dialog', defaultName),
+
+  /** Report open dialog (RETURNS the chosen path or null) — for the Report
+   *  sidebar's Open. */
+  reportOpenDialog: (): Promise<string | null> => ipcRenderer.invoke('report:open-dialog'),
+
   /** OS path of a dropped File (sandboxed renderers have no File.path) —
    *  powers drag-and-drop of datasets (incl. .zspy folders) onto the MDI. */
   pathForFile: (file: File): string | null => {

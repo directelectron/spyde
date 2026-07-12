@@ -8,6 +8,11 @@ import React, {
   createContext, useContext, useEffect, useReducer, useRef, useState,
 } from 'react'
 import { asPlotAppMessage } from './protocol'
+import type { ReportDocState, ReportCell } from './protocol'
+
+// Re-export the report doc types so components import them from the kernel
+// context (the single import surface the rest of the renderer already uses).
+export type { ReportDocState, ReportCell } from './protocol'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -148,6 +153,14 @@ export interface AxisRow {
 interface State {
   windows: Map<number, SpyDEWindow>
   figures: Map<string, SpyDEFigure>
+  // Report figure cells' iframes — same SpyDEFigure shape + same figId-keyed
+  // iframeRefs/replayState binary-replay machinery, but keyed by CELL id and
+  // kept OUT of the MDI `windows`/`figures` state so they never open an MDI
+  // subwindow. `host:"report"` figure messages route here.
+  reportFigures: Map<string, SpyDEFigure>
+  // The authoritative report document (mirrored from `report_state`), or null
+  // before any report is opened/created.
+  report: ReportDocState | null
   metadata: Map<number, MetadataDict>
   histograms: Map<number, Histogram>
   selectors: Map<number, SelectorInfo>
@@ -218,6 +231,8 @@ type Action =
   | { type: 'CONSOLE_VARS'; vars: ConsoleVarEntry[] }
   | { type: 'CONSOLE_COMPLETIONS'; completeId: number; matches: string[] }
   | { type: 'CONSOLE_PREVIEW_RESULT'; preview: ConsolePreviewResult }
+  | { type: 'REPORT_STATE'; report: ReportDocState }
+  | { type: 'REPORT_FIGURE'; cellId: string; figure: SpyDEFigure }
 
 function spydeReducer(state: State, action: Action): State {
   switch (action.type) {
@@ -448,6 +463,18 @@ function spydeReducer(state: State, action: Action): State {
     case 'CONSOLE_PREVIEW_RESULT':
       return { ...state, consolePreview: action.preview }
 
+    case 'REPORT_STATE':
+      return { ...state, report: action.report }
+
+    case 'REPORT_FIGURE': {
+      // A report figure cell's iframe (host:"report"), keyed by CELL id. A
+      // re-render of the same cell (Refresh from live / rebind) replaces the
+      // entry with the fresh figId — the ReportFigureCell mounts the new one.
+      const reportFigures = new Map(state.reportFigures)
+      reportFigures.set(action.cellId, action.figure)
+      return { ...state, reportFigures }
+    }
+
     case 'SIGNAL_TREE': {
       const signalTrees = new Map(state.signalTrees)
       signalTrees.set(action.windowId, action.tree)
@@ -504,6 +531,10 @@ interface SpyDEContextValue {
   sendAction: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
   setActiveWindow: (windowId: number) => void
   replayState: (figId: string) => void
+  // Harvest a rendered PNG from a figure's iframe (the anyplotlib export
+  // protocol). Resolves null on timeout/error. Used by the report save flow +
+  // any future PNG-export path.
+  requestFigurePng: (figId: string, timeoutMs?: number) => Promise<string | null>
   clearNavShapePrompt: () => void
   // Load Stack dialog (renderer-only UI state, opened from the File menu).
   stackDialogOpen: boolean
@@ -529,6 +560,8 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
   const [state, dispatch] = useReducer(spydeReducer, {
     windows: new Map(),
     figures: new Map(),
+    reportFigures: new Map(),
+    report: null,
     metadata: new Map(),
     composition: new Map(),
     histograms: new Map(),
@@ -600,6 +633,43 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     }
   }
 
+  // Ask a figure's iframe for a rendered PNG (the anyplotlib export protocol).
+  // Posts `{type:'anyplotlib_export_png', requestId, opts}` into the iframe and
+  // resolves on the matching `anyplotlib_export_png_result` window message.
+  // Resolves null on timeout / no iframe / error — so a save NEVER blocks on a
+  // figure that can't answer (the backend falls back to its baked PNG).
+  const requestFigurePng = React.useCallback(
+    (figId: string, timeoutMs = 1500): Promise<string | null> => {
+      const iframe = iframeRefs.current.get(figId)
+      if (!iframe?.contentWindow) return Promise.resolve(null)
+      const requestId = `png_${figId}_${Date.now()}_${Math.random().toString(36).slice(2)}`
+      return new Promise<string | null>((resolve) => {
+        let done = false
+        const finish = (v: string | null) => {
+          if (done) return
+          done = true
+          window.removeEventListener('message', onMsg)
+          clearTimeout(timer)
+          resolve(v)
+        }
+        const onMsg = (e: MessageEvent) => {
+          const d = e.data
+          if (d?.type === 'anyplotlib_export_png_result' && d.requestId === requestId) {
+            finish(typeof d.dataUrl === 'string' ? d.dataUrl : null)
+          }
+        }
+        window.addEventListener('message', onMsg)
+        const timer = setTimeout(() => finish(null), timeoutMs)
+        try {
+          iframe.contentWindow!.postMessage(
+            { type: 'anyplotlib_export_png', requestId, opts: {} }, '*',
+          )
+        } catch { finish(null) }
+      })
+    },
+    [],
+  )
+
   // ── Python → Renderer message dispatch ──────────────────────────────────
 
   useEffect(() => {
@@ -635,6 +705,24 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
           if (!fileUrl && msg.html) {
             fileUrl = 'data:text/html;charset=utf-8,' +
               encodeURIComponent(msg.html)
+          }
+          // A report-hosted figure (host:"report", cell_id set) belongs to a
+          // report figure cell — route it to reportFigures (NOT the MDI
+          // windows). It still uses the SAME figId-keyed iframeRefs/replayState
+          // binary-replay path, so its iframe recovers pre-mount frames.
+          if (msg.host === 'report' && msg.cell_id) {
+            dispatch({
+              type: 'REPORT_FIGURE',
+              cellId: msg.cell_id,
+              figure: {
+                figId: msg.fig_id,
+                windowId: msg.window_id,
+                filePath: fileUrl,
+                title: msg.title || 'Figure',
+                isNavigator: false,
+              },
+            })
+            break
           }
           dispatch({
             type: 'FIGURE',
@@ -908,6 +996,27 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
           })
           break
 
+        case 'report_state':
+          // The authoritative report document. Mirrored into state so the
+          // sidebar + cells re-render.
+          if (msg.report) dispatch({ type: 'REPORT_STATE', report: msg.report as ReportDocState })
+          break
+
+        case 'report_saved':
+          // Zip written — surface a transient status (the sidebar reads
+          // report.dirty for the persistent indicator).
+          dispatch({ type: 'STATUS', text: `Report saved: ${msg.path}` })
+          break
+
+        case 'report_need_snapshots':
+          // The backend needs a fresh PNG per cell before it writes the zip.
+          // Re-broadcast as a DOM CustomEvent; the provider's snapshot effect
+          // (below) harvests via requestFigurePng and replies with
+          // report_snapshots {token, images}. Doing it there keeps requestFigurePng
+          // out of this message-effect's closure (which has no deps).
+          window.dispatchEvent(new CustomEvent('spyde:report_need_snapshots', { detail: msg }))
+          break
+
         case 'log':
           dispatch({ type: 'LOG', entry: {
             level: String(msg.level), name: String(msg.name),
@@ -1048,6 +1157,43 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     windowId?: number,
   ) => window.electron.action(action, payload, windowId)
 
+  // Snapshot harvest: when the backend requests PNGs before a save
+  // (report_need_snapshots), grab one per cell via the export protocol and
+  // reply with report_snapshots {token, images}. Per-cell PNGs are gathered in
+  // parallel (each self-times-out at 1.5 s in requestFigurePng); we send
+  // whatever succeeded — the backend has its own baked-PNG fallback, so a save
+  // must never block. sendAction is recreated each render, so route through a
+  // ref to keep this effect's identity stable (it must attach ONCE).
+  const sendActionRef = useRef(sendAction)
+  sendActionRef.current = sendAction
+  // Mirror reportFigures into a ref so the harvest (a stable-identity effect)
+  // reads the LATEST cell→figure map without re-subscribing per figure.
+  const reportFiguresRef = useRef(state.reportFigures)
+  reportFiguresRef.current = state.reportFigures
+  useEffect(() => {
+    const onNeed = async (e: Event) => {
+      const detail = (e as CustomEvent).detail as {
+        token?: string; cells?: Array<{ cell_id: string; fig_id: string }>
+      }
+      const token = detail?.token
+      const cells = detail?.cells ?? []
+      if (!token) return
+      const images: Record<string, string> = {}
+      await Promise.all(cells.map(async ({ cell_id }) => {
+        // The backend's `fig_id` field is the CELL id (its state() ships
+        // fig_id === cell.id). The real iframe key is the anyplotlib figId of
+        // the report figure for this cell — resolve it via reportFigures.
+        const realFigId = reportFiguresRef.current.get(cell_id)?.figId
+        if (!realFigId) return
+        const dataUrl = await requestFigurePng(realFigId, 1500)
+        if (dataUrl) images[cell_id] = dataUrl
+      }))
+      sendActionRef.current('report_snapshots', { token, images })
+    }
+    window.addEventListener('spyde:report_need_snapshots', onNeed)
+    return () => window.removeEventListener('spyde:report_need_snapshots', onNeed)
+  }, [requestFigurePng])
+
   const setActiveWindow = (windowId: number) => {
     dispatch({ type: 'SET_ACTIVE', windowId })
     // Tell the backend too, so window-less actions (e.g. the File→Save menu,
@@ -1065,7 +1211,8 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
 
   return (
     <SpyDEContext.Provider value={{
-      state, iframeRefs, latestStates, sendAction, setActiveWindow, replayState, clearNavShapePrompt,
+      state, iframeRefs, latestStates, sendAction, setActiveWindow, replayState,
+      requestFigurePng, clearNavShapePrompt,
       stackDialogOpen, openStackDialog, closeStackDialog,
       updateDialogOpen, openUpdateDialog, closeUpdateDialog,
       gpuStatusDialogOpen, openGpuStatusDialog, closeGpuStatusDialog,

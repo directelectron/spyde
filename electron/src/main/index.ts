@@ -582,6 +582,27 @@ ipcMain.handle('spyde:save-dialog', async () => {
   }
 })
 
+/** Report save dialog — RETURNS the chosen path (or null) to the renderer;
+ *  does not send any backend action itself (the Report sidebar drives the
+ *  actual save via its own action once it has a path). */
+ipcMain.handle('report:save-dialog', async (_e, defaultPath?: string) => {
+  const result = await dialog.showSaveDialog(win!, {
+    defaultPath: defaultPath ?? 'report.spyde-report',
+    filters: [{ name: 'SpyDE Report', extensions: ['spyde-report'] }],
+  })
+  return result.canceled || !result.filePath ? null : result.filePath
+})
+
+/** Report open dialog (single file) — RETURNS the chosen path (or null). */
+ipcMain.handle('report:open-dialog', async () => {
+  const result = await dialog.showOpenDialog(win!, {
+    title: 'Open a SpyDE Report',
+    properties: ['openFile'],
+    filters: [{ name: 'SpyDE Report', extensions: ['spyde-report'] }],
+  })
+  return result.canceled || !result.filePaths.length ? null : result.filePaths[0]
+})
+
 /** Forward figure interaction events to Python. */
 ipcMain.on('spyde:figure-event', (_, figId: string, eventJson: string) =>
   sendFigureEvent(figId, eventJson)

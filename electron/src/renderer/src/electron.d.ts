@@ -21,6 +21,8 @@ declare global {
       pickFile: (opts: { name?: string; extensions?: string[] }) => Promise<string | null>
       pickFiles: (opts?: { name?: string; extensions?: string[] }) => Promise<string[]>
       pickFolders: () => Promise<string[]>
+      reportSaveDialog: (defaultName?: string) => Promise<string | null>
+      reportOpenDialog: () => Promise<string | null>
       pathForFile?: (file: File) => string | null
       figureEvent: (figId: string, eventJson: string) => void
       resizeFigure: (figId: string, width: number, height: number) => void
