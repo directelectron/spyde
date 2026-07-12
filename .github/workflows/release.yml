@@ -98,6 +98,14 @@ jobs:
     needs: [channel, prepare-release]
     permissions:
       contents: write      # electron-builder publishes assets to the release
+    # windows-latest's default step shell is PowerShell, which killed two
+    # v0.1.0 attempts (ParserError on the bash version-guard script; then
+    # npm.cmd arg-mangling that turned -c.publish.repo=spyde into a config
+    # FILE path → ENOENT). Every run step in this job is a POSIX script or a
+    # command verified under Git Bash on Windows, so default the whole job.
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: true        # abort all legs if one fails — keeps releases clean
       matrix:
@@ -123,10 +131,7 @@ jobs:
       # drift here would ship an installer electron-updater can't reason about
       # correctly (or a release that silently doesn't offer itself as an
       # update). Fail fast rather than publish a mismatched build.
-      # shell: bash is load-bearing — the windows-latest default is PowerShell,
-      # which can't parse this script (ParserError, killed the v0.1.0 run).
       - name: Verify electron/package.json version matches the pushed tag
-        shell: bash
         run: |
           pkg_version=$(node -p "require('./electron/package.json').version")
           tag_version="${{ needs.channel.outputs.version }}"
