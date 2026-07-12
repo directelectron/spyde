@@ -134,6 +134,12 @@ functions:
             type: enum
             default: mean
             options: [mean, sum]
+  Copy to Report:
+    description: Snapshot this image into the Report as a figure cell (opens a report if none is active).
+    icon: drawing/toolbars/icons/signal_tree.svg
+    function: spyde.actions.report.toolbar_actions.copy_to_report
+    plot_dim: [2]
+    toolbar_side: right
   Line Profile:
     description: Extract a 1D line profile from the current 2D plot.
     icon: drawing/toolbars/icons/line_profile.svg

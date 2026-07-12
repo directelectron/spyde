@@ -239,6 +239,32 @@ class ReportManager:
             "host": "report", "cell_id": cell.id,
         })
 
+    def assemble_assets(self, harvested: dict) -> dict:
+        """Build ``{cell_id -> PNG bytes}`` for every non-placeholder figure cell,
+        preferring (in order): the renderer-harvested PNG, a fresh bake of the held
+        snapshot, then the PNG loaded from an opened report. The shared basis for
+        the zip save AND every export path so all writes get identical pixels."""
+        assets: dict[str, bytes] = {}
+        for c in self.doc.cells:
+            if c.cell_type != "figure" or c.placeholder:
+                continue
+            png = harvested.get(c.id)
+            if png is None:
+                arr = self.primary_snapshot(c.id)
+                if arr is not None:
+                    try:
+                        layer = c.spec.primary_layer if c.spec else None
+                        cmap = layer.cmap if layer else "viridis"
+                        clim = layer.clim if layer else None
+                        png = bake_fallback_png(arr, cmap=cmap, clim=clim)
+                    except Exception as e:
+                        log.debug("asset bake failed for cell %s: %s", c.id, e)
+                if png is None:
+                    png = self._baked.get(c.id)
+            if png is not None:
+                assets[c.id] = png
+        return assets
+
     def _forget(self, window_id: int) -> None:
         forget = getattr(self.session, "_forget_window", None)
         if forget is not None:
@@ -424,6 +450,53 @@ def report_open(session, plot, payload) -> None:
     mgr.emit_state()
 
 
+def harvest_snapshots(session, mgr: ReportManager, finish) -> None:
+    """Run the renderer PNG-harvest handshake, then call ``finish(harvested)``.
+
+    Shared by ``report_save`` AND the HTML/markdown exporters so every write path
+    gets FRESH live-figure pixels (0f export protocol) with the SAME 3 s
+    fallback-bake safety: emit ``report_need_snapshots``, accept a matching
+    ``report_snapshots`` reply, and — if it's slow/missing — fire ``finish`` with
+    whatever arrived (``finish`` fills the gaps from held / baked snapshots).
+
+    ``finish`` is ``finish(harvested: dict[cell_id -> png bytes]) -> None``. When
+    there are no mounted figures OR no event loop (headless / tests), ``finish``
+    is called synchronously with an empty dict — the write happens NOW."""
+    fig_cells = [c for c in mgr.doc.cells
+                 if c.cell_type == "figure" and not c.placeholder]
+    live_cells = [c for c in fig_cells if c.id in mgr._window_by_cell]
+
+    if not live_cells or getattr(session, "_main_loop", None) is None:
+        finish({})
+        return
+
+    import uuid as _uuid
+    token = _uuid.uuid4().hex
+    mgr._pending_save[token] = {
+        "cell_ids": [c.id for c in live_cells],
+        "harvested": {},
+        "finish": finish,
+    }
+    ipc.emit({
+        "type": "report_need_snapshots", "token": token,
+        "cells": [{"cell_id": c.id, "fig_id": c.id} for c in live_cells],
+    })
+    loop = session._main_loop
+
+    def _timeout():
+        pend = mgr._pending_save.pop(token, None)
+        if pend is None:
+            return   # already completed by report_snapshots
+        pend["finish"](pend["harvested"])
+
+    try:
+        loop.call_later(_SNAPSHOT_TIMEOUT_S, _timeout)
+    except Exception as e:
+        log.debug("snapshot-harvest timeout arm failed, finishing now: %s", e)
+        mgr._pending_save.pop(token, None)
+        finish({})
+
+
 def report_save(session, plot, payload) -> None:
     """Save the report. Ask the renderer to harvest live-figure PNGs (0f export
     protocol); fall back to a baked PNG for any cell whose image doesn't arrive
@@ -437,48 +510,14 @@ def report_save(session, plot, payload) -> None:
         ipc.emit_error("report_save: no path (use Save As).")
         return
     mgr.path = path
-
-    fig_cells = [c for c in mgr.doc.cells
-                 if c.cell_type == "figure" and not c.placeholder]
-    live_cells = [c for c in fig_cells if c.id in mgr._window_by_cell]
-
-    if not live_cells or getattr(session, "_main_loop", None) is None:
-        # No mounted figures to harvest (headless / all-offline) OR no event loop
-        # to time out on (tests) → bake straight from held snapshots.
-        _finish_save(session, mgr, path, harvested={})
-        return
-
-    import uuid as _uuid
-    token = _uuid.uuid4().hex
-    mgr._pending_save[token] = {
-        "path": path,
-        "cell_ids": [c.id for c in live_cells],
-        "harvested": {},
-    }
-    ipc.emit({
-        "type": "report_need_snapshots", "token": token,
-        "cells": [{"cell_id": c.id, "fig_id": c.id} for c in live_cells],
-    })
-    # Arm a timeout so a missing / slow reply never wedges the save.
-    loop = session._main_loop
-
-    def _timeout():
-        pend = mgr._pending_save.pop(token, None)
-        if pend is None:
-            return   # already completed by report_snapshots
-        _finish_save(session, mgr, pend["path"], harvested=pend["harvested"])
-
-    try:
-        loop.call_later(_SNAPSHOT_TIMEOUT_S, _timeout)
-    except Exception as e:
-        log.debug("save timeout arm failed, baking now: %s", e)
-        mgr._pending_save.pop(token, None)
-        _finish_save(session, mgr, path, harvested={})
+    harvest_snapshots(session, mgr,
+                      lambda harvested: _finish_save(session, mgr, path, harvested))
 
 
 def report_snapshots(session, plot, payload) -> None:
-    """Renderer-harvested PNGs for a pending save. Decode the data URLs and
-    complete the save (fallback-baking any still-missing cell)."""
+    """Renderer-harvested PNGs for a pending harvest handshake (save OR export).
+    Decode the data URLs and hand them to the pending entry's ``finish``
+    callback (fallback-baking any still-missing cell)."""
     mgr = _manager(session)
     token = payload.get("token")
     pend = mgr._pending_save.pop(token, None) if token else None
@@ -490,9 +529,15 @@ def report_snapshots(session, plot, payload) -> None:
             harvested[cell_id] = png
     if pend is None:
         # Timeout already fired (or unknown token) — nothing to complete. The
-        # save already happened via the timeout path.
+        # write already happened via the timeout path.
         return
     pend["harvested"].update(harvested)
+    finish = pend.get("finish")
+    if finish is not None:
+        finish(pend["harvested"])
+        return
+    # Legacy pending shape (a directly-seeded {path, cell_ids, harvested}) →
+    # the save finisher.
     _finish_save(session, mgr, pend["path"], harvested=pend["harvested"])
 
 
@@ -500,26 +545,7 @@ def _finish_save(session, mgr: ReportManager, path: str,
                  harvested: dict) -> None:
     """Assemble the asset PNGs (harvested → held-baked → offline-baked) and write
     the zip atomically, then emit ``report_saved`` + refresh state."""
-    assets: dict[str, bytes] = {}
-    for c in mgr.doc.cells:
-        if c.cell_type != "figure" or c.placeholder:
-            continue
-        png = harvested.get(c.id)
-        if png is None:
-            # Prefer a fresh bake of the held snapshot; else the PNG we loaded.
-            arr = mgr.primary_snapshot(c.id)
-            if arr is not None:
-                try:
-                    layer = c.spec.primary_layer if c.spec else None
-                    cmap = layer.cmap if layer else "viridis"
-                    clim = layer.clim if layer else None
-                    png = bake_fallback_png(arr, cmap=cmap, clim=clim)
-                except Exception as e:
-                    log.debug("save bake failed for cell %s: %s", c.id, e)
-            if png is None:
-                png = mgr._baked.get(c.id)
-        if png is not None:
-            assets[c.id] = png
+    assets = mgr.assemble_assets(harvested)
     try:
         mgr.doc.touch()
         write_report(mgr.doc, path, assets=assets)
@@ -580,6 +606,10 @@ def report_add_cell(session, plot, payload) -> None:
         return
     cell = Cell(id=new_cell_id(), cell_type="markdown",
                 source=str(payload.get("source", "") or ""))
+    # OPTIONAL sanitized HTML fragment from the renderer (marked+DOMPurify) —
+    # a derived, non-persisted field used only by HTML export.
+    if payload.get("html") is not None:
+        cell.html = str(payload.get("html") or "")
     _insert_cell(mgr.doc, cell, payload.get("index"))
     mgr.dirty = True
     mgr.emit_state()
@@ -593,6 +623,13 @@ def report_update_cell(session, plot, payload) -> None:
     if cell is None or cell.cell_type != "markdown":
         return
     cell.source = str(payload.get("source", "") or "")
+    # Refresh the derived (non-persisted) rendered-HTML fragment when the
+    # renderer sends one; otherwise the stale fragment is dropped so export can't
+    # emit HTML that no longer matches the source.
+    if "html" in payload:
+        cell.html = str(payload.get("html") or "")
+    else:
+        cell.html = ""
     mgr.dirty = True
     mgr.emit_state()
 

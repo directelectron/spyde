@@ -1,0 +1,391 @@
+"""
+export_html.py — the Report Builder export handlers (Phase 3).
+
+Three export forms, all sharing the SAME snapshot-harvest handshake as
+``report_save`` (so ``<img>``s / figures are current):
+
+* ``report_export_html {mode:'static'|'interactive', path}`` — one self-contained
+  HTML file (a clean neutral article; print-safe for Electron ``printToPDF``).
+    - **static**: figure cells become ``<figure><img src="data:image/png;…">``;
+      no iframes, no external fetches.
+    - **interactive**: figure cells embed their LIVE anyplotlib figure in a
+      sandboxed ``<iframe srcdoc>`` (rebuilt via ``build_cell_figure`` so the
+      pixels are inlined — no ``\\x00bin:`` tokens); a cell that can't rebuild
+      (offline) falls back to the static ``<img>``.
+* ``report_export_markdown {path}`` — write the UNZIPPED container (``report.md``
+  + ``figures/*.yaml`` + ``assets/*.png``) into a target DIRECTORY.
+* ``report_paste_cell {cell}`` — insert a serialized cell (renderer clipboard):
+  a markdown cell verbatim, or a figure cell rebuilt LIVE from the resolved
+  source (offline → the provided ``png`` data URL as the baked fallback).
+
+On success each export emits
+``{"type":"report_exported","kind":<k>,"path":<str>}`` where ``<k>`` is one of
+``"html-static" | "html-interactive" | "markdown-folder"``. Failures go through
+``emit_error``.
+"""
+from __future__ import annotations
+
+import base64
+import html as _html
+import logging
+import os
+
+import numpy as np
+
+from spyde.backend import ipc
+from spyde.actions.report.handlers import (
+    _decode_data_url, _manager, harvest_snapshots,
+)
+from spyde.actions.report.model import (
+    Cell, FigureSpec, dir_is_safe_md_target, new_cell_id, write_report_dir,
+)
+
+log = logging.getLogger(__name__)
+
+
+# ── the page skeleton + article CSS ───────────────────────────────────────────
+
+# A clean neutral article stylesheet: readable column, works when printed. The
+# print block forces black-on-white (this exact file is what Electron
+# printToPDF consumes) so a dark UI theme never bleeds into the PDF.
+_ARTICLE_CSS = """
+:root { color-scheme: light; }
+* { box-sizing: border-box; }
+body {
+  margin: 0; padding: 2.5rem 1.25rem;
+  background: #ffffff; color: #1a1a1a;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica,
+    Arial, sans-serif;
+  line-height: 1.6; font-size: 16px;
+}
+.report-article { max-width: 46rem; margin: 0 auto; }
+.report-article h1 { font-size: 2rem; line-height: 1.2; margin: 0 0 1.5rem;
+  font-weight: 700; }
+.report-article h2 { font-size: 1.5rem; margin: 2rem 0 0.75rem; }
+.report-article h3 { font-size: 1.2rem; margin: 1.5rem 0 0.5rem; }
+.report-article p { margin: 0 0 1rem; }
+.report-article a { color: #1a5fb4; }
+.report-article code { font-family: ui-monospace, SFMono-Regular, Menlo,
+  Consolas, monospace; font-size: 0.9em;
+  background: #f2f2f4; padding: 0.1em 0.35em; border-radius: 4px; }
+.report-article pre { background: #f6f6f8; padding: 1rem; border-radius: 8px;
+  overflow-x: auto; }
+.report-article pre code { background: none; padding: 0; }
+.report-article pre.md-src { white-space: pre-wrap; }
+.report-article blockquote { margin: 0 0 1rem; padding: 0 1rem;
+  border-left: 4px solid #d0d0d6; color: #555; }
+.report-article table { border-collapse: collapse; margin: 0 0 1rem;
+  display: block; overflow-x: auto; }
+.report-article th, .report-article td { border: 1px solid #d0d0d6;
+  padding: 0.4rem 0.6rem; }
+.report-article img { max-width: 100%; height: auto; }
+figure.report-figure { margin: 1.75rem 0; text-align: center; }
+figure.report-figure img { max-width: 100%; height: auto;
+  border: 1px solid #e2e2e6; border-radius: 6px; }
+figure.report-figure iframe { width: 100%; border: 1px solid #e2e2e6;
+  border-radius: 6px; }
+figure.report-figure figcaption { margin-top: 0.6rem; font-size: 0.9rem;
+  color: #555; font-style: italic; }
+@media print {
+  body { background: #fff !important; color: #000 !important;
+    padding: 0; }
+  .report-article { max-width: none; }
+  figure.report-figure img, figure.report-figure iframe { border: none; }
+}
+"""
+
+# Aspect box for an interactive figure iframe — a self-contained figure sizes
+# itself, but the srcdoc iframe needs an explicit height. A 4:3-ish default keeps
+# a diffraction-pattern square figure fully visible without scroll.
+_IFRAME_HEIGHT_PX = 480
+
+
+def _page(title: str, body_html: str) -> str:
+    """Wrap the article body in a self-contained HTML page (no external fetches)."""
+    esc_title = _html.escape(title or "Report")
+    return (
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n"
+        "<meta charset=\"utf-8\">\n"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+        f"<title>{esc_title}</title>\n"
+        f"<style>{_ARTICLE_CSS}</style>\n"
+        "</head>\n<body>\n"
+        f"<article class=\"report-article\">\n<h1>{esc_title}</h1>\n"
+        f"{body_html}\n</article>\n</body>\n</html>\n"
+    )
+
+
+# ── cell → HTML fragment ──────────────────────────────────────────────────────
+
+
+def _markdown_cell_html(cell: Cell) -> str:
+    """The rendered-HTML fragment for a markdown cell.
+
+    The renderer is the single markdown engine (marked+DOMPurify): it sends the
+    sanitized fragment on every commit and we cache it on ``cell.html``. When
+    that cache is absent (never edited this session / reloaded), fall back to the
+    raw markdown source escaped inside ``<pre class="md-src">`` — correctness
+    over beauty."""
+    frag = (cell.html or "").strip()
+    if frag:
+        return frag
+    return f"<pre class=\"md-src\">{_html.escape(cell.source or '')}</pre>"
+
+
+def _figure_img_html(caption: str, png: "bytes | None") -> str:
+    """A static ``<figure><img data:image/png;…></figure>`` for a figure cell.
+    Returns ``""`` when there are no pixels (placeholder / unbaked)."""
+    if not png:
+        return ""
+    b64 = base64.b64encode(png).decode("ascii")
+    cap = _html.escape(caption or "")
+    figcap = f"<figcaption>{cap}</figcaption>" if cap else ""
+    return (
+        "<figure class=\"report-figure\">"
+        f"<img src=\"data:image/png;base64,{b64}\" alt=\"{cap}\">"
+        f"{figcap}</figure>"
+    )
+
+
+def _figure_iframe_html(caption: str, figure_html: str) -> str:
+    """A sandboxed ``<iframe srcdoc>`` embedding a cell's self-contained
+    interactive figure HTML (pixels already inlined). The srcdoc content is
+    HTML-escaped so the attribute can't be broken out of."""
+    srcdoc = _html.escape(figure_html, quote=True)
+    cap = _html.escape(caption or "")
+    figcap = f"<figcaption>{cap}</figcaption>" if cap else ""
+    return (
+        "<figure class=\"report-figure\">"
+        f"<iframe sandbox=\"allow-scripts\" srcdoc=\"{srcdoc}\" "
+        f"style=\"height:{_IFRAME_HEIGHT_PX}px;\" loading=\"lazy\"></iframe>"
+        f"{figcap}</figure>"
+    )
+
+
+def _build_interactive_figure_html(mgr, cell: Cell) -> "str | None":
+    """Rebuild a figure cell's LIVE anyplotlib figure and return its
+    self-contained standalone HTML (pixels materialised via ``build_cell_figure``
+    → ``_resolve_pixels_for_standalone`` so no binary tokens leak), or None when
+    the cell has no snapshot to rebuild (offline)."""
+    if cell.spec is None:
+        return None
+    snap_map = mgr.snapshot_map(cell.id)
+    if not snap_map:
+        return None
+    try:
+        from spyde.actions.report.figure_builder import build_cell_figure
+        _fig, _fig_id, html_str = build_cell_figure(cell.spec, snap_map)
+        return html_str
+    except Exception as e:
+        log.debug("interactive figure rebuild failed for cell %s: %s", cell.id, e)
+        return None
+
+
+def _render_body(mgr, assets: dict, *, interactive: bool) -> str:
+    """Assemble the article body: each cell in order → its HTML fragment. Figure
+    placeholders are skipped. For interactive mode a figure with no rebuildable
+    live figure falls back to the static ``<img>``."""
+    blocks: list[str] = []
+    for c in mgr.doc.cells:
+        if c.cell_type == "markdown":
+            blocks.append(_markdown_cell_html(c))
+        elif c.cell_type == "figure":
+            if c.placeholder:
+                continue
+            html_frag = ""
+            if interactive:
+                fig_html = _build_interactive_figure_html(mgr, c)
+                if fig_html is not None:
+                    html_frag = _figure_iframe_html(c.caption, fig_html)
+            if not html_frag:
+                # Static path (also the interactive OFFLINE fallback).
+                html_frag = _figure_img_html(c.caption, assets.get(c.id))
+            if html_frag:
+                blocks.append(html_frag)
+    return "\n".join(blocks)
+
+
+# ── handlers ───────────────────────────────────────────────────────────────────
+
+
+def report_export_html(session, plot, payload) -> None:
+    """Export the open report as ONE self-contained HTML file.
+
+    ``mode`` is ``"static"`` (baked ``<img>``s only) or ``"interactive"`` (live
+    figures in sandboxed ``srcdoc`` iframes). Runs the snapshot-harvest handshake
+    first so the images are fresh, then writes the file and emits
+    ``report_exported``.
+
+    ``temp:true`` (static only) writes to a UNIQUE file under the OS temp
+    directory instead of ``path`` and emits ``report_exported`` with THAT path.
+    This is the first leg of the PDF export flow: the renderer awaits the emitted
+    temp path, then hands it to Electron ``printToPDF``. ``path`` is ignored when
+    ``temp`` is set."""
+    mgr = _manager(session)
+    if not mgr.open:
+        ipc.emit_error("report_export_html: no open report.")
+        return
+    temp = bool(payload.get("temp"))
+    if temp:
+        import tempfile
+        import uuid
+        path = os.path.join(
+            tempfile.gettempdir(), f"spyde-report-{uuid.uuid4().hex}.html")
+    else:
+        path = payload.get("path")
+        if not path:
+            ipc.emit_error("report_export_html: no path.")
+            return
+    mode = str(payload.get("mode", "static")).lower()
+    interactive = mode == "interactive"
+    kind = "html-interactive" if interactive else "html-static"
+
+    def finish(harvested: dict) -> None:
+        try:
+            assets = mgr.assemble_assets(harvested)
+            body = _render_body(mgr, assets, interactive=interactive)
+            page = _page(mgr.doc.title, body)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(page)
+        except Exception as e:
+            ipc.emit_error(f"Exporting HTML failed: {e}")
+            log.exception("report_export_html failed")
+            return
+        ipc.emit({"type": "report_exported", "kind": kind, "path": path})
+
+    harvest_snapshots(session, mgr, finish)
+
+
+def report_export_markdown(session, plot, payload) -> None:
+    """Export the open report as an UNZIPPED markdown folder (``report.md`` +
+    ``figures/*.yaml`` + ``assets/*.png``) into the target directory ``path``.
+
+    Refuses a directory that already holds content that doesn't look like a prior
+    export (conservative — never clobber the user's data). Runs the same snapshot
+    handshake as save so the baked PNGs are fresh."""
+    mgr = _manager(session)
+    if not mgr.open:
+        ipc.emit_error("report_export_markdown: no open report.")
+        return
+    path = payload.get("path")
+    if not path:
+        ipc.emit_error("report_export_markdown: no path.")
+        return
+    if os.path.isfile(path):
+        ipc.emit_error("report_export_markdown: target is a file, not a directory.")
+        return
+    if not dir_is_safe_md_target(path):
+        ipc.emit_error(
+            "report_export_markdown: target directory is not empty and doesn't "
+            "look like a previous export — pick an empty directory.")
+        return
+
+    def finish(harvested: dict) -> None:
+        try:
+            assets = mgr.assemble_assets(harvested)
+            mgr.doc.touch()
+            write_report_dir(mgr.doc, path, assets=assets)
+        except Exception as e:
+            ipc.emit_error(f"Exporting markdown folder failed: {e}")
+            log.exception("report_export_markdown failed")
+            return
+        ipc.emit({"type": "report_exported", "kind": "markdown-folder",
+                  "path": path})
+
+    harvest_snapshots(session, mgr, finish)
+
+
+def report_paste_cell(session, plot, payload) -> None:
+    """Insert a serialized cell from the renderer's internal clipboard.
+
+    ``cell`` is ``{cell_type:'markdown', source}`` or
+    ``{cell_type:'figure', caption, figure:<FigureSpec dict>, png?:<dataURL>}``.
+    A markdown cell is inserted verbatim (fresh id). A figure cell gets FRESH ids
+    for its cell / panels / layers, and each layer's SignalRef is resolved like
+    ``report_open`` does: all-resolvable → rebuilt LIVE (re-snapshotted from the
+    resolved plots' current_data); otherwise an OFFLINE cell whose baked fallback
+    is the provided ``png`` data URL."""
+    from spyde.actions.report.handlers import _ensure_open, _insert_cell
+    mgr = _ensure_open(session)
+    spec_cell = payload.get("cell") or {}
+    cell_type = str(spec_cell.get("cell_type", "markdown"))
+    index = payload.get("index")
+
+    if cell_type == "markdown":
+        cell = Cell(id=new_cell_id(), cell_type="markdown",
+                    source=str(spec_cell.get("source", "") or ""))
+        if spec_cell.get("html") is not None:
+            cell.html = str(spec_cell.get("html") or "")
+        _insert_cell(mgr.doc, cell, index)
+        mgr.dirty = True
+        mgr.emit_state()
+        return
+
+    if cell_type != "figure":
+        ipc.emit_error(f"report_paste_cell: unsupported cell_type {cell_type!r}.")
+        return
+
+    # Figure cell — rebuild the spec with fresh ids so a paste never collides with
+    # the source cell's ids.
+    spec = FigureSpec.from_dict(spec_cell.get("figure") or {})
+    _freshen_spec_ids(spec)
+    caption = str(spec_cell.get("caption", "") or "")
+    cell = Cell(id=new_cell_id(), cell_type="figure", caption=caption,
+                placeholder=False, spec=spec)
+
+    # Resolve every layer against open trees/files; a live rebuild needs a snapshot
+    # for EACH layer (same all-or-offline rule as report_open).
+    snap_map: dict = {}
+    all_resolved = bool(spec.panels)
+    for panel in spec.panels:
+        for layer in panel.layers:
+            src_plot = layer.source.resolve(session) if layer.source else None
+            arr = None
+            if src_plot is not None:
+                frame = getattr(src_plot, "current_data", None)
+                if isinstance(frame, np.ndarray) and frame.dtype != object:
+                    arr = np.array(frame, copy=True)
+            if arr is None:
+                all_resolved = False
+            else:
+                snap_map[(panel.id, layer.id)] = arr
+
+    _insert_cell(mgr.doc, cell, index)
+
+    if all_resolved and snap_map:
+        mgr._snapshots[cell.id] = snap_map
+        mgr._baked.pop(cell.id, None)
+        mgr._offline.discard(cell.id)
+        mgr.build_figure_window(cell)
+    else:
+        # Offline: keep the provided PNG as the baked fallback so the renderer can
+        # still show the snapshot (its data URL rides along in report_state).
+        png = _decode_data_url(spec_cell.get("png"))
+        mgr._snapshots.pop(cell.id, None)
+        if png is not None:
+            mgr._baked[cell.id] = png
+        mgr._offline.add(cell.id)
+
+    mgr.dirty = True
+    mgr.emit_state()
+
+
+def _freshen_spec_ids(spec: FigureSpec) -> None:
+    """Assign fresh panel + layer ids to a pasted FigureSpec (in place), keeping
+    inset ``panel:`` back-references pointing at the renamed panels so callouts
+    survive the paste."""
+    from spyde.actions.report.model import new_layer_id
+    panel_remap: dict = {}
+    for i, panel in enumerate(spec.panels):
+        old_pid = panel.id
+        new_pid = f"p{i + 1}"
+        panel_remap[old_pid] = new_pid
+        panel.id = new_pid
+        for layer in panel.layers:
+            layer.id = new_layer_id()
+    # Re-point inset panel references at the renamed panels.
+    for panel in spec.panels:
+        for ins in (panel.insets or []):
+            ref = ins.get("panel")
+            if ref in panel_remap:
+                ins["panel"] = panel_remap[ref]

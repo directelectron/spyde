@@ -98,6 +98,10 @@ STAGED_HANDLERS: dict[str, str] = {
     "report_refresh_figure":   "spyde.actions.report.handlers.report_refresh_figure",
     "report_snapshots":        "spyde.actions.report.handlers.report_snapshots",
     "report_cell_from_window": "spyde.actions.report.handlers.report_cell_from_window",
+    # Report Builder Phase 3 — export + copy/paste (spyde/actions/report/export_html.py)
+    "report_export_html":      "spyde.actions.report.export_html.report_export_html",
+    "report_export_markdown":  "spyde.actions.report.export_html.report_export_markdown",
+    "report_paste_cell":       "spyde.actions.report.export_html.report_paste_cell",
     # Report Builder Phase 2 — combined report figures (spyde/actions/report/compose.py)
     "repfig_query_compose":    "spyde.actions.report.compose.repfig_query_compose",
     "repfig_compose":          "spyde.actions.report.compose.repfig_compose",

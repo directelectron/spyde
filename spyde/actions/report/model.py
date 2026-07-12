@@ -341,13 +341,20 @@ class Cell:
     ``cell_type`` is ``"markdown"`` or ``"figure"``. A figure cell carries a
     ``caption``, a ``fig_id`` (the FigureSpec / asset basename == this cell's
     id), a ``spec`` (FigureSpec, in memory), and — for a template — a
-    ``placeholder`` flag when no figure has been dropped yet."""
+    ``placeholder`` flag when no figure has been dropped yet.
+
+    ``html`` is a DERIVED, NON-PERSISTED field: the renderer's own
+    marked+DOMPurify-sanitized rendering of ``source`` (delivered on every
+    markdown commit). It is used ONLY by HTML export — never written into
+    report.md / the zip, and absent after a reload until the next edit. HTML
+    export falls back to escaping the raw markdown when it's empty."""
     id: str = field(default_factory=new_cell_id)
     cell_type: str = "markdown"
     source: str = ""                           # markdown text (markdown cells)
     caption: str = ""                          # figure caption / alt text
     placeholder: bool = False
     spec: FigureSpec | None = None             # figure recipe (figure cells)
+    html: str = ""                             # derived, NON-persisted (export only)
 
 
 @dataclass
@@ -646,6 +653,61 @@ def write_report(doc: ReportDoc, path: str,
         except OSError:
             pass
         raise
+
+
+# The top-level entries an exported markdown FOLDER is allowed to contain — so a
+# re-export into a previous export overwrites cleanly, but we never clobber an
+# arbitrary populated directory the user picked by mistake.
+_MD_FOLDER_ALLOWED = frozenset({"report.md", "figures", "assets"})
+
+
+def dir_is_safe_md_target(directory: str) -> bool:
+    """True when *directory* is safe to write a markdown-folder export into:
+    it doesn't exist yet, is empty, or contains ONLY the entries a prior export
+    would have produced (``report.md`` / ``figures`` / ``assets``). A directory
+    with other content is refused (conservative — don't clobber the user's data)."""
+    if not os.path.isdir(directory):
+        # A missing path (we'll create it) or a plain file (caller errors) — a
+        # non-existent dir is safe to create; a file is handled by the caller.
+        return not os.path.exists(directory)
+    try:
+        entries = os.listdir(directory)
+    except OSError:
+        return False
+    return all(name in _MD_FOLDER_ALLOWED for name in entries)
+
+
+def write_report_dir(doc: ReportDoc, directory: str,
+                     assets: "dict[str, bytes] | None" = None) -> None:
+    """Write *doc* to *directory* as the UNZIPPED container — exactly the same
+    files a ``.spyde-report`` zip holds, laid out on disk:
+
+        <directory>/report.md
+        <directory>/figures/<id>.yaml
+        <directory>/assets/<id>.png
+
+    This is the "Export as markdown folder" form (a plain, pandoc-ready markdown
+    tree). The caller is expected to have vetted the directory with
+    :func:`dir_is_safe_md_target` first."""
+    assets = assets or {}
+    os.makedirs(directory, exist_ok=True)
+    figures_dir = os.path.join(directory, "figures")
+    assets_dir = os.path.join(directory, "assets")
+    with open(os.path.join(directory, "report.md"), "w", encoding="utf-8") as f:
+        f.write(serialize_report_md(doc))
+    for c in doc.cells:
+        if c.cell_type != "figure":
+            continue
+        if c.spec is not None:
+            os.makedirs(figures_dir, exist_ok=True)
+            with open(os.path.join(figures_dir, f"{c.id}.yaml"), "w",
+                      encoding="utf-8") as f:
+                f.write(c.spec.to_yaml())
+        png = assets.get(c.id)
+        if png:
+            os.makedirs(assets_dir, exist_ok=True)
+            with open(os.path.join(assets_dir, f"{c.id}.png"), "wb") as f:
+                f.write(png)
 
 
 def read_report(path: str) -> "tuple[ReportDoc, dict[str, bytes]]":
