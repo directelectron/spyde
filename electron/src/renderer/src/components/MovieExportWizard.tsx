@@ -139,7 +139,12 @@ export function MovieExportWizard({ caretPos, windowId, sendAction, onClose }: P
 
   // ── Annotations ──────────────────────────────────────────────────────────
   const addAnnotation = () => {
-    const ann: MvxAnnotation = { kind: 'text', time_range: [tStart, tEnd], text: 'Label', x: 0, y: 0 }
+    // time_range is in SECONDS (the pipeline gates on t_sec), unlike
+    // t_start/t_end which are frame indices.
+    const ann: MvxAnnotation = {
+      kind: 'text', time_range: [asSeconds(tStart), asSeconds(tEnd)],
+      text: 'Label', x: 0, y: 0,
+    }
     patch({ annotations: [...params.annotations, ann] })
   }
   const updateAnnotation = (i: number, next: Partial<MvxAnnotation>) => {
@@ -151,8 +156,15 @@ export function MovieExportWizard({ caretPos, windowId, sendAction, onClose }: P
   }
 
   // ── Traces (drop a 1-D plot window) ──────────────────────────────────────
+  // The trace slot lives inside the SubWindow, so a drop here also bubbles to the
+  // MDI area's onAreaDrop — which reads NAVIGATOR_DRAG_MIME (a navigator pill
+  // stamps it) and fires `extract_navigator`. Dropping the 1-D TIME navigator onto
+  // the trace slot would therefore ALSO try to extract it as a standalone 2-D image
+  // and error ("no 2-D image for 'base'"). stopPropagation on both handlers keeps
+  // the drop local to the trace slot.
   const onDrop = (e: React.DragEvent) => {
     e.preventDefault()
+    e.stopPropagation()
     setDragOver(false)
     const raw = e.dataTransfer.getData(WINDOW_DRAG_MIME)
     const src = parseInt(raw, 10)
@@ -164,6 +176,7 @@ export function MovieExportWizard({ caretPos, windowId, sendAction, onClose }: P
   const onDragOver = (e: React.DragEvent) => {
     if (!e.dataTransfer.types.includes(WINDOW_DRAG_MIME)) return
     e.preventDefault()
+    e.stopPropagation()
     e.dataTransfer.dropEffect = 'copy'
     if (!dragOver) setDragOver(true)
   }
@@ -242,10 +255,10 @@ export function MovieExportWizard({ caretPos, windowId, sendAction, onClose }: P
                     style={{ ...S.num, width: 60 }}
                     onChange={(e) => updateAnnotation(i, { text: e.target.value })} />
                 )}
-                <input data-testid={`mvx-ann-t0-${i}`} type="number" value={a.time_range[0]} title="t0 (frame)"
+                <input data-testid={`mvx-ann-t0-${i}`} type="number" value={a.time_range[0]} title="t0 (s)"
                   style={{ ...S.num, width: 44 }}
                   onChange={(e) => updateAnnotation(i, { time_range: [Number(e.target.value), a.time_range[1]] })} />
-                <input data-testid={`mvx-ann-t1-${i}`} type="number" value={a.time_range[1]} title="t1 (frame)"
+                <input data-testid={`mvx-ann-t1-${i}`} type="number" value={a.time_range[1]} title="t1 (s)"
                   style={{ ...S.num, width: 44 }}
                   onChange={(e) => updateAnnotation(i, { time_range: [a.time_range[0], Number(e.target.value)] })} />
                 <button data-testid={`mvx-ann-remove-${i}`} style={S.close} title="Remove"
