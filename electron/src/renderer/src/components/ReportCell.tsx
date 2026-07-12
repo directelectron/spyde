@@ -12,8 +12,9 @@
  * report_move_cell, wired by the parent) + a delete button (report_remove_cell).
  */
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { marked } from 'marked'
-import DOMPurify from 'dompurify'
+import { useSpyDE } from '../kernel/SpyDEContext'
+import { renderMarkdown } from '../kernel/markdown'
+import { reportClipboard } from '../kernel/reportClipboard'
 import type { ReportCell as ReportCellType } from '../kernel/protocol'
 
 // One-time scoped markdown stylesheet for the dark theme. Injected under a
@@ -57,19 +58,16 @@ if (typeof document !== 'undefined' && !document.getElementById('spyde-md-css'))
   document.head.appendChild(el)
 }
 
-function renderMarkdown(src: string): string {
-  // `marked` is configured synchronously (no async extensions), so parse
-  // returns a string here; sanitize before it ever touches the DOM.
-  const html = marked.parse(src ?? '', { async: false }) as string
-  return DOMPurify.sanitize(html)
-}
-
 interface Props {
   cell: ReportCellType
   /** Report-level raw/rendered toggle — forces the editor for every cell. */
   rawMode: boolean
-  onUpdate: (source: string) => void
+  /** Commit a new source + its rendered (sanitized) html fragment. The html
+   *  rides along so static export embeds real HTML, not a `<pre>` fallback. */
+  onUpdate: (source: string, html: string) => void
   onRemove: () => void
+  /** Own index in the cell list (for Duplicate → insert at index+1). */
+  index: number
   /** HTML5 DnD reorder wiring supplied by the parent list. */
   dragProps: {
     onDragStart: (e: React.DragEvent) => void
@@ -81,7 +79,8 @@ interface Props {
   }
 }
 
-export function ReportCell({ cell, rawMode, onUpdate, onRemove, dragProps }: Props) {
+export function ReportCell({ cell, rawMode, onUpdate, onRemove, index, dragProps }: Props) {
+  const { sendAction } = useSpyDE()
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(cell.source ?? '')
   const [hover, setHover] = useState(false)
@@ -105,7 +104,7 @@ export function ReportCell({ cell, rawMode, onUpdate, onRemove, dragProps }: Pro
 
   const commit = () => {
     setEditing(false)
-    if (draft !== (cell.source ?? '')) onUpdate(draft)
+    if (draft !== (cell.source ?? '')) onUpdate(draft, renderMarkdown(draft))
   }
   const revert = () => {
     setDraft(cell.source ?? '')
@@ -114,6 +113,18 @@ export function ReportCell({ cell, rawMode, onUpdate, onRemove, dragProps }: Pro
 
   const rendered = React.useMemo(() => renderMarkdown(cell.source ?? ''), [cell.source])
   const empty = !(cell.source ?? '').trim()
+
+  // The serialized clipboard form of THIS cell (source + its rendered html, so a
+  // paste static-exports real HTML). Rendered from the live source so a paste
+  // reflects any un-committed-but-persisted edit already in `cell.source`.
+  const serialize = () => ({
+    cell_type: 'markdown' as const,
+    source: cell.source ?? '',
+    html: rendered,
+  })
+  const doCopy = () => reportClipboard.set(serialize())
+  const doDuplicate = () =>
+    sendAction('report_paste_cell', { cell: serialize(), index: index + 1 })
 
   return (
     <div
@@ -131,7 +142,7 @@ export function ReportCell({ cell, rawMode, onUpdate, onRemove, dragProps }: Pro
         ...(dragProps.dropBefore ? styles.cellDropBefore : {}),
       }}
     >
-      {/* Hover chrome: drag handle (reorder) + delete. */}
+      {/* Hover chrome: drag handle (reorder) + copy + duplicate + delete. */}
       {(hover || showEditor) && (
         <div style={styles.chrome}>
           <span
@@ -139,6 +150,18 @@ export function ReportCell({ cell, rawMode, onUpdate, onRemove, dragProps }: Pro
             style={styles.dragHandle}
             title="Drag to reorder"
           >⠿</span>
+          <button
+            data-testid={`cell-copy-${cell.id}`}
+            style={styles.chromeBtn}
+            title="Copy cell"
+            onClick={doCopy}
+          >⧉</button>
+          <button
+            data-testid={`cell-duplicate-${cell.id}`}
+            style={styles.chromeBtn}
+            title="Duplicate cell"
+            onClick={doDuplicate}
+          >＋</button>
           <button
             data-testid={`report-cell-delete-${cell.id}`}
             style={styles.deleteBtn}
@@ -158,7 +181,7 @@ export function ReportCell({ cell, rawMode, onUpdate, onRemove, dragProps }: Pro
           spellCheck={false}
           placeholder="Write markdown…"
           onChange={(e) => setDraft(e.target.value)}
-          onBlur={() => { if (!rawMode) commit(); else if (draft !== (cell.source ?? '')) onUpdate(draft) }}
+          onBlur={() => { if (!rawMode) commit(); else if (draft !== (cell.source ?? '')) onUpdate(draft, renderMarkdown(draft)) }}
           onKeyDown={(e) => {
             if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
               e.preventDefault()
@@ -204,6 +227,10 @@ const styles: Record<string, React.CSSProperties> = {
   dragHandle: {
     cursor: 'grab', color: '#6c7086', fontSize: 13, userSelect: 'none',
     lineHeight: 1,
+  },
+  chromeBtn: {
+    background: 'none', border: 'none', color: '#6c7086', cursor: 'pointer',
+    fontSize: 12, padding: '0 2px', lineHeight: 1,
   },
   deleteBtn: {
     background: 'none', border: 'none', color: '#6c7086', cursor: 'pointer',

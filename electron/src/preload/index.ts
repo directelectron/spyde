@@ -129,6 +129,20 @@ contextBridge.exposeInMainWorld('electron', {
    *  sidebar's Open. */
   reportOpenDialog: (): Promise<string | null> => ipcRenderer.invoke('report:open-dialog'),
 
+  /** Report export dialog (RETURNS the chosen path or null) — 'html'/'pdf' are
+   *  save dialogs, 'folder' is a directory picker. For the Report sidebar's
+   *  Export menu. */
+  reportExportDialog: (kind: 'html' | 'pdf' | 'folder', defaultName?: string): Promise<string | null> =>
+    ipcRenderer.invoke('report:export-dialog', kind, defaultName),
+
+  /** Render an exported report HTML file to PDF via a hidden BrowserWindow. */
+  reportExportPdf: (htmlPath: string, pdfPath: string): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('report:export-pdf', htmlPath, pdfPath),
+
+  /** Write a PNG data URL to the OS clipboard as an image. */
+  clipboardWritePng: (dataUrl: string): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('clipboard:write-png', dataUrl),
+
   /** OS path of a dropped File (sandboxed renderers have no File.path) —
    *  powers drag-and-drop of datasets (incl. .zspy folders) onto the MDI. */
   pathForFile: (file: File): string | null => {

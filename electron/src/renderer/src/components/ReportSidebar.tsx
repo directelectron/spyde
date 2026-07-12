@@ -10,9 +10,10 @@
  *
  * Left-edge resize uses the SubWindow Pointer-Capture pattern (NOT react-rnd).
  */
-import React, { useCallback, useRef, useState } from 'react'
+import React, { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { useSpyDE } from '../kernel/SpyDEContext'
 import { FIGURE_DRAG_MIME, WINDOW_DRAG_MIME } from '../kernel/dnd'
+import { reportClipboard } from '../kernel/reportClipboard'
 import { ReportCell } from './ReportCell'
 import { ReportFigureCell } from './ReportFigureCell'
 
@@ -53,6 +54,11 @@ export function ReportSidebar() {
   const [titleEditing, setTitleEditing] = useState(false)
   const [titleDraft, setTitleDraft] = useState('')
   const [confirmNew, setConfirmNew] = useState(false)
+  // Export dropdown open state + a transient success/failure note in the header.
+  const [exportMenuOpen, setExportMenuOpen] = useState(false)
+  const [exportNote, setExportNote] = useState<{ ok: boolean; text: string } | null>(null)
+  const exportNoteTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const exportMenuRef = useRef<HTMLDivElement>(null)
   // Body drop state: whether a compatible pill is over the body, and the cell
   // index it would insert BEFORE (the between-cell indicator line).
   const [dropIndex, setDropIndex] = useState<number | null>(null)
@@ -105,6 +111,124 @@ export function ReportSidebar() {
     }
   }
 
+  // ── Export ────────────────────────────────────────────────────────────────
+  const canExport = report != null && cells.length > 0
+
+  const basename = (p: string) =>
+    p.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || p
+  const titleSlug = (report?.title || 'report').replace(/[^\w.-]+/g, '_')
+
+  // Show a transient note in the header area; auto-clears after ~4s.
+  const showNote = (ok: boolean, text: string) => {
+    if (exportNoteTimer.current) clearTimeout(exportNoteTimer.current)
+    setExportNote({ ok, text })
+    exportNoteTimer.current = setTimeout(() => setExportNote(null), 4000)
+  }
+
+  // Attach a `spyde:report_exported` listener FIRST, then run `trigger()` (which
+  // sends the action). Resolves the matched export path via `match(detail)`, or
+  // null on ~15s timeout. Listening before triggering closes the (theoretical)
+  // race where a reply arrives before the listener is attached.
+  const awaitExport = (
+    match: (d: { kind?: string; path?: string }) => boolean,
+    trigger: () => void,
+    timeoutMs = 15000,
+  ): Promise<string | null> =>
+    new Promise((resolve) => {
+      let done = false
+      const finish = (v: string | null) => {
+        if (done) return
+        done = true
+        window.removeEventListener('spyde:report_exported', onEvt)
+        clearTimeout(timer)
+        resolve(v)
+      }
+      const onEvt = (ev: Event) => {
+        const d = (ev as CustomEvent).detail as { kind?: string; path?: string }
+        if (match(d)) finish(d.path ?? null)
+      }
+      window.addEventListener('spyde:report_exported', onEvt)
+      const timer = setTimeout(() => finish(null), timeoutMs)
+      trigger()
+    })
+
+  const exportHtml = async (mode: 'static' | 'interactive') => {
+    setExportMenuOpen(false)
+    if (!canExport) return
+    const path = await window.electron.reportExportDialog('html', `${titleSlug}.html`)
+    if (!path) return
+    const done = await awaitExport(
+      (d) => d.path === path,
+      () => sendAction('report_export_html', { mode, path }),
+    )
+    if (done) showNote(true, `Exported ✓ ${basename(done)}`)
+    else showNote(false, 'Export timed out')
+  }
+
+  const exportMarkdownFolder = async () => {
+    setExportMenuOpen(false)
+    if (!canExport) return
+    const path = await window.electron.reportExportDialog('folder')
+    if (!path) return
+    const done = await awaitExport(
+      (d) => d.path === path,
+      () => sendAction('report_export_markdown', { path }),
+    )
+    if (done) showNote(true, `Exported ✓ ${basename(done)}`)
+    else showNote(false, 'Export timed out')
+  }
+
+  const exportPdf = async () => {
+    setExportMenuOpen(false)
+    if (!canExport) return
+    const pdfPath = await window.electron.reportExportDialog('pdf', `${titleSlug}.pdf`)
+    if (!pdfPath) return
+    // First leg: render a STATIC HTML into a temp file (backend generates the
+    // path and emits report_exported with it — no `path` supplied). We can't
+    // predict the generated temp name, so match on the first html-static event.
+    const tmpPath = await awaitExport(
+      (d) => d.kind === 'html-static' && !!d.path,
+      () => sendAction('report_export_html', { mode: 'static', temp: true }),
+    )
+    if (!tmpPath) { showNote(false, 'PDF export timed out'); return }
+    // Second leg: render that temp HTML to the chosen PDF path (printToPDF).
+    const res = await window.electron.reportExportPdf(tmpPath, pdfPath)
+    if (res?.ok) showNote(true, `Exported ✓ ${basename(pdfPath)}`)
+    else showNote(false, 'PDF export failed')
+  }
+
+  // ── Paste (internal cell clipboard) ───────────────────────────────────────
+  // Reactive enablement: the Paste button is enabled only while the clipboard
+  // holds a cell. useSyncExternalStore subscribes to the module-scope store.
+  const clipboardCell = useSyncExternalStore(
+    reportClipboard.subscribe, reportClipboard.get, reportClipboard.get,
+  )
+  const doPaste = () => {
+    const cell = reportClipboard.get()
+    if (!cell) return
+    sendAction('report_paste_cell', { cell })   // append (no index)
+  }
+
+  // Close the export menu on outside click / Escape.
+  useEffect(() => {
+    if (!exportMenuOpen) return
+    const onDown = (e: MouseEvent) => {
+      if (!exportMenuRef.current?.contains(e.target as Node)) setExportMenuOpen(false)
+    }
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setExportMenuOpen(false) }
+    window.addEventListener('mousedown', onDown)
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('mousedown', onDown)
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [exportMenuOpen])
+
+  // Clear the note timer on unmount (StrictMode-safe).
+  useEffect(() => () => {
+    if (exportNoteTimer.current) clearTimeout(exportNoteTimer.current)
+  }, [])
+
   const commitTitle = () => {
     setTitleEditing(false)
     const t = titleDraft.trim()
@@ -118,7 +242,8 @@ export function ReportSidebar() {
     if (t && t !== (report?.title ?? '')) sendAction('report_set_title', { title: t })
   }
 
-  const addTextCell = () => sendAction('report_add_cell', { cell_type: 'markdown', source: '' })
+  const addTextCell = () =>
+    sendAction('report_add_cell', { cell_type: 'markdown', source: '', html: '' })
 
   // ── Body drop (figure/window pill → report_add_figure at insertion index) ──
   // Insertion index = number of cells whose vertical midpoint is above the
@@ -255,8 +380,45 @@ export function ReportSidebar() {
         >{rawMode ? 'Raw' : 'Rich'}</button>
         <button data-testid="report-new" style={styles.hdrBtn} title="New report" onClick={doNew}>New</button>
         <button data-testid="report-open" style={styles.hdrBtn} title="Open report" onClick={doOpen}>Open</button>
+        <button
+          data-testid="report-paste"
+          style={clipboardCell ? styles.hdrBtn : styles.hdrBtnDisabled}
+          title={clipboardCell ? 'Paste copied cell' : 'Nothing copied'}
+          disabled={!clipboardCell}
+          onClick={doPaste}
+        >Paste</button>
         <button data-testid="report-save" style={styles.hdrBtnPrimary} title="Save report" onClick={doSave}>Save</button>
+
+        {/* Export dropdown (dock palette, closes on outside click / Escape). */}
+        <div ref={exportMenuRef} style={styles.exportWrap}>
+          <button
+            data-testid="report-export-toggle"
+            style={canExport ? styles.hdrBtn : styles.hdrBtnDisabled}
+            title={canExport ? 'Export report' : 'Add a cell to export'}
+            disabled={!canExport}
+            onClick={() => setExportMenuOpen(v => !v)}
+          >Export ▾</button>
+          {exportMenuOpen && canExport && (
+            <div style={styles.exportMenu} data-testid="report-export-menu" role="menu">
+              <ExportItem testid="export-html-interactive" label="Interactive HTML"
+                onClick={() => exportHtml('interactive')} />
+              <ExportItem testid="export-html-static" label="Static HTML"
+                onClick={() => exportHtml('static')} />
+              <ExportItem testid="export-pdf" label="PDF" onClick={exportPdf} />
+              <ExportItem testid="export-md-folder" label="Markdown folder"
+                onClick={exportMarkdownFolder} />
+            </div>
+          )}
+        </div>
       </div>
+
+      {/* Transient export success/failure note. */}
+      {exportNote && (
+        <div
+          data-testid="report-export-note"
+          style={{ ...styles.exportNote, ...(exportNote.ok ? styles.exportNoteOk : styles.exportNoteErr) }}
+        >{exportNote.text}</div>
+      )}
 
       {/* Inline confirm for New over a dirty report. */}
       {confirmNew && (
@@ -289,12 +451,14 @@ export function ReportSidebar() {
             {cell.cell_type === 'figure'
               ? <ReportFigureCell
                   cell={cell}
+                  index={i}
                   onRemove={() => sendAction('report_remove_cell', { cell_id: cell.id })}
                 />
               : <ReportCell
                   cell={cell}
+                  index={i}
                   rawMode={rawMode}
-                  onUpdate={(source) => sendAction('report_update_cell', { cell_id: cell.id, source })}
+                  onUpdate={(source, html) => sendAction('report_update_cell', { cell_id: cell.id, source, html })}
                   onRemove={() => sendAction('report_remove_cell', { cell_id: cell.id })}
                   dragProps={makeDragProps(cell.id, i)}
                 />}
@@ -312,6 +476,22 @@ export function ReportSidebar() {
         >+ Add text cell</button>
       </div>
     </div>
+  )
+}
+
+// One Export dropdown row (hover-highlight, dock-palette style).
+function ExportItem({ testid, label, onClick }: {
+  testid: string; label: string; onClick: () => void
+}) {
+  return (
+    <button
+      data-testid={testid}
+      role="menuitem"
+      style={styles.exportItem}
+      onMouseEnter={(e) => { e.currentTarget.style.background = '#313244' }}
+      onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent' }}
+      onClick={onClick}
+    >{label}</button>
   )
 }
 
@@ -385,6 +565,27 @@ const styles: Record<string, React.CSSProperties> = {
     background: '#fab387', color: '#11111b', border: '1px solid #fab387',
     borderRadius: 5, padding: '3px 10px', fontSize: 11, cursor: 'pointer', fontWeight: 700,
   },
+  hdrBtnDisabled: {
+    background: '#1e1e2e', color: '#585b70', border: '1px solid #313244',
+    borderRadius: 5, padding: '3px 8px', fontSize: 11, cursor: 'default',
+  },
+  exportWrap: { position: 'relative', display: 'inline-flex' },
+  exportMenu: {
+    position: 'absolute', top: '100%', right: 0, marginTop: 4, zIndex: 20,
+    minWidth: 150, background: '#1e1e2e', border: '1px solid #45475a',
+    borderRadius: 6, padding: 4, display: 'flex', flexDirection: 'column', gap: 2,
+    boxShadow: '0 6px 22px rgba(0,0,0,0.5)',
+  },
+  exportItem: {
+    background: 'none', border: 'none', color: '#cdd6f4', cursor: 'pointer',
+    textAlign: 'left', padding: '5px 8px', fontSize: 11.5, borderRadius: 4,
+  },
+  exportNote: {
+    padding: '4px 10px', fontSize: 11, fontWeight: 600,
+    borderBottom: '1px solid #313244',
+  },
+  exportNoteOk: { color: '#a6e3a1', background: 'rgba(166,227,161,0.08)' },
+  exportNoteErr: { color: '#f38ba8', background: 'rgba(243,139,168,0.08)' },
   confirmBar: {
     display: 'flex', alignItems: 'center', gap: 6,
     padding: '6px 10px', background: 'rgba(250,179,135,0.08)',

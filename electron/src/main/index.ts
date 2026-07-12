@@ -1,7 +1,10 @@
 /**
  * index.ts — Electron main process for SpyDE.
  */
-import { app, BrowserWindow, dialog, ipcMain, Menu, shell, nativeTheme, net, protocol } from 'electron'
+import {
+  app, BrowserWindow, dialog, ipcMain, Menu, shell, nativeTheme, net, protocol,
+  clipboard, nativeImage,
+} from 'electron'
 import { join, basename } from 'path'
 import { pathToFileURL } from 'url'
 import { tmpdir } from 'os'
@@ -601,6 +604,95 @@ ipcMain.handle('report:open-dialog', async () => {
     filters: [{ name: 'SpyDE Report', extensions: ['spyde-report'] }],
   })
   return result.canceled || !result.filePaths.length ? null : result.filePaths[0]
+})
+
+/** Report EXPORT dialog — one handler for the three export targets the Report
+ *  sidebar offers (standalone HTML, PDF, or a folder of assets). RETURNS the
+ *  chosen path (or null); does not perform the export itself. */
+ipcMain.handle('report:export-dialog', async (_e, kind: 'html' | 'pdf' | 'folder', defaultName?: string) => {
+  if (kind === 'folder') {
+    const result = await dialog.showOpenDialog(win!, {
+      title: 'Choose a folder to export the report into',
+      properties: ['openDirectory', 'createDirectory', 'promptToCreate'],
+    })
+    return result.canceled || !result.filePaths.length ? null : result.filePaths[0]
+  }
+  const result = await dialog.showSaveDialog(win!, {
+    defaultPath: defaultName ?? (kind === 'pdf' ? 'report.pdf' : 'report.html'),
+    filters: [
+      kind === 'pdf'
+        ? { name: 'PDF', extensions: ['pdf'] }
+        : { name: 'HTML', extensions: ['html'] },
+    ],
+  })
+  return result.canceled || !result.filePath ? null : result.filePath
+})
+
+/** Render an already-exported standalone report HTML file to PDF. Runs the
+ *  render in a hidden, locked-down BrowserWindow (sandbox on, no node
+ *  integration) — this is trusted local content (SpyDE wrote the HTML itself
+ *  moments ago via report:export-dialog + the renderer's own save), but the
+ *  window still gets no Node/IPC surface since it only needs to rasterize. */
+ipcMain.handle('report:export-pdf', async (_e, htmlPath: string, pdfPath: string) => {
+  if (typeof htmlPath !== 'string' || !htmlPath.toLowerCase().endsWith('.html') || !existsSync(htmlPath)) {
+    return { ok: false, error: 'htmlPath must be an existing .html file' }
+  }
+  if (typeof pdfPath !== 'string' || !pdfPath.toLowerCase().endsWith('.pdf')) {
+    return { ok: false, error: 'pdfPath must end with .pdf' }
+  }
+
+  let pdfWin: BrowserWindow | null = new BrowserWindow({
+    show: false,
+    width: 900,
+    height: 1200,
+    webPreferences: {
+      sandbox: true,
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  })
+
+  try {
+    const loaded = new Promise<void>((resolve, reject) => {
+      pdfWin!.webContents.once('did-finish-load', () => resolve())
+      pdfWin!.webContents.once('did-fail-load', (_ev, code, desc) =>
+        reject(new Error(`did-fail-load: ${code} ${desc}`)),
+      )
+    })
+    await pdfWin.loadFile(htmlPath)
+    await loaded
+    // Let images/fonts referenced by the report settle before rasterizing.
+    await new Promise((resolve) => setTimeout(resolve, 250))
+
+    const pdfBuffer = await pdfWin.webContents.printToPDF({
+      printBackground: true,
+      pageSize: 'A4',
+      margins: { marginType: 'default' },
+    })
+    writeFileSync(pdfPath, pdfBuffer)
+    return { ok: true }
+  } catch (err) {
+    return { ok: false, error: (err as Error)?.message ?? String(err) }
+  } finally {
+    if (pdfWin && !pdfWin.isDestroyed()) pdfWin.destroy()
+    pdfWin = null
+  }
+})
+
+/** Write a PNG data URL (e.g. a figure snapshot) to the OS clipboard as an
+ *  image, for the Report sidebar's "Copy image" action. */
+ipcMain.handle('clipboard:write-png', (_e, dataUrl: string) => {
+  if (typeof dataUrl !== 'string' || !dataUrl.startsWith('data:image/png')) {
+    return { ok: false, error: 'expected a data:image/png URL' }
+  }
+  try {
+    const image = nativeImage.createFromDataURL(dataUrl)
+    if (image.isEmpty()) return { ok: false, error: 'failed to decode PNG data URL' }
+    clipboard.writeImage(image)
+    return { ok: true }
+  } catch (err) {
+    return { ok: false, error: (err as Error)?.message ?? String(err) }
+  }
 })
 
 /** Forward figure interaction events to Python. */

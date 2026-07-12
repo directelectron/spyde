@@ -1058,6 +1058,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'console_node_bound':
         case 'layers_state':
         case 'repfig_compose_options':
+        case 'report_exported':
           window.dispatchEvent(new CustomEvent(`spyde:${msg.type}`, { detail: msg }))
           break
       }

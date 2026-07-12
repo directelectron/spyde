@@ -400,6 +400,16 @@ export interface ReportSavedMessage extends MsgBase {
   path: string
 }
 
+/** An export finished: an HTML file (static/interactive) or a markdown folder
+ *  was written at `path`. The renderer's Export flow awaits this (matched by
+ *  `path`) to show a success note; the PDF flow awaits the temp static HTML's
+ *  emitted `path` before handing it to `printToPDF`. */
+export interface ReportExportedMessage extends MsgBase {
+  type: 'report_exported'
+  kind: 'html-static' | 'html-interactive' | 'markdown-folder'
+  path: string
+}
+
 /**
  * Wizard-scoped events re-broadcast verbatim as DOM CustomEvents (the caret
  * components subscribe directly). The payload beyond `type` is consumer-defined,
@@ -489,6 +499,7 @@ export type PlotAppMessage =
   | ReportStateMessage
   | ReportNeedSnapshotsMessage
   | ReportSavedMessage
+  | ReportExportedMessage
   | WizardEventMessage
   | LayersStateMessage
   | RepfigComposeOptionsMessage

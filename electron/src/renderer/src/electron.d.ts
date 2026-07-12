@@ -23,6 +23,9 @@ declare global {
       pickFolders: () => Promise<string[]>
       reportSaveDialog: (defaultName?: string) => Promise<string | null>
       reportOpenDialog: () => Promise<string | null>
+      reportExportDialog: (kind: 'html' | 'pdf' | 'folder', defaultName?: string) => Promise<string | null>
+      reportExportPdf: (htmlPath: string, pdfPath: string) => Promise<{ ok: boolean; error?: string }>
+      clipboardWritePng: (dataUrl: string) => Promise<{ ok: boolean; error?: string }>
       pathForFile?: (file: File) => string | null
       figureEvent: (figId: string, eventJson: string) => void
       resizeFigure: (figId: string, width: number, height: number) => void

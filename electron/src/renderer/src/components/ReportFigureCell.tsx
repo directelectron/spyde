@@ -30,6 +30,7 @@
  */
 import React, { useState } from 'react'
 import { useSpyDE } from '../kernel/SpyDEContext'
+import { reportClipboard, type SerializedFigureCell } from '../kernel/reportClipboard'
 import type { ReportCell, RepfigPanel, RepfigLayer } from '../kernel/protocol'
 import { FIGURE_DRAG_MIME, WINDOW_DRAG_MIME } from '../kernel/dnd'
 
@@ -82,10 +83,12 @@ interface ComposePrompt {
 interface Props {
   cell: ReportCell
   onRemove: () => void
+  /** Own index in the cell list (Duplicate → insert at index+1). */
+  index: number
 }
 
-export function ReportFigureCell({ cell, onRemove }: Props) {
-  const { state, iframeRefs, replayState, sendAction, dragKind } = useSpyDE()
+export function ReportFigureCell({ cell, onRemove, index }: Props) {
+  const { state, iframeRefs, replayState, sendAction, dragKind, requestFigurePng } = useSpyDE()
   const [captionEditing, setCaptionEditing] = useState(false)
   const [captionDraft, setCaptionDraft] = useState(cell.caption ?? '')
   const [hover, setHover] = useState(false)
@@ -224,6 +227,41 @@ export function ReportFigureCell({ cell, onRemove }: Props) {
 
   const isLive = !cell.placeholder && !cell.data_offline && !!fig
 
+  // ── Copy / Duplicate ──────────────────────────────────────────────────────
+  // Build the serialized figure cell. For a LIVE cell harvest a fresh PNG from
+  // the iframe (so the OFFLINE fallback baked into the paste matches what's on
+  // screen); fall back to the cell's baked `png` when the figure can't answer or
+  // the cell is already offline.
+  const serialize = async (): Promise<SerializedFigureCell> => {
+    let png: string | null = cell.png ?? null
+    if (fig?.figId) {
+      const live = await requestFigurePng(fig.figId)
+      if (live) png = live
+    }
+    return {
+      cell_type: 'figure',
+      caption: cell.caption ?? '',
+      figure: cell.figure,
+      png,
+    }
+  }
+  const doCopy = async () => {
+    const ser = await serialize()
+    reportClipboard.set(ser)
+    // Best-effort: also mirror the PNG to the OS clipboard so a paste into an
+    // external app (Word / Slack) works. Ignore failure — the internal
+    // clipboard is the source of truth for in-report paste.
+    if (ser.png) {
+      try { await window.electron.clipboardWritePng(ser.png) } catch { /* ignore */ }
+    }
+  }
+  const doDuplicate = async () => {
+    // Duplicate = copy → paste at own index+1 immediately; the internal
+    // clipboard is NOT touched (a plain Copy would be lost otherwise).
+    const ser = await serialize()
+    sendAction('report_paste_cell', { cell: ser, index: index + 1 })
+  }
+
   return (
     <div
       data-testid={`report-figcell-${cell.id}`}
@@ -231,7 +269,8 @@ export function ReportFigureCell({ cell, onRemove }: Props) {
       onMouseLeave={() => setHover(false)}
       style={styles.cell}
     >
-      {/* Hover chrome: Edit toggle + Refresh-from-live + delete (not on a placeholder). */}
+      {/* Hover chrome: Edit toggle + Copy + Duplicate + Refresh-from-live +
+          delete (not on a placeholder). */}
       {hover && !cell.placeholder && (
         <div style={styles.chrome}>
           <button
@@ -240,6 +279,18 @@ export function ReportFigureCell({ cell, onRemove }: Props) {
             title="Edit figure (layers, annotations)"
             onClick={() => setEditOpen(v => !v)}
           >✎</button>
+          <button
+            data-testid={`cell-copy-${cell.id}`}
+            style={styles.chromeBtn}
+            title="Copy figure"
+            onClick={doCopy}
+          >⧉</button>
+          <button
+            data-testid={`cell-duplicate-${cell.id}`}
+            style={styles.chromeBtn}
+            title="Duplicate figure"
+            onClick={doDuplicate}
+          >＋</button>
           <button
             data-testid={`report-figcell-refresh-${cell.id}`}
             style={styles.chromeBtn}
