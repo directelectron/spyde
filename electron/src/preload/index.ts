@@ -132,7 +132,7 @@ contextBridge.exposeInMainWorld('electron', {
   /** Report export dialog (RETURNS the chosen path or null) — 'html'/'pdf' are
    *  save dialogs, 'folder' is a directory picker. For the Report sidebar's
    *  Export menu. */
-  reportExportDialog: (kind: 'html' | 'pdf' | 'folder', defaultName?: string): Promise<string | null> =>
+  reportExportDialog: (kind: 'html' | 'pdf' | 'folder' | 'mp4', defaultName?: string): Promise<string | null> =>
     ipcRenderer.invoke('report:export-dialog', kind, defaultName),
 
   /** Render an exported report HTML file to PDF via a hidden BrowserWindow. */

@@ -606,10 +606,11 @@ ipcMain.handle('report:open-dialog', async () => {
   return result.canceled || !result.filePaths.length ? null : result.filePaths[0]
 })
 
-/** Report EXPORT dialog — one handler for the three export targets the Report
- *  sidebar offers (standalone HTML, PDF, or a folder of assets). RETURNS the
- *  chosen path (or null); does not perform the export itself. */
-ipcMain.handle('report:export-dialog', async (_e, kind: 'html' | 'pdf' | 'folder', defaultName?: string) => {
+/** Report EXPORT dialog — one handler for the export targets the Report sidebar
+ *  and the Movie Export wizard offer (standalone HTML, PDF, a folder of assets,
+ *  or an mp4/gif movie). RETURNS the chosen path (or null); does not perform the
+ *  export itself. */
+ipcMain.handle('report:export-dialog', async (_e, kind: 'html' | 'pdf' | 'folder' | 'mp4', defaultName?: string) => {
   if (kind === 'folder') {
     const result = await dialog.showOpenDialog(win!, {
       title: 'Choose a folder to export the report into',
@@ -617,13 +618,13 @@ ipcMain.handle('report:export-dialog', async (_e, kind: 'html' | 'pdf' | 'folder
     })
     return result.canceled || !result.filePaths.length ? null : result.filePaths[0]
   }
+  const filter =
+    kind === 'pdf' ? { name: 'PDF', extensions: ['pdf'] }
+      : kind === 'mp4' ? { name: 'Movie', extensions: ['mp4', 'gif'] }
+        : { name: 'HTML', extensions: ['html'] }
   const result = await dialog.showSaveDialog(win!, {
-    defaultPath: defaultName ?? (kind === 'pdf' ? 'report.pdf' : 'report.html'),
-    filters: [
-      kind === 'pdf'
-        ? { name: 'PDF', extensions: ['pdf'] }
-        : { name: 'HTML', extensions: ['html'] },
-    ],
+    defaultPath: defaultName ?? (kind === 'pdf' ? 'report.pdf' : kind === 'mp4' ? 'movie.mp4' : 'report.html'),
+    filters: [filter],
   })
   return result.canceled || !result.filePath ? null : result.filePath
 })

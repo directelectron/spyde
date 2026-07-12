@@ -1059,8 +1059,28 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'layers_state':
         case 'repfig_compose_options':
         case 'report_exported':
+        case 'mvx_state':
+        case 'mvx_done':
           window.dispatchEvent(new CustomEvent(`spyde:${msg.type}`, { detail: msg }))
           break
+
+        case 'progress': {
+          // Heavy backend actions (movie export, …) stream progress via
+          // emit_progress {done,total,label}. Surface it through the EXISTING
+          // StatusBar busy/status line (LOADING), so we reuse the app's one
+          // progress affordance instead of building a new bar. done>=total (or
+          // total<=0) clears the busy state. Also re-broadcast as a CustomEvent
+          // so a wizard can show a % in its own footer.
+          const done = Number(msg.done ?? 0)
+          const total = Number(msg.total ?? 0)
+          const label = String(msg.label ?? '')
+          const busy = total > 0 && done < total
+          const pct = total > 0 ? Math.round((done / total) * 100) : 0
+          const text = label ? (total > 0 ? `${label} (${pct}%)` : label) : ''
+          dispatch({ type: 'LOADING', busy, text })
+          window.dispatchEvent(new CustomEvent('spyde:progress', { detail: msg }))
+          break
+        }
       }
     }
 

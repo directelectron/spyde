@@ -48,6 +48,16 @@ export interface BackendExitedMessage extends MsgBase {
   code: number | null
 }
 
+/** Progress of a heavy backend action (movie export, …) via emit_progress.
+ *  Surfaced through the StatusBar busy line (done>=total or total<=0 clears it)
+ *  and re-broadcast as a `spyde:progress` CustomEvent for wizard footers. */
+export interface ProgressMessage extends MsgBase {
+  type: 'progress'
+  done: number
+  total: number
+  label?: string
+}
+
 export interface FigureMessage extends MsgBase {
   type: 'figure'
   window_id: number
@@ -462,12 +472,74 @@ export interface RepfigComposeOptionsMessage extends MsgBase {
   }
 }
 
+// ── Movie export wizard (mvx_*) ─────────────────────────────────────────────
+
+/** One time-gated overlay annotation in the movie (`time_range` in the movie's
+ *  frame-index or seconds domain, matched to the pipeline's convention). */
+export interface MvxAnnotation {
+  kind: 'text' | 'rect'
+  time_range: [number, number]
+  text?: string
+  /** Position/geometry, in data or fractional coords (pipeline-defined). */
+  x?: number
+  y?: number
+  w?: number
+  h?: number
+  [k: string]: unknown
+}
+
+/** The tunable movie-export parameters (mirrors the wizard's controls). */
+export interface MvxParams {
+  fps: number
+  downsample: number
+  stride: number
+  t_start: number
+  t_end: number
+  cmap?: string
+  clim?: [number, number] | null
+  timestamp: boolean
+  scalebar: boolean
+  annotations: MvxAnnotation[]
+  [k: string]: unknown
+}
+
+/** One trace overlay (a 1-D plot dragged into the wizard). */
+export interface MvxTrace {
+  id: string
+  label: string
+  color: string
+  units?: string
+}
+
+/** Authoritative movie-export wizard state — re-broadcast by the backend on
+ *  every mvx mutation (open/tune/add_trace/remove_trace). The renderer's
+ *  MovieExportWizard subscribes via the `spyde:mvx_state` CustomEvent. */
+export interface MvxStateMessage extends MsgBase {
+  type: 'mvx_state'
+  window_id: number
+  ffmpeg_ok: boolean
+  running: boolean
+  n_frames: number
+  time: { scale_s: number; units: string }
+  params: MvxParams
+  traces: MvxTrace[]
+}
+
+/** A movie export finished — the wizard shows a success note (basename of
+ *  `path`). Re-broadcast as `spyde:mvx_done`. */
+export interface MvxDoneMessage extends MsgBase {
+  type: 'mvx_done'
+  path: string
+  frames: number
+}
+
 /** The discriminated union the renderer dispatches over. */
 export type PlotAppMessage =
   | ReadyMessage
   | StatusMessage
   | ErrorMessage
   | BackendExitedMessage
+  | ProgressMessage
   | FigureMessage
   | ToolbarConfigMessage
   | WindowVisibilityMessage
@@ -503,6 +575,8 @@ export type PlotAppMessage =
   | WizardEventMessage
   | LayersStateMessage
   | RepfigComposeOptionsMessage
+  | MvxStateMessage
+  | MvxDoneMessage
 
 /**
  * Narrow a raw incoming message (`Record<string, unknown>` from the IPC bridge)
