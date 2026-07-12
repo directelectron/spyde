@@ -158,10 +158,12 @@ class TestReportFigures:
         assert rep_figs[0]["host"] == "report"
         assert rep_figs[0]["cell_id"] == cell["id"]
 
-        # The snapshot array was captured in memory (NOT in the file).
+        # The snapshot array was captured in memory (NOT in the file). Phase 2
+        # stores a per-(panel, layer) map; the primary snapshot is the base array.
         mgr = session._report
         assert cell["id"] in mgr._snapshots
-        assert isinstance(mgr._snapshots[cell["id"]], np.ndarray)
+        assert isinstance(mgr._snapshots[cell["id"]], dict)
+        assert isinstance(mgr.primary_snapshot(cell["id"]), np.ndarray)
 
         # The figure has a live controller registered.
         assert cell["id"] in mgr._window_by_cell

@@ -57,8 +57,11 @@ class ReportManager:
         self.doc: "ReportDoc | None" = None
         self.path: str | None = None
         self.dirty = False
-        # cell_id -> ndarray snapshot (in-memory; baked to PNG only on save)
-        self._snapshots: dict[str, np.ndarray] = {}
+        # cell_id -> { (panel_id, layer_id) : ndarray } in-memory snapshots (baked to
+        # PNG only on save; NEVER written to the container's spec). One entry per
+        # panel-layer so a composed multi-panel / multi-layer figure holds every
+        # layer's pixels. Use the accessors (primary_snapshot / snapshot_map) below.
+        self._snapshots: dict[str, dict] = {}
         # cell_id -> baked PNG bytes read from an opened report (offline fallback)
         self._baked: dict[str, bytes] = {}
         # window_id -> ReportFigureController, and cell_id -> window_id
@@ -68,6 +71,37 @@ class ReportManager:
         self._offline: set[str] = set()
         # pending save handshake: token -> {cells, path, remaining}
         self._pending_save: dict[str, dict] = {}
+
+    # ── per-(cell, panel, layer) snapshot accessors ─────────────────────────────
+
+    @staticmethod
+    def _layer_key(panel_id: str, layer_id: str) -> tuple:
+        return (str(panel_id), str(layer_id))
+
+    def set_snapshot(self, cell_id: str, panel_id: str, layer_id: str, arr) -> None:
+        self._snapshots.setdefault(cell_id, {})[self._layer_key(panel_id, layer_id)] = arr
+
+    def snapshot_map(self, cell_id: str) -> dict:
+        """The ``{(panel_id, layer_id): ndarray}`` snapshot map for a cell (may be
+        empty). The builder consumes this to paint each panel-layer."""
+        return self._snapshots.get(cell_id, {})
+
+    def primary_snapshot(self, cell_id: str):
+        """The FIRST panel's FIRST layer snapshot for a cell — the offline-bake +
+        legacy single-image path. None if the cell has no snapshots."""
+        cell = self.doc.cell_by_id(cell_id) if self.doc else None
+        if cell is not None and cell.spec is not None:
+            for panel in cell.spec.panels:
+                for layer in panel.layers:
+                    arr = self._snapshots.get(cell_id, {}).get(
+                        self._layer_key(panel.id, layer.id))
+                    if arr is not None:
+                        return arr
+        # Fallback: any array in the map.
+        m = self._snapshots.get(cell_id, {})
+        for arr in m.values():
+            return arr
+        return None
 
     # ── lifecycle ──────────────────────────────────────────────────────────────
 
@@ -127,6 +161,11 @@ class ReportManager:
                 "fig_id": c.id if c.cell_type == "figure" else None,
                 "data_offline": bool(c.cell_type == "figure" and c.id in self._offline),
             }
+            # For a figure cell, ship the PIXEL-FREE FigureSpec recipe (as a plain
+            # dict) so the renderer's edit toolbar can list panels / layers /
+            # annotations. It carries NO image bytes — only the YAML-shaped structure.
+            if c.cell_type == "figure" and c.spec is not None:
+                entry["figure"] = c.spec.to_dict()
             # For an OFFLINE figure cell only, ship the baked PNG as a data URL so
             # the renderer (which has no zip access) can still show the snapshot.
             if entry["data_offline"]:
@@ -153,7 +192,7 @@ class ReportManager:
         png = self._baked.get(cell_id)
         if png is not None:
             return png
-        arr = self._snapshots.get(cell_id)
+        arr = self.primary_snapshot(cell_id)
         if arr is not None:
             try:
                 cell = self.doc.cell_by_id(cell_id) if self.doc else None
@@ -171,15 +210,15 @@ class ReportManager:
     def build_figure_window(self, cell: Cell) -> None:
         """Build (or rebuild) the live figure window for a figure cell and emit
         it through the bare-figure path with ``host:"report"`` + ``cell_id``."""
-        arr = self._snapshots.get(cell.id)
-        if arr is None or cell.spec is None:
+        snap_map = self.snapshot_map(cell.id)
+        if not snap_map or cell.spec is None:
             return
         # Tear down any prior window for this cell first (re-snapshot / refresh).
         prev_wid = self._window_by_cell.get(cell.id)
         if prev_wid is not None:
             self._forget(prev_wid)
         try:
-            fig, fig_id, html = build_cell_figure(cell.spec, arr)
+            fig, fig_id, html = build_cell_figure(cell.spec, snap_map)
         except Exception as e:
             log.exception("report figure build failed for cell %s: %s", cell.id, e)
             ipc.emit_error(f"Report figure build failed: {e}")
@@ -233,11 +272,16 @@ def _ensure_open(session) -> ReportManager:
 # ── snapshotting a live Plot into a FigureSpec + held array ────────────────────
 
 
-def _snapshot_plot(plot) -> "tuple[FigureSpec, np.ndarray] | None":
-    """Snapshot a live ``Plot`` NOW into a single-panel FigureSpec + a held numpy
-    array copy. Reads ``current_data``, ``_last_levels``, colormap, axes, title,
-    nav indices, and the view label. Returns None when the plot has no paintable
-    frame."""
+def _snapshot_plot(plot) -> "tuple[FigureSpec, dict] | None":
+    """Snapshot a live ``Plot`` NOW into a single-panel FigureSpec + a
+    ``{(panel_id, layer_id): ndarray}`` snapshot map. Reads ``current_data``,
+    ``_last_levels``, colormap, axes, title, nav indices, and the view label.
+
+    If the plot carries live MDI overlay layers (``plot._layers``), each is
+    serialized into the same panel as an extra LayerSpec (same cmap / alpha, its
+    own source ref) with its current frame in the snapshot map — so "Add to report"
+    on a layered plot captures the whole composite. Returns None when the plot has
+    no paintable base frame."""
     data = getattr(plot, "current_data", None)
     if not isinstance(data, np.ndarray) or data.dtype == object:
         return None
@@ -290,14 +334,31 @@ def _snapshot_plot(plot) -> "tuple[FigureSpec, np.ndarray] | None":
     except Exception:
         nav_context = None
 
-    layer = LayerSpec(source=SignalRef.from_plot(plot), cmap=cmap,
-                      clim=clim, alpha=1.0, visible=True)
-    panel = PanelSpec(id="p1", grid_pos=[0, 0], kind="image", layers=[layer],
+    base_layer = LayerSpec(source=SignalRef.from_plot(plot), cmap=cmap,
+                           clim=clim, alpha=1.0, visible=True)
+    layers = [base_layer]
+    snap_map = {("p1", base_layer.id): arr}
+
+    # Live MDI overlay layers → extra LayerSpecs on the same panel (base + overlays).
+    for live in list(getattr(plot, "_layers", None) or []):
+        src = getattr(live, "source_plot", None)
+        frame = getattr(src, "current_data", None) if src is not None else None
+        if not isinstance(frame, np.ndarray) or frame.dtype == object or frame.ndim != 2:
+            continue
+        ov = LayerSpec(source=(SignalRef.from_plot(src) if src is not None else SignalRef()),
+                       cmap=str(getattr(live, "cmap", "magma")),
+                       clim=(list(live.clim) if getattr(live, "clim", None) else None),
+                       alpha=float(getattr(live, "alpha", 0.5)),
+                       visible=bool(getattr(live, "visible", True)))
+        layers.append(ov)
+        snap_map[("p1", ov.id)] = np.array(frame, copy=True)
+
+    panel = PanelSpec(id="p1", grid_pos=[0, 0], kind="image", layers=layers,
                       axes=axes_dict, title=title,
                       scalebar=bool(axes_dict is not None))
     spec = FigureSpec(layout={"kind": "single"}, panels=[panel],
                       nav_context=nav_context)
-    return spec, arr
+    return spec, snap_map
 
 
 def _resolve_source_plot(session, source_window_id):
@@ -334,22 +395,32 @@ def report_open(session, plot, payload) -> None:
     mgr._snapshots.clear()
     mgr._baked = dict(assets)
     mgr._offline.clear()
-    # Rebind each figure cell: resolve its source against open trees / files.
+    # Rebind each figure cell: resolve EVERY layer of EVERY panel against open trees
+    # / files. The cell rebinds live only when ALL its layers resolve; if any layer's
+    # source is offline the whole cell is offline (renderer shows the baked PNG).
     for c in doc.cells:
         if c.cell_type != "figure" or c.placeholder or c.spec is None:
             continue
-        ref = c.spec.primary_layer.source if c.spec.primary_layer else None
-        src_plot = ref.resolve(session) if ref is not None else None
-        if src_plot is not None:
-            snap = _snapshot_plot(src_plot)
-            if snap is not None:
-                _spec, arr = snap
-                # Keep the SAVED spec (cmap/clim/axes/title) but the live pixels.
-                mgr._snapshots[c.id] = arr
-                mgr.build_figure_window(c)
-                continue
-        # Unresolved → offline: renderer shows the baked PNG (data URL in state).
-        mgr._offline.add(c.id)
+        all_resolved = bool(c.spec.panels)
+        for panel in c.spec.panels:
+            for layer in panel.layers:
+                src_plot = layer.source.resolve(session) if layer.source else None
+                arr = None
+                if src_plot is not None:
+                    frame = getattr(src_plot, "current_data", None)
+                    if isinstance(frame, np.ndarray) and frame.dtype != object:
+                        arr = np.array(frame, copy=True)
+                if arr is None:
+                    all_resolved = False
+                else:
+                    # Keep the SAVED spec (cmap/clim/axes/title) but the live pixels.
+                    mgr.set_snapshot(c.id, panel.id, layer.id, arr)
+        if all_resolved:
+            mgr.build_figure_window(c)
+        else:
+            # Unresolved → offline: renderer shows the baked PNG (data URL in state).
+            mgr._snapshots.pop(c.id, None)
+            mgr._offline.add(c.id)
     mgr.emit_state()
 
 
@@ -436,7 +507,7 @@ def _finish_save(session, mgr: ReportManager, path: str,
         png = harvested.get(c.id)
         if png is None:
             # Prefer a fresh bake of the held snapshot; else the PNG we loaded.
-            arr = mgr._snapshots.get(c.id)
+            arr = mgr.primary_snapshot(c.id)
             if arr is not None:
                 try:
                     layer = c.spec.primary_layer if c.spec else None
@@ -595,7 +666,7 @@ def report_add_figure(session, plot, payload) -> None:
     if snap is None:
         ipc.emit_error("report_add_figure: source window has no image to snapshot.")
         return
-    spec, arr = snap
+    spec, snap_map = snap
     caption = str(payload.get("caption", "") or "")
 
     at_cell = payload.get("at_cell")
@@ -611,7 +682,7 @@ def report_add_figure(session, plot, payload) -> None:
                     placeholder=False, spec=spec)
         _insert_cell(mgr.doc, cell, payload.get("index"))
 
-    mgr._snapshots[cell.id] = arr
+    mgr._snapshots[cell.id] = dict(snap_map)
     mgr._baked.pop(cell.id, None)
     mgr._offline.discard(cell.id)
     mgr.build_figure_window(cell)
@@ -640,9 +711,9 @@ def report_refresh_figure(session, plot, payload) -> None:
     snap = _snapshot_plot(src_plot)
     if snap is None:
         return
-    spec, arr = snap
+    spec, snap_map = snap
     cell.spec = spec
-    mgr._snapshots[cell.id] = arr
+    mgr._snapshots[cell.id] = dict(snap_map)
     mgr._offline.discard(cell.id)
     mgr.build_figure_window(cell)
     mgr.dirty = True

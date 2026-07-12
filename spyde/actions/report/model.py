@@ -203,18 +203,27 @@ class SignalRef:
         return candidates[0]
 
 
+def new_layer_id() -> str:
+    """A short, unique layer id (``l`` + 6 hex chars) — addresses a LayerSpec in a
+    panel for the Phase-2 compose edit handlers (repfig_set_layer / _remove_layer)."""
+    return "l" + uuid.uuid4().hex[:6]
+
+
 @dataclass
 class LayerSpec:
     """One image (or line) layer within a panel. ``source`` is a SignalRef;
-    ``>1`` layer per panel = an overlay (Phase 2)."""
+    ``>1`` layer per panel = an overlay (Phase 2). ``id`` addresses the layer for
+    the compose edit handlers."""
     source: SignalRef = field(default_factory=SignalRef)
     cmap: str = "viridis"
     clim: list | None = None                   # [lo, hi] or None (auto)
     alpha: float = 1.0
     visible: bool = True
+    id: str = field(default_factory=new_layer_id)
 
     def to_dict(self) -> dict:
         return {
+            "id": self.id,
             "source": self.source.to_dict(),
             "cmap": self.cmap,
             "clim": (list(self.clim) if self.clim is not None else None),
@@ -232,6 +241,7 @@ class LayerSpec:
             clim=(list(clim) if clim is not None else None),
             alpha=float(d.get("alpha", 1.0)),
             visible=bool(d.get("visible", True)),
+            id=d.get("id") or new_layer_id(),
         )
 
 

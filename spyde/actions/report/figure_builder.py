@@ -2,15 +2,23 @@
 figure_builder.py — build a live anyplotlib figure for a report figure cell.
 
 A report figure cell owns a :class:`~spyde.actions.report.model.FigureSpec`
-(recipe) + an in-memory snapshot ndarray. This module renders that into a bare
-anyplotlib figure and returns its ``(fig, fig_id, html)`` so the handler can
-emit it through the normal bare-figure path (``finalize_figure_html``), plus a
-:class:`ReportFigureController` implementing the WindowController protocol so
-the figure is reachable by dispatch and torn down by ``Session._forget_window``.
+(recipe) + an in-memory snapshot map ``{(panel_id, layer_id): ndarray}``. This
+module renders that into a bare anyplotlib figure and returns its
+``(fig, fig_id, html)`` so the handler can emit it through the normal bare-figure
+path (``finalize_figure_html``), plus a :class:`ReportFigureController`
+implementing the WindowController protocol so the figure is reachable by dispatch
+and torn down by ``Session._forget_window``.
 
-Phase 1 renders a single panel with a single image layer (clim + cmap + axes +
-title from the spec). Phase 2 grows grid layouts, multi-layer panels, and
-annotations here.
+Phase 2 consumes the FULL spec:
+
+* ``layout={kind:single}`` → one panel; ``{kind:grid, rows, cols, width_ratios}``
+  → an ``apl.subplots`` grid, panels placed by ``grid_pos``.
+* per panel: base ``imshow`` (layer 0) + extra layers via ``plot2d.add_layer``
+  (overlay), annotations mapped to ``add_texts/add_circles/add_ellipses/
+  add_rectangles/add_arrows/add_lines``, and callout insets via
+  ``fig.add_inset`` (+ ``inset.indicate_region`` when anyplotlib provides it).
+* ``_resolve_pixels_for_standalone`` materialises the binary pixel tokens for the
+  BASE image AND every layer so the standalone iframe is self-contained.
 """
 from __future__ import annotations
 
@@ -21,35 +29,31 @@ import numpy as np
 log = logging.getLogger(__name__)
 
 
-def build_cell_figure(spec, snapshot_array):
-    """Render *spec* + *snapshot_array* → ``(fig, fig_id, html)``.
+# ── snapshot-map helpers ──────────────────────────────────────────────────────
 
-    Phase 1: single panel / single image layer. ``cmap``/``clim`` come from the
-    primary layer, axes/title/units from the primary panel. RGB(A) snapshots
-    render directly (no colormap)."""
-    import anyplotlib as apl
-    import anyplotlib._electron as _electron
-    from spyde.drawing.plots.plot import finalize_figure_html
-    from spyde.drawing.colormaps import COLORMAPS
 
-    arr = np.asarray(snapshot_array)
-    layer = spec.primary_layer if spec is not None else None
+def _as_snapshot_map(spec, snapshots):
+    """Accept either a single ndarray (legacy single-panel/single-layer) or a
+    ``{(panel_id, layer_id): ndarray}`` map, and return the map form keyed by
+    ``(panel_id, layer_id)`` for uniform lookup."""
+    if isinstance(snapshots, dict):
+        return dict(snapshots)
+    # Legacy: a bare array → the primary panel's primary layer.
+    arr = np.asarray(snapshots)
     panel = spec.panels[0] if (spec is not None and spec.panels) else None
+    layer = panel.layers[0] if (panel is not None and panel.layers) else None
+    if panel is not None and layer is not None:
+        return {(panel.id, layer.id): arr}
+    return {}
 
-    cmap = None
-    clim = None
-    if layer is not None:
-        cmap = COLORMAPS.get(layer.cmap, layer.cmap)
-        clim = layer.clim
 
-    fig, axes = apl.subplots(1, 1)
-    ax = axes[0][0] if isinstance(axes, list) else axes
+def _resolve_cmap(name):
+    from spyde.drawing.colormaps import COLORMAPS
+    return COLORMAPS.get(name, name)
 
-    is_rgb = arr.ndim == 3 and arr.shape[-1] in (3, 4)
-    frame = arr if is_rgb else np.nan_to_num(np.asarray(arr, dtype=np.float32))
 
-    # Calibrated axes / units from the spec (if present) so the report figure
-    # draws the same ticks + scale bar the live plot showed.
+def _panel_axes_kw(panel):
+    """(axes_kw, units) for calibrated ticks / scale bar from a panel's axes."""
     axes_kw = {}
     units = "px"
     if panel is not None and panel.axes:
@@ -64,31 +68,247 @@ def build_cell_figure(spec, snapshot_array):
                 axes_kw["units"] = units
         except Exception as e:
             log.debug("report figure axes from spec failed: %s", e)
+    return axes_kw, units
 
-    p = ax.imshow(frame, cmap=(None if is_rgb else cmap), tile=False, **axes_kw)
-    if not is_rgb and clim is not None and clim[0] is not None and clim[1] is not None:
+
+# ── annotation rendering ──────────────────────────────────────────────────────
+
+
+def _apply_annotations(p2, annotations):
+    """Map each annotation dict (``{kind, ...anyplotlib-marker kwargs, data coords}``)
+    onto the panel's ``add_*`` marker call. Unknown kinds and bad kwargs are logged
+    and skipped so one malformed annotation can't blank the whole figure."""
+    for ann in annotations or []:
         try:
-            p.set_clim(float(clim[0]), float(clim[1]))
+            kind = str(ann.get("kind", "")).lower()
+            kw = {k: v for k, v in ann.items() if k != "kind"}
+            if kind == "text":
+                offsets = kw.pop("offsets", None)
+                texts = kw.pop("texts", None)
+                if offsets is None or texts is None:
+                    continue
+                p2.add_texts(offsets, texts, **kw)
+            elif kind == "circle":
+                offsets = kw.pop("offsets", None)
+                if offsets is None:
+                    continue
+                p2.add_circles(offsets, **kw)
+            elif kind == "ellipse":
+                offsets = kw.pop("offsets", None)
+                widths = kw.pop("widths", None)
+                heights = kw.pop("heights", None)
+                if offsets is None or widths is None or heights is None:
+                    continue
+                p2.add_ellipses(offsets, widths, heights, **kw)
+            elif kind == "rect":
+                offsets = kw.pop("offsets", None)
+                widths = kw.pop("widths", None)
+                heights = kw.pop("heights", None)
+                if offsets is None or widths is None or heights is None:
+                    continue
+                p2.add_rectangles(offsets, widths, heights, **kw)
+            elif kind == "arrow":
+                offsets = kw.pop("offsets", None)
+                U = kw.pop("U", None)
+                V = kw.pop("V", None)
+                if offsets is None or U is None or V is None:
+                    continue
+                p2.add_arrows(offsets, U, V, **kw)
+            elif kind == "line":
+                segments = kw.pop("segments", None)
+                if segments is None:
+                    continue
+                p2.add_lines(segments, **kw)
+            else:
+                log.debug("report figure: unknown annotation kind %r", kind)
         except Exception as e:
-            log.debug("report figure set_clim failed: %s", e)
+            log.debug("report figure annotation %r failed: %s", ann, e)
 
-    title = ""
-    if panel is not None and panel.title:
-        title = str(panel.title)
-    if title and hasattr(p, "set_title"):
+
+# ── one panel: base image + overlay layers ────────────────────────────────────
+
+
+def _render_panel(ax, panel, snap_map):
+    """Render one panel onto ``ax``: the base image (layer 0) + any overlay layers
+    (``add_layer``) + annotations. Returns the base ``Plot2D`` (or None if the panel
+    has no paintable base snapshot)."""
+    if not panel.layers:
+        return None
+    base_layer = panel.layers[0]
+    base_arr = snap_map.get((panel.id, base_layer.id))
+    if base_arr is None:
+        return None
+    base_arr = np.asarray(base_arr)
+    is_rgb = base_arr.ndim == 3 and base_arr.shape[-1] in (3, 4)
+    frame = base_arr if is_rgb else np.nan_to_num(np.asarray(base_arr, dtype=np.float32))
+
+    axes_kw, units = _panel_axes_kw(panel)
+    cmap = None if is_rgb else _resolve_cmap(base_layer.cmap)
+    p2 = ax.imshow(frame, cmap=cmap, tile=False, **axes_kw)
+
+    if not is_rgb and base_layer.clim and base_layer.clim[0] is not None \
+            and base_layer.clim[1] is not None:
         try:
-            p.set_title(title)
+            p2.set_clim(float(base_layer.clim[0]), float(base_layer.clim[1]))
+        except Exception as e:
+            log.debug("report figure base set_clim failed: %s", e)
+
+    # Overlay layers (layer 1..N) — each an add_layer over the base.
+    for layer in panel.layers[1:]:
+        if not layer.visible:
+            continue
+        arr = snap_map.get((panel.id, layer.id))
+        if arr is None:
+            continue
+        arr = np.asarray(arr)
+        if arr.ndim != 2:
+            continue
+        clim = None
+        if layer.clim and layer.clim[0] is not None and layer.clim[1] is not None:
+            clim = (float(layer.clim[0]), float(layer.clim[1]))
+        try:
+            p2.add_layer(arr, cmap=_resolve_cmap(layer.cmap),
+                         alpha=float(layer.alpha), clim=clim,
+                         visible=bool(layer.visible))
+        except Exception as e:
+            log.debug("report figure add_layer failed (panel %s layer %s): %s",
+                      panel.id, layer.id, e)
+
+    if panel.title and hasattr(p2, "set_title"):
+        try:
+            p2.set_title(str(panel.title))
         except Exception as e:
             log.debug("report figure set_title failed: %s", e)
 
-    # The report figure is a COLD standalone embed: its iframe HTML must be
-    # self-contained (no PLOTBIN binary channel, no live re-push). When the app's
-    # binary transport is active (APL_BINARY_TRANSPORT=1), imshow left the panel
-    # pixels as a "\x00bin:<checksum>" change-token in the panel_*_json / _geom
-    # traits (the real bytes ride PLOTBIN for MDI windows). A standalone iframe
-    # can't resolve that token → BLANK figure. Force each panel to re-serialise
-    # with the tokens materialised to inline base64 (Figure._push already does
-    # this whenever _binary_wire() is False) so the embedded state paints on load.
+    _apply_annotations(p2, panel.annotations)
+    return p2
+
+
+# ── callout insets ────────────────────────────────────────────────────────────
+
+_CORNER_ALIASES = {
+    "top-right": "top-right", "top-left": "top-left",
+    "bottom-right": "bottom-right", "bottom-left": "bottom-left",
+}
+
+
+def _apply_insets(fig, panel, base_plot, snap_map):
+    """Render each of a panel's callout insets: a small floating axes
+    (``fig.add_inset``) showing the referenced panel's base snapshot, plus a
+    connector to the source region when anyplotlib exposes ``indicate_region``."""
+    for inset in panel.insets or []:
+        try:
+            ref_panel_id = inset.get("panel")
+            corner = _CORNER_ALIASES.get(str(inset.get("corner", "top-right")),
+                                         "top-right")
+            w_frac = float(inset.get("w_frac", 0.3))
+            h_frac = float(inset.get("h_frac", 0.3))
+            # The inset image is the referenced panel's FIRST layer snapshot.
+            arr = None
+            for (pid, _lid), a in snap_map.items():
+                if pid == ref_panel_id:
+                    arr = a
+                    break
+            if arr is None:
+                continue
+            arr = np.asarray(arr)
+            inset_ax = fig.add_inset(w_frac, h_frac, corner=corner,
+                                     title=str(inset.get("title", "")))
+            is_rgb = arr.ndim == 3 and arr.shape[-1] in (3, 4)
+            ip = inset_ax.imshow(
+                arr if is_rgb else np.nan_to_num(np.asarray(arr, dtype=np.float32)),
+                cmap=(None if is_rgb else "gray"), tile=False)
+            # Connector (dashed source rect + leader lines) — only if anyplotlib
+            # provides it (added in parallel). Region = the snapshot nav-selector
+            # region, if the spec recorded one.
+            connector = inset.get("connector") or {}
+            region = connector.get("region")
+            if region is not None and base_plot is not None \
+                    and hasattr(inset_ax, "indicate_region"):
+                try:
+                    inset_ax.indicate_region(base_plot, tuple(region))
+                except Exception as e:
+                    log.debug("report inset indicate_region failed: %s", e)
+        except Exception as e:
+            log.debug("report figure inset %r failed: %s", inset, e)
+
+
+# ── the figure build ──────────────────────────────────────────────────────────
+
+
+def _grid_shape(spec):
+    """(rows, cols, width_ratios, height_ratios) for the figure grid from the
+    layout spec. A ``single`` layout is 1×1."""
+    layout = spec.layout or {"kind": "single"}
+    if str(layout.get("kind")) == "grid":
+        rows = int(layout.get("rows", 1) or 1)
+        cols = int(layout.get("cols", 1) or 1)
+        wr = layout.get("width_ratios")
+        hr = layout.get("height_ratios")
+        return max(1, rows), max(1, cols), wr, hr
+    return 1, 1, None, None
+
+
+def build_cell_figure(spec, snapshots):
+    """Render *spec* + *snapshots* → ``(fig, fig_id, html)``.
+
+    ``snapshots`` is a ``{(panel_id, layer_id): ndarray}`` map (or, legacy, a single
+    ndarray for a single-panel/single-layer cell). Builds the grid, each panel's
+    base image + overlay layers + annotations, and callout insets, then materialises
+    the pixel tokens for a self-contained standalone embed."""
+    import anyplotlib as apl
+    import anyplotlib._electron as _electron
+    from spyde.drawing.plots.plot import finalize_figure_html
+
+    snap_map = _as_snapshot_map(spec, snapshots)
+    rows, cols, wr, hr = _grid_shape(spec)
+
+    fig, axes = apl.subplots(rows, cols, width_ratios=wr, height_ratios=hr)
+
+    def _ax_at(r, c):
+        # Normalise apl.subplots' return (scalar / 1-D / 2-D) to a grid getter.
+        if rows == 1 and cols == 1:
+            return axes
+        if rows == 1:
+            return axes[c]
+        if cols == 1:
+            return axes[r]
+        return axes[r][c]
+
+    # Panels referenced ONLY as callout insets are drawn as floating insets, not
+    # placed in the grid (they'd otherwise overwrite a grid cell).
+    inset_panel_ids = set()
+    for panel in spec.panels:
+        for ins in (panel.insets or []):
+            if ins.get("panel"):
+                inset_panel_ids.add(ins["panel"])
+
+    base_by_panel = {}
+    used = set()
+    for panel in spec.panels:
+        if panel.id in inset_panel_ids:
+            continue
+        try:
+            gp = panel.grid_pos or [0, 0]
+            r = int(gp[0]) if len(gp) > 0 else 0
+            c = int(gp[1]) if len(gp) > 1 else 0
+            r = max(0, min(r, rows - 1))
+            c = max(0, min(c, cols - 1))
+        except Exception:
+            r, c = 0, 0
+        ax = _ax_at(r, c)
+        p2 = _render_panel(ax, panel, snap_map)
+        if p2 is not None:
+            base_by_panel[panel.id] = p2
+        used.add((r, c))
+
+    # Callout insets (rendered after all panels so their referenced panel exists).
+    for panel in spec.panels:
+        if panel.insets:
+            _apply_insets(fig, panel, base_by_panel.get(panel.id), snap_map)
+
+    # Materialise pixel tokens (base + every layer) so the standalone HTML embed is
+    # self-contained even when the app's binary transport is active.
     _resolve_pixels_for_standalone(fig)
 
     fig_id = _electron.register(fig)
@@ -99,12 +319,12 @@ def build_cell_figure(spec, snapshot_array):
 def _resolve_pixels_for_standalone(fig) -> None:
     """Rewrite every panel trait of *fig* with pixel change-tokens materialised
     to inline base64, so the standalone HTML embed is self-contained even when
-    the app's Electron binary transport is active.
+    the app's Electron binary transport is active (base image AND every layer's
+    ``layer_<id>_b64`` are resolved by anyplotlib's ``resolve_pixel_tokens``).
 
-    Temporarily clears ``APL_BINARY_TRANSPORT`` so ``Figure._push`` takes its
-    cold path (``resolve_pixel_tokens`` → real base64 in both the ``panel_*_json``
-    and ``panel_*_geom`` traits), then restores the env for the live MDI figures.
-    A no-op when binary transport is off (the traits already hold base64)."""
+    Temporarily clears ``APL_BINARY_TRANSPORT`` so ``Figure._push`` takes its cold
+    path (``resolve_pixel_tokens`` → real base64), then restores the env for the
+    live MDI figures. A no-op when binary transport is off."""
     import os
 
     prev = os.environ.get("APL_BINARY_TRANSPORT")
@@ -162,5 +382,6 @@ class ReportFigureController:
             log.debug("report figure controller detach failed: %s", e)
 
     def handle_action(self, name: str, payload: dict) -> bool:
-        # Phase 1 report figures carry no per-window actions of their own.
+        # Report figures carry no per-window actions of their own; the compose
+        # edits are cell-scoped staged actions (spyde.actions.report.compose).
         return False

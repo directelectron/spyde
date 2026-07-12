@@ -79,6 +79,17 @@ class _NavPainter:
                 try:
                     plot.current_data = data
                     plot._set_array(data)
+                    # Apply any pending MDI-overlay layer frames RIGHT AFTER the base
+                    # paint, still on this ONE painter thread — so every layer
+                    # set_data → stdout push stays serialized behind the base push
+                    # (mirrors the base read/paint decouple). No-op when the plot has
+                    # no layers / nothing pending.
+                    if getattr(plot, "_pending_layer_frames", None):
+                        try:
+                            from spyde.actions.overlay import _apply_pending_layer_frames
+                            _apply_pending_layer_frames(plot)
+                        except Exception as e:
+                            logger.debug("applying pending layer frames failed: %s", e)
                 except Exception as e:
                     logger.debug("nav paint failed: %s", e)
 
@@ -255,6 +266,13 @@ class Plot:
         # the GPU. Lazily built on the first large frame (_maybe_gpu_tile); reset on a
         # node switch / close so a new signal rebuilds it. None = not tiling yet.
         self._gpu_tile_backend = None
+        # MDI live overlay layers (Report Phase 2): a list of spyde.actions.overlay
+        # PlotLayer, each an anyplotlib Layer over this plot's base image, refreshed
+        # from its own source on every navigator move. Empty by default (the fast
+        # non-layered path guards on this being falsy). _pending_layer_frames stages
+        # freshly-read layer frames for the painter thread to push.
+        self._layers: list = []
+        self._pending_layer_frames = None
 
         # anyplotlib figure + plot objects
         self._fig: apl.Figure | None = None
@@ -1212,6 +1230,16 @@ class Plot:
                 self._nav_chunk_cache.clear()
             except Exception:
                 pass
+        # Drop any MDI overlay layers ON this plot (their anyplotlib handles) AND
+        # any layers on OTHER plots that source FROM this one — so closing either a
+        # target or a source leaves no dangling handle / stale composited image.
+        try:
+            from spyde.actions.overlay import drop_all_layers, drop_layers_for_source
+            drop_all_layers(self)
+            if self.session is not None:
+                drop_layers_for_source(self.session, self)
+        except Exception as e:
+            logger.debug("dropping overlay layers on plot close failed: %s", e)
         if self._shared_memory is not None:
             try:
                 self._shared_memory.close()

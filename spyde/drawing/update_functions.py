@@ -829,6 +829,70 @@ def _try_async_expensive_nav_read(current_signal, selector, child, indices, prof
         return False
 
 
+def _prepare_nav_indices(current_signal, indices, integrating: bool):
+    """Transform RAW selector indices into DATA-ORDER, clamped array indices — the
+    shared index-prep for the navigator read.
+
+    Does exactly what ``update_from_navigation_selection`` does before it reads:
+      * swap the innermost spatial (x, y) widget pair → (y, x) data order (for a
+        2-D-signal navigator; the outer stack coords in a 5-D chain stay put),
+      * mean-reduce a crosshair's point cloud to one integer nav point when NOT
+        integrating (a region keeps all its points),
+      * clamp every coordinate to the leading (navigation) data-axis sizes so a
+        stale/larger-grid selector position can't IndexError.
+
+    Extracted so the MDI-overlay layer read (:mod:`spyde.actions.overlay`) resolves
+    the SAME nav position as the base frame from the same raw selector indices.
+    Returns the prepared ndarray (or None on failure)."""
+    indices = np.asarray(indices)
+    _has_spatial_nav = False
+    try:
+        _has_spatial_nav = current_signal.axes_manager.signal_dimension == 2
+    except Exception:
+        _has_spatial_nav = indices.ndim >= 1 and indices.shape[-1] == 2
+    if _has_spatial_nav and indices.ndim >= 1 and indices.shape[-1] >= 2:
+        indices = indices.copy()
+        indices[..., -2:] = indices[..., -2:][..., ::-1]
+
+    if not integrating:
+        indices = np.mean(indices, axis=0).astype(int)
+
+    try:
+        data_obj = current_signal.data
+        data_shape = getattr(data_obj, "shape", None)
+        if data_shape is None:
+            nav_shape_xy = tuple(current_signal.axes_manager.navigation_shape)
+            data_shape = tuple(reversed(nav_shape_xy))
+        idx_arr = np.asarray(indices)
+        if idx_arr.size and len(data_shape):
+            ncoord = idx_arr.shape[-1] if idx_arr.ndim else 1
+            n = min(ncoord, len(data_shape))
+            limits = np.array([data_shape[i] - 1 for i in range(n)], dtype=idx_arr.dtype)
+            before = idx_arr.copy()
+            if limits.size == ncoord:
+                indices = np.clip(idx_arr, 0, limits)
+            else:
+                clamped = idx_arr.copy()
+                if idx_arr.ndim == 1:
+                    clamped[:n] = np.clip(idx_arr[:n], 0, limits)
+                else:
+                    clamped[..., :n] = np.clip(idx_arr[..., :n], 0, limits)
+                indices = clamped
+                log.debug(
+                    "NAV-DEBUG clamp ncoord=%d != bounds=%d; partial-clamped "
+                    "data_shape=%s", ncoord, limits.size, data_shape,
+                )
+            if log.isEnabledFor(logging.DEBUG) and not np.array_equal(before, np.asarray(indices)):
+                log.debug(
+                    "NAV-DEBUG clamped out-of-range nav index %s -> %s "
+                    "(data_shape=%s) — selector held a stale/larger-grid position",
+                    before.tolist(), np.asarray(indices).tolist(), data_shape,
+                )
+    except Exception as e:
+        log.debug("clamping nav indices failed: %s", e)
+    return indices
+
+
 def update_from_navigation_selection(
         selector: "BaseSelector",
         child: "Plot",
@@ -925,72 +989,11 @@ def update_from_navigation_selection(
     # against x — the cause of "clamped [0,525,169] -> [0,299,169]" on a 5-D
     # stack: x=525 wrongly bounded by the y-axis). The swap applies whenever the
     # innermost navigator is 2-D spatial (signal_dimension == 2).
-    indices = np.asarray(indices)
-    _has_spatial_nav = False
-    try:
-        _has_spatial_nav = current_signal.axes_manager.signal_dimension == 2
-    except Exception:
-        _has_spatial_nav = indices.ndim >= 1 and indices.shape[-1] == 2
-    if _has_spatial_nav and indices.ndim >= 1 and indices.shape[-1] >= 2:
-        indices = indices.copy()
-        indices[..., -2:] = indices[..., -2:][..., ::-1]
-
-    if not selector.is_integrating:
-        indices = np.mean(indices, axis=0).astype(int)
-
-    # Clamp nav indices to the leading (navigation) axis sizes. The signal behind
-    # a plot can change (e.g. set_signal_type, or loading a SECOND signal) while a
-    # selector still holds positions from the previous, larger nav grid — the
-    # subsequent data[...] index would raise IndexError ("Index N out of bounds
-    # for axis 0 with size N"). Clamping keeps the display valid until the
-    # selector catches up to the new shape.
     #
-    # Use the data array's leading-axis sizes as the AUTHORITATIVE per-coordinate
-    # bound. `indices` here is (y, x, …) order (post-transpose), matching the data
-    # axes; data_shape's leading nav axes are (ny, nx, …). A distributed signal's
-    # `.data` may be a Future (no `.shape`) — fall back to axes_manager then.
-    try:
-        data_obj = current_signal.data
-        data_shape = getattr(data_obj, "shape", None)
-        if data_shape is None:
-            # Future / unshaped — derive the nav-axis sizes from the axes manager
-            # (navigation_shape is (x, y, …); reverse to (…, y, x) array order).
-            nav_shape_xy = tuple(current_signal.axes_manager.navigation_shape)
-            data_shape = tuple(reversed(nav_shape_xy))
-        idx_arr = np.asarray(indices)
-        if idx_arr.size and len(data_shape):
-            # Last axis holds the per-point coordinates (one per leading data
-            # axis); clamp each coordinate to its axis size.
-            ncoord = idx_arr.shape[-1] if idx_arr.ndim else 1
-            n = min(ncoord, len(data_shape))
-            limits = np.array([data_shape[i] - 1 for i in range(n)], dtype=idx_arr.dtype)
-            before = idx_arr.copy()
-            if limits.size == ncoord:
-                indices = np.clip(idx_arr, 0, limits)
-            else:
-                # ncoord != available bounds: clamp the coordinates we CAN bound
-                # rather than skipping entirely (the old code skipped, which let
-                # the IndexError through on a mismatched/changed signal).
-                clamped = idx_arr.copy()
-                if idx_arr.ndim == 1:
-                    clamped[:n] = np.clip(idx_arr[:n], 0, limits)
-                else:
-                    clamped[..., :n] = np.clip(idx_arr[..., :n], 0, limits)
-                indices = clamped
-                log.debug(
-                    "NAV-DEBUG clamp ncoord=%d != bounds=%d; partial-clamped "
-                    "data_shape=%s", ncoord, limits.size, data_shape,
-                )
-            if log.isEnabledFor(logging.DEBUG) and not np.array_equal(before, np.asarray(indices)):
-                log.debug(
-                    "NAV-DEBUG clamped out-of-range nav index %s -> %s "
-                    "(data_shape=%s) — selector held a stale/larger-grid position",
-                    before.tolist(), np.asarray(indices).tolist(), data_shape,
-                )
-    except Exception as e:
-        # Couldn't clamp (unexpected shape) — proceed with raw indices; a real
-        # out-of-range index then surfaces as an IndexError downstream.
-        log.debug("clamping nav indices failed: %s", e)
+    # The swap + mean-reduce + clamp is shared with the MDI-overlay layer read
+    # (spyde.actions.overlay) so a layer resolves the SAME nav position from the
+    # same raw selector indices — see _prepare_nav_indices.
+    indices = _prepare_nav_indices(current_signal, indices, selector.is_integrating)
 
     if current_signal._lazy:
         if isinstance(current_signal.data[0], Future):

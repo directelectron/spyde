@@ -98,6 +98,20 @@ STAGED_HANDLERS: dict[str, str] = {
     "report_refresh_figure":   "spyde.actions.report.handlers.report_refresh_figure",
     "report_snapshots":        "spyde.actions.report.handlers.report_snapshots",
     "report_cell_from_window": "spyde.actions.report.handlers.report_cell_from_window",
+    # Report Builder Phase 2 — combined report figures (spyde/actions/report/compose.py)
+    "repfig_query_compose":    "spyde.actions.report.compose.repfig_query_compose",
+    "repfig_compose":          "spyde.actions.report.compose.repfig_compose",
+    "repfig_set_layer":        "spyde.actions.report.compose.repfig_set_layer",
+    "repfig_remove_layer":     "spyde.actions.report.compose.repfig_remove_layer",
+    "repfig_remove_panel":     "spyde.actions.report.compose.repfig_remove_panel",
+    "repfig_add_annotation":   "spyde.actions.report.compose.repfig_add_annotation",
+    "repfig_update_annotation": "spyde.actions.report.compose.repfig_update_annotation",
+    "repfig_remove_annotation": "spyde.actions.report.compose.repfig_remove_annotation",
+    # Report Builder Phase 2 — MDI live image layering (spyde/actions/overlay.py)
+    "overlay_add":             "spyde.actions.overlay.overlay_add",
+    "overlay_set":             "spyde.actions.overlay.overlay_set",
+    "overlay_remove":          "spyde.actions.overlay.overlay_remove",
+    "overlay_query":           "spyde.actions.overlay.overlay_query",
 }
 
 
