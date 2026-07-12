@@ -69,7 +69,12 @@ linux:
 # `--publish always` so these get generated and uploaded; this block alone does
 # NOT publish anything (a local `npm run dist` without --publish never touches
 # GitHub).
+# The owner/repo here is where a LOCAL build's app-update.yml points; release.yml
+# overrides both to the repo the workflow runs in (-c.publish.owner/.repo), which
+# is what keeps CI publishing working before AND after the planned transfer to the
+# directelectron org (README/pyproject already point there, but that repo does not
+# exist yet — publishing to it 404s, which is what killed the v0.1.0 release).
 publish:
   provider: github
-  owner: directelectron
+  owner: CSSFrancis
   repo: spyde
