@@ -81,9 +81,48 @@ def build_cell_figure(spec, snapshot_array):
         except Exception as e:
             log.debug("report figure set_title failed: %s", e)
 
+    # The report figure is a COLD standalone embed: its iframe HTML must be
+    # self-contained (no PLOTBIN binary channel, no live re-push). When the app's
+    # binary transport is active (APL_BINARY_TRANSPORT=1), imshow left the panel
+    # pixels as a "\x00bin:<checksum>" change-token in the panel_*_json / _geom
+    # traits (the real bytes ride PLOTBIN for MDI windows). A standalone iframe
+    # can't resolve that token → BLANK figure. Force each panel to re-serialise
+    # with the tokens materialised to inline base64 (Figure._push already does
+    # this whenever _binary_wire() is False) so the embedded state paints on load.
+    _resolve_pixels_for_standalone(fig)
+
     fig_id = _electron.register(fig)
     html = finalize_figure_html(fig, fig_id)
     return fig, fig_id, html
+
+
+def _resolve_pixels_for_standalone(fig) -> None:
+    """Rewrite every panel trait of *fig* with pixel change-tokens materialised
+    to inline base64, so the standalone HTML embed is self-contained even when
+    the app's Electron binary transport is active.
+
+    Temporarily clears ``APL_BINARY_TRANSPORT`` so ``Figure._push`` takes its
+    cold path (``resolve_pixel_tokens`` → real base64 in both the ``panel_*_json``
+    and ``panel_*_geom`` traits), then restores the env for the live MDI figures.
+    A no-op when binary transport is off (the traits already hold base64)."""
+    import os
+
+    prev = os.environ.get("APL_BINARY_TRANSPORT")
+    if prev != "1":
+        return   # base64 already inline — nothing to resolve.
+    plots_map = getattr(fig, "_plots_map", None)
+    if not plots_map:
+        return
+    os.environ["APL_BINARY_TRANSPORT"] = "0"
+    try:
+        for panel_id in list(plots_map):
+            try:
+                fig._push(panel_id)
+            except Exception as e:
+                log.debug("report figure pixel-resolve push failed for %s: %s",
+                          panel_id, e)
+    finally:
+        os.environ["APL_BINARY_TRANSPORT"] = prev
 
 
 class ReportFigureController:

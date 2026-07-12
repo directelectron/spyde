@@ -40,7 +40,12 @@ function sourceWindowIdFromDrop(dt: DataTransfer): number | null {
 
 export function ReportSidebar() {
   const { state, sendAction } = useSpyDE()
-  const report = state.report
+  // A closed report is surfaced by the backend as `open:false` (NOT by dropping
+  // state.report to null — `report_close` still emits a report_state so the
+  // renderer clears its cells). Treat both "no state yet" and "open:false" as
+  // "no report open" so closing returns to the empty New/Open chrome instead of
+  // an open-but-empty body (dangling Save/dirty affordances on a closed report).
+  const report = state.report && state.report.open ? state.report : null
   const cells = report?.cells ?? []
 
   const [width, setWidth] = useState(DEFAULT_W)
