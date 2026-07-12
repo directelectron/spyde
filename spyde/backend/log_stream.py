@@ -52,6 +52,8 @@ _AREA_RULES = (
     ("spyde.qt", "ui"),
     ("spyde.live", "instrument"),
     ("spyde", "spyde"),
+    ("anyplotlib.tile", "plots"),
+    ("anyplotlib", "plots"),
     ("distributed", "dask"),
     ("dask", "dask"),
     ("hyperspy", "hyperspy"),

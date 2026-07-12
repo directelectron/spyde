@@ -209,7 +209,8 @@ def vom_generate_library(session, plot, payload) -> None:
             # the GPU right away — it's seconds on a real scan — and show the
             # IPF-Z map immediately so you see the orientation result while you
             # refine. Cached on the tree so Compute Maps is then instant.
-            field = _fit_field(vecs, lib, dict(strain_cap=DEFAULTS["strain_cap"]))
+            field = _fit_field(vecs, lib, dict(strain_cap=DEFAULTS["strain_cap"]),
+                               tree=tree)
             if field is not None:
                 tree._vom_field = field
                 tree._vom_field_cap = DEFAULTS["strain_cap"]
@@ -345,10 +346,12 @@ def vom_run(session, plot, payload) -> None:
             if reuse:
                 result, with_ipf = cached, False
             else:
-                result = _fit_field(vecs, lib, fit_params)
+                result = _fit_field(vecs, lib, fit_params, tree=tree)
                 with_ipf = True
             if result is None:
-                emit_error("Vector Orientation: fit returned no result")
+                # None also means "cancelled" (tree closed mid-fit) — no toast.
+                if not getattr(tree, "_spyde_closed", False):
+                    emit_error("Vector Orientation: fit returned no result")
                 return
             tree.vector_orientation = result
             _build_result_windows(session, tree.root, result, smooth=smooth,
@@ -362,11 +365,14 @@ def vom_run(session, plot, payload) -> None:
     run_on_worker(session, _work, name="vom-run")
 
 
-def _fit_field(vecs, lib, params):
+def _fit_field(vecs, lib, params, *, tree=None):
     """Whole-field vector-orientation fit. Prefers the BATCHED GPU path (the Qt
     production path) — it fits every nav position in one pass, seconds on a real
     13k-pattern scan; the serial per-pattern CPU scipy fit is ~minutes and only
-    a fallback when torch is unavailable (or the GPU fit errors)."""
+    a fallback when torch is unavailable (or the GPU fit errors).
+
+    ``tree`` (when given) registers a stopped_flag so closing the tree mid-fit
+    interrupts the GPU anneal / CPU loop instead of running it to completion."""
     ny, nx = vecs.nav_shape
     total = ny * nx
 
@@ -374,26 +380,40 @@ def _fit_field(vecs, lib, params):
         if total_:
             emit_status(f"Vector Orientation: fitting… {int(100 * done / total_)}%")
 
+    # Cancellation: both the GPU anneal and the CPU per-pattern loop poll this.
+    stopped_flag = [False]
+    if tree is not None and hasattr(tree, "register_cancel"):
+        tree.register_cancel(flag=stopped_flag)
     try:
-        from spyde.actions.vector_orientation_gpu import (
-            compute_vector_orientation_gpu, select_device, torch_available)
-        dev = select_device() if torch_available() else None
-    except Exception:
-        dev = None
-    if dev is not None:
-        emit_status(f"Vector Orientation: fitting on {dev.type} ({total} patterns)…")
         try:
-            res = compute_vector_orientation_gpu(vecs, lib, params, progress=_progress)
-            if res is not None:
-                return res
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            emit_status(f"Vector Orientation: GPU fit failed ({e}); CPU fallback…")
+            from spyde.actions.vector_orientation_gpu import (
+                compute_vector_orientation_gpu, select_device, torch_available)
+            dev = select_device() if torch_available() else None
+        except Exception:
+            dev = None
+        if dev is not None:
+            emit_status(f"Vector Orientation: fitting on {dev.type} ({total} patterns)…")
+            try:
+                res = compute_vector_orientation_gpu(
+                    vecs, lib, params, progress=_progress, stopped_flag=stopped_flag)
+                if res is not None:
+                    return res
+                if stopped_flag[0]:
+                    return None          # cancelled — don't fall through to CPU
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                emit_status(f"Vector Orientation: GPU fit failed ({e}); CPU fallback…")
 
-    from spyde.actions.vector_orientation import compute_vector_orientation
-    emit_status(f"Vector Orientation: fitting on CPU ({total} patterns, slower)…")
-    return compute_vector_orientation(vecs, lib, params, progress=_progress)
+        if stopped_flag[0]:
+            return None
+        from spyde.actions.vector_orientation import compute_vector_orientation
+        emit_status(f"Vector Orientation: fitting on CPU ({total} patterns, slower)…")
+        return compute_vector_orientation(
+            vecs, lib, params, progress=_progress, stopped_flag=stopped_flag)
+    finally:
+        if tree is not None and hasattr(tree, "unregister_cancel"):
+            tree.unregister_cancel(flag=stopped_flag)
 
 
 def _build_result_windows(session, src, result, *, smooth=False, with_ipf=True) -> None:

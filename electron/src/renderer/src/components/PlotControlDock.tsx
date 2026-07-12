@@ -7,13 +7,15 @@
 import React from 'react'
 import { useSpyDE } from '../kernel/SpyDEContext'
 import type { TreeNode, AxisRow } from '../kernel/SpyDEContext'
+import { WORKFLOW_NODE_DRAG_MIME } from '../kernel/dnd'
 import { CompositionPanel } from './CompositionPanel'
 
 // Compact workflow tree: each step is a row with a depth guide-rail, a node dot,
 // and the step name. The active (displayed) node is highlighted. Hovering tints
 // the row so it reads as clickable.
-function TreeNodes({ nodes, depth, activeId, onPick }:
-  { nodes: TreeNode[]; depth: number; activeId: number | null; onPick: (id: number) => void }) {
+function TreeNodes({ nodes, depth, activeId, windowId, onPick }:
+  { nodes: TreeNode[]; depth: number; activeId: number | null
+    windowId: number | null; onPick: (id: number) => void }) {
   const [hover, setHover] = React.useState<number | null>(null)
   return (
     <>
@@ -25,6 +27,16 @@ function TreeNodes({ nodes, depth, activeId, onPick }:
             <button
               data-testid={`tree-node-${n.name}`}
               data-active={active ? 'true' : undefined}
+              // Drag a workflow node into the console to bind it (backend
+              // console_bind_node picks a var name for this exact tree node).
+              draggable={windowId != null}
+              onDragStart={(e) => {
+                if (windowId == null) return
+                e.dataTransfer.setData(WORKFLOW_NODE_DRAG_MIME, JSON.stringify({
+                  windowId, signalId: n.signal_id, name: n.name,
+                }))
+                e.dataTransfer.effectAllowed = 'copy'
+              }}
               onMouseEnter={() => setHover(n.signal_id)}
               onMouseLeave={() => setHover(h => (h === n.signal_id ? null : h))}
               onClick={() => onPick(n.signal_id)}
@@ -50,7 +62,8 @@ function TreeNodes({ nodes, depth, activeId, onPick }:
               </span>
             </button>
             {n.children?.length > 0 && (
-              <TreeNodes nodes={n.children} depth={depth + 1} activeId={activeId} onPick={onPick} />
+              <TreeNodes nodes={n.children} depth={depth + 1} activeId={activeId}
+                windowId={windowId} onPick={onPick} />
             )}
           </div>
         )
@@ -397,6 +410,7 @@ export function PlotControlDock() {
             nodes={[tree]}
             depth={0}
             activeId={activeId != null ? (state.signalTreeActive.get(activeId) ?? null) : null}
+            windowId={activeId}
             onPick={(id) => activeId != null && sendAction('select_signal_node', { signal_id: id }, activeId)}
           />
         </div>

@@ -680,12 +680,18 @@ def _find_vectors_single_frame_dog(
 # Method names accepted across the find-vectors stack.
 METHOD_NXCORR = "nxcorr"
 METHOD_DOG = "dog"
+METHOD_NEURAL = "neural"
 DEFAULT_DOG_SIGMA1 = 0.8
 DEFAULT_DOG_SIGMA2 = 2.0
 # Absolute band-pass SNR (response / 1.4826·MAD).  ~10 balances recall/precision
 # on real small-spot data (benchmarked on the 3 nm DESEMCam scan); raise toward
 # 15 for cleaner / fewer peaks, lower toward 6 for more recall.
 DEFAULT_DOG_THRESHOLD = 10.0
+# Heatmap confidence below which neural (SpotUNet) detections are discarded —
+# the model's natural, dataset-independent operating point (mirrors
+# find_vectors_neural.DEFAULT_NEURAL_THRESHOLD; kept literal here to avoid a
+# circular import — find_vectors_neural imports back from this package).
+DEFAULT_NEURAL_THRESHOLD = 0.3
 
 
 def _find_peaks_single_frame(frame, params, *, beamstop_mask=None,
@@ -693,13 +699,27 @@ def _find_peaks_single_frame(frame, params, *, beamstop_mask=None,
                              with_response=False):
     """Dispatch a single frame to the configured detector, returning peaks
     ``(N,3)`` ``[ky, kx, intensity]``.  ``params`` is the find-vectors param
-    dict (``method`` selects ``nxcorr`` or ``dog``).
+    dict (``method`` selects ``neural``, ``nxcorr`` or ``dog``).
 
     ``with_response=True`` returns ``(peaks, response_map)`` where response_map is
-    the detector's transformed image — the DoG band-pass SNR or the NXCORR
-    correlation surface — for the "show transform" preview toggle."""
+    the detector's transformed image — the neural confidence heatmap, the DoG
+    band-pass SNR or the NXCORR correlation surface — for the "show transform"
+    preview toggle."""
     method = str(params.get("method", METHOD_NXCORR)).lower()
-    if method == METHOD_DOG:
+    if method == METHOD_NEURAL:
+        # Lazy import — find_vectors_neural imports back from this package.
+        from spyde.actions.find_vectors_neural import (
+            _find_vectors_single_frame_neural,
+        )
+        out = _find_vectors_single_frame_neural(
+            frame,
+            float(params.get("threshold", DEFAULT_NEURAL_THRESHOLD)),
+            int(params.get("min_distance", 3)),
+            subpixel=bool(params.get("subpixel", True)),
+            beamstop_mask=beamstop_mask,
+            model_id=(params.get("model_id") or None),
+        )
+    elif method == METHOD_DOG:
         out = _find_vectors_single_frame_dog(
             frame,
             float(params.get("dog_sigma1", DEFAULT_DOG_SIGMA1)),

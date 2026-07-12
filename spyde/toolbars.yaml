@@ -24,6 +24,24 @@ functions:
     plot_dim: [ 1, 2 ]
     navigation: True
     toolbar_side: right
+  Play:
+    description: Play the movie in real time — 1 s of playback = 1 s of experiment time (from the time-axis scale). Loops; toggle to pause.
+    icon: drawing/toolbars/icons/play.svg
+    function: spyde.actions.base.play_pause
+    plot_dim: [ 1 ]
+    navigation: True
+    signal_types: [insitu]
+    toggle: True
+    toolbar_side: right
+  Fast Forward:
+    description: Fast-forward — cycle the playback speed 2x → 4x → 8x → 1x. Starts playback if stopped.
+    icon: drawing/toolbars/icons/fastforward.svg
+    function: spyde.actions.base.fast_forward
+    plot_dim: [ 1 ]
+    navigation: True
+    signal_types: [insitu]
+    toggle: True
+    toolbar_side: right
   FFT:
     description: Applies Fast Fourier Transform to the data based on the current selected area.
     icon: drawing/toolbars/icons/fft.svg
@@ -47,6 +65,38 @@ functions:
     toolbar_side: bottom
     navigation: False
     toggle: True
+  Crop:
+    description: Crop the dataset to a spatial (image) box and optional time range. Produces a smaller lazy dataset (no data copied). Leave a range at 0 to keep that axis whole.
+    icon: drawing/toolbars/icons/crop.svg
+    function: spyde.actions.base.CropAction
+    plot_dim: [ 2 ]
+    toolbar_side: bottom
+    navigation: False
+    parameters:
+      x0:
+        name: X start
+        type: int
+        default: 0
+      x1:
+        name: X end
+        type: int
+        default: 0
+      y0:
+        name: Y start
+        type: int
+        default: 0
+      y1:
+        name: Y end
+        type: int
+        default: 0
+      t0:
+        name: T start
+        type: int
+        default: 0
+      t1:
+        name: T end
+        type: int
+        default: 0
   Center Zero Beam:
     description: Centers the zero beam in diffraction patterns (Automatic / Manual).
     icon: drawing/toolbars/icons/center_zero_beam.svg
@@ -148,7 +198,7 @@ functions:
         max: 20
         tab: Run
   Find Diffraction Vectors:
-    description: Find diffraction vectors via window-normalized cross-correlation (flat disk) or a Difference-of-Gaussians band-pass (small spots / beam-stopped data).
+    description: Find diffraction vectors via the neural (SpotUNet) disk detector, window-normalized cross-correlation (flat disk) or a Difference-of-Gaussians band-pass (small spots / beam-stopped data).
     icon: drawing/toolbars/icons/peak_finding.svg
     function: spyde.actions.find_vectors_action.find_diffraction_vectors
     signal_class: pyxem.signals.Diffraction2D
@@ -160,8 +210,8 @@ functions:
       method:
         name: Method
         type: enum
-        default: nxcorr
-        choices: [nxcorr, dog]
+        default: neural
+        choices: [neural, nxcorr, dog]
       sigma:
         name: Nav Blur σ
         type: float
@@ -192,7 +242,7 @@ functions:
       threshold:
         name: Threshold
         type: float
-        default: 0.5
+        default: 0.3
         min: 0.0
         max: 30.0
         step: 0.05

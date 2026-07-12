@@ -28,19 +28,23 @@ from spyde.backend.ipc import emit, emit_status, emit_error
 from spyde.actions.context import src_plot_tree as _src_plot_tree
 from spyde.actions.find_vectors import _do_compute_vectors, _copy_nav_axes_to
 
-# Defaults mirror the old Qt CaretGroup sliders, plus the DoG band-pass method
-# (better for small 2-3 px spots / beam-stopped data — see the 3 nm benchmark).
-# `threshold` is shared but means different things per method: NXCORR uses an
-# [-1,1] correlation score (~0.5); DoG uses an absolute band-pass SNR (~10).
+# Defaults mirror the old Qt CaretGroup sliders, plus the detection method:
+# "neural" (the SpotUNet disk detector — parameter-free, the default), "nxcorr"
+# (window-normalised cross-correlation against a flat disk) and "dog" (band-pass,
+# better for small 2-3 px spots / beam-stopped data — see the 3 nm benchmark).
+# `threshold` is shared but means different things per method: neural uses the
+# model's confidence (~0.3); NXCORR an [-1,1] correlation score (~0.5); DoG an
+# absolute band-pass SNR (~10). `model_id` selects a registry model for the
+# neural method ("" → the registry default).
 DEFAULTS: dict = dict(
-    sigma=1.0, kernel_radius=5, threshold=0.5, min_distance=5, subpixel=True,
-    method="nxcorr", dog_sigma1=0.8, dog_sigma2=2.0, beamstop_auto=False,
-    beamstop_dilate=5, show_transform=False,
+    sigma=1.0, kernel_radius=5, threshold=0.3, min_distance=5, subpixel=True,
+    method="neural", model_id="", dog_sigma1=0.8, dog_sigma2=2.0,
+    beamstop_auto=False, beamstop_dilate=5, show_transform=False,
 )
 
 # Per-method threshold default applied when the user switches method without
 # having explicitly set a threshold for it.
-_METHOD_THRESHOLD = {"nxcorr": 0.5, "dog": 10.0}
+_METHOD_THRESHOLD = {"neural": 0.3, "nxcorr": 0.5, "dog": 10.0}
 
 
 def _coerce(params: dict) -> dict:
@@ -53,14 +57,14 @@ def _coerce(params: dict) -> dict:
             p[k] = bool(v) if isinstance(default, bool) else type(default)(v)
         except (TypeError, ValueError) as e:
             log.debug("find-vectors param %r=%r not coercible, using default: %s", k, v, e)
-    p["method"] = str(p.get("method", "nxcorr")).lower()
+    p["method"] = str(p.get("method", DEFAULTS["method"])).lower()
     if p["method"] not in _METHOD_THRESHOLD:
-        p["method"] = "nxcorr"
-    # DoG uses an SNR threshold on a different scale than NXCORR's [-1,1] score;
-    # if the caller left threshold at the NXCORR default while asking for DoG,
-    # substitute the DoG default so the first preview isn't empty/flooded.
-    if (params.get("threshold") in (None, "")) and p["method"] == "dog":
-        p["threshold"] = _METHOD_THRESHOLD["dog"]
+        p["method"] = DEFAULTS["method"]
+    # Thresholds are per-method scales (neural confidence ~0.3, NXCORR score
+    # ~0.5, DoG SNR ~10); when the caller didn't set one explicitly, substitute
+    # the method's own default so the first preview isn't empty/flooded.
+    if params.get("threshold") in (None, ""):
+        p["threshold"] = _METHOD_THRESHOLD[p["method"]]
     return p
 
 
@@ -181,6 +185,14 @@ def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = Tr
     new_tree._fv_batch_running = True
     src_tree._fv_batch_running = True
 
+    # Cancellation: register a stopped_flag on BOTH trees (compute reads the
+    # source, results land on the new tree — closing either should stop it).
+    # _do_compute_vectors polls this flag and cancels its dask futures.
+    stopped_flag = [False]
+    for _t in {id(src_tree): src_tree, id(new_tree): new_tree}.values():
+        if hasattr(_t, "register_cancel"):
+            _t.register_cancel(flag=stopped_flag)
+
     stop_poll = live_fill_poller(nav_shape_full, shm_name, _paint,
                                  interval=0.35, name="fv-poll")
 
@@ -195,12 +207,16 @@ def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = Tr
             t0 = _time.monotonic()
             log.info("[fv-batch] compute starting (shm=%s)", shm_name)
             vecs = _do_compute_vectors(src, p, main_window=session,
-                                       signal_tree=src_tree, shm_name=shm_name)
+                                       signal_tree=src_tree, shm_name=shm_name,
+                                       stopped_flag=stopped_flag)
             log.info("[fv-batch] compute returned in %.1fs (vecs=%s)",
                      _time.monotonic() - t0, "none" if vecs is None else "ok")
             stop_poll()                              # final paint owns the nav plot
             if vecs is None:
-                emit_error("Find Vectors: compute returned no result")
+                # None also means "cancelled" (tree closed mid-compute) — stay
+                # quiet in that case; only surface an error for a real failure.
+                if not stopped_flag[0]:
+                    emit_error("Find Vectors: compute returned no result")
                 return
             _finalize(new_tree, vecs)
             log.info("[fv-batch] finalized in %.1fs total", _time.monotonic() - t0)
@@ -213,6 +229,9 @@ def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = Tr
             stop_poll()
             new_tree._fv_batch_running = False
             src_tree._fv_batch_running = False
+            for _t in {id(src_tree): src_tree, id(new_tree): new_tree}.values():
+                if hasattr(_t, "unregister_cancel"):
+                    _t.unregister_cancel(flag=stopped_flag)
             if shm is not None:
                 try:
                     shm.close()
@@ -532,7 +551,8 @@ def fv_open(session, plot, payload) -> None:
                 src, tree.root, tree, sigma=p["sigma"],
                 kernel_radius=p["kernel_radius"], threshold=p["threshold"],
                 min_distance=p["min_distance"], subpixel=p["subpixel"],
-                method=p["method"], dog_sigma1=p["dog_sigma1"],
+                method=p["method"], model_id=p.get("model_id") or None,
+                dog_sigma1=p["dog_sigma1"],
                 dog_sigma2=p["dog_sigma2"],
                 beamstop_auto=bool(p.get("beamstop_auto")),
                 show_transform=p["show_transform"],
@@ -646,6 +666,20 @@ def fv_run(session, plot, payload) -> None:
     # The wizard caret closes on Compute; attach the final source-DP overlay
     # hidden so the pattern is clean until the caret is reopened.
     _start_batch(session, src, tree, p, overlay_visible=False)
+
+
+def fv_models(session, plot, payload) -> None:
+    """Emit the available neural models for the wizard's Model dropdown.
+
+    Payload: ``{type: "fv_models", window_id, default, models: [{id, label,
+    version, notes}]}`` — straight from the model registry (bundled manifest
+    merged with any user-installed models)."""
+    from spyde.models import available_models
+    msg = {"type": "fv_models",
+           "window_id": (payload or {}).get("window_id",
+                                            getattr(plot, "window_id", None))}
+    msg.update(available_models())
+    emit(msg)
 
 
 def fv_close(session, plot, payload=None) -> None:

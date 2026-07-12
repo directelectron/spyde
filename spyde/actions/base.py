@@ -66,6 +66,53 @@ def add_selector(toolbar: "ActionContext", toggled=None, *args, **kwargs):
         mgr.add_navigation_selector_and_signal_plot(toolbar.plot_window)
 
 
+# ── Movie playback (on the 1-D time navigator) ───────────────────────────────
+
+def _session_of(toolbar: "ActionContext"):
+    return getattr(getattr(toolbar, "plot", None), "session", None)
+
+
+def _bind_playback_tree(toolbar: "ActionContext", pb) -> None:
+    """Bias the shared clock toward the tree of the plot whose button was clicked,
+    so the RIGHT movie plays when several are open (falls back to a full scan)."""
+    tree = getattr(getattr(toolbar, "plot", None), "signal_tree", None)
+    if tree is not None:
+        pb.set_preferred_tree(tree)
+
+
+def play_pause(toolbar: "ActionContext", toggled=None, *args, **kwargs):
+    """Toggle real-time movie playback: start the wall-clock frame clock (or pause
+    it). A plain on/off toggle — pressing Play while fast-forwarding PAUSES (Fast
+    Forward owns the speed cycle). Real-time pacing is derived from the time axis'
+    scale/units. Playback ALWAYS loops (wraps to frame 0 at the end)."""
+    session = _session_of(toolbar)
+    if session is None:
+        return
+    pb = session.playback
+    _bind_playback_tree(toolbar, pb)
+    if toggled is None:
+        pb.toggle(loop=True)
+    elif toggled:
+        pb.play(loop=True)
+    else:
+        pb.pause()
+
+
+def fast_forward(toolbar: "ActionContext", toggled=None, *args, **kwargs):
+    """Fast-forward = speed multiplier. Cycles 2x → 4x → 8x → back to 1x. Pressed
+    while stopped, starts playback at 2x; while playing, bumps the speed one notch
+    (staying at 1x after 8x)."""
+    session = _session_of(toolbar)
+    if session is None:
+        return
+    pb = session.playback
+    _bind_playback_tree(toolbar, pb)
+    if toggled is False:
+        pb.pause()
+    else:
+        pb.fast_forward(loop=True)
+
+
 def add_fft_selector(toolbar: "ActionContext", action_name="", *args, **kwargs):
     """Add an FFT selector: a RectangleSelector on the parent that computes the
     FFT of the selected region into a new plot window."""
@@ -149,3 +196,78 @@ class Rebin2DAction(TransformAction):
             raise RuntimeError("Current signal is not 2D, cannot rebin2d.")
         nav = signal.axes_manager.navigation_dimension
         return {"scale": [1] * nav + [int(scale_x), int(scale_y)]}
+
+
+# ── Crop ─────────────────────────────────────────────────────────────────────
+
+def _crop_signal(signal, x0=0, x1=0, y0=0, y1=0, t0=0, t1=0, **_):
+    """Crop a 2-D-signal dataset to a spatial (image) box and, for a movie /
+    navigated dataset, an optional leading-nav (time/first-nav-axis) range.
+
+    All slicing is by PIXEL INDEX via hyperspy ``isig`` / ``inav`` — a lazy dask
+    view (a graph op, no materialise), so a huge in-situ movie is trimmed to a
+    smaller lazy movie with no data read (memory-safety rule respected). Empty /
+    zero ranges mean "keep the full extent" on that axis, so a pure spatial crop
+    leaves the nav axis whole and vice-versa.
+
+    ``x0:x1`` / ``y0:y1`` are signal-axis (image column / row) pixel bounds;
+    ``t0:t1`` is the FIRST navigation axis in DISPLAY order — a movie's time axis
+    (nav-dim 1) or, on a 4-D scan, the fast (x) scan axis. An ``end`` of 0 (the
+    default) means "keep the full extent" on that axis, so a pure spatial crop
+    leaves the nav axis whole; if every bound is 0 the signal is returned
+    UNCHANGED (no redundant node).
+    """
+    am = signal.axes_manager
+    sig_shape = tuple(int(s) for s in am.signal_shape)   # (x, y) display order
+    nav_shape = tuple(int(s) for s in am.navigation_shape)
+
+    def _bounds(lo, hi, n):
+        # An `end` of 0 (or out of range) means "to the end". An inverted /
+        # degenerate box is clamped to a >=1-px slice rather than raising.
+        lo = int(lo or 0)
+        hi = int(hi or 0)
+        if hi <= 0 or hi > n:
+            hi = n
+        lo = max(0, min(lo, n - 1))
+        hi = max(lo + 1, min(hi, n))
+        return lo, hi
+
+    want_spatial = any(int(v or 0) for v in (x0, x1, y0, y1))
+    want_time = bool(int(t0 or 0) or int(t1 or 0))
+    if not want_spatial and not want_time:
+        return signal          # all-zero crop → no-op, don't add a redundant node
+
+    out = signal
+    if am.signal_dimension >= 2 and want_spatial:
+        sx0, sx1 = _bounds(x0, x1, sig_shape[0])
+        sy0, sy1 = _bounds(y0, y1, sig_shape[1])
+        # isig indexes signal axes in display (x, y) order → X=columns, Y=rows.
+        out = out.isig[sx0:sx1, sy0:sy1]
+    if am.navigation_dimension >= 1 and want_time:
+        nt0, nt1 = _bounds(t0, t1, nav_shape[0])
+        # inav indexes the FIRST navigation axis (display order): a movie's time
+        # axis, or a 4-D scan's fast (x) axis.
+        out = out.inav[nt0:nt1]
+    return out
+
+
+class CropAction(TransformAction):
+    """Crop the dataset to a spatial (image) box + optional time range — a
+    TransformAction that adds a lazy "Cropped" node to the SAME tree. Nothing is
+    materialised (isig/inav are dask-view slices), so a multi-GB movie crops for
+    free. Zero ranges keep the full extent on that axis."""
+
+    name = "Crop"
+    function = staticmethod(_crop_signal)
+    node_name = "Cropped"
+    parameters = {
+        "x0": {"default": 0},
+        "x1": {"default": 0},
+        "y0": {"default": 0},
+        "y1": {"default": 0},
+        "t0": {"default": 0},
+        "t1": {"default": 0},
+    }
+
+    def build_kwargs(self, signal, x0=0, x1=0, y0=0, y1=0, t0=0, t1=0, **_):
+        return {"x0": x0, "x1": x1, "y0": y0, "y1": y1, "t0": t0, "t1": t1}

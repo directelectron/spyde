@@ -275,6 +275,10 @@ def _do_compute_vectors(
     subpixel = bool(params.get("subpixel", True))
     dog_sigma1 = float(params.get("dog_sigma1", DEFAULT_DOG_SIGMA1))
     dog_sigma2 = float(params.get("dog_sigma2", DEFAULT_DOG_SIGMA2))
+    # Neural-method knobs: registry model id ("" → the registry default) and the
+    # calibrated local-norm high-pass scale (see find_vectors_neural).
+    model_id = str(params.get("model_id") or "").strip() or None
+    bg_sigma = float(params.get("bg_sigma") or 12.0)
     log.debug("[do_compute_vectors] START method=%s thr=%s md=%s sigma=%s "
               "nav_dim=%s sig_shape=%s lazy=%s beamstop=%s", method, threshold,
               min_dist, sigma, nav_dim, tuple(sig_shape),
@@ -401,6 +405,8 @@ def _do_compute_vectors(
         method=method,
         dog_sigma1=dog_sigma1,
         dog_sigma2=dog_sigma2,
+        model_id=model_id,
+        bg_sigma=bg_sigma,
     )
 
     # Resolve the distributed client up front — needed both to decide on GPU

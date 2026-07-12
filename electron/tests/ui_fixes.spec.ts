@@ -64,7 +64,8 @@ test('2: minimize lists the window in the top bar; the chip restores it', async 
   const bar = page.getByTestId('minimized-bar')
   await expect(bar).toBeVisible()
   await shot('02-minimized.png')
-  await bar.locator('button').first().click()
+  // Minimized chips are breadcrumb Pills (min-chip-<id>), not <button>s.
+  await bar.locator('[data-testid^="min-chip-"]').first().click()
   await expect(dpWindow()).toBeVisible()
   await expect(page.getByTestId('minimized-bar')).toHaveCount(0)
 })

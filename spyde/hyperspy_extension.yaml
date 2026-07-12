@@ -17,3 +17,15 @@ signals:
     dtype: real
     lazy: False
     module: spyde.signals.dense_diffraction_vectors
+  InSitu:
+    signal_type: insitu
+    signal_dimension: 2
+    dtype: real
+    lazy: False
+    module: spyde.signals.insitu
+  LazyInSitu:
+    signal_type: insitu
+    signal_dimension: 2
+    dtype: real
+    lazy: True
+    module: spyde.signals.insitu

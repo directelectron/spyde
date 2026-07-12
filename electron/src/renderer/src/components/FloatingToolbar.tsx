@@ -232,22 +232,37 @@ export function FloatingToolbar({
         transition: 'opacity 140ms ease',
       }}
     >
-      {shown.map(a => (
-        <button
-          key={a.name}
-          title={a.name}
-          data-testid={`action-btn-${a.name}`}
-          className="spyde-tb-btn"
-          style={(openName === a.name || live.has(a.name)
-            || (state.subItems.get(windowId)?.get(a.name)?.length ?? 0) > 0)
-            ? styles.btnActive : undefined}
-          onClick={() => click(a)}
-        >
-          {a.icon && a.icon.endsWith('.svg')
-            ? <img src={fileUrl(a.icon)} width={18} height={18} alt={a.name} />
-            : <span style={{ fontSize: 10 }}>{a.name.slice(0, 4)}</span>}
-        </button>
-      ))}
+      {shown.map(a => {
+        // Movie playback reflects the session-wide clock (playback_state), NOT
+        // the per-window activeActions set: the Play button stays lit while the
+        // clock runs and un-lights when playback auto-stops at the movie end.
+        const pb = state.playback
+        const playbackActive = a.name === 'Play' && pb.playing
+        const ffSpeed = a.name === 'Fast Forward' && pb.playing && pb.speed > 1
+          ? pb.speed : 0
+        const active = openName === a.name || live.has(a.name)
+          || (state.subItems.get(windowId)?.get(a.name)?.length ?? 0) > 0
+          || playbackActive
+        return (
+          <button
+            key={a.name}
+            title={a.name}
+            data-testid={`action-btn-${a.name}`}
+            className="spyde-tb-btn"
+            style={{ ...(active ? styles.btnActive : {}), position: 'relative' }}
+            onClick={() => click(a)}
+          >
+            {a.icon && a.icon.endsWith('.svg')
+              ? <img src={fileUrl(a.icon)} width={18} height={18} alt={a.name} />
+              : <span style={{ fontSize: 10 }}>{a.name.slice(0, 4)}</span>}
+            {ffSpeed > 0 && (
+              <span data-testid="playback-speed-badge" style={styles.speedBadge}>
+                {ffSpeed}x
+              </span>
+            )}
+          </button>
+        )
+      })}
 
       {/* Static wrapper (no box of its own) — lets the placement effect measure
           the open caret without affecting its absolute positioning. */}
@@ -586,6 +601,13 @@ const styles: Record<string, React.CSSProperties> = {
     background: '#89b4fa', color: '#11111b',
     border: 'none', cursor: 'pointer', width: 30, height: 30, borderRadius: 6,
     display: 'flex', alignItems: 'center', justifyContent: 'center',
+  },
+  // Small "×N" corner badge on the Fast Forward button while speed > 1.
+  speedBadge: {
+    position: 'absolute', bottom: -3, right: -3,
+    background: '#f38ba8', color: '#11111b',
+    fontSize: 8, fontWeight: 700, lineHeight: 1,
+    padding: '1px 3px', borderRadius: 6, pointerEvents: 'none',
   },
   subBar: { ...subBase, top: '100%', marginTop: 10, animation: 'spyde-pop 130ms ease-out' },
   subBarUp: { ...subBase, bottom: '100%', marginBottom: 10, animation: 'spyde-pop-up 130ms ease-out' },

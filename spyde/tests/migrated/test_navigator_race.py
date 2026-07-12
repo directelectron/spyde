@@ -31,6 +31,12 @@ class _RecorderChild:
     def update_data(self, data):
         self.current_data = data
 
+    def enqueue_paint(self, data):
+        # The dispatcher now paints off-thread via the newest-wins painter; the
+        # real Plot.enqueue_paint sets current_data immediately (then the painter
+        # repaints). Mirror that immediate set so latest-wins is observable here.
+        self.current_data = data
+
 
 class _PositionSelector(BaseSelector):
     """A selector whose 'position' the test drives directly."""

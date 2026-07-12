@@ -103,14 +103,21 @@ class VirtualImageAction(RegionAction):
             # reads the whole dataset. Cancel the previous (now superseded) compute
             # before submitting the new one so the cluster isn't clogged.
             prev = getattr(self, "_prev_vi_future", None)
+            tree = self.signal_tree
             if prev is not None:
                 try:
                     if not prev.done():
                         prev.cancel()
                 except Exception as e:
                     log.debug("cancelling prior VI future failed: %s", e)
+                if tree is not None and hasattr(tree, "unregister_cancel"):
+                    tree.unregister_cancel(future=prev)
             fut = client.compute(vi)
             self._prev_vi_future = fut
+            # Register on the tree so closing it mid-fill cancels this VI compute
+            # (dragging the ROI supersedes+unregisters the prior one above).
+            if tree is not None and hasattr(tree, "register_cancel"):
+                tree.register_cancel(future=fut)
             return fut
         if hasattr(vi, "compute"):
             return vi.compute()

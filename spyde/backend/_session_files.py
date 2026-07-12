@@ -152,20 +152,34 @@ class FileLoaderMixin:
             log.exception("dense-vectors load failed for %s", path)
             return True   # we recognised it; don't fall through to image open
 
-    @staticmethod
-    def _signal_spanning_chunks(sig, nav_chunk: int = 32):
+    # Target bytes per chunk for whole-signal-frame chunking. ~64 MB keeps a
+    # single-frame read cheap without a per-chunk explosion: a 128x128 uint16 DP
+    # (32 KB) packs ~2000 frames/chunk (capped at NAV_CHUNK_MAX below), while an
+    # 8k x 8k uint8/float frame (64-256 MB) forces exactly ONE frame per chunk.
+    _CHUNK_TARGET_BYTES = 64 << 20  # 64 MB
+    _NAV_CHUNK_MAX = 32             # never span more than this many nav positions
+
+    @classmethod
+    def _signal_spanning_chunks(cls, sig, nav_chunk: "int | None" = None):
         """Chunks for a lazy 2-D-signal dataset where each chunk holds WHOLE
         signal frames (``-1`` on the signal axes) and a small contiguous nav
         block.  Returns a ``chunks`` tuple to re-load with, or None if the
-        dataset isn't a navigated 2-D-signal or its signal axes are already
-        whole.
+        dataset isn't a navigated 2-D-signal or its chunking is already fine.
 
         Why: RosettaSciIO auto-chunks a 4-D MRC as a balanced cube (e.g.
         (90,90,90,90)) that SPLITS the signal axes — so reading one diffraction
         pattern ``data[iy,ix]`` pulls a 131 MB chunk spanning 90x90 nav
         positions and partial frames.  Whole-signal chunks make single-frame
         navigator access read one contiguous chunk, and the navigator sum is
-        uniform across chunk boundaries."""
+        uniform across chunk boundaries.
+
+        The nav-block size is **adapted to the frame byte size** so a chunk stays
+        near ``_CHUNK_TARGET_BYTES`` regardless of frame resolution. The old flat
+        ``nav_chunk=32`` was tuned for 128-256 px DP frames; for an in-situ movie
+        of 8k x 8k images it would make a 512 MB chunk (32 x 64 MB) and read half
+        a gigabyte to show one frame — see benchmarks.md "movie playback". Now a
+        big frame gets 1 frame/chunk, a small DP many. Pass ``nav_chunk`` to force
+        a value (tests)."""
         try:
             am = sig.axes_manager
             nav_dim = am.navigation_dimension
@@ -173,10 +187,34 @@ class FileLoaderMixin:
             data = sig.data
             if sig_dim != 2 or nav_dim < 1 or not hasattr(data, "chunks"):
                 return None
-            # Signal axes already whole (one chunk each)? nothing to do.
+
+            # Frame byte size drives the adaptive nav-block target.
+            sig_shape = data.shape[nav_dim:]
+            frame_bytes = int(np.prod(sig_shape)) * data.dtype.itemsize
+            if nav_chunk is None:
+                target = max(1, cls._CHUNK_TARGET_BYTES // max(1, frame_bytes))
+                nav_chunk = int(min(cls._NAV_CHUNK_MAX, target))
+                # A MOVIE time navigator reads ONE frame per move and jumps around
+                # in time, so packing several frames per chunk (e.g. 4 for a 16 MB
+                # frame → a 64 MB read to show 1 frame) is wasted I/O — each move
+                # crosses a chunk. Force 1 frame/chunk for a movie so a scrub reads
+                # exactly the frame it shows. (A 4D-STEM DP navigator dwells within
+                # a chunk, so there the multi-frame pack is a genuine cache win.)
+                if cls._is_movie_time_axis(sig):
+                    nav_chunk = 1
+
             sig_chunks = data.chunks[nav_dim:]
-            if all(len(c) == 1 for c in sig_chunks):
+            sig_whole = all(len(c) == 1 for c in sig_chunks)
+            # Current nav-block size (frames per chunk on the fastest-varying nav
+            # axis the reader split); used to decide if a re-chunk is warranted.
+            cur_nav0 = data.chunks[0][0] if data.chunks and data.chunks[0] else 1
+
+            # If the signal axes are ALREADY whole AND the reader's nav block is
+            # no bigger than our target, the chunking is fine — don't rebuild the
+            # graph for nothing (the common self-describing / already-good case).
+            if sig_whole and cur_nav0 <= nav_chunk:
                 return None
+
             nav_shape = data.shape[:nav_dim]
             nav = tuple(min(nav_chunk, int(n)) for n in nav_shape)
             return nav + (-1,) * sig_dim
@@ -231,6 +269,7 @@ class FileLoaderMixin:
                 self._prompt_nav_shape(signal[0], path)
                 return
             for sig in signal:
+                self._maybe_set_insitu_signal_type(sig)
                 self._add_signal(sig, source_path=path)
             self._add_recent(path)
             ipc.emit({"type": "recent_files", "paths": self._recent_files[:20]})
@@ -245,17 +284,84 @@ class FileLoaderMixin:
         the scan-shape prompt (for ambiguous raw .mrc/.tif) should be skipped."""
         return _path_ext(path) in (".zspy", ".zarr", ".hspy")
 
-    @staticmethod
-    def _wants_nav_prompt(sig: BaseSignal) -> bool:
+    # Axis names identifying a MOVIE / sequential-stack leading axis (NOT a
+    # foldable spatial scan): a TIME axis (DE-MRC non-scanning movies →
+    # name="time", units="sec") OR a generic stack index (name "z"/"index"/
+    # "stack"/"frame"/"slice", which DE movies use). For any of these, folding
+    # the stack into a 2-D scan grid or stamping a spatial nm step is wrong.
+    _TIME_AXIS_NAMES = ("time", "t", "frame", "frames", "z", "index", "stack",
+                        "slice", "image", "images")
+    _TIME_AXIS_UNITS = ("s", "sec", "secs", "second", "seconds", "ms",
+                        "millisecond", "milliseconds", "us", "µs", "min", "minute")
+    # A movie frame is a real IMAGE; a raw 4D-STEM DP stack has small detector
+    # frames. Frames at least this size (either axis) are treated as movie images
+    # even if the axis name is uninformative — a fold-to-grid prompt on a
+    # 2048²+ "diffraction pattern" is never what the user wants.
+    _MOVIE_MIN_FRAME_PX = 1024
+
+    @classmethod
+    def _is_movie_time_axis(cls, sig: BaseSignal) -> bool:
+        """True when the dataset is an in-situ MOVIE / image stack: nav-dim 1 with
+        2-D image frames, whose single navigation axis is a time/stack axis (by
+        name or units) OR whose frames are large images (≥ _MOVIE_MIN_FRAME_PX).
+        Such a dataset opens straight as a movie — NOT folded into a 2-D scan grid,
+        and NOT given a spatial step on its sequence axis (the prompt does both)."""
+        try:
+            am = sig.axes_manager
+            if am.signal_dimension != 2 or am.navigation_dimension != 1:
+                return False
+            ax = am.navigation_axes[0]
+            name = str(getattr(ax, "name", "") or "").strip().lower()
+            units = str(getattr(ax, "units", "") or "").strip().lower()
+            if units in ("<undefined>",):
+                units = ""
+            if name in cls._TIME_AXIS_NAMES or units in cls._TIME_AXIS_UNITS:
+                return True
+            # Large image frames → a movie regardless of the (uninformative) name.
+            sh = tuple(int(s) for s in am.signal_shape)
+            return bool(sh) and max(sh) >= cls._MOVIE_MIN_FRAME_PX
+        except Exception:
+            return False
+
+    @classmethod
+    def _wants_nav_prompt(cls, sig: BaseSignal) -> bool:
         """True for a signal where confirming the scan shape + step size is
         useful: a 2-D-signal dataset that is either already navigated (4D-STEM)
         or a flat stack of images (nav-dim 1) that the user may want to fold into
-        a 2-D scan grid."""
+        a 2-D scan grid.
+
+        A calibrated in-situ MOVIE (nav-dim 1, time axis) is EXCLUDED — it opens
+        straight as a movie with its time navigator, no fold-to-grid prompt (which
+        would otherwise stamp a spatial nm step on the time axis)."""
         try:
             am = sig.axes_manager
-            return am.signal_dimension == 2 and am.navigation_dimension >= 1
+            if not (am.signal_dimension == 2 and am.navigation_dimension >= 1):
+                return False
+            if cls._is_movie_time_axis(sig):
+                return False
+            return True
         except Exception:
             return False
+
+    @classmethod
+    def _maybe_set_insitu_signal_type(cls, sig: BaseSignal) -> None:
+        """Tag a freshly-loaded signal as ``insitu`` (see spyde.signals.insitu)
+        when it's recognised as an in-situ MOVIE by the same
+        ``_is_movie_time_axis`` check that already decides chunking + skips the
+        nav-shape prompt for it — this reuses that existing movie-detection
+        condition rather than inventing a new heuristic. Typing it drives the
+        Play/Fast Forward toolbar gate (spyde/toolbars.yaml ``signal_types:
+        [insitu]``). No-op (best-effort) if the signal already carries a more
+        specific signal_type someone set deliberately, or on any error."""
+        try:
+            if not cls._is_movie_time_axis(sig):
+                return
+            current = str(getattr(sig, "_signal_type", "") or "")
+            if current and current != "insitu":
+                return
+            sig.set_signal_type("insitu")
+        except Exception as e:
+            log.debug("auto-tagging in-situ movie signal_type failed: %s", e)
 
     def _prompt_nav_shape(self, sig: BaseSignal, path: str) -> None:
         """Stash the loaded (lazy) signal and ask the frontend to confirm the
@@ -478,7 +584,7 @@ class FileLoaderMixin:
             # 0,1,2,… (the user can rename/calibrate it in the Axes dock). Running
             # the single-file prompt here would also wrongly stamp the scan step
             # onto the stack axis (it calibrates every nav axis).
-            self._add_signal(new, source_path=paths[0])
+            self._add_signal(new, source_path=paths[0], enable_nav_sidecar=False)
             emit_status(
                 f"Stacked {len(paths)} files → "
                 f"{tuple(new.axes_manager.navigation_shape)} nav "
@@ -532,6 +638,7 @@ class FileLoaderMixin:
                 return
             sig = self._load_example_lazy(loader)
             _apply_example_calibration(sig, name)
+            self._maybe_set_insitu_signal_type(sig)
             self._add_signal(sig, source_path=None)
         except Exception as e:
             import traceback

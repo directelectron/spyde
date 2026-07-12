@@ -6,6 +6,8 @@
  */
 import { test, expect, _electron as electron, ElectronApplication, Page } from '@playwright/test'
 import { join } from 'path'
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const { sigWindow } = require('./_harness.cjs')
 
 let app: ElectronApplication
 let page: Page
@@ -33,7 +35,9 @@ test.beforeAll(async () => {
 test.afterAll(async () => { await app?.close() })
 
 test('lazy virtual image displays non-black (real Dask client)', async () => {
-  const sig = page.getByTestId('subwindow').filter({ hasNotText: 'Navigator' }).first()
+  // Breadcrumb-chip picker — the literal word "Navigator" is gone from titles,
+  // so hasNotText:'Navigator' matched BOTH windows and .first() grabbed the nav.
+  const sig = sigWindow(page)
   await sig.getByTestId('subwindow-title').click()
   await sig.getByTestId('subwindow-titlebar').hover()   // toolbar reveals on hover
   await sig.getByTestId('action-btn-Virtual Imaging').click()

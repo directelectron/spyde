@@ -108,6 +108,18 @@ class Session(
         # poll thread only detects done futures + reads shm; plot.update()/push
         # runs on the main thread, like the Qt app's queued plot_ready slot.
         self._main_loop = None
+        # Lazily-built ComputeBackend for the EXPENSIVE-tier navigator read (large
+        # region / cold cross-chunk / derived rebin-crop view): submit_graph gives
+        # a cancellable async read so an expensive frame never blocks the serial
+        # nav dispatcher. Threaded (no-cluster) mode gets its own small pool so
+        # nav reads don't queue behind other pool work; distributed mode uses the
+        # live client. Rebuilt when the client identity changes. See compute_backend.
+        self._compute_backend = None
+        self._compute_backend_client = None   # identity of the client the cached backend wraps
+        self._nav_executor = None             # ThreadPoolExecutor, created lazily in no-cluster mode
+        # Set by shutdown() so a nav update still draining on the process-global
+        # dispatcher thread can't recreate the nav executor after teardown.
+        self._closed = False
         self._plot_worker = PlotUpdateWorker(
             get_plots_callable=lambda: list(self._plots),
             interval_ms=5,
@@ -182,6 +194,39 @@ class Session(
                 log.debug("dispatch_to_main failed, running inline: %s", e)
         fn()
 
+    @property
+    def compute_backend(self):
+        """A ComputeBackend for the EXPENSIVE-tier navigator read (submit_graph).
+
+        Distributed when a Dask client exists (already async + cancellable via the
+        adapter); otherwise a small dedicated ThreadPoolExecutor so an expensive
+        nav frame computes off the serial dispatcher thread and a superseded one
+        can be cancelled while queued. Cached and rebuilt only when the client
+        identity changes (client appears once the cluster is ready, or disappears
+        on shutdown) — so the same backend is reused across scrubbing.
+
+        Returns None once the session is shut down: the process-global nav
+        dispatcher (and its settle timers) can still fire a queued update after
+        teardown, and we must NOT lazily spawn a fresh executor then (it would leak
+        and defeat shutdown's cleanup). A None here makes _submit_async_nav_read
+        fall through to the synchronous read, which is always correct."""
+        if self._closed:
+            return None
+        from spyde.compute_backend import ComputeBackend
+        client = self.dask_manager.client if self.dask_manager is not None else None
+        if client is not self._compute_backend_client or self._compute_backend is None:
+            if client is not None:
+                self._compute_backend = ComputeBackend(client=client)
+            else:
+                if self._nav_executor is None:
+                    from concurrent.futures import ThreadPoolExecutor
+                    self._nav_executor = ThreadPoolExecutor(
+                        max_workers=2, thread_name_prefix="nav-read"
+                    )
+                self._compute_backend = ComputeBackend(executor=self._nav_executor)
+            self._compute_backend_client = client
+        return self._compute_backend
+
     def _on_dask_ready(self) -> None:
         self._dask_ready.set()           # release any load waiting on the cluster
         emit_status("Dask cluster ready")
@@ -196,6 +241,7 @@ class Session(
         source_path: str | None = None,
         navigator_override: BaseSignal | None = None,
         selector_type=None,
+        enable_nav_sidecar: bool = True,
     ):
         """Create a signal tree + plots for a loaded signal. Returns the tree.
 
@@ -213,21 +259,41 @@ class Session(
         from spyde.drawing.plots.plot import Plot
 
         client = self.dask_manager.client
+        # Only a real on-disk origin enables the navigator sidecar cache
+        # (test/example loaders pass pseudo-paths like "test_data"; a STACK's
+        # navigator depends on every member, not just paths[0] → disabled).
+        disk_path = (source_path if enable_nav_sidecar and source_path
+                     and os.path.exists(source_path) else None)
+
+        # Resolve the dataset name and stamp it onto the signal BEFORE building the
+        # tree — the tree's constructor (_initialize_initial_plots) creates the
+        # plots and emits their `figure` messages, whose `title` field (the window
+        # header + breadcrumb Name) and in-panel title strip both read
+        # General.title. Stamping after would leave the header at the "Signal"/
+        # "Navigator" fallback even though we know the filename.
+        title = signal.metadata.get_item("General.title", default=None)
+        # hyperspy may return an empty string or a `<undefined>` sentinel for an
+        # unset title, not None — treat any of those as "no title".
+        if (title is None or str(title).strip() in ("", "<undefined>")) and source_path:
+            title = os.path.splitext(os.path.basename(source_path))[0]
+            if title:
+                try:
+                    signal.metadata.set_item("General.title", title)
+                except Exception as e:
+                    log.debug("stamping General.title failed: %s", e)
+
         tree = BaseSignalTree(
             root_signal=signal,
             session=self,
             distributed_client=client,
             selector_type=selector_type,
             navigator_override=navigator_override,
+            source_path=disk_path,
         )
         self.signal_trees.append(tree)
 
         # Open the MDI windows for this tree
         tree.open()
-
-        title = signal.metadata.get_item("General.title", default=None)
-        if title is None and source_path:
-            title = os.path.splitext(os.path.basename(source_path))[0]
 
         # Emit metadata + axes for the sidebar, tagged with this tree's windows.
         try:
@@ -257,7 +323,21 @@ class Session(
             log.warning("composition emit failed: %s", e)
 
         emit_status(f"Loaded: {title or 'Signal'}")
+        self._notify_console_trees_changed()
         return tree
+
+    def _notify_console_trees_changed(self) -> None:
+        """Refresh the math console's signal bindings after a tree is added /
+        closed. Only pokes the console if it has ALREADY been created — never
+        force-creates the engine (and its heavy hyperspy import) just because a
+        dataset loaded. The refresh is posted onto the console thread, so this is a
+        cheap non-blocking call safe to make from the main thread OR a load thread."""
+        con = getattr(self, "_console", None)
+        if con is not None:
+            try:
+                con.refresh_bindings()
+            except Exception as e:
+                log.debug("console binding refresh failed: %s", e)
 
     # Signal types offered in the sidebar dropdown (HyperSpy/pyxem). "" = the
     # generic BaseSignal/Signal2D with no specialised type.
@@ -550,7 +630,26 @@ class Session(
     # ── Shutdown ───────────────────────────────────────────────────────────────
 
     def shutdown(self) -> None:
+        pb = getattr(self, "_playback", None)
+        if pb is not None:
+            try:
+                pb.shutdown()
+            except Exception as e:
+                log.debug("playback shutdown failed: %s", e)
+        con = getattr(self, "_console", None)
+        if con is not None:
+            try:
+                con.shutdown()
+            except Exception as e:
+                log.debug("console shutdown failed: %s", e)
+        self._closed = True   # block compute_backend from recreating _nav_executor
         self._plot_worker.stop()
+        if self._nav_executor is not None:
+            try:
+                self._nav_executor.shutdown(wait=False, cancel_futures=True)
+            except Exception as e:
+                log.debug("nav executor shutdown failed: %s", e)
+            self._nav_executor = None
         self.dask_manager.shutdown()
         for tmpdir in self._example_temp_paths:
             try:

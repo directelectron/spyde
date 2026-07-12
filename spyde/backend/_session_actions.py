@@ -34,7 +34,9 @@ log = logging.getLogger(__name__)
 _TEST_ACTIONS_ENABLED = os.environ.get("SPYDE_PACKAGED") != "1"
 _TEST_ACTIONS = frozenset({
     "load_test_data", "load_test_data_lazy", "load_test_data_lazy_chunked",
-    "load_test_data_si_grains", "load_test_data_sped_ag", "test_nav_drag",
+    "load_test_data_si_grains", "load_test_data_sped_ag",
+    "load_test_data_movie", "test_nav_drag",
+    "test_region_scrub", "test_add_second_navigator",
     "load_test_vectors", "run_test_orientation", "dump_dask_state",
 })
 
@@ -71,6 +73,10 @@ class ActionRouterMixin:
             self._load_test_data_si_grains()
         elif action == "load_test_data_sped_ag":
             self._load_test_data_sped_ag()
+        elif action == "load_test_data_movie":
+            self._load_test_data_movie(payload)
+        elif action == "test_add_second_navigator":
+            self._test_add_second_navigator()
         elif action == "test_nav_drag":
             # Run on a BACKGROUND thread: the drag loop sleeps/polls, and if it ran
             # on the main asyncio thread it would block loop.call_soon_threadsafe —
@@ -78,6 +84,11 @@ class ActionRouterMixin:
             threading.Thread(
                 target=self._test_nav_drag, args=(payload.get("targets") or [],),
                 daemon=True, name="test-nav-drag",
+            ).start()
+        elif action == "test_region_scrub":
+            threading.Thread(
+                target=self._test_region_scrub, args=(payload,),
+                daemon=True, name="test-region-scrub",
             ).start()
         elif action == "load_test_vectors":
             self._load_test_vectors()
@@ -109,6 +120,8 @@ class ActionRouterMixin:
             self._select_signal_node(plot, payload.get("signal_id"))
         elif action == "set_axis":
             self._set_axis(plot, payload)
+        elif action == "set_title":
+            self._set_title(plot, payload)
         elif action == "set_offset_crosshair":
             self._set_offset_crosshair(plot, payload)
         elif action == "set_overlay":
@@ -126,6 +139,33 @@ class ActionRouterMixin:
             self.open_stack(payload.get("paths") or [])
         elif action == "confirm_nav_shape":
             self._confirm_nav_shape(payload)
+        elif action == "playback":
+            self._handle_playback(payload)
+        elif action == "console_exec":
+            self.console.submit_exec(
+                str(payload.get("code", "")), int(payload.get("exec_id", 0))
+            )
+        elif action == "console_create_window":
+            self.console.create_window(str(payload.get("name", "")))
+        elif action == "console_bind_node":
+            self.console.bind_node(plot, payload.get("signal_id"))
+        elif action == "console_bind_window":
+            # Ensure the console exists + is bound to this window's tree, then
+            # re-emit console_vars so the renderer can resolve the dropped
+            # window → its variable name (a signal-pill drop before the console
+            # was ever opened would otherwise find no bindings).
+            self.console.refresh_bindings()
+        elif action == "console_preview":
+            self.console.submit_preview(
+                str(payload.get("code", "")), int(payload.get("preview_id", 0)),
+                bool(payload.get("auto", True)),
+            )
+        elif action == "console_complete":
+            self.console.submit_complete(
+                str(payload.get("prefix", "")), int(payload.get("complete_id", 0))
+            )
+        elif action == "console_remove_var":
+            self.console.remove_var(str(payload.get("name", "")))
         elif action == "set_signal_type":
             self._set_signal_type(plot, payload.get("signal_type", ""))
         elif action == "load_example":
@@ -310,6 +350,73 @@ class ActionRouterMixin:
             src._vi_items = [it for it in src._vi_items if it.get("name") != name]
         ipc.emit({"type": "sub_item", "window_id": window_id,
                   "action": parent, "name": name, "active": False})
+
+    @property
+    def playback(self):
+        """Lazily-created movie playback controller (one per session)."""
+        pb = getattr(self, "_playback", None)
+        if pb is None:
+            from spyde.actions.playback import MoviePlaybackController
+            pb = MoviePlaybackController(self)
+            self._playback = pb
+        return pb
+
+    @property
+    def console(self):
+        """Lazily-created math-console execution engine (one per session).
+
+        Owns the persistent namespace + result registry and runs user cells on a
+        dedicated daemon thread (see spyde.backend.console). Created on first use
+        so an idle session pays nothing; shut down in Session.shutdown()."""
+        con = getattr(self, "_console", None)
+        if con is None:
+            from spyde.backend.console import ConsoleSession
+            con = ConsoleSession(self)
+            self._console = con
+        return con
+
+    def _handle_playback(self, payload: dict) -> None:
+        """Play / pause / fast-forward the movie time navigator. Commands:
+        ``play`` / ``pause`` / ``toggle`` (real-time on/off) / ``fast_forward``
+        (speed cycle 2→4→8→1) / ``step`` (single frame) / ``set_speed`` /
+        ``set_loop``. Playback is real-time (paced from the time axis), so there is
+        no ``fps``/``step`` speed control any more — ``speed`` is a 1/2/4/8x
+        multiplier and ``loop`` wraps at the end."""
+        cmd = payload.get("command", "toggle")
+        pb = self.playback
+        speed = payload.get("speed")
+        step = payload.get("step")
+        # Playback always loops (the UI Loop toggle was removed); honour an
+        # explicit loop value if a caller still passes one, else default to True.
+        loop = payload.get("loop")
+        if loop is None:
+            loop = True
+        if cmd == "play":
+            pb.play(speed=speed, loop=loop)
+        elif cmd == "pause":
+            pb.pause()
+        elif cmd == "toggle":
+            pb.toggle(**({"speed": speed} if speed is not None else {}), loop=loop)
+        elif cmd == "fast_forward":
+            pb.fast_forward(loop=loop)
+        elif cmd == "step":
+            self._playback_single_step(int(step or 1))
+        elif cmd == "set_speed" and speed is not None:
+            pb.set_speed(speed)
+        elif cmd == "set_loop" and loop is not None:
+            pb.set_loop(loop)
+
+    def _playback_single_step(self, delta: int) -> None:
+        """Advance the time navigator by ``delta`` frames once (keyboard step)."""
+        pb = self.playback
+        sel, _tree = pb._time_selector()
+        if sel is None:
+            return
+        try:
+            sel.translate_pixels(int(delta))
+            sel.delayed_update_data(force=True)
+        except Exception as e:
+            log.debug("playback single-step failed: %s", e)
 
     def _update_vi(self, window_id: int, name: str, params: dict) -> None:
         """A per-VI caret edit — apply new detector params and recompute that

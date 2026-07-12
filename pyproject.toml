@@ -31,7 +31,7 @@ dependencies = [
     "imageio-ffmpeg",
     "imagecodecs",
     "psygnal>=0.10.0",
-    "anyplotlib>=0.1.0",
+    "anyplotlib>=0.2.0",
     "pyyaml",
     # GPU-accelerated batched compute (vector orientation mapping, etc.).
     "torch",
@@ -62,6 +62,29 @@ extra-index-url = []
 # `uv pip install --torch-backend=auto` flag is the manual equivalent.)
 torch-backend = "auto"
 
+# Explicit PyTorch CUDA wheel index. torch-backend="auto" wasn't selecting CUDA at
+# LOCK time on this box (it fell back to the CPU PyPI wheel), so pin torch's source to
+# the CUDA index directly — this survives `uv run`'s re-sync. cu124 wheels still ship
+# sm_61 (Pascal / TITAN X), so the GPU tile backend works on this dev machine.
+# The index is win32-only: it publishes no macOS wheels (CI mac runners must fall
+# back to the default PyPI torch), and Linux CI keeps the PyPI wheel it always had.
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu124", marker = "sys_platform == 'win32'" },
+]
+# anyplotlib is co-developed in the sibling checkout but resolved from PyPI
+# (releases track this repo's needs). While an unreleased anyplotlib feature is
+# in flight, pin a git sha in [project.dependencies] (the hyperspy/rosettasciio
+# pattern). When actively editing anyplotlib locally, temporarily re-add the
+# editable path override below (do NOT commit it — the path doesn't exist on CI
+# runners and breaks `uv sync --frozen`):
+# anyplotlib = { path = "../anyplotlib", editable = true }
+
 [tool.pycrucible]
 entrypoint = "main.py"
 
@@ -74,6 +97,8 @@ include = [
     "spyde/**/*.ico",
     "spyde/**/*.icns",
     "spyde/**/*.svg",
+    "spyde/models/weights/*.pt",
+    "spyde/models/weights/registry.json",
 ]
 exclude = [
     ".venv/**/*",
@@ -105,6 +130,8 @@ spyde = [
     "*.icns",
     "*.svg",
     "drawing/toolbars/icons/*.svg",
+    "models/weights/*.pt",
+    "models/weights/registry.json",
 ]
 
 [project.optional-dependencies]

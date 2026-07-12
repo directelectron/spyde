@@ -15,6 +15,8 @@
  */
 import { test, expect, _electron as electron, ElectronApplication, Page, Frame } from '@playwright/test'
 import { join } from 'path'
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const { titlebarGrabPoint } = require('./_harness.cjs')
 
 let app: ElectronApplication
 let page: Page
@@ -44,7 +46,7 @@ async function frameForWindow(isNav: boolean): Promise<{ frame: Frame; box: { x:
   const n = await subs.count()
   for (let i = 0; i < n; i++) {
     const title = (await subs.nth(i).getByTestId('subwindow-title').textContent()) || ''
-    const matches = /navigator/i.test(title)
+    const matches = /^N-/.test(title)
     if (matches === isNav) {
       const handle = await subs.nth(i).locator('iframe').elementHandle()
       const frame = await handle!.contentFrame()
@@ -91,7 +93,7 @@ async function figIdForWindow(isNav: boolean): Promise<string> {
   const n = await subs.count()
   for (let i = 0; i < n; i++) {
     const title = (await subs.nth(i).getByTestId('subwindow-title').textContent()) || ''
-    if (/navigator/i.test(title) === isNav) {
+    if (/^N-/.test(title) === isNav) {
       const tid = await subs.nth(i).locator('iframe').getAttribute('data-testid')
       return (tid || '').replace('figure-', '')
     }
@@ -178,27 +180,28 @@ test('a pointer_move (not just release) updates the signal live', async () => {
   expect(b, 'pointer_move did not update the signal live').not.toEqual(a)
 })
 
-// Locate a real subwindow (navigator) by title.
+// Locate a real subwindow (navigator) by its breadcrumb chip — the literal
+// word "Navigator" is GONE from titles (breadcrumb pills show "N-<name>").
 function navSubwindow() {
-  return page.getByTestId('subwindow').filter({ has: page.getByText('Navigator', { exact: false }) }).first()
+  return page.getByTestId('subwindow')
+    .filter({ has: page.getByTestId('window-breadcrumb').filter({ hasText: /^N-/ }) })
+    .first()
 }
 
 test('a REAL figure window drags by its title bar (drag crosses the iframe)', async () => {
   const sub = navSubwindow()
   await expect(sub).toBeVisible()
   const before = await sub.boundingBox()
-  const bar = sub.getByTestId('subwindow-titlebar')
-  const bb = await bar.boundingBox()
+  // Grab RIGHT of the breadcrumb pill — the pill is an HTML5 drag source that
+  // stops pointerdown, so grabbing it starts a DnD payload, not a window move.
+  const grab = await titlebarGrabPoint(sub)
 
   // Drag the title bar DOWN-RIGHT — the path crosses over the anyplotlib iframe,
   // whose canvas does setPointerCapture and would otherwise steal the drag.
-  await page.mouse.move(bb!.x + bb!.width / 2, bb!.y + bb!.height / 2)
+  await page.mouse.move(grab.x, grab.y)
   await page.mouse.down()
   for (let s = 1; s <= 10; s++) {
-    await page.mouse.move(
-      bb!.x + bb!.width / 2 + 14 * s,
-      bb!.y + bb!.height / 2 + 12 * s,
-    )
+    await page.mouse.move(grab.x + 14 * s, grab.y + 12 * s)
     await page.waitForTimeout(15)
   }
   await page.mouse.up()
@@ -254,11 +257,12 @@ test('drag shield covers the iframe on mousedown (prevents native pointer captur
   // the title bar is pressed — BEFORE any movement — a shield is raised that
   // fully covers the iframe, so no native pointer event can reach it.
   const sub = navSubwindow()
-  const bar = sub.getByTestId('subwindow-titlebar')
-  const bb = await bar.boundingBox()
   const iframeBox = await sub.locator('iframe').first().boundingBox()
+  // Grab right of the pill — its pointerdown stopPropagation would otherwise
+  // keep onTitleDown (which raises the shield) from ever firing.
+  const grab = await titlebarGrabPoint(sub)
 
-  await page.mouse.move(bb!.x + bb!.width / 2, bb!.y + bb!.height / 2)
+  await page.mouse.move(grab.x, grab.y)
   await page.mouse.down()
   try {
     const shield = sub.getByTestId('drag-shield')
@@ -298,7 +302,7 @@ test('Virtual Imaging: Add (real backend) creates a VI + lists a colored chip', 
   // on the signal window, click "Add Virtual Image" → a new VI output window opens
   // AND a colour-coded chip appears in the sub-toolbar (the wired-up multi-VI).
   const sig = page.getByTestId('subwindow')
-    .filter({ hasNotText: 'Navigator' }).first()
+    .filter({ has: page.getByTestId('window-breadcrumb').filter({ hasText: /^S-/ }) }).first()
   await sig.getByTestId('subwindow-title').click()   // raise it
   const before = await page.getByTestId('subwindow').count()
 

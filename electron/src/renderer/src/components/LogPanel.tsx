@@ -101,6 +101,19 @@ export function LogPanel({ open, onClose }: { open: boolean; onClose: () => void
   const onLevel = (e: React.ChangeEvent<HTMLSelectElement>) =>
     sendAction('set_log_level', { level: e.target.value })
 
+  // Per-frame update profiling: toggle the backend flag live (no restart / env
+  // var). When on, each navigator move logs [NAV-PROFILE] + [PAINT-PROFILE] lines
+  // (read/dtype/prefetch/lod/levels/transport ms) into this panel — filter on
+  // "PROFILE" or paste them to report where a slow update spends its time.
+  const [profiling, setProfiling] = useState(false)
+  const onToggleProfile = () => {
+    const next = !profiling
+    setProfiling(next)
+    sendAction('set_debug_flag', { name: 'nav_profile', value: next })
+    if (next) setQuery('PROFILE')          // auto-filter to the profile lines
+    else if (query === 'PROFILE') setQuery('')
+  }
+
   // Copy the visible log as plain text (tab-separated, one record per line).
   const [copied, setCopied] = useState(false)
   const onCopy = async () => {
@@ -152,6 +165,14 @@ export function LogPanel({ open, onClose }: { open: boolean; onClose: () => void
         >
           {LEVELS.map((l) => <option key={l} value={l}>{l}</option>)}
         </select>
+        <button
+          data-testid="log-profile"
+          style={{ ...styles.btn, ...(profiling ? styles.btnActive : null) }}
+          onClick={onToggleProfile}
+          title="Toggle per-frame navigator update timing (read / levels / transport ms per move)"
+        >
+          {profiling ? 'Profiling ●' : 'Profile'}
+        </button>
         <button
           data-testid="log-copy"
           style={styles.btn}
@@ -248,6 +269,9 @@ const styles: Record<string, React.CSSProperties> = {
   btn: {
     background: '#313244', border: 'none', color: '#cdd6f4',
     fontSize: 12, cursor: 'pointer', padding: '3px 10px', borderRadius: 4,
+  },
+  btnActive: {
+    background: '#89b4fa', color: '#11111b', fontWeight: 600,
   },
   iconBtn: {
     background: 'transparent', border: 'none', color: '#a6adc8',

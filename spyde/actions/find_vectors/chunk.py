@@ -19,6 +19,7 @@ from spyde.actions.find_vectors.detectors import (
     DEFAULT_DOG_SIGMA1,
     DEFAULT_DOG_SIGMA2,
     METHOD_DOG,
+    METHOD_NEURAL,
     METHOD_NXCORR,
     _find_vectors_single_frame,
     _find_vectors_single_frame_dog,
@@ -158,6 +159,8 @@ def _find_vectors_chunk(
     method: str = METHOD_NXCORR,
     dog_sigma1: float = DEFAULT_DOG_SIGMA1,
     dog_sigma2: float = DEFAULT_DOG_SIGMA2,
+    model_id=None,
+    bg_sigma: float = 12.0,
 ) -> np.ndarray:
     """
     Full pipeline for one ghost-padded nav chunk.
@@ -206,6 +209,19 @@ def _find_vectors_chunk(
             ghost_block, depth_px, nav_dim, sigma,
             dog_sigma1, dog_sigma2, threshold, min_dist, subpixel,
             beamstop_mask,
+        )
+
+    # ── Neural (SpotUNet) detector ────────────────────────────────────────────
+    # The adapter lives in find_vectors_neural (lazy import — it imports back
+    # from this package). Shares the same nav-blur + ghost-trim, then runs the
+    # net per frame (one batched torch forward pass per chunk when a GPU is
+    # available, per-frame CPU otherwise).
+    if str(method).lower() == METHOD_NEURAL:
+        from spyde.actions.find_vectors_neural import _find_vectors_chunk_neural
+        return _find_vectors_chunk_neural(
+            ghost_block, depth_px, nav_dim, sigma,
+            threshold, min_dist, subpixel, beamstop_mask,
+            model_id=model_id, bg_sigma=bg_sigma,
         )
 
     # ── Try GPU path ──────────────────────────────────────────────────────────

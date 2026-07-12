@@ -29,7 +29,7 @@ test.beforeAll(async () => {
 test.afterAll(async () => { await app?.close() })
 
 test('Center Zero Beam (Automatic) centres the beam and records a tree node', async () => {
-  const sig = page.getByTestId('subwindow').filter({ hasNotText: 'Navigator' }).first()
+  const sig = page.getByTestId('subwindow').filter({ has: page.getByTestId('window-breadcrumb').filter({ hasText: /^S-/ }) }).first()
   await sig.getByTestId('subwindow-titlebar').hover()
   await sig.getByTestId('action-btn-Center Zero Beam').click()
   await expect(page.getByTestId('center-zero-beam-wizard')).toBeVisible()

@@ -153,6 +153,11 @@ async def _main() -> None:
     # Warm the file-reader + pyxem imports too, so the FIRST file open isn't slow
     # (the "stuck on Reading…" until a second load — really first-call import lag).
     _prewarm_io()
+    # Warm torch + the CUDA context: the GPU tile backend (first large signal
+    # frame) otherwise pays the ~3 s import ON THE PAINTER THREAD — much worse
+    # while the navigator fill saturates the disk (black signal panel).
+    from spyde.backend.heavy_imports import prewarm_torch_cuda
+    prewarm_torch_cuda()
 
     emit({"type": "ready"})
 
@@ -170,6 +175,11 @@ async def _main() -> None:
                 _resize_figure(msg)
             elif msg_type == "quit":
                 break
+            elif "command" in msg:
+                # Math-console commands arrive as flat {"command": "console_*", …}
+                # (the console IPC contract), not wrapped in a "type":"action"
+                # envelope. Route them straight to the session's console handler.
+                _dispatch_console(session, msg)
             else:
                 log.warning("[backend] unknown message type: %s", msg_type)
         except Exception as e:
@@ -177,6 +187,31 @@ async def _main() -> None:
             emit_error(str(e))
 
     session.shutdown()
+
+
+def _dispatch_console(session, msg: dict) -> None:
+    """Route a flat console command ({"command": "console_exec"|"console_create_window"|
+    "console_complete", …}) to the session's console engine. The engine queues the
+    work on its own daemon thread, so this returns immediately (the asyncio loop is
+    never blocked on user code)."""
+    command = msg.get("command")
+    if command == "console_exec":
+        session.console.submit_exec(str(msg.get("code", "")), int(msg.get("exec_id", 0)))
+    elif command == "console_create_window":
+        session.console.create_window(str(msg.get("name", "")))
+    elif command == "console_preview":
+        session.console.submit_preview(
+            str(msg.get("code", "")), int(msg.get("preview_id", 0)),
+            bool(msg.get("auto", True)),
+        )
+    elif command == "console_complete":
+        session.console.submit_complete(
+            str(msg.get("prefix", "")), int(msg.get("complete_id", 0))
+        )
+    elif command == "console_remove_var":
+        session.console.remove_var(str(msg.get("name", "")))
+    else:
+        log.warning("[backend] unknown console command: %s", command)
 
 
 def _dispatch_figure_event(msg: dict) -> None:

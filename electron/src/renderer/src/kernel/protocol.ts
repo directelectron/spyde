@@ -81,11 +81,27 @@ export interface WindowClosedMessage extends MsgBase {
   window_id: number
 }
 
+/** A lightweight rename — updates the header [Name] of every listed window's
+ *  tree WITHOUT re-emitting the figure (no iframe reload). */
+export interface WindowTitleMessage extends MsgBase {
+  type: 'window_title'
+  window_ids?: number[]
+  title?: string
+}
+
 export interface StateUpdateMessage extends MsgBase {
   type: 'state_update'
   fig_id: string
   key: string
   value: unknown
+}
+
+export interface StateUpdateBinaryMessage extends MsgBase {
+  type: 'state_update_binary'
+  fig_id: string
+  key: string
+  header: Record<string, unknown>
+  buffer: Uint8Array
 }
 
 export interface CompositionMessage extends MsgBase {
@@ -181,6 +197,85 @@ export interface NavigatorOptionsMessage extends MsgBase {
   current?: string | null
 }
 
+export interface PlaybackStateMessage extends MsgBase {
+  type: 'playback_state'
+  /** True while the movie clock is running. */
+  playing: boolean
+  /** Current speed multiplier (1/2/4/8) — drives the Fast Forward "×N" badge. */
+  speed?: number
+  loop?: boolean
+}
+
+/** One entry of a `console_result`/`console_vars` value description. */
+export interface ConsoleVarKind {
+  name: string
+  kind?: string
+  shape?: number[] | null
+  dtype?: string | null
+  lazy?: boolean
+}
+
+export interface ConsoleResultMessage extends MsgBase {
+  type: 'console_result'
+  exec_id: number
+  ok: boolean
+  value_repr?: string | null
+  stdout?: string | null
+  error?: string | null
+  traceback?: string | null
+  duration_ms?: number
+  result?: ConsoleVarKind | null
+}
+
+/** One row of the console's live variable table (the result-chip strip). */
+export interface ConsoleVarEntry extends ConsoleVarKind {
+  source: 'signal' | 'assign' | 'out'
+  /** For source:"signal" entries — the MDI window(s) currently showing it, so
+   *  a dropped `SIGNAL_REF_DRAG_MIME` windowId can resolve to this var name. */
+  window_ids?: number[] | null
+}
+
+export interface ConsoleVarsMessage extends MsgBase {
+  type: 'console_vars'
+  vars: ConsoleVarEntry[]
+}
+
+export interface ConsoleCompletionsMessage extends MsgBase {
+  type: 'console_completions'
+  complete_id: number
+  matches: string[]
+}
+
+/**
+ * Live-preview reply for a `console_preview` request (the eye-toggled
+ * thumbnail/sparkline/scalar). `preview_id` echoes the requester's id so the
+ * renderer can drop stale replies (newest-wins). `kind` selects the render:
+ *   • image      — `data_b64` is raw uint8 GRAYSCALE, row-major, length w*h
+ *   • sparkline  — `points` (≤512; `null` = a gap in the line)
+ *   • scalar     — `text` (a short repr)
+ *   • unavailable— `reason` (may be "" → render quietly / keep prior content)
+ */
+export interface ConsolePreviewResultMessage extends MsgBase {
+  type: 'console_preview_result'
+  preview_id: number
+  kind: 'image' | 'sparkline' | 'scalar' | 'unavailable'
+  w?: number
+  h?: number
+  data_b64?: string
+  points?: (number | null)[]
+  text?: string
+  shape?: number[] | null
+  dtype?: string | null
+  reason?: string
+  elapsed_ms?: number
+}
+
+/** A workflow-node bind completed; the backend assigned it `name`. */
+export interface ConsoleNodeBoundMessage extends MsgBase {
+  type: 'console_node_bound'
+  name: string
+}
+
 export interface LogMessage extends MsgBase {
   type: 'log'
   level: unknown
@@ -210,6 +305,7 @@ export interface WizardEventMessage extends MsgBase {
     | 'vom_library_ready'
     | 'om_library_ready'
     | 'fv_auto_params'
+    | 'fv_models'
     | 'cod_results'
     | 'cod_cif_ready'
     | 'gpu_status_result'
@@ -225,7 +321,9 @@ export type PlotAppMessage =
   | ToolbarConfigMessage
   | WindowVisibilityMessage
   | WindowClosedMessage
+  | WindowTitleMessage
   | StateUpdateMessage
+  | StateUpdateBinaryMessage
   | CompositionMessage
   | MetadataMessage
   | AxesInfoMessage
@@ -238,6 +336,12 @@ export type PlotAppMessage =
   | SelectorInfoMessage
   | SignalTreeMessage
   | NavigatorOptionsMessage
+  | PlaybackStateMessage
+  | ConsoleResultMessage
+  | ConsoleVarsMessage
+  | ConsoleCompletionsMessage
+  | ConsolePreviewResultMessage
+  | ConsoleNodeBoundMessage
   | LogMessage
   | LogBackfillMessage
   | LogLevelMessage

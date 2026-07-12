@@ -42,7 +42,7 @@ test.beforeAll(async () => {
 test.afterAll(async () => { await app?.close() })
 
 test('staged wizard: Generate Library → Compute Map opens the IPF window (lazy, real Dask)', async () => {
-  const sig = page.getByTestId('subwindow').filter({ hasNotText: 'Navigator' }).first()
+  const sig = page.getByTestId('subwindow').filter({ has: page.getByTestId('window-breadcrumb').filter({ hasText: /^S-/ }) }).first()
   await sig.getByTestId('subwindow-titlebar').hover()             // reveal toolbar
   await sig.getByTestId('action-btn-Orientation Mapping').click()
   await expect(page.getByTestId('orientation-wizard')).toBeVisible()

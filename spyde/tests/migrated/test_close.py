@@ -86,3 +86,60 @@ class TestCloseWindow:
             m.get("type") == "window_closed" and m.get("window_id") == 9999
             for m in msgs
         )
+
+
+class _FakeFuture:
+    """A minimal cancel()-able stand-in for a dask Future."""
+    def __init__(self):
+        self.cancelled = False
+
+    def cancel(self):
+        self.cancelled = True
+
+
+class TestComputeCancellationRegistry:
+    """Closing a tree must STOP in-flight compute: flip every registered
+    stopped_flag and cancel every registered future (see SignalTree.close ->
+    _cancel_all_compute). Without this, Find Vectors / OM / VOM / nav / VI
+    compute keeps running on the cluster after the tree is gone."""
+
+    def _tree(self, session):
+        assert session.signal_trees, "expected an open tree"
+        return session.signal_trees[0]
+
+    def test_close_flips_registered_flag_and_cancels_future(self, stem_4d_dataset):
+        session = stem_4d_dataset["window"]
+        tree = self._tree(session)
+        flag = tree.register_cancel()          # creates a [False] token
+        fut = _FakeFuture()
+        tree.register_cancel(future=fut)
+        assert flag == [False] and not fut.cancelled
+
+        nav = _nav_wid(session)
+        session.dispatch_action({"action": "close_window", "window_id": nav})
+
+        assert flag[0] is True, "stopped_flag must be set on tree close"
+        assert fut.cancelled, "registered future must be cancelled on tree close"
+
+    def test_register_on_already_closed_tree_flips_immediately(self, stem_4d_dataset):
+        session = stem_4d_dataset["window"]
+        tree = self._tree(session)
+        nav = _nav_wid(session)
+        session.dispatch_action({"action": "close_window", "window_id": nav})
+        # A worker that registers AFTER the tree closed must not keep running.
+        flag = tree.register_cancel()
+        fut = _FakeFuture()
+        tree.register_cancel(future=fut)
+        assert flag[0] is True
+        assert fut.cancelled
+
+    def test_unregister_drops_from_registry(self, stem_4d_dataset):
+        session = stem_4d_dataset["window"]
+        tree = self._tree(session)
+        flag = tree.register_cancel()
+        tree.unregister_cancel(flag=flag)
+        # A finished compute's flag is gone, so close() won't flip it (proving
+        # the registry doesn't grow without bound across runs).
+        nav = _nav_wid(session)
+        session.dispatch_action({"action": "close_window", "window_id": nav})
+        assert flag[0] is False

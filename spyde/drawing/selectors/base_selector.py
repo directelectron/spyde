@@ -19,6 +19,14 @@ from spyde.drawing.selectors.utils import broadcast_rows_cartesian
 
 logger = logging.getLogger(__name__)
 
+# Hard cap on how far an INTEGRATING region (rectangle / 1-D span) may extend
+# along each navigation dimension. Clamped on the widget GEOMETRY (the ROI
+# visibly stops growing) so a region read can never accidentally integrate a
+# huge number of nav positions — the worst case is MAX_REGION_EXTENT_PER_DIM**k
+# frames for a k-dimensional region (16 for a span, 16*16=256 for a rectangle).
+# See selector1d.LinearRegionSelector / selector2d.RectangleSelector.
+MAX_REGION_EXTENT_PER_DIM = 16
+
 import os as _os
 # Per-frame navigator trace logs are gated behind this (they fire on every
 # crosshair move and flood the IPC log/panel at DEBUG, which adds real lag).
@@ -82,6 +90,15 @@ class _NavDispatcher:
 # One dispatcher for the whole process — the single serial lane all navigator
 # updates flow through (the Qt event-loop equivalent).
 _nav_dispatcher = _NavDispatcher()
+
+# Module-level hooks fired (no args, on the dispatcher thread) whenever ANY
+# selector commits a genuinely NEW position — the cross-cutting "navigation
+# changed" pub for listeners that aren't tied to one selector (the console's
+# live preview re-slices its expression at the new cursor). Unlike a selector's
+# per-instance ``index_hooks``, these need no registration per selector and are
+# NOT fired for force-only re-fires at an unchanged position (settle/contrast
+# repaints). Hooks must be cheap/non-blocking (enqueue, don't compute).
+NAV_CHANGE_HOOKS: list = []
 
 
 def event_handler_fn(method: Callable) -> Callable:
@@ -336,7 +353,10 @@ class BaseSelector:
         computes and paints. force=True bypasses the dup short-circuit in
         _run_update (an earlier move already committed current_indices here)."""
         self._settle_timer = None
-        _nav_dispatcher.submit(self, force=True)
+        # settle=True → the resting frame paints at FULL resolution (see
+        # _run_update / Plot._set_array two-tier LOD). force=True bypasses the
+        # dup short-circuit at this already-committed position.
+        _nav_dispatcher.submit(self, force=True, settle=True)
 
     def delayed_update_data(self, force: bool = False, update_contrast: bool = False) -> None:
         """Public entry point: queue an update on the single serial dispatcher.
@@ -347,7 +367,8 @@ class BaseSelector:
         for this selector replaces any still-queued one."""
         _nav_dispatcher.submit(self, force=force, update_contrast=update_contrast)
 
-    def _run_update(self, force: bool = False, update_contrast: bool = False) -> None:
+    def _run_update(self, force: bool = False, update_contrast: bool = False,
+                    settle: bool = False) -> None:
         """The actual update body — ALWAYS runs on the dispatcher thread, one at a
         time. Because nothing else can be running an update concurrently, the
         cache call inside ``fn`` is safe without a lock and the generation /
@@ -365,7 +386,8 @@ class BaseSelector:
         # end) so the duplicate skips here even if it runs back-to-back before the
         # body finishes. force=True bypasses (repaint after a signal/contrast
         # change at an unchanged position).
-        if np.array_equal(indices, self.current_indices) and not force:
+        changed = not np.array_equal(indices, self.current_indices)
+        if not changed and not force:
             return
         self.current_indices = indices
 
@@ -377,10 +399,34 @@ class BaseSelector:
 
         for child, fn in self.children.items():
             try:
+                # Stash `settle` where the update fn can see it: an EXPENSIVE-tier
+                # nav read is submitted async (returns None here) and paints later
+                # from its callback, so it needs to know at SUBMIT time whether the
+                # resting frame should paint at full resolution. Consumed by
+                # _submit_async_nav_read; harmless for the synchronous path.
+                child._pending_settle = settle
                 new_data = fn(self, child, indices)
                 if new_data is None:
                     continue
-                child.update_data(new_data)
+                # A CHEAP synchronous frame is painting now — supersede any
+                # in-flight EXPENSIVE async read so a late-landing stale async
+                # result can't clobber this newer frame (its callback no-ops once
+                # _nav_future is cleared). Covers expensive→cheap transitions
+                # (a big region dragged small, or moving off a derived node).
+                nf = getattr(child, "_nav_future", None)
+                if nf is not None:
+                    try:
+                        nf.cancel()
+                    except Exception:
+                        pass
+                    child._nav_future = None
+                # Paint OFF the dispatcher thread (newest-wins painter) so this
+                # transport doesn't block reading the NEXT slider position — the
+                # slider stays live and the display lags a frame behind + catches up
+                # (instead of the slider "catching" at slow frames). A frame
+                # superseded before it paints is dropped. See Plot.enqueue_paint /
+                # _NavPainter.
+                child.enqueue_paint(new_data)
                 if update_contrast:
                     child.needs_auto_level = True
                 # Chain to a downstream navigator (5-D: time → spatial → DP). The
@@ -413,6 +459,16 @@ class BaseSelector:
                 hook(indices)
             except Exception as e:
                 logger.debug("index hook failed: %s", e)
+
+        # Notify the module-level listeners that the navigation position
+        # genuinely MOVED — skipped for force-only re-fires at an unchanged
+        # position, so a settle/contrast repaint doesn't re-trigger listeners.
+        if changed:
+            for hook in list(NAV_CHANGE_HOOKS):
+                try:
+                    hook()
+                except Exception as e:
+                    logger.debug("nav change hook failed: %s", e)
 
     # ── Visibility ─────────────────────────────────────────────────────────────
 

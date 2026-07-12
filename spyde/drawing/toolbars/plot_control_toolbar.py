@@ -46,6 +46,34 @@ def _resolve_signal_class(path: str) -> type:
     return cls
 
 
+def _gate_signal_type(plot_state: "PlotState", navigation_only) -> str:
+    """The ``_signal_type`` string a ``signal_types``/``exclude_signal_types``
+    gate should compare against for *plot_state*.
+
+    For a SIGNAL plot this is simply the displayed signal's own type. For a
+    NAVIGATOR plot (``navigation_only`` truthy — the action is gated to
+    navigator plots, e.g. Play/Fast Forward), the plot's *own* displayed
+    signal is a DERIVED trace (``signal_tree._initialize_navigator`` sums the
+    root over its signal axes to build the nav image/line) — it is never the
+    tree root's class, so gating a navigator-only action on e.g.
+    ``signal_types: [insitu]`` would never match if we looked at
+    ``plot_state.current_signal``. Instead resolve against the TREE ROOT
+    signal's type, which is what actually carries the user-facing signal_type
+    (e.g. set via ``set_signal_type("insitu")`` on load).
+
+    Non-navigator gates (the vector actions' ``exclude_signal_types``, dense
+    diffraction gates, etc.) are unaffected — they keep reading
+    ``current_signal`` as before.
+    """
+    signal = plot_state.current_signal
+    if navigation_only:
+        tree = getattr(plot_state.plot, "signal_tree", None)
+        root = getattr(tree, "root", None)
+        if root is not None:
+            return root._signal_type
+    return signal._signal_type
+
+
 def get_toolbar_actions_for_plot(
     plot_state: "PlotState",
 ) -> tuple[
@@ -85,7 +113,7 @@ def get_toolbar_actions_for_plot(
         params = meta.get("parameters", {})
 
         signal = plot_state.current_signal
-        plot_signal_type = signal._signal_type
+        plot_signal_type = _gate_signal_type(plot_state, navigation_only)
 
         # requires_vectors: action only shows once the plot's signal tree has
         # diffraction_vectors attached (set after Find Vectors completes).
@@ -177,7 +205,7 @@ def _action_matches_plot(action: str, meta: dict, plot_state: "PlotState") -> bo
     navigation_only = meta.get("navigation")
 
     signal = plot_state.current_signal
-    plot_signal_type = signal._signal_type
+    plot_signal_type = _gate_signal_type(plot_state, navigation_only)
 
     tree = getattr(plot_state.plot, "signal_tree", None)
     has_vectors = getattr(tree, "diffraction_vectors", None) is not None

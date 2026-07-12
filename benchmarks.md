@@ -328,3 +328,217 @@ detection F1 vs known spots (tuned to F1=1.0 on clean data):
   it). Gap ~1-2% F1; Gaussian keeps better sub-pixel precision (0.48 vs 0.63 px).
 - Verdict: keep Gaussian default; offer TV nav-denoise for low-dose data with
   sharp grain structure. Dose/microstructure-dependent, not a universal win.
+
+## In-situ movie playback — per-frame stage timings (Phase 0, 2026-07-05)
+
+`benchmark_movie_playback.py` on a **real Direct-Electron in-situ movie**
+`20251117_88074_run1_9104_movie.mrc` = **(3618, 4096, 4096) uint8**, 60.7 GB —
+a 3618-frame movie of **4k×4k image frames** (16.8 MB/frame), nav-dim 1 (time).
+This is the case the 4D-STEM-oriented live-display path was NOT built for.
+Frames sampled across the stack (crossing chunk boundaries); cold OS cache.
+
+| stage | mean ms | what |
+|---|---:|---|
+| `memmap`    |  44 | `np.memmap mm[t]` -> RAM — the proposed playback read |
+| `normalize` | 185 | -> uint8 (anyplotlib `set_data` / `_normalize_image`) |
+| `getinds`   | 251 | hyperspy `_get_cache_dask_chunk` — **the current live-display call** (threaded) |
+| `b64`       | 268 | + base64 encode (transport payload) |
+| `compute`   | 275 | dask `raw[t].compute()` (threaded) |
+| `json`      | 323 | + `json.dumps` PLOTAPP line (the full transport step) |
+
+Frame in RAM **16.8 MB**; transport payload (b64-in-JSON) **22.4 MB/frame**
+(scales to ~85 MB at 8k×8k).
+
+**Findings (these drive the rewrite):**
+- **Dask is the wrong tool for sequential movie reads.** `compute()` is **6.2×**
+  the raw memmap read (275 vs 44 ms) and the current live-display `getinds` call
+  is **~5.7×** (251 vs 44 ms) — because the reader auto-chunks 8 frames × full
+  4096² = a **128 MB chunk read per single frame**. The plan's `nav_chunk=32`
+  re-chunk would make it a **512 MB chunk** — worse. Confirms the "dask might be
+  an issue" suspicion; motivates the direct `np.memmap` playback read (Phase 2)
+  and per-frame-size-adaptive chunking (Phase 1).
+- **Transport dominates the rest.** normalize->b64->json is **185->268->323 ms**
+  and ships **22.4 MB/frame** of base64-in-JSON. Motivates the binary transport +
+  GPU-shader colormap (Phases 4-5, in anyplotlib).
+- **Current total ≈ getinds (251) + json transport (323) ≈ ~570 ms/frame -> under
+  2 fps** on a 4k movie. Target (memmap 44 + binary + GPU render) removes ~500 ms
+  of that. The ordering says: fix the read path AND the transport; normalize/LUT
+  moving to the GPU removes the ~185 ms normalize too.
+
+**Pure 8k×8k transport** (`--synthetic 8192`, no disk): normalize **729 ms** ->
+b64 **1037 ms** -> json **1288 ms**, payload **89.5 MB/frame** (67.1 MB frame in
+RAM). i.e. the transport chain ALONE is >1 s/frame (<1 fps) at 8k before any read
+or render — the base64-in-JSON-over-stdout scheme cannot carry an 8k movie. This
+is the hard case for the binary transport + GPU-shader colormap.
+
+Run: `.venv/Scripts/python spyde/tests/benchmark_movie_playback.py --frames 20`
+(`--path <file.mrc>`, or `--synthetic 8192` for pure 8k transport numbers).
+
+### Pooled sync-graph movie read: futures + cancel WITHOUT distributed (2026-07-05)
+
+The dilemma: the navigator needs **cancellable async futures** (latest-wins scrub)
+but the distributed scheduler's per-frame round-trip is slow (251 ms above), while
+the plain threaded `.compute()` is fast but blocking (no Future/cancel). Resolution
+(`repro_movie_scrub.py` on the real 4k movie; `ComputeBackend.submit_graph`): submit
+`lazy[t].compute(scheduler="synchronous")` to OUR ThreadPoolExecutor — the pool
+gives the real `concurrent.futures.Future` (cancel + done_callback), the synchronous
+scheduler walks the dask graph on that worker (no nested pool), no distributed hop.
+
+| property | distributed (today) | **submit_graph (pool+sync)** |
+|---|---|---|
+| per-frame latency | 251 ms | **46 ms** (min 20) |
+| cancel a queued scrub frame | yes | **yes (17/19 cancelled)** |
+| async done-callback paint | yes | **yes** |
+| scrub a lazy CROP (`inav/isig`) | yes | **yes, same path** (crop build 14.5 ms lazy; cropped frame read 48 ms) |
+
+So we keep the full dask graph (crop/rebin/zspy all read through one path) and own
+the async layer via the executor already in `ComputeBackend`. ~5.5x faster per frame
+than the current distributed live-display call, and crop-then-scrub is free. This is
+the basis for the Phase-2 movie navigator read.
+
+### 4D-STEM DP nav A/B: DO NOT unify onto submit_graph (2026-07-05)
+
+Gate benchmark before unifying the 4D-STEM diffraction-pattern navigator onto
+submit_graph (`benchmark_nav_read_ab.py`, real 4D-STEM `20241219_29674_movie_movie.mrc`,
+300×648 nav × 128² DP). Correctness: submit_graph of `raw[iy,ix]` (single) /
+`raw[pts].mean(0)` **float64** (region) matches hyperspy `get_index(sum_data=True)`
+exactly — the region result is the un-rounded float64 mean, NOT cast to frame dtype.
+
+| case | current `get_index` | submit_graph |
+|---|---:|---:|
+| single point | **1.2 ms** | 24.6 ms |
+| region (25 pts, integrating) | **3.5 ms** | 52.0 ms |
+
+**The two navigator paths have OPPOSITE optimal strategies:**
+- **4D-STEM DP**: navigation dwells WITHIN a nav chunk (adjacent probe positions
+  share a 32×32 chunk). `get_index` caches the loaded chunk in numpy, so ~every move
+  is a ~1 ms cache hit. submit_graph re-walks the graph + re-reads from disk each
+  move (~24 ms) → **~15-20x slower**. Do NOT unify — it would badly regress the DP
+  live display (CLAUDE.md §1-4).
+- **Movie**: consecutive frames are in DIFFERENT chunks (1 frame/chunk), so the
+  get_index chunk cache never helps; submit_graph's direct read wins (46 vs 251 ms).
+
+**Conclusion (superseded — see below):** ~~keep distributed for DP, submit_graph for
+movie~~. A better unification exists.
+
+### The unified read: cached get_index MINUS distributed (2026-07-05)
+
+Key realisation (from reading `CachedDaskArray.get_index`): the numpy chunk cache
+that makes the DP navigator fast is **independent of the distributed scheduler**.
+With `self.client` unset, `get_index` takes a **synchronous** branch
+(`array_tools.py` ~L1067/1134) that caches blocks in numpy and slices/means them —
+the SAME cache logic, no distributed hop. Measured on the 4D-STEM scan with the
+cache client set to None: dwell-in-chunk **1.31 ms** (min 0.80), cross-chunk 45-100 ms.
+
+So `cached_read` = `get_index` (no distributed client, synchronous chunk cache)
+submitted to our own ThreadPoolExecutor gives a **cancellable async Future** AND the
+cache hits, with NO distributed overhead. A/B (`benchmark_nav_read_ab.py`):
+
+| case | distributed (today) | naive submit_graph | **cached_read (unified)** |
+|---|---:|---:|---:|
+| single DP | 1.6 ms | 25.0 ms | **1.0 ms** |
+| region (25 pts) | 2.3 ms | 52.9 ms | **1.5 ms** |
+
+All outputs match. This **unifies both navigators** on one path (cache logic kept,
+distributed dropped): 4D-STEM DP dwells in chunk → ~1 ms hits; a movie is 1
+frame/chunk → every move a ~46 ms cold read (already optimal). It's also SIMPLER
+than today — no shm buffer, no distributed-client pinning, no `_inflight_getinds`
+juggling — and must run on the serial `_NavDispatcher` (CLAUDE.md §4: the cache is
+not concurrency-safe; the dispatcher already serialises). This is the Phase-2 design.
+
+### The `_client=None` pin needs a property patch to actually take effect (2026-07-06)
+
+A review caught that `cached_arr._client = None` **does not** force the synchronous
+cache branch when a real cluster is up (the app default). The fork's
+`CachedDaskArray.client` property, when `_client is None`, calls
+`dask.distributed.get_client()` — which returns the process-global default `Client`
+from any non-worker thread (it does NOT raise). So the nav read still went
+distributed in the app; only `SPYDE_NO_DASK=1` tests hit the sync branch.
+
+Measured on a real `LocalCluster` (default `Client`), 64×64×128² 4D-STEM, from a
+`nav-dispatch` thread:
+
+| | dwell-in-chunk | cross-chunk |
+|---|---:|---:|
+| `_client=None` alone (still distributed) | **~16 ms** | ~103 ms |
+| + `_patch_cached_dask_client()` (true sync) | **~2 ms** (min 0.7) | (one chunk read) |
+
+Fix: `heavy_imports._patch_cached_dask_client()` (applied in `ensure_heavy_imports`)
+makes `.client` honour `_client=None` (no `get_client()` fallback). Verified with a
+real cluster (2 ms dwell, correct frame) and in the app (DP nav 9/9 moves update).
+The RETIREMENT of the shm/cancel machinery was always safe — it came from
+**seriality + blocking**, not the branch; the patch just makes the read fast too.
+
+### LOD decimation + read-ahead prefetch (Phase 3, 2026-07-05)
+
+Two wins for a large-movie scrub, both benchmark-driven on the real 4k movie:
+
+- **LOD (transport):** strided *reads* do NOT save disk I/O on a contiguous memmap
+  (`raw[t,::4,::4]` = 45 ms vs 47 ms full — the OS reads full pages regardless), but
+  decimating an already-read frame in numpy is ~1 ms and cuts the base64-in-JSON
+  transport (the dominant per-frame cost) by the square of the stride. So
+  `Plot._set_array` decimates any frame whose longest side > 1536 px (4096→1366,
+  stride 3; 8192→1366, stride 6) before the wire, subsampling the axes identically
+  to keep the scale bar calibrated. A DP frame (≤1536) is untouched.
+- **Prefetch (cold read):** a warm (already-paged) frame re-reads in ~18 ms vs ~50 ms
+  cold. `_MoviePrefetcher` reads t±1…t±3 on a background thread after each movie move
+  to warm the OS page cache, so a steady scrub finds the next frame warm. It reads the
+  RAW dask array (not the CachedDaskArray) so it never races the nav read's cache.
+
+Verified in the real app: movie scrub 5/5 moves repaint a fresh decimated 4k frame
+(scale bar correct) in ~23 s incl. cold load; LOD + prefetch coexist with no DP
+regression.
+
+### Real-cluster (`--distributed`) A/B + a rounding gotcha (2026-07-05)
+
+Ran the A/B against a real `LocalCluster(processes=True)` (CLAUDE.md: won't run in
+an agent sandbox — run directly). Cold reads through the cluster:
+
+| case | distributed get_index | submit_graph | cached_read (no client) |
+|---|---:|---:|---:|
+| single | 13.3 ms | 23.9 ms | 18.9 ms |
+| region-25 | 26.8 ms | 48.6 ms | 25.2 ms |
+
+cached_read is competitive-to-better than the real distributed path even cold, and
+~1 ms on warm dwell-in-chunk hits (threaded run) — so unifying does NOT regress the
+DP navigator.
+
+**Gotcha (must handle when unifying): the two get_index branches round the
+integrating-region mean differently.**
+- Distributed branch → `weighted_mean_round_from_sums` → for INTEGER dtype,
+  `np.rint(mean).astype(dtype)` (rounded uint16, e.g. 106).
+- No-client branch → `np.mean(arrays)` → **float64**, un-rounded (106.444...).
+
+So a naive unify would change the DP navigator's region frames from rounded uint16
+to float64 (shifting contrast/levels). The unified read must reproduce the
+distributed rounding for integer data (round-to-dtype on the region mean). Small
+fix, but it's a real display-correctness constraint — noted for the Phase-2 rewire.
+(Single-frame reads match exactly; only the multi-point integrating region rounds.)
+
+### First paint of a 16 GB movie + navigator sidecar (2026-07-10)
+
+Repro: `D:\20251117_88075_run3 some growth_1236_movie.mrc` (977 x 4096 x 4096 uint8,
+16.8 MB frames), fresh open with a running distributed navigator fill.
+
+The signal panel sat BLACK long after the frame was read (`_set_array` entered at
+~2.5 s): stage-timestamping showed the first paint's auto-level block took
+**11.7 s** — `_emit_histogram` ran `np.isfinite` + `np.histogram` over the FULL
+16 M-px frame while the fill's worker processes saturated memory bandwidth.
+Subsampling the histogram input to ≤512² (like `_robust_levels`) + skipping the
+isfinite mask for integer dtypes: **11,660 ms → 22 ms**. Second stall: lazy
+`import torch` in `GpuTileBackend` on the painter thread (~3.3 s idle, worse under
+load; and a sys.modules poke at a MID-IMPORT torch blocks on the import lock —
+measured 11 s) → background `prewarm_torch_cuda()` at startup + flag-only
+readiness + numpy-first tile that upgrades to CUDA when the prewarm lands.
+
+End-to-end (first_paint_real_load.spec.ts, real file, dask):
+
+| stage | before | after |
+|---|---:|---:|
+| signal panel first content (fresh open, fill running) | never (until nav move / fill end) | **5.3 s** (0.5 s after windows) |
+| navigator on REOPEN (sidecar `<file>.spyde-nav.npz`) | ~52 s whole-file fill | **4.4 s** (real data at window-open) |
+| navigator fill (977 x 16.8 MB read) | ~52 s | ~52 s + "Computing navigator… N%" status |
+
+The fill is also DEFERRED until the signal plot's first frame lands
+(`_start_nav_compute_after_first_frame`) so the first frame wins the disk, and the
+completed fill writes the sidecar for the next open.

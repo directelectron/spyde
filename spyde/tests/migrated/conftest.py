@@ -91,3 +91,31 @@ def stem_4d_dataset(captured_messages):
     yield {"window": session, "signal_trees": session.signal_trees,
            "plots": session._plots, "messages": captured_messages}
     session.shutdown()
+
+
+def _movie_stack(n_frames=8, frame=(32, 32)):
+    """A lazy in-situ movie: nav-dim 1 (time) stack of 2-D image frames.
+    Each frame is a moving bright blob so successive frames differ."""
+    import dask.array as da
+    data = np.zeros((n_frames,) + frame, dtype=np.float32)
+    yy, xx = np.mgrid[0:frame[0], 0:frame[1]]
+    for t in range(n_frames):
+        cy = int((t / max(1, n_frames - 1)) * (frame[0] - 1))
+        data[t] = np.exp(-((yy - cy) ** 2 + (xx - frame[1] // 2) ** 2) / 8.0)
+    # Chunk one frame per block (mimics a large-frame movie's storage layout).
+    return da.from_array(data, chunks=(1,) + frame)
+
+
+@pytest.fixture
+def movie_dataset(captured_messages):
+    """In-situ movie: nav-dim 1 (time), 2-D image signal → 1-D time navigator."""
+    session = _make_session()
+    s = hs.signals.Signal2D(_movie_stack()).as_lazy()
+    # A calibrated time axis (what the DE-MRC reader gives an in-situ movie).
+    tax = s.axes_manager.navigation_axes[0]
+    tax.name, tax.units, tax.scale = "time", "sec", 0.1
+    s.set_signal_type("insitu")   # gates the Play/Fast Forward toolbar buttons
+    _load(session, s)
+    yield {"window": session, "signal_trees": session.signal_trees,
+           "plots": session._plots, "messages": captured_messages}
+    session.shutdown()

@@ -2,10 +2,18 @@ import React, { useCallback, useRef, useState } from 'react'
 import type { ToolbarAction } from '../kernel/SpyDEContext'
 import { FloatingToolbar } from './FloatingToolbar'
 import { WINDOW_DRAG_MIME } from '../kernel/dnd'
+import { Pill, type PillSegment, type WindowPillPayload } from './Pill'
 
 interface Props {
   id: string
   title: string
+  /** Breadcrumb segments for the header pill: [Name]|[Signal|Navigator]|[Root|navName].
+   *  The first segment (Name) is double-click editable via onRename. */
+  breadcrumb?: PillSegment[]
+  /** What the header pill drags (window + navigator + signal-ref payloads). */
+  windowPayload?: WindowPillPayload
+  /** Commit a rename of the dataset Name (double-click the first segment). */
+  onRename?: (windowId: number, name: string) => void
   initialX: number
   initialY: number
   initialW: number
@@ -119,7 +127,8 @@ function clampToVisible(x: number, y: number, w: number, areaW: number, areaH: n
 // cursor is over the out-of-process figure iframe (whose canvas would otherwise
 // steal the native pointer and freeze the interaction).
 export function SubWindow({
-  id, title, initialX, initialY, initialW, initialH,
+  id, title, breadcrumb, windowPayload, onRename,
+  initialX, initialY, initialW, initialH,
   toolbarActions, onClose, onFocus, onMinimize, onResize, onAction,
   zIndex, windowId, children, hidden = false,
   acceptSignalDrop = false, onSignalDrop,
@@ -127,6 +136,9 @@ export function SubWindow({
 }: Props) {
   const [maximized, setMaximized] = useState(false)
   const [dropHover, setDropHover] = useState(false)
+  // Inline rename of the dataset Name (first breadcrumb segment).
+  const [renaming, setRenaming] = useState(false)
+  const [renameText, setRenameText] = useState('')
   const [pos, setPos] = useState({ x: initialX, y: initialY })
   const [size, setSize] = useState({ width: initialW, height: initialH })
   const [busy, setBusy] = useState(false)   // dragging or resizing → shield on
@@ -158,6 +170,18 @@ export function SubWindow({
     onLiveRect?.(id, { x: pos.x, y: pos.y, w: size.width, h: size.height })
   }, [id, pos.x, pos.y, size.width, size.height, onLiveRect])
 
+  // Inline rename: double-clicking the breadcrumb's Name segment swaps it for an
+  // input; Enter (or blur) commits via onRename, Escape cancels.
+  const startRename = useCallback((current: string) => {
+    setRenameText(current)
+    setRenaming(true)
+  }, [])
+  const commitRename = useCallback(() => {
+    setRenaming(false)
+    const name = renameText.trim()
+    if (name && onRename) onRename(windowId, name)
+  }, [renameText, onRename, windowId])
+
   // The floating toolbar sits BELOW the window and reveals on hover (over the
   // window or the toolbar itself). A short hide delay covers the gap between the
   // window's bottom edge and the toolbar so moving toward it doesn't hide it.
@@ -187,8 +211,9 @@ export function SubWindow({
   const onTitleDown = (e: React.PointerEvent) => {
     if (maximized) return
     if ((e.target as HTMLElement).closest('button')) return  // let buttons click
-    // The signal-drag grip starts an HTML5 drag, not a window move.
-    if ((e.target as HTMLElement).closest('[data-testid="signal-drag-handle"]')) return
+    // The breadcrumb pill starts an HTML5 drag (and stops pointer propagation
+    // itself), so grabbing it never starts a window move — only empty titlebar
+    // space does.
     onFocus(id)
     try { (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId) } catch { /* */ }
     gesture.current = { kind: 'drag', px: e.clientX, py: e.clientY, ox: pos.x, oy: pos.y }
@@ -265,7 +290,6 @@ export function SubWindow({
         onPointerMove={onTitleMove}
         onPointerUp={endGesture}
         onPointerCancel={endGesture}
-        onDoubleClick={() => setMaximized(m => !m)}
         onDragOver={(e) => {
           if (!acceptSignalDrop || !e.dataTransfer.types.includes(WINDOW_DRAG_MIME)) return
           e.preventDefault()
@@ -283,20 +307,47 @@ export function SubWindow({
           if (Number.isFinite(src) && src !== windowId) onSignalDrop?.(src)
         }}
       >
-        <span style={{ display: 'flex', alignItems: 'center', gap: 5, minWidth: 0 }}>
-          {/* Grip: drag this signal onto a navigator's titlebar to add it as a
-              named navigator (a plain titlebar drag still moves the window). */}
-          <span
-            data-testid="signal-drag-handle"
-            title="Drag onto a navigator to add this signal as a navigator"
-            draggable
-            onDragStart={(e) => {
-              e.dataTransfer.setData(WINDOW_DRAG_MIME, String(windowId))
-              e.dataTransfer.effectAllowed = 'copy'
-            }}
-            style={styles.dragHandle}
-          >⠿</span>
-          <span data-testid="subwindow-title" style={styles.title}>{title}</span>
+        {/* The breadcrumb pill IS the window's drag source (window / navigator /
+            signal-ref payloads) and the rename affordance (double-click Name).
+            The wrapper is content-width (NOT flex:1) and does NOT swallow pointer
+            events — so the empty titlebar space to its RIGHT still starts a window
+            move. The pill itself stops propagation (via onPointerDown) so grabbing
+            it starts an HTML5 drag, not a window move. */}
+        {/* data-testid=subwindow-title lives on THIS wrapper (not the fallback
+            span) so it resolves in every branch — pill, rename, or plain title.
+            A click here lands on the pill, whose stopPropagation only blocks
+            pointerdown; the root's onMouseDown focus/raise still fires. Specs
+            rely on it as the click-to-raise + title-text handle. */}
+        <span data-testid="subwindow-title"
+          style={{ display: 'flex', alignItems: 'center', minWidth: 0 }}>
+          {renaming ? (
+            <input
+              data-testid="rename-input"
+              autoFocus
+              value={renameText}
+              onChange={(e) => setRenameText(e.target.value)}
+              onBlur={() => { commitRename() }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') { commitRename() }
+                else if (e.key === 'Escape') { setRenaming(false) }
+              }}
+              onPointerDown={(e) => e.stopPropagation()}
+              style={styles.renameInput}
+            />
+          ) : breadcrumb && breadcrumb.length ? (
+            <Pill
+              testid="window-breadcrumb"
+              onPointerDown={(e) => e.stopPropagation()}
+              segments={breadcrumb.map((s) =>
+                s.testid === 'breadcrumb-name' && onRename && windowPayload
+                  ? { ...s, onDoubleClick: () => startRename(s.text) }
+                  : s)}
+              window={windowPayload}
+              title="Drag to add a navigator, into the console to bind, or onto a navigator. Double-click the name to rename."
+            />
+          ) : (
+            <span style={styles.title}>{title}</span>
+          )}
         </span>
         <div style={styles.controls}>
           {onMinimize && (
@@ -382,11 +433,12 @@ const styles: Record<string, React.CSSProperties> = {
     flexShrink: 0,
   },
   title: { fontSize: 12, color: '#cdd6f4', fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
-  titleBarDrop: { background: '#2a2a44', borderBottom: '1px solid #89b4fa' },
-  dragHandle: {
-    color: '#6c7086', fontSize: 11, cursor: 'grab', flexShrink: 0,
-    userSelect: 'none',
+  renameInput: {
+    background: '#11111b', border: '1px solid #89b4fa', borderRadius: 6,
+    color: '#cdd6f4', fontSize: 12, fontWeight: 600, padding: '2px 8px',
+    outline: 'none', maxWidth: 220,
   },
+  titleBarDrop: { background: '#2a2a44', borderBottom: '1px solid #89b4fa' },
   controls: { display: 'flex', gap: 4 },
   btn: {
     background: 'none', border: 'none', color: '#6c7086',

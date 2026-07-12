@@ -1,0 +1,21 @@
+{
+  "default": "spotunet-production-v2",
+  "models": [
+    {
+      "id": "spotunet-production-v2",
+      "label": "SpotUNet production (bundled)",
+      "version": 2,
+      "notes": "SRO-augmented edge-decoupled detector; best on CuNb/ZrNb/SPED-Ag, parameter-free with auto-calibration. Beats WNCC on crystalline 4D-STEM.",
+      "arch": {"base": 16, "in_ch": 1, "levels": 2},
+      "source": {"type": "bundled", "file": "spotunet_production.pt"}
+    },
+    {
+      "id": "spotunet-base16-v1",
+      "label": "SpotUNet base16 (legacy)",
+      "version": 1,
+      "notes": "Earlier edge-trained detector. Kept as a fallback.",
+      "arch": {"base": 16, "in_ch": 1, "levels": 2},
+      "source": {"type": "bundled", "file": "spotunet_base16.pt"}
+    }
+  ]
+}

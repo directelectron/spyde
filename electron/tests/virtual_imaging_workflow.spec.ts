@@ -10,7 +10,7 @@
  * windows through the full Electron pipeline in this tree.
  */
 import { test, expect } from '@playwright/test'
-const { launchApp, backendAction, waitForSubwindowCount } = require('./_harness.cjs')
+const { launchApp, backendAction, waitForSubwindowCount, sigWindow } = require('./_harness.cjs')
 
 let ctx: Awaited<ReturnType<typeof launchApp>>
 
@@ -30,7 +30,9 @@ test.setTimeout(180_000)
 
 test('virtual image output window paints non-black', async () => {
   const { page } = ctx
-  const sig = page.getByTestId('subwindow').filter({ hasNotText: 'Navigator' }).first()
+  // Breadcrumb-chip picker — the literal word "Navigator" is gone from titles,
+  // so hasNotText:'Navigator' matched BOTH windows and .first() grabbed the nav.
+  const sig = sigWindow(page)
   await sig.getByTestId('subwindow-title').click()
   await sig.getByTestId('subwindow-titlebar').hover()   // reveal toolbar
   // Wait for the toolbar button to actually be revealed before clicking — on a

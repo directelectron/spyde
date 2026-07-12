@@ -10,8 +10,11 @@ interface Props {
   sendAction: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
 }
 
-// The reserved view_label of the backend-built side-by-side comparison figure.
+// The reserved view_label of the backend-built side-by-side comparison figure
+// (2-D navigators, tiled) and the stacked comparison figure (1-D/movie
+// navigators, rows) — see navigator_views.py TILED_LABEL / STACKED_LABEL.
 const TILED = '__tiled__'
+const STACKED = '__stacked__'
 const STRAIN_LABEL: Record<string, string> = { exx: 'εxx', eyy: 'εyy', exy: 'εxy', omega: 'ω' }
 
 // A window's content area: the unified "view" selector + the figure it shows.
@@ -81,6 +84,7 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction }: Prop
   // the corner of the 2-D map (not a switchable view).
   const figIpfKey = useMemo(() => figs.find(f => f.view === 'ipf_key'), [figs])
   const tiledFig = useMemo(() => figs.find(f => f.viewLabel === TILED), [figs])
+  const stackedFig = useMemo(() => figs.find(f => f.viewLabel === STACKED), [figs])
   // Unique chip labels in stable first-seen order (the tiled figure is not a chip).
   const labels = useMemo(() => {
     const seen: string[] = []
@@ -143,10 +147,12 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction }: Prop
     if (has3d && mode === '3d' && fig3d) return fig3d
     if (hasDensity && mode === 'density' && figDensity) return figDensity
     if (multi && tiledFig) return tiledFig                     // anyplotlib N-axis compare
-    if (navMulti && tiledFig) return tiledFig                  // tiled navigators
+    if (navMulti && tiledFig) return tiledFig                  // tiled navigators (2-D)
+    if (navMulti && stackedFig) return stackedFig              // stacked navigators (1-D/movie)
     if (hasChips) return [...figs].reverse().find(f => f.viewLabel === selected[0]) ?? null
-    return figs.find(f => f.view !== '3d' && f.view !== 'density' && f.view !== 'ipf_key' && f.viewLabel !== TILED) ?? figs[0] ?? null
-  }, [has3d, mode, fig3d, hasDensity, figDensity, multi, navMulti, tiledFig, hasChips, selected, figs])
+    return figs.find(f => f.view !== '3d' && f.view !== 'density' && f.view !== 'ipf_key'
+      && f.viewLabel !== TILED && f.viewLabel !== STACKED) ?? figs[0] ?? null
+  }, [has3d, mode, fig3d, hasDensity, figDensity, multi, navMulti, tiledFig, stackedFig, hasChips, selected, figs])
 
   const shownId = shownFig?.figId
 

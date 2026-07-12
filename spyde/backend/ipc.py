@@ -43,6 +43,21 @@ def _write_line(line: str) -> None:
         _PROTOCOL_OUT.flush()
 
 
+def _write_binary(frame: bytes) -> None:
+    """Write one raw binary frame to the protocol channel's BINARY stream, under
+    the same lock as text lines so a PLOTBIN frame never interleaves with a
+    PLOTAPP: line. Uses ``_PROTOCOL_OUT.buffer`` (the real stdout's binary fd) so
+    the bytes are NOT newline-translated / re-encoded (Windows text mode would
+    corrupt binary — the '\\n' bytes in the pixels would become '\\r\\n')."""
+    buf = getattr(_PROTOCOL_OUT, "buffer", None)
+    if buf is None:
+        return
+    with _stdout_lock:
+        _PROTOCOL_OUT.flush()      # flush any pending text first (ordering)
+        buf.write(frame)
+        buf.flush()
+
+
 def redirect_stray_stdout() -> None:
     """Send all `print()` output to stderr so it can never interleave with the
     PLOTAPP protocol on stdout, while keeping BOTH protocol emitters — spyde's
@@ -64,6 +79,24 @@ def redirect_stray_stdout() -> None:
             _write_line("PLOTAPP:" + json.dumps(obj, default=str) + "\n")
 
         _ael.emit = _shared_emit
+
+        # anyplotlib's emit_binary writes raw PLOTBIN frames to sys.stdout.buffer,
+        # but after the redirect below sys.stdout IS stderr — so without this the
+        # binary pixels would spew to the terminal (garbled) and never reach the
+        # Electron demuxer. Route it through the locked BINARY protocol channel.
+        if hasattr(_ael, "emit_binary"):
+            from anyplotlib._binary_frame import encode_frame as _encode_frame
+
+            _bin_logged = [False]
+
+            def _shared_emit_binary(fig_id, key, header, payload) -> None:
+                if not _bin_logged[0]:
+                    _bin_logged[0] = True
+                    log.info("binary transport active: PLOTBIN %s %d bytes",
+                             key, len(payload))
+                _write_binary(_encode_frame(fig_id, key, header, payload))
+
+            _ael.emit_binary = _shared_emit_binary
     except Exception as e:
         log.debug("redirecting anyplotlib emit to shared protocol channel failed: %s", e)
 

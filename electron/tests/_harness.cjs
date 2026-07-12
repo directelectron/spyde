@@ -249,6 +249,71 @@ async function countColorPixels(page, kind) {
   return total
 }
 
+/**
+ * Window pickers. The breadcrumb Pill replaced the old "<name> Navigator"
+ * title text with an S-/N- kind-prefix chip, so `filter({ hasText:
+ * 'Navigator' })` no longer distinguishes windows — select by prefix instead.
+ * Windows without a breadcrumb (bare figure windows, e.g. strain) match
+ * neither; pick those by their plain title text.
+ */
+function sigWindow(page) {
+  return page.getByTestId('subwindow')
+    .filter({ has: page.getByTestId('window-breadcrumb').filter({ hasText: /^S-/ }) })
+    .first()
+}
+
+function navWindow(page) {
+  return page.getByTestId('subwindow')
+    .filter({ has: page.getByTestId('window-breadcrumb').filter({ hasText: /^N-/ }) })
+    .first()
+}
+
+function navWindows(page) {
+  return page.getByTestId('subwindow')
+    .filter({ has: page.getByTestId('window-breadcrumb').filter({ hasText: /^N-/ }) })
+}
+
+/**
+ * REAL backend error lines from the log buffer — the "no errors surfaced"
+ * audit several specs end with. Matches Python ERROR/Traceback lines but
+ * excludes known-benign noise:
+ *  - the Electron dev-mode CSP "Security Warning" (tagged RENDERER-ERROR),
+ *  - Chromium's willReadFrequently canvas perf hint (our own pixel probes),
+ *  - CHROMIUM PROCESS stderr in `[pid:date:ERROR:file.cc(line)]` format —
+ *    on headless Linux CI this fires constantly (bus.cc dbus failures,
+ *    viz_main_impl.cc "Exiting GPU process", command_buffer_proxy_impl.cc)
+ *    and is infrastructure noise, not a SpyDE error. Python backend lines
+ *    never match that shape, so real errors still fail the audit.
+ */
+function backendErrorLines(backend) {
+  return backend.logBuffer.filter((l) =>
+    /ERROR|Traceback/i.test(l)
+    && !/Security Warning|Content.Security.Policy|Content Security/i.test(l)
+    && !/willReadFrequently/i.test(l)
+    && !/:(ERROR|FATAL):[a-z_0-9]+\.(cc|mm)\(\d+\)/.test(l))
+}
+
+/**
+ * A safe point to GRAB the titlebar for a WINDOW-MOVE drag. The breadcrumb
+ * pill (left side) is an HTML5 drag SOURCE that stops pointerdown — grabbing
+ * it starts a DnD payload drag, NOT a window move. The window controls
+ * (minimize/maximize/close, ~90px) own the right edge. Return a point in the
+ * empty strip between the two.
+ */
+async function titlebarGrabPoint(win) {
+  const bar = win.getByTestId('subwindow-titlebar')
+  const bb = await bar.boundingBox()
+  if (!bb) throw new Error('titlebar has no bounding box')
+  let x = bb.x + bb.width / 2
+  const pill = win.getByTestId('window-breadcrumb')
+  if (await pill.count()) {
+    const pb = await pill.first().boundingBox()
+    if (pb) x = pb.x + pb.width + 20
+  }
+  x = Math.min(x, bb.x + bb.width - 110)
+  return { x, y: bb.y + bb.height / 2 }
+}
+
 module.exports = {
   launchApp,
   backendAction,
@@ -257,4 +322,9 @@ module.exports = {
   loadTestVectors,
   dumpDaskState,
   countColorPixels,
+  sigWindow,
+  navWindow,
+  navWindows,
+  titlebarGrabPoint,
+  backendErrorLines,
 }

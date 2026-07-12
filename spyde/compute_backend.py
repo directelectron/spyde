@@ -15,6 +15,7 @@ import logging
 import threading
 from typing import Callable, Any, Iterable
 
+import numpy as np
 import dask
 import dask.array as da
 
@@ -120,6 +121,34 @@ class ComputeBackend:
         else:
             dask_fut = self._client.submit(fn, *args, **kwargs)
             return _DistributedFutureAdapter(dask_fut)
+
+    def submit_graph(self, lazy_array: "da.Array") -> concurrent.futures.Future:
+        """Compute a single lazy dask slice and return a **cancellable** Future.
+
+        This is the low-latency, async, cancellable read the movie navigator
+        needs — WITHOUT the distributed scheduler round-trip. In threaded mode it
+        submits ``lazy_array.compute(scheduler="synchronous")`` to OUR
+        ThreadPoolExecutor: the pool provides the concurrent.futures.Future
+        (``.cancel()`` a superseded scrub frame, ``.add_done_callback()`` to
+        paint off-thread), while the ``synchronous`` scheduler walks the dask
+        graph on that one worker thread — so dask does NOT spawn a nested thread
+        pool under ours (which would contend). A queued future cancels cleanly
+        (latest-position-wins); an in-flight one runs to completion.
+
+        Because the input is a plain lazy dask array, the SAME call reads the
+        original movie, a lazy CROP (``s.inav[..].isig[..]``), a rebinned view,
+        or a ``.zspy`` — cropping/rebinning stay pure graph ops and scrub through
+        this one path. Result is a materialised ``np.ndarray``.
+
+        In distributed mode it falls back to ``client.compute`` (already async +
+        cancellable via the adapter) so callers are backend-agnostic.
+        """
+        if self._executor is not None:
+            def _read(a=lazy_array):
+                return np.asarray(a.compute(scheduler="synchronous"))
+            return self._executor.submit(_read)
+        dask_fut = self._client.compute(lazy_array)
+        return _DistributedFutureAdapter(dask_fut)
 
     def compute(self, dask_array_or_list) -> concurrent.futures.Future:
         """

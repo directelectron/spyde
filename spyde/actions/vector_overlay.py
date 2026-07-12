@@ -761,7 +761,7 @@ class FindVectorsPreviewOverlay(_DPOverlay):
 
     def __init__(self, dp_plot, signal, *, sigma=1.0, kernel_radius=5,
                  threshold=0.5, min_distance=5, subpixel=True,
-                 method="nxcorr", dog_sigma1=0.8, dog_sigma2=2.0,
+                 method="nxcorr", model_id=None, dog_sigma1=0.8, dog_sigma2=2.0,
                  beamstop_mask=None, show_transform=False,
                  color="#ff3030", name="fv_preview"):
         self.dp_plot = dp_plot
@@ -772,6 +772,7 @@ class FindVectorsPreviewOverlay(_DPOverlay):
         self.min_distance = int(min_distance)
         self.subpixel = bool(subpixel)
         self.method = str(method).lower()
+        self.model_id = str(model_id) if model_id else None
         self.dog_sigma1 = float(dog_sigma1)
         self.dog_sigma2 = float(dog_sigma2)
         self.beamstop_mask = beamstop_mask
@@ -819,6 +820,8 @@ class FindVectorsPreviewOverlay(_DPOverlay):
             self.subpixel = bool(p["subpixel"])
         if p.get("method") is not None:
             self.method = str(p["method"]).lower()
+        if "model_id" in p:
+            self.model_id = str(p["model_id"]) if p["model_id"] else None
         if p.get("dog_sigma1") is not None:
             self.dog_sigma1 = float(p["dog_sigma1"])
         if p.get("dog_sigma2") is not None:
@@ -1025,8 +1028,10 @@ class FindVectorsPreviewOverlay(_DPOverlay):
             params = dict(
                 method=self.method, kernel_radius=self.kernel_radius,
                 threshold=self.threshold, min_distance=self.min_distance,
-                subpixel=self.subpixel, dog_sigma1=self.dog_sigma1,
-                dog_sigma2=self.dog_sigma2,
+                subpixel=self.subpixel,
+                # getattr: tests construct the overlay via __new__ (no __init__)
+                model_id=getattr(self, "model_id", None),
+                dog_sigma1=self.dog_sigma1, dog_sigma2=self.dog_sigma2,
             )
             if self.show_transform:
                 peaks, response = _find_peaks_single_frame(
@@ -1291,7 +1296,8 @@ def attach_vector_orientation_overlay(dp_plot, vecs, lib, tree, *, params=None,
 
 def attach_find_vectors_preview(dp_plot, signal, tree, *, sigma=1.0,
                                 kernel_radius=5, threshold=0.5, min_distance=5,
-                                subpixel=True, method="nxcorr", dog_sigma1=0.8,
+                                subpixel=True, method="nxcorr", model_id=None,
+                                dog_sigma1=0.8,
                                 dog_sigma2=2.0, beamstop_mask=None,
                                 beamstop_auto=False, show_transform=False,
                                 color="#ff3030") -> FindVectorsPreviewOverlay:
@@ -1300,7 +1306,8 @@ def attach_find_vectors_preview(dp_plot, signal, tree, *, sigma=1.0,
     ov = FindVectorsPreviewOverlay(
         dp_plot, signal, sigma=sigma, kernel_radius=kernel_radius,
         threshold=threshold, min_distance=min_distance, subpixel=subpixel,
-        method=method, dog_sigma1=dog_sigma1, dog_sigma2=dog_sigma2,
+        method=method, model_id=model_id,
+        dog_sigma1=dog_sigma1, dog_sigma2=dog_sigma2,
         beamstop_mask=beamstop_mask, show_transform=show_transform, color=color,
     ).attach(tree)
     if beamstop_auto:

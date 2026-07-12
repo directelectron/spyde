@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Union, List
 from spyde.drawing.selectors.base_selector import (
     BaseSelector,
     IntegratingSelectorMixin,
+    MAX_REGION_EXTENT_PER_DIM,
     event_handler_fn,
 )
 
@@ -127,7 +128,33 @@ class LinearRegionSelector(BaseSelector):
         return getattr(plot, "_plot1d", None) if plot is not None else None
 
     def _on_pointer_up(self, event):
+        self._clamp_extent()
         self.update_data()
+
+    def _clamp_extent(self) -> None:
+        """Cap the 1-D span to MAX_REGION_EXTENT_PER_DIM indices and write the
+        clamped upper edge back to the widget so the span physically STOPS growing
+        at the cap. x0/x1 are in DATA units (the 1-D widget uses the signal-axis
+        calibration), so the cap in data units is MAX_REGION_EXTENT_PER_DIM*scale.
+        Anchored at the lower edge (x0) so dragging the right edge past the cap
+        just pins it."""
+        if self._widget is None:
+            return
+        try:
+            scale, _ = _signal_axis(self)
+            span_cap = abs(MAX_REGION_EXTENT_PER_DIM * scale)
+            x0 = float(self._widget.x0)
+            x1 = float(self._widget.x1)
+            lo, hi = (x0, x1) if x0 <= x1 else (x1, x0)
+            if (hi - lo) > span_cap:
+                hi = lo + span_cap
+                # Preserve the widget's x0/x1 orientation when writing back.
+                if x0 <= x1:
+                    self._widget.x1 = hi
+                else:
+                    self._widget.x0 = hi
+        except Exception as e:
+            logger.debug("clamping region span extent failed: %s", e)
 
     def _get_selected_indices(self) -> np.ndarray:
         if self._widget is None:
@@ -139,7 +166,12 @@ class LinearRegionSelector(BaseSelector):
             x0, x1 = x1, x0
         start = (x0 - offset) / scale
         end = (x1 - offset) / scale
-        indices = np.arange(int(np.floor(start)), int(np.ceil(end))).reshape(-1, 1)
+        first = int(np.floor(start))
+        last = int(np.ceil(end))
+        # Belt-and-suspenders: cap the span length even if the widget geometry
+        # wasn't clamped (e.g. a programmatic set that bypassed _on_pointer_up).
+        last = min(last, first + MAX_REGION_EXTENT_PER_DIM)
+        indices = np.arange(first, last).reshape(-1, 1)
         if len(indices) == 0:
             indices = np.array([[int(round(start))]])
         return indices

@@ -39,7 +39,7 @@ Slow benchmarks live in `spyde/tests/benchmark_*.py` — run directly (`python -
 ## Dependencies
 
 Python deps are in `pyproject.toml`. Key non-PyPI deps from custom forks (check `pyproject.toml` for the exact pinned branch — they move):
-- `hyperspy` → `github.com/cssfrancis/hyperspy@slice-integrate2` (the navigator `CachedDaskArray` / `get_index` fixes live here — see Live-Display §4)
+- `hyperspy` → `github.com/cssfrancis/hyperspy@slice-integrate2` (the navigator `CachedDaskArray` / `get_index` cache logic lives here — see Live-Display §3)
 - `rosettasciio` → `github.com/cssfrancis/rosettasciio@win32-binary-read`
 
 Frontend deps (Electron, React, electron-vite, Playwright) are in `electron/package.json`.
@@ -87,7 +87,7 @@ Supported file extensions: `.hspy`, `.zspy`, `.mrc`, `.tif`, `.tiff`, `.de5` (se
 Key methods: `.submit()`, `.compute()`, `.compute_chunks_progressive()` (streaming chunk results). Callers never import Dask directly; switch modes by swapping the backend instance.
 
 ### Workers (`spyde/workers/`)
-- `plot_update_worker.py`: `PlotUpdateWorker` runs on a **plain daemon thread** (not a `QThread`); polls `dask.distributed.Future` objects, reads the completed result (from the per-plot shm buffer for the navigator path), and **marshals the apply onto the asyncio main thread** via the `dispatch` callback (`loop.call_soon_threadsafe`) → `Session._on_plot_ready` / `_on_signal_ready`. It emits via `psygnal` signals, not Qt signals.
+- `plot_update_worker.py`: `PlotUpdateWorker` runs on a **plain daemon thread** (not a `QThread`); polls `dask.distributed.Future` objects for the **VI / signal-output** paths (the per-frame navigator read is now a synchronous cached read on the dispatcher — see Live-Display §3), reads the completed result (from the per-plot shm buffer where used), and **marshals the apply onto the asyncio main thread** via the `dispatch` callback (`loop.call_soon_threadsafe`) → `Session._on_plot_ready` / `_on_signal_ready`. It emits via `psygnal` signals, not Qt signals.
 
 ### Live Instrument Control (`spyde/live/`)
 WIP modules for live microscope control: camera, stage, STEM, TEM, particle scanning, reference.
@@ -127,7 +127,8 @@ Tests are **Qt-free** (no `pytest-qt`, no `QApplication`). They build a real `Se
 **Do NOT hand-roll a launcher.** A proven, signal-based Playwright harness already exists — copy it, don't reinvent it (repeatedly writing throwaway `_electron` probe scripts with blind `waitForTimeout`s wasted an entire session and mis-diagnosed the harness's own noise as app bugs).
 
 - **Harness:** `electron/tests/_harness.cjs` — `launchApp({dask:true, env})` waits for `[spyde backend] ready` + `dask_ready`; gives `backend.waitForLog`/`waitForMessage`, `waitForSubwindowCount`, `countColorPixels`, and `assertNoJsErrors`. **Copy the shape of `find_vectors_workflow.spec.ts`** (real Dask + bundled-synthetic data) for anything vectors/strain/orientation.
-- **Load real-ish data the way a user does:** `backendAction(page, 'load_test_data_si_grains')` (bundled synthetic, crisp reciprocal lattice — find-vectors can actually detect spots) or `load_example {name}` (Examples menu; `zrnb_precipitate` etc., needs download+dask). `load_test_data*`/`load_test_vectors` are the fast bundled paths.
+- **Load real-ish data the way a user does:** `backendAction(page, 'load_test_data_si_grains')` (bundled synthetic, crisp reciprocal lattice — find-vectors can actually detect spots) or `load_example {name}` (Examples menu; `zrnb_precipitate` etc., needs download+dask). `load_test_data*`/`load_test_vectors` are the fast bundled paths. `load_test_data_movie` (6 × 2048² uint16, 1 frame/chunk lazy, no file) is the synthetic in-situ movie for the GPU/tile path — asymmetric content (corner blocks, per-frame index band, fine checkerboard) makes mirror / stale-frame / blurry-tile bugs pixel-visible; `SPYDE_GPU_IMAGE=0` in `launchApp({env})` forces the Canvas2D reference render of the same scene (`gpu_image_parity.spec.ts` is the GPU-vs-CPU screenshot-parity + pan-direction + no-flash spec).
+- **GPU render math belongs in anyplotlib's own suite first:** headless Playwright CAN run real WebGPU — `chromium.launch(channel="chromium", args=["--enable-unsafe-webgpu"])` (the default headless SHELL has no `navigator.gpu`; probe on a `file://` page — secure context) — and `page.screenshot()` captures the gpuCanvas there. The library-level GPU-vs-CPU parity suite is `anyplotlib/tests/test_plot2d/test_gpu_parity_playwright.py`; the SpyDE spec covers app integration (tile backend, binary transport, detail-tile round trip), not shader math.
 - **Screenshot each stage** to `electron/<name>_shots/NN-step.png` and Read them. A blank/black frame is a failure to launch or a stale placeholder, not success.
 - **Backend `emit`/`emit_error`/`emit_status` do NOT reach Playwright stdout** (they're the `PLOTAPP:` line protocol, consumed by the main process). To see a backend error, either read `ctx.backend.logBuffer` at the end of the test, or set `SPYDE_LOG_LEVEL=WARNING` in `launchApp({env})` so `logging` tees to stderr (which the harness captures). Watching plain stdout for a status string will silently miss the error.
 - **Run:** `npx playwright test tests/<spec>.spec.ts --project=electron --reporter=line --retries=0`. Kill strays first if flaky (`Get-Process electron,python | Stop-Process -Force`), but don't over-attribute flakiness to the app — a polluted local env (repeated relaunches, leftover processes) produces slow dask / port contention that is YOUR test setup, not a real bug. On this dev box a healthy `LocalCluster` scheduler starts in ~1 s.
@@ -150,7 +151,7 @@ The 5D path slices by time index first (`raw[t, ...]`), producing a 4D chunk —
 
 - UI/figure updates must happen on the **asyncio main thread**. Background workers (e.g. `PlotUpdateWorker`, the `_NavDispatcher`) must marshal their results back via `Session._dispatch_to_main` (`loop.call_soon_threadsafe`) — never push to a `Plot`/emit IPC directly from the worker thread.
 - Dask cluster startup is asynchronous (`DaskManager` builds it on a background thread and signals `ready` / `workers_ready`). Don't block the main loop waiting for it; submit compute only once a client exists.
-- All navigator updates run serially on the single `_NavDispatcher` thread (latest-position-wins coalescing), so the hyperspy cache is never re-entered concurrently — no lock needed. See Live-Display §2 and §4.
+- All navigator updates run serially on the single `_NavDispatcher` thread (latest-position-wins coalescing), so the hyperspy cache is never re-entered concurrently — no lock needed. See Live-Display §2 and §3.
 
 ## Live-Display Core Patterns (DO NOT "CLEAN UP" — they look hacky but every alternative tried is worse)
 
@@ -188,8 +189,9 @@ The navigator→signal update path must be **non-blocking** AND **non-concurrent
 Every selector update runs on a single dedicated daemon thread, `_NavDispatcher`
 (`base_selector.py`): `submit(selector)` coalesces by `id(selector)` (a newer
 position replaces the queued one), and the worker runs one `_run_update` at a time.
-The plot applies only the result of its current future (`plot.current_data is
-future` staleness guard in `_on_plot_ready`), so superseded frames are dropped.
+`_run_update` computes the frame synchronously (§3) and paints the returned ndarray;
+superseded positions are dropped from the pending slot before they ever run, so no
+in-flight staleness guard is needed for the nav read.
 
 - **Why one thread, not per-update `threading.Timer`s:** concurrent updates raced
   hyperspy's `CachedDaskArray` block bookkeeping (`ValueError: (i, j) is not in
@@ -200,84 +202,160 @@ future` staleness guard in `_on_plot_ready`), so superseded frames are dropped.
 - `_run_update` commits `current_indices` **up front** then short-circuits an
   identical position, because the widget fires `pointer_move` + `pointer_up` =
   two submits per release.
-- **Settle re-fire:** during a fast drag the in-flight futures get cancelled by
-  latest-wins; `update_data` (re)arms ONE trailing timer (`_settle_timer`) that
-  fires a single `force=True` update once motion stops, so the resting frame
-  computes even if the user just holds still mid-drag. It has NO in-flight gate, so
-  it cannot wedge.
-- **Do NOT add self-pacing or a buffer ring** (skip-while-in-flight, per-future shm
-  slots). Both were tried; both made it worse — a wedged gate / an infinite
-  ~6-frame re-emit loop. Single shm buffer + serial dispatcher + latest-wins is it.
-- A **cancelled** future is `done()` but its work never ran — never read its
-  result/buffer (`read_shared_array` rejects an empty/torn buffer; `_on_plot_ready`
-  drops superseded/torn results silently). Some churn is expected under latest-wins.
-  But if EVERY get_inds/write future ends `cancelled`, that's the bug in §4 — fix it.
+- **Settle re-fire:** the `_settle_timer` (re)armed by `update_data` fires ONE
+  `force=True` update once motion stops, so the resting frame computes even if the
+  user holds still mid-drag. It has NO in-flight gate, so it cannot wedge. (Still
+  useful: coalescing drops intermediate positions; the settle guarantees the final
+  one runs.)
+- **Do NOT add self-pacing or a buffer ring** (skip-while-in-flight, per-future
+  slots). Both were tried; both made it worse — a wedged gate / an infinite ~6-frame
+  re-emit loop. Serial dispatcher + latest-wins coalescing is it.
 - Tests pin the contract: `test_navigator_race.py` (slow update must not block a
-  newer one; stale result must not clobber), `test_shm_read_robust.py`.
+  newer one; stale result must not clobber), `test_nav_cached_read.py` (the unified
+  read's single/region/dtype behaviour), `test_shm_read_robust.py`.
 
-### 3. Fast shared-memory display path — bypass TCP for the navigator image
+### 3. Navigator frame read — TIERED: synchronous cached read for CHEAP reads, async + cancellable for EXPENSIVE ones
 
-For the distributed path, a chunk result is written into a per-plot **shared-memory
-buffer** (`write_shared_array` / `read_shared_array`) and the `PlotUpdateWorker`
-reads it locally when the future completes — instead of transferring the array over
-the Dask TCP comm. This optimized navigator/VI pipeline's *approach* was carried
-over from the original Qt app; the reused single buffer is race-safe because only
-the LATEST future's result is applied (the `plot.current_data is future` staleness
-guard in `_on_plot_ready`) — a frame clobbered by a newer write was going to be
-dropped anyway. (Do NOT add a per-future buffer ring; see §2/§4.) The progressive
-navigator (`signal_tree._start_progressive_nav_compute` +
-`compute_with_live_buffer`) paints per-chunk into this buffer so a multi-GB
-navigator fills top-to-bottom instead of blanking until the whole sum finishes.
+A **cheap** read (single point / small dwell-in-chunk / small region) is computed
+**synchronously, right on the `_NavDispatcher` thread**, in
+`update_from_navigation_selection`: it calls
+`current_signal._get_cache_dask_chunk(indices, get_result=True)` with the cache's
+`_client` forced to `None` (or `_direct_read_frame` for a direct slice), and returns
+the resulting **numpy array** directly. `Plot.update_data` paints an ndarray
+immediately — no distributed Future, no shared-memory buffer, no `PlotUpdateWorker`
+poll for the cheap nav path. This is the fast common case and stays fully synchronous.
 
-- Don't replace the shm path with `future.result()` over TCP "for simplicity" —
-  it's measurably slower on real scans and was deliberately built this way.
-- Compute navigator display levels from the FULL accumulated finite data
-  (robust 2–98% percentiles), with a final uniform repaint when the fill
-  completes — per-chunk min/max levels make the contrast jump at chunk seams.
+- **Derived views (rebin / crop / rechunk / .zspy) are SYNCHRONOUS + chunk-cached — NOT
+  async.** They have no hyperspy `CachedDaskArray`, so a naive read re-decodes + re-runs
+  the transform on the WHOLE source nav-chunk every move (dask must materialise the whole
+  chunk to yield any one frame — and re-decompress it on `.zspy`). `Plot._nav_chunk_cache`
+  (`_NavChunkCache` in `update_functions.py`) decodes each output nav-chunk ONCE and
+  slices frames out of it, so dwell-in-chunk is a ~0 ms numpy slice (measured 145× on a
+  12×12-nav-chunk 4D-STEM rebin; ~9 ms/decode → ~0 ms/dwell). This rebuilds, for derived
+  views, exactly what `CachedDaskArray` gives the base signal. Keyed by
+  `(id(signal), block-index)`, bounded by `MAX_CACHED_FRAMES`, cleared on node switch /
+  close, touched only on the dispatcher thread (no lock). `_direct_read_frame`'s
+  single-point branch reads through it. **Do NOT route derived single-point reads async**
+  — the transform recompute is only ~5–9 ms, while the async round-trip is 4 thread hops +
+  2 event-loop turns + ~15–40 ms; async was pure overhead there (the "everything is
+  async-submits and slow" regression).
+- **Tiered routing** (`_classify_nav_read`, called before the read): async
+  (`_submit_async_nav_read` → `Session.compute_backend.submit_graph(lazy)` OFF the
+  dispatcher, cancellable via `plot._nav_future`, paint from the done-callback) fires
+  ONLY for reads that would genuinely FREEZE the navigator: a **large region**
+  (`> REGION_ASYNC_FRAME_CAP=48` frames — a maxed 4D-STEM 16×16=256-frame region is
+  ~0.5–0.9 s synchronously; a maxed movie 16-frame region is ~64 ms, stays sync) or
+  `> REGION_BYTES_CAP`, or a **cold HUGE single frame on a CACHED signal**
+  (`> COLD_FRAME_CAP` and not resident). The dispatcher returns `None` → `_run_update`
+  skips the synchronous paint; the last good frame stays up until the async result lands
+  (no flash). The async machinery is retained (audited) but fires far less often.
+- **Region extent cap (Tier 0):** an integrating ROI/span is clamped to
+  `MAX_REGION_EXTENT_PER_DIM=16` nav positions PER navigation dimension on the widget
+  geometry (`RectangleSelector._clamp_extent` / `LinearRegionSelector._clamp_extent`) —
+  the ROI physically stops growing — so a region read can never accidentally integrate
+  a huge number of positions (worst case 16×16=256 frames). See `test_region_extent_cap.py`.
+- **Paint is DECOUPLED from the read (slider stays live):** the read stays serial on the
+  `_NavDispatcher`, but the PAINT (`set_data` → binary-uint8 → stdout, ~8–70 ms) runs on a
+  separate serial newest-wins painter thread (`_NavPainter` in `plot.py`;
+  `Plot.enqueue_paint` enqueues, `_run_update` calls it instead of painting inline). So a
+  slow transport/decode doesn't block reading the NEXT slider position — the slider tracks
+  the cursor and the display lags a frame behind + catches up (instead of the slider
+  "catching" at slow frames). A frame superseded before it paints is DROPPED (newest-wins by
+  `id(plot)`); stdout PLOTBIN writes stay serialized (one painter thread). This is NOT the
+  retired READ self-pacing/buffer-ring — it's a newest-wins single-slot PAINT decouple. See
+  `test_nav_paint_decouple.py`.
+- **Large signal frames use anyplotlib TILE MODE (crisp zoom, no flash) — anyplotlib owns
+  it, not SpyDE.** A big (≥1024 edge) signal frame is handed to anyplotlib's tiled display
+  via `Plot._maybe_tile_signal` (in `_set_array`): it wraps the native frame in a
+  `NumpyTileBackend` and calls `plot._plot2d.enable_tile(...)`. anyplotlib then owns the
+  whole loop — it sends a downsampled OVERVIEW as the base (logical `image_width` = full
+  size, `base_width` = overview px), reacts to its OWN debounced `view_changed`, and samples
+  a hi-res detail tile of the visible region (1.25× over-fetch) at panel resolution. Each nav
+  move swaps the frame via `update_tile_source(native)` — the zoom/subselection PERSIST while
+  the pixels refresh (live-data contract). SpyDE no longer computes viewport crops or a base
+  LOD for tiled frames. Why a tile not a full-res send: the ~400 ms full-res cost is
+  dominated by normalising 16 M pixels (~100 ms) + the renderer receive; a tile processes
+  only the ~1 MP the screen shows and scales to any image size. The default backend is
+  numpy (a fast vectorised box-mean — GPU/torch measured not worth the dep for a ~1 MP
+  visualisation sample, and numpy works on Mac too); a custom `TileBackend` (owns the source
+  + sampling) can swap in for out-of-core/GPU. anyplotlib: `Plot2D.enable_tile` /
+  `update_tile_source` / `set_detail` / `_detailUV`; `imshow(huge, tile="auto",
+  integration_method="mean")` is the public API. See SpyDE `test_viewport_detail.py`;
+  anyplotlib `test_tiled_imshow.py`, `test_tile_backend.py`, `test_detail_tile.py`.
+- **Base frame SUBSAMPLES cheaply** (`data[::stride]`, ~1 ms): the base is just a
+  thumbnail the GPU upscales for the zoomed-OUT overview — real detail always comes from
+  the detail tile (which crops the NATIVE `current_data` on zoom, NOT this decimated copy).
+  An area-MEAN of the base was ~70 ms on a uint16 4096² (the float32 cast of 16 M px alone
+  is ~34 ms) and dominated the paint — not worth it for a thumbnail. `_lod_downsample` (a
+  fast strided-add box-mean, ~40 ms, no full float cast) still exists but is used ONLY to
+  cap an oversized detail-tile crop (deep zoom into a huge region). NB the LOD rebinds a
+  LOCAL `data`; `current_data` stays the native frame so the tile crops native detail. See
+  `test_lod_display.py`.
 
-### 4. **The DP-stuck-on-a-stale-frame trap (cost a brutal multi-hour session — DO NOT re-derive)**
+- **Why it's fast:** hyperspy's `CachedDaskArray` keeps the loaded chunk in a numpy
+  cache. With **no client**, `get_index` takes its **synchronous** branch (cache the
+  block, then slice/mean it in numpy) — ~1–2 ms dwell-in-chunk hits vs ~16 ms for the
+  distributed round-trip (~100 ms cross-chunk). A 4D-STEM DP navigator dwells *within*
+  a nav chunk → fast hits; an in-situ movie is 1 frame/chunk → each move is a small
+  cold read of just that frame.
+- **CRITICAL — `_client = None` alone is NOT enough** (this was a silent
+  perf-only bug for a while). The fork's `CachedDaskArray.client` property, when
+  `_client is None`, falls back to `dask.distributed.get_client()`, which returns the
+  app's **process-global default `Client(cluster)`** from ANY thread (the
+  `_NavDispatcher` thread included — it does NOT raise). So the pin was a no-op with a
+  live cluster and every nav move still went distributed. `heavy_imports.
+  _patch_cached_dask_client()` (applied in `ensure_heavy_imports`) removes that
+  fallback so `_client = None` truly selects the synchronous branch. Tests never
+  caught it because they run `SPYDE_NO_DASK=1` (no default client). See
+  `test_cache_client_patch.py`; measured numbers in `benchmarks.md`.
+- **Latest-wins — cheap vs expensive:** for a **cheap** read the serial dispatcher
+  coalesces by `id(selector)`, so a superseded position is dropped from the pending slot
+  before it ever runs — no in-flight compute to cancel. For an **expensive** read the
+  dispatcher returns immediately after submitting, so a newer position must actively
+  **cancel** the prior `plot._nav_future` (`fut.cancel()` in `_submit_async_nav_read`;
+  a cheap paint also cancels+clears any stale `_nav_future` in `_run_update`). A queued
+  future cancels cleanly; an already-running threaded one runs to completion but its
+  callback no-ops via the `plot._nav_future is not fut` identity check (no lock, no
+  generation counter — all on the one dispatcher thread). The settle re-fire still fires
+  the (possibly expensive) authoritative read for the resting position at full res.
+  See `test_nav_async_cancel.py`, `test_nav_rebin_no_block.py`, `test_nav_tiered_classify.py`.
+- **dtype parity:** the synchronous branch returns float64 via `np.mean`. For an
+  INTEGER source, round back to the frame dtype (no-op on a single point; correct
+  rounded mean for an integrating region) so the DP shows the SAME uint16 frame +
+  contrast the old distributed path did (`weighted_mean_round_from_sums`). This is
+  the one non-obvious behaviour — see `test_nav_cached_read.py`.
+- **Same slice semantics for everything lazy:** it's just "compute this lazy slice", so
+  a cropped (`s.inav[..].isig[..]`) / rebinned / `.zspy` view scrubs through the same
+  read — cheap ones synchronously, a heavy derived view via the async tier
+  (`_build_nav_lazy_slice` builds the identical expression for both paths). A 1-D
+  derived-view scrub also warms its **source** chunk off-thread (the movie prefetcher
+  primed with the derived array) so the next re-decode reads warm pages.
+- `write_shared_array` / `read_shared_array` and the shm buffer **remain** — but only
+  for the **VI / progressive-navigator-fill** paths (`stream_progressive_to_plot`,
+  `signal_tree._start_progressive_nav_compute`), NOT the per-frame nav read.
+- Compute navigator (VI) display levels from the FULL accumulated finite data
+  (robust 2–98% percentiles), with a final uniform repaint when the fill completes.
 
-**Symptom:** dragging the navigator, the diffraction pattern (signal plot) freezes
-on one frame; you may also see nothing in the Dask dashboard. The selector reports
-changing indices and distinct `write_shared_array` futures fire per move, but
-`[plot-paint] SIG` shows the **same content hash** every frame. It "used to work."
-
-**There are TWO independent causes and you must fix BOTH. Diagnose, don't guess —
-the path is: selector → `_run_update` → `update_from_navigation_selection` →
-`CachedDaskArray.get_index(return_future=True)` (get_inds future) →
-`client.submit(write_shared_array, get_inds_fut, …)` → shm → `PlotUpdateWorker` →
-`_on_plot_ready`. Add `[plot-paint] hash=`, then a `[LIFE]` done-callback logging
-`getinds_fut.status` + `write_fut.status`. If both are `cancelled`, it's the two
-causes below. If the get_inds future is a NUMPY array (not a Future), it's the
-ambient-client cause alone.**
-
-1. **`CachedDaskArray._client` must be pinned to `DaskManager.client`.** The
-   `.client` property falls back to `dask.distributed.get_client()` when `_client`
-   is unset. Navigator updates run on the **`_NavDispatcher` thread** (a plain
-   `threading.Thread`, not a Dask worker) where `get_client()` raises → returns
-   `None` → the cache does a **silent synchronous threaded compute** (no dashboard
-   tasks; `return_future=True` returns a numpy array, not a future; flapping
-   client across threads corrupts the cached block state). FIX in
-   `update_from_navigation_selection`, BEFORE `_get_cache_dask_chunk`:
-   `cached_arr._client = child.main_window.dask_manager.client`.
-
-2. **Do NOT `cancel_surrounding()` before the chunk request, and HOLD the get_inds
-   future alive until its write lands.** Two things were cancelling EVERY get_inds
-   (and its dependent `write_shared_array`) → state `cancelled` → the buffer kept
-   the last surviving frame: (a) `cancel_surrounding()` cancels prefetch block
-   futures, cascading into the core block the in-flight get_inds depends on —
-   **removed that call**; (b) `current_img = fut` dropped the only client-side ref
-   to the get_inds future, so distributed sent release-key and cancelled it before
-   the write pulled its dependency — **now stashed on `plot._inflight_getinds[fut.key]`
-   and released in the write's done-callback**. A cancelled future is `done()` but
-   never ran; its shm write never happened.
-
-Repros: `spyde/tests/repro_cache_client_thread.py` (prints `cache.client=THREADED/none`
-from a timer thread) and `spyde/tests/repro_write_cancelled.py` (write future ends
-`cancelled`). **Do NOT "fix" this with a buffer ring or self-pacing on `update_data`
-— both were tried, both made it worse (infinite 6-frame re-emit loop / wedged
-gate). Single shm buffer + serial dispatcher + latest-wins + the two fixes above is
-the working design.**
+> **History (do NOT re-introduce):** the nav read USED to submit a distributed
+> `get_inds` future + `write_shared_array` into a per-plot shm buffer, polled by
+> `PlotUpdateWorker`. That path needed two hard-won fixes to avoid a DP frozen on a
+> stale frame — pinning `CachedDaskArray._client` to the cluster and holding the
+> get_inds future alive (`plot._inflight_getinds`) so distributed didn't
+> release-key-cancel it. Both are now MOOT: the read is serial + blocking, so nothing
+> is submitted to cancel and no future can be lost. The retired repros
+> (`repro_cache_client_thread.py`, `repro_write_cancelled.py`) documented that dead
+> machinery. Don't add a buffer ring or self-pacing (tried, both worse: wedged gate /
+> infinite ~6-frame re-emit). NB: the safety came from **seriality + blocking**, not
+> from which `get_index` branch runs — a serial blocking read is correct either way
+> (the `_client=None` patch just makes it also FAST; see §3).
+>
+> **Tiered read (the expensive tier does NOT revive that machinery):** the async path
+> for expensive reads uses ONE cancellable `submit_graph` frame future +
+> `add_done_callback` → `_dispatch_to_main` paint. There is no `get_inds`, no
+> `write_shared_array`, no shm ring, no `PlotUpdateWorker` poll, no self-pacing — a
+> superseded read is cancelled by identity on the one dispatcher thread. The CHEAP tier
+> is exactly the old synchronous read, untouched. So "expensive reads are async again"
+> is restored WITHOUT the retired distributed per-frame path.
 
 ## GPU Computing
 

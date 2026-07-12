@@ -144,6 +144,10 @@ class RegionAction(Action):
     #: Dimensionality of the output plot (2 = image, 1 = line).
     output_dims: int = 2
     output_node_name: str = "Region"
+    #: Y-axis label for a 1-D output plot (``output_dims == 1``). Stamped onto the
+    #: output signal's ``metadata.Signal.quantity`` so the line plot draws it —
+    #: see ``Plot._axes_info_1d``. ``None`` falls back to the generic "Intensity".
+    output_y_label: str | None = None
     #: Optional ROI colour (e.g. multi virtual-image "red"/"green"/…).
     roi_color: str | None = None
 
@@ -158,7 +162,16 @@ class RegionAction(Action):
     def placeholder_signal(self):
         """Signal shown in the output plot before the first reduce."""
         if self.output_dims == 1:
-            return hs.signals.Signal1D(np.zeros(10))
+            sig = hs.signals.Signal1D(np.zeros(10))
+            # Stamp the y-axis label so the 1-D line plot shows it (read from
+            # metadata.Signal.quantity by Plot._axes_info_1d). Default when the
+            # action doesn't declare one is handled downstream ("Intensity").
+            if self.output_y_label:
+                try:
+                    sig.metadata.set_item("Signal.quantity", self.output_y_label)
+                except Exception:
+                    pass
+            return sig
         return hs.signals.Signal2D(np.zeros((10, 10)))
 
     def reduce(self, signal, selector: "BaseSelector", indices, **params):
