@@ -222,8 +222,14 @@ test('6) save to an explicit path and validate the zip contents', async () => {
     timeout: 10_000, message: 'report file was never written',
   }).toBe(true)
 
-  // Unzip via bsdtar (Windows tar handles zip) into the work dir.
-  execFileSync('tar', ['-xf', reportPath, '-C', workDir], { stdio: 'pipe' })
+  // Unzip via bsdtar (Windows tar handles zip) into the work dir. Resolve the
+  // System32 binary explicitly on Windows: a bare 'tar' can resolve to git's
+  // GNU tar depending on the spawning shell's PATH, and GNU tar treats the
+  // drive-letter in an absolute 'C:\...' path as a remote-host prefix.
+  const tarExe = process.platform === 'win32'
+    ? join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'tar.exe')
+    : 'tar'
+  execFileSync(tarExe, ['-xf', reportPath, '-C', workDir], { stdio: 'pipe' })
   // tar extracts report.md / figures/ / assets/ under workDir.
   const mdPath = join(workDir, 'report.md')
   expect(existsSync(mdPath)).toBe(true)

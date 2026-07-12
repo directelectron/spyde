@@ -7,6 +7,7 @@
 import React from 'react'
 import { useSpyDE } from '../kernel/SpyDEContext'
 import type { TreeNode, AxisRow } from '../kernel/SpyDEContext'
+import type { LayerState, LayersStateMessage } from '../kernel/protocol'
 import { WORKFLOW_NODE_DRAG_MIME } from '../kernel/dnd'
 import { CompositionPanel } from './CompositionPanel'
 
@@ -285,6 +286,145 @@ function Histogram({ counts, edges, vmin, vmax, threshold, onClim }:
   )
 }
 
+// One layer row: colour-coded title, colormap select, alpha slider (debounced
+// live overlay_set), a visibility toggle, and remove. `sendSet` is a per-row
+// debounced sender (mirrors wizardHooks' useDebouncedAction pattern) so a
+// dragged alpha slider doesn't flood overlay_set.
+function LayerRow({ layer, dotColor, onCmap, onAlpha, onVisible, onRemove }: {
+  layer: LayerState
+  dotColor: string
+  onCmap: (cmap: string) => void
+  onAlpha: (alpha: number) => void
+  onVisible: (visible: boolean) => void
+  onRemove: () => void
+}) {
+  // Local alpha draft so the slider tracks the pointer smoothly between
+  // debounced sends (mirrors the clim-drag pattern above).
+  const [draftAlpha, setDraftAlpha] = React.useState(layer.alpha)
+  React.useEffect(() => { setDraftAlpha(layer.alpha) }, [layer.alpha])
+
+  return (
+    <div data-testid={`layer-row-${layer.id}`} style={styles.layerRow}>
+      <div style={styles.toggleRow}>
+        <span style={{ ...styles.selectorDot, background: dotColor }} title={layer.title} />
+        <span style={styles.layerTitle} title={layer.title}>{layer.title || 'Layer'}</span>
+        <button
+          data-testid={`layer-visible-${layer.id}`}
+          title={layer.visible ? 'Hide layer' : 'Show layer'}
+          onClick={() => onVisible(!layer.visible)}
+          style={layer.visible ? styles.eyeOn : styles.eyeOff}
+        >
+          {layer.visible ? '◉' : '○'}
+        </button>
+        <button
+          data-testid={`layer-remove-${layer.id}`}
+          title="Remove layer"
+          onClick={onRemove}
+          style={styles.removeBtn}
+        >
+          {'×'}
+        </button>
+      </div>
+      <div style={styles.row}>
+        <select
+          data-testid={`layer-cmap-${layer.id}`}
+          style={{ ...styles.select, flex: 1 }}
+          value={layer.cmap}
+          onChange={(e) => onCmap(e.target.value)}
+        >
+          {COLORMAPS.map(c => <option key={c} value={c}>{c}</option>)}
+        </select>
+      </div>
+      <div style={styles.toggleRow}>
+        <span style={styles.hint}>alpha</span>
+        <input
+          data-testid={`layer-alpha-${layer.id}`}
+          type="range" min={0} max={1} step={0.05}
+          value={draftAlpha}
+          onChange={(e) => {
+            const v = Number(e.target.value)
+            setDraftAlpha(v)
+            onAlpha(v)
+          }}
+          style={{ flex: 1 }}
+        />
+        <span style={{ ...styles.hint, minWidth: 28, textAlign: 'right' }}>
+          {draftAlpha.toFixed(2)}
+        </span>
+      </div>
+    </div>
+  )
+}
+
+// A small palette cycled per-row so each layer's title dot reads as visually
+// distinct (mirrors the backend's own _LAYER_CMAP_CYCLE intent, but this is
+// just a UI accent — the authoritative appearance is layer.cmap).
+const LAYER_DOT_COLORS = ['#f38ba8', '#a6e3a1', '#f9e2af', '#89b4fa', '#cba6f7', '#94e2d5']
+
+// "Layers" section: live overlay stack for the ACTIVE window (MDI image
+// layering — spyde/actions/overlay.py). Listens for `spyde:layers_state`
+// CustomEvents (re-broadcast by SpyDEContext) filtered to the active window,
+// and re-queries on active-window change. Renders nothing when there are no
+// layers (including no active window).
+function LayersSection({ activeId, sendAction }: {
+  activeId: number | null
+  sendAction: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
+}) {
+  const [layers, setLayers] = React.useState<LayerState[]>([])
+
+  React.useEffect(() => {
+    setLayers([])
+    if (activeId == null) return
+    sendAction('overlay_query', { window_id: activeId }, activeId)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeId])
+
+  React.useEffect(() => {
+    const on = (e: Event) => {
+      const msg = (e as CustomEvent).detail as LayersStateMessage
+      if (activeId == null || msg.window_id !== activeId) return
+      setLayers(msg.layers ?? [])
+    }
+    window.addEventListener('spyde:layers_state', on)
+    return () => window.removeEventListener('spyde:layers_state', on)
+  }, [activeId])
+
+  // Debounced per-layer overlay_set sender — keyed by layer id so dragging one
+  // layer's alpha doesn't cancel another's pending send.
+  const timers = React.useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
+  React.useEffect(() => {
+    const t = timers.current
+    return () => { t.forEach(clearTimeout); t.clear() }
+  }, [])
+  const sendSet = (layerId: string, payload: Record<string, unknown>, ms = 150) => {
+    if (activeId == null) return
+    const existing = timers.current.get(layerId)
+    if (existing) clearTimeout(existing)
+    timers.current.set(layerId, setTimeout(() => {
+      sendAction('overlay_set', { window_id: activeId, layer_id: layerId, ...payload }, activeId)
+    }, ms))
+  }
+
+  if (activeId == null || layers.length === 0) return null
+
+  return (
+    <div style={styles.section} data-testid="layers-section">
+      <div style={styles.label}>Layers</div>
+      {layers.map((layer, i) => (
+        <LayerRow
+          key={layer.id}
+          layer={layer}
+          dotColor={LAYER_DOT_COLORS[i % LAYER_DOT_COLORS.length]}
+          onCmap={(cmap) => sendAction('overlay_set', { window_id: activeId, layer_id: layer.id, cmap }, activeId)}
+          onAlpha={(alpha) => sendSet(layer.id, { alpha })}
+          onVisible={(visible) => sendAction('overlay_set', { window_id: activeId, layer_id: layer.id, visible }, activeId)}
+          onRemove={() => sendAction('overlay_remove', { window_id: activeId, layer_id: layer.id }, activeId)}
+        />
+      ))}
+    </div>
+  )
+}
+
 export function PlotControlDock() {
   const { state, sendAction } = useSpyDE()
   const activeId = state.activeWindowId
@@ -453,6 +593,9 @@ export function PlotControlDock() {
         </div>
       )}
 
+      {/* 6. Layers — live MDI image overlay stack (spyde/actions/overlay.py) */}
+      {win && <LayersSection activeId={activeId} sendAction={sendAction} />}
+
       {/* Navigator Selector (bottom) — one row per selector, with its colour dot */}
       {navSelectors.length > 0 && (
         <div style={styles.section} data-testid="selector-control">
@@ -584,5 +727,25 @@ const styles: Record<string, React.CSSProperties> = {
     border: '1px solid #ffae57', background: '#ffae57', color: '#11111b',
     borderRadius: 3, width: 14, height: 14, lineHeight: '12px', fontSize: 11,
     padding: 0, cursor: 'pointer', fontWeight: 700,
+  },
+  layerRow: {
+    display: 'flex', flexDirection: 'column', gap: 4,
+    padding: '6px 0', borderBottom: '1px solid #1e1e2e',
+  },
+  layerTitle: {
+    flex: 1, fontSize: 11, color: '#cdd6f4', minWidth: 0,
+    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+  },
+  eyeOn: {
+    background: 'none', border: 'none', color: '#89b4fa', cursor: 'pointer',
+    fontSize: 12, padding: '0 4px', lineHeight: 1,
+  },
+  eyeOff: {
+    background: 'none', border: 'none', color: '#585b70', cursor: 'pointer',
+    fontSize: 12, padding: '0 4px', lineHeight: 1,
+  },
+  removeBtn: {
+    background: 'none', border: 'none', color: '#f38ba8', cursor: 'pointer',
+    fontSize: 13, padding: '0 4px', lineHeight: 1, fontWeight: 700,
   },
 }

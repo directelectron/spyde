@@ -301,6 +301,53 @@ export interface LogLevelMessage extends MsgBase {
 
 // ── Report ─────────────────────────────────────────────────────────────────
 
+/** A layer within a report figure panel (the PIXEL-FREE recipe, from
+ *  `LayerSpec.to_dict()`). `source.title` names the layer in the edit toolbar. */
+export interface RepfigLayer {
+  id: string
+  source?: {
+    file_path?: string | null
+    tree_node?: string | null
+    view?: string | null
+    title?: string | null
+    [k: string]: unknown
+  }
+  cmap: string
+  clim?: [number, number] | null
+  alpha: number
+  visible: boolean
+}
+
+/** One panel of a report figure's recipe (from `PanelSpec.to_dict()`). The
+ *  `axes` dict carries `x_axis`/`y_axis` float arrays (snapshot-time calibration)
+ *  used to derive a sensible data-coord default for a new annotation. */
+export interface RepfigPanel {
+  id: string
+  grid_pos: [number, number]
+  kind: string
+  layers: RepfigLayer[]
+  axes?: {
+    units?: string
+    x_axis?: number[]
+    y_axis?: number[]
+    [k: string]: unknown
+  } | null
+  annotations: Array<Record<string, unknown> & { kind: string }>
+  scalebar?: boolean
+  colorbar?: boolean
+  title?: string
+  insets?: Array<Record<string, unknown>>
+}
+
+/** A report figure cell's full recipe (from `FigureSpec.to_dict()`) — shipped
+ *  pixel-free in `report_state` so the edit toolbar can list panels/layers/
+ *  annotations. */
+export interface RepfigSpec {
+  layout: { kind: string; rows?: number; cols?: number; [k: string]: unknown }
+  panels: RepfigPanel[]
+  nav_context?: { indices?: number[] } | null
+}
+
 /** One cell of the report document (markdown text or an embedded figure). */
 export interface ReportCell {
   id: string
@@ -317,6 +364,9 @@ export interface ReportCell {
   data_offline?: boolean
   /** figure cells: a data-URL PNG fallback (present only for offline cells). */
   png?: string
+  /** figure cells: the pixel-free FigureSpec recipe (panels/layers/annotations)
+   *  driving the edit toolbar. Absent while a cell is a placeholder. */
+  figure?: RepfigSpec
 }
 
 /** The authoritative report document (mirrored by the renderer for editing). */
@@ -367,6 +417,41 @@ export interface WizardEventMessage extends MsgBase {
     | 'gpu_status_result'
 }
 
+// ── MDI image layering (overlay) ────────────────────────────────────────────
+
+/** One layer's appearance, as tracked by the backend (`spyde/actions/overlay.py`
+ *  `PlotLayer.to_state`). */
+export interface LayerState {
+  id: string
+  title: string
+  cmap: string
+  alpha: number
+  clim: [number, number] | null
+  visible: boolean
+}
+
+/** The authoritative layer stack for one target window — emitted after every
+ *  overlay mutation (`overlay_add`/`overlay_set`/`overlay_remove`) and in reply
+ *  to `overlay_query`. */
+export interface LayersStateMessage extends MsgBase {
+  type: 'layers_state'
+  window_id: number
+  layers: LayerState[]
+}
+
+/** Report-cell figure-compose options offered for a source window (consumed by
+ *  the report-builder drop-zone UI, not by this dock). */
+export interface RepfigComposeOptionsMessage extends MsgBase {
+  type: 'repfig_compose_options'
+  cell_id: string
+  source_window_id: number
+  options: string[]
+  detail: {
+    same_shape: boolean
+    nav_signal_pair: boolean
+  }
+}
+
 /** The discriminated union the renderer dispatches over. */
 export type PlotAppMessage =
   | ReadyMessage
@@ -405,6 +490,8 @@ export type PlotAppMessage =
   | ReportNeedSnapshotsMessage
   | ReportSavedMessage
   | WizardEventMessage
+  | LayersStateMessage
+  | RepfigComposeOptionsMessage
 
 /**
  * Narrow a raw incoming message (`Record<string, unknown>` from the IPC bridge)

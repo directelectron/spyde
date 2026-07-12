@@ -9,10 +9,13 @@ import React, {
 } from 'react'
 import { asPlotAppMessage } from './protocol'
 import type { ReportDocState, ReportCell } from './protocol'
+import { WINDOW_DRAG_MIME, FIGURE_DRAG_MIME } from './dnd'
 
 // Re-export the report doc types so components import them from the kernel
 // context (the single import surface the rest of the renderer already uses).
-export type { ReportDocState, ReportCell } from './protocol'
+export type {
+  ReportDocState, ReportCell, RepfigSpec, RepfigPanel, RepfigLayer,
+} from './protocol'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -552,6 +555,13 @@ interface SpyDEContextValue {
   // "Tile" button can trigger it without threading window-layout state (which
   // lives in MDIArea's local refs) through the shared context.
   tileWindowsRef: React.MutableRefObject<(() => void) | null>
+  // What kind of thing is currently being dragged (set from window-level
+  // dragstart/dragend/drop capture listeners by inspecting the drag's MIME
+  // types). 'window' = a window/figure pill (carries a source window); null =
+  // nothing / an unrelated drag. Drives the MDI overlay-drop shield: only when
+  // a window pill is in flight do OTHER SubWindows mount their transparent
+  // drag-shield + "Overlay images" zone over the figure iframe.
+  dragKind: 'window' | null
 }
 
 const SpyDEContext = createContext<SpyDEContextValue | null>(null)
@@ -607,6 +617,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
   const [stackDialogOpen, setStackDialogOpen] = useState(false)
   const [updateDialogOpen, setUpdateDialogOpen] = useState(false)
   const [gpuStatusDialogOpen, setGpuStatusDialogOpen] = useState(false)
+  const [dragKind, setDragKind] = useState<'window' | null>(null)
 
   // Post every stored state for a figure to its iframe (called on iframe load).
   const replayState = (figId: string) => {
@@ -1045,6 +1056,8 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'cod_cif_ready':
         case 'gpu_status_result':
         case 'console_node_bound':
+        case 'layers_state':
+        case 'repfig_compose_options':
           window.dispatchEvent(new CustomEvent(`spyde:${msg.type}`, { detail: msg }))
           break
       }
@@ -1194,6 +1207,53 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     return () => window.removeEventListener('spyde:report_need_snapshots', onNeed)
   }, [requestFigurePng])
 
+  // Global drag-kind tracking: a window-level dragstart listener inspects the
+  // drag's MIME TYPES (readable during a drag; the payload is not) to classify
+  // the in-flight drag. A window/figure pill carries the spyde window MIMEs →
+  // dragKind='window', which the MDI overlay-drop shield + report compose-drop
+  // shield key on. Cleared on dragend/drop so the shields unmount as soon as the
+  // drag ends (whether or not it landed on a window).
+  //
+  // BUBBLE (not capture) phase deliberately: the drag SOURCE is a Pill whose own
+  // onDragStart is what stamps the MIMEs into the DataTransfer. React dispatches
+  // that at its root container, so a native BUBBLE listener on `window` (above
+  // the React root) runs AFTER it — by which time dataTransfer.types is
+  // populated. A capture-phase window listener would run BEFORE the Pill's
+  // setData and see an empty types list. StrictMode-safe: added in an effect
+  // with cleanup, so a re-mount never stacks duplicate listeners.
+  useEffect(() => {
+    const WINDOW_TYPES = [WINDOW_DRAG_MIME, FIGURE_DRAG_MIME]
+    const classify = (e: DragEvent): 'window' | null => {
+      const types = e.dataTransfer?.types
+      if (!types) return null
+      const arr = Array.from(types)
+      // Only classify as 'window' when a window/figure MIME is present; leave it
+      // unchanged (return null → no-op below) for drags that carry NO spyde types
+      // at all yet (some browsers withhold custom types on dragover) so a bare
+      // file/text dragover doesn't clobber an active window drag.
+      return WINDOW_TYPES.some(t => arr.includes(t)) ? 'window' : null
+    }
+    const onDragStart = (e: DragEvent) => setDragKind(classify(e))
+    // dragover is a belt-and-braces re-classify: if dragstart's read raced the
+    // source's setData (ordering across the React-root vs window listeners), the
+    // first dragover — where types are reliably populated — sets it. Only ever
+    // PROMOTES to 'window'; never clears (clearing is dragend/drop's job).
+    const onDragOver = (e: DragEvent) => {
+      if (classify(e) === 'window') setDragKind(prev => (prev === 'window' ? prev : 'window'))
+    }
+    const clear = () => setDragKind(null)
+    window.addEventListener('dragstart', onDragStart)
+    window.addEventListener('dragover', onDragOver)
+    window.addEventListener('dragend', clear)
+    window.addEventListener('drop', clear)
+    return () => {
+      window.removeEventListener('dragstart', onDragStart)
+      window.removeEventListener('dragover', onDragOver)
+      window.removeEventListener('dragend', clear)
+      window.removeEventListener('drop', clear)
+    }
+  }, [])
+
   const setActiveWindow = (windowId: number) => {
     dispatch({ type: 'SET_ACTIVE', windowId })
     // Tell the backend too, so window-less actions (e.g. the File→Save menu,
@@ -1216,7 +1276,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
       stackDialogOpen, openStackDialog, closeStackDialog,
       updateDialogOpen, openUpdateDialog, closeUpdateDialog,
       gpuStatusDialogOpen, openGpuStatusDialog, closeGpuStatusDialog,
-      tileWindowsRef,
+      tileWindowsRef, dragKind,
     }}>
       {children}
       {state.backendExited && <BackendExitedOverlay code={state.backendExited.code} />}
