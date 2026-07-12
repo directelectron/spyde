@@ -40,7 +40,7 @@ class TestSchemaCompleteness:
 
 
 class TestSchemaValidity:
-    @pytest.mark.parametrize("key", ["fv", "om", "strain", "vom", "czb"])
+    @pytest.mark.parametrize("key", ["fv", "om", "strain", "vom", "czb", "mvx"])
     def test_entries_well_formed(self, key):
         schema = registry.wizard_parameters(key)
         for pname, spec in schema.items():
@@ -80,6 +80,13 @@ class TestSchemaBackendLockstep:
         for k in ("method", "half_square_width", "make_flat_field"):
             assert schema[k]["default"] == czb.DEFAULTS[k], \
                 f"czb schema/{k} drifted from center_zero_beam.DEFAULTS"
+
+    def test_mvx_defaults(self):
+        from spyde.actions.movie_export.handlers import DEFAULTS
+        schema = registry.wizard_parameters("mvx")
+        for k in ("fps", "downsample", "stride", "cmap", "timestamp", "scalebar"):
+            assert schema[k]["default"] == DEFAULTS[k], \
+                f"mvx schema/{k} drifted from movie_export.handlers.DEFAULTS"
 
     def test_vom_defaults(self):
         from spyde.actions import vector_orientation_om as vom

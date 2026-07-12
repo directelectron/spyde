@@ -116,6 +116,14 @@ STAGED_HANDLERS: dict[str, str] = {
     "overlay_set":             "spyde.actions.overlay.overlay_set",
     "overlay_remove":          "spyde.actions.overlay.overlay_remove",
     "overlay_query":           "spyde.actions.overlay.overlay_query",
+    # Movie Export (spyde/actions/movie_export/) — in-situ movie → video wizard.
+    "mvx_open":                "spyde.actions.movie_export.handlers.mvx_open",
+    "mvx_tune":                "spyde.actions.movie_export.handlers.mvx_tune",
+    "mvx_add_trace":           "spyde.actions.movie_export.handlers.mvx_add_trace",
+    "mvx_remove_trace":        "spyde.actions.movie_export.handlers.mvx_remove_trace",
+    "mvx_run":                 "spyde.actions.movie_export.handlers.mvx_run",
+    "mvx_cancel":              "spyde.actions.movie_export.handlers.mvx_cancel",
+    "mvx_close":               "spyde.actions.movie_export.handlers.mvx_close",
 }
 
 
@@ -151,6 +159,7 @@ _WIZARD_SCHEMAS: dict[str, tuple[str, str]] = {
     "strain": ("spyde.actions.strain_action", "StrainController"),
     "vom":    ("spyde.actions.vector_orientation_om", "VomWizard"),
     "czb":    ("spyde.actions.center_zero_beam", "PARAMETERS"),
+    "mvx":    ("spyde.actions.movie_export.handlers", "PARAMETERS"),
     # YAML-declared (resolved from spyde.TOOLBAR_ACTIONS):
     "fv":     ("__yaml__", "Find Diffraction Vectors"),
     "om":     ("__yaml__", "Orientation Mapping"),

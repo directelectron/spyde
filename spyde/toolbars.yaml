@@ -42,6 +42,15 @@ functions:
     signal_types: [insitu]
     toggle: True
     toolbar_side: right
+  Export Movie:
+    description: Export the in-situ movie to a video (H.264 mp4 / GIF) — colormapped frames with a burnt-in timestamp, scale bar, time-gated annotations, and optional 1-D trace insets.
+    icon: drawing/toolbars/icons/play.svg
+    function: spyde.actions.movie_export.handlers.export_movie_action
+    signal_types: [insitu]
+    plot_dim: [2]
+    navigation: False
+    toolbar_side: bottom
+    toggle: True
   FFT:
     description: Applies Fast Fourier Transform to the data based on the current selected area.
     icon: drawing/toolbars/icons/fft.svg
