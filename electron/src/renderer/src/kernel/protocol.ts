@@ -46,6 +46,11 @@ export interface ErrorMessage extends MsgBase {
 export interface BackendExitedMessage extends MsgBase {
   type: 'backend_exited'
   code: number | null
+  // Optional human-readable explanation. Set when the main process synthesises
+  // this for a packaged env-setup failure (uv sync failed on first launch) —
+  // distinct from a plain runtime death (runner.ts emits no reason). Shown in
+  // the blocking overlay in place of the generic "process exited" copy.
+  reason?: string
 }
 
 /** Progress of a heavy backend action (movie export, …) via emit_progress.

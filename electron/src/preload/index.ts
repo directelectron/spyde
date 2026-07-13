@@ -81,6 +81,13 @@ contextBridge.exposeInMainWorld('electron', {
     return () => ipcRenderer.removeListener('spyde:open_gpu_status_dialog', h)
   },
 
+  /** Open the "GPU & CUDA" help dialog (from the Help menu). Returns an unsubscribe fn. */
+  onOpenGpuHelpDialog: (cb: () => void) => {
+    const h = () => cb()
+    ipcRenderer.on('spyde:open_gpu_help_dialog', h)
+    return () => ipcRenderer.removeListener('spyde:open_gpu_help_dialog', h)
+  },
+
   /** electron-updater's check/download/install progress. Returns an unsubscribe fn. */
   onUpdateStatus: (cb: (status: Record<string, unknown>) => void) => {
     const h = (_: unknown, status: Record<string, unknown>) => cb(status)
@@ -185,4 +192,20 @@ contextBridge.exposeInMainWorld('electron', {
 
   /** Flip the update channel (stable/beta). */
   setUpdateChannel: (channel: 'stable' | 'beta') => ipcRenderer.send('spyde:set-update-channel', channel),
+
+  /** GPU triage probe (Help → GPU & CUDA): nvidia-smi result + managed-env
+   *  facts. torch-side facts come from the backend's get_gpu_status. */
+  gpuTriage: (): Promise<{
+    nvidia: { name: string; driver: string } | null
+    managedEnv: boolean
+    envExists: boolean
+    lockedTorch: string | null
+    busy: boolean
+  }> => ipcRenderer.invoke('gpu:triage'),
+
+  /** Re-install torch into the managed env with --torch-backend=auto (the
+   *  triage "Fix PyTorch install"). Progress arrives on the raw-output stream;
+   *  restart is manual after ok:true. */
+  gpuFixTorch: (): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('gpu:fix-torch'),
 })

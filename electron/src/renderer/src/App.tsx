@@ -11,6 +11,7 @@ import { NavShapeGate } from './components/NavShapeGate'
 import { StackGate } from './components/StackGate'
 import { UpdateGate } from './components/UpdateGate'
 import { GpuStatusGate } from './components/GpuStatusGate'
+import { GpuHelpGate } from './components/GpuHelpGate'
 import { UpdateBanner } from './components/UpdateBanner'
 import { MenuBar } from './components/MenuBar'
 import { GUIDES, getGuide, type Guide } from '@guides/index'
@@ -57,9 +58,10 @@ export function App() {
       {/* Load Stack dialog — reorderable list of datasets to combine into one
           5D stack; opened from File → Load Stack…. */}
       <StackGate />
-      {/* Help → Check for Updates… / GPU Status… */}
+      {/* Help → Check for Updates… / GPU Status… / GPU & CUDA */}
       <UpdateGate />
       <GpuStatusGate />
+      <GpuHelpGate />
     </SpyDEProvider>
   )
 }

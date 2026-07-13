@@ -184,7 +184,7 @@ interface State {
   navShapePrompt: NavShapePrompt | null   // pending scan-shape/step-size dialog
   loading: { busy: boolean; text: string }   // long file-read busy indicator
   signalTypes: Map<number, { current: string; options: string[] }>   // windowId → signal-type info
-  backendExited: { code: number | null } | null   // set when the Python sidecar dies; surfaces a blocking banner
+  backendExited: { code: number | null; reason?: string } | null   // set when the Python sidecar dies; surfaces a blocking banner
   playback: { playing: boolean; speed: number; loop: boolean }   // movie playback clock (session-wide)
   consoleResult: ConsoleResult | null       // last-executed cell (the ConsoleBar echo strip)
   consoleVars: ConsoleVarEntry[]            // live variable table (chips + signal-ref resolution)
@@ -228,7 +228,7 @@ type Action =
   | { type: 'LOG'; entry: LogEntry }
   | { type: 'LOG_BACKFILL'; entries: LogEntry[] }
   | { type: 'LOG_LEVEL'; level: string }
-  | { type: 'BACKEND_EXITED'; code: number | null }
+  | { type: 'BACKEND_EXITED'; code: number | null; reason?: string }
   | { type: 'PLAYBACK'; playing: boolean; speed: number; loop: boolean }
   | { type: 'CONSOLE_RESULT'; result: ConsoleResult }
   | { type: 'CONSOLE_VARS'; vars: ConsoleVarEntry[] }
@@ -535,7 +535,12 @@ function spydeReducer(state: State, action: Action): State {
     }
 
     case 'BACKEND_EXITED':
-      return { ...state, backendExited: { code: action.code }, ready: false, status: 'Backend stopped' }
+      return {
+        ...state,
+        backendExited: { code: action.code, reason: action.reason },
+        ready: false,
+        status: 'Backend stopped',
+      }
 
     default:
       return state
@@ -571,6 +576,9 @@ interface SpyDEContextValue {
   gpuStatusDialogOpen: boolean
   openGpuStatusDialog: () => void
   closeGpuStatusDialog: () => void
+  gpuHelpDialogOpen: boolean
+  openGpuHelpDialog: () => void
+  closeGpuHelpDialog: () => void
   // MDIArea registers its tile-all-windows function here so StatusBar's
   // "Tile" button can trigger it without threading window-layout state (which
   // lives in MDIArea's local refs) through the shared context.
@@ -649,6 +657,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
   const [stackDialogOpen, setStackDialogOpen] = useState(false)
   const [updateDialogOpen, setUpdateDialogOpen] = useState(false)
   const [gpuStatusDialogOpen, setGpuStatusDialogOpen] = useState(false)
+  const [gpuHelpDialogOpen, setGpuHelpDialogOpen] = useState(false)
   const [dragKind, setDragKind] = useState<'window' | null>(null)
 
   // Post every stored state for a figure to its iframe (called on iframe load).
@@ -739,9 +748,11 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
           break
 
         case 'backend_exited':
-          // The Python sidecar died (synthesised by runner.ts, not a PLOTAPP line).
-          // Surface a blocking banner — every sendAction after this no-ops.
-          dispatch({ type: 'BACKEND_EXITED', code: msg.code ?? null })
+          // The Python sidecar died (synthesised by runner.ts) OR a packaged
+          // first-launch env-setup failure (synthesised by index.ts, which also
+          // passes a `reason`). Either way, surface the blocking overlay — every
+          // sendAction after this no-ops.
+          dispatch({ type: 'BACKEND_EXITED', code: msg.code ?? null, reason: msg.reason })
           break
 
         case 'figure': {
@@ -1239,6 +1250,9 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     const disposeGpuStatusDialog = window.electron.onOpenGpuStatusDialog(() =>
       setGpuStatusDialogOpen(true),
     )
+    const disposeGpuHelpDialog = window.electron.onOpenGpuHelpDialog(() =>
+      setGpuHelpDialogOpen(true),
+    )
 
     // Forward iframe events to Python
     const onMessage = (e: MessageEvent) => {
@@ -1256,6 +1270,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
       disposeStackDialog?.()
       disposeUpdateDialog?.()
       disposeGpuStatusDialog?.()
+      disposeGpuHelpDialog?.()
       window.removeEventListener('message', onMessage)
       if (testHooksEnabled) {
         delete window._spyde_test_inject
@@ -1368,6 +1383,8 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
   const closeUpdateDialog = () => setUpdateDialogOpen(false)
   const openGpuStatusDialog = () => setGpuStatusDialogOpen(true)
   const closeGpuStatusDialog = () => setGpuStatusDialogOpen(false)
+  const openGpuHelpDialog = () => setGpuHelpDialogOpen(true)
+  const closeGpuHelpDialog = () => setGpuHelpDialogOpen(false)
 
   return (
     <SpyDEContext.Provider value={{
@@ -1376,37 +1393,85 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
       stackDialogOpen, openStackDialog, closeStackDialog,
       updateDialogOpen, openUpdateDialog, closeUpdateDialog,
       gpuStatusDialogOpen, openGpuStatusDialog, closeGpuStatusDialog,
+      gpuHelpDialogOpen, openGpuHelpDialog, closeGpuHelpDialog,
       tileWindowsRef, dragKind,
     }}>
       {children}
-      {state.backendExited && <BackendExitedOverlay code={state.backendExited.code} />}
+      {state.backendExited && (
+        <BackendExitedOverlay
+          code={state.backendExited.code}
+          reason={state.backendExited.reason}
+          streamLines={state.streamLines}
+        />
+      )}
     </SpyDEContext.Provider>
   )
 }
 
-// Blocking, non-dismissable overlay shown when the Python analysis backend dies.
-// Without this the UI silently freezes (every sendAction no-ops). Restart is a
-// follow-up; for 0.1.0 we make the death visible and tell the user to relaunch.
-function BackendExitedOverlay({ code }: { code: number | null }) {
+// Blocking, non-dismissable overlay shown when the Python analysis backend dies
+// (or fails to build on a packaged first launch, which passes `reason`). Without
+// this the UI silently freezes (every sendAction no-ops). It now embeds the last
+// raw stdout/stderr lines the backend/uv emitted — that captured text was
+// previously written to `streamLines` and NEVER rendered, so a startup crash left
+// the user with an empty Log panel and no clue. The overlay is self-diagnosing.
+function BackendExitedOverlay({ code, reason, streamLines }: {
+  code: number | null
+  reason?: string
+  streamLines: Array<{ text: string; kind: 'stdout' | 'stderr' }>
+}) {
+  // Last ~40 lines — enough to show a traceback / uv error without a wall of text.
+  const tail = streamLines.slice(-40)
+  const isSetupFailure = Boolean(reason)
   return (
     <div style={{
       position: 'fixed', inset: 0, zIndex: 99999,
       background: 'rgba(0,0,0,0.78)', display: 'flex',
       alignItems: 'center', justifyContent: 'center', userSelect: 'text',
-    }}>
+      padding: 24,
+    }} data-testid="backend-exited-overlay">
       <div style={{
-        maxWidth: 460, padding: '28px 32px', borderRadius: 10,
+        maxWidth: 640, width: '100%', maxHeight: '90%', overflow: 'hidden',
+        display: 'flex', flexDirection: 'column',
+        padding: '26px 30px', borderRadius: 10,
         background: '#1e1e2e', border: '1px solid #f38ba8',
-        color: '#cdd6f4', fontFamily: 'system-ui, sans-serif', textAlign: 'center',
+        color: '#cdd6f4', fontFamily: 'system-ui, sans-serif',
       }}>
         <div style={{ fontSize: 18, fontWeight: 600, color: '#f38ba8', marginBottom: 10 }}>
-          Analysis backend stopped
+          {isSetupFailure ? 'Python environment setup failed' : 'Analysis backend stopped'}
         </div>
-        <div style={{ fontSize: 14, lineHeight: 1.5 }}>
-          The Python process powering SpyDE exited
-          {code != null ? <> (exit code <code>{code}</code>)</> : null}.
-          Compute and file operations are unavailable. Please restart SpyDE.
-          Check the Log panel for details.
+        <div style={{ fontSize: 14, lineHeight: 1.5, whiteSpace: 'pre-wrap' }}>
+          {reason ?? (
+            <>
+              The Python process powering SpyDE exited
+              {code != null ? <> (exit code <code>{code}</code>)</> : null}.
+              Compute and file operations are unavailable. Please restart SpyDE.
+              The captured output below shows why.
+            </>
+          )}
+        </div>
+        <div style={{
+          marginTop: 14, fontSize: 11, color: '#a6adc8', textTransform: 'uppercase',
+          letterSpacing: 0.5,
+        }}>
+          Raw output {tail.length ? `(last ${tail.length} lines)` : ''}
+        </div>
+        <div
+          data-testid="backend-exited-raw"
+          style={{
+            marginTop: 6, flex: 1, minHeight: 60, maxHeight: 260, overflow: 'auto',
+            background: '#11111b', border: '1px solid #313244', borderRadius: 6,
+            padding: '8px 10px',
+            fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+            fontSize: 11.5, lineHeight: 1.5, whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+          }}
+        >
+          {tail.length === 0
+            ? <span style={{ color: '#6c7086', fontStyle: 'italic' }}>No output was captured.</span>
+            : tail.map((l, i) => (
+                <div key={i} style={{ color: l.kind === 'stderr' ? '#f9c0c9' : '#a6adc8' }}>
+                  {l.text.replace(/\n$/, '')}
+                </div>
+              ))}
         </div>
       </div>
     </div>

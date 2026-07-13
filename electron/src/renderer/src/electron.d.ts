@@ -12,6 +12,7 @@ declare global {
       onOpenStackDialog: (cb: () => void) => () => void
       onOpenUpdateDialog: (cb: () => void) => () => void
       onOpenGpuStatusDialog: (cb: () => void) => () => void
+      onOpenGpuHelpDialog: (cb: () => void) => () => void
       onUpdateStatus: (cb: (status: Record<string, unknown>) => void) => () => void
       action: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
       openFile: () => Promise<void>
@@ -40,6 +41,14 @@ declare global {
       downloadUpdate: () => void
       quitAndInstallUpdate: () => void
       setUpdateChannel: (channel: 'stable' | 'beta') => void
+      gpuTriage: () => Promise<{
+        nvidia: { name: string; driver: string } | null
+        managedEnv: boolean
+        envExists: boolean
+        lockedTorch: string | null
+        busy: boolean
+      }>
+      gpuFixTorch: () => Promise<{ ok: boolean; error?: string }>
     }
 
     // Test-only hooks attached by the renderer for Playwright e2e (DEV /
