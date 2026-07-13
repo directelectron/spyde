@@ -172,15 +172,18 @@ class SpyDEOrientationMap:
             rgb[mask] = np.clip(colors * 255.0, 0, 255).astype(np.uint8)
         return rgb
 
-    def ipf_sphere_points(self, direction: str = "z", max_points: int = 20000):
+    def ipf_sphere_points(self, direction: str = "z", max_points: int = 1_000_000):
         """Per-position reduced crystal directions ON THE UNIT SPHERE + their IPF
         colour, for the 3-D IPF explorer (anyplotlib ``scatter3d``).
 
         Returns ``(xyz (M, 3) float32, rgb (M, 3) uint8)`` for the best match at
         every position: ``xyz`` is ``(rotation · direction)`` folded into the
         point group's fundamental sector (the same point the 2-D IPF shows, but
-        kept in 3-D), ``rgb`` is the matching IPF colour. Uniformly subsampled to
-        ``max_points`` so a large scan stays interactive.
+        kept in 3-D), ``rgb`` is the matching IPF colour. The WebGPU instanced
+        scatter path (``scatter3d(..., gpu=True)``) renders comfortably up to
+        ~1M points, so every nav pixel is kept by default; only a scan bigger
+        than ``max_points`` (a safety ceiling, not the interactive budget) is
+        uniformly subsampled.
         """
         from orix.plot import IPFColorKeyTSL
         from orix.quaternion import Orientation, Rotation

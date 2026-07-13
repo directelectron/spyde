@@ -61,12 +61,118 @@ class TestIpfRefine:
         assert corr.max() > 0 and np.isfinite(corr).all()
         assert int(best[0]) == int(np.argmax(corr))   # best row == argmax template
 
-    def test_native_heatmap_colours_vary(self):
-        """The native PlotXY render paints one polygon per inside-sector cell and
-        colours them by correlation — a real heatmap (varied), not flat."""
+    def test_build_uses_single_raster_not_polygons(self):
+        """The heatmap is ONE RGBA raster (not ~9k recoloured polygons), and the
+        static markers (mask circles, outline, corner labels, best-match scatter)
+        still exist alongside it."""
+        from spyde.actions import ipf_refine
+        from spyde.actions.ipf_refine_render import build_refine_figure
+
+        _s, sim, _cache, _n = _lib()
+        infos = ipf_refine.build_phase_ipf(sim)
+        _fig, _fid, _html, panels = build_refine_figure(infos)
+        panel = panels[0]
+
+        # Heatmap is a single raster marker of the right shape (GRID_N × GRID_N).
+        raster = panel["raster"]
+        assert raster._type == "raster"
+        assert raster._data["image_width"] == ipf_refine.GRID_N
+        assert raster._data["image_height"] == ipf_refine.GRID_N
+        assert raster._data.get("image_b64")               # pixels present
+        assert raster._data.get("clip_path") is not None   # clipped to the sector
+        assert panel.get("mesh") is None                   # the polygon mesh is gone
+
+        # The cheap decorations are untouched.
+        assert panel["circle_grp"]._type == "polygons"     # mask circles
+        assert panel["best"] is not None                   # best-match scatter
+        info = panel["info"]
+        assert info["tri_xy"].shape[1] == 2                # outline
+        assert info["labels"]                              # corner labels
+
+    def test_corr_rgba_lut_alpha_and_orientation(self):
+        """`_corr_rgba`: LUT-maps correlation to colour, sets outside-sector cells
+        to alpha 0, and orients rows so grid (0,0)/(0,n-1) land at the extent
+        corners the old polygon layout used (row 0 = bottom = mins[1])."""
+        from spyde.actions.ipf_refine_render import _corr_rgba, _lut
+
+        lut = _lut()
+        n = 4
+        # Everything inside except one outside cell; distinct values at the two
+        # bottom corners so we can check orientation unambiguously.
+        outside = np.zeros((n, n), dtype=bool)
+        outside[2, 2] = True
+        vals = np.zeros((n, n), dtype=float)
+        vals[0, 0] = 1.0                # grid bottom-left (mins[0], mins[1])
+        vals[0, n - 1] = 0.5            # grid bottom-right (maxs[0], mins[1])
+
+        rgba = _corr_rgba(vals, outside, lut)
+        assert rgba.shape == (n, n, 4) and rgba.dtype == np.uint8
+
+        # LUT colour: value 1.0 → lut[255], value 0.5 → lut[~127].
+        top_val = np.clip(np.round(1.0 * 255), 0, 255).astype(int)
+        half_val = np.clip(np.round(0.5 * 255), 0, 255).astype(int)
+
+        # Orientation: raster row 0 = TOP of extent (origin="upper"), grid row 0 =
+        # BOTTOM (mins[1]). So grid (0, j) → raster IMAGE row (n-1).
+        # grid (0,0)  → image (n-1, 0)     value 1.0
+        assert np.array_equal(rgba[n - 1, 0, :3], lut[top_val])
+        assert rgba[n - 1, 0, 3] == 255
+        # grid (0,n-1) → image (n-1, n-1)  value 0.5
+        assert np.array_equal(rgba[n - 1, n - 1, :3], lut[half_val])
+        assert rgba[n - 1, n - 1, 3] == 255
+
+        # Outside cell grid (2,2) → image row (n-1-2)=1, col 2 → alpha 0.
+        assert rgba[n - 1 - 2, 2, 3] == 0
+        # All other cells opaque.
+        opaque = rgba[..., 3] == 255
+        assert opaque.sum() == n * n - 1
+
+    def test_corr_rgba_matches_polygon_cell_position(self):
+        """The raster places each correlation cell at the same (x, y) the old
+        `_mesh_geometry` polygon for that cell centred on — using the real sector
+        geometry: cell (i, j) sits at y = linspace(mins[1], maxs[1], n)[i], and
+        the raster (origin='upper') maps it to image row (n-1-i)."""
+        from spyde.actions import ipf_refine
+        from spyde.actions.ipf_refine_render import _corr_rgba, _lut, _mesh_geometry
+
+        _s, sim, _cache, _n = _lib()
+        info = ipf_refine.build_phase_ipf(sim)[0]
+        n = int(info["grid_n"])
+        outside = np.asarray(info["outside"]).reshape(n, n)
+        lut = _lut()
+
+        verts, cells = _mesh_geometry(info)
+        assert 0 < len(cells) < ipf_refine.GRID_N ** 2   # a real triangular subset
+
+        # Put a unique ramp value at each inside cell; check the raster pixel at
+        # the y-flipped row/col carries that cell's colour, and its data-space
+        # centre matches the polygon centroid for that cell.
+        vals = np.zeros((n, n), dtype=float)
+        for k, (i, j) in enumerate(cells):
+            vals[i, j] = (k % 200 + 1) / 255.0          # in (0, 1], distinct-ish
+        rgba = _corr_rgba(vals, outside, lut)
+
+        ex = np.linspace(float(info["mins"][0]), float(info["maxs"][0]), n + 1)
+        ey = np.linspace(float(info["mins"][1]), float(info["maxs"][1]), n + 1)
+        # spot-check a handful of inside cells (verts[k] ↔ cells[k], same order)
+        step = max(1, len(cells) // 20)
+        for k in range(0, len(cells), step):
+            i, j = int(cells[k][0]), int(cells[k][1])
+            code = np.clip(np.round(vals[i, j] * 255), 0, 255).astype(int)
+            img_row = n - 1 - i                          # origin="upper" flip
+            assert np.array_equal(rgba[img_row, j, :3], lut[code])
+            assert rgba[img_row, j, 3] == 255
+            # polygon centroid for this cell (mesh spanned [ex[j],ex[j+1]] × [ey[i],ey[i+1]])
+            cx, cy = np.asarray(verts[k]).mean(0)
+            assert ex[j] <= cx <= ex[j + 1]
+            assert ey[i] <= cy <= ey[i + 1]
+
+    def test_update_panels_pushes_image_not_facecolors(self):
+        """The live update swaps the raster's pixels (`image_b64`) — NOT per-cell
+        facecolors — and still moves the best-match marker + mask circles."""
         from spyde.actions import ipf_refine
         from spyde.actions.ipf_refine_render import (
-            build_refine_figure, update_panels, best_xy_for, _mesh_geometry,
+            build_refine_figure, update_panels, best_xy_for,
         )
         s, sim, cache, _n = _lib()
         infos = ipf_refine.build_phase_ipf(sim)
@@ -74,17 +180,33 @@ class TestIpfRefine:
             np.asarray(s.data[0, 0], float), sim, cache, gamma=0.5)
 
         _fig, _fid, _html, panels = build_refine_figure(infos)
-        # the mesh covers the inside-sector cells (some cells, not the whole grid)
-        verts, cells = _mesh_geometry(infos[0])
-        assert 0 < len(cells) < ipf_refine.GRID_N ** 2
+        panel = panels[0]
+        blank_b64 = panel["raster"]._data.get("image_b64")
 
-        update_panels(panels, corr, {i["phase_index"]: [] for i in infos},
-                      best_xy_for(infos, int(best[0])))
-        faces = panels[0]["mesh"]._data.get("facecolors")
-        assert faces is not None and len(faces) == len(cells)
-        assert len(set(faces)) > 3                      # colour variation
-        # the best-match marker got placed
-        assert len(np.asarray(panels[0]["best"]._data.get("offsets"))) == 1
+        # A mask circle so the circle-update path is exercised too.
+        circles = {i["phase_index"]: [] for i in infos}
+        circles[infos[0]["phase_index"]] = [
+            (float(infos[0]["xs"][0]), float(infos[0]["ys"][0]), 0.05)]
+
+        update_panels(panels, corr, circles, best_xy_for(infos, int(best[0])))
+
+        # Heatmap: the raster's stored bytes changed and NO facecolors were pushed.
+        painted_b64 = panel["raster"]._data.get("image_b64")
+        assert painted_b64 is not None and painted_b64 != blank_b64
+        assert "facecolors" not in panel["raster"]._data
+        assert "edgecolors" not in panel["raster"]._data
+        assert panel["raster"]._data["image_width"] == ipf_refine.GRID_N
+
+        # Decoded pixels vary (a real heatmap, not flat) and carry transparency.
+        import base64
+        raw = np.frombuffer(base64.b64decode(painted_b64), dtype=np.uint8)
+        img = raw.reshape(ipf_refine.GRID_N, ipf_refine.GRID_N, 4)
+        assert len(np.unique(img[..., :3].reshape(-1, 3), axis=0)) > 3
+        assert (img[..., 3] == 0).any() and (img[..., 3] == 255).any()
+
+        # The best-match marker got placed; the mask circle got drawn.
+        assert len(np.asarray(panel["best"]._data.get("offsets"))) == 1
+        assert len(panel["circle_grp"]._data.get("vertices_list")) == 1
 
     def test_rot_mask_from_circles_restricts(self):
         from spyde.actions import ipf_refine

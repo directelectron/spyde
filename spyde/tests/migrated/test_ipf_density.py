@@ -1,8 +1,9 @@
 """
 IPF density heatmap (inverse pole density function): `ipf_density` builds a
-native-anyplotlib `pcolormesh` of the orientation density across the fundamental
-sector (one triangle per phase) and emits it as a `view="density"` figure for the
-IPF window — the 3rd toggle next to the 2-D map and 3-D sphere.
+native-anyplotlib raster (resampled from orix's equal-area grid) of the
+orientation density across the fundamental sector (one triangle per phase) and
+emits it as a `view="density"` figure for the IPF window — the 3rd toggle next
+to the 2-D map and 3-D sphere.
 """
 from __future__ import annotations
 
@@ -36,25 +37,67 @@ class TestIpfDensity:
         fig, fig_id, html = build_ipf_density_figure(_al_orientation_map(), "z")
         assert isinstance(fig_id, str) and fig_id
         assert isinstance(html, str) and "<body>" in html
-        # The density is drawn as a polygon quad mesh (pcolormesh) with the
-        # white sector outline (a lines group) — both serialise into the state.
-        assert "polygons" in html
+        # The density is now a single stretched RGBA raster (add_raster) — a
+        # `raster` marker, not thousands of polygons — plus the white sector
+        # outline (a lines group). Both serialise into the state.
+        assert "raster" in html
         assert "lines" in html
 
-    def test_density_mesh_has_colored_cells(self):
-        # Introspect the PlotXY: the mesh is one polygons group with per-cell
-        # fill colours (a PathCollection), clipped to the sector (>0 cells).
+    def test_density_uses_raster_not_polygon_mesh(self):
+        # The equal-area orix grid is resampled onto a regular raster and drawn
+        # as ONE `add_raster` image instead of one polygon per histogram cell.
         from spyde.actions.ipf_density import build_ipf_density_figure
         fig, _id, _html = build_ipf_density_figure(_al_orientation_map(), "z")
         plot = list(fig._plots_map.values())[0]
         markers = plot.to_state_dict().get("markers", [])
+        rasters = [m for m in markers if m.get("type") == "raster"]
+        assert rasters, "expected a raster marker (equal-area grid resampled)"
+        r = rasters[0]
+        assert r["image_width"] > 1 and r["image_height"] > 1
+        assert "clip_path" in r                       # clipped to the sector
         polys = [m for m in markers if m.get("type") == "polygons"]
-        assert polys, "expected a polygon mesh"
-        mesh = polys[0]
-        assert len(mesh["vertices_list"]) > 0
-        assert isinstance(mesh.get("fill_color"), list)      # per-cell colours
-        assert len(mesh["fill_color"]) == len(mesh["vertices_list"])
-        assert len(set(mesh["fill_color"])) > 3              # a density gradient
+        assert not polys, "should not also draw the slow per-cell polygon mesh"
+
+    def test_density_raster_known_region_maps_to_sane_color(self):
+        # A known high-density direction (the mode of a tight, seeded cluster of
+        # crystal directions) should map to a warm/high-value colour in the
+        # resampled raster, not to background/transparent — a basic fidelity
+        # check on the nearest-neighbour resample.
+        from spyde.actions.ipf_density import (
+            _resample_density_to_raster, _sector_limits,
+        )
+        from spyde.signals.orientation_map import ipf_triangle_xy
+        from orix.crystal_map import Phase
+        from orix.measure import pole_density_function
+        from orix.quaternion import Rotation
+        from orix.vector import Vector3d
+        from diffpy.structure import Atom, Lattice, Structure
+
+        structure = Structure(atoms=[Atom("Al", [0, 0, 0])],
+                              lattice=Lattice(4.05, 4.05, 4.05, 90, 90, 90))
+        phase = Phase(name="Al", space_group=225, structure=structure)
+
+        # A tight cluster of near-identical rotations -> one hot spot.
+        rng = np.random.RandomState(0)
+        base = np.array([1.0, 0.0, 0.0, 0.0])
+        q = base[None, :] + rng.randn(500, 4) * 1e-3
+        q /= np.linalg.norm(q, axis=1, keepdims=True)
+        t = Rotation(q) * Vector3d.zvector()
+        hist, (x, y) = pole_density_function(
+            t, symmetry=phase.point_group, resolution=2.0, sigma=5.0,
+            log=False, hemisphere="upper",
+        )
+        xy_edges, _label_xy, _labels = ipf_triangle_xy(phase)
+        xlim, ylim = _sector_limits(xy_edges)
+        raster = _resample_density_to_raster(x, y, hist, xlim, ylim, "fire", None)
+        assert raster is not None
+        rgba, extent = raster
+        assert rgba.shape[-1] == 4
+        # The brightest cell (the resampled hot spot) should be far from
+        # black/transparent — a basic fidelity check on the nearest-neighbour
+        # resample (not washed out to background).
+        brightness = rgba[..., :3].sum(axis=-1)
+        assert int(brightness.max()) > 60
 
     def test_emit_density_message(self):
         import spyde.backend.ipc as ipc
