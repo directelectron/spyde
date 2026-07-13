@@ -465,3 +465,70 @@ class TestCopyToReportToolbar:
         assert meta["function"] == \
             "spyde.actions.report.toolbar_actions.copy_to_report"
         assert 2 in meta["plot_dim"]
+
+
+# ── export token correlation (cross-agent renderer contract, finding 9) ─────────
+
+
+class TestExportToken:
+    def test_html_export_echoes_token_verbatim(self, tem_2d_dataset, tmp_path):
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        _prime_plot_data(session)
+        wid = _signal_window_id(session)
+        h.report_new(session, None, {})
+        h.report_add_figure(session, None, {"source_window_id": wid, "caption": "F"})
+
+        path = str(tmp_path / "tok.html")
+        messages.clear()
+        ex.report_export_html(session, None, {
+            "mode": "static", "path": path, "token": "req-42"})
+        exp = _exported(messages)
+        assert exp and exp[0]["kind"] == "html-static"
+        assert exp[0]["path"] == path
+        # The token rides back VERBATIM.
+        assert exp[0]["token"] == "req-42"
+
+    def test_html_export_omits_token_when_absent(self, tem_2d_dataset, tmp_path):
+        """No token in the request → no token key in the reply (backward compat)."""
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        _prime_plot_data(session)
+        wid = _signal_window_id(session)
+        h.report_new(session, None, {})
+        h.report_add_figure(session, None, {"source_window_id": wid})
+
+        path = str(tmp_path / "notok.html")
+        messages.clear()
+        ex.report_export_html(session, None, {"mode": "static", "path": path})
+        exp = _exported(messages)
+        assert exp and "token" not in exp[0]
+
+    def test_markdown_export_echoes_token_verbatim(self, tem_2d_dataset, tmp_path):
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        _prime_plot_data(session)
+        wid = _signal_window_id(session)
+        h.report_new(session, None, {})
+        h.report_add_figure(session, None, {"source_window_id": wid})
+
+        out = str(tmp_path / "tok_dir")
+        messages.clear()
+        ex.report_export_markdown(session, None, {"path": out, "token": "md-tok-7"})
+        exp = _exported(messages)
+        assert exp and exp[0]["kind"] == "markdown-folder"
+        assert exp[0]["token"] == "md-tok-7"
+
+    def test_markdown_export_omits_token_when_absent(self, tem_2d_dataset, tmp_path):
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        _prime_plot_data(session)
+        wid = _signal_window_id(session)
+        h.report_new(session, None, {})
+        h.report_add_figure(session, None, {"source_window_id": wid})
+
+        out = str(tmp_path / "notok_dir")
+        messages.clear()
+        ex.report_export_markdown(session, None, {"path": out})
+        exp = _exported(messages)
+        assert exp and "token" not in exp[0]

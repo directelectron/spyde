@@ -9,6 +9,8 @@ import { useSpyDE } from '../kernel/SpyDEContext'
 import type { TreeNode, AxisRow } from '../kernel/SpyDEContext'
 import type { LayerState, LayersStateMessage } from '../kernel/protocol'
 import { WORKFLOW_NODE_DRAG_MIME } from '../kernel/dnd'
+import { COLORMAPS } from '../kernel/colormaps'
+import { useKeyedDebounce } from './wizardHooks'
 import { CompositionPanel } from './CompositionPanel'
 
 // Compact workflow tree: each step is a row with a depth guide-rail, a node dot,
@@ -72,11 +74,6 @@ function TreeNodes({ nodes, depth, activeId, windowId, onPick }:
     </>
   )
 }
-
-const COLORMAPS = [
-  'gray', 'viridis', 'inferno', 'magma', 'plasma',
-  'cividis', 'hot', 'jet', 'turbo', 'twilight',
-]
 
 // Click-to-edit cell (Qt-like): shows the value as text; click turns it into an
 // input that commits on blur/Enter and reverts on Escape. Avoids the "wall of
@@ -391,18 +388,12 @@ function LayersSection({ activeId, sendAction }: {
 
   // Debounced per-layer overlay_set sender — keyed by layer id so dragging one
   // layer's alpha doesn't cancel another's pending send.
-  const timers = React.useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
-  React.useEffect(() => {
-    const t = timers.current
-    return () => { t.forEach(clearTimeout); t.clear() }
-  }, [])
-  const sendSet = (layerId: string, payload: Record<string, unknown>, ms = 150) => {
+  const debounce = useKeyedDebounce(150)
+  const sendSet = (layerId: string, payload: Record<string, unknown>) => {
     if (activeId == null) return
-    const existing = timers.current.get(layerId)
-    if (existing) clearTimeout(existing)
-    timers.current.set(layerId, setTimeout(() => {
+    debounce(layerId, () => {
       sendAction('overlay_set', { window_id: activeId, layer_id: layerId, ...payload }, activeId)
-    }, ms))
+    })
   }
 
   if (activeId == null || layers.length === 0) return null

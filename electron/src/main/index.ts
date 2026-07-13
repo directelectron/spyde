@@ -634,6 +634,8 @@ ipcMain.handle('report:export-dialog', async (_e, kind: 'html' | 'pdf' | 'folder
  *  integration) — this is trusted local content (SpyDE wrote the HTML itself
  *  moments ago via report:export-dialog + the renderer's own save), but the
  *  window still gets no Node/IPC surface since it only needs to rasterize. */
+const PDF_EXPORT_TIMEOUT_MS = 30000
+
 ipcMain.handle('report:export-pdf', async (_e, htmlPath: string, pdfPath: string) => {
   if (typeof htmlPath !== 'string' || !htmlPath.toLowerCase().endsWith('.html') || !existsSync(htmlPath)) {
     return { ok: false, error: 'htmlPath must be an existing .html file' }
@@ -653,38 +655,68 @@ ipcMain.handle('report:export-pdf', async (_e, htmlPath: string, pdfPath: string
     },
   })
 
-  try {
-    const loaded = new Promise<void>((resolve, reject) => {
-      pdfWin!.webContents.once('did-finish-load', () => resolve())
-      pdfWin!.webContents.once('did-fail-load', (_ev, code, desc) =>
-        reject(new Error(`did-fail-load: ${code} ${desc}`)),
-      )
-    })
-    await pdfWin.loadFile(htmlPath)
-    await loaded
-    // Let images/fonts referenced by the report settle before rasterizing.
-    await new Promise((resolve) => setTimeout(resolve, 250))
+  // Race the whole load+settle+printToPDF sequence against a hard timeout so a
+  // hung page load or a stuck renderer (printToPDF has been seen to wedge on
+  // pathological content) can never leave the hidden window running forever —
+  // the timeout branch always destroys it, same as the normal `finally` below.
+  let timer: ReturnType<typeof setTimeout> | null = null
+  const timeout = new Promise<{ ok: false; error: string }>((resolve) => {
+    timer = setTimeout(() => resolve({ ok: false, error: 'PDF render timed out' }), PDF_EXPORT_TIMEOUT_MS)
+  })
 
-    const pdfBuffer = await pdfWin.webContents.printToPDF({
-      printBackground: true,
-      pageSize: 'A4',
-      margins: { marginType: 'default' },
-    })
-    writeFileSync(pdfPath, pdfBuffer)
-    return { ok: true }
-  } catch (err) {
-    return { ok: false, error: (err as Error)?.message ?? String(err) }
+  const render = (async () => {
+    try {
+      const loaded = new Promise<void>((resolve, reject) => {
+        pdfWin!.webContents.once('did-finish-load', () => resolve())
+        pdfWin!.webContents.once('did-fail-load', (_ev, code, desc) =>
+          reject(new Error(`did-fail-load: ${code} ${desc}`)),
+        )
+      })
+      await pdfWin!.loadFile(htmlPath)
+      await loaded
+      // Let images/fonts referenced by the report settle before rasterizing.
+      await new Promise((resolve) => setTimeout(resolve, 250))
+
+      const pdfBuffer = await pdfWin!.webContents.printToPDF({
+        printBackground: true,
+        pageSize: 'A4',
+        margins: { marginType: 'default' },
+      })
+      writeFileSync(pdfPath, pdfBuffer)
+      return { ok: true as const }
+    } catch (err) {
+      return { ok: false as const, error: (err as Error)?.message ?? String(err) }
+    }
+  })()
+
+  try {
+    return await Promise.race([render, timeout])
   } finally {
+    if (timer) clearTimeout(timer)
+    // Destroy on EVERY path, including the timeout branch (where `render` may
+    // still be in flight) — a hidden BrowserWindow left alive after a timed-out
+    // export is a leaked renderer process.
     if (pdfWin && !pdfWin.isDestroyed()) pdfWin.destroy()
     pdfWin = null
   }
 })
 
+// A data URL is ~4/3 the size of the decoded bytes (base64) — cap the STRING
+// itself so we reject before nativeImage does any decode work at all.
+const CLIPBOARD_PNG_MAX_BYTES = 32 * 1024 * 1024
+const CLIPBOARD_PNG_MAX_DATA_URL_LEN = Math.ceil((CLIPBOARD_PNG_MAX_BYTES * 4) / 3) + 64
+
 /** Write a PNG data URL (e.g. a figure snapshot) to the OS clipboard as an
- *  image, for the Report sidebar's "Copy image" action. */
+ *  image, for the Report sidebar's "Copy image" action. Rejects oversized
+ *  images up front — `nativeImage.createFromDataURL` decodes synchronously on
+ *  the main process's only thread, so an unbounded image would block the
+ *  whole app (every window, every IPC reply) for however long the decode takes. */
 ipcMain.handle('clipboard:write-png', (_e, dataUrl: string) => {
   if (typeof dataUrl !== 'string' || !dataUrl.startsWith('data:image/png')) {
     return { ok: false, error: 'expected a data:image/png URL' }
+  }
+  if (dataUrl.length > CLIPBOARD_PNG_MAX_DATA_URL_LEN) {
+    return { ok: false, error: 'image too large for clipboard' }
   }
   try {
     const image = nativeImage.createFromDataURL(dataUrl)

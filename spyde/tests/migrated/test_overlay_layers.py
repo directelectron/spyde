@@ -133,6 +133,28 @@ class TestOverlayAdd:
 # ── overlay_set ─────────────────────────────────────────────────────────────────
 
 
+class TestShapeChangeDropsLayers:
+    def test_shape_changing_paint_drops_layers_cleanly(self, stem_4d_dataset):
+        """anyplotlib raises on a shape-changing set_data while layers exist; the
+        plot must drop its layers FIRST (status + empty layers_state), not raise."""
+        session, messages = stem_4d_dataset["window"], stem_4d_dataset["messages"]
+        _prime(session)
+        tgt, src, nav, mm, navpw = _two_signal_windows(session)
+        ov.overlay_add(session, tgt, {"window_id": tgt.window_id,
+                                      "source_window_id": src.window_id})
+        assert len(tgt._layers) == 1
+        messages.clear()
+        old_shape = tgt._plot2d._state["image_height"], tgt._plot2d._state["image_width"]
+        new_frame = np.random.rand(old_shape[0] * 2, old_shape[1] * 2).astype(np.float32)
+        tgt._set_array(new_frame)          # must not raise
+        assert tgt._layers == []
+        st = _layers_states(messages)
+        assert st and st[-1]["window_id"] == tgt.window_id
+        assert st[-1]["layers"] == []
+        assert any(m.get("type") == "status" and "shape changed" in m.get("text", "")
+                   for m in messages)
+
+
 class TestOverlaySet:
     def test_set_reflected_in_layer_state(self, stem_4d_dataset):
         session, messages = stem_4d_dataset["window"], stem_4d_dataset["messages"]
@@ -265,3 +287,226 @@ class TestOverlayTeardown:
         assert not getattr(tgt, "_layers", [])
         assert any(m.get("type") == "status" and "tile" in str(m.get("text", "")).lower()
                    for m in messages)
+
+
+# ── finding #1: pending-frames lost-update race ───────────────────────────────────
+
+
+class _FakePlot:
+    """Minimal target-plot stand-in for the pending-frames slot machinery: it only
+    needs `_pending_layer_frames`, `current_data`, and `enqueue_paint`. We make
+    enqueue_paint drain the slot INLINE (as the real painter thread would) so the
+    read-then-clear happens on a controllable thread."""
+
+    def __init__(self):
+        self._pending_layer_frames = None
+        self.current_data = None            # None → _enqueue_layer_push drains inline
+
+    def enqueue_paint(self, data):          # unused (current_data is None)
+        pass
+
+
+class _RecordingHandle:
+    def __init__(self):
+        self.frames = []
+
+    def set_data(self, frame):
+        self.frames.append(frame)
+
+
+class TestPendingFramesRace:
+    def test_write_between_read_and_clear_is_not_lost(self, monkeypatch):
+        """The painter's take-and-clear of `_pending_layer_frames` must be ATOMIC
+        against a dispatcher write. We wedge the painter INSIDE the critical section
+        (a slow read) and fire a newer write; with the lock the write blocks until
+        the painter finishes its swap, so the newer frames are applied on the next
+        drain — never silently dropped (finding #1: the settle re-fire's frames were
+        the lost ones)."""
+        import threading
+
+        plot = _FakePlot()
+        handle = _RecordingHandle()
+        layer = ov.PlotLayer(layer_id="L", source_plot=None, handle=handle)
+
+        old_frame = np.zeros((2, 2), np.float32)
+        new_frame = np.ones((2, 2), np.float32)
+
+        # Choreograph: the painter enters the critical section and pauses (still
+        # holding _PENDING_LOCK) so the writer thread races to set newer frames.
+        in_crit = threading.Event()
+        release = threading.Event()
+        real_getattr_slot = {"read": 0}
+
+        orig_lock = ov._PENDING_LOCK
+
+        class _InstrumentedLock:
+            """Wrap the real lock: on the painter's ACQUIRE (the first, i.e. the
+            take-and-clear), signal that we're in the section and block until the
+            writer has attempted its (lock-contended) write."""
+            def __enter__(self):
+                orig_lock.acquire()
+                # First acquire is the painter's take-and-clear.
+                if real_getattr_slot["read"] == 0:
+                    real_getattr_slot["read"] = 1
+                    in_crit.set()
+                    release.wait(2.0)
+                return self
+
+            def __exit__(self, *a):
+                orig_lock.release()
+                return False
+
+        monkeypatch.setattr(ov, "_PENDING_LOCK", _InstrumentedLock())
+
+        # Seed OLD frames, then have the painter drain (it will wedge in-section).
+        plot._pending_layer_frames = [(layer, handle, old_frame)]
+
+        painter = threading.Thread(
+            target=ov._apply_pending_layer_frames, args=(plot,))
+        painter.start()
+        assert in_crit.wait(2.0), "painter never entered the critical section"
+
+        # Writer: set NEWER frames while the painter holds the lock. This ACQUIRE
+        # must block until the painter's swap completes (atomic take-and-clear).
+        wrote = threading.Event()
+
+        def _writer():
+            ov._enqueue_layer_push(plot, [(layer, handle, new_frame)])
+            wrote.set()
+
+        wt = threading.Thread(target=_writer)
+        wt.start()
+        # The writer is now blocked on _PENDING_LOCK (painter holds it).
+        assert not wrote.wait(0.3), "writer wrote while painter held the lock (race!)"
+
+        release.set()          # let the painter finish its swap (clears OLD)
+        painter.join(2.0)
+        assert wrote.wait(2.0)  # writer now proceeds, sets NEW into the slot
+        wt.join(2.0)
+
+        # Painter applied the OLD frames it read; the NEW frames are pending (not
+        # dropped). Drain again → NEW applied. Nothing lost.
+        ov._apply_pending_layer_frames(plot)
+        means = [float(f.mean()) for f in handle.frames]
+        assert means[0] == 0.0, "old frames not applied"
+        assert 1.0 in means, "NEWER frames were LOST (lost-update race not fixed)"
+
+
+# ── finding #2: cold derived-source read skips + warms off-thread ─────────────────
+
+
+class TestColdSourceReadWarms:
+    def test_cold_derived_read_skips_then_warms_then_paints(self, monkeypatch):
+        """A single-point read on a LAZY source whose chunk is NOT resident must NOT
+        block the dispatcher: the first refresh returns None (skip) and warms the
+        chunk off-thread; once warm, a subsequent read returns the frame. We drive
+        _read_source_frame directly with a fake lazy source + a _NavChunkCache."""
+        import concurrent.futures as cf
+        import types
+        import dask.array as da
+        import hyperspy.api as hs
+        from spyde.drawing.update_functions import _NavChunkCache
+
+        # A lazy derived-style movie: 6 frames, 1/chunk, NO CachedDaskArray.
+        frames = np.stack([np.full((4, 4), i, np.float32) for i in range(6)])
+        arr = da.from_array(frames, chunks=(1, 4, 4))
+        sig = hs.signals.Signal2D(arr).as_lazy()
+
+        # A synchronous ComputeBackend stand-in: submit() runs the warm inline and
+        # returns a resolved concurrent.futures.Future (so the warm populates the
+        # source's chunk cache immediately, as a real off-thread warm eventually does).
+        def _submit(fn, *a, **k):
+            f = cf.Future()
+            try:
+                f.set_result(fn(*a, **k))
+            except Exception as e:              # pragma: no cover
+                f.set_exception(e)
+            return f
+
+        backend = types.SimpleNamespace(submit=_submit)
+        session_stub = types.SimpleNamespace(compute_backend=backend)
+        plot_state = types.SimpleNamespace(current_signal=sig)
+        src = types.SimpleNamespace(
+            plot_state=plot_state, window_id=99,
+            _nav_chunk_cache=_NavChunkCache(), session=session_stub)
+        indices = np.array([2])                 # single nav point (frame 2)
+
+        # COLD: chunk not resident → skip (None) and warm off-thread (synchronous
+        # backend runs the warm immediately, populating the cache).
+        first = ov._read_source_frame(src, indices)
+        assert first is None, "cold derived read did not skip the dispatcher"
+        assert src._nav_chunk_cache.is_resident(sig, sig.data, indices), \
+            "cold miss did not warm the source chunk off-thread"
+
+        # WARM: now resident → the read returns the actual frame (settle re-fire path).
+        second = ov._read_source_frame(src, indices)
+        assert second is not None, "warm read still skipped"
+        assert float(np.asarray(second).mean()) == 2.0, "wrong frame after warm"
+
+
+# ── finding #3: dead layer is skipped by refresh ──────────────────────────────────
+
+
+class TestDeadLayerSkip:
+    def test_dead_layer_not_read_or_painted(self, stem_4d_dataset):
+        """A layer marked `dead` (a drop path in progress) must be skipped by
+        refresh_plot_layers — its source is never dereferenced and no set_data is
+        queued (finding #3: source-teardown race)."""
+        session = stem_4d_dataset["window"]
+        _prime(session)
+        tgt, src, nav, mm, navpw = _two_signal_windows(session)
+        ov.overlay_add(session, tgt, {"window_id": tgt.window_id,
+                                      "source_window_id": src.window_id})
+        layer = tgt._layers[0]
+        pushed = []
+        layer.handle.set_data = lambda f: pushed.append(1)
+
+        # Mark dead (as drop_layers_for_source would, before removal) and refresh.
+        layer.dead = True
+        # A source that would RAISE if dereferenced — proves we short-circuit early.
+        layer.source_plot = None
+        ov.refresh_plot_layers(tgt, np.array([1]))
+        time.sleep(0.15)
+        assert pushed == [], "a dead layer was still read/painted"
+
+
+# ── finding #6: eager region layer value matches the base (un-rounded) ────────────
+
+
+class TestEagerRegionParity:
+    def test_eager_region_mean_is_unrounded(self):
+        """The overlay eager integrating-region read must return the UN-rounded float
+        mean — identical to the base eager region read (update_functions ~1149,
+        ``data[sl].mean(axis=0)``) — NOT ``np.rint(...).astype(dtype)``. Otherwise the
+        layer diverges from the base frame it composites over (finding #6)."""
+        import hyperspy.api as hs
+        from spyde.drawing.update_functions import _prepare_nav_indices
+
+        # Integer eager 4-D source, nav (2, 2) so no clamp ambiguity; per-nav frames
+        # chosen so an averaged pair is fractional (…, .5).
+        data = np.zeros((2, 2, 2, 2), dtype=np.uint16)
+        for iy in range(2):
+            for ix in range(2):
+                data[iy, ix] = np.array([[iy, ix], [iy + ix, iy * 2 + ix]], np.uint16)
+        sig = hs.signals.Signal2D(data)                       # eager (numpy)
+
+        class _PS:
+            current_signal = sig
+
+        class _SrcPlot:
+            plot_state = _PS()
+            window_id = 7
+
+        # A 2-nav-point integrating region (widget (cx, cy) pairs).
+        region_idx = np.array([[0, 0], [1, 1]])
+        frame = ov._read_source_frame(_SrcPlot(), region_idx, integrating=True)
+        assert frame is not None
+
+        # The BASE eager region read, driven through the SAME index prep the overlay
+        # uses, then `data[sl].mean(axis=0)` UN-rounded (verbatim base behaviour).
+        idx = _prepare_nav_indices(sig, region_idx, integrating=True)
+        sl = tuple(idx[:, k].astype(int) for k in range(idx.shape[1]))
+        base = np.asarray(sig.data[sl]).mean(axis=0)
+        assert np.array_equal(frame, base), "layer eager region diverges from base"
+        # It is genuinely fractional — not rounded to the int dtype.
+        assert np.any(frame != np.rint(frame)), "layer region was rounded (divergence)"

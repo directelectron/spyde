@@ -67,6 +67,28 @@ export function useDebouncedAction(
   }, [sendAction, action, windowId, ms])
 }
 
+/**
+ * useKeyedDebounce — a per-key debounced dispatcher. Two independent draggable
+ * controls (e.g. two different layers' alpha sliders) each get their own timer
+ * keyed by whatever string identifies them, so debouncing one never cancels or
+ * delays the other (a single shared timer would make dragging layer B's slider
+ * swallow layer A's pending send). Pending timers are cleared on unmount so a
+ * fire can't land after the owning component (e.g. a closed wizard/editor) is
+ * gone. Mirrors `useDebouncedAction` above, generalized to N independent keys.
+ */
+export function useKeyedDebounce(delay = 150): (key: string, fn: () => void) => void {
+  const timers = React.useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
+  React.useEffect(() => {
+    const t = timers.current
+    return () => { t.forEach(clearTimeout); t.clear() }
+  }, [])
+  return React.useCallback((key: string, fn: () => void) => {
+    const existing = timers.current.get(key)
+    if (existing) clearTimeout(existing)
+    timers.current.set(key, setTimeout(fn, delay))
+  }, [delay])
+}
+
 export function useWizardEvent(
   name: string, windowId: number,
   handler: (detail: Record<string, unknown>) => void,

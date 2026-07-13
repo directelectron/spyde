@@ -57,6 +57,11 @@ export function ReportSidebar() {
   // Export dropdown open state + a transient success/failure note in the header.
   const [exportMenuOpen, setExportMenuOpen] = useState(false)
   const [exportNote, setExportNote] = useState<{ ok: boolean; text: string } | null>(null)
+  // True while ANY export (HTML/Markdown/PDF) is in flight — disables the
+  // Export menu items so a second export can't be triggered mid-flight
+  // (which would otherwise cross-wire the `spyde:report_exported` match).
+  // Always cleared on success, failure, AND timeout (finally-style).
+  const [exporting, setExporting] = useState(false)
   const exportNoteTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const exportMenuRef = useRef<HTMLDivElement>(null)
   // Body drop state: whether a compatible pill is over the body, and the cell
@@ -130,7 +135,7 @@ export function ReportSidebar() {
   // null on ~15s timeout. Listening before triggering closes the (theoretical)
   // race where a reply arrives before the listener is attached.
   const awaitExport = (
-    match: (d: { kind?: string; path?: string }) => boolean,
+    match: (d: { kind?: string; path?: string; token?: string | null }) => boolean,
     trigger: () => void,
     timeoutMs = 15000,
   ): Promise<string | null> =>
@@ -144,7 +149,7 @@ export function ReportSidebar() {
         resolve(v)
       }
       const onEvt = (ev: Event) => {
-        const d = (ev as CustomEvent).detail as { kind?: string; path?: string }
+        const d = (ev as CustomEvent).detail as { kind?: string; path?: string; token?: string | null }
         if (match(d)) finish(d.path ?? null)
       }
       window.addEventListener('spyde:report_exported', onEvt)
@@ -152,50 +157,70 @@ export function ReportSidebar() {
       trigger()
     })
 
-  const exportHtml = async (mode: 'static' | 'interactive') => {
+  // Run one export "leg", guarding `exporting` around it (set true before, always
+  // cleared after — success, failure, or timeout) so the Export menu can't be
+  // used to fire a second overlapping export while one is in flight.
+  const runExport = async (body: () => Promise<void>) => {
+    setExporting(true)
+    try {
+      await body()
+    } finally {
+      setExporting(false)
+    }
+  }
+
+  const exportHtml = (mode: 'static' | 'interactive') => runExport(async () => {
     setExportMenuOpen(false)
     if (!canExport) return
     const path = await window.electron.reportExportDialog('html', `${titleSlug}.html`)
     if (!path) return
+    // A fresh token per export correlates THIS export's reply with THIS
+    // trigger — two exports in flight at once (or a stray retry) can't match
+    // each other's `report_exported` echo. Fall back to a `path` match too
+    // (belt-and-braces) in case the reply predates the token contract.
+    const token = crypto.randomUUID()
     const done = await awaitExport(
-      (d) => d.path === path,
-      () => sendAction('report_export_html', { mode, path }),
+      (d) => d.token === token || d.path === path,
+      () => sendAction('report_export_html', { mode, path, token }),
     )
     if (done) showNote(true, `Exported ✓ ${basename(done)}`)
     else showNote(false, 'Export timed out')
-  }
+  })
 
-  const exportMarkdownFolder = async () => {
+  const exportMarkdownFolder = () => runExport(async () => {
     setExportMenuOpen(false)
     if (!canExport) return
     const path = await window.electron.reportExportDialog('folder')
     if (!path) return
+    const token = crypto.randomUUID()
     const done = await awaitExport(
-      (d) => d.path === path,
-      () => sendAction('report_export_markdown', { path }),
+      (d) => d.token === token || d.path === path,
+      () => sendAction('report_export_markdown', { path, token }),
     )
     if (done) showNote(true, `Exported ✓ ${basename(done)}`)
     else showNote(false, 'Export timed out')
-  }
+  })
 
-  const exportPdf = async () => {
+  const exportPdf = () => runExport(async () => {
     setExportMenuOpen(false)
     if (!canExport) return
     const pdfPath = await window.electron.reportExportDialog('pdf', `${titleSlug}.pdf`)
     if (!pdfPath) return
     // First leg: render a STATIC HTML into a temp file (backend generates the
-    // path and emits report_exported with it — no `path` supplied). We can't
-    // predict the generated temp name, so match on the first html-static event.
+    // path and emits report_exported with it — no `path` supplied). The token
+    // is the only way to correlate the reply since the temp name is unknown
+    // up front and a concurrent export could otherwise match the wrong event.
+    const tmpToken = crypto.randomUUID()
     const tmpPath = await awaitExport(
-      (d) => d.kind === 'html-static' && !!d.path,
-      () => sendAction('report_export_html', { mode: 'static', temp: true }),
+      (d) => d.token === tmpToken && d.kind === 'html-static',
+      () => sendAction('report_export_html', { mode: 'static', temp: true, token: tmpToken }),
     )
     if (!tmpPath) { showNote(false, 'PDF export timed out'); return }
     // Second leg: render that temp HTML to the chosen PDF path (printToPDF).
     const res = await window.electron.reportExportPdf(tmpPath, pdfPath)
     if (res?.ok) showNote(true, `Exported ✓ ${basename(pdfPath)}`)
     else showNote(false, 'PDF export failed')
-  }
+  })
 
   // ── Paste (internal cell clipboard) ───────────────────────────────────────
   // Reactive enablement: the Paste button is enabled only while the clipboard
@@ -386,19 +411,19 @@ export function ReportSidebar() {
         <div ref={exportMenuRef} style={styles.exportWrap}>
           <button
             data-testid="report-export-toggle"
-            style={canExport ? styles.hdrBtn : styles.hdrBtnDisabled}
-            title={canExport ? 'Export report' : 'Add a cell to export'}
-            disabled={!canExport}
+            style={canExport && !exporting ? styles.hdrBtn : styles.hdrBtnDisabled}
+            title={exporting ? 'Export in progress…' : canExport ? 'Export report' : 'Add a cell to export'}
+            disabled={!canExport || exporting}
             onClick={() => setExportMenuOpen(v => !v)}
-          >Export ▾</button>
+          >{exporting ? 'Exporting…' : 'Export ▾'}</button>
           {exportMenuOpen && canExport && (
             <div style={styles.exportMenu} data-testid="report-export-menu" role="menu">
-              <ExportItem testid="export-html-interactive" label="Interactive HTML"
+              <ExportItem testid="export-html-interactive" label="Interactive HTML" disabled={exporting}
                 onClick={() => exportHtml('interactive')} />
-              <ExportItem testid="export-html-static" label="Static HTML"
+              <ExportItem testid="export-html-static" label="Static HTML" disabled={exporting}
                 onClick={() => exportHtml('static')} />
-              <ExportItem testid="export-pdf" label="PDF" onClick={exportPdf} />
-              <ExportItem testid="export-md-folder" label="Markdown folder"
+              <ExportItem testid="export-pdf" label="PDF" disabled={exporting} onClick={exportPdf} />
+              <ExportItem testid="export-md-folder" label="Markdown folder" disabled={exporting}
                 onClick={exportMarkdownFolder} />
             </div>
           )}
@@ -473,17 +498,18 @@ export function ReportSidebar() {
 }
 
 // One Export dropdown row (hover-highlight, dock-palette style).
-function ExportItem({ testid, label, onClick }: {
-  testid: string; label: string; onClick: () => void
+function ExportItem({ testid, label, onClick, disabled }: {
+  testid: string; label: string; onClick: () => void; disabled?: boolean
 }) {
   return (
     <button
       data-testid={testid}
       role="menuitem"
-      style={styles.exportItem}
-      onMouseEnter={(e) => { e.currentTarget.style.background = '#313244' }}
+      disabled={disabled}
+      style={disabled ? { ...styles.exportItem, color: '#585b70', cursor: 'default' } : styles.exportItem}
+      onMouseEnter={(e) => { if (!disabled) e.currentTarget.style.background = '#313244' }}
       onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent' }}
-      onClick={onClick}
+      onClick={disabled ? undefined : onClick}
     >{label}</button>
   )
 }

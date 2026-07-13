@@ -411,13 +411,16 @@ export interface ReportSavedMessage extends MsgBase {
 }
 
 /** An export finished: an HTML file (static/interactive) or a markdown folder
- *  was written at `path`. The renderer's Export flow awaits this (matched by
- *  `path`) to show a success note; the PDF flow awaits the temp static HTML's
- *  emitted `path` before handing it to `printToPDF`. */
+ *  was written at `path`. The renderer's Export flow awaits this, matched by
+ *  `token` (the same token it sent in the triggering `report_export_html` /
+ *  `report_export_markdown` payload — the backend echoes it back verbatim) so
+ *  two exports in flight at once can't cross-wire; the PDF flow's first leg
+ *  (temp static HTML) also matches on `token`. */
 export interface ReportExportedMessage extends MsgBase {
   type: 'report_exported'
   kind: 'html-static' | 'html-interactive' | 'markdown-folder'
   path: string
+  token?: string | null
 }
 
 /**

@@ -91,24 +91,59 @@ def _is_nav_signal_pair(session, cell, source_plot):
     return src_nav != tgt_nav
 
 
+def _region_from_selector(sel):
+    """The integrating ``(x, y, w, h)`` nav region of one selector, or None when
+    it's a crosshair (non-integrating) or its indices can't be read."""
+    if not getattr(sel, "is_integrating", False):
+        return None
+    try:
+        idx = np.asarray(sel.get_selected_indices())
+    except Exception as e:
+        log.debug("reading selector indices failed: %s", e)
+        return None
+    if idx.ndim == 2 and idx.shape[0] >= 1 and idx.shape[1] >= 2:
+        xs, ys = idx[:, 0], idx[:, 1]
+        x0, y0 = int(xs.min()), int(ys.min())
+        return (x0, y0, int(xs.max() - x0 + 1), int(ys.max() - y0 + 1))
+    return None
+
+
+def _selectors_for_source(mm, source_plot):
+    """The nav selectors ACTUALLY linked to *source_plot* (NOT every selector on
+    any navigator). A selector is linked when *source_plot* is one of its driven
+    children (source is the signal plot the selector slices) OR when the source is
+    the NAVIGATOR the selector lives on (its ``parent`` plot_window holds the
+    source). Returns them in registration order."""
+    nav_selectors = getattr(mm, "navigation_selectors", {}) or {}
+    src_pw = getattr(source_plot, "plot_window", None)
+    out = []
+    for nav_pw, selectors in nav_selectors.items():
+        for sel in selectors:
+            children = getattr(sel, "children", {}) or {}
+            drives_source = source_plot in children
+            on_source_nav = src_pw is not None and (
+                nav_pw is src_pw or getattr(sel, "parent", None) is src_pw)
+            if drives_source or on_source_nav:
+                out.append(sel)
+    return out
+
+
 def _source_nav_region(session, source_plot):
-    """The source's current nav-selector region ``(x, y, w, h)`` when it has an
-    integrating navigator selector — used as the callout connector region. None
-    when there's no region selector (a crosshair) or it can't be read."""
+    """The nav-selector region ``(x, y, w, h)`` of the integrating selector that
+    is actually linked to *source_plot* — used as the callout connector region.
+
+    Only selectors driving/attached to *source_plot* are considered (NOT the first
+    integrating selector across any navigator, which would return an unrelated
+    ROI). None when *source_plot* has no linked integrating region selector or it
+    can't be read."""
     try:
         mm = getattr(source_plot, "multiplot_manager", None)
         if mm is None:
             return None
-        # Search every navigator's selectors for one whose child is this plot.
-        for nav_pw, selectors in getattr(mm, "navigation_selectors", {}).items():
-            for sel in selectors:
-                if not getattr(sel, "is_integrating", False):
-                    continue
-                idx = np.asarray(sel.get_selected_indices())
-                if idx.ndim == 2 and idx.shape[0] >= 1 and idx.shape[1] >= 2:
-                    xs, ys = idx[:, 0], idx[:, 1]
-                    x0, y0 = int(xs.min()), int(ys.min())
-                    return (x0, y0, int(xs.max() - x0 + 1), int(ys.max() - y0 + 1))
+        for sel in _selectors_for_source(mm, source_plot):
+            region = _region_from_selector(sel)
+            if region is not None:
+                return region
     except Exception as e:
         log.debug("reading source nav region failed: %s", e)
     return None
@@ -278,10 +313,48 @@ def _compose_tile(mgr, cell, src_panel, src_map, mode) -> None:
     spec.layout = {"kind": "grid", "rows": rows, "cols": cols}
 
 
+def _axis_offset_scale(axis_vals):
+    """(offset, scale) for a calibrated 1-D axis array (offset = first sample,
+    scale = uniform step). None when the array is missing / too short."""
+    try:
+        a = np.asarray(axis_vals, dtype=float)
+    except (TypeError, ValueError):
+        return None
+    if a.ndim != 1 or a.size < 1:
+        return None
+    offset = float(a[0])
+    scale = float(a[1] - a[0]) if a.size >= 2 else 1.0
+    return offset, scale
+
+
+def _index_region_to_data(panel, region):
+    """Convert a nav-INDEX-space ``(x, y, w, h)`` region to the ``panel``'s DATA
+    coords using the panel's calibrated x/y axes (offset + index*scale for the
+    origin, w/h scaled). Falls back to the raw index region if the panel carries
+    no usable axes (uncalibrated → index == data)."""
+    x, y, w, h = region
+    axes = panel.axes if panel is not None else None
+    if not axes:
+        return (float(x), float(y), float(w), float(h))
+    xo_sc = _axis_offset_scale(axes.get("x_axis"))
+    yo_sc = _axis_offset_scale(axes.get("y_axis"))
+    if xo_sc is None or yo_sc is None:
+        return (float(x), float(y), float(w), float(h))
+    (ox, sx), (oy, sy) = xo_sc, yo_sc
+    return (ox + x * sx, oy + y * sy, w * sx, h * sy)
+
+
 def _compose_callout(session, mgr, cell, src, src_panel, src_map) -> None:
     """Add a small callout INSET on the target's primary panel that references a NEW
-    small panel spec rendered from the source snapshot. The connector region is the
-    source's current nav-selector region on the navigator (when applicable)."""
+    small panel spec rendered from the source snapshot.
+
+    The connector (the dashed source-region rectangle drawn on the BASE panel) is
+    attached ONLY when the base panel is the NAVIGATOR whose selector produced the
+    region — i.e. the base shows the navigator and the callout inset shows the
+    signal. In that case the nav-INDEX-space region is converted to the base
+    panel's DATA coords (offset + index*scale). When the base panel is the SIGNAL
+    (the navigator was dropped as the inset) there is no meaningful source region
+    on the diffraction-pattern panel, so the connector is SKIPPED."""
     target_panel = cell.spec.panels[0] if cell.spec.panels else None
     if target_panel is None:
         return
@@ -300,13 +373,29 @@ def _compose_callout(session, mgr, cell, src, src_panel, src_map) -> None:
     cell.spec.panels.append(inset_panel)
     mgr.set_snapshot(cell.id, inset_panel_id, inset_layer.id, np.asarray(src_arr))
 
-    region = _source_nav_region(session, src)
+    # A connector is meaningful only when the BASE panel is the navigator (so the
+    # region rectangle lands on nav axes) AND the inset (the dropped source) is the
+    # signal driven by that navigator's selector. Determine the base plot and skip
+    # the connector otherwise.
+    connector = None
+    base_ref = _target_base_source(cell)
+    base_plot = base_ref.resolve(session) if base_ref is not None else None
+    base_is_nav = bool(getattr(base_plot, "is_navigator", False)) if base_plot else False
+    src_is_nav = bool(getattr(src, "is_navigator", False))
+    if base_is_nav and not src_is_nav:
+        # The selector that produced the region lives on the BASE navigator; read
+        # its region and convert index → the base panel's data coords.
+        region = _source_nav_region(session, base_plot)
+        if region is not None:
+            data_region = _index_region_to_data(target_panel, region)
+            connector = {"region": list(data_region)}
+
     inset_entry = {
         "panel": inset_panel_id,
         "corner": "top-right",
         "w_frac": 0.3,
         "h_frac": 0.3,
-        "connector": ({"region": list(region)} if region is not None else None),
+        "connector": connector,
     }
     target_panel.insets.append(inset_entry)
 

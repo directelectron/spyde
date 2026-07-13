@@ -246,6 +246,24 @@ class TestComposeModes:
         assert any(p["id"] == inset_pid for p in fig["panels"])
         assert len(_report_figures(messages)) == 1
 
+    def test_callout_signal_base_has_no_connector(self, stem_4d_dataset):
+        """The e2e case: cell built from the SIGNAL, NAVIGATOR dropped as the inset.
+        The base panel is the diffraction pattern — there's no meaningful source
+        region on the DP panel — so the connector MUST be None (finding 5)."""
+        session, messages = stem_4d_dataset["window"], stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        sig_wid = _signal_wid(session)
+        nav_wid = _nav_wid(session)
+        h.report_new(session, None, {})
+        cid = _make_figure_cell(session, messages, sig_wid)
+        messages.clear()
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "callout",
+                           "source_window_id": nav_wid})
+        fig = _fig_dict_of(messages, cid)
+        inset = fig["panels"][0]["insets"][0]
+        assert inset["connector"] is None
+
 
 # ── layer / panel / annotation edits ────────────────────────────────────────────
 
@@ -457,3 +475,140 @@ class TestLayeredAddToReport:
         assert "magma" in cmaps
         # Both layers have a stored snapshot.
         assert len(session._report.snapshot_map(cid)) == 2
+
+
+# ── callout source-region selector filtering + coordinate space ─────────────────
+
+
+class _FakeSelector:
+    """A fake nav selector: an integrating region driving a set of child plots,
+    living on a parent plot_window."""
+    def __init__(self, indices, children, parent, is_integrating=True):
+        self._indices = np.asarray(indices)
+        self.children = {c: None for c in children}
+        self.parent = parent
+        self.is_integrating = is_integrating
+
+    def get_selected_indices(self):
+        return self._indices
+
+
+class _FakePW:
+    """A stand-in navigator plot_window (identity only)."""
+
+
+class _FakePlot2:
+    def __init__(self, plot_window=None, mm=None):
+        self.plot_window = plot_window
+        self.multiplot_manager = mm
+
+
+class _FakeMM:
+    def __init__(self, navigation_selectors):
+        self.navigation_selectors = navigation_selectors
+
+
+class TestCalloutRegionFiltering:
+    def _rect_indices(self, x0, y0, w, h):
+        pts = [[x0 + dx, y0 + dy] for dy in range(h) for dx in range(w)]
+        return np.asarray(pts)
+
+    def test_source_region_uses_selector_linked_to_source(self):
+        """Two selector SETS on one tree: _source_nav_region must return the region
+        of the selector actually linked to the source plot, NOT the first
+        integrating selector across any navigator (finding 4)."""
+        nav_pw = _FakePW()
+        # The SIGNAL plot driven by selector B (the one we drop / query).
+        sig_b = _FakePlot2(plot_window=None)
+        sig_a = _FakePlot2(plot_window=None)
+        # Selector A: an unrelated ROI at (0,0) 2x2. Selector B: (5,6) 3x2 → the
+        # source region we expect. A is registered FIRST (would win the old bug).
+        sel_a = _FakeSelector(self._rect_indices(0, 0, 2, 2), [sig_a], nav_pw)
+        sel_b = _FakeSelector(self._rect_indices(5, 6, 3, 2), [sig_b], nav_pw)
+        mm = _FakeMM({nav_pw: [sel_a, sel_b]})
+        sig_b.multiplot_manager = mm
+
+        region = cx._source_nav_region(None, sig_b)
+        assert region == (5, 6, 3, 2)
+
+    def test_source_region_by_navigator_parent(self):
+        """When the SOURCE is the navigator itself, its selectors match by parent
+        plot_window."""
+        nav_pw = _FakePW()
+        nav_plot = _FakePlot2(plot_window=nav_pw)
+        driven = _FakePlot2(plot_window=None)
+        sel = _FakeSelector(self._rect_indices(2, 3, 4, 4), [driven], nav_pw)
+        mm = _FakeMM({nav_pw: [sel]})
+        nav_plot.multiplot_manager = mm
+        assert cx._source_nav_region(None, nav_plot) == (2, 3, 4, 4)
+
+    def test_crosshair_selector_gives_no_region(self):
+        nav_pw = _FakePW()
+        sig = _FakePlot2(plot_window=None)
+        sel = _FakeSelector(self._rect_indices(1, 1, 1, 1), [sig], nav_pw,
+                            is_integrating=False)
+        mm = _FakeMM({nav_pw: [sel]})
+        sig.multiplot_manager = mm
+        assert cx._source_nav_region(None, sig) is None
+
+    def test_index_region_to_data_calibrated(self):
+        """A nav-index region converts to the panel's DATA coords via offset+scale
+        (both axes; w/h scaled) — finding 5."""
+        from spyde.actions.report.model import PanelSpec
+        # x axis: offset 10, scale 2.  y axis: offset -4, scale 0.5.
+        panel = PanelSpec(axes={"x_axis": [10.0, 12.0, 14.0, 16.0],
+                                "y_axis": [-4.0, -3.5, -3.0]})
+        # region (x=1, y=2, w=2, h=1) in index space.
+        got = cx._index_region_to_data(panel, (1, 2, 2, 1))
+        # x: 10 + 1*2 = 12 ; y: -4 + 2*0.5 = -3 ; w: 2*2 = 4 ; h: 1*0.5 = 0.5
+        assert got == (12.0, -3.0, 4.0, 0.5)
+
+    def test_index_region_to_data_uncalibrated_passthrough(self):
+        from spyde.actions.report.model import PanelSpec
+        panel = PanelSpec(axes=None)
+        assert cx._index_region_to_data(panel, (3, 4, 5, 6)) == (3.0, 4.0, 5.0, 6.0)
+
+    def test_callout_navigator_base_converts_region_to_data(
+            self, stem_4d_dataset, monkeypatch):
+        """Cell built from the NAVIGATOR (base panel), SIGNAL dropped as the inset:
+        a connector IS attached and its region is the nav-index region converted to
+        the base navigator panel's DATA coords (finding 5)."""
+        session, messages = stem_4d_dataset["window"], stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        sig_wid = _signal_wid(session)
+        nav_wid = _nav_wid(session)
+        assert nav_wid is not None
+        h.report_new(session, None, {})
+        # Base = navigator.
+        cid = _make_figure_cell(session, messages, nav_wid)
+
+        # Give the base (navigator) panel calibrated axes so the conversion is
+        # observable, and force the nav-selector region to a known index region.
+        base_panel = session._report.doc.cell_by_id(cid).spec.panels[0]
+        base_panel.axes = {"x_axis": [100.0, 110.0, 120.0, 130.0],
+                           "y_axis": [0.0, 5.0, 10.0]}
+        monkeypatch.setattr(cx, "_source_nav_region",
+                            lambda session, plot: (1, 2, 2, 1))
+        # Base is the navigator → force resolve() to return that navigator plot.
+        nav_plot = session._plot_by_window_id(nav_wid)
+        monkeypatch.setattr(cx, "_target_base_source",
+                            lambda cell: _StubRef(nav_plot))
+
+        messages.clear()
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "callout",
+                           "source_window_id": sig_wid})
+        fig = _fig_dict_of(messages, cid)
+        inset = fig["panels"][0]["insets"][0]
+        assert inset["connector"] is not None
+        # x: 100 + 1*10 = 110 ; y: 0 + 2*5 = 10 ; w: 2*10 = 20 ; h: 1*5 = 5
+        assert inset["connector"]["region"] == [110.0, 10.0, 20.0, 5.0]
+
+
+class _StubRef:
+    """A SignalRef-like object whose resolve() returns a fixed plot."""
+    def __init__(self, plot):
+        self._plot = plot
+
+    def resolve(self, session):
+        return self._plot

@@ -734,6 +734,24 @@ class Plot:
             return
         dims = data.ndim
 
+        # Layered plots: anyplotlib REFUSES a shape-changing set_data while image
+        # layers exist (they would silently mis-stretch over the new fit rect). A
+        # node switch / recompute that changes the frame shape must therefore drop
+        # the layers FIRST — cleanly, with a status + layers_state so the dock
+        # clears — instead of raising mid-paint.
+        if dims == 2 and getattr(self, "_layers", None) and self._plot2d is not None:
+            st = getattr(self._plot2d, "_state", None) or {}
+            bh, bw = st.get("image_height"), st.get("image_width")
+            if bh and bw and (data.shape[0] != bh or data.shape[1] != bw):
+                try:
+                    from spyde.actions.overlay import drop_all_layers, _emit_layers_state
+                    drop_all_layers(self)
+                    _emit_layers_state(self)
+                    from spyde.backend.ipc import emit_status
+                    emit_status("Overlay layers removed: image shape changed.")
+                except Exception as e:
+                    logger.debug("layer drop on shape change failed: %s", e)
+
         # DIAGNOSTIC: how much REAL detail is in the array handed to us? shape says
         # 4096² but if a small 82² center crop has only ~36 distinct values the ARRAY
         # is blocky (a low-res frame stored at 4096, not true 4k). Logs the crop's

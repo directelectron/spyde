@@ -117,9 +117,13 @@ class TestReportDocument:
             h.report_add_cell(session, None, {"cell_type": "markdown", "source": s})
         cells = _last_state(messages)["cells"]
         first_id = cells[0]["id"]
+        # ``index`` is the drop-target cell's pre-removal position ("insert before
+        # the cell currently at this index"). Dragging A (idx 0) onto C (idx 2) lands
+        # A just before C → [B, A, C]. (Detailed off-by-one coverage lives in
+        # test_report_move_cell.py.)
         h.report_move_cell(session, None, {"cell_id": first_id, "index": 2})
         sources = [c["source"] for c in _last_state(messages)["cells"]]
-        assert sources == ["B", "C", "A"]
+        assert sources == ["B", "A", "C"]
 
     def test_close_emits_closed_state(self, window):
         session, messages = window["window"], window["messages"]
@@ -289,11 +293,16 @@ class TestReportSave:
         mgr = session._report
         cid = next(iter(mgr._window_by_cell))
 
-        # Simulate a pending save (as report_save would arm with a loop present).
+        # Simulate a pending save (as report_save/harvest_snapshots would arm with a
+        # loop present): the pending entry carries the ``finish`` callback that
+        # writes the report — matching the real shape (no legacy ``path`` key).
         path = str(tmp_path / "harvest.spyde-report")
         token = "tok123"
-        mgr._pending_save[token] = {"path": path, "cell_ids": [cid],
-                                    "harvested": {}}
+        mgr._pending_save[token] = {
+            "cell_ids": [cid], "harvested": {},
+            "finish": lambda harvested: h._finish_save(session, mgr, path,
+                                                       harvested),
+        }
         # A distinct red 1x1 PNG so we can tell harvest from bake.
         from spyde.actions.report.model import bake_fallback_png
         harvested_png = bake_fallback_png(np.ones((4, 4)) * 7.0)
@@ -304,6 +313,60 @@ class TestReportSave:
         from spyde.actions.report.model import read_report
         _doc, assets = read_report(path)
         assert assets[cid] == harvested_png
+
+    def test_empty_harvested_png_still_writes_baked_asset(self, tem_2d_dataset,
+                                                          tmp_path):
+        """An EMPTY harvested payload (b"" from a "data:image/png;base64," data URL
+        with no bytes) must NOT skip the asset — the bake fallback fills it, so the
+        written container still holds a non-empty PNG (no dangling image ref)."""
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        _prime_plot_data(session)
+        wid = _signal_window_id(session)
+        h.report_new(session, None, {})
+        h.report_add_figure(session, None, {"source_window_id": wid, "caption": "F"})
+        mgr = session._report
+        cid = next(iter(mgr._window_by_cell))
+
+        # Simulate the renderer delivering an EMPTY data URL for this cell (decodes
+        # to b"") through the real report_snapshots → finish → _finish_save path.
+        path = str(tmp_path / "empty.spyde-report")
+        token = "tokEMPTY"
+        mgr._pending_save[token] = {
+            "cell_ids": [cid], "harvested": {},
+            "finish": lambda harvested: h._finish_save(session, mgr, path,
+                                                       harvested),
+        }
+        h.report_snapshots(session, None, {
+            "token": token, "images": {cid: "data:image/png;base64,"}})
+
+        from spyde.actions.report.model import read_report
+        _doc, assets = read_report(path)
+        # The asset IS present (baked) and non-empty — a valid PNG.
+        assert cid in assets
+        assert assets[cid], "asset must not be empty (bake fallback expected)"
+        assert assets[cid][:8] == b"\x89PNG\r\n\x1a\n"
+
+    def test_assemble_assets_empty_harvest_uses_baked_fallback(self, tem_2d_dataset):
+        """Unit: assemble_assets treats an empty harvested PNG as missing and falls
+        back to the held baked PNG (not skipping the cell)."""
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        _prime_plot_data(session)
+        wid = _signal_window_id(session)
+        h.report_new(session, None, {})
+        h.report_add_figure(session, None, {"source_window_id": wid})
+        mgr = session._report
+        cid = next(iter(mgr._window_by_cell))
+        # Drop the live snapshot so the only fallback is the baked PNG.
+        from spyde.actions.report.model import bake_fallback_png
+        baked = bake_fallback_png(np.ones((6, 6)) * 3.0)
+        mgr._baked[cid] = baked
+        mgr._snapshots.pop(cid, None)
+
+        # An empty harvest for this cell → must fall back to baked, not skip it.
+        assets = mgr.assemble_assets({cid: b""})
+        assert assets.get(cid) == baked
 
 
 # ── open + rebind round-trip ───────────────────────────────────────────────────
@@ -429,3 +492,28 @@ class TestReportTeardown:
         session, messages = window["window"], window["messages"]
         h.report_close(session, None, {})
         assert _last_state(messages)["open"] is False
+
+    def test_build_figure_window_early_return_tears_down_stale(self, tem_2d_dataset):
+        """A rebuild with an empty snap_map (or no spec) must STILL tear down the
+        prior window/controller — it must not leave a stale window mapped to a now
+        figure-less cell."""
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        _prime_plot_data(session)
+        wid = _signal_window_id(session)
+        h.report_new(session, None, {})
+        h.report_add_figure(session, None, {"source_window_id": wid})
+        mgr = session._report
+        cid = next(iter(mgr._window_by_cell))
+        fig_wid = mgr._window_by_cell[cid]
+        assert fig_wid in session._window_controllers
+
+        # Simulate the cell losing its snapshot (e.g. a refresh that went offline)
+        # then a rebuild — the early return must tear down the prior window.
+        cell = mgr.doc.cell_by_id(cid)
+        mgr._snapshots.pop(cid, None)
+        mgr.build_figure_window(cell)
+
+        assert cid not in mgr._window_by_cell
+        assert fig_wid not in mgr._controllers
+        assert fig_wid not in session._window_controllers

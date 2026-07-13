@@ -414,7 +414,10 @@ def mvx_run(session, plot, payload) -> None:
         emit_status(f"Movie exported: {frames} frames.")
         st.emit()
 
-    def _on_error(exc):
+    def _finish_error(exc):
+        # State mutation + cleanup + emit — runs on the MAIN thread (marshalled),
+        # so it never races the main-thread handlers (mvx_cancel / mvx_close /
+        # mvx_run) that touch st.running / st._cancel_flag / the cancel registry.
         _unregister(tree, flag)
         st.running = False
         st._cancel_flag = None
@@ -423,9 +426,16 @@ def mvx_run(session, plot, payload) -> None:
             emit_status("Movie export cancelled.")
         else:
             emit_error(f"Movie export failed: {exc}")
-        # Marshal the state refresh back to the main thread if possible.
+        st.emit()
+
+    def _on_error(exc):
+        # Runs on the WORKER thread — marshal ALL state mutation to the main loop,
+        # exactly like _done (which run_on_worker dispatches). Same no-loop inline
+        # fallback run_on_worker uses (bare test session → run inline) so tests still
+        # observe the emission synchronously.
         disp = getattr(session, "_dispatch_to_main", None)
-        (disp(st.emit) if disp is not None else st.emit())
+        (disp(lambda: _finish_error(exc)) if disp is not None
+         else _finish_error(exc))
 
     run_on_worker(session, _work, name="movie-export",
                   on_done=_done, on_error=_on_error)

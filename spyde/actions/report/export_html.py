@@ -211,6 +211,16 @@ def _render_body(mgr, assets: dict, *, interactive: bool) -> str:
 # ── handlers ───────────────────────────────────────────────────────────────────
 
 
+def _exported_msg(kind: str, path: str, token) -> dict:
+    """The ``report_exported`` message body. Echoes ``token`` VERBATIM when the
+    request supplied one (any non-None value, incl. 0 / ""), and OMITS the key
+    entirely otherwise — so the contract stays backward compatible."""
+    msg = {"type": "report_exported", "kind": kind, "path": path}
+    if token is not None:
+        msg["token"] = token
+    return msg
+
+
 def report_export_html(session, plot, payload) -> None:
     """Export the open report as ONE self-contained HTML file.
 
@@ -242,6 +252,10 @@ def report_export_html(session, plot, payload) -> None:
     mode = str(payload.get("mode", "static")).lower()
     interactive = mode == "interactive"
     kind = "html-interactive" if interactive else "html-static"
+    # OPTIONAL correlation token echoed verbatim in report_exported so the renderer
+    # can match an export reply to the request it issued (e.g. the PDF flow awaits a
+    # specific temp-export). Backward compatible: absent → absent in the reply.
+    token = payload.get("token")
 
     def finish(harvested: dict) -> None:
         try:
@@ -254,7 +268,7 @@ def report_export_html(session, plot, payload) -> None:
             ipc.emit_error(f"Exporting HTML failed: {e}")
             log.exception("report_export_html failed")
             return
-        ipc.emit({"type": "report_exported", "kind": kind, "path": path})
+        ipc.emit(_exported_msg(kind, path, token))
 
     harvest_snapshots(session, mgr, finish)
 
@@ -282,6 +296,9 @@ def report_export_markdown(session, plot, payload) -> None:
             "report_export_markdown: target directory is not empty and doesn't "
             "look like a previous export — pick an empty directory.")
         return
+    # OPTIONAL correlation token echoed verbatim in report_exported (see
+    # report_export_html). Backward compatible: absent → absent in the reply.
+    token = payload.get("token")
 
     def finish(harvested: dict) -> None:
         try:
@@ -292,8 +309,7 @@ def report_export_markdown(session, plot, payload) -> None:
             ipc.emit_error(f"Exporting markdown folder failed: {e}")
             log.exception("report_export_markdown failed")
             return
-        ipc.emit({"type": "report_exported", "kind": "markdown-folder",
-                  "path": path})
+        ipc.emit(_exported_msg("markdown-folder", path, token))
 
     harvest_snapshots(session, mgr, finish)
 

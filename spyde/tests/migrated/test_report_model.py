@@ -87,6 +87,63 @@ class TestMarkdownRoundTrip:
         back = m.parse_report_md(m.serialize_report_md(doc))
         assert [c.cell_type for c in back.cells] == ["markdown"]
 
+    def test_four_backtick_fence_with_inner_triple_fence(self):
+        """A 4-backtick fence that CONTAINS a nested ```python line + an
+        ``![x](assets/cX.png)`` figure lookalike must NOT close at the inner ```
+        (CommonMark: a closing fence needs length >= the opener). It round-trips
+        intact and spawns NO phantom figure cell."""
+        src = (
+            "````\n"
+            "```python\n"
+            "img = '![x](assets/cX.png)'\n"
+            "```\n"
+            "still inside the outer fence\n"
+            "````"
+        )
+        doc = m.ReportDoc()
+        doc.cells.append(m.Cell(cell_type="markdown", source=src))
+        back = m.parse_report_md(m.serialize_report_md(doc))
+        # ONE markdown cell, no figure cell leaked from inside the fence.
+        assert [c.cell_type for c in back.cells] == ["markdown"]
+        body = back.cells[0].source
+        assert "assets/cX.png" in body
+        assert "```python" in body
+        assert body.count("````") == 2       # outer fence intact (open + close)
+
+    def test_four_backtick_fence_round_trips_stable(self):
+        """Serialize→parse→serialize is a fixed point for a nested-fence block."""
+        src = (
+            "````\n"
+            "```\n"
+            "![z](assets/cZZ.png)\n"
+            "```\n"
+            "````"
+        )
+        doc = m.ReportDoc(title="Nested")
+        doc.created = doc.modified = "2020-01-01T00:00:00+00:00"
+        doc.cells.append(m.Cell(cell_type="markdown", source=src))
+        t1 = m.serialize_report_md(doc)
+        back = m.parse_report_md(t1)
+        back.created = back.modified = "2020-01-01T00:00:00+00:00"
+        t2 = m.serialize_report_md(back)
+        assert t1 == t2
+        assert [c.cell_type for c in back.cells] == ["markdown"]
+
+    def test_four_tilde_fence_with_inner_triple_tilde(self):
+        """The same nested-fence rule for tilde fences."""
+        src = (
+            "~~~~\n"
+            "~~~\n"
+            "![t](assets/cTT.png)\n"
+            "~~~\n"
+            "~~~~"
+        )
+        doc = m.ReportDoc()
+        doc.cells.append(m.Cell(cell_type="markdown", source=src))
+        back = m.parse_report_md(m.serialize_report_md(doc))
+        assert [c.cell_type for c in back.cells] == ["markdown"]
+        assert "assets/cTT.png" in back.cells[0].source
+
     def test_placeholder_parsing_with_and_without_caption(self):
         doc = m.ReportDoc(template=True)
         doc.cells.append(m.Cell(id="cph1", cell_type="figure",
@@ -277,6 +334,96 @@ class TestFingerprint:
     def test_signalref_resolve_none_session(self):
         ref = m.SignalRef(file_path="/a.hspy")
         assert ref.resolve(None) is None
+
+
+# ── title-based rebind with shape disambiguation (finding 3) ───────────────────
+
+
+class _FakeMeta:
+    def __init__(self, title):
+        self._title = title
+
+    def get_item(self, key, default=""):
+        if key == "General.title":
+            return self._title
+        return default
+
+
+class _FakeSignal:
+    def __init__(self, shape):
+        self.metadata = _FakeMeta("")
+        self.data = np.zeros(shape, dtype=np.float32)
+
+
+class _FakeAxesRoot:
+    def __init__(self, title):
+        self.metadata = _FakeMeta(title)
+
+
+class _FakeTree:
+    def __init__(self, title, shape, source_path=None):
+        self.root = _FakeAxesRoot(title)
+        self.source_path = source_path
+
+
+class _FakePlotState:
+    def __init__(self, shape):
+        self.current_signal = _FakeSignal(shape)
+
+
+class _FakePlot:
+    def __init__(self, title, shape, source_path=None, is_navigator=False):
+        self.signal_tree = _FakeTree(title, shape, source_path)
+        self.plot_state = _FakePlotState(shape)
+        self.is_navigator = is_navigator
+
+
+class _FakeSession:
+    def __init__(self, plots):
+        self._plots = plots
+
+
+class TestRebindShape:
+    def test_same_title_different_shape_rebinds_correct(self):
+        """Two open trees share a title but differ in shape → the ref (which
+        recorded a shape) rebinds to the tree with the MATCHING shape, never the
+        wrong one."""
+        p_small = _FakePlot("Scan", (16, 16))
+        p_big = _FakePlot("Scan", (64, 64))
+        session = _FakeSession([p_small, p_big])
+        # A ref pinned to the small-shape tree by title + shape.
+        ref = m.SignalRef(tree_node="Scan", title="Scan", shape=[16, 16])
+        assert ref.resolve(session) is p_small
+        # And the big one.
+        ref_big = m.SignalRef(tree_node="Scan", title="Scan", shape=[64, 64])
+        assert ref_big.resolve(session) is p_big
+
+    def test_same_title_same_shape_is_ambiguous_offline(self):
+        """Two open trees share BOTH title and shape → genuinely ambiguous; the
+        ref resolves to None (offline) rather than binding the wrong one."""
+        p1 = _FakePlot("Scan", (32, 32))
+        p2 = _FakePlot("Scan", (32, 32))
+        session = _FakeSession([p1, p2])
+        ref = m.SignalRef(tree_node="Scan", title="Scan", shape=[32, 32])
+        assert ref.resolve(session) is None
+
+    def test_title_match_no_shape_still_binds(self):
+        """An OLD ref with no shape (older file) still binds by title alone when
+        unambiguous — shape is only a disambiguator, not a hard requirement."""
+        p = _FakePlot("Scan", (16, 16))
+        session = _FakeSession([p])
+        ref = m.SignalRef(tree_node="Scan", title="Scan", shape=None)
+        assert ref.resolve(session) is p
+
+    def test_shape_serialized_and_tolerant_of_absence(self):
+        """``shape`` round-trips through to_dict/from_dict, and from_dict tolerates
+        an old dict that lacks it."""
+        ref = m.SignalRef(tree_node="Scan", title="Scan", shape=[8, 8])
+        assert ref.to_dict()["shape"] == [8, 8]
+        assert m.SignalRef.from_dict(ref.to_dict()).shape == [8, 8]
+        # Old file: no "shape" key → None, no error.
+        old = {"tree_node": "Scan", "title": "Scan"}
+        assert m.SignalRef.from_dict(old).shape is None
 
 
 # ── baked PNG fallback ────────────────────────────────────────────────────────

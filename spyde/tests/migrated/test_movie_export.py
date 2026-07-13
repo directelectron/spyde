@@ -238,6 +238,72 @@ class TestCancellation:
         h._cleanup_partial(path)
         assert not os.path.exists(path)
 
+    def test_cancel_before_run_raises_before_probe_and_no_output(self, tmp_path,
+                                                                 monkeypatch):
+        """Finding #7: a cancel flag ALREADY set when export_movie starts must raise
+        _Cancelled at the earliest moment (before the auto-contrast probe read) and
+        leave NO output file — the writer is never opened."""
+        path = str(tmp_path / "precancel.mp4")
+
+        # If the probe read runs, this counter increments — it must NOT.
+        reads = {"n": 0}
+        real_read = pl.read_frame
+
+        def _counting_read(raw, t):
+            reads["n"] += 1
+            return real_read(raw, t)
+
+        monkeypatch.setattr(pl, "read_frame", _counting_read)
+
+        with pytest.raises(pl._Cancelled):
+            pl.export_movie(
+                _raw_lazy(), path=path, params=_base_params(), n_frames=N_FRAMES,
+                scale_s=TIME_SCALE_S, sig_scale_x=0.5, sig_units="nm",
+                should_cancel=lambda: True)     # cancelled from the very first poll
+        # Raised before the probe read → no frame was read, no file was created.
+        assert reads["n"] == 0, "probe read ran despite an already-set cancel flag"
+        assert not os.path.exists(path)
+
+
+# ── ragged frames (finding #5) ────────────────────────────────────────────────────
+
+class TestRaggedFrames:
+    def test_smaller_tail_frame_is_letterbox_padded(self, tmp_path, monkeypatch):
+        """A later frame that is SMALLER than the first (shape drifts after
+        downsample / even-crop) must be zero-padded up to the writer's fixed size —
+        NOT reach the writer with a mismatched shape. Export succeeds; frame count
+        matches; every decoded frame has the first frame's dimensions."""
+        raw = _raw_lazy()
+        real_read = pl.read_frame
+
+        def _ragged_read(r, t):
+            f = real_read(r, t)
+            if t == N_FRAMES // 2:          # one shrunken frame in the middle
+                return f[: FRAME - 6, : FRAME - 4]
+            return f
+
+        monkeypatch.setattr(pl, "read_frame", _ragged_read)
+
+        path, frames = _export(tmp_path, raw=raw, name="ragged.mp4")
+        assert frames == N_FRAMES           # no frame dropped / no crash
+        rdr = imageio.get_reader(path)
+        assert rdr.count_frames() == N_FRAMES
+        h0, w0 = rdr.get_data(0).shape[:2]
+        for i in range(N_FRAMES):           # uniform writer dimensions throughout
+            assert rdr.get_data(i).shape[:2] == (h0, w0)
+
+    def test_fit_frame_pads_and_crops(self):
+        """Unit: _fit_frame crops an oversized frame and zero-pads an undersized one
+        to exactly (out_h, out_w, 3)."""
+        big = np.full((40, 50, 3), 7, dtype=np.uint8)
+        assert pl._fit_frame(big, 32, 32).shape == (32, 32, 3)
+        small = np.full((20, 24, 3), 9, dtype=np.uint8)
+        out = pl._fit_frame(small, 32, 32)
+        assert out.shape == (32, 32, 3)
+        assert np.array_equal(out[:20, :24], small)     # original preserved
+        assert int(out[20:, :].sum()) == 0              # padded region is zero
+        assert int(out[:, 24:].sum()) == 0
+
 
 # ── ffmpeg missing ───────────────────────────────────────────────────────────────
 
@@ -395,3 +461,50 @@ class TestHandlers:
         assert plot.signal_tree._mvx_state is not None
         h.mvx_close(session, plot, {"window_id": plot.window_id})
         assert plot.signal_tree._mvx_state is None
+
+    def test_error_marshals_state_reset_to_main_loop(self, movie_dataset, tmp_path,
+                                                     monkeypatch):
+        """Finding #4: on an export FAILURE the worker-thread _on_error must marshal
+        the state mutation (running=False, _cancel_flag=None, unregister, emit) back
+        to the main loop via session._dispatch_to_main — not mutate it on the worker
+        thread. Assert the marshal is used AND the state is fully reset + an error
+        emitted."""
+        import time
+        session, messages = movie_dataset["window"], movie_dataset["messages"]
+        plot = _insitu_plot(session)
+        h.mvx_open(session, plot, {"window_id": plot.window_id})
+
+        # Record every fn marshalled to the main loop; run it inline (no loop in tests
+        # → mirrors _dispatch_to_main's own inline fallback).
+        marshalled = []
+        real_dispatch = session._dispatch_to_main
+
+        def _recording_dispatch(fn):
+            marshalled.append(fn)
+            return real_dispatch(fn)
+
+        monkeypatch.setattr(session, "_dispatch_to_main", _recording_dispatch)
+
+        # Force the pipeline to blow up so _on_error fires.
+        import spyde.actions.movie_export.pipeline as plmod
+        monkeypatch.setattr(
+            plmod, "export_movie",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+
+        path = str(tmp_path / "fail.mp4")
+        st = plot.signal_tree._mvx_state
+        h.mvx_run(session, plot, {"window_id": plot.window_id, "path": path})
+
+        for _ in range(200):
+            if not st.running and any(m.get("type") == "error" for m in messages):
+                break
+            time.sleep(0.02)
+
+        # The error path marshalled at least one callback to the main loop.
+        assert marshalled, "_on_error did not marshal state reset to the main loop"
+        # State fully reset (on the main loop), error emitted, no partial file.
+        assert st.running is False
+        assert st._cancel_flag is None
+        assert any(m.get("type") == "error"
+                   and "failed" in str(m.get("text", "")).lower() for m in messages)
+        assert not os.path.exists(path)

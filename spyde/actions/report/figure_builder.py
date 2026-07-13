@@ -323,32 +323,63 @@ def build_cell_figure(spec, snapshots, *, standalone: bool = False):
 
 
 def _resolve_pixels_for_standalone(fig) -> None:
-    """Rewrite every panel trait of *fig* with pixel change-tokens materialised
-    to inline base64, so the standalone HTML embed is self-contained even when
-    the app's Electron binary transport is active (base image AND every layer's
+    """Rewrite every panel trait of *fig* with pixel change-tokens materialised to
+    inline base64, so the standalone HTML embed is self-contained even when the
+    app's Electron binary transport is active (base image AND every layer's
     ``layer_<id>_b64`` are resolved by anyplotlib's ``resolve_pixel_tokens``).
 
-    Temporarily clears ``APL_BINARY_TRANSPORT`` so ``Figure._push`` takes its cold
-    path (``resolve_pixel_tokens`` → real base64), then restores the env for the
-    live MDI figures. A no-op when binary transport is off."""
-    import os
+    Does this WITHOUT mutating ``APL_BINARY_TRANSPORT``: the old approach cleared
+    the env around a ``fig._push`` and restored it, but the process-global env is
+    shared with the live ``_NavPainter`` thread pushing MDI figures concurrently —
+    a genuine race that could resolve a live figure's token to base64 (corrupting
+    the binary-transport dedup) or leave a token unresolved in the export.
 
-    prev = os.environ.get("APL_BINARY_TRANSPORT")
-    if prev != "1":
-        return   # base64 already inline — nothing to resolve.
+    Instead we replicate ``Figure._push``'s COLD path per panel directly: serialise
+    the panel state, resolve its pixel tokens to real base64, split the heavy geom
+    keys onto the ``panel_<id>_geom`` trait (where ``build_standalone_html`` reads
+    them for the initial render), and write the light state onto ``panel_<id>_json``
+    — so ``build_standalone_html`` serialises real pixels regardless of the env.
+    The live MDI figures are untouched (we only write THIS export figure's traits).
+    """
+    import json
+
     plots_map = getattr(fig, "_plots_map", None)
     if not plots_map:
         return
-    os.environ["APL_BINARY_TRANSPORT"] = "0"
-    try:
-        for panel_id in list(plots_map):
-            try:
-                fig._push(panel_id)
-            except Exception as e:
-                log.debug("report figure pixel-resolve push failed for %s: %s",
-                          panel_id, e)
-    finally:
-        os.environ["APL_BINARY_TRANSPORT"] = prev
+    for panel_id, plot in list(plots_map.items()):
+        try:
+            tname = f"panel_{panel_id}_json"
+            if not fig.has_trait(tname):
+                continue
+            state = plot.to_state_dict()
+            # Materialise "\x00bin:…" tokens (base image + overlay mask + every
+            # layer's layer_<id>_b64) to real base64, in place.
+            if hasattr(plot, "resolve_pixel_tokens"):
+                plot.resolve_pixel_tokens(state)
+            geom_keys = getattr(plot, "_GEOM_KEYS", None)
+            gname = f"panel_{panel_id}_geom"
+            if geom_keys and fig.has_trait(gname):
+                # Mirror _push's geom split so the JS reassembles the panel from the
+                # geom trait (its initial render reads panel_<id>_geom). Bump the
+                # revision so the resolved geom is treated as fresh.
+                geom = {k: state.pop(k) for k in list(geom_keys) if k in state}
+                rev = getattr(fig, "_geom_rev", {})
+                geom_last = getattr(fig, "_geom_last", {})
+                if geom != (geom_last.get(panel_id) if isinstance(geom_last, dict)
+                            else None):
+                    if isinstance(geom_last, dict):
+                        geom_last[panel_id] = geom
+                    if isinstance(rev, dict):
+                        rev[panel_id] = rev.get(panel_id, 0) + 1
+                    setattr(fig, gname, json.dumps(geom, sort_keys=True))
+                state["_geom_rev"] = (rev.get(panel_id, 0)
+                                      if isinstance(rev, dict) else 0)
+                setattr(fig, tname, json.dumps(state))
+            else:
+                setattr(fig, tname, json.dumps(state))
+        except Exception as e:
+            log.debug("report figure pixel-resolve failed for %s: %s",
+                      panel_id, e)
 
 
 class ReportFigureController:

@@ -99,6 +99,20 @@ def even_crop(rgb: np.ndarray) -> np.ndarray:
     return rgb[: h - (h % 2), : w - (w % 2)]
 
 
+def _fit_frame(rgb: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
+    """Force an ``(H, W, 3)`` RGB frame to exactly ``(out_h, out_w, 3)`` for the
+    fixed-size writer: crop any dimension that's too big, then zero-pad (letterbox,
+    top-left origin) any that's too small. Keeps the writer's frame shape uniform
+    even when a ragged source frame shrinks below the first frame's size."""
+    rgb = rgb[:out_h, :out_w]
+    h, w = rgb.shape[:2]
+    if h == out_h and w == out_w:
+        return rgb
+    out = np.zeros((out_h, out_w, rgb.shape[2]), dtype=rgb.dtype)
+    out[:h, :w] = rgb
+    return out
+
+
 # ── frame reading (MEMORY-SAFE) ──────────────────────────────────────────────────
 
 def read_frame(raw, t: int) -> np.ndarray:
@@ -405,8 +419,22 @@ def export_movie(raw, *, path: str, params: dict, n_frames: int,
 
     lut = build_lut(cmap)
 
+    # Cancel BEFORE the first-frame (contrast probe) read so a cancel requested
+    # during setup takes effect at the earliest possible moment. The in-flight dask
+    # read itself cannot be interrupted mid-compute (a single-frame slice is small,
+    # so this is acceptable) — but polling on each side keeps the window between a
+    # cancel request and stopping as tight as possible (finding: uncancellable probe).
+    if should_cancel is not None and should_cancel():
+        raise _Cancelled()
+
     # Auto contrast from the FIRST rendered frame when clim is unset (robust 2-98%).
     first = downsample(read_frame(raw, idxs[0]), k)
+
+    # Cancel immediately AFTER the probe read too (a cancel that arrived while the
+    # read was in flight stops us before we open the writer / encode any frame).
+    if should_cancel is not None and should_cancel():
+        raise _Cancelled()
+
     if clim and len(clim) == 2 and clim[0] is not None and clim[1] is not None:
         lo, hi = float(clim[0]), float(clim[1])
     else:
@@ -447,10 +475,13 @@ def export_movie(raw, *, path: str, params: dict, n_frames: int,
                 raise _Cancelled()
             frame = first if fi == 0 else downsample(read_frame(raw, t), k)
             rgb = even_crop(apply_lut(frame, lut, lo, hi))
-            # Guard against a ragged tail frame that even-crops to a different
-            # size than the first (shouldn't happen with uniform frames).
+            # Fit every frame to the writer's fixed (out_h, out_w): a LARGER frame is
+            # cropped, a SMALLER one (a ragged frame that shrank after downsample /
+            # even-crop) is letterbox-PADDED with zeros — the shrink-only slice
+            # couldn't pad, so a smaller frame reached the writer with a mismatched
+            # shape and raised (finding: ragged-frame writer mismatch).
             if rgb.shape[:2] != (out_h, out_w):
-                rgb = rgb[:out_h, :out_w]
+                rgb = _fit_frame(rgb, out_h, out_w)
             img = _pil_rgb(rgb)
 
             _draw_annotations(img, anns, times[fi], k)

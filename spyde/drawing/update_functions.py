@@ -465,6 +465,31 @@ class _NavChunkCache:
         local = tuple(point[ax] - nav_slices[ax].start for ax in range(nav_ndim))
         return block[local]
 
+    def is_resident(self, signal, data, indices) -> bool:
+        """Cheap, side-effect-free probe: is the decoded output nav-chunk for a
+        single-point ``indices`` ALREADY cached? (Mirrors :meth:`get_frame`'s key
+        derivation but NEVER decodes.) Lets a caller decide whether a synchronous
+        read would be a ~0 ms numpy slice (resident) vs a ~9 ms whole-chunk decode
+        (miss). Returns False for a region / no chunks / any probe failure — the
+        conservative answer (treat as not-resident)."""
+        try:
+            idx = np.asarray(indices)
+            if idx.ndim > 1:
+                return False
+            chunks = getattr(data, "chunks", None)
+            if not chunks:
+                return False
+            nav_ndim = signal.axes_manager.navigation_dimension
+            point = tuple(int(v) for v in np.atleast_1d(idx))
+            if len(point) != nav_ndim:
+                return False
+            block_idx = [
+                _nav_chunk_span(chunks[ax], point[ax])[0] for ax in range(nav_ndim)
+            ]
+            return (id(signal), tuple(block_idx)) in self._blocks
+        except Exception:
+            return False
+
     def _evict_over_budget(self) -> None:
         # Keep at least the just-inserted block (last) even if it alone exceeds the
         # budget — we still need to serve the current frame.

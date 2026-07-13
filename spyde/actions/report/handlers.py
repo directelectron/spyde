@@ -212,6 +212,14 @@ class ReportManager:
         it through the bare-figure path with ``host:"report"`` + ``cell_id``."""
         snap_map = self.snapshot_map(cell.id)
         if not snap_map or cell.spec is None:
+            # Nothing to build — but STILL tear down any prior window/controller for
+            # this cell (a refresh that lost its snapshot, or a spec-cleared cell),
+            # so a stale live figure is never left mapped to a now-figure-less cell.
+            # _forget clears both _controllers and _window_by_cell for the cell.
+            prev_wid = self._window_by_cell.get(cell.id)
+            if prev_wid is not None:
+                self._forget(prev_wid)
+                self._window_by_cell.pop(cell.id, None)
             return
         # Tear down any prior window for this cell first (re-snapshot / refresh).
         prev_wid = self._window_by_cell.get(cell.id)
@@ -249,7 +257,11 @@ class ReportManager:
             if c.cell_type != "figure" or c.placeholder:
                 continue
             png = harvested.get(c.id)
-            if png is None:
+            # Treat an EMPTY harvest (b"" from a "data:image/png;base64," data URL
+            # with no payload) as missing, so we still bake / fall back — otherwise
+            # write_report's ``if png:`` guard would silently skip the asset, leaving
+            # a dangling image ref in report.md.
+            if not png:
                 arr = self.primary_snapshot(c.id)
                 if arr is not None:
                     try:
@@ -259,7 +271,7 @@ class ReportManager:
                         png = bake_fallback_png(arr, cmap=cmap, clim=clim)
                     except Exception as e:
                         log.debug("asset bake failed for cell %s: %s", c.id, e)
-                if png is None:
+                if not png:
                     png = self._baked.get(c.id)
             if png is not None:
                 assets[c.id] = png
@@ -533,12 +545,14 @@ def report_snapshots(session, plot, payload) -> None:
         return
     pend["harvested"].update(harvested)
     finish = pend.get("finish")
-    if finish is not None:
-        finish(pend["harvested"])
+    if finish is None:
+        # Every pending entry armed by ``harvest_snapshots`` carries a ``finish``
+        # callback; a pend with none is malformed. Log and return rather than
+        # KeyError on the old ``pend["path"]`` shape (which no longer exists).
+        log.debug("report_snapshots: pending entry has no finish callback; "
+                  "ignoring (token=%s)", token)
         return
-    # Legacy pending shape (a directly-seeded {path, cell_ids, harvested}) →
-    # the save finisher.
-    _finish_save(session, mgr, pend["path"], harvested=pend["harvested"])
+    finish(pend["harvested"])
 
 
 def _finish_save(session, mgr: ReportManager, path: str,
@@ -662,9 +676,12 @@ def report_move_cell(session, plot, payload) -> None:
     cur = mgr.doc.index_of(cell_id)
     if cur < 0:
         return
-    cell = mgr.doc.cells.pop(cur)
     idx = payload.get("index")
-    idx = len(mgr.doc.cells) if idx is None else max(0, min(int(idx), len(mgr.doc.cells)))
+    idx = len(mgr.doc.cells) if idx is None else int(idx)
+    if cur < idx:
+        idx -= 1
+    cell = mgr.doc.cells.pop(cur)
+    idx = max(0, min(idx, len(mgr.doc.cells)))
     mgr.doc.cells.insert(idx, cell)
     mgr.dirty = True
     mgr.emit_state()

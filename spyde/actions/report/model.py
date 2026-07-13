@@ -70,6 +70,31 @@ def _tree_uid(tree, create: bool = True) -> "str | None":
     return uid
 
 
+def _signal_shape(sig) -> "list | None":
+    """The signal's data shape as a plain list of ints (for rebind
+    disambiguation), or None if it can't be read."""
+    if sig is None:
+        return None
+    try:
+        shp = getattr(getattr(sig, "data", None), "shape", None)
+        if shp is None:
+            return None
+        return [int(x) for x in shp]
+    except Exception:
+        return None
+
+
+def _plot_root_shape(plot) -> "list | None":
+    """The shape of the ROOT signal of a plot's tree (matches the shape stored on
+    a SignalRef by :meth:`SignalRef.from_plot`, which reads the current signal at
+    snapshot time). Used only to disambiguate same-title trees during rebind."""
+    try:
+        sig = plot.plot_state.current_signal
+        return _signal_shape(sig)
+    except Exception:
+        return None
+
+
 # A standalone-paragraph image ref whose target is ``assets/<id>.png``. The
 # basename (without extension) is the cell id; the alt text is the caption.
 _FIG_LINE_RE = re.compile(
@@ -99,6 +124,8 @@ class SignalRef:
     tree_node: str | None = None
     view: str | None = None
     title: str | None = None
+    shape: list | None = None                  # signal data shape (disambiguates
+                                               # same-title trees on rebind)
 
     def to_dict(self) -> dict:
         return {
@@ -109,12 +136,14 @@ class SignalRef:
             "tree_node": self.tree_node,
             "view": self.view,
             "title": self.title,
+            "shape": (list(self.shape) if self.shape is not None else None),
         }
 
     @classmethod
     def from_dict(cls, d: dict | None) -> "SignalRef":
         d = d or {}
         fp = d.get("fingerprint")
+        shp = d.get("shape")                   # tolerate absent on older files
         return cls(
             file_path=d.get("file_path"),
             fingerprint=(dict(fp) if isinstance(fp, dict) else None),
@@ -122,6 +151,7 @@ class SignalRef:
             tree_node=d.get("tree_node"),
             view=d.get("view"),
             title=d.get("title"),
+            shape=(list(shp) if isinstance(shp, (list, tuple)) else None),
         )
 
     @classmethod
@@ -135,9 +165,11 @@ class SignalRef:
         # the plot's view label / navigator flag.
         tree_node = None
         title = None
+        shape = None
         try:
             sig = plot.plot_state.current_signal
             title = str(sig.metadata.get_item("General.title", default="") or "")
+            shape = _signal_shape(sig)
         except Exception:
             title = None
         if tree is not None:
@@ -150,7 +182,7 @@ class SignalRef:
         view = getattr(plot, "view_label", None)
         return cls(file_path=file_path, fingerprint=fingerprint,
                    tree_uid=tree_uid, tree_node=tree_node, view=view,
-                   title=title or tree_node)
+                   title=title or tree_node, shape=shape)
 
     def resolve(self, session) -> "Any | None":
         """Find the live plot this ref points at in *session*, or None.
@@ -169,8 +201,14 @@ class SignalRef:
                 tree = getattr(p, "signal_tree", None)
                 if tree is not None and _tree_uid(tree, create=False) == self.tree_uid:
                     candidates.append(p)
-        # 1b) open trees by root/node title.
+        # 1b) open trees by root/node title (with shape disambiguation) OR by
+        # source file path. Title matching is fuzzy — two DIFFERENT datasets can
+        # share a title — so we require a shape match when the ref recorded one,
+        # and if title matching still lands on more than one DISTINCT tree we
+        # treat the source as unresolved (offline) rather than guessing wrong.
         if not candidates:
+            title_candidates: list = []
+            title_trees: list = []             # distinct trees matched by title
             for p in plots:
                 tree = getattr(p, "signal_tree", None)
                 if tree is None:
@@ -181,10 +219,23 @@ class SignalRef:
                 except Exception:
                     root_title = ""
                 if self.tree_node and root_title and root_title == self.tree_node:
-                    candidates.append(p)
+                    # Require a shape match when both sides carry a shape; if the
+                    # ref has a shape but the plot can't report one, don't match on
+                    # title alone (fall through to fingerprint / offline).
+                    if self.shape is not None:
+                        cand_shape = _plot_root_shape(p)
+                        if cand_shape is None or list(cand_shape) != list(self.shape):
+                            continue
+                    title_candidates.append(p)
+                    if tree not in title_trees:
+                        title_trees.append(tree)
                 elif (self.file_path is not None
                       and getattr(tree, "source_path", None) == self.file_path):
                     candidates.append(p)
+            # Ambiguous: title (+shape) matched more than one distinct tree → the
+            # ref can't be pinned to a single source, so stay offline.
+            if len(title_trees) <= 1:
+                candidates.extend(title_candidates)
         # 2) file fingerprint fallback (a report reopened in a fresh session).
         if not candidates and self.file_path is not None:
             for p in plots:
@@ -486,7 +537,8 @@ def _parse_body_cells(body: str) -> list:
     cells: list = []
     md_buf: list[str] = []
     in_fence = False
-    fence_marker: str | None = None
+    fence_char: str | None = None       # "`" or "~"
+    fence_len = 0                        # opener run length (CommonMark)
 
     def flush_md() -> None:
         if md_buf:
@@ -500,19 +552,36 @@ def _parse_body_cells(body: str) -> list:
     for raw in body.splitlines():
         line = raw.rstrip("\r")
         stripped = line.strip()
-        # Fence tracking (``` or ~~~). A fence opens/closes only at the same
-        # marker; inside a fence NOTHING is interpreted as a figure/placeholder.
-        fence_open = re.match(r"^(```+|~~~+)", stripped)
+        # Fence tracking (``` or ~~~). Per CommonMark a fenced code block is
+        # delimited by a run of ≥3 of the SAME char; the closing fence must use
+        # the SAME char and be AT LEAST as long as the opener. Track the opener
+        # char + length so a 4-backtick fence containing an inner ``` line does
+        # NOT close early (which would corrupt round-trips + spawn phantom figure
+        # cells from image-ref lookalikes inside the fence). Inside a fence
+        # NOTHING is interpreted as a figure/placeholder.
+        fence_open = re.match(r"^(`{3,}|~{3,})", stripped)
         if fence_open:
-            marker = fence_open.group(1)[:3]
+            run = fence_open.group(1)
+            char = run[0]
+            length = len(run)
             if not in_fence:
                 in_fence = True
-                fence_marker = marker
-            elif fence_marker is not None and stripped.startswith(fence_marker):
-                in_fence = False
-                fence_marker = None
-            md_buf.append(line)
-            continue
+                fence_char = char
+                fence_len = length
+                md_buf.append(line)
+                continue
+            elif char == fence_char and length >= fence_len:
+                # A closing fence: same char, length ≥ opener. An info string is
+                # not allowed on a closing fence, so require the rest to be blank.
+                if stripped[length:].strip() == "":
+                    in_fence = False
+                    fence_char = None
+                    fence_len = 0
+                    md_buf.append(line)
+                    continue
+            # A same-family fence line that does NOT close (too short, wrong char,
+            # or carries an info string) is just fence content — fall through to
+            # the in-fence passthrough below.
         if in_fence:
             md_buf.append(line)
             continue

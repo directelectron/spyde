@@ -33,12 +33,9 @@ import { useSpyDE } from '../kernel/SpyDEContext'
 import { reportClipboard, type SerializedFigureCell } from '../kernel/reportClipboard'
 import type { ReportCell, RepfigPanel, RepfigLayer } from '../kernel/protocol'
 import { FIGURE_DRAG_MIME, WINDOW_DRAG_MIME } from '../kernel/dnd'
-
-// Same colormap set as the Plot Control dock's layer/colormap selects.
-const COLORMAPS = [
-  'gray', 'viridis', 'inferno', 'magma', 'plasma',
-  'cividis', 'hot', 'jet', 'turbo', 'twilight',
-]
+import { COLORMAPS } from '../kernel/colormaps'
+import { useKeyedDebounce } from './wizardHooks'
+import { CellChrome } from './CellChrome'
 
 // The compose modes the backend can return (subset of these per drop).
 type ComposeMode =
@@ -272,38 +269,31 @@ export function ReportFigureCell({ cell, onRemove, index }: Props) {
       {/* Hover chrome: Edit toggle + Copy + Duplicate + Refresh-from-live +
           delete (not on a placeholder). */}
       {hover && !cell.placeholder && (
-        <div style={styles.chrome}>
-          <button
-            data-testid={`report-figcell-edit-toggle-${cell.id}`}
-            style={editOpen ? styles.chromeBtnActive : styles.chromeBtn}
-            title="Edit figure (layers, annotations)"
-            onClick={() => setEditOpen(v => !v)}
-          >✎</button>
-          <button
-            data-testid={`cell-copy-${cell.id}`}
-            style={styles.chromeBtn}
-            title="Copy figure"
-            onClick={doCopy}
-          >⧉</button>
-          <button
-            data-testid={`cell-duplicate-${cell.id}`}
-            style={styles.chromeBtn}
-            title="Duplicate figure"
-            onClick={doDuplicate}
-          >＋</button>
-          <button
-            data-testid={`report-figcell-refresh-${cell.id}`}
-            style={styles.chromeBtn}
-            title="Refresh from live figure"
-            onClick={() => sendAction('report_refresh_figure', { cell_id: cell.id })}
-          >⟳</button>
-          <button
-            data-testid={`report-figcell-delete-${cell.id}`}
-            style={styles.chromeBtn}
-            title="Delete figure"
-            onClick={onRemove}
-          >✕</button>
-        </div>
+        <CellChrome
+          cellId={cell.id}
+          styles={{ chrome: styles.chrome, chromeBtn: styles.chromeBtn }}
+          onCopy={doCopy}
+          onDuplicate={doDuplicate}
+          onDelete={onRemove}
+          deleteTestid={`report-figcell-delete-${cell.id}`}
+          deleteTitle="Delete figure"
+          leading={
+            <button
+              data-testid={`report-figcell-edit-toggle-${cell.id}`}
+              style={editOpen ? styles.chromeBtnActive : styles.chromeBtn}
+              title="Edit figure (layers, annotations)"
+              onClick={() => setEditOpen(v => !v)}
+            >✎</button>
+          }
+          trailing={
+            <button
+              data-testid={`report-figcell-refresh-${cell.id}`}
+              style={styles.chromeBtn}
+              title="Refresh from live figure"
+              onClick={() => sendAction('report_refresh_figure', { cell_id: cell.id })}
+            >⟳</button>
+          }
+        />
       )}
 
       {cell.placeholder ? (
@@ -490,20 +480,13 @@ function FigureEditPanel({ cell, onClose }: { cell: ReportCell; onClose: () => v
 
   // Debounced per-(panel,layer) alpha sender so a dragged slider doesn't flood
   // repfig_set_layer (mirrors PlotControlDock's LayersSection pattern).
-  const timers = React.useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
-  React.useEffect(() => {
-    const t = timers.current
-    return () => { t.forEach(clearTimeout); t.clear() }
-  }, [])
+  const debounceSet = useKeyedDebounce(150)
   const setLayer = (panelId: string, layerId: string,
                     payload: Record<string, unknown>, debounce = false) => {
     const send = () => sendAction('repfig_set_layer',
       { cell_id: cell.id, panel_id: panelId, layer_id: layerId, ...payload })
     if (!debounce) { send(); return }
-    const key = `${panelId}:${layerId}`
-    const existing = timers.current.get(key)
-    if (existing) clearTimeout(existing)
-    timers.current.set(key, setTimeout(send, 150))
+    debounceSet(`${panelId}:${layerId}`, send)
   }
 
   return (

@@ -466,8 +466,28 @@ function spydeReducer(state: State, action: Action): State {
     case 'CONSOLE_PREVIEW_RESULT':
       return { ...state, consolePreview: action.preview }
 
-    case 'REPORT_STATE':
-      return { ...state, report: action.report }
+    case 'REPORT_STATE': {
+      // Prune `reportFigures` to the cells the authoritative document still
+      // has — a cell can be removed (report_remove_cell / undo / New / a
+      // different report opened) without ever going through REPORT_FIGURE
+      // again, so nothing else would otherwise evict its stale entry. A
+      // closed report (open:false) clears every report figure outright. This
+      // only ever removes figIds that were stamped into `reportFigures` by a
+      // REPORT_FIGURE action (i.e. belonged to a report cell) — MDI `figures`
+      // is a completely separate map and is untouched here.
+      if (!action.report.open) {
+        return { ...state, report: action.report, reportFigures: new Map() }
+      }
+      const liveIds = new Set(action.report.cells.map(c => c.id))
+      let reportFigures = state.reportFigures
+      for (const cellId of reportFigures.keys()) {
+        if (!liveIds.has(cellId)) {
+          if (reportFigures === state.reportFigures) reportFigures = new Map(reportFigures)
+          reportFigures.delete(cellId)
+        }
+      }
+      return { ...state, report: action.report, reportFigures }
+    }
 
     case 'REPORT_FIGURE': {
       // A report figure cell's iframe (host:"report"), keyed by CELL id. A
@@ -613,6 +633,14 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
   // detaches the original ArrayBuffer) — matches the "latest-wins" paint
   // philosophy used throughout the nav/paint pipeline (see CLAUDE.md).
   const latestBinaryStates = useRef<Map<string, Map<string, { header: unknown; buffer: Uint8Array }>>>(new Map())
+  // Mirror reportFigures into a ref so the (stable-identity, deps-[]) message
+  // effect below can read the LATEST cell→figure map synchronously — e.g. to
+  // find a report cell's OLD figId before it's replaced, so its shadow state
+  // (latestStates/latestBinaryStates) can be evicted. Declared here (before the
+  // message effect) so the effect's closure captures a ref whose `.current` is
+  // always fresh; also read by the harvest effect further below.
+  const reportFiguresRef = useRef(state.reportFigures)
+  reportFiguresRef.current = state.reportFigures
   const tileWindowsRef = useRef<(() => void) | null>(null)
   const [stackDialogOpen, setStackDialogOpen] = useState(false)
   const [updateDialogOpen, setUpdateDialogOpen] = useState(false)
@@ -722,6 +750,22 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
           // windows). It still uses the SAME figId-keyed iframeRefs/replayState
           // binary-replay path, so its iframe recovers pre-mount frames.
           if (msg.host === 'report' && msg.cell_id) {
+            // A cell can be re-rendered (Refresh from live / rebind / compose
+            // edit) in place, which mints a BRAND NEW anyplotlib figId for the
+            // SAME cell. The old figId's shadow state (latestStates /
+            // latestBinaryStates — the awi_state replay stash) is now orphaned:
+            // nothing will ever look it up again (report cells are keyed by
+            // cell id, not figId, everywhere except these two maps), so it just
+            // grows the maps forever across a long report-editing session. Evict
+            // it here, BEFORE the new figure lands, using the figId we know is
+            // being replaced (only ever a figId that belonged to a report cell —
+            // never touches an MDI figure's entry).
+            const prev = reportFiguresRef.current.get(msg.cell_id)
+            if (prev && prev.figId && prev.figId !== msg.fig_id) {
+              latestStates.current.delete(prev.figId)
+              latestBinaryStates.current.delete(prev.figId)
+              iframeRefs.current.delete(prev.figId)
+            }
             dispatch({
               type: 'REPORT_FIGURE',
               cellId: msg.cell_id,
@@ -1007,11 +1051,31 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
           })
           break
 
-        case 'report_state':
+        case 'report_state': {
           // The authoritative report document. Mirrored into state so the
-          // sidebar + cells re-render.
-          if (msg.report) dispatch({ type: 'REPORT_STATE', report: msg.report as ReportDocState })
+          // sidebar + cells re-render. The reducer prunes `reportFigures` to
+          // the surviving cell ids (or clears it on report-closed) — but the
+          // figId-keyed shadow state (latestStates/latestBinaryStates/
+          // iframeRefs) lives OUTSIDE the reducer as refs, so evict any figIds
+          // that are about to fall out of `reportFigures` HERE, using the map
+          // as it stood just before this update.
+          const report = msg.report as ReportDocState | undefined
+          if (report) {
+            const prevFigures = reportFiguresRef.current
+            const liveIds = report.open ? new Set(report.cells.map(c => c.id)) : null
+            for (const [cellId, fig] of prevFigures) {
+              if (!liveIds || !liveIds.has(cellId)) {
+                if (fig.figId) {
+                  latestStates.current.delete(fig.figId)
+                  latestBinaryStates.current.delete(fig.figId)
+                  iframeRefs.current.delete(fig.figId)
+                }
+              }
+            }
+            dispatch({ type: 'REPORT_STATE', report })
+          }
           break
+        }
 
         case 'report_saved':
           // Zip written — surface a transient status (the sidebar reads
@@ -1200,10 +1264,8 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
   // ref to keep this effect's identity stable (it must attach ONCE).
   const sendActionRef = useRef(sendAction)
   sendActionRef.current = sendAction
-  // Mirror reportFigures into a ref so the harvest (a stable-identity effect)
-  // reads the LATEST cell→figure map without re-subscribing per figure.
-  const reportFiguresRef = useRef(state.reportFigures)
-  reportFiguresRef.current = state.reportFigures
+  // (reportFiguresRef is declared above, before the message effect, so both it
+  // and this harvest effect share the same ref.)
   useEffect(() => {
     const onNeed = async (e: Event) => {
       const detail = (e as CustomEvent).detail as {
