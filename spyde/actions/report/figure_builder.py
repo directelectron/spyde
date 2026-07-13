@@ -74,14 +74,76 @@ def _panel_axes_kw(panel):
 # ── annotation rendering ──────────────────────────────────────────────────────
 
 
-def _apply_annotations(p2, annotations):
+def _first_offset(offsets):
+    """The first ``(x, y)`` of an annotation's ``offsets`` — accepts a flat
+    ``[x, y]`` OR an ``(N, 2)`` list; returns None if unusable."""
+    if offsets is None:
+        return None
+    arr = np.asarray(offsets, dtype=float)
+    if arr.ndim == 1 and arr.size >= 2:
+        return float(arr[0]), float(arr[1])
+    if arr.ndim == 2 and arr.shape[0] >= 1 and arr.shape[1] >= 2:
+        return float(arr[0, 0]), float(arr[0, 1])
+    return None
+
+
+def _scalar0(val):
+    """First element of a scalar-or-list size field (radius/widths/heights/U/V)."""
+    if val is None:
+        return None
+    arr = np.asarray(val, dtype=float)
+    if arr.ndim == 0:
+        return float(arr)
+    return float(arr.reshape(-1)[0]) if arr.size else None
+
+
+def _first_color(val, default="#00e5ff"):
+    """First colour from an edgecolors/color field (scalar or list)."""
+    if val is None:
+        return default
+    if isinstance(val, (list, tuple)):
+        return str(val[0]) if val else default
+    return str(val)
+
+
+# Kinds that map cleanly onto a draggable EDIT widget. Everything else
+# (ellipse/line — not creatable from the UI) stays on the static-marker path.
+_WIDGET_KINDS = {"text", "circle", "rect", "arrow"}
+
+
+def _apply_annotations(p2, annotations, axes=None, *, interactive=False,
+                       panel_spec=None):
     """Map each annotation dict (``{kind, ...anyplotlib-marker kwargs, data coords}``)
-    onto the panel's ``add_*`` marker call. Unknown kinds and bad kwargs are logged
-    and skipped so one malformed annotation can't blank the whole figure."""
-    for ann in annotations or []:
+    onto the panel. Unknown kinds and bad kwargs are logged and skipped so one
+    malformed annotation can't blank the whole figure.
+
+    Annotation dicts store offsets/sizes in calibrated DATA coordinates (the
+    on-disk spec/YAML contract), but anyplotlib's 2-D path renders them as IMAGE
+    PIXELS — so each dict is converted (on a COPY; the spec's stored dicts are
+    never mutated) via ``coords.annotation_data_to_pixel`` using the panel's
+    ``axes`` (``{units, x_axis, y_axis}``). ``axes=None``/unusable → identity
+    passthrough (an uncalibrated panel already has index == pixel).
+
+    ``interactive=True`` (edit mode) renders every ``text/circle/rect/arrow``
+    annotation as a draggable anyplotlib WIDGET (``show_handles=False``) instead
+    of a static marker, and RETURNS a wiring list
+    ``[(widget, panel_id, ann_index, panel_spec)]`` so the caller can attach a
+    ``pointer_up`` drag-persist handler to each. Non-widget kinds (ellipse/line)
+    still render as static markers. ``interactive=False`` returns ``[]``."""
+    from spyde.actions.report.coords import annotation_data_to_pixel
+
+    wiring = []
+    panel_id = getattr(p2, "_id", None)
+    for ann_index, ann in enumerate(annotations or []):
         try:
-            kind = str(ann.get("kind", "")).lower()
-            kw = {k: v for k, v in ann.items() if k != "kind"}
+            conv = annotation_data_to_pixel(ann, axes)
+            kind = str(conv.get("kind", "")).lower()
+            if interactive and kind in _WIDGET_KINDS:
+                widget = _add_annotation_widget(p2, kind, conv)
+                if widget is not None:
+                    wiring.append((widget, panel_id, ann_index, panel_spec))
+                continue
+            kw = {k: v for k, v in conv.items() if k != "kind"}
             if kind == "text":
                 offsets = kw.pop("offsets", None)
                 texts = kw.pop("texts", None)
@@ -123,15 +185,74 @@ def _apply_annotations(p2, annotations):
                 log.debug("report figure: unknown annotation kind %r", kind)
         except Exception as e:
             log.debug("report figure annotation %r failed: %s", ann, e)
+    return wiring
+
+
+def _add_annotation_widget(p2, kind, conv):
+    """Add ONE draggable edit widget for a PIXEL-converted annotation dict *conv*
+    (``kind`` in :data:`_WIDGET_KINDS`). Returns the created widget, or None if the
+    geometry can't be read (logged + skipped, mirroring the static path's robustness).
+
+    Field mapping (spec annotation → widget), all image-pixel:
+      * text   → ``add_label_widget(x, y, text, fontsize, color)`` (offset = anchor)
+      * circle → ``add_circle_widget(cx, cy, r, color)`` (offset = center, radius = r)
+      * rect   → ``add_rectangle_widget(x, y, w, h, color)`` — the spec rect offset
+                 is the CENTER + widths/heights; the widget x/y is the TOP-LEFT, so
+                 ``x = cx - w/2``, ``y = cy - h/2``.
+      * arrow  → ``add_arrow_widget(x, y, u, v, color)`` (offset = tail, U/V = vector)
+    All widgets are added with ``show_handles=False`` (clean finished-annotation
+    look; drag still works)."""
+    pt = _first_offset(conv.get("offsets"))
+    if pt is None:
+        return None
+    cx, cy = pt
+    if kind == "text":
+        texts = conv.get("texts")
+        text = str(texts[0]) if isinstance(texts, (list, tuple)) and texts \
+            else str(conv.get("text", "Label"))
+        color = _first_color(conv.get("color"), "#00e5ff")
+        fontsize = int(conv.get("fontsize", 14) or 14)
+        return p2.add_label_widget(x=cx, y=cy, text=text, fontsize=fontsize,
+                                   color=color, show_handles=False)
+    if kind == "circle":
+        r = _scalar0(conv.get("radius"))
+        if r is None:
+            return None
+        color = _first_color(conv.get("edgecolors"), "#00e5ff")
+        return p2.add_circle_widget(cx=cx, cy=cy, r=float(r), color=color,
+                                    show_handles=False)
+    if kind == "rect":
+        w = _scalar0(conv.get("widths"))
+        hh = _scalar0(conv.get("heights"))
+        if w is None or hh is None:
+            return None
+        color = _first_color(conv.get("edgecolors"), "#00e5ff")
+        # spec rect offset is the CENTER; widget x/y is the TOP-LEFT.
+        return p2.add_rectangle_widget(x=cx - float(w) / 2.0, y=cy - float(hh) / 2.0,
+                                       w=float(w), h=float(hh), color=color,
+                                       show_handles=False)
+    if kind == "arrow":
+        u = _scalar0(conv.get("U"))
+        v = _scalar0(conv.get("V"))
+        if u is None or v is None:
+            return None
+        color = _first_color(conv.get("edgecolors"), "#00e5ff")
+        return p2.add_arrow_widget(x=cx, y=cy, u=float(u), v=float(v), color=color,
+                                   show_handles=False)
+    return None
 
 
 # ── one panel: base image + overlay layers ────────────────────────────────────
 
 
-def _render_panel(ax, panel, snap_map):
+def _render_panel(ax, panel, snap_map, *, interactive=False, wiring=None):
     """Render one panel onto ``ax``: the base image (layer 0) + any overlay layers
     (``add_layer``) + annotations. Returns the base ``Plot2D`` (or None if the panel
-    has no paintable base snapshot)."""
+    has no paintable base snapshot).
+
+    ``interactive=True`` renders the panel's annotations as draggable EDIT widgets
+    and appends their ``(widget, panel_id, ann_index, panel_spec)`` wiring tuples to
+    the passed ``wiring`` list (for the caller to attach drag-persist handlers)."""
     if not panel.layers:
         return None
     base_layer = panel.layers[0]
@@ -180,7 +301,10 @@ def _render_panel(ax, panel, snap_map):
         except Exception as e:
             log.debug("report figure set_title failed: %s", e)
 
-    _apply_annotations(p2, panel.annotations)
+    panel_wiring = _apply_annotations(p2, panel.annotations, panel.axes,
+                                      interactive=interactive, panel_spec=panel)
+    if interactive and wiring is not None:
+        wiring.extend(panel_wiring)
     return p2
 
 
@@ -249,7 +373,30 @@ def _grid_shape(spec):
     return 1, 1, None, None
 
 
-def build_cell_figure(spec, snapshots, *, standalone: bool = False):
+def _apply_layout_spacing(fig, layout) -> None:
+    """Apply the figure-level ``hspace``/``wspace`` from *layout* to the anyplotlib
+    figure (whole-figure inter-panel gaps). Only the keys present in *layout* are
+    passed; absent → anyplotlib leaves its current value unchanged. No-op when the
+    figure has no ``subplots_adjust`` or the values aren't numeric."""
+    if not layout or not hasattr(fig, "subplots_adjust"):
+        return
+    kw = {}
+    for key in ("hspace", "wspace"):
+        val = layout.get(key)
+        if val is not None:
+            try:
+                kw[key] = float(val)
+            except (TypeError, ValueError):
+                pass
+    if kw:
+        try:
+            fig.subplots_adjust(**kw)
+        except Exception as e:
+            log.debug("report figure subplots_adjust failed: %s", e)
+
+
+def build_cell_figure(spec, snapshots, *, standalone: bool = False,
+                      interactive: bool = False):
     """Render *spec* + *snapshots* → ``(fig, fig_id, html)``.
 
     ``snapshots`` is a ``{(panel_id, layer_id): ndarray}`` map (or, legacy, a single
@@ -261,7 +408,22 @@ def build_cell_figure(spec, snapshots, *, standalone: bool = False):
     bundle fully INLINED — no machine-local ``file://`` ESM reference — so the
     figure renders on any machine, in any browser, inside a sandboxed ``srcdoc``
     iframe. ``standalone=False`` (default, the live report cell) keeps the shared
-    ``file://`` ESM optimization used by the MDI iframes."""
+    ``file://`` ESM optimization used by the MDI iframes.
+
+    ``interactive=True`` (EDIT MODE, the live report cell only — NEVER an export /
+    standalone / bake path) renders each panel's annotations as draggable anyplotlib
+    widgets instead of static markers, and stashes the drag-persist wiring list
+    ``[(widget, panel_id, ann_index, panel_spec)]`` on ``fig._report_annotation_wiring``
+    for the caller (``ReportManager.build_figure_window``) to attach ``pointer_up``
+    handlers to. Non-interactive builds set it to ``[]``.
+
+    Figure-level state applied regardless of *interactive*: ``spec.annotations``
+    (figure-fraction markers) → ``fig.set_figure_markers`` (drawn + exported
+    always), and ``spec.layout`` hspace/wspace → ``fig.subplots_adjust``. In edit
+    mode ONLY, ``fig.edit_chrome`` is turned on (hover outlines / background click /
+    figure-marker drag). The spec-panel-id → anyplotlib plot dispatch id map is
+    stashed on ``fig._report_panel_map`` so the caller can push ``selected_panel``
+    from a spec-panel id."""
     import anyplotlib as apl
     import anyplotlib._electron as _electron
     from spyde.drawing.plots.plot import finalize_figure_html
@@ -291,6 +453,7 @@ def build_cell_figure(spec, snapshots, *, standalone: bool = False):
 
     base_by_panel = {}
     used = set()
+    wiring: list = []
     for panel in spec.panels:
         if panel.id in inset_panel_ids:
             continue
@@ -303,7 +466,8 @@ def build_cell_figure(spec, snapshots, *, standalone: bool = False):
         except Exception:
             r, c = 0, 0
         ax = _ax_at(r, c)
-        p2 = _render_panel(ax, panel, snap_map)
+        p2 = _render_panel(ax, panel, snap_map, interactive=interactive,
+                           wiring=wiring)
         if p2 is not None:
             base_by_panel[panel.id] = p2
         used.add((r, c))
@@ -313,9 +477,43 @@ def build_cell_figure(spec, snapshots, *, standalone: bool = False):
         if panel.insets:
             _apply_insets(fig, panel, base_by_panel.get(panel.id), snap_map)
 
+    # Apply the figure-level layout spacing (hspace/wspace) from the layout dict
+    # when the user has tuned it (the whole-figure gap between grid panels).
+    _apply_layout_spacing(fig, spec.layout)
+
+    # Figure-level annotations (fraction-coord markers). These are CONTENT —
+    # drawn + exported ALWAYS, interactive or not — so they ride straight into
+    # anyplotlib's figure-marker layer regardless of edit mode.
+    fig_anns = list(getattr(spec, "annotations", None) or [])
+    if fig_anns:
+        try:
+            fig.set_figure_markers(fig_anns)
+        except Exception as e:
+            log.debug("report figure set_figure_markers failed: %s", e)
+
+    # In EDIT MODE, turn on anyplotlib's figure edit chrome (JS-local hover
+    # outlines + background-click + figure-marker dragging).
+    if interactive:
+        try:
+            fig.edit_chrome = True
+        except Exception as e:
+            log.debug("report figure edit_chrome set failed: %s", e)
+
+    # Stash the SPEC-panel-id → anyplotlib plot dispatch id map so the manager can
+    # push ``fig.selected_panel`` (which is keyed by the anyplotlib plot id) from a
+    # spec-panel id. base_by_panel already keys the rendered base Plot2D per spec id.
+    fig._report_panel_map = {pid: getattr(p2, "_id", None)
+                             for pid, p2 in base_by_panel.items()
+                             if getattr(p2, "_id", None) is not None}
+
     # Materialise pixel tokens (base + every layer) so the standalone HTML embed is
     # self-contained even when the app's binary transport is active.
     _resolve_pixels_for_standalone(fig)
+
+    # Stash the edit-mode drag-persist wiring on the figure so the caller can
+    # attach pointer_up handlers to each widget (and the wiring is kept alive
+    # alongside the figure). Empty for non-interactive builds.
+    fig._report_annotation_wiring = wiring
 
     fig_id = _electron.register(fig)
     html = finalize_figure_html(fig, fig_id, standalone=standalone)

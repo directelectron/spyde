@@ -223,6 +223,44 @@ class TestFigureSpecYaml:
         assert spec.primary_layer.cmap == "inferno"
         assert m.FigureSpec().primary_layer is None
 
+    def test_figure_annotations_default_empty(self):
+        """A FigureSpec has no figure-level annotations by default."""
+        assert m.FigureSpec().annotations == []
+        assert m.FigureSpec().to_dict()["annotations"] == []
+
+    def test_figure_annotations_yaml_round_trip(self):
+        """Figure-level annotations (figure-fraction markers, NO calibration
+        conversion) survive to_dict / YAML / zip round-trips verbatim."""
+        anns = [
+            {"id": "m1", "kind": "text", "x": 0.5, "y": 0.5, "text": "Label",
+             "color": "#ff9800", "fontsize": 14},
+            {"id": "m2", "kind": "circle", "x": 0.2, "y": 0.3, "r": 0.08},
+            {"id": "m3", "kind": "rect", "x": 0.5, "y": 0.5, "w": 0.2, "h": 0.15},
+            {"id": "m4", "kind": "arrow", "x": 0.35, "y": 0.35, "u": 0.15, "v": 0.15},
+        ]
+        spec = self._spec()
+        spec.annotations = [dict(a) for a in anns]
+        back = m.FigureSpec.from_yaml(spec.to_yaml())
+        assert back.annotations == anns
+        assert back.to_dict() == spec.to_dict()
+
+    def test_figure_annotations_absent_key_yields_empty(self):
+        """A spec dict from an OLDER file (no ``annotations`` key) → []."""
+        d = {"layout": {"kind": "single"}, "panels": []}
+        assert m.FigureSpec.from_dict(d).annotations == []
+
+    def test_figure_annotations_zip_round_trip(self, tmp_path):
+        """Figure-level annotations survive the .spyde-report zip write/read."""
+        doc = m.ReportDoc(title="FigAnn")
+        anns = [{"id": "z1", "kind": "text", "x": 0.4, "y": 0.6, "text": "Hi"}]
+        spec = m.FigureSpec(panels=[m.PanelSpec(layers=[m.LayerSpec()])],
+                            annotations=anns)
+        doc.cells.append(m.Cell(id="cfa00001", cell_type="figure", spec=spec))
+        path = str(tmp_path / "figann.spyde-report")
+        m.write_report(doc, path, assets={"cfa00001": b""})
+        back, _ = m.read_report(path)
+        assert back.cells[0].spec.annotations == anns
+
 
 # ── zip container (atomic) ────────────────────────────────────────────────────
 

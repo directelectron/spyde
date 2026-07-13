@@ -67,6 +67,17 @@ class ReportManager:
         # window_id -> ReportFigureController, and cell_id -> window_id
         self._controllers: dict[int, ReportFigureController] = {}
         self._window_by_cell: dict[str, int] = {}
+        # cell ids currently in EDIT MODE (annotations rendered as draggable
+        # widgets). Membership drives ``build_figure_window``'s ``interactive`` flag.
+        self._editing: set[str] = set()
+        # cell_id -> the live annotation drag-persist wiring list from the last
+        # interactive build (kept so the widget handlers aren't GC'd); replaced
+        # wholesale on each rebuild, dropped when the cell is removed / report closed.
+        self._edit_wiring: dict[str, list] = {}
+        # cell_id -> the currently SELECTED spec panel id (or None = figure-level
+        # selection). The single source of truth the edit dock mirrors; cleared
+        # alongside _editing (new / close / remove-cell / edit-off).
+        self._selected: dict[str, "str | None"] = {}
         # cell_id -> True while a figure's rebuild is pending
         self._offline: set[str] = set()
         # pending save handshake: token -> {cells, path, remaining}
@@ -117,6 +128,9 @@ class ReportManager:
         self._snapshots.clear()
         self._baked.clear()
         self._offline.clear()
+        self._editing.clear()
+        self._edit_wiring.clear()
+        self._selected.clear()
 
     def close_windows(self) -> None:
         """Tear down every open figure window (through the session's forget path
@@ -142,6 +156,9 @@ class ReportManager:
         self._baked.clear()
         self._offline.clear()
         self._pending_save.clear()
+        self._editing.clear()
+        self._edit_wiring.clear()
+        self._selected.clear()
 
     # ── state emission ─────────────────────────────────────────────────────────
 
@@ -220,17 +237,31 @@ class ReportManager:
             if prev_wid is not None:
                 self._forget(prev_wid)
                 self._window_by_cell.pop(cell.id, None)
+            self._edit_wiring.pop(cell.id, None)
             return
         # Tear down any prior window for this cell first (re-snapshot / refresh).
         prev_wid = self._window_by_cell.get(cell.id)
         if prev_wid is not None:
             self._forget(prev_wid)
+        interactive = cell.id in self._editing
         try:
-            fig, fig_id, html = build_cell_figure(cell.spec, snap_map)
+            fig, fig_id, html = build_cell_figure(cell.spec, snap_map,
+                                                  interactive=interactive)
         except Exception as e:
             log.exception("report figure build failed for cell %s: %s", cell.id, e)
             ipc.emit_error(f"Report figure build failed: {e}")
             return
+        # Attach a pointer_up drag-persist handler to each annotation widget and
+        # keep the wiring alive on the manager (replaced wholesale each rebuild, so
+        # a stale build's handlers/widgets are dropped). Non-interactive → empty.
+        wiring = list(getattr(fig, "_report_annotation_wiring", None) or [])
+        self._wire_annotation_drag(cell.id, wiring)
+        # In edit mode, also wire the SELECTION handlers: a genuine click on a
+        # panel selects it; a figure-background click deselects (→ figure-level);
+        # a figure-marker drag persists into spec.annotations. Appended to the same
+        # _edit_wiring keep-alive list so nothing is GC'd (dropped on next rebuild).
+        if interactive:
+            self._wire_selection_handlers(cell.id, fig)
         wid = self.session.next_window_id()
         keep_alive(int(wid), fig)
         ctrl = ReportFigureController(self.session, self, cell.id, wid, fig=fig)
@@ -246,6 +277,108 @@ class ReportManager:
             "is_navigator": False,
             "host": "report", "cell_id": cell.id,
         })
+
+    def _wire_annotation_drag(self, cell_id: str, wiring: list) -> None:
+        """Attach a ``pointer_up`` drag-persist handler to each annotation widget in
+        *wiring* and store the (widget, handler) list on the manager so nothing is
+        garbage-collected. Replaces this cell's prior wiring wholesale (a rebuild's
+        widgets supersede the old ones). ``wiring`` empty (non-interactive) → the
+        cell's wiring is dropped."""
+        stored = []
+        for (widget, panel_id, ann_index, panel_spec) in wiring:
+            kind = str((panel_spec.annotations[ann_index] or {}).get("kind", "")) \
+                if (0 <= ann_index < len(panel_spec.annotations)) else ""
+            handler = _make_annotation_drag_handler(
+                self, cell_id, panel_spec, ann_index, kind)
+            try:
+                widget.add_event_handler(handler, "pointer_up")
+            except Exception as e:
+                log.debug("wiring annotation drag handler failed: %s", e)
+                continue
+            stored.append((widget, handler))
+        if stored:
+            self._edit_wiring[cell_id] = stored
+        else:
+            self._edit_wiring.pop(cell_id, None)
+
+    def _wire_selection_handlers(self, cell_id: str, fig) -> None:
+        """Wire the EDIT-MODE selection handlers onto *fig* (interactive builds
+        only). Registers, per panel base plot, a module-level-closure
+        ``pointer_down`` handler → ``select_panel(cell_id, spec_panel_id)``; and a
+        FIGURE-level ``pointer_down``/``pointer_up`` handler that routes a
+        ``figure_background`` click → deselect (figure-level) and a
+        ``figure_marker`` drop → persist the moved marker into ``spec.annotations``.
+
+        All handlers are appended to this cell's ``_edit_wiring`` keep-alive list
+        (this runs AFTER ``_wire_annotation_drag`` set it) so none are GC'd; the
+        whole list is replaced on the next rebuild. After wiring, re-applies the
+        cell's CURRENT selection so the persistent outline survives a rebuild."""
+        stored = self._edit_wiring.get(cell_id) or []
+        panel_map = dict(getattr(fig, "_report_panel_map", None) or {})
+        plots_map = getattr(fig, "_plots_map", None) or {}
+        # spec-panel id keyed by anyplotlib plot dispatch id (inverse of panel_map).
+        spec_by_dispatch = {disp: spec for spec, disp in panel_map.items()}
+
+        # Per panel: a pointer_down handler that selects the SPEC panel id.
+        for spec_pid, disp_id in panel_map.items():
+            plot = plots_map.get(disp_id)
+            if plot is None:
+                continue
+            handler = _make_panel_select_handler(self, cell_id, spec_pid)
+            try:
+                plot.add_event_handler(handler, "pointer_down")
+            except Exception as e:
+                log.debug("wiring panel-select handler failed: %s", e)
+                continue
+            stored.append((plot, handler))
+
+        # One figure-level handler for background-deselect + figure-marker persist.
+        fig_handler = _make_figure_edit_handler(self, cell_id)
+        try:
+            fig.add_event_handler(fig_handler, "pointer_down", "pointer_up")
+            # Keep a reference alive; the figure itself outlives the wiring, but
+            # the handler closure must not be GC'd.
+            stored.append((fig, fig_handler))
+        except Exception as e:
+            log.debug("wiring figure-level edit handler failed: %s", e)
+
+        self._edit_wiring[cell_id] = stored
+        # Re-apply the current selection so the outline persists across rebuilds.
+        self._apply_selected_panel(cell_id, fig)
+
+    def _apply_selected_panel(self, cell_id: str, fig) -> None:
+        """Push ``fig.selected_panel`` to match this cell's recorded selection: the
+        anyplotlib dispatch id for the selected SPEC panel, or "" for figure-level
+        (None). No-op if the figure can't accept the trait."""
+        spec_pid = self._selected.get(cell_id)
+        panel_map = dict(getattr(fig, "_report_panel_map", None) or {})
+        disp_id = panel_map.get(spec_pid) if spec_pid is not None else None
+        try:
+            fig.selected_panel = disp_id or ""
+        except Exception as e:
+            log.debug("applying selected_panel failed: %s", e)
+
+    def select_panel(self, cell_id: str, panel_id: "str | None") -> None:
+        """Record the selected SPEC panel id (or None = figure-level) for *cell_id*,
+        push the persistent outline onto the live figure (``selected_panel`` = the
+        panel's anyplotlib dispatch id, "" for None), and emit
+        ``report_panel_selected`` so the dock mirrors it. A ``panel_id`` that isn't
+        one of the cell's panels is treated as None (figure-level)."""
+        cell = self.doc.cell_by_id(cell_id) if self.doc else None
+        if cell is None or cell.cell_type != "figure":
+            return
+        # Normalise: only accept a panel id that actually exists on the spec.
+        pid = None
+        if panel_id is not None and cell.spec is not None:
+            if any(p.id == panel_id for p in cell.spec.panels):
+                pid = panel_id
+        self._selected[cell_id] = pid
+        wid = self._window_by_cell.get(cell_id)
+        fig = self._controllers[wid].fig if wid in self._controllers else None
+        if fig is not None:
+            self._apply_selected_panel(cell_id, fig)
+        ipc.emit({"type": "report_panel_selected", "cell_id": cell_id,
+                  "panel_id": pid})
 
     def assemble_assets(self, harvested: dict) -> dict:
         """Build ``{cell_id -> PNG bytes}`` for every non-placeholder figure cell,
@@ -288,6 +421,185 @@ class ReportManager:
         for cid, wid in list(self._window_by_cell.items()):
             if wid == window_id:
                 self._window_by_cell.pop(cid, None)
+
+
+# ── edit-mode annotation drag persistence ──────────────────────────────────────
+
+
+def _make_annotation_drag_handler(mgr, cell_id, panel_spec, ann_index, kind):
+    """A module-level closure factory (NOT a bound method — anyplotlib's
+    ``add_event_handler`` sets ``fn._event_types`` on the handler, which fails on a
+    bound method) that returns a ``pointer_up`` handler for one annotation widget.
+
+    On drop (runs on the asyncio main thread; the widget's ``_data`` already carries
+    the final DRAGGED geometry in image pixels) it converts px → DATA and rewrites
+    ONLY the geometric keys of ``panel_spec.annotations[ann_index]`` in place
+    (offsets; radius; widths/heights; U/V — never texts/colors), sets
+    ``mgr.dirty`` + emits the authoritative state. It does NOT rebuild the figure
+    (the widget already moved JS-side; a rebuild would flash the iframe).
+
+    Guards (no-op, no crash): the cell must still exist in ``mgr.doc``; the panel
+    must still be one of the cell's panels; ``ann_index`` must be in range; the
+    widget geometry must be readable."""
+    from spyde.actions.report import coords
+
+    def _on_drag_end(event):
+        try:
+            widget = getattr(event, "source", None)
+            if widget is None:
+                return
+            # Guards: cell + panel + index must still be valid.
+            cell = mgr.doc.cell_by_id(cell_id) if mgr.doc else None
+            if cell is None or cell.spec is None:
+                return
+            if panel_spec not in cell.spec.panels:
+                return
+            anns = panel_spec.annotations
+            if not (0 <= ann_index < len(anns)):
+                return
+            ann = anns[ann_index]
+            axes = panel_spec.axes
+            new_geom = _widget_geometry_to_data(kind, widget, axes, coords)
+            if not new_geom:
+                return
+            changed = False
+            for key, val in new_geom.items():
+                if ann.get(key) != val:
+                    ann[key] = val
+                    changed = True
+            # A drag on a panel annotation also SELECTS that panel (the dock
+            # follows the last-touched panel). Best-effort; independent of the
+            # geometry change so a no-move drag still selects.
+            try:
+                mgr.select_panel(cell_id, panel_spec.id)
+            except Exception as e:
+                log.debug("annotation drag panel-select failed: %s", e)
+            if changed:
+                mgr.dirty = True
+                mgr.emit_state()
+        except Exception as e:
+            log.debug("annotation drag persist failed (cell %s idx %s): %s",
+                      cell_id, ann_index, e)
+
+    return _on_drag_end
+
+
+def _make_panel_select_handler(mgr, cell_id, spec_panel_id):
+    """A module-level closure (NOT a bound method — anyplotlib sets
+    ``fn._event_types`` on it) returning a ``pointer_down`` handler that selects
+    one panel. Fires on a genuine panel click that misses widgets (anyplotlib only
+    fires ``pointer_down`` on the panel plot when the click is not on a widget), so
+    a click on a panel → its spec panel becomes the selection."""
+    def _on_panel_down(event):
+        try:
+            mgr.select_panel(cell_id, spec_panel_id)
+        except Exception as e:
+            log.debug("panel-select handler failed (cell %s panel %s): %s",
+                      cell_id, spec_panel_id, e)
+    return _on_panel_down
+
+
+def _make_figure_edit_handler(mgr, cell_id):
+    """A module-level closure returning a FIGURE-level handler (registered for
+    ``pointer_down`` + ``pointer_up``) that routes the two figure-scoped edit
+    events:
+
+    * ``figure_background`` (a click on the bare figure, no panel underneath) →
+      ``select_panel(cell_id, None)`` (deselect → figure-level dock).
+    * ``figure_marker`` on ``pointer_up`` (a figure annotation was dragged) →
+      persist the marker's updated FRACTION fields into ``spec.annotations``
+      (matched by id — anyplotlib has ALREADY merged them into its own
+      ``figure_markers`` before firing), set ``mgr.dirty``, re-emit the state,
+      and do NOT rebuild (the marker already moved JS-side).
+
+    anyplotlib's figure event carries the flat fields on the ``Event``; the marker
+    id rides in ``event.last_widget_id`` and the authoritative moved marker is read
+    back off ``fig.figure_markers`` so we persist exactly what the JS committed."""
+    def _on_figure_event(event):
+        try:
+            fig = getattr(event, "source", None)
+            etype = getattr(event, "event_type", "")
+            marker_id = getattr(event, "last_widget_id", None)
+            cell = mgr.doc.cell_by_id(cell_id) if mgr.doc else None
+            if cell is None or cell.cell_type != "figure":
+                return
+            # figure-background click → deselect (any pointer event; a click
+            # arrives as pointer_down). No marker id on a background click.
+            if marker_id is None:
+                if etype == "pointer_down":
+                    mgr.select_panel(cell_id, None)
+                return
+            # figure-marker drag end → persist the moved marker.
+            if etype != "pointer_up" or cell.spec is None or fig is None:
+                return
+            markers = getattr(fig, "figure_markers", None) or []
+            moved = next((dict(m) for m in markers
+                          if m.get("id") == marker_id), None)
+            if moved is None:
+                return
+            anns = cell.spec.annotations
+            # Match the stored annotation by id; fall back to positional index if
+            # ids weren't assigned yet (set_figure_markers assigns them on build).
+            target = None
+            for a in anns:
+                if a.get("id") == marker_id:
+                    target = a
+                    break
+            if target is None:
+                # No id match — append the moved marker (a new figure annotation
+                # created + dragged before its id round-tripped to the spec).
+                return
+            changed = False
+            for key, val in moved.items():
+                if target.get(key) != val:
+                    target[key] = val
+                    changed = True
+            if changed:
+                mgr.dirty = True
+                mgr.emit_state()
+        except Exception as e:
+            log.debug("figure-level edit handler failed (cell %s): %s",
+                      cell_id, e)
+    return _on_figure_event
+
+
+def _widget_geometry_to_data(kind, widget, axes, coords) -> "dict | None":
+    """Read one edit widget's final IMAGE-PIXEL geometry from its ``_data`` and
+    convert to the DATA-coordinate annotation keys (the inverse of
+    ``figure_builder._add_annotation_widget``'s field mapping). Returns a dict of
+    ONLY the geometric keys to rewrite (offsets / radius / widths+heights / U+V),
+    or None if the geometry can't be read.
+
+    Inverse field mapping (widget px → spec data):
+      * text (label)  → ``x, y``            → ``offsets: [[dx, dy]]``
+      * circle        → ``cx, cy, r``       → ``offsets: [[dx, dy]]``, ``radius``
+      * rect          → ``x, y, w, h`` (TOP-LEFT) → CENTER + ``widths/heights``
+      * arrow         → ``x, y, u, v``      → ``offsets: [[tail]]``, ``U``, ``V``"""
+    g = getattr(widget, "_data", None)
+    if not isinstance(g, dict):
+        return None
+    if kind == "text":
+        dx, dy = coords.pixel_to_data_point(g.get("x"), g.get("y"), axes)
+        return {"offsets": [[dx, dy]]}
+    if kind == "circle":
+        dx, dy = coords.pixel_to_data_point(g.get("cx"), g.get("cy"), axes)
+        r = coords.pixel_to_data_radius(g.get("r"), axes)
+        return {"offsets": [[dx, dy]], "radius": r}
+    if kind == "rect":
+        # widget x/y is the TOP-LEFT; the spec offset is the CENTER.
+        px, py = float(g.get("x", 0.0)), float(g.get("y", 0.0))
+        pw, ph = float(g.get("w", 0.0)), float(g.get("h", 0.0))
+        cx_px, cy_px = px + pw / 2.0, py + ph / 2.0
+        dx, dy = coords.pixel_to_data_point(cx_px, cy_px, axes)
+        w = coords.pixel_to_data_width(pw, axes)
+        hh = coords.pixel_to_data_height(ph, axes)
+        return {"offsets": [[dx, dy]], "widths": [w], "heights": [hh]}
+    if kind == "arrow":
+        dx, dy = coords.pixel_to_data_point(g.get("x"), g.get("y"), axes)
+        u = coords.pixel_to_data_u(g.get("u"), axes)
+        v = coords.pixel_to_data_v(g.get("v"), axes)
+        return {"offsets": [[dx, dy]], "U": [u], "V": [v]}
+    return None
 
 
 def _manager(session) -> ReportManager:
@@ -663,6 +975,9 @@ def report_remove_cell(session, plot, payload) -> None:
         mgr._snapshots.pop(cell.id, None)
         mgr._baked.pop(cell.id, None)
         mgr._offline.discard(cell.id)
+        mgr._editing.discard(cell.id)
+        mgr._edit_wiring.pop(cell.id, None)
+        mgr._selected.pop(cell.id, None)
     mgr.doc.cells = [c for c in mgr.doc.cells if c.id != cell.id]
     mgr.dirty = True
     mgr.emit_state()

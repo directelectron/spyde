@@ -387,6 +387,232 @@ class TestEdits:
         assert len(anns) == 1 and anns[0]["kind"] == "text"
 
 
+# ── target-relative 2-D tiling ──────────────────────────────────────────────────
+
+
+class TestTileTargeted:
+    """Target-relative 2-D tiling: ``target_panel_id`` picks the neighbor of a
+    SPECIFIC panel (not just an edge of the whole grid), enabling interior grid
+    cells to be reached and hole-filled."""
+
+    def _grid_by_pos(self, fig):
+        return {tuple(p["grid_pos"]): p for p in fig["panels"]}
+
+    def test_targeted_tile_down_right_panel_makes_2x2(self, stem_4d_dataset):
+        # 1x2 grid (A at (0,0), B at (0,1)) → tile-down TARGETING B → 2x2 with the
+        # new panel at (1,1); A and B keep their positions.
+        session, messages = stem_4d_dataset["window"], stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        sig_wid = _signal_wid(session)
+        nav_wid = _nav_wid(session)
+        h.report_new(session, None, {})
+        cid = _make_figure_cell(session, messages, sig_wid)
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "tile-right",
+                           "source_window_id": nav_wid})
+        fig = _fig_dict_of(messages, cid)
+        by_pos = self._grid_by_pos(fig)
+        panel_a_id = by_pos[(0, 0)]["id"]
+        panel_b = by_pos[(0, 1)]
+
+        messages.clear()
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "tile-down",
+                           "source_window_id": nav_wid,
+                           "target_panel_id": panel_b["id"]})
+        fig = _fig_dict_of(messages, cid)
+        assert fig["layout"] == {"kind": "grid", "rows": 2, "cols": 2}
+        by_pos = self._grid_by_pos(fig)
+        assert set(by_pos.keys()) == {(0, 0), (0, 1), (1, 1)}
+        # The original two panels didn't move.
+        assert by_pos[(0, 0)]["id"] == panel_a_id
+        assert by_pos[(0, 1)]["id"] == panel_b["id"]
+
+    def _build_2x2_full(self, session, messages, sig_wid, nav_wid):
+        """A fully-occupied 2x2 grid: (0,0)=orig, (0,1), (1,0), (1,1)."""
+        h.report_new(session, None, {})
+        cid = _make_figure_cell(session, messages, sig_wid)
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "tile-right",
+                           "source_window_id": nav_wid})
+        fig = _fig_dict_of(messages, cid)
+        pB = self._grid_by_pos(fig)[(0, 1)]
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "tile-down",
+                           "source_window_id": nav_wid,
+                           "target_panel_id": pB["id"]})
+        fig = _fig_dict_of(messages, cid)
+        pA = self._grid_by_pos(fig)[(0, 0)]
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "tile-down",
+                           "source_window_id": nav_wid,
+                           "target_panel_id": pA["id"]})
+        fig = _fig_dict_of(messages, cid)
+        assert fig["layout"] == {"kind": "grid", "rows": 2, "cols": 2}
+        assert set(self._grid_by_pos(fig).keys()) == {(0, 0), (0, 1), (1, 0), (1, 1)}
+        return cid, fig
+
+    def test_occupied_neighbor_inserts_row_and_shifts(self, stem_4d_dataset):
+        # A fully-occupied 2x2 grid; tile-down TARGETING a TOP panel (whose
+        # neighbor cell below is occupied) must INSERT a row at 1: the bottom row
+        # shifts to row 2, and the new panel lands directly below the target.
+        session, messages = stem_4d_dataset["window"], stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        sig_wid = _signal_wid(session)
+        nav_wid = _nav_wid(session)
+        cid, fig = self._build_2x2_full(session, messages, sig_wid, nav_wid)
+        by_pos = self._grid_by_pos(fig)
+        top_left = by_pos[(0, 0)]
+        bottom_left_id = by_pos[(1, 0)]["id"]
+        bottom_right_id = by_pos[(1, 1)]["id"]
+
+        messages.clear()
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "tile-down",
+                           "source_window_id": nav_wid,
+                           "target_panel_id": top_left["id"]})
+        fig = _fig_dict_of(messages, cid)
+        assert fig["layout"] == {"kind": "grid", "rows": 3, "cols": 2}
+        by_pos = self._grid_by_pos(fig)
+        # The bottom row (originally row 1) shifted down to row 2.
+        assert by_pos[(2, 0)]["id"] == bottom_left_id
+        assert by_pos[(2, 1)]["id"] == bottom_right_id
+        # The target kept its row; the new panel is inserted directly below it.
+        assert by_pos[(0, 0)]["id"] == top_left["id"]
+        assert (1, 0) in by_pos
+        new_panel_id = by_pos[(1, 0)]["id"]
+        assert new_panel_id not in (top_left["id"], bottom_left_id, bottom_right_id)
+        # No panel left behind at the target's old row-1 slot other than the new one.
+        assert len(fig["panels"]) == 5
+
+    def test_targeted_tile_left_on_interior_panel_inserts_column(self, stem_4d_dataset):
+        # A fully-occupied 2x2 grid; tile-left TARGETING the top-RIGHT panel must
+        # insert a column between col 0 and col 1: the target keeps its row, the
+        # column at/after the insertion point shifts right.
+        session, messages = stem_4d_dataset["window"], stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        sig_wid = _signal_wid(session)
+        nav_wid = _nav_wid(session)
+        cid, fig = self._build_2x2_full(session, messages, sig_wid, nav_wid)
+        by_pos = self._grid_by_pos(fig)
+        top_right = by_pos[(0, 1)]
+        top_left_id = by_pos[(0, 0)]["id"]
+        bottom_left_id = by_pos[(1, 0)]["id"]
+        bottom_right_id = by_pos[(1, 1)]["id"]
+
+        messages.clear()
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "tile-left",
+                           "source_window_id": nav_wid,
+                           "target_panel_id": top_right["id"]})
+        fig = _fig_dict_of(messages, cid)
+        assert fig["layout"] == {"kind": "grid", "rows": 2, "cols": 3}
+        by_pos = self._grid_by_pos(fig)
+        # Column 0 (top_left/bottom_left) is untouched — insertion happens AT the
+        # target's column, so only the target's own column and beyond shift.
+        assert by_pos[(0, 0)]["id"] == top_left_id
+        assert by_pos[(1, 0)]["id"] == bottom_left_id
+        # The target itself shifted right by one (to col 2); the new panel took
+        # its old column slot (col 1). The other row's col-1 panel did NOT shift
+        # (only col >= insert_at among ALL panels shifts — bottom_right stays at
+        # col 1 since bottom row's panel-at-1 is >= insert_at=1 too... verify via
+        # direct check below instead of assuming which specific id lands where).
+        assert by_pos[(0, 2)]["id"] == top_right["id"]
+        new_panel_id = by_pos[(0, 1)]["id"]
+        assert new_panel_id not in (top_left_id, bottom_left_id, bottom_right_id,
+                                    top_right["id"])
+        # bottom row's original col-1 panel also shifts (col >= insert_at=1).
+        assert by_pos[(1, 2)]["id"] == bottom_right_id
+        assert len(fig["panels"]) == 5
+
+    def test_hole_fill_no_grid_growth(self, stem_4d_dataset):
+        # Build a full 2x2, remove one panel to make a hole, then tile TOWARD the
+        # hole from an adjacent panel — the hole is filled, rows/cols unchanged.
+        session, messages = stem_4d_dataset["window"], stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        sig_wid = _signal_wid(session)
+        nav_wid = _nav_wid(session)
+        cid, fig = self._build_2x2_full(session, messages, sig_wid, nav_wid)
+        by_pos = self._grid_by_pos(fig)
+        hole_target_id = by_pos[(1, 1)]["id"]   # will remove this → hole at (1,1)
+        top_right_id = by_pos[(0, 1)]["id"]     # tile-down from here fills (1,1)
+
+        messages.clear()
+        cx.repfig_remove_panel(session, None, {"cell_id": cid, "panel_id": hole_target_id})
+        fig = _fig_dict_of(messages, cid)
+        # _renormalise_layout recomputes bounds from the remaining panels; with
+        # (1,1) gone the remaining max row/col is still 1 (from (1,0) and (0,1)).
+        assert fig["layout"] == {"kind": "grid", "rows": 2, "cols": 2}
+        by_pos = self._grid_by_pos(fig)
+        assert (1, 1) not in by_pos
+
+        messages.clear()
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "tile-down",
+                           "source_window_id": nav_wid,
+                           "target_panel_id": top_right_id})
+        fig = _fig_dict_of(messages, cid)
+        # No growth: still 2x2, hole filled, panel count back to 4.
+        assert fig["layout"] == {"kind": "grid", "rows": 2, "cols": 2}
+        by_pos = self._grid_by_pos(fig)
+        assert (1, 1) in by_pos
+        assert len(fig["panels"]) == 4
+
+    def test_legacy_no_target_matches_old_semantics(self, stem_4d_dataset):
+        # No target_panel_id → tile-right appends a new column on the right (the
+        # panel lands there), tile-down appends a new row — identical to the
+        # pre-targeting behaviour pinned by TestComposeModes.
+        session, messages = stem_4d_dataset["window"], stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        sig_wid = _signal_wid(session)
+        nav_wid = _nav_wid(session)
+        h.report_new(session, None, {})
+        cid = _make_figure_cell(session, messages, sig_wid)
+        messages.clear()
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "tile-right",
+                           "source_window_id": nav_wid})
+        fig = _fig_dict_of(messages, cid)
+        assert fig["layout"] == {"kind": "grid", "rows": 1, "cols": 2}
+        positions = sorted(tuple(p["grid_pos"]) for p in fig["panels"])
+        assert positions == [(0, 0), (0, 1)]
+
+        messages.clear()
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "tile-down",
+                           "source_window_id": nav_wid})
+        fig = _fig_dict_of(messages, cid)
+        assert fig["layout"]["kind"] == "grid"
+        assert fig["layout"]["rows"] == 2
+        assert len(fig["panels"]) == 3
+
+    def test_sparse_grid_survives_renormalise_and_build(self, stem_4d_dataset):
+        # After producing a spec with a hole, _renormalise_layout and
+        # figure_builder.build_cell_figure run without exception and panels land
+        # at their grid_pos.
+        from spyde.actions.report import figure_builder
+
+        session, messages = stem_4d_dataset["window"], stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        sig_wid = _signal_wid(session)
+        nav_wid = _nav_wid(session)
+        cid, fig = self._build_2x2_full(session, messages, sig_wid, nav_wid)
+        by_pos = self._grid_by_pos(fig)
+        hole_id = by_pos[(0, 1)]["id"]
+        cx.repfig_remove_panel(session, None, {"cell_id": cid, "panel_id": hole_id})
+
+        mgr = session._report
+        cell = mgr.doc.cell_by_id(cid)
+        cx._renormalise_layout(cell.spec)   # must not raise on a sparse grid
+        snap_map = mgr.snapshot_map(cid)
+        result = figure_builder.build_cell_figure(cell.spec, snap_map)
+        assert result is not None
+        # Panel count unchanged by the build (3 panels remain after the removal).
+        assert len(cell.spec.panels) == 3
+        for p in cell.spec.panels:
+            assert isinstance(p.grid_pos, list) and len(p.grid_pos) == 2
+
+
 # ── YAML round-trip of a composed multi-panel spec ─────────────────────────────
 
 
@@ -592,7 +818,7 @@ class TestCalloutRegionFiltering:
         # Base is the navigator → force resolve() to return that navigator plot.
         nav_plot = session._plot_by_window_id(nav_wid)
         monkeypatch.setattr(cx, "_target_base_source",
-                            lambda cell: _StubRef(nav_plot))
+                            lambda cell, target_panel_id=None: _StubRef(nav_plot))
 
         messages.clear()
         cx.repfig_compose(session, None,

@@ -49,6 +49,7 @@ declare global {
       figId: string,
     ) => Array<{ panel_id: string; id: string; type: string; data: Record<string, unknown> }>
     _spyde_test_image_sig?: (figId: string) => string
+    _spyde_test_report?: () => Record<string, unknown> | null
   }
 }
 

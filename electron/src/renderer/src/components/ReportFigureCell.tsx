@@ -42,10 +42,39 @@ type ComposeMode =
   | 'overlay' | 'callout'
   | 'tile-up' | 'tile-down' | 'tile-left' | 'tile-right'
 
-// The five drop zones on a figure cell.
+// The five drop zones on a figure cell (or, on a multi-panel grid, within the
+// hovered PANEL's cell rect).
 type Zone = 'center' | 'up' | 'down' | 'left' | 'right'
 const ZONE_TILE: Record<Exclude<Zone, 'center'>, ComposeMode> = {
   up: 'tile-up', down: 'tile-down', left: 'tile-left', right: 'tile-right',
+}
+
+// The currently-hovered zone PLUS which panel it's relative to (for a grid
+// figure) and the panel's on-screen rect (fraction of the shield box, 0..1) so
+// ComposeZones can position itself over just that cell. `panelId` is null for a
+// single-panel figure (whole-box zones, today's behaviour) and `panelRect` is
+// the full box (0,0,1,1) in that case.
+interface HoverZone {
+  zone: Zone
+  panelId: string | null
+  panelLabel: string | null
+  panelRect: { left: number; top: number; width: number; height: number }
+}
+
+const FULL_RECT = { left: 0, top: 0, width: 1, height: 1 }
+
+// Map a cursor fraction (fx, fy) WITHIN a cell rect (0..1 local to that rect)
+// to a Zone: a ~30%-wide edge strip on each side, center otherwise. Shared by
+// the single-panel (whole box) and grid (per-panel cell) paths.
+function zoneFromLocalFraction(fx: number, fy: number): Zone {
+  const edge = 0.3
+  const dl = fx, dr = 1 - fx, dt = fy, db = 1 - fy
+  const m = Math.min(dl, dr, dt, db)
+  if (m > edge) return 'center'
+  if (m === dl) return 'left'
+  if (m === dr) return 'right'
+  if (m === dt) return 'up'
+  return 'down'
 }
 
 // Resolve a source window id from a FIGURE_DRAG_MIME or WINDOW_DRAG_MIME drop.
@@ -75,6 +104,8 @@ interface ComposePrompt {
   options: ComposeMode[]
   sameShape: boolean
   navSignalPair: boolean
+  /** The grid panel this compose is relative to (null on a single-panel figure). */
+  targetPanelId: string | null
 }
 
 interface Props {
@@ -91,8 +122,18 @@ export function ReportFigureCell({ cell, onRemove, index }: Props) {
   const [hover, setHover] = useState(false)
   const [dropHover, setDropHover] = useState(false)     // placeholder fill hover
   const [editOpen, setEditOpen] = useState(false)
-  // Which compose zone the cursor is over (non-placeholder live cell only).
-  const [zone, setZone] = useState<Zone | null>(null)
+  // The SELECTED spec panel id (null = figure-level), mirrored from the backend's
+  // report_panel_selected → spyde:report_panel_selected CustomEvent (the backend
+  // is the source of truth; a click on the live figure, a dock chip, or a widget
+  // drag all funnel through it). Drives WHICH section the edit dock shows.
+  const [selectedPanel, setSelectedPanel] = useState<string | null>(null)
+  // Mirror editOpen into a ref so the unmount cleanup reads the current value
+  // without re-arming the effect (and switching edit mode off) on every toggle.
+  const editOpenRef = React.useRef(editOpen)
+  React.useEffect(() => { editOpenRef.current = editOpen }, [editOpen])
+  // Which compose zone the cursor is over (non-placeholder live cell only), plus
+  // which panel it targets on a multi-panel grid.
+  const [hoverZone, setHoverZone] = useState<HoverZone | null>(null)
   // A center-drop compose prompt (popover) awaiting / showing options.
   const [prompt, setPrompt] = useState<ComposePrompt | null>(null)
 
@@ -100,9 +141,45 @@ export function ReportFigureCell({ cell, onRemove, index }: Props) {
     if (!captionEditing) setCaptionDraft(cell.caption ?? '')
   }, [cell.caption, captionEditing])
 
+  // Toggle backend edit mode alongside the local editOpen flag: in edit mode the
+  // backend rebuilds the figure with draggable annotation widgets (drag → persist);
+  // out of it the annotations are static markers again. Best-effort cleanup on
+  // unmount / report close switches edit mode OFF so the cell isn't left rebuilding
+  // in interactive mode with no editor open.
+  const toggleEdit = () => {
+    setEditOpen(v => {
+      const next = !v
+      sendAction('repfig_set_edit_mode', { cell_id: cell.id, editing: next })
+      return next
+    })
+  }
+  React.useEffect(() => {
+    return () => {
+      if (editOpenRef.current) {
+        sendAction('repfig_set_edit_mode', { cell_id: cell.id, editing: false })
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cell.id])
+
+  // Mirror the backend's selection for THIS cell while the editor is open. The
+  // backend re-emits report_panel_selected on a live-figure click, a chip click,
+  // or a widget drag; we filter by cell_id. When the editor closes, selection is
+  // reset (the dock unmounts anyway).
+  React.useEffect(() => {
+    if (!editOpen) { setSelectedPanel(null); return }
+    const onSelected = (ev: Event) => {
+      const d = (ev as CustomEvent).detail as { cell_id?: string; panel_id?: string | null }
+      if (d?.cell_id !== cell.id) return
+      setSelectedPanel(d.panel_id ?? null)
+    }
+    window.addEventListener('spyde:report_panel_selected', onSelected)
+    return () => window.removeEventListener('spyde:report_panel_selected', onSelected)
+  }, [editOpen, cell.id])
+
   // Clear a lingering hovered zone once the drag ends (the shield unmounts) so a
   // fresh drag doesn't flash a stale highlight.
-  React.useEffect(() => { if (dragKind == null) setZone(null) }, [dragKind])
+  React.useEffect(() => { if (dragKind == null) setHoverZone(null) }, [dragKind])
 
   const fig = state.reportFigures.get(cell.id)
 
@@ -131,58 +208,103 @@ export function ReportFigureCell({ cell, onRemove, index }: Props) {
   }
 
   // ── Compose drop zones (live figure cell) ─────────────────────────────────
-  // Map the cursor position within the figure box to one of the 5 zones: a
-  // ~28%-wide strip on each edge, the center rectangle otherwise.
-  const zoneAt = (e: React.DragEvent): Zone => {
+  // Panels laid out in a grid (cell.figure.layout.kind === 'grid' with >1
+  // panel). Single-panel / non-grid figures keep the whole-box 5-zone behaviour.
+  const gridPanels = cell.figure?.layout?.kind === 'grid' ? (cell.figure.panels ?? []) : []
+  const gridRows = Math.max(1, Number(cell.figure?.layout?.rows) || 1)
+  const gridCols = Math.max(1, Number(cell.figure?.layout?.cols) || 1)
+  const isGridFigure = gridPanels.length > 1
+
+  // Nearest occupied grid panel to a (row, col) cell (by grid-cell center
+  // distance) — used when the cursor is over a HOLE in a sparse grid.
+  const nearestPanelAt = (row: number, col: number): RepfigPanel | null => {
+    if (!gridPanels.length) return null
+    let best: RepfigPanel | null = null
+    let bestDist = Infinity
+    for (const p of gridPanels) {
+      const [pr, pc] = p.grid_pos
+      const d = (pr - row) ** 2 + (pc - col) ** 2
+      if (d < bestDist) { bestDist = d; best = p }
+    }
+    return best
+  }
+
+  // Map the cursor position within the shield box to a HoverZone. On a grid
+  // figure this first resolves WHICH panel cell the cursor is over (uniform
+  // rows/cols — report grids have no ratios), then computes the zone from the
+  // LOCAL fraction within that cell; on a single-panel figure it's the whole
+  // box (today's behaviour, panelId null).
+  const hoverZoneAt = (e: React.DragEvent): HoverZone => {
     const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
     const fx = (e.clientX - r.left) / Math.max(1, r.width)
     const fy = (e.clientY - r.top) / Math.max(1, r.height)
-    const edge = 0.28
-    // Nearest edge if within its strip; ties broken by proximity so corners feel
-    // predictable. Center when comfortably inside.
-    const dl = fx, dr = 1 - fx, dt = fy, db = 1 - fy
-    const m = Math.min(dl, dr, dt, db)
-    if (m > edge) return 'center'
-    if (m === dl) return 'left'
-    if (m === dr) return 'right'
-    if (m === dt) return 'up'
-    return 'down'
+    if (!isGridFigure) {
+      return { zone: zoneFromLocalFraction(fx, fy), panelId: null, panelLabel: null, panelRect: FULL_RECT }
+    }
+    const col = Math.min(gridCols - 1, Math.max(0, Math.floor(fx * gridCols)))
+    const row = Math.min(gridRows - 1, Math.max(0, Math.floor(fy * gridRows)))
+    let panel = gridPanels.find(p => p.grid_pos[0] === row && p.grid_pos[1] === col) ?? null
+    let cellRow = row, cellCol = col
+    if (!panel) {
+      // Hole — target the nearest occupied panel instead, but keep the
+      // highlighted rect on the HOVERED (empty) cell so the overlay tracks the
+      // cursor.
+      panel = nearestPanelAt(row, col)
+    }
+    const panelRect = {
+      left: cellCol / gridCols, top: cellRow / gridRows,
+      width: 1 / gridCols, height: 1 / gridRows,
+    }
+    const localFx = fx * gridCols - cellCol
+    const localFy = fy * gridRows - cellRow
+    const idx = gridPanels.indexOf(panel as RepfigPanel)
+    return {
+      zone: zoneFromLocalFraction(localFx, localFy),
+      panelId: panel ? panel.id : null,
+      panelLabel: panel ? panelLabel(idx) : null,
+      panelRect,
+    }
   }
   const onComposeDragOver = (e: React.DragEvent) => {
     if (!isComposeDrag(e.dataTransfer)) return
     e.preventDefault()
     e.stopPropagation()
     e.dataTransfer.dropEffect = 'copy'
-    setZone(zoneAt(e))
+    setHoverZone(hoverZoneAt(e))
   }
   const onComposeDragLeave = (e: React.DragEvent) => {
     // Only clear when actually leaving the box (not crossing a child overlay).
     if (!(e.currentTarget as HTMLElement).contains(e.relatedTarget as Node)) {
-      setZone(null)
+      setHoverZone(null)
     }
   }
   const onComposeDrop = (e: React.DragEvent) => {
     if (!isComposeDrag(e.dataTransfer)) return
     e.preventDefault()
     e.stopPropagation()
-    const z = zoneAt(e)
-    setZone(null)
+    const hz = hoverZoneAt(e)
+    setHoverZone(null)
     const src = sourceWindowIdFromDrop(e.dataTransfer)
     if (src == null) return
-    if (z !== 'center') {
-      // Edge → tile immediately on that side.
-      sendAction('repfig_compose', { cell_id: cell.id, mode: ZONE_TILE[z], source_window_id: src })
+    if (hz.zone !== 'center') {
+      // Edge → tile immediately on that side, relative to the targeted panel
+      // (undefined on a single-panel figure → backend legacy default).
+      sendAction('repfig_compose', {
+        cell_id: cell.id, mode: ZONE_TILE[hz.zone], source_window_id: src,
+        ...(hz.panelId != null ? { target_panel_id: hz.panelId } : {}),
+      })
       return
     }
     // Center → query which modes are compatible, then decide.
-    beginCenterCompose(src)
+    beginCenterCompose(src, hz.panelId)
   }
 
   // Center-drop: fire repfig_query_compose and wait for the matching
   // spyde:repfig_compose_options CustomEvent for THIS cell (~2 s timeout → fall
   // back to tile-right). If only tiles come back, tile-right directly; if richer
-  // options exist, open the popover.
-  const beginCenterCompose = (src: number) => {
+  // options exist, open the popover. `targetPanelId` (grid figure only) is
+  // threaded through to both the query and the follow-up compose action.
+  const beginCenterCompose = (src: number, targetPanelId: string | null) => {
     let done = false
     const onOptions = (ev: Event) => {
       const d = (ev as CustomEvent).detail as {
@@ -200,10 +322,14 @@ export function ReportFigureCell({ cell, onRemove, index }: Props) {
       const hasRich = options.includes('overlay') || options.includes('callout')
       if (!hasRich) {
         // Only tiles → tile-right directly (no ambiguity to resolve).
-        sendAction('repfig_compose', { cell_id: cell.id, mode: 'tile-right', source_window_id: src })
+        sendAction('repfig_compose', {
+          cell_id: cell.id, mode: 'tile-right', source_window_id: src,
+          ...(targetPanelId != null ? { target_panel_id: targetPanelId } : {}),
+        })
         return
       }
-      setPrompt({ sourceWindowId: src, options, sameShape: same, navSignalPair: navPair })
+      setPrompt({ sourceWindowId: src, options, sameShape: same, navSignalPair: navPair,
+                 targetPanelId })
     }
     window.addEventListener('spyde:repfig_compose_options', onOptions)
     const timer = setTimeout(() => {
@@ -211,14 +337,23 @@ export function ReportFigureCell({ cell, onRemove, index }: Props) {
       done = true
       window.removeEventListener('spyde:repfig_compose_options', onOptions)
       // No reply → safe default.
-      sendAction('repfig_compose', { cell_id: cell.id, mode: 'tile-right', source_window_id: src })
+      sendAction('repfig_compose', {
+        cell_id: cell.id, mode: 'tile-right', source_window_id: src,
+        ...(targetPanelId != null ? { target_panel_id: targetPanelId } : {}),
+      })
     }, 2000)
-    sendAction('repfig_query_compose', { cell_id: cell.id, source_window_id: src })
+    sendAction('repfig_query_compose', {
+      cell_id: cell.id, source_window_id: src,
+      ...(targetPanelId != null ? { target_panel_id: targetPanelId } : {}),
+    })
   }
 
   const runCompose = (mode: ComposeMode) => {
     if (!prompt) return
-    sendAction('repfig_compose', { cell_id: cell.id, mode, source_window_id: prompt.sourceWindowId })
+    sendAction('repfig_compose', {
+      cell_id: cell.id, mode, source_window_id: prompt.sourceWindowId,
+      ...(prompt.targetPanelId != null ? { target_panel_id: prompt.targetPanelId } : {}),
+    })
     setPrompt(null)
   }
 
@@ -282,7 +417,7 @@ export function ReportFigureCell({ cell, onRemove, index }: Props) {
               data-testid={`report-figcell-edit-toggle-${cell.id}`}
               style={editOpen ? styles.chromeBtnActive : styles.chromeBtn}
               title="Edit figure (layers, annotations)"
-              onClick={() => setEditOpen(v => !v)}
+              onClick={toggleEdit}
             >✎</button>
           }
           trailing={
@@ -352,7 +487,10 @@ export function ReportFigureCell({ cell, onRemove, index }: Props) {
               onDragLeave={onComposeDragLeave}
               onDrop={onComposeDrop}
             >
-              {zone != null && <ComposeZones active={zone} cellId={cell.id} />}
+              {hoverZone != null && (
+                <ComposeZones active={hoverZone.zone} cellId={cell.id}
+                  panelRect={hoverZone.panelRect} panelLabel={hoverZone.panelLabel} />
+              )}
             </div>
           )}
         </div>
@@ -422,7 +560,10 @@ export function ReportFigureCell({ cell, onRemove, index }: Props) {
 
       {/* Edit toolbar (layers + annotations) — only on a live figure cell. */}
       {editOpen && isLive && cell.figure && (
-        <FigureEditPanel cell={cell} onClose={() => setEditOpen(false)} />
+        <FigureEditPanel cell={cell} selectedPanel={selectedPanel} onClose={() => {
+          setEditOpen(false)
+          sendAction('repfig_set_edit_mode', { cell_id: cell.id, editing: false })
+        }} />
       )}
     </div>
   )
@@ -430,30 +571,49 @@ export function ReportFigureCell({ cell, onRemove, index }: Props) {
 
 // ── 5-zone drop overlay ───────────────────────────────────────────────────────
 
-function ComposeZones({ active, cellId }: { active: Zone; cellId: string }) {
+// `panelRect` positions the zones overlay INSIDE the hovered grid cell (percent
+// of the shield box); defaults to the full box on a single-panel figure.
+// `panelLabel` (e.g. "Panel B"), when present, is appended to the tile labels
+// so a multi-panel drop reads as "Tile → of Panel B".
+function ComposeZones({ active, cellId, panelRect, panelLabel: targetLabel }: {
+  active: Zone
+  cellId: string
+  panelRect?: { left: number; top: number; width: number; height: number }
+  panelLabel?: string | null
+}) {
   const zStyle = (z: Zone): React.CSSProperties => ({
     ...styles.zone,
     ...(active === z ? styles.zoneHot : {}),
   })
+  const rootStyle: React.CSSProperties = panelRect
+    ? {
+        ...styles.zonesRoot,
+        inset: 'auto',
+        left: `${panelRect.left * 100}%`, top: `${panelRect.top * 100}%`,
+        width: `${panelRect.width * 100}%`, height: `${panelRect.height * 100}%`,
+        right: 'auto', bottom: 'auto',
+      }
+    : styles.zonesRoot
+  const ofSuffix = targetLabel ? ` of ${targetLabel}` : ''
   // Only the cell under the cursor shows zones, so the bare spec testids
   // (figcell-zone-<zone>) are unambiguous; data-cell disambiguates in the DOM.
   return (
-    <div style={styles.zonesRoot} data-testid="figcell-zones" data-cell={cellId}>
+    <div style={rootStyle} data-testid="figcell-zones" data-cell={cellId}>
       {/* Edges first (thin strips), center last so it sits between them. */}
       <div data-testid="figcell-zone-up" style={{ ...zStyle('up'), ...styles.zoneUp }}>
-        <span style={styles.zoneLabel}>Tile ↑</span>
+        <span style={styles.zoneLabel}>{`Tile ↑${ofSuffix}`}</span>
       </div>
       <div data-testid="figcell-zone-down" style={{ ...zStyle('down'), ...styles.zoneDown }}>
-        <span style={styles.zoneLabel}>Tile ↓</span>
+        <span style={styles.zoneLabel}>{`Tile ↓${ofSuffix}`}</span>
       </div>
       <div data-testid="figcell-zone-left" style={{ ...zStyle('left'), ...styles.zoneLeft }}>
-        <span style={styles.zoneLabel}>Tile ←</span>
+        <span style={styles.zoneLabel}>{`Tile ←${ofSuffix}`}</span>
       </div>
       <div data-testid="figcell-zone-right" style={{ ...zStyle('right'), ...styles.zoneRight }}>
-        <span style={styles.zoneLabel}>Tile →</span>
+        <span style={styles.zoneLabel}>{`Tile →${ofSuffix}`}</span>
       </div>
       <div data-testid="figcell-zone-center" style={{ ...zStyle('center'), ...styles.zoneCenter }}>
-        <span style={styles.zoneLabel}>Overlay / Combine</span>
+        <span style={styles.zoneLabel}>{targetLabel ? `Combine${ofSuffix}` : 'Overlay / Combine'}</span>
       </div>
     </div>
   )
@@ -473,7 +633,11 @@ const ANNOT_LABEL: Record<string, string> = {
   arrow: 'Arrow', line: 'Line',
 }
 
-function FigureEditPanel({ cell, onClose }: { cell: ReportCell; onClose: () => void }) {
+function FigureEditPanel({ cell, selectedPanel, onClose }: {
+  cell: ReportCell
+  selectedPanel: string | null
+  onClose: () => void
+}) {
   const { sendAction } = useSpyDE()
   const panels = cell.figure?.panels ?? []
   const multiPanel = panels.length > 1
@@ -489,6 +653,18 @@ function FigureEditPanel({ cell, onClose }: { cell: ReportCell; onClose: () => v
     debounceSet(`${panelId}:${layerId}`, send)
   }
 
+  // The selection SOURCE OF TRUTH is the backend; clicking a chip just tells it
+  // to select (it echoes report_panel_selected → the prop updates). `null` = the
+  // Figure chip (figure-level).
+  const selectPanel = (panelId: string | null) =>
+    sendAction('repfig_select_panel', { cell_id: cell.id, panel_id: panelId })
+
+  // The panel whose section to show (resolve the selected id to a panel; unknown
+  // / null → figure-level).
+  const activePanel = selectedPanel != null
+    ? panels.find(p => p.id === selectedPanel) ?? null
+    : null
+
   return (
     <div style={styles.editPanel} data-testid={`figcell-edit-${cell.id}`}>
       <div style={styles.editHeader}>
@@ -497,17 +673,149 @@ function FigureEditPanel({ cell, onClose }: { cell: ReportCell; onClose: () => v
         <button style={styles.editClose} title="Close editor" onClick={onClose}>×</button>
       </div>
 
-      {panels.map((panel, i) => (
+      {/* Selection chips: one per panel (A, B, C…) + a Figure chip. */}
+      <div style={styles.chipRow} data-testid={`figcell-chips-${cell.id}`}>
+        {panels.map((panel, i) => (
+          <button
+            key={panel.id}
+            data-testid={`figcell-chip-${panel.id}`}
+            style={activePanel?.id === panel.id ? styles.chipActive : styles.chip}
+            title={`Select ${panelLabel(i)}`}
+            onClick={() => selectPanel(panel.id)}
+          >{PANEL_LETTERS[i] ?? String(i + 1)}</button>
+        ))}
+        <button
+          data-testid={`figcell-chip-figure-${cell.id}`}
+          style={activePanel == null ? styles.chipActive : styles.chip}
+          title="Figure-level controls (layout, caption, figure annotations)"
+          onClick={() => selectPanel(null)}
+        >Figure</button>
+      </div>
+
+      {activePanel != null ? (
         <PanelEdit
-          key={panel.id}
+          key={activePanel.id}
           cellId={cell.id}
-          panel={panel}
-          index={i}
+          panel={activePanel}
+          index={panels.indexOf(activePanel)}
           canRemovePanel={multiPanel}
           onSetLayer={setLayer}
           sendAction={sendAction}
         />
+      ) : (
+        <FigureLevelEdit cell={cell} sendAction={sendAction} />
+      )}
+    </div>
+  )
+}
+
+// ── Figure-level section (shown when the "Figure" chip is active) ───────────────
+
+function FigureLevelEdit({ cell, sendAction }: {
+  cell: ReportCell
+  sendAction: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
+}) {
+  const figure = cell.figure
+  const panels = figure?.panels ?? []
+  const layout = figure?.layout
+  const isGrid = layout?.kind === 'grid'
+  const rows = Math.max(1, Number(layout?.rows) || 1)
+  const cols = Math.max(1, Number(layout?.cols) || 1)
+  const gridSummary = isGrid && panels.length > 1 ? `${rows} × ${cols} grid` : 'single panel'
+
+  // Debounced layout sender so a dragged slider doesn't flood repfig_set_layout.
+  const debounceSet = useKeyedDebounce(150)
+  const setLayout = (payload: Record<string, unknown>) =>
+    debounceSet('layout', () => sendAction('repfig_set_layout', { cell_id: cell.id, ...payload }))
+
+  const hspace = Number(layout?.hspace ?? 0.2)
+  const wspace = Number(layout?.wspace ?? 0.2)
+  const [draftH, setDraftH] = React.useState(hspace)
+  const [draftW, setDraftW] = React.useState(wspace)
+  React.useEffect(() => { setDraftH(hspace) }, [hspace])
+  React.useEffect(() => { setDraftW(wspace) }, [wspace])
+
+  const annotations = figure?.annotations ?? []
+
+  // Figure-fraction defaults (0..1, centered) — same accent as panel annotations.
+  const ANNOT_COLOR = '#ff9800'
+  const addFigAnnotation = (kind: 'text' | 'circle' | 'rect' | 'arrow') => {
+    let annotation: Record<string, unknown>
+    if (kind === 'text') {
+      annotation = { kind: 'text', x: 0.5, y: 0.5, text: 'Label', color: ANNOT_COLOR, fontsize: 14 }
+    } else if (kind === 'circle') {
+      annotation = { kind: 'circle', x: 0.5, y: 0.5, r: 0.08, color: ANNOT_COLOR }
+    } else if (kind === 'rect') {
+      annotation = { kind: 'rect', x: 0.5, y: 0.5, w: 0.2, h: 0.15, color: ANNOT_COLOR }
+    } else {
+      annotation = { kind: 'arrow', x: 0.35, y: 0.35, u: 0.15, v: 0.15, color: ANNOT_COLOR }
+    }
+    sendAction('repfig_add_fig_annotation', { cell_id: cell.id, annotation })
+  }
+
+  return (
+    <div style={styles.panelBlock} data-testid={`figcell-figure-edit-${cell.id}`}>
+      <div style={styles.subLabel}>Layout</div>
+      <div style={styles.figGridSummary} data-testid={`figcell-grid-summary-${cell.id}`}>
+        {gridSummary}
+      </div>
+      {isGrid && panels.length > 1 && (
+        <>
+          <div style={styles.layerTop}>
+            <span style={styles.hint}>row gap</span>
+            <input
+              data-testid={`figcell-hspace-${cell.id}`}
+              type="range" min={0} max={1} step={0.05}
+              value={draftH}
+              onChange={(e) => { const v = Number(e.target.value); setDraftH(v); setLayout({ hspace: v }) }}
+              style={{ flex: 1 }}
+            />
+            <span style={{ ...styles.hint, minWidth: 26, textAlign: 'right' }}>{draftH.toFixed(2)}</span>
+          </div>
+          <div style={styles.layerTop}>
+            <span style={styles.hint}>col gap</span>
+            <input
+              data-testid={`figcell-wspace-${cell.id}`}
+              type="range" min={0} max={1} step={0.05}
+              value={draftW}
+              onChange={(e) => { const v = Number(e.target.value); setDraftW(v); setLayout({ wspace: v }) }}
+              style={{ flex: 1 }}
+            />
+            <span style={{ ...styles.hint, minWidth: 26, textAlign: 'right' }}>{draftW.toFixed(2)}</span>
+          </div>
+        </>
+      )}
+
+      <div style={styles.subLabel}>Caption</div>
+      <div style={styles.figCaptionHint}>
+        Edit the caption below the figure (click it to type).
+      </div>
+
+      {/* Figure-level annotations (figure fractions, draggable in edit mode). */}
+      <div style={styles.subLabel}>Figure annotations</div>
+      {annotations.length === 0 && (
+        <div style={styles.annEmpty}>None yet — add one below.</div>
+      )}
+      {annotations.map((ann, ai) => (
+        <FigureAnnotationRow
+          key={ann.id ?? ai}
+          cellId={cell.id}
+          index={ai}
+          annotation={ann as Record<string, unknown> & { kind: string }}
+          sendAction={sendAction}
+        />
       ))}
+      <div style={styles.annPalette}>
+        {(['text', 'circle', 'rect', 'arrow'] as const).map(k => (
+          <button
+            key={k}
+            data-testid={`figcell-add-fig-${k}-${cell.id}`}
+            style={styles.annAddBtn}
+            title={`Add figure ${ANNOT_LABEL[k]}`}
+            onClick={() => addFigAnnotation(k)}
+          >+ {ANNOT_LABEL[k]}</button>
+        ))}
+      </div>
     </div>
   )
 }
@@ -773,6 +1081,74 @@ function AnnotationRow({ cellId, panelId, index, annotation, sendAction }: {
   )
 }
 
+// A FIGURE-LEVEL annotation row (sibling of AnnotationRow): figure-fraction
+// markers store a text kind's string in the `text` scalar (anyplotlib
+// figure-marker schema, not panel `texts`), and edits route through the
+// repfig_*_fig_annotation actions.
+function FigureAnnotationRow({ cellId, index, annotation, sendAction }: {
+  cellId: string
+  index: number
+  annotation: Record<string, unknown> & { kind: string }
+  sendAction: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
+}) {
+  const kind = String(annotation.kind ?? '')
+  const isText = kind === 'text'
+  const current = String(annotation.text ?? '')
+  const [editing, setEditing] = React.useState(false)
+  const [draft, setDraft] = React.useState(current)
+  React.useEffect(() => { if (!editing) setDraft(current) }, [current, editing])
+
+  const commitText = () => {
+    setEditing(false)
+    if (draft !== current) {
+      sendAction('repfig_update_fig_annotation', {
+        cell_id: cellId, index,
+        annotation: { ...annotation, text: draft },
+      })
+    }
+  }
+
+  const label = ANNOT_LABEL[kind] ?? kind
+
+  return (
+    <div style={styles.annRow} data-testid={`figcell-fig-annotation-${index}`}>
+      <span style={styles.annKind}>{label}</span>
+      {isText ? (
+        editing ? (
+          <input
+            data-testid={`figcell-fig-annotation-text-input-${index}`}
+            autoFocus
+            style={styles.annInput}
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onBlur={commitText}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') (e.target as HTMLInputElement).blur()
+              else if (e.key === 'Escape') { setDraft(current); setEditing(false) }
+            }}
+          />
+        ) : (
+          <span
+            data-testid={`figcell-fig-annotation-text-${index}`}
+            style={styles.annText}
+            title="Click to edit text"
+            onClick={() => { setDraft(current); setEditing(true) }}
+          >{current || <span style={styles.captionPlaceholder}>(empty)</span>}</span>
+        )
+      ) : (
+        <span style={styles.annText} />
+      )}
+      <div style={{ flex: 1 }} />
+      <button
+        data-testid={`figcell-fig-annotation-remove-${index}`}
+        style={styles.removeBtn}
+        title="Delete figure annotation"
+        onClick={() => sendAction('repfig_remove_fig_annotation', { cell_id: cellId, index })}
+      >×</button>
+    </div>
+  )
+}
+
 const styles: Record<string, React.CSSProperties> = {
   cell: {
     position: 'relative',
@@ -907,6 +1283,22 @@ const styles: Record<string, React.CSSProperties> = {
     background: 'none', border: 'none', color: '#6c7086', cursor: 'pointer',
     fontSize: 15, lineHeight: 1, padding: '0 2px',
   },
+  chipRow: {
+    display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 4,
+    paddingBottom: 4, borderBottom: '1px solid #1e1e2e',
+  },
+  chip: {
+    background: '#1e1e2e', color: '#a6adc8', border: '1px solid #313244',
+    borderRadius: 5, padding: '2px 8px', fontSize: 10.5, cursor: 'pointer',
+    lineHeight: 1.2,
+  },
+  chipActive: {
+    background: '#89b4fa', color: '#11111b', border: '1px solid #89b4fa',
+    borderRadius: 5, padding: '2px 8px', fontSize: 10.5, cursor: 'pointer',
+    fontWeight: 600, lineHeight: 1.2,
+  },
+  figGridSummary: { fontSize: 10.5, color: '#cdd6f4', padding: '1px 0 3px' },
+  figCaptionHint: { fontSize: 9.5, color: '#6c7086', fontStyle: 'italic', padding: '1px 0' },
   panelBlock: {
     borderTop: '1px solid #1e1e2e', paddingTop: 5, marginTop: 4,
   },

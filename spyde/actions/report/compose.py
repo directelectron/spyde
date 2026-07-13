@@ -56,28 +56,44 @@ def _cell(mgr, cell_id):
     return cell
 
 
-def _target_base_shape(mgr, cell):
-    """The (H, W) of the target cell's BASE layer snapshot, or None."""
-    arr = mgr.primary_snapshot(cell.id)
+def _target_panel(cell, target_panel_id=None):
+    """The panel to treat as the compose TARGET: the panel matching
+    ``target_panel_id`` when given and found, else the primary (first) panel —
+    preserves single-panel behaviour and is the safe default for an unknown id."""
+    if cell.spec is None or not cell.spec.panels:
+        return None
+    if target_panel_id is not None:
+        for p in cell.spec.panels:
+            if p.id == target_panel_id:
+                return p
+    return cell.spec.panels[0]
+
+
+def _target_base_shape(mgr, cell, target_panel_id=None):
+    """The (H, W) of the target panel's BASE layer snapshot, or None."""
+    panel = _target_panel(cell, target_panel_id)
+    if panel is None or not panel.layers:
+        return None
+    arr = mgr.snapshot_map(cell.id).get((panel.id, panel.layers[0].id))
     if isinstance(arr, np.ndarray) and arr.ndim >= 2:
         return tuple(arr.shape[:2])
     return None
 
 
-def _target_base_source(cell):
-    """The SignalRef of the target cell's base (primary) layer — the plot the cell
-    was snapshotted from."""
-    pl = cell.spec.primary_layer if cell.spec else None
-    return pl.source if pl is not None else None
+def _target_base_source(cell, target_panel_id=None):
+    """The SignalRef of the target panel's base layer — the plot the panel was
+    snapshotted from."""
+    panel = _target_panel(cell, target_panel_id)
+    return panel.layers[0].source if (panel is not None and panel.layers) else None
 
 
-def _is_nav_signal_pair(session, cell, source_plot):
-    """True when the source plot and the target cell's base source are a
+def _is_nav_signal_pair(session, cell, source_plot, target_panel_id=None):
+    """True when the source plot and the target panel's base source are a
     NAVIGATOR ↔ SIGNAL pair of the SAME signal tree (so a callout makes sense —
     e.g. a navigator cell with a diffraction-pattern callout, or vice versa)."""
     if source_plot is None or cell.spec is None:
         return False
-    ref = _target_base_source(cell)
+    ref = _target_base_source(cell, target_panel_id)
     target_plot = ref.resolve(session) if ref is not None else None
     if target_plot is None:
         return False
@@ -164,10 +180,12 @@ def repfig_query_compose(session, plot, payload) -> None:
     """Reply with the compose modes compatible for dropping ``source_window_id``
     onto figure cell ``cell_id``: overlay when the source frame shape matches the
     target panel's base; callout when they're a navigator↔signal pair of one tree;
-    tiles ALWAYS."""
+    tiles ALWAYS. ``target_panel_id`` (optional) selects which panel is the
+    compose target on a multi-panel cell; defaults to the primary (first) panel."""
     mgr = _manager(session)
     cell_id = payload.get("cell_id")
     source_window_id = payload.get("source_window_id")
+    target_panel_id = payload.get("target_panel_id")
     cell = _cell(mgr, cell_id)
     src = _resolve_source_plot(session, source_window_id)
 
@@ -176,7 +194,7 @@ def repfig_query_compose(session, plot, payload) -> None:
     options = list(_TILE_MODES)   # tiles always available
 
     if cell is not None and src is not None:
-        base_shape = _target_base_shape(mgr, cell)
+        base_shape = _target_base_shape(mgr, cell, target_panel_id)
         src_frame = getattr(src, "current_data", None)
         src_shape = (tuple(src_frame.shape[:2])
                      if isinstance(src_frame, np.ndarray) and src_frame.ndim >= 2
@@ -184,7 +202,7 @@ def repfig_query_compose(session, plot, payload) -> None:
         if base_shape is not None and src_shape is not None and base_shape == src_shape:
             same_shape = True
             options.insert(0, "overlay")
-        if _is_nav_signal_pair(session, cell, src):
+        if _is_nav_signal_pair(session, cell, src, target_panel_id):
             nav_signal_pair = True
             options.append("callout")
 
@@ -204,7 +222,13 @@ def repfig_query_compose(session, plot, payload) -> None:
 def repfig_compose(session, plot, payload) -> None:
     """Combine ``source_window_id`` into figure cell ``cell_id`` in ``mode``
     (``overlay`` / ``tile-up|down|left|right`` / ``callout``). Snapshots the source
-    NOW and mutates the cell's FigureSpec, then rebuilds + re-emits."""
+    NOW and mutates the cell's FigureSpec, then rebuilds + re-emits.
+
+    ``target_panel_id`` (optional) is the panel the compose is relative to —
+    for ``overlay`` the panel that gains the layer, for a ``tile-*`` mode the
+    panel the new panel is placed next to. Defaults to the primary (first)
+    panel / the legacy edge-of-grid placement when absent or unresolvable, so
+    existing (whole-figure) drop behaviour is unchanged."""
     mgr = _manager(session)
     cell = _cell(mgr, payload.get("cell_id"))
     if cell is None:
@@ -224,13 +248,14 @@ def repfig_compose(session, plot, payload) -> None:
         ipc.emit_error("repfig_compose: source has no layer to compose.")
         return
     mode = str(payload.get("mode", "")).lower()
+    target_panel_id = payload.get("target_panel_id")
 
     if mode == "overlay":
-        _compose_overlay(mgr, cell, src_panel, src_map)
+        _compose_overlay(mgr, cell, src_panel, src_map, target_panel_id)
     elif mode in _TILE_MODES:
-        _compose_tile(mgr, cell, src_panel, src_map, mode)
+        _compose_tile(mgr, cell, src_panel, src_map, mode, target_panel_id)
     elif mode == "callout":
-        _compose_callout(session, mgr, cell, src, src_panel, src_map)
+        _compose_callout(session, mgr, cell, src, src_panel, src_map, target_panel_id)
     else:
         ipc.emit_error(f"repfig_compose: unknown mode {mode!r}.")
         return
@@ -238,10 +263,10 @@ def repfig_compose(session, plot, payload) -> None:
     _rebuild_and_emit(mgr, cell)
 
 
-def _compose_overlay(mgr, cell, src_panel, src_map) -> None:
+def _compose_overlay(mgr, cell, src_panel, src_map, target_panel_id=None) -> None:
     """Append the source's base layer to the TARGET panel as an overlay layer
     (distinct cmap, alpha 0.5)."""
-    target_panel = cell.spec.panels[0] if cell.spec.panels else None
+    target_panel = _target_panel(cell, target_panel_id)
     if target_panel is None:
         return
     src_base = src_panel.layers[0]
@@ -256,43 +281,107 @@ def _compose_overlay(mgr, cell, src_panel, src_map) -> None:
     mgr.set_snapshot(cell.id, target_panel.id, new_layer.id, np.asarray(src_arr))
 
 
-def _compose_tile(mgr, cell, src_panel, src_map, mode) -> None:
-    """Grow the grid layout, placing the source as a NEW panel on the given side.
+_DIRECTION_DELTA = {
+    "tile-up": (-1, 0), "tile-down": (1, 0),
+    "tile-left": (0, -1), "tile-right": (0, 1),
+}
 
-    single → 1×2 / 2×1 with the new panel left/right/up/down of the existing one;
-    already-grid → insert a row/col on that side and place the new panel there.
-    Existing panels' ``grid_pos`` are shifted as needed."""
+
+def _grid_panels(spec):
+    """The panels that occupy a GRID cell — i.e. every panel NOT referenced as a
+    callout inset (an inset panel is a floating overlay, not a grid cell). Mirrors
+    the inset-id scan in :func:`_renormalise_layout`."""
+    inset_ids = set()
+    for p in spec.panels:
+        for ins in (p.insets or []):
+            if ins.get("panel"):
+                inset_ids.add(ins["panel"])
+    return [p for p in spec.panels if p.id not in inset_ids]
+
+
+def _resolve_tile_target(grid_panels, mode, target_panel_id):
+    """The grid panel the tile should be placed relative to.
+
+    Prefers the panel matching ``target_panel_id``; falls back to the legacy
+    edge-of-grid default (preserves pre-targeting behaviour when no/unknown
+    target is given): tile-right → max col (tie-break min row), tile-left → min
+    col, tile-down → max row (tie-break min col), tile-up → min row (tie-break
+    min col)."""
+    if target_panel_id is not None:
+        for p in grid_panels:
+            if p.id == target_panel_id:
+                return p
+    if not grid_panels:
+        return None
+    if mode == "tile-right":
+        return min(grid_panels, key=lambda p: (-int(p.grid_pos[1]), int(p.grid_pos[0])))
+    if mode == "tile-left":
+        return min(grid_panels, key=lambda p: (int(p.grid_pos[1]), int(p.grid_pos[0])))
+    if mode == "tile-down":
+        return min(grid_panels, key=lambda p: (-int(p.grid_pos[0]), int(p.grid_pos[1])))
+    # tile-up
+    return min(grid_panels, key=lambda p: (int(p.grid_pos[0]), int(p.grid_pos[1])))
+
+
+def _compose_tile(mgr, cell, src_panel, src_map, mode, target_panel_id=None) -> None:
+    """Place the source as a NEW panel in the grid, relative to a TARGET panel
+    (2-D grid-aware; see module docstring / CLAUDE task notes for the full
+    contract):
+
+    * Resolve the target panel (``target_panel_id``, else the legacy
+      edge-of-grid default for *mode*).
+    * The neighbor cell = target.grid_pos + the direction delta for *mode*.
+    * If that cell is within the current grid AND unoccupied → HOLE FILL (no
+      grid growth, no shifting).
+    * Otherwise INSERT a row/column at the neighbor position: every grid panel
+      at/after the insertion index is shifted by one, and the new panel lands
+      at the freed slot next to the target.
+
+    ``spec.layout`` is recomputed as the bounding grid over all grid panels
+    (including the new one) once placement is decided."""
     spec = cell.spec
     layout = dict(spec.layout or {"kind": "single"})
+    grid_panels = _grid_panels(spec)
     if str(layout.get("kind")) != "grid":
+        # Single (0 or 1 grid panel) — normalise every existing grid panel to
+        # [0, 0] so the legacy/target resolution below sees a coherent 1x1 grid.
         rows, cols = 1, 1
+        for p in grid_panels:
+            p.grid_pos = [0, 0]
     else:
         rows = int(layout.get("rows", 1) or 1)
         cols = int(layout.get("cols", 1) or 1)
 
-    horizontal = mode in ("tile-left", "tile-right")
-    prepend = mode in ("tile-up", "tile-left")
+    target = _resolve_tile_target(grid_panels, mode, target_panel_id)
+    dr, dc = _DIRECTION_DELTA[mode]
 
-    if horizontal:
-        new_cols = cols + 1
-        new_rows = max(rows, 1)
-        if prepend:
-            for p in spec.panels:
-                p.grid_pos = [p.grid_pos[0], p.grid_pos[1] + 1]
-            new_pos = [0, 0]
-        else:
-            new_pos = [0, cols]
-        rows, cols = new_rows, new_cols
+    if target is None:
+        # No existing grid panel at all — place the new one at the origin.
+        new_pos = [0, 0]
+        rows, cols = 1, 1
     else:
-        new_rows = rows + 1
-        new_cols = max(cols, 1)
-        if prepend:
-            for p in spec.panels:
-                p.grid_pos = [p.grid_pos[0] + 1, p.grid_pos[1]]
-            new_pos = [0, 0]
+        tr, tc = int(target.grid_pos[0]), int(target.grid_pos[1])
+        nr, nc = tr + dr, tc + dc
+        occupied = {(int(p.grid_pos[0]), int(p.grid_pos[1])) for p in grid_panels}
+        if 0 <= nr < rows and 0 <= nc < cols and (nr, nc) not in occupied:
+            # Hole fill: the neighbor cell exists and is empty.
+            new_pos = [nr, nc]
         else:
-            new_pos = [rows, 0]
-        rows, cols = new_rows, new_cols
+            horizontal = dc != 0
+            if horizontal:
+                insert_at = tc + 1 if dc > 0 else tc
+                for p in grid_panels:
+                    if int(p.grid_pos[1]) >= insert_at:
+                        p.grid_pos = [p.grid_pos[0], p.grid_pos[1] + 1]
+                new_pos = [tr, insert_at]
+                cols += 1
+            else:
+                insert_at = tr + 1 if dr > 0 else tr
+                for p in grid_panels:
+                    if int(p.grid_pos[0]) >= insert_at:
+                        p.grid_pos = [p.grid_pos[0] + 1, p.grid_pos[1]]
+                new_pos = [insert_at, tc]
+                rows += 1
 
     # Build the new panel from the source (a fresh id; copy its base layer).
     src_base = src_panel.layers[0]
@@ -310,7 +399,12 @@ def _compose_tile(mgr, cell, src_panel, src_map, mode) -> None:
     if src_arr is not None:
         mgr.set_snapshot(cell.id, new_panel_id, new_base.id, np.asarray(src_arr))
 
-    spec.layout = {"kind": "grid", "rows": rows, "cols": cols}
+    # Recompute the bounding grid over all grid panels (including the new one).
+    all_grid = _grid_panels(spec)
+    final_rows = max((int(p.grid_pos[0]) for p in all_grid), default=0) + 1
+    final_cols = max((int(p.grid_pos[1]) for p in all_grid), default=0) + 1
+    spec.layout = {"kind": "grid", "rows": max(rows, final_rows),
+                   "cols": max(cols, final_cols)}
 
 
 def _axis_offset_scale(axis_vals):
@@ -344,8 +438,9 @@ def _index_region_to_data(panel, region):
     return (ox + x * sx, oy + y * sy, w * sx, h * sy)
 
 
-def _compose_callout(session, mgr, cell, src, src_panel, src_map) -> None:
-    """Add a small callout INSET on the target's primary panel that references a NEW
+def _compose_callout(session, mgr, cell, src, src_panel, src_map,
+                     target_panel_id=None) -> None:
+    """Add a small callout INSET on the target panel that references a NEW
     small panel spec rendered from the source snapshot.
 
     The connector (the dashed source-region rectangle drawn on the BASE panel) is
@@ -355,7 +450,7 @@ def _compose_callout(session, mgr, cell, src, src_panel, src_map) -> None:
     panel's DATA coords (offset + index*scale). When the base panel is the SIGNAL
     (the navigator was dropped as the inset) there is no meaningful source region
     on the diffraction-pattern panel, so the connector is SKIPPED."""
-    target_panel = cell.spec.panels[0] if cell.spec.panels else None
+    target_panel = _target_panel(cell, target_panel_id)
     if target_panel is None:
         return
     src_base = src_panel.layers[0]
@@ -378,7 +473,7 @@ def _compose_callout(session, mgr, cell, src, src_panel, src_map) -> None:
     # signal driven by that navigator's selector. Determine the base plot and skip
     # the connector otherwise.
     connector = None
-    base_ref = _target_base_source(cell)
+    base_ref = _target_base_source(cell, target_panel_id)
     base_plot = base_ref.resolve(session) if base_ref is not None else None
     base_is_nav = bool(getattr(base_plot, "is_navigator", False)) if base_plot else False
     src_is_nav = bool(getattr(src, "is_navigator", False))
@@ -535,6 +630,9 @@ def _finalize_edit(mgr, cell) -> None:
         if wid is not None:
             mgr._forget(wid)
         mgr._snapshots.pop(cell.id, None)
+        mgr._editing.discard(cell.id)
+        mgr._edit_wiring.pop(cell.id, None)
+        mgr._selected.pop(cell.id, None)
         cell.spec = None
         cell.placeholder = True
         mgr.dirty = True
@@ -598,4 +696,148 @@ def repfig_remove_annotation(session, plot, payload) -> None:
         return
     if 0 <= i < len(panel.annotations):
         del panel.annotations[i]
+        _rebuild_and_emit(mgr, cell)
+
+
+def repfig_set_edit_mode(session, plot, payload) -> None:
+    """Toggle EDIT MODE for a figure cell (``{cell_id, editing: bool}``). In edit
+    mode the cell's annotations render as draggable widgets (drag → persist), out of
+    it they render as static markers. On ANY change to the ``_editing`` membership
+    the cell's figure is rebuilt (so it re-renders in the right mode) and the
+    authoritative state re-emitted."""
+    mgr = _manager(session)
+    cell = _cell(mgr, payload.get("cell_id"))
+    if cell is None:
+        return
+    editing = bool(payload.get("editing"))
+    was = cell.id in mgr._editing
+    if editing == was:
+        return
+    if editing:
+        mgr._editing.add(cell.id)
+    else:
+        mgr._editing.discard(cell.id)
+        # Leaving edit mode clears the selection (the dock unmounts); the outline
+        # is gone anyway once edit_chrome is off on the rebuilt figure.
+        mgr._selected.pop(cell.id, None)
+    _rebuild_and_emit(mgr, cell)
+
+
+# ── selection + figure-level layout / annotations ─────────────────────────────
+
+
+def repfig_select_panel(session, plot, payload) -> None:
+    """Select a panel (``{cell_id, panel_id|null}``) — the dock chips drive the
+    same selection source of truth as a click on the live figure. ``panel_id`` null
+    → figure-level (deselect). Delegates to ``ReportManager.select_panel`` (which
+    records it, pushes the outline, and emits ``report_panel_selected``)."""
+    mgr = _manager(session)
+    cell = _cell(mgr, payload.get("cell_id"))
+    if cell is None:
+        return
+    mgr.select_panel(cell.id, payload.get("panel_id"))
+
+
+# Figure layout spacing is clamped to a sane fraction range (a whole-figure inter-
+# panel gap of >1 mean cell is nonsensical; negatives collapse panels).
+_LAYOUT_MIN, _LAYOUT_MAX = 0.0, 1.0
+
+
+def _clamp_layout(val):
+    try:
+        return max(_LAYOUT_MIN, min(_LAYOUT_MAX, float(val)))
+    except (TypeError, ValueError):
+        return None
+
+
+def repfig_set_layout(session, plot, payload) -> None:
+    """Set the figure-level layout spacing (``{cell_id, hspace?, wspace?}``) — the
+    whole-figure gap between grid panels. Only the provided keys are stored (clamped
+    to 0..1); then the figure is rebuilt so ``subplots_adjust`` takes effect."""
+    mgr = _manager(session)
+    cell = _cell(mgr, payload.get("cell_id"))
+    if cell is None or cell.spec is None:
+        return
+    layout = dict(cell.spec.layout or {"kind": "single"})
+    changed = False
+    for key in ("hspace", "wspace"):
+        if key in payload and payload[key] is not None:
+            v = _clamp_layout(payload[key])
+            if v is not None:
+                layout[key] = v
+                changed = True
+    if not changed:
+        return
+    cell.spec.layout = layout
+    _rebuild_and_emit(mgr, cell)
+
+
+def _valid_fig_annotation(ann) -> bool:
+    """A figure-level annotation is a dict whose ``kind`` is one anyplotlib's
+    figure-marker layer accepts (text/circle/rect/arrow). Positions are FIGURE
+    FRACTIONS — no data-coord conversion — so we only validate the kind here."""
+    return isinstance(ann, dict) and str(ann.get("kind", "")) in _FIG_ANN_KINDS
+
+
+_FIG_ANN_KINDS = {"text", "circle", "rect", "arrow"}
+
+
+def repfig_add_fig_annotation(session, plot, payload) -> None:
+    """Add a FIGURE-LEVEL annotation (``{cell_id, annotation}``) — a fraction-coord
+    marker in the anyplotlib figure-marker schema. An ``id`` is assigned when
+    missing so a later drag can persist back by id."""
+    import uuid as _uuid
+    mgr = _manager(session)
+    cell = _cell(mgr, payload.get("cell_id"))
+    if cell is None or cell.spec is None:
+        return
+    ann = payload.get("annotation")
+    if not _valid_fig_annotation(ann):
+        return
+    ann = dict(ann)
+    if not ann.get("id"):
+        ann["id"] = _uuid.uuid4().hex[:8]
+    cell.spec.annotations.append(ann)
+    _rebuild_and_emit(mgr, cell)
+
+
+def repfig_update_fig_annotation(session, plot, payload) -> None:
+    """Replace the FIGURE-LEVEL annotation at ``index`` (``{cell_id, index,
+    annotation}``). Preserves the existing id when the incoming dict omits one so
+    drag-persistence keeps matching."""
+    mgr = _manager(session)
+    cell = _cell(mgr, payload.get("cell_id"))
+    if cell is None or cell.spec is None:
+        return
+    ann = payload.get("annotation")
+    idx = payload.get("index")
+    if not _valid_fig_annotation(ann) or idx is None:
+        return
+    try:
+        i = int(idx)
+    except (TypeError, ValueError):
+        return
+    anns = cell.spec.annotations
+    if 0 <= i < len(anns):
+        new = dict(ann)
+        if not new.get("id"):
+            new["id"] = anns[i].get("id")
+        anns[i] = new
+        _rebuild_and_emit(mgr, cell)
+
+
+def repfig_remove_fig_annotation(session, plot, payload) -> None:
+    """Remove the FIGURE-LEVEL annotation at ``index`` (``{cell_id, index}``)."""
+    mgr = _manager(session)
+    cell = _cell(mgr, payload.get("cell_id"))
+    if cell is None or cell.spec is None:
+        return
+    idx = payload.get("index")
+    try:
+        i = int(idx)
+    except (TypeError, ValueError):
+        return
+    anns = cell.spec.annotations
+    if 0 <= i < len(anns):
+        del anns[i]
         _rebuild_and_emit(mgr, cell)

@@ -144,6 +144,47 @@ test('2) add a markdown cell, edit it, render H1 + bold', async () => {
   ctx.assertNoJsErrors()
 })
 
+// Spec A (report_edit): Shift+Enter commits a markdown cell — the textarea
+// closes and the rendered markdown reflects the new source. (Test 2 exercised
+// Ctrl+Enter; the ReportCell keydown handler also commits on Shift+Enter.)
+test('2b) Shift+Enter commits the markdown cell (textarea closes, content updates)', async () => {
+  const { page } = ctx
+  // Re-enter edit on the same (only) markdown cell.
+  const rendered = page.locator('[data-testid^="report-cell-rendered-"]').first()
+  await expect(rendered).toBeVisible()
+  await rendered.dblclick()
+  const ta = page.locator('[data-testid^="report-cell-textarea-"]').first()
+  await expect(ta).toBeVisible()
+  await ta.fill('## Updated via Shift+Enter\nNew *content* here')
+  // The load-bearing assertion: Shift+Enter (NOT Ctrl+Enter) commits + closes.
+  await ta.press('Shift+Enter')
+
+  // The textarea is gone (edit committed → back to rendered view).
+  await expect(page.locator('[data-testid^="report-cell-textarea-"]')).toHaveCount(0, {
+    timeout: 10_000,
+  })
+  // The rendered markdown reflects the new source: an H2 with the new heading +
+  // emphasised (em) text — and NOT the old "Results" H1.
+  const renderedAfter = page.locator('[data-testid^="report-cell-rendered-"]').first()
+  await expect(renderedAfter).toBeVisible()
+  await expect(renderedAfter.locator('h2')).toHaveText(/Updated via Shift\+Enter/)
+  await expect(renderedAfter.locator('em')).toHaveText('content')
+  await expect(renderedAfter.locator('h1')).toHaveCount(0)
+  await page.screenshot({ path: join(SHOTS, '02b-markdown-shift-enter.png') })
+  ctx.assertNoJsErrors()
+
+  // Restore the cell to its original H1+bold content so downstream tests
+  // (save/reopen asserts on "# Results" + **bold**) still hold.
+  await renderedAfter.dblclick()
+  const ta2 = page.locator('[data-testid^="report-cell-textarea-"]').first()
+  await expect(ta2).toBeVisible()
+  await ta2.fill('# Results\nSome **bold** text')
+  await ta2.press('Shift+Enter')
+  await expect(page.locator('[data-testid^="report-cell-rendered-"]').first().locator('h1'))
+    .toHaveText(/Results/, { timeout: 10_000 })
+  ctx.assertNoJsErrors()
+})
+
 test('3) drag the signal window pill into the report → live figure cell', async () => {
   const { page } = ctx
   // The signal window's breadcrumb pill stamps FIGURE_DRAG_MIME (windowId). Tag

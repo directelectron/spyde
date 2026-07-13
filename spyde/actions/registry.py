@@ -111,6 +111,13 @@ STAGED_HANDLERS: dict[str, str] = {
     "repfig_add_annotation":   "spyde.actions.report.compose.repfig_add_annotation",
     "repfig_update_annotation": "spyde.actions.report.compose.repfig_update_annotation",
     "repfig_remove_annotation": "spyde.actions.report.compose.repfig_remove_annotation",
+    "repfig_set_edit_mode":    "spyde.actions.report.compose.repfig_set_edit_mode",
+    # Selection-driven edit + figure-level layout / annotations.
+    "repfig_select_panel":     "spyde.actions.report.compose.repfig_select_panel",
+    "repfig_set_layout":       "spyde.actions.report.compose.repfig_set_layout",
+    "repfig_add_fig_annotation": "spyde.actions.report.compose.repfig_add_fig_annotation",
+    "repfig_update_fig_annotation": "spyde.actions.report.compose.repfig_update_fig_annotation",
+    "repfig_remove_fig_annotation": "spyde.actions.report.compose.repfig_remove_fig_annotation",
     # Report Builder Phase 2 — MDI live image layering (spyde/actions/overlay.py)
     "overlay_add":             "spyde.actions.overlay.overlay_add",
     "overlay_set":             "spyde.actions.overlay.overlay_set",

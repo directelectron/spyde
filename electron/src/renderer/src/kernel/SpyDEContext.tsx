@@ -641,6 +641,10 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
   // always fresh; also read by the harvest effect further below.
   const reportFiguresRef = useRef(state.reportFigures)
   reportFiguresRef.current = state.reportFigures
+  // Mirror the authoritative report doc into a ref for the same reason (the
+  // deps-[] message effect + the e2e test hook read the LATEST doc synchronously).
+  const reportRef = useRef(state.report)
+  reportRef.current = state.report
   const tileWindowsRef = useRef<(() => void) | null>(null)
   const [stackDialogOpen, setStackDialogOpen] = useState(false)
   const [updateDialogOpen, setUpdateDialogOpen] = useState(false)
@@ -701,7 +705,10 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         const timer = setTimeout(() => finish(null), timeoutMs)
         try {
           iframe.contentWindow!.postMessage(
-            { type: 'anyplotlib_export_png', requestId, opts: {} }, '*',
+            // includeWidgets: a PNG harvested while a cell is in EDIT MODE keeps
+            // the annotation widgets (harmless otherwise; anyplotlib never exports
+            // the edit chrome / grab handles).
+            { type: 'anyplotlib_export_png', requestId, opts: { includeWidgets: true } }, '*',
           )
         } catch { finish(null) }
       })
@@ -1122,6 +1129,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'console_node_bound':
         case 'layers_state':
         case 'repfig_compose_options':
+        case 'report_panel_selected':
         case 'report_exported':
         case 'mvx_state':
         case 'mvx_done':
@@ -1178,6 +1186,14 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
           } catch { /* */ }
         }
         return widgets
+      }
+
+      // Test hook: return the authoritative report doc (read-only snapshot) so a
+      // Playwright spec can read backend-assigned ids that never surface in the
+      // DOM — e.g. a figure-level annotation's `id` (needed to inject a
+      // figure-marker drag pointer_up). Reads the ref so it's always current.
+      window._spyde_test_report = () => {
+        try { return JSON.parse(JSON.stringify(reportRef.current)) } catch { return null }
       }
 
       // Test hook: a cheap signature of a figure's latest image data (length +
@@ -1244,6 +1260,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
       if (testHooksEnabled) {
         delete window._spyde_test_inject
         delete window._spyde_test_widgets
+        delete window._spyde_test_report
         delete window._spyde_test_image_sig
       }
     }

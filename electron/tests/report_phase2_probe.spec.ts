@@ -95,6 +95,12 @@ test('edit toolbar: opens, lists a layer + annotation palette', async () => {
   await page.getByTestId(`report-figcell-edit-toggle-${cellId}`).click()
   const editPanel = page.getByTestId(`figcell-edit-${cellId}`)
   await expect(editPanel).toBeVisible()
+  // The edit dock now opens in FIGURE-LEVEL view by default (selection UI); select
+  // the first panel chip so the per-panel controls (layers + annotation palette)
+  // appear.
+  const panelChip = editPanel.locator('[data-testid^="figcell-chip-p"]').first()
+  await expect(panelChip).toBeVisible({ timeout: 10_000 })
+  await panelChip.click()
   // A base layer row (cmap select) + the annotation add palette.
   await expect(editPanel.locator('[data-testid^="figcell-layer-cmap-"]').first()).toBeVisible()
   const panelId = await editPanel.locator('[data-testid^="figcell-panel-"]').first()

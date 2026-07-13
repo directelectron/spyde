@@ -171,6 +171,13 @@ async function openEditToolbar(page: any): Promise<{ cellId: string; panelId: st
   if (!(await page.getByTestId(`figcell-edit-${cellId}`).count())) await toggle.click()
   const editPanel = page.getByTestId(`figcell-edit-${cellId}`)
   await expect(editPanel).toBeVisible()
+  // The edit dock now opens in FIGURE-LEVEL view by default (selection UI); the
+  // per-panel block (`figcell-panel-<id>`) shows only when a panel is SELECTED.
+  // Click the first panel chip (a single-letter chip whose testid is
+  // `figcell-chip-p<id>`, distinct from the `figcell-chip-figure-<cell>` chip) so
+  // the panel controls appear, then read the panel id.
+  const panelChip = editPanel.locator('[data-testid^="figcell-chip-p"]').first()
+  if (await panelChip.count()) await panelChip.click()
   const panelId = await editPanel.locator('[data-testid^="figcell-panel-"]').first()
     .evaluate((el) => (el.getAttribute('data-testid') || '').replace('figcell-panel-', ''))
   return { cellId, panelId }

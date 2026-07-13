@@ -349,13 +349,33 @@ export interface RepfigPanel {
   insets?: Array<Record<string, unknown>>
 }
 
+/** A FIGURE-LEVEL annotation (distinct from a panel's `annotations`): a marker
+ *  in the anyplotlib figure-marker schema, positioned in FIGURE FRACTIONS
+ *  (0..1, top-left origin) — NO calibration. `kind` is text/circle/rect/arrow.
+ *  An `id` is assigned by the backend so a drag persists by id. */
+export interface RepfigFigAnnotation {
+  id?: string
+  kind: 'text' | 'circle' | 'rect' | 'arrow'
+  x: number
+  y: number
+  // per-kind position/size fields (fractions): text→text; circle→r; rect→w,h;
+  // arrow→u,v — plus optional color/fontsize/linewidth.
+  [k: string]: unknown
+}
+
 /** A report figure cell's full recipe (from `FigureSpec.to_dict()`) — shipped
  *  pixel-free in `report_state` so the edit toolbar can list panels/layers/
- *  annotations. */
+ *  annotations. `annotations` are FIGURE-level markers (figure fractions);
+ *  `layout.hspace`/`layout.wspace` are the inter-panel gaps. */
 export interface RepfigSpec {
-  layout: { kind: string; rows?: number; cols?: number; [k: string]: unknown }
+  layout: {
+    kind: string; rows?: number; cols?: number
+    hspace?: number; wspace?: number
+    [k: string]: unknown
+  }
   panels: RepfigPanel[]
   nav_context?: { indices?: number[] } | null
+  annotations?: RepfigFigAnnotation[]
 }
 
 /** One cell of the report document (markdown text or an embedded figure). */
@@ -421,6 +441,17 @@ export interface ReportExportedMessage extends MsgBase {
   kind: 'html-static' | 'html-interactive' | 'markdown-folder'
   path: string
   token?: string | null
+}
+
+/** A report figure cell's SELECTED panel changed (backend is the source of
+ *  truth: a click on the live figure, a dock chip, or a widget drag all funnel
+ *  through `ReportManager.select_panel`). `panel_id` is the SPEC panel id, or
+ *  null for figure-level (deselected). Re-broadcast as a `spyde:` CustomEvent so
+ *  the open editor for THIS cell mirrors it. */
+export interface ReportPanelSelectedMessage extends MsgBase {
+  type: 'report_panel_selected'
+  cell_id: string
+  panel_id: string | null
 }
 
 /**
@@ -575,6 +606,7 @@ export type PlotAppMessage =
   | ReportNeedSnapshotsMessage
   | ReportSavedMessage
   | ReportExportedMessage
+  | ReportPanelSelectedMessage
   | WizardEventMessage
   | LayersStateMessage
   | RepfigComposeOptionsMessage

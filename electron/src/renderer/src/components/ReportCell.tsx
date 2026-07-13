@@ -175,7 +175,7 @@ export function ReportCell({ cell, rawMode, onUpdate, onRemove, index, dragProps
           onChange={(e) => setDraft(e.target.value)}
           onBlur={() => { if (!rawMode) commit(); else if (draft !== (cell.source ?? '')) onUpdate(draft, renderMarkdown(draft)) }}
           onKeyDown={(e) => {
-            if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+            if (e.key === 'Enter' && (e.ctrlKey || e.metaKey || e.shiftKey)) {
               e.preventDefault()
               ;(e.target as HTMLTextAreaElement).blur()
             } else if (e.key === 'Escape' && !rawMode) {
