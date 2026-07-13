@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from spyde.actions.report import compose as cx
 from spyde.actions.report import handlers as h
 
 
@@ -38,6 +39,14 @@ def _signal_window_id(session):
         if not getattr(p, "is_navigator", False) and p.window_id is not None:
             return p.window_id
     return session._plots[0].window_id
+
+
+def _nav_window_id(session):
+    """The window id of the loaded navigator plot, or None."""
+    for p in session._plots:
+        if getattr(p, "is_navigator", False) and p.window_id is not None:
+            return p.window_id
+    return None
 
 
 def _prime_plot_data(session):
@@ -236,6 +245,132 @@ class TestReportFigures:
         messages.clear()
         h.report_refresh_figure(session, None, {"cell_id": cid})
         assert len(_report_figures(messages)) == 1
+
+
+# ── per-panel refresh (repfig_refresh_panel) ────────────────────────────────────
+
+
+class TestPanelRefresh:
+    def _two_panel_cell(self, session, messages):
+        """Build a 2-panel figure cell (signal panel p1 + a tiled-in navigator
+        panel) and return (cell_id, panel_ids_by_grid_pos)."""
+        sig_wid = _signal_window_id(session)
+        nav_wid = _nav_window_id(session)
+        h.report_new(session, None, {})
+        h.report_add_figure(session, None, {"source_window_id": sig_wid})
+        cid = [c for c in _last_state(messages)["cells"]
+               if c["cell_type"] == "figure"][0]["id"]
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "tile-right",
+                           "source_window_id": nav_wid})
+        return cid
+
+    def test_refresh_one_panel_updates_only_that_panel(self, stem_4d_dataset):
+        session = stem_4d_dataset["window"]
+        messages = stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        cid = self._two_panel_cell(session, messages)
+        mgr = session._report
+
+        cell = mgr.doc.cell_by_id(cid)
+        panels = list(cell.spec.panels)
+        assert len(panels) == 2
+        target_panel, other_panel = panels[0], panels[1]
+
+        # Snapshot arrays BEFORE refresh (by identity — untouched panel's array
+        # object must be the exact same one after the targeted refresh).
+        before_target = dict(mgr.snapshot_map(cid))
+        other_layer = other_panel.layers[0]
+        other_arr_before = before_target[(other_panel.id, other_layer.id)]
+
+        messages.clear()
+        h.repfig_refresh_panel(session, None,
+                               {"cell_id": cid, "panel_id": target_panel.id})
+
+        # A rebuild was emitted.
+        assert len(_report_figures(messages)) == 1
+
+        after = mgr.snapshot_map(cid)
+        # The OTHER panel's snapshot array is untouched (same object identity).
+        assert after[(other_panel.id, other_layer.id)] is other_arr_before
+        # The target panel's layer still has a valid ndarray snapshot.
+        target_layer = target_panel.layers[0]
+        assert isinstance(after[(target_panel.id, target_layer.id)], np.ndarray)
+
+    def test_refresh_unknown_panel_id_is_noop(self, tem_2d_dataset):
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        _prime_plot_data(session)
+        wid = _signal_window_id(session)
+        h.report_new(session, None, {})
+        h.report_add_figure(session, None, {"source_window_id": wid})
+        cid = [c for c in _last_state(messages)["cells"]
+               if c["cell_type"] == "figure"][0]["id"]
+        messages.clear()
+        # Should not crash and should not emit anything.
+        h.repfig_refresh_panel(session, None,
+                               {"cell_id": cid, "panel_id": "no-such-panel"})
+        assert _report_figures(messages) == []
+        assert _states(messages) == []
+
+    def test_refresh_unknown_cell_id_is_noop(self, window):
+        session = window["window"]
+        messages = window["messages"]
+        h.report_new(session, None, {})
+        messages.clear()
+        h.repfig_refresh_panel(session, None,
+                               {"cell_id": "no-such-cell", "panel_id": "p1"})
+        assert _report_figures(messages) == []
+        assert _states(messages) == []
+
+    def test_refresh_unresolvable_source_keeps_old_snapshot(self, tem_2d_dataset):
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        _prime_plot_data(session)
+        wid = _signal_window_id(session)
+        h.report_new(session, None, {})
+        h.report_add_figure(session, None, {"source_window_id": wid})
+        cid = [c for c in _last_state(messages)["cells"]
+               if c["cell_type"] == "figure"][0]["id"]
+        mgr = session._report
+        cell = mgr.doc.cell_by_id(cid)
+        panel = cell.spec.panels[0]
+        layer = panel.layers[0]
+        old_arr = mgr.snapshot_map(cid)[(panel.id, layer.id)]
+
+        # Sever the source binding so it can't resolve to a live plot.
+        layer.source.tree_uid = "does-not-exist"
+        layer.source.file_path = None
+        layer.source.tree_node = "no-such-tree"
+        layer.source.shape = [999999]
+
+        messages.clear()
+        h.repfig_refresh_panel(session, None,
+                               {"cell_id": cid, "panel_id": panel.id})
+
+        # No rebuild/state emitted (silent no-op) and the snapshot is unchanged.
+        assert _report_figures(messages) == []
+        assert _states(messages) == []
+        assert mgr.snapshot_map(cid)[(panel.id, layer.id)] is old_arr
+
+    def test_whole_figure_refresh_still_refreshes_every_panel(self, stem_4d_dataset):
+        """report_refresh_figure now delegates to the same per-panel helper for
+        EVERY panel — a composed multi-panel cell keeps its panel count/layout
+        (unlike the old single-panel-collapsing behaviour)."""
+        session = stem_4d_dataset["window"]
+        messages = stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        cid = self._two_panel_cell(session, messages)
+        mgr = session._report
+        cell = mgr.doc.cell_by_id(cid)
+        assert len(cell.spec.panels) == 2
+
+        messages.clear()
+        h.report_refresh_figure(session, None, {"cell_id": cid})
+
+        assert len(_report_figures(messages)) == 1
+        cell_after = mgr.doc.cell_by_id(cid)
+        assert len(cell_after.spec.panels) == 2
 
 
 # ── save flow (headless fallback baking) ───────────────────────────────────────

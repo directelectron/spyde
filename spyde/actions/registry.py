@@ -96,6 +96,7 @@ STAGED_HANDLERS: dict[str, str] = {
     "report_set_title":        "spyde.actions.report.handlers.report_set_title",
     "report_add_figure":       "spyde.actions.report.handlers.report_add_figure",
     "report_refresh_figure":   "spyde.actions.report.handlers.report_refresh_figure",
+    "repfig_refresh_panel":    "spyde.actions.report.handlers.repfig_refresh_panel",
     "report_snapshots":        "spyde.actions.report.handlers.report_snapshots",
     "report_cell_from_window": "spyde.actions.report.handlers.report_cell_from_window",
     # Report Builder Phase 3 — export + copy/paste (spyde/actions/report/export_html.py)
@@ -115,6 +116,7 @@ STAGED_HANDLERS: dict[str, str] = {
     # Selection-driven edit + figure-level layout / annotations.
     "repfig_select_panel":     "spyde.actions.report.compose.repfig_select_panel",
     "repfig_set_layout":       "spyde.actions.report.compose.repfig_set_layout",
+    "repfig_apply_layout_preset": "spyde.actions.report.compose.repfig_apply_layout_preset",
     "repfig_add_fig_annotation": "spyde.actions.report.compose.repfig_add_fig_annotation",
     "repfig_update_fig_annotation": "spyde.actions.report.compose.repfig_update_fig_annotation",
     "repfig_remove_fig_annotation": "spyde.actions.report.compose.repfig_remove_fig_annotation",

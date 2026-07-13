@@ -173,6 +173,18 @@ def _rebuild_and_emit(mgr, cell) -> None:
     mgr.emit_state()
 
 
+def _emit_fig_markers_or_rebuild(mgr, cell) -> None:
+    """Persist a FIGURE-LEVEL annotation change with the LEAST disruption: try an
+    in-place ``fig.set_figure_markers`` on the live figure (targeted redraw, no
+    iframe reload); if there's no live figure, fall back to a full rebuild. Either
+    way, flag dirty + emit the authoritative state so the renderer mirror updates."""
+    mgr.dirty = True
+    if mgr.push_fig_markers(cell):
+        mgr.emit_state()
+    else:
+        _rebuild_and_emit(mgr, cell)
+
+
 # ── query: which compose modes are compatible for this drop ───────────────────
 
 
@@ -265,13 +277,28 @@ def repfig_compose(session, plot, payload) -> None:
 
 def _compose_overlay(mgr, cell, src_panel, src_map, target_panel_id=None) -> None:
     """Append the source's base layer to the TARGET panel as an overlay layer
-    (distinct cmap, alpha 0.5)."""
+    (distinct cmap, alpha 0.5).
+
+    Refuses (no-op + ``emit_error``) when the source frame's shape doesn't match
+    the target panel's existing base shape — the popover's query-time gate
+    (``repfig_query_compose``) keeps the UI from OFFERING overlay in that case,
+    but ``mode`` is caller-supplied, so the execute path re-checks independently
+    (a stale popover click, a race, or a hand-built payload must not be able to
+    smuggle a mismatched layer into the FigureSpec — anyplotlib layers require
+    matching shapes; see ``Plot._set_array``'s shape-change layer-drop guard)."""
     target_panel = _target_panel(cell, target_panel_id)
     if target_panel is None:
         return
     src_base = src_panel.layers[0]
     src_arr = src_map.get((src_panel.id, src_base.id))
     if src_arr is None:
+        return
+    base_shape = _target_base_shape(mgr, cell, target_panel_id)
+    src_shape = tuple(np.asarray(src_arr).shape[:2])
+    if base_shape is not None and base_shape != src_shape:
+        ipc.emit_error(
+            f"repfig_compose: overlay needs matching image sizes: "
+            f"{src_shape} vs {base_shape}.")
         return
     n_over = len(target_panel.layers)   # base is [0]; overlays start at 1
     cmap = _OVERLAY_CMAP_CYCLE[(n_over - 1) % len(_OVERLAY_CMAP_CYCLE)]
@@ -632,6 +659,7 @@ def _finalize_edit(mgr, cell) -> None:
         mgr._snapshots.pop(cell.id, None)
         mgr._editing.discard(cell.id)
         mgr._edit_wiring.pop(cell.id, None)
+        mgr._ann_widgets.pop(cell.id, None)
         mgr._selected.pop(cell.id, None)
         cell.spec = None
         cell.placeholder = True
@@ -658,8 +686,77 @@ def repfig_add_annotation(session, plot, payload) -> None:
     _rebuild_and_emit(mgr, cell)
 
 
+# The widget kinds an in-place ``widget.set`` update supports (mirrors
+# figure_builder._WIDGET_KINDS — ellipse/line have no draggable widget, so an
+# edit to them always rebuilds).
+_INPLACE_WIDGET_KINDS = {"text", "circle", "rect", "arrow"}
+
+
+def _spec_ann_to_widget_fields(ann: dict, axes) -> "dict | None":
+    """Map a PANEL annotation dict (DATA coords, spec schema) → the anyplotlib
+    edit-WIDGET field schema (image PIXELS), the SAME forward mapping
+    ``figure_builder._add_annotation_widget`` applies at build time. Returns the
+    widget-attr dict to push via ``widget.set(...)`` (color/text/fontsize +
+    geometry), or None if the kind has no widget / the geometry can't be read.
+
+    Field mapping (spec → widget), post data→px conversion:
+      * text   → ``x, y`` (offset), ``text`` (texts[0]), ``fontsize``, ``color``
+      * circle → ``cx, cy`` (offset), ``r`` (radius), ``color`` (edgecolors)
+      * rect   → ``x, y`` (offset - size/2 → TOP-LEFT), ``w, h``, ``color``
+      * arrow  → ``x, y`` (tail offset), ``u, v`` (U/V), ``color`` (edgecolors)"""
+    from spyde.actions.report import coords
+    from spyde.actions.report.figure_builder import (
+        _first_offset, _scalar0, _first_color,
+    )
+
+    kind = str(ann.get("kind", "")).lower()
+    if kind not in _INPLACE_WIDGET_KINDS:
+        return None
+    conv = coords.annotation_data_to_pixel(ann, axes)
+    pt = _first_offset(conv.get("offsets"))
+    if pt is None:
+        return None
+    cx, cy = pt
+    if kind == "text":
+        texts = conv.get("texts")
+        text = str(texts[0]) if isinstance(texts, (list, tuple)) and texts \
+            else str(conv.get("text", "Label"))
+        return {"x": cx, "y": cy, "text": text,
+                "fontsize": int(conv.get("fontsize", 14) or 14),
+                "color": _first_color(conv.get("color"), "#00e5ff")}
+    if kind == "circle":
+        r = _scalar0(conv.get("radius"))
+        if r is None:
+            return None
+        return {"cx": cx, "cy": cy, "r": float(r),
+                "color": _first_color(conv.get("edgecolors"), "#00e5ff")}
+    if kind == "rect":
+        w = _scalar0(conv.get("widths"))
+        hh = _scalar0(conv.get("heights"))
+        if w is None or hh is None:
+            return None
+        # spec offset is the CENTER; widget x/y is the TOP-LEFT.
+        return {"x": cx - float(w) / 2.0, "y": cy - float(hh) / 2.0,
+                "w": float(w), "h": float(hh),
+                "color": _first_color(conv.get("edgecolors"), "#00e5ff")}
+    if kind == "arrow":
+        u = _scalar0(conv.get("U"))
+        v = _scalar0(conv.get("V"))
+        if u is None or v is None:
+            return None
+        return {"x": cx, "y": cy, "u": float(u), "v": float(v),
+                "color": _first_color(conv.get("edgecolors"), "#00e5ff")}
+    return None
+
+
 def repfig_update_annotation(session, plot, payload) -> None:
-    """Replace the annotation at ``index`` on a panel."""
+    """Replace the annotation at ``index`` on a panel.
+
+    Fast path (NO figure rebuild → no iframe flash): when the cell is in EDIT MODE,
+    the KIND is unchanged (color/text/fontsize/geometry edit only), and a live edit
+    widget exists for this annotation, push the changed fields onto that widget via
+    ``widget.set(...)`` — a targeted JS merge + redraw. Otherwise (not editing /
+    kind changed / widget missing) fall back to the full rebuild."""
     mgr = _manager(session)
     cell = _cell(mgr, payload.get("cell_id"))
     if cell is None or cell.spec is None:
@@ -675,9 +772,25 @@ def repfig_update_annotation(session, plot, payload) -> None:
         i = int(idx)
     except (TypeError, ValueError):
         return
-    if 0 <= i < len(panel.annotations):
-        panel.annotations[i] = dict(ann)
-        _rebuild_and_emit(mgr, cell)
+    if not (0 <= i < len(panel.annotations)):
+        return
+    prev = panel.annotations[i]
+    new_ann = dict(ann)
+    panel.annotations[i] = new_ann
+
+    # In-place update ONLY when editing, the kind is unchanged, and a live widget
+    # exists + accepts the pushed fields. A kind change (or a non-widget kind, or a
+    # missing widget) restructures the overlay → full rebuild.
+    same_kind = str(prev.get("kind", "")) == str(new_ann.get("kind", ""))
+    if cell.id in mgr._editing and same_kind:
+        fields = _spec_ann_to_widget_fields(new_ann, panel.axes)
+        if fields is not None and mgr.push_ann_widget(cell.id, panel.id, i, fields):
+            # Widget updated live (no rebuild) — just persist + emit state.
+            mgr.dirty = True
+            mgr.emit_state()
+            return
+    # Fallback: not editing / kind changed / widget not found → rebuild.
+    _rebuild_and_emit(mgr, cell)
 
 
 def repfig_remove_annotation(session, plot, payload) -> None:
@@ -772,6 +885,62 @@ def repfig_set_layout(session, plot, payload) -> None:
     _rebuild_and_emit(mgr, cell)
 
 
+_LAYOUT_PRESETS = ("row", "column", "grid")
+
+
+def repfig_apply_layout_preset(session, plot, payload) -> None:
+    """Reassign ``grid_pos`` for every GRID panel (inset-referenced panels are
+    excluded — see :func:`_grid_panels`) to one of three presets, in the
+    panels' CURRENT visual order (sorted by ``(row, col)`` first):
+
+    * ``row``    — 1 × N (all panels in a single row)
+    * ``column`` — N × 1 (all panels in a single column)
+    * ``grid``   — 2 columns, ``ceil(N/2)`` rows, filled row-major
+
+    ``{cell_id, preset}``. Updates ``spec.layout`` rows/cols (preserving
+    ``hspace``/``wspace`` when present) and rebuilds + re-emits. An unknown
+    preset (or a cell/spec that can't be resolved) emits an error and makes NO
+    change."""
+    mgr = _manager(session)
+    cell = _cell(mgr, payload.get("cell_id"))
+    if cell is None or cell.spec is None:
+        ipc.emit_error("repfig_apply_layout_preset: figure cell not found.")
+        return
+    preset = str(payload.get("preset", "")).lower()
+    if preset not in _LAYOUT_PRESETS:
+        ipc.emit_error(f"repfig_apply_layout_preset: unknown preset {preset!r}.")
+        return
+
+    grid_panels = _grid_panels(cell.spec)
+    if not grid_panels:
+        return
+    ordered = sorted(grid_panels, key=lambda p: (int(p.grid_pos[0]), int(p.grid_pos[1])))
+    n = len(ordered)
+
+    if preset == "row":
+        rows, cols = 1, n
+        for i, p in enumerate(ordered):
+            p.grid_pos = [0, i]
+    elif preset == "column":
+        rows, cols = n, 1
+        for i, p in enumerate(ordered):
+            p.grid_pos = [i, 0]
+    else:   # grid — 2 columns, ceil(N/2) rows, row-major
+        cols = 2
+        rows = (n + cols - 1) // cols
+        for i, p in enumerate(ordered):
+            p.grid_pos = [i // cols, i % cols]
+
+    layout = dict(cell.spec.layout or {"kind": "single"})
+    layout["kind"] = "grid"
+    layout["rows"] = rows
+    layout["cols"] = cols
+    # hspace/wspace (if the caller previously set them) are preserved as-is —
+    # nothing above touches those keys.
+    cell.spec.layout = layout
+    _rebuild_and_emit(mgr, cell)
+
+
 def _valid_fig_annotation(ann) -> bool:
     """A figure-level annotation is a dict whose ``kind`` is one anyplotlib's
     figure-marker layer accepts (text/circle/rect/arrow). Positions are FIGURE
@@ -798,7 +967,7 @@ def repfig_add_fig_annotation(session, plot, payload) -> None:
     if not ann.get("id"):
         ann["id"] = _uuid.uuid4().hex[:8]
     cell.spec.annotations.append(ann)
-    _rebuild_and_emit(mgr, cell)
+    _emit_fig_markers_or_rebuild(mgr, cell)
 
 
 def repfig_update_fig_annotation(session, plot, payload) -> None:
@@ -823,7 +992,7 @@ def repfig_update_fig_annotation(session, plot, payload) -> None:
         if not new.get("id"):
             new["id"] = anns[i].get("id")
         anns[i] = new
-        _rebuild_and_emit(mgr, cell)
+        _emit_fig_markers_or_rebuild(mgr, cell)
 
 
 def repfig_remove_fig_annotation(session, plot, payload) -> None:
@@ -840,4 +1009,4 @@ def repfig_remove_fig_annotation(session, plot, payload) -> None:
     anns = cell.spec.annotations
     if 0 <= i < len(anns):
         del anns[i]
-        _rebuild_and_emit(mgr, cell)
+        _emit_fig_markers_or_rebuild(mgr, cell)

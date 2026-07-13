@@ -1,9 +1,10 @@
 """test_report_edit_mode.py — Report Builder draggable-annotation EDIT MODE.
 
 Edit mode renders a figure cell's annotations as draggable anyplotlib WIDGETS
-(``show_handles=False``) instead of static markers; dragging one and releasing
-(``pointer_up``) persists the new geometry back into ``PanelSpec.annotations`` in
-DATA coords WITHOUT rebuilding the iframe (the widget already moved JS-side).
+(shape widgets show resize handles; the label is handle-free) instead of static
+markers; dragging/resizing one and releasing (``pointer_up``) persists the new
+geometry back into ``PanelSpec.annotations`` in DATA coords WITHOUT rebuilding the
+iframe (the widget already moved JS-side).
 
 Covered (against a real Qt-free ``Session`` + ``captured_messages``):
   1. Toggle edit ON → the rebuilt figure's panel plots carry widgets matching the
@@ -152,8 +153,13 @@ class TestEditModeToggle:
         assert kinds == ["circle", "label"]   # text → label widget
         assert _markers(p2, "texts") == []
         assert _markers(p2, "circles") == []
-        # Handles are hidden on a finished annotation.
-        assert all(x.get("show_handles") is False for x in w)
+        # SHAPE widgets (circle) show resize handles — the nodes ARE the resize
+        # affordance; the LABEL keeps handles hidden (reposition-only, no resize
+        # DOF → a bare anchor dot would just clutter the text).
+        circle = next(x for x in w if x._type == "circle")
+        label0 = next(x for x in w if x._type == "label")
+        assert circle.get("show_handles") is True
+        assert label0.get("show_handles") is False
         # Widget geometry is the pixel-converted center (data 6 → index 63.5).
         label = next(x for x in w if x._type == "label")
         assert abs(label.get("x") - 63.5) < 0.6
@@ -293,6 +299,110 @@ class TestGeometryRoundTrip:
         assert abs(panel.annotations[0]["U"][0] - 15.0 * _STEP) < 1e-6
         assert abs(panel.annotations[0]["V"][0] - (-12.0 * _STEP)) < 1e-6
         assert panel.annotations[0]["V"][0] < 0
+
+
+# ── 3b. RESIZE (not just move) persistence ──────────────────────────────────────
+#
+# Edit-mode widgets now show resize NODES; a resize emits the same pointer_up with
+# the widget's FINAL geometry, so the drag-persist path must write the resized
+# radius / size / arrow-vector — not merely a translated offset.
+
+
+class TestResizePersistence:
+    def test_circle_radius_resize_persists_data_radius(self, tem_2d_dataset):
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        ann = [{"kind": "circle", "offsets": [[6.0, 6.0]], "radius": _STEP * 5.0,
+                "edgecolors": "#ff9800"}]
+        mgr, cid, panel = _make_calibrated_cell(session, messages, annotations=ann)
+        cx.repfig_set_edit_mode(session, None, {"cell_id": cid, "editing": True})
+        fig = _cell_figure(mgr, cid)
+        p2 = _first_plot(fig)
+        widget = _widgets(p2)[0]
+
+        messages.clear()
+        # Pure radius grow: the east-edge node dragged out → r 5px → 22px, center
+        # UNCHANGED (cx/cy identical to the built position, index 63.5).
+        _dispatch_up(fig, p2, widget, {"cx": 63.5, "cy": 63.5, "r": 22.0})
+        # Center in data coords is unchanged (6 nm); radius is the NEW 22px * step.
+        off = panel.annotations[0]["offsets"][0]
+        assert abs(off[0] - 6.0) < 1e-6 and abs(off[1] - 6.0) < 1e-6
+        assert abs(panel.annotations[0]["radius"] - 22.0 * _STEP) < 1e-6
+        assert _report_figures(messages) == []   # no rebuild
+
+    def test_rect_corner_resize_persists_center_and_size(self, tem_2d_dataset):
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        # data-coord rect: center (6,6), width step*40, height step*20 → px built
+        # top-left (43.5, 53.5), w40 h20.
+        ann = [{"kind": "rect", "offsets": [[6.0, 6.0]],
+                "widths": [_STEP * 40.0], "heights": [_STEP * 20.0],
+                "edgecolors": "#ff9800"}]
+        mgr, cid, panel = _make_calibrated_cell(session, messages, annotations=ann)
+        cx.repfig_set_edit_mode(session, None, {"cell_id": cid, "editing": True})
+        fig = _cell_figure(mgr, cid)
+        p2 = _first_plot(fig)
+        widget = _widgets(p2)[0]
+
+        messages.clear()
+        # Anchor the TOP-LEFT corner (43.5, 53.5) and drag the BOTTOM-RIGHT out:
+        # new size 80x50 px (anyplotlib's opposite-corner anchor keeps x/y fixed).
+        _dispatch_up(fig, p2, widget,
+                     {"x": 43.5, "y": 53.5, "w": 80.0, "h": 50.0})
+        # New CENTER = top-left + size/2 = (43.5+40, 53.5+25) px = (83.5, 78.5).
+        off = panel.annotations[0]["offsets"][0]
+        assert abs(off[0] - 83.5 * _STEP) < 1e-6
+        assert abs(off[1] - 78.5 * _STEP) < 1e-6
+        # BOTH width AND height grew (a resize, not a move).
+        assert abs(panel.annotations[0]["widths"][0] - 80.0 * _STEP) < 1e-6
+        assert abs(panel.annotations[0]["heights"][0] - 50.0 * _STEP) < 1e-6
+        assert _report_figures(messages) == []
+
+    def test_arrow_tail_reshape_keeps_head_fixed(self, tem_2d_dataset):
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        # data arrow: tail (4,4), U/V = step*10 / step*8 → head data (4+step*10,
+        # 4+step*8). px: tail 4/step, u=10, v=8 → head px (4/step+10, 4/step+8).
+        ann = [{"kind": "arrow", "offsets": [[4.0, 4.0]],
+                "U": [_STEP * 10.0], "V": [_STEP * 8.0], "edgecolors": "#ff9800"}]
+        mgr, cid, panel = _make_calibrated_cell(session, messages, annotations=ann)
+        cx.repfig_set_edit_mode(session, None, {"cell_id": cid, "editing": True})
+        fig = _cell_figure(mgr, cid)
+        p2 = _first_plot(fig)
+        widget = _widgets(p2)[0]
+
+        tail_px = 4.0 / _STEP
+        head_px_x = tail_px + 10.0
+        head_px_y = tail_px + 8.0
+        # anyplotlib's tail reshape: tail moves to the cursor, HEAD STAYS — it emits
+        # x,y = new tail px and u,v = (head - new tail) so head px is invariant.
+        # Move the tail to (tail+15, tail-6) px; the widget re-solves u,v to keep
+        # the head at (head_px_x, head_px_y).
+        new_tail_x = tail_px + 15.0
+        new_tail_y = tail_px - 6.0
+        new_u = head_px_x - new_tail_x
+        new_v = head_px_y - new_tail_y
+
+        messages.clear()
+        _dispatch_up(fig, p2, widget,
+                     {"x": new_tail_x, "y": new_tail_y, "u": new_u, "v": new_v})
+        # Tail offset moved (in data coords).
+        off = panel.annotations[0]["offsets"][0]
+        assert abs(off[0] - new_tail_x * _STEP) < 1e-6
+        assert abs(off[1] - new_tail_y * _STEP) < 1e-6
+        # U/V CHANGED from the originals.
+        U = panel.annotations[0]["U"][0]
+        V = panel.annotations[0]["V"][0]
+        assert abs(U - new_u * _STEP) < 1e-6
+        assert abs(V - new_v * _STEP) < 1e-6
+        assert U != _STEP * 10.0 and V != _STEP * 8.0
+        # THE HEAD (offset + U, offset + V) in DATA coords is UNCHANGED — the tail
+        # reshape must pivot about a fixed head.
+        head_x = off[0] + U
+        head_y = off[1] + V
+        assert abs(head_x - head_px_x * _STEP) < 1e-6
+        assert abs(head_y - head_px_y * _STEP) < 1e-6
+        assert _report_figures(messages) == []
 
 
 # ── 4. guards ───────────────────────────────────────────────────────────────────
@@ -622,3 +732,224 @@ class TestLayoutAndFigureAnnotationActions:
         cx.repfig_add_fig_annotation(session, None, {
             "cell_id": cid, "annotation": {"kind": "polygon", "x": 0.5, "y": 0.5}})
         assert spec.annotations == []
+
+
+# ── 10. panel drag-swap (figure-level event → grid_pos swap + rebuild) ──────────
+
+
+def _make_two_panel_cell(session, messages):
+    """A 2-panel (1×2 grid) figure cell in EDIT MODE. Builds a single-panel cell
+    then tile-rights a navigator into it. Returns (mgr, cell_id, fig)."""
+    _prime_plot_data(session)
+    sig_wid = _signal_wid(session)
+    nav_wid = None
+    for p in session._plots:
+        if getattr(p, "is_navigator", False) and p.window_id is not None:
+            nav_wid = p.window_id
+            break
+    h.report_new(session, None, {})
+    h.report_add_figure(session, None, {"source_window_id": sig_wid, "caption": "F"})
+    st = _last_state(messages)
+    cid = [c for c in st["cells"] if c["cell_type"] == "figure"][-1]["id"]
+    src = nav_wid if nav_wid is not None else sig_wid
+    cx.repfig_compose(session, None,
+                      {"cell_id": cid, "mode": "tile-right", "source_window_id": src})
+    mgr = session._report
+    cx.repfig_set_edit_mode(session, None, {"cell_id": cid, "editing": True})
+    return mgr, cid, _cell_figure(mgr, cid)
+
+
+def _dispatch_panel_swap(fig, src_disp, tgt_disp):
+    fig._dispatch_event(json.dumps({
+        "panel_id": "", "event_type": "pointer_up", "panel_swap": True,
+        "source_panel_id": src_disp, "target_panel_id": tgt_disp,
+    }))
+
+
+class TestPanelSwap:
+    def test_swap_exchanges_grid_pos_and_rebuilds(self, stem_4d_dataset):
+        session = stem_4d_dataset["window"]
+        messages = stem_4d_dataset["messages"]
+        mgr, cid, fig = _make_two_panel_cell(session, messages)
+        spec = mgr.doc.cell_by_id(cid).spec
+        assert len(spec.panels) == 2
+        pmap = dict(fig._report_panel_map)   # spec_pid → dispatch id
+        # The two panels' spec ids and their current grid positions.
+        pos_before = {p.id: list(p.grid_pos) for p in spec.panels}
+        (pid_a, disp_a), (pid_b, disp_b) = list(pmap.items())[:2]
+        assert pos_before[pid_a] != pos_before[pid_b]
+
+        messages.clear()
+        _dispatch_panel_swap(fig, disp_a, disp_b)
+
+        # grid_pos EXCHANGED between the two panels.
+        panel_a = next(p for p in spec.panels if p.id == pid_a)
+        panel_b = next(p for p in spec.panels if p.id == pid_b)
+        assert panel_a.grid_pos == pos_before[pid_b]
+        assert panel_b.grid_pos == pos_before[pid_a]
+        assert mgr.dirty is True
+        # A rebuild WAS emitted (unlike the no-rebuild annotation-drag path).
+        assert _report_figures(messages), "panel swap must rebuild the figure"
+
+    def test_swap_same_panel_is_noop(self, stem_4d_dataset):
+        session = stem_4d_dataset["window"]
+        messages = stem_4d_dataset["messages"]
+        mgr, cid, fig = _make_two_panel_cell(session, messages)
+        spec = mgr.doc.cell_by_id(cid).spec
+        pmap = dict(fig._report_panel_map)
+        disp_a = next(iter(pmap.values()))
+        pos_before = {p.id: list(p.grid_pos) for p in spec.panels}
+        messages.clear()
+        mgr.dirty = False
+        _dispatch_panel_swap(fig, disp_a, disp_a)   # same → no-op
+        assert {p.id: list(p.grid_pos) for p in spec.panels} == pos_before
+        assert mgr.dirty is False
+        assert _report_figures(messages) == []
+
+    def test_swap_unknown_dispatch_id_is_noop(self, stem_4d_dataset):
+        session = stem_4d_dataset["window"]
+        messages = stem_4d_dataset["messages"]
+        mgr, cid, fig = _make_two_panel_cell(session, messages)
+        spec = mgr.doc.cell_by_id(cid).spec
+        pmap = dict(fig._report_panel_map)
+        disp_a = next(iter(pmap.values()))
+        pos_before = {p.id: list(p.grid_pos) for p in spec.panels}
+        messages.clear()
+        mgr.dirty = False
+        _dispatch_panel_swap(fig, disp_a, 999999)   # target not a panel
+        assert {p.id: list(p.grid_pos) for p in spec.panels} == pos_before
+        assert mgr.dirty is False
+        assert _report_figures(messages) == []
+
+
+# ── 11. in-place updates skip the figure rebuild (no iframe flash) ──────────────
+
+
+class TestFigAnnotationInPlaceUpdate:
+    """Figure-level annotation add/update/remove push fig.set_figure_markers on the
+    LIVE figure instead of rebuilding — a report_state is emitted, but NO new figure
+    build message (so the iframe never reloads / flashes)."""
+
+    def test_update_fig_annotation_no_rebuild(self, tem_2d_dataset):
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        mgr, cid, _panel = _make_calibrated_cell(session, messages)
+        cx.repfig_add_fig_annotation(session, None, {
+            "cell_id": cid,
+            "annotation": {"kind": "circle", "x": 0.5, "y": 0.5, "r": 0.1,
+                           "color": "#ff9800"}})
+        fig = _cell_figure(mgr, cid)
+        messages.clear()
+        mgr.dirty = False
+
+        # Update the color → in-place set_figure_markers, no rebuild.
+        cx.repfig_update_fig_annotation(session, None, {
+            "cell_id": cid, "index": 0,
+            "annotation": {"kind": "circle", "x": 0.5, "y": 0.5, "r": 0.1,
+                           "color": "#00b0ff"}})
+        assert len(_states(messages)) >= 1
+        assert _report_figures(messages) == []
+        assert mgr.dirty is True
+        # The LIVE figure's marker layer reflects the new color.
+        assert fig.figure_markers[0]["color"] == "#00b0ff"
+
+    def test_add_and_remove_fig_annotation_no_rebuild(self, tem_2d_dataset):
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        mgr, cid, _panel = _make_calibrated_cell(session, messages)
+        fig = _cell_figure(mgr, cid)
+        messages.clear()
+        cx.repfig_add_fig_annotation(session, None, {
+            "cell_id": cid, "annotation": {"kind": "text", "x": 0.3, "y": 0.3,
+                                           "text": "hi"}})
+        assert _report_figures(messages) == []          # no rebuild on add
+        assert [m["kind"] for m in fig.figure_markers] == ["text"]
+        messages.clear()
+        cx.repfig_remove_fig_annotation(session, None, {"cell_id": cid, "index": 0})
+        assert _report_figures(messages) == []          # no rebuild on remove
+        assert fig.figure_markers == []
+
+
+class TestPanelAnnotationInPlaceUpdate:
+    """A panel-annotation edit (color/text/geometry) WHILE in edit mode pushes
+    widget.set on the matching live widget — report_state but NO figure rebuild, and
+    the live widget's _data carries the new value. A NON-edit-mode edit rebuilds."""
+
+    def test_edit_mode_color_update_no_rebuild(self, tem_2d_dataset):
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        ann = [{"kind": "circle", "offsets": [[6.0, 6.0]], "radius": _STEP * 5.0,
+                "edgecolors": "#ff9800", "linewidths": 1.5}]
+        mgr, cid, panel = _make_calibrated_cell(session, messages, annotations=ann)
+        cx.repfig_set_edit_mode(session, None, {"cell_id": cid, "editing": True})
+        fig = _cell_figure(mgr, cid)
+        p2 = _first_plot(fig)
+        widget = _widgets(p2)[0]
+
+        messages.clear()
+        mgr.dirty = False
+        # Change ONLY the color — an in-place widget.set, no rebuild.
+        new_ann = dict(ann[0])
+        new_ann["edgecolors"] = "#00b0ff"
+        cx.repfig_update_annotation(session, None, {
+            "cell_id": cid, "panel_id": panel.id, "index": 0, "annotation": new_ann})
+
+        # Spec updated, state emitted, NO figure rebuild.
+        assert panel.annotations[0]["edgecolors"] == "#00b0ff"
+        assert len(_states(messages)) >= 1
+        assert _report_figures(messages) == []
+        assert mgr.dirty is True
+        # The LIVE widget's _data reflects the new color (mapped edgecolors→color).
+        assert widget.get("color") == "#00b0ff"
+
+    def test_edit_mode_text_update_no_rebuild(self, tem_2d_dataset):
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        ann = [{"kind": "text", "offsets": [[6.0, 6.0]], "texts": ["hi"],
+                "color": "#ff9800", "fontsize": 12}]
+        mgr, cid, panel = _make_calibrated_cell(session, messages, annotations=ann)
+        cx.repfig_set_edit_mode(session, None, {"cell_id": cid, "editing": True})
+        fig = _cell_figure(mgr, cid)
+        p2 = _first_plot(fig)
+        widget = _widgets(p2)[0]
+
+        messages.clear()
+        new_ann = dict(ann[0])
+        new_ann["texts"] = ["updated"]
+        cx.repfig_update_annotation(session, None, {
+            "cell_id": cid, "panel_id": panel.id, "index": 0, "annotation": new_ann})
+        assert panel.annotations[0]["texts"] == ["updated"]
+        assert _report_figures(messages) == []
+        assert widget.get("text") == "updated"
+
+    def test_non_edit_mode_update_rebuilds(self, tem_2d_dataset):
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        ann = [{"kind": "circle", "offsets": [[6.0, 6.0]], "radius": _STEP * 5.0,
+                "edgecolors": "#ff9800"}]
+        mgr, cid, panel = _make_calibrated_cell(session, messages, annotations=ann)
+        # NOT in edit mode → the update takes the rebuild path.
+        messages.clear()
+        new_ann = dict(ann[0])
+        new_ann["edgecolors"] = "#00b0ff"
+        cx.repfig_update_annotation(session, None, {
+            "cell_id": cid, "panel_id": panel.id, "index": 0, "annotation": new_ann})
+        assert panel.annotations[0]["edgecolors"] == "#00b0ff"
+        assert _report_figures(messages), "non-edit update must rebuild the figure"
+
+    def test_kind_change_rebuilds_even_in_edit_mode(self, tem_2d_dataset):
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        ann = [{"kind": "circle", "offsets": [[6.0, 6.0]], "radius": _STEP * 5.0,
+                "edgecolors": "#ff9800"}]
+        mgr, cid, panel = _make_calibrated_cell(session, messages, annotations=ann)
+        cx.repfig_set_edit_mode(session, None, {"cell_id": cid, "editing": True})
+        messages.clear()
+        # Circle → rect: a kind change restructures the overlay → must rebuild.
+        cx.repfig_update_annotation(session, None, {
+            "cell_id": cid, "panel_id": panel.id, "index": 0,
+            "annotation": {"kind": "rect", "offsets": [[6.0, 6.0]],
+                           "widths": [_STEP * 8.0], "heights": [_STEP * 8.0],
+                           "edgecolors": "#ff9800"}})
+        assert panel.annotations[0]["kind"] == "rect"
+        assert _report_figures(messages), "kind change must rebuild"

@@ -125,8 +125,9 @@ def _apply_annotations(p2, annotations, axes=None, *, interactive=False,
     passthrough (an uncalibrated panel already has index == pixel).
 
     ``interactive=True`` (edit mode) renders every ``text/circle/rect/arrow``
-    annotation as a draggable anyplotlib WIDGET (``show_handles=False``) instead
-    of a static marker, and RETURNS a wiring list
+    annotation as a draggable anyplotlib WIDGET (shape widgets carry visible
+    resize handles; the label is handle-free — see ``_add_annotation_widget``)
+    instead of a static marker, and RETURNS a wiring list
     ``[(widget, panel_id, ann_index, panel_spec)]`` so the caller can attach a
     ``pointer_up`` drag-persist handler to each. Non-widget kinds (ellipse/line)
     still render as static markers. ``interactive=False`` returns ``[]``."""
@@ -200,8 +201,21 @@ def _add_annotation_widget(p2, kind, conv):
                  is the CENTER + widths/heights; the widget x/y is the TOP-LEFT, so
                  ``x = cx - w/2``, ``y = cy - h/2``.
       * arrow  → ``add_arrow_widget(x, y, u, v, color)`` (offset = tail, U/V = vector)
-    All widgets are added with ``show_handles=False`` (clean finished-annotation
-    look; drag still works)."""
+
+    SHAPE widgets (circle/rect/arrow) are added with ``show_handles=True`` so the
+    resize NODES are visible — they ARE the resize affordance (circle: center=move,
+    east-edge=resize radius; rect: 4 corners resize with opposite-corner anchor;
+    arrow: tail=reshape-tail, head=reshape-head, shaft=move). The LABEL widget keeps
+    ``show_handles=False``: its only node is a plain anchor dot (a label has no
+    resize DOF — it's reposition-only), so the dot is pure clutter over the text.
+
+    KNOWN EXPORT CAVEAT: anyplotlib's ``drawOverlay2d`` draws these handle dots on the
+    overlay canvas whenever ``show_handles`` is truthy, and ``exportPNG`` with
+    ``includeWidgets:true`` blits that canvas verbatim (NO handle-suppression, unlike
+    the figure-marker layer's ``forceNoHandles`` export path). So a PNG harvested from
+    a cell WHILE it is in edit mode will bake the handle dots in. The HTML/standalone
+    export is unaffected (it rebuilds NON-interactive → static markers, never widgets).
+    See the SpyDE report-edit report for the flagged anyplotlib follow-up."""
     pt = _first_offset(conv.get("offsets"))
     if pt is None:
         return None
@@ -220,7 +234,7 @@ def _add_annotation_widget(p2, kind, conv):
             return None
         color = _first_color(conv.get("edgecolors"), "#00e5ff")
         return p2.add_circle_widget(cx=cx, cy=cy, r=float(r), color=color,
-                                    show_handles=False)
+                                    show_handles=True)
     if kind == "rect":
         w = _scalar0(conv.get("widths"))
         hh = _scalar0(conv.get("heights"))
@@ -230,7 +244,7 @@ def _add_annotation_widget(p2, kind, conv):
         # spec rect offset is the CENTER; widget x/y is the TOP-LEFT.
         return p2.add_rectangle_widget(x=cx - float(w) / 2.0, y=cy - float(hh) / 2.0,
                                        w=float(w), h=float(hh), color=color,
-                                       show_handles=False)
+                                       show_handles=True)
     if kind == "arrow":
         u = _scalar0(conv.get("U"))
         v = _scalar0(conv.get("V"))
@@ -238,7 +252,7 @@ def _add_annotation_widget(p2, kind, conv):
             return None
         color = _first_color(conv.get("edgecolors"), "#00e5ff")
         return p2.add_arrow_widget(x=cx, y=cy, u=float(u), v=float(v), color=color,
-                                   show_handles=False)
+                                   show_handles=True)
     return None
 
 

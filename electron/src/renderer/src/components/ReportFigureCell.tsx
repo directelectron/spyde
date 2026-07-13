@@ -21,17 +21,19 @@
  *
  *   2. EDIT toolbar — an "Edit" toggle in the hover chrome opens a compact dock
  *      panel below the figure, driven by cell.figure (the pixel-free FigureSpec):
- *      per-panel layer list (cmap / alpha / visibility / remove), panel remove,
- *      and an annotations list + add palette (Text / Circle / Rect / Arrow).
+ *      per-panel layer list (cmap / alpha / visibility / remove), a per-panel
+ *      refresh (⟳ → repfig_refresh_panel, re-snapshots ONLY that panel) and
+ *      remove, and an annotations list + add palette (Text / Circle / Rect /
+ *      Arrow).
  *
  * Below the figure: an editable caption (click-to-edit → report_set_caption) +
- * hover chrome (Edit toggle, Refresh-from-live → report_refresh_figure, delete →
- * report_remove_cell).
+ * hover chrome (Edit toggle, Refresh-ALL-panels-from-live → report_refresh_figure,
+ * delete → report_remove_cell).
  */
 import React, { useState } from 'react'
 import { useSpyDE } from '../kernel/SpyDEContext'
 import { reportClipboard, type SerializedFigureCell } from '../kernel/reportClipboard'
-import type { ReportCell, RepfigPanel, RepfigLayer } from '../kernel/protocol'
+import type { ReportCell, RepfigPanel, RepfigLayer, RepfigSpec } from '../kernel/protocol'
 import { FIGURE_DRAG_MIME, WINDOW_DRAG_MIME } from '../kernel/dnd'
 import { COLORMAPS } from '../kernel/colormaps'
 import { useKeyedDebounce } from './wizardHooks'
@@ -62,6 +64,25 @@ interface HoverZone {
 }
 
 const FULL_RECT = { left: 0, top: 0, width: 1, height: 1 }
+
+// The figure cell's CSS box has no native pixel width/height to key an
+// aspect-ratio off — the `figure` message (host:"report") carries no `aspect`
+// field the way an MDI navigator figure's does (that one is the real-space
+// scan aspect, meaningless here), and anyplotlib's report-grid `subplots()`
+// call doesn't report its own figsize back either. So the box's CSS
+// `aspect-ratio` is DERIVED from the panel grid shape: each panel cell is
+// assumed ~4:3 (a common default for an image plot), scaled by cols/rows —
+// matches a single panel to the box's long-standing 16/10 default (close to
+// 4:3 widened a bit for the caption/chrome) and degrades sensibly for a wide
+// row or tall column of panels. This is a SANE DEFAULT, not a measured value.
+const PANEL_ASPECT = 4 / 3
+function figureAspectRatio(figure: RepfigSpec | undefined | null): number {
+  const layout = figure?.layout
+  if (!layout || layout.kind !== 'grid') return 16 / 10
+  const rows = Math.max(1, Number(layout.rows) || 1)
+  const cols = Math.max(1, Number(layout.cols) || 1)
+  return (PANEL_ASPECT * cols) / rows
+}
 
 // Map a cursor fraction (fx, fy) WITHIN a cell rect (0..1 local to that rect)
 // to a Zone: a ~30%-wide edge strip on each side, center otherwise. Shared by
@@ -182,6 +203,13 @@ export function ReportFigureCell({ cell, onRemove, index }: Props) {
   React.useEffect(() => { if (dragKind == null) setHoverZone(null) }, [dragKind])
 
   const fig = state.reportFigures.get(cell.id)
+  // CSS-only responsive sizing: figBox is width:100% of the cell (which tracks
+  // the sidebar width via ordinary block layout), height held by aspect-ratio
+  // derived from the panel grid shape — no JS resize loop on this side. The
+  // iframe itself relayouts to its box on resize (anyplotlib-side, not here).
+  const figBoxStyle: React.CSSProperties = {
+    ...styles.figBox, aspectRatio: String(figureAspectRatio(cell.figure)),
+  }
 
   const commitCaption = () => {
     setCaptionEditing(false)
@@ -424,7 +452,7 @@ export function ReportFigureCell({ cell, onRemove, index }: Props) {
             <button
               data-testid={`report-figcell-refresh-${cell.id}`}
               style={styles.chromeBtn}
-              title="Refresh from live figure"
+              title="Refresh all panels from live plots"
               onClick={() => sendAction('report_refresh_figure', { cell_id: cell.id })}
             >⟳</button>
           }
@@ -447,7 +475,7 @@ export function ReportFigureCell({ cell, onRemove, index }: Props) {
         </div>
       ) : cell.data_offline ? (
         // Rebind failed — show the baked snapshot + a "data offline" badge.
-        <div style={styles.figBox}>
+        <div style={figBoxStyle}>
           {cell.png
             ? <img src={cell.png} alt={cell.caption ?? ''} style={styles.offlineImg} />
             : <div style={styles.offlineMissing}>snapshot unavailable</div>}
@@ -456,29 +484,22 @@ export function ReportFigureCell({ cell, onRemove, index }: Props) {
           </span>
         </div>
       ) : fig ? (
-        // Live report figure iframe + the compose drop-zone shield.
-        <div style={styles.figBox}>
-          <iframe
-            key={fig.figId}
-            ref={el => {
-              if (el) iframeRefs.current.set(fig.figId, el)
-              else iframeRefs.current.delete(fig.figId)
-            }}
-            src={fig.filePath ?? undefined}
-            onLoad={(e) => {
-              replayState(fig.figId)
-              const el = e.currentTarget
-              window.electron.resizeFigure(fig.figId, Math.max(80, el.clientWidth), Math.max(80, el.clientHeight))
-            }}
-            style={styles.frame}
+        // Live report figure — a seamless (no-flash) iframe swap host + the
+        // compose drop-zone shield stacked on top.
+        <div style={figBoxStyle}>
+          <SeamlessFigureFrame
+            figId={fig.figId}
+            filePath={fig.filePath}
             title={fig.title}
-            data-testid={`figure-${fig.figId}`}
+            iframeRefs={iframeRefs}
+            replayState={replayState}
           />
           {/* Drag shield: the figure iframe is out-of-process and swallows DnD, so
               while a window/figure pill is in flight we mount a transparent shield
               over it to catch dragover/drop (same reason SubWindow shields during
               gestures). Mounted ONLY during the drag → no interference otherwise.
-              The zone overlay renders inside it once a zone is hovered. */}
+              The zone overlay renders inside it once a zone is hovered. Sits ABOVE
+              the frames (composeShield z 3) so pointer capture still works. */}
           {dragKind === 'window' && (
             <div
               data-testid={`figcell-compose-shield-${cell.id}`}
@@ -496,7 +517,7 @@ export function ReportFigureCell({ cell, onRemove, index }: Props) {
         </div>
       ) : (
         // Figure cell whose iframe hasn't arrived yet — show the baked PNG if any.
-        <div style={styles.figBox}>
+        <div style={figBoxStyle}>
           {cell.png
             ? <img src={cell.png} alt={cell.caption ?? ''} style={styles.offlineImg} />
             : <div style={styles.pending} data-testid={`report-figcell-pending-${cell.id}`}>rendering…</div>}
@@ -569,6 +590,132 @@ export function ReportFigureCell({ cell, onRemove, index }: Props) {
   )
 }
 
+// ── Seamless figure iframe swap (no blank flash on rebuild) ────────────────────
+
+/**
+ * SeamlessFigureFrame — hosts the report cell's figure iframe and swaps it
+ * WITHOUT the blank flash a naive `src` change causes.
+ *
+ * A report figure rebuild (compose edit, refresh, layout change) mints a BRAND
+ * NEW anyplotlib figId for the same cell. Swapping one iframe's `src` blanks the
+ * frame while the new document + ESM load + first paint (~100s of ms) → a jarring
+ * flash. Instead we keep the OLD iframe mounted and visible while the NEW one
+ * loads stacked underneath (absolute inset 0, opacity 0), and only PROMOTE the
+ * new one (opacity 1, unmount the old) once it has actually PAINTED.
+ *
+ * The "painted" signal: there is no explicit ready-postMessage from the figure
+ * iframe, so we reuse the SAME handshake the rest of the app relies on — the
+ * iframe `load` event, then `replayState(figId)` (which pushes the pixel/selector
+ * state the frame needs to draw), then two rAFs to let that state paint (the same
+ * 2-rAF settle anyplotlib's own export tests wait on). Only then do we promote.
+ *
+ * Cross-wiring safety: SpyDEContext keys iframeRefs / latestStates / the PNG
+ * harvest by figId, and the two frames have DISTINCT figIds, so mounting both
+ * briefly never crosses their state. Each frame binds its OWN figId into
+ * iframeRefs and clears it on unmount.
+ *
+ * Also owns the ResizeObserver → resizeFigure(figId, w, h) so the figure
+ * relayouts when the CSS-responsive cell box changes size (mirrors WindowContent).
+ */
+function SeamlessFigureFrame({ figId, filePath, title, iframeRefs, replayState }: {
+  figId: string
+  filePath: string | null
+  title: string
+  iframeRefs: React.MutableRefObject<Map<string, HTMLIFrameElement>>
+  replayState: (figId: string) => void
+}) {
+  // The figId currently PROMOTED (opacity 1). Starts as the first figId; updated
+  // only once a newer frame has painted.
+  const [shownFigId, setShownFigId] = React.useState(figId)
+  // The incoming figId while it loads underneath (null when nothing pending).
+  const [pendingFigId, setPendingFigId] = React.useState<string | null>(null)
+  const boxRef = React.useRef<HTMLDivElement | null>(null)
+  const shownRef = React.useRef(shownFigId)
+  shownRef.current = shownFigId
+  // figId → its OWN filePath. Each figId's `src` MUST stay pinned to the path it
+  // was minted with — a frame that stays mounted (the OLD one during a swap) must
+  // NOT have its src rewritten to the new figId's path (that would reload it and
+  // defeat the seamless swap). The current prop path always belongs to `figId`.
+  const pathByFigId = React.useRef<Map<string, string | null>>(new Map())
+  pathByFigId.current.set(figId, filePath)
+
+  // When the prop figId changes to something we're neither showing nor already
+  // loading, start loading it underneath.
+  React.useEffect(() => {
+    if (figId !== shownFigId && figId !== pendingFigId) {
+      setPendingFigId(figId)
+    }
+    // If the prop reverts to the shown one, drop any stale pending frame.
+    if (figId === shownFigId && pendingFigId != null) {
+      setPendingFigId(null)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [figId])
+
+  // Promote the pending frame once it has painted: load → replayState → 2 rAFs.
+  const onFrameLoad = (loadedFigId: string, el: HTMLIFrameElement) => {
+    replayState(loadedFigId)
+    window.electron.resizeFigure(loadedFigId,
+      Math.max(80, el.clientWidth), Math.max(80, el.clientHeight))
+    if (loadedFigId === shownRef.current) return   // the currently-shown frame
+    // Let the replayed state paint, THEN promote (drop the old frame).
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      // Guard: only promote if this is still the frame we're waiting for (a newer
+      // rebuild may have superseded it).
+      setPendingFigId(prev => (prev === loadedFigId ? null : prev))
+      setShownFigId(prev => (prev === loadedFigId ? prev : loadedFigId))
+    }))
+  }
+
+  // Keep the SHOWN figure sized to the (CSS-responsive) box — the report cell has
+  // no explicit pixel size; its aspect-ratio box resizes with the sidebar. Mirrors
+  // WindowContent's rAF-debounced ResizeObserver so a resize triggers exactly one
+  // relayout per frame.
+  React.useEffect(() => {
+    const fit = () => {
+      const el = iframeRefs.current.get(shownRef.current)
+      if (el && el.clientWidth && el.clientHeight) {
+        window.electron.resizeFigure(shownRef.current,
+          Math.max(80, el.clientWidth), Math.max(80, el.clientHeight))
+      }
+    }
+    let raf = requestAnimationFrame(fit)
+    const ro = new ResizeObserver(() => {
+      cancelAnimationFrame(raf); raf = requestAnimationFrame(fit)
+    })
+    if (boxRef.current) ro.observe(boxRef.current)
+    return () => { cancelAnimationFrame(raf); ro.disconnect() }
+  }, [shownFigId, iframeRefs])
+
+  // Render the shown frame (opacity 1), and — while a newer one loads — the
+  // pending frame stacked on top but INVISIBLE (opacity 0) so its paint doesn't
+  // flash before it's ready. Each frame keeps its OWN pinned src (pathByFigId) so
+  // the old frame is never reloaded during the overlap. Both bind their own figId
+  // into iframeRefs.
+  const renderFrame = (fid: string, visible: boolean) => (
+    <iframe
+      key={fid}
+      ref={el => {
+        if (el) iframeRefs.current.set(fid, el)
+        else { iframeRefs.current.delete(fid); pathByFigId.current.delete(fid) }
+      }}
+      src={pathByFigId.current.get(fid) ?? undefined}
+      onLoad={(e) => onFrameLoad(fid, e.currentTarget)}
+      style={{ ...styles.frame, opacity: visible ? 1 : 0 }}
+      title={title}
+      data-testid={`figure-${fid}`}
+    />
+  )
+
+  return (
+    <div ref={boxRef} style={styles.frameHost}>
+      {renderFrame(shownFigId, true)}
+      {pendingFigId != null && pendingFigId !== shownFigId &&
+        renderFrame(pendingFigId, false)}
+    </div>
+  )
+}
+
 // ── 5-zone drop overlay ───────────────────────────────────────────────────────
 
 // `panelRect` positions the zones overlay INSIDE the hovered grid cell (percent
@@ -631,6 +778,34 @@ function panelLabel(index: number): string {
 const ANNOT_LABEL: Record<string, string> = {
   text: 'Text', circle: 'Circle', ellipse: 'Ellipse', rect: 'Rect',
   arrow: 'Arrow', line: 'Line',
+}
+
+// The accent used as the default annotation color everywhere it's created
+// (PanelEdit.addAnnotation / FigureLevelEdit.addFigAnnotation) — the swatch
+// falls back to this when an existing annotation carries no color at all.
+const ANNOT_COLOR_DEFAULT = '#ff9800'
+
+// A compact native color input, styled to sit inline in an annotation row
+// without disturbing its layout (fixed small square, no browser chrome
+// beyond the swatch itself). `value` may be missing/non-string on an
+// annotation predating this control — falls back to the accent default.
+function ColorSwatch({ value, onChange, testid, title }: {
+  value: unknown
+  onChange: (color: string) => void
+  testid: string
+  title: string
+}) {
+  const color = typeof value === 'string' && value ? value : ANNOT_COLOR_DEFAULT
+  return (
+    <input
+      type="color"
+      data-testid={testid}
+      title={title}
+      value={color}
+      onChange={(e) => onChange(e.target.value)}
+      style={styles.colorSwatch}
+    />
+  )
 }
 
 function FigureEditPanel({ cell, selectedPanel, onClose }: {
@@ -711,6 +886,59 @@ function FigureEditPanel({ cell, selectedPanel, onClose }: {
 
 // ── Figure-level section (shown when the "Figure" chip is active) ───────────────
 
+// The panels that occupy a GRID cell — mirrors the backend's `_grid_panels`:
+// every panel NOT referenced as a callout inset on any panel's `insets`.
+function gridPanelsOf(panels: RepfigPanel[]): RepfigPanel[] {
+  const insetIds = new Set<string>()
+  for (const p of panels) {
+    for (const ins of (p.insets ?? [])) {
+      const pid = (ins as Record<string, unknown>).panel
+      if (typeof pid === 'string') insetIds.add(pid)
+    }
+  }
+  return panels.filter(p => !insetIds.has(p.id))
+}
+
+// The three layout presets, deduplicated for the CURRENT grid-panel count N:
+// row (1×N), column (N×1), grid (2 cols × ceil(N/2) rows). Two presets that
+// produce the same (rows, cols) shape for this N collapse to one entry (e.g.
+// N=2: row=1×2, column=2×1, grid=2×1 — grid is dropped as a duplicate of
+// column).
+const LAYOUT_PRESET_LABEL: Record<string, string> = { row: 'Row', column: 'Column', grid: 'Grid' }
+function presetShape(preset: 'row' | 'column' | 'grid', n: number): { rows: number; cols: number } {
+  if (preset === 'row') return { rows: 1, cols: n }
+  if (preset === 'column') return { rows: n, cols: 1 }
+  const cols = 2
+  return { rows: Math.ceil(n / cols), cols }
+}
+function distinctPresets(n: number): Array<{ preset: 'row' | 'column' | 'grid'; rows: number; cols: number }> {
+  const seen = new Set<string>()
+  const out: Array<{ preset: 'row' | 'column' | 'grid'; rows: number; cols: number }> = []
+  for (const preset of ['row', 'column', 'grid'] as const) {
+    const shape = presetShape(preset, n)
+    const key = `${shape.rows}x${shape.cols}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push({ preset, ...shape })
+  }
+  return out
+}
+
+// A tiny inline schematic (~28×20px) of a preset's grid shape: pure CSS boxes,
+// one per cell, filled row-major (N may be less than rows*cols for the "grid"
+// preset when N is odd — the last cell of the schematic is left empty to
+// mirror the real row-major fill).
+function LayoutPresetIcon({ rows, cols, n }: { rows: number; cols: number; n: number }) {
+  const cells = rows * cols
+  return (
+    <div style={{ ...styles.presetIcon, gridTemplateRows: `repeat(${rows}, 1fr)`, gridTemplateColumns: `repeat(${cols}, 1fr)` }}>
+      {Array.from({ length: cells }, (_, i) => (
+        <div key={i} style={i < n ? styles.presetCellFilled : styles.presetCellEmpty} />
+      ))}
+    </div>
+  )
+}
+
 function FigureLevelEdit({ cell, sendAction }: {
   cell: ReportCell
   sendAction: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
@@ -722,6 +950,11 @@ function FigureLevelEdit({ cell, sendAction }: {
   const rows = Math.max(1, Number(layout?.rows) || 1)
   const cols = Math.max(1, Number(layout?.cols) || 1)
   const gridSummary = isGrid && panels.length > 1 ? `${rows} × ${cols} grid` : 'single panel'
+
+  const gridPanelCount = gridPanelsOf(panels).length
+  const presets = gridPanelCount >= 2 ? distinctPresets(gridPanelCount) : []
+  const applyPreset = (preset: 'row' | 'column' | 'grid') =>
+    sendAction('repfig_apply_layout_preset', { cell_id: cell.id, preset })
 
   // Debounced layout sender so a dragged slider doesn't flood repfig_set_layout.
   const debounceSet = useKeyedDebounce(150)
@@ -738,7 +971,7 @@ function FigureLevelEdit({ cell, sendAction }: {
   const annotations = figure?.annotations ?? []
 
   // Figure-fraction defaults (0..1, centered) — same accent as panel annotations.
-  const ANNOT_COLOR = '#ff9800'
+  const ANNOT_COLOR = ANNOT_COLOR_DEFAULT
   const addFigAnnotation = (kind: 'text' | 'circle' | 'rect' | 'arrow') => {
     let annotation: Record<string, unknown>
     if (kind === 'text') {
@@ -759,6 +992,22 @@ function FigureLevelEdit({ cell, sendAction }: {
       <div style={styles.figGridSummary} data-testid={`figcell-grid-summary-${cell.id}`}>
         {gridSummary}
       </div>
+      {presets.length > 0 && (
+        <div style={styles.presetRow} data-testid={`figcell-layout-presets-${cell.id}`}>
+          {presets.map(({ preset, rows: pr, cols: pc }) => (
+            <button
+              key={preset}
+              data-testid={`figcell-layout-preset-${preset}-${cell.id}`}
+              style={styles.presetBtn}
+              title={`${LAYOUT_PRESET_LABEL[preset]} layout (${pr} × ${pc})`}
+              onClick={() => applyPreset(preset)}
+            >
+              <LayoutPresetIcon rows={pr} cols={pc} n={gridPanelCount} />
+              <span style={styles.presetLabel}>{LAYOUT_PRESET_LABEL[preset]}</span>
+            </button>
+          ))}
+        </div>
+      )}
       {isGrid && panels.length > 1 && (
         <>
           <div style={styles.layerTop}>
@@ -854,7 +1103,7 @@ function PanelEdit({ cellId, panel, index, canRemovePanel, onSetLayer, sendActio
   // names wrong means the annotation is appended to the spec but never DRAWS
   // (the builder pops a None offsets and `continue`s). Offsets are (N,2) [x,y]
   // arrays in DATA coordinates; a single marker is a 1-length list.
-  const ANNOT_COLOR = '#ff9800'
+  const ANNOT_COLOR = ANNOT_COLOR_DEFAULT
   const addAnnotation = (kind: 'text' | 'circle' | 'rect' | 'arrow') => {
     const d = annotationDefaults()
     let annotation: Record<string, unknown>
@@ -886,6 +1135,12 @@ function PanelEdit({ cellId, panel, index, canRemovePanel, onSetLayer, sendActio
       <div style={styles.panelHeader}>
         <span style={styles.panelLabel}>{panelLabel(index)}</span>
         <div style={{ flex: 1 }} />
+        <button
+          data-testid={`figcell-panel-refresh-${panel.id}`}
+          style={styles.smallRefresh}
+          title="Refresh this panel from the live plot"
+          onClick={() => sendAction('repfig_refresh_panel', { cell_id: cellId, panel_id: panel.id })}
+        >⟳</button>
         {canRemovePanel && (
           <button
             data-testid={`figcell-panel-remove-${panel.id}`}
@@ -1039,11 +1294,32 @@ function AnnotationRow({ cellId, panelId, index, annotation, sendAction }: {
     }
   }
 
+  // Color: `text` kind stores it in `color`; circle/rect/arrow store it in
+  // `edgecolors` (a plain string here, not the add_* array form — the builder
+  // forwards it straight through as an mpl kwarg). Debounced (~250ms) like the
+  // layer alpha slider so dragging the native picker doesn't flood the backend.
+  const colorField = isText ? 'color' : 'edgecolors'
+  const debounceColor = useKeyedDebounce(250)
+  const setColor = (color: string) => {
+    debounceColor(`${panelId}:${index}:color`, () => {
+      sendAction('repfig_update_annotation', {
+        cell_id: cellId, panel_id: panelId, index,
+        annotation: { ...annotation, [colorField]: color },
+      })
+    })
+  }
+
   const label = ANNOT_LABEL[kind] ?? kind
 
   return (
     <div style={styles.annRow} data-testid={`figcell-annotation-${panelId}-${index}`}>
       <span style={styles.annKind}>{label}</span>
+      <ColorSwatch
+        value={annotation[colorField]}
+        onChange={setColor}
+        testid={`figcell-annotation-color-${panelId}-${index}`}
+        title="Annotation color"
+      />
       {isText ? (
         editing ? (
           <input
@@ -1108,11 +1384,30 @@ function FigureAnnotationRow({ cellId, index, annotation, sendAction }: {
     }
   }
 
+  // Figure-level annotations use `color` uniformly across every kind (unlike a
+  // panel annotation's shape kinds, which use `edgecolors`). Debounced like the
+  // panel swatch so dragging the native picker doesn't flood the backend.
+  const debounceColor = useKeyedDebounce(250)
+  const setColor = (color: string) => {
+    debounceColor(`fig:${index}:color`, () => {
+      sendAction('repfig_update_fig_annotation', {
+        cell_id: cellId, index,
+        annotation: { ...annotation, color },
+      })
+    })
+  }
+
   const label = ANNOT_LABEL[kind] ?? kind
 
   return (
     <div style={styles.annRow} data-testid={`figcell-fig-annotation-${index}`}>
       <span style={styles.annKind}>{label}</span>
+      <ColorSwatch
+        value={annotation.color}
+        onChange={setColor}
+        testid={`figcell-fig-annotation-color-${index}`}
+        title="Annotation color"
+      />
       {isText ? (
         editing ? (
           <input
@@ -1169,14 +1464,26 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: 13, padding: '0 3px', lineHeight: 1, borderRadius: 4,
   },
   figBox: {
+    // aspectRatio is set per-instance (figBoxStyle, derived from the figure's
+    // panel grid shape via figureAspectRatio) — width:100% here is what makes
+    // the box track the sidebar's CSS width; no JS resize loop involved.
     position: 'relative', width: '100%',
-    aspectRatio: '16 / 10',
     background: '#11111b', border: '1px solid #313244', borderRadius: 6,
     overflow: 'hidden',
+  },
+  // Fills the figBox; hosts the (up to two, briefly-overlapping) figure iframes
+  // during a seamless swap. Frames are absolute inset 0, so this box is what the
+  // ResizeObserver watches for the CSS-responsive relayout.
+  frameHost: {
+    position: 'absolute', inset: 0,
   },
   frame: {
     position: 'absolute', inset: 0, width: '100%', height: '100%',
     border: 'none',
+    // opacity is set per-frame: 0 while a pending frame loads underneath, 1 once
+    // promoted. The promoted frame has ALREADY painted (we waited its load + 2
+    // rAFs), so the swap is a hard, in-the-same-commit opacity flip with the old
+    // frame removed simultaneously — no fade-in gap, no blank flash.
   },
   offlineImg: {
     position: 'absolute', inset: 0, width: '100%', height: '100%',
@@ -1298,6 +1605,23 @@ const styles: Record<string, React.CSSProperties> = {
     fontWeight: 600, lineHeight: 1.2,
   },
   figGridSummary: { fontSize: 10.5, color: '#cdd6f4', padding: '1px 0 3px' },
+  // ── Layout presets ────────────────────────────────────────────────────────
+  presetRow: { display: 'flex', gap: 6, padding: '2px 0 4px' },
+  presetBtn: {
+    display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3,
+    background: '#1e1e2e', border: '1px solid #313244', borderRadius: 5,
+    padding: '4px 6px', cursor: 'pointer',
+  },
+  presetIcon: {
+    display: 'grid', gap: 1.5, width: 28, height: 20,
+  },
+  presetCellFilled: {
+    background: '#89b4fa', borderRadius: 1,
+  },
+  presetCellEmpty: {
+    background: '#313244', borderRadius: 1,
+  },
+  presetLabel: { fontSize: 8.5, color: '#a6adc8' },
   figCaptionHint: { fontSize: 9.5, color: '#6c7086', fontStyle: 'italic', padding: '1px 0' },
   panelBlock: {
     borderTop: '1px solid #1e1e2e', paddingTop: 5, marginTop: 4,
@@ -1307,6 +1631,11 @@ const styles: Record<string, React.CSSProperties> = {
   smallRemove: {
     background: 'none', border: '1px solid #45475a', color: '#f38ba8',
     borderRadius: 4, padding: '1px 6px', fontSize: 9.5, cursor: 'pointer',
+  },
+  smallRefresh: {
+    background: 'none', border: '1px solid #45475a', color: '#a6adc8',
+    borderRadius: 4, padding: '1px 6px', fontSize: 9.5, cursor: 'pointer',
+    lineHeight: 1,
   },
   subLabel: { fontSize: 9.5, color: '#6c7086', margin: '5px 0 2px', fontWeight: 600 },
   layerRow: {
@@ -1343,6 +1672,12 @@ const styles: Record<string, React.CSSProperties> = {
   annKind: {
     fontSize: 9, fontWeight: 700, color: '#a6adc8',
     background: '#313244', borderRadius: 4, padding: '1px 5px',
+  },
+  // Compact native color input — fixed small square, no browser-default label/
+  // padding, sits inline in the row without disturbing its height.
+  colorSwatch: {
+    width: 16, height: 16, padding: 0, border: '1px solid #45475a',
+    borderRadius: 3, background: 'none', cursor: 'pointer', flexShrink: 0,
   },
   annText: {
     fontSize: 10.5, color: '#cdd6f4', cursor: 'text', minWidth: 0,

@@ -273,9 +273,15 @@ test('b) new signal cell + its OWN navigator center-drop → Callout prompt → 
   const oldFigId = await figCell.locator('iframe[data-testid^="figure-"]')
     .first().getAttribute('data-testid')
 
-  // Panel count BEFORE the callout (single panel).
+  // Panel count BEFORE the callout (single panel). Round-2 shows only the SELECTED
+  // panel's `figcell-panel-<id>` block (and that prefix now ALSO matches the new
+  // per-panel `figcell-panel-refresh-<id>` button), so count PANEL CHIPS instead —
+  // the chip row enumerates EVERY panel (`figcell-chip-p<id>`), independent of
+  // selection, which is the true panel count.
   const before = await openEditToolbar(page)
-  const panelsBefore = await page.locator(`[data-testid="figcell-edit-${before.cellId}"] [data-testid^="figcell-panel-"]`).count()
+  const panelChips = (cellId: string) =>
+    page.locator(`[data-testid="figcell-chips-${cellId}"] [data-testid^="figcell-chip-p"]`)
+  const panelsBefore = await panelChips(before.cellId).count()
   console.log('[compose] panels before callout =', panelsBefore)
   expect(panelsBefore).toBe(1)
   // Close the editor so the compose shield isn't obstructed by the edit panel.
@@ -304,10 +310,10 @@ test('b) new signal cell + its OWN navigator center-drop → Callout prompt → 
   }).not.toBe(oldFigId)
   await page.waitForTimeout(2000)
 
-  // The edit toolbar now lists a SECOND panel (the inset callout panel).
+  // The edit toolbar now lists a SECOND panel (the inset callout panel) — count
+  // the panel CHIPS (every panel gets one, selection-independent).
   const after = await openEditToolbar(page)
-  const panelsAfter = page.locator(`[data-testid="figcell-edit-${after.cellId}"] [data-testid^="figcell-panel-"]`)
-  await expect.poll(async () => panelsAfter.count(), {
+  await expect.poll(async () => panelChips(after.cellId).count(), {
     timeout: 10_000, message: 'callout did not add an inset panel to the cell',
   }).toBeGreaterThanOrEqual(2)
 

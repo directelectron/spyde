@@ -74,6 +74,11 @@ class ReportManager:
         # interactive build (kept so the widget handlers aren't GC'd); replaced
         # wholesale on each rebuild, dropped when the cell is removed / report closed.
         self._edit_wiring: dict[str, list] = {}
+        # cell_id -> { (panel_id, ann_index) : widget } for the current interactive
+        # build — lets a live color/text/geometry edit push widget.set(...) onto the
+        # exact widget instead of rebuilding the figure (edit-mode in-place update).
+        # Rebuilt alongside _edit_wiring; empty for non-interactive builds.
+        self._ann_widgets: dict[str, dict] = {}
         # cell_id -> the currently SELECTED spec panel id (or None = figure-level
         # selection). The single source of truth the edit dock mirrors; cleared
         # alongside _editing (new / close / remove-cell / edit-off).
@@ -130,6 +135,7 @@ class ReportManager:
         self._offline.clear()
         self._editing.clear()
         self._edit_wiring.clear()
+        self._ann_widgets.clear()
         self._selected.clear()
 
     def close_windows(self) -> None:
@@ -158,6 +164,7 @@ class ReportManager:
         self._pending_save.clear()
         self._editing.clear()
         self._edit_wiring.clear()
+        self._ann_widgets.clear()
         self._selected.clear()
 
     # ── state emission ─────────────────────────────────────────────────────────
@@ -238,6 +245,7 @@ class ReportManager:
                 self._forget(prev_wid)
                 self._window_by_cell.pop(cell.id, None)
             self._edit_wiring.pop(cell.id, None)
+            self._ann_widgets.pop(cell.id, None)
             return
         # Tear down any prior window for this cell first (re-snapshot / refresh).
         prev_wid = self._window_by_cell.get(cell.id)
@@ -285,6 +293,7 @@ class ReportManager:
         widgets supersede the old ones). ``wiring`` empty (non-interactive) → the
         cell's wiring is dropped."""
         stored = []
+        ann_widgets: dict = {}
         for (widget, panel_id, ann_index, panel_spec) in wiring:
             kind = str((panel_spec.annotations[ann_index] or {}).get("kind", "")) \
                 if (0 <= ann_index < len(panel_spec.annotations)) else ""
@@ -296,10 +305,14 @@ class ReportManager:
                 log.debug("wiring annotation drag handler failed: %s", e)
                 continue
             stored.append((widget, handler))
+            # Key by (SPEC panel id, ann_index) so a live edit finds the widget.
+            ann_widgets[(panel_spec.id, ann_index)] = widget
         if stored:
             self._edit_wiring[cell_id] = stored
+            self._ann_widgets[cell_id] = ann_widgets
         else:
             self._edit_wiring.pop(cell_id, None)
+            self._ann_widgets.pop(cell_id, None)
 
     def _wire_selection_handlers(self, cell_id: str, fig) -> None:
         """Wire the EDIT-MODE selection handlers onto *fig* (interactive builds
@@ -373,12 +386,58 @@ class ReportManager:
             if any(p.id == panel_id for p in cell.spec.panels):
                 pid = panel_id
         self._selected[cell_id] = pid
-        wid = self._window_by_cell.get(cell_id)
-        fig = self._controllers[wid].fig if wid in self._controllers else None
+        fig = self.live_fig(cell_id)
         if fig is not None:
             self._apply_selected_panel(cell_id, fig)
         ipc.emit({"type": "report_panel_selected", "cell_id": cell_id,
                   "panel_id": pid})
+
+    # ── in-place live updates (skip the figure rebuild / iframe flash) ──────────
+
+    def live_fig(self, cell_id: str):
+        """The live anyplotlib Figure for a cell (via its window controller), or
+        None if the cell has no mounted figure window."""
+        wid = self._window_by_cell.get(cell_id)
+        ctrl = self._controllers.get(wid) if wid is not None else None
+        return getattr(ctrl, "fig", None) if ctrl is not None else None
+
+    def push_fig_markers(self, cell) -> bool:
+        """Re-sync a cell's figure-level annotations onto the LIVE figure's marker
+        layer (``fig.set_figure_markers``) — a targeted redraw, NO rebuild / iframe
+        reload. Returns True when it reached a live figure, False otherwise (caller
+        should fall back to a rebuild). ``spec.annotations`` are already in the
+        anyplotlib figure-marker fraction schema, so they pass straight through."""
+        if cell is None or cell.spec is None:
+            return False
+        fig = self.live_fig(cell.id)
+        if fig is None or not hasattr(fig, "set_figure_markers"):
+            return False
+        try:
+            fig.set_figure_markers(list(cell.spec.annotations))
+            return True
+        except Exception as e:
+            log.debug("push_fig_markers failed (cell %s): %s", cell.id, e)
+            return False
+
+    def push_ann_widget(self, cell_id: str, panel_id: str, ann_index: int,
+                        widget_fields: dict) -> bool:
+        """Push *widget_fields* (already in the WIDGET's image-pixel / attr schema)
+        onto the live edit widget for ``(panel_id, ann_index)`` via ``widget.set``
+        — a targeted JS merge + redraw, NO figure rebuild. Returns True when the
+        widget was found and updated, False otherwise (caller rebuilds instead).
+
+        Only valid while the cell is in EDIT MODE (widgets exist); a non-edit cell
+        has no ``_ann_widgets`` entry → returns False."""
+        widget = (self._ann_widgets.get(cell_id, {}) or {}).get((panel_id, ann_index))
+        if widget is None or not widget_fields:
+            return False
+        try:
+            widget.set(**widget_fields)
+            return True
+        except Exception as e:
+            log.debug("push_ann_widget failed (cell %s panel %s idx %s): %s",
+                      cell_id, panel_id, ann_index, e)
+            return False
 
     def assemble_assets(self, harvested: dict) -> dict:
         """Build ``{cell_id -> PNG bytes}`` for every non-placeholder figure cell,
@@ -501,9 +560,12 @@ def _make_panel_select_handler(mgr, cell_id, spec_panel_id):
 
 def _make_figure_edit_handler(mgr, cell_id):
     """A module-level closure returning a FIGURE-level handler (registered for
-    ``pointer_down`` + ``pointer_up``) that routes the two figure-scoped edit
+    ``pointer_down`` + ``pointer_up``) that routes the three figure-scoped edit
     events:
 
+    * ``panel_swap`` (``event.source_panel_id`` + ``event.target_panel_id`` set —
+      the user dragged one panel's move-grip onto another) → swap the two spec
+      panels' ``grid_pos`` and REBUILD (anyplotlib reorders nothing itself).
     * ``figure_background`` (a click on the bare figure, no panel underneath) →
       ``select_panel(cell_id, None)`` (deselect → figure-level dock).
     * ``figure_marker`` on ``pointer_up`` (a figure annotation was dragged) →
@@ -522,6 +584,14 @@ def _make_figure_edit_handler(mgr, cell_id):
             marker_id = getattr(event, "last_widget_id", None)
             cell = mgr.doc.cell_by_id(cell_id) if mgr.doc else None
             if cell is None or cell.cell_type != "figure":
+                return
+            # panel drag-swap: two panel DISPATCH ids on the event (mapped back to
+            # spec panel ids via fig._report_panel_map). Handled BEFORE the
+            # background/marker branches (a swap carries no marker id).
+            src_disp = getattr(event, "source_panel_id", None)
+            tgt_disp = getattr(event, "target_panel_id", None)
+            if src_disp is not None and tgt_disp is not None:
+                _handle_panel_swap(mgr, cell_id, fig, src_disp, tgt_disp)
                 return
             # figure-background click → deselect (any pointer event; a click
             # arrives as pointer_down). No marker id on a background click.
@@ -561,6 +631,42 @@ def _make_figure_edit_handler(mgr, cell_id):
             log.debug("figure-level edit handler failed (cell %s): %s",
                       cell_id, e)
     return _on_figure_event
+
+
+def _handle_panel_swap(mgr, cell_id, fig, src_disp, tgt_disp) -> None:
+    """Swap two panels' ``grid_pos`` in response to a panel drag-swap event.
+
+    *src_disp* / *tgt_disp* are anyplotlib PLOT dispatch ids; invert
+    ``fig._report_panel_map`` (spec_pid → dispatch id) to get the two SPEC panel
+    ids, find both ``PanelSpec``s, exchange their ``grid_pos``, mark dirty, and
+    REBUILD the figure (anyplotlib performs no layout change itself — it only
+    reports the intent).
+
+    Guards (no-op, no crash): the cell/spec must exist; both dispatch ids must map
+    to a distinct spec panel; both panels must still be on the spec. An unknown id
+    or a same-panel drop is a no-op."""
+    cell = mgr.doc.cell_by_id(cell_id) if mgr.doc else None
+    if cell is None or cell.cell_type != "figure" or cell.spec is None:
+        return
+    if src_disp == tgt_disp:
+        return
+    panel_map = dict(getattr(fig, "_report_panel_map", None) or {})
+    # dispatch id → spec panel id (inverse of the stashed panel_map).
+    spec_by_disp = {disp: pid for pid, disp in panel_map.items()}
+    src_pid = spec_by_disp.get(src_disp)
+    tgt_pid = spec_by_disp.get(tgt_disp)
+    if src_pid is None or tgt_pid is None or src_pid == tgt_pid:
+        return
+    src_panel = next((p for p in cell.spec.panels if p.id == src_pid), None)
+    tgt_panel = next((p for p in cell.spec.panels if p.id == tgt_pid), None)
+    if src_panel is None or tgt_panel is None:
+        return
+    # Exchange grid positions (swap in place; keep every other panel attr).
+    src_panel.grid_pos, tgt_panel.grid_pos = (
+        list(tgt_panel.grid_pos), list(src_panel.grid_pos))
+    mgr.dirty = True
+    mgr.build_figure_window(cell)
+    mgr.emit_state()
 
 
 def _widget_geometry_to_data(kind, widget, axes, coords) -> "dict | None":
@@ -709,6 +815,71 @@ def _snapshot_plot(plot) -> "tuple[FigureSpec, dict] | None":
     spec = FigureSpec(layout={"kind": "single"}, panels=[panel],
                       nav_context=nav_context)
     return spec, snap_map
+
+
+def _snapshot_layer_now(plot) -> "tuple[np.ndarray, str, list | None] | None":
+    """Read a live ``Plot`` NOW into ``(arr, cmap, clim)`` for an EXISTING
+    LayerSpec refresh (per-panel / per-layer re-snapshot) — the pixel + contrast
+    half of :func:`_snapshot_plot`'s base-layer logic, factored out so a panel
+    refresh can update one layer's pixels/cmap/clim without rebuilding the whole
+    FigureSpec (axes/title/annotations/alpha/visible are left untouched — a
+    refresh keeps the panel's edited chrome). Returns None when the plot has no
+    paintable frame."""
+    data = getattr(plot, "current_data", None)
+    if not isinstance(data, np.ndarray) or data.dtype == object:
+        return None
+    arr = np.array(data, copy=True)   # detach from the live buffer
+
+    cmap = "gray"
+    try:
+        ps = getattr(plot, "plot_state", None)
+        if ps is not None and getattr(ps, "colormap", None):
+            cmap = str(ps.colormap)
+    except Exception:
+        pass
+
+    clim = None
+    lv = getattr(plot, "_last_levels", None)
+    is_rgb = arr.ndim == 3 and arr.shape[-1] in (3, 4)
+    if lv is not None and not is_rgb:
+        try:
+            clim = [float(lv[0]), float(lv[1])]
+        except Exception:
+            clim = None
+
+    return arr, cmap, clim
+
+
+def refresh_panel(session, mgr: "ReportManager", cell: Cell, panel: PanelSpec) -> bool:
+    """Re-snapshot ONE panel's layers from their resolved live plots, IN PLACE.
+
+    Every layer's ``source`` ref must resolve to a live plot for the panel to
+    refresh; if ANY layer is unresolvable the panel is left untouched (its
+    existing snapshot/spec stay exactly as they were) — matching the whole-figure
+    refresh's "skip on unresolved source" behaviour, just scoped to one panel.
+    On success, each layer's pixels/cmap/clim are updated (alpha/visible/id and
+    the panel's axes/title/annotations are left alone — a refresh pulls fresh
+    data, it doesn't discard the user's edits) and the manager's snapshot map is
+    updated. Returns True when the panel was refreshed, False otherwise (caller
+    decides whether that means "mark offline" — see ``report_refresh_figure`` —
+    or "leave silently as-is" — ``repfig_refresh_panel``)."""
+    if not panel.layers:
+        return False
+    resolved: list[tuple[LayerSpec, np.ndarray, str, "list | None"]] = []
+    for layer in panel.layers:
+        src_plot = layer.source.resolve(session) if layer.source else None
+        if src_plot is None:
+            return False
+        snap = _snapshot_layer_now(src_plot)
+        if snap is None:
+            return False
+        arr, cmap, clim = snap
+        resolved.append((layer, arr, cmap, clim))
+    for layer, arr, cmap, clim in resolved:
+        layer.cmap = cmap
+        layer.clim = clim
+        mgr.set_snapshot(cell.id, panel.id, layer.id, arr)
+    return True
 
 
 def _resolve_source_plot(session, source_window_id):
@@ -977,6 +1148,7 @@ def report_remove_cell(session, plot, payload) -> None:
         mgr._offline.discard(cell.id)
         mgr._editing.discard(cell.id)
         mgr._edit_wiring.pop(cell.id, None)
+        mgr._ann_widgets.pop(cell.id, None)
         mgr._selected.pop(cell.id, None)
     mgr.doc.cells = [c for c in mgr.doc.cells if c.id != cell.id]
     mgr.dirty = True
@@ -1060,30 +1232,59 @@ def report_add_figure(session, plot, payload) -> None:
 
 
 def report_refresh_figure(session, plot, payload) -> None:
-    """Re-snapshot a figure cell from its resolved live plot and re-emit."""
+    """Re-snapshot EVERY panel of a figure cell from its resolved live plot(s)
+    and re-emit — i.e. ``refresh_panel`` run for each panel in turn (one code
+    path shared with the single-panel ``repfig_refresh_panel``). A panel whose
+    source(s) can't be resolved keeps its existing snapshot; if NO panel
+    resolved (nothing refreshed at all) the whole cell is marked offline, same
+    as before this was panel-scoped."""
     mgr = _manager(session)
     if not mgr.open:
         return
     cell = mgr.doc.cell_by_id(payload.get("cell_id"))
     if cell is None or cell.cell_type != "figure" or cell.spec is None:
         return
-    ref = cell.spec.primary_layer.source if cell.spec.primary_layer else None
-    src_plot = ref.resolve(session) if ref is not None else None
-    if src_plot is None:
-        # Source offline — can't refresh; mark offline so the UI reflects it.
+    any_refreshed = False
+    for panel in cell.spec.panels:
+        if refresh_panel(session, mgr, cell, panel):
+            any_refreshed = True
+    if not any_refreshed:
+        # Nothing resolved — can't refresh; mark offline so the UI reflects it.
         mgr._offline.add(cell.id)
         wid = mgr._window_by_cell.get(cell.id)
         if wid is not None:
             mgr._forget(wid)
         mgr.emit_state()
         return
-    snap = _snapshot_plot(src_plot)
-    if snap is None:
-        return
-    spec, snap_map = snap
-    cell.spec = spec
-    mgr._snapshots[cell.id] = dict(snap_map)
     mgr._offline.discard(cell.id)
+    mgr.build_figure_window(cell)
+    mgr.dirty = True
+    mgr.emit_state()
+
+
+def repfig_refresh_panel(session, plot, payload) -> None:
+    """Re-snapshot ONLY ONE panel (``{cell_id, panel_id}``) of a figure cell from
+    its resolved live plot(s), then rebuild + re-emit the whole cell (the
+    renderer swaps the iframe seamlessly, so a full rebuild for a one-panel
+    change is fine — same rebuild path every other repfig edit uses).
+
+    If the panel's source(s) can't be resolved, the panel keeps its existing
+    snapshot untouched (no offline flag on the panel/cell — the OTHER panels are
+    still live) and this is a silent no-op (no error; a transient source can
+    reconnect on a later refresh). An unknown ``cell_id``/``panel_id`` is
+    likewise a no-op — no crash."""
+    mgr = _manager(session)
+    if not mgr.open:
+        return
+    cell = mgr.doc.cell_by_id(payload.get("cell_id"))
+    if cell is None or cell.cell_type != "figure" or cell.spec is None:
+        return
+    panel = next((p for p in cell.spec.panels
+                  if p.id == payload.get("panel_id")), None)
+    if panel is None:
+        return
+    if not refresh_panel(session, mgr, cell, panel):
+        return
     mgr.build_figure_window(cell)
     mgr.dirty = True
     mgr.emit_state()
