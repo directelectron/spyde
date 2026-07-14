@@ -284,12 +284,19 @@ function navWindows(page) {
  *    viz_main_impl.cc "Exiting GPU process", command_buffer_proxy_impl.cc)
  *    and is infrastructure noise, not a SpyDE error. Python backend lines
  *    never match that shape, so real errors still fail the audit.
+ *  - "Failed to create WebGPU Context Provider" — Chromium emits this from the
+ *    figure iframe whenever the runner has no usable WebGPU adapter (every
+ *    hosted CI runner under xvfb). anyplotlib falls back to Canvas2D and the
+ *    render is still correct (the GPU render math is covered separately in
+ *    anyplotlib's own --enable-unsafe-webgpu suite), so it is benign here. A
+ *    real backend error is a Python traceback, never this renderer line.
  */
 function backendErrorLines(backend) {
   return backend.logBuffer.filter((l) =>
     /ERROR|Traceback/i.test(l)
     && !/Security Warning|Content.Security.Policy|Content Security/i.test(l)
     && !/willReadFrequently/i.test(l)
+    && !/Failed to create WebGPU Context Provider/i.test(l)
     && !/:(ERROR|FATAL):[a-z_0-9]+\.(cc|mm)\(\d+\)/.test(l))
 }
 

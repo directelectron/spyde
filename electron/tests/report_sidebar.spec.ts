@@ -263,15 +263,20 @@ test('6) save to an explicit path and validate the zip contents', async () => {
     timeout: 10_000, message: 'report file was never written',
   }).toBe(true)
 
-  // Unzip via bsdtar (Windows tar handles zip) into the work dir. Resolve the
-  // System32 binary explicitly on Windows: a bare 'tar' can resolve to git's
-  // GNU tar depending on the spawning shell's PATH, and GNU tar treats the
-  // drive-letter in an absolute 'C:\...' path as a remote-host prefix.
-  const tarExe = process.platform === 'win32'
-    ? join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'tar.exe')
-    : 'tar'
-  execFileSync(tarExe, ['-xf', reportPath, '-C', workDir], { stdio: 'pipe' })
-  // tar extracts report.md / figures/ / assets/ under workDir.
+  // A .spyde-report is a ZIP. Extract it into the work dir. Picking the right
+  // extractor is per-platform: on Windows bsdtar reads zip, but we must resolve
+  // the System32 binary explicitly — a bare 'tar' can resolve to git's GNU tar
+  // depending on the spawning shell's PATH, and GNU tar treats the drive-letter
+  // in an absolute 'C:\...' path as a remote-host prefix. On Linux/macOS the
+  // system 'tar' is GNU tar, which CANNOT read a zip ("does not look like a tar
+  // archive") — use 'unzip' (preinstalled on the GitHub Ubuntu runners) there.
+  if (process.platform === 'win32') {
+    const tarExe = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'tar.exe')
+    execFileSync(tarExe, ['-xf', reportPath, '-C', workDir], { stdio: 'pipe' })
+  } else {
+    execFileSync('unzip', ['-o', '-q', reportPath, '-d', workDir], { stdio: 'pipe' })
+  }
+  // The extractor writes report.md / figures/ / assets/ under workDir.
   const mdPath = join(workDir, 'report.md')
   expect(existsSync(mdPath)).toBe(true)
   const md = readFileSync(mdPath, 'utf-8')

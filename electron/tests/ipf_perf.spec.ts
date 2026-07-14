@@ -339,6 +339,9 @@ test('IPF raster/GPU render paths render correctly in the real app', async () =>
   const gpuLogLines = backendLog.filter((l) => /gpu|webgpu|scatter3d/i.test(l))
   const tbLines = backendLog.filter((l) =>
     /Traceback|ERROR/.test(l) && !/Security Warning|willReadFrequently/.test(l)
+    // Benign on adapter-less CI runners — anyplotlib falls back to Canvas2D and
+    // the render is still correct (see backendErrorLines in _harness.cjs).
+    && !/Failed to create WebGPU Context Provider/i.test(l)
     && !/:(ERROR|FATAL):[a-z_0-9]+\.(cc|mm)\(\d+\)/.test(l))
   console.log('[ipf_perf] renderer gpu warnings:',
     gpuWarns.slice(-8).join(' | ') || '(none)')
