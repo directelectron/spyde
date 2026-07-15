@@ -93,11 +93,22 @@ Run from a clean checkout of the commit you intend to tag.
 ## Cutting the release
 
 1. **Run the Prepare Release workflow** (Actions tab → *Prepare Release* → *Run
-   workflow*). Pick the bump: `major` / `minor` / `patch` (optionally as an
-   `-rc.1` via the checkbox), `rc` (next `-rc.N` on the current base), or
-   `stable` (drop the `-rc` suffix — promote the current rc). It bumps
-   `electron/package.json` (+ lockfile), runs the lockfile/pin pre-flight
-   checks, and opens a `release/vX.Y.Z` PR.
+   workflow*). The bump options (and the `beta` checkbox) mirror anyplotlib's
+   Prepare Release; only the pre-release *suffix* differs — this repo emits
+   semver `-rc.N` where anyplotlib emits PEP 440 `bN`, because the version of
+   record is `electron/package.json` (npm/electron-builder), which is
+   semver-only. Pick the bump:
+   - `major` / `minor` / `bugfix` — standard bumps (optionally cut as an
+     `-rc.1` by ticking the `beta` checkbox).
+   - `pre-release` — next `-rc.N` on the current base (always a beta; the
+     `beta` checkbox is implied).
+   - `finalize` — drop the `-rc.N` suffix to promote the current release
+     candidate to stable (e.g. `0.2.0-rc.2` → `0.2.0`).
+
+   From an `-rc.N` base, `major`/`minor`/`bugfix` are rejected (they'd skip the
+   in-progress version) — use `finalize` to ship it, or `pre-release` for the
+   next candidate. It bumps `electron/package.json` (+ lockfile), runs the
+   lockfile/pin pre-flight checks, and opens a `release/vX.Y.Z` PR.
 
    > Exception: if `electron/package.json` already equals the version you want
    > to tag (no bump needed), skip straight to tagging.

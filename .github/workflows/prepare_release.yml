@@ -1,13 +1,20 @@
 name: Prepare Release
 
-# Run manually from the Actions tab (same flow as anyplotlib's Prepare Release).
-# Creates a branch + PR that bumps electron/package.json — the ONE hand-set
-# version string in this repo (the Python version is derived from the git tag
-# by setuptools_scm, so there is nothing to bump on that side). release.yml
-# hard-fails when the pushed tag doesn't match electron/package.json (that
-# guard is exactly what killed the v0.1.0-rc.3 release); going through this
-# workflow makes the two agree by construction, because the PR tells you the
-# one tag that will pass.
+# Run manually from the Actions tab (same flow + vocabulary as anyplotlib's
+# Prepare Release). Creates a branch + PR that bumps electron/package.json —
+# the ONE hand-set version string in this repo (the Python version is derived
+# from the git tag by setuptools_scm, so there is nothing to bump on that side).
+# release.yml hard-fails when the pushed tag doesn't match electron/package.json
+# (that guard is exactly what killed the v0.1.0-rc.3 release); going through
+# this workflow makes the two agree by construction, because the PR tells you
+# the one tag that will pass.
+#
+# Version FORMAT note: this repo's version of record is electron/package.json,
+# which is SEMVER (npm / electron-builder / electron-updater). anyplotlib uses
+# PEP 440 betas (0.3.0b2) because its version lives in pyproject.toml; the
+# equivalent semver pre-release here is a release candidate (0.3.0-rc.2). The
+# INPUT NAMES match anyplotlib exactly (finalize / bugfix / pre-release / beta);
+# only the emitted suffix differs (-rc.N vs bN), because npm cannot store bN.
 on:
   workflow_dispatch:
     inputs:
@@ -16,13 +23,13 @@ on:
         required: true
         type: choice
         options:
+          - finalize      # drop the -rc.N suffix: release the current rc's base as stable (0.3.0-rc.2 -> 0.3.0)
           - minor
-          - patch
+          - bugfix
           - major
-          - rc       # increments the -rc.N counter on the current base version
-          - stable   # drops the -rc.N suffix: promote the current rc to stable
-      rc:
-        description: "Cut the bumped version as a release candidate (-rc.1; implied by bump=rc)"
+          - pre-release   # increments the -rc.N counter on the current base version
+      beta:
+        description: "Mark as beta pre-release (adds -rc.N suffix). Ignored for 'pre-release' (always beta) and 'finalize' (always stable)."
         required: false
         type: boolean
         default: false
@@ -56,7 +63,7 @@ jobs:
         id: version
         env:
           BUMP: ${{ inputs.bump }}
-          IS_RC: ${{ inputs.rc }}
+          IS_BETA: ${{ inputs.beta }}
         run: |
           CURRENT=$(node -p "require('./electron/package.json').version")
           export CURRENT_VERSION="$CURRENT"
@@ -66,32 +73,53 @@ jobs:
 
           current = os.environ["CURRENT_VERSION"]
           bump    = os.environ["BUMP"]
-          is_rc   = os.environ["IS_RC"].lower() == "true"
+          is_beta = os.environ["IS_BETA"].lower() == "true"
 
+          # Semver pre-release: -rc.N (the npm-valid equivalent of PEP 440 bN).
           m = re.match(r"^(\d+)\.(\d+)\.(\d+)(?:-rc\.(\d+))?$", current)
           if not m:
               sys.exit(f"unparseable current version: {current!r}")
           major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
           rc_n = int(m.group(4)) if m.group(4) else None
+          on_rc = rc_n is not None
 
-          if bump == "major":
+          if bump == "finalize":
+              # Release the current rc's base as stable: just drop the -rc.N
+              # suffix, keep major.minor.patch. e.g. 0.3.0-rc.2 -> 0.3.0.
+              if not on_rc:
+                  sys.exit(
+                      f"'finalize' requires a release-candidate base version, but "
+                      f"current version {current!r} has no -rc.N suffix. Use minor "
+                      f"/ bugfix / major to start a new release instead."
+                  )
+              is_beta = False
+          elif bump == "pre-release":
+              # Keep the same base; just walk the rc counter forward.
+              is_beta = True
+              rc_n    = (rc_n or 0) + 1
+          elif on_rc:
+              # We are on an rc of the NEXT release (e.g. 0.3.0-rc.2). The base
+              # major.minor.patch is that upcoming version, so minor/bugfix/major
+              # must bump relative to the LAST STABLE (base - the in-progress
+              # component), not skip a whole version. The common intent from an
+              # rc is 'finalize', so steer the user there rather than guess.
+              nxt = ("%d.%d.0" % (major, minor + 1)) if bump == "minor" else "..."
+              sys.exit(
+                  f"Current version {current!r} is a release candidate of the "
+                  f"upcoming {major}.{minor}.{patch} release. To ship it, use "
+                  f"bump='finalize' (-> {major}.{minor}.{patch}). A '{bump}' bump "
+                  f"from an rc would skip {major}.{minor}.{patch} entirely "
+                  f"(e.g. -> {nxt}); that is almost never intended."
+              )
+          elif bump == "major":
               major, minor, patch = major + 1, 0, 0
           elif bump == "minor":
               minor, patch = minor + 1, 0
-          elif bump == "patch":
+          elif bump == "bugfix":
               patch += 1
-          elif bump == "rc":
-              # Keep the same base; just walk the rc counter forward.
-              is_rc = True
-              rc_n  = (rc_n or 0) + 1
-          elif bump == "stable":
-              # Promote the current rc to its stable base version.
-              if rc_n is None:
-                  sys.exit(f"bump=stable but current version {current!r} has no -rc suffix")
-              is_rc = False
 
-          if is_rc:
-              if bump != "rc":
+          if is_beta:
+              if bump != "pre-release":
                   rc_n = 1          # fresh rc series for the new base
               print(f"{major}.{minor}.{patch}-rc.{rc_n}", end="")
           else:
@@ -99,9 +127,15 @@ jobs:
           PYEOF
           )
 
+          # Derive is_beta from the COMPUTED version (ends in -rc.N?), not the
+          # raw input — so 'finalize' is always treated as stable and a
+          # mismatched beta checkbox can't mislabel the release channel.
+          if [[ "$NEW_VERSION" =~ -rc\.[0-9]+$ ]]; then IS_BETA_OUT=true; else IS_BETA_OUT=false; fi
+
           echo "new_version=$NEW_VERSION"     >> "$GITHUB_OUTPUT"
           echo "tag=v$NEW_VERSION"            >> "$GITHUB_OUTPUT"
           echo "branch=release/v$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "is_beta=$IS_BETA_OUT"         >> "$GITHUB_OUTPUT"
           echo "Bumping (${BUMP}): $CURRENT → $NEW_VERSION"
 
       - name: Fail if the tag already exists
