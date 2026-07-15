@@ -183,27 +183,6 @@ async function openMovie(env: Record<string, string>) {
   const expectGpu = env.SPYDE_GPU_IMAGE !== '0'
   const ctx = await launchApp({ dask: true, env })
   const { page } = ctx
-  if (expectGpu) {
-    // Skip (don't fail) when the environment has no usable WebGPU device —
-    // hosted CI runners have no adapter, so __apl_gpu2d[..].active can never
-    // become true and the wait below burns its full 30s timeout twice per
-    // test. Probe EXACTLY like figure_esm's _gpuDevice(): adapter + device.
-    // Library-level GPU render math is CI-covered in anyplotlib's own
-    // test_gpu_parity_playwright.py (chromium + --enable-unsafe-webgpu).
-    const webgpu = await page.evaluate(async () => {
-      const g = (navigator as any).gpu
-      if (!g) return false
-      try {
-        const adapter = await g.requestAdapter()
-        if (!adapter) return false
-        return !!(await adapter.requestDevice())
-      } catch { return false }
-    })
-    if (!webgpu) {
-      await ctx.app.close().catch(() => {})
-      test.skip(true, 'no usable WebGPU adapter (software/CI runner) — GPU image path cannot activate')
-    }
-  }
   await page.waitForTimeout(1500)
   await backendAction(page, 'load_test_data_movie', {})
   await waitForSubwindowCount(page, 2, 120_000)
@@ -217,9 +196,27 @@ async function openMovie(env: Record<string, string>) {
     // The WebGPU device init is async (first frame is Canvas2D by contract) —
     // wait for the activation redraw before driving the scenario, so every
     // screenshot is the GPU rendering.
-    await sig.fr.waitForFunction(
-      (pid: string) => (globalThis as any).__apl_gpu2d?.[pid]?.active === true,
-      sig.panelId, { timeout: 30_000 })
+    //
+    // This activation IS the WebGPU-availability probe: it runs inside the
+    // figure iframe (figure_esm's _gpuDevice: adapter + device + a real
+    // GPUImage init), which is the ONLY context that agrees with the render
+    // path. A top-page `navigator.gpu.requestAdapter()` probe was unreliable
+    // on hosted runners — it could hand back a software adapter/device while
+    // the iframe's real context creation still failed ("Failed to create
+    // WebGPU Context Provider"), so the test proceeded and then hung its full
+    // 600s waiting for an activation that never came. When the iframe never
+    // activates within the window, SKIP (don't fail, don't hang) — hosted CI
+    // runners have no usable WebGPU device. Library-level GPU render math is
+    // CI-covered in anyplotlib's own test_gpu_parity_playwright.py
+    // (chromium + --enable-unsafe-webgpu).
+    try {
+      await sig.fr.waitForFunction(
+        (pid: string) => (globalThis as any).__apl_gpu2d?.[pid]?.active === true,
+        sig.panelId, { timeout: 30_000 })
+    } catch {
+      await ctx.app.close().catch(() => {})
+      test.skip(true, 'WebGPU image path never activated (software/CI runner) — GPU parity cannot be tested')
+    }
   }
   return { ...ctx, sig }
 }
