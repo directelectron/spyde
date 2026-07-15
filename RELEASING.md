@@ -1,10 +1,13 @@
 # Releasing SpyDE
 
-The single checklist for cutting a SpyDE release. The Python version is
-**derived from the git tag** (`setuptools_scm`), so tagging is the act that sets
-it. The one hand-maintained version string is `electron/package.json` — and the
-**Prepare Release** workflow (`.github/workflows/prepare_release.yml`) bumps it
-for you, so nothing is edited by hand in practice.
+The checklist for cutting a SpyDE release. In practice it is **two buttons** in
+the Actions tab: **Prepare Release** (bump the version, open a PR) → merge →
+**Release** (tag + build + publish). Nothing is edited or tagged by hand.
+
+The one hand-maintained version string is `electron/package.json`; Prepare
+Release bumps it, and the Release action reads it to tag + build. The Python
+version is **derived from the git tag** (`setuptools_scm`) — the Release action
+creates that tag, so tagging is automated, not a manual step.
 
 ## Versioning model
 
@@ -111,23 +114,25 @@ Run from a clean checkout of the commit you intend to tag.
    lockfile/pin pre-flight checks, and opens a `release/vX.Y.Z` PR.
 
    > Exception: if `electron/package.json` already equals the version you want
-   > to tag (no bump needed), skip straight to tagging.
+   > to release (no bump needed), skip step 1 and go straight to step 3.
 
 2. **Review and merge the PR** — CI runs the full matrix on it.
 
-3. **Tag the merge commit with exactly the tag named in the PR** and push:
+3. **Run the Release workflow** (Actions tab → *Release* → *Run workflow* on
+   `main`). No inputs: it reads the version from `electron/package.json` (the one
+   the merged PR just set), **creates and pushes the `vX.Y.Z` tag for you**, then
+   builds the Electron app + uv-managed Python sidecar on Windows / macOS / Linux
+   in parallel and publishes a single GitHub Release once all three legs pass
+   (`fail-fast`, so users never see a partial release). See `electron/PACKAGING.md`
+   and `DISTRIBUTION_PLAN.md` for how the installer stages `uv` + the locked
+   sources and builds the venv on first launch.
 
-   ```bash
-   git fetch origin
-   git tag vX.Y.Z origin/main
-   git push origin vX.Y.Z
-   ```
+   > There is **no manual `git tag`** step — the Release action owns tagging. The
+   > tag still lands in history (so `setuptools_scm` derives the Python version
+   > from it). If the version was already released, the action refuses to re-tag;
+   > bump via Prepare Release first.
 
-The tag triggers `.github/workflows/release.yml`, which builds the Electron app +
-uv-managed Python sidecar on Windows / macOS / Linux in parallel and publishes a
-single GitHub Release once all three legs pass (`fail-fast`, so users never see a
-partial release). See `electron/PACKAGING.md` and `DISTRIBUTION_PLAN.md` for how
-the installer stages `uv` + the locked sources and builds the venv on first launch.
+**That's the whole flow: two buttons — Prepare Release, then Release.**
 
 4. **Confirm the release actually has installers** before announcing it:
 
@@ -142,12 +147,13 @@ the installer stages `uv` + the locked sources and builds the venv on first laun
 
 ## ⚠️ Golden rule: NEVER create or edit the GitHub Release by hand
 
-`release.yml` owns the entire release object. It creates a **draft**, the three
-build legs upload installers **into that draft**, and only then does `finalize`
-un-draft it and stamp the beta/stable flag. Do **not**:
+`release.yml` owns the entire release object AND the tag. It creates the tag,
+creates a **draft** release, the three build legs upload installers **into that
+draft**, and only then does `finalize` un-draft it and stamp the beta/stable
+flag. Do **not**:
 
 - run `gh release create` / click "Draft a new release" for a release tag, or
-- create the release before pushing the tag, or
+- create the release (or the tag) by hand before running the Release action, or
 - flip a release's draft/prerelease flags manually mid-run.
 
 **Why this is load-bearing (this bit us on `v0.2.0-rc.1`):** electron-builder's
@@ -157,17 +163,23 @@ asset* (`"existing type not compatible with publishing type"`) — and, because
 that skip is non-fatal, the run goes **green with an empty release**. A
 hand-made release (created ~30 min before the workflow ran) is exactly what
 stranded `v0.2.0-rc.1` with zero installers. The workflow now force-drafts the
-release and hard-fails on a skipped publish, but the simplest guarantee is: push
-the tag and let CI do everything.
+release and hard-fails on a skipped publish, but the simplest guarantee is: run
+the **Release** action and let it do everything (tag + build + publish).
 
 ### If a release ends up empty anyway
 
-1. Delete the empty release (keep the tag):
-   `gh release delete vX.Y.Z --repo CSSFrancis/spyde --yes`
-2. Cut the **next** rc through Prepare Release (`bump=pre-release`) rather than
-   reusing the stranded tag — cleaner provenance. Re-pushing a deleted-release
-   tag also works (`git push origin :refs/tags/vX.Y.Z && git push origin vX.Y.Z`)
-   once no release object exists for it.
+The `finalize` asset-count gate should now prevent an empty release from ever
+publishing, but if you need to redo one:
+
+1. Delete the empty release **and** its tag (the Release action refuses to
+   re-tag an existing version):
+   ```bash
+   gh release delete vX.Y.Z --repo CSSFrancis/spyde --yes
+   git push origin :refs/tags/vX.Y.Z          # delete the remote tag
+   ```
+2. Re-run the **Release** action (Actions tab). With no release or tag for that
+   version, it recreates both cleanly. Or bump to the next rc via Prepare
+   Release first (`bump=pre-release`) for cleaner provenance.
 
 ## Notes
 

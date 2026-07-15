@@ -1,14 +1,23 @@
 name: Release
 
-# Fires only when a version tag (e.g. v0.1.0) is pushed.
-# Builds the Electron desktop app (with the uv-managed Python sidecar — see
+# The SECOND of the two release actions (the first is Prepare Release). Run it
+# manually from the Actions tab AFTER the release PR has merged — no arguments,
+# no hand-typed tag. It reads the version already in electron/package.json (which
+# Prepare Release bumped), CREATES + pushes the matching `vX.Y.Z` tag, then builds
+# the Electron desktop app (with the uv-managed Python sidecar — see
 # electron/PACKAGING.md, DISTRIBUTION_PLAN.md "Option A") on each platform in
 # parallel, publishing straight to a DRAFT GitHub Release so electron-builder
 # generates the latest.yml/latest-mac.yml/latest-linux.yml feeds electron-
 # updater's autoUpdater needs. The draft only goes live once all three legs
 # succeed (`finalize`, gated on `needs: build`) so users never see a partial
-# release — same "fail-fast, all-or-nothing" guarantee as before, just with
-# real update-feed metadata attached this time.
+# release.
+#
+# Why the workflow makes the tag itself (instead of a pushed tag triggering it):
+# it collapses the release to TWO button-clicks (Prepare Release → Release) with
+# nothing typed in a terminal, and it keeps everything in ONE run — so there is
+# no cross-workflow trigger (a tag pushed by GITHUB_TOKEN can't start another
+# workflow anyway). The tag still exists in history, so setuptools_scm derives
+# the Python version from it exactly as before.
 #
 # Job order is load-bearing: the release must be CREATED once, sequentially,
 # BEFORE the matrix — electron-builder's GitHub publisher finds-or-creates a
@@ -21,29 +30,38 @@ name: Release
 # user's machine on first launch via `uv sync`. torch is NOT baked into the
 # artifact.
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # create + push the tag; publish release assets
 
 jobs:
-  # ── Derive the update channel from the tag shape (stable vs beta) ───────────
-  # Plain vX.Y.Z -> stable. Any prerelease suffix (-rc.N / -beta.N / -alpha.N)
-  # -> beta. electron-updater's autoUpdater understands GitHub's own
-  # "prerelease" flag natively (allowPrerelease gates on it), so this one
-  # regex is what the whole channel feature hinges on downstream.
+  # ── Read the version from package.json, tag it, derive the channel ──────────
+  # electron/package.json is the source of truth (Prepare Release bumped it). We
+  # compute the tag = v<version>, CREATE + push it here, and derive the channel
+  # from its shape: plain vX.Y.Z -> stable; any -rc.N / -beta.N / -alpha.N ->
+  # beta (electron-updater's autoUpdater gates on GitHub's prerelease flag). All
+  # downstream jobs consume `needs.channel.outputs.{tag,version,channel,prerelease}`
+  # and check out `tag` (NOT github.ref, which is the branch under dispatch).
   channel:
-    name: Derive channel from tag
+    name: Tag + derive channel from package.json
     runs-on: ubuntu-latest
     outputs:
       channel: ${{ steps.detect.outputs.channel }}
       prerelease: ${{ steps.detect.outputs.prerelease }}
       version: ${{ steps.detect.outputs.version }}
+      tag: ${{ steps.detect.outputs.tag }}
     steps:
-      - name: Detect channel + version from tag
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read version + derive tag/channel
         id: detect
         run: |
-          tag="${GITHUB_REF_NAME}"
-          version="${tag#v}"
+          version="$(node -p "require('./electron/package.json').version")"
+          tag="v${version}"
           if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "channel=stable" >> "$GITHUB_OUTPUT"
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
@@ -52,6 +70,30 @@ jobs:
             echo "prerelease=true" >> "$GITHUB_OUTPUT"
           fi
           echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "Releasing ${tag} (from electron/package.json)."
+
+      # Refuse to release a version that's already been tagged — otherwise this
+      # would rebuild over an existing release. To ship a new build, bump via
+      # Prepare Release first. (Idempotency guard, same spirit as prepare_release.)
+      - name: Fail if the tag already exists
+        env:
+          TAG: ${{ steps.detect.outputs.tag }}
+        run: |
+          if git ls-remote --tags origin "refs/tags/$TAG" | grep -q .; then
+            echo "::error::tag $TAG already exists — bump the version via Prepare Release before releasing."
+            exit 1
+          fi
+
+      - name: Create and push the tag
+        env:
+          TAG: ${{ steps.detect.outputs.tag }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "$TAG"
+          git push origin "$TAG"
+          echo "Pushed $TAG."
 
   # ── Create the (draft) release BEFORE the matrix builds ─────────────────────
   # Sequential, single writer — sidesteps the concurrent-create race matrix
@@ -79,10 +121,11 @@ jobs:
       - name: Create draft GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: SpyDE ${{ github.ref_name }}
+          name: SpyDE ${{ needs.channel.outputs.tag }}
+          tag_name: ${{ needs.channel.outputs.tag }}
           draft: true
           body: |
-            ## SpyDE ${{ github.ref_name }}
+            ## SpyDE ${{ needs.channel.outputs.tag }}
 
             Desktop app (Electron) with a uv-managed Python backend. The
             installer is small — the analysis environment (incl. the GPU-correct
@@ -113,7 +156,7 @@ jobs:
       - name: Force the release to draft (and clear stale assets)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ needs.channel.outputs.tag }}
           REPO: ${{ github.repository }}
         run: |
           gh release edit "$TAG" --repo "$REPO" --draft=true
@@ -156,17 +199,20 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        # Full history + tags so setuptools_scm derives the real version from the
-        # pushed v* tag (a shallow checkout has no tags -> 0.0.postN.devN).
+        # Check out the TAG the channel job just created (under workflow_dispatch
+        # github.ref is `main`, not the tag). Full history + tags so
+        # setuptools_scm derives the real version from it (a shallow checkout has
+        # no tags -> 0.0.postN.devN).
         with:
+          ref: ${{ needs.channel.outputs.tag }}
           fetch-depth: 0
 
-      # electron/package.json's "version" is hand-set (RELEASING.md) — it's
-      # what electron-builder/electron-updater treat as the app's semver, so a
-      # drift here would ship an installer electron-updater can't reason about
-      # correctly (or a release that silently doesn't offer itself as an
-      # update). Fail fast rather than publish a mismatched build.
-      - name: Verify electron/package.json version matches the pushed tag
+      # The tag was derived FROM electron/package.json, but this build leg checks
+      # out the TAG ref — so re-assert they agree on the tagged commit. Guards
+      # against main moving between the channel job reading package.json and this
+      # checkout, which would otherwise ship an installer whose embedded semver
+      # (what electron-updater reasons about) doesn't match the release tag.
+      - name: Verify electron/package.json version matches the tag
         run: |
           pkg_version=$(node -p "require('./electron/package.json').version")
           tag_version="${{ needs.channel.outputs.version }}"
@@ -266,7 +312,7 @@ jobs:
       - name: Verify the release has assets before publishing
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ needs.channel.outputs.tag }}
           REPO: ${{ github.repository }}
         run: |
           count=$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets | length')
@@ -284,7 +330,7 @@ jobs:
       - name: Publish the release (un-draft + set channel)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ needs.channel.outputs.tag }}
           REPO: ${{ github.repository }}
           PRERELEASE: ${{ needs.channel.outputs.prerelease }}
         run: |
