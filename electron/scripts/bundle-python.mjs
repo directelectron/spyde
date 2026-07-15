@@ -63,16 +63,24 @@ function resolveSpydeVersion() {
 rmSync(outDir, { recursive: true, force: true })
 mkdirSync(outDir, { recursive: true })
 
-// 1. Project metadata + lock (reproducible `uv sync`). `.python-version` pins
-//    the interpreter uv resolves for the managed env — WITHOUT it uv picks the
-//    newest CPython (3.14), which has no CUDA torch wheels, and first-launch
-//    `uv sync` fails. It must travel with pyproject/lock into the payload.
-for (const f of ['pyproject.toml', 'uv.lock', '.python-version']) {
+// 1. Project metadata + lock (reproducible `uv sync`).
+for (const f of ['pyproject.toml', 'uv.lock']) {
   const src = join(repoRoot, f)
   if (!existsSync(src)) throw new Error(`missing ${f} at repo root`)
   copyFileSync(src, join(outDir, f))
   log(`staged ${f}`)
 }
+
+// Pin the interpreter for the PACKAGED env only. WITHOUT this, first-launch
+// `uv sync` picks the newest CPython (it grabbed 3.14), which has no CUDA torch
+// wheels → setup fails. We write `.python-version` ONLY into the payload, never
+// at the repo root: a root file would also hijack dev + the CI test matrix
+// (every `uv run` re-creates the venv at this version, so `uv sync --python
+// 3.10` then `uv run pytest` silently runs 3.12). Scoping it to the staged tree
+// keeps 3.12 for shipped users while dev/CI stay free to pick their own Python.
+const PAYLOAD_PYTHON = '3.12'
+writeFileSync(join(outDir, '.python-version'), PAYLOAD_PYTHON + '\n', 'utf8')
+log(`staged .python-version = ${PAYLOAD_PYTHON}`)
 
 // 2. The spyde source package (installed into the venv by uv sync). Exclude the
 //    test suite and caches to keep the payload small.
