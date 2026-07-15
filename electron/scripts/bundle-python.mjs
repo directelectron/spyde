@@ -82,22 +82,33 @@ const PAYLOAD_PYTHON = '3.12'
 writeFileSync(join(outDir, '.python-version'), PAYLOAD_PYTHON + '\n', 'utf8')
 log(`staged .python-version = ${PAYLOAD_PYTHON}`)
 
-// 2. The spyde source package (installed into the venv by uv sync). Exclude the
-//    test suite and caches to keep the payload small.
-cpSync(join(repoRoot, 'spyde'), join(outDir, 'spyde'), {
-  recursive: true,
-  filter: (src) => {
-    // Normalise separators: cpSync hands back backslash paths on Windows, so a
-    // hard-coded "spyde/tests" check would silently fail to exclude the tests.
-    const p = src.replaceAll('\\', '/')
-    return (
-      !p.includes('/spyde/tests') &&
-      !p.includes('__pycache__') &&
-      !p.endsWith('.pyc')
-    )
-  },
+// 2. A PRE-BUILT spyde wheel — NOT the source tree.
+//    Building `spyde` from source on first launch is impossible when the app is
+//    installed read-only (e.g. C:\Program Files): setuptools' build_wheel runs
+//    egg_info, which writes `spyde.egg-info` INTO the source dir → "could not
+//    create 'spyde.egg-info': Access is denied", and `uv sync` exits 1. (This
+//    bit rc.2 AND rc.3; --no-editable does NOT help — a wheel build still writes
+//    egg_info into the tree.) So we build the wheel HERE, where the repo is
+//    writable, and ship the .whl. pythonEnv.ts installs it with
+//    `uv pip install --no-deps` after syncing the deps with --no-install-project,
+//    so NOTHING is built on the user's machine. spyde is pure-Python → one
+//    py3-none-any wheel works on every platform + Python we ship.
+const wheelsDir = join(outDir, 'wheels')
+mkdirSync(wheelsDir, { recursive: true })
+// setuptools_scm can't see a version from the (git-less at build? no — CI has
+// git) tree reliably across environments; pin the already-validated release
+// version so the wheel's metadata matches the tag / package.json.
+const wheelVersion = resolveSpydeVersion()
+const scmEnv = wheelVersion
+  ? { ...process.env, SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SPYDE: wheelVersion,
+      SETUPTOOLS_SCM_PRETEND_VERSION: wheelVersion }
+  : process.env
+execSync(`uv build --wheel --out-dir "${wheelsDir}"`, {
+  cwd: repoRoot, stdio: 'inherit', env: scmEnv,
 })
-log('staged spyde/ source')
+const builtWheel = readdirSync(wheelsDir).find((f) => f.endsWith('.whl'))
+if (!builtWheel) throw new Error('uv build produced no spyde wheel')
+log(`staged spyde wheel: ${builtWheel}`)
 
 // 3. The uv binary.
 const vendored = join(__dirname, '..', 'vendor', 'uv', process.platform, uvName)

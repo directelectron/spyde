@@ -25,7 +25,7 @@
  * root — exactly the previous behaviour.
  */
 import { spawn } from 'child_process'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'fs'
 import { createHash } from 'crypto'
 import { join } from 'path'
 
@@ -252,12 +252,50 @@ export function installTorchPerMachine(
   )
 }
 
+/** The pre-built spyde wheel staged by bundle-python.mjs at <projectDir>/wheels/
+ *  (a single py3-none-any .whl). Null in dev (no staged wheel) → the caller
+ *  installs the project from source the old way (dev tree is writable). */
+function stagedSpydeWheel(projectDir: string): string | null {
+  const dir = join(projectDir, 'wheels')
+  if (!existsSync(dir)) return null
+  try {
+    const whl = readdirSync(dir).find((f) => f.startsWith('spyde') && f.endsWith('.whl'))
+    return whl ? join(dir, whl) : null
+  } catch { return null }
+}
+
+/**
+ * Install the PRE-BUILT spyde wheel into the managed env with no dependency
+ * resolution (`--no-deps` — the sync already installed every dependency). This
+ * is the whole reason the wheel exists: it avoids building spyde from the
+ * read-only shipped source tree (setuptools' egg_info write → "Access is
+ * denied", the rc.2/rc.3 first-launch crash). Throws on failure.
+ */
+function installSpydeWheel(
+  projectDir: string,
+  envDir: string,
+  wheel: string,
+  onProgress?: (line: string) => void,
+): Promise<void> {
+  onProgress?.(`[env-setup] installing spyde from wheel ${wheel.split(/[\\/]/).pop()}\n`)
+  return runUv(
+    projectDir, envDir,
+    ['pip', 'install', '--no-deps', '--python', venvPython(envDir), wheel],
+    '', onProgress,
+  )
+}
+
 /**
  * Create/refresh the managed env. On win32/linux (the platforms where the lock
  * pins CUDA torch) this is the two-step per-machine install; on failure — or on
  * macOS, or when the lock has no readable torch pin — the plain full
  * `uv sync --frozen --no-dev` (the original, known-good path) runs instead.
- * Logs which path ran to the progress stream.
+ *
+ * When a pre-built spyde wheel is staged (the packaged app), the syncs use
+ * `--no-install-project` (resolve + install DEPS only, never build spyde) and
+ * spyde is installed from the wheel afterwards — so NOTHING is built from the
+ * read-only source tree. In dev (no staged wheel) the project installs from
+ * source as before. Logs which path ran to the progress stream.
  */
 async function setupEnv(
   projectDir: string,
@@ -265,6 +303,11 @@ async function setupEnv(
   spydeVersion: string,
   onProgress?: (line: string) => void,
 ): Promise<void> {
+  const wheel = stagedSpydeWheel(projectDir)
+  // With a staged wheel, tell uv sync NOT to touch the project (spyde builds
+  // from the read-only tree otherwise); we install the wheel separately.
+  const projectArgs = wheel ? ['--no-install-project'] : ['--no-editable']
+
   const twoStep =
     (process.platform === 'win32' || process.platform === 'linux') &&
     readLockedTorchVersion(projectDir) !== null
@@ -273,20 +316,17 @@ async function setupEnv(
     try {
       onProgress?.('[env-setup] two-step install: uv sync (lock-exact, torch deferred) '
         + 'then torch via --torch-backend=auto\n')
-      // Step 1: everything except torch, exactly as locked. torch is the only
-      // torch-family package in the lock, so one exclusion covers it.
-      // --no-editable: the shipped `spyde` source lives under a READ-ONLY
-      // install dir (e.g. C:\Program Files\SpyDE\resources\python). An editable
-      // install writes `spyde.egg-info` INTO that source tree → "Access is
-      // denied" and the whole sync fails. Non-editable builds the wheel in a
-      // temp dir and installs it into the venv, touching nothing in the bundle.
+      // Step 1: every DEPENDENCY except torch, exactly as locked. torch is the
+      // only torch-family package in the lock, so one exclusion covers it.
       await runUv(
         projectDir, envDir,
-        ['sync', '--frozen', '--no-dev', '--no-editable', '--no-install-package', 'torch'],
+        ['sync', '--frozen', '--no-dev', ...projectArgs, '--no-install-package', 'torch'],
         spydeVersion, onProgress,
       )
       // Step 2: torch resolved for this machine.
       await installTorchPerMachine(projectDir, envDir, onProgress)
+      // Step 3: spyde itself, from the pre-built wheel (packaged only).
+      if (wheel) await installSpydeWheel(projectDir, envDir, wheel, onProgress)
       onProgress?.('[env-setup] per-machine torch install complete\n')
       return
     } catch (err) {
@@ -297,7 +337,6 @@ async function setupEnv(
   }
 
   onProgress?.('[env-setup] running full locked uv sync\n')
-  // --no-editable: see the two-step branch — never write egg-info into the
-  // read-only shipped source tree.
-  await runUv(projectDir, envDir, ['sync', '--frozen', '--no-dev', '--no-editable'], spydeVersion, onProgress)
+  await runUv(projectDir, envDir, ['sync', '--frozen', '--no-dev', ...projectArgs], spydeVersion, onProgress)
+  if (wheel) await installSpydeWheel(projectDir, envDir, wheel, onProgress)
 }
