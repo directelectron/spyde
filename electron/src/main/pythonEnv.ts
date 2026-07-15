@@ -160,7 +160,7 @@ function readSpydeVersion(projectDir: string): string {
  * exits 1 (the first-launch crash). Absent in dev (marker not present) → the
  * env is unchanged and setuptools_scm resolves from the repo's git history.
  */
-function uvEnv(envDir: string, spydeVersion: string): NodeJS.ProcessEnv {
+function uvEnv(envDir: string, spydeVersion: string, projectDir?: string): NodeJS.ProcessEnv {
   // Pretend-version env for setuptools_scm. The dist-name–scoped var
   // (…_FOR_SPYDE — setuptools_scm normalises "spyde" to the env suffix "SPYDE")
   // is the precise one; the plain SETUPTOOLS_SCM_PRETEND_VERSION is a harmless
@@ -171,9 +171,25 @@ function uvEnv(envDir: string, spydeVersion: string): NodeJS.ProcessEnv {
         SETUPTOOLS_SCM_PRETEND_VERSION: spydeVersion,
       }
     : {}
+  // Put the vendored portable git (bundle-python.mjs staged it at
+  // <projectDir>/git) on PATH so `uv sync` can resolve `git+https://…` deps
+  // (the hyperspy fork) on machines with no system git. MinGit's launcher is in
+  // git/cmd on Windows; git/bin holds it on posix. Prepend so ours wins; fall
+  // through to any system git if the vendored one is absent (dev builds).
+  const gitDir = projectDir ? join(projectDir, 'git') : ''
+  const gitBins = gitDir
+    ? [join(gitDir, 'cmd'), join(gitDir, 'bin')].filter((d) => existsSync(d))
+    : []
+  const pathKey = isWin ? 'Path' : 'PATH'
+  const basePath = process.env[pathKey] ?? process.env.PATH ?? ''
+  const mergedPath = gitBins.length
+    ? [...gitBins, basePath].join(isWin ? ';' : ':')
+    : basePath
+
   return {
     ...process.env,
     ...scmEnv,
+    [pathKey]: mergedPath,
     // UV_PROJECT_ENVIRONMENT redirects `uv sync`'s venv out of the read-only
     // resources into the writable user dir. (Ignored by `uv pip install`,
     // which targets via --python — verified; harmless to set for both.)
@@ -197,7 +213,7 @@ function runUv(
   return new Promise((resolve, reject) => {
     const proc = spawn(uvCmd, args, {
       cwd: projectDir,
-      env: uvEnv(envDir, spydeVersion),
+      env: uvEnv(envDir, spydeVersion, projectDir),
       stdio: ['ignore', 'pipe', 'pipe'],
     })
     const relay = (b: Buffer) => onProgress?.(b.toString())
@@ -259,9 +275,14 @@ async function setupEnv(
         + 'then torch via --torch-backend=auto\n')
       // Step 1: everything except torch, exactly as locked. torch is the only
       // torch-family package in the lock, so one exclusion covers it.
+      // --no-editable: the shipped `spyde` source lives under a READ-ONLY
+      // install dir (e.g. C:\Program Files\SpyDE\resources\python). An editable
+      // install writes `spyde.egg-info` INTO that source tree → "Access is
+      // denied" and the whole sync fails. Non-editable builds the wheel in a
+      // temp dir and installs it into the venv, touching nothing in the bundle.
       await runUv(
         projectDir, envDir,
-        ['sync', '--frozen', '--no-dev', '--no-install-package', 'torch'],
+        ['sync', '--frozen', '--no-dev', '--no-editable', '--no-install-package', 'torch'],
         spydeVersion, onProgress,
       )
       // Step 2: torch resolved for this machine.
@@ -276,5 +297,7 @@ async function setupEnv(
   }
 
   onProgress?.('[env-setup] running full locked uv sync\n')
-  await runUv(projectDir, envDir, ['sync', '--frozen', '--no-dev'], spydeVersion, onProgress)
+  // --no-editable: see the two-step branch — never write egg-info into the
+  // read-only shipped source tree.
+  await runUv(projectDir, envDir, ['sync', '--frozen', '--no-dev', '--no-editable'], spydeVersion, onProgress)
 }

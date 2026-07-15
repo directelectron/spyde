@@ -14,7 +14,7 @@
  * otherwise copies the `uv` found on PATH. CI should populate vendor/ with the
  * pinned uv for each target OS.
  */
-import { cpSync, existsSync, mkdirSync, rmSync, copyFileSync, chmodSync, readFileSync, writeFileSync } from 'fs'
+import { cpSync, existsSync, mkdirSync, rmSync, copyFileSync, chmodSync, readdirSync, readFileSync, writeFileSync } from 'fs'
 import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
 import { execSync } from 'child_process'
@@ -63,8 +63,11 @@ function resolveSpydeVersion() {
 rmSync(outDir, { recursive: true, force: true })
 mkdirSync(outDir, { recursive: true })
 
-// 1. Project metadata + lock (reproducible `uv sync`).
-for (const f of ['pyproject.toml', 'uv.lock']) {
+// 1. Project metadata + lock (reproducible `uv sync`). `.python-version` pins
+//    the interpreter uv resolves for the managed env — WITHOUT it uv picks the
+//    newest CPython (3.14), which has no CUDA torch wheels, and first-launch
+//    `uv sync` fails. It must travel with pyproject/lock into the payload.
+for (const f of ['pyproject.toml', 'uv.lock', '.python-version']) {
   const src = join(repoRoot, f)
   if (!existsSync(src)) throw new Error(`missing ${f} at repo root`)
   copyFileSync(src, join(outDir, f))
@@ -105,6 +108,37 @@ const uvDst = join(outDir, uvName)
 copyFileSync(uvSrc, uvDst)
 if (!isWin) chmodSync(uvDst, 0o755)
 log(`staged ${uvName}`)
+
+// 3b. Vendored git (portable). Some dependencies are `git+https://…` sources
+//     (the cssfrancis/hyperspy fork), which `uv sync` resolves by shelling out
+//     to `git clone`. A clean user machine often has NO git on PATH → "Git
+//     operation failed" and first-launch setup dies. So ship a portable git in
+//     the payload (like uv above); pythonEnv.ts prepends its bin dir to PATH for
+//     the sync. Staged from electron/vendor/git/<platform>/ (a MinGit tree on
+//     Windows). Optional in DEV — if absent we log and skip, and the sync falls
+//     back to any git on PATH (the dev box has one). CI MUST populate vendor/git
+//     for a shippable installer.
+const vendoredGit = join(__dirname, '..', 'vendor', 'git', process.platform)
+if (existsSync(vendoredGit)) {
+  const gitDst = join(outDir, 'git')
+  cpSync(vendoredGit, gitDst, { recursive: true })
+  // Make the git executables runnable on posix (Windows ignores the mode).
+  if (!isWin) {
+    for (const sub of ['bin', 'libexec/git-core']) {
+      const d = join(gitDst, sub)
+      if (existsSync(d)) {
+        for (const f of readdirSync(d)) {
+          try { chmodSync(join(d, f), 0o755) } catch { /* best-effort */ }
+        }
+      }
+    }
+  }
+  log('staged vendored git')
+} else {
+  log(`vendor/git/${process.platform} not found; NOT staging git — first-launch ` +
+      '`uv sync` will need a git on the user\'s PATH for git+https deps. ' +
+      'CI must populate electron/vendor/git/<platform>/ for a shippable build.')
+}
 
 // 4. Version marker: the staged tree has no `.git`, so setuptools_scm can't
 //    detect a version at first-launch `uv sync` time (-> LookupError, exit 1).
