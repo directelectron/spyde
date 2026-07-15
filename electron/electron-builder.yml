@@ -28,21 +28,24 @@ extraResources:
     to: python
     filter: ["**/*"]
 
-# Icons: the same set already used by the PyCrucible portable build
-# (crucible.toml) — single source of truth, referenced from ../spyde/ rather
-# than duplicated under electron/build/. electron-builder resolves relative to
-# this file's directory (electron/), so ../ reaches the repo root.
+# Icons: ONE source image (../spyde/Spyde.png, a 512x512 RGBA export of
+# Spyde.svg) for every platform. electron-builder auto-generates the macOS
+# .icns and the Windows .ico from this PNG at build time via its bundled
+# app-builder converter — so there is no hand-maintained .ico/.icns to keep in
+# sync with the artwork; re-export the PNG from Spyde.svg and all three
+# platforms follow. electron-builder resolves relative to this file's directory
+# (electron/), so ../ reaches the repo root.
 mac:
   category: public.app-category.education
   target: [dmg]
-  icon: ../spyde/icon.icns
+  icon: ../spyde/Spyde.png
   # Unsigned for now — Gatekeeper will warn; see PACKAGING.md for the
   # sign+notarize follow-up (needs an Apple Developer ID).
   identity: null
 
 win:
   target: [nsis]
-  icon: ../spyde/Spyde.ico
+  icon: ../spyde/Spyde.png
 
 # Per-user NSIS installer: no admin, Start-Menu + desktop shortcuts, uninstaller,
 # user-chosen install dir.
