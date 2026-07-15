@@ -26,7 +26,12 @@ dependencies = [
     "distributed",
     "dask",
     "hyperspy@git+https://github.com/cssfrancis/hyperspy.git@f314cf42aa16a06d82449cd8dc8c8f57df2e3e72",
-    "rosettasciio@git+https://github.com/cssfrancis/rosettasciio.git@ab4f4562c62c1bf5130c5c9a1999929c7b7c5b35",
+    # Upstream PyPI rosettasciio (was a cssfrancis fork whose only delta was an
+    # MRC-read speed/memory optimisation — see git history). Dropped the fork so
+    # the installer no longer needs to git-clone it; large .mrc files just read
+    # via the stock memmap path instead of the fork's chunked-run reader. The
+    # [hdf5,image] extras cover .hspy / .tif reading (hyperspy pins the same).
+    "rosettasciio[hdf5,image]>=0.14.0",
     "pyxem",
     "imageio-ffmpeg",
     "imagecodecs",
@@ -49,7 +54,12 @@ keywords = [
     "4D STEM",
 ]
 name = "spyde"
-requires-python = ">=3.10"
+# Upper bound is load-bearing for the SHIPPED app, not just a courtesy: with an
+# open bound uv installs the newest CPython on a fresh machine (it grabbed 3.14),
+# for which the CUDA torch wheels (cp310–cp313) don't exist → first-launch
+# `uv sync` fails. Cap below 3.14 and ship a `.python-version` (= 3.12) so the
+# managed env resolves an interpreter every dependency has wheels for.
+requires-python = ">=3.10,<3.14"
 
 [tool.uv]
 # When running via the PyCrucible launcher, install only core dependencies —

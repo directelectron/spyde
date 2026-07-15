@@ -203,6 +203,29 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends fuse libfuse2
 
+      # ── Vendor a portable git into the payload (Windows only) ────────────────
+      # `uv sync` resolves the git+https hyperspy fork by shelling out to `git`,
+      # and a clean Windows user machine often has NO git → first-launch setup
+      # fails ("Git operation failed"). bundle-python.mjs stages
+      # electron/vendor/git/win32/ into the installer; this step populates it with
+      # the official MinGit. macOS/Linux ship git, so they need no vendored copy.
+      - name: Vendor MinGit (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          MINGIT_VER: "2.51.0"
+          MINGIT_TAG: "v2.51.0.windows.1"
+        run: |
+          dest="electron/vendor/git/win32"
+          mkdir -p "$dest"
+          url="https://github.com/git-for-windows/git/releases/download/${MINGIT_TAG}/MinGit-${MINGIT_VER}-64-bit.zip"
+          echo "Downloading $url"
+          curl -fsSL -o mingit.zip "$url"
+          unzip -q mingit.zip -d "$dest"
+          # Sanity: the launcher must exist where pythonEnv.ts adds it to PATH.
+          test -f "$dest/cmd/git.exe" || test -f "$dest/bin/git.exe"
+          "$dest/cmd/git.exe" --version || "$dest/bin/git.exe" --version
+
       - name: Install Electron dependencies
         working-directory: electron
         run: npm ci
