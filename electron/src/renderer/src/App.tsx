@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react'
 import { SpyDEProvider } from './kernel/SpyDEContext'
 import { MDIArea } from './components/MDIArea'
 import { PlotControlDock } from './components/PlotControlDock'
+import { ReportSidebar } from './components/ReportSidebar'
 import { ConsoleBar } from './components/ConsoleBar'
 import { StatusBar } from './components/StatusBar'
 import { LogPanel } from './components/LogPanel'
@@ -10,12 +11,14 @@ import { NavShapeGate } from './components/NavShapeGate'
 import { StackGate } from './components/StackGate'
 import { UpdateGate } from './components/UpdateGate'
 import { GpuStatusGate } from './components/GpuStatusGate'
+import { GpuHelpGate } from './components/GpuHelpGate'
 import { UpdateBanner } from './components/UpdateBanner'
 import { MenuBar } from './components/MenuBar'
 import { GUIDES, getGuide, type Guide } from '@guides/index'
 
 export function App() {
   const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [reportOpen, setReportOpen] = useState(false)
   const [logOpen, setLogOpen] = useState(false)
   const [tour, setTour] = useState<Guide | null>(null)
 
@@ -34,12 +37,15 @@ export function App() {
         <AppBar
           sidebarOpen={sidebarOpen}
           onToggleSidebar={() => setSidebarOpen(v => !v)}
+          reportOpen={reportOpen}
+          onToggleReport={() => setReportOpen(v => !v)}
           onStartGuide={(g) => setTour(g)}
         />
         <UpdateBanner />
         <div style={styles.body}>
           <MDIArea />
           {sidebarOpen && <PlotControlDock />}
+          {reportOpen && <ReportSidebar />}
         </div>
         <LogPanel open={logOpen} onClose={() => setLogOpen(false)} />
         <ConsoleBar />
@@ -52,9 +58,10 @@ export function App() {
       {/* Load Stack dialog — reorderable list of datasets to combine into one
           5D stack; opened from File → Load Stack…. */}
       <StackGate />
-      {/* Help → Check for Updates… / GPU Status… */}
+      {/* Help → Check for Updates… / GPU Status… / GPU & CUDA */}
       <UpdateGate />
       <GpuStatusGate />
+      <GpuHelpGate />
     </SpyDEProvider>
   )
 }
@@ -124,12 +131,28 @@ function PanelIcon({ open }: { open: boolean }) {
   )
 }
 
+// Report-panel toggle glyph: a document with lines (a report page).
+function ReportIcon({ open }: { open: boolean }) {
+  return (
+    <svg width="15" height="15" viewBox="0 0 16 16" fill="none"
+         stroke="currentColor" strokeWidth="1.3">
+      <rect x="3" y="1.75" width="10" height="12.5" rx="1.5"
+            fill={open ? 'currentColor' : 'none'} opacity={open ? 0.2 : 1} />
+      <line x1="5.25" y1="5" x2="10.75" y2="5" />
+      <line x1="5.25" y1="8" x2="10.75" y2="8" />
+      <line x1="5.25" y1="11" x2="8.75" y2="11" />
+    </svg>
+  )
+}
+
 // Frameless-window top bar. The whole bar is a drag region (so the OS window can
 // be moved); interactive controls opt out with -webkit-app-region: no-drag. Left
 // padding clears the macOS traffic-light buttons (titleBarStyle: hiddenInset).
-function AppBar({ sidebarOpen, onToggleSidebar, onStartGuide }: {
+function AppBar({ sidebarOpen, onToggleSidebar, reportOpen, onToggleReport, onStartGuide }: {
   sidebarOpen: boolean
   onToggleSidebar: () => void
+  reportOpen: boolean
+  onToggleReport: () => void
   onStartGuide: (g: Guide) => void
 }) {
   const [hover, setHover] = useState(false)
@@ -155,6 +178,7 @@ function AppBar({ sidebarOpen, onToggleSidebar, onStartGuide }: {
       </div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 2, ...noDrag }}>
         <HelpButton onStartGuide={onStartGuide} />
+        <ReportToggle open={reportOpen} onToggle={onToggleReport} />
         <button
           data-testid="toggle-sidebar"
           aria-label={sidebarOpen ? 'Hide control panel' : 'Show control panel'}
@@ -172,6 +196,30 @@ function AppBar({ sidebarOpen, onToggleSidebar, onStartGuide }: {
         </button>
       </div>
     </div>
+  )
+}
+
+// Report-panel toggle button (its own hover state, next to the control-panel
+// toggle). Opening/closing the report sidebar is pure renderer UI state — no
+// backend action fires here, so StrictMode's double-mount can't double-send.
+function ReportToggle({ open, onToggle }: { open: boolean; onToggle: () => void }) {
+  const [hover, setHover] = useState(false)
+  return (
+    <button
+      data-testid="toggle-report"
+      aria-label={open ? 'Hide report' : 'Show report'}
+      title={open ? 'Hide report' : 'Show report'}
+      onClick={onToggle}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{
+        ...styles.iconBtn,
+        color: open ? '#cdd6f4' : '#7f849c',
+        background: hover ? '#2a2a3c' : 'transparent',
+      }}
+    >
+      <ReportIcon open={open} />
+    </button>
   )
 }
 

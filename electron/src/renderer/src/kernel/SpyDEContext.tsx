@@ -8,6 +8,14 @@ import React, {
   createContext, useContext, useEffect, useReducer, useRef, useState,
 } from 'react'
 import { asPlotAppMessage } from './protocol'
+import type { ReportDocState, ReportCell } from './protocol'
+import { WINDOW_DRAG_MIME, FIGURE_DRAG_MIME } from './dnd'
+
+// Re-export the report doc types so components import them from the kernel
+// context (the single import surface the rest of the renderer already uses).
+export type {
+  ReportDocState, ReportCell, RepfigSpec, RepfigPanel, RepfigLayer,
+} from './protocol'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -148,6 +156,14 @@ export interface AxisRow {
 interface State {
   windows: Map<number, SpyDEWindow>
   figures: Map<string, SpyDEFigure>
+  // Report figure cells' iframes — same SpyDEFigure shape + same figId-keyed
+  // iframeRefs/replayState binary-replay machinery, but keyed by CELL id and
+  // kept OUT of the MDI `windows`/`figures` state so they never open an MDI
+  // subwindow. `host:"report"` figure messages route here.
+  reportFigures: Map<string, SpyDEFigure>
+  // The authoritative report document (mirrored from `report_state`), or null
+  // before any report is opened/created.
+  report: ReportDocState | null
   metadata: Map<number, MetadataDict>
   histograms: Map<number, Histogram>
   selectors: Map<number, SelectorInfo>
@@ -168,7 +184,7 @@ interface State {
   navShapePrompt: NavShapePrompt | null   // pending scan-shape/step-size dialog
   loading: { busy: boolean; text: string }   // long file-read busy indicator
   signalTypes: Map<number, { current: string; options: string[] }>   // windowId → signal-type info
-  backendExited: { code: number | null } | null   // set when the Python sidecar dies; surfaces a blocking banner
+  backendExited: { code: number | null; reason?: string } | null   // set when the Python sidecar dies; surfaces a blocking banner
   playback: { playing: boolean; speed: number; loop: boolean }   // movie playback clock (session-wide)
   consoleResult: ConsoleResult | null       // last-executed cell (the ConsoleBar echo strip)
   consoleVars: ConsoleVarEntry[]            // live variable table (chips + signal-ref resolution)
@@ -212,12 +228,14 @@ type Action =
   | { type: 'LOG'; entry: LogEntry }
   | { type: 'LOG_BACKFILL'; entries: LogEntry[] }
   | { type: 'LOG_LEVEL'; level: string }
-  | { type: 'BACKEND_EXITED'; code: number | null }
+  | { type: 'BACKEND_EXITED'; code: number | null; reason?: string }
   | { type: 'PLAYBACK'; playing: boolean; speed: number; loop: boolean }
   | { type: 'CONSOLE_RESULT'; result: ConsoleResult }
   | { type: 'CONSOLE_VARS'; vars: ConsoleVarEntry[] }
   | { type: 'CONSOLE_COMPLETIONS'; completeId: number; matches: string[] }
   | { type: 'CONSOLE_PREVIEW_RESULT'; preview: ConsolePreviewResult }
+  | { type: 'REPORT_STATE'; report: ReportDocState }
+  | { type: 'REPORT_FIGURE'; cellId: string; figure: SpyDEFigure }
 
 function spydeReducer(state: State, action: Action): State {
   switch (action.type) {
@@ -448,6 +466,38 @@ function spydeReducer(state: State, action: Action): State {
     case 'CONSOLE_PREVIEW_RESULT':
       return { ...state, consolePreview: action.preview }
 
+    case 'REPORT_STATE': {
+      // Prune `reportFigures` to the cells the authoritative document still
+      // has — a cell can be removed (report_remove_cell / undo / New / a
+      // different report opened) without ever going through REPORT_FIGURE
+      // again, so nothing else would otherwise evict its stale entry. A
+      // closed report (open:false) clears every report figure outright. This
+      // only ever removes figIds that were stamped into `reportFigures` by a
+      // REPORT_FIGURE action (i.e. belonged to a report cell) — MDI `figures`
+      // is a completely separate map and is untouched here.
+      if (!action.report.open) {
+        return { ...state, report: action.report, reportFigures: new Map() }
+      }
+      const liveIds = new Set(action.report.cells.map(c => c.id))
+      let reportFigures = state.reportFigures
+      for (const cellId of reportFigures.keys()) {
+        if (!liveIds.has(cellId)) {
+          if (reportFigures === state.reportFigures) reportFigures = new Map(reportFigures)
+          reportFigures.delete(cellId)
+        }
+      }
+      return { ...state, report: action.report, reportFigures }
+    }
+
+    case 'REPORT_FIGURE': {
+      // A report figure cell's iframe (host:"report"), keyed by CELL id. A
+      // re-render of the same cell (Refresh from live / rebind) replaces the
+      // entry with the fresh figId — the ReportFigureCell mounts the new one.
+      const reportFigures = new Map(state.reportFigures)
+      reportFigures.set(action.cellId, action.figure)
+      return { ...state, reportFigures }
+    }
+
     case 'SIGNAL_TREE': {
       const signalTrees = new Map(state.signalTrees)
       signalTrees.set(action.windowId, action.tree)
@@ -485,7 +535,12 @@ function spydeReducer(state: State, action: Action): State {
     }
 
     case 'BACKEND_EXITED':
-      return { ...state, backendExited: { code: action.code }, ready: false, status: 'Backend stopped' }
+      return {
+        ...state,
+        backendExited: { code: action.code, reason: action.reason },
+        ready: false,
+        status: 'Backend stopped',
+      }
 
     default:
       return state
@@ -504,6 +559,10 @@ interface SpyDEContextValue {
   sendAction: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
   setActiveWindow: (windowId: number) => void
   replayState: (figId: string) => void
+  // Harvest a rendered PNG from a figure's iframe (the anyplotlib export
+  // protocol). Resolves null on timeout/error. Used by the report save flow +
+  // any future PNG-export path.
+  requestFigurePng: (figId: string, timeoutMs?: number) => Promise<string | null>
   clearNavShapePrompt: () => void
   // Load Stack dialog (renderer-only UI state, opened from the File menu).
   stackDialogOpen: boolean
@@ -517,10 +576,20 @@ interface SpyDEContextValue {
   gpuStatusDialogOpen: boolean
   openGpuStatusDialog: () => void
   closeGpuStatusDialog: () => void
+  gpuHelpDialogOpen: boolean
+  openGpuHelpDialog: () => void
+  closeGpuHelpDialog: () => void
   // MDIArea registers its tile-all-windows function here so StatusBar's
   // "Tile" button can trigger it without threading window-layout state (which
   // lives in MDIArea's local refs) through the shared context.
   tileWindowsRef: React.MutableRefObject<(() => void) | null>
+  // What kind of thing is currently being dragged (set from window-level
+  // dragstart/dragend/drop capture listeners by inspecting the drag's MIME
+  // types). 'window' = a window/figure pill (carries a source window); null =
+  // nothing / an unrelated drag. Drives the MDI overlay-drop shield: only when
+  // a window pill is in flight do OTHER SubWindows mount their transparent
+  // drag-shield + "Overlay images" zone over the figure iframe.
+  dragKind: 'window' | null
 }
 
 const SpyDEContext = createContext<SpyDEContextValue | null>(null)
@@ -529,6 +598,8 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
   const [state, dispatch] = useReducer(spydeReducer, {
     windows: new Map(),
     figures: new Map(),
+    reportFigures: new Map(),
+    report: null,
     metadata: new Map(),
     composition: new Map(),
     histograms: new Map(),
@@ -570,10 +641,24 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
   // detaches the original ArrayBuffer) — matches the "latest-wins" paint
   // philosophy used throughout the nav/paint pipeline (see CLAUDE.md).
   const latestBinaryStates = useRef<Map<string, Map<string, { header: unknown; buffer: Uint8Array }>>>(new Map())
+  // Mirror reportFigures into a ref so the (stable-identity, deps-[]) message
+  // effect below can read the LATEST cell→figure map synchronously — e.g. to
+  // find a report cell's OLD figId before it's replaced, so its shadow state
+  // (latestStates/latestBinaryStates) can be evicted. Declared here (before the
+  // message effect) so the effect's closure captures a ref whose `.current` is
+  // always fresh; also read by the harvest effect further below.
+  const reportFiguresRef = useRef(state.reportFigures)
+  reportFiguresRef.current = state.reportFigures
+  // Mirror the authoritative report doc into a ref for the same reason (the
+  // deps-[] message effect + the e2e test hook read the LATEST doc synchronously).
+  const reportRef = useRef(state.report)
+  reportRef.current = state.report
   const tileWindowsRef = useRef<(() => void) | null>(null)
   const [stackDialogOpen, setStackDialogOpen] = useState(false)
   const [updateDialogOpen, setUpdateDialogOpen] = useState(false)
   const [gpuStatusDialogOpen, setGpuStatusDialogOpen] = useState(false)
+  const [gpuHelpDialogOpen, setGpuHelpDialogOpen] = useState(false)
+  const [dragKind, setDragKind] = useState<'window' | null>(null)
 
   // Post every stored state for a figure to its iframe (called on iframe load).
   const replayState = (figId: string) => {
@@ -600,6 +685,46 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     }
   }
 
+  // Ask a figure's iframe for a rendered PNG (the anyplotlib export protocol).
+  // Posts `{type:'anyplotlib_export_png', requestId, opts}` into the iframe and
+  // resolves on the matching `anyplotlib_export_png_result` window message.
+  // Resolves null on timeout / no iframe / error — so a save NEVER blocks on a
+  // figure that can't answer (the backend falls back to its baked PNG).
+  const requestFigurePng = React.useCallback(
+    (figId: string, timeoutMs = 1500): Promise<string | null> => {
+      const iframe = iframeRefs.current.get(figId)
+      if (!iframe?.contentWindow) return Promise.resolve(null)
+      const requestId = `png_${figId}_${Date.now()}_${Math.random().toString(36).slice(2)}`
+      return new Promise<string | null>((resolve) => {
+        let done = false
+        const finish = (v: string | null) => {
+          if (done) return
+          done = true
+          window.removeEventListener('message', onMsg)
+          clearTimeout(timer)
+          resolve(v)
+        }
+        const onMsg = (e: MessageEvent) => {
+          const d = e.data
+          if (d?.type === 'anyplotlib_export_png_result' && d.requestId === requestId) {
+            finish(typeof d.dataUrl === 'string' ? d.dataUrl : null)
+          }
+        }
+        window.addEventListener('message', onMsg)
+        const timer = setTimeout(() => finish(null), timeoutMs)
+        try {
+          iframe.contentWindow!.postMessage(
+            // includeWidgets: a PNG harvested while a cell is in EDIT MODE keeps
+            // the annotation widgets (harmless otherwise; anyplotlib never exports
+            // the edit chrome / grab handles).
+            { type: 'anyplotlib_export_png', requestId, opts: { includeWidgets: true } }, '*',
+          )
+        } catch { finish(null) }
+      })
+    },
+    [],
+  )
+
   // ── Python → Renderer message dispatch ──────────────────────────────────
 
   useEffect(() => {
@@ -623,9 +748,11 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
           break
 
         case 'backend_exited':
-          // The Python sidecar died (synthesised by runner.ts, not a PLOTAPP line).
-          // Surface a blocking banner — every sendAction after this no-ops.
-          dispatch({ type: 'BACKEND_EXITED', code: msg.code ?? null })
+          // The Python sidecar died (synthesised by runner.ts) OR a packaged
+          // first-launch env-setup failure (synthesised by index.ts, which also
+          // passes a `reason`). Either way, surface the blocking overlay — every
+          // sendAction after this no-ops.
+          dispatch({ type: 'BACKEND_EXITED', code: msg.code ?? null, reason: msg.reason })
           break
 
         case 'figure': {
@@ -635,6 +762,40 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
           if (!fileUrl && msg.html) {
             fileUrl = 'data:text/html;charset=utf-8,' +
               encodeURIComponent(msg.html)
+          }
+          // A report-hosted figure (host:"report", cell_id set) belongs to a
+          // report figure cell — route it to reportFigures (NOT the MDI
+          // windows). It still uses the SAME figId-keyed iframeRefs/replayState
+          // binary-replay path, so its iframe recovers pre-mount frames.
+          if (msg.host === 'report' && msg.cell_id) {
+            // A cell can be re-rendered (Refresh from live / rebind / compose
+            // edit) in place, which mints a BRAND NEW anyplotlib figId for the
+            // SAME cell. The old figId's shadow state (latestStates /
+            // latestBinaryStates — the awi_state replay stash) is now orphaned:
+            // nothing will ever look it up again (report cells are keyed by
+            // cell id, not figId, everywhere except these two maps), so it just
+            // grows the maps forever across a long report-editing session. Evict
+            // it here, BEFORE the new figure lands, using the figId we know is
+            // being replaced (only ever a figId that belonged to a report cell —
+            // never touches an MDI figure's entry).
+            const prev = reportFiguresRef.current.get(msg.cell_id)
+            if (prev && prev.figId && prev.figId !== msg.fig_id) {
+              latestStates.current.delete(prev.figId)
+              latestBinaryStates.current.delete(prev.figId)
+              iframeRefs.current.delete(prev.figId)
+            }
+            dispatch({
+              type: 'REPORT_FIGURE',
+              cellId: msg.cell_id,
+              figure: {
+                figId: msg.fig_id,
+                windowId: msg.window_id,
+                filePath: fileUrl,
+                title: msg.title || 'Figure',
+                isNavigator: false,
+              },
+            })
+            break
           }
           dispatch({
             type: 'FIGURE',
@@ -908,6 +1069,47 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
           })
           break
 
+        case 'report_state': {
+          // The authoritative report document. Mirrored into state so the
+          // sidebar + cells re-render. The reducer prunes `reportFigures` to
+          // the surviving cell ids (or clears it on report-closed) — but the
+          // figId-keyed shadow state (latestStates/latestBinaryStates/
+          // iframeRefs) lives OUTSIDE the reducer as refs, so evict any figIds
+          // that are about to fall out of `reportFigures` HERE, using the map
+          // as it stood just before this update.
+          const report = msg.report as ReportDocState | undefined
+          if (report) {
+            const prevFigures = reportFiguresRef.current
+            const liveIds = report.open ? new Set(report.cells.map(c => c.id)) : null
+            for (const [cellId, fig] of prevFigures) {
+              if (!liveIds || !liveIds.has(cellId)) {
+                if (fig.figId) {
+                  latestStates.current.delete(fig.figId)
+                  latestBinaryStates.current.delete(fig.figId)
+                  iframeRefs.current.delete(fig.figId)
+                }
+              }
+            }
+            dispatch({ type: 'REPORT_STATE', report })
+          }
+          break
+        }
+
+        case 'report_saved':
+          // Zip written — surface a transient status (the sidebar reads
+          // report.dirty for the persistent indicator).
+          dispatch({ type: 'STATUS', text: `Report saved: ${msg.path}` })
+          break
+
+        case 'report_need_snapshots':
+          // The backend needs a fresh PNG per cell before it writes the zip.
+          // Re-broadcast as a DOM CustomEvent; the provider's snapshot effect
+          // (below) harvests via requestFigurePng and replies with
+          // report_snapshots {token, images}. Doing it there keeps requestFigurePng
+          // out of this message-effect's closure (which has no deps).
+          window.dispatchEvent(new CustomEvent('spyde:report_need_snapshots', { detail: msg }))
+          break
+
         case 'log':
           dispatch({ type: 'LOG', entry: {
             level: String(msg.level), name: String(msg.name),
@@ -936,8 +1138,32 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'cod_cif_ready':
         case 'gpu_status_result':
         case 'console_node_bound':
+        case 'layers_state':
+        case 'repfig_compose_options':
+        case 'report_panel_selected':
+        case 'report_exported':
+        case 'mvx_state':
+        case 'mvx_done':
           window.dispatchEvent(new CustomEvent(`spyde:${msg.type}`, { detail: msg }))
           break
+
+        case 'progress': {
+          // Heavy backend actions (movie export, …) stream progress via
+          // emit_progress {done,total,label}. Surface it through the EXISTING
+          // StatusBar busy/status line (LOADING), so we reuse the app's one
+          // progress affordance instead of building a new bar. done>=total (or
+          // total<=0) clears the busy state. Also re-broadcast as a CustomEvent
+          // so a wizard can show a % in its own footer.
+          const done = Number(msg.done ?? 0)
+          const total = Number(msg.total ?? 0)
+          const label = String(msg.label ?? '')
+          const busy = total > 0 && done < total
+          const pct = total > 0 ? Math.round((done / total) * 100) : 0
+          const text = label ? (total > 0 ? `${label} (${pct}%)` : label) : ''
+          dispatch({ type: 'LOADING', busy, text })
+          window.dispatchEvent(new CustomEvent('spyde:progress', { detail: msg }))
+          break
+        }
       }
     }
 
@@ -971,6 +1197,14 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
           } catch { /* */ }
         }
         return widgets
+      }
+
+      // Test hook: return the authoritative report doc (read-only snapshot) so a
+      // Playwright spec can read backend-assigned ids that never surface in the
+      // DOM — e.g. a figure-level annotation's `id` (needed to inject a
+      // figure-marker drag pointer_up). Reads the ref so it's always current.
+      window._spyde_test_report = () => {
+        try { return JSON.parse(JSON.stringify(reportRef.current)) } catch { return null }
       }
 
       // Test hook: a cheap signature of a figure's latest image data (length +
@@ -1016,6 +1250,9 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     const disposeGpuStatusDialog = window.electron.onOpenGpuStatusDialog(() =>
       setGpuStatusDialogOpen(true),
     )
+    const disposeGpuHelpDialog = window.electron.onOpenGpuHelpDialog(() =>
+      setGpuHelpDialogOpen(true),
+    )
 
     // Forward iframe events to Python
     const onMessage = (e: MessageEvent) => {
@@ -1033,10 +1270,12 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
       disposeStackDialog?.()
       disposeUpdateDialog?.()
       disposeGpuStatusDialog?.()
+      disposeGpuHelpDialog?.()
       window.removeEventListener('message', onMessage)
       if (testHooksEnabled) {
         delete window._spyde_test_inject
         delete window._spyde_test_widgets
+        delete window._spyde_test_report
         delete window._spyde_test_image_sig
       }
     }
@@ -1047,6 +1286,88 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     payload: Record<string, unknown> = {},
     windowId?: number,
   ) => window.electron.action(action, payload, windowId)
+
+  // Snapshot harvest: when the backend requests PNGs before a save
+  // (report_need_snapshots), grab one per cell via the export protocol and
+  // reply with report_snapshots {token, images}. Per-cell PNGs are gathered in
+  // parallel (each self-times-out at 1.5 s in requestFigurePng); we send
+  // whatever succeeded — the backend has its own baked-PNG fallback, so a save
+  // must never block. sendAction is recreated each render, so route through a
+  // ref to keep this effect's identity stable (it must attach ONCE).
+  const sendActionRef = useRef(sendAction)
+  sendActionRef.current = sendAction
+  // (reportFiguresRef is declared above, before the message effect, so both it
+  // and this harvest effect share the same ref.)
+  useEffect(() => {
+    const onNeed = async (e: Event) => {
+      const detail = (e as CustomEvent).detail as {
+        token?: string; cells?: Array<{ cell_id: string; fig_id: string }>
+      }
+      const token = detail?.token
+      const cells = detail?.cells ?? []
+      if (!token) return
+      const images: Record<string, string> = {}
+      await Promise.all(cells.map(async ({ cell_id }) => {
+        // The backend's `fig_id` field is the CELL id (its state() ships
+        // fig_id === cell.id). The real iframe key is the anyplotlib figId of
+        // the report figure for this cell — resolve it via reportFigures.
+        const realFigId = reportFiguresRef.current.get(cell_id)?.figId
+        if (!realFigId) return
+        const dataUrl = await requestFigurePng(realFigId, 1500)
+        if (dataUrl) images[cell_id] = dataUrl
+      }))
+      sendActionRef.current('report_snapshots', { token, images })
+    }
+    window.addEventListener('spyde:report_need_snapshots', onNeed)
+    return () => window.removeEventListener('spyde:report_need_snapshots', onNeed)
+  }, [requestFigurePng])
+
+  // Global drag-kind tracking: a window-level dragstart listener inspects the
+  // drag's MIME TYPES (readable during a drag; the payload is not) to classify
+  // the in-flight drag. A window/figure pill carries the spyde window MIMEs →
+  // dragKind='window', which the MDI overlay-drop shield + report compose-drop
+  // shield key on. Cleared on dragend/drop so the shields unmount as soon as the
+  // drag ends (whether or not it landed on a window).
+  //
+  // BUBBLE (not capture) phase deliberately: the drag SOURCE is a Pill whose own
+  // onDragStart is what stamps the MIMEs into the DataTransfer. React dispatches
+  // that at its root container, so a native BUBBLE listener on `window` (above
+  // the React root) runs AFTER it — by which time dataTransfer.types is
+  // populated. A capture-phase window listener would run BEFORE the Pill's
+  // setData and see an empty types list. StrictMode-safe: added in an effect
+  // with cleanup, so a re-mount never stacks duplicate listeners.
+  useEffect(() => {
+    const WINDOW_TYPES = [WINDOW_DRAG_MIME, FIGURE_DRAG_MIME]
+    const classify = (e: DragEvent): 'window' | null => {
+      const types = e.dataTransfer?.types
+      if (!types) return null
+      const arr = Array.from(types)
+      // Only classify as 'window' when a window/figure MIME is present; leave it
+      // unchanged (return null → no-op below) for drags that carry NO spyde types
+      // at all yet (some browsers withhold custom types on dragover) so a bare
+      // file/text dragover doesn't clobber an active window drag.
+      return WINDOW_TYPES.some(t => arr.includes(t)) ? 'window' : null
+    }
+    const onDragStart = (e: DragEvent) => setDragKind(classify(e))
+    // dragover is a belt-and-braces re-classify: if dragstart's read raced the
+    // source's setData (ordering across the React-root vs window listeners), the
+    // first dragover — where types are reliably populated — sets it. Only ever
+    // PROMOTES to 'window'; never clears (clearing is dragend/drop's job).
+    const onDragOver = (e: DragEvent) => {
+      if (classify(e) === 'window') setDragKind(prev => (prev === 'window' ? prev : 'window'))
+    }
+    const clear = () => setDragKind(null)
+    window.addEventListener('dragstart', onDragStart)
+    window.addEventListener('dragover', onDragOver)
+    window.addEventListener('dragend', clear)
+    window.addEventListener('drop', clear)
+    return () => {
+      window.removeEventListener('dragstart', onDragStart)
+      window.removeEventListener('dragover', onDragOver)
+      window.removeEventListener('dragend', clear)
+      window.removeEventListener('drop', clear)
+    }
+  }, [])
 
   const setActiveWindow = (windowId: number) => {
     dispatch({ type: 'SET_ACTIVE', windowId })
@@ -1062,44 +1383,95 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
   const closeUpdateDialog = () => setUpdateDialogOpen(false)
   const openGpuStatusDialog = () => setGpuStatusDialogOpen(true)
   const closeGpuStatusDialog = () => setGpuStatusDialogOpen(false)
+  const openGpuHelpDialog = () => setGpuHelpDialogOpen(true)
+  const closeGpuHelpDialog = () => setGpuHelpDialogOpen(false)
 
   return (
     <SpyDEContext.Provider value={{
-      state, iframeRefs, latestStates, sendAction, setActiveWindow, replayState, clearNavShapePrompt,
+      state, iframeRefs, latestStates, sendAction, setActiveWindow, replayState,
+      requestFigurePng, clearNavShapePrompt,
       stackDialogOpen, openStackDialog, closeStackDialog,
       updateDialogOpen, openUpdateDialog, closeUpdateDialog,
       gpuStatusDialogOpen, openGpuStatusDialog, closeGpuStatusDialog,
-      tileWindowsRef,
+      gpuHelpDialogOpen, openGpuHelpDialog, closeGpuHelpDialog,
+      tileWindowsRef, dragKind,
     }}>
       {children}
-      {state.backendExited && <BackendExitedOverlay code={state.backendExited.code} />}
+      {state.backendExited && (
+        <BackendExitedOverlay
+          code={state.backendExited.code}
+          reason={state.backendExited.reason}
+          streamLines={state.streamLines}
+        />
+      )}
     </SpyDEContext.Provider>
   )
 }
 
-// Blocking, non-dismissable overlay shown when the Python analysis backend dies.
-// Without this the UI silently freezes (every sendAction no-ops). Restart is a
-// follow-up; for 0.1.0 we make the death visible and tell the user to relaunch.
-function BackendExitedOverlay({ code }: { code: number | null }) {
+// Blocking, non-dismissable overlay shown when the Python analysis backend dies
+// (or fails to build on a packaged first launch, which passes `reason`). Without
+// this the UI silently freezes (every sendAction no-ops). It now embeds the last
+// raw stdout/stderr lines the backend/uv emitted — that captured text was
+// previously written to `streamLines` and NEVER rendered, so a startup crash left
+// the user with an empty Log panel and no clue. The overlay is self-diagnosing.
+function BackendExitedOverlay({ code, reason, streamLines }: {
+  code: number | null
+  reason?: string
+  streamLines: Array<{ text: string; kind: 'stdout' | 'stderr' }>
+}) {
+  // Last ~40 lines — enough to show a traceback / uv error without a wall of text.
+  const tail = streamLines.slice(-40)
+  const isSetupFailure = Boolean(reason)
   return (
     <div style={{
       position: 'fixed', inset: 0, zIndex: 99999,
       background: 'rgba(0,0,0,0.78)', display: 'flex',
       alignItems: 'center', justifyContent: 'center', userSelect: 'text',
-    }}>
+      padding: 24,
+    }} data-testid="backend-exited-overlay">
       <div style={{
-        maxWidth: 460, padding: '28px 32px', borderRadius: 10,
+        maxWidth: 640, width: '100%', maxHeight: '90%', overflow: 'hidden',
+        display: 'flex', flexDirection: 'column',
+        padding: '26px 30px', borderRadius: 10,
         background: '#1e1e2e', border: '1px solid #f38ba8',
-        color: '#cdd6f4', fontFamily: 'system-ui, sans-serif', textAlign: 'center',
+        color: '#cdd6f4', fontFamily: 'system-ui, sans-serif',
       }}>
         <div style={{ fontSize: 18, fontWeight: 600, color: '#f38ba8', marginBottom: 10 }}>
-          Analysis backend stopped
+          {isSetupFailure ? 'Python environment setup failed' : 'Analysis backend stopped'}
         </div>
-        <div style={{ fontSize: 14, lineHeight: 1.5 }}>
-          The Python process powering SpyDE exited
-          {code != null ? <> (exit code <code>{code}</code>)</> : null}.
-          Compute and file operations are unavailable. Please restart SpyDE.
-          Check the Log panel for details.
+        <div style={{ fontSize: 14, lineHeight: 1.5, whiteSpace: 'pre-wrap' }}>
+          {reason ?? (
+            <>
+              The Python process powering SpyDE exited
+              {code != null ? <> (exit code <code>{code}</code>)</> : null}.
+              Compute and file operations are unavailable. Please restart SpyDE.
+              The captured output below shows why.
+            </>
+          )}
+        </div>
+        <div style={{
+          marginTop: 14, fontSize: 11, color: '#a6adc8', textTransform: 'uppercase',
+          letterSpacing: 0.5,
+        }}>
+          Raw output {tail.length ? `(last ${tail.length} lines)` : ''}
+        </div>
+        <div
+          data-testid="backend-exited-raw"
+          style={{
+            marginTop: 6, flex: 1, minHeight: 60, maxHeight: 260, overflow: 'auto',
+            background: '#11111b', border: '1px solid #313244', borderRadius: 6,
+            padding: '8px 10px',
+            fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+            fontSize: 11.5, lineHeight: 1.5, whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+          }}
+        >
+          {tail.length === 0
+            ? <span style={{ color: '#6c7086', fontStyle: 'italic' }}>No output was captured.</span>
+            : tail.map((l, i) => (
+                <div key={i} style={{ color: l.kind === 'stderr' ? '#f9c0c9' : '#a6adc8' }}>
+                  {l.text.replace(/\n$/, '')}
+                </div>
+              ))}
         </div>
       </div>
     </div>

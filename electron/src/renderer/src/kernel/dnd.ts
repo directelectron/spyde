@@ -25,9 +25,15 @@
  *                        dock); payload = JSON {windowId, signalId, name}.
  *                        Dropping it on the ConsoleBar binds that tree node into
  *                        the console namespace and inserts its variable name.
+ * FIGURE_DRAG_MIME    — dragging a window-header pill as a FIGURE reference;
+ *                        payload = JSON {windowId, figId?, title?, view?}.
+ *                        Stamped by window-header pills alongside the other
+ *                        window MIMEs. Dropping it on the Report sidebar embeds
+ *                        that figure into the report (backend `report_add_figure`).
  */
 export const WINDOW_DRAG_MIME = 'application/x-spyde-window'
 export const NAVIGATOR_DRAG_MIME = 'application/x-spyde-navigator'
 export const SIGNAL_REF_DRAG_MIME = 'application/x-spyde-signal-ref'
 export const CONSOLE_VAR_DRAG_MIME = 'application/x-spyde-console-var'
 export const WORKFLOW_NODE_DRAG_MIME = 'application/x-spyde-workflow-node'
+export const FIGURE_DRAG_MIME = 'application/x-spyde-figure'

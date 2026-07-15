@@ -23,10 +23,21 @@ function windowPayloadFor(
   win: SpyDEWindow, navigatorOptions: Map<number, NavigatorOptions>,
 ): WindowPillPayload {
   const nav = win.isNavigator ? navigatorOptions.get(win.windowId) : undefined
+  // Best-effort "currently shown" figure for the Report-sidebar drag payload.
+  // This mirrors WindowContent's default fallback (the first non-3d/density/
+  // ipf_key/tiled/stacked figure), not its full chip-selection state — good
+  // enough for a drag hint; the backend can resolve the window's true active
+  // figure if this is stale.
+  const shownFig = win.figures.find(f =>
+    f.view !== '3d' && f.view !== 'density' && f.view !== 'ipf_key'
+    && f.viewLabel !== '__tiled__' && f.viewLabel !== '__stacked__') ?? win.figures[0]
   return {
     windowId: win.windowId,
     isNavigator: win.isNavigator,
     navName: nav?.current || nav?.names?.[0] || 'base',
+    figId: shownFig?.figId,
+    title: shownFig?.title,
+    view: shownFig?.view,
   }
 }
 

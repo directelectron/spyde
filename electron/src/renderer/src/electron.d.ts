@@ -12,6 +12,7 @@ declare global {
       onOpenStackDialog: (cb: () => void) => () => void
       onOpenUpdateDialog: (cb: () => void) => () => void
       onOpenGpuStatusDialog: (cb: () => void) => () => void
+      onOpenGpuHelpDialog: (cb: () => void) => () => void
       onUpdateStatus: (cb: (status: Record<string, unknown>) => void) => () => void
       action: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
       openFile: () => Promise<void>
@@ -21,6 +22,11 @@ declare global {
       pickFile: (opts: { name?: string; extensions?: string[] }) => Promise<string | null>
       pickFiles: (opts?: { name?: string; extensions?: string[] }) => Promise<string[]>
       pickFolders: () => Promise<string[]>
+      reportSaveDialog: (defaultName?: string) => Promise<string | null>
+      reportOpenDialog: () => Promise<string | null>
+      reportExportDialog: (kind: 'html' | 'pdf' | 'folder' | 'mp4', defaultName?: string) => Promise<string | null>
+      reportExportPdf: (htmlPath: string, pdfPath: string) => Promise<{ ok: boolean; error?: string }>
+      clipboardWritePng: (dataUrl: string) => Promise<{ ok: boolean; error?: string }>
       pathForFile?: (file: File) => string | null
       figureEvent: (figId: string, eventJson: string) => void
       resizeFigure: (figId: string, width: number, height: number) => void
@@ -35,6 +41,14 @@ declare global {
       downloadUpdate: () => void
       quitAndInstallUpdate: () => void
       setUpdateChannel: (channel: 'stable' | 'beta') => void
+      gpuTriage: () => Promise<{
+        nvidia: { name: string; driver: string } | null
+        managedEnv: boolean
+        envExists: boolean
+        lockedTorch: string | null
+        busy: boolean
+      }>
+      gpuFixTorch: () => Promise<{ ok: boolean; error?: string }>
     }
 
     // Test-only hooks attached by the renderer for Playwright e2e (DEV /
@@ -44,6 +58,7 @@ declare global {
       figId: string,
     ) => Array<{ panel_id: string; id: string; type: string; data: Record<string, unknown> }>
     _spyde_test_image_sig?: (figId: string) => string
+    _spyde_test_report?: () => Record<string, unknown> | null
   }
 }
 

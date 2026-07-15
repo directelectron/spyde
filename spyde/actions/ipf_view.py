@@ -46,6 +46,7 @@ def build_ipf_3d_figure(xyz: np.ndarray, rgb: np.ndarray, highlight=None):
         colors=colors, point_size=6,
         x_label="[100]", y_label="[010]", z_label="[001]",
         bounds=((-1, 1),) * 3, zoom=1.4,
+        gpu=True,
     )
     try:
         p3d.set_sphere(1.0)
@@ -103,13 +104,15 @@ def emit_ipf_3d(window_id: int, result, direction: str = "z",
 
 
 def _ipf_key_color_grid(phase, direction: str, n: int):
-    """Build the IPF colour-KEY raster over the fundamental sector → ``(xc, yc,
-    colors, xy_edges, label_xy, labels)``.
+    """Build the IPF colour-KEY raster over the fundamental sector → ``(rgba,
+    extent, xy_edges, label_xy, labels)``.
 
-    ``xc``/``yc`` are the ``(n+1, n+1)`` cell-CORNER stereographic grids (for
-    ``pcolormesh``); ``colors`` is the ``(n, n)`` array of ``#rrggbb`` strings —
-    the orix IPF colour at each cell-centre direction, masked (``""``) outside the
-    fundamental sector so the mesh clips itself to the triangle.
+    ``rgba`` is an ``(n, n, 4)`` uint8 image — the orix IPF colour at each
+    cell-centre direction, alpha 0 outside the fundamental sector (the visual
+    clip is additionally enforced by ``clip_path`` on the raster marker).
+    ``extent`` is the ``(x0, x1, y0, y1)`` data-coord bounding box, oriented so
+    row 0 of ``rgba`` is the TOP (max y) and column 0 is the LEFT (min x) — the
+    convention :meth:`anyplotlib.Plot1D.add_raster` stretches the image with.
     """
     import numpy as np
     from orix.plot import IPFColorKeyTSL
@@ -127,13 +130,12 @@ def _ipf_key_color_grid(phase, direction: str, n: int):
     xmin, xmax = float(ex.min()), float(ex.max())
     ymin, ymax = float(ey.min()), float(ey.max())
 
-    # Cell-corner grids (n+1) and cell-centre grids (n) for the colour eval.
+    # Cell-corner grid (n+1) and cell-centre grid (n) for the colour eval.
     xe = np.linspace(xmin, xmax, n + 1)
     ye = np.linspace(ymin, ymax, n + 1)
-    xc, yc = np.meshgrid(xe, ye)
     cx = 0.5 * (xe[:-1] + xe[1:])
     cy = 0.5 * (ye[:-1] + ye[1:])
-    CX, CY = np.meshgrid(cx, cy)
+    CX, CY = np.meshgrid(cx, cy)              # row i = cy[i] (ascending y, row 0 = ymin)
 
     inv = InverseStereographicProjection()
     v = inv.xy2vector(CX.ravel(), CY.ravel())
@@ -141,16 +143,17 @@ def _ipf_key_color_grid(phase, direction: str, n: int):
     rgb = np.asarray(dck.direction2color(v)).reshape(CX.shape + (3,))
     rgb8 = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
 
-    colors = np.empty(CX.shape, dtype=object)
-    for i in range(CX.shape[0]):
-        for j in range(CX.shape[1]):
-            if inside[i, j]:
-                r, g, b = rgb8[i, j]
-                colors[i, j] = f"#{r:02x}{g:02x}{b:02x}"
-            else:
-                colors[i, j] = ""                            # skipped by pcolormesh
-    masked = np.ma.masked_array(colors, mask=~inside)
-    return xc, yc, masked, np.asarray(xy_edges), np.asarray(label_xy), labels
+    rgba = np.zeros(CX.shape + (4,), dtype=np.uint8)
+    rgba[..., :3] = rgb8
+    rgba[..., 3] = np.where(inside, 255, 0).astype(np.uint8)
+
+    # `CX`/`CY` rows ascend with y (row 0 = ymin) — add_raster wants row 0 = TOP
+    # (max y), so flip vertically. Columns already ascend with x (col 0 = xmin
+    # = left), so no horizontal flip needed.
+    rgba = rgba[::-1, :, :]
+    extent = (xmin, xmax, ymin, ymax)
+    return (np.ascontiguousarray(rgba), extent,
+           np.asarray(xy_edges), np.asarray(label_xy), labels)
 
 
 def build_ipf_key_figure(result, direction: str = "z", *, n: int = 120):
@@ -158,12 +161,11 @@ def build_ipf_key_figure(result, direction: str = "z", *, n: int = 120):
     ``(fig, fig_id, html)``.
 
     The standard stereographic fundamental-sector colour key (e.g. cubic
-    [001]/[101]/[111]) rendered with the same anyplotlib primitives as
-    :func:`spyde.actions.ipf_density.build_ipf_density_figure` — a ``pcolormesh``
-    quad mesh whose per-cell face colours come directly from the orix IPF colour
-    key (``direction2color``), clipped to the curved sector boundary, with the
-    white sector outline and the ``[hkl]`` corner labels. Same key for sample
-    X/Y/Z (it's the crystal-direction colour map)."""
+    [001]/[101]/[111]) rendered as a single stretched RGBA raster
+    (:meth:`anyplotlib.Plot1D.add_raster`) — the per-cell orix IPF colour
+    (``direction2color``) baked into an image and clipped to the curved sector
+    boundary, instead of one polygon per grid cell (~n² polygons for the same
+    visual). Same key for sample X/Y/Z (it's the crystal-direction colour map)."""
     import anyplotlib as apl
     import anyplotlib._electron as _electron
 
@@ -173,16 +175,15 @@ def build_ipf_key_figure(result, direction: str = "z", *, n: int = 120):
     om = _as_orientation_map(result)
     phase = om.orix_phase(0)                       # primary phase's point group
 
-    xc, yc, colors, xy_edges, label_xy, labels = _ipf_key_color_grid(
+    rgba, extent, xy_edges, label_xy, labels = _ipf_key_color_grid(
         phase, direction, n)
     xlim, ylim = _sector_limits(xy_edges)
 
     fig, axes = apl.subplots(1, 1)
     ax = axes[0][0] if isinstance(axes, list) else axes
     xy = ax.axes2d(xlim=xlim, ylim=ylim, aspect="equal")
-    # `colors` is an array of CSS colour strings → pcolormesh draws each cell with
-    # that exact face colour (the direct-RGB path); clip to the sector boundary.
-    xy.pcolormesh(xc, yc, colors, clip_path=xy_edges)
+    # One drawImage instead of ~n² polygons; clip to the curved sector boundary.
+    xy.add_raster(rgba, extent=extent, clip_path=xy_edges, smooth=False)
     xy.plot(xy_edges[:, 0], xy_edges[:, 1], color="#ffffff", linewidth=1.5)
     for (lx, ly), txt in zip(np.asarray(label_xy, dtype=float), labels):
         xy.text(float(lx), float(ly), str(txt), color="#ffffff", fontsize=12)

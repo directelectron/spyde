@@ -79,6 +79,17 @@ class _NavPainter:
                 try:
                     plot.current_data = data
                     plot._set_array(data)
+                    # Apply any pending MDI-overlay layer frames RIGHT AFTER the base
+                    # paint, still on this ONE painter thread — so every layer
+                    # set_data → stdout push stays serialized behind the base push
+                    # (mirrors the base read/paint decouple). No-op when the plot has
+                    # no layers / nothing pending.
+                    if getattr(plot, "_pending_layer_frames", None):
+                        try:
+                            from spyde.actions.overlay import _apply_pending_layer_frames
+                            _apply_pending_layer_frames(plot)
+                        except Exception as e:
+                            logger.debug("applying pending layer frames failed: %s", e)
                 except Exception as e:
                     logger.debug("nav paint failed: %s", e)
 
@@ -153,32 +164,16 @@ def _shared_esm_url(esm: str) -> str:
     return "file://" + path
 
 
-def finalize_figure_html(fig, fig_id) -> str:
-    """Build the standalone HTML for an anyplotlib figure and apply SpyDE's shared
-    post-processing: swap the inlined JS bundle for the shared file URL (V8 code
-    cache), force dark mode (`#widget-root`), and add the click-to-front focus
-    relay. Shared by :meth:`Plot._ensure_figure` and the IPF 3-D figure builder."""
-    import json as _json
+def _apply_figure_html_shell(html: str, fig_id) -> str:
+    """SpyDE's dark-mode + fill-the-iframe + focus-relay post-processing, shared by
+    the live and standalone figure-HTML paths.
 
-    html = build_standalone_html(fig, fig_id=fig_id, resizable=False)
-    try:
-        esm = str(getattr(fig, "_esm", "") or "")
-        if esm:
-            embedded = _json.dumps(esm)
-            shared = _shared_esm_url(esm)
-            html = html.replace(
-                f"const esmSource = {embedded};", "const esmSource = null;", 1)
-            html = html.replace(
-                "import(blobUrl)", f"import({_json.dumps(shared)})", 1)
-    except Exception as e:
-        logger.debug("shared-esm optimization skipped: %s", e)
-
-    # The standalone template pins html/body to the figure's INITIAL px size with
-    # overflow:hidden (sized for a fixed docs/notebook embed). SpyDE drives the
-    # size live via resize_figure (fig_width/height → the panels re-layout), so
-    # when the subwindow is dragged LARGER than that initial size the grown figure
-    # was clipped to the old body box. Make html/body/#widget-root fill the iframe
-    # (100%) so the figure always fills — and is never clipped by — the subwindow.
+    The anyplotlib standalone template pins html/body to the figure's INITIAL px
+    size with overflow:hidden (sized for a fixed docs/notebook embed). SpyDE drives
+    the size live via resize_figure (fig_width/height → the panels re-layout), so
+    when the subwindow is dragged LARGER than that initial size the grown figure was
+    clipped to the old body box. Make html/body/#widget-root fill the iframe (100%)
+    so the figure always fills — and is never clipped by — the subwindow."""
     dark = ("<style>html,body{background:#1e1e2e !important;color-scheme:dark;"
             "width:100% !important;height:100% !important;overflow:hidden}"
             "#widget-root{background:#1e1e2e !important;"
@@ -188,6 +183,38 @@ def finalize_figure_html(fig, fig_id) -> str:
              "try{window.parent.postMessage({type:'spyde_focus',figId:%r},'*');}"
              "catch(e){}},true);</script>" % str(fig_id))
     return html.replace("<body>", dark + focus + "<body>", 1)
+
+
+def finalize_figure_html(fig, fig_id, *, standalone: bool = False) -> str:
+    """Build the standalone HTML for an anyplotlib figure and apply SpyDE's shared
+    post-processing: force dark mode (`#widget-root`) + fill-the-iframe sizing + the
+    click-to-front focus relay. Shared by :meth:`Plot._ensure_figure`, the IPF 3-D
+    figure builder, and the report figure builder.
+
+    ``standalone=False`` (default, the LIVE MDI path) also swaps the inlined JS
+    bundle for a shared ``file://`` URL so Chromium's V8 code cache is reused across
+    iframes (the "big drag" optimization) — but that file URL is machine-local and
+    is blocked inside a cross-origin/sandboxed ``srcdoc`` iframe. For a PORTABLE
+    EXPORT (the interactive report HTML), pass ``standalone=True`` to KEEP the ESM
+    fully inlined so the figure renders on any machine, in any browser, inside a
+    sandboxed iframe with no ``file://`` dependency."""
+    import json as _json
+
+    html = build_standalone_html(fig, fig_id=fig_id, resizable=False)
+    if not standalone:
+        try:
+            esm = str(getattr(fig, "_esm", "") or "")
+            if esm:
+                embedded = _json.dumps(esm)
+                shared = _shared_esm_url(esm)
+                html = html.replace(
+                    f"const esmSource = {embedded};", "const esmSource = null;", 1)
+                html = html.replace(
+                    "import(blobUrl)", f"import({_json.dumps(shared)})", 1)
+        except Exception as e:
+            logger.debug("shared-esm optimization skipped: %s", e)
+
+    return _apply_figure_html_shell(html, fig_id)
 
 
 class Plot:
@@ -255,6 +282,13 @@ class Plot:
         # the GPU. Lazily built on the first large frame (_maybe_gpu_tile); reset on a
         # node switch / close so a new signal rebuilds it. None = not tiling yet.
         self._gpu_tile_backend = None
+        # MDI live overlay layers (Report Phase 2): a list of spyde.actions.overlay
+        # PlotLayer, each an anyplotlib Layer over this plot's base image, refreshed
+        # from its own source on every navigator move. Empty by default (the fast
+        # non-layered path guards on this being falsy). _pending_layer_frames stages
+        # freshly-read layer frames for the painter thread to push.
+        self._layers: list = []
+        self._pending_layer_frames = None
 
         # anyplotlib figure + plot objects
         self._fig: apl.Figure | None = None
@@ -699,6 +733,24 @@ class Plot:
                              else f"object-ndarray{data.shape}", self.window_id)
             return
         dims = data.ndim
+
+        # Layered plots: anyplotlib REFUSES a shape-changing set_data while image
+        # layers exist (they would silently mis-stretch over the new fit rect). A
+        # node switch / recompute that changes the frame shape must therefore drop
+        # the layers FIRST — cleanly, with a status + layers_state so the dock
+        # clears — instead of raising mid-paint.
+        if dims == 2 and getattr(self, "_layers", None) and self._plot2d is not None:
+            st = getattr(self._plot2d, "_state", None) or {}
+            bh, bw = st.get("image_height"), st.get("image_width")
+            if bh and bw and (data.shape[0] != bh or data.shape[1] != bw):
+                try:
+                    from spyde.actions.overlay import drop_all_layers, _emit_layers_state
+                    drop_all_layers(self)
+                    _emit_layers_state(self)
+                    from spyde.backend.ipc import emit_status
+                    emit_status("Overlay layers removed: image shape changed.")
+                except Exception as e:
+                    logger.debug("layer drop on shape change failed: %s", e)
 
         # DIAGNOSTIC: how much REAL detail is in the array handed to us? shape says
         # 4096² but if a small 82² center crop has only ~36 distinct values the ARRAY
@@ -1212,6 +1264,16 @@ class Plot:
                 self._nav_chunk_cache.clear()
             except Exception:
                 pass
+        # Drop any MDI overlay layers ON this plot (their anyplotlib handles) AND
+        # any layers on OTHER plots that source FROM this one — so closing either a
+        # target or a source leaves no dangling handle / stale composited image.
+        try:
+            from spyde.actions.overlay import drop_all_layers, drop_layers_for_source
+            drop_all_layers(self)
+            if self.session is not None:
+                drop_layers_for_source(self.session, self)
+        except Exception as e:
+            logger.debug("dropping overlay layers on plot close failed: %s", e)
         if self._shared_memory is not None:
             try:
                 self._shared_memory.close()

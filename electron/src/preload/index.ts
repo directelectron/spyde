@@ -81,6 +81,13 @@ contextBridge.exposeInMainWorld('electron', {
     return () => ipcRenderer.removeListener('spyde:open_gpu_status_dialog', h)
   },
 
+  /** Open the "GPU & CUDA" help dialog (from the Help menu). Returns an unsubscribe fn. */
+  onOpenGpuHelpDialog: (cb: () => void) => {
+    const h = () => cb()
+    ipcRenderer.on('spyde:open_gpu_help_dialog', h)
+    return () => ipcRenderer.removeListener('spyde:open_gpu_help_dialog', h)
+  },
+
   /** electron-updater's check/download/install progress. Returns an unsubscribe fn. */
   onUpdateStatus: (cb: (status: Record<string, unknown>) => void) => {
     const h = (_: unknown, status: Record<string, unknown>) => cb(status)
@@ -119,6 +126,29 @@ contextBridge.exposeInMainWorld('electron', {
 
   /** Multi-select DIRECTORY picker (RETURNS paths) — for .zspy/.zarr folders. */
   pickFolders: (): Promise<string[]> => ipcRenderer.invoke('spyde:pick-folders'),
+
+  /** Report save dialog (RETURNS the chosen path or null) — for the Report
+   *  sidebar's Save/Save As. */
+  reportSaveDialog: (defaultName?: string): Promise<string | null> =>
+    ipcRenderer.invoke('report:save-dialog', defaultName),
+
+  /** Report open dialog (RETURNS the chosen path or null) — for the Report
+   *  sidebar's Open. */
+  reportOpenDialog: (): Promise<string | null> => ipcRenderer.invoke('report:open-dialog'),
+
+  /** Report export dialog (RETURNS the chosen path or null) — 'html'/'pdf' are
+   *  save dialogs, 'folder' is a directory picker. For the Report sidebar's
+   *  Export menu. */
+  reportExportDialog: (kind: 'html' | 'pdf' | 'folder' | 'mp4', defaultName?: string): Promise<string | null> =>
+    ipcRenderer.invoke('report:export-dialog', kind, defaultName),
+
+  /** Render an exported report HTML file to PDF via a hidden BrowserWindow. */
+  reportExportPdf: (htmlPath: string, pdfPath: string): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('report:export-pdf', htmlPath, pdfPath),
+
+  /** Write a PNG data URL to the OS clipboard as an image. */
+  clipboardWritePng: (dataUrl: string): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('clipboard:write-png', dataUrl),
 
   /** OS path of a dropped File (sandboxed renderers have no File.path) —
    *  powers drag-and-drop of datasets (incl. .zspy folders) onto the MDI. */
@@ -162,4 +192,20 @@ contextBridge.exposeInMainWorld('electron', {
 
   /** Flip the update channel (stable/beta). */
   setUpdateChannel: (channel: 'stable' | 'beta') => ipcRenderer.send('spyde:set-update-channel', channel),
+
+  /** GPU triage probe (Help → GPU & CUDA): nvidia-smi result + managed-env
+   *  facts. torch-side facts come from the backend's get_gpu_status. */
+  gpuTriage: (): Promise<{
+    nvidia: { name: string; driver: string } | null
+    managedEnv: boolean
+    envExists: boolean
+    lockedTorch: string | null
+    busy: boolean
+  }> => ipcRenderer.invoke('gpu:triage'),
+
+  /** Re-install torch into the managed env with --torch-backend=auto (the
+   *  triage "Fix PyTorch install"). Progress arrives on the raw-output stream;
+   *  restart is manual after ok:true. */
+  gpuFixTorch: (): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('gpu:fix-torch'),
 })

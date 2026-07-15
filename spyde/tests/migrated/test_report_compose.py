@@ -1,0 +1,1070 @@
+"""
+test_report_compose.py — Report Builder Phase 2 combined-figure composition.
+
+Exercises the ``repfig_*`` staged handlers against a real Qt-free ``Session``:
+compose-option query (same-shape → overlay, nav/signal pair → callout, mismatch →
+tiles only), each compose mode's FigureSpec mutation + figure/state re-emission,
+layer edit/remove semantics (incl. last-layer / last-panel collapse), annotation
+CRUD, a YAML round-trip of a composed multi-panel spec, and that "Add to report"
+from a LAYERED MDI plot carries the layers into the FigureSpec.
+"""
+from __future__ import annotations
+
+import numpy as np
+
+from spyde.actions.report import compose as cx
+from spyde.actions.report import handlers as h
+
+
+# ── helpers ────────────────────────────────────────────────────────────────────
+
+
+def _prime_plot_data(session):
+    for p in session._plots:
+        if isinstance(getattr(p, "current_data", None), np.ndarray):
+            continue
+        try:
+            sig = p.plot_state.current_signal
+            frame = np.asarray(sig.data)
+            if frame.ndim > 2:
+                frame = frame.reshape(-1, *frame.shape[-2:])[0]
+            p.current_data = np.ascontiguousarray(frame.astype(np.float32))
+            p._last_levels = (float(np.nanmin(p.current_data)),
+                              float(np.nanmax(p.current_data)))
+        except Exception:
+            pass
+
+
+def _signal_wid(session):
+    for p in session._plots:
+        if not getattr(p, "is_navigator", False) and p.window_id is not None:
+            return p.window_id
+    return session._plots[0].window_id
+
+
+def _nav_wid(session):
+    for p in session._plots:
+        if getattr(p, "is_navigator", False) and p.window_id is not None:
+            return p.window_id
+    return None
+
+
+def _states(messages):
+    return [m for m in messages if m.get("type") == "report_state"]
+
+
+def _last_state(messages):
+    st = _states(messages)
+    assert st, "no report_state emitted"
+    return st[-1]["report"]
+
+
+def _report_figures(messages):
+    return [m for m in messages if m.get("type") == "figure"
+            and m.get("host") == "report"]
+
+
+def _compose_options(messages):
+    return [m for m in messages if m.get("type") == "repfig_compose_options"]
+
+
+def _make_figure_cell(session, messages, source_wid, caption="Fig"):
+    """Add a figure cell from a source window and return its cell id + FigureSpec."""
+    h.report_add_figure(session, None, {"source_window_id": source_wid,
+                                        "caption": caption})
+    st = _last_state(messages)
+    fig_cells = [c for c in st["cells"] if c["cell_type"] == "figure"]
+    cid = fig_cells[-1]["id"]
+    return cid
+
+
+def _fig_dict_of(messages, cell_id):
+    """The pixel-free FigureSpec dict carried in report_state for a cell."""
+    st = _last_state(messages)
+    for c in st["cells"]:
+        if c["id"] == cell_id:
+            return c.get("figure")
+    return None
+
+
+# ── query options ──────────────────────────────────────────────────────────────
+
+
+class TestQueryOptions:
+    def test_same_shape_offers_overlay(self, tem_2d_dataset):
+        session, messages = tem_2d_dataset["window"], tem_2d_dataset["messages"]
+        _prime_plot_data(session)
+        wid = _signal_wid(session)
+        h.report_new(session, None, {})
+        cid = _make_figure_cell(session, messages, wid)
+        messages.clear()
+        # Compose the SAME window (identical frame shape) → overlay is offered.
+        cx.repfig_query_compose(session, None,
+                                {"cell_id": cid, "source_window_id": wid})
+        opts = _compose_options(messages)
+        assert opts, "no repfig_compose_options emitted"
+        m = opts[-1]
+        assert m["cell_id"] == cid
+        assert m["source_window_id"] == wid
+        assert "overlay" in m["options"]
+        assert m["detail"]["same_shape"] is True
+        # Tiles are always present.
+        for t in ("tile-up", "tile-down", "tile-left", "tile-right"):
+            assert t in m["options"]
+
+    def test_nav_signal_pair_offers_callout(self, stem_4d_dataset):
+        session, messages = stem_4d_dataset["window"], stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        sig_wid = _signal_wid(session)
+        nav_wid = _nav_wid(session)
+        assert nav_wid is not None
+        h.report_new(session, None, {})
+        # Build the cell from the SIGNAL; drop the NAVIGATOR onto it.
+        cid = _make_figure_cell(session, messages, sig_wid)
+        messages.clear()
+        cx.repfig_query_compose(session, None,
+                                {"cell_id": cid, "source_window_id": nav_wid})
+        m = _compose_options(messages)[-1]
+        assert m["detail"]["nav_signal_pair"] is True
+        assert "callout" in m["options"]
+        # nav (4x5) vs signal (16x16) differ → no overlay.
+        assert "overlay" not in m["options"]
+        assert m["detail"]["same_shape"] is False
+
+    def test_mismatch_tiles_only(self, stem_4d_dataset):
+        session, messages = stem_4d_dataset["window"], stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        sig_wid = _signal_wid(session)
+        nav_wid = _nav_wid(session)
+        h.report_new(session, None, {})
+        # Build the cell from the NAVIGATOR; the signal is a nav/signal pair too,
+        # so to get a pure tiles-only case we compose a DIFFERENT-shape non-pair:
+        # use the navigator cell + the signal window but assert overlay absent.
+        cid = _make_figure_cell(session, messages, nav_wid)
+        messages.clear()
+        cx.repfig_query_compose(session, None,
+                                {"cell_id": cid, "source_window_id": sig_wid})
+        m = _compose_options(messages)[-1]
+        assert "overlay" not in m["options"]     # shapes differ
+        assert set(m["options"]) >= {"tile-up", "tile-down", "tile-left", "tile-right"}
+
+    def test_mismatch_multi_panel_target_excludes_overlay(self, stem_4d_dataset):
+        """Multi-panel cell: a query targeting a SPECIFIC panel (not panels[0])
+        whose base shape differs from the source must also exclude 'overlay' —
+        the gate has to consult the HOVERED panel's shape, not just the primary
+        panel's."""
+        session, messages = stem_4d_dataset["window"], stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        sig_wid = _signal_wid(session)
+        nav_wid = _nav_wid(session)
+        h.report_new(session, None, {})
+        # Build a 1x2 grid: panel A = signal (base), panel B = navigator (tiled).
+        cid = _make_figure_cell(session, messages, sig_wid)
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "tile-right",
+                           "source_window_id": nav_wid})
+        fig = _fig_dict_of(messages, cid)
+        by_pos = {tuple(p["grid_pos"]): p for p in fig["panels"]}
+        panel_a_id = by_pos[(0, 0)]["id"]   # signal-shaped base
+        panel_b_id = by_pos[(0, 1)]["id"]   # nav-shaped base
+
+        messages.clear()
+        # Drop the SIGNAL-shaped source onto panel B (nav-shaped) — shapes differ
+        # even though the SAME source dropped onto panel A would match.
+        cx.repfig_query_compose(session, None,
+                                {"cell_id": cid, "source_window_id": sig_wid,
+                                 "target_panel_id": panel_b_id})
+        m = _compose_options(messages)[-1]
+        assert "overlay" not in m["options"]
+        assert m["detail"]["same_shape"] is False
+
+        messages.clear()
+        # Sanity: the SAME source targeting panel A (matching shape) DOES offer it.
+        cx.repfig_query_compose(session, None,
+                                {"cell_id": cid, "source_window_id": sig_wid,
+                                 "target_panel_id": panel_a_id})
+        m = _compose_options(messages)[-1]
+        assert "overlay" in m["options"]
+        assert m["detail"]["same_shape"] is True
+
+
+# ── compose modes ───────────────────────────────────────────────────────────────
+
+
+class TestComposeModes:
+    def test_overlay_appends_layer(self, tem_2d_dataset):
+        session, messages = tem_2d_dataset["window"], tem_2d_dataset["messages"]
+        _prime_plot_data(session)
+        wid = _signal_wid(session)
+        h.report_new(session, None, {})
+        cid = _make_figure_cell(session, messages, wid)
+        messages.clear()
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "overlay", "source_window_id": wid})
+        # The panel now has TWO layers (base + overlay), a figure re-emit + state.
+        fig = _fig_dict_of(messages, cid)
+        assert fig is not None
+        assert len(fig["panels"]) == 1
+        assert len(fig["panels"][0]["layers"]) == 2
+        assert len(_report_figures(messages)) == 1
+        # The overlay layer has its own snapshot stored.
+        mgr = session._report
+        assert len(mgr.snapshot_map(cid)) == 2
+
+    def test_overlay_forced_mismatch_refused(self, stem_4d_dataset):
+        """The execute path (repfig_compose mode='overlay') must independently
+        refuse a shape mismatch even when forced directly (bypassing the popover's
+        query-time gate) — a stale click, a race, or a hand-built payload must not
+        be able to smuggle a mismatched layer into the FigureSpec."""
+        session, messages = stem_4d_dataset["window"], stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        sig_wid = _signal_wid(session)
+        nav_wid = _nav_wid(session)
+        h.report_new(session, None, {})
+        # Cell built from the SIGNAL; the navigator has a different frame shape.
+        cid = _make_figure_cell(session, messages, sig_wid)
+        fig_before = _fig_dict_of(messages, cid)
+        n_layers_before = len(fig_before["panels"][0]["layers"])
+        mgr = session._report
+        n_snaps_before = len(mgr.snapshot_map(cid))
+        messages.clear()
+
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "overlay",
+                           "source_window_id": nav_wid})
+
+        errors = [m for m in messages if m.get("type") == "error"]
+        assert errors, "expected an error emission for a mismatched overlay"
+        assert "matching image sizes" in errors[-1]["text"]
+        # No layer/snapshot appended — the refusal happened before any mutation
+        # (no rebuild is triggered by _compose_overlay's early return).
+        fig_after = _fig_dict_of(messages, cid) or fig_before
+        assert len(fig_after["panels"][0]["layers"]) == n_layers_before
+        assert len(mgr.snapshot_map(cid)) == n_snaps_before
+
+    def test_tile_right_grows_grid(self, stem_4d_dataset):
+        session, messages = stem_4d_dataset["window"], stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        sig_wid = _signal_wid(session)
+        nav_wid = _nav_wid(session)
+        h.report_new(session, None, {})
+        cid = _make_figure_cell(session, messages, sig_wid)
+        messages.clear()
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "tile-right",
+                           "source_window_id": nav_wid})
+        fig = _fig_dict_of(messages, cid)
+        assert fig["layout"]["kind"] == "grid"
+        assert fig["layout"]["rows"] == 1 and fig["layout"]["cols"] == 2
+        assert len(fig["panels"]) == 2
+        positions = sorted(tuple(p["grid_pos"]) for p in fig["panels"])
+        assert positions == [(0, 0), (0, 1)]
+
+    def test_tile_left_prepends_and_shifts(self, stem_4d_dataset):
+        session, messages = stem_4d_dataset["window"], stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        sig_wid = _signal_wid(session)
+        nav_wid = _nav_wid(session)
+        h.report_new(session, None, {})
+        cid = _make_figure_cell(session, messages, sig_wid)
+        messages.clear()
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "tile-left",
+                           "source_window_id": nav_wid})
+        fig = _fig_dict_of(messages, cid)
+        assert fig["layout"] == {"kind": "grid", "rows": 1, "cols": 2}
+        # New panel at col 0, the original shifted to col 1.
+        by_pos = {tuple(p["grid_pos"]): p for p in fig["panels"]}
+        assert (0, 0) in by_pos and (0, 1) in by_pos
+
+    def test_tile_down_then_insert_stays_grid(self, stem_4d_dataset):
+        session, messages = stem_4d_dataset["window"], stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        sig_wid = _signal_wid(session)
+        nav_wid = _nav_wid(session)
+        h.report_new(session, None, {})
+        cid = _make_figure_cell(session, messages, sig_wid)
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "tile-down",
+                           "source_window_id": nav_wid})
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "tile-right",
+                           "source_window_id": nav_wid})
+        fig = _fig_dict_of(messages, cid)
+        assert fig["layout"]["kind"] == "grid"
+        assert len(fig["panels"]) == 3
+
+    def test_callout_adds_inset(self, stem_4d_dataset):
+        session, messages = stem_4d_dataset["window"], stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        sig_wid = _signal_wid(session)
+        nav_wid = _nav_wid(session)
+        h.report_new(session, None, {})
+        cid = _make_figure_cell(session, messages, sig_wid)
+        messages.clear()
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "callout",
+                           "source_window_id": nav_wid})
+        fig = _fig_dict_of(messages, cid)
+        # Layout stays single (the callout panel is a floating inset, not a grid
+        # cell), the primary panel gains an inset entry, and a new inset panel
+        # spec + its snapshot exist.
+        assert fig["layout"]["kind"] == "single"
+        primary = fig["panels"][0]
+        assert len(primary["insets"]) == 1
+        inset_pid = primary["insets"][0]["panel"]
+        assert any(p["id"] == inset_pid for p in fig["panels"])
+        assert len(_report_figures(messages)) == 1
+
+    def test_callout_signal_base_has_no_connector(self, stem_4d_dataset):
+        """The e2e case: cell built from the SIGNAL, NAVIGATOR dropped as the inset.
+        The base panel is the diffraction pattern — there's no meaningful source
+        region on the DP panel — so the connector MUST be None (finding 5)."""
+        session, messages = stem_4d_dataset["window"], stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        sig_wid = _signal_wid(session)
+        nav_wid = _nav_wid(session)
+        h.report_new(session, None, {})
+        cid = _make_figure_cell(session, messages, sig_wid)
+        messages.clear()
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "callout",
+                           "source_window_id": nav_wid})
+        fig = _fig_dict_of(messages, cid)
+        inset = fig["panels"][0]["insets"][0]
+        assert inset["connector"] is None
+
+
+# ── layer / panel / annotation edits ────────────────────────────────────────────
+
+
+class TestEdits:
+    def _overlayed(self, session, messages):
+        """A cell with a base + one overlay layer; returns (cid, panel_id, layer_ids)."""
+        wid = _signal_wid(session)
+        h.report_new(session, None, {})
+        cid = _make_figure_cell(session, messages, wid)
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "overlay", "source_window_id": wid})
+        fig = _fig_dict_of(messages, cid)
+        panel = fig["panels"][0]
+        return cid, panel["id"], [ly["id"] for ly in panel["layers"]]
+
+    def test_set_layer_updates_spec(self, tem_2d_dataset):
+        session, messages = tem_2d_dataset["window"], tem_2d_dataset["messages"]
+        _prime_plot_data(session)
+        cid, pid, lids = self._overlayed(session, messages)
+        messages.clear()
+        cx.repfig_set_layer(session, None, {
+            "cell_id": cid, "panel_id": pid, "layer_id": lids[1],
+            "cmap": "plasma", "alpha": 0.25, "visible": False,
+            "clim": [1.0, 9.0]})
+        fig = _fig_dict_of(messages, cid)
+        ov = [ly for ly in fig["panels"][0]["layers"] if ly["id"] == lids[1]][0]
+        assert ov["cmap"] == "plasma"
+        assert abs(ov["alpha"] - 0.25) < 1e-9
+        assert ov["visible"] is False
+        assert ov["clim"] == [1.0, 9.0]
+
+    def test_remove_overlay_layer(self, tem_2d_dataset):
+        session, messages = tem_2d_dataset["window"], tem_2d_dataset["messages"]
+        _prime_plot_data(session)
+        cid, pid, lids = self._overlayed(session, messages)
+        messages.clear()
+        cx.repfig_remove_layer(session, None,
+                               {"cell_id": cid, "panel_id": pid, "layer_id": lids[1]})
+        fig = _fig_dict_of(messages, cid)
+        assert len(fig["panels"][0]["layers"]) == 1
+        # Overlay snapshot dropped.
+        mgr = session._report
+        assert len(mgr.snapshot_map(cid)) == 1
+
+    def test_remove_last_layer_removes_panel_and_collapses_cell(self, tem_2d_dataset):
+        session, messages = tem_2d_dataset["window"], tem_2d_dataset["messages"]
+        _prime_plot_data(session)
+        wid = _signal_wid(session)
+        h.report_new(session, None, {})
+        cid = _make_figure_cell(session, messages, wid)
+        fig = _fig_dict_of(messages, cid)
+        pid = fig["panels"][0]["id"]
+        lid = fig["panels"][0]["layers"][0]["id"]
+        mgr = session._report
+        assert cid in mgr._window_by_cell
+        messages.clear()
+        # Removing the ONLY layer of the ONLY panel → placeholder (empty) cell.
+        cx.repfig_remove_layer(session, None,
+                               {"cell_id": cid, "panel_id": pid, "layer_id": lid})
+        st = _last_state(messages)
+        cell = [c for c in st["cells"] if c["id"] == cid][0]
+        assert cell["placeholder"] is True
+        assert cell.get("figure") is None
+        assert cid not in mgr._window_by_cell
+        assert cid not in mgr._snapshots
+
+    def test_remove_panel_from_grid(self, stem_4d_dataset):
+        session, messages = stem_4d_dataset["window"], stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        sig_wid = _signal_wid(session)
+        nav_wid = _nav_wid(session)
+        h.report_new(session, None, {})
+        cid = _make_figure_cell(session, messages, sig_wid)
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "tile-right",
+                           "source_window_id": nav_wid})
+        fig = _fig_dict_of(messages, cid)
+        # Remove the second (tiled) panel → collapse back to single.
+        pid2 = [p["id"] for p in fig["panels"] if tuple(p["grid_pos"]) == (0, 1)][0]
+        messages.clear()
+        cx.repfig_remove_panel(session, None, {"cell_id": cid, "panel_id": pid2})
+        fig = _fig_dict_of(messages, cid)
+        assert len(fig["panels"]) == 1
+        assert fig["layout"]["kind"] == "single"
+
+    def test_annotation_crud(self, tem_2d_dataset):
+        session, messages = tem_2d_dataset["window"], tem_2d_dataset["messages"]
+        _prime_plot_data(session)
+        wid = _signal_wid(session)
+        h.report_new(session, None, {})
+        cid = _make_figure_cell(session, messages, wid)
+        fig = _fig_dict_of(messages, cid)
+        pid = fig["panels"][0]["id"]
+
+        # ADD a circle.
+        cx.repfig_add_annotation(session, None, {
+            "cell_id": cid, "panel_id": pid,
+            "annotation": {"kind": "circle", "offsets": [[8, 8]], "radius": 3}})
+        fig = _fig_dict_of(messages, cid)
+        anns = fig["panels"][0]["annotations"]
+        assert len(anns) == 1 and anns[0]["kind"] == "circle"
+
+        # ADD a text, then UPDATE index 0.
+        cx.repfig_add_annotation(session, None, {
+            "cell_id": cid, "panel_id": pid,
+            "annotation": {"kind": "text", "offsets": [[2, 2]], "texts": ["A"]}})
+        cx.repfig_update_annotation(session, None, {
+            "cell_id": cid, "panel_id": pid, "index": 0,
+            "annotation": {"kind": "circle", "offsets": [[4, 4]], "radius": 5}})
+        fig = _fig_dict_of(messages, cid)
+        anns = fig["panels"][0]["annotations"]
+        assert len(anns) == 2
+        assert anns[0]["offsets"] == [[4, 4]]
+
+        # REMOVE index 0.
+        cx.repfig_remove_annotation(session, None,
+                                    {"cell_id": cid, "panel_id": pid, "index": 0})
+        fig = _fig_dict_of(messages, cid)
+        anns = fig["panels"][0]["annotations"]
+        assert len(anns) == 1 and anns[0]["kind"] == "text"
+
+
+# ── target-relative 2-D tiling ──────────────────────────────────────────────────
+
+
+class TestTileTargeted:
+    """Target-relative 2-D tiling: ``target_panel_id`` picks the neighbor of a
+    SPECIFIC panel (not just an edge of the whole grid), enabling interior grid
+    cells to be reached and hole-filled."""
+
+    def _grid_by_pos(self, fig):
+        return {tuple(p["grid_pos"]): p for p in fig["panels"]}
+
+    def test_targeted_tile_down_right_panel_makes_2x2(self, stem_4d_dataset):
+        # 1x2 grid (A at (0,0), B at (0,1)) → tile-down TARGETING B → 2x2 with the
+        # new panel at (1,1); A and B keep their positions.
+        session, messages = stem_4d_dataset["window"], stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        sig_wid = _signal_wid(session)
+        nav_wid = _nav_wid(session)
+        h.report_new(session, None, {})
+        cid = _make_figure_cell(session, messages, sig_wid)
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "tile-right",
+                           "source_window_id": nav_wid})
+        fig = _fig_dict_of(messages, cid)
+        by_pos = self._grid_by_pos(fig)
+        panel_a_id = by_pos[(0, 0)]["id"]
+        panel_b = by_pos[(0, 1)]
+
+        messages.clear()
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "tile-down",
+                           "source_window_id": nav_wid,
+                           "target_panel_id": panel_b["id"]})
+        fig = _fig_dict_of(messages, cid)
+        assert fig["layout"] == {"kind": "grid", "rows": 2, "cols": 2}
+        by_pos = self._grid_by_pos(fig)
+        assert set(by_pos.keys()) == {(0, 0), (0, 1), (1, 1)}
+        # The original two panels didn't move.
+        assert by_pos[(0, 0)]["id"] == panel_a_id
+        assert by_pos[(0, 1)]["id"] == panel_b["id"]
+
+    def _build_2x2_full(self, session, messages, sig_wid, nav_wid):
+        """A fully-occupied 2x2 grid: (0,0)=orig, (0,1), (1,0), (1,1)."""
+        h.report_new(session, None, {})
+        cid = _make_figure_cell(session, messages, sig_wid)
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "tile-right",
+                           "source_window_id": nav_wid})
+        fig = _fig_dict_of(messages, cid)
+        pB = self._grid_by_pos(fig)[(0, 1)]
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "tile-down",
+                           "source_window_id": nav_wid,
+                           "target_panel_id": pB["id"]})
+        fig = _fig_dict_of(messages, cid)
+        pA = self._grid_by_pos(fig)[(0, 0)]
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "tile-down",
+                           "source_window_id": nav_wid,
+                           "target_panel_id": pA["id"]})
+        fig = _fig_dict_of(messages, cid)
+        assert fig["layout"] == {"kind": "grid", "rows": 2, "cols": 2}
+        assert set(self._grid_by_pos(fig).keys()) == {(0, 0), (0, 1), (1, 0), (1, 1)}
+        return cid, fig
+
+    def test_occupied_neighbor_inserts_row_and_shifts(self, stem_4d_dataset):
+        # A fully-occupied 2x2 grid; tile-down TARGETING a TOP panel (whose
+        # neighbor cell below is occupied) must INSERT a row at 1: the bottom row
+        # shifts to row 2, and the new panel lands directly below the target.
+        session, messages = stem_4d_dataset["window"], stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        sig_wid = _signal_wid(session)
+        nav_wid = _nav_wid(session)
+        cid, fig = self._build_2x2_full(session, messages, sig_wid, nav_wid)
+        by_pos = self._grid_by_pos(fig)
+        top_left = by_pos[(0, 0)]
+        bottom_left_id = by_pos[(1, 0)]["id"]
+        bottom_right_id = by_pos[(1, 1)]["id"]
+
+        messages.clear()
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "tile-down",
+                           "source_window_id": nav_wid,
+                           "target_panel_id": top_left["id"]})
+        fig = _fig_dict_of(messages, cid)
+        assert fig["layout"] == {"kind": "grid", "rows": 3, "cols": 2}
+        by_pos = self._grid_by_pos(fig)
+        # The bottom row (originally row 1) shifted down to row 2.
+        assert by_pos[(2, 0)]["id"] == bottom_left_id
+        assert by_pos[(2, 1)]["id"] == bottom_right_id
+        # The target kept its row; the new panel is inserted directly below it.
+        assert by_pos[(0, 0)]["id"] == top_left["id"]
+        assert (1, 0) in by_pos
+        new_panel_id = by_pos[(1, 0)]["id"]
+        assert new_panel_id not in (top_left["id"], bottom_left_id, bottom_right_id)
+        # No panel left behind at the target's old row-1 slot other than the new one.
+        assert len(fig["panels"]) == 5
+
+    def test_targeted_tile_left_on_interior_panel_inserts_column(self, stem_4d_dataset):
+        # A fully-occupied 2x2 grid; tile-left TARGETING the top-RIGHT panel must
+        # insert a column between col 0 and col 1: the target keeps its row, the
+        # column at/after the insertion point shifts right.
+        session, messages = stem_4d_dataset["window"], stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        sig_wid = _signal_wid(session)
+        nav_wid = _nav_wid(session)
+        cid, fig = self._build_2x2_full(session, messages, sig_wid, nav_wid)
+        by_pos = self._grid_by_pos(fig)
+        top_right = by_pos[(0, 1)]
+        top_left_id = by_pos[(0, 0)]["id"]
+        bottom_left_id = by_pos[(1, 0)]["id"]
+        bottom_right_id = by_pos[(1, 1)]["id"]
+
+        messages.clear()
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "tile-left",
+                           "source_window_id": nav_wid,
+                           "target_panel_id": top_right["id"]})
+        fig = _fig_dict_of(messages, cid)
+        assert fig["layout"] == {"kind": "grid", "rows": 2, "cols": 3}
+        by_pos = self._grid_by_pos(fig)
+        # Column 0 (top_left/bottom_left) is untouched — insertion happens AT the
+        # target's column, so only the target's own column and beyond shift.
+        assert by_pos[(0, 0)]["id"] == top_left_id
+        assert by_pos[(1, 0)]["id"] == bottom_left_id
+        # The target itself shifted right by one (to col 2); the new panel took
+        # its old column slot (col 1). The other row's col-1 panel did NOT shift
+        # (only col >= insert_at among ALL panels shifts — bottom_right stays at
+        # col 1 since bottom row's panel-at-1 is >= insert_at=1 too... verify via
+        # direct check below instead of assuming which specific id lands where).
+        assert by_pos[(0, 2)]["id"] == top_right["id"]
+        new_panel_id = by_pos[(0, 1)]["id"]
+        assert new_panel_id not in (top_left_id, bottom_left_id, bottom_right_id,
+                                    top_right["id"])
+        # bottom row's original col-1 panel also shifts (col >= insert_at=1).
+        assert by_pos[(1, 2)]["id"] == bottom_right_id
+        assert len(fig["panels"]) == 5
+
+    def test_hole_fill_no_grid_growth(self, stem_4d_dataset):
+        # Build a full 2x2, remove one panel to make a hole, then tile TOWARD the
+        # hole from an adjacent panel — the hole is filled, rows/cols unchanged.
+        session, messages = stem_4d_dataset["window"], stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        sig_wid = _signal_wid(session)
+        nav_wid = _nav_wid(session)
+        cid, fig = self._build_2x2_full(session, messages, sig_wid, nav_wid)
+        by_pos = self._grid_by_pos(fig)
+        hole_target_id = by_pos[(1, 1)]["id"]   # will remove this → hole at (1,1)
+        top_right_id = by_pos[(0, 1)]["id"]     # tile-down from here fills (1,1)
+
+        messages.clear()
+        cx.repfig_remove_panel(session, None, {"cell_id": cid, "panel_id": hole_target_id})
+        fig = _fig_dict_of(messages, cid)
+        # _renormalise_layout recomputes bounds from the remaining panels; with
+        # (1,1) gone the remaining max row/col is still 1 (from (1,0) and (0,1)).
+        assert fig["layout"] == {"kind": "grid", "rows": 2, "cols": 2}
+        by_pos = self._grid_by_pos(fig)
+        assert (1, 1) not in by_pos
+
+        messages.clear()
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "tile-down",
+                           "source_window_id": nav_wid,
+                           "target_panel_id": top_right_id})
+        fig = _fig_dict_of(messages, cid)
+        # No growth: still 2x2, hole filled, panel count back to 4.
+        assert fig["layout"] == {"kind": "grid", "rows": 2, "cols": 2}
+        by_pos = self._grid_by_pos(fig)
+        assert (1, 1) in by_pos
+        assert len(fig["panels"]) == 4
+
+    def test_legacy_no_target_matches_old_semantics(self, stem_4d_dataset):
+        # No target_panel_id → tile-right appends a new column on the right (the
+        # panel lands there), tile-down appends a new row — identical to the
+        # pre-targeting behaviour pinned by TestComposeModes.
+        session, messages = stem_4d_dataset["window"], stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        sig_wid = _signal_wid(session)
+        nav_wid = _nav_wid(session)
+        h.report_new(session, None, {})
+        cid = _make_figure_cell(session, messages, sig_wid)
+        messages.clear()
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "tile-right",
+                           "source_window_id": nav_wid})
+        fig = _fig_dict_of(messages, cid)
+        assert fig["layout"] == {"kind": "grid", "rows": 1, "cols": 2}
+        positions = sorted(tuple(p["grid_pos"]) for p in fig["panels"])
+        assert positions == [(0, 0), (0, 1)]
+
+        messages.clear()
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "tile-down",
+                           "source_window_id": nav_wid})
+        fig = _fig_dict_of(messages, cid)
+        assert fig["layout"]["kind"] == "grid"
+        assert fig["layout"]["rows"] == 2
+        assert len(fig["panels"]) == 3
+
+    def test_sparse_grid_survives_renormalise_and_build(self, stem_4d_dataset):
+        # After producing a spec with a hole, _renormalise_layout and
+        # figure_builder.build_cell_figure run without exception and panels land
+        # at their grid_pos.
+        from spyde.actions.report import figure_builder
+
+        session, messages = stem_4d_dataset["window"], stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        sig_wid = _signal_wid(session)
+        nav_wid = _nav_wid(session)
+        cid, fig = self._build_2x2_full(session, messages, sig_wid, nav_wid)
+        by_pos = self._grid_by_pos(fig)
+        hole_id = by_pos[(0, 1)]["id"]
+        cx.repfig_remove_panel(session, None, {"cell_id": cid, "panel_id": hole_id})
+
+        mgr = session._report
+        cell = mgr.doc.cell_by_id(cid)
+        cx._renormalise_layout(cell.spec)   # must not raise on a sparse grid
+        snap_map = mgr.snapshot_map(cid)
+        result = figure_builder.build_cell_figure(cell.spec, snap_map)
+        assert result is not None
+        # Panel count unchanged by the build (3 panels remain after the removal).
+        assert len(cell.spec.panels) == 3
+        for p in cell.spec.panels:
+            assert isinstance(p.grid_pos, list) and len(p.grid_pos) == 2
+
+
+# ── layout presets ──────────────────────────────────────────────────────────────
+
+
+class TestLayoutPresets:
+    """``repfig_apply_layout_preset`` reassigns grid_pos for the GRID panels (in
+    their current visual order) to row / column / grid; inset panels are left
+    untouched; an unknown preset errors without mutating the spec."""
+
+    def _grid_by_pos(self, fig):
+        return {tuple(p["grid_pos"]): p for p in fig["panels"]}
+
+    def _build_3panel_sparse(self, session, messages, sig_wid, nav_wid):
+        """A holey 3-panel grid: A=(0,0), B=(0,1) via tile-right, C=(1,1) via
+        tile-down targeting B — leaves (1,0) empty (bounding grid is 2x2)."""
+        h.report_new(session, None, {})
+        cid = _make_figure_cell(session, messages, sig_wid)
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "tile-right",
+                           "source_window_id": nav_wid})
+        fig = _fig_dict_of(messages, cid)
+        by_pos = self._grid_by_pos(fig)
+        panel_a_id = by_pos[(0, 0)]["id"]
+        panel_b = by_pos[(0, 1)]
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "tile-down",
+                           "source_window_id": nav_wid,
+                           "target_panel_id": panel_b["id"]})
+        fig = _fig_dict_of(messages, cid)
+        by_pos = self._grid_by_pos(fig)
+        assert set(by_pos.keys()) == {(0, 0), (0, 1), (1, 1)}
+        panel_c_id = by_pos[(1, 1)]["id"]
+        return cid, panel_a_id, panel_b["id"], panel_c_id
+
+    def test_row_preset(self, stem_4d_dataset):
+        session, messages = stem_4d_dataset["window"], stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        sig_wid = _signal_wid(session)
+        nav_wid = _nav_wid(session)
+        cid, a, b, c = self._build_3panel_sparse(session, messages, sig_wid, nav_wid)
+
+        messages.clear()
+        cx.repfig_apply_layout_preset(session, None,
+                                      {"cell_id": cid, "preset": "row"})
+        fig = _fig_dict_of(messages, cid)
+        assert fig["layout"]["kind"] == "grid"
+        assert fig["layout"]["rows"] == 1 and fig["layout"]["cols"] == 3
+        by_pos = self._grid_by_pos(fig)
+        assert set(by_pos.keys()) == {(0, 0), (0, 1), (0, 2)}
+        # Visual order preserved: sorted by (row, col) → A, B, C left to right.
+        assert by_pos[(0, 0)]["id"] == a
+        assert by_pos[(0, 1)]["id"] == b
+        assert by_pos[(0, 2)]["id"] == c
+
+    def test_column_preset(self, stem_4d_dataset):
+        session, messages = stem_4d_dataset["window"], stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        sig_wid = _signal_wid(session)
+        nav_wid = _nav_wid(session)
+        cid, a, b, c = self._build_3panel_sparse(session, messages, sig_wid, nav_wid)
+
+        messages.clear()
+        cx.repfig_apply_layout_preset(session, None,
+                                      {"cell_id": cid, "preset": "column"})
+        fig = _fig_dict_of(messages, cid)
+        assert fig["layout"]["kind"] == "grid"
+        assert fig["layout"]["rows"] == 3 and fig["layout"]["cols"] == 1
+        by_pos = self._grid_by_pos(fig)
+        assert set(by_pos.keys()) == {(0, 0), (1, 0), (2, 0)}
+        assert by_pos[(0, 0)]["id"] == a
+        assert by_pos[(1, 0)]["id"] == b
+        assert by_pos[(2, 0)]["id"] == c
+
+    def test_grid_preset(self, stem_4d_dataset):
+        session, messages = stem_4d_dataset["window"], stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        sig_wid = _signal_wid(session)
+        nav_wid = _nav_wid(session)
+        cid, a, b, c = self._build_3panel_sparse(session, messages, sig_wid, nav_wid)
+
+        messages.clear()
+        cx.repfig_apply_layout_preset(session, None,
+                                      {"cell_id": cid, "preset": "grid"})
+        fig = _fig_dict_of(messages, cid)
+        # 3 panels → 2 cols, ceil(3/2)=2 rows, filled row-major: A(0,0) B(0,1) C(1,0).
+        assert fig["layout"]["kind"] == "grid"
+        assert fig["layout"]["rows"] == 2 and fig["layout"]["cols"] == 2
+        by_pos = self._grid_by_pos(fig)
+        assert set(by_pos.keys()) == {(0, 0), (0, 1), (1, 0)}
+        assert by_pos[(0, 0)]["id"] == a
+        assert by_pos[(0, 1)]["id"] == b
+        assert by_pos[(1, 0)]["id"] == c
+
+    def test_inset_panels_untouched(self, stem_4d_dataset):
+        # A callout inset (floating, not a grid cell) must not be touched by a
+        # layout preset applied to the remaining grid panels.
+        session, messages = stem_4d_dataset["window"], stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        sig_wid = _signal_wid(session)
+        nav_wid = _nav_wid(session)
+        h.report_new(session, None, {})
+        cid = _make_figure_cell(session, messages, sig_wid)
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "tile-right",
+                           "source_window_id": nav_wid})
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "callout",
+                           "source_window_id": nav_wid})
+        fig = _fig_dict_of(messages, cid)
+        inset_pid = fig["panels"][0]["insets"][0]["panel"]
+        inset_before = next(p for p in fig["panels"] if p["id"] == inset_pid)
+
+        messages.clear()
+        cx.repfig_apply_layout_preset(session, None,
+                                      {"cell_id": cid, "preset": "column"})
+        fig = _fig_dict_of(messages, cid)
+        # Still exactly one inset reference, on the same panel, grid_pos unchanged.
+        inset_after = next(p for p in fig["panels"] if p["id"] == inset_pid)
+        assert inset_after["grid_pos"] == inset_before["grid_pos"]
+        # The preset only reshaped the 2 GRID panels into a column.
+        assert fig["layout"]["kind"] == "grid"
+        assert fig["layout"]["rows"] == 2 and fig["layout"]["cols"] == 1
+
+    def test_unknown_preset_errors_no_change(self, stem_4d_dataset):
+        session, messages = stem_4d_dataset["window"], stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        sig_wid = _signal_wid(session)
+        nav_wid = _nav_wid(session)
+        cid, a, b, c = self._build_3panel_sparse(session, messages, sig_wid, nav_wid)
+        before = _fig_dict_of(messages, cid)
+
+        messages.clear()
+        cx.repfig_apply_layout_preset(session, None,
+                                      {"cell_id": cid, "preset": "diagonal"})
+        errors = [m for m in messages if m.get("type") == "error"]
+        assert errors, "expected an emit_error for an unknown preset"
+        # No report_state re-emitted (no mutation happened).
+        assert not _states(messages)
+        after = session._report.doc.cell_by_id(cid).spec.to_dict()
+        assert after["layout"] == before["layout"]
+        assert self._grid_by_pos(after) == self._grid_by_pos(before)
+
+    def test_hspace_wspace_preserved(self, stem_4d_dataset):
+        session, messages = stem_4d_dataset["window"], stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        sig_wid = _signal_wid(session)
+        nav_wid = _nav_wid(session)
+        cid, a, b, c = self._build_3panel_sparse(session, messages, sig_wid, nav_wid)
+        messages.clear()
+        cx.repfig_set_layout(session, None,
+                             {"cell_id": cid, "hspace": 0.4, "wspace": 0.1})
+
+        messages.clear()
+        cx.repfig_apply_layout_preset(session, None,
+                                      {"cell_id": cid, "preset": "row"})
+        fig = _fig_dict_of(messages, cid)
+        assert fig["layout"]["hspace"] == 0.4
+        assert fig["layout"]["wspace"] == 0.1
+        assert fig["layout"]["rows"] == 1 and fig["layout"]["cols"] == 3
+
+
+# ── YAML round-trip of a composed multi-panel spec ─────────────────────────────
+
+
+class TestRoundTrip:
+    def test_composed_spec_roundtrips(self, stem_4d_dataset):
+        session, messages = stem_4d_dataset["window"], stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        sig_wid = _signal_wid(session)
+        nav_wid = _nav_wid(session)
+        h.report_new(session, None, {})
+        cid = _make_figure_cell(session, messages, sig_wid)
+        # Grid + an annotation → a non-trivial spec.
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "tile-right",
+                           "source_window_id": nav_wid})
+        fig = _fig_dict_of(messages, cid)
+        pid = fig["panels"][0]["id"]
+        cx.repfig_add_annotation(session, None, {
+            "cell_id": cid, "panel_id": pid,
+            "annotation": {"kind": "circle", "offsets": [[8, 8]], "radius": 3}})
+
+        spec = session._report.doc.cell_by_id(cid).spec
+        from spyde.actions.report.model import FigureSpec
+        text = spec.to_yaml()
+        assert "\x00bin" not in text          # NO pixel bytes in the recipe
+        rt = FigureSpec.from_yaml(text)
+        assert rt.layout == spec.layout
+        assert len(rt.panels) == len(spec.panels)
+        # Panel ids, layer ids, grid positions, and the annotation survive.
+        assert [p.id for p in rt.panels] == [p.id for p in spec.panels]
+        assert [[ly.id for ly in p.layers] for p in rt.panels] == \
+               [[ly.id for ly in p.layers] for p in spec.panels]
+        assert rt.panels[0].annotations == spec.panels[0].annotations
+
+
+# ── Add to report from a LAYERED MDI plot ──────────────────────────────────────
+
+
+class TestLayeredAddToReport:
+    def test_layered_plot_carries_layers(self, stem_4d_dataset):
+        from spyde.actions import overlay as ov
+        session, messages = stem_4d_dataset["window"], stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        sig_wid = _signal_wid(session)
+        sig_plot = session._plot_by_window_id(sig_wid)
+
+        # Fake a second same-shape source and a live layer on the signal plot,
+        # WITHOUT anyplotlib (headless): construct the PlotLayer directly with a
+        # stub handle, so _snapshot_plot serializes it.
+        class _StubHandle:
+            id = "Lx"
+            def set_data(self, f):
+                pass
+
+        class _StubSource:
+            def __init__(self, frame):
+                self.current_data = frame
+                self._layers = []
+                self.view_label = "Overlay Src"
+                self.is_navigator = False
+                self.signal_tree = sig_plot.signal_tree
+
+                class _PS:
+                    class _Sig:
+                        class metadata:
+                            @staticmethod
+                            def get_item(k, default=""):
+                                return "Src"
+                    current_signal = _Sig()
+                self.plot_state = _PS()
+
+        src_frame = np.asarray(sig_plot.current_data, dtype=np.float32) + 1.0
+        stub_src = _StubSource(src_frame)
+        sig_plot._layers = [ov.PlotLayer(
+            layer_id="Lx", source_plot=stub_src, cmap="magma", alpha=0.5,
+            clim=None, visible=True, handle=_StubHandle(), title="Overlay Src")]
+
+        h.report_new(session, None, {})
+        h.report_add_figure(session, None, {"source_window_id": sig_wid})
+        st = _last_state(messages)
+        cid = [c for c in st["cells"] if c["cell_type"] == "figure"][-1]["id"]
+        fig = _fig_dict_of(messages, cid)
+        # Base + the live overlay layer serialized into the panel.
+        assert len(fig["panels"][0]["layers"]) == 2
+        cmaps = [ly["cmap"] for ly in fig["panels"][0]["layers"]]
+        assert "magma" in cmaps
+        # Both layers have a stored snapshot.
+        assert len(session._report.snapshot_map(cid)) == 2
+
+
+# ── callout source-region selector filtering + coordinate space ─────────────────
+
+
+class _FakeSelector:
+    """A fake nav selector: an integrating region driving a set of child plots,
+    living on a parent plot_window."""
+    def __init__(self, indices, children, parent, is_integrating=True):
+        self._indices = np.asarray(indices)
+        self.children = {c: None for c in children}
+        self.parent = parent
+        self.is_integrating = is_integrating
+
+    def get_selected_indices(self):
+        return self._indices
+
+
+class _FakePW:
+    """A stand-in navigator plot_window (identity only)."""
+
+
+class _FakePlot2:
+    def __init__(self, plot_window=None, mm=None):
+        self.plot_window = plot_window
+        self.multiplot_manager = mm
+
+
+class _FakeMM:
+    def __init__(self, navigation_selectors):
+        self.navigation_selectors = navigation_selectors
+
+
+class TestCalloutRegionFiltering:
+    def _rect_indices(self, x0, y0, w, h):
+        pts = [[x0 + dx, y0 + dy] for dy in range(h) for dx in range(w)]
+        return np.asarray(pts)
+
+    def test_source_region_uses_selector_linked_to_source(self):
+        """Two selector SETS on one tree: _source_nav_region must return the region
+        of the selector actually linked to the source plot, NOT the first
+        integrating selector across any navigator (finding 4)."""
+        nav_pw = _FakePW()
+        # The SIGNAL plot driven by selector B (the one we drop / query).
+        sig_b = _FakePlot2(plot_window=None)
+        sig_a = _FakePlot2(plot_window=None)
+        # Selector A: an unrelated ROI at (0,0) 2x2. Selector B: (5,6) 3x2 → the
+        # source region we expect. A is registered FIRST (would win the old bug).
+        sel_a = _FakeSelector(self._rect_indices(0, 0, 2, 2), [sig_a], nav_pw)
+        sel_b = _FakeSelector(self._rect_indices(5, 6, 3, 2), [sig_b], nav_pw)
+        mm = _FakeMM({nav_pw: [sel_a, sel_b]})
+        sig_b.multiplot_manager = mm
+
+        region = cx._source_nav_region(None, sig_b)
+        assert region == (5, 6, 3, 2)
+
+    def test_source_region_by_navigator_parent(self):
+        """When the SOURCE is the navigator itself, its selectors match by parent
+        plot_window."""
+        nav_pw = _FakePW()
+        nav_plot = _FakePlot2(plot_window=nav_pw)
+        driven = _FakePlot2(plot_window=None)
+        sel = _FakeSelector(self._rect_indices(2, 3, 4, 4), [driven], nav_pw)
+        mm = _FakeMM({nav_pw: [sel]})
+        nav_plot.multiplot_manager = mm
+        assert cx._source_nav_region(None, nav_plot) == (2, 3, 4, 4)
+
+    def test_crosshair_selector_gives_no_region(self):
+        nav_pw = _FakePW()
+        sig = _FakePlot2(plot_window=None)
+        sel = _FakeSelector(self._rect_indices(1, 1, 1, 1), [sig], nav_pw,
+                            is_integrating=False)
+        mm = _FakeMM({nav_pw: [sel]})
+        sig.multiplot_manager = mm
+        assert cx._source_nav_region(None, sig) is None
+
+    def test_index_region_to_data_calibrated(self):
+        """A nav-index region converts to the panel's DATA coords via offset+scale
+        (both axes; w/h scaled) — finding 5."""
+        from spyde.actions.report.model import PanelSpec
+        # x axis: offset 10, scale 2.  y axis: offset -4, scale 0.5.
+        panel = PanelSpec(axes={"x_axis": [10.0, 12.0, 14.0, 16.0],
+                                "y_axis": [-4.0, -3.5, -3.0]})
+        # region (x=1, y=2, w=2, h=1) in index space.
+        got = cx._index_region_to_data(panel, (1, 2, 2, 1))
+        # x: 10 + 1*2 = 12 ; y: -4 + 2*0.5 = -3 ; w: 2*2 = 4 ; h: 1*0.5 = 0.5
+        assert got == (12.0, -3.0, 4.0, 0.5)
+
+    def test_index_region_to_data_uncalibrated_passthrough(self):
+        from spyde.actions.report.model import PanelSpec
+        panel = PanelSpec(axes=None)
+        assert cx._index_region_to_data(panel, (3, 4, 5, 6)) == (3.0, 4.0, 5.0, 6.0)
+
+    def test_callout_navigator_base_converts_region_to_data(
+            self, stem_4d_dataset, monkeypatch):
+        """Cell built from the NAVIGATOR (base panel), SIGNAL dropped as the inset:
+        a connector IS attached and its region is the nav-index region converted to
+        the base navigator panel's DATA coords (finding 5)."""
+        session, messages = stem_4d_dataset["window"], stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        sig_wid = _signal_wid(session)
+        nav_wid = _nav_wid(session)
+        assert nav_wid is not None
+        h.report_new(session, None, {})
+        # Base = navigator.
+        cid = _make_figure_cell(session, messages, nav_wid)
+
+        # Give the base (navigator) panel calibrated axes so the conversion is
+        # observable, and force the nav-selector region to a known index region.
+        base_panel = session._report.doc.cell_by_id(cid).spec.panels[0]
+        base_panel.axes = {"x_axis": [100.0, 110.0, 120.0, 130.0],
+                           "y_axis": [0.0, 5.0, 10.0]}
+        monkeypatch.setattr(cx, "_source_nav_region",
+                            lambda session, plot: (1, 2, 2, 1))
+        # Base is the navigator → force resolve() to return that navigator plot.
+        nav_plot = session._plot_by_window_id(nav_wid)
+        monkeypatch.setattr(cx, "_target_base_source",
+                            lambda cell, target_panel_id=None: _StubRef(nav_plot))
+
+        messages.clear()
+        cx.repfig_compose(session, None,
+                          {"cell_id": cid, "mode": "callout",
+                           "source_window_id": sig_wid})
+        fig = _fig_dict_of(messages, cid)
+        inset = fig["panels"][0]["insets"][0]
+        assert inset["connector"] is not None
+        # x: 100 + 1*10 = 110 ; y: 0 + 2*5 = 10 ; w: 2*10 = 20 ; h: 1*5 = 5
+        assert inset["connector"]["region"] == [110.0, 10.0, 20.0, 5.0]
+
+
+class _StubRef:
+    """A SignalRef-like object whose resolve() returns a fixed plot."""
+    def __init__(self, plot):
+        self._plot = plot
+
+    def resolve(self, session):
+        return self._plot

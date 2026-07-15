@@ -39,6 +39,22 @@ class TestIpf3D:
         assert np.allclose(norms, 1.0, atol=1e-3)
         assert rgb.dtype == np.uint8
 
+    def test_sphere_points_not_capped_at_20000(self):
+        # A scan bigger than the OLD 20000-point subsample cap must now return
+        # every valid pixel (WebGPU instanced points handle up to ~1M).
+        om = _al_orientation_map(ny=200, nx=200)          # 40,000 pixels
+        xyz, rgb = om.ipf_sphere_points("z")
+        assert len(xyz) == len(rgb) == 40_000
+        assert len(xyz) > 20_000
+
+    def test_sphere_points_still_caps_at_absurd_size(self):
+        # The 1,000,000-point safety ceiling still strides down an absurdly
+        # large input so it can't blow up memory/transport.
+        om = _al_orientation_map(ny=1200, nx=1200)         # 1,440,000 pixels
+        xyz, rgb = om.ipf_sphere_points("z", max_points=1_000_000)
+        assert len(xyz) == len(rgb) <= 1_000_000
+        assert len(xyz) > 0
+
     def test_build_ipf_key_figure(self):
         # The colour-key triangle legend builds as a native anyplotlib figure.
         from spyde.actions.ipf_view import build_ipf_key_figure
@@ -46,6 +62,26 @@ class TestIpf3D:
         assert isinstance(fig_id, str) and fig_id
         assert isinstance(html, str) and "<body>" in html
         assert len(html) > 2000                      # a real figure, not empty
+
+    def test_ipf_key_uses_raster_not_thousands_of_polygons(self):
+        # The colour-key triangle is drawn as a single stretched RGBA raster
+        # (add_raster), not ~n^2 individual polygons.
+        from spyde.actions.ipf_view import build_ipf_key_figure
+        fig, _id, _html = build_ipf_key_figure(_al_orientation_map(), "z")
+        plot = list(fig._plots_map.values())[0]
+        markers = plot.to_state_dict().get("markers", [])
+        rasters = [m for m in markers if m.get("type") == "raster"]
+        assert rasters, "expected a raster marker for the colour key"
+        r = rasters[0]
+        assert r["image_width"] > 1 and r["image_height"] > 1
+        assert "clip_path" in r                       # clipped to the sector
+        assert len(r["clip_path"]) >= 3
+        polys = [m for m in markers if m.get("type") == "polygons"]
+        assert not polys, "should not also draw the slow per-cell polygon mesh"
+        lines = [m for m in markers if m.get("type") == "lines"]
+        assert lines, "sector outline should still be present"
+        texts = [m for m in markers if m.get("type") == "texts"]
+        assert texts, "[hkl] corner labels should still be present"
 
     def test_emit_ipf_key_message(self):
         # emit_ipf_key posts a `figure` message tagged view="ipf_key" (the legend
@@ -71,6 +107,17 @@ class TestIpf3D:
         assert isinstance(html, str) and len(html) > 500
         assert isinstance(fig_id, str) and fig_id
         assert p3d is not None                       # the live Plot3D (for set_highlight)
+
+    def test_build_3d_figure_forces_gpu(self):
+        # scatter3d(..., gpu=True) must reach Plot3D so it renders on the
+        # WebGPU instanced-points pipeline instead of gpu="auto" (which would
+        # fall back to Canvas2D below anyplotlib's ~20k-point threshold — and
+        # the sphere now carries every nav pixel, not a 20k subsample).
+        om = _al_orientation_map()
+        xyz, rgb = om.ipf_sphere_points("z")
+        from spyde.actions.ipf_view import build_ipf_3d_figure
+        _fig, _fig_id, _html, p3d = build_ipf_3d_figure(xyz, rgb)
+        assert p3d._state["gpu_mode"] == "always"
 
     def test_emit_3d_figure_message(self):
         # emit_ipf_3d posts a `figure` message tagged view="3d".

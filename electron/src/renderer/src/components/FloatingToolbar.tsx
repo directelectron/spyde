@@ -26,10 +26,11 @@ import { FindVectorsWizard } from './FindVectorsWizard'
 import { VectorOrientationWizard } from './VectorOrientationWizard'
 import { CenterZeroBeamWizard } from './CenterZeroBeamWizard'
 import { StrainWizard } from './StrainWizard'
+import { MovieExportWizard } from './MovieExportWizard'
 
 const WIZARD_ACTIONS = new Set([
   'Orientation Mapping', 'Find Diffraction Vectors', 'Vector Orientation Mapping',
-  'Center Zero Beam', 'Strain Mapping',
+  'Center Zero Beam', 'Strain Mapping', 'Export Movie',
 ])
 
 /**
@@ -293,6 +294,12 @@ export function FloatingToolbar({
         )}
         {openAction && openAction.name === 'Strain Mapping' && (
           <StrainWizard
+            caretPos={caretPos} windowId={windowId} sendAction={sendAction}
+            onClose={() => setOpenName(null)}
+          />
+        )}
+        {openAction && openAction.name === 'Export Movie' && (
+          <MovieExportWizard
             caretPos={caretPos} windowId={windowId} sendAction={sendAction}
             onClose={() => setOpenName(null)}
           />

@@ -46,6 +46,21 @@ export interface ErrorMessage extends MsgBase {
 export interface BackendExitedMessage extends MsgBase {
   type: 'backend_exited'
   code: number | null
+  // Optional human-readable explanation. Set when the main process synthesises
+  // this for a packaged env-setup failure (uv sync failed on first launch) —
+  // distinct from a plain runtime death (runner.ts emits no reason). Shown in
+  // the blocking overlay in place of the generic "process exited" copy.
+  reason?: string
+}
+
+/** Progress of a heavy backend action (movie export, …) via emit_progress.
+ *  Surfaced through the StatusBar busy line (done>=total or total<=0 clears it)
+ *  and re-broadcast as a `spyde:progress` CustomEvent for wizard footers. */
+export interface ProgressMessage extends MsgBase {
+  type: 'progress'
+  done: number
+  total: number
+  label?: string
 }
 
 export interface FigureMessage extends MsgBase {
@@ -61,6 +76,11 @@ export interface FigureMessage extends MsgBase {
   view_label?: string
   view_kind?: string
   strain_components?: string[]
+  /** When present + === "report", this figure belongs to a report figure cell
+   *  (routed to `reportFigures`, keyed by `cell_id`) — NOT the MDI windows. */
+  host?: string
+  /** The report cell id owning this figure (only set when host === "report"). */
+  cell_id?: string
 }
 
 export interface ToolbarConfigMessage extends MsgBase {
@@ -294,6 +314,151 @@ export interface LogLevelMessage extends MsgBase {
   level: unknown
 }
 
+// ── Report ─────────────────────────────────────────────────────────────────
+
+/** A layer within a report figure panel (the PIXEL-FREE recipe, from
+ *  `LayerSpec.to_dict()`). `source.title` names the layer in the edit toolbar. */
+export interface RepfigLayer {
+  id: string
+  source?: {
+    file_path?: string | null
+    tree_node?: string | null
+    view?: string | null
+    title?: string | null
+    [k: string]: unknown
+  }
+  cmap: string
+  clim?: [number, number] | null
+  alpha: number
+  visible: boolean
+}
+
+/** One panel of a report figure's recipe (from `PanelSpec.to_dict()`). The
+ *  `axes` dict carries `x_axis`/`y_axis` float arrays (snapshot-time calibration)
+ *  used to derive a sensible data-coord default for a new annotation. */
+export interface RepfigPanel {
+  id: string
+  grid_pos: [number, number]
+  kind: string
+  layers: RepfigLayer[]
+  axes?: {
+    units?: string
+    x_axis?: number[]
+    y_axis?: number[]
+    [k: string]: unknown
+  } | null
+  annotations: Array<Record<string, unknown> & { kind: string }>
+  scalebar?: boolean
+  colorbar?: boolean
+  title?: string
+  insets?: Array<Record<string, unknown>>
+}
+
+/** A FIGURE-LEVEL annotation (distinct from a panel's `annotations`): a marker
+ *  in the anyplotlib figure-marker schema, positioned in FIGURE FRACTIONS
+ *  (0..1, top-left origin) — NO calibration. `kind` is text/circle/rect/arrow.
+ *  An `id` is assigned by the backend so a drag persists by id. */
+export interface RepfigFigAnnotation {
+  id?: string
+  kind: 'text' | 'circle' | 'rect' | 'arrow'
+  x: number
+  y: number
+  // per-kind position/size fields (fractions): text→text; circle→r; rect→w,h;
+  // arrow→u,v — plus optional color/fontsize/linewidth.
+  [k: string]: unknown
+}
+
+/** A report figure cell's full recipe (from `FigureSpec.to_dict()`) — shipped
+ *  pixel-free in `report_state` so the edit toolbar can list panels/layers/
+ *  annotations. `annotations` are FIGURE-level markers (figure fractions);
+ *  `layout.hspace`/`layout.wspace` are the inter-panel gaps. */
+export interface RepfigSpec {
+  layout: {
+    kind: string; rows?: number; cols?: number
+    hspace?: number; wspace?: number
+    [k: string]: unknown
+  }
+  panels: RepfigPanel[]
+  nav_context?: { indices?: number[] } | null
+  annotations?: RepfigFigAnnotation[]
+}
+
+/** One cell of the report document (markdown text or an embedded figure). */
+export interface ReportCell {
+  id: string
+  cell_type: 'markdown' | 'figure'
+  /** markdown cells: the source text. */
+  source?: string
+  /** figure cells: the caption (alt text). */
+  caption?: string
+  /** figure cells: a template placeholder (dashed drop-zone, no figure yet). */
+  placeholder?: boolean
+  /** figure cells: the live figure id (null when its data is offline). */
+  fig_id?: string | null
+  /** figure cells: the SignalRef couldn't be rebound → show the baked PNG. */
+  data_offline?: boolean
+  /** figure cells: a data-URL PNG fallback (present only for offline cells). */
+  png?: string
+  /** figure cells: the pixel-free FigureSpec recipe (panels/layers/annotations)
+   *  driving the edit toolbar. Absent while a cell is a placeholder. */
+  figure?: RepfigSpec
+}
+
+/** The authoritative report document (mirrored by the renderer for editing). */
+export interface ReportDocState {
+  open: boolean
+  path: string | null
+  title: string
+  template: boolean
+  dirty: boolean
+  cells: ReportCell[]
+}
+
+/** Full report document — the backend re-broadcasts this on every change. */
+export interface ReportStateMessage extends MsgBase {
+  type: 'report_state'
+  report: ReportDocState
+}
+
+/** The backend needs a fresh PNG snapshot per listed cell before it can save.
+ *  The renderer harvests each via the figure iframe export protocol and replies
+ *  with `report_snapshots {token, images:{cell_id: dataUrl}}`. */
+export interface ReportNeedSnapshotsMessage extends MsgBase {
+  type: 'report_need_snapshots'
+  token: string
+  cells: Array<{ cell_id: string; fig_id: string }>
+}
+
+/** The report was written to disk at `path`. */
+export interface ReportSavedMessage extends MsgBase {
+  type: 'report_saved'
+  path: string
+}
+
+/** An export finished: an HTML file (static/interactive) or a markdown folder
+ *  was written at `path`. The renderer's Export flow awaits this, matched by
+ *  `token` (the same token it sent in the triggering `report_export_html` /
+ *  `report_export_markdown` payload — the backend echoes it back verbatim) so
+ *  two exports in flight at once can't cross-wire; the PDF flow's first leg
+ *  (temp static HTML) also matches on `token`. */
+export interface ReportExportedMessage extends MsgBase {
+  type: 'report_exported'
+  kind: 'html-static' | 'html-interactive' | 'markdown-folder'
+  path: string
+  token?: string | null
+}
+
+/** A report figure cell's SELECTED panel changed (backend is the source of
+ *  truth: a click on the live figure, a dock chip, or a widget drag all funnel
+ *  through `ReportManager.select_panel`). `panel_id` is the SPEC panel id, or
+ *  null for figure-level (deselected). Re-broadcast as a `spyde:` CustomEvent so
+ *  the open editor for THIS cell mirrors it. */
+export interface ReportPanelSelectedMessage extends MsgBase {
+  type: 'report_panel_selected'
+  cell_id: string
+  panel_id: string | null
+}
+
 /**
  * Wizard-scoped events re-broadcast verbatim as DOM CustomEvents (the caret
  * components subscribe directly). The payload beyond `type` is consumer-defined,
@@ -311,12 +476,109 @@ export interface WizardEventMessage extends MsgBase {
     | 'gpu_status_result'
 }
 
+// ── MDI image layering (overlay) ────────────────────────────────────────────
+
+/** One layer's appearance, as tracked by the backend (`spyde/actions/overlay.py`
+ *  `PlotLayer.to_state`). */
+export interface LayerState {
+  id: string
+  title: string
+  cmap: string
+  alpha: number
+  clim: [number, number] | null
+  visible: boolean
+}
+
+/** The authoritative layer stack for one target window — emitted after every
+ *  overlay mutation (`overlay_add`/`overlay_set`/`overlay_remove`) and in reply
+ *  to `overlay_query`. */
+export interface LayersStateMessage extends MsgBase {
+  type: 'layers_state'
+  window_id: number
+  layers: LayerState[]
+}
+
+/** Report-cell figure-compose options offered for a source window (consumed by
+ *  the report-builder drop-zone UI, not by this dock). */
+export interface RepfigComposeOptionsMessage extends MsgBase {
+  type: 'repfig_compose_options'
+  cell_id: string
+  source_window_id: number
+  options: string[]
+  detail: {
+    same_shape: boolean
+    nav_signal_pair: boolean
+  }
+}
+
+// ── Movie export wizard (mvx_*) ─────────────────────────────────────────────
+
+/** One time-gated overlay annotation in the movie (`time_range` in the movie's
+ *  frame-index or seconds domain, matched to the pipeline's convention). */
+export interface MvxAnnotation {
+  kind: 'text' | 'rect'
+  time_range: [number, number]
+  text?: string
+  /** Position/geometry, in data or fractional coords (pipeline-defined). */
+  x?: number
+  y?: number
+  w?: number
+  h?: number
+  [k: string]: unknown
+}
+
+/** The tunable movie-export parameters (mirrors the wizard's controls). */
+export interface MvxParams {
+  fps: number
+  downsample: number
+  stride: number
+  t_start: number
+  t_end: number
+  cmap?: string
+  clim?: [number, number] | null
+  timestamp: boolean
+  scalebar: boolean
+  annotations: MvxAnnotation[]
+  [k: string]: unknown
+}
+
+/** One trace overlay (a 1-D plot dragged into the wizard). */
+export interface MvxTrace {
+  id: string
+  label: string
+  color: string
+  units?: string
+}
+
+/** Authoritative movie-export wizard state — re-broadcast by the backend on
+ *  every mvx mutation (open/tune/add_trace/remove_trace). The renderer's
+ *  MovieExportWizard subscribes via the `spyde:mvx_state` CustomEvent. */
+export interface MvxStateMessage extends MsgBase {
+  type: 'mvx_state'
+  window_id: number
+  ffmpeg_ok: boolean
+  running: boolean
+  n_frames: number
+  time: { scale_s: number; units: string }
+  params: MvxParams
+  traces: MvxTrace[]
+}
+
+/** A movie export finished — the wizard shows a success note (basename of
+ *  `path`). Re-broadcast as `spyde:mvx_done`. */
+export interface MvxDoneMessage extends MsgBase {
+  type: 'mvx_done'
+  path: string
+  frames: number
+}
+
 /** The discriminated union the renderer dispatches over. */
 export type PlotAppMessage =
   | ReadyMessage
   | StatusMessage
   | ErrorMessage
   | BackendExitedMessage
+  | ProgressMessage
   | FigureMessage
   | ToolbarConfigMessage
   | WindowVisibilityMessage
@@ -345,7 +607,16 @@ export type PlotAppMessage =
   | LogMessage
   | LogBackfillMessage
   | LogLevelMessage
+  | ReportStateMessage
+  | ReportNeedSnapshotsMessage
+  | ReportSavedMessage
+  | ReportExportedMessage
+  | ReportPanelSelectedMessage
   | WizardEventMessage
+  | LayersStateMessage
+  | RepfigComposeOptionsMessage
+  | MvxStateMessage
+  | MvxDoneMessage
 
 /**
  * Narrow a raw incoming message (`Record<string, unknown>` from the IPC bridge)

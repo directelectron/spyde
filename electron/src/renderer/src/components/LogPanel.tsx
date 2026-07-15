@@ -52,6 +52,12 @@ export function LogPanel({ open, onClose }: { open: boolean; onClose: () => void
   const [clearAt, setClearAt] = useState(0)        // hide entries older than this
   const [query, setQuery] = useState('')           // free-text search filter
   const [areaFilter, setAreaFilter] = useState('') // '' = all areas
+  // Two views: structured backend log records (default) OR the RAW process
+  // stdout/stderr the backend/uv emitted. The raw stream is captured even when
+  // the backend dies before any structured record arrives (a startup crash), so
+  // it's the only place that early failure output is reachable outside the
+  // backend-exited overlay. Plain lines + the same search box; no area chips.
+  const [raw, setRaw] = useState(false)
   const bodyRef = useRef<HTMLDivElement>(null)
   const followRef = useRef(true)                   // auto-scroll unless user scrolled up
 
@@ -81,6 +87,17 @@ export function LogPanel({ open, onClose }: { open: boolean; onClose: () => void
     })
   }, [state.logEntries, clearAt, query, areaFilter])
 
+  // Raw stdout/stderr lines (the "Raw output" view). Filtered by the same search
+  // box; no area filter (there are no areas). Kept separate so the structured
+  // and raw views never interleave.
+  const rawRows = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    return state.streamLines.filter((l) => !q || l.text.toLowerCase().includes(q))
+  }, [state.streamLines, query])
+
+  // Count shown in the header + whether the current view has anything.
+  const shownCount = raw ? rawRows.length : rows.length
+
   // Auto-scroll to the newest line while the user is parked at the bottom —
   // but NOT while a text selection is active in the log (auto-scrolling would
   // collapse/yank the user's selection as new records stream in).
@@ -90,7 +107,7 @@ export function LogPanel({ open, onClose }: { open: boolean; onClose: () => void
     const sel = window.getSelection?.()
     const selectingHere = sel && !sel.isCollapsed && el.contains(sel.anchorNode)
     if (!selectingHere) el.scrollTop = el.scrollHeight
-  }, [rows.length, open])
+  }, [shownCount, open, raw])
 
   const onScroll = () => {
     const el = bodyRef.current
@@ -117,9 +134,11 @@ export function LogPanel({ open, onClose }: { open: boolean; onClose: () => void
   // Copy the visible log as plain text (tab-separated, one record per line).
   const [copied, setCopied] = useState(false)
   const onCopy = async () => {
-    const text = rows
-      .map((e) => `${clock(e.time)}\t${e.level}\t[${areaOf(e)}]\t${shortName(e.name)}\t${e.msg}`)
-      .join('\n')
+    const text = raw
+      ? rawRows.map((l) => l.text.replace(/\n$/, '')).join('\n')
+      : rows
+          .map((e) => `${clock(e.time)}\t${e.level}\t[${areaOf(e)}]\t${shortName(e.name)}\t${e.msg}`)
+          .join('\n')
     try {
       await navigator.clipboard.writeText(text)
       setCopied(true)
@@ -134,45 +153,61 @@ export function LogPanel({ open, onClose }: { open: boolean; onClose: () => void
   return (
     <div style={styles.root} data-testid="log-panel">
       <div style={styles.header}>
-        <span style={styles.title}>Application Log</span>
-        <span style={styles.count} data-testid="log-count">{rows.length}</span>
+        <span style={styles.title}>{raw ? 'Raw Output' : 'Application Log'}</span>
+        <span style={styles.count} data-testid="log-count">{shownCount}</span>
+        <button
+          data-testid="log-raw-toggle"
+          style={{ ...styles.btn, ...(raw ? styles.btnActive : null) }}
+          onClick={() => { setRaw(v => !v); followRef.current = true }}
+          title={raw
+            ? 'Show the structured backend log records'
+            : 'Show the raw process stdout/stderr (captures startup crashes the structured log misses)'}
+        >
+          {raw ? 'Structured log' : 'Raw output'}
+        </button>
         <input
           data-testid="log-search"
           style={styles.search}
           type="text"
-          placeholder="Search logs…"
+          placeholder={raw ? 'Search raw output…' : 'Search logs…'}
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          title="Filter visible log lines (matches level, logger, area, and message)"
+          title={raw
+            ? 'Filter visible raw output lines'
+            : 'Filter visible log lines (matches level, logger, area, and message)'}
         />
-        <select
-          data-testid="log-area-select"
-          style={styles.select}
-          value={areaFilter}
-          onChange={(e) => setAreaFilter(e.target.value)}
-          title="Show only one subsystem's logs"
-        >
-          <option value="">All areas</option>
-          {areas.map((a) => <option key={a} value={a}>{a}</option>)}
-        </select>
+        {!raw && (
+          <select
+            data-testid="log-area-select"
+            style={styles.select}
+            value={areaFilter}
+            onChange={(e) => setAreaFilter(e.target.value)}
+            title="Show only one subsystem's logs"
+          >
+            <option value="">All areas</option>
+            {areas.map((a) => <option key={a} value={a}>{a}</option>)}
+          </select>
+        )}
         <span style={{ flex: 1 }} />
-        <label style={styles.levelLabel}>Level</label>
-        <select
-          data-testid="log-level-select"
-          style={styles.select}
-          value={state.logLevel}
-          onChange={onLevel}
-        >
-          {LEVELS.map((l) => <option key={l} value={l}>{l}</option>)}
-        </select>
-        <button
-          data-testid="log-profile"
-          style={{ ...styles.btn, ...(profiling ? styles.btnActive : null) }}
-          onClick={onToggleProfile}
-          title="Toggle per-frame navigator update timing (read / levels / transport ms per move)"
-        >
-          {profiling ? 'Profiling ●' : 'Profile'}
-        </button>
+        {!raw && <>
+          <label style={styles.levelLabel}>Level</label>
+          <select
+            data-testid="log-level-select"
+            style={styles.select}
+            value={state.logLevel}
+            onChange={onLevel}
+          >
+            {LEVELS.map((l) => <option key={l} value={l}>{l}</option>)}
+          </select>
+          <button
+            data-testid="log-profile"
+            style={{ ...styles.btn, ...(profiling ? styles.btnActive : null) }}
+            onClick={onToggleProfile}
+            title="Toggle per-frame navigator update timing (read / levels / transport ms per move)"
+          >
+            {profiling ? 'Profiling ●' : 'Profile'}
+          </button>
+        </>}
         <button
           data-testid="log-copy"
           style={styles.btn}
@@ -181,14 +216,16 @@ export function LogPanel({ open, onClose }: { open: boolean; onClose: () => void
         >
           {copied ? 'Copied' : 'Copy'}
         </button>
-        <button
-          data-testid="log-clear"
-          style={styles.btn}
-          onClick={() => { setClearAt(Date.now() / 1000); followRef.current = true }}
-          title="Clear the visible log"
-        >
-          Clear
-        </button>
+        {!raw && (
+          <button
+            data-testid="log-clear"
+            style={styles.btn}
+            onClick={() => { setClearAt(Date.now() / 1000); followRef.current = true }}
+            title="Clear the visible log"
+          >
+            Clear
+          </button>
+        )}
         <button
           data-testid="log-close"
           style={styles.iconBtn}
@@ -201,7 +238,21 @@ export function LogPanel({ open, onClose }: { open: boolean; onClose: () => void
       </div>
 
       <div style={styles.body} ref={bodyRef} onScroll={onScroll} data-testid="log-body">
-        {rows.length === 0 ? (
+        {raw ? (
+          rawRows.length === 0 ? (
+            <div style={styles.empty} data-testid="log-empty">No raw output captured yet.</div>
+          ) : (
+            rawRows.map((l, i) => (
+              <div
+                key={i}
+                data-testid="log-raw-row"
+                style={{ ...styles.rawRow, color: l.kind === 'stderr' ? '#f9c0c9' : '#a6adc8' }}
+              >
+                {l.text.replace(/\n$/, '')}
+              </div>
+            ))
+          )
+        ) : rows.length === 0 ? (
           <div style={styles.empty} data-testid="log-empty">No log records at this level yet.</div>
         ) : (
           rows.map((e, i) => <LogRow key={i} entry={e} onPickArea={setAreaFilter} />)
@@ -288,6 +339,7 @@ const styles: Record<string, React.CSSProperties> = {
   },
   empty: { color: '#6c7086', fontStyle: 'italic', padding: '8px 0' },
   row: { display: 'flex', gap: 8, whiteSpace: 'pre-wrap', wordBreak: 'break-word' },
+  rawRow: { whiteSpace: 'pre-wrap', wordBreak: 'break-word' },
   time: { color: '#6c7086', flexShrink: 0 },
   level: { flexShrink: 0, whiteSpace: 'pre', fontWeight: 600 },
   area: {

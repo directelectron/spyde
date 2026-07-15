@@ -1,22 +1,36 @@
 /**
  * index.ts — Electron main process for SpyDE.
  */
-import { app, BrowserWindow, dialog, ipcMain, Menu, shell, nativeTheme, net, protocol } from 'electron'
+import {
+  app, BrowserWindow, dialog, ipcMain, Menu, shell, nativeTheme, net, protocol,
+  clipboard, nativeImage,
+} from 'electron'
 import { join, basename } from 'path'
 import { pathToFileURL } from 'url'
 import { tmpdir } from 'os'
 import { existsSync, realpathSync, writeFileSync, rmSync } from 'fs'
+import { execFile } from 'child_process'
 import {
   startSpyDE, sendAction, sendFigureEvent, sendResize,
   stopSpyDE,
 } from './runner'
-import { resolvePythonEnv } from './pythonEnv'
+import {
+  resolvePythonEnv, managedEnvPaths, installTorchPerMachine, readLockedTorchVersion,
+} from './pythonEnv'
 import {
   initUpdater, checkForUpdates, downloadUpdate, quitAndInstall,
   readUpdateChannel, setUpdateChannel, getLastUpdateStatus, updatesSupported,
 } from './updater'
 
 let win: BrowserWindow | null = null
+
+// Concurrency guards for anything that writes into the managed Python env:
+// the first-run `uv sync` (envSetupInProgress, set around resolvePythonEnv in
+// whenReady) and the GPU-triage "Fix PyTorch install" (torchFixInProgress).
+// gpu:fix-torch refuses to run while either is set — two uv processes mutating
+// one venv concurrently would corrupt it.
+let envSetupInProgress = false
+let torchFixInProgress = false
 
 // ── Figure protocol ───────────────────────────────────────────────────────────
 //
@@ -246,7 +260,8 @@ app.whenReady().then(async () => {
   // __dirname is electron/out/main → three levels up is the repo root (dev),
   // where spyde's pyproject.toml lives (so `uv run` resolves the right env).
   const projectRoot = join(__dirname, '..', '..', '..')
-  const { cmd, cwd } = await resolvePythonEnv({
+  envSetupInProgress = true
+  const resolved = await resolvePythonEnv({
     isPackaged: app.isPackaged,
     resourcesPath: process.resourcesPath,
     projectRoot,
@@ -258,12 +273,37 @@ app.whenReady().then(async () => {
       sendToRenderer({ type: 'status', text: 'Setting up Python environment…' })
     },
   }).catch((err) => {
-    const msg = `Python environment setup failed: ${err?.message ?? err}`
-    console.error(`[spyde] ${msg}`)
-    sendToRenderer({ type: 'error', text: msg })
-    // Fall back to dev-style launch so a broken bundle is still diagnosable.
+    const detail = err?.message ?? String(err)
+    console.error(`[spyde] Python environment setup failed: ${detail}`)
+    // In a PACKAGED build the dev-style `uv run python -m spyde` from a bogus
+    // projectRoot (join(__dirname,'..','..','..') is garbage inside the app
+    // bundle) is guaranteed to fail with "No module named spyde" — a misleading
+    // second crash that buries the REAL env-setup error. So don't attempt it:
+    // surface the actual failure and stop, pointing the user at the raw-output
+    // view (the streamed uv output is captured there). In DEV the fallback is
+    // still useful (projectRoot is the real repo), so keep it there.
+    if (app.isPackaged) {
+      const text =
+        'Python environment setup failed. SpyDE could not build its analysis ' +
+        'backend on first launch.\n\n' + detail +
+        '\n\nSee "Raw output" (the Log panel toggle, or below) for the full ' +
+        'setup log. The environment lives under your user data folder — ' +
+        'deleting it forces a clean re-sync on next launch.'
+      // Drive the SAME blocking overlay the backend-death path uses (it now
+      // renders the last raw-output lines), plus an error status line.
+      sendToRenderer({ type: 'error', text: 'Python environment setup failed' })
+      sendToRenderer({ type: 'backend_exited', code: null, reason: text })
+      return null
+    }
+    sendToRenderer({ type: 'error', text: `Python environment setup failed: ${detail}` })
     return { cmd: ['uv', 'run', 'python', '-m', 'spyde'], cwd: projectRoot }
   })
+
+  envSetupInProgress = false
+
+  // Packaged env-setup failure: overlay is up, do not spawn a doomed backend.
+  if (!resolved) return
+  const { cmd, cwd } = resolved
 
   startSpyDE(cmd, {
     onMessage: (msg) => {
@@ -487,6 +527,10 @@ function buildMenu(): void {
           click: () => win?.webContents.send('spyde:open_update_dialog'),
         },
         {
+          label: 'GPU & CUDA',
+          click: () => win?.webContents.send('spyde:open_gpu_help_dialog'),
+        },
+        {
           label: 'GPU Status…',
           click: () => win?.webContents.send('spyde:open_gpu_status_dialog'),
         },
@@ -582,6 +626,149 @@ ipcMain.handle('spyde:save-dialog', async () => {
   }
 })
 
+/** Report save dialog — RETURNS the chosen path (or null) to the renderer;
+ *  does not send any backend action itself (the Report sidebar drives the
+ *  actual save via its own action once it has a path). */
+ipcMain.handle('report:save-dialog', async (_e, defaultPath?: string) => {
+  const result = await dialog.showSaveDialog(win!, {
+    defaultPath: defaultPath ?? 'report.spyde-report',
+    filters: [{ name: 'SpyDE Report', extensions: ['spyde-report'] }],
+  })
+  return result.canceled || !result.filePath ? null : result.filePath
+})
+
+/** Report open dialog (single file) — RETURNS the chosen path (or null). */
+ipcMain.handle('report:open-dialog', async () => {
+  const result = await dialog.showOpenDialog(win!, {
+    title: 'Open a SpyDE Report',
+    properties: ['openFile'],
+    filters: [{ name: 'SpyDE Report', extensions: ['spyde-report'] }],
+  })
+  return result.canceled || !result.filePaths.length ? null : result.filePaths[0]
+})
+
+/** Report EXPORT dialog — one handler for the export targets the Report sidebar
+ *  and the Movie Export wizard offer (standalone HTML, PDF, a folder of assets,
+ *  or an mp4/gif movie). RETURNS the chosen path (or null); does not perform the
+ *  export itself. */
+ipcMain.handle('report:export-dialog', async (_e, kind: 'html' | 'pdf' | 'folder' | 'mp4', defaultName?: string) => {
+  if (kind === 'folder') {
+    const result = await dialog.showOpenDialog(win!, {
+      title: 'Choose a folder to export the report into',
+      properties: ['openDirectory', 'createDirectory', 'promptToCreate'],
+    })
+    return result.canceled || !result.filePaths.length ? null : result.filePaths[0]
+  }
+  const filter =
+    kind === 'pdf' ? { name: 'PDF', extensions: ['pdf'] }
+      : kind === 'mp4' ? { name: 'Movie', extensions: ['mp4', 'gif'] }
+        : { name: 'HTML', extensions: ['html'] }
+  const result = await dialog.showSaveDialog(win!, {
+    defaultPath: defaultName ?? (kind === 'pdf' ? 'report.pdf' : kind === 'mp4' ? 'movie.mp4' : 'report.html'),
+    filters: [filter],
+  })
+  return result.canceled || !result.filePath ? null : result.filePath
+})
+
+/** Render an already-exported standalone report HTML file to PDF. Runs the
+ *  render in a hidden, locked-down BrowserWindow (sandbox on, no node
+ *  integration) — this is trusted local content (SpyDE wrote the HTML itself
+ *  moments ago via report:export-dialog + the renderer's own save), but the
+ *  window still gets no Node/IPC surface since it only needs to rasterize. */
+const PDF_EXPORT_TIMEOUT_MS = 30000
+
+ipcMain.handle('report:export-pdf', async (_e, htmlPath: string, pdfPath: string) => {
+  if (typeof htmlPath !== 'string' || !htmlPath.toLowerCase().endsWith('.html') || !existsSync(htmlPath)) {
+    return { ok: false, error: 'htmlPath must be an existing .html file' }
+  }
+  if (typeof pdfPath !== 'string' || !pdfPath.toLowerCase().endsWith('.pdf')) {
+    return { ok: false, error: 'pdfPath must end with .pdf' }
+  }
+
+  let pdfWin: BrowserWindow | null = new BrowserWindow({
+    show: false,
+    width: 900,
+    height: 1200,
+    webPreferences: {
+      sandbox: true,
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  })
+
+  // Race the whole load+settle+printToPDF sequence against a hard timeout so a
+  // hung page load or a stuck renderer (printToPDF has been seen to wedge on
+  // pathological content) can never leave the hidden window running forever —
+  // the timeout branch always destroys it, same as the normal `finally` below.
+  let timer: ReturnType<typeof setTimeout> | null = null
+  const timeout = new Promise<{ ok: false; error: string }>((resolve) => {
+    timer = setTimeout(() => resolve({ ok: false, error: 'PDF render timed out' }), PDF_EXPORT_TIMEOUT_MS)
+  })
+
+  const render = (async () => {
+    try {
+      const loaded = new Promise<void>((resolve, reject) => {
+        pdfWin!.webContents.once('did-finish-load', () => resolve())
+        pdfWin!.webContents.once('did-fail-load', (_ev, code, desc) =>
+          reject(new Error(`did-fail-load: ${code} ${desc}`)),
+        )
+      })
+      await pdfWin!.loadFile(htmlPath)
+      await loaded
+      // Let images/fonts referenced by the report settle before rasterizing.
+      await new Promise((resolve) => setTimeout(resolve, 250))
+
+      const pdfBuffer = await pdfWin!.webContents.printToPDF({
+        printBackground: true,
+        pageSize: 'A4',
+        margins: { marginType: 'default' },
+      })
+      writeFileSync(pdfPath, pdfBuffer)
+      return { ok: true as const }
+    } catch (err) {
+      return { ok: false as const, error: (err as Error)?.message ?? String(err) }
+    }
+  })()
+
+  try {
+    return await Promise.race([render, timeout])
+  } finally {
+    if (timer) clearTimeout(timer)
+    // Destroy on EVERY path, including the timeout branch (where `render` may
+    // still be in flight) — a hidden BrowserWindow left alive after a timed-out
+    // export is a leaked renderer process.
+    if (pdfWin && !pdfWin.isDestroyed()) pdfWin.destroy()
+    pdfWin = null
+  }
+})
+
+// A data URL is ~4/3 the size of the decoded bytes (base64) — cap the STRING
+// itself so we reject before nativeImage does any decode work at all.
+const CLIPBOARD_PNG_MAX_BYTES = 32 * 1024 * 1024
+const CLIPBOARD_PNG_MAX_DATA_URL_LEN = Math.ceil((CLIPBOARD_PNG_MAX_BYTES * 4) / 3) + 64
+
+/** Write a PNG data URL (e.g. a figure snapshot) to the OS clipboard as an
+ *  image, for the Report sidebar's "Copy image" action. Rejects oversized
+ *  images up front — `nativeImage.createFromDataURL` decodes synchronously on
+ *  the main process's only thread, so an unbounded image would block the
+ *  whole app (every window, every IPC reply) for however long the decode takes. */
+ipcMain.handle('clipboard:write-png', (_e, dataUrl: string) => {
+  if (typeof dataUrl !== 'string' || !dataUrl.startsWith('data:image/png')) {
+    return { ok: false, error: 'expected a data:image/png URL' }
+  }
+  if (dataUrl.length > CLIPBOARD_PNG_MAX_DATA_URL_LEN) {
+    return { ok: false, error: 'image too large for clipboard' }
+  }
+  try {
+    const image = nativeImage.createFromDataURL(dataUrl)
+    if (image.isEmpty()) return { ok: false, error: 'failed to decode PNG data URL' }
+    clipboard.writeImage(image)
+    return { ok: true }
+  } catch (err) {
+    return { ok: false, error: (err as Error)?.message ?? String(err) }
+  }
+})
+
 /** Forward figure interaction events to Python. */
 ipcMain.on('spyde:figure-event', (_, figId: string, eventJson: string) =>
   sendFigureEvent(figId, eventJson)
@@ -640,4 +827,79 @@ ipcMain.handle('spyde:get-update-info', () => ({
 ipcMain.on('spyde:set-update-channel', (_, channel: 'stable' | 'beta') => {
   setUpdateChannel(channel)
   sendAction('set_update_channel', { channel })
+})
+
+// ── GPU triage (Help → GPU & CUDA) ────────────────────────────────────────────
+
+/** Probe the machine's NVIDIA GPU via nvidia-smi. Resolves null when nvidia-smi
+ *  is absent/failing (= no usable NVIDIA driver stack, which for triage means
+ *  "no NVIDIA GPU"). Short timeout — this runs on dialog open. */
+function probeNvidiaSmi(): Promise<{ name: string; driver: string } | null> {
+  return new Promise((resolve) => {
+    try {
+      execFile(
+        'nvidia-smi',
+        ['--query-gpu=name,driver_version', '--format=csv,noheader'],
+        { timeout: 5000 },
+        (err, stdout) => {
+          if (err || !stdout?.trim()) return resolve(null)
+          // One line per GPU: "NVIDIA TITAN X (Pascal), 576.02" — take the first.
+          const parts = stdout.trim().split('\n')[0].split(',').map((s) => s.trim())
+          if (parts.length < 2 || !parts[0]) return resolve(null)
+          resolve({ name: parts[0], driver: parts[1] })
+        },
+      )
+    } catch {
+      resolve(null)
+    }
+  })
+}
+
+/** Triage probe for the GPU & CUDA help dialog: what nvidia-smi sees, whether a
+ *  managed (packaged) Python env exists to fix, the locked torch release, and
+ *  whether an env-mutating operation is currently running. The torch-side facts
+ *  (installed? CUDA usable? why not?) come from the backend's get_gpu_status —
+ *  the renderer combines both. */
+ipcMain.handle('gpu:triage', async () => {
+  const env = managedEnvPaths(process.resourcesPath, app.getPath('userData'))
+  return {
+    nvidia: await probeNvidiaSmi(),
+    // "Managed" = a packaged install with the staged payload; dev runs (repo
+    // uv env) are report-only — fixing torch there is the developer's job.
+    managedEnv: app.isPackaged && env.bundled,
+    envExists: env.envExists,
+    lockedTorch: readLockedTorchVersion(env.projectDir),
+    busy: envSetupInProgress || torchFixInProgress,
+  }
+})
+
+/** "Fix PyTorch install": re-install the locked torch release into the managed
+ *  env with the backend resolved for THIS machine (--torch-backend=auto). Same
+ *  command as first-run setup's step 2. Progress streams to the renderer's raw
+ *  output view; restart stays manual (the renderer prompts). */
+ipcMain.handle('gpu:fix-torch', async () => {
+  if (envSetupInProgress || torchFixInProgress) {
+    return { ok: false, error: 'Environment setup or another fix is already running.' }
+  }
+  const env = managedEnvPaths(process.resourcesPath, app.getPath('userData'))
+  if (!app.isPackaged || !env.bundled) {
+    return { ok: false, error: 'No managed environment (development run).' }
+  }
+  if (!env.envExists) {
+    return { ok: false, error: 'The Python environment has not been created yet — restart SpyDE to run first-time setup.' }
+  }
+  torchFixInProgress = true
+  try {
+    await installTorchPerMachine(env.projectDir, env.envDir, (line) => {
+      process.stderr.write(`[uv fix-torch] ${line}`)
+      // Land the progress in the same raw-output stream the Log panel +
+      // backend-exited overlay render.
+      if (rendererAlive()) win!.webContents.send('spyde:stream', line, 'stderr')
+    })
+    return { ok: true }
+  } catch (err) {
+    return { ok: false, error: (err as Error)?.message ?? String(err) }
+  } finally {
+    torchFixInProgress = false
+  }
 })

@@ -68,9 +68,27 @@ export function Field({ label, children }: { label: string; children: React.Reac
 export function NumInput({ value, onChange, step = 'any', width = 64, testid }: {
   value: number; onChange: (n: number) => void; step?: string; width?: number; testid?: string
 }) {
+  // A bare `Number(e.target.value)` propagates NaN upward for a mid-edit or
+  // malformed string (empty, "-", "1.", "e", …), which then flows into every
+  // consumer's state (and often straight into a backend payload) as NaN. Keep
+  // typing responsive by tracking the raw text locally, but only ever call
+  // `onChange` with a finite number — an invalid/incomplete value is ignored
+  // (the last valid `value` from the parent stays authoritative) rather than
+  // clobbering state with NaN. Valid input's behavior is unchanged.
+  const [draft, setDraft] = React.useState<string | null>(null)
   return (
-    <input data-testid={testid} type="number" step={step} value={value} style={{ ...S.num, width }}
-      onChange={(e) => onChange(e.target.value === '' ? 0 : Number(e.target.value))} />
+    <input
+      data-testid={testid} type="number" step={step}
+      value={draft ?? value}
+      style={{ ...S.num, width }}
+      onChange={(e) => {
+        const text = e.target.value
+        setDraft(text)
+        const n = Number(text)
+        if (text !== '' && Number.isFinite(n)) onChange(n)
+      }}
+      onBlur={() => setDraft(null)}
+    />
   )
 }
 

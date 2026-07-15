@@ -427,6 +427,20 @@ class BaseSelector:
                 # superseded before it paints is dropped. See Plot.enqueue_paint /
                 # _NavPainter.
                 child.enqueue_paint(new_data)
+                # MDI live overlay layers: after the base frame is enqueued, refresh
+                # each visible layer from ITS source at the SAME nav indices — a
+                # cheap SYNCHRONOUS read HERE (on the serial dispatcher thread), then
+                # a painter-thread push (mirrors the base read/paint split). ZERO-COST
+                # when the plot has no layers (the common case). Expensive-tier layer
+                # reads are skipped and caught up by the settle re-fire. See
+                # spyde.actions.overlay.refresh_plot_layers.
+                if getattr(child, "_layers", None):
+                    try:
+                        from spyde.actions.overlay import refresh_plot_layers
+                        refresh_plot_layers(child, indices,
+                                            integrating=bool(self.is_integrating))
+                    except Exception as e:
+                        logger.debug("layer refresh failed: %s", e)
                 if update_contrast:
                     child.needs_auto_level = True
                 # Chain to a downstream navigator (5-D: time → spatial → DP). The

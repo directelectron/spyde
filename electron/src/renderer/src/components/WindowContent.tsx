@@ -1,7 +1,27 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import type { SpyDEWindow, SpyDEFigure } from '../kernel/SpyDEContext'
 import { useSpyDE } from '../kernel/SpyDEContext'
-import { NAVIGATOR_DRAG_MIME } from '../kernel/dnd'
+import {
+  NAVIGATOR_DRAG_MIME, WINDOW_DRAG_MIME, FIGURE_DRAG_MIME,
+} from '../kernel/dnd'
+
+// Resolve a source window id from a FIGURE_DRAG_MIME or WINDOW_DRAG_MIME drop
+// (the window pill stamps both; payload is only readable on drop).
+function sourceWindowIdFromDrop(dt: DataTransfer): number | null {
+  const fig = dt.getData(FIGURE_DRAG_MIME)
+  if (fig) {
+    try {
+      const { windowId } = JSON.parse(fig) as { windowId?: number }
+      if (typeof windowId === 'number') return windowId
+    } catch { /* malformed */ }
+  }
+  const win = dt.getData(WINDOW_DRAG_MIME)
+  if (win) {
+    const n = parseInt(win, 10)
+    if (Number.isFinite(n)) return n
+  }
+  return null
+}
 
 interface Props {
   win: SpyDEWindow
@@ -38,7 +58,51 @@ const STRAIN_LABEL: Record<string, string> = { exx: 'εxx', eyy: 'εyy', exy: '�
 export function WindowContent({ win, iframeRefs, replayState, sendAction }: Props) {
   const id = String(win.windowId)
   const figs = win.figures
-  const { state } = useSpyDE()
+  const { state, dragKind } = useSpyDE()
+
+  // ── MDI overlay drop (Report Builder Phase 2) ──────────────────────────────
+  // While a window/figure pill is in flight (dragKind==='window'), the figure
+  // iframe (out-of-process, swallows DnD) is covered by a transparent shield with
+  // a centered "Overlay images" zone. Dropping another window's pill here asks to
+  // layer that source's image over this window's image (overlay_add). Self-drops
+  // are ignored; the backend validates shape compatibility and reports errors via
+  // status (no pre-validation here). The navigator titlebar drop (acceptSignalDrop
+  // in SubWindow) and the MDI-area drops are untouched — this shield sits only over
+  // the CONTENT box, not the titlebar.
+  const [overlayHover, setOverlayHover] = useState(false)
+  const [overlayConfirm, setOverlayConfirm] = useState<number | null>(null)
+  // Clear any transient hover once the drag ends.
+  useEffect(() => { if (dragKind == null) setOverlayHover(false) }, [dragKind])
+
+  const onOverlayDragOver = (e: React.DragEvent) => {
+    const types = e.dataTransfer.types
+    if (!types.includes(WINDOW_DRAG_MIME) && !types.includes(FIGURE_DRAG_MIME)) return
+    e.preventDefault()
+    e.stopPropagation()
+    e.dataTransfer.dropEffect = 'copy'
+    setOverlayHover(true)
+  }
+  const onOverlayDragLeave = (e: React.DragEvent) => {
+    if (!(e.currentTarget as HTMLElement).contains(e.relatedTarget as Node)) {
+      setOverlayHover(false)
+    }
+  }
+  const onOverlayDrop = (e: React.DragEvent) => {
+    const src = sourceWindowIdFromDrop(e.dataTransfer)
+    setOverlayHover(false)
+    if (src == null) return
+    e.preventDefault()
+    e.stopPropagation()
+    if (src === win.windowId) return   // ignore self-drops
+    setOverlayConfirm(src)             // ask before layering
+  }
+  const confirmOverlay = () => {
+    if (overlayConfirm != null) {
+      sendAction('overlay_add',
+        { window_id: win.windowId, source_window_id: overlayConfirm }, win.windowId)
+    }
+    setOverlayConfirm(null)
+  }
 
   // Navigator chip strip: a navigator window whose tree carries ≥2 NAMED
   // navigators (base sum, vector count map, a dropped-in signal, …) lists them
@@ -285,6 +349,42 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction }: Prop
             data-testid={`ipf-key-${id}`}
           />
         )}
+
+        {/* MDI overlay-drop shield — mounted ONLY while a window/figure pill is
+            being dragged, so it never interferes otherwise. Catches the DnD the
+            iframe would swallow; a centered zone reads "Overlay images". */}
+        {dragKind === 'window' && overlayConfirm == null && (
+          <div
+            data-testid={`overlay-drop-shield-${id}`}
+            style={styles.overlayShield}
+            onDragOver={onOverlayDragOver}
+            onDragLeave={onOverlayDragLeave}
+            onDrop={onOverlayDrop}
+          >
+            <div style={{ ...styles.overlayZone, ...(overlayHover ? styles.overlayZoneHot : {}) }}>
+              <span style={styles.overlayZoneLabel}>Overlay images</span>
+            </div>
+          </div>
+        )}
+
+        {/* Confirm popover — a small "Overlay onto this image?" before layering. */}
+        {overlayConfirm != null && (
+          <div style={styles.overlayConfirm} data-testid={`overlay-confirm-${id}`} role="dialog">
+            <div style={styles.overlayConfirmText}>Overlay onto this image?</div>
+            <div style={styles.overlayConfirmRow}>
+              <button
+                data-testid={`overlay-confirm-ok-${id}`}
+                style={styles.overlayConfirmOk}
+                onClick={confirmOverlay}
+              >Overlay</button>
+              <button
+                data-testid={`overlay-confirm-cancel-${id}`}
+                style={styles.overlayConfirmCancel}
+                onClick={() => setOverlayConfirm(null)}
+              >Cancel</button>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   )
@@ -307,6 +407,43 @@ const styles: Record<string, React.CSSProperties> = {
     position: 'absolute', right: 6, bottom: 6, width: 132, height: 120,
     border: 'none', zIndex: 4,
     background: 'rgba(24,24,37,0.72)', borderRadius: 6,
+  },
+  // MDI overlay-drop shield (over the figure iframe, only during a window drag).
+  overlayShield: {
+    position: 'absolute', inset: 0, zIndex: 6,
+    display: 'flex', alignItems: 'center', justifyContent: 'center',
+    padding: 16, boxSizing: 'border-box',
+  },
+  overlayZone: {
+    width: '78%', height: '62%',
+    display: 'flex', alignItems: 'center', justifyContent: 'center',
+    border: '2px dashed rgba(137,180,250,0.45)', borderRadius: 10,
+    background: 'rgba(24,24,37,0.28)',
+    transition: 'background 70ms, border-color 70ms',
+  },
+  overlayZoneHot: {
+    borderColor: '#89b4fa', background: 'rgba(137,180,250,0.24)',
+  },
+  overlayZoneLabel: {
+    fontSize: 12, fontWeight: 600, color: '#cdd6f4',
+    textShadow: '0 1px 3px rgba(0,0,0,0.85)',
+  },
+  overlayConfirm: {
+    position: 'absolute', left: '50%', top: '50%', transform: 'translate(-50%, -50%)',
+    zIndex: 7, minWidth: 190,
+    background: 'rgba(24,24,37,0.98)', border: '1px solid #89b4fa',
+    borderRadius: 8, padding: '10px 12px',
+    boxShadow: '0 6px 22px rgba(0,0,0,0.55)', textAlign: 'center',
+  },
+  overlayConfirmText: { fontSize: 12, color: '#cdd6f4', marginBottom: 8 },
+  overlayConfirmRow: { display: 'flex', gap: 6, justifyContent: 'center' },
+  overlayConfirmOk: {
+    background: '#89b4fa', color: '#11111b', border: 'none',
+    borderRadius: 5, padding: '4px 12px', fontSize: 11, cursor: 'pointer', fontWeight: 600,
+  },
+  overlayConfirmCancel: {
+    background: '#1e1e2e', color: '#a6adc8', border: '1px solid #45475a',
+    borderRadius: 5, padding: '4px 12px', fontSize: 11, cursor: 'pointer',
   },
   frame: {
     position: 'absolute', inset: 0, width: '100%', height: '100%',

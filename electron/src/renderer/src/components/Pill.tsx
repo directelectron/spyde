@@ -5,15 +5,16 @@
  * states are consistent everywhere.
  *
  * A window pill is the SINGLE drag source for its dataset: on dragStart it stamps
- * ALL relevant MIME payloads (window / navigator / signal-ref), so the DROP TARGET
- * decides what happens — MDI → new navigator/dataset, console → bind signal,
- * navigator titlebar → add as navigator. Titlebar empty space still moves the
- * window (the pill's drag is HTML5 drag, separate from the window-move gesture).
+ * ALL relevant MIME payloads (window / navigator / signal-ref / figure), so the
+ * DROP TARGET decides what happens — MDI → new navigator/dataset, console → bind
+ * signal, navigator titlebar → add as navigator, Report sidebar → embed the
+ * window's figure. Titlebar empty space still moves the window (the pill's drag
+ * is HTML5 drag, separate from the window-move gesture).
  */
 import React, { useState } from 'react'
 import {
   WINDOW_DRAG_MIME, NAVIGATOR_DRAG_MIME, SIGNAL_REF_DRAG_MIME, CONSOLE_VAR_DRAG_MIME,
-  WORKFLOW_NODE_DRAG_MIME,
+  WORKFLOW_NODE_DRAG_MIME, FIGURE_DRAG_MIME,
 } from '../kernel/dnd'
 
 export interface PillSegment {
@@ -34,6 +35,11 @@ export interface WindowPillPayload {
   isNavigator: boolean
   /** the displayed navigator's name (navigator windows only) */
   navName?: string | null
+  /** the window's currently-shown figure, if known — carried in the
+   *  FIGURE_DRAG_MIME payload for a Report-sidebar drop. */
+  figId?: string
+  title?: string
+  view?: string
 }
 
 export interface PillProps {
@@ -83,6 +89,13 @@ export function Pill({
           windowId: win.windowId, name: win.navName || 'base',
         }))
       }
+      const figPayload: { windowId: number; figId?: string; title?: string; view?: string } = {
+        windowId: win.windowId,
+      }
+      if (win.figId !== undefined) figPayload.figId = win.figId
+      if (win.title !== undefined) figPayload.title = win.title
+      if (win.view !== undefined) figPayload.view = win.view
+      dt.setData(FIGURE_DRAG_MIME, JSON.stringify(figPayload))
     }
     if (consoleVar) dt.setData(CONSOLE_VAR_DRAG_MIME, JSON.stringify({ name: consoleVar.name }))
     if (workflowNode) dt.setData(WORKFLOW_NODE_DRAG_MIME, JSON.stringify(workflowNode))
