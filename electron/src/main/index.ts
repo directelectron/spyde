@@ -17,6 +17,7 @@ import {
 import {
   resolvePythonEnv, managedEnvPaths, installTorchPerMachine, readLockedTorchVersion,
 } from './pythonEnv'
+import { parseUvLine } from './envProgress'
 import {
   initUpdater, checkForUpdates, downloadUpdate, quitAndInstall,
   readUpdateChannel, setUpdateChannel, getLastUpdateStatus, updatesSupported,
@@ -261,16 +262,35 @@ app.whenReady().then(async () => {
   // where spyde's pyproject.toml lives (so `uv run` resolves the right env).
   const projectRoot = join(__dirname, '..', '..', '..')
   envSetupInProgress = true
+  // Whether a real first-run setup actually ran (uv emitted output). Only THEN
+  // do we tell the renderer to raise/lower the floating setup overlay — a warm
+  // launch (env already built) resolves instantly with no onProgress calls, so
+  // the overlay must never flash.
+  let envSetupStarted = false
   const resolved = await resolvePythonEnv({
     isPackaged: app.isPackaged,
     resourcesPath: process.resourcesPath,
     projectRoot,
     userData: app.getPath('userData'),
-    onProgress: (line) => {
-      process.stderr.write(`[uv] ${line}`)
-      // Surface first-run env setup in the UI (the stream/log channel).
-      win?.webContents.send('spyde:stream', line, 'stderr')
-      sendToRenderer({ type: 'status', text: 'Setting up Python environment…' })
+    onProgress: (chunk) => {
+      process.stderr.write(`[uv] ${chunk}`)
+      // Keep feeding the raw stream/log channel (Raw output view, crash overlay).
+      win?.webContents.send('spyde:stream', chunk, 'stderr')
+      if (!envSetupStarted) {
+        envSetupStarted = true
+        sendToRenderer({ type: 'env_setup', event: 'start' })
+      }
+      // Parse each line into a structured step + push the raw line to the
+      // overlay's live tail, so first-run setup shows real, moving progress
+      // instead of a single frozen "Setting up…" string.
+      for (const line of chunk.split('\n')) {
+        if (!line.trim()) continue
+        const p = parseUvLine(line)
+        sendToRenderer({
+          type: 'env_setup', event: 'progress', raw: line.replace(/\r/g, ''),
+          phase: p?.phase, step: p?.step, percent: p?.percent ?? null,
+        })
+      }
     },
   }).catch((err) => {
     const detail = err?.message ?? String(err)
@@ -300,6 +320,14 @@ app.whenReady().then(async () => {
   })
 
   envSetupInProgress = false
+
+  // Tear down the floating setup overlay once setup finishes (success OR the
+  // dev-fallback path). On the packaged failure path `resolved` is null and the
+  // blocking backend_exited overlay takes over instead, so only emit `done`
+  // when we actually have a resolved env to launch.
+  if (envSetupStarted && resolved) {
+    sendToRenderer({ type: 'env_setup', event: 'done' })
+  }
 
   // Packaged env-setup failure: overlay is up, do not spawn a doomed backend.
   if (!resolved) return

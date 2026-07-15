@@ -10,6 +10,7 @@ import React, {
 import { asPlotAppMessage } from './protocol'
 import type { ReportDocState, ReportCell } from './protocol'
 import { WINDOW_DRAG_MIME, FIGURE_DRAG_MIME } from './dnd'
+import { EnvSetupOverlay } from '../components/EnvSetupOverlay'
 
 // Re-export the report doc types so components import them from the kernel
 // context (the single import surface the rest of the renderer already uses).
@@ -185,11 +186,23 @@ interface State {
   loading: { busy: boolean; text: string }   // long file-read busy indicator
   signalTypes: Map<number, { current: string; options: string[] }>   // windowId → signal-type info
   backendExited: { code: number | null; reason?: string } | null   // set when the Python sidecar dies; surfaces a blocking banner
+  envSetup: EnvSetupState | null   // first-run `uv sync` progress; drives the floating setup overlay
   playback: { playing: boolean; speed: number; loop: boolean }   // movie playback clock (session-wide)
   consoleResult: ConsoleResult | null       // last-executed cell (the ConsoleBar echo strip)
   consoleVars: ConsoleVarEntry[]            // live variable table (chips + signal-ref resolution)
   consoleCompletions: { completeId: number; matches: string[] } | null
   consolePreview: ConsolePreviewResult | null   // last live-preview reply (the eye-toggled slot)
+}
+
+// First-run environment setup progress (main-process `env_setup` events, parsed
+// from uv output in envProgress.ts). Drives the floating EnvSetupOverlay.
+export type EnvPhase =
+  | 'resolving' | 'downloading' | 'installing' | 'building' | 'torch' | 'working'
+export interface EnvSetupState {
+  phase: EnvPhase
+  step: string                 // friendly current-step headline
+  percent: number | null       // 0–100 for a download we can measure, else null
+  lines: string[]              // rolling raw uv output tail (bounded)
 }
 
 // Backend `nav_shape_prompt`: confirm the scan grid + step size before opening a
@@ -229,6 +242,9 @@ type Action =
   | { type: 'LOG_BACKFILL'; entries: LogEntry[] }
   | { type: 'LOG_LEVEL'; level: string }
   | { type: 'BACKEND_EXITED'; code: number | null; reason?: string }
+  | { type: 'ENV_SETUP_START' }
+  | { type: 'ENV_SETUP_PROGRESS'; phase?: EnvPhase; step?: string; percent: number | null; raw: string }
+  | { type: 'ENV_SETUP_DONE' }
   | { type: 'PLAYBACK'; playing: boolean; speed: number; loop: boolean }
   | { type: 'CONSOLE_RESULT'; result: ConsoleResult }
   | { type: 'CONSOLE_VARS'; vars: ConsoleVarEntry[] }
@@ -538,9 +554,39 @@ function spydeReducer(state: State, action: Action): State {
       return {
         ...state,
         backendExited: { code: action.code, reason: action.reason },
+        // A setup failure surfaces via BACKEND_EXITED — drop the setup overlay
+        // so the two don't stack.
+        envSetup: null,
         ready: false,
         status: 'Backend stopped',
       }
+
+    case 'ENV_SETUP_START':
+      return {
+        ...state,
+        envSetup: { phase: 'resolving', step: 'Preparing the analysis environment', percent: null, lines: [] },
+        status: 'Setting up the analysis environment…',
+      }
+
+    case 'ENV_SETUP_PROGRESS': {
+      const prev = state.envSetup
+        ?? { phase: 'resolving' as EnvPhase, step: 'Preparing the analysis environment', percent: null, lines: [] }
+      // Keep the last meaningful step/phase when a noisy line parses to nothing;
+      // always append the raw line to the bounded tail so it visibly moves.
+      const lines = [...prev.lines, action.raw].slice(-200)
+      return {
+        ...state,
+        envSetup: {
+          phase: action.phase ?? prev.phase,
+          step: action.step ?? prev.step,
+          percent: action.percent,
+          lines,
+        },
+      }
+    }
+
+    case 'ENV_SETUP_DONE':
+      return { ...state, envSetup: null }
 
     default:
       return state
@@ -621,6 +667,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     loading: { busy: false, text: '' },
     signalTypes: new Map(),
     backendExited: null,
+    envSetup: null,
     playback: { playing: false, speed: 1, loop: false },
     consoleResult: null,
     consoleVars: [],
@@ -753,6 +800,19 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
           // passes a `reason`). Either way, surface the blocking overlay — every
           // sendAction after this no-ops.
           dispatch({ type: 'BACKEND_EXITED', code: msg.code ?? null, reason: msg.reason })
+          break
+
+        case 'env_setup':
+          // First-run `uv sync` progress (index.ts). Drives the floating setup
+          // overlay so a multi-minute download never looks frozen.
+          if (msg.event === 'start') dispatch({ type: 'ENV_SETUP_START' })
+          else if (msg.event === 'done') dispatch({ type: 'ENV_SETUP_DONE' })
+          else dispatch({
+            type: 'ENV_SETUP_PROGRESS',
+            phase: msg.phase, step: msg.step,
+            percent: (typeof msg.percent === 'number' ? msg.percent : null),
+            raw: String(msg.raw ?? ''),
+          })
           break
 
         case 'figure': {
@@ -1397,6 +1457,9 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
       tileWindowsRef, dragKind,
     }}>
       {children}
+      {state.envSetup && !state.backendExited && (
+        <EnvSetupOverlay setup={state.envSetup} />
+      )}
       {state.backendExited && (
         <BackendExitedOverlay
           code={state.backendExited.code}
