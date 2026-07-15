@@ -129,6 +129,46 @@ single GitHub Release once all three legs pass (`fail-fast`, so users never see 
 partial release). See `electron/PACKAGING.md` and `DISTRIBUTION_PLAN.md` for how
 the installer stages `uv` + the locked sources and builds the venv on first launch.
 
+4. **Confirm the release actually has installers** before announcing it:
+
+   ```bash
+   gh release view vX.Y.Z --repo CSSFrancis/spyde --json assets --jq '.assets[].name'
+   ```
+
+   Expect the three installers (`SpyDE Setup *.exe`, `SpyDE-*.dmg`,
+   `SpyDE-*.AppImage`), their `.blockmap`s, and the `latest*.yml` update feeds.
+   `release.yml`'s `finalize` job now refuses to un-draft an asset-less release,
+   so a green run with an empty release should no longer be possible — but check.
+
+## ⚠️ Golden rule: NEVER create or edit the GitHub Release by hand
+
+`release.yml` owns the entire release object. It creates a **draft**, the three
+build legs upload installers **into that draft**, and only then does `finalize`
+un-draft it and stamp the beta/stable flag. Do **not**:
+
+- run `gh release create` / click "Draft a new release" for a release tag, or
+- create the release before pushing the tag, or
+- flip a release's draft/prerelease flags manually mid-run.
+
+**Why this is load-bearing (this bit us on `v0.2.0-rc.1`):** electron-builder's
+GitHub publisher only uploads into an existing release when it is still a
+**draft**. If it finds a **non-draft** release for the tag, it *skips every
+asset* (`"existing type not compatible with publishing type"`) — and, because
+that skip is non-fatal, the run goes **green with an empty release**. A
+hand-made release (created ~30 min before the workflow ran) is exactly what
+stranded `v0.2.0-rc.1` with zero installers. The workflow now force-drafts the
+release and hard-fails on a skipped publish, but the simplest guarantee is: push
+the tag and let CI do everything.
+
+### If a release ends up empty anyway
+
+1. Delete the empty release (keep the tag):
+   `gh release delete vX.Y.Z --repo CSSFrancis/spyde --yes`
+2. Cut the **next** rc through Prepare Release (`bump=pre-release`) rather than
+   reusing the stranded tag — cleaner provenance. Re-pushing a deleted-release
+   tag also works (`git push origin :refs/tags/vX.Y.Z && git push origin vX.Y.Z`)
+   once no release object exists for it.
+
 ## Notes
 
 - Installers are currently **unsigned** (Windows SmartScreen / macOS Gatekeeper
