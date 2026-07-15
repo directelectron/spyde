@@ -63,6 +63,19 @@ export interface ProgressMessage extends MsgBase {
   label?: string
 }
 
+/** First-run Python environment setup progress (main process, index.ts). Parsed
+ *  from `uv` output by envProgress.ts. `start`/`done` bracket the setup; each
+ *  `progress` carries a parsed phase/step (+ optional download %) and the raw
+ *  line for the overlay's live tail. Drives the floating EnvSetupOverlay. */
+export interface EnvSetupMessage extends MsgBase {
+  type: 'env_setup'
+  event: 'start' | 'progress' | 'done'
+  phase?: 'resolving' | 'downloading' | 'installing' | 'building' | 'torch' | 'working'
+  step?: string
+  percent?: number | null
+  raw?: string
+}
+
 export interface FigureMessage extends MsgBase {
   type: 'figure'
   window_id: number
@@ -578,6 +591,7 @@ export type PlotAppMessage =
   | StatusMessage
   | ErrorMessage
   | BackendExitedMessage
+  | EnvSetupMessage
   | ProgressMessage
   | FigureMessage
   | ToolbarConfigMessage
