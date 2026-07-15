@@ -56,6 +56,19 @@ jobs:
   # ── Create the (draft) release BEFORE the matrix builds ─────────────────────
   # Sequential, single writer — sidesteps the concurrent-create race matrix
   # legs would hit if they each tried to find-or-create the release themselves.
+  #
+  # CRITICAL — the release MUST be a DRAFT when the builds publish into it.
+  # electron-builder's GitHub publisher only uploads assets into an EXISTING
+  # release when that release `.draft === true` (gitHubPublisher getOrCreateRelease:
+  # `if (release.draft) return release`). If it finds a NON-draft release for the
+  # tag, it skips every asset with "existing type not compatible with publishing
+  # type" and — because that skip is non-fatal — the whole run goes GREEN with an
+  # EMPTY release. That is exactly what silently shipped an asset-less
+  # v0.2.0-rc.1: a non-draft prerelease had been created out-of-band ~30 min
+  # before the workflow ran, so `prepare-release` merely FOUND it (non-draft) and
+  # left it that way. So we do NOT set `prerelease:` here (a draft is type-neutral
+  # for the upload path) and we FORCE the release back to draft if it already
+  # exists. The prerelease flag is applied in `finalize`, AFTER assets attach.
   prepare-release:
     name: Create draft release
     runs-on: ubuntu-latest
@@ -68,7 +81,6 @@ jobs:
         with:
           name: SpyDE ${{ github.ref_name }}
           draft: true
-          prerelease: ${{ needs.channel.outputs.prerelease == 'true' }}
           body: |
             ## SpyDE ${{ github.ref_name }}
 
@@ -90,6 +102,29 @@ jobs:
             | macOS    | `SpyDE-*.dmg` |
             | Linux    | `SpyDE-*.AppImage` |
           generate_release_notes: true
+
+      # softprops/action-gh-release only CREATES a draft; if a release for this
+      # tag already exists (e.g. one made out-of-band, which is what stranded
+      # v0.2.0-rc.1) it just updates it and leaves its draft flag untouched. The
+      # builds can only upload into a DRAFT, so force it here — idempotent, and
+      # the single point that guarantees the invariant the whole publish path
+      # depends on. Also strip any assets a prior half-run left attached, so the
+      # "release has assets" check in each build leg reflects THIS run only.
+      - name: Force the release to draft (and clear stale assets)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh release edit "$TAG" --repo "$REPO" --draft=true
+          # Delete any assets already attached (from an earlier failed attempt),
+          # so a build leg can trust that assets it doesn't upload are its own gap.
+          assets=$(gh release view "$TAG" --repo "$REPO" \
+                     --json assets --jq '.assets[].name' 2>/dev/null || true)
+          for a in $assets; do
+            echo "Removing stale asset: $a"
+            gh release delete-asset "$TAG" "$a" --repo "$REPO" --yes || true
+          done
 
   # ── Build the Electron app + staged Python sidecar on each platform ─────────
   build:
@@ -186,9 +221,25 @@ jobs:
       # doesn't match this repo 404s the whole build (v0.1.0 died publishing to
       # the not-yet-existing directelectron org). Survives a future repo
       # transfer with zero edits.
+      # electron-builder's "skipped publishing" is a NON-FATAL warning: if it
+      # can't upload into the release (e.g. the release isn't a draft) it logs
+      # the skip and exits 0, so the build looks green while attaching ZERO
+      # assets. `prepare-release` now guarantees a draft, but that guarantee is
+      # only worth anything if a regression that breaks it FAILS loudly — so tee
+      # the output and hard-fail on any "skipped publishing" / "release not
+      # created" line. This is the tripwire that would have caught the empty
+      # v0.2.0-rc.1 release at build time instead of after users noticed.
       - name: Build + publish desktop app
         working-directory: electron
-        run: npm run dist -- --publish always -c.publish.owner=${{ github.repository_owner }} -c.publish.repo=${{ github.event.repository.name }}
+        run: |
+          set -o pipefail
+          npm run dist -- --publish always \
+            -c.publish.owner=${{ github.repository_owner }} \
+            -c.publish.repo=${{ github.event.repository.name }} 2>&1 | tee eb-publish.log
+          if grep -qiE "skipped publishing|GitHub release not created" eb-publish.log; then
+            echo "::error::electron-builder SKIPPED publishing assets — the release is not a writable draft. See the 'skipped publishing' / 'release not created' lines above."
+            exit 1
+          fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -203,12 +254,39 @@ jobs:
   finalize:
     name: Publish (un-draft) the release
     runs-on: ubuntu-latest
-    needs: build           # only runs when ALL build legs pass
+    needs: [channel, build]   # only runs when ALL build legs pass
     permissions:
       contents: write
 
     steps:
-      - name: Un-draft the release
+      # Last line of defence: all three legs went green, but confirm assets
+      # ACTUALLY landed before we publish. A release with no installers is worse
+      # than a failed run (it looks shippable), so refuse to un-draft an empty
+      # one. Expect the 3 installers + their .blockmap + the latest*.yml feeds.
+      - name: Verify the release has assets before publishing
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release edit "${{ github.ref_name }}" --draft=false --repo "${{ github.repository }}"
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          count=$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets | length')
+          echo "Release $TAG has $count asset(s)."
+          gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name'
+          if [ "$count" -lt 3 ]; then
+            echo "::error::Release $TAG has only $count assets — the installers did not attach. Refusing to publish an empty release."
+            exit 1
+          fi
+
+      # Un-draft AND stamp the channel: the prerelease flag is applied HERE (not
+      # at draft-creation) so the release stays a plain draft during the upload
+      # phase — see the prepare-release note on why a non-draft release makes
+      # electron-builder skip every asset.
+      - name: Publish the release (un-draft + set channel)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          PRERELEASE: ${{ needs.channel.outputs.prerelease }}
+        run: |
+          gh release edit "$TAG" --repo "$REPO" \
+            --draft=false --prerelease="$PRERELEASE"
