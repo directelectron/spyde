@@ -65,7 +65,16 @@ log = logging.getLogger(__name__)
 def _nav_blur_trim(ghost_block, depth_px, nav_dim, sigma):
     """Nav-space Gaussian blur (sigma over the 2 spatial nav dims, 0 elsewhere)
     of a ghost-padded block, then trim the ghost zones.  Shared by the NXCORR CPU
-    fallback and the DoG path."""
+    fallback and the DoG path.
+
+    sigma<=0 (nav blur OFF — the neural default) short-circuits to the RAW
+    block, ORIGINAL dtype: the old path still paid a float32 conversion PLUS a
+    gaussian_filter identity pass on every chunk — for a uint16 source that is
+    two full-chunk copies (4x the chunk's bytes) of pure waste per task, and
+    with ~36 concurrent tasks it dominated the batch's RAM churn. Every
+    downstream detector core converts to float32 itself exactly once."""
+    if depth_px <= 0 and (sigma is None or float(sigma) <= 0.0):
+        return np.asarray(ghost_block)
     from scipy.ndimage import gaussian_filter as _gf
     sigma_tuple = tuple([0.0] * (nav_dim - 2) + [sigma, sigma, 0.0, 0.0])
     blurred = _gf(np.asarray(ghost_block, dtype=np.float32), sigma=sigma_tuple)

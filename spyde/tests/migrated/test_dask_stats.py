@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import time
 
+import numpy as np
 import pytest
 
 
@@ -118,6 +119,55 @@ class TestSampler:
         sampler.stop()
         assert msgs and msgs[0]["type"] == "dask_stats"
         assert msgs[0]["tasks"]["executing"] == 4
+
+
+class TestNavBlurNoCopy:
+    def test_sigma_zero_returns_raw_block_no_copy(self):
+        """Nav blur OFF must NOT convert/copy the chunk: the old path made two
+        full float32 copies of every uint16 chunk (the 34 GiB batch churn)."""
+        from spyde.actions.find_vectors.chunk import _nav_blur_trim
+        block = (np.random.rand(4, 4, 8, 8) * 100).astype(np.uint16)
+        out = _nav_blur_trim(block, 0, 2, 0.0)
+        assert out is block                      # same object — zero copies
+        assert out.dtype == np.uint16
+
+    def test_sigma_positive_still_blurs(self):
+        from scipy.ndimage import gaussian_filter
+        from spyde.actions.find_vectors.chunk import _nav_blur_trim
+        block = (np.random.rand(6, 6, 8, 8) * 100).astype(np.uint16)
+        out = _nav_blur_trim(block, 1, 2, 0.5)
+        ref = gaussian_filter(block.astype(np.float32),
+                              sigma=(0.5, 0.5, 0, 0))[1:-1, 1:-1]
+        assert out.dtype == np.float32
+        np.testing.assert_allclose(out, ref, rtol=1e-6)
+
+
+class TestMemoryTrim:
+    def test_trim_runs_and_reports_rss(self):
+        from spyde.backend.dask_stats import _trim_process_memory
+        rss = _trim_process_memory()
+        assert isinstance(rss, int) and rss > 0
+
+    def test_dask_trim_action(self, monkeypatch):
+        import spyde.backend.dask_stats as ds
+        ran = []
+
+        class _FakeClient:
+            def run(self, fn):
+                ran.append(fn)
+                return {}
+
+        class _FakeSession:
+            class dask_manager:
+                client = _FakeClient()
+
+        statuses = []
+        import spyde.backend.ipc as ipc
+        monkeypatch.setattr(ipc, "emit_status", lambda t: statuses.append(t))
+        # session lacks _dispatch_to_main → run_on_worker executes inline.
+        ds.dask_trim(_FakeSession(), None, {})
+        assert ran and ran[0] is ds._trim_process_memory
+        assert statuses and "Memory trimmed" in statuses[0]
 
 
 class TestMemoryBackpressure:

@@ -30,6 +30,17 @@ async function inject(msg: Record<string, unknown>) {
   await page.evaluate((m) => { (window as any)._spyde_test_inject?.(m) }, msg)
 }
 
+async function trackActions() {
+  await app.evaluate(({ ipcMain }) => {
+    ;(globalThis as any).__sent = []
+    ipcMain.removeAllListeners('spyde:action')
+    ipcMain.on('spyde:action', (_e, action, payload, windowId) => {
+      ;(globalThis as any).__sent.push({ action, payload, windowId })
+    })
+  })
+}
+const sentActions = () => app.evaluate(() => (globalThis as any).__sent)
+
 const STATS = {
   type: 'dask_stats',
   workers: [
@@ -63,6 +74,12 @@ test('dask_stats shows the HUD; click opens the per-worker popover', async () =>
   await expect(page.getByTestId('dask-worker-1')).toContainText('3+5')
   await expect(page.getByTestId('dask-worker-0')).toContainText('–')  // idle worker
   await expect(page.getByTestId('dask-gpu-row')).toContainText('2.9/8.0')
+
+  // Trim memory → dispatches the dask_trim action (worker+backend reclaim).
+  await trackActions()
+  await page.getByTestId('dask-trim').click()
+  await expect.poll(async () => (await sentActions()).map((s: any) => s.action))
+    .toContain('dask_trim')
   await page.screenshot({ path: 'dask_monitor_shots/01-popover.png' })
 })
 

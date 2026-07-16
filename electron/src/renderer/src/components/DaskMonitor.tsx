@@ -24,7 +24,7 @@ const pctColor = (p: number) =>
 const fmtGB = (bytes: number) => (bytes / 1024 ** 3).toFixed(1)
 
 export function DaskMonitor() {
-  const { state } = useSpyDE()
+  const { state, sendAction } = useSpyDE()
   const [stats, setStats] = React.useState<DaskStatsMessage | null>(null)
   const [open, setOpen] = React.useState(false)
   const lastAt = React.useRef(0)
@@ -121,12 +121,21 @@ export function DaskMonitor() {
               <span style={S.wtasks} />
             </div>
           )}
-          {state.dashboardUrl && (
-            <button style={S.dash}
-              onClick={() => window.electron.openExternal(state.dashboardUrl!)}>
-              Open full Dask dashboard ↗
+          <div style={S.footer}>
+            {state.dashboardUrl && (
+              <button style={S.dash}
+                onClick={() => window.electron.openExternal(state.dashboardUrl!)}>
+                Open full Dask dashboard ↗
+              </button>
+            )}
+            {/* Reclaim post-batch allocator retention across workers + backend
+                (gc + torch cache + Windows EmptyWorkingSet). */}
+            <button data-testid="dask-trim" style={S.trim}
+              title="Release memory held by idle compute workers"
+              onClick={() => sendAction('dask_trim', {})}>
+              Trim memory
             </button>
-          )}
+          </div>
         </div>
       )}
     </div>
@@ -160,8 +169,16 @@ const S: Record<string, React.CSSProperties> = {
   wnum: { width: 32, textAlign: 'right', flexShrink: 0 },
   wmem: { width: 66, textAlign: 'right', color: '#a6adc8', flexShrink: 0 },
   wtasks: { width: 40, textAlign: 'right', color: '#89b4fa', flexShrink: 0 },
+  footer: {
+    marginTop: 4, display: 'flex', alignItems: 'center',
+    justifyContent: 'space-between', gap: 8,
+  },
   dash: {
-    marginTop: 4, background: 'none', border: 'none', color: '#89b4fa',
+    background: 'none', border: 'none', color: '#89b4fa',
     fontSize: 11, cursor: 'pointer', padding: 0, textAlign: 'left',
+  },
+  trim: {
+    background: 'transparent', color: '#a6adc8', border: '1px solid #45475a',
+    borderRadius: 5, padding: '2px 8px', fontSize: 10.5, cursor: 'pointer',
   },
 }

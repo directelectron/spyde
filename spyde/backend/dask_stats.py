@@ -66,6 +66,60 @@ def build_stats(info: dict, gpu: dict | None, host_cpu: float | None,
     return msg
 
 
+def _trim_process_memory() -> int:
+    """Reclaim what THIS process can hand back: collect garbage, release
+    torch's cached CUDA blocks, and on Windows push the working set out to
+    standby (``EmptyWorkingSet`` — RSS drops immediately; touched pages soft-
+    fault back in). Runs in workers via ``client.run`` and in the backend
+    directly. Returns the post-trim RSS in bytes (-1 if unreadable)."""
+    import ctypes
+    import gc
+    import sys
+
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.psapi.EmptyWorkingSet(
+                ctypes.windll.kernel32.GetCurrentProcess())
+        except Exception:
+            pass
+    try:
+        import psutil
+        return int(psutil.Process().memory_info().rss)
+    except Exception:
+        return -1
+
+
+def dask_trim(session, plot, payload=None) -> None:
+    """Staged action (the monitor popover's "Trim memory" button): run the
+    trim in every worker AND the backend, then report the host-RAM delta.
+    Post-batch worker RSS is mostly allocator retention + torch/hyperspy
+    baselines — trimming is safe any time; a busy worker just re-faults its
+    hot pages."""
+    def _work():
+        import psutil
+        from spyde.backend.ipc import emit_status
+        before = psutil.virtual_memory().percent
+        client = getattr(getattr(session, "dask_manager", None), "client", None)
+        if client is not None:
+            try:
+                client.run(_trim_process_memory)
+            except Exception as e:
+                log.debug("[dask-trim] worker trim failed: %s", e)
+        _trim_process_memory()
+        after = psutil.virtual_memory().percent
+        emit_status(f"Memory trimmed: host RAM {before:.0f}% → {after:.0f}%")
+
+    from spyde.actions.lifecycle import run_on_worker
+    run_on_worker(session, _work, name="dask-trim")
+
+
 class GpuProbe:
     """``nvidia-smi`` utilisation/VRAM sampler.
 
