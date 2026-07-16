@@ -18,9 +18,18 @@ let page: Page
 const htmlPath = join(tmpdir(), 'spyde-vectors-embed-test.html')
 
 test.beforeAll(async () => {
-  const py = join(__dirname, '..', '..', '.venv', 'Scripts', 'python.exe')
+  // Cross-platform venv interpreter (Windows Scripts/ vs POSIX bin/), falling
+  // back to whatever python is on PATH (CI layouts vary).
+  const root = join(__dirname, '..', '..')
+  const { existsSync } = require('fs')
+  const candidates = [
+    join(root, '.venv', 'Scripts', 'python.exe'),
+    join(root, '.venv', 'bin', 'python'),
+  ]
+  const py = candidates.find((p) => existsSync(p))
+    ?? (process.platform === 'win32' ? 'python' : 'python3')
   execFileSync(py, ['-m', 'spyde.tests.gen_vectors_embed', htmlPath],
-    { cwd: join(__dirname, '..', '..') })
+    { cwd: root })
   browser = await chromium.launch()
   page = await browser.newPage()
   await page.goto('file:///' + htmlPath.replace(/\\/g, '/'))
