@@ -39,6 +39,7 @@ const STATS = {
   tasks: { executing: 3, queued: 5 },
   gpu: { util: 96, vram_used: 3000, vram_total: 8192 },
   host_cpu: 88,
+  host_mem: 52,
 }
 
 test('dask_stats shows the HUD; click opens the per-worker popover', async () => {
@@ -49,6 +50,7 @@ test('dask_stats shows the HUD; click opens the per-worker popover', async () =>
   const seg = page.getByTestId('dask-monitor')
   await expect(seg).toBeVisible()
   await expect(seg).toContainText('CPU 88%')
+  await expect(seg).toContainText('MEM 52%')
   await expect(seg).toContainText('GPU 96%')
   await expect(seg).toContainText('8 tasks')
 

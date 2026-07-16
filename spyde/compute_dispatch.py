@@ -115,6 +115,36 @@ def poke_scheduler(client, label: str = "poke") -> None:
         log.debug("[%s] stall poke failed: %s", label, e)
 
 
+# Memory-pressure hysteresis for the dispatch window (fractions of a worker's
+# memory_limit): shrink the window when ANY worker crosses HOT (just under
+# dask's own 0.6-spill/0.8-pause thresholds so we back off BEFORE the
+# spill-to-disk thrash starts), restore it below COOL.
+MEM_HOT_FRAC = 0.72
+MEM_COOL_FRAC = 0.60
+
+
+def _lane_cap(base_cap: int, threads: int, mem_hot: bool) -> int:
+    """Effective in-flight window for a lane: the full cap normally, ~half the
+    lane's threads while cluster memory is hot (never below 2 — the workers
+    must keep making progress to drain the pressure)."""
+    if not mem_hot:
+        return base_cap
+    return min(base_cap, max(2, threads // 2))
+
+
+def _cluster_mem_frac(client) -> float:
+    """Peak worker memory as a fraction of its limit (0.0 when unknown)."""
+    info = client.scheduler_info(n_workers=-1).get("workers") or {}
+    peak = 0.0
+    for w in info.values():
+        limit = float(w.get("memory_limit") or 0)
+        if limit <= 0:
+            continue
+        used = float((w.get("metrics") or {}).get("memory", 0))
+        peak = max(peak, used / limit)
+    return peak
+
+
 def dispatch_chunks(
     client,
     result_array,
@@ -178,6 +208,7 @@ def dispatch_chunks(
         "gpu": max(2, 2 * gpu_threads + 2),
         "cpu": max(2, cpu_threads + 2),
     }
+    lane_threads = {"gpu": gpu_threads, "cpu": cpu_threads}
     lanes = {"gpu": list(gpu_addrs), "cpu": list(cpu_addrs)}
 
     # Banded (2-row) submission order: vertical ghost-zone neighbours stay
@@ -201,15 +232,23 @@ def dispatch_chunks(
     completed_futures: list = []  # held until the end — see module docstring
     outstanding = {"gpu": 0, "cpu": 0}
     state = {"completed": 0, "error": None, "last_progress": time.time(),
-             "lane_done": {"gpu": 0, "cpu": 0}}
+             "lane_done": {"gpu": 0, "cpu": 0}, "mem_hot": False}
 
     def _submit_next(lane):
-        """Top up `lane` with a batch of pending chunks (lock held)."""
+        """Top up `lane` with a batch of pending chunks (lock held).
+
+        MEMORY BACKPRESSURE: while cluster memory is hot (see the wait-loop
+        sampler) the effective window shrinks to ~half the lane's threads —
+        the loading/producing side pauses and lets in-flight chunks drain
+        instead of buffering the workers into spill. Top-ups are only ever
+        DEFERRED (the pending deque is untouched, every completion re-calls
+        this), so the throttle cannot wedge the dispatch."""
         if state["error"] is not None or not pending:
             return
         if stopped_flag is not None and stopped_flag[0]:
             return
-        n = min(submit_batch, len(pending), caps[lane] - outstanding[lane])
+        cap = _lane_cap(caps[lane], lane_threads[lane], state["mem_hot"])
+        n = min(submit_batch, len(pending), cap - outstanding[lane])
         if n <= 0:
             return
         idxs = [pending.popleft() for _ in range(n)]
@@ -287,9 +326,41 @@ def dispatch_chunks(
 
     last_lane_refresh = time.time()
     last_poke = time.time()
+    last_mem_check = time.time()
     while not done_event.wait(timeout=0.5):
         if stopped_flag is not None and stopped_flag[0]:
             break
+        # Memory backpressure sampler (~3 s): while any worker sits above
+        # MEM_HOT_FRAC of its limit, _submit_next holds the window at ~half
+        # the lane threads so the producing side stops outrunning the
+        # consumers (the "loading steps" throttle). Hysteresis avoids
+        # flapping; the hot→cool transition kicks a top-up pass because
+        # completions alone may be sparse at the shrunken window.
+        if time.time() - last_mem_check > 3.0:
+            last_mem_check = time.time()
+            try:
+                peak = _cluster_mem_frac(client)
+                with lock:
+                    was_hot = state["mem_hot"]
+                    state["mem_hot"] = (peak > MEM_HOT_FRAC if not was_hot
+                                        else peak > MEM_COOL_FRAC)
+                    now_hot = state["mem_hot"]
+                    if not now_hot and was_hot:
+                        for lane in ("gpu", "cpu"):
+                            while (outstanding[lane]
+                                   < _lane_cap(caps[lane], lane_threads[lane], False)
+                                   and pending):
+                                before = outstanding[lane]
+                                _submit_next(lane)
+                                if outstanding[lane] == before:
+                                    break
+                if now_hot != was_hot:
+                    log.info("[%s] memory %s (peak worker %.0f%% of limit) — "
+                             "dispatch window %s", label,
+                             "HOT" if now_hot else "cool", peak * 100,
+                             "shrunk" if now_hot else "restored")
+            except Exception as e:
+                log.debug("[%s] memory pressure sample failed: %s", label, e)
         # No-progress watchdog poke (see poke_scheduler): on the frozen-
         # delivery pathology, tasks sit assigned-but-undelivered until client
         # traffic arrives — re-poke every 5 s of no progress until they move.
@@ -309,10 +380,12 @@ def dispatch_chunks(
                             lanes["gpu"][:] = new_gpu
                             lanes["cpu"][:] = new_cpu
                             w_info = client.scheduler_info(n_workers=-1)["workers"]
-                            caps["cpu"] = max(2, sum(
+                            new_cpu_threads = sum(
                                 int(w_info[a].get("nthreads", 1))
                                 for a in new_cpu if a in w_info
-                            ) + 2)
+                            )
+                            lane_threads["cpu"] = new_cpu_threads
+                            caps["cpu"] = max(2, new_cpu_threads + 2)
                             log.debug(
                                 "[%s] dispatcher lanes refreshed: GPU=%d CPU=%d workers",
                                 label, len(new_gpu), len(new_cpu),

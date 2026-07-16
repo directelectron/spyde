@@ -27,13 +27,15 @@ class TestBuildStats:
     def test_shape_and_sums(self):
         from spyde.backend.dask_stats import build_stats
         msg = build_stats(_FAKE_INFO, gpu={"util": 96.0, "vram_used": 3000,
-                                           "vram_total": 8192}, host_cpu=88.26)
+                                           "vram_total": 8192},
+                          host_cpu=88.26, host_mem=52.04)
         assert msg["type"] == "dask_stats"
         assert [w["name"] for w in msg["workers"]] == ["0", "1"]   # sorted
         assert msg["workers"][1]["cpu"] == 97.4
         assert msg["tasks"] == {"executing": 4, "queued": 5}
         assert msg["gpu"]["util"] == 96.0
         assert msg["host_cpu"] == 88.3
+        assert msg["host_mem"] == 52.0
 
     def test_tolerates_missing_fields(self):
         from spyde.backend.dask_stats import build_stats
@@ -43,7 +45,7 @@ class TestBuildStats:
 
 
 class TestGpuProbe:
-    def test_disables_after_first_failure(self, monkeypatch):
+    def test_missing_nvidia_smi_disables_permanently(self, monkeypatch):
         import spyde.backend.dask_stats as ds
         calls = []
 
@@ -56,6 +58,32 @@ class TestGpuProbe:
         assert probe.sample() is None
         assert probe.sample() is None            # second call: no subprocess
         assert len(calls) == 1
+
+    def test_transient_failure_keeps_last_reading(self, monkeypatch):
+        """The "GPU % goes away" bug: one slow nvidia-smi under load must NOT
+        kill the probe — the sample is skipped and the last reading holds."""
+        import spyde.backend.dask_stats as ds
+
+        class _R:
+            returncode = 0
+            stdout = b"96, 3000, 8192\n"
+            stderr = b""
+
+        seq = [_R(), ds.subprocess.TimeoutExpired("nvidia-smi", 3.0), _R()]
+
+        def _run(*a, **k):
+            item = seq.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        monkeypatch.setattr(ds.subprocess, "run", _run)
+        probe = ds.GpuProbe()
+        first = probe.sample()
+        assert first is not None and first["util"] == 96.0
+        assert probe.sample() == first            # timeout → last reading held
+        assert probe.sample() is not None         # and the probe recovers
+        assert not probe._dead
 
     def test_parses_nvidia_smi(self, monkeypatch):
         import spyde.backend.dask_stats as ds
@@ -90,6 +118,39 @@ class TestSampler:
         sampler.stop()
         assert msgs and msgs[0]["type"] == "dask_stats"
         assert msgs[0]["tasks"]["executing"] == 4
+
+
+class TestMemoryBackpressure:
+    def test_lane_cap_shrinks_when_hot(self):
+        from spyde.compute_dispatch import _lane_cap
+        assert _lane_cap(34, 32, mem_hot=False) == 34
+        assert _lane_cap(34, 32, mem_hot=True) == 16     # ~half the threads
+        assert _lane_cap(10, 4, mem_hot=True) == 2       # floor keeps progress
+        assert _lane_cap(10, 2, mem_hot=True) == 2
+
+    def test_cluster_mem_frac(self):
+        from spyde.compute_dispatch import _cluster_mem_frac
+
+        class _C:
+            def scheduler_info(self, n_workers=None):
+                return {"workers": {
+                    "a": {"memory_limit": 100, "metrics": {"memory": 30}},
+                    "b": {"memory_limit": 100, "metrics": {"memory": 80}},
+                    "c": {"memory_limit": 0, "metrics": {"memory": 999}},  # ignored
+                }}
+
+        assert _cluster_mem_frac(_C()) == 0.8
+
+    def test_worker_memory_limit(self, monkeypatch):
+        from spyde.dask_manager import _worker_memory_limit
+        monkeypatch.delenv("SPYDE_MEM_FRACTION", raising=False)
+        total = 64 * 1024 ** 3
+        # Default: HALF the machine split across workers (was 80%).
+        assert _worker_memory_limit(total, 8) == int(total * 0.5) // 8
+        assert _worker_memory_limit(total, 8, fraction=0.8) == int(total * 0.8) // 8
+        assert _worker_memory_limit(total, 8, fraction=0.05) == int(total * 0.2) // 8  # clamp
+        monkeypatch.setenv("SPYDE_MEM_FRACTION", "0.25")
+        assert _worker_memory_limit(total, 8) == int(total * 0.25) // 8
 
 
 class TestWorkerPlan:

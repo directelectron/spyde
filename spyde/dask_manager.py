@@ -1,5 +1,6 @@
 from __future__ import annotations
 import logging
+import os
 import subprocess
 import threading
 
@@ -97,6 +98,19 @@ try:
     from distributed.diagnostics.plugin import WorkerPlugin as _WorkerPluginBase
 except Exception:                                    # pragma: no cover
     _WorkerPluginBase = object
+
+
+def _worker_memory_limit(total_mem: int, n_workers: int,
+                         fraction: float | None = None) -> int:
+    """Per-worker dask memory_limit from a whole-cluster RAM budget (default
+    50% of the machine; SPYDE_MEM_FRACTION overrides, clamped 0.2–0.8)."""
+    if fraction is None:
+        try:
+            fraction = float(os.environ.get("SPYDE_MEM_FRACTION", "0.5"))
+        except ValueError:
+            fraction = 0.5
+    fraction = min(0.8, max(0.2, fraction))
+    return int(total_mem * fraction) // max(n_workers, 1)
 
 
 def _lower_worker_priority(proc=None) -> bool:
@@ -216,7 +230,15 @@ class DaskManager:
         try:
             logger.info("[dask] _run begin (t+%s): building LocalCluster", _elapsed())
             total_mem = psutil.virtual_memory().total
-            memory_per_worker = int(total_mem * 0.80) // max(self._n_workers, 1)
+            # Workers collectively get HALF the machine's RAM by default (was
+            # 80%: on a ~74 GB box a batch could buffer ~38 GB before dask's
+            # own backpressure — spill at 60% / pause at 80% of each worker's
+            # limit — ever engaged, and the OS paged while the UI froze).
+            # Halving the budget makes dask's native throttles bite while the
+            # machine still has headroom; the chunk dispatcher additionally
+            # shrinks its window under pressure (compute_dispatch MEM_HOT).
+            # Override with SPYDE_MEM_FRACTION (clamped 0.2–0.8).
+            memory_per_worker = _worker_memory_limit(total_mem, self._n_workers)
             logger.info(
                 "[dask] memory per worker: %.1f GB (total=%.1f GB, workers=%d)",
                 memory_per_worker / 1024**3,

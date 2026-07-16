@@ -31,7 +31,8 @@ log = logging.getLogger(__name__)
 SAMPLE_INTERVAL_S = 2.0
 
 
-def build_stats(info: dict, gpu: dict | None, host_cpu: float | None) -> dict:
+def build_stats(info: dict, gpu: dict | None, host_cpu: float | None,
+                host_mem: float | None = None) -> dict:
     """Shape one ``dask_stats`` message from ``client.scheduler_info()`` output
     (pure — unit-testable without a cluster)."""
     workers = []
@@ -60,15 +61,24 @@ def build_stats(info: dict, gpu: dict | None, host_cpu: float | None) -> dict:
         msg["gpu"] = gpu
     if host_cpu is not None:
         msg["host_cpu"] = round(float(host_cpu), 1)
+    if host_mem is not None:
+        msg["host_mem"] = round(float(host_mem), 1)
     return msg
 
 
 class GpuProbe:
-    """``nvidia-smi`` utilisation/VRAM sampler; disables itself permanently on
-    the first failure (no GPU / no driver) so idle machines pay nothing."""
+    """``nvidia-smi`` utilisation/VRAM sampler.
+
+    Only a MISSING nvidia-smi (no GPU / no driver) disables the probe
+    permanently — so a GPU-less machine pays the subprocess cost exactly once.
+    Transient failures (the user-visible "GPU % goes away" bug: a saturated
+    machine can make one nvidia-smi call exceed its timeout) just skip that
+    sample and keep the LAST reading, so the HUD holds steady under exactly
+    the load it exists to show."""
 
     def __init__(self):
         self._dead = False
+        self._last: dict | None = None
 
     def sample(self) -> dict | None:
         if self._dead:
@@ -78,17 +88,23 @@ class GpuProbe:
                 ["nvidia-smi",
                  "--query-gpu=utilization.gpu,memory.used,memory.total",
                  "--format=csv,noheader,nounits"],
-                capture_output=True, timeout=1.5,
+                capture_output=True, timeout=3.0,
             )
             if result.returncode != 0:
                 raise RuntimeError(result.stderr.decode(errors="replace")[:200])
             line = result.stdout.decode().strip().splitlines()[0]
             util, used, total = [float(x) for x in line.split(",")]
-            return {"util": util, "vram_used": int(used), "vram_total": int(total)}
-        except Exception as e:
-            log.debug("[dask-stats] GPU probe disabled: %s", e)
+            self._last = {"util": util, "vram_used": int(used),
+                          "vram_total": int(total)}
+            return self._last
+        except FileNotFoundError:
+            log.debug("[dask-stats] no nvidia-smi — GPU probe disabled")
             self._dead = True
+            self._last = None
             return None
+        except Exception as e:
+            log.debug("[dask-stats] GPU sample skipped (%s)", e)
+            return self._last
 
 
 class DaskStatsSampler:
@@ -124,7 +140,8 @@ class DaskStatsSampler:
                     continue
                 info = client.scheduler_info(n_workers=-1)
                 emit(build_stats(info, self._gpu.sample(),
-                                 psutil.cpu_percent(interval=None)))
+                                 psutil.cpu_percent(interval=None),
+                                 psutil.virtual_memory().percent))
             except Exception as e:
                 # Cluster shutting down / transient RPC error — keep sampling;
                 # the stop() in Session.shutdown ends the thread.

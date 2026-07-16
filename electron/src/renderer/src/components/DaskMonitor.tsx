@@ -64,6 +64,11 @@ export function DaskMonitor() {
         onClick={() => setOpen(v => !v)}
       >
         <span style={{ color: pctColor(cpu) }}>CPU {cpu.toFixed(0)}%</span>
+        {typeof stats.host_mem === 'number' && (
+          <span style={{ color: pctColor(stats.host_mem) }}>
+            MEM {stats.host_mem.toFixed(0)}%
+          </span>
+        )}
         {gpu && <span style={{ color: pctColor(gpu.util) }}>GPU {gpu.util.toFixed(0)}%</span>}
         <span style={{ color: nTasks > 0 ? '#89b4fa' : '#6c7086' }}>
           {nTasks > 0 ? `${nTasks} tasks` : 'idle'}

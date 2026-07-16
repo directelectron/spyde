@@ -508,6 +508,7 @@ export interface DaskStatsMessage extends MsgBase {
   tasks: { executing: number; queued: number }
   gpu?: { util: number; vram_used: number; vram_total: number }  // %, MB, MB
   host_cpu?: number      // whole-machine CPU percent
+  host_mem?: number      // whole-machine RAM percent (paging = the freeze killer)
 }
 
 /**
