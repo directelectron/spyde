@@ -5,7 +5,7 @@
       "id": "spotunet-anyscale8-peaked-sharpened-v1",
       "label": "SpotUNet anyscale8 peaked+sharpened (scale-robust, bundled)",
       "version": 1,
-      "notes": "spotunet_anyscale8_peaked_sharpened from yoloDiffraction: the anyscale8_peaked scale-robust base (base8, levels=3; trained across disk sizes, so big disks left at native scale by the upsample-only policy are still handled) with the sharpened offset head grafted on. Best current all-rounder on real 4D-STEM (ZrNb/CuNb/SPED-Ag truth benchmark, 2026-07-16); parameter-free with auto-calibration.",
+      "notes": "spotunet_anyscale8_peaked_sharpened from yoloDiffraction: the anyscale8_peaked scale-robust base (base8, levels=3; trained across disk sizes, so it tolerates residual scale error after the canonical rescale) with the sharpened offset head grafted on. Best current all-rounder on real 4D-STEM (ZrNb/CuNb/SPED-Ag truth benchmark, 2026-07-16); parameter-free with auto-calibration.",
       "arch": {"base": 8, "in_ch": 1, "levels": 3},
       "sha256": "8b2d71d8a76b388231b8ccd7012393b980a64f9c69ceaf56b3936818c9818ef0",
       "source": {"type": "bundled", "file": "spotunet_anyscale8_peaked_sharpened.pt"}

@@ -32,7 +32,12 @@ def merge_overlaps(peaks, min_sep=3.0):
         d = np.hypot(peaks[:, 0] - p[0], peaks[:, 1] - p[1])
         grp = (d <= min_sep) & (~used)
         used[grp] = True
-        w = peaks[grp, 2]
+        # score col2 may be a disk-mean INTENSITY (GPU batch path), which can be
+        # 0 (or negative on background-subtracted data) for every group member ->
+        # np.average(weights=...) raises. Fall back to an unweighted mean.
+        w = np.clip(peaks[grp, 2], 0, None)
+        if w.sum() <= 0:
+            w = None
         y = np.average(peaks[grp, 0], weights=w)
         x = np.average(peaks[grp, 1], weights=w)
         kept.append([y, x, peaks[grp, 2].max()])

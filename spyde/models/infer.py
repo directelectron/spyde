@@ -87,7 +87,7 @@ def _estimate_work_diam(frame: np.ndarray, factor: float,
                         spot_diameter: float | None) -> float:
     """Disk diameter at WORKING (post-scale) resolution — drives BOTH the
     background-subtraction scale and the NMS window for big disks run near-native
-    (the upsample-only policy leaves them at native size). Ported from
+    (the SCALE_CLIP floor keeps very large disks well above canonical). Ported from
     yoloDiffraction detect(): the autocorrelation estimator high-passes at
     sigma=20 (canonical-tuned) and SATURATES on big disks, so iterate with a
     size-adaptive high-pass, then correct its measured ~0.83 undershoot."""
@@ -164,7 +164,7 @@ def detect(model, frame: np.ndarray, device, thresh: float = 0.3,
     disk for big disks run near-native). ``thresh`` is the heatmap confidence.
     ``spot_diameter`` (px) overrides the autocorrelation disk-size estimate — the
     user-facing "Spot size" knob for when the estimate gets it wrong; the canonical
-    rescale then derives from it (still upsample-only).
+    rescale then derives from it (both directions, bounded by SCALE_CLIP).
     """
     factor = 1.0
     work = frame
