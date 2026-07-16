@@ -62,14 +62,21 @@ class TestExplorerHtml:
         html = vectors_explorer_html(_vecs(), caption="cap & <text>")
         assert html is not None
         assert "vx-header" in html and "vx-data" in html
-        assert "vx-k" in html and "vx-vi" in html
+        # Two mounted anyplotlib figures + their serialized states + the ESM.
+        assert "vx-figk" in html and "vx-figvi" in html
+        assert "vx-state-k" in html and "vx-state-vi" in html
+        assert "vx-esm" in html and "createLocalModel" in html
+        # Both detector shapes + the real-space region widget serialized in
+        # (inside the panel-state JSON string, so quotes are escaped).
+        assert "circle" in html
+        assert "annular" in html and "rectangle" in html
         assert "cap &amp; &lt;text&gt;" in html       # caption escaped
         # The embedded JSON header parses and matches the dataset.
         m = re.search(r'id="vx-header">(.*?)</script>', html, re.S)
         hdr = json.loads(m.group(1))
         assert hdr["nav"] == [8, 8] and hdr["n"] == 8 * 8 * 3
-        # No external fetches (single-file contract).
-        assert "http://" not in html and "https://" not in html
+        # Single-file contract: no external script/style/fetch references.
+        assert "<script src=" not in html and "<link " not in html
 
     def test_over_cap_returns_none(self, monkeypatch):
         import spyde.actions.report.vectors_embed as ve
