@@ -99,6 +99,30 @@ except Exception:                                    # pragma: no cover
     _WorkerPluginBase = object
 
 
+def _lower_worker_priority(proc=None) -> bool:
+    """Drop THIS (worker) process to background priority: BELOW_NORMAL on
+    Windows, nice +10 on POSIX. A saturating batch then still consumes every
+    idle cycle, but the UI processes (Electron renderer/main + the backend
+    event loop, all at normal priority) always preempt it — this is the fix
+    for "peak finding freezes my computer". Opt out for throughput A/B runs
+    with SPYDE_WORKER_PRIORITY=normal. Returns True if the priority changed."""
+    import os as _os
+    if _os.environ.get("SPYDE_WORKER_PRIORITY", "").lower() == "normal":
+        return False
+    try:
+        import sys as _sys
+        p = proc if proc is not None else psutil.Process()
+        if _sys.platform == "win32":
+            p.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
+        else:
+            if p.nice() < 10:
+                p.nice(10)
+        return True
+    except Exception as e:
+        logger.debug("worker priority drop failed: %s", e)
+        return False
+
+
 class _WorkerTuningPlugin(_WorkerPluginBase):
     """WorkerPlugin: per-worker-process environment fixes (workers are
     separate processes — backend-side patches never reach them). Runs on
@@ -111,6 +135,8 @@ class _WorkerTuningPlugin(_WorkerPluginBase):
     2. timer unthrottle: workers inherit the hidden-Electron-child throttling
        class, so their timer waits freeze the same way as the backend's (see
        process_guard.unthrottle_windows_timers).
+    3. background priority: see _lower_worker_priority — the UI stays
+       responsive while a batch pegs every core.
     """
 
     name = "spyde-worker-tuning"
@@ -122,6 +148,7 @@ class _WorkerTuningPlugin(_WorkerPluginBase):
             unthrottle_windows_timers()
         except Exception as e:
             logger.debug("worker timer unthrottle failed: %s", e)
+        _lower_worker_priority()
 
     def teardown(self, worker=None):
         pass

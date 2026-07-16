@@ -231,6 +231,15 @@ class Session(
         self._dask_ready.set()           # release any load waiting on the cluster
         emit_status("Dask cluster ready")
         emit({"type": "dask_ready", "dashboard": self.dask_manager.client.dashboard_link})
+        # Live compute telemetry for the StatusBar HUD (worker CPU/mem/queues +
+        # GPU util) — see backend/dask_stats.py. Stopped in shutdown().
+        try:
+            from spyde.backend.dask_stats import DaskStatsSampler
+            self._dask_stats = DaskStatsSampler(
+                lambda: getattr(self.dask_manager, "client", None))
+            self._dask_stats.start()
+        except Exception as e:
+            log.debug("dask stats sampler failed to start: %s", e)
 
     def _on_dask_error(self, msg: str) -> None:
         emit_error(f"Dask startup failed: {msg}")
@@ -643,6 +652,12 @@ class Session(
             except Exception as e:
                 log.debug("console shutdown failed: %s", e)
         self._closed = True   # block compute_backend from recreating _nav_executor
+        stats = getattr(self, "_dask_stats", None)
+        if stats is not None:
+            try:
+                stats.stop()
+            except Exception as e:
+                log.debug("dask stats sampler stop failed: %s", e)
         self._plot_worker.stop()
         if self._nav_executor is not None:
             try:

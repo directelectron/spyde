@@ -493,6 +493,23 @@ export interface DownloadDoneMessage extends MsgBase {
   cancelled: boolean
 }
 
+/** One live cluster sample (~every 2 s while the cluster is up) for the
+ *  StatusBar Dask monitor HUD. `gpu` present only on NVIDIA machines. */
+export interface DaskStatsMessage extends MsgBase {
+  type: 'dask_stats'
+  workers: {
+    name: string
+    cpu: number          // percent (per worker process)
+    mem: number          // bytes
+    mem_limit: number    // bytes (0 = unknown)
+    executing: number    // tasks running now
+    ready: number        // tasks queued on the worker
+  }[]
+  tasks: { executing: number; queued: number }
+  gpu?: { util: number; vram_used: number; vram_total: number }  // %, MB, MB
+  host_cpu?: number      // whole-machine CPU percent
+}
+
 /**
  * Wizard-scoped events re-broadcast verbatim as DOM CustomEvents (the caret
  * components subscribe directly). The payload beyond `type` is consumer-defined,

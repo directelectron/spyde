@@ -1209,6 +1209,8 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         // (app-global, not wizard-scoped, but the same re-broadcast fits).
         case 'download_progress':
         case 'download_done':
+        // Cluster telemetry — consumed by the StatusBar DaskMonitor HUD.
+        case 'dask_stats':
           window.dispatchEvent(new CustomEvent(`spyde:${msg.type}`, { detail: msg }))
           break
 

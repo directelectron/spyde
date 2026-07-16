@@ -1,5 +1,6 @@
 import React from 'react'
 import { useSpyDE } from '../kernel/SpyDEContext'
+import { DaskMonitor } from './DaskMonitor'
 
 // One-time keyframes for the loading spinner (renderer has no global CSS file).
 if (typeof document !== 'undefined' && !document.getElementById('spyde-spin-kf')) {
@@ -30,6 +31,8 @@ export function StatusBar({ logOpen, onToggleLog }: {
       <span style={styles.text} data-testid="status-text">
         {busy && state.loading.text ? state.loading.text : state.status}
       </span>
+      {/* Live compute readout (CPU / GPU / tasks) — click for per-worker detail. */}
+      <DaskMonitor />
       {state.dashboardUrl && (
         <button
           style={styles.link}

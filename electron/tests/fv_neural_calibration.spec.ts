@@ -84,6 +84,14 @@ test('neural wizard: bg-σ control, auto-calibration, model refresh, compute', a
     timeout: 120_000, message: 'vectors result window never opened',
   }).toBeGreaterThan(before)
 
+  // The LIVE compute HUD (backend dask_stats sampler → StatusBar DaskMonitor)
+  // is flowing during the batch — the real end-to-end telemetry check.
+  await expect(page.getByTestId('dask-monitor')).toBeVisible({ timeout: 15_000 })
+  await page.getByTestId('dask-monitor').click()
+  await expect(page.getByTestId('dask-monitor-popover')).toBeVisible()
+  await page.screenshot({ path: 'fv_neural_shots/02b-compute-monitor.png' })
+  await page.getByTestId('dask-monitor').click()   // close the popover again
+
   // WAIT for the batch to finish before afterAll closes the app: closing
   // mid-batch wedges teardown on Windows (the Electron stdin tick that keeps
   // the hidden backend scheduled stops during shutdown — see the fv-batch
