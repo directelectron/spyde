@@ -278,6 +278,15 @@ def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = Tr
             stop_poll()
             new_tree._fv_batch_running = False
             src_tree._fv_batch_running = False
+            # Reset the workers' RSS accounting after the batch churn — see
+            # dask_stats.trim_cluster_memory (spill thresholds act on process
+            # memory, so this batch's allocator retention would otherwise eat
+            # the NEXT compute's headroom).
+            try:
+                from spyde.backend.dask_stats import trim_cluster_memory
+                trim_cluster_memory(session)
+            except Exception as e:
+                log.debug("post-batch cluster trim failed: %s", e)
             for _t in {id(src_tree): src_tree, id(new_tree): new_tree}.values():
                 if hasattr(_t, "unregister_cancel"):
                     _t.unregister_cancel(flag=stopped_flag)

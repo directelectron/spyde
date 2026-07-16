@@ -174,15 +174,17 @@ is the selling point) with visible values + override; it's ~8 forward passes on
 
 ### Phase 2 — Runtime parity + platform reach (G5, G6) — PARTIAL 2026-07-16
 
-1. ~~Wire the policy~~ DONE, and ~~the benchmark~~ RESOLVED by a real-data A/B
-   (2026-07-16, the user's 48-core / 1-GPU box, real 4D-STEM scan):
-   all-workers-CUDA was **slower** (GPU context thrash) and lagged the desktop;
-   `SPYDE_FV_GPU=2` was faster AND smooth. The neural unset-default is now
-   **"2"** — consistently in `_neural_block`'s `_gpu_task_allowed` AND
-   orchestrate's lane split (`split_workers_for_gpu(default_mode=…)`, threaded
-   through `dispatch_chunks`' mid-run lane refresh) — a mismatched pair was
-   exactly the old contention. NXCORR keeps "one" (serialising kernels).
-   `SPYDE_FV_GPU=one/N/all/off` still overrides everything.
+1. ~~Wire the policy~~ DONE. The neural unset-default is **"4"** GPU-feeding
+   workers (user-picked starting point; their first "=2 beats all" A/B turned
+   out not to have applied the env var — the freeze cure was the sigma-0
+   copy-elimination + backpressure work, and with GPU-ONLY dispatch the CPU
+   workers idle anyway, so more feeders are cheap). Consistent in
+   `_neural_block`'s `_gpu_task_allowed` AND orchestrate's lane split
+   (threaded through `dispatch_chunks`' mid-run lane refresh; chunks pinned
+   HARD — `allow_other_workers=False` — since torch-CPU inference is 10-50×
+   slower and soft placement leaks chunks there). NXCORR keeps "one"
+   (serialising kernels). `SPYDE_FV_GPU=one/N/all/off` overrides; a proper
+   measured default is still worth a benchmark pass.
 2. ~~MPS~~ DONE (code): `load_model` picks cuda → mps → cpu and smoke-tests one
    forward on MPS at load, degrading to CPU if an op is unsupported. OPEN:
    validate on real Apple-Silicon hardware.

@@ -77,13 +77,40 @@ class VirtualImageAction(RegionAction):
         widget = getattr(selector, "roi", None)
         if widget is None:
             return None
-        mask = widget_to_mask(widget, signal)
+        mask = np.ascontiguousarray(widget_to_mask(widget, signal), dtype=np.float32)
 
-        vi = (signal.data * mask).sum(axis=(-2, -1))
+        # Contract the detector mask per chunk WITHOUT materialising the
+        # ``data * mask`` product: einsum accumulates in place, so a task's
+        # only intermediates are the source chunk + the tiny nav output. The
+        # old ``(data * mask).sum(...)`` allocated a full float copy of every
+        # chunk (2-4x the chunk bytes) — ~36 of those in flight was the "VI
+        # spills GiBs to disk" pathology on uint16 data.
+        def _masked_sum(block):
+            return np.einsum("...ij,ij->...", block, mask).astype(
+                np.float32, copy=False)
+
+        data = signal.data
+        if hasattr(data, "chunks"):
+            import dask.array as da
+            if len(data.chunks[-1]) == 1 and len(data.chunks[-2]) == 1:
+                # Storage-aligned chunking (whole frames per chunk — the app's
+                # loading contract): one einsum per chunk.
+                vi = da.map_blocks(
+                    _masked_sum, data, dtype=np.float32,
+                    drop_axis=(data.ndim - 2, data.ndim - 1),
+                )
+            else:
+                # Signal axes are split across chunks (foreign/odd data): the
+                # per-block mask slice bookkeeping isn't worth it — fall back
+                # to the broadcast product and let dask handle alignment.
+                vi = (data * mask).sum(axis=(-2, -1))
+        else:
+            vi = _masked_sum(data)
+
         if params.get("calculation", "mean") == "mean":
             norm = float(mask.sum())
             if norm > 0:
-                vi = vi / norm
+                vi = vi / norm       # nav-sized — the cheap truediv
         return vi
 
     def reduce(self, signal, selector, indices, **params):
@@ -124,11 +151,28 @@ class VirtualImageAction(RegionAction):
         return np.asarray(vi)
 
     def reduce_to(self, signal, selector, child, indices, **params):
-        """Compute the virtual image. Lazy data with a Dask client returns a
-        Future (the PlotUpdateWorker polls it and pushes the result); numpy data
-        is computed synchronously. (The earlier per-chunk poll-thread stream
-        clobbered the output back to a blank frame — the "VI is just black" bug.)
+        """Compute the virtual image for the live selector flow.
+
+        Lazy data with a client STREAMS through the windowed progressive
+        compute (bounded in-flight chunks, ROI-move cancellable — the old
+        monolithic ``client.compute`` let the scheduler load the entire source
+        dataset and spill GiBs, and painted nothing until the very end). The
+        stream OWNS the child display and this returns ``None``, which the
+        selector skips (``base_selector``: ``if new_data is None: continue``)
+        — that is what fixes the historical clobbered-back-to-blank bug that
+        forced the earlier per-chunk stream to be reverted: nothing else
+        pushes to the child while the stream paints.
+
+        Numpy data keeps the synchronous :meth:`reduce` path.
         """
+        client = getattr(self.signal_tree, "client", None)
+        if getattr(signal, "_lazy", False) and client is not None:
+            vi = self._virtual_image_array(signal, selector, **params)
+            if vi is None:
+                return None
+            from spyde.drawing.update_functions import stream_progressive_to_plot
+            stream_progressive_to_plot(child, vi, client, name="vi")
+            return None
         return self.reduce(signal, selector, indices, **params)
 
 

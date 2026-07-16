@@ -554,7 +554,7 @@ def _do_compute_vectors(
         # batch blew its 120 s budget). All chunks go to the GPU workers; the
         # CPU workers stay free (which is also why the desktop stays smooth).
         neural = method == METHOD_NEURAL
-        lane_mode = "2" if neural else "one"
+        lane_mode = "4" if neural else "one"
         gpu_addrs, cpu_addrs = _split_workers_for_gpu(client, lane_mode)
         if neural:
             cpu_addrs = []

@@ -96,28 +96,24 @@ def _trim_process_memory() -> int:
         return -1
 
 
-def dask_trim(session, plot, payload=None) -> None:
-    """Staged action (the monitor popover's "Trim memory" button): run the
-    trim in every worker AND the backend, then report the host-RAM delta.
-    Post-batch worker RSS is mostly allocator retention + torch/hyperspy
-    baselines — trimming is safe any time; a busy worker just re-faults its
-    hot pages."""
-    def _work():
-        import psutil
-        from spyde.backend.ipc import emit_status
-        before = psutil.virtual_memory().percent
+def trim_cluster_memory(session) -> None:
+    """AUTOMATIC post-batch trim (no UI — user feedback: a manual "Trim
+    memory" button second-guessing dask is odd). Why it runs at all: dask's
+    spill/pause thresholds act on process RSS, so allocator retention left by
+    a batch's churn silently eats the NEXT compute's headroom (the
+    fv → VI → fv chronic-spill chain). Resetting RSS right after a batch
+    keeps dask's accounting honest. Best-effort; touched pages soft-fault
+    back in."""
+    try:
         client = getattr(getattr(session, "dask_manager", None), "client", None)
         if client is not None:
-            try:
-                client.run(_trim_process_memory)
-            except Exception as e:
-                log.debug("[dask-trim] worker trim failed: %s", e)
+            # wait=False: fire-and-forget. A blocking run() across all workers
+            # right at app close wedged teardown (the batch thread sat in the
+            # RPC while shutdown killed the stdin tick).
+            client.run(_trim_process_memory, wait=False)
         _trim_process_memory()
-        after = psutil.virtual_memory().percent
-        emit_status(f"Memory trimmed: host RAM {before:.0f}% → {after:.0f}%")
-
-    from spyde.actions.lifecycle import run_on_worker
-    run_on_worker(session, _work, name="dask-trim")
+    except Exception as e:
+        log.debug("[dask-stats] post-batch trim failed: %s", e)
 
 
 class GpuProbe:

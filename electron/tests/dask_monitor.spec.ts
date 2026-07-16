@@ -74,12 +74,8 @@ test('dask_stats shows the HUD; click opens the per-worker popover', async () =>
   await expect(page.getByTestId('dask-worker-1')).toContainText('3+5')
   await expect(page.getByTestId('dask-worker-0')).toContainText('–')  // idle worker
   await expect(page.getByTestId('dask-gpu-row')).toContainText('2.9/8.0')
-
-  // Trim memory → dispatches the dask_trim action (worker+backend reclaim).
-  await trackActions()
-  await page.getByTestId('dask-trim').click()
-  await expect.poll(async () => (await sentActions()).map((s: any) => s.action))
-    .toContain('dask_trim')
+  // No manual Trim button (removed — the backend trims automatically post-batch).
+  await expect(page.getByTestId('dask-trim')).toHaveCount(0)
   await page.screenshot({ path: 'dask_monitor_shots/01-popover.png' })
 })
 

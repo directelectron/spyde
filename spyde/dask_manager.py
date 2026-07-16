@@ -103,12 +103,21 @@ except Exception:                                    # pragma: no cover
 def _worker_memory_limit(total_mem: int, n_workers: int,
                          fraction: float | None = None) -> int:
     """Per-worker dask memory_limit from a whole-cluster RAM budget (default
-    50% of the machine; SPYDE_MEM_FRACTION overrides, clamped 0.2–0.8)."""
+    65% of the machine; SPYDE_MEM_FRACTION overrides, clamped 0.2–0.8).
+
+    Why 0.65 and not lower: dask's spill/pause thresholds act on PROCESS RSS,
+    and a worker that has run one GPU batch carries a ~2-2.5 GB baseline
+    (torch CUDA runtime + hyperspy/pyxem imports). An over-tight budget puts
+    the spill trigger (60% of the limit) BELOW that baseline, so every batch
+    after the first spills chronically ("disk detection spills the second
+    time"). 0.65 keeps spill ~1-1.5 GB of managed headroom above baseline on
+    a mid-size box; the dispatcher's MEM_HOT window shrink is the global
+    guard against actual pile-up."""
     if fraction is None:
         try:
-            fraction = float(os.environ.get("SPYDE_MEM_FRACTION", "0.5"))
+            fraction = float(os.environ.get("SPYDE_MEM_FRACTION", "0.65"))
         except ValueError:
-            fraction = 0.5
+            fraction = 0.65
     fraction = min(0.8, max(0.2, fraction))
     return int(total_mem * fraction) // max(n_workers, 1)
 

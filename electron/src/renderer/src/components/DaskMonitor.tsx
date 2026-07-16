@@ -24,7 +24,7 @@ const pctColor = (p: number) =>
 const fmtGB = (bytes: number) => (bytes / 1024 ** 3).toFixed(1)
 
 export function DaskMonitor() {
-  const { state, sendAction } = useSpyDE()
+  const { state } = useSpyDE()
   const [stats, setStats] = React.useState<DaskStatsMessage | null>(null)
   const [open, setOpen] = React.useState(false)
   const lastAt = React.useRef(0)
@@ -121,23 +121,16 @@ export function DaskMonitor() {
               <span style={S.wtasks} />
             </div>
           )}
-          <div style={S.footer}>
-            {state.dashboardUrl && (
-              <button style={S.dash}
-                onClick={() => window.electron.openExternal(state.dashboardUrl!)}>
-                Open full Dask dashboard ↗
-              </button>
-            )}
-            {/* Reclaim post-batch allocator retention across workers + backend
-                (gc + torch cache + Windows EmptyWorkingSet). NB it cannot free
-                the ~0.7-1 GB/worker of loaded torch/hyperspy runtime — that
-                baseline only goes away with the workers themselves. */}
-            <button data-testid="dask-trim" style={S.trim}
-              title="Free leftover batch memory in idle workers (the ~1 GB/worker library runtime always remains)"
-              onClick={() => sendAction('dask_trim', {})}>
-              Trim memory
+          {/* (The manual "Trim memory" button was removed — user feedback:
+              second-guessing dask's memory manager is odd. The backend now
+              trims automatically after each batch, where RSS bloat would
+              otherwise poison dask's process-memory spill accounting.) */}
+          {state.dashboardUrl && (
+            <button style={S.dash}
+              onClick={() => window.electron.openExternal(state.dashboardUrl!)}>
+              Open full Dask dashboard ↗
             </button>
-          </div>
+          )}
         </div>
       )}
     </div>
@@ -171,16 +164,8 @@ const S: Record<string, React.CSSProperties> = {
   wnum: { width: 32, textAlign: 'right', flexShrink: 0 },
   wmem: { width: 66, textAlign: 'right', color: '#a6adc8', flexShrink: 0 },
   wtasks: { width: 40, textAlign: 'right', color: '#89b4fa', flexShrink: 0 },
-  footer: {
-    marginTop: 4, display: 'flex', alignItems: 'center',
-    justifyContent: 'space-between', gap: 8,
-  },
   dash: {
-    background: 'none', border: 'none', color: '#89b4fa',
+    marginTop: 4, background: 'none', border: 'none', color: '#89b4fa',
     fontSize: 11, cursor: 'pointer', padding: 0, textAlign: 'left',
-  },
-  trim: {
-    background: 'transparent', color: '#a6adc8', border: '1px solid #45475a',
-    borderRadius: 5, padding: '2px 8px', fontSize: 10.5, cursor: 'pointer',
   },
 }

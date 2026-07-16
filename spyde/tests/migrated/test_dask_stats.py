@@ -148,26 +148,26 @@ class TestMemoryTrim:
         rss = _trim_process_memory()
         assert isinstance(rss, int) and rss > 0
 
-    def test_dask_trim_action(self, monkeypatch):
+    def test_auto_trim_runs_on_workers(self):
+        """The AUTOMATIC post-batch trim (no UI button) hits every worker via
+        client.run — the batch's allocator retention otherwise eats the next
+        compute's spill headroom (the fv → VI → fv chronic-spill chain)."""
         import spyde.backend.dask_stats as ds
         ran = []
 
         class _FakeClient:
-            def run(self, fn):
-                ran.append(fn)
+            def run(self, fn, wait=True):
+                ran.append((fn, wait))
                 return {}
 
         class _FakeSession:
             class dask_manager:
                 client = _FakeClient()
 
-        statuses = []
-        import spyde.backend.ipc as ipc
-        monkeypatch.setattr(ipc, "emit_status", lambda t: statuses.append(t))
-        # session lacks _dispatch_to_main → run_on_worker executes inline.
-        ds.dask_trim(_FakeSession(), None, {})
-        assert ran and ran[0] is ds._trim_process_memory
-        assert statuses and "Memory trimmed" in statuses[0]
+        ds.trim_cluster_memory(_FakeSession())
+        assert ran and ran[0][0] is ds._trim_process_memory
+        assert ran[0][1] is False        # fire-and-forget — a blocking run()
+                                         # across all workers wedged app close
 
 
 class TestMemoryBackpressure:
@@ -195,8 +195,9 @@ class TestMemoryBackpressure:
         from spyde.dask_manager import _worker_memory_limit
         monkeypatch.delenv("SPYDE_MEM_FRACTION", raising=False)
         total = 64 * 1024 ** 3
-        # Default: HALF the machine split across workers (was 80%).
-        assert _worker_memory_limit(total, 8) == int(total * 0.5) // 8
+        # Default 0.65 (was 0.8, then 0.5 — too tight: the spill trigger sat
+        # BELOW the post-GPU-run worker baseline, so every later batch spilled).
+        assert _worker_memory_limit(total, 8) == int(total * 0.65) // 8
         assert _worker_memory_limit(total, 8, fraction=0.8) == int(total * 0.8) // 8
         assert _worker_memory_limit(total, 8, fraction=0.05) == int(total * 0.2) // 8  # clamp
         monkeypatch.setenv("SPYDE_MEM_FRACTION", "0.25")

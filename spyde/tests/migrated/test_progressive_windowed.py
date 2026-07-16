@@ -66,6 +66,37 @@ def _run(nav=(8, 8), chunks=(2, 2), stop_event=None):
     return src, client, handle, chunks_seen
 
 
+class TestVirtualImageMaskedSum:
+    def test_einsum_path_matches_product_reference(self, monkeypatch):
+        """The per-chunk einsum contraction (no ``data*mask`` product
+        intermediate — the VI spill fix) must equal the old broadcast-product
+        reduce for sum AND mean, on lazy uint16 data and the numpy fast-path."""
+        import hyperspy.api as hs
+        import spyde.actions.virtual_image as vi_mod
+
+        rng = np.random.default_rng(0)
+        raw = (rng.random((3, 4, 8, 8)) * 1000).astype(np.uint16)
+        mask = (rng.random((8, 8)) > 0.4).astype(np.float32)
+        monkeypatch.setattr(vi_mod, "widget_to_mask", lambda w, s: mask)
+
+        class _Sel:
+            roi = object()
+
+        inst = object.__new__(vi_mod.VirtualImageAction)
+        ref = (raw.astype(np.float64) * mask).sum(axis=(-2, -1))
+
+        sig = hs.signals.Signal2D(raw).as_lazy()
+        sig.data = sig.data.rechunk((2, 2, 8, 8))     # full-frame chunks
+        out_sum = inst._virtual_image_array(sig, _Sel(), calculation="sum")
+        np.testing.assert_allclose(out_sum.compute(), ref, rtol=1e-4)
+        out_mean = inst._virtual_image_array(sig, _Sel(), calculation="mean")
+        np.testing.assert_allclose(out_mean.compute(), ref / mask.sum(), rtol=1e-4)
+
+        out_np = inst._virtual_image_array(hs.signals.Signal2D(raw), _Sel(),
+                                           calculation="sum")
+        np.testing.assert_allclose(np.asarray(out_np), ref, rtol=1e-4)
+
+
 class TestWindowedProgressive:
     def test_bounded_in_flight_and_assembly(self):
         src, client, handle, seen = _run()

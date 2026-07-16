@@ -188,7 +188,7 @@ def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
 
     peaks_list = None
     try:
-        if torch_gpu_device() is not None and _gpu_task_allowed(default_mode="2"):
+        if torch_gpu_device() is not None and _gpu_task_allowed(default_mode="4"):
             # One forward pass for the whole chunk on the GPU.
             raw = models.detect_batch(
                 model, flat, device, thresh=float(threshold),
