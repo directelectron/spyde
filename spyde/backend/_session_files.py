@@ -626,6 +626,9 @@ class FileLoaderMixin:
         ).start()
 
     def _load_example_thread(self, name: str) -> None:
+        from spyde.backend.example_download import (
+            DownloadCancelled, patched_example_downloader,
+        )
         try:
             # Wait for the Dask cluster before registering the signal — _add_signal
             # builds the navigator compute, which needs the client. A load fired
@@ -636,7 +639,16 @@ class FileLoaderMixin:
             if loader is None:
                 emit_error(f"Unknown example dataset: {name}")
                 return
-            sig = self._load_example_lazy(loader)
+            # Progress + cancel for the (possible) pooch download: the renderer
+            # shows a toast with a bar and a Cancel button (download_progress /
+            # download_done messages; download_cancel action). A cache hit never
+            # downloads → no toast.
+            try:
+                with patched_example_downloader(f"example:{name}", name):
+                    sig = self._load_example_lazy(loader)
+            except DownloadCancelled:
+                emit_status(f"Download cancelled: {name}")
+                return
             _apply_example_calibration(sig, name)
             self._maybe_set_insitu_signal_type(sig)
             self._add_signal(sig, source_path=None)

@@ -1205,6 +1205,10 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'report_exported':
         case 'mvx_state':
         case 'mvx_done':
+        // Examples-menu download progress/terminal — consumed by DownloadToasts
+        // (app-global, not wizard-scoped, but the same re-broadcast fits).
+        case 'download_progress':
+        case 'download_done':
           window.dispatchEvent(new CustomEvent(`spyde:${msg.type}`, { detail: msg }))
           break
 

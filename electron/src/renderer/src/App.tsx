@@ -14,6 +14,7 @@ import { GpuStatusGate } from './components/GpuStatusGate'
 import { GpuHelpGate } from './components/GpuHelpGate'
 import { UpdateBanner } from './components/UpdateBanner'
 import { MenuBar } from './components/MenuBar'
+import { DownloadToasts } from './components/DownloadToasts'
 import { GUIDES, getGuide, type Guide } from '@guides/index'
 
 export function App() {
@@ -51,6 +52,8 @@ export function App() {
         <ConsoleBar />
         <StatusBar logOpen={logOpen} onToggleLog={() => setLogOpen(v => !v)} />
       </div>
+      {/* Examples-menu download progress cards (bottom-right, above the bar). */}
+      <DownloadToasts />
       {tour && <Tour guide={tour} onClose={() => setTour(null)} />}
       {/* Scan-shape/step-size confirm dialog — reads the pending prompt from the
           SpyDE context (so injected test messages reach it too). */}

@@ -472,6 +472,27 @@ export interface ReportPanelSelectedMessage extends MsgBase {
   panel_id: string | null
 }
 
+/** One in-flight Examples-menu download (pooch fetch on the backend). Emitted
+ *  throttled (~5 Hz) while bytes flow; `total` 0 = size unknown. Consumed by
+ *  DownloadToasts (bottom-right card with a progress bar + Cancel, which sends
+ *  the `download_cancel` action with this `token`). */
+export interface DownloadProgressMessage extends MsgBase {
+  type: 'download_progress'
+  token: string
+  label: string
+  done: number
+  total: number
+}
+
+/** Terminal state for a download toast — remove the card. `cancelled` downloads
+ *  also get a status-line note from the backend. */
+export interface DownloadDoneMessage extends MsgBase {
+  type: 'download_done'
+  token: string
+  ok: boolean
+  cancelled: boolean
+}
+
 /**
  * Wizard-scoped events re-broadcast verbatim as DOM CustomEvents (the caret
  * components subscribe directly). The payload beyond `type` is consumer-defined,
