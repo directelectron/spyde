@@ -231,20 +231,43 @@ const region = { on: false, x: 0, y: 0, w: navW, h: navH };
 const stats = { hit: 0, leftMean: 0, rightMean: 0 };   // test/readout mirror
 const readout = document.getElementById('vx-readout');
 
-function b64OfU8(u8) {
-  let s = '';
-  for (let i = 0; i < u8.length; i += 0x8000) {
-    s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
-  }
-  return btoa(s);
+// Recomputed frames render on a PASS-THROUGH OVERLAY canvas positioned over
+// the figure's image rect. Pushing pixels through the figure's own state keys
+// proved undebuggable in the standalone shim (the model accepted the bytes,
+// the blit cache rebuilt, a correct drawImage was even observed — and the
+// frame still ended black); a plain canvas drawImage on top is a primitive we
+// verified directly. The anyplotlib figure below keeps what it is here for:
+// the widget interactions, axes and theme. (Trade-off: the overlay tracks the
+// UNZOOMED fit rect, so figure zoom/pan is a no-op on these panels — fine for
+// a report page.)
+function makeOverlay(handle, iw, ih) {
+  const pn = [...handle.api.panels.values()][0];
+  const host = pn.plotCanvas.parentElement;
+  const scale = Math.min(pn.imgW / iw, pn.imgH / ih);
+  const w = iw * scale, h = ih * scale;
+  const x = (pn.imgW - w) / 2, y = (pn.imgH - h) / 2;
+  const c = document.createElement('canvas');
+  c.width = iw; c.height = ih;
+  // z-index 2: above the plot canvas (z 1, opaque), below markers/widgets (z 5+).
+  c.style.cssText = 'position:absolute;pointer-events:none;z-index:2;'
+    + 'image-rendering:pixelated;'
+    + `left:${pn.plotCanvas.offsetLeft + x}px;`
+    + `top:${pn.plotCanvas.offsetTop + y}px;`
+    + `width:${w}px;height:${h}px;`;
+  if (getComputedStyle(host).position === 'static') host.style.position = 'relative';
+  // Under the widget/overlay canvas (last child) so handles stay on top.
+  host.insertBefore(c, pn.plotCanvas.nextSibling);
+  return c.getContext('2d');
 }
 
-function pushImage(handle, jsonKey, geomKey, panel, geom, u8) {
-  geom.image_b64 = b64OfU8(u8);
-  panel.display_min = 0; panel.display_max = 255;
-  panel._geom_rev = (panel._geom_rev || 0) + 1;   // re-render insurance
-  handle.applyUpdate(geomKey, JSON.stringify(geom));
-  handle.applyUpdate(jsonKey, JSON.stringify(panel));
+function pushImage(ctx, u8, iw, ih) {
+  const img = ctx.createImageData(iw, ih);
+  const d = img.data;
+  for (let i = 0; i < u8.length; i++) {
+    const v = u8[i];
+    d[4 * i] = v; d[4 * i + 1] = v; d[4 * i + 2] = v; d[4 * i + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
 }
 
 function inRegion(i) {
@@ -279,7 +302,7 @@ function computeVI() {
     }
   }
   stats.hit = hit; stats.leftMean = lS / nL; stats.rightMean = rS / nR;
-  pushImage(hVI, keyVI, geomKeyVI, panelVI, geomVI, u8);
+  pushImage(ovVI, u8, navW, navH);
   readout.textContent = 'detector: (' + cx.toFixed(3) + ', ' + cy.toFixed(3)
     + ') ' + (det.shape === 'circle'
         ? 'r=' + rO.toFixed(3)
@@ -303,7 +326,7 @@ function computeK() {
   for (let i = 0; i < binsArr.length; i++) {
     u8[i] = Math.round(255 * Math.log1p(binsArr[i]) / lmax);
   }
-  pushImage(hK, keyK, geomKeyK, panelK, geomK, u8);
+  pushImage(ovK, u8, BINS, BINS);
 }
 
 let pend = 0;
@@ -347,8 +370,12 @@ function pushDetectorWidget() {
     ? Object.assign({}, circleDef, { cx: det.cx, cy: det.cy, r: det.r })
     : Object.assign({}, annularDef,
         { cx: det.cx, cy: det.cy, r_outer: det.rOut, r_inner: det.rIn });
-  panelK.overlay_widgets = [w];
-  hK.applyUpdate(keyK, JSON.stringify(panelK));
+  // Mutate the LIVE model state (handle.get), never the page-load parse —
+  // a stale json apply resets the fitted view/layout (0-width canvas).
+  let live;
+  try { live = JSON.parse(hK.get(keyK)); } catch (e) { live = panelK; }
+  live.overlay_widgets = [w];
+  hK.applyUpdate(keyK, JSON.stringify(live));
 }
 
 function setShape(shape) {
@@ -359,6 +386,33 @@ function setShape(shape) {
 
 hK = mount(document.getElementById('vx-figk'), STATE_K, { onEvent: onKEvent });
 hVI = mount(document.getElementById('vx-figvi'), STATE_VI, { onEvent: onVIEvent });
+// Give the layout a beat to settle so the overlays measure the final rects.
+await new Promise((res) => requestAnimationFrame(() => setTimeout(res, 30)));
+const ovK = makeOverlay(hK, BINS, BINS);
+const ovVI = makeOverlay(hVI, navW, navH);
+
+// TOUCH → MOUSE shim: anyplotlib's widget drags listen to mouse events only,
+// so phone touches would dead-end. Re-dispatch single-finger touches on the
+// figure containers as synthetic mouse events (and stop the page scrolling
+// while dragging a widget); two-finger gestures pass through untouched.
+for (const el of [document.getElementById('vx-figk'),
+                  document.getElementById('vx-figvi')]) {
+  const relay = (type) => (ev) => {
+    if (ev.touches && ev.touches.length > 1) return;
+    const t = ev.touches[0] || ev.changedTouches[0];
+    if (!t) return;
+    ev.preventDefault();
+    const target = document.elementFromPoint(t.clientX, t.clientY) || el;
+    (type === 'mousemove' ? document : target).dispatchEvent(
+      new MouseEvent(type, {
+        bubbles: true, cancelable: true, view: window,
+        clientX: t.clientX, clientY: t.clientY, button: 0, buttons: 1,
+      }));
+  };
+  el.addEventListener('touchstart', relay('mousedown'), { passive: false });
+  el.addEventListener('touchmove', relay('mousemove'), { passive: false });
+  el.addEventListener('touchend', relay('mouseup'), { passive: false });
+}
 
 for (const rb of document.querySelectorAll('input[name=vx-shape]')) {
   rb.addEventListener('change', () => setShape(rb.value));
@@ -373,6 +427,8 @@ window.__vx = {
   setDetector(d) { Object.assign(det, d); pushDetectorWidget(); refresh(false); },
   setRegion(r) { Object.assign(region, r, { on: true }); refresh(true); },
   det, region, stats,
+  // Diagnostics (also handy in the field): the raw mount handles + keys.
+  _h: () => ({ hK, hVI, keyK, keyVI, geomKeyK, geomKeyVI, panelVI, geomVI }),
 };
 
 refresh(true);
@@ -402,6 +458,7 @@ def vectors_explorer_html(vecs, caption: str = "") -> "str | None":
     esm_safe = esm.replace("</script>", "<\\/script>")
     return (
         "<!doctype html>\n<html><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
         f"<style>{_EXPLORER_CSS}</style></head><body>"
         "<div id=\"vx-root\" class=\"vx-wrap\">"
         "<div class=\"vx-col\"><h4>Diffraction vectors — drag the detector</h4>"

@@ -62,6 +62,21 @@ test('detector position selects which nav half lights up (disk + annulus + regio
   let s = await stats()
   expect(s.leftMean).toBeGreaterThan(10 * Math.max(1, s.rightMean))
   expect(s.hit).toBeGreaterThan(0)
+  // The RENDERED canvas must light up too — the stats mirror the compute,
+  // but a broken pixel push once left the canvas black while stats passed.
+  await expect.poll(async () => page.evaluate(() => {
+    let best = 0
+    for (const c of document.querySelectorAll('#vx-figvi canvas')) {
+      const ctx = (c as HTMLCanvasElement).getContext('2d')
+      if (!ctx || !(c as HTMLCanvasElement).width) continue
+      const d = ctx.getImageData(0, 0, (c as HTMLCanvasElement).width,
+                                 (c as HTMLCanvasElement).height).data
+      let sum = 0
+      for (let i = 0; i < d.length; i += 4) sum += d[i]
+      best = Math.max(best, sum / (d.length / 4))
+    }
+    return best
+  }), { timeout: 5_000, message: 'VI canvas never painted' }).toBeGreaterThan(15)
   await expect(page.locator('#vx-readout')).toContainText('of 768 vectors')
   await page.screenshot({ path: 'vectors_embed_shots/01-left-cluster.png' })
 
