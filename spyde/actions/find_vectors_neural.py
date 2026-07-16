@@ -67,7 +67,8 @@ def _find_vectors_single_frame_neural(
                                     # emits subpixel offsets (no integer-only mode).
     beamstop_mask: Optional[np.ndarray] = None,
     model_id: Optional[str] = None,
-    bg_sigma: float = 12.0,         # local-norm high-pass scale (from calibrate()).
+    bg_sigma: Optional[float] = None,  # local-norm high-pass scale (from calibrate());
+                                       # None → auto (12, size-scaled for big disks).
     spot_radius: Optional[float] = None,   # user Spot-size (px radius) override for
                                            # the canonical rescale; None → auto.
 ):
@@ -83,7 +84,8 @@ def _find_vectors_single_frame_neural(
     f = np.asarray(frame, dtype=np.float32)
     model, device = models.get_model(model_id)
     pred = models.detect(model, f, device, thresh=float(threshold),
-                         min_distance=int(min_distance), bg_sigma=float(bg_sigma),
+                         min_distance=int(min_distance),
+                         bg_sigma=(float(bg_sigma) if bg_sigma is not None else None),
                          spot_diameter=(2.0 * spot_radius) if spot_radius else None)
     pred = np.asarray(pred, dtype=np.float32).reshape(-1, 3)
     pred = _apply_beamstop(pred, beamstop_mask, f.shape)
@@ -161,7 +163,7 @@ def _refine_block(peaks_grid, ny, nx, flat, beamstop_mask):
 
 
 def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
-                  bg_sigma=12.0, persistence=False, spot_radius=None):
+                  bg_sigma=None, persistence=False, spot_radius=None):
     """Run the neural detector on a (ny, nx, KY, KX) block → NaN-padded
     (ny, nx, MAX_PEAKS, 3). Batches the whole block through one forward pass on the
     torch GPU when available; per-frame CPU otherwise. ``bg_sigma`` is the calibrated
@@ -188,7 +190,8 @@ def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
             # One forward pass for the whole chunk on the GPU.
             raw = models.detect_batch(
                 model, flat, device, thresh=float(threshold),
-                min_distance=int(min_dist), bg_sigma=float(bg_sigma),
+                min_distance=int(min_dist),
+                bg_sigma=(float(bg_sigma) if bg_sigma is not None else None),
                 spot_diameter=(2.0 * spot_radius) if spot_radius else None)
             peaks_list = []
             for i, p in enumerate(raw):
@@ -223,7 +226,7 @@ def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
 
 def _find_vectors_chunk_neural(
     ghost_block, depth_px, nav_dim, sigma,
-    threshold, min_dist, subpixel, beamstop_mask, model_id=None, bg_sigma=12.0,
+    threshold, min_dist, subpixel, beamstop_mask, model_id=None, bg_sigma=None,
     persistence=False, spot_radius=None,
 ):
     """Neural variant of ``_find_vectors_chunk``: nav-blur + ghost-trim (shared with

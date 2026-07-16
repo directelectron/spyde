@@ -147,7 +147,13 @@ class TestNeuralDetect:
     def test_bundled_model_loads(self):
         out = _run("load")
         assert out["is_spotunet"]
-        assert out["levels"] == 2
+        # levels must match whatever the registry declares for the default model
+        # (don't hardcode: the default has been upgraded before, e.g. production
+        # levels=2 -> anyscale8 levels=3).
+        from spyde.models import registry
+        entry = next(m for m in registry.list_models()
+                     if m["id"] == registry.default_model_id())
+        assert out["levels"] == entry["arch"]["levels"]
         assert out["params"] > 0
 
     def test_detect_localises_planted_spots(self):
@@ -165,7 +171,9 @@ class TestNeuralDetect:
     def test_registry_fallback(self):
         out = _run("fallback")
         assert out["fell_back"]
-        assert out["default"] == "spotunet-production-v2"
+        # fallback lands on whatever the registry's current default is
+        from spyde.models import registry
+        assert out["default"] == registry.default_model_id()
 
     def test_registry_upgrade_merge(self):
         out = _run("upgrade")
