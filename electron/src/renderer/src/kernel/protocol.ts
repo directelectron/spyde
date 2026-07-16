@@ -509,6 +509,13 @@ export interface DaskStatsMessage extends MsgBase {
   gpu?: { util: number; vram_used: number; vram_total: number }  // %, MB, MB
   host_cpu?: number      // whole-machine CPU percent
   host_mem?: number      // whole-machine RAM percent (paging = the freeze killer)
+  /** Effective compute limits (the popover settings rows; `compute_configure`
+   *  applies changes by restarting the cluster). */
+  config?: {
+    mem_fraction: number       // cluster RAM budget, fraction of the machine
+    compute_fraction: number   // CPU budget, fraction of logical cores
+    gpu_workers: string        // GPU-feeding workers: "1".."8" | "one" | "all" | "off"
+  }
 }
 
 /**

@@ -15,6 +15,33 @@
 import React from 'react'
 import { useSpyDE } from '../kernel/SpyDEContext'
 import type { DaskStatsMessage } from '../kernel/protocol'
+import { Dropdown } from './Dropdown'
+
+const RAM_OPTS = [
+  { value: '0.4', label: '40% of RAM' }, { value: '0.5', label: '50% of RAM' },
+  { value: '0.65', label: '65% of RAM' }, { value: '0.8', label: '80% of RAM' },
+] as const
+const CPU_OPTS = [
+  { value: '0.25', label: '25% of cores' }, { value: '0.5', label: '50% of cores' },
+  { value: '0.75', label: '75% of cores' }, { value: '1.0', label: '100% of cores' },
+] as const
+const GPU_OPTS = [
+  { value: '1', label: '1 worker' }, { value: '2', label: '2 workers' },
+  { value: '4', label: '4 workers' }, { value: '6', label: '6 workers' },
+  { value: '8', label: '8 workers' }, { value: 'all', label: 'all workers' },
+  { value: 'off', label: 'off (CPU only)' },
+] as const
+
+// Snap an effective fraction to the nearest dropdown option value.
+const snap = (opts: readonly { value: string }[], v: number | string) => {
+  const n = Number(v)
+  if (!Number.isFinite(n)) return String(v)
+  let best = opts[0].value
+  for (const o of opts) {
+    if (Math.abs(Number(o.value) - n) < Math.abs(Number(best) - n)) best = o.value
+  }
+  return best
+}
 
 const STALE_MS = 7_000          // hide after ~3 missed samples
 
@@ -24,15 +51,31 @@ const pctColor = (p: number) =>
 const fmtGB = (bytes: number) => (bytes / 1024 ** 3).toFixed(1)
 
 export function DaskMonitor() {
-  const { state } = useSpyDE()
+  const { state, sendAction } = useSpyDE()
   const [stats, setStats] = React.useState<DaskStatsMessage | null>(null)
   const [open, setOpen] = React.useState(false)
   const lastAt = React.useRef(0)
+  // Compute-limit drafts (seeded once from the backend's effective config;
+  // Apply → compute_configure → cluster restart).
+  const [cfgRam, setCfgRam] = React.useState<string | null>(null)
+  const [cfgCpu, setCfgCpu] = React.useState<string | null>(null)
+  const [cfgGpu, setCfgGpu] = React.useState<string | null>(null)
+  const [applying, setApplying] = React.useState(false)
+  const seeded = React.useRef(false)
 
   React.useEffect(() => {
     const onStats = (e: Event) => {
       lastAt.current = Date.now()
-      setStats((e as CustomEvent).detail as DaskStatsMessage)
+      const s = (e as CustomEvent).detail as DaskStatsMessage
+      setStats(s)
+      if (!seeded.current && s.config) {
+        seeded.current = true
+        setCfgRam(snap(RAM_OPTS, s.config.mem_fraction))
+        setCfgCpu(snap(CPU_OPTS, s.config.compute_fraction))
+        setCfgGpu(GPU_OPTS.some(o => o.value === s.config!.gpu_workers)
+          ? s.config.gpu_workers : snap(GPU_OPTS, s.config.gpu_workers))
+      }
+      setApplying(false)     // fresh stats = the (re)started cluster is alive
     }
     window.addEventListener('spyde:dask_stats', onStats)
     // Staleness sweep: clear the readout when samples stop arriving.
@@ -121,10 +164,41 @@ export function DaskMonitor() {
               <span style={S.wtasks} />
             </div>
           )}
-          {/* (The manual "Trim memory" button was removed — user feedback:
-              second-guessing dask's memory manager is odd. The backend now
-              trims automatically after each batch, where RSS bloat would
-              otherwise poison dask's process-memory spill accounting.) */}
+          {/* Compute limits — Apply restarts the cluster with the new plan.
+              (The manual "Trim memory" button was removed — the backend trims
+              automatically after each batch instead.) */}
+          <div style={S.cfgTitle}>Compute limits</div>
+          <div style={S.cfgRow}>
+            <span style={S.cfgLbl}>Max RAM</span>
+            <Dropdown testid="compute-ram" value={cfgRam ?? '0.65'}
+              options={RAM_OPTS} onChange={setCfgRam} width={130} />
+          </div>
+          <div style={S.cfgRow}>
+            <span style={S.cfgLbl}>CPU use</span>
+            <Dropdown testid="compute-cpu" value={cfgCpu ?? '0.75'}
+              options={CPU_OPTS} onChange={setCfgCpu} width={130} />
+          </div>
+          <div style={S.cfgRow}>
+            <span style={S.cfgLbl}>GPU feeders</span>
+            <Dropdown testid="compute-gpu" value={cfgGpu ?? '4'}
+              options={GPU_OPTS} onChange={setCfgGpu} width={130} />
+          </div>
+          <button
+            data-testid="compute-apply"
+            style={{ ...S.apply, opacity: applying ? 0.5 : 1 }}
+            disabled={applying}
+            title="Applies the limits by restarting the compute cluster — in-flight computes are cancelled"
+            onClick={() => {
+              setApplying(true)
+              sendAction('compute_configure', {
+                mem_fraction: Number(cfgRam ?? 0.65),
+                compute_fraction: Number(cfgCpu ?? 0.75),
+                gpu_workers: cfgGpu ?? '4',
+              })
+            }}
+          >
+            {applying ? 'Restarting cluster…' : 'Apply (restarts cluster)'}
+          </button>
           {state.dashboardUrl && (
             <button style={S.dash}
               onClick={() => window.electron.openExternal(state.dashboardUrl!)}>
@@ -164,6 +238,19 @@ const S: Record<string, React.CSSProperties> = {
   wnum: { width: 32, textAlign: 'right', flexShrink: 0 },
   wmem: { width: 66, textAlign: 'right', color: '#a6adc8', flexShrink: 0 },
   wtasks: { width: 40, textAlign: 'right', color: '#89b4fa', flexShrink: 0 },
+  cfgTitle: {
+    marginTop: 6, paddingTop: 6, borderTop: '1px solid #313244',
+    fontSize: 9.5, color: '#6c7086', textTransform: 'uppercase', letterSpacing: 0.5,
+  },
+  cfgRow: {
+    display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8,
+  },
+  cfgLbl: { fontSize: 10.5, color: '#a6adc8' },
+  apply: {
+    marginTop: 2, background: '#313244', color: '#cdd6f4',
+    border: '1px solid #45475a', borderRadius: 5, padding: '4px 8px',
+    fontSize: 10.5, cursor: 'pointer',
+  },
   dash: {
     marginTop: 4, background: 'none', border: 'none', color: '#89b4fa',
     fontSize: 11, cursor: 'pointer', padding: 0, textAlign: 'left',

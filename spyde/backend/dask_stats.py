@@ -189,9 +189,16 @@ class DaskStatsSampler:
                 if client is None:
                     continue
                 info = client.scheduler_info(n_workers=-1)
-                emit(build_stats(info, self._gpu.sample(),
-                                 psutil.cpu_percent(interval=None),
-                                 psutil.virtual_memory().percent))
+                msg = build_stats(info, self._gpu.sample(),
+                                  psutil.cpu_percent(interval=None),
+                                  psutil.virtual_memory().percent)
+                # Effective compute limits for the monitor's settings rows.
+                try:
+                    from spyde.backend.compute_config import current_config
+                    msg["config"] = current_config()
+                except Exception:
+                    pass
+                emit(msg)
             except Exception as e:
                 # Cluster shutting down / transient RPC error — keep sampling;
                 # the stop() in Session.shutdown ends the thread.

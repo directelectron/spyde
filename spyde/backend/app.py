@@ -153,6 +153,11 @@ async def _main() -> None:
         logging.getLogger().addHandler(_h)
         logging.getLogger().setLevel(getattr(logging, _init_level.upper(), logging.INFO))
 
+    # Persisted in-app compute settings (max RAM / CPU use / GPU feeders — the
+    # DaskMonitor popover) land in the environment BEFORE the worker plan and
+    # cluster build; an explicitly-set env var still wins.
+    from spyde.backend.compute_config import apply_persisted_compute_env
+    apply_persisted_compute_env()
     workers, threads = _compute_worker_plan(os.cpu_count() or 4)
 
     session = Session(n_workers=workers, threads_per_worker=threads)

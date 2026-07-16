@@ -364,6 +364,24 @@ class DaskManager:
         except Exception:
             return 0
 
+    def restart(self, n_workers: int | None = None,
+                threads_per_worker: int | None = None) -> None:
+        """Tear the cluster down and rebuild it — the apply path for the
+        in-app compute settings (worker count / memory budget / GPU feeders
+        are all fixed at worker spawn, so changing them means a restart).
+        Blocks until the old cluster is gone, then starts the new one on the
+        usual background thread (`ready` re-fires → Session re-opens the
+        dask gate and the stats sampler picks up the new client)."""
+        if n_workers is not None:
+            self._n_workers = int(n_workers)
+        if threads_per_worker is not None:
+            self._threads_per_worker = int(threads_per_worker)
+        self.shutdown()
+        self._client = None
+        self._cluster = None
+        self._heavy_compute_workers = None
+        self.start()
+
     def shutdown(self) -> None:
         """Gracefully shut down the Dask client and cluster."""
         import logging as _logging

@@ -1325,12 +1325,17 @@ def _windowed_progressive(result_array, nav_shape, client, chunk_slices,
     assembled = np.full(result_array.shape, np.nan, dtype=dtype)
 
     if window is None:
+        # HALF the cluster threads: a VI chunk is read-bound (the disk is the
+        # bottleneck, not the CPU), so full saturation buys no throughput but
+        # every in-flight chunk pins a full source chunk in RAM. 2x threads
+        # was effectively NO throttle on medium scans (64-chunk graph, 72-deep
+        # window) — the "sum memory usage is still crazy" report.
         try:
             info = client.scheduler_info(n_workers=-1)["workers"]
-            window = max(4, 2 * sum(int(w.get("nthreads", 1))
-                                    for w in info.values()))
+            window = max(4, sum(int(w.get("nthreads", 1))
+                                for w in info.values()) // 2)
         except Exception:
-            window = 16
+            window = 8
 
     handle = _ProgressiveFuture()
     lock = threading.Lock()
