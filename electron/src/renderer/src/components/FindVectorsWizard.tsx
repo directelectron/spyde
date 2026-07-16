@@ -43,7 +43,7 @@ interface FvSaved {
   method: Method; modelId: string; sigma: number; radius: number
   sigma1: number; sigma2: number; bgSigma: number
   threshold: number; minDist: number; subpixel: boolean; beamstop: boolean
-  beamstopDilate: number; showTransform: boolean
+  beamstopDilate: number; showTransform: boolean; persistence: boolean
 }
 const _fvStore = new Map<number, FvSaved>()
 
@@ -68,19 +68,20 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
   const [beamstop, setBeamstop] = React.useState(saved?.beamstop ?? false)
   const [beamstopDilate, setBeamstopDilate] = React.useState(saved?.beamstopDilate ?? 5)
   const [showTransform, setShowTransform] = React.useState(saved?.showTransform ?? false)
+  const [persistence, setPersistence] = React.useState(saved?.persistence ?? false)
   const [status, setStatus] = React.useState('Tune the parameters — peaks preview under the crosshair.')
 
   React.useEffect(() => {
     _fvStore.set(windowId, {
       method, modelId, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist, subpixel,
-      beamstop, beamstopDilate, showTransform,
+      beamstop, beamstopDilate, showTransform, persistence,
     })
   }, [windowId, method, modelId, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist,
-      subpixel, beamstop, beamstopDilate, showTransform])
+      subpixel, beamstop, beamstopDilate, showTransform, persistence])
 
   // Live refs so the debounced tune always sends the latest of EVERY control.
-  const vals = React.useRef({ method, modelId, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform })
-  vals.current = { method, modelId, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform }
+  const vals = React.useRef({ method, modelId, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform, persistence })
+  vals.current = { method, modelId, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform, persistence }
   const params = () => ({
     method: vals.current.method, model_id: vals.current.modelId,
     sigma: vals.current.sigma, kernel_radius: vals.current.radius,
@@ -90,6 +91,7 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
     subpixel: vals.current.subpixel, beamstop_auto: vals.current.beamstop,
     beamstop_dilate: vals.current.beamstopDilate,
     show_transform: vals.current.showTransform,
+    persistence: vals.current.persistence,
   })
 
   // Start the live preview when the caret opens; tear it down when it closes
@@ -254,6 +256,12 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
           label={isDog ? 'Show DoG' : isNeural ? 'Show heatmap' : 'Show corr.'} />
         <Check testid="fv-subpixel" checked={subpixel} onChange={live(setSubpixel)}
           label="Subpixel" />
+        {isNeural && (
+          // Batch-only stage-2 refine (scan-neighbour persistence + Friedel);
+          // the live preview has no neighbours so it only affects Compute.
+          <Check testid="fv-persistence" checked={persistence} onChange={live(setPersistence)}
+            label="Neighbor refine" />
+        )}
       </div>
       <button data-testid="fv-compute" style={S.primary} onClick={compute}>Compute</button>
     </WizardShell>

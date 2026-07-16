@@ -161,6 +161,7 @@ def _find_vectors_chunk(
     dog_sigma2: float = DEFAULT_DOG_SIGMA2,
     model_id=None,
     bg_sigma: float = 12.0,
+    persistence: bool = False,
 ) -> np.ndarray:
     """
     Full pipeline for one ghost-padded nav chunk.
@@ -221,7 +222,7 @@ def _find_vectors_chunk(
         return _find_vectors_chunk_neural(
             ghost_block, depth_px, nav_dim, sigma,
             threshold, min_dist, subpixel, beamstop_mask,
-            model_id=model_id, bg_sigma=bg_sigma,
+            model_id=model_id, bg_sigma=bg_sigma, persistence=persistence,
         )
 
     # ── Try GPU path ──────────────────────────────────────────────────────────

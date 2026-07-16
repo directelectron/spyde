@@ -41,6 +41,10 @@ from spyde.actions.find_vectors import _do_compute_vectors, _copy_nav_axes_to
 DEFAULTS: dict = dict(
     sigma=1.0, kernel_radius=5, threshold=0.3, min_distance=5, subpixel=True,
     method="neural", model_id="", bg_sigma=12.0, dog_sigma1=0.8, dog_sigma2=2.0,
+    # Neural stage-2 refine: drop peaks not confirmed by scan neighbours
+    # (models/refine.py). BATCH-only (the preview has no neighbours) and
+    # default-off until the eval benchmark says it should be on (plan Phase 3).
+    persistence=False,
     beamstop_auto=False, beamstop_dilate=5, show_transform=False,
 )
 

@@ -182,6 +182,83 @@ class TestFindVectorsNeural:
         assert seen["bg_sigma"] == 7.5
         assert abs(seen["threshold"] - 0.25) < 1e-9
 
+    def test_gpu_policy_modes(self, monkeypatch):
+        """SPYDE_FV_GPU governs the neural path too: off → CPU everywhere;
+        unset → the caller's default (neural passes "all")."""
+        from spyde.actions.find_vectors.gpu_runtime import _gpu_task_allowed
+
+        monkeypatch.delenv("SPYDE_FV_GPU", raising=False)
+        assert _gpu_task_allowed(default_mode="all") is True
+        assert _gpu_task_allowed() is True          # outside a worker: allowed
+
+        monkeypatch.setenv("SPYDE_FV_GPU", "off")
+        assert _gpu_task_allowed(default_mode="all") is False
+        assert _gpu_task_allowed() is False
+
+    def test_neural_block_respects_gpu_off(self, monkeypatch):
+        """SPYDE_FV_GPU=off must keep the batched torch path off even when a
+        GPU device is present — every frame goes through the per-frame CPU
+        detector instead."""
+        import spyde.actions.find_vectors_neural as fvn
+        import spyde.actions.find_vectors_torch as fvt
+        from spyde import models as smodels
+
+        monkeypatch.setenv("SPYDE_FV_GPU", "off")
+        monkeypatch.setattr(fvt, "torch_gpu_device", lambda: "fake-gpu")
+        monkeypatch.setattr(smodels, "get_model", lambda mid=None: (None, "cpu"))
+
+        batched = []
+        monkeypatch.setattr(smodels, "detect_batch",
+                            lambda *a, **k: batched.append(1) or [])
+        single = []
+
+        def _fake_single(frame, threshold, min_distance, **k):
+            single.append(1)
+            z = np.zeros(frame.shape, np.float32)
+            return z, z, np.zeros((0, 3), np.float32)
+
+        monkeypatch.setattr(fvn, "_find_vectors_single_frame_neural", _fake_single)
+
+        b4d = np.zeros((2, 2, 32, 32), np.float32)
+        out = fvn._neural_block(b4d, 0.3, 4, True, None, None)
+        assert out.shape[:2] == (2, 2)
+        assert not batched, "detect_batch ran despite SPYDE_FV_GPU=off"
+        assert len(single) == 4, "per-frame CPU fallback did not run"
+
+    def test_chunk_passes_persistence(self, monkeypatch):
+        """The map_overlap chunk fn forwards the persistence flag to the neural
+        chunk (it was silently dropped before — refine.py was dead code)."""
+        import spyde.actions.find_vectors_neural as fvn
+        from spyde.actions.find_vectors import MAX_PEAKS
+        from spyde.actions.find_vectors.chunk import _find_vectors_chunk
+
+        seen = {}
+
+        def _fake_chunk(ghost_block, depth_px, nav_dim, sigma, threshold,
+                        min_dist, subpixel, beamstop_mask, model_id=None,
+                        bg_sigma=12.0, persistence=False):
+            seen.update(persistence=persistence, bg_sigma=bg_sigma)
+            return np.full((ghost_block.shape[0], ghost_block.shape[1],
+                            MAX_PEAKS, 3), np.nan, np.float32)
+
+        monkeypatch.setattr(fvn, "_find_vectors_chunk_neural", _fake_chunk)
+        block = np.zeros((2, 2, 8, 8), np.float32)
+        _find_vectors_chunk(block, 0, 2, 0.0, 5, 0.3, 4, True, None, None, None,
+                            method="neural", bg_sigma=6.0, persistence=True)
+        assert seen == {"persistence": True, "bg_sigma": 6.0}
+
+    def test_default_device_chain(self, monkeypatch):
+        """CUDA → MPS → CPU fallback chain (Macs previously never got MPS)."""
+        import torch
+        from spyde.models import infer
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        if getattr(torch.backends, "mps", None) is not None:
+            monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+            assert infer._default_device().type == "mps"
+            monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+        assert infer._default_device().type == "cpu"
+
     def test_neural_run_cpu(self, monkeypatch):
         # Force the CPU branch — deterministic, and no torch-CUDA under pytest.
         import spyde.actions.find_vectors_torch as fvt
@@ -198,9 +275,13 @@ class TestFindVectorsNeural:
             assert src is not None
             before = len(session.signal_trees)
 
+            # persistence=True also exercises the stage-2 refine
+            # (models/refine.py): identical frames → full neighbour
+            # persistence → real peaks survive the filter.
             fv_run(session, src, {
                 "method": "neural", "sigma": 1.0, "threshold": 0.3,
                 "min_distance": 4, "subpixel": True, "model_id": "",
+                "persistence": True,
             })
             assert _wait(lambda: len(session.signal_trees) == before + 1), \
                 "neural vectors window never opened"

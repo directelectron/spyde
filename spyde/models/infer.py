@@ -20,22 +20,48 @@ from .preprocess import normalize_input, scale_to_canonical
 from .unet import SpotUNet
 
 
+def _default_device():
+    """Best device for inference: CUDA → Apple-MPS → CPU (mirrors
+    ``find_vectors_torch.torch_gpu_device``; previously Macs silently ran the
+    model on CPU while the batch path believed it had a GPU)."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    try:
+        mps = getattr(torch.backends, "mps", None)
+        if mps is not None and torch.backends.mps.is_available():
+            return torch.device("mps")
+    except Exception:
+        pass
+    return torch.device("cpu")
+
+
 def load_model(ckpt_path, device=None, arch: dict | None = None):
     """Load a SpotUNet checkpoint. ``arch`` (from the model registry) overrides the
     architecture hyperparams when present; otherwise they're read from the
     checkpoint (which stores ``base``/``in_ch``/``levels``)."""
-    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = device or _default_device()
     # weights_only=True: checkpoints are plain state dicts + scalar hyperparams;
     # never unpickle arbitrary objects from a (possibly downloaded) file.
-    ck = torch.load(ckpt_path, map_location=device, weights_only=True)
+    ck = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     arch = arch or {}
+    in_ch = arch.get("in_ch", ck.get("in_ch", 1))
     model = SpotUNet(
-        in_ch=arch.get("in_ch", ck.get("in_ch", 1)),
+        in_ch=in_ch,
         base=arch.get("base", ck["base"]),
         levels=arch.get("levels", ck.get("levels", 2)),
-    ).to(device)
+    )
     model.load_state_dict(ck["state_dict"])
+    model = model.to(device)
     model.eval()
+    if device.type == "mps":
+        # Smoke-test the forward ONCE at load: an MPS build missing an op this
+        # net uses should degrade to CPU here, not fail on every chunk.
+        try:
+            with torch.no_grad():
+                model(torch.zeros(1, in_ch, 32, 32, device=device))
+        except Exception:
+            device = torch.device("cpu")
+            model = model.to(device)
     return model, device
 
 

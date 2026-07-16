@@ -4,12 +4,19 @@ Status of the neural disk-detector integration and the phased plan to make it
 complete. Written 2026-07-15 after an audit of `spyde/models/`,
 `spyde/actions/find_vectors*`, the wizard UI, and the packaging config.
 
-> **Status 2026-07-15: Phases 0 and 1 are IMPLEMENTED** (G1, G2, G3, G7 fixed;
+> **Status 2026-07-16: Phases 0 and 1 are IMPLEMENTED** (G1, G2, G3, G7 fixed;
 > the concurrent-download half of G5 fixed via client-side `ensure_local`).
+> **Phase 2 partially done**: the SPYDE_FV_GPU policy now governs the neural
+> path (neural unset-default "all" = today's behaviour; flipping it needs the
+> multi-worker benchmark, still open) and `load_model` uses the CUDA→MPS→CPU
+> chain with a load-time MPS smoke test (needs a Mac to validate for real).
+> **Phase 3 partially done**: `persistence` is wired end-to-end behind a
+> default-off "Neighbor refine" wizard toggle (refine.py is live code now);
+> the eval promotion gate is still open. Phase 4 not started.
 > Verified: pytest (`test_model_registry.py`, `test_find_vectors_neural.py`)
 > + Playwright (`fv_neural_calibration.spec.ts` — screenshots show High-pass σ
 > auto-calibrating 12→4 on si-grains, live preview re-tuning, model-list
-> refresh, and the vectors window opening). Phases 2–4 remain.
+> refresh, and the vectors window opening). Full migrated suite green.
 
 ## Where we are
 
@@ -165,32 +172,33 @@ Decision (2026-07-15): calibration **auto-runs on wizard-open** (parameter-free
 is the selling point) with visible values + override; it's ~8 forward passes on
 ~4 frames.
 
-### Phase 2 — Runtime parity + platform reach (G5, G6)
+### Phase 2 — Runtime parity + platform reach (G5, G6) — PARTIAL 2026-07-16
 
-1. **Benchmark first**: extend `benchmark_neural_spots.py` with a
-   multi-process-cluster variant measuring all-workers-GPU vs. one-GPU-worker +
-   CPU-rest for the neural method. Only then pick the default; wire
-   `_gpu_task_allowed()` (or a torch-specific analog honouring `SPYDE_FV_GPU`)
-   into `_neural_block` so the policy is at least controllable.
-2. MPS: make `load_model` use the `torch_gpu_device()` chain (cuda → mps →
-   cpu); verify the decode ops run on MPS (scatter/max-pool support), CPU
-   fallback if not. Needs a Mac to validate — keep behind the same availability
-   guard.
-3. Optional, benchmark-gated: move `detect_batch`'s per-frame CPU
-   zoom+normalize loop (`infer.py:141-148`) into batched torch ops if the CPU
-   preprocess dominates GPU batch time.
+1. ~~Wire the policy~~ DONE: `_gpu_task_allowed(default_mode=...)` is consulted
+   by `_neural_block` with a neural-specific unset-default of **"all"**
+   (preserves today's behaviour exactly; `SPYDE_FV_GPU=off/one/N` now governs
+   neural too). OPEN: the multi-process-cluster benchmark
+   (all-workers-GPU vs. one-GPU-worker + CPU-rest, extend
+   `benchmark_neural_spots.py`) that decides whether the unset-default should
+   move to "one"/"N".
+2. ~~MPS~~ DONE (code): `load_model` picks cuda → mps → cpu and smoke-tests one
+   forward on MPS at load, degrading to CPU if an op is unsupported. OPEN:
+   validate on real Apple-Silicon hardware.
+3. OPEN (benchmark-gated): move `detect_batch`'s per-frame CPU zoom+normalize
+   loop into batched torch ops if the CPU preprocess dominates GPU batch time.
 
-### Phase 3 — Quality: propose-then-refine + a promotion gate (G4)
+### Phase 3 — Quality: propose-then-refine + a promotion gate (G4) — PARTIAL 2026-07-16
 
-1. Wire `persistence` through `chunk.py` → `_find_vectors_chunk_neural` and add
-   a wizard toggle ("Refine: neighbour persistence"), default **off** until
-   benchmarked. Batch-only (needs scan neighbours; preview stays single-frame).
-2. Add an **eval mode** to `benchmark_neural_spots.py`: precision/recall against
-   synthetic ground truth + persistence-consensus pseudo-labels on sped_ag.
-   Reference it from `RELEASING.md` as the required promotion gate ("beats the
-   current default" becomes a number, not a feeling).
-3. If the refine stage doesn't win on the benchmark, delete `refine.py` and the
-   dead plumbing instead of shipping a toggle.
+1. ~~Wire persistence~~ DONE: `persistence` flows wizard → `_coerce` →
+   orchestrate → chunk → `_refine_block` (refine.py is live code now), behind
+   the default-off "Neighbor refine" checkbox (neural only, batch-only — the
+   preview has no scan neighbours). NB `refine()` normalises the col-2 value
+   internally, so the raw-intensity column works as the relative-confidence
+   term; the hard `min_persist=0.5` floor does the real filtering.
+2. OPEN: add an **eval mode** to `benchmark_neural_spots.py`: precision/recall
+   against synthetic ground truth + persistence-consensus pseudo-labels on
+   sped_ag. Reference it from `RELEASING.md` as the required promotion gate —
+   and use it to decide whether "Neighbor refine" should default ON.
 
 ### Phase 4 — Training-data flywheel (G8)
 
