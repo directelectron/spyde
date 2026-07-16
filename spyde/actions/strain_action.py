@@ -61,11 +61,28 @@ class StrainController(WizardController):
             "name": "Match radius (px)", "type": "int", "default": 6,
             "min": 1, "max": 30,
         },
+        "min_matches": {
+            "name": "Min. matched spots", "type": "int", "default": 4,
+            "min": 3, "max": 20,
+        },
+        "ref_radius": {
+            "name": "Reference region radius (px)", "type": "int", "default": 2,
+            "min": 0, "max": 10,
+        },
+        "vmax": {
+            "name": "Colour range ± (0 = auto)", "type": "float", "default": 0.0,
+            "min": 0.0,
+        },
+        "weight": {
+            "name": "Weight display by", "type": "enum", "default": "none",
+            "choices": ["none", "coverage", "error"],
+        },
     }
 
     def __init__(self, vecs, plot2d, *, window_id=None,
                  component="exx", ref_yx=(0, 0), session=None,
-                 src_tree=None, src_dp_plot=None, match_radius_px=6.0):
+                 src_tree=None, src_dp_plot=None, match_radius_px=6.0,
+                 min_matches=4, ref_radius=2, vmax=None, weight="none"):
         super().__init__(session, src_tree)
         self.vecs = vecs
         self.p = plot2d                  # the strain MAP figure (output)
@@ -74,6 +91,11 @@ class StrainController(WizardController):
         self.ref_yx = (int(ref_yx[0]), int(ref_yx[1]))
         self.field = None
         self.cif_mode = False
+        # Fit robustness + display knobs (see strain_mapping / strain_display).
+        self.min_matches = int(min_matches)
+        self.ref_radius = int(ref_radius)
+        self.vmax = (float(vmax) if vmax else None)     # None/0 → robust auto
+        self.weight = str(weight)
         self._g_ref_full = None          # reference spots (zero-beam removed)
         self._recompute_gen = 0          # latest-wins guard for async recomputes
         # Source-DP selection overlay (the interactive part) + the dedicated
@@ -85,8 +107,16 @@ class StrainController(WizardController):
         self._ref_selector = None
         self._ref_plot = None
 
+    def _pooled_reference(self):
+        """Region-consensus reference at the current crosshair: ALL peaks from the
+        (2r+1)² neighbourhood, clustered; reflections that persist across frames
+        keep their MEDIAN position (noise/FP-robust — see region_reference).
+        ref_radius=0 falls back to the single pixel's raw vectors."""
+        from spyde.actions.strain_mapping import region_reference
+        return region_reference(self.vecs, self.ref_yx, radius=self.ref_radius)
+
     def attach(self):
-        self._set_full_reference(self.vecs.kxy_at(*self.ref_yx))
+        self._set_full_reference(self._pooled_reference())
         # The strain window is a bare `figure` (not a registered Plot) — give it
         # a dispatch + teardown identity in the session's controller registry.
         self.own_window(self.window_id)
@@ -264,11 +294,13 @@ class StrainController(WizardController):
                           gen, self._recompute_gen)
                 return
             self.field = field
-            update_strain_view(self.p, self.field, self.component)
+            update_strain_view(self.p, self.field, self.component,
+                               vmax=self.vmax, weight=self.weight)
             log.debug("[strain-ref] _recompute gen=%d applied to plot", gen)
 
         self.run_on_worker(
-            lambda: compute_strain_field(self.vecs, ref_vectors=ref),
+            lambda: compute_strain_field(self.vecs, ref_vectors=ref,
+                                         min_matches=self.min_matches),
             name="strain-recompute", on_done=_apply,
         )
 
@@ -278,7 +310,7 @@ class StrainController(WizardController):
         log.debug("[strain-ref] set_reference (%d,%d) (was %s)", ry, rx, self.ref_yx)
         self.ref_yx = (int(ry), int(rx))
         self.cif_mode = False
-        self._set_full_reference(self.vecs.kxy_at(*self.ref_yx))
+        self._set_full_reference(self._pooled_reference())
         if self.overlay is not None:
             self.overlay.set_reference(self.ref_yx, self._g_ref_full)
         self._recompute()
@@ -287,7 +319,7 @@ class StrainController(WizardController):
         """CIF mode: snap the reference pixel's vectors to the phase's ideal |g|
         families → absolute strain (no unstrained region needed)."""
         from spyde.actions.strain_mapping import cif_g_families, snap_reference_to_cif
-        snapped = snap_reference_to_cif(self.vecs.kxy_at(*self.ref_yx), cif_g_families(phase))
+        snapped = snap_reference_to_cif(self._pooled_reference(), cif_g_families(phase))
         snapped = _zero_beam_filtered(snapped)
         if len(snapped) < 2:
             return
@@ -307,7 +339,33 @@ class StrainController(WizardController):
         if component not in _COMPONENTS or self.field is None:
             return
         self.component = component
-        update_strain_view(self.p, self.field, component)
+        update_strain_view(self.p, self.field, component,
+                           vmax=self.vmax, weight=self.weight)
+
+    def set_display(self, vmax=None, weight=None) -> None:
+        """Display-only knobs (no re-fit): symmetric colour range (0/None = auto)
+        and per-pixel confidence weighting ('none' | 'coverage' | 'error')."""
+        from spyde.actions.strain_display import update_strain_view, WEIGHT_MODES
+        if vmax is not None:
+            self.vmax = float(vmax) if float(vmax) > 0 else None
+        if weight is not None and str(weight) in WEIGHT_MODES:
+            self.weight = str(weight)
+        if self.field is not None:
+            update_strain_view(self.p, self.field, self.component,
+                               vmax=self.vmax, weight=self.weight)
+
+    def set_fit(self, min_matches=None, ref_radius=None) -> None:
+        """Fit knobs (re-fit required): the min-match gate and the reference
+        pooling radius. Refreshes the reference (radius changed) and recomputes."""
+        if min_matches is not None:
+            self.min_matches = max(3, int(min_matches))
+        if ref_radius is not None:
+            self.ref_radius = max(0, int(ref_radius))
+        if not self.cif_mode:
+            self._set_full_reference(self._pooled_reference())
+            if self.overlay is not None:
+                self.overlay.set_reference(self.ref_yx, self._g_ref_full)
+        self._recompute()
 
     def commit(self):
         """Freeze the current strain field as a NEW SignalTree — εxx is the signal
@@ -327,7 +385,9 @@ class StrainController(WizardController):
             provenance={
                 "action": "Strain Mapping",
                 "params": {"ref_yx": list(self.ref_yx), "cif_mode": self.cif_mode,
-                           "match_radius_px": self.match_radius_px},
+                           "match_radius_px": self.match_radius_px,
+                           "min_matches": self.min_matches,
+                           "ref_radius": self.ref_radius},
             },
         )
 
@@ -462,11 +522,16 @@ def strain_open(session, plot, payload) -> None:
     gen = bump_generation(tree, "_strain_run_gen")
 
     ref_yx = _default_reference(vecs)
+    min_matches = max(3, int(payload.get("min_matches", 4)))
+    ref_radius = max(0, int(payload.get("ref_radius", 2)))
+    vmax = float(payload.get("vmax", 0.0)) or None
+    weight = str(payload.get("weight", "none"))
 
     def _build_window(field):
         if not is_current(tree, "_strain_run_gen", gen):
             return   # superseded by a strain_close or a newer strain_open
-        _fig, fig_id, html, p = build_strain_figure(field, component="exx")
+        _fig, fig_id, html, p = build_strain_figure(field, component="exx",
+                                                    vmax=vmax, weight=weight)
         wid = session.next_window_id()
         from spyde.actions.figure_registry import keep_alive
         keep_alive(int(wid), _fig)
@@ -477,7 +542,9 @@ def strain_open(session, plot, payload) -> None:
         ctrl = StrainController(vecs, p, window_id=wid, component="exx",
                                 ref_yx=ref_yx, session=session,
                                 src_tree=tree, src_dp_plot=src_dp,
-                                match_radius_px=float(payload.get("match_radius_px", 6.0)))
+                                match_radius_px=float(payload.get("match_radius_px", 6.0)),
+                                min_matches=min_matches, ref_radius=ref_radius,
+                                vmax=vmax, weight=weight)
         ctrl.field = field
         ctrl.attach()
         tree._strain_controller = ctrl
@@ -486,7 +553,8 @@ def strain_open(session, plot, payload) -> None:
     if getattr(session, "_dispatch_to_main", None) is not None:
         emit_status("Computing strain field…")
     run_on_worker(
-        session, lambda: compute_strain_field(vecs, ref_yx),
+        session, lambda: compute_strain_field(vecs, ref_yx, min_matches=min_matches,
+                                              ref_radius=ref_radius),
         name="strain-run", on_done=_build_window,
         on_error=lambda e: emit_error(f"Strain mapping failed: {e}"),
     )
@@ -527,6 +595,24 @@ def strain_set_match_radius(session, plot, payload) -> None:
     ctrl = _ctrl_for(session, plot, payload)
     if ctrl is not None:
         ctrl.set_match_radius(float(payload.get("match_radius_px", 6.0)))
+
+
+def strain_set_display(session, plot, payload) -> None:
+    """Display knobs (no re-fit): ``vmax`` (symmetric colour range, 0 = auto) and
+    ``weight`` (per-pixel confidence alpha: 'none' | 'coverage' | 'error')."""
+    ctrl = _ctrl_for(session, plot, payload)
+    if ctrl is not None:
+        ctrl.set_display(vmax=payload.get("vmax"), weight=payload.get("weight"))
+
+
+def strain_set_fit(session, plot, payload) -> None:
+    """Fit knobs (re-fit): ``min_matches`` (the well-posed gate — an affine fit
+    needs redundancy, not just solvability) and ``ref_radius`` (reference pooled
+    over a (2r+1)² region; 0 = single pixel)."""
+    ctrl = _ctrl_for(session, plot, payload)
+    if ctrl is not None:
+        ctrl.set_fit(min_matches=payload.get("min_matches"),
+                     ref_radius=payload.get("ref_radius"))
 
 
 def strain_commit(session, plot, payload) -> None:

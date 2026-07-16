@@ -103,9 +103,9 @@ class TestStrainThreaded:
         import spyde.actions.strain_display as sd
         orig = sd.update_strain_view
 
-        def _spy(plot, field, component):
+        def _spy(plot, field, component, **kw):
             apply_thread["name"] = threading.current_thread().name
-            orig(plot, field, component)
+            orig(plot, field, component, **kw)
             applied.set()
 
         sd.update_strain_view = _spy
@@ -156,9 +156,9 @@ class TestStrainThreaded:
         import spyde.actions.strain_display as sd
         orig_apply = sd.update_strain_view
 
-        def _count_apply(plot, field, component):
+        def _count_apply(plot, field, component, **kw):
             applies.append(field)
-            orig_apply(plot, field, component)
+            orig_apply(plot, field, component, **kw)
 
         sm.compute_strain_field = _slow
         sd.update_strain_view = _count_apply
