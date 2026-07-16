@@ -62,7 +62,6 @@ STAGED_HANDLERS: dict[str, str] = {
     "strain_set_component": "spyde.actions.strain_action.strain_set_component",
     "strain_set_method":   "spyde.actions.strain_action.strain_set_method",
     "strain_set_match_radius": "spyde.actions.strain_action.strain_set_match_radius",
-    "strain_set_display":  "spyde.actions.strain_action.strain_set_display",
     "strain_set_fit":      "spyde.actions.strain_action.strain_set_fit",
     "strain_set_overlay":  "spyde.actions.strain_action.strain_set_overlay",
     "strain_close":        "spyde.actions.strain_action.strain_close",

@@ -144,8 +144,10 @@ def _median_nn(g: np.ndarray) -> float:
 
 # A pixel's affine fit (2×2 T + translation = 6 unknowns) is EXACTLY determined by
 # 3 matches and UNDER-determined by 2 (lstsq then returns an arbitrary min-norm T →
-# a wild strain value: the "bright dot" pixels). ≥4 matches gives real redundancy.
-DEFAULT_MIN_MATCHES = 4
+# a wild strain value: the "bright dot" pixels). 3 is the mathematical minimum; the
+# residual trim below is what protects a 3-match pixel from a single FP (dropping
+# the FP leaves 2 → below the gate → honestly masked instead of garbage).
+DEFAULT_MIN_MATCHES = 3
 # Residual trimming: after the first fit, matches with residual > 2.5× the pixel's
 # RMS (with a small absolute floor so exact synthetic fits keep everything, and an
 # absolute cap of tol/2) are dropped and the pixel refit once — one FP vector inside

@@ -177,9 +177,15 @@ class ActionRouterMixin:
         elif action == "save_signal":
             self._save_signal(payload.get("path"), plot)
         elif action == "set_colormap":
-            self._set_colormap(plot, payload.get("name"))
+            # Controller fallback: bare-figure windows (strain map, IPF views…)
+            # have no Plot, but their controller may duck-type set_colormap /
+            # set_clim — this is what lets the dock's histogram handles and
+            # colormap picker drive the live strain window.
+            self._set_colormap(plot or self.controller_by_window_id(window_id),
+                               payload.get("name"))
         elif action == "set_clim":
-            self._set_clim(plot, payload.get("vmin"), payload.get("vmax"))
+            self._set_clim(plot or self.controller_by_window_id(window_id),
+                           payload.get("vmin"), payload.get("vmax"))
         elif action == "close_window":
             self._close_window(window_id)
         elif action == "resize_figure":

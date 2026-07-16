@@ -61,28 +61,12 @@ class StrainController(WizardController):
             "name": "Match radius (px)", "type": "int", "default": 6,
             "min": 1, "max": 30,
         },
-        "min_matches": {
-            "name": "Min. matched spots", "type": "int", "default": 4,
-            "min": 3, "max": 20,
-        },
-        "ref_radius": {
-            "name": "Reference region radius (px)", "type": "int", "default": 2,
-            "min": 0, "max": 10,
-        },
-        "vmax": {
-            "name": "Colour range ± (0 = auto)", "type": "float", "default": 0.0,
-            "min": 0.0,
-        },
-        "weight": {
-            "name": "Weight display by", "type": "enum", "default": "none",
-            "choices": ["none", "coverage", "error"],
-        },
     }
 
     def __init__(self, vecs, plot2d, *, window_id=None,
                  component="exx", ref_yx=(0, 0), session=None,
                  src_tree=None, src_dp_plot=None, match_radius_px=6.0,
-                 min_matches=4, ref_radius=2, vmax=None, weight="none"):
+                 min_matches=3, ref_radius=2):
         super().__init__(session, src_tree)
         self.vecs = vecs
         self.p = plot2d                  # the strain MAP figure (output)
@@ -91,11 +75,16 @@ class StrainController(WizardController):
         self.ref_yx = (int(ref_yx[0]), int(ref_yx[1]))
         self.field = None
         self.cif_mode = False
-        # Fit robustness + display knobs (see strain_mapping / strain_display).
+        # Fit robustness (backend knobs — scripted via strain_set_fit, no wizard
+        # clutter; defaults are the measured-good ones).
         self.min_matches = int(min_matches)
         self.ref_radius = int(ref_radius)
-        self.vmax = (float(vmax) if vmax else None)     # None/0 → robust auto
-        self.weight = str(weight)
+        # Contrast is owned by the plot-widget dock: the histogram handles send
+        # set_clim (stored here so component switches keep the user's range) and
+        # the colormap picker sends set_colormap — both reach this controller via
+        # the session's controller fallback.
+        self.clim = None                 # None → fresh symmetric auto per update
+        self.cmap = "coolwarm"
         self._g_ref_full = None          # reference spots (zero-beam removed)
         self._recompute_gen = 0          # latest-wins guard for async recomputes
         # Source-DP selection overlay (the interactive part) + the dedicated
@@ -294,8 +283,8 @@ class StrainController(WizardController):
                           gen, self._recompute_gen)
                 return
             self.field = field
-            update_strain_view(self.p, self.field, self.component,
-                               vmax=self.vmax, weight=self.weight)
+            update_strain_view(self.p, self.field, self.component, clim=self.clim)
+            self._emit_histogram()
             log.debug("[strain-ref] _recompute gen=%d applied to plot", gen)
 
         self.run_on_worker(
@@ -339,20 +328,36 @@ class StrainController(WizardController):
         if component not in _COMPONENTS or self.field is None:
             return
         self.component = component
-        update_strain_view(self.p, self.field, component,
-                           vmax=self.vmax, weight=self.weight)
+        # Each component gets a fresh histogram; the user's dock-set contrast is
+        # kept (components are on comparable scales — same as commit's auto_sym).
+        update_strain_view(self.p, self.field, component, clim=self.clim)
+        self._emit_histogram()
 
-    def set_display(self, vmax=None, weight=None) -> None:
-        """Display-only knobs (no re-fit): symmetric colour range (0/None = auto)
-        and per-pixel confidence weighting ('none' | 'coverage' | 'error')."""
-        from spyde.actions.strain_display import update_strain_view, WEIGHT_MODES
-        if vmax is not None:
-            self.vmax = float(vmax) if float(vmax) > 0 else None
-        if weight is not None and str(weight) in WEIGHT_MODES:
-            self.weight = str(weight)
-        if self.field is not None:
-            update_strain_view(self.p, self.field, self.component,
-                               vmax=self.vmax, weight=self.weight)
+    # ── plot-widget dock integration (session controller fallback) ────────────
+    def _emit_histogram(self) -> None:
+        from spyde.actions.strain_display import emit_strain_histogram, _auto_clim, \
+            _component_map
+        if self.field is None:
+            return
+        clim = self.clim or _auto_clim(_component_map(self.field, self.component))
+        emit_strain_histogram(self.window_id, self.field, self.component, clim)
+
+    def set_clim(self, vmin, vmax) -> None:
+        """Dock histogram handles → the displayed contrast (kept across component
+        switches and recomputes until changed again)."""
+        try:
+            self.clim = (float(vmin), float(vmax))
+            self.p.set_clim(*self.clim)
+        except Exception as e:
+            log.debug("strain set_clim failed: %s", e)
+
+    def set_colormap(self, name: str) -> None:
+        """Dock colormap picker → the strain map."""
+        try:
+            self.cmap = str(name)
+            self.p.set_colormap(self.cmap)
+        except Exception as e:
+            log.debug("strain set_colormap failed: %s", e)
 
     def set_fit(self, min_matches=None, ref_radius=None) -> None:
         """Fit knobs (re-fit required): the min-match gate and the reference
@@ -522,16 +527,13 @@ def strain_open(session, plot, payload) -> None:
     gen = bump_generation(tree, "_strain_run_gen")
 
     ref_yx = _default_reference(vecs)
-    min_matches = max(3, int(payload.get("min_matches", 4)))
+    min_matches = max(3, int(payload.get("min_matches", 3)))
     ref_radius = max(0, int(payload.get("ref_radius", 2)))
-    vmax = float(payload.get("vmax", 0.0)) or None
-    weight = str(payload.get("weight", "none"))
 
     def _build_window(field):
         if not is_current(tree, "_strain_run_gen", gen):
             return   # superseded by a strain_close or a newer strain_open
-        _fig, fig_id, html, p = build_strain_figure(field, component="exx",
-                                                    vmax=vmax, weight=weight)
+        _fig, fig_id, html, p = build_strain_figure(field, component="exx")
         wid = session.next_window_id()
         from spyde.actions.figure_registry import keep_alive
         keep_alive(int(wid), _fig)
@@ -543,11 +545,11 @@ def strain_open(session, plot, payload) -> None:
                                 ref_yx=ref_yx, session=session,
                                 src_tree=tree, src_dp_plot=src_dp,
                                 match_radius_px=float(payload.get("match_radius_px", 6.0)),
-                                min_matches=min_matches, ref_radius=ref_radius,
-                                vmax=vmax, weight=weight)
+                                min_matches=min_matches, ref_radius=ref_radius)
         ctrl.field = field
         ctrl.attach()
         tree._strain_controller = ctrl
+        ctrl._emit_histogram()          # arm the dock's contrast handles
         emit_status("Strain field ready.")
 
     if getattr(session, "_dispatch_to_main", None) is not None:
@@ -595,14 +597,6 @@ def strain_set_match_radius(session, plot, payload) -> None:
     ctrl = _ctrl_for(session, plot, payload)
     if ctrl is not None:
         ctrl.set_match_radius(float(payload.get("match_radius_px", 6.0)))
-
-
-def strain_set_display(session, plot, payload) -> None:
-    """Display knobs (no re-fit): ``vmax`` (symmetric colour range, 0 = auto) and
-    ``weight`` (per-pixel confidence alpha: 'none' | 'coverage' | 'error')."""
-    ctrl = _ctrl_for(session, plot, payload)
-    if ctrl is not None:
-        ctrl.set_display(vmax=payload.get("vmax"), weight=payload.get("weight"))
 
 
 def strain_set_fit(session, plot, payload) -> None:
