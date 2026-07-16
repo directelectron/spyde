@@ -722,6 +722,8 @@ def _find_peaks_single_frame(frame, params, *, beamstop_mask=None,
             # compute (orchestrate reads the same key) or the live preview
             # shows different peaks than the full run finds.
             bg_sigma=float(params.get("bg_sigma") or 12.0),
+            # Spot-size override (px radius) for the canonical rescale; 0 → auto.
+            spot_radius=float(params.get("spot_radius") or 0.0) or None,
         )
     elif method == METHOD_DOG:
         out = _find_vectors_single_frame_dog(

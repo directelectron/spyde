@@ -7,6 +7,7 @@
  * that chrome and the common form controls so each wizard is just its content.
  */
 import React from 'react'
+import { Dropdown } from './Dropdown'
 
 interface ShellProps {
   testid: string
@@ -105,20 +106,15 @@ export function Slider({ value, min, max, step, onChange, fmt, testid }: {
   )
 }
 
+/** Themed dropdown (menubar look) — NOT a native <select>; see Dropdown.tsx
+ *  for the Playwright interaction pattern (`selectOption` does not apply). */
 export function Select<T extends string>({ value, options, onChange, testid }: {
   value: T
   options: readonly { value: T; label: string }[]
   onChange: (v: T) => void
   testid: string
 }) {
-  return (
-    <select data-testid={testid} value={value} style={S.sel}
-      onChange={(e) => onChange(e.target.value as T)}>
-      {options.map((o) => (
-        <option key={o.value} value={o.value}>{o.label}</option>
-      ))}
-    </select>
-  )
+  return <Dropdown value={value} options={options} onChange={onChange} testid={testid} />
 }
 
 export function Check({ checked, onChange, label, testid }: {

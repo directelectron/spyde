@@ -112,17 +112,21 @@ def bg_sigma_from_peak_size(peak_diameter_px: float) -> float:
 @torch.no_grad()
 def detect(model, frame: np.ndarray, device, thresh: float = 0.3,
            min_distance: int = 4, auto_scale: bool = True,
-           bg_sigma: float = DEFAULT_BG_SIGMA):
+           bg_sigma: float = DEFAULT_BG_SIGMA,
+           spot_diameter: float | None = None):
     """Detect spots in a single frame. Returns (N,3) [y,x,score] in ORIGINAL coords.
 
     Estimates disk size, rescales to canonical, runs the model, maps positions back.
     ``bg_sigma`` is the local-norm high-pass scale (set by ``calibrate`` for diffuse
     data; default suits normal data). ``thresh`` is the heatmap confidence.
+    ``spot_diameter`` (px) overrides the autocorrelation disk-size estimate — the
+    user-facing "Spot size" knob for when the estimate gets it wrong; the canonical
+    rescale then derives from it (still upsample-only).
     """
     factor = 1.0
     work = frame
     if auto_scale:
-        work, factor = scale_to_canonical(frame)
+        work, factor = scale_to_canonical(frame, diameter=spot_diameter)
     nrm = normalize_input(work, local=True, bg_sigma=bg_sigma)
     levels = int(getattr(model, "levels", 2))
     nrm = _pad_to_multiple(nrm, levels)
@@ -139,7 +143,8 @@ def detect(model, frame: np.ndarray, device, thresh: float = 0.3,
 @torch.no_grad()
 def detect_batch(model, frames, device, thresh: float = 0.3,
                  min_distance: int = 4, auto_scale: bool = True,
-                 shared_scale: bool = True, bg_sigma: float = DEFAULT_BG_SIGMA):
+                 shared_scale: bool = True, bg_sigma: float = DEFAULT_BG_SIGMA,
+                 spot_diameter: float | None = None):
     """Detect spots in a STACK of frames in one forward pass.
 
     ``frames`` is an (N,H,W) array (or a sequence of (H,W) arrays). Returns a list
@@ -162,8 +167,9 @@ def detect_batch(model, frames, device, thresh: float = 0.3,
 
     factor = 1.0
     if auto_scale:
-        # One estimate for the whole stack (shared physical disk size).
-        _ref, factor = scale_to_canonical(frames[0])
+        # One estimate for the whole stack (shared physical disk size); a known
+        # ``spot_diameter`` (the user's Spot-size override) replaces the estimate.
+        _ref, factor = scale_to_canonical(frames[0], diameter=spot_diameter)
 
     levels = int(getattr(model, "levels", 2))
     nrm_list = []
@@ -191,7 +197,8 @@ def detect_batch(model, frames, device, thresh: float = 0.3,
 
 
 @torch.no_grad()
-def calibrate(model, sample_frames, device, tune_threshold: bool = True):
+def calibrate(model, sample_frames, device, tune_threshold: bool = True,
+              spot_diameter: float | None = None):
     """Calibration step (run ONCE on a few representative frames before a full scan).
 
     All frames in a 4D-STEM scan share the same physical disk size and background
@@ -213,8 +220,8 @@ def calibrate(model, sample_frames, device, tune_threshold: bool = True):
         return {"bg_sigma": DEFAULT_BG_SIGMA, "thresh": 0.3, "scale_factor": 1.0}
 
     # 1) scale: one estimate (shared physical disk size). scale_to_canonical returns
-    #    the upscale-only factor.
-    _ref, factor = scale_to_canonical(frames[0])
+    #    the upscale-only factor; a known spot_diameter overrides the estimate.
+    _ref, factor = scale_to_canonical(frames[0], diameter=spot_diameter)
     work0 = _ref if factor != 1.0 else frames[0]
 
     # 2) bg_sigma: confidence-max over the sample (median best-sigma is robust).

@@ -44,11 +44,24 @@ test('neural wizard: bg-σ control, auto-calibration, model refresh, compute', a
   await sig.getByTestId('action-btn-Find Diffraction Vectors').click()
   await expect(page.getByTestId('find-vectors-wizard')).toBeVisible()
 
-  // New neural controls: High-pass σ slider + refresh button by the dropdown.
-  await expect(page.getByTestId('fv-bg-sigma')).toBeVisible()
+  // Minimal neural pane (user decision 2026-07-16): Spot size + Threshold
+  // sliders only — nav blur / min distance / subpixel / high-pass are hidden
+  // (blur is never applied; the high-pass is auto-calibrated invisibly).
+  await expect(page.getByTestId('fv-spot-size')).toBeVisible()
+  await expect(page.getByTestId('fv-threshold')).toBeVisible()
+  await expect(page.getByTestId('fv-sigma')).toHaveCount(0)
+  await expect(page.getByTestId('fv-mindist')).toHaveCount(0)
+  await expect(page.getByTestId('fv-subpixel')).toHaveCount(0)
+  await expect(page.getByTestId('fv-bg-sigma')).toHaveCount(0)
   await expect(page.getByTestId('fv-model')).toBeVisible()
   await expect(page.getByTestId('fv-refresh-models')).toBeVisible()
   await page.screenshot({ path: 'fv_neural_shots/01-wizard-open.png' })
+
+  // The themed Model dropdown opens with the menubar look (screenshot check).
+  await page.getByTestId('fv-model').click()
+  await expect(page.getByTestId('fv-model-opt-spotunet-production-v2')).toBeVisible()
+  await page.screenshot({ path: 'fv_neural_shots/01b-model-dropdown.png' })
+  await page.keyboard.press('Escape')
 
   // Auto-calibration ran on wizard-open (backend log; the emitted fv_calibration
   // is only adopted in the UI when it differs from the defaults, so the log is
@@ -63,12 +76,20 @@ test('neural wizard: bg-σ control, auto-calibration, model refresh, compute', a
   })
   await page.screenshot({ path: 'fv_neural_shots/02-models-refreshed.png' })
 
-  // Compute (params now include bg_sigma) → vectors result window opens.
+  // Compute (params now include spot_radius; nav blur forced off) → vectors
+  // result window opens and the batch runs to completion.
   const before = await page.getByTestId('subwindow').count()
   await page.getByTestId('fv-compute').click()
   await expect.poll(() => page.getByTestId('subwindow').count(), {
     timeout: 120_000, message: 'vectors result window never opened',
   }).toBeGreaterThan(before)
+
+  // WAIT for the batch to finish before afterAll closes the app: closing
+  // mid-batch wedges teardown on Windows (the Electron stdin tick that keeps
+  // the hidden backend scheduled stops during shutdown — see the fv-batch
+  // stall note in CLAUDE.md). This also asserts the sigma=0 / spot-size
+  // compute path actually completes.
+  await backend.waitForLog('[fv-batch] finalized', 120_000)
   await page.screenshot({ path: 'fv_neural_shots/03-vectors-window.png' })
 
   ctx.assertNoJsErrors()

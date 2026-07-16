@@ -88,6 +88,16 @@ class TestFindVectorsNeural:
         assert _coerce({})["bg_sigma"] == 12.0
         assert _coerce({"bg_sigma": 8})["bg_sigma"] == 8.0
 
+    def test_coerce_neural_no_nav_blur_and_spot_radius(self):
+        """Nav blur is NEVER applied for neural (forced to 0 even if sent), it
+        defaults to 0 for every method, and spot_radius coerces through."""
+        from spyde.actions.find_vectors_action import _coerce
+        assert _coerce({})["sigma"] == 0.0                       # default off
+        assert _coerce({"method": "neural", "sigma": 2.5})["sigma"] == 0.0
+        assert _coerce({"method": "nxcorr", "sigma": 2.5})["sigma"] == 2.5
+        assert _coerce({})["spot_radius"] == 0.0                 # 0 = auto
+        assert _coerce({"spot_radius": 7})["spot_radius"] == 7.0
+
     def test_fv_refresh_models_emits(self, monkeypatch):
         """fv_refresh_models pulls the remote registry (offline-safe) and re-emits
         the fv_models payload with refreshed:true for the wizard status line."""
@@ -124,7 +134,7 @@ class TestFindVectorsNeural:
 
         calls = []
 
-        def _fake_cal(frames, *, sigma=1.0, model_id=None):
+        def _fake_cal(frames, *, sigma=1.0, model_id=None, spot_radius=None):
             calls.append(len(frames))
             return {"bg_sigma": 8.0, "thresh": 0.22, "scale_factor": 1.0,
                     "confidence": 0.5}
@@ -170,17 +180,42 @@ class TestFindVectorsNeural:
         seen = {}
 
         def _fake_single(frame, threshold, min_distance, *, subpixel=True,
-                         beamstop_mask=None, model_id=None, bg_sigma=12.0):
-            seen.update(threshold=threshold, bg_sigma=bg_sigma, model_id=model_id)
+                         beamstop_mask=None, model_id=None, bg_sigma=12.0,
+                         spot_radius=None):
+            seen.update(threshold=threshold, bg_sigma=bg_sigma,
+                        model_id=model_id, spot_radius=spot_radius)
             z = np.zeros(frame.shape, np.float32)
             return z, z, np.zeros((0, 3), np.float32)
 
         monkeypatch.setattr(fvn, "_find_vectors_single_frame_neural", _fake_single)
         frame = np.zeros((16, 16), np.float32)
         _find_peaks_single_frame(
-            frame, {"method": "neural", "bg_sigma": 7.5, "threshold": 0.25})
+            frame, {"method": "neural", "bg_sigma": 7.5, "threshold": 0.25,
+                    "spot_radius": 6})
         assert seen["bg_sigma"] == 7.5
+        assert seen["spot_radius"] == 6.0
         assert abs(seen["threshold"] - 0.25) < 1e-9
+
+    def test_spot_size_drives_model_scale(self, monkeypatch):
+        """The Spot-size override reaches models.detect as spot_diameter=2·radius
+        (the canonical-rescale factor then derives from it, not the estimate)."""
+        import spyde.actions.find_vectors_neural as fvn
+        from spyde import models as smodels
+
+        seen = {}
+        monkeypatch.setattr(smodels, "get_model", lambda mid=None: (None, "cpu"))
+
+        def _fake_detect(model, f, device, thresh=0.3, min_distance=4,
+                         auto_scale=True, bg_sigma=12.0, spot_diameter=None):
+            seen.update(spot_diameter=spot_diameter)
+            return np.zeros((0, 3), np.float32)
+
+        monkeypatch.setattr(smodels, "detect", _fake_detect)
+        frame = np.zeros((16, 16), np.float32)
+        fvn._find_vectors_single_frame_neural(frame, spot_radius=6.0)
+        assert seen["spot_diameter"] == 12.0
+        fvn._find_vectors_single_frame_neural(frame)          # no override → auto
+        assert seen["spot_diameter"] is None
 
     def test_gpu_policy_modes(self, monkeypatch):
         """SPYDE_FV_GPU governs the neural path too: off → CPU everywhere;
@@ -236,16 +271,18 @@ class TestFindVectorsNeural:
 
         def _fake_chunk(ghost_block, depth_px, nav_dim, sigma, threshold,
                         min_dist, subpixel, beamstop_mask, model_id=None,
-                        bg_sigma=12.0, persistence=False):
-            seen.update(persistence=persistence, bg_sigma=bg_sigma)
+                        bg_sigma=12.0, persistence=False, spot_radius=None):
+            seen.update(persistence=persistence, bg_sigma=bg_sigma,
+                        spot_radius=spot_radius)
             return np.full((ghost_block.shape[0], ghost_block.shape[1],
                             MAX_PEAKS, 3), np.nan, np.float32)
 
         monkeypatch.setattr(fvn, "_find_vectors_chunk_neural", _fake_chunk)
         block = np.zeros((2, 2, 8, 8), np.float32)
         _find_vectors_chunk(block, 0, 2, 0.0, 5, 0.3, 4, True, None, None, None,
-                            method="neural", bg_sigma=6.0, persistence=True)
-        assert seen == {"persistence": True, "bg_sigma": 6.0}
+                            method="neural", bg_sigma=6.0, persistence=True,
+                            spot_radius=7.0)
+        assert seen == {"persistence": True, "bg_sigma": 6.0, "spot_radius": 7.0}
 
     def test_default_device_chain(self, monkeypatch):
         """CUDA → MPS → CPU fallback chain (Macs previously never got MPS)."""

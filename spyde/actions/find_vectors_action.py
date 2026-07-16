@@ -39,8 +39,16 @@ from spyde.actions.find_vectors import _do_compute_vectors, _copy_nav_axes_to
 # high-pass scale — auto-set by the one-shot calibration (fv_open emits
 # `fv_calibration`) and threaded identically through preview AND batch.
 DEFAULTS: dict = dict(
-    sigma=1.0, kernel_radius=5, threshold=0.3, min_distance=5, subpixel=True,
+    # Nav blur defaults OFF (user decision 2026-07-16): the slider remains for
+    # NXCORR/DoG (weak-signal data benefits) but starts at 0; for NEURAL it is
+    # never applied at all (_coerce forces sigma=0 — the net is trained on
+    # single frames).
+    sigma=0.0, kernel_radius=5, threshold=0.3, min_distance=5, subpixel=True,
     method="neural", model_id="", bg_sigma=12.0, dog_sigma1=0.8, dog_sigma2=2.0,
+    # Spot size (px RADIUS) for the neural canonical rescale: 0 = the model's
+    # own autocorrelation estimate; the wizard always sends its auto-seeded
+    # Spot-size slider so the UI knob is the single source of truth.
+    spot_radius=0.0,
     # Neural stage-2 refine: drop peaks not confirmed by scan neighbours
     # (models/refine.py). BATCH-only (the preview has no neighbours) and
     # default-off until the eval benchmark says it should be on (plan Phase 3).
@@ -71,6 +79,11 @@ def _coerce(params: dict) -> dict:
     # the method's own default so the first preview isn't empty/flooded.
     if params.get("threshold") in (None, ""):
         p["threshold"] = _METHOD_THRESHOLD[p["method"]]
+    # Nav blur is NEVER applied for the neural method (user decision — the net
+    # is trained on single frames; blur only smears the disks it was trained
+    # to see). Forced here, the single choke point for wizard/toolbar/api.
+    if p["method"] == "neural":
+        p["sigma"] = 0.0
     return p
 
 
@@ -592,6 +605,7 @@ def fv_open(session, plot, payload) -> None:
                 min_distance=p["min_distance"], subpixel=p["subpixel"],
                 method=p["method"], model_id=p.get("model_id") or None,
                 bg_sigma=p["bg_sigma"],
+                spot_radius=p.get("spot_radius") or None,
                 dog_sigma1=p["dog_sigma1"],
                 dog_sigma2=p["dog_sigma2"],
                 beamstop_auto=bool(p.get("beamstop_auto")),
@@ -714,8 +728,9 @@ def _emit_calibration(plot, tree, p: dict, gen) -> None:
         if not frames:
             return
         from spyde.actions.find_vectors_neural import calibrate_neural
-        cal = calibrate_neural(frames, sigma=p.get("sigma", 1.0),
-                               model_id=p.get("model_id") or None)
+        cal = calibrate_neural(frames, sigma=p.get("sigma", 0.0),
+                               model_id=p.get("model_id") or None,
+                               spot_radius=p.get("spot_radius") or None)
         tree._fv_calibration = cal
     if not is_current(tree, "_fv_run_gen", gen):
         return                       # wizard closed / superseded while calibrating

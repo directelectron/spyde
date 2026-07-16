@@ -18,7 +18,8 @@ const {
 let ctx: Awaited<ReturnType<typeof launchApp>>
 
 test.beforeAll(async () => {
-  ctx = await launchApp({ dask: true })
+  // INFO logs tee to stderr so waitForLog can see the batch-finalized line.
+  ctx = await launchApp({ dask: true, env: { SPYDE_LOG_LEVEL: 'INFO' } })
   const { page } = ctx
   await backendAction(page, 'load_test_data_si_grains')
   await waitForSubwindowCount(page, 2, 120_000)
@@ -60,6 +61,11 @@ test('live red-peak preview, then Compute opens the vectors window', async () =>
   await expect.poll(() => page.getByTestId('subwindow').count(), {
     timeout: 120_000, message: 'vectors result window never opened',
   }).toBeGreaterThan(before)
+
+  // Let the batch FINISH before afterAll closes the app — closing mid-batch
+  // wedges shutdown on Windows (the Electron stdin tick that keeps the hidden
+  // backend scheduled stops during close; see the fv-batch stall note).
+  await ctx.backend.waitForLog('[fv-batch] finalized', 120_000)
 
   ctx.assertNoJsErrors()
 })

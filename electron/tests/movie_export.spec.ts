@@ -179,8 +179,9 @@ test('2) Format tab: downsample=4, fps=10 → 6 frames · 0.6 s', async () => {
   const fps = page.getByTestId('mvx-fps')
   await fps.fill('10')
   await fps.blur()
-  // downsample = 4 (a <select>)
-  await page.getByTestId('mvx-downsample').selectOption('4')
+  // downsample = 4 (themed Dropdown: click trigger, click option)
+  await page.getByTestId('mvx-downsample').click()
+  await page.getByTestId('mvx-downsample-opt-4').click()
   await page.waitForTimeout(600)   // debounced tune round-trip
 
   // The computed output-info line: 6 frames (full range / stride 1) at 10 fps → 0.6 s.

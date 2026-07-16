@@ -210,6 +210,39 @@ is the selling point) with visible values + override; it's ~8 forward passes on
    hard examples — the highest-value labels are exactly the frames users had to
    fix.
 
+## UX simplification (user feedback 2026-07-16) — DONE
+
+The neural pane was over-parameterised ("too many options"). Decisions, all
+implemented:
+
+- **Neural controls = Spot size + Threshold only.** Spot size (px radius,
+  auto-seeded from the pattern's LoG estimate) is THE scale knob: it overrides
+  the model's autocorrelation disk-size estimate (`spot_diameter = 2·radius` →
+  `scale_to_canonical(diameter=…)`, still upsample-only), drives the NMS
+  min-distance (~radius/2) and the preview marker radius. `spot_radius=0`
+  (scripting/api default) keeps the model's own auto-estimate.
+- **Nav blur is NEVER applied for neural** (`_coerce` forces `sigma=0` — the
+  net is trained on single frames) **and defaults to 0 for NXCORR/DoG too**
+  (slider remains for those methods; `toolbars.yaml` default updated in
+  lockstep).
+- **High-pass (bg σ) is fully automatic** — no control; `fv_calibration` is
+  adopted invisibly (threshold adoption still respects a user override).
+- **Subpixel checkbox hidden for neural** (the net always emits subpixel — it
+  was a no-op).
+- **Every dropdown is themed like the File/Examples/Help menus**: new
+  `Dropdown.tsx` (menubar palette; NOT a native `<select>` — Playwright must
+  click trigger then `${testid}-opt-${value}`), swapped into the shared
+  `WizardShell.Select` (all wizards) and the Plot Control dock
+  (colormap/signal-type/layer-cmap). A global `color-scheme: dark` covers the
+  remaining native selects' popups (log panel, toolbar param carets, …) —
+  sweep those onto `Dropdown` opportunistically.
+
+Newly surfaced open issue: **quitting the app while a find-vectors batch is
+streaming can wedge shutdown on Windows** (the Electron stdin tick that keeps
+the hidden backend scheduled stops during close — same mechanism as the fv
+batch stall). The e2e spec now waits for `[fv-batch] finalized` before closing;
+the app-side fix (keep ticking during shutdown, or force-reap) is open.
+
 ## Out of scope (noted for later)
 
 Other NN surfaces (denoising, segmentation, learned orientation) would reuse

@@ -136,7 +136,8 @@ test('math console: exec, chip drag-to-MDI, signal drag-in, mask, arithmetic, ' 
     // this repo's control. A real user interaction that re-triggers `_set_array`
     // (e.g. changing the colormap) reliably un-blanks it — do that here so the
     // screenshot shows the actual noise instead of a placeholder black square.
-    await page.getByRole('combobox', { name: 'Colormap' }).selectOption('viridis')
+    await page.getByTestId('colormap-select').click()
+    await page.getByTestId('colormap-select-opt-viridis').click()
     await page.waitForTimeout(1000)
     await shot(page, ++shotN, 'noise-window-open')
 

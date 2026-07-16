@@ -281,6 +281,10 @@ def _do_compute_vectors(
     model_id = str(params.get("model_id") or "").strip() or None
     bg_sigma = float(params.get("bg_sigma") or 12.0)
     persistence = bool(params.get("persistence", False))
+    # Spot-size (px radius) override for the model's canonical rescale; 0/None →
+    # the model's own autocorrelation estimate (the wizard always sends its
+    # auto-seeded Spot-size slider value).
+    spot_radius = float(params.get("spot_radius") or 0.0) or None
     log.debug("[do_compute_vectors] START method=%s thr=%s md=%s sigma=%s "
               "nav_dim=%s sig_shape=%s lazy=%s beamstop=%s", method, threshold,
               min_dist, sigma, nav_dim, tuple(sig_shape),
@@ -410,6 +414,7 @@ def _do_compute_vectors(
         model_id=model_id,
         bg_sigma=bg_sigma,
         persistence=persistence,
+        spot_radius=spot_radius,
     )
 
     # Resolve the distributed client up front — needed both to decide on GPU
