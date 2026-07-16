@@ -184,10 +184,16 @@ def _build_interactive_figure_html(mgr, cell: Cell) -> "str | None":
         return None
 
 
-def _render_body(mgr, assets: dict, *, interactive: bool) -> str:
+def _render_body(mgr, assets: dict, *, interactive: bool, session=None) -> str:
     """Assemble the article body: each cell in order → its HTML fragment. Figure
     placeholders are skipped. For interactive mode a figure with no rebuildable
-    live figure falls back to the static ``<img>``."""
+    live figure falls back to the static ``<img>``.
+
+    A figure cell whose resolved source tree carries ``diffraction_vectors``
+    exports the FULL vectors dataset as the interactive explorer instead of an
+    anyplotlib iframe — the reader recomputes virtual images from the embedded
+    vectors right in the page (see vectors_embed.py). Over the embed cap /
+    offline → the usual static image."""
     blocks: list[str] = []
     for c in mgr.doc.cells:
         if c.cell_type == "markdown":
@@ -197,9 +203,21 @@ def _render_body(mgr, assets: dict, *, interactive: bool) -> str:
                 continue
             html_frag = ""
             if interactive:
-                fig_html = _build_interactive_figure_html(mgr, c)
-                if fig_html is not None:
-                    html_frag = _figure_iframe_html(c.caption, fig_html)
+                try:
+                    from spyde.actions.report.vectors_embed import (
+                        vectors_explorer_html, vectors_for_cell,
+                    )
+                    vecs = vectors_for_cell(session, c)
+                    if vecs is not None:
+                        vx_html = vectors_explorer_html(vecs, caption=c.caption)
+                        if vx_html is not None:
+                            html_frag = _figure_iframe_html(c.caption, vx_html)
+                except Exception as e:
+                    log.debug("vectors embed for cell %s failed: %s", c.id, e)
+                if not html_frag:
+                    fig_html = _build_interactive_figure_html(mgr, c)
+                    if fig_html is not None:
+                        html_frag = _figure_iframe_html(c.caption, fig_html)
             if not html_frag:
                 # Static path (also the interactive OFFLINE fallback).
                 html_frag = _figure_img_html(c.caption, assets.get(c.id))
@@ -260,7 +278,8 @@ def report_export_html(session, plot, payload) -> None:
     def finish(harvested: dict) -> None:
         try:
             assets = mgr.assemble_assets(harvested)
-            body = _render_body(mgr, assets, interactive=interactive)
+            body = _render_body(mgr, assets, interactive=interactive,
+                                session=session)
             page = _page(mgr.doc.title, body)
             with open(path, "w", encoding="utf-8") as f:
                 f.write(page)
