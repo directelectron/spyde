@@ -52,15 +52,22 @@ def reliable_sleep(seconds: float) -> None:
     _WAKE.wait(seconds)
 
 
-def split_workers_for_gpu(client) -> tuple:
+def split_workers_for_gpu(client, default_mode: str = "one") -> tuple:
     """
     Partition cluster workers into (gpu_addrs, cpu_addrs) per SPYDE_FV_GPU.
 
     Returns ([], []) when GPU-aware dispatching should be disabled:
     mode "off"/"all", no CUDA on this machine, or no split possible
     (the GPU lane and the CPU lane each need at least one worker).
+
+    ``default_mode`` is the policy when SPYDE_FV_GPU is UNSET and must match
+    the chunk fn's ``_gpu_task_allowed`` default for the method being
+    dispatched — a mismatched lane split (sized for one GPU worker while every
+    worker actually submits CUDA) was exactly the all-workers contention that
+    made the GPU slower AND lagged the desktop (real-data A/B 2026-07-16:
+    2 GPU workers beat 9 on throughput and smoothness).
     """
-    mode = os.environ.get("SPYDE_FV_GPU", "one").lower()
+    mode = os.environ.get("SPYDE_FV_GPU", default_mode).lower()
     if mode in ("off", "all"):
         return [], []
     try:
@@ -158,6 +165,8 @@ def dispatch_chunks(
     submit_batch: int = 8,
     label: str = "dispatch",
     on_chunk_done=None,
+    lane_default_mode: str = "one",
+    gpu_only: bool = False,
 ):
     """
     Compute `result_array` (a dask array with nav dims leading) chunk by
@@ -247,6 +256,12 @@ def dispatch_chunks(
             return
         if stopped_flag is not None and stopped_flag[0]:
             return
+        if not lanes[lane]:
+            # Empty lane (gpu_only dispatch: torch-CPU inference is 10-50x
+            # slower than the GPU batch, so the CPU lane would only stretch
+            # the tail — and `workers=[] + allow_other_workers` would leak
+            # chunks to ANY worker). Never submit here.
+            return
         cap = _lane_cap(caps[lane], lane_threads[lane], state["mem_hot"])
         n = min(submit_batch, len(pending), cap - outstanding[lane])
         if n <= 0:
@@ -261,8 +276,13 @@ def dispatch_chunks(
             ]
         else:
             delayeds = [result_array[chunk_slices[i] + trailing] for i in idxs]
+        # gpu_only dispatch pins tasks HARD to the lane: with
+        # allow_other_workers=True the list is only a soft preference, and a
+        # busy GPU lane silently leaks chunks onto CPU workers — for neural
+        # that is the 10-50x-slower torch-CPU path (the e2e batch timed out
+        # exactly this way). Dual-lane mode keeps the soft placement.
         futs = client.compute(
-            delayeds, workers=lanes[lane], allow_other_workers=True,
+            delayeds, workers=lanes[lane], allow_other_workers=not gpu_only,
         )
         for i, fut in zip(idxs, futs):
             futures.add(fut)
@@ -372,8 +392,12 @@ def dispatch_chunks(
         if time.time() - last_lane_refresh > 5.0:
             last_lane_refresh = time.time()
             try:
-                new_gpu, new_cpu = split_workers_for_gpu(client)
-                if new_gpu and new_cpu:
+                # Same unset-default as the initial split — a refresh must not
+                # silently change the lane policy mid-run.
+                new_gpu, new_cpu = split_workers_for_gpu(client, lane_default_mode)
+                if gpu_only:
+                    new_cpu = []
+                if new_gpu and (new_cpu or gpu_only):
                     with lock:
                         if set(new_cpu) != set(lanes["cpu"]) or \
                                 set(new_gpu) != set(lanes["gpu"]):

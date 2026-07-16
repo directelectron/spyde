@@ -171,9 +171,11 @@ def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
     extraneous (non-neighbour-confirmed) peaks (uses the block's scan neighbours).
 
     GPU use honours the SPYDE_FV_GPU worker policy (``_gpu_task_allowed``), with a
-    neural-specific unset-default of "all" (today's behaviour: every worker batches
-    on the device — one forward pass per chunk, unlike the serialising numba
-    kernels). Set SPYDE_FV_GPU=one/N/off to gate or disable it cluster-wide."""
+    neural-specific unset-default of "2": two CUDA-submitting workers keep the
+    device fed while the rest run the per-frame CPU path. Real-data A/B
+    (2026-07-16, 48-core/1-GPU box): all-workers CUDA was SLOWER (context
+    thrash) and lagged the desktop; 2 workers was faster and smooth. Must match
+    orchestrate's lane_mode. Set SPYDE_FV_GPU=one/N/all/off to override."""
     from spyde import models
     from spyde.actions.find_vectors import MAX_PEAKS, _with_raw_intensity
     from spyde.actions.find_vectors.gpu_runtime import _gpu_task_allowed
@@ -186,7 +188,7 @@ def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
 
     peaks_list = None
     try:
-        if torch_gpu_device() is not None and _gpu_task_allowed(default_mode="all"):
+        if torch_gpu_device() is not None and _gpu_task_allowed(default_mode="2"):
             # One forward pass for the whole chunk on the GPU.
             raw = models.detect_batch(
                 model, flat, device, thresh=float(threshold),

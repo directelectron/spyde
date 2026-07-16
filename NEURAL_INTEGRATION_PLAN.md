@@ -174,13 +174,15 @@ is the selling point) with visible values + override; it's ~8 forward passes on
 
 ### Phase 2 — Runtime parity + platform reach (G5, G6) — PARTIAL 2026-07-16
 
-1. ~~Wire the policy~~ DONE: `_gpu_task_allowed(default_mode=...)` is consulted
-   by `_neural_block` with a neural-specific unset-default of **"all"**
-   (preserves today's behaviour exactly; `SPYDE_FV_GPU=off/one/N` now governs
-   neural too). OPEN: the multi-process-cluster benchmark
-   (all-workers-GPU vs. one-GPU-worker + CPU-rest, extend
-   `benchmark_neural_spots.py`) that decides whether the unset-default should
-   move to "one"/"N".
+1. ~~Wire the policy~~ DONE, and ~~the benchmark~~ RESOLVED by a real-data A/B
+   (2026-07-16, the user's 48-core / 1-GPU box, real 4D-STEM scan):
+   all-workers-CUDA was **slower** (GPU context thrash) and lagged the desktop;
+   `SPYDE_FV_GPU=2` was faster AND smooth. The neural unset-default is now
+   **"2"** — consistently in `_neural_block`'s `_gpu_task_allowed` AND
+   orchestrate's lane split (`split_workers_for_gpu(default_mode=…)`, threaded
+   through `dispatch_chunks`' mid-run lane refresh) — a mismatched pair was
+   exactly the old contention. NXCORR keeps "one" (serialising kernels).
+   `SPYDE_FV_GPU=one/N/all/off` still overrides everything.
 2. ~~MPS~~ DONE (code): `load_model` picks cuda → mps → cpu and smoke-tests one
    forward on MPS at load, degrading to CPU if an op is unsupported. OPEN:
    validate on real Apple-Silicon hardware.

@@ -219,16 +219,45 @@ class TestFindVectorsNeural:
 
     def test_gpu_policy_modes(self, monkeypatch):
         """SPYDE_FV_GPU governs the neural path too: off → CPU everywhere;
-        unset → the caller's default (neural passes "all")."""
+        unset → the caller's default (neural passes "2" — the real-data A/B
+        default; outside a dask worker any worker-gated mode allows)."""
         from spyde.actions.find_vectors.gpu_runtime import _gpu_task_allowed
 
         monkeypatch.delenv("SPYDE_FV_GPU", raising=False)
+        assert _gpu_task_allowed(default_mode="2") is True   # not on a worker
         assert _gpu_task_allowed(default_mode="all") is True
         assert _gpu_task_allowed() is True          # outside a worker: allowed
 
         monkeypatch.setenv("SPYDE_FV_GPU", "off")
-        assert _gpu_task_allowed(default_mode="all") is False
+        assert _gpu_task_allowed(default_mode="2") is False
         assert _gpu_task_allowed() is False
+
+    def test_lane_split_default_mode(self, monkeypatch):
+        """split_workers_for_gpu honours the per-method unset-default so the
+        lane sizing matches which workers actually submit CUDA."""
+        from spyde.compute_dispatch import split_workers_for_gpu
+
+        monkeypatch.delenv("SPYDE_FV_GPU", raising=False)
+
+        class _C:
+            def scheduler_info(self, n_workers=None):
+                return {"workers": {
+                    f"tcp://{i}": {"name": i} for i in range(4)
+                }}
+
+        # Force the numba-availability gate open for the unit test.
+        import spyde.compute_dispatch as cd
+        import types
+        fake_numba = types.SimpleNamespace(
+            cuda=types.SimpleNamespace(is_available=lambda: True))
+        monkeypatch.setitem(__import__("sys").modules, "numba", fake_numba)
+        monkeypatch.setitem(__import__("sys").modules, "numba.cuda",
+                            fake_numba.cuda)
+
+        gpu1, cpu1 = cd.split_workers_for_gpu(_C(), "one")
+        gpu2, cpu2 = cd.split_workers_for_gpu(_C(), "2")
+        assert len(gpu1) == 1 and len(cpu1) == 3
+        assert len(gpu2) == 2 and len(cpu2) == 2
 
     def test_neural_block_respects_gpu_off(self, monkeypatch):
         """SPYDE_FV_GPU=off must keep the batched torch path off even when a

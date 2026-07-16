@@ -129,9 +129,11 @@ export function DaskMonitor() {
               </button>
             )}
             {/* Reclaim post-batch allocator retention across workers + backend
-                (gc + torch cache + Windows EmptyWorkingSet). */}
+                (gc + torch cache + Windows EmptyWorkingSet). NB it cannot free
+                the ~0.7-1 GB/worker of loaded torch/hyperspy runtime — that
+                baseline only goes away with the workers themselves. */}
             <button data-testid="dask-trim" style={S.trim}
-              title="Release memory held by idle compute workers"
+              title="Free leftover batch memory in idle workers (the ~1 GB/worker library runtime always remains)"
               onClick={() => sendAction('dask_trim', {})}>
               Trim memory
             </button>
