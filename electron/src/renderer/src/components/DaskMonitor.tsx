@@ -75,6 +75,14 @@ export function DaskMonitor() {
             Compute — {stats.workers.length} workers,{' '}
             {stats.tasks.executing} running / {stats.tasks.queued} queued
           </div>
+          {/* Column legend (the bare glyph version read as noise — "what is 0▶?"). */}
+          <div style={{ ...S.row, ...S.head }}>
+            <span style={S.wname} />
+            <div style={{ flex: 1 }}>cpu</div>
+            <span style={S.wnum} />
+            <span style={S.wmem}>mem (GB)</span>
+            <span style={S.wtasks}>tasks</span>
+          </div>
           {stats.workers.map((w) => (
             <div key={w.name} style={S.row} data-testid={`dask-worker-${w.name}`}>
               <span style={S.wname}>w{w.name}</span>
@@ -84,9 +92,14 @@ export function DaskMonitor() {
               </div>
               <span style={S.wnum}>{w.cpu.toFixed(0)}%</span>
               <span style={S.wmem}>
-                {fmtGB(w.mem)}{w.mem_limit > 0 ? `/${fmtGB(w.mem_limit)}` : ''} GB
+                {fmtGB(w.mem)}{w.mem_limit > 0 ? `/${fmtGB(w.mem_limit)}` : ''}
               </span>
-              <span style={S.wtasks}>{w.executing}▶{w.ready > 0 ? ` +${w.ready}` : ''}</span>
+              <span style={S.wtasks}
+                title={`${w.executing} running${w.ready ? `, ${w.ready} queued` : ''}`}>
+                {w.executing + w.ready > 0
+                  ? `${w.executing}${w.ready > 0 ? `+${w.ready}` : ''}`
+                  : '–'}
+              </span>
             </div>
           ))}
           {gpu && (
@@ -98,7 +111,7 @@ export function DaskMonitor() {
               </div>
               <span style={S.wnum}>{gpu.util.toFixed(0)}%</span>
               <span style={S.wmem}>
-                {(gpu.vram_used / 1024).toFixed(1)}/{(gpu.vram_total / 1024).toFixed(1)} GB
+                {(gpu.vram_used / 1024).toFixed(1)}/{(gpu.vram_total / 1024).toFixed(1)}
               </span>
               <span style={S.wtasks} />
             </div>
@@ -131,6 +144,7 @@ const S: Record<string, React.CSSProperties> = {
     display: 'flex', flexDirection: 'column', gap: 4,
   },
   popTitle: { fontSize: 10.5, color: '#a6adc8', paddingBottom: 4 },
+  head: { color: '#6c7086', fontSize: 9.5, textTransform: 'uppercase', letterSpacing: 0.5 },
   row: {
     display: 'flex', alignItems: 'center', gap: 6,
     fontSize: 10.5, color: '#cdd6f4', fontVariantNumeric: 'tabular-nums',

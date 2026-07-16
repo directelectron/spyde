@@ -31,16 +31,10 @@ export function StatusBar({ logOpen, onToggleLog }: {
       <span style={styles.text} data-testid="status-text">
         {busy && state.loading.text ? state.loading.text : state.status}
       </span>
-      {/* Live compute readout (CPU / GPU / tasks) — click for per-worker detail. */}
+      {/* Live compute readout (CPU / GPU / tasks) — click for per-worker detail
+          + the full-dashboard link (the old standalone "Dask dashboard ↗"
+          button folded into the popover). */}
       <DaskMonitor />
-      {state.dashboardUrl && (
-        <button
-          style={styles.link}
-          onClick={() => window.electron.openExternal(state.dashboardUrl!)}
-        >
-          Dask dashboard ↗
-        </button>
-      )}
       <button
         data-testid="toggle-log"
         style={{ ...styles.btn, ...(logOpen ? styles.btnActive : null) }}
@@ -92,10 +86,6 @@ const styles: Record<string, React.CSSProperties> = {
     width: 12, height: 12, borderRadius: '50%', flexShrink: 0,
     border: '2px solid #45475a', borderTopColor: '#89b4fa',
     animation: 'spyde-spin 0.8s linear infinite',
-  },
-  link: {
-    background: 'none', border: 'none', color: '#89b4fa',
-    fontSize: 12, cursor: 'pointer', padding: 0,
   },
   btn: {
     display: 'inline-flex', alignItems: 'center', gap: 6,

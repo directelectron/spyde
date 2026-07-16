@@ -92,6 +92,29 @@ class TestSampler:
         assert msgs[0]["tasks"]["executing"] == 4
 
 
+class TestWorkerPlan:
+    def test_budget_is_75_percent_of_cores(self, monkeypatch):
+        monkeypatch.delenv("SPYDE_COMPUTE_FRACTION", raising=False)
+        from spyde.backend.app import _compute_worker_plan
+        # 16 logical cores → 12-thread budget → 6 workers × 2 threads (75%).
+        assert _compute_worker_plan(16) == (6, 2)
+        # 32 cores → 24-thread budget → 6 workers × 4 threads (75%).
+        assert _compute_worker_plan(32) == (6, 4)
+        # 8 cores → 6-thread budget → 3 × 2.
+        assert _compute_worker_plan(8) == (3, 2)
+        # Tiny machines keep the 1×1 floor.
+        assert _compute_worker_plan(2) == (1, 1)
+
+    def test_fraction_override_and_clamp(self, monkeypatch):
+        from spyde.backend.app import _compute_worker_plan
+        assert _compute_worker_plan(16, fraction=1.0) == (8, 2)     # full machine
+        assert _compute_worker_plan(16, fraction=0.0) == (1, 2)     # clamped to 0.1
+        monkeypatch.setenv("SPYDE_COMPUTE_FRACTION", "0.5")
+        assert _compute_worker_plan(16) == (4, 2)
+        monkeypatch.setenv("SPYDE_COMPUTE_FRACTION", "junk")
+        assert _compute_worker_plan(16) == (6, 2)                   # bad env → 0.75
+
+
 class TestWorkerPriority:
     def test_drops_to_below_normal(self, monkeypatch):
         import sys

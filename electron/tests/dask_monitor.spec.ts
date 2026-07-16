@@ -33,10 +33,10 @@ async function inject(msg: Record<string, unknown>) {
 const STATS = {
   type: 'dask_stats',
   workers: [
-    { name: '0', cpu: 12, mem: 1e9, mem_limit: 8e9, executing: 1, ready: 0 },
+    { name: '0', cpu: 3, mem: 1e9, mem_limit: 8e9, executing: 0, ready: 0 },  // idle
     { name: '1', cpu: 97, mem: 2e9, mem_limit: 8e9, executing: 3, ready: 5 },
   ],
-  tasks: { executing: 4, queued: 5 },
+  tasks: { executing: 3, queued: 5 },
   gpu: { util: 96, vram_used: 3000, vram_total: 8192 },
   host_cpu: 88,
 }
@@ -50,15 +50,17 @@ test('dask_stats shows the HUD; click opens the per-worker popover', async () =>
   await expect(seg).toBeVisible()
   await expect(seg).toContainText('CPU 88%')
   await expect(seg).toContainText('GPU 96%')
-  await expect(seg).toContainText('9 tasks')
+  await expect(seg).toContainText('8 tasks')
 
   await seg.click()
   const pop = page.getByTestId('dask-monitor-popover')
   await expect(pop).toBeVisible()
-  await expect(pop).toContainText('2 workers, 4 running / 5 queued')
+  await expect(pop).toContainText('2 workers, 3 running / 5 queued')
+  await expect(pop).toContainText('tasks')                      // column legend
   await expect(page.getByTestId('dask-worker-1')).toContainText('97%')
-  await expect(page.getByTestId('dask-worker-1')).toContainText('3▶ +5')
-  await expect(page.getByTestId('dask-gpu-row')).toContainText('2.9/8.0 GB')
+  await expect(page.getByTestId('dask-worker-1')).toContainText('3+5')
+  await expect(page.getByTestId('dask-worker-0')).toContainText('–')  // idle worker
+  await expect(page.getByTestId('dask-gpu-row')).toContainText('2.9/8.0')
   await page.screenshot({ path: 'dask_monitor_shots/01-popover.png' })
 })
 
