@@ -678,6 +678,9 @@ export type PlotAppMessage =
   | RepfigComposeOptionsMessage
   | MvxStateMessage
   | MvxDoneMessage
+  | DownloadProgressMessage
+  | DownloadDoneMessage
+  | DaskStatsMessage
 
 /**
  * Narrow a raw incoming message (`Record<string, unknown>` from the IPC bridge)
