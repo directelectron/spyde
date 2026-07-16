@@ -41,11 +41,16 @@ const THR_DEFAULT: Record<Method, number> = { neural: 0.3, nxcorr: 0.5, dog: 10 
 // the last-used parameters.
 interface FvSaved {
   method: Method; modelId: string; sigma: number; radius: number
-  sigma1: number; sigma2: number
+  sigma1: number; sigma2: number; bgSigma: number
   threshold: number; minDist: number; subpixel: boolean; beamstop: boolean
   beamstopDilate: number; showTransform: boolean
 }
 const _fvStore = new Map<number, FvSaved>()
+
+// Neural local-norm high-pass scale (px). 12 matches the backend default; the
+// backend's one-shot auto-calibration (`fv_calibration`) overwrites it unless
+// the user already moved the slider.
+const BG_SIGMA_DEFAULT = 12
 
 export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: Props) {
   const saved = _fvStore.get(windowId)
@@ -56,6 +61,7 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
   const [radius, setRadius] = React.useState(saved?.radius ?? 5)
   const [sigma1, setSigma1] = React.useState(saved?.sigma1 ?? 0.8)
   const [sigma2, setSigma2] = React.useState(saved?.sigma2 ?? 2.0)
+  const [bgSigma, setBgSigma] = React.useState(saved?.bgSigma ?? BG_SIGMA_DEFAULT)
   const [threshold, setThreshold] = React.useState(saved?.threshold ?? 0.3)
   const [minDist, setMinDist] = React.useState(saved?.minDist ?? 5)
   const [subpixel, setSubpixel] = React.useState(saved?.subpixel ?? true)
@@ -66,19 +72,20 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
 
   React.useEffect(() => {
     _fvStore.set(windowId, {
-      method, modelId, sigma, radius, sigma1, sigma2, threshold, minDist, subpixel,
+      method, modelId, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist, subpixel,
       beamstop, beamstopDilate, showTransform,
     })
-  }, [windowId, method, modelId, sigma, radius, sigma1, sigma2, threshold, minDist,
+  }, [windowId, method, modelId, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist,
       subpixel, beamstop, beamstopDilate, showTransform])
 
   // Live refs so the debounced tune always sends the latest of EVERY control.
-  const vals = React.useRef({ method, modelId, sigma, radius, sigma1, sigma2, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform })
-  vals.current = { method, modelId, sigma, radius, sigma1, sigma2, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform }
+  const vals = React.useRef({ method, modelId, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform })
+  vals.current = { method, modelId, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform }
   const params = () => ({
     method: vals.current.method, model_id: vals.current.modelId,
     sigma: vals.current.sigma, kernel_radius: vals.current.radius,
     dog_sigma1: vals.current.sigma1, dog_sigma2: vals.current.sigma2,
+    bg_sigma: vals.current.bgSigma,
     threshold: vals.current.threshold, min_distance: vals.current.minDist,
     subpixel: vals.current.subpixel, beamstop_auto: vals.current.beamstop,
     beamstop_dilate: vals.current.beamstopDilate,
@@ -111,6 +118,40 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
     setModels(list.map((m) => ({ value: m.id, label: m.label ?? m.id })))
     // '' = registry default; surface it as the concrete id once known.
     if (!vals.current.modelId && typeof d.default === 'string') setModelId(d.default)
+    if (d.refreshed) setStatus(`Model list refreshed — ${list.length} available.`)
+  })
+
+  // "Check for new models": pull the latest registry from Hugging Face; the
+  // backend re-emits fv_models (refreshed: true) with the merged list.
+  const refreshModels = () => {
+    setStatus('Checking for new models…')
+    sendRef.current('fv_refresh_models', {}, windowId)
+  }
+
+  // Backend one-shot auto-calibration (neural): adopt bg σ / threshold unless
+  // the user already moved them off their defaults (override wins), then
+  // re-run the preview with the calibrated values.
+  useWizardEvent('spyde:fv_calibration', windowId, (d) => {
+    if (vals.current.method !== 'neural') return
+    let adopted = false
+    if (typeof d.bg_sigma === 'number' && vals.current.bgSigma === BG_SIGMA_DEFAULT
+        && d.bg_sigma !== BG_SIGMA_DEFAULT) {
+      setBgSigma(d.bg_sigma)
+      vals.current = { ...vals.current, bgSigma: d.bg_sigma }
+      adopted = true
+    }
+    if (typeof d.thresh === 'number' && vals.current.threshold === THR_DEFAULT.neural
+        && d.thresh !== THR_DEFAULT.neural) {
+      setThreshold(d.thresh)
+      vals.current = { ...vals.current, threshold: d.thresh }
+      adopted = true
+    }
+    if (adopted) {
+      const conf = typeof d.confidence === 'number' ? ` (conf ${d.confidence.toFixed(2)})` : ''
+      setStatus(`Auto-calibrated: high-pass σ=${Number(d.bg_sigma).toFixed(1)}, `
+        + `threshold ${Number(d.thresh).toFixed(2)}${conf}.`)
+      tune()
+    }
   })
 
   // Adopt the backend's auto-estimated disk radius (Qt parity) the first time it
@@ -155,8 +196,12 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
       </Field>
       {isNeural && models.length > 0 && (
         <Field label="Model">
-          <Select testid="fv-model" value={modelId} options={models}
-            onChange={live(setModelId)} />
+          <div style={modelRowStyle}>
+            <Select testid="fv-model" value={modelId} options={models}
+              onChange={live(setModelId)} />
+            <button data-testid="fv-refresh-models" style={refreshBtnStyle}
+              title="Check Hugging Face for new models" onClick={refreshModels}>↻</button>
+          </div>
         </Field>
       )}
       <div style={gridStyle}>
@@ -167,6 +212,12 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
         {!isDog && !isNeural && (
           <Cell label="Disk Radius">
             <Slider testid="fv-radius" value={radius} min={1} max={30} step={1} onChange={live(setRadius)} />
+          </Cell>
+        )}
+        {isNeural && (
+          <Cell label="High-pass σ">
+            <Slider testid="fv-bg-sigma" value={bgSigma} min={2} max={24} step={0.5}
+              onChange={live(setBgSigma)} fmt={(n) => n.toFixed(1)} />
           </Cell>
         )}
         {isDog && (
@@ -211,6 +262,14 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
 
 const gridStyle: React.CSSProperties = {
   display: 'grid', gridTemplateColumns: '1fr 1fr', columnGap: 10, rowGap: 6,
+}
+const modelRowStyle: React.CSSProperties = {
+  display: 'flex', alignItems: 'center', gap: 4, minWidth: 0,
+}
+const refreshBtnStyle: React.CSSProperties = {
+  flex: '0 0 auto', width: 22, height: 22, padding: 0, lineHeight: '20px',
+  background: 'transparent', color: 'inherit', border: '1px solid #444',
+  borderRadius: 4, cursor: 'pointer',
 }
 const cellStyle: React.CSSProperties = {
   display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0,

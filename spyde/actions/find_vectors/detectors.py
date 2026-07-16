@@ -718,6 +718,10 @@ def _find_peaks_single_frame(frame, params, *, beamstop_mask=None,
             subpixel=bool(params.get("subpixel", True)),
             beamstop_mask=beamstop_mask,
             model_id=(params.get("model_id") or None),
+            # Calibrated local-norm high-pass scale — MUST match the batch
+            # compute (orchestrate reads the same key) or the live preview
+            # shows different peaks than the full run finds.
+            bg_sigma=float(params.get("bg_sigma") or 12.0),
         )
     elif method == METHOD_DOG:
         out = _find_vectors_single_frame_dog(

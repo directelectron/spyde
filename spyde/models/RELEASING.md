@@ -34,7 +34,9 @@ Users pick it up via **Find Vectors → Model dropdown → refresh** (the
 3. Upload the `.pt` to the HF repo (`cssfrancis/spyde-spotunet`) under a
    **versioned filename**, e.g. `spotunet-base16-v2.pt`.
 4. Add a versioned entry to the repo's `registry.json` and (once accepted as
-   best) set `default` to it:
+   best) set `default` to it. Include the file's `sha256` (``sha256sum
+   spotunet-base16-v2.pt``) — the registry verifies it after download and
+   rejects a corrupted/tampered file (falling back to the bundled default):
    ```json
    {
      "id": "spotunet-base16-v2",
@@ -42,10 +44,14 @@ Users pick it up via **Find Vectors → Model dropdown → refresh** (the
      "version": 2,
      "notes": "Better recall on thick samples / grain boundaries.",
      "arch": {"base": 16, "in_ch": 1, "levels": 2},
+     "sha256": "<hex digest of the .pt>",
      "source": {"type": "hf", "repo": "cssfrancis/spyde-spotunet",
                 "file": "spotunet-base16-v2.pt"}
    }
    ```
+   Checkpoints are loaded with ``torch.load(weights_only=True)`` — they must be
+   plain state dicts + scalar hyperparams (what ``train.py`` saves), never
+   pickled objects.
 5. Done — on the next refresh the model appears in the dropdown and (if promoted)
    becomes the default. No SpyDE build required.
 

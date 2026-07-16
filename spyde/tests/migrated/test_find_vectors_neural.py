@@ -7,6 +7,10 @@ avoids the torch-CUDA-under-pytest segfault on Windows (see CLAUDE.md). Confirms
   - the wizard default method is now ``neural`` and the model registry resolves
     the bundled model,
   - ``fv_models`` emits the available-models payload for the Model dropdown,
+  - ``fv_refresh_models`` refreshes the remote registry and re-emits the list,
+  - the one-shot auto-calibration (``_emit_calibration``) emits ``fv_calibration``
+    once, caches on the tree and respects the run generation,
+  - ``bg_sigma`` reaches the single-frame preview dispatch (preview/batch parity),
   - ``fv_run`` with ``method="neural"`` produces a vectors window with
     ``tree.diffraction_vectors`` attached.
 
@@ -78,6 +82,105 @@ class TestFindVectorsNeural:
         assert captured and captured[0]["type"] == "fv_models"
         assert captured[0]["default"] == default_model_id()
         assert any(m["id"] == default_model_id() for m in captured[0]["models"])
+
+    def test_coerce_carries_bg_sigma(self):
+        from spyde.actions.find_vectors_action import _coerce
+        assert _coerce({})["bg_sigma"] == 12.0
+        assert _coerce({"bg_sigma": 8})["bg_sigma"] == 8.0
+
+    def test_fv_refresh_models_emits(self, monkeypatch):
+        """fv_refresh_models pulls the remote registry (offline-safe) and re-emits
+        the fv_models payload with refreshed:true for the wizard status line."""
+        import spyde.actions.find_vectors_action as fva
+        from spyde import models as smodels
+
+        called = []
+
+        def _fake_refresh():
+            called.append(1)
+            return smodels.available_models()
+
+        monkeypatch.setattr(smodels, "refresh_remote_registry", _fake_refresh)
+        captured = []
+        monkeypatch.setattr(fva, "emit", lambda msg: captured.append(msg))
+
+        class _P:
+            window_id = 7
+
+        # session=None → run_on_worker executes inline (bare-stub path).
+        fva.fv_refresh_models(None, _P(), {"window_id": 7})
+        assert called, "refresh_remote_registry never called"
+        assert captured and captured[0]["type"] == "fv_models"
+        assert captured[0]["refreshed"] is True
+        assert captured[0]["window_id"] == 7
+        assert captured[0]["models"], "merged manifest lost its models"
+
+    def test_emit_calibration_wiring(self, monkeypatch):
+        """fv_calibration is emitted once with the calibrated values, cached on
+        the tree (no recompute on caret reopen) and dropped on a stale generation."""
+        import spyde.actions.find_vectors_action as fva
+        import spyde.actions.find_vectors_neural as fvn
+        from spyde.actions.lifecycle import bump_generation
+
+        calls = []
+
+        def _fake_cal(frames, *, sigma=1.0, model_id=None):
+            calls.append(len(frames))
+            return {"bg_sigma": 8.0, "thresh": 0.22, "scale_factor": 1.0,
+                    "confidence": 0.5}
+
+        monkeypatch.setattr(fvn, "calibrate_neural", _fake_cal)
+        captured = []
+        monkeypatch.setattr(fva, "emit", lambda m: captured.append(m))
+
+        class _Tree:
+            pass
+
+        tree = _Tree()
+        tree.root = _diffraction_4d()
+        gen = bump_generation(tree, "_fv_run_gen")
+
+        class _P:
+            window_id = 5
+
+        fva._emit_calibration(_P(), tree, {"sigma": 1.0, "model_id": ""}, gen)
+        assert captured and captured[0]["type"] == "fv_calibration"
+        assert captured[0]["window_id"] == 5
+        assert captured[0]["bg_sigma"] == 8.0
+        assert captured[0]["thresh"] == 0.22
+        assert captured[0]["confidence"] == 0.5
+        assert calls and calls[0] >= 1, "no sample frames reached calibrate"
+        assert tree._fv_calibration["bg_sigma"] == 8.0
+
+        # Cached: a second wizard-open re-emits WITHOUT recomputing.
+        fva._emit_calibration(_P(), tree, {"sigma": 1.0}, gen)
+        assert len(calls) == 1 and len(captured) == 2
+
+        # Stale generation (wizard closed while calibrating): nothing emitted.
+        bump_generation(tree, "_fv_run_gen")
+        fva._emit_calibration(_P(), tree, {"sigma": 1.0}, gen)
+        assert len(captured) == 2
+
+    def test_preview_dispatch_passes_bg_sigma(self, monkeypatch):
+        """The live-preview dispatch must forward bg_sigma to the neural detector —
+        otherwise preview and batch run with DIFFERENT high-pass scales."""
+        import spyde.actions.find_vectors_neural as fvn
+        from spyde.actions.find_vectors import _find_peaks_single_frame
+
+        seen = {}
+
+        def _fake_single(frame, threshold, min_distance, *, subpixel=True,
+                         beamstop_mask=None, model_id=None, bg_sigma=12.0):
+            seen.update(threshold=threshold, bg_sigma=bg_sigma, model_id=model_id)
+            z = np.zeros(frame.shape, np.float32)
+            return z, z, np.zeros((0, 3), np.float32)
+
+        monkeypatch.setattr(fvn, "_find_vectors_single_frame_neural", _fake_single)
+        frame = np.zeros((16, 16), np.float32)
+        _find_peaks_single_frame(
+            frame, {"method": "neural", "bg_sigma": 7.5, "threshold": 0.25})
+        assert seen["bg_sigma"] == 7.5
+        assert abs(seen["threshold"] - 0.25) < 1e-9
 
     def test_neural_run_cpu(self, monkeypatch):
         # Force the CPU branch — deterministic, and no torch-CUDA under pytest.

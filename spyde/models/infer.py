@@ -25,7 +25,9 @@ def load_model(ckpt_path, device=None, arch: dict | None = None):
     architecture hyperparams when present; otherwise they're read from the
     checkpoint (which stores ``base``/``in_ch``/``levels``)."""
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ck = torch.load(ckpt_path, map_location=device)
+    # weights_only=True: checkpoints are plain state dicts + scalar hyperparams;
+    # never unpickle arbitrary objects from a (possibly downloaded) file.
+    ck = torch.load(ckpt_path, map_location=device, weights_only=True)
     arch = arch or {}
     model = SpotUNet(
         in_ch=arch.get("in_ch", ck.get("in_ch", 1)),

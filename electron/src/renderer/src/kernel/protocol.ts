@@ -484,6 +484,7 @@ export interface WizardEventMessage extends MsgBase {
     | 'om_library_ready'
     | 'fv_auto_params'
     | 'fv_models'
+    | 'fv_calibration'
     | 'cod_results'
     | 'cod_cif_ready'
     | 'gpu_status_result'

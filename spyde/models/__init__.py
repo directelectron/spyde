@@ -26,7 +26,9 @@ from .infer import (
 from .registry import (
     available_models,
     default_model_id,
+    ensure_local,
     get_model,
+    is_cached,
     list_models,
     refresh_remote_registry,
 )
@@ -44,5 +46,7 @@ __all__ = [
     "list_models",
     "available_models",
     "default_model_id",
+    "ensure_local",
+    "is_cached",
     "refresh_remote_registry",
 ]

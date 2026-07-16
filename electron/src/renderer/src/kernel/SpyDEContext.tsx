@@ -1194,6 +1194,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'om_library_ready':
         case 'fv_auto_params':
         case 'fv_models':
+        case 'fv_calibration':
         case 'cod_results':
         case 'cod_cif_ready':
         case 'gpu_status_result':
