@@ -25,7 +25,19 @@ export function Dropdown<T extends string>({ value, options, onChange, testid, w
   width?: number | string
 }) {
   const [open, setOpen] = React.useState(false)
+  // Auto drop-UP when the menu would clip the bottom of the window (e.g. the
+  // status-bar monitor popover — its rows sit a few px above the viewport edge).
+  const [dropUp, setDropUp] = React.useState(false)
   const rootRef = React.useRef<HTMLDivElement>(null)
+
+  const toggle = () => {
+    if (!open && rootRef.current) {
+      const rect = rootRef.current.getBoundingClientRect()
+      const estMenuH = Math.min(260, options.length * 27 + 12)
+      setDropUp(rect.bottom + estMenuH + 8 > window.innerHeight)
+    }
+    setOpen(!open)
+  }
 
   // Close on outside click / Escape (same behaviour as MenuBar).
   React.useEffect(() => {
@@ -49,13 +61,16 @@ export function Dropdown<T extends string>({ value, options, onChange, testid, w
         type="button" data-testid={testid} data-value={value}
         aria-haspopup="listbox" aria-expanded={open}
         style={{ ...S.trigger, ...(open ? S.triggerOpen : {}) }}
-        onClick={() => setOpen(!open)}
+        onClick={toggle}
       >
         <span style={S.triggerLabel}>{current?.label ?? String(value)}</span>
         <span style={S.caret}>▾</span>
       </button>
       {open && (
-        <div role="listbox" style={S.menu}>
+        <div role="listbox"
+          style={{ ...S.menu,
+                   ...(dropUp ? { bottom: 'calc(100% + 3px)' }
+                              : { top: 'calc(100% + 3px)' }) }}>
           {options.map((o) => (
             <button
               key={o.value} type="button" role="option"
@@ -90,8 +105,9 @@ const S: Record<string, React.CSSProperties> = {
   triggerLabel: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
   caret: { fontSize: 9, color: '#6c7086', flex: '0 0 auto' },
   // The panel is a copy of MenuBar's `styles.dropdown` / `styles.item`.
+  // (top/bottom anchoring is applied inline — see the dropUp state.)
   menu: {
-    position: 'absolute', top: 'calc(100% + 3px)', left: 0, zIndex: 9500,
+    position: 'absolute', left: 0, zIndex: 9500,
     minWidth: '100%', maxHeight: 260, overflowY: 'auto',
     background: '#1e1e2e', border: '1px solid #313244',
     borderRadius: 8, padding: 5, boxShadow: '0 10px 28px rgba(0,0,0,0.5)',

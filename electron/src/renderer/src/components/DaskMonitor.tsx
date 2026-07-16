@@ -61,6 +61,7 @@ export function DaskMonitor() {
   const [cfgCpu, setCfgCpu] = React.useState<string | null>(null)
   const [cfgGpu, setCfgGpu] = React.useState<string | null>(null)
   const [applying, setApplying] = React.useState(false)
+  const [limitsOpen, setLimitsOpen] = React.useState(false)
   const seeded = React.useRef(false)
 
   React.useEffect(() => {
@@ -118,7 +119,10 @@ export function DaskMonitor() {
         </span>
       </button>
       {open && (
-        <div style={S.pop} data-testid="dask-monitor-popover">
+        <div style={{ ...S.pop, width: limitsOpen ? 505 : 330 }}
+          data-testid="dask-monitor-popover">
+        <div style={S.cols}>
+        <div style={S.leftCol}>
           <div style={S.popTitle}>
             Compute — {stats.workers.length} workers,{' '}
             {stats.tasks.executing} running / {stats.tasks.queued} queued
@@ -164,47 +168,60 @@ export function DaskMonitor() {
               <span style={S.wtasks} />
             </div>
           )}
-          {/* Compute limits — Apply restarts the cluster with the new plan.
-              (The manual "Trim memory" button was removed — the backend trims
-              automatically after each batch instead.) */}
-          <div style={S.cfgTitle}>Compute limits</div>
-          <div style={S.cfgRow}>
-            <span style={S.cfgLbl}>Max RAM</span>
-            <Dropdown testid="compute-ram" value={cfgRam ?? '0.65'}
-              options={RAM_OPTS} onChange={setCfgRam} width={130} />
-          </div>
-          <div style={S.cfgRow}>
-            <span style={S.cfgLbl}>CPU use</span>
-            <Dropdown testid="compute-cpu" value={cfgCpu ?? '0.75'}
-              options={CPU_OPTS} onChange={setCfgCpu} width={130} />
-          </div>
-          <div style={S.cfgRow}>
-            <span style={S.cfgLbl}>GPU feeders</span>
-            <Dropdown testid="compute-gpu" value={cfgGpu ?? '4'}
-              options={GPU_OPTS} onChange={setCfgGpu} width={130} />
-          </div>
-          <button
-            data-testid="compute-apply"
-            style={{ ...S.apply, opacity: applying ? 0.5 : 1 }}
-            disabled={applying}
-            title="Applies the limits by restarting the compute cluster — in-flight computes are cancelled"
-            onClick={() => {
-              setApplying(true)
-              sendAction('compute_configure', {
-                mem_fraction: Number(cfgRam ?? 0.65),
-                compute_fraction: Number(cfgCpu ?? 0.75),
-                gpu_workers: cfgGpu ?? '4',
-              })
-            }}
-          >
-            {applying ? 'Restarting cluster…' : 'Apply (restarts cluster)'}
-          </button>
-          {state.dashboardUrl && (
-            <button style={S.dash}
-              onClick={() => window.electron.openExternal(state.dashboardUrl!)}>
-              Open full Dask dashboard ↗
+          <div style={S.footRow}>
+            {state.dashboardUrl && (
+              <button style={S.dash}
+                onClick={() => window.electron.openExternal(state.dashboardUrl!)}>
+                Open full Dask dashboard ↗
+              </button>
+            )}
+            {/* Toggles the Compute-limits column open to the right. */}
+            <button data-testid="compute-limits-toggle" style={S.limitsToggle}
+              onClick={() => setLimitsOpen(v => !v)}>
+              ⚙ Limits {limitsOpen ? '▸' : '◂'}
             </button>
-          )}
+          </div>
+        </div>
+        {limitsOpen && (
+          <div style={S.rightCol} data-testid="compute-limits-panel">
+            {/* Apply restarts the cluster with the new plan. (The manual
+                "Trim memory" button was removed — the backend trims
+                automatically after each batch instead.) */}
+            <div style={S.cfgTitle}>Compute limits</div>
+            <div style={S.cfgRow}>
+              <span style={S.cfgLbl}>Max RAM</span>
+              <Dropdown testid="compute-ram" value={cfgRam ?? '0.65'}
+                options={RAM_OPTS} onChange={setCfgRam} width="100%" />
+            </div>
+            <div style={S.cfgRow}>
+              <span style={S.cfgLbl}>CPU use</span>
+              <Dropdown testid="compute-cpu" value={cfgCpu ?? '0.75'}
+                options={CPU_OPTS} onChange={setCfgCpu} width="100%" />
+            </div>
+            <div style={S.cfgRow}>
+              <span style={S.cfgLbl}>GPU feeders</span>
+              <Dropdown testid="compute-gpu" value={cfgGpu ?? '4'}
+                options={GPU_OPTS} onChange={setCfgGpu} width="100%" />
+            </div>
+            <button
+              data-testid="compute-apply"
+              style={{ ...S.apply, opacity: applying ? 0.5 : 1 }}
+              disabled={applying}
+              title="Applies the limits by restarting the compute cluster — in-flight computes are cancelled"
+              onClick={() => {
+                setApplying(true)
+                sendAction('compute_configure', {
+                  mem_fraction: Number(cfgRam ?? 0.65),
+                  compute_fraction: Number(cfgCpu ?? 0.75),
+                  gpu_workers: cfgGpu ?? '4',
+                })
+              }}
+            >
+              {applying ? 'Restarting cluster…' : 'Apply (restarts)'}
+            </button>
+          </div>
+        )}
+        </div>
         </div>
       )}
     </div>
@@ -222,9 +239,23 @@ const S: Record<string, React.CSSProperties> = {
   segOpen: { background: '#1e1e2e', borderColor: '#45475a' },
   pop: {
     position: 'absolute', bottom: 26, right: 0, zIndex: 9300,
-    width: 330, background: '#1e1e2e', border: '1px solid #313244',
+    background: '#1e1e2e', border: '1px solid #313244',
     borderRadius: 8, padding: 8, boxShadow: '0 10px 28px rgba(0,0,0,0.5)',
-    display: 'flex', flexDirection: 'column', gap: 4,
+  },
+  cols: { display: 'flex', gap: 10, alignItems: 'stretch' },
+  leftCol: { flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 4 },
+  rightCol: {
+    flex: '0 0 160px', display: 'flex', flexDirection: 'column', gap: 6,
+    borderLeft: '1px solid #313244', paddingLeft: 10,
+  },
+  footRow: {
+    marginTop: 4, display: 'flex', alignItems: 'center',
+    justifyContent: 'space-between', gap: 8,
+  },
+  limitsToggle: {
+    background: 'transparent', color: '#a6adc8', border: '1px solid #45475a',
+    borderRadius: 5, padding: '2px 8px', fontSize: 10.5, cursor: 'pointer',
+    flexShrink: 0, marginLeft: 'auto',
   },
   popTitle: { fontSize: 10.5, color: '#a6adc8', paddingBottom: 4 },
   head: { color: '#6c7086', fontSize: 9.5, textTransform: 'uppercase', letterSpacing: 0.5 },
@@ -239,13 +270,10 @@ const S: Record<string, React.CSSProperties> = {
   wmem: { width: 66, textAlign: 'right', color: '#a6adc8', flexShrink: 0 },
   wtasks: { width: 40, textAlign: 'right', color: '#89b4fa', flexShrink: 0 },
   cfgTitle: {
-    marginTop: 6, paddingTop: 6, borderTop: '1px solid #313244',
     fontSize: 9.5, color: '#6c7086', textTransform: 'uppercase', letterSpacing: 0.5,
   },
-  cfgRow: {
-    display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8,
-  },
-  cfgLbl: { fontSize: 10.5, color: '#a6adc8' },
+  cfgRow: { display: 'flex', flexDirection: 'column', gap: 2 },
+  cfgLbl: { fontSize: 10, color: '#a6adc8', whiteSpace: 'nowrap' },
   apply: {
     marginTop: 2, background: '#313244', color: '#cdd6f4',
     border: '1px solid #45475a', borderRadius: 5, padding: '4px 8px',
