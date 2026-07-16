@@ -173,21 +173,30 @@ def _fit_pattern_strain_full(g_meas, g_ref, *, tol, min_matches=DEFAULT_MIN_MATC
         return None
 
     from scipy.spatial import cKDTree
-    # Centre both sets: a centrosymmetric ({g, −g}) peak set's centroid IS the
-    # diffraction-pattern-centre offset, so removing it makes the ±g match robust
-    # to a badly-centred pattern (the −g=g point). The affine translation below
-    # then mops up any residual from missing reflections.
-    g_meas = g_meas - g_meas.mean(axis=0)
-    g_ref = g_ref - g_ref.mean(axis=0)
-
-    # Friedel: a reference reflection may show up at +g OR −g.
-    ref_aug = np.vstack([g_ref, -g_ref])                       # (2M, 2)
-    src_idx = np.concatenate([np.arange(len(g_ref))] * 2)      # back to ref id
-    # Match each MEASURED peak to its nearest augmented reference within tol.
-    d, idx = cKDTree(ref_aug).query(g_meas, distance_upper_bound=tol)
-    ok = np.isfinite(d)
+    # TWO candidate alignments; the one matching MORE spots wins (per pixel):
+    #   raw      — trust the pipeline's pattern centre (kxy are centre-relative).
+    #              Essential for ASYMMETRIC detections (missing Friedel partners,
+    #              e.g. faint precipitate patterns): their centroid is NOT the
+    #              centre — the bias reaches ~|g|/3 > tol, so the old
+    #              centroid-only alignment matched NOTHING and a frame with six
+    #              good spots read as a failed fit.
+    #   centroid — remove each set's mean (a CENTROSYMMETRIC set's centroid IS
+    #              the centre offset): robust to a badly-centred pattern.
+    # The affine translation term mops up the residual either way; strict '>'
+    # keeps the centroid behaviour on ties.
+    src_idx = np.concatenate([np.arange(len(g_ref))] * 2)      # aug → ref id
+    cands = []
+    for centre in (False, True):
+        gm = g_meas - (g_meas.mean(axis=0) if centre else 0.0)
+        gr = g_ref - (g_ref.mean(axis=0) if centre else 0.0)
+        ref_aug = np.vstack([gr, -gr])                         # (2M, 2) Friedel
+        d, idx = cKDTree(ref_aug).query(gm, distance_upper_bound=tol)
+        ok = np.isfinite(d)
+        cands.append((int(ok.sum()), gm, ref_aug, idx, ok))
+    n_raw, n_cen = cands[0][0], cands[1][0]
+    _, gm, ref_aug, idx, ok = cands[0] if n_raw > n_cen else cands[1]
     G_ref = ref_aug[idx[ok]]                                   # (K, 2)
-    G_meas = g_meas[ok]                                        # (K, 2)
+    G_meas = gm[ok]                                            # (K, 2)
     ref_ids = src_idx[idx[ok]]
 
     sol = None
@@ -448,17 +457,27 @@ def _compute_strain_field_vectorized(flat_buffer, x_off, g_ref, tol, ny, nx,
     centroids = sums / cnt
     kc = kxy - centroids[pix]                                        # centred measured
 
-    g_ref = g_ref - g_ref.mean(axis=0)                              # centred reference
-    ref_aug = np.vstack([g_ref, -g_ref])                           # (2M, 2), Friedel
-    src_idx = np.concatenate([np.arange(len(g_ref))] * 2)          # back to ref id
-
-    # One KDTree match for EVERY measured vector across the whole scan.
-    d, idx = cKDTree(ref_aug).query(kc, distance_upper_bound=tol)
-    ok = np.isfinite(d)
-    pid = pix[ok]
-    Gr = ref_aug[idx[ok]]                                           # (K, 2) matched ref
-    Gm = kc[ok]                                                     # (K, 2) measured
-    rid = src_idx[idx[ok]]                                          # ref id per match
+    src_idx = np.concatenate([np.arange(len(g_ref))] * 2)          # aug → ref id
+    # TWO candidate alignments (see _fit_pattern_strain_full): raw (asymmetric
+    # detections — the centroid is biased) vs centroid-removed (badly-centred
+    # patterns). One KDTree match each for EVERY vector across the whole scan;
+    # each pixel keeps whichever alignment matched MORE of its spots (strict '>'
+    # keeps the centroid behaviour on ties — identical rule to the loop path).
+    ref_aug_raw = np.vstack([g_ref, -g_ref])
+    g_ref_cen = g_ref - g_ref.mean(axis=0)
+    ref_aug_cen = np.vstack([g_ref_cen, -g_ref_cen])
+    d0, idx0 = cKDTree(ref_aug_raw).query(kxy, distance_upper_bound=tol)
+    d1, idx1 = cKDTree(ref_aug_cen).query(kc, distance_upper_bound=tol)
+    ok0, ok1 = np.isfinite(d0), np.isfinite(d1)
+    n0 = np.zeros(P, np.int64); np.add.at(n0, pix[ok0], 1)
+    n1 = np.zeros(P, np.int64); np.add.at(n1, pix[ok1], 1)
+    use_raw = n0 > n1                                               # per pixel
+    take0 = ok0 & use_raw[pix]
+    take1 = ok1 & ~use_raw[pix]
+    pid = np.concatenate([pix[take0], pix[take1]])
+    Gr = np.vstack([ref_aug_raw[idx0[take0]], ref_aug_cen[idx1[take1]]])
+    Gm = np.vstack([kxy[take0], kc[take1]])
+    rid = np.concatenate([src_idx[idx0[take0]], src_idx[idx1[take1]]])
 
     min_m = max(2, int(min_matches))
 
