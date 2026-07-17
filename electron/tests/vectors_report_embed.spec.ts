@@ -3,15 +3,17 @@
  * HTML report, driven in a REAL browser (plain chromium over file://; the page
  * must work with no app, no backend, no network — that's its whole point).
  *
- * The explorer is built from real anyplotlib figures: a circle/annulus widget
- * on the k-space density selects the detector, a rectangle widget on the
- * virtual image selects a real-space region that filters the k view. The
- * fixture (spyde/tests/gen_vectors_embed.py) plants cluster A at k=(-0.5,0)
- * only in the LEFT nav half and cluster B at k=(+0.5,0) only in the RIGHT
- * half — moving the detector between clusters must flip which half lights up.
- * Geometry is driven through window.__vx (the same code path the widget
- * events call), plus one REAL pointer drag on the anyplotlib widget as a
- * smoke test that events actually flow.
+ * The explorer mirrors the MDI vector view: ONE anyplotlib figure with TWO
+ * panels — a NAVIGATOR (count map) with a draggable CROSSHAIR (pointer mode) /
+ * RECTANGLE (integrate mode), and a DIFFRACTION-PATTERN panel that shows the
+ * pointed position's vectors as intensity DISKS (rendered client-side from the
+ * embedded POINTS — no frames are shipped). The fixture
+ * (spyde/tests/gen_vectors_embed.py) plants cluster A at k=(-0.5,0) only in the
+ * LEFT nav half and cluster B at k=(+0.5,0) only in the RIGHT half. Because
+ * kx ↔ DP column, a position in the left nav half renders disks in the LEFT of
+ * the DP; a right-half position renders in the RIGHT. Geometry is driven through
+ * window.__vx (the same code path the widget events call), plus one REAL pointer
+ * drag on the anyplotlib crosshair as a smoke test that events actually flow.
  */
 import { test, expect, chromium, Browser, Page } from '@playwright/test'
 import { execFileSync } from 'child_process'
@@ -45,90 +47,83 @@ test.afterAll(async () => { await browser?.close() })
 
 const stats = () => page.evaluate(() => (window as any).__vx.stats)
 
-// Fixture geometry: k extent [-1,1] over a 256-bin density image →
-// k=-0.5 is px 63.75, k=+0.5 is px 191.25; r=0.2 in k = 25.5 px.
-const PX = (k: number) => ((k + 1) / 2) * 255
+// The DP overlay canvas: brightest per-pixel mean over the figure's canvases
+// (the DP disks push here — a broken pixel push would leave it dark).
+const dpBrightness = () => page.evaluate(() => {
+  let best = 0
+  for (const c of document.querySelectorAll('#vx-fig canvas')) {
+    const ctx = (c as HTMLCanvasElement).getContext('2d')
+    if (!ctx || !(c as HTMLCanvasElement).width) continue
+    const d = ctx.getImageData(0, 0, (c as HTMLCanvasElement).width,
+                               (c as HTMLCanvasElement).height).data
+    let sum = 0
+    for (let i = 0; i < d.length; i += 4) sum += d[i]
+    best = Math.max(best, sum / (d.length / 4))
+  }
+  return best
+})
 
-test('detector position selects which nav half lights up (disk + annulus + region)', async () => {
-  // Both anyplotlib figures mounted (each renders at least one canvas).
-  expect(await page.locator('#vx-figk canvas').count()).toBeGreaterThan(0)
-  expect(await page.locator('#vx-figvi canvas').count()).toBeGreaterThan(0)
+test('pointer + integrate render the DP from embedded points', async () => {
+  // ONE figure, TWO panels → several canvases mounted.
+  expect(await page.locator('#vx-fig canvas').count()).toBeGreaterThan(0)
 
-  // Disk on cluster A → LEFT half bright.
-  await page.evaluate(({ cx, cy, r }) =>
-    (window as any).__vx.setDetector({ cx, cy, r }),
-    { cx: PX(-0.5), cy: PX(0), r: 25.5 })
-  await expect.poll(async () => (await stats()).leftMean).toBeGreaterThan(50)
+  // POINTER on cluster A (left nav half) → disks in the LEFT of the DP.
+  await page.evaluate(() => (window as any).__vx.setPointer({ ix: 1, iy: 0 }))
+  await expect.poll(async () => (await stats()).hit).toBe(3)
   let s = await stats()
-  expect(s.leftMean).toBeGreaterThan(10 * Math.max(1, s.rightMean))
-  expect(s.hit).toBeGreaterThan(0)
-  // The RENDERED canvas must light up too — the stats mirror the compute,
-  // but a broken pixel push once left the canvas black while stats passed.
-  await expect.poll(async () => page.evaluate(() => {
-    let best = 0
-    for (const c of document.querySelectorAll('#vx-figvi canvas')) {
-      const ctx = (c as HTMLCanvasElement).getContext('2d')
-      if (!ctx || !(c as HTMLCanvasElement).width) continue
-      const d = ctx.getImageData(0, 0, (c as HTMLCanvasElement).width,
-                                 (c as HTMLCanvasElement).height).data
-      let sum = 0
-      for (let i = 0; i < d.length; i += 4) sum += d[i]
-      best = Math.max(best, sum / (d.length / 4))
-    }
-    return best
-  }), { timeout: 5_000, message: 'VI canvas never painted' }).toBeGreaterThan(15)
-  await expect(page.locator('#vx-readout')).toContainText('of 768 vectors')
-  await page.screenshot({ path: 'vectors_embed_shots/01-left-cluster.png' })
+  expect(s.leftMean).toBeGreaterThan(5 * Math.max(0.001, s.rightMean))
+  // The DP canvas must actually light up (stats mirror the compute, but a broken
+  // pixel push once left the canvas black while stats passed).
+  await expect.poll(dpBrightness, { timeout: 5_000 }).toBeGreaterThan(5)
+  await expect(page.locator('#vx-readout')).toContainText('3 vectors')
+  await page.screenshot({ path: 'vectors_embed_shots/01-pointer-left.png' })
 
-  // Disk on cluster B → flips to the RIGHT half.
-  await page.evaluate(({ cx, cy, r }) =>
-    (window as any).__vx.setDetector({ cx, cy, r }),
-    { cx: PX(0.5), cy: PX(0), r: 25.5 })
-  await expect.poll(async () => (await stats()).rightMean).toBeGreaterThan(50)
-  s = await stats()
-  expect(s.rightMean).toBeGreaterThan(10 * Math.max(1, s.leftMean))
-
-  // ANNULUS with the ring straddling cluster B stays bright; a ring whose
-  // inner radius EXCLUDES the cluster goes dark (r in px: cluster ±0.02 k).
-  await page.locator('input[name=vx-shape][value=annular]').check()
-  await page.evaluate(({ cx, cy }) =>
-    (window as any).__vx.setDetector({ cx, cy, rIn: 2, rOut: 26 }),
-    { cx: PX(0.5), cy: PX(0) })
-  await expect.poll(async () => (await stats()).rightMean).toBeGreaterThan(50)
-  await page.evaluate(({ cx, cy }) =>
-    (window as any).__vx.setDetector({ cx, cy, rIn: 15, rOut: 26 }),
-    { cx: PX(0.5), cy: PX(0) })
-  await expect.poll(async () => (await stats()).hit).toBe(0)
-  await page.screenshot({ path: 'vectors_embed_shots/02-annulus.png' })
-
-  // REAL-SPACE region filter: back to a disk on cluster A, then restrict the
-  // region to the RIGHT nav half — cluster A vanishes from the k view, so the
-  // detector catches nothing.
-  await page.locator('input[name=vx-shape][value=circle]').check()
-  await page.evaluate(({ cx, cy, r }) =>
-    (window as any).__vx.setDetector({ cx, cy, r }),
-    { cx: PX(-0.5), cy: PX(0), r: 25.5 })
-  await expect.poll(async () => (await stats()).hit).toBeGreaterThan(0)
+  // POINTER on cluster B (right nav half) → flips to the RIGHT of the DP.
   await page.evaluate((nx) =>
-    (window as any).__vx.setRegion({ x: nx / 2, y: 0, w: nx / 2, h: 16 }), 16)
-  // The VI itself is detector-driven (unchanged), but the readout notes the
-  // region filter and the k view now only holds cluster B.
-  await expect(page.locator('#vx-readout')).toContainText('region-filtered')
-  await page.screenshot({ path: 'vectors_embed_shots/03-region.png' })
+    (window as any).__vx.setPointer({ ix: nx - 2, iy: 0 }), 16)
+  await expect.poll(async () => (await stats()).rightMean)
+    .toBeGreaterThan(0)
+  s = await stats()
+  expect(s.rightMean).toBeGreaterThan(5 * Math.max(0.001, s.leftMean))
+  await page.screenshot({ path: 'vectors_embed_shots/02-pointer-right.png' })
 
-  // Smoke: a REAL pointer drag on the anyplotlib circle widget flows through
-  // onEvent into the glue (det changes from where we left it). Park a big
-  // disk at the image centre so the widget sits under the canvas centre.
-  await page.locator('input[name=vx-shape][value=circle]').check()
+  // INTEGRATE the whole LEFT nav half (8 x 16 positions x 3 vectors = 384).
+  await page.evaluate(() => (window as any).__vx.setMode(true))
   await page.evaluate(() =>
-    (window as any).__vx.setDetector({ cx: 127.5, cy: 127.5, r: 40 }))
-  const before = await page.evaluate(() => ({ ...(window as any).__vx.det }))
-  const box = (await page.locator('#vx-figk canvas').first().boundingBox())!
-  const startX = box.x + box.width * 0.5, startY = box.y + box.height * 0.5
-  await page.mouse.move(startX, startY)
+    (window as any).__vx.setRegion({ x: 0, y: 0, w: 8, h: 16 }))
+  await expect.poll(async () => (await stats()).hit).toBe(384)
+  await expect(page.locator('#vx-readout')).toContainText('384 vectors summed')
+  // Integrating many positions is much brighter than a single pointer frame.
+  expect((await stats()).max).toBeGreaterThan(1000)
+  await page.screenshot({ path: 'vectors_embed_shots/03-integrate.png' })
+
+  // A 1x1 integrate region equals the pointer at that position (2x2=12 here).
+  await page.evaluate(() =>
+    (window as any).__vx.setRegion({ x: 0, y: 0, w: 2, h: 2 }))
+  await expect.poll(async () => (await stats()).hit).toBe(12)
+
+  // Smoke: a REAL pointer drag on the anyplotlib crosshair flows through onEvent
+  // into the glue. Back to pointer mode, then grab the crosshair at its actual
+  // SCREEN position (computed from the nav panel fit rect) so the drag lands on
+  // the handle, not near it.
+  await page.evaluate(() => (window as any).__vx.setMode(false))
+  const before = await page.evaluate(() => ({ ...(window as any).__vx.cross }))
+  const crossPos = await page.evaluate(() => {
+    const h = (window as any).__vx._h()
+    const nav = h.navPanel
+    const pj = JSON.parse(h.H.get(h.navKey))
+    const w = (pj.overlay_widgets || []).find((x: any) => x.type === 'crosshair')
+    const host = nav.plotCanvas.getBoundingClientRect()
+    const scale = Math.min(nav.imgW / pj.image_width, nav.imgH / pj.image_height)
+    const offX = (nav.imgW - pj.image_width * scale) / 2
+    const offY = (nav.imgH - pj.image_height * scale) / 2
+    return { sx: host.x + offX + (w.cx + 0.5) * scale,
+             sy: host.y + offY + (w.cy + 0.5) * scale }
+  })
+  await page.mouse.move(crossPos.sx, crossPos.sy)
   await page.mouse.down()
-  await page.mouse.move(startX + 30, startY + 20, { steps: 5 })
+  await page.mouse.move(crossPos.sx + 20, crossPos.sy + 15, { steps: 5 })
   await page.mouse.up()
-  const after = await page.evaluate(() => ({ ...(window as any).__vx.det }))
-  expect(after.cx !== before.cx || after.cy !== before.cy).toBe(true)
+  const after = await page.evaluate(() => ({ ...(window as any).__vx.cross }))
+  expect(after.ix !== before.ix || after.iy !== before.iy).toBe(true)
 })

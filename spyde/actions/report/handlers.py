@@ -321,9 +321,64 @@ class ReportManager:
 
     # ── figure cell build / rebuild ────────────────────────────────────────────
 
+    def _vectors_explorer_for_cell(self, cell: Cell) -> "tuple[str, str] | None":
+        """For a VIEWER-vectors figure cell (its resolved source tree carries
+        ``diffraction_vectors`` and ``spec.vectors_mode != "image"``), build the
+        self-contained interactive vectors explorer — the SAME page the HTML
+        export emits — and return ``(fig_id, html)``, else None.
+
+        This is Approach A: the sidebar cell hosts the EXACT export explorer
+        (navigator + DP, crosshair/rectangle, pointer/integrate) as its figure
+        iframe. It renders client-side (overlay-canvas disk splat) and is fully
+        self-contained (inlines the anyplotlib ESM + the packed vectors blob), so
+        the existing figure-emit path (``host:"report"`` → main writes
+        ``spyde_fig_<figId>.html`` → served over ``spyde-fig://`` → mounted by
+        SeamlessFigureFrame) shows it with NO renderer changes and guaranteed
+        export/sidebar parity. Over the embed cap / empty / unavailable →
+        None, and ``build_figure_window`` falls back to the anyplotlib snapshot.
+
+        The fig_id is a fresh uuid per rebuild (there is no live anyplotlib
+        figure to ``_electron.register``); a unique id per build is exactly what
+        SeamlessFigureFrame keys its seamless swap on, and the explorer receives
+        no state-push replay (self-contained), so an unregistered id is safe."""
+        spec = cell.spec
+        if spec is None:
+            return None
+        # Drop-time choice: "image" pins the static snapshot even when the tree
+        # carries vectors. Default "" and "viewer" both embed the explorer
+        # (mirrors export_html._render_body's `!= "image"` gate exactly).
+        if str(getattr(spec, "vectors_mode", "") or "") == "image":
+            return None
+        # A scene3d cell is never a vectors-explorer candidate.
+        if _is_scene3d_cell(cell):
+            return None
+        try:
+            from spyde.actions.report.vectors_embed import (
+                vectors_explorer_html, vectors_for_cell,
+            )
+            vecs = vectors_for_cell(self.session, cell)
+            if vecs is None:
+                return None
+            html = vectors_explorer_html(vecs, caption=cell.caption or "")
+            if html is None:            # over the embed cap / empty dataset
+                return None
+        except Exception as e:
+            log.debug("[report] sidebar vectors explorer build failed "
+                      "(cell %s): %s", cell.id, e)
+            return None
+        import uuid
+        return f"vx_{cell.id}_{uuid.uuid4().hex[:8]}", html
+
     def build_figure_window(self, cell: Cell) -> None:
         """Build (or rebuild) the live figure window for a figure cell and emit
-        it through the bare-figure path with ``host:"report"`` + ``cell_id``."""
+        it through the bare-figure path with ``host:"report"`` + ``cell_id``.
+
+        A VIEWER-vectors cell (source tree carries diffraction vectors and the
+        drop chose the interactive viewer, or defaulted to it) is emitted as the
+        LIVE 2-panel vectors explorer instead of the plain anyplotlib snapshot —
+        the same page the interactive HTML export embeds (see
+        :meth:`_vectors_explorer_for_cell`). Over the embed cap / no vectors it
+        falls through to the anyplotlib figure below."""
         snap_map = self.snapshot_map(cell.id)
         if not snap_map or cell.spec is None:
             # Nothing to build — but STILL tear down any prior window/controller for
@@ -341,6 +396,14 @@ class ReportManager:
         prev_wid = self._window_by_cell.get(cell.id)
         if prev_wid is not None:
             self._forget(prev_wid)
+        # VIEWER-vectors cell → host the interactive explorer (Approach A). Not in
+        # EDIT mode (the annotation editor targets the anyplotlib figure, so a cell
+        # being edited falls back to the plain snapshot figure it can annotate).
+        if cell.id not in self._editing:
+            explorer = self._vectors_explorer_for_cell(cell)
+            if explorer is not None:
+                self._emit_vectors_explorer(cell, explorer)
+                return
         interactive = cell.id in self._editing
         try:
             fig, fig_id, html = build_cell_figure(cell.spec, snap_map,
@@ -379,6 +442,31 @@ class ReportManager:
         if reg is not None:
             reg(int(wid), ctrl)
         self._controllers[int(wid)] = ctrl
+        self._window_by_cell[cell.id] = int(wid)
+        self._offline.discard(cell.id)
+        ipc.emit({
+            "type": "figure", "fig_id": fig_id, "window_id": int(wid),
+            "html": html, "title": cell.caption or "Figure",
+            "is_navigator": False,
+            "host": "report", "cell_id": cell.id,
+        })
+
+    def _emit_vectors_explorer(self, cell: Cell, explorer: "tuple[str, str]") -> None:
+        """Emit a VIEWER-vectors cell's self-contained explorer as its figure
+        iframe through the SAME ``host:"report"`` figure path
+        (``build_figure_window`` picked it — see :meth:`_vectors_explorer_for_cell`).
+
+        Unlike the anyplotlib branch there is NO live backend figure to
+        ``keep_alive`` and NO ``ReportFigureController`` to register — the explorer
+        is fully client-side (self-contained page; disks splatted in the iframe),
+        so nothing on the backend drives it. We still allocate a window id and map
+        it into ``_window_by_cell`` so a later rebuild / refresh / cell-close tears
+        the cell's window down through the normal ``_forget`` path. Edit-mode
+        annotation wiring is cleared (a vectors cell isn't annotation-edited)."""
+        fig_id, html = explorer
+        self._edit_wiring.pop(cell.id, None)
+        self._ann_widgets.pop(cell.id, None)
+        wid = self.session.next_window_id()
         self._window_by_cell[cell.id] = int(wid)
         self._offline.discard(cell.id)
         ipc.emit({
