@@ -31,7 +31,8 @@ from spyde.actions.report.figure_builder import (
 )
 from spyde.actions.report.model import (
     Cell, FigureSpec, LayerSpec, PanelSpec, ReportDoc, SignalRef,
-    bake_fallback_png, new_cell_id, read_report, write_report,
+    bake_fallback_png, bake_line_fallback_png, new_cell_id, read_report,
+    write_report,
 )
 
 log = logging.getLogger(__name__)
@@ -41,6 +42,47 @@ _SNAPSHOT_TIMEOUT_S = 3.0
 # Cap the inline offline-fallback PNG (data URL in report_state) so a long
 # offline report doesn't balloon the state message.
 _OFFLINE_PNG_MAX_EDGE = 640
+# The pseudo layer ids a scene3d panel's snapshots are keyed under:
+# (panel_id, "xyz") float32 (M,3) sphere points, (panel_id, "rgb") uint8 (M,3)
+# IPF colours. NOT LayerSpec ids — a scene3d panel has no image layers.
+_SCENE3D_SNAPSHOT_KEYS = ("xyz", "rgb")
+
+
+def _is_scene3d_panel(panel) -> bool:
+    return str(getattr(panel, "kind", "")) == "scene3d"
+
+
+def _is_scene3d_cell(cell) -> bool:
+    """True when *cell* is a figure cell whose spec contains a scene3d panel
+    (the matplotlib Agg bake CANNOT render these — fallbacks must reuse a
+    harvested/baked PNG or skip gracefully)."""
+    spec = getattr(cell, "spec", None)
+    return spec is not None and any(_is_scene3d_panel(p) for p in spec.panels)
+
+
+def _is_line_panel(panel) -> bool:
+    return str(getattr(panel, "kind", "")) == "line"
+
+
+def _bake_primary_snapshot(cell, arr, *, max_edge: int) -> "bytes | None":
+    """Bake a fallback PNG for *cell*'s primary-panel snapshot *arr*, routing
+    to the LINE-panel Agg renderer (a real ``ax.plot``) when the cell's
+    primary panel is ``kind="line"``, else the image heatmap renderer. Shared
+    by ``_offline_png`` and ``assemble_assets`` so both bake paths agree."""
+    panel = cell.spec.panels[0] if (cell.spec and cell.spec.panels) else None
+    if panel is not None and _is_line_panel(panel):
+        layer = panel.layers[0] if panel.layers else None
+        x_axis = (panel.axes or {}).get("x_axis") if panel.axes else None
+        x_units = str((panel.axes or {}).get("units") or "") if panel.axes else ""
+        return bake_line_fallback_png(
+            arr, x_axis=x_axis,
+            color=(layer.color if layer and layer.color else "#4fc3f7"),
+            linewidth=(layer.linewidth if layer and layer.linewidth else 1.5),
+            label=(layer.label if layer else None), x_units=x_units)
+    layer = cell.spec.primary_layer if cell.spec else None
+    cmap = layer.cmap if layer else "viridis"
+    clim = layer.clim if layer else None
+    return bake_fallback_png(arr, cmap=cmap, clim=clim, max_edge=max_edge)
 
 
 # ── the per-session report manager ────────────────────────────────────────────
@@ -104,7 +146,13 @@ class ReportManager:
 
     def primary_snapshot(self, cell_id: str):
         """The FIRST panel's FIRST layer snapshot for a cell — the offline-bake +
-        legacy single-image path. None if the cell has no snapshots."""
+        legacy single-image path. None if the cell has no snapshots.
+
+        A scene3d panel's snapshots live under the pseudo layer ids ``"xyz"`` /
+        ``"rgb"`` (point-cloud arrays, not an image) — those are NEVER a valid
+        primary IMAGE snapshot, so both the spec walk (its layer ids don't
+        collide) and the any-array fallback skip them: baking an (M, 3) point
+        array through matplotlib would produce garbage, not a figure."""
         cell = self.doc.cell_by_id(cell_id) if self.doc else None
         if cell is not None and cell.spec is not None:
             for panel in cell.spec.panels:
@@ -113,9 +161,11 @@ class ReportManager:
                         self._layer_key(panel.id, layer.id))
                     if arr is not None:
                         return arr
-        # Fallback: any array in the map.
+        # Fallback: any IMAGE array in the map (scene3d point clouds excluded).
         m = self._snapshots.get(cell_id, {})
-        for arr in m.values():
+        for key, arr in m.items():
+            if key[1] in _SCENE3D_SNAPSHOT_KEYS:
+                continue
             return arr
         return None
 
@@ -169,12 +219,40 @@ class ReportManager:
 
     # ── state emission ─────────────────────────────────────────────────────────
 
+    def _panel_nav_dims(self, panel, cache: dict) -> int:
+        """Navigation dimensionality of a panel's layer-0 source signal (0 when
+        unresolvable) — an EPHEMERAL emit-time field the renderer uses to gate
+        the fresh-slice callout buttons. Stamped onto the SHIPPED panel dicts
+        only; never part of PanelSpec/to_dict/YAML. *cache* is per-emit, keyed
+        by the SignalRef identity, so one emit resolves each source once."""
+        # A scene3d panel has no image layers to slice — callouts never apply,
+        # so skip the resolve entirely (cheap, and keeps the buttons hidden).
+        if _is_scene3d_panel(panel):
+            return 0
+        if not panel.layers or panel.layers[0].source is None:
+            return 0
+        ref = panel.layers[0].source
+        key = id(ref)
+        if key in cache:
+            return cache[key]
+        dims = 0
+        try:
+            p = ref.resolve(self.session)
+            if p is not None:
+                dims = int(p.plot_state.current_signal
+                           .axes_manager.navigation_dimension)
+        except Exception as e:
+            log.debug("panel nav_dims resolve failed: %s", e)
+        cache[key] = dims
+        return dims
+
     def state(self) -> dict:
         """The authoritative ``report_state`` message body."""
         if self.doc is None:
             return {"open": False, "path": None, "title": "", "template": False,
                     "dirty": False, "cells": []}
         cells = []
+        nav_dims_cache: dict = {}
         for c in self.doc.cells:
             entry = {
                 "id": c.id,
@@ -190,6 +268,20 @@ class ReportManager:
             # annotations. It carries NO image bytes — only the YAML-shaped structure.
             if c.cell_type == "figure" and c.spec is not None:
                 entry["figure"] = c.spec.to_dict()
+                # Stamp nav_dims onto the SHIPPED panel dicts (ephemeral —
+                # to_dict() built fresh dicts, so the spec is never touched).
+                for pd, ps in zip(entry["figure"]["panels"], c.spec.panels):
+                    pd["nav_dims"] = self._panel_nav_dims(ps, nav_dims_cache)
+                # While the cell is in EDIT MODE, also ship the live widget-id →
+                # annotation mapping so the renderer can resolve a clicked edit
+                # widget (awi_event widget_id) to its spec annotation and open
+                # the floating style popover. Ephemeral — never persisted.
+                if c.id in self._editing:
+                    amap = self._ann_widgets.get(c.id) or {}
+                    entry["ann_widgets"] = {
+                        str(w.id): {"panel_id": pid, "index": int(idx)}
+                        for (pid, idx), w in amap.items()
+                    }
             # For an OFFLINE figure cell only, ship the baked PNG as a data URL so
             # the renderer (which has no zip access) can still show the snapshot.
             if entry["data_offline"]:
@@ -220,11 +312,9 @@ class ReportManager:
         if arr is not None:
             try:
                 cell = self.doc.cell_by_id(cell_id) if self.doc else None
-                layer = cell.spec.primary_layer if (cell and cell.spec) else None
-                cmap = layer.cmap if layer else "viridis"
-                clim = layer.clim if layer else None
-                return bake_fallback_png(arr, cmap=cmap, clim=clim,
-                                         max_edge=_OFFLINE_PNG_MAX_EDGE)
+                if cell is not None and cell.spec is not None:
+                    return _bake_primary_snapshot(
+                        cell, arr, max_edge=_OFFLINE_PNG_MAX_EDGE)
             except Exception as e:
                 log.debug("offline png bake failed: %s", e)
         return None
@@ -264,6 +354,18 @@ class ReportManager:
         # a stale build's handlers/widgets are dropped). Non-interactive → empty.
         wiring = list(getattr(fig, "_report_annotation_wiring", None) or [])
         self._wire_annotation_drag(cell.id, wiring)
+        # Fresh-slice callout markers (edit mode): pointer_up → re-slice the
+        # inset at the dropped nav position. Appended AFTER _wire_annotation_drag
+        # (which replaces the keep-alive list wholesale) so both survive.
+        callout_wiring = list(getattr(fig, "_report_callout_wiring", None) or [])
+        if callout_wiring:
+            self._wire_callout_drag(cell.id, callout_wiring)
+        # Zoom-region callout rectangles (edit mode): pointer_up → re-crop the
+        # base panel's OWN snapshot at the dragged/resized rect. Appended to the
+        # same _edit_wiring keep-alive list (after callout drag, same reasoning).
+        zoom_wiring = list(getattr(fig, "_report_zoom_wiring", None) or [])
+        if zoom_wiring:
+            self._wire_zoom_region_drag(cell.id, zoom_wiring)
         # In edit mode, also wire the SELECTION handlers: a genuine click on a
         # panel selects it; a figure-background click deselects (→ figure-level);
         # a figure-marker drag persists into spec.annotations. Appended to the same
@@ -314,13 +416,55 @@ class ReportManager:
             self._edit_wiring.pop(cell_id, None)
             self._ann_widgets.pop(cell_id, None)
 
+    def _wire_callout_drag(self, cell_id: str, wiring: list) -> None:
+        """Attach a ``pointer_up`` re-slice handler to each fresh-slice callout
+        marker widget in *wiring* and APPEND the (widget, handler) pairs to this
+        cell's keep-alive list (``_wire_annotation_drag`` has already replaced
+        it wholesale for this rebuild, so appending here never mixes stale
+        builds)."""
+        stored = self._edit_wiring.get(cell_id) or []
+        for (widget, panel_id, inset_index, panel_spec) in wiring:
+            handler = _make_callout_drag_handler(self, cell_id, panel_spec,
+                                                 inset_index)
+            try:
+                widget.add_event_handler(handler, "pointer_up")
+            except Exception as e:
+                log.debug("wiring callout drag handler failed: %s", e)
+                continue
+            stored.append((widget, handler))
+        if stored:
+            self._edit_wiring[cell_id] = stored
+
+    def _wire_zoom_region_drag(self, cell_id: str, wiring: list) -> None:
+        """Attach a ``pointer_up`` re-crop handler to each zoom-region
+        rectangle widget in *wiring* (``[(widget, base_panel_id,
+        inset_index)]`` — see ``figure_builder._apply_insets``) and APPEND the
+        (widget, handler) pairs to this cell's keep-alive list (mirrors
+        ``_wire_callout_drag``; runs after it so both survive a rebuild)."""
+        stored = self._edit_wiring.get(cell_id) or []
+        for (widget, base_panel_id, inset_index) in wiring:
+            handler = _make_zoom_region_drag_handler(
+                self, cell_id, base_panel_id, inset_index)
+            try:
+                widget.add_event_handler(handler, "pointer_up")
+            except Exception as e:
+                log.debug("wiring zoom region drag handler failed: %s", e)
+                continue
+            stored.append((widget, handler))
+        if stored:
+            self._edit_wiring[cell_id] = stored
+
     def _wire_selection_handlers(self, cell_id: str, fig) -> None:
         """Wire the EDIT-MODE selection handlers onto *fig* (interactive builds
         only). Registers, per panel base plot, a module-level-closure
-        ``pointer_down`` handler → ``select_panel(cell_id, spec_panel_id)``; and a
+        ``pointer_down`` handler → ``select_panel(cell_id, spec_panel_id)``; a
         FIGURE-level ``pointer_down``/``pointer_up`` handler that routes a
         ``figure_background`` click → deselect (figure-level) and a
-        ``figure_marker`` drop → persist the moved marker into ``spec.annotations``.
+        ``figure_marker`` drop → persist the moved marker into ``spec.annotations``;
+        and a FIGURE-level ``inset_geometry_change`` handler that persists a
+        dragged/resized inset's anchor + w_frac/h_frac (see
+        :func:`_make_inset_geometry_handler` — anyplotlib has already applied the
+        geometry to its own InsetAxes, so this only writes the spec back).
 
         All handlers are appended to this cell's ``_edit_wiring`` keep-alive list
         (this runs AFTER ``_wire_annotation_drag`` set it) so none are GC'd; the
@@ -354,6 +498,14 @@ class ReportManager:
             stored.append((fig, fig_handler))
         except Exception as e:
             log.debug("wiring figure-level edit handler failed: %s", e)
+
+        # One figure-level handler for inset drag/resize persistence.
+        inset_geom_handler = _make_inset_geometry_handler(self, cell_id)
+        try:
+            fig.add_event_handler(inset_geom_handler, "inset_geometry_change")
+            stored.append((fig, inset_geom_handler))
+        except Exception as e:
+            log.debug("wiring inset-geometry handler failed: %s", e)
 
         self._edit_wiring[cell_id] = stored
         # Re-apply the current selection so the outline persists across rebuilds.
@@ -454,17 +606,24 @@ class ReportManager:
             # write_report's ``if png:`` guard would silently skip the asset, leaving
             # a dangling image ref in report.md.
             if not png:
+                # The Agg bake cannot render a 3-D scene: primary_snapshot skips
+                # the scene3d point-cloud arrays, so a scene3d cell falls straight
+                # through to the last harvested/loaded PNG (below) — or is skipped
+                # gracefully (no asset) rather than baking garbage / crashing.
                 arr = self.primary_snapshot(c.id)
-                if arr is not None:
+                if arr is not None and c.spec is not None:
                     try:
-                        layer = c.spec.primary_layer if c.spec else None
-                        cmap = layer.cmap if layer else "viridis"
-                        clim = layer.clim if layer else None
-                        png = bake_fallback_png(arr, cmap=cmap, clim=clim)
+                        png = _bake_primary_snapshot(c, arr, max_edge=1200)
                     except Exception as e:
                         log.debug("asset bake failed for cell %s: %s", c.id, e)
                 if not png:
                     png = self._baked.get(c.id)
+            elif _is_scene3d_cell(c):
+                # Keep the renderer-harvested 3-D pixels as this cell's baked
+                # fallback: a later HEADLESS save (no renderer reply) has no way
+                # to re-render the scene, so "the last harvested PNG" is the
+                # best truthful asset available.
+                self._baked[c.id] = png
             if png is not None:
                 assets[c.id] = png
         return assets
@@ -541,6 +700,164 @@ def _make_annotation_drag_handler(mgr, cell_id, panel_spec, ann_index, kind):
                       cell_id, ann_index, e)
 
     return _on_drag_end
+
+
+def _make_callout_drag_handler(mgr, cell_id, panel_spec, inset_index):
+    """A module-level closure factory (NOT a bound method — anyplotlib sets
+    ``fn._event_types`` on the handler) returning a ``pointer_up`` handler for
+    one fresh-slice callout MARKER widget on the base (navigator) panel.
+
+    On drop: the widget's ``_data`` carries the final dragged center in IMAGE
+    PIXELS, which on a navigator image ARE nav indices (index == pixel, so no
+    axes inversion is needed — anyplotlib 2-D widgets are pixel-convention).
+    Nearest index, clamped into the nav space; then the INSET panel's layer-0
+    source is resolved and re-sliced at the new position
+    (``slicing.read_frame_at`` — slice-then-compute, never the full dataset),
+    the snapshot + ``nav_indices`` + connector region are updated, and the cell
+    is REBUILT (the inset image must repaint) + state re-emitted.
+
+    Guards (no-op, no crash): cell/panel/inset must still exist; the inset must
+    carry ``nav_indices``; the source must resolve; an unchanged index skips
+    the rebuild (no iframe flash — the marker merely snaps on the next one)."""
+    def _on_marker_drop(event):
+        try:
+            from spyde.actions.report.compose import _callout_connector_region
+            from spyde.actions.report.slicing import read_frame_at
+
+            widget = getattr(event, "source", None)
+            g = getattr(widget, "_data", None) if widget is not None else None
+            if not isinstance(g, dict):
+                return
+            cell = mgr.doc.cell_by_id(cell_id) if mgr.doc else None
+            if cell is None or cell.spec is None \
+                    or panel_spec not in cell.spec.panels:
+                return
+            insets = panel_spec.insets or []
+            if not (0 <= inset_index < len(insets)):
+                return
+            inset = insets[inset_index]
+            if inset.get("nav_indices") is None:
+                return
+            inset_panel = next((p for p in cell.spec.panels
+                                if p.id == inset.get("panel")), None)
+            if inset_panel is None or not inset_panel.layers:
+                return
+            layer = inset_panel.layers[0]
+            src_plot = layer.source.resolve(mgr.session) if layer.source else None
+            if src_plot is None:
+                return
+            try:
+                am = src_plot.plot_state.current_signal.axes_manager
+                nav_shape = tuple(int(n) for n in am.navigation_shape)
+            except Exception:
+                return
+            if len(nav_shape) != 2:
+                return
+            ix = int(np.clip(round(float(g.get("cx", 0.0))), 0, nav_shape[0] - 1))
+            iy = int(np.clip(round(float(g.get("cy", 0.0))), 0, nav_shape[1] - 1))
+            if [ix, iy] == [int(v) for v in inset["nav_indices"]]:
+                return
+            frame = read_frame_at(src_plot, [ix, iy])
+            if frame is None:
+                return
+            inset["nav_indices"] = [ix, iy]
+            if inset.get("connector") is not None:
+                inset["connector"] = _callout_connector_region(panel_spec, ix, iy)
+            mgr.set_snapshot(cell_id, inset_panel.id, layer.id, frame)
+            mgr.dirty = True
+            mgr._offline.discard(cell_id)
+            mgr.build_figure_window(cell)
+            mgr.emit_state()
+        except Exception as e:
+            log.debug("callout marker drop failed (cell %s inset %s): %s",
+                      cell_id, inset_index, e)
+    return _on_marker_drop
+
+
+def _make_zoom_region_drag_handler(mgr, cell_id, base_panel_id, inset_index):
+    """A module-level closure factory (NOT a bound method — anyplotlib sets
+    ``fn._event_types`` on the handler) returning a ``pointer_up`` handler for
+    one zoom-region callout RECTANGLE widget on the base panel.
+
+    On drop: the widget's ``_data`` carries the final dragged/resized rect in
+    IMAGE PIXELS (``x, y, w, h`` — top-left + size, the anyplotlib rect-widget
+    convention). Clamp to the base image bounds, convert px → the base panel's
+    DATA coords (``coords.data_region_to_index``'s inverse —
+    ``compose._index_region_to_data``, the SAME conversion the drop-time
+    zoom-callout add used), and if the region is UNCHANGED skip everything (no
+    re-crop, no rebuild — the rect merely snaps back on the next repaint).
+    Otherwise: update the inset dict's ``zoom_region`` + ``connector.region``,
+    re-crop the BASE panel's OWN held snapshot from ``mgr._snapshots`` (never
+    any dataset — this is a pixel crop of an already-in-memory array, so it
+    can't violate the memory-safety rule), store the crop as the inset panel's
+    layer-0 snapshot, and REBUILD (the inset image must repaint) + re-emit.
+
+    Guards (no-op, no crash): cell/base panel/inset must still exist; the
+    inset must carry ``zoom_region``; the base snapshot must still resolve."""
+    def _on_rect_drop(event):
+        try:
+            from spyde.actions.report.compose import (
+                _crop_region_px, _index_region_to_data,
+            )
+
+            widget = getattr(event, "source", None)
+            g = getattr(widget, "_data", None) if widget is not None else None
+            if not isinstance(g, dict):
+                return
+            cell = mgr.doc.cell_by_id(cell_id) if mgr.doc else None
+            if cell is None or cell.spec is None:
+                return
+            base_panel = next((p for p in cell.spec.panels
+                               if p.id == base_panel_id), None)
+            if base_panel is None or not base_panel.layers:
+                return
+            insets = base_panel.insets or []
+            if not (0 <= inset_index < len(insets)):
+                return
+            inset = insets[inset_index]
+            if inset.get("zoom_region") is None:
+                return
+            base_layer = base_panel.layers[0]
+            base_arr = mgr.snapshot_map(cell_id).get(
+                (base_panel.id, base_layer.id))
+            if base_arr is None:
+                return
+            base_arr = np.asarray(base_arr)
+            H, W = base_arr.shape[0], base_arr.shape[1]
+            px = float(g.get("x", 0.0))
+            py = float(g.get("y", 0.0))
+            pw = max(1.0, float(g.get("w", 1.0)))
+            ph = max(1.0, float(g.get("h", 1.0)))
+            pw = min(pw, W)
+            ph = min(ph, H)
+            px = max(0.0, min(px, W - pw))
+            py = max(0.0, min(py, H - ph))
+
+            new_region = list(_index_region_to_data(
+                base_panel, (px, py, pw, ph)))
+            old_region = [float(v) for v in (inset.get("zoom_region") or [])]
+            if len(old_region) == 4 and all(
+                    abs(a - b) < 1e-6 for a, b in zip(old_region, new_region)):
+                return
+
+            inset_panel = next((p for p in cell.spec.panels
+                                if p.id == inset.get("panel")), None)
+            if inset_panel is None or not inset_panel.layers:
+                return
+            crop = _crop_region_px(base_arr, px, py, pw, ph)
+            inset["zoom_region"] = new_region
+            if inset.get("connector") is not None:
+                inset["connector"] = {"region": list(new_region)}
+            layer = inset_panel.layers[0]
+            mgr.set_snapshot(cell_id, inset_panel.id, layer.id, crop)
+            mgr.dirty = True
+            mgr._offline.discard(cell_id)
+            mgr.build_figure_window(cell)
+            mgr.emit_state()
+        except Exception as e:
+            log.debug("zoom region drop failed (cell %s panel %s inset %s): %s",
+                      cell_id, base_panel_id, inset_index, e)
+    return _on_rect_drop
 
 
 def _make_panel_select_handler(mgr, cell_id, spec_panel_id):
@@ -669,6 +986,86 @@ def _handle_panel_swap(mgr, cell_id, fig, src_disp, tgt_disp) -> None:
     mgr.emit_state()
 
 
+def _make_inset_geometry_handler(mgr, cell_id):
+    """A module-level closure (NOT a bound method — anyplotlib sets
+    ``fn._event_types`` on it) returning a FIGURE-level ``inset_geometry_change``
+    handler that persists a dragged/resized inset's geometry.
+
+    anyplotlib has ALREADY applied the geometry to its own ``InsetAxes`` before
+    firing this event (see ``Figure._dispatch_event``'s ``inset_geometry_change``
+    branch, which calls ``inset_ax.set_geometry(...)`` before
+    ``_fire_figure_event``) — this handler ONLY persists the same values into
+    the spec so a save/rebuild reproduces the position, and does NOT rebuild
+    the figure (the inset already moved JS-side; a rebuild would flash it).
+
+    ``event.inset_id`` is the moved inset's anyplotlib Plot2D dispatch id;
+    resolve it to the SPEC inset-panel id via the inverted
+    ``fig._report_inset_map`` (built by ``figure_builder._apply_insets``), then
+    find the grid panel whose ``insets`` entry references that spec panel id
+    (``inset["panel"] == spec_pid``) and rewrite its ``anchor``/``w_frac``/
+    ``h_frac`` in place, dropping ``corner`` (an explicit ``anchor`` wins over
+    ``corner`` at render time — see ``_apply_insets`` — so a stale ``corner``
+    would be dead weight, not a conflicting value).
+
+    Guards (no-op, no crash; every failure just returns after a debug log):
+    the cell must still exist and be a figure cell; ``inset_id`` must resolve
+    through ``_report_inset_map``; a grid panel with a matching inset entry
+    must still exist on the spec."""
+    def _on_inset_geometry(event):
+        try:
+            fig = getattr(event, "source", None)
+            inset_disp_id = getattr(event, "inset_id", None)
+            if inset_disp_id is None or fig is None:
+                return
+            cell = mgr.doc.cell_by_id(cell_id) if mgr.doc else None
+            if cell is None or cell.cell_type != "figure" or cell.spec is None:
+                return
+            inset_map = dict(getattr(fig, "_report_inset_map", None) or {})
+            spec_by_disp = {disp: pid for pid, disp in inset_map.items()}
+            spec_pid = spec_by_disp.get(inset_disp_id)
+            if spec_pid is None:
+                log.debug("inset geometry event for unknown inset id %s "
+                          "(cell %s)", inset_disp_id, cell_id)
+                return
+            owner = None
+            for p in cell.spec.panels:
+                for ins in (p.insets or []):
+                    if ins.get("panel") == spec_pid:
+                        owner = ins
+                        break
+                if owner is not None:
+                    break
+            if owner is None:
+                log.debug("inset geometry event: no inset entry references "
+                          "panel %s (cell %s)", spec_pid, cell_id)
+                return
+            anchor = getattr(event, "anchor", None)
+            w_frac = getattr(event, "w_frac", None)
+            h_frac = getattr(event, "h_frac", None)
+            if anchor is not None:
+                try:
+                    owner["anchor"] = [float(anchor[0]), float(anchor[1])]
+                except (TypeError, ValueError, IndexError):
+                    pass
+            if w_frac is not None:
+                try:
+                    owner["w_frac"] = float(w_frac)
+                except (TypeError, ValueError):
+                    pass
+            if h_frac is not None:
+                try:
+                    owner["h_frac"] = float(h_frac)
+                except (TypeError, ValueError):
+                    pass
+            owner.pop("corner", None)
+            mgr.dirty = True
+            mgr.emit_state()
+        except Exception as e:
+            log.debug("inset geometry persist failed (cell %s): %s",
+                      cell_id, e)
+    return _on_inset_geometry
+
+
 def _widget_geometry_to_data(kind, widget, axes, coords) -> "dict | None":
     """Read one edit widget's final IMAGE-PIXEL geometry from its ``_data`` and
     convert to the DATA-coordinate annotation keys (the inverse of
@@ -728,20 +1125,104 @@ def _ensure_open(session) -> ReportManager:
 # ── snapshotting a live Plot into a FigureSpec + held array ────────────────────
 
 
+def _snapshot_line_state(plot) -> dict:
+    """Read the live 1-D anyplotlib state (``line_color``/``line_linewidth``/
+    ``line_label``) off ``plot._plot1d`` for the base-layer styling snapshot.
+    Every key is independently tolerant — a plot with no ``_plot1d`` (e.g. a
+    test that stamps ``current_data`` directly without going through the real
+    paint pipeline) simply yields an empty dict, and the caller's LayerSpec
+    fields stay ``None`` (figure_builder falls back to anyplotlib's own
+    defaults)."""
+    out: dict = {}
+    p1 = getattr(plot, "_plot1d", None)
+    state = getattr(p1, "_state", None) if p1 is not None else None
+    if not isinstance(state, dict):
+        return out
+    try:
+        if state.get("line_color") is not None:
+            out["color"] = str(state["line_color"])
+    except Exception:
+        pass
+    try:
+        if state.get("line_linewidth") is not None:
+            out["linewidth"] = float(state["line_linewidth"])
+    except Exception:
+        pass
+    try:
+        lbl = state.get("line_label")
+        if lbl:
+            out["label"] = str(lbl)
+    except Exception:
+        pass
+    return out
+
+
+def _snapshot_line_extras(plot) -> list:
+    """Extra overlay curves from the live plot's ``extra_lines`` state, each as
+    ``(ndarray, {color, linewidth, label})``. Best-effort: an entry whose
+    y-data isn't cleanly readable as a 1-D numpy array is skipped silently (a
+    base-curve-only snapshot is acceptable v1) rather than failing the whole
+    snapshot."""
+    out: list = []
+    p1 = getattr(plot, "_plot1d", None)
+    state = getattr(p1, "_state", None) if p1 is not None else None
+    if not isinstance(state, dict):
+        return out
+    for entry in list(state.get("extra_lines", None) or []):
+        try:
+            y = np.asarray(entry.get("data"), dtype=float)
+            if y.ndim != 1 or y.size == 0:
+                continue
+        except Exception:
+            continue
+        style: dict = {}
+        try:
+            if entry.get("color") is not None:
+                style["color"] = str(entry["color"])
+        except Exception:
+            pass
+        try:
+            if entry.get("linewidth") is not None:
+                style["linewidth"] = float(entry["linewidth"])
+        except Exception:
+            pass
+        try:
+            if entry.get("label"):
+                style["label"] = str(entry["label"])
+        except Exception:
+            pass
+        out.append((np.array(y, copy=True), style))
+    return out
+
+
 def _snapshot_plot(plot) -> "tuple[FigureSpec, dict] | None":
     """Snapshot a live ``Plot`` NOW into a single-panel FigureSpec + a
     ``{(panel_id, layer_id): ndarray}`` snapshot map. Reads ``current_data``,
     ``_last_levels``, colormap, axes, title, nav indices, and the view label.
 
-    If the plot carries live MDI overlay layers (``plot._layers``), each is
-    serialized into the same panel as an extra LayerSpec (same cmap / alpha, its
-    own source ref) with its current frame in the snapshot map — so "Add to report"
-    on a layered plot captures the whole composite. Returns None when the plot has
-    no paintable base frame."""
+    A 1-D ``current_data`` (a line-profile / spectrum plot) takes the
+    LINE-PANEL branch (``kind="line"``): axes carries ``x_axis`` + ``units``
+    (from ``plot._axes_info_1d``, falling back to ``range(n)`` when
+    unavailable — never crashing the snapshot), and the base LayerSpec's
+    ``color``/``linewidth``/``label`` are read from the live anyplotlib 1-D
+    state when reachable (see :func:`_snapshot_line_state`). Extra overlay
+    curves (``plot._plot1d``'s ``extra_lines``) become extra LayerSpecs when
+    their y-data is cleanly readable; MDI overlay-LAYER harvesting
+    (``plot._layers``, the 2-D compositing path) does NOT apply to a 1-D plot
+    and is skipped entirely.
+
+    If the plot carries live MDI overlay layers (``plot._layers``, 2-D only),
+    each is serialized into the same panel as an extra LayerSpec (same
+    cmap / alpha, its own source ref) with its current frame in the snapshot
+    map — so "Add to report" on a layered plot captures the whole composite.
+    Returns None when the plot has no paintable base frame."""
     data = getattr(plot, "current_data", None)
     if not isinstance(data, np.ndarray) or data.dtype == object:
         return None
     arr = np.array(data, copy=True)   # detach from the live buffer
+
+    if arr.ndim == 1:
+        return _snapshot_line_plot(plot, arr)
 
     # colormap
     cmap = "gray"
@@ -817,6 +1298,63 @@ def _snapshot_plot(plot) -> "tuple[FigureSpec, dict] | None":
     return spec, snap_map
 
 
+def _snapshot_line_plot(plot, arr: np.ndarray) -> "tuple[FigureSpec, dict]":
+    """The ``kind="line"`` branch of :func:`_snapshot_plot`: build a
+    single-panel FigureSpec from a 1-D ``current_data`` array. Always
+    succeeds (a 1-D array is always paintable) — unlike the 2-D branch there
+    is no "no paintable frame" case to reject."""
+    axes_dict = None
+    try:
+        xa, x_units, _y_label = plot._axes_info_1d(arr)
+        if xa is not None:
+            axes_dict = {"units": x_units,
+                         "x_axis": [float(v) for v in np.asarray(xa)]}
+    except Exception as e:
+        log.debug("snapshot 1d axes read failed: %s", e)
+    if axes_dict is None:
+        # No calibrated axis reachable (or the length didn't match) — fall back
+        # to a bare index axis so the panel still renders with real ticks.
+        axes_dict = {"units": "px",
+                     "x_axis": [float(i) for i in range(arr.shape[0])]}
+
+    title = ""
+    try:
+        title = plot._plot_title()
+    except Exception:
+        title = ""
+
+    nav_context = None
+    try:
+        sig = plot.plot_state.current_signal
+        idx = tuple(int(i) for i in sig.axes_manager.indices)
+        if idx:
+            nav_context = {"indices": list(idx)}
+    except Exception:
+        nav_context = None
+
+    style = _snapshot_line_state(plot)
+    base_layer = LayerSpec(source=SignalRef.from_plot(plot), alpha=1.0,
+                           visible=True, color=style.get("color"),
+                           linewidth=style.get("linewidth"),
+                           label=style.get("label"))
+    layers = [base_layer]
+    snap_map = {("p1", base_layer.id): arr}
+
+    for extra_arr, extra_style in _snapshot_line_extras(plot):
+        ov = LayerSpec(source=SignalRef.from_plot(plot), alpha=1.0,
+                       visible=True, color=extra_style.get("color"),
+                       linewidth=extra_style.get("linewidth"),
+                       label=extra_style.get("label"))
+        layers.append(ov)
+        snap_map[("p1", ov.id)] = extra_arr
+
+    panel = PanelSpec(id="p1", grid_pos=[0, 0], kind="line", layers=layers,
+                      axes=axes_dict, title=title)
+    spec = FigureSpec(layout={"kind": "single"}, panels=[panel],
+                      nav_context=nav_context)
+    return spec, snap_map
+
+
 def _snapshot_layer_now(plot) -> "tuple[np.ndarray, str, list | None] | None":
     """Read a live ``Plot`` NOW into ``(arr, cmap, clim)`` for an EXISTING
     LayerSpec refresh (per-panel / per-layer re-snapshot) — the pixel + contrast
@@ -850,6 +1388,164 @@ def _snapshot_layer_now(plot) -> "tuple[np.ndarray, str, list | None] | None":
     return arr, cmap, clim
 
 
+def _snapshot_scene3d(session, src_plot) -> "tuple[FigureSpec, dict] | None":
+    """Snapshot a window's 3-D IPF view into a single scene3d-panel FigureSpec +
+    a ``{(panel_id, "xyz"/"rgb"): ndarray}`` snapshot map.
+
+    Recomputes the sphere points EXACTLY the way ``emit_ipf_3d`` does (the
+    shared ``ipf_view.ipf_scene_data`` builder) from the orientation result on
+    the plot's tree, at the tree's CURRENT direction (the X/Y/Z selector state,
+    ``tree._ipf_direction``). Point size mirrors the live ``Plot3D`` when one is
+    cached on the tree. The panel carries one LayerSpec whose SignalRef points
+    at the tree — the rebind/refresh handle — but the pixels are the xyz/rgb
+    arrays under the pseudo layer keys, never a LayerSpec image. Returns None
+    when the tree has no orientation result (caller emits the no-image error)."""
+    from spyde.actions.ipf_view import (
+        IPF3D_POINT_SIZE, ipf_scene_data, tree_orientation_result,
+    )
+
+    tree = getattr(src_plot, "signal_tree", None)
+    result = tree_orientation_result(tree)
+    if result is None:
+        return None
+    direction = str(getattr(tree, "_ipf_direction", "z") or "z")
+    data = ipf_scene_data(result, direction)
+    if data is None:
+        return None
+    xyz, rgb, scene = data
+    # Mirror the live explorer's point size when the tree holds the live Plot3D
+    # (a user-tuned size would ride along); otherwise the shared default.
+    try:
+        p3d = getattr(tree, "_ipf_p3d", None)
+        ps = (getattr(p3d, "_state", {}) or {}).get("point_size")
+        scene["point_size"] = float(ps) if ps else float(IPF3D_POINT_SIZE)
+    except Exception:
+        scene["point_size"] = float(IPF3D_POINT_SIZE)
+
+    ref_layer = LayerSpec(source=SignalRef.from_plot(src_plot))
+    panel = PanelSpec(id="p1", grid_pos=[0, 0], kind="scene3d",
+                      layers=[ref_layer], scene=scene)
+    spec = FigureSpec(layout={"kind": "single"}, panels=[panel])
+    snap_map = {("p1", "xyz"): np.asarray(xyz), ("p1", "rgb"): np.asarray(rgb)}
+    return spec, snap_map
+
+
+def _scene3d_snap_entries(session, panel: PanelSpec) -> "dict | None":
+    """Recompute a scene3d panel's point cloud from its resolved source tree at
+    the panel's STORED scene direction → ``{(panel_id, "xyz"/"rgb"): ndarray}``,
+    or None (source offline / no orientation result). The one recompute path
+    behind report_open rebind, paste rebind, and refresh_panel."""
+    from spyde.actions.ipf_view import ipf_scene_data, tree_orientation_result
+
+    if not panel.layers or panel.layers[0].source is None:
+        return None
+    src_plot = panel.layers[0].source.resolve(session)
+    if src_plot is None:
+        return None
+    result = tree_orientation_result(getattr(src_plot, "signal_tree", None))
+    if result is None:
+        return None
+    direction = str((panel.scene or {}).get("direction", "z") or "z")
+    data = ipf_scene_data(result, direction)
+    if data is None:
+        return None
+    xyz, rgb, _scene = data
+    return {(panel.id, "xyz"): np.asarray(xyz),
+            (panel.id, "rgb"): np.asarray(rgb)}
+
+
+def _recompute_scene3d_panel(session, mgr: "ReportManager", cell: Cell,
+                             panel: PanelSpec) -> bool:
+    """Refresh a scene3d panel's xyz/rgb snapshots in place via
+    :func:`_scene3d_snap_entries`. Returns True on success (False = source
+    offline / no orientation result — caller decides offline vs no-op)."""
+    entries = _scene3d_snap_entries(session, panel)
+    if entries is None:
+        return False
+    for (pid, key), arr in entries.items():
+        mgr.set_snapshot(cell.id, pid, key, arr)
+    return True
+
+
+def _stored_position_inset(spec, panel_id):
+    """The inset dict referencing *panel_id* that carries a STORED slice
+    position (``nav_indices`` / ``time_index``), or None. Such a panel is a
+    FRESH-SLICE callout: refresh re-slices the dataset at the stored position
+    instead of re-snapshotting whatever frame the live plot currently shows."""
+    for p in spec.panels:
+        for ins in (p.insets or []):
+            if ins.get("panel") == panel_id and (
+                    ins.get("nav_indices") is not None
+                    or ins.get("time_index") is not None):
+                return ins
+    return None
+
+
+def _refresh_callout_panel(session, mgr: "ReportManager", cell: Cell,
+                           panel: PanelSpec, inset: dict) -> bool:
+    """Refresh a fresh-slice callout panel: resolve its layer-0 source and
+    RE-SLICE at the inset's stored position (never the live current frame).
+    cmap/clim are left alone — the stored-position slice isn't the live view,
+    so the live plot's display state doesn't apply. Returns True on success."""
+    from spyde.actions.report.slicing import read_frame_at
+
+    if not panel.layers:
+        return False
+    layer = panel.layers[0]
+    src_plot = layer.source.resolve(session) if layer.source else None
+    if src_plot is None:
+        return False
+    indices = inset.get("nav_indices")
+    if indices is None:
+        indices = [inset.get("time_index")]
+    frame = read_frame_at(src_plot, indices)
+    if frame is None:
+        return False
+    mgr.set_snapshot(cell.id, panel.id, layer.id, frame)
+    return True
+
+
+def _stored_zoom_inset(spec, panel_id):
+    """``(base_panel, inset)`` for the inset referencing *panel_id* that
+    carries a ``zoom_region`` (a ZOOM-REGION callout — a magnified crop of its
+    BASE panel's own pixels, never a dataset re-slice), or ``(None, None)``."""
+    for p in spec.panels:
+        for ins in (p.insets or []):
+            if ins.get("panel") == panel_id and ins.get("zoom_region") is not None:
+                return p, ins
+    return None, None
+
+
+def _refresh_zoom_panel(mgr: "ReportManager", cell: Cell, panel: PanelSpec,
+                        base_panel: PanelSpec, inset: dict) -> bool:
+    """Refresh a zoom-region callout panel: re-crop the (possibly just-
+    refreshed) BASE panel's OWN held snapshot at ``inset["zoom_region"]``
+    (DATA coords → pixel index via ``coords.data_region_to_index``) — never a
+    dataset re-slice, never the live plot. Returns True on success (the base
+    panel's snapshot must already be resolvable; False leaves the zoom
+    panel's existing snapshot untouched)."""
+    from spyde.actions.report import coords
+    from spyde.actions.report.compose import _crop_region_px
+
+    if not panel.layers or not base_panel.layers:
+        return False
+    base_layer = base_panel.layers[0]
+    base_arr = mgr.snapshot_map(cell.id).get((base_panel.id, base_layer.id))
+    if base_arr is None:
+        return False
+    base_arr = np.asarray(base_arr)
+    region = inset.get("zoom_region")
+    try:
+        x, y, w, h = coords.data_region_to_index(region, base_panel.axes)
+    except Exception as e:
+        log.debug("zoom panel refresh region convert failed: %s", e)
+        return False
+    crop = _crop_region_px(base_arr, x, y, w, h)
+    layer = panel.layers[0]
+    mgr.set_snapshot(cell.id, panel.id, layer.id, crop)
+    return True
+
+
 def refresh_panel(session, mgr: "ReportManager", cell: Cell, panel: PanelSpec) -> bool:
     """Re-snapshot ONE panel's layers from their resolved live plots, IN PLACE.
 
@@ -862,9 +1558,36 @@ def refresh_panel(session, mgr: "ReportManager", cell: Cell, panel: PanelSpec) -
     data, it doesn't discard the user's edits) and the manager's snapshot map is
     updated. Returns True when the panel was refreshed, False otherwise (caller
     decides whether that means "mark offline" — see ``report_refresh_figure`` —
-    or "leave silently as-is" — ``repfig_refresh_panel``)."""
+    or "leave silently as-is" — ``repfig_refresh_panel``).
+
+    A LINE panel's layers refresh through this same generic path:
+    ``_snapshot_layer_now`` places no ndim gate on ``current_data``, so a 1-D
+    array flows through unchanged (cmap/clim are updated but stay unused —
+    ``figure_builder`` ignores them for ``kind="line"``); the curve's
+    color/linewidth/label styling is left as-is (a refresh pulls fresh DATA,
+    not a re-read of the live line style).
+
+    A FRESH-SLICE callout panel (referenced by an inset carrying
+    ``nav_indices``/``time_index``) takes the re-slice path instead: its pixels
+    come from the dataset at the STORED position, not the live current frame.
+    A ZOOM-REGION callout panel (referenced by an inset carrying
+    ``zoom_region``) takes the re-crop path instead: its pixels come from
+    cropping its BASE panel's OWN (already-refreshed, if the base panel
+    precedes it in ``cell.spec.panels`` — the normal creation order) held
+    snapshot, never a dataset re-slice or the live plot. A SCENE3D panel
+    likewise recomputes its point cloud from the resolved orientation result
+    at the STORED scene direction (never image layers)."""
     if not panel.layers:
         return False
+    if _is_scene3d_panel(panel):
+        return _recompute_scene3d_panel(session, mgr, cell, panel)
+    if cell.spec is not None:
+        ins = _stored_position_inset(cell.spec, panel.id)
+        if ins is not None:
+            return _refresh_callout_panel(session, mgr, cell, panel, ins)
+        base_panel, zoom_ins = _stored_zoom_inset(cell.spec, panel.id)
+        if zoom_ins is not None:
+            return _refresh_zoom_panel(mgr, cell, panel, base_panel, zoom_ins)
     resolved: list[tuple[LayerSpec, np.ndarray, str, "list | None"]] = []
     for layer in panel.layers:
         src_plot = layer.source.resolve(session) if layer.source else None
@@ -924,6 +1647,14 @@ def report_open(session, plot, payload) -> None:
             continue
         all_resolved = bool(c.spec.panels)
         for panel in c.spec.panels:
+            # A scene3d panel rebinds by RECOMPUTING its point cloud from the
+            # resolved orientation result (there is no image layer to read);
+            # an unresolvable source / missing result → the whole cell offline
+            # (baked PNG badge), same rule as image layers.
+            if _is_scene3d_panel(panel):
+                if not _recompute_scene3d_panel(session, mgr, c, panel):
+                    all_resolved = False
+                continue
             for layer in panel.layers:
                 src_plot = layer.source.resolve(session) if layer.source else None
                 arr = None
@@ -1203,34 +1934,48 @@ def report_add_figure(session, plot, payload) -> None:
     static snapshot or as the interactive vectors explorer. When the payload
     has no ``vectors_mode`` yet, the drop is deferred: a
     ``report_vectors_choice`` message asks the renderer, which re-sends this
-    action with ``vectors_mode`` ("viewer" | "image") once the user picks."""
+    action with ``vectors_mode`` ("viewer" | "image") once the user picks.
+
+    ``view: "3d"`` (the pill was dragged while the window showed its 3-D IPF
+    explorer) snapshots the SCENE instead of the 2-D image: a single scene3d
+    panel whose point cloud is recomputed from the tree's orientation result
+    (``_snapshot_scene3d``). This branch runs FIRST — a 3-D drop is never a
+    vectors-explorer candidate."""
     mgr = _ensure_open(session)
     src = _resolve_source_plot(session, payload.get("source_window_id"))
     if src is None:
         ipc.emit_error("report_add_figure: source window not found.")
         return
     vectors_mode = str(payload.get("vectors_mode", "") or "")
-    if not vectors_mode:
-        vecs = getattr(getattr(src, "signal_tree", None),
-                       "diffraction_vectors", None)
-        if vecs is not None:
-            try:
-                count = int(len(vecs.flat_buffer))
-            except Exception:
-                count = 0
-            ipc.emit({
-                "type": "report_vectors_choice",
-                "source_window_id": payload.get("source_window_id"),
-                "index": payload.get("index"),
-                "at_cell": payload.get("at_cell"),
-                "caption": str(payload.get("caption", "") or ""),
-                "count": count,
-            })
+    if str(payload.get("view", "") or "") == "3d":
+        snap = _snapshot_scene3d(session, src)
+        if snap is None:
+            ipc.emit_error("report_add_figure: source window has no 3-D "
+                           "orientation view to snapshot.")
             return
-    snap = _snapshot_plot(src)
-    if snap is None:
-        ipc.emit_error("report_add_figure: source window has no image to snapshot.")
-        return
+        vectors_mode = ""              # a scene cell never embeds the explorer
+    else:
+        if not vectors_mode:
+            vecs = getattr(getattr(src, "signal_tree", None),
+                           "diffraction_vectors", None)
+            if vecs is not None:
+                try:
+                    count = int(len(vecs.flat_buffer))
+                except Exception:
+                    count = 0
+                ipc.emit({
+                    "type": "report_vectors_choice",
+                    "source_window_id": payload.get("source_window_id"),
+                    "index": payload.get("index"),
+                    "at_cell": payload.get("at_cell"),
+                    "caption": str(payload.get("caption", "") or ""),
+                    "count": count,
+                })
+                return
+        snap = _snapshot_plot(src)
+        if snap is None:
+            ipc.emit_error("report_add_figure: source window has no image to snapshot.")
+            return
     spec, snap_map = snap
     spec.vectors_mode = vectors_mode
     caption = str(payload.get("caption", "") or "")

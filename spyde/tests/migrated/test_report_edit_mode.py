@@ -21,9 +21,11 @@ from __future__ import annotations
 import json
 
 import numpy as np
+import pytest
 
 from spyde.actions.report import compose as cx
 from spyde.actions.report import handlers as h
+from spyde.actions.report.model import FigureSpec, PanelSpec
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -953,3 +955,252 @@ class TestPanelAnnotationInPlaceUpdate:
                            "edgecolors": "#ff9800"}})
         assert panel.annotations[0]["kind"] == "rect"
         assert _report_figures(messages), "kind change must rebuild"
+
+
+class TestAnnotationStyleFields:
+    """The style fields the edit dock writes (`linewidths` on shapes, `fontsize`
+    on text) persist on the spec through repfig_update_annotation, and flow onto
+    the live widget where the widget schema carries them (arrow linewidth,
+    label fontsize)."""
+
+    def test_arrow_linewidth_flows_to_live_widget(self, tem_2d_dataset):
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        ann = [{"kind": "arrow", "offsets": [[4.0, 4.0]],
+                "U": [_STEP * 4.0], "V": [_STEP * 4.0],
+                "edgecolors": "#ff9800", "linewidths": 1.6}]
+        mgr, cid, panel = _make_calibrated_cell(session, messages, annotations=ann)
+        cx.repfig_set_edit_mode(session, None, {"cell_id": cid, "editing": True})
+        fig = _cell_figure(mgr, cid)
+        widget = _widgets(_first_plot(fig))[0]
+        # The BUILD path already forwards linewidths → the arrow widget.
+        assert widget.get("linewidth") == pytest.approx(1.6)
+
+        messages.clear()
+        new_ann = dict(ann[0])
+        new_ann["linewidths"] = 4.5
+        cx.repfig_update_annotation(session, None, {
+            "cell_id": cid, "panel_id": panel.id, "index": 0, "annotation": new_ann})
+        # Spec persisted, in-place widget push (no rebuild), widget updated.
+        assert panel.annotations[0]["linewidths"] == pytest.approx(4.5)
+        assert _report_figures(messages) == []
+        assert widget.get("linewidth") == pytest.approx(4.5)
+
+    def test_text_fontsize_flows_to_live_widget(self, tem_2d_dataset):
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        ann = [{"kind": "text", "offsets": [[6.0, 6.0]], "texts": ["hi"],
+                "color": "#ff9800", "fontsize": 12}]
+        mgr, cid, panel = _make_calibrated_cell(session, messages, annotations=ann)
+        cx.repfig_set_edit_mode(session, None, {"cell_id": cid, "editing": True})
+        fig = _cell_figure(mgr, cid)
+        widget = _widgets(_first_plot(fig))[0]
+
+        messages.clear()
+        new_ann = dict(ann[0])
+        new_ann["fontsize"] = 24
+        cx.repfig_update_annotation(session, None, {
+            "cell_id": cid, "panel_id": panel.id, "index": 0, "annotation": new_ann})
+        assert panel.annotations[0]["fontsize"] == 24
+        assert _report_figures(messages) == []
+        assert widget.get("fontsize") == 24
+
+    def test_circle_linewidth_flows_to_live_widget(self, tem_2d_dataset):
+        # anyplotlib's CircleWidget now carries its own linewidth field, so the
+        # BUILD path forwards linewidths → the widget, and an in-edit update
+        # pushes the new value onto the live widget (in-place, no rebuild) —
+        # the same contract as the arrow widget's linewidth.
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        ann = [{"kind": "circle", "offsets": [[6.0, 6.0]], "radius": _STEP * 5.0,
+                "edgecolors": "#ff9800", "linewidths": 1.5}]
+        mgr, cid, panel = _make_calibrated_cell(session, messages, annotations=ann)
+        cx.repfig_set_edit_mode(session, None, {"cell_id": cid, "editing": True})
+        fig = _cell_figure(mgr, cid)
+        widget = _widgets(_first_plot(fig))[0]
+        assert widget.get("linewidth") == pytest.approx(1.5)
+
+        messages.clear()
+        new_ann = dict(ann[0])
+        new_ann["linewidths"] = 6.0
+        cx.repfig_update_annotation(session, None, {
+            "cell_id": cid, "panel_id": panel.id, "index": 0, "annotation": new_ann})
+        assert panel.annotations[0]["linewidths"] == pytest.approx(6.0)
+        assert _report_figures(messages) == []
+        assert widget.get("linewidth") == pytest.approx(6.0)
+
+    def test_rect_linewidth_flows_to_live_widget(self, tem_2d_dataset):
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        ann = [{"kind": "rect", "offsets": [[6.0, 6.0]],
+                "widths": [_STEP * 40.0], "heights": [_STEP * 20.0],
+                "edgecolors": "#ff9800", "linewidths": 2.5}]
+        mgr, cid, panel = _make_calibrated_cell(session, messages, annotations=ann)
+        cx.repfig_set_edit_mode(session, None, {"cell_id": cid, "editing": True})
+        fig = _cell_figure(mgr, cid)
+        widget = _widgets(_first_plot(fig))[0]
+        assert widget.get("linewidth") == pytest.approx(2.5)
+
+        messages.clear()
+        new_ann = dict(ann[0])
+        new_ann["linewidths"] = 5.0
+        cx.repfig_update_annotation(session, None, {
+            "cell_id": cid, "panel_id": panel.id, "index": 0, "annotation": new_ann})
+        assert panel.annotations[0]["linewidths"] == pytest.approx(5.0)
+        assert _report_figures(messages) == []
+        assert widget.get("linewidth") == pytest.approx(5.0)
+
+
+# ── text-size styling ────────────────────────────────────────────────────────
+
+
+class TestTextSizes:
+    """``repfig_set_text_size`` persists per-element font sizes onto
+    ``PanelSpec.text_sizes`` (only-when-set, tolerant round-trip like ``scene``)
+    and pushes them onto the LIVE panel plot in place (no rebuild) whenever the
+    cell has a mounted figure window."""
+
+    def test_spec_round_trip_and_omitted_when_unset(self):
+        panel = PanelSpec(id="p1", kind="image", layers=[])
+        assert "text_sizes" not in panel.to_dict()
+
+        panel.text_sizes = {"title": 18, "ticks": 9}
+        d = panel.to_dict()
+        assert d["text_sizes"] == {"title": 18, "ticks": 9}
+        back = PanelSpec.from_dict(d)
+        assert back.text_sizes == {"title": 18, "ticks": 9}
+
+        # Older dict without the key loads as None.
+        old = PanelSpec.from_dict({"id": "p1", "kind": "image", "layers": []})
+        assert old.text_sizes is None
+
+    def test_spec_yaml_round_trip(self):
+        panel = PanelSpec(id="p1", kind="image", layers=[], text_sizes={"legend": 13})
+        spec = FigureSpec(layout={"kind": "single"}, panels=[panel])
+        back = FigureSpec.from_yaml(spec.to_yaml())
+        assert back.panels[0].text_sizes == {"legend": 13}
+
+    def test_verb_persists_on_spec_and_to_dict(self, tem_2d_dataset):
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        mgr, cid, panel = _make_calibrated_cell(session, messages)
+        assert panel.text_sizes is None
+
+        cx.repfig_set_text_size(session, None, {
+            "cell_id": cid, "panel_id": panel.id, "target": "title", "size": 20})
+        assert panel.text_sizes == {"title": 20}
+        st = _last_state(messages)
+        fig_cell = next(c for c in st["cells"] if c["id"] == cid)
+        assert fig_cell["figure"]["panels"][0]["text_sizes"] == {"title": 20}
+
+        # A second call with a different target merges rather than clobbers.
+        cx.repfig_set_text_size(session, None, {
+            "cell_id": cid, "panel_id": panel.id, "target": "ticks", "size": 8})
+        assert panel.text_sizes == {"title": 20, "ticks": 8}
+
+    def test_live_push_no_rebuild(self, tem_2d_dataset):
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        mgr, cid, panel = _make_calibrated_cell(session, messages)
+        wid_before = mgr._window_by_cell.get(cid)
+        p2 = _first_plot(_cell_figure(mgr, cid))
+
+        messages.clear()
+        cx.repfig_set_text_size(session, None, {
+            "cell_id": cid, "panel_id": panel.id, "target": "ticks", "size": 22})
+
+        # No rebuild: same window id, no new figure message.
+        assert mgr._window_by_cell.get(cid) == wid_before
+        assert _report_figures(messages) == []
+        assert _states(messages)
+        # The live panel plot's state carries the new tick size.
+        assert p2._state.get("tick_size") == pytest.approx(22.0)
+
+    def test_event_style_target_aliases(self, tem_2d_dataset):
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        mgr, cid, panel = _make_calibrated_cell(session, messages)
+        p2 = _first_plot(_cell_figure(mgr, cid))
+
+        cx.repfig_set_text_size(session, None, {
+            "cell_id": cid, "panel_id": panel.id, "target": "x_ticks", "size": 15})
+        assert panel.text_sizes == {"ticks": 15}
+        assert p2._state.get("tick_size") == pytest.approx(15.0)
+
+        cx.repfig_set_text_size(session, None, {
+            "cell_id": cid, "panel_id": panel.id, "target": "y_ticks", "size": 17})
+        assert panel.text_sizes == {"ticks": 17}
+
+        cx.repfig_set_text_size(session, None, {
+            "cell_id": cid, "panel_id": panel.id, "target": "colorbar_label",
+            "size": 11})
+        assert panel.text_sizes == {"ticks": 17, "colorbar": 11}
+
+    def test_invalid_target_errors_and_leaves_spec_untouched(self, tem_2d_dataset):
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        mgr, cid, panel = _make_calibrated_cell(session, messages)
+
+        messages.clear()
+        cx.repfig_set_text_size(session, None, {
+            "cell_id": cid, "panel_id": panel.id, "target": "nonsense", "size": 12})
+        assert panel.text_sizes is None
+        errs = [m for m in messages if m.get("type") == "error"]
+        assert errs, "expected an emit_error for an unknown target"
+
+    def test_invalid_size_errors_and_leaves_spec_untouched(self, tem_2d_dataset):
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        mgr, cid, panel = _make_calibrated_cell(session, messages)
+
+        messages.clear()
+        cx.repfig_set_text_size(session, None, {
+            "cell_id": cid, "panel_id": panel.id, "target": "title", "size": "big"})
+        assert panel.text_sizes is None
+        errs = [m for m in messages if m.get("type") == "error"]
+        assert errs, "expected an emit_error for a non-numeric size"
+
+    def test_size_is_clamped(self, tem_2d_dataset):
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        mgr, cid, panel = _make_calibrated_cell(session, messages)
+
+        cx.repfig_set_text_size(session, None, {
+            "cell_id": cid, "panel_id": panel.id, "target": "title", "size": 500})
+        assert panel.text_sizes == {"title": 96}
+
+        cx.repfig_set_text_size(session, None, {
+            "cell_id": cid, "panel_id": panel.id, "target": "title", "size": 1})
+        assert panel.text_sizes == {"title": 6}
+
+    def test_dispatch_panel_id_resolves_to_spec_panel(self, tem_2d_dataset):
+        # panel_id may be an anyplotlib dispatch id (fig._report_panel_map value)
+        # instead of the spec panel id — both must resolve to the same PanelSpec.
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        mgr, cid, panel = _make_calibrated_cell(session, messages)
+        fig = _cell_figure(mgr, cid)
+        pmap = dict(fig._report_panel_map)   # spec_pid → dispatch id
+        disp_id = pmap[panel.id]
+
+        cx.repfig_set_text_size(session, None, {
+            "cell_id": cid, "panel_id": disp_id, "target": "legend", "size": 13})
+        assert panel.text_sizes == {"legend": 13}
+
+    def test_fallback_persists_when_cell_not_live(self, tem_2d_dataset):
+        # A cell with no mounted figure window (never editing/never built live)
+        # still persists via the rebuild path.
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        mgr, cid, panel = _make_calibrated_cell(session, messages)
+        wid = mgr._window_by_cell.pop(cid, None)
+        assert wid is not None
+        mgr._controllers.pop(wid, None)
+
+        messages.clear()
+        cx.repfig_set_text_size(session, None, {
+            "cell_id": cid, "panel_id": panel.id, "target": "x_label", "size": 14})
+        assert panel.text_sizes == {"x_label": 14}
+        # No live figure to push onto → falls back to the rebuild path, which
+        # mounts a fresh window for the cell (verifiable via a new figure msg).
+        assert _report_figures(messages), "fallback must rebuild the figure"
