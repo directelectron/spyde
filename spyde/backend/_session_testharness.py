@@ -224,6 +224,38 @@ class TestHarnessMixin:
             log.debug("set_signal_type on sped_ag failed: %s", e)
         self._add_signal(s, source_path="test_data_sped_ag")
 
+    def _load_test_data_line(self, payload: dict | None = None) -> None:
+        """Test-only: a small calibrated 1-D signal (``Signal1D``) with NO
+        navigation axes — so exactly ONE signal plot window is created
+        (``is_navigator=False``) and no navigator. Backs the report line-panel
+        e2e (dropping a 1-D window into a report makes a ``kind="line"`` panel).
+
+        A 512-point synthetic spectrum: a slowly-rising baseline plus two
+        Gaussian peaks at distinct positions, so the rendered curve has clear
+        structure (a recoloured line / a set label + legend is pixel-visible),
+        and a calibrated x-axis (0.5 eV/px) so the line panel carries real axis
+        units. Mirrors ``test_report_line_panels.py``'s ``signal1d_dataset``
+        fixture construction."""
+        import numpy as np
+        # A 1-D signal never casts to a diffraction/insitu type, but the pyxem
+        # import prewarm still races _add_signal's plot machinery — keep the
+        # ensure_heavy_imports guard the other loaders use (see _load_test_data).
+        from spyde.backend.heavy_imports import ensure_heavy_imports
+        ensure_heavy_imports()
+        payload = payload or {}
+        n = int(payload.get("size", 512))
+        x = np.arange(n, dtype=np.float32)
+        baseline = 0.15 + 0.35 * (x / n)
+        def _gauss(c, w, a):
+            return a * np.exp(-0.5 * ((x - c) / w) ** 2)
+        y = (baseline + _gauss(n * 0.30, n * 0.02, 1.0)
+             + _gauss(n * 0.65, n * 0.03, 0.7)).astype(np.float32)
+        s = hs.signals.Signal1D(y)
+        ax = s.axes_manager.signal_axes[0]
+        ax.name, ax.units, ax.scale, ax.offset = "Energy", "eV", 0.5, 0.0
+        s.metadata.set_item("General.title", "1D Spectrum")
+        self._add_signal(s, source_path="test_data_line")
+
     def _load_test_data_movie(self, payload: dict | None = None) -> None:
         """Test-only: synthetic in-situ MOVIE (1-D time nav × LARGE 2-D frames) —
         the GPU large-image consumer, with NO file and NO download so the
