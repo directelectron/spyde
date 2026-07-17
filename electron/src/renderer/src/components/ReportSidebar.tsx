@@ -71,8 +71,39 @@ export function ReportSidebar() {
   const dragCellId = useRef<string | null>(null)
   const [dragCell, setDragCell] = useState<string | null>(null)
   const [reorderBefore, setReorderBefore] = useState<string | null>(null)
+  // A deferred vectors-figure drop awaiting the embed choice (viewer vs image).
+  const [vxChoice, setVxChoice] = useState<{
+    source_window_id: number
+    index?: number | null
+    at_cell?: string | null
+    caption?: string
+    count?: number
+  } | null>(null)
 
   const bodyRef = useRef<HTMLDivElement>(null)
+
+  // The backend defers a drop whose source tree carries diffraction vectors
+  // and asks how HTML exports should embed it (SpyDEContext re-broadcasts the
+  // message as this CustomEvent). Picking re-sends the original drop payload
+  // with the choice; dismissing just drops it.
+  useEffect(() => {
+    const onChoice = (e: Event) => {
+      setVxChoice((e as CustomEvent).detail)
+    }
+    window.addEventListener('spyde:report_vectors_choice', onChoice)
+    return () => window.removeEventListener('spyde:report_vectors_choice', onChoice)
+  }, [])
+  const pickVectorsMode = (mode: 'viewer' | 'image') => {
+    if (!vxChoice) return
+    sendAction('report_add_figure', {
+      source_window_id: vxChoice.source_window_id,
+      index: vxChoice.index ?? undefined,
+      at_cell: vxChoice.at_cell ?? undefined,
+      caption: vxChoice.caption ?? '',
+      vectors_mode: mode,
+    })
+    setVxChoice(null)
+  }
 
   // ── Left-edge resize (Pointer-Capture, per SubWindow) ─────────────────────
   const resizeGesture = useRef<{ px: number; w: number } | null>(null)
@@ -448,6 +479,36 @@ export function ReportSidebar() {
         </div>
       )}
 
+      {/* Deferred vectors-figure drop: embed choice. */}
+      {vxChoice && (
+        <div style={styles.vxChoiceBar} data-testid="report-vectors-choice">
+          <span style={styles.confirmText}>
+            This figure has diffraction vectors
+            {vxChoice.count ? ` (${vxChoice.count.toLocaleString()})` : ''}.
+            Embed as:
+          </span>
+          <div style={styles.vxChoiceBtns}>
+            <button
+              style={styles.hdrBtnActive}
+              onClick={() => pickVectorsMode('viewer')}
+              data-testid="report-vectors-viewer"
+              title="Interactive explorer in HTML exports — drag a virtual detector in the page"
+            >Interactive viewer</button>
+            <button
+              style={styles.hdrBtn}
+              onClick={() => pickVectorsMode('image')}
+              data-testid="report-vectors-image"
+            >Just the image</button>
+            <div style={{ flex: 1 }} />
+            <button
+              style={styles.hdrBtn}
+              onClick={() => setVxChoice(null)}
+              data-testid="report-vectors-cancel"
+            >Cancel</button>
+          </div>
+        </div>
+      )}
+
       {/* Body: scrollable cell list + trailing add button. */}
       <div
         ref={bodyRef}
@@ -611,6 +672,12 @@ const styles: Record<string, React.CSSProperties> = {
     borderBottom: '1px solid #313244',
   },
   confirmText: { fontSize: 11.5, color: '#fab387' },
+  vxChoiceBar: {
+    display: 'flex', flexDirection: 'column', gap: 6,
+    padding: '6px 10px', background: 'rgba(250,179,135,0.08)',
+    borderBottom: '1px solid #313244',
+  },
+  vxChoiceBtns: { display: 'flex', alignItems: 'center', gap: 6 },
   confirmDiscard: {
     background: '#f38ba8', color: '#11111b', border: 'none',
     borderRadius: 5, padding: '3px 10px', fontSize: 11, cursor: 'pointer', fontWeight: 600,

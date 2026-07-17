@@ -1161,6 +1161,11 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
           dispatch({ type: 'STATUS', text: `Report saved: ${msg.path}` })
           break
 
+        case 'report_vectors_choice':
+          // Deferred vectors-figure drop — the sidebar owns the prompt.
+          window.dispatchEvent(new CustomEvent('spyde:report_vectors_choice', { detail: msg }))
+          break
+
         case 'report_need_snapshots':
           // The backend needs a fresh PNG per cell before it writes the zip.
           // Re-broadcast as a DOM CustomEvent; the provider's snapshot effect

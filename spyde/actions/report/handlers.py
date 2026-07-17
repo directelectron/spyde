@@ -1197,17 +1197,42 @@ def report_set_title(session, plot, payload) -> None:
 
 def report_add_figure(session, plot, payload) -> None:
     """Snapshot the source window's Plot NOW into a figure cell. ``at_cell`` fills
-    an existing placeholder in place; otherwise a new figure cell is inserted."""
+    an existing placeholder in place; otherwise a new figure cell is inserted.
+
+    A source whose tree carries diffraction vectors can export either as the
+    static snapshot or as the interactive vectors explorer. When the payload
+    has no ``vectors_mode`` yet, the drop is deferred: a
+    ``report_vectors_choice`` message asks the renderer, which re-sends this
+    action with ``vectors_mode`` ("viewer" | "image") once the user picks."""
     mgr = _ensure_open(session)
     src = _resolve_source_plot(session, payload.get("source_window_id"))
     if src is None:
         ipc.emit_error("report_add_figure: source window not found.")
         return
+    vectors_mode = str(payload.get("vectors_mode", "") or "")
+    if not vectors_mode:
+        vecs = getattr(getattr(src, "signal_tree", None),
+                       "diffraction_vectors", None)
+        if vecs is not None:
+            try:
+                count = int(len(vecs.flat_buffer))
+            except Exception:
+                count = 0
+            ipc.emit({
+                "type": "report_vectors_choice",
+                "source_window_id": payload.get("source_window_id"),
+                "index": payload.get("index"),
+                "at_cell": payload.get("at_cell"),
+                "caption": str(payload.get("caption", "") or ""),
+                "count": count,
+            })
+            return
     snap = _snapshot_plot(src)
     if snap is None:
         ipc.emit_error("report_add_figure: source window has no image to snapshot.")
         return
     spec, snap_map = snap
+    spec.vectors_mode = vectors_mode
     caption = str(payload.get("caption", "") or "")
 
     at_cell = payload.get("at_cell")

@@ -448,6 +448,19 @@ export interface ReportSavedMessage extends MsgBase {
   path: string
 }
 
+/** A figure drop whose source tree carries diffraction vectors: the backend
+ *  deferred the cell and asks how HTML exports should embed it. The sidebar
+ *  prompts and re-sends `report_add_figure` with the original payload plus
+ *  `vectors_mode: 'viewer' | 'image'`. Re-broadcast as a `spyde:` CustomEvent. */
+export interface ReportVectorsChoiceMessage extends MsgBase {
+  type: 'report_vectors_choice'
+  source_window_id: number
+  index?: number | null
+  at_cell?: string | null
+  caption?: string
+  count?: number
+}
+
 /** An export finished: an HTML file (static/interactive) or a markdown folder
  *  was written at `path`. The renderer's Export flow awaits this, matched by
  *  `token` (the same token it sent in the triggering `report_export_html` /
@@ -671,6 +684,7 @@ export type PlotAppMessage =
   | ReportStateMessage
   | ReportNeedSnapshotsMessage
   | ReportSavedMessage
+  | ReportVectorsChoiceMessage
   | ReportExportedMessage
   | ReportPanelSelectedMessage
   | WizardEventMessage

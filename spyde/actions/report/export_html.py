@@ -203,17 +203,23 @@ def _render_body(mgr, assets: dict, *, interactive: bool, session=None) -> str:
                 continue
             html_frag = ""
             if interactive:
-                try:
-                    from spyde.actions.report.vectors_embed import (
-                        vectors_explorer_html, vectors_for_cell,
-                    )
-                    vecs = vectors_for_cell(session, c)
-                    if vecs is not None:
-                        vx_html = vectors_explorer_html(vecs, caption=c.caption)
-                        if vx_html is not None:
-                            html_frag = _figure_iframe_html(c.caption, vx_html)
-                except Exception as e:
-                    log.debug("vectors embed for cell %s failed: %s", c.id, e)
+                # Drop-time choice: vectors_mode == "image" pins the static
+                # snapshot even when the tree carries diffraction vectors.
+                if getattr(c.spec, "vectors_mode", "") != "image":
+                    try:
+                        from spyde.actions.report.vectors_embed import (
+                            vectors_explorer_html, vectors_for_cell,
+                        )
+                        vecs = vectors_for_cell(session, c)
+                        if vecs is not None:
+                            vx_html = vectors_explorer_html(vecs,
+                                                            caption=c.caption)
+                            if vx_html is not None:
+                                html_frag = _figure_iframe_html(c.caption,
+                                                                vx_html)
+                    except Exception as e:
+                        log.debug("vectors embed for cell %s failed: %s",
+                                  c.id, e)
                 if not html_frag:
                     fig_html = _build_interactive_figure_html(mgr, c)
                     if fig_html is not None:
