@@ -16,6 +16,7 @@ import {
   WINDOW_DRAG_MIME, NAVIGATOR_DRAG_MIME, SIGNAL_REF_DRAG_MIME, CONSOLE_VAR_DRAG_MIME,
   WORKFLOW_NODE_DRAG_MIME, FIGURE_DRAG_MIME,
 } from '../kernel/dnd'
+import { getActiveFigure } from '../kernel/activeFigure'
 
 export interface PillSegment {
   text: string
@@ -89,12 +90,21 @@ export function Pill({
           windowId: win.windowId, name: win.navName || 'base',
         }))
       }
+      // The figure payload prefers the window's CURRENTLY ACTIVE view, read
+      // from the registry AT DRAG TIME: the `win` prop is stamped when MDIArea
+      // renders, which doesn't happen when WindowContent's local 2D⇄3D toggle
+      // flips — so a window dragged while showing its 3-D IPF explorer must
+      // resolve view:'3d' here, not the stale render-time fallback.
+      const live = getActiveFigure(win.windowId)
       const figPayload: { windowId: number; figId?: string; title?: string; view?: string } = {
         windowId: win.windowId,
       }
-      if (win.figId !== undefined) figPayload.figId = win.figId
-      if (win.title !== undefined) figPayload.title = win.title
-      if (win.view !== undefined) figPayload.view = win.view
+      const figId = live?.figId ?? win.figId
+      const title = live?.title ?? win.title
+      const view = live ? live.view : win.view
+      if (figId !== undefined) figPayload.figId = figId
+      if (title !== undefined) figPayload.title = title
+      if (view !== undefined) figPayload.view = view
       dt.setData(FIGURE_DRAG_MIME, JSON.stringify(figPayload))
     }
     if (consoleVar) dt.setData(CONSOLE_VAR_DRAG_MIME, JSON.stringify({ name: consoleVar.name }))
