@@ -463,11 +463,20 @@ const u8DP = new Uint8Array(DPW * DPH);
 const accVI = new Float32Array(navW * navH);
 const u8VI = new Uint8Array(navW * navH);
 const idxScratch = [];
+// INTEGRATE FAST PATH: the "vector sum" buffer — every region vector's intensity
+// accumulated at its DP-pixel CENTRE (one O(vectors) pass), BEFORE any disk is
+// drawn. sumCols tracks the touched centre pixels so we splat disks over only the
+// occupied centres (sparse), then re-zero just those. This makes integrate
+// "vectors -> vector sum -> sum image": ONE disk-raster pass total, not one per
+// nav position (the old per-position render was O(positions * vectors * r^2)).
+const sumK = new Float32Array(DPW * DPH);
+const sumCols = [];
 
 // Splat one position's vectors into the DP accumulator with INTRA-frame MAX
 // (mirror _render_disks_block: overlapping disks keep the max value), then add
-// that max frame into accDP (render_region's max-then-sum). Walks the flat DISK
-// offset list; touched pixels tracked in _dirty so only they are re-zeroed.
+// that max frame into accDP. Used ONLY by pointer mode (a single nav position —
+// the correct single-frame look). Walks the flat DISK offset list; touched
+// pixels tracked in _dirty so only they are re-zeroed.
 const _dirty = [];
 function splatPosition(rowIdx) {
   _dirty.length = 0;
@@ -485,6 +494,58 @@ function splatPosition(rowIdx) {
     }
   }
   for (const p of _dirty) { accDP[p] += scratchDP[p]; scratchDP[p] = 0; }
+}
+
+// Accumulate one vector into the sumK vector-sum buffer at its DP-centre pixel.
+function _sumVector(i) {
+  const cc = kxToCol(KX[i]), cr = kyToRow(KY[i]);
+  if (cr < 0 || cr >= DPH || cc < 0 || cc >= DPW) return 0;
+  const p = cr * DPW + cc;
+  if (sumK[p] === 0) sumCols.push(p);
+  sumK[p] += IN[i];
+  return 1;
+}
+
+// INTEGRATE: sum every region vector's intensity into sumK at its centre pixel
+// (the vector sum), then draw the disk of each occupied centre ONCE into accDP,
+// overlapping disks ADDING (a spot present across many nav positions gets
+// brighter). Cost is O(region_vectors) + O(occupied_centres * r^2) — independent
+// of how many nav positions the region spans. Iterates the vector buffer DIRECTLY
+// over each nav position's row range (via NAV_OFF), so no giant index array is
+// built. Returns the vector count. `pos` is the flattened nav index iy*navW+ix.
+function splatSummedRegion(y0, y1, x0, x1) {
+  sumCols.length = 0;
+  let hit = 0;
+  // Pass 1: the vector sum. With NAV_OFF each position's rows are a contiguous
+  // [s, e) slice; without it we scan once and bin by region membership.
+  if (NAV_OFF) {
+    for (let iy = y0; iy < y1; iy++) {
+      const base = iy * navW;
+      for (let ix = x0; ix < x1; ix++) {
+        const p = base + ix, s = NAV_OFF[p], e = NAV_OFF[p + 1];
+        for (let i = s; i < e; i++) hit += _sumVector(i);
+      }
+    }
+  } else {
+    for (let i = 0; i < n; i++) {
+      if (Y[i] >= y0 && Y[i] < y1 && X[i] >= x0 && X[i] < x1) hit += _sumVector(i);
+    }
+  }
+  // Pass 2: draw each occupied centre's disk once into accDP (disks add).
+  const nd = DISK.length;
+  for (const p of sumCols) {
+    const cr = (p / DPW) | 0, cc = p - cr * DPW;
+    const inten = sumK[p];
+    for (let k = 0; k < nd; k += 2) {
+      const ry = cr + DISK[k];
+      if (ry < 0 || ry >= DPH) continue;
+      const rx = cc + DISK[k + 1];
+      if (rx < 0 || rx >= DPW) continue;
+      accDP[ry * DPW + rx] += inten;
+    }
+    sumK[p] = 0;   // re-zero only the touched centres
+  }
+  return hit;
 }
 
 const mode = { integrate: false };
@@ -513,12 +574,15 @@ function computeDP() {
     y0 = Math.max(0, Math.min(navH - 1, cross.iy)); y1 = y0 + 1;
   }
   let hit = 0;
-  for (let iy = y0; iy < y1; iy++) {
-    for (let ix = x0; ix < x1; ix++) {
-      rowsAt(iy, ix, idx);
-      hit += idx.length;
-      splatPosition(idx);
-    }
+  if (mode.integrate) {
+    // vectors -> vector sum -> sum image: a SINGLE summed disk raster over the
+    // region (one pass total, not one per nav position). Iterates the vector
+    // buffer directly — no giant index array.
+    hit = splatSummedRegion(y0, y1, x0, x1);
+  } else {
+    rowsAt(y0, x0, idx);
+    hit = idx.length;
+    splatPosition(idx);
   }
   let m = 0;
   for (let i = 0; i < accDP.length; i++) if (accDP[i] > m) m = accDP[i];
