@@ -5,8 +5,10 @@ explorer HTML (the shared fixture for the unit tests and the real-browser spec).
 
 The synthetic set is designed for crisp assertions: cluster A at k=(-0.5, 0)
 exists ONLY in the LEFT half of the nav grid; cluster B at k=(+0.5, 0) ONLY in
-the RIGHT half. Dragging the detector between the clusters must flip which
-half of the virtual image lights up.
+the RIGHT half. Because kx maps to the DP column, a POINTER on a left-half nav
+position renders its disks in the LEFT of the diffraction pattern (and a
+right-half position in the RIGHT); an INTEGRATE region over the left half sums
+all of cluster A's disks into a bright left-side blob.
 """
 from __future__ import annotations
 

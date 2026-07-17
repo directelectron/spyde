@@ -85,6 +85,58 @@ class TestDiskRendering:
         assert frame[cy, cx] > 0
 
 
+class TestRenderRegion:
+    """render_region: max-within-frame, sum-across-region — so a 1x1 region
+    equals render_frame and a 2-position region equals the sum of two frames."""
+
+    def test_1x1_region_equals_render_frame(self, vecs):
+        for (iy, ix) in [(0, 0), (0, 3), (2, 1)]:
+            frame = vecs.render_frame(iy, ix)
+            reg = vecs.render_region(iy, iy + 1, ix, ix + 1)
+            assert reg.shape == frame.shape
+            np.testing.assert_array_equal(reg, frame)
+
+    def test_two_position_region_equals_sum_of_frames(self, vecs):
+        # A 1-row x 2-col region → sum of the two per-position frames.
+        f0 = vecs.render_frame(0, 0)
+        f1 = vecs.render_frame(0, 1)
+        reg = vecs.render_region(0, 1, 0, 2)
+        np.testing.assert_allclose(reg, f0 + f1, atol=1e-4)
+
+    def test_full_region_sums_all_frames(self, vecs):
+        ny, nx = vecs.nav_shape
+        ref = np.zeros_like(vecs.render_frame(0, 0))
+        for iy in range(ny):
+            for ix in range(nx):
+                ref += vecs.render_frame(iy, ix)
+        reg = vecs.render_region(0, ny, 0, nx)
+        np.testing.assert_allclose(reg, ref, atol=1e-4)
+
+    def test_bounds_clamped_and_ordered(self, vecs):
+        ny, nx = vecs.nav_shape
+        # Backwards + out-of-range bounds are sorted and clamped, never crash.
+        a = vecs.render_region(ny + 5, -3, nx + 2, -1)
+        assert a.shape == vecs.render_frame(0, 0).shape
+        # Degenerate (equal) bounds collapse to a single position == render_frame.
+        b = vecs.render_region(1, 1, 2, 2)
+        np.testing.assert_array_equal(b, vecs.render_frame(1, 2))
+
+    def test_no_full_dataset_compute(self, vecs, monkeypatch):
+        # Memory-safety: render_region must only touch the CSR buffer, never
+        # trigger a dask compute on any lazy array.
+        import dask.array as da
+        called = {"n": 0}
+        orig = da.Array.compute
+
+        def _spy(self, *a, **k):
+            called["n"] += 1
+            return orig(self, *a, **k)
+
+        monkeypatch.setattr(da.Array, "compute", _spy)
+        vecs.render_region(0, 2, 0, 2)
+        assert called["n"] == 0
+
+
 class TestVectorVirtualImaging:
     def test_intensity_weighted_matches_manual_sum(self, vecs):
         # ROI over the whole detector → every vector counts.
