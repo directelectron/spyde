@@ -95,24 +95,30 @@ test('edit toolbar: opens, lists a layer + annotation palette', async () => {
   await page.getByTestId(`report-figcell-edit-toggle-${cellId}`).click()
   const editPanel = page.getByTestId(`figcell-edit-${cellId}`)
   await expect(editPanel).toBeVisible()
-  // The edit dock now opens in FIGURE-LEVEL view by default (selection UI); select
-  // the first panel chip so the per-panel controls (layers + annotation palette)
-  // appear.
-  const panelChip = editPanel.locator('[data-testid^="figcell-chip-p"]').first()
-  await expect(panelChip).toBeVisible({ timeout: 10_000 })
-  await panelChip.click()
-  // A base layer row (cmap select) + the annotation add palette.
+  // Slim-bar redesign: a SINGLE-panel figure renders no chips and auto-targets
+  // its only panel — the layer row + add palette are present directly. The
+  // panel id comes from the authoritative report doc (the old figcell-panel-
+  // dock block is gone).
   await expect(editPanel.locator('[data-testid^="figcell-layer-cmap-"]').first()).toBeVisible()
-  const panelId = await editPanel.locator('[data-testid^="figcell-panel-"]').first()
-    .evaluate((el) => (el.getAttribute('data-testid') || '').replace('figcell-panel-', ''))
+  const panelId = await page.evaluate((cid: string) => {
+    const d = (window as any)._spyde_test_report?.()
+    const cell = d?.cells?.find((c: any) => c.id === cid)
+    return cell?.figure?.panels?.[0]?.id ?? null
+  }, cellId)
+  expect(panelId, 'no panel id in the report doc').toBeTruthy()
   await expect(page.getByTestId(`figcell-add-text-${panelId}`)).toBeVisible()
   await page.screenshot({ path: join(SHOTS, '02-edit-toolbar.png') })
   ctx.assertNoJsErrors()
 
-  // Add a Text annotation → the figure rebuilds; the annotation row appears.
+  // Add a Text annotation → the figure rebuilds; the annotation lands in the
+  // spec (annotation rows are popover-only now — poll the report doc).
   await page.getByTestId(`figcell-add-text-${panelId}`).click()
-  await expect(page.locator(`[data-testid^="figcell-annotation-${panelId}-"]`).first())
-    .toBeVisible({ timeout: 10_000 })
+  await expect.poll(async () => await page.evaluate((cid: string) => {
+    const d = (window as any)._spyde_test_report?.()
+    const cell = d?.cells?.find((c: any) => c.id === cid)
+    return (cell?.figure?.panels?.[0]?.annotations ?? []).length
+  }, cellId), { timeout: 10_000, message: '+ Text did not append a panel annotation' })
+    .toBeGreaterThan(0)
   await page.waitForTimeout(1500)   // let the rebuilt figure repaint
   await page.screenshot({ path: join(SHOTS, '03-annotation-added.png') })
   ctx.assertNoJsErrors()

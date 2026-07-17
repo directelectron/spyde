@@ -157,7 +157,19 @@ async function reportCellColoredPixels(page: any): Promise<number> {
   } catch { return -1 }
 }
 
-// Open the edit toolbar for the (single) figure cell; return {cellId, panelId}.
+/** The report doc's cell via the authoritative test hook (report_slimbar
+ *  pattern) — report_state is the source of truth for panels/layers. */
+async function docCell(page: any, cellId: string): Promise<any> {
+  return await page.evaluate((cid: string) => {
+    const d = (window as any)._spyde_test_report?.()
+    return d?.cells?.find((c: any) => c.id === cid) ?? null
+  }, cellId)
+}
+
+// Open the SLIM edit bar for the (single) figure cell; return {cellId, panelId}.
+// Post-Phase-2 there is no `figcell-panel-<id>` block and chips render only on
+// multi-panel cells — the panel id comes from report_state instead (the same
+// source report_slimbar.spec.ts reads).
 async function openEditToolbar(page: any): Promise<{ cellId: string; panelId: string }> {
   const figCell = page.locator('[data-testid^="report-figcell-"]').first()
   const cellId = await figCell.evaluate((el) =>
@@ -169,17 +181,10 @@ async function openEditToolbar(page: any): Promise<{ cellId: string; panelId: st
   await expect(toggle).toBeVisible()
   // Only open if not already open.
   if (!(await page.getByTestId(`figcell-edit-${cellId}`).count())) await toggle.click()
-  const editPanel = page.getByTestId(`figcell-edit-${cellId}`)
-  await expect(editPanel).toBeVisible()
-  // The edit dock now opens in FIGURE-LEVEL view by default (selection UI); the
-  // per-panel block (`figcell-panel-<id>`) shows only when a panel is SELECTED.
-  // Click the first panel chip (a single-letter chip whose testid is
-  // `figcell-chip-p<id>`, distinct from the `figcell-chip-figure-<cell>` chip) so
-  // the panel controls appear, then read the panel id.
-  const panelChip = editPanel.locator('[data-testid^="figcell-chip-p"]').first()
-  if (await panelChip.count()) await panelChip.click()
-  const panelId = await editPanel.locator('[data-testid^="figcell-panel-"]').first()
-    .evaluate((el) => (el.getAttribute('data-testid') || '').replace('figcell-panel-', ''))
+  await expect(page.getByTestId(`figcell-edit-${cellId}`)).toBeVisible()
+  const cell = await docCell(page, cellId)
+  const panelId = cell?.figure?.panels?.[0]?.id
+  expect(panelId, 'no panel id in the report doc').toBeTruthy()
   return { cellId, panelId }
 }
 
@@ -273,15 +278,13 @@ test('b) new signal cell + its OWN navigator center-drop → Callout prompt → 
   const oldFigId = await figCell.locator('iframe[data-testid^="figure-"]')
     .first().getAttribute('data-testid')
 
-  // Panel count BEFORE the callout (single panel). Round-2 shows only the SELECTED
-  // panel's `figcell-panel-<id>` block (and that prefix now ALSO matches the new
-  // per-panel `figcell-panel-refresh-<id>` button), so count PANEL CHIPS instead —
-  // the chip row enumerates EVERY panel (`figcell-chip-p<id>`), independent of
-  // selection, which is the true panel count.
+  // Panel count BEFORE the callout (single panel). The slim bar's chips list
+  // GRID panels only (a callout's hidden inset panel never gets a chip — the
+  // Phase-3 chip fix), so the true spec-panel count comes from report_state.
   const before = await openEditToolbar(page)
-  const panelChips = (cellId: string) =>
-    page.locator(`[data-testid="figcell-chips-${cellId}"] [data-testid^="figcell-chip-p"]`)
-  const panelsBefore = await panelChips(before.cellId).count()
+  const panelCount = async (cellId: string) =>
+    (await docCell(page, cellId))?.figure?.panels?.length ?? 0
+  const panelsBefore = await panelCount(before.cellId)
   console.log('[compose] panels before callout =', panelsBefore)
   expect(panelsBefore).toBe(1)
   // Close the editor so the compose shield isn't obstructed by the edit panel.
@@ -310,10 +313,10 @@ test('b) new signal cell + its OWN navigator center-drop → Callout prompt → 
   }).not.toBe(oldFigId)
   await page.waitForTimeout(2000)
 
-  // The edit toolbar now lists a SECOND panel (the inset callout panel) — count
-  // the panel CHIPS (every panel gets one, selection-independent).
+  // The spec now carries a SECOND panel (the hidden inset callout panel) —
+  // report_state is authoritative (the inset panel deliberately gets no chip).
   const after = await openEditToolbar(page)
-  await expect.poll(async () => panelChips(after.cellId).count(), {
+  await expect.poll(async () => panelCount(after.cellId), {
     timeout: 10_000, message: 'callout did not add an inset panel to the cell',
   }).toBeGreaterThanOrEqual(2)
 
