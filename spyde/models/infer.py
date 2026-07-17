@@ -185,6 +185,22 @@ def detect(model, frame: np.ndarray, device, thresh: float = 0.3,
     return pred
 
 
+def _neural_sub_batch_size() -> int:
+    """Sub-batch size (frames per forward pass) for ``detect_batch``. A single
+    forward pass over a whole nav chunk (1000+ frames) allocates activations for
+    every frame at once — tens of GB for a big U-Net. Looping in fixed sub-batches
+    bounds peak activation memory to O(K) instead of O(N) while keeping identical
+    results (the loop is purely a memory/throughput knob; the per-frame maths is
+    unchanged). ``SPYDE_NEURAL_BATCH`` overrides the default; parsed once per call,
+    clamped >= 1."""
+    import os
+    try:
+        k = int(os.environ.get("SPYDE_NEURAL_BATCH", "64"))
+    except ValueError:
+        k = 64
+    return max(1, k)
+
+
 @torch.no_grad()
 def detect_batch(model, frames, device, thresh: float = 0.3,
                  min_distance: int = 4, auto_scale: bool = True,
@@ -202,6 +218,13 @@ def detect_batch(model, frames, device, thresh: float = 0.3,
     uniformly (cheaper, and what the scale-norm design recommends — "reuse one
     estimate across a stack"). The whole batch must share one H,W for a single
     tensor, so a shared factor is also required to keep frames the same shape.
+
+    Memory: the (N,H,W) stack is run through the U-Net in fixed sub-batches of
+    ``SPYDE_NEURAL_BATCH`` frames (default 64), NOT as one (N,1,H,W) tensor — a
+    single pass over a full nav chunk (1000+ frames) held ~16 GB of activations.
+    The scale/NMS-window/bg_sigma are resolved ONCE from ``frames[0]`` (below,
+    outside the sub-batch loop) so results are bit-identical to a single pass;
+    only the forward+decode is chunked.
     """
     frames = np.asarray(frames, dtype=np.float32)
     if frames.ndim == 2:
@@ -233,10 +256,19 @@ def detect_batch(model, frames, device, thresh: float = 0.3,
     stack = np.stack(nrm_list, 0)
     stack = np.stack([_pad_to_multiple(n, levels) for n in stack], 0)
 
-    x = torch.from_numpy(stack[:, None]).to(device)
-    hm, off = model(x)
-    res = decode_batch(hm, off, thresh=thresh, min_distance=md)
-    per_frame = split_by_batch(res, N)
+    K = _neural_sub_batch_size()
+    is_cuda = device.type == "cuda"
+    per_frame: list = []
+    for i0 in range(0, N, K):
+        chunk = stack[i0:i0 + K]
+        x = torch.from_numpy(chunk[:, None]).to(device)
+        hm, off = model(x)
+        res = decode_batch(hm, off, thresh=thresh, min_distance=md)
+        per_frame.extend(split_by_batch(res, chunk.shape[0]))
+        del x, hm, off, res
+        if is_cuda:
+            torch.cuda.empty_cache()
+
     if factor != 1.0:
         for i, p in enumerate(per_frame):
             if len(p):

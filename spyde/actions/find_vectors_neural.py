@@ -165,20 +165,27 @@ def _refine_block(peaks_grid, ny, nx, flat, beamstop_mask):
 def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
                   bg_sigma=None, persistence=False, spot_radius=None):
     """Run the neural detector on a (ny, nx, KY, KX) block → NaN-padded
-    (ny, nx, MAX_PEAKS, 3). Batches the whole block through one forward pass on the
-    torch GPU when available; per-frame CPU otherwise. ``bg_sigma`` is the calibrated
-    local-norm high-pass scale (see calibrate_neural). ``persistence`` drops
-    extraneous (non-neighbour-confirmed) peaks (uses the block's scan neighbours).
+    (ny, nx, MAX_PEAKS, 3). Batches the whole block through the torch GPU when
+    available (internally sub-batched by ``detect_batch``, see infer.py, so a
+    1000+ frame nav chunk never allocates activations for more than
+    ``SPYDE_NEURAL_BATCH`` frames at once); per-frame CPU otherwise. ``bg_sigma``
+    is the calibrated local-norm high-pass scale (see calibrate_neural).
+    ``persistence`` drops extraneous (non-neighbour-confirmed) peaks (uses the
+    block's scan neighbours).
 
     GPU use honours the SPYDE_FV_GPU worker policy (``_gpu_task_allowed``), with a
     neural-specific unset-default of "2": two CUDA-submitting workers keep the
     device fed while the rest run the per-frame CPU path. Real-data A/B
     (2026-07-16, 48-core/1-GPU box): all-workers CUDA was SLOWER (context
     thrash) and lagged the desktop; 2 workers was faster and smooth. Must match
-    orchestrate's lane_mode. Set SPYDE_FV_GPU=one/N/all/off to override."""
+    orchestrate's lane_mode. Set SPYDE_FV_GPU=one/N/all/off to override. The
+    forward pass itself is additionally bounded by ``_gpu_slots()``
+    (SPYDE_FV_GPU_CONC, default 2) — the same device-concurrency semaphore the
+    numba NXCORR path uses — so concurrent CUDA-submitting workers don't each
+    hold a full activation set on the device simultaneously."""
     from spyde import models
     from spyde.actions.find_vectors import MAX_PEAKS, _with_raw_intensity
-    from spyde.actions.find_vectors.gpu_runtime import _gpu_task_allowed
+    from spyde.actions.find_vectors.gpu_runtime import _gpu_slots, _gpu_task_allowed
     from spyde.actions.find_vectors_torch import torch_gpu_device
 
     out = np.full((b4d.shape[0], b4d.shape[1], MAX_PEAKS, 3), np.nan, dtype=np.float32)
@@ -189,12 +196,17 @@ def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
     peaks_list = None
     try:
         if torch_gpu_device() is not None and _gpu_task_allowed(default_mode="4"):
-            # One forward pass for the whole chunk on the GPU.
-            raw = models.detect_batch(
-                model, flat, device, thresh=float(threshold),
-                min_distance=int(min_dist),
-                bg_sigma=(float(bg_sigma) if bg_sigma is not None else None),
-                spot_diameter=(2.0 * spot_radius) if spot_radius else None)
+            # Bound concurrent forward passes per process (same semaphore the
+            # numba NXCORR path uses — chunk.py's _device_section — so a mixed
+            # run shares one device-concurrency budget, SPYDE_FV_GPU_CONC).
+            with _gpu_slots():
+                # Sub-batched internally (SPYDE_NEURAL_BATCH) — NOT one forward
+                # pass for the whole chunk; see infer.detect_batch.
+                raw = models.detect_batch(
+                    model, flat, device, thresh=float(threshold),
+                    min_distance=int(min_dist),
+                    bg_sigma=(float(bg_sigma) if bg_sigma is not None else None),
+                    spot_diameter=(2.0 * spot_radius) if spot_radius else None)
             peaks_list = []
             for i, p in enumerate(raw):
                 p = _apply_beamstop(np.asarray(p, np.float32).reshape(-1, 3),
