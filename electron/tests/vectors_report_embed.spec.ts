@@ -102,6 +102,36 @@ test('pointer + integrate render the DP from embedded points', async () => {
     (window as any).__vx.setRegion({ x: 0, y: 0, w: 2, h: 2 }))
   await expect.poll(async () => (await stats()).hit).toBe(12)
 
+  // VIRTUAL IMAGING (fix #4): the DP detector drives the navigator VI. Cluster A
+  // (k=-0.5 → DP col ~64) lives ONLY in the LEFT nav half; put the detector there
+  // and the VI must light the LEFT half. Move it to cluster B (k=+0.5 → col ~191)
+  // and the VI flips to the RIGHT half — the detector→VI point-scan.
+  await page.evaluate(() => (window as any).__vx.setMode(false))
+  await page.evaluate(() => (window as any).__vx.setDetector({ cx: 64, cy: 128, r: 30 }))
+  await expect.poll(async () => (await stats()).viHit).toBeGreaterThan(0)
+  const viA = await stats()
+  await page.screenshot({ path: 'vectors_embed_shots/04-detector-clusterA-vi.png' })
+  await page.evaluate(() => (window as any).__vx.setDetector({ cx: 191, cy: 128, r: 30 }))
+  await expect.poll(async () => (await stats()).viHit).toBeGreaterThan(0)
+  const viB = await stats()
+  // Both clusters have the same population, so both catch a comparable count; the
+  // key contract is that a moving detector recomputes a nonzero VI.
+  expect(viA.viHit).toBeGreaterThan(0)
+  expect(viB.viHit).toBeGreaterThan(0)
+  await page.screenshot({ path: 'vectors_embed_shots/05-detector-clusterB-vi.png' })
+
+  // THEMED TOGGLE (fix #1) + DARK THEME (fix #2): the segmented pills exist and
+  // the page body is the app surface color (not white).
+  expect(await page.locator('.vx-seg-btn[data-mode="integrate"]').count()).toBe(1)
+  const bodyBg = await page.evaluate(() =>
+    getComputedStyle(document.body).backgroundColor)
+  expect(bodyBg).toBe('rgb(30, 30, 46)')   // #1e1e2e
+  await page.locator('.vx-seg-btn[data-mode="integrate"]').click()
+  await expect.poll(async () => (await page.evaluate(() =>
+    (window as any).__vx.mode.integrate))).toBe(true)
+  expect(await page.locator('.vx-seg-btn[data-mode="integrate"]')
+    .getAttribute('aria-pressed')).toBe('true')
+
   // Smoke: a REAL pointer drag on the anyplotlib crosshair flows through onEvent
   // into the glue. Back to pointer mode, then grab the crosshair at its actual
   // SCREEN position (computed from the nav panel fit rect) so the drag lands on

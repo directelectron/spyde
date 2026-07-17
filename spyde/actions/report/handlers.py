@@ -187,6 +187,7 @@ class ReportManager:
         self._edit_wiring.clear()
         self._ann_widgets.clear()
         self._selected.clear()
+        _clear_vectors_explorer_cache()
 
     def close_windows(self) -> None:
         """Tear down every open figure window (through the session's forget path
@@ -216,6 +217,7 @@ class ReportManager:
         self._edit_wiring.clear()
         self._ann_widgets.clear()
         self._selected.clear()
+        _clear_vectors_explorer_cache()
 
     # ── state emission ─────────────────────────────────────────────────────────
 
@@ -359,7 +361,11 @@ class ReportManager:
             vecs = vectors_for_cell(self.session, cell)
             if vecs is None:
                 return None
-            html = vectors_explorer_html(vecs, caption=cell.caption or "")
+            # cache_key=cell.id memoizes the built page per (cell, vectors
+            # identity) so a rebuild for the same cell + same vectors reuses the
+            # packed blob + serialized figure instead of re-encoding (fix #6).
+            html = vectors_explorer_html(vecs, caption=cell.caption or "",
+                                         cache_key=cell.id)
             if html is None:            # over the embed cap / empty dataset
                 return None
         except Exception as e:
@@ -1193,6 +1199,17 @@ def _widget_geometry_to_data(kind, widget, axes, coords) -> "dict | None":
     return None
 
 
+def _clear_vectors_explorer_cache(cell_id: "str | None" = None) -> None:
+    """Drop the memoized vectors-explorer page(s) (fix #6). Best-effort; a lazy
+    import so vectors_embed (which pulls anyplotlib) isn't loaded at handler
+    import time. ``cell_id`` clears one cell; ``None`` clears all."""
+    try:
+        from spyde.actions.report.vectors_embed import clear_explorer_cache
+        clear_explorer_cache(cell_id)
+    except Exception as e:
+        log.debug("clear vectors explorer cache failed: %s", e)
+
+
 def _manager(session) -> ReportManager:
     """Return (creating lazily) the session's ReportManager."""
     mgr = getattr(session, "_report", None)
@@ -1969,6 +1986,7 @@ def report_remove_cell(session, plot, payload) -> None:
         mgr._edit_wiring.pop(cell.id, None)
         mgr._ann_widgets.pop(cell.id, None)
         mgr._selected.pop(cell.id, None)
+        _clear_vectors_explorer_cache(cell.id)
     mgr.doc.cells = [c for c in mgr.doc.cells if c.id != cell.id]
     mgr.dirty = True
     mgr.emit_state()
@@ -2001,6 +2019,9 @@ def report_set_caption(session, plot, payload) -> None:
     if cell is None or cell.cell_type != "figure":
         return
     cell.caption = str(payload.get("caption", "") or "")
+    # A vectors-explorer page bakes the caption in; drop its memoized page so the
+    # next rebuild picks up the new caption (fix #6 cache correctness).
+    _clear_vectors_explorer_cache(cell.id)
     mgr.dirty = True
     mgr.emit_state()
 
@@ -2115,6 +2136,8 @@ def report_refresh_figure(session, plot, payload) -> None:
         mgr.emit_state()
         return
     mgr._offline.discard(cell.id)
+    # Explicit refresh → always rebuild the explorer page from fresh vectors.
+    _clear_vectors_explorer_cache(cell.id)
     mgr.build_figure_window(cell)
     mgr.dirty = True
     mgr.emit_state()
@@ -2143,6 +2166,8 @@ def repfig_refresh_panel(session, plot, payload) -> None:
         return
     if not refresh_panel(session, mgr, cell, panel):
         return
+    # Explicit refresh → always rebuild the explorer page from fresh vectors.
+    _clear_vectors_explorer_cache(cell.id)
     mgr.build_figure_window(cell)
     mgr.dirty = True
     mgr.emit_state()

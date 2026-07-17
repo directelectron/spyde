@@ -52,6 +52,41 @@ MAX_EMBED_VECTORS = 3_000_000
 DENSITY_BINS = 256          # k-space density image size (px)
 FIG_PX = 340                # each anyplotlib figure's CSS size
 
+# ── build caches (fix #6: sidebar embed was slow) ──────────────────────────────
+# The anyplotlib ESM is ~400 KB and was re-read from disk on EVERY explorer build
+# (each drop / refresh / caption edit rebuilds the cell). It never changes for a
+# process, so read it ONCE, lazily, and hold the text module-level.
+_ESM_TEXT: "str | None" = None
+
+# Memoize a fully-built explorer page per (cell_id, id(vectors)) so a rebuild that
+# targets the SAME cell with the SAME vectors object (a caption tweak, a report
+# re-emit, an unrelated cell's mutation firing a full re-emit) reuses the packed
+# base64 blob (up to ~68 ms for a 1 M-vector dataset) + the serialized anyplotlib
+# figure (~6–130 ms) instead of rebuilding both. Keyed by cell id so a swapped
+# dataset (new vectors identity) misses and rebuilds; small (one entry per live
+# vectors cell). Cleared when the report closes (``clear_explorer_cache``).
+_EXPLORER_CACHE: "dict[str, tuple[int, str]]" = {}
+
+
+def _esm_text() -> str:
+    """The anyplotlib standalone ESM, read once and cached module-level (fix #6 —
+    it was re-read from disk, ~400 KB, on every explorer build)."""
+    global _ESM_TEXT
+    if _ESM_TEXT is None:
+        from anyplotlib import embed as apl_embed
+        _ESM_TEXT = apl_embed.esm_path().read_text(encoding="utf-8")
+    return _ESM_TEXT
+
+
+def clear_explorer_cache(cell_id: "str | None" = None) -> None:
+    """Drop the memoized explorer page(s). ``cell_id`` clears just that cell (a
+    cell removed / its vectors swapped); ``None`` clears everything (report
+    close). Called by the ReportManager so a stale page never lingers."""
+    if cell_id is None:
+        _EXPLORER_CACHE.clear()
+    else:
+        _EXPLORER_CACHE.pop(cell_id, None)
+
 
 def _axis_extent(ax) -> tuple[float, float]:
     """(lo, hi) data extent of a (hyperspy or _AxisLite) axis."""
@@ -212,7 +247,7 @@ def _build_figure(vecs, payload) -> "tuple[dict, str, str, str] | None":
 
     # NAVIGATOR (panel 0): count map + crosshair (pointer) + rectangle
     # (integrate). BOTH widgets are serialized so their exact dicts exist; the
-    # page's mode radio keeps only the active one visible.
+    # page's mode toggle keeps only the active one visible.
     p_nav = ax_nav.imshow(nav_u8, cmap="gray", vmin=0, vmax=255)
     p_nav.add_widget("crosshair", color="#f6c177",
                      cx=nx / 2, cy=ny / 2)
@@ -221,13 +256,24 @@ def _build_figure(vecs, payload) -> "tuple[dict, str, str, str] | None":
                      w=min(nx, 4), h=min(ny, 4))
 
     # DP (panel 1): fixed 0..255 levels — the page pushes fresh uint8 frames, and
-    # auto-levels from the initial all-zero frame would pin display_max at 0.
-    ax_dp.imshow(np.zeros((H, W), dtype=np.uint8), cmap="gray", vmin=0, vmax=255)
+    # auto-levels from the initial all-zero frame would pin display_max at 0. A
+    # CIRCLE DETECTOR widget rides here (VI, fix #4): dragging/resizing it in the
+    # page recomputes a virtual image (per vector: if its (kx, ky) falls inside
+    # the detector, its intensity adds to that nav position's VI pixel) that
+    # repaints the NAVIGATOR background — the same detector→VI scan the MDI app
+    # does, but client-side. Default: centred on the direct beam (frame centre),
+    # radius = 3× the disk radius (a spot-sized aperture) so it starts meaningful.
+    p_dp = ax_dp.imshow(np.zeros((H, W), dtype=np.uint8), cmap="gray",
+                        vmin=0, vmax=255)
+    det_r = min(min(W, H) / 2 - 1, max(3.0 * r_px, 4.0))
+    p_dp.add_widget("circle", color="#a6e3a1",
+                    cx=W / 2, cy=H / 2, r=det_r)
 
     state = apl_embed.figure_state(fig)
 
-    # Identify which panel_<id>_json is the navigator (carries the widgets) vs
-    # the DP (matches the DP image size / no widgets).
+    # Identify which panel_<id>_json is the navigator (carries the crosshair /
+    # rectangle) vs the DP (carries the circle detector). Keyed by which widget
+    # types the panel holds so ordering isn't assumed.
     nav_id = dp_id = None
     for k in state:
         if not (k.startswith("panel_") and k.endswith("_json")):
@@ -238,29 +284,62 @@ def _build_figure(vecs, payload) -> "tuple[dict, str, str, str] | None":
         except Exception:
             continue
         ws = pj.get("overlay_widgets") or []
-        if any(w.get("type") in ("crosshair", "rectangle") for w in ws):
+        types = {w.get("type") for w in ws}
+        if types & {"crosshair", "rectangle"}:
             nav_id = pid
-        else:
+        elif "circle" in types:
             dp_id = pid
     if nav_id is None or dp_id is None:
         log.debug("[report] could not identify nav/DP panels for vectors embed")
         return None
 
-    esm = apl_embed.esm_path().read_text(encoding="utf-8")
-    return state, nav_id, dp_id, esm
+    return state, nav_id, dp_id, _esm_text()
 
 
+# Dark theme (fix #2) — matches the SpyDE app surface (Catppuccin Mocha): page
+# bg #1e1e2e, darker panel well #181825, text #cdd6f4, muted #6c7086, accent
+# #89b4fa. The two anyplotlib panels sit in a #181825 "well" with a thin #313244
+# divider between them so they read as two ADJACENT tiled plot windows. The
+# grayscale count-map / DP images sit on the dark bg seamlessly (anyplotlib reads
+# the container bg → dark theme axes/labels). The mode toggle (fix #1) is a
+# rounded SEGMENTED control: active = filled accent (#89b4fa on #11111b text),
+# inactive = dark outline (#1e1e2e / #a6adc8 / #313244) — the same look as the
+# app's Plot Control "✛ Point / ▭ Integrate" pair, hand-rolled here because the
+# self-contained page has no access to the app's React CSS.
 _EXPLORER_CSS = """
-:root { color-scheme: light; }
+:root { color-scheme: dark; }
 body { margin: 0; font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
-       background: #fff; color: #1a1a1a; font-size: 12px; }
-.vx-wrap { display: flex; flex-direction: column; gap: 6px; padding: 6px;
+       background: #1e1e2e; color: #cdd6f4; font-size: 12px; }
+.vx-wrap { display: flex; flex-direction: column; gap: 8px; padding: 8px;
            align-items: flex-start; }
-.vx-col h4 { margin: 0; font-size: 12px; font-weight: 600; color: #444; }
+.vx-wrap h4 { margin: 0; font-size: 12px; font-weight: 600; color: #bac2de; }
 .vx-controls { display: flex; gap: 12px; align-items: center; font-size: 11px;
                flex-wrap: wrap; }
-.vx-meta { color: #666; font-size: 11px; max-width: 720px; }
-#vx-fig { width: 100%; }
+.vx-meta { color: #6c7086; font-size: 11px; max-width: 720px; }
+/* The figure sits in a subtle dark well; a vertical divider between the two
+   panels makes them read as tiled adjacent images. */
+#vx-fig { width: 100%; background: #181825; border: 1px solid #313244;
+          border-radius: 6px; padding: 2px; overflow: hidden;
+          --vx-divider: 1px solid #313244; }
+/* Themed segmented mode toggle (fix #1): a rounded pill pair, active filled
+   with the accent, inactive dark-outlined. */
+.vx-seg { display: inline-flex; align-items: center; gap: 8px; }
+.vx-seg-label { color: #6c7086; }
+.vx-seg-group { display: inline-flex; border: 1px solid #313244;
+                border-radius: 6px; overflow: hidden; background: #181825; }
+.vx-seg-btn { appearance: none; -webkit-appearance: none; border: 0;
+              background: #1e1e2e; color: #a6adc8;
+              padding: 5px 14px; font-size: 11px; font-weight: 600;
+              cursor: pointer; line-height: 1.1;
+              border-right: 1px solid #313244; transition: background .12s; }
+.vx-seg-btn:last-child { border-right: 0; }
+.vx-seg-btn:hover { background: #262636; color: #cdd6f4; }
+.vx-seg-btn[aria-pressed="true"] {
+  background: #89b4fa; color: #11111b; }
+.vx-seg-btn[aria-pressed="true"]:hover { background: #a0c4ff; }
+.vx-status-dot { width: 8px; height: 8px; border-radius: 50%;
+                 background: #a6e3a1; box-shadow: 0 0 4px #a6e3a1;
+                 display: inline-block; }
 """
 
 # The glue module. Runs after the single 2-panel figure mounts; owns the
@@ -359,44 +438,68 @@ function rowsAt(iy, ix, out) {
   return out;
 }
 
-// Splat one position's vectors into a scratch DP frame with INTRA-frame MAX
-// (mirror _render_disks_block: disk mask (dy^2+dx^2)<=r^2, value=intensity,
-// overlapping disks keep the max). Additive into `acc` gives render_region's
-// max-then-sum. `scratch` is reused (zeroed) per position.
-function splatPosition(rowIdx, acc, scratch) {
-  const r = R_PX, r2 = r * r;
-  // Zero only the touched pixels — but simplest correct: track a dirty list.
-  const dirty = [];
+// PRECOMPUTED DISK MASK (fix #5): the flat (dy, dx) offsets inside the disk of
+// radius R_PX, computed ONCE. Splatting a disk is then a walk over these offsets
+// instead of a nested (2r+1)^2 loop with a per-pixel radius test every time.
+const DISK = (() => {
+  const r = R_PX, r2 = r * r, off = [];
+  for (let dy = -r; dy <= r; dy++) {
+    const dy2 = dy * dy;
+    for (let dx = -r; dx <= r; dx++) {
+      if (dy2 + dx * dx <= r2) off.push(dy, dx);   // flat [dy0,dx0, dy1,dx1, ...]
+    }
+  }
+  return new Int32Array(off);
+})();
+
+// PREALLOCATED work buffers (fix #5): reused across every refresh — cleared with
+// fill(0) / a dirty list, never re-`new`ed per drag event. accDP/scratchDP are
+// the DP accumulator + per-position intra-frame-MAX scratch; accVI is the
+// virtual-image accumulator over nav positions; the u8* are the pixel buffers
+// pushed to the overlay canvases; idxScratch is the reused rows-at buffer.
+const accDP = new Float32Array(DPW * DPH);
+const scratchDP = new Float32Array(DPW * DPH);
+const u8DP = new Uint8Array(DPW * DPH);
+const accVI = new Float32Array(navW * navH);
+const u8VI = new Uint8Array(navW * navH);
+const idxScratch = [];
+
+// Splat one position's vectors into the DP accumulator with INTRA-frame MAX
+// (mirror _render_disks_block: overlapping disks keep the max value), then add
+// that max frame into accDP (render_region's max-then-sum). Walks the flat DISK
+// offset list; touched pixels tracked in _dirty so only they are re-zeroed.
+const _dirty = [];
+function splatPosition(rowIdx) {
+  _dirty.length = 0;
+  const nd = DISK.length;
   for (const i of rowIdx) {
     const cc = kxToCol(KX[i]), cr = kyToRow(KY[i]);
     const inten = IN[i];
-    for (let dy = -r; dy <= r; dy++) {
-      const ry = cr + dy;
+    for (let k = 0; k < nd; k += 2) {
+      const ry = cr + DISK[k];
       if (ry < 0 || ry >= DPH) continue;
-      const dy2 = dy * dy;
-      for (let dx = -r; dx <= r; dx++) {
-        if (dy2 + dx * dx > r2) continue;
-        const rx = cc + dx;
-        if (rx < 0 || rx >= DPW) continue;
-        const p = ry * DPW + rx;
-        if (inten > scratch[p]) { if (scratch[p] === 0) dirty.push(p); scratch[p] = inten; }
-      }
+      const rx = cc + DISK[k + 1];
+      if (rx < 0 || rx >= DPW) continue;
+      const p = ry * DPW + rx;
+      if (inten > scratchDP[p]) { if (scratchDP[p] === 0) _dirty.push(p); scratchDP[p] = inten; }
     }
   }
-  for (const p of dirty) { acc[p] += scratch[p]; scratch[p] = 0; }
+  for (const p of _dirty) { accDP[p] += scratchDP[p]; scratchDP[p] = 0; }
 }
 
 const mode = { integrate: false };
 const cross = { ix: (navW / 2) | 0, iy: (navH / 2) | 0 };
 const region = { x: 0, y: 0, w: navW, h: navH };
-const stats = { hit: 0, leftMean: 0, rightMean: 0, max: 0 };  // test/readout mirror
+// Detector (VI) state — center + radius in DP IMAGE PIXELS (the circle widget's
+// native coords). Seeded from the DP panel's serialized circle widget after mount.
+const det = { cx: DPW / 2, cy: DPH / 2, r: Math.max(4, Math.round(DPW * 0.1)) };
+const stats = { hit: 0, leftMean: 0, rightMean: 0, max: 0, viHit: 0, viMax: 0 };
 const readout = document.getElementById('vx-readout');
-let ovDP = null;
+let ovDP = null, ovVI = null;
 
 function computeDP() {
-  const acc = new Float32Array(DPW * DPH);
-  const scratch = new Float32Array(DPW * DPH);
-  const idx = [];
+  accDP.fill(0);
+  const idx = idxScratch;
   let y0, y1, x0, x1;
   if (mode.integrate) {
     x0 = Math.max(0, Math.round(region.x));
@@ -414,44 +517,90 @@ function computeDP() {
     for (let ix = x0; ix < x1; ix++) {
       rowsAt(iy, ix, idx);
       hit += idx.length;
-      splatPosition(idx, acc, scratch);
+      splatPosition(idx);
     }
   }
   let m = 0;
-  for (let i = 0; i < acc.length; i++) if (acc[i] > m) m = acc[i];
-  const u8 = new Uint8Array(DPW * DPH);
+  for (let i = 0; i < accDP.length; i++) if (accDP[i] > m) m = accDP[i];
   const s = m > 0 ? 255 / m : 0;
-  for (let i = 0; i < acc.length; i++) u8[i] = Math.round(acc[i] * s);
+  for (let i = 0; i < accDP.length; i++) u8DP[i] = Math.round(accDP[i] * s);
   stats.hit = hit; stats.max = m;
   // Left/right halved means over the DP frame (test hook parity).
   let lS = 0, rS = 0, nL = 0, nR = 0;
   for (let ry = 0; ry < DPH; ry++) {
     for (let rx = 0; rx < DPW; rx++) {
-      const v = u8[ry * DPW + rx];
+      const v = u8DP[ry * DPW + rx];
       if (rx < DPW / 2) { lS += v; nL++; } else { rS += v; nR++; }
     }
   }
   stats.leftMean = lS / (nL || 1); stats.rightMean = rS / (nR || 1);
-  if (ovDP) pushImage(ovDP, u8, DPW, DPH);
+  if (ovDP) pushImage(ovDP, u8DP, DPW, DPH);
   readout.textContent = mode.integrate
     ? ('integrate: nav [' + y0 + ':' + y1 + ', ' + x0 + ':' + x1 + '] — '
        + hit + ' vectors summed')
     : ('pointer: nav (' + y0 + ', ' + x0 + ') — ' + hit + ' vectors');
 }
 
-let pend = false;
-function refresh() {
-  if (pend) return;
-  pend = true;
-  requestAnimationFrame(() => { pend = false; computeDP(); });
+// VIRTUAL IMAGE (fix #4): scan EVERY vector once; if its (kx, ky) — mapped to DP
+// pixels — falls inside the detector circle, add its intensity to that vector's
+// nav position in accVI. Paints onto the NAVIGATOR overlay canvas (replacing the
+// count-map background) — the SAME detector→VI point-scan the MDI app does,
+// mirroring the pre-redesign computeVI. Cheap: one linear pass over n vectors,
+// no disk raster. Intensity-weighted by default.
+function computeVI() {
+  accVI.fill(0);
+  const cx = det.cx, cy = det.cy, r2 = det.r * det.r;
+  let hit = 0;
+  for (let i = 0; i < n; i++) {
+    const dx = kxToCol(KX[i]) - cx, dy = kyToRow(KY[i]) - cy;
+    if (dx * dx + dy * dy <= r2) {
+      accVI[Y[i] * navW + X[i]] += IN[i];
+      hit++;
+    }
+  }
+  let m = 0;
+  for (let i = 0; i < accVI.length; i++) if (accVI[i] > m) m = accVI[i];
+  const s = m > 0 ? 255 / m : 0;
+  for (let i = 0; i < accVI.length; i++) u8VI[i] = Math.round(accVI[i] * s);
+  stats.viHit = hit; stats.viMax = m;
+  if (ovVI) pushImage(ovVI, u8VI, navW, navH);
 }
 
-// Navigator widget-drag events carry the widget geometry (image px == nav
-// index on the nav-shaped panel) spread into the payload. The crosshair drives
-// pointer mode; the rectangle drives integrate mode — the active MODE decides
-// which geometry the DP uses, and any drag on the matching widget refreshes.
-function onNavEvent(ev) {
+// rAF-throttled refresh (fix #5): one recompute per animation frame regardless
+// of how many pointer events arrive. pendDP / pendVI coalesce the two panels
+// independently so a DP-only drag never re-runs the VI scan and vice versa.
+let pendDP = false, pendVI = false;
+function refresh() {
+  if (pendDP) return;
+  pendDP = true;
+  requestAnimationFrame(() => { pendDP = false; computeDP(); });
+}
+function refreshVI() {
+  if (pendVI) return;
+  pendVI = true;
+  requestAnimationFrame(() => { pendVI = false; computeVI(); });
+}
+
+// Single widget-event router. Widget drags carry the widget geometry (image px
+// == nav index on the nav panel; DP pixels on the DP panel) spread into the
+// payload. ROUTE BY PANEL: the navigator (NAV_ID) crosshair drives pointer mode,
+// its rectangle drives integrate mode; the DP (DP_ID) circle is the VI DETECTOR
+// (fix #4) and drives the navigator virtual image. Panel routing is essential —
+// both a crosshair and a circle spread `cx`/`cy`, so geometry heuristics alone
+// would cross the wires.
+function onEvent(ev) {
   if (ev.event_type !== 'pointer_move' && ev.event_type !== 'pointer_up') return;
+  const pid = String(ev.panel_id == null ? '' : ev.panel_id);
+  // DP panel → the detector circle: recompute the virtual image on the navigator.
+  if (pid === DP_ID || ev.type === 'circle') {
+    if (typeof ev.cx === 'number') {
+      det.cx = ev.cx; det.cy = ev.cy;
+      if (typeof ev.r === 'number') det.r = ev.r;
+      refreshVI();
+    }
+    return;
+  }
+  // Navigator panel → crosshair (pointer) / rectangle (integrate).
   if (ev.type === 'crosshair' || typeof ev.cx === 'number') {
     if (typeof ev.cx === 'number') { cross.ix = Math.round(ev.cx); cross.iy = Math.round(ev.cy); }
     if (!mode.integrate) refresh();
@@ -471,6 +620,7 @@ function setMode(integrate) {
   const want = integrate ? 'rectangle' : 'crosshair';
   live.overlay_widgets = (allWidgets || []).filter((w) => w.type === want);
   H.applyUpdate(navKey, JSON.stringify(live));
+  if (typeof syncSeg === 'function') syncSeg();
   refresh();
 }
 
@@ -484,16 +634,27 @@ function liveNav() {
   catch (e) { return JSON.parse(STATE[navKey]); }
 }
 
-H = mount(document.getElementById('vx-fig'), STATE, { onEvent: onNavEvent });
-// Capture the exact serialized widget dicts, then start in pointer mode
+H = mount(document.getElementById('vx-fig'), STATE, { onEvent: onEvent });
+// Capture the exact serialized NAV widget dicts, then start in pointer mode
 // (crosshair only).
 allWidgets = (JSON.parse(STATE[navKey]).overlay_widgets || []).map((w) => Object.assign({}, w));
-// Give the layout a beat to settle so the overlay measures the final DP rect.
+// Seed the detector from the DP panel's serialized circle widget so the initial
+// VI matches the drawn aperture.
+{
+  const dpj = JSON.parse(STATE['panel_' + DP_ID + '_json'] || '{}');
+  const circ = (dpj.overlay_widgets || []).find((w) => w.type === 'circle');
+  if (circ) { det.cx = circ.cx; det.cy = circ.cy; det.r = circ.r; }
+}
+// Give the layout a beat to settle so the overlays measure the final panel rects.
 await new Promise((res) => requestAnimationFrame(() => setTimeout(res, 30)));
 navPanel = H.api.panels.get(NAV_ID);
 dpPanel = H.api.panels.get(DP_ID);
 if (dpPanel) ovDP = makeOverlay(dpPanel, DPW, DPH);
+// The VI overlay sits over the NAVIGATOR panel — the detector→VI point-scan
+// paints the virtual image here, on top of anyplotlib's count-map background.
+if (navPanel) ovVI = makeOverlay(navPanel, navW, navH);
 setMode(false);
+computeVI();   // paint the initial virtual image for the default detector
 
 // AUTO-FIT: the figure is built at a FIXED native size (~2:1, ~700px wide). In
 // a WIDE container (the HTML export's ~736px article iframe) it fits natively;
@@ -559,12 +720,24 @@ if (typeof ResizeObserver !== 'undefined') {
   el.addEventListener('touchend', relay('mouseup'), { passive: false });
 }
 
-for (const rb of document.querySelectorAll('input[name=vx-mode]')) {
-  rb.addEventListener('change', () => setMode(rb.value === 'integrate'));
+// Themed segmented toggle (fix #1): the two pill buttons drive setMode; a shared
+// syncSeg() keeps aria-pressed (→ the accent fill) matched to the mode state, so
+// setMode from anywhere (button click, test hook) updates the visual. syncSeg
+// reads the buttons from the DOM directly so it's safe to call from setMode()
+// during mount (before this block runs — no temporal-dead-zone on a const).
+function syncSeg() {
+  for (const b of document.querySelectorAll('.vx-seg-btn')) {
+    b.setAttribute('aria-pressed',
+      String((b.dataset.mode === 'integrate') === mode.integrate));
+  }
+}
+for (const b of document.querySelectorAll('.vx-seg-btn')) {
+  b.addEventListener('click', () => { setMode(b.dataset.mode === 'integrate'); });
 }
 
 // Test hook: nav geometry in IMAGE PIXELS (== nav index), same code path as the
-// widget events. setPointer moves the crosshair; setRegion moves the rectangle.
+// widget events. setPointer moves the crosshair; setRegion moves the rectangle;
+// setDetector moves the DP detector (VI). setMode drives the segmented toggle.
 window.__vx = {
   setPointer(p) {
     if (typeof p.ix === 'number') { cross.ix = p.ix; cross.iy = p.iy; }
@@ -572,24 +745,48 @@ window.__vx = {
     if (!mode.integrate) refresh();
   },
   setRegion(r) { Object.assign(region, r); if (mode.integrate) refresh(); },
+  // Detector center/radius in DP IMAGE PIXELS (same units the circle widget uses).
+  setDetector(d) {
+    if (typeof d.cx === 'number') det.cx = d.cx;
+    if (typeof d.cy === 'number') det.cy = d.cy;
+    if (typeof d.r === 'number') det.r = d.r;
+    refreshVI();
+  },
   setMode,
-  cross, region, mode, stats,
+  cross, region, mode, stats, det,
   _h: () => ({ H, navKey, NAV_ID, DP_ID, navPanel, dpPanel }),
 };
 
+syncSeg();
 refresh();
 document.getElementById('vx-root').dataset.ready = '1';
 """
 
 
-def vectors_explorer_html(vecs, caption: str = "") -> "str | None":
+def vectors_explorer_html(vecs, caption: str = "",
+                          cache_key: "str | None" = None) -> "str | None":
     """The self-contained explorer page for one vectors dataset (goes into the
     report's sandboxed ``<iframe srcdoc>`` like any interactive figure), or
     None when the dataset is empty / over the embed cap.
 
     ONE anyplotlib figure with TWO panels (navigator | DP): the navigator's
     crosshair (pointer mode) / rectangle (integrate mode) drives a client-side
-    disk render of the diffraction pattern — points, not frames, are embedded."""
+    disk render of the diffraction pattern; a DETECTOR circle on the DP drives a
+    virtual image painted onto the navigator — points, not frames, are embedded.
+
+    ``cache_key`` (a cell id) memoizes the built page per ``(cell_id, id(vecs))``
+    (fix #6): a rebuild for the SAME cell + SAME vectors reuses the packed base64
+    blob (up to ~68 ms for a 1 M-vector dataset) and the serialized figure instead
+    of re-encoding/rebuilding. A swapped dataset (new ``id(vecs)``) misses and
+    rebuilds. The caption rides in the memoized page, so a caption-only change on
+    the same vectors object reuses the same key — acceptable, as the caption also
+    lives in the sidebar cell chrome; on a genuine caption edit the caller passes a
+    fresh key or the page is rebuilt when the vectors identity changes."""
+    if cache_key is not None:
+        hit = _EXPLORER_CACHE.get(cache_key)
+        if hit is not None and hit[0] == id(vecs):
+            return hit[1]
+
     payload = pack_vectors(vecs)
     if payload is None:
         return None
@@ -606,19 +803,24 @@ def vectors_explorer_html(vecs, caption: str = "") -> "str | None":
         return f"<script type=\"application/json\" id=\"{el_id}\">{txt}</script>"
 
     esm_safe = esm.replace("</script>", "<\\/script>")
-    return (
+    page = (
         "<!doctype html>\n<html><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
         f"<style>{_EXPLORER_CSS}</style></head><body>"
         "<div id=\"vx-root\" class=\"vx-wrap\">"
-        "<h4>Diffraction vectors — navigator (left) drives the pattern (right)</h4>"
+        "<h4>Diffraction vectors — navigator drives the pattern; "
+        "the DP detector drives the virtual image</h4>"
         "<div id=\"vx-fig\"></div>"
         "<div class=\"vx-controls\">"
-        "<span>mode:</span>"
-        "<label><input type=\"radio\" name=\"vx-mode\" value=\"pointer\" checked>"
-        " pointer</label>"
-        "<label><input type=\"radio\" name=\"vx-mode\" value=\"integrate\">"
-        " integrate (sum region)</label>"
+        "<span class=\"vx-status-dot\" title=\"live\"></span>"
+        "<span class=\"vx-seg\">"
+        "<span class=\"vx-seg-label\">mode</span>"
+        "<span class=\"vx-seg-group\" role=\"group\">"
+        "<button type=\"button\" class=\"vx-seg-btn\" data-mode=\"pointer\" "
+        "data-testid=\"vx-mode-pointer\" aria-pressed=\"true\">Point</button>"
+        "<button type=\"button\" class=\"vx-seg-btn\" data-mode=\"integrate\" "
+        "data-testid=\"vx-mode-integrate\" aria-pressed=\"false\">Integrate</button>"
+        "</span></span>"
         "</div>"
         f"<div id=\"vx-readout\" class=\"vx-meta\"></div>"
         f"<div class=\"vx-meta\">{cap}</div>"
@@ -632,6 +834,9 @@ def vectors_explorer_html(vecs, caption: str = "") -> "str | None":
         f"<script type=\"module\">{_EXPLORER_JS_TMPL}</script>"
         "</body></html>"
     )
+    if cache_key is not None:
+        _EXPLORER_CACHE[cache_key] = (id(vecs), page)
+    return page
 
 
 def vectors_for_cell(session, cell) -> "object | None":

@@ -87,10 +87,22 @@ class TestExplorerHtml:
         assert "vx-state" in html and "vx-navid" in html and "vx-dpid" in html
         assert "vx-esm" in html and "createLocalModel" in html
         # Navigator carries BOTH widgets (crosshair pointer + rectangle
-        # integrate), serialized inside the panel-state JSON string.
+        # integrate); the DP carries the CIRCLE detector for virtual imaging —
+        # all serialized inside the panel-state JSON string.
         assert "crosshair" in html and "rectangle" in html
-        # The pointer/integrate mode radio (not the old detector-shape radio).
-        assert 'name="vx-mode"' in html and "integrate" in html
+        assert '"type": "circle"' in html or "circle" in html
+        # The themed SEGMENTED pointer/integrate toggle (fix #1) — pill buttons,
+        # not radios. Both mode buttons + the accent-driven aria-pressed present.
+        assert "vx-seg-btn" in html
+        assert 'data-mode="pointer"' in html and 'data-mode="integrate"' in html
+        assert 'aria-pressed=' in html
+        # Dark theme (fix #2): dark color-scheme + the app surface color, not #fff.
+        assert "color-scheme: dark" in html
+        assert "#1e1e2e" in html
+        assert "background: #fff" not in html
+        # VI machinery (fix #4): the detector→virtual-image scan + nav overlay.
+        assert "computeVI" in html and "refreshVI" in html and "ovVI" in html
+        assert "setDetector" in html
         assert "cap &amp; &lt;text&gt;" in html       # caption escaped
         # The embedded JSON header parses and matches the dataset (new keys too).
         m = re.search(r'id="vx-header">(.*?)</script>', html, re.S)
@@ -110,6 +122,56 @@ class TestExplorerHtml:
         import spyde.actions.report.vectors_embed as ve
         monkeypatch.setattr(ve, "MAX_EMBED_VECTORS", 10)
         assert ve.vectors_explorer_html(_vecs()) is None
+
+
+class TestBuildCaching:
+    """Fix #6: the ESM is read once (module-level) and a built explorer page is
+    memoized per (cell_id, id(vectors)) so a rebuild for the same cell + same
+    vectors reuses the packed blob + figure instead of re-encoding."""
+
+    def test_page_memoized_by_cell_and_identity(self):
+        import spyde.actions.report.vectors_embed as ve
+        ve.clear_explorer_cache()
+        vecs = _vecs()
+        # Same cell + same vectors object → the EXACT same page object (no rebuild).
+        h1 = ve.vectors_explorer_html(vecs, cache_key="cellA")
+        h2 = ve.vectors_explorer_html(vecs, cache_key="cellA")
+        assert h1 is not None and h1 is h2
+
+    def test_swapped_vectors_identity_rebuilds(self):
+        import spyde.actions.report.vectors_embed as ve
+        ve.clear_explorer_cache()
+        h1 = ve.vectors_explorer_html(_vecs(), cache_key="cellA")
+        # A DIFFERENT vectors object under the same key → cache MISS → new page.
+        h2 = ve.vectors_explorer_html(_vecs(), cache_key="cellA")
+        assert h1 is not None and h2 is not None and h1 is not h2
+
+    def test_no_cache_key_never_memoizes(self):
+        import spyde.actions.report.vectors_embed as ve
+        ve.clear_explorer_cache()
+        vecs = _vecs()
+        # Without a cache_key each call rebuilds (distinct page objects).
+        h1 = ve.vectors_explorer_html(vecs)
+        h2 = ve.vectors_explorer_html(vecs)
+        assert h1 is not None and h1 is not h2
+
+    def test_clear_drops_entry(self):
+        import spyde.actions.report.vectors_embed as ve
+        ve.clear_explorer_cache()
+        vecs = _vecs()
+        h1 = ve.vectors_explorer_html(vecs, cache_key="cellA")
+        ve.clear_explorer_cache("cellA")
+        h2 = ve.vectors_explorer_html(vecs, cache_key="cellA")
+        # After a clear, the same cell + vectors rebuilds a fresh page object.
+        assert h1 is not h2
+
+    def test_esm_text_cached_module_level(self):
+        import spyde.actions.report.vectors_embed as ve
+        # The module-level ESM cache is populated once and reused.
+        ve._ESM_TEXT = None
+        t1 = ve._esm_text()
+        assert isinstance(t1, str) and len(t1) > 1000
+        assert ve._esm_text() is t1        # same object, not re-read
 
 
 class TestDropChoice:
@@ -324,9 +386,12 @@ class TestSidebarExplorer:
         html = fig.get("html") or ""
         # The self-contained explorer page, NOT a plain anyplotlib snapshot.
         assert "vx-root" in html and "vx-header" in html and "vx-data" in html
-        assert 'name="vx-mode"' in html and "integrate" in html
-        # It carries the navigator widgets + DP panel (2-panel figure).
+        # Themed segmented toggle (fix #1) + dark theme (fix #2).
+        assert "vx-seg-btn" in html and 'data-mode="integrate"' in html
+        assert "color-scheme: dark" in html
+        # It carries the navigator widgets + DP detector (2-panel figure + VI).
         assert "crosshair" in html and "rectangle" in html
+        assert "computeVI" in html
         # fig_id is the explorer scheme (vx_<cell>_<uuid>), unique per build.
         assert str(fig.get("fig_id", "")).startswith("vx_")
 
@@ -349,6 +414,41 @@ class TestSidebarExplorer:
         # (default "" path is covered by report_add_figure deferring the choice;
         # here we assert the viewer explorer is the emitted figure.)
         assert "vx-root" in (fig.get("html") or "")
+
+    def test_rebuild_reuses_memoized_page(self, tem_2d_dataset):
+        """Fix #6: rebuilding the SAME viewer cell (same vectors) does NOT
+        re-encode — the explorer page is served from the (cell_id, id(vecs))
+        memo. We assert vectors_explorer_html is called with the cell's
+        cache_key and that a second build returns the identical page string."""
+        from spyde.actions.report import handlers as h
+        import spyde.actions.report.vectors_embed as ve
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        fig = self._drop_vectors_cell(session, messages, "viewer")
+        html1 = fig.get("html") or ""
+        assert "vx-root" in html1
+        cell_id = fig.get("cell_id")
+        assert cell_id
+        # Spy: pack_vectors must NOT run again on a cache hit (it's the expensive
+        # base64 encode). Rebuild the SAME cell → served from the memo.
+        calls = {"pack": 0}
+        orig_pack = ve.pack_vectors
+        try:
+            ve.pack_vectors = lambda v: (calls.__setitem__("pack", calls["pack"] + 1)
+                                         or orig_pack(v))
+            mgr = h._manager(session)
+            cell = mgr.doc.cell_by_id(cell_id)
+            messages.clear()
+            mgr.build_figure_window(cell)
+        finally:
+            ve.pack_vectors = orig_pack
+        figs = [m for m in messages
+                if m.get("type") == "figure" and m.get("host") == "report"]
+        assert figs, "no figure re-emitted on rebuild"
+        html2 = figs[-1].get("html") or ""
+        # Same page bytes, and NO re-pack (the expensive encode was skipped).
+        assert html2 == html1
+        assert calls["pack"] == 0
 
 
 class TestCellResolution:

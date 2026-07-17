@@ -162,16 +162,91 @@ test('viewer-vectors sidebar cell hosts the live explorer; crosshair drives the 
   await expect.poll(dpBrightness, { timeout: 5_000 }).toBeGreaterThan(5)
   await page.screenshot({ path: join(SHOTS, '04-pointer-55.png') })
 
+  // THEMED SEGMENTED TOGGLE (fix #1): clicking the "Integrate" pill switches mode
+  // (aria-pressed follows the accent fill) — the same path setMode drives. Assert
+  // the toggle markup is present, dark, and actually switches the mode.
+  await expect(fr.locator('.vx-seg-btn[data-mode="pointer"]')).toBeVisible()
+  await expect(fr.locator('.vx-seg-btn[data-mode="integrate"]')).toBeVisible()
+  // Dark theme (fix #2): the page body carries the app surface color, not white.
+  const bodyBg = await fr.evaluate(() =>
+    getComputedStyle(document.body).backgroundColor)
+  expect(bodyBg).toBe('rgb(30, 30, 46)')   // #1e1e2e
+  await fr.locator('.vx-seg-btn[data-mode="integrate"]').click()
+  await expect.poll(async () => (await fr.evaluate(() => (window as any).__vx.mode.integrate)))
+    .toBe(true)
+  expect(await fr.locator('.vx-seg-btn[data-mode="integrate"]')
+    .getAttribute('aria-pressed')).toBe('true')
+  expect(await fr.locator('.vx-seg-btn[data-mode="pointer"]')
+    .getAttribute('aria-pressed')).toBe('false')
+
   // INTEGRATE the whole 6x6 nav → 36 positions x perPos vectors summed. (Patterns
   // are identical so the NORMALISED DP looks the same as a pointer frame — the
   // contract here is the mode switch + region sum path, so assert the vector count
   // + that the DP still lights up.)
-  await fr.evaluate(() => (window as any).__vx.setMode(true))
   await fr.evaluate(() => (window as any).__vx.setRegion({ x: 0, y: 0, w: 6, h: 6 }))
   await expect.poll(async () => (await stats()).hit).toBe(36 * perPos)
   await expect(fr.locator('#vx-readout')).toContainText(`${36 * perPos} vectors summed`)
   await expect.poll(dpBrightness, { timeout: 5_000 }).toBeGreaterThan(5)
   await page.screenshot({ path: join(SHOTS, '05-integrate.png') })
+
+  // VIRTUAL IMAGING (fix #4): the DP DETECTOR drives the navigator VI. Back to
+  // pointer mode; the identical-pattern fixture has 4 disks per frame — place the
+  // detector ON a disk (nonzero viHit, nav lights) then MOVE it far OFF all disks
+  // (zero viHit, nav goes dark). A moving detector changing the nav VI is the
+  // contract. Read a disk center from the vectors payload so the detector lands
+  // exactly on one.
+  await fr.evaluate(() => (window as any).__vx.setMode(false))
+  const disk = await fr.evaluate(() => {
+    const h = (window as any).__vx._h()
+    const hdr = JSON.parse(document.getElementById('vx-header')!.textContent!)
+    // Reconstruct the first vector's DP-pixel column/row from the header extents.
+    const b64 = document.getElementById('vx-data')!.textContent!.trim()
+    return { W: hdr.sig[1], H: hdr.sig[0] }
+  })
+  // Put the detector at a disk (the fixture's disks are away from center); scan a
+  // few candidate columns and keep the one that catches vectors.
+  let onDisk = 0
+  for (const cx of [Math.round(disk.W * 0.25), Math.round(disk.W * 0.5),
+                    Math.round(disk.W * 0.75), Math.round(disk.W * 0.4),
+                    Math.round(disk.W * 0.6)]) {
+    await fr.evaluate((c) => (window as any).__vx.setDetector(
+      { cx: c, cy: Math.round(c * 0 + 0) }), cx)
+    // sweep cy too
+    for (const cy of [Math.round(disk.H * 0.25), Math.round(disk.H * 0.5),
+                      Math.round(disk.H * 0.75)]) {
+      await fr.evaluate(({ c, y }) => (window as any).__vx.setDetector(
+        { cx: c, cy: y, r: 20 }), { c: cx, y: cy })
+      await page.waitForTimeout(60)
+      const vh = (await stats()).viHit
+      if (vh > 0) { onDisk = vh; break }
+    }
+    if (onDisk > 0) break
+  }
+  expect(onDisk).toBeGreaterThan(0)
+  // The navigator VI overlay must now carry signal (nonzero mean).
+  const navBrightness = () => fr.evaluate((navId) => {
+    // The VI overlay is the topmost canvas over the nav panel; measure the max
+    // mean over all figure canvases as a signal-present proxy.
+    let best = 0
+    for (const c of document.querySelectorAll('#vx-fig canvas')) {
+      const ctx2 = (c as HTMLCanvasElement).getContext('2d')
+      if (!ctx2 || !(c as HTMLCanvasElement).width) continue
+      const d = ctx2.getImageData(0, 0, (c as HTMLCanvasElement).width,
+                                  (c as HTMLCanvasElement).height).data
+      let sum = 0
+      for (let i = 0; i < d.length; i += 4) sum += d[i]
+      best = Math.max(best, sum / (d.length / 4))
+    }
+    return best
+  }, '')
+  await expect.poll(navBrightness, { timeout: 5_000 }).toBeGreaterThan(5)
+  await page.screenshot({ path: join(SHOTS, '06-detector-vi.png') })
+
+  // MOVE the detector to a far corner (off every disk) → the VI drops to zero.
+  await fr.evaluate((d) => (window as any).__vx.setDetector(
+    { cx: 2, cy: 2, r: 1 }), disk)
+  await expect.poll(async () => (await stats()).viHit).toBe(0)
+  await page.screenshot({ path: join(SHOTS, '07-detector-vi-empty.png') })
 
   ctx.assertNoJsErrors()
 })
