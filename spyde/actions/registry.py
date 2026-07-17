@@ -111,6 +111,7 @@ STAGED_HANDLERS: dict[str, str] = {
     "repfig_query_compose":    "spyde.actions.report.compose.repfig_query_compose",
     "repfig_compose":          "spyde.actions.report.compose.repfig_compose",
     "repfig_set_layer":        "spyde.actions.report.compose.repfig_set_layer",
+    "repfig_set_text_size":    "spyde.actions.report.compose.repfig_set_text_size",
     "repfig_remove_layer":     "spyde.actions.report.compose.repfig_remove_layer",
     "repfig_remove_panel":     "spyde.actions.report.compose.repfig_remove_panel",
     "repfig_add_annotation":   "spyde.actions.report.compose.repfig_add_annotation",
@@ -124,6 +125,10 @@ STAGED_HANDLERS: dict[str, str] = {
     "repfig_add_fig_annotation": "spyde.actions.report.compose.repfig_add_fig_annotation",
     "repfig_update_fig_annotation": "spyde.actions.report.compose.repfig_update_fig_annotation",
     "repfig_remove_fig_annotation": "spyde.actions.report.compose.repfig_remove_fig_annotation",
+    # Report Builder Phase 3 — fresh-slice zoom-inset callouts.
+    "repfig_add_callout":      "spyde.actions.report.compose.repfig_add_callout",
+    "repfig_add_time_callouts": "spyde.actions.report.compose.repfig_add_time_callouts",
+    "repfig_add_zoom_callout": "spyde.actions.report.compose.repfig_add_zoom_callout",
     # Report Builder Phase 2 — MDI live image layering (spyde/actions/overlay.py)
     "overlay_add":             "spyde.actions.overlay.overlay_add",
     "overlay_set":             "spyde.actions.overlay.overlay_set",
