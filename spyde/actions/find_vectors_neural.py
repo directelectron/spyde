@@ -67,7 +67,10 @@ def _find_vectors_single_frame_neural(
                                     # emits subpixel offsets (no integer-only mode).
     beamstop_mask: Optional[np.ndarray] = None,
     model_id: Optional[str] = None,
-    bg_sigma: float = 12.0,         # local-norm high-pass scale (from calibrate()).
+    bg_sigma: Optional[float] = None,  # local-norm high-pass scale (from calibrate());
+                                       # None → auto (12, size-scaled for big disks).
+    spot_radius: Optional[float] = None,   # user Spot-size (px radius) override for
+                                           # the canonical rescale; None → auto.
 ):
     """Neural detector for one diffraction pattern.
 
@@ -81,7 +84,9 @@ def _find_vectors_single_frame_neural(
     f = np.asarray(frame, dtype=np.float32)
     model, device = models.get_model(model_id)
     pred = models.detect(model, f, device, thresh=float(threshold),
-                         min_distance=int(min_distance), bg_sigma=float(bg_sigma))
+                         min_distance=int(min_distance),
+                         bg_sigma=(float(bg_sigma) if bg_sigma is not None else None),
+                         spot_diameter=(2.0 * spot_radius) if spot_radius else None)
     pred = np.asarray(pred, dtype=np.float32).reshape(-1, 3)
     pred = _apply_beamstop(pred, beamstop_mask, f.shape)
 
@@ -158,14 +163,22 @@ def _refine_block(peaks_grid, ny, nx, flat, beamstop_mask):
 
 
 def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
-                  bg_sigma=12.0, persistence=False):
+                  bg_sigma=None, persistence=False, spot_radius=None):
     """Run the neural detector on a (ny, nx, KY, KX) block → NaN-padded
     (ny, nx, MAX_PEAKS, 3). Batches the whole block through one forward pass on the
     torch GPU when available; per-frame CPU otherwise. ``bg_sigma`` is the calibrated
     local-norm high-pass scale (see calibrate_neural). ``persistence`` drops
-    extraneous (non-neighbour-confirmed) peaks (uses the block's scan neighbours)."""
+    extraneous (non-neighbour-confirmed) peaks (uses the block's scan neighbours).
+
+    GPU use honours the SPYDE_FV_GPU worker policy (``_gpu_task_allowed``), with a
+    neural-specific unset-default of "2": two CUDA-submitting workers keep the
+    device fed while the rest run the per-frame CPU path. Real-data A/B
+    (2026-07-16, 48-core/1-GPU box): all-workers CUDA was SLOWER (context
+    thrash) and lagged the desktop; 2 workers was faster and smooth. Must match
+    orchestrate's lane_mode. Set SPYDE_FV_GPU=one/N/all/off to override."""
     from spyde import models
     from spyde.actions.find_vectors import MAX_PEAKS, _with_raw_intensity
+    from spyde.actions.find_vectors.gpu_runtime import _gpu_task_allowed
     from spyde.actions.find_vectors_torch import torch_gpu_device
 
     out = np.full((b4d.shape[0], b4d.shape[1], MAX_PEAKS, 3), np.nan, dtype=np.float32)
@@ -175,10 +188,13 @@ def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
 
     peaks_list = None
     try:
-        if torch_gpu_device() is not None:
+        if torch_gpu_device() is not None and _gpu_task_allowed(default_mode="4"):
             # One forward pass for the whole chunk on the GPU.
-            raw = models.detect_batch(model, flat, device, thresh=float(threshold),
-                                      min_distance=int(min_dist), bg_sigma=float(bg_sigma))
+            raw = models.detect_batch(
+                model, flat, device, thresh=float(threshold),
+                min_distance=int(min_dist),
+                bg_sigma=(float(bg_sigma) if bg_sigma is not None else None),
+                spot_diameter=(2.0 * spot_radius) if spot_radius else None)
             peaks_list = []
             for i, p in enumerate(raw):
                 p = _apply_beamstop(np.asarray(p, np.float32).reshape(-1, 3),
@@ -193,7 +209,8 @@ def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
         peaks_list = [
             _find_vectors_single_frame_neural(
                 frame, threshold, min_dist, subpixel=subpixel,
-                beamstop_mask=beamstop_mask, model_id=model_id, bg_sigma=bg_sigma)[2]
+                beamstop_mask=beamstop_mask, model_id=model_id, bg_sigma=bg_sigma,
+                spot_radius=spot_radius)[2]
             for frame in flat
         ]
 
@@ -211,8 +228,8 @@ def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
 
 def _find_vectors_chunk_neural(
     ghost_block, depth_px, nav_dim, sigma,
-    threshold, min_dist, subpixel, beamstop_mask, model_id=None, bg_sigma=12.0,
-    persistence=False,
+    threshold, min_dist, subpixel, beamstop_mask, model_id=None, bg_sigma=None,
+    persistence=False, spot_radius=None,
 ):
     """Neural variant of ``_find_vectors_chunk``: nav-blur + ghost-trim (shared with
     the other methods), then the neural detector per frame (GPU-batched when torch
@@ -228,14 +245,16 @@ def _find_vectors_chunk_neural(
     ny, nx = nav_shape[-2:]
     if nav_dim == 2:
         result = _neural_block(blurred, threshold, min_dist, subpixel,
-                               beamstop_mask, model_id, bg_sigma, persistence)
+                               beamstop_mask, model_id, bg_sigma, persistence,
+                               spot_radius)
         core_shape = result.shape[:2]
     else:
         n_lead = nav_shape[0]
         out = np.full((n_lead, ny, nx, MAX_PEAKS, 3), np.nan, dtype=np.float32)
         for t in range(n_lead):
             out[t] = _neural_block(blurred[t], threshold, min_dist, subpixel,
-                                   beamstop_mask, model_id, bg_sigma, persistence)
+                                   beamstop_mask, model_id, bg_sigma, persistence,
+                                   spot_radius)
         result = out
         core_shape = (n_lead, ny, nx)
     log.debug("[find_vectors] neural chunk core=%s total=%.0fms",
@@ -243,7 +262,7 @@ def _find_vectors_chunk_neural(
     return result
 
 
-def calibrate_neural(sample_frames, *, sigma=1.0, model_id=None):
+def calibrate_neural(sample_frames, *, sigma=1.0, model_id=None, spot_radius=None):
     """One-time calibration on a few representative frames before a full-scan run.
 
     All frames in a scan share disk size + background character, so this optimises the
@@ -266,7 +285,8 @@ def calibrate_neural(sample_frames, *, sigma=1.0, model_id=None):
         f = np.asarray(f, np.float32)
         # light single-frame smoothing as a stand-in for nav-blur on isolated samples
         frames.append(gaussian_filter(f, 0.6) if sigma else f)
-    cal = models.calibrate(model, frames, device)
+    cal = models.calibrate(model, frames, device,
+                           spot_diameter=(2.0 * spot_radius) if spot_radius else None)
     log.info("[find_vectors] neural calibration: bg_sigma=%.1f thresh=%.2f "
              "scale=%.2f conf=%.2f", cal["bg_sigma"], cal["thresh"],
              cal["scale_factor"], cal.get("confidence", float("nan")))

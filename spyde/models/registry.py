@@ -167,24 +167,76 @@ def _resolve_bundled(source: dict) -> str:
 def _resolve_hf(source: dict) -> str:
     """Download (or reuse the cached) HF-hosted weight into ~/.spyde/models. Raises
     on failure (the caller catches and falls back to bundled)."""
-    from huggingface_hub import hf_hub_download         # lazy — optional dep
+    from huggingface_hub import hf_hub_download
 
     repo = source.get("repo", HF_REPO)
     fname = source["file"]
     return hf_hub_download(repo_id=repo, filename=fname, local_dir=user_models_dir())
 
 
+def _verify_sha256(path: str, expected: str, model_id) -> None:
+    """Raise if the file at ``path`` doesn't hash to ``expected`` (hex sha256).
+    Registry entries MAY carry a ``sha256`` — when present, a corrupted or
+    tampered weight file is rejected (get_model then falls back to bundled)."""
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            h.update(block)
+    got = h.hexdigest()
+    if got.lower() != str(expected).lower():
+        raise ValueError(
+            f"sha256 mismatch for model {model_id!r}: expected {expected}, got {got}")
+
+
 def _resolve_weights(entry: dict) -> str:
     source = entry.get("source", {})
     stype = source.get("type")
     if stype == "bundled":
-        return _resolve_bundled(source)
-    if stype == "hf":
-        return _resolve_hf(source)
-    raise ValueError(f"unknown model source type {stype!r} for {entry.get('id')}")
+        path = _resolve_bundled(source)
+    elif stype == "hf":
+        path = _resolve_hf(source)
+    else:
+        raise ValueError(f"unknown model source type {stype!r} for {entry.get('id')}")
+    expected = entry.get("sha256") or source.get("sha256")
+    if expected:
+        _verify_sha256(path, expected, entry.get("id"))
+    return path
 
 
 # ── public model API ────────────────────────────────────────────────────────────
+def is_cached(model_id: Optional[str] = None) -> bool:
+    """True when the model's weights are already present on this machine (bundled,
+    or an HF file previously downloaded into ~/.spyde/models). Lets the action
+    layer decide whether to surface a "downloading model…" status before
+    ``ensure_local`` blocks on the network."""
+    entry = _entry(model_id)
+    if entry is None:
+        return True                      # unknown id resolves to bundled default
+    source = entry.get("source", {})
+    if source.get("type") != "hf":
+        return True
+    return os.path.exists(os.path.join(user_models_dir(), source.get("file", "")))
+
+
+def ensure_local(model_id: Optional[str] = None) -> Optional[str]:
+    """Resolve the model's weights to a LOCAL file path, downloading once if the
+    source is Hugging Face. Call this on the CLIENT before submitting a batch
+    compute so dask workers never hit the network (they re-resolve to the same,
+    now-present file). Returns the path, or None on failure (callers should then
+    let ``get_model``'s bundled-default fallback handle it)."""
+    entry = _entry(model_id)
+    if entry is None:
+        return None
+    try:
+        return _resolve_weights(entry)
+    except Exception as e:
+        log.warning("[models] ensure_local(%r) failed (%s); compute will fall back "
+                    "to the bundled default", model_id, e)
+        return None
+
+
 def get_model(model_id: Optional[str] = None):
     """Return a cached ``(model, device)`` for ``model_id`` (default = registry
     ``default``). On ANY failure resolving a non-default model (no huggingface_hub,

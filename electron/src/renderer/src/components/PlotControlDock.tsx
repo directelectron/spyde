@@ -12,6 +12,10 @@ import { WORKFLOW_NODE_DRAG_MIME } from '../kernel/dnd'
 import { COLORMAPS } from '../kernel/colormaps'
 import { useKeyedDebounce } from './wizardHooks'
 import { CompositionPanel } from './CompositionPanel'
+import { Dropdown } from './Dropdown'
+
+// Dropdown options are {value,label}; the colormap list is shared app-wide.
+const CMAP_OPTS = COLORMAPS.map((c) => ({ value: c, label: c }))
 
 // Compact workflow tree: each step is a row with a depth guide-rail, a node dot,
 // and the step name. The active (displayed) node is highlighted. Hovering tints
@@ -323,14 +327,10 @@ function LayerRow({ layer, dotColor, onCmap, onAlpha, onVisible, onRemove }: {
         </button>
       </div>
       <div style={styles.row}>
-        <select
-          data-testid={`layer-cmap-${layer.id}`}
-          style={{ ...styles.select, flex: 1 }}
-          value={layer.cmap}
-          onChange={(e) => onCmap(e.target.value)}
-        >
-          {COLORMAPS.map(c => <option key={c} value={c}>{c}</option>)}
-        </select>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <Dropdown testid={`layer-cmap-${layer.id}`} value={layer.cmap}
+            options={CMAP_OPTS} onChange={onCmap} />
+        </div>
       </div>
       <div style={styles.toggleRow}>
         <span style={styles.hint}>alpha</span>
@@ -453,14 +453,19 @@ export function PlotControlDock() {
     sendAction('set_offset_crosshair', { on: next }, activeId)
   }
 
-  const onColormap = (e: React.ChangeEvent<HTMLSelectElement>) => {
+  // The colormap dropdown mirrors the old uncontrolled <select>: local state,
+  // 'gray' initial, persists across window switches (the backend is the source
+  // of truth for what each window actually shows).
+  const [cmapSel, setCmapSel] = React.useState('gray')
+  const onColormap = (name: string) => {
+    setCmapSel(name)
     if (activeId == null) return
-    sendAction('set_colormap', { name: e.target.value }, activeId)
+    sendAction('set_colormap', { name }, activeId)
   }
 
-  const onSignalType = (e: React.ChangeEvent<HTMLSelectElement>) => {
+  const onSignalType = (t: string) => {
     if (activeId == null) return
-    sendAction('set_signal_type', { signal_type: e.target.value }, activeId)
+    sendAction('set_signal_type', { signal_type: t }, activeId)
   }
   // Human label for a HyperSpy signal_type (the empty type = a generic signal).
   const sigTypeLabel = (t: string) => t === '' ? 'Generic (none)' : t
@@ -502,34 +507,19 @@ export function PlotControlDock() {
       {/* 2. Colormap */}
       {win && (
         <div style={styles.section}>
-          <label style={styles.label} htmlFor="cmap">Colormap</label>
-          <select
-            id="cmap"
-            data-testid="colormap-select"
-            style={styles.select}
-            defaultValue="gray"
-            onChange={onColormap}
-          >
-            {COLORMAPS.map(c => <option key={c} value={c}>{c}</option>)}
-          </select>
+          <div style={styles.label}>Colormap</div>
+          <Dropdown testid="colormap-select" value={cmapSel}
+            options={CMAP_OPTS} onChange={onColormap} />
         </div>
       )}
 
       {/* 3. Signal type (HyperSpy signal_type — re-casts the signal class) */}
       {win && sigType && (
         <div style={styles.section} data-testid="signal-type-section">
-          <label style={styles.label} htmlFor="sigtype">Signal type</label>
-          <select
-            id="sigtype"
-            data-testid="signal-type-select"
-            style={styles.select}
-            value={sigType.current}
-            onChange={onSignalType}
-          >
-            {sigType.options.map(t => (
-              <option key={t} value={t}>{sigTypeLabel(t)}</option>
-            ))}
-          </select>
+          <div style={styles.label}>Signal type</div>
+          <Dropdown testid="signal-type-select" value={sigType.current}
+            options={sigType.options.map((t) => ({ value: t, label: sigTypeLabel(t) }))}
+            onChange={onSignalType} />
         </div>
       )}
 

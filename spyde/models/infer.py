@@ -16,24 +16,52 @@ import numpy as np
 import torch
 
 from .decode import decode, decode_batch, split_by_batch
-from .preprocess import normalize_input, scale_to_canonical
+from .preprocess import estimate_disk_diameter, normalize_input, scale_to_canonical
 from .unet import SpotUNet
+
+
+def _default_device():
+    """Best device for inference: CUDA → Apple-MPS → CPU (mirrors
+    ``find_vectors_torch.torch_gpu_device``; previously Macs silently ran the
+    model on CPU while the batch path believed it had a GPU)."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    try:
+        mps = getattr(torch.backends, "mps", None)
+        if mps is not None and torch.backends.mps.is_available():
+            return torch.device("mps")
+    except Exception:
+        pass
+    return torch.device("cpu")
 
 
 def load_model(ckpt_path, device=None, arch: dict | None = None):
     """Load a SpotUNet checkpoint. ``arch`` (from the model registry) overrides the
     architecture hyperparams when present; otherwise they're read from the
     checkpoint (which stores ``base``/``in_ch``/``levels``)."""
-    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ck = torch.load(ckpt_path, map_location=device)
+    device = device or _default_device()
+    # weights_only=True: checkpoints are plain state dicts + scalar hyperparams;
+    # never unpickle arbitrary objects from a (possibly downloaded) file.
+    ck = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     arch = arch or {}
+    in_ch = arch.get("in_ch", ck.get("in_ch", 1))
     model = SpotUNet(
-        in_ch=arch.get("in_ch", ck.get("in_ch", 1)),
+        in_ch=in_ch,
         base=arch.get("base", ck["base"]),
         levels=arch.get("levels", ck.get("levels", 2)),
-    ).to(device)
+    )
     model.load_state_dict(ck["state_dict"])
+    model = model.to(device)
     model.eval()
+    if device.type == "mps":
+        # Smoke-test the forward ONCE at load: an MPS build missing an op this
+        # net uses should degrade to CPU here, not fail on every chunk.
+        try:
+            with torch.no_grad():
+                model(torch.zeros(1, in_ch, 32, 32, device=device))
+        except Exception:
+            device = torch.device("cpu")
+            model = model.to(device)
     return model, device
 
 
@@ -53,6 +81,48 @@ def _pad_to_multiple(nrm: np.ndarray, levels: int):
 # backgrounds (beam stop / amorphous halo) need a SMALLER value — set automatically
 # by ``calibrate`` / ``auto_bg_sigma`` rather than by hand.
 DEFAULT_BG_SIGMA = 12.0
+
+
+def _estimate_work_diam(frame: np.ndarray, factor: float,
+                        spot_diameter: float | None) -> float:
+    """Disk diameter at WORKING (post-scale) resolution — drives BOTH the
+    background-subtraction scale and the NMS window for big disks run near-native
+    (the SCALE_CLIP floor keeps very large disks well above canonical). Ported from
+    yoloDiffraction detect(): the autocorrelation estimator high-passes at
+    sigma=20 (canonical-tuned) and SATURATES on big disks, so iterate with a
+    size-adaptive high-pass, then correct its measured ~0.83 undershoot."""
+    if spot_diameter:
+        return float(spot_diameter) * factor
+    wd = estimate_disk_diameter(frame)
+    if np.isfinite(wd) and wd > 20:
+        for _ in range(3):
+            wd2 = estimate_disk_diameter(frame, hp_sigma=max(20.0, wd))
+            if abs(wd2 - wd) < 1:
+                wd = wd2
+                break
+            wd = max(wd, wd2)
+        wd = wd / 0.83
+    return wd * factor
+
+
+def _big_disk_params(md: int, bg_sigma: float | None, work_diam: float):
+    """Resolve the NMS window + background sigma for the working disk size.
+
+    Canonical-size data (work_diam <= 20) is untouched, so existing (production-
+    model) behaviour is unchanged; this only engages on big disks where the fixed
+    values were wrong two ways (measured in yoloDiffraction, 24-96px disks):
+      - a fixed ~4px NMS window fires a CLOUD of detections across one broad disk
+        -> md ~ 0.55*diameter collapses it to ONE (center err <1.3px);
+      - a fixed 12px background sigma high-passes INSIDE the disk (carves the flat
+        interior into a ring the model fires on) -> bg ~ 0.6*diameter keeps the
+        interior intact. An explicitly-passed bg_sigma (e.g. from calibrate) is
+        respected; only the None default is size-scaled."""
+    big = np.isfinite(work_diam) and work_diam > 20
+    if big:
+        md = max(md, int(round(work_diam * 0.55)))
+    if bg_sigma is None:
+        bg_sigma = max(DEFAULT_BG_SIGMA, 0.6 * work_diam) if big else DEFAULT_BG_SIGMA
+    return md, float(bg_sigma)
 
 
 @torch.no_grad()
@@ -84,23 +154,30 @@ def bg_sigma_from_peak_size(peak_diameter_px: float) -> float:
 @torch.no_grad()
 def detect(model, frame: np.ndarray, device, thresh: float = 0.3,
            min_distance: int = 4, auto_scale: bool = True,
-           bg_sigma: float = DEFAULT_BG_SIGMA):
+           bg_sigma: float | None = None,
+           spot_diameter: float | None = None):
     """Detect spots in a single frame. Returns (N,3) [y,x,score] in ORIGINAL coords.
 
     Estimates disk size, rescales to canonical, runs the model, maps positions back.
     ``bg_sigma`` is the local-norm high-pass scale (set by ``calibrate`` for diffuse
-    data; default suits normal data). ``thresh`` is the heatmap confidence.
+    data; ``None`` = automatic: the default 12 for normal data, scaled up with the
+    disk for big disks run near-native). ``thresh`` is the heatmap confidence.
+    ``spot_diameter`` (px) overrides the autocorrelation disk-size estimate — the
+    user-facing "Spot size" knob for when the estimate gets it wrong; the canonical
+    rescale then derives from it (both directions, bounded by SCALE_CLIP).
     """
     factor = 1.0
     work = frame
     if auto_scale:
-        work, factor = scale_to_canonical(frame)
+        work, factor = scale_to_canonical(frame, diameter=spot_diameter)
+    md = max(2, int(round(min_distance * factor)))
+    work_diam = _estimate_work_diam(frame, factor, spot_diameter)
+    md, bg_sigma = _big_disk_params(md, bg_sigma, work_diam)
     nrm = normalize_input(work, local=True, bg_sigma=bg_sigma)
     levels = int(getattr(model, "levels", 2))
     nrm = _pad_to_multiple(nrm, levels)
     x = torch.from_numpy(nrm[None, None]).to(device)
     hm, off = model(x)
-    md = max(2, int(round(min_distance * factor)))
     pred = decode(hm[0], off[0], thresh=thresh, min_distance=md)
     if len(pred) and factor != 1.0:
         pred = pred.copy()
@@ -111,7 +188,8 @@ def detect(model, frame: np.ndarray, device, thresh: float = 0.3,
 @torch.no_grad()
 def detect_batch(model, frames, device, thresh: float = 0.3,
                  min_distance: int = 4, auto_scale: bool = True,
-                 shared_scale: bool = True, bg_sigma: float = DEFAULT_BG_SIGMA):
+                 shared_scale: bool = True, bg_sigma: float | None = None,
+                 spot_diameter: float | None = None):
     """Detect spots in a STACK of frames in one forward pass.
 
     ``frames`` is an (N,H,W) array (or a sequence of (H,W) arrays). Returns a list
@@ -134,8 +212,15 @@ def detect_batch(model, frames, device, thresh: float = 0.3,
 
     factor = 1.0
     if auto_scale:
-        # One estimate for the whole stack (shared physical disk size).
-        _ref, factor = scale_to_canonical(frames[0])
+        # One estimate for the whole stack (shared physical disk size); a known
+        # ``spot_diameter`` (the user's Spot-size override) replaces the estimate.
+        _ref, factor = scale_to_canonical(frames[0], diameter=spot_diameter)
+
+    # Shared physical disk size across the scan -> resolve the size-dependent
+    # NMS window + background sigma ONCE from the first frame (like the scale).
+    md = max(2, int(round(min_distance * factor)))
+    work_diam = _estimate_work_diam(frames[0], factor, spot_diameter)
+    md, bg_sigma = _big_disk_params(md, bg_sigma, work_diam)
 
     levels = int(getattr(model, "levels", 2))
     nrm_list = []
@@ -150,7 +235,6 @@ def detect_batch(model, frames, device, thresh: float = 0.3,
 
     x = torch.from_numpy(stack[:, None]).to(device)
     hm, off = model(x)
-    md = max(2, int(round(min_distance * factor)))
     res = decode_batch(hm, off, thresh=thresh, min_distance=md)
     per_frame = split_by_batch(res, N)
     if factor != 1.0:
@@ -163,7 +247,8 @@ def detect_batch(model, frames, device, thresh: float = 0.3,
 
 
 @torch.no_grad()
-def calibrate(model, sample_frames, device, tune_threshold: bool = True):
+def calibrate(model, sample_frames, device, tune_threshold: bool = True,
+              spot_diameter: float | None = None):
     """Calibration step (run ONCE on a few representative frames before a full scan).
 
     All frames in a 4D-STEM scan share the same physical disk size and background
@@ -185,11 +270,18 @@ def calibrate(model, sample_frames, device, tune_threshold: bool = True):
         return {"bg_sigma": DEFAULT_BG_SIGMA, "thresh": 0.3, "scale_factor": 1.0}
 
     # 1) scale: one estimate (shared physical disk size). scale_to_canonical returns
-    #    the upscale-only factor.
-    _ref, factor = scale_to_canonical(frames[0])
+    #    the upscale-only factor; a known spot_diameter overrides the estimate.
+    _ref, factor = scale_to_canonical(frames[0], diameter=spot_diameter)
     work0 = _ref if factor != 1.0 else frames[0]
 
     # 2) bg_sigma: confidence-max over the sample (median best-sigma is robust).
+    #    Big disks run near-native need bg ~ 0.6*diameter (a 12px high-pass carves
+    #    the disk interior into a ring), so extend the candidate list with
+    #    size-scaled values — the confidence-max picks them only when they win.
+    candidates = [4, 5, 6, 8, 10, 12, 16, 20]
+    wd = _estimate_work_diam(frames[0], factor, spot_diameter)
+    if np.isfinite(wd) and wd > 20:
+        candidates += [round(r * wd, 1) for r in (0.5, 0.6, 0.7)]
     sigmas = []
     confs = []
     for f in frames:
@@ -197,7 +289,7 @@ def calibrate(model, sample_frames, device, tune_threshold: bool = True):
         if factor != 1.0:
             from scipy.ndimage import zoom
             w = zoom(f, factor, order=1)
-        s, c = auto_bg_sigma(model, w, device)
+        s, c = auto_bg_sigma(model, w, device, candidates=tuple(candidates))
         sigmas.append(s)
         confs.append(c)
     bg = float(np.median(sigmas))

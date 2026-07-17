@@ -35,10 +35,24 @@ from spyde.actions.find_vectors import _do_compute_vectors, _copy_nav_axes_to
 # `threshold` is shared but means different things per method: neural uses the
 # model's confidence (~0.3); NXCORR an [-1,1] correlation score (~0.5); DoG an
 # absolute band-pass SNR (~10). `model_id` selects a registry model for the
-# neural method ("" → the registry default).
+# neural method ("" → the registry default). `bg_sigma` is the neural local-norm
+# high-pass scale — auto-set by the one-shot calibration (fv_open emits
+# `fv_calibration`) and threaded identically through preview AND batch.
 DEFAULTS: dict = dict(
-    sigma=1.0, kernel_radius=5, threshold=0.3, min_distance=5, subpixel=True,
-    method="neural", model_id="", dog_sigma1=0.8, dog_sigma2=2.0,
+    # Nav blur defaults OFF (user decision 2026-07-16): the slider remains for
+    # NXCORR/DoG (weak-signal data benefits) but starts at 0; for NEURAL it is
+    # never applied at all (_coerce forces sigma=0 — the net is trained on
+    # single frames).
+    sigma=0.0, kernel_radius=5, threshold=0.3, min_distance=5, subpixel=True,
+    method="neural", model_id="", bg_sigma=12.0, dog_sigma1=0.8, dog_sigma2=2.0,
+    # Spot size (px RADIUS) for the neural canonical rescale: 0 = the model's
+    # own autocorrelation estimate; the wizard always sends its auto-seeded
+    # Spot-size slider so the UI knob is the single source of truth.
+    spot_radius=0.0,
+    # Neural stage-2 refine: drop peaks not confirmed by scan neighbours
+    # (models/refine.py). BATCH-only (the preview has no neighbours) and
+    # default-off until the eval benchmark says it should be on (plan Phase 3).
+    persistence=False,
     beamstop_auto=False, beamstop_dilate=5, show_transform=False,
 )
 
@@ -65,6 +79,11 @@ def _coerce(params: dict) -> dict:
     # the method's own default so the first preview isn't empty/flooded.
     if params.get("threshold") in (None, ""):
         p["threshold"] = _METHOD_THRESHOLD[p["method"]]
+    # Nav blur is NEVER applied for the neural method (user decision — the net
+    # is trained on single frames; blur only smears the disks it was trained
+    # to see). Forced here, the single choke point for wizard/toolbar/api.
+    if p["method"] == "neural":
+        p["sigma"] = 0.0
     return p
 
 
@@ -84,6 +103,24 @@ def find_diffraction_vectors(ctx, action_name: str = "Find Diffraction Vectors",
     return _start_batch(session, plot, src_tree, _coerce(params))
 
 
+def _ensure_model_local(p: dict) -> None:
+    """Resolve the neural model's weights to a LOCAL file before the compute is
+    submitted, so dask workers never touch the network (a first-use HF-hosted
+    model downloads once, with a status line, instead of N times concurrently).
+    No-op for non-neural methods; on failure ``get_model``'s bundled-default
+    fallback takes over on the workers."""
+    if str(p.get("method", "")).lower() != "neural":
+        return
+    try:
+        from spyde import models
+        mid = p.get("model_id") or None
+        if not models.is_cached(mid):
+            emit_status(f"Find Vectors: downloading model {mid or 'default'}…")
+        models.ensure_local(mid)
+    except Exception as e:
+        log.debug("ensure_local(%r) failed: %s", p.get("model_id"), e)
+
+
 def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = True):
     """Build the result window, then run the full-dataset compute on a background
     thread. Shared by the toolbar one-shot and the staged-wizard ``fv_run``
@@ -91,6 +128,17 @@ def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = Tr
     clean; reopening the caret toggles the overlay back via ``set_overlay``)."""
     src = src_tree.root
     am = src.axes_manager
+
+    # Pin the CONCRETE model id for neural runs ("" = registry default) so the
+    # provenance stamped below records exactly which model produced the vectors,
+    # and workers keep loading the same model even if the user manifest is
+    # refreshed mid-run.
+    if p.get("method") == "neural" and not p.get("model_id"):
+        try:
+            from spyde.models import default_model_id
+            p["model_id"] = default_model_id() or ""
+        except Exception as e:
+            log.debug("resolving default model id failed: %s", e)
 
     # Drop any live tuning preview — the final overlay replaces it.
     prev = getattr(src_tree, "_fv_preview", None)
@@ -205,6 +253,7 @@ def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = Tr
             # navigator traffic reaches the same dask client.)
             import time as _time
             t0 = _time.monotonic()
+            _ensure_model_local(p)       # download once HERE, not on N workers
             log.info("[fv-batch] compute starting (shm=%s)", shm_name)
             vecs = _do_compute_vectors(src, p, main_window=session,
                                        signal_tree=src_tree, shm_name=shm_name,
@@ -229,6 +278,15 @@ def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = Tr
             stop_poll()
             new_tree._fv_batch_running = False
             src_tree._fv_batch_running = False
+            # Reset the workers' RSS accounting after the batch churn — see
+            # dask_stats.trim_cluster_memory (spill thresholds act on process
+            # memory, so this batch's allocator retention would otherwise eat
+            # the NEXT compute's headroom).
+            try:
+                from spyde.backend.dask_stats import trim_cluster_memory
+                trim_cluster_memory(session)
+            except Exception as e:
+                log.debug("post-batch cluster trim failed: %s", e)
             for _t in {id(src_tree): src_tree, id(new_tree): new_tree}.values():
                 if hasattr(_t, "unregister_cancel"):
                     _t.unregister_cancel(flag=stopped_flag)
@@ -547,11 +605,16 @@ def fv_open(session, plot, payload) -> None:
             from spyde.actions.vector_overlay import attach_find_vectors_preview
             if not is_current(tree, "_fv_run_gen", gen):
                 return                     # superseded by fv_close / newer preview
+            if p["method"] == "neural":
+                _ensure_model_local(p)   # a first-use HF model downloads here,
+                                         # not inside the preview's frame compute
             new_prev = attach_find_vectors_preview(
                 src, tree.root, tree, sigma=p["sigma"],
                 kernel_radius=p["kernel_radius"], threshold=p["threshold"],
                 min_distance=p["min_distance"], subpixel=p["subpixel"],
                 method=p["method"], model_id=p.get("model_id") or None,
+                bg_sigma=p["bg_sigma"],
+                spot_radius=p.get("spot_radius") or None,
                 dog_sigma1=p["dog_sigma1"],
                 dog_sigma2=p["dog_sigma2"],
                 beamstop_auto=bool(p.get("beamstop_auto")),
@@ -585,6 +648,15 @@ def fv_open(session, plot, payload) -> None:
                 _emit_auto_params(src, tree)
             emit_status("Find Vectors: tune the parameters — peaks preview under "
                         "the crosshair, then Compute")
+            # One-shot neural auto-calibration (bg_sigma / threshold): runs on
+            # this worker AFTER the preview is up, cached on the tree, emitted
+            # to the wizard, which adopts the values and re-tunes — so preview
+            # and batch run with identical, dataset-tuned parameters.
+            if p["method"] == "neural":
+                try:
+                    _emit_calibration(src, tree, p, gen)
+                except Exception as e:
+                    log.debug("[fv-cal] auto-calibration failed: %s", e)
         except Exception as e:
             import logging
             logging.getLogger(__name__).debug("fv_open attach failed: %s", e)
@@ -617,6 +689,69 @@ def _emit_auto_params(plot, tree) -> None:
     except Exception as e:
         import logging
         logging.getLogger(__name__).debug("fv auto-params failed: %s", e)
+
+
+# Skip auto-calibration on very large signal frames: 8 candidate σ × a few
+# frames of CPU forward passes is seconds on a ≤512² DP but minutes on a 4k²
+# frame — and find-vectors targets diffraction patterns, not full-frame movies.
+_CAL_MAX_FRAME_PX = 1024 * 1024
+
+
+def _calibration_frames(root, n: int = 3) -> list:
+    """A few representative diffraction patterns spread across the scan —
+    each a single small per-frame read (never the full dataset)."""
+    nav_dim = root.axes_manager.navigation_dimension
+    nav_shape = tuple(int(s) for s in root.data.shape[:nav_dim])
+    frames, seen = [], set()
+    for f in (0.25, 0.5, 0.75)[:max(1, int(n))]:
+        idx = tuple(min(s - 1, max(0, int(round(s * f)))) for s in nav_shape)
+        if idx in seen:
+            continue
+        seen.add(idx)
+        frame = root.data[idx]
+        if hasattr(frame, "compute"):
+            frame = frame.compute()
+        frame = np.asarray(frame, dtype=np.float32)
+        if frame.ndim == 2:
+            frames.append(frame)
+    return frames
+
+
+def _emit_calibration(plot, tree, p: dict, gen) -> None:
+    """One-shot neural auto-calibration for this dataset (see
+    ``find_vectors_neural.calibrate_neural``): optimise ``bg_sigma`` (diffuse /
+    beam-stopped backgrounds) and lower the threshold for faint-peak data.
+    Cached on the tree (reopening the caret re-emits without recomputing);
+    emitted as ``fv_calibration`` for the wizard to adopt (user-overridable).
+    Generation-guarded like the preview attach — a closed wizard gets nothing."""
+    from spyde.actions.lifecycle import is_current
+
+    cal = getattr(tree, "_fv_calibration", None)
+    if cal is None:
+        root = tree.root
+        sig_shape = root.axes_manager.signal_shape
+        if int(sig_shape[0]) * int(sig_shape[1]) > _CAL_MAX_FRAME_PX:
+            log.debug("[fv-cal] signal frame too large — keeping defaults")
+            return
+        frames = _calibration_frames(root)
+        if not frames:
+            return
+        from spyde.actions.find_vectors_neural import calibrate_neural
+        cal = calibrate_neural(frames, sigma=p.get("sigma", 0.0),
+                               model_id=p.get("model_id") or None,
+                               spot_radius=p.get("spot_radius") or None)
+        tree._fv_calibration = cal
+    if not is_current(tree, "_fv_run_gen", gen):
+        return                       # wizard closed / superseded while calibrating
+    msg = {"type": "fv_calibration",
+           "window_id": getattr(plot, "window_id", None),
+           "bg_sigma": float(cal["bg_sigma"]),
+           "thresh": float(cal["thresh"]),
+           "scale_factor": float(cal.get("scale_factor", 1.0))}
+    conf = cal.get("confidence")
+    if conf is not None and np.isfinite(conf):   # NaN is not valid JSON
+        msg["confidence"] = float(conf)
+    emit(msg)
 
 
 def fv_tune(session, plot, payload) -> None:
@@ -680,6 +815,28 @@ def fv_models(session, plot, payload) -> None:
                                             getattr(plot, "window_id", None))}
     msg.update(available_models())
     emit(msg)
+
+
+def fv_refresh_models(session, plot, payload) -> None:
+    """'Check for new models': pull the latest ``registry.json`` from Hugging
+    Face (the ship-a-model-without-re-releasing path, ``models/RELEASING.md``)
+    on a worker thread — never the main loop (network) — then re-emit
+    ``fv_models`` with ``refreshed: true`` so the wizard dropdown updates in
+    place. Offline-safe: a failed refresh keeps the current merged manifest."""
+    window_id = (payload or {}).get("window_id", getattr(plot, "window_id", None))
+
+    def _work():
+        try:
+            from spyde import models
+            avail = models.refresh_remote_registry()
+            msg = {"type": "fv_models", "window_id": window_id, "refreshed": True}
+            msg.update(avail)
+            emit(msg)
+        except Exception as e:
+            log.debug("fv_refresh_models failed: %s", e)
+
+    from spyde.actions.lifecycle import run_on_worker
+    run_on_worker(session, _work, name="fv-refresh-models")
 
 
 def fv_close(session, plot, payload=None) -> None:

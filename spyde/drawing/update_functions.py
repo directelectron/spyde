@@ -1265,6 +1265,156 @@ def compute_virtual_image_kernel(
     return client.compute(result)
 
 
+class _ProgressiveFuture:
+    """Future-like handle for the WINDOWED progressive compute (duck-typed
+    ``done``/``result``/``cancel`` — the VI stream polls it itself; it is never
+    handed to PlotUpdateWorker, whose isinstance(distributed.Future) checks
+    require the real thing — that is why the navigator-fill path keeps the
+    un-windowed full-graph future)."""
+
+    def __init__(self):
+        self._done_evt = threading.Event()
+        self._error: Exception | None = None
+        self._value = None
+        self._cancel_cb = None
+        self.cancelled = False
+
+    def done(self) -> bool:
+        return self._done_evt.is_set()
+
+    def result(self, timeout=None):
+        if not self._done_evt.wait(timeout):
+            raise TimeoutError("progressive compute not finished")
+        if self._error is not None:
+            raise self._error
+        return self._value
+
+    def cancel(self) -> None:
+        self.cancelled = True
+        cb = self._cancel_cb
+        if cb is not None:
+            try:
+                cb()
+            except Exception as e:
+                log.debug("progressive cancel callback failed: %s", e)
+
+
+def _windowed_progressive(result_array, nav_shape, client, chunk_slices,
+                          on_chunk_done, on_future, stop_event, window=None):
+    """Bounded-in-flight per-chunk compute for the VI/FFT stream.
+
+    The old path submitted EVERY nav chunk at once PLUS the whole array as a
+    second graph — the scheduler was then free to load the entire source
+    dataset immediately (the "VI spills tons to disk" pathology), and an ROI
+    move could not cancel the per-chunk futures at all, so each drag tick
+    stacked another complete full-dataset pass. Here at most ``window``
+    (~2× cluster threads) chunk futures exist at a time, every future is
+    reported via ``on_future`` AND cancellable through the returned handle,
+    a set ``stop_event`` halts further submission, and the full result is
+    assembled CLIENT-side from the same chunk results (no second graph).
+    Completed futures are held until the end (releasing mid-run races shared
+    input keys — see compute_dispatch) — chunk results are nav-sized floats,
+    so holding them is KBs."""
+    import collections
+    import functools
+
+    nav_ndim = len(nav_shape)
+    trailing = (slice(None),) * (result_array.ndim - nav_ndim)
+    dtype = (result_array.dtype if np.issubdtype(result_array.dtype, np.floating)
+             else np.float32)
+    assembled = np.full(result_array.shape, np.nan, dtype=dtype)
+
+    if window is None:
+        # HALF the cluster threads: a VI chunk is read-bound (the disk is the
+        # bottleneck, not the CPU), so full saturation buys no throughput but
+        # every in-flight chunk pins a full source chunk in RAM. 2x threads
+        # was effectively NO throttle on medium scans (64-chunk graph, 72-deep
+        # window) — the "sum memory usage is still crazy" report.
+        try:
+            info = client.scheduler_info(n_workers=-1)["workers"]
+            window = max(4, sum(int(w.get("nthreads", 1))
+                                for w in info.values()) // 2)
+        except Exception:
+            window = 8
+
+    handle = _ProgressiveFuture()
+    lock = threading.Lock()
+    pending = collections.deque(range(len(chunk_slices)))
+    outstanding: set = set()
+    held: list = []
+    state = {"completed": 0, "error": None}
+    n_total = len(chunk_slices)
+
+    def _stopped() -> bool:
+        return handle.cancelled or (stop_event is not None and stop_event.is_set())
+
+    def _finish():
+        if state["error"] is not None:
+            handle._error = state["error"]
+        else:
+            handle._value = assembled
+        handle._done_evt.set()
+
+    def _submit_up_to():
+        """Top up to the window (lock held). Deferred-only — a stop simply
+        drains what's in flight."""
+        while pending and len(outstanding) < window and not _stopped() \
+                and state["error"] is None:
+            idx = pending.popleft()
+            nav_sl = chunk_slices[idx]
+            fut = client.compute(result_array[nav_sl + trailing])
+            outstanding.add(fut)
+            if on_future is not None:
+                try:
+                    on_future(fut)
+                except Exception as e:
+                    log.debug("on_future(chunk) registration failed: %s", e)
+            fut.add_done_callback(functools.partial(_on_done, nav_sl=nav_sl))
+
+    def _on_done(fut, nav_sl):
+        try:
+            chunk_result = fut.result()
+            assembled[nav_sl + trailing] = chunk_result
+            if on_chunk_done is not None and not _stopped():
+                try:
+                    on_chunk_done(chunk_result, nav_sl)
+                except Exception as e:
+                    log.debug("progressive on_chunk_done failed: %s", e)
+        except Exception as exc:
+            with lock:
+                if state["error"] is None and not _stopped():
+                    state["error"] = exc
+        with lock:
+            outstanding.discard(fut)
+            held.append(fut)
+            state["completed"] += 1
+            _submit_up_to()
+            if (state["completed"] >= n_total or _stopped()
+                    or state["error"] is not None) and not outstanding:
+                _finish()
+
+    def _cancel_outstanding():
+        with lock:
+            pending.clear()
+            futs = list(outstanding)
+        for f in futs:
+            try:
+                f.cancel()
+            except Exception as e:
+                log.debug("cancelling progressive chunk future failed: %s", e)
+        with lock:
+            if not outstanding:
+                _finish()
+
+    handle._cancel_cb = _cancel_outstanding
+
+    with lock:
+        _submit_up_to()
+        if not outstanding:      # zero chunks (degenerate) — finish immediately
+            _finish()
+    return handle
+
+
 def compute_with_live_buffer(
     result_array: da.Array,
     nav_shape: tuple,
@@ -1272,6 +1422,8 @@ def compute_with_live_buffer(
     shm_name: str,
     on_chunk_done=None,
     on_future=None,
+    windowed: bool = False,
+    stop_event=None,
 ) -> distributed.Future:
     """
     Progressive compute: submits one Future per nav chunk and calls
@@ -1324,7 +1476,7 @@ def compute_with_live_buffer(
 
         return _SyncResult()
 
-    # Build per-nav-chunk futures
+    # Build per-nav-chunk slice list
     axes_ranges = []
     for axis_chunks in nav_chunks:
         positions, start = [], 0
@@ -1332,11 +1484,25 @@ def compute_with_live_buffer(
             positions.append((start, size))
             start += size
         axes_ranges.append(positions)
+    all_slices = [tuple(slice(s, s + n) for s, n in combo)
+                  for combo in itertools.product(*axes_ranges)]
 
+    if windowed:
+        # Bounded, fully-cancellable VI/FFT stream — see _windowed_progressive.
+        # Returns a duck-typed Future (done/result/cancel), NOT a
+        # distributed.Future, so it must never be handed to PlotUpdateWorker.
+        return _windowed_progressive(result_array, nav_shape, client,
+                                     all_slices, on_chunk_done, on_future,
+                                     stop_event)
+
+    # ── Legacy unbounded path (navigator fill ONLY) ─────────────────────────
+    # Submits every chunk up front + the full graph below: the full future IS
+    # the contract here — PlotUpdateWorker isinstance-checks distributed.Future
+    # on plot.current_data. The navigator fill runs once per dataset load (not
+    # per ROI drag), so the unbounded submission is tolerable there.
     chunk_futures = []
     chunk_slices = []
-    for combo in itertools.product(*axes_ranges):
-        slices = tuple(slice(s, s + n) for s, n in combo)
+    for slices in all_slices:
         full_slice = slices + (slice(None),) * (result_array.ndim - nav_ndim)
         chunk_da = result_array[full_slice]
         fut = client.compute(chunk_da)
@@ -1481,8 +1647,15 @@ def stream_progressive_to_plot(plot, result_array, client, *, name="vi"):
     def _on_chunk(chunk_result, nav_slices):
         relay.chunk_ready.emit(chunk_result, nav_slices)
 
+    # WINDOWED + CANCELLABLE (the "VI is a completely wild dask task" fix):
+    # bounded in-flight chunks (no whole-dataset prefetch/spill), no duplicate
+    # full-graph submission, and _stop_progressive_stream's future.cancel()
+    # now actually stops EVERYTHING (the old per-chunk futures were
+    # unregistered and ran to completion — every ROI drag tick stacked another
+    # complete full-dataset pass on the cluster).
     future = compute_with_live_buffer(
-        result_array, nav_shape, client, shm_name, on_chunk_done=_on_chunk
+        result_array, nav_shape, client, shm_name, on_chunk_done=_on_chunk,
+        windowed=True, stop_event=stop,
     )
 
     levels = [None]

@@ -123,6 +123,26 @@ def commit_result_tree(session, *, title: str, primary, primary_label: str | Non
     for k, v in (attrs or {}).items():
         setattr(tree, k, v)
 
+    # The views are ALSO committed as REAL child signal nodes — not just
+    # chip-selectable display figures. A saved committed tree then carries every
+    # component (a committed Strain tree used to hold εxx alone: the εyy/εxy/ω
+    # chips were figures, so saving / downstream processing lost them), and the
+    # Workflow panel can switch between the nodes.
+    view_mats = mats[1:] if not rgb else mats
+    for lbl, m in view_mats:
+        try:
+            child = hs.signals.Signal2D(m.copy())
+            child.metadata.General.title = f"{title} {lbl}"
+            tree.add_node(new_sig, child, lbl)
+            tree.update_plot_states(child)
+        except Exception as e:
+            log.debug("committing view node %r failed: %s", lbl, e)
+    if view_mats:
+        try:
+            session._reemit_signal_tree(tree)
+        except Exception as e:
+            log.debug("re-emitting committed tree failed: %s", e)
+
     sp = next(iter(getattr(tree, "signal_plots", []) or []), None)
     if sp is not None:
         try:

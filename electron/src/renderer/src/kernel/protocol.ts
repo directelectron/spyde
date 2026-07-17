@@ -448,6 +448,19 @@ export interface ReportSavedMessage extends MsgBase {
   path: string
 }
 
+/** A figure drop whose source tree carries diffraction vectors: the backend
+ *  deferred the cell and asks how HTML exports should embed it. The sidebar
+ *  prompts and re-sends `report_add_figure` with the original payload plus
+ *  `vectors_mode: 'viewer' | 'image'`. Re-broadcast as a `spyde:` CustomEvent. */
+export interface ReportVectorsChoiceMessage extends MsgBase {
+  type: 'report_vectors_choice'
+  source_window_id: number
+  index?: number | null
+  at_cell?: string | null
+  caption?: string
+  count?: number
+}
+
 /** An export finished: an HTML file (static/interactive) or a markdown folder
  *  was written at `path`. The renderer's Export flow awaits this, matched by
  *  `token` (the same token it sent in the triggering `report_export_html` /
@@ -472,6 +485,52 @@ export interface ReportPanelSelectedMessage extends MsgBase {
   panel_id: string | null
 }
 
+/** One in-flight Examples-menu download (pooch fetch on the backend). Emitted
+ *  throttled (~5 Hz) while bytes flow; `total` 0 = size unknown. Consumed by
+ *  DownloadToasts (bottom-right card with a progress bar + Cancel, which sends
+ *  the `download_cancel` action with this `token`). */
+export interface DownloadProgressMessage extends MsgBase {
+  type: 'download_progress'
+  token: string
+  label: string
+  done: number
+  total: number
+}
+
+/** Terminal state for a download toast — remove the card. `cancelled` downloads
+ *  also get a status-line note from the backend. */
+export interface DownloadDoneMessage extends MsgBase {
+  type: 'download_done'
+  token: string
+  ok: boolean
+  cancelled: boolean
+}
+
+/** One live cluster sample (~every 2 s while the cluster is up) for the
+ *  StatusBar Dask monitor HUD. `gpu` present only on NVIDIA machines. */
+export interface DaskStatsMessage extends MsgBase {
+  type: 'dask_stats'
+  workers: {
+    name: string
+    cpu: number          // percent (per worker process)
+    mem: number          // bytes
+    mem_limit: number    // bytes (0 = unknown)
+    executing: number    // tasks running now
+    ready: number        // tasks queued on the worker
+  }[]
+  tasks: { executing: number; queued: number }
+  gpu?: { util: number; vram_used: number; vram_total: number }  // %, MB, MB
+  host_cpu?: number      // whole-machine CPU percent
+  host_mem?: number      // whole-machine RAM percent (paging = the freeze killer)
+  /** Effective compute limits (the popover settings rows; `compute_configure`
+   *  applies changes by restarting the cluster). */
+  config?: {
+    mem_fraction: number       // cluster RAM budget, fraction of the machine
+    compute_fraction: number   // CPU budget, fraction of logical cores
+    gpu_workers: string        // GPU-feeding workers: "1".."8" | "one" | "all" | "off"
+  }
+}
+
 /**
  * Wizard-scoped events re-broadcast verbatim as DOM CustomEvents (the caret
  * components subscribe directly). The payload beyond `type` is consumer-defined,
@@ -484,6 +543,7 @@ export interface WizardEventMessage extends MsgBase {
     | 'om_library_ready'
     | 'fv_auto_params'
     | 'fv_models'
+    | 'fv_calibration'
     | 'cod_results'
     | 'cod_cif_ready'
     | 'gpu_status_result'
@@ -624,6 +684,7 @@ export type PlotAppMessage =
   | ReportStateMessage
   | ReportNeedSnapshotsMessage
   | ReportSavedMessage
+  | ReportVectorsChoiceMessage
   | ReportExportedMessage
   | ReportPanelSelectedMessage
   | WizardEventMessage
@@ -631,6 +692,9 @@ export type PlotAppMessage =
   | RepfigComposeOptionsMessage
   | MvxStateMessage
   | MvxDoneMessage
+  | DownloadProgressMessage
+  | DownloadDoneMessage
+  | DaskStatsMessage
 
 /**
  * Narrow a raw incoming message (`Record<string, unknown>` from the IPC bridge)

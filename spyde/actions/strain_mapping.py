@@ -39,6 +39,9 @@ class StrainField:
     exy: np.ndarray
     omega: np.ndarray          # lattice rotation (radians)
     coverage: np.ndarray       # fraction of reference reflections matched (0–1)
+    # Per-pixel fit quality (drives the confidence-weighted display):
+    residual: Optional[np.ndarray] = None    # RMS match residual of the final fit
+    n_matched: Optional[np.ndarray] = None   # matches used in the final fit
     # Provenance record ({"action", "params", "spyde_version"}) — same dict
     # convention as commit._stamp_provenance (script/app interchangeable).
     provenance: Optional[dict] = None
@@ -75,6 +78,58 @@ def zero_beam_filtered(g_ref) -> np.ndarray:
     return g[mag > thresh]
 
 
+def region_reference(vecs, ref_yx, radius: int = 2, min_frac: float = 0.5,
+                     tol: float | None = None) -> np.ndarray:
+    """Consensus reference built from ALL peaks in the ``(2·radius+1)²`` scan
+    neighbourhood around ``ref_yx`` — the noise-robust replacement for trusting a
+    single frame's peak set.
+
+    Vectors from every frame in the window are pooled and clustered by proximity
+    (greedy, densest-first, radius = the same ¼-NN-spacing scale the strain match
+    uses). A cluster is kept only when it appears in ≥ ``min_frac`` of the frames
+    — so a false positive detected in one or two frames is DROPPED — and its
+    position is the MEDIAN over members, so per-frame subpixel noise averages
+    down ~√N. ``radius=0`` returns the single-pixel set (old behaviour).
+
+    Returns (K, 2) vectors (zero-beam NOT yet filtered — callers filter)."""
+    ry, rx = int(ref_yx[0]), int(ref_yx[1])
+    centre = np.asarray(vecs.kxy_at(ry, rx), dtype=float).reshape(-1, 2)
+    if radius <= 0:
+        return centre
+    ny, nx = vecs.nav_shape
+    frames = []
+    for iy in range(max(0, ry - radius), min(ny, ry + radius + 1)):
+        for ix in range(max(0, rx - radius), min(nx, rx + radius + 1)):
+            g = np.asarray(vecs.kxy_at(iy, ix), dtype=float).reshape(-1, 2)
+            if len(g):
+                frames.append(g)
+    if len(frames) <= 1:
+        return centre
+    if tol is None:
+        nn = _median_nn(centre if len(centre) >= 2 else np.vstack(frames))
+        tol = 0.25 * nn if nn > 0 else 0.0
+    if tol <= 0:
+        return centre
+    from scipy.spatial import cKDTree
+    pool = np.vstack(frames)
+    fid = np.repeat(np.arange(len(frames)), [len(f) for f in frames])
+    neigh = cKDTree(pool).query_ball_point(pool, r=tol)
+    order = np.argsort([-len(n) for n in neigh])          # densest clusters first
+    used = np.zeros(len(pool), bool)
+    need = max(2, int(np.ceil(min_frac * len(frames))))
+    out = []
+    for i in order:
+        if used[i]:
+            continue
+        members = [j for j in neigh[i] if not used[j]]
+        used[members] = True
+        if len({int(fid[j]) for j in members}) >= need:   # persists across frames
+            out.append(np.median(pool[members], axis=0))
+    if len(out) < 2:
+        return centre                                     # degenerate → old behaviour
+    return np.asarray(out, dtype=float)
+
+
 def _median_nn(g: np.ndarray) -> float:
     """Median nearest-neighbour distance of a point set — a natural length scale
     for the match tolerance. Returns 0.0 for < 2 points."""
@@ -87,42 +142,80 @@ def _median_nn(g: np.ndarray) -> float:
     return float(np.median(nn)) if nn.size else 0.0
 
 
-def fit_pattern_strain(g_meas: np.ndarray, g_ref: np.ndarray, *, tol: float):
-    """Fit one pixel: ``g_meas ≈ T · g_ref + t`` with ±g (Friedel) matching.
+# A pixel's affine fit (2×2 T + translation = 6 unknowns) is EXACTLY determined by
+# 3 matches and UNDER-determined by 2 (lstsq then returns an arbitrary min-norm T →
+# a wild strain value: the "bright dot" pixels). 3 is the mathematical minimum; the
+# residual trim below is what protects a 3-match pixel from a single FP (dropping
+# the FP leaves 2 → below the gate → honestly masked instead of garbage).
+DEFAULT_MIN_MATCHES = 3
+# Residual trimming: after the first fit, matches with residual > 2.5× the pixel's
+# RMS (with a small absolute floor so exact synthetic fits keep everything, and an
+# absolute cap of tol/2) are dropped and the pixel refit once — one FP vector inside
+# the match radius no longer drags T.
+_TRIM_SIGMA = 2.5
+_TRIM_FLOOR = 1e-6
 
-    Returns ``(exx, eyy, exy, omega, coverage)`` or ``None`` when fewer than two
-    reflections match (an undetermined fit). ``coverage`` is the fraction of the
-    reference reflections that found a measured partner.
-    """
+
+def _trim_keep(r: np.ndarray, rms: float, tol: float) -> np.ndarray:
+    keep = r <= max(_TRIM_SIGMA * rms, _TRIM_FLOOR)
+    if np.isfinite(tol):
+        keep &= r <= 0.5 * tol
+    return keep
+
+
+def _fit_pattern_strain_full(g_meas, g_ref, *, tol, min_matches=DEFAULT_MIN_MATCHES,
+                             trim=True):
+    """fit_pattern_strain + fit-quality extras:
+    ``(exx, eyy, exy, omega, coverage, residual_rms, n_matched)`` or None."""
     g_meas = np.asarray(g_meas, dtype=float).reshape(-1, 2)
     g_ref = np.asarray(g_ref, dtype=float).reshape(-1, 2)
     if len(g_meas) < 2 or len(g_ref) < 2:
         return None
 
     from scipy.spatial import cKDTree
-    # Centre both sets: a centrosymmetric ({g, −g}) peak set's centroid IS the
-    # diffraction-pattern-centre offset, so removing it makes the ±g match robust
-    # to a badly-centred pattern (the −g=g point). The affine translation below
-    # then mops up any residual from missing reflections.
-    g_meas = g_meas - g_meas.mean(axis=0)
-    g_ref = g_ref - g_ref.mean(axis=0)
-
-    # Friedel: a reference reflection may show up at +g OR −g.
-    ref_aug = np.vstack([g_ref, -g_ref])                       # (2M, 2)
-    src_idx = np.concatenate([np.arange(len(g_ref))] * 2)      # back to ref id
-    # Match each MEASURED peak to its nearest augmented reference within tol.
-    d, idx = cKDTree(ref_aug).query(g_meas, distance_upper_bound=tol)
-    ok = np.isfinite(d)
-    if ok.sum() < 2:
-        return None
+    # TWO candidate alignments; the one matching MORE spots wins (per pixel):
+    #   raw      — trust the pipeline's pattern centre (kxy are centre-relative).
+    #              Essential for ASYMMETRIC detections (missing Friedel partners,
+    #              e.g. faint precipitate patterns): their centroid is NOT the
+    #              centre — the bias reaches ~|g|/3 > tol, so the old
+    #              centroid-only alignment matched NOTHING and a frame with six
+    #              good spots read as a failed fit.
+    #   centroid — remove each set's mean (a CENTROSYMMETRIC set's centroid IS
+    #              the centre offset): robust to a badly-centred pattern.
+    # The affine translation term mops up the residual either way; strict '>'
+    # keeps the centroid behaviour on ties.
+    src_idx = np.concatenate([np.arange(len(g_ref))] * 2)      # aug → ref id
+    cands = []
+    for centre in (False, True):
+        gm = g_meas - (g_meas.mean(axis=0) if centre else 0.0)
+        gr = g_ref - (g_ref.mean(axis=0) if centre else 0.0)
+        ref_aug = np.vstack([gr, -gr])                         # (2M, 2) Friedel
+        d, idx = cKDTree(ref_aug).query(gm, distance_upper_bound=tol)
+        ok = np.isfinite(d)
+        cands.append((int(ok.sum()), gm, ref_aug, idx, ok))
+    n_raw, n_cen = cands[0][0], cands[1][0]
+    _, gm, ref_aug, idx, ok = cands[0] if n_raw > n_cen else cands[1]
     G_ref = ref_aug[idx[ok]]                                   # (K, 2)
-    G_meas = g_meas[ok]                                        # (K, 2)
-    if np.linalg.matrix_rank(G_ref - G_ref.mean(0)) < 2:       # collinear → ill-posed
-        return None
+    G_meas = gm[ok]                                            # (K, 2)
+    ref_ids = src_idx[idx[ok]]
 
-    # Affine least squares: [G_ref | 1] @ M = G_meas, M = [[T^T],[t^T]] (3×2).
-    A = np.hstack([G_ref, np.ones((len(G_ref), 1))])
-    sol, *_ = np.linalg.lstsq(A, G_meas, rcond=None)
+    sol = None
+    resid = None
+    for it in range(2 if trim else 1):
+        if len(G_ref) < max(2, min_matches):
+            return None
+        if np.linalg.matrix_rank(G_ref - G_ref.mean(0)) < 2:   # collinear → ill-posed
+            return None
+        # Affine least squares: [G_ref | 1] @ M = G_meas, M = [[T^T],[t^T]] (3×2).
+        A = np.hstack([G_ref, np.ones((len(G_ref), 1))])
+        sol, *_ = np.linalg.lstsq(A, G_meas, rcond=None)
+        resid = np.linalg.norm(G_meas - A @ sol, axis=1)
+        if it == 0 and trim:
+            rms = float(np.sqrt(np.mean(resid ** 2)))
+            keep = _trim_keep(resid, rms, tol)
+            if keep.all():
+                break
+            G_ref, G_meas, ref_ids = G_ref[keep], G_meas[keep], ref_ids[keep]
     T = sol[:2, :].T                                           # 2×2: g_meas ≈ T·g_ref + t
 
     # Report REAL-SPACE lattice strain, not reciprocal: the measured g map as
@@ -144,8 +237,26 @@ def fit_pattern_strain(g_meas: np.ndarray, g_ref: np.ndarray, *, tol: float):
         omega = float(np.arctan2(R[1, 0], R[0, 0]))
     except np.linalg.LinAlgError:
         omega = 0.0
-    coverage = len(np.unique(src_idx[idx[ok]])) / len(g_ref)
-    return float(e[0, 0]), float(e[1, 1]), float(e[0, 1]), omega, float(coverage)
+    coverage = len(np.unique(ref_ids)) / len(g_ref)
+    rms = float(np.sqrt(np.mean(resid ** 2)))
+    return (float(e[0, 0]), float(e[1, 1]), float(e[0, 1]), omega, float(coverage),
+            rms, int(len(G_ref)))
+
+
+def fit_pattern_strain(g_meas: np.ndarray, g_ref: np.ndarray, *, tol: float,
+                       min_matches: int = DEFAULT_MIN_MATCHES, trim: bool = True):
+    """Fit one pixel: ``g_meas ≈ T · g_ref + t`` with ±g (Friedel) matching.
+
+    Returns ``(exx, eyy, exy, omega, coverage)`` or ``None`` when fewer than
+    ``min_matches`` reflections match (an under-determined fit — the 6-unknown
+    affine needs redundancy, not just solvability). One residual-trimming pass
+    (``trim``) drops outlier matches (FP vectors inside the match radius) and
+    refits. ``coverage`` is the fraction of the reference reflections that found
+    a measured partner.
+    """
+    r = _fit_pattern_strain_full(g_meas, g_ref, tol=tol, min_matches=min_matches,
+                                 trim=trim)
+    return None if r is None else r[:5]
 
 
 def cif_g_families(phase, *, min_dspacing: float = 0.7) -> np.ndarray:
@@ -255,14 +366,19 @@ def _strain_from_T(T: np.ndarray):
 
 
 def compute_strain_field(vecs, ref_yx=None, *, ref_vectors=None,
-                         tol: float | None = None) -> StrainField:
+                         tol: float | None = None,
+                         min_matches: int = DEFAULT_MIN_MATCHES, trim: bool = True,
+                         ref_radius: int = 0) -> StrainField:
     """Strain field of ``vecs`` (a ``SpyDEDiffractionVectors``) measured against a
     reference lattice — either the vectors at reference pixel ``ref_yx = (ry, rx)``
     (relative strain; ε = 0 there by construction) OR an explicit ``ref_vectors``
     set, e.g. the CIF-snapped absolute reference (absolute strain).
 
     ``tol`` (reciprocal units) is the ±g match radius; defaults to ¼ of the
-    reference lattice's nearest-neighbour spacing.
+    reference lattice's nearest-neighbour spacing. ``min_matches`` / ``trim`` are
+    the fit-robustness knobs (see :func:`fit_pattern_strain`). ``ref_radius`` > 0
+    pools the reference over a ``(2r+1)²`` neighbourhood of ``ref_yx``
+    (:func:`region_reference` — noise-robust consensus; 0 = the single pixel).
 
     Fits EVERY nav pixel in one vectorized pass (one global KDTree match + batched
     per-pixel normal-equation solve + closed-form 2×2 polar decomposition) rather
@@ -274,8 +390,7 @@ def compute_strain_field(vecs, ref_yx=None, *, ref_vectors=None,
     if ref_vectors is not None:
         g_ref = np.asarray(ref_vectors, dtype=float).reshape(-1, 2)
     else:
-        ry, rx = int(ref_yx[0]), int(ref_yx[1])
-        g_ref = np.asarray(vecs.kxy_at(ry, rx), dtype=float).reshape(-1, 2)
+        g_ref = region_reference(vecs, ref_yx, radius=int(ref_radius))
     if tol is None:
         nn = _median_nn(g_ref)
         tol = 0.25 * nn if nn > 0 else np.inf
@@ -286,33 +401,43 @@ def compute_strain_field(vecs, ref_yx=None, *, ref_vectors=None,
     offs = getattr(vecs, "nav_offsets", None)
     n_time = getattr(vecs, "n_time", 0)
     if (flat is None or offs is None or n_time != 0 or len(g_ref) < 2):
-        return _compute_strain_field_loop(vecs, g_ref, tol, ny, nx)
+        return _compute_strain_field_loop(vecs, g_ref, tol, ny, nx,
+                                          min_matches=min_matches, trim=trim)
 
-    return _compute_strain_field_vectorized(flat, offs[-1], g_ref, tol, ny, nx)
+    return _compute_strain_field_vectorized(flat, offs[-1], g_ref, tol, ny, nx,
+                                            min_matches=min_matches, trim=trim)
 
 
-def _compute_strain_field_loop(vecs, g_ref, tol, ny, nx) -> StrainField:
+def _compute_strain_field_loop(vecs, g_ref, tol, ny, nx,
+                               min_matches=DEFAULT_MIN_MATCHES, trim=True) -> StrainField:
     """Per-pixel reference path (5-D / non-CSR / degenerate reference)."""
     exx = np.full((ny, nx), np.nan, dtype=np.float32)
     eyy = np.full((ny, nx), np.nan, dtype=np.float32)
     exy = np.full((ny, nx), np.nan, dtype=np.float32)
     omega = np.full((ny, nx), np.nan, dtype=np.float32)
     cov = np.zeros((ny, nx), dtype=np.float32)
+    res = np.full((ny, nx), np.nan, dtype=np.float32)
+    nm = np.zeros((ny, nx), dtype=np.int32)
     for iy in range(ny):
         for ix in range(nx):
-            r = fit_pattern_strain(vecs.kxy_at(iy, ix), g_ref, tol=tol)
+            r = _fit_pattern_strain_full(vecs.kxy_at(iy, ix), g_ref, tol=tol,
+                                         min_matches=min_matches, trim=trim)
             if r is not None:
-                exx[iy, ix], eyy[iy, ix], exy[iy, ix], omega[iy, ix], cov[iy, ix] = r
-    return StrainField(exx, eyy, exy, omega, cov)
+                (exx[iy, ix], eyy[iy, ix], exy[iy, ix], omega[iy, ix],
+                 cov[iy, ix], res[iy, ix], nm[iy, ix]) = r
+    return StrainField(exx, eyy, exy, omega, cov, residual=res, n_matched=nm)
 
 
-def _compute_strain_field_vectorized(flat_buffer, x_off, g_ref, tol, ny, nx) -> StrainField:
+def _compute_strain_field_vectorized(flat_buffer, x_off, g_ref, tol, ny, nx,
+                                     min_matches=DEFAULT_MIN_MATCHES,
+                                     trim=True) -> StrainField:
     """Whole-field strain in one pass — see :func:`compute_strain_field`.
 
-    Mirrors :func:`fit_pattern_strain` exactly, batched over all P = ny·nx pixels:
-    per-pixel mean-centre → one ±g (Friedel) KDTree match for every vector at once
-    → per-pixel affine normal equations (AᵀA, AᵀB) via scatter-add → batched 3×3
-    solve → closed-form 2×2 polar decomposition.
+    Mirrors :func:`fit_pattern_strain` exactly (incl. the min-match gate and the
+    one residual-trimming pass), batched over all P = ny·nx pixels: per-pixel
+    mean-centre → one ±g (Friedel) KDTree match for every vector at once →
+    per-pixel affine normal equations (AᵀA, AᵀB) via scatter-add → batched 3×3
+    solve → residual trim + refit → closed-form 2×2 polar decomposition.
     """
     from scipy.spatial import cKDTree
 
@@ -332,61 +457,104 @@ def _compute_strain_field_vectorized(flat_buffer, x_off, g_ref, tol, ny, nx) -> 
     centroids = sums / cnt
     kc = kxy - centroids[pix]                                        # centred measured
 
-    g_ref = g_ref - g_ref.mean(axis=0)                              # centred reference
-    ref_aug = np.vstack([g_ref, -g_ref])                           # (2M, 2), Friedel
-    src_idx = np.concatenate([np.arange(len(g_ref))] * 2)          # back to ref id
+    src_idx = np.concatenate([np.arange(len(g_ref))] * 2)          # aug → ref id
+    # TWO candidate alignments (see _fit_pattern_strain_full): raw (asymmetric
+    # detections — the centroid is biased) vs centroid-removed (badly-centred
+    # patterns). One KDTree match each for EVERY vector across the whole scan;
+    # each pixel keeps whichever alignment matched MORE of its spots (strict '>'
+    # keeps the centroid behaviour on ties — identical rule to the loop path).
+    ref_aug_raw = np.vstack([g_ref, -g_ref])
+    g_ref_cen = g_ref - g_ref.mean(axis=0)
+    ref_aug_cen = np.vstack([g_ref_cen, -g_ref_cen])
+    d0, idx0 = cKDTree(ref_aug_raw).query(kxy, distance_upper_bound=tol)
+    d1, idx1 = cKDTree(ref_aug_cen).query(kc, distance_upper_bound=tol)
+    ok0, ok1 = np.isfinite(d0), np.isfinite(d1)
+    n0 = np.zeros(P, np.int64); np.add.at(n0, pix[ok0], 1)
+    n1 = np.zeros(P, np.int64); np.add.at(n1, pix[ok1], 1)
+    use_raw = n0 > n1                                               # per pixel
+    take0 = ok0 & use_raw[pix]
+    take1 = ok1 & ~use_raw[pix]
+    pid = np.concatenate([pix[take0], pix[take1]])
+    Gr = np.vstack([ref_aug_raw[idx0[take0]], ref_aug_cen[idx1[take1]]])
+    Gm = np.vstack([kxy[take0], kc[take1]])
+    rid = np.concatenate([src_idx[idx0[take0]], src_idx[idx1[take1]]])
 
-    # One KDTree match for EVERY measured vector across the whole scan.
-    d, idx = cKDTree(ref_aug).query(kc, distance_upper_bound=tol)
-    ok = np.isfinite(d)
-    pid = pix[ok]
-    Gr = ref_aug[idx[ok]]                                           # (K, 2) matched ref
-    Gm = kc[ok]                                                     # (K, 2) measured
+    min_m = max(2, int(min_matches))
 
-    # Per-pixel affine normal equations for [gx,gy,1]·M = g_meas. Accumulate the
-    # six unique AᵀA entries + the AᵀB (3×2) via scatter-add keyed by pixel.
-    ax, ay = Gr[:, 0], Gr[:, 1]
-    AtA = np.zeros((P, 3, 3))
-    AtB = np.zeros((P, 3, 2))
-    # AᵀA = Σ [ax,ay,1]ᵀ[ax,ay,1]
-    np.add.at(AtA[:, 0, 0], pid, ax * ax)
-    np.add.at(AtA[:, 0, 1], pid, ax * ay)
-    np.add.at(AtA[:, 0, 2], pid, ax)
-    np.add.at(AtA[:, 1, 1], pid, ay * ay)
-    np.add.at(AtA[:, 1, 2], pid, ay)
-    np.add.at(AtA[:, 2, 2], pid, np.ones_like(ax))
-    AtA[:, 1, 0] = AtA[:, 0, 1]
-    AtA[:, 2, 0] = AtA[:, 0, 2]
-    AtA[:, 2, 1] = AtA[:, 1, 2]
-    np.add.at(AtB[:, 0, :], pid, ax[:, None] * Gm)
-    np.add.at(AtB[:, 1, :], pid, ay[:, None] * Gm)
-    np.add.at(AtB[:, 2, :], pid, Gm)
+    def _normal_eqs(pid, Gr, Gm):
+        """Per-pixel affine normal equations for [gx,gy,1]·M = g_meas: the six
+        unique AᵀA entries + AᵀB (3×2) via scatter-add keyed by pixel."""
+        ax, ay = Gr[:, 0], Gr[:, 1]
+        AtA = np.zeros((P, 3, 3))
+        AtB = np.zeros((P, 3, 2))
+        np.add.at(AtA[:, 0, 0], pid, ax * ax)
+        np.add.at(AtA[:, 0, 1], pid, ax * ay)
+        np.add.at(AtA[:, 0, 2], pid, ax)
+        np.add.at(AtA[:, 1, 1], pid, ay * ay)
+        np.add.at(AtA[:, 1, 2], pid, ay)
+        np.add.at(AtA[:, 2, 2], pid, np.ones_like(ax))
+        AtA[:, 1, 0] = AtA[:, 0, 1]
+        AtA[:, 2, 0] = AtA[:, 0, 2]
+        AtA[:, 2, 1] = AtA[:, 1, 2]
+        np.add.at(AtB[:, 0, :], pid, ax[:, None] * Gm)
+        np.add.at(AtB[:, 1, :], pid, ay[:, None] * Gm)
+        np.add.at(AtB[:, 2, :], pid, Gm)
+        matched = np.zeros(P, dtype=np.int64); np.add.at(matched, pid, 1)
+        detAtA = np.linalg.det(AtA)
+        good = (matched >= min_m) & np.isfinite(detAtA) & (np.abs(detAtA) > 1e-12)
+        sol = np.zeros((P, 3, 2))
+        if good.any():
+            sol[good] = np.linalg.solve(AtA[good], AtB[good])       # rows of M
+        return sol, good, matched
 
-    # Matched ref count + distinct-ref coverage per pixel.
-    matched = np.zeros(P, dtype=np.int64); np.add.at(matched, pid, 1)
-    # Coverage = #distinct reference reflections matched / len(g_ref).
+    def _residuals(sol, pid, Gr, Gm):
+        A = np.hstack([Gr, np.ones((len(Gr), 1))])                  # (K, 3)
+        model = np.einsum('kj,kjl->kl', A, sol[pid])                # (K, 2)
+        return np.linalg.norm(Gm - model, axis=1)
+
+    sol, good, matched = _normal_eqs(pid, Gr, Gm)
+    if trim and len(pid):
+        # One trimming pass (same thresholds as _fit_pattern_strain_full): drop
+        # matches whose residual exceeds 2.5× their pixel's RMS (abs floor) or
+        # tol/2, then refit. Matches on not-yet-good pixels are left alone —
+        # their pixels stay NaN either way (mirrors the loop returning None).
+        r = _residuals(sol, pid, Gr, Gm)
+        ss = np.zeros(P); nn = np.zeros(P)
+        np.add.at(ss, pid, r * r); np.add.at(nn, pid, 1.0)
+        rms = np.sqrt(ss / np.maximum(nn, 1.0))
+        keep = r <= np.maximum(_TRIM_SIGMA * rms[pid], _TRIM_FLOOR)
+        if np.isfinite(tol):
+            keep &= r <= 0.5 * tol
+        keep |= ~good[pid]
+        if not keep.all():
+            pid, Gr, Gm, rid = pid[keep], Gr[keep], Gm[keep], rid[keep]
+            sol, good, matched = _normal_eqs(pid, Gr, Gm)
+
+    # Coverage = #distinct reference reflections matched / len(g_ref), from the
+    # FINAL (post-trim) match set.
     cov = np.zeros((ny, nx), dtype=np.float32)
     if len(pid):
-        ref_of = src_idx[idx[ok]]
-        seen = {}
-        # distinct (pixel, ref) pairs → count per pixel (small K; vectorized via unique)
-        pairs = pid.astype(np.int64) * len(g_ref) + ref_of
-        upairs = np.unique(pairs)
-        dpix = (upairs // len(g_ref)).astype(np.int64)
+        pairs = pid.astype(np.int64) * len(g_ref) + rid
+        dpix = (np.unique(pairs) // len(g_ref)).astype(np.int64)
         dcov = np.zeros(P, dtype=np.float32); np.add.at(dcov, dpix, 1.0)
         cov = (dcov / len(g_ref)).reshape(ny, nx)
 
-    # A pixel is well-posed only with ≥2 matches AND a non-collinear, invertible
-    # normal matrix. Solve all good pixels' 3×3 systems at once.
+    # Per-pixel RMS residual of the FINAL fit (the confidence/error map).
+    res = np.full(P, np.nan)
+    if len(pid):
+        r = _residuals(sol, pid, Gr, Gm)
+        ss = np.zeros(P); nn = np.zeros(P)
+        np.add.at(ss, pid, r * r); np.add.at(nn, pid, 1.0)
+        with np.errstate(invalid="ignore"):
+            res = np.where(nn > 0, np.sqrt(ss / np.maximum(nn, 1.0)), np.nan)
+
     exx = np.full(P, np.nan); eyy = np.full(P, np.nan)
     exy = np.full(P, np.nan); omega = np.full(P, np.nan)
-    detAtA = np.linalg.det(AtA)
-    good = (matched >= 2) & np.isfinite(detAtA) & (np.abs(detAtA) > 1e-12)
     if good.any():
-        sol = np.linalg.solve(AtA[good], AtB[good])                # (G, 3, 2): rows = M
-        T = np.transpose(sol[:, :2, :], (0, 2, 1))                 # (G, 2, 2): g≈T·g_ref
+        T = np.transpose(sol[good][:, :2, :], (0, 2, 1))            # (G, 2, 2)
         gx, gy, gz, gw = _strain_from_T(T)
         exx[good], eyy[good], exy[good], omega[good] = gx, gy, gz, gw
+    res[~good] = np.nan
 
     return StrainField(
         exx.reshape(ny, nx).astype(np.float32),
@@ -394,6 +562,8 @@ def _compute_strain_field_vectorized(flat_buffer, x_off, g_ref, tol, ny, nx) -> 
         exy.reshape(ny, nx).astype(np.float32),
         omega.reshape(ny, nx).astype(np.float32),
         cov.astype(np.float32),
+        residual=res.reshape(ny, nx).astype(np.float32),
+        n_matched=matched.reshape(ny, nx).astype(np.int32),
     )
 
 

@@ -1161,6 +1161,11 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
           dispatch({ type: 'STATUS', text: `Report saved: ${msg.path}` })
           break
 
+        case 'report_vectors_choice':
+          // Deferred vectors-figure drop — the sidebar owns the prompt.
+          window.dispatchEvent(new CustomEvent('spyde:report_vectors_choice', { detail: msg }))
+          break
+
         case 'report_need_snapshots':
           // The backend needs a fresh PNG per cell before it writes the zip.
           // Re-broadcast as a DOM CustomEvent; the provider's snapshot effect
@@ -1194,6 +1199,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'om_library_ready':
         case 'fv_auto_params':
         case 'fv_models':
+        case 'fv_calibration':
         case 'cod_results':
         case 'cod_cif_ready':
         case 'gpu_status_result':
@@ -1204,6 +1210,12 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'report_exported':
         case 'mvx_state':
         case 'mvx_done':
+        // Examples-menu download progress/terminal — consumed by DownloadToasts
+        // (app-global, not wizard-scoped, but the same re-broadcast fits).
+        case 'download_progress':
+        case 'download_done':
+        // Cluster telemetry — consumed by the StatusBar DaskMonitor HUD.
+        case 'dask_stats':
           window.dispatchEvent(new CustomEvent(`spyde:${msg.type}`, { detail: msg }))
           break
 

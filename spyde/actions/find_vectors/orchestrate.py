@@ -24,6 +24,7 @@ from spyde.actions.find_vectors.chunk import _find_vectors_chunk
 from spyde.actions.find_vectors.detectors import (
     DEFAULT_DOG_SIGMA1,
     DEFAULT_DOG_SIGMA2,
+    METHOD_NEURAL,
     METHOD_NXCORR,
     _auto_beamstop_from_signal,
     _find_vectors_single_frame,  # noqa: F401  (referenced in docstrings)
@@ -88,10 +89,12 @@ def _balanced_nav_chunks(dim: int, target: int, depth: int) -> tuple:
     return tuple(chunks)
 
 
-def _split_workers_for_gpu(client) -> tuple:
-    """Lane split per SPYDE_FV_GPU — shared implementation in compute_dispatch."""
+def _split_workers_for_gpu(client, default_mode: str = "one") -> tuple:
+    """Lane split per SPYDE_FV_GPU — shared implementation in compute_dispatch.
+    ``default_mode`` is the per-METHOD unset-default (neural "2", numba NXCORR
+    "one") and must match the chunk fn's ``_gpu_task_allowed`` default."""
     from spyde.compute_dispatch import split_workers_for_gpu
-    return split_workers_for_gpu(client)
+    return split_workers_for_gpu(client, default_mode)
 
 
 def _compact_padded_chunk(arr: np.ndarray) -> np.ndarray:
@@ -197,6 +200,8 @@ def _dispatch_chunks_gpu_aware(
     cpu_addrs: list,
     stopped_flag=None,
     on_chunk_done=None,
+    lane_default_mode: str = "one",
+    gpu_only: bool = False,
 ):
     """Greedy dual-lane chunk dispatch — shared implementation in
     compute_dispatch; vectors-specific NaN-slot compaction via postprocess."""
@@ -205,6 +210,7 @@ def _dispatch_chunks_gpu_aware(
         client, result_array, nav_dim, gpu_addrs, cpu_addrs,
         stopped_flag=stopped_flag, postprocess=_compact_padded_chunk,
         fill_value=np.nan, label="find_vectors", on_chunk_done=on_chunk_done,
+        lane_default_mode=lane_default_mode, gpu_only=gpu_only,
     )
 
 
@@ -275,10 +281,16 @@ def _do_compute_vectors(
     subpixel = bool(params.get("subpixel", True))
     dog_sigma1 = float(params.get("dog_sigma1", DEFAULT_DOG_SIGMA1))
     dog_sigma2 = float(params.get("dog_sigma2", DEFAULT_DOG_SIGMA2))
-    # Neural-method knobs: registry model id ("" → the registry default) and the
-    # calibrated local-norm high-pass scale (see find_vectors_neural).
+    # Neural-method knobs: registry model id ("" → the registry default), the
+    # calibrated local-norm high-pass scale (see find_vectors_neural), and the
+    # optional scan-neighbour persistence refine (batch-only — needs neighbours).
     model_id = str(params.get("model_id") or "").strip() or None
     bg_sigma = float(params.get("bg_sigma") or 12.0)
+    persistence = bool(params.get("persistence", False))
+    # Spot-size (px radius) override for the model's canonical rescale; 0/None →
+    # the model's own autocorrelation estimate (the wizard always sends its
+    # auto-seeded Spot-size slider value).
+    spot_radius = float(params.get("spot_radius") or 0.0) or None
     log.debug("[do_compute_vectors] START method=%s thr=%s md=%s sigma=%s "
               "nav_dim=%s sig_shape=%s lazy=%s beamstop=%s", method, threshold,
               min_dist, sigma, nav_dim, tuple(sig_shape),
@@ -407,6 +419,8 @@ def _do_compute_vectors(
         dog_sigma2=dog_sigma2,
         model_id=model_id,
         bg_sigma=bg_sigma,
+        persistence=persistence,
+        spot_radius=spot_radius,
     )
 
     # Resolve the distributed client up front — needed both to decide on GPU
@@ -528,15 +542,32 @@ def _do_compute_vectors(
         # GPU-aware dual-lane dispatcher when the cluster has a designated
         # GPU worker: dask's locality-driven placement starves the (much
         # faster) GPU worker, so we place per-chunk futures ourselves.
-        gpu_addrs, cpu_addrs = _split_workers_for_gpu(client)
-        if gpu_addrs and cpu_addrs:
+        # Per-method unset-default for the GPU lane: neural = "2" (real-data
+        # A/B 2026-07-16 — two CUDA-submitting workers beat all-workers on
+        # BOTH throughput and desktop smoothness; must match _neural_block's
+        # _gpu_task_allowed default), numba NXCORR keeps "one" (its kernels
+        # serialise on the device).
+        #
+        # NEURAL IS GPU-ONLY: torch-CPU inference is 10-50x slower than the
+        # batched GPU forward, so a mixed dispatch just parks the last
+        # window-full of chunks on a crawling CPU lane (measured: the e2e
+        # batch blew its 120 s budget). All chunks go to the GPU workers; the
+        # CPU workers stay free (which is also why the desktop stays smooth).
+        neural = method == METHOD_NEURAL
+        lane_mode = "4" if neural else "one"
+        gpu_addrs, cpu_addrs = _split_workers_for_gpu(client, lane_mode)
+        if neural:
+            cpu_addrs = []
+        if gpu_addrs and (cpu_addrs or neural):
             log.debug(
                 f"[find_vectors] dispatcher lanes: "
                 f"GPU={len(gpu_addrs)} worker(s), CPU={len(cpu_addrs)} worker(s)"
+                f"{' (gpu-only)' if neural else ''}"
             )
             result_padded = _dispatch_chunks_gpu_aware(
                 client, peaks_padded, nav_dim, gpu_addrs, cpu_addrs,
                 stopped_flag=stopped_flag, on_chunk_done=_live_count_chunk,
+                lane_default_mode=lane_mode, gpu_only=neural,
             )
             if result_padded is None:
                 return None

@@ -1,5 +1,6 @@
 import React from 'react'
 import { useSpyDE } from '../kernel/SpyDEContext'
+import { DaskMonitor } from './DaskMonitor'
 
 // One-time keyframes for the loading spinner (renderer has no global CSS file).
 if (typeof document !== 'undefined' && !document.getElementById('spyde-spin-kf')) {
@@ -30,14 +31,10 @@ export function StatusBar({ logOpen, onToggleLog }: {
       <span style={styles.text} data-testid="status-text">
         {busy && state.loading.text ? state.loading.text : state.status}
       </span>
-      {state.dashboardUrl && (
-        <button
-          style={styles.link}
-          onClick={() => window.electron.openExternal(state.dashboardUrl!)}
-        >
-          Dask dashboard ↗
-        </button>
-      )}
+      {/* Live compute readout (CPU / GPU / tasks) — click for per-worker detail
+          + the full-dashboard link (the old standalone "Dask dashboard ↗"
+          button folded into the popover). */}
+      <DaskMonitor />
       <button
         data-testid="toggle-log"
         style={{ ...styles.btn, ...(logOpen ? styles.btnActive : null) }}
@@ -89,10 +86,6 @@ const styles: Record<string, React.CSSProperties> = {
     width: 12, height: 12, borderRadius: '50%', flexShrink: 0,
     border: '2px solid #45475a', borderTopColor: '#89b4fa',
     animation: 'spyde-spin 0.8s linear infinite',
-  },
-  link: {
-    background: 'none', border: 'none', color: '#89b4fa',
-    fontSize: 12, cursor: 'pointer', padding: 0,
   },
   btn: {
     display: 'inline-flex', alignItems: 'center', gap: 6,

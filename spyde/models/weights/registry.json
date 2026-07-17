@@ -1,11 +1,20 @@
 {
-  "default": "spotunet-production-v2",
+  "default": "spotunet-anyscale8-peaked-sharpened-v1",
   "models": [
+    {
+      "id": "spotunet-anyscale8-peaked-sharpened-v1",
+      "label": "SpotUNet anyscale8 peaked+sharpened (scale-robust, bundled)",
+      "version": 1,
+      "notes": "spotunet_anyscale8_peaked_sharpened from yoloDiffraction: the anyscale8_peaked scale-robust base (base8, levels=3; trained across disk sizes, so it tolerates residual scale error after the canonical rescale) with the sharpened offset head grafted on. Best current all-rounder on real 4D-STEM (ZrNb/CuNb/SPED-Ag truth benchmark, 2026-07-16); parameter-free with auto-calibration.",
+      "arch": {"base": 8, "in_ch": 1, "levels": 3},
+      "sha256": "8b2d71d8a76b388231b8ccd7012393b980a64f9c69ceaf56b3936818c9818ef0",
+      "source": {"type": "bundled", "file": "spotunet_anyscale8_peaked_sharpened.pt"}
+    },
     {
       "id": "spotunet-production-v2",
       "label": "SpotUNet production (bundled)",
       "version": 2,
-      "notes": "SRO-augmented edge-decoupled detector; best on CuNb/ZrNb/SPED-Ag, parameter-free with auto-calibration. Beats WNCC on crystalline 4D-STEM.",
+      "notes": "SRO-augmented edge-decoupled detector; best on CuNb/ZrNb/SPED-Ag, parameter-free with auto-calibration. Beats WNCC on crystalline 4D-STEM. Slightly higher crystal recall than anyscale8 on canonical-size disks; weaker off its trained scale.",
       "arch": {"base": 16, "in_ch": 1, "levels": 2},
       "source": {"type": "bundled", "file": "spotunet_production.pt"}
     },

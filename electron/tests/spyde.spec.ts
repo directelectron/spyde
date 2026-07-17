@@ -822,7 +822,8 @@ test('sidebar shows colormap + draggable histogram once a signal plot is active'
 test('changing colormap sends set_colormap for the active window', async () => {
   await trackActions()
   await openFourD()
-  await page.getByTestId('colormap-select').selectOption('viridis')
+  await page.getByTestId('colormap-select').click()
+  await page.getByTestId('colormap-select-opt-viridis').click()
   expect(await sentActions()).toContainEqual({
     action: 'set_colormap', payload: { name: 'viridis' }, windowId: 1,
   })

@@ -56,9 +56,12 @@ test('signal_type_info populates the dropdown with the current type', async () =
   })
   const sel = page.getByTestId('signal-type-select')
   await expect(sel).toBeVisible()
-  expect(await sel.inputValue()).toBe('electron_diffraction')
-  // The generic option renders with a friendly label.
-  await expect(sel.locator('option[value=""]')).toHaveText('Generic (none)')
+  // Themed Dropdown: the trigger button carries the value as data-value.
+  expect(await sel.getAttribute('data-value')).toBe('electron_diffraction')
+  // The generic option renders with a friendly label (open the menu to see it).
+  await sel.click()
+  await expect(page.getByTestId('signal-type-select-opt-')).toHaveText('Generic (none)')
+  await page.keyboard.press('Escape')
 })
 
 test('changing the type dispatches set_signal_type for the active window', async () => {
@@ -68,7 +71,8 @@ test('changing the type dispatches set_signal_type for the active window', async
     type: 'signal_type_info', window_ids: [1],
     current: '', options: ['', 'electron_diffraction', 'EELS'],
   })
-  await page.getByTestId('signal-type-select').selectOption('electron_diffraction')
+  await page.getByTestId('signal-type-select').click()
+  await page.getByTestId('signal-type-select-opt-electron_diffraction').click()
   expect(await sentActions()).toContainEqual({
     action: 'set_signal_type',
     payload: { signal_type: 'electron_diffraction' },

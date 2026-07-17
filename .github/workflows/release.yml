@@ -188,6 +188,9 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
         with:
+          # Pinned: resolving "latest" hits the GitHub releases API, which
+          # took out every CI leg during the 2026-07 API outage.
+          version: "0.10.11"
           enable-cache: true
 
       # Fail fast on a drifted lock: the installer bundles pyproject.toml +

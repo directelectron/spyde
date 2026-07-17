@@ -6,6 +6,11 @@
     <title>SpyDE</title>
     <style>
       * { box-sizing: border-box; margin: 0; padding: 0; }
+      /* Dark color-scheme so any remaining NATIVE control popup (a <select>'s
+         option list, date pickers, …) renders in Chromium's dark style instead
+         of an OS-white list. The marquee dropdowns (wizards, Plot Control) are
+         the custom themed Dropdown component; this covers the long tail. */
+      :root { color-scheme: dark; }
       html, body, #root {
         width: 100%; height: 100%;
         overflow: hidden;

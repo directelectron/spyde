@@ -352,20 +352,29 @@ class FigureSpec:
     ``PanelSpec.annotations``): each dict is in the EXACT anyplotlib
     figure-marker schema — positions/sizes in FIGURE FRACTIONS (0..1, top-left
     origin), NO calibration/data-coord conversion — so they ride straight into
-    ``Figure.set_figure_markers``. Absent on older files → ``[]``."""
+    ``Figure.set_figure_markers``. Absent on older files → ``[]``.
+
+    ``vectors_mode`` records the user's drop-time choice for a source tree that
+    carries diffraction vectors: ``"viewer"`` embeds the interactive explorer in
+    HTML exports, ``"image"`` forces the static snapshot. ``""`` (older files /
+    non-vectors sources) keeps the viewer-when-available default."""
     layout: dict = field(default_factory=lambda: {"kind": "single"})
     panels: list = field(default_factory=list)          # [PanelSpec]
     nav_context: dict | None = None            # {"indices": [iy, ix]}
     annotations: list = field(default_factory=list)     # [dict] figure-fraction markers
+    vectors_mode: str = ""                     # "" | "viewer" | "image"
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "layout": dict(self.layout),
             "panels": [p.to_dict() for p in self.panels],
             "nav_context": (dict(self.nav_context)
                             if self.nav_context is not None else None),
             "annotations": [dict(a) for a in self.annotations],
         }
+        if self.vectors_mode:
+            d["vectors_mode"] = self.vectors_mode
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "FigureSpec":
@@ -376,6 +385,7 @@ class FigureSpec:
             nav_context=(dict(d["nav_context"])
                          if d.get("nav_context") is not None else None),
             annotations=[dict(a) for a in (d.get("annotations") or [])],
+            vectors_mode=str(d.get("vectors_mode", "") or ""),
         )
 
     def to_yaml(self) -> str:

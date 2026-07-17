@@ -8,6 +8,12 @@
  * reference pixel the overlay draws displacement arrows (reference spot → matched
  * peak within the match radius).
  *
+ * Deliberately minimal: contrast (min/max) and colormap belong to the PLOT
+ * WIDGET's histogram dock (the strain window emits the standard histogram and
+ * responds to its handles), and the fit-robustness knobs (min matched spots,
+ * reference pooling radius) live on good defaults in the backend, adjustable
+ * via the `strain_set_fit` action for scripted use — not wizard clutter.
+ *
  *   Method        — Region (relative, the navigator pixel) or CIF (absolute,
  *                   from a crystal's ideal spacings → prompts for the .cif).
  *   Match radius  — how far (px) a frame peak can be from a reference spot to
@@ -16,7 +22,7 @@
  *                   (`strain_commit` → the standard Commit affordance).
  */
 import React from 'react'
-import { WizardShell, Field, NumInput, Select, S } from './WizardShell'
+import { WizardShell, Field, Select, Slider, S } from './WizardShell'
 import { useWizardLifecycle, CommitButton } from './wizardHooks'
 
 const METHODS = [
@@ -70,13 +76,15 @@ export function StrainWizard({ caretPos, windowId, sendAction, onClose }: Props)
       <div style={S.page}>
         <div style={S.hint}>
           Green circles = reference spots used in the fit. Double-click a spot to drop/restore it.
-          Move the navigator to set the reference pixel; off it, arrows show each spot's displacement.
+          Move the navigator to set the reference pixel. Contrast: drag the histogram handles
+          in the plot sidebar.
         </div>
         <Field label="Method">
           <Select testid="strain-method" value={method} options={METHODS} onChange={onMethod} />
         </Field>
         <Field label="Match radius (px)">
-          <NumInput testid="strain-match-radius" value={matchRadius} onChange={onRadius} step="1" />
+          <Slider testid="strain-match-radius" value={matchRadius} min={1} max={15} step={1}
+            onChange={onRadius} fmt={(v: number) => `${v} px`} />
         </Field>
         <CommitButton wizardKey="strain" windowId={windowId} sendAction={sendAction}
           onCommit={() => setStatus('Committed — new strain signal tree created.')} />

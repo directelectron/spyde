@@ -22,13 +22,23 @@ from __future__ import annotations
 
 import numpy as np
 
-# Canonical disk size the model is trained at. Set at the LARGER end of real disk
-# sizes (ZrNb ~18-22px) because DOWNSAMPLING a large disk to a small canonical size
-# destroys subpixel information (~2x worse Friedel residual on ZrNb). Policy is
-# upsample-only: small disks are upsampled to ~canonical; large disks are left at
-# native size (never shrunk).
-CANONICAL_DIAMETER = 20.0
-DOWNSAMPLE = False            # never downsample (it throws away subpixel info)
+# Canonical disk size the detector prefers, synced 2026-07-16 from yoloDiffraction
+# scale_norm.py: with autocorrelation-measured diameters (CuNb/ZrNb ~16-18px,
+# SPED-Ag ~8px) canonical=9 + DOWNSAMPLE reproduces the KNOWN-GOOD per-dataset
+# scales (CuNb 0.56, ZrNb 0.50, SPED-Ag ~1.1). The previous canonical=20 +
+# upsample-only made every scale wrong (CuNb ran UPSAMPLED 1.25x instead of
+# downsampled 0.56x -> the model saw disks >2x its trained size -> noise-peak
+# flood; wrong scale is the #1 FP-flood cause). Big-disk subpixel is protected by
+# SCALE_CLIP, not by refusing to downsample.
+CANONICAL_DIAMETER = 9.0
+DOWNSAMPLE = True             # allow downscale (large disks shrink toward canonical)
+
+# Bound the resample factor: a pathological diameter estimate (beam stop, empty or
+# saturated frame) must not trigger an extreme resample. Same clip the
+# yoloDiffraction truth harness uses; also keeps very large disks from being
+# crushed to 9px (they run at the 0.3 floor instead, where the size-scaled
+# NMS/background parameters in infer.py take over).
+SCALE_CLIP = (0.3, 3.0)
 
 
 def normalize_input(frame: np.ndarray, local: bool = True,
@@ -81,23 +91,21 @@ def estimate_disk_diameter(frame: np.ndarray, hp_sigma: float = 20.0) -> float:
 
 
 def scale_factor(frame: np.ndarray, target: float = CANONICAL_DIAMETER) -> float:
-    """Upsample-only factor so this frame's disks become >= ~``target`` px.
-
-    factor >= 1 (never shrinks): if disks are already >= target, factor = 1 (leave
-    big disks at native size; downsampling them destroys subpixel info).
-    """
+    """Resample factor so this frame's disks land at ~``target`` px (both
+    directions, bounded by SCALE_CLIP)."""
     f = target / estimate_disk_diameter(frame)
-    return float(max(f, 1.0)) if not DOWNSAMPLE else float(f)
+    if not DOWNSAMPLE:
+        f = max(f, 1.0)
+    return float(np.clip(f, *SCALE_CLIP))
 
 
 def scale_to_canonical(frame: np.ndarray, diameter: float | None = None,
                        target: float = CANONICAL_DIAMETER):
-    """Resample ``frame`` so its disks are >= ~``target`` px. Returns (scaled, factor).
-
-    Upsample-only (never downsample — shrinking large disks ~doubles subpixel
-    error). A predicted position p in the scaled frame maps back as p / factor.
-    ``diameter`` may be passed to reuse one estimate across a stack.
-    """
+    """Resample ``frame`` so its disks land at ~``target`` px. Returns
+    (scaled, factor), bounded by SCALE_CLIP (see the constants above for why the
+    old upsample-only policy was wrong). A predicted position p in the scaled
+    frame maps back as p / factor. ``diameter`` may be passed to reuse one
+    estimate across a stack."""
     from scipy.ndimage import zoom
 
     if diameter is None:
@@ -105,6 +113,7 @@ def scale_to_canonical(frame: np.ndarray, diameter: float | None = None,
     factor = target / diameter
     if not DOWNSAMPLE:
         factor = max(factor, 1.0)            # never shrink
+    factor = float(np.clip(factor, *SCALE_CLIP))
     if abs(factor - 1.0) < 0.05:
         return frame.astype(np.float32), 1.0
     scaled = zoom(frame.astype(np.float32), factor, order=1)

@@ -80,6 +80,32 @@ def _prewarm_io() -> None:
     threading.Thread(target=_warm, daemon=True, name="io-prewarm").start()
 
 
+def _compute_worker_plan(cpu_count: int, fraction: float | None = None) -> tuple[int, int]:
+    """Cluster size (n_workers, threads_per_worker) from the machine's logical
+    cores.
+
+    The compute budget is ``fraction`` of the logical cores — default **0.75**,
+    deliberately NOT all of them (user feedback 2026-07-16: a batch saturating
+    100% of cores stuttered the frontend even with the workers at below-normal
+    priority; leaving ~a quarter of the machine for the Electron UI + the
+    backend event loop + the painter/dispatcher threads keeps it fluid).
+    Override with SPYDE_COMPUTE_FRACTION (clamped to 0.1–1.0) for throughput
+    A/B runs — the priority throttle (_lower_worker_priority) has its own
+    SPYDE_WORKER_PRIORITY opt-out.
+    """
+    if fraction is None:
+        try:
+            fraction = float(os.environ.get("SPYDE_COMPUTE_FRACTION", "0.75"))
+        except ValueError:
+            fraction = 0.75
+    fraction = min(1.0, max(0.1, fraction))
+    budget = max(1, int(cpu_count * fraction))
+    if cpu_count < 4:
+        return 1, 1
+    threads = 2 if cpu_count <= 16 else 4
+    return max(1, budget // threads), threads
+
+
 async def _main() -> None:
     from spyde.backend.ipc import read_messages, emit, emit_status, redirect_stray_stdout
     from spyde.backend.session import Session
@@ -127,15 +153,12 @@ async def _main() -> None:
         logging.getLogger().addHandler(_h)
         logging.getLogger().setLevel(getattr(logging, _init_level.upper(), logging.INFO))
 
-    cpu_count = os.cpu_count() or 4
-    if cpu_count < 4:
-        workers, threads = 1, 1
-    elif cpu_count <= 16:
-        workers = max(1, cpu_count // 2 - 1)
-        threads = 2
-    else:
-        workers = max(1, cpu_count // 4 - 1)
-        threads = 4
+    # Persisted in-app compute settings (max RAM / CPU use / GPU feeders — the
+    # DaskMonitor popover) land in the environment BEFORE the worker plan and
+    # cluster build; an explicitly-set env var still wins.
+    from spyde.backend.compute_config import apply_persisted_compute_env
+    apply_persisted_compute_env()
+    workers, threads = _compute_worker_plan(os.cpu_count() or 4)
 
     session = Session(n_workers=workers, threads_per_worker=threads)
 

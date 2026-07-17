@@ -58,6 +58,18 @@ class TestStrainFit:
     def test_too_few_matches_returns_none(self):
         assert fit_pattern_strain(np.array([[5.0, 5.0]]), G_REF, tol=0.1) is None
 
+    def test_asymmetric_detection_still_fits(self):
+        # Missing Friedel partners (e.g. faint precipitate patterns) bias the
+        # set's centroid by up to ~|g|/3 > tol — the old centroid-only alignment
+        # then matched NOTHING and a frame with six good spots read as a failed
+        # fit. The raw-alignment candidate must recover it.
+        T = np.array([[1.01, 0.0], [0.0, 0.995]])
+        asym = np.delete(_strained(T), [0, 4], axis=0)   # drop two same-side spots
+        r = fit_pattern_strain(asym, G_REF, tol=0.25)
+        assert r is not None, "asymmetric 6-spot pattern must still fit"
+        exx, eyy, exy, omega, cov = r
+        assert abs(exx - 0.01) < 1e-4 and abs(eyy + 0.005) < 1e-4
+
 
 class _MockVecs:
     """Duck-typed SpyDEDiffractionVectors: nav_shape + kxy_at(iy, ix)."""

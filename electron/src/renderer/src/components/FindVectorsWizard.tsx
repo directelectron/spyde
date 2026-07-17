@@ -8,9 +8,12 @@
  * closing the caret tears the preview down (`fv_close`).
  *
  * Three detection methods:
- *   • Neural — the SpotUNet disk detector (parameter-free disk size; threshold
- *     is the model's confidence, ~0.3; Model dropdown selects a registry model,
- *     populated by the `fv_models` payload). The default.
+ *   • Neural — the SpotUNet disk detector. Deliberately MINIMAL controls
+ *     (user decision 2026-07-16): Spot size (auto-seeded; drives the model's
+ *     canonical rescale + NMS + marker radius) and Threshold (model confidence,
+ *     ~0.3). Nav blur is never applied for neural; the high-pass (bg σ) is
+ *     auto-calibrated invisibly (`fv_calibration`). Model dropdown + ↻ refresh
+ *     from the registry (`fv_models`). The default method.
  *   • NXCORR — window-normalised cross-correlation against a flat disk
  *     (Disk Radius slider; threshold is a [-1,1] correlation score).
  *   • DoG — Difference-of-Gaussians band-pass, best for small (2-3 px) spots
@@ -41,49 +44,67 @@ const THR_DEFAULT: Record<Method, number> = { neural: 0.3, nxcorr: 0.5, dog: 10 
 // the last-used parameters.
 interface FvSaved {
   method: Method; modelId: string; sigma: number; radius: number
-  sigma1: number; sigma2: number
+  sigma1: number; sigma2: number; bgSigma: number
   threshold: number; minDist: number; subpixel: boolean; beamstop: boolean
-  beamstopDilate: number; showTransform: boolean
+  beamstopDilate: number; showTransform: boolean; persistence: boolean
 }
 const _fvStore = new Map<number, FvSaved>()
+
+// Neural local-norm high-pass scale (px). 12 matches the backend default; the
+// backend's one-shot auto-calibration (`fv_calibration`) overwrites it unless
+// the user already moved the slider.
+const BG_SIGMA_DEFAULT = 12
 
 export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: Props) {
   const saved = _fvStore.get(windowId)
   const [method, setMethod] = React.useState<Method>(saved?.method ?? 'neural')
   const [modelId, setModelId] = React.useState(saved?.modelId ?? '')
   const [models, setModels] = React.useState<readonly { value: string; label: string }[]>([])
-  const [sigma, setSigma] = React.useState(saved?.sigma ?? 1.0)
+  const [sigma, setSigma] = React.useState(saved?.sigma ?? 0)
   const [radius, setRadius] = React.useState(saved?.radius ?? 5)
   const [sigma1, setSigma1] = React.useState(saved?.sigma1 ?? 0.8)
   const [sigma2, setSigma2] = React.useState(saved?.sigma2 ?? 2.0)
+  const [bgSigma, setBgSigma] = React.useState(saved?.bgSigma ?? BG_SIGMA_DEFAULT)
   const [threshold, setThreshold] = React.useState(saved?.threshold ?? 0.3)
   const [minDist, setMinDist] = React.useState(saved?.minDist ?? 5)
   const [subpixel, setSubpixel] = React.useState(saved?.subpixel ?? true)
   const [beamstop, setBeamstop] = React.useState(saved?.beamstop ?? false)
   const [beamstopDilate, setBeamstopDilate] = React.useState(saved?.beamstopDilate ?? 5)
   const [showTransform, setShowTransform] = React.useState(saved?.showTransform ?? false)
+  const [persistence, setPersistence] = React.useState(saved?.persistence ?? false)
   const [status, setStatus] = React.useState('Tune the parameters — peaks preview under the crosshair.')
 
   React.useEffect(() => {
     _fvStore.set(windowId, {
-      method, modelId, sigma, radius, sigma1, sigma2, threshold, minDist, subpixel,
-      beamstop, beamstopDilate, showTransform,
+      method, modelId, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist, subpixel,
+      beamstop, beamstopDilate, showTransform, persistence,
     })
-  }, [windowId, method, modelId, sigma, radius, sigma1, sigma2, threshold, minDist,
-      subpixel, beamstop, beamstopDilate, showTransform])
+  }, [windowId, method, modelId, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist,
+      subpixel, beamstop, beamstopDilate, showTransform, persistence])
 
   // Live refs so the debounced tune always sends the latest of EVERY control.
-  const vals = React.useRef({ method, modelId, sigma, radius, sigma1, sigma2, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform })
-  vals.current = { method, modelId, sigma, radius, sigma1, sigma2, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform }
-  const params = () => ({
-    method: vals.current.method, model_id: vals.current.modelId,
-    sigma: vals.current.sigma, kernel_radius: vals.current.radius,
-    dog_sigma1: vals.current.sigma1, dog_sigma2: vals.current.sigma2,
-    threshold: vals.current.threshold, min_distance: vals.current.minDist,
-    subpixel: vals.current.subpixel, beamstop_auto: vals.current.beamstop,
-    beamstop_dilate: vals.current.beamstopDilate,
-    show_transform: vals.current.showTransform,
-  })
+  const vals = React.useRef({ method, modelId, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform, persistence })
+  vals.current = { method, modelId, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform, persistence }
+  const params = () => {
+    const v = vals.current
+    const neural = v.method === 'neural'
+    return {
+      method: v.method, model_id: v.modelId,
+      // Neural never applies nav blur (the backend forces it too); the Spot
+      // size slider is the single scale knob — it drives the model's rescale
+      // (spot_radius) and the NMS min-distance (~radius/2).
+      sigma: neural ? 0 : v.sigma, kernel_radius: v.radius,
+      dog_sigma1: v.sigma1, dog_sigma2: v.sigma2,
+      bg_sigma: v.bgSigma,
+      spot_radius: neural ? v.radius : 0,
+      threshold: v.threshold,
+      min_distance: neural ? Math.max(1, Math.round(v.radius / 2)) : v.minDist,
+      subpixel: v.subpixel, beamstop_auto: v.beamstop,
+      beamstop_dilate: v.beamstopDilate,
+      show_transform: v.showTransform,
+      persistence: v.persistence,
+    }
+  }
 
   // Start the live preview when the caret opens; tear it down when it closes
   // (StrictMode-safe: exactly one fv_open reaches the backend).
@@ -111,6 +132,38 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
     setModels(list.map((m) => ({ value: m.id, label: m.label ?? m.id })))
     // '' = registry default; surface it as the concrete id once known.
     if (!vals.current.modelId && typeof d.default === 'string') setModelId(d.default)
+    if (d.refreshed) setStatus(`Model list refreshed — ${list.length} available.`)
+  })
+
+  // "Check for new models": pull the latest registry from Hugging Face; the
+  // backend re-emits fv_models (refreshed: true) with the merged list.
+  const refreshModels = () => {
+    setStatus('Checking for new models…')
+    sendRef.current('fv_refresh_models', {}, windowId)
+  }
+
+  // Backend one-shot auto-calibration (neural). The high-pass (bg σ) has NO
+  // visible control — it is always adopted (fully automatic); the threshold is
+  // adopted only if the user hasn't moved it off the neural default.
+  useWizardEvent('spyde:fv_calibration', windowId, (d) => {
+    if (vals.current.method !== 'neural') return
+    let adopted = false
+    if (typeof d.bg_sigma === 'number' && d.bg_sigma !== vals.current.bgSigma) {
+      setBgSigma(d.bg_sigma)
+      vals.current = { ...vals.current, bgSigma: d.bg_sigma }
+      adopted = true
+    }
+    if (typeof d.thresh === 'number' && vals.current.threshold === THR_DEFAULT.neural
+        && d.thresh !== THR_DEFAULT.neural) {
+      setThreshold(d.thresh)
+      vals.current = { ...vals.current, threshold: d.thresh }
+      adopted = true
+    }
+    if (adopted) {
+      const conf = typeof d.confidence === 'number' ? ` (conf ${d.confidence.toFixed(2)})` : ''
+      setStatus(`Auto-calibrated background removal${conf}.`)
+      tune()
+    }
   })
 
   // Adopt the backend's auto-estimated disk radius (Qt parity) the first time it
@@ -121,7 +174,7 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
     autoApplied.current = true
     if (typeof d.kernel_radius === 'number') setRadius(d.kernel_radius)
     if (typeof d.min_distance === 'number') setMinDist(d.min_distance)
-    setStatus(`Disk radius auto-set to ${d.kernel_radius} px from the pattern.`)
+    setStatus(`Spot size auto-set to ${d.kernel_radius} px from the pattern.`)
     tune()
   })
 
@@ -155,15 +208,31 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
       </Field>
       {isNeural && models.length > 0 && (
         <Field label="Model">
-          <Select testid="fv-model" value={modelId} options={models}
-            onChange={live(setModelId)} />
+          <div style={modelRowStyle}>
+            <Select testid="fv-model" value={modelId} options={models}
+              onChange={live(setModelId)} />
+            <button data-testid="fv-refresh-models" style={refreshBtnStyle}
+              title="Check Hugging Face for new models" onClick={refreshModels}>↻</button>
+          </div>
         </Field>
       )}
       <div style={gridStyle}>
-        <Cell label="Nav Blur σ">
-          <Slider testid="fv-sigma" value={sigma} min={0} max={5} step={0.1}
-            onChange={live(setSigma)} fmt={(n) => n.toFixed(1)} />
-        </Cell>
+        {!isNeural && (
+          // Nav blur is a NXCORR/DoG option only (defaults off) — the neural
+          // net is trained on single frames and never gets a blurred input.
+          <Cell label="Nav Blur σ">
+            <Slider testid="fv-sigma" value={sigma} min={0} max={5} step={0.1}
+              onChange={live(setSigma)} fmt={(n) => n.toFixed(1)} />
+          </Cell>
+        )}
+        {isNeural && (
+          // THE neural scale knob: auto-seeded from the pattern; drives the
+          // model's canonical rescale, the NMS spacing and the marker radius.
+          <Cell label="Spot size (px)">
+            <Slider testid="fv-spot-size" value={radius} min={2} max={30} step={1}
+              onChange={live(setRadius)} />
+          </Cell>
+        )}
         {!isDog && !isNeural && (
           <Cell label="Disk Radius">
             <Slider testid="fv-radius" value={radius} min={1} max={30} step={1} onChange={live(setRadius)} />
@@ -186,9 +255,11 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
             min={0} max={isDog ? 30 : 1} step={isDog ? 0.5 : 0.05}
             onChange={live(setThreshold)} fmt={(n) => (isDog ? n.toFixed(1) : n.toFixed(2))} />
         </Cell>
-        <Cell label="Min Distance">
-          <Slider testid="fv-mindist" value={minDist} min={1} max={30} step={1} onChange={live(setMinDist)} />
-        </Cell>
+        {!isNeural && (
+          <Cell label="Min Distance">
+            <Slider testid="fv-mindist" value={minDist} min={1} max={30} step={1} onChange={live(setMinDist)} />
+          </Cell>
+        )}
         {beamstop && (
           <Cell label="Beam-stop dilate">
             <Slider testid="fv-beamstop-dilate" value={beamstopDilate} min={0} max={20} step={1}
@@ -201,8 +272,17 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
           label="Mask beam stop" />
         <Check testid="fv-show-transform" checked={showTransform} onChange={live(setShowTransform)}
           label={isDog ? 'Show DoG' : isNeural ? 'Show heatmap' : 'Show corr.'} />
-        <Check testid="fv-subpixel" checked={subpixel} onChange={live(setSubpixel)}
-          label="Subpixel" />
+        {!isNeural && (
+          // The net always emits subpixel offsets — the toggle is a no-op there.
+          <Check testid="fv-subpixel" checked={subpixel} onChange={live(setSubpixel)}
+            label="Subpixel" />
+        )}
+        {isNeural && (
+          // Batch-only stage-2 refine (scan-neighbour persistence + Friedel);
+          // the live preview has no neighbours so it only affects Compute.
+          <Check testid="fv-persistence" checked={persistence} onChange={live(setPersistence)}
+            label="Neighbor refine" />
+        )}
       </div>
       <button data-testid="fv-compute" style={S.primary} onClick={compute}>Compute</button>
     </WizardShell>
@@ -211,6 +291,14 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
 
 const gridStyle: React.CSSProperties = {
   display: 'grid', gridTemplateColumns: '1fr 1fr', columnGap: 10, rowGap: 6,
+}
+const modelRowStyle: React.CSSProperties = {
+  display: 'flex', alignItems: 'center', gap: 4, minWidth: 0,
+}
+const refreshBtnStyle: React.CSSProperties = {
+  flex: '0 0 auto', width: 22, height: 22, padding: 0, lineHeight: '20px',
+  background: 'transparent', color: 'inherit', border: '1px solid #444',
+  borderRadius: 4, cursor: 'pointer',
 }
 const cellStyle: React.CSSProperties = {
   display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0,

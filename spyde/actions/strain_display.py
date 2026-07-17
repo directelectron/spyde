@@ -7,6 +7,13 @@ A component toggle swaps the shown map in place. (The old white principal-strain
 ellipse glyphs were removed — they cluttered the map and bought nothing the
 component colour didn't already show.)
 
+Contrast is the PLOT WIDGET's job, not a wizard knob: the strain window emits
+the standard sidebar histogram (``emit_strain_histogram`` — same message the
+Plot class sends) and the dock's drag-handles / colormap picker reach the
+StrainController via the session's ``set_clim`` / ``set_colormap`` controller
+fallback. Failed-fit pixels are NaN in the DATA (excluded from the histogram +
+auto-levels) and render as the neutral zero-strain colour.
+
 No Qt. Host-agnostic (Electron + Jupyter).
 """
 from __future__ import annotations
@@ -27,33 +34,61 @@ def _component_map(field: StrainField, component: str) -> np.ndarray:
     }[component]
 
 
-def _auto_vmax(arr: np.ndarray) -> float:
-    """Symmetric colour limit from the robust (98th-pct) magnitude."""
+def _auto_clim(arr: np.ndarray) -> tuple[float, float]:
+    """Symmetric colour limits from the robust (98th-pct) magnitude of the FINITE
+    values (failed pixels are NaN and excluded, so they can't stretch the scale)."""
     finite = arr[np.isfinite(arr)]
     if finite.size == 0:
-        return 1.0
+        return (-1.0, 1.0)
     v = float(np.percentile(np.abs(finite), 98))
-    return v if v > 0 else 1.0
+    v = v if v > 0 else 1.0
+    return (-v, v)
+
+
+def emit_strain_histogram(window_id, field: StrainField, component: str,
+                          clim: tuple[float, float]) -> None:
+    """Send the sidebar histogram for the strain window — the same message shape
+    ``Plot._emit_histogram`` uses, so the dock's contrast handles just work."""
+    if window_id is None:
+        return
+    data = np.asarray(_component_map(field, component), float)
+    finite = data[np.isfinite(data)]
+    if finite.size == 0:
+        return
+    try:
+        counts, edges = np.histogram(finite, bins=64)
+        from spyde.backend.ipc import emit
+        emit({
+            "type": "histogram",
+            "window_id": int(window_id),
+            "counts": counts.astype(int).tolist(),
+            "edges": [float(e) for e in edges],
+            "vmin": float(clim[0]),
+            "vmax": float(clim[1]),
+            "threshold": None,
+        })
+    except Exception as e:
+        logger.debug("strain histogram emit failed: %s", e)
 
 
 def build_strain_figure(field: StrainField, *, component: str = "exx",
-                        ref_yx=None, vmax: float | None = None,
+                        ref_yx=None, clim: tuple[float, float] | None = None,
                         cmap: str = "coolwarm"):
     """Build the strain view → ``(fig, fig_id, html, plot2d)``.
     ``plot2d`` is returned so a controller can live-update the component map /
-    reference crosshair."""
+    reference crosshair / contrast."""
     import anyplotlib as apl
     import anyplotlib._electron as _electron
     from spyde.drawing.plots.plot import finalize_figure_html
 
-    cmap_data = _component_map(field, component)
-    v = float(vmax) if vmax is not None else _auto_vmax(cmap_data)
+    data = _component_map(field, component)
+    lo, hi = clim if clim is not None else _auto_clim(data)
 
     fig, axes = apl.subplots(1, 1)
     ax = axes[0][0] if isinstance(axes, list) else axes
-    p = ax.imshow(np.nan_to_num(cmap_data, nan=0.0).astype(np.float32), cmap=cmap)
+    p = ax.imshow(np.nan_to_num(data, nan=0.0).astype(np.float32), cmap=cmap)
     try:
-        p.set_clim(-v, v)                       # diverging, centred on zero strain
+        p.set_clim(lo, hi)                      # diverging, centred on zero strain
     except Exception as e:
         logger.debug("set_clim on strain map failed: %s", e)
 
@@ -69,13 +104,13 @@ def build_strain_figure(field: StrainField, *, component: str = "exx",
 
 
 def update_strain_view(p, field: StrainField, component: str, *,
-                       vmax: float | None = None) -> None:
-    """Live-update an existing strain plot in place: swap the component map with
-    a fresh symmetric colour limit."""
+                       clim: tuple[float, float] | None = None) -> None:
+    """Live-update an existing strain plot in place: swap the component map.
+    ``clim`` = the user's dock-set contrast (None → fresh symmetric auto)."""
     data = _component_map(field, component)
-    v = float(vmax) if vmax is not None else _auto_vmax(data)
+    lo, hi = clim if clim is not None else _auto_clim(data)
     try:
         p.set_data(np.nan_to_num(data, nan=0.0).astype(np.float32))
-        p.set_clim(-v, v)
+        p.set_clim(lo, hi)
     except Exception as e:
         logger.debug("updating strain map data failed: %s", e)
