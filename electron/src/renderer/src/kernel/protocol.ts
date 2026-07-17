@@ -344,6 +344,14 @@ export interface RepfigLayer {
   clim?: [number, number] | null
   alpha: number
   visible: boolean
+  /** Clear→colour intensity-ramp hex (overlay tint); absent/null = colormap
+   *  display (`cmap` stays stored as the revert value while tinted). */
+  tint?: string | null
+  /** Line-panel curve styling (kind === "line" only): CSS stroke colour,
+   *  stroke width in px, and the legend label. Absent on image layers. */
+  color?: string | null
+  linewidth?: number | null
+  label?: string | null
 }
 
 /** One panel of a report figure's recipe (from `PanelSpec.to_dict()`). The
@@ -352,8 +360,21 @@ export interface RepfigLayer {
 export interface RepfigPanel {
   id: string
   grid_pos: [number, number]
+  /** "image" | "line" | "scene3d" — a scene3d panel is a 3-D scatter scene
+   *  (IPF sphere); its layers paint nothing (the point cloud lives backend-side)
+   *  and the slim bar hides annotation/layer controls for it. */
   kind: string
   layers: RepfigLayer[]
+  /** Per-panel text sizes ({title,x_label,y_label,ticks,legend,colorbar} → px),
+   *  emitted only when set — the double-click size popover edits these. */
+  text_sizes?: Record<string, number> | null
+  /** scene3d recompute params ({kind:'ipf3d', direction, point_size, bounds,
+   *  camera?}) — small params only, never pixels. Absent on image/line panels. */
+  scene?: Record<string, unknown> | null
+  /** EPHEMERAL (stamped at emit time only): navigation dimensionality of the
+   *  panel's layer-0 source signal — gates the fresh-slice callout buttons.
+   *  Never part of the persisted spec/YAML. */
+  nav_dims?: number
   axes?: {
     units?: string
     x_axis?: number[]
@@ -394,6 +415,10 @@ export interface RepfigSpec {
   panels: RepfigPanel[]
   nav_context?: { indices?: number[] } | null
   annotations?: RepfigFigAnnotation[]
+  /** Drop-time vectors embed choice for a vectors-carrying source: 'viewer' (the
+   *  default when the tree has vectors — the sidebar cell hosts the live 2-panel
+   *  explorer) | 'image' (a static snapshot). Absent for a non-vectors cell. */
+  vectors_mode?: string
 }
 
 /** One cell of the report document (markdown text or an embedded figure). */
@@ -415,6 +440,10 @@ export interface ReportCell {
   /** figure cells: the pixel-free FigureSpec recipe (panels/layers/annotations)
    *  driving the edit toolbar. Absent while a cell is a placeholder. */
   figure?: RepfigSpec
+  /** figure cells in EDIT MODE only: live edit-widget id → its spec annotation
+   *  (panel_id + index), so a widget click resolves to the annotation whose
+   *  style popover should open. Ephemeral — never persisted. */
+  ann_widgets?: Record<string, { panel_id: string; index: number }>
 }
 
 /** The authoritative report document (mirrored by the renderer for editing). */
