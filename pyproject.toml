@@ -36,7 +36,7 @@ dependencies = [
     "imageio-ffmpeg",
     "imagecodecs",
     "psygnal>=0.10.0",
-    "anyplotlib>=0.3.0",
+    "anyplotlib>=0.4.0",
     "pyyaml",
     # GPU-accelerated batched compute (vector orientation mapping, etc.).
     "torch",
@@ -93,8 +93,10 @@ torch = [
     { index = "pytorch-cu124", marker = "sys_platform == 'win32'" },
 ]
 # anyplotlib is co-developed in the sibling checkout but resolved from PyPI
-# (releases track this repo's needs). While an unreleased anyplotlib feature is
-# in flight, pin a git sha in [project.dependencies] (the hyperspy/rosettasciio
+# (releases track this repo's needs). The report builder needs the 0.4.0 widget/
+# layer/inset APIs (shape-widget linewidth, add_layer tint, inset_geometry_change
+# dispatch), so the floor is >=0.4.0. While an unreleased anyplotlib feature is in
+# flight, pin a git sha in [project.dependencies] (the hyperspy/rosettasciio
 # pattern). When actively editing anyplotlib locally, temporarily re-add the
 # editable path override below (do NOT commit it — the path doesn't exist on CI
 # runners and breaks `uv sync --frozen`):
