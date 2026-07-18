@@ -277,23 +277,11 @@ test('1) overlay compose auto-tints; slim bar tint dots round-trip through repor
     return c?.figure?.panels?.[0]?.layers?.[1]?.tint ?? null
   }, { timeout: 10_000, message: 'red tint dot did not persist' }).toBe('#f38ba8')
 
-  // The rebuilt figure paints a RED ramp over the gray base — but ONLY on an
-  // anyplotlib that renders add_layer(tint=), which is newer than the pinned
-  // release (>=0.3.0 → PyPI 0.3.0 has no tint=). Probe it; where the live tint
-  // can't render, the spec/UI tint-dot round-trip asserted above is this test's
-  // deliverable, so skip just the pixel leg — it lights up once anyplotlib ships
-  // tint. (Test 2's exported blender tints via its own JS and is unaffected.)
-  let redPixels = 0
-  const tintDeadline = Date.now() + 20_000
-  while (Date.now() < tintDeadline) {
-    redPixels = await redPixelsInCell(page)
-    if (redPixels > 200) break
-    await page.waitForTimeout(500)
-  }
-  console.log('[tint] red pixels after red dot =', redPixels)
-  test.skip(redPixels <= 200,
-    'anyplotlib build has no add_layer(tint=) (pinned release); live tint preview inert')
-  expect(redPixels).toBeGreaterThan(200)
+  // The rebuilt figure paints a RED ramp over the gray base.
+  await expect.poll(async () => redPixelsInCell(page), {
+    timeout: 20_000, message: 'cell iframe gained no red-ish pixels after tint',
+  }).toBeGreaterThan(200)
+  console.log('[tint] red pixels after red dot =', await redPixelsInCell(page))
   await page.waitForTimeout(800)
   await page.screenshot({ path: join(SHOTS, '03-red-tint-applied.png') })
   ctx.assertNoJsErrors()
