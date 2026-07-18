@@ -179,7 +179,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
 
       # ── uv (vendored into the installer as the Python sidecar bootstrapper) ──
       # bundle-python.mjs copies the `uv` on PATH into the payload when
