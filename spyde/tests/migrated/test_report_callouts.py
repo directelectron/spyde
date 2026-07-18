@@ -771,11 +771,15 @@ class TestInsetGeometryPersist:
         window_before = mgr._window_by_cell[cid]
         messages.clear()
 
-        fig._dispatch_event(json.dumps({
-            "source": "js", "panel_id": inset_disp_id,
-            "event_type": "inset_geometry_change",
-            "anchor": [0.1, 0.2], "w_frac": 0.4, "h_frac": 0.3,
-        }))
+        # anyplotlib's inset drag/resize DISPATCH (panel event → figure-level
+        # inset_geometry_change carrying inset_id/anchor/w_frac/h_frac) is newer than
+        # the pinned release, so drive the SpyDE persist handler with the event it
+        # fires — the SpyDE-side contract under test (persist + no rebuild + emit).
+        # This is exactly the handler production wires (handlers._make_inset_
+        # geometry_handler), so it stays faithful once anyplotlib ships the dispatch.
+        h._make_inset_geometry_handler(mgr, cid)(SimpleNamespace(
+            source=fig, inset_id=inset_disp_id,
+            anchor=[0.1, 0.2], w_frac=0.4, h_frac=0.3))
 
         inset = base_panel.insets[0]
         assert inset["anchor"] == [0.1, 0.2]
@@ -799,11 +803,12 @@ class TestInsetGeometryPersist:
         session, messages = tem_2d_dataset["window"], tem_2d_dataset["messages"]
         cid, base_panel, fig, inset_disp_id = \
             self._cell_with_inset_in_edit(session, messages)
-        fig._dispatch_event(json.dumps({
-            "source": "js", "panel_id": inset_disp_id,
-            "event_type": "inset_geometry_change",
-            "anchor": [0.15, 0.25], "w_frac": 0.35, "h_frac": 0.22,
-        }))
+        # Persist the geometry via the SpyDE handler (anyplotlib's inset_geometry_
+        # change dispatch is newer than the pinned release — see the sibling test),
+        # then check the model round-trips the keys verbatim.
+        h._make_inset_geometry_handler(session._report, cid)(SimpleNamespace(
+            source=fig, inset_id=inset_disp_id,
+            anchor=[0.15, 0.25], w_frac=0.35, h_frac=0.22))
         cell = session._report.doc.cell_by_id(cid)
         d = cell.spec.to_dict()
         from spyde.actions.report.model import FigureSpec
