@@ -16,6 +16,14 @@
  * autoDownload is OFF: check -> tell the renderer -> user clicks "Download" ->
  * we call downloadUpdate() -> "Restart to install" -> quitAndInstall(). This
  * matches the "click here to update" ask (not a silent background install).
+ *
+ * HARDENING (flaky GitHub can HANG, not just crash): every network step is
+ * bounded by a timeout so a half-open connection can't wedge the UI in
+ * 'checking'/'downloading' forever (with the "Check Now" button disabled in
+ * exactly those states → unrecoverable). A stall detector watches the download
+ * for silence. Any timeout/error leaves the updater RECHECKABLE (the in-flight
+ * guard clears), raw electron-updater strings are mapped to friendly text, and
+ * quitAndInstall() can no longer throw the process down.
  */
 import { app, BrowserWindow } from 'electron'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
@@ -33,10 +41,62 @@ export type UpdateStatus =
   | { state: 'downloaded'; version: string }
   | { state: 'error'; message: string }
 
+// Bound the two network steps. A flaky/half-open GitHub connection otherwise
+// leaves autoUpdater's promise pending forever (the 'error' event never fires),
+// wedging the UI in 'checking'/'downloading'. Mirrors the PDF_EXPORT_TIMEOUT_MS
+// race idiom in index.ts.
+const CHECK_TIMEOUT_MS = 30_000
+// The download reports periodic 'download-progress' events; if none arrives for
+// this long while 'downloading', the transfer has stalled (a half-open socket
+// mid-stream doesn't reject, it just goes quiet).
+const DOWNLOAD_STALL_MS = 60_000
+
 let win: BrowserWindow | null = null
 let channelFilePath = ''
 let userDataDir = ''
 let lastStatus: UpdateStatus = { state: 'idle' }
+
+// In-flight guards. `checkInFlight` prevents overlapping checks AND is what a
+// timeout/error must CLEAR so a subsequent checkForUpdates() isn't blocked by a
+// stale belief that a check is still running (the "guaranteed recovery" rule).
+let checkInFlight = false
+let checkTimer: ReturnType<typeof setTimeout> | null = null
+let downloadStallTimer: ReturnType<typeof setTimeout> | null = null
+
+function clearCheckTimer(): void {
+  if (checkTimer) { clearTimeout(checkTimer); checkTimer = null }
+}
+function clearDownloadStallTimer(): void {
+  if (downloadStallTimer) { clearTimeout(downloadStallTimer); downloadStallTimer = null }
+}
+
+/** Map a raw electron-updater / Chromium-net error to something a user can act
+ *  on. Falls back to the raw message when we don't recognise it. */
+export function friendlyError(raw: string): string {
+  const s = String(raw || '')
+  if (/ERR_INTERNET_DISCONNECTED|ENOTFOUND|EAI_AGAIN|ERR_NAME_NOT_RESOLVED|getaddrinfo/i.test(s)) {
+    return 'You appear to be offline — check your connection and try again.'
+  }
+  if (/ETIMEDOUT|ERR_TIMED_OUT|ERR_CONNECTION_TIMED_OUT|timed out/i.test(s)) {
+    return 'The update server took too long to respond — please try again.'
+  }
+  if (/ERR_CONNECTION_(REFUSED|RESET|CLOSED)|ECONNRESET|ECONNREFUSED|socket hang up/i.test(s)) {
+    return 'Could not reach the update server — please try again.'
+  }
+  if (/latest.*\.yml|Cannot find .*\.yml|status code 404|HttpError: 404|ERR_HTTP_RESPONSE_CODE_FAILURE/i.test(s)) {
+    return 'No update information available right now — please try again later.'
+  }
+  return s
+}
+
+/** Every error/timeout path funnels through here so state stays consistent:
+ *  friendly text out, in-flight guard + timers cleared so a retry works. */
+function reportError(rawMessage: string): void {
+  checkInFlight = false
+  clearCheckTimer()
+  clearDownloadStallTimer()
+  sendStatus({ state: 'error', message: friendlyError(rawMessage) })
+}
 
 function sendStatus(status: UpdateStatus): void {
   lastStatus = status
@@ -85,23 +145,48 @@ export function initUpdater(mainWindow: BrowserWindow, userData: string): void {
 
   autoUpdater.on('checking-for-update', () => sendStatus({ state: 'checking' }))
 
-  autoUpdater.on('update-available', (info) =>
-    sendStatus({ state: 'available', version: info.version, releaseNotes: releaseNotesText(info) }),
-  )
+  autoUpdater.on('update-available', (info) => {
+    // A definite result arrived → the check is no longer in flight and its
+    // timeout must not later fire a spurious "timed out" over this state.
+    checkInFlight = false
+    clearCheckTimer()
+    sendStatus({ state: 'available', version: info.version, releaseNotes: releaseNotesText(info) })
+  })
 
-  autoUpdater.on('update-not-available', () => sendStatus({ state: 'not-available' }))
+  autoUpdater.on('update-not-available', () => {
+    checkInFlight = false
+    clearCheckTimer()
+    sendStatus({ state: 'not-available' })
+  })
 
-  autoUpdater.on('download-progress', (progress) =>
-    sendStatus({ state: 'downloading', percent: Math.round(progress.percent) }),
-  )
+  autoUpdater.on('download-progress', (progress) => {
+    // Each progress tick proves the transfer is alive — re-arm the stall watch.
+    armDownloadStall()
+    sendStatus({ state: 'downloading', percent: Math.round(progress.percent) })
+  })
 
-  autoUpdater.on('update-downloaded', (info) =>
-    sendStatus({ state: 'downloaded', version: info.version }),
-  )
+  autoUpdater.on('update-downloaded', (info) => {
+    clearDownloadStallTimer()
+    sendStatus({ state: 'downloaded', version: info.version })
+  })
 
-  autoUpdater.on('error', (err) =>
-    sendStatus({ state: 'error', message: err?.message ?? String(err) }),
-  )
+  // electron-updater surfaces network + verification failures here. Route
+  // through reportError so the state is left recheckable + the message friendly.
+  autoUpdater.on('error', (err) => reportError(err?.message ?? String(err)))
+}
+
+/** (Re)arm the download stall watchdog: if no progress event lands within
+ *  DOWNLOAD_STALL_MS, treat the transfer as failed (recheckable). */
+function armDownloadStall(): void {
+  clearDownloadStallTimer()
+  downloadStallTimer = setTimeout(() => {
+    downloadStallTimer = null
+    // Only fires while we still believe we're downloading — a completed/errored
+    // download clears the timer, so reaching here means genuine silence.
+    if (lastStatus.state === 'downloading') {
+      reportError('The download stalled — check your connection and try again.')
+    }
+  }, DOWNLOAD_STALL_MS)
 }
 
 function releaseNotesText(info: { releaseNotes?: string | Array<{ note?: string | null }> | null }): string | undefined {
@@ -112,23 +197,61 @@ function releaseNotesText(info: { releaseNotes?: string | Array<{ note?: string 
   return undefined
 }
 
-/** Manual or startup check. Safe to call repeatedly (electron-updater no-ops
- *  a check already in flight). Not packaged (dev/e2e) -> no-op, since there's
- *  no installed app for electron-updater to reason about updating. */
+/** Force the updater back to a neutral, checkable state. Exposed so any external
+ *  recovery (e.g. a renderer "Retry" that wants a clean slate) can reset it; the
+ *  error path already leaves it recheckable, so this is belt-and-braces. */
+export function resetToIdle(): void {
+  checkInFlight = false
+  clearCheckTimer()
+  clearDownloadStallTimer()
+  sendStatus({ state: 'idle' })
+}
+
+/** Manual or startup check. Safe to call repeatedly — an in-flight check is a
+ *  no-op (guarded), and a prior timed-out/errored check has already cleared the
+ *  guard so a retry proceeds. Not packaged (dev/e2e) -> no-op, since there's no
+ *  installed app for electron-updater to reason about updating. */
 export function checkForUpdates(): void {
   if (!app.isPackaged) {
     sendStatus({ state: 'not-available' })
     return
   }
-  autoUpdater.checkForUpdates().catch((err) => sendStatus({ state: 'error', message: err?.message ?? String(err) }))
+  if (checkInFlight) return
+  checkInFlight = true
+
+  // Bound the check: a half-open GitHub connection never rejects the promise nor
+  // fires 'error', so without this the UI wedges in 'checking' forever with the
+  // "Check Now" button disabled. On timeout report + clear the guard so a retry
+  // works (mirrors index.ts's PDF_EXPORT_TIMEOUT_MS race).
+  clearCheckTimer()
+  checkTimer = setTimeout(() => {
+    checkTimer = null
+    if (checkInFlight) {
+      reportError('Update check timed out — check your connection and try again.')
+    }
+  }, CHECK_TIMEOUT_MS)
+
+  autoUpdater.checkForUpdates().catch((err) => reportError(err?.message ?? String(err)))
 }
 
 export function downloadUpdate(): void {
-  autoUpdater.downloadUpdate().catch((err) => sendStatus({ state: 'error', message: err?.message ?? String(err) }))
+  // A download that never starts producing progress (immediate half-open) would
+  // otherwise sit forever — arm the stall watch up front; each progress event
+  // re-arms it, downloaded/error clears it.
+  armDownloadStall()
+  autoUpdater.downloadUpdate().catch((err) => reportError(err?.message ?? String(err)))
 }
 
 export function quitAndInstall(): void {
-  autoUpdater.quitAndInstall()
+  // The one call that used to be able to throw the process down. If the installer
+  // handoff fails (missing/locked installer, permissions), surface a friendly
+  // recoverable error instead of an uncaught exception crashing the app.
+  try {
+    clearDownloadStallTimer()
+    autoUpdater.quitAndInstall()
+  } catch (err) {
+    reportError(`Couldn't start the installer — please download manually. (${(err as Error)?.message ?? String(err)})`)
+  }
 }
 
 /** Whether this is a build electron-builder/electron-updater can actually

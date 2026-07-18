@@ -12,7 +12,7 @@ import { StackGate } from './components/StackGate'
 import { UpdateGate } from './components/UpdateGate'
 import { GpuStatusGate } from './components/GpuStatusGate'
 import { GpuHelpGate } from './components/GpuHelpGate'
-import { UpdateBanner } from './components/UpdateBanner'
+import { UpdateCard } from './components/UpdateCard'
 import { MenuBar } from './components/MenuBar'
 import { DownloadToasts } from './components/DownloadToasts'
 import { GUIDES, getGuide, type Guide } from '@guides/index'
@@ -42,7 +42,6 @@ export function App() {
           onToggleReport={() => setReportOpen(v => !v)}
           onStartGuide={(g) => setTour(g)}
         />
-        <UpdateBanner />
         <div style={styles.body}>
           <MDIArea />
           {sidebarOpen && <PlotControlDock />}
@@ -54,6 +53,9 @@ export function App() {
       </div>
       {/* Examples-menu download progress cards (bottom-right, above the bar). */}
       <DownloadToasts />
+      {/* "New version available" card (bottom-left, above the bar) — mirrors the
+          DownloadToasts corner. Shows the whole updater lifecycle incl. errors. */}
+      <UpdateCard />
       {tour && <Tour guide={tour} onClose={() => setTour(null)} />}
       {/* Scan-shape/step-size confirm dialog — reads the pending prompt from the
           SpyDE context (so injected test messages reach it too). */}
