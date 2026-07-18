@@ -262,17 +262,19 @@ def _neural_sub_batch_size() -> int:
     return max(1, k)
 
 
-def _forward_with_cpu_retry(model, device, chunk_np: np.ndarray):
-    """Run ``model`` on ``chunk_np`` ((K,H,W)); on a torch/MPS ``RuntimeError``
-    move the model to CPU, retry on CPU, and return the CPU model+device so the
-    caller stays on CPU (fix 2 — catchable MPS op failure → per-op CPU retry).
+def _forward_with_cpu_retry(model, device, x):
+    """Run ``model`` on the ``(K,1,H,W)`` tensor ``x``; on a torch/MPS
+    ``RuntimeError`` move the model AND tensor to CPU, retry on CPU, and return the
+    CPU model+device so the caller stays on CPU (fix 2 — catchable MPS op failure →
+    per-op CPU retry). ``x`` may already sit on ``device`` (on-device preprocessing)
+    or on CPU (host numpy prep); it is moved to the active device either way.
 
     Returns ``(hm, off, model, device)`` — the (possibly CPU-moved) model+device
     are what the caller must use for the REST of this call. On CUDA/CPU the retry
     path never triggers, so behaviour there is unchanged."""
-    x = torch.from_numpy(chunk_np[:, None]).to(device)
+    xd = x.to(device)
     try:
-        hm, off = model(x)
+        hm, off = model(xd)
         return hm, off, model, device
     except RuntimeError as e:
         # A catchable MPS (or other device) op failure. Re-move the model to CPU
@@ -284,7 +286,7 @@ def _forward_with_cpu_retry(model, device, chunk_np: np.ndarray):
         log.warning("[models] %s forward raised (%s); retrying this sub-batch on "
                     "CPU and staying on CPU for the rest of this call",
                     device.type, e)
-        del x
+        del xd
         cpu = torch.device("cpu")
         model = model.to(cpu)
         model.eval()
@@ -295,9 +297,52 @@ def _forward_with_cpu_retry(model, device, chunk_np: np.ndarray):
             demote_cached_models_to_cpu()
         except Exception:
             pass
-        x = torch.from_numpy(chunk_np[:, None]).to(cpu)
-        hm, off = model(x)
+        hm, off = model(x.to(cpu))
         return hm, off, model, cpu
+
+
+def _gpu_prep_enabled() -> bool:
+    """Whether ``detect_batch`` preprocesses (normalise/scale/pad) ON the model
+    device instead of on the host. Default ON — it removes the fixed host-numpy
+    floor that otherwise dominates end-to-end time once the forward is on the GPU
+    (Amdahl; see ``preprocess_torch``). ``SPYDE_NEURAL_GPU_PREP=0`` forces the host
+    numpy path (the exact CPU reference) as an escape hatch. Irrelevant on CPU."""
+    return os.environ.get("SPYDE_NEURAL_GPU_PREP", "").lower() not in (
+        "0", "off", "false", "no")
+
+
+def _build_input_stack(frames: np.ndarray, device, factor: float, bg_sigma: float,
+                       levels: int, auto_scale: bool):
+    """Preprocess ``frames`` ((N,H,W)) into the padded ``(N,1,H',W')`` U-Net input
+    tensor: scale → normalise → pad-to-multiple.
+
+    On a GPU device (cuda/mps) with GPU-prep enabled this runs entirely ON the
+    device via ``preprocess_torch`` (numerically matched to the numpy reference —
+    see ``test_preprocess_torch_parity``), so nothing but the raw frames crosses
+    the bus. On CPU (or if GPU-prep is disabled / a device op fails) it uses the
+    canonical numpy/scipy path from ``preprocess.py`` and returns a CPU tensor.
+    ``factor``/``bg_sigma`` are the shared per-batch knobs resolved by the caller."""
+    if device.type in ("cuda", "mps") and _gpu_prep_enabled():
+        try:
+            from . import preprocess_torch as pt
+            x = torch.from_numpy(frames).to(device)                  # (N,H,W)
+            if auto_scale and factor != 1.0:
+                x = pt.scale_batch(x, factor)
+            x = pt.normalize_input_batch(x, bg_sigma=bg_sigma, local=True)
+            return pt.pad_to_multiple_batch(x, levels).unsqueeze(1)   # (N,1,H',W')
+        except Exception as e:                     # pragma: no cover — device-specific
+            log.warning("[models] on-device preprocessing failed (%s); falling back "
+                        "to host numpy preprocessing", e)
+    # Host numpy/scipy reference (CPU device, gpu-prep off, or a device-op failure).
+    nrm_list = []
+    for f in frames:
+        if auto_scale and factor != 1.0:
+            from scipy.ndimage import zoom
+            f = zoom(f, factor, order=1)
+        nrm_list.append(normalize_input(f, local=True, bg_sigma=bg_sigma))
+    stack = np.stack(nrm_list, 0)
+    stack = np.stack([_pad_to_multiple(n, levels) for n in stack], 0)
+    return torch.from_numpy(stack[:, None])                           # CPU (N,1,H',W')
 
 
 @torch.no_grad()
@@ -318,12 +363,17 @@ def detect_batch(model, frames, device, thresh: float = 0.3,
     estimate across a stack"). The whole batch must share one H,W for a single
     tensor, so a shared factor is also required to keep frames the same shape.
 
-    Memory: the (N,H,W) stack is run through the U-Net in fixed sub-batches of
+    Memory: the padded stack is run through the U-Net in fixed sub-batches of
     ``SPYDE_NEURAL_BATCH`` frames (default 64), NOT as one (N,1,H,W) tensor — a
     single pass over a full nav chunk (1000+ frames) held ~16 GB of activations.
     The scale/NMS-window/bg_sigma are resolved ONCE from ``frames[0]`` (below,
     outside the sub-batch loop) so results are bit-identical to a single pass;
     only the forward+decode is chunked.
+
+    Preprocessing (normalise/scale/pad) runs ON the model device when it's a GPU
+    (``_build_input_stack`` → ``preprocess_torch``), so nothing but the raw frames
+    crosses the bus; on CPU it uses the numpy/scipy reference. Both produce the same
+    result (parity-tested), so switching devices never changes the peaks.
     """
     frames = np.asarray(frames, dtype=np.float32)
     if frames.ndim == 2:
@@ -345,15 +395,10 @@ def detect_batch(model, frames, device, thresh: float = 0.3,
     md, bg_sigma = _big_disk_params(md, bg_sigma, work_diam)
 
     levels = int(getattr(model, "levels", 2))
-    nrm_list = []
-    for f in frames:
-        if auto_scale and factor != 1.0:
-            from scipy.ndimage import zoom
-            f = zoom(f, factor, order=1)
-        nrm_list.append(normalize_input(f, local=True, bg_sigma=bg_sigma))
-    # All frames now share one shape; pad the stack to the U-Net multiple.
-    stack = np.stack(nrm_list, 0)
-    stack = np.stack([_pad_to_multiple(n, levels) for n in stack], 0)
+    # Padded (N,1,H',W') U-Net input — built on the model device (GPU) or on the
+    # host (CPU); see _build_input_stack. Shared factor/bg_sigma keep every frame
+    # one shape, so it's a single tensor sliced per sub-batch below.
+    stack_t = _build_input_stack(frames, device, factor, bg_sigma, levels, auto_scale)
 
     K = _neural_sub_batch_size()
     per_frame: list = []
@@ -365,7 +410,7 @@ def detect_batch(model, frames, device, thresh: float = 0.3,
     # loop for the whole chunk). ``cur_*`` is the live model/device the loop uses.
     cur_model, cur_device = model, device
     for i0 in range(0, N, K):
-        chunk = stack[i0:i0 + K]
+        chunk = stack_t[i0:i0 + K]
         # If even the CPU retry inside _forward_with_cpu_retry fails, the error
         # propagates to the caller's coarser fallback (per-frame CPU in
         # _neural_block) — no extra handling needed here.
