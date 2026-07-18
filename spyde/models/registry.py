@@ -270,6 +270,68 @@ def get_model(model_id: Optional[str] = None):
     return result
 
 
+_CPU_MODEL_CACHE: dict = {}      # model_id -> (cpu_model, cpu_device)
+
+
+def get_cpu_model(model_id: Optional[str] = None):
+    """Return a cached ``(model, torch.device('cpu'))`` for ``model_id`` WITHOUT
+    disturbing the primary (possibly MPS/CUDA) cache.
+
+    Used by the Mac neural BATCH gate: when the batch is forced to CPU (the safe
+    default) we need a CPU model, but the single-frame PREVIEW must keep the cached
+    MPS model — so we can't move the shared cached model in-place. This keeps a
+    separate CPU copy, loaded once per id. The CPU model is a full independent
+    module (loaded from weights on CPU), so mutating it never affects the MPS one."""
+    import torch as _torch
+    mid = model_id or default_model_id()
+    with _CACHE_LOCK:
+        if mid in _CPU_MODEL_CACHE:
+            return _CPU_MODEL_CACHE[mid]
+    # Load a fresh CPU instance from the same weights (never reuses the primary
+    # cache object, so the MPS model the preview uses is untouched).
+    from . import infer
+    entry = _entry(mid)
+    if entry is None:
+        model, _dev = get_model(None)
+        model = model.to(_torch.device("cpu"))
+    else:
+        try:
+            path = _resolve_weights(entry)
+            model, _dev = infer.load_model(path, device=_torch.device("cpu"),
+                                           arch=entry.get("arch"))
+        except Exception as e:
+            log.warning("[models] get_cpu_model(%r) load failed (%s); reusing "
+                        "primary model on CPU", mid, e)
+            model, _dev = get_model(mid)
+            model = model.to(_torch.device("cpu"))
+    model.eval()
+    result = (model, _torch.device("cpu"))
+    with _CACHE_LOCK:
+        _CPU_MODEL_CACHE[mid] = result
+    return result
+
+
+def demote_cached_models_to_cpu() -> None:
+    """Move every cached ``(model, device)`` to CPU and rewrite its device to CPU.
+
+    Called when an MPS forward proves flaky (infer._forward_with_cpu_retry): the
+    cache is shared across the process, so leaving a CPU-moved model paired with a
+    stale ``mps`` device would make the NEXT ``get_model`` caller ``.to("mps")`` it
+    and crash again. This pins the whole process's neural inference to CPU for the
+    rest of the session — the safe response to a device that just failed. No-op if
+    nothing is cached; idempotent (a model already on CPU is unchanged)."""
+    import torch as _torch
+    with _CACHE_LOCK:
+        for mid, (model, device) in list(_MODEL_CACHE.items()):
+            try:
+                if getattr(device, "type", str(device)) != "cpu":
+                    model = model.to(_torch.device("cpu"))
+                    model.eval()
+                    _MODEL_CACHE[mid] = (model, _torch.device("cpu"))
+            except Exception as e:      # pragma: no cover — best-effort demotion
+                log.debug("[models] demoting cached model %r to CPU failed: %s", mid, e)
+
+
 def _raise_no_models():        # pragma: no cover
     raise RuntimeError("no models registered (bundled registry.json missing?)")
 

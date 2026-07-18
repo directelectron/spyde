@@ -12,12 +12,73 @@ model; predicted positions are mapped back to the original frame coordinates.
 """
 from __future__ import annotations
 
+import logging
+import os
+import sys
+
 import numpy as np
 import torch
 
 from .decode import decode, decode_batch, split_by_batch
 from .preprocess import estimate_disk_diameter, normalize_input, scale_to_canonical
 from .unet import SpotUNet
+
+log = logging.getLogger(__name__)
+
+
+# ── Apple-MPS robustness gates (Mac-only) ─────────────────────────────────────
+# SpotUNet uses nn.ConvTranspose2d + BatchNorm; ConvTranspose on MPS has a long
+# crash/correctness bug history, and the multi-worker batch path runs several
+# MPS forwards concurrently across worker processes. On Mac, some MPS op failures
+# raise a catchable RuntimeError, but the ones that take the *process* down are
+# uncatchable native Metal aborts (SIGABRT/segfault) — no try/except catches
+# those. The gates below make the Mac path non-crashing by default while keeping
+# MPS for the safe single-thread preview.
+#
+# ── THE ONE FLAG a user flips after validating MPS on their Mac ──────────────
+# ``SPYDE_NEURAL_MPS_BATCH`` controls whether the multi-worker BATCH path uses
+# MPS on Mac at all:
+#     unset / "0" / "off"  → batch runs on CPU (the SAFE default; we cannot test
+#                            MPS on the Windows dev box, so the shipped default
+#                            must not crash). The single-frame PREVIEW still uses
+#                            MPS (one thread in the main process — far safer).
+#     "1" / "on"           → batch is ALLOWED to use MPS again (once the user has
+#                            confirmed ConvTranspose/BatchNorm are stable on their
+#                            Mac). Fixes 1-4 (MPS fallback env, catchable-error CPU
+#                            retry, device serialization, worker-death demotion)
+#                            all still apply, so re-enabling is much safer than
+#                            before.
+# On non-Mac (CUDA) this gate is IRRELEVANT — ``mps_batch_allowed`` only ever
+# returns False on darwin; CUDA behaviour is completely unchanged.
+def _is_mac() -> bool:
+    return sys.platform == "darwin"
+
+
+def mps_batch_allowed() -> bool:
+    """True iff the multi-worker neural BATCH may use MPS. Off-Mac this is always
+    True (the gate is a no-op — CUDA/CPU decide via the device chain). On Mac it is
+    False unless ``SPYDE_NEURAL_MPS_BATCH`` is explicitly enabled (see the module
+    comment: the safe default is CPU batch on Mac, one flag re-enables MPS batch)."""
+    if not _is_mac():
+        return True
+    return os.environ.get("SPYDE_NEURAL_MPS_BATCH", "").lower() in ("1", "on", "true", "yes")
+
+
+def enable_mps_cpu_fallback() -> None:
+    """Set ``PYTORCH_ENABLE_MPS_FALLBACK=1`` on Mac so an unsupported MPS op (e.g.
+    a ConvTranspose gap in a given torch build) transparently runs on CPU per-op
+    instead of raising or aborting. MUST be called BEFORE torch initialises MPS
+    (i.e. before the first MPS tensor/op) to take effect — so this is invoked at
+    process startup (main process and every worker). No-op off Mac; idempotent."""
+    if not _is_mac():
+        return
+    # Only set if unset so a user override (e.g. explicitly "0") is respected.
+    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
+
+# On import (main process + every worker that imports this module) make the
+# unsupported-op → CPU fallback active before any MPS work. Cheap + idempotent.
+enable_mps_cpu_fallback()
 
 
 def _default_device():
@@ -201,6 +262,44 @@ def _neural_sub_batch_size() -> int:
     return max(1, k)
 
 
+def _forward_with_cpu_retry(model, device, chunk_np: np.ndarray):
+    """Run ``model`` on ``chunk_np`` ((K,H,W)); on a torch/MPS ``RuntimeError``
+    move the model to CPU, retry on CPU, and return the CPU model+device so the
+    caller stays on CPU (fix 2 — catchable MPS op failure → per-op CPU retry).
+
+    Returns ``(hm, off, model, device)`` — the (possibly CPU-moved) model+device
+    are what the caller must use for the REST of this call. On CUDA/CPU the retry
+    path never triggers, so behaviour there is unchanged."""
+    x = torch.from_numpy(chunk_np[:, None]).to(device)
+    try:
+        hm, off = model(x)
+        return hm, off, model, device
+    except RuntimeError as e:
+        # A catchable MPS (or other device) op failure. Re-move the model to CPU
+        # ONCE and retry this sub-batch there; subsequent sub-batches reuse the
+        # CPU model. (PYTORCH_ENABLE_MPS_FALLBACK should already route unsupported
+        # ops to CPU per-op; this catches the ones that still raise.)
+        if device.type == "cpu":
+            raise
+        log.warning("[models] %s forward raised (%s); retrying this sub-batch on "
+                    "CPU and staying on CPU for the rest of this call",
+                    device.type, e)
+        del x
+        cpu = torch.device("cpu")
+        model = model.to(cpu)
+        model.eval()
+        # Also demote the SHARED registry cache so the next get_model() caller in
+        # this process doesn't re-select the just-failed device and crash again.
+        try:
+            from .registry import demote_cached_models_to_cpu
+            demote_cached_models_to_cpu()
+        except Exception:
+            pass
+        x = torch.from_numpy(chunk_np[:, None]).to(cpu)
+        hm, off = model(x)
+        return hm, off, model, cpu
+
+
 @torch.no_grad()
 def detect_batch(model, frames, device, thresh: float = 0.3,
                  min_distance: int = 4, auto_scale: bool = True,
@@ -257,16 +356,25 @@ def detect_batch(model, frames, device, thresh: float = 0.3,
     stack = np.stack([_pad_to_multiple(n, levels) for n in stack], 0)
 
     K = _neural_sub_batch_size()
-    is_cuda = device.type == "cuda"
     per_frame: list = []
+    # ``device`` / ``model`` may flip to CPU mid-call if an MPS op raises a
+    # catchable RuntimeError (fix 2): re-move the model to CPU ONCE, retry the
+    # failing sub-batch on CPU, and stay on CPU for the remaining sub-batches so
+    # a flaky MPS op degrades cleanly at the finest grain instead of bubbling up
+    # to the coarser ``_neural_block`` catch (which drops to a slow per-frame CPU
+    # loop for the whole chunk). ``cur_*`` is the live model/device the loop uses.
+    cur_model, cur_device = model, device
     for i0 in range(0, N, K):
         chunk = stack[i0:i0 + K]
-        x = torch.from_numpy(chunk[:, None]).to(device)
-        hm, off = model(x)
+        # If even the CPU retry inside _forward_with_cpu_retry fails, the error
+        # propagates to the caller's coarser fallback (per-frame CPU in
+        # _neural_block) — no extra handling needed here.
+        hm, off, cur_model, cur_device = _forward_with_cpu_retry(
+            cur_model, cur_device, chunk)
         res = decode_batch(hm, off, thresh=thresh, min_distance=md)
         per_frame.extend(split_by_batch(res, chunk.shape[0]))
-        del x, hm, off, res
-        if is_cuda:
+        del hm, off, res
+        if cur_device.type == "cuda":
             torch.cuda.empty_cache()
 
     if factor != 1.0:

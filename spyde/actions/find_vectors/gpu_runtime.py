@@ -254,10 +254,11 @@ def _gpu_task_allowed(default_mode: str = "one") -> bool:
 
     ``default_mode`` is the policy used when SPYDE_FV_GPU is UNSET, and is
     per-CALLER: the numba NXCORR kernels keep "one" (they serialise on the
-    device); the neural torch path passes "2" — the real-data A/B
-    (2026-07-16, 48-core/1-GPU) showed all-workers CUDA was SLOWER (context
-    thrash) and lagged the desktop, while 2 submitting workers were faster
-    and smooth. An explicit env var overrides both.
+    device); the neural torch path passes "4"
+    (find_vectors_neural.NEURAL_GPU_LANE_DEFAULT — up to four CUDA-submitting
+    workers keep the device fed; must match orchestrate's lane_mode and the
+    lane split). An explicit env var overrides both. (History: the docstrings
+    once said "2" while the code passed "4"; reconciled to "4" 2026-07-17.)
     """
     import os
     if _gpu_warm_failures[0] >= _GPU_MAX_WARM_FAILURES and not _gpu_warmed[0]:

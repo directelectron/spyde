@@ -214,6 +214,66 @@ def _dispatch_chunks_gpu_aware(
     )
 
 
+def _is_worker_death(exc: Exception) -> bool:
+    """True when ``exc`` looks like a dask WORKER-PROCESS death (a Mac Metal abort
+    kills the worker, and dask surfaces that as a KilledWorker / a broken comm /
+    the dispatcher's no-progress stall — 'worker restarted or task unschedulable').
+    Matched by type name + message so we don't hard-import distributed internals."""
+    name = type(exc).__name__
+    if name in ("KilledWorker", "WorkerDied"):
+        return True
+    msg = str(exc).lower()
+    return any(s in msg for s in (
+        "killedworker", "worker restarted", "worker died",
+        "lost dependencies", "closedworker", "task unschedulable",
+    ))
+
+
+def _retry_neural_on_cpu(client, peaks_padded, nav_dim, stopped_flag,
+                         on_chunk_done):
+    """Re-dispatch a neural compute on the CPU workers after a GPU worker died
+    (fix 4). Sets SPYDE_FV_GPU=off on every worker (so ``_neural_gpu_demoted`` /
+    ``_gpu_task_allowed`` route the batch to CPU there) and dispatches to ALL
+    (respawned) workers as a plain CPU lane. Slow but SAFE — it finishes instead
+    of crash-looping the MPS device. Returns the assembled result, or None if
+    stopped."""
+    # Force the neural CPU path on every worker for the rest of this run. The env
+    # var is the cross-process signal the worker's _gpu_task_allowed reads; the
+    # module flag covers workers that stay alive.
+    try:
+        def _demote_worker():
+            import os
+            os.environ["SPYDE_FV_GPU"] = "off"
+            try:
+                from spyde.actions.find_vectors_neural import demote_neural_gpu
+                demote_neural_gpu()
+            except Exception:
+                pass
+        client.run(_demote_worker)
+    except Exception as e:
+        log.debug("[find_vectors] broadcasting neural CPU demotion failed: %s", e)
+
+    # Every worker is now a CPU worker for neural. Dispatch across ALL current
+    # worker addresses (a dead worker respawned under its nanny) as one CPU lane
+    # (gpu_only=False, no GPU lane) so the CPU work spreads out.
+    try:
+        cpu_lane = list(client.scheduler_info(n_workers=-1)["workers"].keys())
+    except Exception as e:
+        log.warning("[find_vectors] could not enumerate workers for CPU retry: %s", e)
+        cpu_lane = []
+    if not cpu_lane:
+        # No addressable workers — fall back to the monolithic threaded compute
+        # so the operation still COMPLETES on CPU rather than failing.
+        return peaks_padded.compute(scheduler="threads")
+    log.info("[find_vectors] neural CPU-recovery dispatch across %d worker(s)",
+             len(cpu_lane))
+    return _dispatch_chunks_gpu_aware(
+        client, peaks_padded, nav_dim, [], cpu_lane,
+        stopped_flag=stopped_flag, on_chunk_done=on_chunk_done,
+        lane_default_mode="off", gpu_only=False,
+    )
+
+
 def _do_compute_vectors(
     signal, params: dict, main_window=None, signal_tree=None,
     shm_name: str = None,
@@ -542,9 +602,8 @@ def _do_compute_vectors(
         # GPU-aware dual-lane dispatcher when the cluster has a designated
         # GPU worker: dask's locality-driven placement starves the (much
         # faster) GPU worker, so we place per-chunk futures ourselves.
-        # Per-method unset-default for the GPU lane: neural = "2" (real-data
-        # A/B 2026-07-16 — two CUDA-submitting workers beat all-workers on
-        # BOTH throughput and desktop smoothness; must match _neural_block's
+        # Per-method unset-default for the GPU lane: neural = "4"
+        # (NEURAL_GPU_LANE_DEFAULT — must match _neural_block's
         # _gpu_task_allowed default), numba NXCORR keeps "one" (its kernels
         # serialise on the device).
         #
@@ -564,11 +623,31 @@ def _do_compute_vectors(
                 f"GPU={len(gpu_addrs)} worker(s), CPU={len(cpu_addrs)} worker(s)"
                 f"{' (gpu-only)' if neural else ''}"
             )
-            result_padded = _dispatch_chunks_gpu_aware(
-                client, peaks_padded, nav_dim, gpu_addrs, cpu_addrs,
-                stopped_flag=stopped_flag, on_chunk_done=_live_count_chunk,
-                lane_default_mode=lane_mode, gpu_only=neural,
-            )
+            try:
+                result_padded = _dispatch_chunks_gpu_aware(
+                    client, peaks_padded, nav_dim, gpu_addrs, cpu_addrs,
+                    stopped_flag=stopped_flag, on_chunk_done=_live_count_chunk,
+                    lane_default_mode=lane_mode, gpu_only=neural,
+                )
+            except Exception as exc:
+                # FIX 4 — uncatchable Metal abort on a Mac MPS worker kills the
+                # WORKER PROCESS mid-chunk. dask surfaces that as a KilledWorker
+                # (or the dispatcher's no-progress stall) rather than crashing the
+                # app. Re-sending the same chunk to another MPS worker just
+                # crash-loops, so on a worker-death-class failure during a NEURAL
+                # run we demote the whole neural run to CPU and re-dispatch on the
+                # CPU workers — the operation COMPLETES on CPU instead of failing.
+                if neural and _is_worker_death(exc):
+                    log.warning("[find_vectors] neural GPU worker died mid-run "
+                                "(%s: %s); demoting neural to CPU and retrying",
+                                type(exc).__name__, exc)
+                    result_padded = _retry_neural_on_cpu(
+                        client, peaks_padded, nav_dim, stopped_flag,
+                        _live_count_chunk)
+                    if result_padded is None:
+                        return None
+                else:
+                    raise
             if result_padded is None:
                 return None
         elif _live_count_chunk is not None:

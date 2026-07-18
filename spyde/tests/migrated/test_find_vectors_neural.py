@@ -219,17 +219,21 @@ class TestFindVectorsNeural:
 
     def test_gpu_policy_modes(self, monkeypatch):
         """SPYDE_FV_GPU governs the neural path too: off → CPU everywhere;
-        unset → the caller's default (neural passes "2" — the real-data A/B
-        default; outside a dask worker any worker-gated mode allows)."""
+        unset → the caller's default (neural passes "4" —
+        NEURAL_GPU_LANE_DEFAULT; outside a dask worker any worker-gated mode
+        allows)."""
         from spyde.actions.find_vectors.gpu_runtime import _gpu_task_allowed
+        from spyde.actions.find_vectors_neural import NEURAL_GPU_LANE_DEFAULT
+
+        assert NEURAL_GPU_LANE_DEFAULT == "4"
 
         monkeypatch.delenv("SPYDE_FV_GPU", raising=False)
-        assert _gpu_task_allowed(default_mode="2") is True   # not on a worker
+        assert _gpu_task_allowed(default_mode="4") is True   # not on a worker
         assert _gpu_task_allowed(default_mode="all") is True
         assert _gpu_task_allowed() is True          # outside a worker: allowed
 
         monkeypatch.setenv("SPYDE_FV_GPU", "off")
-        assert _gpu_task_allowed(default_mode="2") is False
+        assert _gpu_task_allowed(default_mode="4") is False
         assert _gpu_task_allowed() is False
 
     def test_lane_split_default_mode(self, monkeypatch):
@@ -324,6 +328,243 @@ class TestFindVectorsNeural:
             assert infer._default_device().type == "mps"
             monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
         assert infer._default_device().type == "cpu"
+
+    # ── Mac (Apple-MPS) crash-avoidance layer ─────────────────────────────────
+    # These never touch a real MPS device (this is a Windows box with no Metal):
+    # they monkeypatch sys.platform='darwin' + a fake MPS device and force CPU
+    # everywhere a real device would be needed.
+
+    def test_mps_batch_gate_forces_cpu_default_on_mac(self, monkeypatch):
+        """On Mac with MPS available, the multi-worker BATCH runs on CPU by
+        DEFAULT (SPYDE_NEURAL_MPS_BATCH unset) — get_cpu_model is used and
+        detect_batch is invoked on the CPU device, NOT the MPS device. This is
+        the shipped non-crashing default; one flag re-enables MPS batch."""
+        import torch
+        import spyde.actions.find_vectors_neural as fvn
+        import spyde.actions.find_vectors_torch as fvt
+        from spyde import models as smodels
+
+        monkeypatch.setattr(fvn.sys, "platform", "darwin", raising=False)
+        monkeypatch.delenv("SPYDE_NEURAL_MPS_BATCH", raising=False)
+        # mps_batch_allowed reads sys.platform inside spyde.models.infer.
+        from spyde.models import infer as _infer
+        monkeypatch.setattr(_infer.sys, "platform", "darwin")
+
+        mps_dev = torch.device("mps")
+        cpu_dev = torch.device("cpu")
+        # get_model resolves to a (fake) MPS device; get_cpu_model to CPU.
+        monkeypatch.setattr(smodels, "get_model",
+                            lambda mid=None: ("MPS_MODEL", mps_dev))
+        monkeypatch.setattr(smodels, "get_cpu_model",
+                            lambda mid=None: ("CPU_MODEL", cpu_dev))
+        # A GPU device is "present" (the batch would otherwise try MPS).
+        monkeypatch.setattr(fvt, "torch_gpu_device", lambda: mps_dev)
+
+        seen = {}
+
+        def _fake_detect_batch(model, frames, device, **k):
+            seen["model"] = model
+            seen["device"] = device
+            return [np.zeros((0, 3), np.float32) for _ in range(len(frames))]
+
+        monkeypatch.setattr(smodels, "detect_batch", _fake_detect_batch)
+
+        b4d = np.zeros((2, 2, 16, 16), np.float32)
+        fvn._neural_block(b4d, 0.3, 4, True, None, None)
+        assert seen["device"].type == "cpu", "Mac batch did not fall back to CPU"
+        assert seen["model"] == "CPU_MODEL", "Mac batch did not use the CPU model"
+
+    def test_mps_batch_gate_reenabled_by_flag(self, monkeypatch):
+        """With SPYDE_NEURAL_MPS_BATCH=1 on Mac, the batch is ALLOWED to use MPS
+        again — the one flag the user flips after validating their Mac."""
+        import torch
+        import spyde.actions.find_vectors_neural as fvn
+        import spyde.actions.find_vectors_torch as fvt
+        from spyde import models as smodels
+
+        monkeypatch.setattr(fvn.sys, "platform", "darwin", raising=False)
+        from spyde.models import infer as _infer
+        monkeypatch.setattr(_infer.sys, "platform", "darwin")
+        monkeypatch.setenv("SPYDE_NEURAL_MPS_BATCH", "1")
+
+        mps_dev = torch.device("mps")
+        monkeypatch.setattr(smodels, "get_model",
+                            lambda mid=None: ("MPS_MODEL", mps_dev))
+        monkeypatch.setattr(fvt, "torch_gpu_device", lambda: mps_dev)
+
+        seen = {}
+
+        def _fake_detect_batch(model, frames, device, **k):
+            seen["device"] = device
+            return [np.zeros((0, 3), np.float32) for _ in range(len(frames))]
+
+        monkeypatch.setattr(smodels, "detect_batch", _fake_detect_batch)
+
+        b4d = np.zeros((2, 2, 16, 16), np.float32)
+        fvn._neural_block(b4d, 0.3, 4, True, None, None)
+        assert seen["device"].type == "mps", "flag did not re-enable MPS batch"
+
+    def test_mps_batch_allowed_platform_gate(self, monkeypatch):
+        """mps_batch_allowed: True off-Mac unconditionally; on Mac only when the
+        flag is set."""
+        from spyde.models import infer
+
+        monkeypatch.setattr(infer.sys, "platform", "win32")
+        monkeypatch.delenv("SPYDE_NEURAL_MPS_BATCH", raising=False)
+        assert infer.mps_batch_allowed() is True         # off-Mac: no-op gate
+
+        monkeypatch.setattr(infer.sys, "platform", "darwin")
+        assert infer.mps_batch_allowed() is False        # Mac default: CPU batch
+        monkeypatch.setenv("SPYDE_NEURAL_MPS_BATCH", "1")
+        assert infer.mps_batch_allowed() is True          # flag re-enables
+
+    def test_mps_fallback_env_set_on_darwin(self, monkeypatch):
+        """enable_mps_cpu_fallback sets PYTORCH_ENABLE_MPS_FALLBACK=1 on Mac
+        (fix 1) and is a no-op off Mac. __main__ and the worker plugin both
+        apply the same env early."""
+        from spyde.models import infer
+
+        # Off Mac: never touches the env.
+        monkeypatch.setattr(infer.sys, "platform", "win32")
+        monkeypatch.delenv("PYTORCH_ENABLE_MPS_FALLBACK", raising=False)
+        infer.enable_mps_cpu_fallback()
+        assert "PYTORCH_ENABLE_MPS_FALLBACK" not in infer.os.environ
+
+        # On Mac: sets it to 1.
+        monkeypatch.setattr(infer.sys, "platform", "darwin")
+        infer.enable_mps_cpu_fallback()
+        assert infer.os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] == "1"
+
+        # __main__ helper does the same (and also SPYDE_FV_GPU_CONC=1 — fix 3).
+        import spyde.__main__ as m
+        import sys as _sys
+        monkeypatch.setattr(_sys, "platform", "darwin")
+        monkeypatch.delenv("SPYDE_FV_GPU_CONC", raising=False)
+        m._set_mac_neural_env()
+        assert infer.os.environ["SPYDE_FV_GPU_CONC"] == "1"
+
+    def test_worker_plugin_sets_mac_env(self, monkeypatch):
+        """The dask worker plugin applies the Mac neural env in each worker
+        process (fix 1 + fix 3) — PYTORCH_ENABLE_MPS_FALLBACK=1 and
+        SPYDE_FV_GPU_CONC=1 on darwin; nothing off Mac."""
+        import spyde.dask_manager as dm
+
+        monkeypatch.setattr(dm.sys, "platform", "win32", raising=False)
+        monkeypatch.delenv("PYTORCH_ENABLE_MPS_FALLBACK", raising=False)
+        monkeypatch.delenv("SPYDE_FV_GPU_CONC", raising=False)
+        dm._apply_mac_neural_env()
+        assert "PYTORCH_ENABLE_MPS_FALLBACK" not in dm.os.environ
+
+        monkeypatch.setattr(dm.sys, "platform", "darwin", raising=False)
+        dm._apply_mac_neural_env()
+        assert dm.os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] == "1"
+        assert dm.os.environ["SPYDE_FV_GPU_CONC"] == "1"
+
+    def test_gpu_conc_one_on_mac_serializes(self, monkeypatch):
+        """With SPYDE_FV_GPU_CONC=1 (set on Mac), _gpu_slots admits ONE thread —
+        the neural forward is serialised process-wide (fix 3)."""
+        from spyde.actions.find_vectors.gpu_runtime import _gpu_slots
+
+        monkeypatch.setenv("SPYDE_FV_GPU_CONC", "1")
+        sem = _gpu_slots()
+        assert sem.acquire(blocking=False) is True
+        # A second acquire must fail — only one forward at a time.
+        assert sem.acquire(blocking=False) is False
+        sem.release()
+
+    def test_detect_batch_runtimeerror_cpu_retry(self, monkeypatch):
+        """A catchable RuntimeError on the non-CPU device forward → the sub-batch
+        retries on CPU, the model+device flip to CPU for the rest of the call,
+        and correct peaks come back (fix 2). No real MPS needed — we use torch's
+        'meta' device (has no hardware requirement, and device.type != 'cpu' so
+        the retry branch fires) and a fake model that raises on the first
+        (non-CPU) forward then succeeds on CPU."""
+        import torch
+        from spyde.models import infer
+
+        H = W = 16
+        calls = {"devices": []}
+
+        class _FakeModel:
+            levels = 2
+
+            def __init__(self):
+                self._device = torch.device("meta")
+
+            def to(self, dev):
+                self._device = torch.device(dev)
+                return self
+
+            def eval(self):
+                return self
+
+            def __call__(self, x):
+                calls["devices"].append(self._device.type)
+                if self._device.type != "cpu":
+                    raise RuntimeError("device op not implemented (simulated)")
+                # CPU: return a heatmap with one bright spot + zero offsets.
+                B = x.shape[0]
+                hm = torch.full((B, 1, H, W), -6.0)
+                hm[:, 0, 8, 8] = 6.0                 # sigmoid → ~1 confidence
+                off = torch.zeros((B, 2, H, W))
+                return hm, off
+
+        model = _FakeModel()
+        # Avoid poking the real registry cache in the demotion hook.
+        from spyde.models import registry as _reg
+        monkeypatch.setattr(_reg, "demote_cached_models_to_cpu", lambda: None)
+
+        frames = np.zeros((3, H, W), np.float32)
+        frames[:, 8, 8] = 100.0
+        # auto_scale False keeps the frame at native size (no scipy zoom / estimate).
+        out = infer.detect_batch(model, frames, torch.device("meta"),
+                                 thresh=0.3, min_distance=2, auto_scale=False)
+        assert len(out) == 3
+        # The forward was attempted on the non-CPU device (raised) then on cpu.
+        assert calls["devices"][0] != "cpu"
+        assert "cpu" in calls["devices"]
+        assert model._device.type == "cpu", "model did not flip to CPU"
+        # Correct peak decoded near (8,8) on every frame.
+        for p in out:
+            assert len(p) >= 1
+            assert abs(p[0, 0] - 8) < 2 and abs(p[0, 1] - 8) < 2
+
+    def test_neural_gpu_demote_flag(self, monkeypatch):
+        """demote_neural_gpu pins this process to CPU (fix 4 per-process flag);
+        SPYDE_FV_GPU=off also reads as demoted."""
+        import spyde.actions.find_vectors_neural as fvn
+
+        monkeypatch.delenv("SPYDE_FV_GPU", raising=False)
+        fvn._NEURAL_GPU_DEMOTED[0] = False
+        assert fvn._neural_gpu_demoted() is False
+        fvn.demote_neural_gpu()
+        assert fvn._neural_gpu_demoted() is True
+        fvn._NEURAL_GPU_DEMOTED[0] = False           # reset module state
+        monkeypatch.setenv("SPYDE_FV_GPU", "off")
+        assert fvn._neural_gpu_demoted() is True
+
+    def test_worker_death_detected(self):
+        """orchestrate._is_worker_death recognises a dask worker-process death
+        so fix 4's CPU-recovery retry fires only on that class of failure."""
+        from spyde.actions.find_vectors.orchestrate import _is_worker_death
+
+        class KilledWorker(Exception):
+            pass
+
+        assert _is_worker_death(KilledWorker("boom")) is True
+        assert _is_worker_death(RuntimeError(
+            "dispatcher stalled: worker restarted or task unschedulable")) is True
+        assert _is_worker_death(ValueError("bad shape")) is False
+
+    def test_dask_spawn_method_pinned(self):
+        """Fix 5: DaskManager pins the worker multiprocessing method to 'spawn'
+        so a perf change can't reintroduce the fork+Metal crash."""
+        from spyde.models import infer  # noqa: F401 (ensures package imports)
+        import inspect
+        import spyde.dask_manager as dm
+
+        src = inspect.getsource(dm.DaskManager._run)
+        assert "multiprocessing-method" in src and '"spawn"' in src
 
     def test_neural_run_cpu(self, monkeypatch):
         # Force the CPU branch — deterministic, and no torch-CUDA under pytest.

@@ -17,6 +17,7 @@ by the registry, so a 13k-pattern scan loads the net a single time.
 from __future__ import annotations
 
 import logging
+import sys
 from typing import Optional
 
 import numpy as np
@@ -26,6 +27,33 @@ log = logging.getLogger(__name__)
 # Heatmap confidence below which detections are discarded (the model's natural,
 # dataset-independent operating point). Mirrored in find_vectors.DEFAULT_NEURAL_THRESHOLD.
 DEFAULT_NEURAL_THRESHOLD = 0.3
+
+# ── Per-process neural-GPU demotion flag (fix 4) ──────────────────────────────
+# Set (in a worker process) when the neural GPU path has proven unsafe here, so
+# every subsequent chunk on THIS process runs the CPU path instead of re-crashing
+# on the device. The main process ALSO drives a coarser recovery: on a detected
+# GPU-worker death mid-run, orchestrate retries the whole compute with the neural
+# lane forced to CPU (SPYDE_FV_GPU=off) so the operation COMPLETES on CPU instead
+# of crash-looping (a dead worker respawns and would be handed the same chunk).
+# A module global (not env) because it must flip mid-process without a restart.
+import threading as _threading
+_NEURAL_GPU_DEMOTED = [False]
+_NEURAL_DEMOTE_LOCK = _threading.Lock()
+
+
+def _neural_gpu_demoted() -> bool:
+    """True once this process has demoted neural inference to CPU (device proved
+    unsafe, or SPYDE_FV_GPU=off was set for the CPU-recovery retry)."""
+    import os
+    if os.environ.get("SPYDE_FV_GPU", "").lower() == "off":
+        return True
+    return _NEURAL_GPU_DEMOTED[0]
+
+
+def demote_neural_gpu() -> None:
+    """Pin this process's neural inference to CPU for the rest of the session."""
+    with _NEURAL_DEMOTE_LOCK:
+        _NEURAL_GPU_DEMOTED[0] = True
 # Footprint (px) over which the raw disk-mean intensity is averaged for the value
 # column. The model works at a ~20 px canonical disk; ~5 px in native space is a
 # robust, method-agnostic default (matches the NXCORR/DoG kernel scale).
@@ -162,6 +190,31 @@ def _refine_block(peaks_grid, ny, nx, flat, beamstop_mask):
     return out
 
 
+# ── Neural GPU-lane unset-default (reconciled "2" vs "4") ─────────────────────
+# The neural batch's GPU worker-lane count when SPYDE_FV_GPU is UNSET. This MUST
+# match orchestrate's ``lane_mode`` (orchestrate.py sets "4" for neural) and
+# _gpu_task_allowed's ``default_mode`` here, or the lane sizing and the per-worker
+# GPU-allow gate disagree (some workers get chunks they refuse to run on GPU).
+# Reconciliation (2026-07-17): the code path used "4" while several docstrings
+# still said "2"; the real-data A/B that motivated a small GPU lane predates the
+# gpu-only neural dispatch, and orchestrate + the tests now assert "4". So the
+# single source of truth is "4"; the old "2" wording is corrected everywhere.
+NEURAL_GPU_LANE_DEFAULT = "4"
+
+
+def _mps_forward_lock():
+    """Whole-device lock that serialises the MPS forward on Mac — ONE forward at a
+    time per process (fix 3). Thread-race crashes on MPS come from concurrent
+    forwards hitting a single Metal context; this gives the neural path the same
+    serial discipline the NXCORR torch path has via ``_GPU_LOCK``. Reuses that
+    same lock object so a mixed neural+NXCORR run shares one device-serialisation
+    budget. Off Mac this returns a null context (CUDA keeps its own concurrency)."""
+    if sys.platform != "darwin":
+        return None
+    from spyde.actions.find_vectors_torch import _GPU_LOCK
+    return _GPU_LOCK
+
+
 def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
                   bg_sigma=None, persistence=False, spot_radius=None):
     """Run the neural detector on a (ny, nx, KY, KX) block → NaN-padded
@@ -174,15 +227,25 @@ def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
     block's scan neighbours).
 
     GPU use honours the SPYDE_FV_GPU worker policy (``_gpu_task_allowed``), with a
-    neural-specific unset-default of "2": two CUDA-submitting workers keep the
-    device fed while the rest run the per-frame CPU path. Real-data A/B
-    (2026-07-16, 48-core/1-GPU box): all-workers CUDA was SLOWER (context
-    thrash) and lagged the desktop; 2 workers was faster and smooth. Must match
-    orchestrate's lane_mode. Set SPYDE_FV_GPU=one/N/all/off to override. The
-    forward pass itself is additionally bounded by ``_gpu_slots()``
-    (SPYDE_FV_GPU_CONC, default 2) — the same device-concurrency semaphore the
-    numba NXCORR path uses — so concurrent CUDA-submitting workers don't each
-    hold a full activation set on the device simultaneously."""
+    neural-specific unset-default of "4" (``NEURAL_GPU_LANE_DEFAULT``): up to four
+    CUDA-submitting workers keep the device fed while the rest run the per-frame
+    CPU path. Must match orchestrate's lane_mode. Set SPYDE_FV_GPU=one/N/all/off
+    to override. The forward pass is additionally bounded by ``_gpu_slots()``
+    (SPYDE_FV_GPU_CONC) — the same device-concurrency semaphore the numba NXCORR
+    path uses — so concurrent CUDA-submitting workers don't each hold a full
+    activation set on the device simultaneously.
+
+    MAC (Apple-MPS) SAFETY — the crash-avoidance layer:
+      - The BATCH runs on MPS ONLY if ``models.mps_batch_allowed()`` (i.e. the
+        user set SPYDE_NEURAL_MPS_BATCH=1 after validating MPS). By DEFAULT on Mac
+        the batch device is forced to CPU here (the shipped, non-crashing default);
+        the single-frame preview still uses MPS elsewhere.
+      - When MPS batch IS enabled, the forward is serialised process-wide by
+        ``_mps_forward_lock`` (one Metal forward at a time — fix 3) and
+        SPYDE_FV_GPU_CONC=1 is expected (set on Mac in the worker/main env).
+      - If a GPU-worker process was seen to die mid-run (Metal abort), the session
+        flips the neural lane to CPU (see ``neural_gpu_demoted`` / orchestrate's
+        worker-death retry — fix 4) and ``_gpu_task_allowed`` returns CPU here."""
     from spyde import models
     from spyde.actions.find_vectors import MAX_PEAKS, _with_raw_intensity
     from spyde.actions.find_vectors.gpu_runtime import _gpu_slots, _gpu_task_allowed
@@ -193,20 +256,50 @@ def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
 
     model, device = models.get_model(model_id)
 
+    # Does the worker policy allow the GPU here, and wasn't the neural lane demoted
+    # to CPU after a worker death (fix 4)?
+    gpu_allowed = (torch_gpu_device() is not None
+                   and _gpu_task_allowed(default_mode=NEURAL_GPU_LANE_DEFAULT)
+                   and not _neural_gpu_demoted())
+
+    # MAC BATCH GATE (fix 7): if the resolved device is MPS but the batch is not
+    # allowed to use MPS (the safe DEFAULT on Mac), run the BATCH on CPU — still
+    # the fast batched detect_batch path, just on the CPU device. Only the
+    # multi-worker batch is the crash surface; the single-frame preview keeps MPS
+    # elsewhere. This is the ONE place SPYDE_NEURAL_MPS_BATCH gates the batch.
+    dev_is_mps = getattr(device, "type", str(device)) == "mps"
+    force_cpu_batch = False
+    if dev_is_mps and not models.mps_batch_allowed():
+        log.info("[find_vectors] Mac neural BATCH forced to CPU (SPYDE_NEURAL_MPS_"
+                 "BATCH unset); MPS kept for single-frame preview")
+        # Use a SEPARATE CPU model (never move the cached MPS model in-place — the
+        # single-frame preview shares that cache object and must keep MPS).
+        model, device = models.get_cpu_model(model_id)
+        dev_is_mps = False
+        force_cpu_batch = True    # still use the batched path, just on CPU
+
     peaks_list = None
     try:
-        if torch_gpu_device() is not None and _gpu_task_allowed(default_mode="4"):
-            # Bound concurrent forward passes per process (same semaphore the
-            # numba NXCORR path uses — chunk.py's _device_section — so a mixed
-            # run shares one device-concurrency budget, SPYDE_FV_GPU_CONC).
-            with _gpu_slots():
-                # Sub-batched internally (SPYDE_NEURAL_BATCH) — NOT one forward
-                # pass for the whole chunk; see infer.detect_batch.
-                raw = models.detect_batch(
-                    model, flat, device, thresh=float(threshold),
-                    min_distance=int(min_dist),
-                    bg_sigma=(float(bg_sigma) if bg_sigma is not None else None),
-                    spot_diameter=(2.0 * spot_radius) if spot_radius else None)
+        # Use the batched detect_batch path when the GPU is allowed, OR when the
+        # Mac gate forced this MPS batch onto CPU (batched CPU beats the per-frame
+        # loop). Everywhere else (no GPU, non-Mac) keep the per-frame CPU fallback.
+        use_batch = gpu_allowed or force_cpu_batch
+        if use_batch:
+            # Serialise the MPS forward process-wide (fix 3); on CUDA/CPU this is a
+            # null context and the existing _gpu_slots semaphore governs
+            # concurrency. Also bound concurrent forward passes per process (same
+            # semaphore the numba NXCORR path uses).
+            mps_lock = _mps_forward_lock() if dev_is_mps else None
+            import contextlib
+            with (mps_lock or contextlib.nullcontext()):
+                with _gpu_slots():
+                    # Sub-batched internally (SPYDE_NEURAL_BATCH) — NOT one forward
+                    # pass for the whole chunk; see infer.detect_batch.
+                    raw = models.detect_batch(
+                        model, flat, device, thresh=float(threshold),
+                        min_distance=int(min_dist),
+                        bg_sigma=(float(bg_sigma) if bg_sigma is not None else None),
+                        spot_diameter=(2.0 * spot_radius) if spot_radius else None)
             peaks_list = []
             for i, p in enumerate(raw):
                 p = _apply_beamstop(np.asarray(p, np.float32).reshape(-1, 3),
