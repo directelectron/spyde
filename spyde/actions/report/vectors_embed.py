@@ -58,14 +58,22 @@ FIG_PX = 340                # each anyplotlib figure's CSS size
 # process, so read it ONCE, lazily, and hold the text module-level.
 _ESM_TEXT: "str | None" = None
 
-# Memoize a fully-built explorer page per (cell_id, id(vectors)) so a rebuild that
-# targets the SAME cell with the SAME vectors object (a caption tweak, a report
+# Memoize a fully-built explorer page per (cell_id, vectors-identity) so a rebuild
+# that targets the SAME cell with the SAME vectors object (a caption tweak, a report
 # re-emit, an unrelated cell's mutation firing a full re-emit) reuses the packed
 # base64 blob (up to ~68 ms for a 1 M-vector dataset) + the serialized anyplotlib
 # figure (~6–130 ms) instead of rebuilding both. Keyed by cell id so a swapped
 # dataset (new vectors identity) misses and rebuilds; small (one entry per live
 # vectors cell). Cleared when the report closes (``clear_explorer_cache``).
-_EXPLORER_CACHE: "dict[str, tuple[int, str]]" = {}
+#
+# The value holds a STRONG REFERENCE to the vectors object (identity compared with
+# ``is``), NOT ``id(vectors)``: an int id is reused once the original object is GC'd,
+# so a swapped-in vectors object could land on the freed address and read back the
+# STALE page (deterministic on CPython 3.13's allocator — the id-key form served the
+# wrong explorer for swapped vectors). Holding the ref keeps the address unique while
+# the entry lives; the entry is replaced on swap and dropped on report close, so it
+# stays one-object-per-cell.
+_EXPLORER_CACHE: "dict[str, tuple[object, str]]" = {}
 
 
 def _esm_text() -> str:
@@ -848,7 +856,7 @@ def vectors_explorer_html(vecs, caption: str = "",
     fresh key or the page is rebuilt when the vectors identity changes."""
     if cache_key is not None:
         hit = _EXPLORER_CACHE.get(cache_key)
-        if hit is not None and hit[0] == id(vecs):
+        if hit is not None and hit[0] is vecs:
             return hit[1]
 
     payload = pack_vectors(vecs)
@@ -899,7 +907,7 @@ def vectors_explorer_html(vecs, caption: str = "",
         "</body></html>"
     )
     if cache_key is not None:
-        _EXPLORER_CACHE[cache_key] = (id(vecs), page)
+        _EXPLORER_CACHE[cache_key] = (vecs, page)
     return page
 
 
