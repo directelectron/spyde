@@ -15,6 +15,7 @@ chunk inside a fixed RAM/VRAM budget.
 from __future__ import annotations
 
 import logging
+import sys
 import time
 
 import numpy as np
@@ -95,6 +96,46 @@ def _split_workers_for_gpu(client, default_mode: str = "one") -> tuple:
     "one") and must match the chunk fn's ``_gpu_task_allowed`` default."""
     from spyde.compute_dispatch import split_workers_for_gpu
     return split_workers_for_gpu(client, default_mode)
+
+
+def _mps_neural_enabled() -> bool:
+    """True when the Apple-MPS neural batch should be used on this machine:
+    darwin + a torch MPS device + ``mps_batch_allowed`` (i.e. the user hasn't set
+    the SPYDE_NEURAL_MPS_BATCH=0 CPU escape hatch). Off Mac / no MPS → False, so
+    the CUDA/CPU lane logic below runs unchanged."""
+    if sys.platform != "darwin":
+        return False
+    try:
+        from spyde import models
+        from spyde.actions.find_vectors_torch import torch_gpu_device
+        dev = torch_gpu_device()
+        return (dev is not None and getattr(dev, "type", None) == "mps"
+                and models.mps_batch_allowed())
+    except Exception:
+        return False
+
+
+def _mps_neural_lane(client) -> tuple:
+    """Apple-MPS: pin the ENTIRE neural run to a single worker process.
+
+    Concurrent SpotUNet forwards across separate worker PROCESSES (each its own
+    Metal context) are the uncatchable Metal-abort crash surface on MPS, and a
+    single GPU is not sped up by more workers anyway. Returning worker "1" as the
+    sole GPU lane with an EMPTY cpu lane makes the gpu_only dispatcher route every
+    chunk to that one worker, where SPYDE_FV_GPU_CONC=1 + the device lock keep it
+    to one forward at a time. Worker "1" is the canonical GPU worker the lane
+    machinery already uses (``_gpu_task_allowed`` admits names 1..N; worker "0" is
+    intentionally CPU-only). Returns ([addr], []) for worker "1", or ([], []) when
+    it isn't up (only a <4-core degenerate cluster; the caller then falls back to
+    the single-lane path, which with so few workers has no concurrency anyway)."""
+    try:
+        info = client.scheduler_info(n_workers=-1)["workers"]
+    except Exception:
+        return [], []
+    for addr, w in info.items():
+        if str(w.get("name")) == "1":
+            return [addr], []
+    return [], []
 
 
 def _compact_padded_chunk(arr: np.ndarray) -> np.ndarray:
@@ -614,9 +655,17 @@ def _do_compute_vectors(
         # CPU workers stay free (which is also why the desktop stays smooth).
         neural = method == METHOD_NEURAL
         lane_mode = "4" if neural else "one"
-        gpu_addrs, cpu_addrs = _split_workers_for_gpu(client, lane_mode)
-        if neural:
-            cpu_addrs = []
+        # Apple-MPS neural: pin the whole run to ONE worker process (single Metal
+        # context) — see _mps_neural_lane. Elsewhere (CUDA / CPU) keep the existing
+        # per-method lane split. On Mac split_workers_for_gpu returns ([],[]) anyway
+        # (it gates on numba CUDA), so without this the neural batch would spread
+        # across every worker's MPS — the concurrent-context crash surface.
+        if neural and _mps_neural_enabled():
+            gpu_addrs, cpu_addrs = _mps_neural_lane(client)
+        else:
+            gpu_addrs, cpu_addrs = _split_workers_for_gpu(client, lane_mode)
+            if neural:
+                cpu_addrs = []
         if gpu_addrs and (cpu_addrs or neural):
             log.debug(
                 f"[find_vectors] dispatcher lanes: "

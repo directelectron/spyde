@@ -35,21 +35,20 @@ log = logging.getLogger(__name__)
 # those. The gates below make the Mac path non-crashing by default while keeping
 # MPS for the safe single-thread preview.
 #
-# ── THE ONE FLAG a user flips after validating MPS on their Mac ──────────────
-# ``SPYDE_NEURAL_MPS_BATCH`` controls whether the multi-worker BATCH path uses
-# MPS on Mac at all:
-#     unset / "0" / "off"  → batch runs on CPU (the SAFE default; we cannot test
-#                            MPS on the Windows dev box, so the shipped default
-#                            must not crash). The single-frame PREVIEW still uses
-#                            MPS (one thread in the main process — far safer).
-#     "1" / "on"           → batch is ALLOWED to use MPS again (once the user has
-#                            confirmed ConvTranspose/BatchNorm are stable on their
-#                            Mac). Fixes 1-4 (MPS fallback env, catchable-error CPU
-#                            retry, device serialization, worker-death demotion)
-#                            all still apply, so re-enabling is much safer than
-#                            before.
-# On non-Mac (CUDA) this gate is IRRELEVANT — ``mps_batch_allowed`` only ever
-# returns False on darwin; CUDA behaviour is completely unchanged.
+# ── THE ESCAPE-HATCH FLAG (SPYDE_NEURAL_MPS_BATCH) ───────────────────────────
+# On Mac the neural BATCH runs on MPS **by default** (validated on real Metal:
+# SpotUNet's forward is correct and ~6x faster than CPU on Apple silicon, and the
+# batch is now pinned to a SINGLE worker process — see orchestrate._mps_neural_lane
+# — so the concurrent-Metal-context abort that motivated the old CPU default can no
+# longer happen). ``SPYDE_NEURAL_MPS_BATCH`` only exists now as an OFF switch for a
+# user whose specific hardware/torch build still misbehaves:
+#     unset / "1" / "on"   → batch uses MPS (the default on Mac).
+#     "0" / "off"          → batch forced onto CPU (the old safe default; the
+#                            batched detect_batch path, just on the CPU device).
+# The layered safety nets (MPS fallback env, catchable-error CPU retry, device
+# serialization, worker-death → CPU demotion) all still apply. On non-Mac (CUDA)
+# this gate is IRRELEVANT — ``mps_batch_allowed`` only reads the env on darwin;
+# CUDA behaviour is completely unchanged.
 def _is_mac() -> bool:
     return sys.platform == "darwin"
 
@@ -57,11 +56,12 @@ def _is_mac() -> bool:
 def mps_batch_allowed() -> bool:
     """True iff the multi-worker neural BATCH may use MPS. Off-Mac this is always
     True (the gate is a no-op — CUDA/CPU decide via the device chain). On Mac it is
-    False unless ``SPYDE_NEURAL_MPS_BATCH`` is explicitly enabled (see the module
-    comment: the safe default is CPU batch on Mac, one flag re-enables MPS batch)."""
+    True by default (MPS is validated + single-worker-pinned) and only False when
+    ``SPYDE_NEURAL_MPS_BATCH`` is explicitly set to 0/off (the CPU escape hatch)."""
     if not _is_mac():
         return True
-    return os.environ.get("SPYDE_NEURAL_MPS_BATCH", "").lower() in ("1", "on", "true", "yes")
+    return os.environ.get("SPYDE_NEURAL_MPS_BATCH", "").lower() not in (
+        "0", "off", "false", "no")
 
 
 def enable_mps_cpu_fallback() -> None:

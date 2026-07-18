@@ -263,6 +263,58 @@ class TestFindVectorsNeural:
         assert len(gpu1) == 1 and len(cpu1) == 3
         assert len(gpu2) == 2 and len(cpu2) == 2
 
+    def test_mps_neural_lane_pins_single_worker(self, monkeypatch):
+        """On Mac, the neural run is pinned to ONE worker process (worker '1' as
+        the sole GPU lane, empty CPU lane) so only a single Metal context is ever
+        live — the concurrent-context abort surface. Worker '0' is CPU-only."""
+        import spyde.actions.find_vectors.orchestrate as o
+
+        class _C:
+            def scheduler_info(self, n_workers=None):
+                return {"workers": {
+                    f"tcp://{i}": {"name": i} for i in range(4)
+                }}
+
+        gpu, cpu = o._mps_neural_lane(_C())
+        assert gpu == ["tcp://1"], "neural MPS lane must pin to worker '1'"
+        assert cpu == [], "neural MPS lane must leave the CPU lane empty (gpu_only)"
+
+        # Worker '1' absent (degenerate <4-core cluster): return empty so the
+        # caller falls back to the single-lane path (no concurrency there anyway).
+        class _C0:
+            def scheduler_info(self, n_workers=None):
+                return {"workers": {"tcp://0": {"name": 0}}}
+
+        assert o._mps_neural_lane(_C0()) == ([], [])
+
+    def test_mps_neural_enabled_gate(self, monkeypatch):
+        """_mps_neural_enabled: True only on darwin + a torch MPS device + not the
+        =0 escape hatch; False off Mac or when MPS is unavailable."""
+        import spyde.actions.find_vectors.orchestrate as o
+        import spyde.actions.find_vectors_torch as fvt
+        import torch
+
+        monkeypatch.delenv("SPYDE_NEURAL_MPS_BATCH", raising=False)
+        from spyde.models import infer as _infer
+        monkeypatch.setattr(_infer.sys, "platform", "darwin")
+        monkeypatch.setattr(o.sys, "platform", "darwin", raising=False)
+        monkeypatch.setattr(fvt, "torch_gpu_device", lambda: torch.device("mps"))
+        assert o._mps_neural_enabled() is True
+
+        # Escape hatch disables it even with MPS present.
+        monkeypatch.setenv("SPYDE_NEURAL_MPS_BATCH", "0")
+        assert o._mps_neural_enabled() is False
+        monkeypatch.delenv("SPYDE_NEURAL_MPS_BATCH", raising=False)
+
+        # No MPS device → False (CUDA/CPU lane logic runs instead).
+        monkeypatch.setattr(fvt, "torch_gpu_device", lambda: None)
+        assert o._mps_neural_enabled() is False
+
+        # Off Mac → always False regardless of device.
+        monkeypatch.setattr(o.sys, "platform", "win32", raising=False)
+        monkeypatch.setattr(fvt, "torch_gpu_device", lambda: torch.device("mps"))
+        assert o._mps_neural_enabled() is False
+
     def test_neural_block_respects_gpu_off(self, monkeypatch):
         """SPYDE_FV_GPU=off must keep the batched torch path off even when a
         GPU device is present — every frame goes through the per-frame CPU
@@ -334,11 +386,11 @@ class TestFindVectorsNeural:
     # they monkeypatch sys.platform='darwin' + a fake MPS device and force CPU
     # everywhere a real device would be needed.
 
-    def test_mps_batch_gate_forces_cpu_default_on_mac(self, monkeypatch):
-        """On Mac with MPS available, the multi-worker BATCH runs on CPU by
-        DEFAULT (SPYDE_NEURAL_MPS_BATCH unset) — get_cpu_model is used and
-        detect_batch is invoked on the CPU device, NOT the MPS device. This is
-        the shipped non-crashing default; one flag re-enables MPS batch."""
+    def test_mps_batch_uses_mps_by_default_on_mac(self, monkeypatch):
+        """On Mac with MPS available, the BATCH runs on MPS by DEFAULT
+        (SPYDE_NEURAL_MPS_BATCH unset) — detect_batch is invoked on the MPS
+        device with the MPS model. MPS is validated + single-worker-pinned
+        (orchestrate._mps_neural_lane), so this is the shipped default now."""
         import torch
         import spyde.actions.find_vectors_neural as fvn
         import spyde.actions.find_vectors_torch as fvt
@@ -351,13 +403,8 @@ class TestFindVectorsNeural:
         monkeypatch.setattr(_infer.sys, "platform", "darwin")
 
         mps_dev = torch.device("mps")
-        cpu_dev = torch.device("cpu")
-        # get_model resolves to a (fake) MPS device; get_cpu_model to CPU.
         monkeypatch.setattr(smodels, "get_model",
                             lambda mid=None: ("MPS_MODEL", mps_dev))
-        monkeypatch.setattr(smodels, "get_cpu_model",
-                            lambda mid=None: ("CPU_MODEL", cpu_dev))
-        # A GPU device is "present" (the batch would otherwise try MPS).
         monkeypatch.setattr(fvt, "torch_gpu_device", lambda: mps_dev)
 
         seen = {}
@@ -371,12 +418,13 @@ class TestFindVectorsNeural:
 
         b4d = np.zeros((2, 2, 16, 16), np.float32)
         fvn._neural_block(b4d, 0.3, 4, True, None, None)
-        assert seen["device"].type == "cpu", "Mac batch did not fall back to CPU"
-        assert seen["model"] == "CPU_MODEL", "Mac batch did not use the CPU model"
+        assert seen["device"].type == "mps", "Mac batch did not use MPS by default"
+        assert seen["model"] == "MPS_MODEL", "Mac batch did not use the MPS model"
 
-    def test_mps_batch_gate_reenabled_by_flag(self, monkeypatch):
-        """With SPYDE_NEURAL_MPS_BATCH=1 on Mac, the batch is ALLOWED to use MPS
-        again — the one flag the user flips after validating their Mac."""
+    def test_mps_batch_cpu_escape_hatch_on_mac(self, monkeypatch):
+        """SPYDE_NEURAL_MPS_BATCH=0 on Mac forces the batch onto CPU — the escape
+        hatch for hardware/torch builds where MPS still misbehaves. get_cpu_model
+        supplies the CPU model and detect_batch runs on the CPU device."""
         import torch
         import spyde.actions.find_vectors_neural as fvn
         import spyde.actions.find_vectors_torch as fvt
@@ -385,16 +433,20 @@ class TestFindVectorsNeural:
         monkeypatch.setattr(fvn.sys, "platform", "darwin", raising=False)
         from spyde.models import infer as _infer
         monkeypatch.setattr(_infer.sys, "platform", "darwin")
-        monkeypatch.setenv("SPYDE_NEURAL_MPS_BATCH", "1")
+        monkeypatch.setenv("SPYDE_NEURAL_MPS_BATCH", "0")
 
         mps_dev = torch.device("mps")
+        cpu_dev = torch.device("cpu")
         monkeypatch.setattr(smodels, "get_model",
                             lambda mid=None: ("MPS_MODEL", mps_dev))
+        monkeypatch.setattr(smodels, "get_cpu_model",
+                            lambda mid=None: ("CPU_MODEL", cpu_dev))
         monkeypatch.setattr(fvt, "torch_gpu_device", lambda: mps_dev)
 
         seen = {}
 
         def _fake_detect_batch(model, frames, device, **k):
+            seen["model"] = model
             seen["device"] = device
             return [np.zeros((0, 3), np.float32) for _ in range(len(frames))]
 
@@ -402,11 +454,13 @@ class TestFindVectorsNeural:
 
         b4d = np.zeros((2, 2, 16, 16), np.float32)
         fvn._neural_block(b4d, 0.3, 4, True, None, None)
-        assert seen["device"].type == "mps", "flag did not re-enable MPS batch"
+        assert seen["device"].type == "cpu", "escape hatch did not force CPU batch"
+        assert seen["model"] == "CPU_MODEL", "escape hatch did not use the CPU model"
 
     def test_mps_batch_allowed_platform_gate(self, monkeypatch):
-        """mps_batch_allowed: True off-Mac unconditionally; on Mac only when the
-        flag is set."""
+        """mps_batch_allowed: True off-Mac unconditionally; on Mac True by DEFAULT
+        (MPS validated + single-worker-pinned), False only via the =0 escape
+        hatch."""
         from spyde.models import infer
 
         monkeypatch.setattr(infer.sys, "platform", "win32")
@@ -414,9 +468,13 @@ class TestFindVectorsNeural:
         assert infer.mps_batch_allowed() is True         # off-Mac: no-op gate
 
         monkeypatch.setattr(infer.sys, "platform", "darwin")
-        assert infer.mps_batch_allowed() is False        # Mac default: CPU batch
+        assert infer.mps_batch_allowed() is True          # Mac default: MPS batch
         monkeypatch.setenv("SPYDE_NEURAL_MPS_BATCH", "1")
-        assert infer.mps_batch_allowed() is True          # flag re-enables
+        assert infer.mps_batch_allowed() is True           # explicit on
+        monkeypatch.setenv("SPYDE_NEURAL_MPS_BATCH", "0")
+        assert infer.mps_batch_allowed() is False          # escape hatch: CPU
+        monkeypatch.setenv("SPYDE_NEURAL_MPS_BATCH", "off")
+        assert infer.mps_batch_allowed() is False          # escape hatch: CPU
 
     def test_mps_fallback_env_set_on_darwin(self, monkeypatch):
         """enable_mps_cpu_fallback sets PYTORCH_ENABLE_MPS_FALLBACK=1 on Mac

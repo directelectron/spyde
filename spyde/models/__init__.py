@@ -21,12 +21,16 @@ from .infer import (
     calibrate,
     detect,
     detect_batch,
+    enable_mps_cpu_fallback,
     load_model,
+    mps_batch_allowed,
 )
 from .registry import (
     available_models,
     default_model_id,
+    demote_cached_models_to_cpu,
     ensure_local,
+    get_cpu_model,
     get_model,
     is_cached,
     list_models,
@@ -43,10 +47,18 @@ __all__ = [
     "auto_bg_sigma",
     "bg_sigma_from_peak_size",
     "get_model",
+    "get_cpu_model",
     "list_models",
     "available_models",
     "default_model_id",
     "ensure_local",
     "is_cached",
     "refresh_remote_registry",
+    # Apple-MPS neural-batch gates (used by find_vectors_neural / orchestrate).
+    # These are referenced as ``models.<name>`` and MUST be exported here — an
+    # unexported name AttributeErrors only on Mac (where dev_is_mps is True), so
+    # a Windows/CUDA dev box never surfaces the miss.
+    "mps_batch_allowed",
+    "enable_mps_cpu_fallback",
+    "demote_cached_models_to_cpu",
 ]

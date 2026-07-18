@@ -236,16 +236,17 @@ def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
     activation set on the device simultaneously.
 
     MAC (Apple-MPS) SAFETY — the crash-avoidance layer:
-      - The BATCH runs on MPS ONLY if ``models.mps_batch_allowed()`` (i.e. the
-        user set SPYDE_NEURAL_MPS_BATCH=1 after validating MPS). By DEFAULT on Mac
-        the batch device is forced to CPU here (the shipped, non-crashing default);
-        the single-frame preview still uses MPS elsewhere.
-      - When MPS batch IS enabled, the forward is serialised process-wide by
-        ``_mps_forward_lock`` (one Metal forward at a time — fix 3) and
-        SPYDE_FV_GPU_CONC=1 is expected (set on Mac in the worker/main env).
-      - If a GPU-worker process was seen to die mid-run (Metal abort), the session
-        flips the neural lane to CPU (see ``neural_gpu_demoted`` / orchestrate's
-        worker-death retry — fix 4) and ``_gpu_task_allowed`` returns CPU here."""
+      - The BATCH runs on MPS by DEFAULT (``models.mps_batch_allowed()`` is True on
+        Mac unless SPYDE_NEURAL_MPS_BATCH=0); orchestrate pins the whole neural run
+        to a SINGLE worker process (``_mps_neural_lane``) so only one Metal context
+        is ever live — the concurrent-context abort can't happen. Set
+        SPYDE_NEURAL_MPS_BATCH=0 to force the CPU batch instead.
+      - The forward is additionally serialised process-wide by ``_mps_forward_lock``
+        (one Metal forward at a time — fix 3) and SPYDE_FV_GPU_CONC=1 (set on Mac in
+        the worker/main env).
+      - If the single GPU-worker process still dies mid-run (Metal abort), the
+        session flips the neural lane to CPU (see ``neural_gpu_demoted`` /
+        orchestrate's worker-death retry — fix 4) and the run COMPLETES on CPU."""
     from spyde import models
     from spyde.actions.find_vectors import MAX_PEAKS, _with_raw_intensity
     from spyde.actions.find_vectors.gpu_runtime import _gpu_slots, _gpu_task_allowed
@@ -262,16 +263,15 @@ def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
                    and _gpu_task_allowed(default_mode=NEURAL_GPU_LANE_DEFAULT)
                    and not _neural_gpu_demoted())
 
-    # MAC BATCH GATE (fix 7): if the resolved device is MPS but the batch is not
-    # allowed to use MPS (the safe DEFAULT on Mac), run the BATCH on CPU — still
-    # the fast batched detect_batch path, just on the CPU device. Only the
-    # multi-worker batch is the crash surface; the single-frame preview keeps MPS
-    # elsewhere. This is the ONE place SPYDE_NEURAL_MPS_BATCH gates the batch.
+    # MAC BATCH GATE (fix 7): the batch runs on MPS by default; this only fires
+    # when a user set the SPYDE_NEURAL_MPS_BATCH=0 CPU escape hatch. Then run the
+    # BATCH on CPU — still the fast batched detect_batch path, just on the CPU
+    # device. This is the ONE place SPYDE_NEURAL_MPS_BATCH gates the batch.
     dev_is_mps = getattr(device, "type", str(device)) == "mps"
     force_cpu_batch = False
     if dev_is_mps and not models.mps_batch_allowed():
-        log.info("[find_vectors] Mac neural BATCH forced to CPU (SPYDE_NEURAL_MPS_"
-                 "BATCH unset); MPS kept for single-frame preview")
+        log.info("[find_vectors] Mac neural BATCH forced to CPU "
+                 "(SPYDE_NEURAL_MPS_BATCH=0); MPS kept for single-frame preview")
         # Use a SEPARATE CPU model (never move the cached MPS model in-place — the
         # single-frame preview shares that cache object and must keep MPS).
         model, device = models.get_cpu_model(model_id)
