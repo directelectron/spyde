@@ -22,32 +22,11 @@ Phase 2 consumes the FULL spec:
 """
 from __future__ import annotations
 
-import inspect
 import logging
 
 import numpy as np
 
 log = logging.getLogger(__name__)
-
-
-def _accepts_kw(method, name: str) -> bool:
-    """True if ``method`` accepts a keyword arg ``name`` (or has ``**kwargs``).
-
-    Some anyplotlib styling kwargs are newer than the pinned release: ``linewidth``
-    on the circle/rectangle EDIT widgets and ``tint`` on ``add_layer`` only exist in
-    a newer anyplotlib than ``anyplotlib>=0.3.0`` resolves to. Passing an unsupported
-    kwarg raises ``TypeError``, which the annotation/overlay loops swallow — so the
-    WHOLE widget/layer silently vanished (the shape widgets and tinted overlays just
-    didn't appear). Gate the optional kwarg on this check instead: the widget/layer
-    is still created, just without the newer styling, and the styling flows
-    automatically the moment anyplotlib ships the parameter. If the signature can't
-    be introspected, assume supported (preserves behaviour on exotic callables)."""
-    try:
-        params = inspect.signature(method).parameters
-    except (TypeError, ValueError):
-        return True
-    return name in params or any(
-        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 # ── snapshot-map helpers ──────────────────────────────────────────────────────
@@ -292,12 +271,9 @@ def _add_annotation_widget(p2, kind, conv):
             return None
         color = _first_color(conv.get("edgecolors"), "#00e5ff")
         lw = _scalar0(conv.get("linewidths"))
-        # linewidth only when this anyplotlib's circle widget supports it (else the
-        # widget would silently fail to be created); it flows once anyplotlib ships it.
-        lw_kw = ({"linewidth": float(lw) if lw else 2.0}
-                 if _accepts_kw(p2.add_circle_widget, "linewidth") else {})
         return p2.add_circle_widget(cx=cx, cy=cy, r=float(r), color=color,
-                                    show_handles=True, **lw_kw)
+                                    linewidth=float(lw) if lw else 2.0,
+                                    show_handles=True)
     if kind == "rect":
         w = _scalar0(conv.get("widths"))
         hh = _scalar0(conv.get("heights"))
@@ -305,12 +281,11 @@ def _add_annotation_widget(p2, kind, conv):
             return None
         color = _first_color(conv.get("edgecolors"), "#00e5ff")
         lw = _scalar0(conv.get("linewidths"))
-        lw_kw = ({"linewidth": float(lw) if lw else 2.0}
-                 if _accepts_kw(p2.add_rectangle_widget, "linewidth") else {})
         # spec rect offset is the CENTER; widget x/y is the TOP-LEFT.
         return p2.add_rectangle_widget(x=cx - float(w) / 2.0, y=cy - float(hh) / 2.0,
                                        w=float(w), h=float(hh), color=color,
-                                       show_handles=True, **lw_kw)
+                                       linewidth=float(lw) if lw else 2.0,
+                                       show_handles=True)
     if kind == "arrow":
         u = _scalar0(conv.get("U"))
         v = _scalar0(conv.get("V"))
@@ -525,11 +500,7 @@ def _render_panel(ax, panel, snap_map, *, interactive=False, wiring=None):
             # cmap+tint combination). The base layer never tints — it's the
             # panel's imshow, not an add_layer.
             add_kw = {}
-            # tint only when this anyplotlib's add_layer supports it — otherwise the
-            # tinted overlay would silently drop out entirely (TypeError swallowed
-            # below); degrade to the plain-cmap overlay, which still renders. The
-            # tint flows automatically once anyplotlib ships the parameter.
-            if getattr(layer, "tint", None) and _accepts_kw(p2.add_layer, "tint"):
+            if getattr(layer, "tint", None):
                 add_kw["tint"] = str(layer.tint)
             p2.add_layer(arr, cmap=_resolve_cmap(layer.cmap),
                          alpha=float(layer.alpha), clim=clim,
@@ -614,11 +585,9 @@ def _add_zoom_region_widget(base_plot, panel, inset):
         return None
     try:
         x, y, w, h = coords.data_region_to_index(region, panel.axes)
-        lw_kw = ({"linewidth": 2}
-                 if _accepts_kw(base_plot.add_rectangle_widget, "linewidth") else {})
         return base_plot.add_rectangle_widget(
             x=float(x), y=float(y), w=float(w), h=float(h),
-            color=_CALLOUT_MARKER_COLOR, show_handles=True, **lw_kw)
+            color=_CALLOUT_MARKER_COLOR, linewidth=2, show_handles=True)
     except Exception as e:
         log.debug("zoom region widget failed: %s", e)
         return None

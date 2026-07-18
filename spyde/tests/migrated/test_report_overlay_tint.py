@@ -252,21 +252,12 @@ class TestBackendRender:
         return spec, snap
 
     def test_tint_reaches_layer_state(self, window):
-        import pytest
         from spyde.actions.report.figure_builder import build_cell_figure
         spec, snap = self._spec_with_overlay("#f38ba8")
         fig, _fig_id, _html = build_cell_figure(spec, snap)
         plot = next(iter(fig._plots_map.values()))
         layers = plot._state.get("layers", [])
         assert len(layers) == 1
-        # A per-layer tint (RGBA LUT with an alpha ramp) needs anyplotlib's
-        # add_layer(tint=), newer than the pinned release. Where it's unsupported the
-        # overlay still renders (plain cmap, no "tint" key), so assert the tint leg
-        # only when the layer state carries it — it lights up once anyplotlib ships
-        # tint, with no change here.
-        if "tint" not in layers[0]:
-            pytest.skip("anyplotlib add_layer has no tint= in the pinned release; "
-                        "overlay renders untinted")
         assert layers[0]["tint"] == "#f38ba8"
         # A tint LUT is RGBA (256×4) with the alpha ramping 0→255.
         lut = layers[0]["colormap_data"]
@@ -280,8 +271,7 @@ class TestBackendRender:
         plot = next(iter(fig._plots_map.values()))
         layers = plot._state.get("layers", [])
         assert len(layers) == 1
-        # No tint requested → untinted (a pre-tint anyplotlib omits the key entirely).
-        assert layers[0].get("tint") is None
+        assert layers[0]["tint"] is None
         # Named-cmap LUT stays RGB (256×3) — the legacy shape.
         assert len(layers[0]["colormap_data"][0]) == 3
 
