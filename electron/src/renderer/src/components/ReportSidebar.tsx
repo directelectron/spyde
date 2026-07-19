@@ -25,7 +25,9 @@ import { ReportCell } from './ReportCell'
 import { ReportFigureCell } from './ReportFigureCell'
 import { ReportImageCell } from './ReportImageCell'
 import { ReportSplitCell } from './ReportSplitCell'
+import { SlideNotesEditor } from './SlideNotesEditor'
 import { GUIDES } from '@guides/index'
+import type { ReportCell as ReportCellType } from '../kernel/protocol'
 
 const MIN_W = 300
 const MAX_W = 800
@@ -99,6 +101,46 @@ function hasImageFiles(dt: DataTransfer): boolean {
   return false
 }
 
+/** One slide's worth of cells, carrying each cell's ORIGINAL flat index (so the
+ *  slide-native list still drives the index-keyed drop/reorder machinery
+ *  unchanged) plus the slide's start cell (index 0 of the group — where the
+ *  per-slide attributes live). The renderer mirror of `ReportDoc.slides()`. */
+interface SlideGroup {
+  /** 0-based slide number (for the "Slide N" label). */
+  n: number
+  /** The slide's cells, each paired with its index in the flat `cells` array. */
+  items: Array<{ cell: ReportCellType; index: number }>
+  /** The slide's FIRST cell — where slide_kind / slide_style / notes are carried
+   *  and to which the per-slide verbs are addressed. */
+  first: ReportCellType
+}
+
+/** Group the flat cell list into slides by `slide_break`, mirroring
+ *  `ReportDoc.slides()` (a break STARTS a new slide; the first cell always begins
+ *  slide 0). Each cell keeps its ORIGINAL flat index. */
+function groupSlides(cells: ReportCellType[]): SlideGroup[] {
+  const groups: SlideGroup[] = []
+  cells.forEach((cell, index) => {
+    if (cell.slide_break && groups.length) {
+      groups.push({ n: groups.length, items: [{ cell, index }], first: cell })
+    } else if (!groups.length) {
+      groups.push({ n: 0, items: [{ cell, index }], first: cell })
+    } else {
+      groups[groups.length - 1].items.push({ cell, index })
+    }
+  })
+  return groups
+}
+
+// The three background presets a slide can carry (slide_style). '' == the
+// standard dark stage ("Default"); the labels + swatch colours are shown in the
+// per-slide header's Background picker.
+const SLIDE_STYLES: Array<{ value: '' | 'plain' | 'accent'; label: string; swatch: string }> = [
+  { value: '', label: 'Default', swatch: '#1e1e2e' },
+  { value: 'plain', label: 'Plain', swatch: '#0e0e16' },
+  { value: 'accent', label: 'Accent', swatch: '#89b4fa' },
+]
+
 export function ReportSidebar() {
   const { state, sendAction } = useSpyDE()
   // A closed report is surfaced by the backend as `open:false` (NOT by dropping
@@ -140,6 +182,19 @@ export function ReportSidebar() {
   const dragCellId = useRef<string | null>(null)
   const [dragCell, setDragCell] = useState<string | null>(null)
   const [reorderBefore, setReorderBefore] = useState<string | null>(null)
+  // Presentation slide-native chrome state:
+  //  • which slides' Speaker-notes editors are expanded (keyed by the slide's
+  //    first-cell id — the per-slide attribute owner),
+  //  • which slide's Background picker popover is open (first-cell id or null),
+  //  • whether the "+ Add slide" starter menu is open.
+  const [openNotes, setOpenNotes] = useState<Set<string>>(new Set())
+  const [bgPickerFor, setBgPickerFor] = useState<string | null>(null)
+  const [addSlideMenu, setAddSlideMenu] = useState(false)
+  const addSlideRef = useRef<HTMLDivElement>(null)
+  // Whole-slide reorder DnD (drag a slide's grip onto another slide group).
+  const dragSlideN = useRef<number | null>(null)
+  const [dragSlide, setDragSlide] = useState<number | null>(null)
+  const [slideDropOn, setSlideDropOn] = useState<number | null>(null)
   // A deferred vectors-figure drop awaiting the embed choice (viewer vs image).
   const [vxChoice, setVxChoice] = useState<{
     source_window_id: number
@@ -398,6 +453,21 @@ export function ReportSidebar() {
     if (exportNoteTimer.current) clearTimeout(exportNoteTimer.current)
   }, [])
 
+  // Close the "+ Add slide" starter menu on outside click / Escape.
+  useEffect(() => {
+    if (!addSlideMenu) return
+    const onDown = (e: MouseEvent) => {
+      if (!addSlideRef.current?.contains(e.target as Node)) setAddSlideMenu(false)
+    }
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setAddSlideMenu(false) }
+    window.addEventListener('mousedown', onDown)
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('mousedown', onDown)
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [addSlideMenu])
+
   const commitTitle = () => {
     setTitleEditing(false)
     const t = titleDraft.trim()
@@ -412,6 +482,53 @@ export function ReportSidebar() {
   // report and a presentation.
   const addSplitCell = () =>
     sendAction('report_add_split_cell', {})
+
+  // ── Presentation: "+ Add slide" starter layouts ──────────────────────────────
+  // Each starter appends a cell (at the end) with slide_break=true so it opens a
+  // NEW slide. A leading break on cell 0 is a harmless no-op (the first cell is
+  // always slide 0), so the FIRST slide added to an empty deck still reads as
+  // Slide 1. Three starters: a blank text slide, a split (text + figure) slide,
+  // and a title slide (a text cell pre-marked slide_kind='title').
+  const addTextSlide = () => {
+    setAddSlideMenu(false)
+    sendAction('report_add_cell', { cell_type: 'markdown', source: '', html: '', slide_break: true })
+  }
+  const addSplitSlide = () => {
+    setAddSlideMenu(false)
+    sendAction('report_add_split_cell', { slide_break: true })
+  }
+  const addTitleSlide = () => {
+    setAddSlideMenu(false)
+    sendAction('report_add_cell', {
+      cell_type: 'markdown',
+      source: '# Title\n\nSubtitle',
+      html: '<h1>Title</h1><p>Subtitle</p>',
+      slide_break: true,
+      slide_kind: 'title',
+    })
+  }
+
+  // ── Per-slide header verbs (addressed to the slide's FIRST cell) ──────────────
+  const toggleSlideTitle = (firstCellId: string) =>
+    sendAction('report_set_slide_kind', { cell_id: firstCellId })
+  const setSlideStyle = (firstCellId: string, style: '' | 'plain' | 'accent') => {
+    sendAction('report_set_slide_style', { cell_id: firstCellId, slide_style: style })
+    setBgPickerFor(null)
+  }
+  const setSlideNotes = (firstCellId: string, notes: string) =>
+    sendAction('report_set_slide_notes', { cell_id: firstCellId, notes })
+  const toggleNotesEditor = (firstCellId: string) =>
+    setOpenNotes(prev => {
+      const next = new Set(prev)
+      if (next.has(firstCellId)) next.delete(firstCellId)
+      else next.add(firstCellId)
+      return next
+    })
+  // Reorder a WHOLE slide (drag the slide's grip). from/to are slide positions.
+  const moveSlide = (from: number, to: number) => {
+    if (from === to) return
+    sendAction('report_move_slide', { from, to })
+  }
 
   // ── Add an image (photo) cell — shared by drop / paste / browse ────────────
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -568,6 +685,49 @@ export function ReportSidebar() {
     dropBefore: reorderBefore === cellId,
   })
 
+  // ── Whole-slide reorder wiring (HTML5 DnD, presentation only) ──────────────
+  // ONLY the slide's GRIP is draggable (never the whole group), so a slide drag
+  // never collides with a CELL reorder or with text selection/editing inside the
+  // slide's cells. The slide GROUP is the drop TARGET: dropping a dragged grip
+  // onto another group moves the WHOLE slide (report_move_slide {from, to} — the
+  // block reorder). Slide numbers (`n`) ARE the from/to positions. The drop
+  // handlers no-op unless a SLIDE (not a cell) is the thing being dragged
+  // (`dragSlideN.current != null`), so a cell drop onto a group falls through to
+  // the body/cell handlers untouched.
+  const makeSlideGripProps = (n: number) => ({
+    draggable: true,
+    onDragStart: (e: React.DragEvent) => {
+      dragSlideN.current = n
+      setDragSlide(n)
+      e.dataTransfer.effectAllowed = 'move'
+      e.dataTransfer.setData('application/x-spyde-report-slide', String(n))
+      e.stopPropagation()
+    },
+    onDragEnd: () => {
+      dragSlideN.current = null
+      setDragSlide(null)
+      setSlideDropOn(null)
+    },
+  })
+  const makeSlideDropProps = (n: number) => ({
+    onDragOver: (e: React.DragEvent) => {
+      if (dragSlideN.current == null) return   // a cell drag → let it fall through
+      e.preventDefault()
+      e.stopPropagation()
+      setSlideDropOn(n)
+    },
+    onDrop: (e: React.DragEvent) => {
+      if (dragSlideN.current == null) return   // a cell drag → let it fall through
+      e.preventDefault()
+      e.stopPropagation()
+      const from = dragSlideN.current
+      dragSlideN.current = null
+      setDragSlide(null)
+      setSlideDropOn(null)
+      if (from !== n) moveSlide(from, n)
+    },
+  })
+
   // The compact File menu — the single collapse point for New / Open / Save /
   // Export. Shared by the empty-state and open-report chrome so both offer the
   // same New Report / New Presentation / New from guide / Open entries.
@@ -655,6 +815,50 @@ export function ReportSidebar() {
       </div>
     )
   }
+
+  // Render ONE cell (by its flat index `i`) — the between-cell insert indicator +
+  // the right cell component by type. Shared by the flat (report) list and the
+  // slide-grouped (presentation) list so both render cells identically.
+  const renderCell = (cell: ReportCellType, i: number) => (
+    <div key={cell.id} data-report-cell="1" style={{ position: 'relative' }}>
+      {dropIndex === i && <div style={styles.insertLine} data-testid={`report-insert-${i}`} />}
+      {cell.cell_type === 'figure'
+        ? <ReportFigureCell
+            cell={cell}
+            index={i}
+            onRemove={() => sendAction('report_remove_cell', { cell_id: cell.id })}
+            dragProps={makeDragProps(cell.id, i)}
+            reorderActive={dragCell != null}
+          />
+        : cell.cell_type === 'image'
+        ? <ReportImageCell
+            cell={cell}
+            index={i}
+            onRemove={() => sendAction('report_remove_cell', { cell_id: cell.id })}
+            dragProps={makeDragProps(cell.id, i)}
+          />
+        : cell.cell_type === 'split'
+        ? <ReportSplitCell
+            cell={cell}
+            index={i}
+            onRemove={() => sendAction('report_remove_cell', { cell_id: cell.id })}
+            dragProps={makeDragProps(cell.id, i)}
+            reorderActive={dragCell != null}
+          />
+        : <ReportCell
+            cell={cell}
+            index={i}
+            onUpdate={(source, html) => sendAction('report_update_cell', { cell_id: cell.id, source, html })}
+            onRemove={() => sendAction('report_remove_cell', { cell_id: cell.id })}
+            dragProps={makeDragProps(cell.id, i)}
+          />}
+    </div>
+  )
+
+  // The slide-grouped body (presentation only): each slide is a bordered, labeled
+  // group with a per-slide header (Slide N + Title-slide toggle + Background
+  // picker + drag grip) and a collapsible Speaker-notes area below.
+  const slides = isPresentation ? groupSlides(cells) : []
 
   return (
     <div ref={dockRef} style={{ ...styles.dock, width }} data-testid="report-sidebar">
@@ -773,71 +977,178 @@ export function ReportSidebar() {
       >
         {cells.length === 0 && (
           <div style={styles.dropHint} data-testid="report-drop-hint">
-            Drag a figure window here, or add a text / split cell below.
+            {isPresentation
+              ? 'Empty deck — add your first slide below, or drag a figure window here.'
+              : 'Drag a figure window here, or add a text / split cell below.'}
           </div>
         )}
 
-        {cells.map((cell, i) => {
-          return (
-          <div key={cell.id} data-report-cell="1" style={{ position: 'relative' }}>
-            {dropIndex === i && <div style={styles.insertLine} data-testid={`report-insert-${i}`} />}
-            {cell.cell_type === 'figure'
-              ? <ReportFigureCell
-                  cell={cell}
-                  index={i}
-                  onRemove={() => sendAction('report_remove_cell', { cell_id: cell.id })}
-                  dragProps={makeDragProps(cell.id, i)}
-                  reorderActive={dragCell != null}
-                />
-              : cell.cell_type === 'image'
-              ? <ReportImageCell
-                  cell={cell}
-                  index={i}
-                  onRemove={() => sendAction('report_remove_cell', { cell_id: cell.id })}
-                  dragProps={makeDragProps(cell.id, i)}
-                />
-              : cell.cell_type === 'split'
-              ? <ReportSplitCell
-                  cell={cell}
-                  index={i}
-                  onRemove={() => sendAction('report_remove_cell', { cell_id: cell.id })}
-                  dragProps={makeDragProps(cell.id, i)}
-                  reorderActive={dragCell != null}
-                />
-              : <ReportCell
-                  cell={cell}
-                  index={i}
-                  onUpdate={(source, html) => sendAction('report_update_cell', { cell_id: cell.id, source, html })}
-                  onRemove={() => sendAction('report_remove_cell', { cell_id: cell.id })}
-                  dragProps={makeDragProps(cell.id, i)}
-                />}
-          </div>
-          )
-        })}
+        {/* PRESENTATION: a sequence of labeled SLIDE groups, each with a
+            per-slide header (Slide N + Title toggle + Background) and a
+            collapsible Speaker-notes area below. REPORT: a flat cell list. */}
+        {isPresentation
+          ? slides.map((slide) => {
+              const firstId = slide.first.id
+              const meta = slideMetaOf(slide.first)
+              const isTitle = meta.kind === 'title'
+              const notes = String(slide.first.notes ?? '')
+              const hasNotes = notes.trim().length > 0
+              const notesOpen = openNotes.has(firstId)
+              return (
+                <div
+                  key={firstId}
+                  data-testid={`report-slide-${slide.n}`}
+                  data-slide-kind={isTitle ? 'title' : 'content'}
+                  data-slide-style={meta.style || 'default'}
+                  style={{
+                    ...styles.slideGroup,
+                    ...(dragSlide === slide.n ? styles.slideGroupDragging : {}),
+                    ...(slideDropOn === slide.n && dragSlide !== slide.n
+                      ? styles.slideGroupDropOn : {}),
+                  }}
+                  {...makeSlideDropProps(slide.n)}
+                >
+                  {/* Per-slide header: grip + Slide N + Title toggle + Background. */}
+                  <div style={styles.slideHeader} data-testid={`report-slide-header-${slide.n}`}>
+                    <span
+                      style={styles.slideGrip}
+                      title="Drag to reorder this slide"
+                      data-testid={`report-slide-grip-${slide.n}`}
+                      {...makeSlideGripProps(slide.n)}
+                    >⠿</span>
+                    <span style={styles.slideLabel}>Slide {slide.n + 1}</span>
+                    <div style={{ flex: 1 }} />
+                    {/* Title-slide toggle — a clear labeled pill (not a cryptic T). */}
+                    <button
+                      data-testid={`report-slide-title-toggle-${slide.n}`}
+                      data-active={isTitle ? '1' : '0'}
+                      style={isTitle ? styles.slidePillActive : styles.slidePill}
+                      title="Make this a big centered TITLE / SECTION slide"
+                      onClick={() => toggleSlideTitle(firstId)}
+                    >
+                      <span style={styles.slideCheck}>{isTitle ? '☑' : '☐'}</span> Title slide
+                    </button>
+                    {/* Background picker — a small labeled dropdown (Default / Plain /
+                        Accent) with colour swatches, NOT the cryptic ◐/○/● cycle. */}
+                    <div style={styles.bgPickerWrap}>
+                      <button
+                        data-testid={`report-slide-bg-toggle-${slide.n}`}
+                        style={styles.slidePill}
+                        title="Slide background"
+                        aria-haspopup="menu"
+                        aria-expanded={bgPickerFor === firstId}
+                        onClick={() => setBgPickerFor(v => (v === firstId ? null : firstId))}
+                      >
+                        <span style={{ ...styles.bgSwatch, background: swatchOf(meta.style) }} />
+                        {labelOf(meta.style)} ▾
+                      </button>
+                      {bgPickerFor === firstId && (
+                        <div
+                          style={styles.bgMenu}
+                          data-testid={`report-slide-bg-menu-${slide.n}`}
+                          role="menu"
+                        >
+                          {SLIDE_STYLES.map(s => (
+                            <button
+                              key={s.value || 'default'}
+                              data-testid={`report-slide-bg-${slide.n}-${s.value || 'default'}`}
+                              role="menuitemradio"
+                              aria-checked={meta.style === s.value}
+                              style={styles.bgMenuItem}
+                              onMouseEnter={(e) => { e.currentTarget.style.background = '#313244' }}
+                              onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent' }}
+                              onClick={() => setSlideStyle(firstId, s.value)}
+                            >
+                              <span style={{ ...styles.bgSwatch, background: s.swatch }} />
+                              {s.label}
+                              {meta.style === s.value && <span style={styles.bgCheck}>✓</span>}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* The slide's cell(s). */}
+                  <div style={styles.slideCells}>
+                    {slide.items.map(({ cell, index }) => renderCell(cell, index))}
+                  </div>
+
+                  {/* Speaker notes — BELOW the slide, collapsible, presenter-only. */}
+                  <div style={styles.notesRow}>
+                    <button
+                      data-testid={`report-slide-notes-toggle-${slide.n}`}
+                      data-has-notes={hasNotes ? '1' : '0'}
+                      style={notesOpen || hasNotes ? styles.notesToggleActive : styles.notesToggle}
+                      title="Speaker notes for this slide (presenter view only)"
+                      onClick={() => toggleNotesEditor(firstId)}
+                    >
+                      📝 Speaker notes
+                      {hasNotes && <span style={styles.notesDot} title="This slide has notes" />}
+                      <span style={styles.notesChevron}>{notesOpen ? '▾' : '▸'}</span>
+                    </button>
+                  </div>
+                  {notesOpen && (
+                    <SlideNotesEditor
+                      cellId={firstId}
+                      notes={notes}
+                      onCommit={(v) => setSlideNotes(firstId, v)}
+                      onClose={() => toggleNotesEditor(firstId)}
+                    />
+                  )}
+                </div>
+              )
+            })
+          : cells.map((cell, i) => renderCell(cell, i))}
+
         {/* Trailing insert indicator (drop AFTER the last cell). */}
         {dropIndex === cells.length && cells.length > 0 && (
           <div style={styles.insertLine} data-testid={`report-insert-${cells.length}`} />
         )}
 
-        <div style={styles.addRow}>
-          <button
-            data-testid="report-add-text"
-            style={styles.addBtn}
-            onClick={addTextCell}
-          >+ Add text cell</button>
-          <button
-            data-testid="report-add-split"
-            style={styles.addBtn}
-            title="Add a split block — text on one side, a figure/photo on the other"
-            onClick={addSplitCell}
-          >+ Add split block</button>
-          <button
-            data-testid="report-add-image"
-            style={styles.addBtn}
-            title="Add a photo (or drop / paste one anywhere in this panel)"
-            onClick={() => fileInputRef.current?.click()}
-          >+ Add image</button>
-        </div>
+        {/* Add row: slide-native for a presentation, cell-native for a report. */}
+        {isPresentation ? (
+          <div style={styles.addRow}>
+            <div ref={addSlideRef} style={styles.addSlideWrap}>
+              <button
+                data-testid="report-add-slide"
+                style={styles.addSlideBtn}
+                title="Add a new slide"
+                aria-haspopup="menu"
+                aria-expanded={addSlideMenu}
+                onClick={() => setAddSlideMenu(v => !v)}
+              >+ Add slide ▾</button>
+              {addSlideMenu && (
+                <div style={styles.addSlideMenu} data-testid="report-add-slide-menu" role="menu">
+                  <MenuItem testid="add-slide-text" label="Text slide" onClick={addTextSlide} />
+                  <MenuItem testid="add-slide-split" label="Split slide (text + figure)"
+                    onClick={addSplitSlide} />
+                  <MenuItem testid="add-slide-title" label="Title slide" onClick={addTitleSlide} />
+                </div>
+              )}
+            </div>
+          </div>
+        ) : (
+          <div style={styles.addRow}>
+            <button
+              data-testid="report-add-text"
+              style={styles.addBtn}
+              onClick={addTextCell}
+            >+ Add text cell</button>
+            <button
+              data-testid="report-add-split"
+              style={styles.addBtn}
+              title="Add a split block — text on one side, a figure/photo on the other"
+              onClick={addSplitCell}
+            >+ Add split block</button>
+            <button
+              data-testid="report-add-image"
+              style={styles.addBtn}
+              title="Add a photo (or drop / paste one anywhere in this panel)"
+              onClick={() => fileInputRef.current?.click()}
+            >+ Add image</button>
+          </div>
+        )}
         <input
           ref={fileInputRef}
           data-testid="report-image-input"
@@ -849,6 +1160,29 @@ export function ReportSidebar() {
       </div>
     </div>
   )
+}
+
+// The per-slide presentation attributes read off the slide's FIRST cell (the
+// renderer mirror of model.slide_meta — kept local to avoid a PresentMode import
+// cycle). kind '' (content) | 'title'; style '' (default) | 'plain' | 'accent'.
+function slideMetaOf(first: ReportCellType | undefined):
+  { kind: '' | 'title'; style: '' | 'plain' | 'accent' } {
+  const k = (first?.slide_kind ?? '').trim().toLowerCase()
+  const s = (first?.slide_style ?? '').trim().toLowerCase()
+  return {
+    kind: k === 'title' ? 'title' : '',
+    style: s === 'plain' || s === 'accent' ? (s as 'plain' | 'accent') : '',
+  }
+}
+
+/** The human label for a slide background style. */
+function labelOf(style: '' | 'plain' | 'accent'): string {
+  return (SLIDE_STYLES.find(s => s.value === style) ?? SLIDE_STYLES[0]).label
+}
+
+/** The swatch colour for a slide background style. */
+function swatchOf(style: '' | 'plain' | 'accent'): string {
+  return (SLIDE_STYLES.find(s => s.value === style) ?? SLIDE_STYLES[0]).swatch
 }
 
 // One File-menu / submenu row (hover-highlight, dock-palette style).
@@ -1016,5 +1350,91 @@ const styles: Record<string, React.CSSProperties> = {
     flex: 1, minWidth: 0,
     background: '#1e1e2e', color: '#a6adc8', border: '1px dashed #45475a',
     borderRadius: 6, padding: '7px', fontSize: 12, cursor: 'pointer',
+  },
+  // ── Slide-native (presentation) chrome ───────────────────────────────────────
+  slideGroup: {
+    position: 'relative',
+    border: '1px solid #313244', borderRadius: 10,
+    background: '#1e1e2e', padding: '2px 6px 6px',
+    marginBottom: 12,
+  },
+  slideGroupDragging: { opacity: 0.4 },
+  slideGroupDropOn: { borderColor: '#89b4fa', boxShadow: '0 0 0 1px #89b4fa inset' },
+  slideHeader: {
+    display: 'flex', alignItems: 'center', gap: 6,
+    padding: '5px 2px 6px', borderBottom: '1px solid #313244',
+    marginBottom: 6,
+  },
+  slideGrip: {
+    cursor: 'grab', color: '#585b70', fontSize: 13, userSelect: 'none',
+    lineHeight: 1,
+  },
+  slideLabel: {
+    fontSize: 11, fontWeight: 700, letterSpacing: 0.4, color: '#89b4fa',
+    textTransform: 'uppercase',
+  },
+  slidePill: {
+    display: 'inline-flex', alignItems: 'center', gap: 4,
+    background: '#181825', color: '#a6adc8', border: '1px solid #313244',
+    borderRadius: 6, padding: '2px 7px', fontSize: 10.5, cursor: 'pointer',
+    whiteSpace: 'nowrap',
+  },
+  slidePillActive: {
+    display: 'inline-flex', alignItems: 'center', gap: 4,
+    background: 'rgba(137,180,250,0.16)', color: '#89b4fa',
+    border: '1px solid #89b4fa',
+    borderRadius: 6, padding: '2px 7px', fontSize: 10.5, cursor: 'pointer',
+    fontWeight: 600, whiteSpace: 'nowrap',
+  },
+  slideCheck: { fontSize: 11, lineHeight: 1 },
+  bgPickerWrap: { position: 'relative', display: 'inline-flex' },
+  bgSwatch: {
+    width: 10, height: 10, borderRadius: 3, border: '1px solid #45475a',
+    display: 'inline-block', flexShrink: 0,
+  },
+  bgMenu: {
+    position: 'absolute', top: '100%', right: 0, marginTop: 4, zIndex: 20,
+    minWidth: 128, background: '#1e1e2e', border: '1px solid #45475a',
+    borderRadius: 6, padding: 4, display: 'flex', flexDirection: 'column', gap: 1,
+    boxShadow: '0 6px 22px rgba(0,0,0,0.5)',
+  },
+  bgMenuItem: {
+    display: 'flex', alignItems: 'center', gap: 7,
+    background: 'transparent', border: 'none', color: '#cdd6f4', cursor: 'pointer',
+    textAlign: 'left', padding: '5px 8px', fontSize: 11.5, borderRadius: 4,
+    width: '100%', whiteSpace: 'nowrap',
+  },
+  bgCheck: { marginLeft: 'auto', color: '#89b4fa', fontSize: 11 },
+  slideCells: {},
+  notesRow: { marginTop: 6 },
+  notesToggle: {
+    display: 'inline-flex', alignItems: 'center', gap: 6,
+    background: 'transparent', color: '#6c7086',
+    border: '1px dashed #313244', borderRadius: 6,
+    padding: '3px 9px', fontSize: 11, cursor: 'pointer',
+  },
+  notesToggleActive: {
+    display: 'inline-flex', alignItems: 'center', gap: 6,
+    background: 'rgba(137,180,250,0.06)', color: '#89b4fa',
+    border: '1px solid rgba(137,180,250,0.35)', borderRadius: 6,
+    padding: '3px 9px', fontSize: 11, cursor: 'pointer',
+  },
+  notesDot: {
+    width: 6, height: 6, borderRadius: '50%', background: '#89b4fa',
+    flexShrink: 0,
+  },
+  notesChevron: { fontSize: 9, color: '#6c7086' },
+  addSlideWrap: { position: 'relative', flex: 1, display: 'flex' },
+  addSlideBtn: {
+    flex: 1, minWidth: 0,
+    background: 'rgba(137,180,250,0.10)', color: '#89b4fa',
+    border: '1px dashed #89b4fa', borderRadius: 6, padding: '8px',
+    fontSize: 12.5, fontWeight: 600, cursor: 'pointer',
+  },
+  addSlideMenu: {
+    position: 'absolute', bottom: '100%', left: 0, right: 0, marginBottom: 4,
+    zIndex: 20, background: '#1e1e2e', border: '1px solid #45475a',
+    borderRadius: 6, padding: 4, display: 'flex', flexDirection: 'column', gap: 1,
+    boxShadow: '0 -6px 22px rgba(0,0,0,0.5)',
   },
 }
