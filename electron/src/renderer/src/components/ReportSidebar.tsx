@@ -808,9 +808,53 @@ export function ReportSidebar() {
           {fileMenu}
         </div>
         <div style={styles.emptyState} data-testid="report-empty">
-          No document open. Open the <b>File ▾</b> menu to start a
-          <b> New Report</b>, a <b>New Presentation</b>, seed a deck
-          {' '}<b>from a guide</b>, or <b>Open</b> an existing .spyde-report.
+          <div style={styles.emptyLead}>Start a new document</div>
+          <div style={styles.cardGrid}>
+            <NewDocCard
+              testid="report-new-report-card"
+              icon={<ReportGlyph />}
+              title="Report"
+              desc="A scrolling article — text, figures, and combined panels."
+              onClick={() => doNew('report')}
+            />
+            <NewDocCard
+              testid="report-new-presentation-card"
+              icon={<PresentationGlyph />}
+              title="Presentation"
+              desc="A slide deck — present live figures full-screen."
+              onClick={() => doNew('presentation')}
+            />
+          </div>
+
+          {/* Seed a presentation from a built-in guide (one slide per step). */}
+          {GUIDES.length > 0 && (
+            <div style={styles.emptySection}>
+              <div style={styles.emptySectionLabel}>…or seed a presentation from a guide</div>
+              <div style={styles.guideChips}>
+                {GUIDES.map(g => (
+                  <button
+                    key={g.id}
+                    data-testid={`report-empty-from-guide-${g.id}`}
+                    style={styles.guideChip}
+                    title={g.summary}
+                    onClick={() => newFromGuide(g.id)}
+                    onMouseEnter={(e) => { e.currentTarget.style.background = '#313244' }}
+                    onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent' }}
+                  >{g.title}</button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div style={styles.emptyOpenRow}>
+            <button
+              data-testid="report-empty-open"
+              style={styles.emptyOpenBtn}
+              onClick={doOpen}
+              onMouseEnter={(e) => { e.currentTarget.style.background = '#313244' }}
+              onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent' }}
+            >Open an existing .spyde-report…</button>
+          </div>
         </div>
       </div>
     )
@@ -1185,6 +1229,56 @@ function swatchOf(style: '' | 'plain' | 'accent'): string {
   return (SLIDE_STYLES.find(s => s.value === style) ?? SLIDE_STYLES[0]).swatch
 }
 
+// A big pick-a-document-type card shown in the empty state (New Report / New
+// Presentation). Icon + title + one-line description; accent border on hover.
+function NewDocCard({ testid, icon, title, desc, onClick }: {
+  testid: string; icon: React.ReactNode; title: string; desc: string
+  onClick: () => void
+}) {
+  const [hover, setHover] = useState(false)
+  return (
+    <button
+      data-testid={testid}
+      style={hover ? { ...styles.docCard, ...styles.docCardHover } : styles.docCard}
+      onClick={onClick}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+    >
+      <div style={hover ? { ...styles.docCardIcon, ...styles.docCardIconHover } : styles.docCardIcon}>
+        {icon}
+      </div>
+      <div style={styles.docCardTitle}>{title}</div>
+      <div style={styles.docCardDesc}>{desc}</div>
+    </button>
+  )
+}
+
+// Inline SVG glyphs for the two document-type cards (currentColor → theme-aware).
+const cardSvg = {
+  width: 26, height: 26, viewBox: '0 0 24 24', fill: 'none',
+  stroke: 'currentColor', strokeWidth: 1.7,
+  strokeLinecap: 'round' as const, strokeLinejoin: 'round' as const,
+}
+// A page with text lines — a scrolling report.
+function ReportGlyph() {
+  return (
+    <svg {...cardSvg} aria-hidden>
+      <rect x="4" y="3" width="16" height="18" rx="2" />
+      <path d="M8 8h8M8 12h8M8 16h5" />
+    </svg>
+  )
+}
+// A framed slide with a play triangle — a presentation deck.
+function PresentationGlyph() {
+  return (
+    <svg {...cardSvg} aria-hidden>
+      <rect x="3" y="4" width="18" height="12" rx="1.5" />
+      <path d="M12 16v3M9 21h6" />
+      <path d="M10.5 8.5l3.5 2-3.5 2z" fill="currentColor" stroke="none" />
+    </svg>
+  )
+}
+
 // One File-menu / submenu row (hover-highlight, dock-palette style).
 function MenuItem({ testid, label, onClick, disabled }: {
   testid: string; label: string; onClick: () => void; disabled?: boolean
@@ -1333,7 +1427,52 @@ const styles: Record<string, React.CSSProperties> = {
     padding: '10px 10px 24px',
   },
   emptyState: {
-    padding: 20, fontSize: 12.5, color: '#7f849c', lineHeight: 1.6,
+    padding: 16, fontSize: 12.5, color: '#7f849c', lineHeight: 1.6,
+    overflowY: 'auto',
+  },
+  emptyLead: {
+    fontSize: 11, fontWeight: 700, letterSpacing: 0.6, textTransform: 'uppercase',
+    color: '#6c7086', margin: '2px 2px 10px',
+  },
+  cardGrid: {
+    display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10,
+  },
+  docCard: {
+    display: 'flex', flexDirection: 'column', alignItems: 'flex-start',
+    gap: 6, textAlign: 'left', cursor: 'pointer',
+    background: '#181825', border: '1px solid #313244', borderRadius: 10,
+    padding: '14px 12px', color: '#cdd6f4',
+    transition: 'border-color 120ms ease, background 120ms ease, transform 120ms ease',
+  },
+  docCardHover: {
+    background: '#1e1e2e', borderColor: '#89b4fa', transform: 'translateY(-1px)',
+  },
+  docCardIcon: {
+    display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+    width: 40, height: 40, borderRadius: 9,
+    background: 'rgba(137,180,250,0.10)', color: '#89b4fa',
+    transition: 'background 120ms ease',
+  },
+  docCardIconHover: { background: 'rgba(137,180,250,0.20)' },
+  docCardTitle: { fontSize: 14, fontWeight: 700, color: '#cdd6f4', marginTop: 2 },
+  docCardDesc: { fontSize: 11, color: '#7f849c', lineHeight: 1.4 },
+  emptySection: { marginTop: 18 },
+  emptySectionLabel: {
+    fontSize: 11, fontWeight: 700, letterSpacing: 0.6, textTransform: 'uppercase',
+    color: '#6c7086', margin: '0 2px 8px',
+  },
+  guideChips: { display: 'flex', flexWrap: 'wrap', gap: 6 },
+  guideChip: {
+    background: 'transparent', border: '1px solid #313244', borderRadius: 999,
+    color: '#bac2de', cursor: 'pointer', fontSize: 11.5, padding: '4px 11px',
+    transition: 'background 100ms ease',
+  },
+  emptyOpenRow: { marginTop: 20, borderTop: '1px solid #26263a', paddingTop: 12 },
+  emptyOpenBtn: {
+    width: '100%', textAlign: 'left', background: 'transparent',
+    border: '1px solid #313244', borderRadius: 8, color: '#bac2de',
+    cursor: 'pointer', fontSize: 12, padding: '8px 11px',
+    transition: 'background 100ms ease',
   },
   dropHint: {
     padding: '20px 12px', fontSize: 12.5, color: '#585b70',
