@@ -99,6 +99,7 @@ STAGED_HANDLERS: dict[str, str] = {
     "report_update_cell":      "spyde.actions.report.handlers.report_update_cell",
     "report_remove_cell":      "spyde.actions.report.handlers.report_remove_cell",
     "report_move_cell":        "spyde.actions.report.handlers.report_move_cell",
+    "report_move_slide":       "spyde.actions.report.handlers.report_move_slide",
     "report_set_caption":      "spyde.actions.report.handlers.report_set_caption",
     "report_set_title":        "spyde.actions.report.handlers.report_set_title",
     # Report Builder Phase 6 — Present mode (slide grouping + go-live excursion)

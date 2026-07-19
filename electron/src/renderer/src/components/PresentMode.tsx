@@ -44,6 +44,7 @@ import React, { useEffect, useMemo } from 'react'
 import { useSpyDE } from '../kernel/SpyDEContext'
 import { renderMarkdown } from '../kernel/markdown'
 import { SeamlessFigureFrame } from './ReportFigureCell'
+import { SlideOverview } from './SlideOverview'
 import type { ReportCell } from '../kernel/protocol'
 
 // Present-mode markdown sizing: the `.spyde-md` base stylesheet (injected by
@@ -167,9 +168,9 @@ function groupColumns(cells: ReportCell[]): ColumnRow[] {
 // The per-slide presentation attributes — read off the slide's FIRST cell (the
 // renderer mirror of `model.slide_meta`). kind '' (content) / 'title' (a
 // big-centered title slide); style '' (default) / 'plain' / 'accent'.
-type SlideKind = '' | 'title'
-type SlideStyle = '' | 'plain' | 'accent'
-function slideMeta(cells: ReportCell[]): { kind: SlideKind; style: SlideStyle } {
+export type SlideKind = '' | 'title'
+export type SlideStyle = '' | 'plain' | 'accent'
+export function slideMeta(cells: ReportCell[]): { kind: SlideKind; style: SlideStyle } {
   const first = cells[0]
   const k = (first?.slide_kind ?? '').trim().toLowerCase()
   const s = (first?.slide_style ?? '').trim().toLowerCase()
@@ -181,9 +182,13 @@ function slideMeta(cells: ReportCell[]): { kind: SlideKind; style: SlideStyle } 
 
 /** A slide's SPEAKER NOTES — read off its FIRST cell (the renderer mirror of
  *  `model.slide_notes`). '' when the slide has no notes. */
-function slideNotes(cells: ReportCell[]): string {
+export function slideNotes(cells: ReportCell[]): string {
   return (cells[0]?.notes ?? '').toString()
 }
+
+/** Group the mirrored report cells into slides by `slide_break` — re-exported so
+ *  the Slide Overview grid uses the SAME grouping as Present mode. */
+export { groupSlides }
 
 /** mm:ss for an elapsed-seconds count (the presenter timer). */
 function fmtElapsed(sec: number): string {
@@ -194,7 +199,7 @@ function fmtElapsed(sec: number): string {
 }
 
 export function PresentMode({ initialSlide, onSlideChange, onExit, onLaunchLive }: Props) {
-  const { state, iframeRefs, replayState } = useSpyDE()
+  const { state, iframeRefs, replayState, sendAction } = useSpyDE()
   const report = state.report && state.report.open ? state.report : null
   const cells = report?.cells ?? []
 
@@ -210,6 +215,12 @@ export function PresentMode({ initialSlide, onSlideChange, onExit, onLaunchLive 
   // presenter dashboard (current + next + notes + timer). Same window, toggled
   // with `S` or the header button. Advancing keeps both in sync (shared index).
   const [presenter, setPresenter] = React.useState(false)
+
+  // Slide overview grid: a thumbnail grid of ALL slides (the presenter's "jump
+  // around" + drag-reorder tool). Toggled with `O` or the header grid button.
+  // While it's open, present-mode navigation keys are suppressed (the overview
+  // owns the keyboard) so arrows/Esc don't leak through to the deck behind it.
+  const [overview, setOverview] = React.useState(false)
 
   // Report every change up so App can persist it for re-entry.
   useEffect(() => { onSlideChange(index) }, [index, onSlideChange])
@@ -229,6 +240,12 @@ export function PresentMode({ initialSlide, onSlideChange, onExit, onLaunchLive 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const k = e.key
+      // While the overview grid is open it OWNS the keyboard (it has its own
+      // capture-phase Esc → close). Only `O` (toggle back off) reaches here.
+      if (overview) {
+        if (k === 'o' || k === 'O') { e.preventDefault(); setOverview(false) }
+        return
+      }
       if (k === 'ArrowRight' || k === 'PageDown' || k === ' ' || k === 'Spacebar') {
         e.preventDefault(); go(index + 1)
       } else if (k === 'ArrowLeft' || k === 'PageUp') {
@@ -236,11 +253,14 @@ export function PresentMode({ initialSlide, onSlideChange, onExit, onLaunchLive 
       } else if (k === 'Home') { e.preventDefault(); go(0) }
       else if (k === 'End') { e.preventDefault(); go(count - 1) }
       else if (k === 's' || k === 'S') { e.preventDefault(); setPresenter(p => !p) }
+      else if (k === 'o' || k === 'O' || k === 'g' || k === 'G') {
+        e.preventDefault(); setOverview(true)
+      }
       else if (k === 'Escape') { e.preventDefault(); onExit() }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [index, count, go, onExit])
+  }, [index, count, go, onExit, overview])
 
   if (report == null || count === 0) {
     // Nothing to present — surface a tiny message instead of a blank overlay.
@@ -283,8 +303,43 @@ export function PresentMode({ initialSlide, onSlideChange, onExit, onLaunchLive 
         />
       )}
 
-      {/* Top-right controls: presenter-view toggle + exit. */}
+      {/* Slide overview grid: thumbnails of every slide. Click a thumbnail to
+          jump (and close); drag one onto another to reorder the WHOLE slide via
+          `report_move_slide`. Thumbnails are STATIC (baked PNGs), not live
+          iframes — the live embeds stay in the audience stack behind this. */}
+      {overview && (
+        <SlideOverview
+          slides={slides}
+          index={index}
+          onJump={(i) => { go(i); setOverview(false) }}
+          onClose={() => setOverview(false)}
+          onMoveSlide={(from, to) => {
+            sendAction('report_move_slide', { from, to })
+            // Keep the CURRENT slide highlighted at its new position: if the
+            // moved slide is the one we're on, follow it; otherwise adjust for
+            // the block shift so the same slide stays "current".
+            setIndex(cur => {
+              if (cur === from) return to
+              // A slide moved out of `from` and into `to`: recompute where our
+              // current index lands after the splice.
+              let n = cur
+              if (from < cur) n -= 1          // our slide shifted down by the removal
+              if (to <= n) n += 1             // …and up by the insertion at/<= it
+              return Math.max(0, Math.min(n, Math.max(0, count - 1)))
+            })
+          }}
+        />
+      )}
+
+      {/* Top-right controls: overview grid + presenter-view toggle + exit. */}
       <div style={styles.topBar}>
+        <button
+          data-testid="present-overview-toggle"
+          data-active={overview ? '1' : '0'}
+          style={{ ...styles.iconBtn, ...(overview ? styles.iconBtnActive : {}) }}
+          title="Slide overview: jump around + reorder slides (O)"
+          onClick={() => setOverview(o => !o)}
+        >▦</button>
         <button
           data-testid="present-presenter-toggle"
           data-active={presenter ? '1' : '0'}
@@ -458,7 +513,7 @@ function PresenterView({ slides, index, count, onGo }: {
  *  image cells show their photo. It deliberately does NOT mount the live figure
  *  iframe (that lives in the hidden audience stack) so the presenter panel is cheap
  *  and never duplicates/steals an embed. `dimmed` softens the NEXT preview. */
-function SlidePreview({ cells, dimmed }: { cells: ReportCell[]; dimmed?: boolean }) {
+export function SlidePreview({ cells, dimmed }: { cells: ReportCell[]; dimmed?: boolean }) {
   const meta = React.useMemo(() => slideMeta(cells), [cells])
   const isTitle = meta.kind === 'title'
   const styleBg =

@@ -31,8 +31,8 @@ from spyde.actions.report.figure_builder import (
 )
 from spyde.actions.report.model import (
     IMAGE_EXTS, Cell, FigureSpec, LayerSpec, PanelSpec, ReportDoc, SignalRef,
-    bake_fallback_png, bake_line_fallback_png, new_cell_id, read_report,
-    write_report,
+    bake_fallback_png, bake_line_fallback_png, move_slide, new_cell_id,
+    read_report, write_report,
 )
 
 log = logging.getLogger(__name__)
@@ -2132,6 +2132,38 @@ def report_move_cell(session, plot, payload) -> None:
     cell = mgr.doc.cells.pop(cur)
     idx = max(0, min(idx, len(mgr.doc.cells)))
     mgr.doc.cells.insert(idx, cell)
+    mgr.dirty = True
+    mgr.emit_state()
+
+
+def report_move_slide(session, plot, payload) -> None:
+    """Reorder a WHOLE SLIDE (the Slide Overview grid's drag-reorder).
+
+    ``{from: <slide index>, to: <slide index>}`` extracts slide ``from``'s entire
+    contiguous cell-run and re-inserts it at slide POSITION ``to`` in
+    ``doc.cells``, preserving the slide GROUPING (see
+    :func:`spyde.actions.report.model.move_slide` for the slide_break invariant it
+    keeps correct). Out-of-range / no-op indices leave the deck unchanged."""
+    mgr = _manager(session)
+    if not mgr.open:
+        return
+    frm = payload.get("from")
+    to = payload.get("to")
+    if frm is None or to is None:
+        return
+    try:
+        frm, to = int(frm), int(to)
+    except (TypeError, ValueError):
+        return
+    old_cells = mgr.doc.cells
+    new_cells = move_slide(old_cells, frm, to)
+    # Genuine no-op (out-of-range / frm==to): move_slide returns the SAME Cell
+    # objects in the SAME order — compare by identity so we don't mark dirty or
+    # emit a redundant state for a move that changed nothing.
+    if len(new_cells) == len(old_cells) and all(
+            a is b for a, b in zip(new_cells, old_cells)):
+        return
+    mgr.doc.cells = new_cells
     mgr.dirty = True
     mgr.emit_state()
 

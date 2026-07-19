@@ -781,6 +781,74 @@ def slide_notes(cells: "list[Cell]") -> str:
     return str(getattr(first, "notes", "") or "")
 
 
+def move_slide(cells: "list[Cell]", frm: int, to: int) -> "list[Cell]":
+    """Reorder the flat ``cells`` list by moving WHOLE SLIDES (the block reorder
+    behind ``report_move_slide``).
+
+    A slide is a contiguous RUN of cells (see :meth:`ReportDoc.slides`): the run
+    STARTS at a cell with ``slide_break=True`` and accumulates until the next
+    break. ``move_slide`` extracts the whole cell-run for slide ``frm`` and
+    re-inserts it so that, in the new order, it lands at slide POSITION ``to``.
+
+    Returns a NEW list of the SAME Cell objects reordered (the cells themselves
+    are mutated only to fix ``slide_break`` — see the invariant below); the input
+    list is not modified. Out-of-range ``frm``/``to`` (or a no-op ``frm == to``)
+    return a copy of ``cells`` unchanged.
+
+    SLIDE-BREAK INVARIANT (kept correct across the move so ``slides()`` regroups
+    into the SAME slides, just reordered):
+
+    * ``slides()`` groups by ``slide_break`` but treats a leading break on cell 0
+      as a no-op — the FIRST slide begins at cell 0 regardless. So after a move
+      the deck could group WRONG unless we fix the two boundary cells:
+      - The cell that becomes the NEW FIRST cell (index 0) does not NEED a
+        ``slide_break`` (harmless if it has one), but the slide that USED to be
+        first, once displaced, MUST gain ``slide_break=True`` on its first cell
+        so it stays a distinct slide instead of merging into whatever precedes it.
+      - Symmetrically, the moved slide's own first cell MUST carry
+        ``slide_break=True`` unless it lands at index 0 (where it's the implicit
+        first slide). We SET it on every non-index-0 slide-start so the grouping
+        is unambiguous regardless of the source deck's leading-break state.
+    * We therefore normalise ALL slide starts after the splice: every slide's
+      first cell gets ``slide_break=True`` EXCEPT the slide at index 0 (whose
+      leading break, if any, we leave untouched — it's a harmless no-op). This is
+      idempotent and preserves the exact slide GROUPING while making the flags
+      internally consistent."""
+    # Group into slide blocks (list-of-lists), preserving object identity.
+    blocks: list[list] = []
+    for c in cells:
+        if getattr(c, "slide_break", False) and blocks:
+            blocks.append([c])
+        elif not blocks:
+            blocks.append([c])
+        else:
+            blocks[-1].append(c)
+
+    n = len(blocks)
+    if n == 0:
+        return list(cells)
+    if not (0 <= frm < n) or not (0 <= to < n) or frm == to:
+        return list(cells)
+
+    # Splice the moved block out, then re-insert at the target slide position.
+    moved = blocks.pop(frm)
+    # After the pop, indices at/after `frm` shifted down by one; `to` is the
+    # DESIRED final slide position, so insert directly at `to` (clamped).
+    to = max(0, min(to, len(blocks)))
+    blocks.insert(to, moved)
+
+    # Flatten and normalise slide-break flags so grouping stays exact.
+    out: list = []
+    for bi, block in enumerate(blocks):
+        for ci, c in enumerate(block):
+            if ci == 0:
+                # First cell of each slide: MUST be a break unless it's the very
+                # first slide (index 0), where a leading break is a no-op anyway.
+                c.slide_break = bi != 0
+            out.append(c)
+    return out
+
+
 # ── time / yaml helpers ───────────────────────────────────────────────────────
 
 
