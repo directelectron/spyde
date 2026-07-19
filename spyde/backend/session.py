@@ -133,9 +133,15 @@ class Session(
         self._plot_worker.start()
 
         # Settings
-        self._settings_path = os.path.join(
-            os.path.expanduser("~"), ".spyde", "settings.json"
+        # SPYDE_SETTINGS_DIR lets tests (e2e in particular — Electron itself
+        # refuses to launch if USERPROFILE/HOME is redirected to a scratch dir,
+        # so overriding the whole-process home isn't viable there) point the
+        # settings.json file at a throwaway directory without touching the
+        # real user's ~/.spyde. Unset in normal use.
+        settings_dir = os.environ.get("SPYDE_SETTINGS_DIR") or os.path.join(
+            os.path.expanduser("~"), ".spyde"
         )
+        self._settings_path = os.path.join(settings_dir, "settings.json")
         self._settings: dict[str, Any] = self._load_settings()
         # Restore the persisted recent-files list (capped to match _add_recent).
         try:
@@ -638,6 +644,26 @@ class Session(
     def get_recent_files(self) -> list[str]:
         return list(self._recent_files[:20])
 
+    # ── First-run welcome tour ───────────────────────────────────────────────────
+
+    @property
+    def first_run(self) -> bool:
+        """True until the welcome tour has been opened/dismissed once. Mirrors
+        the ``tutorial_seen`` settings.json key: absent (never set) => first run."""
+        return not bool(self._settings.get("tutorial_seen", False))
+
+    def mark_tutorial_seen(self) -> None:
+        """Persist that the welcome tour has been shown, so it never auto-opens
+        again. Called by the renderer the moment the welcome tour is opened
+        (see App.tsx) — idempotent, safe to call more than once."""
+        if self._settings.get("tutorial_seen") is True:
+            return
+        self._settings["tutorial_seen"] = True
+        try:
+            self._save_settings()
+        except Exception as e:
+            log.debug("saving tutorial_seen setting failed: %s", e)
+
     # ── Shutdown ───────────────────────────────────────────────────────────────
 
     def shutdown(self) -> None:
@@ -682,3 +708,19 @@ class Session(
 def dispatch_set_update_channel(session: Session, plot, payload: dict) -> None:
     """Renderer's channel radio (stable/beta) -> persist to settings.json."""
     session.set_update_channel(str(payload.get("channel", "stable")))
+
+
+def get_first_run(session: Session, plot, payload: dict) -> None:
+    """Staged handler: report whether the welcome tour has been seen yet.
+
+    Payload-less request/response, mirroring get_gpu_status — the renderer
+    calls this once on boot and emits `mark_tutorial_seen` when it opens the
+    welcome tour so it never auto-shows again. Emits `first_run_result`.
+    """
+    emit({"type": "first_run_result", "first_run": session.first_run})
+
+
+def dispatch_mark_tutorial_seen(session: Session, plot, payload: dict) -> None:
+    """Renderer opened (or dismissed) the welcome tour -> persist tutorial_seen
+    so it never auto-opens again. Always available (not gated)."""
+    session.mark_tutorial_seen()

@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react'
-import { SpyDEProvider } from './kernel/SpyDEContext'
+import { SpyDEProvider, useSpyDE } from './kernel/SpyDEContext'
 import { MDIArea } from './components/MDIArea'
 import { PlotControlDock } from './components/PlotControlDock'
 import { ReportSidebar } from './components/ReportSidebar'
@@ -16,6 +16,7 @@ import { UpdateCard } from './components/UpdateCard'
 import { MenuBar } from './components/MenuBar'
 import { DownloadToasts } from './components/DownloadToasts'
 import { PresentGate } from './components/PresentGate'
+import { FirstRunGate } from './components/FirstRunGate'
 import { GUIDES, getGuide, type Guide } from '@guides/index'
 
 export function App() {
@@ -73,6 +74,10 @@ export function App() {
       <UpdateGate />
       <GpuStatusGate />
       <GpuHelpGate />
+      {/* First-run welcome walkthrough (docs overhaul Phase 4): auto-opens the
+          "First Steps" tour exactly once, tracked by the tutorial_seen settings
+          flag. Always re-launchable afterwards from Help → First Steps. */}
+      <FirstRunGate onAutoOpen={(g) => setTour((cur) => cur ?? g)} />
     </SpyDEProvider>
   )
 }

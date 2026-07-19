@@ -583,6 +583,7 @@ export interface WizardEventMessage extends MsgBase {
     | 'cod_results'
     | 'cod_cif_ready'
     | 'gpu_status_result'
+    | 'first_run_result'
 }
 
 // ── MDI image layering (overlay) ────────────────────────────────────────────

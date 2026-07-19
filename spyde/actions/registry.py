@@ -86,6 +86,8 @@ STAGED_HANDLERS: dict[str, str] = {
     "set_debug_flag":      "spyde.backend.debug_flags.set_debug_flag",
     "get_gpu_status":      "spyde.actions.gpu_status.get_gpu_status",
     "set_update_channel":  "spyde.backend.session.dispatch_set_update_channel",
+    "get_first_run":       "spyde.backend.session.get_first_run",
+    "mark_tutorial_seen":  "spyde.backend.session.dispatch_mark_tutorial_seen",
     # Report Builder (spyde/actions/report/) — the report sidebar's staged actions.
     "report_new":              "spyde.actions.report.handlers.report_new",
     "report_open":             "spyde.actions.report.handlers.report_open",
