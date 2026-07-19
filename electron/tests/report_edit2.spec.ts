@@ -20,7 +20,13 @@
  *     reliably land on a tiny widget handle. Event JSON shapes copied from the
  *     migrated unit tests (_dispatch_up / _dispatch_panel_swap).
  *   - Palette buttons, layout presets, color swatches, the sidebar resize handle,
- *     and per-panel ⟳ are REAL DOM interactions.
+ *     and per-panel ⟳ are REAL DOM interactions. Annotation STYLE controls live
+ *     in the floating AnnotationPopover now (slim-bar redesign): the spec opens
+ *     it by re-dispatching the widget pointer_up as the spyde:figure_event
+ *     CustomEvent (widget id from report_state's ann_widgets), then drives the
+ *     popover's controls (same testids the retired dock rows had). Panel chips
+ *     render only on MULTI-panel figures; a single-panel figure auto-targets
+ *     its only panel.
  *   - Panel dispatch ids (for the swap) are resolved from _spyde_test_widgets
  *     (each widget carries its panel plot's dispatch id as `panel_id`); we plant
  *     one annotation per panel to make both panels carry a widget in edit mode.
@@ -139,7 +145,7 @@ async function cellFigure(page: any, cellId: string): Promise<{
   }, cellId)
 }
 
-/** Open the figure cell's edit dock (✎ toggle). Idempotent on the toggle. */
+/** Open the figure cell's edit bar (✎ toggle). Idempotent on the toggle. */
 async function openEdit(page: any): Promise<{ cellId: string; figId: string }> {
   const cellId = await figCellId(page)
   const figCell = page.locator(`[data-testid="report-figcell-${cellId}"]`)
@@ -153,21 +159,82 @@ async function openEdit(page: any): Promise<{ cellId: string; figId: string }> {
   return { cellId, figId }
 }
 
-/** Close the edit dock (toggle ✎ off) if open. */
+/** Close the edit bar (toggle ✎ off) if open. Re-mounts the hover chrome first
+ *  (bubbling mouseover — a rebuild/layout shift can have unhovered the cell,
+ *  unmounting the chrome and the toggle with it). */
 async function closeEdit(page: any, cellId: string) {
   if (await page.getByTestId(`figcell-edit-${cellId}`).count()) {
+    await page.locator(`[data-testid="report-figcell-${cellId}"]`)
+      .dispatchEvent('mouseover', { bubbles: true })
     await page.getByTestId(`report-figcell-edit-toggle-${cellId}`).click()
     await expect(page.getByTestId(`figcell-edit-${cellId}`)).toHaveCount(0, { timeout: 10_000 })
   }
 }
 
-/** Select a panel via its dock chip (panel index 0-based → letter chip). */
+/**
+ * Select a panel via its slim-bar letter chip (MULTI-panel figures only — a
+ * single-panel figure renders no chips and auto-targets its only panel). The
+ * old `figcell-panel-<id>` dock block is gone; the selection's observable is
+ * the panel refresh button (`figcell-panel-refresh-<id>`) the bar shows for
+ * the active panel.
+ */
 async function selectPanelChip(page: any, panelSpecId: string) {
   const chip = page.locator(`[data-testid="figcell-chip-${panelSpecId}"]`).first()
   await expect(chip).toBeVisible({ timeout: 10_000 })
   await chip.click()
-  await expect(page.locator(`[data-testid="figcell-panel-${panelSpecId}"]`))
+  await expect(page.getByTestId(`figcell-panel-refresh-${panelSpecId}`))
     .toBeVisible({ timeout: 10_000 })
+}
+
+/** Annotation count of a panel from the authoritative report doc. */
+async function panelAnnCount(page: any, cellId: string, panelId: string): Promise<number> {
+  const s = await cellFigure(page, cellId)
+  return s?.panels.find(p => p.id === panelId)?.annotations.length ?? 0
+}
+
+/** Widget id for (panelId, index) from the edit-mode ann_widgets map shipped
+ *  on the report_state figure cell (authoritative; populated by the
+ *  interactive rebuild). Null until the post-rebuild state arrives. */
+async function annWidgetId(page: any, cellId: string, panelId: string,
+                           index: number): Promise<string | null> {
+  return await page.evaluate(({ cid, pid, idx }: any) => {
+    const d = (window as any)._spyde_test_report?.()
+    const cell = d?.cells?.find((c: any) => c.id === cid)
+    const m = cell?.ann_widgets ?? {}
+    for (const wid of Object.keys(m)) {
+      const v = m[wid]
+      if (v && v.panel_id === pid && Number(v.index) === idx) return wid
+    }
+    return null
+  }, { cid: cellId, pid: panelId, idx: index })
+}
+
+/**
+ * Open the floating AnnotationPopover for (panelId, index): resolve the live
+ * widget id from report_state's ann_widgets (poll — it arrives with the
+ * post-rebuild state), then re-dispatch the widget pointer_up as the
+ * spyde:figure_event CustomEvent (renderer-only — no backend side effects).
+ * Retries with a re-read figId in case a seamless iframe swap was in flight.
+ */
+async function openAnnPopover(page: any, cellId: string, panelId: string, index = 0) {
+  await expect.poll(async () => await annWidgetId(page, cellId, panelId, index), {
+    timeout: 15_000, message: `ann_widgets has no entry for (${panelId}, ${index})`,
+  }).not.toBeNull()
+  const widgetId = (await annWidgetId(page, cellId, panelId, index))!
+  const popover = page.getByTestId(`figcell-annotation-${panelId}-${index}`)
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const figId = (await reportFigId(page))!
+    await page.evaluate(({ fid, pid, wid }: any) => {
+      window.dispatchEvent(new CustomEvent('spyde:figure_event', {
+        detail: { figId: fid, event: { panel_id: pid, event_type: 'pointer_up', widget_id: wid } },
+      }))
+    }, { fid: figId, pid: panelId, wid: widgetId })
+    try {
+      await expect(popover).toBeVisible({ timeout: 4_000 })
+      return
+    } catch { /* stale figId during a swap — re-read + retry */ }
+  }
+  await expect(popover).toBeVisible({ timeout: 4_000 })
 }
 
 /** A fresh single-panel figure cell in a NEW report. Returns {cellId, figId}. */
@@ -241,14 +308,15 @@ test('1) circle shows resize nodes + a radius resize persists (data units)', asy
   const { cellId } = await makeFigureCell(page)
   await openEdit(page)
 
-  // Select the (only) panel so the panel palette is shown, then add a Circle.
+  // Single-panel figure: the slim bar renders NO chips and auto-targets the
+  // only panel — click "+ Circle" directly.
   const spec0 = await cellFigure(page, cellId)
   const panelId = spec0!.panels[0].id
-  await selectPanelChip(page, panelId)
   await page.getByTestId(`figcell-add-circle-${panelId}`).click()
-  // The circle annotation row appears.
-  await expect(page.locator(`[data-testid^="figcell-annotation-${panelId}-"]`).first())
-    .toBeVisible({ timeout: 10_000 })
+  // The circle annotation lands in the spec (rows are popover-only now).
+  await expect.poll(async () => await panelAnnCount(page, cellId, panelId), {
+    timeout: 10_000, message: '+ Circle did not append a panel annotation',
+  }).toBeGreaterThan(0)
   await page.waitForTimeout(2000)   // rebuilt edit-mode figure paints the widget
 
   // The circle renders as a WIDGET with resize handles ON. Read it.
@@ -306,12 +374,13 @@ test('2) arrow tail reshape: tail moves, head stays fixed', async () => {
   const { cellId } = await makeFigureCell(page)
   await openEdit(page)
 
+  // Single-panel: no chips — "+ Arrow" targets the only panel directly.
   const spec0 = await cellFigure(page, cellId)
   const panelId = spec0!.panels[0].id
-  await selectPanelChip(page, panelId)
   await page.getByTestId(`figcell-add-arrow-${panelId}`).click()
-  await expect(page.locator(`[data-testid^="figcell-annotation-${panelId}-"]`).first())
-    .toBeVisible({ timeout: 10_000 })
+  await expect.poll(async () => await panelAnnCount(page, cellId, panelId), {
+    timeout: 10_000, message: '+ Arrow did not append a panel annotation',
+  }).toBeGreaterThan(0)
   await page.waitForTimeout(2000)
 
   const figId = (await reportFigId(page))!
@@ -404,8 +473,9 @@ test('3) panel swap: two panels exchange grid_pos + rebuild', async () => {
   for (const p of before!.panels) {
     await selectPanelChip(page, p.id)
     await page.getByTestId(`figcell-add-circle-${p.id}`).click()
-    await expect(page.locator(`[data-testid^="figcell-annotation-${p.id}-"]`).first())
-      .toBeVisible({ timeout: 10_000 })
+    await expect.poll(async () => await panelAnnCount(page, cellId, p.id), {
+      timeout: 10_000, message: `+ Circle did not land on panel ${p.id}`,
+    }).toBeGreaterThan(0)
     await page.waitForTimeout(1500)
   }
 
@@ -472,9 +542,10 @@ test('4) layout presets: column → 3×1, grid → 2×2-ish', async () => {
   await page.waitForTimeout(2000)
 
   await openEdit(page)
-  // Figure-level view (the Figure chip) exposes the preset buttons.
+  // Figure scope (the Fig chip) exposes the preset buttons on the slim bar
+  // (the old figcell-figure-edit dock section is gone — the preset row IS the
+  // figure-scope observable now).
   await page.getByTestId(`figcell-chip-figure-${cellId}`).click()
-  await expect(page.getByTestId(`figcell-figure-edit-${cellId}`)).toBeVisible({ timeout: 10_000 })
   const presetRow = page.getByTestId(`figcell-layout-presets-${cellId}`)
   await expect(presetRow).toBeVisible({ timeout: 10_000 })
   await page.screenshot({ path: join(SHOTS, '06-layout-presets-shown.png') })
@@ -513,13 +584,13 @@ test('5) annotation color swatch: persists new color, no figure rebuild (in-plac
   const { cellId } = await makeFigureCell(page)
   await openEdit(page)
 
+  // Single-panel: no chips — add a Circle directly (color lives in `edgecolors`).
   const spec0 = await cellFigure(page, cellId)
   const panelId = spec0!.panels[0].id
-  await selectPanelChip(page, panelId)
-  // Add a Circle (shape kind → color stored in `edgecolors`).
   await page.getByTestId(`figcell-add-circle-${panelId}`).click()
-  await expect(page.locator(`[data-testid="figcell-annotation-${panelId}-0"]`))
-    .toBeVisible({ timeout: 10_000 })
+  await expect.poll(async () => await panelAnnCount(page, cellId, panelId), {
+    timeout: 10_000, message: '+ Circle did not append a panel annotation',
+  }).toBeGreaterThan(0)
   await page.waitForTimeout(2000)
 
   // The figId currently shown — an IN-PLACE color update must NOT change it.
@@ -532,6 +603,12 @@ test('5) annotation color swatch: persists new color, no figure rebuild (in-plac
     return ann ? String(ann.edgecolors ?? ann.color ?? '') : null
   }, cellId)
   console.log('[edit2] annotation color BEFORE =', await colorOf())
+
+  // Annotation STYLE controls live in the floating popover now — open it by
+  // re-dispatching the widget pointer_up as a spyde:figure_event CustomEvent
+  // (widget id resolved from report_state's ann_widgets).
+  await openAnnPopover(page, cellId, panelId, 0)
+  await page.screenshot({ path: join(SHOTS, '09a-annotation-popover-open.png') })
 
   // Change the native color swatch to #00ff00. The debounced React onChange fires
   // repfig_update_annotation. A plain `el.value = …` + dispatch is SWALLOWED by
@@ -710,8 +787,9 @@ test('8) selection outline is unclipped on the bottom-right panel of a 2×2', as
   }
 
   await openEdit(page)
+  // Fig chip → figure scope → the preset row shows on the slim bar.
   await page.getByTestId(`figcell-chip-figure-${cellId}`).click()
-  await expect(page.getByTestId(`figcell-figure-edit-${cellId}`)).toBeVisible({ timeout: 10_000 })
+  await expect(page.getByTestId(`figcell-layout-presets-${cellId}`)).toBeVisible({ timeout: 10_000 })
   await page.getByTestId(`figcell-layout-preset-grid-${cellId}`).click()
   await expect.poll(async () => {
     const s = await cellFigure(page, cellId)
@@ -733,8 +811,9 @@ test('8) selection outline is unclipped on the bottom-right panel of a 2×2', as
   // pointer_down to SELECT it (the outline draws on selection).
   await selectPanelChip(page, brPanel.id)
   await page.getByTestId(`figcell-add-circle-${brPanel.id}`).click()
-  await expect(page.locator(`[data-testid^="figcell-annotation-${brPanel.id}-"]`).first())
-    .toBeVisible({ timeout: 10_000 })
+  await expect.poll(async () => await panelAnnCount(page, cellId, brPanel.id), {
+    timeout: 10_000, message: `+ Circle did not land on panel ${brPanel.id}`,
+  }).toBeGreaterThan(0)
   await page.waitForTimeout(1500)
 
   const figId = (await reportFigId(page))!

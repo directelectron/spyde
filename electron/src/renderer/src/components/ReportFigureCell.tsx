@@ -19,12 +19,20 @@
  *      → the spyde:repfig_compose_options CustomEvent) and, when non-tile options
  *      exist, opens a small anchored popover (Overlay / Callout / Tile right).
  *
- *   2. EDIT toolbar — an "Edit" toggle in the hover chrome opens a compact dock
- *      panel below the figure, driven by cell.figure (the pixel-free FigureSpec):
- *      per-panel layer list (cmap / alpha / visibility / remove), a per-panel
- *      refresh (⟳ → repfig_refresh_panel, re-snapshots ONLY that panel) and
- *      remove, and an annotations list + add palette (Text / Circle / Rect /
- *      Arrow).
+ *   2. EDIT mode — an "✎" toggle in the hover chrome. The backend rebuilds the
+ *      figure with draggable annotation widgets; a SLIM BAR under the figure
+ *      (driven by cell.figure, the pixel-free FigureSpec) carries the panel
+ *      targeting chips (multi-panel only), the add-annotation palette, layout
+ *      presets + gap sliders (figure scope) and the per-layer rows. Annotation
+ *      STYLE editing lives in a floating AnnotationPopover anchored near the
+ *      clicked annotation — the spyde:figure_event CustomEvent (SpyDEContext
+ *      re-dispatches every awi_event) resolves the clicked widget id through
+ *      cell.ann_widgets / the figure-marker id and drives open/close.
+ *
+ * Figure cells reorder like markdown cells: a ⠿ handle in the hover chrome
+ * starts an HTML5 drag (wiring supplied by ReportSidebar's makeDragProps);
+ * while ANY cell reorder is in flight a transparent shield covers the figure
+ * iframe (out-of-process — it would swallow dragover otherwise).
  *
  * Below the figure: an editable caption (click-to-edit → report_set_caption) +
  * hover chrome (Edit toggle, Refresh-ALL-panels-from-live → report_refresh_figure,
@@ -77,11 +85,65 @@ const FULL_RECT = { left: 0, top: 0, width: 1, height: 1 }
 // row or tall column of panels. This is a SANE DEFAULT, not a measured value.
 const PANEL_ASPECT = 4 / 3
 function figureAspectRatio(figure: RepfigSpec | undefined | null): number {
+  // A VIEWER-vectors cell hosts the live 2-panel explorer (navigator | DP): a
+  // wide ~2:1 FIGURE plus a header + mode radio + readout below it. The snapshot
+  // spec is single-panel, so the grid path below would size the box at 16/10
+  // (too tall/narrow → anyplotlib squeezes/clips the DP). Give it a box whose
+  // HEIGHT (= width / aspect) leaves room for the 2:1 figure (≈ width/2) AND the
+  // ~½-width of chrome below it — 3/2 (height ≈ 0.67·width) fits both panels
+  // plus the controls without clipping across the sidebar's width range.
+  if (figure && String(figure.vectors_mode ?? '') !== '' &&
+      String(figure.vectors_mode) !== 'image') {
+    return 3 / 2
+  }
   const layout = figure?.layout
   if (!layout || layout.kind !== 'grid') return 16 / 10
   const rows = Math.max(1, Number(layout.rows) || 1)
   const cols = Math.max(1, Number(layout.cols) || 1)
   return (PANEL_ASPECT * cols) / rows
+}
+
+// Approximate on-screen anchor (fig-box fraction, 0..1) of a PANEL annotation,
+// for positioning its style popover: locate the panel's grid cell, convert the
+// annotation's stored data-coord offset to a fraction of the panel's snapshot
+// axes range (axes.x_axis/y_axis), then apply the typical axes inset within the
+// cell (mpl-style margins — left 0.10 / width 0.84, top 0.06 / height 0.82).
+// Best-effort geometry: the popover only needs to appear NEAR the annotation,
+// not on top of it — anything missing degrades to the cell center, clamped.
+const AX_INSET_X = 0.10, AX_SPAN_X = 0.84
+const AX_INSET_Y = 0.06, AX_SPAN_Y = 0.82
+function panelAnnAnchor(
+  figure: RepfigSpec | undefined | null, panelId: string | null, index: number,
+): { fx: number; fy: number } {
+  const panels = figure?.panels ?? []
+  const panel = panels.find(p => p.id === panelId)
+  if (!panel) return { fx: 0.5, fy: 0.5 }
+  const isGrid = figure?.layout?.kind === 'grid'
+  const rows = isGrid ? Math.max(1, Number(figure?.layout?.rows) || 1) : 1
+  const cols = isGrid ? Math.max(1, Number(figure?.layout?.cols) || 1) : 1
+  const [row, col] = panel.grid_pos ?? [0, 0]
+  const ann = panel.annotations?.[index] as Record<string, unknown> | undefined
+  // The annotation's (first) offset in DATA coordinates → axes fraction.
+  let fxData = 0.5, fyData = 0.5
+  const offs = ann?.offsets
+  if (Array.isArray(offs) && Array.isArray(offs[0])) {
+    const dx = Number(offs[0][0]), dy = Number(offs[0][1])
+    const xs = panel.axes?.x_axis, ys = panel.axes?.y_axis
+    if (Number.isFinite(dx) && xs && xs.length > 1) {
+      const span = xs[xs.length - 1] - xs[0]
+      if (span !== 0) fxData = (dx - xs[0]) / span
+    }
+    if (Number.isFinite(dy) && ys && ys.length > 1) {
+      const span = ys[ys.length - 1] - ys[0]
+      if (span !== 0) fyData = (dy - ys[0]) / span
+    }
+  }
+  fxData = Math.min(1, Math.max(0, fxData))
+  fyData = Math.min(1, Math.max(0, fyData))
+  return {
+    fx: (col + AX_INSET_X + fxData * AX_SPAN_X) / cols,
+    fy: (row + AX_INSET_Y + fyData * AX_SPAN_Y) / rows,
+  }
 }
 
 // Map a cursor fraction (fx, fy) WITHIN a cell rect (0..1 local to that rect)
@@ -98,21 +160,34 @@ function zoneFromLocalFraction(fx: number, fy: number): Zone {
   return 'down'
 }
 
-// Resolve a source window id from a FIGURE_DRAG_MIME or WINDOW_DRAG_MIME drop.
-function sourceWindowIdFromDrop(dt: DataTransfer): number | null {
+// The figure payload of a pill drop: the source window id plus — when the
+// FIGURE_DRAG_MIME payload carries them — the dragged window's shown-figure id
+// and view tag (view:'3d' while its 3-D IPF explorer was up; the placeholder
+// fill forwards these so report_add_figure can snapshot the 3-D scene).
+interface DropFigurePayload { windowId: number; figId?: string; view?: string }
+
+function figurePayloadFromDrop(dt: DataTransfer): DropFigurePayload | null {
   const fig = dt.getData(FIGURE_DRAG_MIME)
   if (fig) {
     try {
-      const { windowId } = JSON.parse(fig) as { windowId?: number }
-      if (typeof windowId === 'number') return windowId
+      const { windowId, figId, view } = JSON.parse(fig) as {
+        windowId?: number; figId?: string; view?: string
+      }
+      if (typeof windowId === 'number') return { windowId, figId, view }
     } catch { /* malformed */ }
   }
   const win = dt.getData(WINDOW_DRAG_MIME)
   if (win) {
     const n = parseInt(win, 10)
-    if (Number.isFinite(n)) return n
+    if (Number.isFinite(n)) return { windowId: n }
   }
   return null
+}
+
+// Resolve just the source window id from a drop (compose paths — a compose
+// always consumes the source's 2-D image, so the view tag is irrelevant there).
+function sourceWindowIdFromDrop(dt: DataTransfer): number | null {
+  return figurePayloadFromDrop(dt)?.windowId ?? null
 }
 
 const DROP_MIMES = [FIGURE_DRAG_MIME, WINDOW_DRAG_MIME]
@@ -134,9 +209,53 @@ interface Props {
   onRemove: () => void
   /** Own index in the cell list (Duplicate → insert at index+1). */
   index: number
+  /** HTML5 DnD reorder wiring supplied by the parent list (same shape as the
+   *  markdown ReportCell's — ReportSidebar.makeDragProps). */
+  dragProps: {
+    onDragStart: (e: React.DragEvent) => void
+    onDragOver: (e: React.DragEvent) => void
+    onDrop: (e: React.DragEvent) => void
+    onDragEnd: () => void
+    dragging: boolean
+    dropBefore: boolean
+  }
+  /** True while ANY cell reorder is in flight — mounts a transparent shield
+   *  over the figure iframe so dragover/drop reach this cell (the out-of-
+   *  process iframe swallows DnD events otherwise). */
+  reorderActive: boolean
 }
 
-export function ReportFigureCell({ cell, onRemove, index }: Props) {
+// The floating popover's target: which annotation (panel or figure scope) and
+// WHERE over the fig box to anchor (fractions of the box, 0..1).
+interface AnnPopoverTarget {
+  kind: 'annotation'
+  scope: 'panel' | 'figure'
+  panelId: string | null
+  index: number
+  fx: number
+  fy: number
+}
+
+// A double-clicked text element (title/axis label/ticks/legend/colorbar label)
+// on the live figure — targets a font-size adjuster instead of an annotation.
+// `panelId` is the anyplotlib DISPATCH id from the event (not necessarily a
+// spec panel id); the backend resolves it.
+type TextSizeTarget =
+  | 'title' | 'x_label' | 'x_ticks' | 'y_label' | 'y_ticks' | 'legend' | 'colorbar_label'
+interface TextSizePopoverTarget {
+  kind: 'text_size'
+  panelId: string | null
+  target: TextSizeTarget
+  fx: number
+  fy: number
+}
+
+// Only one floating popover is shown at a time; the `kind` discriminant picks
+// which one renders (opening one closes the other — both funnel through this
+// single piece of state).
+type PopoverTarget = AnnPopoverTarget | TextSizePopoverTarget
+
+export function ReportFigureCell({ cell, onRemove, index, dragProps, reorderActive }: Props) {
   const { state, iframeRefs, replayState, sendAction, dragKind, requestFigurePng } = useSpyDE()
   const [captionEditing, setCaptionEditing] = useState(false)
   const [captionDraft, setCaptionDraft] = useState(cell.caption ?? '')
@@ -157,6 +276,12 @@ export function ReportFigureCell({ cell, onRemove, index }: Props) {
   const [hoverZone, setHoverZone] = useState<HoverZone | null>(null)
   // A center-drop compose prompt (popover) awaiting / showing options.
   const [prompt, setPrompt] = useState<ComposePrompt | null>(null)
+  // The floating annotation style popover (edit mode; opened by clicking an
+  // annotation in the live figure via the spyde:figure_event subscription).
+  const [popover, setPopover] = useState<PopoverTarget | null>(null)
+  // Root element — the reorder drag image (drag the whole cell, not the tiny
+  // ⠿ glyph the browser would otherwise snapshot).
+  const rootRef = React.useRef<HTMLDivElement>(null)
 
   React.useEffect(() => {
     if (!captionEditing) setCaptionDraft(cell.caption ?? '')
@@ -203,6 +328,101 @@ export function ReportFigureCell({ cell, onRemove, index }: Props) {
   React.useEffect(() => { if (dragKind == null) setHoverZone(null) }, [dragKind])
 
   const fig = state.reportFigures.get(cell.id)
+
+  // The figure-event subscription below must read the CURRENT figId/cell without
+  // re-arming (a rebuild mints a new figId; report_state replaces the cell every
+  // edit) — refs, updated each render, not effect deps.
+  const figIdRef = React.useRef<string | null>(null)
+  figIdRef.current = fig?.figId ?? null
+  const cellRef = React.useRef(cell)
+  cellRef.current = cell
+
+  // Open/close the floating popover from events INSIDE the live figure iframe.
+  // SpyDEContext re-dispatches every awi_event as a spyde:figure_event
+  // CustomEvent. Two independent triggers share this one listener:
+  //
+  //   • Annotation style popover (EDIT MODE ONLY): pointer_up on a widget /
+  //     figure-marker release opens it; pointer_down on the background or an
+  //     empty panel area dismisses it (widget mousedown emits nothing — so
+  //     pointer_up = open, pointer_down = dismiss). cell.ann_widgets (edit mode
+  //     only) maps a live widget id to the spec annotation to edit; figure
+  //     markers match by annotation id.
+  //   • Text-size popover (works IN or OUT of edit mode): a double_click whose
+  //     `target` names a text element (title/x_label/x_ticks/y_label/y_ticks/
+  //     legend/colorbar_label) opens it, anchored at the pointer. A plain
+  //     plot-area double_click (no target) is ignored.
+  //
+  // The listener is always attached (not gated on editOpen) so the text-size
+  // popover works outside edit mode; the annotation branches individually
+  // check editOpen.
+  React.useEffect(() => {
+    if (!editOpen) {
+      setPopover(p => (p?.kind === 'annotation' ? null : p))
+    }
+    const onFigEvent = (ev: Event) => {
+      const d = (ev as CustomEvent).detail as
+        { figId?: string; event?: Record<string, unknown> } | undefined
+      if (!d?.event || d.figId !== figIdRef.current) return
+      const e = d.event
+      const widgetId = typeof e.widget_id === 'string' ? e.widget_id : null
+      const c = cellRef.current
+      if (e.event_type === 'double_click') {
+        // A plain plot-area double_click carries no target — ignore it.
+        if (typeof e.target !== 'string') return
+        const target = e.target as TextSizeTarget
+        setPopover({
+          kind: 'text_size',
+          panelId: typeof e.panel_id === 'string' ? e.panel_id : null,
+          target,
+          fx: typeof e.x === 'number' ? e.x : 0.5,
+          fy: typeof e.y === 'number' ? e.y : 0.5,
+        })
+        return
+      }
+      if (!editOpen) return
+      if (e.event_type === 'pointer_up') {
+        // An annotation edit-widget was released → its style popover.
+        const hit = widgetId != null ? c.ann_widgets?.[widgetId] : undefined
+        if (hit) {
+          const { fx, fy } = panelAnnAnchor(c.figure, hit.panel_id, hit.index)
+          setPopover({ kind: 'annotation', scope: 'panel', panelId: hit.panel_id, index: hit.index, fx, fy })
+          return
+        }
+        // A figure-level marker was released → match the spec annotation by id;
+        // the event's x/y are already figure fractions.
+        if (widgetId == null && e.figure_marker && e.marker_id != null) {
+          const anns = c.figure?.annotations ?? []
+          const idx = anns.findIndex(a => a.id === e.marker_id)
+          if (idx >= 0) {
+            setPopover({
+              kind: 'annotation', scope: 'figure', panelId: null, index: idx,
+              fx: typeof e.x === 'number' ? e.x : 0.5,
+              fy: typeof e.y === 'number' ? e.y : 0.5,
+            })
+          }
+          return
+        }
+        return
+      }
+      // A genuine click on the background or an empty panel area dismisses
+      // (clicks in the iframe never reach the popover's own outside-mousedown).
+      if (e.event_type === 'pointer_down' && widgetId == null &&
+          (e.figure_background || e.img_x != null)) {
+        setPopover(p => (p?.kind === 'annotation' ? null : p))
+      }
+    }
+    const onKey = (ke: KeyboardEvent) => { if (ke.key === 'Escape') setPopover(null) }
+    window.addEventListener('spyde:figure_event', onFigEvent)
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('spyde:figure_event', onFigEvent)
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [editOpen])
+
+  // A figure rebuild (add/remove/reorder annotations, compose, refresh) can
+  // leave the popover pointing at a stale index — close rather than mis-edit.
+  React.useEffect(() => { setPopover(null) }, [cell.figure])
   // CSS-only responsive sizing: figBox is width:100% of the cell (which tracks
   // the sidebar width via ordinary block layout), height held by aspect-ratio
   // derived from the panel grid shape — no JS resize loop on this side. The
@@ -231,8 +451,14 @@ export function ReportFigureCell({ cell, onRemove, index }: Props) {
     e.preventDefault()
     e.stopPropagation()
     setDropHover(false)
-    const src = sourceWindowIdFromDrop(e.dataTransfer)
-    if (src != null) sendAction('report_add_figure', { source_window_id: src, at_cell: cell.id })
+    const src = figurePayloadFromDrop(e.dataTransfer)
+    if (src != null) {
+      sendAction('report_add_figure', {
+        source_window_id: src.windowId, at_cell: cell.id,
+        ...(src.view !== undefined ? { view: src.view } : {}),
+        ...(src.figId !== undefined ? { fig_id: src.figId } : {}),
+      })
+    }
   }
 
   // ── Compose drop zones (live figure cell) ─────────────────────────────────
@@ -424,13 +650,23 @@ export function ReportFigureCell({ cell, onRemove, index }: Props) {
 
   return (
     <div
+      ref={rootRef}
       data-testid={`report-figcell-${cell.id}`}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
-      style={styles.cell}
+      onDragOver={dragProps.onDragOver}
+      onDrop={dragProps.onDrop}
+      onDragEnd={dragProps.onDragEnd}
+      style={{
+        ...styles.cell,
+        ...(dragProps.dragging ? styles.cellDragging : {}),
+        ...(dragProps.dropBefore ? styles.cellDropBefore : {}),
+      }}
     >
-      {/* Hover chrome: Edit toggle + Copy + Duplicate + Refresh-from-live +
-          delete (not on a placeholder). */}
+      {/* Hover chrome: drag handle (reorder) + Edit toggle + Copy + Duplicate +
+          Refresh-from-live + delete (not on a placeholder). Only the ⠿ handle is
+          draggable — the cell root can't be (the figure iframe needs its own
+          pointer gestures), so the handle sets the ROOT as the drag image. */}
       {hover && !cell.placeholder && (
         <CellChrome
           cellId={cell.id}
@@ -441,12 +677,25 @@ export function ReportFigureCell({ cell, onRemove, index }: Props) {
           deleteTestid={`report-figcell-delete-${cell.id}`}
           deleteTitle="Delete figure"
           leading={
-            <button
-              data-testid={`report-figcell-edit-toggle-${cell.id}`}
-              style={editOpen ? styles.chromeBtnActive : styles.chromeBtn}
-              title="Edit figure (layers, annotations)"
-              onClick={toggleEdit}
-            >✎</button>
+            <>
+              <span
+                data-testid={`report-figcell-drag-${cell.id}`}
+                style={styles.dragHandle}
+                title="Drag to reorder"
+                draggable
+                onDragStart={(e) => {
+                  dragProps.onDragStart(e)
+                  if (rootRef.current) e.dataTransfer.setDragImage(rootRef.current, 24, 16)
+                }}
+                onDragEnd={dragProps.onDragEnd}
+              >⠿</span>
+              <button
+                data-testid={`report-figcell-edit-toggle-${cell.id}`}
+                style={editOpen ? styles.chromeBtnActive : styles.chromeBtn}
+                title="Edit figure (layers, annotations)"
+                onClick={toggleEdit}
+              >✎</button>
+            </>
           }
           trailing={
             <button
@@ -514,6 +763,15 @@ export function ReportFigureCell({ cell, onRemove, index }: Props) {
               )}
             </div>
           )}
+          {/* Reorder shield: same iframe-swallows-DnD problem as compose, but
+              for CELL reorder drags — a bare transparent layer (no handlers;
+              dragover/drop bubble to the cell root's dragProps wiring). */}
+          {reorderActive && (
+            <div
+              data-testid={`figcell-reorder-shield-${cell.id}`}
+              style={styles.composeShield}
+            />
+          )}
         </div>
       ) : (
         // Figure cell whose iframe hasn't arrived yet — show the baked PNG if any.
@@ -521,6 +779,36 @@ export function ReportFigureCell({ cell, onRemove, index }: Props) {
           {cell.png
             ? <img src={cell.png} alt={cell.caption ?? ''} style={styles.offlineImg} />
             : <div style={styles.pending} data-testid={`report-figcell-pending-${cell.id}`}>rendering…</div>}
+        </div>
+      )}
+
+      {/* Floating annotation style popover (edit mode only) — the layer mirrors
+          the FIG BOX only (same aspect-ratio trick as figBoxStyle, anchored to
+          the cell top), so the popover's fx/fy anchor within the FIGURE, not
+          the caption/bar below. The layer is click-through; the popover
+          re-enables pointer events on itself. */}
+      {editOpen && isLive && popover?.kind === 'annotation' && cell.figure && (
+        <div style={{ ...styles.popoverLayer, aspectRatio: String(figureAspectRatio(cell.figure)) }}>
+          <AnnotationPopover
+            cell={cell}
+            popover={popover}
+            onClose={() => setPopover(null)}
+            sendAction={sendAction}
+          />
+        </div>
+      )}
+
+      {/* Floating text-size popover — double-click a title/label/ticks/legend/
+          colorbar on the live figure. Works IN or OUT of edit mode (unlike the
+          annotation popover above), so it's gated on isLive only. */}
+      {isLive && popover?.kind === 'text_size' && cell.figure && (
+        <div style={{ ...styles.popoverLayer, aspectRatio: String(figureAspectRatio(cell.figure)) }}>
+          <TextSizePopover
+            cell={cell}
+            popover={popover}
+            onClose={() => setPopover(null)}
+            sendAction={sendAction}
+          />
         </div>
       )}
 
@@ -781,8 +1069,8 @@ const ANNOT_LABEL: Record<string, string> = {
 }
 
 // The accent used as the default annotation color everywhere it's created
-// (PanelEdit.addAnnotation / FigureLevelEdit.addFigAnnotation) — the swatch
-// falls back to this when an existing annotation carries no color at all.
+// (the slim bar's add palette, panel and figure level) — the swatch falls back
+// to this when an existing annotation carries no color at all.
 const ANNOT_COLOR_DEFAULT = '#ff9800'
 
 // A compact native color input, styled to sit inline in an annotation row
@@ -808,13 +1096,122 @@ function ColorSwatch({ value, onChange, testid, title }: {
   )
 }
 
+// One-click preset dots beside the free-pick swatch: white/black for print-
+// friendly figures + the app's marker palette. Hex, lowercase (the active-ring
+// comparison lowercases the stored color).
+const PRESET_COLORS = [
+  '#ffffff', '#000000', '#f38ba8', '#ff9800',
+  '#f9e2af', '#a6e3a1', '#89dceb', '#cba6f7',
+]
+
+// First entry of an array-or-scalar numeric field — annotation specs store
+// linewidths/fontsize either way (add_* kwargs accept both) — with a fallback
+// for missing/non-positive values so the control never shows 0/NaN.
+function scalarOf(val: unknown, fallback: number): number {
+  const v = Array.isArray(val) ? val[0] : val
+  const n = Number(v)
+  return Number.isFinite(n) && n > 0 ? n : fallback
+}
+
+// A tiny labelled number input. Local draft (so partial typing like "1." isn't
+// clobbered by the round-trip), resynced when the upstream value moves; every
+// parseable change commits CLAMPED so the backend never sees an out-of-range
+// width/size.
+function NumBox({ value, min, max, step, testid, label, onCommit }: {
+  value: number
+  min: number
+  max: number
+  step: number
+  testid: string
+  label: string
+  onCommit: (v: number) => void
+}) {
+  const [draft, setDraft] = React.useState(String(value))
+  React.useEffect(() => { setDraft(String(value)) }, [value])
+  return (
+    <span style={styles.numWrap}>
+      <span style={styles.hint}>{label}</span>
+      <input
+        type="number"
+        data-testid={testid}
+        style={styles.numInput}
+        min={min} max={max} step={step}
+        value={draft}
+        onChange={(e) => {
+          setDraft(e.target.value)
+          const v = Number(e.target.value)
+          if (e.target.value !== '' && Number.isFinite(v)) {
+            onCommit(Math.min(max, Math.max(min, v)))
+          }
+        }}
+      />
+    </span>
+  )
+}
+
+// One compact style-control line shared by every annotation editor: the free
+// color swatch + the preset dots + (shape) line width or (text) font size.
+// `colorTestid` is separate from `testidBase` because the swatch keeps the
+// legacy row testid (figcell-annotation-color-*) the e2e specs target.
+function AnnotationStyleLine({ color, onColor, testidBase, colorTestid,
+                               width, onWidth, fontsize, onFontsize }: {
+  color: unknown
+  onColor: (c: string) => void
+  testidBase: string
+  colorTestid: string
+  width?: number
+  onWidth?: (w: number) => void
+  fontsize?: number
+  onFontsize?: (s: number) => void
+}) {
+  const current = typeof color === 'string' ? color.toLowerCase() : ''
+  return (
+    <div style={styles.annStyleLine}>
+      <ColorSwatch value={color} onChange={onColor}
+        testid={colorTestid} title="Annotation color" />
+      {PRESET_COLORS.map(hex => (
+        <button
+          key={hex}
+          data-testid={`${testidBase}-preset-${hex.slice(1)}`}
+          title={hex}
+          onClick={() => onColor(hex)}
+          style={{
+            ...styles.presetDot,
+            background: hex,
+            ...(current === hex ? styles.presetDotActive : {}),
+          }}
+        />
+      ))}
+      {width != null && onWidth != null && (
+        <NumBox value={width} min={0.5} max={12} step={0.5}
+          testid={`${testidBase}-width`} label="width" onCommit={onWidth} />
+      )}
+      {fontsize != null && onFontsize != null && (
+        <NumBox value={fontsize} min={6} max={96} step={1}
+          testid={`${testidBase}-size`} label="size" onCommit={onFontsize} />
+      )}
+    </div>
+  )
+}
+
+// ── Slim edit bar ─────────────────────────────────────────────────────────────
+// One compact bar under the figure (edit mode only). Annotation STYLE editing
+// lives in the floating AnnotationPopover (click the annotation on the live
+// figure), so the bar carries only: panel-targeting chips (multi-panel — WHICH
+// panel adds/refresh/layers apply to; the Fig chip = figure scope), the add-
+// annotation palette, layout presets + gap sliders (figure scope on a grid),
+// and the per-layer rows.
 function FigureEditPanel({ cell, selectedPanel, onClose }: {
   cell: ReportCell
   selectedPanel: string | null
   onClose: () => void
 }) {
   const { sendAction } = useSpyDE()
-  const panels = cell.figure?.panels ?? []
+  const figure = cell.figure
+  // Chips/targeting list GRID panels only — a callout's hidden inset panel is
+  // real in the spec but has no cell of its own, so a chip for it would select
+  // something the user can't see (it's edited via its marker on the base).
+  const panels = gridPanelsOf(figure?.panels ?? [])
   const multiPanel = panels.length > 1
 
   // Debounced per-(panel,layer) alpha sender so a dragged slider doesn't flood
@@ -830,61 +1227,275 @@ function FigureEditPanel({ cell, selectedPanel, onClose }: {
 
   // The selection SOURCE OF TRUTH is the backend; clicking a chip just tells it
   // to select (it echoes report_panel_selected → the prop updates). `null` = the
-  // Figure chip (figure-level).
+  // Fig chip (figure scope).
   const selectPanel = (panelId: string | null) =>
     sendAction('repfig_select_panel', { cell_id: cell.id, panel_id: panelId })
 
-  // The panel whose section to show (resolve the selected id to a panel; unknown
-  // / null → figure-level).
   const activePanel = selectedPanel != null
     ? panels.find(p => p.id === selectedPanel) ?? null
     : null
+  // Where an ADD lands: the selected panel; on a single-panel figure (no chips)
+  // the only panel; otherwise (multi-panel, Fig scope) figure-level fractions.
+  const targetPanel = activePanel ?? (multiPanel ? null : panels[0] ?? null)
+  // The layer rows always show SOME panel's layers (the add target or the first).
+  const layerPanel = targetPanel ?? panels[0] ?? null
+
+  // A robust default annotation position + size in the panel's DATA coordinates.
+  // Prefer the snapshot axes (x_axis/y_axis float arrays carried on the spec);
+  // fall back to a 0..100 span when the spec carries none.
+  const annotationDefaults = (panel: RepfigPanel) => {
+    const xs = panel.axes?.x_axis
+    const ys = panel.axes?.y_axis
+    let x0 = 0, x1 = 100, y0 = 0, y1 = 100
+    if (xs && xs.length) { x0 = xs[0]; x1 = xs[xs.length - 1] }
+    if (ys && ys.length) { y0 = ys[0]; y1 = ys[ys.length - 1] }
+    const cx = (x0 + x1) / 2
+    const cy = (y0 + y1) / 2
+    const w = Math.abs(x1 - x0) || 100
+    const h = Math.abs(y1 - y0) || 100
+    return { cx, cy, rx: w * 0.15, ry: h * 0.15 }
+  }
+
+  // Build the annotation dict in the EXACT anyplotlib-marker kwarg shape the
+  // backend's figure_builder._apply_annotations consumes (it pops offsets/texts/
+  // widths/heights/U/V and forwards the rest as add_* kwargs). Getting these
+  // names wrong means the annotation is appended to the spec but never DRAWS
+  // (the builder pops a None offsets and `continue`s). Offsets are (N,2) [x,y]
+  // arrays in DATA coordinates; a single marker is a 1-length list.
+  const addPanelAnnotation = (panel: RepfigPanel, kind: 'text' | 'circle' | 'rect' | 'arrow') => {
+    const d = annotationDefaults(panel)
+    let annotation: Record<string, unknown>
+    if (kind === 'text') {
+      // add_texts(offsets, texts, color=, fontsize=)
+      annotation = { kind: 'text', offsets: [[d.cx, d.cy]], texts: ['Label'],
+        color: ANNOT_COLOR_DEFAULT, fontsize: 12 }
+    } else if (kind === 'circle') {
+      // add_circles(offsets, radius=, edgecolors=, facecolors=)
+      annotation = { kind: 'circle', offsets: [[d.cx, d.cy]], radius: Math.min(d.rx, d.ry),
+        edgecolors: ANNOT_COLOR_DEFAULT, facecolors: null, linewidths: 1.5, alpha: 1.0 }
+    } else if (kind === 'rect') {
+      // add_rectangles(offsets, widths, heights, edgecolors=, facecolors=) —
+      // offset is the rectangle CENTER (matplotlib collection convention).
+      annotation = { kind: 'rect', offsets: [[d.cx, d.cy]], widths: [d.rx * 2],
+        heights: [d.ry * 2], edgecolors: ANNOT_COLOR_DEFAULT, facecolors: null,
+        linewidths: 1.5, alpha: 1.0 }
+    } else {
+      // add_arrows(offsets, U, V, edgecolors=) — tail at (cx-rx, cy-ry), pointing
+      // toward the center.
+      annotation = { kind: 'arrow', offsets: [[d.cx - d.rx, d.cy - d.ry]],
+        U: [d.rx], V: [d.ry], edgecolors: ANNOT_COLOR_DEFAULT, linewidths: 1.6 }
+    }
+    sendAction('repfig_add_annotation', { cell_id: cell.id, panel_id: panel.id, annotation })
+  }
+
+  // Figure-level annotations position in FIGURE FRACTIONS (0..1, centered) and
+  // use scalar color/linewidth uniformly (anyplotlib figure-marker schema).
+  const addFigAnnotation = (kind: 'text' | 'circle' | 'rect' | 'arrow') => {
+    let annotation: Record<string, unknown>
+    if (kind === 'text') {
+      annotation = { kind: 'text', x: 0.5, y: 0.5, text: 'Label', color: ANNOT_COLOR_DEFAULT, fontsize: 14 }
+    } else if (kind === 'circle') {
+      annotation = { kind: 'circle', x: 0.5, y: 0.5, r: 0.08, color: ANNOT_COLOR_DEFAULT, linewidth: 2 }
+    } else if (kind === 'rect') {
+      annotation = { kind: 'rect', x: 0.5, y: 0.5, w: 0.2, h: 0.15, color: ANNOT_COLOR_DEFAULT, linewidth: 2 }
+    } else {
+      annotation = { kind: 'arrow', x: 0.35, y: 0.35, u: 0.15, v: 0.15, color: ANNOT_COLOR_DEFAULT, linewidth: 2 }
+    }
+    sendAction('repfig_add_fig_annotation', { cell_id: cell.id, annotation })
+  }
+  const addAnnotation = (kind: 'text' | 'circle' | 'rect' | 'arrow') =>
+    targetPanel != null ? addPanelAnnotation(targetPanel, kind) : addFigAnnotation(kind)
+
+  // Layout presets + gap sliders — figure scope on a multi-panel grid only.
+  const layout = figure?.layout
+  const isGrid = layout?.kind === 'grid'
+  const gridPanelCount = gridPanelsOf(panels).length
+  const presets = targetPanel == null && gridPanelCount >= 2 ? distinctPresets(gridPanelCount) : []
+  const applyPreset = (preset: 'row' | 'column' | 'grid') =>
+    sendAction('repfig_apply_layout_preset', { cell_id: cell.id, preset })
+
+  // Debounced layout sender so a dragged slider doesn't flood repfig_set_layout.
+  const setLayout = (payload: Record<string, unknown>) =>
+    debounceSet('layout', () => sendAction('repfig_set_layout', { cell_id: cell.id, ...payload }))
+  const hspace = Number(layout?.hspace ?? 0.2)
+  const wspace = Number(layout?.wspace ?? 0.2)
+  const [draftH, setDraftH] = React.useState(hspace)
+  const [draftW, setDraftW] = React.useState(wspace)
+  React.useEffect(() => { setDraftH(hspace) }, [hspace])
+  React.useEffect(() => { setDraftW(wspace) }, [wspace])
 
   return (
     <div style={styles.editPanel} data-testid={`figcell-edit-${cell.id}`}>
-      <div style={styles.editHeader}>
-        <span style={styles.editTitle}>Edit figure</span>
+      <div style={styles.toolRow}>
+        {/* Targeting chips (A, B, … + Fig) — only when there's a choice. */}
+        {multiPanel && (
+          <>
+            {panels.map((panel, i) => (
+              <button
+                key={panel.id}
+                data-testid={`figcell-chip-${panel.id}`}
+                style={activePanel?.id === panel.id ? styles.chipActive : styles.chip}
+                title={`Target ${panelLabel(i)}`}
+                onClick={() => selectPanel(panel.id)}
+              >{PANEL_LETTERS[i] ?? String(i + 1)}</button>
+            ))}
+            <button
+              data-testid={`figcell-chip-figure-${cell.id}`}
+              style={activePanel == null ? styles.chipActive : styles.chip}
+              title="Target the whole figure (layout, figure annotations)"
+              onClick={() => selectPanel(null)}
+            >Fig</button>
+            <div style={styles.toolDivider} />
+          </>
+        )}
+        {/* Panel annotations don't exist on a 3-D scene (2-D marker geometry
+            has no meaning there) or a line panel (annotations/callouts are
+            refused backend-side on a line plot) — hide the add palette for
+            those TARGET panels. Figure-level adds (Fig scope, targetPanel
+            null) stay. */}
+        {targetPanel?.kind !== 'scene3d' && targetPanel?.kind !== 'line' &&
+          (['text', 'circle', 'rect', 'arrow'] as const).map(k => (
+          <button
+            key={k}
+            data-testid={targetPanel != null
+              ? `figcell-add-${k}-${targetPanel.id}`
+              : `figcell-add-fig-${k}-${cell.id}`}
+            style={styles.annAddBtn}
+            title={targetPanel != null ? `Add ${ANNOT_LABEL[k]}` : `Add figure ${ANNOT_LABEL[k]}`}
+            onClick={() => addAnnotation(k)}
+          >+ {ANNOT_LABEL[k]}</button>
+        ))}
+        {/* Fresh-slice zoom-inset callouts — gated on the panel's source having
+            navigation axes (nav_dims is stamped onto the shipped panel dict at
+            emit time; absent/0 on an unresolvable or plain-2D source). Hidden
+            entirely on a line panel (below). */}
+        {targetPanel != null && targetPanel.kind !== 'line' && (targetPanel.nav_dims ?? 0) >= 1 && (
+          <>
+            <div style={styles.toolDivider} />
+            <button
+              data-testid={`figcell-add-callout-${targetPanel.id}`}
+              style={styles.annAddBtn}
+              title="Add a zoom-inset callout sliced fresh from the dataset"
+              onClick={() => sendAction('repfig_add_callout',
+                { cell_id: cell.id, panel_id: targetPanel.id })}
+            >+ Callout</button>
+            {(targetPanel.nav_dims ?? 0) === 1 && (
+              <button
+                data-testid={`figcell-add-time-callouts-${targetPanel.id}`}
+                style={styles.annAddBtn}
+                title="Add start / middle / end frame callouts"
+                onClick={() => sendAction('repfig_add_time_callouts',
+                  { cell_id: cell.id, panel_id: targetPanel.id })}
+              >+ Time callouts</button>
+            )}
+          </>
+        )}
+        {/* Zoom callout: a magnified inset of a region of an IMAGE panel — no
+            nav_dims gate (unlike the fresh-slice callout above, which needs a
+            navigable source; a zoom callout just crops the panel's own pixels). */}
+        {targetPanel != null && targetPanel.kind === 'image' && (
+          <>
+            <div style={styles.toolDivider} />
+            <button
+              data-testid={`figcell-add-zoom-callout-${targetPanel.id}`}
+              style={styles.annAddBtn}
+              title="Add a magnified inset of a region of this panel"
+              onClick={() => sendAction('repfig_add_zoom_callout',
+                { cell_id: cell.id, panel_id: targetPanel.id })}
+            >+ Zoom callout</button>
+          </>
+        )}
+        {activePanel != null && (
+          <>
+            <div style={styles.toolDivider} />
+            <button
+              data-testid={`figcell-panel-refresh-${activePanel.id}`}
+              style={styles.smallRefresh}
+              title="Refresh this panel from the live plot"
+              onClick={() => sendAction('repfig_refresh_panel', { cell_id: cell.id, panel_id: activePanel.id })}
+            >⟳</button>
+            {multiPanel && (
+              <button
+                data-testid={`figcell-panel-remove-${activePanel.id}`}
+                style={styles.smallRemove}
+                title="Remove this panel"
+                onClick={() => sendAction('repfig_remove_panel', { cell_id: cell.id, panel_id: activePanel.id })}
+              >remove panel</button>
+            )}
+          </>
+        )}
         <div style={{ flex: 1 }} />
         <button style={styles.editClose} title="Close editor" onClick={onClose}>×</button>
       </div>
 
-      {/* Selection chips: one per panel (A, B, C…) + a Figure chip. */}
-      <div style={styles.chipRow} data-testid={`figcell-chips-${cell.id}`}>
-        {panels.map((panel, i) => (
-          <button
-            key={panel.id}
-            data-testid={`figcell-chip-${panel.id}`}
-            style={activePanel?.id === panel.id ? styles.chipActive : styles.chip}
-            title={`Select ${panelLabel(i)}`}
-            onClick={() => selectPanel(panel.id)}
-          >{PANEL_LETTERS[i] ?? String(i + 1)}</button>
-        ))}
-        <button
-          data-testid={`figcell-chip-figure-${cell.id}`}
-          style={activePanel == null ? styles.chipActive : styles.chip}
-          title="Figure-level controls (layout, caption, figure annotations)"
-          onClick={() => selectPanel(null)}
-        >Figure</button>
+      <div style={styles.editHint}>
+        Click an annotation on the figure to edit it; drag to move.
       </div>
 
-      {activePanel != null ? (
-        <PanelEdit
-          key={activePanel.id}
+      {presets.length > 0 && (
+        <div style={styles.presetRow} data-testid={`figcell-layout-presets-${cell.id}`}>
+          {presets.map(({ preset, rows: pr, cols: pc }) => (
+            <button
+              key={preset}
+              data-testid={`figcell-layout-preset-${preset}-${cell.id}`}
+              style={styles.presetBtn}
+              title={`${LAYOUT_PRESET_LABEL[preset]} layout (${pr} × ${pc})`}
+              onClick={() => applyPreset(preset)}
+            >
+              <LayoutPresetIcon rows={pr} cols={pc} n={gridPanelCount} />
+            </button>
+          ))}
+        </div>
+      )}
+      {targetPanel == null && isGrid && multiPanel && (
+        <>
+          <div style={styles.gapRow}>
+            <span style={styles.hint}>row gap</span>
+            <input
+              data-testid={`figcell-hspace-${cell.id}`}
+              type="range" min={0} max={1} step={0.05}
+              value={draftH}
+              onChange={(e) => { const v = Number(e.target.value); setDraftH(v); setLayout({ hspace: v }) }}
+              style={{ flex: 1 }}
+            />
+            <span style={{ ...styles.hint, minWidth: 26, textAlign: 'right' }}>{draftH.toFixed(2)}</span>
+          </div>
+          <div style={styles.gapRow}>
+            <span style={styles.hint}>col gap</span>
+            <input
+              data-testid={`figcell-wspace-${cell.id}`}
+              type="range" min={0} max={1} step={0.05}
+              value={draftW}
+              onChange={(e) => { const v = Number(e.target.value); setDraftW(v); setLayout({ wspace: v }) }}
+              style={{ flex: 1 }}
+            />
+            <span style={{ ...styles.hint, minWidth: 26, textAlign: 'right' }}>{draftW.toFixed(2)}</span>
+          </div>
+        </>
+      )}
+
+      {/* A scene3d panel has no image layers (its LayerSpec is just the rebind
+          ref; the point cloud isn't a layer) — no layer rows for it. A line
+          panel's "layers" are its plotted lines — LayerEdit shows line-styling
+          controls (color/width/label) instead of the image-only tint/cmap. */}
+      {layerPanel != null && layerPanel.kind !== 'scene3d' &&
+        (layerPanel.layers ?? []).map((layer, li) => (
+        <LayerEdit
+          key={layer.id}
           cellId={cell.id}
-          panel={activePanel}
-          index={panels.indexOf(activePanel)}
-          canRemovePanel={multiPanel}
-          onSetLayer={setLayer}
+          panelId={layerPanel.id}
+          layer={layer}
+          isBase={li === 0}
+          isLine={layerPanel.kind === 'line'}
+          onSet={setLayer}
           sendAction={sendAction}
         />
-      ) : (
-        <FigureLevelEdit cell={cell} sendAction={sendAction} />
-      )}
+      ))}
     </div>
   )
 }
 
-// ── Figure-level section (shown when the "Figure" chip is active) ───────────────
+// ── Layout preset helpers (figure scope of the slim bar) ────────────────────
 
 // The panels that occupy a GRID cell — mirrors the backend's `_grid_panels`:
 // every panel NOT referenced as a callout inset on any panel's `insets`.
@@ -939,273 +1550,38 @@ function LayoutPresetIcon({ rows, cols, n }: { rows: number; cols: number; n: nu
   )
 }
 
-function FigureLevelEdit({ cell, sendAction }: {
-  cell: ReportCell
-  sendAction: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
-}) {
-  const figure = cell.figure
-  const panels = figure?.panels ?? []
-  const layout = figure?.layout
-  const isGrid = layout?.kind === 'grid'
-  const rows = Math.max(1, Number(layout?.rows) || 1)
-  const cols = Math.max(1, Number(layout?.cols) || 1)
-  const gridSummary = isGrid && panels.length > 1 ? `${rows} × ${cols} grid` : 'single panel'
+// The overlay TINT palette: the preset dots minus white/black — a clear→white
+// or clear→black intensity ramp is invisible over a grayscale base. Mirrors
+// the backend's compose._OVERLAY_TINT_CYCLE (the auto-assigned defaults).
+const TINT_PRESETS = PRESET_COLORS.filter(c => c !== '#ffffff' && c !== '#000000')
 
-  const gridPanelCount = gridPanelsOf(panels).length
-  const presets = gridPanelCount >= 2 ? distinctPresets(gridPanelCount) : []
-  const applyPreset = (preset: 'row' | 'column' | 'grid') =>
-    sendAction('repfig_apply_layout_preset', { cell_id: cell.id, preset })
-
-  // Debounced layout sender so a dragged slider doesn't flood repfig_set_layout.
-  const debounceSet = useKeyedDebounce(150)
-  const setLayout = (payload: Record<string, unknown>) =>
-    debounceSet('layout', () => sendAction('repfig_set_layout', { cell_id: cell.id, ...payload }))
-
-  const hspace = Number(layout?.hspace ?? 0.2)
-  const wspace = Number(layout?.wspace ?? 0.2)
-  const [draftH, setDraftH] = React.useState(hspace)
-  const [draftW, setDraftW] = React.useState(wspace)
-  React.useEffect(() => { setDraftH(hspace) }, [hspace])
-  React.useEffect(() => { setDraftW(wspace) }, [wspace])
-
-  const annotations = figure?.annotations ?? []
-
-  // Figure-fraction defaults (0..1, centered) — same accent as panel annotations.
-  const ANNOT_COLOR = ANNOT_COLOR_DEFAULT
-  const addFigAnnotation = (kind: 'text' | 'circle' | 'rect' | 'arrow') => {
-    let annotation: Record<string, unknown>
-    if (kind === 'text') {
-      annotation = { kind: 'text', x: 0.5, y: 0.5, text: 'Label', color: ANNOT_COLOR, fontsize: 14 }
-    } else if (kind === 'circle') {
-      annotation = { kind: 'circle', x: 0.5, y: 0.5, r: 0.08, color: ANNOT_COLOR }
-    } else if (kind === 'rect') {
-      annotation = { kind: 'rect', x: 0.5, y: 0.5, w: 0.2, h: 0.15, color: ANNOT_COLOR }
-    } else {
-      annotation = { kind: 'arrow', x: 0.35, y: 0.35, u: 0.15, v: 0.15, color: ANNOT_COLOR }
-    }
-    sendAction('repfig_add_fig_annotation', { cell_id: cell.id, annotation })
-  }
-
-  return (
-    <div style={styles.panelBlock} data-testid={`figcell-figure-edit-${cell.id}`}>
-      <div style={styles.subLabel}>Layout</div>
-      <div style={styles.figGridSummary} data-testid={`figcell-grid-summary-${cell.id}`}>
-        {gridSummary}
-      </div>
-      {presets.length > 0 && (
-        <div style={styles.presetRow} data-testid={`figcell-layout-presets-${cell.id}`}>
-          {presets.map(({ preset, rows: pr, cols: pc }) => (
-            <button
-              key={preset}
-              data-testid={`figcell-layout-preset-${preset}-${cell.id}`}
-              style={styles.presetBtn}
-              title={`${LAYOUT_PRESET_LABEL[preset]} layout (${pr} × ${pc})`}
-              onClick={() => applyPreset(preset)}
-            >
-              <LayoutPresetIcon rows={pr} cols={pc} n={gridPanelCount} />
-              <span style={styles.presetLabel}>{LAYOUT_PRESET_LABEL[preset]}</span>
-            </button>
-          ))}
-        </div>
-      )}
-      {isGrid && panels.length > 1 && (
-        <>
-          <div style={styles.layerTop}>
-            <span style={styles.hint}>row gap</span>
-            <input
-              data-testid={`figcell-hspace-${cell.id}`}
-              type="range" min={0} max={1} step={0.05}
-              value={draftH}
-              onChange={(e) => { const v = Number(e.target.value); setDraftH(v); setLayout({ hspace: v }) }}
-              style={{ flex: 1 }}
-            />
-            <span style={{ ...styles.hint, minWidth: 26, textAlign: 'right' }}>{draftH.toFixed(2)}</span>
-          </div>
-          <div style={styles.layerTop}>
-            <span style={styles.hint}>col gap</span>
-            <input
-              data-testid={`figcell-wspace-${cell.id}`}
-              type="range" min={0} max={1} step={0.05}
-              value={draftW}
-              onChange={(e) => { const v = Number(e.target.value); setDraftW(v); setLayout({ wspace: v }) }}
-              style={{ flex: 1 }}
-            />
-            <span style={{ ...styles.hint, minWidth: 26, textAlign: 'right' }}>{draftW.toFixed(2)}</span>
-          </div>
-        </>
-      )}
-
-      <div style={styles.subLabel}>Caption</div>
-      <div style={styles.figCaptionHint}>
-        Edit the caption below the figure (click it to type).
-      </div>
-
-      {/* Figure-level annotations (figure fractions, draggable in edit mode). */}
-      <div style={styles.subLabel}>Figure annotations</div>
-      {annotations.length === 0 && (
-        <div style={styles.annEmpty}>None yet — add one below.</div>
-      )}
-      {annotations.map((ann, ai) => (
-        <FigureAnnotationRow
-          key={ann.id ?? ai}
-          cellId={cell.id}
-          index={ai}
-          annotation={ann as Record<string, unknown> & { kind: string }}
-          sendAction={sendAction}
-        />
-      ))}
-      <div style={styles.annPalette}>
-        {(['text', 'circle', 'rect', 'arrow'] as const).map(k => (
-          <button
-            key={k}
-            data-testid={`figcell-add-fig-${k}-${cell.id}`}
-            style={styles.annAddBtn}
-            title={`Add figure ${ANNOT_LABEL[k]}`}
-            onClick={() => addFigAnnotation(k)}
-          >+ {ANNOT_LABEL[k]}</button>
-        ))}
-      </div>
-    </div>
-  )
-}
-
-function PanelEdit({ cellId, panel, index, canRemovePanel, onSetLayer, sendAction }: {
-  cellId: string
-  panel: RepfigPanel
-  index: number
-  canRemovePanel: boolean
-  onSetLayer: (panelId: string, layerId: string, payload: Record<string, unknown>, debounce?: boolean) => void
-  sendAction: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
-}) {
-  const annotations = panel.annotations ?? []
-
-  // A robust default annotation position + size in the panel's DATA coordinates.
-  // Prefer the snapshot axes (x_axis/y_axis float arrays carried on the spec);
-  // fall back to pixel-index midpoint (0..N-1) via the layer clim-agnostic size.
-  const annotationDefaults = () => {
-    const xs = panel.axes?.x_axis
-    const ys = panel.axes?.y_axis
-    let x0 = 0, x1 = 100, y0 = 0, y1 = 100
-    if (xs && xs.length) { x0 = xs[0]; x1 = xs[xs.length - 1] }
-    if (ys && ys.length) { y0 = ys[0]; y1 = ys[ys.length - 1] }
-    const cx = (x0 + x1) / 2
-    const cy = (y0 + y1) / 2
-    const w = Math.abs(x1 - x0) || 100
-    const h = Math.abs(y1 - y0) || 100
-    const rx = w * 0.15    // ~15% of the image
-    const ry = h * 0.15
-    return { cx, cy, rx, ry, w, h }
-  }
-
-  // Build the annotation dict in the EXACT anyplotlib-marker kwarg shape the
-  // backend's figure_builder._apply_annotations consumes (it pops offsets/texts/
-  // widths/heights/U/V and forwards the rest as add_* kwargs). Getting these
-  // names wrong means the annotation is appended to the spec but never DRAWS
-  // (the builder pops a None offsets and `continue`s). Offsets are (N,2) [x,y]
-  // arrays in DATA coordinates; a single marker is a 1-length list.
-  const ANNOT_COLOR = ANNOT_COLOR_DEFAULT
-  const addAnnotation = (kind: 'text' | 'circle' | 'rect' | 'arrow') => {
-    const d = annotationDefaults()
-    let annotation: Record<string, unknown>
-    if (kind === 'text') {
-      // add_texts(offsets, texts, color=, fontsize=)
-      annotation = { kind: 'text', offsets: [[d.cx, d.cy]], texts: ['Label'],
-        color: ANNOT_COLOR, fontsize: 12 }
-    } else if (kind === 'circle') {
-      // add_circles(offsets, radius=, edgecolors=, facecolors=)
-      annotation = { kind: 'circle', offsets: [[d.cx, d.cy]], radius: Math.min(d.rx, d.ry),
-        edgecolors: ANNOT_COLOR, facecolors: null, linewidths: 1.5, alpha: 1.0 }
-    } else if (kind === 'rect') {
-      // add_rectangles(offsets, widths, heights, edgecolors=, facecolors=) —
-      // offset is the rectangle CENTER (matplotlib collection convention).
-      annotation = { kind: 'rect', offsets: [[d.cx, d.cy]], widths: [d.rx * 2],
-        heights: [d.ry * 2], edgecolors: ANNOT_COLOR, facecolors: null,
-        linewidths: 1.5, alpha: 1.0 }
-    } else {
-      // add_arrows(offsets, U, V, edgecolors=) — tail at (cx-rx, cy-ry), pointing
-      // toward the center.
-      annotation = { kind: 'arrow', offsets: [[d.cx - d.rx, d.cy - d.ry]],
-        U: [d.rx], V: [d.ry], edgecolors: ANNOT_COLOR, linewidths: 1.6 }
-    }
-    sendAction('repfig_add_annotation', { cell_id: cellId, panel_id: panel.id, annotation })
-  }
-
-  return (
-    <div style={styles.panelBlock} data-testid={`figcell-panel-${panel.id}`}>
-      <div style={styles.panelHeader}>
-        <span style={styles.panelLabel}>{panelLabel(index)}</span>
-        <div style={{ flex: 1 }} />
-        <button
-          data-testid={`figcell-panel-refresh-${panel.id}`}
-          style={styles.smallRefresh}
-          title="Refresh this panel from the live plot"
-          onClick={() => sendAction('repfig_refresh_panel', { cell_id: cellId, panel_id: panel.id })}
-        >⟳</button>
-        {canRemovePanel && (
-          <button
-            data-testid={`figcell-panel-remove-${panel.id}`}
-            style={styles.smallRemove}
-            title="Remove this panel"
-            onClick={() => sendAction('repfig_remove_panel', { cell_id: cellId, panel_id: panel.id })}
-          >remove panel</button>
-        )}
-      </div>
-
-      {/* Layers */}
-      <div style={styles.subLabel}>Layers</div>
-      {(panel.layers ?? []).map((layer, li) => (
-        <LayerEdit
-          key={layer.id}
-          cellId={cellId}
-          panelId={panel.id}
-          layer={layer}
-          isBase={li === 0}
-          onSet={onSetLayer}
-          sendAction={sendAction}
-        />
-      ))}
-
-      {/* Annotations */}
-      <div style={styles.subLabel}>Annotations</div>
-      {annotations.length === 0 && (
-        <div style={styles.annEmpty}>None yet — add one below.</div>
-      )}
-      {annotations.map((ann, ai) => (
-        <AnnotationRow
-          key={ai}
-          cellId={cellId}
-          panelId={panel.id}
-          index={ai}
-          annotation={ann}
-          sendAction={sendAction}
-        />
-      ))}
-      <div style={styles.annPalette}>
-        {(['text', 'circle', 'rect', 'arrow'] as const).map(k => (
-          <button
-            key={k}
-            data-testid={`figcell-add-${k}-${panel.id}`}
-            style={styles.annAddBtn}
-            title={`Add ${ANNOT_LABEL[k]}`}
-            onClick={() => addAnnotation(k)}
-          >+ {ANNOT_LABEL[k]}</button>
-        ))}
-      </div>
-    </div>
-  )
-}
-
-function LayerEdit({ cellId, panelId, layer, isBase, onSet, sendAction }: {
+function LayerEdit({ cellId, panelId, layer, isBase, isLine, onSet, sendAction }: {
   cellId: string
   panelId: string
   layer: RepfigLayer
   isBase: boolean
+  /** True when the owning panel is `kind === 'line'` — swaps the image-only
+   *  tint/cmap controls for line styling (color/width/label). */
+  isLine?: boolean
   onSet: (panelId: string, layerId: string, payload: Record<string, unknown>, debounce?: boolean) => void
   sendAction: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
 }) {
   const [draftAlpha, setDraftAlpha] = React.useState(layer.alpha)
   React.useEffect(() => { setDraftAlpha(layer.alpha) }, [layer.alpha])
-  const title = layer.source?.title || (isBase ? 'Base' : 'Layer')
+  // `color`/`linewidth`/`label` are the line-panel fields (RepfigLayer doesn't
+  // declare them — they're only meaningful on a line layer); read defensively.
+  const lineLayer = layer as RepfigLayer & { color?: string; linewidth?: number; label?: string }
+  const title = lineLayer.label || layer.source?.title || (isBase ? 'Base' : 'Layer')
+  const [draftLabel, setDraftLabel] = React.useState(lineLayer.label ?? '')
+  React.useEffect(() => { setDraftLabel(lineLayer.label ?? '') }, [lineLayer.label])
+  const commitLabel = () => {
+    if (draftLabel !== (lineLayer.label ?? '')) onSet(panelId, layer.id, { label: draftLabel })
+  }
+  // Overlay display mode: a set tint replaces the cmap select with the ramp
+  // controls; clearing it (the "cmap" mini-toggle → tint:null) restores the
+  // select. The base layer never tints — it keeps its cmap select untouched.
+  const tint = !isBase && typeof layer.tint === 'string' && layer.tint
+    ? layer.tint.toLowerCase() : null
 
   return (
     <div style={styles.layerRow} data-testid={`figcell-layer-${panelId}-${layer.id}`}>
@@ -1225,21 +1601,102 @@ function LayerEdit({ cellId, panelId, layer, isBase, onSet, sendAction }: {
           style={styles.removeBtn}
         >×</button>
       </div>
-      <div style={styles.layerControls}>
-        <select
-          data-testid={`figcell-layer-cmap-${layer.id}`}
-          style={{ ...styles.select, flex: 1 }}
-          value={COLORMAPS.includes(layer.cmap) ? layer.cmap : COLORMAPS[0]}
-          onChange={(e) => onSet(panelId, layer.id, { cmap: e.target.value })}
-        >
-          {/* Include the layer's cmap even if it's outside the standard set (e.g.
-              an overlay cmap like "cool"/"spring") so it round-trips. */}
-          {!COLORMAPS.includes(layer.cmap) && (
-            <option value={layer.cmap}>{layer.cmap}</option>
+      {isLine ? (
+        // Line panels have no image tint/cmap concept — color + width + a
+        // label input instead, sent via the same repfig_set_layer verb.
+        <>
+          <div style={styles.annStyleLine}>
+            <ColorSwatch
+              value={lineLayer.color}
+              onChange={(c) => onSet(panelId, layer.id, { color: c })}
+              testid={`figcell-layer-color-${layer.id}`}
+              title="Line color"
+            />
+            {PRESET_COLORS.map(hex => (
+              <button
+                key={hex}
+                data-testid={`figcell-layer-color-${layer.id}-preset-${hex.slice(1)}`}
+                title={hex}
+                onClick={() => onSet(panelId, layer.id, { color: hex })}
+                style={{
+                  ...styles.presetDot,
+                  background: hex,
+                  ...(typeof lineLayer.color === 'string' &&
+                      lineLayer.color.toLowerCase() === hex ? styles.presetDotActive : {}),
+                }}
+              />
+            ))}
+            <NumBox value={scalarOf(lineLayer.linewidth, 1.5)} min={0.5} max={12} step={0.5}
+              testid={`figcell-layer-width-${layer.id}`} label="width"
+              onCommit={(w) => onSet(panelId, layer.id, { linewidth: w })} />
+          </div>
+          <div style={styles.layerTop}>
+            <span style={styles.hint}>label</span>
+            <input
+              data-testid={`figcell-layer-label-${layer.id}`}
+              style={styles.annInput}
+              value={draftLabel}
+              placeholder={layer.source?.title || 'label'}
+              onChange={(e) => setDraftLabel(e.target.value)}
+              onBlur={commitLabel}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') (e.target as HTMLInputElement).blur()
+              }}
+            />
+          </div>
+        </>
+      ) : (
+        <>
+          {!isBase && (
+            <div style={styles.annStyleLine}>
+              {TINT_PRESETS.map(hex => (
+                <button
+                  key={hex}
+                  data-testid={`figcell-layer-tint-${layer.id}-${hex.slice(1)}`}
+                  title={`Tint ${hex}`}
+                  onClick={() => onSet(panelId, layer.id, { tint: hex })}
+                  style={{
+                    ...styles.presetDot,
+                    background: hex,
+                    ...(tint === hex ? styles.presetDotActive : {}),
+                  }}
+                />
+              ))}
+              <ColorSwatch
+                value={tint ?? TINT_PRESETS[0]}
+                onChange={(c) => onSet(panelId, layer.id, { tint: c })}
+                testid={`figcell-layer-tint-custom-${layer.id}`}
+                title="Custom tint color"
+              />
+              {tint != null && (
+                <button
+                  data-testid={`figcell-layer-tint-clear-${layer.id}`}
+                  title="Back to colormap display"
+                  onClick={() => onSet(panelId, layer.id, { tint: null })}
+                  style={styles.tintClearBtn}
+                >cmap</button>
+              )}
+            </div>
           )}
-          {COLORMAPS.map(c => <option key={c} value={c}>{c}</option>)}
-        </select>
-      </div>
+          {(isBase || tint == null) && (
+            <div style={styles.layerControls}>
+              <select
+                data-testid={`figcell-layer-cmap-${layer.id}`}
+                style={{ ...styles.select, flex: 1 }}
+                value={COLORMAPS.includes(layer.cmap) ? layer.cmap : COLORMAPS[0]}
+                onChange={(e) => onSet(panelId, layer.id, { cmap: e.target.value })}
+              >
+                {/* Include the layer's cmap even if it's outside the standard set (e.g.
+                    an overlay cmap like "cool"/"spring") so it round-trips. */}
+                {!COLORMAPS.includes(layer.cmap) && (
+                  <option value={layer.cmap}>{layer.cmap}</option>
+                )}
+                {COLORMAPS.map(c => <option key={c} value={c}>{c}</option>)}
+              </select>
+            </div>
+          )}
+        </>
+      )}
       <div style={styles.layerTop}>
         <span style={styles.hint}>alpha</span>
         <input
@@ -1261,185 +1718,244 @@ function LayerEdit({ cellId, panelId, layer, isBase, onSet, sendAction }: {
   )
 }
 
-function AnnotationRow({ cellId, panelId, index, annotation, sendAction }: {
-  cellId: string
-  panelId: string
-  index: number
-  annotation: Record<string, unknown> & { kind: string }
+// ── Floating annotation style popover ────────────────────────────────────────
+// Opened by clicking an annotation in the live figure (edit mode). Reuses the
+// SAME testids the retired dock rows had (figcell-annotation-*/figcell-fig-
+// annotation-*) so the control contract is unchanged — only WHERE it renders
+// moved. Field mapping matches the old rows: panel shapes use `edgecolors` /
+// `linewidths`; panel text uses `color`/`fontsize`/`texts`; figure-level uses
+// `color`/`linewidth`/`fontsize`/`text` uniformly.
+function AnnotationPopover({ cell, popover, onClose, sendAction }: {
+  cell: ReportCell
+  popover: AnnPopoverTarget
+  onClose: () => void
   sendAction: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
 }) {
-  const kind = String(annotation.kind ?? '')
+  const { scope, panelId, index, fx, fy } = popover
+  const ann = (scope === 'figure'
+    ? cell.figure?.annotations?.[index]
+    : cell.figure?.panels?.find(p => p.id === panelId)?.annotations?.[index]
+  ) as (Record<string, unknown> & { kind: string }) | undefined
+  const rootRef = React.useRef<HTMLDivElement>(null)
+
+  // Outside-mousedown dismiss (popover only — clicks inside the figure iframe
+  // are handled by the spyde:figure_event subscription in the cell).
+  React.useEffect(() => {
+    const onDown = (e: MouseEvent) => {
+      if (!rootRef.current?.contains(e.target as Node)) onClose()
+    }
+    window.addEventListener('mousedown', onDown)
+    return () => window.removeEventListener('mousedown', onDown)
+  }, [onClose])
+
+  const kind = String(ann?.kind ?? '')
   const isText = kind === 'text'
-  // A text annotation stores its string(s) in `texts` (the anyplotlib add_texts
-  // arg); read/write the first entry. Fall back to a legacy `text` scalar.
-  const textOf = (a: Record<string, unknown>): string => {
-    const ts = a.texts
-    if (Array.isArray(ts) && ts.length) return String(ts[0] ?? '')
-    return String(a.text ?? '')
-  }
-  const [editing, setEditing] = React.useState(false)
-  const [draft, setDraft] = React.useState(textOf(annotation))
-  const current = textOf(annotation)
-  React.useEffect(() => { if (!editing) setDraft(current) }, [current, editing])
+  const isShape = ['circle', 'ellipse', 'rect', 'arrow', 'line'].includes(kind)
+  const textOf = ann == null ? '' : scope === 'figure'
+    ? String(ann.text ?? '')
+    : (Array.isArray(ann.texts) && ann.texts.length
+        ? String(ann.texts[0] ?? '') : String(ann.text ?? ''))
+  const [draft, setDraft] = React.useState(textOf)
+  React.useEffect(() => { setDraft(textOf) }, [textOf])
+
+  const debounce = useKeyedDebounce(250)
+  if (ann == null) return null
+
+  const action = scope === 'figure'
+    ? 'repfig_update_fig_annotation' : 'repfig_update_annotation'
+  const payloadBase = scope === 'figure'
+    ? { cell_id: cell.id, index }
+    : { cell_id: cell.id, panel_id: panelId, index }
+  const send = (next: Record<string, unknown>) =>
+    sendAction(action, { ...payloadBase, annotation: next })
+  const update = (patch: Record<string, unknown>, key: string) =>
+    debounce(`pop:${scope}:${panelId ?? 'fig'}:${index}:${key}`,
+      () => send({ ...ann, ...patch }))
+
+  const colorField = scope === 'figure' || isText ? 'color' : 'edgecolors'
+  const setColor = (c: string) => update({ [colorField]: c }, 'color')
+  const setWidth = (w: number) =>
+    update(scope === 'figure' ? { linewidth: w } : { linewidths: w }, 'width')
+  const setFontsize = (s: number) => update({ fontsize: s }, 'size')
+  const widthVal = scope === 'figure'
+    ? scalarOf(ann.linewidth, 2) : scalarOf(ann.linewidths, 1.5)
 
   const commitText = () => {
-    setEditing(false)
-    if (draft !== current) {
-      // Preserve the array shape the builder expects; drop any legacy `text`.
-      const { text: _drop, ...rest } = annotation
-      sendAction('repfig_update_annotation', {
-        cell_id: cellId, panel_id: panelId, index,
-        annotation: { ...rest, texts: [draft] },
-      })
-    }
+    if (draft === textOf) return
+    if (scope === 'figure') send({ ...ann, text: draft })
+    else { const { text: _drop, ...rest } = ann; send({ ...rest, texts: [draft] }) }
+  }
+  const remove = () => {
+    sendAction(scope === 'figure'
+      ? 'repfig_remove_fig_annotation' : 'repfig_remove_annotation', payloadBase)
+    onClose()
   }
 
-  // Color: `text` kind stores it in `color`; circle/rect/arrow store it in
-  // `edgecolors` (a plain string here, not the add_* array form — the builder
-  // forwards it straight through as an mpl kwarg). Debounced (~250ms) like the
-  // layer alpha slider so dragging the native picker doesn't flood the backend.
-  const colorField = isText ? 'color' : 'edgecolors'
-  const debounceColor = useKeyedDebounce(250)
-  const setColor = (color: string) => {
-    debounceColor(`${panelId}:${index}:color`, () => {
-      sendAction('repfig_update_annotation', {
-        cell_id: cellId, panel_id: panelId, index,
-        annotation: { ...annotation, [colorField]: color },
-      })
-    })
-  }
+  const testidBase = scope === 'figure'
+    ? `figcell-fig-annotation-${index}`
+    : `figcell-annotation-${panelId}-${index}`
+  const colorTestid = scope === 'figure'
+    ? `figcell-fig-annotation-color-${index}`
+    : `figcell-annotation-color-${panelId}-${index}`
+  const removeTestid = scope === 'figure'
+    ? `figcell-fig-annotation-remove-${index}`
+    : `figcell-annotation-remove-${panelId}-${index}`
+  const textTestid = scope === 'figure'
+    ? `figcell-fig-annotation-text-input-${index}`
+    : `figcell-annotation-text-input-${panelId}-${index}`
 
-  const label = ANNOT_LABEL[kind] ?? kind
+  // Anchor: fraction of the fig box; flip sides near the right/bottom edges so
+  // the popover stays inside the box (FloatingToolbar collision idea, cheap).
+  const pos: React.CSSProperties = {
+    left: `${Math.min(97, Math.max(3, fx * 100))}%`,
+    top: `${Math.min(97, Math.max(3, fy * 100))}%`,
+    transform: `translate(${fx > 0.6 ? '-100%' : '0'}, ${fy > 0.6 ? 'calc(-100% - 10px)' : '10px'})`,
+  }
 
   return (
-    <div style={styles.annRow} data-testid={`figcell-annotation-${panelId}-${index}`}>
-      <span style={styles.annKind}>{label}</span>
-      <ColorSwatch
-        value={annotation[colorField]}
-        onChange={setColor}
-        testid={`figcell-annotation-color-${panelId}-${index}`}
-        title="Annotation color"
-      />
-      {isText ? (
-        editing ? (
+    <div
+      ref={rootRef}
+      data-testid={testidBase}
+      role="dialog"
+      style={{ ...styles.annPopover, ...pos }}
+    >
+      <div style={styles.annTopLine}>
+        <span style={styles.annKind}>{ANNOT_LABEL[kind] ?? kind}</span>
+        {isText && (
           <input
-            data-testid={`figcell-annotation-text-input-${panelId}-${index}`}
-            autoFocus
+            data-testid={textTestid}
             style={styles.annInput}
             value={draft}
+            placeholder="text"
             onChange={(e) => setDraft(e.target.value)}
             onBlur={commitText}
             onKeyDown={(e) => {
               if (e.key === 'Enter') (e.target as HTMLInputElement).blur()
-              else if (e.key === 'Escape') { setDraft(String(annotation.text ?? '')); setEditing(false) }
             }}
           />
-        ) : (
-          <span
-            data-testid={`figcell-annotation-text-${panelId}-${index}`}
-            style={styles.annText}
-            title="Click to edit text"
-            onClick={() => { setDraft(current); setEditing(true) }}
-          >{current || <span style={styles.captionPlaceholder}>(empty)</span>}</span>
-        )
-      ) : (
-        <span style={styles.annText} />
-      )}
-      <div style={{ flex: 1 }} />
-      <button
-        data-testid={`figcell-annotation-remove-${panelId}-${index}`}
-        style={styles.removeBtn}
-        title="Delete annotation"
-        onClick={() => sendAction('repfig_remove_annotation',
-          { cell_id: cellId, panel_id: panelId, index })}
-      >×</button>
+        )}
+        <div style={{ flex: 1 }} />
+        <button
+          data-testid={removeTestid}
+          style={styles.removeBtn}
+          title="Delete annotation"
+          onClick={remove}
+        >×</button>
+        <button style={styles.editClose} title="Close" onClick={onClose}>×</button>
+      </div>
+      <AnnotationStyleLine
+        color={ann[colorField]}
+        onColor={setColor}
+        testidBase={testidBase}
+        colorTestid={colorTestid}
+        width={isShape ? widthVal : undefined}
+        onWidth={isShape ? setWidth : undefined}
+        fontsize={isText ? scalarOf(ann.fontsize, scope === 'figure' ? 14 : 12) : undefined}
+        onFontsize={isText ? setFontsize : undefined}
+      />
     </div>
   )
 }
 
-// A FIGURE-LEVEL annotation row (sibling of AnnotationRow): figure-fraction
-// markers store a text kind's string in the `text` scalar (anyplotlib
-// figure-marker schema, not panel `texts`), and edits route through the
-// repfig_*_fig_annotation actions.
-function FigureAnnotationRow({ cellId, index, annotation, sendAction }: {
-  cellId: string
-  index: number
-  annotation: Record<string, unknown> & { kind: string }
+// ── Floating text-size popover ───────────────────────────────────────────────
+// Opened by double-clicking a text element (title/axis label/ticks/legend/
+// colorbar label) on the live figure — IN or OUT of edit mode. Clones
+// AnnotationPopover's anchoring/dismiss behavior (outside-mousedown + Escape,
+// same edge-flip anchor math) but edits a font size instead of an annotation.
+const TEXT_SIZE_LABEL: Record<TextSizeTarget, string> = {
+  title: 'Title', x_label: 'X label', x_ticks: 'X ticks',
+  y_label: 'Y label', y_ticks: 'Y ticks', legend: 'Legend',
+  colorbar_label: 'Colorbar label',
+}
+// target → the spec panel's `text_sizes` key (ticks share one key for both axes).
+const TEXT_SIZE_SPEC_KEY: Record<TextSizeTarget, string> = {
+  title: 'title', x_label: 'x_label', y_label: 'y_label',
+  x_ticks: 'ticks', y_ticks: 'ticks', legend: 'legend', colorbar_label: 'colorbar',
+}
+const TEXT_SIZE_DEFAULT: Record<string, number> = {
+  ticks: 10, x_label: 11, y_label: 11, title: 11, legend: 10, colorbar: 10,
+}
+const TEXT_SIZE_PRESETS = [8, 10, 12, 14, 18, 24]
+
+function TextSizePopover({ cell, popover, onClose, sendAction }: {
+  cell: ReportCell
+  popover: TextSizePopoverTarget
+  onClose: () => void
   sendAction: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
 }) {
-  const kind = String(annotation.kind ?? '')
-  const isText = kind === 'text'
-  const current = String(annotation.text ?? '')
-  const [editing, setEditing] = React.useState(false)
-  const [draft, setDraft] = React.useState(current)
-  React.useEffect(() => { if (!editing) setDraft(current) }, [current, editing])
+  const { panelId, target, fx, fy } = popover
+  const rootRef = React.useRef<HTMLDivElement>(null)
 
-  const commitText = () => {
-    setEditing(false)
-    if (draft !== current) {
-      sendAction('repfig_update_fig_annotation', {
-        cell_id: cellId, index,
-        annotation: { ...annotation, text: draft },
-      })
+  // Outside-mousedown dismiss (popover only — clicks inside the figure iframe
+  // are handled by the spyde:figure_event subscription in the cell).
+  React.useEffect(() => {
+    const onDown = (e: MouseEvent) => {
+      if (!rootRef.current?.contains(e.target as Node)) onClose()
     }
+    window.addEventListener('mousedown', onDown)
+    return () => window.removeEventListener('mousedown', onDown)
+  }, [onClose])
+
+  // Seed value: the event's panel_id is anyplotlib's DISPATCH id, which may not
+  // match a spec panel id — so prefer a spec panel match, but fall back to the
+  // sole panel when the figure has exactly one (the common case). Unset →
+  // the JS-side default for that target.
+  const specKey = TEXT_SIZE_SPEC_KEY[target]
+  const panels = cell.figure?.panels ?? []
+  const matched = panels.find(p => p.id === panelId)
+    ?? (panels.length === 1 ? panels[0] : undefined)
+  const textSizes = (matched as (RepfigPanel & { text_sizes?: Record<string, number> }) | undefined)?.text_sizes
+  const seed = scalarOf(textSizes?.[specKey], TEXT_SIZE_DEFAULT[specKey] ?? 10)
+
+  const [draft, setDraft] = React.useState(seed)
+  React.useEffect(() => { setDraft(seed) }, [seed])
+
+  const debounce = useKeyedDebounce(250)
+  const commit = (size: number) => {
+    setDraft(size)
+    debounce(`textsize:${panelId ?? 'fig'}:${target}`, () =>
+      sendAction('repfig_set_text_size', { cell_id: cell.id, panel_id: panelId, target, size }))
   }
 
-  // Figure-level annotations use `color` uniformly across every kind (unlike a
-  // panel annotation's shape kinds, which use `edgecolors`). Debounced like the
-  // panel swatch so dragging the native picker doesn't flood the backend.
-  const debounceColor = useKeyedDebounce(250)
-  const setColor = (color: string) => {
-    debounceColor(`fig:${index}:color`, () => {
-      sendAction('repfig_update_fig_annotation', {
-        cell_id: cellId, index,
-        annotation: { ...annotation, color },
-      })
-    })
+  // Anchor: fraction of the fig box; flip sides near the right/bottom edges so
+  // the popover stays inside the box (same collision idea as AnnotationPopover).
+  const pos: React.CSSProperties = {
+    left: `${Math.min(97, Math.max(3, fx * 100))}%`,
+    top: `${Math.min(97, Math.max(3, fy * 100))}%`,
+    transform: `translate(${fx > 0.6 ? '-100%' : '0'}, ${fy > 0.6 ? 'calc(-100% - 10px)' : '10px'})`,
   }
-
-  const label = ANNOT_LABEL[kind] ?? kind
 
   return (
-    <div style={styles.annRow} data-testid={`figcell-fig-annotation-${index}`}>
-      <span style={styles.annKind}>{label}</span>
-      <ColorSwatch
-        value={annotation.color}
-        onChange={setColor}
-        testid={`figcell-fig-annotation-color-${index}`}
-        title="Annotation color"
-      />
-      {isText ? (
-        editing ? (
-          <input
-            data-testid={`figcell-fig-annotation-text-input-${index}`}
-            autoFocus
-            style={styles.annInput}
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            onBlur={commitText}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') (e.target as HTMLInputElement).blur()
-              else if (e.key === 'Escape') { setDraft(current); setEditing(false) }
+    <div
+      ref={rootRef}
+      data-testid={`figcell-text-size-${target}`}
+      role="dialog"
+      style={{ ...styles.annPopover, ...pos }}
+    >
+      <div style={styles.annTopLine}>
+        <span style={styles.annKind}>{TEXT_SIZE_LABEL[target]}</span>
+        <div style={{ flex: 1 }} />
+        <button style={styles.editClose} title="Close" onClick={onClose}>×</button>
+      </div>
+      <div style={styles.annStyleLine}>
+        <NumBox value={draft} min={6} max={96} step={1}
+          testid="figcell-text-size-input" label="size" onCommit={commit} />
+        {TEXT_SIZE_PRESETS.map(size => (
+          <button
+            key={size}
+            data-testid={`figcell-text-size-preset-${size}`}
+            title={`${size}px`}
+            onClick={() => commit(size)}
+            style={{
+              ...styles.presetDot,
+              width: 16, height: 16, borderRadius: 4,
+              background: '#313244', color: '#a6adc8', fontSize: 7,
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              ...(draft === size ? styles.presetDotActive : {}),
             }}
-          />
-        ) : (
-          <span
-            data-testid={`figcell-fig-annotation-text-${index}`}
-            style={styles.annText}
-            title="Click to edit text"
-            onClick={() => { setDraft(current); setEditing(true) }}
-          >{current || <span style={styles.captionPlaceholder}>(empty)</span>}</span>
-        )
-      ) : (
-        <span style={styles.annText} />
-      )}
-      <div style={{ flex: 1 }} />
-      <button
-        data-testid={`figcell-fig-annotation-remove-${index}`}
-        style={styles.removeBtn}
-        title="Delete figure annotation"
-        onClick={() => sendAction('repfig_remove_fig_annotation', { cell_id: cellId, index })}
-      >×</button>
+          >{size}</button>
+        ))}
+      </div>
     </div>
   )
 }
@@ -1449,6 +1965,14 @@ const styles: Record<string, React.CSSProperties> = {
     position: 'relative',
     marginBottom: 8,
     borderRadius: 6,
+    // Reserve the drop-indicator stripe so a reorder hover can't shift layout.
+    borderTop: '2px solid transparent',
+  },
+  cellDragging: { opacity: 0.4 },
+  cellDropBefore: { borderTop: '2px solid #89b4fa' },
+  dragHandle: {
+    cursor: 'grab', color: '#6c7086', fontSize: 13, userSelect: 'none',
+    lineHeight: 1,
   },
   chrome: {
     position: 'absolute', top: 4, right: 6, zIndex: 4,
@@ -1576,23 +2100,23 @@ const styles: Record<string, React.CSSProperties> = {
     border: '1px solid #313244', borderRadius: 5,
     padding: '3px 6px', fontSize: 11.5, outline: 'none', textAlign: 'center',
   },
-  // ── Edit panel ────────────────────────────────────────────────────────────
+  // ── Slim edit bar ─────────────────────────────────────────────────────────
   editPanel: {
     marginTop: 4,
     background: '#181825', border: '1px solid #313244', borderRadius: 6,
     padding: '6px 8px',
   },
-  editHeader: {
-    display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4,
+  // The bar's single control row; dividers separate the chip / add / panel-op
+  // groups.
+  toolRow: {
+    display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 4,
   },
-  editTitle: { fontSize: 11, fontWeight: 600, color: '#cdd6f4' },
+  toolDivider: { width: 1, height: 14, background: '#313244' },
+  editHint: { fontSize: 9.5, color: '#585b70', fontStyle: 'italic', padding: '2px 0 1px' },
+  gapRow: { display: 'flex', gap: 6, alignItems: 'center', padding: '2px 0' },
   editClose: {
     background: 'none', border: 'none', color: '#6c7086', cursor: 'pointer',
     fontSize: 15, lineHeight: 1, padding: '0 2px',
-  },
-  chipRow: {
-    display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 4,
-    paddingBottom: 4, borderBottom: '1px solid #1e1e2e',
   },
   chip: {
     background: '#1e1e2e', color: '#a6adc8', border: '1px solid #313244',
@@ -1604,7 +2128,6 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: 5, padding: '2px 8px', fontSize: 10.5, cursor: 'pointer',
     fontWeight: 600, lineHeight: 1.2,
   },
-  figGridSummary: { fontSize: 10.5, color: '#cdd6f4', padding: '1px 0 3px' },
   // ── Layout presets ────────────────────────────────────────────────────────
   presetRow: { display: 'flex', gap: 6, padding: '2px 0 4px' },
   presetBtn: {
@@ -1621,13 +2144,6 @@ const styles: Record<string, React.CSSProperties> = {
   presetCellEmpty: {
     background: '#313244', borderRadius: 1,
   },
-  presetLabel: { fontSize: 8.5, color: '#a6adc8' },
-  figCaptionHint: { fontSize: 9.5, color: '#6c7086', fontStyle: 'italic', padding: '1px 0' },
-  panelBlock: {
-    borderTop: '1px solid #1e1e2e', paddingTop: 5, marginTop: 4,
-  },
-  panelHeader: { display: 'flex', alignItems: 'center', gap: 6, marginBottom: 3 },
-  panelLabel: { fontSize: 10.5, fontWeight: 600, color: '#a6adc8' },
   smallRemove: {
     background: 'none', border: '1px solid #45475a', color: '#f38ba8',
     borderRadius: 4, padding: '1px 6px', fontSize: 9.5, cursor: 'pointer',
@@ -1637,7 +2153,6 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: 4, padding: '1px 6px', fontSize: 9.5, cursor: 'pointer',
     lineHeight: 1,
   },
-  subLabel: { fontSize: 9.5, color: '#6c7086', margin: '5px 0 2px', fontWeight: 600 },
   layerRow: {
     display: 'flex', flexDirection: 'column', gap: 3,
     padding: '4px 0', borderBottom: '1px solid #1e1e2e',
@@ -1665,9 +2180,11 @@ const styles: Record<string, React.CSSProperties> = {
     background: 'none', border: 'none', color: '#f38ba8', cursor: 'pointer',
     fontSize: 13, padding: '0 4px', lineHeight: 1, fontWeight: 700,
   },
-  annEmpty: { fontSize: 9.5, color: '#585b70', fontStyle: 'italic', padding: '1px 0' },
-  annRow: {
-    display: 'flex', alignItems: 'center', gap: 6, padding: '2px 0',
+  // The overlay layer row's "back to colormap" mini-toggle (clears the tint).
+  tintClearBtn: {
+    background: '#1e1e2e', color: '#a6adc8', border: '1px solid #313244',
+    borderRadius: 4, padding: '0 5px', fontSize: 9, cursor: 'pointer',
+    lineHeight: '14px', flexShrink: 0,
   },
   annKind: {
     fontSize: 9, fontWeight: 700, color: '#a6adc8',
@@ -1679,19 +2196,42 @@ const styles: Record<string, React.CSSProperties> = {
     width: 16, height: 16, padding: 0, border: '1px solid #45475a',
     borderRadius: 3, background: 'none', cursor: 'pointer', flexShrink: 0,
   },
-  annText: {
-    fontSize: 10.5, color: '#cdd6f4', cursor: 'text', minWidth: 0,
-    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-    maxWidth: 150,
-  },
   annInput: {
     background: '#11111b', color: '#cdd6f4', border: '1px solid #313244',
     borderRadius: 4, padding: '1px 5px', fontSize: 10.5, outline: 'none',
     minWidth: 0, flex: '0 1 150px',
   },
-  annPalette: { display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 4 },
   annAddBtn: {
     background: '#1e1e2e', color: '#a6adc8', border: '1px solid #313244',
     borderRadius: 5, padding: '2px 7px', fontSize: 10, cursor: 'pointer',
+  },
+  // ── Annotation style kit + floating popover ───────────────────────────────
+  annStyleLine: { display: 'flex', alignItems: 'center', gap: 4 },
+  presetDot: {
+    width: 11, height: 11, borderRadius: '50%', padding: 0, flexShrink: 0,
+    border: '1px solid rgba(0,0,0,0.45)', cursor: 'pointer',
+  },
+  presetDotActive: { boxShadow: '0 0 0 2px #89b4fa' },
+  numWrap: { display: 'flex', alignItems: 'center', gap: 3 },
+  numInput: {
+    width: 42, background: '#11111b', color: '#cdd6f4',
+    border: '1px solid #313244', borderRadius: 4, padding: '1px 4px',
+    fontSize: 10.5, outline: 'none',
+  },
+  annTopLine: { display: 'flex', alignItems: 'center', gap: 6 },
+  // The popover's positioning layer mirrors the FIG BOX footprint (aspect-ratio
+  // set per-instance, same derivation as figBoxStyle) so the anchor fractions
+  // are FIGURE fractions; click-through except for the popover itself.
+  popoverLayer: {
+    position: 'absolute', top: 0, left: 0, right: 0,
+    pointerEvents: 'none', zIndex: 6,
+  },
+  annPopover: {
+    position: 'absolute', minWidth: 210,
+    background: 'rgba(24,24,37,0.97)', border: '1px solid #89b4fa',
+    borderRadius: 8, padding: '6px 8px',
+    boxShadow: '0 6px 22px rgba(0,0,0,0.55)',
+    display: 'flex', flexDirection: 'column', gap: 4,
+    pointerEvents: 'auto',
   },
 }

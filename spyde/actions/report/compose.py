@@ -26,6 +26,7 @@ Message contracts (the renderer is written against these EXACT shapes):
 from __future__ import annotations
 
 import logging
+import re
 
 import numpy as np
 
@@ -38,10 +39,35 @@ from spyde.actions.report.model import (
 log = logging.getLogger(__name__)
 
 # The default overlay-layer colormap cycle (distinct from a typical gray/viridis
-# base) so a composed overlay reads as a separate image.
+# base) so a composed overlay reads as a separate image. Still assigned to every
+# composed overlay — it's the stored REVERT value when the user clears a tint
+# back to colormap display.
 _OVERLAY_CMAP_CYCLE = ["magma", "cividis", "plasma", "inferno", "cool", "spring"]
 
+# The default overlay TINT cycle: the renderer's preset palette minus
+# white/black (a white/black clear→colour ramp is invisible over a gray base).
+# A newly composed overlay renders as a clear→tint intensity ramp by default;
+# legacy cells (tint None) keep colormap display unchanged.
+_OVERLAY_TINT_CYCLE = ["#f38ba8", "#ff9800", "#f9e2af",
+                       "#a6e3a1", "#89dceb", "#cba6f7"]
+
+# A tint must be a #rgb / #rrggbb hex — the same shapes anyplotlib's tint LUT
+# parses. Anything else is ignored at the handler (an invalid colour would
+# raise ValueError inside add_layer at rebuild time and silently DROP the
+# layer from the figure — the guarded add_layer logs + skips).
+_TINT_RE = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
+
 _TILE_MODES = ("tile-up", "tile-down", "tile-left", "tile-right")
+
+# repfig_set_text_size: valid PanelSpec.text_sizes keys, and the event-style
+# target aliases the edit dock sends (x_ticks/y_ticks share one "ticks" size —
+# anyplotlib's set_tick_label_size applies to both axes; colorbar_label is the
+# dock's event name for the "colorbar" spec key).
+_TEXT_SIZE_KEYS = {"title", "x_label", "y_label", "ticks", "legend", "colorbar"}
+_TEXT_SIZE_TARGET_ALIASES = {
+    "x_ticks": "ticks", "y_ticks": "ticks", "colorbar_label": "colorbar",
+}
+_TEXT_SIZE_MIN, _TEXT_SIZE_MAX = 6, 96
 
 
 # ── shared helpers ────────────────────────────────────────────────────────────
@@ -205,6 +231,22 @@ def repfig_query_compose(session, plot, payload) -> None:
     nav_signal_pair = False
     options = list(_TILE_MODES)   # tiles always available
 
+    # A scene3d target composes with nothing: overlay needs matching image
+    # shapes, a callout needs nav slicing, and tiling next to a 3-D scene is
+    # unsupported (repfig_compose refuses it too — the renderer's no-rich-
+    # options fallback auto-fires tile-right). Reply with NO options.
+    if cell is not None:
+        tgt = _target_panel(cell, target_panel_id)
+        if tgt is not None and str(tgt.kind) == "scene3d":
+            ipc.emit({
+                "type": "repfig_compose_options",
+                "cell_id": cell_id,
+                "source_window_id": source_window_id,
+                "options": [],
+                "detail": {"same_shape": False, "nav_signal_pair": False},
+            })
+            return
+
     if cell is not None and src is not None:
         base_shape = _target_base_shape(mgr, cell, target_panel_id)
         src_frame = getattr(src, "current_data", None)
@@ -246,6 +288,14 @@ def repfig_compose(session, plot, payload) -> None:
     if cell is None:
         ipc.emit_error("repfig_compose: figure cell not found.")
         return
+    # ``mode`` is caller-supplied (an edge drop / the renderer's tile-right
+    # fallback bypasses the query), so the execute path must refuse a scene3d
+    # target independently — no overlay/tile/callout onto a 3-D scene panel.
+    tgt = _target_panel(cell, payload.get("target_panel_id"))
+    if tgt is not None and str(tgt.kind) == "scene3d":
+        ipc.emit_error("repfig_compose: a 3-D scene panel can't be combined "
+                       "with another figure.")
+        return
     src = _resolve_source_plot(session, payload.get("source_window_id"))
     if src is None:
         ipc.emit_error("repfig_compose: source window not found.")
@@ -275,9 +325,21 @@ def repfig_compose(session, plot, payload) -> None:
     _rebuild_and_emit(mgr, cell)
 
 
+def _next_overlay_tint(panel) -> str:
+    """The first :data:`_OVERLAY_TINT_CYCLE` colour not already used by one of
+    *panel*'s layers, so stacked overlays stay visually distinct; wraps by
+    overlay count once every cycle colour is taken."""
+    used = {str(getattr(ly, "tint", None) or "").lower() for ly in panel.layers}
+    for hexc in _OVERLAY_TINT_CYCLE:
+        if hexc not in used:
+            return hexc
+    return _OVERLAY_TINT_CYCLE[(len(panel.layers) - 1) % len(_OVERLAY_TINT_CYCLE)]
+
+
 def _compose_overlay(mgr, cell, src_panel, src_map, target_panel_id=None) -> None:
     """Append the source's base layer to the TARGET panel as an overlay layer
-    (distinct cmap, alpha 0.5).
+    (clear→tint ramp from the tint cycle, alpha 0.5; the cmap cycle value is
+    kept alongside as the revert-to-colormap value).
 
     Refuses (no-op + ``emit_error``) when the source frame's shape doesn't match
     the target panel's existing base shape — the popover's query-time gate
@@ -303,7 +365,9 @@ def _compose_overlay(mgr, cell, src_panel, src_map, target_panel_id=None) -> Non
     n_over = len(target_panel.layers)   # base is [0]; overlays start at 1
     cmap = _OVERLAY_CMAP_CYCLE[(n_over - 1) % len(_OVERLAY_CMAP_CYCLE)]
     new_layer = LayerSpec(source=src_base.source, cmap=cmap, clim=src_base.clim,
-                          alpha=0.5, visible=True, id=new_layer_id())
+                          alpha=0.5, visible=True,
+                          tint=_next_overlay_tint(target_panel),
+                          id=new_layer_id())
     target_panel.layers.append(new_layer)
     mgr.set_snapshot(cell.id, target_panel.id, new_layer.id, np.asarray(src_arr))
 
@@ -519,6 +583,21 @@ def _compose_callout(session, mgr, cell, src, src_panel, src_map,
         "h_frac": 0.3,
         "connector": connector,
     }
+    # Record WHERE the inset was sliced so the callout becomes refreshable
+    # (a fresh-slice callout: refresh/marker-drag re-slice the dataset at this
+    # position instead of re-snapshotting the live frame). Only when the inset
+    # shows the SIGNAL (a navigator dropped as the inset has no nav position).
+    # Convention: hyperspy ``axes_manager.indices`` is x-first ((ix, iy)) and
+    # ``sig.inav[...]`` consumes the SAME order, so the list is stored as-is —
+    # exactly what ``slicing.read_frame_at`` expects.
+    if not src_is_nav:
+        try:
+            idx = [int(i) for i in
+                   src.plot_state.current_signal.axes_manager.indices]
+            if idx:
+                inset_entry["nav_indices"] = idx
+        except Exception as e:
+            log.debug("callout nav_indices read failed: %s", e)
     target_panel.insets.append(inset_entry)
 
 
@@ -529,6 +608,283 @@ def _next_panel_id(spec) -> str:
     while f"p{n}" in used:
         n += 1
     return f"p{n}"
+
+
+# ── fresh-slice zoom-inset callouts (Phase 3) ─────────────────────────────────
+#
+# A fresh-slice callout inset carries WHERE it was sliced (``nav_indices``
+# x-first, or ``time_index`` for a movie) so refresh / marker-drag re-slice the
+# dataset at that position via ``slicing.read_frame_at`` — never a snapshot of
+# whatever frame the live plot happens to show.
+
+# Top-left anchors (figure fractions) spreading the t=0 / t=n//2 / t=n-1 time
+# callouts left → center → right along the top edge.
+_TIME_CALLOUT_ANCHORS = ([0.03, 0.03], [0.37, 0.03], [0.71, 0.03])
+
+
+def _callout_connector_region(panel, ix, iy):
+    """Connector dict for a callout marked at nav index ``(ix, iy)``: a
+    1-nav-pixel rect centered on the point, in the BASE panel's DATA coords
+    (same conversion the drop-time callout connector uses)."""
+    region = _index_region_to_data(panel, (ix - 0.5, iy - 0.5, 1.0, 1.0))
+    return {"region": list(region)}
+
+
+def _resolve_panel_nav_source(session, panel):
+    """``(src_plot, nav_shape)`` for a panel's layer-0 source: the resolved live
+    plot (``SignalRef.resolve`` prefers the non-navigator plot of the tree, so
+    even a navigator-snapshotted panel yields the plot whose ``current_signal``
+    carries the full navigation space) and its x-first ``navigation_shape``.
+    ``(None, ())`` when unresolvable / no nav axes."""
+    if panel is None or not panel.layers or panel.layers[0].source is None:
+        return None, ()
+    src_plot = panel.layers[0].source.resolve(session)
+    if src_plot is None:
+        return None, ()
+    try:
+        am = src_plot.plot_state.current_signal.axes_manager
+        nav_shape = tuple(int(n) for n in am.navigation_shape)
+    except Exception as e:
+        log.debug("callout nav source read failed: %s", e)
+        return None, ()
+    return src_plot, nav_shape
+
+
+def _append_callout_inset(mgr, cell, target_panel, frame, entry) -> str:
+    """Create the hidden inset panel (same source ref as the target's base
+    layer, NOT placed in the grid), store *frame* as its snapshot, and append
+    *entry* (completed with the new panel id) to the target's insets. Returns
+    the new inset panel id."""
+    base_layer = target_panel.layers[0]
+    inset_panel_id = _next_panel_id(cell.spec)
+    inset_layer = LayerSpec(source=base_layer.source, cmap=base_layer.cmap,
+                            clim=None, alpha=1.0, visible=True,
+                            id=new_layer_id())
+    inset_panel = PanelSpec(id=inset_panel_id, grid_pos=[0, 0], kind="image",
+                            layers=[inset_layer])
+    cell.spec.panels.append(inset_panel)
+    mgr.set_snapshot(cell.id, inset_panel_id, inset_layer.id, frame)
+    entry = dict(entry)
+    entry["panel"] = inset_panel_id
+    target_panel.insets.append(entry)
+    return inset_panel_id
+
+
+def repfig_add_callout(session, plot, payload) -> None:
+    """Add a FRESH-SLICE callout inset to a panel (``{cell_id, panel_id,
+    nav_indices?}``): slice the panel's source signal at ``nav_indices``
+    (default: the center of the navigation space) and show that frame as a
+    floating inset. ``nav_indices`` is x-first (hyperspy ``inav`` order),
+    clamped into range. When the base panel IS the navigator image (its
+    snapshot spans the nav space) the inset also gets a connector rect around
+    the marked point, and edit mode renders a draggable marker there."""
+    from spyde.actions.report.slicing import read_frame_at
+
+    mgr = _manager(session)
+    cell = _cell(mgr, payload.get("cell_id"))
+    if cell is None or cell.spec is None:
+        ipc.emit_error("repfig_add_callout: figure cell not found.")
+        return
+    panel = _target_panel(cell, payload.get("panel_id"))
+    if panel is None or not panel.layers:
+        ipc.emit_error("repfig_add_callout: target panel not found.")
+        return
+    if str(panel.kind) == "line":
+        ipc.emit_error("repfig_add_callout: callouts aren't supported on a "
+                       "line panel.")
+        return
+    src_plot, nav_shape = _resolve_panel_nav_source(session, panel)
+    if src_plot is None or not nav_shape:
+        ipc.emit_error("repfig_add_callout: panel source has no live signal "
+                       "with navigation axes.")
+        return
+    raw = payload.get("nav_indices")
+    if raw is None:
+        nav_indices = [int(n) // 2 for n in nav_shape]
+    else:
+        try:
+            nav_indices = [int(i) for i in raw]
+        except (TypeError, ValueError):
+            ipc.emit_error("repfig_add_callout: bad nav_indices.")
+            return
+        if len(nav_indices) != len(nav_shape):
+            ipc.emit_error("repfig_add_callout: nav_indices rank mismatch "
+                           f"({len(nav_indices)} vs {len(nav_shape)} nav axes).")
+            return
+        nav_indices = [max(0, min(i, n - 1))
+                       for i, n in zip(nav_indices, nav_shape)]
+    frame = read_frame_at(src_plot, nav_indices)
+    if frame is None:
+        ipc.emit_error("repfig_add_callout: slicing the frame failed.")
+        return
+
+    # Connector (and, in edit mode, the draggable marker) only when the base
+    # panel is the NAVIGATOR image — its pixels ARE the nav space, so the
+    # marked point has a spatial anchor. Detected by shape: the base snapshot
+    # spans (ny, nx) of a 2-D nav.
+    connector = None
+    if len(nav_shape) == 2:
+        base_arr = mgr.snapshot_map(cell.id).get((panel.id, panel.layers[0].id))
+        if isinstance(base_arr, np.ndarray) and base_arr.ndim >= 2 \
+                and tuple(base_arr.shape[:2]) == (nav_shape[1], nav_shape[0]):
+            connector = _callout_connector_region(
+                panel, nav_indices[0], nav_indices[1])
+
+    _append_callout_inset(mgr, cell, panel, frame, {
+        "corner": "top-right",
+        "w_frac": 0.3,
+        "h_frac": 0.3,
+        "connector": connector,
+        "nav_indices": [int(i) for i in nav_indices],
+    })
+    _rebuild_and_emit(mgr, cell)
+
+
+def repfig_add_time_callouts(session, plot, payload) -> None:
+    """Add THREE fresh-slice callouts at t = 0, n//2, n-1 of a 1-D (time)
+    navigation axis (``{cell_id, panel_id}``), anchored top-left / top-center /
+    top-right. All frames are sliced BEFORE any spec mutation so a failed slice
+    leaves the cell untouched. Duplicate t values (tiny movies) collapse."""
+    from spyde.actions.report.slicing import read_frame_at
+
+    mgr = _manager(session)
+    cell = _cell(mgr, payload.get("cell_id"))
+    if cell is None or cell.spec is None:
+        ipc.emit_error("repfig_add_time_callouts: figure cell not found.")
+        return
+    panel = _target_panel(cell, payload.get("panel_id"))
+    if panel is None or not panel.layers:
+        ipc.emit_error("repfig_add_time_callouts: target panel not found.")
+        return
+    if str(panel.kind) == "line":
+        ipc.emit_error("repfig_add_time_callouts: callouts aren't supported "
+                       "on a line panel.")
+        return
+    src_plot, nav_shape = _resolve_panel_nav_source(session, panel)
+    if src_plot is None or not nav_shape:
+        ipc.emit_error("repfig_add_time_callouts: panel source has no live "
+                       "signal with navigation axes.")
+        return
+    if len(nav_shape) != 1:
+        ipc.emit_error("repfig_add_time_callouts: needs a 1-D (time) "
+                       "navigation axis.")
+        return
+    n = nav_shape[0]
+    ts = list(dict.fromkeys([0, n // 2, n - 1]))
+    frames = []
+    for t in ts:
+        f = read_frame_at(src_plot, [t])
+        if f is None:
+            ipc.emit_error(f"repfig_add_time_callouts: slicing frame t={t} "
+                           "failed.")
+            return
+        frames.append(f)
+    for slot, (t, f) in enumerate(zip(ts, frames)):
+        _append_callout_inset(mgr, cell, panel, f, {
+            "anchor": list(_TIME_CALLOUT_ANCHORS[slot % len(_TIME_CALLOUT_ANCHORS)]),
+            "w_frac": 0.26,
+            "h_frac": 0.26,
+            "connector": None,
+            "time_index": int(t),
+            "title": f"t={t}",
+        })
+    _rebuild_and_emit(mgr, cell)
+
+
+# ── zoom-region callouts (a magnified crop of the BASE panel itself, no nav) ──
+#
+# Unlike a fresh-slice callout (which re-slices a DIFFERENT dataset position),
+# a zoom callout crops the panel's OWN currently-held base snapshot — it never
+# touches the dataset, so it works on a plain 2-D image with no navigation axes
+# at all (a scene3d panel is still refused: there's no 2-D pixel grid to crop).
+
+
+def _base_snapshot_hw(mgr, cell, panel):
+    """The target panel's base-layer snapshot as ``(arr, H, W)``, or
+    ``(None, 0, 0)`` when there's no usable 2-D/RGB base snapshot."""
+    if panel is None or not panel.layers:
+        return None, 0, 0
+    arr = mgr.snapshot_map(cell.id).get((panel.id, panel.layers[0].id))
+    arr = np.asarray(arr) if arr is not None else None
+    if arr is None or arr.ndim < 2:
+        return None, 0, 0
+    h, w = arr.shape[0], arr.shape[1]
+    return arr, h, w
+
+
+def _crop_region_px(arr, ix0, iy0, w, h):
+    """Crop *arr* (2-D or HxWxC) to the pixel-index rect ``[ix0, ix0+w) x
+    [iy0, iy0+h)``, clamped to the array bounds. Returns a detached copy."""
+    H, W = arr.shape[0], arr.shape[1]
+    x0 = max(0, min(int(round(ix0)), W - 1))
+    y0 = max(0, min(int(round(iy0)), H - 1))
+    x1 = max(x0 + 1, min(int(round(ix0 + w)), W))
+    y1 = max(y0 + 1, min(int(round(iy0 + h)), H))
+    return np.array(arr[y0:y1, x0:x1], copy=True)
+
+
+def repfig_add_zoom_callout(session, plot, payload) -> None:
+    """Add a ZOOM-REGION callout to a panel (``{cell_id, panel_id,
+    region?:[x,y,w,h] index-space}``): crop a rectangular region out of the
+    panel's OWN base snapshot (never a dataset re-slice — works on a plain 2-D
+    image with no navigation axes) and show the crop as a floating inset,
+    magnified. Default region (when ``region`` is omitted): centered, W/4 x
+    H/4 pixel indices. The inset carries ``zoom_region`` (the region in DATA
+    coords, the write-back key for a later drag-resize) and a ``connector``
+    pointing at the same region on the base panel.
+
+    Refused (no-op + ``emit_error``) for a scene3d panel (no 2-D pixel grid to
+    crop), a line panel (no 2-D pixel grid either — a curve has no region to
+    zoom into), or when the target panel has no usable base snapshot yet."""
+    mgr = _manager(session)
+    cell = _cell(mgr, payload.get("cell_id"))
+    if cell is None or cell.spec is None:
+        ipc.emit_error("repfig_add_zoom_callout: figure cell not found.")
+        return
+    panel = _target_panel(cell, payload.get("panel_id"))
+    if panel is None or not panel.layers:
+        ipc.emit_error("repfig_add_zoom_callout: target panel not found.")
+        return
+    if str(panel.kind) == "scene3d":
+        ipc.emit_error("repfig_add_zoom_callout: a 3-D scene panel has no "
+                       "2-D region to zoom into.")
+        return
+    if str(panel.kind) == "line":
+        ipc.emit_error("repfig_add_zoom_callout: a line panel has no 2-D "
+                       "region to zoom into.")
+        return
+    base_arr, H, W = _base_snapshot_hw(mgr, cell, panel)
+    if base_arr is None or H < 1 or W < 1:
+        ipc.emit_error("repfig_add_zoom_callout: panel has no image to zoom "
+                       "into yet.")
+        return
+
+    raw_region = payload.get("region")
+    if raw_region is not None:
+        try:
+            ix0, iy0, iw, ih = (float(v) for v in raw_region)
+        except (TypeError, ValueError):
+            ipc.emit_error("repfig_add_zoom_callout: bad region.")
+            return
+    else:
+        iw, ih = max(1.0, W / 4.0), max(1.0, H / 4.0)
+        ix0, iy0 = (W - iw) / 2.0, (H - ih) / 2.0
+    iw = max(1.0, min(iw, W))
+    ih = max(1.0, min(ih, H))
+    ix0 = max(0.0, min(ix0, W - iw))
+    iy0 = max(0.0, min(iy0, H - ih))
+
+    crop = _crop_region_px(base_arr, ix0, iy0, iw, ih)
+    data_region = _index_region_to_data(panel, (ix0, iy0, iw, ih))
+
+    _append_callout_inset(mgr, cell, panel, crop, {
+        "corner": "bottom-right",
+        "w_frac": 0.3,
+        "h_frac": 0.3,
+        "connector": {"region": list(data_region)},
+        "zoom_region": list(data_region),
+    })
+    _rebuild_and_emit(mgr, cell)
 
 
 # ── layer / panel / annotation edits ──────────────────────────────────────────
@@ -548,8 +904,108 @@ def _find_layer(panel, layer_id):
     return None
 
 
+def repfig_set_text_size(session, plot, payload) -> None:
+    """Set one text element's font size (title/x_label/y_label/ticks/legend/
+    colorbar) on a panel, persist it to ``PanelSpec.text_sizes``, and push it
+    to the LIVE figure in place (no rebuild / iframe flash) when the cell has a
+    mounted window — via ``figure_builder._apply_text_sizes`` on the live plot
+    object for the panel's anyplotlib dispatch id. Falls back to a full rebuild
+    when there's no live figure (or the in-place push raises).
+
+    ``{cell_id, panel_id, target, size}`` — ``target`` accepts both a spec key
+    (``title``/``x_label``/``y_label``/``ticks``/``legend``/``colorbar``) and
+    the edit dock's event-style names (``x_ticks``/``y_ticks`` → ``ticks``,
+    ``colorbar_label`` → ``colorbar``). ``panel_id`` may be either a spec panel
+    id or an anyplotlib dispatch panel id — both are resolved to the spec
+    panel. ``size`` is clamped to ``[6, 96]`` (int). An unknown target or a
+    non-numeric size emits an error and makes NO change."""
+    mgr = _manager(session)
+    cell = _cell(mgr, payload.get("cell_id"))
+    if cell is None or cell.spec is None:
+        ipc.emit_error("repfig_set_text_size: figure cell not found.")
+        return
+
+    raw_target = str(payload.get("target", "") or "")
+    key = _TEXT_SIZE_TARGET_ALIASES.get(raw_target, raw_target)
+    if key not in _TEXT_SIZE_KEYS:
+        ipc.emit_error(f"repfig_set_text_size: unknown target {raw_target!r}.")
+        return
+
+    try:
+        size = int(round(float(payload.get("size"))))
+    except (TypeError, ValueError):
+        ipc.emit_error("repfig_set_text_size: size must be numeric.")
+        return
+    size = max(_TEXT_SIZE_MIN, min(_TEXT_SIZE_MAX, size))
+
+    # panel_id may be either a spec panel id OR an anyplotlib dispatch id (the
+    # fig._report_panel_map key vs value) — resolve to the spec PanelSpec and
+    # remember the dispatch id for the live push below.
+    raw_panel_id = payload.get("panel_id")
+    panel = _find_panel(cell.spec, raw_panel_id)
+    disp_id = None
+    fig = mgr.live_fig(cell.id)
+    if panel is None and fig is not None:
+        panel_map = dict(getattr(fig, "_report_panel_map", None) or {})
+        spec_by_dispatch = {disp: spec for spec, disp in panel_map.items()}
+        spec_pid = spec_by_dispatch.get(raw_panel_id)
+        if spec_pid is not None:
+            panel = _find_panel(cell.spec, spec_pid)
+            disp_id = raw_panel_id
+    if panel is None:
+        ipc.emit_error("repfig_set_text_size: panel not found.")
+        return
+    if disp_id is None and fig is not None:
+        panel_map = dict(getattr(fig, "_report_panel_map", None) or {})
+        disp_id = panel_map.get(panel.id)
+
+    panel.text_sizes = {**(panel.text_sizes or {}), key: size}
+
+    pushed = False
+    if fig is not None and disp_id is not None:
+        plots_map = getattr(fig, "_plots_map", None) or {}
+        live_plot = plots_map.get(disp_id)
+        if live_plot is not None:
+            try:
+                from spyde.actions.report.figure_builder import _apply_text_sizes
+                _apply_text_sizes(live_plot, {key: size})
+                pushed = True
+            except Exception as e:
+                log.debug("repfig_set_text_size in-place push failed "
+                          "(cell %s panel %s): %s", cell.id, panel.id, e)
+                pushed = False
+
+    mgr.dirty = True
+    if pushed:
+        mgr.emit_state()
+    else:
+        _rebuild_and_emit(mgr, cell)
+
+
+# repfig_set_layer's LINE-panel styling clamps/caps.
+_LINEWIDTH_MIN, _LINEWIDTH_MAX = 0.5, 12.0
+_LABEL_MAX_LEN = 120
+
+
 def repfig_set_layer(session, plot, payload) -> None:
-    """Update one layer's appearance (cmap / alpha / clim / visible) in a panel."""
+    """Update one layer's appearance (cmap / alpha / clim / visible / tint /
+    color / linewidth / label) in a panel.
+
+    ``tint`` (key present): a ``#rgb``/``#rrggbb`` string switches the layer to
+    the clear→tint intensity ramp; ``null``/``""`` clears it back to colormap
+    display. The stored ``cmap`` is NEVER dropped by a tint change — it's the
+    revert value the clear falls back to. (anyplotlib's ``Layer.set`` rejects
+    cmap+tint together, but this handler persists to the SPEC and rebuilds the
+    figure — ``add_layer(cmap=..., tint=...)`` accepts both, keeping the cmap
+    as the revert value — so no live ``set`` call ever carries both.)
+
+    ``color`` / ``linewidth`` / ``label`` are LINE-PANEL curve styling
+    (unused on an image layer, but harmless to set — they simply ride along
+    unread until/unless the layer's panel becomes a line panel). ``color`` is
+    a pass-through string (no validation — any CSS colour anyplotlib accepts).
+    ``linewidth`` is clamped to ``[0.5, 12]``. ``label`` is capped to
+    ``_LABEL_MAX_LEN`` chars; an explicit empty string CLEARS it to ``None``
+    (removing the legend entry), while an absent key leaves it unchanged."""
     mgr = _manager(session)
     cell = _cell(mgr, payload.get("cell_id"))
     if cell is None or cell.spec is None:
@@ -562,6 +1018,14 @@ def repfig_set_layer(session, plot, payload) -> None:
         return
     if "cmap" in payload and payload["cmap"]:
         layer.cmap = str(payload["cmap"])
+    if "tint" in payload:
+        tint = payload["tint"]
+        if tint is None or tint == "":
+            layer.tint = None              # back to cmap display (cmap kept)
+        elif isinstance(tint, str) and _TINT_RE.match(tint):
+            layer.tint = tint
+        # A malformed tint string is ignored (same tolerance as the fields
+        # below) — see _TINT_RE for why it must never reach the spec.
     if "alpha" in payload and payload["alpha"] is not None:
         try:
             layer.alpha = float(payload["alpha"])
@@ -578,6 +1042,26 @@ def repfig_set_layer(session, plot, payload) -> None:
                 layer.clim = [float(clim[0]), float(clim[1])]
             except (TypeError, ValueError, IndexError):
                 pass
+    if "color" in payload:
+        color = payload["color"]
+        layer.color = str(color) if color else None
+    if "linewidth" in payload and payload["linewidth"] is not None:
+        try:
+            lw = float(payload["linewidth"])
+            layer.linewidth = max(_LINEWIDTH_MIN, min(_LINEWIDTH_MAX, lw))
+        except (TypeError, ValueError):
+            pass
+    if "label" in payload:
+        label = payload["label"]
+        if label is None:
+            pass                            # absent/None = leave unchanged
+        elif label == "":
+            layer.label = None              # explicit empty = clear
+        else:
+            layer.label = str(label)[:_LABEL_MAX_LEN]
+    # Layer appearance changes reach the live figure via the REBUILD path (the
+    # same route cmap/alpha take today); tint/color/linewidth/label ride
+    # identically.
     _rebuild_and_emit(mgr, cell)
 
 
@@ -679,6 +1163,17 @@ def repfig_add_annotation(session, plot, payload) -> None:
     panel = _find_panel(cell.spec, payload.get("panel_id"))
     if panel is None:
         return
+    # 2-D marker geometry has no meaning on a 3-D scene panel OR a 1-D line
+    # panel (the renderer hides the add buttons; this guards a stale/hand-built
+    # payload).
+    if str(panel.kind) == "scene3d":
+        ipc.emit_error("repfig_add_annotation: annotations aren't supported "
+                       "on a 3-D scene panel.")
+        return
+    if str(panel.kind) == "line":
+        ipc.emit_error("repfig_add_annotation: annotations aren't supported "
+                       "on a line panel.")
+        return
     ann = payload.get("annotation")
     if not isinstance(ann, dict) or not ann.get("kind"):
         return
@@ -701,9 +1196,13 @@ def _spec_ann_to_widget_fields(ann: dict, axes) -> "dict | None":
 
     Field mapping (spec → widget), post data→px conversion:
       * text   → ``x, y`` (offset), ``text`` (texts[0]), ``fontsize``, ``color``
-      * circle → ``cx, cy`` (offset), ``r`` (radius), ``color`` (edgecolors)
-      * rect   → ``x, y`` (offset - size/2 → TOP-LEFT), ``w, h``, ``color``
-      * arrow  → ``x, y`` (tail offset), ``u, v`` (U/V), ``color`` (edgecolors)"""
+      * circle → ``cx, cy`` (offset), ``r`` (radius), ``color`` (edgecolors),
+                 ``linewidth`` (when the annotation carries a scalar-able
+                 ``linewidths``)
+      * rect   → ``x, y`` (offset - size/2 → TOP-LEFT), ``w, h``, ``color``,
+                 ``linewidth`` (same as circle)
+      * arrow  → ``x, y`` (tail offset), ``u, v`` (U/V), ``color`` (edgecolors),
+                 ``linewidth`` (defaults to 2.0 when unset)"""
     from spyde.actions.report import coords
     from spyde.actions.report.figure_builder import (
         _first_offset, _scalar0, _first_color,
@@ -728,24 +1227,34 @@ def _spec_ann_to_widget_fields(ann: dict, axes) -> "dict | None":
         r = _scalar0(conv.get("radius"))
         if r is None:
             return None
-        return {"cx": cx, "cy": cy, "r": float(r),
-                "color": _first_color(conv.get("edgecolors"), "#00e5ff")}
+        out = {"cx": cx, "cy": cy, "r": float(r),
+               "color": _first_color(conv.get("edgecolors"), "#00e5ff")}
+        lw = _scalar0(conv.get("linewidths"))
+        if lw is not None:
+            out["linewidth"] = float(lw)
+        return out
     if kind == "rect":
         w = _scalar0(conv.get("widths"))
         hh = _scalar0(conv.get("heights"))
         if w is None or hh is None:
             return None
         # spec offset is the CENTER; widget x/y is the TOP-LEFT.
-        return {"x": cx - float(w) / 2.0, "y": cy - float(hh) / 2.0,
-                "w": float(w), "h": float(hh),
-                "color": _first_color(conv.get("edgecolors"), "#00e5ff")}
+        out = {"x": cx - float(w) / 2.0, "y": cy - float(hh) / 2.0,
+               "w": float(w), "h": float(hh),
+               "color": _first_color(conv.get("edgecolors"), "#00e5ff")}
+        lw = _scalar0(conv.get("linewidths"))
+        if lw is not None:
+            out["linewidth"] = float(lw)
+        return out
     if kind == "arrow":
         u = _scalar0(conv.get("U"))
         v = _scalar0(conv.get("V"))
         if u is None or v is None:
             return None
+        lw = _scalar0(conv.get("linewidths"))
         return {"x": cx, "y": cy, "u": float(u), "v": float(v),
-                "color": _first_color(conv.get("edgecolors"), "#00e5ff")}
+                "color": _first_color(conv.get("edgecolors"), "#00e5ff"),
+                "linewidth": float(lw) if lw else 2.0}
     return None
 
 

@@ -194,3 +194,22 @@ def pixel_to_data_v(v, axes):
         return None if v is None else float(v)
     _ox, _sx, _oy, sy = scale
     return float(v) * sy if sy else float(v)
+
+
+def data_region_to_index(region, axes):
+    """Convert a DATA-coord ``(x, y, w, h)`` region to PIXEL/INDEX space using
+    panel *axes* (``{units, x_axis, y_axis}``) — the exact inverse of
+    ``spyde.actions.report.compose._index_region_to_data``. Identity
+    passthrough when the panel is uncalibrated (axes None/unusable, or a
+    zero-scale axis), mirroring every other ``pixel_to_data_*``/
+    ``*_to_pixel`` helper in this module.
+
+    Kept here (not in ``compose.py``) so ``figure_builder.py`` can import it
+    without a circular import — the same reason ``annotation_data_to_pixel``
+    lives in this module instead of ``compose``."""
+    x, y, w, h = region
+    scale = _panel_data_to_pixel_scale(axes)
+    if scale is None:
+        return float(x), float(y), float(w), float(h)
+    ox, sx, oy, sy = scale
+    return (x - ox) / sx, (y - oy) / sy, w / sx, h / sy

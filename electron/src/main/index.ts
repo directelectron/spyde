@@ -25,6 +25,33 @@ import {
 
 let win: BrowserWindow | null = null
 
+// ── Global crash backstop ─────────────────────────────────────────────────────
+//
+// A stray rejection or thrown error anywhere in the main process (e.g. the
+// updater's quitAndInstall handoff, a late autoUpdater event, some IPC path)
+// must NOT silently kill the whole app with no trace. Log it to stderr (the same
+// channel the rest of main uses), and — if a window is up — surface a
+// non-blocking status line so the user knows something hiccuped rather than the
+// window just vanishing. We deliberately do NOT force-exit here: keeping the app
+// alive for a non-fatal rejection is the whole point. A genuinely fatal state
+// (e.g. a corrupt V8 heap) will still take the process down on its own; we've at
+// least written the reason first.
+function surfaceMainProcessCrash(kind: string, err: unknown): void {
+  const detail = (err as Error)?.stack ?? (err as Error)?.message ?? String(err)
+  process.stderr.write(`[spyde main] ${kind}: ${detail}\n`)
+  try {
+    if (win && !win.isDestroyed() && !win.webContents.isDestroyed()) {
+      win.webContents.send('spyde:message', {
+        type: 'error',
+        text: `Unexpected background error (${kind}) — the app is still running.`,
+      })
+    }
+  } catch { /* never let the crash handler itself throw */ }
+}
+
+process.on('uncaughtException', (err) => surfaceMainProcessCrash('uncaughtException', err))
+process.on('unhandledRejection', (reason) => surfaceMainProcessCrash('unhandledRejection', reason))
+
 // Concurrency guards for anything that writes into the managed Python env:
 // the first-run `uv sync` (envSetupInProgress, set around resolvePythonEnv in
 // whenReady) and the GPU-triage "Fix PyTorch install" (torchFixInProgress).

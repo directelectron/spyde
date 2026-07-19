@@ -74,6 +74,12 @@ body {
 .report-article pre.md-src { white-space: pre-wrap; }
 .report-article blockquote { margin: 0 0 1rem; padding: 0 1rem;
   border-left: 4px solid #d0d0d6; color: #555; }
+.report-article li input[type="checkbox"] { margin-right: 0.4em; }
+/* KaTeX math ships as MathML (output:'mathml') — no KaTeX CSS/fonts needed;
+   browsers and printToPDF render MathML Core natively. */
+.report-article .katex { font-size: 1.08em; }
+.report-article .katex-display { display: block; margin: 1rem 0;
+  text-align: center; overflow-x: auto; overflow-y: hidden; }
 .report-article table { border-collapse: collapse; margin: 0 0 1rem;
   display: block; overflow-x: auto; }
 .report-article th, .report-article td { border: 1px solid #d0d0d6;
@@ -193,7 +199,12 @@ def _render_body(mgr, assets: dict, *, interactive: bool, session=None) -> str:
     exports the FULL vectors dataset as the interactive explorer instead of an
     anyplotlib iframe — the reader recomputes virtual images from the embedded
     vectors right in the page (see vectors_embed.py). Over the embed cap /
-    offline → the usual static image."""
+    offline → the usual static image.
+
+    A figure cell with TINTED overlay layers (and no vectors explorer — the
+    vectors swap takes precedence) exports the overlay BLENDER instead: base
+    grayscale + clear→tint ramps with a LIVE opacity slider per overlay (see
+    overlay_embed.py). No tinted overlay → the live-figure iframe as before."""
     blocks: list[str] = []
     for c in mgr.doc.cells:
         if c.cell_type == "markdown":
@@ -220,6 +231,21 @@ def _render_body(mgr, assets: dict, *, interactive: bool, session=None) -> str:
                     except Exception as e:
                         log.debug("vectors embed for cell %s failed: %s",
                                   c.id, e)
+                # Tinted-overlay blender (vectors swap above wins when both
+                # apply — a vectors cell stays a vectors explorer).
+                if not html_frag:
+                    try:
+                        from spyde.actions.report.overlay_embed import (
+                            overlay_blender_html,
+                        )
+                        ov_html = overlay_blender_html(mgr, c,
+                                                       caption=c.caption)
+                        if ov_html is not None:
+                            html_frag = _figure_iframe_html(c.caption,
+                                                            ov_html)
+                    except Exception as e:
+                        log.debug("overlay blender embed for cell %s "
+                                  "failed: %s", c.id, e)
                 if not html_frag:
                     fig_html = _build_interactive_figure_html(mgr, c)
                     if fig_html is not None:
@@ -378,10 +404,20 @@ def report_paste_cell(session, plot, payload) -> None:
                 placeholder=False, spec=spec)
 
     # Resolve every layer against open trees/files; a live rebuild needs a snapshot
-    # for EACH layer (same all-or-offline rule as report_open).
+    # for EACH layer (same all-or-offline rule as report_open). A scene3d panel
+    # rebinds by RECOMPUTING its point cloud from the resolved orientation
+    # result (no image layer to read) — same rule as report_open's rebind.
+    from spyde.actions.report.handlers import _scene3d_snap_entries
     snap_map: dict = {}
     all_resolved = bool(spec.panels)
     for panel in spec.panels:
+        if str(getattr(panel, "kind", "")) == "scene3d":
+            entries = _scene3d_snap_entries(session, panel)
+            if entries is None:
+                all_resolved = False
+            else:
+                snap_map.update(entries)
+            continue
         for layer in panel.layers:
             src_plot = layer.source.resolve(session) if layer.source else None
             arr = None

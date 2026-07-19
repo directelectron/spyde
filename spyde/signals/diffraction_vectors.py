@@ -823,6 +823,61 @@ class SpyDEDiffractionVectors:
             (int(iy), int(ix)),
         )[0, 0]
 
+    def render_region(
+        self,
+        y0: int,
+        y1: int,
+        x0: int,
+        x1: int,
+        t: Optional[int] = None,
+    ) -> np.ndarray:
+        """
+        (H, W) float32 frame INTEGRATED over the nav rectangle [y0, y1) x [x0, x1).
+
+        Accumulation rule (mirrors the MDI region-integrate contract): each nav
+        position's disks are rendered with the existing INTRA-frame MAX semantics
+        (overlapping disks within one position keep the max), then those per-
+        position frames are SUMMED across the region. This guarantees a 1x1
+        region equals :meth:`render_frame` exactly — pointer == integrate at one
+        position — while never double-counting overlapping disks inside a single
+        frame.
+
+        Memory-safe: only slices the compact CSR flat buffer (O(rows)); never
+        materialises the source dataset. The bounds are clamped to the nav grid
+        and ordered, so a degenerate/backwards rectangle is handled gracefully.
+        """
+        ny, nx = self.nav_shape
+        y0, y1 = sorted((int(y0), int(y1)))
+        x0, x1 = sorted((int(x0), int(x1)))
+        y0 = max(0, min(ny, y0))
+        y1 = max(0, min(ny, y1))
+        x0 = max(0, min(nx, x0))
+        x1 = max(0, min(nx, x1))
+        # An empty selection collapses to a single position (never smaller than
+        # 1x1 so region-mode always shows the pointed position).
+        if y1 <= y0:
+            y1 = min(ny, y0 + 1)
+        if x1 <= x0:
+            x1 = min(nx, x0 + 1)
+
+        H = int(self.sig_axes[1].size)
+        W = int(self.sig_axes[0].size)
+        acc = np.zeros((H, W), dtype=np.float32)
+        for iy in range(y0, y1):
+            for ix in range(x0, x1):
+                rows = self.at(iy, ix) if t is None else self.at_t(iy, ix, t)
+                if len(rows) == 0:
+                    continue
+                frame = _render_disks_block(
+                    rows, (1, 1), (H, W),
+                    float(self.sig_axes[0].scale), float(self.sig_axes[0].offset),
+                    float(self.sig_axes[1].scale), float(self.sig_axes[1].offset),
+                    self.kernel_radius_px,
+                    (int(iy), int(ix)),
+                )[0, 0]
+                acc += frame
+        return acc
+
     def to_rendered_dask(self, nav_chunk: int = 32):
         """
         Lazy dask array of rendered disk frames shaped like the source dataset:

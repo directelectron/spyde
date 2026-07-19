@@ -812,6 +812,11 @@ class TestLayoutPresets:
         nav_wid = _nav_wid(session)
         cid, a, b, c = self._build_3panel_sparse(session, messages, sig_wid, nav_wid)
         before = _fig_dict_of(messages, cid)
+        # The SHIPPED state stamps ephemeral per-panel nav_dims (Phase 3 callout
+        # gating); strip it so the comparison below is against the PERSISTED
+        # spec shape (spec.to_dict() never carries it).
+        for p in before["panels"]:
+            p.pop("nav_dims", None)
 
         messages.clear()
         cx.repfig_apply_layout_preset(session, None,

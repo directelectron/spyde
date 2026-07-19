@@ -52,6 +52,43 @@ def _resolve_cmap(name):
     return COLORMAPS.get(name, name)
 
 
+def _apply_text_sizes(plot, text_sizes: dict) -> None:
+    """Apply per-element font-size overrides from a panel's ``text_sizes`` dict
+    onto a live anyplotlib *plot* via its existing live setters (mutate state +
+    push, no rebuild). Reads the CURRENT text from ``plot._state`` (falling back
+    to ``""``) so a pure size change never clobbers the label/title text.
+
+    Each key is ``hasattr``-guarded (a kind/backend that lacks the setter is
+    silently skipped, mirroring the ``indicate_region`` guard) and individually
+    try/excepted so one bad key can't block the rest."""
+    if not text_sizes:
+        return
+    state = getattr(plot, "_state", None) or {}
+
+    def _apply(key, fn_name, cur_text_key=None):
+        if key not in text_sizes or text_sizes[key] is None:
+            return
+        fn = getattr(plot, fn_name, None)
+        if fn is None:
+            return
+        try:
+            size = float(text_sizes[key])
+            if cur_text_key is None:
+                fn(size)
+            else:
+                fn(str(state.get(cur_text_key, "") or ""), fontsize=size)
+        except Exception as e:
+            log.debug("report figure text_sizes[%s] via %s failed: %s",
+                      key, fn_name, e)
+
+    _apply("title", "set_title", "title")
+    _apply("ticks", "set_tick_label_size")
+    _apply("x_label", "set_xlabel", "x_label")
+    _apply("y_label", "set_ylabel", "y_label")
+    _apply("colorbar", "set_colorbar_label", "colorbar_label")
+    _apply("legend", "set_legend_fontsize")
+
+
 def _panel_axes_kw(panel):
     """(axes_kw, units) for calibrated ticks / scale bar from a panel's axes."""
     axes_kw = {}
@@ -233,7 +270,9 @@ def _add_annotation_widget(p2, kind, conv):
         if r is None:
             return None
         color = _first_color(conv.get("edgecolors"), "#00e5ff")
+        lw = _scalar0(conv.get("linewidths"))
         return p2.add_circle_widget(cx=cx, cy=cy, r=float(r), color=color,
+                                    linewidth=float(lw) if lw else 2.0,
                                     show_handles=True)
     if kind == "rect":
         w = _scalar0(conv.get("widths"))
@@ -241,9 +280,11 @@ def _add_annotation_widget(p2, kind, conv):
         if w is None or hh is None:
             return None
         color = _first_color(conv.get("edgecolors"), "#00e5ff")
+        lw = _scalar0(conv.get("linewidths"))
         # spec rect offset is the CENTER; widget x/y is the TOP-LEFT.
         return p2.add_rectangle_widget(x=cx - float(w) / 2.0, y=cy - float(hh) / 2.0,
                                        w=float(w), h=float(hh), color=color,
+                                       linewidth=float(lw) if lw else 2.0,
                                        show_handles=True)
     if kind == "arrow":
         u = _scalar0(conv.get("U"))
@@ -251,7 +292,9 @@ def _add_annotation_widget(p2, kind, conv):
         if u is None or v is None:
             return None
         color = _first_color(conv.get("edgecolors"), "#00e5ff")
+        lw = _scalar0(conv.get("linewidths"))
         return p2.add_arrow_widget(x=cx, y=cy, u=float(u), v=float(v), color=color,
+                                   linewidth=float(lw) if lw else 2.0,
                                    show_handles=True)
     return None
 
@@ -259,14 +302,163 @@ def _add_annotation_widget(p2, kind, conv):
 # ── one panel: base image + overlay layers ────────────────────────────────────
 
 
+def _render_scene3d_panel(ax, panel, snap_map):
+    """Render a scene3d panel (the 3-D IPF sphere) onto ``ax`` from its
+    point-cloud snapshots — ``(panel_id, "xyz")`` / ``(panel_id, "rgb")`` — and
+    the small ``panel.scene`` params. Mirrors ``build_ipf_3d_figure``'s scatter
+    via the shared ``ipf_view.scatter_ipf_sphere`` call, so a report cell shows
+    the SAME sphere the live explorer does. Returns the ``Plot3D`` (or None
+    when the point cloud is missing/empty — the panel is skipped, no crash).
+
+    Annotations/insets/edit widgets never apply here: 2-D marker geometry has
+    no meaning on the 3-D scene, so the caller's annotation path is bypassed
+    entirely for this panel kind."""
+    from spyde.actions.ipf_view import (
+        IPF3D_BOUNDS, IPF3D_POINT_SIZE, IPF3D_ZOOM, scatter_ipf_sphere,
+    )
+
+    xyz = snap_map.get((panel.id, "xyz"))
+    rgb = snap_map.get((panel.id, "rgb"))
+    if xyz is None or rgb is None or len(np.asarray(xyz)) == 0:
+        return None
+    scene = panel.scene or {}
+    try:
+        point_size = float(scene.get("point_size", IPF3D_POINT_SIZE))
+    except (TypeError, ValueError):
+        point_size = float(IPF3D_POINT_SIZE)
+    bounds = scene.get("bounds") or IPF3D_BOUNDS
+    try:
+        return scatter_ipf_sphere(ax, np.asarray(xyz), np.asarray(rgb),
+                                  point_size=point_size, bounds=bounds,
+                                  zoom=IPF3D_ZOOM)
+    except Exception as e:
+        log.debug("report figure scene3d render failed (panel %s): %s",
+                  panel.id, e)
+        return None
+
+
+def _line_axes_kw(panel):
+    """(x, units) for a line panel's calibrated x-axis from ``panel.axes``
+    (``{units, x_axis}`` — the 1-D snapshot's axes dict, distinct from the 2-D
+    ``{units, x_axis, y_axis}`` shape ``_panel_axes_kw`` reads). Returns
+    ``(None, "px")`` when the panel carries no usable x-axis (the caller falls
+    back to ``ax.plot``'s own ``arange`` default)."""
+    if panel is not None and panel.axes:
+        try:
+            xa = panel.axes.get("x_axis")
+            if xa is not None:
+                units = str(panel.axes.get("units") or "px")
+                return np.asarray(xa, dtype=float), units
+        except Exception as e:
+            log.debug("report figure line axes from spec failed: %s", e)
+    return None, "px"
+
+
+def _render_line_panel(ax, panel, snap_map):
+    """Render a line panel (``kind="line"``) onto ``ax``: the base curve
+    (layer 0, via ``ax.plot``) + any extra overlay curves (layers 1..N, via
+    ``Plot1D.add_line``), styled from each LayerSpec's ``color``/``linewidth``/
+    ``label`` (unset → anyplotlib's own defaults). Sets the x-axis label from
+    the panel's calibrated units and the panel title. Returns the base
+    ``Plot1D`` (or None if the panel has no paintable base snapshot).
+
+    A LENGTH MISMATCH between the panel's stored x-axis and a layer's y-data
+    (e.g. a stale axes dict after a data-shape change) falls back to a bare
+    index axis for THAT layer rather than raising — logged at debug.
+
+    No scalebar / colorbar / clim apply to a line panel (1-D has no
+    calibrated area or intensity range to bar/bar-label); annotations/insets
+    are the caller's responsibility to skip (see ``_render_panel``)."""
+    if not panel.layers:
+        return None
+    base_layer = panel.layers[0]
+    base_y = snap_map.get((panel.id, base_layer.id))
+    if base_y is None:
+        return None
+    base_y = np.asarray(base_y, dtype=np.float64).reshape(-1)
+
+    xa, units = _line_axes_kw(panel)
+    if xa is not None and xa.shape[0] != base_y.shape[0]:
+        log.debug("report line panel %s: x_axis length %d != data length %d, "
+                  "falling back to index axis", panel.id, xa.shape[0],
+                  base_y.shape[0])
+        xa = None
+
+    plot_kw = {}
+    if base_layer.color:
+        plot_kw["color"] = str(base_layer.color)
+    if base_layer.linewidth:
+        plot_kw["linewidth"] = float(base_layer.linewidth)
+    if base_layer.label:
+        plot_kw["label"] = str(base_layer.label)
+    p1 = ax.plot(base_y, axes=([xa] if xa is not None else None),
+                units=units, **plot_kw)
+
+    for layer in panel.layers[1:]:
+        if not layer.visible:
+            continue
+        y = snap_map.get((panel.id, layer.id))
+        if y is None:
+            continue
+        y = np.asarray(y, dtype=np.float64).reshape(-1)
+        lxa, _lunits = _line_axes_kw(panel)
+        if lxa is not None and lxa.shape[0] != y.shape[0]:
+            lxa = None
+        line_kw = {}
+        if layer.color:
+            line_kw["color"] = str(layer.color)
+        if layer.linewidth:
+            line_kw["linewidth"] = float(layer.linewidth)
+        if layer.label:
+            line_kw["label"] = str(layer.label)
+        try:
+            p1.add_line(y, x_axis=lxa, **line_kw)
+        except Exception as e:
+            log.debug("report figure line add_line failed (panel %s layer "
+                      "%s): %s", panel.id, layer.id, e)
+
+    if units and units != "px" and hasattr(p1, "set_xlabel"):
+        try:
+            p1.set_xlabel(units)
+        except Exception as e:
+            log.debug("report line panel set_xlabel failed: %s", e)
+
+    if panel.title and hasattr(p1, "set_title"):
+        try:
+            p1.set_title(str(panel.title))
+        except Exception as e:
+            log.debug("report figure line set_title failed: %s", e)
+
+    if panel.text_sizes:
+        _apply_text_sizes(p1, panel.text_sizes)
+
+    return p1
+
+
 def _render_panel(ax, panel, snap_map, *, interactive=False, wiring=None):
     """Render one panel onto ``ax``: the base image (layer 0) + any overlay layers
     (``add_layer``) + annotations. Returns the base ``Plot2D`` (or None if the panel
     has no paintable base snapshot).
 
+    A ``scene3d`` panel takes the 3-D scatter path instead (returns a ``Plot3D``);
+    image layers/annotations/edit widgets don't apply to it. A ``line`` panel takes
+    the 1-D curve path instead (returns a ``Plot1D``); annotations/insets don't
+    apply to it either — no scalebar/colorbar/clim, and the caller's annotation
+    call is skipped entirely for this kind (see the ``kind == "line"`` branch below,
+    which returns BEFORE the shared image-annotation call at the end of this
+    function).
+
     ``interactive=True`` renders the panel's annotations as draggable EDIT widgets
     and appends their ``(widget, panel_id, ann_index, panel_spec)`` wiring tuples to
     the passed ``wiring`` list (for the caller to attach drag-persist handlers)."""
+    if str(getattr(panel, "kind", "")) == "scene3d":
+        return _render_scene3d_panel(ax, panel, snap_map)
+    if str(getattr(panel, "kind", "")) == "line":
+        # Annotations/callouts are refused on a line panel (compose.py's
+        # repfig_add_annotation/add_callout/add_time_callouts/add_zoom_callout
+        # all check panel.kind and error out before mutating the spec), so
+        # there is never a wiring list to populate here — just render + return.
+        return _render_line_panel(ax, panel, snap_map)
     if not panel.layers:
         return None
     base_layer = panel.layers[0]
@@ -302,9 +494,17 @@ def _render_panel(ax, panel, snap_map, *, interactive=False, wiring=None):
         if layer.clim and layer.clim[0] is not None and layer.clim[1] is not None:
             clim = (float(layer.clim[0]), float(layer.clim[1]))
         try:
+            # tint only when SET: a legacy (untinted) layer issues the exact
+            # pre-tint call, and the cmap always rides along as the stored
+            # revert value (add_layer keeps both; only Layer.set() rejects the
+            # cmap+tint combination). The base layer never tints — it's the
+            # panel's imshow, not an add_layer.
+            add_kw = {}
+            if getattr(layer, "tint", None):
+                add_kw["tint"] = str(layer.tint)
             p2.add_layer(arr, cmap=_resolve_cmap(layer.cmap),
                          alpha=float(layer.alpha), clim=clim,
-                         visible=bool(layer.visible))
+                         visible=bool(layer.visible), **add_kw)
         except Exception as e:
             log.debug("report figure add_layer failed (panel %s layer %s): %s",
                       panel.id, layer.id, e)
@@ -314,6 +514,9 @@ def _render_panel(ax, panel, snap_map, *, interactive=False, wiring=None):
             p2.set_title(str(panel.title))
         except Exception as e:
             log.debug("report figure set_title failed: %s", e)
+
+    if panel.text_sizes:
+        _apply_text_sizes(p2, panel.text_sizes)
 
     panel_wiring = _apply_annotations(p2, panel.annotations, panel.axes,
                                       interactive=interactive, panel_spec=panel)
@@ -330,17 +533,116 @@ _CORNER_ALIASES = {
 }
 
 
-def _apply_insets(fig, panel, base_plot, snap_map):
+# Edit-mode callout markers are drawn in a distinct accent so they don't read
+# as content annotations (annotation widgets default to #00e5ff).
+_CALLOUT_MARKER_COLOR = "#89b4fa"
+
+
+def _add_callout_marker(base_plot, inset, base_shape):
+    """A small draggable circle widget on the BASE panel marking a fresh-slice
+    callout's nav position (edit mode only). Only for an inset carrying 2-D
+    ``nav_indices`` AND a connector — the connector is created exactly when the
+    base panel IS the navigator image, so the nav point maps onto base-panel
+    pixels (a ``time_index`` inset on an image base panel has no spatial
+    anchor → skip). anyplotlib 2-D widgets take IMAGE PIXELS and a navigator
+    image has index == pixel, so the nav indices are used directly. Returns the
+    widget, or None (unusable geometry — logged + skipped)."""
+    if base_plot is None:
+        return None
+    nav_indices = inset.get("nav_indices")
+    if not isinstance(nav_indices, (list, tuple)) or len(nav_indices) != 2:
+        return None
+    if inset.get("connector") is None:
+        return None
+    try:
+        ix, iy = float(nav_indices[0]), float(nav_indices[1])
+        # Radius scaled to the base image so the handle stays visible on a tiny
+        # nav map yet unobtrusive on a large one.
+        r = max(0.5, 0.02 * max(base_shape)) if base_shape else 3.0
+        return base_plot.add_circle_widget(cx=ix, cy=iy, r=float(r),
+                                           color=_CALLOUT_MARKER_COLOR,
+                                           show_handles=False)
+    except Exception as e:
+        log.debug("callout marker widget failed: %s", e)
+        return None
+
+
+def _add_zoom_region_widget(base_plot, panel, inset):
+    """A draggable RECTANGLE widget on the BASE panel marking a zoom-region
+    callout's source rect (edit mode only) — the resize-handle affordance for
+    ``repfig_add_zoom_callout``. Only for an inset carrying ``zoom_region``
+    (DATA coords); converted to the base panel's IMAGE PIXELS via
+    ``coords.data_region_to_index`` (the inverse of ``compose.
+    _index_region_to_data``, which built ``zoom_region`` in the first place).
+    Returns the widget, or None (no zoom_region / unusable geometry — logged +
+    skipped, mirroring :func:`_add_callout_marker`)."""
+    from spyde.actions.report import coords
+
+    if base_plot is None:
+        return None
+    region = inset.get("zoom_region")
+    if not isinstance(region, (list, tuple)) or len(region) != 4:
+        return None
+    try:
+        x, y, w, h = coords.data_region_to_index(region, panel.axes)
+        return base_plot.add_rectangle_widget(
+            x=float(x), y=float(y), w=float(w), h=float(h),
+            color=_CALLOUT_MARKER_COLOR, linewidth=2, show_handles=True)
+    except Exception as e:
+        log.debug("zoom region widget failed: %s", e)
+        return None
+
+
+def _apply_insets(fig, panel, base_plot, snap_map, *, interactive=False,
+                  wiring=None, zoom_wiring=None, inset_id_map=None):
     """Render each of a panel's callout insets: a small floating axes
     (``fig.add_inset``) showing the referenced panel's base snapshot, plus a
-    connector to the source region when anyplotlib exposes ``indicate_region``."""
-    for inset in panel.insets or []:
+    connector to the source region when anyplotlib exposes ``indicate_region``.
+    An inset may carry an ``anchor`` ([fx, fy] figure fractions, top-left
+    corner) for free placement — it wins over ``corner``.
+
+    A ZOOM-REGION inset (``inset["zoom_region"]`` set — a magnified crop of the
+    BASE panel's own pixels, from ``repfig_add_zoom_callout``) renders with the
+    BASE layer-0's cmap/clim instead of the flat "gray" every other (fresh-
+    slice) callout uses, so the magnified crop matches the parent's display.
+
+    ``interactive=True`` (edit mode) also adds, per inset: a draggable MARKER
+    widget on the base panel for a fresh-slice callout (see
+    :func:`_add_callout_marker`, appended to *wiring* as ``(widget, panel_id,
+    inset_index, panel_spec)``), OR a draggable RECTANGLE widget for a zoom
+    callout (see :func:`_add_zoom_region_widget`, appended to *zoom_wiring* as
+    ``(widget, panel_id, inset_index)``) — never both, since the two kinds are
+    mutually exclusive per inset.
+
+    *inset_id_map*, when given, is populated with ``{ref_panel_id:
+    inset_dispatch_id}`` for every rendered inset — the SPEC inset-panel id →
+    the anyplotlib Plot2D dispatch id ``fig.add_inset(...).imshow(...)``
+    creates. The caller stashes this SEPARATELY from ``fig._report_panel_map``
+    (as ``fig._report_inset_map``) — inset panels are floating callouts, not
+    grid panels, so they must NOT enter the panel-select / text-size dispatch
+    path that iterates ``_report_panel_map``; an ``inset_geometry_change``
+    handler inverts ``_report_inset_map`` instead to resolve its ``inset_id``
+    (a dispatch id) back to the owning spec panel id."""
+    base_shape = None
+    base_layer = panel.layers[0] if panel.layers else None
+    if base_layer is not None:
+        a0 = snap_map.get((panel.id, base_layer.id))
+        if a0 is not None:
+            base_shape = np.asarray(a0).shape[:2]
+    for inset_index, inset in enumerate(panel.insets or []):
         try:
             ref_panel_id = inset.get("panel")
             corner = _CORNER_ALIASES.get(str(inset.get("corner", "top-right")),
                                          "top-right")
             w_frac = float(inset.get("w_frac", 0.3))
             h_frac = float(inset.get("h_frac", 0.3))
+            inset_kw = {}
+            anchor = inset.get("anchor")
+            if anchor is not None:
+                try:
+                    inset_kw["anchor"] = (float(anchor[0]), float(anchor[1]))
+                except (TypeError, ValueError, IndexError):
+                    pass
             # The inset image is the referenced panel's FIRST layer snapshot.
             arr = None
             for (pid, _lid), a in snap_map.items():
@@ -351,11 +653,32 @@ def _apply_insets(fig, panel, base_plot, snap_map):
                 continue
             arr = np.asarray(arr)
             inset_ax = fig.add_inset(w_frac, h_frac, corner=corner,
-                                     title=str(inset.get("title", "")))
+                                     title=str(inset.get("title", "")),
+                                     **inset_kw)
+            is_zoom = inset.get("zoom_region") is not None
             is_rgb = arr.ndim == 3 and arr.shape[-1] in (3, 4)
+            if is_rgb:
+                inset_cmap = None
+            elif is_zoom and base_layer is not None:
+                # Match the parent's display so the magnified crop reads as
+                # "the same image, zoomed in" rather than a re-tinted copy.
+                inset_cmap = _resolve_cmap(base_layer.cmap)
+            else:
+                inset_cmap = "gray"
             ip = inset_ax.imshow(
                 arr if is_rgb else np.nan_to_num(np.asarray(arr, dtype=np.float32)),
-                cmap=(None if is_rgb else "gray"), tile=False)
+                cmap=inset_cmap, tile=False)
+            disp_id = getattr(ip, "_id", None)
+            if inset_id_map is not None and ref_panel_id is not None \
+                    and disp_id is not None:
+                inset_id_map[ref_panel_id] = disp_id
+            if is_zoom and not is_rgb and base_layer is not None \
+                    and base_layer.clim and base_layer.clim[0] is not None \
+                    and base_layer.clim[1] is not None:
+                try:
+                    ip.set_clim(float(base_layer.clim[0]), float(base_layer.clim[1]))
+                except Exception as e:
+                    log.debug("report zoom inset set_clim failed: %s", e)
             # Connector (dashed source rect + leader lines) — only if anyplotlib
             # provides it (added in parallel). Region = the snapshot nav-selector
             # region, if the spec recorded one.
@@ -367,6 +690,16 @@ def _apply_insets(fig, panel, base_plot, snap_map):
                     inset_ax.indicate_region(base_plot, tuple(region))
                 except Exception as e:
                     log.debug("report inset indicate_region failed: %s", e)
+            if interactive:
+                if is_zoom:
+                    if zoom_wiring is not None:
+                        w = _add_zoom_region_widget(base_plot, panel, inset)
+                        if w is not None:
+                            zoom_wiring.append((w, panel.id, inset_index))
+                elif wiring is not None:
+                    w = _add_callout_marker(base_plot, inset, base_shape)
+                    if w is not None:
+                        wiring.append((w, panel.id, inset_index, panel))
         except Exception as e:
             log.debug("report figure inset %r failed: %s", inset, e)
 
@@ -486,10 +819,19 @@ def build_cell_figure(spec, snapshots, *, standalone: bool = False,
             base_by_panel[panel.id] = p2
         used.add((r, c))
 
-    # Callout insets (rendered after all panels so their referenced panel exists).
+    # Callout insets (rendered after all panels so their referenced panel
+    # exists). In edit mode this also creates the draggable fresh-slice
+    # markers (wired by the caller via ``fig._report_callout_wiring``) and the
+    # draggable zoom-region RECTANGLES (via ``fig._report_zoom_wiring``) — the
+    # two lists are disjoint per inset (see ``_apply_insets``).
+    callout_wiring: list = []
+    zoom_wiring: list = []
+    inset_id_map: dict = {}
     for panel in spec.panels:
         if panel.insets:
-            _apply_insets(fig, panel, base_by_panel.get(panel.id), snap_map)
+            _apply_insets(fig, panel, base_by_panel.get(panel.id), snap_map,
+                          interactive=interactive, wiring=callout_wiring,
+                          zoom_wiring=zoom_wiring, inset_id_map=inset_id_map)
 
     # Apply the figure-level layout spacing (hspace/wspace) from the layout dict
     # when the user has tuned it (the whole-figure gap between grid panels).
@@ -516,9 +858,18 @@ def build_cell_figure(spec, snapshots, *, standalone: bool = False,
     # Stash the SPEC-panel-id → anyplotlib plot dispatch id map so the manager can
     # push ``fig.selected_panel`` (which is keyed by the anyplotlib plot id) from a
     # spec-panel id. base_by_panel already keys the rendered base Plot2D per spec id.
+    # Inset panels are kept OUT of this map (they aren't grid-selectable / don't
+    # take a text-size target) — see ``fig._report_inset_map`` below instead.
     fig._report_panel_map = {pid: getattr(p2, "_id", None)
                              for pid, p2 in base_by_panel.items()
                              if getattr(p2, "_id", None) is not None}
+
+    # SPEC inset-panel id → its anyplotlib Plot2D dispatch id (from
+    # ``_apply_insets``'s inset_id_map). Lets an ``inset_geometry_change``
+    # event's ``inset_id`` (a dispatch id) resolve back to the spec panel that
+    # owns the moved/resized inset, without polluting ``_report_panel_map``'s
+    # grid-panel-only contract (panel-select / text-size dispatch).
+    fig._report_inset_map = dict(inset_id_map)
 
     # Materialise pixel tokens (base + every layer) so the standalone HTML embed is
     # self-contained even when the app's binary transport is active.
@@ -526,8 +877,18 @@ def build_cell_figure(spec, snapshots, *, standalone: bool = False,
 
     # Stash the edit-mode drag-persist wiring on the figure so the caller can
     # attach pointer_up handlers to each widget (and the wiring is kept alive
-    # alongside the figure). Empty for non-interactive builds.
+    # alongside the figure). Empty for non-interactive builds. The callout
+    # wiring is the same contract for the fresh-slice marker widgets:
+    # ``[(widget, panel_id, inset_index, panel_spec)]``. The zoom wiring is the
+    # rectangle-widget contract for zoom-region callouts:
+    # ``[(widget, base_panel_id, inset_index)]`` — the handler side
+    # (``handlers._wire_zoom_region_drag``) re-resolves the PanelSpec from
+    # ``cell.spec`` by id at drop time (the same defensive re-lookup every
+    # other drag handler here does, so a rebuilt/removed panel can't leave a
+    # handler holding a stale spec object).
     fig._report_annotation_wiring = wiring
+    fig._report_callout_wiring = callout_wiring
+    fig._report_zoom_wiring = zoom_wiring
 
     fig_id = _electron.register(fig)
     html = finalize_figure_html(fig, fig_id, standalone=standalone)
@@ -560,6 +921,11 @@ def _resolve_pixels_for_standalone(fig) -> None:
         return
     for panel_id, plot in list(plots_map.items()):
         try:
+            # A 3-D panel (scene3d) has no pixel tokens: its geometry is already
+            # self-contained b64 in the state the normal push wrote. Skip it —
+            # nothing to resolve, and this loop's geom rewrite is Plot2D-shaped.
+            if str((getattr(plot, "_state", None) or {}).get("kind", "")) == "3d":
+                continue
             tname = f"panel_{panel_id}_json"
             if not fig.has_trait(tname):
                 continue

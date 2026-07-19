@@ -30,6 +30,74 @@ def _as_orientation_map(result):
     return result
 
 
+def tree_orientation_result(tree):
+    """The orientation result associated with *tree* (the IPF window's tree), or
+    None. Checks the cached ``_ipf_result`` first (set by :func:`attach_ipf_3d`),
+    then the raw-OM / vector-OM attach points — the SAME resolution chain
+    ``ipf_set_direction`` uses, factored out so the Report Builder's scene3d
+    snapshot resolves the result identically."""
+    if tree is None:
+        return None
+    return (getattr(tree, "_ipf_result", None)
+            or getattr(tree, "orientation_map", None)
+            or getattr(tree, "vector_orientation", None))
+
+
+# The 3-D IPF scene's fixed display parameters — ONE source of truth shared by
+# the live explorer (build_ipf_3d_figure) and the report scene3d panel renderer
+# (figure_builder._render_panel), so a report cell mirrors the live view.
+IPF3D_POINT_SIZE = 6.0
+IPF3D_BOUNDS = ((-1.0, 1.0),) * 3
+IPF3D_ZOOM = 1.4
+
+
+def ipf_scene_data(result, direction: str = "z"):
+    """Compute the 3-D IPF sphere scene from an orientation *result* →
+    ``(xyz (M,3) float32, rgb (M,3) uint8, scene dict)`` — or None when the
+    result yields no points. The shared builder behind BOTH ``emit_ipf_3d``
+    (live explorer) and the Report Builder's ``_snapshot_scene3d``; the returned
+    ``scene`` dict is the SMALL param record stored on ``PanelSpec.scene``
+    (never the arrays)."""
+    om = _as_orientation_map(result)
+    try:
+        xyz, rgb = om.ipf_sphere_points(direction)
+    except Exception as e:
+        log.debug("ipf_sphere_points failed: %s", e)
+        return None
+    if xyz is None or len(xyz) == 0:
+        return None
+    scene = {
+        "kind": "ipf3d",
+        "direction": str(direction),
+        "point_size": float(IPF3D_POINT_SIZE),
+        "bounds": [list(b) for b in IPF3D_BOUNDS],
+    }
+    return np.asarray(xyz), np.asarray(rgb), scene
+
+
+def scatter_ipf_sphere(ax, xyz: np.ndarray, rgb: np.ndarray, *,
+                       point_size: float = IPF3D_POINT_SIZE,
+                       bounds=IPF3D_BOUNDS, zoom: float = IPF3D_ZOOM):
+    """Draw the IPF unit-sphere scatter onto *ax* → the live ``Plot3D``. The one
+    ``scatter3d`` call both the live explorer and the report scene3d panel make
+    (crystal-axis labels, fixed unit bounds, GPU instanced points, reference
+    sphere)."""
+    colors = np.clip(np.asarray(rgb).astype(np.float32) / 255.0, 0.0, 1.0)
+    xyz = np.asarray(xyz)
+    p3d = ax.scatter3d(
+        xyz[:, 0], xyz[:, 1], xyz[:, 2],
+        colors=colors, point_size=float(point_size),
+        x_label="[100]", y_label="[010]", z_label="[001]",
+        bounds=tuple(tuple(b) for b in bounds), zoom=float(zoom),
+        gpu=True,
+    )
+    try:
+        p3d.set_sphere(1.0)
+    except Exception as e:
+        log.debug("setting IPF sphere failed: %s", e)
+    return p3d
+
+
 def build_ipf_3d_figure(xyz: np.ndarray, rgb: np.ndarray, highlight=None):
     """Build the 3-D IPF scatter figure → ``(fig, fig_id, html)``. If
     ``highlight`` is a 3-vector, draw a large black-ringed white marker there (the
@@ -40,18 +108,7 @@ def build_ipf_3d_figure(xyz: np.ndarray, rgb: np.ndarray, highlight=None):
 
     fig, axes = apl.subplots(1, 1)
     ax = axes[0][0] if isinstance(axes, list) else axes
-    colors = np.clip(rgb.astype(np.float32) / 255.0, 0.0, 1.0)
-    p3d = ax.scatter3d(
-        xyz[:, 0], xyz[:, 1], xyz[:, 2],
-        colors=colors, point_size=6,
-        x_label="[100]", y_label="[010]", z_label="[001]",
-        bounds=((-1, 1),) * 3, zoom=1.4,
-        gpu=True,
-    )
-    try:
-        p3d.set_sphere(1.0)
-    except Exception as e:
-        log.debug("setting IPF sphere failed: %s", e)
+    p3d = scatter_ipf_sphere(ax, xyz, rgb)
     if highlight is not None:
         try:
             p3d.set_highlight(float(highlight[0]), float(highlight[1]),
@@ -73,26 +130,21 @@ def emit_ipf_3d(window_id: int, result, direction: str = "z",
     re-emitting. Returns True if a figure was emitted."""
     from spyde.backend.ipc import emit
 
-    om = _as_orientation_map(result)
-    try:
-        xyz, rgb = om.ipf_sphere_points(direction)
-    except Exception as e:
-        import logging
-        logging.getLogger(__name__).debug("ipf_sphere_points failed: %s", e)
+    scene = ipf_scene_data(result, direction)
+    if scene is None:
         return False
-    if xyz is None or len(xyz) == 0:
-        return False
+    xyz, rgb, _params = scene
 
     highlight = None
     if highlight_iyix is not None:
         try:
             iy, ix = int(highlight_iyix[0]), int(highlight_iyix[1])
+            om = _as_orientation_map(result)
             highlight = om.ipf_xyz(iy, ix, 0, direction)[0]      # the sphere point
         except Exception:
             highlight = None
 
-    _fig, fig_id, html, p3d = build_ipf_3d_figure(
-        np.asarray(xyz), np.asarray(rgb), highlight=highlight)
+    _fig, fig_id, html, p3d = build_ipf_3d_figure(xyz, rgb, highlight=highlight)
     keep_alive(int(window_id), _fig)
     if tree is not None:
         tree._ipf_p3d = p3d
@@ -292,9 +344,7 @@ def ipf_set_direction(session, plot, payload) -> None:
     tree = getattr(plot, "signal_tree", None)
     if tree is None:
         return
-    result = (getattr(tree, "_ipf_result", None)
-              or getattr(tree, "orientation_map", None)
-              or getattr(tree, "vector_orientation", None))
+    result = tree_orientation_result(tree)
     if result is None:
         return
     try:

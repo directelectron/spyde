@@ -21,20 +21,31 @@ const MIN_W = 300
 const MAX_W = 800
 const DEFAULT_W = 420
 
+// The rendered-markdown text sizes the header "Aa" button cycles through.
+const MD_SIZES = [11, 13, 15, 17]
+
 const DROP_MIMES = [FIGURE_DRAG_MIME, WINDOW_DRAG_MIME]
 
-function sourceWindowIdFromDrop(dt: DataTransfer): number | null {
+/** The figure payload of a pill drop: the source window id plus — when the
+ *  FIGURE_DRAG_MIME payload carries them — the dragged window's shown figure
+ *  id and its view tag (view:'3d' while the 3-D IPF explorer was up), which
+ *  report_add_figure branches on to snapshot the 3-D scene. */
+interface DropFigurePayload { windowId: number; figId?: string; view?: string }
+
+function figurePayloadFromDrop(dt: DataTransfer): DropFigurePayload | null {
   const fig = dt.getData(FIGURE_DRAG_MIME)
   if (fig) {
     try {
-      const { windowId } = JSON.parse(fig) as { windowId?: number }
-      if (typeof windowId === 'number') return windowId
+      const { windowId, figId, view } = JSON.parse(fig) as {
+        windowId?: number; figId?: string; view?: string
+      }
+      if (typeof windowId === 'number') return { windowId, figId, view }
     } catch { /* malformed */ }
   }
   const win = dt.getData(WINDOW_DRAG_MIME)
   if (win) {
     const n = parseInt(win, 10)
-    if (Number.isFinite(n)) return n
+    if (Number.isFinite(n)) return { windowId: n }
   }
   return null
 }
@@ -51,6 +62,18 @@ export function ReportSidebar() {
 
   const [width, setWidth] = useState(DEFAULT_W)
   const [rawMode, setRawMode] = useState(false)
+  // Rendered-markdown base font size (px), cycled by the "Aa" header button and
+  // applied to the cell list as the `--spyde-md-fs` CSS var (all .spyde-md
+  // sizes are em-relative, so headings/code/tables scale together).
+  const [mdSize, setMdSize] = useState<number>(() => {
+    const v = Number(localStorage.getItem('spyde-report-md-fs'))
+    return MD_SIZES.includes(v) ? v : 13
+  })
+  const cycleMdSize = () => {
+    const next = MD_SIZES[(MD_SIZES.indexOf(mdSize) + 1) % MD_SIZES.length]
+    setMdSize(next)
+    localStorage.setItem('spyde-report-md-fs', String(next))
+  }
   const [titleEditing, setTitleEditing] = useState(false)
   const [titleDraft, setTitleDraft] = useState('')
   const [confirmNew, setConfirmNew] = useState(false)
@@ -323,8 +346,14 @@ export function ReportSidebar() {
     e.preventDefault()
     const idx = computeDropIndex(e.clientY)
     setDropIndex(null)
-    const src = sourceWindowIdFromDrop(e.dataTransfer)
-    if (src != null) sendAction('report_add_figure', { source_window_id: src, index: idx })
+    const src = figurePayloadFromDrop(e.dataTransfer)
+    if (src != null) {
+      sendAction('report_add_figure', {
+        source_window_id: src.windowId, index: idx,
+        ...(src.view !== undefined ? { view: src.view } : {}),
+        ...(src.figId !== undefined ? { fig_id: src.figId } : {}),
+      })
+    }
   }
   const onBodyDragLeave = (e: React.DragEvent) => {
     // Only clear when actually leaving the body (not moving between children).
@@ -422,6 +451,12 @@ export function ReportSidebar() {
         )}
         <div style={{ flex: 1 }} />
         <button
+          data-testid="report-md-size"
+          style={styles.hdrBtn}
+          title={`Text size: ${mdSize}px — click to cycle`}
+          onClick={cycleMdSize}
+        >Aa</button>
+        <button
           data-testid="report-raw-toggle"
           style={rawMode ? styles.hdrBtnActive : styles.hdrBtn}
           title={rawMode ? 'Show rendered' : 'Show raw markdown'}
@@ -513,7 +548,7 @@ export function ReportSidebar() {
       <div
         ref={bodyRef}
         data-testid="report-body"
-        style={styles.body}
+        style={{ ...styles.body, ['--spyde-md-fs' as string]: `${mdSize}px` } as React.CSSProperties}
         onDragOver={onBodyDragOver}
         onDrop={onBodyDrop}
         onDragLeave={onBodyDragLeave}
@@ -532,6 +567,8 @@ export function ReportSidebar() {
                   cell={cell}
                   index={i}
                   onRemove={() => sendAction('report_remove_cell', { cell_id: cell.id })}
+                  dragProps={makeDragProps(cell.id, i)}
+                  reorderActive={dragCell != null}
                 />
               : <ReportCell
                   cell={cell}

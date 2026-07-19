@@ -1330,6 +1330,17 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     const onMessage = (e: MessageEvent) => {
       if (e.data?.type === 'awi_event' && e.data.figId) {
         window.electron.figureEvent(e.data.figId, e.data.data)
+        // Also mirror the event to renderer components as a CustomEvent so UI
+        // like the report cell's floating annotation popover can react to
+        // widget clicks WITHOUT touching the raw message channel. The payload
+        // is the parsed event dict (event_json is a JSON string).
+        try {
+          const parsed = typeof e.data.data === 'string'
+            ? JSON.parse(e.data.data) : e.data.data
+          window.dispatchEvent(new CustomEvent('spyde:figure_event', {
+            detail: { figId: e.data.figId, event: parsed },
+          }))
+        } catch { /* malformed event_json — backend still got the raw form */ }
       }
     }
     window.addEventListener('message', onMessage)

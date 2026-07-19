@@ -4,6 +4,7 @@ import { useSpyDE } from '../kernel/SpyDEContext'
 import {
   NAVIGATOR_DRAG_MIME, WINDOW_DRAG_MIME, FIGURE_DRAG_MIME,
 } from '../kernel/dnd'
+import { setActiveFigure } from '../kernel/activeFigure'
 
 // Resolve a source window id from a FIGURE_DRAG_MIME or WINDOW_DRAG_MIME drop
 // (the window pill stamps both; payload is only readable on drop).
@@ -219,6 +220,17 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction }: Prop
   }, [has3d, mode, fig3d, hasDensity, figDensity, multi, navMulti, tiledFig, stackedFig, hasChips, selected, figs])
 
   const shownId = shownFig?.figId
+
+  // Publish the shown figure to the drag-payload registry: the header pill
+  // reads it at dragstart, so dragging this window while the 3-D IPF view is
+  // up stamps view:'3d' (MDIArea's render-time payload can't see this local
+  // toggle state). Cleared on unmount so a closed window never goes stale.
+  useEffect(() => {
+    setActiveFigure(win.windowId, shownFig
+      ? { figId: shownFig.figId, title: shownFig.title, view: shownFig.view }
+      : null)
+  }, [win.windowId, shownFig])
+  useEffect(() => () => setActiveFigure(win.windowId, null), [win.windowId])
 
   // Resize the visible figure to its real box (window resize / bar height / the
   // view swap that revealed a previously-hidden iframe).

@@ -264,16 +264,38 @@ def new_layer_id() -> str:
 class LayerSpec:
     """One image (or line) layer within a panel. ``source`` is a SignalRef;
     ``>1`` layer per panel = an overlay (Phase 2). ``id`` addresses the layer for
-    the compose edit handlers."""
+    the compose edit handlers.
+
+    ``tint`` is a ``#rgb``/``#rrggbb`` hex string that renders the layer as a
+    clear→colour intensity ramp (anyplotlib's tint LUT) instead of a named
+    colormap; ``None`` keeps colormap display. ``cmap`` is ALWAYS stored (even
+    while tinted) — it's the revert value when the tint is cleared. Tolerant
+    round-trip: ``to_dict`` emits the ``tint`` key ONLY when set and
+    ``from_dict`` reads it with ``.get()``, so an older file without the key
+    loads as ``None`` and renders exactly as before (SCHEMA_VERSION stays 1).
+
+    ``color`` / ``linewidth`` / ``label`` are LINE-PANEL curve styling
+    (``PanelSpec.kind == "line"``): ``color`` a CSS colour string for the
+    curve, ``linewidth`` the stroke width in px, ``label`` the legend entry
+    text (anyplotlib draws a legend automatically once any line carries a
+    non-empty label). Unused / ignored on an image layer. Tolerant round-trip
+    like ``tint``: each is emitted in ``to_dict`` ONLY when set (non-None) and
+    read with ``.get()`` in ``from_dict``, so an older file without the keys
+    loads every one as ``None`` (figure_builder falls back to anyplotlib's own
+    defaults) — SCHEMA_VERSION stays 1."""
     source: SignalRef = field(default_factory=SignalRef)
     cmap: str = "viridis"
     clim: list | None = None                   # [lo, hi] or None (auto)
     alpha: float = 1.0
     visible: bool = True
+    tint: str | None = None                    # "#rrggbb" ramp, None = cmap mode
+    color: str | None = None                   # line-panel curve colour
+    linewidth: float | None = None             # line-panel stroke width (px)
+    label: str | None = None                   # line-panel legend label
     id: str = field(default_factory=new_layer_id)
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "id": self.id,
             "source": self.source.to_dict(),
             "cmap": self.cmap,
@@ -281,17 +303,35 @@ class LayerSpec:
             "alpha": float(self.alpha),
             "visible": bool(self.visible),
         }
+        # Emitted only when set — old files/readers never see the key.
+        if self.tint:
+            d["tint"] = str(self.tint)
+        if self.color is not None:
+            d["color"] = str(self.color)
+        if self.linewidth is not None:
+            d["linewidth"] = float(self.linewidth)
+        if self.label is not None:
+            d["label"] = str(self.label)
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "LayerSpec":
         d = d or {}
         clim = d.get("clim")
+        tint = d.get("tint")                   # tolerate absent on older files
+        color = d.get("color")
+        linewidth = d.get("linewidth")
+        label = d.get("label")
         return cls(
             source=SignalRef.from_dict(d.get("source")),
             cmap=d.get("cmap", "viridis"),
             clim=(list(clim) if clim is not None else None),
             alpha=float(d.get("alpha", 1.0)),
             visible=bool(d.get("visible", True)),
+            tint=(str(tint) if tint else None),
+            color=(str(color) if color is not None else None),
+            linewidth=(float(linewidth) if linewidth is not None else None),
+            label=(str(label) if label is not None else None),
             id=d.get("id") or new_layer_id(),
         )
 
@@ -299,10 +339,33 @@ class LayerSpec:
 @dataclass
 class PanelSpec:
     """One panel (axes cell) of a figure: ≥1 layer, calibrated axes, annotations,
-    and decorations. Phase 1 uses a single panel with a single image layer."""
+    and decorations. Phase 1 uses a single panel with a single image layer.
+
+    ``kind`` is ``"image"`` | ``"line"`` | ``"scene3d"``. A ``scene3d`` panel is
+    a 3-D scatter scene (the IPF sphere explorer): its pixels are NOT a
+    LayerSpec image — the point cloud lives in the backend snapshot map keyed
+    ``(panel_id, "xyz")`` / ``(panel_id, "rgb")`` (float/uint8 arrays, never in
+    this spec / YAML / report_state). ``scene`` holds the SMALL recompute
+    parameters only:
+
+        {"kind": "ipf3d", "direction": "x|y|z", "point_size": float,
+         "bounds": [[lo,hi],[lo,hi],[lo,hi]], "camera"?: {...}}
+
+    A scene3d panel still carries ONE LayerSpec whose ``source`` SignalRef
+    points at the orientation-result tree — that's the rebind/refresh handle
+    (the layer itself paints nothing). Tolerant round-trip like ``tint``:
+    ``to_dict`` emits ``scene`` only when set, ``from_dict`` reads it with
+    ``.get()`` — older files without the key load as ``None`` and render
+    exactly as before (SCHEMA_VERSION stays 1).
+
+    ``text_sizes`` holds per-element font-size overrides in CSS pixels, keys
+    among ``{"title","x_label","y_label","ticks","legend","colorbar"}``
+    mapping to an int size. Absent/``None`` keeps anyplotlib's own defaults.
+    Tolerant round-trip like ``scene``: ``to_dict`` emits ``text_sizes`` only
+    when set, ``from_dict`` reads it with ``.get()``."""
     id: str = "p1"
     grid_pos: list = field(default_factory=lambda: [0, 0])
-    kind: str = "image"                        # "image" | "line"
+    kind: str = "image"                        # "image" | "line" | "scene3d"
     layers: list = field(default_factory=list)         # [LayerSpec]
     axes: dict | None = None                   # {units, scale:[sy,sx], offset:[oy,ox]}
     annotations: list = field(default_factory=list)    # [dict] (marker kwargs)
@@ -310,9 +373,11 @@ class PanelSpec:
     colorbar: bool = False
     title: str = ""
     insets: list = field(default_factory=list)         # [dict] (Phase 2)
+    scene: dict | None = None                  # scene3d recompute params (small)
+    text_sizes: dict | None = None             # {title|x_label|y_label|ticks|legend|colorbar: int}
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "id": self.id,
             "grid_pos": list(self.grid_pos),
             "kind": self.kind,
@@ -324,10 +389,18 @@ class PanelSpec:
             "title": self.title,
             "insets": [dict(i) for i in self.insets],
         }
+        # Emitted only when set — old files/readers never see the key.
+        if self.scene:
+            d["scene"] = dict(self.scene)
+        if self.text_sizes:
+            d["text_sizes"] = dict(self.text_sizes)
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "PanelSpec":
         d = d or {}
+        scene = d.get("scene")                 # tolerate absent on older files
+        text_sizes = d.get("text_sizes")        # tolerate absent on older files
         return cls(
             id=d.get("id", "p1"),
             grid_pos=list(d.get("grid_pos", [0, 0])),
@@ -339,6 +412,8 @@ class PanelSpec:
             colorbar=bool(d.get("colorbar", False)),
             title=d.get("title", ""),
             insets=[dict(i) for i in (d.get("insets") or [])],
+            scene=(dict(scene) if isinstance(scene, dict) else None),
+            text_sizes=(dict(text_sizes) if isinstance(text_sizes, dict) else None),
         )
 
 
@@ -641,6 +716,51 @@ def fingerprint_file(path: str | None) -> "dict | None":
 # ── baked PNG fallback (headless save) ────────────────────────────────────────
 
 
+def bake_line_fallback_png(y: np.ndarray, x_axis=None, *, color: str = "#4fc3f7",
+                           linewidth: float = 1.5, label: "str | None" = None,
+                           x_units: str = "", max_points: int = 4000) -> bytes:
+    """Render a 1-D curve to PNG bytes with matplotlib Agg — the line-panel
+    counterpart of :func:`bake_fallback_png`, used when a report cell's
+    ``kind="line"`` panel has no renderer-harvested PNG (headless save).
+
+    Draws an actual ``ax.plot(x, y)`` (not the 1-row-heatmap fallback
+    ``bake_fallback_png`` uses for a stray 1-D array elsewhere) so the baked
+    PNG reads as a real curve. Downsamples by striding when *y* is very long
+    so a huge trace stays cheap; ``x_axis`` defaults to ``range(n)`` when
+    omitted or length-mismatched. matplotlib is imported inside so it stays
+    off the import path for callers that never save."""
+    import matplotlib
+    matplotlib.use("Agg", force=False)
+    import matplotlib.pyplot as plt
+
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+    n = y.shape[0]
+    xa = np.asarray(x_axis, dtype=np.float64) if x_axis is not None else None
+    if xa is None or xa.shape[0] != n:
+        xa = np.arange(n, dtype=np.float64)
+
+    if n > max_points:
+        stride = int(np.ceil(n / max_points))
+        xa = xa[::stride]
+        y = y[::stride]
+
+    fig, ax = plt.subplots(figsize=(6.2, 3.2), dpi=100)
+    try:
+        ax.plot(xa, y, color=color or "#4fc3f7",
+               linewidth=float(linewidth) if linewidth else 1.5,
+               label=(label or None))
+        if x_units:
+            ax.set_xlabel(str(x_units))
+        if label:
+            ax.legend(fontsize=8)
+        fig.tight_layout()
+        buf = io.BytesIO()
+        fig.savefig(buf, format="PNG")
+        return buf.getvalue()
+    finally:
+        plt.close(fig)
+
+
 def bake_fallback_png(array2d: np.ndarray, cmap: str = "viridis",
                       clim=None, max_edge: int = 1200) -> bytes:
     """Render *array2d* to PNG bytes with matplotlib Agg — the WYSIWYG fallback
@@ -648,7 +768,12 @@ def bake_fallback_png(array2d: np.ndarray, cmap: str = "viridis",
 
     Downsamples by striding first so a huge frame stays cheap, caps the long
     edge at ``max_edge``. matplotlib is imported inside so it stays off the
-    import path for callers that never save."""
+    import path for callers that never save.
+
+    NB: a bare 1-D array here (no panel context) is reshaped to a 1-row
+    heatmap — this is the generic "any array" fallback. A report LINE PANEL
+    (``kind="line"``) uses :func:`bake_line_fallback_png` instead, which
+    draws a real ``ax.plot`` curve; see ``handlers.py``'s bake call sites."""
     import matplotlib
     matplotlib.use("Agg", force=False)
     import matplotlib.colors as mcolors

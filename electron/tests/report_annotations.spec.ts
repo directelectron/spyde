@@ -9,12 +9,13 @@
  *   2. Drag persistence — a widget pointer_up (injected via the proven
  *      awi_event postMessage path) moves an annotation; the spec/DOM row reflects
  *      the moved value; exiting edit mode re-renders the marker at the new spot.
- *   3. Selection — a panel pointer_down (injected) selects the panel → the edit
- *      dock shows the chips row + only that panel's controls; a figure-background
- *      pointer_down deselects → the figure-level section (grid summary, figure
- *      annotation palette).
- *   4. Figure-level annotation — figure-level "+ Text" draws a centered marker +
- *      adds a row; a figure-marker pointer_up drag persists the new fraction.
+ *   3. Selection — a panel pointer_down (injected) selects the panel → the slim
+ *      bar shows the per-panel refresh (⟳) button; a figure-background
+ *      pointer_down deselects → the button leaves the bar. (The old chips row /
+ *      panel dock block are gone — slim-bar redesign.)
+ *   4. Figure-level annotation — the figure-scope add action draws a centered
+ *      marker; a figure-marker pointer_up drag persists the new fraction; the
+ *      floating AnnotationPopover opens for the marker (old row testids).
  *
  * Interaction paths: the figure iframe is an out-of-process OOPIF whose canvas
  * does setPointerCapture, so a synthetic Playwright mouse cannot reliably grab a
@@ -113,9 +114,29 @@ async function reportWidgets(page: any, figId: string): Promise<Array<{
   return await page.evaluate((fid: string) => (window as any)._spyde_test_widgets(fid), figId)
 }
 
+/** The cell's first spec panel id + its annotation count from the report doc. */
+async function firstPanel(page: any, cellId: string): Promise<{ id: string; annCount: number } | null> {
+  return await page.evaluate((cid: string) => {
+    const d = (window as any)._spyde_test_report?.()
+    const cell = d?.cells?.find((c: any) => c.id === cid)
+    const p = cell?.figure?.panels?.[0]
+    if (!p) return null
+    return { id: p.id, annCount: (p.annotations ?? []).length }
+  }, cellId)
+}
+
+/** Figure-level annotation count from the report doc. */
+async function figAnnCount(page: any, cellId: string): Promise<number> {
+  return await page.evaluate((cid: string) => {
+    const d = (window as any)._spyde_test_report?.()
+    const cell = d?.cells?.find((c: any) => c.id === cid)
+    return (cell?.figure?.annotations ?? []).length
+  }, cellId)
+}
+
 /**
- * Open the figure cell's edit dock (✎ toggle). Returns {cellId, figId}. Idempotent
- * on the toggle (only clicks if the dock isn't already open).
+ * Open the figure cell's edit bar (✎ toggle). Returns {cellId, figId}. Idempotent
+ * on the toggle (only clicks if the bar isn't already open).
  */
 async function openEdit(page: any): Promise<{ cellId: string; figId: string }> {
   const cellId = await figCellId(page)
@@ -234,35 +255,29 @@ test('coordinate fix: "+ Text" places the annotation at the image CENTER', async
   await makeFigureCell(page)
   void FIG_MIME
 
-  // Open edit → the single panel's PanelEdit shows the "+ Text" palette. In edit
-  // mode we select the panel first so the panel-level palette is shown (a fresh
-  // cell defaults to figure-level view). Select the only panel via its chip.
+  // Open edit → the slim bar shows the "+ Text" palette. A SINGLE-panel figure
+  // renders NO chips (multi-panel only) and auto-targets its only panel, so the
+  // add button is present directly with the panel's spec id.
   // NB: toggling edit mode REBUILDS the figure (new figId), so always re-read the
   // CURRENT figId right before reading pixels.
-  await openEdit(page)
-  const chip = page.locator(`[data-testid^="figcell-chip-"]`).first()
-  await expect(chip).toBeVisible()
-  // The panel chips are single letters (A, B…); the "Figure" chip has a distinct
-  // testid. Click the first LETTER chip (panel A).
-  const panelChip = page.locator(`[data-testid^="figcell-chip-p"]`).first()
-  await expect(panelChip).toBeVisible({ timeout: 10_000 })
-  await panelChip.click()
-
-  // Discover the panel id from the panel block that appears.
-  const panelBlock = page.locator(`[data-testid^="figcell-panel-"]`).first()
-  await expect(panelBlock).toBeVisible({ timeout: 10_000 })
-  const panelId = await panelBlock.evaluate((el: HTMLElement) =>
-    (el.getAttribute('data-testid') || '').replace('figcell-panel-', ''))
+  const { cellId } = await openEdit(page)
+  await expect(page.locator(`[data-testid^="figcell-chip-"]`))
+    .toHaveCount(0)   // single panel → no targeting chips on the slim bar
+  const p0 = await firstPanel(page, cellId)
+  expect(p0, 'no panel in the report doc').toBeTruthy()
+  const panelId = p0!.id
 
   // Baseline accent pixels (should be ~0 — no annotation yet). Re-read figId.
   const before = await accentBands(page, (await reportFigId(page))!)
   console.log('[annotations] accent bands BEFORE +Text =', JSON.stringify(before))
 
   // Click "+ Text" → the backend appends a text annotation at the panel center +
-  // rebuilds the figure. Wait for the annotation ROW to appear.
+  // rebuilds the figure. Annotation ROWS are popover-only now — wait on the
+  // authoritative report doc instead.
   await page.getByTestId(`figcell-add-text-${panelId}`).click()
-  await expect(page.locator(`[data-testid^="figcell-annotation-${panelId}-"]`).first())
-    .toBeVisible({ timeout: 10_000 })
+  await expect.poll(async () => (await firstPanel(page, cellId))?.annCount ?? 0, {
+    timeout: 10_000, message: '+ Text did not append a panel annotation',
+  }).toBe(p0!.annCount + 1)
   await page.waitForTimeout(2500)   // let the rebuilt figure paint the marker
 
   await page.screenshot({ path: join(SHOTS, 'C-01-text-centered.png') })
@@ -336,7 +351,10 @@ test('drag persistence: a widget pointer_up moves the annotation + persists', as
   await page.screenshot({ path: join(SHOTS, 'C-02a-annotation-dragged-editmode.png') })
 
   // Exit edit mode → the annotation re-renders as a STATIC marker AT THE MOVED
-  // position (top-left quadrant now), not the center. Toggle the ✎ off.
+  // position (top-left quadrant now), not the center. Toggle the ✎ off (re-mount
+  // the hover chrome first — a rebuild can have unhovered the cell).
+  await page.locator(`[data-testid="report-figcell-${cellId}"]`)
+    .dispatchEvent('mouseover', { bubbles: true })
   await page.getByTestId(`report-figcell-edit-toggle-${cellId}`).click()
   await expect(page.getByTestId(`figcell-edit-${cellId}`)).toHaveCount(0, { timeout: 10_000 })
   await page.waitForTimeout(2000)   // static-marker rebuild + paint
@@ -374,7 +392,7 @@ test('drag persistence: a widget pointer_up moves the annotation + persists', as
 
 // ── 3: selection UI (panel select / figure-background deselect) ─────────────────
 
-test('selection: panel pointer_down selects (chips + panel controls); background deselects', async () => {
+test('selection: panel pointer_down selects (panel refresh appears); background deselects', async () => {
   const { page } = ctx
   const { cellId, figId } = await openEdit(page)
 
@@ -386,6 +404,8 @@ test('selection: panel pointer_down selects (chips + panel controls); background
     .toBeGreaterThan(0)
   const panelDispatchId = widgets[0].panel_id
   console.log('[annotations] panel dispatch id =', panelDispatchId)
+  // The panel's SPEC id (the slim bar's testids key off it).
+  const specPanelId = (await firstPanel(page, cellId))!.id
 
   // Inject a genuine panel click (misses widgets) → pointer_down on the panel
   // plot → backend report_panel_selected → renderer selects the panel. Shape from
@@ -394,32 +414,22 @@ test('selection: panel pointer_down selects (chips + panel controls); background
     panel_id: panelDispatchId, event_type: 'pointer_down',
   })
 
-  // The dock's chips row shows + a panel LETTER chip becomes active, and the
-  // panel block (panel-specific controls: Layers / Annotations) is shown.
-  const chipsRow = page.getByTestId(`figcell-chips-${cellId}`)
-  await expect(chipsRow).toBeVisible({ timeout: 10_000 })
-  // A panel-specific block (figcell-panel-<specId>) must be present when a panel
-  // is selected (figure-level view has NO figcell-panel- block).
-  await expect.poll(async () =>
-    page.locator(`[data-testid="figcell-edit-${cellId}"] [data-testid^="figcell-panel-"]`).count(),
-    { timeout: 10_000, message: 'panel controls did not appear after panel pointer_down' })
-    .toBeGreaterThan(0)
-  // The Figure chip is NOT the active one now (a panel is selected).
+  // Slim-bar redesign: the selection's observable is the per-panel refresh (⟳)
+  // button the bar shows for the ACTIVE panel (the old chips row / panel dock
+  // block are gone; chips only render on multi-panel figures).
+  await expect(page.getByTestId(`figcell-panel-refresh-${specPanelId}`))
+    .toBeVisible({ timeout: 10_000 })
   await page.waitForTimeout(400)
   await page.screenshot({ path: join(SHOTS, 'C-03a-panel-selected.png') })
 
-  // Now inject a figure-BACKGROUND pointer_down → deselect → figure-level view.
+  // Now inject a figure-BACKGROUND pointer_down → deselect → figure scope: the
+  // per-panel refresh button leaves the bar (the bar itself stays).
   await figureEvent(page, figId, {
     panel_id: '', event_type: 'pointer_down', figure_background: true,
   })
-  // The figure-level section shows (grid summary + figure annotation palette);
-  // the panel-specific block is gone.
-  await expect(page.getByTestId(`figcell-figure-edit-${cellId}`)).toBeVisible({ timeout: 10_000 })
-  await expect(page.getByTestId(`figcell-grid-summary-${cellId}`)).toBeVisible()
-  await expect.poll(async () =>
-    page.locator(`[data-testid="figcell-edit-${cellId}"] [data-testid^="figcell-panel-"]`).count(),
-    { timeout: 10_000, message: 'panel controls did not clear after figure-background click' })
-    .toBe(0)
+  await expect(page.getByTestId(`figcell-panel-refresh-${specPanelId}`))
+    .toHaveCount(0, { timeout: 10_000 })
+  await expect(page.getByTestId(`figcell-edit-${cellId}`)).toBeVisible()
   await page.waitForTimeout(400)
   await page.screenshot({ path: join(SHOTS, 'C-03b-figure-deselected.png') })
   ctx.assertNoJsErrors()
@@ -428,30 +438,25 @@ test('selection: panel pointer_down selects (chips + panel controls); background
 
 // ── 4: figure-level annotation (add + drag persist) ─────────────────────────────
 
-test('figure-level annotation: "+ Text" draws + a marker drag persists', async () => {
+test('figure-level annotation: add draws + a marker drag persists + popover opens', async () => {
   const { page } = ctx
   const edit = await openEdit(page)
   const cellId = edit.cellId
   let figId = edit.figId
 
-  // Ensure figure-level view (click the Figure chip).
-  await page.getByTestId(`figcell-chip-figure-${cellId}`).click()
-  await expect(page.getByTestId(`figcell-figure-edit-${cellId}`)).toBeVisible({ timeout: 10_000 })
-
-  // Add a FIGURE-level Text annotation → repfig_add_fig_annotation → the figure
-  // rebuilds with a figure-marker; a fig-annotation ROW appears. Count ONLY the
-  // row container (testid `figcell-fig-annotation-<index>` = prefix + digits),
-  // NOT its -text/-remove sub-elements (which share the prefix).
-  const rowRe = /^figcell-fig-annotation-\d+$/
-  const countFigRows = async () => await page.locator('[data-testid^="figcell-fig-annotation-"]')
-    .evaluateAll((els, re: string) =>
-      els.filter(e => new RegExp(re).test(e.getAttribute('data-testid') || '')).length,
-      rowRe.source)
-  const rowsBefore = await countFigRows()
-  await page.getByTestId(`figcell-add-fig-text-${cellId}`).click()
-  await expect.poll(countFigRows,
-    { timeout: 10_000, message: 'figure-level +Text did not add a row' })
-    .toBe(rowsBefore + 1)
+  // Slim-bar redesign: figure-level ADD buttons only render on MULTI-panel
+  // figures (a single-panel bar auto-targets its panel). Dispatch the SAME
+  // action the bar's "+ Text" fires in figure scope, with the identical
+  // payload (addFigAnnotation in ReportFigureCell.tsx), then assert on the
+  // authoritative report doc.
+  const annsBefore = await figAnnCount(page, cellId)
+  await backendAction(page, 'repfig_add_fig_annotation', {
+    cell_id: cellId,
+    annotation: { kind: 'text', x: 0.5, y: 0.5, text: 'Label', color: '#ff9800', fontsize: 14 },
+  })
+  await expect.poll(async () => await figAnnCount(page, cellId),
+    { timeout: 10_000, message: 'figure-level add did not append an annotation' })
+    .toBe(annsBefore + 1)
   await page.waitForTimeout(2500)   // rebuilt figure paints the figure marker
   figId = (await reportFigId(page))!   // rebuilt on add
   await page.screenshot({ path: join(SHOTS, 'C-04a-fig-annotation-added.png') })
@@ -500,6 +505,30 @@ test('figure-level annotation: "+ Text" draws + a marker drag persists', async (
     .toBeCloseTo(0.2, 1)
   await page.waitForTimeout(1500)
   await page.screenshot({ path: join(SHOTS, 'C-04b-fig-annotation-dragged.png') })
+
+  // The floating AnnotationPopover opens for a figure-level marker: re-dispatch
+  // the marker pointer_up as the spyde:figure_event CustomEvent (renderer-only;
+  // no backend side effects) → the popover (which now carries the old fig-
+  // annotation row testids) appears with the text input.
+  const annIdx = await page.evaluate(({ cid, mid }: { cid: string; mid: string }) => {
+    const d = (window as any)._spyde_test_report?.()
+    const cell = d?.cells?.find((c: any) => c.id === cid)
+    const anns = cell?.figure?.annotations ?? []
+    return anns.findIndex((x: any) => x.id === mid)
+  }, { cid: cellId, mid: markerId })
+  expect(annIdx, 'dragged figure annotation not found by id').toBeGreaterThanOrEqual(0)
+  await page.evaluate(({ fid, mid }: any) => {
+    window.dispatchEvent(new CustomEvent('spyde:figure_event', {
+      detail: { figId: fid, event: {
+        panel_id: '', event_type: 'pointer_up', figure_marker: true,
+        marker_id: mid, x: 0.2, y: 0.75,
+      } },
+    }))
+  }, { fid: figId, mid: markerId })
+  await expect(page.getByTestId(`figcell-fig-annotation-${annIdx}`))
+    .toBeVisible({ timeout: 10_000 })
+  await expect(page.getByTestId(`figcell-fig-annotation-text-input-${annIdx}`)).toBeVisible()
+  await page.screenshot({ path: join(SHOTS, 'C-04c-fig-annotation-popover.png') })
   ctx.assertNoJsErrors()
   await assertNoBackendErrors()
 })

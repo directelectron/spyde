@@ -472,12 +472,42 @@ def _install_render_display(tree, vecs) -> None:
     H = int(vecs.sig_axes[1].size)
     W = int(vecs.sig_axes[0].size)
 
+    def _region_bounds(indices):
+        """If ``indices`` spans MORE THAN ONE nav position (a RectangleSelector
+        emits a grid of ``[ix, iy]`` rows; a crosshair emits exactly one), return
+        the half-open nav rectangle ``(y0, y1, x0, x1)`` covering it — else None.
+        Uses the SPATIAL (last two) coords of every row so a 5-D stack's leading
+        stack coord is ignored (it is handled via ``t=`` below)."""
+        idx = np.asarray(indices)
+        if idx.ndim != 2 or idx.shape[0] <= 1 or idx.shape[1] < 2:
+            return None
+        ixs = idx[:, -2].astype(np.int64)
+        iys = idx[:, -1].astype(np.int64)
+        y0, y1 = int(iys.min()), int(iys.max()) + 1
+        x0, x1 = int(ixs.min()), int(ixs.max()) + 1
+        if (y1 - y0) <= 1 and (x1 - x0) <= 1:
+            return None                     # collapsed to a single position
+        return y0, y1, x0, x1
+
     def _fn(selector, child, indices):
         iy, ix = _indices_to_iyix(indices)
         # 5-D stack: the leading nav coord is the stack/time index → render that
         # slice's disks (t=). 4-D: lead=() → t=None (all, i.e. the single slice).
         lead = _indices_lead_nav(indices)
         t = int(lead[0]) if lead else None
+        # Region selector on the navigator (rectangle/span) → SUM the disks over
+        # every nav position it covers (mirrors render_region's max-then-sum
+        # rule, so a 1x1 region == render_frame). A crosshair falls through to
+        # the single-position render_frame path unchanged.
+        region = _region_bounds(indices)
+        if region is not None:
+            y0, y1, x0, x1 = region
+            try:
+                return vecs.render_region(y0, y1, x0, x1, t=t)
+            except Exception as e:
+                log.debug("render_region(%s..%s, %s..%s, t=%s) failed, "
+                          "showing blank: %s", y0, y1, x0, x1, t, e)
+                return np.zeros((H, W), dtype=np.float32)
         try:
             return vecs.render_frame(iy, ix, t=t)
         except Exception as e:

@@ -2,6 +2,7 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import sys
 import threading
 
 from psygnal import Signal
@@ -146,6 +147,26 @@ def _lower_worker_priority(proc=None) -> bool:
         return False
 
 
+def _apply_mac_neural_env() -> None:
+    """Mac-only neural-inference robustness env, set in each WORKER process
+    (workers are separate processes — a main-process setenv never reaches them).
+    No-op off Mac.
+
+    - ``PYTORCH_ENABLE_MPS_FALLBACK=1`` (fix 1): an unsupported MPS op transparently
+      runs on CPU per-op instead of raising/aborting. Set BEFORE torch initialises
+      MPS — the worker plugin runs at worker startup, before any neural compute
+      touches torch, so this is in place in time.
+    - ``SPYDE_FV_GPU_CONC=1`` (fix 3): admit ONE thread to the device section, so a
+      worker's own task threads never issue concurrent MPS forwards (Metal
+      thread-race crashes). The neural batch also holds the whole-device lock, but
+      pinning the semaphore to 1 makes the whole process single-forward on Mac.
+    Both use setdefault so an explicit user override wins."""
+    if sys.platform != "darwin":
+        return
+    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+    os.environ.setdefault("SPYDE_FV_GPU_CONC", "1")
+
+
 class _WorkerTuningPlugin(_WorkerPluginBase):
     """WorkerPlugin: per-worker-process environment fixes (workers are
     separate processes — backend-side patches never reach them). Runs on
@@ -160,6 +181,9 @@ class _WorkerTuningPlugin(_WorkerPluginBase):
        process_guard.unthrottle_windows_timers).
     3. background priority: see _lower_worker_priority — the UI stays
        responsive while a batch pegs every core.
+    4. Mac neural env (_apply_mac_neural_env): PYTORCH_ENABLE_MPS_FALLBACK=1 +
+       SPYDE_FV_GPU_CONC=1 so MPS ops degrade to CPU and the device is used by
+       one forward at a time (crash-avoidance for the SpotUNet batch).
     """
 
     name = "spyde-worker-tuning"
@@ -172,6 +196,7 @@ class _WorkerTuningPlugin(_WorkerPluginBase):
         except Exception as e:
             logger.debug("worker timer unthrottle failed: %s", e)
         _lower_worker_priority()
+        _apply_mac_neural_env()
 
     def teardown(self, worker=None):
         pass
@@ -263,6 +288,16 @@ class DaskManager:
             # passed once, then Scheduler.__init__ still blocked 60s). Workers
             # get the same stub via _NetIoStubPlugin below.
             _neutralize_slow_net_io_counters(force=True)
+
+            # FIX 5 — pin the worker multiprocessing method to 'spawn'. Workers
+            # that FORK inherit a torch/Metal state from the parent and hard-crash
+            # the moment they touch MPS (the classic fork+Metal abort). spawn (the
+            # macOS default already, but a future dask/perf change could flip it)
+            # gives each worker a clean interpreter, so a perf tweak can't silently
+            # reintroduce the fork-MPS crash. Zero runtime cost; also matches the
+            # freeze_support() assumption in __main__.main (workers re-exec).
+            import dask as _dask
+            _dask.config.set({"distributed.worker.multiprocessing-method": "spawn"})
 
             # Build the SCHEDULER first (n_workers=0) so the client + dashboard
             # come up fast, THEN spawn workers and let them register in the
