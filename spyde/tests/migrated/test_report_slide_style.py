@@ -175,14 +175,14 @@ class TestSlideMeta:
             m.Cell(cell_type="markdown", source="not read"),
         ]
         meta = m.slide_meta(cells)
-        assert meta == {"kind": "title", "style": "accent"}
+        assert meta == {"kind": "title", "style": "accent", "notes": ""}
 
     def test_defaults_for_plain_content_slide(self):
         cells = [m.Cell(cell_type="markdown", source="body")]
-        assert m.slide_meta(cells) == {"kind": "", "style": ""}
+        assert m.slide_meta(cells) == {"kind": "", "style": "", "notes": ""}
 
     def test_empty_slide(self):
-        assert m.slide_meta([]) == {"kind": "", "style": ""}
+        assert m.slide_meta([]) == {"kind": "", "style": "", "notes": ""}
 
     def test_slides_meta_combines_with_grouping(self):
         doc = m.ReportDoc()

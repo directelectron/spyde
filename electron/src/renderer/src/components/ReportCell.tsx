@@ -19,6 +19,7 @@ import { renderMarkdown } from '../kernel/markdown'
 import { reportClipboard } from '../kernel/reportClipboard'
 import type { ReportCell as ReportCellType } from '../kernel/protocol'
 import { CellChrome, ColumnBadge, type CellColumn } from './CellChrome'
+import { SlideNotesEditor } from './SlideNotesEditor'
 
 // One-time scoped markdown stylesheet for the dark theme. Injected under a
 // `.spyde-md` wrapper so it never leaks into the rest of the app. Sizes are in
@@ -238,6 +239,7 @@ export function ReportCell({ cell, rawMode, onUpdate, onRemove, index, slideStar
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(cell.source ?? '')
   const [hover, setHover] = useState(false)
+  const [notesOpen, setNotesOpen] = useState(false)
   const taRef = useRef<HTMLTextAreaElement>(null)
 
   // Sync the draft when the backing source changes and we're NOT actively
@@ -328,6 +330,9 @@ export function ReportCell({ cell, rawMode, onUpdate, onRemove, index, slideStar
           onToggleTitle={() => sendAction('report_set_slide_kind', { cell_id: cell.id })}
           slideStyle={cell.slide_style}
           onCycleStyle={(style) => sendAction('report_set_slide_style', { cell_id: cell.id, slide_style: style })}
+          slideNotes={cell.notes}
+          notesOpen={notesOpen}
+          onToggleNotes={() => setNotesOpen((v) => !v)}
           deleteTestid={`report-cell-delete-${cell.id}`}
           deleteTitle="Delete cell"
           leading={
@@ -394,6 +399,17 @@ export function ReportCell({ cell, rawMode, onUpdate, onRemove, index, slideStar
             ? <span style={styles.emptyHint}>Empty text cell — double-click to edit</span>
             : <span dangerouslySetInnerHTML={{ __html: rendered }} />}
         </div>
+      )}
+
+      {/* Speaker-notes editor (slide-starting cells only), toggled from the chrome
+          📝 button. Debounced → report_set_slide_notes. */}
+      {slideStart && notesOpen && (
+        <SlideNotesEditor
+          cellId={cell.id}
+          notes={cell.notes ?? ''}
+          onCommit={(notes) => sendAction('report_set_slide_notes', { cell_id: cell.id, notes })}
+          onClose={() => setNotesOpen(false)}
+        />
       )}
     </div>
   )

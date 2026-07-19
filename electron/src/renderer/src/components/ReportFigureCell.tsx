@@ -46,6 +46,7 @@ import { FIGURE_DRAG_MIME, WINDOW_DRAG_MIME } from '../kernel/dnd'
 import { COLORMAPS } from '../kernel/colormaps'
 import { useKeyedDebounce } from './wizardHooks'
 import { CellChrome, ColumnBadge, type CellColumn } from './CellChrome'
+import { SlideNotesEditor } from './SlideNotesEditor'
 
 // The compose modes the backend can return (subset of these per drop).
 type ComposeMode =
@@ -263,6 +264,7 @@ export function ReportFigureCell({ cell, onRemove, index, slideStart, dragProps,
   const [captionEditing, setCaptionEditing] = useState(false)
   const [captionDraft, setCaptionDraft] = useState(cell.caption ?? '')
   const [hover, setHover] = useState(false)
+  const [notesOpen, setNotesOpen] = useState(false)
   const [dropHover, setDropHover] = useState(false)     // placeholder fill hover
   const [editOpen, setEditOpen] = useState(false)
   // The SELECTED spec panel id (null = figure-level), mirrored from the backend's
@@ -687,6 +689,9 @@ export function ReportFigureCell({ cell, onRemove, index, slideStart, dragProps,
           onToggleTitle={() => sendAction('report_set_slide_kind', { cell_id: cell.id })}
           slideStyle={cell.slide_style}
           onCycleStyle={(style) => sendAction('report_set_slide_style', { cell_id: cell.id, slide_style: style })}
+          slideNotes={cell.notes}
+          notesOpen={notesOpen}
+          onToggleNotes={() => setNotesOpen((v) => !v)}
           deleteTestid={`report-figcell-delete-${cell.id}`}
           deleteTitle="Delete figure"
           leading={
@@ -886,6 +891,17 @@ export function ReportFigureCell({ cell, onRemove, index, slideStart, dragProps,
           setEditOpen(false)
           sendAction('repfig_set_edit_mode', { cell_id: cell.id, editing: false })
         }} />
+      )}
+
+      {/* Speaker-notes editor (slide-starting cells only, not a placeholder),
+          toggled from the chrome 📝 button. Debounced → report_set_slide_notes. */}
+      {slideStart && !cell.placeholder && notesOpen && (
+        <SlideNotesEditor
+          cellId={cell.id}
+          notes={cell.notes ?? ''}
+          onCommit={(notes) => sendAction('report_set_slide_notes', { cell_id: cell.id, notes })}
+          onClose={() => setNotesOpen(false)}
+        />
       )}
     </div>
   )

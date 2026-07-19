@@ -284,6 +284,10 @@ class ReportManager:
                 "column": str(getattr(c, "column", "") or ""),
                 "slide_kind": str(getattr(c, "slide_kind", "") or ""),
                 "slide_style": str(getattr(c, "slide_style", "") or ""),
+                # Speaker notes (presenter view) — per-slide, carried on the
+                # slide's first cell; free multi-line markdown, shown only in the
+                # presenter view, never to the audience.
+                "notes": str(getattr(c, "notes", "") or ""),
             }
             # An IMAGE (photo) cell ships its bytes as a data URL so the renderer
             # can draw the <img> with no round trip (mirrors the offline-figure
@@ -2006,6 +2010,10 @@ def report_add_cell(session, plot, payload) -> None:
     if payload.get("slide_style") is not None:
         from spyde.actions.report.model import _normalize_slide_style
         cell.slide_style = _normalize_slide_style(payload.get("slide_style"))
+    # Speaker notes (presenter view) — a seeded deck can create a slide's first
+    # cell already carrying notes without a follow-up round trip.
+    if payload.get("notes") is not None:
+        cell.notes = str(payload.get("notes") or "")
     _insert_cell(mgr.doc, cell, payload.get("index"))
     mgr.dirty = True
     mgr.emit_state()
@@ -2241,6 +2249,27 @@ def report_set_slide_style(session, plot, payload) -> None:
         return
     target = _slide_start_cell(mgr, cell) or cell
     target.slide_style = _normalize_slide_style(payload.get("slide_style"))
+    mgr.dirty = True
+    mgr.emit_state()
+
+
+def report_set_slide_notes(session, plot, payload) -> None:
+    """Set a SLIDE's SPEAKER NOTES — free multi-line markdown text the presenter
+    sees in the presenter view but the audience never does.
+
+    Applied to the slide's FIRST cell (the slide-break cell) even when ``cell_id``
+    names a later cell of the slide — the per-slide attribute lives there
+    (:func:`_slide_start_cell`, like :func:`report_set_slide_kind`). ``{cell_id,
+    notes}`` sets it (any string; empty clears); a missing ``notes`` clears.
+    Unknown cell → no-op."""
+    mgr = _manager(session)
+    if not mgr.open:
+        return
+    cell = mgr.doc.cell_by_id(payload.get("cell_id"))
+    if cell is None:
+        return
+    target = _slide_start_cell(mgr, cell) or cell
+    target.notes = str(payload.get("notes", "") or "")
     mgr.dirty = True
     mgr.emit_state()
 

@@ -30,6 +30,8 @@ Phase 2 (combined figures, MDI layering) reuses it without migration.
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import io
 import os
 import re
@@ -145,6 +147,15 @@ _SLIDE_KIND_RE = re.compile(r"^<!--\s*spyde:slide-kind\s+(?P<val>\S+)\s*-->\s*$"
 # ``plain`` = a flat darker stage; ``accent`` = a subtle accent-tinted gradient.
 # Anything else → "" (default). Mirrors the slide-kind marker.
 _SLIDE_STYLE_RE = re.compile(r"^<!--\s*spyde:slide-style\s+(?P<val>\S+)\s*-->\s*$")
+# A per-slide SPEAKER-NOTES marker (Present mode presenter view):
+# ``<!-- spyde:notes <base64> -->`` — an invisible comment BEFORE the slide's FIRST
+# cell carrying the speaker's private notes for the WHOLE slide (shown only in the
+# presenter view / never to the audience). Notes are free multi-line text with
+# markdown + unicode, so they are base64-encoded (utf-8 → standard base64) inside
+# the single-line comment: this survives newlines / ``-->`` / special chars while
+# staying a valid, invisible HTML comment. Absent → "" (older files). ``_encode_notes``
+# / ``_decode_notes`` own the round trip.
+_SLIDE_NOTES_RE = re.compile(r"^<!--\s*spyde:notes\s+(?P<b64>\S+)\s*-->\s*$")
 # The accepted slide kinds/styles (anything else → "" == default). "content" and
 # "" are equivalent (a normal slide); "default" and "" pick the standard stage.
 _SLIDE_KINDS = ("title",)
@@ -173,6 +184,31 @@ def _normalize_slide_style(val) -> str:
     stage) so an older report loads exactly as before."""
     s = str(val or "").strip().lower()
     return s if s in _SLIDE_STYLES else ""
+
+
+def _encode_notes(notes) -> str:
+    """utf-8 speaker notes → a single-line, comment-safe base64 token (standard
+    base64, no newlines). Empty / whitespace-only notes → ``""`` (the marker is
+    then omitted entirely). Base64 is bulletproof for the free-text notes: it
+    survives newlines, markdown syntax, ``-->`` sequences and unicode inside an
+    HTML comment."""
+    s = str(notes or "")
+    if not s.strip():
+        return ""
+    return base64.b64encode(s.encode("utf-8")).decode("ascii")
+
+
+def _decode_notes(token) -> str:
+    """A base64 notes token (from :func:`_encode_notes`) → the utf-8 notes string.
+    Tolerant: a malformed / non-base64 token decodes to ``""`` rather than raising,
+    so a hand-edited or corrupt marker can never break a report load."""
+    t = str(token or "").strip()
+    if not t:
+        return ""
+    try:
+        return base64.b64decode(t, validate=True).decode("utf-8")
+    except (binascii.Error, ValueError, UnicodeDecodeError):
+        return ""
 
 
 # ── the spec dataclasses (full schema; Phase 1 uses single-panel/single-layer) ─
@@ -606,7 +642,17 @@ class Cell:
     to style the whole slide); on a non-first cell they're harmless/ignored.
     Persisted as invisible ``<!-- spyde:slide-kind title -->`` /
     ``<!-- spyde:slide-style accent -->`` comments before the cell; absent on
-    older files → ``""`` (SCHEMA_VERSION stays 1)."""
+    older files → ``""`` (SCHEMA_VERSION stays 1).
+
+    ``notes`` (Present mode presenter view) are the slide's SPEAKER NOTES — free
+    multi-line markdown text the speaker sees in the presenter view but the
+    audience NEVER does. Like ``slide_kind`` / ``slide_style`` they are a PER-SLIDE
+    attribute carried on the slide's FIRST cell (read via :func:`slide_meta` /
+    :func:`slide_notes`); on a non-first cell they're harmless/ignored. Persisted
+    as an invisible ``<!-- spyde:notes <base64> -->`` comment before the cell —
+    base64 so the free text (newlines / markdown / ``-->`` / unicode) round-trips
+    inside a single-line HTML comment and NEVER leaks into any external markdown
+    renderer. Absent on older files → ``""`` (SCHEMA_VERSION stays 1)."""
     id: str = field(default_factory=new_cell_id)
     cell_type: str = "markdown"
     source: str = ""                           # markdown text (markdown cells)
@@ -620,6 +666,7 @@ class Cell:
     column: str = ""                           # Present mode: "" | "left" | "right"
     slide_kind: str = ""                       # Present mode: "" (content) | "title"
     slide_style: str = ""                      # Present mode: "" | "plain" | "accent"
+    notes: str = ""                            # Present mode: per-slide speaker notes
 
 
 @dataclass
@@ -711,17 +758,27 @@ def slide_columns(cells: "list[Cell]") -> list:
 def slide_meta(cells: "list[Cell]") -> dict:
     """The per-slide presentation attributes for a SLIDE's cell list — read off
     the slide's FIRST cell (the slide-break cell), which is where ``slide_kind`` /
-    ``slide_style`` are carried. Reused by Present mode + the slides HTML export
-    (and mirrored in the renderer). An empty slide → the defaults.
+    ``slide_style`` / ``notes`` are carried. Reused by Present mode + the slides
+    HTML export (and mirrored in the renderer). An empty slide → the defaults.
 
-    Returns ``{"kind": "" | "title", "style": "" | "plain" | "accent"}`` — both
-    normalised (unknown / absent → ``""``), so a legacy slide with no markers
-    renders exactly as a content slide on the standard stage."""
+    Returns ``{"kind": "" | "title", "style": "" | "plain" | "accent",
+    "notes": "<str>"}`` — kind/style normalised (unknown / absent → ``""``),
+    notes verbatim (absent → ``""``), so a legacy slide with no markers renders
+    exactly as a content slide on the standard stage with no notes."""
     first = cells[0] if cells else None
     return {
         "kind": _normalize_slide_kind(getattr(first, "slide_kind", "")),
         "style": _normalize_slide_style(getattr(first, "slide_style", "")),
+        "notes": str(getattr(first, "notes", "") or ""),
     }
+
+
+def slide_notes(cells: "list[Cell]") -> str:
+    """The SPEAKER NOTES for a SLIDE's cell list — read off the slide's FIRST cell
+    (where the per-slide ``notes`` are carried, like ``slide_kind`` / ``slide_style``).
+    An empty slide / a slide with no notes → ``""``."""
+    first = cells[0] if cells else None
+    return str(getattr(first, "notes", "") or "")
 
 
 # ── time / yaml helpers ───────────────────────────────────────────────────────
@@ -768,6 +825,9 @@ def serialize_report_md(doc: ReportDoc) -> str:
         style = _normalize_slide_style(getattr(c, "slide_style", ""))
         if style:
             body_blocks.append(f"<!-- spyde:slide-style {style} -->")
+        notes_token = _encode_notes(getattr(c, "notes", ""))
+        if notes_token:
+            body_blocks.append(f"<!-- spyde:notes {notes_token} -->")
         if getattr(c, "live_action", None):
             flow = yaml.safe_dump(dict(c.live_action), default_flow_style=True,
                                   sort_keys=True, allow_unicode=True).strip()
@@ -852,7 +912,7 @@ def _parse_body_cells(body: str) -> list:
     # buffer first (so the marker starts a NEW cell rather than joining the one
     # already accumulating above it).
     pending: dict = {"slide_break": False, "live_action": None, "column": "",
-                     "slide_kind": "", "slide_style": ""}
+                     "slide_kind": "", "slide_style": "", "notes": ""}
 
     def _apply_pending(cell: "Cell") -> "Cell":
         if pending["slide_break"]:
@@ -865,11 +925,14 @@ def _parse_body_cells(body: str) -> list:
             cell.slide_kind = pending["slide_kind"]
         if pending["slide_style"]:
             cell.slide_style = pending["slide_style"]
+        if pending["notes"]:
+            cell.notes = pending["notes"]
         pending["slide_break"] = False
         pending["live_action"] = None
         pending["column"] = ""
         pending["slide_kind"] = ""
         pending["slide_style"] = ""
+        pending["notes"] = ""
         return cell
 
     def flush_md() -> None:
@@ -921,6 +984,7 @@ def _parse_body_cells(body: str) -> list:
         m_break = _SLIDE_BREAK_RE.match(stripped)
         m_kind = _SLIDE_KIND_RE.match(stripped)
         m_style = _SLIDE_STYLE_RE.match(stripped)
+        m_notes = _SLIDE_NOTES_RE.match(stripped)
         m_live = _LIVE_ACTION_RE.match(stripped)
         m_col = _COLUMN_RE.match(stripped)
         m_fig = _FIG_LINE_RE.match(stripped)
@@ -939,6 +1003,11 @@ def _parse_body_cells(body: str) -> list:
         elif m_style is not None:
             flush_md()
             pending["slide_style"] = _normalize_slide_style(m_style.group("val"))
+        elif m_notes is not None:
+            # Speaker notes (base64) apply to whatever cell comes next (the
+            # slide's first cell). A malformed token decodes to "" (tolerant).
+            flush_md()
+            pending["notes"] = _decode_notes(m_notes.group("b64"))
         elif m_live is not None:
             flush_md()
             try:

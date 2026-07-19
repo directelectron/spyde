@@ -508,7 +508,14 @@ def _render_slides(mgr, assets: dict, *, interactive: bool, session=None) -> str
     ``data-kind="title"`` + a ``slide-style-<preset>`` class on the ``<section>``,
     which the deck CSS turns into the big-centered title treatment / the
     background preset. ``data-kind``/style are OMITTED when default so an older
-    deck's markup is byte-for-byte unchanged."""
+    deck's markup is byte-for-byte unchanged.
+
+    SPEAKER NOTES stay AUDIENCE-INVISIBLE: notes are never rendered as slide
+    content (they live only on the model, not in any cell's HTML). For a possible
+    future web presenter view we stash them as a hidden ``data-notes`` attribute
+    (HTML-escaped) on the ``<section>`` — the deck CSS/JS never surfaces it, so
+    the audience deck shows nothing. The attribute is OMITTED when a slide has no
+    notes, keeping a notes-free deck's markup unchanged."""
     from spyde.actions.report.model import slide_meta
 
     blocks: list[str] = []
@@ -523,9 +530,15 @@ def _render_slides(mgr, assets: dict, *, interactive: bool, session=None) -> str
         if meta["style"]:
             cls += f" slide-style-{meta['style']}"
         kind_attr = ' data-kind="title"' if meta["kind"] == "title" else ""
+        # Speaker notes → a hidden data-notes attribute (escaped so it can't break
+        # out of the attribute or inject markup); NEVER rendered as visible slide
+        # content, so the audience deck shows nothing. Omitted when there are none.
+        notes = str(meta.get("notes") or "")
+        notes_attr = (f' data-notes="{_html.escape(notes, quote=True)}"'
+                      if notes else "")
         blocks.append(
-            f"<section class=\"{cls}\"{kind_attr}>\n<div class=\"slide-inner\">\n"
-            f"{inner}\n</div>\n</section>")
+            f"<section class=\"{cls}\"{kind_attr}{notes_attr}>\n"
+            f"<div class=\"slide-inner\">\n{inner}\n</div>\n</section>")
     return "\n".join(blocks)
 
 

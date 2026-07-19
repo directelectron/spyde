@@ -469,6 +469,10 @@ export interface ReportCell {
    *  cell. '' / 'default' the standard dark stage; 'plain' flat darker; 'accent'
    *  a subtle accent-tinted gradient. */
   slide_style?: string
+  /** Present mode (presenter view): the slide's SPEAKER NOTES — free multi-line
+   *  markdown carried on the slide's FIRST cell. Shown only in the presenter
+   *  view; NEVER to the audience. Absent → '' (no notes). */
+  notes?: string
 }
 
 /** The authoritative report document (mirrored by the renderer for editing). */

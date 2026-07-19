@@ -85,6 +85,14 @@ interface Props {
    *  toggle. */
   slideStyle?: string
   onCycleStyle?: (style: string) => void
+  /** The slide's SPEAKER NOTES (presenter view) — read off this (slide-starting)
+   *  cell. When `onToggleNotes` is also given and `slideStart` is true, a
+   *  "📝 Notes" button renders in the chrome; the parent owns the editor
+   *  (an inline textarea), so this button just toggles it open/closed. The button
+   *  shows a filled state when the slide already has notes. */
+  slideNotes?: string
+  notesOpen?: boolean
+  onToggleNotes?: () => void
 }
 
 /** A small ALWAYS-VISIBLE badge (top-left of a cell) marking its slide column —
@@ -120,6 +128,7 @@ export function CellChrome({
   cellId, styles, onCopy, onDuplicate, onDelete, deleteTestid,
   deleteTitle = 'Delete cell', leading, trailing, column, onSetColumn,
   slideStart, slideKind, onToggleTitle, slideStyle, onCycleStyle,
+  slideNotes, notesOpen, onToggleNotes,
 }: Props) {
   const cur: CellColumn =
     column === 'left' || column === 'right' ? column : ''
@@ -157,6 +166,19 @@ export function CellChrome({
           title={`Slide background: ${STYLE_LABEL[curStyle]} — click to cycle`}
           onClick={cycleStyle}
         >{STYLE_GLYPH[curStyle]}</button>
+      )}
+      {slideStart && onToggleNotes && (
+        <button
+          data-testid={`cell-slide-notes-${cellId}`}
+          data-has-notes={(slideNotes || '').trim() ? '1' : '0'}
+          data-notes-open={notesOpen ? '1' : '0'}
+          style={(slideNotes || '').trim() || notesOpen
+            ? (styles.columnBtnActive ?? styles.chromeBtn) : styles.chromeBtn}
+          title={(slideNotes || '').trim()
+            ? 'Edit this slide’s speaker notes (presenter view only)'
+            : 'Add speaker notes for this slide (presenter view only)'}
+          onClick={onToggleNotes}
+        >{'📝'}</button>
       )}
       {onSetColumn && (
         <button

@@ -24,6 +24,17 @@
  * exit. A presentation clicker (remote) sends arrow / PageUp/PageDown keys, so
  * those Just Work. A slide counter (n / N) shows position.
  *
+ * PRESENTER VIEW (S to toggle, or the header button): swaps THIS screen between
+ * the clean audience slide and a presenter DASHBOARD — the current slide (live,
+ * scaled), the NEXT slide (a smaller dimmed preview), the current slide's SPEAKER
+ * NOTES (the big readable panel), and an elapsed-time TIMER (start/pause/reset) +
+ * the slide position. SpyDE is a single Electron window, so this is a same-screen
+ * toggle, not a true dual-monitor audience/presenter split (a real second-window
+ * popout is a future extension). Advancing slides (arrows) works in BOTH views and
+ * keeps them in sync — the presenter dashboard reads the SAME `index`. Notes are
+ * speaker-private: they render ONLY in the presenter view, never on the audience
+ * slide or in the exported deck.
+ *
  * Graceful degradation (Phase 1/2 may not be merged): `onLaunchLive` is wired to
  * `sendAction('tutorial_load', …)` — if that action isn't available the backend
  * simply no-ops and the excursion is just "exit Present mode"; we never hard-
@@ -75,6 +86,22 @@ if (typeof document !== 'undefined' && !document.getElementById('spyde-present-m
 .present-title-md p { font-size: 1.6rem; color: #a6adc8; margin: 0.3rem 0; }
 .present-title-md h1::after { content: ""; display: block; width: 4rem; height: 3px;
   margin: 1.2rem auto 0; background: #89b4fa; border-radius: 2px; }
+/* ── presenter-view speaker notes ─────────────────────────────────────────────
+   The big readable notes panel in the presenter dashboard — larger, roomy line
+   height, scoped so it doesn't affect the audience slide markdown. */
+.present-notes-md { font-size: 1.25rem; line-height: 1.7; color: #e8e8f0; }
+.present-notes-md > *:first-child { margin-top: 0; }
+.present-notes-md h1, .present-notes-md h2, .present-notes-md h3 {
+  color: #cdd6f4; margin: 0.8rem 0 0.4rem; border-bottom: none; padding-bottom: 0; }
+.present-notes-md h1 { font-size: 1.7rem; }
+.present-notes-md h2 { font-size: 1.45rem; }
+.present-notes-md h3 { font-size: 1.25rem; }
+.present-notes-md p { margin: 0 0 0.7rem; }
+.present-notes-md ul, .present-notes-md ol { margin: 0.5rem 0; padding-left: 1.5rem; }
+.present-notes-md li { margin: 0.25rem 0; }
+.present-notes-md strong { color: #ffffff; }
+.present-notes-md code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.9em; background: #22222f; padding: 0.1em 0.35em; border-radius: 4px; color: #f5c2e7; }
 `
   document.head.appendChild(el)
 }
@@ -152,6 +179,20 @@ function slideMeta(cells: ReportCell[]): { kind: SlideKind; style: SlideStyle } 
   }
 }
 
+/** A slide's SPEAKER NOTES — read off its FIRST cell (the renderer mirror of
+ *  `model.slide_notes`). '' when the slide has no notes. */
+function slideNotes(cells: ReportCell[]): string {
+  return (cells[0]?.notes ?? '').toString()
+}
+
+/** mm:ss for an elapsed-seconds count (the presenter timer). */
+function fmtElapsed(sec: number): string {
+  const s = Math.max(0, Math.floor(sec))
+  const mm = Math.floor(s / 60)
+  const ss = s % 60
+  return `${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}`
+}
+
 export function PresentMode({ initialSlide, onSlideChange, onExit, onLaunchLive }: Props) {
   const { state, iframeRefs, replayState } = useSpyDE()
   const report = state.report && state.report.open ? state.report : null
@@ -164,6 +205,11 @@ export function PresentMode({ initialSlide, onSlideChange, onExit, onLaunchLive 
   // leave it past the end).
   const [index, setIndex] = React.useState(() =>
     Math.max(0, Math.min(initialSlide, Math.max(0, count - 1))))
+
+  // Presenter view: swap THIS screen between the clean audience slide and the
+  // presenter dashboard (current + next + notes + timer). Same window, toggled
+  // with `S` or the header button. Advancing keeps both in sync (shared index).
+  const [presenter, setPresenter] = React.useState(false)
 
   // Report every change up so App can persist it for re-entry.
   useEffect(() => { onSlideChange(index) }, [index, onSlideChange])
@@ -189,6 +235,7 @@ export function PresentMode({ initialSlide, onSlideChange, onExit, onLaunchLive 
         e.preventDefault(); go(index - 1)
       } else if (k === 'Home') { e.preventDefault(); go(0) }
       else if (k === 'End') { e.preventDefault(); go(count - 1) }
+      else if (k === 's' || k === 'S') { e.preventDefault(); setPresenter(p => !p) }
       else if (k === 'Escape') { e.preventDefault(); onExit() }
     }
     window.addEventListener('keydown', onKey)
@@ -208,23 +255,45 @@ export function PresentMode({ initialSlide, onSlideChange, onExit, onLaunchLive 
   }
 
   return (
-    <div style={styles.overlay} data-testid="present-mode">
+    <div style={styles.overlay} data-testid="present-mode" data-presenter={presenter ? '1' : '0'}>
       {/* Every slide is RENDERED (so figure iframes stay mounted across
-          navigation and never tear down); only the active one is displayed. */}
-      {slides.map((group, si) => (
-        <Slide
-          key={si}
-          cells={group}
-          active={si === index}
-          reportFigures={state.reportFigures}
-          iframeRefs={iframeRefs}
-          replayState={replayState}
-          onLaunchLive={onLaunchLive}
-        />
-      ))}
+          navigation and never tear down); only the active one is displayed.
+          In presenter mode the whole audience stack is hidden (kept MOUNTED so
+          the live iframes survive) and the presenter dashboard renders on top. */}
+      <div style={presenter ? styles.audienceHidden : undefined} aria-hidden={presenter}>
+        {slides.map((group, si) => (
+          <Slide
+            key={si}
+            cells={group}
+            active={si === index}
+            reportFigures={state.reportFigures}
+            iframeRefs={iframeRefs}
+            replayState={replayState}
+            onLaunchLive={onLaunchLive}
+          />
+        ))}
+      </div>
 
-      {/* Top-right controls: exit. */}
+      {presenter && (
+        <PresenterView
+          slides={slides}
+          index={index}
+          count={count}
+          onGo={go}
+        />
+      )}
+
+      {/* Top-right controls: presenter-view toggle + exit. */}
       <div style={styles.topBar}>
+        <button
+          data-testid="present-presenter-toggle"
+          data-active={presenter ? '1' : '0'}
+          style={{ ...styles.iconBtn, ...(presenter ? styles.iconBtnActive : {}) }}
+          title={presenter
+            ? 'Presenter view ON — show the clean audience slide (S)'
+            : 'Presenter view: current + next + notes + timer (S)'}
+          onClick={() => setPresenter(p => !p)}
+        >🗣</button>
         <button
           data-testid="present-exit"
           style={styles.iconBtn}
@@ -233,27 +302,206 @@ export function PresentMode({ initialSlide, onSlideChange, onExit, onLaunchLive 
         >✕</button>
       </div>
 
-      {/* Bottom bar: prev / counter / next. */}
-      <div style={styles.bottomBar}>
-        <button
-          data-testid="present-prev"
-          style={{ ...styles.navBtn, ...(index === 0 ? styles.navBtnDisabled : {}) }}
-          title="Previous (←)"
-          disabled={index === 0}
-          onClick={() => go(index - 1)}
-        >‹</button>
-        <span data-testid="present-counter" style={styles.counter}>
-          {index + 1} / {count}
-        </span>
-        <button
-          data-testid="present-next"
-          style={{ ...styles.navBtn, ...(index >= count - 1 ? styles.navBtnDisabled : {}) }}
-          title="Next (→ / Space)"
-          disabled={index >= count - 1}
-          onClick={() => go(index + 1)}
-        >›</button>
+      {/* Bottom bar: prev / counter / next. Hidden in presenter mode (the
+          dashboard has its own nav + counter). */}
+      {!presenter && (
+        <div style={styles.bottomBar}>
+          <button
+            data-testid="present-prev"
+            style={{ ...styles.navBtn, ...(index === 0 ? styles.navBtnDisabled : {}) }}
+            title="Previous (←)"
+            disabled={index === 0}
+            onClick={() => go(index - 1)}
+          >‹</button>
+          <span data-testid="present-counter" style={styles.counter}>
+            {index + 1} / {count}
+          </span>
+          <button
+            data-testid="present-next"
+            style={{ ...styles.navBtn, ...(index >= count - 1 ? styles.navBtnDisabled : {}) }}
+            title="Next (→ / Space)"
+            disabled={index >= count - 1}
+            onClick={() => go(index + 1)}
+          >›</button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── Presenter view (single-window dashboard) ───────────────────────────────────
+
+/** The presenter dashboard: a header (timer + position + nav), the CURRENT slide
+ *  preview (largest, top-left), the NEXT slide preview (smaller, dimmed, top-right),
+ *  and the current slide's SPEAKER NOTES filling the bottom (the big readable
+ *  panel). Slide previews are STATIC (markdown + the figure's baked PNG / photo) so
+ *  we never duplicate the live audience iframes; the live embeds stay in the hidden
+ *  audience stack. Advancing (arrows / the header nav) drives the SAME `index`, so
+ *  audience + presenter stay in sync. */
+function PresenterView({ slides, index, count, onGo }: {
+  slides: ReportCell[][]
+  index: number
+  count: number
+  onGo: (n: number) => void
+}) {
+  const current = slides[index] ?? []
+  const next = index + 1 < count ? slides[index + 1] : null
+  const notes = slideNotes(current)
+  const notesHtml = React.useMemo(
+    () => (notes.trim() ? renderMarkdown(notes) : ''), [notes])
+
+  // Elapsed timer: running/paused + start epoch, mm:ss. Starts running the
+  // moment the presenter view first opens.
+  const [running, setRunning] = React.useState(true)
+  const [elapsed, setElapsed] = React.useState(0)
+  const startedAt = React.useRef<number>(Date.now())
+  const baseElapsed = React.useRef(0)   // accumulated seconds across pauses
+  React.useEffect(() => {
+    if (!running) return
+    startedAt.current = Date.now()
+    const id = setInterval(() => {
+      setElapsed(baseElapsed.current + (Date.now() - startedAt.current) / 1000)
+    }, 250)
+    return () => clearInterval(id)
+  }, [running])
+  const togglePause = () => {
+    setRunning(r => {
+      if (r) { baseElapsed.current = baseElapsed.current + (Date.now() - startedAt.current) / 1000 }
+      else { startedAt.current = Date.now() }
+      return !r
+    })
+  }
+  const resetTimer = () => {
+    baseElapsed.current = 0
+    startedAt.current = Date.now()
+    setElapsed(0)
+  }
+
+  return (
+    <div style={styles.presenter} data-testid="presenter-view">
+      {/* Header: timer + slide position + prev/next. */}
+      <div style={styles.presHeader}>
+        <div style={styles.timerBox}>
+          <span data-testid="presenter-timer" style={styles.timerText}>
+            {fmtElapsed(elapsed)}
+          </span>
+          <button
+            data-testid="presenter-timer-pause"
+            style={styles.timerBtn}
+            title={running ? 'Pause timer' : 'Resume timer'}
+            onClick={togglePause}
+          >{running ? '⏸' : '▶'}</button>
+          <button
+            data-testid="presenter-timer-reset"
+            style={styles.timerBtn}
+            title="Reset timer"
+            onClick={resetTimer}
+          >⟲</button>
+        </div>
+        <div style={styles.presTitle}>Presenter view</div>
+        <div style={styles.presNav}>
+          <button
+            data-testid="presenter-prev"
+            style={{ ...styles.presNavBtn, ...(index === 0 ? styles.navBtnDisabled : {}) }}
+            disabled={index === 0}
+            title="Previous (←)"
+            onClick={() => onGo(index - 1)}
+          >‹</button>
+          <span data-testid="presenter-counter" style={styles.presCounter}>
+            {index + 1} / {count}
+          </span>
+          <button
+            data-testid="presenter-next"
+            style={{ ...styles.presNavBtn, ...(index >= count - 1 ? styles.navBtnDisabled : {}) }}
+            disabled={index >= count - 1}
+            title="Next (→ / Space)"
+            onClick={() => onGo(index + 1)}
+          >›</button>
+        </div>
+      </div>
+
+      {/* Top row: current slide (large) + next slide (smaller, dimmed). */}
+      <div style={styles.presPreviews}>
+        <div style={styles.presCurrentWrap}>
+          <div style={styles.presPreviewLabel}>Current</div>
+          <div style={styles.presCurrentBox} data-testid="presenter-current">
+            <SlidePreview cells={current} />
+          </div>
+        </div>
+        <div style={styles.presNextWrap}>
+          <div style={styles.presPreviewLabel}>Next</div>
+          <div style={styles.presNextBox} data-testid="presenter-next-preview">
+            {next
+              ? <SlidePreview cells={next} dimmed />
+              : <div style={styles.presEndCard}>End of deck</div>}
+          </div>
+        </div>
+      </div>
+
+      {/* Bottom: the current slide's speaker notes (the big readable panel). */}
+      <div style={styles.presNotes} data-testid="presenter-notes">
+        <div style={styles.presNotesLabel}>Speaker notes</div>
+        {notesHtml
+          ? <div className="spyde-md present-notes-md"
+              data-testid="presenter-notes-body"
+              dangerouslySetInnerHTML={{ __html: notesHtml }} />
+          : <div style={styles.presNotesEmpty} data-testid="presenter-notes-empty">
+              No notes for this slide.
+            </div>}
       </div>
     </div>
+  )
+}
+
+/** A STATIC, scaled-down preview of a slide for the presenter dashboard: markdown
+ *  cells render their HTML; figure cells show their baked PNG (offline snapshot);
+ *  image cells show their photo. It deliberately does NOT mount the live figure
+ *  iframe (that lives in the hidden audience stack) so the presenter panel is cheap
+ *  and never duplicates/steals an embed. `dimmed` softens the NEXT preview. */
+function SlidePreview({ cells, dimmed }: { cells: ReportCell[]; dimmed?: boolean }) {
+  const meta = React.useMemo(() => slideMeta(cells), [cells])
+  const isTitle = meta.kind === 'title'
+  const styleBg =
+    meta.style === 'plain' ? styles.slideBgPlain
+      : meta.style === 'accent' ? styles.slideBgAccent : {}
+  return (
+    <div style={{ ...styles.previewStage, ...styleBg, ...(dimmed ? styles.previewDimmed : {}) }}>
+      <div style={{ ...styles.previewInner, ...(isTitle ? styles.previewInnerTitle : {}) }}>
+        {cells.map(cell => (
+          <PreviewCell key={cell.id} cell={cell} titleSlide={isTitle} />
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function PreviewCell({ cell, titleSlide }: { cell: ReportCell; titleSlide: boolean }) {
+  if (cell.cell_type === 'markdown') {
+    const html = renderMarkdown(cell.source ?? '')
+    if (!(cell.source ?? '').trim()) return null
+    const cls = 'spyde-md present-md' + (titleSlide ? ' present-title-md' : '')
+    return <div className={cls} dangerouslySetInnerHTML={{ __html: html }} />
+  }
+  if (cell.cell_type === 'image') {
+    if (!cell.image) return null
+    return (
+      <figure style={styles.previewFigure}>
+        <img src={cell.image} alt={cell.caption ?? ''} style={styles.previewImg} />
+        {(cell.caption ?? '').trim() &&
+          <figcaption style={styles.previewCaption}>{cell.caption}</figcaption>}
+      </figure>
+    )
+  }
+  // figure cell — the baked PNG snapshot (a live iframe isn't mounted here).
+  if (cell.placeholder) return null
+  return (
+    <figure style={styles.previewFigure}>
+      {cell.png
+        ? <img src={cell.png} alt={cell.caption ?? ''} style={styles.previewImg} />
+        : <div style={styles.previewFigPending}>figure</div>}
+      {(cell.caption ?? '').trim() &&
+        <figcaption style={styles.previewCaption}>{cell.caption}</figcaption>}
+    </figure>
   )
 }
 
@@ -493,6 +741,103 @@ const styles: Record<string, React.CSSProperties> = {
     background: 'rgba(30,30,46,0.8)', color: '#cdd6f4',
     border: '1px solid #313244', borderRadius: 8,
     width: 36, height: 36, fontSize: 16, cursor: 'pointer',
+  },
+  iconBtnActive: {
+    background: '#89b4fa', color: '#11111b', borderColor: '#89b4fa',
+  },
+  // The whole audience slide stack is hidden (but kept MOUNTED) while the
+  // presenter dashboard is up, so the live figure iframes never tear down.
+  audienceHidden: { visibility: 'hidden', pointerEvents: 'none' },
+  // ── presenter dashboard ──────────────────────────────────────────────────────
+  presenter: {
+    position: 'absolute', inset: 0, zIndex: 20,
+    background: '#0e0e16', color: '#e8e8f0',
+    display: 'flex', flexDirection: 'column',
+    padding: '56px 3vw 2.5vh', gap: '1.6vh',
+    fontSize: 16,
+  },
+  presHeader: {
+    display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+    gap: 16, paddingBottom: 8, borderBottom: '1px solid #313244',
+  },
+  timerBox: {
+    display: 'flex', alignItems: 'center', gap: 8,
+    minWidth: 220,
+  },
+  timerText: {
+    fontSize: 34, fontWeight: 700, letterSpacing: 1,
+    color: '#89b4fa', fontVariantNumeric: 'tabular-nums',
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+  },
+  timerBtn: {
+    background: 'rgba(137,180,250,0.12)', color: '#cdd6f4',
+    border: '1px solid #313244', borderRadius: 6,
+    width: 30, height: 30, fontSize: 14, cursor: 'pointer',
+  },
+  presTitle: {
+    fontSize: 14, color: '#7f849c', fontWeight: 600, letterSpacing: 0.5,
+    textTransform: 'uppercase',
+  },
+  presNav: { display: 'flex', alignItems: 'center', gap: 12, minWidth: 220, justifyContent: 'flex-end' },
+  presNavBtn: {
+    background: 'rgba(30,30,46,0.9)', color: '#cdd6f4',
+    border: '1px solid #313244', borderRadius: 8,
+    width: 40, height: 40, fontSize: 24, lineHeight: 1, cursor: 'pointer',
+  },
+  presCounter: { fontSize: 18, color: '#cdd6f4', minWidth: 66, textAlign: 'center', fontWeight: 600 },
+  presPreviews: {
+    display: 'grid', gridTemplateColumns: '1.6fr 1fr', gap: '2vw',
+    flex: '0 0 48%', minHeight: 0,
+  },
+  presCurrentWrap: { display: 'flex', flexDirection: 'column', minHeight: 0 },
+  presNextWrap: { display: 'flex', flexDirection: 'column', minHeight: 0 },
+  presPreviewLabel: {
+    fontSize: 12, color: '#7f849c', fontWeight: 600, letterSpacing: 0.5,
+    textTransform: 'uppercase', marginBottom: 5,
+  },
+  presCurrentBox: {
+    flex: 1, minHeight: 0, borderRadius: 10, overflow: 'hidden',
+    border: '2px solid #45475a', background: '#14141f',
+  },
+  presNextBox: {
+    flex: 1, minHeight: 0, borderRadius: 10, overflow: 'hidden',
+    border: '1px solid #313244', background: '#14141f',
+  },
+  presEndCard: {
+    display: 'flex', alignItems: 'center', justifyContent: 'center',
+    height: '100%', color: '#585b70', fontSize: 15, fontStyle: 'italic',
+  },
+  presNotes: {
+    flex: 1, minHeight: 0, borderRadius: 10, padding: '14px 20px',
+    background: '#181825', border: '1px solid #313244',
+    overflowY: 'auto',
+  },
+  presNotesLabel: {
+    fontSize: 12, color: '#7f849c', fontWeight: 600, letterSpacing: 0.5,
+    textTransform: 'uppercase', marginBottom: 8,
+  },
+  presNotesEmpty: { color: '#585b70', fontSize: 16, fontStyle: 'italic' },
+  // ── slide preview (static, scaled) ───────────────────────────────────────────
+  previewStage: {
+    width: '100%', height: '100%', overflow: 'hidden',
+    display: 'flex', flexDirection: 'column', justifyContent: 'center',
+    padding: '3% 5%',
+  },
+  previewDimmed: { opacity: 0.65 },
+  previewInner: { width: '100%', maxWidth: '100%', margin: '0 auto' },
+  previewInnerTitle: { textAlign: 'center' },
+  previewFigure: { margin: '0.4rem 0', textAlign: 'center' },
+  previewImg: {
+    display: 'block', margin: '0 auto',
+    maxWidth: '100%', maxHeight: '30vh', height: 'auto', borderRadius: 6,
+  },
+  previewFigPending: {
+    display: 'flex', alignItems: 'center', justifyContent: 'center',
+    height: 80, color: '#585b70', fontSize: 12,
+    border: '1px dashed #45475a', borderRadius: 6,
+  },
+  previewCaption: {
+    marginTop: 3, fontSize: '0.7rem', color: '#a6adc8', fontStyle: 'italic',
   },
   bottomBar: {
     position: 'fixed', bottom: 18, left: '50%', transform: 'translateX(-50%)',
