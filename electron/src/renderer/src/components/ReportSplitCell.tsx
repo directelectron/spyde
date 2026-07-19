@@ -82,6 +82,7 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
   const { state, iframeRefs, replayState, sendAction, dragKind } = useSpyDE()
   const [hover, setHover] = useState(false)
   const [editing, setEditing] = useState(false)
+  const [figEditOpen, setFigEditOpen] = useState(false)
   const [draft, setDraft] = useState(cell.source ?? '')
   const [dropHover, setDropHover] = useState(false)
   const taRef = useRef<HTMLTextAreaElement>(null)
@@ -106,6 +107,20 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
     ta.style.height = 'auto'
     ta.style.height = `${ta.scrollHeight}px`
   }, [draft, editing])
+
+  // Figure-side actions — available only when the figure side is a live FIGURE
+  // (not a photo, not an empty drop zone). The backend admits a split's figure
+  // side into report_refresh_figure / repfig_set_edit_mode (it reuses the same
+  // FigureSpec machinery), so these behave exactly like a figure cell's.
+  const canEditFigure = isLive && !!cell.figure
+  const refreshFigure = () => sendAction('report_refresh_figure', { cell_id: cell.id })
+  const toggleFigEdit = () => {
+    setFigEditOpen((v) => {
+      const next = !v
+      sendAction('repfig_set_edit_mode', { cell_id: cell.id, editing: next })
+      return next
+    })
+  }
 
   const commitText = () => {
     setEditing(false)
@@ -292,14 +307,34 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
             >⠿</span>
           }
           trailing={
-            <button
-              data-testid={`report-split-layout-${cell.id}`}
-              style={styles.chromeBtn}
-              title={layout === 'text-left'
-                ? 'Text is on the LEFT — click to move it to the right'
-                : 'Text is on the RIGHT — click to move it to the left'}
-              onClick={swapLayout}
-            >{layout === 'text-left' ? '◨' : '◧'}</button>
+            <>
+              {canEditFigure && (
+                <button
+                  data-testid={`report-split-edit-${cell.id}`}
+                  style={figEditOpen ? styles.chromeBtnActive : styles.chromeBtn}
+                  title={figEditOpen
+                    ? 'Done editing the figure'
+                    : 'Edit the figure side (annotations, layers, callouts)'}
+                  onClick={toggleFigEdit}
+                >✎</button>
+              )}
+              {canEditFigure && (
+                <button
+                  data-testid={`report-split-refresh-${cell.id}`}
+                  style={styles.chromeBtn}
+                  title="Refresh the figure side from the live data"
+                  onClick={refreshFigure}
+                >⟳</button>
+              )}
+              <button
+                data-testid={`report-split-layout-${cell.id}`}
+                style={styles.chromeBtn}
+                title={layout === 'text-left'
+                  ? 'Text is on the LEFT — click to move it to the right'
+                  : 'Text is on the RIGHT — click to move it to the left'}
+                onClick={swapLayout}
+              >{layout === 'text-left' ? '◨' : '◧'}</button>
+            </>
           }
         />
       )}
@@ -337,6 +372,10 @@ const styles: Record<string, React.CSSProperties> = {
   chromeBtn: {
     background: 'none', border: 'none', color: '#a6adc8', cursor: 'pointer',
     fontSize: 13, padding: '0 3px', lineHeight: 1,
+  },
+  chromeBtnActive: {
+    background: 'rgba(137,180,250,0.18)', border: 'none', color: '#89b4fa',
+    cursor: 'pointer', fontSize: 13, padding: '0 3px', lineHeight: 1, borderRadius: 3,
   },
   dragHandle: {
     cursor: 'grab', color: '#6c7086', fontSize: 13, userSelect: 'none', lineHeight: 1,

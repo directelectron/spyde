@@ -13,7 +13,7 @@ Covered here:
   ``report_set_split_figure`` fills the figure side (snapshot captured);
 * a ``.spyde-report`` zip round-trip restores the split cell + its asset;
 * ``slide_columns`` yields a ``split`` row; export mode:'slides'/'static' renders
-  the 2-col grid; the LEGACY adjacency ``column`` 2-col path still loads/renders.
+  the 2-col grid.
 """
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ import numpy as np
 
 from spyde.actions.report import export_html as ex
 from spyde.actions.report import handlers as h
+from spyde.actions.report.handlers import _is_figure_like
 from spyde.actions.report.model import (
     Cell, FigureSpec, PanelSpec, ReportDoc, parse_report_md, read_report,
     serialize_report_md, slide_columns, write_report,
@@ -123,6 +124,43 @@ class TestSplitSerialization:
         assert sc.source == "just text here"
         assert sc.spec is None
         assert not sc.image_ext
+
+    def test_empty_split_does_not_swallow_following_cell(self):
+        # REGRESSION (critical data loss): an empty-figure-side split followed by
+        # a real figure/image cell must NOT bind that following cell's ref as its
+        # own figure side — both cells must survive. Previously the split's open
+        # figure side swallowed the next figure ref anywhere later in the doc.
+        for follower in (
+            Cell(cell_type="figure", caption="REAL FIG"),
+            Cell(cell_type="image", image_ext="png", caption="REAL PHOTO"),
+        ):
+            doc = ReportDoc(cells=[
+                Cell(cell_type="split", source="describe"),   # empty figure side
+                follower,
+            ])
+            doc2 = parse_report_md(serialize_report_md(doc))
+            assert len(doc2.cells) == 2, (
+                f"empty split swallowed the following {follower.cell_type} cell")
+            assert doc2.cells[0].cell_type == "split"
+            assert doc2.cells[0].spec is None and not doc2.cells[0].image_ext
+            # The follower keeps its own identity (a .png figure ref parses as a
+            # figure pre-promotion; a non-png image parses as an image).
+            assert doc2.cells[1].cell_type in ("figure", "image")
+
+    def test_split_text_with_image_ref_lookalike_stays_intact(self):
+        # REGRESSION: a standalone image-ref lookalike inside a split's TEXT must
+        # NOT fragment the text or be stolen as the figure side (the text is
+        # base64-encoded into the marker, so it is fully opaque).
+        src = "intro\n\n![sneaky](assets/otherid.png)\n\nmore text"
+        doc = ReportDoc(cells=[
+            Cell(cell_type="split", source=src, image_ext="jpg", caption="realcap"),
+        ])
+        doc2 = parse_report_md(serialize_report_md(doc))
+        assert len(doc2.cells) == 1
+        sc = doc2.cells[0]
+        assert sc.cell_type == "split"
+        assert sc.source == src            # text preserved EXACTLY, not truncated
+        assert sc.image_ext == "jpg"        # its real figure side, not "otherid"
 
     def test_split_layout_normalizes(self):
         c = Cell(cell_type="split", source="x", image_ext="png",
@@ -235,22 +273,15 @@ class TestSplitSlideColumns:
         assert rows[0]["kind"] == "split"
         assert rows[0]["cell"] is c
 
-    def test_legacy_column_path_still_works(self):
-        # The legacy adjacency 2-col path (column="left"/"right") is unchanged.
-        left = Cell(cell_type="markdown", source="L", column="left")
-        right = Cell(cell_type="figure", caption="R", column="right",
-                     spec=FigureSpec(panels=[PanelSpec()]))
-        rows = slide_columns([left, right])
-        assert len(rows) == 1
-        assert rows[0]["kind"] == "cols"
-        assert rows[0]["left"] == [left]
-        assert rows[0]["right"] == [right]
-
-    def test_split_closes_open_legacy_cols_row(self):
-        left = Cell(cell_type="markdown", source="L", column="left")
+    def test_non_split_cells_are_full_rows(self):
+        # Every non-split cell emits its own full-width row (order preserved).
+        a = Cell(cell_type="markdown", source="A")
         split = Cell(cell_type="split", source="s", image_ext="png")
-        rows = slide_columns([left, split])
-        assert [r["kind"] for r in rows] == ["cols", "split"]
+        b = Cell(cell_type="figure", caption="B",
+                 spec=FigureSpec(panels=[PanelSpec()]))
+        rows = slide_columns([a, split, b])
+        assert [r["kind"] for r in rows] == ["full", "split", "full"]
+        assert [r["cell"] for r in rows] == [a, split, b]
 
 
 # ── handlers ────────────────────────────────────────────────────────────────────
@@ -320,6 +351,42 @@ class TestSplitHandlers:
         # the snapshot was captured for the split cell's id
         mgr = h._manager(session)
         assert cid in mgr._snapshots and mgr._snapshots[cid]
+
+    def test_split_figure_side_is_refreshable(self, stem_4d_dataset):
+        # REGRESSION: a split cell's FIGURE side (once filled) must be refreshable
+        # — report_refresh_figure previously rejected any cell_type != "figure",
+        # so a split's figure could never be pulled fresh from live data. The fix
+        # admits a split-with-a-spec (_is_figure_like).
+        session = stem_4d_dataset["window"]
+        messages = stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        wid = _signal_wid(session)
+        h.report_new(session, None, {"type": "presentation"})
+        h.report_add_split_cell(session, None, {"source": "txt"})
+        cid = _cells(messages)[0]["id"]
+        h.report_set_split_figure(
+            session, None, {"cell_id": cid, "source_window_id": wid})
+        assert _is_figure_like(h._manager(session).doc.cell_by_id(cid))
+        errs_before = len([m for m in messages if m.get("type") == "error"])
+        # Refresh must run (not silently return on the type gate) and keep the cell
+        # a split with its figure side intact — no crash, no error.
+        h.report_refresh_figure(session, None, {"cell_id": cid})
+        errs_after = len([m for m in messages if m.get("type") == "error"])
+        assert errs_after == errs_before
+        c = next(x for x in _cells(messages) if x["id"] == cid)
+        assert c["cell_type"] == "split"
+        assert c["source"] == "txt"
+        assert c.get("figure") is not None
+        assert c["split_empty"] is False
+
+    def test_photo_split_is_not_figure_like(self):
+        # A split whose side is a PHOTO (no spec) is NOT figure-like — you can't
+        # repfig-edit a photo. Guards the _is_figure_like boundary.
+        assert not _is_figure_like(Cell(cell_type="split", image_ext="png"))
+        assert _is_figure_like(Cell(cell_type="split", spec=FigureSpec()))
+        assert _is_figure_like(Cell(cell_type="figure"))
+        assert not _is_figure_like(Cell(cell_type="markdown"))
+        assert not _is_figure_like(None)
 
     def test_set_split_figure_non_split_is_noop(self, stem_4d_dataset):
         session = stem_4d_dataset["window"]
@@ -435,24 +502,3 @@ class TestSplitExport:
         html2 = _render_static(mgr2)
         assert html2.index("split-fig") < html2.index("split-text")
 
-    def test_legacy_column_export_still_renders(self, window):
-        # A LEGACY 2-col slide (column left/right, NOT a split cell) still renders
-        # its .slide-cols grid — the split cell doesn't break the old path.
-        session, messages = window["window"], window["messages"]
-        h.report_new(session, None, {"type": "presentation"})
-        h.report_add_cell(session, None, {"cell_type": "markdown",
-                                          "source": "left text",
-                                          "column": "left"})
-        h.report_add_image_cell(session, None, {
-            "image_b64": (
-                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1"
-                "HAwCAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="),
-            "image_ext": "png", "column": "right"})
-        # tag the image cell to the right column
-        cells = _cells(messages)
-        img_id = cells[-1]["id"]
-        h.report_set_cell_column(session, None,
-                                 {"cell_id": img_id, "column": "right"})
-        mgr = h._manager(session)
-        html = _render_slides(mgr)
-        assert "slide-cols" in html

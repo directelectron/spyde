@@ -51,6 +51,19 @@ _IMAGE_CELL_MAX_BYTES = 10 * 1024 * 1024
 _SCENE3D_SNAPSHOT_KEYS = ("xyz", "rgb")
 
 
+def _is_figure_like(cell) -> bool:
+    """True for a cell whose figure machinery (spec/panels/refresh/repfig edit)
+    applies: a plain ``figure`` cell, OR a ``split`` cell whose figure side is a
+    real figure (has a ``spec``). A split's figure side reuses the exact same
+    FigureSpec/panel snapshot/rebuild path, so refresh + repfig editing work on it
+    unchanged — the gates just need to admit it (a photo-side split has no spec
+    and is correctly excluded)."""
+    if cell is None:
+        return False
+    ct = getattr(cell, "cell_type", "")
+    return ct == "figure" or (ct == "split" and getattr(cell, "spec", None) is not None)
+
+
 def _is_scene3d_panel(panel) -> bool:
     return str(getattr(panel, "kind", "")) == "scene3d"
 
@@ -284,13 +297,11 @@ class ReportManager:
                 "data_offline": bool(
                     c.cell_type in ("figure", "split") and c.id in self._offline),
                 # Present-mode fields (Phase 6): slide grouping + go-live handle
-                # + 2-column layout ("" | "left" | "right") + per-slide kind/style
-                # (title/section slide + background preset — carried on the
-                # slide's first cell).
+                # + per-slide kind/style (title/section slide + background preset —
+                # carried on the slide's first cell).
                 "slide_break": bool(getattr(c, "slide_break", False)),
                 "live_action": (dict(c.live_action)
                                 if getattr(c, "live_action", None) else None),
-                "column": str(getattr(c, "column", "") or ""),
                 "slide_kind": str(getattr(c, "slide_kind", "") or ""),
                 "slide_style": str(getattr(c, "slide_style", "") or ""),
                 # Speaker notes (presenter view) — per-slide, carried on the
@@ -1072,7 +1083,7 @@ def _make_figure_edit_handler(mgr, cell_id):
             etype = getattr(event, "event_type", "")
             marker_id = getattr(event, "last_widget_id", None)
             cell = mgr.doc.cell_by_id(cell_id) if mgr.doc else None
-            if cell is None or cell.cell_type != "figure":
+            if not _is_figure_like(cell):
                 return
             # panel drag-swap: two panel DISPATCH ids on the event (mapped back to
             # spec panel ids via fig._report_panel_map). Handled BEFORE the
@@ -1135,7 +1146,7 @@ def _handle_panel_swap(mgr, cell_id, fig, src_disp, tgt_disp) -> None:
     to a distinct spec panel; both panels must still be on the spec. An unknown id
     or a same-panel drop is a no-op."""
     cell = mgr.doc.cell_by_id(cell_id) if mgr.doc else None
-    if cell is None or cell.cell_type != "figure" or cell.spec is None:
+    if not _is_figure_like(cell) or cell.spec is None:
         return
     if src_disp == tgt_disp:
         return
@@ -1190,7 +1201,7 @@ def _make_inset_geometry_handler(mgr, cell_id):
             if inset_disp_id is None or fig is None:
                 return
             cell = mgr.doc.cell_by_id(cell_id) if mgr.doc else None
-            if cell is None or cell.cell_type != "figure" or cell.spec is None:
+            if not _is_figure_like(cell) or cell.spec is None:
                 return
             inset_map = dict(getattr(fig, "_report_inset_map", None) or {})
             spec_by_disp = {disp: pid for pid, disp in inset_map.items()}
@@ -2061,9 +2072,6 @@ def report_add_cell(session, plot, payload) -> None:
     la = payload.get("live_action")
     if isinstance(la, dict) and la:
         cell.live_action = dict(la)
-    if payload.get("column") is not None:
-        from spyde.actions.report.model import _normalize_column
-        cell.column = _normalize_column(payload.get("column"))
     # Per-slide kind/style (presentation polish) so a seeded deck can create a
     # title / styled slide's first cell already-marked without a round trip.
     if payload.get("slide_kind") is not None:
@@ -2136,9 +2144,6 @@ def report_add_split_cell(session, plot, payload) -> None:
                 split_layout=_normalize_split_layout(payload.get("layout")))
     if payload.get("slide_break") is not None:
         cell.slide_break = bool(payload.get("slide_break"))
-    if payload.get("column") is not None:
-        from spyde.actions.report.model import _normalize_column
-        cell.column = _normalize_column(payload.get("column"))
     _insert_cell(mgr.doc, cell, payload.get("index"))
     mgr.dirty = True
     mgr.emit_state()
@@ -2370,26 +2375,6 @@ def report_set_live_action(session, plot, payload) -> None:
     mgr.emit_state()
 
 
-def report_set_cell_column(session, plot, payload) -> None:
-    """Assign a cell to a COLUMN within its slide — the 2-column layout so a text
-    cell can sit BESIDE a figure/photo (see :func:`spyde.actions.report.model.slide_columns`).
-
-    ``{cell_id, column}`` where ``column`` is ``"left"`` / ``"right"`` (place in
-    the 2-col grid) or ``""`` / ``"full"`` (span the whole slide — the default).
-    Any other value collapses to ``""`` (full width). An unknown cell is a no-op
-    (no crash)."""
-    from spyde.actions.report.model import _normalize_column
-    mgr = _manager(session)
-    if not mgr.open:
-        return
-    cell = mgr.doc.cell_by_id(payload.get("cell_id"))
-    if cell is None:
-        return
-    cell.column = _normalize_column(payload.get("column"))
-    mgr.dirty = True
-    mgr.emit_state()
-
-
 def _slide_start_cell(mgr, cell):
     """The FIRST cell of the slide *cell* belongs to — walk BACK from *cell* until
     a slide_break cell (or the document start). Per-slide attributes (kind/style)
@@ -2605,7 +2590,7 @@ def report_refresh_figure(session, plot, payload) -> None:
     if not mgr.open:
         return
     cell = mgr.doc.cell_by_id(payload.get("cell_id"))
-    if cell is None or cell.cell_type != "figure" or cell.spec is None:
+    if not _is_figure_like(cell) or cell.spec is None:
         return
     any_refreshed = False
     for panel in cell.spec.panels:
@@ -2642,7 +2627,7 @@ def repfig_refresh_panel(session, plot, payload) -> None:
     if not mgr.open:
         return
     cell = mgr.doc.cell_by_id(payload.get("cell_id"))
-    if cell is None or cell.cell_type != "figure" or cell.spec is None:
+    if not _is_figure_like(cell) or cell.spec is None:
         return
     panel = next((p for p in cell.spec.panels
                   if p.id == payload.get("panel_id")), None)
