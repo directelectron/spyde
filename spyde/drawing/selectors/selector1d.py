@@ -78,9 +78,6 @@ class InfiniteLineSelector(BaseSelector):
         index = int(round((pos - offset) / scale))
         return np.array([[index]])
 
-    def add_linked_roi(self, plot: "Plot") -> None:
-        pass
-
     def translate_pixels(self, shift_x: int) -> None:
         if self._widget is not None:
             scale, offset = _signal_axis(self)
@@ -175,9 +172,6 @@ class LinearRegionSelector(BaseSelector):
         if len(indices) == 0:
             indices = np.array([[int(round(start))]])
         return indices
-
-    def add_linked_roi(self, plot: "Plot") -> None:
-        pass
 
     def translate_pixels(self, shift_x: int) -> None:
         if self._widget is not None:
@@ -313,9 +307,6 @@ class IntegratingSelector1D(IntegratingSelectorMixin):
     def close(self) -> None:
         self._inf_line_selector.close()
         self._linear_region_selector.close()
-
-    def add_linked_roi(self, plot: "Plot") -> None:
-        pass
 
     def move_roi(self, key) -> None:
         if hasattr(self.selector, "translate_pixels"):

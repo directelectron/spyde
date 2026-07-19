@@ -60,24 +60,23 @@ def _is_figure_like(cell) -> bool:
     and is correctly excluded)."""
     if cell is None:
         return False
-    ct = getattr(cell, "cell_type", "")
-    return ct == "figure" or (ct == "split" and getattr(cell, "spec", None) is not None)
+    return cell.cell_type == "figure" or (
+        cell.cell_type == "split" and cell.spec is not None)
 
 
 def _is_scene3d_panel(panel) -> bool:
-    return str(getattr(panel, "kind", "")) == "scene3d"
+    return str(panel.kind) == "scene3d"
 
 
 def _is_scene3d_cell(cell) -> bool:
     """True when *cell* is a figure cell whose spec contains a scene3d panel
     (the matplotlib Agg bake CANNOT render these — fallbacks must reuse a
     harvested/baked PNG or skip gracefully)."""
-    spec = getattr(cell, "spec", None)
-    return spec is not None and any(_is_scene3d_panel(p) for p in spec.panels)
+    return cell.spec is not None and any(_is_scene3d_panel(p) for p in cell.spec.panels)
 
 
 def _is_line_panel(panel) -> bool:
-    return str(getattr(panel, "kind", "")) == "line"
+    return str(panel.kind) == "line"
 
 
 def _bake_primary_snapshot(cell, arr, *, max_edge: int) -> "bytes | None":
@@ -122,6 +121,9 @@ class ReportManager:
         self._snapshots: dict[str, dict] = {}
         # cell_id -> baked PNG bytes read from an opened report (offline fallback)
         self._baked: dict[str, bytes] = {}
+        # figure cells the last assemble_assets could not produce any pixels for
+        # (dangling-ref risk on save) — read by _finish_save to warn the user.
+        self._dropped_assets: list = []
         # cell_id -> raw image bytes for an IMAGE (photo) cell — dropped / pasted /
         # browsed in. Held here so save can write them to assets/<id>.<ext> and
         # state() can emit them as a data URL; loaded back from the zip on open.
@@ -299,15 +301,14 @@ class ReportManager:
                 # Present-mode fields (Phase 6): slide grouping + go-live handle
                 # + per-slide kind/style (title/section slide + background preset —
                 # carried on the slide's first cell).
-                "slide_break": bool(getattr(c, "slide_break", False)),
-                "live_action": (dict(c.live_action)
-                                if getattr(c, "live_action", None) else None),
-                "slide_kind": str(getattr(c, "slide_kind", "") or ""),
-                "slide_style": str(getattr(c, "slide_style", "") or ""),
+                "slide_break": bool(c.slide_break),
+                "live_action": dict(c.live_action) if c.live_action else None,
+                "slide_kind": c.slide_kind,
+                "slide_style": c.slide_style,
                 # Speaker notes (presenter view) — per-slide, carried on the
                 # slide's first cell; free multi-line markdown, shown only in the
                 # presenter view, never to the audience.
-                "notes": str(getattr(c, "notes", "") or ""),
+                "notes": c.notes,
             }
             # Wave A — SPLIT cell: ship which side the TEXT sits on so the renderer
             # (Wave B) builds the 2-pane block correctly. Its text side rides in
@@ -315,19 +316,17 @@ class ReportManager:
             # (below, shared with figure/image cells).
             if c.cell_type == "split":
                 from spyde.actions.report.model import _normalize_split_layout
-                entry["split_layout"] = _normalize_split_layout(
-                    getattr(c, "split_layout", "text-left"))
+                entry["split_layout"] = _normalize_split_layout(c.split_layout)
                 # A split cell whose figure side is EMPTY (no spec, no image yet)
                 # is a drop zone — surface that so the renderer can draw it.
-                entry["split_empty"] = bool(
-                    c.spec is None and not getattr(c, "image_ext", ""))
+                entry["split_empty"] = bool(c.spec is None and not c.image_ext)
             # An IMAGE (photo) cell — OR a split cell whose figure side is a photo —
             # ships its bytes as a data URL so the renderer can draw the <img> with
             # no round trip (mirrors the offline-figure PNG emission below). The
             # extension picks the MIME so jpg/gif/webp render correctly.
             if (c.cell_type == "image"
                     or (c.cell_type == "split" and c.spec is None
-                        and getattr(c, "image_ext", ""))):
+                        and c.image_ext)):
                 img = self._images.get(c.id)
                 if img is not None:
                     ext = (c.image_ext or "png").lower()
@@ -369,7 +368,7 @@ class ReportManager:
             "title": self.doc.title,
             "template": bool(self.doc.template),
             # Wave A — the document TYPE ("report" | "presentation" | "movie").
-            "type": str(getattr(self.doc, "doc_type", "report") or "report"),
+            "type": self.doc.doc_type,
             "dirty": bool(self.dirty),
             "cells": cells,
         }
@@ -422,7 +421,7 @@ class ReportManager:
         # Drop-time choice: "image" pins the static snapshot even when the tree
         # carries vectors. Default "" and "viewer" both embed the explorer
         # (mirrors export_html._render_body's `!= "image"` gate exactly).
-        if str(getattr(spec, "vectors_mode", "") or "") == "image":
+        if spec.vectors_mode == "image":
             return None
         # A scene3d cell is never a vectors-explorer candidate.
         if _is_scene3d_cell(cell):
@@ -764,8 +763,17 @@ class ReportManager:
         renderer-harvested PNG, a fresh bake of the held snapshot, then the PNG
         loaded from an opened report. For an image cell it is simply the held raw
         image bytes. The shared basis for the zip save AND every export path so all
-        writes get identical pixels."""
+        writes get identical pixels.
+
+        Records on ``self._dropped_assets`` every FIGURE cell that ends up with no
+        pixels at all (harvest empty, bake failed/unavailable, nothing baked): its
+        spec yaml still gets written, so without a PNG the on-disk report has a
+        dangling image ref (a figure that reloads blank when its source is offline).
+        The save path reads this list to warn the user rather than reporting a clean
+        save. (A scene3d cell legitimately has no Agg bake — see below — so it is NOT
+        counted as a drop.)"""
         assets: dict[str, bytes] = {}
+        dropped: list = []
         for c in self.doc.cells:
             # Image (photo) cells: the held raw bytes go straight to the asset dict.
             if c.cell_type == "image":
@@ -797,8 +805,13 @@ class ReportManager:
                 if arr is not None and c.spec is not None:
                     try:
                         png = _bake_primary_snapshot(c, arr, max_edge=1200)
-                    except Exception as e:
-                        log.debug("asset bake failed for cell %s: %s", c.id, e)
+                    except (ValueError, TypeError, RuntimeError) as e:
+                        # A bake failure (bad dtype/shape, an mpl/agg error, a
+                        # missing colormap the spec names) is a RENDER failure, not
+                        # a reason to crash the save — fall through to the last baked
+                        # PNG. But warn (below) instead of a silent log.debug: a
+                        # figure with no fallback PNG writes a dangling ref.
+                        log.warning("asset bake failed for cell %s: %s", c.id, e)
                 if not png:
                     png = self._baked.get(c.id)
             elif _is_scene3d_cell(c):
@@ -809,6 +822,14 @@ class ReportManager:
                 self._baked[c.id] = png
             if png is not None:
                 assets[c.id] = png
+            elif c.spec is not None and not _is_scene3d_cell(c):
+                # A FIGURE cell (has a spec) with NO pixels: write_report still
+                # writes its figures/<id>.yaml, so the saved report carries an image
+                # ref with no PNG behind it — a figure that reloads blank when its
+                # live source is offline. Record it so the save warns loudly.
+                # (scene3d cells legitimately have no Agg bake and are excluded.)
+                dropped.append(c)
+        self._dropped_assets = dropped
         return assets
 
     def _forget(self, window_id: int) -> None:
@@ -1335,18 +1356,18 @@ def _snapshot_line_state(plot) -> dict:
     try:
         if state.get("line_color") is not None:
             out["color"] = str(state["line_color"])
-    except Exception:
+    except (TypeError, ValueError):
         pass
     try:
         if state.get("line_linewidth") is not None:
             out["linewidth"] = float(state["line_linewidth"])
-    except Exception:
+    except (TypeError, ValueError):
         pass
     try:
         lbl = state.get("line_label")
         if lbl:
             out["label"] = str(lbl)
-    except Exception:
+    except (TypeError, ValueError):
         pass
     return out
 
@@ -1367,23 +1388,23 @@ def _snapshot_line_extras(plot) -> list:
             y = np.asarray(entry.get("data"), dtype=float)
             if y.ndim != 1 or y.size == 0:
                 continue
-        except Exception:
+        except (TypeError, ValueError):
             continue
         style: dict = {}
         try:
             if entry.get("color") is not None:
                 style["color"] = str(entry["color"])
-        except Exception:
+        except (TypeError, ValueError):
             pass
         try:
             if entry.get("linewidth") is not None:
                 style["linewidth"] = float(entry["linewidth"])
-        except Exception:
+        except (TypeError, ValueError):
             pass
         try:
             if entry.get("label"):
                 style["label"] = str(entry["label"])
-        except Exception:
+        except (TypeError, ValueError):
             pass
         out.append((np.array(y, copy=True), style))
     return out
@@ -1434,7 +1455,7 @@ def _snapshot_plot(plot) -> "tuple[FigureSpec, dict] | None":
     if lv is not None and not is_rgb:
         try:
             clim = [float(lv[0]), float(lv[1])]
-        except Exception:
+        except (TypeError, ValueError, IndexError):
             clim = None
 
     # axes / units / title
@@ -1576,7 +1597,7 @@ def _snapshot_layer_now(plot) -> "tuple[np.ndarray, str, list | None] | None":
     if lv is not None and not is_rgb:
         try:
             clim = [float(lv[0]), float(lv[1])]
-        except Exception:
+        except (TypeError, ValueError, IndexError):
             clim = None
 
     return arr, cmap, clim
@@ -1888,6 +1909,15 @@ def report_open(session, plot, payload) -> None:
             # Unresolved → offline: renderer shows the baked PNG (data URL in state).
             mgr._snapshots.pop(c.id, None)
             mgr._offline.add(c.id)
+    # A figure whose spec yaml was corrupt (read_report recorded spec_error) is shown
+    # as its baked PNG but can no longer be edited/refreshed — tell the user loudly
+    # rather than leaving them to discover the dead Edit button.
+    broken = [c for c in doc.cells if c.spec_error]
+    if broken:
+        ipc.emit_error(
+            f"Report opened, but {len(broken)} figure(s) could not be loaded and "
+            f"are shown as static images (their saved recipe was corrupt): "
+            f"{', '.join(c.caption or c.id for c in broken)}.")
     mgr.emit_state()
 
 
@@ -2001,6 +2031,15 @@ def _finish_save(session, mgr: ReportManager, path: str,
     mgr.path = path
     mgr.dirty = False
     ipc.emit({"type": "report_saved", "path": path})
+    # A figure whose pixels could not be rendered was written as a spec-only cell
+    # (dangling image ref): tell the user their save is incomplete rather than
+    # reporting a clean save and letting them discover a blank figure on reload.
+    dropped = mgr._dropped_assets
+    if dropped:
+        ipc.emit_error(
+            f"Report saved, but {len(dropped)} figure(s) could not be rendered and "
+            f"were saved without an image (they may reload blank if their data is "
+            f"unavailable): {', '.join(c.caption or c.id for c in dropped)}.")
     mgr.emit_state()
 
 
@@ -2021,7 +2060,7 @@ def report_save_as_template(session, plot, payload) -> None:
     assets: dict[str, bytes] = {}
     template_doc = ReportDoc(
         title=mgr.doc.title, template=True, version=mgr.doc.version,
-        doc_type=getattr(mgr.doc, "doc_type", "report"),
+        doc_type=mgr.doc.doc_type,
         created=mgr.doc.created,
     )
     for c in mgr.doc.cells:
@@ -2036,8 +2075,7 @@ def report_save_as_template(session, plot, payload) -> None:
             # zone) — a template split is filled later.
             template_doc.cells.append(Cell(
                 id=c.id, cell_type="split", source=c.source,
-                caption=c.caption,
-                split_layout=getattr(c, "split_layout", "text-left")))
+                caption=c.caption, split_layout=c.split_layout))
     try:
         write_report(template_doc, path, assets=assets)
     except Exception as e:
@@ -2352,7 +2390,7 @@ def report_toggle_slide_break(session, plot, payload) -> None:
     if "value" in payload:
         cell.slide_break = bool(payload.get("value"))
     else:
-        cell.slide_break = not bool(getattr(cell, "slide_break", False))
+        cell.slide_break = not cell.slide_break
     mgr.dirty = True
     mgr.emit_state()
 
@@ -2523,7 +2561,10 @@ def report_add_figure(session, plot, payload) -> None:
             if vecs is not None:
                 try:
                     count = int(len(vecs.flat_buffer))
-                except Exception:
+                except (TypeError, AttributeError):
+                    # A vectors object without a sized flat_buffer is malformed;
+                    # show 0 rather than crash the choice prompt, but don't swallow
+                    # an unrelated error (that would be a real bug worth surfacing).
                     count = 0
                 ipc.emit({
                     "type": "report_vectors_choice",

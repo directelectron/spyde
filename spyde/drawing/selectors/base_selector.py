@@ -486,9 +486,6 @@ class BaseSelector:
 
     # ── Visibility ─────────────────────────────────────────────────────────────
 
-    def add_linked_roi(self, plot: "Plot") -> None:
-        pass
-
     def hide(self) -> None:
         if self._widget is not None:
             try:

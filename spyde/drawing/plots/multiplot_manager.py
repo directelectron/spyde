@@ -45,11 +45,9 @@ class MultiplotManager:
         self,
         signal_tree: "BaseSignalTree",
         selector_type=None,
-        # Accept both 'session' (new) and 'main_window' (legacy) for compat
         session: "Session | None" = None,
-        main_window=None,
     ):
-        self.session = session or main_window
+        self.session = session
         self.plots: Dict["PlotWindow", List["Plot"]] = {}
         self.plot_windows: Dict["PlotWindow", Dict] = {}
         self.navigation_selectors: Dict["PlotWindow", List["BaseSelector"]] = {}

@@ -410,11 +410,8 @@ def _apply_pending_layer_frames(target_plot) -> None:
     if not frames:
         return
     for entry in frames:
-        # Entries are (layer, handle, frame); tolerate a legacy (handle, frame) tuple.
-        if len(entry) == 3:
-            layer, handle, frame = entry
-        else:
-            layer, (handle, frame) = None, entry
+        # Entries are always (layer, handle, frame) — see _enqueue_layer_push's caller.
+        layer, handle, frame = entry
         # Skip a layer torn down between read and paint (source-teardown race).
         if layer is not None and getattr(layer, "dead", False):
             continue

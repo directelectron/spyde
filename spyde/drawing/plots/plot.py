@@ -1219,21 +1219,6 @@ class Plot:
         """Compatibility shim — returns session for code that still uses main_window."""
         return self.session
 
-    # ── Axis helpers (compatibility with old code) ────────────────────────────
-
-    def addItem(self, item) -> None:
-        """No-op compatibility — items are now anyplotlib widgets, not pg items."""
-        pass
-
-    def removeItem(self, item) -> None:
-        pass
-
-    def normalize_axes(self) -> None:
-        pass
-
-    def update_range(self) -> None:
-        pass
-
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
     def close(self) -> None:

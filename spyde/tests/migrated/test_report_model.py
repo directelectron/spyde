@@ -262,6 +262,62 @@ class TestFigureSpecYaml:
         assert back.cells[0].spec.annotations == anns
 
 
+def _rewrite_zip_member(path: str, member: str, data: bytes) -> None:
+    """Rebuild the zip at ``path`` with ``member`` replaced by ``data`` (zipfile
+    has no in-place member replace)."""
+    with zipfile.ZipFile(path) as zf:
+        items = [(n, zf.read(n)) for n in zf.namelist()]
+    with zipfile.ZipFile(path, "w") as zf:
+        for n, blob in items:
+            zf.writestr(n, data if n == member else blob)
+
+
+class TestMalformedSpecYaml:
+    """A corrupt ``figures/<id>.yaml`` must drop the figure to its baked PNG
+    LOUDLY (spec_error recorded, spec=None) — not be silently swallowed, and not
+    mask a real code bug in the parser."""
+
+    def _report_with_fig(self, tmp_path):
+        doc = m.ReportDoc(title="Corrupt")
+        spec = m.FigureSpec(panels=[m.PanelSpec(layers=[m.LayerSpec()])])
+        doc.cells.append(m.Cell(id="cbad00001", cell_type="figure",
+                                caption="Broken figure", spec=spec))
+        path = str(tmp_path / "r.spyde-report")
+        png = m.bake_fallback_png(np.random.RandomState(0).rand(32, 32))
+        m.write_report(doc, path, assets={"cbad00001": png})
+        return path, png
+
+    def test_malformed_spec_yaml_records_error_not_raises(self, tmp_path):
+        path, png = self._report_with_fig(tmp_path)
+        # A non-mapping YAML body → FigureSpec.from_dict raises AttributeError/TypeError
+        # on ``.get`` — use a scalar so it's a data error, not valid-but-wrong.
+        _rewrite_zip_member(path, "figures/cbad00001.yaml", b"not: [a, valid\n")
+        back, assets = m.read_report(path)          # must NOT raise
+        cell = back.cells[0]
+        assert cell.spec is None, "corrupt spec must drop to None"
+        assert cell.spec_error, "spec_error must record why it failed"
+        assert cell.cell_type == "figure", "still a figure (shows baked PNG), not promoted"
+        assert assets["cbad00001"] == png, "the baked PNG fallback is still read"
+
+    def test_bad_scalar_in_layer_records_error(self, tmp_path):
+        path, _png = self._report_with_fig(tmp_path)
+        # A mapping that parses as YAML but has a non-float alpha → from_dict's
+        # float() raises ValueError; that must be recorded, not swallowed silently.
+        bad = b"layout: {kind: single}\npanels:\n  - layers:\n      - {alpha: nope}\n"
+        _rewrite_zip_member(path, "figures/cbad00001.yaml", bad)
+        back, _assets = m.read_report(path)
+        assert back.cells[0].spec is None
+        assert back.cells[0].spec_error
+
+    def test_spec_error_is_not_persisted(self, tmp_path):
+        """spec_error is a derived load-time field — it must not serialize."""
+        c = m.Cell(id="c1", cell_type="figure", spec_error="boom")
+        doc = m.ReportDoc(title="X", cells=[c])
+        text = m.serialize_report_md(doc)
+        assert "boom" not in text
+        assert "spec_error" not in text
+
+
 # ── zip container (atomic) ────────────────────────────────────────────────────
 
 

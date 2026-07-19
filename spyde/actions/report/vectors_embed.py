@@ -213,8 +213,11 @@ def _count_map_u8(vecs, ny: int, nx: int) -> np.ndarray:
     MDI vector window's count-map navigator)."""
     try:
         cm = np.asarray(vecs.count_map(), dtype=np.float32)
-    except Exception as e:
-        log.debug("[report] count_map failed, using zeros nav: %s", e)
+    except (ValueError, TypeError, AttributeError, IndexError) as e:
+        # A broken count-map (bad CSR shape/buffer) degrades to a blank navigator
+        # rather than failing the whole embed — but warn, since a zero nav reads as
+        # "no vectors here" and could mask a real aggregation bug.
+        log.warning("[report] count_map failed, using zeros nav: %s", e)
         cm = np.zeros((ny, nx), dtype=np.float32)
     if cm.shape != (ny, nx):
         cm = cm.reshape(ny, nx) if cm.size == ny * nx else np.zeros((ny, nx), np.float32)
@@ -914,8 +917,8 @@ def vectors_explorer_html(vecs, caption: str = "",
 def vectors_for_cell(session, cell) -> "object | None":
     """The SpyDEDiffractionVectors behind a figure cell's base layer, or None.
     Resolution goes through the cell spec's SignalRef → live plot → tree."""
-    spec = getattr(cell, "spec", None)
-    if spec is None or not getattr(spec, "panels", None):
+    spec = cell.spec
+    if spec is None or not spec.panels:
         return None
     try:
         layers = spec.panels[0].layers

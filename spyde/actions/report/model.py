@@ -35,6 +35,7 @@ import binascii
 import io
 import os
 import re
+import logging
 import uuid
 import zipfile
 from dataclasses import dataclass, field, replace
@@ -43,6 +44,8 @@ from typing import Any
 
 import numpy as np
 import yaml
+
+log = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 
@@ -716,6 +719,11 @@ class Cell:
     spec: FigureSpec | None = None             # figure recipe (figure cells)
     image_ext: str = ""                        # image cells: "png"/"jpg"/… (asset ext)
     html: str = ""                             # derived, NON-persisted (export only)
+    spec_error: str = ""                       # derived, NON-persisted: read_report
+    #                                          # stamps the reason a figures/<id>.yaml
+    #                                          # failed to parse (spec dropped to the
+    #                                          # baked PNG); surfaced to the user, never
+    #                                          # written back to the zip.
     slide_break: bool = False                  # Present mode: starts a new slide
     live_action: dict | None = None            # Present mode: "go live" excursion
     slide_kind: str = ""                       # Present mode: "" (content) | "title"
@@ -801,7 +809,7 @@ def slide_columns(cells: "list[Cell]") -> list:
     lands in exactly one row."""
     rows: list = []
     for c in cells:
-        if getattr(c, "cell_type", "") == "split":
+        if c.cell_type == "split":
             rows.append({"kind": "split", "cell": c})
         else:
             rows.append({"kind": "full", "cell": c})
@@ -820,9 +828,9 @@ def slide_meta(cells: "list[Cell]") -> dict:
     exactly as a content slide on the standard stage with no notes."""
     first = cells[0] if cells else None
     return {
-        "kind": _normalize_slide_kind(getattr(first, "slide_kind", "")),
-        "style": _normalize_slide_style(getattr(first, "slide_style", "")),
-        "notes": str(getattr(first, "notes", "") or ""),
+        "kind": _normalize_slide_kind(first.slide_kind if first else ""),
+        "style": _normalize_slide_style(first.slide_style if first else ""),
+        "notes": first.notes if first else "",
     }
 
 
@@ -831,7 +839,7 @@ def slide_notes(cells: "list[Cell]") -> str:
     (where the per-slide ``notes`` are carried, like ``slide_kind`` / ``slide_style``).
     An empty slide / a slide with no notes → ``""``."""
     first = cells[0] if cells else None
-    return str(getattr(first, "notes", "") or "")
+    return first.notes if first else ""
 
 
 def move_slide(cells: "list[Cell]", frm: int, to: int) -> "list[Cell]":
@@ -870,7 +878,7 @@ def move_slide(cells: "list[Cell]", frm: int, to: int) -> "list[Cell]":
     # Group into slide blocks (list-of-lists), preserving object identity.
     blocks: list[list] = []
     for c in cells:
-        if getattr(c, "slide_break", False) and blocks:
+        if c.slide_break and blocks:
             blocks.append([c])
         elif not blocks:
             blocks.append([c])
@@ -939,18 +947,18 @@ def serialize_report_md(doc: ReportDoc) -> str:
         # per-slide kind/style (only meaningful on the slide's first cell, but
         # serialized wherever set), then any live-action, so parsing sees them in
         # a stable order.
-        if getattr(c, "slide_break", False):
+        if c.slide_break:
             body_blocks.append("<!-- spyde:slide-break -->")
-        kind = _normalize_slide_kind(getattr(c, "slide_kind", ""))
+        kind = _normalize_slide_kind(c.slide_kind)
         if kind:
             body_blocks.append(f"<!-- spyde:slide-kind {kind} -->")
-        style = _normalize_slide_style(getattr(c, "slide_style", ""))
+        style = _normalize_slide_style(c.slide_style)
         if style:
             body_blocks.append(f"<!-- spyde:slide-style {style} -->")
-        notes_token = _encode_notes(getattr(c, "notes", ""))
+        notes_token = _encode_notes(c.notes)
         if notes_token:
             body_blocks.append(f"<!-- spyde:notes {notes_token} -->")
-        if getattr(c, "live_action", None):
+        if c.live_action:
             flow = yaml.safe_dump(dict(c.live_action), default_flow_style=True,
                                   sort_keys=True, allow_unicode=True).strip()
             body_blocks.append(f"<!-- spyde:live-action {flow} -->")
@@ -962,7 +970,7 @@ def serialize_report_md(doc: ReportDoc) -> str:
             # fills the figure side: ``.png`` (a figure — has a sibling figures
             # yaml) OR ``.<ext>`` (a dropped photo — no yaml) OR omitted entirely
             # (empty drop zone until a figure/photo is dropped).
-            layout = _normalize_split_layout(getattr(c, "split_layout", "text-left"))
+            layout = _normalize_split_layout(c.split_layout)
             # The text side is ALWAYS base64-encoded into the marker (a base64 of
             # "" is the empty string "" — still a 4th token position, just empty).
             # We emit "=" for empty so the token is always present and non-blank;
@@ -1186,7 +1194,9 @@ def _parse_body_cells(body: str) -> list:
             flush_md()
             try:
                 payload = yaml.safe_load(m_live.group("payload"))
-            except Exception:
+            except yaml.YAMLError:
+                # A malformed live-action marker (hand-edited flow mapping) is
+                # ignored; a non-YAML error would be a parser bug worth surfacing.
                 payload = None
             pending["live_action"] = (dict(payload)
                                       if isinstance(payload, dict) else None)
@@ -1547,8 +1557,17 @@ def read_report(path: str) -> "tuple[ReportDoc, dict[str, bytes]]":
                     try:
                         c.spec = FigureSpec.from_yaml(
                             zf.read(spec_name).decode("utf-8"))
-                    except Exception:
+                    except (yaml.YAMLError, ValueError, TypeError, KeyError) as e:
+                        # A MALFORMED figure yaml (bad scalar, truncated write,
+                        # hand-edit) drops the live spec to the baked PNG — but
+                        # LOUDLY: record why so report_open can warn the user this
+                        # figure lost its editability (and DON'T mask a code bug in
+                        # from_dict, e.g. AttributeError — that still propagates).
                         c.spec = None
+                        c.spec_error = str(e)
+                        log.warning(
+                            "report %s: figures/%s.yaml failed to parse (%s); "
+                            "cell shown as baked image only", path, c.id, e)
                     png_name = f"assets/{c.id}.png"
                     if png_name in names:
                         assets[c.id] = zf.read(png_name)
@@ -1575,8 +1594,15 @@ def read_report(path: str) -> "tuple[ReportDoc, dict[str, bytes]]":
             if has_spec:
                 try:
                     c.spec = FigureSpec.from_yaml(zf.read(spec_name).decode("utf-8"))
-                except Exception:
+                except (yaml.YAMLError, ValueError, TypeError, KeyError) as e:
+                    # See the split-cell branch above: a malformed spec drops to the
+                    # baked PNG but is recorded + logged, and a code bug (AttributeError)
+                    # still propagates rather than masquerading as "corrupt file".
                     c.spec = None
+                    c.spec_error = str(e)
+                    log.warning(
+                        "report %s: figures/%s.yaml failed to parse (%s); "
+                        "cell shown as baked image only", path, c.id, e)
             asset_name = f"assets/{c.id}.png"
             if asset_name in names:
                 assets[c.id] = zf.read(asset_name)

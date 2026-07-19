@@ -1,7 +1,6 @@
 """
 mdi_manager.py — MDI window lifecycle coordinator.
 
-The Qt QMdiArea implementation lives in _qt_main_legacy.py (Phase 4 reference).
 This module provides the backend-facing MDI coordinator used by Session: it
 tracks open plot windows, handles window creation requests, and emits Electron
 IPC messages when windows are opened/closed/focused.

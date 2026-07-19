@@ -923,7 +923,6 @@ def update_from_navigation_selection(
         child: "Plot",
         indices,
         get_result: bool = False,
-        cache_in_shared_memory: bool = True,
 ):
     """
     Update the plot based on the navigation selection. This is the most common update function for using some
@@ -940,11 +939,6 @@ def update_from_navigation_selection(
     get_result : bool
         Only meaningful in the eager/placeholder branches; the lazy branch always
         reads synchronously (see below). Kept for signature stability.
-    cache_in_shared_memory : bool
-        DEPRECATED / NO-OP. The lazy nav read is now a synchronous cached read that
-        returns a numpy array directly (no distributed Future, no shared-memory
-        buffer — see §3 of CLAUDE.md Live-Display). This parameter no longer has any
-        effect; it remains only so existing callers don't break. Do not rely on it.
     """
     # Signal that the user is interacting NOW, so a heavy background disk fill
     # (the progressive navigator/VI sum) yields the disk to this frame read
@@ -964,8 +958,7 @@ def update_from_navigation_selection(
     # crosshair move and floods the IPC log/panel at DEBUG (which itself adds lag).
     if _NAV_TIMING:
         log.debug(f"update_from_navigation_selection: indicies = {indices}, current_signal = {current_signal}, "
-                  f"selector = {selector}, child = {child}, get_result = {get_result},"
-                  f" cache_in_shared_memory = {cache_in_shared_memory}")
+                  f"selector = {selector}, child = {child}, get_result = {get_result}")
 
     # ── NAV-DEBUG ───────────────────────────────────────────────────────────
     # Diagnostics for the "second signal" reports: IndexError on the DP update

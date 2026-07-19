@@ -27,23 +27,3 @@ def broadcast_rows_cartesian(*arrays: np.ndarray) -> np.ndarray:
         parts.append(chosen_rows)
 
     return np.concatenate(parts, axis=1)
-
-
-def no_return_update_function(selector, child_plot, indices: np.ndarray):
-    """Placeholder update function that does nothing."""
-    return None
-
-
-# Stubs kept for import compatibility — linked ROI logic is now handled by
-# anyplotlib widget state synchronization, not pyqtgraph signal chaining.
-
-def create_linked_rect_roi(core_roi):
-    return core_roi
-
-
-def create_linked_linear_region(core_roi, pen=None, hover_pen=None):
-    return core_roi
-
-
-def create_linked_infinite_line(core_roi, pen=None, hover_pen=None):
-    return core_roi

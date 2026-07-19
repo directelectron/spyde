@@ -81,8 +81,8 @@ def _cell(mgr, cell_id):
         return None
     # A plain figure cell OR a split cell whose figure side is a real figure
     # (has a spec) — both use the same FigureSpec/panel edit machinery.
-    ct = getattr(cell, "cell_type", "")
-    if ct == "figure" or (ct == "split" and getattr(cell, "spec", None) is not None):
+    if cell.cell_type == "figure" or (
+            cell.cell_type == "split" and cell.spec is not None):
         return cell
     return None
 

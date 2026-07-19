@@ -171,7 +171,7 @@ def _image_cell_html(cell: Cell, data: "bytes | None") -> str:
     are no bytes."""
     if not data:
         return ""
-    ext = (getattr(cell, "image_ext", "") or "png").lower()
+    ext = (cell.image_ext or "png").lower()
     mime = "jpeg" if ext in ("jpg", "jpeg") else ext
     b64 = base64.b64encode(data).decode("ascii")
     cap = _html.escape(cell.caption or "")
@@ -236,7 +236,7 @@ def _render_figure_side_html(mgr, cell: Cell, assets: dict, *, interactive: bool
     if interactive:
         # Drop-time choice: vectors_mode == "image" pins the static
         # snapshot even when the tree carries diffraction vectors.
-        if getattr(cell.spec, "vectors_mode", "") != "image":
+        if cell.spec.vectors_mode != "image":
             try:
                 from spyde.actions.report.vectors_embed import (
                     vectors_explorer_html, vectors_for_cell,
@@ -284,7 +284,7 @@ def _split_cell_html(mgr, cell: Cell, assets: dict, *, interactive: bool,
     text_html = _markdown_cell_html(cell)
     fig_html = _render_figure_side_html(mgr, cell, assets, interactive=interactive,
                                         session=session)
-    layout = _normalize_split_layout(getattr(cell, "split_layout", "text-left"))
+    layout = _normalize_split_layout(cell.split_layout)
     text_col = f"<div class=\"split-col split-text\">\n{text_html}\n</div>"
     fig_col = f"<div class=\"split-col split-fig\">\n{fig_html}\n</div>"
     first, second = ((text_col, fig_col) if layout == "text-left"
@@ -774,7 +774,7 @@ def report_paste_cell(session, plot, payload) -> None:
     snap_map: dict = {}
     all_resolved = bool(spec.panels)
     for panel in spec.panels:
-        if str(getattr(panel, "kind", "")) == "scene3d":
+        if str(panel.kind) == "scene3d":
             entries = _scene3d_snap_entries(session, panel)
             if entries is None:
                 all_resolved = False
