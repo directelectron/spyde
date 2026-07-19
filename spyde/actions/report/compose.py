@@ -77,9 +77,14 @@ def _cell(mgr, cell_id):
     if not mgr.open:
         return None
     cell = mgr.doc.cell_by_id(cell_id)
-    if cell is None or cell.cell_type != "figure" or cell.placeholder:
+    if cell is None or cell.placeholder:
         return None
-    return cell
+    # A plain figure cell OR a split cell whose figure side is a real figure
+    # (has a spec) — both use the same FigureSpec/panel edit machinery.
+    if cell.cell_type == "figure" or (
+            cell.cell_type == "split" and cell.spec is not None):
+        return cell
+    return None
 
 
 def _target_panel(cell, target_panel_id=None):

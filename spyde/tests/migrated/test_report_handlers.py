@@ -503,6 +503,52 @@ class TestReportSave:
         assets = mgr.assemble_assets({cid: b""})
         assert assets.get(cid) == baked
 
+    def test_figure_with_no_pixels_is_recorded_as_dropped(self, tem_2d_dataset):
+        """A FIGURE cell (has a spec) that assemble_assets can produce NO pixels for
+        (no harvest, no snapshot, no baked fallback) is recorded on _dropped_assets —
+        write_report still writes its spec yaml, so this is a dangling-ref risk that
+        the save must warn about, not skip silently."""
+        session = tem_2d_dataset["window"]
+        _prime_plot_data(session)
+        wid = _signal_window_id(session)
+        h.report_new(session, None, {})
+        h.report_add_figure(session, None, {"source_window_id": wid, "caption": "F"})
+        mgr = session._report
+        cid = next(iter(mgr._window_by_cell))
+        # Remove every pixel source: no live snapshot, no baked PNG.
+        mgr._snapshots.pop(cid, None)
+        mgr._baked.pop(cid, None)
+
+        assets = mgr.assemble_assets({})     # empty harvest, nothing to fall back to
+        assert cid not in assets, "no pixels available → no asset written"
+        assert any(c.id == cid for c in mgr._dropped_assets), \
+            "a spec-carrying figure with no pixels must be recorded as dropped"
+
+    def test_finish_save_warns_on_dropped_figure(self, tem_2d_dataset, tmp_path):
+        """_finish_save emits report_saved AND a user-visible error when a figure
+        was written without pixels (dangling ref) — a save is not reported clean if
+        it silently lost a figure."""
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        _prime_plot_data(session)
+        wid = _signal_window_id(session)
+        h.report_new(session, None, {})
+        h.report_add_figure(session, None, {"source_window_id": wid, "caption": "F"})
+        mgr = session._report
+        cid = next(iter(mgr._window_by_cell))
+        mgr._snapshots.pop(cid, None)
+        mgr._baked.pop(cid, None)
+
+        path = str(tmp_path / "dropped.spyde-report")
+        messages.clear()
+        h._finish_save(session, mgr, path, {})   # empty harvest → cell has no pixels
+
+        saved = [m for m in messages if m.get("type") == "report_saved"]
+        errors = [m for m in messages if m.get("type") == "error"]
+        assert saved, "the save still completes (report_saved emitted)"
+        assert errors, "but a warning is emitted about the un-rendered figure"
+        assert "could not be rendered" in errors[0].get("text", "")
+
 
 # ── open + rebind round-trip ───────────────────────────────────────────────────
 

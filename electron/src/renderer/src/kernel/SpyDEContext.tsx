@@ -1203,6 +1203,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'cod_results':
         case 'cod_cif_ready':
         case 'gpu_status_result':
+        case 'first_run_result':
         case 'console_node_bound':
         case 'layers_state':
         case 'repfig_compose_options':

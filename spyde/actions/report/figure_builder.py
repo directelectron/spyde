@@ -331,9 +331,12 @@ def _render_scene3d_panel(ax, panel, snap_map):
         return scatter_ipf_sphere(ax, np.asarray(xyz), np.asarray(rgb),
                                   point_size=point_size, bounds=bounds,
                                   zoom=IPF3D_ZOOM)
-    except Exception as e:
-        log.debug("report figure scene3d render failed (panel %s): %s",
-                  panel.id, e)
+    except (ValueError, TypeError, RuntimeError) as e:
+        # A 3-D scatter failure drops just this panel (the caller skips a None) so
+        # the rest of the figure still builds — but warn: a panel the user asked for
+        # silently vanishing is worth surfacing, not hiding at debug level.
+        log.warning("report figure scene3d render failed (panel %s): %s",
+                    panel.id, e)
         return None
 
 
@@ -451,9 +454,9 @@ def _render_panel(ax, panel, snap_map, *, interactive=False, wiring=None):
     ``interactive=True`` renders the panel's annotations as draggable EDIT widgets
     and appends their ``(widget, panel_id, ann_index, panel_spec)`` wiring tuples to
     the passed ``wiring`` list (for the caller to attach drag-persist handlers)."""
-    if str(getattr(panel, "kind", "")) == "scene3d":
+    if str(panel.kind) == "scene3d":
         return _render_scene3d_panel(ax, panel, snap_map)
-    if str(getattr(panel, "kind", "")) == "line":
+    if str(panel.kind) == "line":
         # Annotations/callouts are refused on a line panel (compose.py's
         # repfig_add_annotation/add_callout/add_time_callouts/add_zoom_callout
         # all check panel.kind and error out before mutating the spec), so

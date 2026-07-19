@@ -67,9 +67,6 @@ class CrosshairSelector(BaseSelector):
         cx, cy = self._data_to_index(float(self._widget.cx), float(self._widget.cy))
         return np.array([[cx, cy]])
 
-    def add_linked_roi(self, plot: "Plot") -> None:
-        pass
-
     def translate_pixels(self, shift_x: int, shift_y: int) -> None:
         if self._widget is not None:
             try:
@@ -163,9 +160,6 @@ class RectangleSelector(BaseSelector):
         grid = np.array(np.meshgrid(x_indices, y_indices)).T.reshape(-1, 2)
         return grid
 
-    def add_linked_roi(self, plot: "Plot") -> None:
-        pass
-
     def translate_pixels(self, shift_x: int, shift_y: int) -> None:
         if self._widget is not None:
             try:
@@ -211,9 +205,6 @@ class CircleSelector(BaseSelector):
         r = int(round(float(self._widget.r)))
         return np.array([[cx, cy, r]])
 
-    def add_linked_roi(self, plot) -> None:
-        pass
-
 
 class AnnularSelector(BaseSelector):
     """Ring selector — wraps anyplotlib AnnularWidget."""
@@ -250,9 +241,6 @@ class AnnularSelector(BaseSelector):
         r_in = int(round(float(self._widget.r_inner)))
         r_out = int(round(float(self._widget.r_outer)))
         return np.array([[cx, cy, r_in, r_out]])
-
-    def add_linked_roi(self, plot) -> None:
-        pass
 
 
 class LineProfileSelector(BaseSelector):
@@ -421,9 +409,6 @@ class LineProfileSelector(BaseSelector):
                           int(round(x1)), int(round(y1)),
                           int(round(self.width))]])
 
-    def add_linked_roi(self, plot: "Plot") -> None:
-        pass
-
     def translate_pixels(self, shift_x: int, shift_y: int) -> None:
         if self._line is None:
             return
@@ -466,8 +451,6 @@ class LineProfileSelector(BaseSelector):
         super().close()   # hides the widgets (our hide override) + panel push
 
 
-# Back-compat alias (the old stub's export name).
-LineSelector = LineProfileSelector
 
 
 class IntegratingSSelector2D(IntegratingSelectorMixin):
@@ -595,9 +578,3 @@ class IntegratingSSelector2D(IntegratingSelectorMixin):
         self._crosshair_selector.close()
         self._rect_selector.close()
 
-    def add_linked_roi(self, plot: "Plot") -> None:
-        pass
-
-
-# Keep old name as alias
-IntegratingSSelector2D = IntegratingSSelector2D

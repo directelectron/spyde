@@ -74,8 +74,6 @@ if (typeof document !== 'undefined' && !document.getElementById('spyde-md-css'))
 
 interface Props {
   cell: ReportCellType
-  /** Report-level raw/rendered toggle — forces the editor for every cell. */
-  rawMode: boolean
   /** Commit a new source + its rendered (sanitized) html fragment. The html
    *  rides along so static export embeds real HTML, not a `<pre>` fallback. */
   onUpdate: (source: string, html: string) => void
@@ -230,7 +228,7 @@ const TOOLBAR: Array<[ToolbarCommand, string, string, React.CSSProperties?]> = [
   ['link', '🔗', 'Link', { fontSize: 10 }],
 ]
 
-export function ReportCell({ cell, rawMode, onUpdate, onRemove, index, dragProps }: Props) {
+export function ReportCell({ cell, onUpdate, onRemove, index, dragProps }: Props) {
   const { sendAction } = useSpyDE()
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(cell.source ?? '')
@@ -241,9 +239,8 @@ export function ReportCell({ cell, rawMode, onUpdate, onRemove, index, dragProps
   // editing (a live report_state update from elsewhere).
   useEffect(() => { if (!editing) setDraft(cell.source ?? '') }, [cell.source, editing])
 
-  // Raw mode forces the editor open; leaving raw mode drops back to rendered
-  // (unless the user had explicitly double-clicked into edit).
-  const showEditor = rawMode || editing
+  // Double-click to edit; the rendered view is shown otherwise.
+  const showEditor = editing
 
   // Autosize the textarea to its content.
   useLayoutEffect(() => {
@@ -350,16 +347,16 @@ export function ReportCell({ cell, rawMode, onUpdate, onRemove, index, dragProps
             data-testid={`report-cell-textarea-${cell.id}`}
             style={styles.textarea}
             value={draft}
-            autoFocus={editing && !rawMode}
+            autoFocus={editing}
             spellCheck={false}
             placeholder="Write markdown…  ($x^2$ and $$…$$ render as math)"
             onChange={(e) => setDraft(e.target.value)}
-            onBlur={() => { if (!rawMode) commit(); else if (draft !== (cell.source ?? '')) onUpdate(draft, renderMarkdown(draft)) }}
+            onBlur={commit}
             onKeyDown={(e) => {
               if (e.key === 'Enter' && (e.ctrlKey || e.metaKey || e.shiftKey)) {
                 e.preventDefault()
                 ;(e.target as HTMLTextAreaElement).blur()
-              } else if (e.key === 'Escape' && !rawMode) {
+              } else if (e.key === 'Escape') {
                 e.preventDefault()
                 revert()
               } else if ((e.ctrlKey || e.metaKey) && !e.altKey) {

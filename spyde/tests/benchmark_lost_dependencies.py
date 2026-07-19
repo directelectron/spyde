@@ -134,8 +134,7 @@ def drive(client, signal, positions, cancel_counter, settle=0.25, return_future=
         indices = np.array([[x, y]])  # widget order (cx, cy)
         try:
             uf.update_from_navigation_selection(
-                sel, child, indices,
-                get_result=False, cache_in_shared_memory=False,
+                sel, child, indices, get_result=False,
             )
         except Exception as e:
             # The "lost dependencies" FutureCancelledError surfaces HERE, exactly

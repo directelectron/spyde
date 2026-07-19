@@ -1,20 +1,36 @@
 /**
  * CellChrome.tsx — the shared hover-chrome pill (absolute-positioned, top-right)
- * shown on a Report cell (ReportCell.tsx: markdown; ReportFigureCell.tsx: figure).
+ * shown on a Report cell (ReportCell: markdown; ReportFigureCell: figure;
+ * ReportImageCell: photo; ReportSplitCell: split block).
  *
- * Both cells show the SAME Copy / Duplicate / Delete trio; ReportCell also has a
- * leading drag handle, ReportFigureCell also has a leading Edit toggle and a
- * trailing Refresh button. Rather than force one fixed button set, CellChrome
- * takes `leading`/`trailing` slots for the cell-specific extras and owns just the
- * chrome wrapper + the three shared buttons — so each caller keeps its own extra
- * affordances while the copy/duplicate/delete markup (and styling) lives once.
+ * All cells show the SAME Copy / Duplicate / Delete trio; each caller adds its
+ * own extras via the `leading` / `trailing` slots (a drag handle, a figure Edit
+ * toggle + Refresh, a split's layout switch). CellChrome owns just the chrome
+ * wrapper + the three shared buttons so the copy/duplicate/delete markup +
+ * styling lives once.
  *
- * Every existing `data-testid` is preserved EXACTLY as it was before this
- * extraction (both e2e suites select on them):
- *   `cell-copy-<id>`, `cell-duplicate-<id>`, plus a caller-supplied delete
- *   testid (`report-cell-delete-<id>` / `report-figcell-delete-<id>`).
+ * Wave B de-clutter: the per-cell SLIDE chrome (title-slide 'T', background
+ * style '◐', and speaker-notes '📝') was REMOVED. Those roles are re-surfaced
+ * slide-natively in Wave C; the backend fields (slide_kind/slide_style/notes)
+ * remain untouched.
+ *
+ * Every surviving `data-testid` is preserved EXACTLY (both e2e suites select on
+ * them): `cell-copy-<id>`, `cell-duplicate-<id>`, plus a caller-supplied delete
+ * testid (`report-cell-delete-<id>` / `report-figcell-delete-<id>` / …).
  */
 import React from 'react'
+
+// Shared hover feedback for a chrome button (they use inline styles, not CSS
+// classes, so hover is wired per-button). A subtle raised background on hover
+// makes the small icon buttons feel like real, clickable targets.
+const hoverProps = {
+  onMouseEnter: (e: React.MouseEvent<HTMLButtonElement>) => {
+    e.currentTarget.style.background = 'rgba(137,180,250,0.18)'
+  },
+  onMouseLeave: (e: React.MouseEvent<HTMLButtonElement>) => {
+    e.currentTarget.style.background = 'none'
+  },
+}
 
 export interface CellChromeStyles {
   /** The absolute-positioned wrapper pill. */
@@ -35,11 +51,11 @@ interface Props {
   onDelete: () => void
   deleteTestid: string
   deleteTitle?: string
-  /** Extra buttons rendered BEFORE Copy (e.g. ReportCell's drag handle,
-   *  ReportFigureCell's Edit toggle). */
+  /** Extra buttons rendered BEFORE Copy (e.g. a drag handle, a figure Edit
+   *  toggle). */
   leading?: React.ReactNode
-  /** Extra buttons rendered AFTER Duplicate, BEFORE Delete (e.g.
-   *  ReportFigureCell's Refresh-from-live). */
+  /** Extra buttons rendered AFTER Duplicate, BEFORE Delete (e.g. a figure's
+   *  Refresh, a split block's layout switch). */
   trailing?: React.ReactNode
 }
 
@@ -55,12 +71,14 @@ export function CellChrome({
         style={styles.chromeBtn}
         title="Copy cell"
         onClick={onCopy}
+        {...hoverProps}
       >⧉</button>
       <button
         data-testid={`cell-duplicate-${cellId}`}
         style={styles.chromeBtn}
         title="Duplicate cell"
         onClick={onDuplicate}
+        {...hoverProps}
       >＋</button>
       {trailing}
       <button
@@ -68,6 +86,7 @@ export function CellChrome({
         style={styles.deleteBtn ?? styles.chromeBtn}
         title={deleteTitle}
         onClick={onDelete}
+        {...hoverProps}
       >✕</button>
     </div>
   )

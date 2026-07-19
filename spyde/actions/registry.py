@@ -86,6 +86,8 @@ STAGED_HANDLERS: dict[str, str] = {
     "set_debug_flag":      "spyde.backend.debug_flags.set_debug_flag",
     "get_gpu_status":      "spyde.actions.gpu_status.get_gpu_status",
     "set_update_channel":  "spyde.backend.session.dispatch_set_update_channel",
+    "get_first_run":       "spyde.backend.session.get_first_run",
+    "mark_tutorial_seen":  "spyde.backend.session.dispatch_mark_tutorial_seen",
     # Report Builder (spyde/actions/report/) — the report sidebar's staged actions.
     "report_new":              "spyde.actions.report.handlers.report_new",
     "report_open":             "spyde.actions.report.handlers.report_open",
@@ -93,11 +95,24 @@ STAGED_HANDLERS: dict[str, str] = {
     "report_save_as_template": "spyde.actions.report.handlers.report_save_as_template",
     "report_close":            "spyde.actions.report.handlers.report_close",
     "report_add_cell":         "spyde.actions.report.handlers.report_add_cell",
+    "report_add_image_cell":   "spyde.actions.report.handlers.report_add_image_cell",
+    # Report/Presentation redesign Wave A — the split-block primitive (text side
+    # BESIDE a figure/photo side, one atomic cell).
+    "report_add_split_cell":   "spyde.actions.report.handlers.report_add_split_cell",
+    "report_set_split_layout": "spyde.actions.report.handlers.report_set_split_layout",
+    "report_set_split_figure": "spyde.actions.report.handlers.report_set_split_figure",
     "report_update_cell":      "spyde.actions.report.handlers.report_update_cell",
     "report_remove_cell":      "spyde.actions.report.handlers.report_remove_cell",
     "report_move_cell":        "spyde.actions.report.handlers.report_move_cell",
+    "report_move_slide":       "spyde.actions.report.handlers.report_move_slide",
     "report_set_caption":      "spyde.actions.report.handlers.report_set_caption",
     "report_set_title":        "spyde.actions.report.handlers.report_set_title",
+    # Report Builder Phase 6 — Present mode (slide grouping + go-live excursion)
+    "report_toggle_slide_break": "spyde.actions.report.handlers.report_toggle_slide_break",
+    "report_set_live_action":  "spyde.actions.report.handlers.report_set_live_action",
+    "report_set_slide_kind":   "spyde.actions.report.handlers.report_set_slide_kind",
+    "report_set_slide_style":  "spyde.actions.report.handlers.report_set_slide_style",
+    "report_set_slide_notes":  "spyde.actions.report.handlers.report_set_slide_notes",
     "report_add_figure":       "spyde.actions.report.handlers.report_add_figure",
     "report_refresh_figure":   "spyde.actions.report.handlers.report_refresh_figure",
     "repfig_refresh_panel":    "spyde.actions.report.handlers.repfig_refresh_panel",

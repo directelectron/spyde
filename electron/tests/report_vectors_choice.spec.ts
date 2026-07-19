@@ -55,7 +55,7 @@ test('vectors window drop prompts; viewer and image picks each create a cell', a
   // Open the report sidebar + a fresh document.
   await page.getByTestId('toggle-report').click()
   await expect(page.getByTestId('report-sidebar')).toBeVisible()
-  await page.getByTestId('report-new').click()
+  await backendAction(page, 'report_new', {})
   await expect(page.getByTestId('report-body')).toBeVisible()
 
   // The vectors SIGNAL window (its tree carries diffraction_vectors) is the

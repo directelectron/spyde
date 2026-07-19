@@ -421,14 +421,20 @@ export interface RepfigSpec {
   vectors_mode?: string
 }
 
-/** One cell of the report document (markdown text or an embedded figure). */
+/** One cell of the report document (markdown text, an embedded figure, a
+ *  dropped/pasted/browsed photo, or a SPLIT block — text BESIDE a figure/photo). */
 export interface ReportCell {
   id: string
-  cell_type: 'markdown' | 'figure'
-  /** markdown cells: the source text. */
+  cell_type: 'markdown' | 'figure' | 'image' | 'split'
+  /** markdown + split cells: the (text side's) source markdown. */
   source?: string
-  /** figure cells: the caption (alt text). */
+  /** figure + image + split cells: the caption (alt text). */
   caption?: string
+  /** image (photo) cells: the raw image inlined as a data URL (rendered inline
+   *  as a resizable <img>). */
+  image?: string
+  /** image cells: the asset extension (png/jpg/gif/webp) — informs the MIME. */
+  image_ext?: string
   /** figure cells: a template placeholder (dashed drop-zone, no figure yet). */
   placeholder?: boolean
   /** figure cells: the live figure id (null when its data is offline). */
@@ -444,6 +450,33 @@ export interface ReportCell {
    *  (panel_id + index), so a widget click resolves to the annotation whose
    *  style popover should open. Ephemeral — never persisted. */
   ann_widgets?: Record<string, { panel_id: string; index: number }>
+  /** Present mode (Phase 6): this cell STARTS a new slide (cells accumulate
+   *  onto the current slide until the next break). Absent → false. */
+  slide_break?: boolean
+  /** Present mode (Phase 6): an optional "go live" excursion — Present mode
+   *  turns it into a "Launch live ▶" button. e.g. { tutorial: 'strain',
+   *  guide: 'strain' }. Absent → no button on the slide. */
+  live_action?: { tutorial?: string; guide?: string } | null
+  /** Present mode (presentation polish): the per-SLIDE kind, carried on the
+   *  slide's FIRST cell. '' (content, default) renders normally; 'title' makes
+   *  the whole slide a big-centered TITLE / SECTION slide. */
+  slide_kind?: string
+  /** Present mode: the per-SLIDE background/heading preset, on the slide's first
+   *  cell. '' / 'default' the standard dark stage; 'plain' flat darker; 'accent'
+   *  a subtle accent-tinted gradient. */
+  slide_style?: string
+  /** Present mode (presenter view): the slide's SPEAKER NOTES — free multi-line
+   *  markdown carried on the slide's FIRST cell. Shown only in the presenter
+   *  view; NEVER to the audience. Absent → '' (no notes). */
+  notes?: string
+  /** SPLIT cells (Wave A): which side the TEXT sits on — 'text-left' (text left,
+   *  figure right — the default) | 'text-right' (mirror). The figure side rides
+   *  in `figure` (a FigureSpec) or `image` (a photo data URL), like a
+   *  figure/image cell; `source` carries the text side. */
+  split_layout?: string
+  /** SPLIT cells: the figure side is EMPTY (no figure/photo dropped yet) — the
+   *  renderer draws a drop zone. Absent/false → the figure side is filled. */
+  split_empty?: boolean
 }
 
 /** The authoritative report document (mirrored by the renderer for editing). */
@@ -452,6 +485,10 @@ export interface ReportDocState {
   path: string | null
   title: string
   template: boolean
+  /** Wave A — the document TYPE: 'report' (a scrolling article — the default and
+   *  every legacy document) | 'presentation' (a slide deck) | 'movie' (reserved).
+   *  Absent on an older backend/file → 'report'. */
+  type?: string
   dirty: boolean
   cells: ReportCell[]
 }
@@ -498,7 +535,7 @@ export interface ReportVectorsChoiceMessage extends MsgBase {
  *  (temp static HTML) also matches on `token`. */
 export interface ReportExportedMessage extends MsgBase {
   type: 'report_exported'
-  kind: 'html-static' | 'html-interactive' | 'markdown-folder'
+  kind: 'html-static' | 'html-interactive' | 'html-slides' | 'markdown-folder'
   path: string
   token?: string | null
 }
@@ -576,6 +613,7 @@ export interface WizardEventMessage extends MsgBase {
     | 'cod_results'
     | 'cod_cif_ready'
     | 'gpu_status_result'
+    | 'first_run_result'
 }
 
 // ── MDI image layering (overlay) ────────────────────────────────────────────

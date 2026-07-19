@@ -905,7 +905,7 @@ export function ReportFigureCell({ cell, onRemove, index, dragProps, reorderActi
  * Also owns the ResizeObserver → resizeFigure(figId, w, h) so the figure
  * relayouts when the CSS-responsive cell box changes size (mirrors WindowContent).
  */
-function SeamlessFigureFrame({ figId, filePath, title, iframeRefs, replayState }: {
+export function SeamlessFigureFrame({ figId, filePath, title, iframeRefs, replayState }: {
   figId: string
   filePath: string | null
   title: string
@@ -1971,21 +1971,28 @@ const styles: Record<string, React.CSSProperties> = {
   cellDragging: { opacity: 0.4 },
   cellDropBefore: { borderTop: '2px solid #89b4fa' },
   dragHandle: {
-    cursor: 'grab', color: '#6c7086', fontSize: 13, userSelect: 'none',
-    lineHeight: 1,
+    cursor: 'grab', color: '#7f849c', fontSize: 15, userSelect: 'none',
+    lineHeight: 1, display: 'inline-flex', alignItems: 'center',
+    height: 24, padding: '0 3px',
   },
   chrome: {
-    position: 'absolute', top: 4, right: 6, zIndex: 4,
-    display: 'flex', alignItems: 'center', gap: 4,
-    background: 'rgba(24,24,37,0.92)', borderRadius: 5, padding: '1px 3px',
+    position: 'absolute', top: 6, right: 6, zIndex: 4,
+    display: 'flex', alignItems: 'center', gap: 2,
+    background: 'rgba(24,24,37,0.96)', borderRadius: 8, padding: 3,
+    border: '1px solid #313244', boxShadow: '0 3px 10px rgba(0,0,0,0.35)',
   },
   chromeBtn: {
-    background: 'none', border: 'none', color: '#a6adc8', cursor: 'pointer',
-    fontSize: 13, padding: '0 3px', lineHeight: 1,
+    background: 'none', border: 'none', color: '#cdd6f4', cursor: 'pointer',
+    fontSize: 15, lineHeight: 1, borderRadius: 6,
+    width: 24, height: 24, display: 'inline-flex',
+    alignItems: 'center', justifyContent: 'center', padding: 0,
+    transition: 'background 100ms ease, color 100ms ease',
   },
   chromeBtnActive: {
     background: '#89b4fa', border: 'none', color: '#11111b', cursor: 'pointer',
-    fontSize: 13, padding: '0 3px', lineHeight: 1, borderRadius: 4,
+    fontSize: 15, lineHeight: 1, borderRadius: 6,
+    width: 24, height: 24, display: 'inline-flex',
+    alignItems: 'center', justifyContent: 'center', padding: 0,
   },
   figBox: {
     // aspectRatio is set per-instance (figBoxStyle, derived from the figure's

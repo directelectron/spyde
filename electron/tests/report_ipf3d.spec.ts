@@ -182,7 +182,7 @@ test('2) drag the 3-D pill into the report → scene3d cell with a LIVE 3-D ifra
   const { page } = ctx
   await page.getByTestId('toggle-report').click()
   await expect(page.getByTestId('report-sidebar')).toBeVisible()
-  await page.getByTestId('report-new').click()
+  await backendAction(page, 'report_new', {})
   await expect(page.getByTestId('report-body')).toBeVisible()
 
   // Drag the ORIENTATION window's breadcrumb pill (its 3-D view is up).
@@ -230,6 +230,7 @@ test('2) drag the 3-D pill into the report → scene3d cell with a LIVE 3-D ifra
 test('3) static HTML export → the scene3d cell <img> holds real 3-D pixels', async () => {
   const { page } = ctx
   await setExportRoute('static')
+  await page.getByTestId('report-menu-toggle').click()
   await page.getByTestId('report-export-toggle').click()
   await expect(page.getByTestId('report-export-menu')).toBeVisible()
   await page.getByTestId('export-html-static').click()
@@ -287,6 +288,7 @@ test('3) static HTML export → the scene3d cell <img> holds real 3-D pixels', a
 test('4) interactive HTML export → the scene3d iframe renders live 3-D', async () => {
   const { page } = ctx
   await setExportRoute('interactive')
+  await page.getByTestId('report-menu-toggle').click()
   await page.getByTestId('report-export-toggle').click()
   await expect(page.getByTestId('report-export-menu')).toBeVisible()
   await page.getByTestId('export-html-interactive').click()

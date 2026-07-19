@@ -93,8 +93,11 @@ def _apply_example_calibration(sig, name: str) -> None:
         for ax in sig.axes_manager.signal_axes:
             ax.scale = cal["scale"]
             ax.offset = cal["offset"]
-    except Exception as e:
-        log.debug("applying calibration to signal axes failed: %s", e)
+    except (AttributeError, KeyError, TypeError) as e:
+        # Applying a KNOWN example dataset's hardcoded calibration should always
+        # succeed; a failure here is a regression (hyperspy axes API change,
+        # unexpected signal shape) worth surfacing, not swallowing at debug level.
+        log.warning("applying calibration to signal axes failed: %s", e)
 
 
 class FileLoaderMixin:

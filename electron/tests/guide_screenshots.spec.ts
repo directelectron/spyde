@@ -40,7 +40,8 @@ test.describe('guide screenshots', () => {
           const d = step.drive
           // --- perform the step's action -------------------------------------
           if (d?.action === 'backend' && d.backend) {
-            await backendAction(page, d.backend)
+            // Pass the drive's payload through — e.g. tutorial_load needs {name}.
+            await backendAction(page, d.backend, d.payload ?? {})
           } else if (d?.action === 'click' || d?.action === 'hover') {
             const tid = d.testid || step.anchor
             if (tid) {

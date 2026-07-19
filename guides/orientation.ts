@@ -16,6 +16,12 @@ export const orientationGuide: Guide = {
   summary:
     'Match a simulated template library against a 4D-STEM scan to map crystal ' +
     'orientation, with the best-fit template overlaid live on the pattern.',
+  // Load the small instant Orientation tutorial dataset (Si grains) on open —
+  // no download.
+  autoload: {
+    action: 'backend', backend: 'tutorial_load', payload: { name: 'orientation' },
+    waitFor: { subwindows: 2 }, timeoutMs: 60_000, settleMs: 1000,
+  },
   steps: [
     {
       anchor: null,
@@ -25,7 +31,8 @@ export const orientationGuide: Guide = {
         'of **simulated templates** (one per candidate crystal orientation) and ' +
         'keeps the best match. The result is an **IPF map** colouring every scan ' +
         'position by its crystal orientation.\n\n' +
-        '> 💡 Open a 4D dataset first — **Examples → sped_ag** is a good real scan.',
+        '> 💡 A small tutorial scan (**Tutorial Data → Orientation Mapping**, ' +
+        'Si grains) is loaded for you — no download needed.',
       placement: 'center',
     },
     {
@@ -37,9 +44,10 @@ export const orientationGuide: Guide = {
       placement: 'center',
       image: 'om-windows.png',
       drive: {
-        action: 'backend', backend: 'load_test_data_si_grains',
-        waitFor: { subwindows: 2 }, timeoutMs: 120_000, settleMs: 1500,
+        action: 'backend', backend: 'tutorial_load', payload: { name: 'orientation' },
+        waitFor: { subwindows: 2 }, timeoutMs: 60_000, settleMs: 1500,
       },
+      autoDrive: true,
     },
     {
       anchor: 'mdi-area',
@@ -51,6 +59,9 @@ export const orientationGuide: Guide = {
       placement: 'center',
       image: 'om-ipf-map.png',
       // Drives the built-in test orientation (no CIF dialog) for the screenshot.
+      // NOT autoDrive: matching the whole scan against the template library is
+      // the slow stage and can run long — leave it manual, like find-vectors'
+      // Compute step, so the tour never appears to hang.
       drive: {
         action: 'backend', backend: 'run_test_orientation',
         waitFor: { subwindows: 3 }, timeoutMs: 180_000,

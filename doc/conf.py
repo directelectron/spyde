@@ -61,6 +61,16 @@ sphinx_gallery_conf = {
     # Default matplotlib scraper. (The old "spyde.qt_scrapper.qt_sg_scraper"
     # captured screenshots of the retired Qt MainWindow; that module is gone
     # now that the UI is Electron/anyplotlib.)
+    #
+    # TODO (docs Phase 5 follow-up): swap in anyplotlib's AnywidgetScraper
+    # (`from anyplotlib.sphinx_anywidget import AnywidgetScraper`) alongside the
+    # matplotlib one so example scripts that build an anyplotlib figure render as
+    # LIVE interactive widgets in the gallery — the same precompute-embed model
+    # the docs-site walkthrough embeds use (see spyde/tests/gen_guide_embeds.py
+    # and docs-site/ InteractiveEmbed). Gated on the anyplotlib version pinned in
+    # pyproject exposing sphinx_anywidget in every doc-build env; wire it as
+    #   "image_scrapers": ("matplotlib", AnywidgetScraper()),
+    # and add an examples/general/plot_*.py that builds an anyplotlib Plot2D.
     "image_scrapers": ("matplotlib",),
     "capture_repr": (),  # Disable text output capture
 }

@@ -68,10 +68,6 @@ class PlotWindow:
         self.visible: bool = True
         self._spyde_closed: bool = False
 
-        # Compatibility: layout tracking
-        self.previous_subplots_pos: dict = {}
-        self.previous_subplot_added = None
-
     @property
     def current_plot_item(self) -> "Plot | None":
         return self._current_plot_item or (self.plots[0] if self.plots else None)
@@ -176,28 +172,3 @@ class PlotWindow:
 
     def close(self) -> None:
         self.close_window()
-
-    # ── Compatibility shims ────────────────────────────────────────────────────
-
-    def set_graphics_layout_widget(self, items: dict) -> None:
-        """No-op shim — layout is managed by Electron."""
-        pass
-
-    def _build_new_layout(self, drop_pos=None, plot_to_add=None) -> None:
-        pass
-
-    @property
-    def x(self):
-        return lambda: 0
-
-    @property
-    def y(self):
-        return lambda: 0
-
-    @property
-    def width(self):
-        return lambda: 600
-
-    @property
-    def height(self):
-        return lambda: 400

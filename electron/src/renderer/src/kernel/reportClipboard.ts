@@ -28,7 +28,17 @@ export interface SerializedFigureCell {
   png?: string | null
 }
 
-export type SerializedCell = SerializedMarkdownCell | SerializedFigureCell
+/** A serialized image (photo) cell — the caption + the raw image inlined as a
+ *  data URL (the backend re-holds the bytes on paste). */
+export interface SerializedImageCell {
+  cell_type: 'image'
+  caption: string
+  image_ext: string
+  image: string
+}
+
+export type SerializedCell =
+  | SerializedMarkdownCell | SerializedFigureCell | SerializedImageCell
 
 let current: SerializedCell | null = null
 const listeners = new Set<() => void>()

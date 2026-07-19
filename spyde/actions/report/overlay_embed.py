@@ -97,7 +97,7 @@ def _pack_cell(mgr, cell) -> "dict | None":
     """The blender payload ``{"panels": [...]}`` for *cell*, or None when the
     spec has no tinted overlay layer (the gate — legacy/untinted cells keep the
     live-figure iframe)."""
-    spec = getattr(cell, "spec", None)
+    spec = cell.spec
     if spec is None or not spec.panels:
         return None
     snap = mgr.snapshot_map(cell.id)

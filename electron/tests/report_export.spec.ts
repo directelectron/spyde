@@ -207,7 +207,7 @@ test('1) build a small report: markdown H1+bold cell + one live figure cell', as
   const { page } = ctx
   await page.getByTestId('toggle-report').click()
   await expect(page.getByTestId('report-sidebar')).toBeVisible()
-  await page.getByTestId('report-new').click()
+  await backendAction(page, 'report_new', {})
   await expect(page.getByTestId('report-body')).toBeVisible()
 
   // Markdown cell: heading + bold.
@@ -257,6 +257,7 @@ test('1) build a small report: markdown H1+bold cell + one live figure cell', as
 test('2) static HTML export → real rendered markdown + one embedded PNG', async () => {
   const { page } = ctx
   await setExportRoute('static')
+  await page.getByTestId('report-menu-toggle').click()
   await page.getByTestId('report-export-toggle').click()
   await expect(page.getByTestId('report-export-menu')).toBeVisible()
   await page.getByTestId('export-html-static').click()
@@ -297,6 +298,7 @@ test('2) static HTML export → real rendered markdown + one embedded PNG', asyn
 test('3) interactive HTML export → sandboxed srcdoc iframe that RENDERS', async () => {
   const { page } = ctx
   await setExportRoute('interactive')
+  await page.getByTestId('report-menu-toggle').click()
   await page.getByTestId('report-export-toggle').click()
   await expect(page.getByTestId('report-export-menu')).toBeVisible()
   await page.getByTestId('export-html-interactive').click()
@@ -398,6 +400,7 @@ test('3) interactive HTML export → sandboxed srcdoc iframe that RENDERS', asyn
 
 test('4) PDF export → %PDF file > 20 KB', async () => {
   const { page } = ctx
+  await page.getByTestId('report-menu-toggle').click()
   await page.getByTestId('report-export-toggle').click()
   await expect(page.getByTestId('report-export-menu')).toBeVisible()
   await page.getByTestId('export-pdf').click()
@@ -425,6 +428,7 @@ test('5) markdown-folder export → report.md + figures/*.yaml + assets/*.png', 
   const { page } = ctx
   // The backend refuses a non-empty / non-export folder; mdFolderPath doesn't
   // exist yet, so dir_is_safe_md_target creates it fresh.
+  await page.getByTestId('report-menu-toggle').click()
   await page.getByTestId('report-export-toggle').click()
   await expect(page.getByTestId('report-export-menu')).toBeVisible()
   await page.getByTestId('export-md-folder').click()
@@ -483,20 +487,21 @@ test('6) figure Copy → Paste appends a live cell; markdown Duplicate; OS clipb
   const copyBtn = page.getByTestId(`cell-copy-${figCellId}`)
   await expect(copyBtn).toBeVisible()
   await copyBtn.click()
-
-  // Paste button in the header enables reactively once the clipboard holds a cell.
-  const pasteBtn = page.getByTestId('report-paste')
-  await expect(pasteBtn).toBeEnabled({ timeout: 10_000 })
   await page.screenshot({ path: join(SHOTS, '06a-after-copy.png') })
 
   // OS clipboard now holds a real PNG (isEmpty() === false).
   const clipEmpty = await ctx.app.evaluate(({ clipboard }) => clipboard.readImage().isEmpty())
   expect(clipEmpty, 'OS clipboard image is empty after figure Copy').toBe(false)
 
-  // Paste → a SECOND figure cell appears with LIVE pixels.
-  await pasteBtn.click()
+  // Wave B removed the header Paste button (Ctrl+V still pastes an image; the
+  // internal cell clipboard is consumed by the per-cell Duplicate). Duplicate the
+  // figure cell → a SECOND figure cell appears with LIVE pixels.
+  await figCell.dispatchEvent('mouseover', { bubbles: true })
+  const figDupBtn = page.getByTestId(`cell-duplicate-${figCellId}`)
+  await expect(figDupBtn).toBeVisible()
+  await figDupBtn.click()
   await expect.poll(async () => countFigCells(page), {
-    timeout: 15_000, message: 'Paste did not append a second figure cell',
+    timeout: 15_000, message: 'Duplicate did not append a second figure cell',
   }).toBe(2)
   // The newly-pasted (last) figure cell should render live pixels.
   await expect.poll(async () => figCellPixels(page, 1), {
