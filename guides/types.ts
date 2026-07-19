@@ -32,6 +32,13 @@ export interface GuideDrive {
   testid?: string
   /** Backend test-only action name for action:'backend' (e.g. run_test_orientation). */
   backend?: string
+  /**
+   * Payload for an `action:'backend'` drive. E.g. a data-loading step uses
+   * `{action:'backend', backend:'tutorial_load', payload:{name:'find_vectors'}}`.
+   * Both the in-app driver (`guideDriver.ts`) and the screenshot spec pass this
+   * through to the backend action.
+   */
+  payload?: Record<string, unknown>
   /** What to wait for AFTER the action, before screenshotting. */
   waitFor?: {
     /** At least N subwindows exist. */
@@ -77,6 +84,18 @@ export interface GuideStep {
    * a step that is just captured in the current state. See {@link GuideDrive}.
    */
   drive?: GuideDrive
+  /**
+   * In-app opt-in: when true, the coachmark Tour renders a "Show me ▶" button
+   * that runs this step's `drive` live (via `guideDriver.ts`) and advances to
+   * the next step once its `waitFor` signal is met. DEFAULT false — a step must
+   * be EXPLICITLY marked safe to auto-run. Steps left unmarked stay manual (the
+   * spotlight guides the user to do it themselves).
+   *
+   * CRITICAL: never mark a long/full-scan COMPUTE step `autoDrive` (e.g. the
+   * find-vectors "Compute across the whole scan" step) — it can run for minutes
+   * and would appear to hang the tour. Leave those manual.
+   */
+  autoDrive?: boolean
 }
 
 export interface Guide {
@@ -88,4 +107,14 @@ export interface Guide {
   summary: string
   /** Ordered steps. */
   steps: GuideStep[]
+  /**
+   * In-app opt-in: a drive the coachmark Tour runs automatically ON OPEN, before
+   * showing step 1 — typically `{action:'backend', backend:'tutorial_load',
+   * payload:{name:'…'}}` to load the walkthrough's small instant tutorial
+   * dataset so the tour starts with data already on screen. The Tour shows a
+   * "Loading tutorial data…" state while its `waitFor` resolves. Omit to start
+   * with whatever is already open. Ignored by the docs website + screenshot spec
+   * (they walk each step's own `drive`).
+   */
+  autoload?: GuideDrive
 }

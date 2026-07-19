@@ -11,6 +11,12 @@ export const findVectorsGuide: Guide = {
   summary:
     'Detect Bragg peaks across a 4D-STEM scan and overlay the found vectors on ' +
     'the live diffraction pattern.',
+  // Load the small instant Find-Vectors tutorial dataset (Si grains) on open —
+  // no download — so the walkthrough starts with data already on screen.
+  autoload: {
+    action: 'backend', backend: 'tutorial_load', payload: { name: 'find_vectors' },
+    waitFor: { subwindows: 2 }, timeoutMs: 60_000, settleMs: 1000,
+  },
   steps: [
     {
       anchor: null,
@@ -20,8 +26,8 @@ export const findVectorsGuide: Guide = {
         'diffraction pattern of a 4D-STEM scan. The result is a sparse set of ' +
         'peaks per scan position — the input to virtual imaging, strain, and ' +
         'orientation mapping.\n\n' +
-        '> 💡 You’ll need a 4D dataset open. Use **Examples → sped_ag** for a ' +
-        'real scan to follow along.',
+        '> 💡 A small tutorial scan (**Tutorial Data → Find Vectors**, Si ' +
+        'grains) is loaded for you — no download needed.',
       placement: 'center',
     },
     {
@@ -33,11 +39,13 @@ export const findVectorsGuide: Guide = {
         'the crosshair on the navigator updates the pattern live.',
       placement: 'center',
       image: 'mdi-two-windows.png',
-      // Screenshot setup: load the dataset and wait for both windows.
+      // Screenshot setup / in-app "Show me": load the tutorial dataset and wait
+      // for both windows. autoDrive so the tour can (re)load it on demand.
       drive: {
-        action: 'backend', backend: 'load_test_data_si_grains',
-        waitFor: { subwindows: 2 }, timeoutMs: 120_000, settleMs: 1500,
+        action: 'backend', backend: 'tutorial_load', payload: { name: 'find_vectors' },
+        waitFor: { subwindows: 2 }, timeoutMs: 60_000, settleMs: 1500,
       },
+      autoDrive: true,
     },
     {
       anchor: 'floating-toolbar',
@@ -50,6 +58,7 @@ export const findVectorsGuide: Guide = {
       image: 'floating-toolbar.png',
       // Reveal the toolbar by hovering the signal window's titlebar.
       drive: { action: 'hover', testid: 'subwindow-titlebar' },
+      autoDrive: true,
     },
     {
       anchor: 'action-btn-Find Diffraction Vectors',
@@ -64,6 +73,7 @@ export const findVectorsGuide: Guide = {
         action: 'click', testid: 'action-btn-Find Diffraction Vectors',
         waitFor: { visible: 'find-vectors-wizard' },
       },
+      autoDrive: true,
     },
     {
       anchor: 'find-vectors-wizard',
