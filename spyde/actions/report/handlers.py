@@ -275,11 +275,15 @@ class ReportManager:
                 "fig_id": c.id if c.cell_type == "figure" else None,
                 "data_offline": bool(c.cell_type == "figure" and c.id in self._offline),
                 # Present-mode fields (Phase 6): slide grouping + go-live handle
-                # + 2-column layout ("" | "left" | "right").
+                # + 2-column layout ("" | "left" | "right") + per-slide kind/style
+                # (title/section slide + background preset — carried on the
+                # slide's first cell).
                 "slide_break": bool(getattr(c, "slide_break", False)),
                 "live_action": (dict(c.live_action)
                                 if getattr(c, "live_action", None) else None),
                 "column": str(getattr(c, "column", "") or ""),
+                "slide_kind": str(getattr(c, "slide_kind", "") or ""),
+                "slide_style": str(getattr(c, "slide_style", "") or ""),
             }
             # An IMAGE (photo) cell ships its bytes as a data URL so the renderer
             # can draw the <img> with no round trip (mirrors the offline-figure
@@ -1994,6 +1998,14 @@ def report_add_cell(session, plot, payload) -> None:
     if payload.get("column") is not None:
         from spyde.actions.report.model import _normalize_column
         cell.column = _normalize_column(payload.get("column"))
+    # Per-slide kind/style (presentation polish) so a seeded deck can create a
+    # title / styled slide's first cell already-marked without a round trip.
+    if payload.get("slide_kind") is not None:
+        from spyde.actions.report.model import _normalize_slide_kind
+        cell.slide_kind = _normalize_slide_kind(payload.get("slide_kind"))
+    if payload.get("slide_style") is not None:
+        from spyde.actions.report.model import _normalize_slide_style
+        cell.slide_style = _normalize_slide_style(payload.get("slide_style"))
     _insert_cell(mgr.doc, cell, payload.get("index"))
     mgr.dirty = True
     mgr.emit_state()
@@ -2166,6 +2178,69 @@ def report_set_cell_column(session, plot, payload) -> None:
     if cell is None:
         return
     cell.column = _normalize_column(payload.get("column"))
+    mgr.dirty = True
+    mgr.emit_state()
+
+
+def _slide_start_cell(mgr, cell):
+    """The FIRST cell of the slide *cell* belongs to — walk BACK from *cell* until
+    a slide_break cell (or the document start). Per-slide attributes (kind/style)
+    live on the slide's first cell, so an authoring toggle fired on ANY cell of a
+    slide is applied there. A missing cell → None."""
+    cells = mgr.doc.cells
+    idx = mgr.doc.index_of(cell.id)
+    if idx < 0:
+        return None
+    j = idx
+    while j > 0 and not bool(getattr(cells[j], "slide_break", False)):
+        j -= 1
+    return cells[j]
+
+
+def report_set_slide_kind(session, plot, payload) -> None:
+    """Set a SLIDE's ``slide_kind`` — ``"title"`` makes the whole slide a
+    TITLE / SECTION slide (big centered title block in Present mode + the slides
+    export); ``""`` / ``"content"`` is a normal slide.
+
+    Applied to the slide's FIRST cell (the slide-break cell) even when
+    ``cell_id`` names a later cell of the slide — the per-slide attribute lives
+    there (:func:`_slide_start_cell`). ``{cell_id}`` alone TOGGLES title↔content;
+    an explicit ``{cell_id, slide_kind}`` sets it. Unknown value → ""; unknown
+    cell → no-op."""
+    from spyde.actions.report.model import _normalize_slide_kind
+    mgr = _manager(session)
+    if not mgr.open:
+        return
+    cell = mgr.doc.cell_by_id(payload.get("cell_id"))
+    if cell is None:
+        return
+    target = _slide_start_cell(mgr, cell) or cell
+    if "slide_kind" in payload:
+        target.slide_kind = _normalize_slide_kind(payload.get("slide_kind"))
+    else:
+        cur = _normalize_slide_kind(getattr(target, "slide_kind", ""))
+        target.slide_kind = "" if cur == "title" else "title"
+    mgr.dirty = True
+    mgr.emit_state()
+
+
+def report_set_slide_style(session, plot, payload) -> None:
+    """Set a SLIDE's ``slide_style`` background/heading preset — ``""`` /
+    ``"default"`` the standard dark stage, ``"plain"`` a flat darker stage,
+    ``"accent"`` a subtle accent-tinted gradient.
+
+    Applied to the slide's FIRST cell like :func:`report_set_slide_kind`.
+    ``{cell_id, slide_style}`` sets it; unknown value → "" (default). Unknown
+    cell → no-op."""
+    from spyde.actions.report.model import _normalize_slide_style
+    mgr = _manager(session)
+    if not mgr.open:
+        return
+    cell = mgr.doc.cell_by_id(payload.get("cell_id"))
+    if cell is None:
+        return
+    target = _slide_start_cell(mgr, cell) or cell
+    target.slide_style = _normalize_slide_style(payload.get("slide_style"))
     mgr.dirty = True
     mgr.emit_state()
 

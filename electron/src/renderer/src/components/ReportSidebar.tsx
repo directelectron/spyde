@@ -752,13 +752,19 @@ export function ReportSidebar() {
           </div>
         )}
 
-        {cells.map((cell, i) => (
+        {cells.map((cell, i) => {
+          // A cell STARTS a slide when it's the first cell OR carries a
+          // slide_break — only there is the per-slide "Title slide" toggle
+          // offered (the whole slide's kind lives on its first cell).
+          const slideStart = i === 0 || !!cell.slide_break
+          return (
           <div key={cell.id} data-report-cell="1" style={{ position: 'relative' }}>
             {dropIndex === i && <div style={styles.insertLine} data-testid={`report-insert-${i}`} />}
             {cell.cell_type === 'figure'
               ? <ReportFigureCell
                   cell={cell}
                   index={i}
+                  slideStart={slideStart}
                   onRemove={() => sendAction('report_remove_cell', { cell_id: cell.id })}
                   dragProps={makeDragProps(cell.id, i)}
                   reorderActive={dragCell != null}
@@ -767,19 +773,22 @@ export function ReportSidebar() {
               ? <ReportImageCell
                   cell={cell}
                   index={i}
+                  slideStart={slideStart}
                   onRemove={() => sendAction('report_remove_cell', { cell_id: cell.id })}
                   dragProps={makeDragProps(cell.id, i)}
                 />
               : <ReportCell
                   cell={cell}
                   index={i}
+                  slideStart={slideStart}
                   rawMode={rawMode}
                   onUpdate={(source, html) => sendAction('report_update_cell', { cell_id: cell.id, source, html })}
                   onRemove={() => sendAction('report_remove_cell', { cell_id: cell.id })}
                   dragProps={makeDragProps(cell.id, i)}
                 />}
           </div>
-        ))}
+          )
+        })}
         {/* Trailing insert indicator (drop AFTER the last cell). */}
         {dropIndex === cells.length && cells.length > 0 && (
           <div style={styles.insertLine} data-testid={`report-insert-${cells.length}`} />

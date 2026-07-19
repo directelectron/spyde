@@ -64,6 +64,17 @@ if (typeof document !== 'undefined' && !document.getElementById('spyde-present-m
 .present-md strong { color: #ffffff; }
 .present-md .katex-display { display: block; margin: 1rem 0; text-align: center;
   overflow-x: auto; overflow-y: hidden; }
+/* ── presentation polish: TITLE / SECTION slides ──────────────────────────────
+   A title slide centers a large title block — first heading huge, the rest a
+   muted subtitle. Scoped to .present-title-md so a content slide is unchanged. */
+.present-title-md { text-align: center; }
+.present-title-md h1 { font-size: 4.2rem; line-height: 1.08; margin: 0 0 0.6rem;
+  font-weight: 800; letter-spacing: -0.01em; }
+.present-title-md h2 { font-size: 2.2rem; margin: 0.2rem 0; font-weight: 600; color: #cdd6f4; }
+.present-title-md h3 { font-size: 1.6rem; color: #a6adc8; font-weight: 500; }
+.present-title-md p { font-size: 1.6rem; color: #a6adc8; margin: 0.3rem 0; }
+.present-title-md h1::after { content: ""; display: block; width: 4rem; height: 3px;
+  margin: 1.2rem auto 0; background: #89b4fa; border-radius: 2px; }
 `
   document.head.appendChild(el)
 }
@@ -124,6 +135,21 @@ function groupColumns(cells: ReportCell[]): ColumnRow[] {
     }
   }
   return rows
+}
+
+// The per-slide presentation attributes — read off the slide's FIRST cell (the
+// renderer mirror of `model.slide_meta`). kind '' (content) / 'title' (a
+// big-centered title slide); style '' (default) / 'plain' / 'accent'.
+type SlideKind = '' | 'title'
+type SlideStyle = '' | 'plain' | 'accent'
+function slideMeta(cells: ReportCell[]): { kind: SlideKind; style: SlideStyle } {
+  const first = cells[0]
+  const k = (first?.slide_kind ?? '').trim().toLowerCase()
+  const s = (first?.slide_style ?? '').trim().toLowerCase()
+  return {
+    kind: k === 'title' ? 'title' : '',
+    style: s === 'plain' || s === 'accent' ? (s as SlideStyle) : '',
+  }
 }
 
 export function PresentMode({ initialSlide, onSlideChange, onExit, onLaunchLive }: Props) {
@@ -246,12 +272,20 @@ function Slide({ cells, active, reportFigures, iframeRefs, replayState, onLaunch
   const live = cells.find(c => c.live_action)?.live_action as LiveAction | undefined
   // Group the slide's cells into full-width / 2-column rows.
   const rows = React.useMemo(() => groupColumns(cells), [cells])
+  // Per-slide presentation polish: a title slide big-centers its markdown; a
+  // style preset paints the background.
+  const meta = React.useMemo(() => slideMeta(cells), [cells])
+  const isTitle = meta.kind === 'title'
+  const styleBg =
+    meta.style === 'plain' ? styles.slideBgPlain
+      : meta.style === 'accent' ? styles.slideBgAccent : {}
 
   const renderCell = (cell: ReportCell, inColumn = false) => (
     <SlideCell
       key={cell.id}
       cell={cell}
       inColumn={inColumn}
+      titleSlide={isTitle}
       reportFigures={reportFigures}
       iframeRefs={iframeRefs}
       replayState={replayState}
@@ -262,9 +296,13 @@ function Slide({ cells, active, reportFigures, iframeRefs, replayState, onLaunch
     <section
       data-testid="present-slide"
       data-active={active ? '1' : '0'}
-      style={{ ...styles.slide, ...(active ? styles.slideActive : {}) }}
+      data-kind={isTitle ? 'title' : 'content'}
+      data-style={meta.style || 'default'}
+      style={{ ...styles.slide, ...styleBg,
+        ...(isTitle ? styles.slideTitle : {}),
+        ...(active ? styles.slideActive : {}) }}
     >
-      <div style={styles.slideInner}>
+      <div style={{ ...styles.slideInner, ...(isTitle ? styles.slideInnerTitle : {}) }}>
         {rows.map((row, ri) => (
           row.kind === 'full'
             ? <React.Fragment key={row.cell.id}>{renderCell(row.cell)}</React.Fragment>
@@ -299,14 +337,15 @@ function Slide({ cells, active, reportFigures, iframeRefs, replayState, onLaunch
 // its baked PNG when offline, or a skipped placeholder. Dispatches to two
 // sub-components so hooks are never called conditionally (cell_type is stable
 // per cell id, but keep the split for React-rules correctness).
-function SlideCell({ cell, inColumn, reportFigures, iframeRefs, replayState }: {
+function SlideCell({ cell, inColumn, titleSlide, reportFigures, iframeRefs, replayState }: {
   cell: ReportCell
   inColumn: boolean
+  titleSlide: boolean
   reportFigures: ReturnType<typeof useSpyDE>['state']['reportFigures']
   iframeRefs: ReturnType<typeof useSpyDE>['iframeRefs']
   replayState: ReturnType<typeof useSpyDE>['replayState']
 }) {
-  if (cell.cell_type === 'markdown') return <SlideMarkdown cell={cell} />
+  if (cell.cell_type === 'markdown') return <SlideMarkdown cell={cell} titleSlide={titleSlide} />
   if (cell.cell_type === 'image') return <SlideImage cell={cell} inColumn={inColumn} />
   return (
     <SlideFigure
@@ -335,13 +374,16 @@ function SlideImage({ cell, inColumn }: { cell: ReportCell; inColumn: boolean })
   )
 }
 
-function SlideMarkdown({ cell }: { cell: ReportCell }) {
+function SlideMarkdown({ cell, titleSlide }: { cell: ReportCell; titleSlide: boolean }) {
   const html = useMemo(() => renderMarkdown(cell.source ?? ''), [cell.source])
   if (!(cell.source ?? '').trim()) return null
+  // A title slide adds `present-title-md` (big-centered heading treatment).
+  const cls = 'spyde-md present-md' + (titleSlide ? ' present-title-md' : '')
   return (
     <div
       data-testid={`present-md-${cell.id}`}
-      className="spyde-md present-md"
+      data-title-slide={titleSlide ? '1' : '0'}
+      className={cls}
       dangerouslySetInnerHTML={{ __html: html }}
     />
   )
@@ -392,6 +434,15 @@ const styles: Record<string, React.CSSProperties> = {
   },
   slideActive: { display: 'flex' },
   slideInner: { maxWidth: '60rem', margin: '0 auto', width: '100%' },
+  // A title slide: content vertically + horizontally centered, tighter column.
+  slideTitle: { justifyContent: 'center', textAlign: 'center' },
+  slideInnerTitle: { maxWidth: '48rem' },
+  // Per-slide background presets.
+  slideBgPlain: { background: '#0e0e16' },
+  slideBgAccent: {
+    background:
+      'radial-gradient(ellipse at 50% 30%, rgba(137,180,250,0.18), transparent 70%), #14141f',
+  },
   // A 2-column row: text BESIDE a figure/photo. Vertically centered so a short
   // text column reads well against a tall figure.
   cols: {

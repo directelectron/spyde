@@ -63,6 +63,15 @@ interface Props {
    *  ◨ right) renders between `leading` and Copy. Omit both to hide it. */
   column?: string
   onSetColumn?: (column: CellColumn) => void
+  /** Presentation polish: this cell STARTS a slide (index 0 or a slide_break
+   *  cell), so a "Title slide" toggle is offered — it flips the WHOLE slide
+   *  between a big-centered title/section slide and a normal content slide.
+   *  Only rendered when `slideStart` is true AND `onToggleTitle` is given. */
+  slideStart?: boolean
+  /** The slide's current kind ('' / 'content' = normal; 'title' = title slide).
+   *  Read off this (slide-starting) cell. */
+  slideKind?: string
+  onToggleTitle?: () => void
 }
 
 /** A small ALWAYS-VISIBLE badge (top-left of a cell) marking its slide column —
@@ -97,6 +106,7 @@ const badgeStyle: React.CSSProperties = {
 export function CellChrome({
   cellId, styles, onCopy, onDuplicate, onDelete, deleteTestid,
   deleteTitle = 'Delete cell', leading, trailing, column, onSetColumn,
+  slideStart, slideKind, onToggleTitle,
 }: Props) {
   const cur: CellColumn =
     column === 'left' || column === 'right' ? column : ''
@@ -105,9 +115,21 @@ export function CellChrome({
     const idx = COLUMN_CYCLE.indexOf(cur)
     onSetColumn(COLUMN_CYCLE[(idx + 1) % COLUMN_CYCLE.length])
   }
+  const isTitle = slideKind === 'title'
   return (
     <div style={styles.chrome}>
       {leading}
+      {slideStart && onToggleTitle && (
+        <button
+          data-testid={`cell-slide-kind-${cellId}`}
+          data-slide-kind={isTitle ? 'title' : 'content'}
+          style={isTitle ? (styles.columnBtnActive ?? styles.chromeBtn) : styles.chromeBtn}
+          title={isTitle
+            ? 'Title slide — click for a normal content slide'
+            : 'Make this a title / section slide (big centered heading)'}
+          onClick={onToggleTitle}
+        >T</button>
+      )}
       {onSetColumn && (
         <button
           data-testid={`cell-column-${cellId}`}

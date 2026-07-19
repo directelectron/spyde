@@ -356,6 +356,35 @@ figure.report-figure figcaption { margin-top: 0.5rem; font-size: 0.85rem;
 @media (max-width: 720px), (orientation: portrait) {
   .slide-cols { grid-template-columns: 1fr; }
 }
+/* ── presentation polish: TITLE / SECTION slides ──────────────────────────────
+   A title slide (data-kind="title") centers a large title block — the whole
+   markdown is scaled up + centered, first heading huge, the rest a muted
+   subtitle. Selecting the .slide-inner keeps it inside the normal padded stage. */
+.slide[data-kind="title"] { text-align: center; }
+.slide[data-kind="title"] .slide-inner {
+  max-width: 48rem; display: flex; flex-direction: column;
+  justify-content: center; gap: 0.4rem;
+}
+.slide[data-kind="title"] h1 {
+  font-size: 4.2rem; line-height: 1.08; margin: 0 0 0.6rem; font-weight: 800;
+  letter-spacing: -0.01em;
+}
+.slide[data-kind="title"] h2 { font-size: 2.2rem; margin: 0.2rem 0; font-weight: 600;
+  color: #cdd6f4; }
+.slide[data-kind="title"] h3 { font-size: 1.6rem; color: #a6adc8; font-weight: 500; }
+.slide[data-kind="title"] p { font-size: 1.6rem; color: #a6adc8; margin: 0.3rem 0; }
+.slide[data-kind="title"] .present-md, .slide[data-kind="title"] .spyde-md { text-align: center; }
+/* An accent rule under the title — a subtle branded flourish for section slides. */
+.slide[data-kind="title"] h1::after {
+  content: ""; display: block; width: 4rem; height: 3px; margin: 1.2rem auto 0;
+  background: #89b4fa; border-radius: 2px;
+}
+/* ── per-slide background/heading presets ─────────────────────────────────────*/
+.slide-style-plain { background: #0e0e16; }
+.slide-style-accent {
+  background: radial-gradient(ellipse at 50% 30%, rgba(137,180,250,0.18), transparent 70%), #14141f;
+}
+.slide-style-accent h1, .slide-style-accent h2 { color: #b4c6fb; }
 #deck-counter {
   position: fixed; bottom: 14px; right: 18px; z-index: 10;
   font-size: 0.8rem; color: #7f849c; background: rgba(20,20,31,0.7);
@@ -472,7 +501,16 @@ def _render_slides(mgr, assets: dict, *, interactive: bool, session=None) -> str
     export. Within a slide, cells assigned ``column`` ``left``/``right`` render
     side-by-side in a 2-col grid (see :func:`_render_slide_rows`). A slide whose
     cells all render empty (e.g. a lone placeholder) is dropped rather than
-    shown blank."""
+    shown blank.
+
+    Presentation POLISH: the slide's per-slide ``slide_kind`` / ``slide_style``
+    (read off its first cell via :func:`slide_meta`) are stamped as
+    ``data-kind="title"`` + a ``slide-style-<preset>`` class on the ``<section>``,
+    which the deck CSS turns into the big-centered title treatment / the
+    background preset. ``data-kind``/style are OMITTED when default so an older
+    deck's markup is byte-for-byte unchanged."""
+    from spyde.actions.report.model import slide_meta
+
     blocks: list[str] = []
     for group in mgr.doc.slides():
         rows = _render_slide_rows(mgr, group, assets, interactive=interactive,
@@ -480,8 +518,13 @@ def _render_slides(mgr, assets: dict, *, interactive: bool, session=None) -> str
         if not rows:
             continue
         inner = "\n".join(rows)
+        meta = slide_meta(group)
+        cls = "slide"
+        if meta["style"]:
+            cls += f" slide-style-{meta['style']}"
+        kind_attr = ' data-kind="title"' if meta["kind"] == "title" else ""
         blocks.append(
-            f"<section class=\"slide\">\n<div class=\"slide-inner\">\n"
+            f"<section class=\"{cls}\"{kind_attr}>\n<div class=\"slide-inner\">\n"
             f"{inner}\n</div>\n</section>")
     return "\n".join(blocks)
 

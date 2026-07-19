@@ -133,6 +133,22 @@ _COLUMN_RE = re.compile(r"^<!--\s*spyde:column\s+(?P<val>\S+)\s*-->\s*$")
 # The accepted column values (anything else → "" == full width). "full" and ""
 # are equivalent (both span the slide); only left/right open a 2-col grid.
 _COLUMN_VALUES = ("left", "right", "full")
+# A per-slide KIND marker (Present mode / slides): ``<!-- spyde:slide-kind title -->``
+# — an invisible comment BEFORE the slide's FIRST cell (the slide-break cell)
+# declaring the WHOLE slide a title/section slide (rendered as a large centered
+# title block). ``content`` / absence = a normal slide. Anything else → ""
+# (content). Mirrors the slide-break marker exactly.
+_SLIDE_KIND_RE = re.compile(r"^<!--\s*spyde:slide-kind\s+(?P<val>\S+)\s*-->\s*$")
+# A per-slide STYLE marker (Present mode / slides): ``<!-- spyde:slide-style plain -->``
+# — an invisible comment BEFORE the slide's FIRST cell picking a background/heading
+# preset for the WHOLE slide. ``default`` / absence = the standard dark stage;
+# ``plain`` = a flat darker stage; ``accent`` = a subtle accent-tinted gradient.
+# Anything else → "" (default). Mirrors the slide-kind marker.
+_SLIDE_STYLE_RE = re.compile(r"^<!--\s*spyde:slide-style\s+(?P<val>\S+)\s*-->\s*$")
+# The accepted slide kinds/styles (anything else → "" == default). "content" and
+# "" are equivalent (a normal slide); "default" and "" pick the standard stage.
+_SLIDE_KINDS = ("title",)
+_SLIDE_STYLES = ("plain", "accent")
 
 
 def _normalize_column(val) -> str:
@@ -141,6 +157,22 @@ def _normalize_column(val) -> str:
     report — which has no column markers — renders exactly as before."""
     s = str(val or "").strip().lower()
     return s if s in ("left", "right") else ""
+
+
+def _normalize_slide_kind(val) -> str:
+    """Normalise a raw slide-kind to one of ``{"", "title"}``. ``content`` and any
+    unknown/absent value collapse to ``""`` (a normal content slide) so an older
+    report — which has no slide-kind markers — renders exactly as before."""
+    s = str(val or "").strip().lower()
+    return s if s in _SLIDE_KINDS else ""
+
+
+def _normalize_slide_style(val) -> str:
+    """Normalise a raw slide-style to one of ``{"", "plain", "accent"}``.
+    ``default`` and any unknown/absent value collapse to ``""`` (the standard dark
+    stage) so an older report loads exactly as before."""
+    s = str(val or "").strip().lower()
+    return s if s in _SLIDE_STYLES else ""
 
 
 # ── the spec dataclasses (full schema; Phase 1 uses single-panel/single-layer) ─
@@ -560,7 +592,21 @@ class Cell:
     2-col row; a ``""``/full cell closes any open row and spans full width (see
     :func:`slide_columns`). Persisted in report.md as an invisible
     ``<!-- spyde:column left -->`` comment before the cell (mirrors
-    ``slide_break``); absent on older files → ``""`` (SCHEMA_VERSION stays 1)."""
+    ``slide_break``); absent on older files → ``""`` (SCHEMA_VERSION stays 1).
+
+    ``slide_kind`` / ``slide_style`` (Present mode / slides — presentation POLISH)
+    are PER-SLIDE attributes carried on the slide's FIRST cell (the slide_break
+    cell). ``slide_kind`` ``""`` (content, default) renders the slide as today;
+    ``"title"`` makes the WHOLE slide a TITLE / SECTION slide — its markdown
+    renders as a large vertically+horizontally centered title block (the first
+    line big, the rest a muted subtitle). ``slide_style`` picks a per-slide
+    background/heading preset: ``""``/``default`` the standard dark stage,
+    ``"plain"`` a flat darker stage, ``"accent"`` a subtle accent-tinted gradient.
+    Only the slide's FIRST cell's values matter (Present mode + export read them
+    to style the whole slide); on a non-first cell they're harmless/ignored.
+    Persisted as invisible ``<!-- spyde:slide-kind title -->`` /
+    ``<!-- spyde:slide-style accent -->`` comments before the cell; absent on
+    older files → ``""`` (SCHEMA_VERSION stays 1)."""
     id: str = field(default_factory=new_cell_id)
     cell_type: str = "markdown"
     source: str = ""                           # markdown text (markdown cells)
@@ -572,6 +618,8 @@ class Cell:
     slide_break: bool = False                  # Present mode: starts a new slide
     live_action: dict | None = None            # Present mode: "go live" excursion
     column: str = ""                           # Present mode: "" | "left" | "right"
+    slide_kind: str = ""                       # Present mode: "" (content) | "title"
+    slide_style: str = ""                      # Present mode: "" | "plain" | "accent"
 
 
 @dataclass
@@ -660,6 +708,22 @@ def slide_columns(cells: "list[Cell]") -> list:
     return rows
 
 
+def slide_meta(cells: "list[Cell]") -> dict:
+    """The per-slide presentation attributes for a SLIDE's cell list — read off
+    the slide's FIRST cell (the slide-break cell), which is where ``slide_kind`` /
+    ``slide_style`` are carried. Reused by Present mode + the slides HTML export
+    (and mirrored in the renderer). An empty slide → the defaults.
+
+    Returns ``{"kind": "" | "title", "style": "" | "plain" | "accent"}`` — both
+    normalised (unknown / absent → ``""``), so a legacy slide with no markers
+    renders exactly as a content slide on the standard stage."""
+    first = cells[0] if cells else None
+    return {
+        "kind": _normalize_slide_kind(getattr(first, "slide_kind", "")),
+        "style": _normalize_slide_style(getattr(first, "slide_style", "")),
+    }
+
+
 # ── time / yaml helpers ───────────────────────────────────────────────────────
 
 
@@ -692,11 +756,18 @@ def serialize_report_md(doc: ReportDoc) -> str:
     for c in doc.cells:
         # Present-mode markers ride as invisible comments in their OWN standalone
         # block (a blank line keeps them from being sucked into a markdown cell),
-        # emitted BEFORE the cell they apply to. slide-break first, then any
-        # live-action, then any column assignment, so parsing sees them in a
-        # stable order.
+        # emitted BEFORE the cell they apply to. slide-break first, then the
+        # per-slide kind/style (only meaningful on the slide's first cell, but
+        # serialized wherever set), then any live-action, then any column
+        # assignment, so parsing sees them in a stable order.
         if getattr(c, "slide_break", False):
             body_blocks.append("<!-- spyde:slide-break -->")
+        kind = _normalize_slide_kind(getattr(c, "slide_kind", ""))
+        if kind:
+            body_blocks.append(f"<!-- spyde:slide-kind {kind} -->")
+        style = _normalize_slide_style(getattr(c, "slide_style", ""))
+        if style:
+            body_blocks.append(f"<!-- spyde:slide-style {style} -->")
         if getattr(c, "live_action", None):
             flow = yaml.safe_dump(dict(c.live_action), default_flow_style=True,
                                   sort_keys=True, allow_unicode=True).strip()
@@ -780,7 +851,8 @@ def _parse_body_cells(body: str) -> list:
     # NEXT cell created (markdown or figure). They flush the pending markdown
     # buffer first (so the marker starts a NEW cell rather than joining the one
     # already accumulating above it).
-    pending: dict = {"slide_break": False, "live_action": None, "column": ""}
+    pending: dict = {"slide_break": False, "live_action": None, "column": "",
+                     "slide_kind": "", "slide_style": ""}
 
     def _apply_pending(cell: "Cell") -> "Cell":
         if pending["slide_break"]:
@@ -789,9 +861,15 @@ def _parse_body_cells(body: str) -> list:
             cell.live_action = pending["live_action"]
         if pending["column"]:
             cell.column = pending["column"]
+        if pending["slide_kind"]:
+            cell.slide_kind = pending["slide_kind"]
+        if pending["slide_style"]:
+            cell.slide_style = pending["slide_style"]
         pending["slide_break"] = False
         pending["live_action"] = None
         pending["column"] = ""
+        pending["slide_kind"] = ""
+        pending["slide_style"] = ""
         return cell
 
     def flush_md() -> None:
@@ -841,6 +919,8 @@ def _parse_body_cells(body: str) -> list:
             continue
 
         m_break = _SLIDE_BREAK_RE.match(stripped)
+        m_kind = _SLIDE_KIND_RE.match(stripped)
+        m_style = _SLIDE_STYLE_RE.match(stripped)
         m_live = _LIVE_ACTION_RE.match(stripped)
         m_col = _COLUMN_RE.match(stripped)
         m_fig = _FIG_LINE_RE.match(stripped)
@@ -851,6 +931,14 @@ def _parse_body_cells(body: str) -> list:
             # comes next.
             flush_md()
             pending["slide_break"] = True
+        elif m_kind is not None:
+            # A per-slide kind (title/content) applies to whatever cell comes
+            # next (the slide's first cell); unknown → "" via _normalize.
+            flush_md()
+            pending["slide_kind"] = _normalize_slide_kind(m_kind.group("val"))
+        elif m_style is not None:
+            flush_md()
+            pending["slide_style"] = _normalize_slide_style(m_style.group("val"))
         elif m_live is not None:
             flush_md()
             try:

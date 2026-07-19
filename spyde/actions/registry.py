@@ -105,6 +105,8 @@ STAGED_HANDLERS: dict[str, str] = {
     "report_toggle_slide_break": "spyde.actions.report.handlers.report_toggle_slide_break",
     "report_set_live_action":  "spyde.actions.report.handlers.report_set_live_action",
     "report_set_cell_column":  "spyde.actions.report.handlers.report_set_cell_column",
+    "report_set_slide_kind":   "spyde.actions.report.handlers.report_set_slide_kind",
+    "report_set_slide_style":  "spyde.actions.report.handlers.report_set_slide_style",
     "report_add_figure":       "spyde.actions.report.handlers.report_add_figure",
     "report_refresh_figure":   "spyde.actions.report.handlers.report_refresh_figure",
     "repfig_refresh_panel":    "spyde.actions.report.handlers.repfig_refresh_panel",

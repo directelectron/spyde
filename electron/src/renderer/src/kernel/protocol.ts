@@ -461,6 +461,14 @@ export interface ReportCell {
    *  slide (default), 'left' / 'right' place it in the 2-column grid so a text
    *  cell sits BESIDE a figure/photo. Absent → '' (full width). */
   column?: string
+  /** Present mode (presentation polish): the per-SLIDE kind, carried on the
+   *  slide's FIRST cell. '' (content, default) renders normally; 'title' makes
+   *  the whole slide a big-centered TITLE / SECTION slide. */
+  slide_kind?: string
+  /** Present mode: the per-SLIDE background/heading preset, on the slide's first
+   *  cell. '' / 'default' the standard dark stage; 'plain' flat darker; 'accent'
+   *  a subtle accent-tinted gradient. */
+  slide_style?: string
 }
 
 /** The authoritative report document (mirrored by the renderer for editing). */

@@ -82,6 +82,9 @@ interface Props {
   onRemove: () => void
   /** Own index in the cell list (for Duplicate → insert at index+1). */
   index: number
+  /** This cell STARTS a slide (first cell or a slide_break) — offer the
+   *  per-slide "Title slide" toggle in the chrome. */
+  slideStart?: boolean
   /** HTML5 DnD reorder wiring supplied by the parent list. */
   dragProps: {
     onDragStart: (e: React.DragEvent) => void
@@ -230,7 +233,7 @@ const TOOLBAR: Array<[ToolbarCommand, string, string, React.CSSProperties?]> = [
   ['link', '🔗', 'Link', { fontSize: 10 }],
 ]
 
-export function ReportCell({ cell, rawMode, onUpdate, onRemove, index, dragProps }: Props) {
+export function ReportCell({ cell, rawMode, onUpdate, onRemove, index, slideStart, dragProps }: Props) {
   const { sendAction } = useSpyDE()
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(cell.source ?? '')
@@ -320,6 +323,9 @@ export function ReportCell({ cell, rawMode, onUpdate, onRemove, index, dragProps
           onDelete={onRemove}
           column={cell.column}
           onSetColumn={(c: CellColumn) => sendAction('report_set_cell_column', { cell_id: cell.id, column: c })}
+          slideStart={slideStart}
+          slideKind={cell.slide_kind}
+          onToggleTitle={() => sendAction('report_set_slide_kind', { cell_id: cell.id })}
           deleteTestid={`report-cell-delete-${cell.id}`}
           deleteTitle="Delete cell"
           leading={

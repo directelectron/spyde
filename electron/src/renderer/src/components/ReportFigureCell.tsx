@@ -209,6 +209,9 @@ interface Props {
   onRemove: () => void
   /** Own index in the cell list (Duplicate → insert at index+1). */
   index: number
+  /** This cell STARTS a slide (first cell or a slide_break) — offer the
+   *  per-slide "Title slide" toggle in the chrome. */
+  slideStart?: boolean
   /** HTML5 DnD reorder wiring supplied by the parent list (same shape as the
    *  markdown ReportCell's — ReportSidebar.makeDragProps). */
   dragProps: {
@@ -255,7 +258,7 @@ interface TextSizePopoverTarget {
 // single piece of state).
 type PopoverTarget = AnnPopoverTarget | TextSizePopoverTarget
 
-export function ReportFigureCell({ cell, onRemove, index, dragProps, reorderActive }: Props) {
+export function ReportFigureCell({ cell, onRemove, index, slideStart, dragProps, reorderActive }: Props) {
   const { state, iframeRefs, replayState, sendAction, dragKind, requestFigurePng } = useSpyDE()
   const [captionEditing, setCaptionEditing] = useState(false)
   const [captionDraft, setCaptionDraft] = useState(cell.caption ?? '')
@@ -679,6 +682,9 @@ export function ReportFigureCell({ cell, onRemove, index, dragProps, reorderActi
           onDelete={onRemove}
           column={cell.column}
           onSetColumn={(c: CellColumn) => sendAction('report_set_cell_column', { cell_id: cell.id, column: c })}
+          slideStart={slideStart}
+          slideKind={cell.slide_kind}
+          onToggleTitle={() => sendAction('report_set_slide_kind', { cell_id: cell.id })}
           deleteTestid={`report-figcell-delete-${cell.id}`}
           deleteTitle="Delete figure"
           leading={
