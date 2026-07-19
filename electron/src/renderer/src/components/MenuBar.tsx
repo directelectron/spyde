@@ -22,8 +22,24 @@ const EXAMPLES = [
   'fe_multi_phase_grains',
 ]
 
+// Curated, ALWAYS-AVAILABLE small in-memory tutorial datasets (Phase 1 of the
+// docs/walkthroughs overhaul) — unlike EXAMPLES (which download real files via
+// pyxem+pooch), these fire the ungated `tutorial_load` backend action and load
+// in a couple of seconds with no network. Keys mirror
+// spyde/backend/tutorial_data.py TUTORIAL_LOADERS; Phase 2+ guided walkthroughs
+// drive the same action names.
+const TUTORIAL_DATA: { key: string; label: string }[] = [
+  { key: 'navigation', label: 'Navigation & Virtual Imaging' },
+  { key: 'find_vectors', label: 'Find Vectors (Si grains)' },
+  { key: 'orientation', label: 'Orientation Mapping' },
+  { key: 'multiphase', label: 'Multi-Phase Orientation Mapping' },
+  { key: 'strain', label: 'Strain Mapping' },
+  { key: 'spectroscopy', label: 'Spectroscopy (1D)' },
+  { key: 'movie', label: 'In-situ Movie' },
+]
+
 type Item =
-  | { label: string; onClick: () => void; disabled?: boolean }
+  | { label: string; onClick: () => void; disabled?: boolean; testId?: string }
   | { separator: true }
 
 export function MenuBar({ onStartGuide }: { onStartGuide: (g: Guide) => void }) {
@@ -60,6 +76,11 @@ export function MenuBar({ onStartGuide }: { onStartGuide: (g: Guide) => void }) 
       label: name,
       onClick: () => sendAction('load_example', { name }),
     })),
+    'Tutorial Data': TUTORIAL_DATA.map(({ key, label }) => ({
+      label,
+      testId: `tutorial-${key}`,
+      onClick: () => sendAction('tutorial_load', { name: key }),
+    })),
     Help: [
       ...GUIDES.map((g) => ({
         label: `Guided Tour: ${g.title}`,
@@ -84,7 +105,7 @@ export function MenuBar({ onStartGuide }: { onStartGuide: (g: Guide) => void }) 
       {Object.keys(menus).map((name) => (
         <div key={name} style={{ position: 'relative' }}>
           <button
-            data-testid={`menu-${name.toLowerCase()}`}
+            data-testid={`menu-${name.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}`}
             style={{
               ...styles.top,
               background: open === name ? '#2a2a3c' : 'transparent',
@@ -96,7 +117,7 @@ export function MenuBar({ onStartGuide }: { onStartGuide: (g: Guide) => void }) 
             {name}
           </button>
           {open === name && (
-            <div style={styles.dropdown} data-testid={`menu-${name.toLowerCase()}-items`}
+            <div style={styles.dropdown} data-testid={`menu-${name.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}-items`}
                  onClick={(e) => e.stopPropagation()}>
               {menus[name].map((it, i) =>
                 'separator' in it ? (
@@ -104,7 +125,7 @@ export function MenuBar({ onStartGuide }: { onStartGuide: (g: Guide) => void }) 
                 ) : (
                   <button
                     key={it.label}
-                    data-testid={`menu-item-${it.label.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}`}
+                    data-testid={it.testId ?? `menu-item-${it.label.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}`}
                     disabled={it.disabled}
                     style={{ ...styles.item, opacity: it.disabled ? 0.4 : 1 }}
                     onClick={() => { setOpen(null); if (!it.disabled) it.onClick() }}

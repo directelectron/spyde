@@ -26,6 +26,7 @@ from spyde.backend._session_files import (
     _apply_example_calibration,
 )
 from spyde.backend._session_testharness import TestHarnessMixin
+from spyde.backend.tutorial_data import TutorialDataMixin
 from spyde.backend._session_windows import WindowManagerMixin
 from spyde.dask_manager import DaskManager
 from spyde.workers.plot_update_worker import PlotUpdateWorker
@@ -55,6 +56,7 @@ class Session(
     ActionRouterMixin,
     FileLoaderMixin,
     TestHarnessMixin,
+    TutorialDataMixin,
     WindowManagerMixin,
 ):
     """

@@ -22,6 +22,7 @@ import threading
 from spyde.backend import ipc
 from spyde.backend.ipc import emit_error
 from spyde.actions.registry import STAGED_HANDLERS, resolve_staged
+from spyde.backend.tutorial_data import TUTORIAL_LOADERS
 
 log = logging.getLogger(__name__)
 
@@ -63,7 +64,18 @@ class ActionRouterMixin:
             log.warning("ignoring test-only action %r in a packaged build", action)
             return
 
-        if action == "load_test_data":
+        if action == "tutorial_load":
+            # Curated ALWAYS-AVAILABLE tutorial datasets (Phase 1 of the
+            # docs/walkthroughs overhaul) — reachable in a packaged build too,
+            # unlike the _TEST_ACTIONS above. payload={"name": "<key>"}; keys
+            # are TUTORIAL_LOADERS in spyde/backend/tutorial_data.py.
+            name = payload.get("name")
+            loader = TUTORIAL_LOADERS.get(name)
+            if loader is None:
+                emit_error(f"Unknown tutorial dataset: {name!r}")
+            else:
+                loader(self)
+        elif action == "load_test_data":
             self._load_test_data()
         elif action == "load_test_data_lazy":
             self._load_test_data_lazy()

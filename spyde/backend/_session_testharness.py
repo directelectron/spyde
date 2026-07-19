@@ -263,7 +263,10 @@ class TestHarnessMixin:
         edge → anyplotlib tile mode via SpyDE's GpuTileBackend; >1 Mpx → the
         WebGPU image path above GPU_IMAGE_THRESHOLD).
 
-        Frame content is designed for coordinate/parity assertions:
+        Frame content is designed for coordinate/parity assertions (built by
+        the shared ``_build_movie_frames`` — see also the DOWNSIZED
+        ``TutorialDataMixin.tutorial_movie`` in ``spyde/backend/tutorial_data.py``,
+        which reuses this exact frame generator at 512² for a fast tutorial):
           - x+y gradient + a bright TOP-LEFT block + dimmer BOTTOM-RIGHT block:
             any flip / mirror / mis-registration of the render is visible;
           - a bright vertical band whose position encodes the FRAME INDEX, so a
@@ -274,28 +277,14 @@ class TestHarnessMixin:
         Chunked 1 frame/chunk lazy, like a real .mrc in-situ movie (Live-Display
         §3: each nav move is a small cold read of just that frame).
         """
-        import numpy as np
         import dask.array as da
         from spyde.backend.heavy_imports import ensure_heavy_imports
+        from spyde.backend.tutorial_data import _build_movie_frames
         ensure_heavy_imports()   # see _load_test_data — don't race the prewarm
         payload = payload or {}
         n = int(payload.get("size", 2048))
         n_frames = int(payload.get("frames", 6))
-        yy, xx = np.mgrid[0:n, 0:n].astype(np.float32)
-        base = (xx / n) * 250.0 + (yy / n) * 250.0
-        base[(yy < n // 6) & (xx < n // 6)] = 1000.0          # TOP-LEFT block
-        base[(yy > 5 * n // 6) & (xx > 5 * n // 6)] = 800.0   # BOTTOM-RIGHT block
-        # Fine checkerboard patch (2-px pitch) in the centre quarter.
-        cb = slice(3 * n // 8, 5 * n // 8)
-        checker = (((xx[cb, cb] // 2).astype(np.int32)
-                    + (yy[cb, cb] // 2).astype(np.int32)) % 2) * 400.0 + 200.0
-        frames = np.empty((n_frames, n, n), dtype=np.uint16)
-        for t in range(n_frames):
-            f = base.copy()
-            f[cb, cb] = checker
-            x0 = (t + 1) * n // (n_frames + 2)
-            f[:, x0:x0 + n // 32] = 900.0                     # frame-index band
-            frames[t] = f.astype(np.uint16)
+        frames = _build_movie_frames(n, n_frames)
         stack = da.from_array(frames, chunks=(1, n, n))       # 1 frame/chunk
         s = hs.signals.Signal2D(stack).as_lazy()
         for ax, unit in zip(s.axes_manager.signal_axes, ("nm", "nm")):
