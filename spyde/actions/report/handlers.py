@@ -30,7 +30,7 @@ from spyde.actions.report.figure_builder import (
     ReportFigureController, build_cell_figure,
 )
 from spyde.actions.report.model import (
-    Cell, FigureSpec, LayerSpec, PanelSpec, ReportDoc, SignalRef,
+    IMAGE_EXTS, Cell, FigureSpec, LayerSpec, PanelSpec, ReportDoc, SignalRef,
     bake_fallback_png, bake_line_fallback_png, new_cell_id, read_report,
     write_report,
 )
@@ -42,6 +42,9 @@ _SNAPSHOT_TIMEOUT_S = 3.0
 # Cap the inline offline-fallback PNG (data URL in report_state) so a long
 # offline report doesn't balloon the state message.
 _OFFLINE_PNG_MAX_EDGE = 640
+# Cap the DECODED bytes of an image (photo) cell — refuse a giant photo so a
+# single drop/paste can't balloon the report file / the report_state message.
+_IMAGE_CELL_MAX_BYTES = 10 * 1024 * 1024
 # The pseudo layer ids a scene3d panel's snapshots are keyed under:
 # (panel_id, "xyz") float32 (M,3) sphere points, (panel_id, "rgb") uint8 (M,3)
 # IPF colours. NOT LayerSpec ids — a scene3d panel has no image layers.
@@ -106,6 +109,10 @@ class ReportManager:
         self._snapshots: dict[str, dict] = {}
         # cell_id -> baked PNG bytes read from an opened report (offline fallback)
         self._baked: dict[str, bytes] = {}
+        # cell_id -> raw image bytes for an IMAGE (photo) cell — dropped / pasted /
+        # browsed in. Held here so save can write them to assets/<id>.<ext> and
+        # state() can emit them as a data URL; loaded back from the zip on open.
+        self._images: dict[str, bytes] = {}
         # window_id -> ReportFigureController, and cell_id -> window_id
         self._controllers: dict[int, ReportFigureController] = {}
         self._window_by_cell: dict[str, int] = {}
@@ -182,6 +189,7 @@ class ReportManager:
         self.dirty = False
         self._snapshots.clear()
         self._baked.clear()
+        self._images.clear()
         self._offline.clear()
         self._editing.clear()
         self._edit_wiring.clear()
@@ -211,6 +219,7 @@ class ReportManager:
         self.dirty = False
         self._snapshots.clear()
         self._baked.clear()
+        self._images.clear()
         self._offline.clear()
         self._pending_save.clear()
         self._editing.clear()
@@ -260,7 +269,8 @@ class ReportManager:
                 "id": c.id,
                 "cell_type": c.cell_type,
                 "source": c.source if c.cell_type == "markdown" else None,
-                "caption": c.caption if c.cell_type == "figure" else None,
+                "caption": (c.caption
+                            if c.cell_type in ("figure", "image") else None),
                 "placeholder": bool(c.placeholder),
                 "fig_id": c.id if c.cell_type == "figure" else None,
                 "data_offline": bool(c.cell_type == "figure" and c.id in self._offline),
@@ -269,6 +279,18 @@ class ReportManager:
                 "live_action": (dict(c.live_action)
                                 if getattr(c, "live_action", None) else None),
             }
+            # An IMAGE (photo) cell ships its bytes as a data URL so the renderer
+            # can draw the <img> with no round trip (mirrors the offline-figure
+            # PNG emission below). The extension picks the MIME so jpg/gif/webp
+            # render correctly.
+            if c.cell_type == "image":
+                img = self._images.get(c.id)
+                if img is not None:
+                    ext = (c.image_ext or "png").lower()
+                    mime = "jpeg" if ext in ("jpg", "jpeg") else ext
+                    entry["image_ext"] = ext
+                    entry["image"] = (f"data:image/{mime};base64,"
+                                      + base64.b64encode(img).decode("ascii"))
             # For a figure cell, ship the PIXEL-FREE FigureSpec recipe (as a plain
             # dict) so the renderer's edit toolbar can list panels / layers /
             # annotations. It carries NO image bytes — only the YAML-shaped structure.
@@ -690,12 +712,20 @@ class ReportManager:
             return False
 
     def assemble_assets(self, harvested: dict) -> dict:
-        """Build ``{cell_id -> PNG bytes}`` for every non-placeholder figure cell,
-        preferring (in order): the renderer-harvested PNG, a fresh bake of the held
-        snapshot, then the PNG loaded from an opened report. The shared basis for
-        the zip save AND every export path so all writes get identical pixels."""
+        """Build ``{cell_id -> bytes}`` for every non-placeholder figure cell AND
+        every image (photo) cell. For a figure it prefers (in order): the
+        renderer-harvested PNG, a fresh bake of the held snapshot, then the PNG
+        loaded from an opened report. For an image cell it is simply the held raw
+        image bytes. The shared basis for the zip save AND every export path so all
+        writes get identical pixels."""
         assets: dict[str, bytes] = {}
         for c in self.doc.cells:
+            # Image (photo) cells: the held raw bytes go straight to the asset dict.
+            if c.cell_type == "image":
+                data = self._images.get(c.id)
+                if data:
+                    assets[c.id] = data
+                continue
             if c.cell_type != "figure" or c.placeholder:
                 continue
             png = harvested.get(c.id)
@@ -1747,6 +1777,11 @@ def report_open(session, plot, payload) -> None:
     mgr.dirty = False
     mgr._snapshots.clear()
     mgr._baked = dict(assets)
+    # Image (photo) cells re-hydrate their raw bytes from the same assets dict
+    # (read_report returns image bytes keyed by cell id). Held so state() can emit
+    # the data URL and a re-save round-trips them.
+    mgr._images = {c.id: assets[c.id] for c in doc.cells
+                   if c.cell_type == "image" and c.id in assets}
     mgr._offline.clear()
     # Rebind each figure cell: resolve EVERY layer of EVERY panel against open trees
     # / files. The cell rebinds live only when ALL its layers resolve; if any layer's
@@ -1959,12 +1994,59 @@ def report_add_cell(session, plot, payload) -> None:
     mgr.emit_state()
 
 
+def report_add_image_cell(session, plot, payload) -> None:
+    """Add an IMAGE (photo) cell from a base64-encoded image — a file dropped,
+    a clipboard paste, or a browse. Decodes the bytes, size-caps them, stores them
+    on the manager keyed by a fresh cell id, inserts an ``image`` cell at ``index``,
+    and re-emits state (the bytes ride back as a data URL).
+
+    ``payload``: ``{image_b64, image_ext, caption?, index?, slide_break?}``. The
+    ext is normalised to one of :data:`IMAGE_EXTS` (unknown → png), and the bytes
+    are refused over :data:`_IMAGE_CELL_MAX_BYTES` so a giant photo can't bloat the
+    report."""
+    mgr = _ensure_open(session)
+    raw = payload.get("image_b64")
+    data = _decode_data_url(raw) if raw else None
+    if not data:
+        ipc.emit_error("report_add_image_cell: no / undecodable image data.")
+        return
+    if len(data) > _IMAGE_CELL_MAX_BYTES:
+        mb = _IMAGE_CELL_MAX_BYTES / (1024 * 1024)
+        ipc.emit_error(
+            f"Image is too large ({len(data) / (1024 * 1024):.1f} MB) — the limit "
+            f"is {mb:.0f} MB. Resize it and try again.")
+        return
+    ext = str(payload.get("image_ext", "") or "").lower().lstrip(".")
+    if ext == "jpeg":
+        ext = "jpg"
+    if ext not in IMAGE_EXTS:
+        ext = "png"
+    cell = Cell(id=new_cell_id(), cell_type="image",
+                caption=str(payload.get("caption", "") or ""), image_ext=ext)
+    if payload.get("slide_break") is not None:
+        cell.slide_break = bool(payload.get("slide_break"))
+    mgr._images[cell.id] = data
+    _insert_cell(mgr.doc, cell, payload.get("index"))
+    mgr.dirty = True
+    mgr.emit_state()
+
+
 def report_update_cell(session, plot, payload) -> None:
     mgr = _manager(session)
     if not mgr.open:
         return
     cell = mgr.doc.cell_by_id(payload.get("cell_id"))
-    if cell is None or cell.cell_type != "markdown":
+    if cell is None:
+        return
+    # An IMAGE (photo) cell edits only its caption through this path (its bytes are
+    # immutable once added). Mirror report_set_caption so either wire works.
+    if cell.cell_type == "image":
+        if "caption" in payload:
+            cell.caption = str(payload.get("caption", "") or "")
+            mgr.dirty = True
+            mgr.emit_state()
+        return
+    if cell.cell_type != "markdown":
         return
     cell.source = str(payload.get("source", "") or "")
     # Refresh the derived (non-persisted) rendered-HTML fragment when the
@@ -1998,6 +2080,8 @@ def report_remove_cell(session, plot, payload) -> None:
         mgr._ann_widgets.pop(cell.id, None)
         mgr._selected.pop(cell.id, None)
         _clear_vectors_explorer_cache(cell.id)
+    elif cell.cell_type == "image":
+        mgr._images.pop(cell.id, None)
     mgr.doc.cells = [c for c in mgr.doc.cells if c.id != cell.id]
     mgr.dirty = True
     mgr.emit_state()
@@ -2066,7 +2150,7 @@ def report_set_caption(session, plot, payload) -> None:
     if not mgr.open:
         return
     cell = mgr.doc.cell_by_id(payload.get("cell_id"))
-    if cell is None or cell.cell_type != "figure":
+    if cell is None or cell.cell_type not in ("figure", "image"):
         return
     cell.caption = str(payload.get("caption", "") or "")
     # A vectors-explorer page bakes the caption in; drop its memoized page so the

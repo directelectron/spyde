@@ -153,6 +153,25 @@ def _figure_img_html(caption: str, png: "bytes | None") -> str:
     )
 
 
+def _image_cell_html(cell: Cell, data: "bytes | None") -> str:
+    """A static ``<figure><img data:image/<ext>;…></figure>`` for an IMAGE (photo)
+    cell — the raw image bytes inlined as a data URL so the exported page is
+    self-contained (same principle as the figure PNGs). Returns ``""`` when there
+    are no bytes."""
+    if not data:
+        return ""
+    ext = (getattr(cell, "image_ext", "") or "png").lower()
+    mime = "jpeg" if ext in ("jpg", "jpeg") else ext
+    b64 = base64.b64encode(data).decode("ascii")
+    cap = _html.escape(cell.caption or "")
+    figcap = f"<figcaption>{cap}</figcaption>" if cap else ""
+    return (
+        "<figure class=\"report-figure\">"
+        f"<img src=\"data:image/{mime};base64,{b64}\" alt=\"{cap}\">"
+        f"{figcap}</figure>"
+    )
+
+
 def _figure_iframe_html(caption: str, figure_html: str) -> str:
     """A sandboxed ``<iframe srcdoc>`` embedding a cell's self-contained
     interactive figure HTML (pixels already inlined). The srcdoc content is
@@ -201,6 +220,9 @@ def _render_cell_html(mgr, cell: Cell, assets: dict, *, interactive: bool,
     ``<img>``. Static mode is always the ``<img>``."""
     if cell.cell_type == "markdown":
         return _markdown_cell_html(cell)
+    if cell.cell_type == "image":
+        # A photo — always the inlined <img> (self-contained), in every mode.
+        return _image_cell_html(cell, assets.get(cell.id))
     if cell.cell_type != "figure" or cell.placeholder:
         return ""
     html_frag = ""
@@ -558,6 +580,27 @@ def report_paste_cell(session, plot, payload) -> None:
                     source=str(spec_cell.get("source", "") or ""))
         if spec_cell.get("html") is not None:
             cell.html = str(spec_cell.get("html") or "")
+        _insert_cell(mgr.doc, cell, index)
+        mgr.dirty = True
+        mgr.emit_state()
+        return
+
+    if cell_type == "image":
+        # A pasted photo carries its bytes as an ``image`` data URL. A fresh id +
+        # held bytes, exactly like report_add_image_cell.
+        from spyde.actions.report.model import IMAGE_EXTS
+        data = _decode_data_url(spec_cell.get("image"))
+        if not data:
+            ipc.emit_error("report_paste_cell: image cell has no image bytes.")
+            return
+        ext = str(spec_cell.get("image_ext", "") or "").lower().lstrip(".")
+        if ext == "jpeg":
+            ext = "jpg"
+        if ext not in IMAGE_EXTS:
+            ext = "png"
+        cell = Cell(id=new_cell_id(), cell_type="image",
+                    caption=str(spec_cell.get("caption", "") or ""), image_ext=ext)
+        mgr._images[cell.id] = data
         _insert_cell(mgr.doc, cell, index)
         mgr.dirty = True
         mgr.emit_state()

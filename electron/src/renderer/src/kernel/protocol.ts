@@ -421,14 +421,20 @@ export interface RepfigSpec {
   vectors_mode?: string
 }
 
-/** One cell of the report document (markdown text or an embedded figure). */
+/** One cell of the report document (markdown text, an embedded figure, or a
+ *  dropped/pasted/browsed photo). */
 export interface ReportCell {
   id: string
-  cell_type: 'markdown' | 'figure'
+  cell_type: 'markdown' | 'figure' | 'image'
   /** markdown cells: the source text. */
   source?: string
-  /** figure cells: the caption (alt text). */
+  /** figure + image cells: the caption (alt text). */
   caption?: string
+  /** image (photo) cells: the raw image inlined as a data URL (rendered inline
+   *  as a resizable <img>). */
+  image?: string
+  /** image cells: the asset extension (png/jpg/gif/webp) — informs the MIME. */
+  image_ext?: string
   /** figure cells: a template placeholder (dashed drop-zone, no figure yet). */
   placeholder?: boolean
   /** figure cells: the live figure id (null when its data is offline). */

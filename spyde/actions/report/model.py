@@ -99,6 +99,20 @@ def _plot_root_shape(plot) -> "list | None":
 # basename (without extension) is the cell id; the alt text is the caption.
 _FIG_LINE_RE = re.compile(
     r"^!\[(?P<caption>.*?)\]\(assets/(?P<cid>[^)/]+)\.png\)\s*$")
+# The image-file extensions a PHOTO/IMAGE cell may use. A figure cell is ALWAYS
+# ``.png`` (with a sibling ``figures/<id>.yaml``); an IMAGE cell serializes as an
+# ``assets/<id>.<ext>`` ref with NO figures yaml. A NON-png image ext parses
+# straight to an image cell (a figure never uses jpg/gif/webp); a ``.png`` image
+# is disambiguated from a figure by the yaml-presence check in :func:`read_report`
+# (a bare ``.png`` ref defaults to a figure cell here, back-compat).
+IMAGE_EXTS = ("png", "jpg", "jpeg", "gif", "webp")
+_NONPNG_EXT_ALT = "|".join(e for e in IMAGE_EXTS if e != "png")
+# A standalone-paragraph image ref whose target is ``assets/<id>.<non-png-ext>``
+# — an IMAGE cell (a photo dropped/pasted/browsed in). ``.png`` refs are handled
+# by ``_FIG_LINE_RE`` above (default figure; promoted to image on missing yaml).
+_IMAGE_LINE_RE = re.compile(
+    r"^!\[(?P<caption>.*?)\]\(assets/(?P<cid>[^)/]+)\."
+    r"(?P<ext>" + _NONPNG_EXT_ALT + r")\)\s*$")
 # A template placeholder comment: ``<!-- spyde:placeholder <id> [caption] -->``.
 _PLACEHOLDER_RE = re.compile(
     r"^<!--\s*spyde:placeholder\s+(?P<cid>\S+)(?:\s+(?P<caption>.*?))?\s*-->\s*$")
@@ -491,10 +505,18 @@ class FigureSpec:
 class Cell:
     """A document cell.
 
-    ``cell_type`` is ``"markdown"`` or ``"figure"``. A figure cell carries a
-    ``caption``, a ``fig_id`` (the FigureSpec / asset basename == this cell's
-    id), a ``spec`` (FigureSpec, in memory), and — for a template — a
+    ``cell_type`` is ``"markdown"``, ``"figure"``, or ``"image"``. A figure cell
+    carries a ``caption``, a ``fig_id`` (the FigureSpec / asset basename == this
+    cell's id), a ``spec`` (FigureSpec, in memory), and — for a template — a
     ``placeholder`` flag when no figure has been dropped yet.
+
+    An ``"image"`` cell is a plain PHOTO the user dropped / pasted / browsed in:
+    it carries a ``caption`` and its raw image bytes are stored as an asset like a
+    figure, at ``assets/<id>.<image_ext>`` (``image_ext`` ∈ :data:`IMAGE_EXTS`).
+    It has NO ``spec`` and NO sibling ``figures/<id>.yaml`` — that yaml-presence
+    distinction (a ``.png`` ref WITH a figures yaml = figure; an image ref WITHOUT
+    one = image) is how :func:`read_report` tells the two apart on load, so an
+    older figure-only report parses unchanged.
 
     ``html`` is a DERIVED, NON-PERSISTED field: the renderer's own
     marked+DOMPurify-sanitized rendering of ``source`` (delivered on every
@@ -516,9 +538,10 @@ class Cell:
     id: str = field(default_factory=new_cell_id)
     cell_type: str = "markdown"
     source: str = ""                           # markdown text (markdown cells)
-    caption: str = ""                          # figure caption / alt text
+    caption: str = ""                          # figure / image caption / alt text
     placeholder: bool = False
     spec: FigureSpec | None = None             # figure recipe (figure cells)
+    image_ext: str = ""                        # image cells: "png"/"jpg"/… (asset ext)
     html: str = ""                             # derived, NON-persisted (export only)
     slide_break: bool = False                  # Present mode: starts a new slide
     live_action: dict | None = None            # Present mode: "go live" excursion
@@ -619,6 +642,12 @@ def serialize_report_md(doc: ReportDoc) -> str:
             body_blocks.append(f"<!-- spyde:live-action {flow} -->")
         if c.cell_type == "markdown":
             body_blocks.append(c.source.rstrip("\n"))
+        elif c.cell_type == "image":
+            # A photo: a standalone-paragraph image ref pointing at
+            # ``assets/<id>.<ext>`` (NOT ``.png`` unless the photo IS a png), with
+            # NO sibling figures yaml. alt text == caption.
+            ext = (c.image_ext or "png").lower()
+            body_blocks.append(f"![{c.caption}](assets/{c.id}.{ext})")
         elif c.cell_type == "figure":
             if c.placeholder:
                 cap = (c.caption or "").strip()
@@ -747,6 +776,7 @@ def _parse_body_cells(body: str) -> list:
         m_break = _SLIDE_BREAK_RE.match(stripped)
         m_live = _LIVE_ACTION_RE.match(stripped)
         m_fig = _FIG_LINE_RE.match(stripped)
+        m_image = _IMAGE_LINE_RE.match(stripped)
         m_ph = _PLACEHOLDER_RE.match(stripped)
         if m_break is not None:
             # Ends the current markdown run; the marker applies to whatever cell
@@ -761,6 +791,16 @@ def _parse_body_cells(body: str) -> list:
                 payload = None
             pending["live_action"] = (dict(payload)
                                       if isinstance(payload, dict) else None)
+        elif m_image is not None:
+            # A NON-png image ref is unambiguously an IMAGE cell (a figure is
+            # always ``.png``). A ``.png`` image is matched by ``_FIG_LINE_RE``
+            # below (default figure) and later promoted to an image cell by
+            # ``read_report`` when it has no sibling figures yaml.
+            flush_md()
+            cells.append(_apply_pending(Cell(
+                id=m_image.group("cid"), cell_type="image",
+                caption=m_image.group("caption") or "",
+                image_ext=(m_image.group("ext") or "").lower())))
         elif m_fig is not None:
             flush_md()
             cells.append(_apply_pending(Cell(
@@ -919,9 +959,10 @@ def write_report(doc: ReportDoc, path: str,
     """Write *doc* to a ``.spyde-report`` zip at *path*, ATOMICALLY (tmp file in
     the same dir + ``os.replace``) so a crash never leaves a torn container.
 
-    ``assets`` maps ``cell_id -> PNG bytes`` for the baked snapshot of each
-    figure cell. Figure cells missing from ``assets`` are written without an
-    asset (the caller is expected to always provide one via harvest or bake)."""
+    ``assets`` maps ``cell_id -> bytes`` for the baked snapshot of each figure
+    cell AND the raw image bytes of each image cell. Cells missing from ``assets``
+    are written without an asset (the caller is expected to always provide one via
+    harvest or bake for figures, and the held image bytes for image cells)."""
     assets = assets or {}
     directory = os.path.dirname(os.path.abspath(path)) or "."
     os.makedirs(directory, exist_ok=True)
@@ -930,6 +971,14 @@ def write_report(doc: ReportDoc, path: str,
         with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("report.md", serialize_report_md(doc))
             for c in doc.cells:
+                if c.cell_type == "image":
+                    # A photo: the raw image bytes at assets/<id>.<ext>, NO yaml
+                    # (the missing-yaml is what marks it an image cell on reload).
+                    data = assets.get(c.id)
+                    if data:
+                        ext = (c.image_ext or "png").lower()
+                        zf.writestr(f"assets/{c.id}.{ext}", data)
+                    continue
                 if c.cell_type != "figure":
                     continue
                 if c.spec is not None:
@@ -989,6 +1038,14 @@ def write_report_dir(doc: ReportDoc, directory: str,
     with open(os.path.join(directory, "report.md"), "w", encoding="utf-8") as f:
         f.write(serialize_report_md(doc))
     for c in doc.cells:
+        if c.cell_type == "image":
+            data = assets.get(c.id)
+            if data:
+                os.makedirs(assets_dir, exist_ok=True)
+                ext = (c.image_ext or "png").lower()
+                with open(os.path.join(assets_dir, f"{c.id}.{ext}"), "wb") as f:
+                    f.write(data)
+            continue
         if c.cell_type != "figure":
             continue
         if c.spec is not None:
@@ -1005,18 +1062,32 @@ def write_report_dir(doc: ReportDoc, directory: str,
 
 def read_report(path: str) -> "tuple[ReportDoc, dict[str, bytes]]":
     """Read a ``.spyde-report`` zip → ``(ReportDoc, assets)`` where ``assets``
-    maps ``cell_id -> PNG bytes``. Figure ``spec``s are attached from
-    ``figures/<id>.yaml``."""
+    maps ``cell_id -> bytes`` (a figure's baked PNG, or an image cell's raw image
+    bytes). Figure ``spec``s are attached from ``figures/<id>.yaml``.
+
+    **Figure vs image disambiguation** (the load-time rule): a ``.png`` ref
+    parses as a FIGURE cell by default, but a figure MUST have a sibling
+    ``figures/<id>.yaml`` — a ``.png`` cell with NO yaml is really a PHOTO (a
+    pasted/dropped PNG), so it is PROMOTED to an ``"image"`` cell here. Non-png
+    image refs already parsed as image cells. Existing figure-only reports (PNG +
+    yaml) are unaffected, so this stays fully back-compatible."""
     assets: dict[str, bytes] = {}
     with zipfile.ZipFile(path, "r") as zf:
         md = zf.read("report.md").decode("utf-8")
         doc = parse_report_md(md)
         names = set(zf.namelist())
         for c in doc.cells:
+            if c.cell_type == "image":
+                ext = (c.image_ext or "png").lower()
+                asset_name = f"assets/{c.id}.{ext}"
+                if asset_name in names:
+                    assets[c.id] = zf.read(asset_name)
+                continue
             if c.cell_type != "figure":
                 continue
             spec_name = f"figures/{c.id}.yaml"
-            if spec_name in names:
+            has_spec = spec_name in names
+            if has_spec:
                 try:
                     c.spec = FigureSpec.from_yaml(zf.read(spec_name).decode("utf-8"))
                 except Exception:
@@ -1024,4 +1095,12 @@ def read_report(path: str) -> "tuple[ReportDoc, dict[str, bytes]]":
             asset_name = f"assets/{c.id}.png"
             if asset_name in names:
                 assets[c.id] = zf.read(asset_name)
+            # A ``.png`` cell with NO figures yaml is really a PHOTO — promote it
+            # to an image cell (its bytes are already harvested above). A
+            # placeholder (template figure, never has a yaml) is left as-is.
+            if not has_spec and not c.placeholder:
+                c.cell_type = "image"
+                c.image_ext = "png"
+                c.placeholder = False
+                c.spec = None
     return doc, assets

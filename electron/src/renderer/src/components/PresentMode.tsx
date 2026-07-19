@@ -260,6 +260,7 @@ function SlideCell({ cell, reportFigures, iframeRefs, replayState }: {
   replayState: ReturnType<typeof useSpyDE>['replayState']
 }) {
   if (cell.cell_type === 'markdown') return <SlideMarkdown cell={cell} />
+  if (cell.cell_type === 'image') return <SlideImage cell={cell} />
   return (
     <SlideFigure
       cell={cell}
@@ -267,6 +268,20 @@ function SlideCell({ cell, reportFigures, iframeRefs, replayState }: {
       iframeRefs={iframeRefs}
       replayState={replayState}
     />
+  )
+}
+
+// A photo on a slide — large + centered, using the same data URL the sidebar
+// renders. Sized to fit the slide (max-height caps it so a tall image doesn't
+// push the caption off-screen).
+function SlideImage({ cell }: { cell: ReportCell }) {
+  const caption = (cell.caption ?? '').trim()
+  if (!cell.image) return null
+  return (
+    <figure data-testid={`present-img-${cell.id}`} style={styles.figure}>
+      <img src={cell.image} alt={caption} style={styles.slideImg} />
+      {caption && <figcaption style={styles.figCaption}>{caption}</figcaption>}
+    </figure>
   )
 }
 
@@ -333,6 +348,12 @@ const styles: Record<string, React.CSSProperties> = {
     background: '#0e0e16',
   },
   figImg: { maxWidth: '100%', maxHeight: '100%', height: 'auto' },
+  // A photo cell on a slide — large + centered, capped so it stays on-screen
+  // with room for the caption.
+  slideImg: {
+    display: 'block', margin: '0 auto',
+    maxWidth: '100%', maxHeight: '68vh', height: 'auto', borderRadius: 8,
+  },
   figPending: {
     display: 'flex', alignItems: 'center', justifyContent: 'center',
     height: '100%', color: '#585b70', fontSize: 14,

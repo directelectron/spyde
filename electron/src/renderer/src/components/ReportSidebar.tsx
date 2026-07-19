@@ -17,6 +17,7 @@ import { reportClipboard } from '../kernel/reportClipboard'
 import { reportFromGuide } from '../kernel/reportFromGuide'
 import { ReportCell } from './ReportCell'
 import { ReportFigureCell } from './ReportFigureCell'
+import { ReportImageCell } from './ReportImageCell'
 import { GUIDES } from '@guides/index'
 
 const MIN_W = 300
@@ -50,6 +51,48 @@ function figurePayloadFromDrop(dt: DataTransfer): DropFigurePayload | null {
     if (Number.isFinite(n)) return { windowId: n }
   }
   return null
+}
+
+// The image file extensions a PHOTO cell may carry (must mirror the backend's
+// IMAGE_EXTS). Anything else the browser hands us is normalised to png (the
+// backend defaults unknown exts to png too).
+const IMAGE_EXTS = ['png', 'jpg', 'jpeg', 'gif', 'webp'] as const
+
+/** Map an image file's MIME / name to one of IMAGE_EXTS. */
+function imageExtOf(file: File): string {
+  const fromType = (file.type.split('/')[1] || '').toLowerCase()
+  if ((IMAGE_EXTS as readonly string[]).includes(fromType)) return fromType
+  const fromName = (file.name.split('.').pop() || '').toLowerCase()
+  if ((IMAGE_EXTS as readonly string[]).includes(fromName)) return fromName
+  return 'png'
+}
+
+/** Read a File/Blob as a data URL. Rejects on read error. */
+function readFileAsDataURL(file: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader()
+    fr.onload = () => resolve(String(fr.result || ''))
+    fr.onerror = () => reject(fr.error)
+    fr.readAsDataURL(file)
+  })
+}
+
+/** True when a DataTransfer carries at least one image FILE (drop-a-photo path,
+ *  distinct from a figure/window pill drop). */
+function hasImageFiles(dt: DataTransfer): boolean {
+  if (dt.files && dt.files.length) {
+    for (const f of Array.from(dt.files)) {
+      if (f.type.startsWith('image/')) return true
+    }
+  }
+  // During dragover the file list isn't readable yet — fall back to the items
+  // kind/type (Files with an image type).
+  if (dt.items && dt.items.length) {
+    for (const it of Array.from(dt.items)) {
+      if (it.kind === 'file' && it.type.startsWith('image/')) return true
+    }
+  }
+  return false
 }
 
 export function ReportSidebar() {
@@ -366,6 +409,67 @@ export function ReportSidebar() {
   const addTextCell = () =>
     sendAction('report_add_cell', { cell_type: 'markdown', source: '', html: '' })
 
+  // ── Add an image (photo) cell — shared by drop / paste / browse ────────────
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  const addImageFile = async (file: Blob, ext: string, index?: number) => {
+    try {
+      const dataUrl = await readFileAsDataURL(file)
+      if (!dataUrl) return
+      sendAction('report_add_image_cell', {
+        image_b64: dataUrl, image_ext: ext,
+        ...(index !== undefined ? { index } : {}),
+      })
+    } catch { /* unreadable file — silently ignore */ }
+  }
+  // Browse: the hidden <input type=file> picked a file.
+  const onBrowsePicked = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (file) await addImageFile(file, imageExtOf(file))
+    // Reset so re-picking the SAME file fires change again.
+    if (fileInputRef.current) fileInputRef.current.value = ''
+  }
+
+  // Paste from clipboard: scoped to the sidebar (a focused paste). Reads the
+  // first image/* clipboard item and adds it — the killer flow (paste a
+  // screenshot). Only fires when the report body has focus / hover so a paste
+  // into a text cell's editor is NOT hijacked.
+  const dockRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (report == null) return
+    const onPaste = (e: ClipboardEvent) => {
+      // Don't steal a paste aimed at a text input / textarea (caption/markdown
+      // editing) — only handle a paste landing on the report chrome itself.
+      const target = e.target as HTMLElement | null
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' ||
+          target.isContentEditable)) {
+        return
+      }
+      // Only act when the paste is within the report dock.
+      if (!dockRef.current?.contains(target as Node) &&
+          document.activeElement && !dockRef.current?.contains(document.activeElement)) {
+        // Fall through only if the sidebar is the active region; otherwise ignore.
+        if (!dockRef.current?.matches(':hover')) return
+      }
+      const items = e.clipboardData?.items
+      if (!items) return
+      for (const it of Array.from(items)) {
+        if (it.kind === 'file' && it.type.startsWith('image/')) {
+          const blob = it.getAsFile()
+          if (blob) {
+            e.preventDefault()
+            const ext = (it.type.split('/')[1] || 'png').toLowerCase()
+            void addImageFile(blob,
+              (IMAGE_EXTS as readonly string[]).includes(ext) ? ext : 'png')
+          }
+          return
+        }
+      }
+    }
+    window.addEventListener('paste', onPaste)
+    return () => window.removeEventListener('paste', onPaste)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [report == null])
+
   // ── Body drop (figure/window pill → report_add_figure at insertion index) ──
   // Insertion index = number of cells whose vertical midpoint is above the
   // cursor (the between-cell position). A drop directly on a placeholder cell is
@@ -385,12 +489,27 @@ export function ReportSidebar() {
     return idx
   }
   const onBodyDragOver = (e: React.DragEvent) => {
-    if (!DROP_MIMES.some(m => e.dataTransfer.types.includes(m))) return
+    // Accept a figure/window pill OR an image FILE being dragged in from the OS.
+    const isPill = DROP_MIMES.some(m => e.dataTransfer.types.includes(m))
+    const isImageFile = e.dataTransfer.types.includes('Files') &&
+      hasImageFiles(e.dataTransfer)
+    if (!isPill && !isImageFile) return
     e.preventDefault()
     e.dataTransfer.dropEffect = 'copy'
     setDropIndex(computeDropIndex(e.clientY))
   }
   const onBodyDrop = (e: React.DragEvent) => {
+    // An image FILE drop → add a photo cell (branch FIRST so it never collides
+    // with the pill path). Falls through to the pill path otherwise.
+    if (hasImageFiles(e.dataTransfer)) {
+      e.preventDefault()
+      const idx = computeDropIndex(e.clientY)
+      setDropIndex(null)
+      const files = Array.from(e.dataTransfer.files).filter(f => f.type.startsWith('image/'))
+      // Insert each dropped image in order at the drop point.
+      files.forEach((f, k) => { void addImageFile(f, imageExtOf(f), idx + k) })
+      return
+    }
     if (!DROP_MIMES.some(m => e.dataTransfer.types.includes(m))) return
     e.preventDefault()
     const idx = computeDropIndex(e.clientY)
@@ -480,7 +599,7 @@ export function ReportSidebar() {
   }
 
   return (
-    <div style={{ ...styles.dock, width }} data-testid="report-sidebar">
+    <div ref={dockRef} style={{ ...styles.dock, width }} data-testid="report-sidebar">
       <ResizeHandle onDown={onResizeDown} onMove={onResizeMove} onUp={onResizeUp} />
 
       {/* Header */}
@@ -644,6 +763,13 @@ export function ReportSidebar() {
                   dragProps={makeDragProps(cell.id, i)}
                   reorderActive={dragCell != null}
                 />
+              : cell.cell_type === 'image'
+              ? <ReportImageCell
+                  cell={cell}
+                  index={i}
+                  onRemove={() => sendAction('report_remove_cell', { cell_id: cell.id })}
+                  dragProps={makeDragProps(cell.id, i)}
+                />
               : <ReportCell
                   cell={cell}
                   index={i}
@@ -659,11 +785,27 @@ export function ReportSidebar() {
           <div style={styles.insertLine} data-testid={`report-insert-${cells.length}`} />
         )}
 
-        <button
-          data-testid="report-add-text"
-          style={styles.addBtn}
-          onClick={addTextCell}
-        >+ Add text cell</button>
+        <div style={styles.addRow}>
+          <button
+            data-testid="report-add-text"
+            style={styles.addBtn}
+            onClick={addTextCell}
+          >+ Add text cell</button>
+          <button
+            data-testid="report-add-image"
+            style={styles.addBtn}
+            title="Add a photo (or drop / paste one anywhere in this panel)"
+            onClick={() => fileInputRef.current?.click()}
+          >+ Add image</button>
+        </div>
+        <input
+          ref={fileInputRef}
+          data-testid="report-image-input"
+          type="file"
+          accept="image/*"
+          style={{ display: 'none' }}
+          onChange={onBrowsePicked}
+        />
       </div>
     </div>
   )
@@ -808,8 +950,11 @@ const styles: Record<string, React.CSSProperties> = {
   insertLine: {
     height: 2, background: '#89b4fa', borderRadius: 1, margin: '2px 0',
   },
+  addRow: {
+    display: 'flex', gap: 8, marginTop: 8,
+  },
   addBtn: {
-    display: 'block', width: '100%', marginTop: 8,
+    flex: 1, minWidth: 0,
     background: '#1e1e2e', color: '#a6adc8', border: '1px dashed #45475a',
     borderRadius: 6, padding: '7px', fontSize: 12, cursor: 'pointer',
   },

@@ -95,6 +95,7 @@ STAGED_HANDLERS: dict[str, str] = {
     "report_save_as_template": "spyde.actions.report.handlers.report_save_as_template",
     "report_close":            "spyde.actions.report.handlers.report_close",
     "report_add_cell":         "spyde.actions.report.handlers.report_add_cell",
+    "report_add_image_cell":   "spyde.actions.report.handlers.report_add_image_cell",
     "report_update_cell":      "spyde.actions.report.handlers.report_update_cell",
     "report_remove_cell":      "spyde.actions.report.handlers.report_remove_cell",
     "report_move_cell":        "spyde.actions.report.handlers.report_move_cell",
