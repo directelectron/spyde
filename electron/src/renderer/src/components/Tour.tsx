@@ -26,6 +26,19 @@ function resolveAnchor(anchor: string | null): DOMRect | null {
   const r = el.getBoundingClientRect()
   // Treat an off-screen / zero-size element as "not found" so we center instead.
   if (r.width === 0 && r.height === 0) return null
+  // Treat an element that is present in the DOM but not actually VISIBLE
+  // (opacity 0 / hidden / display none) as "not found" too — otherwise we draw a
+  // spotlight ring around an invisible control. The floating plot toolbar, for
+  // example, is laid out but opacity:0 until the window is hovered; without this
+  // check the "plot toolbar" step would highlight an empty box.
+  const cs = window.getComputedStyle(el)
+  if (
+    cs.visibility === 'hidden' ||
+    cs.display === 'none' ||
+    Number(cs.opacity) === 0
+  ) {
+    return null
+  }
   return r
 }
 
@@ -64,9 +77,6 @@ export function Tour({ guide, onClose }: { guide: Guide; onClose: () => void }) 
   // Auto-load (guide.autoload) lifecycle: 'idle' → 'loading' → 'done'|'error'.
   const [autoloadState, setAutoloadState] =
     useState<'idle' | 'loading' | 'done' | 'error'>(guide.autoload ? 'loading' : 'done')
-  // Per-step "Show me" run state. 'running' disables the button; 'error' shows
-  // a "couldn't run it — try it yourself" note (the tour never dead-ends).
-  const [driveState, setDriveState] = useState<'idle' | 'running' | 'error'>('idle')
   const step: GuideStep = guide.steps[i]
   const last = i === guide.steps.length - 1
 
@@ -75,48 +85,40 @@ export function Tour({ guide, onClose }: { guide: Guide; onClose: () => void }) 
   // below don't re-fire on every render.
   const sendRef = useRef(sendAction)
   sendRef.current = sendAction
-  // Guards so an async drive that resolves after the tour advanced/closed can't
-  // clobber state (React "setState on unmounted"/stale-step guard).
-  const iRef = useRef(i)
-  iRef.current = i
-  const aliveRef = useRef(true)
-  useEffect(() => () => { aliveRef.current = false }, [])
+  // The tour is purely descriptive: it loads the tutorial dataset once on open,
+  // spotlights each step's UI, and closes the dataset again on exit. There is no
+  // per-step "Show me" auto-drive — the user follows the highlighted controls
+  // themselves (the auto-drive was removed; it also double-loaded the data).
+
+  // Track whether this tour actually loaded a tutorial dataset, so teardown only
+  // closes data the tour opened (never the user's own). A ref (not state) so the
+  // unmount cleanup reads the latest value without re-running.
+  const didAutoloadRef = useRef(false)
+  // StrictMode double-invokes effects in dev; guard the autoload so a re-mount
+  // doesn't fire a second load.
+  const autoloadStartedRef = useRef(false)
 
   // Auto-load the tutorial dataset ONCE on open, before showing step 1. Errors
   // are swallowed into an 'error' state (the tour still works; the dataset just
-  // wasn't loaded for the user).
+  // wasn't loaded for the user). On tour EXIT, close the tutorial dataset(s) so
+  // the dummy data doesn't linger after the walkthrough.
   useEffect(() => {
     if (!guide.autoload) return
+    if (autoloadStartedRef.current) return
+    autoloadStartedRef.current = true
     let cancelled = false
     setAutoloadState('loading')
     runDrive(guide.autoload, guide.steps[0], { sendAction: sendRef.current })
-      .then(() => { if (!cancelled) setAutoloadState('done') })
+      .then(() => { if (!cancelled) { didAutoloadRef.current = true; setAutoloadState('done') } })
       .catch(() => { if (!cancelled) setAutoloadState('error') })
-    return () => { cancelled = true }
+    return () => {
+      cancelled = true
+      // Tour is unmounting (Done / ✕ / Esc): tear down the tutorial data it
+      // loaded so the user is left with a clean workspace.
+      if (didAutoloadRef.current) sendRef.current('tutorial_close_all', {})
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [guide.id])
-
-  // Reset per-step drive state when the step changes.
-  useEffect(() => { setDriveState('idle') }, [i])
-
-  // "Show me": run this step's drive, and on its waitFor signal advance to the
-  // next step. On failure, show a non-blocking note and STAY on the step so the
-  // spotlight can guide manual completion — never wedge.
-  const showMe = () => {
-    if (!step.drive) return
-    setDriveState('running')
-    const runningAt = iRef.current
-    runDrive(step.drive, step, { sendAction: sendRef.current })
-      .then(() => {
-        if (!aliveRef.current || iRef.current !== runningAt) return
-        setDriveState('idle')
-        setI((n) => (n < guide.steps.length - 1 ? n + 1 : n))
-      })
-      .catch(() => {
-        if (!aliveRef.current || iRef.current !== runningAt) return
-        setDriveState('error')
-      })
-  }
 
   // Re-measure the anchor on step change, on resize, and on a short poll (so a
   // wizard that opens slightly after the step advances still gets spotlighted).
@@ -142,13 +144,12 @@ export function Tour({ guide, onClose }: { guide: Guide; onClose: () => void }) 
     return () => window.removeEventListener('keydown', onKey)
   }, [i, last, onClose])
 
-  // Show a "Show me ▶" button only for a step EXPLICITLY marked autoDrive with a
-  // runnable drive. The find-vectors full-scan Compute step is intentionally NOT
-  // autoDrive, so it stays manual (it can run for minutes).
-  const canShowMe = Boolean(step.autoDrive && step.drive)
-
   const bubbleW = 320
-  const bubbleH = 200
+  // The bubble height varies with body length (some steps have a callout). Use a
+  // generous estimate for placement so a tall bubble isn't positioned with its
+  // footer (Back/Done) clamped off-screen; the bubble itself caps at the viewport
+  // and scrolls (styles.bubble maxHeight/overflowY) as a final guard.
+  const bubbleH = 320
   const { left, top } = bubblePos(rect, step.placement ?? 'bottom', bubbleW, bubbleH)
   const pad = 6 // spotlight padding around the element
 
@@ -201,15 +202,7 @@ export function Tour({ guide, onClose }: { guide: Guide; onClose: () => void }) 
         {i === 0 && autoloadState === 'error' && (
           <div data-testid="tour-autoload-error" style={styles.errNote}>
             Couldn’t auto-load the tutorial data — open it from{' '}
-            <strong>Tutorial Data</strong> and follow along.
-          </div>
-        )}
-
-        {/* Per-step drive error — non-blocking; the spotlight still guides. */}
-        {driveState === 'error' && (
-          <div data-testid="tour-drive-error" style={styles.errNote}>
-            Couldn’t run this automatically — try it yourself using the
-            highlighted control.
+            <strong>Examples → Dummy Data</strong> and follow along.
           </div>
         )}
 
@@ -221,35 +214,19 @@ export function Tour({ guide, onClose }: { guide: Guide; onClose: () => void }) 
           >
             ‹ Back
           </button>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            {canShowMe && (
-              <button
-                data-testid="tour-show-me"
-                style={{
-                  ...styles.showMeBtn,
-                  opacity: driveState === 'running' ? 0.6 : 1,
-                  cursor: driveState === 'running' ? 'default' : 'pointer',
-                }}
-                disabled={driveState === 'running'}
-                onClick={showMe}
-              >
-                {driveState === 'running' ? 'Running…' : 'Show me ▶'}
-              </button>
-            )}
-            {last ? (
-              <button data-testid="tour-done" style={styles.primaryBtn} onClick={onClose}>
-                Done
-              </button>
-            ) : (
-              <button
-                data-testid="tour-next"
-                style={styles.primaryBtn}
-                onClick={() => setI((n) => n + 1)}
-              >
-                Next ›
-              </button>
-            )}
-          </div>
+          {last ? (
+            <button data-testid="tour-done" style={styles.primaryBtn} onClick={onClose}>
+              Done
+            </button>
+          ) : (
+            <button
+              data-testid="tour-next"
+              style={styles.primaryBtn}
+              onClick={() => setI((n) => n + 1)}
+            >
+              Next ›
+            </button>
+          )}
         </div>
       </div>
     </div>
@@ -277,6 +254,12 @@ const styles: Record<string, React.CSSProperties> = {
     color: '#cdd6f4',
     fontSize: 13,
     transition: 'left 140ms ease, top 140ms ease',
+    // Never taller than the viewport — a long step body scrolls INSIDE the
+    // bubble so the Back/Next/Done footer is always on-screen and clickable.
+    maxHeight: 'calc(100vh - 16px)',
+    overflowY: 'auto',
+    display: 'flex',
+    flexDirection: 'column',
   },
   header: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' },
   stepCount: { fontSize: 11, color: '#6c7086', letterSpacing: 0.5 },
@@ -294,6 +277,10 @@ const styles: Record<string, React.CSSProperties> = {
   },
   footer: {
     display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 12,
+    // Sticky at the bottom of a scrolling bubble so Back/Done is always visible
+    // even when a long step body overflows.
+    position: 'sticky', bottom: -14, background: '#1e1e2e',
+    paddingTop: 8, marginBottom: -14, paddingBottom: 14,
   },
   navBtn: {
     background: 'transparent', border: '1px solid #313244', color: '#cdd6f4',
@@ -302,11 +289,6 @@ const styles: Record<string, React.CSSProperties> = {
   primaryBtn: {
     background: ACCENT, border: 'none', color: '#11111b', fontWeight: 600,
     borderRadius: 6, padding: '6px 16px', cursor: 'pointer', fontSize: 12,
-  },
-  showMeBtn: {
-    background: 'transparent', border: `1px solid ${ACCENT}`, color: ACCENT,
-    fontWeight: 600, borderRadius: 6, padding: '6px 12px', fontSize: 12,
-    transition: 'opacity 120ms ease',
   },
   loadNote: {
     display: 'flex', alignItems: 'center', gap: 8, marginTop: 10,

@@ -163,6 +163,49 @@ class TestTutorialLoadDispatch:
         tree = _last_tree(session)
         assert tuple(tree.root.axes_manager.navigation_shape) == (10, 10)
 
+    def test_repeat_load_is_idempotent(self, window):
+        """Loading the SAME tutorial name twice must NOT stack a duplicate copy
+        (the walkthrough double/triple-load fix) — the second dispatch is a no-op
+        because that dataset is already open."""
+        session = window["window"]
+        n0 = len(session.signal_trees)
+        session.dispatch_action(
+            {"action": "tutorial_load", "payload": {"name": "navigation"}})
+        _settle()
+        assert len(session.signal_trees) == n0 + 1
+        # Second load of the same name → no new tree.
+        session.dispatch_action(
+            {"action": "tutorial_load", "payload": {"name": "navigation"}})
+        _settle()
+        assert len(session.signal_trees) == n0 + 1
+        # A DIFFERENT tutorial name still loads (dedup is per-name, not global).
+        session.dispatch_action(
+            {"action": "tutorial_load", "payload": {"name": "spectroscopy"}})
+        _settle()
+        assert len(session.signal_trees) == n0 + 2
+
+    def test_close_all_tears_down_tutorial_trees(self, window):
+        """tutorial_close_all closes every tutorial dataset opened this session
+        (walkthrough teardown) and leaves non-tutorial data untouched."""
+        session = window["window"]
+        # A non-tutorial dataset the close must NOT touch.
+        session.dispatch_action({"action": "load_test_data", "payload": {}})
+        _settle()
+        keep = len(session.signal_trees)
+        session.dispatch_action(
+            {"action": "tutorial_load", "payload": {"name": "navigation"}})
+        session.dispatch_action(
+            {"action": "tutorial_load", "payload": {"name": "spectroscopy"}})
+        _settle()
+        assert len(session.signal_trees) == keep + 2
+        # Close all tutorial trees → back to just the non-tutorial dataset.
+        session.dispatch_action({"action": "tutorial_close_all", "payload": {}})
+        _settle()
+        assert len(session.signal_trees) == keep
+        # A second close is a harmless no-op.
+        session.dispatch_action({"action": "tutorial_close_all", "payload": {}})
+        assert len(session.signal_trees) == keep
+
     def test_tutorial_load_not_in_test_actions_gate(self):
         """The un-gate is the whole point of Phase 1: tutorial_load must not
         be listed among the packaged-build-disabled test actions."""

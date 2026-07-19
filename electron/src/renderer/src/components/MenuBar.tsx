@@ -41,6 +41,7 @@ const TUTORIAL_DATA: { key: string; label: string }[] = [
 type Item =
   | { label: string; onClick: () => void; disabled?: boolean; testId?: string }
   | { separator: true }
+  | { header: string }
 
 export function MenuBar({ onStartGuide }: { onStartGuide: (g: Guide) => void }) {
   const { sendAction, openStackDialog, openUpdateDialog, openGpuStatusDialog, openGpuHelpDialog, state } = useSpyDE()
@@ -72,15 +73,22 @@ export function MenuBar({ onStartGuide }: { onStartGuide: (g: Guide) => void }) 
       { separator: true },
       { label: 'Quit', onClick: () => window.electron.quit() },
     ],
-    Examples: EXAMPLES.map((name) => ({
-      label: name,
-      onClick: () => sendAction('load_example', { name }),
-    })),
-    'Tutorial Data': TUTORIAL_DATA.map(({ key, label }) => ({
-      label,
-      testId: `tutorial-${key}`,
-      onClick: () => sendAction('tutorial_load', { name: key }),
-    })),
+    Examples: [
+      // Real downloadable datasets (pyxem+pooch).
+      ...EXAMPLES.map((name) => ({
+        label: name,
+        onClick: () => sendAction('load_example', { name }),
+      })),
+      // Instant, no-download tutorial datasets — grouped under a "Dummy Data"
+      // header inside Examples (the menu has no nested fly-outs).
+      { separator: true } as Item,
+      { header: 'Dummy Data' } as Item,
+      ...TUTORIAL_DATA.map(({ key, label }) => ({
+        label,
+        testId: `tutorial-${key}`,
+        onClick: () => sendAction('tutorial_load', { name: key }),
+      })),
+    ],
     Help: [
       ...GUIDES.map((g) => ({
         label: `Guided Tour: ${g.title}`,
@@ -122,6 +130,8 @@ export function MenuBar({ onStartGuide }: { onStartGuide: (g: Guide) => void }) 
               {menus[name].map((it, i) =>
                 'separator' in it ? (
                   <div key={`sep${i}`} style={styles.sep} />
+                ) : 'header' in it ? (
+                  <div key={`hdr${i}`} style={styles.header}>{it.header}</div>
                 ) : (
                   <button
                     key={it.label}
@@ -165,4 +175,9 @@ const styles: Record<string, React.CSSProperties> = {
     whiteSpace: 'nowrap',
   },
   sep: { height: 1, background: '#313244', margin: '5px 4px' },
+  header: {
+    padding: '4px 10px 2px', fontSize: 10.5, fontWeight: 700,
+    letterSpacing: 0.6, textTransform: 'uppercase', color: '#6c7086',
+    whiteSpace: 'nowrap', userSelect: 'none',
+  },
 }

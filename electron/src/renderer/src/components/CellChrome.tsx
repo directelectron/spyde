@@ -20,6 +20,18 @@
  */
 import React from 'react'
 
+// Shared hover feedback for a chrome button (they use inline styles, not CSS
+// classes, so hover is wired per-button). A subtle raised background on hover
+// makes the small icon buttons feel like real, clickable targets.
+const hoverProps = {
+  onMouseEnter: (e: React.MouseEvent<HTMLButtonElement>) => {
+    e.currentTarget.style.background = 'rgba(137,180,250,0.18)'
+  },
+  onMouseLeave: (e: React.MouseEvent<HTMLButtonElement>) => {
+    e.currentTarget.style.background = 'none'
+  },
+}
+
 export interface CellChromeStyles {
   /** The absolute-positioned wrapper pill. */
   chrome: React.CSSProperties
@@ -59,12 +71,14 @@ export function CellChrome({
         style={styles.chromeBtn}
         title="Copy cell"
         onClick={onCopy}
+        {...hoverProps}
       >⧉</button>
       <button
         data-testid={`cell-duplicate-${cellId}`}
         style={styles.chromeBtn}
         title="Duplicate cell"
         onClick={onDuplicate}
+        {...hoverProps}
       >＋</button>
       {trailing}
       <button
@@ -72,6 +86,7 @@ export function CellChrome({
         style={styles.deleteBtn ?? styles.chromeBtn}
         title={deleteTitle}
         onClick={onDelete}
+        {...hoverProps}
       >✕</button>
     </div>
   )

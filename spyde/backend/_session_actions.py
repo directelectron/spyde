@@ -74,7 +74,37 @@ class ActionRouterMixin:
             if loader is None:
                 emit_error(f"Unknown tutorial dataset: {name!r}")
             else:
-                loader(self)
+                # IDEMPOTENT: a tutorial dataset already open for this name is
+                # FOCUSED, not re-loaded — so a walkthrough that autoloads on open
+                # (and any re-entry) never stacks duplicate copies. Track the tree
+                # each name created so tutorial_close_all can tear them down at the
+                # end of a walkthrough.
+                registry = getattr(self, "_tutorial_trees", None)
+                if registry is None:
+                    registry = self._tutorial_trees = {}
+                existing = registry.get(name)
+                if existing is not None and existing in self.signal_trees:
+                    # Already open — this dataset is on screen; do nothing rather
+                    # than stack a duplicate copy.
+                    pass
+                else:
+                    registry.pop(name, None)
+                    before = list(self.signal_trees)
+                    loader(self)
+                    new_trees = [t for t in self.signal_trees if t not in before]
+                    if new_trees:
+                        registry[name] = new_trees[-1]
+        elif action == "tutorial_close_all":
+            # Close every tutorial dataset opened this session (walkthrough
+            # teardown) — leaves the user's own data untouched.
+            registry = getattr(self, "_tutorial_trees", None) or {}
+            for tree in list(registry.values()):
+                if tree in self.signal_trees:
+                    try:
+                        self._close_tree(tree)
+                    except Exception as e:
+                        log.debug("tutorial_close_all: closing tree failed: %s", e)
+            registry.clear()
         elif action == "load_test_data":
             self._load_test_data()
         elif action == "load_test_data_lazy":

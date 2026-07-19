@@ -47,6 +47,39 @@ import { SeamlessFigureFrame } from './ReportFigureCell'
 import { SlideOverview } from './SlideOverview'
 import type { ReportCell } from '../kernel/protocol'
 
+// Crisp inline SVG icons for the top-right present controls (replacing the emoji
+// glyphs — the 🗣 speaker in particular read as "voice/audio", not "presenter").
+// `currentColor` so they inherit the button's text colour (incl. the active state).
+const svgProps = {
+  width: 17, height: 17, viewBox: '0 0 24 24', fill: 'none',
+  stroke: 'currentColor', strokeWidth: 2,
+  strokeLinecap: 'round' as const, strokeLinejoin: 'round' as const,
+}
+// A 3×3 grid — the slide-overview toggle.
+const GridIcon = () => (
+  <svg {...svgProps} aria-hidden>
+    <rect x="3" y="3" width="7" height="7" rx="1" />
+    <rect x="14" y="3" width="7" height="7" rx="1" />
+    <rect x="3" y="14" width="7" height="7" rx="1" />
+    <rect x="14" y="14" width="7" height="7" rx="1" />
+  </svg>
+)
+// A presenter at a screen/board with a pointer — the presenter-view toggle.
+const PresenterIcon = () => (
+  <svg {...svgProps} aria-hidden>
+    <rect x="3" y="3" width="18" height="12" rx="1.5" />
+    <path d="M12 15v3" />
+    <path d="M8 21h8" />
+    <circle cx="8.5" cy="8.5" r="1.4" />
+    <path d="M11.5 11l3-4 3 4" />
+  </svg>
+)
+const CloseIcon = () => (
+  <svg {...svgProps} aria-hidden>
+    <path d="M6 6l12 12M18 6L6 18" />
+  </svg>
+)
+
 // Present-mode markdown sizing: the `.spyde-md` base stylesheet (injected by
 // ReportCell) is em-relative off `--spyde-md-fs` (13px in the sidebar). On the
 // full-screen stage we want big readable type, so a scoped `present-md` override
@@ -193,6 +226,11 @@ export function PresentMode({ initialSlide, onSlideChange, onExit, onLaunchLive 
   // While it's open, present-mode navigation keys are suppressed (the overview
   // owns the keyboard) so arrows/Esc don't leak through to the deck behind it.
   const [overview, setOverview] = React.useState(false)
+  // On Windows the native title-bar overlay (min/max/close) sits at the very
+  // top-right, ~38px tall. Push the presentation top controls BELOW it so they
+  // aren't clipped/covered (macOS traffic lights are on the left, no conflict).
+  const isMac = window.electron?.platform === 'darwin'
+  const topBarStyle = isMac ? styles.topBar : { ...styles.topBar, top: 46, right: 12 }
 
   // Report every change up so App can persist it for re-entry.
   useEffect(() => { onSlideChange(index) }, [index, onSlideChange])
@@ -304,14 +342,14 @@ export function PresentMode({ initialSlide, onSlideChange, onExit, onLaunchLive 
       )}
 
       {/* Top-right controls: overview grid + presenter-view toggle + exit. */}
-      <div style={styles.topBar}>
+      <div style={topBarStyle}>
         <button
           data-testid="present-overview-toggle"
           data-active={overview ? '1' : '0'}
           style={{ ...styles.iconBtn, ...(overview ? styles.iconBtnActive : {}) }}
           title="Slide overview: jump around + reorder slides (O)"
           onClick={() => setOverview(o => !o)}
-        >▦</button>
+        ><GridIcon /></button>
         <button
           data-testid="present-presenter-toggle"
           data-active={presenter ? '1' : '0'}
@@ -320,13 +358,13 @@ export function PresentMode({ initialSlide, onSlideChange, onExit, onLaunchLive 
             ? 'Presenter view ON — show the clean audience slide (S)'
             : 'Presenter view: current + next + notes + timer (S)'}
           onClick={() => setPresenter(p => !p)}
-        >🗣</button>
+        ><PresenterIcon /></button>
         <button
           data-testid="present-exit"
           style={styles.iconBtn}
           title="Exit presentation (Esc)"
           onClick={onExit}
-        >✕</button>
+        ><CloseIcon /></button>
       </div>
 
       {/* Bottom bar: prev / counter / next. Hidden in presenter mode (the
@@ -519,6 +557,29 @@ function PreviewCell({ cell, titleSlide }: { cell: ReportCell; titleSlide: boole
       </figure>
     )
   }
+  if (cell.cell_type === 'split') {
+    // A split preview (presenter dashboard / overview thumbnail): text + the
+    // baked figure/photo, side by side per split_layout. No live iframe here.
+    const html = renderMarkdown(cell.source ?? '')
+    const src = cell.image || cell.png
+    const textPane = (
+      <div key="t" className="spyde-md present-md" style={{ minWidth: 0 }}
+           dangerouslySetInnerHTML={{ __html: html }} />
+    )
+    const figPane = (
+      <div key="f" style={{ minWidth: 0, textAlign: 'center' }}>
+        {src ? <img src={src} alt={cell.caption ?? ''} style={styles.previewImg} />
+             : <div style={styles.previewFigPending}>figure</div>}
+      </div>
+    )
+    const textLeft = (cell.split_layout ?? 'text-left') !== 'text-right'
+    return (
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem',
+                    alignItems: 'center', margin: '0.5rem 0' }}>
+        {textLeft ? [textPane, figPane] : [figPane, textPane]}
+      </div>
+    )
+  }
   // figure cell — the baked PNG snapshot (a live iframe isn't mounted here).
   if (cell.placeholder) return null
   return (
@@ -607,6 +668,16 @@ function SlideCell({ cell, titleSlide, reportFigures, iframeRefs, replayState }:
 }) {
   if (cell.cell_type === 'markdown') return <SlideMarkdown cell={cell} titleSlide={titleSlide} />
   if (cell.cell_type === 'image') return <SlideImage cell={cell} />
+  if (cell.cell_type === 'split') {
+    return (
+      <SlideSplit
+        cell={cell}
+        reportFigures={reportFigures}
+        iframeRefs={iframeRefs}
+        replayState={replayState}
+      />
+    )
+  }
   return (
     <SlideFigure
       cell={cell}
@@ -677,11 +748,68 @@ function SlideFigure({ cell, reportFigures, iframeRefs, replayState }: {
   )
 }
 
+// A SPLIT cell on a slide: text on one side, a figure/photo on the other, in the
+// order given by split_layout (text-left | text-right). Renders BOTH panes — the
+// earlier bug routed split cells to SlideFigure, which dropped the text entirely.
+function SlideSplit({ cell, reportFigures, iframeRefs, replayState }: {
+  cell: ReportCell
+  reportFigures: ReturnType<typeof useSpyDE>['state']['reportFigures']
+  iframeRefs: ReturnType<typeof useSpyDE>['iframeRefs']
+  replayState: ReturnType<typeof useSpyDE>['replayState']
+}) {
+  const html = React.useMemo(() => renderMarkdown(cell.source ?? ''), [cell.source])
+  const textPane = (
+    <div key="text" className="spyde-md present-md" style={styles.splitText}
+         dangerouslySetInnerHTML={{ __html: html }} />
+  )
+  // The figure side reuses the same figure/photo/pending logic as SlideFigure.
+  const fig = reportFigures.get(cell.id)
+  const figPane = (
+    <div key="fig" style={styles.splitFig}>
+      {fig ? (
+        <div style={styles.splitFigBox}>
+          <SeamlessFigureFrame
+            figId={fig.figId} filePath={fig.filePath} title={fig.title}
+            iframeRefs={iframeRefs} replayState={replayState} />
+        </div>
+      ) : cell.image ? (
+        <img src={cell.image} alt={cell.caption ?? ''} style={styles.figImg} />
+      ) : cell.png ? (
+        <img src={cell.png} alt={cell.caption ?? ''} style={styles.figImg} />
+      ) : (
+        <div style={styles.splitFigBox}><div style={styles.figPending}>rendering…</div></div>
+      )}
+    </div>
+  )
+  const textLeft = (cell.split_layout ?? 'text-left') !== 'text-right'
+  return (
+    <div data-testid={`present-split-${cell.id}`}
+         data-layout={textLeft ? 'text-left' : 'text-right'}
+         style={styles.splitRow}>
+      {textLeft ? [textPane, figPane] : [figPane, textPane]}
+    </div>
+  )
+}
+
 const styles: Record<string, React.CSSProperties> = {
   overlay: {
     position: 'fixed', inset: 0, zIndex: 9500,
     background: '#14141f', color: '#e8e8f0',
     fontSize: 22, lineHeight: 1.6,
+  },
+  splitRow: {
+    display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '2rem',
+    alignItems: 'center', margin: '1rem 0',
+  },
+  splitText: { minWidth: 0, alignSelf: 'center' },
+  splitFig: {
+    minWidth: 0, display: 'flex', flexDirection: 'column',
+    alignItems: 'center', justifyContent: 'center',
+  },
+  splitFigBox: {
+    position: 'relative', width: '100%', height: '48vh',
+    border: '1px solid #313244', borderRadius: 8, overflow: 'hidden',
+    background: '#0e0e16',
   },
   slide: {
     position: 'absolute', inset: 0, display: 'none',
@@ -737,7 +865,9 @@ const styles: Record<string, React.CSSProperties> = {
   iconBtn: {
     background: 'rgba(30,30,46,0.8)', color: '#cdd6f4',
     border: '1px solid #313244', borderRadius: 8,
-    width: 36, height: 36, fontSize: 16, cursor: 'pointer',
+    width: 36, height: 36, cursor: 'pointer',
+    display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+    padding: 0,
   },
   iconBtnActive: {
     background: '#89b4fa', color: '#11111b', borderColor: '#89b4fa',
