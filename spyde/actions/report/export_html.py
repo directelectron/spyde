@@ -92,6 +92,17 @@ figure.report-figure iframe { width: 100%; border: 1px solid #e2e2e6;
   border-radius: 6px; }
 figure.report-figure figcaption { margin-top: 0.6rem; font-size: 0.9rem;
   color: #555; font-style: italic; }
+/* Split block (Wave A): a text side BESIDE a figure/photo side. The two columns
+   are vertically centered against each other; stacks to one column on a narrow
+   viewport so a phone still reads it. The figure column's own figure sizes to its
+   column. */
+.report-article .split-block { display: grid; grid-template-columns: 1fr 1fr;
+  gap: 1.5rem; align-items: center; margin: 1.75rem 0; }
+.report-article .split-col { min-width: 0; }
+.report-article .split-fig figure.report-figure { margin: 0; }
+@media (max-width: 720px) {
+  .report-article .split-block { grid-template-columns: 1fr; }
+}
 @media print {
   body { background: #fff !important; color: #000 !important;
     padding: 0; }
@@ -209,22 +220,18 @@ def _build_interactive_figure_html(mgr, cell: Cell) -> "str | None":
         return None
 
 
-def _render_cell_html(mgr, cell: Cell, assets: dict, *, interactive: bool,
-                      session=None) -> str:
-    """The HTML fragment for ONE cell (markdown or figure), shared by the
-    article body AND the slides shell. A placeholder figure → ``""`` (skipped).
-
-    Figure handling mirrors :func:`_render_body`'s per-cell logic: interactive
-    mode tries the vectors explorer, then the tinted-overlay blender, then the
-    live-figure iframe; anything that can't rebuild falls back to the static
-    ``<img>``. Static mode is always the ``<img>``."""
-    if cell.cell_type == "markdown":
-        return _markdown_cell_html(cell)
-    if cell.cell_type == "image":
-        # A photo — always the inlined <img> (self-contained), in every mode.
+def _render_figure_side_html(mgr, cell: Cell, assets: dict, *, interactive: bool,
+                             session=None) -> str:
+    """The ``<figure>`` fragment for a cell's FIGURE/PHOTO side — the FIGURE-cell
+    rendering logic, factored out so a figure cell AND a split cell's figure side
+    share ONE path. Interactive mode tries the vectors explorer, then the
+    tinted-overlay blender, then the live-figure iframe; anything that can't
+    rebuild falls back to the static ``<img>``. A cell with a photo side (a spec-
+    less split, or an image cell) inlines the raw ``<img>`` in every mode. Returns
+    ``""`` when there are no pixels."""
+    # A photo side (no FigureSpec) — always the inlined <img>, in every mode.
+    if cell.spec is None:
         return _image_cell_html(cell, assets.get(cell.id))
-    if cell.cell_type != "figure" or cell.placeholder:
-        return ""
     html_frag = ""
     if interactive:
         # Drop-time choice: vectors_mode == "image" pins the static
@@ -262,6 +269,50 @@ def _render_cell_html(mgr, cell: Cell, assets: dict, *, interactive: bool,
         # Static path (also the interactive OFFLINE fallback).
         html_frag = _figure_img_html(cell.caption, assets.get(cell.id))
     return html_frag
+
+
+def _split_cell_html(mgr, cell: Cell, assets: dict, *, interactive: bool,
+                     session=None) -> str:
+    """A SPLIT cell (Wave A) → a 2-column ``.split-block`` grid: the TEXT side
+    (its markdown) BESIDE the FIGURE/PHOTO side, ordered by ``split_layout``
+    (``text-left`` → text then figure; ``text-right`` → figure then text). The
+    figure side reuses :func:`_render_figure_side_html` (interactive iframe / baked
+    PNG / photo data URL — all self-contained). An empty figure side just renders
+    the text beside an empty column. Reused by the article/static export AND (via
+    :func:`_render_slide_rows`) the slides deck."""
+    from spyde.actions.report.model import _normalize_split_layout
+    text_html = _markdown_cell_html(cell)
+    fig_html = _render_figure_side_html(mgr, cell, assets, interactive=interactive,
+                                        session=session)
+    layout = _normalize_split_layout(getattr(cell, "split_layout", "text-left"))
+    text_col = f"<div class=\"split-col split-text\">\n{text_html}\n</div>"
+    fig_col = f"<div class=\"split-col split-fig\">\n{fig_html}\n</div>"
+    first, second = ((text_col, fig_col) if layout == "text-left"
+                     else (fig_col, text_col))
+    return f"<div class=\"split-block\">\n{first}\n{second}\n</div>"
+
+
+def _render_cell_html(mgr, cell: Cell, assets: dict, *, interactive: bool,
+                      session=None) -> str:
+    """The HTML fragment for ONE cell (markdown, figure, image, or split), shared
+    by the article body AND the slides shell. A placeholder figure → ``""``
+    (skipped).
+
+    Figure handling mirrors :func:`_render_body`'s per-cell logic (see
+    :func:`_render_figure_side_html`). A SPLIT cell renders as a 2-column
+    ``.split-block`` (text beside figure/photo)."""
+    if cell.cell_type == "markdown":
+        return _markdown_cell_html(cell)
+    if cell.cell_type == "image":
+        # A photo — always the inlined <img> (self-contained), in every mode.
+        return _image_cell_html(cell, assets.get(cell.id))
+    if cell.cell_type == "split":
+        return _split_cell_html(mgr, cell, assets, interactive=interactive,
+                                session=session)
+    if cell.cell_type != "figure" or cell.placeholder:
+        return ""
+    return _render_figure_side_html(mgr, cell, assets, interactive=interactive,
+                                    session=session)
 
 
 def _render_body(mgr, assets: dict, *, interactive: bool, session=None) -> str:
@@ -353,8 +404,17 @@ figure.report-figure figcaption { margin-top: 0.5rem; font-size: 0.85rem;
 .slide-cols figure.report-figure { margin: 0.5rem 0; }
 .slide-cols figure.report-figure img { max-height: 74vh; }
 .slide-cols figure.report-figure iframe { height: 56vh; }
+/* Split block (Wave A) — the self-contained text-beside-figure cell. Same 2-col
+   grid as .slide-cols; the column ORDER is baked by the export (text-left vs
+   text-right) so no CSS reordering is needed. */
+.split-block { display: grid; grid-template-columns: 1fr 1fr; gap: 2.5vw;
+  align-items: center; }
+.split-col { min-width: 0; }
+.split-fig figure.report-figure { margin: 0.5rem 0; }
+.split-fig figure.report-figure img { max-height: 74vh; }
+.split-fig figure.report-figure iframe { height: 56vh; }
 @media (max-width: 720px), (orientation: portrait) {
-  .slide-cols { grid-template-columns: 1fr; }
+  .slide-cols, .split-block { grid-template-columns: 1fr; }
 }
 /* ── presentation polish: TITLE / SECTION slides ──────────────────────────────
    A title slide (data-kind="title") centers a large title block — the whole
@@ -477,6 +537,13 @@ def _render_slide_rows(mgr, group, assets: dict, *, interactive: bool,
     rows: list[str] = []
     for row in slide_columns(group):
         if row["kind"] == "full":
+            fr = _frags([row["cell"]])
+            if fr:
+                rows.append("\n".join(fr))
+        elif row["kind"] == "split":
+            # A SPLIT cell is a self-contained 2-column block — _render_cell_html
+            # already emits the .split-block grid (text beside figure, ordered by
+            # split_layout), so just render the one cell.
             fr = _frags([row["cell"]])
             if fr:
                 rows.append("\n".join(fr))

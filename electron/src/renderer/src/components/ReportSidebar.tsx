@@ -2,30 +2,34 @@
  * ReportSidebar.tsx — the Report Builder dock (third in-flow flex child in the
  * App body, after PlotControlDock).
  *
- * Composes markdown + embedded figures. Header carries the report title
- * (click-to-edit), a dirty dot, New/Open/Save buttons and a rendered↔raw
- * toggle. The body is a scrollable cell list with a trailing "+ Add text cell"
- * button; the whole body is a drop target (ConsoleBar model) accepting figure /
- * window pills → report_add_figure at the drop position.
+ * Composes markdown + embedded figures + split blocks (text beside a figure).
+ * The COMPACT top bar (Wave B redesign) carries only: the document title
+ * (click-to-edit), a dirty dot, a type badge (Report / Presentation), a single
+ * "File ▾" menu (New Report / New Presentation / New from guide ▸ / Open / Save /
+ * Save As Template / Export ▸) and a Present ▶ button shown ONLY for a
+ * presentation. Everything else (Aa text-size, Rich/Raw, Capture, Paste) was
+ * removed to de-clutter — Ctrl+V still pastes an image.
+ *
+ * The body is a scrollable cell list (text / figure / image / SPLIT) with
+ * trailing "+ Add text cell" / "+ Add split block" / "+ Add image" buttons; the
+ * whole body is a drop target (ConsoleBar model) accepting figure / window
+ * pills → report_add_figure at the drop position.
  *
  * Left-edge resize uses the SubWindow Pointer-Capture pattern (NOT react-rnd).
  */
-import React, { useEffect, useRef, useState, useSyncExternalStore } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import { useSpyDE } from '../kernel/SpyDEContext'
 import { FIGURE_DRAG_MIME, WINDOW_DRAG_MIME } from '../kernel/dnd'
-import { reportClipboard } from '../kernel/reportClipboard'
 import { reportFromGuide } from '../kernel/reportFromGuide'
 import { ReportCell } from './ReportCell'
 import { ReportFigureCell } from './ReportFigureCell'
 import { ReportImageCell } from './ReportImageCell'
+import { ReportSplitCell } from './ReportSplitCell'
 import { GUIDES } from '@guides/index'
 
 const MIN_W = 300
 const MAX_W = 800
 const DEFAULT_W = 420
-
-// The rendered-markdown text sizes the header "Aa" button cycles through.
-const MD_SIZES = [11, 13, 15, 17]
 
 const DROP_MIMES = [FIGURE_DRAG_MIME, WINDOW_DRAG_MIME]
 
@@ -104,29 +108,24 @@ export function ReportSidebar() {
   // an open-but-empty body (dangling Save/dirty affordances on a closed report).
   const report = state.report && state.report.open ? state.report : null
   const cells = report?.cells ?? []
+  // The document TYPE ('report' | 'presentation'), absent on an older backend →
+  // 'report'. Drives the type badge, the Present button, and the Slides export.
+  const docType = (report?.type === 'presentation') ? 'presentation' : 'report'
+  const isPresentation = docType === 'presentation'
 
   const [width, setWidth] = useState(DEFAULT_W)
-  const [rawMode, setRawMode] = useState(false)
-  // Rendered-markdown base font size (px), cycled by the "Aa" header button and
-  // applied to the cell list as the `--spyde-md-fs` CSS var (all .spyde-md
-  // sizes are em-relative, so headings/code/tables scale together).
-  const [mdSize, setMdSize] = useState<number>(() => {
-    const v = Number(localStorage.getItem('spyde-report-md-fs'))
-    return MD_SIZES.includes(v) ? v : 13
-  })
-  const cycleMdSize = () => {
-    const next = MD_SIZES[(MD_SIZES.indexOf(mdSize) + 1) % MD_SIZES.length]
-    setMdSize(next)
-    localStorage.setItem('spyde-report-md-fs', String(next))
-  }
   const [titleEditing, setTitleEditing] = useState(false)
   const [titleDraft, setTitleDraft] = useState('')
-  const [confirmNew, setConfirmNew] = useState(false)
-  // "New presentation from guide ▸" submenu open state.
-  const [guideMenuOpen, setGuideMenuOpen] = useState(false)
-  const guideMenuRef = useRef<HTMLDivElement>(null)
-  // Export dropdown open state + a transient success/failure note in the header.
-  const [exportMenuOpen, setExportMenuOpen] = useState(false)
+  // Which pending New (report | presentation) the dirty-confirm bar is guarding
+  // (null → not confirming). New over a dirty document routes through it.
+  const [confirmNew, setConfirmNew] = useState<'report' | 'presentation' | null>(null)
+  // The compact "File ▾" menu open state, and its nested Export / New-from-guide
+  // submenu flags (only one submenu open at a time).
+  const [menuOpen, setMenuOpen] = useState(false)
+  const [guideSubOpen, setGuideSubOpen] = useState(false)
+  const [exportSubOpen, setExportSubOpen] = useState(false)
+  const menuRef = useRef<HTMLDivElement>(null)
+  // A transient export success/failure note shown under the header.
   const [exportNote, setExportNote] = useState<{ ok: boolean; text: string } | null>(null)
   // True while ANY export (HTML/Markdown/PDF) is in flight — disables the
   // Export menu items so a second export can't be triggered mid-flight
@@ -134,7 +133,6 @@ export function ReportSidebar() {
   // Always cleared on success, failure, AND timeout (finally-style).
   const [exporting, setExporting] = useState(false)
   const exportNoteTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const exportMenuRef = useRef<HTMLDivElement>(null)
   // Body drop state: whether a compatible pill is over the body, and the cell
   // index it would insert BEFORE (the between-cell indicator line).
   const [dropIndex, setDropIndex] = useState<number | null>(null)
@@ -198,18 +196,35 @@ export function ReportSidebar() {
   }
 
   // ── Header actions ────────────────────────────────────────────────────────
-  const doNew = () => {
-    if (report?.dirty) { setConfirmNew(true); return }
-    sendAction('report_new', {})
+  // New = a TYPE choice (report | presentation). Over a dirty document it routes
+  // through the confirm bar, remembering WHICH type was requested.
+  const doNew = (type: 'report' | 'presentation') => {
+    setMenuOpen(false)
+    if (report?.dirty) { setConfirmNew(type); return }
+    sendAction('report_new', { type })
   }
-  const confirmNewNow = () => { setConfirmNew(false); sendAction('report_new', {}) }
+  const confirmNewNow = () => {
+    const type = confirmNew ?? 'report'
+    setConfirmNew(null)
+    sendAction('report_new', { type })
+  }
 
   const doOpen = async () => {
+    setMenuOpen(false)
     const path = await window.electron.reportOpenDialog()
     if (path) sendAction('report_open', { path })
   }
 
+  const doSaveAsTemplate = async () => {
+    setMenuOpen(false)
+    const path = await window.electron.reportSaveDialog(
+      (report?.title || 'template').replace(/[^\w.-]+/g, '_'),
+    )
+    if (path) sendAction('report_save_as_template', { path })
+  }
+
   const doSave = async () => {
+    setMenuOpen(false)
     if (report?.path) {
       sendAction('report_save', {})
     } else {
@@ -274,7 +289,7 @@ export function ReportSidebar() {
   }
 
   const exportHtml = (mode: 'static' | 'interactive') => runExport(async () => {
-    setExportMenuOpen(false)
+    closeMenus()
     if (!canExport) return
     const path = await window.electron.reportExportDialog('html', `${titleSlug}.html`)
     if (!path) return
@@ -292,7 +307,7 @@ export function ReportSidebar() {
   })
 
   const exportMarkdownFolder = () => runExport(async () => {
-    setExportMenuOpen(false)
+    closeMenus()
     if (!canExport) return
     const path = await window.electron.reportExportDialog('folder')
     if (!path) return
@@ -306,7 +321,7 @@ export function ReportSidebar() {
   })
 
   const exportPdf = () => runExport(async () => {
-    setExportMenuOpen(false)
+    closeMenus()
     if (!canExport) return
     const pdfPath = await window.electron.reportExportDialog('pdf', `${titleSlug}.pdf`)
     if (!pdfPath) return
@@ -327,7 +342,7 @@ export function ReportSidebar() {
   })
 
   const exportSlides = () => runExport(async () => {
-    setExportMenuOpen(false)
+    closeMenus()
     if (!canExport) return
     const path = await window.electron.reportExportDialog('html', `${titleSlug}-slides.html`)
     if (!path) return
@@ -343,77 +358,40 @@ export function ReportSidebar() {
   // ── Present mode (Phase 6) ────────────────────────────────────────────────
   // Open the full-screen slide deck. PresentGate (inside the provider) listens
   // for this event and mounts PresentMode; the report is the source of slides.
+  // Only offered for a PRESENTATION (a scrolling report has no slides to run).
   const doPresent = () => {
     window.dispatchEvent(new CustomEvent('spyde:report_present', { detail: { resume: false } }))
   }
 
-  // ── Capture to presentation ────────────────────────────────────────────────
-  // One-click: snapshot the ACTIVE (focused) plot window's current live state
-  // (nav position, contrast, colormap, overlays — report_add_figure's existing
-  // _snapshot_plot already captures all of that) straight into the report as a
-  // new slide. No dragging. vectors_mode:'image' skips the viewer-vs-image
-  // prompt (a one-click capture should never stop to ask) — the user can still
-  // switch a captured cell to the interactive viewer later via its own controls.
-  const canCapture = state.activeWindowId != null
-  const doCapture = () => {
-    if (state.activeWindowId == null) return
-    sendAction('report_add_figure', {
-      source_window_id: state.activeWindowId,
-      slide_break: true,
-      vectors_mode: 'image',
-    })
-    showNote(true, 'Captured to presentation')
+  // Close the File menu (and its submenus) — shared by every menu action.
+  const closeMenus = () => {
+    setMenuOpen(false)
+    setGuideSubOpen(false)
+    setExportSubOpen(false)
   }
 
-  // Seed a fresh presentation from a guide (each step → a slide). Opens the guide
-  // submenu; picking a guide dispatches report_new + a report_add_cell per step.
+  // Seed a fresh PRESENTATION from a guide (each step → a slide). Picking a guide
+  // dispatches report_new {type:'presentation'} + a report_add_cell per step.
   const newFromGuide = (guideId: string) => {
-    setGuideMenuOpen(false)
+    closeMenus()
     const g = GUIDES.find(x => x.id === guideId)
     if (g) reportFromGuide(g, sendAction)
   }
 
-  // Close the guide menu on outside click / Escape.
+  // Close the File menu on outside click / Escape.
   useEffect(() => {
-    if (!guideMenuOpen) return
+    if (!menuOpen) return
     const onDown = (e: MouseEvent) => {
-      if (!guideMenuRef.current?.contains(e.target as Node)) setGuideMenuOpen(false)
+      if (!menuRef.current?.contains(e.target as Node)) closeMenus()
     }
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setGuideMenuOpen(false) }
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') closeMenus() }
     window.addEventListener('mousedown', onDown)
     window.addEventListener('keydown', onKey)
     return () => {
       window.removeEventListener('mousedown', onDown)
       window.removeEventListener('keydown', onKey)
     }
-  }, [guideMenuOpen])
-
-  // ── Paste (internal cell clipboard) ───────────────────────────────────────
-  // Reactive enablement: the Paste button is enabled only while the clipboard
-  // holds a cell. useSyncExternalStore subscribes to the module-scope store.
-  const clipboardCell = useSyncExternalStore(
-    reportClipboard.subscribe, reportClipboard.get, reportClipboard.get,
-  )
-  const doPaste = () => {
-    const cell = reportClipboard.get()
-    if (!cell) return
-    sendAction('report_paste_cell', { cell })   // append (no index)
-  }
-
-  // Close the export menu on outside click / Escape.
-  useEffect(() => {
-    if (!exportMenuOpen) return
-    const onDown = (e: MouseEvent) => {
-      if (!exportMenuRef.current?.contains(e.target as Node)) setExportMenuOpen(false)
-    }
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setExportMenuOpen(false) }
-    window.addEventListener('mousedown', onDown)
-    window.addEventListener('keydown', onKey)
-    return () => {
-      window.removeEventListener('mousedown', onDown)
-      window.removeEventListener('keydown', onKey)
-    }
-  }, [exportMenuOpen])
+  }, [menuOpen])
 
   // Clear the note timer on unmount (StrictMode-safe).
   useEffect(() => () => {
@@ -428,6 +406,12 @@ export function ReportSidebar() {
 
   const addTextCell = () =>
     sendAction('report_add_cell', { cell_type: 'markdown', source: '', html: '' })
+
+  // A split block: ONE atomic cell — a text side + an EMPTY figure side (a drop
+  // zone the user fills by dropping a figure window onto it). Works in both a
+  // report and a presentation.
+  const addSplitCell = () =>
+    sendAction('report_add_split_cell', {})
 
   // ── Add an image (photo) cell — shared by drop / paste / browse ────────────
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -584,6 +568,76 @@ export function ReportSidebar() {
     dropBefore: reorderBefore === cellId,
   })
 
+  // The compact File menu — the single collapse point for New / Open / Save /
+  // Export. Shared by the empty-state and open-report chrome so both offer the
+  // same New Report / New Presentation / New from guide / Open entries.
+  const fileMenu = (
+    <div ref={menuRef} style={styles.menuWrap}>
+      <button
+        data-testid="report-menu-toggle"
+        style={styles.hdrBtn}
+        title="File menu"
+        aria-haspopup="menu"
+        aria-expanded={menuOpen}
+        onClick={() => { setMenuOpen(v => !v); setGuideSubOpen(false); setExportSubOpen(false) }}
+      >File ▾</button>
+      {menuOpen && (
+        <div style={styles.menu} data-testid="report-menu" role="menu">
+          <MenuItem testid="menu-new-report" label="New Report"
+            onClick={() => doNew('report')} />
+          <MenuItem testid="menu-new-presentation" label="New Presentation"
+            onClick={() => doNew('presentation')} />
+          {/* New from guide ▸ — seeds a PRESENTATION, one slide per step. Click
+              expands the nested list INLINE (no hover submenu — robust + never
+              clips off-screen). */}
+          <MenuItem testid="menu-new-from-guide"
+            label={guideSubOpen ? 'New from guide ▾' : 'New from guide ▸'}
+            onClick={() => { setGuideSubOpen(v => !v); setExportSubOpen(false) }} />
+          {guideSubOpen && (
+            <div style={styles.submenuInline} data-testid="menu-guide-submenu" role="menu">
+              {GUIDES.map(g => (
+                <MenuItem key={g.id} testid={`from-guide-${g.id}`} label={g.title}
+                  onClick={() => newFromGuide(g.id)} />
+              ))}
+            </div>
+          )}
+          <div style={styles.menuSep} />
+          <MenuItem testid="report-open" label="Open…" onClick={doOpen} />
+          {report != null && (
+            <>
+              <MenuItem testid="report-save" label="Save" onClick={doSave} />
+              <MenuItem testid="report-save-template" label="Save As Template"
+                onClick={doSaveAsTemplate} />
+              <div style={styles.menuSep} />
+              {/* Export ▸ — expands INLINE on click. Slides deck is
+                  presentation-only. */}
+              <MenuItem testid="report-export-toggle"
+                disabled={!canExport || exporting}
+                label={exporting ? 'Exporting… ▸' : (exportSubOpen ? 'Export ▾' : 'Export ▸')}
+                onClick={() => { if (canExport && !exporting) { setExportSubOpen(v => !v); setGuideSubOpen(false) } }} />
+              {exportSubOpen && canExport && (
+                <div style={styles.submenuInline} data-testid="report-export-menu" role="menu">
+                  <MenuItem testid="export-html-interactive" label="Interactive HTML"
+                    disabled={exporting} onClick={() => exportHtml('interactive')} />
+                  <MenuItem testid="export-html-static" label="Static HTML"
+                    disabled={exporting} onClick={() => exportHtml('static')} />
+                  {isPresentation && (
+                    <MenuItem testid="export-slides" label="Slides deck (HTML)"
+                      disabled={exporting} onClick={exportSlides} />
+                  )}
+                  <MenuItem testid="export-pdf" label="PDF"
+                    disabled={exporting} onClick={exportPdf} />
+                  <MenuItem testid="export-md-folder" label="Markdown folder"
+                    disabled={exporting} onClick={exportMarkdownFolder} />
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  )
+
   if (report == null) {
     return (
       <div style={{ ...styles.dock, width }} data-testid="report-sidebar">
@@ -591,28 +645,12 @@ export function ReportSidebar() {
         <div style={styles.header}>
           <span style={styles.headerTitle}>Report</span>
           <div style={{ flex: 1 }} />
-          <button data-testid="report-new" style={styles.hdrBtn} title="New report" onClick={doNew}>New</button>
-          <button data-testid="report-open" style={styles.hdrBtn} title="Open report" onClick={doOpen}>Open</button>
-          <div ref={guideMenuRef} style={styles.exportWrap}>
-            <button
-              data-testid="report-from-guide-toggle"
-              style={styles.hdrBtn}
-              title="Seed a presentation from a guided walkthrough"
-              onClick={() => setGuideMenuOpen(v => !v)}
-            >From guide ▾</button>
-            {guideMenuOpen && (
-              <div style={styles.exportMenu} data-testid="report-from-guide-menu" role="menu">
-                {GUIDES.map(g => (
-                  <ExportItem key={g.id} testid={`from-guide-${g.id}`} label={g.title}
-                    onClick={() => newFromGuide(g.id)} />
-                ))}
-              </div>
-            )}
-          </div>
+          {fileMenu}
         </div>
         <div style={styles.emptyState} data-testid="report-empty">
-          No report open. Click <b>New</b> to start, <b>Open</b> an existing
-          .spyde-report, or seed a slide deck <b>From guide</b>.
+          No document open. Open the <b>File ▾</b> menu to start a
+          <b> New Report</b>, a <b>New Presentation</b>, seed a deck
+          {' '}<b>from a guide</b>, or <b>Open</b> an existing .spyde-report.
         </div>
       </div>
     )
@@ -653,69 +691,25 @@ export function ReportSidebar() {
         {report.template && (
           <span style={styles.templateBadge} title="Template">tpl</span>
         )}
+        {/* Type badge — Report / Presentation (replaces the old "tpl"-only slot). */}
+        <span
+          data-testid="report-type-badge"
+          data-type={docType}
+          style={isPresentation ? styles.typeBadgePresentation : styles.typeBadgeReport}
+          title={isPresentation ? 'Presentation (slide deck)' : 'Report (scrolling article)'}
+        >{isPresentation ? 'Presentation' : 'Report'}</span>
         <div style={{ flex: 1 }} />
-        <button
-          data-testid="report-md-size"
-          style={styles.hdrBtn}
-          title={`Text size: ${mdSize}px — click to cycle`}
-          onClick={cycleMdSize}
-        >Aa</button>
-        <button
-          data-testid="report-raw-toggle"
-          style={rawMode ? styles.hdrBtnActive : styles.hdrBtn}
-          title={rawMode ? 'Show rendered' : 'Show raw markdown'}
-          onClick={() => setRawMode(v => !v)}
-        >{rawMode ? 'Raw' : 'Rich'}</button>
-        <button data-testid="report-new" style={styles.hdrBtn} title="New report" onClick={doNew}>New</button>
-        <button data-testid="report-open" style={styles.hdrBtn} title="Open report" onClick={doOpen}>Open</button>
-        <button
-          data-testid="report-capture"
-          style={canCapture ? styles.hdrBtn : styles.hdrBtnDisabled}
-          title={canCapture
-            ? 'Capture the active plot window’s current view as a new slide'
-            : 'Focus a plot window to capture it'}
-          disabled={!canCapture}
-          onClick={doCapture}
-        >📷 Capture</button>
-        <button
-          data-testid="report-paste"
-          style={clipboardCell ? styles.hdrBtn : styles.hdrBtnDisabled}
-          title={clipboardCell ? 'Paste copied cell' : 'Nothing copied'}
-          disabled={!clipboardCell}
-          onClick={doPaste}
-        >Paste</button>
-        <button data-testid="report-save" style={styles.hdrBtnPrimary} title="Save report" onClick={doSave}>Save</button>
-        <button
-          data-testid="report-present"
-          style={canExport ? styles.hdrBtn : styles.hdrBtnDisabled}
-          title={canExport ? 'Present as slides' : 'Add a cell to present'}
-          disabled={!canExport}
-          onClick={doPresent}
-        >Present ▶</button>
-
-        {/* Export dropdown (dock palette, closes on outside click / Escape). */}
-        <div ref={exportMenuRef} style={styles.exportWrap}>
+        {/* Present ▶ — presentations only (a scrolling report has no slides). */}
+        {isPresentation && (
           <button
-            data-testid="report-export-toggle"
-            style={canExport && !exporting ? styles.hdrBtn : styles.hdrBtnDisabled}
-            title={exporting ? 'Export in progress…' : canExport ? 'Export report' : 'Add a cell to export'}
-            disabled={!canExport || exporting}
-            onClick={() => setExportMenuOpen(v => !v)}
-          >{exporting ? 'Exporting…' : 'Export ▾'}</button>
-          {exportMenuOpen && canExport && (
-            <div style={styles.exportMenu} data-testid="report-export-menu" role="menu">
-              <ExportItem testid="export-html-interactive" label="Interactive HTML" disabled={exporting}
-                onClick={() => exportHtml('interactive')} />
-              <ExportItem testid="export-html-static" label="Static HTML" disabled={exporting}
-                onClick={() => exportHtml('static')} />
-              <ExportItem testid="export-slides" label="Slides deck (HTML)" disabled={exporting}
-                onClick={exportSlides} />
-              <ExportItem testid="export-pdf" label="PDF" disabled={exporting} onClick={exportPdf} />
-              <ExportItem testid="export-md-folder" label="Markdown folder" disabled={exporting}
-                onClick={exportMarkdownFolder} />
-            </div>
-          )}
-        </div>
+            data-testid="report-present"
+            style={canExport ? styles.hdrBtnPrimary : styles.hdrBtnDisabled}
+            title={canExport ? 'Present as slides' : 'Add a slide to present'}
+            disabled={!canExport}
+            onClick={doPresent}
+          >Present ▶</button>
+        )}
+        {fileMenu}
       </div>
 
       {/* Transient export success/failure note. */}
@@ -726,13 +720,15 @@ export function ReportSidebar() {
         >{exportNote.text}</div>
       )}
 
-      {/* Inline confirm for New over a dirty report. */}
+      {/* Inline confirm for New over a dirty document. */}
       {confirmNew && (
         <div style={styles.confirmBar} data-testid="report-confirm-new">
-          <span style={styles.confirmText}>Discard unsaved changes?</span>
+          <span style={styles.confirmText}>
+            Discard unsaved changes and start a new {confirmNew}?
+          </span>
           <div style={{ flex: 1 }} />
           <button style={styles.confirmDiscard} onClick={confirmNewNow} data-testid="report-confirm-discard">Discard</button>
-          <button style={styles.hdrBtn} onClick={() => setConfirmNew(false)} data-testid="report-confirm-cancel">Cancel</button>
+          <button style={styles.hdrBtn} onClick={() => setConfirmNew(null)} data-testid="report-confirm-cancel">Cancel</button>
         </div>
       )}
 
@@ -766,26 +762,22 @@ export function ReportSidebar() {
         </div>
       )}
 
-      {/* Body: scrollable cell list + trailing add button. */}
+      {/* Body: scrollable cell list + trailing add buttons. */}
       <div
         ref={bodyRef}
         data-testid="report-body"
-        style={{ ...styles.body, ['--spyde-md-fs' as string]: `${mdSize}px` } as React.CSSProperties}
+        style={styles.body}
         onDragOver={onBodyDragOver}
         onDrop={onBodyDrop}
         onDragLeave={onBodyDragLeave}
       >
         {cells.length === 0 && (
           <div style={styles.dropHint} data-testid="report-drop-hint">
-            Drag a figure window here, or add a text cell below.
+            Drag a figure window here, or add a text / split cell below.
           </div>
         )}
 
         {cells.map((cell, i) => {
-          // A cell STARTS a slide when it's the first cell OR carries a
-          // slide_break — only there is the per-slide "Title slide" toggle
-          // offered (the whole slide's kind lives on its first cell).
-          const slideStart = i === 0 || !!cell.slide_break
           return (
           <div key={cell.id} data-report-cell="1" style={{ position: 'relative' }}>
             {dropIndex === i && <div style={styles.insertLine} data-testid={`report-insert-${i}`} />}
@@ -793,7 +785,6 @@ export function ReportSidebar() {
               ? <ReportFigureCell
                   cell={cell}
                   index={i}
-                  slideStart={slideStart}
                   onRemove={() => sendAction('report_remove_cell', { cell_id: cell.id })}
                   dragProps={makeDragProps(cell.id, i)}
                   reorderActive={dragCell != null}
@@ -802,15 +793,20 @@ export function ReportSidebar() {
               ? <ReportImageCell
                   cell={cell}
                   index={i}
-                  slideStart={slideStart}
                   onRemove={() => sendAction('report_remove_cell', { cell_id: cell.id })}
                   dragProps={makeDragProps(cell.id, i)}
+                />
+              : cell.cell_type === 'split'
+              ? <ReportSplitCell
+                  cell={cell}
+                  index={i}
+                  onRemove={() => sendAction('report_remove_cell', { cell_id: cell.id })}
+                  dragProps={makeDragProps(cell.id, i)}
+                  reorderActive={dragCell != null}
                 />
               : <ReportCell
                   cell={cell}
                   index={i}
-                  slideStart={slideStart}
-                  rawMode={rawMode}
                   onUpdate={(source, html) => sendAction('report_update_cell', { cell_id: cell.id, source, html })}
                   onRemove={() => sendAction('report_remove_cell', { cell_id: cell.id })}
                   dragProps={makeDragProps(cell.id, i)}
@@ -829,6 +825,12 @@ export function ReportSidebar() {
             style={styles.addBtn}
             onClick={addTextCell}
           >+ Add text cell</button>
+          <button
+            data-testid="report-add-split"
+            style={styles.addBtn}
+            title="Add a split block — text on one side, a figure/photo on the other"
+            onClick={addSplitCell}
+          >+ Add split block</button>
           <button
             data-testid="report-add-image"
             style={styles.addBtn}
@@ -849,8 +851,8 @@ export function ReportSidebar() {
   )
 }
 
-// One Export dropdown row (hover-highlight, dock-palette style).
-function ExportItem({ testid, label, onClick, disabled }: {
+// One File-menu / submenu row (hover-highlight, dock-palette style).
+function MenuItem({ testid, label, onClick, disabled }: {
   testid: string; label: string; onClick: () => void; disabled?: boolean
 }) {
   return (
@@ -858,7 +860,7 @@ function ExportItem({ testid, label, onClick, disabled }: {
       data-testid={testid}
       role="menuitem"
       disabled={disabled}
-      style={disabled ? { ...styles.exportItem, color: '#585b70', cursor: 'default' } : styles.exportItem}
+      style={disabled ? { ...styles.menuItem, color: '#585b70', cursor: 'default' } : styles.menuItem}
       onMouseEnter={(e) => { if (!disabled) e.currentTarget.style.background = '#313244' }}
       onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent' }}
       onClick={disabled ? undefined : onClick}
@@ -924,6 +926,16 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: 9, fontWeight: 700, color: '#a6adc8',
     background: '#313244', borderRadius: 4, padding: '1px 4px',
   },
+  typeBadgeReport: {
+    fontSize: 9, fontWeight: 700, letterSpacing: 0.3, color: '#a6adc8',
+    background: '#313244', border: '1px solid #45475a',
+    borderRadius: 4, padding: '1px 6px', whiteSpace: 'nowrap',
+  },
+  typeBadgePresentation: {
+    fontSize: 9, fontWeight: 700, letterSpacing: 0.3, color: '#11111b',
+    background: '#89b4fa', border: '1px solid #89b4fa',
+    borderRadius: 4, padding: '1px 6px', whiteSpace: 'nowrap',
+  },
   hdrBtn: {
     background: '#1e1e2e', color: '#cdd6f4', border: '1px solid #313244',
     borderRadius: 5, padding: '3px 8px', fontSize: 11, cursor: 'pointer',
@@ -940,16 +952,25 @@ const styles: Record<string, React.CSSProperties> = {
     background: '#1e1e2e', color: '#585b70', border: '1px solid #313244',
     borderRadius: 5, padding: '3px 8px', fontSize: 11, cursor: 'default',
   },
-  exportWrap: { position: 'relative', display: 'inline-flex' },
-  exportMenu: {
+  // Compact "File ▾" menu (single collapse point for New/Open/Save/Export).
+  menuWrap: { position: 'relative', display: 'inline-flex' },
+  menu: {
     position: 'absolute', top: '100%', right: 0, marginTop: 4, zIndex: 20,
-    minWidth: 150, background: '#1e1e2e', border: '1px solid #45475a',
-    borderRadius: 6, padding: 4, display: 'flex', flexDirection: 'column', gap: 2,
+    minWidth: 172, background: '#1e1e2e', border: '1px solid #45475a',
+    borderRadius: 6, padding: 4, display: 'flex', flexDirection: 'column', gap: 1,
     boxShadow: '0 6px 22px rgba(0,0,0,0.5)',
   },
-  exportItem: {
+  menuItem: {
     background: 'none', border: 'none', color: '#cdd6f4', cursor: 'pointer',
     textAlign: 'left', padding: '5px 8px', fontSize: 11.5, borderRadius: 4,
+    width: '100%', whiteSpace: 'nowrap',
+  },
+  menuSep: { height: 1, background: '#313244', margin: '3px 2px' },
+  // A nested submenu expanded INLINE below its parent row (indented, subtle
+  // left rule) — no absolute positioning, so it never clips off-screen.
+  submenuInline: {
+    display: 'flex', flexDirection: 'column', gap: 1,
+    marginLeft: 8, paddingLeft: 4, borderLeft: '2px solid #313244',
   },
   exportNote: {
     padding: '4px 10px', fontSize: 11, fontWeight: 600,

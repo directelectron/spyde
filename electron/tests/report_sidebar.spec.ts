@@ -122,9 +122,10 @@ test('1) toggle the report sidebar open', async () => {
 
 test('2) add a markdown cell, edit it, render H1 + bold', async () => {
   const { page } = ctx
-  // New report (the empty sidebar shows New/Open only; create a doc).
-  const newBtn = page.getByTestId('report-new')
-  await newBtn.click()
+  // New report — the compact File menu (Wave B) → "New Report".
+  await page.getByTestId('report-menu-toggle').click()
+  await expect(page.getByTestId('report-menu')).toBeVisible()
+  await page.getByTestId('menu-new-report').click()
   await expect(page.getByTestId('report-body')).toBeVisible()
 
   await page.getByTestId('report-add-text').click()
@@ -232,15 +233,17 @@ test('4) edit the caption', async () => {
   ctx.assertNoJsErrors()
 })
 
-test('5) toggle raw mode (source textareas) and back', async () => {
+test('5) double-click a markdown cell opens the editor, blur re-renders', async () => {
   const { page } = ctx
-  await page.getByTestId('report-raw-toggle').click()
-  // In raw mode every markdown cell shows a textarea.
-  await expect(page.locator('[data-testid^="report-cell-textarea-"]').first())
-    .toBeVisible()
-  await page.screenshot({ path: join(SHOTS, '05-raw-mode.png') })
-  // Toggle back to rich.
-  await page.getByTestId('report-raw-toggle').click()
+  // Wave B removed the Rich/Raw toggle; double-click is the sole edit affordance.
+  const rendered = page.locator('[data-testid^="report-cell-rendered-"]').first()
+  await expect(rendered).toBeVisible()
+  await rendered.dblclick()
+  const ta = page.locator('[data-testid^="report-cell-textarea-"]').first()
+  await expect(ta).toBeVisible()
+  await page.screenshot({ path: join(SHOTS, '05-edit-mode.png') })
+  // Blur (Escape reverts to rendered) closes the editor back to the rendered view.
+  await ta.press('Escape')
   await expect(page.locator('[data-testid^="report-cell-rendered-"]').first())
     .toBeVisible()
   ctx.assertNoJsErrors()

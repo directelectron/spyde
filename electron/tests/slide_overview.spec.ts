@@ -66,7 +66,7 @@ test('1) build a 3-slide deck with distinct titles', async () => {
   await page.getByTestId('toggle-report').click()
   await expect(page.getByTestId('report-sidebar')).toBeVisible()
 
-  await backendAction(page, 'report_new', {})
+  await backendAction(page, 'report_new', { type: 'presentation' })
   await backendAction(page, 'report_set_title', { title: 'Overview Demo Deck' })
   // Slide 1 — a title slide "Alpha".
   await backendAction(page, 'report_add_cell', {

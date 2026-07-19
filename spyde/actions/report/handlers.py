@@ -182,9 +182,11 @@ class ReportManager:
     def open(self) -> bool:
         return self.doc is not None
 
-    def new(self, template: bool = False) -> None:
+    def new(self, template: bool = False, doc_type: str = "report") -> None:
+        from spyde.actions.report.model import _normalize_doc_type
         self.close_windows()
-        self.doc = ReportDoc(template=template)
+        self.doc = ReportDoc(template=template,
+                             doc_type=_normalize_doc_type(doc_type))
         self.path = None
         self.dirty = False
         self._snapshots.clear()
@@ -261,19 +263,26 @@ class ReportManager:
         """The authoritative ``report_state`` message body."""
         if self.doc is None:
             return {"open": False, "path": None, "title": "", "template": False,
-                    "dirty": False, "cells": []}
+                    "type": "report", "dirty": False, "cells": []}
         cells = []
         nav_dims_cache: dict = {}
         for c in self.doc.cells:
             entry = {
                 "id": c.id,
                 "cell_type": c.cell_type,
-                "source": c.source if c.cell_type == "markdown" else None,
+                # A split cell carries text in ``source`` (like a markdown cell) —
+                # so its text side ships here too.
+                "source": (c.source
+                           if c.cell_type in ("markdown", "split") else None),
                 "caption": (c.caption
-                            if c.cell_type in ("figure", "image") else None),
+                            if c.cell_type in ("figure", "image", "split")
+                            else None),
                 "placeholder": bool(c.placeholder),
-                "fig_id": c.id if c.cell_type == "figure" else None,
-                "data_offline": bool(c.cell_type == "figure" and c.id in self._offline),
+                # The split cell's figure side reuses the figure fig_id/offline
+                # plumbing (its asset is keyed by the cell id, like a figure).
+                "fig_id": (c.id if c.cell_type in ("figure", "split") else None),
+                "data_offline": bool(
+                    c.cell_type in ("figure", "split") and c.id in self._offline),
                 # Present-mode fields (Phase 6): slide grouping + go-live handle
                 # + 2-column layout ("" | "left" | "right") + per-slide kind/style
                 # (title/section slide + background preset — carried on the
@@ -289,11 +298,25 @@ class ReportManager:
                 # presenter view, never to the audience.
                 "notes": str(getattr(c, "notes", "") or ""),
             }
-            # An IMAGE (photo) cell ships its bytes as a data URL so the renderer
-            # can draw the <img> with no round trip (mirrors the offline-figure
-            # PNG emission below). The extension picks the MIME so jpg/gif/webp
-            # render correctly.
-            if c.cell_type == "image":
+            # Wave A — SPLIT cell: ship which side the TEXT sits on so the renderer
+            # (Wave B) builds the 2-pane block correctly. Its text side rides in
+            # ``source`` (above); its figure side rides in ``figure`` / ``image``
+            # (below, shared with figure/image cells).
+            if c.cell_type == "split":
+                from spyde.actions.report.model import _normalize_split_layout
+                entry["split_layout"] = _normalize_split_layout(
+                    getattr(c, "split_layout", "text-left"))
+                # A split cell whose figure side is EMPTY (no spec, no image yet)
+                # is a drop zone — surface that so the renderer can draw it.
+                entry["split_empty"] = bool(
+                    c.spec is None and not getattr(c, "image_ext", ""))
+            # An IMAGE (photo) cell — OR a split cell whose figure side is a photo —
+            # ships its bytes as a data URL so the renderer can draw the <img> with
+            # no round trip (mirrors the offline-figure PNG emission below). The
+            # extension picks the MIME so jpg/gif/webp render correctly.
+            if (c.cell_type == "image"
+                    or (c.cell_type == "split" and c.spec is None
+                        and getattr(c, "image_ext", ""))):
                 img = self._images.get(c.id)
                 if img is not None:
                     ext = (c.image_ext or "png").lower()
@@ -301,10 +324,11 @@ class ReportManager:
                     entry["image_ext"] = ext
                     entry["image"] = (f"data:image/{mime};base64,"
                                       + base64.b64encode(img).decode("ascii"))
-            # For a figure cell, ship the PIXEL-FREE FigureSpec recipe (as a plain
-            # dict) so the renderer's edit toolbar can list panels / layers /
-            # annotations. It carries NO image bytes — only the YAML-shaped structure.
-            if c.cell_type == "figure" and c.spec is not None:
+            # For a figure cell — OR a split cell whose figure side is a figure —
+            # ship the PIXEL-FREE FigureSpec recipe (as a plain dict) so the
+            # renderer's edit toolbar can list panels / layers / annotations. It
+            # carries NO image bytes — only the YAML-shaped structure.
+            if c.cell_type in ("figure", "split") and c.spec is not None:
                 entry["figure"] = c.spec.to_dict()
                 # Stamp nav_dims onto the SHIPPED panel dicts (ephemeral —
                 # to_dict() built fresh dicts, so the spec is never touched).
@@ -333,6 +357,8 @@ class ReportManager:
             "path": self.path,
             "title": self.doc.title,
             "template": bool(self.doc.template),
+            # Wave A — the document TYPE ("report" | "presentation" | "movie").
+            "type": str(getattr(self.doc, "doc_type", "report") or "report"),
             "dirty": bool(self.dirty),
             "cells": cells,
         }
@@ -736,7 +762,15 @@ class ReportManager:
                 if data:
                     assets[c.id] = data
                 continue
-            if c.cell_type != "figure" or c.placeholder:
+            # A SPLIT cell whose figure side is a PHOTO (spec-less, image_ext): the
+            # held raw bytes, exactly like an image cell. A split whose figure side
+            # is a FIGURE (has a spec) falls through to the figure bake path below.
+            if c.cell_type == "split" and c.spec is None:
+                data = self._images.get(c.id)
+                if data:
+                    assets[c.id] = data
+                continue
+            if c.cell_type not in ("figure", "split") or c.placeholder:
                 continue
             png = harvested.get(c.id)
             # Treat an EMPTY harvest (b"" from a "data:image/png;base64," data URL
@@ -1771,7 +1805,8 @@ def _resolve_source_plot(session, source_window_id):
 
 def report_new(session, plot, payload) -> None:
     mgr = _manager(session)
-    mgr.new(template=bool(payload.get("template", False)))
+    mgr.new(template=bool(payload.get("template", False)),
+            doc_type=str(payload.get("type", "report") or "report"))
     mgr.emit_state()
 
 
@@ -1795,14 +1830,24 @@ def report_open(session, plot, payload) -> None:
     # Image (photo) cells re-hydrate their raw bytes from the same assets dict
     # (read_report returns image bytes keyed by cell id). Held so state() can emit
     # the data URL and a re-save round-trips them.
-    mgr._images = {c.id: assets[c.id] for c in doc.cells
-                   if c.cell_type == "image" and c.id in assets}
+    # Image (photo) cells AND split cells whose figure side is a PHOTO (a spec-less
+    # split with an image_ext) re-hydrate their raw bytes from the same assets dict.
+    mgr._images = {
+        c.id: assets[c.id] for c in doc.cells
+        if c.id in assets and (
+            c.cell_type == "image"
+            or (c.cell_type == "split" and c.spec is None and c.image_ext))
+    }
     mgr._offline.clear()
     # Rebind each figure cell: resolve EVERY layer of EVERY panel against open trees
     # / files. The cell rebinds live only when ALL its layers resolve; if any layer's
     # source is offline the whole cell is offline (renderer shows the baked PNG).
     for c in doc.cells:
-        if c.cell_type != "figure" or c.placeholder or c.spec is None:
+        # A figure cell OR a SPLIT cell whose figure side is a figure (has a spec)
+        # rebinds its live pixels the same way; a placeholder / spec-less cell (an
+        # empty split figure side, or a split whose figure side is a photo) is
+        # skipped (the photo side re-hydrates via mgr._images above).
+        if c.cell_type not in ("figure", "split") or c.placeholder or c.spec is None:
             continue
         all_resolved = bool(c.spec.panels)
         for panel in c.spec.panels:
@@ -1847,8 +1892,11 @@ def harvest_snapshots(session, mgr: ReportManager, finish) -> None:
     ``finish`` is ``finish(harvested: dict[cell_id -> png bytes]) -> None``. When
     there are no mounted figures OR no event loop (headless / tests), ``finish``
     is called synchronously with an empty dict — the write happens NOW."""
+    # Figure cells AND split cells whose figure side is a live figure (has a spec)
+    # both need a fresh PNG harvest before a save/export.
     fig_cells = [c for c in mgr.doc.cells
-                 if c.cell_type == "figure" and not c.placeholder]
+                 if c.cell_type in ("figure", "split")
+                 and not c.placeholder and c.spec is not None]
     live_cells = [c for c in fig_cells if c.id in mgr._window_by_cell]
 
     if not live_cells or getattr(session, "_main_loop", None) is None:
@@ -1957,10 +2005,12 @@ def report_save_as_template(session, plot, payload) -> None:
         ipc.emit_error("report_save_as_template: no path.")
         return
     # A template keeps the cell structure but ships placeholders (no baked
-    # pixels), so filling it later starts from an empty drop zone.
+    # pixels), so filling it later starts from an empty drop zone. It preserves
+    # the document type (a presentation template stays a presentation).
     assets: dict[str, bytes] = {}
     template_doc = ReportDoc(
         title=mgr.doc.title, template=True, version=mgr.doc.version,
+        doc_type=getattr(mgr.doc, "doc_type", "report"),
         created=mgr.doc.created,
     )
     for c in mgr.doc.cells:
@@ -1970,6 +2020,13 @@ def report_save_as_template(session, plot, payload) -> None:
         elif c.cell_type == "figure":
             template_doc.cells.append(Cell(id=c.id, cell_type="figure",
                                            caption=c.caption, placeholder=True))
+        elif c.cell_type == "split":
+            # Keep the split's TEXT side + layout; EMPTY the figure side (a drop
+            # zone) — a template split is filled later.
+            template_doc.cells.append(Cell(
+                id=c.id, cell_type="split", source=c.source,
+                caption=c.caption,
+                split_layout=getattr(c, "split_layout", "text-left")))
     try:
         write_report(template_doc, path, assets=assets)
     except Exception as e:
@@ -2061,12 +2118,115 @@ def report_add_image_cell(session, plot, payload) -> None:
     mgr.emit_state()
 
 
+def report_add_split_cell(session, plot, payload) -> None:
+    """Add a SPLIT cell (Wave A — the split-block primitive): ONE atomic block with
+    a TEXT side + a (initially empty) FIGURE/PHOTO side, side by side.
+
+    ``payload``: ``{index?, slide_break?, source?, caption?, layout?}``. The figure
+    side starts EMPTY (a drop zone) — Wave B wires a figure/photo drop onto it via
+    :func:`report_set_split_figure` (or ``report_add_figure`` targeting the split
+    cell's slot). ``layout`` is ``"text-left"`` / ``"text-right"`` (normalised;
+    default ``text-left``). Mirrors :func:`report_add_cell` for the seed-time
+    Present-mode fields so a seeded deck can create it already-marked."""
+    from spyde.actions.report.model import _normalize_split_layout
+    mgr = _ensure_open(session)
+    cell = Cell(id=new_cell_id(), cell_type="split",
+                source=str(payload.get("source", "") or ""),
+                caption=str(payload.get("caption", "") or ""),
+                split_layout=_normalize_split_layout(payload.get("layout")))
+    if payload.get("slide_break") is not None:
+        cell.slide_break = bool(payload.get("slide_break"))
+    if payload.get("column") is not None:
+        from spyde.actions.report.model import _normalize_column
+        cell.column = _normalize_column(payload.get("column"))
+    _insert_cell(mgr.doc, cell, payload.get("index"))
+    mgr.dirty = True
+    mgr.emit_state()
+
+
+def report_set_split_layout(session, plot, payload) -> None:
+    """Set a SPLIT cell's ``split_layout`` — ``"text-left"`` (text on the left,
+    figure on the right — the default) or ``"text-right"`` (mirror). Any other
+    value normalises to ``"text-left"``.
+
+    ``{cell_id, layout}``. A non-split / unknown cell is a no-op (no crash)."""
+    from spyde.actions.report.model import _normalize_split_layout
+    mgr = _manager(session)
+    if not mgr.open:
+        return
+    cell = mgr.doc.cell_by_id(payload.get("cell_id"))
+    if cell is None or cell.cell_type != "split":
+        return
+    cell.split_layout = _normalize_split_layout(payload.get("layout"))
+    mgr.dirty = True
+    mgr.emit_state()
+
+
+def report_set_split_figure(session, plot, payload) -> None:
+    """Snapshot a source window into a SPLIT cell's FIGURE SIDE — the same
+    ``_snapshot_plot`` path :func:`report_add_figure` uses, but it fills an
+    EXISTING split cell's figure slot (keyed by the split cell id) instead of
+    creating a new figure cell.
+
+    ``{cell_id, source_window_id?, caption?}``. The split cell's TEXT side
+    (``source``) and ``split_layout`` are untouched. A non-split / unknown cell,
+    or a source window with no paintable image, is an error/no-op. (The vectors
+    viewer-vs-image prompt of ``report_add_figure`` is skipped here — a split cell
+    always takes the static/figure snapshot; a vectors explorer is a full-width
+    concept, not a split side.)"""
+    mgr = _manager(session)
+    if not mgr.open:
+        ipc.emit_error("report_set_split_figure: no open report.")
+        return
+    cell = mgr.doc.cell_by_id(payload.get("cell_id"))
+    if cell is None or cell.cell_type != "split":
+        ipc.emit_error("report_set_split_figure: not a split cell.")
+        return
+    src = _resolve_source_plot(session, payload.get("source_window_id"))
+    if src is None:
+        ipc.emit_error("report_set_split_figure: source window not found.")
+        return
+    snap = _snapshot_plot(src)
+    if snap is None:
+        ipc.emit_error(
+            "report_set_split_figure: source window has no image to snapshot.")
+        return
+    spec, snap_map = snap
+    # A split cell's figure side is a static/figure snapshot (never the vectors
+    # explorer), so leave vectors_mode empty.
+    spec.vectors_mode = ""
+    cell.spec = spec
+    # Filling with a figure clears any prior PHOTO side on the same cell.
+    cell.image_ext = ""
+    mgr._images.pop(cell.id, None)
+    caption = str(payload.get("caption", "") or "")
+    if caption:
+        cell.caption = caption
+    mgr._snapshots[cell.id] = dict(snap_map)
+    mgr._baked.pop(cell.id, None)
+    mgr._offline.discard(cell.id)
+    mgr.build_figure_window(cell)
+    mgr.dirty = True
+    mgr.emit_state()
+
+
 def report_update_cell(session, plot, payload) -> None:
     mgr = _manager(session)
     if not mgr.open:
         return
     cell = mgr.doc.cell_by_id(payload.get("cell_id"))
     if cell is None:
+        return
+    # A SPLIT cell edits its TEXT side (``source``) through this path — like a
+    # markdown cell (its caption goes through report_set_caption; its figure side
+    # through report_set_split_figure).
+    if cell.cell_type == "split":
+        if "source" in payload:
+            cell.source = str(payload.get("source", "") or "")
+        if "html" in payload:
+            cell.html = str(payload.get("html") or "")
+        mgr.dirty = True
+        mgr.emit_state()
         return
     # An IMAGE (photo) cell edits only its caption through this path (its bytes are
     # immutable once added). Mirror report_set_caption so either wire works.
@@ -2097,8 +2257,10 @@ def report_remove_cell(session, plot, payload) -> None:
     cell = mgr.doc.cell_by_id(payload.get("cell_id"))
     if cell is None:
         return
-    # Tear down the figure window (if any) so nothing leaks.
-    if cell.cell_type == "figure":
+    # Tear down the figure window (if any) so nothing leaks. A SPLIT cell holds a
+    # figure side (same figure-window resources) AND possibly a held photo, so it
+    # gets BOTH cleanups.
+    if cell.cell_type in ("figure", "split"):
         wid = mgr._window_by_cell.get(cell.id)
         if wid is not None:
             mgr._forget(wid)
@@ -2109,6 +2271,7 @@ def report_remove_cell(session, plot, payload) -> None:
         mgr._edit_wiring.pop(cell.id, None)
         mgr._ann_widgets.pop(cell.id, None)
         mgr._selected.pop(cell.id, None)
+        mgr._images.pop(cell.id, None)
         _clear_vectors_explorer_cache(cell.id)
     elif cell.cell_type == "image":
         mgr._images.pop(cell.id, None)
@@ -2356,6 +2519,11 @@ def report_add_figure(session, plot, payload) -> None:
         ipc.emit_error("report_add_figure: source window not found.")
         return
     vectors_mode = str(payload.get("vectors_mode", "") or "")
+    # A drop targeting an existing SPLIT cell's figure side is always a static
+    # snapshot (a vectors explorer is a full-width concept, never a split side), so
+    # the viewer-vs-image prompt is skipped for it.
+    _tgt = mgr.doc.cell_by_id(payload.get("at_cell")) if payload.get("at_cell") else None
+    _target_is_split = _tgt is not None and _tgt.cell_type == "split"
     if str(payload.get("view", "") or "") == "3d":
         snap = _snapshot_scene3d(session, src)
         if snap is None:
@@ -2364,7 +2532,7 @@ def report_add_figure(session, plot, payload) -> None:
             return
         vectors_mode = ""              # a scene cell never embeds the explorer
     else:
-        if not vectors_mode:
+        if not vectors_mode and not _target_is_split:
             vecs = getattr(getattr(src, "signal_tree", None),
                            "diffraction_vectors", None)
             if vecs is not None:
@@ -2396,6 +2564,15 @@ def report_add_figure(session, plot, payload) -> None:
         # Fill a placeholder (or replace an existing figure) in place.
         cell.placeholder = False
         cell.spec = spec
+        if caption:
+            cell.caption = caption
+    elif cell is not None and cell.cell_type == "split":
+        # Fill an existing SPLIT cell's FIGURE SIDE in place (Wave B's figure-drop-
+        # onto-a-split path) — keeps the split cell's text side + layout, replaces
+        # any prior photo side with this figure.
+        cell.spec = spec
+        cell.image_ext = ""
+        mgr._images.pop(cell.id, None)
         if caption:
             cell.caption = caption
     else:

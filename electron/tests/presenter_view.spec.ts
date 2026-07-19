@@ -46,7 +46,7 @@ test('1) build a 2-slide deck and set speaker notes on slide 1', async () => {
   await page.getByTestId('toggle-report').click()
   await expect(page.getByTestId('report-sidebar')).toBeVisible()
 
-  await backendAction(page, 'report_new', {})
+  await backendAction(page, 'report_new', { type: 'presentation' })
   await backendAction(page, 'report_set_title', { title: 'Presenter View Demo' })
   await backendAction(page, 'report_add_cell', {
     cell_type: 'markdown',

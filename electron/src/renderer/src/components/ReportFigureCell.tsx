@@ -45,8 +45,7 @@ import type { ReportCell, RepfigPanel, RepfigLayer, RepfigSpec } from '../kernel
 import { FIGURE_DRAG_MIME, WINDOW_DRAG_MIME } from '../kernel/dnd'
 import { COLORMAPS } from '../kernel/colormaps'
 import { useKeyedDebounce } from './wizardHooks'
-import { CellChrome, ColumnBadge, type CellColumn } from './CellChrome'
-import { SlideNotesEditor } from './SlideNotesEditor'
+import { CellChrome } from './CellChrome'
 
 // The compose modes the backend can return (subset of these per drop).
 type ComposeMode =
@@ -210,9 +209,6 @@ interface Props {
   onRemove: () => void
   /** Own index in the cell list (Duplicate → insert at index+1). */
   index: number
-  /** This cell STARTS a slide (first cell or a slide_break) — offer the
-   *  per-slide "Title slide" toggle in the chrome. */
-  slideStart?: boolean
   /** HTML5 DnD reorder wiring supplied by the parent list (same shape as the
    *  markdown ReportCell's — ReportSidebar.makeDragProps). */
   dragProps: {
@@ -259,12 +255,11 @@ interface TextSizePopoverTarget {
 // single piece of state).
 type PopoverTarget = AnnPopoverTarget | TextSizePopoverTarget
 
-export function ReportFigureCell({ cell, onRemove, index, slideStart, dragProps, reorderActive }: Props) {
+export function ReportFigureCell({ cell, onRemove, index, dragProps, reorderActive }: Props) {
   const { state, iframeRefs, replayState, sendAction, dragKind, requestFigurePng } = useSpyDE()
   const [captionEditing, setCaptionEditing] = useState(false)
   const [captionDraft, setCaptionDraft] = useState(cell.caption ?? '')
   const [hover, setHover] = useState(false)
-  const [notesOpen, setNotesOpen] = useState(false)
   const [dropHover, setDropHover] = useState(false)     // placeholder fill hover
   const [editOpen, setEditOpen] = useState(false)
   // The SELECTED spec panel id (null = figure-level), mirrored from the backend's
@@ -668,30 +663,17 @@ export function ReportFigureCell({ cell, onRemove, index, slideStart, dragProps,
         ...(dragProps.dropBefore ? styles.cellDropBefore : {}),
       }}
     >
-      {/* Always-visible slide-column badge (◧ Left / ◨ Right) — not on a
-          placeholder (a slot has no slide role yet). */}
-      {!cell.placeholder && <ColumnBadge column={cell.column} />}
-      {/* Hover chrome: drag handle (reorder) + column toggle + Edit toggle + Copy
-          + Duplicate + Refresh-from-live + delete (not on a placeholder). Only the
-          ⠿ handle is draggable — the cell root can't be (the figure iframe needs
-          its own pointer gestures), so the handle sets the ROOT as the drag image. */}
+      {/* Hover chrome: drag handle (reorder) + Edit toggle + Copy + Duplicate +
+          Refresh-from-live + delete (not on a placeholder). Only the ⠿ handle is
+          draggable — the cell root can't be (the figure iframe needs its own
+          pointer gestures), so the handle sets the ROOT as the drag image. */}
       {hover && !cell.placeholder && (
         <CellChrome
           cellId={cell.id}
-          styles={{ chrome: styles.chrome, chromeBtn: styles.chromeBtn, columnBtnActive: styles.chromeBtnActive }}
+          styles={{ chrome: styles.chrome, chromeBtn: styles.chromeBtn }}
           onCopy={doCopy}
           onDuplicate={doDuplicate}
           onDelete={onRemove}
-          column={cell.column}
-          onSetColumn={(c: CellColumn) => sendAction('report_set_cell_column', { cell_id: cell.id, column: c })}
-          slideStart={slideStart}
-          slideKind={cell.slide_kind}
-          onToggleTitle={() => sendAction('report_set_slide_kind', { cell_id: cell.id })}
-          slideStyle={cell.slide_style}
-          onCycleStyle={(style) => sendAction('report_set_slide_style', { cell_id: cell.id, slide_style: style })}
-          slideNotes={cell.notes}
-          notesOpen={notesOpen}
-          onToggleNotes={() => setNotesOpen((v) => !v)}
           deleteTestid={`report-figcell-delete-${cell.id}`}
           deleteTitle="Delete figure"
           leading={
@@ -891,17 +873,6 @@ export function ReportFigureCell({ cell, onRemove, index, slideStart, dragProps,
           setEditOpen(false)
           sendAction('repfig_set_edit_mode', { cell_id: cell.id, editing: false })
         }} />
-      )}
-
-      {/* Speaker-notes editor (slide-starting cells only, not a placeholder),
-          toggled from the chrome 📝 button. Debounced → report_set_slide_notes. */}
-      {slideStart && !cell.placeholder && notesOpen && (
-        <SlideNotesEditor
-          cellId={cell.id}
-          notes={cell.notes ?? ''}
-          onCommit={(notes) => sendAction('report_set_slide_notes', { cell_id: cell.id, notes })}
-          onClose={() => setNotesOpen(false)}
-        />
       )}
     </div>
   )

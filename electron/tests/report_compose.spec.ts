@@ -192,7 +192,7 @@ test('setup: open a new report + embed signal-A as a live figure cell', async ()
   const { page } = ctx
   await page.getByTestId('toggle-report').click()
   await expect(page.getByTestId('report-sidebar')).toBeVisible()
-  await page.getByTestId('report-new').click()
+  await backendAction(page, 'report_new', {})
   await expect(page.getByTestId('report-body')).toBeVisible()
 
   // Embed the FIRST signal window (tree A) — drag its pill into the report body.

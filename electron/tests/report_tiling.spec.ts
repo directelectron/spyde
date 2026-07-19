@@ -209,7 +209,7 @@ test('1) embed signal-A → single-panel figure cell', async () => {
   const { page } = ctx
   await page.getByTestId('toggle-report').click()
   await expect(page.getByTestId('report-sidebar')).toBeVisible()
-  await page.getByTestId('report-new').click()
+  await backendAction(page, 'report_new', {})
   await expect(page.getByTestId('report-body')).toBeVisible()
 
   const sigA = sigWindows(page).nth(0)

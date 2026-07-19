@@ -22,10 +22,6 @@ interface Props {
   onClose: (id: string) => void
   onFocus: (id: string) => void
   onMinimize?: (id: string) => void
-  /** "Capture to presentation" — snapshot THIS window's current live state
-   *  (nav position, contrast, colormap, overlays) into the report as a new
-   *  slide, no dragging. Omitted → the button doesn't render (older callers). */
-  onCapture?: (windowId: number) => void
   onResize: (id: string, w: number, h: number) => void
   onAction: (action: string, windowId: number, params: Record<string, unknown>) => void
   zIndex: number
@@ -133,7 +129,7 @@ function clampToVisible(x: number, y: number, w: number, areaW: number, areaH: n
 export function SubWindow({
   id, title, breadcrumb, windowPayload, onRename,
   initialX, initialY, initialW, initialH,
-  toolbarActions, onClose, onFocus, onMinimize, onResize, onAction, onCapture,
+  toolbarActions, onClose, onFocus, onMinimize, onResize, onAction,
   zIndex, windowId, children, hidden = false,
   acceptSignalDrop = false, onSignalDrop,
   areaSize, otherRects, onLiveRect, forced,
@@ -354,16 +350,6 @@ export function SubWindow({
           )}
         </span>
         <div style={styles.controls}>
-          {onCapture && (
-            <button
-              data-testid="capture-btn"
-              style={styles.btn}
-              title="Capture to presentation — snapshot this view as a new slide"
-              onClick={() => onCapture(windowId)}
-            >
-              📷
-            </button>
-          )}
           {onMinimize && (
             <button
               data-testid="minimize-btn"

@@ -77,7 +77,7 @@ test('1) build a title-slide + captioned-figure deck', async () => {
   await page.getByTestId('toggle-report').click()
   await expect(page.getByTestId('report-sidebar')).toBeVisible()
 
-  await backendAction(page, 'report_new', {})
+  await backendAction(page, 'report_new', { type: 'presentation' })
   await backendAction(page, 'report_set_title', { title: 'Title Slide Demo' })
 
   // Slide 1 — a title slide: one markdown cell we then mark slide_kind='title'.

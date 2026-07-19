@@ -18,8 +18,7 @@ import { useSpyDE } from '../kernel/SpyDEContext'
 import { renderMarkdown } from '../kernel/markdown'
 import { reportClipboard } from '../kernel/reportClipboard'
 import type { ReportCell as ReportCellType } from '../kernel/protocol'
-import { CellChrome, ColumnBadge, type CellColumn } from './CellChrome'
-import { SlideNotesEditor } from './SlideNotesEditor'
+import { CellChrome } from './CellChrome'
 
 // One-time scoped markdown stylesheet for the dark theme. Injected under a
 // `.spyde-md` wrapper so it never leaks into the rest of the app. Sizes are in
@@ -75,17 +74,12 @@ if (typeof document !== 'undefined' && !document.getElementById('spyde-md-css'))
 
 interface Props {
   cell: ReportCellType
-  /** Report-level raw/rendered toggle — forces the editor for every cell. */
-  rawMode: boolean
   /** Commit a new source + its rendered (sanitized) html fragment. The html
    *  rides along so static export embeds real HTML, not a `<pre>` fallback. */
   onUpdate: (source: string, html: string) => void
   onRemove: () => void
   /** Own index in the cell list (for Duplicate → insert at index+1). */
   index: number
-  /** This cell STARTS a slide (first cell or a slide_break) — offer the
-   *  per-slide "Title slide" toggle in the chrome. */
-  slideStart?: boolean
   /** HTML5 DnD reorder wiring supplied by the parent list. */
   dragProps: {
     onDragStart: (e: React.DragEvent) => void
@@ -234,21 +228,19 @@ const TOOLBAR: Array<[ToolbarCommand, string, string, React.CSSProperties?]> = [
   ['link', '🔗', 'Link', { fontSize: 10 }],
 ]
 
-export function ReportCell({ cell, rawMode, onUpdate, onRemove, index, slideStart, dragProps }: Props) {
+export function ReportCell({ cell, onUpdate, onRemove, index, dragProps }: Props) {
   const { sendAction } = useSpyDE()
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(cell.source ?? '')
   const [hover, setHover] = useState(false)
-  const [notesOpen, setNotesOpen] = useState(false)
   const taRef = useRef<HTMLTextAreaElement>(null)
 
   // Sync the draft when the backing source changes and we're NOT actively
   // editing (a live report_state update from elsewhere).
   useEffect(() => { if (!editing) setDraft(cell.source ?? '') }, [cell.source, editing])
 
-  // Raw mode forces the editor open; leaving raw mode drops back to rendered
-  // (unless the user had explicitly double-clicked into edit).
-  const showEditor = rawMode || editing
+  // Double-click to edit; the rendered view is shown otherwise.
+  const showEditor = editing
 
   // Autosize the textarea to its content.
   useLayoutEffect(() => {
@@ -313,26 +305,14 @@ export function ReportCell({ cell, rawMode, onUpdate, onRemove, index, slideStar
         ...(dragProps.dropBefore ? styles.cellDropBefore : {}),
       }}
     >
-      {/* Always-visible slide-column badge (◧ Left / ◨ Right). */}
-      <ColumnBadge column={cell.column} />
-      {/* Hover chrome: drag handle (reorder) + column toggle + copy + duplicate + delete. */}
+      {/* Hover chrome: drag handle (reorder) + copy + duplicate + delete. */}
       {(hover || showEditor) && (
         <CellChrome
           cellId={cell.id}
-          styles={{ chrome: styles.chrome, chromeBtn: styles.chromeBtn, deleteBtn: styles.deleteBtn, columnBtnActive: styles.columnBtnActive }}
+          styles={{ chrome: styles.chrome, chromeBtn: styles.chromeBtn, deleteBtn: styles.deleteBtn }}
           onCopy={doCopy}
           onDuplicate={doDuplicate}
           onDelete={onRemove}
-          column={cell.column}
-          onSetColumn={(c: CellColumn) => sendAction('report_set_cell_column', { cell_id: cell.id, column: c })}
-          slideStart={slideStart}
-          slideKind={cell.slide_kind}
-          onToggleTitle={() => sendAction('report_set_slide_kind', { cell_id: cell.id })}
-          slideStyle={cell.slide_style}
-          onCycleStyle={(style) => sendAction('report_set_slide_style', { cell_id: cell.id, slide_style: style })}
-          slideNotes={cell.notes}
-          notesOpen={notesOpen}
-          onToggleNotes={() => setNotesOpen((v) => !v)}
           deleteTestid={`report-cell-delete-${cell.id}`}
           deleteTitle="Delete cell"
           leading={
@@ -367,16 +347,16 @@ export function ReportCell({ cell, rawMode, onUpdate, onRemove, index, slideStar
             data-testid={`report-cell-textarea-${cell.id}`}
             style={styles.textarea}
             value={draft}
-            autoFocus={editing && !rawMode}
+            autoFocus={editing}
             spellCheck={false}
             placeholder="Write markdown…  ($x^2$ and $$…$$ render as math)"
             onChange={(e) => setDraft(e.target.value)}
-            onBlur={() => { if (!rawMode) commit(); else if (draft !== (cell.source ?? '')) onUpdate(draft, renderMarkdown(draft)) }}
+            onBlur={commit}
             onKeyDown={(e) => {
               if (e.key === 'Enter' && (e.ctrlKey || e.metaKey || e.shiftKey)) {
                 e.preventDefault()
                 ;(e.target as HTMLTextAreaElement).blur()
-              } else if (e.key === 'Escape' && !rawMode) {
+              } else if (e.key === 'Escape') {
                 e.preventDefault()
                 revert()
               } else if ((e.ctrlKey || e.metaKey) && !e.altKey) {
@@ -399,17 +379,6 @@ export function ReportCell({ cell, rawMode, onUpdate, onRemove, index, slideStar
             ? <span style={styles.emptyHint}>Empty text cell — double-click to edit</span>
             : <span dangerouslySetInnerHTML={{ __html: rendered }} />}
         </div>
-      )}
-
-      {/* Speaker-notes editor (slide-starting cells only), toggled from the chrome
-          📝 button. Debounced → report_set_slide_notes. */}
-      {slideStart && notesOpen && (
-        <SlideNotesEditor
-          cellId={cell.id}
-          notes={cell.notes ?? ''}
-          onCommit={(notes) => sendAction('report_set_slide_notes', { cell_id: cell.id, notes })}
-          onClose={() => setNotesOpen(false)}
-        />
       )}
     </div>
   )
@@ -436,10 +405,6 @@ const styles: Record<string, React.CSSProperties> = {
   },
   chromeBtn: {
     background: 'none', border: 'none', color: '#6c7086', cursor: 'pointer',
-    fontSize: 12, padding: '0 2px', lineHeight: 1,
-  },
-  columnBtnActive: {
-    background: 'none', border: 'none', color: '#89b4fa', cursor: 'pointer',
     fontSize: 12, padding: '0 2px', lineHeight: 1,
   },
   deleteBtn: {

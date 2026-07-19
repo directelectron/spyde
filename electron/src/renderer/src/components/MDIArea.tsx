@@ -233,23 +233,6 @@ export function MDIArea() {
     sendAction('toolbar_action', { name: action, params }, windowId)
   }, [sendAction])
 
-  // "Capture to presentation" — the per-window camera button. Snapshots THIS
-  // window's CURRENT live state (nav position, contrast, colormap, overlays —
-  // report_add_figure already does this via _snapshot_plot) straight into the
-  // report as a new slide (slide_break:true), no dragging. vectors_mode:'image'
-  // so a vectors-carrying tree captures instantly (static image) instead of
-  // deferring to the viewer-vs-image prompt — a one-click action shouldn't stop
-  // to ask. Also pings the App shell to make sure the report dock is visible so
-  // the user actually sees the slide land.
-  const handleCapture = useCallback((windowId: number) => {
-    sendAction('report_add_figure', {
-      source_window_id: windowId,
-      slide_break: true,
-      vectors_mode: 'image',
-    })
-    window.dispatchEvent(new CustomEvent('spyde:report_open_dock'))
-  }, [sendAction])
-
   // Drops onto the MDI background:
   //  • a navigator chip → extract that navigator into its own signal tree,
   //  • a console result chip → open that console variable as a new window,
@@ -392,7 +375,6 @@ export function MDIArea() {
               onMinimize={handleMinimize}
               onResize={handleResize}
               onAction={handleAction}
-              onCapture={handleCapture}
               zIndex={getZ(id)}
               hidden={minimized.has(id)}
               acceptSignalDrop={win.isNavigator}

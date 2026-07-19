@@ -105,7 +105,7 @@ test('1) open the report sidebar and build a 3-slide deck', async () => {
 
   // Build the deck via the backend actions (no OS dialogs). A markdown title
   // slide, a second markdown slide, and a figure slide from the signal window.
-  await backendAction(page, 'report_new', {})
+  await backendAction(page, 'report_new', { type: 'presentation' })
   await backendAction(page, 'report_set_title', { title: 'Phase 6 Demo Deck' })
   await backendAction(page, 'report_add_cell', {
     cell_type: 'markdown',

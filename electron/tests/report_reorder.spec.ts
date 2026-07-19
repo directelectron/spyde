@@ -78,7 +78,7 @@ async function cellOrder(page: any): Promise<string[]> {
 test('1) build [md, figure, md]', async () => {
   const { page } = ctx
   await page.getByTestId('toggle-report').click()
-  await page.getByTestId('report-new').click()
+  await backendAction(page, 'report_new', {})
   await expect(page.getByTestId('report-body')).toBeVisible()
 
   // md "Alpha"

@@ -18,8 +18,7 @@ import React, { useState } from 'react'
 import { useSpyDE } from '../kernel/SpyDEContext'
 import { reportClipboard, type SerializedImageCell } from '../kernel/reportClipboard'
 import type { ReportCell } from '../kernel/protocol'
-import { CellChrome, ColumnBadge, type CellColumn } from './CellChrome'
-import { SlideNotesEditor } from './SlideNotesEditor'
+import { CellChrome } from './CellChrome'
 
 const WIDTH_KEY = (id: string) => `spyde-report-imgw-${id}`
 const DEFAULT_WIDTH_PCT = 100
@@ -30,9 +29,6 @@ interface Props {
   onRemove: () => void
   /** Own index in the cell list (Duplicate → insert at index+1). */
   index: number
-  /** This cell STARTS a slide (first cell or a slide_break) — offer the
-   *  per-slide "Title slide" toggle in the chrome. */
-  slideStart?: boolean
   /** HTML5 DnD reorder wiring supplied by the parent list (same shape as the
    *  markdown/figure cells' — ReportSidebar.makeDragProps). */
   dragProps: {
@@ -45,10 +41,9 @@ interface Props {
   }
 }
 
-export function ReportImageCell({ cell, onRemove, index, slideStart, dragProps }: Props) {
+export function ReportImageCell({ cell, onRemove, index, dragProps }: Props) {
   const { sendAction } = useSpyDE()
   const [hover, setHover] = useState(false)
-  const [notesOpen, setNotesOpen] = useState(false)
   const [captionEditing, setCaptionEditing] = useState(false)
   const [captionDraft, setCaptionDraft] = useState(cell.caption ?? '')
   const [widthPct, setWidthPct] = useState<number>(() => {
@@ -126,25 +121,13 @@ export function ReportImageCell({ cell, onRemove, index, slideStart, dragProps }
         ...(dragProps.dropBefore ? styles.cellDropBefore : {}),
       }}
     >
-      {/* Always-visible slide-column badge (◧ Left / ◨ Right). */}
-      <ColumnBadge column={cell.column} />
       {hover && (
         <CellChrome
           cellId={cell.id}
-          styles={{ chrome: styles.chrome, chromeBtn: styles.chromeBtn, columnBtnActive: styles.columnBtnActive }}
+          styles={{ chrome: styles.chrome, chromeBtn: styles.chromeBtn }}
           onCopy={doCopy}
           onDuplicate={doDuplicate}
           onDelete={onRemove}
-          column={cell.column}
-          onSetColumn={(c: CellColumn) => sendAction('report_set_cell_column', { cell_id: cell.id, column: c })}
-          slideStart={slideStart}
-          slideKind={cell.slide_kind}
-          onToggleTitle={() => sendAction('report_set_slide_kind', { cell_id: cell.id })}
-          slideStyle={cell.slide_style}
-          onCycleStyle={(style) => sendAction('report_set_slide_style', { cell_id: cell.id, slide_style: style })}
-          slideNotes={cell.notes}
-          notesOpen={notesOpen}
-          onToggleNotes={() => setNotesOpen((v) => !v)}
           deleteTestid={`report-imgcell-delete-${cell.id}`}
           deleteTitle="Delete image"
           leading={
@@ -224,17 +207,6 @@ export function ReportImageCell({ cell, onRemove, index, slideStart, dragProps }
             : <span style={styles.captionPlaceholder}>Add a caption…</span>}
         </div>
       )}
-
-      {/* Speaker-notes editor (slide-starting cells only), toggled from the
-          chrome 📝 button. Debounced → report_set_slide_notes. */}
-      {slideStart && notesOpen && (
-        <SlideNotesEditor
-          cellId={cell.id}
-          notes={cell.notes ?? ''}
-          onCommit={(notes) => sendAction('report_set_slide_notes', { cell_id: cell.id, notes })}
-          onClose={() => setNotesOpen(false)}
-        />
-      )}
     </div>
   )
 }
@@ -259,10 +231,6 @@ const styles: Record<string, React.CSSProperties> = {
   },
   chromeBtn: {
     background: 'none', border: 'none', color: '#a6adc8', cursor: 'pointer',
-    fontSize: 13, padding: '0 3px', lineHeight: 1,
-  },
-  columnBtnActive: {
-    background: 'none', border: 'none', color: '#89b4fa', cursor: 'pointer',
     fontSize: 13, padding: '0 3px', lineHeight: 1,
   },
   imgWrap: {

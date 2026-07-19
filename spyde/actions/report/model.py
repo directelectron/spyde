@@ -160,6 +160,43 @@ _SLIDE_NOTES_RE = re.compile(r"^<!--\s*spyde:notes\s+(?P<b64>\S+)\s*-->\s*$")
 # "" are equivalent (a normal slide); "default" and "" pick the standard stage.
 _SLIDE_KINDS = ("title",)
 _SLIDE_STYLES = ("plain", "accent")
+# A SPLIT-cell marker (Wave A — the split-block primitive): ``<!-- spyde:split
+# <layout> <id> -->`` — an invisible comment BEFORE a split cell's block that
+# declares the block a SPLIT cell (one atomic block: a text side + a figure/photo
+# side, side by side) and carries BOTH the layout and the cell id. The cell id is
+# what re-associates the split cell's text block AND its immediately-following
+# figure/image ref to the ONE split cell (the ref adopts this id rather than
+# minting a new cell). ``<layout>`` ∈ {"text-left", "text-right"} places which
+# side is which. Absent → not a split cell (a plain markdown/figure/image cell is
+# NEVER mis-parsed as split — the marker is required). Mirrors the column marker.
+_SPLIT_RE = re.compile(
+    r"^<!--\s*spyde:split\s+(?P<layout>\S+)(?:\s+(?P<cid>\S+))?\s*-->\s*$")
+# The accepted split layouts (anything else → "text-left", the default). Which
+# side the TEXT sits on; the figure/photo takes the other side.
+_SPLIT_LAYOUTS = ("text-left", "text-right")
+
+
+def _normalize_split_layout(val) -> str:
+    """Normalise a raw split layout to one of ``{"text-left", "text-right"}``.
+    Any unknown/absent value collapses to ``"text-left"`` (the default — text on
+    the left, figure on the right) so a malformed marker still renders sanely."""
+    s = str(val or "").strip().lower()
+    return s if s in _SPLIT_LAYOUTS else "text-left"
+
+
+# The accepted document types (anything else / absent → "report"). "movie" is
+# reserved (not built in Wave A) but tolerated so a hand-authored future file
+# doesn't fail to load.
+_DOC_TYPES = ("report", "presentation", "movie")
+
+
+def _normalize_doc_type(val) -> str:
+    """Normalise a raw document type to one of ``{"report", "presentation",
+    "movie"}``. Any unknown/absent value collapses to ``"report"`` (a scrolling
+    article — the default and every legacy document) so an older report — which
+    has no ``type:`` front-matter — loads exactly as before."""
+    s = str(val or "").strip().lower()
+    return s if s in _DOC_TYPES else "report"
 
 
 def _normalize_column(val) -> str:
@@ -590,10 +627,27 @@ class FigureSpec:
 class Cell:
     """A document cell.
 
-    ``cell_type`` is ``"markdown"``, ``"figure"``, or ``"image"``. A figure cell
-    carries a ``caption``, a ``fig_id`` (the FigureSpec / asset basename == this
-    cell's id), a ``spec`` (FigureSpec, in memory), and — for a template — a
-    ``placeholder`` flag when no figure has been dropped yet.
+    ``cell_type`` is ``"markdown"``, ``"figure"``, ``"image"``, or ``"split"``. A
+    figure cell carries a ``caption``, a ``fig_id`` (the FigureSpec / asset
+    basename == this cell's id), a ``spec`` (FigureSpec, in memory), and — for a
+    template — a ``placeholder`` flag when no figure has been dropped yet.
+
+    A ``"split"`` cell (Wave A — the split-block primitive) is ONE atomic block
+    holding a TEXT side + a FIGURE/PHOTO side, side by side. It REUSES the existing
+    fields: ``source`` is the text side's markdown; the figure/photo side is the
+    SAME machinery a figure/image cell uses — a ``spec`` (FigureSpec) + its snapshot
+    (like a figure cell) OR ``image_ext`` + held bytes (like an image cell). So all
+    the existing snapshot / asset / export code works on a split cell unchanged; the
+    split cell just ALSO renders its ``source`` text beside the figure/photo. Until
+    a figure/photo is dropped the figure side is empty (``spec is None`` and no
+    ``image_ext``) — an empty drop zone. ``split_layout`` (``"text-left"`` /
+    ``"text-right"``) picks which side the TEXT sits on (the figure takes the
+    other). Persisted in report.md as an invisible ``<!-- spyde:split <layout>
+    <id> -->`` marker BEFORE the block: the text block THEN the figure/image ref
+    both bind to the marker's cell id, so the two sides re-associate to the one
+    split cell unambiguously (see :func:`serialize_report_md` /
+    :func:`_parse_body_cells`). Absent marker → NOT a split cell (fully
+    back-compatible — SCHEMA_VERSION stays 1).
 
     An ``"image"`` cell is a plain PHOTO the user dropped / pasted / browsed in:
     it carries a ``caption`` and its raw image bytes are stored as an asset like a
@@ -667,13 +721,21 @@ class Cell:
     slide_kind: str = ""                       # Present mode: "" (content) | "title"
     slide_style: str = ""                      # Present mode: "" | "plain" | "accent"
     notes: str = ""                            # Present mode: per-slide speaker notes
+    split_layout: str = "text-left"            # split cells: "text-left" | "text-right"
 
 
 @dataclass
 class ReportDoc:
-    """The in-memory report: metadata + an ordered list of :class:`Cell`."""
+    """The in-memory report: metadata + an ordered list of :class:`Cell`.
+
+    ``doc_type`` (Wave A — the document TYPE field) is one of ``"report"``
+    (a scrolling article — the default and every existing document),
+    ``"presentation"`` (a slide deck), or ``"movie"`` (reserved, not built yet).
+    It mirrors ``template``: serialized as a front-matter ``type:`` key, read back
+    tolerantly (absent → ``"report"``), and never changes SCHEMA_VERSION."""
     title: str = "Untitled Report"
     template: bool = False
+    doc_type: str = "report"
     version: int = SCHEMA_VERSION
     created: str = ""
     modified: str = ""
@@ -733,9 +795,16 @@ def slide_columns(cells: "list[Cell]") -> list:
       ``column`` ``""`` / ``"full"``), OR
     * ``{"kind": "cols", "left": [<Cell>…], "right": [<Cell>…]}`` — a 2-column
       grid row: consecutive ``left``/``right`` cells accumulate into the two
-      columns (in document order within each column).
+      columns (in document order within each column) — the LEGACY adjacency path,
+      still supported so existing 2-col reports load/render, OR
+    * ``{"kind": "split", "cell": <Cell>}`` — a self-contained SPLIT cell (Wave A):
+      ONE cell that IS a 2-column block (text side + figure/photo side). The
+      renderer + export render its two sides side by side, ordered by the cell's
+      ``split_layout`` (text-left / text-right). A split cell CLOSES any open
+      legacy cols row and stands alone (it is its own 2-column row).
 
-    Rule: walk the cells in order; a ``left``/``right`` cell opens or continues
+    Rule: walk the cells in order; a ``cell_type=="split"`` cell emits a ``split``
+    row (closing any open cols row); a ``left``/``right`` cell opens or continues
     the current cols row; a full cell CLOSES any open cols row and stands alone.
     A slide of all-full cells (the common / legacy case) yields one full row per
     cell — exactly the current stacked behaviour. Preserves order; every cell
@@ -743,6 +812,12 @@ def slide_columns(cells: "list[Cell]") -> list:
     rows: list = []
     cur: dict | None = None                    # the open {"kind":"cols",…} row
     for c in cells:
+        if getattr(c, "cell_type", "") == "split":
+            # A split cell is its OWN self-contained 2-column row; it closes any
+            # open legacy cols row.
+            cur = None
+            rows.append({"kind": "split", "cell": c})
+            continue
         col = _normalize_column(getattr(c, "column", ""))
         if col in ("left", "right"):
             if cur is None:
@@ -873,6 +948,7 @@ def serialize_report_md(doc: ReportDoc) -> str:
         "version": doc.version,
         "title": doc.title,
         "template": bool(doc.template),
+        "type": _normalize_doc_type(getattr(doc, "doc_type", "report")),
         "created": doc.created,
         "modified": doc.modified,
     }
@@ -903,7 +979,23 @@ def serialize_report_md(doc: ReportDoc) -> str:
         col = _normalize_column(getattr(c, "column", ""))
         if col:
             body_blocks.append(f"<!-- spyde:column {col} -->")
-        if c.cell_type == "markdown":
+        if c.cell_type == "split":
+            # A SPLIT block: an invisible marker carrying the layout + THIS cell's
+            # id, then the TEXT side (markdown ``source``), then the figure/photo
+            # side's image ref. The marker's id is what re-binds BOTH blocks back
+            # to the one split cell on parse (the ref adopts this id). The figure
+            # side is ``.png`` (a figure — has a sibling figures yaml) OR
+            # ``.<ext>`` (a dropped photo — no yaml) OR omitted entirely (empty
+            # drop zone until a figure/photo is dropped).
+            layout = _normalize_split_layout(getattr(c, "split_layout", "text-left"))
+            body_blocks.append(f"<!-- spyde:split {layout} {c.id} -->")
+            body_blocks.append((c.source or "").rstrip("\n"))
+            if c.spec is not None:
+                body_blocks.append(f"![{c.caption}](assets/{c.id}.png)")
+            elif c.image_ext:
+                ext = (c.image_ext or "png").lower()
+                body_blocks.append(f"![{c.caption}](assets/{c.id}.{ext})")
+        elif c.cell_type == "markdown":
             body_blocks.append(c.source.rstrip("\n"))
         elif c.cell_type == "image":
             # A photo: a standalone-paragraph image ref pointing at
@@ -938,6 +1030,7 @@ def parse_report_md(text: str) -> ReportDoc:
         version=int(front.get("version", SCHEMA_VERSION)),
         title=str(front.get("title", "Untitled Report")),
         template=bool(front.get("template", False)),
+        doc_type=_normalize_doc_type(front.get("type", "report")),
         created=str(front.get("created", "")),
         modified=str(front.get("modified", "")),
     )
@@ -981,6 +1074,16 @@ def _parse_body_cells(body: str) -> list:
     # already accumulating above it).
     pending: dict = {"slide_break": False, "live_action": None, "column": "",
                      "slide_kind": "", "slide_style": "", "notes": ""}
+    # SPLIT-cell parse state. A ``<!-- spyde:split <layout> <id> -->`` marker arms
+    # ``split_pending`` (the layout + id). The NEXT flushed markdown run (even an
+    # EMPTY one — a split with no text is valid) becomes that split cell's ``source``
+    # and creates the cell; ``open_split`` then points at it so the IMMEDIATELY
+    # FOLLOWING figure/image ref fills its figure side (adopting the marker id)
+    # instead of minting a new figure/image cell. A split without a following ref
+    # is an empty-figure-side split (a drop zone). No pending split → the classic
+    # markdown/figure/image parse path (fully back-compatible).
+    split_pending: "dict | None" = None
+    open_split: "Cell | None" = None
 
     def _apply_pending(cell: "Cell") -> "Cell":
         if pending["slide_break"]:
@@ -1004,13 +1107,26 @@ def _parse_body_cells(body: str) -> list:
         return cell
 
     def flush_md() -> None:
-        if md_buf:
-            src = "\n".join(md_buf).strip("\n")
-            # Drop a run that is nothing but blank lines (paragraph separators).
-            if src.strip() != "":
-                cells.append(_apply_pending(Cell(
-                    id=new_cell_id(), cell_type="markdown", source=src)))
-            md_buf.clear()
+        nonlocal split_pending, open_split
+        src = "\n".join(md_buf).strip("\n") if md_buf else ""
+        md_buf.clear()
+        if split_pending is not None:
+            # The text side of a split cell — create the split cell NOW (even when
+            # the text is empty) and leave it OPEN so the next figure/image ref
+            # fills its figure side. The split-break/column/etc. pending markers
+            # apply to the split cell as a whole (its first-in-block position).
+            cell = _apply_pending(Cell(
+                id=str(split_pending["id"] or new_cell_id()),
+                cell_type="split", source=src,
+                split_layout=_normalize_split_layout(split_pending["layout"])))
+            cells.append(cell)
+            open_split = cell
+            split_pending = None
+            return
+        # Drop a run that is nothing but blank lines (paragraph separators).
+        if src.strip() != "":
+            cells.append(_apply_pending(Cell(
+                id=new_cell_id(), cell_type="markdown", source=src)))
 
     for raw in body.splitlines():
         line = raw.rstrip("\r")
@@ -1055,10 +1171,25 @@ def _parse_body_cells(body: str) -> list:
         m_notes = _SLIDE_NOTES_RE.match(stripped)
         m_live = _LIVE_ACTION_RE.match(stripped)
         m_col = _COLUMN_RE.match(stripped)
+        m_split = _SPLIT_RE.match(stripped)
         m_fig = _FIG_LINE_RE.match(stripped)
         m_image = _IMAGE_LINE_RE.match(stripped)
         m_ph = _PLACEHOLDER_RE.match(stripped)
-        if m_break is not None:
+        # A figure/image ref DIRECTLY after a split cell's text fills that split
+        # cell's figure side (adopting its id) rather than opening a new cell —
+        # any other line closes the open split (a bare drop-zone split).
+        if open_split is not None and m_fig is None and m_image is None:
+            open_split = None
+        if m_split is not None:
+            # Open a new split cell: flush prior content, then arm the split so the
+            # NEXT flushed markdown run becomes its text side. Unknown layout →
+            # "text-left"; a missing id mints a fresh one (defensive).
+            flush_md()
+            split_pending = {
+                "layout": _normalize_split_layout(m_split.group("layout")),
+                "id": (m_split.group("cid") or "").strip() or new_cell_id(),
+            }
+        elif m_break is not None:
             # Ends the current markdown run; the marker applies to whatever cell
             # comes next.
             flush_md()
@@ -1095,15 +1226,29 @@ def _parse_body_cells(body: str) -> list:
             # below (default figure) and later promoted to an image cell by
             # ``read_report`` when it has no sibling figures yaml.
             flush_md()
-            cells.append(_apply_pending(Cell(
-                id=m_image.group("cid"), cell_type="image",
-                caption=m_image.group("caption") or "",
-                image_ext=(m_image.group("ext") or "").lower())))
+            if open_split is not None:
+                # Fill the open split cell's figure side with this PHOTO (keep the
+                # split cell's id + text; adopt the image ext + caption).
+                open_split.image_ext = (m_image.group("ext") or "").lower()
+                open_split.caption = m_image.group("caption") or ""
+                open_split = None
+            else:
+                cells.append(_apply_pending(Cell(
+                    id=m_image.group("cid"), cell_type="image",
+                    caption=m_image.group("caption") or "",
+                    image_ext=(m_image.group("ext") or "").lower())))
         elif m_fig is not None:
             flush_md()
-            cells.append(_apply_pending(Cell(
-                id=m_fig.group("cid"), cell_type="figure",
-                caption=m_fig.group("caption") or "", placeholder=False)))
+            if open_split is not None:
+                # Fill the open split cell's figure side with this FIGURE. The
+                # sibling ``figures/<id>.yaml`` (attached by read_report) supplies
+                # the spec; here we just record the caption + keep the split id.
+                open_split.caption = m_fig.group("caption") or ""
+                open_split = None
+            else:
+                cells.append(_apply_pending(Cell(
+                    id=m_fig.group("cid"), cell_type="figure",
+                    caption=m_fig.group("caption") or "", placeholder=False)))
         elif m_ph is not None:
             flush_md()
             cells.append(_apply_pending(Cell(
@@ -1277,6 +1422,23 @@ def write_report(doc: ReportDoc, path: str,
                         ext = (c.image_ext or "png").lower()
                         zf.writestr(f"assets/{c.id}.{ext}", data)
                     continue
+                if c.cell_type == "split":
+                    # A split cell's FIGURE SIDE writes exactly like a figure or
+                    # image cell (same asset layout, keyed by the split cell id):
+                    # a figure side (has a spec) → figures/<id>.yaml + assets/<id>.png;
+                    # a photo side (image_ext, no spec) → assets/<id>.<ext>; an empty
+                    # figure side → no asset. The text side lives in report.md.
+                    if c.spec is not None:
+                        zf.writestr(f"figures/{c.id}.yaml", c.spec.to_yaml())
+                        png = assets.get(c.id)
+                        if png:
+                            zf.writestr(f"assets/{c.id}.png", png)
+                    elif c.image_ext:
+                        data = assets.get(c.id)
+                        if data:
+                            ext = (c.image_ext or "png").lower()
+                            zf.writestr(f"assets/{c.id}.{ext}", data)
+                    continue
                 if c.cell_type != "figure":
                     continue
                 if c.spec is not None:
@@ -1344,6 +1506,28 @@ def write_report_dir(doc: ReportDoc, directory: str,
                 with open(os.path.join(assets_dir, f"{c.id}.{ext}"), "wb") as f:
                     f.write(data)
             continue
+        if c.cell_type == "split":
+            # The split cell's figure side writes like a figure/photo cell
+            # (§write_report): a figure side → figures/<id>.yaml + assets/<id>.png;
+            # a photo side → assets/<id>.<ext>; an empty side → nothing.
+            if c.spec is not None:
+                os.makedirs(figures_dir, exist_ok=True)
+                with open(os.path.join(figures_dir, f"{c.id}.yaml"), "w",
+                          encoding="utf-8") as f:
+                    f.write(c.spec.to_yaml())
+                png = assets.get(c.id)
+                if png:
+                    os.makedirs(assets_dir, exist_ok=True)
+                    with open(os.path.join(assets_dir, f"{c.id}.png"), "wb") as f:
+                        f.write(png)
+            elif c.image_ext:
+                data = assets.get(c.id)
+                if data:
+                    os.makedirs(assets_dir, exist_ok=True)
+                    ext = (c.image_ext or "png").lower()
+                    with open(os.path.join(assets_dir, f"{c.id}.{ext}"), "wb") as f:
+                        f.write(data)
+            continue
         if c.cell_type != "figure":
             continue
         if c.spec is not None:
@@ -1380,6 +1564,39 @@ def read_report(path: str) -> "tuple[ReportDoc, dict[str, bytes]]":
                 asset_name = f"assets/{c.id}.{ext}"
                 if asset_name in names:
                     assets[c.id] = zf.read(asset_name)
+                continue
+            if c.cell_type == "split":
+                # A split cell's figure side re-hydrates like a figure OR image
+                # cell, keyed by the split cell id. A sibling figures/<id>.yaml →
+                # a figure side (attach the spec, read the .png). No yaml but an
+                # image_ext (parsed off the ref) → a photo side (read the raw
+                # bytes). An empty figure side → nothing. The split cell is NEVER
+                # promoted to an image cell (its cell_type stays "split").
+                spec_name = f"figures/{c.id}.yaml"
+                if spec_name in names:
+                    try:
+                        c.spec = FigureSpec.from_yaml(
+                            zf.read(spec_name).decode("utf-8"))
+                    except Exception:
+                        c.spec = None
+                    png_name = f"assets/{c.id}.png"
+                    if png_name in names:
+                        assets[c.id] = zf.read(png_name)
+                elif c.image_ext:
+                    ext = (c.image_ext or "png").lower()
+                    asset_name = f"assets/{c.id}.{ext}"
+                    if asset_name in names:
+                        assets[c.id] = zf.read(asset_name)
+                else:
+                    # No yaml and no non-png ext: a ``.png`` PHOTO side (a dropped
+                    # PNG) parsed through the figure-ref branch (which never set
+                    # ``image_ext``). Same figure-vs-image disambiguation as a
+                    # standalone ``.png`` cell: no yaml → it's a photo. Read its
+                    # bytes and stamp ``image_ext="png"`` so a re-save round-trips.
+                    png_name = f"assets/{c.id}.png"
+                    if png_name in names:
+                        assets[c.id] = zf.read(png_name)
+                        c.image_ext = "png"
                 continue
             if c.cell_type != "figure":
                 continue

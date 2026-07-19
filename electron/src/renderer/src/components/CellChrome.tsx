@@ -1,18 +1,22 @@
 /**
  * CellChrome.tsx — the shared hover-chrome pill (absolute-positioned, top-right)
- * shown on a Report cell (ReportCell.tsx: markdown; ReportFigureCell.tsx: figure).
+ * shown on a Report cell (ReportCell: markdown; ReportFigureCell: figure;
+ * ReportImageCell: photo; ReportSplitCell: split block).
  *
- * Both cells show the SAME Copy / Duplicate / Delete trio; ReportCell also has a
- * leading drag handle, ReportFigureCell also has a leading Edit toggle and a
- * trailing Refresh button. Rather than force one fixed button set, CellChrome
- * takes `leading`/`trailing` slots for the cell-specific extras and owns just the
- * chrome wrapper + the three shared buttons — so each caller keeps its own extra
- * affordances while the copy/duplicate/delete markup (and styling) lives once.
+ * All cells show the SAME Copy / Duplicate / Delete trio; each caller adds its
+ * own extras via the `leading` / `trailing` slots (a drag handle, a figure Edit
+ * toggle + Refresh, a split's layout switch). CellChrome owns just the chrome
+ * wrapper + the three shared buttons so the copy/duplicate/delete markup +
+ * styling lives once.
  *
- * Every existing `data-testid` is preserved EXACTLY as it was before this
- * extraction (both e2e suites select on them):
- *   `cell-copy-<id>`, `cell-duplicate-<id>`, plus a caller-supplied delete
- *   testid (`report-cell-delete-<id>` / `report-figcell-delete-<id>`).
+ * Wave B de-clutter: the per-cell SLIDE chrome (title-slide 'T', background
+ * style '◐', speaker-notes '📝', and the 2-column '▭/◧/◨' toggle + ColumnBadge)
+ * was REMOVED. Those roles are re-surfaced slide-natively in Wave C; the backend
+ * fields (slide_kind/slide_style/notes/column) remain untouched.
+ *
+ * Every surviving `data-testid` is preserved EXACTLY (both e2e suites select on
+ * them): `cell-copy-<id>`, `cell-duplicate-<id>`, plus a caller-supplied delete
+ * testid (`report-cell-delete-<id>` / `report-figcell-delete-<id>` / …).
  */
 import React from 'react'
 
@@ -25,30 +29,6 @@ export interface CellChromeStyles {
    *  delete button was 1px smaller than its copy/duplicate buttons). Defaults
    *  to `chromeBtn` when omitted. */
   deleteBtn?: React.CSSProperties
-  /** Style for the column toggle when a column is active (left/right). Defaults
-   *  to `chromeBtn` when omitted. */
-  columnBtnActive?: React.CSSProperties
-}
-
-/** The per-cell column value + cycle handler for the slide 2-column layout.
- *  '' / 'full' = full-width (default); 'left' / 'right' = a slide column. The
- *  toggle button cycles full → left → right → full. */
-export type CellColumn = '' | 'full' | 'left' | 'right'
-
-// The cycle order + the glyph/label per state.
-const COLUMN_CYCLE: CellColumn[] = ['', 'left', 'right']
-const COLUMN_GLYPH: Record<string, string> = {
-  '': '▭', full: '▭', left: '◧', right: '◨',
-}
-const COLUMN_LABEL: Record<string, string> = {
-  '': 'Full width', full: 'Full width', left: 'Left column', right: 'Right column',
-}
-
-// Slide background presets — the toggle cycles default → plain → accent.
-const STYLE_CYCLE = ['', 'plain', 'accent']
-const STYLE_GLYPH: Record<string, string> = { '': '◐', plain: '○', accent: '●' }
-const STYLE_LABEL: Record<string, string> = {
-  '': 'Default background', plain: 'Plain (flat) background', accent: 'Accent-tinted background',
 }
 
 interface Props {
@@ -59,136 +39,21 @@ interface Props {
   onDelete: () => void
   deleteTestid: string
   deleteTitle?: string
-  /** Extra buttons rendered BEFORE Copy (e.g. ReportCell's drag handle,
-   *  ReportFigureCell's Edit toggle). */
+  /** Extra buttons rendered BEFORE Copy (e.g. a drag handle, a figure Edit
+   *  toggle). */
   leading?: React.ReactNode
-  /** Extra buttons rendered AFTER Duplicate, BEFORE Delete (e.g.
-   *  ReportFigureCell's Refresh-from-live). */
+  /** Extra buttons rendered AFTER Duplicate, BEFORE Delete (e.g. a figure's
+   *  Refresh, a split block's layout switch). */
   trailing?: React.ReactNode
-  /** The cell's slide column ('' / 'full' / 'left' / 'right'). When
-   *  `onSetColumn` is also given, a 3-way toggle button (▭ full → ◧ left →
-   *  ◨ right) renders between `leading` and Copy. Omit both to hide it. */
-  column?: string
-  onSetColumn?: (column: CellColumn) => void
-  /** Presentation polish: this cell STARTS a slide (index 0 or a slide_break
-   *  cell), so a "Title slide" toggle is offered — it flips the WHOLE slide
-   *  between a big-centered title/section slide and a normal content slide.
-   *  Only rendered when `slideStart` is true AND `onToggleTitle` is given. */
-  slideStart?: boolean
-  /** The slide's current kind ('' / 'content' = normal; 'title' = title slide).
-   *  Read off this (slide-starting) cell. */
-  slideKind?: string
-  onToggleTitle?: () => void
-  /** The slide's background style preset ('' / 'default', 'plain', 'accent').
-   *  Read off this (slide-starting) cell. When `onCycleStyle` is also given and
-   *  `slideStart` is true, a preset-cycling button renders next to the title
-   *  toggle. */
-  slideStyle?: string
-  onCycleStyle?: (style: string) => void
-  /** The slide's SPEAKER NOTES (presenter view) — read off this (slide-starting)
-   *  cell. When `onToggleNotes` is also given and `slideStart` is true, a
-   *  "📝 Notes" button renders in the chrome; the parent owns the editor
-   *  (an inline textarea), so this button just toggles it open/closed. The button
-   *  shows a filled state when the slide already has notes. */
-  slideNotes?: string
-  notesOpen?: boolean
-  onToggleNotes?: () => void
-}
-
-/** A small ALWAYS-VISIBLE badge (top-left of a cell) marking its slide column —
- *  "◧ Left" / "◨ Right" — so the 2-column intent reads in the vertical cell
- *  list even when the cell isn't hovered. Renders nothing for a full-width cell.
- *  The sidebar keeps its linear DnD list (a real side-by-side grid would break
- *  the per-cell reorder + the vertical drop-index math), so the badge is how the
- *  authoring view signals columns; Present mode + export render them for real. */
-export function ColumnBadge({ column }: { column?: string }) {
-  const cur = column === 'left' || column === 'right' ? column : ''
-  if (!cur) return null
-  return (
-    <span
-      data-testid="cell-column-badge"
-      data-column={cur}
-      title={`This cell is the ${COLUMN_LABEL[cur].toLowerCase()} of its slide`}
-      style={badgeStyle}
-    >{COLUMN_GLYPH[cur]} {cur === 'left' ? 'Left' : 'Right'}</span>
-  )
-}
-
-const badgeStyle: React.CSSProperties = {
-  position: 'absolute', top: 2, left: 6, zIndex: 2,
-  display: 'inline-flex', alignItems: 'center', gap: 3,
-  fontSize: 9, fontWeight: 700, letterSpacing: 0.2,
-  color: '#89b4fa', background: 'rgba(137,180,250,0.12)',
-  border: '1px solid rgba(137,180,250,0.35)', borderRadius: 4,
-  padding: '1px 5px', lineHeight: 1.3, userSelect: 'none',
-  pointerEvents: 'none',
 }
 
 export function CellChrome({
   cellId, styles, onCopy, onDuplicate, onDelete, deleteTestid,
-  deleteTitle = 'Delete cell', leading, trailing, column, onSetColumn,
-  slideStart, slideKind, onToggleTitle, slideStyle, onCycleStyle,
-  slideNotes, notesOpen, onToggleNotes,
+  deleteTitle = 'Delete cell', leading, trailing,
 }: Props) {
-  const cur: CellColumn =
-    column === 'left' || column === 'right' ? column : ''
-  const cycleColumn = () => {
-    if (!onSetColumn) return
-    const idx = COLUMN_CYCLE.indexOf(cur)
-    onSetColumn(COLUMN_CYCLE[(idx + 1) % COLUMN_CYCLE.length])
-  }
-  const isTitle = slideKind === 'title'
-  const curStyle: string = STYLE_CYCLE.includes(slideStyle || '') ? (slideStyle || '') : ''
-  const cycleStyle = () => {
-    if (!onCycleStyle) return
-    const idx = STYLE_CYCLE.indexOf(curStyle)
-    onCycleStyle(STYLE_CYCLE[(idx + 1) % STYLE_CYCLE.length])
-  }
   return (
     <div style={styles.chrome}>
       {leading}
-      {slideStart && onToggleTitle && (
-        <button
-          data-testid={`cell-slide-kind-${cellId}`}
-          data-slide-kind={isTitle ? 'title' : 'content'}
-          style={isTitle ? (styles.columnBtnActive ?? styles.chromeBtn) : styles.chromeBtn}
-          title={isTitle
-            ? 'Title slide — click for a normal content slide'
-            : 'Make this a title / section slide (big centered heading)'}
-          onClick={onToggleTitle}
-        >T</button>
-      )}
-      {slideStart && onCycleStyle && (
-        <button
-          data-testid={`cell-slide-style-${cellId}`}
-          data-slide-style={curStyle || 'default'}
-          style={curStyle ? (styles.columnBtnActive ?? styles.chromeBtn) : styles.chromeBtn}
-          title={`Slide background: ${STYLE_LABEL[curStyle]} — click to cycle`}
-          onClick={cycleStyle}
-        >{STYLE_GLYPH[curStyle]}</button>
-      )}
-      {slideStart && onToggleNotes && (
-        <button
-          data-testid={`cell-slide-notes-${cellId}`}
-          data-has-notes={(slideNotes || '').trim() ? '1' : '0'}
-          data-notes-open={notesOpen ? '1' : '0'}
-          style={(slideNotes || '').trim() || notesOpen
-            ? (styles.columnBtnActive ?? styles.chromeBtn) : styles.chromeBtn}
-          title={(slideNotes || '').trim()
-            ? 'Edit this slide’s speaker notes (presenter view only)'
-            : 'Add speaker notes for this slide (presenter view only)'}
-          onClick={onToggleNotes}
-        >{'📝'}</button>
-      )}
-      {onSetColumn && (
-        <button
-          data-testid={`cell-column-${cellId}`}
-          data-column={cur || 'full'}
-          style={cur ? (styles.columnBtnActive ?? styles.chromeBtn) : styles.chromeBtn}
-          title={`Slide layout: ${COLUMN_LABEL[cur]} — click to cycle (full → left → right)`}
-          onClick={cycleColumn}
-        >{COLUMN_GLYPH[cur]}</button>
-      )}
       <button
         data-testid={`cell-copy-${cellId}`}
         style={styles.chromeBtn}

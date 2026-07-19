@@ -421,14 +421,14 @@ export interface RepfigSpec {
   vectors_mode?: string
 }
 
-/** One cell of the report document (markdown text, an embedded figure, or a
- *  dropped/pasted/browsed photo). */
+/** One cell of the report document (markdown text, an embedded figure, a
+ *  dropped/pasted/browsed photo, or a SPLIT block — text BESIDE a figure/photo). */
 export interface ReportCell {
   id: string
-  cell_type: 'markdown' | 'figure' | 'image'
-  /** markdown cells: the source text. */
+  cell_type: 'markdown' | 'figure' | 'image' | 'split'
+  /** markdown + split cells: the (text side's) source markdown. */
   source?: string
-  /** figure + image cells: the caption (alt text). */
+  /** figure + image + split cells: the caption (alt text). */
   caption?: string
   /** image (photo) cells: the raw image inlined as a data URL (rendered inline
    *  as a resizable <img>). */
@@ -473,6 +473,14 @@ export interface ReportCell {
    *  markdown carried on the slide's FIRST cell. Shown only in the presenter
    *  view; NEVER to the audience. Absent → '' (no notes). */
   notes?: string
+  /** SPLIT cells (Wave A): which side the TEXT sits on — 'text-left' (text left,
+   *  figure right — the default) | 'text-right' (mirror). The figure side rides
+   *  in `figure` (a FigureSpec) or `image` (a photo data URL), like a
+   *  figure/image cell; `source` carries the text side. */
+  split_layout?: string
+  /** SPLIT cells: the figure side is EMPTY (no figure/photo dropped yet) — the
+   *  renderer draws a drop zone. Absent/false → the figure side is filled. */
+  split_empty?: boolean
 }
 
 /** The authoritative report document (mirrored by the renderer for editing). */
@@ -481,6 +489,10 @@ export interface ReportDocState {
   path: string | null
   title: string
   template: boolean
+  /** Wave A — the document TYPE: 'report' (a scrolling article — the default and
+   *  every legacy document) | 'presentation' (a slide deck) | 'movie' (reserved).
+   *  Absent on an older backend/file → 'report'. */
+  type?: string
   dirty: boolean
   cells: ReportCell[]
 }

@@ -40,7 +40,7 @@ test.beforeAll(async () => {
   }
   await page.getByTestId('toggle-report').click()
   await expect(page.getByTestId('report-sidebar')).toBeVisible()
-  await backendAction(page, 'report_new', {})
+  await backendAction(page, 'report_new', { type: 'presentation' })
   await expect(page.getByTestId('report-body')).toBeVisible()
 })
 

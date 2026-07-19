@@ -6,7 +6,6 @@
  *     rendered cell; a `$` inside a code span stays literal.
  *   • The formatting toolbar: Bold wraps the selection in `**`, commits to a
  *     real <strong>; Ctrl+B does the same.
- *   • The header "Aa" text-size cycle actually changes the rendered font size.
  *
  * Screenshots to report_text_ui_shots/ — each Read by the author (a blank
  * panel is a failure even when selectors pass).
@@ -30,7 +29,9 @@ test.beforeAll(async () => {
   await page.waitForTimeout(1000)
   await page.getByTestId('toggle-report').click()
   await expect(page.getByTestId('report-sidebar')).toBeVisible()
-  await page.getByTestId('report-new').click()
+  // New report — the compact File menu (Wave B) → "New Report".
+  await page.getByTestId('report-menu-toggle').click()
+  await page.getByTestId('menu-new-report').click()
   await expect(page.getByTestId('report-body')).toBeVisible()
 })
 
@@ -137,6 +138,8 @@ test('4) static HTML export carries the MathML through (self-contained math)', a
     ipcMain.removeHandler('report:export-dialog')
     ipcMain.handle('report:export-dialog', async () => p)
   }, htmlPath)
+  // Export ▸ Static HTML lives in the compact File menu (Wave B).
+  await page.getByTestId('report-menu-toggle').click()
   await page.getByTestId('report-export-toggle').click()
   await page.getByTestId('export-html-static').click()
   await expect
@@ -155,19 +158,5 @@ test('4) static HTML export carries the MathML through (self-contained math)', a
   ctx.assertNoJsErrors()
 })
 
-test('5) the Aa header button cycles the rendered text size', async () => {
-  const { page } = ctx
-  const sizeOf = async () =>
-    await rendered().evaluate((el: HTMLElement) => getComputedStyle(el).fontSize)
-  const before = await sizeOf()
-  await page.getByTestId('report-md-size').click()
-  const after = await sizeOf()
-  expect(after).not.toBe(before)
-  // Cycle the remaining steps → wraps back to the starting size (4 sizes).
-  await page.getByTestId('report-md-size').click()
-  await page.getByTestId('report-md-size').click()
-  await page.getByTestId('report-md-size').click()
-  expect(await sizeOf()).toBe(before)
-  await page.screenshot({ path: join(SHOTS, '04-md-size-cycle.png') })
-  ctx.assertNoJsErrors()
-})
+// (Wave B removed the "Aa" text-size cycle button; the cell renders at the
+// default 13px size. The former test 5 that drove report-md-size was deleted.)

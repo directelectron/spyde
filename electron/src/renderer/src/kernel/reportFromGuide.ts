@@ -59,7 +59,8 @@ function slideSource(title: string, body: string): string {
  */
 export function reportFromGuide(guide: Guide, sendAction: SendAction): void {
   if (!guide || !Array.isArray(guide.steps) || guide.steps.length === 0) return
-  sendAction('report_new', {})
+  // A guided walkthrough seeds a PRESENTATION (each step → a slide).
+  sendAction('report_new', { type: 'presentation' })
   sendAction('report_set_title', { title: guide.title })
   guide.steps.forEach((step, i) => {
     const source = slideSource(step.title, step.body)

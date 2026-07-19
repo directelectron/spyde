@@ -297,6 +297,7 @@ test('2) interactive export embeds the blender; slider→0 drops the red pixels'
   await expect(page.getByTestId(`figcell-edit-${cellId}`)).toHaveCount(0)
   await page.waitForTimeout(1500)
 
+  await page.getByTestId('report-menu-toggle').click()
   await page.getByTestId('report-export-toggle').click()
   await expect(page.getByTestId('report-export-menu')).toBeVisible()
   await page.getByTestId('export-html-interactive').click()
