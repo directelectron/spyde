@@ -18,7 +18,7 @@ import React, { useState } from 'react'
 import { useSpyDE } from '../kernel/SpyDEContext'
 import { reportClipboard, type SerializedImageCell } from '../kernel/reportClipboard'
 import type { ReportCell } from '../kernel/protocol'
-import { CellChrome } from './CellChrome'
+import { CellChrome, ColumnBadge, type CellColumn } from './CellChrome'
 
 const WIDTH_KEY = (id: string) => `spyde-report-imgw-${id}`
 const DEFAULT_WIDTH_PCT = 100
@@ -121,13 +121,17 @@ export function ReportImageCell({ cell, onRemove, index, dragProps }: Props) {
         ...(dragProps.dropBefore ? styles.cellDropBefore : {}),
       }}
     >
+      {/* Always-visible slide-column badge (◧ Left / ◨ Right). */}
+      <ColumnBadge column={cell.column} />
       {hover && (
         <CellChrome
           cellId={cell.id}
-          styles={{ chrome: styles.chrome, chromeBtn: styles.chromeBtn }}
+          styles={{ chrome: styles.chrome, chromeBtn: styles.chromeBtn, columnBtnActive: styles.columnBtnActive }}
           onCopy={doCopy}
           onDuplicate={doDuplicate}
           onDelete={onRemove}
+          column={cell.column}
+          onSetColumn={(c: CellColumn) => sendAction('report_set_cell_column', { cell_id: cell.id, column: c })}
           deleteTestid={`report-imgcell-delete-${cell.id}`}
           deleteTitle="Delete image"
           leading={
@@ -231,6 +235,10 @@ const styles: Record<string, React.CSSProperties> = {
   },
   chromeBtn: {
     background: 'none', border: 'none', color: '#a6adc8', cursor: 'pointer',
+    fontSize: 13, padding: '0 3px', lineHeight: 1,
+  },
+  columnBtnActive: {
+    background: 'none', border: 'none', color: '#89b4fa', cursor: 'pointer',
     fontSize: 13, padding: '0 3px', lineHeight: 1,
   },
   imgWrap: {

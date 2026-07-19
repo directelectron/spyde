@@ -45,7 +45,7 @@ import type { ReportCell, RepfigPanel, RepfigLayer, RepfigSpec } from '../kernel
 import { FIGURE_DRAG_MIME, WINDOW_DRAG_MIME } from '../kernel/dnd'
 import { COLORMAPS } from '../kernel/colormaps'
 import { useKeyedDebounce } from './wizardHooks'
-import { CellChrome } from './CellChrome'
+import { CellChrome, ColumnBadge, type CellColumn } from './CellChrome'
 
 // The compose modes the backend can return (subset of these per drop).
 type ComposeMode =
@@ -663,17 +663,22 @@ export function ReportFigureCell({ cell, onRemove, index, dragProps, reorderActi
         ...(dragProps.dropBefore ? styles.cellDropBefore : {}),
       }}
     >
-      {/* Hover chrome: drag handle (reorder) + Edit toggle + Copy + Duplicate +
-          Refresh-from-live + delete (not on a placeholder). Only the ⠿ handle is
-          draggable — the cell root can't be (the figure iframe needs its own
-          pointer gestures), so the handle sets the ROOT as the drag image. */}
+      {/* Always-visible slide-column badge (◧ Left / ◨ Right) — not on a
+          placeholder (a slot has no slide role yet). */}
+      {!cell.placeholder && <ColumnBadge column={cell.column} />}
+      {/* Hover chrome: drag handle (reorder) + column toggle + Edit toggle + Copy
+          + Duplicate + Refresh-from-live + delete (not on a placeholder). Only the
+          ⠿ handle is draggable — the cell root can't be (the figure iframe needs
+          its own pointer gestures), so the handle sets the ROOT as the drag image. */}
       {hover && !cell.placeholder && (
         <CellChrome
           cellId={cell.id}
-          styles={{ chrome: styles.chrome, chromeBtn: styles.chromeBtn }}
+          styles={{ chrome: styles.chrome, chromeBtn: styles.chromeBtn, columnBtnActive: styles.chromeBtnActive }}
           onCopy={doCopy}
           onDuplicate={doDuplicate}
           onDelete={onRemove}
+          column={cell.column}
+          onSetColumn={(c: CellColumn) => sendAction('report_set_cell_column', { cell_id: cell.id, column: c })}
           deleteTestid={`report-figcell-delete-${cell.id}`}
           deleteTitle="Delete figure"
           leading={

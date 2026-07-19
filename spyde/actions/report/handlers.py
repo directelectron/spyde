@@ -274,10 +274,12 @@ class ReportManager:
                 "placeholder": bool(c.placeholder),
                 "fig_id": c.id if c.cell_type == "figure" else None,
                 "data_offline": bool(c.cell_type == "figure" and c.id in self._offline),
-                # Present-mode fields (Phase 6): slide grouping + go-live handle.
+                # Present-mode fields (Phase 6): slide grouping + go-live handle
+                # + 2-column layout ("" | "left" | "right").
                 "slide_break": bool(getattr(c, "slide_break", False)),
                 "live_action": (dict(c.live_action)
                                 if getattr(c, "live_action", None) else None),
+                "column": str(getattr(c, "column", "") or ""),
             }
             # An IMAGE (photo) cell ships its bytes as a data URL so the renderer
             # can draw the <img> with no round trip (mirrors the offline-figure
@@ -1989,6 +1991,9 @@ def report_add_cell(session, plot, payload) -> None:
     la = payload.get("live_action")
     if isinstance(la, dict) and la:
         cell.live_action = dict(la)
+    if payload.get("column") is not None:
+        from spyde.actions.report.model import _normalize_column
+        cell.column = _normalize_column(payload.get("column"))
     _insert_cell(mgr.doc, cell, payload.get("index"))
     mgr.dirty = True
     mgr.emit_state()
@@ -2141,6 +2146,26 @@ def report_set_live_action(session, plot, payload) -> None:
         return
     la = payload.get("live_action")
     cell.live_action = dict(la) if isinstance(la, dict) and la else None
+    mgr.dirty = True
+    mgr.emit_state()
+
+
+def report_set_cell_column(session, plot, payload) -> None:
+    """Assign a cell to a COLUMN within its slide — the 2-column layout so a text
+    cell can sit BESIDE a figure/photo (see :func:`spyde.actions.report.model.slide_columns`).
+
+    ``{cell_id, column}`` where ``column`` is ``"left"`` / ``"right"`` (place in
+    the 2-col grid) or ``""`` / ``"full"`` (span the whole slide — the default).
+    Any other value collapses to ``""`` (full width). An unknown cell is a no-op
+    (no crash)."""
+    from spyde.actions.report.model import _normalize_column
+    mgr = _manager(session)
+    if not mgr.open:
+        return
+    cell = mgr.doc.cell_by_id(payload.get("cell_id"))
+    if cell is None:
+        return
+    cell.column = _normalize_column(payload.get("column"))
     mgr.dirty = True
     mgr.emit_state()
 

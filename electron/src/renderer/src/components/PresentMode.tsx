@@ -98,6 +98,34 @@ function groupSlides(cells: ReportCell[]): ReportCell[][] {
   return groups
 }
 
+/** A slide's cells grouped into ROWS for the 2-column layout — the renderer
+ *  mirror of `model.slide_columns()`. A `left`/`right` cell opens/continues a
+ *  2-col row; a `full` (''/'full') cell closes it and spans the slide. */
+type ColumnRow =
+  | { kind: 'full'; cell: ReportCell }
+  | { kind: 'cols'; left: ReportCell[]; right: ReportCell[] }
+
+function normalizeColumn(col: string | undefined): '' | 'left' | 'right' {
+  const s = (col ?? '').trim().toLowerCase()
+  return s === 'left' || s === 'right' ? s : ''
+}
+
+function groupColumns(cells: ReportCell[]): ColumnRow[] {
+  const rows: ColumnRow[] = []
+  let cur: { kind: 'cols'; left: ReportCell[]; right: ReportCell[] } | null = null
+  for (const c of cells) {
+    const col = normalizeColumn(c.column)
+    if (col === 'left' || col === 'right') {
+      if (!cur) { cur = { kind: 'cols', left: [], right: [] }; rows.push(cur) }
+      cur[col].push(c)
+    } else {
+      cur = null
+      rows.push({ kind: 'full', cell: c })
+    }
+  }
+  return rows
+}
+
 export function PresentMode({ initialSlide, onSlideChange, onExit, onLaunchLive }: Props) {
   const { state, iframeRefs, replayState } = useSpyDE()
   const report = state.report && state.report.open ? state.report : null
@@ -216,6 +244,19 @@ function Slide({ cells, active, reportFigures, iframeRefs, replayState, onLaunch
 }) {
   // The go-live handle for this slide: the first cell that carries one.
   const live = cells.find(c => c.live_action)?.live_action as LiveAction | undefined
+  // Group the slide's cells into full-width / 2-column rows.
+  const rows = React.useMemo(() => groupColumns(cells), [cells])
+
+  const renderCell = (cell: ReportCell, inColumn = false) => (
+    <SlideCell
+      key={cell.id}
+      cell={cell}
+      inColumn={inColumn}
+      reportFigures={reportFigures}
+      iframeRefs={iframeRefs}
+      replayState={replayState}
+    />
+  )
 
   return (
     <section
@@ -224,14 +265,19 @@ function Slide({ cells, active, reportFigures, iframeRefs, replayState, onLaunch
       style={{ ...styles.slide, ...(active ? styles.slideActive : {}) }}
     >
       <div style={styles.slideInner}>
-        {cells.map(cell => (
-          <SlideCell
-            key={cell.id}
-            cell={cell}
-            reportFigures={reportFigures}
-            iframeRefs={iframeRefs}
-            replayState={replayState}
-          />
+        {rows.map((row, ri) => (
+          row.kind === 'full'
+            ? <React.Fragment key={row.cell.id}>{renderCell(row.cell)}</React.Fragment>
+            : (
+              <div key={`cols-${ri}`} data-testid="present-cols" style={styles.cols}>
+                <div data-testid="present-col-left" style={styles.col}>
+                  {row.left.map(c => renderCell(c, true))}
+                </div>
+                <div data-testid="present-col-right" style={styles.col}>
+                  {row.right.map(c => renderCell(c, true))}
+                </div>
+              </div>
+            )
         ))}
         {live && (
           <div style={styles.liveRow}>
@@ -253,17 +299,19 @@ function Slide({ cells, active, reportFigures, iframeRefs, replayState, onLaunch
 // its baked PNG when offline, or a skipped placeholder. Dispatches to two
 // sub-components so hooks are never called conditionally (cell_type is stable
 // per cell id, but keep the split for React-rules correctness).
-function SlideCell({ cell, reportFigures, iframeRefs, replayState }: {
+function SlideCell({ cell, inColumn, reportFigures, iframeRefs, replayState }: {
   cell: ReportCell
+  inColumn: boolean
   reportFigures: ReturnType<typeof useSpyDE>['state']['reportFigures']
   iframeRefs: ReturnType<typeof useSpyDE>['iframeRefs']
   replayState: ReturnType<typeof useSpyDE>['replayState']
 }) {
   if (cell.cell_type === 'markdown') return <SlideMarkdown cell={cell} />
-  if (cell.cell_type === 'image') return <SlideImage cell={cell} />
+  if (cell.cell_type === 'image') return <SlideImage cell={cell} inColumn={inColumn} />
   return (
     <SlideFigure
       cell={cell}
+      inColumn={inColumn}
       reportFigures={reportFigures}
       iframeRefs={iframeRefs}
       replayState={replayState}
@@ -273,13 +321,15 @@ function SlideCell({ cell, reportFigures, iframeRefs, replayState }: {
 
 // A photo on a slide — large + centered, using the same data URL the sidebar
 // renders. Sized to fit the slide (max-height caps it so a tall image doesn't
-// push the caption off-screen).
-function SlideImage({ cell }: { cell: ReportCell }) {
+// push the caption off-screen). In a 2-column row it caps shorter so it sits
+// beside the text without overflowing the row.
+function SlideImage({ cell, inColumn }: { cell: ReportCell; inColumn: boolean }) {
   const caption = (cell.caption ?? '').trim()
   if (!cell.image) return null
   return (
     <figure data-testid={`present-img-${cell.id}`} style={styles.figure}>
-      <img src={cell.image} alt={caption} style={styles.slideImg} />
+      <img src={cell.image} alt={caption}
+        style={{ ...styles.slideImg, ...(inColumn ? styles.slideImgCol : {}) }} />
       {caption && <figcaption style={styles.figCaption}>{caption}</figcaption>}
     </figure>
   )
@@ -297,8 +347,9 @@ function SlideMarkdown({ cell }: { cell: ReportCell }) {
   )
 }
 
-function SlideFigure({ cell, reportFigures, iframeRefs, replayState }: {
+function SlideFigure({ cell, inColumn, reportFigures, iframeRefs, replayState }: {
   cell: ReportCell
+  inColumn: boolean
   reportFigures: ReturnType<typeof useSpyDE>['state']['reportFigures']
   iframeRefs: ReturnType<typeof useSpyDE>['iframeRefs']
   replayState: ReturnType<typeof useSpyDE>['replayState']
@@ -308,7 +359,7 @@ function SlideFigure({ cell, reportFigures, iframeRefs, replayState }: {
   const caption = (cell.caption ?? '').trim()
   return (
     <figure data-testid={`present-fig-${cell.id}`} style={styles.figure}>
-      <div style={styles.figBox}>
+      <div style={{ ...styles.figBox, ...(inColumn ? styles.figBoxCol : {}) }}>
         {fig ? (
           <SeamlessFigureFrame
             figId={fig.figId}
@@ -341,12 +392,27 @@ const styles: Record<string, React.CSSProperties> = {
   },
   slideActive: { display: 'flex' },
   slideInner: { maxWidth: '60rem', margin: '0 auto', width: '100%' },
+  // A 2-column row: text BESIDE a figure/photo. Vertically centered so a short
+  // text column reads well against a tall figure.
+  cols: {
+    display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '2.5vw',
+    alignItems: 'center', width: '100%', margin: '0.5rem 0',
+  },
+  col: { minWidth: 0 },
   figure: { margin: '1rem 0', textAlign: 'center' },
   figBox: {
+    // position:relative is LOAD-BEARING — SeamlessFigureFrame's frameHost is
+    // `position:absolute; inset:0`, so it anchors to the nearest positioned
+    // ancestor. Without this the iframe escaped the column box and filled the
+    // whole slide (the 2-column layout made that visible).
+    position: 'relative',
     width: '100%', height: '58vh',
     border: '1px solid #313244', borderRadius: 8, overflow: 'hidden',
     background: '#0e0e16',
   },
+  // In a 2-column row the figure box is a touch shorter so it sits beside the
+  // text within one slide height rather than overflowing the row.
+  figBoxCol: { height: '52vh' },
   figImg: { maxWidth: '100%', maxHeight: '100%', height: 'auto' },
   // A photo cell on a slide — large + centered, capped so it stays on-screen
   // with room for the caption.
@@ -354,6 +420,7 @@ const styles: Record<string, React.CSSProperties> = {
     display: 'block', margin: '0 auto',
     maxWidth: '100%', maxHeight: '68vh', height: 'auto', borderRadius: 8,
   },
+  slideImgCol: { maxHeight: '60vh' },
   figPending: {
     display: 'flex', alignItems: 'center', justifyContent: 'center',
     height: '100%', color: '#585b70', fontSize: 14,

@@ -124,6 +124,23 @@ _SLIDE_BREAK_RE = re.compile(r"^<!--\s*spyde:slide-break\s*-->\s*$")
 # the cell it applies to.
 _LIVE_ACTION_RE = re.compile(
     r"^<!--\s*spyde:live-action\s+(?P<payload>.*?)\s*-->\s*$")
+# A 2-column layout marker (Present mode / slides): ``<!-- spyde:column <val> -->``
+# — an invisible comment BEFORE the cell assigning it to a column WITHIN its
+# slide. ``left`` / ``right`` place the cell in the two-column grid; ``full``
+# (or absence) spans the whole slide (the current, default behaviour). Anything
+# else parses as "" (full width). Mirrors the slide-break marker exactly.
+_COLUMN_RE = re.compile(r"^<!--\s*spyde:column\s+(?P<val>\S+)\s*-->\s*$")
+# The accepted column values (anything else → "" == full width). "full" and ""
+# are equivalent (both span the slide); only left/right open a 2-col grid.
+_COLUMN_VALUES = ("left", "right", "full")
+
+
+def _normalize_column(val) -> str:
+    """Normalise a raw column value to one of ``{"", "left", "right"}``. ``full``
+    and any unknown/absent value collapse to ``""`` (full width) so an older
+    report — which has no column markers — renders exactly as before."""
+    s = str(val or "").strip().lower()
+    return s if s in ("left", "right") else ""
 
 
 # ── the spec dataclasses (full schema; Phase 1 uses single-panel/single-layer) ─
@@ -534,7 +551,16 @@ class Cell:
     "go live" excursion handle — a small dict like
     ``{"tutorial": "<name>", "guide": "<id>"}`` that Present mode turns into a
     "Launch live ▶" button; persisted as ``<!-- spyde:live-action <yaml-flow> -->``
-    before the cell. Absent → None."""
+    before the cell. Absent → None.
+
+    ``column`` (Present mode / slides) assigns the cell to a COLUMN within its
+    slide: ``""`` (default) / ``"full"`` span the whole slide (current
+    behaviour); ``"left"`` / ``"right"`` place the cell in a 2-column grid so a
+    text cell can sit BESIDE a figure/photo. Consecutive left/right cells form a
+    2-col row; a ``""``/full cell closes any open row and spans full width (see
+    :func:`slide_columns`). Persisted in report.md as an invisible
+    ``<!-- spyde:column left -->`` comment before the cell (mirrors
+    ``slide_break``); absent on older files → ``""`` (SCHEMA_VERSION stays 1)."""
     id: str = field(default_factory=new_cell_id)
     cell_type: str = "markdown"
     source: str = ""                           # markdown text (markdown cells)
@@ -545,6 +571,7 @@ class Cell:
     html: str = ""                             # derived, NON-persisted (export only)
     slide_break: bool = False                  # Present mode: starts a new slide
     live_action: dict | None = None            # Present mode: "go live" excursion
+    column: str = ""                           # Present mode: "" | "left" | "right"
 
 
 @dataclass
@@ -600,6 +627,39 @@ class ReportDoc:
         self.modified = _utcnow()
 
 
+def slide_columns(cells: "list[Cell]") -> list:
+    """Turn a SLIDE's cell list into an ordered list of ROWS for the 2-column
+    layout, reused by Present mode + the slides HTML export (and mirrored in the
+    renderer's ``groupColumns``).
+
+    Each returned row is one of:
+
+    * ``{"kind": "full", "cell": <Cell>}`` — a full-width block (a cell with
+      ``column`` ``""`` / ``"full"``), OR
+    * ``{"kind": "cols", "left": [<Cell>…], "right": [<Cell>…]}`` — a 2-column
+      grid row: consecutive ``left``/``right`` cells accumulate into the two
+      columns (in document order within each column).
+
+    Rule: walk the cells in order; a ``left``/``right`` cell opens or continues
+    the current cols row; a full cell CLOSES any open cols row and stands alone.
+    A slide of all-full cells (the common / legacy case) yields one full row per
+    cell — exactly the current stacked behaviour. Preserves order; every cell
+    lands in exactly one row."""
+    rows: list = []
+    cur: dict | None = None                    # the open {"kind":"cols",…} row
+    for c in cells:
+        col = _normalize_column(getattr(c, "column", ""))
+        if col in ("left", "right"):
+            if cur is None:
+                cur = {"kind": "cols", "left": [], "right": []}
+                rows.append(cur)
+            cur[col].append(c)
+        else:
+            cur = None
+            rows.append({"kind": "full", "cell": c})
+    return rows
+
+
 # ── time / yaml helpers ───────────────────────────────────────────────────────
 
 
@@ -633,13 +693,17 @@ def serialize_report_md(doc: ReportDoc) -> str:
         # Present-mode markers ride as invisible comments in their OWN standalone
         # block (a blank line keeps them from being sucked into a markdown cell),
         # emitted BEFORE the cell they apply to. slide-break first, then any
-        # live-action, so parsing sees them in a stable order.
+        # live-action, then any column assignment, so parsing sees them in a
+        # stable order.
         if getattr(c, "slide_break", False):
             body_blocks.append("<!-- spyde:slide-break -->")
         if getattr(c, "live_action", None):
             flow = yaml.safe_dump(dict(c.live_action), default_flow_style=True,
                                   sort_keys=True, allow_unicode=True).strip()
             body_blocks.append(f"<!-- spyde:live-action {flow} -->")
+        col = _normalize_column(getattr(c, "column", ""))
+        if col:
+            body_blocks.append(f"<!-- spyde:column {col} -->")
         if c.cell_type == "markdown":
             body_blocks.append(c.source.rstrip("\n"))
         elif c.cell_type == "image":
@@ -716,15 +780,18 @@ def _parse_body_cells(body: str) -> list:
     # NEXT cell created (markdown or figure). They flush the pending markdown
     # buffer first (so the marker starts a NEW cell rather than joining the one
     # already accumulating above it).
-    pending: dict = {"slide_break": False, "live_action": None}
+    pending: dict = {"slide_break": False, "live_action": None, "column": ""}
 
     def _apply_pending(cell: "Cell") -> "Cell":
         if pending["slide_break"]:
             cell.slide_break = True
         if pending["live_action"] is not None:
             cell.live_action = pending["live_action"]
+        if pending["column"]:
+            cell.column = pending["column"]
         pending["slide_break"] = False
         pending["live_action"] = None
+        pending["column"] = ""
         return cell
 
     def flush_md() -> None:
@@ -775,6 +842,7 @@ def _parse_body_cells(body: str) -> list:
 
         m_break = _SLIDE_BREAK_RE.match(stripped)
         m_live = _LIVE_ACTION_RE.match(stripped)
+        m_col = _COLUMN_RE.match(stripped)
         m_fig = _FIG_LINE_RE.match(stripped)
         m_image = _IMAGE_LINE_RE.match(stripped)
         m_ph = _PLACEHOLDER_RE.match(stripped)
@@ -791,6 +859,11 @@ def _parse_body_cells(body: str) -> list:
                 payload = None
             pending["live_action"] = (dict(payload)
                                       if isinstance(payload, dict) else None)
+        elif m_col is not None:
+            # A column assignment applies to whatever cell comes next; unknown
+            # values collapse to "" (full width) via _normalize_column.
+            flush_md()
+            pending["column"] = _normalize_column(m_col.group("val"))
         elif m_image is not None:
             # A NON-png image ref is unambiguously an IMAGE cell (a figure is
             # always ``.png``). A ``.png`` image is matched by ``_FIG_LINE_RE``

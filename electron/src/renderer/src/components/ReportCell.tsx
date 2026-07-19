@@ -18,7 +18,7 @@ import { useSpyDE } from '../kernel/SpyDEContext'
 import { renderMarkdown } from '../kernel/markdown'
 import { reportClipboard } from '../kernel/reportClipboard'
 import type { ReportCell as ReportCellType } from '../kernel/protocol'
-import { CellChrome } from './CellChrome'
+import { CellChrome, ColumnBadge, type CellColumn } from './CellChrome'
 
 // One-time scoped markdown stylesheet for the dark theme. Injected under a
 // `.spyde-md` wrapper so it never leaks into the rest of the app. Sizes are in
@@ -308,14 +308,18 @@ export function ReportCell({ cell, rawMode, onUpdate, onRemove, index, dragProps
         ...(dragProps.dropBefore ? styles.cellDropBefore : {}),
       }}
     >
-      {/* Hover chrome: drag handle (reorder) + copy + duplicate + delete. */}
+      {/* Always-visible slide-column badge (◧ Left / ◨ Right). */}
+      <ColumnBadge column={cell.column} />
+      {/* Hover chrome: drag handle (reorder) + column toggle + copy + duplicate + delete. */}
       {(hover || showEditor) && (
         <CellChrome
           cellId={cell.id}
-          styles={{ chrome: styles.chrome, chromeBtn: styles.chromeBtn, deleteBtn: styles.deleteBtn }}
+          styles={{ chrome: styles.chrome, chromeBtn: styles.chromeBtn, deleteBtn: styles.deleteBtn, columnBtnActive: styles.columnBtnActive }}
           onCopy={doCopy}
           onDuplicate={doDuplicate}
           onDelete={onRemove}
+          column={cell.column}
+          onSetColumn={(c: CellColumn) => sendAction('report_set_cell_column', { cell_id: cell.id, column: c })}
           deleteTestid={`report-cell-delete-${cell.id}`}
           deleteTitle="Delete cell"
           leading={
@@ -408,6 +412,10 @@ const styles: Record<string, React.CSSProperties> = {
   },
   chromeBtn: {
     background: 'none', border: 'none', color: '#6c7086', cursor: 'pointer',
+    fontSize: 12, padding: '0 2px', lineHeight: 1,
+  },
+  columnBtnActive: {
+    background: 'none', border: 'none', color: '#89b4fa', cursor: 'pointer',
     fontSize: 12, padding: '0 2px', lineHeight: 1,
   },
   deleteBtn: {
