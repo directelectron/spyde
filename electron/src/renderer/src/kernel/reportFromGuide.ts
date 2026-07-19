@@ -25,9 +25,12 @@ type SendAction = (action: string, payload?: Record<string, unknown>) => void
 // Phase 1's `tutorial_load` isn't wired, the Launch-live button degrades to just
 // exiting Present mode (see PresentMode.tsx).
 const GUIDE_TUTORIAL: Record<string, string | undefined> = {
+  welcome: 'navigation',
   'find-vectors': 'find_vectors',
   'virtual-imaging': 'find_vectors',
   orientation: 'orientation',
+  strain: 'strain',
+  spectroscopy: 'spectroscopy',
 }
 
 /** The markdown source for one guide step's slide: the title as an H1 heading

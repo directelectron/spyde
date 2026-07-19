@@ -64,7 +64,9 @@ export const virtualImagingGuide: Guide = {
       body:
         'Add a detector region and a **virtual image** window opens, filled from ' +
         'the intensity it integrates across the scan. Drag or resize the detector ' +
-        'on the pattern to update the image live.',
+        'on the pattern to update the image live.\n\n' +
+        '> 💡 Try it below — drag the green detector over a diffraction spot and ' +
+        'watch the scan map light up wherever that spot appears.',
       placement: 'center',
       image: 'vi-output.png',
       drive: {
@@ -73,6 +75,9 @@ export const virtualImagingGuide: Guide = {
         settleMs: 1500,
       },
       autoDrive: true,
+      // Interactive web embed: the vectors explorer's live detector→virtual-image
+      // scan, running entirely in the browser. Falls back to the screenshot.
+      embed: 'vectors-explorer.html',
     },
   ],
 }
