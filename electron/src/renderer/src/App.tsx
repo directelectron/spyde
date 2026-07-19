@@ -15,6 +15,7 @@ import { GpuHelpGate } from './components/GpuHelpGate'
 import { UpdateCard } from './components/UpdateCard'
 import { MenuBar } from './components/MenuBar'
 import { DownloadToasts } from './components/DownloadToasts'
+import { PresentGate } from './components/PresentGate'
 import { GUIDES, getGuide, type Guide } from '@guides/index'
 
 export function App() {
@@ -57,6 +58,11 @@ export function App() {
           DownloadToasts corner. Shows the whole updater lifecycle incl. errors. */}
       <UpdateCard />
       {tour && <Tour guide={tour} onClose={() => setTour(null)} />}
+      {/* Present mode (Phase 6): renders the open Report as full-screen slides,
+          launched from the Report sidebar's "Present" button (via the
+          spyde:report_present event). Owns the slide-index persistence + the
+          go-live excursion handoff. */}
+      <PresentGate onStartGuide={(g) => setTour(g)} />
       {/* Scan-shape/step-size confirm dialog — reads the pending prompt from the
           SpyDE context (so injected test messages reach it too). */}
       <NavShapeGate />

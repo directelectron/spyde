@@ -264,6 +264,10 @@ class ReportManager:
                 "placeholder": bool(c.placeholder),
                 "fig_id": c.id if c.cell_type == "figure" else None,
                 "data_offline": bool(c.cell_type == "figure" and c.id in self._offline),
+                # Present-mode fields (Phase 6): slide grouping + go-live handle.
+                "slide_break": bool(getattr(c, "slide_break", False)),
+                "live_action": (dict(c.live_action)
+                                if getattr(c, "live_action", None) else None),
             }
             # For a figure cell, ship the PIXEL-FREE FigureSpec recipe (as a plain
             # dict) so the renderer's edit toolbar can list panels / layers /
@@ -1943,6 +1947,13 @@ def report_add_cell(session, plot, payload) -> None:
     # a derived, non-persisted field used only by HTML export.
     if payload.get("html") is not None:
         cell.html = str(payload.get("html") or "")
+    # OPTIONAL Present-mode fields (Phase 6) so a seeded deck (report_from_guide)
+    # can create each cell already-marked without a follow-up round trip.
+    if payload.get("slide_break") is not None:
+        cell.slide_break = bool(payload.get("slide_break"))
+    la = payload.get("live_action")
+    if isinstance(la, dict) and la:
+        cell.live_action = dict(la)
     _insert_cell(mgr.doc, cell, payload.get("index"))
     mgr.dirty = True
     mgr.emit_state()
@@ -2007,6 +2018,45 @@ def report_move_cell(session, plot, payload) -> None:
     cell = mgr.doc.cells.pop(cur)
     idx = max(0, min(idx, len(mgr.doc.cells)))
     mgr.doc.cells.insert(idx, cell)
+    mgr.dirty = True
+    mgr.emit_state()
+
+
+def report_toggle_slide_break(session, plot, payload) -> None:
+    """Toggle (or set) a cell's ``slide_break`` flag — Present mode / the slides
+    export group cells into slides by it (a cell with ``slide_break=True`` STARTS
+    a new slide).
+
+    ``{cell_id}`` alone TOGGLES; an explicit ``{cell_id, value: bool}`` sets it.
+    An unknown cell is a no-op (no crash)."""
+    mgr = _manager(session)
+    if not mgr.open:
+        return
+    cell = mgr.doc.cell_by_id(payload.get("cell_id"))
+    if cell is None:
+        return
+    if "value" in payload:
+        cell.slide_break = bool(payload.get("value"))
+    else:
+        cell.slide_break = not bool(getattr(cell, "slide_break", False))
+    mgr.dirty = True
+    mgr.emit_state()
+
+
+def report_set_live_action(session, plot, payload) -> None:
+    """Set (or clear) a cell's ``live_action`` — the optional "go live" excursion
+    Present mode surfaces as a "Launch live ▶" button.
+
+    ``{cell_id, live_action: {tutorial?, guide?}}`` sets it; a null / empty
+    ``live_action`` clears it. An unknown cell is a no-op."""
+    mgr = _manager(session)
+    if not mgr.open:
+        return
+    cell = mgr.doc.cell_by_id(payload.get("cell_id"))
+    if cell is None:
+        return
+    la = payload.get("live_action")
+    cell.live_action = dict(la) if isinstance(la, dict) and la else None
     mgr.dirty = True
     mgr.emit_state()
 

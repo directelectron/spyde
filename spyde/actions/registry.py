@@ -98,6 +98,9 @@ STAGED_HANDLERS: dict[str, str] = {
     "report_move_cell":        "spyde.actions.report.handlers.report_move_cell",
     "report_set_caption":      "spyde.actions.report.handlers.report_set_caption",
     "report_set_title":        "spyde.actions.report.handlers.report_set_title",
+    # Report Builder Phase 6 — Present mode (slide grouping + go-live excursion)
+    "report_toggle_slide_break": "spyde.actions.report.handlers.report_toggle_slide_break",
+    "report_set_live_action":  "spyde.actions.report.handlers.report_set_live_action",
     "report_add_figure":       "spyde.actions.report.handlers.report_add_figure",
     "report_refresh_figure":   "spyde.actions.report.handlers.report_refresh_figure",
     "repfig_refresh_panel":    "spyde.actions.report.handlers.repfig_refresh_panel",

@@ -905,7 +905,7 @@ export function ReportFigureCell({ cell, onRemove, index, dragProps, reorderActi
  * Also owns the ResizeObserver → resizeFigure(figId, w, h) so the figure
  * relayouts when the CSS-responsive cell box changes size (mirrors WindowContent).
  */
-function SeamlessFigureFrame({ figId, filePath, title, iframeRefs, replayState }: {
+export function SeamlessFigureFrame({ figId, filePath, title, iframeRefs, replayState }: {
   figId: string
   filePath: string | null
   title: string

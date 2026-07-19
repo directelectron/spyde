@@ -102,6 +102,14 @@ _FIG_LINE_RE = re.compile(
 # A template placeholder comment: ``<!-- spyde:placeholder <id> [caption] -->``.
 _PLACEHOLDER_RE = re.compile(
     r"^<!--\s*spyde:placeholder\s+(?P<cid>\S+)(?:\s+(?P<caption>.*?))?\s*-->\s*$")
+# A slide-break marker (Present mode): ``<!-- spyde:slide-break -->`` — an
+# invisible comment BEFORE the cell that starts a new slide.
+_SLIDE_BREAK_RE = re.compile(r"^<!--\s*spyde:slide-break\s*-->\s*$")
+# A "go live" excursion marker: ``<!-- spyde:live-action <yaml-flow> -->`` — a
+# small YAML flow mapping (e.g. ``{tutorial: strain, guide: strain}``) BEFORE
+# the cell it applies to.
+_LIVE_ACTION_RE = re.compile(
+    r"^<!--\s*spyde:live-action\s+(?P<payload>.*?)\s*-->\s*$")
 
 
 # ── the spec dataclasses (full schema; Phase 1 uses single-panel/single-layer) ─
@@ -492,7 +500,19 @@ class Cell:
     marked+DOMPurify-sanitized rendering of ``source`` (delivered on every
     markdown commit). It is used ONLY by HTML export — never written into
     report.md / the zip, and absent after a reload until the next edit. HTML
-    export falls back to escaping the raw markdown when it's empty."""
+    export falls back to escaping the raw markdown when it's empty.
+
+    ``slide_break`` (Phase 6 — Present mode) marks a cell as the START of a new
+    slide when the report is presented / exported as slides: cells accumulate
+    onto the current slide until the next cell with ``slide_break=True`` (see
+    :meth:`ReportDoc.slides`). Persisted in report.md as an invisible HTML
+    comment ``<!-- spyde:slide-break -->`` immediately BEFORE the cell's block
+    (invisible in any external markdown renderer). Absent on older files → False
+    (SCHEMA_VERSION stays 1). ``live_action`` (also Phase 6) is an OPTIONAL
+    "go live" excursion handle — a small dict like
+    ``{"tutorial": "<name>", "guide": "<id>"}`` that Present mode turns into a
+    "Launch live ▶" button; persisted as ``<!-- spyde:live-action <yaml-flow> -->``
+    before the cell. Absent → None."""
     id: str = field(default_factory=new_cell_id)
     cell_type: str = "markdown"
     source: str = ""                           # markdown text (markdown cells)
@@ -500,6 +520,8 @@ class Cell:
     placeholder: bool = False
     spec: FigureSpec | None = None             # figure recipe (figure cells)
     html: str = ""                             # derived, NON-persisted (export only)
+    slide_break: bool = False                  # Present mode: starts a new slide
+    live_action: dict | None = None            # Present mode: "go live" excursion
 
 
 @dataclass
@@ -532,6 +554,24 @@ class ReportDoc:
             if c.id == cell_id:
                 return i
         return -1
+
+    def slides(self) -> "list[list[Cell]]":
+        """Group ``cells`` into slides for Present mode / the slides export.
+
+        A cell with ``slide_break=True`` STARTS a new slide; cells accumulate
+        onto the current slide until the next break. The FIRST slide always
+        begins with the first cell (a leading ``slide_break`` on cell 0 is a
+        no-op — it can't split before the start). An empty document → ``[]``.
+        Preserves cell order exactly; every cell lands in exactly one slide."""
+        groups: list[list[Cell]] = []
+        for c in self.cells:
+            if c.slide_break and groups:
+                groups.append([c])
+            elif not groups:
+                groups.append([c])
+            else:
+                groups[-1].append(c)
+        return groups
 
     def touch(self) -> None:
         self.modified = _utcnow()
@@ -567,6 +607,16 @@ def serialize_report_md(doc: ReportDoc) -> str:
     parts = ["---\n", _dump_yaml(front), "---\n"]
     body_blocks: list[str] = []
     for c in doc.cells:
+        # Present-mode markers ride as invisible comments in their OWN standalone
+        # block (a blank line keeps them from being sucked into a markdown cell),
+        # emitted BEFORE the cell they apply to. slide-break first, then any
+        # live-action, so parsing sees them in a stable order.
+        if getattr(c, "slide_break", False):
+            body_blocks.append("<!-- spyde:slide-break -->")
+        if getattr(c, "live_action", None):
+            flow = yaml.safe_dump(dict(c.live_action), default_flow_style=True,
+                                  sort_keys=True, allow_unicode=True).strip()
+            body_blocks.append(f"<!-- spyde:live-action {flow} -->")
         if c.cell_type == "markdown":
             body_blocks.append(c.source.rstrip("\n"))
         elif c.cell_type == "figure":
@@ -633,14 +683,28 @@ def _parse_body_cells(body: str) -> list:
     in_fence = False
     fence_char: str | None = None       # "`" or "~"
     fence_len = 0                        # opener run length (CommonMark)
+    # Present-mode markers seen since the last cell was emitted — applied to the
+    # NEXT cell created (markdown or figure). They flush the pending markdown
+    # buffer first (so the marker starts a NEW cell rather than joining the one
+    # already accumulating above it).
+    pending: dict = {"slide_break": False, "live_action": None}
+
+    def _apply_pending(cell: "Cell") -> "Cell":
+        if pending["slide_break"]:
+            cell.slide_break = True
+        if pending["live_action"] is not None:
+            cell.live_action = pending["live_action"]
+        pending["slide_break"] = False
+        pending["live_action"] = None
+        return cell
 
     def flush_md() -> None:
         if md_buf:
             src = "\n".join(md_buf).strip("\n")
             # Drop a run that is nothing but blank lines (paragraph separators).
             if src.strip() != "":
-                cells.append(Cell(id=new_cell_id(), cell_type="markdown",
-                                  source=src))
+                cells.append(_apply_pending(Cell(
+                    id=new_cell_id(), cell_type="markdown", source=src)))
             md_buf.clear()
 
     for raw in body.splitlines():
@@ -680,18 +744,34 @@ def _parse_body_cells(body: str) -> list:
             md_buf.append(line)
             continue
 
+        m_break = _SLIDE_BREAK_RE.match(stripped)
+        m_live = _LIVE_ACTION_RE.match(stripped)
         m_fig = _FIG_LINE_RE.match(stripped)
         m_ph = _PLACEHOLDER_RE.match(stripped)
-        if m_fig is not None:
+        if m_break is not None:
+            # Ends the current markdown run; the marker applies to whatever cell
+            # comes next.
             flush_md()
-            cells.append(Cell(id=m_fig.group("cid"), cell_type="figure",
-                              caption=m_fig.group("caption") or "",
-                              placeholder=False))
+            pending["slide_break"] = True
+        elif m_live is not None:
+            flush_md()
+            try:
+                payload = yaml.safe_load(m_live.group("payload"))
+            except Exception:
+                payload = None
+            pending["live_action"] = (dict(payload)
+                                      if isinstance(payload, dict) else None)
+        elif m_fig is not None:
+            flush_md()
+            cells.append(_apply_pending(Cell(
+                id=m_fig.group("cid"), cell_type="figure",
+                caption=m_fig.group("caption") or "", placeholder=False)))
         elif m_ph is not None:
             flush_md()
-            cells.append(Cell(id=m_ph.group("cid"), cell_type="figure",
-                              caption=(m_ph.group("caption") or "").strip(),
-                              placeholder=True))
+            cells.append(_apply_pending(Cell(
+                id=m_ph.group("cid"), cell_type="figure",
+                caption=(m_ph.group("caption") or "").strip(),
+                placeholder=True)))
         else:
             md_buf.append(line)
     flush_md()

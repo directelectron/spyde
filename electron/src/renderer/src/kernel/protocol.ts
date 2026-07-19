@@ -444,6 +444,13 @@ export interface ReportCell {
    *  (panel_id + index), so a widget click resolves to the annotation whose
    *  style popover should open. Ephemeral — never persisted. */
   ann_widgets?: Record<string, { panel_id: string; index: number }>
+  /** Present mode (Phase 6): this cell STARTS a new slide (cells accumulate
+   *  onto the current slide until the next break). Absent → false. */
+  slide_break?: boolean
+  /** Present mode (Phase 6): an optional "go live" excursion — Present mode
+   *  turns it into a "Launch live ▶" button. e.g. { tutorial: 'strain',
+   *  guide: 'strain' }. Absent → no button on the slide. */
+  live_action?: { tutorial?: string; guide?: string } | null
 }
 
 /** The authoritative report document (mirrored by the renderer for editing). */
@@ -498,7 +505,7 @@ export interface ReportVectorsChoiceMessage extends MsgBase {
  *  (temp static HTML) also matches on `token`. */
 export interface ReportExportedMessage extends MsgBase {
   type: 'report_exported'
-  kind: 'html-static' | 'html-interactive' | 'markdown-folder'
+  kind: 'html-static' | 'html-interactive' | 'html-slides' | 'markdown-folder'
   path: string
   token?: string | null
 }

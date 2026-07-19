@@ -14,8 +14,10 @@ import React, { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { useSpyDE } from '../kernel/SpyDEContext'
 import { FIGURE_DRAG_MIME, WINDOW_DRAG_MIME } from '../kernel/dnd'
 import { reportClipboard } from '../kernel/reportClipboard'
+import { reportFromGuide } from '../kernel/reportFromGuide'
 import { ReportCell } from './ReportCell'
 import { ReportFigureCell } from './ReportFigureCell'
+import { GUIDES } from '@guides/index'
 
 const MIN_W = 300
 const MAX_W = 800
@@ -77,6 +79,9 @@ export function ReportSidebar() {
   const [titleEditing, setTitleEditing] = useState(false)
   const [titleDraft, setTitleDraft] = useState('')
   const [confirmNew, setConfirmNew] = useState(false)
+  // "New presentation from guide ▸" submenu open state.
+  const [guideMenuOpen, setGuideMenuOpen] = useState(false)
+  const guideMenuRef = useRef<HTMLDivElement>(null)
   // Export dropdown open state + a transient success/failure note in the header.
   const [exportMenuOpen, setExportMenuOpen] = useState(false)
   const [exportNote, setExportNote] = useState<{ ok: boolean; text: string } | null>(null)
@@ -276,6 +281,50 @@ export function ReportSidebar() {
     else showNote(false, 'PDF export failed')
   })
 
+  const exportSlides = () => runExport(async () => {
+    setExportMenuOpen(false)
+    if (!canExport) return
+    const path = await window.electron.reportExportDialog('html', `${titleSlug}-slides.html`)
+    if (!path) return
+    const token = crypto.randomUUID()
+    const done = await awaitExport(
+      (d) => d.token === token || d.path === path,
+      () => sendAction('report_export_html', { mode: 'slides', path, token }),
+    )
+    if (done) showNote(true, `Exported ✓ ${basename(done)}`)
+    else showNote(false, 'Export timed out')
+  })
+
+  // ── Present mode (Phase 6) ────────────────────────────────────────────────
+  // Open the full-screen slide deck. PresentGate (inside the provider) listens
+  // for this event and mounts PresentMode; the report is the source of slides.
+  const doPresent = () => {
+    window.dispatchEvent(new CustomEvent('spyde:report_present', { detail: { resume: false } }))
+  }
+
+  // Seed a fresh presentation from a guide (each step → a slide). Opens the guide
+  // submenu; picking a guide dispatches report_new + a report_add_cell per step.
+  const newFromGuide = (guideId: string) => {
+    setGuideMenuOpen(false)
+    const g = GUIDES.find(x => x.id === guideId)
+    if (g) reportFromGuide(g, sendAction)
+  }
+
+  // Close the guide menu on outside click / Escape.
+  useEffect(() => {
+    if (!guideMenuOpen) return
+    const onDown = (e: MouseEvent) => {
+      if (!guideMenuRef.current?.contains(e.target as Node)) setGuideMenuOpen(false)
+    }
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setGuideMenuOpen(false) }
+    window.addEventListener('mousedown', onDown)
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('mousedown', onDown)
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [guideMenuOpen])
+
   // ── Paste (internal cell clipboard) ───────────────────────────────────────
   // Reactive enablement: the Paste button is enabled only while the clipboard
   // holds a cell. useSyncExternalStore subscribes to the module-scope store.
@@ -405,10 +454,26 @@ export function ReportSidebar() {
           <div style={{ flex: 1 }} />
           <button data-testid="report-new" style={styles.hdrBtn} title="New report" onClick={doNew}>New</button>
           <button data-testid="report-open" style={styles.hdrBtn} title="Open report" onClick={doOpen}>Open</button>
+          <div ref={guideMenuRef} style={styles.exportWrap}>
+            <button
+              data-testid="report-from-guide-toggle"
+              style={styles.hdrBtn}
+              title="Seed a presentation from a guided walkthrough"
+              onClick={() => setGuideMenuOpen(v => !v)}
+            >From guide ▾</button>
+            {guideMenuOpen && (
+              <div style={styles.exportMenu} data-testid="report-from-guide-menu" role="menu">
+                {GUIDES.map(g => (
+                  <ExportItem key={g.id} testid={`from-guide-${g.id}`} label={g.title}
+                    onClick={() => newFromGuide(g.id)} />
+                ))}
+              </div>
+            )}
+          </div>
         </div>
         <div style={styles.emptyState} data-testid="report-empty">
-          No report open. Click <b>New</b> to start, or <b>Open</b> an existing
-          .spyde-report.
+          No report open. Click <b>New</b> to start, <b>Open</b> an existing
+          .spyde-report, or seed a slide deck <b>From guide</b>.
         </div>
       </div>
     )
@@ -472,6 +537,13 @@ export function ReportSidebar() {
           onClick={doPaste}
         >Paste</button>
         <button data-testid="report-save" style={styles.hdrBtnPrimary} title="Save report" onClick={doSave}>Save</button>
+        <button
+          data-testid="report-present"
+          style={canExport ? styles.hdrBtn : styles.hdrBtnDisabled}
+          title={canExport ? 'Present as slides' : 'Add a cell to present'}
+          disabled={!canExport}
+          onClick={doPresent}
+        >Present ▶</button>
 
         {/* Export dropdown (dock palette, closes on outside click / Escape). */}
         <div ref={exportMenuRef} style={styles.exportWrap}>
@@ -488,6 +560,8 @@ export function ReportSidebar() {
                 onClick={() => exportHtml('interactive')} />
               <ExportItem testid="export-html-static" label="Static HTML" disabled={exporting}
                 onClick={() => exportHtml('static')} />
+              <ExportItem testid="export-slides" label="Slides deck (HTML)" disabled={exporting}
+                onClick={exportSlides} />
               <ExportItem testid="export-pdf" label="PDF" disabled={exporting} onClick={exportPdf} />
               <ExportItem testid="export-md-folder" label="Markdown folder" disabled={exporting}
                 onClick={exportMarkdownFolder} />

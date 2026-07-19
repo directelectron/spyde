@@ -190,6 +190,58 @@ def _build_interactive_figure_html(mgr, cell: Cell) -> "str | None":
         return None
 
 
+def _render_cell_html(mgr, cell: Cell, assets: dict, *, interactive: bool,
+                      session=None) -> str:
+    """The HTML fragment for ONE cell (markdown or figure), shared by the
+    article body AND the slides shell. A placeholder figure → ``""`` (skipped).
+
+    Figure handling mirrors :func:`_render_body`'s per-cell logic: interactive
+    mode tries the vectors explorer, then the tinted-overlay blender, then the
+    live-figure iframe; anything that can't rebuild falls back to the static
+    ``<img>``. Static mode is always the ``<img>``."""
+    if cell.cell_type == "markdown":
+        return _markdown_cell_html(cell)
+    if cell.cell_type != "figure" or cell.placeholder:
+        return ""
+    html_frag = ""
+    if interactive:
+        # Drop-time choice: vectors_mode == "image" pins the static
+        # snapshot even when the tree carries diffraction vectors.
+        if getattr(cell.spec, "vectors_mode", "") != "image":
+            try:
+                from spyde.actions.report.vectors_embed import (
+                    vectors_explorer_html, vectors_for_cell,
+                )
+                vecs = vectors_for_cell(session, cell)
+                if vecs is not None:
+                    vx_html = vectors_explorer_html(vecs, caption=cell.caption)
+                    if vx_html is not None:
+                        html_frag = _figure_iframe_html(cell.caption, vx_html)
+            except Exception as e:
+                log.debug("vectors embed for cell %s failed: %s", cell.id, e)
+        # Tinted-overlay blender (vectors swap above wins when both
+        # apply — a vectors cell stays a vectors explorer).
+        if not html_frag:
+            try:
+                from spyde.actions.report.overlay_embed import (
+                    overlay_blender_html,
+                )
+                ov_html = overlay_blender_html(mgr, cell, caption=cell.caption)
+                if ov_html is not None:
+                    html_frag = _figure_iframe_html(cell.caption, ov_html)
+            except Exception as e:
+                log.debug("overlay blender embed for cell %s failed: %s",
+                          cell.id, e)
+        if not html_frag:
+            fig_html = _build_interactive_figure_html(mgr, cell)
+            if fig_html is not None:
+                html_frag = _figure_iframe_html(cell.caption, fig_html)
+    if not html_frag:
+        # Static path (also the interactive OFFLINE fallback).
+        html_frag = _figure_img_html(cell.caption, assets.get(cell.id))
+    return html_frag
+
+
 def _render_body(mgr, assets: dict, *, interactive: bool, session=None) -> str:
     """Assemble the article body: each cell in order → its HTML fragment. Figure
     placeholders are skipped. For interactive mode a figure with no rebuildable
@@ -207,54 +259,156 @@ def _render_body(mgr, assets: dict, *, interactive: bool, session=None) -> str:
     overlay_embed.py). No tinted overlay → the live-figure iframe as before."""
     blocks: list[str] = []
     for c in mgr.doc.cells:
-        if c.cell_type == "markdown":
-            blocks.append(_markdown_cell_html(c))
-        elif c.cell_type == "figure":
-            if c.placeholder:
-                continue
-            html_frag = ""
-            if interactive:
-                # Drop-time choice: vectors_mode == "image" pins the static
-                # snapshot even when the tree carries diffraction vectors.
-                if getattr(c.spec, "vectors_mode", "") != "image":
-                    try:
-                        from spyde.actions.report.vectors_embed import (
-                            vectors_explorer_html, vectors_for_cell,
-                        )
-                        vecs = vectors_for_cell(session, c)
-                        if vecs is not None:
-                            vx_html = vectors_explorer_html(vecs,
-                                                            caption=c.caption)
-                            if vx_html is not None:
-                                html_frag = _figure_iframe_html(c.caption,
-                                                                vx_html)
-                    except Exception as e:
-                        log.debug("vectors embed for cell %s failed: %s",
-                                  c.id, e)
-                # Tinted-overlay blender (vectors swap above wins when both
-                # apply — a vectors cell stays a vectors explorer).
-                if not html_frag:
-                    try:
-                        from spyde.actions.report.overlay_embed import (
-                            overlay_blender_html,
-                        )
-                        ov_html = overlay_blender_html(mgr, c,
-                                                       caption=c.caption)
-                        if ov_html is not None:
-                            html_frag = _figure_iframe_html(c.caption,
-                                                            ov_html)
-                    except Exception as e:
-                        log.debug("overlay blender embed for cell %s "
-                                  "failed: %s", c.id, e)
-                if not html_frag:
-                    fig_html = _build_interactive_figure_html(mgr, c)
-                    if fig_html is not None:
-                        html_frag = _figure_iframe_html(c.caption, fig_html)
-            if not html_frag:
-                # Static path (also the interactive OFFLINE fallback).
-                html_frag = _figure_img_html(c.caption, assets.get(c.id))
-            if html_frag:
-                blocks.append(html_frag)
+        frag = _render_cell_html(mgr, c, assets, interactive=interactive,
+                                 session=session)
+        if frag:
+            blocks.append(frag)
+    return "\n".join(blocks)
+
+
+# ── slides deck (portable, self-contained, no CDN) ────────────────────────────
+
+# A minimal reveal.js-STYLE deck: full-viewport dark stage, one `.slide` shown at
+# a time, a tiny vanilla-JS switcher (arrow / space / pagedown advance, Home/End,
+# a slide counter). No external fetches — the interactive figure embeds are the
+# SAME self-contained srcdoc iframes the interactive HTML export emits, so they
+# work here too with zero runtime Python. Print falls back to showing every slide
+# stacked (so a browser "Print to PDF" of the deck yields one slide per page-ish).
+_SLIDES_CSS = """
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; height: 100%; }
+body {
+  background: #14141f; color: #e8e8f0; overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica,
+    Arial, sans-serif;
+  line-height: 1.6; font-size: 22px;
+}
+#deck { position: fixed; inset: 0; }
+.slide {
+  position: absolute; inset: 0; display: none;
+  flex-direction: column; justify-content: center;
+  padding: 5vh 8vw; overflow-y: auto;
+}
+.slide.active { display: flex; }
+.slide-inner { max-width: 60rem; margin: 0 auto; width: 100%; }
+.slide h1 { font-size: 2.4rem; line-height: 1.15; margin: 0 0 1.2rem; font-weight: 700; }
+.slide h2 { font-size: 1.8rem; margin: 1.4rem 0 0.7rem; }
+.slide h3 { font-size: 1.35rem; margin: 1.1rem 0 0.5rem; }
+.slide p { margin: 0 0 0.9rem; }
+.slide a { color: #89b4fa; }
+.slide code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.9em; background: #22222f; padding: 0.1em 0.35em; border-radius: 4px; }
+.slide pre { background: #1c1c28; padding: 1rem; border-radius: 8px; overflow-x: auto; }
+.slide pre code { background: none; padding: 0; }
+.slide pre.md-src { white-space: pre-wrap; }
+.slide blockquote { margin: 0 0 1rem; padding: 0 1rem; border-left: 4px solid #45475a;
+  color: #a6adc8; }
+.slide table { border-collapse: collapse; margin: 0 0 1rem; display: block; overflow-x: auto; }
+.slide th, .slide td { border: 1px solid #45475a; padding: 0.4rem 0.6rem; }
+.slide .katex-display { display: block; margin: 1rem 0; text-align: center;
+  overflow-x: auto; overflow-y: hidden; }
+figure.report-figure { margin: 1rem 0; text-align: center; }
+figure.report-figure img { max-width: 100%; max-height: 62vh; height: auto;
+  border-radius: 6px; }
+figure.report-figure iframe { width: 100%; height: 62vh; border: 1px solid #313244;
+  border-radius: 6px; }
+figure.report-figure figcaption { margin-top: 0.5rem; font-size: 0.85rem;
+  color: #a6adc8; font-style: italic; }
+#deck-counter {
+  position: fixed; bottom: 14px; right: 18px; z-index: 10;
+  font-size: 0.8rem; color: #7f849c; background: rgba(20,20,31,0.7);
+  padding: 3px 10px; border-radius: 12px; user-select: none;
+}
+#deck-hint {
+  position: fixed; bottom: 14px; left: 18px; z-index: 10;
+  font-size: 0.72rem; color: #585b70; user-select: none;
+}
+@media print {
+  body { overflow: visible; height: auto; background: #fff; color: #000; }
+  #deck-counter, #deck-hint { display: none; }
+  .slide { position: static; display: flex !important; page-break-after: always;
+    min-height: 90vh; }
+}
+"""
+
+_SLIDES_JS = """
+(function () {
+  var slides = Array.prototype.slice.call(document.querySelectorAll('.slide'));
+  var counter = document.getElementById('deck-counter');
+  var i = 0;
+  function show(n) {
+    if (!slides.length) return;
+    i = Math.max(0, Math.min(slides.length - 1, n));
+    for (var k = 0; k < slides.length; k++) {
+      slides[k].classList.toggle('active', k === i);
+    }
+    if (counter) counter.textContent = (i + 1) + ' / ' + slides.length;
+    try { location.hash = 'slide-' + (i + 1); } catch (e) {}
+  }
+  function next() { show(i + 1); }
+  function prev() { show(i - 1); }
+  document.addEventListener('keydown', function (e) {
+    var k = e.key;
+    // A presentation clicker sends these arrow / PageUp/PageDown keys.
+    if (k === 'ArrowRight' || k === 'PageDown' || k === ' ' || k === 'Spacebar') {
+      e.preventDefault(); next();
+    } else if (k === 'ArrowLeft' || k === 'PageUp') {
+      e.preventDefault(); prev();
+    } else if (k === 'Home') { e.preventDefault(); show(0); }
+    else if (k === 'End') { e.preventDefault(); show(slides.length - 1); }
+  });
+  // Click the right two-thirds → next, the left third → prev (tap-friendly).
+  document.getElementById('deck').addEventListener('click', function (e) {
+    if (e.target.closest('a, iframe, button, input, figure.report-figure')) return;
+    if (e.clientX < window.innerWidth / 3) prev(); else next();
+  });
+  var m = /slide-(\\d+)/.exec(location.hash || '');
+  show(m ? parseInt(m[1], 10) - 1 : 0);
+})();
+"""
+
+
+def _slides_page(title: str, slides_html: str) -> str:
+    """Wrap the rendered slides in the self-contained deck shell (inline CSS +
+    JS, no external fetches)."""
+    esc_title = _html.escape(title or "Presentation")
+    return (
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n"
+        "<meta charset=\"utf-8\">\n"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+        f"<title>{esc_title}</title>\n"
+        f"<style>{_SLIDES_CSS}</style>\n"
+        "</head>\n<body>\n"
+        f"<div id=\"deck\">\n{slides_html}\n</div>\n"
+        "<div id=\"deck-counter\"></div>\n"
+        "<div id=\"deck-hint\">← → / Space to navigate</div>\n"
+        f"<script>{_SLIDES_JS}</script>\n"
+        "</body>\n</html>\n"
+    )
+
+
+def _render_slides(mgr, assets: dict, *, interactive: bool, session=None) -> str:
+    """Render the report as slide `<section class="slide">` blocks, grouped by
+    the same ``slide_break`` flag :meth:`ReportDoc.slides` uses. Each slide holds
+    every one of its cells' HTML fragments (reusing :func:`_render_cell_html`),
+    so a slide's interactive embeds work exactly as in the interactive HTML
+    export. A slide whose cells all render empty (e.g. a lone placeholder) is
+    dropped rather than shown blank."""
+    blocks: list[str] = []
+    for group in mgr.doc.slides():
+        frags = [
+            _render_cell_html(mgr, c, assets, interactive=interactive,
+                              session=session)
+            for c in group
+        ]
+        frags = [f for f in frags if f]
+        if not frags:
+            continue
+        inner = "\n".join(frags)
+        blocks.append(
+            f"<section class=\"slide\">\n<div class=\"slide-inner\">\n"
+            f"{inner}\n</div>\n</section>")
     return "\n".join(blocks)
 
 
@@ -274,9 +428,12 @@ def _exported_msg(kind: str, path: str, token) -> dict:
 def report_export_html(session, plot, payload) -> None:
     """Export the open report as ONE self-contained HTML file.
 
-    ``mode`` is ``"static"`` (baked ``<img>``s only) or ``"interactive"`` (live
-    figures in sandboxed ``srcdoc`` iframes). Runs the snapshot-harvest handshake
-    first so the images are fresh, then writes the file and emits
+    ``mode`` is ``"static"`` (baked ``<img>``s only), ``"interactive"`` (live
+    figures in sandboxed ``srcdoc`` iframes), or ``"slides"`` (a portable
+    reveal.js-STYLE deck — the same self-contained cells wrapped in a thin
+    slide-navigable shell, grouped by ``slide_break``; the interactive figure
+    embeds work in the deck too, zero runtime Python). Runs the snapshot-harvest
+    handshake first so the images are fresh, then writes the file and emits
     ``report_exported``.
 
     ``temp:true`` (static only) writes to a UNIQUE file under the OS temp
@@ -300,8 +457,17 @@ def report_export_html(session, plot, payload) -> None:
             ipc.emit_error("report_export_html: no path.")
             return
     mode = str(payload.get("mode", "static")).lower()
+    slides = mode == "slides"
     interactive = mode == "interactive"
-    kind = "html-interactive" if interactive else "html-static"
+    if slides:
+        kind = "html-slides"
+    elif interactive:
+        kind = "html-interactive"
+    else:
+        kind = "html-static"
+    # A slides deck embeds the interactive figures (the whole point of a portable
+    # deck the reader can drive) — so it renders figure cells interactively.
+    render_interactive = interactive or slides
     # OPTIONAL correlation token echoed verbatim in report_exported so the renderer
     # can match an export reply to the request it issued (e.g. the PDF flow awaits a
     # specific temp-export). Backward compatible: absent → absent in the reply.
@@ -310,9 +476,15 @@ def report_export_html(session, plot, payload) -> None:
     def finish(harvested: dict) -> None:
         try:
             assets = mgr.assemble_assets(harvested)
-            body = _render_body(mgr, assets, interactive=interactive,
-                                session=session)
-            page = _page(mgr.doc.title, body)
+            if slides:
+                body = _render_slides(mgr, assets,
+                                      interactive=render_interactive,
+                                      session=session)
+                page = _slides_page(mgr.doc.title, body)
+            else:
+                body = _render_body(mgr, assets, interactive=render_interactive,
+                                    session=session)
+                page = _page(mgr.doc.title, body)
             with open(path, "w", encoding="utf-8") as f:
                 f.write(page)
         except Exception as e:
