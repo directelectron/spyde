@@ -331,11 +331,9 @@ def _render_body(mgr, assets: dict, *, interactive: bool, session=None) -> str:
     grayscale + clear→tint ramps with a LIVE opacity slider per overlay (see
     overlay_embed.py). No tinted overlay → the live-figure iframe as before.
 
-    The per-cell ``column`` assignment (the 2-column SLIDE layout) is IGNORED
-    here — the static/interactive article is a single narrow reading column, so
-    column-assigned cells simply STACK in order (graceful degradation). The
-    2-column layout is a slides-deck feature; ``mode:'slides'`` renders it (see
-    :func:`_render_slides`)."""
+    A SPLIT cell renders as a self-contained 2-column ``.split-block`` (text
+    beside figure/photo — see :func:`_split_cell_html`); every other cell renders
+    full width in document order."""
     blocks: list[str] = []
     for c in mgr.doc.cells:
         frag = _render_cell_html(mgr, c, assets, interactive=interactive,
@@ -394,19 +392,10 @@ figure.report-figure iframe { width: 100%; height: 62vh; border: 1px solid #3132
   border-radius: 6px; }
 figure.report-figure figcaption { margin-top: 0.5rem; font-size: 0.85rem;
   color: #a6adc8; font-style: italic; }
-/* 2-column slide layout — a "cols" row (text BESIDE a figure). The columns are
-   vertically centered against each other (a short text column reads well
-   centered next to a tall figure); the figure/photo sizes to its column. Stacks
-   to one column on a narrow / portrait viewport so a phone still reads it. */
-.slide-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 2.5vw;
-  align-items: center; }
-.slide-col { min-width: 0; }
-.slide-cols figure.report-figure { margin: 0.5rem 0; }
-.slide-cols figure.report-figure img { max-height: 74vh; }
-.slide-cols figure.report-figure iframe { height: 56vh; }
-/* Split block (Wave A) — the self-contained text-beside-figure cell. Same 2-col
-   grid as .slide-cols; the column ORDER is baked by the export (text-left vs
-   text-right) so no CSS reordering is needed. */
+/* Split block (Wave A) — the self-contained text-beside-figure cell. A 2-col
+   grid; the column ORDER is baked by the export (text-left vs text-right) so no
+   CSS reordering is needed. Stacks to one column on a narrow / portrait viewport
+   so a phone still reads it. */
 .split-block { display: grid; grid-template-columns: 1fr 1fr; gap: 2.5vw;
   align-items: center; }
 .split-col { min-width: 0; }
@@ -414,7 +403,7 @@ figure.report-figure figcaption { margin-top: 0.5rem; font-size: 0.85rem;
 .split-fig figure.report-figure img { max-height: 74vh; }
 .split-fig figure.report-figure iframe { height: 56vh; }
 @media (max-width: 720px), (orientation: portrait) {
-  .slide-cols, .split-block { grid-template-columns: 1fr; }
+  .split-block { grid-template-columns: 1fr; }
 }
 /* ── presentation polish: TITLE / SECTION slides ──────────────────────────────
    A title slide (data-kind="title") centers a large title block — the whole
@@ -520,12 +509,12 @@ def _slides_page(title: str, slides_html: str) -> str:
 
 def _render_slide_rows(mgr, group, assets: dict, *, interactive: bool,
                        session=None) -> "list[str]":
-    """Render ONE slide's cells into ordered HTML row blocks, applying the
-    per-cell ``column`` grouping (:func:`slide_columns`): a ``full`` row is a
-    plain block; a ``cols`` row is a 2-column ``.slide-cols`` grid with the
-    left/right cells stacked in each column. Reuses :func:`_render_cell_html`
-    for every cell so interactive embeds work exactly as before. Rows whose
-    cells all render empty are dropped."""
+    """Render ONE slide's cells into ordered HTML row blocks
+    (:func:`slide_columns`): a ``full`` row is a plain block; a ``split`` row is
+    a self-contained SPLIT cell (:func:`_render_cell_html` emits its own
+    ``.split-block`` 2-column grid). Reuses :func:`_render_cell_html` for every
+    cell so interactive embeds work exactly as before. Rows whose cell renders
+    empty are dropped."""
     from spyde.actions.report.model import slide_columns
 
     def _frags(cells) -> "list[str]":
@@ -536,27 +525,12 @@ def _render_slide_rows(mgr, group, assets: dict, *, interactive: bool,
 
     rows: list[str] = []
     for row in slide_columns(group):
-        if row["kind"] == "full":
-            fr = _frags([row["cell"]])
-            if fr:
-                rows.append("\n".join(fr))
-        elif row["kind"] == "split":
-            # A SPLIT cell is a self-contained 2-column block — _render_cell_html
-            # already emits the .split-block grid (text beside figure, ordered by
-            # split_layout), so just render the one cell.
-            fr = _frags([row["cell"]])
-            if fr:
-                rows.append("\n".join(fr))
-        else:  # "cols"
-            left = _frags(row["left"])
-            right = _frags(row["right"])
-            if not left and not right:
-                continue
-            rows.append(
-                "<div class=\"slide-cols\">\n"
-                f"<div class=\"slide-col\">\n{chr(10).join(left)}\n</div>\n"
-                f"<div class=\"slide-col\">\n{chr(10).join(right)}\n</div>\n"
-                "</div>")
+        # Both "full" and "split" render a single cell — a split cell's
+        # _render_cell_html already emits the .split-block grid (text beside
+        # figure, ordered by split_layout).
+        fr = _frags([row["cell"]])
+        if fr:
+            rows.append("\n".join(fr))
     return rows
 
 
@@ -565,10 +539,9 @@ def _render_slides(mgr, assets: dict, *, interactive: bool, session=None) -> str
     the same ``slide_break`` flag :meth:`ReportDoc.slides` uses. Each slide holds
     every one of its cells' HTML fragments (reusing :func:`_render_cell_html`),
     so a slide's interactive embeds work exactly as in the interactive HTML
-    export. Within a slide, cells assigned ``column`` ``left``/``right`` render
-    side-by-side in a 2-col grid (see :func:`_render_slide_rows`). A slide whose
-    cells all render empty (e.g. a lone placeholder) is dropped rather than
-    shown blank.
+    export. Within a slide, a SPLIT cell renders as a self-contained 2-column
+    ``.split-block`` (see :func:`_render_slide_rows`). A slide whose cells all
+    render empty (e.g. a lone placeholder) is dropped rather than shown blank.
 
     Presentation POLISH: the slide's per-slide ``slide_kind`` / ``slide_style``
     (read off its first cell via :func:`slide_meta`) are stamped as

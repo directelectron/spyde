@@ -457,10 +457,6 @@ export interface ReportCell {
    *  turns it into a "Launch live ▶" button. e.g. { tutorial: 'strain',
    *  guide: 'strain' }. Absent → no button on the slide. */
   live_action?: { tutorial?: string; guide?: string } | null
-  /** Present mode: the cell's COLUMN within its slide — '' / 'full' spans the
-   *  slide (default), 'left' / 'right' place it in the 2-column grid so a text
-   *  cell sits BESIDE a figure/photo. Absent → '' (full width). */
-  column?: string
   /** Present mode (presentation polish): the per-SLIDE kind, carried on the
    *  slide's FIRST cell. '' (content, default) renders normally; 'title' makes
    *  the whole slide a big-centered TITLE / SECTION slide. */

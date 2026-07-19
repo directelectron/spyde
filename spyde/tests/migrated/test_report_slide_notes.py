@@ -156,19 +156,18 @@ class TestNotesRoundTrip:
         assert t1 == t2
 
     def test_notes_coexist_with_all_markers(self):
-        """Notes coexist with break + kind + style + column on one cell."""
+        """Notes coexist with break + kind + style on one cell."""
         doc = m.ReportDoc()
         doc.cells.append(m.Cell(cell_type="markdown", source="Intro"))
         doc.cells.append(m.Cell(cell_type="markdown", source="# Section",
                                 slide_break=True, slide_kind="title",
-                                slide_style="accent", column="left",
+                                slide_style="accent",
                                 notes="the section notes"))
         back = m.parse_report_md(m.serialize_report_md(doc))
         c = back.cells[1]
         assert c.slide_break is True
         assert c.slide_kind == "title"
         assert c.slide_style == "accent"
-        assert c.column == "left"
         assert c.notes == "the section notes"
 
 

@@ -10,9 +10,9 @@
  * styling lives once.
  *
  * Wave B de-clutter: the per-cell SLIDE chrome (title-slide 'T', background
- * style '◐', speaker-notes '📝', and the 2-column '▭/◧/◨' toggle + ColumnBadge)
- * was REMOVED. Those roles are re-surfaced slide-natively in Wave C; the backend
- * fields (slide_kind/slide_style/notes/column) remain untouched.
+ * style '◐', and speaker-notes '📝') was REMOVED. Those roles are re-surfaced
+ * slide-natively in Wave C; the backend fields (slide_kind/slide_style/notes)
+ * remain untouched.
  *
  * Every surviving `data-testid` is preserved EXACTLY (both e2e suites select on
  * them): `cell-copy-<id>`, `cell-duplicate-<id>`, plus a caller-supplied delete

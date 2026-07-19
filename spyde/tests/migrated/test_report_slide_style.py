@@ -8,7 +8,7 @@ FIRST cell (the slide-break cell) — against a real Qt-free ``Session``:
 
 * ``slide_kind`` / ``slide_style`` round-trip through report.md serialization +
   the zip (markers on the first cell; absent on old files = default; combined with
-  slide_break / column so the marker order stays stable),
+  slide_break so the marker order stays stable),
 * ``model.slide_meta`` reads the slide's kind/style off its first cell,
 * the ``report_set_slide_kind`` / ``report_set_slide_style`` verbs mutate + emit
   (and apply to the slide's FIRST cell even when fired from a later cell),
@@ -108,15 +108,6 @@ class TestSlideKindStyleRoundTrip:
         assert c.slide_break is True
         assert c.slide_kind == "title"
         assert c.slide_style == "accent"
-
-    def test_kind_with_column_coexists(self):
-        """A title cell can also carry a column assignment — both markers parse."""
-        doc = m.ReportDoc(title="Deck")
-        doc.cells.append(m.Cell(cell_type="markdown", source="Left",
-                                slide_kind="title", column="left"))
-        back = m.parse_report_md(m.serialize_report_md(doc))
-        assert back.cells[0].slide_kind == "title"
-        assert back.cells[0].column == "left"
 
     def test_absent_markers_default_on_old_file(self):
         old = ("---\nversion: 1\ntitle: Old\n---\n\n"
