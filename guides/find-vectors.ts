@@ -107,13 +107,20 @@ export const findVectorsGuide: Guide = {
     },
     {
       anchor: 'status-text',
-      title: 'Done',
+      title: 'Done — explore the vectors',
       body:
         'When the status bar reports completion, the diffraction vectors are ' +
         'ready. From here you can run **Vector Virtual Imaging** or **Vector ' +
-        'Orientation Mapping** on them.',
+        'Orientation Mapping** on them.\n\n' +
+        '> 💡 The demo below is the real vector explorer, running in your ' +
+        'browser: drag the crosshair across the scan to see each grain’s ' +
+        'diffraction pattern, integrate a region, or virtual-image a spot.',
       placement: 'top',
       image: 'find-vectors-done.png',
+      // Interactive web embed: the self-contained vectors explorer (navigate +
+      // integrate + virtual imaging, all client-side, no backend). Falls back to
+      // the screenshot in-app / if the embed file is missing.
+      embed: 'vectors-explorer.html',
     },
   ],
 }

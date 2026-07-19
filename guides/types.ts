@@ -80,6 +80,17 @@ export interface GuideStep {
    */
   image?: string
   /**
+   * Self-contained INTERACTIVE HTML for the web walkthrough (path relative to
+   * the guide's media dir, like {@link image}). When present, the docs website
+   * renders this file in a sandboxed iframe INSTEAD of the static screenshot —
+   * a real "try it" demo (navigate / integrate / virtual-imaging) that runs
+   * entirely in the browser with zero runtime Python (the precompute-embed
+   * model, NOT pyodide). Falls back to `image` when absent. Ignored by the
+   * in-app tour (which spotlights the live UI). The embed .html is built by
+   * `spyde/tests/gen_guide_embeds.py` into the docs-site media dir.
+   */
+  embed?: string
+  /**
    * Optional: how to reach this step when auto-generating screenshots. Omit for
    * a step that is just captured in the current state. See {@link GuideDrive}.
    */

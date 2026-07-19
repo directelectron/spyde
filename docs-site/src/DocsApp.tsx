@@ -6,9 +6,62 @@
  * drift. Each guide is shown as a numbered, scrollable walkthrough; steps with a
  * screenshot show it, matching what the in-app tour spotlights live.
  */
-import React, { useState } from 'react'
+import React, { useEffect, useState } from 'react'
 import { GUIDES, type Guide } from '@guides/index'
 import { Markdown } from '@guides/markdown'
+
+/**
+ * InteractiveEmbed — renders a step's self-contained interactive HTML embed in a
+ * sandboxed iframe. The embed (built by spyde/tests/gen_guide_embeds.py into
+ * public/media/<guide>/) is a standalone page that runs entirely in the browser
+ * — navigate, integrate, and virtual-imaging all recompute in JS from
+ * precomputed data, with ZERO runtime
+ * Python (no pyodide). `sandbox="allow-scripts"` lets the embed's ESM module run
+ * while denying same-origin access — the same isolation the app's report export
+ * uses. A little "interactive — try it" badge tells the reader to click/drag.
+ *
+ * Graceful degradation: the embed .html is optional media (like a screenshot). A
+ * broken/blank iframe is worse than nothing, so we HEAD-probe the file first and
+ * render nothing if it's missing — the step keeps its text, just no demo.
+ */
+function InteractiveEmbed({ guideId, embed, title }:
+  { guideId: string; embed: string; title: string }) {
+  const src = `./media/${guideId}/${embed}`
+  // 'checking' → probing; 'ok' → file present, mount the iframe; 'missing' → hide.
+  const [state, setState] = useState<'checking' | 'ok' | 'missing'>('checking')
+  useEffect(() => {
+    let live = true
+    // A HEAD (falling back to GET) confirms the embed exists before we mount the
+    // iframe, so a missing file degrades to hidden instead of a broken frame.
+    fetch(src, { method: 'HEAD' })
+      .then((r) => { if (live) setState(r.ok ? 'ok' : 'missing') })
+      .catch(() => { if (live) setState('missing') })
+    return () => { live = false }
+  }, [src])
+
+  if (state === 'missing') return null
+  return (
+    <div style={styles.embedWrap} data-testid={`docs-embed-${embed}`}>
+      <div style={styles.embedBadge}>
+        <span style={styles.embedDot} />
+        interactive — try it
+      </div>
+      {state === 'ok' && (
+        <iframe
+          src={src}
+          title={`${title} — interactive`}
+          // allow-scripts only: the embed's ESM runs, but it stays cross-origin
+          // isolated (no cookies, no same-origin fetch of the parent site).
+          sandbox="allow-scripts"
+          style={styles.embedFrame}
+          // NOT loading="lazy": the explorer measures its panel rects with
+          // requestAnimationFrame/ResizeObserver at mount, which stalls if the
+          // frame is deferred off-screen — it must lay out eagerly to initialise.
+        />
+      )}
+    </div>
+  )
+}
 
 export function DocsApp() {
   const [guide, setGuide] = useState<Guide>(GUIDES[0])
@@ -53,14 +106,18 @@ export function DocsApp() {
                   styles={{ paragraph: styles.p, callout: styles.callout }}
                 />
               </div>
-              {step.image && (
-                <img
-                  src={`./media/${guide.id}/${step.image}`}
-                  alt={step.title}
-                  style={styles.shot}
-                  // Screenshots are optional; hide the broken-image icon if absent.
-                  onError={(e) => { (e.currentTarget.style.display = 'none') }}
-                />
+              {step.embed ? (
+                <InteractiveEmbed guideId={guide.id} embed={step.embed} title={step.title} />
+              ) : (
+                step.image && (
+                  <img
+                    src={`./media/${guide.id}/${step.image}`}
+                    alt={step.title}
+                    style={styles.shot}
+                    // Screenshots are optional; hide the broken-image icon if absent.
+                    onError={(e) => { (e.currentTarget.style.display = 'none') }}
+                  />
+                )
               )}
             </section>
           ))}
@@ -120,5 +177,26 @@ const styles: Record<string, React.CSSProperties> = {
   shot: {
     display: 'block', width: '100%', marginTop: 16, borderRadius: 8,
     border: '1px solid #313244',
+  },
+  // Interactive embed: a dark-themed well with a "try it" badge above a
+  // sandboxed iframe that fills the article width. A fixed-ish height (via
+  // aspect-ratio, clamped) keeps it from collapsing before the embed lays out.
+  embedWrap: {
+    marginTop: 16, borderRadius: 8, border: '1px solid #313244',
+    background: '#181825', overflow: 'hidden',
+  },
+  embedBadge: {
+    display: 'flex', alignItems: 'center', gap: 6,
+    padding: '7px 12px', fontSize: 11, fontWeight: 600, letterSpacing: 0.3,
+    color: '#89b4fa', background: 'rgba(137,180,250,0.10)',
+    borderBottom: '1px solid #1e1e2e', textTransform: 'uppercase',
+  },
+  embedDot: {
+    width: 7, height: 7, borderRadius: '50%', background: '#a6e3a1',
+    boxShadow: '0 0 5px rgba(166,227,161,0.8)',
+  },
+  embedFrame: {
+    display: 'block', width: '100%', height: 520, border: 'none',
+    background: '#1e1e2e',
   },
 }
