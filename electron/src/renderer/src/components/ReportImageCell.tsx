@@ -138,6 +138,8 @@ export function ReportImageCell({ cell, onRemove, index, slideStart, dragProps }
           slideStart={slideStart}
           slideKind={cell.slide_kind}
           onToggleTitle={() => sendAction('report_set_slide_kind', { cell_id: cell.id })}
+          slideStyle={cell.slide_style}
+          onCycleStyle={(style) => sendAction('report_set_slide_style', { cell_id: cell.id, slide_style: style })}
           deleteTestid={`report-imgcell-delete-${cell.id}`}
           deleteTitle="Delete image"
           leading={

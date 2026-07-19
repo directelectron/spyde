@@ -326,6 +326,8 @@ export function ReportCell({ cell, rawMode, onUpdate, onRemove, index, slideStar
           slideStart={slideStart}
           slideKind={cell.slide_kind}
           onToggleTitle={() => sendAction('report_set_slide_kind', { cell_id: cell.id })}
+          slideStyle={cell.slide_style}
+          onCycleStyle={(style) => sendAction('report_set_slide_style', { cell_id: cell.id, slide_style: style })}
           deleteTestid={`report-cell-delete-${cell.id}`}
           deleteTitle="Delete cell"
           leading={

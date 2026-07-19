@@ -44,6 +44,13 @@ const COLUMN_LABEL: Record<string, string> = {
   '': 'Full width', full: 'Full width', left: 'Left column', right: 'Right column',
 }
 
+// Slide background presets — the toggle cycles default → plain → accent.
+const STYLE_CYCLE = ['', 'plain', 'accent']
+const STYLE_GLYPH: Record<string, string> = { '': '◐', plain: '○', accent: '●' }
+const STYLE_LABEL: Record<string, string> = {
+  '': 'Default background', plain: 'Plain (flat) background', accent: 'Accent-tinted background',
+}
+
 interface Props {
   cellId: string
   styles: CellChromeStyles
@@ -72,6 +79,12 @@ interface Props {
    *  Read off this (slide-starting) cell. */
   slideKind?: string
   onToggleTitle?: () => void
+  /** The slide's background style preset ('' / 'default', 'plain', 'accent').
+   *  Read off this (slide-starting) cell. When `onCycleStyle` is also given and
+   *  `slideStart` is true, a preset-cycling button renders next to the title
+   *  toggle. */
+  slideStyle?: string
+  onCycleStyle?: (style: string) => void
 }
 
 /** A small ALWAYS-VISIBLE badge (top-left of a cell) marking its slide column —
@@ -106,7 +119,7 @@ const badgeStyle: React.CSSProperties = {
 export function CellChrome({
   cellId, styles, onCopy, onDuplicate, onDelete, deleteTestid,
   deleteTitle = 'Delete cell', leading, trailing, column, onSetColumn,
-  slideStart, slideKind, onToggleTitle,
+  slideStart, slideKind, onToggleTitle, slideStyle, onCycleStyle,
 }: Props) {
   const cur: CellColumn =
     column === 'left' || column === 'right' ? column : ''
@@ -116,6 +129,12 @@ export function CellChrome({
     onSetColumn(COLUMN_CYCLE[(idx + 1) % COLUMN_CYCLE.length])
   }
   const isTitle = slideKind === 'title'
+  const curStyle: string = STYLE_CYCLE.includes(slideStyle || '') ? (slideStyle || '') : ''
+  const cycleStyle = () => {
+    if (!onCycleStyle) return
+    const idx = STYLE_CYCLE.indexOf(curStyle)
+    onCycleStyle(STYLE_CYCLE[(idx + 1) % STYLE_CYCLE.length])
+  }
   return (
     <div style={styles.chrome}>
       {leading}
@@ -129,6 +148,15 @@ export function CellChrome({
             : 'Make this a title / section slide (big centered heading)'}
           onClick={onToggleTitle}
         >T</button>
+      )}
+      {slideStart && onCycleStyle && (
+        <button
+          data-testid={`cell-slide-style-${cellId}`}
+          data-slide-style={curStyle || 'default'}
+          style={curStyle ? (styles.columnBtnActive ?? styles.chromeBtn) : styles.chromeBtn}
+          title={`Slide background: ${STYLE_LABEL[curStyle]} — click to cycle`}
+          onClick={cycleStyle}
+        >{STYLE_GLYPH[curStyle]}</button>
       )}
       {onSetColumn && (
         <button
