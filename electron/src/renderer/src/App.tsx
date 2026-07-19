@@ -34,6 +34,15 @@ export function App() {
     return () => dispose?.()
   }, [])
 
+  // "Capture to presentation" (per-window camera button, WindowContent/SubWindow)
+  // fires this so the report dock becomes visible even if it was closed — the
+  // user should SEE the slide they just captured, not wonder where it went.
+  useEffect(() => {
+    const onOpen = () => setReportOpen(true)
+    window.addEventListener('spyde:report_open_dock', onOpen)
+    return () => window.removeEventListener('spyde:report_open_dock', onOpen)
+  }, [])
+
   return (
     <SpyDEProvider>
       <div style={styles.root}>

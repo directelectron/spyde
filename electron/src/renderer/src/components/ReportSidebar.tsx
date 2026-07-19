@@ -149,6 +149,7 @@ export function ReportSidebar() {
     at_cell?: string | null
     caption?: string
     count?: number
+    slide_break?: boolean | null
   } | null>(null)
 
   const bodyRef = useRef<HTMLDivElement>(null)
@@ -172,6 +173,7 @@ export function ReportSidebar() {
       at_cell: vxChoice.at_cell ?? undefined,
       caption: vxChoice.caption ?? '',
       vectors_mode: mode,
+      ...(vxChoice.slide_break != null ? { slide_break: vxChoice.slide_break } : {}),
     })
     setVxChoice(null)
   }
@@ -343,6 +345,24 @@ export function ReportSidebar() {
   // for this event and mounts PresentMode; the report is the source of slides.
   const doPresent = () => {
     window.dispatchEvent(new CustomEvent('spyde:report_present', { detail: { resume: false } }))
+  }
+
+  // ── Capture to presentation ────────────────────────────────────────────────
+  // One-click: snapshot the ACTIVE (focused) plot window's current live state
+  // (nav position, contrast, colormap, overlays — report_add_figure's existing
+  // _snapshot_plot already captures all of that) straight into the report as a
+  // new slide. No dragging. vectors_mode:'image' skips the viewer-vs-image
+  // prompt (a one-click capture should never stop to ask) — the user can still
+  // switch a captured cell to the interactive viewer later via its own controls.
+  const canCapture = state.activeWindowId != null
+  const doCapture = () => {
+    if (state.activeWindowId == null) return
+    sendAction('report_add_figure', {
+      source_window_id: state.activeWindowId,
+      slide_break: true,
+      vectors_mode: 'image',
+    })
+    showNote(true, 'Captured to presentation')
   }
 
   // Seed a fresh presentation from a guide (each step → a slide). Opens the guide
@@ -648,6 +668,15 @@ export function ReportSidebar() {
         >{rawMode ? 'Raw' : 'Rich'}</button>
         <button data-testid="report-new" style={styles.hdrBtn} title="New report" onClick={doNew}>New</button>
         <button data-testid="report-open" style={styles.hdrBtn} title="Open report" onClick={doOpen}>Open</button>
+        <button
+          data-testid="report-capture"
+          style={canCapture ? styles.hdrBtn : styles.hdrBtnDisabled}
+          title={canCapture
+            ? 'Capture the active plot window’s current view as a new slide'
+            : 'Focus a plot window to capture it'}
+          disabled={!canCapture}
+          onClick={doCapture}
+        >📷 Capture</button>
         <button
           data-testid="report-paste"
           style={clipboardCell ? styles.hdrBtn : styles.hdrBtnDisabled}

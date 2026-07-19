@@ -1755,7 +1755,12 @@ def refresh_panel(session, mgr: "ReportManager", cell: Cell, panel: PanelSpec) -
 
 
 def _resolve_source_plot(session, source_window_id):
-    """The Plot for a source window id (the plot the user dragged into the report)."""
+    """The Plot for a source window id (the plot the user dragged into the
+    report). ``None``/missing falls back to the session's ACTIVE (focused)
+    window — the one-click "Capture to presentation" path never has to name a
+    window explicitly; it just captures whatever the user is looking at."""
+    if source_window_id is None:
+        source_window_id = getattr(session, "_active_window_id", None)
     if source_window_id is None:
         return None
     return session._plot_by_window_id(int(source_window_id))
@@ -2342,6 +2347,7 @@ def report_add_figure(session, plot, payload) -> None:
                     "at_cell": payload.get("at_cell"),
                     "caption": str(payload.get("caption", "") or ""),
                     "count": count,
+                    "slide_break": payload.get("slide_break"),
                 })
                 return
         snap = _snapshot_plot(src)
@@ -2364,6 +2370,12 @@ def report_add_figure(session, plot, payload) -> None:
         cell = Cell(id=new_cell_id(), cell_type="figure", caption=caption,
                     placeholder=False, spec=spec)
         _insert_cell(mgr.doc, cell, payload.get("index"))
+
+    # OPTIONAL Present-mode field (Phase 6, and the "Capture to presentation"
+    # one-click affordance): a capture defaults to slide_break=True so it lands
+    # as its OWN slide rather than piling onto whatever slide is currently open.
+    if payload.get("slide_break") is not None:
+        cell.slide_break = bool(payload.get("slide_break"))
 
     mgr._snapshots[cell.id] = dict(snap_map)
     mgr._baked.pop(cell.id, None)
