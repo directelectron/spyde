@@ -157,6 +157,8 @@ STAGED_HANDLERS: dict[str, str] = {
     "movie_open":              "spyde.actions.report.movie.movie_open",
     "movie_close":             "spyde.actions.report.movie.movie_close",
     "movie_scrub":             "spyde.actions.report.movie.movie_scrub",
+    "movie_play":              "spyde.actions.report.movie.movie_play",
+    "movie_stop":              "spyde.actions.report.movie.movie_stop",
     "movie_tune":              "spyde.actions.report.movie.movie_tune",
     "movie_crop_mode":         "spyde.actions.report.movie.movie_crop_mode",
     "movie_add_text_overlay":  "spyde.actions.report.movie.movie_add_text_overlay",

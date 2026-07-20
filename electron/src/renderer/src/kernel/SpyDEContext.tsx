@@ -1214,6 +1214,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         // editor" signal (from the sidebar Movie card / add-with-open). Consumed by
         // MovieGate / MovieEditor.
         case 'movie_state':
+        case 'movie_frame':
         case 'movie_done':
         case 'movie_edit_open':
         // Examples-menu download progress/terminal — consumed by DownloadToasts

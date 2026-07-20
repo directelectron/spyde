@@ -517,8 +517,14 @@ export interface MovieAnnotation {
   size?: number                      // text px
 }
 
-/** A freeze hold: linger on frame `t` for `hold_s` seconds (repeats the frame). */
+/** A freeze hold: linger on frame `t` for `hold_s` seconds (repeats the frame).
+ *  Superseded by MovieSpeedSegment (a 0× segment) but kept for back-compat. */
 export interface MovieFreeze { t: number; hold_s: number }
+
+/** A variable-speed segment: source time inside `time_range` (seconds) plays at
+ *  `speed`× (0 = hold/freeze, <1 slow-mo, >1 fast-forward). The export resamples
+ *  source→output time through these, emitting more frames where slow. */
+export interface MovieSpeedSegment { time_range: [number, number]; speed: number }
 
 /** The pixel-free MovieSpec recipe for a movie cell (mirrors the backend). */
 export interface MovieSpec {
@@ -527,9 +533,18 @@ export interface MovieSpec {
   annotations?: MovieAnnotation[]
   text_overlays?: MovieTextOverlay[]
   freezes?: MovieFreeze[]
+  speed_segments?: MovieSpeedSegment[]
   overlay_image?: Record<string, unknown> | null
   crop?: [number, number, number, number] | null   // [x0,y0,x1,y1] source px
   out_size?: [number, number] | null                // [w,h] output px
+}
+
+/** The navigator's current frame during scrub / playback (spyde:movie_frame). */
+export interface MovieFrameMessage extends MsgBase {
+  type: 'movie_frame'
+  cell_id: string
+  t: number
+  playing?: boolean
 }
 
 /** The base render params for a movie (matches the backend params dict). */
@@ -541,6 +556,7 @@ export interface MovieParams {
   clim?: [number, number] | null
   timestamp?: boolean
   scalebar?: boolean
+  axes?: boolean                        // draw calibrated axis ticks (default true)
   t_start?: number
   t_end?: number
 }
@@ -561,6 +577,7 @@ export interface MovieStateMessage extends MsgBase {
   annotations: MovieAnnotation[]
   text_overlays: MovieTextOverlay[]
   freezes: MovieFreeze[]
+  speed_segments: MovieSpeedSegment[]
   crop: [number, number, number, number] | null
   out_size: [number, number] | null
   frame_size: [number, number]        // source frame [w,h] — the editor coord space
@@ -810,6 +827,7 @@ export type PlotAppMessage =
   | LayersStateMessage
   | RepfigComposeOptionsMessage
   | MovieStateMessage
+  | MovieFrameMessage
   | MovieDoneMessage
   | MovieEditOpenMessage
   | DownloadProgressMessage

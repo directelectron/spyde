@@ -495,6 +495,92 @@ def frame_indices_with_freezes(n_frames: int, t_start: int, t_end: int,
     return out
 
 
+def frame_indices_with_speed(n_frames: int, t_start: int, t_end: int, stride: int,
+                             speed_segments, fps: float, scale_s: float,
+                             freezes=None):
+    """The render sequence resampled through VARIABLE-SPEED segments.
+
+    ``speed_segments`` is a list of ``{"time_range":[s0,s1] (seconds), "speed":m}``.
+    Source time inside a segment advances at ``m×`` (0 = hold, <1 slow-mo → more
+    output frames, >1 fast-forward → fewer). Outside any segment the speed is 1×.
+
+    The output is one source index per OUTPUT frame (fixed 1/fps output steps): a
+    source-time cursor walks ``t_start..t_end`` at the local speed; each output step
+    emits the nearest source index. A very slow / hold segment repeats indices; a
+    fast one skips them. Falls back to :func:`frame_indices_with_freezes` when there
+    are no speed segments (so legacy freezes still work)."""
+    if not speed_segments:
+        return frame_indices_with_freezes(n_frames, t_start, t_end, stride,
+                                          freezes or [], fps)
+    t0 = max(0, int(t_start))
+    t1 = min(int(n_frames) - 1, int(t_end))
+    if t1 < t0:
+        return []
+    sc = float(scale_s) if scale_s and scale_s > 0 else 1.0
+    out_dt = 1.0 / max(1.0, float(fps))          # output seconds per frame
+
+    def speed_at(src_frame: float) -> float:
+        t_sec = src_frame * sc
+        for seg in speed_segments:
+            try:
+                tr = seg.get("time_range")
+                if tr and float(tr[0]) <= t_sec <= float(tr[1]):
+                    return max(0.0, float(seg.get("speed", 1.0)))
+            except (TypeError, ValueError, AttributeError):
+                continue
+        return 1.0
+
+    out: list[int] = []
+    cur = float(t0)
+    # A hard cap so a 0×/tiny-speed segment spanning the whole movie can't loop
+    # forever — 10 minutes of output at this fps.
+    cap = int(600 * fps)
+    while cur <= t1 + 0.5 and len(out) < cap:
+        out.append(int(round(min(cur, t1))))
+        m = speed_at(cur)
+        # advance the source cursor by (speed * out_dt) SECONDS → frames.
+        adv = (m * out_dt) / sc
+        # A 0× (hold) segment still needs to eventually escape: nudge by a tiny
+        # epsilon so a hold at the very end doesn't wedge (it emits the same frame
+        # repeatedly while inside the segment's time window, which is the point).
+        if adv <= 0:
+            # Peek: if we're inside a hold segment, emit holds for its DURATION.
+            held = _hold_frames(speed_segments, cur * sc, out_dt, fps)
+            for _ in range(max(0, held - 1)):
+                if len(out) >= cap:
+                    break
+                out.append(int(round(min(cur, t1))))
+            # Then step past the segment end.
+            cur = _segment_end_frame(speed_segments, cur * sc, sc, t1) + (stride or 1)
+        else:
+            cur += adv
+    return out
+
+
+def _hold_frames(segments, t_sec, out_dt, fps) -> int:
+    """How many output frames a 0× hold at *t_sec* should last (its duration × fps)."""
+    for seg in segments:
+        try:
+            tr = seg.get("time_range")
+            if tr and float(seg.get("speed", 1)) == 0 and float(tr[0]) <= t_sec <= float(tr[1]):
+                return max(1, int(round((float(tr[1]) - float(tr[0])) * fps)))
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return 1
+
+
+def _segment_end_frame(segments, t_sec, sc, t1) -> float:
+    """The source frame index at the end of the hold segment containing *t_sec*."""
+    for seg in segments:
+        try:
+            tr = seg.get("time_range")
+            if tr and float(tr[0]) <= t_sec <= float(tr[1]):
+                return min(t1, float(tr[1]) / sc)
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return t_sec / sc
+
+
 def _base_frame(raw, t: int, crop, k: int) -> np.ndarray:
     """Read source frame *t*, apply the CROP (source px, before downsample), then
     the spatial downsample. Memory-safe: one :func:`read_frame` slice."""
@@ -659,11 +745,13 @@ def export_movie(raw, *, path: str, params: dict, n_frames: int,
     anns = p.get("annotations") or []
     text_overlays = list(text_overlays or [])
 
-    # Freeze holds are expanded into the rendered sequence (a frozen frame is
-    # re-encoded, its timestamp holds — see frame_indices_with_freezes).
-    idxs = frame_indices_with_freezes(
+    # Variable-speed segments (slow / fast-forward / hold) resample source→output
+    # time; when absent this falls back to legacy freeze-holds. A hold segment (0×)
+    # subsumes the freeze.
+    idxs = frame_indices_with_speed(
         n_frames, p.get("t_start", 0), p.get("t_end", n_frames - 1),
-        p.get("stride", 1), p.get("freezes") or [], fps)
+        p.get("stride", 1), p.get("speed_segments") or [], fps, scale_s,
+        freezes=p.get("freezes") or [])
     total = len(idxs)
     if total == 0:
         raise ValueError("Movie export: empty frame range.")

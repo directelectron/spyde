@@ -131,8 +131,8 @@ class TestEditorSession:
         assert st is not None
         for k in ("cell_id", "has_source", "ffmpeg_ok", "running", "n_frames",
                   "time", "sig", "params", "annotations", "text_overlays",
-                  "freezes", "crop", "out_size", "frame_size", "output_info",
-                  "signal_fig_id", "signal_window_id", "nav_fig_id",
+                  "freezes", "speed_segments", "crop", "out_size", "frame_size",
+                  "output_info", "signal_fig_id", "signal_window_id", "nav_fig_id",
                   "current_index"):
             assert k in st, f"movie_state missing {k!r}"
         assert set(st["output_info"]) == {"frames", "w", "h"}
@@ -443,6 +443,91 @@ class TestOverlays:
         assert _poll(messages, "movie_done") is not None
         f = np.asarray(iio.imread(out))[0]
         assert float(f[20:30, 2:12].mean()) > 60, "static overlay not composited"
+
+    def test_speed_segment_slows_the_export(self, movie_dataset, tmp_path):
+        # A 0.25× slow-mo segment over part of the movie makes the export LONGER
+        # (more output frames) than the plain range. (Variable-speed timeline.)
+        # The frame count is asserted from the authoritative movie_done + output_info
+        # (a GIF re-encode may de-dup repeated frames on disk, so we don't count the
+        # file). The output_info readout must match the exported frame count.
+        session, messages = movie_dataset["window"], movie_dataset["messages"]
+        cell_id = _add_movie(session, messages)
+        M.movie_open(session, None, {"cell_id": cell_id})
+        out0 = str(tmp_path / "base.gif")
+        M.movie_export(session, None, {"cell_id": cell_id, "path": out0})
+        assert _poll(messages, "movie_done")["frames"] == 8
+        messages.clear()
+        # 0.25× over the first half (t 0.0–0.3s at 0.1 s/frame → frames 0..3).
+        M.movie_tune(session, None, {"cell_id": cell_id,
+                                     "speed_segments": [{"time_range": [0.0, 0.3], "speed": 0.25}]})
+        # The readout (output_info) reflects the slow-mo frame count.
+        st = _latest(messages, "movie_state")
+        assert st["output_info"]["frames"] > 8, "output_info did not grow with slow-mo"
+        out1 = str(tmp_path / "slow.gif")
+        M.movie_export(session, None, {"cell_id": cell_id, "path": out1})
+        done = _poll(messages, "movie_done")
+        assert done is not None
+        assert done["frames"] > 8, f"slow-mo did not add frames ({done['frames']})"
+        assert done["frames"] == st["output_info"]["frames"]   # readout == export
+
+    def test_time_gated_annotation_shows_only_in_window(self, movie_dataset):
+        # A text annotation's live widget is hidden outside its time_range and shown
+        # inside it, as the scrubber crosses. (Live time-gating on the figure.)
+        session, messages = movie_dataset["window"], movie_dataset["messages"]
+        cell_id = _add_movie(session, messages)
+        M.movie_open(session, None, {"cell_id": cell_id})
+        sess = M._sessions(session._report)[cell_id]
+        M.movie_tune(session, None, {"cell_id": cell_id, "annotations": [
+            {"kind": "text", "text": "X", "xy": [4, 4], "time_range": [0.3, 0.5]}]})
+        w = sess._ann_widgets[0]
+        M.movie_scrub(session, None, {"cell_id": cell_id, "t": 0})   # 0.0s, outside
+        _wait_until(lambda: sess.current_index() == 0)
+        assert w.visible is False
+        M.movie_scrub(session, None, {"cell_id": cell_id, "t": 4})   # 0.4s, inside
+        _wait_until(lambda: sess.current_index() == 4)
+        assert w.visible is True
+
+    def test_render_params_apply_to_live_figure(self, movie_dataset):
+        # cmap / contrast / axes-toggle push onto the live signal plot.
+        session, messages = movie_dataset["window"], movie_dataset["messages"]
+        cell_id = _add_movie(session, messages)
+        M.movie_open(session, None, {"cell_id": cell_id})
+        sess = M._sessions(session._report)[cell_id]
+        p2 = sess._signal_plot2d()
+        M.movie_tune(session, None, {"cell_id": cell_id,
+                                     "params": {"clim": [10.0, 900.0], "axes": False}})
+        assert p2._state.get("has_axes") is False
+        assert float(p2._state.get("display_min")) == 10.0
+        assert float(p2._state.get("display_max")) == 900.0
+
+    def test_crop_zooms_the_live_figure(self, movie_dataset):
+        # Applying a crop zooms the live figure into the region (set_view).
+        session, messages = movie_dataset["window"], movie_dataset["messages"]
+        cell_id = _add_movie(session, messages)
+        M.movie_open(session, None, {"cell_id": cell_id})
+        sess = M._sessions(session._report)[cell_id]
+        p2 = sess._signal_plot2d()
+        M.movie_crop_mode(session, None, {"cell_id": cell_id, "on": True})
+        w = sess._crop_widget
+        w._data = {"x": 8.0, "y": 8.0, "w": 8.0, "h": 8.0}
+
+        class _Ev:
+            pass
+        ev = _Ev(); ev.source = w
+        sess._crop_handler(ev)
+        assert sess.cell.movie.crop == [8, 8, 16, 16]
+        assert float(p2._state.get("zoom", 1)) > 1.5   # zoomed in
+
+    def test_play_emits_frames_and_stops(self, movie_dataset):
+        import time
+        session, messages = movie_dataset["window"], movie_dataset["messages"]
+        cell_id = _add_movie(session, messages)
+        M.movie_open(session, None, {"cell_id": cell_id})
+        M.movie_play(session, None, {"cell_id": cell_id})
+        time.sleep(0.8)
+        M.movie_stop(session, None, {"cell_id": cell_id})
+        frames = [m for m in messages if m.get("type") == "movie_frame"]
+        assert len(frames) >= 2, "play did not emit movie_frame events"
 
     def test_crop_widget_on_figure_persists(self, movie_dataset):
         # Crop mode adds a draggable rect widget on the live figure; dragging it

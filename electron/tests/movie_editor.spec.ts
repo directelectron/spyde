@@ -162,6 +162,17 @@ test('3) scrubbing drives the real navigator — current_index advances', async 
   await expect(counter).toContainText('5 / 5', { timeout: 10_000 })
   await page.waitForTimeout(1200)
   await page.screenshot({ path: join(SHOTS, '03-scrubbed.png') })
+
+  // Play advances the navigator via movie_frame events (the backend clock). Click
+  // Play, wait for the frame counter to move OFF the last frame (it loops to the
+  // start of the range), then Pause.
+  const play = page.getByTestId('movie-play')
+  await expect(play).toBeVisible()
+  await play.click()
+  await expect.poll(async () => (await counter.textContent()) || '', {
+    timeout: 10_000, message: 'Play did not advance the navigator',
+  }).not.toContain('5 / 5')
+  await play.click()                                  // pause
   ctx.assertNoJsErrors()
 })
 
@@ -170,17 +181,21 @@ test('3) scrubbing drives the real navigator — current_index advances', async 
 test('4) add a Text overlay → a draggable clip appears on the Text timeline lane', async () => {
   const { page } = ctx
   await page.getByTestId('movie-add-text').click()
-  // A text clip appears (index within the annotations list; text is first → -0).
+  // A text clip appears on the Text lane; the inspector opens to edit it.
   await expect(page.getByTestId('movie-clip-text-0'),
     'no text clip appeared on the timeline').toBeVisible({ timeout: 5_000 })
-  // A ROI clip too — the ROI is the 2nd annotation (its testid carries its list
-  // index), so match the ROI lane's clip by prefix rather than a fixed index.
+  await expect(page.getByTestId('movie-insp-text'),
+    'inspector did not open for the new text clip').toBeVisible({ timeout: 5_000 })
+  // Edit the text in the inspector → the clip label updates.
+  await page.getByTestId('movie-insp-text').fill('Frame A')
+  await expect(page.getByTestId('movie-clip-text-0')).toContainText('Frame A', { timeout: 5_000 })
+  // A ROI clip.
   await page.getByTestId('movie-add-roi').click()
   await expect(page.locator('[data-testid^="movie-clip-roi-"]').first(),
     'no ROI clip appeared').toBeVisible({ timeout: 5_000 })
-  // A freeze marker at the current frame.
-  await page.getByTestId('movie-add-freeze').click()
-  await expect(page.getByTestId('movie-clip-freeze-0')).toBeVisible({ timeout: 5_000 })
+  // A speed segment (replaces freeze).
+  await page.getByTestId('movie-add-speed').click()
+  await expect(page.getByTestId('movie-clip-speed-0')).toBeVisible({ timeout: 5_000 })
   await page.screenshot({ path: join(SHOTS, '04-timeline.png') })
   ctx.assertNoJsErrors()
 })

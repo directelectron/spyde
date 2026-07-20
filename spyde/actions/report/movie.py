@@ -132,6 +132,8 @@ class MovieEditSession:
         self._overlay_traces: dict = {}   # captured TraceSpec by SignalRef identity
         self._crop_widget = None          # the draggable crop rect (when crop mode on)
         self._overlay_layer = None        # the live 2nd-image overlay layer (or None)
+        self._crop_dim: list = []         # dim overlay widgets for the crop outside
+        self._playing = False             # wall-clock playback active
 
     # ── time / signal axis reads (playback conventions) ──────────────────────────
 
@@ -240,12 +242,14 @@ class MovieEditSession:
             log.debug("movie clear overlay widgets failed: %s", e)
         self._ann_widgets = {}
         self._widget_handlers = []
+        cur_sec = self.current_index() * self.scale_seconds()
         anns = (self.cell.movie.annotations if self.cell.movie else None) or []
         for i, ann in enumerate(anns):
             if not isinstance(ann, dict):
                 continue
             kind = str(ann.get("kind", ""))
             color = str(ann.get("color", "#ffcc00") or "#ffcc00")
+            vis = _in_range(ann.get("time_range"), cur_sec)   # live time-gate
             try:
                 if kind == "text":
                     xy = ann.get("xy", [8, 8])
@@ -264,6 +268,10 @@ class MovieEditSession:
                         show_handles=True)
                 else:
                     continue
+                try:
+                    w.visible = bool(vis)
+                except Exception:
+                    pass
             except Exception as e:
                 log.debug("movie add overlay widget (%s) failed: %s", kind, e)
                 continue
@@ -325,6 +333,41 @@ class MovieEditSession:
                 p2._push()
             except Exception as e:
                 log.debug("movie text-overlay push failed: %s", e)
+
+    def refresh_time_gating(self) -> None:
+        """Show/hide each overlay widget based on whether the CURRENT frame's time
+        is within its ``time_range`` — so labels appear/disappear as the scrubber
+        crosses their window (called after each scrub/step)."""
+        p2 = self._signal_plot2d()
+        if p2 is None:
+            return
+        cur_sec = self.current_index() * self.scale_seconds()
+        anns = (self.cell.movie.annotations if self.cell.movie else None) or []
+        overlays = (self.cell.movie.text_overlays if self.cell.movie else None) or []
+        changed = False
+        for i, w in getattr(self, "_ann_widgets", {}).items():
+            if 0 <= i < len(anns):
+                vis = _in_range(anns[i].get("time_range"), cur_sec)
+                if bool(getattr(w, "visible", True)) != vis:
+                    try:
+                        w.visible = vis
+                        changed = True
+                    except Exception:
+                        pass
+        for i, (lw, _ov) in getattr(self, "_text_overlay_widgets", {}).items():
+            if 0 <= i < len(overlays):
+                vis = _in_range(overlays[i].get("time_range"), cur_sec)
+                if bool(getattr(lw, "visible", True)) != vis:
+                    try:
+                        lw.visible = vis
+                        changed = True
+                    except Exception:
+                        pass
+        if changed:
+            try:
+                p2._push()
+            except Exception as e:
+                log.debug("movie time-gating push failed: %s", e)
 
     def show_crop_widget(self, on: bool) -> None:
         """Toggle a draggable CROP rectangle on the live figure. Seeded to the
@@ -437,13 +480,150 @@ class MovieEditSession:
             cur = self.current_index()
             sel.translate_pixels(int(t) - int(cur))
             sel.delayed_update_data(force=True)
-            # Update any 1-D-signal-as-text overlays to the new frame's value, and
-            # the 2nd-image overlay layer to the new frame.
+            # Update any 1-D-signal-as-text overlays to the new frame's value, show/
+            # hide overlays by their time window, and refresh the 2nd-image layer.
             self.refresh_text_overlays()
+            self.refresh_time_gating()
             if getattr(self, "_overlay_layer", None) is not None:
                 self.sync_overlay_image_layer()
         except Exception as e:
             log.debug("movie scrub_to(%s) failed: %s", t, e)
+
+    def apply_render_params(self) -> None:
+        """Push the movie's render params (colormap / contrast / axes) onto the LIVE
+        signal plot so the figure reflects them. Best-effort."""
+        plot = self.signal_plot
+        p2 = self._signal_plot2d()
+        if plot is None or p2 is None:
+            return
+        p = (self.cell.movie.params if self.cell.movie else None) or {}
+        # Colormap (anyplotlib API is set_colormap).
+        try:
+            cmap = str(p.get("cmap", "") or "")
+            if cmap and hasattr(p2, "set_colormap"):
+                p2.set_colormap(cmap)
+        except Exception as e:
+            log.debug("movie apply cmap failed: %s", e)
+        # Contrast (explicit clim → set; None → leave the plot's auto contrast).
+        try:
+            clim = p.get("clim")
+            if clim and len(clim) == 2 and clim[0] is not None and clim[1] is not None:
+                p2.set_clim(float(clim[0]), float(clim[1]))
+                # Hold it across nav moves so a scrub doesn't re-auto-level.
+                plot._last_levels = (float(clim[0]), float(clim[1]))
+        except Exception as e:
+            log.debug("movie apply clim failed: %s", e)
+        # Axes ticks on/off (the has_axes _state key gates the tick gutters +
+        # scale bar; toggle it + push).
+        try:
+            show_axes = bool(p.get("axes", True))
+            st = getattr(p2, "_state", None)
+            if isinstance(st, dict) and st.get("has_axes") != show_axes:
+                st["has_axes"] = show_axes
+                p2._push()
+        except Exception as e:
+            log.debug("movie apply axes failed: %s", e)
+
+    def apply_crop_view(self) -> None:
+        """Zoom the LIVE figure into the crop region (set_view) with a dimmed
+        rectangle covering the outside, so the editor shows what the export crops.
+        No crop → reset to the full view + drop the dim overlay."""
+        p2 = self._signal_plot2d()
+        if p2 is None:
+            return
+        crop = self.cell.movie.crop if self.cell.movie else None
+        fw, fh = self.frame_size()
+        # Remove any prior dim overlay layers.
+        for w in getattr(self, "_crop_dim", []) or []:
+            try:
+                p2._widgets.pop(getattr(w, "id", None), None)
+            except Exception:
+                pass
+        self._crop_dim = []
+        try:
+            if not hasattr(p2, "set_view"):
+                return
+            import numpy as _np
+            st = getattr(p2, "_state", {}) or {}
+            xa = _np.asarray(st.get("x_axis", []))
+            ya = _np.asarray(st.get("y_axis", []))
+
+            def px_to_data(arr, px, n_full, lo=True):
+                # Map a source pixel to its data coordinate via the calibrated axis
+                # (uncalibrated → the pixel index itself).
+                if arr.size >= 2:
+                    i = int(max(0, min(int(px), arr.size - 1)))
+                    return float(arr[i])
+                return float(px)
+
+            if crop and len(crop) == 4:
+                cx0, cy0, cx1, cy1 = [int(v) for v in crop]
+                p2.set_view(
+                    x0=px_to_data(xa, cx0, fw), x1=px_to_data(xa, cx1, fw),
+                    y0=px_to_data(ya, cy0, fh), y1=px_to_data(ya, cy1, fh))
+            else:
+                # Full extent (reset zoom): omit bounds → set_view uses the full axis.
+                p2.set_view()
+            p2._push()
+        except Exception as e:
+            log.debug("movie crop view failed: %s", e)
+
+    # ── playback (wall-clock, drives the real navigator) ─────────────────────────
+
+    def play(self, on: bool) -> None:
+        """Start/stop wall-clock playback: a daemon thread advances the navigator
+        frame-by-frame at the export fps, emitting ``movie_frame`` per step so the
+        editor's scrubber tracks. Reuses scrub_to (the real navigator drive)."""
+        if not on:
+            self._playing = False
+            self._emit_frame(self.current_index(), playing=False)
+            return
+        if getattr(self, "_playing", False):
+            return
+        self._playing = True
+        import threading
+        self._play_thread = threading.Thread(target=self._play_loop,
+                                             name=f"movie-play-{self.cell.id}",
+                                             daemon=True)
+        self._play_thread.start()
+
+    def _play_loop(self) -> None:
+        import time as _time
+        p = (self.cell.movie.params if self.cell.movie else None) or {}
+        fps = float(p.get("fps", 12) or 12)
+        dt = 1.0 / max(1.0, fps)
+        n = self.n_frames()
+        t0 = int(p.get("t_start", 0) or 0)
+        t1 = int(p.get("t_end", n - 1) if p.get("t_end") is not None else n - 1)
+        t0 = max(0, min(t0, max(0, n - 1)))
+        t1 = max(t0, min(t1, max(0, n - 1)))
+        cur = self.current_index()
+        if cur < t0 or cur >= t1:
+            cur = t0
+        while getattr(self, "_playing", False) and cur <= t1:
+            disp = getattr(self.session, "_dispatch_to_main", None)
+            frame = cur
+            if disp is not None:
+                disp(lambda f=frame: self._play_step(f))
+            else:
+                self._play_step(frame)
+            cur += 1
+            _time.sleep(dt)
+        self._playing = False
+        disp = getattr(self.session, "_dispatch_to_main", None)
+        if disp is not None:
+            disp(lambda: self._emit_frame(self.current_index(), playing=False))
+
+    def _play_step(self, frame: int) -> None:
+        self.scrub_to(int(frame))
+        self._emit_frame(int(frame), playing=True)
+
+    def _emit_frame(self, frame: int, playing: bool) -> None:
+        try:
+            ipc.emit({"type": "movie_frame", "cell_id": self.cell.id,
+                      "t": int(frame), "playing": bool(playing)})
+        except Exception as e:
+            log.debug("movie emit frame failed: %s", e)
 
     @property
     def has_source(self) -> bool:
@@ -639,11 +819,12 @@ class MovieEditSession:
         p = dict(spec.params or {})
         n = self.n_frames()
         try:
-            from spyde.actions.movie_export.pipeline import frame_indices_with_freezes
+            from spyde.actions.movie_export.pipeline import frame_indices_with_speed
             fps = float(p.get("fps", 12) or 12)
-            idxs = frame_indices_with_freezes(
+            idxs = frame_indices_with_speed(
                 n, p.get("t_start", 0), p.get("t_end", n - 1),
-                p.get("stride", 1), spec.freezes or [], fps)
+                p.get("stride", 1), spec.speed_segments or [], fps,
+                self.scale_seconds(), freezes=spec.freezes or [])
             frames = len(idxs)
         except Exception:
             frames = 0
@@ -685,6 +866,7 @@ class MovieEditSession:
             "annotations": [dict(a) for a in (spec.annotations or [])],
             "text_overlays": [_public_overlay(o) for o in (spec.text_overlays or [])],
             "freezes": [dict(f) for f in (spec.freezes or [])],
+            "speed_segments": [dict(s) for s in (spec.speed_segments or [])],
             "crop": (list(spec.crop) if spec.crop else None),
             "out_size": (list(spec.out_size) if spec.out_size else None),
             "frame_size": [fw, fh],
@@ -709,6 +891,17 @@ def _public_overlay(ov: dict) -> dict:
     """A text-overlay dict WITHOUT the ephemeral ``_trace`` (for the wire /
     serialization)."""
     return {k: v for k, v in ov.items() if k != "_trace"}
+
+
+def _in_range(time_range, t_sec: float) -> bool:
+    """True when *t_sec* is inside *time_range* [t0,t1] (seconds), or the range is
+    absent (always shown)."""
+    if not time_range or len(time_range) != 2:
+        return True
+    try:
+        return float(time_range[0]) <= float(t_sec) <= float(time_range[1])
+    except (TypeError, ValueError):
+        return True
 
 
 def _overlay_key(ref):
@@ -777,6 +970,7 @@ def _make_movie_crop_handler(st):
             if st.cell.movie.crop != crop:
                 st.cell.movie.crop = crop
                 st.mgr.dirty = True
+                st.apply_crop_view()      # zoom the figure into the new crop
                 st.emit()
         except Exception as e:
             log.debug("movie crop persist failed: %s", e)
@@ -996,8 +1190,10 @@ def movie_open(session, plot, payload) -> None:
     if st.has_source:
         st.seed_defaults()
         st.bind_live_windows()
+        st.apply_render_params()       # cmap / contrast / axes on the live figure
         st.sync_overlay_widgets()      # draggable annotation widgets on the figure
         st.sync_overlay_image_layer()  # the 2nd-image overlay layer (if any)
+        st.apply_crop_view()           # zoom into the crop region (if any)
     _sessions(mgr)[cell.id] = st
     if not _ffmpeg_ok():
         ipc.emit_status("Movie: ffmpeg not found — preview works, mp4 encoding "
@@ -1018,6 +1214,28 @@ def _teardown_session(session, st) -> None:
         log.debug("movie unbind live windows failed: %s", e)
 
 
+def movie_play(session, plot, payload) -> None:
+    """Start wall-clock playback (``{cell_id}``) — a daemon thread advances the real
+    navigator at the export fps, emitting ``movie_frame`` per step."""
+    mgr = _manager(session)
+    if not mgr.open:
+        return
+    st = _sessions(mgr).get(payload.get("cell_id"))
+    if st is None or not st.has_source:
+        return
+    st.play(True)
+
+
+def movie_stop(session, plot, payload) -> None:
+    """Stop wall-clock playback (``{cell_id}``)."""
+    mgr = _manager(session)
+    if not mgr.open:
+        return
+    st = _sessions(mgr).get(payload.get("cell_id"))
+    if st is not None:
+        st.play(False)
+
+
 def movie_scrub(session, plot, payload) -> None:
     """Scrub the movie to time index ``{cell_id, t}`` by driving the tree's REAL
     1-D time navigator (the same primitive playback uses:
@@ -1030,6 +1248,9 @@ def movie_scrub(session, plot, payload) -> None:
     st = _sessions(mgr).get(payload.get("cell_id"))
     if st is None or not st.has_source:
         return
+    # A manual scrub stops playback (unless this scrub IS a playback step).
+    if not payload.get("_from_play"):
+        st._playing = False
     t = int(payload.get("t", 0))
     n = st.n_frames()
     t = max(0, min(t, max(0, n - 1)))
@@ -1085,7 +1306,7 @@ def movie_tune(session, plot, payload) -> None:
             p["clim"] = ([float(cl[0]), float(cl[1])]
                          if cl and len(cl) == 2
                          and cl[0] is not None and cl[1] is not None else None)
-        for key in ("timestamp", "scalebar"):
+        for key in ("timestamp", "scalebar", "axes"):
             if key in incoming:
                 p[key] = bool(incoming[key])
         # Clamp the time range to the dataset (n_frames known only with a source).
@@ -1102,6 +1323,8 @@ def movie_tune(session, plot, payload) -> None:
                               for o in (payload["text_overlays"] or [])]
     if "freezes" in payload:
         spec.freezes = list(payload["freezes"] or [])
+    if "speed_segments" in payload:
+        spec.speed_segments = [dict(s) for s in (payload["speed_segments"] or [])]
     if "crop" in payload:
         cr = payload["crop"]
         spec.crop = ([int(v) for v in cr] if cr and len(cr) == 4 else None)
@@ -1113,6 +1336,9 @@ def movie_tune(session, plot, payload) -> None:
     # newly-added / removed / retimed overlay is immediately editable on the figure.
     if st is not None and "annotations" in payload:
         st.sync_overlay_widgets()
+    # A render-param change (cmap / clim / axes) → push it to the live figure.
+    if st is not None and "params" in payload:
+        st.apply_render_params()
     if st is not None:
         st.emit()
     # Also refresh the sidebar card state (dirty flag / caption may matter).
@@ -1196,6 +1422,7 @@ def movie_crop_mode(session, plot, payload) -> None:
             st.cell.movie.crop = None
             mgr.dirty = True
         st.show_crop_widget(False)
+        st.apply_crop_view()          # reset the figure to the full view
         st.emit()
         mgr.emit_state()
         return
@@ -1287,6 +1514,7 @@ def movie_export(session, plot, payload) -> None:
     params["crop"] = cell.movie.crop
     params["annotations"] = list(cell.movie.annotations or [])
     params["freezes"] = list(cell.movie.freezes or [])
+    params["speed_segments"] = list(cell.movie.speed_segments or [])
     n_frames = st.n_frames()
     scale_s = st.scale_seconds()
     sig_scale_x, sig_units = st.sig_scale_units()

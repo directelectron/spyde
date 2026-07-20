@@ -671,7 +671,8 @@ class MovieSpec:
     #                                                     clim/timestamp/scalebar/t_start/t_end
     annotations: list = field(default_factory=list)     # [dict] time-gated markers (incl. ROIs)
     text_overlays: list = field(default_factory=list)   # [dict] 1-D-signal-as-text overlays
-    freezes: list = field(default_factory=list)         # [{"t":int,"hold_s":float}]
+    freezes: list = field(default_factory=list)         # [{"t":int,"hold_s":float}] (legacy)
+    speed_segments: list = field(default_factory=list)  # [{"time_range":[s0,s1],"speed":float}]
     overlay_image: dict | None = None                   # 2nd-image composite (Phase 3)
     crop: list | None = None                            # [x0,y0,x1,y1] source px, or None
     out_size: list | None = None                        # [w,h] output px, or None
@@ -683,6 +684,7 @@ class MovieSpec:
             "annotations": [dict(a) for a in self.annotations],
             "text_overlays": [dict(t) for t in self.text_overlays],
             "freezes": [dict(f) for f in self.freezes],
+            "speed_segments": [dict(s) for s in self.speed_segments],
         }
         if self.overlay_image is not None:
             d["overlay_image"] = dict(self.overlay_image)
@@ -705,6 +707,7 @@ class MovieSpec:
             annotations=[dict(a) for a in (d.get("annotations") or [])],
             text_overlays=[dict(t) for t in (d.get("text_overlays") or [])],
             freezes=[dict(f) for f in (d.get("freezes") or [])],
+            speed_segments=[dict(s) for s in (d.get("speed_segments") or [])],
             overlay_image=(dict(oi) if isinstance(oi, dict) else None),
             crop=([int(v) for v in crop] if crop else None),
             out_size=([int(v) for v in out_size] if out_size else None),
