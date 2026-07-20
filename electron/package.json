@@ -9,6 +9,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
     "preview": "electron-vite preview",
     "test": "playwright test",
+    "test:unit": "node --test \"src/**/*.test.ts\"",
     "test:build": "electron-vite build && playwright test",
     "bundle:python": "node scripts/bundle-python.mjs",
     "dist": "npm run build && npm run bundle:python && electron-builder --config electron-builder.yml",

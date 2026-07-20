@@ -149,7 +149,11 @@ jobs:
             # electron-builder (nsis) emits "SpyDE Setup <version>.exe".
             artifact_glob: electron/dist/*.exe
           - os: macos-latest
-            artifact_glob: electron/dist/*.dmg
+            # dmg = manual install; zip = the electron-updater auto-update payload
+            # (macOS can't auto-update from a dmg). Both are published to the release.
+            artifact_glob: |
+              electron/dist/*.dmg
+              electron/dist/*.zip
           - os: ubuntu-latest
             artifact_glob: electron/dist/*.AppImage
 
@@ -302,6 +306,60 @@ jobs:
             echo "::error::Release $TAG has only $count assets — the installers did not attach. Refusing to publish an empty release."
             exit 1
           fi
+
+      # AUTO-UPDATE FEED GATE — the check that would have caught "mac auto-update
+      # failed spectacularly". electron-updater reads latest*.yml to decide what to
+      # download; on macOS it CANNOT apply a .dmg, only a .zip. A dmg-only mac feed
+      # builds + publishes fine (so the asset-count gate above passes) yet every
+      # mac auto-update then fails. Validate each platform feed references an
+      # INSTALLABLE payload AND that the referenced file is actually an attached
+      # asset — refuse to publish a release users can't update from.
+      - name: Validate the auto-update feeds are installable
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # asset names actually attached to the release
+          mapfile -t ASSETS < <(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name')
+          has_asset() { for a in "${ASSETS[@]}"; do [ "$a" = "$1" ] && return 0; done; return 1; }
+
+          # feed file -> the extension(s) electron-updater can install from it
+          declare -A FEED_EXT=(
+            [latest-mac.yml]='\.zip$'
+            [latest.yml]='\.(exe|nupkg)$'
+            [latest-linux.yml]='\.(AppImage|deb|rpm)$'
+          )
+          fail=0
+          for feed in latest-mac.yml latest.yml latest-linux.yml; do
+            url="https://github.com/$REPO/releases/download/$TAG/$feed"
+            if ! body=$(curl -fsSL "$url"); then
+              echo "::error::update feed $feed is missing from the release — electron-updater can't detect updates on that platform."
+              fail=1; continue
+            fi
+            # every `url:` entry under files: (the installable payloads)
+            mapfile -t urls < <(printf '%s\n' "$body" | sed -nE 's/^[[:space:]]*-?[[:space:]]*url:[[:space:]]*//p')
+            if [ "${#urls[@]}" -eq 0 ]; then
+              echo "::error::$feed lists no files — malformed update feed."; fail=1; continue
+            fi
+            want="${FEED_EXT[$feed]}"
+            ok=0
+            for u in "${urls[@]}"; do
+              u="${u%$'\r'}"                       # strip any CRLF
+              if printf '%s' "$u" | grep -qiE "$want"; then
+                if has_asset "$u"; then ok=1; echo "  $feed -> $u ✓"; else
+                  echo "::error::$feed references '$u' but it is NOT an attached asset."; fail=1
+                fi
+              fi
+            done
+            if [ "$ok" -eq 0 ]; then
+              echo "::error::$feed has no installable payload (need $want). Files: ${urls[*]}. On macOS a dmg-only feed CANNOT auto-update — add the zip target."
+              fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] || { echo "::error::auto-update feed validation failed — refusing to publish a release users can't update from."; exit 1; }
+          echo "All auto-update feeds reference an installable, attached payload."
 
       # Un-draft AND stamp the channel: the prerelease flag is applied HERE (not
       # at draft-creation) so the release stays a plain draft during the upload

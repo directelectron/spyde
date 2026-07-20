@@ -127,6 +127,34 @@ test('error → friendly message + Retry (the banner dropped this)', async () =>
   await expect.poll(firedChannels).toContain('spyde:check-for-updates')
 })
 
+test('a huge raw error message stays BOUNDED inside the card (no wall of text)', async () => {
+  // Regression: a provider that couldn't resolve latest-mac.yml surfaced the raw
+  // GitHub releases.atom XML as the error message — it rendered as a full-screen
+  // wall of markup. friendlyError now collapses markup main-side; the card's error
+  // box is ALSO bounded (maxHeight + scroll) as defence-in-depth. Push a giant
+  // blob directly (bypassing friendlyError) and assert the card doesn't blow out.
+  const huge = '<?xml version="1.0"?><feed>' + '<entry>x</entry>'.repeat(400) + '</feed>'
+  await pushStatus({ state: 'error', message: huge })
+  const card = page.getByTestId('update-card')
+  await expect(card).toBeVisible()
+
+  const { cardH, winH, errScrolls } = await card.evaluate((el) => {
+    const err = el.querySelector('[data-testid="update-card-error"]') as HTMLElement
+    return {
+      cardH: el.getBoundingClientRect().height,
+      winH: window.innerHeight,
+      // The error box caps its own height and scrolls its overflow.
+      errScrolls: err ? err.scrollHeight > err.clientHeight + 1 : false,
+    }
+  })
+  // The whole card must stay a small fraction of the window, not fill it.
+  expect(cardH).toBeLessThan(winH * 0.6)
+  expect(errScrolls).toBe(true)
+  // Retry is still reachable (not pushed off-screen by the blob).
+  await expect(page.getByTestId('update-card-retry')).toBeVisible()
+  await page.screenshot({ path: 'update_card_shots/04-bounded-error.png' })
+})
+
 test('dismiss hides the card; a NEW status re-shows it', async () => {
   await pushStatus({ state: 'available', version: '9.9.9' })
   await expect(page.getByTestId('update-card')).toBeVisible()

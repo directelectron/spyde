@@ -1,5 +1,10 @@
 {
   "include": ["electron.vite.config.*", "src/main/**/*", "src/preload/**/*"],
+  // *.test.ts are run by `node --test` (native TS strip), not compiled into the
+  // app bundle — and they use explicit .ts import specifiers node's ESM resolver
+  // needs, which tsc's bundler resolution rejects (TS5097). Keep them out of the
+  // typecheck; their own run is the gate (npm run test:unit).
+  "exclude": ["src/**/*.test.ts"],
   "compilerOptions": {
     "composite": true,
     "types": ["electron-vite/node"],

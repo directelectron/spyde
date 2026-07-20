@@ -204,7 +204,12 @@ const S: Record<string, React.CSSProperties> = {
     fontSize: 16, lineHeight: 1, cursor: 'pointer', padding: '0 2px', marginTop: -2,
   },
   subtle: { fontSize: 11.5, color: '#a6adc8' },
-  errText: { fontSize: 11.5, color: '#f38ba8', lineHeight: 1.4 },
+  errText: {
+    fontSize: 11.5, color: '#f38ba8', lineHeight: 1.4,
+    // Bound an unexpectedly long message so it scrolls inside the card instead of
+    // blowing out its height (see updater.ts friendlyError).
+    maxHeight: 120, overflowY: 'auto', overflowWrap: 'anywhere', whiteSpace: 'pre-wrap',
+  },
   notes: {
     fontSize: 11, color: '#a6adc8', lineHeight: 1.45, whiteSpace: 'pre-wrap',
     maxHeight: 140, overflowY: 'auto',

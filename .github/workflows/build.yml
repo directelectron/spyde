@@ -90,6 +90,41 @@ jobs:
         working-directory: electron
         run: npm run typecheck
 
+  # ── Main-process unit tests (cross-OS) ─────────────────────────────────────
+  # Pure-logic units from the Electron MAIN process (node:test, native TS type-
+  # stripping on Node 24). No display / Python / Electron runtime — just Node — so
+  # it runs fast on all three desktop OSes. Motivation: the auto-updater's
+  # friendlyError() must sanitise a raw releases.atom / HTML error body on EVERY
+  # platform (the "mac auto-update failed spectacularly" wall-of-XML regression,
+  # also reported on Windows). The mapper is platform-independent, but running it
+  # on windows/macos/ubuntu also guards against per-OS differences in node --test
+  # + TS type-stripping + glob expansion.
+  unit:
+    name: electron-unit (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # windows-latest ≈ Win 11 image; windows-2022 ≈ the older Win 10-era image.
+        # macos-latest = Apple Silicon. Covers Win 11 / Win 10-era / macOS as asked.
+        os: [ubuntu-latest, windows-latest, windows-2022, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install Electron dependencies
+        working-directory: electron
+        run: npm ci
+
+      - name: Run main-process unit tests
+        working-directory: electron
+        run: npm run test:unit
+
   # ── Electron e2e (Playwright) ──────────────────────────────────────────────
   # Runs the DEFAULT 'electron' project only (synthetic + bundled data, no
   # network). The opt-in 'electron-real' project (real pyxem downloads + the
