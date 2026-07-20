@@ -71,7 +71,8 @@ function clearDownloadStallTimer(): void {
 }
 
 /** Map a raw electron-updater / Chromium-net error to something a user can act
- *  on. Falls back to the raw message when we don't recognise it. */
+ *  on. Falls back to a BOUNDED, sanitised version of the raw message when we
+ *  don't recognise it — never the raw blob verbatim. */
 export function friendlyError(raw: string): string {
   const s = String(raw || '')
   if (/ERR_INTERNET_DISCONNECTED|ENOTFOUND|EAI_AGAIN|ERR_NAME_NOT_RESOLVED|getaddrinfo/i.test(s)) {
@@ -86,7 +87,22 @@ export function friendlyError(raw: string): string {
   if (/latest.*\.yml|Cannot find .*\.yml|status code 404|HttpError: 404|ERR_HTTP_RESPONSE_CODE_FAILURE/i.test(s)) {
     return 'No update information available right now — please try again later.'
   }
-  return s
+  // A provider that can't resolve the platform feed can surface the GitHub
+  // releases.atom body (or an HTML error page) as the error message. That raw
+  // XML/HTML must NEVER reach the UI verbatim — it rendered as a full-screen wall
+  // of markup ("mac auto-update failed spectacularly"). Detect markup / an
+  // oversized blob and collapse it to a short, actionable line.
+  if (/<\?xml|<!DOCTYPE|<feed\b|<entry\b|<html\b|<rss\b/i.test(s)) {
+    return 'The update server returned an unexpected response — please try again later or update manually from GitHub.'
+  }
+  return truncateMessage(s)
+}
+
+/** Bound an unrecognised error message so a huge single-line payload can't blow
+ *  out the error box. Collapse whitespace, cap length, keep it one readable line. */
+function truncateMessage(s: string, max = 300): string {
+  const flat = s.replace(/\s+/g, ' ').trim()
+  return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat
 }
 
 /** Every error/timeout path funnels through here so state stays consistent:

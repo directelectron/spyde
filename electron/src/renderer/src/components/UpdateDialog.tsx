@@ -208,6 +208,9 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: 12.5, color: '#f38ba8', margin: '0 0 14px',
     background: 'rgba(243,139,168,0.08)', border: '1px solid rgba(243,139,168,0.3)',
     borderRadius: 6, padding: '10px 12px',
+    // Belt-and-braces against an unexpectedly long message (see updater.ts
+    // friendlyError): scroll inside the box, wrap, never overflow the dialog.
+    maxHeight: 160, overflowY: 'auto', overflowWrap: 'anywhere', whiteSpace: 'pre-wrap',
   },
   progressTrack: {
     marginTop: 6, height: 5, borderRadius: 3, background: '#313244', overflow: 'hidden',

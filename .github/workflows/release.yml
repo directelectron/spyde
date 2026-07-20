@@ -149,7 +149,11 @@ jobs:
             # electron-builder (nsis) emits "SpyDE Setup <version>.exe".
             artifact_glob: electron/dist/*.exe
           - os: macos-latest
-            artifact_glob: electron/dist/*.dmg
+            # dmg = manual install; zip = the electron-updater auto-update payload
+            # (macOS can't auto-update from a dmg). Both are published to the release.
+            artifact_glob: |
+              electron/dist/*.dmg
+              electron/dist/*.zip
           - os: ubuntu-latest
             artifact_glob: electron/dist/*.AppImage
 

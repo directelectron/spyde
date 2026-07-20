@@ -37,7 +37,13 @@ extraResources:
 # (electron/), so ../ reaches the repo root.
 mac:
   category: public.app-category.education
-  target: [dmg]
+  # BOTH dmg (what users download by hand) AND zip. electron-updater CANNOT
+  # auto-update from a .dmg on macOS — it needs a .zip in latest-mac.yml to apply
+  # an update. A dmg-only feed made autoUpdater download the dmg it could not
+  # install and then fall back to fetching the releases.atom feed, whose raw XML
+  # surfaced as the "mac auto-update failed" wall of text. The zip is the update
+  # payload; the dmg stays for first-time manual installs.
+  target: [dmg, zip]
   icon: ../spyde/Spyde.png
   # Unsigned for now — Gatekeeper will warn; see PACKAGING.md for the
   # sign+notarize follow-up (needs an Apple Developer ID).
