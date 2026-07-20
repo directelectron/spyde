@@ -123,6 +123,11 @@ class MovieEditSession:
         self.signal_plot = None         # the 2-D signal Plot
         self.time_selector = None       # the 1-D time navigator selector
         self.nav_plot = None            # the 1-D navigator Plot (shown beside, opt)
+        # Draggable anyplotlib annotation widgets on the live signal plot, keyed by
+        # the annotation's index in cell.movie.annotations. Rebuilt on every spec
+        # change so a widget drag → persist → re-emit → resync stays consistent.
+        self._ann_widgets: dict = {}    # {ann_index: widget}
+        self._widget_handlers: list = []  # keep-alive for the drag handlers
 
     # ── time / signal axis reads (playback conventions) ──────────────────────────
 
@@ -206,10 +211,88 @@ class MovieEditSession:
         except Exception as e:
             log.debug("movie bind time selector failed: %s", e)
 
+    # ── annotation widgets on the live signal figure ─────────────────────────────
+
+    def _signal_plot2d(self):
+        """The live anyplotlib Plot2D of the signal figure (None until the iframe
+        loads)."""
+        return getattr(self.signal_plot, "_plot2d", None) if self.signal_plot else None
+
+    def sync_overlay_widgets(self) -> None:
+        """(Re)build the DRAGGABLE anyplotlib annotation widgets on the live signal
+        plot from ``cell.movie.annotations`` — text → ``add_label_widget``, rect →
+        ``add_rectangle_widget`` (source-pixel coords == image-pixel widget coords
+        for a signal frame, so no data-coord conversion). A ``pointer_up`` handler
+        persists the moved geometry back to the spec + re-emits state. Non-fatal if
+        the figure iframe hasn't loaded (retried on the next scrub / tune)."""
+        p2 = self._signal_plot2d()
+        if p2 is None:
+            return
+        # Drop the previous widgets (a rebuild supersedes them wholesale).
+        try:
+            for w in self._ann_widgets.values():
+                p2._widgets.pop(getattr(w, "id", None), None)
+        except Exception as e:
+            log.debug("movie clear overlay widgets failed: %s", e)
+        self._ann_widgets = {}
+        self._widget_handlers = []
+        anns = (self.cell.movie.annotations if self.cell.movie else None) or []
+        for i, ann in enumerate(anns):
+            if not isinstance(ann, dict):
+                continue
+            kind = str(ann.get("kind", ""))
+            color = str(ann.get("color", "#ffcc00") or "#ffcc00")
+            try:
+                if kind == "text":
+                    xy = ann.get("xy", [8, 8])
+                    w = p2.add_label_widget(
+                        x=float(xy[0]), y=float(xy[1]),
+                        text=str(ann.get("text", "") or "Label"),
+                        fontsize=int(ann.get("size", 18) or 18),
+                        color=color, show_handles=False)
+                elif kind in ("rect", "circle"):
+                    xy = ann.get("xy", [8, 8])
+                    wh = ann.get("wh", [40, 40])
+                    w = p2.add_rectangle_widget(
+                        x=float(xy[0]), y=float(xy[1]),
+                        w=float(wh[0]), h=float(wh[1]),
+                        color=color, linewidth=float(ann.get("width", 3) or 3),
+                        show_handles=True)
+                else:
+                    continue
+            except Exception as e:
+                log.debug("movie add overlay widget (%s) failed: %s", kind, e)
+                continue
+            self._ann_widgets[i] = w
+            handler = _make_movie_widget_handler(self, i, kind)
+            try:
+                w.add_event_handler(handler, "pointer_up")
+                self._widget_handlers.append(handler)
+            except Exception as e:
+                log.debug("movie wire widget drag failed: %s", e)
+        try:
+            p2._push()
+        except Exception as e:
+            log.debug("movie widget push failed: %s", e)
+
+    def clear_overlay_widgets(self) -> None:
+        p2 = self._signal_plot2d()
+        if p2 is not None:
+            try:
+                for w in self._ann_widgets.values():
+                    p2._widgets.pop(getattr(w, "id", None), None)
+                p2._push()
+            except Exception as e:
+                log.debug("movie clear overlay widgets failed: %s", e)
+        self._ann_widgets = {}
+        self._widget_handlers = []
+
     def unbind_live_windows(self) -> None:
         """Restore the surfaced windows to normal (the renderer re-parents the
-        signal figure back to its MDI window on movie_close). No backend figure was
-        created, so there's nothing to evict — just drop the references."""
+        signal figure back to its MDI window on movie_close). Clears the annotation
+        widgets off the live plot; no backend figure was created, so there's nothing
+        else to evict — just drop the references."""
+        self.clear_overlay_widgets()
         self.signal_plot = None
         self.time_selector = None
         self.nav_plot = None
@@ -378,6 +461,48 @@ def _public_overlay(ov: dict) -> dict:
     """A text-overlay dict WITHOUT the ephemeral ``_trace`` (for the wire /
     serialization)."""
     return {k: v for k, v in ov.items() if k != "_trace"}
+
+
+def _make_movie_widget_handler(st, ann_index: int, kind: str):
+    """A module-level closure (NOT a bound method — anyplotlib sets
+    ``fn._event_types`` on the handler) returning a ``pointer_up`` handler that
+    persists ONE dragged annotation widget's new geometry back to
+    ``cell.movie.annotations[ann_index]``. The widget geometry is in IMAGE pixels,
+    which for a signal frame ARE source pixels — so it maps straight to the movie
+    annotation's ``xy`` / ``wh`` (no data-coord conversion, unlike a figure panel).
+    Re-emits ``movie_state`` so the timeline / renderer mirror stays in sync."""
+
+    def _on_drag_end(event):
+        try:
+            widget = getattr(event, "source", None)
+            g = getattr(widget, "_data", None) if widget is not None else None
+            if not isinstance(g, dict):
+                return
+            cell = st.cell
+            anns = (cell.movie.annotations if cell.movie else None) or []
+            if not (0 <= ann_index < len(anns)):
+                return
+            ann = anns[ann_index]
+            changed = False
+            if kind == "text":
+                nx, ny = int(round(float(g.get("x", 0)))), int(round(float(g.get("y", 0))))
+                if ann.get("xy") != [nx, ny]:
+                    ann["xy"] = [nx, ny]
+                    changed = True
+            elif kind in ("rect", "circle"):
+                nx, ny = int(round(float(g.get("x", 0)))), int(round(float(g.get("y", 0))))
+                nw, nh = int(round(float(g.get("w", 0)))), int(round(float(g.get("h", 0))))
+                if ann.get("xy") != [nx, ny] or ann.get("wh") != [nw, nh]:
+                    ann["xy"] = [nx, ny]
+                    ann["wh"] = [nw, nh]
+                    changed = True
+            if changed:
+                st.mgr.dirty = True
+                st.emit()
+        except Exception as e:
+            log.debug("movie widget drag persist failed (idx %s): %s", ann_index, e)
+
+    return _on_drag_end
 
 
 # ── manager access ─────────────────────────────────────────────────────────────
@@ -551,6 +676,7 @@ def movie_open(session, plot, payload) -> None:
     if st.has_source:
         st.seed_defaults()
         st.bind_live_windows()
+        st.sync_overlay_widgets()      # draggable annotation widgets on the figure
     _sessions(mgr)[cell.id] = st
     if not _ffmpeg_ok():
         ipc.emit_status("Movie: ffmpeg not found — preview works, mp4 encoding "
@@ -661,6 +787,10 @@ def movie_tune(session, plot, payload) -> None:
         os_ = payload["out_size"]
         spec.out_size = ([int(v) for v in os_] if os_ and len(os_) == 2 else None)
     mgr.dirty = True
+    # An annotation change → rebuild the draggable widgets on the live figure so a
+    # newly-added / removed / retimed overlay is immediately editable on the figure.
+    if st is not None and "annotations" in payload:
+        st.sync_overlay_widgets()
     if st is not None:
         st.emit()
     # Also refresh the sidebar card state (dirty flag / caption may matter).

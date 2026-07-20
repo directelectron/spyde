@@ -285,6 +285,40 @@ class TestOverlays:
         assert len(st["annotations"]) == 2
         assert st["freezes"] == [{"t": 2, "hold_s": 0.5}]
 
+    def test_annotation_widgets_drag_persists_to_spec(self, movie_dataset):
+        # Text/rect annotations become DRAGGABLE anyplotlib widgets on the live
+        # signal figure; a widget drag persists the moved geometry (source px) back
+        # to the spec. (Widget coords == image px == source px for a signal frame.)
+        session, messages = movie_dataset["window"], movie_dataset["messages"]
+        cell_id = _add_movie(session, messages)
+        M.movie_open(session, None, {"cell_id": cell_id})
+        sess = M._sessions(session._report)[cell_id]
+        assert sess._signal_plot2d() is not None, "no live signal Plot2D"
+        M.movie_tune(session, None, {"cell_id": cell_id, "annotations": [
+            {"kind": "text", "text": "Label", "xy": [10, 20], "time_range": [0, 1]},
+            {"kind": "rect", "xy": [5, 5], "wh": [30, 30], "time_range": [0, 1]}]})
+        assert len(sess._ann_widgets) == 2, "annotation widgets not attached"
+
+        class _Ev:
+            pass
+        # Drag the text widget.
+        wt = sess._ann_widgets[0]
+        wt._data = {"x": 40.0, "y": 50.0}
+        ev = _Ev(); ev.source = wt
+        sess._widget_handlers[0](ev)
+        cell = session._report.doc.cell_by_id(cell_id)
+        assert cell.movie.annotations[0]["xy"] == [40, 50]
+        # Drag the rect widget.
+        wr = sess._ann_widgets[1]
+        wr._data = {"x": 12.0, "y": 14.0, "w": 22.0, "h": 26.0}
+        ev2 = _Ev(); ev2.source = wr
+        sess._widget_handlers[1](ev2)
+        assert cell.movie.annotations[1]["xy"] == [12, 14]
+        assert cell.movie.annotations[1]["wh"] == [22, 26]
+        # Close clears the widgets off the live plot.
+        M.movie_close(session, None, {"cell_id": cell_id})
+        assert not sess._ann_widgets
+
     def test_add_text_overlay_from_1d_window(self, movie_dataset):
         import hyperspy.api as hs
         import numpy as np
