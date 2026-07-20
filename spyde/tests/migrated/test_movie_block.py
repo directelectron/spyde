@@ -319,6 +319,28 @@ class TestOverlays:
         M.movie_close(session, None, {"cell_id": cell_id})
         assert not sess._ann_widgets
 
+    def test_crop_widget_on_figure_persists(self, movie_dataset):
+        # Crop mode adds a draggable rect widget on the live figure; dragging it
+        # persists spec.crop (source px), and clear resets it.
+        session, messages = movie_dataset["window"], movie_dataset["messages"]
+        cell_id = _add_movie(session, messages)
+        M.movie_open(session, None, {"cell_id": cell_id})
+        sess = M._sessions(session._report)[cell_id]
+        M.movie_crop_mode(session, None, {"cell_id": cell_id, "on": True})
+        assert sess._crop_widget is not None, "no crop widget appeared"
+
+        class _Ev:
+            pass
+        w = sess._crop_widget
+        w._data = {"x": 6.0, "y": 6.0, "w": 20.0, "h": 20.0}
+        ev = _Ev(); ev.source = w
+        sess._crop_handler(ev)
+        cell = session._report.doc.cell_by_id(cell_id)
+        assert cell.movie.crop == [6, 6, 26, 26]
+        M.movie_crop_mode(session, None, {"cell_id": cell_id, "clear": True})
+        assert cell.movie.crop is None
+        assert sess._crop_widget is None
+
     def test_add_text_overlay_from_1d_window(self, movie_dataset):
         import hyperspy.api as hs
         import numpy as np

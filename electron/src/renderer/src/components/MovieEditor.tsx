@@ -51,6 +51,7 @@ export function MovieEditor({ cellId, sendAction, onClose }: Props) {
   const [running, setRunning] = React.useState(false)
   const [status, setStatus] = React.useState('Loading movie…')
   const [showNav, setShowNav] = React.useState(false)
+  const [cropMode, setCropMode] = React.useState(false)
   const statusKey = React.useRef<string>('')
 
   // Debounced scrub + tune (pending timers cleared on unmount).
@@ -130,6 +131,7 @@ export function MovieEditor({ cellId, sendAction, onClose }: Props) {
 
   const nFrames = Number(st?.n_frames ?? 0)
   const params: MovieParams = st?.params ?? {}
+  const crop = st?.crop ?? null
   const scaleS = Number(st?.time?.scale_s ?? 0)
   const timeUnits = String(st?.time?.units ?? '')
   const duration = scaleS > 0 ? Math.max(0, nFrames - 1) * scaleS : 0
@@ -255,6 +257,23 @@ export function MovieEditor({ cellId, sendAction, onClose }: Props) {
             <button style={styles.toolBtn} data-testid="movie-add-freeze" onClick={addFreeze}>
               ＋ Freeze @ {t}
             </button>
+          </div>
+          <div style={styles.railGroup}>
+            <div style={styles.railHead}>Crop</div>
+            <button
+              data-testid="movie-crop-toggle"
+              style={cropMode ? { ...styles.toolBtn, ...styles.toolBtnActive } : styles.toolBtn}
+              onClick={() => {
+                const next = !cropMode
+                setCropMode(next)
+                sendAction('movie_crop_mode', { cell_id: cellId, on: next })
+              }}>{cropMode ? '✓ Cropping — drag on figure' : '⛶ Crop the frame'}</button>
+            {crop && (
+              <button style={styles.toolBtn} data-testid="movie-crop-clear"
+                onClick={() => { setCropMode(false); sendAction('movie_crop_mode', { cell_id: cellId, clear: true }) }}>
+                ✕ Clear crop ({crop[2] - crop[0]}×{crop[3] - crop[1]})
+              </button>
+            )}
           </div>
           <div style={{ flex: 1 }} />
           <ExportPanel st={st} nFrames={nFrames} running={running}
@@ -481,6 +500,7 @@ const styles: Record<string, React.CSSProperties> = {
     background: '#1e1e2e', color: '#cdd6f4', border: '1px solid #313244', borderRadius: 5,
     padding: '5px 8px', fontSize: 11.5, cursor: 'pointer', textAlign: 'left',
   },
+  toolBtnActive: { background: '#89b4fa', color: '#11111b', borderColor: '#89b4fa', fontWeight: 700 },
   sel: {
     background: '#11111b', color: '#cdd6f4', border: '1px solid #313244',
     borderRadius: 5, padding: '4px 6px', fontSize: 12,

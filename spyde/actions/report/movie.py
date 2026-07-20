@@ -130,6 +130,7 @@ class MovieEditSession:
         self._widget_handlers: list = []  # keep-alive for the drag handlers
         self._text_overlay_widgets: dict = {}  # {i: (label_widget, overlay_dict)}
         self._overlay_traces: dict = {}   # captured TraceSpec by SignalRef identity
+        self._crop_widget = None          # the draggable crop rect (when crop mode on)
 
     # ── time / signal axis reads (playback conventions) ──────────────────────────
 
@@ -324,6 +325,42 @@ class MovieEditSession:
             except Exception as e:
                 log.debug("movie text-overlay push failed: %s", e)
 
+    def show_crop_widget(self, on: bool) -> None:
+        """Toggle a draggable CROP rectangle on the live figure. Seeded to the
+        current crop (or the full frame); its ``pointer_up`` persists the rect to
+        ``spec.crop`` (source px == widget px). Off → removes the widget."""
+        p2 = self._signal_plot2d()
+        if p2 is None:
+            return
+        # Drop any prior crop widget first.
+        cw = getattr(self, "_crop_widget", None)
+        if cw is not None:
+            try:
+                p2._widgets.pop(getattr(cw, "id", None), None)
+            except Exception:
+                pass
+            self._crop_widget = None
+        if not on:
+            try:
+                p2._push()
+            except Exception:
+                pass
+            return
+        fw, fh = self.frame_size()
+        crop = (self.cell.movie.crop if self.cell.movie else None) or [0, 0, fw, fh]
+        try:
+            w = p2.add_rectangle_widget(
+                x=float(crop[0]), y=float(crop[1]),
+                w=float(crop[2] - crop[0]), h=float(crop[3] - crop[1]),
+                color="#89b4fa", linewidth=3, show_handles=True)
+            handler = _make_movie_crop_handler(self)
+            w.add_event_handler(handler, "pointer_up")
+            self._crop_widget = w
+            self._crop_handler = handler
+            p2._push()
+        except Exception as e:
+            log.debug("movie show crop widget failed: %s", e)
+
     def clear_overlay_widgets(self) -> None:
         p2 = self._signal_plot2d()
         if p2 is not None:
@@ -332,12 +369,16 @@ class MovieEditSession:
                     p2._widgets.pop(getattr(w, "id", None), None)
                 for lw, _ov in getattr(self, "_text_overlay_widgets", {}).values():
                     p2._widgets.pop(getattr(lw, "id", None), None)
+                cw = getattr(self, "_crop_widget", None)
+                if cw is not None:
+                    p2._widgets.pop(getattr(cw, "id", None), None)
                 p2._push()
             except Exception as e:
                 log.debug("movie clear overlay widgets failed: %s", e)
         self._ann_widgets = {}
         self._widget_handlers = []
         self._text_overlay_widgets = {}
+        self._crop_widget = None
 
     def unbind_live_windows(self) -> None:
         """Restore the surfaced windows to normal (the renderer re-parents the
@@ -581,6 +622,34 @@ def _format_overlay_value(ov: dict, frame: int, scale_s: float,
         except (KeyError, IndexError, ValueError):
             pass
     return f"{label} = {val:.2f} {units}".strip()
+
+
+def _make_movie_crop_handler(st):
+    """A ``pointer_up`` handler for the crop rectangle: persists the dragged rect
+    (source px) to ``cell.movie.crop`` as ``[x0, y0, x1, y1]`` and re-emits state."""
+    def _on_drag_end(event):
+        try:
+            widget = getattr(event, "source", None)
+            g = getattr(widget, "_data", None) if widget is not None else None
+            if not isinstance(g, dict) or st.cell.movie is None:
+                return
+            x0 = int(round(float(g.get("x", 0))))
+            y0 = int(round(float(g.get("y", 0))))
+            x1 = x0 + int(round(float(g.get("w", 0))))
+            y1 = y0 + int(round(float(g.get("h", 0))))
+            fw, fh = st.frame_size()
+            x0 = max(0, min(x0, fw)); x1 = max(0, min(x1, fw))
+            y0 = max(0, min(y0, fh)); y1 = max(0, min(y1, fh))
+            if x1 - x0 < 2 or y1 - y0 < 2:
+                return
+            crop = [x0, y0, x1, y1]
+            if st.cell.movie.crop != crop:
+                st.cell.movie.crop = crop
+                st.mgr.dirty = True
+                st.emit()
+        except Exception as e:
+            log.debug("movie crop persist failed: %s", e)
+    return _on_drag_end
 
 
 def _make_movie_widget_handler(st, ann_index: int, kind: str):
@@ -915,6 +984,27 @@ def movie_tune(session, plot, payload) -> None:
         st.emit()
     # Also refresh the sidebar card state (dirty flag / caption may matter).
     mgr.emit_state()
+
+
+def movie_crop_mode(session, plot, payload) -> None:
+    """Toggle the draggable CROP rectangle on the live figure (``{cell_id, on}``).
+    Dragging it persists ``spec.crop``; a ``{clear: true}`` payload resets the crop
+    to the full frame."""
+    mgr = _manager(session)
+    if not mgr.open:
+        return
+    st = _sessions(mgr).get(payload.get("cell_id"))
+    if st is None or not st.has_source:
+        return
+    if payload.get("clear"):
+        if st.cell.movie is not None:
+            st.cell.movie.crop = None
+            mgr.dirty = True
+        st.show_crop_widget(False)
+        st.emit()
+        mgr.emit_state()
+        return
+    st.show_crop_widget(bool(payload.get("on", True)))
 
 
 def movie_add_text_overlay(session, plot, payload) -> None:
