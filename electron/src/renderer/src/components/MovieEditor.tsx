@@ -449,15 +449,15 @@ function ExportPanel({ st, nFrames, running, onExport, onCancel }: {
 }) {
   const p = st?.params ?? {}
   const fps = Number(p.fps ?? 12)
-  const stride = Math.max(1, Number(p.stride ?? 1))
-  const t0 = Number(p.t_start ?? 0), t1 = Number(p.t_end ?? Math.max(0, nFrames - 1))
-  const outFrames = Math.max(0, Math.floor((t1 - t0) / stride) + 1)
-  const duration = fps > 0 ? outFrames / fps : 0
-  const crop = st?.crop
-  const [fw, fh] = st?.frame_size ?? [0, 0]
   const ds = Math.max(1, Number(p.downsample ?? 1))
-  const outW = Math.floor((crop ? crop[2] - crop[0] : fw) / ds)
-  const outH = Math.floor((crop ? crop[3] - crop[1] : fh) / ds)
+  // Prefer the backend's AUTHORITATIVE output info (freeze-expanded frame count,
+  // even-crop, out_size-aware) so the readout matches the exported file exactly.
+  const info = st?.output_info
+  const outFrames = info ? info.frames : Math.max(0, Math.floor(
+    (Number(p.t_end ?? Math.max(0, nFrames - 1)) - Number(p.t_start ?? 0)) / Math.max(1, Number(p.stride ?? 1))) + 1)
+  const outW = info ? info.w : 0
+  const outH = info ? info.h : 0
+  const duration = fps > 0 ? outFrames / fps : 0
   return (
     <div style={styles.railGroup}>
       <div style={styles.railHead}>Export</div>

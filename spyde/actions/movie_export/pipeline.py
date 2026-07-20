@@ -238,17 +238,19 @@ def _in_time_range(t_sec: float, ann: dict) -> bool:
     return t0 <= t_sec <= t1
 
 
-def _draw_annotations(img, anns, t_sec: float, k: int):
-    """Draw each time-gated annotation. Coordinates are in the ORIGINAL image's
-    pixel space; we divide by the downsample factor *k* so they land correctly on
-    the shrunk frame."""
+def _draw_annotations(img, anns, t_sec: float, k: int, crop_origin=(0, 0)):
+    """Draw each time-gated annotation. Coordinates are in the ORIGINAL (uncropped)
+    source pixel space; we subtract the crop origin (so a cropped export places them
+    correctly) then divide by the downsample factor *k* to land on the shrunk
+    frame."""
     from PIL import ImageDraw
     if not anns:
         return
     draw = ImageDraw.Draw(img, "RGBA")
+    ox, oy = float(crop_origin[0]), float(crop_origin[1])
 
-    def sc(v):
-        return float(v) / max(1, k)
+    def sc(v, o=0.0):
+        return (float(v) - o) / max(1, k)
 
     for ann in anns:
         if not isinstance(ann, dict) or not _in_time_range(t_sec, ann):
@@ -259,45 +261,48 @@ def _draw_annotations(img, anns, t_sec: float, k: int):
             if kind == "text":
                 xy = ann.get("xy", [0, 0])
                 font = _load_font(int(ann.get("size", 16)))
-                _text_with_shadow(draw, (sc(xy[0]), sc(xy[1])),
+                _text_with_shadow(draw, (sc(xy[0], ox), sc(xy[1], oy)),
                                   str(ann.get("text", "")), font,
                                   color, (0, 0, 0, 220))
             elif kind == "circle":
                 xy = ann.get("xy", [0, 0])
                 r = sc(ann.get("radius", 10))
-                cx, cy = sc(xy[0]), sc(xy[1])
+                cx, cy = sc(xy[0], ox), sc(xy[1], oy)
                 draw.ellipse([cx - r, cy - r, cx + r, cy + r],
                              outline=color, width=max(1, int(sc(ann.get("width", 3)))))
             elif kind == "rect":
                 xy = ann.get("xy", [0, 0])
                 wh = ann.get("wh", [10, 10])
-                x0, y0 = sc(xy[0]), sc(xy[1])
+                x0, y0 = sc(xy[0], ox), sc(xy[1], oy)
                 draw.rectangle([x0, y0, x0 + sc(wh[0]), y0 + sc(wh[1])],
                                outline=color, width=max(1, int(sc(ann.get("width", 3)))))
             elif kind == "arrow":
                 xy = ann.get("xy", [0, 0])         # tail
                 xy2 = ann.get("xy2", [10, 10])     # head
-                _draw_arrow(draw, (sc(xy[0]), sc(xy[1])),
-                            (sc(xy2[0]), sc(xy2[1])), color,
+                _draw_arrow(draw, (sc(xy[0], ox), sc(xy[1], oy)),
+                            (sc(xy2[0], ox), sc(xy2[1], oy)), color,
                             max(1, int(sc(ann.get("width", 3)))))
         except Exception as e:
             log.debug("annotation %r draw failed: %s", kind, e)
 
 
-def _draw_text_overlays(img, overlays, values_at_t, t_sec: float, k: int):
+def _draw_text_overlays(img, overlays, values_at_t, t_sec: float, k: int,
+                        crop_origin=(0, 0)):
     """Draw each 1-D-signal-as-text overlay: a live value formatted as text (e.g.
     ``"T = 812.3 °C"``). *overlays* is the list of overlay dicts; *values_at_t* is
     a parallel list of the current numeric value for each (already resampled onto
     the movie time base and indexed at this frame) — ``None`` for an overlay with
     no resolved signal, which then paints its label + a dash. Coordinates are in
-    ORIGINAL source pixels; divide by the downsample factor *k*."""
+    ORIGINAL (uncropped) source pixels; subtract the crop origin then divide by the
+    downsample factor *k*."""
     from PIL import ImageDraw
     if not overlays:
         return
     draw = ImageDraw.Draw(img, "RGBA")
+    ox, oy = float(crop_origin[0]), float(crop_origin[1])
 
-    def sc(v):
-        return float(v) / max(1, k)
+    def sc(v, o=0.0):
+        return (float(v) - o) / max(1, k)
 
     for ov, val in zip(overlays, values_at_t):
         if not isinstance(ov, dict) or not _in_time_range(t_sec, ov):
@@ -319,7 +324,7 @@ def _draw_text_overlays(img, overlays, values_at_t, t_sec: float, k: int):
                     text = f"{label} = {float(val):.2f} {units}".strip()
             else:
                 text = f"{label} = {float(val):.2f} {units}".strip()
-            _text_with_shadow(draw, (sc(xy[0]), sc(xy[1])), text, font,
+            _text_with_shadow(draw, (sc(xy[0], ox), sc(xy[1], oy)), text, font,
                               color, (0, 0, 0, 220))
         except Exception as e:
             log.debug("text overlay draw failed: %s", e)
@@ -515,13 +520,16 @@ def _resolve_clim(first: np.ndarray, clim):
 def _compose_frame(frame, lut, lo, hi, out_h, out_w, *, t_sec, k,
                    anns, text_overlays, text_values, timestamp, scalebar,
                    sb_scale, sig_units, ts_font, sb_font, inset=None, inset_i=0,
-                   overlay=None, raw_over=None, src_t=0):
+                   overlay=None, raw_over=None, src_t=0, crop_origin=(0, 0)):
     """LUT + fit + the whole overlay stack for ONE already-read (cropped +
     downsampled) *frame* → a PIL RGB image. Shared by :func:`export_movie` and the
     single-frame preview so the editor preview is byte-for-byte what exports.
 
-    A 2nd-image *overlay* (with its lazy array *raw_over*) is alpha/screen-composited
-    onto the base BEFORE the drawn overlays (so annotations/timestamp sit on top)."""
+    ``crop_origin`` (the crop's ``(x0, y0)`` in source px, ``(0,0)`` when uncropped)
+    shifts the annotation / text-overlay coordinates so they land correctly on a
+    cropped frame. A 2nd-image *overlay* (with its lazy array *raw_over*) is
+    alpha/screen-composited onto the base BEFORE the drawn overlays (so
+    annotations/timestamp sit on top)."""
     rgb = even_crop(apply_lut(frame, lut, lo, hi))
     # Fit every frame to the writer's fixed (out_h, out_w): a LARGER frame is
     # cropped, a SMALLER (ragged / shrunk) one is letterbox-PADDED with zeros.
@@ -530,9 +538,9 @@ def _compose_frame(frame, lut, lo, hi, out_h, out_w, *, t_sec, k,
     if overlay is not None and raw_over is not None:
         rgb = _composite_overlay(rgb, overlay, raw_over, src_t, k, t_sec, out_h, out_w)
     img = _pil_rgb(rgb)
-    _draw_annotations(img, anns, t_sec, k)
+    _draw_annotations(img, anns, t_sec, k, crop_origin)
     if text_overlays:
-        _draw_text_overlays(img, text_overlays, text_values, t_sec, k)
+        _draw_text_overlays(img, text_overlays, text_values, t_sec, k, crop_origin)
     if timestamp:
         _draw_timestamp(img, t_sec, ts_font)
     if scalebar:
@@ -544,7 +552,7 @@ def _compose_frame(frame, lut, lo, hi, out_h, out_w, *, t_sec, k,
 
 def render_single_frame(raw, t: int, *, params: dict, n_frames: int,
                         scale_s: float, sig_scale_x: float, sig_units: str,
-                        text_overlays=None, text_values=None):
+                        text_overlays=None, text_values=None, overlay=None):
     """Render ONE composed frame at source index *t* → a PIL RGB image. The
     editor's live preview path — MEMORY-SAFE (a single :func:`read_frame` slice),
     no writer, no full sequence. Uses the SAME LUT + overlay stack as the export so
@@ -566,11 +574,14 @@ def render_single_frame(raw, t: int, *, params: dict, n_frames: int,
     ts_font = _load_font(max(12, out_h // 28))
     sb_font = _load_font(max(11, out_h // 32))
     t_sec = int(t) * scale_s
+    crop_origin = (int(crop[0]), int(crop[1])) if crop and len(crop) == 4 else (0, 0)
+    raw_over = overlay.get("raw") if overlay else None
     return _compose_frame(
         frame, lut, lo, hi, out_h, out_w, t_sec=t_sec, k=k,
         anns=anns, text_overlays=(text_overlays or []),
         text_values=(text_values or []), timestamp=timestamp, scalebar=scalebar,
-        sb_scale=sb_scale, sig_units=sig_units, ts_font=ts_font, sb_font=sb_font)
+        sb_scale=sb_scale, sig_units=sig_units, ts_font=ts_font, sb_font=sb_font,
+        crop_origin=crop_origin, overlay=overlay, raw_over=raw_over, src_t=int(t))
 
 
 def _composite_overlay(base_rgb: np.ndarray, overlay, raw_over, t: int, k: int,
@@ -578,9 +589,10 @@ def _composite_overlay(base_rgb: np.ndarray, overlay, raw_over, t: int, k: int,
     """Alpha/screen-composite a SECOND image over *base_rgb* (an (H,W,3) uint8).
 
     *overlay* is the resolved 2nd-image spec ``{raw, alpha, cmap, clim, blend,
-    time_range, downsample}``; *raw_over* is its lazy/numpy array (read one frame at
-    a time). Time-gated by ``time_range`` (seconds). Returns the blended RGB. On any
-    failure returns *base_rgb* unchanged (the overlay is cosmetic)."""
+    time_range, downsample}``; *raw_over* is its lazy/numpy array. A 3-D source is a
+    TIME STACK (read one frame at the current index); a 2-D source is a STATIC image
+    (same on every frame). Time-gated by ``time_range`` (seconds). Returns the
+    blended RGB. On any failure returns *base_rgb* unchanged (overlay is cosmetic)."""
     try:
         if overlay is None or raw_over is None:
             return base_rgb
@@ -588,9 +600,14 @@ def _composite_overlay(base_rgb: np.ndarray, overlay, raw_over, t: int, k: int,
         if tr and not (float(tr[0]) <= t_sec <= float(tr[1])):
             return base_rgb
         ov_k = int(overlay.get("downsample", k) or k)
-        # Read the overlay's frame at the same time index (memory-safe single slice).
-        ti = min(int(t), raw_over.shape[0] - 1)
-        of = downsample(read_frame(raw_over, ti), ov_k)
+        # A 3-D overlay is a time stack → read the frame at the current index; a 2-D
+        # overlay is a static image → use it directly (memory-safe single slice).
+        if getattr(raw_over, "ndim", 2) >= 3:
+            ti = min(int(t), raw_over.shape[0] - 1)
+            over_frame = read_frame(raw_over, ti)
+        else:
+            over_frame = np.asarray(raw_over)
+        of = downsample(over_frame, ov_k)
         olut = build_lut(str(overlay.get("cmap", "magma") or "magma"))
         oclim = overlay.get("clim")
         olo, ohi = _resolve_clim(of, oclim)
@@ -671,10 +688,20 @@ def export_movie(raw, *, path: str, params: dict, n_frames: int,
 
     lo, hi = _resolve_clim(first, clim)
 
-    # Even-crop the first frame to fix the output size; scale bar / downsample
+    # Even-crop the first frame to fix the COMPOSE size; scale bar / downsample
     # factor drive annotation coordinate scaling.
     rgb0 = even_crop(apply_lut(first, lut, lo, hi))
     out_h, out_w = rgb0.shape[:2]
+
+    # Optional final OUTPUT size (spec.out_size [w, h]) — the composed frame is
+    # resized to it (even-dimensioned for H.264) as the very last step. None → the
+    # frame's own (crop + downsample) size is the output.
+    os_spec = p.get("out_size")
+    final_wh = None
+    if os_spec and len(os_spec) == 2 and os_spec[0] and os_spec[1]:
+        fw2, fh2 = int(os_spec[0]) - (int(os_spec[0]) % 2), int(os_spec[1]) - (int(os_spec[1]) % 2)
+        if fw2 >= 2 and fh2 >= 2 and (fw2, fh2) != (out_w, out_h):
+            final_wh = (fw2, fh2)
 
     # The physical x-scale on the DOWNSAMPLED frame (each output px spans k input px).
     sb_scale = sig_scale_x * k
@@ -696,8 +723,10 @@ def export_movie(raw, *, path: str, params: dict, n_frames: int,
     sb_font = _load_font(max(11, out_h // 32))
 
     raw_over = overlay.get("raw") if overlay else None
+    crop_origin = (int(crop[0]), int(crop[1])) if crop and len(crop) == 4 else (0, 0)
 
-    writer = open_writer(path, fps, (out_w, out_h))
+    writer_wh = final_wh if final_wh is not None else (out_w, out_h)
+    writer = open_writer(path, fps, writer_wh)
     written = 0
     try:
         for fi, t in enumerate(idxs):
@@ -711,7 +740,11 @@ def export_movie(raw, *, path: str, params: dict, n_frames: int,
                 timestamp=timestamp, scalebar=scalebar, sb_scale=sb_scale,
                 sig_units=sig_units, ts_font=ts_font, sb_font=sb_font,
                 inset=inset, inset_i=fi,
-                overlay=overlay, raw_over=raw_over, src_t=t)
+                overlay=overlay, raw_over=raw_over, src_t=t,
+                crop_origin=crop_origin)
+            if final_wh is not None:
+                from PIL import Image as _Image
+                img = img.resize(final_wh, _Image.LANCZOS)
             writer.append(np.asarray(img.convert("RGB")))
             written += 1
             if progress is not None:

@@ -596,13 +596,17 @@ class MovieEditSession:
             log.debug("overlay-image layer add failed: %s", e)
 
     def read_overlay_frame(self, oi: dict, t: int):
-        """Read ONE frame of the overlay image at time *t* (memory-safe slice)."""
+        """Read ONE frame of the overlay image at time *t* (memory-safe slice). A
+        3-D overlay is a time stack (index by *t*); a 2-D overlay is a static image
+        (returned directly, same on every frame)."""
         raw_over = oi.get("raw")
         if raw_over is None:
             return None
         try:
-            ti = min(int(t), int(raw_over.shape[0]) - 1)
-            sl = raw_over[ti]
+            if int(getattr(raw_over, "ndim", 2)) >= 3:
+                sl = raw_over[min(int(t), int(raw_over.shape[0]) - 1)]
+            else:
+                sl = raw_over
             comp = getattr(sl, "compute", None)
             if comp is not None:
                 try:
@@ -625,6 +629,36 @@ class MovieEditSession:
             cache = {}
             self._overlay_traces = cache
         cache[key] = trace
+
+    def output_info(self) -> dict:
+        """The AUTHORITATIVE exported {frames, w, h} — computed with the SAME
+        pipeline logic the export uses (freeze-expanded frame count, even-crop, and
+        the optional out_size override), so the renderer shows the true output size
+        instead of re-deriving it (and drifting on odd edges / freezes)."""
+        spec = self.cell.movie
+        p = dict(spec.params or {})
+        n = self.n_frames()
+        try:
+            from spyde.actions.movie_export.pipeline import frame_indices_with_freezes
+            fps = float(p.get("fps", 12) or 12)
+            idxs = frame_indices_with_freezes(
+                n, p.get("t_start", 0), p.get("t_end", n - 1),
+                p.get("stride", 1), spec.freezes or [], fps)
+            frames = len(idxs)
+        except Exception:
+            frames = 0
+        # Output W×H: (crop or full) → /downsample → even-crop (−1 on an odd edge).
+        fw, fh = self.frame_size()
+        crop = spec.crop
+        w = (crop[2] - crop[0]) if crop and len(crop) == 4 else fw
+        h = (crop[3] - crop[1]) if crop and len(crop) == 4 else fh
+        k = max(1, int(p.get("downsample", 1) or 1))
+        w, h = w // k, h // k
+        w, h = w - (w % 2), h - (h % 2)         # even-crop for H.264
+        if spec.out_size and len(spec.out_size) == 2 and spec.out_size[0] and spec.out_size[1]:
+            w = int(spec.out_size[0]) - (int(spec.out_size[0]) % 2)
+            h = int(spec.out_size[1]) - (int(spec.out_size[1]) % 2)
+        return {"frames": int(frames), "w": int(max(0, w)), "h": int(max(0, h))}
 
     # ── state emission ───────────────────────────────────────────────────────────
 
@@ -654,6 +688,9 @@ class MovieEditSession:
             "crop": (list(spec.crop) if spec.crop else None),
             "out_size": (list(spec.out_size) if spec.out_size else None),
             "frame_size": [fw, fh],
+            # The authoritative exported {frames, w, h} (freeze-expanded, even-crop,
+            # out_size-aware) so the renderer readout can't drift from the export.
+            "output_info": self.output_info(),
             # The live windows the editor surfaces: the tree's REAL 2-D signal
             # figure (re-parented into the editor) + the 1-D navigator (shown
             # beside, optional). A fig_id is 1:1 with an iframe, so mounting it in
@@ -1046,7 +1083,8 @@ def movie_tune(session, plot, payload) -> None:
         if "clim" in incoming:
             cl = incoming["clim"]
             p["clim"] = ([float(cl[0]), float(cl[1])]
-                         if cl and len(cl) == 2 and cl[0] is not None else None)
+                         if cl and len(cl) == 2
+                         and cl[0] is not None and cl[1] is not None else None)
         for key in ("timestamp", "scalebar"):
             if key in incoming:
                 p[key] = bool(incoming[key])
@@ -1274,9 +1312,11 @@ def movie_export(session, plot, payload) -> None:
             text_overlays=overlays, overlay=overlay_img,
             should_cancel=should_cancel, progress=progress)
         # Bake a poster from the first rendered frame (memory-safe single frame)
-        # so the report card + saved zip show a representative still.
+        # so the report card + saved zip show a representative still — WITH the
+        # overlays so the thumbnail matches the movie.
         poster = _bake_poster(raw, params, n_frames, scale_s,
-                              sig_scale_x, sig_units)
+                              sig_scale_x, sig_units,
+                              text_overlays=overlays, overlay=overlay_img)
         return (frames, poster)
 
     def _done(result):
@@ -1333,9 +1373,12 @@ def _insert_cell(doc, cell, index) -> None:
     _ic(doc, cell, index)
 
 
-def _bake_poster(raw, params, n_frames, scale_s, sig_scale_x, sig_units):
+def _bake_poster(raw, params, n_frames, scale_s, sig_scale_x, sig_units,
+                 text_overlays=None, overlay=None):
     """Render the movie's FIRST in-range frame to a capped-size PNG (the card
-    poster + saved-zip still). Memory-safe single frame. None on failure."""
+    poster + saved-zip still) — INCLUDING the annotation / 1-D-text / 2nd-image
+    overlays so the thumbnail matches the exported movie. Memory-safe single frame.
+    None on failure."""
     try:
         from spyde.actions.movie_export.pipeline import frame_indices
         idxs = frame_indices(n_frames, params.get("t_start", 0),
@@ -1343,6 +1386,7 @@ def _bake_poster(raw, params, n_frames, scale_s, sig_scale_x, sig_units):
                              params.get("stride", 1))
         if not idxs:
             return None
+        t0 = idxs[0]
         pp = dict(params)
         # Cap the poster edge like a preview.
         fw = fh = 0
@@ -1355,9 +1399,17 @@ def _bake_poster(raw, params, n_frames, scale_s, sig_scale_x, sig_units):
         while longest and longest // need > _PREVIEW_MAX_EDGE:
             need += 1
         pp["downsample"] = max(int(pp.get("downsample", 1) or 1), need)
-        img = render_single_frame(raw, idxs[0], params=pp, n_frames=n_frames,
+        # The 1-D-text values at the poster frame + a static overlay for compositing.
+        tvals = None
+        overlays = list(text_overlays or [])
+        if overlays:
+            from spyde.actions.movie_export.pipeline import _overlay_value_at
+            tvals = [_overlay_value_at(o.get("_trace"), t0, scale_s, n_frames)
+                     for o in overlays]
+        img = render_single_frame(raw, t0, params=pp, n_frames=n_frames,
                                   scale_s=scale_s, sig_scale_x=sig_scale_x,
-                                  sig_units=sig_units)
+                                  sig_units=sig_units, text_overlays=overlays,
+                                  text_values=tvals, overlay=overlay)
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         return buf.getvalue()

@@ -564,6 +564,9 @@ export interface MovieStateMessage extends MsgBase {
   crop: [number, number, number, number] | null
   out_size: [number, number] | null
   frame_size: [number, number]        // source frame [w,h] — the editor coord space
+  /** Authoritative exported {frames, w, h} (freeze-expanded, even-crop, out_size-
+   *  aware) — the readout uses this so it can't drift from what export writes. */
+  output_info?: { frames: number; w: number; h: number }
   /** The tree's LIVE 2-D signal figure the editor re-parents into its preview area
    *  (a figId is 1:1 with an iframe, so mounting it supersedes the MDI iframe while
    *  the editor is open). null when no source is resolved. */

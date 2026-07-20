@@ -131,10 +131,12 @@ class TestEditorSession:
         assert st is not None
         for k in ("cell_id", "has_source", "ffmpeg_ok", "running", "n_frames",
                   "time", "sig", "params", "annotations", "text_overlays",
-                  "freezes", "crop", "out_size", "frame_size",
+                  "freezes", "crop", "out_size", "frame_size", "output_info",
                   "signal_fig_id", "signal_window_id", "nav_fig_id",
                   "current_index"):
             assert k in st, f"movie_state missing {k!r}"
+        assert set(st["output_info"]) == {"frames", "w", "h"}
+        assert st["output_info"]["frames"] == 8      # full 0..7, no stride/freeze
         assert st["cell_id"] == cell_id
         assert st["has_source"] is True
         assert st["running"] is False
@@ -165,6 +167,18 @@ class TestEditorSession:
         assert cell.movie.crop == [8, 8, 56, 56]
         assert cell.movie.freezes == [{"t": 2, "hold_s": 0.5}]
         assert len(cell.movie.annotations) == 1
+
+    def test_tune_half_open_clim_does_not_raise(self, movie_dataset):
+        # A clim of [lo, None] (only one bound) must NOT raise TypeError and abort
+        # the tune — it collapses to auto (None). (Review finding.)
+        session, messages = movie_dataset["window"], movie_dataset["messages"]
+        cell_id = _add_movie(session, messages)
+        M.movie_open(session, None, {"cell_id": cell_id})
+        M.movie_tune(session, None,
+                     {"cell_id": cell_id, "params": {"clim": [5.0, None], "fps": 15}})
+        cell = session._report.doc.cell_by_id(cell_id)
+        assert cell.movie.params["clim"] is None      # half-open → auto
+        assert cell.movie.params["fps"] == 15         # the rest of the tune applied
 
     def test_tune_clamps_time_range(self, movie_dataset):
         session, messages = movie_dataset["window"], movie_dataset["messages"]
@@ -367,6 +381,68 @@ class TestOverlays:
         # Clear removes it.
         M.movie_add_overlay_image(session, None, {"cell_id": cell_id, "clear": True})
         assert cell.movie.overlay_image is None
+
+    def test_crop_offsets_annotation_coordinates_in_export(self, movie_dataset, tmp_path):
+        # A time-gated annotation placed in source coords must land at (xy - crop
+        # origin) in the cropped export (the review's crop-origin bug). We place a
+        # bright rect at source (18,18) and crop [12,12,32,32]; in the 20x20 output
+        # it must appear near (6,6), NOT off-frame at (18,18).
+        import numpy as np
+        import imageio.v3 as iio
+        session, messages = movie_dataset["window"], movie_dataset["messages"]
+        cell_id = _add_movie(session, messages)
+        M.movie_open(session, None, {"cell_id": cell_id})
+        # A red TEXT marker at source (14,14). With crop [12,12,32,32] it maps to
+        # (2,2) in the 20x20 output (top-left); WITHOUT the origin fix it would draw
+        # at (14,14) (bottom-right). Text has a black shadow, so the red channel in
+        # the correct quadrant is unambiguous.
+        M.movie_tune(session, None, {
+            "cell_id": cell_id,
+            "crop": [12, 12, 32, 32],
+            "annotations": [{"kind": "text", "text": "XXXX", "xy": [14, 14],
+                             "size": 8, "color": "#ff0000", "time_range": [0, 100]}]})
+        out = str(tmp_path / "crop_ann.gif")
+        M.movie_export(session, None, {"cell_id": cell_id, "path": out})
+        assert _poll(messages, "movie_done") is not None
+        f = np.asarray(iio.imread(out))[0]           # 20x20
+        assert f.shape[0] == 20 and f.shape[1] == 20
+
+        # Count strongly-red pixels (R high, G/B low — the marker) per quadrant.
+        def red_px(reg):
+            r = reg.astype(np.int32)
+            return int(((r[..., 0] > 150) & (r[..., 1] < 100) & (r[..., 2] < 100)).sum())
+        tl = red_px(f[0:12, 0:12])                   # where cropped (2,2) lands
+        br = red_px(f[8:20, 8:20])                    # where an un-offset (14,14) lands
+        assert tl > 0, "red marker not found in the top-left (crop origin not applied)"
+        assert tl > br, f"crop origin not applied — red not in TL ({tl} vs {br})"
+
+    def test_static_2d_overlay_image_composites(self, movie_dataset, tmp_path):
+        # A STATIC 2-D image (not a time stack) as the 2nd-image overlay must
+        # composite as one fixed image on every frame (review bug: rows-as-frames).
+        import hyperspy.api as hs
+        import numpy as np
+        import imageio.v3 as iio
+        session, messages = movie_dataset["window"], movie_dataset["messages"]
+        cell_id = _add_movie(session, messages)
+        M.movie_open(session, None, {"cell_id": cell_id})
+        img2d = np.zeros((32, 32), dtype=np.uint16)
+        img2d[20:30, 2:12] = 1000                    # bright square bottom-left
+        static = hs.signals.Signal2D(img2d)          # a plain 2-D image (ndim==2 root)
+        static.metadata.set_item("General.title", "static")
+        session._add_signal(static, source_path=None)
+        sp = next(p for p in session._plots
+                  if getattr(getattr(p, "signal_tree", None), "root", None) is not None
+                  and str(p.signal_tree.root.metadata.get_item("General.title", default="")) == "static"
+                  and getattr(p, "current_data", None) is not None
+                  and np.asarray(p.current_data).ndim == 2)
+        M.movie_add_overlay_image(session, None, {
+            "cell_id": cell_id, "source_window_id": sp.window_id,
+            "alpha": 0.8, "cmap": "gray"})
+        out = str(tmp_path / "static_ov.gif")
+        M.movie_export(session, None, {"cell_id": cell_id, "path": out})
+        assert _poll(messages, "movie_done") is not None
+        f = np.asarray(iio.imread(out))[0]
+        assert float(f[20:30, 2:12].mean()) > 60, "static overlay not composited"
 
     def test_crop_widget_on_figure_persists(self, movie_dataset):
         # Crop mode adds a draggable rect widget on the live figure; dragging it
