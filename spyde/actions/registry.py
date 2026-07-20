@@ -149,6 +149,18 @@ STAGED_HANDLERS: dict[str, str] = {
     "overlay_set":             "spyde.actions.overlay.overlay_set",
     "overlay_remove":          "spyde.actions.overlay.overlay_remove",
     "overlay_query":           "spyde.actions.overlay.overlay_query",
+    # Movie BLOCK (spyde/actions/report/movie.py) — an editable, persistent in-situ
+    # movie cell in the report/presentation doc + its full-screen editor. Replaces
+    # the mvx caret wizard (removed in Phase 2); reuses the movie_export render engine.
+    "report_add_movie_cell":   "spyde.actions.report.movie.report_add_movie_cell",
+    "report_set_movie_source": "spyde.actions.report.movie.report_set_movie_source",
+    "movie_open":              "spyde.actions.report.movie.movie_open",
+    "movie_close":             "spyde.actions.report.movie.movie_close",
+    "movie_scrub":             "spyde.actions.report.movie.movie_scrub",
+    "movie_tune":              "spyde.actions.report.movie.movie_tune",
+    "movie_add_text_overlay":  "spyde.actions.report.movie.movie_add_text_overlay",
+    "movie_export":            "spyde.actions.report.movie.movie_export",
+    "movie_cancel":            "spyde.actions.report.movie.movie_cancel",
     # Movie Export (spyde/actions/movie_export/) — in-situ movie → video wizard.
     "mvx_open":                "spyde.actions.movie_export.handlers.mvx_open",
     "mvx_tune":                "spyde.actions.movie_export.handlers.mvx_tune",

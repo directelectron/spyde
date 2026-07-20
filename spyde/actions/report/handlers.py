@@ -212,7 +212,20 @@ class ReportManager:
         self._edit_wiring.clear()
         self._ann_widgets.clear()
         self._selected.clear()
+        self._clear_movie_sessions()
         _clear_vectors_explorer_cache()
+
+    def _clear_movie_sessions(self) -> None:
+        """Tear down any open Movie editor sessions (cancel in-flight exports).
+        Owned lazily by the movie block; safe to call when none exist."""
+        sessions = getattr(self, "_movie_sessions", None)
+        if not sessions:
+            return
+        for st in list(sessions.values()):
+            flag = getattr(st, "_cancel_flag", None)
+            if flag is not None:
+                flag[0] = True
+        sessions.clear()
 
     def close_windows(self) -> None:
         """Tear down every open figure window (through the session's forget path
@@ -243,6 +256,7 @@ class ReportManager:
         self._edit_wiring.clear()
         self._ann_widgets.clear()
         self._selected.clear()
+        self._clear_movie_sessions()
         _clear_vectors_explorer_cache()
 
     # ── state emission ─────────────────────────────────────────────────────────
@@ -290,7 +304,7 @@ class ReportManager:
                 "source": (c.source
                            if c.cell_type in ("markdown", "split") else None),
                 "caption": (c.caption
-                            if c.cell_type in ("figure", "image", "split")
+                            if c.cell_type in ("figure", "image", "split", "movie")
                             else None),
                 "placeholder": bool(c.placeholder),
                 # The split cell's figure side reuses the figure fig_id/offline
@@ -334,6 +348,19 @@ class ReportManager:
                     entry["image_ext"] = ext
                     entry["image"] = (f"data:image/{mime};base64,"
                                       + base64.b64encode(img).decode("ascii"))
+            # A MOVIE cell ships its (pixel-free) MovieSpec dict for the card /
+            # editor mirror + its poster PNG as a data URL (a representative still,
+            # baked on export or loaded from the zip). No frame pixels ride here —
+            # the editor pulls live preview frames from the backend on demand.
+            if c.cell_type == "movie":
+                entry["placeholder"] = bool(c.placeholder)
+                if c.movie is not None:
+                    entry["movie"] = c.movie.to_dict()
+                    entry["has_source"] = c.movie.source is not None
+                poster = self._baked.get(c.id)
+                if poster is not None:
+                    entry["poster"] = ("data:image/png;base64,"
+                                       + base64.b64encode(poster).decode("ascii"))
             # For a figure cell — OR a split cell whose figure side is a figure —
             # ship the PIXEL-FREE FigureSpec recipe (as a plain dict) so the
             # renderer's edit toolbar can list panels / layers / annotations. It
@@ -780,6 +807,14 @@ class ReportManager:
                 data = self._images.get(c.id)
                 if data:
                     assets[c.id] = data
+                continue
+            # Movie cells: the poster PNG (baked on export, or the one loaded from a
+            # previously-saved zip). No harvest / bake handshake — a movie has no
+            # figure iframe; its poster is a rendered still held in _baked.
+            if c.cell_type == "movie":
+                poster = self._baked.get(c.id)
+                if poster:
+                    assets[c.id] = poster
                 continue
             # A SPLIT cell whose figure side is a PHOTO (spec-less, image_ext): the
             # held raw bytes, exactly like an image cell. A split whose figure side
