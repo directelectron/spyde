@@ -128,6 +128,8 @@ class MovieEditSession:
         # change so a widget drag → persist → re-emit → resync stays consistent.
         self._ann_widgets: dict = {}    # {ann_index: widget}
         self._widget_handlers: list = []  # keep-alive for the drag handlers
+        self._text_overlay_widgets: dict = {}  # {i: (label_widget, overlay_dict)}
+        self._overlay_traces: dict = {}   # captured TraceSpec by SignalRef identity
 
     # ── time / signal axis reads (playback conventions) ──────────────────────────
 
@@ -270,10 +272,57 @@ class MovieEditSession:
                 self._widget_handlers.append(handler)
             except Exception as e:
                 log.debug("movie wire widget drag failed: %s", e)
+        # 1-D-signal-as-text overlays: a (non-draggable) label showing the signal's
+        # LIVE value at the current frame, e.g. "T = 812.3 °C". Refreshed on scrub.
+        self._text_overlay_widgets = {}
+        overlays = self.rebuild_text_traces()
+        cur = self.current_index()
+        scale_s = self.scale_seconds()
+        n = self.n_frames()
+        for i, ov in enumerate(overlays):
+            try:
+                xy = ov.get("xy", [8, 8])
+                lw = p2.add_label_widget(
+                    x=float(xy[0]), y=float(xy[1]),
+                    text=_format_overlay_value(ov, cur, scale_s, n),
+                    fontsize=int(ov.get("size", 18) or 18),
+                    color=str(ov.get("color", "#ffffff") or "#ffffff"),
+                    show_handles=False)
+                self._text_overlay_widgets[i] = (lw, ov)
+            except Exception as e:
+                log.debug("movie add text-overlay widget failed: %s", e)
         try:
             p2._push()
         except Exception as e:
             log.debug("movie widget push failed: %s", e)
+
+    def refresh_text_overlays(self) -> None:
+        """Update each 1-D-signal-as-text label to the value at the CURRENT frame
+        (called after a scrub so the live value tracks the navigator). Cheap: just
+        re-sets the widget text + pushes."""
+        widgets = getattr(self, "_text_overlay_widgets", None)
+        if not widgets:
+            return
+        p2 = self._signal_plot2d()
+        if p2 is None:
+            return
+        cur = self.current_index()
+        scale_s = self.scale_seconds()
+        n = self.n_frames()
+        changed = False
+        for lw, ov in widgets.values():
+            try:
+                txt = _format_overlay_value(ov, cur, scale_s, n)
+                if getattr(lw, "text", None) != txt:
+                    lw.text = txt
+                    changed = True
+            except Exception as e:
+                log.debug("movie text-overlay refresh failed: %s", e)
+        if changed:
+            try:
+                p2._push()
+            except Exception as e:
+                log.debug("movie text-overlay push failed: %s", e)
 
     def clear_overlay_widgets(self) -> None:
         p2 = self._signal_plot2d()
@@ -281,11 +330,14 @@ class MovieEditSession:
             try:
                 for w in self._ann_widgets.values():
                     p2._widgets.pop(getattr(w, "id", None), None)
+                for lw, _ov in getattr(self, "_text_overlay_widgets", {}).values():
+                    p2._widgets.pop(getattr(lw, "id", None), None)
                 p2._push()
             except Exception as e:
                 log.debug("movie clear overlay widgets failed: %s", e)
         self._ann_widgets = {}
         self._widget_handlers = []
+        self._text_overlay_widgets = {}
 
     def unbind_live_windows(self) -> None:
         """Restore the surfaced windows to normal (the renderer re-parents the
@@ -336,6 +388,8 @@ class MovieEditSession:
             cur = self.current_index()
             sel.translate_pixels(int(t) - int(cur))
             sel.delayed_update_data(force=True)
+            # Update any 1-D-signal-as-text overlays to the new frame's value.
+            self.refresh_text_overlays()
         except Exception as e:
             log.debug("movie scrub_to(%s) failed: %s", t, e)
 
@@ -392,28 +446,50 @@ class MovieEditSession:
     # ── text-overlay trace captures ──────────────────────────────────────────────
 
     def rebuild_text_traces(self) -> list:
-        """For every 1-D-signal-as-text overlay on the spec, resolve its source
-        SignalRef to a live 1-D plot and capture the trace (so export/preview can
-        resample the current value). Returns the overlay dicts with a live
-        ``_trace`` attached (ephemeral — never serialized). An overlay whose source
-        can't be resolved yields the overlay unchanged (paints label + dash)."""
+        """For every 1-D-signal-as-text overlay on the spec, attach a live
+        ``_trace`` (a captured :class:`TraceSpec`) so export/preview can resample
+        the current value. Prefers a trace CAPTURED AT ADD TIME + cached on the
+        session (``_overlay_traces`` keyed by the overlay's SignalRef identity — a
+        snapshot survives the source window closing, like a report figure); falls
+        back to re-resolving the SignalRef. Returns copies with ``_trace`` attached
+        (ephemeral — never serialized); an unresolvable overlay paints label + dash."""
         from spyde.actions.report.model import SignalRef
         spec = self.cell.movie
+        cache = getattr(self, "_overlay_traces", None) or {}
         out = []
         for ov in (spec.text_overlays or []):
             ov = dict(ov)
             ref = ov.get("source")
-            if isinstance(ref, dict):
+            tr = None
+            key = _overlay_key(ref)
+            if key is not None and key in cache:
+                tr = cache[key]
+            elif isinstance(ref, dict):
                 try:
                     src = SignalRef.from_dict(ref).resolve(self.session)
                     if src is not None:
                         tr = _traces.capture_from_plot(src)
-                        if tr is not None:
-                            ov["_trace"] = tr
+                        if tr is not None and key is not None:
+                            cache[key] = tr           # memoize the snapshot
                 except Exception as e:
-                    log.debug("text-overlay trace capture failed: %s", e)
+                    log.debug("text-overlay trace resolve failed: %s", e)
+            if tr is not None:
+                ov["_trace"] = tr
             out.append(ov)
+        self._overlay_traces = cache
         return out
+
+    def cache_overlay_trace(self, ref: dict, trace) -> None:
+        """Cache a trace captured at add-time keyed by its SignalRef identity, so
+        the live value survives the source window closing."""
+        key = _overlay_key(ref)
+        if key is None or trace is None:
+            return
+        cache = getattr(self, "_overlay_traces", None)
+        if cache is None:
+            cache = {}
+            self._overlay_traces = cache
+        cache[key] = trace
 
     # ── state emission ───────────────────────────────────────────────────────────
 
@@ -461,6 +537,50 @@ def _public_overlay(ov: dict) -> dict:
     """A text-overlay dict WITHOUT the ephemeral ``_trace`` (for the wire /
     serialization)."""
     return {k: v for k, v in ov.items() if k != "_trace"}
+
+
+def _overlay_key(ref):
+    """A stable identity for a text-overlay's source SignalRef (for the trace
+    cache) — the tree_uid + title + shape, tolerant of a partial dict."""
+    if not isinstance(ref, dict):
+        return None
+    return (ref.get("tree_uid"), ref.get("title"),
+            tuple(ref.get("shape") or ()))
+
+
+def _overlay_value_at(tr, frame: int, scale_s: float, n_frames: int):
+    """The 1-D-signal-as-text value at movie *frame*. If the trace has ONE point
+    per movie frame (the common per-frame column, e.g. a temperature log), read it
+    by FRAME INDEX directly; otherwise resample by physical time (``frame*scale_s``)
+    against the trace's own x-axis. ``None`` when unavailable."""
+    import numpy as _np
+    if tr is None or not hasattr(tr, "resample"):
+        return None
+    try:
+        y = _np.asarray(getattr(tr, "y", None))
+        if y is not None and y.size == int(n_frames) and n_frames > 0:
+            return float(y[max(0, min(int(frame), int(n_frames) - 1))])
+        return float(tr.resample(_np.array([float(frame) * scale_s]))[0])
+    except Exception:
+        return None
+
+
+def _format_overlay_value(ov: dict, frame: int, scale_s: float,
+                          n_frames: int = 0) -> str:
+    """Format a 1-D-signal-as-text overlay's value at *frame* as label text (e.g.
+    ``"T = 812.3 °C"``); a dash when no trace is resolved."""
+    label = str(ov.get("label", "") or "")
+    units = str(ov.get("units", "") or "")
+    fmt = str(ov.get("fmt", "") or "")
+    val = _overlay_value_at(ov.get("_trace"), frame, scale_s, n_frames)
+    if val is None:
+        return f"{label} = —" if label else "—"
+    if fmt:
+        try:
+            return fmt.format(label=label, value=val, units=units)
+        except (KeyError, IndexError, ValueError):
+            pass
+    return f"{label} = {val:.2f} {units}".strip()
 
 
 def _make_movie_widget_handler(st, ann_index: int, kind: str):
@@ -831,6 +951,8 @@ def movie_add_text_overlay(session, plot, payload) -> None:
     mgr.dirty = True
     st = _sessions(mgr).get(cell.id)
     if st is not None:
+        st.cache_overlay_trace(ov["source"], tr)   # snapshot survives window close
+        st.sync_overlay_widgets()                  # show the live value on the figure
         st.emit()
     mgr.emit_state()
 

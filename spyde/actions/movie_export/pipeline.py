@@ -645,7 +645,7 @@ def export_movie(raw, *, path: str, params: dict, n_frames: int,
         inset = render_trace_inset(traces, times, inset_w, sig_units or "s")
 
     # Resample each 1-D-signal-as-text overlay onto the movie time base ONCE.
-    text_resampled = _resample_text_overlays(text_overlays, times)
+    text_resampled = _resample_text_overlays(text_overlays, times, src_indices=idxs)
 
     ts_font = _load_font(max(12, out_h // 28))
     sb_font = _load_font(max(11, out_h // 32))
@@ -673,22 +673,41 @@ def export_movie(raw, *, path: str, params: dict, n_frames: int,
         writer.close()
 
 
-def _resample_text_overlays(text_overlays, times):
-    """For each 1-D-signal-as-text overlay carrying a captured trace
-    (``_trace`` — a :class:`TraceSpec`), resample it onto the movie *times*; an
+def _resample_text_overlays(text_overlays, times, src_indices=None):
+    """For each 1-D-signal-as-text overlay carrying a captured trace (``_trace`` —
+    a :class:`TraceSpec`), produce its per-rendered-frame values. When the trace
+    has ONE point per source frame (a per-frame column, e.g. a temperature log) and
+    ``src_indices`` (the source frame index per rendered frame) is given, read it by
+    FRAME INDEX (index-aligned); otherwise resample by physical time on *times*. An
     overlay with no trace yields ``None`` (paints label + dash). Returns a list
     parallel to *text_overlays*."""
     out = []
+    n_src = None
+    if src_indices is not None:
+        idx = np.asarray(src_indices, dtype=int)
     for ov in text_overlays:
         tr = ov.get("_trace") if isinstance(ov, dict) else None
         if tr is not None and hasattr(tr, "resample"):
             try:
+                y = np.asarray(getattr(tr, "y", None))
+                if (src_indices is not None and y is not None
+                        and y.size and int(y.size) == int(_src_span(src_indices))):
+                    # Per-source-frame column → index-align to the rendered frames.
+                    out.append(y[np.clip(idx, 0, y.size - 1)].astype(float))
+                    continue
                 out.append(np.asarray(tr.resample(times), dtype=float))
                 continue
             except Exception as e:
                 log.debug("text-overlay resample failed: %s", e)
         out.append(None)
     return out
+
+
+def _src_span(src_indices) -> int:
+    """The number of DISTINCT source frames a per-frame column would have (max
+    index + 1) — used to decide whether a trace is index-aligned to the movie."""
+    a = np.asarray(src_indices, dtype=int)
+    return int(a.max()) + 1 if a.size else 0
 
 
 class _Cancelled(Exception):

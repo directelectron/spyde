@@ -24,6 +24,7 @@
 import React from 'react'
 import { useSpyDE } from '../kernel/SpyDEContext'
 import { SeamlessFigureFrame } from './ReportFigureCell'
+import { WINDOW_DRAG_MIME } from '../kernel/dnd'
 import type { MovieStateMessage, MovieParams, MovieAnnotation } from '../kernel/protocol'
 
 interface Props {
@@ -197,6 +198,30 @@ export function MovieEditor({ cellId, sendAction, onClose }: Props) {
   }
   const addFreeze = () => setFreezes([...freezes, { t, hold_s: 1.0 }])
 
+  // Drop a 1-D plot window onto the figure → a 1-D-signal-as-text overlay (its
+  // live value burnt onto the movie, e.g. temperature). Backend captures it.
+  const [dropOver, setDropOver] = React.useState(false)
+  const onSignalDrop = (e: React.DragEvent) => {
+    if (!e.dataTransfer.types.includes(WINDOW_DRAG_MIME)) return
+    e.preventDefault(); e.stopPropagation()
+    setDropOver(false)
+    const wid = parseInt(e.dataTransfer.getData(WINDOW_DRAG_MIME), 10)
+    if (!Number.isNaN(wid)) {
+      const fw = st?.frame_size?.[0] ?? 0
+      const fh = st?.frame_size?.[1] ?? 0
+      sendAction('movie_add_text_overlay', {
+        cell_id: cellId, source_window_id: wid,
+        xy: [Math.round(fw * 0.06), Math.round(fh * 0.9) - 30 * textOverlays.length],
+      })
+    }
+  }
+  const onSignalDragOver = (e: React.DragEvent) => {
+    if (!e.dataTransfer.types.includes(WINDOW_DRAG_MIME)) return
+    e.preventDefault(); e.stopPropagation()
+    e.dataTransfer.dropEffect = 'copy'
+    if (!dropOver) setDropOver(true)
+  }
+
   // Timeline geometry: fraction of the duration for a given seconds value.
   const frac = (sec: number) => (duration > 0 ? Math.max(0, Math.min(1, sec / duration)) : 0)
 
@@ -246,7 +271,9 @@ export function MovieEditor({ cellId, sendAction, onClose }: Props) {
         {/* Centre: the LIVE signal figure (+ optional navigator) + scrubber. */}
         <div style={styles.center}>
           <div style={styles.figRow}>
-            <div style={styles.figWrap} data-testid="movie-figure-wrap">
+            <div style={styles.figWrap} data-testid="movie-figure-wrap"
+              onDrop={onSignalDrop} onDragOver={onSignalDragOver}
+              onDragLeave={() => setDropOver(false)}>
               {signalFig && signalFig.figId ? (
                 <SeamlessFigureFrame
                   figId={signalFig.figId}
@@ -258,6 +285,14 @@ export function MovieEditor({ cellId, sendAction, onClose }: Props) {
               ) : (
                 <div style={styles.figPlaceholder} data-testid="movie-figure-empty">
                   {st?.has_source ? 'Loading the movie figure…' : 'No signal assigned yet.'}
+                </div>
+              )}
+              {/* Drop hint for a 1-D-signal-as-text overlay (a dragged 1-D window,
+                  e.g. a temperature trace). The iframe swallows pointer events, so
+                  the overlay only appears WHILE dragging (pointer-events guarded). */}
+              {dropOver && (
+                <div style={styles.figDropHint} data-testid="movie-signal-drop-hint">
+                  Drop a 1-D signal (e.g. temperature) to overlay its live value
                 </div>
               )}
             </div>
@@ -463,6 +498,12 @@ const styles: Record<string, React.CSSProperties> = {
   figPlaceholder: {
     position: 'absolute', inset: 0, display: 'flex', alignItems: 'center',
     justifyContent: 'center', color: '#6c7086', fontSize: 13,
+  },
+  figDropHint: {
+    position: 'absolute', inset: 8, display: 'flex', alignItems: 'center',
+    justifyContent: 'center', textAlign: 'center', borderRadius: 8,
+    border: '2px dashed #89b4fa', background: 'rgba(137,180,250,0.14)',
+    color: '#89b4fa', fontSize: 14, fontWeight: 600, pointerEvents: 'none', zIndex: 5,
   },
   scrubRow: { display: 'flex', alignItems: 'center', gap: 12, flexShrink: 0 },
   scrubber: { flex: 1, accentColor: '#89b4fa' },

@@ -345,6 +345,43 @@ class TestOverlays:
         assert len(st["text_overlays"]) == 1
         assert "_trace" not in st["text_overlays"][0]
 
+    def test_text_overlay_live_value_on_figure(self, movie_dataset):
+        # A 1-D-signal-as-text overlay puts a LABEL widget on the live figure whose
+        # text is the signal's value at the current frame (index-aligned per frame),
+        # and it updates as you scrub. Uses a per-frame temperature column.
+        import hyperspy.api as hs
+        import numpy as np
+        session, messages = movie_dataset["window"], movie_dataset["messages"]
+        cell_id = _add_movie(session, messages)
+        M.movie_open(session, None, {"cell_id": cell_id})
+        # 8 frames → a per-frame temperature [100, 200, …, 800].
+        temp = hs.signals.Signal1D(np.arange(1, 9, dtype=np.float32) * 100)
+        temp.metadata.set_item("General.title", "temperature")
+        temp.axes_manager.signal_axes[0].units = "C"
+        session._add_signal(temp, source_path=None)
+
+        def _is_temp(p):
+            if getattr(p, "current_data", None) is None \
+                    or np.asarray(p.current_data).ndim != 1:
+                return False
+            tr = getattr(p, "signal_tree", None)
+            try:
+                return str(tr.root.metadata.get_item(
+                    "General.title", default="")) == "temperature"
+            except Exception:
+                return False
+        tline = next(p for p in session._plots if _is_temp(p))
+        M.movie_add_text_overlay(session, None, {
+            "cell_id": cell_id, "source_window_id": tline.window_id, "label": "T"})
+        sess = M._sessions(session._report)[cell_id]
+        assert len(sess._text_overlay_widgets) == 1, "no live text-overlay widget"
+        lw = sess._text_overlay_widgets[0][0]
+        assert "100" in lw.text, lw.text          # frame 0 → 100
+        M.movie_scrub(session, None, {"cell_id": cell_id, "t": 5})
+        _wait_until(lambda: sess.current_index() == 5)
+        sess.refresh_text_overlays()
+        assert "600" in lw.text, lw.text          # frame 5 → 600
+
     def test_text_overlay_value_in_export(self, movie_dataset, tmp_path):
         """A 1-D-signal-as-text overlay resamples the source onto the movie time and
         renders the current value — the export must run without error and produce a
