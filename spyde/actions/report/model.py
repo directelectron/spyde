@@ -173,14 +173,15 @@ _SLIDE_STYLES = ("plain", "accent")
 _SPLIT_RE = re.compile(
     r"^<!--\s*spyde:split\s+(?P<layout>\S+)\s+(?P<cid>\S+)\s+(?P<text>\S+)\s*-->\s*$")
 # The accepted split layouts (anything else → "text-left", the default). Which
-# side the TEXT sits on; the figure/photo takes the other side.
-_SPLIT_LAYOUTS = ("text-left", "text-right")
+# side the TEXT sits on relative to the figure/photo: left / right (side by side)
+# or top / bottom (stacked).
+_SPLIT_LAYOUTS = ("text-left", "text-right", "text-top", "text-bottom")
 
 
 def _normalize_split_layout(val) -> str:
-    """Normalise a raw split layout to one of ``{"text-left", "text-right"}``.
-    Any unknown/absent value collapses to ``"text-left"`` (the default — text on
-    the left, figure on the right) so a malformed marker still renders sanely."""
+    """Normalise a raw split layout to one of :data:`_SPLIT_LAYOUTS`. Any
+    unknown/absent value collapses to ``"text-left"`` (the default — text on the
+    left, figure on the right) so a malformed marker still renders sanely."""
     s = str(val or "").strip().lower()
     return s if s in _SPLIT_LAYOUTS else "text-left"
 
