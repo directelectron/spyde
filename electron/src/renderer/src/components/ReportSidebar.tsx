@@ -523,6 +523,12 @@ export function ReportSidebar() {
       slide_kind: 'title',
     })
   }
+  // A figure slide: an empty placeholder figure cell (a dashed drop-zone) as its
+  // own slide. Dropping a window onto it makes it a live figure.
+  const addFigureSlide = () => {
+    setAddSlideMenu(false)
+    sendAction('report_add_figure_placeholder', { slide_break: true })
+  }
 
   // ── Per-slide header verbs (addressed to the slide's FIRST cell) ──────────────
   const toggleSlideTitle = (firstCellId: string) =>
@@ -1196,10 +1202,10 @@ export function ReportSidebar() {
               >+ Add slide ▾</button>
               {addSlideMenu && (
                 <div style={styles.addSlideMenu} data-testid="report-add-slide-menu" role="menu">
-                  <MenuItem testid="add-slide-text" label="Text slide" onClick={addTextSlide} />
-                  <MenuItem testid="add-slide-split" label="Split slide (text + figure)"
-                    onClick={addSplitSlide} />
-                  <MenuItem testid="add-slide-title" label="Title slide" onClick={addTitleSlide} />
+                  <MenuItem testid="add-slide-text" label="Add text slide" onClick={addTextSlide} />
+                  <MenuItem testid="add-slide-split" label="Add split slide" onClick={addSplitSlide} />
+                  <MenuItem testid="add-slide-title" label="Add title slide" onClick={addTitleSlide} />
+                  <MenuItem testid="add-slide-figure" label="Add figure slide" onClick={addFigureSlide} />
                 </div>
               )}
             </div>

@@ -310,6 +310,8 @@ export function PresentMode({ initialSlide, onSlideChange, onExit, onLaunchLive 
           index={index}
           count={count}
           onGo={go}
+          onExitPresenter={() => setPresenter(false)}
+          onExit={onExit}
         />
       )}
 
@@ -403,11 +405,13 @@ export function PresentMode({ initialSlide, onSlideChange, onExit, onLaunchLive 
  *  we never duplicate the live audience iframes; the live embeds stay in the hidden
  *  audience stack. Advancing (arrows / the header nav) drives the SAME `index`, so
  *  audience + presenter stay in sync. */
-function PresenterView({ slides, index, count, onGo }: {
+function PresenterView({ slides, index, count, onGo, onExitPresenter, onExit }: {
   slides: ReportCell[][]
   index: number
   count: number
   onGo: (n: number) => void
+  onExitPresenter: () => void   // back to the clean audience slide (leave presenter)
+  onExit: () => void            // exit Present mode entirely
 }) {
   const current = slides[index] ?? []
   const next = index + 1 < count ? slides[index + 1] : null
@@ -482,6 +486,20 @@ function PresenterView({ slides, index, count, onGo }: {
             title="Next (→ / Space)"
             onClick={() => onGo(index + 1)}
           >›</button>
+          {/* Explicit exits — the presenter dashboard covers the top-right
+              controls, so these are the only on-screen way out. */}
+          <button
+            data-testid="presenter-exit-view"
+            style={styles.presExitBtn}
+            title="Leave presenter view — show the clean audience slide (S)"
+            onClick={onExitPresenter}
+          >Audience view</button>
+          <button
+            data-testid="presenter-exit-present"
+            style={styles.presExitBtnStrong}
+            title="Exit the presentation (Esc)"
+            onClick={onExit}
+          >✕ Exit</button>
         </div>
       </div>
 
@@ -912,6 +930,14 @@ const styles: Record<string, React.CSSProperties> = {
     width: 40, height: 40, fontSize: 24, lineHeight: 1, cursor: 'pointer',
   },
   presCounter: { fontSize: 18, color: '#cdd6f4', minWidth: 66, textAlign: 'center', fontWeight: 600 },
+  presExitBtn: {
+    background: 'rgba(30,30,46,0.9)', color: '#cdd6f4', border: '1px solid #313244',
+    borderRadius: 8, padding: '0 14px', height: 40, fontSize: 14, cursor: 'pointer',
+  },
+  presExitBtnStrong: {
+    background: '#f38ba8', color: '#11111b', border: 'none',
+    borderRadius: 8, padding: '0 16px', height: 40, fontSize: 14, fontWeight: 700, cursor: 'pointer',
+  },
   presPreviews: {
     display: 'grid', gridTemplateColumns: '1.6fr 1fr', gap: '2vw',
     flex: '0 0 48%', minHeight: 0,
