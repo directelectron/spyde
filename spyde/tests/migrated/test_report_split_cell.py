@@ -325,6 +325,40 @@ class TestSplitHandlers:
                                   {"cell_id": cid, "layout": "bogus"})
         assert _cells(messages)[0]["split_layout"] == "text-left"
 
+    def test_set_split_layout_stacked(self, window):
+        # The stacked layouts (text-top / text-bottom) are accepted + round-trip.
+        session, messages = window["window"], window["messages"]
+        h.report_new(session, None, {})
+        h.report_add_split_cell(session, None, {"source": "x"})
+        cid = _cells(messages)[0]["id"]
+        for lay in ("text-top", "text-bottom"):
+            h.report_set_split_layout(session, None, {"cell_id": cid, "layout": lay})
+            assert _cells(messages)[0]["split_layout"] == lay
+
+
+class TestFigurePlaceholderSlide:
+    def test_add_figure_placeholder(self, window):
+        # "Add figure slide" creates an empty placeholder figure cell (dashed
+        # drop-zone) — with slide_break so it's its own slide.
+        session, messages = window["window"], window["messages"]
+        h.report_new(session, None, {"type": "presentation"})
+        h.report_add_figure_placeholder(session, None, {"slide_break": True})
+        cells = _cells(messages)
+        fig = next(c for c in cells if c["cell_type"] == "figure")
+        assert fig["placeholder"] is True
+        assert fig["slide_break"] is True
+
+    def test_figure_placeholder_roundtrips(self, window, tmp_path):
+        session, messages = window["window"], window["messages"]
+        h.report_new(session, None, {"type": "presentation"})
+        h.report_add_figure_placeholder(session, None, {"slide_break": True})
+        mgr = session._report
+        p = str(tmp_path / "p.spyde-report")
+        write_report(mgr.doc, p, mgr.assemble_assets({}))
+        doc2, _ = read_report(p)
+        fig = next(c for c in doc2.cells if c.cell_type == "figure")
+        assert fig.placeholder is True and fig.slide_break is True
+
     def test_update_cell_edits_split_text(self, window):
         session, messages = window["window"], window["messages"]
         h.report_new(session, None, {})
@@ -500,5 +534,19 @@ class TestSplitExport:
         mgr2, _cid2 = self._mgr_with_photo_split(session2, messages2,
                                                  layout="text-right")
         html2 = _render_static(mgr2)
+        assert html2.index("split-fig") < html2.index("split-text")
+
+    def test_stacked_layout_export(self, window):
+        # text-top → text before figure + the --stacked modifier class (rows).
+        session, messages = window["window"], window["messages"]
+        mgr, _cid = self._mgr_with_photo_split(session, messages, layout="text-top")
+        html = _render_static(mgr)
+        assert "split-block--stacked" in html
+        assert html.index("split-text") < html.index("split-fig")
+        # text-bottom → figure before text, still stacked.
+        session2, messages2 = window["window"], window["messages"]
+        mgr2, _cid2 = self._mgr_with_photo_split(session2, messages2, layout="text-bottom")
+        html2 = _render_static(mgr2)
+        assert "split-block--stacked" in html2
         assert html2.index("split-fig") < html2.index("split-text")
 
