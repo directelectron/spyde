@@ -131,6 +131,7 @@ class MovieEditSession:
         self._text_overlay_widgets: dict = {}  # {i: (label_widget, overlay_dict)}
         self._overlay_traces: dict = {}   # captured TraceSpec by SignalRef identity
         self._crop_widget = None          # the draggable crop rect (when crop mode on)
+        self._overlay_layer = None        # the live 2nd-image overlay layer (or None)
 
     # ── time / signal axis reads (playback conventions) ──────────────────────────
 
@@ -372,6 +373,12 @@ class MovieEditSession:
                 cw = getattr(self, "_crop_widget", None)
                 if cw is not None:
                     p2._widgets.pop(getattr(cw, "id", None), None)
+                ol = getattr(self, "_overlay_layer", None)
+                if ol is not None:
+                    try:
+                        p2.remove_layer(ol)
+                    except Exception:
+                        pass
                 p2._push()
             except Exception as e:
                 log.debug("movie clear overlay widgets failed: %s", e)
@@ -379,6 +386,7 @@ class MovieEditSession:
         self._widget_handlers = []
         self._text_overlay_widgets = {}
         self._crop_widget = None
+        self._overlay_layer = None
 
     def unbind_live_windows(self) -> None:
         """Restore the surfaced windows to normal (the renderer re-parents the
@@ -429,8 +437,11 @@ class MovieEditSession:
             cur = self.current_index()
             sel.translate_pixels(int(t) - int(cur))
             sel.delayed_update_data(force=True)
-            # Update any 1-D-signal-as-text overlays to the new frame's value.
+            # Update any 1-D-signal-as-text overlays to the new frame's value, and
+            # the 2nd-image overlay layer to the new frame.
             self.refresh_text_overlays()
+            if getattr(self, "_overlay_layer", None) is not None:
+                self.sync_overlay_image_layer()
         except Exception as e:
             log.debug("movie scrub_to(%s) failed: %s", t, e)
 
@@ -519,6 +530,89 @@ class MovieEditSession:
             out.append(ov)
         self._overlay_traces = cache
         return out
+
+    def resolve_overlay_image(self):
+        """Resolve the cell's 2nd-image overlay to a render-ready dict for
+        ``export_movie`` (its lazy ``raw`` array + alpha/cmap/clim/blend/time_range),
+        or None. Reads the overlay's source SignalRef → live tree → root data
+        (sliced one frame at a time in the pipeline). Best-effort; None on failure."""
+        from spyde.actions.report.model import SignalRef
+        oi = self.cell.movie.overlay_image if self.cell.movie else None
+        if not isinstance(oi, dict):
+            return None
+        ref = oi.get("source")
+        if not isinstance(ref, dict):
+            return None
+        try:
+            src = SignalRef.from_dict(ref).resolve(self.session)
+            tree = getattr(src, "signal_tree", None) if src is not None else None
+            raw_over = tree.root.data if tree is not None else None
+            if raw_over is None:
+                return None
+            return {
+                "raw": raw_over,
+                "alpha": float(oi.get("alpha", 0.5) or 0.5),
+                "cmap": str(oi.get("cmap", "magma") or "magma"),
+                "clim": oi.get("clim"),
+                "blend": str(oi.get("blend", "over") or "over"),
+                "time_range": oi.get("time_range"),
+                "downsample": int(oi.get("downsample", self.cell.movie.params.get("downsample", 1) or 1)),
+            }
+        except Exception as e:
+            log.debug("resolve overlay image failed: %s", e)
+            return None
+
+    def sync_overlay_image_layer(self) -> None:
+        """Composite the 2nd-image overlay as a LIVE layer on the signal figure (a
+        translucent ``add_layer`` of its current frame), so the editor shows it too.
+        Refreshed on scrub. Best-effort."""
+        p2 = self._signal_plot2d()
+        if p2 is None:
+            return
+        # Drop any prior overlay layer.
+        prev = getattr(self, "_overlay_layer", None)
+        if prev is not None:
+            try:
+                p2.remove_layer(prev)
+            except Exception:
+                try:
+                    p2._layers = [ly for ly in getattr(p2, "_layers", [])
+                                  if ly is not prev]
+                    p2._push()
+                except Exception:
+                    pass
+            self._overlay_layer = None
+        oi = self.resolve_overlay_image()
+        if oi is None:
+            return
+        try:
+            frame = self.read_overlay_frame(oi, self.current_index())
+            if frame is None:
+                return
+            self._overlay_layer = p2.add_layer(
+                np.asarray(frame, dtype=np.float32),
+                cmap=oi["cmap"], alpha=oi["alpha"], clim=oi.get("clim"))
+        except Exception as e:
+            log.debug("overlay-image layer add failed: %s", e)
+
+    def read_overlay_frame(self, oi: dict, t: int):
+        """Read ONE frame of the overlay image at time *t* (memory-safe slice)."""
+        raw_over = oi.get("raw")
+        if raw_over is None:
+            return None
+        try:
+            ti = min(int(t), int(raw_over.shape[0]) - 1)
+            sl = raw_over[ti]
+            comp = getattr(sl, "compute", None)
+            if comp is not None:
+                try:
+                    sl = comp(scheduler="synchronous")
+                except TypeError:
+                    sl = comp()
+            return np.asarray(sl)
+        except Exception as e:
+            log.debug("overlay frame read failed: %s", e)
+            return None
 
     def cache_overlay_trace(self, ref: dict, trace) -> None:
         """Cache a trace captured at add-time keyed by its SignalRef identity, so
@@ -866,6 +960,7 @@ def movie_open(session, plot, payload) -> None:
         st.seed_defaults()
         st.bind_live_windows()
         st.sync_overlay_widgets()      # draggable annotation widgets on the figure
+        st.sync_overlay_image_layer()  # the 2nd-image overlay layer (if any)
     _sessions(mgr)[cell.id] = st
     if not _ffmpeg_ok():
         ipc.emit_status("Movie: ffmpeg not found — preview works, mp4 encoding "
@@ -986,6 +1081,68 @@ def movie_tune(session, plot, payload) -> None:
     mgr.emit_state()
 
 
+def movie_drop_window(session, plot, payload) -> None:
+    """Route a window dropped onto the movie figure by its dimensionality: a 1-D
+    plot → a 1-D-signal-as-text overlay; a 2-D image → the 2nd-image overlay. So the
+    user just drops any window and the editor does the right thing.
+    ``{cell_id, source_window_id, xy?}``."""
+    src = _resolve_source_plot(session, payload.get("source_window_id"))
+    if src is None:
+        ipc.emit_error("Movie drop: source window not found.")
+        return
+    data = getattr(src, "current_data", None)
+    ndim = np.asarray(data).ndim if isinstance(data, np.ndarray) else 0
+    if ndim == 1:
+        movie_add_text_overlay(session, plot, payload)
+    elif ndim == 2:
+        movie_add_overlay_image(session, plot, payload)
+    else:
+        ipc.emit_error("Movie drop: unsupported window (need a 1-D signal or 2-D image).")
+
+
+def movie_add_overlay_image(session, plot, payload) -> None:
+    """Set the 2nd-image overlay from a dropped 2-D (in-situ) window
+    (``{cell_id, source_window_id, alpha?, cmap?, blend?}``). Composited over the
+    base frame in the live figure + the export. A ``{clear: true}`` payload removes
+    it. Emits ``movie_state``."""
+    from spyde.actions.report.model import SignalRef
+    mgr = _manager(session)
+    if not mgr.open:
+        return
+    cell = mgr.doc.cell_by_id(payload.get("cell_id"))
+    if cell is None or cell.cell_type != "movie" or cell.movie is None:
+        return
+    st = _sessions(mgr).get(cell.id)
+    if payload.get("clear"):
+        cell.movie.overlay_image = None
+        mgr.dirty = True
+        if st is not None:
+            st.sync_overlay_image_layer()
+            st.emit()
+        mgr.emit_state()
+        return
+    src = _resolve_source_plot(session, payload.get("source_window_id"))
+    if src is None:
+        ipc.emit_error("Add overlay image: source window not found.")
+        return
+    frame = getattr(src, "current_data", None)
+    if not isinstance(frame, np.ndarray) or frame.ndim != 2:
+        ipc.emit_error("Add overlay image: source is not a 2-D image.")
+        return
+    cell.movie.overlay_image = {
+        "source": SignalRef.from_plot(src).to_dict(),
+        "alpha": float(payload.get("alpha", 0.5) or 0.5),
+        "cmap": str(payload.get("cmap", "magma") or "magma"),
+        "blend": str(payload.get("blend", "over") or "over"),
+        "time_range": payload.get("time_range"),
+    }
+    mgr.dirty = True
+    if st is not None:
+        st.sync_overlay_image_layer()      # show it on the figure
+        st.emit()
+    mgr.emit_state()
+
+
 def movie_crop_mode(session, plot, payload) -> None:
     """Toggle the draggable CROP rectangle on the live figure (``{cell_id, on}``).
     Dragging it persists ``spec.crop``; a ``{clear: true}`` payload resets the crop
@@ -1096,6 +1253,7 @@ def movie_export(session, plot, payload) -> None:
     scale_s = st.scale_seconds()
     sig_scale_x, sig_units = st.sig_scale_units()
     overlays = st.rebuild_text_traces()
+    overlay_img = st.resolve_overlay_image()   # the 2nd-image composite (or None)
     st.emit()   # running=True
 
     def should_cancel():
@@ -1113,7 +1271,8 @@ def movie_export(session, plot, payload) -> None:
         frames = export_movie(
             raw, path=path, params=params, n_frames=n_frames, scale_s=scale_s,
             sig_scale_x=sig_scale_x, sig_units=sig_units,
-            text_overlays=overlays, should_cancel=should_cancel, progress=progress)
+            text_overlays=overlays, overlay=overlay_img,
+            should_cancel=should_cancel, progress=progress)
         # Bake a poster from the first rendered frame (memory-safe single frame)
         # so the report card + saved zip show a representative still.
         poster = _bake_poster(raw, params, n_frames, scale_s,

@@ -319,6 +319,55 @@ class TestOverlays:
         M.movie_close(session, None, {"cell_id": cell_id})
         assert not sess._ann_widgets
 
+    def test_overlay_image_composited_in_export(self, movie_dataset, tmp_path):
+        # A 2nd-image overlay (a bright square) composites onto the base movie's
+        # dark region — the exported frame brightens where the overlay lands.
+        import hyperspy.api as hs
+        import numpy as np
+        import dask.array as da
+        import imageio.v3 as iio
+        session, messages = movie_dataset["window"], movie_dataset["messages"]
+        cell_id = _add_movie(session, messages)
+        M.movie_open(session, None, {"cell_id": cell_id})
+        # A 2nd in-situ movie: a bright square bottom-left (base there is dark).
+        ov = np.zeros((8, 32, 32), dtype=np.uint16)
+        ov[:, 20:30, 2:12] = 1000
+        osig = hs.signals.Signal2D(da.from_array(ov, chunks=(1, 32, 32))).as_lazy()
+        osig.metadata.set_item("General.title", "overlay")
+        osig.axes_manager.navigation_axes[0].scale = 0.1
+        osig.set_signal_type("insitu")
+        session._add_signal(osig, source_path=None)
+
+        def _is_ov(p):
+            tr = getattr(p, "signal_tree", None)
+            root = getattr(tr, "root", None)
+            return (root is not None
+                    and getattr(root, "_signal_type", None) == "insitu"
+                    and not getattr(p, "is_navigator", False)
+                    and str(root.metadata.get_item("General.title", default="")) == "overlay")
+        oplot = next(p for p in session._plots if _is_ov(p))
+
+        out0 = str(tmp_path / "base.gif")
+        M.movie_export(session, None, {"cell_id": cell_id, "path": out0})
+        assert _poll(messages, "movie_done") is not None
+        bl0 = float(np.asarray(iio.imread(out0))[0][20:30, 2:12].mean())
+
+        M.movie_add_overlay_image(session, None, {
+            "cell_id": cell_id, "source_window_id": oplot.window_id,
+            "alpha": 0.8, "cmap": "gray"})
+        cell = session._report.doc.cell_by_id(cell_id)
+        assert cell.movie.overlay_image is not None
+        out1 = str(tmp_path / "ov.gif")
+        # Clear the movie_done marker so the poll waits for the NEW export.
+        messages.clear()
+        M.movie_export(session, None, {"cell_id": cell_id, "path": out1})
+        assert _poll(messages, "movie_done") is not None
+        bl1 = float(np.asarray(iio.imread(out1))[0][20:30, 2:12].mean())
+        assert bl1 > bl0 + 30, f"overlay did not brighten ({bl1} vs {bl0})"
+        # Clear removes it.
+        M.movie_add_overlay_image(session, None, {"cell_id": cell_id, "clear": True})
+        assert cell.movie.overlay_image is None
+
     def test_crop_widget_on_figure_persists(self, movie_dataset):
         # Crop mode adds a draggable rect widget on the live figure; dragging it
         # persists spec.crop (source px), and clear resets it.

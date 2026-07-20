@@ -514,15 +514,21 @@ def _resolve_clim(first: np.ndarray, clim):
 
 def _compose_frame(frame, lut, lo, hi, out_h, out_w, *, t_sec, k,
                    anns, text_overlays, text_values, timestamp, scalebar,
-                   sb_scale, sig_units, ts_font, sb_font, inset=None, inset_i=0):
+                   sb_scale, sig_units, ts_font, sb_font, inset=None, inset_i=0,
+                   overlay=None, raw_over=None, src_t=0):
     """LUT + fit + the whole overlay stack for ONE already-read (cropped +
     downsampled) *frame* → a PIL RGB image. Shared by :func:`export_movie` and the
-    single-frame preview so the editor preview is byte-for-byte what exports."""
+    single-frame preview so the editor preview is byte-for-byte what exports.
+
+    A 2nd-image *overlay* (with its lazy array *raw_over*) is alpha/screen-composited
+    onto the base BEFORE the drawn overlays (so annotations/timestamp sit on top)."""
     rgb = even_crop(apply_lut(frame, lut, lo, hi))
     # Fit every frame to the writer's fixed (out_h, out_w): a LARGER frame is
     # cropped, a SMALLER (ragged / shrunk) one is letterbox-PADDED with zeros.
     if rgb.shape[:2] != (out_h, out_w):
         rgb = _fit_frame(rgb, out_h, out_w)
+    if overlay is not None and raw_over is not None:
+        rgb = _composite_overlay(rgb, overlay, raw_over, src_t, k, t_sec, out_h, out_w)
     img = _pil_rgb(rgb)
     _draw_annotations(img, anns, t_sec, k)
     if text_overlays:
@@ -567,10 +573,49 @@ def render_single_frame(raw, t: int, *, params: dict, n_frames: int,
         sb_scale=sb_scale, sig_units=sig_units, ts_font=ts_font, sb_font=sb_font)
 
 
+def _composite_overlay(base_rgb: np.ndarray, overlay, raw_over, t: int, k: int,
+                       t_sec: float, out_h: int, out_w: int) -> np.ndarray:
+    """Alpha/screen-composite a SECOND image over *base_rgb* (an (H,W,3) uint8).
+
+    *overlay* is the resolved 2nd-image spec ``{raw, alpha, cmap, clim, blend,
+    time_range, downsample}``; *raw_over* is its lazy/numpy array (read one frame at
+    a time). Time-gated by ``time_range`` (seconds). Returns the blended RGB. On any
+    failure returns *base_rgb* unchanged (the overlay is cosmetic)."""
+    try:
+        if overlay is None or raw_over is None:
+            return base_rgb
+        tr = overlay.get("time_range")
+        if tr and not (float(tr[0]) <= t_sec <= float(tr[1])):
+            return base_rgb
+        ov_k = int(overlay.get("downsample", k) or k)
+        # Read the overlay's frame at the same time index (memory-safe single slice).
+        ti = min(int(t), raw_over.shape[0] - 1)
+        of = downsample(read_frame(raw_over, ti), ov_k)
+        olut = build_lut(str(overlay.get("cmap", "magma") or "magma"))
+        oclim = overlay.get("clim")
+        olo, ohi = _resolve_clim(of, oclim)
+        orgb = even_crop(apply_lut(of, olut, olo, ohi))
+        if orgb.shape[:2] != (out_h, out_w):
+            orgb = _fit_frame(orgb, out_h, out_w)
+        alpha = float(overlay.get("alpha", 0.5) or 0.5)
+        blend = str(overlay.get("blend", "over") or "over")
+        b = base_rgb.astype(np.float32)
+        o = orgb.astype(np.float32)
+        if blend == "screen":
+            mixed = 255.0 - (255.0 - b) * (255.0 - o) / 255.0
+            out = b * (1.0 - alpha) + mixed * alpha
+        else:  # "over" — straight alpha
+            out = b * (1.0 - alpha) + o * alpha
+        return np.clip(out, 0, 255).astype(np.uint8)
+    except Exception as e:
+        log.debug("overlay-image composite failed: %s", e)
+        return base_rgb
+
+
 def export_movie(raw, *, path: str, params: dict, n_frames: int,
                  scale_s: float, sig_scale_x: float, sig_units: str,
-                 traces=None, text_overlays=None, should_cancel=None,
-                 progress=None) -> int:
+                 traces=None, text_overlays=None, overlay=None,
+                 should_cancel=None, progress=None) -> int:
     """Render the movie to *path*. Returns the number of frames written.
 
     MEMORY-SAFE: reads one frame per iteration via :func:`read_frame` (a lazy
@@ -650,6 +695,8 @@ def export_movie(raw, *, path: str, params: dict, n_frames: int,
     ts_font = _load_font(max(12, out_h // 28))
     sb_font = _load_font(max(11, out_h // 32))
 
+    raw_over = overlay.get("raw") if overlay else None
+
     writer = open_writer(path, fps, (out_w, out_h))
     written = 0
     try:
@@ -663,7 +710,8 @@ def export_movie(raw, *, path: str, params: dict, n_frames: int,
                 anns=anns, text_overlays=text_overlays, text_values=text_values,
                 timestamp=timestamp, scalebar=scalebar, sb_scale=sb_scale,
                 sig_units=sig_units, ts_font=ts_font, sb_font=sb_font,
-                inset=inset, inset_i=fi)
+                inset=inset, inset_i=fi,
+                overlay=overlay, raw_over=raw_over, src_t=t)
             writer.append(np.asarray(img.convert("RGB")))
             written += 1
             if progress is not None:

@@ -200,8 +200,9 @@ export function MovieEditor({ cellId, sendAction, onClose }: Props) {
   }
   const addFreeze = () => setFreezes([...freezes, { t, hold_s: 1.0 }])
 
-  // Drop a 1-D plot window onto the figure → a 1-D-signal-as-text overlay (its
-  // live value burnt onto the movie, e.g. temperature). Backend captures it.
+  // Drop a window onto the figure → the backend routes by dimensionality: a 1-D
+  // plot becomes a 1-D-signal-as-text overlay (its live value, e.g. temperature);
+  // a 2-D image becomes the 2nd-image overlay (composited with alpha).
   const [dropOver, setDropOver] = React.useState(false)
   const onSignalDrop = (e: React.DragEvent) => {
     if (!e.dataTransfer.types.includes(WINDOW_DRAG_MIME)) return
@@ -211,7 +212,7 @@ export function MovieEditor({ cellId, sendAction, onClose }: Props) {
     if (!Number.isNaN(wid)) {
       const fw = st?.frame_size?.[0] ?? 0
       const fh = st?.frame_size?.[1] ?? 0
-      sendAction('movie_add_text_overlay', {
+      sendAction('movie_drop_window', {
         cell_id: cellId, source_window_id: wid,
         xy: [Math.round(fw * 0.06), Math.round(fh * 0.9) - 30 * textOverlays.length],
       })
@@ -311,7 +312,8 @@ export function MovieEditor({ cellId, sendAction, onClose }: Props) {
                   the overlay only appears WHILE dragging (pointer-events guarded). */}
               {dropOver && (
                 <div style={styles.figDropHint} data-testid="movie-signal-drop-hint">
-                  Drop a 1-D signal (e.g. temperature) to overlay its live value
+                  Drop a 1-D signal (live value, e.g. temperature) or a 2-D image
+                  (overlaid with alpha) onto the movie
                 </div>
               )}
             </div>

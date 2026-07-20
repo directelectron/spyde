@@ -160,6 +160,8 @@ STAGED_HANDLERS: dict[str, str] = {
     "movie_tune":              "spyde.actions.report.movie.movie_tune",
     "movie_crop_mode":         "spyde.actions.report.movie.movie_crop_mode",
     "movie_add_text_overlay":  "spyde.actions.report.movie.movie_add_text_overlay",
+    "movie_add_overlay_image": "spyde.actions.report.movie.movie_add_overlay_image",
+    "movie_drop_window":       "spyde.actions.report.movie.movie_drop_window",
     "movie_export":            "spyde.actions.report.movie.movie_export",
     "movie_cancel":            "spyde.actions.report.movie.movie_cancel",
 }
