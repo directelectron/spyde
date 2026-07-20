@@ -98,6 +98,8 @@ figure.report-figure figcaption { margin-top: 0.6rem; font-size: 0.9rem;
    column. */
 .report-article .split-block { display: grid; grid-template-columns: 1fr 1fr;
   gap: 1.5rem; align-items: center; margin: 1.75rem 0; }
+.report-article .split-block--stacked { grid-template-columns: 1fr;
+  grid-auto-rows: auto; }
 .report-article .split-col { min-width: 0; }
 .report-article .split-fig figure.report-figure { margin: 0; }
 @media (max-width: 720px) {
@@ -287,9 +289,13 @@ def _split_cell_html(mgr, cell: Cell, assets: dict, *, interactive: bool,
     layout = _normalize_split_layout(cell.split_layout)
     text_col = f"<div class=\"split-col split-text\">\n{text_html}\n</div>"
     fig_col = f"<div class=\"split-col split-fig\">\n{fig_html}\n</div>"
-    first, second = ((text_col, fig_col) if layout == "text-left"
-                     else (fig_col, text_col))
-    return f"<div class=\"split-block\">\n{first}\n{second}\n</div>"
+    # Text-first for left/top; figure-first for right/bottom. A "--stacked"
+    # modifier switches the block from 2 columns to 2 rows (CSS below).
+    text_first = layout in ("text-left", "text-top")
+    stacked = layout in ("text-top", "text-bottom")
+    first, second = (text_col, fig_col) if text_first else (fig_col, text_col)
+    cls = "split-block split-block--stacked" if stacked else "split-block"
+    return f"<div class=\"{cls}\">\n{first}\n{second}\n</div>"
 
 
 def _render_cell_html(mgr, cell: Cell, assets: dict, *, interactive: bool,
@@ -398,6 +404,8 @@ figure.report-figure figcaption { margin-top: 0.5rem; font-size: 0.85rem;
    so a phone still reads it. */
 .split-block { display: grid; grid-template-columns: 1fr 1fr; gap: 2.5vw;
   align-items: center; }
+.split-block--stacked { grid-template-columns: 1fr; grid-auto-rows: auto;
+  gap: 1.5vh; }
 .split-col { min-width: 0; }
 .split-fig figure.report-figure { margin: 0.5rem 0; }
 .split-fig figure.report-figure img { max-height: 74vh; }

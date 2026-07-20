@@ -2222,6 +2222,25 @@ def report_add_split_cell(session, plot, payload) -> None:
     mgr.emit_state()
 
 
+def report_add_figure_placeholder(session, plot, payload) -> None:
+    """Add an EMPTY placeholder figure cell — a dashed drop-zone that becomes a
+    live figure when the user drops a window onto it (via ``report_add_figure``
+    with ``at_cell`` = this cell). Used by the "Add figure slide" action.
+
+    ``payload``: ``{index?, slide_break?, caption?}``. Mirrors
+    :func:`report_add_split_cell` for the seed-time fields (so a figure slide can
+    be created already slide-break-marked). The placeholder render + drop wiring
+    already exist in ``ReportFigureCell.tsx``."""
+    mgr = _ensure_open(session)
+    cell = Cell(id=new_cell_id(), cell_type="figure", placeholder=True,
+                caption=str(payload.get("caption", "") or ""))
+    if payload.get("slide_break") is not None:
+        cell.slide_break = bool(payload.get("slide_break"))
+    _insert_cell(mgr.doc, cell, payload.get("index"))
+    mgr.dirty = True
+    mgr.emit_state()
+
+
 def report_set_split_layout(session, plot, payload) -> None:
     """Set a SPLIT cell's ``split_layout`` — ``"text-left"`` (text on the left,
     figure on the right — the default) or ``"text-right"`` (mirror). Any other

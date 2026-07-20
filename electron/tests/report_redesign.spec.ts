@@ -198,9 +198,12 @@ test('c) + Add split block → drop zone → fill figure beside text → swap si
   await page.waitForTimeout(1500)   // let the figure paint
   await page.screenshot({ path: join(SHOTS, '06-split-filled-text-left.png') })
 
-  // The layout switch swaps text ↔ figure sides.
+  // The layout control is a dropdown (text-left/right/top/bottom); open it and
+  // pick "text-right" to move the text to the right (figure swaps to the left).
   await split.dispatchEvent('mouseover', { bubbles: true })
   await page.getByTestId(`report-split-layout-${cellId}`).click()
+  await expect(page.getByTestId(`report-split-layout-menu-${cellId}`)).toBeVisible()
+  await page.getByTestId(`report-split-layout-${cellId}-text-right`).click()
   await expect.poll(async () => {
     const doc = await reportDoc(page)
     const c = (doc?.cells ?? []).find((x: any) => x.id === cellId)

@@ -31,7 +31,7 @@ import { reportClipboard } from '../kernel/reportClipboard'
 import type { ReportCell } from '../kernel/protocol'
 import { FIGURE_DRAG_MIME, WINDOW_DRAG_MIME } from '../kernel/dnd'
 import { CellChrome } from './CellChrome'
-import { SeamlessFigureFrame } from './ReportFigureCell'
+import { SeamlessFigureFrame, FigureEditOverlay } from './ReportFigureCell'
 
 const DROP_MIMES = [FIGURE_DRAG_MIME, WINDOW_DRAG_MIME]
 const isComposeDrag = (dt: DataTransfer) => DROP_MIMES.some(m => dt.types.includes(m))
@@ -88,7 +88,13 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
   const taRef = useRef<HTMLTextAreaElement>(null)
   const rootRef = useRef<HTMLDivElement>(null)
 
-  const layout = cell.split_layout === 'text-right' ? 'text-right' : 'text-left'
+  const LAYOUTS = ['text-left', 'text-right', 'text-top', 'text-bottom'] as const
+  type Layout = typeof LAYOUTS[number]
+  const layout: Layout = (LAYOUTS as readonly string[]).includes(cell.split_layout ?? '')
+    ? (cell.split_layout as Layout) : 'text-left'
+  const stacked = layout === 'text-top' || layout === 'text-bottom'
+  const textFirst = layout === 'text-left' || layout === 'text-top'
+  const [layoutMenu, setLayoutMenu] = useState(false)
   const empty = !!cell.split_empty
   // The figure side rides in the same fig_id/reportFigures plumbing as a figure
   // cell (keyed by the CELL id). A photo side ships `image` instead of a spec.
@@ -135,11 +141,17 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
   const rendered = React.useMemo(() => renderMarkdown(cell.source ?? ''), [cell.source])
   const textEmpty = !(cell.source ?? '').trim()
 
-  // ── Layout switch (swap text ↔ figure sides) ──────────────────────────────
-  const swapLayout = () =>
-    sendAction('report_set_split_layout', {
-      cell_id: cell.id, layout: layout === 'text-left' ? 'text-right' : 'text-left',
-    })
+  // ── Layout switch (a dropdown picker: 4 arrangements) ─────────────────────
+  const setLayout = (l: Layout) => {
+    setLayoutMenu(false)
+    sendAction('report_set_split_layout', { cell_id: cell.id, layout: l })
+  }
+  const LAYOUT_OPTS: { value: Layout; label: string; glyph: string }[] = [
+    { value: 'text-left', label: 'Text left', glyph: '◧' },
+    { value: 'text-right', label: 'Text right', glyph: '◨' },
+    { value: 'text-top', label: 'Text top', glyph: '⬒' },
+    { value: 'text-bottom', label: 'Text bottom', glyph: '⬓' },
+  ]
 
   // ── Figure-side drop (fill the empty figure side in place) ─────────────────
   const onFigDragOver = (e: React.DragEvent) => {
@@ -284,10 +296,13 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
         ...(dragProps.dropBefore ? styles.cellDropBefore : {}),
       }}
     >
-      {hover && (
+      {/* The editing chrome is ALWAYS visible (not hover-gated) — a split slide's
+          tools were undiscoverable when they only appeared on hover. Hover just
+          brightens it. */}
+      {(
         <CellChrome
           cellId={cell.id}
-          styles={{ chrome: styles.chrome, chromeBtn: styles.chromeBtn }}
+          styles={{ chrome: { ...styles.chrome, ...(hover ? styles.chromeHover : {}) }, chromeBtn: styles.chromeBtn }}
           onCopy={doCopy}
           onDuplicate={doDuplicate}
           onDelete={onRemove}
@@ -326,25 +341,59 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
                   onClick={refreshFigure}
                 >⟳</button>
               )}
-              <button
-                data-testid={`report-split-layout-${cell.id}`}
-                style={styles.chromeBtn}
-                title={layout === 'text-left'
-                  ? 'Text is on the LEFT — click to move it to the right'
-                  : 'Text is on the RIGHT — click to move it to the left'}
-                onClick={swapLayout}
-              >{layout === 'text-left' ? '◨' : '◧'}</button>
+              <div style={{ position: 'relative' }}>
+                <button
+                  data-testid={`report-split-layout-${cell.id}`}
+                  style={styles.chromeBtn}
+                  title="Split layout (text vs figure arrangement)"
+                  aria-haspopup="menu"
+                  aria-expanded={layoutMenu}
+                  onClick={() => setLayoutMenu(v => !v)}
+                >{LAYOUT_OPTS.find(o => o.value === layout)?.glyph ?? '◧'} ▾</button>
+                {layoutMenu && (
+                  <div style={styles.layoutMenu} role="menu"
+                    data-testid={`report-split-layout-menu-${cell.id}`}>
+                    {LAYOUT_OPTS.map(o => (
+                      <button key={o.value} role="menuitemradio"
+                        aria-checked={layout === o.value}
+                        data-testid={`report-split-layout-${cell.id}-${o.value}`}
+                        style={{ ...styles.layoutMenuItem, ...(layout === o.value ? styles.layoutMenuItemActive : {}) }}
+                        onClick={() => setLayout(o.value)}>
+                        <span style={styles.layoutGlyph}>{o.glyph}</span> {o.label}
+                        {layout === o.value && <span style={{ marginLeft: 'auto' }}>✓</span>}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
             </>
           }
         />
       )}
 
-      {/* The two panes, ordered by split_layout. */}
-      <div style={styles.panes}>
-        {layout === 'text-left'
-          ? <>{textPane}{figurePane}</>
-          : <>{figurePane}{textPane}</>}
+      {/* The two panes, ordered + oriented by split_layout (side-by-side or
+          stacked; text first or figure first). */}
+      <div style={{ ...styles.panes,
+        gridTemplateColumns: stacked ? '1fr' : '1fr 1fr',
+        gridTemplateRows: stacked ? 'auto auto' : '1fr' }}>
+        {textFirst ? <>{textPane}{figurePane}</> : <>{figurePane}{textPane}</>}
       </div>
+
+      {/* The SAME figure-editing pop-down a figure cell gets — the annotation
+          style popover + text-size popover + the add-annotation edit bar — for the
+          split's figure side. Without this, toggling Edit on a split's figure
+          entered edit mode on the backend but showed NO annotation tools. */}
+      <FigureEditOverlay
+        cell={cell}
+        isLive={isLive}
+        editOpen={figEditOpen}
+        figId={fig?.figId ?? null}
+        sendAction={sendAction}
+        onCloseEdit={() => {
+          setFigEditOpen(false)
+          sendAction('repfig_set_edit_mode', { cell_id: cell.id, editing: false })
+        }}
+      />
     </div>
   )
 }
@@ -364,12 +413,29 @@ const styles: Record<string, React.CSSProperties> = {
     display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, alignItems: 'stretch',
   },
   pane: { minWidth: 0, display: 'flex', flexDirection: 'column' },
+  layoutMenu: {
+    position: 'absolute', top: '100%', right: 0, marginTop: 4, zIndex: 20,
+    background: '#1e1e2e', border: '1px solid #313244', borderRadius: 6,
+    padding: 4, minWidth: 130, boxShadow: '0 6px 18px rgba(0,0,0,0.5)',
+    display: 'flex', flexDirection: 'column', gap: 2,
+  },
+  layoutMenuItem: {
+    display: 'flex', alignItems: 'center', gap: 8, width: '100%',
+    background: 'none', border: 'none', color: '#cdd6f4', cursor: 'pointer',
+    fontSize: 12, padding: '5px 8px', borderRadius: 4, textAlign: 'left',
+  },
+  layoutMenuItemActive: { background: '#313244' },
+  layoutGlyph: { fontSize: 15, width: 18, textAlign: 'center' },
   chrome: {
-    position: 'absolute', top: 6, right: 6, zIndex: 4,
+    position: 'absolute', top: 6, right: 6, zIndex: 6,
     display: 'flex', alignItems: 'center', gap: 2,
     background: 'rgba(24,24,37,0.96)', borderRadius: 8, padding: 3,
     border: '1px solid #313244', boxShadow: '0 3px 10px rgba(0,0,0,0.35)',
+    // Always visible (not hover-gated) but slightly dimmed until hovered so the
+    // tools are discoverable without covering the figure side too loudly.
+    opacity: 0.78, transition: 'opacity 120ms ease',
   },
+  chromeHover: { opacity: 1 },
   chromeBtn: {
     background: 'none', border: 'none', color: '#cdd6f4', cursor: 'pointer',
     fontSize: 15, lineHeight: 1, borderRadius: 6,
