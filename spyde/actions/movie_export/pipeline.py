@@ -74,6 +74,29 @@ def apply_lut(frame: np.ndarray, lut: np.ndarray,
     return lut[idx]
 
 
+# ── crop (source pixel space, applied BEFORE downsample) ──────────────────────────
+
+def apply_crop(frame: np.ndarray, crop) -> np.ndarray:
+    """Crop a 2-D *frame* to ``[x0, y0, x1, y1]`` (source pixel space, the same
+    coordinate system annotations use). ``None`` / a malformed / degenerate rect →
+    the full frame unchanged. Clamped to the frame bounds so a stale crop from a
+    larger source can never index out of range."""
+    if not crop:
+        return frame
+    try:
+        x0, y0, x1, y1 = (int(crop[0]), int(crop[1]), int(crop[2]), int(crop[3]))
+    except (TypeError, ValueError, IndexError):
+        return frame
+    h, w = frame.shape[:2]
+    x0 = max(0, min(x0, w))
+    x1 = max(0, min(x1, w))
+    y0 = max(0, min(y0, h))
+    y1 = max(0, min(y1, h))
+    if x1 - x0 < 1 or y1 - y0 < 1:
+        return frame
+    return frame[y0:y1, x0:x1]
+
+
 # ── spatial downsample ──────────────────────────────────────────────────────────
 
 def downsample(frame: np.ndarray, k: int) -> np.ndarray:
@@ -215,17 +238,19 @@ def _in_time_range(t_sec: float, ann: dict) -> bool:
     return t0 <= t_sec <= t1
 
 
-def _draw_annotations(img, anns, t_sec: float, k: int):
-    """Draw each time-gated annotation. Coordinates are in the ORIGINAL image's
-    pixel space; we divide by the downsample factor *k* so they land correctly on
-    the shrunk frame."""
+def _draw_annotations(img, anns, t_sec: float, k: int, crop_origin=(0, 0)):
+    """Draw each time-gated annotation. Coordinates are in the ORIGINAL (uncropped)
+    source pixel space; we subtract the crop origin (so a cropped export places them
+    correctly) then divide by the downsample factor *k* to land on the shrunk
+    frame."""
     from PIL import ImageDraw
     if not anns:
         return
     draw = ImageDraw.Draw(img, "RGBA")
+    ox, oy = float(crop_origin[0]), float(crop_origin[1])
 
-    def sc(v):
-        return float(v) / max(1, k)
+    def sc(v, o=0.0):
+        return (float(v) - o) / max(1, k)
 
     for ann in anns:
         if not isinstance(ann, dict) or not _in_time_range(t_sec, ann):
@@ -236,29 +261,73 @@ def _draw_annotations(img, anns, t_sec: float, k: int):
             if kind == "text":
                 xy = ann.get("xy", [0, 0])
                 font = _load_font(int(ann.get("size", 16)))
-                _text_with_shadow(draw, (sc(xy[0]), sc(xy[1])),
+                _text_with_shadow(draw, (sc(xy[0], ox), sc(xy[1], oy)),
                                   str(ann.get("text", "")), font,
                                   color, (0, 0, 0, 220))
             elif kind == "circle":
                 xy = ann.get("xy", [0, 0])
                 r = sc(ann.get("radius", 10))
-                cx, cy = sc(xy[0]), sc(xy[1])
+                cx, cy = sc(xy[0], ox), sc(xy[1], oy)
                 draw.ellipse([cx - r, cy - r, cx + r, cy + r],
                              outline=color, width=max(1, int(sc(ann.get("width", 3)))))
             elif kind == "rect":
                 xy = ann.get("xy", [0, 0])
                 wh = ann.get("wh", [10, 10])
-                x0, y0 = sc(xy[0]), sc(xy[1])
+                x0, y0 = sc(xy[0], ox), sc(xy[1], oy)
                 draw.rectangle([x0, y0, x0 + sc(wh[0]), y0 + sc(wh[1])],
                                outline=color, width=max(1, int(sc(ann.get("width", 3)))))
             elif kind == "arrow":
                 xy = ann.get("xy", [0, 0])         # tail
                 xy2 = ann.get("xy2", [10, 10])     # head
-                _draw_arrow(draw, (sc(xy[0]), sc(xy[1])),
-                            (sc(xy2[0]), sc(xy2[1])), color,
+                _draw_arrow(draw, (sc(xy[0], ox), sc(xy[1], oy)),
+                            (sc(xy2[0], ox), sc(xy2[1], oy)), color,
                             max(1, int(sc(ann.get("width", 3)))))
         except Exception as e:
             log.debug("annotation %r draw failed: %s", kind, e)
+
+
+def _draw_text_overlays(img, overlays, values_at_t, t_sec: float, k: int,
+                        crop_origin=(0, 0)):
+    """Draw each 1-D-signal-as-text overlay: a live value formatted as text (e.g.
+    ``"T = 812.3 °C"``). *overlays* is the list of overlay dicts; *values_at_t* is
+    a parallel list of the current numeric value for each (already resampled onto
+    the movie time base and indexed at this frame) — ``None`` for an overlay with
+    no resolved signal, which then paints its label + a dash. Coordinates are in
+    ORIGINAL (uncropped) source pixels; subtract the crop origin then divide by the
+    downsample factor *k*."""
+    from PIL import ImageDraw
+    if not overlays:
+        return
+    draw = ImageDraw.Draw(img, "RGBA")
+    ox, oy = float(crop_origin[0]), float(crop_origin[1])
+
+    def sc(v, o=0.0):
+        return (float(v) - o) / max(1, k)
+
+    for ov, val in zip(overlays, values_at_t):
+        if not isinstance(ov, dict) or not _in_time_range(t_sec, ov):
+            continue
+        try:
+            xy = ov.get("xy", [8, 8])
+            font = _load_font(int(ov.get("size", 18)))
+            color = _color(ov.get("color", "#ffffff"))
+            label = str(ov.get("label", "") or "")
+            units = str(ov.get("units", "") or "")
+            fmt = str(ov.get("fmt", "") or "")
+            if val is None:
+                text = f"{label} = —" if label else "—"
+            elif fmt:
+                # A user format string; fall back to a plain render if it's malformed.
+                try:
+                    text = fmt.format(label=label, value=float(val), units=units)
+                except (KeyError, IndexError, ValueError):
+                    text = f"{label} = {float(val):.2f} {units}".strip()
+            else:
+                text = f"{label} = {float(val):.2f} {units}".strip()
+            _text_with_shadow(draw, (sc(xy[0], ox), sc(xy[1], oy)), text, font,
+                              color, (0, 0, 0, 220))
+        except Exception as e:
+            log.debug("text overlay draw failed: %s", e)
 
 
 def _draw_arrow(draw, tail, head, color, width):
@@ -387,18 +456,281 @@ def frame_indices(n_frames: int, t_start: int, t_end: int, stride: int):
     return list(range(t0, t1 + 1, step))
 
 
+def frame_indices_with_freezes(n_frames: int, t_start: int, t_end: int,
+                               stride: int, freezes, fps: float):
+    """The render sequence WITH freeze holds expanded in.
+
+    Starts from :func:`frame_indices`, then for every ``freeze`` ``{t, hold_s}``
+    whose ``t`` lands ON a rendered index, that index is REPEATED
+    ``round(hold_s * fps)`` extra times (a hold — the frame lingers on screen for
+    ``hold_s`` seconds at the export fps). A freeze on a ``t`` not in the sequence
+    (outside the range / skipped by stride) is ignored. Order is preserved: the
+    repeats are inserted immediately after the frame's first occurrence.
+
+    Returns a plain list of source indices (with duplicates for the holds) — the
+    export loop renders each in turn, so a frozen frame is simply re-encoded, and
+    the time base still advances by the frame's OWN time (a freeze shows the same
+    picture while the timestamp holds)."""
+    base = frame_indices(n_frames, t_start, t_end, stride)
+    if not freezes:
+        return base
+    # Map source index -> extra repeat count from the freezes.
+    extra: dict[int, int] = {}
+    for fz in freezes:
+        try:
+            t = int(fz.get("t"))
+            hold_s = float(fz.get("hold_s", 0.0) or 0.0)
+        except (TypeError, ValueError, AttributeError):
+            continue
+        reps = int(round(hold_s * float(fps)))
+        if reps > 0:
+            extra[t] = extra.get(t, 0) + reps
+    if not extra:
+        return base
+    out: list[int] = []
+    for t in base:
+        out.append(t)
+        for _ in range(extra.get(t, 0)):
+            out.append(t)
+    return out
+
+
+def frame_indices_with_speed(n_frames: int, t_start: int, t_end: int, stride: int,
+                             speed_segments, fps: float, scale_s: float,
+                             freezes=None):
+    """The render sequence resampled through VARIABLE-SPEED segments.
+
+    ``speed_segments`` is a list of ``{"time_range":[s0,s1] (seconds), "speed":m}``.
+    Source time inside a segment advances at ``m×`` (0 = hold, <1 slow-mo → more
+    output frames, >1 fast-forward → fewer). Outside any segment the speed is 1×.
+
+    The output is one source index per OUTPUT frame (fixed 1/fps output steps): a
+    source-time cursor walks ``t_start..t_end`` at the local speed; each output step
+    emits the nearest source index. A very slow / hold segment repeats indices; a
+    fast one skips them. Falls back to :func:`frame_indices_with_freezes` when there
+    are no speed segments (so legacy freezes still work)."""
+    if not speed_segments:
+        return frame_indices_with_freezes(n_frames, t_start, t_end, stride,
+                                          freezes or [], fps)
+    t0 = max(0, int(t_start))
+    t1 = min(int(n_frames) - 1, int(t_end))
+    if t1 < t0:
+        return []
+    sc = float(scale_s) if scale_s and scale_s > 0 else 1.0
+    out_dt = 1.0 / max(1.0, float(fps))          # output seconds per frame
+
+    def speed_at(src_frame: float) -> float:
+        t_sec = src_frame * sc
+        for seg in speed_segments:
+            try:
+                tr = seg.get("time_range")
+                if tr and float(tr[0]) <= t_sec <= float(tr[1]):
+                    return max(0.0, float(seg.get("speed", 1.0)))
+            except (TypeError, ValueError, AttributeError):
+                continue
+        return 1.0
+
+    out: list[int] = []
+    cur = float(t0)
+    # A hard cap so a 0×/tiny-speed segment spanning the whole movie can't loop
+    # forever — 10 minutes of output at this fps.
+    cap = int(600 * fps)
+    while cur <= t1 + 0.5 and len(out) < cap:
+        out.append(int(round(min(cur, t1))))
+        m = speed_at(cur)
+        # advance the source cursor by (speed * out_dt) SECONDS → frames.
+        adv = (m * out_dt) / sc
+        # A 0× (hold) segment still needs to eventually escape: nudge by a tiny
+        # epsilon so a hold at the very end doesn't wedge (it emits the same frame
+        # repeatedly while inside the segment's time window, which is the point).
+        if adv <= 0:
+            # Peek: if we're inside a hold segment, emit holds for its DURATION.
+            held = _hold_frames(speed_segments, cur * sc, out_dt, fps)
+            for _ in range(max(0, held - 1)):
+                if len(out) >= cap:
+                    break
+                out.append(int(round(min(cur, t1))))
+            # Then step past the segment end.
+            cur = _segment_end_frame(speed_segments, cur * sc, sc, t1) + (stride or 1)
+        else:
+            cur += adv
+    return out
+
+
+def _hold_frames(segments, t_sec, out_dt, fps) -> int:
+    """How many output frames a 0× hold at *t_sec* should last (its duration × fps)."""
+    for seg in segments:
+        try:
+            tr = seg.get("time_range")
+            if tr and float(seg.get("speed", 1)) == 0 and float(tr[0]) <= t_sec <= float(tr[1]):
+                return max(1, int(round((float(tr[1]) - float(tr[0])) * fps)))
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return 1
+
+
+def _segment_end_frame(segments, t_sec, sc, t1) -> float:
+    """The source frame index at the end of the hold segment containing *t_sec*."""
+    for seg in segments:
+        try:
+            tr = seg.get("time_range")
+            if tr and float(tr[0]) <= t_sec <= float(tr[1]):
+                return min(t1, float(tr[1]) / sc)
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return t_sec / sc
+
+
+def _base_frame(raw, t: int, crop, k: int) -> np.ndarray:
+    """Read source frame *t*, apply the CROP (source px, before downsample), then
+    the spatial downsample. Memory-safe: one :func:`read_frame` slice."""
+    return downsample(apply_crop(read_frame(raw, t), crop), k)
+
+
+def _resolve_clim(first: np.ndarray, clim):
+    """The ``(lo, hi)`` contrast window: an explicit ``clim`` [lo, hi] when set,
+    else a robust 2–98% auto-window from the FIRST rendered frame."""
+    if clim and len(clim) == 2 and clim[0] is not None and clim[1] is not None:
+        return float(clim[0]), float(clim[1])
+    finite = first[np.isfinite(first)]
+    if finite.size:
+        lo, hi = (float(np.percentile(finite, 2)),
+                  float(np.percentile(finite, 98)))
+    else:
+        lo, hi = 0.0, 1.0
+    if hi <= lo:
+        hi = lo + 1.0
+    return lo, hi
+
+
+def _compose_frame(frame, lut, lo, hi, out_h, out_w, *, t_sec, k,
+                   anns, text_overlays, text_values, timestamp, scalebar,
+                   sb_scale, sig_units, ts_font, sb_font, inset=None, inset_i=0,
+                   overlay=None, raw_over=None, src_t=0, crop_origin=(0, 0)):
+    """LUT + fit + the whole overlay stack for ONE already-read (cropped +
+    downsampled) *frame* → a PIL RGB image. Shared by :func:`export_movie` and the
+    single-frame preview so the editor preview is byte-for-byte what exports.
+
+    ``crop_origin`` (the crop's ``(x0, y0)`` in source px, ``(0,0)`` when uncropped)
+    shifts the annotation / text-overlay coordinates so they land correctly on a
+    cropped frame. A 2nd-image *overlay* (with its lazy array *raw_over*) is
+    alpha/screen-composited onto the base BEFORE the drawn overlays (so
+    annotations/timestamp sit on top)."""
+    rgb = even_crop(apply_lut(frame, lut, lo, hi))
+    # Fit every frame to the writer's fixed (out_h, out_w): a LARGER frame is
+    # cropped, a SMALLER (ragged / shrunk) one is letterbox-PADDED with zeros.
+    if rgb.shape[:2] != (out_h, out_w):
+        rgb = _fit_frame(rgb, out_h, out_w)
+    if overlay is not None and raw_over is not None:
+        rgb = _composite_overlay(rgb, overlay, raw_over, src_t, k, t_sec, out_h, out_w)
+    img = _pil_rgb(rgb)
+    _draw_annotations(img, anns, t_sec, k, crop_origin)
+    if text_overlays:
+        _draw_text_overlays(img, text_overlays, text_values, t_sec, k, crop_origin)
+    if timestamp:
+        _draw_timestamp(img, t_sec, ts_font)
+    if scalebar:
+        _draw_scalebar(img, sb_scale, sig_units, sb_font)
+    if inset is not None:
+        _paste_inset(img, inset, inset_i)
+    return img
+
+
+def render_single_frame(raw, t: int, *, params: dict, n_frames: int,
+                        scale_s: float, sig_scale_x: float, sig_units: str,
+                        text_overlays=None, text_values=None, overlay=None):
+    """Render ONE composed frame at source index *t* → a PIL RGB image. The
+    editor's live preview path — MEMORY-SAFE (a single :func:`read_frame` slice),
+    no writer, no full sequence. Uses the SAME LUT + overlay stack as the export so
+    the preview matches. Auto-contrast (when ``clim`` is unset) is computed from
+    THIS frame."""
+    p = params
+    k = int(p.get("downsample", 1) or 1)
+    crop = p.get("crop")
+    cmap = str(p.get("cmap", "gray") or "gray")
+    timestamp = bool(p.get("timestamp", True))
+    scalebar = bool(p.get("scalebar", True)) and sig_scale_x > 0
+    anns = p.get("annotations") or []
+    lut = build_lut(cmap)
+    frame = _base_frame(raw, int(t), crop, k)
+    lo, hi = _resolve_clim(frame, p.get("clim"))
+    rgb0 = even_crop(apply_lut(frame, lut, lo, hi))
+    out_h, out_w = rgb0.shape[:2]
+    sb_scale = sig_scale_x * k
+    ts_font = _load_font(max(12, out_h // 28))
+    sb_font = _load_font(max(11, out_h // 32))
+    t_sec = int(t) * scale_s
+    crop_origin = (int(crop[0]), int(crop[1])) if crop and len(crop) == 4 else (0, 0)
+    raw_over = overlay.get("raw") if overlay else None
+    return _compose_frame(
+        frame, lut, lo, hi, out_h, out_w, t_sec=t_sec, k=k,
+        anns=anns, text_overlays=(text_overlays or []),
+        text_values=(text_values or []), timestamp=timestamp, scalebar=scalebar,
+        sb_scale=sb_scale, sig_units=sig_units, ts_font=ts_font, sb_font=sb_font,
+        crop_origin=crop_origin, overlay=overlay, raw_over=raw_over, src_t=int(t))
+
+
+def _composite_overlay(base_rgb: np.ndarray, overlay, raw_over, t: int, k: int,
+                       t_sec: float, out_h: int, out_w: int) -> np.ndarray:
+    """Alpha/screen-composite a SECOND image over *base_rgb* (an (H,W,3) uint8).
+
+    *overlay* is the resolved 2nd-image spec ``{raw, alpha, cmap, clim, blend,
+    time_range, downsample}``; *raw_over* is its lazy/numpy array. A 3-D source is a
+    TIME STACK (read one frame at the current index); a 2-D source is a STATIC image
+    (same on every frame). Time-gated by ``time_range`` (seconds). Returns the
+    blended RGB. On any failure returns *base_rgb* unchanged (overlay is cosmetic)."""
+    try:
+        if overlay is None or raw_over is None:
+            return base_rgb
+        tr = overlay.get("time_range")
+        if tr and not (float(tr[0]) <= t_sec <= float(tr[1])):
+            return base_rgb
+        ov_k = int(overlay.get("downsample", k) or k)
+        # A 3-D overlay is a time stack → read the frame at the current index; a 2-D
+        # overlay is a static image → use it directly (memory-safe single slice).
+        if getattr(raw_over, "ndim", 2) >= 3:
+            ti = min(int(t), raw_over.shape[0] - 1)
+            over_frame = read_frame(raw_over, ti)
+        else:
+            over_frame = np.asarray(raw_over)
+        of = downsample(over_frame, ov_k)
+        olut = build_lut(str(overlay.get("cmap", "magma") or "magma"))
+        oclim = overlay.get("clim")
+        olo, ohi = _resolve_clim(of, oclim)
+        orgb = even_crop(apply_lut(of, olut, olo, ohi))
+        if orgb.shape[:2] != (out_h, out_w):
+            orgb = _fit_frame(orgb, out_h, out_w)
+        alpha = float(overlay.get("alpha", 0.5) or 0.5)
+        blend = str(overlay.get("blend", "over") or "over")
+        b = base_rgb.astype(np.float32)
+        o = orgb.astype(np.float32)
+        if blend == "screen":
+            mixed = 255.0 - (255.0 - b) * (255.0 - o) / 255.0
+            out = b * (1.0 - alpha) + mixed * alpha
+        else:  # "over" — straight alpha
+            out = b * (1.0 - alpha) + o * alpha
+        return np.clip(out, 0, 255).astype(np.uint8)
+    except Exception as e:
+        log.debug("overlay-image composite failed: %s", e)
+        return base_rgb
+
+
 def export_movie(raw, *, path: str, params: dict, n_frames: int,
                  scale_s: float, sig_scale_x: float, sig_units: str,
-                 traces=None, should_cancel=None, progress=None) -> int:
+                 traces=None, text_overlays=None, overlay=None,
+                 should_cancel=None, progress=None) -> int:
     """Render the movie to *path*. Returns the number of frames written.
 
     MEMORY-SAFE: reads one frame per iteration via :func:`read_frame` (a lazy
     slice ``raw[t].compute()`` / numpy slice) — the full dataset is NEVER
     materialised.
 
-    *should_cancel* is a 0-arg predicate polled per frame (returns True → stop and
-    raise :class:`_Cancelled`). *progress(done, total)* narrates. The caller owns
-    partial-file cleanup; on cancel we raise so the handler removes the file.
+    Applies the ``crop`` (source px) before downsample, expands freeze holds into
+    the render sequence, and draws the annotation / 1-D-signal-as-text / trace-inset
+    overlays. *should_cancel* is a 0-arg predicate polled per frame (returns True →
+    stop and raise :class:`_Cancelled`). *progress(done, total)* narrates. The
+    caller owns partial-file cleanup; on cancel we raise so the handler removes the
+    file.
     """
     from spyde.actions.movie_export.encoder import open_writer
 
@@ -407,12 +739,19 @@ def export_movie(raw, *, path: str, params: dict, n_frames: int,
     fps = float(p.get("fps", 10.0) or 10.0)
     cmap = str(p.get("cmap", "gray") or "gray")
     clim = p.get("clim")
+    crop = p.get("crop")
     timestamp = bool(p.get("timestamp", True))
     scalebar = bool(p.get("scalebar", True)) and sig_scale_x > 0
     anns = p.get("annotations") or []
+    text_overlays = list(text_overlays or [])
 
-    idxs = frame_indices(n_frames, p.get("t_start", 0),
-                         p.get("t_end", n_frames - 1), p.get("stride", 1))
+    # Variable-speed segments (slow / fast-forward / hold) resample source→output
+    # time; when absent this falls back to legacy freeze-holds. A hold segment (0×)
+    # subsumes the freeze.
+    idxs = frame_indices_with_speed(
+        n_frames, p.get("t_start", 0), p.get("t_end", n_frames - 1),
+        p.get("stride", 1), p.get("speed_segments") or [], fps, scale_s,
+        freezes=p.get("freezes") or [])
     total = len(idxs)
     if total == 0:
         raise ValueError("Movie export: empty frame range.")
@@ -428,35 +767,36 @@ def export_movie(raw, *, path: str, params: dict, n_frames: int,
         raise _Cancelled()
 
     # Auto contrast from the FIRST rendered frame when clim is unset (robust 2-98%).
-    first = downsample(read_frame(raw, idxs[0]), k)
+    first = _base_frame(raw, idxs[0], crop, k)
 
     # Cancel immediately AFTER the probe read too (a cancel that arrived while the
     # read was in flight stops us before we open the writer / encode any frame).
     if should_cancel is not None and should_cancel():
         raise _Cancelled()
 
-    if clim and len(clim) == 2 and clim[0] is not None and clim[1] is not None:
-        lo, hi = float(clim[0]), float(clim[1])
-    else:
-        finite = first[np.isfinite(first)]
-        if finite.size:
-            lo, hi = (float(np.percentile(finite, 2)),
-                      float(np.percentile(finite, 98)))
-        else:
-            lo, hi = 0.0, 1.0
-        if hi <= lo:
-            hi = lo + 1.0
+    lo, hi = _resolve_clim(first, clim)
 
-    # Even-crop the first frame to fix the output size; scale bar / downsample
+    # Even-crop the first frame to fix the COMPOSE size; scale bar / downsample
     # factor drive annotation coordinate scaling.
     rgb0 = even_crop(apply_lut(first, lut, lo, hi))
     out_h, out_w = rgb0.shape[:2]
+
+    # Optional final OUTPUT size (spec.out_size [w, h]) — the composed frame is
+    # resized to it (even-dimensioned for H.264) as the very last step. None → the
+    # frame's own (crop + downsample) size is the output.
+    os_spec = p.get("out_size")
+    final_wh = None
+    if os_spec and len(os_spec) == 2 and os_spec[0] and os_spec[1]:
+        fw2, fh2 = int(os_spec[0]) - (int(os_spec[0]) % 2), int(os_spec[1]) - (int(os_spec[1]) % 2)
+        if fw2 >= 2 and fh2 >= 2 and (fw2, fh2) != (out_w, out_h):
+            final_wh = (fw2, fh2)
 
     # The physical x-scale on the DOWNSAMPLED frame (each output px spans k input px).
     sb_scale = sig_scale_x * k
 
     # Movie time base (seconds) for each rendered frame — annotation gating +
-    # trace resampling both use this.
+    # trace/text resampling all use this. (A freeze repeats an index, so the same
+    # t_sec appears consecutively — the timestamp holds, correct for a freeze.)
     times = np.array([i * scale_s for i in idxs], dtype=float)
 
     inset = None
@@ -464,34 +804,35 @@ def export_movie(raw, *, path: str, params: dict, n_frames: int,
         inset_w = max(120, int(out_w * _INSET_W_FRAC))
         inset = render_trace_inset(traces, times, inset_w, sig_units or "s")
 
+    # Resample each 1-D-signal-as-text overlay onto the movie time base ONCE.
+    text_resampled = _resample_text_overlays(text_overlays, times, src_indices=idxs)
+
     ts_font = _load_font(max(12, out_h // 28))
     sb_font = _load_font(max(11, out_h // 32))
 
-    writer = open_writer(path, fps, (out_w, out_h))
+    raw_over = overlay.get("raw") if overlay else None
+    crop_origin = (int(crop[0]), int(crop[1])) if crop and len(crop) == 4 else (0, 0)
+
+    writer_wh = final_wh if final_wh is not None else (out_w, out_h)
+    writer = open_writer(path, fps, writer_wh)
     written = 0
     try:
         for fi, t in enumerate(idxs):
             if should_cancel is not None and should_cancel():
                 raise _Cancelled()
-            frame = first if fi == 0 else downsample(read_frame(raw, t), k)
-            rgb = even_crop(apply_lut(frame, lut, lo, hi))
-            # Fit every frame to the writer's fixed (out_h, out_w): a LARGER frame is
-            # cropped, a SMALLER one (a ragged frame that shrank after downsample /
-            # even-crop) is letterbox-PADDED with zeros — the shrink-only slice
-            # couldn't pad, so a smaller frame reached the writer with a mismatched
-            # shape and raised (finding: ragged-frame writer mismatch).
-            if rgb.shape[:2] != (out_h, out_w):
-                rgb = _fit_frame(rgb, out_h, out_w)
-            img = _pil_rgb(rgb)
-
-            _draw_annotations(img, anns, times[fi], k)
-            if timestamp:
-                _draw_timestamp(img, times[fi], ts_font)
-            if scalebar:
-                _draw_scalebar(img, sb_scale, sig_units, sb_font)
-            if inset is not None:
-                _paste_inset(img, inset, fi)
-
+            frame = first if fi == 0 else _base_frame(raw, t, crop, k)
+            text_values = [(r[fi] if r is not None else None) for r in text_resampled]
+            img = _compose_frame(
+                frame, lut, lo, hi, out_h, out_w, t_sec=times[fi], k=k,
+                anns=anns, text_overlays=text_overlays, text_values=text_values,
+                timestamp=timestamp, scalebar=scalebar, sb_scale=sb_scale,
+                sig_units=sig_units, ts_font=ts_font, sb_font=sb_font,
+                inset=inset, inset_i=fi,
+                overlay=overlay, raw_over=raw_over, src_t=t,
+                crop_origin=crop_origin)
+            if final_wh is not None:
+                from PIL import Image as _Image
+                img = img.resize(final_wh, _Image.LANCZOS)
             writer.append(np.asarray(img.convert("RGB")))
             written += 1
             if progress is not None:
@@ -499,6 +840,43 @@ def export_movie(raw, *, path: str, params: dict, n_frames: int,
         return written
     finally:
         writer.close()
+
+
+def _resample_text_overlays(text_overlays, times, src_indices=None):
+    """For each 1-D-signal-as-text overlay carrying a captured trace (``_trace`` —
+    a :class:`TraceSpec`), produce its per-rendered-frame values. When the trace
+    has ONE point per source frame (a per-frame column, e.g. a temperature log) and
+    ``src_indices`` (the source frame index per rendered frame) is given, read it by
+    FRAME INDEX (index-aligned); otherwise resample by physical time on *times*. An
+    overlay with no trace yields ``None`` (paints label + dash). Returns a list
+    parallel to *text_overlays*."""
+    out = []
+    n_src = None
+    if src_indices is not None:
+        idx = np.asarray(src_indices, dtype=int)
+    for ov in text_overlays:
+        tr = ov.get("_trace") if isinstance(ov, dict) else None
+        if tr is not None and hasattr(tr, "resample"):
+            try:
+                y = np.asarray(getattr(tr, "y", None))
+                if (src_indices is not None and y is not None
+                        and y.size and int(y.size) == int(_src_span(src_indices))):
+                    # Per-source-frame column → index-align to the rendered frames.
+                    out.append(y[np.clip(idx, 0, y.size - 1)].astype(float))
+                    continue
+                out.append(np.asarray(tr.resample(times), dtype=float))
+                continue
+            except Exception as e:
+                log.debug("text-overlay resample failed: %s", e)
+        out.append(None)
+    return out
+
+
+def _src_span(src_indices) -> int:
+    """The number of DISTINCT source frames a per-frame column would have (max
+    index + 1) — used to decide whether a trace is index-aligned to the movie."""
+    a = np.asarray(src_indices, dtype=int)
+    return int(a.max()) + 1 if a.size else 0
 
 
 class _Cancelled(Exception):

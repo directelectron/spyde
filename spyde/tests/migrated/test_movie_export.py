@@ -1,19 +1,20 @@
 """
-test_movie_export.py — Movie Export (Phase 4) backend tests.
+test_movie_export.py — the movie RENDER ENGINE (pipeline/encoder/traces) tests.
 
-Two layers:
+A small synthetic LAZY in-situ movie built in-file (12 × 64×64 uint16 dask, 1
+frame/chunk, distinct per-frame content, calibrated 0.1 s/frame time axis) is
+encoded to mp4 / GIF and read back. Covers: frame count vs stride + time range,
+downsample halving (even-cropped) dimensions, LUT non-blank + differing frames,
+time-gated annotations, trace-inset pixels, cancellation leaving NO partial file,
+ffmpeg-missing error, ragged/letterbox frames, and the
+``patch.object(da.Array.compute)`` guard asserting the FULL dataset shape is
+never computed.
 
-* **Pipeline** (``spyde.actions.movie_export.pipeline`` / ``encoder`` / ``traces``):
-  a small synthetic LAZY in-situ movie built in-file (12 × 64×64 uint16 dask, 1
-  frame/chunk, distinct per-frame content, calibrated 0.1 s/frame time axis) is
-  encoded to mp4 / GIF and read back. Covers: frame count vs stride + time range,
-  downsample halving (even-cropped) dimensions, LUT non-blank + differing frames,
-  time-gated annotations, trace-inset pixels, cancellation leaving NO partial
-  file, ffmpeg-missing error, and the ``patch.object(da.Array.compute)`` guard
-  asserting the FULL dataset shape is never computed.
-
-* **Handlers** (``spyde.actions.movie_export.handlers``): mvx_open gate + state
-  shape, add/remove trace, run→mvx_done, all against a real Session.
+The per-plot ``mvx_*`` caret wizard that used to sit on top of this engine was
+removed (the MOVIE BLOCK — ``spyde.actions.report.movie``, exercised by
+``test_movie_block.py`` — replaced it). The ffmpeg-probe / partial-file-cleanup
+helpers the pipeline tests reference now live on the movie block (imported as
+``h`` below).
 """
 from __future__ import annotations
 
@@ -28,7 +29,9 @@ import imageio
 
 from spyde.actions.movie_export import pipeline as pl
 from spyde.actions.movie_export import traces as tr
-from spyde.actions.movie_export import handlers as h
+# The mvx caret wizard was removed; the movie BLOCK (report.movie) is now the
+# owner of the ffmpeg probe + partial-file cleanup the pipeline tests reference.
+from spyde.actions.report import movie as h
 
 
 # ── synthetic lazy in-situ movie (mirrors load_test_data_movie's construction) ──
@@ -348,163 +351,3 @@ class TestMemorySafety:
         # matches the numpy ground truth for that frame
         assert np.array_equal(f, _movie_frames()[5])
 
-
-# ── handlers ─────────────────────────────────────────────────────────────────────
-
-def _insitu_plot(session):
-    for p in session._plots:
-        tree = getattr(p, "signal_tree", None)
-        root = getattr(tree, "root", None)
-        if root is not None and getattr(root, "_signal_type", None) == "insitu" \
-                and not getattr(p, "is_navigator", False):
-            return p
-    return None
-
-
-class TestHandlers:
-    def test_open_refuses_non_insitu(self, stem_4d_dataset):
-        session, messages = stem_4d_dataset["window"], stem_4d_dataset["messages"]
-        plot = next(p for p in session._plots if not p.is_navigator)
-        h.mvx_open(session, plot, {"window_id": plot.window_id})
-        errs = [m for m in messages if m.get("type") == "error"]
-        assert any("in-situ" in str(m.get("text", "")).lower() for m in errs)
-        assert getattr(plot.signal_tree, "_mvx_state", None) is None
-
-    def test_open_emits_state_shape(self, movie_dataset):
-        session, messages = movie_dataset["window"], movie_dataset["messages"]
-        plot = _insitu_plot(session)
-        assert plot is not None
-        h.mvx_open(session, plot, {"window_id": plot.window_id})
-        states = [m for m in messages if m.get("type") == "mvx_state"]
-        assert states, "no mvx_state emitted"
-        st = states[-1]
-        # exact contract keys
-        for k in ("window_id", "ffmpeg_ok", "running", "n_frames", "time",
-                  "params", "traces"):
-            assert k in st, f"mvx_state missing {k!r}"
-        assert set(st["time"]) == {"scale_s", "units"}
-        for k in ("fps", "downsample", "stride", "t_start", "t_end", "cmap",
-                  "clim", "timestamp", "scalebar", "annotations"):
-            assert k in st["params"], f"params missing {k!r}"
-        assert st["running"] is False
-        assert st["n_frames"] == 8                      # movie_dataset has 8 frames
-        assert st["time"]["scale_s"] == pytest.approx(0.1)
-        assert st["params"]["t_end"] == 7
-
-    def test_tune_updates_params(self, movie_dataset):
-        session = movie_dataset["window"]
-        plot = _insitu_plot(session)
-        h.mvx_open(session, plot, {"window_id": plot.window_id})
-        h.mvx_tune(session, plot, {"window_id": plot.window_id,
-                                   "fps": 24, "downsample": 2, "stride": 2,
-                                   "cmap": "magma", "timestamp": False})
-        st = plot.signal_tree._mvx_state
-        assert st.params["fps"] == 24 and st.params["downsample"] == 2
-        assert st.params["stride"] == 2 and st.params["cmap"] == "magma"
-        assert st.params["timestamp"] is False
-
-    def test_add_and_remove_trace(self, movie_dataset):
-        session, messages = movie_dataset["window"], movie_dataset["messages"]
-        plot = _insitu_plot(session)
-        h.mvx_open(session, plot, {"window_id": plot.window_id})
-        # Build a 1-D plot to add as a trace: a line-profile-style signal window.
-        line = hs.signals.Signal1D(np.sin(np.linspace(0, 6, 40)).astype(np.float32))
-        session._add_signal(line, source_path=None)
-        line_plot = next(p for p in session._plots
-                         if getattr(p, "current_data", None) is not None
-                         and np.asarray(p.current_data).ndim == 1)
-        h.mvx_add_trace(session, plot, {"window_id": plot.window_id,
-                                        "source_window_id": line_plot.window_id})
-        st = plot.signal_tree._mvx_state
-        assert len(st.traces) == 1
-        tid = st.traces[0].id
-        state_msg = [m for m in messages if m.get("type") == "mvx_state"][-1]
-        assert state_msg["traces"][0]["id"] == tid
-        h.mvx_remove_trace(session, plot, {"window_id": plot.window_id,
-                                           "trace_id": tid})
-        assert len(plot.signal_tree._mvx_state.traces) == 0
-
-    def test_run_emits_mvx_done(self, movie_dataset, tmp_path):
-        import time
-        session, messages = movie_dataset["window"], movie_dataset["messages"]
-        plot = _insitu_plot(session)
-        h.mvx_open(session, plot, {"window_id": plot.window_id})
-        if not h._ffmpeg_ok():
-            pytest.skip("ffmpeg not available")
-        path = str(tmp_path / "handler.mp4")
-        # run_on_worker spawns a daemon thread (the session has _dispatch_to_main
-        # but no running loop → the marshalled _done runs inline on that thread);
-        # poll for the mvx_done emission.
-        h.mvx_run(session, plot, {"window_id": plot.window_id, "path": path})
-        done = []
-        for _ in range(200):
-            done = [m for m in messages if m.get("type") == "mvx_done"]
-            if done:
-                break
-            time.sleep(0.05)
-        assert done, "no mvx_done emitted"
-        assert done[-1]["path"] == path
-        assert done[-1]["frames"] == 8
-        assert os.path.exists(path)
-
-    def test_run_refuses_without_path(self, movie_dataset):
-        session, messages = movie_dataset["window"], movie_dataset["messages"]
-        plot = _insitu_plot(session)
-        h.mvx_open(session, plot, {"window_id": plot.window_id})
-        h.mvx_run(session, plot, {"window_id": plot.window_id})
-        assert any(m.get("type") == "error" for m in messages)
-
-    def test_close_clears_state(self, movie_dataset):
-        session = movie_dataset["window"]
-        plot = _insitu_plot(session)
-        h.mvx_open(session, plot, {"window_id": plot.window_id})
-        assert plot.signal_tree._mvx_state is not None
-        h.mvx_close(session, plot, {"window_id": plot.window_id})
-        assert plot.signal_tree._mvx_state is None
-
-    def test_error_marshals_state_reset_to_main_loop(self, movie_dataset, tmp_path,
-                                                     monkeypatch):
-        """Finding #4: on an export FAILURE the worker-thread _on_error must marshal
-        the state mutation (running=False, _cancel_flag=None, unregister, emit) back
-        to the main loop via session._dispatch_to_main — not mutate it on the worker
-        thread. Assert the marshal is used AND the state is fully reset + an error
-        emitted."""
-        import time
-        session, messages = movie_dataset["window"], movie_dataset["messages"]
-        plot = _insitu_plot(session)
-        h.mvx_open(session, plot, {"window_id": plot.window_id})
-
-        # Record every fn marshalled to the main loop; run it inline (no loop in tests
-        # → mirrors _dispatch_to_main's own inline fallback).
-        marshalled = []
-        real_dispatch = session._dispatch_to_main
-
-        def _recording_dispatch(fn):
-            marshalled.append(fn)
-            return real_dispatch(fn)
-
-        monkeypatch.setattr(session, "_dispatch_to_main", _recording_dispatch)
-
-        # Force the pipeline to blow up so _on_error fires.
-        import spyde.actions.movie_export.pipeline as plmod
-        monkeypatch.setattr(
-            plmod, "export_movie",
-            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
-
-        path = str(tmp_path / "fail.mp4")
-        st = plot.signal_tree._mvx_state
-        h.mvx_run(session, plot, {"window_id": plot.window_id, "path": path})
-
-        for _ in range(200):
-            if not st.running and any(m.get("type") == "error" for m in messages):
-                break
-            time.sleep(0.02)
-
-        # The error path marshalled at least one callback to the main loop.
-        assert marshalled, "_on_error did not marshal state reset to the main loop"
-        # State fully reset (on the main loop), error emitted, no partial file.
-        assert st.running is False
-        assert st._cancel_flag is None
-        assert any(m.get("type") == "error"
-                   and "failed" in str(m.get("text", "")).lower() for m in messages)
-        assert not os.path.exists(path)

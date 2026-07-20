@@ -25,6 +25,7 @@ import { ReportCell } from './ReportCell'
 import { ReportFigureCell } from './ReportFigureCell'
 import { ReportImageCell } from './ReportImageCell'
 import { ReportSplitCell } from './ReportSplitCell'
+import { ReportMovieCell } from './ReportMovieCell'
 import { SlideNotesEditor } from './SlideNotesEditor'
 import { GUIDES } from '@guides/index'
 import type { ReportCell as ReportCellType } from '../kernel/protocol'
@@ -160,7 +161,7 @@ export function ReportSidebar() {
   const [titleDraft, setTitleDraft] = useState('')
   // Which pending New (report | presentation) the dirty-confirm bar is guarding
   // (null → not confirming). New over a dirty document routes through it.
-  const [confirmNew, setConfirmNew] = useState<'report' | 'presentation' | null>(null)
+  const [confirmNew, setConfirmNew] = useState<'report' | 'presentation' | 'movie' | null>(null)
   // The compact "File ▾" menu open state, and its nested Export / New-from-guide
   // submenu flags (only one submenu open at a time).
   const [menuOpen, setMenuOpen] = useState(false)
@@ -253,15 +254,30 @@ export function ReportSidebar() {
   // ── Header actions ────────────────────────────────────────────────────────
   // New = a TYPE choice (report | presentation). Over a dirty document it routes
   // through the confirm bar, remembering WHICH type was requested.
-  const doNew = (type: 'report' | 'presentation') => {
+  const doNew = (type: 'report' | 'presentation' | 'movie') => {
     setMenuOpen(false)
     if (report?.dirty) { setConfirmNew(type); return }
-    sendAction('report_new', { type })
+    startNew(type)
   }
   const confirmNewNow = () => {
     const type = confirmNew ?? 'report'
     setConfirmNew(null)
-    sendAction('report_new', { type })
+    startNew(type)
+  }
+  // The Movie card spins up a normal report doc and adds ONE placeholder movie
+  // cell, opened straight into the full-screen editor (open:true → the backend
+  // emits movie_edit_open, which MovieGate turns into the editor). Report /
+  // Presentation are the existing plain report_new.
+  const startNew = (type: 'report' | 'presentation' | 'movie') => {
+    if (type === 'movie') {
+      sendAction('report_new', { type: 'report' })
+      // Seed from the active window when it's an in-situ movie (from_active), else
+      // the cell opens as a "pick a signal" placeholder. open:true jumps straight
+      // into the full-screen editor.
+      sendAction('report_add_movie_cell', { open: true, from_active: true })
+    } else {
+      sendAction('report_new', { type })
+    }
   }
 
   const doOpen = async () => {
@@ -824,6 +840,13 @@ export function ReportSidebar() {
               desc="A slide deck — present live figures full-screen."
               onClick={() => doNew('presentation')}
             />
+            <NewDocCard
+              testid="report-new-movie-card"
+              icon={<MovieGlyph />}
+              title="Movie"
+              desc="Edit an in-situ movie — crop, annotate, overlay, export."
+              onClick={() => doNew('movie')}
+            />
           </div>
 
           {/* Seed a presentation from a built-in guide (one slide per step). */}
@@ -888,6 +911,15 @@ export function ReportSidebar() {
             onRemove={() => sendAction('report_remove_cell', { cell_id: cell.id })}
             dragProps={makeDragProps(cell.id, i)}
             reorderActive={dragCell != null}
+          />
+        : cell.cell_type === 'movie'
+        ? <ReportMovieCell
+            cell={cell}
+            index={i}
+            onRemove={() => sendAction('report_remove_cell', { cell_id: cell.id })}
+            onEdit={() => window.dispatchEvent(new CustomEvent('spyde:movie_edit', { detail: { cell_id: cell.id } }))}
+            onSetSource={(wid) => sendAction('report_set_movie_source', { cell_id: cell.id, source_window_id: wid })}
+            dragProps={makeDragProps(cell.id, i)}
           />
         : <ReportCell
             cell={cell}
@@ -1275,6 +1307,16 @@ function PresentationGlyph() {
       <rect x="3" y="4" width="18" height="12" rx="1.5" />
       <path d="M12 16v3M9 21h6" />
       <path d="M10.5 8.5l3.5 2-3.5 2z" fill="currentColor" stroke="none" />
+    </svg>
+  )
+}
+// A film strip with a play triangle — a movie.
+function MovieGlyph() {
+  return (
+    <svg {...cardSvg} aria-hidden>
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <path d="M3 8h18M3 16h18M8 4v16M16 4v16" />
+      <path d="M11 10.5l3 1.5-3 1.5z" fill="currentColor" stroke="none" />
     </svg>
   )
 }

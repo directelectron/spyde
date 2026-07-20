@@ -121,6 +121,13 @@ _IMAGE_LINE_RE = re.compile(
 # A template placeholder comment: ``<!-- spyde:placeholder <id> [caption] -->``.
 _PLACEHOLDER_RE = re.compile(
     r"^<!--\s*spyde:placeholder\s+(?P<cid>\S+)(?:\s+(?P<caption>.*?))?\s*-->\s*$")
+# A movie-cell marker: ``<!-- spyde:movie <id> -->`` — an invisible comment BEFORE
+# a standalone poster image ref (``assets/<id>.png``). The marker CREATES the movie
+# cell; ONLY an immediately-following ``.png`` ref whose id MATCHES fills its poster
+# (mirrors the split marker). A movie marker with no matching poster is a
+# placeholder movie (no source assigned yet). The ``movies/<id>.yaml`` sibling
+# (attached by read_report) supplies the MovieSpec.
+_MOVIE_RE = re.compile(r"^<!--\s*spyde:movie\s+(?P<cid>\S+)\s*-->\s*$")
 # A slide-break marker (Present mode): ``<!-- spyde:slide-break -->`` — an
 # invisible comment BEFORE the cell that starts a new slide.
 _SLIDE_BREAK_RE = re.compile(r"^<!--\s*spyde:slide-break\s*-->\s*$")
@@ -637,13 +644,102 @@ class FigureSpec:
 
 
 @dataclass
+class MovieSpec:
+    """The recipe for a MOVIE cell — an editable, persistent in-situ movie block.
+
+    A movie cell references a live in-situ signal (``source``, a
+    :class:`SignalRef` rebound on report open exactly like a figure layer) and
+    carries the render/edit state the full-screen Movie editor mutates: the base
+    render ``params`` (fps / spatial downsample / temporal stride / cmap / clim /
+    timestamp / scalebar / time range), a list of time-gated ``annotations``
+    (text / rect / circle / arrow — ROIs are just persistent rect/circle
+    annotations, so there is NO separate rois list; the pipeline's
+    ``_draw_annotations`` is the single draw path), ``text_overlays`` (a 1-D
+    signal's live value painted as text, e.g. ``"T = 812.3 °C"``), ``freezes``
+    (hold on a frame for a duration), an optional ``overlay_image`` (a 2nd image
+    composited over the base — Phase 3), a ``crop`` rect (source signal px), and
+    an ``out_size`` (final output px).
+
+    Serialized to ``movies/<id>.yaml`` in the ``.spyde-report`` zip (the
+    yaml-presence at ``movies/`` — vs ``figures/`` — is what marks a cell a movie
+    on reload), alongside a baked poster ``assets/<id>.png``. All positions/sizes
+    are in the ORIGINAL source frame's pixel space (the pipeline divides by the
+    downsample factor at draw time). Every field tolerates absence (older /
+    hand-authored files) so a partial spec never fails to load."""
+    source: SignalRef | None = None
+    params: dict = field(default_factory=dict)          # fps/downsample/stride/cmap/
+    #                                                     clim/timestamp/scalebar/t_start/t_end
+    annotations: list = field(default_factory=list)     # [dict] time-gated markers (incl. ROIs)
+    text_overlays: list = field(default_factory=list)   # [dict] 1-D-signal-as-text overlays
+    freezes: list = field(default_factory=list)         # [{"t":int,"hold_s":float}] (legacy)
+    speed_segments: list = field(default_factory=list)  # [{"time_range":[s0,s1],"speed":float}]
+    overlay_image: dict | None = None                   # 2nd-image composite (Phase 3)
+    crop: list | None = None                            # [x0,y0,x1,y1] source px, or None
+    out_size: list | None = None                        # [w,h] output px, or None
+
+    def to_dict(self) -> dict:
+        d: dict = {
+            "source": (self.source.to_dict() if self.source is not None else None),
+            "params": dict(self.params),
+            "annotations": [dict(a) for a in self.annotations],
+            "text_overlays": [dict(t) for t in self.text_overlays],
+            "freezes": [dict(f) for f in self.freezes],
+            "speed_segments": [dict(s) for s in self.speed_segments],
+        }
+        if self.overlay_image is not None:
+            d["overlay_image"] = dict(self.overlay_image)
+        if self.crop is not None:
+            d["crop"] = [int(v) for v in self.crop]
+        if self.out_size is not None:
+            d["out_size"] = [int(v) for v in self.out_size]
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "MovieSpec":
+        d = d or {}
+        src = d.get("source")
+        crop = d.get("crop")
+        out_size = d.get("out_size")
+        oi = d.get("overlay_image")
+        return cls(
+            source=(SignalRef.from_dict(src) if isinstance(src, dict) else None),
+            params=dict(d.get("params") or {}),
+            annotations=[dict(a) for a in (d.get("annotations") or [])],
+            text_overlays=[dict(t) for t in (d.get("text_overlays") or [])],
+            freezes=[dict(f) for f in (d.get("freezes") or [])],
+            speed_segments=[dict(s) for s in (d.get("speed_segments") or [])],
+            overlay_image=(dict(oi) if isinstance(oi, dict) else None),
+            crop=([int(v) for v in crop] if crop else None),
+            out_size=([int(v) for v in out_size] if out_size else None),
+        )
+
+    def to_yaml(self) -> str:
+        return _dump_yaml(self.to_dict())
+
+    @classmethod
+    def from_yaml(cls, text: str) -> "MovieSpec":
+        return cls.from_dict(yaml.safe_load(text) or {})
+
+
+@dataclass
 class Cell:
     """A document cell.
 
-    ``cell_type`` is ``"markdown"``, ``"figure"``, ``"image"``, or ``"split"``. A
-    figure cell carries a ``caption``, a ``fig_id`` (the FigureSpec / asset
-    basename == this cell's id), a ``spec`` (FigureSpec, in memory), and — for a
-    template — a ``placeholder`` flag when no figure has been dropped yet.
+    ``cell_type`` is ``"markdown"``, ``"figure"``, ``"image"``, ``"split"``, or
+    ``"movie"``. A figure cell carries a ``caption``, a ``fig_id`` (the FigureSpec
+    / asset basename == this cell's id), a ``spec`` (FigureSpec, in memory), and —
+    for a template — a ``placeholder`` flag when no figure has been dropped yet.
+
+    A ``"movie"`` cell is an editable, persistent in-situ movie block: it carries
+    a ``caption``, a ``movie`` (:class:`MovieSpec` — the source SignalRef + the
+    render/edit state), a baked poster PNG asset (a representative frame, keyed by
+    the cell id like a figure's baked snapshot), and — until a source signal is
+    assigned — a ``placeholder`` flag (an empty "pick a signal" drop zone).
+    Persisted in report.md as an invisible ``<!-- spyde:movie <id> -->`` marker
+    before a standalone poster image ref; the live recipe lives at
+    ``movies/<id>.yaml`` (that ``movies/`` sibling — vs ``figures/`` — is how a
+    movie cell is told from a figure/photo on reload). Absent marker → NOT a movie
+    cell (fully back-compatible; SCHEMA_VERSION stays 1).
 
     A ``"split"`` cell (Wave A — the split-block primitive) is ONE atomic block
     holding a TEXT side + a FIGURE/PHOTO side, side by side. It REUSES the existing
@@ -717,6 +813,7 @@ class Cell:
     caption: str = ""                          # figure / image caption / alt text
     placeholder: bool = False
     spec: FigureSpec | None = None             # figure recipe (figure cells)
+    movie: "MovieSpec | None" = None           # movie recipe (movie cells)
     image_ext: str = ""                        # image cells: "png"/"jpg"/… (asset ext)
     html: str = ""                             # derived, NON-persisted (export only)
     spec_error: str = ""                       # derived, NON-persisted: read_report
@@ -999,6 +1096,14 @@ def serialize_report_md(doc: ReportDoc) -> str:
             else:
                 # Standalone-paragraph image ref; alt text == caption.
                 body_blocks.append(f"![{c.caption}](assets/{c.id}.png)")
+        elif c.cell_type == "movie":
+            # An invisible movie marker (the ``movies/<id>.yaml`` sibling is what
+            # makes it a movie on reload) THEN a standalone poster image ref (alt
+            # text == caption). A placeholder movie (no source assigned yet) has no
+            # poster — just the marker, so it re-parses as an empty movie cell.
+            body_blocks.append(f"<!-- spyde:movie {c.id} -->")
+            if not c.placeholder:
+                body_blocks.append(f"![{c.caption}](assets/{c.id}.png)")
     # A blank line between blocks keeps each figure ref a standalone paragraph.
     body = "\n\n".join(body_blocks)
     return "".join(parts) + "\n" + body + ("\n" if body else "")
@@ -1067,6 +1172,11 @@ def _parse_body_cells(body: str) -> list:
     # ID MATCHES fills its figure side; a split with no matching ref is an
     # empty-figure-side split (a drop zone).
     open_split: "Cell | None" = None
+    # MOVIE-cell parse state (mirrors open_split): a ``<!-- spyde:movie <id> -->``
+    # marker CREATES the movie cell (placeholder=True) and sets ``open_movie`` so
+    # ONLY an immediately-following ``.png`` ref whose id MATCHES fills its poster
+    # (and clears placeholder); a movie with no matching poster stays a placeholder.
+    open_movie: "Cell | None" = None
 
     def _apply_pending(cell: "Cell") -> "Cell":
         if pending["slide_break"]:
@@ -1137,6 +1247,7 @@ def _parse_body_cells(body: str) -> list:
         m_notes = _SLIDE_NOTES_RE.match(stripped)
         m_live = _LIVE_ACTION_RE.match(stripped)
         m_split = _SPLIT_RE.match(stripped)
+        m_movie = _MOVIE_RE.match(stripped)
         m_fig = _FIG_LINE_RE.match(stripped)
         m_image = _IMAGE_LINE_RE.match(stripped)
         m_ph = _PLACEHOLDER_RE.match(stripped)
@@ -1159,6 +1270,14 @@ def _parse_body_cells(body: str) -> list:
         # drop-zone split whose figure side was never written).
         if open_split is not None and _split_ref is None and stripped != "":
             open_split = None
+        # An open movie's poster: a ``.png`` ref (matched by _FIG_LINE_RE) whose id
+        # matches fills the poster + clears placeholder. A blank line is a paragraph
+        # separator (keep it open); any other non-blank, non-matching line closes
+        # the movie as a placeholder (no poster written yet).
+        _movie_ref = (open_movie is not None and m_fig is not None
+                      and m_fig.group("cid") == open_movie.id)
+        if open_movie is not None and not _movie_ref and stripped != "":
+            open_movie = None
         if m_split is not None:
             # A split marker CREATES the split cell now — layout + id + the text
             # side decoded from the marker (opaque). ``open_split`` then lets ONLY
@@ -1172,6 +1291,16 @@ def _parse_body_cells(body: str) -> list:
                 split_layout=_normalize_split_layout(m_split.group("layout"))))
             cells.append(cell)
             open_split = cell
+        elif m_movie is not None:
+            # A movie marker CREATES the movie cell now (placeholder until a
+            # matching poster ref fills it). ``open_movie`` lets ONLY the movie's
+            # OWN matching-id ``.png`` poster ref (if any) clear the placeholder.
+            flush_md()
+            cell = _apply_pending(Cell(
+                id=(m_movie.group("cid") or "").strip() or new_cell_id(),
+                cell_type="movie", placeholder=True))
+            cells.append(cell)
+            open_movie = cell
         elif m_break is not None:
             # Ends the current markdown run; the marker applies to whatever cell
             # comes next.
@@ -1219,7 +1348,14 @@ def _parse_body_cells(body: str) -> list:
                     image_ext=(m_image.group("ext") or "").lower())))
         elif m_fig is not None:
             flush_md()
-            if _split_ref == "fig":
+            if _movie_ref:
+                # This ``.png`` ref is the open movie's POSTER (id matches). Adopt
+                # its caption, clear the placeholder; the sibling ``movies/<id>.yaml``
+                # (attached by read_report) supplies the MovieSpec. NOT a figure cell.
+                open_movie.caption = m_fig.group("caption") or ""
+                open_movie.placeholder = False
+                open_movie = None
+            elif _split_ref == "fig":
                 # Fill the open split cell's figure side with this FIGURE (its id
                 # matches the split's). The sibling ``figures/<id>.yaml`` (attached
                 # by read_report) supplies the spec; keep the split id + text.
@@ -1419,6 +1555,17 @@ def write_report(doc: ReportDoc, path: str,
                             ext = (c.image_ext or "png").lower()
                             zf.writestr(f"assets/{c.id}.{ext}", data)
                     continue
+                if c.cell_type == "movie":
+                    # A movie cell: its MovieSpec at movies/<id>.yaml (the movies/
+                    # sibling is what marks it a movie on reload) + a baked poster PNG
+                    # at assets/<id>.png. A placeholder movie (no source) still writes
+                    # its (mostly-empty) spec so the cell survives a round-trip.
+                    if c.movie is not None:
+                        zf.writestr(f"movies/{c.id}.yaml", c.movie.to_yaml())
+                    poster = assets.get(c.id)
+                    if poster:
+                        zf.writestr(f"assets/{c.id}.png", poster)
+                    continue
                 if c.cell_type != "figure":
                     continue
                 if c.spec is not None:
@@ -1440,7 +1587,7 @@ def write_report(doc: ReportDoc, path: str,
 # The top-level entries an exported markdown FOLDER is allowed to contain — so a
 # re-export into a previous export overwrites cleanly, but we never clobber an
 # arbitrary populated directory the user picked by mistake.
-_MD_FOLDER_ALLOWED = frozenset({"report.md", "figures", "assets"})
+_MD_FOLDER_ALLOWED = frozenset({"report.md", "figures", "assets", "movies"})
 
 
 def dir_is_safe_md_target(directory: str) -> bool:
@@ -1507,6 +1654,20 @@ def write_report_dir(doc: ReportDoc, directory: str,
                     ext = (c.image_ext or "png").lower()
                     with open(os.path.join(assets_dir, f"{c.id}.{ext}"), "wb") as f:
                         f.write(data)
+            continue
+        if c.cell_type == "movie":
+            # A movie cell (§write_report): movies/<id>.yaml + assets/<id>.png poster.
+            if c.movie is not None:
+                movies_dir = os.path.join(directory, "movies")
+                os.makedirs(movies_dir, exist_ok=True)
+                with open(os.path.join(movies_dir, f"{c.id}.yaml"), "w",
+                          encoding="utf-8") as f:
+                    f.write(c.movie.to_yaml())
+            poster = assets.get(c.id)
+            if poster:
+                os.makedirs(assets_dir, exist_ok=True)
+                with open(os.path.join(assets_dir, f"{c.id}.png"), "wb") as f:
+                    f.write(poster)
             continue
         if c.cell_type != "figure":
             continue
@@ -1586,6 +1747,30 @@ def read_report(path: str) -> "tuple[ReportDoc, dict[str, bytes]]":
                     if png_name in names:
                         assets[c.id] = zf.read(png_name)
                         c.image_ext = "png"
+                continue
+            if c.cell_type == "movie":
+                # A movie cell re-hydrates its MovieSpec from movies/<id>.yaml and
+                # its poster PNG from assets/<id>.png. A malformed spec drops to an
+                # empty MovieSpec but is recorded + logged (same tolerance as a
+                # figure spec). A placeholder movie (no source assigned) may have no
+                # yaml at all — it stays an empty movie cell.
+                spec_name = f"movies/{c.id}.yaml"
+                if spec_name in names:
+                    try:
+                        c.movie = MovieSpec.from_yaml(
+                            zf.read(spec_name).decode("utf-8"))
+                        c.placeholder = c.movie.source is None
+                    except (yaml.YAMLError, ValueError, TypeError, KeyError) as e:
+                        c.movie = MovieSpec()
+                        c.spec_error = str(e)
+                        log.warning(
+                            "report %s: movies/%s.yaml failed to parse (%s); "
+                            "movie cell shown as poster only", path, c.id, e)
+                else:
+                    c.movie = MovieSpec()
+                poster_name = f"assets/{c.id}.png"
+                if poster_name in names:
+                    assets[c.id] = zf.read(poster_name)
                 continue
             if c.cell_type != "figure":
                 continue

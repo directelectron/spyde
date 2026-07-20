@@ -149,14 +149,23 @@ STAGED_HANDLERS: dict[str, str] = {
     "overlay_set":             "spyde.actions.overlay.overlay_set",
     "overlay_remove":          "spyde.actions.overlay.overlay_remove",
     "overlay_query":           "spyde.actions.overlay.overlay_query",
-    # Movie Export (spyde/actions/movie_export/) — in-situ movie → video wizard.
-    "mvx_open":                "spyde.actions.movie_export.handlers.mvx_open",
-    "mvx_tune":                "spyde.actions.movie_export.handlers.mvx_tune",
-    "mvx_add_trace":           "spyde.actions.movie_export.handlers.mvx_add_trace",
-    "mvx_remove_trace":        "spyde.actions.movie_export.handlers.mvx_remove_trace",
-    "mvx_run":                 "spyde.actions.movie_export.handlers.mvx_run",
-    "mvx_cancel":              "spyde.actions.movie_export.handlers.mvx_cancel",
-    "mvx_close":               "spyde.actions.movie_export.handlers.mvx_close",
+    # Movie BLOCK (spyde/actions/report/movie.py) — an editable, persistent in-situ
+    # movie cell in the report/presentation doc + its full-screen editor. Replaces
+    # the mvx caret wizard (removed in Phase 2); reuses the movie_export render engine.
+    "report_add_movie_cell":   "spyde.actions.report.movie.report_add_movie_cell",
+    "report_set_movie_source": "spyde.actions.report.movie.report_set_movie_source",
+    "movie_open":              "spyde.actions.report.movie.movie_open",
+    "movie_close":             "spyde.actions.report.movie.movie_close",
+    "movie_scrub":             "spyde.actions.report.movie.movie_scrub",
+    "movie_play":              "spyde.actions.report.movie.movie_play",
+    "movie_stop":              "spyde.actions.report.movie.movie_stop",
+    "movie_tune":              "spyde.actions.report.movie.movie_tune",
+    "movie_crop_mode":         "spyde.actions.report.movie.movie_crop_mode",
+    "movie_add_text_overlay":  "spyde.actions.report.movie.movie_add_text_overlay",
+    "movie_add_overlay_image": "spyde.actions.report.movie.movie_add_overlay_image",
+    "movie_drop_window":       "spyde.actions.report.movie.movie_drop_window",
+    "movie_export":            "spyde.actions.report.movie.movie_export",
+    "movie_cancel":            "spyde.actions.report.movie.movie_cancel",
 }
 
 
@@ -192,7 +201,6 @@ _WIZARD_SCHEMAS: dict[str, tuple[str, str]] = {
     "strain": ("spyde.actions.strain_action", "StrainController"),
     "vom":    ("spyde.actions.vector_orientation_om", "VomWizard"),
     "czb":    ("spyde.actions.center_zero_beam", "PARAMETERS"),
-    "mvx":    ("spyde.actions.movie_export.handlers", "PARAMETERS"),
     # YAML-declared (resolved from spyde.TOOLBAR_ACTIONS):
     "fv":     ("__yaml__", "Find Diffraction Vectors"),
     "om":     ("__yaml__", "Orientation Mapping"),

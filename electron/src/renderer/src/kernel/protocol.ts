@@ -425,7 +425,7 @@ export interface RepfigSpec {
  *  dropped/pasted/browsed photo, or a SPLIT block — text BESIDE a figure/photo). */
 export interface ReportCell {
   id: string
-  cell_type: 'markdown' | 'figure' | 'image' | 'split'
+  cell_type: 'markdown' | 'figure' | 'image' | 'split' | 'movie'
   /** markdown + split cells: the (text side's) source markdown. */
   source?: string
   /** figure + image + split cells: the caption (alt text). */
@@ -477,6 +477,135 @@ export interface ReportCell {
   /** SPLIT cells: the figure side is EMPTY (no figure/photo dropped yet) — the
    *  renderer draws a drop zone. Absent/false → the figure side is filled. */
   split_empty?: boolean
+  /** MOVIE cells: the pixel-free MovieSpec recipe (source ref + render/edit
+   *  state) driving the card summary + the full-screen editor. */
+  movie?: MovieSpec
+  /** MOVIE cells: true once a source in-situ signal is assigned (placeholder=false).
+   *  A placeholder movie shows the "pick a signal" drop-zone card. */
+  has_source?: boolean
+  /** MOVIE cells: a data-URL PNG of a representative frame (baked on export /
+   *  loaded from the zip) shown as the card poster. Absent → no poster yet. */
+  poster?: string
+}
+
+/** A 1-D-signal-as-text overlay: a live value painted as text (e.g. "T = 812.3 °C").
+ *  The value is resampled from the referenced 1-D signal onto the movie time base
+ *  at render time; `fmt` is a Python-style format string over {label,value,units}. */
+export interface MovieTextOverlay {
+  source?: Record<string, unknown>   // a SignalRef dict (opaque to the renderer)
+  label?: string
+  units?: string
+  fmt?: string
+  xy?: [number, number]              // source-pixel position
+  size?: number
+  color?: string
+  time_range?: [number, number]      // seconds; absent → always shown
+}
+
+/** A time-gated overlay drawn on the movie (text / rect / circle / arrow). ROIs are
+ *  persistent rect/circle annotations. Positions/sizes are in SOURCE pixels. */
+export interface MovieAnnotation {
+  kind: 'text' | 'rect' | 'circle' | 'arrow'
+  time_range?: [number, number]      // seconds; absent → always shown
+  text?: string
+  xy?: [number, number]
+  xy2?: [number, number]             // arrow head
+  wh?: [number, number]              // rect
+  radius?: number                    // circle
+  color?: string
+  width?: number
+  size?: number                      // text px
+}
+
+/** A freeze hold: linger on frame `t` for `hold_s` seconds (repeats the frame).
+ *  Superseded by MovieSpeedSegment (a 0× segment) but kept for back-compat. */
+export interface MovieFreeze { t: number; hold_s: number }
+
+/** A variable-speed segment: source time inside `time_range` (seconds) plays at
+ *  `speed`× (0 = hold/freeze, <1 slow-mo, >1 fast-forward). The export resamples
+ *  source→output time through these, emitting more frames where slow. */
+export interface MovieSpeedSegment { time_range: [number, number]; speed: number }
+
+/** The pixel-free MovieSpec recipe for a movie cell (mirrors the backend). */
+export interface MovieSpec {
+  source?: Record<string, unknown> | null   // a SignalRef dict (opaque)
+  params?: MovieParams
+  annotations?: MovieAnnotation[]
+  text_overlays?: MovieTextOverlay[]
+  freezes?: MovieFreeze[]
+  speed_segments?: MovieSpeedSegment[]
+  overlay_image?: Record<string, unknown> | null
+  crop?: [number, number, number, number] | null   // [x0,y0,x1,y1] source px
+  out_size?: [number, number] | null                // [w,h] output px
+}
+
+/** The navigator's current frame during scrub / playback (spyde:movie_frame). */
+export interface MovieFrameMessage extends MsgBase {
+  type: 'movie_frame'
+  cell_id: string
+  t: number
+  playing?: boolean
+}
+
+/** The base render params for a movie (matches the backend params dict). */
+export interface MovieParams {
+  fps?: number
+  downsample?: number
+  stride?: number
+  cmap?: string
+  clim?: [number, number] | null
+  timestamp?: boolean
+  scalebar?: boolean
+  axes?: boolean                        // draw calibrated axis ticks (default true)
+  t_start?: number
+  t_end?: number
+}
+
+/** The authoritative full-screen Movie editor state (spyde:movie_state). */
+export interface MovieStateMessage extends MsgBase {
+  type: 'movie_state'
+  cell_id: string
+  open: boolean
+  has_source: boolean
+  ffmpeg_ok: boolean
+  running: boolean
+  n_frames: number
+  time: { scale_s: number; units: string }
+  sig: { scale_x: number; units: string }
+  source_title: string
+  params: MovieParams
+  annotations: MovieAnnotation[]
+  text_overlays: MovieTextOverlay[]
+  freezes: MovieFreeze[]
+  speed_segments: MovieSpeedSegment[]
+  crop: [number, number, number, number] | null
+  out_size: [number, number] | null
+  frame_size: [number, number]        // source frame [w,h] — the editor coord space
+  /** Authoritative exported {frames, w, h} (freeze-expanded, even-crop, out_size-
+   *  aware) — the readout uses this so it can't drift from what export writes. */
+  output_info?: { frames: number; w: number; h: number }
+  /** The tree's LIVE 2-D signal figure the editor re-parents into its preview area
+   *  (a figId is 1:1 with an iframe, so mounting it supersedes the MDI iframe while
+   *  the editor is open). null when no source is resolved. */
+  signal_fig_id: string | null
+  signal_window_id: number | null     // the MDI window holding the signal figure
+  nav_fig_id: string | null           // the 1-D navigator figure (shown beside, opt)
+  current_index: number               // the navigator's current time index
+}
+
+/** Export finished (spyde:movie_done). */
+export interface MovieDoneMessage extends MsgBase {
+  type: 'movie_done'
+  cell_id: string
+  path: string
+  frames: number
+}
+
+/** "Open this movie cell in the full-screen editor" (spyde:movie_edit_open) —
+ *  dispatched by the sidebar Movie card / add-with-open. */
+export interface MovieEditOpenMessage extends MsgBase {
+  type: 'movie_edit_open'
+  cell_id: string
 }
 
 /** The authoritative report document (mirrored by the renderer for editing). */
@@ -651,66 +780,6 @@ export interface RepfigComposeOptionsMessage extends MsgBase {
   }
 }
 
-// ── Movie export wizard (mvx_*) ─────────────────────────────────────────────
-
-/** One time-gated overlay annotation in the movie (`time_range` in the movie's
- *  frame-index or seconds domain, matched to the pipeline's convention). */
-export interface MvxAnnotation {
-  kind: 'text' | 'rect'
-  time_range: [number, number]
-  text?: string
-  /** Position/geometry, in data or fractional coords (pipeline-defined). */
-  x?: number
-  y?: number
-  w?: number
-  h?: number
-  [k: string]: unknown
-}
-
-/** The tunable movie-export parameters (mirrors the wizard's controls). */
-export interface MvxParams {
-  fps: number
-  downsample: number
-  stride: number
-  t_start: number
-  t_end: number
-  cmap?: string
-  clim?: [number, number] | null
-  timestamp: boolean
-  scalebar: boolean
-  annotations: MvxAnnotation[]
-  [k: string]: unknown
-}
-
-/** One trace overlay (a 1-D plot dragged into the wizard). */
-export interface MvxTrace {
-  id: string
-  label: string
-  color: string
-  units?: string
-}
-
-/** Authoritative movie-export wizard state — re-broadcast by the backend on
- *  every mvx mutation (open/tune/add_trace/remove_trace). The renderer's
- *  MovieExportWizard subscribes via the `spyde:mvx_state` CustomEvent. */
-export interface MvxStateMessage extends MsgBase {
-  type: 'mvx_state'
-  window_id: number
-  ffmpeg_ok: boolean
-  running: boolean
-  n_frames: number
-  time: { scale_s: number; units: string }
-  params: MvxParams
-  traces: MvxTrace[]
-}
-
-/** A movie export finished — the wizard shows a success note (basename of
- *  `path`). Re-broadcast as `spyde:mvx_done`. */
-export interface MvxDoneMessage extends MsgBase {
-  type: 'mvx_done'
-  path: string
-  frames: number
-}
 
 /** The discriminated union the renderer dispatches over. */
 export type PlotAppMessage =
@@ -757,8 +826,10 @@ export type PlotAppMessage =
   | WizardEventMessage
   | LayersStateMessage
   | RepfigComposeOptionsMessage
-  | MvxStateMessage
-  | MvxDoneMessage
+  | MovieStateMessage
+  | MovieFrameMessage
+  | MovieDoneMessage
+  | MovieEditOpenMessage
   | DownloadProgressMessage
   | DownloadDoneMessage
   | DaskStatsMessage

@@ -16,6 +16,7 @@ import { UpdateCard } from './components/UpdateCard'
 import { MenuBar } from './components/MenuBar'
 import { DownloadToasts } from './components/DownloadToasts'
 import { PresentGate } from './components/PresentGate'
+import { MovieGate } from './components/MovieGate'
 import { FirstRunGate } from './components/FirstRunGate'
 import { GUIDES, getGuide, type Guide } from '@guides/index'
 
@@ -73,6 +74,11 @@ export function App() {
           spyde:report_present event). Owns the slide-index persistence + the
           go-live excursion handoff. */}
       <PresentGate onStartGuide={(g) => setTour(g)} />
+      {/* Full-screen Movie editor (spyde/actions/report/movie.py): opens for a
+          movie cell via spyde:movie_edit (a card's Edit button) or
+          spyde:movie_edit_open (the sidebar Movie card / add-with-open). Owns the
+          movie_open/close session lifecycle. */}
+      <MovieGate />
       {/* Scan-shape/step-size confirm dialog — reads the pending prompt from the
           SpyDE context (so injected test messages reach it too). */}
       <NavShapeGate />
