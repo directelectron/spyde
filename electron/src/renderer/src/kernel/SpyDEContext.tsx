@@ -1211,6 +1211,13 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'report_exported':
         case 'mvx_state':
         case 'mvx_done':
+        // Movie BLOCK editor (spyde/actions/report/movie.py) — the full-screen
+        // editor's authoritative state, live preview frames, export-done, and the
+        // "open this cell in the editor" signal (from the sidebar Movie card /
+        // add-with-open). Consumed by MovieGate / MovieEditor.
+        case 'movie_state':
+        case 'movie_done':
+        case 'movie_edit_open':
         // Examples-menu download progress/terminal — consumed by DownloadToasts
         // (app-global, not wizard-scoped, but the same re-broadcast fits).
         case 'download_progress':

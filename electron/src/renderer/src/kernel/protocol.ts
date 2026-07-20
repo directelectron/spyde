@@ -425,7 +425,7 @@ export interface RepfigSpec {
  *  dropped/pasted/browsed photo, or a SPLIT block — text BESIDE a figure/photo). */
 export interface ReportCell {
   id: string
-  cell_type: 'markdown' | 'figure' | 'image' | 'split'
+  cell_type: 'markdown' | 'figure' | 'image' | 'split' | 'movie'
   /** markdown + split cells: the (text side's) source markdown. */
   source?: string
   /** figure + image + split cells: the caption (alt text). */
@@ -477,6 +477,115 @@ export interface ReportCell {
   /** SPLIT cells: the figure side is EMPTY (no figure/photo dropped yet) — the
    *  renderer draws a drop zone. Absent/false → the figure side is filled. */
   split_empty?: boolean
+  /** MOVIE cells: the pixel-free MovieSpec recipe (source ref + render/edit
+   *  state) driving the card summary + the full-screen editor. */
+  movie?: MovieSpec
+  /** MOVIE cells: true once a source in-situ signal is assigned (placeholder=false).
+   *  A placeholder movie shows the "pick a signal" drop-zone card. */
+  has_source?: boolean
+  /** MOVIE cells: a data-URL PNG of a representative frame (baked on export /
+   *  loaded from the zip) shown as the card poster. Absent → no poster yet. */
+  poster?: string
+}
+
+/** A 1-D-signal-as-text overlay: a live value painted as text (e.g. "T = 812.3 °C").
+ *  The value is resampled from the referenced 1-D signal onto the movie time base
+ *  at render time; `fmt` is a Python-style format string over {label,value,units}. */
+export interface MovieTextOverlay {
+  source?: Record<string, unknown>   // a SignalRef dict (opaque to the renderer)
+  label?: string
+  units?: string
+  fmt?: string
+  xy?: [number, number]              // source-pixel position
+  size?: number
+  color?: string
+  time_range?: [number, number]      // seconds; absent → always shown
+}
+
+/** A time-gated overlay drawn on the movie (text / rect / circle / arrow). ROIs are
+ *  persistent rect/circle annotations. Positions/sizes are in SOURCE pixels. */
+export interface MovieAnnotation {
+  kind: 'text' | 'rect' | 'circle' | 'arrow'
+  time_range?: [number, number]      // seconds; absent → always shown
+  text?: string
+  xy?: [number, number]
+  xy2?: [number, number]             // arrow head
+  wh?: [number, number]              // rect
+  radius?: number                    // circle
+  color?: string
+  width?: number
+  size?: number                      // text px
+}
+
+/** A freeze hold: linger on frame `t` for `hold_s` seconds (repeats the frame). */
+export interface MovieFreeze { t: number; hold_s: number }
+
+/** The pixel-free MovieSpec recipe for a movie cell (mirrors the backend). */
+export interface MovieSpec {
+  source?: Record<string, unknown> | null   // a SignalRef dict (opaque)
+  params?: MovieParams
+  annotations?: MovieAnnotation[]
+  text_overlays?: MovieTextOverlay[]
+  freezes?: MovieFreeze[]
+  overlay_image?: Record<string, unknown> | null
+  crop?: [number, number, number, number] | null   // [x0,y0,x1,y1] source px
+  out_size?: [number, number] | null                // [w,h] output px
+}
+
+/** The base render params for a movie (matches the backend params dict). */
+export interface MovieParams {
+  fps?: number
+  downsample?: number
+  stride?: number
+  cmap?: string
+  clim?: [number, number] | null
+  timestamp?: boolean
+  scalebar?: boolean
+  t_start?: number
+  t_end?: number
+}
+
+/** The authoritative full-screen Movie editor state (spyde:movie_state). */
+export interface MovieStateMessage extends MsgBase {
+  type: 'movie_state'
+  cell_id: string
+  open: boolean
+  has_source: boolean
+  ffmpeg_ok: boolean
+  running: boolean
+  n_frames: number
+  time: { scale_s: number; units: string }
+  sig: { scale_x: number; units: string }
+  source_title: string
+  params: MovieParams
+  annotations: MovieAnnotation[]
+  text_overlays: MovieTextOverlay[]
+  freezes: MovieFreeze[]
+  crop: [number, number, number, number] | null
+  out_size: [number, number] | null
+  frame_size: [number, number]        // source frame [w,h] — the editor coord space
+  /** The tree's LIVE 2-D signal figure the editor re-parents into its preview area
+   *  (a figId is 1:1 with an iframe, so mounting it supersedes the MDI iframe while
+   *  the editor is open). null when no source is resolved. */
+  signal_fig_id: string | null
+  signal_window_id: number | null     // the MDI window holding the signal figure
+  nav_fig_id: string | null           // the 1-D navigator figure (shown beside, opt)
+  current_index: number               // the navigator's current time index
+}
+
+/** Export finished (spyde:movie_done). */
+export interface MovieDoneMessage extends MsgBase {
+  type: 'movie_done'
+  cell_id: string
+  path: string
+  frames: number
+}
+
+/** "Open this movie cell in the full-screen editor" (spyde:movie_edit_open) —
+ *  dispatched by the sidebar Movie card / add-with-open. */
+export interface MovieEditOpenMessage extends MsgBase {
+  type: 'movie_edit_open'
+  cell_id: string
 }
 
 /** The authoritative report document (mirrored by the renderer for editing). */
@@ -759,6 +868,9 @@ export type PlotAppMessage =
   | RepfigComposeOptionsMessage
   | MvxStateMessage
   | MvxDoneMessage
+  | MovieStateMessage
+  | MovieDoneMessage
+  | MovieEditOpenMessage
   | DownloadProgressMessage
   | DownloadDoneMessage
   | DaskStatsMessage
