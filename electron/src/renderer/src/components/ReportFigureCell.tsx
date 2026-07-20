@@ -1194,6 +1194,130 @@ function AnnotationStyleLine({ color, onColor, testidBase, colorTestid,
   )
 }
 
+// ── Shared figure-editing overlay (used by BOTH figure cells AND split cells) ──
+/**
+ * FigureEditOverlay — the figure-editing UI for a live figure cell OR a split
+ * cell's figure side: the floating AnnotationPopover + TextSizePopover (opened by
+ * clicking an annotation / double-clicking a text element on the live figure) and
+ * the slim FigureEditPanel edit bar (add annotation / layers / layout). It owns the
+ * popover + selected-panel state and the spyde:figure_event / report_panel_selected
+ * subscriptions, keyed by the cell's fig_id — so a split cell gets the SAME
+ * annotation-editing pop-down a figure cell does (it was previously missing on
+ * splits, so editing a split's figure showed no annotation tools).
+ *
+ * ``figId`` is the cell's current live figure id (from reportFigures). ``editOpen``
+ * gates the annotation popover + the edit bar (the text-size popover works even out
+ * of edit mode). ``onCloseEdit`` turns edit mode off.
+ */
+export function FigureEditOverlay({ cell, isLive, editOpen, figId, sendAction, onCloseEdit }: {
+  cell: ReportCell
+  isLive: boolean
+  editOpen: boolean
+  figId: string | null
+  sendAction: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
+  onCloseEdit: () => void
+}) {
+  const [selectedPanel, setSelectedPanel] = React.useState<string | null>(null)
+  const [popover, setPopover] = React.useState<PopoverTarget | null>(null)
+
+  // Mirror the backend's panel selection for THIS cell while editing.
+  React.useEffect(() => {
+    if (!editOpen) { setSelectedPanel(null); return }
+    const onSelected = (ev: Event) => {
+      const d = (ev as CustomEvent).detail as { cell_id?: string; panel_id?: string | null }
+      if (d?.cell_id !== cell.id) return
+      setSelectedPanel(d.panel_id ?? null)
+    }
+    window.addEventListener('spyde:report_panel_selected', onSelected)
+    return () => window.removeEventListener('spyde:report_panel_selected', onSelected)
+  }, [editOpen, cell.id])
+
+  // The figure-event listener reads the CURRENT figId/cell via refs (a rebuild
+  // mints a new figId; report_state replaces the cell each edit).
+  const figIdRef = React.useRef<string | null>(null)
+  figIdRef.current = figId
+  const cellRef = React.useRef(cell)
+  cellRef.current = cell
+
+  React.useEffect(() => {
+    if (!editOpen) setPopover(p => (p?.kind === 'annotation' ? null : p))
+    const onFigEvent = (ev: Event) => {
+      const d = (ev as CustomEvent).detail as
+        { figId?: string; event?: Record<string, unknown> } | undefined
+      if (!d?.event || d.figId !== figIdRef.current) return
+      const e = d.event
+      const widgetId = typeof e.widget_id === 'string' ? e.widget_id : null
+      const c = cellRef.current
+      if (e.event_type === 'double_click') {
+        if (typeof e.target !== 'string') return
+        setPopover({
+          kind: 'text_size',
+          panelId: typeof e.panel_id === 'string' ? e.panel_id : null,
+          target: e.target as TextSizeTarget,
+          fx: typeof e.x === 'number' ? e.x : 0.5,
+          fy: typeof e.y === 'number' ? e.y : 0.5,
+        })
+        return
+      }
+      if (!editOpen) return
+      if (e.event_type === 'pointer_up') {
+        const hit = widgetId != null ? c.ann_widgets?.[widgetId] : undefined
+        if (hit) {
+          const { fx, fy } = panelAnnAnchor(c.figure, hit.panel_id, hit.index)
+          setPopover({ kind: 'annotation', scope: 'panel', panelId: hit.panel_id, index: hit.index, fx, fy })
+          return
+        }
+        if (widgetId == null && e.figure_marker && e.marker_id != null) {
+          const anns = c.figure?.annotations ?? []
+          const idx = anns.findIndex(a => a.id === e.marker_id)
+          if (idx >= 0) {
+            setPopover({
+              kind: 'annotation', scope: 'figure', panelId: null, index: idx,
+              fx: typeof e.x === 'number' ? e.x : 0.5,
+              fy: typeof e.y === 'number' ? e.y : 0.5,
+            })
+          }
+          return
+        }
+        return
+      }
+      if (e.event_type === 'pointer_down' && widgetId == null &&
+          (e.figure_background || e.img_x != null)) {
+        setPopover(p => (p?.kind === 'annotation' ? null : p))
+      }
+    }
+    const onKey = (ke: KeyboardEvent) => { if (ke.key === 'Escape') setPopover(null) }
+    window.addEventListener('spyde:figure_event', onFigEvent)
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('spyde:figure_event', onFigEvent)
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [editOpen, cell.id])
+
+  if (!isLive || !cell.figure) return null
+  const aspect = String(figureAspectRatio(cell.figure))
+  return (
+    <>
+      {editOpen && popover?.kind === 'annotation' && (
+        <div style={{ ...styles.popoverLayer, aspectRatio: aspect }}>
+          <AnnotationPopover cell={cell} popover={popover}
+            onClose={() => setPopover(null)} sendAction={sendAction} />
+        </div>
+      )}
+      {popover?.kind === 'text_size' && (
+        <div style={{ ...styles.popoverLayer, aspectRatio: aspect }}>
+          <TextSizePopover cell={cell} popover={popover}
+            onClose={() => setPopover(null)} sendAction={sendAction} />
+        </div>
+      )}
+      {editOpen && (
+        <FigureEditPanel cell={cell} selectedPanel={selectedPanel} onClose={onCloseEdit} />
+      )}
+    </>
+  )
+}
+
 // ── Slim edit bar ─────────────────────────────────────────────────────────────
 // One compact bar under the figure (edit mode only). Annotation STYLE editing
 // lives in the floating AnnotationPopover (click the annotation on the live

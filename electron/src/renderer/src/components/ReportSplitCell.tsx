@@ -31,7 +31,7 @@ import { reportClipboard } from '../kernel/reportClipboard'
 import type { ReportCell } from '../kernel/protocol'
 import { FIGURE_DRAG_MIME, WINDOW_DRAG_MIME } from '../kernel/dnd'
 import { CellChrome } from './CellChrome'
-import { SeamlessFigureFrame } from './ReportFigureCell'
+import { SeamlessFigureFrame, FigureEditOverlay } from './ReportFigureCell'
 
 const DROP_MIMES = [FIGURE_DRAG_MIME, WINDOW_DRAG_MIME]
 const isComposeDrag = (dt: DataTransfer) => DROP_MIMES.some(m => dt.types.includes(m))
@@ -296,10 +296,13 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
         ...(dragProps.dropBefore ? styles.cellDropBefore : {}),
       }}
     >
-      {hover && (
+      {/* The editing chrome is ALWAYS visible (not hover-gated) — a split slide's
+          tools were undiscoverable when they only appeared on hover. Hover just
+          brightens it. */}
+      {(
         <CellChrome
           cellId={cell.id}
-          styles={{ chrome: styles.chrome, chromeBtn: styles.chromeBtn }}
+          styles={{ chrome: { ...styles.chrome, ...(hover ? styles.chromeHover : {}) }, chromeBtn: styles.chromeBtn }}
           onCopy={doCopy}
           onDuplicate={doDuplicate}
           onDelete={onRemove}
@@ -375,6 +378,22 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
         gridTemplateRows: stacked ? 'auto auto' : '1fr' }}>
         {textFirst ? <>{textPane}{figurePane}</> : <>{figurePane}{textPane}</>}
       </div>
+
+      {/* The SAME figure-editing pop-down a figure cell gets — the annotation
+          style popover + text-size popover + the add-annotation edit bar — for the
+          split's figure side. Without this, toggling Edit on a split's figure
+          entered edit mode on the backend but showed NO annotation tools. */}
+      <FigureEditOverlay
+        cell={cell}
+        isLive={isLive}
+        editOpen={figEditOpen}
+        figId={fig?.figId ?? null}
+        sendAction={sendAction}
+        onCloseEdit={() => {
+          setFigEditOpen(false)
+          sendAction('repfig_set_edit_mode', { cell_id: cell.id, editing: false })
+        }}
+      />
     </div>
   )
 }
@@ -408,11 +427,15 @@ const styles: Record<string, React.CSSProperties> = {
   layoutMenuItemActive: { background: '#313244' },
   layoutGlyph: { fontSize: 15, width: 18, textAlign: 'center' },
   chrome: {
-    position: 'absolute', top: 6, right: 6, zIndex: 4,
+    position: 'absolute', top: 6, right: 6, zIndex: 6,
     display: 'flex', alignItems: 'center', gap: 2,
     background: 'rgba(24,24,37,0.96)', borderRadius: 8, padding: 3,
     border: '1px solid #313244', boxShadow: '0 3px 10px rgba(0,0,0,0.35)',
+    // Always visible (not hover-gated) but slightly dimmed until hovered so the
+    // tools are discoverable without covering the figure side too loudly.
+    opacity: 0.78, transition: 'opacity 120ms ease',
   },
+  chromeHover: { opacity: 1 },
   chromeBtn: {
     background: 'none', border: 'none', color: '#cdd6f4', cursor: 'pointer',
     fontSize: 15, lineHeight: 1, borderRadius: 6,

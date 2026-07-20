@@ -120,6 +120,64 @@ test('B1: a split cell shows text AND figure on a slide (Present mode)', async (
   }
 })
 
+test('B1b: editing a split cell\'s figure side shows the annotation pop-down', async () => {
+  const { mkdirSync } = require('fs')
+  mkdirSync(SHOTS, { recursive: true })
+  const ctx = await launchApp({ dask: true })
+  const { page } = ctx
+  try {
+    await page.waitForTimeout(1500)
+    await backendAction(page, 'load_test_data_si_grains')
+    await waitForSubwindowCount(page, 2, 60_000)
+    await page.waitForTimeout(1500)
+    await openReportSidebar(page)
+
+    await backendAction(page, 'report_new', { type: 'presentation' })
+    await expect(page.getByTestId('report-type-badge')).toHaveText('Presentation')
+
+    // A split slide with its figure side filled from the live signal window.
+    await backendAction(page, 'report_add_split_cell', {
+      source: '## Edit me\nfigure side has annotation tools', layout: 'text-left',
+    })
+    await expect.poll(async () => {
+      const doc = await reportDoc(page)
+      return (doc?.cells ?? []).some((x: any) => x.cell_type === 'split')
+    }, { timeout: 15_000 }).toBe(true)
+    const cellId = (await reportDoc(page)).cells.find((x: any) => x.cell_type === 'split').id
+
+    const sigId = await windowIdFromPill(page,
+      '[data-testid="subwindow"] [data-testid="window-breadcrumb"]')
+    expect(Number.isFinite(sigId)).toBe(true)
+    await backendAction(page, 'report_add_figure', { source_window_id: sigId, at_cell: cellId })
+    await expect.poll(async () => {
+      const c = (await reportDoc(page))?.cells?.find((x: any) => x.id === cellId)
+      return c && c.cell_type === 'split' && !!c.figure
+    }, { timeout: 30_000 }).toBe(true)
+
+    // BEFORE edit: no annotation edit panel.
+    const editPanel = page.getByTestId(`figcell-edit-${cellId}`)
+    await expect(editPanel).toHaveCount(0)
+    await page.screenshot({ path: join(SHOTS, '03-split-before-edit.png') })
+
+    // Toggle the split's figure-edit (the ✎ chrome button). The edit pop-down
+    // (add annotation / callouts / layers) must appear — this was the bug: the
+    // split cell entered edit mode on the backend but rendered NO tools.
+    await page.getByTestId(`report-splitcell-${cellId}`).hover()
+    await page.getByTestId(`report-split-edit-${cellId}`).click()
+    await expect(editPanel).toBeVisible({ timeout: 10_000 })
+    await page.screenshot({ path: join(SHOTS, '04-split-edit-tools.png') })
+
+    // The add-annotation palette is present inside the edit bar (the "+ Text"
+    // button is the annotation entry point — proves the pop-down is real, not
+    // just an empty container).
+    await expect(editPanel.getByRole('button', { name: '+ Text' })).toBeVisible()
+
+    ctx.assertNoJsErrors()
+  } finally {
+    await ctx.app.close()
+  }
+})
+
 test('B2: a figure cell on a presentation slide accepts a combine drop', async () => {
   const { mkdirSync } = require('fs')
   mkdirSync(SHOTS, { recursive: true })
