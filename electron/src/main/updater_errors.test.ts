@@ -10,7 +10,9 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { friendlyError, truncateMessage } from './updater_errors.ts'
+import {
+  friendlyError, truncateMessage, isPrereleaseVersion, defaultChannelForVersion,
+} from './updater_errors.ts'
 
 test('offline / DNS errors → offline message', () => {
   for (const raw of ['net::ERR_INTERNET_DISCONNECTED', 'getaddrinfo ENOTFOUND github.com', 'EAI_AGAIN']) {
@@ -77,4 +79,33 @@ test('empty / nullish input → empty string, never throws', () => {
   assert.equal(friendlyError(null), '')
   // @ts-expect-error deliberately exercising an undefined raw
   assert.equal(friendlyError(undefined), '')
+})
+
+// ── channel detection (rc build → beta, stable build → stable) ────────────────
+
+test('prerelease versions are detected', () => {
+  for (const v of ['0.2.0-rc.8', '0.2.0-rc.1', '1.0.0-beta.2', '2.3.4-alpha.1',
+                   'v0.2.0-rc.8', '0.2.0-rc.8+build.5']) {
+    assert.equal(isPrereleaseVersion(v), true, `${v} should be prerelease`)
+  }
+})
+
+test('plain releases are NOT prerelease', () => {
+  for (const v of ['0.2.0', '1.0.0', 'v2.3.4', '0.2.0+build.5', '10.20.30']) {
+    assert.equal(isPrereleaseVersion(v), false, `${v} should be stable`)
+  }
+})
+
+test('defaultChannelForVersion: rc build → beta, stable build → stable', () => {
+  assert.equal(defaultChannelForVersion('0.2.0-rc.8'), 'beta')
+  assert.equal(defaultChannelForVersion('v1.0.0-beta.1'), 'beta')
+  assert.equal(defaultChannelForVersion('0.2.0'), 'stable')
+  assert.equal(defaultChannelForVersion('1.2.3'), 'stable')
+})
+
+test('channel detection tolerates empty/garbage version', () => {
+  assert.equal(isPrereleaseVersion(''), false)
+  // @ts-expect-error nullish
+  assert.equal(isPrereleaseVersion(null), false)
+  assert.equal(defaultChannelForVersion(''), 'stable')
 })

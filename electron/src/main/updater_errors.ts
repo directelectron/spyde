@@ -1,13 +1,33 @@
 /**
- * updater_errors.ts — PURE, dependency-free error mapping for the auto-updater.
+ * updater_errors.ts — PURE, dependency-free updater helpers (error mapping +
+ * channel detection).
  *
  * Split out of updater.ts (which imports `electron`, so it can't be loaded by a
- * plain node unit test) so `friendlyError` can be unit-tested with `node:test` on
- * every CI push, on every OS. The whole point: an updater error must NEVER reach
- * the UI as a raw blob — the "mac auto-update failed spectacularly" screenshot was
- * ~10 KB of raw releases.atom XML rendered full-screen because the fallback
- * returned the provider's message verbatim. See updater_errors.test.ts.
+ * plain node unit test) so these can be unit-tested with `node:test` on every CI
+ * push, on every OS. The whole point of friendlyError: an updater error must NEVER
+ * reach the UI as a raw blob — the "mac auto-update failed spectacularly"
+ * screenshot was ~10 KB of raw releases.atom XML rendered full-screen because the
+ * fallback returned the provider's message verbatim. See updater_errors.test.ts.
  */
+
+/** True when a semver string has a prerelease component (-rc.N / -beta.N /
+ *  -alpha.N / any `-suffix`). Used to pick the DEFAULT update channel from the
+ *  running build's OWN version: a prerelease build follows the beta channel, a
+ *  plain X.Y.Z follows stable — so an rc build never fruitlessly looks for a
+ *  (non-existent) stable release. Tolerant of a leading `v` and build metadata
+ *  (`+…`). */
+export function isPrereleaseVersion(version: string): boolean {
+  const v = String(version ?? '').trim().replace(/^v/i, '')
+  // Strip build metadata, then a prerelease is anything after the first '-'.
+  const core = v.split('+')[0]
+  return core.includes('-')
+}
+
+/** The channel a build should follow BY DEFAULT (before any explicit user
+ *  choice): beta if the running build is itself a prerelease, else stable. */
+export function defaultChannelForVersion(version: string): 'stable' | 'beta' {
+  return isPrereleaseVersion(version) ? 'beta' : 'stable'
+}
 
 /** Bound an unrecognised error message so a huge single-line payload can't blow
  *  out the error box. Collapse whitespace, cap length, keep it one readable line. */

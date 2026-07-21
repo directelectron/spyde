@@ -8,10 +8,16 @@
  * to detect a new version per platform. Plain vX.Y.Z tags are regular GitHub
  * releases; vX.Y.Z-rc.N/-beta.N tags are marked `prerelease` (release.yml's
  * `channel` job) — `allowPrerelease` is what gates whether autoUpdater will
- * offer those to a given install (see electron-updater's own default: it
- * auto-allows prereleases only when the CURRENTLY INSTALLED version already
- * has a prerelease component, so an explicit stable->beta opt-in needs us to
- * set this ourselves).
+ * offer those to a given install.
+ *
+ * CHANNEL DEFAULT FOLLOWS THE RUNNING BUILD. The default channel is derived from
+ * THIS build's own version: a prerelease build (…-rc.N) tracks beta, a plain
+ * X.Y.Z tracks stable (defaultChannelForVersion in updater_errors.ts). So an rc
+ * install checks the beta feed (where its updates actually are) instead of the
+ * stable feed — which, with no stable release published yet, would 404 and error.
+ * An explicit user choice (the dialog radio, persisted) always overrides the
+ * default. And a "no release for this channel" result is reported as up-to-date,
+ * not an error (isNoReleaseForChannel).
  *
  * autoDownload is OFF: check -> tell the renderer -> user clicks "Download" ->
  * we call downloadUpdate() -> "Restart to install" -> quitAndInstall(). This
@@ -29,7 +35,7 @@ import { app, BrowserWindow } from 'electron'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import { autoUpdater } from 'electron-updater'
-import { friendlyError } from './updater_errors'
+import { friendlyError, defaultChannelForVersion } from './updater_errors'
 
 export type UpdateChannel = 'stable' | 'beta'
 
@@ -96,15 +102,30 @@ export function getLastUpdateStatus(): UpdateStatus {
   return lastStatus
 }
 
-/** Read the persisted channel choice (defaults to 'stable'). Electron-side
- *  storage, separate from ~/.spyde/settings.json — updater.ts must be able to
- *  read this before the Python sidecar is necessarily up. */
+/** Read the effective update channel. An EXPLICIT persisted choice (the user
+ *  flipped the radio) always wins; otherwise the default follows the RUNNING
+ *  build's own version — a prerelease build (…-rc.N) tracks beta, a plain X.Y.Z
+ *  tracks stable. This is what stops an rc install from fruitlessly checking the
+ *  (non-existent) stable channel and erroring. Electron-side storage, separate
+ *  from ~/.spyde/settings.json — readable before the Python sidecar is up. */
 export function readUpdateChannel(): UpdateChannel {
   try {
     const raw = readFileSync(channelFilePath, 'utf8').trim()
-    return raw === 'beta' ? 'beta' : 'stable'
+    if (raw === 'beta' || raw === 'stable') return raw
+    // Any other/empty content → fall through to the version-derived default.
   } catch {
-    return 'stable'
+    // No persisted choice yet → derive from this build's version.
+  }
+  return defaultChannelForVersion(appVersion())
+}
+
+/** The running app's version. Wrapped so it's overridable/testable and safe if
+ *  called before `app` is ready (falls back to a stable-looking version). */
+function appVersion(): string {
+  try {
+    return app.getVersion()
+  } catch {
+    return '0.0.0'
   }
 }
 
@@ -157,9 +178,32 @@ export function initUpdater(mainWindow: BrowserWindow, userData: string): void {
     sendStatus({ state: 'downloaded', version: info.version })
   })
 
-  // electron-updater surfaces network + verification failures here. Route
-  // through reportError so the state is left recheckable + the message friendly.
-  autoUpdater.on('error', (err) => reportError(err?.message ?? String(err)))
+  // electron-updater surfaces network + verification failures here. But a
+  // "no release found for this channel" error (e.g. a STABLE build/channel when
+  // only prereleases exist yet — no stable release published) is NOT a failure —
+  // it means "you're up to date on your channel". Report THAT as not-available so
+  // the user sees a calm "up to date", not a scary error. Everything else routes
+  // through reportError (friendly + recheckable).
+  autoUpdater.on('error', (err) => {
+    const msg = err?.message ?? String(err)
+    if (isNoReleaseForChannel(msg)) {
+      checkInFlight = false
+      clearCheckTimer()
+      sendStatus({ state: 'not-available' })
+      return
+    }
+    reportError(msg)
+  })
+}
+
+/** Recognise electron-updater's "there is no release matching this channel" error
+ *  — the feed / release simply doesn't exist for the channel we asked for (a
+ *  stable build when only prereleases have shipped). That's "up to date", not a
+ *  fault. Kept conservative: only the shapes electron-updater/GitHubProvider emit
+ *  for a genuinely-absent release, so a real 404-from-network still surfaces. */
+function isNoReleaseForChannel(msg: string): boolean {
+  const s = String(msg || '')
+  return /Unable to find latest version on GitHub|No published versions on GitHub|latest-mac\.yml.*not found|Cannot find channel|No version found/i.test(s)
 }
 
 /** (Re)arm the download stall watchdog: if no progress event lands within
