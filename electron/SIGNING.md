@@ -27,7 +27,8 @@ notarization too. You need both. electron-builder does the code signing during
 ## Step 1 — Create the Developer ID Application certificate (once, on a Mac)
 
 Distributing OUTSIDE the App Store → you need a **"Developer ID Application"**
-cert (NOT "Mac App Distribution").
+cert (NOT "Mac App Distribution", NOT "Developer ID Installer" — that one is only
+for `.pkg` installers, which SpyDE doesn't ship).
 
 - Xcode → Settings → Accounts → your Apple ID → **Manage Certificates** → **+** →
   **Developer ID Application**.
@@ -36,16 +37,44 @@ cert (NOT "Mac App Distribution").
 
 This lands the cert + its private key in your login keychain.
 
+### Which intermediate certificate?
+
+Your signing cert chains up through Apple's **Developer ID** intermediate. Use the
+current one — **"Developer ID Certification Authority (G2)"** — NOT the older
+non-G2 "Developer ID Certification Authority" (still valid for old artifacts but
+being retired; new certs chain to G2):
+
+```
+Apple Root CA
+  └─ Developer ID Certification Authority (G2)     ← the intermediate
+       └─ Developer ID Application: You (TEAMID)    ← your signing cert
+```
+
+**You normally don't pick this by hand** — Xcode / double-clicking the downloaded
+cert installs the right intermediate automatically. It only matters if you hit a
+"unable to build chain" / "CSSMERR_TP_NOT_TRUSTED" error, which on a **CI runner**
+means the runner's keychain is missing the G2 intermediate. Guard against it by
+exporting the full chain into the `.p12` (Step 2), or fetch it in CI:
+`curl -sO https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer` then
+`security import DeveloperIDG2CA.cer -k "$KEYCHAIN"`.
+
 ## Step 2 — Export the certificate as a `.p12` (for CI)
 
 CI has no keychain, so export cert+key to a password-protected `.p12`:
 
-1. Keychain Access → find **"Developer ID Application: Your Name (TEAMID)"** →
-   right-click → **Export** → save `certificate.p12`, set an export password.
-2. base64-encode it for a GitHub secret:
+1. Keychain Access → find **"Developer ID Application: Your Name (TEAMID)"**. To
+   bake the intermediate into the `.p12` (so CI never has a broken chain),
+   Cmd-click BOTH that cert **and** "Developer ID Certification Authority (G2)".
+2. Right-click → **Export … (2 items)** → save `certificate.p12`, set an export
+   password.
+3. base64-encode it for a GitHub secret:
    ```bash
    base64 -i certificate.p12 -o certificate.p12.base64
    ```
+
+> If your Keychain doesn't show the G2 intermediate, download it first:
+> `curl -O https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer` and
+> double-click to add it, then export.
 
 ## Step 3 — Create an App Store Connect API key (for notarization)
 
@@ -117,10 +146,14 @@ The build job is a 3-OS matrix; gate the signing steps to macOS with
           security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
           security import cert.p12 -k "$KEYCHAIN" -P "$MAC_CERT_PASSWORD" \
             -T /usr/bin/codesign -T /usr/bin/security
+          # Belt-and-braces: ensure the Developer ID G2 intermediate is present so
+          # codesign can build the chain even if the .p12 didn't include it.
+          curl -fsSO https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
+          security import DeveloperIDG2CA.cer -k "$KEYCHAIN" || true
           security set-key-partition-list -S apple-tool:,apple:,codesign: \
             -s -k "$KEYCHAIN_PW" "$KEYCHAIN"
           security list-keychains -d user -s "$KEYCHAIN" login.keychain
-          rm -f cert.p12
+          rm -f cert.p12 DeveloperIDG2CA.cer
 
       - name: Stage notarization API key (macOS only)
         if: runner.os == 'macOS'
