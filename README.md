@@ -23,7 +23,7 @@ Download
 | Platform | Download |
 |----------|----------|
 | **Windows** | [SpyDE-Setup-0.2.0-rc.8.exe](https://github.com/CSSFrancis/spyde/releases/download/v0.2.0-rc.8/SpyDE-Setup-0.2.0-rc.8.exe) |
-| **macOS** (Apple Silicon) | [SpyDE-0.2.0-rc.8-arm64.dmg](https://github.com/CSSFrancis/spyde/releases/download/v0.2.0-rc.8/SpyDE-0.2.0-rc.8-arm64.dmg) |
+| **macOS** (Apple Silicon) | [SpyDE-0.2.0-rc.8-arm64-mac.zip](https://github.com/CSSFrancis/spyde/releases/download/v0.2.0-rc.8/SpyDE-0.2.0-rc.8-arm64-mac.zip) |
 | **Linux** | [SpyDE-0.2.0-rc.8.AppImage](https://github.com/CSSFrancis/spyde/releases/download/v0.2.0-rc.8/SpyDE-0.2.0-rc.8.AppImage) |
 
 All releases: <https://github.com/CSSFrancis/spyde/releases>

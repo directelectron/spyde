@@ -18,7 +18,8 @@
  *
  * Asset names mirror electron-builder.yml's outputs (see release.yml):
  *   Windows  SpyDE-Setup-<v>.exe
- *   macOS    SpyDE-<v>-arm64.dmg
+ *   macOS    SpyDE-<v>-arm64-mac.zip   (the signed+notarized .app — just unzip &
+ *            run; the .dmg exists too but the zip is the clean download)
  *   Linux    SpyDE-<v>.AppImage
  */
 import { readFileSync, writeFileSync } from 'node:fs'
@@ -38,7 +39,7 @@ const base = `https://github.com/${repo}/releases/download/v${version}`
 const rel = `https://github.com/${repo}/releases/tag/v${version}`
 const assets = {
   win: `SpyDE-Setup-${version}.exe`,
-  mac: `SpyDE-${version}-arm64.dmg`,
+  mac: `SpyDE-${version}-arm64-mac.zip`,
   linux: `SpyDE-${version}.AppImage`,
 }
 

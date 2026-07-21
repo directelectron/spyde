@@ -26,7 +26,7 @@ Download
    * - **Windows**
      - `SpyDE-Setup-0.2.0-rc.8.exe <https://github.com/CSSFrancis/spyde/releases/download/v0.2.0-rc.8/SpyDE-Setup-0.2.0-rc.8.exe>`__
    * - **macOS** (Apple Silicon)
-     - `SpyDE-0.2.0-rc.8-arm64.dmg <https://github.com/CSSFrancis/spyde/releases/download/v0.2.0-rc.8/SpyDE-0.2.0-rc.8-arm64.dmg>`__
+     - `SpyDE-0.2.0-rc.8-arm64-mac.zip <https://github.com/CSSFrancis/spyde/releases/download/v0.2.0-rc.8/SpyDE-0.2.0-rc.8-arm64-mac.zip>`__
    * - **Linux**
      - `SpyDE-0.2.0-rc.8.AppImage <https://github.com/CSSFrancis/spyde/releases/download/v0.2.0-rc.8/SpyDE-0.2.0-rc.8.AppImage>`__
 
@@ -36,7 +36,9 @@ Notes
 -----
 
 - **macOS** builds are signed + notarized, so they open without a Gatekeeper
-  prompt. Open the ``.dmg`` and drag SpyDE to Applications.
+  prompt. Unzip the download and drag **SpyDE.app** to *Applications*. (A ``.dmg``
+  is also attached to each release if you prefer that; the ``.zip`` is the simplest
+  download and is the same signed app the auto-updater installs.)
 - **Windows** installers are currently unsigned — SmartScreen may warn on first
   run; choose *More info → Run anyway*. The NSIS installer is per-user (no admin).
 - **Linux**: ``chmod +x SpyDE-*.AppImage && ./SpyDE-*.AppImage``.
