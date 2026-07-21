@@ -4,6 +4,10 @@ __pycache__/
 *.egg-info/
 .eggs/
 build/
+# ...but electron/build/ is electron-builder's buildResources dir — TRACKED source
+# (icons, entitlements.mac.plist for macOS signing), not build output. Un-ignore it.
+!electron/build/
+!electron/build/**
 dist/
 *.spec          # PyInstaller specs — SpyDE bundles via PyCrucible, not PyInstaller
 
