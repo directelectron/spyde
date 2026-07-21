@@ -331,13 +331,22 @@ jobs:
             [latest.yml]='\.(exe|nupkg)$'
             [latest-linux.yml]='\.(AppImage|deb|rpm)$'
           )
+          # This step runs while the release is STILL A DRAFT (finalize un-drafts it
+          # AFTER this passes). Draft assets are NOT reachable at the public
+          # releases/download/<tag>/ URL (404), so fetch them through the API with
+          # `gh release download`, which authenticates and sees the draft.
+          tmp=$(mktemp -d)
           fail=0
           for feed in latest-mac.yml latest.yml latest-linux.yml; do
-            url="https://github.com/$REPO/releases/download/$TAG/$feed"
-            if ! body=$(curl -fsSL "$url"); then
-              echo "::error::update feed $feed is missing from the release — electron-updater can't detect updates on that platform."
+            if ! has_asset "$feed"; then
+              echo "::error::update feed $feed is not attached to the release — electron-updater can't detect updates on that platform."
               fail=1; continue
             fi
+            if ! gh release download "$TAG" --repo "$REPO" --pattern "$feed" --dir "$tmp" --clobber; then
+              echo "::error::could not download update feed $feed from the (draft) release."
+              fail=1; continue
+            fi
+            body=$(cat "$tmp/$feed")
             # every `url:` entry under files: (the installable payloads)
             mapfile -t urls < <(printf '%s\n' "$body" | sed -nE 's/^[[:space:]]*-?[[:space:]]*url:[[:space:]]*//p')
             if [ "${#urls[@]}" -eq 0 ]; then
