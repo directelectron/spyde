@@ -70,7 +70,10 @@ Wired via `electron-updater` (`electron/src/main/updater.ts`):
 - **Code signing / notarization.** Shipping unsigned for now (Gatekeeper /
   SmartScreen will warn — see `DISTRIBUTION_PLAN.md §5`). Wire Apple Developer
   ID + Windows EV cert into CI when procured; `mac.identity: null` removes the
-  ad-hoc signing attempt meanwhile.
+  ad-hoc signing attempt meanwhile. **macOS sign+notarize is a ready-to-follow
+  checklist in [`SIGNING.md`](SIGNING.md)** (certs → GitHub secrets →
+  electron-builder.yml + release.yml diffs → verify); the entitlements file it
+  needs already exists at `build/entitlements.mac.plist`.
 - **Offline bundle.** The "portable" PyCrucible single-exe (torch baked in)
   remains the air-gapped fallback per the locked decision; this uv-managed
   installer is the primary path.

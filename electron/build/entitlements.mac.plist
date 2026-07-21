@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    Hardened-runtime entitlements for the SpyDE .app. Required once mac.hardenedRuntime
+    is enabled (which notarization requires). See SIGNING.md for the full setup.
+
+    Why each one:
+      allow-jit / allow-unsigned-executable-memory
+        Electron/V8 (and torch's compiled kernels) JIT-compile at runtime; the
+        hardened runtime blocks executable memory without these.
+      disable-library-validation  ← THE load-bearing one for SpyDE
+        SpyDE spawns a uv-managed Python subprocess whose native wheels (torch,
+        numba, rosettasciio's compiled readers, …) are signed by THEIR authors,
+        not by our Developer ID. Library validation would refuse to load a dylib
+        signed by a different team into our signed process → the backend can't
+        start. This entitlement lets the app load those third-party binaries.
+      allow-dyld-environment-variables
+        pythonEnv.ts sets DYLD_/PYTHON* env vars to point the sidecar at the
+        first-run venv; the hardened runtime strips these without this key.
+  -->
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+  <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+  <true/>
+</dict>
+</plist>
