@@ -5,10 +5,15 @@ users stop hitting the Gatekeeper "unidentified developer" wall — and so the
 auto-update `.zip` is trusted too (electron-updater applies a notarized zip
 without a warning).
 
-> **Status:** the repo ships **unsigned** today (`electron-builder.yml` has
-> `mac.identity: null`). This doc is the checklist to flip it on once you have an
-> Apple Developer account ($99/yr). The entitlements file it references already
-> exists: [`build/entitlements.mac.plist`](build/entitlements.mac.plist).
+> **Status: WIRED (2026-07-21).** `electron-builder.yml` has
+> `hardenedRuntime`/`entitlements`/`notarize: true`, and `release.yml`'s mac leg
+> imports the cert + stages the notarization key, gated on the job-level
+> `MAC_SIGNING_ENABLED` flag (true when the `MAC_CERT_P12_BASE64` secret is set).
+> The six secrets below are configured, so **the next release build signs +
+> notarizes automatically**. A local `npm run dist` or a fork build with no
+> secrets still produces an *unsigned* build (electron-builder logs "skipped macOS
+> code signing") rather than failing. Steps 1–4 below are the one-time cert/secret
+> setup (done); steps 5–7 document what's now wired + how to verify.
 
 ## What "signing an Apple app" means (two required steps)
 

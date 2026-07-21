@@ -45,9 +45,26 @@ mac:
   # payload; the dmg stays for first-time manual installs.
   target: [dmg, zip]
   icon: ../spyde/Spyde.png
-  # Unsigned for now — Gatekeeper will warn; see PACKAGING.md for the
-  # sign+notarize follow-up (needs an Apple Developer ID).
-  identity: null
+  # Code signing + notarization — see SIGNING.md. The Developer ID Application cert
+  # is imported into the CI keychain by release.yml's "Import Apple signing
+  # certificate" step; electron-builder auto-selects it. hardenedRuntime + the
+  # entitlements below are REQUIRED for notarization; disable-library-validation in
+  # particular lets the uv-managed Python sidecar load its third-party native wheels
+  # (torch/numba/rosettasciio, signed by other teams) under the hardened runtime.
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  # notarize submits the signed build to Apple + staples the ticket, using the
+  # App Store Connect API-key env vars (APPLE_API_KEY[_ID]/APPLE_API_ISSUER/
+  # APPLE_TEAM_ID) that release.yml sets on the mac leg.
+  notarize: true
+  # NB: NO `identity: null` here — that would DISABLE signing. When the signing
+  # env is absent (a local `npm run dist`, or a fork build with no secrets),
+  # electron-builder logs "skipped macOS code signing" and produces an UNSIGNED
+  # build rather than failing — so dev/local builds still work; only CI with the
+  # cert imported actually signs. To force-disable signing (emergency unsigned
+  # release), set CSC_IDENTITY_AUTO_DISCOVERY=false in the build env.
 
 win:
   target: [nsis]
