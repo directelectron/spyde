@@ -176,6 +176,13 @@ jobs:
         working-directory: electron
         run: npm version "${{ steps.version.outputs.new_version }}" --no-git-tag-version
 
+      # Regenerate the "Download the latest version" tables in README.md and the
+      # docs (doc/user_guide/installing.rst) with version-pinned links for the
+      # release being cut — so the GitHub front page + docs point at it the moment
+      # the release publishes. Idempotent (rewrites only between the markers).
+      - name: Update download links (README + docs)
+        run: node scripts/update-download-links.mjs "${{ steps.version.outputs.new_version }}" "${{ github.repository }}"
+
       # ── Commit and push ──────────────────────────────────────────────────
       - name: Configure git
         run: |
@@ -185,7 +192,8 @@ jobs:
       - name: Commit release changes
         run: |
           git checkout -b "${{ steps.version.outputs.branch }}"
-          git add electron/package.json electron/package-lock.json
+          git add electron/package.json electron/package-lock.json \
+                  README.md doc/user_guide/installing.rst
           git commit -m "chore: prepare release ${{ steps.version.outputs.tag }}"
           git push origin "${{ steps.version.outputs.branch }}"
 
