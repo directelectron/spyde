@@ -2,7 +2,13 @@
  * CenterZeroBeamWizard.tsx — the Center-Zero-Beam caret (Qt two-tab parity).
  *
  *   Automatic — pick a method (+ optional centred half-width window + linear
- *               flat-field) → "Center" dispatches `czb_run`.
+ *               flat-field) → "Center" dispatches `czb_run`. The half-width
+ *               window is shown as a DRAGGABLE/resizable rectangle widget on
+ *               the DP (czb_set_region); dragging it is the primary input —
+ *               its live size is read back into the half-width field via the
+ *               same `spyde:figure_event` re-broadcast the Crop caret uses
+ *               (see CropWizard.tsx), and czb_run itself re-reads the widget
+ *               so a stale field value can't win.
  *   Manual    — "Place crosshair" drops a draggable crosshair on the DP
  *               (`czb_open`); drag it onto the zero beam; "Apply"
  *               dispatches `czb_pick`. The crosshair is removed on Apply or
@@ -10,7 +16,8 @@
  */
 import React from 'react'
 import { WizardShell, TabRow, Field, NumInput, Check, S } from './WizardShell'
-import { useWizardLifecycle } from './wizardHooks'
+import { useWizardLifecycle, useWizardEvent } from './wizardHooks'
+import { useSpyDE } from '../kernel/SpyDEContext'
 
 const TABS = ['Automatic', 'Manual'] as const
 type Tab = typeof TABS[number]
@@ -23,11 +30,30 @@ interface Props {
 }
 
 export function CenterZeroBeamWizard({ caretPos, windowId, sendAction, onClose }: Props) {
+  const { state } = useSpyDE()
   const [tab, setTab] = React.useState<Tab>('Automatic')
   const [method, setMethod] = React.useState('center_of_mass')
   const [halfWidth, setHalfWidth] = React.useState(0)
   const [flat, setFlat] = React.useState(false)
   const [status, setStatus] = React.useState('Center the direct beam automatically or by hand.')
+
+  // The live figId for this window's DP — spyde:figure_event carries {figId,
+  // event}, not windowId, so this resolves which widget events are ours.
+  const figId = state.windows.get(windowId)?.figures.find(f => !f.isNavigator)?.figId
+    ?? state.windows.get(windowId)?.figures[0]?.figId
+
+  // Drag → field: the search-window rectangle's own pointer_move/pointer_up
+  // events carry its live size; half-width = half the (square) side.
+  useWizardEvent('figure_event', windowId, (detail) => {
+    if (tab !== 'Automatic') return
+    const d = detail as { figId?: string; event?: Record<string, unknown> }
+    if (!figId || d.figId !== figId) return
+    const ev = d.event
+    if (!ev || ev.type !== 'rectangle') return
+    const w = Number(ev.w), h = Number(ev.h)
+    if (!Number.isFinite(w) || !Number.isFinite(h)) return
+    setHalfWidth(Math.round(Math.min(w, h) / 2))
+  })
 
   // Manual crosshair lifecycle: add when the Manual tab is active, remove
   // otherwise (and always on unmount). Re-fires on tab switch.

@@ -55,13 +55,19 @@ _FOUND_COLOR = "#a6e3a1"     # the found beam-centre marker
 
 
 def _czb_remove_region(tree) -> None:
-    mg = getattr(tree, "_czb_region_mg", None) if tree is not None else None
-    if mg is not None:
+    """Tear down the Automatic-tab search-window widget (see czb_open/
+    czb_set_region). ``_czb_region_mg`` is the historical name (it used to hold
+    a static MarkerGroup from add_squares); it now holds a draggable
+    RectangleWidget, hidden the same way the Manual-tab crosshair is (widgets
+    have no ``remove()``, only ``hide()`` — see _czb_manual_stop_obj)."""
+    widget = getattr(tree, "_czb_region_mg", None) if tree is not None else None
+    if widget is not None:
         try:
-            mg.remove()
+            widget.hide()
         except Exception as e:
-            log.debug("removing czb region box failed: %s", e)
+            log.debug("hiding czb region widget failed: %s", e)
         tree._czb_region_mg = None
+        tree._czb_region_handler = None
 
 
 def _czb_remove_found(tree) -> None:
@@ -74,30 +80,97 @@ def _czb_remove_found(tree) -> None:
         tree._czb_found_mgs = None
 
 
+def _czb_region_from_widget(tree, w: int, h: int) -> int | None:
+    """Read the current search-window half-width off the live widget (None if
+    there is no widget). ``get_direct_beam_position`` always centres the search
+    box on the frame, so only the SIZE is meaningful — position drift from a
+    resize-drag is corrected back to centred by the drag handler. A widget that
+    (still) covers the FULL frame reports 0 ("full frame", the same as no
+    override) rather than a half-width that would clip nothing anyway."""
+    widget = getattr(tree, "_czb_region_mg", None) if tree is not None else None
+    if widget is None:
+        return None
+    side = min(float(widget.w), float(widget.h))
+    if side >= min(float(w), float(h)) - 1e-6:
+        return 0
+    return max(1, int(round(side / 2.0)))
+
+
+def _czb_on_region_drag(tree, w: int, h: int, event) -> None:
+    """Drag handler for the Automatic-tab search-window widget: pyxem's
+    ``get_direct_beam_position(half_square_width=...)`` always centres the
+    search box on the frame, so a resize is allowed but the box is snapped back
+    to centred on every move (dragging the whole box, or an asymmetric resize,
+    would otherwise silently do nothing — worse, it would look like it did).
+    Clamped to the frame so it can never grow past the detector edges.
+
+    RE-ENTRANCY GUARD: anyplotlib ``Widget.set()`` fires ``pointer_move``
+    UNCONDITIONALLY (even when nothing changed, and regardless of ``_push``),
+    so the ``set()`` below re-invokes this handler synchronously — unguarded,
+    ONE JS drag frame recursed ~2000 deep before RecursionError. A hard
+    per-tree flag breaks the cycle; compare-before-set is NOT sufficient
+    (``set()`` fires on a no-change write too)."""
+    widget = getattr(tree, "_czb_region_mg", None) if tree is not None else None
+    if widget is None:
+        return
+    if getattr(tree, "_czb_region_clamping", False):
+        return
+    tree._czb_region_clamping = True
+    try:
+        side = min(float(widget.w), float(widget.h), float(w), float(h))
+        side = max(2.0, side)
+        widget.set(x=(w - side) / 2.0, y=(h - side) / 2.0, w=side, h=side)
+    except Exception as e:
+        log.debug("czb region widget re-centre failed: %s", e)
+    finally:
+        tree._czb_region_clamping = False
+
+
 def czb_set_region(session, plot, payload) -> None:
-    """Automatic tab: outline the centering search window (the centred
-    ``half_square_width`` box pyxem's ``get_direct_beam_position`` uses) live
-    on the DP so the user sees what region drives the fit. ``hw <= 0`` (full
-    frame) removes the box."""
+    """Automatic tab: show a DRAGGABLE (resize-only, re-centred) rectangle
+    widget outlining the centring search window (the centred
+    ``half_square_width`` box pyxem's ``get_direct_beam_position`` uses), so
+    the user can see AND adjust what region drives the fit — activating the
+    Automatic tab shows it immediately, covering the FULL frame at
+    ``half_square_width=0`` (pyxem's "search everywhere" default) exactly like
+    the full-frame box Crop opens with. Resizing the widget is the primary
+    input — the numeric half-width field stays in sync via the widget's own
+    drag events (see CenterZeroBeamWizard.tsx), and czb_run reads the live
+    widget size. The box is only ever REMOVED by czb_close (caret closed / tab
+    left)."""
     src, tree = _src_plot_tree(session, plot)
     signal = _current_signal(src)
     plot2d = getattr(src, "_plot2d", None) if src is not None else None
     if plot2d is None or signal is None or tree is None:
         return
-    _czb_remove_region(tree)
-    hw = int(payload.get("half_square_width", 0) or 0)
-    if hw <= 0:
-        return
     sig_ax = signal.axes_manager.signal_axes
     w, h = int(sig_ax[0].size), int(sig_ax[1].size)
-    side = float(min(2 * hw, w, h))
+    hw = int(payload.get("half_square_width", 0) or 0)
+    side = float(min(2 * hw, w, h)) if hw > 0 else float(min(w, h))
+    existing = getattr(tree, "_czb_region_mg", None)
+    if existing is not None:
+        # Re-centre + resize the LIVE widget in place (a caret field edit while
+        # the box is already up) instead of tearing it down and losing the
+        # user's in-progress drag state.
+        try:
+            existing.set(x=(w - side) / 2.0, y=(h - side) / 2.0, w=side, h=side)
+        except Exception as e:
+            log.debug("czb region widget resize failed: %s", e)
+        return
     try:
-        tree._czb_region_mg = plot2d.add_squares(
-            [[w / 2.0, h / 2.0]], [side], name="czb_region",
-            edgecolors=_REGION_COLOR, facecolors=None, linewidths=1.5, alpha=0.9,
+        widget = plot2d.add_rectangle_widget(
+            x=(w - side) / 2.0, y=(h - side) / 2.0, w=side, h=side,
+            color=_REGION_COLOR, show_handles=True,
         )
+        tree._czb_region_mg = widget
+        from spyde.drawing.selectors.base_selector import event_handler_fn
+        handler = event_handler_fn(
+            lambda event: _czb_on_region_drag(tree, w, h, event)
+        )
+        widget.add_event_handler(handler, "pointer_move", "pointer_up")
+        tree._czb_region_handler = handler   # keep a ref alive (weak callback)
     except Exception as e:
-        log.debug("czb region box draw failed: %s", e)
+        log.debug("czb region widget draw failed: %s", e)
 
 
 def _czb_show_found(src, tree, signal, beam_xy) -> None:
@@ -150,6 +223,18 @@ def czb_run(session, plot, payload) -> None:
         return
     method = str(payload.get("method", DEFAULTS["method"]))
     hw = int(payload.get("half_square_width", 0) or 0)
+    # The rectangle widget (see czb_set_region) is the PRIMARY input once it's
+    # on screen — a drag/resize does not round-trip back into the caret's
+    # numeric field on every frame, so the typed field can be stale at Run
+    # time. Always prefer the live widget when one is up. A full-frame widget
+    # (its opening state) reads back as hw=0, and at hw=0 the
+    # half_square_width kwarg is OMITTED below entirely (pyxem then searches
+    # the full frame) — it is never passed as 0.
+    sig_ax = signal.axes_manager.signal_axes
+    w, h = int(sig_ax[0].size), int(sig_ax[1].size)
+    live_hw = _czb_region_from_widget(tree, w, h)
+    if live_hw is not None:
+        hw = live_hw
     flat = bool(payload.get("make_flat_field", False))
     emit_status("Centering zero beam…")
 
@@ -236,13 +321,21 @@ def _czb_manual_stop_obj(tree) -> None:
         tree._czb_cross = None
 
 
+def _czb_clear_widgets(tree) -> None:
+    """Remove every CZB on-plot artefact from *tree* — the Manual crosshair,
+    the Automatic search-window widget, and the found-centre markers. Harmless
+    when absent. Shared by czb_close, the node-switch teardown in
+    ``lifecycle.show_tree_node``, and ``BaseSignalTree.close()``."""
+    _czb_manual_stop_obj(tree)
+    _czb_remove_region(tree)
+    _czb_remove_found(tree)
+
+
 def czb_close(session, plot, payload=None) -> None:
     """Caret closed / left the Manual tab → remove the crosshair, the region
     box, and the found-centre marker."""
     _src, tree = _src_plot_tree(session, plot)
-    _czb_manual_stop_obj(tree)
-    _czb_remove_region(tree)
-    _czb_remove_found(tree)
+    _czb_clear_widgets(tree)
 
 
 def czb_pick(session, plot, payload) -> None:

@@ -205,6 +205,20 @@ def show_tree_node(plot, tree, new_signal) -> None:
 
     This is what makes a TransformAction (Rebin, Center Zero Beam, …) visibly
     take effect without the user having to nudge the crosshair."""
+    # Interactive per-node widgets (the Crop box; the CZB search box /
+    # crosshair / found markers) describe the node being LEFT — a node switch
+    # keeps their caret mounted (no <key>_close fires), so hide them here
+    # rather than leave them painted over the new node's data. Handlers that
+    # add markers AFTER switching (czb_run / czb_pick call _display first,
+    # then _czb_show_found) are unaffected; imports are lazy so this stays
+    # cycle-free.
+    try:
+        from spyde.actions.base import _crop_remove_widget
+        from spyde.actions.center_zero_beam import _czb_clear_widgets
+        _crop_remove_widget(tree)
+        _czb_clear_widgets(tree)
+    except Exception as e:
+        log.debug("node-switch widget teardown failed: %s", e)
     try:
         plot.set_plot_state(new_signal)
     except Exception as e:

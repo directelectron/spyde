@@ -874,6 +874,27 @@ class BaseSignalTree:
                     logger.debug("removing %s on tree close failed: %s", wiz_attr, e)
             if hasattr(self, wiz_attr):
                 setattr(self, wiz_attr, None)
+        # On-plot interactive widgets (the Crop box, the CZB search box and
+        # Manual crosshair: widgets have no remove(), only hide()) and the CZB
+        # found-centre marker groups (real remove()). All harmless when absent.
+        for attr in ("_crop_widget", "_czb_region_mg", "_czb_cross"):
+            wdg = getattr(self, attr, None)
+            if wdg is not None and hasattr(wdg, "hide"):
+                try:
+                    wdg.hide()
+                except Exception as e:
+                    logger.debug("hiding %s on tree close failed: %s", attr, e)
+            if hasattr(self, attr):
+                setattr(self, attr, None)
+        for mg in (getattr(self, "_czb_found_mgs", None) or []):
+            if hasattr(mg, "remove"):
+                try:
+                    mg.remove()
+                except Exception as e:
+                    logger.debug("removing czb found marker on tree close failed: %s", e)
+        for attr in ("_czb_found_mgs", "_crop_widget_handler", "_czb_region_handler"):
+            if hasattr(self, attr):
+                setattr(self, attr, None)
         self.signal_plots = []
         self.navigator_signals = {}
         self.navigator_plot_manager = None

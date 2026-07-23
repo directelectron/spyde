@@ -26,10 +26,11 @@ import { FindVectorsWizard } from './FindVectorsWizard'
 import { VectorOrientationWizard } from './VectorOrientationWizard'
 import { CenterZeroBeamWizard } from './CenterZeroBeamWizard'
 import { StrainWizard } from './StrainWizard'
+import { CropWizard } from './CropWizard'
 
 const WIZARD_ACTIONS = new Set([
   'Orientation Mapping', 'Find Diffraction Vectors', 'Vector Orientation Mapping',
-  'Center Zero Beam', 'Strain Mapping',
+  'Center Zero Beam', 'Strain Mapping', 'Crop',
 ])
 
 /**
@@ -293,6 +294,12 @@ export function FloatingToolbar({
         )}
         {openAction && openAction.name === 'Strain Mapping' && (
           <StrainWizard
+            caretPos={caretPos} windowId={windowId} sendAction={sendAction}
+            onClose={() => setOpenName(null)}
+          />
+        )}
+        {openAction && openAction.name === 'Crop' && (
+          <CropWizard
             caretPos={caretPos} windowId={windowId} sendAction={sendAction}
             onClose={() => setOpenName(null)}
           />
