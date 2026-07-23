@@ -93,6 +93,25 @@ class MultiplotManager:
             selectors.extend(sel_list)
         return selectors
 
+    def remove_navigation_selector(self, selector: "BaseSelector") -> bool:
+        """Deregister a selector from ``navigation_selectors`` (and drop it as
+        ``last_used_selector`` on its owning navigator window if it was that).
+
+        Called when the signal window a selector drives is closed — the
+        selector itself is closed by the caller (see
+        ``Session._cleanup_plot_selectors``); this just prevents the now-dead
+        selector from lingering in the manager's bookkeeping
+        (``all_navigation_selectors``, the ``_run_update`` downstream-chaining
+        lookup, etc.). Returns True if the selector was found and removed."""
+        removed = False
+        for nav_window, sel_list in self.navigation_selectors.items():
+            if selector in sel_list:
+                sel_list.remove(selector)
+                removed = True
+                if getattr(nav_window, "last_used_selector", None) is selector:
+                    nav_window.last_used_selector = sel_list[-1] if sel_list else None
+        return removed
+
     def add_plot_states_for_navigation_signals(self, signals: List[BaseSignal]) -> None:
         for plot_window in self.plot_windows:
             for plot in self.plots[plot_window]:
