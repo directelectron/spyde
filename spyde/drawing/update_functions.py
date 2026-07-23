@@ -1154,7 +1154,7 @@ def update_from_navigation_selection(
             #
             # Force the SYNCHRONOUS cache path (fast: ~1-2 ms dwell-in-chunk hits
             # vs ~16 ms distributed). Setting _client=None requests it, AND
-            # heavy_imports._patch_cached_dask_client makes the cache honour that
+            # spyde.external.hyperspy.cached_dask_array makes the cache honour that
             # (the fork's client property otherwise adopts the app's global default
             # Client from this non-worker thread → a distributed round-trip on
             # every move; the pin alone was a no-op — see that patch). A fresh
@@ -1738,29 +1738,39 @@ def stream_progressive_to_plot(plot, result_array, client, *, name="vi"):
     levels = [None]
 
     def _poll_loop():
-        while not stop.is_set():
+        # window_computing brackets the whole poll in try/finally so a
+        # cancelled stream (a new ROI move calling _stop_progressive_stream,
+        # or the compute erroring) still clears the renderer's floating
+        # "Calculating…" overlay — see lifecycle.window_computing.
+        from spyde.actions.lifecycle import window_computing
+        computing = window_computing(getattr(plot, "window_id", None))
+        computing.start()
+        try:
+            while not stop.is_set():
+                try:
+                    arr = read_live_buffer(nav_shape, shm_name)
+                    finite = arr[np.isfinite(arr)]
+                    if finite.size > 0:
+                        lo, hi = float(finite.min()), float(finite.max())
+                        if levels[0] is None:
+                            levels[0] = (lo, hi if hi > lo else lo + 1)
+                        elif hi > levels[0][1]:
+                            levels[0] = (levels[0][0], hi)
+                        plot.set_data(arr, levels=levels[0])
+                except Exception as e:
+                    log.debug("progressive %s poll paint failed: %s", name, e)
+                if future.done():
+                    break
+                _time.sleep(0.1)
+            # Final push of the completed buffer.
             try:
                 arr = read_live_buffer(nav_shape, shm_name)
-                finite = arr[np.isfinite(arr)]
-                if finite.size > 0:
-                    lo, hi = float(finite.min()), float(finite.max())
-                    if levels[0] is None:
-                        levels[0] = (lo, hi if hi > lo else lo + 1)
-                    elif hi > levels[0][1]:
-                        levels[0] = (levels[0][0], hi)
+                if np.isfinite(arr).any():
                     plot.set_data(arr, levels=levels[0])
             except Exception as e:
-                log.debug("progressive %s poll paint failed: %s", name, e)
-            if future.done():
-                break
-            _time.sleep(0.1)
-        # Final push of the completed buffer.
-        try:
-            arr = read_live_buffer(nav_shape, shm_name)
-            if np.isfinite(arr).any():
-                plot.set_data(arr, levels=levels[0])
-        except Exception as e:
-            log.debug("progressive %s final paint failed: %s", name, e)
+                log.debug("progressive %s final paint failed: %s", name, e)
+        finally:
+            computing.stop()
 
     t = threading.Thread(target=_poll_loop, daemon=True, name=f"{name}-poll")
     t.start()

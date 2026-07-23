@@ -38,6 +38,20 @@ const TILED = '__tiled__'
 const STACKED = '__stacked__'
 const STRAIN_LABEL: Record<string, string> = { exx: 'εxx', eyy: 'εyy', exy: 'εxy', omega: 'ω' }
 
+// Don't show the "Calculating…" chip for a compute that finishes fast — most
+// nav fills / VI streams on modest data land in well under this, and a chip
+// that flashes on/off for <300ms reads as UI noise rather than information.
+const COMPUTING_SHOW_DELAY_MS = 300
+
+// One-time keyframes for the chip's soft pulse (renderer has no global CSS
+// file — mirrors StatusBar.tsx's spyde-spin injection idiom).
+if (typeof document !== 'undefined' && !document.getElementById('spyde-compute-pulse-kf')) {
+  const el = document.createElement('style')
+  el.id = 'spyde-compute-pulse-kf'
+  el.textContent = '@keyframes spyde-compute-pulse { 0%, 100% { opacity: 0.55 } 50% { opacity: 1 } }'
+  document.head.appendChild(el)
+}
+
 // A window's content area: the unified "view" selector + the figure it shows.
 //
 // A window may hold several NAMED views of one navigation field — strain
@@ -60,6 +74,25 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction }: Prop
   const id = String(win.windowId)
   const figs = win.figures
   const { state, dragKind } = useSpyDE()
+
+  // ── Compute overlay (laundry #3) ────────────────────────────────────────────
+  // Backend brackets a long compute (progressive nav fill, streamed VI) with
+  // window_computing start/stop messages, keyed by windowId (see
+  // spyde.actions.lifecycle.window_computing + protocol.ts
+  // WindowComputingMessage). Flash-prevention: don't SHOW the chip until the
+  // backend has been computing for > SHOW_DELAY_MS — most computes finish in
+  // well under that, and flashing a chip for a 50ms fill reads as noise, not
+  // information. Hiding is immediate (no delay) once the stop message lands.
+  const isComputing = state.computingWindows.has(win.windowId)
+  const [showComputing, setShowComputing] = useState(false)
+  useEffect(() => {
+    if (!isComputing) {
+      setShowComputing(false)
+      return
+    }
+    const t = window.setTimeout(() => setShowComputing(true), COMPUTING_SHOW_DELAY_MS)
+    return () => window.clearTimeout(t)
+  }, [isComputing])
 
   // ── MDI overlay drop (Report Builder Phase 2) ──────────────────────────────
   // While a window/figure pill is in flight (dragKind==='window'), the figure
@@ -340,6 +373,20 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction }: Prop
             data-testid={`figure-${fig.figId}`}
           />
         ))}
+        {/* Floating translucent "Calculating…" chip — centered over the figure
+            while a tracked backend compute (progressive nav fill, streamed VI)
+            is filling THIS window in. pointer-events:none so it never steals
+            interaction; the chunk-by-chunk fill stays fully visible under it
+            (see styles.computingChip's opacity/background). */}
+        {showComputing && (
+          <div style={styles.computingOverlay} data-testid={`computing-overlay-${id}`}>
+            <div style={styles.computingChip}>
+              <span style={styles.computingDot} />
+              Calculating…
+            </div>
+          </div>
+        )}
+
         {/* IPF colour-key triangle legend — a native anyplotlib figure pinned in
             the corner of the 2-D map (the stereographic fundamental-sector key
             matplotlib/pyxem show), only over the RGB map (mode==='2d'). */}
@@ -415,6 +462,26 @@ const styles: Record<string, React.CSSProperties> = {
     border: '1px solid #313244', borderRadius: 6, padding: 2,
   },
   box: { flex: 1, minHeight: 0, position: 'relative' },
+  // Floating "Calculating…" overlay — centered, translucent, click-through.
+  // zIndex 5 sits above the figure/IPF-key (4) but below the drag-drop shield
+  // (6) and its confirm popover (7), so an active drag still takes priority.
+  computingOverlay: {
+    position: 'absolute', inset: 0, zIndex: 5,
+    display: 'flex', alignItems: 'center', justifyContent: 'center',
+    pointerEvents: 'none',
+  },
+  computingChip: {
+    display: 'flex', alignItems: 'center', gap: 7,
+    background: 'rgba(24,24,37,0.62)', border: '1px solid rgba(137,180,250,0.35)',
+    borderRadius: 20, padding: '7px 16px', fontSize: 12, fontWeight: 600,
+    color: '#cdd6f4', boxShadow: '0 6px 20px rgba(0,0,0,0.35)',
+    backdropFilter: 'blur(2px)',
+    animation: 'spyde-compute-pulse 1.6s ease-in-out infinite',
+  },
+  computingDot: {
+    width: 7, height: 7, borderRadius: '50%', background: '#89b4fa',
+    flex: '0 0 auto',
+  },
   ipfKey: {
     position: 'absolute', right: 6, bottom: 6, width: 132, height: 120,
     border: 'none', zIndex: 4,

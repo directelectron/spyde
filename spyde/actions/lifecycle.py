@@ -258,6 +258,51 @@ def progress_emitter(prefix: str, *, min_interval: float = 0.5) -> Callable[[int
     return progress
 
 
+# ── per-window "Calculating…" overlay ─────────────────────────────────────────
+
+class window_computing:
+    """Context manager: emit ``window_computing`` start/stop around a long
+    compute that paints into ``window_id`` (the progressive navigator fill, a
+    streamed virtual image, …) — drives the renderer's floating translucent
+    "Calculating…" chip centered on that plot window.
+
+    ALWAYS emits the matching stop, even on exception — the ``__exit__`` runs
+    unconditionally (a bare ``try/finally`` underneath), so a cancelled or
+    failed compute cannot leave the overlay stuck. ``window_id=None`` is a
+    silent no-op both ways (mirrors ``emit_window_computing``'s own guard) so
+    call sites don't need to special-case an unattached plot.
+
+    Usage::
+
+        with window_computing(nav_plot.window_id):
+            ...long fill...
+
+    or, when the start/stop don't naturally bracket a single call (e.g. a
+    background thread that outlives this function), call ``.start()`` /
+    ``.stop()`` directly and put ``.stop()`` in the thread's own
+    ``try/finally``.
+    """
+
+    def __init__(self, window_id: int | None):
+        self.window_id = window_id
+
+    def start(self) -> None:
+        from spyde.backend.ipc import emit_window_computing
+        emit_window_computing(self.window_id, True)
+
+    def stop(self) -> None:
+        from spyde.backend.ipc import emit_window_computing
+        emit_window_computing(self.window_id, False)
+
+    def __enter__(self) -> "window_computing":
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self.stop()
+        return False
+
+
 # ── progressive shared-memory fill ────────────────────────────────────────────
 
 def live_fill_poller(shape: Sequence[int], shm_name: str | None,
