@@ -82,7 +82,11 @@ function TreeNodes({ nodes, depth, activeId, windowId, onPick }:
 // Click-to-edit cell (Qt-like): shows the value as text; click turns it into an
 // input that commits on blur/Enter and reverts on Escape. Avoids the "wall of
 // always-on input boxes" look. ``display`` is the (possibly rounded) text shown
-// when not editing; editing always exposes the full-precision ``value``.
+// when not editing; editing always exposes the full-precision ``value``. A
+// non-editable cell falls back to showing ``value`` itself (real read-only
+// content, e.g. a derived metadata field) UNLESS the caller has no value at
+// all (the axes table's null scale/offset), signalled by passing "" — that
+// still renders as "—" via the placeholder branch below.
 function EditableCell({ value, display, editable, onCommit, testid }:
   { value: string; display?: string; editable: boolean
     onCommit: (v: string) => void; testid: string }) {
@@ -91,7 +95,13 @@ function EditableCell({ value, display, editable, onCommit, testid }:
   React.useEffect(() => { if (!editing) setDraft(value) }, [value, editing])
   const shown = display ?? value
 
-  if (!editable) return <span style={styles.axCellRO} data-testid={testid}>—</span>
+  if (!editable) {
+    return (
+      <span style={styles.axCellRO} data-testid={testid}>
+        {shown === '' ? '—' : shown}
+      </span>
+    )
+  }
   if (!editing) {
     return (
       <span data-testid={testid} style={styles.axText} title="click to edit"
@@ -422,6 +432,7 @@ export function PlotControlDock() {
   const win = activeId != null ? state.windows.get(activeId) : undefined
   const hist = activeId != null ? state.histograms.get(activeId) : undefined
   const meta = activeId != null ? state.metadata.get(activeId) : undefined
+  const metaEditable = activeId != null ? state.metadataEditable.get(activeId) : undefined
   const tree = activeId != null ? state.signalTrees.get(activeId) : undefined
   // Only the ACTIVE signal tree's selectors are listed — every window of a
   // tree receives the same signal_tree payload, so two windows belong to the
@@ -438,6 +449,16 @@ export function PlotControlDock() {
   const onAxisEdit = (index: number, field: string, value: string) => {
     if (activeId == null) return
     sendAction('set_axis', { index, field, value }, activeId)
+  }
+
+  // Instrument-metadata cell edit — same click-to-edit idiom as the axes
+  // table (EditableCell). The backend resolves (group, prop) back to the
+  // writable hyperspy metadata key + type (float/int/string) via the same
+  // METADATA_WIDGET_CONFIG the panel's values come from, so no key/type needs
+  // to travel over the wire — see spyde/backend/_session_axes.py:_set_metadata.
+  const onMetadataEdit = (group: string, prop: string, value: string) => {
+    if (activeId == null) return
+    sendAction('set_metadata', { group, prop, value }, activeId)
   }
 
   // "Set origin" crosshair tool: toggles a draggable crosshair on the signal
@@ -546,22 +567,42 @@ export function PlotControlDock() {
         />
       )}
 
-      {/* 4. Metadata — two columns to save vertical space */}
+      {/* 4. Metadata — two columns to save vertical space. Cells the backend
+          flagged as writable (metaEditable[group]) click-to-edit exactly like
+          an axes-table cell; everything else (Dtype, Dim., the whole Dataset
+          section) stays plain text. */}
       {win && meta && (
         <div style={{ ...styles.section, overflowY: 'auto' }} data-testid="metadata-panel">
-          {Object.entries(meta).map(([group, fields]) => (
-            <div key={group} style={{ marginBottom: 8 }}>
-              <div style={{ ...styles.label, fontWeight: 600, marginBottom: 4 }}>{group}</div>
-              <div style={styles.metaGrid}>
-                {Object.entries(fields).map(([k, v]) => (
-                  <div key={k} style={styles.metaCell}>
-                    <span style={styles.metaKey}>{k}</span>
-                    <span style={styles.metaVal}>{v}</span>
-                  </div>
-                ))}
+          {Object.entries(meta).map(([group, fields]) => {
+            const rawByProp = metaEditable?.[group]
+            return (
+              <div key={group} style={{ marginBottom: 8 }}>
+                <div style={{ ...styles.label, fontWeight: 600, marginBottom: 4 }}>{group}</div>
+                <div style={styles.metaGrid}>
+                  {Object.entries(fields).map(([k, v]) => {
+                    // value/display split (same as the axes table's rounded
+                    // scale/offset): the cell DISPLAYS the formatted string
+                    // with units ("12000.5 x") but the editor pre-fills the
+                    // RAW unit-free value ("12000.5") — committing the
+                    // display string back would fail the backend's float().
+                    const raw = rawByProp?.[k]
+                    return (
+                      <div key={k} style={styles.metaCell}>
+                        <span style={styles.metaKey}>{k}</span>
+                        <EditableCell
+                          testid={`meta-${group}-${k}`}
+                          value={raw ?? ''}
+                          display={v}
+                          editable={raw !== undefined}
+                          onCommit={(next) => onMetadataEdit(group, k, next)}
+                        />
+                      </div>
+                    )
+                  })}
+                </div>
               </div>
-            </div>
-          ))}
+            )
+          })}
         </div>
       )}
 
