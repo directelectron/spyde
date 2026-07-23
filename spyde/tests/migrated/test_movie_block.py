@@ -639,6 +639,243 @@ class TestOverlays:
         assert os.path.exists(out) and os.path.getsize(out) > 0
 
 
+# ── OVERLAY SCOPING: the editor's live-plot widgets must not leak (laundry #6) ────
+#
+# Root cause: annotation/crop/overlay-image widgets are drawn on the tree's REAL
+# signal Plot2D (the movie editor never builds its own figure — see movie.py's
+# module docstring). `movie_close` already tore them down correctly
+# (`_teardown_session` -> `unbind_live_windows` -> `clear_overlay_widgets`,
+# covered by `test_annotation_widgets_drag_persists_to_spec` above). But every
+# OTHER exit path that can drop a `MovieEditSession` did NOT route through that
+# same teardown:
+#   * `ReportManager._clear_movie_sessions` (report_new / report_close) only
+#     flipped the export cancel flag and cleared the session dict — the widgets
+#     stayed on the live plot.
+#   * `report_remove_cell` had no branch for cell_type == "movie" at all.
+# Both are fixed in handlers.py to route through movie.py's `_teardown_session`
+# (the SAME function `movie_close` uses), so the widget cleanup can't drift
+# between exit paths.
+
+class TestOverlayScopingAcrossExitPaths:
+    def _add_two_annotations(self, session, cell_id):
+        M.movie_tune(session, None, {"cell_id": cell_id, "annotations": [
+            {"kind": "text", "text": "Label", "xy": [10, 20], "time_range": [0, 1]},
+            {"kind": "rect", "xy": [5, 5], "wh": [30, 30], "time_range": [0, 1]}]})
+
+    def test_report_new_tears_down_widgets_but_keeps_cell_persistence(self, movie_dataset):
+        # A "New" report (or Open, or explicit report_close) while the editor is
+        # open must drop the widgets off the LIVE plot — the cell model itself
+        # (in the OLD doc, which report_new discards) is a separate concern; what
+        # matters here is the live Plot2D's widget registry is left clean, not
+        # still painting a dead session's overlays.
+        session, messages = movie_dataset["window"], movie_dataset["messages"]
+        cell_id = _add_movie(session, messages)
+        M.movie_open(session, None, {"cell_id": cell_id})
+        sess = M._sessions(session._report)[cell_id]
+        p2 = sess._signal_plot2d()
+        assert p2 is not None
+        self._add_two_annotations(session, cell_id)
+        widget_ids = [getattr(w, "id", None) for w in sess._ann_widgets.values()]
+        assert len(widget_ids) == 2
+        assert all(wid in p2._widgets for wid in widget_ids), \
+            "annotation widgets must be registered on the live Plot2D"
+
+        # New report (mirrors the "New"/"Open" sidebar action) — this is the
+        # report-wide exit path that used to leak.
+        H.report_new(session, None, {"type": "report"})
+
+        assert cell_id not in M._sessions(session._report), \
+            "the movie session must not survive a report_new"
+        assert not sess._ann_widgets, "session's widget bookkeeping must be cleared"
+        assert not any(wid in p2._widgets for wid in widget_ids), \
+            "annotation widgets must be removed from the live Plot2D by report_new"
+
+    def test_report_close_tears_down_widgets(self, movie_dataset):
+        session, messages = movie_dataset["window"], movie_dataset["messages"]
+        cell_id = _add_movie(session, messages)
+        M.movie_open(session, None, {"cell_id": cell_id})
+        sess = M._sessions(session._report)[cell_id]
+        p2 = sess._signal_plot2d()
+        self._add_two_annotations(session, cell_id)
+        widget_ids = [getattr(w, "id", None) for w in sess._ann_widgets.values()]
+
+        from spyde.actions.report.handlers import report_close
+        report_close(session, None, {})
+
+        assert not sess._ann_widgets
+        assert not any(wid in p2._widgets for wid in widget_ids)
+
+    def test_remove_movie_cell_tears_down_widgets(self, movie_dataset):
+        # Deleting the movie cell itself (report_remove_cell) while its editor
+        # session is open must ALSO clear the live-plot widgets — previously
+        # report_remove_cell had no branch for cell_type == "movie" at all, so
+        # the session (and its widgets) just leaked silently.
+        session, messages = movie_dataset["window"], movie_dataset["messages"]
+        cell_id = _add_movie(session, messages)
+        M.movie_open(session, None, {"cell_id": cell_id})
+        sess = M._sessions(session._report)[cell_id]
+        p2 = sess._signal_plot2d()
+        self._add_two_annotations(session, cell_id)
+        widget_ids = [getattr(w, "id", None) for w in sess._ann_widgets.values()]
+        assert all(wid in p2._widgets for wid in widget_ids)
+
+        from spyde.actions.report.handlers import report_remove_cell
+        report_remove_cell(session, None, {"cell_id": cell_id})
+
+        assert cell_id not in M._sessions(session._report)
+        assert session._report.doc.cell_by_id(cell_id) is None, \
+            "the cell must be removed from the document"
+        assert not sess._ann_widgets
+        assert not any(wid in p2._widgets for wid in widget_ids)
+
+    def test_reopen_after_close_restores_widgets_from_persisted_spec(self, movie_dataset):
+        # PERSISTENCE STAYS: the annotations live on cell.movie.annotations
+        # regardless of the editor's open/close state. Closing must remove the
+        # live widgets; reopening must rebuild them from that SAME persisted
+        # list (not lose them).
+        session, messages = movie_dataset["window"], movie_dataset["messages"]
+        cell_id = _add_movie(session, messages)
+        M.movie_open(session, None, {"cell_id": cell_id})
+        self._add_two_annotations(session, cell_id)
+        cell = session._report.doc.cell_by_id(cell_id)
+        assert len(cell.movie.annotations) == 2          # persisted on the spec
+
+        M.movie_close(session, None, {"cell_id": cell_id})
+        assert cell_id not in M._sessions(session._report)
+        # The model survives the close untouched.
+        cell_after_close = session._report.doc.cell_by_id(cell_id)
+        assert len(cell_after_close.movie.annotations) == 2
+
+        M.movie_open(session, None, {"cell_id": cell_id})
+        sess2 = M._sessions(session._report)[cell_id]
+        p2b = sess2._signal_plot2d()
+        assert len(sess2._ann_widgets) == 2, "reopen must rebuild widgets from the spec"
+        widget_ids2 = [getattr(w, "id", None) for w in sess2._ann_widgets.values()]
+        assert all(wid in p2b._widgets for wid in widget_ids2)
+
+    def test_view_outside_editor_after_close_shows_no_overlays(self, movie_dataset):
+        # "Viewing the same tree's signal window normally" after the editor
+        # closes must not show the movie's overlays — i.e. the live Plot2D the
+        # rest of the app renders (sess.signal_plot._plot2d, the SAME object
+        # WindowContent's iframe reflects) carries no leftover widgets.
+        session, messages = movie_dataset["window"], movie_dataset["messages"]
+        cell_id = _add_movie(session, messages)
+        M.movie_open(session, None, {"cell_id": cell_id})
+        sess = M._sessions(session._report)[cell_id]
+        live_plot = sess.signal_plot
+        p2 = live_plot._plot2d
+        self._add_two_annotations(session, cell_id)
+        assert p2._widgets, "sanity: widgets present while editor open"
+
+        M.movie_close(session, None, {"cell_id": cell_id})
+
+        # live_plot is the SAME Plot the MDI window shows outside the editor —
+        # its Plot2D must be clean.
+        assert not p2._widgets, \
+            "the live signal plot still carries movie overlay widgets after close"
+
+
+# ── TILE MODE: the editor's frame updates must route through anyplotlib tile
+#    mode for a LARGE frame (laundry #13) ──────────────────────────────────────
+#
+# The movie editor never builds its own figure/paint path — it drives the
+# tree's REAL 1-D time-navigator selector (`sess.time_selector`), whose update
+# fires the SAME `Plot._set_array` every other nav move uses (see
+# `update_from_navigation_selection` -> `child.enqueue_paint` ->
+# `Plot._set_array` -> `Plot._maybe_gpu_tile`). So a movie whose frames are
+# already >= Plot._GPU_TILE_MIN_EDGE (1024 px edge) takes the SAME tile path
+# scrubbing through the editor as scrubbing the plain MDI window; there is no
+# second/bespoke tile implementation to fork. This is verified directly against
+# `Plot._maybe_gpu_tile` (spy/monkeypatch) using a synthetic movie built the
+# same way `load_test_data_movie` builds its (smaller, to keep the test fast)
+# large-frame synthetic movie (`_build_movie_frames`, shared with the tutorial
+# loader — see spyde/backend/tutorial_data.py).
+
+def _big_movie_dataset(session, edge=1100, n_frames=3):
+    """A lazy in-situ movie whose frames are >= Plot._GPU_TILE_MIN_EDGE (1024),
+    1 frame/chunk (mirrors the real storage-aligned chunking a large in-situ
+    movie loads with)."""
+    import dask.array as da
+    import hyperspy.api as hs
+    from spyde.backend.tutorial_data import _build_movie_frames
+    frames = _build_movie_frames(edge, n_frames).astype(np.float32)
+    stack = da.from_array(frames, chunks=(1, edge, edge))
+    s = hs.signals.Signal2D(stack).as_lazy()
+    tax = s.axes_manager.navigation_axes[0]
+    tax.name, tax.units, tax.scale = "time", "sec", 0.1
+    s.set_signal_type("insitu")
+    session._add_signal(s, source_path=None)
+    time.sleep(1.0)
+
+
+class TestTileModeInEditor:
+    def test_scrub_in_editor_routes_through_gpu_tile(self, window):
+        from spyde.drawing.plots.plot import Plot
+        session, messages = window["window"], window["messages"]
+        _big_movie_dataset(session)
+        plot = _insitu_plot(session)
+        assert plot is not None, "no big in-situ plot loaded"
+
+        H.report_new(session, None, {"type": "report"})
+        M.report_add_movie_cell(session, None,
+                                {"source_window_id": plot.window_id, "caption": "big"})
+        rs = _latest(messages, "report_state")
+        cell_id = next(c for c in rs["report"]["cells"] if c["cell_type"] == "movie")["id"]
+
+        calls = []
+        orig = Plot._maybe_gpu_tile
+
+        def spy(self, data, clim, axes, units):
+            calls.append((self.window_id, tuple(data.shape)))
+            return orig(self, data, clim, axes, units)
+
+        with patch.object(Plot, "_maybe_gpu_tile", spy):
+            M.movie_open(session, None, {"cell_id": cell_id})
+            sess = M._sessions(session._report)[cell_id]
+            assert sess.signal_plot is not None
+            assert sess.signal_plot.window_id == plot.window_id
+
+            before = len(calls)
+            M.movie_scrub(session, None, {"cell_id": cell_id, "t": 1})
+            _wait_until(lambda: sess.current_index() == 1)
+            assert sess.current_index() == 1
+            # The read (nav index) and the PAINT are decoupled (Live-Display §3:
+            # a serial newest-wins _NavPainter thread runs the actual
+            # _set_array/_maybe_gpu_tile call after the index updates) — wait
+            # for the tile call itself, not just the index.
+            _wait_until(lambda: len(calls) > before)
+
+        assert len(calls) > before, \
+            "scrubbing in the movie editor did not reach Plot._maybe_gpu_tile " \
+            "(the tile flow) for a >=1024px frame"
+        assert all(max(shape) >= 1024 for _wid, shape in calls[before:])
+        # Reviewer hardening: prove tile mode actually ENGAGED (a backend was
+        # installed), not merely that the entry point was reached.
+        assert getattr(plot, "_gpu_tile_backend", None) is not None, \
+            "tile entry point ran but no tile backend was installed"
+
+    def test_scrub_in_editor_keeps_using_same_plot_as_outside_editor(self, window):
+        # The editor must not fork a second display path: the Plot object it
+        # scrubs through (sess.signal_plot) is the IDENTICAL object the MDI
+        # window (outside the editor) paints — same _plot2d, same tile backend
+        # state, so "zoom persists across scrub" falls out for free (anyplotlib
+        # owns the tile loop on that one Plot2D; nothing here resets it).
+        session, messages = window["window"], window["messages"]
+        _big_movie_dataset(session)
+        plot = _insitu_plot(session)
+        H.report_new(session, None, {"type": "report"})
+        M.report_add_movie_cell(session, None,
+                                {"source_window_id": plot.window_id, "caption": "big"})
+        rs = _latest(messages, "report_state")
+        cell_id = next(c for c in rs["report"]["cells"] if c["cell_type"] == "movie")["id"]
+        M.movie_open(session, None, {"cell_id": cell_id})
+        sess = M._sessions(session._report)[cell_id]
+        assert sess.signal_plot is plot, \
+            "the editor must surface the SAME live Plot the MDI window uses, " \
+            "not a copy/second figure"
+        assert sess._signal_plot2d() is plot._plot2d
+
+
 # ── MEMORY SAFETY: neither preview nor export computes the full dataset ────────────
 
 def _guarded_compute(real):

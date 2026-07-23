@@ -216,15 +216,28 @@ class ReportManager:
         _clear_vectors_explorer_cache()
 
     def _clear_movie_sessions(self) -> None:
-        """Tear down any open Movie editor sessions (cancel in-flight exports).
-        Owned lazily by the movie block; safe to call when none exist."""
+        """Tear down any open Movie editor sessions: cancel in-flight exports
+        AND unbind their live windows (drop the annotation/crop/overlay-image
+        widgets off the signal plot). Owned lazily by the movie block; safe to
+        call when none exist.
+
+        This is a report-wide exit path (``new()`` / ``close()`` — a report
+        "New"/"Open" or close while an editor is open), which the frontend does
+        NOT couple to the Movie editor's own lifecycle (MovieGate is mounted at
+        the app root, independent of whether a report is open), so no
+        `movie_close` is guaranteed to fire first. Previously this only flipped
+        the cancel flag and dropped the session dict — the widgets the editor
+        had drawn on the tree's LIVE signal plot were never removed, so they
+        kept painting there even though the cell that owned them (and the
+        session tracking them) was gone (laundry #6). Routes through the SAME
+        ``_teardown_session`` `movie_close` uses (not a second copy) so the two
+        exit paths can't drift."""
         sessions = getattr(self, "_movie_sessions", None)
         if not sessions:
             return
+        from spyde.actions.report.movie import _teardown_session
         for st in list(sessions.values()):
-            flag = getattr(st, "_cancel_flag", None)
-            if flag is not None:
-                flag[0] = True
+            _teardown_session(self.session, st)
         sessions.clear()
 
     def close_windows(self) -> None:
@@ -2411,6 +2424,18 @@ def report_remove_cell(session, plot, payload) -> None:
         _clear_vectors_explorer_cache(cell.id)
     elif cell.cell_type == "image":
         mgr._images.pop(cell.id, None)
+    elif cell.cell_type == "movie":
+        # Tear down any open Movie editor session for THIS cell so a delete
+        # while its editor happens to be open (undo/redo, a future UI path)
+        # doesn't leak the annotation/crop/overlay-image widgets it drew on
+        # the live signal plot — the session dict would otherwise keep a
+        # reference to a cell that no longer exists in the doc (laundry #6).
+        sessions = getattr(mgr, "_movie_sessions", None)
+        st = sessions.pop(cell.id, None) if sessions else None
+        if st is not None:
+            from spyde.actions.report.movie import _teardown_session
+            _teardown_session(session, st)
+        mgr._baked.pop(cell.id, None)
     mgr.doc.cells = [c for c in mgr.doc.cells if c.id != cell.id]
     mgr.dirty = True
     mgr.emit_state()
