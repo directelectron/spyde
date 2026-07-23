@@ -2307,6 +2307,45 @@ def report_set_split_figure(session, plot, payload) -> None:
     mgr.emit_state()
 
 
+def report_split_remove_figure(session, plot, payload) -> None:
+    """Remove JUST the figure/photo side of a SPLIT cell, converting it in place
+    to a plain ``"markdown"`` cell that keeps the text side's ``source`` (the
+    whole-cell delete — ``report_remove_cell`` — is a separate, unrelated action
+    and stays untouched).
+
+    ``{cell_id}``. Tears down the figure side's resources exactly like
+    :func:`report_remove_cell` does for a split cell (figure window, snapshot,
+    baked PNG, offline flag, edit-mode wiring, annotation-widget map, panel
+    selection, held photo bytes, vectors-explorer cache) so nothing leaks, then
+    flips ``cell_type`` to ``"markdown"`` and clears the split-only fields
+    (``spec``, ``image_ext``, ``split_layout`` back to its default). A non-split
+    / unknown cell is a no-op (no crash)."""
+    mgr = _manager(session)
+    if not mgr.open:
+        return
+    cell = mgr.doc.cell_by_id(payload.get("cell_id"))
+    if cell is None or cell.cell_type != "split":
+        return
+    wid = mgr._window_by_cell.get(cell.id)
+    if wid is not None:
+        mgr._forget(wid)
+    mgr._snapshots.pop(cell.id, None)
+    mgr._baked.pop(cell.id, None)
+    mgr._offline.discard(cell.id)
+    mgr._editing.discard(cell.id)
+    mgr._edit_wiring.pop(cell.id, None)
+    mgr._ann_widgets.pop(cell.id, None)
+    mgr._selected.pop(cell.id, None)
+    mgr._images.pop(cell.id, None)
+    _clear_vectors_explorer_cache(cell.id)
+    cell.cell_type = "markdown"
+    cell.spec = None
+    cell.image_ext = ""
+    cell.split_layout = "text-left"
+    mgr.dirty = True
+    mgr.emit_state()
+
+
 def report_update_cell(session, plot, payload) -> None:
     mgr = _manager(session)
     if not mgr.open:

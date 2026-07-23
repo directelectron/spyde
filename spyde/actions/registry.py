@@ -102,6 +102,7 @@ STAGED_HANDLERS: dict[str, str] = {
     "report_add_figure_placeholder": "spyde.actions.report.handlers.report_add_figure_placeholder",
     "report_set_split_layout": "spyde.actions.report.handlers.report_set_split_layout",
     "report_set_split_figure": "spyde.actions.report.handlers.report_set_split_figure",
+    "report_split_remove_figure": "spyde.actions.report.handlers.report_split_remove_figure",
     "report_update_cell":      "spyde.actions.report.handlers.report_update_cell",
     "report_remove_cell":      "spyde.actions.report.handlers.report_remove_cell",
     "report_move_cell":        "spyde.actions.report.handlers.report_move_cell",

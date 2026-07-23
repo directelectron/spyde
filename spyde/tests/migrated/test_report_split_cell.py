@@ -439,6 +439,157 @@ class TestFigurePlaceholderSlide:
         assert _cells(messages)[0]["cell_type"] == "markdown"
 
 
+class TestSplitRemoveFigure:
+    """report_split_remove_figure — removing JUST the figure/photo side of a
+    split cell converts it in place to a plain markdown cell, preserving the
+    text (laundry item #7: previously only whole-cell delete existed)."""
+
+    def test_remove_figure_side_converts_to_markdown(self, stem_4d_dataset):
+        session = stem_4d_dataset["window"]
+        messages = stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        wid = _signal_wid(session)
+        h.report_new(session, None, {"type": "presentation"})
+        h.report_add_split_cell(session, None,
+                                {"source": "keep this text", "layout": "text-right"})
+        cid = _cells(messages)[0]["id"]
+        h.report_set_split_figure(
+            session, None, {"cell_id": cid, "source_window_id": wid})
+        assert _cells(messages)[0]["cell_type"] == "split"   # sanity: figure attached
+
+        h.report_split_remove_figure(session, None, {"cell_id": cid})
+        c = next(x for x in _cells(messages) if x["id"] == cid)
+        assert c["cell_type"] == "markdown"
+        assert c["source"] == "keep this text"     # text preserved
+        assert c.get("figure") is None
+        assert not c.get("split_empty")            # markdown cells carry no split flag
+
+        # The underlying doc cell itself also flipped cleanly (spec/image_ext/
+        # split_layout reset, not just the emitted dict).
+        mgr = h._manager(session)
+        doc_cell = mgr.doc.cell_by_id(cid)
+        assert doc_cell.cell_type == "markdown"
+        assert doc_cell.spec is None
+        assert not doc_cell.image_ext
+        assert doc_cell.split_layout == "text-left"
+
+    def test_remove_photo_side_converts_to_markdown(self, window):
+        session, messages = window["window"], window["messages"]
+        h.report_new(session, None, {})
+        h.report_add_split_cell(session, None, {"source": "photo caption text"})
+        cid = _cells(messages)[0]["id"]
+        mgr = h._manager(session)
+        cell = mgr.doc.cell_by_id(cid)
+        cell.image_ext = "png"
+        mgr._images[cid] = b"PHOTOBYTES"
+
+        h.report_split_remove_figure(session, None, {"cell_id": cid})
+        doc_cell = mgr.doc.cell_by_id(cid)
+        assert doc_cell.cell_type == "markdown"
+        assert doc_cell.source == "photo caption text"
+        assert not doc_cell.image_ext
+        assert cid not in mgr._images   # held photo bytes cleaned up, no leak
+
+    def test_remove_figure_cleans_up_figure_window(self, stem_4d_dataset):
+        # REGRESSION guard: the figure-side teardown (window/snapshot/offline/
+        # edit-wiring/ann-widgets/selection) must mirror report_remove_cell's
+        # cleanup for a split cell, so nothing leaks after conversion.
+        session = stem_4d_dataset["window"]
+        messages = stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        wid = _signal_wid(session)
+        h.report_new(session, None, {"type": "presentation"})
+        h.report_add_split_cell(session, None, {"source": "t"})
+        cid = _cells(messages)[0]["id"]
+        h.report_set_split_figure(
+            session, None, {"cell_id": cid, "source_window_id": wid})
+        mgr = h._manager(session)
+        assert cid in mgr._window_by_cell
+        assert cid in mgr._snapshots
+
+        h.report_split_remove_figure(session, None, {"cell_id": cid})
+        assert cid not in mgr._window_by_cell
+        assert cid not in mgr._snapshots
+        assert cid not in mgr._baked
+        assert cid not in mgr._offline
+        assert cid not in mgr._editing
+
+    def test_remove_figure_on_empty_split_still_converts(self, window):
+        # An empty (drop-zone) split has nothing to tear down but still converts
+        # cleanly — no crash on the "nothing to remove" case.
+        session, messages = window["window"], window["messages"]
+        h.report_new(session, None, {})
+        h.report_add_split_cell(session, None, {"source": "empty side text"})
+        cid = _cells(messages)[0]["id"]
+        h.report_split_remove_figure(session, None, {"cell_id": cid})
+        c = next(x for x in _cells(messages) if x["id"] == cid)
+        assert c["cell_type"] == "markdown"
+        assert c["source"] == "empty side text"
+
+    def test_remove_figure_non_split_is_noop(self, window):
+        session, messages = window["window"], window["messages"]
+        h.report_new(session, None, {})
+        h.report_add_cell(session, None, {"cell_type": "markdown", "source": "m"})
+        cid = _cells(messages)[0]["id"]
+        states_before = len(_states(messages))
+        h.report_split_remove_figure(session, None, {"cell_id": cid})
+        # No new report_state emitted — a plain markdown cell is untouched.
+        assert len(_states(messages)) == states_before
+        assert _cells(messages)[0]["cell_type"] == "markdown"
+        assert _cells(messages)[0]["source"] == "m"
+
+    def test_remove_figure_then_edit_text_like_a_markdown_cell(self, stem_4d_dataset):
+        # After conversion the cell behaves exactly like a normal markdown cell:
+        # report_update_cell edits its `source` through the markdown branch.
+        session = stem_4d_dataset["window"]
+        messages = stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        wid = _signal_wid(session)
+        h.report_new(session, None, {})
+        h.report_add_split_cell(session, None, {"source": "orig"})
+        cid = _cells(messages)[0]["id"]
+        h.report_set_split_figure(
+            session, None, {"cell_id": cid, "source_window_id": wid})
+        h.report_split_remove_figure(session, None, {"cell_id": cid})
+        h.report_update_cell(session, None, {"cell_id": cid, "source": "edited"})
+        c = next(x for x in _cells(messages) if x["id"] == cid)
+        assert c["cell_type"] == "markdown"
+        assert c["source"] == "edited"
+
+    def test_remove_figure_roundtrips_through_zip(self, stem_4d_dataset, tmp_path):
+        # The whole point: after save/reload the cell stays a plain markdown
+        # cell (not resurrected as a split) with the text intact, and no stray
+        # figures/<id>.yaml asset is written for it. (A markdown cell's id is
+        # NOT persisted across a report.md round-trip — unlike split/figure/
+        # image/movie cells it carries no id marker — so re-association here is
+        # by content/position, not by the pre-save cell id.)
+        session = stem_4d_dataset["window"]
+        messages = stem_4d_dataset["messages"]
+        _prime_plot_data(session)
+        wid = _signal_wid(session)
+        h.report_new(session, None, {"type": "presentation"})
+        h.report_add_split_cell(session, None,
+                                {"source": "persisted text", "layout": "text-right"})
+        cid = _cells(messages)[0]["id"]
+        h.report_set_split_figure(
+            session, None, {"cell_id": cid, "source_window_id": wid})
+        h.report_split_remove_figure(session, None, {"cell_id": cid})
+
+        mgr = h._manager(session)
+        p = str(tmp_path / "split_remove_fig.spyde-report")
+        assets = mgr.assemble_assets({})
+        write_report(mgr.doc, p, assets)
+        doc2, assets2 = read_report(p)
+        assert len(doc2.cells) == 1
+        c2 = doc2.cells[0]
+        assert c2.cell_type == "markdown"
+        assert c2.source == "persisted text"
+        assert c2.spec is None
+        assert not c2.image_ext
+        assert cid not in assets2       # no leftover figure/photo asset
+        assert not assets2              # nothing orphaned under any key either
+
+
 # ── handlers: full zip save/reopen through the manager ──────────────────────────
 
 

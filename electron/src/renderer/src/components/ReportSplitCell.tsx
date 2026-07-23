@@ -19,6 +19,11 @@
  *   • a LIVE figure embed (SeamlessFigureFrame, keyed by fig_id === cell.id) when
  *     the figure side is a snapshot spec — interactive, like a normal figure cell.
  *   • an <img> when the figure side is a photo (`image` data URL).
+ * When the figure side is FILLED (live or photo), hovering it reveals its OWN
+ * small ✕ chip in the pane's corner (`report-split-remove-figure-<id>`) that
+ * removes JUST the figure/photo — `report_split_remove_figure` converts the
+ * block in place to a plain markdown cell, keeping the text side. This is
+ * separate from the block-level Delete (which removes the whole cell).
  *
  * Chrome (hover): the shared CellChrome trio (Copy / Duplicate / Delete) + a
  * reorder ⠿ handle + the layout switch. NO slide-toggle chrome (removed in the
@@ -127,6 +132,13 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
       return next
     })
   }
+  // Remove JUST the figure/photo side — converts this block to a plain text
+  // cell (report_split_remove_figure), preserving the text side. Shown on the
+  // figure pane's OWN hover chrome (not the block-level CellChrome trio, which
+  // deletes the whole block) whenever the figure side is filled (live figure or
+  // photo) — not on the empty drop zone, which has nothing to remove.
+  const [figHover, setFigHover] = useState(false)
+  const removeFigure = () => sendAction('report_split_remove_figure', { cell_id: cell.id })
 
   const commitText = () => {
     setEditing(false)
@@ -245,7 +257,11 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
           <div style={styles.dropzoneText}>Drop a figure window here</div>
         </div>
       ) : isLive && fig ? (
-        <div style={styles.figBox}>
+        <div
+          style={styles.figBox}
+          onMouseEnter={() => setFigHover(true)}
+          onMouseLeave={() => setFigHover(false)}
+        >
           <SeamlessFigureFrame
             figId={fig.figId}
             filePath={fig.filePath}
@@ -267,10 +283,50 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
               } : {})}
             />
           )}
+          {figHover && (
+            <button
+              data-testid={`report-split-remove-figure-${cell.id}`}
+              style={styles.figRemoveBtn}
+              title="Remove the figure — keeps the text as a plain cell"
+              onClick={removeFigure}
+              onMouseEnter={(e) => {
+                e.currentTarget.style.background = 'rgba(243,139,168,0.22)'
+                e.currentTarget.style.borderColor = '#f38ba8'
+                e.currentTarget.style.color = '#f38ba8'
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.background = 'rgba(24,24,37,0.92)'
+                e.currentTarget.style.borderColor = '#313244'
+                e.currentTarget.style.color = '#cdd6f4'
+              }}
+            >✕</button>
+          )}
         </div>
       ) : hasImage ? (
-        <div style={styles.figBox}>
+        <div
+          style={styles.figBox}
+          onMouseEnter={() => setFigHover(true)}
+          onMouseLeave={() => setFigHover(false)}
+        >
           <img src={cell.image} alt={cell.caption ?? ''} style={styles.img} />
+          {figHover && (
+            <button
+              data-testid={`report-split-remove-figure-${cell.id}`}
+              style={styles.figRemoveBtn}
+              title="Remove the photo — keeps the text as a plain cell"
+              onClick={removeFigure}
+              onMouseEnter={(e) => {
+                e.currentTarget.style.background = 'rgba(243,139,168,0.22)'
+                e.currentTarget.style.borderColor = '#f38ba8'
+                e.currentTarget.style.color = '#f38ba8'
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.background = 'rgba(24,24,37,0.92)'
+                e.currentTarget.style.borderColor = '#313244'
+                e.currentTarget.style.color = '#cdd6f4'
+              }}
+            >✕</button>
+          )}
         </div>
       ) : (
         <div style={styles.figBox}>
@@ -478,6 +534,15 @@ const styles: Record<string, React.CSSProperties> = {
   },
   shield: {
     position: 'absolute', inset: 0, zIndex: 3, background: 'transparent',
+  },
+  figRemoveBtn: {
+    position: 'absolute', top: 6, right: 6, zIndex: 5,
+    background: 'rgba(24,24,37,0.92)', border: '1px solid #313244',
+    color: '#cdd6f4', cursor: 'pointer', borderRadius: 6,
+    width: 22, height: 22, display: 'inline-flex',
+    alignItems: 'center', justifyContent: 'center', padding: 0,
+    fontSize: 12, lineHeight: 1, boxShadow: '0 2px 6px rgba(0,0,0,0.35)',
+    transition: 'background 100ms ease, color 100ms ease, border-color 100ms ease',
   },
   dropzone: {
     display: 'flex', flexDirection: 'column', alignItems: 'center',
