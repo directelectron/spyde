@@ -313,15 +313,7 @@ class Session(
         tree.open()
 
         # Emit metadata + axes for the sidebar, tagged with this tree's windows.
-        try:
-            from spyde.metadata_extract import build_metadata_dict
-            emit({
-                "type": "metadata",
-                "window_ids": self._tree_window_ids(tree),
-                "metadata": build_metadata_dict(tree),
-            })
-        except Exception as e:
-            log.warning("metadata emit failed: %s", e)
+        self._emit_metadata(tree)
         self._emit_axes(tree)
         self._emit_signal_type(tree)
         # The Workflow panel is always-on: push the (initial, single-node) tree
@@ -397,15 +389,7 @@ class Session(
             emit_error(f"Could not set signal type to {signal_type!r}: {e}")
             return
         # Re-broadcast the dependent sidebar panels.
-        try:
-            from spyde.metadata_extract import build_metadata_dict
-            emit({
-                "type": "metadata",
-                "window_ids": self._tree_window_ids(tree),
-                "metadata": build_metadata_dict(tree),
-            })
-        except Exception as e:
-            log.debug("metadata re-emit after signal-type change failed: %s", e)
+        self._emit_metadata(tree)
         self._emit_signal_type(tree)
         # Re-send the toolbar config: available actions are gated on the signal
         # class / signal_type (toolbars.yaml signal_class / signal_types), so a
@@ -545,6 +529,16 @@ class Session(
         # in flight) is no longer the one the plot wants — drop its result silently.
         # This also covers a torn shared-memory read, whose result is a ValueError;
         # it's expected under the latest-wins model, not an error.
+        #
+        # window_computing stop: this is the resolution point for the ONE
+        # future add_signal_plot's window_computing.start() bracketed (the
+        # initial-frame client.compute for a lazy signal). Every branch below
+        # (superseded/dropped/applied/exception) is a terminal outcome for
+        # THIS future, so unconditionally emit the stop here — a no-op on the
+        # renderer if this window was never actually tracked as computing (a
+        # plain nav-read plot_ready, unrelated to add_signal_plot).
+        from spyde.actions.lifecycle import window_computing
+        window_computing(getattr(plot, "window_id", None)).stop()
         if plot.current_data is not future:
             if _NAV_TIMING:
                 log.debug("[REDRAW2] DROP win=%s (current_data superseded "

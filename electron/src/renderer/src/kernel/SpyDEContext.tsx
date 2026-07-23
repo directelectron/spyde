@@ -166,6 +166,11 @@ interface State {
   // before any report is opened/created.
   report: ReportDocState | null
   metadata: Map<number, MetadataDict>
+  // {group: {prop: raw}} of writable cells for that window's metadata dict —
+  // presence gates editability, the value is the unit-free raw value the
+  // inline editor pre-fills with. Sent as a sibling field on the same
+  // `metadata` message (see protocol.ts).
+  metadataEditable: Map<number, Record<string, Record<string, string>>>
   histograms: Map<number, Histogram>
   selectors: Map<number, SelectorInfo>
   signalTrees: Map<number, TreeNode>
@@ -175,6 +180,7 @@ interface State {
   composition: Map<number, Composition>     // windowId → sample elements + percentages
   activeActions: Map<number, Set<string>>   // windowId → action names with live output
   subItems: Map<number, Map<string, SubItem[]>>  // windowId → action → dynamic chips
+  computingWindows: Set<number>   // windowIds with a long compute in flight (→ floating overlay)
   status: string
   ready: boolean
   dashboardUrl: string | null
@@ -224,8 +230,9 @@ type Action =
   | { type: 'TOOLBAR_CONFIG'; windowId: number; plotId: number; actions: ToolbarAction[] }
   | { type: 'WINDOW_VISIBILITY'; windowId: number; visible: boolean }
   | { type: 'WINDOW_CLOSED'; windowId: number }
+  | { type: 'WINDOW_COMPUTING'; windowId: number; computing: boolean }
   | { type: 'SET_ACTIVE'; windowId: number }
-  | { type: 'METADATA'; windowIds: number[]; metadata: MetadataDict }
+  | { type: 'METADATA'; windowIds: number[]; metadata: MetadataDict; editable?: Record<string, Record<string, string>> }
   | { type: 'COMPOSITION'; windowIds: number[]; composition: Composition }
   | { type: 'AXES'; windowIds: number[]; axes: AxisRow[] }
   | { type: 'ACTION_ACTIVE'; windowId: number; name: string; active: boolean }
@@ -235,6 +242,7 @@ type Action =
   | { type: 'LOADING'; busy: boolean; text: string }
   | { type: 'SIGNAL_TYPE'; windowIds: number[]; current: string; options: string[] }
   | { type: 'SELECTOR_INFO'; info: SelectorInfo }
+  | { type: 'SELECTOR_REMOVED'; selectorId: number }
   | { type: 'SIGNAL_TREE'; windowId: number; tree: TreeNode; activeSignalId?: number }
   | { type: 'NAVIGATOR_OPTIONS'; windowId: number; names: string[]; current?: string | null }
   | { type: 'STREAM'; text: string; kind: 'stdout' | 'stderr' }
@@ -361,6 +369,15 @@ function spydeReducer(state: State, action: Action): State {
       return { ...state, windows: newWindows }
     }
 
+    case 'WINDOW_COMPUTING': {
+      const has = state.computingWindows.has(action.windowId)
+      if (action.computing === has) return state   // no-op re-emit
+      const computingWindows = new Set(state.computingWindows)
+      if (action.computing) computingWindows.add(action.windowId)
+      else computingWindows.delete(action.windowId)
+      return { ...state, computingWindows }
+    }
+
     case 'WINDOW_CLOSED': {
       const newWindows = new Map(state.windows)
       newWindows.delete(action.windowId)
@@ -378,12 +395,18 @@ function spydeReducer(state: State, action: Action): State {
       const selectors = new Map(
         [...state.selectors].filter(([, s]) => s.windowId !== action.windowId),
       )
+      // A closed window can never legitimately still be "computing" — drop it
+      // so a stale overlay can't linger if the stop message raced the close.
+      const computingWindows = state.computingWindows.has(action.windowId)
+        ? new Set([...state.computingWindows].filter(id => id !== action.windowId))
+        : state.computingWindows
       return {
         ...state,
         windows: newWindows,
         selectors,
         histograms: drop(state.histograms),
         metadata: drop(state.metadata),
+        metadataEditable: drop(state.metadataEditable),
         axes: drop(state.axes),
         composition: drop(state.composition),
         signalTrees: drop(state.signalTrees),
@@ -391,6 +414,7 @@ function spydeReducer(state: State, action: Action): State {
         navigatorOptions: drop(state.navigatorOptions),
         activeActions: drop(state.activeActions),
         subItems: drop(state.subItems),
+        computingWindows,
         activeWindowId,
       }
     }
@@ -400,8 +424,12 @@ function spydeReducer(state: State, action: Action): State {
 
     case 'METADATA': {
       const metadata = new Map(state.metadata)
-      for (const wid of action.windowIds) metadata.set(wid, action.metadata)
-      return { ...state, metadata }
+      const metadataEditable = new Map(state.metadataEditable)
+      for (const wid of action.windowIds) {
+        metadata.set(wid, action.metadata)
+        metadataEditable.set(wid, action.editable ?? {})
+      }
+      return { ...state, metadata, metadataEditable }
     }
 
     case 'COMPOSITION': {
@@ -452,6 +480,18 @@ function spydeReducer(state: State, action: Action): State {
       const key = action.info.selectorId ?? action.info.windowId
       const prev = selectors.get(key)
       selectors.set(key, { ...prev, ...action.info })
+      return { ...state, selectors }
+    }
+
+    case 'SELECTOR_REMOVED': {
+      // A signal window closed and its driving selector was deregistered
+      // backend-side — drop its dock row directly. WINDOW_CLOSED alone can't
+      // do this: selectors are keyed by the NAVIGATOR's window_id (one
+      // navigator can drive several signal windows / selectors), so closing
+      // one signal window doesn't match any selector's windowId there.
+      if (!state.selectors.has(action.selectorId)) return state
+      const selectors = new Map(state.selectors)
+      selectors.delete(action.selectorId)
       return { ...state, selectors }
     }
 
@@ -518,8 +558,18 @@ function spydeReducer(state: State, action: Action): State {
       const signalTrees = new Map(state.signalTrees)
       signalTrees.set(action.windowId, action.tree)
       const signalTreeActive = new Map(state.signalTreeActive)
+      const prevActive = signalTreeActive.get(action.windowId)
+      const nodeChanged = action.activeSignalId != null && action.activeSignalId !== prevActive
       if (action.activeSignalId != null) signalTreeActive.set(action.windowId, action.activeSignalId)
-      return { ...state, signalTrees, signalTreeActive }
+      // A genuine tree-node switch (not just a re-emit of the same node)
+      // leaves any in-flight compute overlay behind — it belonged to the PRIOR
+      // node's plot. Clear it as a staleness backstop; the backend's own
+      // matching stop message (see lifecycle.window_computing) is the primary
+      // mechanism and should already have cleared it in the normal case.
+      const computingWindows = nodeChanged && state.computingWindows.has(action.windowId)
+        ? new Set([...state.computingWindows].filter(id => id !== action.windowId))
+        : state.computingWindows
+      return { ...state, signalTrees, signalTreeActive, computingWindows }
     }
 
     case 'STREAM':
@@ -647,6 +697,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     reportFigures: new Map(),
     report: null,
     metadata: new Map(),
+    metadataEditable: new Map(),
     composition: new Map(),
     histograms: new Map(),
     selectors: new Map(),
@@ -656,6 +707,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     axes: new Map(),
     activeActions: new Map(),
     subItems: new Map(),
+    computingWindows: new Set<number>(),
     status: 'Starting…',
     ready: false,
     dashboardUrl: null,
@@ -904,6 +956,14 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
           dispatch({ type: 'WINDOW_CLOSED', windowId: msg.window_id })
           break
 
+        case 'window_computing':
+          dispatch({
+            type: 'WINDOW_COMPUTING',
+            windowId: msg.window_id,
+            computing: msg.computing,
+          })
+          break
+
         case 'state_update':
           // Forward anyplotlib state to the iframe AND remember it, so it can
           // be replayed if/when the iframe (re)loads after this arrived.
@@ -968,6 +1028,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
             type: 'METADATA',
             windowIds: msg.window_ids ?? [],
             metadata: msg.metadata ?? {},
+            editable: msg.editable,
           })
           break
 
@@ -1045,6 +1106,10 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
               ...(msg.color != null ? { color: msg.color } : {}),
             },
           })
+          break
+
+        case 'selector_removed':
+          dispatch({ type: 'SELECTOR_REMOVED', selectorId: msg.selector_id })
           break
 
         case 'signal_tree':
@@ -1223,6 +1288,8 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'download_done':
         // Cluster telemetry — consumed by the StatusBar DaskMonitor HUD.
         case 'dask_stats':
+        // Read-throughput readout — consumed by the StatusBar IoThroughput HUD.
+        case 'io_throughput':
           window.dispatchEvent(new CustomEvent(`spyde:${msg.type}`, { detail: msg }))
           break
 
