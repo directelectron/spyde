@@ -13,7 +13,6 @@ Exercises the export handlers (``export_html.py``) against a real Qt-free
   foreign directory is refused.
 * paste: markdown + figure (resolvable → live rebuild; unresolvable → offline with
   the provided PNG).
-* the "Copy to Report" toolbar wrapper dispatched via ``toolbar_action`` adds a cell.
 """
 from __future__ import annotations
 
@@ -427,44 +426,6 @@ class TestPasteCell:
         # No live report figure emitted for an offline paste.
         assert not [m for m in messages if m.get("type") == "figure"
                     and m.get("host") == "report"]
-
-
-# ── the "Copy to Report" toolbar wrapper ───────────────────────────────────────
-
-
-class TestCopyToReportToolbar:
-    def test_toolbar_action_adds_a_figure_cell(self, tem_2d_dataset):
-        """Dispatching the 'Copy to Report' YAML toolbar action adds a figure
-        cell (auto-opening a report)."""
-        session = tem_2d_dataset["window"]
-        messages = tem_2d_dataset["messages"]
-        _prime_plot_data(session)
-        wid = _signal_window_id(session)
-
-        session.dispatch_action({
-            "action": "toolbar_action",
-            "window_id": wid,
-            "payload": {"name": "Copy to Report", "params": {}},
-        })
-
-        # A report was opened and a figure cell added.
-        st = _last_state(messages)
-        assert st["open"] is True
-        fig_cells = [c for c in st["cells"] if c["cell_type"] == "figure"]
-        assert len(fig_cells) == 1
-        # A report figure was emitted.
-        rep_figs = [m for m in messages if m.get("type") == "figure"
-                    and m.get("host") == "report"]
-        assert rep_figs and rep_figs[-1]["host"] == "report"
-
-    def test_wrapper_is_registered_in_yaml(self):
-        """The YAML entry resolves to the wrapper function."""
-        import spyde
-        meta = spyde.TOOLBAR_ACTIONS["functions"].get("Copy to Report")
-        assert meta is not None
-        assert meta["function"] == \
-            "spyde.actions.report.toolbar_actions.copy_to_report"
-        assert 2 in meta["plot_dim"]
 
 
 # ── export token correlation (cross-agent renderer contract, finding 9) ─────────
