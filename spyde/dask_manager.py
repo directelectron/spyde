@@ -18,6 +18,15 @@ def _neutralize_slow_net_io_counters(probe_timeout: float = 2.0,
     """Work around a Windows hang where ``psutil.net_io_counters()`` blocks for
     ~60-70s, freezing the Dask scheduler/worker EVENT LOOPS.
 
+    NB: this IS an upstream (``psutil``) monkeypatch, so conceptually it belongs
+    with the others in :mod:`spyde.external`. It is deliberately LEFT HERE because
+    it is applied inside every WORKER SUBPROCESS via ``_WorkerTuningPlugin.setup``
+    (pickled + re-imported per worker) and at scheduler construction — NOT through
+    :func:`spyde.external.apply_all`, which only runs in the backend process at
+    ``ensure_heavy_imports`` time. Relocating it would change the cross-process
+    import graph the worker plugin reconstructs for no functional gain. See
+    ``spyde/external/__init__.py`` for the general pattern.
+
     Dask's ``distributed.SystemMonitor`` (created inside ``Scheduler.__init__``
     AND inside every ``Worker``) calls ``psutil.net_io_counters()``
     UNCONDITIONALLY at construction and on every monitor tick — and it has NO
