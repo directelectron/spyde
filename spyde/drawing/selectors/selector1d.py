@@ -109,7 +109,19 @@ class LinearRegionSelector(BaseSelector):
         if plot1d is not None:
             try:
                 from anyplotlib.widgets import RangeWidget
-                widget = RangeWidget(lambda: None, x0=0.0, x1=10.0, color=self.color)
+                # max_extent makes the widget itself STOP at the cap while
+                # dragging. The span is in DATA units, so the real cap depends on
+                # the axis scale — which usually isn't known yet here (the signal
+                # attaches later). Seed it from the current scale and let
+                # _clamp_extent re-derive it on every update.
+                scale, _ = _signal_axis(self)
+                span_cap = abs(MAX_REGION_EXTENT_PER_DIM * scale)
+                try:
+                    widget = RangeWidget(lambda: None, x0=0.0, x1=10.0,
+                                         color=self.color, max_extent=span_cap)
+                except TypeError:      # anyplotlib without max_extent
+                    widget = RangeWidget(lambda: None, x0=0.0, x1=10.0,
+                                         color=self.color)
                 widget._push_fn = plot1d._make_widget_push_fn(widget)
                 plot1d._widgets[widget.id] = widget
                 plot1d._push()
@@ -129,17 +141,34 @@ class LinearRegionSelector(BaseSelector):
         self.update_data()
 
     def _clamp_extent(self) -> None:
-        """Cap the 1-D span to MAX_REGION_EXTENT_PER_DIM indices and write the
-        clamped upper edge back to the widget so the span physically STOPS growing
-        at the cap. x0/x1 are in DATA units (the 1-D widget uses the signal-axis
-        calibration), so the cap in data units is MAX_REGION_EXTENT_PER_DIM*scale.
-        Anchored at the lower edge (x0) so dragging the right edge past the cap
-        just pins it."""
+        """Keep the widget's own span cap in sync, then clamp as a fallback.
+
+        The WIDGET enforces the cap during the drag (anyplotlib ``max_extent``),
+        which is what makes the span physically stop instead of snapping back.
+        This method's jobs are the two things the widget can't do for itself:
+
+        1. Re-derive the cap from the CURRENT axis scale. The span is in DATA
+           units, so the cap is ``MAX_REGION_EXTENT_PER_DIM * scale`` — and at
+           construction time the signal often isn't attached yet (``_signal_axis``
+           falls back to scale 1.0), so a cap fixed then would be wrong for any
+           calibrated axis.
+        2. Clamp geometry that never went through a drag (a programmatic set), or
+           that came from an anyplotlib without ``max_extent``.
+
+        The fallback clamp anchors on the lower edge, which can move the edge the
+        user is holding — that is the phantom-movement the widget-side cap exists
+        to avoid, so it should now be a no-op in normal dragging."""
         if self._widget is None:
             return
         try:
             scale, _ = _signal_axis(self)
             span_cap = abs(MAX_REGION_EXTENT_PER_DIM * scale)
+            # Push the live cap down to the widget (no-op if unchanged / absent).
+            try:
+                if getattr(self._widget, "max_extent", None) != span_cap:
+                    self._widget.max_extent = span_cap
+            except Exception:
+                pass                    # older anyplotlib: fallback clamp below
             x0 = float(self._widget.x0)
             x1 = float(self._widget.x1)
             lo, hi = (x0, x1) if x0 <= x1 else (x1, x0)

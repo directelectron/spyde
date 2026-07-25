@@ -101,7 +101,17 @@ class RectangleSelector(BaseSelector):
         plot2d = self._get_plot2d()
         if plot2d is not None:
             try:
-                self._widget = plot2d.add_rectangle_widget(color=self.color)
+                # max_extent makes the widget itself stop at the cap while
+                # dragging. w/h are already in IMAGE PIXELS, so the nav-index cap
+                # is a direct value (no scale conversion, unlike the 1-D span).
+                # _clamp_extent stays as the fallback for an anyplotlib without
+                # the kwarg and for programmatic geometry writes.
+                try:
+                    self._widget = plot2d.add_rectangle_widget(
+                        color=self.color,
+                        max_extent=float(MAX_REGION_EXTENT_PER_DIM))
+                except TypeError:
+                    self._widget = plot2d.add_rectangle_widget(color=self.color)
                 self.roi = self._widget
                 self._event_cb = event_handler_fn(self._on_pointer_up)
                 self._widget.add_event_handler(self._event_cb, "pointer_move", "pointer_up")
