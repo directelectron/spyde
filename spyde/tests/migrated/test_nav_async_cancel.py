@@ -263,3 +263,79 @@ class TestComputeBackendShutdownGuard:
         # Post-shutdown: property returns None and does NOT respawn the executor.
         assert sess.compute_backend is None
         assert sess._nav_executor is None
+
+
+class TestOutOfOrderFramesNeverPaint:
+    """A superseded read that ALREADY STARTED must never paint over a newer one.
+
+    ``fut.cancel()`` only takes effect on a QUEUED future — one that is already
+    running runs to completion. So with a multi-worker pool several superseded
+    reads run concurrently and finish in arbitrary order, and an OLDER frame can
+    land after a newer one: the display visibly jumps backwards while dragging
+    (reported on a 4k x 4k in-situ movie as "it jumps back as you drag").
+
+    Two things prevent it, and both are tested here: the nav pool is SERIAL, and
+    each read carries a monotonic sequence number that _apply refuses to paint
+    out of order.
+    """
+
+    def test_nav_pool_is_serial(self):
+        """One worker: a superseded read cannot run concurrently with its
+        successor, so it cannot finish after it."""
+        be = ComputeBackend(client=object())        # distributed-mode backend
+        try:
+            pool = be._nav_pool()
+            assert pool._max_workers == 1
+        finally:
+            be.shutdown_nav_pool()
+
+    def test_stale_frame_does_not_paint_over_a_newer_one(self):
+        pool = ThreadPoolExecutor(max_workers=1)
+        try:
+            be = ComputeBackend(executor=pool)
+            sess = _FakeSession(be)
+            plot = _FakePlot(sess)
+            data, arr = _movie()
+            sig = _FakeSignal(data, nav_dim=1)
+
+            # Two reads in order; let both complete.
+            _submit_async_nav_read(plot, sig, np.array([1]), False, _Prof())
+            _submit_async_nav_read(plot, sig, np.array([7]), False, _Prof())
+            time.sleep(0.6)
+            sess.drain()
+
+            assert plot.painted, "the newer read should have painted"
+            np.testing.assert_array_equal(plot.painted[-1], arr[7])
+
+            # Now drive a STALE read through the REAL callback path: rewind the
+            # submit counter so the next submission gets an older sequence number
+            # than what has already painted — exactly the state a slow superseded
+            # read is in when it finally completes. Its frame must be dropped.
+            painted_before = len(plot.painted)
+            newest_painted = plot._nav_painted_seq
+            plot._nav_read_seq = newest_painted - 2      # this read is "behind"
+            _submit_async_nav_read(plot, sig, np.array([1]), False, _Prof())
+            time.sleep(0.6)
+            sess.drain()
+
+            assert len(plot.painted) == painted_before, \
+                "a stale frame painted over a newer one — the display jumps back"
+            np.testing.assert_array_equal(plot.painted[-1], arr[7])
+        finally:
+            pool.shutdown(wait=True)
+
+    def test_sequence_advances_per_submission(self):
+        pool = ThreadPoolExecutor(max_workers=1)
+        try:
+            be = ComputeBackend(executor=pool)
+            sess = _FakeSession(be)
+            plot = _FakePlot(sess)
+            data, _ = _movie()
+            sig = _FakeSignal(data, nav_dim=1)
+
+            _submit_async_nav_read(plot, sig, np.array([1]), False, _Prof())
+            first = plot._nav_read_seq
+            _submit_async_nav_read(plot, sig, np.array([2]), False, _Prof())
+            assert plot._nav_read_seq > first
+        finally:
+            pool.shutdown(wait=True)

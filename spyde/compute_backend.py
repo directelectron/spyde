@@ -99,6 +99,33 @@ class ComputeBackend:
         self._executor = executor
         self._client = client
         self._lock = threading.Lock()
+        # Dedicated LOCAL pool for interactive nav frame reads. Created lazily so
+        # threaded mode (which already has _executor) never pays for it. See
+        # submit_graph: a nav read must NEVER go to the distributed cluster.
+        self._nav_executor: concurrent.futures.ThreadPoolExecutor | None = None
+
+    def _nav_pool(self) -> concurrent.futures.ThreadPoolExecutor:
+        """The local pool interactive nav reads run on, built on first use.
+
+        ONE worker, deliberately. ``fut.cancel()`` only takes effect on a QUEUED
+        future — an already-running one runs to completion. With N>1 workers,
+        several superseded reads run concurrently and complete in arbitrary
+        order, so an OLDER frame can land after a newer one and the display jumps
+        backwards while you drag. One worker makes the reads serial, so the only
+        ordering hazard left is a single in-flight read, which the caller's
+        identity check already discards."""
+        with self._lock:
+            if self._nav_executor is None:
+                self._nav_executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="nav-read")
+            return self._nav_executor
+
+    def shutdown_nav_pool(self) -> None:
+        """Release the local nav-read pool (Session.shutdown)."""
+        with self._lock:
+            pool, self._nav_executor = self._nav_executor, None
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
 
     @property
     def client(self):
@@ -140,15 +167,38 @@ class ComputeBackend:
         or a ``.zspy`` — cropping/rebinning stay pure graph ops and scrub through
         this one path. Result is a materialised ``np.ndarray``.
 
-        In distributed mode it falls back to ``client.compute`` (already async +
-        cancellable via the adapter) so callers are backend-agnostic.
+        **This NEVER goes to the distributed cluster, even in distributed mode.**
+        A nav read is a few MB of LOCAL file that the GUI process can read itself;
+        routing it through ``client.compute`` adds graph serialization, worker
+        dispatch and a result transfer to a read whose whole job is to be
+        interactive. Measured in the real app on a .zspy 4D-STEM: an integrating
+        region took 87-441 ms (once 3731 ms) via the cluster, while the same read
+        served locally through the array cache is single-digit ms. The cluster is
+        for BATCH compute (find-vectors, orientation, VI) where the work per byte
+        is large; a frame read is the opposite shape.
+
+        So both modes submit to a LOCAL ThreadPoolExecutor running
+        ``compute(scheduler="synchronous")``: the pool provides the
+        concurrent.futures.Future (``.cancel()`` a superseded scrub frame,
+        ``.add_done_callback()`` to paint off-thread) while the ``synchronous``
+        scheduler walks the graph on that one worker thread, so dask does NOT
+        spawn a nested pool under ours.
         """
-        if self._executor is not None:
-            def _read(a=lazy_array):
-                return np.asarray(a.compute(scheduler="synchronous"))
-            return self._executor.submit(_read)
-        dask_fut = self._client.compute(lazy_array)
-        return _DistributedFutureAdapter(dask_fut)
+        def _read(a=lazy_array):
+            return np.asarray(a.compute(scheduler="synchronous"))
+        pool = self._executor if self._executor is not None else self._nav_pool()
+        return pool.submit(_read)
+
+    def submit_nav_read(self, fn) -> concurrent.futures.Future:
+        """Run ``fn`` (a no-arg callable returning an ndarray) on the LOCAL nav
+        pool — the same never-distributed, cancellable path as submit_graph.
+
+        Exists so the expensive tier can run the CACHED read off the dispatcher.
+        Async used to mean "compute a dask graph", which bypassed the array cache,
+        so a region routed async could never warm and re-read everything on every
+        drag step. This lets async and cached coexist."""
+        pool = self._executor if self._executor is not None else self._nav_pool()
+        return pool.submit(fn)
 
     def compute(self, dask_array_or_list) -> concurrent.futures.Future:
         """

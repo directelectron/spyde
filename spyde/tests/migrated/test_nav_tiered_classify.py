@@ -51,21 +51,45 @@ class TestClassifyRegion:
         idx = np.array([[i] for i in range(16)])  # maxed movie span
         assert _classify_nav_read(sig, idx, data, fb) == "cheap"
 
-    def test_large_region_is_expensive(self):
+    def test_many_UNCACHED_points_is_expensive_even_when_small(self):
+        """"expensive" means "run it OFF the dispatcher", NOT "skip the cache".
+
+        The async path now goes through get_local_frame too, so routing a region
+        there no longer costs it the cache — which is what made an earlier
+        byte-only rule necessary. What remains is purely "would this BLOCK the
+        serial dispatcher long enough for the ROI to stop tracking the cursor?",
+        and many uncached points do, however small each frame is: each is a
+        separate read with its own per-point overhead.
+
+        Getting this wrong is visible either way. Too eager and a trivially cheap
+        region pays an async round-trip; too reluctant and a 4D-STEM ROI blocks
+        the dispatcher for tens of ms per drag step, so the ROI lags the cursor
+        even though throughput looks fine — the regression that prompted this."""
         data = da.zeros((32, 32, 8, 8), dtype=np.uint16, chunks=(8, 8, -1, -1))
         sig = _FakeSignal(cached=object(), nav_dim=2)
         n = REGION_ASYNC_FRAME_CAP + 5
         idx = np.array([[i % 32, 0] for i in range(n)])
         fb = _frame_bytes((8, 8), 2)
-        assert _classify_nav_read(sig, idx, data, fb) == "expensive"
+        assert n * fb < REGION_BYTES_CAP        # small in BYTES...
+        assert _classify_nav_read(sig, idx, data, fb) == "expensive"  # ...but blocking
 
-    def test_region_at_async_cap_is_cheap_over_is_expensive(self):
-        data = da.zeros((512, 8, 8), dtype=np.uint16, chunks=(1, -1, -1))
+    def test_a_few_points_stays_cheap(self):
+        """A handful of points is not worth an async round-trip."""
+        data = da.zeros((32, 32, 8, 8), dtype=np.uint16, chunks=(8, 8, -1, -1))
+        sig = _FakeSignal(cached=object(), nav_dim=2)
+        idx = np.array([[i, 0] for i in range(4)])
+        assert _classify_nav_read(
+            sig, idx, data, _frame_bytes((8, 8), 2)) == "cheap"
+
+    def test_many_points_of_BIG_frames_is_expensive(self):
+        """The point cap still bites when the frames are individually large — the
+        case it was originally tuned for (a movie span). Above COLD_FRAME_CAP per
+        frame AND above the point cap → async."""
+        big = (2048, 2048)
+        fb = _frame_bytes(big, 2)               # 8 MiB/frame, > COLD_FRAME_CAP
+        data = da.zeros((512,) + big, dtype=np.uint16, chunks=(1, -1, -1))
         sig = _FakeSignal(cached=object(), nav_dim=1)
-        fb = _frame_bytes((8, 8), 2)
-        at_cap = np.array([[i] for i in range(REGION_ASYNC_FRAME_CAP)])
         over = np.array([[i] for i in range(REGION_ASYNC_FRAME_CAP + 1)])
-        assert _classify_nav_read(sig, at_cap, data, fb) == "cheap"
         assert _classify_nav_read(sig, over, data, fb) == "expensive"
 
     def test_region_by_bytes_is_expensive(self):
