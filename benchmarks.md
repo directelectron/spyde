@@ -542,3 +542,110 @@ End-to-end (first_paint_real_load.spec.ts, real file, dask):
 The fill is also DEFERRED until the signal plot's first frame lands
 (`_start_nav_compute_after_first_frame`) so the first frame wins the disk, and the
 completed fill writes the sidecar for the next open.
+
+### ArrayCache reader kinds: read the store, not the dask graph (2026-07-24)
+
+`spyde/array_cache/` replaces `_NavChunkCache` with a byte-budgeted frame cache
+behind a `FrameReader` per backing kind. Which kind serves a signal is resolved
+ONCE per node-select (`resolve.py`), so the per-frame path is just "read the
+frame". Measured per frame on a 32x32x128x128 uint16 scan stored in 8x8-nav
+chunks, warm page cache, frames spread one-per-chunk ("cold chunk") vs walking
+new frames inside one already-touched chunk ("dwell"):
+
+| backing | read strategy | cold chunk | dwell |
+|---|---|---:|---:|
+| `.zspy` | per frame from the store | 0.97 ms | 0.79 ms |
+| `.zspy` | whole nav-chunk via dask (kind 4) | 1.64 ms | 0.009 ms |
+| `.zspy` | **whole nav-chunk from the store (kind 2)** | **0.84 ms** | **0.002 ms** |
+| `.hspy` | per frame from the store | 5.12 ms | 0.003 ms |
+| `.hspy` | whole nav-chunk via dask (kind 4) | 5.97 ms | 0.009 ms |
+| `.hspy` | **whole nav-chunk from the store (kind 3)** | **5.10 ms** | **0.002 ms** |
+
+The non-obvious row is `.zspy` per-frame dwell: reading straight from the store
+looks like the minimal read, but zarr re-decompresses the enclosing chunk for
+EVERY frame — 88x worse than slicing a block that is already decoded, on the
+pattern a 4D-STEM DP navigator spends all its time in. Reading the block
+DIRECTLY from the store and memoizing it wins both columns (dask's route to the
+same block costs ~0.8 ms of graph overhead). A CONTIGUOUS store, or a chunk
+spanning 1 nav position (in-situ movie), or a block over
+`MAX_BLOCK_BYTES` = 64 MB reads the frame alone — nothing to amortise.
+
+Cost note: a raw `.mrc`/`.de5` (kind 1) skips all of this with one `os.pread`
+per frame (`hasattr(os, "pread")`-gated; Windows takes the `np.memmap` slice).
+
+Correctness trap worth remembering: a dask HighLevelGraph keeps every ancestor
+layer, so a DERIVED view (rebin/crop of a memmap- or zarr-backed file — exactly
+what the `local` locality tag makes cache-eligible) still carries the source's
+`slice_memmap` / `original-array-*` tasks. Matching those served the RAW SOURCE
+frame with the transform silently skipped (a nav crop read the wrong frame with
+no error at all). Both finders now gate on `data.name` — the array must BE that
+layer's output — plus a shape/dtype match.
+
+### Vector-OM accuracy: what the coarse seed's asymmetry buys (2026-07-24)
+
+Investigating "the vector orientation map results are a little off". Reference
+throughout is the DENSE raw-OM template match on the same region/library/
+calibration; the metric is IPF X/Y/Z colour agreement, which
+`benchmark_om_parity` calls authoritative (the two result types carry different
+quaternion conventions, so a cross-path misorientation angle is NOT comparable —
+it reads ~50-60° even where the colours agree 100%).
+
+**Where vector-OM actually stands** (sped_ag, 12x18 slab, 1081 Ag templates,
+gamma=0.5): the production batched-torch path agrees with the dense reference at
+**98% / 98% / 100%** (IPF X/Y/Z). The serial scipy path (`fit_pattern`, the
+no-torch fallback) on the same vectors and library agrees at only
+**25% / 4% / 67%** — the accuracy gap is between the two vector-OM paths, not
+between vector-OM and the dense match.
+
+**The trap: do NOT cosine-normalise the coarse-seed correlation.**
+`_coarse_seed_batched` correlates polar signatures with a RAW inner product,
+which looks like a bug — brighter templates score higher regardless of match
+quality. Synthetic evidence says fix it; real data says the opposite:
+
+| coarse seed | IPF-X | IPF-Y | IPF-Z | synthetic (patterns that ARE templates) |
+|---|---:|---:|---:|---|
+| raw inner product (shipped) | 98% | 98% | 100% | true template ranked top 1/40, field ~28° off |
+| cosine-normalised | 0% | 28% | 0% | true template ranked top 40/40, field exact |
+
+Real vector finding detects only the strong subset of reflections (~5-15 of ~25),
+so dividing by the template norm charges the true template for spots that were
+never detected and systematically favours sparse/low-multiplicity templates. The
+synthetic test hands the fit every spot, giving both signatures equal support,
+which is exactly the condition that makes cosine look right. Pinned by
+`test_vector_orientation_seed.py`; the pre-existing GPU tests could not catch it
+because they use a SINGLE-template library, where the argmax over templates is
+trivially correct either way.
+
+**FIXED: the scipy path resolved orientation from the wrong angle.**
+`strain_from_pose` polar-decomposes `M = A.Rot(theta)` into `R.S` and reports
+`S - I`, its docstring noting that "the rotation R is absorbed into the
+orientation" — but nothing did that. LM freely splits the total rotation between
+`theta` and the free 2x2 `A` (that freedom is *why* the strain needs the
+decomposition), and `fit_pattern` resolved the quaternion from the bare `theta`,
+so the reported in-plane orientation was short by whatever LM parked in `A`.
+Textbook signature: zone axis right, in-plane wrong. Resolving from the
+polar-decomposition rotation (`pose_in_plane_angle`) instead:
+
+| variant (sped_ag 8x12, vs dense reference) | IPF-X | IPF-Y | IPF-Z |
+|---|---:|---:|---:|
+| scipy, own pyxem seed — before | 25% | 4% | 67% |
+| scipy, own pyxem seed — after | 72% | 67% | 67% |
+| scipy + the torch path's seed — before | 44% | 2% | 100% |
+| scipy + the torch path's seed — after | 99% | 98% | 100% |
+| batched torch path (unaffected) | 98% | 98% | 100% |
+
+With a correct seed the scipy path now matches the production path exactly. The
+batched torch path never had this bug: there `M = S.Rot(theta)` with `S` SPD by
+construction, so its `theta` IS the physical angle. The residual gap in the
+own-seed row is entirely the seed (IPF-Z 67%) — handing that path the batched
+polar-histogram seed closes it, worth doing if the no-torch fallback or the live
+refine overlay matters.
+
+**Also measured and NOT shipped:** refining more than one coarse candidate. The
+refine keeps the best-scoring candidate but is handed only the seed's top pick;
+on synthetic ground truth `n_seed=1` returns a fit strictly worse than the true
+one in 32/120 cases and `n_seed=3` fixes all 32. On real sped_ag it moved
+agreement ~1 pt (25/4/67% -> 27/6/66%) for ~40% more time. Same for adding a
+measured-side coverage term to the candidate score: neutral on real data. Both
+reverted — the scipy path's accuracy limit is somewhere else, and that path is
+the fallback anyway.
