@@ -277,8 +277,14 @@ class Plot:
         # repeat instead of a re-decode every move. Cleared when the displayed
         # node changes / on close. _local_transform_readers caches the small
         # per-signal reader object (holds its own one-chunk memo) alongside it.
-        from spyde.array_cache import ArrayCache
+        from spyde.array_cache import ArrayCache, BlockCache
         self._array_cache = ArrayCache()
+        # Decoded nav-CHUNK blocks (zarr/HDF5 stores, derived dask views) share
+        # this byte-budgeted LRU instead of each reader keeping a one-entry memo,
+        # so crossing a chunk boundary — or integrating a region that spans
+        # several — doesn't re-decode. Demoted to a smaller budget when the plot
+        # loses focus (see set_focused); cleared with the frame cache.
+        self._block_cache = BlockCache()
         self._local_transform_readers: Dict = {}
         # GPU tile backend for a LARGE signal frame — reduces overview/detail tiles on
         # the GPU. Lazily built on the first large frame (_maybe_gpu_tile); reset on a
@@ -1109,6 +1115,23 @@ class Plot:
             self.set_plot_state(signal)
         return state
 
+    def set_focused(self, focused: bool) -> None:
+        """Focus changed for this plot's window — resize the decoded-block budget.
+
+        NOT a purge. A background window keeps a working set (``UNFOCUSED_BUDGET_BYTES``,
+        a chunk or three) so clicking back to it is a numpy slice rather than a
+        cold re-decode of the chunk you were just looking at; it just stops
+        holding the full focused budget while you work elsewhere. The frame cache
+        (``_array_cache``) is small and left alone. Full release still happens only
+        on node switch / close."""
+        cache = getattr(self, "_block_cache", None)
+        if cache is None:
+            return
+        try:
+            cache.restore() if focused else cache.demote()
+        except Exception as e:
+            log.debug("block cache focus resize failed: %s", e)
+
     def set_plot_state(self, signal) -> None:
         old_state = self.plot_state
         self.needs_auto_level = True
@@ -1118,6 +1141,8 @@ class Plot:
         # hold real resources (e.g. BinaryReader's open file descriptor).
         if self._array_cache is not None:
             self._array_cache.clear()
+        if self._block_cache is not None:
+            self._block_cache.clear()
         from spyde.array_cache import close_all_readers
         close_all_readers(self)
         # Rebuild the GPU tile backend for the new node (its logical size / dtype may
@@ -1248,10 +1273,15 @@ class Plot:
             except Exception:
                 pass
             self._nav_future = None
-        # Release cached decoded frames.
+        # Release cached decoded frames and blocks.
         if self._array_cache is not None:
             try:
                 self._array_cache.clear()
+            except Exception:
+                pass
+        if self._block_cache is not None:
+            try:
+                self._block_cache.clear()
             except Exception:
                 pass
         try:

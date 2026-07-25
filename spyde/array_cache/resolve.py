@@ -27,7 +27,12 @@ from .readers.local_transform import LocalTransformReader
 from .readers.source_array import SourceArrayReader, find_source_array
 
 
-def resolve_reader(signal, data):
+def resolve_reader(signal, data, block_cache=None):
+    """``block_cache`` is the owning Plot's shared :class:`BlockCache`, handed to
+    the reader kinds that decode whole nav-chunks (zarr/HDF5, derived views) so
+    their blocks share ONE byte budget instead of each keeping a private
+    one-entry memo. BinaryReader ignores it — it reads exactly the frames asked
+    for and has no chunk to cache."""
     kwargs = find_memmap_source(data)
     if kwargs is not None:
         try:
@@ -38,11 +43,11 @@ def resolve_reader(signal, data):
     source = find_source_array(data)
     if source is not None:
         try:
-            return SourceArrayReader(signal, data, source)
+            return SourceArrayReader(signal, data, source, block_cache=block_cache)
         except Exception:
             pass  # fall through to the universal reader
 
     try:
-        return LocalTransformReader(signal, data)
+        return LocalTransformReader(signal, data, block_cache=block_cache)
     except Exception:
         return None

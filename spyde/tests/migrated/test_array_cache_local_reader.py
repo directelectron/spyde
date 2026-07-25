@@ -22,7 +22,7 @@ from spyde.array_cache.readers.local_transform import (
     LocalTransformReader,
     nav_chunk_span,
 )
-from spyde.array_cache import ArrayCache, get_local_frame
+from spyde.array_cache import ArrayCache, BlockCache, get_local_frame
 
 
 class _AxesManager:
@@ -144,6 +144,10 @@ class TestGetLocalFrameThroughArrayCache:
         def __init__(self):
             self.signal_tree = TestGetLocalFrameThroughArrayCache._FakeTree()
             self._array_cache = ArrayCache()
+            # Readers share the plot's BlockCache for decoded nav-chunks; without
+            # it they fall back to a private one-entry memo and the block-level
+            # behaviour under test isn't exercised.
+            self._block_cache = BlockCache()
             self._local_transform_readers = {}
 
     def test_local_signal_populates_array_cache(self):
@@ -166,13 +170,66 @@ class TestGetLocalFrameThroughArrayCache:
         assert get_local_frame(plot, sig, reb, (5,)) is None
         assert len(plot._array_cache) == 0
 
-    def test_region_returns_none(self):
-        reb, _ = _rebinned_movie()
+    def test_region_returns_frame_wise_mean(self):
+        """An integrating region is served THROUGH the cache, not bailed on.
+
+        It used to return None, so region integration bypassed the whole array
+        cache and paid a dask compute per point — each materialising the enclosing
+        nav-chunk to keep one frame."""
+        reb, src = _rebinned_movie()
         sig = _Signal(reb, nav_dim=1)
         sig._is_local = True
         plot = self._FakePlot()
 
-        assert get_local_frame(plot, sig, reb, np.array([[1], [2]])) is None
+        out = get_local_frame(plot, sig, reb, np.array([[1], [2]]))
+        assert out is not None
+        expected = np.asarray(reb[[1, 2]].compute()).mean(axis=0)
+        if np.issubdtype(reb.dtype, np.integer):
+            expected = np.rint(expected).astype(reb.dtype)
+        np.testing.assert_array_equal(out, expected)
+
+    def test_region_sums_from_the_block_not_frame_by_frame(self):
+        """A region sums straight out of the decoded BLOCK.
+
+        The per-frame path has to COPY each frame out of its block so a cached
+        frame doesn't pin the whole thing; for a region that copy dominates
+        (measured 165 ms vs 61 ms on a resident 537 MB block, 16x16 ROI) and buys
+        nothing, since region frames are summed immediately and never wanted
+        individually. So ``read_frame`` must NOT be called, and the region's
+        frames must NOT be inserted into the frame cache — the BLOCK is what
+        stays resident, which is what makes the next drag step cheap."""
+        reb, _ = _rebinned_movie(n=64, frame=(8, 8), chunk=8)
+        sig = _Signal(reb, nav_dim=1)
+        sig._is_local = True
+        plot = self._FakePlot()
+
+        get_local_frame(plot, sig, reb, np.array([[10], [11], [12], [13]]))
+        reader = plot._local_transform_readers[id(sig)]
+        assert hasattr(reader, "sum_points")
+        calls = []
+        orig = reader.read_frame
+        reader.read_frame = lambda idx, _o=orig: (calls.append(tuple(idx)), _o(idx))[1]
+
+        out = get_local_frame(plot, sig, reb, np.array([[11], [12], [13], [14]]))
+        assert out is not None
+        assert calls == [], calls          # summed from the block, no frame reads
+        # the block is resident, so the next overlapping step is cheap
+        assert plot._block_cache.nbytes > 0
+
+    def test_region_matches_per_frame_sum_across_a_block_boundary(self):
+        """The block path groups points per block; an ROI straddling two blocks
+        must still equal the plain per-frame mean."""
+        reb, _ = _rebinned_movie(n=64, frame=(8, 8), chunk=8)
+        sig = _Signal(reb, nav_dim=1)
+        sig._is_local = True
+        plot = self._FakePlot()
+
+        pts = np.array([[6], [7], [8], [9]])       # chunk=8 -> spans two blocks
+        out = get_local_frame(plot, sig, reb, pts)
+        expected = np.asarray(reb[[6, 7, 8, 9]].compute()).mean(axis=0)
+        if np.issubdtype(reb.dtype, np.integer):
+            expected = np.rint(expected).astype(reb.dtype)
+        np.testing.assert_array_equal(out, expected)
 
     def test_residency_probe_is_chunk_granular(self):
         """overlay.py's cheap/expensive gate: a NEW position inside an already

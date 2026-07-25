@@ -31,21 +31,26 @@ def nav_chunk_span(chunk_sizes, pos):
 
 class LocalTransformReader:
     """One instance per (signal, data) pair. Cheap to construct — holds only
-    references and a one-chunk memo, no I/O happens until read_frame().
+    references, no I/O happens until read_frame().
 
-    The memo is stored as ONE ``(key, block)`` tuple, deliberately not two
-    attributes: overlay.py's off-thread source warm can call read_frame
-    concurrently with the dispatcher's own read, and a torn key/block pair
-    would slice a frame out of the WRONG chunk (a silent wrong-frame bug, or an
-    IndexError on a ragged last chunk). A single assignment is atomic under the
-    GIL, so a concurrent reader sees either the old pair or the new one.
+    Decoded blocks live in the plot's shared :class:`BlockCache` (a byte-budgeted
+    LRU). A one-entry memo — what this used to hold — only served a dwell inside
+    one chunk: a derived view must re-decode AND re-run the transform over the
+    whole source nav-chunk to yield any one frame, so ping-ponging across a
+    boundary cost 217 ms/move instead of 0.14 ms (1520x), and an integrating
+    region spanning several chunks thrashed on every drag step.
+
+    A cache is optional (``block_cache=None`` falls back to a private one-entry
+    memo, stored as ONE tuple so a concurrent reader can't observe a torn
+    key/block pair and slice a frame out of the WRONG chunk).
     """
 
-    def __init__(self, signal, data):
+    def __init__(self, signal, data, block_cache=None):
         self.signal = signal
         self.data = data
         self._nav_ndim = signal.axes_manager.navigation_dimension
-        self._memo = None                   # (block_index_tuple, block ndarray)
+        self._block_cache = block_cache
+        self._memo = None                   # fallback when there's no BlockCache
 
     @property
     def frame_bytes(self) -> int:
@@ -65,21 +70,68 @@ class LocalTransformReader:
             nav_slices.append(slice(s, e))
         return tuple(block_idx), nav_slices
 
+    def _cached_block(self, key):
+        """The decoded block for ``key`` if resident, else None."""
+        if self._block_cache is not None:
+            return self._block_cache.get(id(self), key)
+        memo = self._memo                   # read ONCE — see the class docstring
+        return memo[1] if memo is not None and memo[0] == key else None
+
+    def _store_block(self, key, block) -> None:
+        if self._block_cache is not None:
+            self._block_cache.put(id(self), key, block)
+        else:
+            self._memo = (key, block)
+
     def is_chunk_resident(self, indices) -> bool:
-        """Is the decoded chunk holding ``indices`` already memoized — i.e.
+        """Is the decoded chunk holding ``indices`` already cached — i.e.
         would read_frame be a ~0 ms numpy slice? Side-effect-free. This is the
         CHUNK-granularity residency the overlay's cheap/expensive gate needs:
         ArrayCache alone can only answer for frames it has already returned, so
         without this every NEW position in an already-decoded chunk would be
         misclassified as an expensive cold read."""
         try:
-            memo = self._memo
-            if memo is None:
-                return False
             located = self._locate(indices)
-            return located is not None and located[0] == memo[0]
+            if located is None:
+                return False
+            if self._block_cache is not None:
+                return self._block_cache.contains(id(self), located[0])
+            memo = self._memo
+            return memo is not None and located[0] == memo[0]
         except Exception:
             return False
+
+    def sum_points(self, points, out_dtype=np.float32):
+        """Sum the frames at ``points`` straight out of the resident block(s) —
+        see SourceArrayReader.sum_points for why (skips the per-frame copy the
+        cached single-point path needs). Returns None when this array isn't
+        dask-chunked, so the caller falls back to the per-frame loop."""
+        chunks = getattr(self.data, "chunks", None)
+        if not chunks:
+            return None
+        groups: dict = {}
+        for p in points:
+            point = tuple(int(v) for v in p[:self._nav_ndim])
+            located = self._locate(point)
+            if located is None:
+                return None
+            key, nav_slices = located
+            groups.setdefault(key, (nav_slices, []))[1].append(point)
+
+        acc = None
+        for key, (nav_slices, pts) in groups.items():
+            block = self._cached_block(key)
+            if block is None:
+                full = tuple(nav_slices) + \
+                    (slice(None),) * (self.data.ndim - self._nav_ndim)
+                block = np.asarray(
+                    self.data[full].compute(scheduler="synchronous"))
+                self._store_block(key, block)
+            from .source_array import _sum_block_points
+            part = _sum_block_points(block, nav_slices, pts, self._nav_ndim,
+                                     out_dtype)
+            acc = part if acc is None else acc + part
+        return acc
 
     def read_frame(self, indices: tuple[int, ...]) -> np.ndarray:
         located = self._locate(indices)
@@ -88,13 +140,11 @@ class LocalTransformReader:
             return np.asarray(self.data[indices].compute(scheduler="synchronous"))
         key, nav_slices = located
 
-        memo = self._memo                   # read ONCE — see the class docstring
-        if memo is not None and memo[0] == key:
-            block = memo[1]
-        else:
+        block = self._cached_block(key)
+        if block is None:
             full_slice = tuple(nav_slices) + (slice(None),) * (self.data.ndim - self._nav_ndim)
             block = np.asarray(self.data[full_slice].compute(scheduler="synchronous"))
-            self._memo = (key, block)
+            self._store_block(key, block)
 
         local = tuple(indices[ax] - nav_slices[ax].start for ax in range(self._nav_ndim))
         frame = block[local]

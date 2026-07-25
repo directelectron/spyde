@@ -17,9 +17,13 @@ frames and readers).
 """
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 
 from .resolve import resolve_reader
+
+log = logging.getLogger(__name__)
 
 
 def _reader_for(plot, signal, data):
@@ -47,35 +51,154 @@ def _reader_for(plot, signal, data):
         # window's computed data landing) — frames decoded from the OLD array are
         # stale, and ArrayCache keys on the signal's identity, not its data's.
         plot._array_cache.drop_key(key)
-    reader = resolve_reader(signal, data)
+        block_cache = getattr(plot, "_block_cache", None)
+        if block_cache is not None and reader is not None:
+            block_cache.drop_owner(id(reader))
+    reader = _try_per_frame_reader(plot, signal, data) or resolve_reader(
+        signal, data, block_cache=getattr(plot, "_block_cache", None))
     if reader is not None:
         readers[key] = reader
     return reader
 
 
+def _try_per_frame_reader(plot, signal, data):
+    """A PerFrameReader for a derived view whose frames are a per-frame numpy
+    function of the PARENT's frames (rebin, signal-space crop), or None.
+
+    This is the big win for derived views: asking dask for one rebinned frame
+    materialises the whole enclosing source chunk and re-runs the graph (measured
+    2403 ms on a 537 MB-chunk .zspy), while reading the parent's frame through
+    the PARENT's reader and rebinning in numpy is ~1.8 ms once the parent's block
+    is cached. See readers/per_frame.py.
+
+    Lives here rather than in resolve_reader because it needs the signal TREE (to
+    find the parent node and its recorded transform args), which the array_cache
+    package otherwise stays agnostic of. Returns None on anything unexpected —
+    LocalTransformReader then serves it correctly, just slower."""
+    tree = getattr(plot, "signal_tree", None)
+    if tree is None:
+        return None
+    try:
+        from .readers.per_frame import build_per_frame_reader
+
+        node = tree.get_node(signal)
+        parent = getattr(node, "parent", None) if node is not None else None
+        parent_signal = getattr(parent, "signal", None)
+        if parent_signal is None or getattr(parent_signal, "data", None) is None:
+            return None
+        # Resolve the PARENT's reader through the normal path so it gets the
+        # plot's BlockCache — that cache is what makes the repeat reads cheap.
+        parent_reader = _reader_for(plot, parent_signal, parent_signal.data)
+        if parent_reader is None:
+            return None
+        return build_per_frame_reader(signal, data, node, parent_reader,
+                                      parent_signal)
+    except Exception as e:
+        log.debug("per-frame reader resolve failed, using the dask view: %s", e)
+        return None
+
+
+def _resolve_for(plot, signal, data):
+    """The reader serving this (signal, data), or None if the signal isn't
+    ArrayCache-eligible (an opaque signal-tree node, or no signal_tree).
+
+    An EXISTING reader is itself proof the locality gate already passed — only a
+    local-resolved signal ever gets one. That keeps BaseSignalTree.resolve_locality
+    (which walks the tree to find the node) off the per-frame path: it runs once
+    per view, not once per move."""
+    reader = plot._local_transform_readers.get(id(signal))
+    if reader is not None and getattr(reader, "data", None) is data:
+        return reader
+    tree = getattr(plot, "signal_tree", None)
+    if tree is None or not tree.resolve_locality(signal):
+        return None
+    return _reader_for(plot, signal, data)
+
+
 def get_local_frame(plot, signal, data, indices, prof=None):
     """Return the decoded frame at ``indices`` via the plot's ArrayCache, or
     None if this signal isn't ArrayCache-eligible right now (an opaque
-    signal-tree node, a region rather than a single point, or no signal_tree
-    available) — the caller falls back to a plain compute."""
+    signal-tree node, or no signal_tree available) — the caller falls back to a
+    plain compute.
+
+    ``indices`` is either a single nav point (``ndim <= 1``) or an INTEGRATING
+    REGION of N points (``ndim > 1``), in which case the frame-wise mean is
+    returned. A region used to bail out here, which is why region integration
+    never touched any of this machinery and re-materialised a whole nav-chunk
+    per point through dask — 64 chunk decodes to read the ~4 chunks an 8x8 ROI
+    actually spans. Serving it through the same readers makes a drag cheap: the
+    points share blocks, and the blocks are cached."""
     idx = np.asarray(indices)
     if idx.ndim > 1:
-        return None  # region — not a single frame
+        return _get_local_region(plot, signal, data, idx, prof)
     point = tuple(int(v) for v in np.atleast_1d(idx))
 
-    # An EXISTING reader for this (signal, data) is itself proof the locality
-    # gate already passed — only a local-resolved signal ever gets one. That
-    # keeps BaseSignalTree.resolve_locality (which walks the tree to find the
-    # node) off the per-frame path: it runs once per view, not once per move.
-    reader = plot._local_transform_readers.get(id(signal))
-    if reader is None or getattr(reader, "data", None) is not data:
-        tree = getattr(plot, "signal_tree", None)
-        if tree is None or not tree.resolve_locality(signal):
-            return None
-        reader = _reader_for(plot, signal, data)
-        if reader is None:
-            return None
+    reader = _resolve_for(plot, signal, data)
+    if reader is None:
+        return None
     return plot._array_cache.get_frame(id(signal), reader, point, prof)
+
+
+def _get_local_region(plot, signal, data, idx, prof=None):
+    """Frame-wise mean over the N nav points of an integrating region.
+
+    Reads point-by-point through the SAME reader (and therefore the same
+    ArrayCache/BlockCache) the single-point path uses, so an 8x8 ROI touches
+    only the handful of nav-chunks it spans and a dragged ROI re-serves the
+    ~75% of points it shares with the previous step from cache.
+
+    Accumulates in float32, which is EXACT here: a nav region is capped at
+    MAX_REGION_EXTENT_PER_DIM=16 per dimension (256 frames), and 256 x uint16
+    max is ~2^24, inside float32's exact-integer range. Rounds back to an
+    integer source dtype for parity with the distributed
+    ``weighted_mean_round_from_sums`` the old path used.
+
+    Memory stays bounded by construction: one frame at a time into one
+    accumulator, never an N-frame stack (the Memory-Safety rule)."""
+    reader = _resolve_for(plot, signal, data)
+    if reader is None:
+        return None
+    key = id(signal)
+    cache = plot._array_cache
+    n_pts = int(idx.shape[0])
+    if n_pts == 0:
+        return None
+
+    # FAST PATH: a reader that owns decoded blocks can sum the points directly
+    # out of them. The per-frame path below has to COPY each frame out of its
+    # block (so a cached frame doesn't pin the whole block) — for a region that
+    # copy dominates: 165 ms vs 61 ms on a resident 537 MB block, 16x16 ROI.
+    # Region frames are summed immediately and never wanted individually, so the
+    # copy buys nothing here.
+    acc = None
+    how = "region"
+    summer = getattr(reader, "sum_points", None)
+    if summer is not None:
+        try:
+            acc = summer(idx, np.float32)
+            if acc is not None:
+                how = "region-block"
+        except Exception as e:
+            log.debug("block region sum failed, per-frame fallback: %s", e)
+            acc = None
+
+    if acc is None:
+        # Per-frame fallback: contiguous sources, unchunked arrays, BinaryReader
+        # (which reads exactly the frames asked for and has no block to sum from).
+        for i in range(n_pts):
+            point = tuple(int(v) for v in idx[i])
+            frame = cache.get_frame(key, reader, point, None)
+            if acc is None:
+                acc = np.asarray(frame, dtype=np.float32).copy()
+            else:
+                acc += frame
+
+    acc = acc / n_pts
+    if np.issubdtype(data.dtype, np.integer):
+        acc = np.rint(acc).astype(data.dtype)
+    if prof is not None:
+        prof.done(f"array-cache {how} x{n_pts}")
+    return acc
 
 
 def close_all_readers(plot) -> None:

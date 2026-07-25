@@ -84,12 +84,59 @@ def find_source_array(data):
         return None
 
 
-# Don't memoize a nav-chunk bigger than this — read the single frame instead.
-# A storage chunk spanning 32x32 nav positions of 256^2 uint16 frames is 128 MB;
-# holding that per plot (on top of ArrayCache) for a dwell win isn't a trade
-# worth making, and for a chunked store a single-frame read is still correct,
-# just without the dwell amortisation (CLAUDE.md Memory-Safety rule).
-MAX_BLOCK_BYTES = 64 << 20
+# A COMPRESSED store's chunk is ATOMIC: you cannot read less than one.
+#
+# Measured on a real .zspy with 537 MB (32x32 nav x 512^2 uint16) chunks:
+#
+#     whole chunk 32x32   537 MB : 437 ms
+#     sub-block    8x16    67 MB : 445 ms   (102% of the whole chunk)
+#     ONE frame           0.5 MB : 406 ms   ( 93% of the whole chunk)
+#
+# Reading one frame costs the SAME as reading all 1024. So the old fallback
+# ("chunk too big to cache -> read single frames") was a ~100x bug on compressed
+# data: a ~50-frame integrating ROI paid ~50 whole-chunk decodes. In the app that
+# was 2100-4250 ms (0.01 GB/s) for a region MRC served in 50-100 ms (0.74-1.27
+# GB/s). Sub-blocking is equally wrong — same decode, 1/8 the payload cached.
+#
+# So for a chunked store we ALWAYS cache the whole nav-chunk, and the budget must
+# be big enough to hold the few chunks an ROI spans. A 16x16 ROI touches at most
+# 4 chunks; the BlockCache LRU bounds the total (CLAUDE.md Memory-Safety: this is
+# a handful of chunks, never the dataset).
+#
+# The one case still read frame-at-a-time is an UNCHUNKED (contiguous) source,
+# where a frame really is an exact hyperslab and nothing is amortised.
+MAX_BLOCK_BYTES = 1 << 30            # 1 GiB — hold a chunk even when it is large
+
+
+def _sum_block_points(block, nav_slices, pts, nav_ndim, out_dtype):
+    """Sum the frames at ``pts`` out of a decoded ``block``.
+
+    An integrating ROI is a RECTANGLE, so its points inside one block are almost
+    always a dense sub-rectangle. Summing that as a plain slice with
+    ``sum(axis=nav_axes)`` avoids materialising an intermediate — which is the
+    whole cost here. Measured on a resident 537 MB block, 16x16 ROI:
+
+        fancy-index then sum          141 ms   (copies 134 MB first)
+        slice + reshape then sum      124 ms   (reshape also copies)
+        slice, sum over the nav axes   67 ms   <- no intermediate
+
+    Falls back to fancy indexing for a non-rectangular point set (which the
+    selectors don't currently produce, but nothing here depends on that)."""
+    local = [np.fromiter((p[ax] - nav_slices[ax].start for p in pts),
+                         dtype=np.intp, count=len(pts))
+             for ax in range(nav_ndim)]
+    lo = [int(a.min()) for a in local]
+    hi = [int(a.max()) + 1 for a in local]
+    # Dense == the bounding box has exactly as many cells as we have points AND
+    # the points are distinct (duplicates would make the counts match while the
+    # slice silently summed different frames).
+    extent = int(np.prod([h - l for l, h in zip(lo, hi)]))
+    dense = extent == len(pts) and len(
+        set(zip(*(a.tolist() for a in local)))) == len(pts)
+    if dense:
+        sl = tuple(slice(l, h) for l, h in zip(lo, hi))
+        return block[sl].sum(axis=tuple(range(nav_ndim)), dtype=out_dtype)
+    return block[tuple(local)].sum(axis=0, dtype=out_dtype)
 
 
 class SourceArrayReader:
@@ -97,31 +144,49 @@ class SourceArrayReader:
     already-open source (hyperspy keeps the h5py file / zarr store open for the
     lifetime of a lazy signal), so there is nothing to close.
 
-    Like LocalTransformReader, the decoded-block memo is ONE ``(key, block)``
-    tuple so overlay.py's off-thread source warm can't observe a torn pair and
-    slice a frame out of the wrong chunk.
+    Decoded blocks live in the plot's shared :class:`BlockCache` (a byte-budgeted
+    LRU), NOT in a one-entry memo. A single slot could only serve a dwell inside
+    one chunk: crossing a boundary and returning re-decompressed the chunk every
+    move (59x on zspy), and an integrating region — which spans up to 4 nav-chunks
+    — thrashed on every drag step. The LRU keeps a region's whole span plus recent
+    history resident.
+
+    A cache is optional (``block_cache=None`` falls back to a private one-entry
+    memo) so a reader constructed outside a Plot still works.
     """
 
-    def __init__(self, signal, data, source):
+    def __init__(self, signal, data, source, block_cache=None):
         self.signal = signal
         self.data = data
         self.source = source
         self._nav_ndim = signal.axes_manager.navigation_dimension
         self._nav_shape = tuple(int(v) for v in data.shape[:self._nav_ndim])
-        self._memo = None                   # (block_index_tuple, block ndarray)
+        self._block_cache = block_cache
+        self._memo = None                   # fallback when there's no BlockCache
 
         # Uniform per-axis STORAGE chunk sizes along the nav axes (h5py's
         # Dataset.chunks / zarr's Array.chunks; None for a contiguous dataset,
-        # absent for a memmap). The block read is worth it only when the store
-        # decodes a whole chunk anyway.
+        # absent for a memmap).
         chunks = getattr(source, "chunks", None)
         nav_chunks = None
         if chunks is not None and len(chunks) >= self._nav_ndim:
-            nav_chunks = tuple(int(c) for c in chunks[:self._nav_ndim])
-            block_frames = int(np.prod(nav_chunks))
-            if block_frames <= 1 or block_frames * self.frame_bytes > MAX_BLOCK_BYTES:
-                nav_chunks = None           # nothing to amortise / too big to hold
+            nav_chunks = self._fit_block(
+                tuple(int(c) for c in chunks[:self._nav_ndim]))
         self._nav_chunks = nav_chunks
+
+    def _fit_block(self, nav_chunks):
+        """The nav extent to read and cache as one block — the WHOLE storage chunk
+        for a chunked source, since a chunk is atomic (see the module note).
+
+        Returns None (read frame-at-a-time) only when there is nothing to
+        amortise: a 1-frame chunk, or a chunk so large that holding it would blow
+        the budget outright, in which case per-frame reads at least bound memory."""
+        total = int(np.prod(nav_chunks))
+        if total <= 1:
+            return None                      # 1 frame/chunk — nothing to amortise
+        if total * self.frame_bytes > MAX_BLOCK_BYTES:
+            return None                      # can't hold it; bound memory instead
+        return tuple(nav_chunks)
 
     @property
     def frame_bytes(self) -> int:
@@ -141,19 +206,75 @@ class SourceArrayReader:
             nav_slices.append(slice(b * c, min((b + 1) * c, self._nav_shape[ax])))
         return tuple(block_idx), nav_slices
 
+    def _cached_block(self, key):
+        """The decoded block for ``key`` if resident, else None."""
+        if self._block_cache is not None:
+            return self._block_cache.get(id(self), key)
+        memo = self._memo                   # read ONCE — torn pairs slice the wrong chunk
+        return memo[1] if memo is not None and memo[0] == key else None
+
+    def _store_block(self, key, block) -> None:
+        if self._block_cache is not None:
+            self._block_cache.put(id(self), key, block)
+        else:
+            self._memo = (key, block)
+
     def is_chunk_resident(self, indices) -> bool:
-        """Is the decoded storage chunk holding ``indices`` already memoized —
+        """Is the decoded storage chunk holding ``indices`` already cached —
         i.e. would read_frame be a ~0 ms numpy slice? Side-effect-free; feeds
         overlay.py's cheap/expensive gate (see nav_read.is_local_frame_resident)."""
         try:
-            memo = self._memo
-            if memo is None:
-                return False
             point = tuple(int(v) for v in np.atleast_1d(np.asarray(indices)))
             located = self._locate(point)
-            return located is not None and located[0] == memo[0]
+            if located is None:
+                return False
+            if self._block_cache is not None:
+                return self._block_cache.contains(id(self), located[0])
+            memo = self._memo
+            return memo is not None and located[0] == memo[0]
         except Exception:
             return False
+
+    def sum_points(self, points, out_dtype=np.float32):
+        """Sum the frames at ``points`` straight out of the resident block(s).
+
+        The per-frame path (read_frame -> ArrayCache) has to COPY each frame out
+        of its block so a cached entry doesn't pin the whole thing. For a REGION
+        that copy is pure waste — the frames are summed immediately and never
+        cached individually. Measured on a resident 537 MB block, 16x16 ROI:
+
+            per-frame loop + copy   165 ms
+            loop without the copy    61 ms
+            vectorised block sum     99 ms
+
+        so skipping the copy is the win, and slicing contiguous runs out of the
+        block lets numpy do the accumulate. Returns None if this reader has no
+        block concept (contiguous source), so the caller falls back.
+
+        Groups points by block, so an ROI straddling several chunks still works;
+        each block is fetched once through the same cache the single-point path
+        uses (no extra decode, no extra residency)."""
+        if self._nav_chunks is None:
+            return None
+        groups: dict = {}
+        for p in points:
+            point = tuple(int(v) for v in p[:self._nav_ndim])
+            located = self._locate(point)
+            if located is None:
+                return None
+            key, nav_slices = located
+            groups.setdefault(key, (nav_slices, []))[1].append(point)
+
+        acc = None
+        for key, (nav_slices, pts) in groups.items():
+            block = self._cached_block(key)
+            if block is None:
+                block = np.asarray(self.source[tuple(nav_slices)])
+                self._store_block(key, block)
+            part = _sum_block_points(block, nav_slices, pts, self._nav_ndim,
+                                     out_dtype)
+            acc = part if acc is None else acc + part
+        return acc
 
     def read_frame(self, indices: tuple[int, ...]) -> np.ndarray:
         point = tuple(int(v) for v in indices[:self._nav_ndim])
@@ -164,12 +285,10 @@ class SourceArrayReader:
             frame = np.asarray(self.source[point])
         else:
             key, nav_slices = located
-            memo = self._memo               # read ONCE — see the class docstring
-            if memo is not None and memo[0] == key:
-                block = memo[1]
-            else:
+            block = self._cached_block(key)
+            if block is None:
                 block = np.asarray(self.source[tuple(nav_slices)])
-                self._memo = (key, block)
+                self._store_block(key, block)
             local = tuple(point[ax] - nav_slices[ax].start
                           for ax in range(self._nav_ndim))
             frame = block[local]
