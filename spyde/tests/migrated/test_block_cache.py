@@ -157,3 +157,46 @@ class TestThreadSafety:
         # accounting must equal the real retained bytes
         total = sum(int(b.nbytes) for b in c._entries.values())
         assert c.nbytes == total
+
+
+class TestRegionAccumulatorDtype:
+    """The region accumulator must not silently lose precision.
+
+    float32 is ~40% faster than float64 on a 512^2 frame, but it holds only 24
+    bits of integer precision — exact only while n_pts * max(dtype) < 2^24. That
+    holds for the common detector dtypes (256 x uint16 max = 16,776,960, just
+    under 16,777,216) and NOT for int32/uint32/float64, which .hspy/.zspy can
+    hold: summing 256 int32 frames in float32 loses up to ~236,148 in absolute
+    value, which would show up as a visibly wrong integrated frame.
+    """
+
+    def test_uint16_at_the_cap_uses_float32(self):
+        from spyde.array_cache.nav_read import _region_accum_dtype
+        assert _region_accum_dtype(np.uint16, 256) == np.float32
+        # ...and the margin is exactly the frame budget, so this is not slack.
+        assert 256 * np.iinfo(np.uint16).max <= (1 << 24)
+
+    def test_uint16_above_the_cap_falls_back(self):
+        """If MAX_REGION_EXTENT_PER_DIM ever rises, uint16 stops being exact."""
+        from spyde.array_cache.nav_read import _region_accum_dtype
+        assert _region_accum_dtype(np.uint16, 4096) == np.float64
+
+    @pytest.mark.parametrize("dt", [np.int32, np.uint32, np.float64])
+    def test_wide_dtypes_use_float64(self, dt):
+        from spyde.array_cache.nav_read import _region_accum_dtype
+        assert _region_accum_dtype(dt, 256) == np.float64
+
+    @pytest.mark.parametrize("dt", [np.uint8, np.int16, np.float16, np.float32])
+    def test_narrow_dtypes_use_float32(self, dt):
+        from spyde.array_cache.nav_read import _region_accum_dtype
+        assert _region_accum_dtype(dt, 256) == np.float32
+
+    def test_int32_region_mean_is_accurate(self):
+        """End-to-end: an int32 source must not degrade through the region sum."""
+        from spyde.array_cache.nav_read import _region_accum_dtype
+        rng = np.random.default_rng(0)
+        frames = rng.integers(0, 2 ** 31 - 1, (256, 8, 8), dtype=np.int32)
+        acc_dt = _region_accum_dtype(np.int32, 256)
+        got = frames.sum(0, dtype=acc_dt) / 256
+        exact = frames.sum(0, dtype=np.float64) / 256
+        np.testing.assert_allclose(got, exact, rtol=1e-12)

@@ -139,6 +139,36 @@ def get_local_frame(plot, signal, data, indices, prof=None):
     return plot._array_cache.get_frame(id(signal), reader, point, prof)
 
 
+def _region_accum_dtype(dtype, n_pts):
+    """Accumulator dtype for summing ``n_pts`` frames of ``dtype``.
+
+    float32 is the fast choice (measured ~40% quicker than float64 on a 512^2
+    frame) but it only holds 24 bits of integer precision, so it is EXACT only
+    while ``n_pts * max(dtype)`` stays under 2^24. That is true for the common
+    detector dtypes — 256 x uint16 max is 16,776,960, just under 16,777,216 —
+    and NOT true for int32/uint32 or float64 data, which .hspy/.zspy can hold:
+    summing 256 int32 frames in float32 was measured to lose up to 236,148 in
+    absolute value. Anything else gets float64.
+
+    NB the uint16 margin is only 256 counts, i.e. exactly the frame budget. If
+    MAX_REGION_EXTENT_PER_DIM ever rises above 16, uint16 stops being exact too
+    and lands here — which is why this decides from n_pts rather than a
+    hard-coded dtype list."""
+    dt = np.dtype(dtype)
+    if dt == np.float64 or dt.itemsize > 4:
+        return np.float64
+    if np.issubdtype(dt, np.floating):
+        # float16/float32 sources: float32 accumulate keeps the source's own
+        # precision (a float64 accumulator cannot recover bits the data lacks).
+        return np.float32
+    if np.issubdtype(dt, np.integer):
+        info = np.iinfo(dt)
+        span = max(abs(int(info.max)), abs(int(info.min)))
+        if int(n_pts) * span <= (1 << 24):
+            return np.float32
+    return np.float64
+
+
 def _get_local_region(plot, signal, data, idx, prof=None):
     """Frame-wise mean over the N nav points of an integrating region.
 
@@ -147,10 +177,9 @@ def _get_local_region(plot, signal, data, idx, prof=None):
     only the handful of nav-chunks it spans and a dragged ROI re-serves the
     ~75% of points it shares with the previous step from cache.
 
-    Accumulates in float32, which is EXACT here: a nav region is capped at
-    MAX_REGION_EXTENT_PER_DIM=16 per dimension (256 frames), and 256 x uint16
-    max is ~2^24, inside float32's exact-integer range. Rounds back to an
-    integer source dtype for parity with the distributed
+    The accumulator dtype is chosen by :func:`_region_accum_dtype` — float32 only
+    where it is provably exact, float64 otherwise. Rounds back to an integer
+    source dtype for parity with the distributed
     ``weighted_mean_round_from_sums`` the old path used.
 
     Memory stays bounded by construction: one frame at a time into one
@@ -170,12 +199,13 @@ def _get_local_region(plot, signal, data, idx, prof=None):
     # copy dominates: 165 ms vs 61 ms on a resident 537 MB block, 16x16 ROI.
     # Region frames are summed immediately and never wanted individually, so the
     # copy buys nothing here.
+    acc_dtype = _region_accum_dtype(data.dtype, n_pts)
     acc = None
     how = "region"
     summer = getattr(reader, "sum_points", None)
     if summer is not None:
         try:
-            acc = summer(idx, np.float32)
+            acc = summer(idx, acc_dtype)
             if acc is not None:
                 how = "region-block"
         except Exception as e:
@@ -189,7 +219,7 @@ def _get_local_region(plot, signal, data, idx, prof=None):
             point = tuple(int(v) for v in idx[i])
             frame = cache.get_frame(key, reader, point, None)
             if acc is None:
-                acc = np.asarray(frame, dtype=np.float32).copy()
+                acc = np.asarray(frame, dtype=acc_dtype).copy()
             else:
                 acc += frame
 

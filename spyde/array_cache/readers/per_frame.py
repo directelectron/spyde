@@ -162,9 +162,23 @@ class PerFrameReader:
 
         Both of these transforms are LINEAR (rebin sums blocks; a crop selects a
         sub-array), so summing the PARENT's frames first and transforming once is
-        identical to transforming each frame and summing — and it does the
-        transform once instead of N times. Measured on a 16x16 ROI of 512^2
-        frames: 529 ms per-frame vs ~60 ms via the parent's own block sum.
+        algebraically identical to transforming each frame and summing — and it
+        does the transform once instead of N times. Measured on a 16x16 ROI of
+        512^2 frames: 529 ms per-frame vs ~60 ms via the parent's own block sum.
+        (Verified: swapping the order is exact for rebin and crop, and would NOT
+        be for a non-linear op — which is why the build gate only admits these
+        two.)
+
+        FLOATING-POINT NOTE: rebin's block sum multiplies magnitudes by the rebin
+        factor, so with a float32 accumulator the POST-transform values can leave
+        float32's exact-integer range even when the parent sum was exact.
+        Measured worst case on 256 near-max uint16 frames: ~1e-7 relative error
+        (3 counts at 2x2, 106 at 8x8 on values of order 1e9) — far below one
+        display level, and _region_accum_dtype already promotes to float64 for
+        any dtype where the PARENT sum itself would be inexact. Flagged rather
+        than fixed because widening the accumulator here costs ~40% for an error
+        no one can see; revisit if these frames ever feed quantitative analysis
+        rather than the display.
 
         Falls back to the per-frame loop if the parent can't sum for us."""
         parent_sum = getattr(self.parent_reader, "sum_points", None)
