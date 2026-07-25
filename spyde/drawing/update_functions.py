@@ -305,14 +305,14 @@ _interactive_activity = _InteractiveActivity()
 # (Single-point reads — including derived rebin/crop/.zspy views — are ALWAYS
 # synchronous now: the transform recompute is only ~5–9 ms and the decoded-chunk
 # cache makes dwell-in-chunk ~0 ms, so the async round-trip's ~15–40 ms + 4 thread
-# hops was pure overhead. See _NavChunkCache.)
+# hops was pure overhead. See spyde/array_cache.)
 REGION_FRAME_CAP = 4              # ≤ this many frames: definitely synchronous
 REGION_ASYNC_FRAME_CAP = 48      # > this many frames: async (would freeze otherwise)
 REGION_BYTES_CAP = 128 * 2 ** 20  # …or more than this many total bytes → async
 COLD_FRAME_CAP = 8 * 2 ** 20      # a cache-MISS single LARGE frame → async (rare)
 
 
-def _classify_nav_read(current_signal, indices, data, frame_bytes):
+def _classify_nav_read(current_signal, indices, data, frame_bytes, child=None):
     """Return ``"cheap"`` or ``"expensive"`` for this lazy nav read. O(1)-ish and
     side-effect-free — NEVER triggers a compute (it only inspects index shapes and
     the cache). Called on the serial dispatcher thread before the read, so an
@@ -341,13 +341,32 @@ def _classify_nav_read(current_signal, indices, data, frame_bytes):
         # Single point. A cached signal's cold read of a HUGE frame is the only
         # single-point case worth the async round-trip; derived views (no cache) are
         # served synchronously from the decoded-chunk cache.
+        #
+        # "Cold" now means cold in BOTH caches. The per-frame read is served by the
+        # plot's ArrayCache (spyde/array_cache), which leaves hyperspy's
+        # CachedDaskArray empty — so _nav_cache_is_resident alone would call every
+        # big frame cold and pay the async round-trip even for one that ArrayCache
+        # can hand back as a dict lookup.
         cached_arr = getattr(current_signal, "cached_dask_array", None)
         if cached_arr is not None and frame_bytes > COLD_FRAME_CAP \
-                and not _nav_cache_is_resident(current_signal, indices):
+                and not _nav_cache_is_resident(current_signal, indices) \
+                and not _array_cache_is_resident(child, current_signal, data, indices):
             return "expensive"
         return "cheap"
     except Exception:
         return "cheap"
+
+
+def _array_cache_is_resident(child, current_signal, data, indices) -> bool:
+    """Would the ArrayCache path serve ``indices`` without a real read? False for
+    a missing plot / an ArrayCache-ineligible (opaque) signal / any probe failure
+    — always the conservative answer, since a false "resident" only costs a brief
+    stall the settle re-fire recovers from."""
+    try:
+        from spyde.array_cache import is_local_frame_resident
+        return is_local_frame_resident(child, current_signal, data, indices)
+    except Exception:
+        return False
 
 
 def _nav_cache_is_resident(signal, indices) -> bool:
@@ -370,132 +389,6 @@ def _nav_cache_is_resident(signal, indices) -> bool:
         return all(c in cache.core_cached_block_inds for c in core)
     except Exception:
         return False
-
-
-# Total decoded frames the per-plot derived-view chunk cache may hold across all
-# resident nav-chunks. A 256×256 float64 frame is ~0.5 MB, so 512 frames ≈ 256 MB
-# worst case; a 128×128 uint16 DP frame is ~32 KB → 512 frames ≈ 16 MB. Bounds the
-# cache like hyperspy's CachedDaskArray bounds its resident blocks.
-MAX_CACHED_FRAMES = 512
-
-
-def _nav_chunk_span(chunk_sizes, pos):
-    """For one navigation axis with dask ``chunk_sizes`` (a tuple of per-block
-    lengths) and integer ``pos``, return ``(block_index, start, stop)`` of the
-    chunk that contains ``pos`` — so a nav index maps to the block that must be
-    decoded whole (a derived frame at pos needs its ENTIRE source nav-chunk; the
-    chunk is the true unit of compute, esp. for compressed .zspy). cumsum +
-    searchsorted; O(number of blocks)."""
-    edges = np.cumsum((0,) + tuple(int(c) for c in chunk_sizes))
-    b = int(np.searchsorted(edges, pos, side="right") - 1)
-    b = max(0, min(b, len(chunk_sizes) - 1))
-    return b, int(edges[b]), int(edges[b + 1])
-
-
-class _NavChunkCache:
-    """Per-plot LRU of DECODED output nav-chunks for a DERIVED lazy view (rebin /
-    crop / rechunk / .zspy) — those have no hyperspy ``CachedDaskArray``, so without
-    this every crosshair move re-decodes + re-transforms the whole source nav-chunk
-    (dask must materialise the entire chunk to yield any one frame; on compressed
-    data it also re-decompresses it). Caching the decoded chunk makes every frame
-    within that nav span a free numpy slice — dwell-in-chunk goes from ~9 ms/move to
-    ~0 ms, matching what CachedDaskArray gives the base navigator (measured 145× on a
-    12×12-nav-chunk 4D-STEM rebin).
-
-    Keyed by ``(id(signal), block_index_tuple)`` so switching the displayed node
-    misses naturally. Touched ONLY from the serial ``_NavDispatcher`` thread, so no
-    lock is needed (Live-Display §2/§4). Bounded by MAX_CACHED_FRAMES decoded frames
-    (never the whole dataset — Memory-Safety rule)."""
-
-    def __init__(self, max_frames: int = MAX_CACHED_FRAMES) -> None:
-        from collections import OrderedDict
-        # key -> (block ndarray, frame_count) — storing the count avoids re-inferring
-        # nav_ndim on eviction.
-        self._blocks: "OrderedDict" = OrderedDict()
-        self._frames = 0                              # running frame count across blocks
-        self._max_frames = int(max_frames)
-
-    def clear(self) -> None:
-        self._blocks.clear()
-        self._frames = 0
-
-    def get_frame(self, signal, data, indices, prof=None):
-        """Return the single output frame at ``indices`` (nav point) as a numpy
-        array, decoding + caching its whole output nav-chunk on a miss. Returns None
-        if it can't serve the request (not a single point / no chunks) so the caller
-        falls back to the direct read."""
-        idx = np.asarray(indices)
-        if idx.ndim > 1:
-            return None                                # region — not a single frame
-        chunks = getattr(data, "chunks", None)
-        if not chunks:
-            return None
-        nav_ndim = signal.axes_manager.navigation_dimension
-        point = tuple(int(v) for v in np.atleast_1d(idx))
-        if len(point) != nav_ndim:
-            return None
-
-        # Locate the nav-chunk containing this point + the slice spanning it.
-        block_idx, nav_slices = [], []
-        for ax in range(nav_ndim):
-            b, s, e = _nav_chunk_span(chunks[ax], point[ax])
-            block_idx.append(b)
-            nav_slices.append(slice(s, e))
-        key = (id(signal), tuple(block_idx))
-
-        entry = self._blocks.get(key)
-        if entry is not None:
-            self._blocks.move_to_end(key)              # LRU touch
-            block, _ = entry
-            if prof is not None:
-                prof.done("chunk-cache hit")
-        else:
-            # MISS: decode the whole output nav-chunk once (all frames for this
-            # source-chunk nav span), synchronously on the dispatcher thread.
-            full_slice = tuple(nav_slices) + (slice(None),) * (data.ndim - nav_ndim)
-            block = np.asarray(data[full_slice].compute(scheduler="synchronous"))
-            n_frames = int(np.prod(block.shape[:nav_ndim]))
-            self._blocks[key] = (block, n_frames)
-            self._frames += n_frames
-            self._evict_over_budget()
-            if prof is not None:
-                prof.done("chunk-cache MISS decode")
-
-        # Slice the requested frame OUT of the cached block (offset within the chunk).
-        local = tuple(point[ax] - nav_slices[ax].start for ax in range(nav_ndim))
-        return block[local]
-
-    def is_resident(self, signal, data, indices) -> bool:
-        """Cheap, side-effect-free probe: is the decoded output nav-chunk for a
-        single-point ``indices`` ALREADY cached? (Mirrors :meth:`get_frame`'s key
-        derivation but NEVER decodes.) Lets a caller decide whether a synchronous
-        read would be a ~0 ms numpy slice (resident) vs a ~9 ms whole-chunk decode
-        (miss). Returns False for a region / no chunks / any probe failure — the
-        conservative answer (treat as not-resident)."""
-        try:
-            idx = np.asarray(indices)
-            if idx.ndim > 1:
-                return False
-            chunks = getattr(data, "chunks", None)
-            if not chunks:
-                return False
-            nav_ndim = signal.axes_manager.navigation_dimension
-            point = tuple(int(v) for v in np.atleast_1d(idx))
-            if len(point) != nav_ndim:
-                return False
-            block_idx = [
-                _nav_chunk_span(chunks[ax], point[ax])[0] for ax in range(nav_ndim)
-            ]
-            return (id(signal), tuple(block_idx)) in self._blocks
-        except Exception:
-            return False
-
-    def _evict_over_budget(self) -> None:
-        # Keep at least the just-inserted block (last) even if it alone exceeds the
-        # budget — we still need to serve the current frame.
-        while self._frames > self._max_frames and len(self._blocks) > 1:
-            _k, (_old, n) = self._blocks.popitem(last=False)  # evict oldest
-            self._frames -= n
 
 
 def _direct_read_frame(current_signal, selector, indices, prof, child=None):
@@ -556,15 +449,15 @@ def _direct_read_frame(current_signal, selector, indices, prof, child=None):
                 # ~9 ms per-move re-decode. Falls through to the plain compute when
                 # there's no cache (returns None → recompute below).
                 point = tuple(int(v) for v in np.atleast_1d(idx))
-                cache = getattr(child, "_nav_chunk_cache", None) if child is not None else None
                 frame = None
-                if cache is not None:
+                if child is not None:
                     try:
-                        cframe = cache.get_frame(current_signal, data, idx, prof)
+                        from spyde.array_cache import get_local_frame
+                        cframe = get_local_frame(child, current_signal, data, idx, prof)
                         if cframe is not None:
                             frame = np.asarray(cframe)
                     except Exception as _ce:
-                        log.debug("nav chunk cache read failed, direct read: %s", _ce)
+                        log.debug("array cache read failed, direct read: %s", _ce)
                         frame = None
                 if frame is None:
                     frame = np.asarray(
@@ -845,7 +738,8 @@ def _try_async_expensive_nav_read(current_signal, selector, child, indices, prof
         nav_dim = current_signal.axes_manager.navigation_dimension
         frame_shape = data.shape[nav_dim:]
         frame_bytes = int(np.prod(frame_shape)) * data.dtype.itemsize
-        if _classify_nav_read(current_signal, indices, data, frame_bytes) != "expensive":
+        if _classify_nav_read(current_signal, indices, data, frame_bytes,
+                              child=child) != "expensive":
             return False
         settle = bool(getattr(child, "_pending_settle", False))
         return _submit_async_nav_read(child, current_signal, indices, settle, prof)

@@ -175,6 +175,9 @@ def czb_run(session, plot, payload) -> None:
             new = tree.add_transformation(
                 parent_signal=signal, method="center_direct_beam",
                 node_name="Centered", shifts=shifts, inplace=False,
+                # Per-pattern shift estimates are local; flat-field mode fits one
+                # plane across ALL shifts first, so that specific run is opaque.
+                local=(not flat),
             )
             if new is None:
                 emit_error("Center Zero Beam: centering failed")
@@ -284,6 +287,8 @@ def czb_pick(session, plot, payload) -> None:
             new = tree.add_transformation(
                 parent_signal=signal, method="center_direct_beam",
                 node_name="Centered (Manual)", shifts=shifts, inplace=False,
+                # A constant shift over the whole scan — trivially local.
+                local=True,
             )
             if new is None:
                 emit_error("Center Zero Beam: centering failed")

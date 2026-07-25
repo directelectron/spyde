@@ -693,7 +693,26 @@ class BaseSignalTree:
                 return node
         return None
 
-    def add_node(self, parent_signal, new_signal, transformation: str) -> None:
+    def resolve_locality(self, signal) -> bool:
+        """Is ``signal``'s node ArrayCache-eligible for the fast per-frame
+        path? See spyde/array_cache/locality.py — memoized on the node, walks
+        ancestry only on first call. A signal not found in this tree resolves
+        opaque (False) — the same fail-safe default as an untagged node."""
+        from spyde.array_cache.locality import resolve_locality
+
+        node = self.get_node(signal)
+        if node is None:
+            return False
+        return resolve_locality(node)
+
+    def add_node(
+        self,
+        parent_signal,
+        new_signal,
+        transformation: str,
+        *,
+        local: bool | None = None,
+    ) -> None:
         parent_node = self.get_node(parent_signal)
         if parent_node is None:
             raise ValueError("Parent node not found in the tree.")
@@ -708,6 +727,7 @@ class BaseSignalTree:
             name=final_name,
             parent=parent_node,
             transformation=transformation,
+            local=local,
         )
 
     def add_transformation(
@@ -717,6 +737,7 @@ class BaseSignalTree:
         function: callable = None,
         node_name: str = None,
         *args,
+        local: bool | None = None,
         **kwargs,
     ) -> BaseSignal | None:
         from spyde.backend.ipc import emit_error
@@ -754,6 +775,7 @@ class BaseSignalTree:
             transformation=transformation_name,
             args=args,
             kwargs=kwargs,
+            local=local,
         )
         self.update_plot_states(new_signal)
         return new_signal

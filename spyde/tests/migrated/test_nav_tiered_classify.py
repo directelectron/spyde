@@ -116,6 +116,32 @@ class TestClassifyCachedCold:
         fb = _frame_bytes((4096, 4096), 4)  # 64 MiB > COLD_FRAME_CAP
         assert _classify_nav_read(sig, np.array([5]), data, fb) == "expensive"
 
+    def test_huge_frame_resident_in_the_array_cache_is_cheap(self):
+        """"Cold" means cold in BOTH caches: the per-frame read is served by the
+        plot's ArrayCache, which leaves hyperspy's CachedDaskArray empty, so a
+        big frame ALREADY in the ArrayCache must not pay the async round-trip."""
+        import types
+        from spyde.array_cache import ArrayCache
+
+        data = da.zeros((6, 4096, 4096), dtype=np.uint16, chunks=(1, -1, -1))
+        sig = _FakeSignal(cached=object(), nav_dim=1)
+        fb = _frame_bytes((4096, 4096), 2)
+        idx = np.array([5])
+        plot = types.SimpleNamespace(
+            signal_tree=types.SimpleNamespace(resolve_locality=lambda s: True),
+            _array_cache=ArrayCache(),
+            _local_transform_readers={},
+        )
+        # Nothing cached yet -> still the cold-huge-frame async tier.
+        assert _classify_nav_read(sig, idx, data, fb, child=plot) == "expensive"
+
+        class _R:
+            data = None
+            def read_frame(self, indices):
+                return np.zeros((4, 4), np.uint16)
+        plot._array_cache.get_frame(id(sig), _R(), (5,))
+        assert _classify_nav_read(sig, idx, data, fb, child=plot) == "cheap"
+
     def test_derived_huge_frame_stays_cheap(self):
         # No cache (derived) → single points are ALWAYS synchronous (chunk-cached),
         # even for a huge frame — the async cold rule only applies to cached signals.

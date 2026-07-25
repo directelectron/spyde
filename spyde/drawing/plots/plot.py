@@ -271,13 +271,15 @@ class Plot:
         # serial dispatcher and a superseded frame is dropped (Live-Display §3
         # tiered read). None when the current read is cheap/synchronous.
         self._nav_future = None
-        # Per-plot LRU of decoded output nav-chunks for the synchronous read — makes
-        # dwelling within a chunk on a derived (rebin/crop/.zspy) view a ~0 ms numpy
-        # slice instead of re-decoding the whole source chunk every move. Cleared
-        # when the displayed node changes / on close. (Import here to avoid a
-        # module-load cycle: update_functions imports drawing types.)
-        from spyde.drawing.update_functions import _NavChunkCache
-        self._nav_chunk_cache = _NavChunkCache()
+        # Per-plot byte-budget LRU of decoded frames for the synchronous read —
+        # makes dwelling on a derived (rebin/crop/.zspy) view or any other
+        # ArrayCache-eligible (locality-tagged) source a ~0 ms numpy slice on a
+        # repeat instead of a re-decode every move. Cleared when the displayed
+        # node changes / on close. _local_transform_readers caches the small
+        # per-signal reader object (holds its own one-chunk memo) alongside it.
+        from spyde.array_cache import ArrayCache
+        self._array_cache = ArrayCache()
+        self._local_transform_readers: Dict = {}
         # GPU tile backend for a LARGE signal frame — reduces overview/detail tiles on
         # the GPU. Lazily built on the first large frame (_maybe_gpu_tile); reset on a
         # node switch / close so a new signal rebuilds it. None = not tiling yet.
@@ -1110,11 +1112,14 @@ class Plot:
     def set_plot_state(self, signal) -> None:
         old_state = self.plot_state
         self.needs_auto_level = True
-        # The displayed node is changing — drop cached decoded chunks of the old
+        # The displayed node is changing — drop cached decoded frames of the old
         # node so they don't occupy the budget (keys are per-signal-id, so they'd
-        # never be returned for the new node anyway).
-        if self._nav_chunk_cache is not None:
-            self._nav_chunk_cache.clear()
+        # never be returned for the new node anyway), and close any readers that
+        # hold real resources (e.g. BinaryReader's open file descriptor).
+        if self._array_cache is not None:
+            self._array_cache.clear()
+        from spyde.array_cache import close_all_readers
+        close_all_readers(self)
         # Rebuild the GPU tile backend for the new node (its logical size / dtype may
         # differ; a stale backend would swap a mismatched frame into the old tiling).
         self._gpu_tile_backend = None
@@ -1243,12 +1248,17 @@ class Plot:
             except Exception:
                 pass
             self._nav_future = None
-        # Release cached decoded chunks.
-        if self._nav_chunk_cache is not None:
+        # Release cached decoded frames.
+        if self._array_cache is not None:
             try:
-                self._nav_chunk_cache.clear()
+                self._array_cache.clear()
             except Exception:
                 pass
+        try:
+            from spyde.array_cache import close_all_readers
+            close_all_readers(self)
+        except Exception:
+            pass
         # Drop any MDI overlay layers ON this plot (their anyplotlib handles) AND
         # any layers on OTHER plots that source FROM this one — so closing either a
         # target or a source leaves no dangling handle / stale composited image.
