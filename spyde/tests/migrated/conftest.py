@@ -10,6 +10,7 @@ fixtures' shape: ``window`` (the Session), ``signal_trees``, ``plots``, and
 from __future__ import annotations
 
 import os
+import tempfile
 import time
 from typing import Iterator
 
@@ -18,6 +19,16 @@ import hyperspy.api as hs
 import pytest
 
 os.environ.setdefault("SPYDE_NO_DASK", "1")
+# Point settings.json at a throwaway dir for the whole test session (the
+# mechanism Session documents for exactly this). Several tests assert on
+# DEFAULTS — first_run, update_channel — and a Session reads the real
+# ~/.spyde/settings.json at construction, so those tests fail on any machine
+# that has actually RUN the app: a dismissed welcome tour persists
+# tutorial_seen, an rc build persists update_channel=beta. A fresh dir per
+# pytest process also stops a test that persists a setting from poisoning the
+# next run. setdefault, so a developer can still point it somewhere on purpose.
+os.environ.setdefault(
+    "SPYDE_SETTINGS_DIR", tempfile.mkdtemp(prefix="spyde-test-settings-"))
 
 
 @pytest.fixture
