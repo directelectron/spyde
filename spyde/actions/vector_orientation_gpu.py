@@ -310,6 +310,34 @@ def _coarse_seed_batched(g, gI, gmask, v, vI, vmask, n_angles, sigma):
     of their radial-angular signatures. The correlation over all template/angle
     pairs is one batched FFT product — no per-template or per-angle Python loop.
     Returns (best_template (P,), best_theta (P,), best_score (P,)).
+
+    DO NOT "fix" this into a normalised (cosine) correlation. It looks obviously
+    wrong as a raw inner product — a bare Σ vh·gh is maximised partly by total
+    template intensity rather than purely by match quality — and on synthetic
+    patterns that ARE library templates, cosine normalisation looks like a
+    dramatic win: true template ranked top in 40/40 cases vs 1/40, and the
+    recovered field goes from ~28° off to exact.
+
+    On REAL data it is decidedly WORSE. A/B on sped_ag (12×18 slab, 1081 Ag
+    templates) against the dense raw-OM reference, seed normalisation the ONLY
+    difference:
+
+        seed                        IPF-X  IPF-Y  IPF-Z
+        raw inner product            98%    98%   100%
+        cosine-normalised             0%    28%     0%
+
+    Why the synthetic result misleads: it hands the fit EVERY template spot, so
+    the two signatures have equal support and cosine is ideal. Real vector
+    finding detects only the strong subset (~5–15 of ~25 reflections), and
+    dividing by the template norm then penalises a template for the spots that
+    simply were not detected — systematically favouring sparse/low-multiplicity
+    templates. The unnormalised product instead rewards templates whose
+    intensity mass sits where the measurement has mass, which is the asymmetry
+    partial detection actually calls for (the same asymmetry the refine's
+    no-match sink encodes: template spots may opt out, measured ones should not).
+
+    Any future change here must be A/B'd on a real scan against the dense
+    reference, not on synthetic full-support patterns.
     """
     import torch
     dev = v.device
