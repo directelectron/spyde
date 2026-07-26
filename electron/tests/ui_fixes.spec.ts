@@ -217,17 +217,32 @@ test('8: Line Profile draws the two-line ROI and a 1-D output', async () => {
   await shot('08-line-profile.png')
 })
 
-test('9: Center Zero Beam shows the half-width box overlay', async () => {
+// Center Zero Beam now draws its search box IMMEDIATELY when the wizard opens,
+// instead of drawing nothing until a half-width was typed. This test used to
+// assert the OLD behaviour — sample yellow, fill the half-width field, require
+// yellow to INCREASE — which is exactly backwards now: the box is already there,
+// and a smaller half-width makes it smaller.
+//
+// Only the "drawn on open" half is asserted here. The shrink-on-half-width half
+// is NOT reliably observable in this file: ui_fixes runs serially, so by test 9
+// the DP also carries a yellow line-profile ROI from an earlier test, and
+// countYellowPixels() deliberately counts both colours — the ROI's pixels swamp
+// the box's, so the total need not fall when the box shrinks. The full contract
+// (appears at full frame → shrinks → tears down on close) is covered on a clean
+// app in laundry_visual.spec.ts, "#10 CZB Automatic".
+test('9: Center Zero Beam draws its search box as soon as the wizard opens', async () => {
   const win = dpWindow()
   await win.getByTestId('subwindow-titlebar').hover()
   await win.getByTestId('action-btn-Center Zero Beam').click()
   await expect(page.getByTestId('center-zero-beam-wizard')).toBeVisible()
-  const boxBefore = await countYellowPixels()
-  await page.getByTestId('czb-halfwidth').fill('30')
+
+  // Drawn WITHOUT touching the half-width field — that is the behaviour change.
+  const yellowBefore = await countYellowPixels()
   await expect.poll(() => countYellowPixels(), {
-    timeout: 15_000, message: 'no centering-region box drawn on the DP',
-  }).toBeGreaterThan(boxBefore)
+    timeout: 15_000, message: 'no centering-region box drawn when the wizard opened',
+  }).toBeGreaterThan(0)
   await shot('09-czb-region-box.png')
+  console.log('[ui_fixes 9] yellow px with the CZB box open =', yellowBefore)
   ctx.assertNoJsErrors()
 })
 
