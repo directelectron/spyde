@@ -284,6 +284,49 @@ poll for the cheap nav path. This is the fast common case and stays fully synchr
   accumulate in float32 (exact: ≤256 frames × uint16 max < 2²⁴) and round back to an
   integer source dtype for parity with the old distributed
   `weighted_mean_round_from_sums`.
+- **On LARGE frames a region integrate is ARITHMETIC-bound, not I/O-bound — every
+  other bullet in this section models I/O and none of them explains it.** Measured on
+  a 48 × 4096² uint16 `.mrc` movie, 16-frame ROI, one drag step: **660 ms, of which
+  only ~166 ms was I/O** (16 × 10.4 ms memmap reads at 3.0 GiB/s). The other ~500 ms
+  was plain numpy — `16 × acc(float32, 64 MiB) += frame(uint16, 32 MiB)` plus the
+  `/n`, `rint`, `astype` tail, ~2.5 GiB of memory traffic through ONE core. So the
+  two cache-shaped fixes both disappoint: sizing `ArrayCache` to hold the ROI gets
+  660 → 460 ms, and routing the read async moves the 500 ms off the dispatcher
+  without removing it. **Time the arithmetic with the frames already in RAM before
+  reasoning about caches or sync-vs-async.** `spyde/array_cache/region_sum.py` fixes
+  it two ways, together **660 → ~58 ms**:
+  - **row-band threading** — numpy ufuncs release the GIL, so banding the frame and
+    accumulating concurrently is ~6.6× (502 → 76 ms). Banding partitions PIXELS, so
+    each pixel still sees its frames in the same order and the result is
+    **bit-identical** — that is the whole contract (`test_region_integrator.py`
+    asserts `array_equal`, never `allclose`). It saturates at ~8 threads: bandwidth-
+    bound, not core-bound (48 cores gain nothing past that). `SPYDE_REGION_THREADS`.
+  - **incremental ±1** — a slid ROI subtracts the leaving frames and adds the
+    entering ones instead of re-summing all N. Enabled ONLY for an INTEGER source:
+    every value is then exact in the accumulator and every partial sum stays inside
+    float32's exact-integer range (leaving frames are subtracted BEFORE entering ones
+    are added, so no intermediate can exceed the full-window bound). A FLOAT source
+    cannot be subtracted back out without drift and always recomputes.
+  - The full recompute streams ONE frame at a time into ONE accumulator with a
+    per-frame band barrier — it never materialises an N-frame stack, so the
+    Memory-Safety rule holds exactly as it did for the serial loop.
+  - `ArrayCache` grows for a region (`ensure_budget_for`, ceiling 1 GiB, restored by
+    `clear()`). The window alone is NOT enough headroom — the incremental path
+    touches 2 frames per step, so the other N−2 age by one insert per step and the
+    LEAVING frame gets evicted at almost exactly the step it is next needed
+    (1.9 misses/step at N+1 slots vs 1.0 at N×1.5).
+  - **`mean_frame` is NOT dispatcher-confined** — the expensive tier runs
+    `get_local_frame` on a compute worker (`_submit_async_nav_read`) and
+    `actions/overlay.py` warms off-thread — and the running sum is mutated IN PLACE.
+    It is guarded by a **TRY-lock**: a contended caller recomputes into a private
+    accumulator instead of waiting. Never make it a blocking lock; holding one across
+    a compute is the retired `_cache_lock_ctx` wedge (§2).
+  - An optional torch-CUDA accumulator (`region_sum_gpu.py`, `SPYDE_GPU_REGION=1`,
+    **off by default**) is bit-identical (`torch.round` is round-half-to-even like
+    `np.rint`; the cast back to the source dtype happens on-device). It is worth
+    ~60 → 48 ms median / 102 → 60 ms p95 on the real path and is *slower* than the
+    threaded CPU path when frames are already in RAM — it is PCIe-transfer-bound, not
+    compute-bound. Measured on one Pascal card only, hence opt-in.
 - **Focus demotes the block budget, it does NOT purge.** `set_active` →
   `Session._apply_focus_budgets` → `Plot.set_focused`: an unfocused plot shrinks to
   `UNFOCUSED_BUDGET_BYTES` (100 MiB) but KEEPS its working set, so clicking back is a

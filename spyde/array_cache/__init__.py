@@ -15,18 +15,24 @@ Reader kinds, tried in this order (see resolve.py):
 Every specific kind must DECLINE for a derived view instead of reading through
 to its untransformed source; see resolve.py.
 """
-from .cache import ArrayCache, DEFAULT_BUDGET_BYTES
+from .cache import (
+    ArrayCache, DEFAULT_BUDGET_BYTES, REGION_BUDGET_CEILING_BYTES,
+)
 from .block_cache import (
     BlockCache, DEFAULT_BLOCK_BUDGET_BYTES, UNFOCUSED_BUDGET_BYTES,
 )
 from .protocol import FrameReader
+from .region_sum import RegionIntegrator, finalize_sum
 from .nav_read import get_local_frame, is_local_frame_resident, close_all_readers
 
 __all__ = [
     "ArrayCache",
     "BlockCache",
     "FrameReader",
+    "RegionIntegrator",
+    "finalize_sum",
     "DEFAULT_BUDGET_BYTES",
+    "REGION_BUDGET_CEILING_BYTES",
     "DEFAULT_BLOCK_BUDGET_BYTES",
     "UNFOCUSED_BUDGET_BYTES",
     "get_local_frame",
