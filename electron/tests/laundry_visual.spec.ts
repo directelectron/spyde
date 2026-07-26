@@ -514,48 +514,16 @@ test.describe('Group B · movie editor (#6/#13)', () => {
 
   test.afterAll(async () => { await ctx?.app?.close() })
 
-  test('#8 MB/s HUD: scrubbing the movie navigator surfaces the throughput pill (+ popover), then it hides', async () => {
-    // The movie is 1 frame/chunk lazy → EVERY nav move is a genuine COLD read,
-    // which is exactly what the throughput meter samples (cache hits excluded).
-    // Scrub the 1-D time navigator via the server-side _test_nav_drag driver so
-    // the backend performs real cold reads.
-    const hud = page.getByTestId('io-throughput')
-    let sawHud = false
-    const deadline = Date.now() + 30_000
-    let k = 0
-    while (Date.now() < deadline) {
-      // Walk the 6-frame movie back and forth to force fresh cold reads.
-      const idx = k % 6
-      // eslint-disable-next-line no-await-in-loop
-      await backendAction(page, 'test_nav_drag', { targets: [[idx, 0]] })
-      k++
-      // eslint-disable-next-line no-await-in-loop
-      await page.waitForTimeout(150)
-      if (await hud.count() && await hud.first().isVisible().catch(() => false)) {
-        sawHud = true
-        break
-      }
-    }
-    console.log('[laundry #8] sawHud =', sawHud)
-    await page.screenshot({ path: join(SHOTS, '17-hud-pill.png') })
-    expect(sawHud, 'MB/s throughput pill never appeared while scrubbing the lazy movie').toBe(true)
+  // NOTE: the "#8 MB/s HUD" test that lived here has been removed along with the
+  // feature it covers. The cold-read throughput meter + StatusBar pill
+  // (laundry commit 0e46fa8) is NOT part of this batch — it belongs with the
+  // deferred data-access work. It was left in place at first and duly failed,
+  // and because this describe block is serial its failure also stopped
+  // "#6/#13 editor" (which IS in this batch) from running at all. Restore the
+  // test in the same commit that restores the feature.
 
-    // The "?" opens a storage-guidance popover.
-    await page.getByTestId('io-throughput-help').click().catch(() => {})
-    await expect(page.getByTestId('io-throughput-popover'),
-      'MB/s "?" did not open the guidance popover').toBeVisible({ timeout: 5_000 })
-    await page.screenshot({ path: join(SHOTS, '18-hud-popover.png') })
-    await page.getByTestId('io-throughput-help').click().catch(() => {})
-
-    // Stop scrubbing → the pill hides (STALE_MS = 8s; give it margin).
-    await page.waitForTimeout(12_000)
-    await expect(hud, 'MB/s pill did not hide after scrubbing stopped')
-      .toHaveCount(0, { timeout: 5_000 })
-    await page.screenshot({ path: join(SHOTS, '19-hud-hidden.png') })
-    ctx.assertNoJsErrors()
-  })
-
-  test('#6/#13 editor: overlay stays inside; source MDI window hidden; zoom persists on scrub', async () => {
+  // #13's zoom-persistence claim is NOT covered here — see the test.fixme below.
+  test('#6/#13 editor: overlay stays inside; source MDI window hidden; reopens clean', async () => {
     // Count the visible MDI subwindows before opening the editor.
     const mdiBefore = await page.getByTestId('subwindow').count()
     console.log('[laundry #6] MDI windows before editor =', mdiBefore)
@@ -611,12 +579,38 @@ test.describe('Group B · movie editor (#6/#13)', () => {
     // CLAUDE.md. Capture the figure's visible axis range as a NON-pixel signal
     // that the zoom took effect and PERSISTS across the scrub (the numbers on the
     // axis shrink when zoomed and must stay shrunk after the frame change).
+    // Read the visible span. Tick labels alone are NOT enough: the editor figure
+    // renders without numeric ticks, so the original tick-scraping version
+    // returned NaN both times and the persistence assertion below — guarded by
+    // isFinite — silently never ran. The panel's own `zoom` trait is the
+    // authoritative value, so try that first and fall back to ticks.
     const axisRange = async (): Promise<number> => {
       const h = await figWrap.locator('iframe[data-testid^="figure-"]').first().elementHandle()
       const fr = h ? await h.contentFrame() : null
       if (!fr) return NaN
       return fr.evaluate(() => {
-        // The largest numeric axis tick minus the smallest = the visible span.
+        // SpyDE's embedded figure page exposes __apl_viewStateJson (NOT
+        // anyplotlib's _aplModel, which only its own test page sets up).
+        const w = window as any
+        for (const src of [w.__apl_viewStateJson, w.__apl_panelDiag]) {
+          if (src === undefined || src === null) continue
+          try {
+            let st = typeof src === 'function' ? src() : src
+            if (typeof st === 'string') st = JSON.parse(st)
+            // A bigger zoom means a SMALLER visible region, so report 1/zoom to
+            // keep "span" semantics for the comparison below.
+            const pick = (o: any) =>
+              (o && typeof o.zoom === 'number' && o.zoom > 0) ? 1 / o.zoom : null
+            let v = pick(st)
+            if (v == null && st && typeof st === 'object') {
+              for (const k of Object.keys(st)) {
+                v = pick((st as any)[k])
+                if (v != null) break
+              }
+            }
+            if (v != null) return v
+          } catch { /* try the next source, then ticks */ }
+        }
         const txt = Array.from(document.querySelectorAll('text, tspan'))
           .map(t => Number((t.textContent || '').trim()))
           .filter(n => Number.isFinite(n))
@@ -641,11 +635,8 @@ test.describe('Group B · movie editor (#6/#13)', () => {
     await page.screenshot({ path: join(SHOTS, '23-movie-scrubbed-zoom-persist.png') })
     // The zoom must PERSIST across the frame change: the visible span stays the
     // same (within tolerance) rather than resetting to the full 0–2048 frame.
-    if (Number.isFinite(spanZoomed) && Number.isFinite(spanAfter)) {
-      expect(Math.abs(spanAfter - spanZoomed),
-        `zoom reset on scrub (was span=${spanZoomed}, became ${spanAfter})`)
-        .toBeLessThan(Math.max(50, spanZoomed * 0.25))
-    }
+    // NO assertion here on purpose — see the test.fixme after this block. The
+    // spans are logged so a future fix has something to compare against.
 
     // Close the editor → the MDI window comes back (visible again), NO overlay.
     await page.getByTestId('movie-editor-close').click()
@@ -677,6 +668,35 @@ test.describe('Group B · movie editor (#6/#13)', () => {
         'overlay-persist-on-reopen not asserted (source MDI restore + in-editor overlay already verified)')
     }
     ctx.assertNoJsErrors()
+  })
+
+  // KNOWN GAP, deliberately visible rather than silently green.
+  //
+  // "the editor's zoom survives a frame change" is the interesting half of #13
+  // and it is NOT verified. The original check scraped numeric axis tick labels,
+  // got NaN both times, and was wrapped in `if (Number.isFinite(...))` — so it
+  // passed while asserting nothing, for as long as it has existed.
+  //
+  // Tried and failed to get a real handle on the view state from inside the
+  // editor: anyplotlib's `_aplModel` (only its own test page defines it), and
+  // the figure page's `__apl_viewStateJson` / `__apl_panelDiag` (both present in
+  // a normal MDI figure frame — confirmed by probe — but the span still reads
+  // NaN from the editor).
+  //
+  // The decisive clue for whoever picks this up: screenshot
+  // 21-movie-editor-overlay.png shows the editor figure rendering numeric axis
+  // ticks (0…1000). So the tick-scraping fallback SHOULD find them, and the
+  // failure is therefore in resolving the frame — `elementHandle()` /
+  // `contentFrame()` on the nested spyde-fig:// iframe — not in the page
+  // content. Try `page.frames()` filtered by url instead of walking down from
+  // the locator.
+  //
+  // The rest of #6/#13 IS verified above (overlay confined to the editor, source
+  // MDI window hidden while open and restored after, editor reopens clean).
+  test.fixme('#13 editor zoom persists across a frame change', async () => {
+    // Needs: a reliable read of the editor figure's zoom/visible region.
+    // Start from electron/tests/_probe_zoom_state.spec.ts's approach, but probe
+    // the frames WHILE THE EDITOR IS OPEN rather than in the plain MDI layout.
   })
 
   test('Group B audit: no backend tracebacks', async () => {
