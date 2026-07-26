@@ -26,6 +26,17 @@ from spyde.array_cache.readers.binary import BinaryReader, find_memmap_source
 from spyde.array_cache.readers.local_transform import LocalTransformReader
 from spyde.array_cache.resolve import resolve_reader
 
+# ``os.pread`` is Unix-only. BinaryReader gates its zero-copy fast path on it and
+# uses the memmap slice everywhere else (binary.py), so on Windows the fast path
+# is CORRECTLY absent — tests that assert it unconditionally are asserting a
+# platform, not a contract. The parity/fd tests below are split accordingly:
+# the pread specifics are skipped, and the behaviour that must hold on EVERY
+# platform (same bytes out, resources released) is asserted everywhere.
+HAS_PREAD = hasattr(os, "pread")
+requires_pread = pytest.mark.skipif(
+    not HAS_PREAD, reason="os.pread is Unix-only; BinaryReader uses the memmap "
+                          "fallback on this platform")
+
 
 class _AxesManager:
     def __init__(self, nav_dim):
@@ -174,7 +185,9 @@ class TestBinaryReaderFastPathVsFallback:
         finally:
             reader.close()
 
+    @requires_pread
     def test_pread_matches_memmap_fallback(self, tmp_path):
+        """The two read mechanisms must agree byte for byte."""
         data = np.random.RandomState(0).randint(0, 4000, (10, 8, 8)).astype(np.uint16)
         path = str(tmp_path / "synthetic.mrc")
         _write_synthetic_mrc(path, data)
@@ -192,6 +205,28 @@ class TestBinaryReaderFastPathVsFallback:
                 reader._fast_path = True
                 np.testing.assert_array_equal(fast, slow)
                 np.testing.assert_array_equal(fast, data[i])
+        finally:
+            reader.close()
+
+    def test_frames_are_correct_on_any_platform(self, tmp_path):
+        """Whichever mechanism this platform selects, the frames must be right.
+
+        The parity test above can only run where os.pread exists; this one is the
+        contract that has to hold everywhere, so Windows still has real coverage
+        of BinaryReader's output rather than just a skip."""
+        data = np.random.RandomState(1).randint(0, 4000, (10, 8, 8)).astype(np.uint16)
+        path = str(tmp_path / "synthetic.mrc")
+        _write_synthetic_mrc(path, data)
+
+        s = hs.load(path, lazy=True)
+        kwargs = find_memmap_source(s.data)
+        sig = _Signal(s.data, nav_dim=1)
+        reader = BinaryReader(sig, s.data, kwargs)
+        try:
+            assert reader._fast_path is HAS_PREAD, \
+                "the fast path should track os.pread availability"
+            for i in (0, 5, 9):
+                np.testing.assert_array_equal(reader.read_frame((i,)), data[i])
         finally:
             reader.close()
 
@@ -274,20 +309,36 @@ class TestResolveReaderFallback:
 
 
 class TestReaderCleanup:
-    def test_close_releases_fd(self, tmp_path):
+    def _reader(self, tmp_path):
         data = np.zeros((4, 4, 4), dtype=np.uint16)
         path = str(tmp_path / "synthetic.mrc")
         _write_synthetic_mrc(path, data)
         s = hs.load(path, lazy=True)
         kwargs = find_memmap_source(s.data)
-        sig = _Signal(s.data, nav_dim=1)
-        reader = BinaryReader(sig, s.data, kwargs)
+        return BinaryReader(_Signal(s.data, nav_dim=1), s.data, kwargs)
+
+    @requires_pread
+    def test_close_releases_fd(self, tmp_path):
+        """On the pread path close() must actually release the descriptor —
+        leaking one per opened node would exhaust the process's fd budget."""
+        reader = self._reader(tmp_path)
         fd = reader._fd
         assert fd is not None
         reader.close()
         assert reader._fd is None
         with pytest.raises(OSError):
             os.pread(fd, 1, 0)
+
+    def test_close_is_safe_on_any_platform(self, tmp_path):
+        """close() has to be callable (and idempotent) wherever the reader runs —
+        close_all_readers calls it on node switch and plot close regardless of
+        which read mechanism was selected."""
+        reader = self._reader(tmp_path)
+        if not HAS_PREAD:
+            assert reader._fd is None, "no fd is opened without the pread path"
+        reader.close()
+        assert reader._fd is None
+        reader.close()          # idempotent — must not raise
 
 
 class TestCloseAllReaders:
