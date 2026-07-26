@@ -105,6 +105,7 @@ class LinearRegionSelector(BaseSelector):
         )
         self._widget = None
         self.roi = None
+        self._roi_trace = None          # built lazily on the first pointer event
         plot1d = self._get_plot1d()
         if plot1d is not None:
             try:
@@ -133,8 +134,37 @@ class LinearRegionSelector(BaseSelector):
         return getattr(plot, "_plot1d", None) if plot is not None else None
 
     def _on_pointer_up(self, event):
+        before = self._spans()
         self._clamp_extent()
+        after = self._spans()
+        self._trace_geometry(before, after)
         self.update_data()
+
+    def _spans(self):
+        """Geometry as ``[(lo, hi)]`` for RoiTrace — normalised so x0>x1 (the
+        widget keeps whichever orientation the drag produced) doesn't read as a
+        jump on its own."""
+        if self._widget is None:
+            return []
+        x0, x1 = float(self._widget.x0), float(self._widget.x1)
+        return [(x0, x1) if x0 <= x1 else (x1, x0)]
+
+    def _trace_geometry(self, before, after) -> None:
+        """Feed the ROI-jump detector. Silent unless the geometry moved in a way
+        no single pointer gesture explains — see roi_trace.py."""
+        try:
+            if self._roi_trace is None:
+                from spyde.drawing.selectors.roi_trace import RoiTrace
+                self._roi_trace = RoiTrace("1-D span")
+            idx = self._get_selected_indices()
+            scale, offset = _signal_axis(self)
+            self._roi_trace.observe(
+                before, after, n_indices=int(idx.shape[0]),
+                n_unique=int(np.unique(idx).size),
+                extra=f"scale={scale:.4g} offset={offset:.4g} "
+                      f"cap={getattr(self._widget, 'max_extent', None)}")
+        except Exception as e:
+            logger.debug("roi trace (1-D) failed: %s", e)
 
     def _clamp_extent(self) -> None:
         """Keep the widget's own span cap in sync, then clamp as a fallback.
@@ -168,7 +198,13 @@ class LinearRegionSelector(BaseSelector):
             x0 = float(self._widget.x0)
             x1 = float(self._widget.x1)
             lo, hi = (x0, x1) if x0 <= x1 else (x1, x0)
-            if (hi - lo) > span_cap:
+            # Relative tolerance, NOT a bare >. A span sitting exactly on the cap
+            # computes hi-lo fractionally OVER it in floating point (1.95-1.15 =
+            # 0.8000000000000003 > 0.8), so a bare comparison rewrote the widget
+            # on nearly every pointer_move of a capped drag. Each rewrite pushes a
+            # python-sourced geometry echo back to the renderer mid-drag, which is
+            # exactly the feedback loop this clamp is supposed to stay out of.
+            if (hi - lo) > span_cap * (1.0 + 1e-9):
                 hi = lo + span_cap
                 # Preserve the widget's x0/x1 orientation when writing back.
                 if x0 <= x1:
