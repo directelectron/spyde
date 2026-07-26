@@ -186,6 +186,9 @@ class Rebin2DAction(TransformAction):
     name = "Rebin"
     method = "rebin"
     node_name = "Binned"
+    # Frame N of the binned output is a deterministic downsample of frame N of
+    # the input only — a bounded, local per-frame transform.
+    is_local_per_frame = True
     parameters = {
         "scale_x": {"default": 2},
         "scale_y": {"default": 2},
@@ -260,6 +263,10 @@ class CropAction(TransformAction):
     name = "Crop"
     function = staticmethod(_crop_signal)
     node_name = "Cropped"
+    # Pure isig/inav dask-view slicing: frame N of the output is a spatial crop
+    # of a single (possibly index-shifted, for the t0/t1 nav crop) input frame —
+    # local either way.
+    is_local_per_frame = True
     parameters = {
         "x0": {"default": 0},
         "x1": {"default": 0},

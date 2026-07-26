@@ -225,20 +225,74 @@ the resulting **numpy array** directly. `Plot.update_data` paints an ndarray
 immediately — no distributed Future, no shared-memory buffer, no `PlotUpdateWorker`
 poll for the cheap nav path. This is the fast common case and stays fully synchronous.
 
-- **Derived views (rebin / crop / rechunk / .zspy) are SYNCHRONOUS + chunk-cached — NOT
-  async.** They have no hyperspy `CachedDaskArray`, so a naive read re-decodes + re-runs
-  the transform on the WHOLE source nav-chunk every move (dask must materialise the whole
-  chunk to yield any one frame — and re-decompress it on `.zspy`). `Plot._nav_chunk_cache`
-  (`_NavChunkCache` in `update_functions.py`) decodes each output nav-chunk ONCE and
-  slices frames out of it, so dwell-in-chunk is a ~0 ms numpy slice (measured 145× on a
-  12×12-nav-chunk 4D-STEM rebin; ~9 ms/decode → ~0 ms/dwell). This rebuilds, for derived
-  views, exactly what `CachedDaskArray` gives the base signal. Keyed by
-  `(id(signal), block-index)`, bounded by `MAX_CACHED_FRAMES`, cleared on node switch /
-  close, touched only on the dispatcher thread (no lock). `_direct_read_frame`'s
-  single-point branch reads through it. **Do NOT route derived single-point reads async**
-  — the transform recompute is only ~5–9 ms, while the async round-trip is 4 thread hops +
-  2 event-loop turns + ~15–40 ms; async was pure overhead there (the "everything is
-  async-submits and slow" regression).
+- **One read path for points AND regions, through `spyde/array_cache/`.**
+  `_direct_read_frame` calls `get_local_frame(child, signal, data, idx)` for BOTH a
+  single crosshair point and an N-point integrating region; the resolved
+  `FrameReader` decides granularity per backing. **Read granularity must match
+  ACCESS granularity, not storage chunking** — that is the whole principle:
+  `BinaryReader` (.mrc/.de5/raw) reads exactly the frames asked for and caches no
+  block at all; `SourceArrayReader` (zarr/HDF5) and `LocalTransformReader` (derived
+  views) must decode a whole nav-chunk to yield any frame, so they cache that block.
+  When sub-chunked `.zspy` lands, that reader just stops populating blocks — no
+  interface change.
+- **A COMPRESSED chunk is ATOMIC — reading one frame costs the same as reading all
+  of them.** Measured on a real `.zspy` with 537 MB (32×32 nav × 512² uint16)
+  chunks: whole chunk 437 ms, an 8×16 sub-block 445 ms, **one frame 406 ms**. So
+  "the chunk is too big to cache, read single frames instead" is a ~100× bug on
+  compressed data (a ~50-frame ROI paid ~50 whole-chunk decodes: 2100–4250 ms vs
+  50–100 ms on MRC). Sub-blocking is equally wrong — same decode, a fraction of
+  the payload cached. Always cache the whole chunk and size the budget for it.
+- **Derived views (rebin / signal-space crop) are computed PER FRAME in numpy from
+  the PARENT's frame** — `readers/per_frame.py`, resolved in `nav_read` (it needs
+  the signal tree, which `array_cache` otherwise stays agnostic of). Asking dask
+  for one rebinned frame materialises the whole enclosing source chunk and re-runs
+  the graph: **2403 ms**, versus **1.8 ms** once the parent's block is cached (the
+  rebin itself is 1.8 ms; the parent's 435 ms decode is unavoidable and shared).
+  `sum_points` sums the PARENT's frames and transforms ONCE — valid only because
+  rebin and crop are LINEAR (529 → 69 ms on a 16×16 ROI). The gate is deliberately
+  conservative: anything it can't reproduce exactly (unknown transform, non-integer
+  rebin factor, changed nav grid, nav/time crop) returns None and falls back to
+  `LocalTransformReader`. A silently wrong frame is far worse than a slow one.
+- **Two caches, two granularities, both per-plot.** `Plot._array_cache`
+  (`ArrayCache`, 256 MiB) holds decoded FRAMES; `Plot._block_cache` (`BlockCache`,
+  **3 GiB**) holds decoded nav-CHUNK blocks shared by every reader that has one.
+  The budget must hold the few STORAGE CHUNKS an ROI spans, and a chunk can be
+  537 MB (see above), so a 16×16 ROI straddling 4 of them is ~2.1 GB.
+  The block cache is why a region is cheap: an 8×8 ROI spans ≤4 nav-chunks, and a
+  dragged ROI re-serves the ~75% of points it shares with the previous step from
+  RAM. Both are cleared on node switch / close.
+  **The block cache MUST be an LRU, not a one-entry memo** — that was the original
+  bug: a single slot serves a dwell inside one chunk and nothing else, so crossing
+  a boundary and returning re-decoded every move (measured 59× on `.zspy`, **1520×**
+  on a rebinned view — a derived view re-runs the transform over the whole source
+  chunk), and a region spanning several chunks thrashed on every drag step.
+- **Verify a nav-read change with a REAL DRAG on LAZY data** (`region_drag_perf.spec.ts`).
+  Two traps this caught that headless tests and a green suite did not: (1) the bundled
+  `load_test_data_si_grains` is **EAGER**, so the whole cache path is skipped and the
+  profile line says `eager` — the spec measures nothing; use
+  `load_test_data_lazy_chunked` (lazy, 3×3 nav-chunk grid). (2) The tiered classifier
+  can route the region async, which silently bypasses every cache below it. Run with
+  `SPYDE_NAV_PROFILE=1` + `SPYDE_LOG_LEVEL=INFO` and check the `[NAV-PROFILE]` lines
+  for `async-submit` and for `array-cache region` — a fast median with zero
+  cache-served reads means the read never touched this machinery.
+- **A region is NOT special-cased.** `get_local_frame` used to `return None` for
+  `idx.ndim > 1`, so region integration bypassed all of the above and paid one dask
+  `.compute()` per point, each materialising the enclosing nav-chunk to keep one
+  frame — ~64 chunk decodes to read the ~4 chunks it actually spans. Measured on a
+  64×64×256² 4D-STEM: **2850 ms → ~5 ms per drag step** (p95 ≤ 10 ms, i.e. inside
+  the 16.7 ms/60 fps budget) on zspy, rebinned-zspy and MRC alike. Region means
+  accumulate in float32 (exact: ≤256 frames × uint16 max < 2²⁴) and round back to an
+  integer source dtype for parity with the old distributed
+  `weighted_mean_round_from_sums`.
+- **Focus demotes the block budget, it does NOT purge.** `set_active` →
+  `Session._apply_focus_budgets` → `Plot.set_focused`: an unfocused plot shrinks to
+  `UNFOCUSED_BUDGET_BYTES` (100 MiB) but KEEPS its working set, so clicking back is a
+  numpy slice, not a cold re-decode. There is no idle timer (deliberately — it would
+  need a thread and the caches are dispatcher-owned).
+- **Do NOT route derived single-point reads async** — the transform recompute is only
+  ~5–9 ms, while the async round-trip is 4 thread hops + 2 event-loop turns +
+  ~15–40 ms; async was pure overhead there (the "everything is async-submits and
+  slow" regression).
 - **Tiered routing** (`_classify_nav_read`, called before the read): async
   (`_submit_async_nav_read` → `Session.compute_backend.submit_graph(lazy)` OFF the
   dispatcher, cancellable via `plot._nav_future`, paint from the done-callback) fires
@@ -246,14 +300,37 @@ poll for the cheap nav path. This is the fast common case and stays fully synchr
   (`> REGION_ASYNC_FRAME_CAP=48` frames — a maxed 4D-STEM 16×16=256-frame region is
   ~0.5–0.9 s synchronously; a maxed movie 16-frame region is ~64 ms, stays sync) or
   `> REGION_BYTES_CAP`, or a **cold HUGE single frame on a CACHED signal**
+  — where a region is sized by the **BYTES** of its **UNCACHED** frames
+  (`_region_uncached_count`, a side-effect-free residency probe), NOT by point count
+  and NOT by total extent. **This is load-bearing and was got wrong twice.** Async
+  **bypasses the array cache**, and the async path never populates it — so any region
+  routed async can *never warm*, and re-reads every frame on every drag step forever.
+  A 4D-STEM ROI is many points of TINY frames (16×16 of 32 KB DPs = 256 points but
+  only ~8 MB), so the old frame-COUNT cap (48) sent ordinary ROIs async: measured in
+  the real app at **129 ms median / 380 ms p95 with ZERO cache-served reads**, vs
+  **5.5 ms / 9.8 ms** once sized by bytes. The point cap now applies only when frames
+  are individually large (`> COLD_FRAME_CAP`), i.e. the movie span it was tuned for.
+  With no cache to probe it falls back to the total count (no regression)
   (`> COLD_FRAME_CAP` and not resident). The dispatcher returns `None` → `_run_update`
   skips the synchronous paint; the last good frame stays up until the async result lands
   (no flash). The async machinery is retained (audited) but fires far less often.
-- **Region extent cap (Tier 0):** an integrating ROI/span is clamped to
-  `MAX_REGION_EXTENT_PER_DIM=16` nav positions PER navigation dimension on the widget
-  geometry (`RectangleSelector._clamp_extent` / `LinearRegionSelector._clamp_extent`) —
-  the ROI physically stops growing — so a region read can never accidentally integrate
-  a huge number of positions (worst case 16×16=256 frames). See `test_region_extent_cap.py`.
+- **Region extent cap (Tier 0):** an integrating ROI/span is capped at
+  `MAX_REGION_EXTENT_PER_DIM=16` nav positions PER navigation dimension, so a region
+  read can never accidentally integrate a huge number of positions (worst case
+  16×16=256 frames). The cap is enforced by the **anyplotlib widget itself**
+  (`max_extent=`, ≥0.4.1): the ROI physically stops under the cursor mid-drag, the
+  dragged edge pins and the opposite one stays put. SpyDE passes it in
+  (`RectangleSelector` in image px; `LinearRegionSelector` in DATA units, so the cap
+  is `MAX_REGION_EXTENT_PER_DIM * scale` and `_clamp_extent` re-derives it every
+  update — the signal usually attaches AFTER the widget is built, so a cap fixed at
+  construction is wrong for any calibrated axis).
+  `_clamp_extent` remains as the fallback for geometry that never went through a
+  drag (a programmatic set) — the widget's cap only applies to interactive drags.
+  **Do not rely on it as the primary path**: it anchors on the lower edge, so it can move
+  the edge the user is holding — which reads as the ROI jumping around. That, plus
+  a default ROI size of half the image that then snapped down to the cap, was the
+  "ROI is always huge and then clamps down / jumps" behaviour.
+  See `test_region_extent_cap.py` and anyplotlib's `test_widget_max_extent.py`.
 - **Paint is DECOUPLED from the read (slider stays live):** the read stays serial on the
   `_NavDispatcher`, but the PAINT (`set_data` → binary-uint8 → stdout, ~8–70 ms) runs on a
   separate serial newest-wins painter thread (`_NavPainter` in `plot.py`;

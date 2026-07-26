@@ -62,7 +62,10 @@ class TestUpdateChannelSettings:
         with open(settings_path, "w", encoding="utf-8") as fh:
             json.dump({"update_channel": "beta"}, fh)
 
-        monkeypatch.setattr(os.path, "expanduser", lambda p: str(tmp_path))
+        # Redirect via SPYDE_SETTINGS_DIR (the documented hook, and what
+        # conftest sets session-wide) rather than patching expanduser — the env
+        # var takes precedence in Session, so a patched HOME would be ignored.
+        monkeypatch.setenv("SPYDE_SETTINGS_DIR", os.path.dirname(settings_path))
         session = Session(n_workers=1, threads_per_worker=1)
         try:
             assert session._update_channel == "beta"

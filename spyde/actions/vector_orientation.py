@@ -49,7 +49,13 @@ DEFAULTS = dict(
     sigma_schedule=(0.06, 0.03, 0.015),   # soft-assign anneal, Å⁻¹
     strain_penalty=50.0,    # weight on the in-residual strain-band penalty
     max_nfev=200,
-    n_seed=1,               # coarse-search candidate branches to refine
+    # Coarse-search candidate branches to refine. Raising this looks attractive
+    # — on synthetic ground truth n_seed=1 returns a fit strictly worse than the
+    # true one in 32/120 cases and n_seed=3 fixes all of them — but on REAL
+    # sped_ag it changed IPF agreement with the dense reference by ~1 pt
+    # (25/4/67% → 27/6/66%, X/Y/Z) for ~40% more time, i.e. nothing. The
+    # accuracy limit on this path is elsewhere; don't pay for candidates.
+    n_seed=1,
     coarse_NR=100,
     coarse_NA=360,
     # Reflection weighting (see §"weighting" below). The refine weights each
@@ -173,12 +179,40 @@ def strain_from_pose(params: np.ndarray) -> np.ndarray:
     symmetric positive-definite) and report `S − I` — the rotation R is absorbed
     into the orientation, leaving only the physical stretch/strain.
     """
+    _R, S = _polar_decompose_pose(params)
+    return S - np.eye(2)
+
+
+def _polar_decompose_pose(params: np.ndarray):
+    """Split the total template→measured map ``M = A · Rot(theta)`` into its
+    rotation and symmetric stretch, ``M = R · S``. Returns ``(R, S)``."""
     A = params[_P_A].reshape(2, 2)
     M = A @ _rot(params[_P_THETA])
-    # right polar: M = R S, S = sqrt(MᵀM)
+    # right polar: M = R S, with S = sqrt(MᵀM) symmetric positive-definite
     U, sv, Vt = np.linalg.svd(M)
-    S = (Vt.T * sv) @ Vt
-    return S - np.eye(2)
+    return U @ Vt, (Vt.T * sv) @ Vt
+
+
+def pose_in_plane_angle(params: np.ndarray) -> float:
+    """The PHYSICAL in-plane rotation of a converged pose, radians.
+
+    NOT the same as the bare ``theta`` parameter. LM is free to split the total
+    rotation between ``theta`` and the free 2x2 ``A`` (that freedom is exactly
+    why :func:`strain_from_pose` polar-decomposes before reporting strain), so
+    ``theta`` alone under-reports the rotation by however much LM parked in
+    ``A``. The orientation must be resolved from the rotation factor of
+    ``M = A · Rot(theta)``, which is what this returns.
+
+    Measured on sped_ag against the dense raw-OM reference: resolving the
+    quaternion from the bare ``theta`` gave IPF-X/Y agreement of 44%/2% with the
+    correct template already handed in (IPF-Z, which is blind to the in-plane
+    angle, was 100%) — the classic signature of a purely in-plane error. The
+    batched torch path never had this bug because there ``M = S · Rot(theta)``
+    with ``S`` symmetric-positive-definite by construction, so its ``theta`` IS
+    the physical angle.
+    """
+    R, _S = _polar_decompose_pose(params)
+    return float(np.arctan2(R[1, 0], R[0, 0]))
 
 
 def project_strain_bound(A: np.ndarray, cap: float = 0.05) -> np.ndarray:
@@ -402,7 +436,11 @@ def fit_pattern(meas_xy: np.ndarray, meas_I: np.ndarray,
     resid, bt, p0, cscore, n_matched, g = best
     A = p0[_P_A].reshape(2, 2)
     strain = strain_from_pose(p0)
-    quat = _resolve_one_quat(bt, p0[_P_THETA], lib)
+    # Resolve the orientation from the pose's PHYSICAL in-plane rotation (the
+    # rotation factor of A·Rot(theta)), not the bare theta parameter — see
+    # pose_in_plane_angle. `theta` below stays the raw pose parameter, because
+    # the live refine overlay reprojects spots with the same A·Rot(theta) pose.
+    quat = _resolve_one_quat(bt, pose_in_plane_angle(p0), lib)
     fa = _friedel_asymmetry(p0, g, meas_xy)
     return PatternFit(
         template_idx=bt, quat=quat,

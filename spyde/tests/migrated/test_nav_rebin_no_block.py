@@ -1,17 +1,21 @@
-"""A rebinned/derived lazy view scrubs SYNCHRONOUSLY via the decoded-chunk cache.
+"""A rebinned/derived lazy view scrubs SYNCHRONOUSLY via the ArrayCache local-
+transform reader.
 
 A derived view (rebin/crop) has no hyperspy CachedDaskArray, so a naive read
-re-decodes + re-transforms the whole source nav-chunk on every move. The read now
-serves it synchronously through _direct_read_frame + the per-plot _NavChunkCache:
-the first frame in a chunk pays one decode, every other frame in that chunk is a
-free numpy slice — NO async round-trip, NO per-move re-decode.
+re-decodes + re-transforms the whole source nav-chunk on every move. The read
+now serves it synchronously through _direct_read_frame + the per-plot
+ArrayCache (spyde/array_cache): the first frame in a chunk pays one decode
+(via LocalTransformReader's internal one-chunk memo AND the ArrayCache frame
+cache), every other frame in that chunk is a free numpy slice — NO async
+round-trip, NO per-move re-decode.
 """
 import time
 
 import numpy as np
 import dask.array as da
 
-from spyde.drawing.update_functions import _direct_read_frame, _NavChunkCache
+from spyde.drawing.update_functions import _direct_read_frame
+from spyde.array_cache import ArrayCache
 
 
 class _AxesManager:
@@ -27,10 +31,20 @@ class _Signal:
         self.axes_manager = _AxesManager(nav_dim)
 
 
+class _AlwaysLocalTree:
+    """Stand-in for BaseSignalTree.resolve_locality — this test is about the
+    ArrayCache read-path timing, not locality resolution (covered by
+    test_locality_tag.py), so it always resolves local."""
+    def resolve_locality(self, signal):
+        return True
+
+
 class _Plot:
-    """Minimal stand-in carrying the per-plot chunk cache _direct_read_frame reads."""
+    """Minimal stand-in carrying what _direct_read_frame / get_local_frame need."""
     def __init__(self):
-        self._nav_chunk_cache = _NavChunkCache()
+        self.signal_tree = _AlwaysLocalTree()
+        self._array_cache = ArrayCache()
+        self._local_transform_readers = {}
 
 
 class _Prof:

@@ -105,6 +105,12 @@ class TransformAction(Action):
     method: str | None = None          # HyperSpy method name on the signal
     function: Any = None               # or function(signal, **kwargs) -> signal
     node_name: str | None = None
+    # ArrayCache locality tag (spyde/array_cache/locality.py): True only if
+    # frame N of this transform's output needs just a small, bounded slice of
+    # frame N of the input (rebin, crop, per-pattern filter, ...). Default False
+    # (opaque/must-materialize) is the fail-safe choice — leave it False unless
+    # you've confirmed the transform is genuinely per-frame local.
+    is_local_per_frame: bool = False
 
     def build_kwargs(self, signal, **params) -> dict:
         """Default: pass resolved params straight through. Override to adapt."""
@@ -118,6 +124,7 @@ class TransformAction(Action):
             method=self.method,
             function=self.function,
             node_name=self.node_name or self.name or None,
+            local=self.is_local_per_frame,
             **kwargs,
         )
         # Switch the display to the new node and force a navigator re-slice —

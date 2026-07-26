@@ -133,3 +133,94 @@ test('window placement, snapping, titlebar visibility, and tile', async () => {
 
   ctx.assertNoJsErrors()
 })
+
+test('snapped windows stay INDEPENDENT (no link/stick) and resize snaps too', async () => {
+  const { page } = ctx
+  const wins = page.getByTestId('subwindow')
+
+  // Put two windows in a known, non-overlapping arrangement first: Tile, then
+  // work with the first two. (Tile is asserted overlap-free above.)
+  await page.getByTestId('tile-windows').click()
+  await page.waitForTimeout(500)
+
+  const mover = wins.nth(0)
+  const peer = wins.nth(1)
+
+  // ── 1) Drag `mover` so its RIGHT edge lands within snap distance of `peer`'s
+  // LEFT edge — it should snap flush. (Left-of-peer, not right: after Tile the
+  // right-hand column sits against the area bound, where the titlebar-visibility
+  // clamp — not snapping — decides the final x.)
+  let peerBox = (await peer.boundingBox())!
+  let moverBox = (await mover.boundingBox())!
+  let grab = await titlebarGrabPoint(mover)
+  const offX = grab.x - moverBox.x, offY = grab.y - moverBox.y
+  const dropX = peerBox.x - moverBox.width + 5     // right edge 5 px past peer's left
+  const dropY = peerBox.y
+  await page.mouse.move(grab.x, grab.y)
+  await page.mouse.down()
+  await page.mouse.move(dropX + offX, dropY + offY, { steps: 8 })
+  await page.mouse.up()
+  await page.waitForTimeout(300)
+
+  moverBox = (await mover.boundingBox())!
+  console.log('[mdi] independence: peer left =', peerBox.x,
+    'mover right =', moverBox.x + moverBox.width)
+  expect(Math.abs((moverBox.x + moverBox.width) - peerBox.x)).toBeLessThanOrEqual(2)
+  await page.screenshot({ path: join(SHOTS, '06-adjacent.png') })
+
+  // ── 2) THE POINT OF THIS TEST: dragging a window that is flush against a
+  // neighbour must NOT drag the neighbour with it. The removed edge-snap
+  // GROUPING feature ("stick windows", commit 9bfe6ae) nudged every partner in
+  // the group by the same delta — snapping is alignment, not attachment.
+  const peerBefore = (await peer.boundingBox())!
+  grab = await titlebarGrabPoint(mover)
+  await page.mouse.move(grab.x, grab.y)
+  await page.mouse.down()
+  await page.mouse.move(grab.x - 120, grab.y + 40, { steps: 10 })   // well past SNAP_DIST
+  await page.mouse.up()
+  await page.waitForTimeout(300)
+
+  const peerAfter = (await peer.boundingBox())!
+  const moverAfter = (await mover.boundingBox())!
+  console.log('[mdi] peer before =', peerBefore, 'after =', peerAfter)
+  expect(Math.abs(peerAfter.x - peerBefore.x)).toBeLessThanOrEqual(1)
+  expect(Math.abs(peerAfter.y - peerBefore.y)).toBeLessThanOrEqual(1)
+  // …and the dragged window really did move (otherwise the assert above is vacuous).
+  expect(Math.abs(moverAfter.x - moverBox.x)).toBeGreaterThan(20)
+  await page.screenshot({ path: join(SHOTS, '07-dragged-away-peer-stayed.png') })
+
+  // ── 3) Resize snapping: drag `mover`'s bottom-right handle to just short of
+  // `peer`'s LEFT edge — the right edge should snap flush to it.
+  moverBox = (await mover.boundingBox())!
+  peerBox = (await peer.boundingBox())!
+  // Only meaningful when peer's left edge is to the RIGHT of mover's left edge
+  // with room for the minimum width; skip the assert rather than fake it.
+  const targetRight = peerBox.x
+  if (targetRight - moverBox.x > 320) {
+    const handle = mover.getByTestId('resize-handle')
+    const hb = (await handle.boundingBox())!
+    await page.mouse.move(hb.x + hb.width / 2, hb.y + hb.height / 2)
+    await page.mouse.down()
+    // Aim 6 px short of peer's left edge (inside SNAP_DIST), same height.
+    await page.mouse.move(targetRight - 6, hb.y + hb.height / 2, { steps: 10 })
+    await page.mouse.up()
+    await page.waitForTimeout(300)
+
+    const resized = (await mover.boundingBox())!
+    console.log('[mdi] resize snap: target (peer left) =', targetRight,
+      'mover right after =', resized.x + resized.width)
+    expect(Math.abs((resized.x + resized.width) - targetRight)).toBeLessThanOrEqual(2)
+
+    // …and resizing must not resize/move the neighbour either (the removed
+    // "v2 linked resize" propagated the linked dimension across the group).
+    const peerAfterResize = (await peer.boundingBox())!
+    expect(Math.abs(peerAfterResize.x - peerAfter.x)).toBeLessThanOrEqual(1)
+    expect(Math.abs(peerAfterResize.width - peerAfter.width)).toBeLessThanOrEqual(1)
+    expect(Math.abs(peerAfterResize.height - peerAfter.height)).toBeLessThanOrEqual(1)
+    await page.screenshot({ path: join(SHOTS, '08-resize-snapped.png') })
+  } else {
+    console.log('[mdi] resize-snap skipped: no room between the two windows')
+  }
+
+  ctx.assertNoJsErrors()
+})

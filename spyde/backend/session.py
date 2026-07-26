@@ -693,6 +693,14 @@ class Session(
             except Exception as e:
                 log.debug("nav executor shutdown failed: %s", e)
             self._nav_executor = None
+        # The compute backend keeps its OWN local nav pool in distributed mode
+        # (submit_graph never uses the cluster for an interactive read).
+        backend = self._compute_backend
+        if backend is not None:
+            try:
+                backend.shutdown_nav_pool()
+            except Exception as e:
+                log.debug("compute-backend nav pool shutdown failed: %s", e)
         self.dask_manager.shutdown()
         for tmpdir in self._example_temp_paths:
             try:

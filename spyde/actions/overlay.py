@@ -118,10 +118,11 @@ def _source_read_is_cheap(current_signal, idx, source_plot) -> bool:
         classifier already flags a huge cold frame 'expensive' upstream), AND we do
         NOT warm/mutate that cache off-thread (which would race the dispatcher — see
         CLAUDE.md §2/§4); a small cold read is served inline safely, OR
-      * a DERIVED view (rebin/crop/.zspy — NO CachedDaskArray) whose decoded output
-        nav-chunk is ALREADY resident in the source plot's ``_NavChunkCache`` (a ~0 ms
-        numpy slice). A cold derived miss re-decodes the WHOLE source nav-chunk
-        (~9–160 ms) on every move — that is the read finding #2 must NOT run inline.
+      * a locality-tagged (ArrayCache-eligible) DERIVED view (rebin/crop/.zspy — NO
+        CachedDaskArray) whose decoded frame is ALREADY resident in the source
+        plot's ArrayCache (a ~0 ms numpy slice). A cold derived miss re-decodes the
+        WHOLE source nav-chunk (~9–160 ms) on every move — that is the read finding
+        #2 must NOT run inline.
 
     Region reads and any probe failure → False (skip inline; warm off-thread). Reuses
     the existing update_functions probes — no duplicated chunk-index logic."""
@@ -134,14 +135,14 @@ def _source_read_is_cheap(current_signal, idx, source_plot) -> bool:
     # base navigator does the same); don't gate it (and never warm it off-thread).
     if getattr(current_signal, "cached_dask_array", None) is not None:
         return True
-    # Derived view (no CachedDaskArray): cheap ONLY if the decoded chunk is resident.
+    # Derived view (no CachedDaskArray): cheap ONLY if the decoded frame is resident.
     try:
-        cache = getattr(source_plot, "_nav_chunk_cache", None)
+        from spyde.array_cache import is_local_frame_resident
         data = getattr(current_signal, "data", None)
-        if cache is not None and data is not None and hasattr(cache, "is_resident"):
-            return bool(cache.is_resident(current_signal, data, idx))
+        if data is not None:
+            return is_local_frame_resident(source_plot, current_signal, data, idx)
     except Exception as e:
-        log.debug("overlay chunk-cache residency probe failed: %s", e)
+        log.debug("overlay array-cache residency probe failed: %s", e)
     return False
 
 
@@ -156,9 +157,9 @@ def _warm_source_chunk(source_plot, layer, current_signal, idx) -> None:
     source reads cheaply inline and is never warmed here (warming its cache off-thread
     would race the dispatcher; see CLAUDE.md §2/§4). Newest-wins per
     ``(id(plot), id(layer))``: a superseded warm's future is cancelled before a newer
-    one is scheduled. The warm decodes via the SAME path the resident read PROBES — the
-    source plot's ``_NavChunkCache.get_frame`` (populates the decoded-chunk cache
-    ``is_resident`` checks), else a direct one-frame ``.compute`` (page-cache warm)."""
+    one is scheduled. The warm decodes via the SAME path the resident read PROBES —
+    the source plot's ArrayCache (populates what ``is_local_frame_resident`` checks),
+    else a direct one-frame ``.compute`` (page-cache warm) when not ArrayCache-eligible."""
     try:
         session = _session_of(source_plot)
         if session is None:
@@ -174,17 +175,19 @@ def _warm_source_chunk(source_plot, layer, current_signal, idx) -> None:
             except Exception:
                 pass
 
-        cache = getattr(source_plot, "_nav_chunk_cache", None)
         data = getattr(current_signal, "data", None)
         idx_copy = np.array(idx)
 
         def _warm():
             try:
-                if cache is not None and data is not None:
-                    cache.get_frame(current_signal, data, idx_copy)
-                elif data is not None:
-                    point = tuple(int(v) for v in np.atleast_1d(idx_copy))
-                    data[point].compute(scheduler="synchronous")
+                from spyde.array_cache import get_local_frame
+                if data is not None:
+                    frame = get_local_frame(source_plot, current_signal, data, idx_copy)
+                    if frame is None:
+                        # Not ArrayCache-eligible (e.g. opaque node) — fall back to
+                        # a plain page-cache warm, same as before.
+                        point = tuple(int(v) for v in np.atleast_1d(idx_copy))
+                        data[point].compute(scheduler="synchronous")
             except Exception as e:
                 log.debug("overlay off-thread chunk warm failed: %s", e)
 
@@ -218,7 +221,7 @@ def _read_source_frame(source_plot, indices, integrating=False, layer=None):
 
     A synchronous read is done inline ONLY when it is genuinely cheap for the SOURCE:
     numpy-backed data, a CachedDaskArray with the needed block resident, or a resident
-    ``_NavChunkCache`` decoded output nav-chunk on the source plot. A COLD single-point
+    ArrayCache frame on the source plot. A COLD single-point
     miss on a lazy source (a derived rebin/crop view has no CachedDaskArray → a real
     ~9–160 ms blocking decode) is NOT run on the dispatcher: it returns None and warms
     the needed chunk OFF-thread (keyed per (plot, ``layer``), newest-wins), so the next
@@ -269,7 +272,8 @@ def _read_source_frame(source_plot, indices, integrating=False, layer=None):
             frame_bytes = int(np.prod(frame_shape)) * data.dtype.itemsize
             # Expensive reads (large region / cold huge frame) are NOT done inline
             # for a layer — skip; the settle re-fire runs the cheap path.
-            if _classify_nav_read(current_signal, idx, data, frame_bytes) == "expensive":
+            if _classify_nav_read(current_signal, idx, data, frame_bytes,
+                                  child=source_plot) == "expensive":
                 return None
             # A single-point read is run inline only when genuinely cheap for the
             # SOURCE (CachedDaskArray one-block read, or a resident derived-view

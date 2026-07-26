@@ -117,3 +117,48 @@ class TestRegionExtentCap:
             assert idx.shape[0] <= MAX_REGION_EXTENT_PER_DIM
         finally:
             sess.shutdown()
+
+
+class TestWidgetSideCap:
+    """The cap is now ALSO pushed into the anyplotlib widget as ``max_extent``.
+
+    That is what makes the ROI physically stop under the cursor mid-drag. The
+    Python-side ``_clamp_extent`` remains as the fallback for geometry that never
+    went through a drag, but it anchors on the lower edge — which can move the
+    edge the user is holding, and reads as the selection jumping. With the widget
+    enforcing the cap itself, that fallback should not fire during normal use.
+    """
+
+    def test_rectangle_widget_carries_the_cap(self):
+        sess = _make_4d_session()
+        try:
+            w = _composite(sess)._rect_selector._widget
+            assert w is not None
+            assert float(w.max_w) == float(MAX_REGION_EXTENT_PER_DIM)
+            assert float(w.max_h) == float(MAX_REGION_EXTENT_PER_DIM)
+        finally:
+            sess.shutdown()
+
+    def test_span_widget_cap_tracks_the_axis_scale(self):
+        """The 1-D span is in DATA units, so the cap is index-cap * scale — and
+        the signal usually attaches AFTER the widget is built, so a cap fixed at
+        construction would be wrong for any calibrated axis. _clamp_extent
+        re-derives it."""
+        sess = _make_movie_session()
+        try:
+            region = _composite(sess)._linear_region_selector
+            w = region._widget
+            assert w is not None
+            from spyde.drawing.selectors.selector1d import _signal_axis
+            scale, _ = _signal_axis(region)
+            region._clamp_extent()
+            expected = abs(MAX_REGION_EXTENT_PER_DIM * scale)
+            assert float(w.max_extent) == expected
+
+            # A recalibrated axis must move the cap with it.
+            sig = region.current_plot.plot_state.current_signal
+            sig.axes_manager.signal_axes[0].scale = float(scale) * 4.0
+            region._clamp_extent()
+            assert float(w.max_extent) == abs(MAX_REGION_EXTENT_PER_DIM * scale * 4.0)
+        finally:
+            sess.shutdown()

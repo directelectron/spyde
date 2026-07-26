@@ -238,6 +238,84 @@ class _MoviePrefetcher:
 _movie_prefetcher = _MoviePrefetcher()
 
 
+class _BlockPrefetcher:
+    """Warm the nav-CHUNK block a 2-D drag is heading into, off the dispatcher.
+
+    With the block cache in place a region drag is ~5 ms/step — EXCEPT on the few
+    steps that cross into an undecoded nav-chunk, which cost ~100 ms (measured: 4
+    decodes across a 120-step squiggle, median 103 ms vs 5.5 ms otherwise). Those
+    are the only remaining stalls, and they are predictable: a drag has velocity,
+    so the chunk it is about to enter can be decoded before it is asked for.
+
+    Extrapolates the last step one ROI-length ahead, and decodes that block through
+    the SAME reader — so the result lands in the plot's BlockCache and the
+    dispatcher's next read is a hit. Latest-target-wins (a newer position replaces
+    the pending one), single daemon thread, and every failure is swallowed: this is
+    pure speculation, so being wrong must cost nothing but wasted background work.
+
+    Distinct from _MoviePrefetcher, which warms the OS page cache for 1-D time
+    scrubs; this warms the DECODED-block cache for 2-D nav. Both are latest-wins.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._target = None         # (plot, signal, data, point)
+        self._pending = False
+        self._wake = threading.Event()
+        self._thread = None
+
+    def prime(self, plot, signal, data, prev_point, point, reach: int) -> None:
+        """Queue a speculative decode of the block ``reach`` positions along the
+        travel direction. No-op without a previous point (no velocity yet)."""
+        if plot is None or prev_point is None or point is None:
+            return
+        try:
+            if len(prev_point) != len(point) or len(point) < 2:
+                return              # 2-D nav only; 1-D is _MoviePrefetcher's job
+            delta = [int(point[k]) - int(prev_point[k]) for k in range(len(point))]
+            if not any(delta):
+                return              # not moving — nothing to guess
+            nav_shape = data.shape[:len(point)]
+            ahead = tuple(
+                int(np.clip(int(point[k]) + delta[k] * reach, 0, nav_shape[k] - 1))
+                for k in range(len(point)))
+        except Exception:
+            return
+        with self._lock:
+            self._target = (plot, signal, data, ahead)
+            self._pending = True
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._run, name="nav-block-prefetch", daemon=True)
+                self._thread.start()
+        self._wake.set()
+
+    def _run(self) -> None:
+        while True:
+            self._wake.wait()
+            with self._lock:
+                self._wake.clear()
+                if not self._pending:
+                    continue
+                self._pending = False
+                target = self._target
+            if target is None:
+                continue
+            plot, signal, data, point = target
+            try:
+                from spyde.array_cache import (
+                    get_local_frame, is_local_frame_resident,
+                )
+                if is_local_frame_resident(plot, signal, data, np.asarray(point)):
+                    continue                    # already warm
+                get_local_frame(plot, signal, data, np.asarray(point))
+            except Exception as e:
+                log.debug("nav block prefetch at %s failed: %s", point, e)
+
+
+_block_prefetcher = _BlockPrefetcher()
+
+
 class _InteractiveActivity:
     """Lets a heavy MAIN-PROCESS background disk reader YIELD to interactive
     navigation. For a large movie the threaded navigator sum reads the WHOLE file
@@ -305,14 +383,14 @@ _interactive_activity = _InteractiveActivity()
 # (Single-point reads — including derived rebin/crop/.zspy views — are ALWAYS
 # synchronous now: the transform recompute is only ~5–9 ms and the decoded-chunk
 # cache makes dwell-in-chunk ~0 ms, so the async round-trip's ~15–40 ms + 4 thread
-# hops was pure overhead. See _NavChunkCache.)
+# hops was pure overhead. See spyde/array_cache.)
 REGION_FRAME_CAP = 4              # ≤ this many frames: definitely synchronous
 REGION_ASYNC_FRAME_CAP = 48      # > this many frames: async (would freeze otherwise)
 REGION_BYTES_CAP = 128 * 2 ** 20  # …or more than this many total bytes → async
 COLD_FRAME_CAP = 8 * 2 ** 20      # a cache-MISS single LARGE frame → async (rare)
 
 
-def _classify_nav_read(current_signal, indices, data, frame_bytes):
+def _classify_nav_read(current_signal, indices, data, frame_bytes, child=None):
     """Return ``"cheap"`` or ``"expensive"`` for this lazy nav read. O(1)-ish and
     side-effect-free — NEVER triggers a compute (it only inspects index shapes and
     the cache). Called on the serial dispatcher thread before the read, so an
@@ -331,23 +409,79 @@ def _classify_nav_read(current_signal, indices, data, frame_bytes):
         idx = np.asarray(indices)
         is_region = idx.ndim > 1
         if is_region:
-            n_pts = int(idx.shape[0])
-            if n_pts > REGION_ASYNC_FRAME_CAP or n_pts * frame_bytes > REGION_BYTES_CAP:
+            # Size the region by the frames that would actually be READ, not by
+            # its total extent: a dragged ROI shares most of its points with the
+            # previous step, so an already-served region is nearly free. Falls
+            # back to the total count when there's no cache to probe.
+            n_read = _region_uncached_count(child, current_signal, data, idx)
+            # "expensive" now means "run it OFF the dispatcher", NOT "skip the
+            # cache" — the async path goes through get_local_frame too. So the
+            # question is only whether the read would BLOCK long enough to make
+            # the ROI stop tracking the cursor, and a read that is mostly cache
+            # hits does not, however many points it has.
+            #
+            # Getting this wrong in either direction is visible: too eager and a
+            # trivially-cheap region pays an async round-trip; too reluctant and a
+            # 4D-STEM ROI blocks the serial dispatcher for tens of ms per drag
+            # step, so the ROI lags behind the cursor even though the throughput
+            # numbers look fine (that regression is why this comment exists).
+            if n_read * frame_bytes > REGION_BYTES_CAP:
                 return "expensive"
-            # Small/medium region — sum synchronously (bounded by the 16/dim extent
-            # cap, so a movie region is ≤16 frames and a STEM region here is ≤48).
+            # Many UNCACHED points is also blocking even when the bytes are small
+            # — each one is a separate read with its own per-point overhead.
+            if n_read > REGION_ASYNC_FRAME_CAP:
+                return "expensive"
             return "cheap"
 
         # Single point. A cached signal's cold read of a HUGE frame is the only
         # single-point case worth the async round-trip; derived views (no cache) are
         # served synchronously from the decoded-chunk cache.
+        #
+        # "Cold" now means cold in BOTH caches. The per-frame read is served by the
+        # plot's ArrayCache (spyde/array_cache), which leaves hyperspy's
+        # CachedDaskArray empty — so _nav_cache_is_resident alone would call every
+        # big frame cold and pay the async round-trip even for one that ArrayCache
+        # can hand back as a dict lookup.
         cached_arr = getattr(current_signal, "cached_dask_array", None)
         if cached_arr is not None and frame_bytes > COLD_FRAME_CAP \
-                and not _nav_cache_is_resident(current_signal, indices):
+                and not _nav_cache_is_resident(current_signal, indices) \
+                and not _array_cache_is_resident(child, current_signal, data, indices):
             return "expensive"
         return "cheap"
     except Exception:
         return "cheap"
+
+
+def _region_uncached_count(child, current_signal, data, idx) -> int:
+    """How many of a region's points would need a REAL read? Side-effect-free
+    (never LRU-touches, never reads), so the classifier can call it before
+    deciding sync-vs-async. Returns the full point count when there's no cache to
+    probe or on any failure — the conservative answer that preserves the old
+    extent-based behaviour."""
+    n_pts = int(idx.shape[0])
+    if child is None:
+        return n_pts
+    try:
+        from spyde.array_cache import is_local_frame_resident
+        n = 0
+        for i in range(n_pts):
+            if not is_local_frame_resident(child, current_signal, data, idx[i]):
+                n += 1
+        return n
+    except Exception:
+        return n_pts
+
+
+def _array_cache_is_resident(child, current_signal, data, indices) -> bool:
+    """Would the ArrayCache path serve ``indices`` without a real read? False for
+    a missing plot / an ArrayCache-ineligible (opaque) signal / any probe failure
+    — always the conservative answer, since a false "resident" only costs a brief
+    stall the settle re-fire recovers from."""
+    try:
+        from spyde.array_cache import is_local_frame_resident
+        return is_local_frame_resident(child, current_signal, data, indices)
+    except Exception:
+        return False
 
 
 def _nav_cache_is_resident(signal, indices) -> bool:
@@ -370,132 +504,6 @@ def _nav_cache_is_resident(signal, indices) -> bool:
         return all(c in cache.core_cached_block_inds for c in core)
     except Exception:
         return False
-
-
-# Total decoded frames the per-plot derived-view chunk cache may hold across all
-# resident nav-chunks. A 256×256 float64 frame is ~0.5 MB, so 512 frames ≈ 256 MB
-# worst case; a 128×128 uint16 DP frame is ~32 KB → 512 frames ≈ 16 MB. Bounds the
-# cache like hyperspy's CachedDaskArray bounds its resident blocks.
-MAX_CACHED_FRAMES = 512
-
-
-def _nav_chunk_span(chunk_sizes, pos):
-    """For one navigation axis with dask ``chunk_sizes`` (a tuple of per-block
-    lengths) and integer ``pos``, return ``(block_index, start, stop)`` of the
-    chunk that contains ``pos`` — so a nav index maps to the block that must be
-    decoded whole (a derived frame at pos needs its ENTIRE source nav-chunk; the
-    chunk is the true unit of compute, esp. for compressed .zspy). cumsum +
-    searchsorted; O(number of blocks)."""
-    edges = np.cumsum((0,) + tuple(int(c) for c in chunk_sizes))
-    b = int(np.searchsorted(edges, pos, side="right") - 1)
-    b = max(0, min(b, len(chunk_sizes) - 1))
-    return b, int(edges[b]), int(edges[b + 1])
-
-
-class _NavChunkCache:
-    """Per-plot LRU of DECODED output nav-chunks for a DERIVED lazy view (rebin /
-    crop / rechunk / .zspy) — those have no hyperspy ``CachedDaskArray``, so without
-    this every crosshair move re-decodes + re-transforms the whole source nav-chunk
-    (dask must materialise the entire chunk to yield any one frame; on compressed
-    data it also re-decompresses it). Caching the decoded chunk makes every frame
-    within that nav span a free numpy slice — dwell-in-chunk goes from ~9 ms/move to
-    ~0 ms, matching what CachedDaskArray gives the base navigator (measured 145× on a
-    12×12-nav-chunk 4D-STEM rebin).
-
-    Keyed by ``(id(signal), block_index_tuple)`` so switching the displayed node
-    misses naturally. Touched ONLY from the serial ``_NavDispatcher`` thread, so no
-    lock is needed (Live-Display §2/§4). Bounded by MAX_CACHED_FRAMES decoded frames
-    (never the whole dataset — Memory-Safety rule)."""
-
-    def __init__(self, max_frames: int = MAX_CACHED_FRAMES) -> None:
-        from collections import OrderedDict
-        # key -> (block ndarray, frame_count) — storing the count avoids re-inferring
-        # nav_ndim on eviction.
-        self._blocks: "OrderedDict" = OrderedDict()
-        self._frames = 0                              # running frame count across blocks
-        self._max_frames = int(max_frames)
-
-    def clear(self) -> None:
-        self._blocks.clear()
-        self._frames = 0
-
-    def get_frame(self, signal, data, indices, prof=None):
-        """Return the single output frame at ``indices`` (nav point) as a numpy
-        array, decoding + caching its whole output nav-chunk on a miss. Returns None
-        if it can't serve the request (not a single point / no chunks) so the caller
-        falls back to the direct read."""
-        idx = np.asarray(indices)
-        if idx.ndim > 1:
-            return None                                # region — not a single frame
-        chunks = getattr(data, "chunks", None)
-        if not chunks:
-            return None
-        nav_ndim = signal.axes_manager.navigation_dimension
-        point = tuple(int(v) for v in np.atleast_1d(idx))
-        if len(point) != nav_ndim:
-            return None
-
-        # Locate the nav-chunk containing this point + the slice spanning it.
-        block_idx, nav_slices = [], []
-        for ax in range(nav_ndim):
-            b, s, e = _nav_chunk_span(chunks[ax], point[ax])
-            block_idx.append(b)
-            nav_slices.append(slice(s, e))
-        key = (id(signal), tuple(block_idx))
-
-        entry = self._blocks.get(key)
-        if entry is not None:
-            self._blocks.move_to_end(key)              # LRU touch
-            block, _ = entry
-            if prof is not None:
-                prof.done("chunk-cache hit")
-        else:
-            # MISS: decode the whole output nav-chunk once (all frames for this
-            # source-chunk nav span), synchronously on the dispatcher thread.
-            full_slice = tuple(nav_slices) + (slice(None),) * (data.ndim - nav_ndim)
-            block = np.asarray(data[full_slice].compute(scheduler="synchronous"))
-            n_frames = int(np.prod(block.shape[:nav_ndim]))
-            self._blocks[key] = (block, n_frames)
-            self._frames += n_frames
-            self._evict_over_budget()
-            if prof is not None:
-                prof.done("chunk-cache MISS decode")
-
-        # Slice the requested frame OUT of the cached block (offset within the chunk).
-        local = tuple(point[ax] - nav_slices[ax].start for ax in range(nav_ndim))
-        return block[local]
-
-    def is_resident(self, signal, data, indices) -> bool:
-        """Cheap, side-effect-free probe: is the decoded output nav-chunk for a
-        single-point ``indices`` ALREADY cached? (Mirrors :meth:`get_frame`'s key
-        derivation but NEVER decodes.) Lets a caller decide whether a synchronous
-        read would be a ~0 ms numpy slice (resident) vs a ~9 ms whole-chunk decode
-        (miss). Returns False for a region / no chunks / any probe failure — the
-        conservative answer (treat as not-resident)."""
-        try:
-            idx = np.asarray(indices)
-            if idx.ndim > 1:
-                return False
-            chunks = getattr(data, "chunks", None)
-            if not chunks:
-                return False
-            nav_ndim = signal.axes_manager.navigation_dimension
-            point = tuple(int(v) for v in np.atleast_1d(idx))
-            if len(point) != nav_ndim:
-                return False
-            block_idx = [
-                _nav_chunk_span(chunks[ax], point[ax])[0] for ax in range(nav_ndim)
-            ]
-            return (id(signal), tuple(block_idx)) in self._blocks
-        except Exception:
-            return False
-
-    def _evict_over_budget(self) -> None:
-        # Keep at least the just-inserted block (last) even if it alone exceeds the
-        # budget — we still need to serve the current frame.
-        while self._frames > self._max_frames and len(self._blocks) > 1:
-            _k, (_old, n) = self._blocks.popitem(last=False)  # evict oldest
-            self._frames -= n
 
 
 def _direct_read_frame(current_signal, selector, indices, prof, child=None):
@@ -547,35 +555,35 @@ def _direct_read_frame(current_signal, selector, indices, prof, child=None):
 
         is_region = idx.ndim > 1
         with prof.stage("read"):
-            if not is_region:
-                # Single point (crosshair): one frame, native dtype. Serve it from
-                # the plot's decoded-chunk cache when available — a derived view
-                # (rebin/crop/.zspy) must materialise its WHOLE source nav-chunk to
-                # yield any one frame (and re-decompress it on .zspy), so caching the
-                # decoded chunk makes dwell-in-chunk a ~0 ms numpy slice instead of a
-                # ~9 ms per-move re-decode. Falls through to the plain compute when
-                # there's no cache (returns None → recompute below).
+            # BOTH shapes go through the array cache first — a single point and an
+            # integrating region are the same question ("give me these frames"), so
+            # they share one path. A region used to bypass this entirely and pay a
+            # dask compute PER POINT, each materialising the whole enclosing
+            # nav-chunk to keep one frame: ~64 chunk decodes for the ~4 chunks an
+            # 8x8 ROI actually spans (measured 2.9 s/step; through the cache it is
+            # ~4 ms). Falls through to the plain compute below when the cache
+            # declines (an opaque node, eager data, no signal_tree).
+            frame = None
+            if child is not None:
+                try:
+                    from spyde.array_cache import get_local_frame
+                    cframe = get_local_frame(child, current_signal, data, idx, prof)
+                    if cframe is not None:
+                        frame = np.asarray(cframe)
+                except Exception as _ce:
+                    log.debug("array cache read failed, direct read: %s", _ce)
+                    frame = None
+
+            if frame is None and not is_region:
                 point = tuple(int(v) for v in np.atleast_1d(idx))
-                cache = getattr(child, "_nav_chunk_cache", None) if child is not None else None
-                frame = None
-                if cache is not None:
-                    try:
-                        cframe = cache.get_frame(current_signal, data, idx, prof)
-                        if cframe is not None:
-                            frame = np.asarray(cframe)
-                    except Exception as _ce:
-                        log.debug("nav chunk cache read failed, direct read: %s", _ce)
-                        frame = None
-                if frame is None:
-                    frame = np.asarray(
-                        data[point].compute(scheduler="synchronous"))
-            else:
-                # Integrating region: N nav points → frame-wise mean, accumulated
-                # INCREMENTALLY (read one frame, add to a float accumulator, free
-                # it) so peak memory is ~ONE frame, not the whole block. Reading a
-                # 59-frame region as one vindex block peaked ~2 GB; incremental
-                # peaks ~1 frame at the SAME speed (it's disk-bound either way).
-                # No size cap needed — memory is bounded by construction.
+                frame = np.asarray(data[point].compute(scheduler="synchronous"))
+            elif frame is None:
+                # Integrating region fallback: N nav points → frame-wise mean,
+                # accumulated INCREMENTALLY (read one frame, add to a float
+                # accumulator, free it) so peak memory is ~ONE frame, not the whole
+                # block. Reading a 59-frame region as one vindex block peaked ~2 GB;
+                # incremental peaks ~1 frame at the SAME speed (it's disk-bound
+                # either way). No size cap needed — memory is bounded by construction.
                 coords = [idx[:, k].astype(int) for k in range(idx.shape[1])]
                 n_pts = int(idx.shape[0])
                 acc = None
@@ -610,22 +618,44 @@ def _direct_read_frame(current_signal, selector, indices, prof, child=None):
         except Exception as _de:
             log.debug("off-disk probe failed: %s", _de)
 
-        # Read-ahead for a MOVIE scrub (1-D time nav, single point): warm the OS
-        # page cache for the neighbouring frames off-thread. A 4D-STEM DP dwells in
-        # small in-RAM-cheap chunks and an integrating region has no single "next
-        # frame", so prefetch is movie-only.
+        # Read-ahead. TWO kinds, by nav shape:
+        #  * 1-D time scrub → _movie_prefetcher warms the OS page cache for the
+        #    neighbouring frames.
+        #  * 2-D nav (4D-STEM point or region) → _block_prefetcher decodes the
+        #    nav-CHUNK the drag is heading into. With the block cache resident that
+        #    is the ONLY remaining stall (measured: 4 decodes in a 120-step
+        #    squiggle, ~103 ms each vs ~5.5 ms otherwise), and it is predictable
+        #    from the travel direction.
         with prof.stage("prefetch"):
             try:
                 if nav_dim == 1 and idx.ndim <= 1:
                     n_time = int(data.shape[0])
                     center = int(np.atleast_1d(idx).ravel()[0])
                     _movie_prefetcher.prime(data, center, n_time)
+                elif child is not None and nav_dim >= 2:
+                    # Guess from the ROI's leading corner (a region) or the point.
+                    cur = (tuple(int(v) for v in idx.min(axis=0)) if is_region
+                           else tuple(int(v) for v in np.atleast_1d(idx)))
+                    prev = getattr(child, "_prefetch_prev_point", None)
+                    child._prefetch_prev_point = cur
+                    # Reach one region-extent ahead so the block is decoded before
+                    # the ROI's leading edge arrives; a point gets a short lookahead.
+                    reach = int(np.ptp(idx[:, 0])) + 1 if is_region else 2
+                    _block_prefetcher.prime(child, current_signal, data,
+                                            prev, cur, max(2, reach))
             except Exception as _e:
-                log.debug("movie prefetch prime failed: %s", _e)
+                log.debug("prefetch prime failed: %s", _e)
         prof.done("direct")
         return frame
     except Exception as _e:
-        log.debug("direct-read failed, falling back to cached get_index: %s", _e)
+        # WARNING, not debug: this fallback is ~100x slower than the direct read
+        # (measured 220 ms vs 2.8 ms on a real 4D-STEM scrub), so it silently
+        # turning a fast path into a slow one is exactly the kind of failure that
+        # must not hide at debug level. A user-driven profile capture showed 66 of
+        # 223 reads taking it — including 26 that had ALREADY paid for a successful
+        # array-cache read and then threw, discarding the result.
+        log.warning("direct-read FAILED (falling back to the ~100x slower cached "
+                    "get_index path): %r", _e, exc_info=True)
         return None
 
 
@@ -679,13 +709,39 @@ def _submit_async_nav_read(child, current_signal, indices, settle, prof):
         # synchronous read, which is always correct.
         return False
 
-    lazy = _build_nav_lazy_slice(current_signal, indices)
-    if lazy is None:
-        return False
+    # Prefer the CACHED read, just executed off the dispatcher. Async used to mean
+    # "build a dask graph", which bypassed the array cache entirely — so a region
+    # routed async could never warm and re-read everything on every drag step.
+    # Going through get_local_frame instead means async and cached are no longer
+    # mutually exclusive: the navigator stays responsive AND the blocks stay warm.
+    # Falls back to the lazy dask slice when the cache declines (opaque node, eager
+    # data, no signal_tree).
+    _idx = np.asarray(indices)
+    cached_read = None
+    if child is not None and getattr(child, "signal_tree", None) is not None:
+        try:
+            from spyde.array_cache import get_local_frame
+            data_ref = current_signal.data
+            # Decide HERE, not in the callback: only take this path if the cache
+            # will actually serve this signal. Discovering "declined" after the
+            # round-trip would mean painting nothing for that move.
+            if child.signal_tree.resolve_locality(current_signal):
+                def cached_read(_sig=current_signal, _data=data_ref, _i=_idx):
+                    out = get_local_frame(child, _sig, _data, _i)
+                    return None if out is None else np.asarray(out)
+        except Exception as e:
+            log.debug("async cached-read setup failed: %s", e)
+            cached_read = None
+
+    lazy = None
+    if cached_read is None:
+        lazy = _build_nav_lazy_slice(current_signal, indices)
+        if lazy is None:
+            return False
 
     # Supersede: cancel the prior in-flight expensive read for this plot. A queued
     # future cancels cleanly; an already-running one runs to completion but its
-    # callback then no-ops via the identity check (wasted CPU, never mispaints).
+    # callback then no-ops via the identity + sequence checks.
     prev = child._nav_future
     if prev is not None:
         try:
@@ -693,10 +749,18 @@ def _submit_async_nav_read(child, current_signal, indices, settle, prof):
         except Exception:
             pass
 
+    # Monotonically increasing submit order for this plot, so a read that was
+    # superseded AFTER it started running can be dropped instead of painting an
+    # older frame over a newer one (see _apply). Assigned on the one serial
+    # dispatcher thread, so a plain increment is enough — no lock.
+    my_seq = getattr(child, "_nav_read_seq", 0) + 1
+    child._nav_read_seq = my_seq
+
     try:
-        fut = backend.submit_graph(lazy)
+        fut = (backend.submit_nav_read(cached_read) if cached_read is not None
+               else backend.submit_graph(lazy))
     except Exception as e:
-        log.debug("submit_graph for async nav read failed: %s", e)
+        log.debug("submit for async nav read failed: %s", e)
         return False
     child._nav_future = fut
     # NB: we deliberately do NOT set child.current_data = fut. The nav read's
@@ -726,9 +790,16 @@ def _submit_async_nav_read(child, current_signal, indices, settle, prof):
     except Exception as e:
         log.debug("source-chunk warm prime failed: %s", e)
 
-    def _apply(f, plot=child, expected=fut, want_settle=settle):
+    def _apply(f, plot=child, expected=fut, want_settle=settle, seq=my_seq):
         # Superseded before we even ran → drop (a newer read owns the slot).
         if getattr(plot, "_nav_future", None) is not expected:
+            return
+        # MONOTONIC GUARD. The identity check above is not sufficient on its own:
+        # fut.cancel() only takes effect on a QUEUED future, so a superseded read
+        # that already STARTED runs to completion and can land after a newer one,
+        # painting an older frame — the display visibly jumps backwards mid-drag.
+        # Never paint a frame older than the newest one already painted.
+        if seq < getattr(plot, "_nav_painted_seq", 0):
             return
         try:
             result = f.result()
@@ -740,11 +811,23 @@ def _submit_async_nav_read(child, current_signal, indices, settle, prof):
             if getattr(plot, "_nav_future", None) is expected:
                 plot._nav_future = None
             return
+        if result is None:
+            # The cached read declined (opaque node / eager data). Release the
+            # slot and hold the last good frame — the settle re-fire will take
+            # the synchronous path, which is always correct.
+            if getattr(plot, "_nav_future", None) is expected:
+                plot._nav_future = None
+            return
         result = np.asarray(result)
 
         def _paint():
             if getattr(plot, "_nav_future", None) is not expected:
                 return
+            # Re-check on the main thread: a newer frame may have painted while
+            # this one was queued for dispatch.
+            if seq < getattr(plot, "_nav_painted_seq", 0):
+                return
+            plot._nav_painted_seq = seq
             plot._nav_future = None
             plot.current_data = result
             try:
@@ -845,7 +928,8 @@ def _try_async_expensive_nav_read(current_signal, selector, child, indices, prof
         nav_dim = current_signal.axes_manager.navigation_dimension
         frame_shape = data.shape[nav_dim:]
         frame_bytes = int(np.prod(frame_shape)) * data.dtype.itemsize
-        if _classify_nav_read(current_signal, indices, data, frame_bytes) != "expensive":
+        if _classify_nav_read(current_signal, indices, data, frame_bytes,
+                              child=child) != "expensive":
             return False
         settle = bool(getattr(child, "_pending_settle", False))
         return _submit_async_nav_read(child, current_signal, indices, settle, prof)

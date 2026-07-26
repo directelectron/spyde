@@ -218,6 +218,7 @@ class ActionRouterMixin:
             wid = payload.get("window_id", window_id)
             if wid is not None:
                 self._active_window_id = wid
+                self._apply_focus_budgets(wid)
         elif action == "save_signal":
             self._save_signal(payload.get("path"), plot)
         elif action == "set_colormap":
@@ -242,6 +243,25 @@ class ActionRouterMixin:
             )
         else:
             log.warning("Unknown action: %s", action)
+
+    def _apply_focus_budgets(self, active_window_id) -> None:
+        """Tell every open Plot whether its window is the focused one, so the
+        decoded-block cache can hold its full budget only where the user is
+        actually working. Background plots keep a smaller working set rather than
+        being purged (see Plot.set_focused) — returning to a window should not pay
+        a cold re-decode.
+
+        Best-effort: a plot without the hook (or one that raises) is skipped, since
+        focus tracking must never break the action dispatch."""
+        for p in list(getattr(self, "_plots", []) or []):
+            hook = getattr(p, "set_focused", None)
+            if hook is None:
+                continue
+            try:
+                hook(p.window_id == active_window_id)
+            except Exception as e:
+                log.debug("focus budget update failed for %s: %s",
+                          getattr(p, "window_id", None), e)
 
     def _dispatch_toolbar_action(self, plot, name: str, params: dict) -> None:
         """Invoke a YAML-configured toolbar action by name on *plot*.

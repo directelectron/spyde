@@ -400,12 +400,12 @@ class TestColdSourceReadWarms:
         """A single-point read on a LAZY source whose chunk is NOT resident must NOT
         block the dispatcher: the first refresh returns None (skip) and warms the
         chunk off-thread; once warm, a subsequent read returns the frame. We drive
-        _read_source_frame directly with a fake lazy source + a _NavChunkCache."""
+        _read_source_frame directly with a fake lazy source + an ArrayCache."""
         import concurrent.futures as cf
         import types
         import dask.array as da
         import hyperspy.api as hs
-        from spyde.drawing.update_functions import _NavChunkCache
+        from spyde.array_cache import ArrayCache
 
         # A lazy derived-style movie: 6 frames, 1/chunk, NO CachedDaskArray.
         frames = np.stack([np.full((4, 4), i, np.float32) for i in range(6)])
@@ -426,16 +426,18 @@ class TestColdSourceReadWarms:
         backend = types.SimpleNamespace(submit=_submit)
         session_stub = types.SimpleNamespace(compute_backend=backend)
         plot_state = types.SimpleNamespace(current_signal=sig)
+        tree_stub = types.SimpleNamespace(resolve_locality=lambda signal: True)
         src = types.SimpleNamespace(
-            plot_state=plot_state, window_id=99,
-            _nav_chunk_cache=_NavChunkCache(), session=session_stub)
+            plot_state=plot_state, window_id=99, signal_tree=tree_stub,
+            _array_cache=ArrayCache(), _local_transform_readers={},
+            session=session_stub)
         indices = np.array([2])                 # single nav point (frame 2)
 
         # COLD: chunk not resident → skip (None) and warm off-thread (synchronous
         # backend runs the warm immediately, populating the cache).
         first = ov._read_source_frame(src, indices)
         assert first is None, "cold derived read did not skip the dispatcher"
-        assert src._nav_chunk_cache.is_resident(sig, sig.data, indices), \
+        assert ov._source_read_is_cheap(sig, indices, src), \
             "cold miss did not warm the source chunk off-thread"
 
         # WARM: now resident → the read returns the actual frame (settle re-fire path).
