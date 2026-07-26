@@ -119,6 +119,8 @@ class WindowManagerMixin:
             parent_sel = getattr(pw, "parent_selector", None)
             if parent_sel is not None and hasattr(parent_sel, "close"):
                 parent_sel.close()
+            if parent_sel is not None:
+                self._deregister_nav_selector(parent_sel)
         except Exception as e:
             log.debug("closing parent selector failed: %s", e)
         # Selectors living on this plot itself.
@@ -133,6 +135,45 @@ class WindowManagerMixin:
                             log.debug("closing plot selector failed: %s", e)
         except Exception as e:
             log.debug("iterating plot selectors for cleanup failed: %s", e)
+
+    def _deregister_nav_selector(self, selector) -> None:
+        """Drop a closed selector from every place the backend tracks it (the
+        owning ``MultiplotManager.navigation_selectors``, and the session's
+        window/selector-id lookup tables), and tell the renderer's Plot
+        Control dock to drop its row.
+
+        This is the counterpart to ``parent_sel.close()`` above: closing hides
+        the widget but does NOT remove the selector from the navigator's
+        bookkeeping (it would keep receiving dispatched updates for its own
+        navigator widget and linger forever in the dock's selector list,
+        since ``WINDOW_CLOSED`` only prunes rows keyed by the NAVIGATOR's
+        window_id, not the driven signal window's id).
+
+        NB: the ``_NavDispatcher`` pending slot is intentionally NOT cleared
+        here — a stale queued update drains once and is contained by the
+        dispatcher's / ``_run_update``'s try/excepts (at worst one no-op
+        paint to the dead window, which the renderer ignores). Don't "fix"
+        this by pruning the pending slot from off-thread."""
+        sid = id(selector)
+        try:
+            mm = getattr(selector, "parent", None)
+            mm = getattr(mm, "multiplot_manager", None) if mm is not None else None
+            if mm is not None:
+                mm.remove_navigation_selector(selector)
+        except Exception as e:
+            log.debug("removing selector from multiplot manager failed: %s", e)
+        nav_window_id = None
+        if hasattr(self, "_nav_selectors_by_id"):
+            entry = self._nav_selectors_by_id.pop(sid, None)
+            if entry is not None:
+                nav_window_id, _sel = entry
+        if hasattr(self, "_nav_selectors") and nav_window_id is not None:
+            if self._nav_selectors.get(nav_window_id) is selector:
+                self._nav_selectors.pop(nav_window_id, None)
+        try:
+            ipc.emit({"type": "selector_removed", "selector_id": sid})
+        except Exception as e:
+            log.debug("emitting selector_removed failed: %s", e)
 
     def _close_tree(self, tree: "BaseSignalTree") -> None:
         if tree not in self.signal_trees:
