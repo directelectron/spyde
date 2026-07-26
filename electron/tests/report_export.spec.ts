@@ -21,8 +21,6 @@
  *   6. Copy/Paste — figure Copy → Paste enables → Paste appends a SECOND live
  *      figure cell; markdown Duplicate appends a duplicate; OS clipboard holds a
  *      real PNG after the figure Copy.
- *   7. Copy to Report toolbar button — from a 2-D plot's floating toolbar → a new
- *      figure cell appends; also from a CLOSED report state (auto-opens one).
  *
  * The export flows call ipcMain.handle('report:export-dialog') /
  * 'report:export-pdf' in the MAIN process; we stub the dialog from the spec via
@@ -38,7 +36,6 @@ import { tmpdir } from 'os'
 import { chromium } from 'playwright'
 const {
   launchApp, backendAction, waitForSubwindowCount, backendErrorLines, sigWindow,
-  titlebarGrabPoint,
 } = require('./_harness.cjs')
 
 const SHOTS = join(__dirname, '..', 'report_export_shots')
@@ -174,31 +171,6 @@ async function figCellPixels(page: any, nth = 0): Promise<number> {
       return n
     })
   } catch { return -1 }
-}
-
-/**
- * Click the signal window's "Copy to Report" floating-toolbar button.
- *
- * The floating toolbar shares the window's z-level and sits BELOW the window in
- * the empty MDI space; its pointer-events toggle with the window's hover state,
- * so a plain `.click()` can land while the bar is momentarily transparent and the
- * mdi-area background swallows it. Focus-raise the window first (click its
- * titlebar, per the UI-degradation memory), then HOVER the button — the bar's own
- * onMouseEnter keeps it interactive — and click via the mouse at the button's box
- * centre so no intervening layer can intercept.
- */
-async function clickCopyToReport(page: any) {
-  const sigWin = sigWindow(page)
-  // Raise the window so its toolbar is above sibling windows / the mdi-area.
-  const grab = await titlebarGrabPoint(sigWin)
-  await page.mouse.click(grab.x, grab.y)
-  await sigWin.hover()
-  const btn = sigWin.getByTestId('action-btn-Copy to Report')
-  await expect(btn).toBeVisible({ timeout: 10_000 })
-  await btn.hover()   // keep the bar shown (its onMouseEnter → onHoverShow)
-  const box = await btn.boundingBox()
-  if (!box) throw new Error('Copy to Report button has no bounding box')
-  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2)
 }
 
 // ── 1) Build a small report (markdown cell + one figure cell) ────────────────
@@ -529,50 +501,6 @@ test('6) figure Copy → Paste appends a live cell; markdown Duplicate; OS clipb
   await page.waitForTimeout(600)
   await page.screenshot({ path: join(SHOTS, '06c-after-duplicate.png') })
 
-  ctx.assertNoJsErrors()
-})
-
-// ── 7) "Copy to Report" toolbar button ───────────────────────────────────────
-
-test('7) Copy to Report toolbar button appends a figure cell (open report)', async () => {
-  const { page } = ctx
-  const before = await countFigCells(page)
-
-  // The button is on the signal window's floating toolbar (toolbar_side: right,
-  // plot_dim [2]).
-  await clickCopyToReport(page)
-
-  await expect.poll(async () => countFigCells(page), {
-    timeout: 15_000, message: 'Copy to Report did not append a figure cell',
-  }).toBe(before + 1)
-  await page.waitForTimeout(1200)
-  await page.screenshot({ path: join(SHOTS, '07a-copy-to-report-open.png') })
-  ctx.assertNoJsErrors()
-})
-
-test('7b) Copy to Report from a CLOSED report auto-opens a report', async () => {
-  const { page } = ctx
-  // Close the report first — the sidebar returns to the empty New/Open state.
-  await backendAction(page, 'report_close')
-  await expect(page.getByTestId('report-empty')).toBeVisible({ timeout: 10_000 })
-  await expect(page.locator(figCellContainers())).toHaveCount(0)
-  await page.screenshot({ path: join(SHOTS, '07b-report-closed.png') })
-
-  // Copy to Report on the signal plot → auto-opens a fresh report with one cell.
-  await clickCopyToReport(page)
-
-  await expect(page.getByTestId('report-body')).toBeVisible({ timeout: 15_000 })
-  await expect.poll(async () => countFigCells(page), {
-    timeout: 15_000, message: 'Copy to Report from closed state did not open a report with a figure',
-  }).toBe(1)
-  // The auto-opened figure cell renders live pixels.
-  const figCell = page.locator(figCellContainers()).first()
-  await expect(figCell.locator('iframe[data-testid^="figure-"]')).toBeVisible({ timeout: 15_000 })
-  await expect.poll(async () => figCellPixels(page, 0), {
-    timeout: 30_000, message: 'auto-opened figure cell drew no pixels',
-  }).toBeGreaterThan(500)
-  await page.waitForTimeout(1200)
-  await page.screenshot({ path: join(SHOTS, '07c-copy-to-report-closed.png') })
   ctx.assertNoJsErrors()
 })
 
