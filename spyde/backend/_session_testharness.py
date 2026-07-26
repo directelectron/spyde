@@ -12,6 +12,7 @@ The mixin only USES ``self.<attr>`` (``self._plots``, ``self.signal_trees``,
 from __future__ import annotations
 
 import logging
+import os
 import threading
 
 import numpy as np
@@ -285,8 +286,23 @@ class TestHarnessMixin:
         n = int(payload.get("size", 2048))
         n_frames = int(payload.get("frames", 6))
         frames = _build_movie_frames(n, n_frames)
-        stack = da.from_array(frames, chunks=(1, n, n))       # 1 frame/chunk
-        s = hs.signals.Signal2D(stack).as_lazy()
+        if payload.get("mrc"):
+            # Back it with a REAL .mrc on disk instead of an in-RAM dask array.
+            # This is not cosmetic: the backing decides the reader, and therefore
+            # which region-integrate path runs. da.from_array(numpy) resolves to
+            # SourceArrayReader, which owns decoded blocks and has sum_points —
+            # a real .mrc resolves to BinaryReader, which has neither and goes
+            # through RegionIntegrator's per-frame accumulate. Only the second is
+            # the in-situ movie path a user actually drags.
+            # NB do NOT rechunk this: find_memmap_source gates on the array BEING
+            # the slice_memmap layer's output, and a rechunk renames it — which
+            # would silently drop back to LocalTransformReader, i.e. the very path
+            # this branch exists to avoid. BinaryReader reads frames straight from
+            # the memmap and does not care how dask chunked them.
+            s = hs.load(self._write_movie_mrc(frames), lazy=True)
+        else:
+            stack = da.from_array(frames, chunks=(1, n, n))    # 1 frame/chunk
+            s = hs.signals.Signal2D(stack).as_lazy()
         for ax, unit in zip(s.axes_manager.signal_axes, ("nm", "nm")):
             ax.scale = 0.5
             ax.units = unit
@@ -298,6 +314,44 @@ class TestHarnessMixin:
         tax.name, tax.units, tax.scale = "time", "s", 0.05
         s.set_signal_type("insitu")   # gates the Play/Fast Forward toolbar buttons
         self._add_signal(s, source_path="test_data_movie")
+
+    @staticmethod
+    def _write_movie_mrc(frames) -> str:
+        """Write ``frames`` as a minimal MRC2014 stack (mode 6 = uint16) into the
+        temp dir and return the path; reuses the file if one of the right size is
+        already there, so repeat spec runs don't rewrite a GB.
+
+        Hand-rolled rather than round-tripped through a writer because the point is
+        only to produce something rosettasciio's memmap_distributed reader
+        recognises — the header fields below are the ones it actually reads."""
+        import struct
+        import tempfile
+
+        arr = np.ascontiguousarray(frames)
+        n_frames, ny, nx = arr.shape
+        path = os.path.join(tempfile.gettempdir(),
+                            f"spyde_e2e_movie_{n_frames}x{ny}x{nx}.mrc")
+        want = 1024 + arr.nbytes
+        if os.path.exists(path) and os.path.getsize(path) == want:
+            log.info("reusing e2e movie mrc %s", path)
+            return path
+        hdr = bytearray(1024)
+        struct.pack_into("<iii", hdr, 0, nx, ny, n_frames)      # nx, ny, nz
+        struct.pack_into("<i", hdr, 12, 6)                      # mode 6 = uint16
+        struct.pack_into("<iii", hdr, 28, nx, ny, n_frames)     # mx, my, mz
+        struct.pack_into("<fff", hdr, 40, float(nx), float(ny), float(n_frames))
+        struct.pack_into("<fff", hdr, 52, 90.0, 90.0, 90.0)     # cell angles
+        struct.pack_into("<iii", hdr, 64, 1, 2, 3)              # mapc, mapr, maps
+        struct.pack_into("<i", hdr, 92, 0)                      # nsymbt: no ext hdr
+        hdr[208:212] = b"MAP "
+        hdr[212:216] = bytes([0x44, 0x44, 0, 0])                # little-endian
+        tmp = path + ".part"
+        with open(tmp, "wb") as fh:
+            fh.write(hdr)
+            fh.write(arr.astype(np.uint16, copy=False).tobytes())
+        os.replace(tmp, path)                # never leave a truncated file behind
+        log.info("wrote e2e movie mrc %s (%.2f GiB)", path, want / 2 ** 30)
+        return path
 
     def _test_add_second_navigator(self) -> None:
         """Test-only: register a second NAMED 1-D navigator trace on the
