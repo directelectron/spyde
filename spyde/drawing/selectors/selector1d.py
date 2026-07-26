@@ -116,12 +116,8 @@ class LinearRegionSelector(BaseSelector):
                 # _clamp_extent re-derive it on every update.
                 scale, _ = _signal_axis(self)
                 span_cap = abs(MAX_REGION_EXTENT_PER_DIM * scale)
-                try:
-                    widget = RangeWidget(lambda: None, x0=0.0, x1=10.0,
-                                         color=self.color, max_extent=span_cap)
-                except TypeError:      # anyplotlib without max_extent
-                    widget = RangeWidget(lambda: None, x0=0.0, x1=10.0,
-                                         color=self.color)
+                widget = RangeWidget(lambda: None, x0=0.0, x1=10.0,
+                                     color=self.color, max_extent=span_cap)
                 widget._push_fn = plot1d._make_widget_push_fn(widget)
                 plot1d._widgets[widget.id] = widget
                 plot1d._push()
@@ -152,8 +148,8 @@ class LinearRegionSelector(BaseSelector):
            construction time the signal often isn't attached yet (``_signal_axis``
            falls back to scale 1.0), so a cap fixed then would be wrong for any
            calibrated axis.
-        2. Clamp geometry that never went through a drag (a programmatic set), or
-           that came from an anyplotlib without ``max_extent``.
+        2. Clamp geometry that never went through a drag (a programmatic set) —
+           the widget's cap only applies to interactive drags.
 
         The fallback clamp anchors on the lower edge, which can move the edge the
         user is holding — that is the phantom-movement the widget-side cap exists

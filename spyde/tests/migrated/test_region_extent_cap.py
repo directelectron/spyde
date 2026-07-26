@@ -10,7 +10,6 @@ wasn't clamped (e.g. a programmatic set).
 import time
 
 import numpy as np
-import pytest
 import hyperspy.api as hs
 
 from spyde.drawing.selectors.base_selector import MAX_REGION_EXTENT_PER_DIM
@@ -38,22 +37,6 @@ def _make_movie_session():
     sess._add_signal(s, source_path=None)
     time.sleep(0.6)
     return sess
-
-
-def _widget_supports_max_extent() -> bool:
-    """Does the installed anyplotlib accept ``max_extent=``?
-
-    SpyDE floors at anyplotlib>=0.4.0, but the widget-side cap landed after the
-    0.4.0 release, so a valid environment can lack it. The selectors handle that
-    (TypeError -> uncapped widget), and these tests skip rather than fail."""
-    try:
-        from anyplotlib.widgets import RectangleWidget
-        RectangleWidget(lambda: None, x=0, y=0, w=1, h=1, max_extent=1)
-        return True
-    except TypeError:
-        return False
-    except Exception:
-        return False
 
 
 def _composite(sess):
@@ -147,14 +130,6 @@ class TestWidgetSideCap:
     """
 
     def test_rectangle_widget_carries_the_cap(self):
-        """Skips on an anyplotlib without ``max_extent``.
-
-        The selectors degrade deliberately (they catch TypeError and build an
-        uncapped widget), so asserting unconditionally would turn a supported
-        configuration into a red suite. _clamp_extent still bounds the geometry
-        there — that path is covered by TestRegionExtentCap above."""
-        if not _widget_supports_max_extent():
-            pytest.skip("anyplotlib predates widget max_extent")
         sess = _make_4d_session()
         try:
             w = _composite(sess)._rect_selector._widget
@@ -168,10 +143,7 @@ class TestWidgetSideCap:
         """The 1-D span is in DATA units, so the cap is index-cap * scale — and
         the signal usually attaches AFTER the widget is built, so a cap fixed at
         construction would be wrong for any calibrated axis. _clamp_extent
-        re-derives it. Skips on an anyplotlib without ``max_extent`` — see
-        test_rectangle_widget_carries_the_cap."""
-        if not _widget_supports_max_extent():
-            pytest.skip("anyplotlib predates widget max_extent")
+        re-derives it."""
         sess = _make_movie_session()
         try:
             region = _composite(sess)._linear_region_selector

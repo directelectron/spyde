@@ -318,15 +318,15 @@ poll for the cheap nav path. This is the fast common case and stays fully synchr
   `MAX_REGION_EXTENT_PER_DIM=16` nav positions PER navigation dimension, so a region
   read can never accidentally integrate a huge number of positions (worst case
   16×16=256 frames). The cap is enforced by the **anyplotlib widget itself**
-  (`max_extent=`, ≥0.4.0): the ROI physically stops under the cursor mid-drag, the
+  (`max_extent=`, ≥0.4.1): the ROI physically stops under the cursor mid-drag, the
   dragged edge pins and the opposite one stays put. SpyDE passes it in
   (`RectangleSelector` in image px; `LinearRegionSelector` in DATA units, so the cap
   is `MAX_REGION_EXTENT_PER_DIM * scale` and `_clamp_extent` re-derives it every
   update — the signal usually attaches AFTER the widget is built, so a cap fixed at
   construction is wrong for any calibrated axis).
   `_clamp_extent` remains as the fallback for geometry that never went through a
-  drag (a programmatic set) and for an anyplotlib without `max_extent`. **Do not
-  rely on it as the primary path**: it anchors on the lower edge, so it can move
+  drag (a programmatic set) — the widget's cap only applies to interactive drags.
+  **Do not rely on it as the primary path**: it anchors on the lower edge, so it can move
   the edge the user is holding — which reads as the ROI jumping around. That, plus
   a default ROI size of half the image that then snapped down to the cap, was the
   "ROI is always huge and then clamps down / jumps" behaviour.
