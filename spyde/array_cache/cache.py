@@ -33,15 +33,30 @@ import numpy as np
 
 from .protocol import FrameReader
 
-# PER-PLOT budget, so the real footprint is this × the number of open plots —
-# keep it modest. Only SINGLE frames are cached (get_local_frame declines a
-# region), so the budget just needs to cover the recent scrub history: at 256 MiB
-# that is ~8 frames of a 4096² uint16 movie (32 MB each) or ~8000 frames of a
-# 128² uint16 diffraction pattern (32 KB each) — well past the point of
-# diminishing returns for dwell-and-return scrubbing, and small enough that a
-# few open windows can't quietly hold the whole dataset in RAM (the
-# Memory-Safety rule in CLAUDE.md).
+# PER-PLOT budget for SINGLE-POINT scrub history, so the real footprint is this ×
+# the number of open plots — keep it modest. At 256 MiB that is ~8 frames of a
+# 4096² uint16 movie (32 MB each) or ~8000 frames of a 128² uint16 diffraction
+# pattern (32 KB each) — well past the point of diminishing returns for
+# dwell-and-return scrubbing, and small enough that a few open windows can't
+# quietly hold the whole dataset in RAM (the Memory-Safety rule in CLAUDE.md).
 DEFAULT_BUDGET_BYTES = 256 << 20
+
+# …but regions are ALSO served from here now (get_local_frame stopped declining
+# them), and a region's working set is N frames AT ONCE, not a scrub history. On a
+# 4096² uint16 movie a 16-frame ROI is 512 MiB against 8 slots — an LRU scan over a
+# working set twice the cache, i.e. measured 0 hits / 16 misses on EVERY drag step
+# (~166 ms/step of pure re-reading). ensure_budget_for grows the budget to hold the
+# ROI, bounded by this ceiling so it can't follow a pathological region to
+# arbitrary RAM. It never shrinks below DEFAULT_BUDGET_BYTES, and clear() puts it
+# back (so a node switch doesn't inherit the last ROI's appetite).
+REGION_BUDGET_CEILING_BYTES = 1 << 30
+
+# The window alone is NOT enough headroom. A sliding ROI re-reads the LEAVING
+# frame — the oldest one — while the incremental path touches only 2 frames per
+# step, so the other N-2 age by one insert per step and the leaving frame is
+# evicted at almost exactly the step it is next needed: measured 1.9 misses/step
+# at N+1 slots versus 1.0 at N*1.5 (111 ms vs 59 ms on a 16-frame 4096² ROI).
+REGION_BUDGET_HEADROOM = 1.5
 
 
 class ArrayCache:
@@ -55,12 +70,16 @@ class ArrayCache:
         self._entries: "OrderedDict[tuple[Any, tuple[int, ...]], np.ndarray]" = OrderedDict()
         self._nbytes = 0
         self._budget_bytes = int(budget_bytes)
+        self._default_budget_bytes = int(budget_bytes)   # floor for ensure_budget_for
         self._lock = threading.Lock()      # bookkeeping only — never held across a read
 
     def clear(self) -> None:
         with self._lock:
             self._entries.clear()
             self._nbytes = 0
+            # A plot that grew to hold a big ROI must not keep that budget for
+            # whatever node it shows next (ensure_budget_for re-grows on demand).
+            self._budget_bytes = self._default_budget_bytes
 
     def get_frame(
         self,
@@ -94,6 +113,19 @@ class ArrayCache:
         if prof is not None:
             prof.done("array-cache MISS read")
         return frame
+
+    def ensure_budget_for(self, n_frames: int, frame_bytes: int) -> None:
+        """Grow the budget so an ``n_frames``-point region's working set fits, up
+        to :data:`REGION_BUDGET_CEILING_BYTES`. Never shrinks below the default,
+        and tracks the CURRENT region size so a big ROI followed by a small one
+        gives the memory back (the entries themselves go on the next insert's
+        eviction pass, not here — evicting eagerly would drop frames the caller is
+        about to ask for)."""
+        slots = int(n_frames * REGION_BUDGET_HEADROOM) + 2
+        want = max(self._default_budget_bytes,
+                   min(REGION_BUDGET_CEILING_BYTES, slots * int(frame_bytes)))
+        with self._lock:
+            self._budget_bytes = want
 
     def drop_key(self, key: Any) -> None:
         """Evict every frame cached under ``key``. Needed because the key is the

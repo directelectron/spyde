@@ -54,11 +54,44 @@ def _reader_for(plot, signal, data):
         block_cache = getattr(plot, "_block_cache", None)
         if block_cache is not None and reader is not None:
             block_cache.drop_owner(id(reader))
+        # The region running sum was built from those stale frames. Its token
+        # includes id(reader), which normally catches this on its own — but ids
+        # are recycled, so drop it explicitly at the one place we KNOW the data
+        # changed rather than relying on the new reader landing at a new address.
+        _invalidate_integrator(plot)
     reader = _try_per_frame_reader(plot, signal, data) or resolve_reader(
         signal, data, block_cache=getattr(plot, "_block_cache", None))
     if reader is not None:
         readers[key] = reader
     return reader
+
+
+def _integrator_for(plot):
+    """The plot's :class:`~spyde.array_cache.region_sum.RegionIntegrator`, built on
+    first use. Lazy rather than a Plot attribute so every ``get_local_frame``
+    caller works (spyde/actions/overlay.py passes a Plot too), and None on any
+    failure — the serial region loop then serves the read."""
+    integ = getattr(plot, "_region_integrator", None)
+    if integ is None:
+        try:
+            from .region_sum import RegionIntegrator
+            integ = RegionIntegrator()
+            plot._region_integrator = integ
+        except Exception as e:
+            log.debug("region integrator unavailable, serial region read: %s", e)
+            return None
+    return integ
+
+
+def _invalidate_integrator(plot) -> None:
+    """Drop any running region sum on ``plot`` — call wherever the frame caches
+    are cleared, since the sum was built out of those frames."""
+    integ = getattr(plot, "_region_integrator", None)
+    if integ is not None:
+        try:
+            integ.invalidate()
+        except Exception:
+            pass
 
 
 def _try_per_frame_reader(plot, signal, data):
@@ -193,6 +226,8 @@ def _get_local_region(plot, signal, data, idx, prof=None):
     if n_pts == 0:
         return None
 
+    from .region_sum import finalize_sum
+
     # FAST PATH: a reader that owns decoded blocks can sum the points directly
     # out of them. The per-frame path below has to COPY each frame out of its
     # block (so a cached frame doesn't pin the whole block) — for a region that
@@ -200,34 +235,50 @@ def _get_local_region(plot, signal, data, idx, prof=None):
     # Region frames are summed immediately and never wanted individually, so the
     # copy buys nothing here.
     acc_dtype = _region_accum_dtype(data.dtype, n_pts)
-    acc = None
-    how = "region"
     summer = getattr(reader, "sum_points", None)
     if summer is not None:
         try:
             acc = summer(idx, acc_dtype)
             if acc is not None:
-                how = "region-block"
+                out = finalize_sum(acc, n_pts, data.dtype)
+                if prof is not None:
+                    prof.done(f"array-cache region-block x{n_pts}")
+                return out
         except Exception as e:
             log.debug("block region sum failed, per-frame fallback: %s", e)
-            acc = None
 
-    if acc is None:
-        # Per-frame fallback: contiguous sources, unchunked arrays, BinaryReader
-        # (which reads exactly the frames asked for and has no block to sum from).
-        for i in range(n_pts):
-            point = tuple(int(v) for v in idx[i])
-            frame = cache.get_frame(key, reader, point, None)
-            if acc is None:
-                acc = np.asarray(frame, dtype=acc_dtype).copy()
-            else:
-                acc += frame
+    # PER-FRAME PATH: contiguous sources, unchunked arrays, BinaryReader (which
+    # reads exactly the frames asked for and has no block to sum from).
+    #
+    # Delegated to the plot's RegionIntegrator, which row-band-threads the
+    # accumulate and reuses the previous drag step's running sum when the ROI
+    # merely slid (see region_sum.py — measured 660 -> ~60 ms/step on a 16-frame
+    # 4096² ROI). It returns None if it can't serve the request; the serial loop
+    # below stays as the always-correct fallback and is what the integrator is
+    # required to match bit-for-bit.
+    points = [tuple(int(v) for v in idx[i]) for i in range(n_pts)]
+    frame_bytes = int(np.prod(data.shape[idx.shape[1]:])) * data.dtype.itemsize
+    cache.ensure_budget_for(n_pts, frame_bytes)
+    integrator = _integrator_for(plot)
+    if integrator is not None:
+        out = integrator.mean_frame(key, reader, cache, points, data.dtype,
+                                    acc_dtype, prof)
+        if out is not None:
+            return out
+
+    acc = None
+    for point in points:
+        frame = cache.get_frame(key, reader, point, None)
+        if acc is None:
+            acc = np.asarray(frame, dtype=acc_dtype).copy()
+        else:
+            acc += frame
 
     acc = acc / n_pts
     if np.issubdtype(data.dtype, np.integer):
         acc = np.rint(acc).astype(data.dtype)
     if prof is not None:
-        prof.done(f"array-cache {how} x{n_pts}")
+        prof.done(f"array-cache region x{n_pts} serial")
     return acc
 
 
@@ -235,6 +286,7 @@ def close_all_readers(plot) -> None:
     """Close every cached reader on ``plot`` (releasing e.g. BinaryReader's
     open file descriptor) before dropping them — called on node switch and
     on Plot.close(), mirroring where _array_cache.clear() is already called."""
+    _invalidate_integrator(plot)
     readers = getattr(plot, "_local_transform_readers", None)
     if not readers:
         return
