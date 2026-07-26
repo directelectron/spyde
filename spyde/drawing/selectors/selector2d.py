@@ -98,6 +98,7 @@ class RectangleSelector(BaseSelector):
         )
         self._widget = None
         self.roi = None
+        self._roi_trace = None          # built lazily on the first pointer event
         plot2d = self._get_plot2d()
         if plot2d is not None:
             try:
@@ -120,8 +121,39 @@ class RectangleSelector(BaseSelector):
         return getattr(plot, "_plot2d", None) if plot is not None else None
 
     def _on_pointer_up(self, event):
+        before = self._spans()
         self._clamp_extent()
+        after = self._spans()
+        self._trace_geometry(before, after)
         self.update_data()
+
+    def _spans(self):
+        """Geometry as ``[(x0, x1), (y0, y1)]`` for RoiTrace — the rectangle is
+        carried as x/y/w/h, so widen it to per-axis edges the shared rules can
+        read (see roi_trace.py)."""
+        if self._widget is None:
+            return []
+        x, y = float(self._widget.x), float(self._widget.y)
+        w, h = float(self._widget.w), float(self._widget.h)
+        return [(x, x + w), (y, y + h)]
+
+    def _trace_geometry(self, before, after) -> None:
+        """Feed the ROI-jump detector. Silent unless the geometry moved in a way
+        no single pointer gesture explains — see roi_trace.py."""
+        try:
+            if self._roi_trace is None:
+                from spyde.drawing.selectors.roi_trace import RoiTrace
+                self._roi_trace = RoiTrace("2-D rectangle")
+            idx = self._get_selected_indices()
+            # A 2-D ROI is a grid of (y, x) pairs: count DISTINCT positions, not
+            # distinct coordinate values, or a 16x1 strip would look collapsed.
+            uniq = len(set(map(tuple, np.atleast_2d(idx).tolist())))
+            self._roi_trace.observe(
+                before, after, n_indices=int(np.atleast_2d(idx).shape[0]),
+                n_unique=uniq,
+                extra=f"cap={getattr(self._widget, 'max_w', None)}")
+        except Exception as e:
+            logger.debug("roi trace (2-D) failed: %s", e)
 
     def _clamp_extent(self) -> None:
         """Cap the rectangle to MAX_REGION_EXTENT_PER_DIM image pixels on each
@@ -133,10 +165,15 @@ class RectangleSelector(BaseSelector):
         if self._widget is None:
             return
         try:
+            # Relative tolerance for the same reason as the 1-D span: a rectangle
+            # resting exactly on the cap can compute fractionally over it, and a
+            # bare > then rewrites the widget on every pointer_move, echoing
+            # python-sourced geometry back into a live drag.
             cap = float(MAX_REGION_EXTENT_PER_DIM)
-            if float(self._widget.w) > cap:
+            slack = cap * (1.0 + 1e-9)
+            if float(self._widget.w) > slack:
                 self._widget.w = cap
-            if float(self._widget.h) > cap:
+            if float(self._widget.h) > slack:
                 self._widget.h = cap
         except Exception as e:
             logger.debug("clamping rectangle extent failed: %s", e)
