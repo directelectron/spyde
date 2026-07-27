@@ -163,8 +163,9 @@ def _power_law(x, p):
 
 def _offset(x, p):
     (offset,) = p
-    return offset.expand(-1, x.shape[-1]) if x.shape[0] == 1 else \
-        offset + 0.0 * x
+    # Broadcast rather than expand — see _polynomial_fn for why expand-based
+    # shaping breaks as soon as there is more than one spectrum.
+    return offset + 0.0 * x
 
 
 def _exponential(x, p):
@@ -375,8 +376,12 @@ def _polynomial_fn(order: int):
     Parameters are ``a0..a{order}`` and ``aK`` multiplies ``x**K``."""
 
     def fn(x, p):
-        out = p[0].expand_as(x) if len(p) else None
-        acc = out
+        # `p[0] + 0.0 * x`, NOT `p[0].expand_as(x)`. The parameter block is
+        # (P, 1) and the axis is (1, C), so expand_as tries to force P down to
+        # 1 and raises for any batch bigger than one spectrum — which single-
+        # spectrum tests never reach. Plain broadcasting gives (P, C) for both
+        # a shared axis and a per-position one.
+        acc = p[0] + 0.0 * x
         for k in range(1, order + 1):
             acc = acc + p[k] * x ** k
         return acc

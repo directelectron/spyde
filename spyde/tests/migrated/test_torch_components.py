@@ -230,6 +230,58 @@ class TestBatching:
         assert torch.allclose(y[1], torch.full_like(y[1], 5.0))
 
 
+@pytest.mark.parametrize("kind", sorted(CASES) + ["Polynomial"])
+class TestEveryComponentBatches:
+    """Every component, with P > 1.
+
+    This exists because a single-spectrum test is not enough and once wasn't:
+    `Polynomial` and `Offset` shaped their output with `expand_as`, which
+    happens to work when P == 1 and raises for any real batch. Every other
+    component test used one row, so a whole EDS model failed only at the point
+    of actually fitting a scan.
+    """
+
+    def _component_and_values(self, kind):
+        if kind == "Polynomial":
+            comp = c1d.Polynomial(order=2)
+            for k in range(3):
+                getattr(comp, f"a{k}").value = 0.5 * (k + 1)
+            batched = tc.get_component("Polynomial", n_params=3)
+        else:
+            comp = _hyperspy_component(kind)
+            batched = tc.get_component(kind)
+        base = np.array([getattr(comp, n).value for n in batched.params])
+        return batched, base
+
+    def test_value_batches(self, kind):
+        batched, base = self._component_and_values(kind)
+        vals = np.stack([base * (1.0 + 0.1 * i) for i in range(4)])
+        y = batched(torch.as_tensor(X, dtype=torch.float64),
+                    torch.as_tensor(vals, dtype=torch.float64))
+        assert y.shape == (4, len(X)), f"{kind} returned {tuple(y.shape)}"
+
+    def test_gradient_batches(self, kind):
+        batched, base = self._component_and_values(kind)
+        if not batched.has_analytic_grad:
+            pytest.skip(f"{kind} has no analytic gradient")
+        vals = np.stack([base * (1.0 + 0.1 * i) for i in range(4)])
+        g = batched.grad(torch.as_tensor(X, dtype=torch.float64),
+                         torch.as_tensor(vals, dtype=torch.float64))
+        assert g.shape == (4, len(X), batched.n_params), \
+            f"{kind} gradient returned {tuple(g.shape)}"
+
+    def test_batched_rows_are_independent(self, kind):
+        """Each row must reflect its OWN parameters — a broadcasting slip that
+        returns row 0 for everything would still have the right shape."""
+        batched, base = self._component_and_values(kind)
+        vals = np.stack([base, base * 2.0])
+        y = batched(torch.as_tensor(X, dtype=torch.float64),
+                    torch.as_tensor(vals, dtype=torch.float64))
+        one = batched(torch.as_tensor(X, dtype=torch.float64),
+                      torch.as_tensor(vals[1:2], dtype=torch.float64))
+        torch.testing.assert_close(y[1], one[0])
+
+
 class TestPolynomial:
     @pytest.mark.parametrize("order", [1, 2, 3])
     def test_matches_hyperspy_at_each_order(self, order):
