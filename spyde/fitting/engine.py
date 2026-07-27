@@ -40,9 +40,17 @@ from spyde.fitting import components as tcomp
 
 log = logging.getLogger(__name__)
 
-# Bounds the Jacobian working set per chunk. 2**22 elements x 8 B (float64)
-# x (value + tangents) lands comfortably inside a few hundred MB.
-_TARGET_JACOBIAN_ELEMENTS = 1 << 22
+# Bounds the Jacobian working set per chunk, as ELEMENTS of (P, C, n).
+#
+# Sized to keep a GPU busy, not to be safe: chunking is what stops the whole
+# (P, C, n) Jacobian materialising, but chunk too SMALL and every LM iteration
+# becomes launch overhead on a nearly idle device. Measured at 1024 spectra x
+# 1024 channels x 13 params, a 2**22 cap (which chopped the batch into pieces
+# of 372) ran at 178 spectra/s against 267 for the whole batch in one go — the
+# "safe" setting cost a third of the throughput. 2**26 elements is ~0.5 GB in
+# float64 / 0.27 GB in float32, which fits any GPU worth using and lets typical
+# scans run unchunked.
+_TARGET_JACOBIAN_ELEMENTS = 1 << 26
 
 
 @dataclass
@@ -59,6 +67,11 @@ class FitResult:
     chisq: np.ndarray             # (P,) sum of squared (weighted) residuals
     n_iter: int
     device: str
+    # Set only by spyde.fitting.seeding.fit_seeded — the fraction of the coarse
+    # grid that produced a usable seed, and how many coarse fits there were.
+    # None from a plain fit_batched, which is how a caller tells them apart.
+    seed_converged: float | None = None
+    n_seeds: int | None = None
 
     @property
     def convergence_rate(self) -> float:
@@ -247,14 +260,39 @@ def _fit_chunk(spec, x, S, free_mask, tdtype, device, *, y, w, start, lo, hi,
     fixed_full = start * (~free_mask).to(tdtype)
     p = start[:, free_mask].clone()
 
-    residual = _make_residual_fn(spec, x, S)
-    # in_dims: p_free batched, and y/w/fixed batched alongside it.
-    res_b = vmap(residual, in_dims=(0, 0, 0, 0))
-    jac_b = vmap(jacfwd(residual, argnums=0), in_dims=(0, 0, 0, 0))
+    # ANALYTIC path when every component supplies derivatives, autodiff
+    # otherwise. This is the single biggest cost in the solver: measured on a
+    # 13-free-parameter model, jacfwd took 51.6 ms per call against 3.4 ms for
+    # one residual evaluation — forward-mode AD costs one pass per parameter,
+    # while the closed forms mostly reuse the value that was computed anyway.
+    analytic = tcomp.has_analytic_grad(spec)
+    if analytic:
+        def res_b(pf, y_i, w_i, fixed_i):
+            full = fixed_i + (pf @ S.T)
+            return (tcomp.evaluate(spec, x, full) - y_i) * w_i
+
+        def val_jac(pf, y_i, w_i, fixed_i):
+            full = fixed_i + (pf @ S.T)
+            model, jac_full = tcomp.evaluate_with_grad(spec, x, full)
+            # Weight the residual and its Jacobian identically, and keep only
+            # the FREE columns (S selects them, so S picks the same subset).
+            return ((model - y_i) * w_i,
+                    (jac_full * w_i.unsqueeze(-1)) @ S)
+    else:
+        residual = _make_residual_fn(spec, x, S)
+        # in_dims: p_free batched, and y/w/fixed batched alongside it.
+        _res_v = vmap(residual, in_dims=(0, 0, 0, 0))
+        _jac_v = vmap(jacfwd(residual, argnums=0), in_dims=(0, 0, 0, 0))
+
+        def res_b(pf, y_i, w_i, fixed_i):
+            return _res_v(pf, y_i, w_i, fixed_i)
+
+        def val_jac(pf, y_i, w_i, fixed_i):
+            return (_res_v(pf, y_i, w_i, fixed_i),
+                    _jac_v(pf, y_i, w_i, fixed_i))
 
     lam = torch.full((n_chunk,), 1e-3, dtype=tdtype, device=device)
-    r = res_b(p, y, w, fixed_full)
-    cost = 0.5 * (r * r).sum(1)
+    cost = torch.full((n_chunk,), float("inf"), dtype=tdtype, device=device)
     converged = torch.zeros(n_chunk, dtype=torch.bool, device=device)
     used = 0
 
@@ -262,7 +300,11 @@ def _fit_chunk(spec, x, S, free_mask, tdtype, device, *, y, w, start, lo, hi,
 
     for it in range(max_iter):
         used = it + 1
-        J = jac_b(p, y, w, fixed_full)                     # (B, C, n_free)
+        # One call gives both — the value and its derivatives share almost all
+        # of their work (df/dA IS the shape), so computing them separately
+        # would repeat the expensive part.
+        r, J = val_jac(p, y, w, fixed_full)                # (B, C), (B, C, n_free)
+        cost = 0.5 * (r * r).sum(1)
 
         # COLUMN SCALING (MINPACK's `diag`), and it is load-bearing, not a
         # refinement. Parameters routinely differ by many orders of magnitude —
@@ -304,10 +346,12 @@ def _fit_chunk(spec, x, S, free_mask, tdtype, device, *, y, w, start, lo, hi,
         better = (cost_new < cost) & solvable
         # Accepted: keep the step and trust the model more (smaller λ).
         # Rejected: fall back toward gradient descent (larger λ).
+        # `r`/`cost` are NOT carried forward — the top of the next iteration
+        # recomputes both from the current `p` alongside the Jacobian it needs
+        # anyway, so tracking them here would only risk them drifting out of
+        # step with `p`.
         p = torch.where(better[:, None], p_new, p)
-        r = torch.where(better[:, None], r_new, r)
         rel = (cost - cost_new) / cost.clamp_min(1e-300)
-        cost = torch.where(better, cost_new, cost)
         lam = torch.where(better, (lam / 3.0).clamp_min(1e-12),
                           (lam * 3.0).clamp_max(1e12))
 
@@ -334,9 +378,15 @@ def _fit_chunk(spec, x, S, free_mask, tdtype, device, *, y, w, start, lo, hi,
         if bool(converged.all()):
             break
 
+    # Final cost from the FINAL p. The loop's `cost` belongs to the start of
+    # the last iteration, so reporting it would attribute the previous point's
+    # chisq to the answer actually returned.
+    r_final = res_b(p, y, w, fixed_full)
+    chisq = (r_final * r_final).sum(1)
+
     # Reassemble the full parameter vector (free values back into their slots).
     full = fixed_full + (S @ p.unsqueeze(2)).squeeze(2)
     return (full.detach().cpu().numpy().astype(np.float64),
             converged.detach().cpu().numpy(),
-            (2.0 * cost).detach().cpu().numpy().astype(np.float64),
+            chisq.detach().cpu().numpy().astype(np.float64),
             used)

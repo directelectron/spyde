@@ -27,27 +27,70 @@ import time
 import numpy as np
 
 
-def _build(nav, n_channels):
-    from spyde.data import eels_si
-    s = eels_si(nav=(nav, nav), n_channels=n_channels)
+def _build(nav, n_channels, dataset):
+    """The two cases are DIFFERENT KINDS of benchmark and both are needed.
+
+    ``eds`` is **well-posed**: the data is gaussian peaks on a smooth
+    background, and the component library expresses gaussians exactly, so the
+    fit can actually converge and the convergence rate is a real quality
+    signal.
+
+    ``eels`` is **deliberately hard**: real core-loss edges are tabulated GOS
+    shapes, and nothing in the stock component set represents one, so the best
+    available model (a smeared step) leaves structured residuals and neither
+    HyperSpy nor the batched engine converges. Timing is still comparable —
+    both do the same work — but do not read its convergence rate as a quality
+    claim. That case is what exspy's real ``EELSCLEdge`` (#63) is for.
+    """
+    if dataset == "eels":
+        from spyde.data import eels_si
+        s = eels_si(nav=(nav, nav), n_channels=n_channels)
+    else:
+        from spyde.data import eds_si
+        s = eds_si(nav=(nav, nav), n_channels=n_channels)
     x = s.axes_manager.signal_axes[0].axis
     return s, np.asarray(x, float)
 
 
-def _seed_model(signal):
-    """Power-law background + one smeared STEP per edge.
+def _seed_model(signal, dataset="eels"):
+    """Background + one component per spectral feature.
 
-    ``Erf`` (an error function) is the right shape here and a Gaussian is not:
-    a core-loss edge is a step up at the onset, and a peak cannot represent it.
-    A Gaussian-per-edge model is unfittable — measured, both HyperSpy and the
-    batched engine exhaust their iteration budgets on it and the benchmark ends
-    up timing the iteration cap instead of convergence. Without exspy's real
-    ``EELSCLEdge`` (#63) this is the closest well-posed model.
+    EELS gets ``Erf`` (a smeared step) per edge, because a core-loss edge is a
+    step up at the onset and a peak cannot represent it — a Gaussian-per-edge
+    model is simply unfittable, and measured, both HyperSpy and the batched
+    engine burn their whole iteration budget on it.
+
+    EDS gets a ``Gaussian`` per K-alpha line, which is exactly what the data
+    is, so this one converges.
     """
-    from hyperspy.components1d import Erf, PowerLaw
+    from hyperspy.components1d import Erf, Gaussian, PowerLaw
+
+    if dataset == "eds":
+        from spyde.data.synthetic import EDS_LINES
+        m = signal.create_model()
+        while len(m):
+            m.remove(m[0])
+        comps = [PowerLaw()]
+        for lines in EDS_LINES.values():
+            g = Gaussian()
+            g.centre.value, g.sigma.value, g.A.value = lines[0][1], 0.09, 3e3
+            comps.append(g)
+        m.extend(comps)
+        m[0].A.value, m[0].r.value = 1e4, 1.0
+        m[0].origin.free = False
+        return m
+
     from spyde.data.synthetic import EELS_EDGES
 
     m = signal.create_model()
+    # create_model() PRE-POPULATES for a recognised signal type: with exspy
+    # installed this is an EELSModel that already carries a background, so
+    # appending our own silently produced a model with TWO PowerLaws — a
+    # degenerate fit, and not the model the batched side was given. Both sides
+    # must fit the SAME model or the comparison measures nothing.
+    # (ModelSpec.to_model does the same clear, for the same reason.)
+    while len(m):
+        m.remove(m[0])
     comps = [PowerLaw()]
     for onset in EELS_EDGES.values():
         e = Erf()
@@ -76,6 +119,9 @@ def main() -> None:
     ap.add_argument("--nav", type=int, default=64,
                     help="navigation grid edge (nav x nav spectra)")
     ap.add_argument("--channels", type=int, default=1024)
+    ap.add_argument("--dataset", choices=("eels", "eds"), default="eds",
+                    help="eds is well-posed (convergence is meaningful); "
+                         "eels is deliberately hard (timing only)")
     ap.add_argument("--skip-hyperspy", action="store_true",
                     help="skip the reference (it is the slow one)")
     args = ap.parse_args()
@@ -85,8 +131,8 @@ def main() -> None:
 
     P = args.nav * args.nav
     print(f"building {args.nav}x{args.nav} = {P} spectra x {args.channels} ch …")
-    s, x = _build(args.nav, args.channels)
-    spec = ModelSpec.from_model(_seed_model(s))
+    s, x = _build(args.nav, args.channels, args.dataset)
+    spec = ModelSpec.from_model(_seed_model(s, args.dataset))
     n_free = int(spec.free_mask().sum())
     print(f"model: {[c.kind for c in spec]}  ({n_free} free parameters)\n")
 
@@ -94,7 +140,7 @@ def main() -> None:
 
     # -- reference ---------------------------------------------------------
     if not args.skip_hyperspy:
-        m = _seed_model(s)
+        m = _seed_model(s, args.dataset)
         print("hyperspy multifit … (this is the slow one)")
         _, dt = _time(lambda: m.multifit(optimizer="lm", show_progressbar=False))
         results["hyperspy multifit"] = dt
@@ -106,6 +152,18 @@ def main() -> None:
     results["batched cpu"] = dt
     print(f"  {dt:8.2f} s   {P/dt:8.1f} spectra/s   "
           f"converged {r_cpu.convergence_rate:.1%}  iters {r_cpu.n_iter}\n")
+
+    # -- seeded (coarse -> propagate -> refine) ----------------------------
+    from spyde.fitting.seeding import fit_seeded
+    dev = default_device()
+    print(f"seeded ({dev}) …")
+    r_seed, dt = _time(lambda: fit_seeded(spec, s.data, x, stride=4,
+                                          device=dev),
+                       sync=(dev == "cuda"))
+    results[f"seeded {dev}"] = dt
+    print(f"  {dt:8.2f} s   {P/dt:8.1f} spectra/s   "
+          f"converged {r_seed.convergence_rate:.1%}  "
+          f"(seeds {r_seed.seed_converged:.0%} of {r_seed.n_seeds})\n")
 
     # -- batched, GPU ------------------------------------------------------
     if default_device() == "cuda":
