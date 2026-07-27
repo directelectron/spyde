@@ -112,17 +112,26 @@ def load_model(ckpt_path, device=None, arch: dict | None = None):
         levels=arch.get("levels", ck.get("levels", 2)),
     )
     model.load_state_dict(ck["state_dict"])
-    model = model.to(device)
-    model.eval()
-    if device.type == "mps":
-        # Smoke-test the forward ONCE at load: an MPS build missing an op this
-        # net uses should degrade to CPU here, not fail on every chunk.
-        try:
-            with torch.no_grad():
-                model(torch.zeros(1, in_ch, 32, 32, device=device))
-        except Exception:
-            device = torch.device("cpu")
-            model = model.to(device)
+    # Moving the weights to MPS and the smoke-test forward are both real device
+    # submissions, and ``registry.get_model`` deliberately calls this OUTSIDE its
+    # cache lock (so a slow download doesn't block the cache) — so several
+    # find-vectors chunk threads can land here at once on a cold cache. Concurrent
+    # Metal submission is an uncatchable SIGSEGV, so take THE process-wide device
+    # lock for the device-touching part. Null context off MPS. See spyde.device_lock.
+    from spyde.device_lock import accelerator_lock
+
+    with accelerator_lock(device):
+        model = model.to(device)
+        model.eval()
+        if device.type == "mps":
+            # Smoke-test the forward ONCE at load: an MPS build missing an op this
+            # net uses should degrade to CPU here, not fail on every chunk.
+            try:
+                with torch.no_grad():
+                    model(torch.zeros(1, in_ch, 32, 32, device=device))
+            except Exception:
+                device = torch.device("cpu")
+                model = model.to(device)
     return model, device
 
 
