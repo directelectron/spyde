@@ -23,7 +23,13 @@ from spyde.spectroscopy.composition import (
     prune_to_range,
 )
 
+from spyde.spectroscopy.quantify import (
+    element_intensity_maps,
+    quantify,
+    quantify_result,
+)
 from spyde.spectroscopy.tabulate import onset_energies, tabulate_model
 
 __all__ = ["model_for_composition", "prune_to_range", "MissingExtra",
-           "tabulate_model", "onset_energies"]
+           "tabulate_model", "onset_energies",
+           "element_intensity_maps", "quantify", "quantify_result"]
