@@ -23,8 +23,16 @@ from spyde.ebsd.indexing import (
     sample_orientations,
 )
 from spyde.ebsd.preprocess import average_dot_product_map, remove_background
+from spyde.ebsd.crystal_map import (
+    ipf_colors,
+    merge_phases,
+    orientation_similarity_map,
+    to_crystal_map,
+)
 from spyde.ebsd.refine import RefinementResult, refine_orientations
 
 __all__ = ["dictionary_index", "sample_orientations", "IndexingResult",
            "remove_background", "average_dot_product_map",
-           "refine_orientations", "RefinementResult"]
+           "refine_orientations", "RefinementResult",
+           "to_crystal_map", "ipf_colors", "orientation_similarity_map",
+           "merge_phases"]
