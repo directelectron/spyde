@@ -1262,6 +1262,11 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'vom_fit':
         case 'vom_library_ready':
         case 'om_library_ready':
+        // Fit wizard (spyde/actions/fit_action.py) — `fit_catalogue` is the
+        // component picker's shapes, sent once on open; `fit_state` is the
+        // whole model after every edit. Consumed by FitWizard.
+        case 'fit_catalogue':
+        case 'fit_state':
         case 'fv_auto_params':
         case 'fv_models':
         case 'fv_calibration':

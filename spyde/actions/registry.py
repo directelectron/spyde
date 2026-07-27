@@ -46,6 +46,14 @@ import importlib
 from typing import Callable
 
 STAGED_HANDLERS: dict[str, str] = {
+    "fit_open":             "spyde.actions.fit_action.fit_open",
+    "fit_close":            "spyde.actions.fit_action.fit_close",
+    "fit_add_component":    "spyde.actions.fit_action.fit_add_component",
+    "fit_remove_component": "spyde.actions.fit_action.fit_remove_component",
+    "fit_set_param":        "spyde.actions.fit_action.fit_set_param",
+    "fit_tune":             "spyde.actions.fit_action.fit_tune",
+    "fit_run":              "spyde.actions.fit_action.fit_run",
+    "fit_commit":           "spyde.actions.fit_action.fit_commit",
     "om_generate_library": "spyde.actions.orientation_action.om_generate_library",
     "om_refine":           "spyde.actions.orientation_action.om_refine",
     "om_run":              "spyde.actions.orientation_action.om_run",
@@ -203,6 +211,7 @@ def register_staged(name: str, dotted_path: str) -> None:
 _WIZARD_SCHEMAS: dict[str, tuple[str, str]] = {
     # key: (module, attribute) — attribute is a controller class (its
     # `parameters`) or a dict.
+    "fit":    ("spyde.actions.fit_action", "FitWizard"),
     "strain": ("spyde.actions.strain_action", "StrainController"),
     "vom":    ("spyde.actions.vector_orientation_om", "VomWizard"),
     "czb":    ("spyde.actions.center_zero_beam", "PARAMETERS"),
