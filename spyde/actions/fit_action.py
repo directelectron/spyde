@@ -1019,6 +1019,75 @@ def seed_background(cspec, x: np.ndarray, y: np.ndarray) -> bool:
     return _solve_anchors(cspec, cspec.kind, xs, ys)
 
 
+def spread_repeats(cspec, spec, lo: float, hi: float) -> None:
+    """Place repeats of one kind APART, symmetrically about the seed.
+
+    Every component is seeded mid-axis, so a second gaussian used to land
+    exactly on the first: identical centre, identical sigma, and therefore
+    two IDENTICAL Jacobian columns (measured corr(centre1, centre2) =
+    1.000000, cond(J) = 1e16). A perfectly degenerate pair can never
+    separate — the solver moves both the same way forever — so it grows one
+    and shrinks the other, which is what "it forces the second gaussian to 0"
+    looks like. On two well-separated peaks the pair instead ran away
+    together to sigma = 170 on a 100-wide axis, chisq 6.3e7.
+
+    The family is re-placed as a whole and spaced by ONE of their own widths.
+    Symmetric so the pair still straddles where the seed put it; one width so
+    the columns are distinct without moving a genuinely co-centred pair far —
+    on hyperspy's ``two_gaussians``, where both true centres ARE 50, this
+    reproduces the co-located fit exactly (chisq 5.245e5, unchanged).
+
+    Wider spacing is worse, not better: at two widths the co-centred case
+    fails outright (chisq 6.3e5 against 1.3e-21). Nothing here is a
+    universally right guess — which is why the components have drag handles.
+    """
+    info = _DRAG.get(cspec.kind)
+    if info is None:
+        return                       # a background has no position to spread
+    family = [c for c in spec.components if c.kind == cspec.kind] + [cspec]
+    if len(family) < 2:
+        return
+    width = (float(cspec[info["width"]].value) if info["width"]
+             else (hi - lo) / 8.0)
+    base = float(cspec[info["pos"]].value)
+    for j, comp in enumerate(family):
+        offset = (j - (len(family) - 1) / 2.0) * width
+        comp[info["pos"]].value = float(np.clip(base + offset, lo, hi))
+
+
+def clamp_to_axis(cspec, lo: float, hi: float) -> None:
+    """Keep a peak's position and width inside the data.
+
+    A component centred off the axis, or wider than the whole of it, is not
+    modelling anything the user can see — and those are exactly the runaway
+    directions the solver walks down when a start is poor: a centre at 750 on
+    a 0-100 axis, a sigma of 170 on the same. Bounding them is not enough on
+    its own (a degenerate pair just pins itself at the cap instead) but it is
+    necessary: with the spread above and without these, a noisy pair of
+    near-overlapping peaks still diverged to chisq 1.1e8.
+
+    Only components with a position ON the curve. A background is bounded by
+    nothing here — a PowerLaw's ``origin`` is a reference point that is
+    deliberately placed OUTSIDE the axis when the axis would otherwise
+    contain its singularity.
+    """
+    info = _DRAG.get(cspec.kind)
+    if info is None:
+        return
+    span = hi - lo
+    for name, bmin, bmax in ((info["pos"], lo, hi),
+                             (info["width"], span / 1000.0, span)):
+        if not name:
+            continue
+        try:
+            p = cspec[name]
+        except KeyError:
+            continue
+        p.bmin = bmin if p.bmin is None else max(p.bmin, bmin)
+        p.bmax = bmax if p.bmax is None else min(p.bmax, bmax)
+        p.value = float(np.clip(p.value, p.bmin, p.bmax))
+
+
 def _seed_for_preview(cspec, lo: float, hi: float) -> None:
     """Put a component somewhere visible on THIS axis.
 
@@ -1133,13 +1202,18 @@ def fit_add_component(session, plot, payload) -> None:
         return
 
     x = wiz.axis()
-    _seed_for_preview(cspec, float(np.min(x)), float(np.max(x)))
+    lo, hi = float(np.min(x)), float(np.max(x))
+    _seed_for_preview(cspec, lo, hi)
     # Put it on THIS spectrum, or the component arrives five orders of
     # magnitude below the data and looks like it does nothing. A background
     # needs its shape solved through the data, not just its amplitude scaled.
     spectrum = wiz.current_spectrum()
     if not seed_background(cspec, x, spectrum):
         scale_to_data(cspec, x, spectrum)
+    # Two of a kind must not start in the same place (degenerate, unfittable)
+    # and no peak may wander off the data.
+    spread_repeats(cspec, wiz.spec, lo, hi)
+    clamp_to_axis(cspec, lo, hi)
     # A unique name per instance — two Gaussians must be separately addressable
     # by the caret and produce two distinct area maps at commit.
     existing = {c.name for c in wiz.spec.components}

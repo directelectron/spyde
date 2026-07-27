@@ -457,6 +457,125 @@ class TestARunFillsTheStore:
         assert state["fitted_count"] == len(tree.fit_store) > 0
 
 
+class TestTwoOfAKindCanBeFitted:
+    """A second component of a kind must not start ON the first.
+
+    Every component is seeded mid-axis, so two gaussians used to arrive with
+    identical centres AND sigmas — two IDENTICAL Jacobian columns
+    (corr = 1.000000, cond(J) = 1e16). A perfectly degenerate pair can never
+    separate: the solver moves both the same way forever, so it grows one and
+    shrinks the other, which reads as "it forces the second gaussian to 0".
+    On two well-separated peaks the pair instead ran away together to a sigma
+    larger than the whole axis.
+    """
+
+    @staticmethod
+    def _separated(n=1024):
+        x = np.linspace(0.0, 100.0, n)
+        y = (800 * np.exp(-0.5 * ((x - 30.0) / 5.0) ** 2)
+             + 800 * np.exp(-0.5 * ((x - 70.0) / 5.0) ** 2) + 20.0)
+        return x, y
+
+    @staticmethod
+    def _caret_model(x, y, kinds):
+        """What fit_add_component builds, without needing a Session."""
+        from spyde.actions.fit_action import (
+            _seed_for_preview, clamp_to_axis, new_component_spec,
+            scale_to_data, spread_repeats,
+        )
+        from spyde.fitting import ModelSpec
+        lo, hi = float(x.min()), float(x.max())
+        spec = ModelSpec()
+        for kind in kinds:
+            c = new_component_spec(kind)
+            _seed_for_preview(c, lo, hi)
+            scale_to_data(c, x, y)
+            spread_repeats(c, spec, lo, hi)
+            clamp_to_axis(c, lo, hi)
+            while any(e.name == c.name for e in spec.components):
+                c.name += "'"
+            spec.append(c)
+        return spec
+
+    def test_two_of_a_kind_do_not_share_a_centre(self, window, fitted):
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Gaussian"})
+        fit_add_component(session, plot, {"kind": "Gaussian"})
+        centres = [float(c["centre"].value)
+                   for c in tree.fit_spec.active_components]
+        assert centres[0] != centres[1], "a degenerate pair cannot be fitted"
+
+    def test_the_pair_still_straddles_the_seed(self, window, fitted):
+        """Symmetric, so a genuinely co-centred pair still starts co-centred —
+        which is what makes hyperspy's two_gaussians (both true centres 50)
+        fit exactly as well as it did before."""
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Gaussian"})
+        before = float(tree.fit_spec["Gaussian"]["centre"].value)
+        fit_add_component(session, plot, {"kind": "Gaussian"})
+        centres = [float(c["centre"].value)
+                   for c in tree.fit_spec.active_components]
+        assert sum(centres) / 2 == pytest.approx(before, abs=1e-6)
+
+    def test_separated_peaks_are_actually_recovered(self):
+        """The end of it: this fit used to reach chisq 6e7 with both
+        components pinned at a sigma wider than the whole axis."""
+        from spyde.fitting.engine import fit_batched
+        x, y = self._separated()
+        spec = self._caret_model(x, y, ("Offset", "Gaussian", "Gaussian"))
+        r = fit_batched(spec, y[None, :], x, device="cpu", max_iter=200)
+        spec.set_flat_values(r.values[0])
+        got = sorted((round(float(c["centre"].value), 2),
+                      round(float(c["sigma"].value), 2))
+                     for c in spec.active_components if c.kind == "Gaussian")
+        assert got == [(30.0, 5.0), (70.0, 5.0)]
+        assert float(r.chisq[0]) < 1e-6
+
+    def test_a_co_centred_pair_is_still_recovered(self):
+        """The other half of the trade, and the one the spacing was chosen
+        for: hyperspy's two_gaussians is genuinely two co-centred peaks, a
+        wide one and a narrow one at 1.7% of its height."""
+        from spyde.fitting.engine import fit_batched
+        x = np.linspace(0.0, 100.0, 1024)
+        y = (900 * np.exp(-0.5 * ((x - 50.0) / 25.0) ** 2)
+             + 150 * np.exp(-0.5 * ((x - 50.0) / 2.5) ** 2) + 20.0)
+        spec = self._caret_model(x, y, ("Offset", "Gaussian", "Gaussian"))
+        r = fit_batched(spec, y[None, :], x, device="cpu", max_iter=200)
+        spec.set_flat_values(r.values[0])
+        got = sorted((round(float(c["centre"].value), 1),
+                      round(float(c["sigma"].value), 1))
+                     for c in spec.active_components if c.kind == "Gaussian")
+        assert got == [(50.0, 2.5), (50.0, 25.0)]
+
+    def test_a_peak_cannot_wander_off_the_data(self):
+        """Bounds are NOT redundant with the spread: with the spread and
+        without them, a noisy near-overlapping pair still diverged to a
+        centre off the axis and chisq 1.1e8."""
+        from spyde.actions.fit_action import clamp_to_axis, new_component_spec
+        c = new_component_spec("Gaussian")
+        clamp_to_axis(c, 200.0, 800.0)
+        assert (c["centre"].bmin, c["centre"].bmax) == (200.0, 800.0)
+        assert c["sigma"].bmax == 600.0
+        assert c["sigma"].bmin > 0.0
+
+    def test_a_background_is_not_bounded_to_the_axis(self):
+        """A PowerLaw's `origin` is a reference point, deliberately placed
+        OUTSIDE the axis when the axis would otherwise contain its
+        singularity. Clamping it there would undo `seed_background`."""
+        from spyde.actions.fit_action import (
+            clamp_to_axis, new_component_spec, seed_background,
+        )
+        x = np.linspace(0.0, 100.0, 512)
+        c = new_component_spec("PowerLaw")
+        seed_background(c, x, 1000.0 / (x + 30.0) + 5.0)
+        origin = float(c["origin"].value)
+        assert origin < 0.0, "the singularity was not moved off the axis"
+        clamp_to_axis(c, 0.0, 100.0)
+        assert float(c["origin"].value) == origin
+
+
 class TestBackgroundSeeding:
     """A new background arrives ON the data.
 
