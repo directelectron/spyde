@@ -49,9 +49,9 @@ class TestItIsHyperspysStore:
     def test_the_values_land_in_the_parameter_map(self, store):
         store.put((3, 1), np.arange(6.0))
         par = store._params[0]
-        assert par.map["values"][1, 3] == 0.0
-        assert bool(par.map["is_set"][1, 3])
-        assert store._params[1].map["values"][1, 3] == 1.0
+        assert par.map["values"][3, 1] == 0.0
+        assert bool(par.map["is_set"][3, 1])
+        assert store._params[1].map["values"][3, 1] == 1.0
 
     def test_it_is_a_real_hyperspy_model(self, store):
         assert len(store.model) == 2
@@ -65,9 +65,27 @@ class TestItIsHyperspysStore:
 
 
 class TestIndexing:
-    def test_navigator_indices_are_x_first_and_maps_are_y_first(self, store):
-        """The hazard: on a square scan a transposed store is invisible."""
-        assert store.nav_shape == (4, 5)
+    """The store must index the way the DISPLAY does, and nothing else.
+
+    `_build_nav_lazy_slice` / `get_local_frame` do `data[point]` with the
+    selector's indices exactly as given, so the spectrum on screen at
+    crosshair (cx, cy) is `data[cx, cy]`. The store answers "what was fitted
+    to THAT spectrum", so it has to agree — reasoning instead from
+    `axes_manager.navigation_shape` transposed the whole scan.
+    """
+
+    def test_the_key_matches_how_the_display_reads_the_data(self, store):
+        store.put((3, 1), np.arange(6.0))
+        par = store._params[0]
+        # data[3, 1] is what the display shows at this crosshair, so the map
+        # entry has to be [3, 1] too.
+        assert bool(par.map["is_set"][3, 1]), "the store is transposed"
+        assert not bool(par.map["is_set"][1, 3])
+
+    def test_a_transposed_position_is_a_different_position(self, store):
+        """On a SQUARE scan this is the ONLY thing that catches a transpose —
+        the shapes match, coverage looks complete, and every recall succeeds
+        while quietly returning another pixel's answer."""
         store.put((3, 1), np.arange(6.0))
         assert store.get((3, 1)) is not None
         assert store.get((1, 3)) is None
@@ -112,15 +130,19 @@ class TestWholeScan:
         assert store.put_all(values, chisq=np.arange(20.0)) == 20
         assert store.coverage() == (20, 20)
 
-    def test_put_all_lands_in_the_right_places(self, store):
-        """Flat row i must end up at the position `get` reads back for i —
-        getting this reversed transposes the entire scan."""
-        values = np.arange(20 * 6, dtype=float).reshape(20, 6)
+    def test_put_all_lands_where_the_display_looks(self, store):
+        """A whole-scan fit flattens `data` in C order, so row r is
+        `data[r // nx, r % nx]`. The display shows `data[point]` at crosshair
+        `point`, so `get(point)` must return the row for `data[point]` — a
+        self-consistent-but-transposed convention passes a test that only
+        checks the round trip, and shows every position its neighbour's fit."""
+        ny, nx = 4, 5
+        values = np.arange(ny * nx * 6, dtype=float).reshape(ny * nx, 6)
         store.put_all(values)
-        for iy in range(4):
-            for ix in range(5):
-                flat = iy * 5 + ix
-                assert np.array_equal(store.get((ix, iy)), values[flat])
+        for a in range(ny):
+            for b in range(nx):
+                flat = a * nx + b        # the row fitted to data[a, b]
+                assert np.array_equal(store.get((a, b)), values[flat])
 
     def test_values_array_round_trips(self, store):
         values = np.arange(20 * 6, dtype=float).reshape(20, 6)
@@ -146,8 +168,8 @@ class TestMaps:
         store.put((3, 1), [1000.0, 25.0, 4.0, 500.0, 30.0, 6.0], chisq=9.0)
         maps = store.maps(x)
         assert np.isfinite(maps["Gaussian"]).sum() == 1
-        assert np.isfinite(maps["Gaussian"][1, 3])
-        assert maps["chi squared"][1, 3] == 9.0
+        assert np.isfinite(maps["Gaussian"][3, 1])
+        assert maps["chi squared"][3, 1] == 9.0
         # ...and the rest is still a hole, not a zero. A zero would read as
         # "fitted, and the component is absent here".
         assert np.isnan(maps["Gaussian"][0, 0])
@@ -155,7 +177,7 @@ class TestMaps:
     def test_the_area_map_tracks_the_amplitude(self, store):
         x = np.linspace(0.0, 50.0, 128)
         store.put((0, 0), [1000.0, 25.0, 4.0, 0.0, 30.0, 6.0])
-        store.put((1, 0), [2000.0, 25.0, 4.0, 0.0, 30.0, 6.0])
+        store.put((0, 1), [2000.0, 25.0, 4.0, 0.0, 30.0, 6.0])
         maps = store.maps(x)
         assert maps["Gaussian"][0, 1] == pytest.approx(
             2 * maps["Gaussian"][0, 0], rel=1e-6)

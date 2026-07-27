@@ -390,18 +390,19 @@ class TestARunFillsTheStore:
     fit the navigation mean).
     """
 
-    def test_the_store_is_indexed_the_right_way_round(self, window, fitted):
-        """On a SQUARE scan a transposed store looks identical, so this uses
-        the non-square fixture. Navigator indices are x-first; HyperSpy's
-        parameter maps are y-first like the data."""
+    def test_the_store_is_indexed_like_the_display(self, window, fitted):
+        """The store must key positions the way the DISPLAY reads them —
+        `data[point]` with the selector's indices as given. Reasoning from
+        `axes_manager.navigation_shape` instead transposed the whole scan,
+        which a SQUARE scan hides completely."""
         session, plot, tree, _ = fitted
         fit_open(session, plot, {})
         fit_add_component(session, plot, {"kind": "Offset"})
         store = tree.fit_store
         assert store.nav_shape == (4, 5)
-        store.put((3, 1), [42.0])                     # navigator (ix=3, iy=1)
+        store.put((3, 1), [42.0])
         par = store._params[0]
-        assert bool(par.map["is_set"][1, 3]), "the store is transposed"
+        assert bool(par.map["is_set"][3, 1]), "the store is transposed"
         assert store.get((1, 3)) is None
 
     @staticmethod
@@ -694,7 +695,7 @@ class TestTheResultMaps:
         wiz.remember(wiz.spec.flat_values(), chisq=7.0)
         maps = wiz.result_maps()
         assert int(np.isfinite(maps["Gaussian"]).sum()) == 1
-        assert maps["chi squared"][1, 2] == 7.0
+        assert maps["chi squared"][2, 1] == 7.0
 
 
 class TestBackgroundSeeding:

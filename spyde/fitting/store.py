@@ -84,10 +84,24 @@ class FitStore:
         return len(self._params)
 
     def _key(self, indices):
-        """Navigator indices (x first) -> map index (y first)."""
+        """Navigator indices -> map index. THE SAME WAY THE DISPLAY READS THEM.
+
+        ``_build_nav_lazy_slice`` / ``get_local_frame`` do ``data[point]`` with
+        the selector's indices exactly as given, so the spectrum on screen at
+        crosshair ``(cx, cy)`` is ``data[cx, cy]``. The store has to agree,
+        because its whole job is to answer "what was fitted to THAT spectrum".
+
+        Reversing here — reasoning from ``axes_manager.navigation_shape``
+        rather than from what the display actually does — transposed the whole
+        scan. It was invisible on the 32x32 tutorial: the shapes matched, the
+        coverage read 1024/1024, every recall succeeded, and the diagonal
+        positions were even correct. Every OTHER position quietly showed its
+        transpose's fit, which is a plausible-looking curve that misses the
+        data (measured: 20% median misfit against the spectrum, 47% worst).
+        """
         if indices is None:
             return None
-        key = tuple(int(v) for v in reversed(tuple(indices)))
+        key = tuple(int(v) for v in tuple(indices))
         if len(key) != len(self.nav_shape):
             return None
         if any(not (0 <= k < n) for k, n in zip(key, self.nav_shape)):
