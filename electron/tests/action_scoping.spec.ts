@@ -77,6 +77,49 @@ test('closing an action removes what it put on the plot', async () => {
     expect(x1, 'the caret never heard where the band is (bg_state not relayed)')
       .toBeGreaterThan(x0)
 
+    // ── the preview must FOLLOW the band, not wait for the release ───────
+    const bgCurve = async () => page.evaluate((f) => {
+      const hook = (window as any)._spyde_test_panel_json
+      for (const raw of hook ? hook(f) : []) {
+        const d = JSON.parse(raw)
+        for (const ln of d.extra_lines ?? []) {
+          if (ln.label !== 'background' || !ln.data_b64) continue
+          const bin = atob(ln.data_b64)
+          const b = new Uint8Array(bin.length)
+          for (let i = 0; i < bin.length; i++) b[i] = bin.charCodeAt(i)
+          const v = Array.from(new Float64Array(b.buffer))
+          return { n: v.length, sum: v.reduce((a, c) => a + c, 0) }
+        }
+      }
+      return null
+    }, sigFig)
+
+    const span = (await widgets()).find((w: any) => w.type === 'range')
+    const postSpan = (x0: number, x1: number, type: string) =>
+      page.evaluate(({ f, panel, id, a, b, t }) => {
+        window.postMessage({
+          type: 'awi_event', figId: f,
+          data: JSON.stringify({
+            source: 'js', panel_id: panel, widget_id: id,
+            event_type: t, x0: a, x1: b,
+          }),
+        }, '*')
+      }, { f: sigFig, panel: span.panel_id, id: span.id, a: x0, b: x1, t: type })
+
+    const before = await bgCurve()
+    expect(before, 'no background preview curve is drawn').toBeTruthy()
+    // A pointer_MOVE only — the release is what used to be the only thing
+    // that redrew, and reading the geometry off the event rather than off
+    // `event.source` meant even that never happened.
+    await postSpan(55, 95, 'pointer_move')
+    await page.waitForTimeout(1_500)
+    const during = await bgCurve()
+    expect(
+      Math.abs((during!.sum - before!.sum) / (before!.sum || 1)),
+      'the background preview did not follow the band mid-drag',
+    ).toBeGreaterThan(1e-6)
+    await page.screenshot({ path: `${SHOTS}/01b-band-dragged.png`, fullPage: true })
+
     await page.locator('[data-testid="bg-close"]').click()
     await page.waitForTimeout(1_500)
     await page.screenshot({ path: `${SHOTS}/02-background-closed.png`, fullPage: true })

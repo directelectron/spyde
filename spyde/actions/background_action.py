@@ -86,13 +86,27 @@ class BackgroundWizard(WizardController):
             log.debug("adding the background window failed: %s", e)
 
     def _on_drag(self, event) -> None:
-        get = (lambda k: getattr(event, k, None)
-               if not isinstance(event, dict) else event.get(k))
+        """The band moved — refit and redraw, live.
+
+        The geometry is on ``event.source``, NOT on the event. anyplotlib's
+        ``Event`` carries x/y and a handful of scalars; a range widget's
+        ``x0``/``x1`` live on the widget it hands back. Reading them off the
+        event gave None every time, so this returned at the first check and the
+        background preview never followed the band at all — the same mistake
+        the Fit handles made (see ``_on_widget_drag``).
+        """
+        src = getattr(event, "source", None) or event
+        get = (lambda k: src.get(k) if isinstance(src, dict)
+               else getattr(src, k, None))
         x0, x1 = get("x0"), get("x1")
         if x0 is None or x1 is None:
             return
         self.window = (min(float(x0), float(x1)), max(float(x0), float(x1)))
-        self.preview()
+        # A pointer_move redraws the curve; the state message waits for the
+        # release. Sending the whole state per pointer frame is what made the
+        # Fit caret lag behind its own handles.
+        live = str(getattr(event, "event_type", "") or "") != "pointer_up"
+        self.preview(live=live)
 
     # ── fit + preview ─────────────────────────────────────────────────────
     def build_spec(self):
@@ -123,7 +137,16 @@ class BackgroundWizard(WizardController):
         # would start the background an order of magnitude too high.
         inside = self.current_spectrum()[spec.channel_mask]
         if self.model_kind == "PowerLaw":
-            cspec["origin"].value = 0.0
+            # `origin` is the reference point, and 0 is HyperSpy's convention
+            # and what every downstream tool assumes. But the curve is drawn —
+            # and subtracted — across the WHOLE axis, not just the window, so
+            # if the axis reaches the origin the extrapolation is a
+            # singularity: a window on the far side of a peak fitted to 3e9 at
+            # the left edge, which blew the plot's y-range away and hid the
+            # spectrum entirely. Same rule as `fit_action.seed_background`.
+            cspec["origin"].value = (
+                0.0 if float(x[0]) > 0.0
+                else float(x[0]) - 0.25 * (float(x[-1]) - float(x[0])))
             cspec["origin"].free = False
             cspec["r"].value = 3.0
         scale_to_data(cspec, x[spec.channel_mask], inside, fraction=1.0)
@@ -156,24 +179,32 @@ class BackgroundWizard(WizardController):
         curve = tcomp.evaluate(spec, torch.as_tensor(x), values).numpy()
         return spec, result, curve
 
-    def preview(self) -> None:
+    def preview(self, live: bool = False) -> None:
         p1 = getattr(self.plot, "_plot1d", None)
         if p1 is None:
             return
         try:
             _spec, _res, curve = self.fit_background(whole_scan=False)
         except Exception as e:
-            ipc.emit_status(f"Background: {e}")
+            if not live:            # a mid-drag window can be briefly invalid
+                ipc.emit_status(f"Background: {e}")
             return
+        y = np.asarray(curve[0], np.float32)
         try:
-            if self._line is not None:
-                p1.remove_line(self._line)
-            self._line = p1.add_line(np.asarray(curve[0], np.float32),
-                                     x_axis=self.axis(), label="background",
-                                     color="#a6e3a1", linewidth=1.8)
+            if self._line is None:
+                self._line = p1.add_line(y, x_axis=self.axis(),
+                                         label="background",
+                                         color="#a6e3a1", linewidth=1.8)
+            else:
+                # UPDATE IN PLACE. Removing and re-adding the line every drag
+                # frame is heavy AND does not repaint during the drag — the
+                # curve simply does not follow the band. Same lesson as the fit
+                # preview's `rebuild_lines` vs `refresh_lines`.
+                self._line.set_data(y)
         except Exception as e:
             log.debug("drawing the background preview failed: %s", e)
-        self.emit_state()
+        if not live:
+            self.emit_state()
 
     def emit_state(self, status: str | None = None) -> None:
         lo, hi = self.window or self.default_window()
