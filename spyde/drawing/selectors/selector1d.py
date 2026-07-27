@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Union, List
 
 from spyde.drawing.selectors.base_selector import (
     BaseSelector,
+    DEFAULT_REGION_EXTENT_PER_DIM,
     IntegratingSelectorMixin,
     MAX_REGION_EXTENT_PER_DIM,
     event_handler_fn,
@@ -106,6 +107,10 @@ class LinearRegionSelector(BaseSelector):
         self._widget = None
         self.roi = None
         self._roi_trace = None          # built lazily on the first pointer event
+        # False while the span still holds its arbitrary construction geometry;
+        # set once seed_default_span or a real drag has positioned it. See
+        # seed_default_span for why geometry alone can't answer this.
+        self._span_seeded = False
         plot1d = self._get_plot1d()
         if plot1d is not None:
             try:
@@ -134,6 +139,9 @@ class LinearRegionSelector(BaseSelector):
         return getattr(plot, "_plot1d", None) if plot is not None else None
 
     def _on_pointer_up(self, event):
+        # A real drag has positioned the span — stop treating it as unseeded, so
+        # toggling integrate off and on keeps the width the user chose.
+        self._span_seeded = True
         before = self._spans()
         self._clamp_extent()
         after = self._spans()
@@ -213,6 +221,76 @@ class LinearRegionSelector(BaseSelector):
                     self._widget.x0 = hi
         except Exception as e:
             logger.debug("clamping region span extent failed: %s", e)
+
+    def _nav_size(self) -> int | None:
+        """Number of positions on this axis, or None if not resolvable yet.
+
+        Read from ``signal_axes[0]``, matching :func:`_signal_axis` — this selector
+        lives on the 1-D NAVIGATOR plot, whose *signal* axis is the movie's time
+        axis. Reading ``navigation_axes[0]`` here returned nothing, so the seed
+        could not clamp and put an 8-frame span on a 5-frame movie.
+        """
+        try:
+            sig = self.current_plot.plot_state.current_signal
+            return int(sig.axes_manager.signal_axes[0].size)
+        except Exception:
+            return None
+
+    def seed_default_span(self, centre_index: float | None = None) -> bool:
+        """Give the span a sensible starting geometry, centred on ``centre_index``.
+
+        Called when integrate mode is switched ON. The widget is BUILT before the
+        signal attaches, so its constructor geometry (x0=0, x1=10 in DATA units)
+        means nothing once the axis is calibrated — on a 0.05 s/frame movie it is
+        the whole recording. And `max_extent` only constrains interactive drags,
+        so nothing clamped it either: the drawn box covered everything while
+        `_get_selected_indices` capped the READ at MAX_REGION_EXTENT_PER_DIM, so
+        the region shown and the frame displayed disagreed.
+
+        Reseeds while the span still holds its CONSTRUCTION geometry, and
+        afterwards only if the span has become unusable (wider than the cap, empty,
+        or entirely off the data) — so a width the user chose survives toggling
+        integrate off and back on. Returns True if it reseeded.
+
+        The "has the user positioned this yet?" question cannot be answered from
+        the numbers alone: on an UNCALIBRATED axis (scale 1.0) the constructor's
+        x0=0/x1=10 is a perfectly plausible 10-frame span, so a geometry-only test
+        would accept it and leave the arbitrary default in place. Hence the flag.
+        """
+        if self._widget is None:
+            return False
+        try:
+            scale, offset = _signal_axis(self)
+            if not scale:
+                return False
+            n = self._nav_size()
+            x0, x1 = float(self._widget.x0), float(self._widget.x1)
+            lo, hi = (x0, x1) if x0 <= x1 else (x1, x0)
+            span_idx = abs(hi - lo) / abs(scale)
+            first = (lo - offset) / scale
+            usable = (0 < span_idx <= MAX_REGION_EXTENT_PER_DIM
+                      and (n is None or (first < n and first + span_idx > 0)))
+            if usable and self._span_seeded:
+                return False
+
+            width = min(DEFAULT_REGION_EXTENT_PER_DIM,
+                        MAX_REGION_EXTENT_PER_DIM if n is None else max(1, n))
+            if centre_index is None:
+                centre_index = first + span_idx / 2.0
+            start = centre_index - width / 2.0
+            if n is not None:
+                start = max(0.0, min(float(n) - width, start))
+            start = max(0.0, float(int(round(start))))
+            self._widget.x0 = offset + start * scale
+            self._widget.x1 = offset + (start + width) * scale
+            self._span_seeded = True
+            logger.info(
+                "[ROI] seeded default integrating span: %d frames at index %d "
+                "(was %.3g frames)", width, int(start), span_idx)
+            return True
+        except Exception as e:
+            logger.debug("seeding the default span failed: %s", e)
+            return False
 
     def _get_selected_indices(self) -> np.ndarray:
         if self._widget is None:
@@ -324,6 +402,12 @@ class IntegratingSelector1D(IntegratingSelectorMixin):
 
     def set_integrating(self, enabled: bool) -> None:
         if enabled:
+            # Seed the span BEFORE showing it, so the first frame the user sees is
+            # already a sensible width instead of the whole recording. Centred on
+            # wherever the crosshair was, which is the position they were looking
+            # at. No-op if the span is already usable (see seed_default_span).
+            self._linear_region_selector.seed_default_span(
+                centre_index=self._crosshair_index())
             if self._inf_line_selector._widget is not None:
                 try:
                     self._inf_line_selector._widget.hide()
@@ -357,6 +441,21 @@ class IntegratingSelector1D(IntegratingSelectorMixin):
         except Exception as e:
             logger.debug("pushing 1-D panel overlay state failed: %s", e)
         self.selector.delayed_update_data(force=True)
+
+    def _crosshair_index(self) -> float | None:
+        """The single-index selector's current nav index, so switching to
+        integrate centres the region where the user was already looking."""
+        try:
+            w = self._inf_line_selector._widget
+            if w is None:
+                return None
+            scale, offset = _signal_axis(self._inf_line_selector)
+            if not scale:
+                return None
+            return (float(w.x) - offset) / scale
+        except Exception as e:
+            logger.debug("reading the crosshair index failed: %s", e)
+            return None
 
     def hide(self) -> None:
         self._inf_line_selector.hide()

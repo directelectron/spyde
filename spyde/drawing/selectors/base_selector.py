@@ -27,6 +27,16 @@ logger = logging.getLogger(__name__)
 # See selector1d.LinearRegionSelector / selector2d.RectangleSelector.
 MAX_REGION_EXTENT_PER_DIM = 16
 
+# Width an integrating region STARTS at, per navigation dimension, when it is
+# first switched on. Not the same concern as the cap above: the cap stops a region
+# growing without bound, while this decides what you get before you have dragged
+# anything. Without it the 1-D span kept its construction geometry (x0=0, x1=10 in
+# DATA units), which on a calibrated movie axis is the whole recording — the box
+# claimed to integrate everything while _get_selected_indices quietly capped the
+# READ at MAX_REGION_EXTENT_PER_DIM, so the drawn region and the displayed frame
+# disagreed. Comfortably under the cap so the first drag can grow OR shrink.
+DEFAULT_REGION_EXTENT_PER_DIM = 8
+
 import os as _os
 # Per-frame navigator trace logs are gated behind this (they fire on every
 # crosshair move and flood the IPC log/panel at DEBUG, which adds real lag).

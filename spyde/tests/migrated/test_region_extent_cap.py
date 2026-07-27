@@ -12,7 +12,9 @@ import time
 import numpy as np
 import hyperspy.api as hs
 
-from spyde.drawing.selectors.base_selector import MAX_REGION_EXTENT_PER_DIM
+from spyde.drawing.selectors.base_selector import (
+    DEFAULT_REGION_EXTENT_PER_DIM, MAX_REGION_EXTENT_PER_DIM,
+)
 
 
 def _make_4d_session():
@@ -115,6 +117,126 @@ class TestRegionExtentCap:
             idx = region._get_selected_indices()
             assert idx.ndim == 2 and idx.shape[1] == 1
             assert idx.shape[0] <= MAX_REGION_EXTENT_PER_DIM
+        finally:
+            sess.shutdown()
+
+
+class TestDefaultSpanOnFirstIntegrate:
+    """Switching to integrate mode for the FIRST time must give a small region,
+    not the whole recording.
+
+    The 1-D span widget is constructed before the signal attaches, with x0=0 and
+    x1=10 in DATA units. On a calibrated movie axis (0.05 s/frame) that is the
+    entire 4-second recording, and nothing clamped it: `max_extent` only governs
+    interactive drags, so the box covered everything while _get_selected_indices
+    quietly capped the READ at MAX_REGION_EXTENT_PER_DIM — the drawn region and
+    the displayed frame disagreed.
+    """
+
+    @staticmethod
+    def _movie_session(scale=0.05, n=80):
+        from spyde.backend.session import Session
+        s = hs.signals.Signal2D(
+            np.random.RandomState(2).rand(n, 8, 8).astype(np.float32))
+        tax = s.axes_manager.navigation_axes[0]
+        tax.name, tax.units, tax.scale = "time", "s", scale
+        sess = Session(n_workers=1, threads_per_worker=1)
+        sess._add_signal(s, source_path=None)
+        time.sleep(0.7)
+        return sess
+
+    def test_first_integrate_gives_the_default_width_not_the_whole_axis(self):
+        sess = self._movie_session()
+        try:
+            comp = _composite(sess)
+            region = comp._linear_region_selector
+            # As built: the full-axis span that caused the bug.
+            assert region._widget is not None
+            comp.set_integrating(True)
+            idx = region._get_selected_indices()
+            assert idx.shape[0] == DEFAULT_REGION_EXTENT_PER_DIM, (
+                f"first integrate produced {idx.shape[0]} frames, expected "
+                f"{DEFAULT_REGION_EXTENT_PER_DIM}")
+            assert idx.shape[0] < MAX_REGION_EXTENT_PER_DIM, \
+                "the default must leave room to grow as well as shrink"
+        finally:
+            sess.shutdown()
+
+    def test_the_drawn_span_matches_the_frames_actually_read(self):
+        """The real defect: the box said 'everything', the read said 16."""
+        sess = self._movie_session()
+        try:
+            comp = _composite(sess)
+            region = comp._linear_region_selector
+            comp.set_integrating(True)
+            from spyde.drawing.selectors.selector1d import _signal_axis
+            scale, offset = _signal_axis(region)
+            w = region._widget
+            drawn = abs(float(w.x1) - float(w.x0)) / abs(scale)
+            read = region._get_selected_indices().shape[0]
+            assert abs(drawn - read) <= 1, (
+                f"the drawn span covers {drawn:g} frames but the read uses "
+                f"{read} — the region shown disagrees with the frame displayed")
+        finally:
+            sess.shutdown()
+
+    def test_it_centres_on_the_crosshair(self):
+        sess = self._movie_session()
+        try:
+            comp = _composite(sess)
+            line, region = comp._inf_line_selector, comp._linear_region_selector
+            from spyde.drawing.selectors.selector1d import _signal_axis
+            scale, offset = _signal_axis(line)
+            line._widget.x = offset + 40 * scale       # park the crosshair at 40
+            comp.set_integrating(True)
+            idx = region._get_selected_indices().ravel()
+            centre = (int(idx.min()) + int(idx.max())) / 2.0
+            assert abs(centre - 40) <= 1.5, (
+                f"region centred at {centre}, expected ~40 (the crosshair)")
+        finally:
+            sess.shutdown()
+
+    def test_a_usable_span_survives_toggling_off_and_on(self):
+        """Only an UNUSABLE span gets reseeded — a width the user chose must not
+        be thrown away by toggling the mode."""
+        sess = self._movie_session()
+        try:
+            comp = _composite(sess)
+            region = comp._linear_region_selector
+            comp.set_integrating(True)
+            from spyde.drawing.selectors.selector1d import _signal_axis
+            scale, offset = _signal_axis(region)
+            region._widget.x0 = offset + 10 * scale     # user picks 3 frames
+            region._widget.x1 = offset + 13 * scale
+            comp.set_integrating(False)
+            comp.set_integrating(True)
+            idx = region._get_selected_indices().ravel()
+            assert int(idx.min()) == 10 and idx.shape[0] == 3, (
+                f"the user's 3-frame span at 10 was reseeded to "
+                f"{idx.shape[0]} frames at {int(idx.min())}")
+        finally:
+            sess.shutdown()
+
+    def test_a_short_movie_cannot_seed_past_the_end(self):
+        sess = self._movie_session(n=5)
+        try:
+            comp = _composite(sess)
+            comp.set_integrating(True)
+            idx = comp._linear_region_selector._get_selected_indices().ravel()
+            assert int(idx.min()) >= 0 and int(idx.max()) <= 4, \
+                f"seeded span {idx.min()}..{idx.max()} runs off a 5-frame movie"
+        finally:
+            sess.shutdown()
+
+    def test_uncalibrated_axis_still_gets_the_default(self):
+        """scale=1.0 is the case the old x1=10 accidentally almost worked for —
+        make sure the fix does not regress it."""
+        sess = self._movie_session(scale=1.0)
+        try:
+            comp = _composite(sess)
+            comp.set_integrating(True)
+            idx = comp._linear_region_selector._get_selected_indices()
+            assert idx.shape[0] == DEFAULT_REGION_EXTENT_PER_DIM
         finally:
             sess.shutdown()
 
