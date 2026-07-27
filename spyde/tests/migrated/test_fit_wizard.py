@@ -615,3 +615,68 @@ class TestParameterEditsMoveTheHandles:
                                       "parameter": "centre", "value": 30.0})
         assert wiz._widgets["Gaussian"]["point"] is sentinel, \
             "handles were torn down and rebuilt by a value edit"
+
+
+class TestFitsWhatIsOnScreen:
+    """"Fit spectrum" must fit the spectrum being DISPLAYED.
+
+    `plot.current_data` is the authority — it is the array the plot is showing,
+    already resolved through whatever navigator or region path produced it.
+    Reconstructing it from `signal.data` plus a navigator index failed in the
+    worst way available: it fell through to the mean over navigation, so the
+    fit converged happily against a spectrum nobody was looking at and the
+    drawn model came out at about half the data's height with "converged"
+    beside it.
+    """
+
+    def test_uses_the_painted_spectrum(self, window, fitted):
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        wiz = tree._fit_wizard
+        painted = np.linspace(1.0, 2.0, len(wiz.axis()))
+        plot.current_data = painted
+        np.testing.assert_allclose(wiz.current_spectrum(), painted)
+
+    def test_does_not_silently_use_the_navigation_mean(self, window, fitted):
+        """The specific failure. The mean is a fine PREVIEW stand-in before the
+        first frame lands, but once something is painted it must win."""
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        wiz = tree._fit_wizard
+        nav_mean = np.asarray(wiz.signal.data, float).reshape(
+            -1, len(wiz.axis())).mean(0)
+        plot.current_data = np.asarray(wiz.signal.data, float)[0, 0]
+        got = wiz.current_spectrum()
+        assert not np.allclose(got, nav_mean), \
+            "fell back to the navigation mean despite painted data"
+        np.testing.assert_allclose(got, np.asarray(wiz.signal.data, float)[0, 0])
+
+    def test_ignores_a_stale_shape(self, window, fitted):
+        """current_data can hold a dask Future or a differently-shaped frame
+        mid-transition; neither is this signal's spectrum."""
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        wiz = tree._fit_wizard
+        for bad in (object(), np.zeros((4, 4)), np.zeros(7)):
+            plot.current_data = bad
+            assert len(wiz.current_spectrum()) == len(wiz.axis())
+
+    def test_fit_current_matches_the_displayed_pixel(self, window, fitted):
+        """End to end: the fitted amplitude must track the pixel on screen, not
+        an average of the scan."""
+        from spyde.actions.fit_action import fit_current
+        session, plot, tree, amp = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Offset"})
+        fit_add_component(session, plot, {"kind": "Gaussian"})
+        wiz = tree._fit_wizard
+        wiz.spec["Gaussian"]["centre"].value = 25.0
+        wiz.spec["Gaussian"]["sigma"].value = 3.0
+
+        # The BRIGHTEST pixel — its amplitude is well above the scan mean, so a
+        # fit against the mean cannot pass this.
+        iy, ix = np.unravel_index(int(np.argmax(amp)), amp.shape)
+        plot.current_data = np.asarray(wiz.signal.data, float)[iy, ix]
+        fit_current(session, plot, {})
+        assert wiz.spec["Gaussian"]["A"].value == pytest.approx(
+            float(amp[iy, ix]), rel=0.05)

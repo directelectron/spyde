@@ -165,20 +165,35 @@ class FitWizard(WizardController):
         return np.asarray(self.signal.axes_manager.signal_axes[0].axis, float)
 
     def current_spectrum(self) -> np.ndarray:
-        """The spectrum under the navigator right now — what the preview fits.
+        """The spectrum ON SCREEN — what the preview and "Fit spectrum" fit.
 
-        Falls back to the mean over navigation when there is no navigator
-        position yet, which is better than an arbitrary corner pixel.
+        ``plot.current_data`` is the authority: it is literally the array the
+        plot is displaying, already resolved through whatever navigator,
+        region-integration or derived-view path produced it.
+
+        Reconstructing it instead from ``signal.data`` and a navigator index was
+        wrong in a way that LOOKED like it worked. The index was not where this
+        expected, so it silently fell through to the mean over navigation — the
+        fit then converged happily against a spectrum nobody was looking at, and
+        the drawn model came out about half the height of the data with a
+        "converged" status next to it.
         """
-        data = self.signal.data
-        idx = getattr(self.plot, "current_indices", None)
-        try:
-            if idx is not None and np.ndim(data) > 1:
-                return np.asarray(data[tuple(int(i) for i in idx)], float)
-        except Exception as e:
-            log.debug("reading the current spectrum failed: %s", e)
-        arr = np.asarray(data, float)
-        return arr.reshape(-1, arr.shape[-1]).mean(0)
+        n = len(self.axis())
+        data = getattr(self.plot, "current_data", None)
+        if isinstance(data, np.ndarray):
+            arr = np.asarray(data, float).squeeze()
+            if arr.ndim == 1 and arr.size == n:
+                return arr
+
+        # No painted data yet (the caret can open before the first frame
+        # lands). The nav mean is a defensible stand-in for a PREVIEW, and the
+        # log line says so, because a fit against it is not what was asked for.
+        raw = np.asarray(self.signal.data, float)
+        if raw.ndim > 1:
+            log.debug("no painted spectrum yet — falling back to the "
+                      "navigation mean")
+            return raw.reshape(-1, raw.shape[-1]).mean(0)
+        return raw
 
     # ── live preview: ONE LINE PER COMPONENT + a sum line ─────────────────
     # Follows anyplotlib's interactive-fitting example. Two things there that
