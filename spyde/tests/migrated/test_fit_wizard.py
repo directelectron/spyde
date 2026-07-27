@@ -191,12 +191,15 @@ class TestDragHandles:
         from spyde.actions.fit_action import _DRAG, _amp_from_height
         assert _amp_from_height(_DRAG["GaussianHF"], 5.0, 2.0) == 5.0
 
-    def test_only_positioned_components_get_handles(self):
-        """A background has nothing on the plot to point at."""
-        from spyde.actions.fit_action import _DRAG
-        assert "Gaussian" in _DRAG and "Lorentzian" in _DRAG
-        for background in ("Offset", "PowerLaw", "Polynomial", "Exponential"):
-            assert background not in _DRAG
+    def test_every_offered_component_has_handles(self):
+        """No component is editable only through the caret's number boxes.
+
+        A background has no peak to point at, so it takes the ANCHOR route
+        instead of the point/range pair — but it does take one.
+        """
+        from spyde.actions.fit_action import _ANCHORS, _DRAG
+        for kind, _description in CATALOGUE:
+            assert kind in _DRAG or kind in _ANCHORS, kind
 
     def test_every_drag_target_names_real_parameters(self):
         """A typo in the drag table would silently disable the handles for that
@@ -286,6 +289,297 @@ class TestDragHandles:
         after_h = _height_from_amp(info, comp["A"].value, comp["sigma"].value)
         assert after_h == pytest.approx(before_h, rel=1e-6)
         assert comp["sigma"].value != pytest.approx(before_sigma)
+
+
+class TestBackgroundAnchors:
+    """Backgrounds get handles too — anchor points on the curve.
+
+    The contract is that the curve passes THROUGH the handle you are holding,
+    exactly. A curve that lands near your cursor rather than under it reads as
+    broken, so these assert to 1e-9, not to a tolerance.
+    """
+
+    @pytest.mark.parametrize("kind", ["Offset", "Polynomial", "PowerLaw",
+                                      "Exponential"])
+    def test_dragging_an_anchor_puts_the_curve_under_it(self, window, fitted,
+                                                        kind):
+        from spyde.actions.fit_action import evaluate_component
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": kind})
+        wiz = tree._fit_wizard
+        name = wiz.spec.components[-1].name
+        comp = wiz.spec[name]
+        entry = wiz._widgets[name]
+
+        x0 = entry["at"][0]
+        target = float(evaluate_component(comp, [x0])[0]) * 1.7
+        wiz._on_widget_drag(name, "anchor:0", {"x": x0, "y": target})
+
+        assert float(evaluate_component(comp, [x0])[0]) == pytest.approx(
+            target, rel=1e-9)
+
+    @pytest.mark.parametrize("kind", ["PowerLaw", "Exponential"])
+    def test_the_anchor_you_are_not_holding_stays_put(self, window, fitted,
+                                                      kind):
+        """Two anchors determine both parameters exactly. If the solve only
+        used the dragged one the curve would pivot out from under the other."""
+        from spyde.actions.fit_action import evaluate_component
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": kind})
+        wiz = tree._fit_wizard
+        name = wiz.spec.components[-1].name
+        comp = wiz.spec[name]
+        entry = wiz._widgets[name]
+
+        x0, x1 = entry["at"]
+        held = float(evaluate_component(comp, [x1])[0])
+        wiz._on_widget_drag(
+            name, "anchor:0",
+            {"x": x0, "y": float(evaluate_component(comp, [x0])[0]) * 2.0})
+
+        assert float(evaluate_component(comp, [x1])[0]) == pytest.approx(
+            held, rel=1e-9)
+
+    def test_a_background_gets_widgets_on_the_plot(self, window, fitted):
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "PowerLaw"})
+        wiz = tree._fit_wizard
+        entry = wiz._widgets[wiz.spec.components[-1].name]
+        assert len(entry["anchors"]) == 2
+
+    def test_a_nonsense_drag_leaves_the_model_alone(self, window, fitted):
+        """A power law is undefined at y<=0. Solving anyway would write a nan
+        into the model and every curve afterwards would vanish."""
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "PowerLaw"})
+        wiz = tree._fit_wizard
+        name = wiz.spec.components[-1].name
+        before = [p.value for p in wiz.spec[name].scalar_parameters]
+        wiz._on_widget_drag(name, "anchor:0",
+                            {"x": wiz._widgets[name]["at"][0], "y": -5.0})
+        assert [p.value for p in wiz.spec[name].scalar_parameters] == before
+
+    def test_anchors_follow_a_parameter_edit(self, window, fitted):
+        """Typing a value in the caret must move the handles onto the new
+        curve, the same way it does for a gaussian."""
+        from spyde.actions.fit_action import evaluate_component
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Offset"})
+        wiz = tree._fit_wizard
+        name = wiz.spec.components[-1].name
+        fit_set_param(session, plot, {"component": name, "parameter": "offset",
+                                      "value": 123.0})
+        widget = wiz._widgets[name]["anchors"][0]
+        assert widget.get("y") == pytest.approx(123.0)
+        assert evaluate_component(wiz.spec[name], [0.0])[0] == pytest.approx(123.0)
+
+
+class TestBackgroundSeeding:
+    """A new background arrives ON the data.
+
+    Found in the app, invisible here until these existed: a PowerLaw was
+    seeded with `origin` at the axis MIDPOINT (the rule that puts a gaussian's
+    centre there also matched `origin`), so it was identically zero over the
+    left half of the spectrum and its anchors sat outside its own domain. The
+    two obvious repairs both failed at the other end — scaling by peak matches
+    a power law's singular left edge and leaves ~3e-5 everywhere else; scaling
+    by median level puts 3.7e10 at that same edge. A background needs its
+    SHAPE solved from the data, which is what `seed_background` does.
+    """
+
+    @staticmethod
+    def _spectrum():
+        x = np.linspace(0.0, 102.3, 1024)
+        y = (1000 * np.exp(-0.5 * ((x - 40) / 6.0) ** 2)
+             + 800 * np.exp(-0.5 * ((x - 60) / 9.0) ** 2)
+             + 300 * np.exp(-x / 30.0) + 5.0)
+        return x, y
+
+    @pytest.mark.parametrize("kind", ["PowerLaw", "Exponential", "Offset",
+                                      "Polynomial"])
+    def test_a_seeded_background_is_the_same_size_as_the_data(self, kind):
+        from spyde.actions.fit_action import (
+            evaluate_component, new_component_spec, seed_background,
+            _seed_for_preview,
+        )
+        x, y = self._spectrum()
+        cspec = new_component_spec(kind, 2 if kind == "Polynomial" else None)
+        _seed_for_preview(cspec, float(x[0]), float(x[-1]))
+        assert seed_background(cspec, x, y) is True
+        curve = evaluate_component(cspec, x)
+        assert np.isfinite(curve).all(), f"{kind} seeded to a non-finite curve"
+        # Within an order of magnitude of the data at both ends — the two
+        # failures this replaced were 5 orders low and 7 orders high.
+        assert 0.1 * np.median(y) < np.max(curve) < 10 * np.max(y), kind
+
+    def test_a_background_is_not_seeded_onto_a_peak(self):
+        """The single anchor of a flat background sits mid-axis, which on this
+        spectrum is a peak. Sampling there seeded an Offset at 734 against a
+        baseline of 17."""
+        from spyde.actions.fit_action import (
+            new_component_spec, seed_background,
+        )
+        x, y = self._spectrum()
+        cspec = new_component_spec("Offset")
+        assert seed_background(cspec, x, y)
+        baseline = float(np.percentile(y, 5))
+        assert cspec["offset"].value < 4 * baseline
+
+    def test_a_peak_is_not_treated_as_a_background(self):
+        from spyde.actions.fit_action import new_component_spec, seed_background
+        x, y = self._spectrum()
+        assert seed_background(new_component_spec("Gaussian"), x, y) is False
+
+    def test_flat_data_cannot_fix_an_exponential(self):
+        """Two equal points do not determine tau. Returning True there would
+        leave nan in the model; returning False sends the caller to
+        `scale_to_data`, which at least makes it visible."""
+        from spyde.actions.fit_action import new_component_spec, seed_background
+        x = np.linspace(0.0, 20.0, 512)
+        assert seed_background(new_component_spec("Exponential"), x,
+                               np.full_like(x, 30.0)) is False
+
+    def test_a_power_law_keeps_hyperspys_origin_when_it_can(self):
+        """origin=0 is the convention every downstream tool assumes; it is
+        only moved when the axis would otherwise contain the singularity."""
+        from spyde.actions.fit_action import new_component_spec, seed_background
+        e = np.linspace(200.0, 800.0, 512)
+        cspec = new_component_spec("PowerLaw")
+        seed_background(cspec, e, 5e6 * e ** -3.2 + 20)
+        assert cspec["origin"].value == 0.0
+        assert cspec["origin"].free is False
+
+    def test_adding_a_background_puts_its_handles_on_the_curve(self, window,
+                                                               fitted):
+        """The end-to-end version: the handles must not start at y=0."""
+        from spyde.actions.fit_action import evaluate_component
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "PowerLaw"})
+        wiz = tree._fit_wizard
+        name = wiz.spec.components[-1].name
+        entry = wiz._widgets[name]
+        ys = evaluate_component(wiz.spec[name], entry["at"])
+        assert all(v > 0 for v in ys), "a background arrived flat on the axis"
+
+
+class TestHandlesStayOnTheComponent:
+    """Every handle sits on the curve, INCLUDING mid-drag.
+
+    Updating the partner only on release left it where the drag started while
+    the curve moved out from under it, so the handles drifted off the component
+    and snapped back when you let go.
+    """
+
+    def test_the_range_band_tracks_a_live_point_drag(self, window, fitted):
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Gaussian"})
+        wiz = tree._fit_wizard
+        band = wiz._widgets["Gaussian"]["range"]
+
+        wiz._on_widget_drag("Gaussian", "point", {"x": 40.0, "y": 3.0},
+                            live=True)
+
+        centre = (band.get("x0") + band.get("x1")) / 2.0
+        assert centre == pytest.approx(40.0), "the band lagged behind the point"
+
+    def test_the_point_tracks_a_live_width_drag(self, window, fitted):
+        from spyde.actions.fit_action import _DRAG, _height_from_amp
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Gaussian"})
+        wiz = tree._fit_wizard
+        point = wiz._widgets["Gaussian"]["point"]
+
+        wiz._on_widget_drag("Gaussian", "range", {"x0": 10.0, "x1": 30.0},
+                            live=True)
+
+        comp = wiz.spec["Gaussian"]
+        assert point.get("x") == pytest.approx(20.0)
+        assert point.get("y") == pytest.approx(_height_from_amp(
+            _DRAG["Gaussian"], comp["A"].value, comp["sigma"].value))
+
+    def test_the_handle_being_dragged_is_not_written_back(self, window, fitted):
+        """Writing a position back to the handle under the user's finger fights
+        the drag — it is the one thing update_widgets must skip."""
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Gaussian"})
+        wiz = tree._fit_wizard
+        point = wiz._widgets["Gaussian"]["point"]
+        point.set(x=-999.0, y=-999.0)      # where the widget thinks it is
+
+        wiz.update_widgets(skip="point")
+
+        assert point.get("x") == -999.0
+
+    def test_a_live_drag_still_does_not_re_send_the_model(self, window, fitted):
+        """The partner handle is a targeted widget push; `fit_state` is the
+        whole model. Only the cheap one belongs on the pointer path."""
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Gaussian"})
+        wiz = tree._fit_wizard
+        before = len(_messages_of(window, "fit_state"))
+        wiz._on_widget_drag("Gaussian", "point", {"x": 30.0}, live=True)
+        assert len(_messages_of(window, "fit_state")) == before
+
+
+class TestSpecsAreBuiltOnce:
+    """Constructing a hyperspy component costs 20-110 ms of sympy lambdify and
+    the structure of a kind never changes, so it is read once per process."""
+
+    def test_the_prototype_is_shared(self):
+        from spyde.actions.fit_action import prototype
+        assert prototype("Gaussian") is prototype("Gaussian")
+
+    def test_each_caller_gets_its_own_spec(self):
+        """Shared PROTOTYPE, independent SPEC — two Gaussians in one model must
+        not share parameter objects, or moving one moves the other."""
+        from spyde.actions.fit_action import new_component_spec
+        a, b = new_component_spec("Gaussian"), new_component_spec("Gaussian")
+        assert a is not b and a["centre"] is not b["centre"]
+        a["centre"].value = 42.0
+        assert b["centre"].value != 42.0
+
+    def test_a_polynomial_keeps_its_order(self):
+        from spyde.actions.fit_action import new_component_spec
+        assert len(new_component_spec("Polynomial", 4).scalar_parameters) == 5
+        assert len(new_component_spec("Polynomial", 2).scalar_parameters) == 3
+
+    def test_the_catalogue_is_cached_per_axis(self):
+        """Reopening the caret on the same signal must cost nothing."""
+        x = np.linspace(0.0, 50.0, 128)
+        first = component_catalogue(x)
+        assert component_catalogue(x) is first
+        assert component_catalogue(np.linspace(0.0, 900.0, 128)) is not first
+
+    def test_the_background_wizard_shares_the_cache(self, window, fitted):
+        """Same specs, one build — the two wizards offer the same components."""
+        from spyde.actions import background_action, fit_action
+        calls = []
+        real = fit_action.new_component_spec
+
+        def counted(kind, order=None):
+            calls.append(kind)
+            return real(kind, order)
+
+        fit_action.new_component_spec = counted
+        try:
+            session, plot, tree, _ = fitted
+            background_action.bg_open(session, plot, {})
+            wiz = tree._bg_wizard
+            wiz.model_kind = "PowerLaw"
+            wiz.build_spec()
+        finally:
+            fit_action.new_component_spec = real
+        assert "PowerLaw" in calls
 
 
 class TestBuildingTheModel:

@@ -101,13 +101,13 @@ class BackgroundWizard(WizardController):
         The channel mask is what makes the fit use only the window; the same
         spec then evaluates over the FULL axis to give the curve to subtract.
         """
-        import hyperspy.components1d as c1d
         from spyde.fitting import ModelSpec
-        from spyde.fitting.spec import spec_from_component
+        from spyde.actions.fit_action import new_component_spec
 
-        comp = (c1d.Polynomial(order=2) if self.model_kind == "Polynomial"
-                else getattr(c1d, self.model_kind)())
-        cspec = spec_from_component(comp)
+        # Shared with the Fit caret's picker: the spec for a kind is read off
+        # one prototype per process, not rebuilt on every window drag.
+        cspec = new_component_spec(
+            self.model_kind, 2 if self.model_kind == "Polynomial" else None)
         spec = ModelSpec(components=[cspec])
 
         x = self.axis()

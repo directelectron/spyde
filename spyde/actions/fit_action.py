@@ -60,6 +60,64 @@ CATALOGUE = [
 
 _PREVIEW_POINTS = 64
 
+# ── build hyperspy components ONCE ───────────────────────────────────────────
+# Constructing one costs ~23 ms, because hyperspy's Expression components run
+# their formula through sympy and lambdify it on every instantiation — there is
+# no caching upstream. Building the nine-component palette therefore cost 6.2 s
+# on the first caret open and ~130 ms on every one after, which is what "the
+# fitting is slow" actually was: the caret opening, not the fit.
+#
+# These are read-only TEMPLATES. `spec_from_component` only reads them, and
+# every caller turns the result into its own ComponentSpec dataclass, so a
+# shared instance is safe. Nothing may mutate one — a parameter written here
+# would leak into every component added afterwards.
+_PROTOTYPES: dict[str, object] = {}
+# The ComponentSpec read off each prototype — the structure of a kind never
+# changes, so this is read once and deep-copied per use.
+_SPECS: dict[str, object] = {}
+# Sampled palette shapes, keyed by the axis they were sampled on.
+_CATALOGUE_CACHE: dict[tuple, list] = {}
+
+
+def prototype(kind: str, order: int | None = None):
+    """A shared, read-only hyperspy component of *kind*.
+
+    Racy by design: two threads asking at once may each build one and the
+    second overwrite the first in the dict. Both are equally valid read-only
+    templates, so the only cost is 20 ms of duplicated work — cheaper than a
+    lock on a path the catalogue worker and the caret both take.
+    """
+    key = kind if order is None else f"{kind}:{order}"
+    comp = _PROTOTYPES.get(key)
+    if comp is None:
+        import hyperspy.components1d as c1d
+        comp = (c1d.Polynomial(order=int(order if order is not None else 2))
+                if kind == "Polynomial" else getattr(c1d, kind)())
+        _PROTOTYPES[key] = comp
+    return comp
+
+
+def new_component_spec(kind: str, order: int | None = None):
+    """A FRESH ``ComponentSpec`` for *kind*, built from the shared prototype.
+
+    The single place anything in SpyDE turns a component NAME into a spec.
+    Everywhere that used to construct its own hyperspy component to read the
+    shape of one — the picker, "add component", the background wizard — comes
+    through here, so the ~20-80 ms build happens once per kind per process.
+
+    The returned spec is a deep copy and the caller owns it: it is about to get
+    a name, seeded values and a scale, and two components of the same kind in
+    one model must not share parameter objects.
+    """
+    from copy import deepcopy
+    from spyde.fitting.spec import spec_from_component
+    key = kind if order is None else f"{kind}:{order}"
+    cspec = _SPECS.get(key)
+    if cspec is None:
+        cspec = spec_from_component(prototype(kind, order))
+        _SPECS[key] = cspec
+    return deepcopy(cspec)
+
 # How each component maps onto the on-plot drag handles (#57).
 #
 #   pos    the parameter the POINT widget's x drives
@@ -83,6 +141,79 @@ _DRAG = {
 # Half-width of the RANGE widget, per width parameter, so the band a user drags
 # corresponds to something they recognise (a Gaussian's band is its FWHM).
 _WIDTH_TO_HALF = {"sigma": 1.1774, "gamma": 1.0, "fwhm": 0.5}
+
+# BACKGROUNDS get handles too, they just cannot use the peak/width pair — there
+# is no peak to point at. Instead they carry ANCHOR handles at fixed fractions
+# of the axis, and dragging one makes the curve pass through it. Two anchors
+# determine both parameters of a power law or an exponential exactly, which is
+# also how you would place one by eye: pin it at each end.
+#
+# `solve` names the closed form that turns the anchor positions back into
+# parameters. Least-squares would work for any number of anchors, but an exact
+# solve means the curve passes EXACTLY through the handle the user is holding —
+# a curve that lands near your cursor rather than under it reads as broken.
+_ANCHORS = {
+    "Offset":      {"at": (0.5,), "solve": "offset"},
+    "Polynomial":  {"at": (0.5,), "solve": "shift"},
+    "PowerLaw":    {"at": (0.25, 0.75), "solve": "powerlaw"},
+    "Exponential": {"at": (0.25, 0.75), "solve": "exponential"},
+}
+
+
+def evaluate_component(comp, xs) -> np.ndarray:
+    """A component's own curve at *xs*, through the torch components."""
+    import torch
+    from spyde.fitting import components as tcomp
+    vals = np.array([[p.value for p in comp.scalar_parameters]])
+    return tcomp.component_for(comp)(
+        torch.as_tensor(np.asarray(xs, float)),
+        torch.as_tensor(vals)).numpy()[0]
+
+
+def _clip_to_bounds(param, value: float, span: float = 50.0) -> float:
+    lo, hi = param.bounds()
+    return float(np.clip(value, max(lo, -span), min(hi, span)))
+
+
+def _solve_anchors(comp, kind: str, xs, ys) -> bool:
+    """Write parameters so the component passes through the anchor points.
+
+    False when the points do not determine the component — a power law needs
+    positive values inside its domain, an exponential needs two DIFFERENT
+    ones. Writing anyway would put a nan in the model and every curve drawn
+    afterwards would vanish.
+    """
+    solve = _ANCHORS[kind]["solve"]
+    if solve == "offset":
+        comp["offset"].value = float(ys[0])
+        return True
+    if solve == "shift":
+        # Move the whole polynomial vertically through its constant term. The
+        # higher coefficients are its SHAPE and are left to the fit — a single
+        # handle cannot determine order+1 coefficients, and pretending it can
+        # would make the curve lurch.
+        y_now = float(evaluate_component(comp, [xs[0]])[0])
+        comp["a0"].value = float(comp["a0"].value) + float(ys[0]) - y_now
+        return True
+
+    (x1, x2), (y1, y2) = (float(xs[0]), float(xs[1])), (float(ys[0]), float(ys[1]))
+    if solve == "powerlaw":
+        origin = float(comp["origin"].value)
+        d1, d2 = x1 - origin, x2 - origin
+        if d1 <= 0 or d2 <= 0 or y1 <= 0 or y2 <= 0 or d1 == d2:
+            return False                # outside the curve's domain
+        comp["r"].value = _clip_to_bounds(
+            comp["r"], math.log(y1 / y2) / math.log(d2 / d1))
+        comp["A"].value = float(y1 * d1 ** comp["r"].value)
+        return True
+    if solve == "exponential":
+        if y1 <= 0 or y2 <= 0 or x1 == x2 or y1 == y2:
+            return False
+        tau = (x2 - x1) / math.log(y1 / y2)
+        comp["tau"].value = float(tau)
+        comp["A"].value = float(y1 * math.exp(x1 / tau))
+        return True
+    return False
 
 
 def _amp_from_height(kind_info, height: float, width: float) -> float:
@@ -382,8 +513,14 @@ class FitWizard(WizardController):
 
     # ── on-plot drag handles (#57) ────────────────────────────────────────
     def sync_widgets(self) -> None:
-        """One POINT handle (centre + height) and one RANGE band (width) per
-        positioned component. Rebuilt when the component LIST changes.
+        """Give EVERY component handles. Rebuilt when the component LIST changes.
+
+        A positioned component (a peak, a step) gets a POINT handle for its
+        centre and height plus a RANGE band for its width. A background has no
+        peak to point at, so it gets ANCHOR points instead — see ``_ANCHORS``.
+        Either way there is something on the curve to grab, which is the point:
+        a component you can only edit through the caret's number boxes is a
+        component you cannot see yourself editing.
 
         Handles are kept as OBJECTS, not ids: the widget's own ``set()`` moves
         it and its drag event hands it back on ``event.source``, so the object
@@ -394,23 +531,33 @@ class FitWizard(WizardController):
             return
         self.clear_widgets()
         for i, comp in enumerate(self.spec.active_components):
-            info = _DRAG.get(comp.kind)
-            if info is None:
-                continue                  # a background has nothing to point at
+            colour = self._COMP_COLORS[i % len(self._COMP_COLORS)]
             try:
-                colour = self._COMP_COLORS[i % len(self._COMP_COLORS)]
-                pos, width, height = self._geometry(comp, info)
-                pw = p1.add_point_widget(pos, height, color=colour,
-                                         show_crosshair=False)
-                self._widgets[comp.name] = {"point": pw, "info": info}
-                self._wire(pw, comp.name, "point")
-                if info["width"]:
-                    half = width * _WIDTH_TO_HALF.get(info["width"], 1.0)
-                    rw = p1.add_range_widget(pos - half, pos + half,
-                                             y=height / 2.0, color=colour,
-                                             style="fwhm")
-                    self._widgets[comp.name]["range"] = rw
-                    self._wire(rw, comp.name, "range")
+                info = _DRAG.get(comp.kind)
+                if info is not None:
+                    pos, width, height = self._geometry(comp, info)
+                    pw = p1.add_point_widget(pos, height, color=colour,
+                                             show_crosshair=False)
+                    self._widgets[comp.name] = {"point": pw, "info": info}
+                    self._wire(pw, comp.name, "point")
+                    if info["width"]:
+                        half = width * _WIDTH_TO_HALF.get(info["width"], 1.0)
+                        rw = p1.add_range_widget(pos - half, pos + half,
+                                                 y=height / 2.0, color=colour,
+                                                 style="fwhm")
+                        self._widgets[comp.name]["range"] = rw
+                        self._wire(rw, comp.name, "range")
+                elif comp.kind in _ANCHORS:
+                    xs = self._anchor_x(comp)
+                    ys = self._eval_at(comp, xs)
+                    entry = {"anchors": [], "at": list(xs), "info": None}
+                    for j, (ax, ay) in enumerate(zip(xs, ys)):
+                        w = p1.add_point_widget(float(ax), float(ay),
+                                                color=colour,
+                                                show_crosshair=False)
+                        entry["anchors"].append(w)
+                        self._wire(w, comp.name, f"anchor:{j}")
+                    self._widgets[comp.name] = entry
             except Exception as e:
                 log.debug("adding drag handles for %s failed: %s", comp.name, e)
 
@@ -421,6 +568,16 @@ class FitWizard(WizardController):
                  else float(np.ptp(self.axis())) / 20.0)
         height = _height_from_amp(info, float(comp[info["amp"]].value), width)
         return pos, width, height
+
+    def _anchor_x(self, comp):
+        """Default x positions for a background's anchor handles."""
+        x = self.axis()
+        lo, hi = float(x[0]), float(x[-1])
+        return [lo + f * (hi - lo) for f in _ANCHORS[comp.kind]["at"]]
+
+    def _eval_at(self, comp, xs) -> np.ndarray:
+        """The component's own curve at *xs* — how the anchors stay ON it."""
+        return evaluate_component(comp, xs)
 
     def _wire(self, widget, name: str, role: str) -> None:
         """Register the drag handlers, MOVE and UP separately.
@@ -446,20 +603,35 @@ class FitWizard(WizardController):
         widget.add_event_handler(up, "pointer_up")
 
     def update_widgets(self, skip: str | None = None) -> None:
-        """MOVE the handles to match the model, in place.
+        """MOVE the handles back onto the curve, in place.
 
         Distinct from :meth:`sync_widgets`, which rebuilds. Rebuilding on every
         keystroke destroys and recreates every widget several times a second —
         they flicker, and one can vanish from under the cursor mid-reach.
         *skip* is the role being dragged: writing a position back to the handle
         under the user's finger fights the drag.
+
+        This runs DURING a drag as well as after it. Skipping it mid-drag left
+        the partner handle where the drag started while the curve moved out
+        from under it, so the handles drifted off the component and only
+        snapped back on release. A widget ``set`` is a TARGETED push of that
+        widget's few fields, not a plot re-render, so paying it per frame is
+        what keeps the handles glued on.
         """
         for comp in self.spec.active_components:
             entry = self._widgets.get(comp.name)
             if not entry:
                 continue
-            info = entry["info"]
             try:
+                if entry.get("anchors"):
+                    ys = self._eval_at(comp, entry["at"])
+                    for j, (w, ax) in enumerate(zip(entry["anchors"],
+                                                    entry["at"])):
+                        if skip == f"anchor:{j}":
+                            continue
+                        w.set(x=float(ax), y=float(ys[j]))
+                    continue
+                info = entry["info"]
                 pos, width, height = self._geometry(comp, info)
                 if skip != "point" and entry.get("point") is not None:
                     entry["point"].set(x=pos, y=height)
@@ -473,8 +645,9 @@ class FitWizard(WizardController):
     def clear_widgets(self) -> None:
         p1 = getattr(self.plot, "_plot1d", None)
         for entry in self._widgets.values():
-            for role in ("point", "range"):
-                w = entry.get(role)
+            widgets = [entry.get("point"), entry.get("range")]
+            widgets += entry.get("anchors") or []
+            for w in widgets:
                 if w is None or p1 is None:
                     continue
                 try:
@@ -499,14 +672,29 @@ class FitWizard(WizardController):
             src = getattr(event, "source", None) or event
             comp = self.spec[name]
             info = _DRAG.get(comp.kind)
-            if info is None:
-                return
 
             def get(k):
                 return (src.get(k) if isinstance(src, dict)
                         else getattr(src, k, None))
 
-            if role == "point":
+            if role.startswith("anchor:"):
+                entry = self._widgets.get(name)
+                if entry is None or comp.kind not in _ANCHORS:
+                    return
+                j = int(role.split(":", 1)[1])
+                x, y = get("x"), get("y")
+                if x is None or y is None:
+                    return
+                entry["at"][j] = float(x)
+                # The OTHER anchors stay where they are; solving through all of
+                # them together is what makes one handle move the curve without
+                # throwing the rest off it.
+                ys = list(self._eval_at(comp, entry["at"]))
+                ys[j] = float(y)
+                _solve_anchors(comp, comp.kind, entry["at"], ys)
+            elif info is None:
+                return
+            elif role == "point":
                 x, y = get("x"), get("y")
                 if x is not None:
                     comp[info["pos"]].value = float(x)
@@ -533,14 +721,14 @@ class FitWizard(WizardController):
                         info, height, float(comp[info["width"]].value))
 
             self.result = None          # the old fit no longer describes it
-            # DURING the drag: redraw the curve and nothing else. Moving the
-            # partner handle and re-sending the model both cross the IPC
-            # boundary, and doing either at pointer rate is what made the curve
-            # lag behind the cursor.
-            #
+            # Every frame: redraw the curve AND move the other handles onto it,
+            # so nothing drifts off the component mid-drag. What still waits for
+            # the release is `emit_state` — that one re-sends the entire model
+            # to the caret, and doing THAT at pointer rate is what made the
+            # curve lag behind the cursor.
             self.refresh_lines()
+            self.update_widgets(skip=role)
             if not live:
-                self.update_widgets(skip=role)
                 self.emit_state()
         except Exception as e:
             log.debug("fit widget drag failed: %s", e)
@@ -670,14 +858,18 @@ def component_catalogue(x: np.ndarray) -> list[dict]:
     from spyde.fitting.spec import spec_from_component
 
     lo, hi = float(np.min(x)), float(np.max(x))
+    # The shapes depend only on the axis they are sampled over, so reopening the
+    # caret on the same signal costs nothing.
+    cache_key = (round(lo, 6), round(hi, 6))
+    hit = _CATALOGUE_CACHE.get(cache_key)
+    if hit is not None:
+        return hit
+
     xs = np.linspace(lo, hi, _PREVIEW_POINTS)
     out = []
     for kind, description in CATALOGUE:
         try:
-            import hyperspy.components1d as c1d
-            comp = (c1d.Polynomial(order=2) if kind == "Polynomial"
-                    else getattr(c1d, kind)())
-            cspec = spec_from_component(comp)
+            cspec = new_component_spec(kind, 2 if kind == "Polynomial" else None)
             _seed_for_preview(cspec, lo, hi)
             n = len(cspec.scalar_parameters)
             batched = tcomp.get_component(kind, n_params=n)
@@ -690,6 +882,7 @@ def component_catalogue(x: np.ndarray) -> list[dict]:
                         "preview": [round(float(v), 4) for v in y]})
         except Exception as e:
             log.debug("preview for %s failed: %s", kind, e)
+    _CATALOGUE_CACHE[cache_key] = out
     return out
 
 
@@ -701,10 +894,16 @@ def scale_to_data(cspec, x: np.ndarray, y: np.ndarray, fraction: float = 0.5) ->
     at y=0, and the fit starts five orders of magnitude away from its answer.
     All three read as "the model does nothing".
 
-    Generic rather than per-component: evaluate the component with its linear
-    parameter at 1, then scale so its peak reaches *fraction* of the data's
-    range. Works for any component the batched library can evaluate, including
-    ones added later.
+    Evaluate the component with its linear parameter at 1, then scale so its
+    peak reaches *fraction* of the data's range.
+
+    A BACKGROUND does not go through here — see :func:`seed_background`.
+    Scaling one by its peak matches a power law's SINGULAR left edge (on an
+    axis starting at zero the unit curve peaks at 1/dx**r), which left the
+    background at ~3e-5 across the whole spectrum; scaling it by its median
+    level instead put 3.7e10 at that same edge and blew up the y-axis. Neither
+    is a scaling problem: a background needs its SHAPE seeded from the data,
+    not just its amplitude.
     """
     import torch
     from spyde.fitting import components as tcomp
@@ -727,6 +926,68 @@ def scale_to_data(cspec, x: np.ndarray, y: np.ndarray, fraction: float = 0.5) ->
         log.debug("scaling %s to the data failed: %s", cspec.kind, e)
 
 
+def seed_background(cspec, x: np.ndarray, y: np.ndarray) -> bool:
+    """Put a background ON the data, by solving it through two points of it.
+
+    The same closed form the anchor handles use (:func:`_solve_anchors`), fed
+    from the data instead of from the cursor — so a background arrives roughly
+    where the user would have dragged it, and its handles start on the curve
+    they are about to move.
+
+    This replaces seeding a shape constant and then scaling: with a fixed
+    ``r=3`` a power law spanning a decade of axis is far steeper than any real
+    background, so whichever amplitude you then choose it is either invisible
+    at one end or astronomical at the other. Fitting r to the data's own decay
+    is the only thing that gets both ends right.
+
+    Returns False if *cspec* is not a background, or if the data does not
+    determine one (flat data cannot fix an exponential's tau), so the caller
+    falls back to :func:`scale_to_data` and the component is at least visible.
+    """
+    if cspec.kind not in _ANCHORS:
+        return False
+    x = np.asarray(x, float)
+    ydata = np.asarray(y, float)
+    lo, hi = float(x[0]), float(x[-1])
+    # A LOW PERCENTILE over a WIDE window, not the local value or its median.
+    # A background belongs on the data's low envelope, and the anchor
+    # fractions land wherever they land: on this test spectrum the 50% anchor
+    # sits on a peak, and a median there seeded a flat background at 765 when
+    # the baseline was 5. A wide window is what steps past a peak; a low
+    # percentile is what ignores the part of it still inside the window.
+    at = _ANCHORS[cspec.kind]["at"]
+    # A single-anchor background is a LEVEL, so its window is the whole
+    # spectrum: a window centred mid-axis is centred on whatever peak happens
+    # to be there, and seeded a flat background at 734 on a baseline of 17.
+    half = len(x) if len(at) == 1 else max(len(x) // 6, 1)
+    xs, ys = [], []
+    for f in at:
+        i = int(np.clip(round(f * (len(x) - 1)), 0, len(x) - 1))
+        j0, j1 = max(i - half, 0), min(i + half + 1, len(x))
+        window = ydata[j0:j1]
+        window = window[np.isfinite(window)]
+        if not len(window):
+            return False
+        xs.append(float(x[i]))
+        ys.append(float(np.percentile(window, 15.0)))
+    if cspec.kind == "PowerLaw":
+        # Hyperspy's convention, and the reference point every downstream tool
+        # assumes. It is also where the anchors need it: `origin` above the
+        # first anchor puts that handle outside the curve's domain.
+        cspec["origin"].value = 0.0
+        cspec["origin"].free = False
+        if lo <= 0.0:
+            # ...except that the axis then contains the singularity. Move the
+            # reference off-screen so the curve is finite where it is drawn,
+            # rather than clipping it and drawing a wall. A QUARTER of the
+            # span, not a nudge: at 2% the left edge is only 2% of the way to
+            # the first anchor, so the same fitted r puts 16000 there against
+            # data of 300. A quarter keeps the whole axis on the gentle part
+            # of the curve, which is what a background over this range is.
+            cspec["origin"].value = lo - 0.25 * (hi - lo)
+    return _solve_anchors(cspec, cspec.kind, xs, ys)
+
+
 def _seed_for_preview(cspec, lo: float, hi: float) -> None:
     """Put a component somewhere visible on THIS axis.
 
@@ -735,7 +996,14 @@ def _seed_for_preview(cspec, lo: float, hi: float) -> None:
     peak shape as identical nothing.
     """
     mid, width = (lo + hi) / 2, (hi - lo) / 8
+    # A PowerLaw's `origin` is its reference point, NOT a position on the
+    # curve, and hyperspy returns zero below it. Seeding it mid-axis like a
+    # peak centre gave a background that was identically zero over the left
+    # half of the spectrum — and left its anchor handles outside the domain,
+    # where an exact solve has nothing to solve. `seed_background` owns it.
     for p in cspec.parameters:
+        if p.name == "origin" and cspec.kind == "PowerLaw":
+            continue
         if p.name in ("centre", "origin", "x0"):
             p.value = mid
         elif p.name in ("sigma", "gamma", "fwhm"):
@@ -766,6 +1034,31 @@ def _wizard(session, plot):
     return (getattr(tree, "_fit_wizard", None) if tree is not None else None), tree
 
 
+def _send_catalogue(session, wiz, src, gen: int) -> None:
+    """Sample the palette OFF the main thread and send it when it is ready.
+
+    The first call in a process builds nine hyperspy components (~680 ms of
+    sympy lambdify) and it used to sit in the middle of ``fit_open``, so the
+    caret took most of a second to appear the first time. The renderer already
+    receives ``fit_catalogue`` as its own event and renders an empty picker
+    until it arrives, so nothing here has to be synchronous — the caret opens
+    now and the sparklines fill in.
+    """
+    from spyde.actions.lifecycle import run_on_worker
+    x = wiz.axis()
+
+    def _emit(components):
+        if not wiz.still(gen):
+            return                      # the caret closed while we sampled
+        ipc.emit({"type": "fit_catalogue",
+                  "window_id": getattr(src, "window_id", None),
+                  "components": components})
+
+    run_on_worker(session, lambda: component_catalogue(x),
+                  name="fit-catalogue", on_done=_emit,
+                  on_error=lambda e: log.debug("component catalogue: %s", e))
+
+
 def fit_open(session, plot, payload=None) -> None:
     src, tree = _src_plot_tree(session, plot)
     if src is None or tree is None:
@@ -776,14 +1069,9 @@ def fit_open(session, plot, payload=None) -> None:
         wiz.emit_state()                                  # idempotent re-open
         return
     wiz = FitWizard(session, tree, src)
-    wiz.guard()
+    gen = wiz.guard()
     tree._fit_wizard = wiz
-    try:
-        ipc.emit({"type": "fit_catalogue",
-              "window_id": getattr(src, "window_id", None),
-              "components": component_catalogue(wiz.axis())})
-    except Exception as e:
-        log.debug("emitting the component catalogue failed: %s", e)
+    _send_catalogue(session, wiz, src, gen)
     wiz.draw_preview()
     wiz.sync_widgets()
     wiz.emit_state("Add a component to begin." if not len(wiz.spec)
@@ -806,20 +1094,21 @@ def fit_add_component(session, plot, payload) -> None:
         ipc.emit_error("Fit: no component kind given")
         return
     try:
-        import hyperspy.components1d as c1d
-        from spyde.fitting.spec import spec_from_component
-        comp = (c1d.Polynomial(order=int((payload or {}).get("order", 2)))
-                if kind == "Polynomial" else getattr(c1d, kind)())
-        cspec = spec_from_component(comp)
+        cspec = new_component_spec(
+            kind, int((payload or {}).get("order", 2)) if kind == "Polynomial"
+            else None)
     except Exception as e:
         ipc.emit_error(f"Fit: cannot add {kind} ({e})")
         return
 
     x = wiz.axis()
     _seed_for_preview(cspec, float(np.min(x)), float(np.max(x)))
-    # Scale the amplitude to THIS spectrum, or the component arrives five
-    # orders of magnitude below the data and looks like it does nothing.
-    scale_to_data(cspec, x, wiz.current_spectrum())
+    # Put it on THIS spectrum, or the component arrives five orders of
+    # magnitude below the data and looks like it does nothing. A background
+    # needs its shape solved through the data, not just its amplitude scaled.
+    spectrum = wiz.current_spectrum()
+    if not seed_background(cspec, x, spectrum):
+        scale_to_data(cspec, x, spectrum)
     # A unique name per instance — two Gaussians must be separately addressable
     # by the caret and produce two distinct area maps at commit.
     existing = {c.name for c in wiz.spec.components}

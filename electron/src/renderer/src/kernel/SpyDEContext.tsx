@@ -1350,6 +1350,20 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         return widgets
       }
 
+      // Test hook: the raw panel-state JSON of a figure, so a spec can read the
+      // LINES as well as the widgets. Checking that a drag handle sits ON its
+      // component's curve needs both, and a screenshot cannot tell "on the
+      // curve" from "a few pixels off it".
+      window._spyde_test_panel_json = (figId: string) => {
+        const states = latestStates.current.get(figId)
+        if (!states) return []
+        const out: string[] = []
+        for (const [key, value] of states) {
+          if (key.startsWith('panel_') && key.endsWith('_json')) out.push(value as string)
+        }
+        return out
+      }
+
       // Test hook: return the authoritative report doc (read-only snapshot) so a
       // Playwright spec can read backend-assigned ids that never surface in the
       // DOM — e.g. a figure-level annotation's `id` (needed to inject a
@@ -1437,6 +1451,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
       if (testHooksEnabled) {
         delete window._spyde_test_inject
         delete window._spyde_test_widgets
+        delete window._spyde_test_panel_json
         delete window._spyde_test_report
         delete window._spyde_test_image_sig
       }
