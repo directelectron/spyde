@@ -27,6 +27,7 @@
 import React from 'react'
 import { WizardShell, TabRow, Field, NumInput, Select, Check, S } from './WizardShell'
 import { useWizardLifecycle, useWizardEvent, CommitButton } from './wizardHooks'
+import { useSpyDE } from '../kernel/SpyDEContext'
 
 const TABS = ['Model', 'Run'] as const
 type Tab = typeof TABS[number]
@@ -39,7 +40,11 @@ interface Props {
 }
 
 interface ParamState { name: string; value: number; free: boolean; linear: boolean }
-interface CompState { name: string; kind: string; active: boolean; parameters: ParamState[] }
+interface CompState {
+  name: string; kind: string; active: boolean; parameters: ParamState[]
+  /** Peak height relative to the tallest component — see the header label. */
+  share?: number
+}
 interface CatalogueItem { kind: string; description: string; preview: number[] }
 
 /** Inline sparkline of a component's shape — the picker's whole point. */
@@ -57,6 +62,7 @@ function Spark({ points }: { points: number[] }) {
 }
 
 export function FitWizard({ caretPos, windowId, sendAction, onClose }: Props) {
+  const { state } = useSpyDE()
   const [tab, setTab] = React.useState<Tab>('Model')
   const [catalogue, setCatalogue] = React.useState<CatalogueItem[]>([])
   const [components, setComponents] = React.useState<CompState[]>([])
@@ -102,17 +108,29 @@ export function FitWizard({ caretPos, windowId, sendAction, onClose }: Props) {
 
   // ── follow the navigator ────────────────────────────────────────────────
   // The navigator's crosshair lives on a DIFFERENT window, so this listens to
-  // `spyde:figure_event` unfiltered and ignores anything from this window's own
-  // figures — `useWizardEvent` filters by window_id, which would drop exactly
-  // the events wanted here.
+  // `spyde:figure_event` unfiltered and ignores anything from OUR OWN figures
+  // — `useWizardEvent` filters by window_id, which would drop exactly the
+  // events wanted here.
   //
+  // The filter is by figId, and it has to be: `spyde:figure_event` carries
+  // `{figId, event}` and NO window_id at all (SpyDEContext's re-broadcast), so
+  // the old `detail.window_id === windowId` test compared undefined and never
+  // fired. Every pointer_up on this window's own plot therefore sent
+  // `fit_navigated` — including the ones from the caret's own drag handles.
+  // Before a fit that was harmless; after one the position is in the store, so
+  // `fit_navigated` RECALLED it and overwrote the drag the instant it landed.
+  // That is "once you fit a spectrum you can't move either component".
+  const ownFigIds = React.useRef<Set<string>>(new Set())
+  ownFigIds.current = new Set(
+    (state.windows.get(windowId)?.figures ?? []).map((f) => f.figId))
+
   // Fires on pointer_up, not pointer_move: a fit per pointer frame while
   // dragging the navigator would queue work faster than it completes.
   React.useEffect(() => {
     const on = (e: Event) => {
       const d = (e as CustomEvent).detail as
-        { window_id?: number; event?: { type?: string } }
-      if (d.window_id === windowId) return          // our own plot, not the nav
+        { figId?: string; event?: { type?: string } }
+      if (d.figId && ownFigIds.current.has(d.figId)) return   // our own plot
       if (d.event?.type && !/up|click/i.test(String(d.event.type))) return
       sendAction('fit_navigated', { adaptive: adaptiveRef.current }, windowId)
     }
@@ -169,6 +187,21 @@ export function FitWizard({ caretPos, windowId, sendAction, onClose }: Props) {
                   style={{ background: '#11111b', borderRadius: 4, padding: '4px 6px' }}>
                   <div style={S.fieldRow}>
                     <span style={{ ...S.lbl, color: '#cdd6f4', fontWeight: 600 }}>{c.name}</span>
+                    {/* How TALL this component is, relative to the tallest.
+                        The value box shows a gaussian's `A`, which is its
+                        AREA — so a peak one sixth the height of its neighbour
+                        but a tenth as wide reads as "888 next to 57471", i.e.
+                        as a component suppressed to zero. It is not; this says
+                        so. Amber below 2%, where it really has died. */}
+                    {c.share !== undefined && (
+                      <span data-testid={`fit-share-${c.name}`}
+                        title="peak height, relative to the tallest component"
+                        style={{ ...S.lbl, marginLeft: 6,
+                                 color: c.share < 0.02 ? '#f5a97f' : '#a6adc8' }}>
+                        {c.share >= 0.995 ? '100'
+                          : c.share < 0.001 ? '<0.1' : (c.share * 100).toFixed(1)}% tall
+                      </span>
+                    )}
                     <button data-testid={`fit-remove-${c.name}`} style={S.close}
                       title="Remove component"
                       onClick={() => sendAction('fit_remove_component', { name: c.name }, windowId)}>✕</button>

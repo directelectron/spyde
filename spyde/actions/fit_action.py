@@ -753,19 +753,48 @@ class FitWizard(WizardController):
                         info, height, float(comp[info["width"]].value))
 
             self.result = None          # the old fit no longer describes it
-            # Every frame: redraw the curve AND move the other handles onto it,
+            # Every frame: move the other handles onto the curve AND redraw it,
             # so nothing drifts off the component mid-drag. What still waits for
             # the release is `emit_state` — that one re-sends the entire model
             # to the caret, and doing THAT at pointer rate is what made the
             # curve lag behind the cursor.
-            self.refresh_lines()
+            #
+            # HANDLES FIRST, then the lines. `refresh_lines` ends in a FULL
+            # panel push, which serialises every widget's current geometry;
+            # `update_widgets` only issues TARGETED per-widget pushes. Doing
+            # the lines first meant the frame's full push carried the OLD
+            # partner position and the new one went out on the targeted
+            # channel alone — invisible to anything reading panel state, and
+            # one push per moved handle instead of none.
             self.update_widgets(skip=role)
+            self.refresh_lines()
             if not live:
                 self.emit_state()
         except Exception as e:
             log.debug("fit widget drag failed: %s", e)
         finally:
             self._syncing = False
+
+    def contributions(self) -> dict[str, float]:
+        """Each component's peak height as a fraction of the model's.
+
+        Because the caret shows a gaussian's ``A``, which is its AREA. A
+        component one SIXTH the height of its neighbour has one SIXTY-FIFTH
+        the area once its width is a tenth — so a correct fit of a narrow peak
+        on a broad one reads as "A=888 next to A=57471", i.e. as a component
+        that has been suppressed to zero. It has not; you just cannot see it
+        at that scale on a linear axis. This is the number that says so.
+        """
+        try:
+            x = self.axis()
+            peaks = {c.name: float(np.max(np.abs(np.nan_to_num(
+                evaluate_component(c, x), nan=0.0, posinf=0.0, neginf=0.0))))
+                for c in self.spec.active_components}
+        except Exception as e:
+            log.debug("computing component contributions failed: %s", e)
+            return {}
+        total = max(peaks.values(), default=0.0)
+        return {k: (v / total if total > 0 else 0.0) for k, v in peaks.items()}
 
     def emit_state(self, status: str | None = None) -> None:
         """Send the whole model to the caret — components, parameters, values.
@@ -774,11 +803,13 @@ class FitWizard(WizardController):
         renderer that rebuilds from the truth cannot drift out of step with the
         backend after a failed edit.
         """
+        share = self.contributions()
         ipc.emit({
             "type": "fit_state",
             "window_id": getattr(self.plot, "window_id", None),
             "components": [
                 {"name": c.name, "kind": c.kind, "active": bool(c.active),
+                 "share": share.get(c.name, 0.0),
                  "parameters": [
                      {"name": p.name, "value": float(p.value),
                       "free": bool(p.free), "linear": bool(p.linear)}

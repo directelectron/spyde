@@ -457,6 +457,54 @@ class TestARunFillsTheStore:
         assert state["fitted_count"] == len(tree.fit_store) > 0
 
 
+class TestComponentContribution:
+    """A small-but-real component must be distinguishable from a dead one.
+
+    The caret shows a gaussian's `A`, which is its AREA. A peak one SIXTH the
+    height of its neighbour but a tenth as wide has one SIXTY-FIFTH the area,
+    so a correct fit reads as "A=888 next to A=57471" — as a component
+    suppressed to zero. It has not been; that is what this number says.
+    """
+
+    def test_share_is_relative_peak_height(self, window, fitted):
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Gaussian"})
+        fit_add_component(session, plot, {"kind": "Gaussian"})
+        wiz = tree._fit_wizard
+        names = [c.name for c in wiz.spec.components]
+        # A tenth as wide, so the AREA ratio (1/65) and the HEIGHT ratio
+        # (~0.15) differ by an order of magnitude — which is the whole point.
+        amps, sigmas = (60000.0, 920.0), (25.0, 2.5)
+        for c, amp, sig in zip(wiz.spec.components, amps, sigmas):
+            c["A"].value, c["sigma"].value = amp, sig
+            c["centre"].value = 25.0
+        heights = [a / (s * np.sqrt(2 * np.pi)) for a, s in zip(amps, sigmas)]
+        share = wiz.contributions()
+        assert share[names[0]] == pytest.approx(1.0)
+        assert share[names[1]] == pytest.approx(heights[1] / heights[0],
+                                                rel=0.02)
+        # ...and NOT the area ratio, which is what the caret's A boxes imply.
+        assert share[names[1]] > 5 * (amps[1] / amps[0])
+
+    def test_a_dead_component_reads_as_dead(self, window, fitted):
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Gaussian"})
+        fit_add_component(session, plot, {"kind": "Gaussian"})
+        wiz = tree._fit_wizard
+        names = [c.name for c in wiz.spec.components]
+        wiz.spec[names[1]]["A"].value = 0.0
+        assert wiz.contributions()[names[1]] == pytest.approx(0.0)
+
+    def test_the_state_carries_it(self, window, fitted):
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Gaussian"})
+        comp = _messages_of(window, "fit_state")[-1]["components"][0]
+        assert comp["share"] == pytest.approx(1.0)
+
+
 class TestTwoOfAKindCanBeFitted:
     """A second component of a kind must not start ON the first.
 
