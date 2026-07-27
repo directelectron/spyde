@@ -49,7 +49,7 @@ def _scalar_params(model) -> list:
 
 
 class FitStore:
-    """Fitted parameters per navigation position, in HyperSpy's parameter maps.
+    """Fitted parameters per navigation position, mirrored to HyperSpy's maps.
 
     ``indices`` throughout are the NAVIGATOR's order (x first, as
     ``axes_manager.indices`` gives them). HyperSpy's maps are indexed the other
@@ -59,27 +59,39 @@ class FitStore:
     """
 
     def __init__(self, spec, signal):
-        self.model = spec.to_model(signal)
         self.spec = spec
         self._signal = signal
-        # The parameter objects in the SAME order as `spec.parameter_names()`,
-        # which is the engine's column order. Anything that maps a fitted
-        # vector onto storage has to use that order rather than re-deriving one.
-        # `to_model` appends every component of the spec in order, so the live
-        # model's i-th component is the spec's i-th; the ACTIVE ones, in that
-        # order, are what `parameter_names()` packs.
-        live = list(self.model)
-        self._params = []
-        for i, cspec in enumerate(spec.components):
-            if not cspec.active or i >= len(live):
-                continue
-            for pspec in cspec.scalar_parameters:
-                par = getattr(live[i], pspec.name, None)
-                if par is None:
-                    log.debug("component %s has no parameter %s",
-                              cspec.kind, pspec.name)
-                self._params.append(par)
-        self._chisq = np.full(self.nav_shape, np.nan, dtype=np.float64)
+        nav = self.nav_shape
+        n = len(spec.parameter_names())
+        # (values, std, is_set) per position — the same triple HyperSpy keeps
+        # per parameter, held once for the whole model in `parameter_names()`
+        # order, which is the engine's column order.
+        #
+        # Held HERE and mirrored into a model, rather than living inside one,
+        # because not every component SpyDE fits has a HyperSpy counterpart: a
+        # tabulated EELS edge (#63) exists only here, so `to_model` cannot
+        # rebuild it. A store that lived inside a model would fail to exist for
+        # exactly the models the composition path produces — which is how this
+        # first showed up, as `'NoneType' has no attribute 'coverage'` the
+        # moment you fitted one.
+        self._n = n
+        self._values = np.zeros((n,) + nav, dtype=np.float64)
+        self._std = np.full((n,) + nav, np.nan, dtype=np.float64)
+        self._set = np.zeros(nav, dtype=bool)
+        self._chisq = np.full(nav, np.nan, dtype=np.float64)
+        # Built when it CAN be. This is what `save_as` pushes the arrays into,
+        # so a model HyperSpy can represent still stores on the signal as its
+        # own and travels with the dataset.
+        try:
+            self.model = spec.to_model(signal)
+        except Exception as e:
+            log.info("no HyperSpy model for this spec (%s) — the fit is held "
+                     "here and cannot be stored on the signal", e)
+            self.model = None
+
+    def _model_params(self) -> list:
+        """The model's scalar parameters in `parameter_names()` order, or []."""
+        return _scalar_params(self.model) if self.model is not None else []
 
     # ── geometry ──────────────────────────────────────────────────────────
     @property
@@ -98,7 +110,7 @@ class FitStore:
 
     @property
     def n_params(self) -> int:
-        return len(self._params)
+        return self._n
 
     def _key(self, indices):
         """Navigator indices -> map index. THE SAME WAY THE DISPLAY READS THEM.
@@ -132,17 +144,14 @@ class FitStore:
         if key is None:
             return False
         values = np.asarray(values, float).ravel()
-        if values.size != self.n_params:
+        if values.size != self._n:
             log.debug("store: %d values for %d parameters — refused",
-                      values.size, self.n_params)
+                      values.size, self._n)
             return False
-        for par, v, i in zip(self._params, values, range(len(values))):
-            if par is None:
-                continue
-            par.map["values"][key] = float(v)
-            par.map["is_set"][key] = True
-            if std is not None:
-                par.map["std"][key] = float(np.asarray(std).ravel()[i])
+        self._values[(slice(None),) + key] = values
+        self._set[key] = True
+        if std is not None:
+            self._std[(slice(None),) + key] = np.asarray(std, float).ravel()
         if chisq is not None:
             self._chisq[key] = float(chisq)
         return True
@@ -150,17 +159,13 @@ class FitStore:
     def get(self, indices):
         """This position's parameters, or None if it has not been fitted."""
         key = self._key(indices)
-        if key is None:
+        if key is None or not bool(self._set[key]):
             return None
-        out = np.empty(self.n_params, dtype=np.float64)
-        for i, par in enumerate(self._params):
-            if par is None or not bool(par.map["is_set"][key]):
-                return None
-            out[i] = float(par.map["values"][key])
-        return out
+        return np.array(self._values[(slice(None),) + key])
 
     def is_set(self, indices) -> bool:
-        return self.get(indices) is not None
+        key = self._key(indices)
+        return bool(key is not None and self._set[key])
 
     def chisq_at(self, indices):
         key = self._key(indices)
@@ -170,24 +175,24 @@ class FitStore:
     def put_all(self, values, chisq=None, std=None) -> int:
         """Write a whole-scan result. Returns how many positions landed."""
         values = np.asarray(values, float)
-        if values.ndim != 2 or values.shape[1] != self.n_params:
+        if values.ndim != 2 or values.shape[1] != self._n:
             log.debug("store: whole-scan values %s do not match %d parameters",
-                      values.shape, self.n_params)
+                      values.shape, self._n)
             return 0
-        n = min(values.shape[0], self.n_positions)
-        shaped = values[:n].reshape(*self.nav_shape, self.n_params) \
-            if n == self.n_positions else None
-        if shaped is None:
-            log.debug("store: %d rows for %d positions", n, self.n_positions)
+        if values.shape[0] != self.n_positions:
+            log.debug("store: %d rows for %d positions", values.shape[0],
+                      self.n_positions)
             return 0
-        for i, par in enumerate(self._params):
-            if par is None:
-                continue
-            par.map["values"][...] = shaped[..., i]
-            par.map["is_set"][...] = True
-            if std is not None:
-                par.map["std"][...] = np.asarray(std, float).reshape(
-                    *self.nav_shape, self.n_params)[..., i]
+        # Row r is the fit to `data[r // nx, r % nx]`, and the arrays are
+        # (n,) + nav — so this is a reshape plus moving the parameter axis to
+        # the front, and it lands where `get` reads it back.
+        self._values[...] = np.moveaxis(
+            values.reshape(self.nav_shape + (self._n,)), -1, 0)
+        self._set[...] = True
+        if std is not None:
+            self._std[...] = np.moveaxis(
+                np.asarray(std, float).reshape(self.nav_shape + (self._n,)),
+                -1, 0)
         if chisq is not None:
             self._chisq[...] = np.asarray(chisq, float).reshape(self.nav_shape)
         return self.n_positions
@@ -196,34 +201,24 @@ class FitStore:
         """Forget every position. Called when the component LIST changes: the
         stored vectors are positional, so after an add or remove they would be
         silently reinterpreted against the wrong parameters."""
-        for par in self._params:
-            if par is not None:
-                par.map["is_set"][...] = False
-                par.map["values"][...] = 0.0
+        self._set[...] = False
+        self._values[...] = 0.0
+        self._std[...] = np.nan
         self._chisq[...] = np.nan
 
     def forget(self, indices) -> None:
         key = self._key(indices)
-        if key is None:
-            return
-        for par in self._params:
-            if par is not None:
-                par.map["is_set"][key] = False
-        self._chisq[key] = np.nan
+        if key is not None:
+            self._set[key] = False
+            self._chisq[key] = np.nan
 
     # ── what has been fitted ──────────────────────────────────────────────
     def set_mask(self) -> np.ndarray:
-        """True where every parameter has a stored value."""
-        if not self._params or self._params[0] is None:
-            return np.zeros(self.nav_shape, bool)
-        mask = np.ones(self.nav_shape, bool)
-        for par in self._params:
-            if par is not None:
-                mask &= par.map["is_set"]
-        return mask
+        """True where this position has a stored answer."""
+        return self._set
 
     def coverage(self) -> tuple[int, int]:
-        return int(self.set_mask().sum()), self.n_positions
+        return int(self._set.sum()), self.n_positions
 
     @property
     def chisq(self) -> np.ndarray:
@@ -232,13 +227,9 @@ class FitStore:
 
     def values_array(self) -> np.ndarray:
         """(P, n) of every position's parameters, NaN where unset."""
-        out = np.full((self.n_positions, self.n_params), np.nan)
-        for i, par in enumerate(self._params):
-            if par is None:
-                continue
-            v = np.asarray(par.map["values"], float).ravel()
-            s = np.asarray(par.map["is_set"], bool).ravel()
-            out[s, i] = v[s]
+        out = np.moveaxis(self._values, 0, -1).reshape(
+            self.n_positions, self._n).astype(np.float64, copy=True)
+        out[~self._set.ravel()] = np.nan
         return out
 
     # ── save / load, through HyperSpy ─────────────────────────────────────
@@ -248,6 +239,26 @@ class FitStore:
     # `signal.models.restore(name)` brings it all back, `is_set` included.
     # Nothing here writes a format of its own.
     def save_as(self, name: str) -> None:
+        """Push every position into the model's own maps and store it.
+
+        Raises if this spec has no HyperSpy model — a tabulated EELS edge (#63)
+        exists only in SpyDE, so there is genuinely nothing for HyperSpy to
+        store. Saying so beats writing a private format that only SpyDE can
+        read back.
+        """
+        if self.model is None:
+            raise ValueError(
+                "this model has components HyperSpy cannot represent "
+                "(tabulated edges) — it cannot be stored on the signal")
+        params = self._model_params()
+        if len(params) != self._n:
+            raise ValueError(
+                f"the model has {len(params)} scalar parameters but the fit "
+                f"holds {self._n} — refusing to store a mismatched pair")
+        for i, par in enumerate(params):
+            par.map["values"][...] = self._values[i]
+            par.map["std"][...] = self._std[i]
+            par.map["is_set"][...] = self._set
         self.model.store(str(name))
 
     def stored_names(self) -> list[str]:
@@ -269,11 +280,19 @@ class FitStore:
         spec = spec_cls.from_model(model)
         store = cls(spec, signal)
         # `from_model` reads the CURRENT position's values; the per-position
-        # maps are on the restored model, so copy them across parameter by
-        # parameter rather than refitting anything.
-        for dst, src in zip(store._params, _scalar_params(model)):
-            if dst is not None and src is not None:
-                dst.map[...] = src.map
+        # maps are on the restored model, so pull them across rather than
+        # refitting anything. `is_set` comes with them — without it every
+        # unfitted hole in a component map would come back a confident zero.
+        src = _scalar_params(model)
+        if len(src) == store._n:
+            for i, par in enumerate(src):
+                store._values[i] = par.map["values"]
+                store._std[i] = par.map["std"]
+            store._set[...] = np.logical_and.reduce(
+                [np.asarray(p.map["is_set"], bool) for p in src])
+        else:
+            log.warning("restored model has %d parameters, the store expects "
+                        "%d — values not carried across", len(src), store._n)
         return spec, store
 
     # ── the maps a user looks at ──────────────────────────────────────────

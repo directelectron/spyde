@@ -401,7 +401,8 @@ class TestARunFillsTheStore:
         store = tree.fit_store
         assert store.nav_shape == (4, 5)
         store.put((3, 1), [42.0])
-        par = store._params[0]
+        store.save_as("m")
+        par = store.model[0].offset
         assert bool(par.map["is_set"][3, 1]), "the store is transposed"
         assert store.get((1, 3)) is None
 

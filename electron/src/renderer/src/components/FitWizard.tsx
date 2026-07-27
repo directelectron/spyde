@@ -82,6 +82,10 @@ export function FitWizard({ caretPos, windowId, sendAction, onClose }: Props) {
   // so they travel with the dataset rather than in a format of ours.
   const [storedModels, setStoredModels] = React.useState<string[]>([])
   const [modelName, setModelName] = React.useState('spyde fit')
+  // The elements set in Plot Control's Composition panel — what "From …"
+  // builds a model for. Read from the shared state rather than asked for, so
+  // the button appears the moment they are set.
+  const elements = state.composition.get(windowId)?.elements ?? []
   // Read inside the navigator listener, which is registered once — a state
   // value captured there would be the value at registration forever.
   const adaptiveRef = React.useRef(adaptive)
@@ -282,6 +286,23 @@ export function FitWizard({ caretPos, windowId, sendAction, onClose }: Props) {
                 onClick={() => sendAction('fit_current', {}, windowId)}>
                 Fit spectrum
               </button>
+              {/* Build the whole model from the elements in Plot Control's
+                  Composition panel: an EELS signal gets a background and an
+                  edge per subshell, an EDS one a background and a gaussian per
+                  X-ray line. Everything after that is the ordinary caret — the
+                  drag handles work on an edge exactly as on a hand-placed
+                  gaussian. Shown only when there ARE elements; without them
+                  the backend has nothing to build from. */}
+              {elements.length > 0 && (
+                <button data-testid="fit-from-composition" style={S.primary}
+                  title={`Build a model for ${elements.join(', ')} — replaces the current components`}
+                  onClick={() => {
+                    setStatus(`Building a model for ${elements.join(', ')}…`)
+                    sendAction('fit_from_composition', { elements }, windowId)
+                  }}>
+                  From {elements.join(', ')}
+                </button>
+              )}
               {/* Refit automatically as the navigator moves. Each position's
                   answer is remembered, so scrubbing back shows what was found
                   there rather than the last pixel's model. */}

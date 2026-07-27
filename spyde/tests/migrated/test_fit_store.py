@@ -46,22 +46,45 @@ def store():
 
 
 class TestItIsHyperspysStore:
-    def test_the_values_land_in_the_parameter_map(self, store):
+    def test_the_values_reach_the_parameter_maps_on_save(self, store):
+        """The arrays are the working copy; `save_as` pushes them into the
+        model's own maps, which is what HyperSpy persists."""
         store.put((3, 1), np.arange(6.0))
-        par = store._params[0]
+        store.save_as("m")
+        par = store.model[0].A
         assert par.map["values"][3, 1] == 0.0
         assert bool(par.map["is_set"][3, 1])
-        assert store._params[1].map["values"][3, 1] == 1.0
+        assert store.model[0].centre.map["values"][3, 1] == 1.0
 
     def test_it_is_a_real_hyperspy_model(self, store):
         assert len(store.model) == 2
         assert all(hasattr(c, "parameters") for c in store.model)
 
     def test_the_parameter_order_is_the_engines_column_order(self, store):
+        from spyde.fitting.store import _scalar_params
         names = store.spec.parameter_names()
-        assert len(store._params) == len(names)
-        for full, par in zip(names, store._params):
+        params = _scalar_params(store.model)
+        assert len(params) == len(names) == store.n_params
+        for full, par in zip(names, params):
             assert full.endswith("." + par.name)
+
+    def test_a_spec_hyperspy_cannot_build_still_gets_a_store(self):
+        """A tabulated EELS edge (#63) exists only in SpyDE, so `to_model`
+        cannot rebuild it. A store that lived INSIDE a model simply failed to
+        exist for those — which showed up as `'NoneType' has no attribute
+        'coverage'` the moment you fitted a model built from a composition."""
+        from spyde.fitting.spec import ComponentSpec, ParameterSpec
+        from spyde.fitting import ModelSpec
+        spec = ModelSpec(components=[ComponentSpec(
+            kind="SpydeTabulated", name="C_K",
+            parameters=[ParameterSpec(name="intensity", value=1.0)])])
+        store = FitStore(spec, _signal())
+        assert store.model is None, "the fixture is no longer unbuildable"
+        assert store.coverage() == (0, 20)
+        assert store.put((1, 1), [2.0]) is True
+        assert store.get((1, 1)) == pytest.approx([2.0])
+        with pytest.raises(ValueError, match="HyperSpy cannot represent"):
+            store.save_as("nope")
 
 
 class TestIndexing:
@@ -76,7 +99,8 @@ class TestIndexing:
 
     def test_the_key_matches_how_the_display_reads_the_data(self, store):
         store.put((3, 1), np.arange(6.0))
-        par = store._params[0]
+        store.save_as("m")
+        par = store.model[0].A
         # data[3, 1] is what the display shows at this crosshair, so the map
         # entry has to be [3, 1] too.
         assert bool(par.map["is_set"][3, 1]), "the store is transposed"

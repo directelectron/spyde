@@ -783,6 +783,10 @@ export interface WizardEventMessage extends MsgBase {
     // the whole model after every edit. See spyde/actions/fit_action.py.
     | 'fit_catalogue'
     | 'fit_state'
+    // Remove Background: the model kind and where the dragged band is. The
+    // caret follows the band, so it needs this relayed — without it the
+    // fields sat at 0..0 while the band was somewhere else.
+    | 'bg_state'
     | 'fv_auto_params'
     | 'fv_models'
     | 'fv_calibration'
