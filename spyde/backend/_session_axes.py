@@ -10,6 +10,7 @@ initialised in ``Session.__init__`` — the mixin only USES ``self.<attr>``.
 from __future__ import annotations
 
 import logging
+import math
 
 from spyde.backend import ipc
 
@@ -27,6 +28,83 @@ class AxesEditorMixin:
             })
         except Exception as e:
             log.warning("axes emit failed: %s", e)
+
+    def _emit_metadata(self, tree) -> None:
+        """Re-push the resolved Instrument-Metadata dict to the sidebar (the
+        same payload shape ``_add_signal``/``_set_signal_type`` send on
+        load/type-change). Shared so ``_set_metadata`` and any other mutator
+        can trigger the same refresh instead of duplicating the emit."""
+        try:
+            from spyde.metadata_extract import build_metadata_dict, build_metadata_editable
+            ipc.emit({
+                "type": "metadata",
+                "window_ids": self._tree_window_ids(tree),
+                "metadata": build_metadata_dict(tree),
+                "editable": build_metadata_editable(tree),
+            })
+        except Exception as e:
+            log.debug("metadata emit failed: %s", e)
+
+    def _set_metadata(self, plot, payload: dict) -> None:
+        """Edit one Instrument-Metadata leaf of the active window's root
+        signal (mirrors ``_set_axis``): resolve the writable ``key``/``type``
+        for the ``(group, prop)`` cell from ``METADATA_WIDGET_CONFIG`` (the
+        same table ``build_metadata_dict`` reads), coerce the typed-in string
+        per the YAML ``type`` (float/int → number, else stays a string),
+        write it onto ``tree.root.metadata`` via ``set_item`` so it round-trips
+        through save/reload like any other hyperspy metadata, then re-emit the
+        metadata dict so the dock reflects the committed value.
+
+        Only cells with an explicit ``key`` (i.e. NOT ``attr``/``function``
+        derived entries like Dtype/Dim.) are writable — those are read-only
+        computed values, same as an axis field with ``value is None`` in
+        ``_set_axis``. Invalid numeric input (can't parse as the declared
+        type) is ignored so the edit reverts to the last-emitted value on the
+        next metadata re-render, matching the axes non-numeric-input guard.
+        """
+        if plot is None:
+            return
+        tree = getattr(plot, "signal_tree", None)
+        if tree is None:
+            return
+        group = payload.get("group")
+        prop = payload.get("prop")
+        value = payload.get("value")
+        if group is None or prop is None:
+            return
+        try:
+            from spyde import METADATA_WIDGET_CONFIG
+            entry = METADATA_WIDGET_CONFIG["metadata_widget"].get(group, {}).get(prop)
+        except Exception as e:
+            log.warning("metadata config lookup failed: %s", e)
+            return
+        if not entry or "key" not in entry:
+            # Read-only (derived attr/function) cell — nothing to write.
+            return
+        key = entry["key"]
+        kind = str(entry.get("type", "string")).lower()
+        try:
+            if kind in ("float", "int"):
+                text = str(value).strip()
+                if text == "":
+                    return  # ignore a blank commit rather than writing NaN/0
+                num = float(text)
+                if not math.isfinite(num):
+                    return  # reject nan/inf/1e400 — they'd write (and even
+                            # round-trip to .zspy) as garbage calibration
+                if kind == "int":
+                    num = int(num)
+                coerced = num
+            else:
+                coerced = str(value)
+            tree.root.metadata.set_item(key, coerced)
+        except (TypeError, ValueError):
+            return  # unparsable numeric input mid-typing — revert, don't write
+        except Exception as e:
+            log.warning("set_metadata failed: %s", e)
+            return
+
+        self._emit_metadata(tree)
 
     def _set_axis(self, plot, payload: dict) -> None:
         """Edit one axis property of the active window's root signal and
@@ -87,15 +165,7 @@ class AxesEditorMixin:
                 except Exception as e:
                     log.debug("re-emitting plot update failed: %s", e)
         self._emit_axes(tree)
-        try:
-            from spyde.metadata_extract import build_metadata_dict
-            ipc.emit({
-                "type": "metadata",
-                "window_ids": self._tree_window_ids(tree),
-                "metadata": build_metadata_dict(tree),
-            })
-        except Exception as e:
-            log.debug("re-emitting metadata failed: %s", e)
+        self._emit_metadata(tree)
 
     def _set_title(self, plot, payload: dict) -> None:
         """Rename the dataset (the breadcrumb's [Name] segment). Writes the root

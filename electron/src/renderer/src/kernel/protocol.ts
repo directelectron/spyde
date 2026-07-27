@@ -114,6 +114,19 @@ export interface WindowClosedMessage extends MsgBase {
   window_id: number
 }
 
+/** Per-window compute lifecycle — start/stop bracket a long backend compute
+ *  painting into this window (the progressive navigator fill, a streamed
+ *  virtual image, …). Drives the floating translucent "Calculating…" overlay
+ *  centered on the plot's figure area (WindowContent.tsx). The backend
+ *  guarantees a matching `computing:false` even on a cancelled/failed compute
+ *  (see `spyde.actions.lifecycle.window_computing`) — the renderer additionally
+ *  clears on window close / tree-node switch as a staleness backstop. */
+export interface WindowComputingMessage extends MsgBase {
+  type: 'window_computing'
+  window_id: number
+  computing: boolean
+}
+
 /** A lightweight rename — updates the header [Name] of every listed window's
  *  tree WITHOUT re-emitting the figure (no iframe reload). */
 export interface WindowTitleMessage extends MsgBase {
@@ -148,6 +161,14 @@ export interface MetadataMessage extends MsgBase {
   type: 'metadata'
   window_ids?: number[]
   metadata?: MetadataDict
+  // {group: {prop: raw}} — the config-declared cells with a writable hyperspy
+  // metadata `key` (as opposed to a derived attr/function entry like Dtype/
+  // Dim., or the synthetic Dataset section). Cell PRESENCE gates which cells
+  // the panel lets you click into (mirroring the axes table's per-field
+  // editability); the VALUE is the current RAW unit-free value ("" when unset)
+  // the inline editor pre-fills with — the `metadata` strings have units baked
+  // in ("12000.5 x") and would fail the backend's numeric parse if sent back.
+  editable?: Record<string, Record<string, string>>
 }
 
 export interface AxesInfoMessage extends MsgBase {
@@ -212,6 +233,15 @@ export interface SelectorInfoMessage extends MsgBase {
   color?: string | null
   mode?: 'crosshair' | 'integrate'
   title?: string
+}
+
+/** A selector's driven signal window closed — the backend deregistered it
+ *  (`MultiplotManager.remove_navigation_selector`) and the dock should drop
+ *  its row directly (WINDOW_CLOSED alone can't: selectors are keyed by the
+ *  NAVIGATOR's window_id, not the closed signal window's id). */
+export interface SelectorRemovedMessage extends MsgBase {
+  type: 'selector_removed'
+  selector_id: number
 }
 
 export interface SignalTreeMessage extends MsgBase {
@@ -726,6 +756,19 @@ export interface DaskStatsMessage extends MsgBase {
   }
 }
 
+/** Measured read-throughput readout for the StatusBar MB/s HUD. The backend
+ *  records the COLD nav-frame / chunk reads it already performs (bytes/elapsed,
+ *  EMA-smoothed; cache-hits excluded) and emits this throttled (~1 Hz, only on
+ *  change). Re-broadcast as a `spyde:io_throughput` CustomEvent (same idiom as
+ *  `dask_stats`). `color` mirrors the HUD legend: green > 1 GB/s, yellow
+ *  0.1-1 GB/s, red < 100 MB/s. See `spyde.backend.io_throughput`. */
+export interface IoThroughputMessage extends MsgBase {
+  type: 'io_throughput'
+  window_id: number | null
+  mbps: number
+  color: 'green' | 'yellow' | 'red'
+}
+
 /**
  * Wizard-scoped events re-broadcast verbatim as DOM CustomEvents (the caret
  * components subscribe directly). The payload beyond `type` is consumer-defined,
@@ -793,6 +836,7 @@ export type PlotAppMessage =
   | ToolbarConfigMessage
   | WindowVisibilityMessage
   | WindowClosedMessage
+  | WindowComputingMessage
   | WindowTitleMessage
   | StateUpdateMessage
   | StateUpdateBinaryMessage
@@ -806,6 +850,7 @@ export type PlotAppMessage =
   | LoadingMessage
   | SignalTypeInfoMessage
   | SelectorInfoMessage
+  | SelectorRemovedMessage
   | SignalTreeMessage
   | NavigatorOptionsMessage
   | PlaybackStateMessage
@@ -833,6 +878,7 @@ export type PlotAppMessage =
   | DownloadProgressMessage
   | DownloadDoneMessage
   | DaskStatsMessage
+  | IoThroughputMessage
 
 /**
  * Narrow a raw incoming message (`Record<string, unknown>` from the IPC bridge)

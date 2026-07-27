@@ -69,6 +69,40 @@ def build_axes_list(signal_tree: "BaseSignalTree") -> list[dict]:
     return rows
 
 
+def build_metadata_editable(signal_tree: "BaseSignalTree") -> dict[str, dict[str, str]]:
+    """Return ``{group: {prop: raw}}`` for the config-declared cells that are
+    writable — i.e. have a ``key`` (a real ``metadata.set_item`` path), as
+    opposed to a derived ``attr``/``function`` entry (Dtype, Dim.) which is
+    computed, not stored, and so can't be written back. Cell PRESENCE gates
+    which metadata-panel cells accept a click-to-edit (mirroring the axes
+    table's per-field ``ax[field] != None`` check); the VALUE is the cell's
+    current RAW metadata value as a string ("" when unset).
+
+    The raw value matters: the display string ``build_metadata_dict`` produces
+    has units baked in ("12000.5 x"), and committing that back would fail the
+    float() parse in ``_set_metadata`` — so the renderer pre-fills the inline
+    editor with THIS unit-free value while the cell keeps displaying the
+    formatted one (the same value/``display`` split the axes table's
+    EditableCell already uses for rounded scale/offset).
+
+    The synthetic ``Dataset`` subsection (shape/dtype/chunking, appended in
+    ``build_metadata_dict``) isn't config-driven at all, so it has no entry
+    here and stays fully read-only."""
+    editable: dict[str, dict[str, str]] = {}
+    for subsection, props in METADATA_WIDGET_CONFIG["metadata_widget"].items():
+        cells: dict[str, str] = {}
+        for prop, value in props.items():
+            if "key" not in value:
+                continue
+            current = signal_tree.root.metadata.get_item(
+                item_path=value["key"], default=None
+            )
+            cells[prop] = _clean(current)
+        if cells:
+            editable[subsection] = cells
+    return editable
+
+
 def build_metadata_dict(signal_tree: "BaseSignalTree") -> dict[str, dict[str, str]]:
     """Return metadata for *signal_tree* as a nested plain dict."""
     subsections: dict[str, dict[str, str]] = {}

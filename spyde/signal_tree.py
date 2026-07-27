@@ -192,6 +192,15 @@ class BaseSignalTree:
 
         signal = self.root
         if signal._lazy and self.client is not None:
+            # Tracked here (not via a context manager) because the compute
+            # outlives this function — it resolves later on the
+            # PlotUpdateWorker's poll thread, which marshals the apply onto
+            # the main thread as Session._on_plot_ready. That callback (and
+            # its "drop a superseded/errored future" branches) is the one
+            # place that reliably knows the future is done, so it owns the
+            # matching stop — see the finally there.
+            from spyde.actions.lifecycle import window_computing
+            window_computing(getattr(plot, "window_id", None)).start()
             future = self.client.compute(signal.data)
             plot.update_data(future)
         else:
@@ -307,6 +316,13 @@ class BaseSignalTree:
 
             def _bg_nav(_dask=nav_dask, _plot=nav_plot, _sig=nav_signals,
                         _shape=nav_shape, _stop=stop):
+                # window_computing brackets the WHOLE fill (both early-return
+                # paths on _stop AND the exception handler below) so a
+                # cancelled/failed fill still clears the renderer's overlay —
+                # see lifecycle.window_computing.
+                from spyde.actions.lifecycle import window_computing
+                computing = window_computing(getattr(_plot, "window_id", None))
+                computing.start()
                 try:
                     acc = np.full(_shape, np.nan, dtype=np.float32)
                     levels = [None]
@@ -375,6 +391,8 @@ class BaseSignalTree:
                     # Primary (threaded) navigator load — a failure here leaves a
                     # blank navigator, so surface the traceback rather than hide it.
                     logger.exception("threaded navigator compute failed")
+                finally:
+                    computing.stop()
             threading.Thread(target=_bg_nav, daemon=True, name="nav-threaded").start()
             return
 
@@ -457,53 +475,66 @@ class BaseSignalTree:
                 nav_plot.set_data(arr, levels=_nav_levels[0])
 
         def _poll_loop():
-            # Paint, THEN check done — and ALWAYS do a final paint after the loop.
-            # The old code broke on future.done() at the top of the loop, so the
-            # last chunks that landed in the shm buffer between the final 0.1 s
-            # poll and completion were never painted → HOLES in the navigator.
-            # (The virtual-image progressive poll never had holes precisely because
-            # it does this final read; see stream_progressive_to_plot.)
-            while not _stop.is_set():
-                try:
-                    _paint_from_buffer()
-                except Exception as e:
-                    logger.debug("navigator poll paint failed: %s", e)
-                if future.done():
-                    break
-                time.sleep(0.1)
-            # The nav fill is over (done or stopped) — drop its futures from the
-            # cancel registry so it doesn't grow across reloads on a long tree.
-            for _f in list(nav_futures):
-                self.unregister_cancel(future=_f)
-            if _stop.is_set():
-                return
-            # Final repaint of the COMPLETED navigator. The per-chunk shm writes
-            # race the whole-array `future` (separate computations — the chunk
-            # add_done_callbacks can still be pending when future.done() is True),
-            # so the chunk-built buffer may miss the last slice(s) → holes. The
-            # navigator is small (nav-shaped, ~MB), so paint the AUTHORITATIVE
-            # full result directly — guaranteed complete, no hole possible. Fall
-            # back to the buffer if the result isn't fetchable.
+            # window_computing brackets the whole poll (incl. the early return
+            # on _stop) via try/finally, so a cancelled fill (tree close, a
+            # newer navigator superseding this one) still clears the
+            # renderer's overlay — see lifecycle.window_computing.
+            from spyde.actions.lifecycle import window_computing
+            computing = window_computing(getattr(nav_plot, "window_id", None))
+            computing.start()
             try:
-                res = future.result()
-                arr = np.asarray(res, dtype=np.float32)
-                if arr.shape == tuple(nav_shape):
-                    finite = arr[np.isfinite(arr)]
-                    if finite.size > 0:
-                        lo, hi = float(finite.min()), float(finite.max())
-                        lv = (_nav_levels[0] if _nav_levels[0] is not None
-                              else (lo, hi if hi > lo else lo + 1))
-                        nav_plot.set_data(arr, levels=lv)
-                    self._save_nav_sidecar(arr)
-                else:
-                    _paint_from_buffer()
-            except Exception as e:
-                logger.debug("navigator final result paint failed (%s); "
-                             "falling back to buffer", e)
+                # Paint, THEN check done — and ALWAYS do a final paint after the
+                # loop. The old code broke on future.done() at the top of the loop,
+                # so the last chunks that landed in the shm buffer between the
+                # final 0.1 s poll and completion were never painted → HOLES in the
+                # navigator. (The virtual-image progressive poll never had holes
+                # precisely because it does this final read; see
+                # stream_progressive_to_plot.)
+                while not _stop.is_set():
+                    try:
+                        _paint_from_buffer()
+                    except Exception as e:
+                        logger.debug("navigator poll paint failed: %s", e)
+                    if future.done():
+                        break
+                    time.sleep(0.1)
+                # The nav fill is over (done or stopped) — drop its futures from
+                # the cancel registry so it doesn't grow across reloads on a long
+                # tree.
+                for _f in list(nav_futures):
+                    self.unregister_cancel(future=_f)
+                if _stop.is_set():
+                    return
+                # Final repaint of the COMPLETED navigator. The per-chunk shm
+                # writes race the whole-array `future` (separate computations —
+                # the chunk add_done_callbacks can still be pending when
+                # future.done() is True), so the chunk-built buffer may miss the
+                # last slice(s) → holes. The navigator is small (nav-shaped,
+                # ~MB), so paint the AUTHORITATIVE full result directly —
+                # guaranteed complete, no hole possible. Fall back to the buffer
+                # if the result isn't fetchable.
                 try:
-                    _paint_from_buffer()
-                except Exception as e2:
-                    logger.debug("navigator final buffer paint failed: %s", e2)
+                    res = future.result()
+                    arr = np.asarray(res, dtype=np.float32)
+                    if arr.shape == tuple(nav_shape):
+                        finite = arr[np.isfinite(arr)]
+                        if finite.size > 0:
+                            lo, hi = float(finite.min()), float(finite.max())
+                            lv = (_nav_levels[0] if _nav_levels[0] is not None
+                                  else (lo, hi if hi > lo else lo + 1))
+                            nav_plot.set_data(arr, levels=lv)
+                        self._save_nav_sidecar(arr)
+                    else:
+                        _paint_from_buffer()
+                except Exception as e:
+                    logger.debug("navigator final result paint failed (%s); "
+                                 "falling back to buffer", e)
+                    try:
+                        _paint_from_buffer()
+                    except Exception as e2:
+                        logger.debug("navigator final buffer paint failed: %s", e2)
+            finally:
+                computing.stop()
 
         t = threading.Thread(target=_poll_loop, daemon=True, name="nav-poll")
         t.start()
@@ -843,6 +874,27 @@ class BaseSignalTree:
                     logger.debug("removing %s on tree close failed: %s", wiz_attr, e)
             if hasattr(self, wiz_attr):
                 setattr(self, wiz_attr, None)
+        # On-plot interactive widgets (the Crop box, the CZB search box and
+        # Manual crosshair: widgets have no remove(), only hide()) and the CZB
+        # found-centre marker groups (real remove()). All harmless when absent.
+        for attr in ("_crop_widget", "_czb_region_mg", "_czb_cross"):
+            wdg = getattr(self, attr, None)
+            if wdg is not None and hasattr(wdg, "hide"):
+                try:
+                    wdg.hide()
+                except Exception as e:
+                    logger.debug("hiding %s on tree close failed: %s", attr, e)
+            if hasattr(self, attr):
+                setattr(self, attr, None)
+        for mg in (getattr(self, "_czb_found_mgs", None) or []):
+            if hasattr(mg, "remove"):
+                try:
+                    mg.remove()
+                except Exception as e:
+                    logger.debug("removing czb found marker on tree close failed: %s", e)
+        for attr in ("_czb_found_mgs", "_crop_widget_handler", "_czb_region_handler"):
+            if hasattr(self, attr):
+                setattr(self, attr, None)
         self.signal_plots = []
         self.navigator_signals = {}
         self.navigator_plot_manager = None

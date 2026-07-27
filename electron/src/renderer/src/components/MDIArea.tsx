@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { SubWindow } from './SubWindow'
 import type { Rect } from './SubWindow'
 import { WindowContent } from './WindowContent'
@@ -7,6 +7,7 @@ import {
 } from '../kernel/SpyDEContext'
 import { NAVIGATOR_DRAG_MIME, CONSOLE_VAR_DRAG_MIME } from '../kernel/dnd'
 import { Pill, type PillSegment, type WindowPillPayload } from './Pill'
+import { getMovieEditorClaim, subscribeMovieEditorClaim } from '../kernel/movieEditorClaim'
 
 // A compact breadcrumb for a window: a small S-/N- kind badge + the editable
 // dataset name, e.g. `S-my_scan` / `N-my_scan`. No trailing Root/nav segment —
@@ -93,6 +94,14 @@ const TOOLBAR_RESERVE = 44
 
 export function MDIArea() {
   const { state, iframeRefs, sendAction, setActiveWindow, replayState, tileWindowsRef } = useSpyDE()
+  // The MDI window (if any) the full-screen Movie editor currently surfaces
+  // live (laundry #6/#13 — see movieEditorClaim.ts). That window is EXCLUDED
+  // below (a real unmount, not display:none) so its iframe doesn't fight the
+  // editor's own iframe for the shared fig_id's live pushes — otherwise the
+  // editor's annotation overlays / tile detail can render onto the hidden MDI
+  // window instead of the visible editor, and closing the editor reveals a
+  // window still showing the movie's overlays.
+  const movieClaimedWindowId = useSyncExternalStore(subscribeMovieEditorClaim, getMovieEditorClaim)
   const [focusOrder, setFocusOrder] = useState<string[]>([])
   // Renderer-side minimize: minimized windows stay mounted (their figure
   // iframes keep streaming) but are display:none and listed in the top bar.
@@ -275,7 +284,8 @@ export function MDIArea() {
     }
   }, [sendAction])
 
-  const visibleWindows = Array.from(state.windows.values()).filter(w => w.visible)
+  const visibleWindows = Array.from(state.windows.values())
+    .filter(w => w.visible && w.windowId !== movieClaimedWindowId)
 
   // Assign each window a non-overlapping initial position. Already-placed windows
   // keep their slot; NEW windows are packed into the first free gap — so result

@@ -121,6 +121,24 @@ def emit_progress(done: int, total: int, label: str = "") -> None:
     emit({"type": "progress", "done": done, "total": total, "label": label})
 
 
+def emit_window_computing(window_id: int | None, computing: bool) -> None:
+    """Per-window compute-lifecycle marker — drives the renderer's floating
+    "Calculating…" overlay (centered, translucent, pointer-events:none) on the
+    plot window while a long compute (e.g. the progressive navigator fill, a
+    streamed virtual image) is filling it in.
+
+    ``window_id`` is None-guarded (a plot may not have a window yet, e.g. very
+    early in construction) — silently a no-op rather than sending a malformed
+    message. Callers MUST pair every ``True`` with a matching ``False`` in a
+    ``finally`` block so a cancelled/failed compute still clears the overlay;
+    see ``spyde.actions.lifecycle.window_computing`` for the context-manager
+    helper that guarantees this.
+    """
+    if window_id is None:
+        return
+    emit({"type": "window_computing", "window_id": window_id, "computing": bool(computing)})
+
+
 async def read_messages(loop: asyncio.AbstractEventLoop | None = None):
     """
     Async generator that yields parsed JSON dicts from stdin.

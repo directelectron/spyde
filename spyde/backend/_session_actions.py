@@ -164,6 +164,8 @@ class ActionRouterMixin:
             self._select_signal_node(plot, payload.get("signal_id"))
         elif action == "set_axis":
             self._set_axis(plot, payload)
+        elif action == "set_metadata":
+            self._set_metadata(plot, payload)
         elif action == "set_title":
             self._set_title(plot, payload)
         elif action == "set_offset_crosshair":

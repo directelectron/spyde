@@ -10,6 +10,11 @@ bookkeeping that scoping alone doesn't touch.
 """
 from __future__ import annotations
 
+import time
+
+import numpy as np
+import hyperspy.api as hs
+
 
 def _nav_wid(session):
     for p in session._plots:
@@ -123,6 +128,60 @@ class TestSelectorCloseCleanup:
             for sel in sel_list:
                 assert id(sel) in session._nav_selectors_by_id
 
+    def test_second_selector_survives_closing_first_signal_window(
+        self, stem_4d_dataset,
+    ):
+        """With TWO selectors on one navigator (what the add_selector toolbar
+        action creates), closing ONE signal window must prune ONLY its own
+        selector — the sibling stays registered everywhere and its dock row
+        is not re-emitted or removed. (The single-selector survive test above
+        can't see this: after the only signal window closes, the consistency
+        loop runs over an empty list.)"""
+        session = stem_4d_dataset["window"]
+        msgs = stem_4d_dataset["messages"]
+        mm = _mm(session)
+        nav = _nav_plot(session)
+        navpw = nav.plot_window
+
+        # Second signal window + selector off the SAME navigator (the
+        # add_selector toolbar action's body — see spyde.actions.base).
+        mm.add_navigation_selector_and_signal_plot(navpw)
+        time.sleep(0.3)
+
+        sels = list(mm.navigation_selectors[navpw])
+        assert len(sels) == 2, "expected two selectors on the navigator"
+        sig_wids = _signal_wids(session)
+        assert len(sig_wids) == 2, "expected two signal windows"
+
+        target = sig_wids[0]
+        target_plot = next(p for p in session._plots if p.window_id == target)
+        closed_sel = target_plot.plot_window.parent_selector
+        assert closed_sel is not None
+        survivor = next(s for s in sels if s is not closed_sel)
+        assert id(survivor) in session._nav_selectors_by_id
+
+        msgs.clear()
+        session.dispatch_action({"action": "close_window", "window_id": target})
+
+        # The closed window's selector is gone...
+        assert closed_sel not in mm.all_navigation_selectors
+        removed_ids = [m.get("selector_id") for m in msgs
+                       if m.get("type") == "selector_removed"]
+        assert id(closed_sel) in removed_ids
+        # ...the SIBLING selector survives, fully registered...
+        assert survivor in mm.all_navigation_selectors
+        assert id(survivor) in session._nav_selectors_by_id
+        # ...with NO selector_removed for it and NO selector_info re-emit
+        # that would rewrite its dock row.
+        assert id(survivor) not in removed_ids
+        assert not any(
+            m.get("type") == "selector_info"
+            and m.get("selector_id") == id(survivor)
+            for m in msgs
+        ), "the survivor's dock row payload must be untouched"
+        # The second signal window itself stays open.
+        assert sig_wids[1] in _signal_wids(session)
+
     def test_queued_update_for_closed_selector_does_not_raise(self, stem_4d_dataset):
         """A stale/queued navigator update against an already-closed selector
         must not crash the dispatcher (mirrors the _NavDispatcher's own
@@ -142,3 +201,73 @@ class TestSelectorCloseCleanup:
         # this must not raise even though the selector was just closed and
         # deregistered.
         sel._run_update(force=True)
+
+
+def _make_5d_session():
+    """5-D stack (time → spatial → DP): a 2-level navigator chain whose DP is
+    driven by a COMPOSITE (IntegratingSSelector2D). Mirrors test_nav_chain_5d."""
+    from spyde.backend.session import Session
+    s = hs.signals.Signal2D(
+        np.random.RandomState(0).rand(2, 4, 5, 8, 8).astype(np.float32))
+    s.set_signal_type("electron_diffraction")
+    sess = Session(n_workers=1, threads_per_worker=1)
+    sess._add_signal(s, source_path=None)
+    time.sleep(0.6)
+    return sess
+
+
+class TestComposite5DClose:
+    """Closing the DP of a 5-D chained-navigator tree must deregister the
+    COMPOSITE spatial selector (the DP window's parent_selector points at the
+    composite, not an inner sub-selector — the nav-chain fix) and tear down
+    BOTH inner sub-selectors' settle timers."""
+
+    def test_closing_dp_removes_composite_and_cancels_inner_settles(
+        self, captured_messages,
+    ):
+        sess = _make_5d_session()
+        try:
+            npm = sess.signal_trees[0].navigator_plot_manager
+            sels = {type(x).__name__: x for x in npm.all_navigation_selectors}
+            comp = sels["IntegratingSSelector2D"]       # spatial → drives the DP
+            time_comp = sels["IntegratingSelector1D"]   # time → drives spatial nav
+
+            dp = next(p for p in sess._plots
+                      if not getattr(p, "is_navigator", False)
+                      and p.window_id is not None)
+            assert dp.plot_window.parent_selector is comp
+
+            # Arm both inner settle timers so close() has live timers to
+            # cancel (the construction-time ones fired long ago).
+            comp._crosshair_selector._arm_settle()
+            comp._rect_selector._arm_settle()
+            t_ch = comp._crosshair_selector._settle_timer
+            t_rect = comp._rect_selector._settle_timer
+            assert t_ch is not None and t_rect is not None
+
+            captured_messages.clear()
+            sess.dispatch_action(
+                {"action": "close_window", "window_id": dp.window_id})
+
+            # The COMPOSITE is deregistered everywhere...
+            assert comp not in npm.all_navigation_selectors
+            assert id(comp) not in sess._nav_selectors_by_id
+            removed_ids = [m.get("selector_id") for m in captured_messages
+                           if m.get("type") == "selector_removed"]
+            assert id(comp) in removed_ids, (
+                "selector_removed must carry the COMPOSITE's id"
+            )
+            # ...while the upstream TIME composite (driving the still-open
+            # spatial navigator) survives untouched.
+            assert time_comp in npm.all_navigation_selectors
+            assert id(time_comp) in sess._nav_selectors_by_id
+            assert id(time_comp) not in removed_ids
+
+            # Both inner sub-selectors' settle timers are cancelled + cleared
+            # (composite close() → each inner BaseSelector.close()).
+            assert comp._crosshair_selector._settle_timer is None
+            assert comp._rect_selector._settle_timer is None
+            assert t_ch.finished.is_set(), "crosshair settle timer must be cancelled"
+            assert t_rect.finished.is_set(), "rect settle timer must be cancelled"
+        finally:
+            sess.shutdown()
