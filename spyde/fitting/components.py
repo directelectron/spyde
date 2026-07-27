@@ -62,10 +62,10 @@ class TorchComponent:
     autodiff, which is the ideal oracle for exactly this.
     """
 
-    __slots__ = ("kind", "params", "linear", "_fn", "_grad")
+    __slots__ = ("kind", "params", "linear", "_fn", "_grad", "ndim")
 
     def __init__(self, kind: str, params: Sequence[str], linear: Sequence[bool],
-                 fn: Callable, grad: Callable | None = None):
+                 fn: Callable, grad: Callable | None = None, ndim: int = 1):
         if len(params) != len(linear):
             raise ValueError(f"{kind}: {len(params)} params vs "
                              f"{len(linear)} linear flags")
@@ -74,6 +74,11 @@ class TorchComponent:
         self.linear = tuple(bool(b) for b in linear)
         self._fn = fn
         self._grad = grad
+        # 1 for a spectrum (x is the signal axis), 2 for an image (x carries
+        # (x, y) coordinate PAIRS). A 2-D model is otherwise identical: the
+        # image is flattened to C sample points and everything downstream —
+        # packing, the Jacobian, the LM solve — is unchanged.
+        self.ndim = int(ndim)
 
     @property
     def n_params(self) -> int:
@@ -87,9 +92,15 @@ class TorchComponent:
         if p.shape[-1] != self.n_params:
             raise ValueError(f"{self.kind} expects {self.n_params} parameters "
                              f"{self.params}, got {p.shape[-1]}")
+        cols = [p[:, i:i + 1] for i in range(self.n_params)]
+        if self.ndim == 2:
+            # x is (C, 2) or (P, C, 2): coordinate PAIRS, not a single axis.
+            if x.dim() == 2:
+                x = x.unsqueeze(0)                  # (1, C, 2)
+            return (x[..., 0], x[..., 1]), cols
         if x.dim() == 1:
             x = x.unsqueeze(0)                      # (1, C), broadcasts over P
-        return x, [p[:, i:i + 1] for i in range(self.n_params)]
+        return x, cols
 
     def __call__(self, x, p):
         """``x``: ``(C,)`` or ``(P, C)``. ``p``: ``(P, n_params)``. -> ``(P, C)``."""
@@ -188,6 +199,48 @@ def _logistic(x, p):
     # "a / (1 + b * exp(-c * (x - origin)))"
     a, b, c, origin = p
     return a / (1.0 + b * (-c * (x - origin)).exp())
+
+
+def _gaussian_2d(xy, p):
+    # "A * (1 / (sigma_x * sigma_y * 2 * pi))
+    #  * exp(-((x - centre_x)**2 / (2*sigma_x**2)
+    #        + (y - centre_y)**2 / (2*sigma_y**2)))"
+    # As in 1-D, A is the VOLUME under the surface, not the peak height.
+    x, y = xy
+    A, cx, cy, sx, sy = p
+    sxe, sye = sx + _EPS, sy + _EPS
+    return A / (sxe * sye * 2.0 * math.pi) * (
+        -((x - cx) ** 2 / (2 * sxe ** 2) + (y - cy) ** 2 / (2 * sye ** 2))).exp()
+
+
+def _d_gaussian_2d(xy, p):
+    x, y = xy
+    A, cx, cy, sx, sy = p
+    sxe, sye = sx + _EPS, sy + _EPS
+    dx, dy = x - cx, y - cy
+    shape = (-(dx ** 2 / (2 * sxe ** 2) + dy ** 2 / (2 * sye ** 2))).exp() \
+        / (sxe * sye * 2.0 * math.pi)
+    f = A * shape
+    return _stack(shape,                                   # df/dA
+                  f * dx / sxe ** 2,                       # df/dcentre_x
+                  f * dy / sye ** 2,                       # df/dcentre_y
+                  f * (dx ** 2 / sxe ** 3 - 1.0 / sxe),    # df/dsigma_x
+                  f * (dy ** 2 / sye ** 3 - 1.0 / sye))    # df/dsigma_y
+
+
+def image_coordinates(shape, *, device=None, dtype=None):
+    """``(H*W, 2)`` of ``(x, y)`` sample points for a 2-D model.
+
+    This is the "signal axis" a 2-D fit uses: the image is flattened to H*W
+    sample points, exactly as a spectrum is C channels, so nothing downstream
+    (packing, the Jacobian, the LM solve) needs to know it came from an image.
+    """
+    import torch
+    h, w = int(shape[0]), int(shape[1])
+    yy, xx = torch.meshgrid(torch.arange(h, device=device, dtype=dtype),
+                            torch.arange(w, device=device, dtype=dtype),
+                            indexing="ij")
+    return torch.stack([xx.reshape(-1), yy.reshape(-1)], dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +408,9 @@ _register("Arctan",        ("A", "k", "x0"),                (True, False, False)
 _register("Erf",           ("A", "origin", "sigma"),        (True, False, False),  _erf, _d_erf)
 _register("HeavisideStep", ("A", "n"),                      (True, False),         _heaviside, _d_heaviside)
 _register("Logistic",      ("a", "b", "c", "origin"),       (True, False, False, False), _logistic, _d_logistic)
+_REGISTRY["Gaussian2D"] = TorchComponent(
+    "Gaussian2D", ("A", "centre_x", "centre_y", "sigma_x", "sigma_y"),
+    (True, False, False, False, False), _gaussian_2d, _d_gaussian_2d, ndim=2)
 
 
 def get_component(kind: str, *, n_params: int | None = None) -> TorchComponent:
@@ -426,9 +482,10 @@ def evaluate_with_grad(spec, x, values):
     """
     import torch
 
-    xb = x.unsqueeze(0) if x.dim() == 1 else x
+    # Sample count is the LAST axis for a 1-D axis and the second-to-last for
+    # 2-D coordinate pairs — `x` is (C,)/(P, C) or (C, 2)/(P, C, 2).
+    C = x.shape[-2] if x.shape[-1] == 2 and x.dim() >= 2 else x.shape[-1]
     P = values.shape[0]
-    C = xb.shape[-1]
     n_total = values.shape[1]
     out = torch.zeros((P, C), dtype=values.dtype, device=values.device)
     jac = torch.zeros((P, C, n_total), dtype=values.dtype, device=values.device)
@@ -462,5 +519,6 @@ def evaluate(spec, x, values):
         i += n
     if out is None:
         p = values.shape[0] if values.dim() > 1 else 1
-        return torch.zeros((p, x.shape[-1]), dtype=x.dtype, device=x.device)
+        c = x.shape[-2] if x.shape[-1] == 2 and x.dim() >= 2 else x.shape[-1]
+        return torch.zeros((p, c), dtype=x.dtype, device=x.device)
     return out
