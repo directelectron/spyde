@@ -33,6 +33,7 @@ import numpy as np
 from spyde.actions.commit import commit_result_tree
 from spyde.actions.context import src_plot_tree as _src_plot_tree
 from spyde.actions.wizard import WizardController
+from spyde.drawing.selectors.base_selector import event_handler_fn
 # Imported as a MODULE, not `from ... import emit`. The test fixture patches
 # `ipc.emit` to capture outgoing messages, and a from-import binds the original
 # function at import time — the patch would then never be seen and every
@@ -127,11 +128,17 @@ class FitWizard(WizardController):
         # took a minute to fit. `BaseSignalTree.close()` still disposes both.
         if getattr(tree, "fit_spec", None) is None:
             tree.fit_spec = ModelSpec()
-        self._preview_label = "fit_preview"
-        self._preview_line = None
-        # widget id -> (component name, role) for the on-plot drag handles.
+        # One overlay line per component, plus the dashed sum.
+        self._comp_lines: dict = {}
+        self._sum_line = None
+        # component name -> {"point": widget, "range": widget, "info": ...}
         self._widgets: dict = {}
-        self._widget_cb = None
+        # anyplotlib registers callbacks WEAKLY — a handler this object does
+        # not hold is collected, and the handle goes dead when grabbed.
+        self._widget_cbs: list = []
+        # Guards the widget -> model -> widget round trip (the example's
+        # `_syncing`): moving a handle in response to its own drag re-enters.
+        self._syncing = False
 
     @property
     def spec(self):
@@ -173,172 +180,213 @@ class FitWizard(WizardController):
         arr = np.asarray(data, float)
         return arr.reshape(-1, arr.shape[-1]).mean(0)
 
-    # ── live preview ──────────────────────────────────────────────────────
-    def draw_preview(self) -> None:
-        """Redraw the model curve on the spectrum plot."""
+    # ── live preview: ONE LINE PER COMPONENT + a sum line ─────────────────
+    # Follows anyplotlib's interactive-fitting example. Two things there that
+    # this got wrong at first, and that matter more than they look:
+    #
+    #   * lines are updated with ``Line1D.set_data`` IN PLACE. Removing and
+    #     re-adding a line every drag frame is heavy AND does not repaint
+    #     during the drag — the curve simply did not follow the handle.
+    #   * a widget's drag event carries the widget on ``event.source``:
+    #     ``event.source.x``, not ``event.x``. Reading ``event.x`` gives None,
+    #     so every drag silently did nothing at all.
+    #
+    # Per-component lines rather than one summed curve, also from the example:
+    # with several overlapping peaks a single sum tells you the total is wrong
+    # but not WHICH component to grab.
+    _COMP_COLORS = ("#f5a97f", "#a6da95", "#c6a0f6", "#eed49f", "#8bd5ca",
+                    "#f0c6c6")
+
+    def rebuild_lines(self) -> None:
+        """One overlay line per active component, plus the sum. Called when
+        the component LIST changes."""
         p1 = getattr(self.plot, "_plot1d", None)
-        if p1 is None or not len(self.spec):
+        if p1 is None:
+            return
+        self.clear_preview()
+        x = self.axis()
+        blank = np.zeros(len(x), np.float32)
+        for i, comp in enumerate(self.spec.active_components):
+            try:
+                self._comp_lines[comp.name] = p1.add_line(
+                    blank.copy(), x_axis=x, label=comp.name, linewidth=1.6,
+                    color=self._COMP_COLORS[i % len(self._COMP_COLORS)])
+            except Exception as e:
+                log.debug("adding a line for %s failed: %s", comp.name, e)
+        if len(self.spec):
+            try:
+                self._sum_line = p1.add_line(
+                    blank.copy(), x_axis=x, label="model", color="#cdd6f4",
+                    linewidth=1.8, linestyle="dashed")
+            except Exception as e:
+                log.debug("adding the sum line failed: %s", e)
+        self.refresh_lines()
+
+    def refresh_lines(self) -> None:
+        """Re-evaluate and ``set_data`` every line — cheap enough per drag frame."""
+        if not self._comp_lines and self._sum_line is None:
             return
         try:
             import torch
             from spyde.fitting import components as tcomp
-            x = self.axis()
-            values = torch.as_tensor(self.spec.flat_values()[None, :],
-                                     dtype=torch.float64)
-            y = tcomp.evaluate(self.spec, torch.as_tensor(x), values).numpy()[0]
+            xt = torch.as_tensor(self.axis())
+            total = None
+            for comp in self.spec.active_components:
+                vals = torch.as_tensor(
+                    np.array([[p.value for p in comp.scalar_parameters]]))
+                y = tcomp.component_for(comp)(xt, vals).numpy()[0]
+                total = y if total is None else total + y
+                line = self._comp_lines.get(comp.name)
+                if line is not None:
+                    line.set_data(np.asarray(y, np.float32))
+            if self._sum_line is not None and total is not None:
+                self._sum_line.set_data(np.asarray(total, np.float32))
         except Exception as e:
-            log.debug("evaluating the fit preview failed: %s", e)
-            return
-        try:
-            # `label`, NOT `name` — Plot1D.add_line takes `label`, and passing
-            # `name` raised a TypeError this method's own except swallowed, so
-            # the preview silently never drew.
-            self.clear_preview()
-            self._preview_line = p1.add_line(
-                np.asarray(y, np.float32), x_axis=self.axis(),
-                label=self._preview_label, color="#f5a97f", linewidth=1.8)
-        except Exception as e:
-            log.debug("drawing the fit preview failed: %s", e)
+            log.debug("refreshing the model lines failed: %s", e)
+
+    def draw_preview(self) -> None:
+        """Refresh in place; rebuild only when the line set is out of date."""
+        if list(self._comp_lines) != [c.name for c in self.spec.active_components]:
+            self.rebuild_lines()
+        else:
+            self.refresh_lines()
 
     def clear_preview(self) -> None:
-        """Remove the previous preview line.
+        """Remove every overlay line.
 
-        Keeps the HANDLE ``add_line`` returned — ``remove_line`` takes an id or
-        a ``Line1D``, NOT the label. Passing the label raises a KeyError that
-        was swallowed here, so every redraw stacked another line and the legend
-        filled up with `fit_preview` entries.
+        ``remove_line`` takes an id or a ``Line1D`` HANDLE, not a label —
+        passing the label raises a KeyError that used to be swallowed here, so
+        redraws stacked lines until the legend filled up.
         """
         p1 = getattr(self.plot, "_plot1d", None)
-        line = getattr(self, "_preview_line", None)
-        if p1 is None or line is None:
-            return
-        try:
-            p1.remove_line(line)
-        except Exception as e:
-            log.debug("clearing the fit preview failed: %s", e)
-        finally:
-            self._preview_line = None
+        if p1 is not None:
+            for line in list(self._comp_lines.values()) + [self._sum_line]:
+                if line is None:
+                    continue
+                try:
+                    p1.remove_line(line)
+                except Exception as e:
+                    log.debug("removing a model line failed: %s", e)
+        self._comp_lines.clear()
+        self._sum_line = None
 
     # ── on-plot drag handles (#57) ────────────────────────────────────────
     def sync_widgets(self) -> None:
-        """Put a POINT handle (centre + height) and a RANGE handle (width) on
-        each component that has a position on the axis.
+        """One POINT handle (centre + height) and one RANGE band (width) per
+        positioned component. Rebuilt when the component LIST changes.
 
-        Rebuilt wholesale rather than diffed: a model is a handful of
-        components, and reconciling handle-to-component identity across an
-        add/remove is exactly the kind of bookkeeping that leaves an orphaned
-        handle dragging a component that no longer exists.
+        Handles are kept as OBJECTS, not ids: the widget's own ``set()`` moves
+        it and its drag event hands it back on ``event.source``, so the object
+        is what everything here needs.
         """
         p1 = getattr(self.plot, "_plot1d", None)
         if p1 is None:
             return
         self.clear_widgets()
-        from spyde.drawing.selectors.base_selector import event_handler_fn
-        self._widget_cb = event_handler_fn(self._on_widget_drag)
-
-        for comp in self.spec.active_components:
+        for i, comp in enumerate(self.spec.active_components):
             info = _DRAG.get(comp.kind)
             if info is None:
-                continue                      # a background has nothing to point at
+                continue                  # a background has nothing to point at
             try:
-                pos = float(comp[info["pos"]].value)
-                width = (float(comp[info["width"]].value)
-                         if info["width"] else (self.axis().ptp() / 20.0))
-                height = _height_from_amp(info, float(comp[info["amp"]].value),
-                                          width)
-                pw = p1.add_point_widget(x=pos, y=height, color="#f5a97f")
-                self._widgets[pw.id] = (comp.name, "point")
-                pw.add_event_handler(self._widget_cb, "pointer_move", "pointer_up")
+                colour = self._COMP_COLORS[i % len(self._COMP_COLORS)]
+                pos, width, height = self._geometry(comp, info)
+                pw = p1.add_point_widget(pos, height, color=colour,
+                                         show_crosshair=False)
+                self._widgets[comp.name] = {"point": pw, "info": info}
+                self._wire(pw, comp.name, "point")
                 if info["width"]:
                     half = width * _WIDTH_TO_HALF.get(info["width"], 1.0)
-                    rw = p1.add_range_widget(x0=pos - half, x1=pos + half,
-                                             color="#89b4fa", y=height / 2)
-                    self._widgets[rw.id] = (comp.name, "range")
-                    rw.add_event_handler(self._widget_cb, "pointer_move",
-                                         "pointer_up")
+                    rw = p1.add_range_widget(pos - half, pos + half,
+                                             y=height / 2.0, color=colour,
+                                             style="fwhm")
+                    self._widgets[comp.name]["range"] = rw
+                    self._wire(rw, comp.name, "range")
             except Exception as e:
                 log.debug("adding drag handles for %s failed: %s", comp.name, e)
 
-    def update_widgets(self, skip_id=None) -> None:
-        """MOVE the existing handles to match the model, in place.
+    def _geometry(self, comp, info):
+        """(position, width, peak height) for a component's handles."""
+        pos = float(comp[info["pos"]].value)
+        width = (float(comp[info["width"]].value) if info["width"]
+                 else float(np.ptp(self.axis())) / 20.0)
+        height = _height_from_amp(info, float(comp[info["amp"]].value), width)
+        return pos, width, height
 
-        Distinct from :meth:`sync_widgets`, which tears them down and rebuilds.
-        Rebuilding on every parameter keystroke destroys and recreates every
-        widget several times a second — the handles flicker, a widget the user
-        is reaching for vanishes under the cursor, and the plot spends its time
-        re-pushing widget state instead of redrawing the curve. Rebuild only
-        when the component LIST changes; move them otherwise.
+    def _wire(self, widget, name: str, role: str) -> None:
+        cb = event_handler_fn(
+            lambda event, n=name, r=role: self._on_widget_drag(n, r, event))
+        # Hold the reference: anyplotlib registers callbacks weakly, so a
+        # handler owned only by this call is collected and the handle goes dead
+        # the moment it is grabbed.
+        self._widget_cbs.append(cb)
+        widget.add_event_handler(cb, "pointer_move", "pointer_up")
 
-        *skip_id* is the widget currently being dragged: writing a position
-        back to the handle under the user's finger fights the drag.
+    def update_widgets(self, skip: str | None = None) -> None:
+        """MOVE the handles to match the model, in place.
+
+        Distinct from :meth:`sync_widgets`, which rebuilds. Rebuilding on every
+        keystroke destroys and recreates every widget several times a second —
+        they flicker, and one can vanish from under the cursor mid-reach.
+        *skip* is the role being dragged: writing a position back to the handle
+        under the user's finger fights the drag.
         """
-        p1 = getattr(self.plot, "_plot1d", None)
-        if p1 is None:
-            return
-        by_name: dict = {}
-        for wid, (name, role) in self._widgets.items():
-            by_name.setdefault(name, {})[role] = wid
-
         for comp in self.spec.active_components:
-            info = _DRAG.get(comp.kind)
-            roles = by_name.get(comp.name)
-            if info is None or not roles:
+            entry = self._widgets.get(comp.name)
+            if not entry:
                 continue
+            info = entry["info"]
             try:
-                pos = float(comp[info["pos"]].value)
-                width = (float(comp[info["width"]].value)
-                         if info["width"] else (self.axis().ptp() / 20.0))
-                height = _height_from_amp(info, float(comp[info["amp"]].value),
-                                          width)
-                pid = roles.get("point")
-                if pid is not None and pid != skip_id:
-                    w = p1.get_widget(pid)
-                    if w is not None:
-                        w.set(x=pos, y=height)
-                rid = roles.get("range")
-                if rid is not None and rid != skip_id and info["width"]:
+                pos, width, height = self._geometry(comp, info)
+                if skip != "point" and entry.get("point") is not None:
+                    entry["point"].set(x=pos, y=height)
+                if skip != "range" and entry.get("range") is not None:
                     half = width * _WIDTH_TO_HALF.get(info["width"], 1.0)
-                    w = p1.get_widget(rid)
-                    if w is not None:
-                        w.set(x0=pos - half, x1=pos + half, y=height / 2)
+                    entry["range"].set(x0=pos - half, x1=pos + half,
+                                       y=height / 2.0)
             except Exception as e:
                 log.debug("moving handles for %s failed: %s", comp.name, e)
 
     def clear_widgets(self) -> None:
         p1 = getattr(self.plot, "_plot1d", None)
-        for wid in list(self._widgets):
-            try:
-                if p1 is not None:
-                    p1.remove_widget(wid)
-            except Exception as e:
-                log.debug("removing fit widget %s failed: %s", wid, e)
+        for entry in self._widgets.values():
+            for role in ("point", "range"):
+                w = entry.get(role)
+                if w is None or p1 is None:
+                    continue
+                try:
+                    p1.remove_widget(w.id)
+                except Exception as e:
+                    log.debug("removing a fit widget failed: %s", e)
         self._widgets.clear()
+        self._widget_cbs.clear()
 
-    def _on_widget_drag(self, event) -> None:
+    def _on_widget_drag(self, name: str, role: str, event) -> None:
         """A handle moved — write it back into the model and redraw.
 
-        Handles are the PRIMARY input for shape (the anyplotlib
-        interactive-fitting example's idiom): the numeric fields stay editable
-        and are refreshed from here, so both directions agree.
+        The dragged widget arrives on ``event.source``. Reading ``event.x``
+        gives None and the drag does nothing at all, which is exactly how this
+        failed the first time: the handle moved on screen because the widget
+        draws itself, while the model never heard about it.
         """
+        if self._syncing:
+            return                      # the example's guard against feedback
+        self._syncing = True
         try:
-            wid = getattr(event, "id", None) or (event or {}).get("id")
-            target = self._widgets.get(wid)
-            if target is None:
-                return
-            name, role = target
+            src = getattr(event, "source", None) or event
             comp = self.spec[name]
             info = _DRAG.get(comp.kind)
             if info is None:
                 return
-            get = (lambda k: getattr(event, k, None)
-                   if not isinstance(event, dict) else event.get(k))
+
+            def get(k):
+                return (src.get(k) if isinstance(src, dict)
+                        else getattr(src, k, None))
 
             if role == "point":
                 x, y = get("x"), get("y")
                 if x is not None:
                     comp[info["pos"]].value = float(x)
-                if y is not None and info["amp"]:
+                if y is not None:
                     width = (float(comp[info["width"]].value)
                              if info["width"] else 1.0)
                     comp[info["amp"]].value = _amp_from_height(info, float(y),
@@ -346,25 +394,28 @@ class FitWizard(WizardController):
             else:
                 x0, x1 = get("x0"), get("x1")
                 if x0 is not None and x1 is not None and info["width"]:
-                    half = abs(float(x1) - float(x0)) / 2.0
                     factor = _WIDTH_TO_HALF.get(info["width"], 1.0)
-                    # Keep the AMPLITUDE fixed as the width changes: for an
-                    # area-parameterised component, changing sigma alone would
-                    # otherwise change the peak HEIGHT under the user's cursor,
-                    # which reads as the curve fighting the drag.
+                    # Hold the peak HEIGHT as the width changes: for an
+                    # area-parameterised component, changing sigma alone moves
+                    # the curve away under the cursor.
                     height = _height_from_amp(
                         info, float(comp[info["amp"]].value),
                         float(comp[info["width"]].value))
-                    comp[info["width"]].value = max(half / max(factor, 1e-9),
-                                                    1e-6)
+                    comp[info["width"]].value = max(
+                        abs(float(x1) - float(x0)) / 2.0 / max(factor, 1e-9),
+                        1e-6)
+                    comp[info["pos"]].value = (float(x0) + float(x1)) / 2.0
                     comp[info["amp"]].value = _amp_from_height(
                         info, height, float(comp[info["width"]].value))
-            self.result = None            # the old fit no longer describes it
-            self.draw_preview()
-            self.update_widgets(skip_id=wid)   # never fight the dragged handle
+
+            self.result = None          # the old fit no longer describes it
+            self.refresh_lines()
+            self.update_widgets(skip=role)
             self.emit_state()
         except Exception as e:
             log.debug("fit widget drag failed: %s", e)
+        finally:
+            self._syncing = False
 
     def emit_state(self, status: str | None = None) -> None:
         """Send the whole model to the caret — components, parameters, values.

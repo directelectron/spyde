@@ -157,10 +157,20 @@ export function FitWizard({ caretPos, windowId, sendAction, onClose }: Props) {
               ))}
             </div>
 
-            {/* ── the + picker ── */}
-            <div style={{ position: 'relative' }}>
+            {/* ── + picker and Fit spectrum, side by side ──
+                "Fit spectrum" belongs HERE, not on the Run tab: building a
+                model is a loop — add, look, nudge, fit this one, look again —
+                and that loop happens entirely on this tab. Run scan is the
+                separate, expensive thing you do once the model is right. */}
+            <div style={{ position: 'relative', display: 'flex', gap: 8 }}>
               <button data-testid="fit-add-toggle" style={S.primary}
                 onClick={() => setPickerOpen((v) => !v)}>+ Component</button>
+              <button data-testid="fit-spectrum" style={S.primary}
+                disabled={components.length === 0}
+                title="Fit only the spectrum on screen — quick, for checking a guess"
+                onClick={() => sendAction('fit_current', {}, windowId)}>
+                Fit spectrum
+              </button>
               {pickerOpen && (
                 <div data-testid="fit-palette"
                   style={{
@@ -207,16 +217,6 @@ export function FitWizard({ caretPos, windowId, sendAction, onClose }: Props) {
                 label="Seed from a coarse grid" />
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              {/* Fitting the whole scan to check one guess is the wrong unit of
-                  work — it costs seconds to minutes and answers a question about
-                  one pixel. This fits the spectrum on screen and writes the
-                  result back into the model, so the next nudge starts fitted. */}
-              <button data-testid="fit-spectrum" style={S.primary}
-                disabled={components.length === 0}
-                title="Fit only the spectrum on screen — quick, for checking a guess"
-                onClick={() => sendAction('fit_current', {}, windowId)}>
-                Fit spectrum
-              </button>
               <button data-testid="fit-run" style={S.primary}
                 disabled={components.length === 0} onClick={run}>Run scan</button>
               {fitted && (

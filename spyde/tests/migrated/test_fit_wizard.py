@@ -210,14 +210,27 @@ class TestDragHandles:
             if info["width"]:
                 assert info["width"] in names, kind
 
-    def test_drag_writes_back_into_the_model(self, window, fitted):
+    def test_a_drag_event_carries_the_widget_on_event_source(self, window, fitted):
+        """THE bug this class exists for.
+
+        anyplotlib hands the dragged widget back on ``event.source``, so the
+        position is ``event.source.x`` — not ``event.x``. Reading ``event.x``
+        returns None and the drag does NOTHING, while the handle still moves on
+        screen because the widget draws itself. The model silently never hears
+        about it, which is exactly how it looked in the app.
+        """
         session, plot, tree, _ = fitted
         fit_open(session, plot, {})
         fit_add_component(session, plot, {"kind": "Gaussian"})
         wiz = tree._fit_wizard
-        # Stand in for the widget: register a handle and feed it a drag event.
-        wiz._widgets["w1"] = ("Gaussian", "point")
-        wiz._on_widget_drag({"id": "w1", "x": 31.5, "y": 2.0})
+
+        class _Src:
+            x, y = 31.5, 2.0
+
+        class _Event:
+            source = _Src()
+
+        wiz._on_widget_drag("Gaussian", "point", _Event())
         assert wiz.spec["Gaussian"]["centre"].value == pytest.approx(31.5)
 
     def test_dragging_invalidates_a_previous_fit(self, window, fitted):
@@ -228,17 +241,29 @@ class TestDragHandles:
         fit_add_component(session, plot, {"kind": "Gaussian"})
         wiz = tree._fit_wizard
         wiz.result = object()
-        wiz._widgets["w1"] = ("Gaussian", "point")
-        wiz._on_widget_drag({"id": "w1", "x": 20.0, "y": 1.0})
+        wiz._on_widget_drag("Gaussian", "point", {"x": 20.0, "y": 1.0})
         assert wiz.result is None
 
-    def test_an_unknown_widget_id_is_ignored(self, window, fitted):
+    def test_an_unknown_component_is_ignored(self, window, fitted):
         session, plot, tree, _ = fitted
         fit_open(session, plot, {})
         fit_add_component(session, plot, {"kind": "Gaussian"})
         before = tree._fit_wizard.spec["Gaussian"]["centre"].value
-        tree._fit_wizard._on_widget_drag({"id": "nope", "x": 999.0})
+        tree._fit_wizard._on_widget_drag("NoSuch", "point", {"x": 999.0})
         assert tree._fit_wizard.spec["Gaussian"]["centre"].value == before
+
+    def test_a_reentrant_drag_is_guarded(self, window, fitted):
+        """Moving the handles in response to a drag re-enters the handler. The
+        example guards this with `_syncing`; without it the widget and the
+        model chase each other."""
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Gaussian"})
+        wiz = tree._fit_wizard
+        wiz._syncing = True
+        before = wiz.spec["Gaussian"]["centre"].value
+        wiz._on_widget_drag("Gaussian", "point", {"x": 12.0})
+        assert wiz.spec["Gaussian"]["centre"].value == before
 
     def test_width_drag_keeps_the_peak_height(self, window, fitted):
         """Changing sigma alone would change the peak HEIGHT under the cursor
@@ -251,15 +276,16 @@ class TestDragHandles:
         wiz = tree._fit_wizard
         comp = wiz.spec["Gaussian"]
         info = _DRAG["Gaussian"]
-        before = _height_from_amp(info, comp["A"].value, comp["sigma"].value)
+        before_h = _height_from_amp(info, comp["A"].value, comp["sigma"].value)
+        before_sigma = comp["sigma"].value
 
-        wiz._widgets["r1"] = ("Gaussian", "range")
         centre = comp["centre"].value
-        wiz._on_widget_drag({"id": "r1", "x0": centre - 9.0, "x1": centre + 9.0})
+        wiz._on_widget_drag("Gaussian", "range",
+                            {"x0": centre - 9.0, "x1": centre + 9.0})
 
-        after = _height_from_amp(info, comp["A"].value, comp["sigma"].value)
-        assert after == pytest.approx(before, rel=1e-6)
-        assert comp["sigma"].value != pytest.approx(3.0)
+        after_h = _height_from_amp(info, comp["A"].value, comp["sigma"].value)
+        assert after_h == pytest.approx(before_h, rel=1e-6)
+        assert comp["sigma"].value != pytest.approx(before_sigma)
 
 
 class TestBuildingTheModel:
@@ -549,29 +575,43 @@ class TestParameterEditsMoveTheHandles:
         fit_add_component(session, plot, {"kind": "Gaussian"})
         wiz = tree._fit_wizard
 
+        from spyde.actions.fit_action import _DRAG
         moved = {}
 
         class _FakeWidget:
+            id = "w"
+
             def set(self, **kw):
                 moved.update(kw)
 
-        class _FakeP1:
-            def get_widget(self, wid):
-                return _FakeWidget()
-
-        wiz.plot._plot1d = _FakeP1()
-        wiz._widgets = {"p1": ("Gaussian", "point")}
+        wiz._widgets = {"Gaussian": {"point": _FakeWidget(),
+                                     "info": _DRAG["Gaussian"]}}
         fit_set_param(session, plot, {"component": "Gaussian",
                                       "parameter": "centre", "value": 41.0})
         assert moved.get("x") == pytest.approx(41.0)
 
     def test_a_parameter_edit_does_not_rebuild_the_handles(self, window, fitted):
-        """Rebuilding is for a changed component LIST, not for a keystroke."""
+        """Rebuilding is for a changed component LIST, not for a keystroke.
+
+        Rebuilding several times a second while typing makes the handles
+        flicker and can pull one out from under the cursor.
+        """
+        from spyde.actions.fit_action import _DRAG
         session, plot, tree, _ = fitted
         fit_open(session, plot, {})
         fit_add_component(session, plot, {"kind": "Gaussian"})
         wiz = tree._fit_wizard
-        wiz._widgets = {"p1": ("Gaussian", "point")}
+
+        class _FakeWidget:
+            id = "w"
+
+            def set(self, **kw):
+                pass
+
+        sentinel = _FakeWidget()
+        wiz._widgets = {"Gaussian": {"point": sentinel,
+                                     "info": _DRAG["Gaussian"]}}
         fit_set_param(session, plot, {"component": "Gaussian",
                                       "parameter": "centre", "value": 30.0})
-        assert "p1" in wiz._widgets, "handles were torn down by a value edit"
+        assert wiz._widgets["Gaussian"]["point"] is sentinel, \
+            "handles were torn down and rebuilt by a value edit"
