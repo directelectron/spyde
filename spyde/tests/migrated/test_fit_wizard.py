@@ -390,19 +390,19 @@ class TestARunFillsTheStore:
     fit the navigation mean).
     """
 
-    def test_position_of_inverts_the_flat_index(self, window, fitted):
-        """On a square scan a transposed key looks identical, so this is
-        checked on a NON-square one."""
+    def test_the_store_is_indexed_the_right_way_round(self, window, fitted):
+        """On a SQUARE scan a transposed store looks identical, so this uses
+        the non-square fixture. Navigator indices are x-first; HyperSpy's
+        parameter maps are y-first like the data."""
         session, plot, tree, _ = fitted
         fit_open(session, plot, {})
-        wiz = tree._fit_wizard
-        nav = (4, 5)
-        for iy in range(nav[0]):
-            for ix in range(nav[1]):
-                flat = int(np.ravel_multi_index((iy, ix), nav))
-                # `remember` keys on current_indices(), which the run path
-                # ravels as reversed(indices) — so the key is (ix, iy).
-                assert wiz.position_of(flat, nav) == (ix, iy)
+        fit_add_component(session, plot, {"kind": "Offset"})
+        store = tree.fit_store
+        assert store.nav_shape == (4, 5)
+        store.put((3, 1), [42.0])                     # navigator (ix=3, iy=1)
+        par = store._params[0]
+        assert bool(par.map["is_set"][1, 3]), "the store is transposed"
+        assert store.get((1, 3)) is None
 
     @staticmethod
     def _run(window, fitted):
@@ -427,11 +427,10 @@ class TestARunFillsTheStore:
     def test_a_run_records_every_converged_position(self, window, fitted):
         _session, _plot, tree, _ = fitted
         wiz, result = self._run(window, fitted)
-        assert tree.fit_store, "a whole-scan run recorded nothing"
-        assert len(tree.fit_store) == int(np.asarray(result.converged).sum())
-        for key, values in tree.fit_store.items():
-            assert len(key) == 2
-            assert len(values) == len(tree.fit_spec.parameter_names())
+        done, total = tree.fit_store.coverage()
+        assert done == total == 4 * 5, "a whole-scan run recorded nothing"
+        assert tree.fit_store.values_array().shape == (
+            20, len(tree.fit_spec.parameter_names()))
 
     def test_a_poor_position_is_remembered_and_flagged(self, window, fitted):
         """EVERY position is stored, including the ones that fitted badly.
@@ -446,26 +445,23 @@ class TestARunFillsTheStore:
         wiz, result = self._run(window, fitted)
         result.converged[:] = False
         wiz.record_run(result, wiz.nav_shape())
-        assert len(tree.fit_store) == 4 * 5
-        assert len(tree.fit_poor) == 4 * 5
-        assert set(tree.fit_chisq) == set(tree.fit_store)
+        assert tree.fit_store.coverage() == (4 * 5, 4 * 5)
+        assert np.isfinite(tree.fit_store.chisq).all()
 
     def test_refitting_a_position_clears_its_poor_flag(self, window, fitted):
         _session, _plot, tree, _ = fitted
         wiz, result = self._run(window, fitted)
         result.converged[:] = False
         wiz.record_run(result, wiz.nav_shape())
-        key = next(iter(tree.fit_poor))
-        _fake_nav(tree, key)
-        wiz.remember(np.zeros(len(tree.fit_spec.parameter_names())))
-        assert key not in tree.fit_poor
+        _fake_nav(tree, (0, 0))
+        wiz.remember(np.zeros(len(tree.fit_spec.parameter_names())), chisq=0.0)
+        assert tree.fit_store.chisq_at((0, 0)) == 0.0
 
     def test_navigating_after_a_run_recalls_instead_of_refitting(self, window,
                                                                  fitted):
         _session, _plot, tree, _ = fitted
         wiz, _result = self._run(window, fitted)
-        key = next(iter(tree.fit_store))
-        _fake_nav(tree, key)
+        _fake_nav(tree, (2, 1))
         assert wiz.recall() is True
 
     def test_a_run_reports_its_coverage(self, window, fitted):
@@ -473,7 +469,7 @@ class TestARunFillsTheStore:
         wiz, _result = self._run(window, fitted)
         wiz.emit_state()
         state = _messages_of(window, "fit_state")[-1]
-        assert state["fitted_count"] == len(tree.fit_store) > 0
+        assert state["fitted_count"] == tree.fit_store.coverage()[0] > 0
 
 
 class TestComponentContribution:
@@ -667,16 +663,38 @@ class TestTheResultMaps:
         for c in wiz.spec.active_components:
             assert c.name in maps
 
-    def test_the_automatic_window_is_replaced_not_stacked(self, window, fitted):
-        """Three fits used to leave three identical-looking result windows and
-        no way to tell which was current."""
+    def test_there_is_ONE_maps_window_refreshed_in_place(self, window, fitted):
+        """One window for the life of the caret. Creating a new one per fit
+        stacked identical-looking windows with no way to tell which was
+        current."""
         wiz, _result = TestARunFillsTheStore._run(window, fitted)
         first = wiz.show_maps()
         assert first is not None
-        second = wiz.show_maps()
-        assert second is not None and second is not first
-        assert getattr(first, "_spyde_closed", False), \
-            "the previous fit-maps window was left open"
+        assert wiz.show_maps() is first
+        assert not getattr(first, "_spyde_closed", False)
+
+    def test_the_maps_exist_before_anything_is_fitted(self, window, fitted):
+        """The window opens with the caret and fills in — the point of holding
+        the parameters per position rather than accumulating a result."""
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Gaussian"})
+        wiz = tree._fit_wizard
+        maps = wiz.result_maps()
+        assert set(maps) >= {"Gaussian", "chi squared"}
+        for m in maps.values():
+            assert np.isnan(m).all(), "an unfitted position claims a value"
+
+    def test_a_fitted_position_fills_one_pixel(self, window, fitted):
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Gaussian"})
+        wiz = tree._fit_wizard
+        _fake_nav(tree, (2, 1))
+        wiz.remember(wiz.spec.flat_values(), chisq=7.0)
+        maps = wiz.result_maps()
+        assert int(np.isfinite(maps["Gaussian"]).sum()) == 1
+        assert maps["chi squared"][1, 2] == 7.0
 
 
 class TestBackgroundSeeding:
@@ -1017,7 +1035,7 @@ class TestCommit:
         fit_open(session, plot, {})
         fit_add_component(session, plot, {"kind": "Gaussian"})
         fit_commit(session, plot, {})
-        assert any("run the fit" in (m.get("text") or "").lower()
+        assert any("fit something" in (m.get("text") or "").lower()
                    for m in _messages_of(window, "error"))
 
     def test_commit_makes_one_tree_with_a_view_per_component(self, window, fitted):
@@ -1035,10 +1053,16 @@ class TestCommit:
         from spyde.fitting.engine import fit_batched
         wiz.result = fit_batched(wiz.spec, wiz.signal.data, wiz.axis(),
                                  device="cpu", max_iter=80)
+        # The maps come from the per-position STORE now, so a result that was
+        # never recorded there has nothing to commit — same as in the app,
+        # where `fit_run` records before it shows anything.
+        wiz.record_run(wiz.result)
 
         before = len(window["signal_trees"])
         fit_commit(session, plot, {})
-        assert len(window["signal_trees"]) == before + 1
+        assert len(window["signal_trees"]) == before + 1, \
+            "Keep these maps must make a tree of its own, separate from the " \
+            "live window the caret refreshes"
 
 
 class TestComponentAreaMaps:
@@ -1342,7 +1366,7 @@ class TestPerPositionMemory:
         wiz = tree._fit_wizard
         assert wiz.current_indices() is None
         wiz.remember([1.0])
-        assert not tree.fit_store
+        assert tree.fit_store.coverage()[0] == 0
 
     def test_a_real_session_exposes_a_position(self, window, fitted):
         """The accessor works against the REAL selector, not just the fake —
@@ -1390,10 +1414,11 @@ class TestPerPositionMemory:
         wiz = tree._fit_wizard
         _fake_nav(tree, (0, 0))
         wiz.remember([11.0])
-        assert tree.fit_store
+        assert tree.fit_store.coverage()[0] == 1
 
         fit_add_component(session, plot, {"kind": "Gaussian"})
-        assert not tree.fit_store, "stale positional vectors survived a model change"
+        assert tree.fit_store.coverage()[0] == 0, \
+            "stale positional vectors survived a model change"
 
     def test_a_wrong_length_vector_is_refused(self, window, fitted):
         """Belt and braces for the same hazard."""
@@ -1402,7 +1427,7 @@ class TestPerPositionMemory:
         fit_add_component(session, plot, {"kind": "Offset"})
         wiz = tree._fit_wizard
         _fake_nav(tree, (0, 0))
-        tree.fit_store[(0, 0)] = np.array([1.0, 2.0, 3.0])   # wrong width
+        assert tree.fit_store.put((0, 0), np.array([1.0, 2.0, 3.0])) is False
         assert wiz.recall() is False
 
     def test_the_store_survives_close_and_reopen(self, window, fitted):
@@ -1456,7 +1481,7 @@ class TestAdaptiveFit:
         fit_navigated(session, plot, {"adaptive": True})
         # The data sits on a constant 5.0.
         assert wiz.spec["Offset"]["offset"].value == pytest.approx(5.0, abs=0.5)
-        assert (0, 0) in tree.fit_store, "an adaptive fit was not remembered"
+        assert tree.fit_store.is_set((0, 0)), "an adaptive fit was not remembered"
 
     def test_navigating_with_no_model_does_nothing(self, window, fitted):
         from spyde.actions.fit_action import fit_navigated

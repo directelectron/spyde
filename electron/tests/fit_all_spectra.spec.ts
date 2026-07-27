@@ -46,6 +46,21 @@ test('Fit all Spectra fits everything, plots the maps, and can refit the poor', 
       await page.waitForTimeout(800)
     }
 
+    // ── 0. the maps window exists BEFORE anything is fitted ──────────────
+    // The parameters are held per position from the moment the caret opens,
+    // so the maps are there to watch fill in rather than appearing at the end.
+    expect(
+      await page.getByTestId('subwindow').count(),
+      'no Fit-components window opened with the caret',
+    ).toBeGreaterThan(windowsBefore)
+    const chipsAtOpen = await page.getByTestId('subwindow').last()
+      .locator('[data-testid^="view-chip-"]').allTextContents()
+    console.log('chips before fitting:', JSON.stringify(chipsAtOpen))
+    expect(
+      chipsAtOpen.join('|'),
+      'the empty maps window has no per-component chips',
+    ).toMatch(/Gaussian/)
+
     // ── 1. the name ──────────────────────────────────────────────────────
     await page.getByTestId('fit-tab-Run').click()
     await expect(page.locator('[data-testid="fit-run"]')).toHaveText(/Fit all Spectra/i)
@@ -58,13 +73,6 @@ test('Fit all Spectra fits everything, plots the maps, and can refit the poor', 
     await page.screenshot({ path: `${SHOTS}/02-fitted.png`, fullPage: true })
 
     // ── 2. the maps opened on their own ──────────────────────────────────
-    const windowsAfter = await page.getByTestId('subwindow').count()
-    expect(
-      windowsAfter,
-      'fitting every spectrum opened no result window — the maps were only ' +
-      'reachable by committing',
-    ).toBeGreaterThan(windowsBefore)
-
     // chi squared must be one of them: a component map read without it can be
     // a picture of the fit falling over rather than of the sample.
     const chips = await page.getByTestId('subwindow').last()

@@ -259,18 +259,12 @@ class FitWizard(WizardController):
         # took a minute to fit. `BaseSignalTree.close()` still disposes both.
         if getattr(tree, "fit_spec", None) is None:
             tree.fit_spec = ModelSpec()
-        # Position tuple -> fitted parameter vector, filled in as the user
-        # explores. Sparse on purpose: a full (P, n) array would claim every
-        # position had been fitted when only a handful have.
-        if getattr(tree, "fit_store", None) is None:
-            tree.fit_store = {}
-        # Alongside it: this position's chisq, and whether it is one of the
-        # ones that fitted worse than its neighbours. Both are per-position
-        # facts about the same store, so they live and die with it.
-        if getattr(tree, "fit_chisq", None) is None:
-            tree.fit_chisq = {}
-        if getattr(tree, "fit_poor", None) is None:
-            tree.fit_poor = set()
+        # The per-position parameters live in a real HyperSpy model's own
+        # `parameter.map` arrays — see spyde/fitting/store.py. They exist from
+        # the moment the caret opens, empty, and fill in as positions are
+        # fitted. `_ensure_store` (re)builds it whenever the component list
+        # changes, because the packed width changes with it.
+        self._ensure_store()
         # One overlay line per component, plus the dashed sum.
         self._comp_lines: dict = {}
         self._sum_line = None
@@ -331,71 +325,76 @@ class FitWizard(WizardController):
                     log.debug("reading navigator indices failed: %s", e)
         return None
 
-    def remember(self, values) -> None:
-        """Store the fitted parameters for the CURRENT navigator position.
+    # ── the per-position store ────────────────────────────────────────────
+    @property
+    def store(self):
+        return getattr(self.tree, "fit_store", None)
 
-        The store is keyed by position and lives on the tree beside the model,
-        so scrubbing back to a pixel shows the fit that was made there rather
-        than whatever the last pixel left behind. It is deliberately SPARSE —
-        a dict, not a (P, n) array — because it fills in as the user explores
-        and a full allocation would claim every position had been fitted.
+    def _ensure_store(self, force: bool = False):
+        """(Re)build the per-position store for the CURRENT component list.
+
+        Rebuilt whenever that list changes: the store's width is the packed
+        parameter count, so an add or remove would otherwise reinterpret every
+        stored vector against the wrong parameters. Nothing is carried over —
+        that is the same reason the old dict was cleared on an edit.
         """
-        key = self.current_indices()
-        if key is None:
-            return
-        self.tree.fit_store[key] = np.asarray(values, float).copy()
-        self.tree.fit_poor.discard(key)   # freshly fitted; no longer suspect
+        from spyde.fitting.store import FitStore
+        want = len(self.spec.parameter_names())
+        store = getattr(self.tree, "fit_store", None)
+        if not force and store is not None and store.n_params == want \
+                and store.spec is self.spec:
+            return store
+        try:
+            store = FitStore(self.spec, self.signal)
+        except Exception as e:
+            log.debug("building the fit store failed: %s", e)
+            store = None
+        self.tree.fit_store = store
+        return store
 
-    @staticmethod
-    def position_of(flat: int, nav_shape) -> tuple:
-        """Flat spectrum index -> the key :meth:`remember` would use.
+    def remember(self, values, chisq: float | None = None) -> None:
+        """Store the fitted parameters for the CURRENT navigator position."""
+        store = self.store
+        if store is not None:
+            store.put(self.current_indices(), values, chisq=chisq)
 
-        The exact inverse of the ``ravel_multi_index(reversed(indices))`` the
-        run path uses, so a whole-scan fit lands in the same slots a per-point
-        one does. Getting the reversal wrong here would store every position
-        transposed — and on a square scan nothing would ever look wrong.
-        """
-        return tuple(reversed([int(v) for v in
-                               np.unravel_index(int(flat), tuple(nav_shape))]))
-
-    def record_run(self, result, nav_shape) -> int:
-        """Record a whole-scan fit into the store. Returns how many landed.
+    def record_run(self, result, nav_shape=None) -> int:
+        """Record a whole-scan fit. Returns how many positions landed.
 
         EVERY position, not only the converged ones. Moving the navigator has
-        to show the fit that was made there — a position left out of the store
-        shows whatever the last one left in the model instead, which reads as
-        the fit being stale or wrong. A position that fitted poorly is still
-        that position's answer; `fit_refit_poor` is how it gets improved, and
-        `poor` records which ones want it.
+        to show the fit that was made there — a position left out shows
+        whatever the last one left in the model instead, which reads as the fit
+        being stale. A position that fitted poorly is still that position's
+        answer; ``poor_positions`` is how it gets found again.
         """
-        from spyde.fitting.polish import neighbour_index, poor_mask
-        self.forget_all()
-        converged = np.asarray(result.converged).ravel()
-        values = np.asarray(result.values)
-        chisq = np.asarray(getattr(result, "chisq",
-                                   np.zeros(len(values)))).ravel()
-        # "Poor" is LOCAL — chisq scales with the counts in the spectrum, so a
-        # bright pixel legitimately has a bigger one than a dim pixel and any
-        # global threshold flags either a whole region or nothing. Same
-        # definition `polish_scan` acts on, so the count and the button agree.
+        store = self.store
+        if store is None:
+            return 0
+        return store.put_all(result.values,
+                             chisq=getattr(result, "chisq", None))
+
+    def poor_positions(self) -> int:
+        """How many positions fit worse than their neighbours."""
+        store = self.store
+        if store is None:
+            return 0
         try:
-            poor = poor_mask(chisq, neighbour_index(nav_shape),
-                             converged=converged)
+            from spyde.fitting.polish import neighbour_index, poor_mask
+            chisq = store.chisq.ravel()
+            done = store.set_mask().ravel()
+            if not done.any():
+                return 0
+            mask = poor_mask(np.where(done, chisq, np.nanmedian(chisq[done])),
+                             neighbour_index(store.nav_shape))
+            return int((mask & done).sum())
         except Exception as e:
-            log.debug("locating the poor positions failed: %s", e)
-            poor = ~converged
-        for flat_i in range(len(values)):
-            key = self.position_of(flat_i, nav_shape)
-            self.tree.fit_store[key] = np.asarray(values[flat_i], float).copy()
-            self.tree.fit_chisq[key] = float(chisq[flat_i])
-            if poor[flat_i]:
-                self.tree.fit_poor.add(key)
-        return len(self.tree.fit_store)
+            log.debug("counting the poor positions failed: %s", e)
+            return 0
 
     def recall(self) -> bool:
         """Load this position's stored fit into the model. True if there was one."""
-        key = self.current_indices()
-        stored = self.tree.fit_store.get(key) if key is not None else None
+        store = self.store
+        stored = store.get(self.current_indices()) if store is not None else None
         if stored is None or len(stored) != len(self.spec.parameter_names()):
             return False
         self.spec.set_flat_values(stored)
@@ -408,9 +407,9 @@ class FitWizard(WizardController):
         positional, so after an add or remove they would be silently
         reinterpreted against the wrong parameters.
         """
-        self.tree.fit_store.clear()
-        self.tree.fit_chisq.clear()
-        self.tree.fit_poor.clear()
+        store = self.store
+        if store is not None:
+            store.clear()
 
     def current_spectrum(self) -> np.ndarray:
         """The spectrum ON SCREEN — what the preview and "Fit spectrum" fit.
@@ -852,6 +851,8 @@ class FitWizard(WizardController):
         backend after a failed edit.
         """
         share = self.contributions()
+        done, total = (self.store.coverage() if self.store is not None
+                       else (0, self.nav_total()))
         ipc.emit({
             "type": "fit_state",
             "window_id": getattr(self.plot, "window_id", None),
@@ -868,13 +869,14 @@ class FitWizard(WizardController):
             # invisible: you cannot tell a position you skipped from one you
             # fitted, and "why didn't adaptive fill this in" has no answer on
             # screen.
-            "fitted_count": len(self.tree.fit_store),
-            "nav_total": self.nav_total(),
-            "position_fitted": self.current_indices() in self.tree.fit_store,
+            "fitted_count": done,
+            "nav_total": total,
+            "position_fitted": bool(self.store is not None and
+                                    self.store.is_set(self.current_indices())),
             # How many positions fit worse than their neighbours. The honest
             # headline for a scan fit: "99% converged" can still hide a patch
             # where the model fell over.
-            "poor_count": len(self.tree.fit_poor),
+            "poor_count": self.poor_positions(),
             "status": status,
         })
 
@@ -898,55 +900,57 @@ class FitWizard(WizardController):
         if getattr(self.tree, "_fit_wizard", None) is self:
             self.tree._fit_wizard = None
 
-    # ── commit ────────────────────────────────────────────────────────────
+    # ── the component maps, live ──────────────────────────────────────────
     def result_maps(self) -> dict[str, np.ndarray]:
-        """One map per component, plus chi-squared.
+        """One map per component, plus chi-squared, read from the STORE.
+
+        From the store and not from a finished ``FitResult``, because that is
+        what makes them exist before there is a result: every map is NaN where
+        the position has not been fitted, so the window can open flat when the
+        caret does and fill in as positions are fitted — a point at a time from
+        "Fit spectrum", or all at once from "Fit all Spectra".
 
         chi-squared belongs beside the components, not in a status line: it is
         the map that says WHERE the model failed, and a component map read
         without it can be a picture of the fit falling over rather than of the
         sample.
         """
-        maps = component_area_maps(self.spec, self.result, self.axis(),
-                                   self.nav_shape())
-        try:
-            chisq = np.asarray(self.result.chisq, float).ravel()
-            nav = self.nav_shape()
-            maps["chi squared"] = chisq.reshape(nav) if nav else chisq
-        except Exception as e:
-            log.debug("chi-squared map failed: %s", e)
-        return maps
+        store = self.store
+        if store is None:
+            return {}
+        return store.maps(self.axis())
 
     def show_maps(self):
-        """Open (or REPLACE) the automatic result window.
+        """Open the component-maps window if it is not open, else REFRESH it.
 
-        Every fit and every refit produces a new set of maps, and each one
-        used to stack another window on top of the last — three fits, three
-        identical-looking windows, and no way to tell which was current. The
-        automatic window is a PREVIEW of the fit as it stands, so it is
-        replaced. "Keep these maps" makes one that is not tracked here and
-        therefore survives the next fit.
+        One window for the life of the caret, updated in place. Creating a new
+        one per fit stacked identical-looking windows with no way to tell which
+        was current; and creating it only when a fit finished meant there was
+        nothing to watch fill in.
         """
-        previous = getattr(self, "_maps_tree", None)
-        tree = self.commit()
-        if tree is None:
-            return None
-        self._maps_tree = tree
-        if previous is not None and previous is not tree:
-            try:
-                self.session._close_tree(previous)
-            except Exception as e:
-                log.debug("closing the previous fit-maps window failed: %s", e)
-        return tree
-
-    def commit(self):
-        if self.result is None or self.session is None:
-            ipc.emit_error("Fit: run the fit before committing")
-            return None
         maps = self.result_maps()
         if not maps:
-            ipc.emit_error("Fit: no component produced a map")
             return None
+        labels = list(maps)
+        tree = getattr(self, "_maps_tree", None)
+        alive = tree is not None and not getattr(tree, "_spyde_closed", False)
+        if alive and labels == getattr(self, "_maps_labels", None):
+            self._refresh_maps(tree, maps)
+            return tree
+        # The SET of maps changed — a component was added or removed. The
+        # window's primary map and its chips are fixed at creation, so this
+        # rebuilds rather than repaints: refreshing would leave the first
+        # component with no chip of its own and chi-squared as the primary.
+        if alive:
+            try:
+                self.session._close_tree(tree)
+            except Exception as e:
+                log.debug("closing the previous maps window failed: %s", e)
+        self._maps_tree = self._open_maps(maps)
+        self._maps_labels = labels
+        return self._maps_tree
+
+    def _open_maps(self, maps):
         names = list(maps)
         return commit_result_tree(
             self.session, title="Fit components",
@@ -959,6 +963,51 @@ class FitWizard(WizardController):
                         "source_title": getattr(
                             self.signal.metadata.General, "title", "")},
         )
+
+    def _refresh_maps(self, tree, maps) -> None:
+        """Repaint an already-open maps window with the current store."""
+        from spyde.actions.views import emit_view_figure, register_views
+        mats = [(n, np.nan_to_num(np.asarray(m, np.float32)))
+                for n, m in maps.items()]
+        sp = next(iter(getattr(tree, "signal_plots", []) or []), None)
+        if sp is None:
+            return
+        try:
+            tree.root.data[...] = mats[0][1]
+        except Exception as e:
+            log.debug("writing the maps root failed: %s", e)
+        try:
+            sp.needs_auto_level = True
+            sp.set_data(mats[0][1])
+        except Exception as e:
+            log.debug("repainting the maps plot failed: %s", e)
+        wid = getattr(sp, "window_id", None)
+        if wid is None:
+            return
+        try:
+            register_views(wid, mats, cmap="viridis", levels=None)
+            for lbl, m in mats[1:]:
+                emit_view_figure(wid, m, lbl, kind="2d", cmap="viridis",
+                                 levels=None)
+        except Exception as e:
+            log.debug("re-registering the maps views failed: %s", e)
+
+    def commit(self):
+        """Keep the current maps as a tree of their own.
+
+        The live window belongs to the caret and is refreshed as more
+        positions are fitted; this makes a snapshot that does not move.
+        """
+        if self.session is None:
+            return None
+        if self.store is None or not self.store.coverage()[0]:
+            ipc.emit_error("Fit: fit something before keeping the maps")
+            return None
+        maps = self.result_maps()
+        if not maps:
+            ipc.emit_error("Fit: no component produced a map")
+            return None
+        return self._open_maps(maps)
 
     def nav_shape(self):
         try:
@@ -1296,6 +1345,7 @@ def fit_open(session, plot, payload=None) -> None:
     _send_catalogue(session, wiz, src, gen)
     wiz.draw_preview()
     wiz.sync_widgets()
+    wiz.show_maps()          # flat now, filled in as positions are fitted
     wiz.emit_state("Add a component to begin." if not len(wiz.spec)
                    else "Model restored.")
 
@@ -1345,9 +1395,10 @@ def fit_add_component(session, plot, payload) -> None:
         cspec.name = f"{base} {n}"
     wiz.spec.append(cspec)
     wiz.result = None                       # the old fit no longer describes it
-    wiz.forget_all()   # stored vectors are positional; the parameters changed
+    wiz._ensure_store(force=True)   # the packed width changed with the model
     wiz.draw_preview()
     wiz.sync_widgets()
+    wiz.show_maps()          # one more (or one fewer) map to fill in
     wiz.emit_state(f"Added {cspec.name}.")
 
 
@@ -1404,9 +1455,10 @@ def fit_from_composition(session, plot, payload) -> None:
 
     wiz.spec = spec
     wiz.result = None
-    wiz.forget_all()   # stored vectors are positional; the parameters changed
+    wiz._ensure_store(force=True)   # the packed width changed with the model
     wiz.draw_preview()
     wiz.sync_widgets()
+    wiz.show_maps()          # one more (or one fewer) map to fill in
     dropped = info.get("dropped") or []
     wiz.emit_state(
         f"Built {len(spec)} components for {', '.join(info['elements'])}."
@@ -1421,10 +1473,11 @@ def fit_remove_component(session, plot, payload) -> None:
     name = (payload or {}).get("name")
     wiz.spec.components = [c for c in wiz.spec.components if c.name != name]
     wiz.result = None
-    wiz.forget_all()   # stored vectors are positional; the parameters changed
+    wiz._ensure_store(force=True)   # the packed width changed with the model
     wiz.clear_preview()
     wiz.draw_preview()
     wiz.sync_widgets()
+    wiz.show_maps()          # one more (or one fewer) map to fill in
     wiz.emit_state(f"Removed {name}.")
 
 
@@ -1497,12 +1550,13 @@ def fit_current(session, plot, payload=None) -> None:
         return
 
     wiz.result = None          # a single-spectrum fit is NOT a scan result
-    wiz.remember(res.values[0])          # this position's answer, kept
+    wiz.remember(res.values[0], chisq=float(res.chisq[0]))
     wiz.update_widgets()      # handles first, then the push — see _on_widget_drag
     wiz.draw_preview()
+    wiz.show_maps()           # one more position filled in
     ok = "converged" if bool(res.converged[0]) else "did not converge"
     wiz.emit_state(f"This spectrum {ok} (chi2 {res.chisq[0]:.3g}). "
-                   f"{len(wiz.tree.fit_store)} position(s) fitted.")
+                   f"{wiz.store.coverage()[0]} position(s) fitted.")
 
 
 def fit_navigated(session, plot, payload=None) -> None:
@@ -1632,7 +1686,7 @@ def fit_run(session, plot, payload=None) -> None:
         ipc.emit_status(f"Fit complete — {pct:.0f}% converged "
                         f"({result.n_iter} iterations{extra})")
         wiz.emit_state(f"{pct:.0f}% converged{extra}. "
-                       f"{len(wiz.tree.fit_poor)} position(s) fit poorly.")
+                       f"{wiz.poor_positions()} position(s) fit poorly.")
 
     wiz.run_on_worker(_fit, name="fit-run", on_done=_done)
 
@@ -1687,7 +1741,7 @@ def fit_refit_poor(session, plot, payload=None) -> None:
         except Exception as e:
             log.debug("re-opening the fit result maps failed: %s", e)
         wiz.emit_state(f"Refit {rescued} poor position(s). "
-                       f"{len(wiz.tree.fit_poor)} still poor.")
+                       f"{wiz.poor_positions()} still poor.")
 
     ipc.emit_status("Refitting the positions that fit poorly…")
     wiz.run_on_worker(_work, name="fit-refit-poor", on_done=_done)
