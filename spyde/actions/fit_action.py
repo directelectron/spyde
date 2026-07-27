@@ -338,6 +338,38 @@ class FitWizard(WizardController):
             return
         self.tree.fit_store[key] = np.asarray(values, float).copy()
 
+    @staticmethod
+    def position_of(flat: int, nav_shape) -> tuple:
+        """Flat spectrum index -> the key :meth:`remember` would use.
+
+        The exact inverse of the ``ravel_multi_index(reversed(indices))`` the
+        run path uses, so a whole-scan fit lands in the same slots a per-point
+        one does. Getting the reversal wrong here would store every position
+        transposed — and on a square scan nothing would ever look wrong.
+        """
+        return tuple(reversed([int(v) for v in
+                               np.unravel_index(int(flat), tuple(nav_shape))]))
+
+    def record_run(self, result, nav_shape) -> int:
+        """Record a whole-scan fit into the store. Returns how many landed.
+
+        A run has fitted every position, so the coverage readout should say so
+        and navigating afterwards should RECALL rather than refit — it used to
+        report "0 fitted" immediately after fitting the entire scan.
+
+        Only the CONVERGED ones. A position that did not converge is not an
+        answer to remember, and leaving it out lets a later adaptive pass try
+        again from a better neighbouring seed.
+        """
+        self.forget_all()
+        converged = np.asarray(result.converged).ravel()
+        values = np.asarray(result.values)
+        for flat_i, ok in enumerate(converged):
+            if ok:
+                self.tree.fit_store[self.position_of(flat_i, nav_shape)] = \
+                    np.asarray(values[flat_i], float).copy()
+        return len(self.tree.fit_store)
+
     def recall(self) -> bool:
         """Load this position's stored fit into the model. True if there was one."""
         key = self.current_indices()
@@ -1351,10 +1383,16 @@ def fit_run(session, plot, payload=None) -> None:
             return
         wiz.result = result
         wiz.spec = spec
-        # Show the fit at the CURRENT position, so the preview reflects the
-        # result rather than the pre-run guess.
         try:
-            idx = getattr(wiz.plot, "current_indices", None)
+            wiz.record_run(result, nav_shape)
+        except Exception as e:
+            log.debug("recording the run into the fit store failed: %s", e)
+        # Show the fit at the CURRENT position, so the preview reflects the
+        # result rather than the pre-run guess. `current_indices` lives on the
+        # navigation SELECTOR, not the plot — reading it off the plot always
+        # gave None, so this silently showed position 0's parameters.
+        try:
+            idx = wiz.current_indices()
             flat = 0
             if idx is not None and nav_shape:
                 flat = int(np.ravel_multi_index(
@@ -1363,6 +1401,7 @@ def fit_run(session, plot, payload=None) -> None:
         except Exception as e:
             log.debug("seeding the post-fit preview failed: %s", e)
         wiz.draw_preview()
+        wiz.update_widgets()    # the curves moved; the handles go with them
         pct = 100.0 * result.convergence_rate
         ipc.emit_status(f"Fit complete — {pct:.0f}% converged "
                     f"({result.n_iter} iterations)")

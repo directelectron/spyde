@@ -379,6 +379,84 @@ class TestBackgroundAnchors:
         assert evaluate_component(wiz.spec[name], [0.0])[0] == pytest.approx(123.0)
 
 
+class TestARunFillsTheStore:
+    """A whole-scan run has fitted every position — so say so, and remember it.
+
+    It used to report "0 fitted" straight after fitting the entire scan, and
+    navigating afterwards refit positions it had just solved. It also left the
+    handles where they were while the curves jumped to the fitted values, and
+    seeded the post-run preview from position 0 because it read
+    `current_indices` off the PLOT (the same mistake that made "Fit spectrum"
+    fit the navigation mean).
+    """
+
+    def test_position_of_inverts_the_flat_index(self, window, fitted):
+        """On a square scan a transposed key looks identical, so this is
+        checked on a NON-square one."""
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        wiz = tree._fit_wizard
+        nav = (4, 5)
+        for iy in range(nav[0]):
+            for ix in range(nav[1]):
+                flat = int(np.ravel_multi_index((iy, ix), nav))
+                # `remember` keys on current_indices(), which the run path
+                # ravels as reversed(indices) — so the key is (ix, iy).
+                assert wiz.position_of(flat, nav) == (ix, iy)
+
+    @staticmethod
+    def _run(window, fitted):
+        """Fit the whole scan and record it, without the worker marshal.
+
+        `fit_run`'s `_done` is dispatched onto the asyncio main thread, which
+        does not turn under pytest — the existing run test sidesteps it the
+        same way. The compute is the engine's; what is under test here is what
+        the wizard does with the result.
+        """
+        from spyde.fitting.engine import fit_batched
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Offset"})
+        wiz = tree._fit_wizard
+        result = fit_batched(wiz.spec, wiz.signal.data, wiz.axis(),
+                             device="cpu", max_iter=60)
+        wiz.record_run(result, wiz.nav_shape())
+        return wiz, result
+
+    def test_a_run_records_every_converged_position(self, window, fitted):
+        _session, _plot, tree, _ = fitted
+        wiz, result = self._run(window, fitted)
+        assert tree.fit_store, "a whole-scan run recorded nothing"
+        assert len(tree.fit_store) == int(np.asarray(result.converged).sum())
+        for key, values in tree.fit_store.items():
+            assert len(key) == 2
+            assert len(values) == len(tree.fit_spec.parameter_names())
+
+    def test_an_unconverged_position_is_not_remembered(self, window, fitted):
+        """A failed fit is not an answer. Storing it would make an adaptive
+        pass recall the failure instead of retrying from a better seed."""
+        _session, _plot, tree, _ = fitted
+        wiz, result = self._run(window, fitted)
+        result.converged[:] = False
+        wiz.record_run(result, wiz.nav_shape())
+        assert tree.fit_store == {}
+
+    def test_navigating_after_a_run_recalls_instead_of_refitting(self, window,
+                                                                 fitted):
+        _session, _plot, tree, _ = fitted
+        wiz, _result = self._run(window, fitted)
+        key = next(iter(tree.fit_store))
+        _fake_nav(tree, key)
+        assert wiz.recall() is True
+
+    def test_a_run_reports_its_coverage(self, window, fitted):
+        _session, _plot, tree, _ = fitted
+        wiz, _result = self._run(window, fitted)
+        wiz.emit_state()
+        state = _messages_of(window, "fit_state")[-1]
+        assert state["fitted_count"] == len(tree.fit_store) > 0
+
+
 class TestBackgroundSeeding:
     """A new background arrives ON the data.
 
