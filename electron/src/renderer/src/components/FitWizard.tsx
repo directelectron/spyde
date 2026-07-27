@@ -82,6 +82,37 @@ export function FitWizard({ caretPos, windowId, sendAction, onClose }: Props) {
   const adaptiveRef = React.useRef(adaptive)
   adaptiveRef.current = adaptive
 
+  // ── navigator coalescer: one `fit_navigated` in flight, latest wins ─────
+  // A drag posts a pointer_move per frame and each one costs a recall, a
+  // preview redraw and a full model re-send. Sending one per frame queues work
+  // faster than it is served, and the queue drains AFTER the drag: measured 29
+  // moves over 486 ms, with the model settling 1159 ms after the last of them.
+  // That is the pause, and the value finally arriving is the snap.
+  //
+  // Skipping intermediate sends loses nothing: `fit_navigated` reads the
+  // CURRENT selector position when the backend handles it, so one send after
+  // the previous finishes always acts on the newest position. `fit_state`
+  // coming back is the completion signal — self-tuning, unlike a fixed
+  // throttle, and there is a timeout so a lost reply cannot wedge the gate.
+  const inFlight = React.useRef(false)
+  const pending = React.useRef(false)
+  const wedgeTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const sendNavigated = React.useCallback(() => {
+    if (inFlight.current) { pending.current = true; return }
+    inFlight.current = true
+    pending.current = false
+    if (wedgeTimer.current) clearTimeout(wedgeTimer.current)
+    wedgeTimer.current = setTimeout(() => { inFlight.current = false }, 2_000)
+    sendAction('fit_navigated', { adaptive: adaptiveRef.current }, windowId)
+  }, [sendAction, windowId])
+
+  const navDone = React.useCallback(() => {
+    inFlight.current = false
+    if (wedgeTimer.current) { clearTimeout(wedgeTimer.current); wedgeTimer.current = null }
+    if (pending.current) sendNavigated()
+  }, [sendNavigated])
+
   useWizardLifecycle({
     windowId, sendAction,
     openAction: 'fit_open',
@@ -103,6 +134,9 @@ export function FitWizard({ caretPos, windowId, sendAction, onClose }: Props) {
     if (d.components) setComponents(d.components)
     setFitted(Boolean(d.fitted))
     setPoor(d.poor_count ?? 0)
+    // Every backend edit ends in a `fit_state`, so this is the completion
+    // signal the navigator coalescer waits on — see sendNavigated.
+    navDone()
     setCoverage({
       done: d.fitted_count ?? 0,
       total: d.nav_total ?? 0,
@@ -129,19 +163,18 @@ export function FitWizard({ caretPos, windowId, sendAction, onClose }: Props) {
   ownFigIds.current = new Set(
     (state.windows.get(windowId)?.figures ?? []).map((f) => f.figId))
 
-  // Fires on pointer_up, not pointer_move: a fit per pointer frame while
-  // dragging the navigator would queue work faster than it completes.
   React.useEffect(() => {
     const on = (e: Event) => {
-      const d = (e as CustomEvent).detail as
-        { figId?: string; event?: { type?: string } }
+      const d = (e as CustomEvent).detail as { figId?: string }
       if (d.figId && ownFigIds.current.has(d.figId)) return   // our own plot
-      if (d.event?.type && !/up|click/i.test(String(d.event.type))) return
-      sendAction('fit_navigated', { adaptive: adaptiveRef.current }, windowId)
+      sendNavigated()
     }
     window.addEventListener('spyde:figure_event', on)
-    return () => window.removeEventListener('spyde:figure_event', on)
-  }, [windowId, sendAction])
+    return () => {
+      window.removeEventListener('spyde:figure_event', on)
+      if (wedgeTimer.current) clearTimeout(wedgeTimer.current)
+    }
+  }, [sendNavigated])
 
   const add = (kind: string) => {
     sendAction('fit_add_component', { kind }, windowId)

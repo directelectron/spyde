@@ -1574,9 +1574,18 @@ def fit_navigated(session, plot, payload=None) -> None:
 
     With adaptive off and nothing stored, only the preview is redrawn: the
     model stays put and the user sees it against the new spectrum.
+
+    EVERY path here ends in an ``emit_state``. The caret coalesces navigator
+    moves by keeping ONE of these in flight and waiting for the state to come
+    back, so a branch that returned silently would stall the next move until a
+    2-second wedge timer expired — the pause-and-snap this coalescer exists to
+    remove, reintroduced by the back door.
     """
     wiz, _tree = _wizard(session, plot)
-    if wiz is None or not len(wiz.spec):
+    if wiz is None:
+        return                  # the caret is gone; nothing is listening
+    if not len(wiz.spec):
+        wiz.emit_state()
         return
     if wiz.recall():
         wiz.update_widgets()  # handles first, then the push — see _on_widget_drag
@@ -1584,9 +1593,10 @@ def fit_navigated(session, plot, payload=None) -> None:
         wiz.emit_state("Recalled this position's fit.")
         return
     if bool((payload or {}).get("adaptive")):
-        fit_current(session, plot, payload)
+        fit_current(session, plot, payload)     # emits its own state
         return
     wiz.draw_preview()          # same model, new spectrum underneath
+    wiz.emit_state()
 
 
 def fit_run(session, plot, payload=None) -> None:

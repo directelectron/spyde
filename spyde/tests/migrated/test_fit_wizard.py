@@ -1484,6 +1484,34 @@ class TestAdaptiveFit:
         assert wiz.spec["Offset"]["offset"].value == pytest.approx(5.0, abs=0.5)
         assert tree.fit_store.is_set((0, 0)), "an adaptive fit was not remembered"
 
+    def test_every_navigation_path_answers(self, window, fitted):
+        """The caret keeps ONE `fit_navigated` in flight and waits for the
+        state to come back before sending the next. A branch that returned
+        silently would stall the next move until a 2-second wedge timer — the
+        pause-and-snap the coalescer exists to remove."""
+        from spyde.actions.fit_action import fit_navigated
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        wiz = tree._fit_wizard
+
+        # 1. no components at all
+        n = len(_messages_of(window, "fit_state"))
+        fit_navigated(session, plot, {"adaptive": False})
+        assert len(_messages_of(window, "fit_state")) > n, "no model: silent"
+
+        # 2. a model, but nothing stored here, adaptive OFF
+        fit_add_component(session, plot, {"kind": "Offset"})
+        _fake_nav(tree, (3, 3))
+        n = len(_messages_of(window, "fit_state"))
+        fit_navigated(session, plot, {"adaptive": False})
+        assert len(_messages_of(window, "fit_state")) > n, "nothing stored: silent"
+
+        # 3. a stored fit to recall
+        wiz.remember(wiz.spec.flat_values(), chisq=1.0)
+        n = len(_messages_of(window, "fit_state"))
+        fit_navigated(session, plot, {"adaptive": False})
+        assert len(_messages_of(window, "fit_state")) > n, "recall: silent"
+
     def test_navigating_with_no_model_does_nothing(self, window, fitted):
         from spyde.actions.fit_action import fit_navigated
         session, plot, tree, _ = fitted
