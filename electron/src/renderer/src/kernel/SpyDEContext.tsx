@@ -1267,6 +1267,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         // whole model after every edit. Consumed by FitWizard.
         case 'fit_catalogue':
         case 'fit_state':
+        case 'bg_state':
         case 'fv_auto_params':
         case 'fv_models':
         case 'fv_calibration':

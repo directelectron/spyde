@@ -31,6 +31,23 @@ import numpy as np
 log = logging.getLogger(__name__)
 
 
+def _scalar_params(model) -> list:
+    """A live model's scalar parameters, in ``parameter_names()`` order.
+
+    Vector parameters (EELSCLEdge's fine_structure_coeff) are skipped, exactly
+    as ``ComponentSpec.scalar_parameters`` skips them — the packed vector holds
+    one scalar per column, so the two orders must agree.
+    """
+    out = []
+    for comp in model:
+        if not getattr(comp, "active", True):
+            continue
+        for par in comp.parameters:
+            if int(getattr(par, "_number_of_elements", 1) or 1) == 1:
+                out.append(par)
+    return out
+
+
 class FitStore:
     """Fitted parameters per navigation position, in HyperSpy's parameter maps.
 
@@ -223,6 +240,41 @@ class FitStore:
             s = np.asarray(par.map["is_set"], bool).ravel()
             out[s, i] = v[s]
         return out
+
+    # ── save / load, through HyperSpy ─────────────────────────────────────
+    # `m.store(name)` puts the model — components, parameters AND every
+    # position's map — into the signal's own `models`, so it travels with the
+    # dataset: save the .hspy/.zspy and the fit is in it; `hs.load` then
+    # `signal.models.restore(name)` brings it all back, `is_set` included.
+    # Nothing here writes a format of its own.
+    def save_as(self, name: str) -> None:
+        self.model.store(str(name))
+
+    def stored_names(self) -> list[str]:
+        try:
+            return list(self._signal.models._models.as_dictionary().keys())
+        except Exception as e:
+            log.debug("listing stored models failed: %s", e)
+            return []
+
+    @classmethod
+    def restore(cls, spec_cls, signal, name: str):
+        """Load a stored model back into a (spec, store) pair.
+
+        The SPEC is read from the restored model rather than kept alongside it:
+        the model is the thing that was saved, so it is the thing that decides
+        what the components are.
+        """
+        model = signal.models.restore(str(name))
+        spec = spec_cls.from_model(model)
+        store = cls(spec, signal)
+        # `from_model` reads the CURRENT position's values; the per-position
+        # maps are on the restored model, so copy them across parameter by
+        # parameter rather than refitting anything.
+        for dst, src in zip(store._params, _scalar_params(model)):
+            if dst is not None and src is not None:
+                dst.map[...] = src.map
+        return spec, store
 
     # ── the maps a user looks at ──────────────────────────────────────────
     def maps(self, x) -> dict[str, np.ndarray]:

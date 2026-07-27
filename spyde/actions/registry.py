@@ -58,6 +58,8 @@ STAGED_HANDLERS: dict[str, str] = {
     "fit_current":          "spyde.actions.fit_action.fit_current",
     "fit_navigated":        "spyde.actions.fit_action.fit_navigated",
     "fit_refit_poor":       "spyde.actions.fit_action.fit_refit_poor",
+    "fit_save_model":       "spyde.actions.fit_action.fit_save_model",
+    "fit_load_model":       "spyde.actions.fit_action.fit_load_model",
     "bg_open":              "spyde.actions.background_action.bg_open",
     "bg_close":             "spyde.actions.background_action.bg_close",
     "bg_set_model":         "spyde.actions.background_action.bg_set_model",

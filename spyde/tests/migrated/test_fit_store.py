@@ -154,6 +154,53 @@ class TestWholeScan:
         assert store.coverage()[0] == 0
 
 
+class TestSaveAndLoad:
+    """Straight through HyperSpy's own model store, so a fit travels with the
+    dataset: `m.store(name)` puts the components AND every position's map into
+    the signal's `models`, and saving the file saves them with it."""
+
+    def test_a_stored_model_survives_a_save_and_reload(self, tmp_path):
+        from spyde.fitting import ModelSpec
+        sig = _signal()
+        store = FitStore(_spec(), sig)
+        values = np.tile(np.array([100.0, 25.0, 4.0, 50.0, 30.0, 6.0]), (20, 1))
+        store.put_all(values, chisq=np.arange(20.0))
+        store.save_as("spyde_fit")
+
+        path = tmp_path / "with_a_model.hspy"
+        sig.save(str(path))
+        reloaded = hs.load(str(path))
+
+        spec, restored = FitStore.restore(ModelSpec, reloaded, "spyde_fit")
+        assert [c.kind for c in spec.components] == ["Gaussian", "Gaussian"]
+        assert restored.coverage() == (20, 20)
+        assert np.array_equal(restored.values_array(), values)
+
+    def test_the_names_are_listed(self):
+        store = FitStore(_spec(), _signal())
+        assert store.stored_names() == []
+        store.save_as("first")
+        store.save_as("second")
+        assert set(store.stored_names()) == {"first", "second"}
+
+    def test_an_unfitted_position_stays_unfitted_across_the_round_trip(self, tmp_path):
+        """`is_set` is the thing a values-only format would lose — and losing
+        it turns every hole in a component map into a confident zero."""
+        from spyde.fitting import ModelSpec
+        sig = _signal()
+        store = FitStore(_spec(), sig)
+        store.put((1, 2), np.arange(6.0))
+        store.save_as("partial")
+        path = tmp_path / "partial.hspy"
+        sig.save(str(path))
+
+        _spec_out, restored = FitStore.restore(
+            ModelSpec, hs.load(str(path)), "partial")
+        assert restored.coverage() == (1, 20)
+        assert restored.get((1, 2)) is not None
+        assert restored.get((0, 0)) is None
+
+
 class TestMaps:
     def test_every_map_starts_empty(self, store):
         x = np.linspace(0.0, 50.0, 128)

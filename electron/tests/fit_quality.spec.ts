@@ -79,6 +79,27 @@ test('the fitted model matches the spectrum on screen', async () => {
     await sig.getByTestId('subwindow-titlebar').hover()
     await sig.getByTestId('action-btn-Fit').click()
     await expect(page.locator('[data-testid="fit-wizard"]')).toBeVisible({ timeout: 20_000 })
+
+    // Park the navigator FIRST. A new component is seeded from the spectrum
+    // ON SCREEN, so which one that is decides the whole scan's starting point
+    // — and under load the first paint may not have landed when the component
+    // is added. Pinning it keeps this a test of fit QUALITY rather than of
+    // whichever spectrum happened to be up.
+    const crossEarly = await page.evaluate((f) => {
+      const ws = (window as any)._spyde_test_widgets(f)
+      return ws.find((w: any) => w.type === 'crosshair')
+    }, figIds.nav)
+    await page.evaluate(({ f, panel, id }) => {
+      window.postMessage({
+        type: 'awi_event', figId: f,
+        data: JSON.stringify({
+          source: 'js', panel_id: panel, widget_id: id,
+          event_type: 'pointer_up', cx: 16, cy: 16,
+        }),
+      }, '*')
+    }, { f: figIds.nav, panel: crossEarly.panel_id, id: crossEarly.id })
+    await page.waitForTimeout(2_000)
+
     for (let i = 0; i < 2; i++) {
       await page.locator('[data-testid="fit-add-toggle"]').click()
       await expect(page.locator('[data-testid="fit-add-Gaussian"]')).toBeVisible({ timeout: 30_000 })

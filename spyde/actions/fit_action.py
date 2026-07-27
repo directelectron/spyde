@@ -31,6 +31,7 @@ import math
 import numpy as np
 
 from spyde.actions.commit import commit_result_tree
+from spyde.fitting.store import FitStore
 from spyde.actions.context import src_plot_tree as _src_plot_tree
 from spyde.actions.wizard import WizardController
 from spyde.drawing.selectors.base_selector import event_handler_fn
@@ -877,6 +878,11 @@ class FitWizard(WizardController):
             # headline for a scan fit: "99% converged" can still hide a patch
             # where the model fell over.
             "poor_count": self.poor_positions(),
+            # Models already stored on this signal, so the caret can offer them
+            # without a round trip. These are HyperSpy's own — they save and
+            # load with the dataset.
+            "stored_models": (self.store.stored_names()
+                              if self.store is not None else []),
             "status": status,
         })
 
@@ -894,9 +900,22 @@ class FitWizard(WizardController):
         self._closed = True
         self.clear_preview()
         self.clear_widgets()
-        # The MODEL and the RESULT deliberately SURVIVE — they live on the
-        # tree, so reopening the caret restores what the user built. Only the
-        # controller and its on-plot artefacts go.
+        # The live maps window belongs to the CARET, so it closes with it —
+        # it is a preview of the model as it currently stands, and one left
+        # behind is a window that silently stops tracking. "Commit components"
+        # is how you get one that stays.
+        tree = getattr(self, "_maps_tree", None)
+        self._maps_tree = None
+        self._maps_labels = None
+        if tree is not None and not getattr(tree, "_spyde_closed", False):
+            try:
+                self.session._close_tree(tree)
+            except Exception as e:
+                log.debug("closing the fit maps window failed: %s", e)
+        # The MODEL and the per-position STORE deliberately SURVIVE — they live
+        # on the tree, so reopening the caret restores what the user built and
+        # every position already fitted. Only the controller and its on-plot
+        # artefacts go.
         if getattr(self.tree, "_fit_wizard", None) is self:
             self.tree._fit_wizard = None
 
@@ -1699,6 +1718,60 @@ def fit_run(session, plot, payload=None) -> None:
                        f"{wiz.poor_positions()} position(s) fit poorly.")
 
     wiz.run_on_worker(_fit, name="fit-run", on_done=_done)
+
+
+def fit_save_model(session, plot, payload=None) -> None:
+    """Store the model — components AND every position's fit — on the signal.
+
+    Straight through HyperSpy's ``m.store(name)``, so it lands in the signal's
+    own ``models`` and travels with the dataset: save the .hspy/.zspy and the
+    fit is inside it. No SpyDE format, nothing to keep in step.
+    """
+    wiz, _tree = _wizard(session, plot)
+    if wiz is None or wiz.store is None:
+        ipc.emit_error("Fit: open the Fit caret first")
+        return
+    name = str((payload or {}).get("name") or "").strip() or "spyde fit"
+    try:
+        wiz.store.save_as(name)
+    except Exception as e:
+        ipc.emit_error(f"Fit: could not store the model ({e})")
+        return
+    done, total = wiz.store.coverage()
+    ipc.emit_status(f"Model '{name}' stored on the signal ({done}/{total} "
+                    f"positions) — it saves with the dataset")
+    wiz.emit_state(f"Stored as '{name}'. Save the dataset to keep it.")
+
+
+def fit_load_model(session, plot, payload=None) -> None:
+    """Restore a model stored on this signal, per-position fits and all."""
+    from spyde.fitting import ModelSpec
+    wiz, tree = _wizard(session, plot)
+    if wiz is None:
+        ipc.emit_error("Fit: open the Fit caret first")
+        return
+    names = wiz.store.stored_names() if wiz.store is not None else []
+    name = str((payload or {}).get("name") or "").strip()
+    if not name:
+        name = names[-1] if names else ""
+    if not name:
+        ipc.emit_error("Fit: this signal has no stored models")
+        return
+    try:
+        spec, store = FitStore.restore(ModelSpec, wiz.signal, name)
+    except Exception as e:
+        ipc.emit_error(f"Fit: could not restore '{name}' ({e})")
+        return
+    wiz.spec = spec
+    tree.fit_store = store
+    wiz.result = None
+    wiz.recall()
+    wiz.sync_widgets()
+    wiz.update_widgets()
+    wiz.draw_preview()
+    wiz.show_maps()
+    done, total = store.coverage()
+    wiz.emit_state(f"Restored '{name}' — {done}/{total} positions already fitted.")
 
 
 def fit_refit_poor(session, plot, payload=None) -> None:

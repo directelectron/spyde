@@ -28,10 +28,11 @@ import { CenterZeroBeamWizard } from './CenterZeroBeamWizard'
 import { StrainWizard } from './StrainWizard'
 import { CropWizard } from './CropWizard'
 import { FitWizard } from './FitWizard'
+import { BackgroundWizard } from './BackgroundWizard'
 
 const WIZARD_ACTIONS = new Set([
   'Orientation Mapping', 'Find Diffraction Vectors', 'Vector Orientation Mapping',
-  'Center Zero Beam', 'Strain Mapping', 'Crop', 'Fit',
+  'Center Zero Beam', 'Strain Mapping', 'Crop', 'Fit', 'Remove Background',
 ])
 
 /**
@@ -307,6 +308,12 @@ export function FloatingToolbar({
         )}
         {openAction && openAction.name === 'Fit' && (
           <FitWizard
+            caretPos={caretPos} windowId={windowId} sendAction={sendAction}
+            onClose={() => setOpenName(null)}
+          />
+        )}
+        {openAction && openAction.name === 'Remove Background' && (
+          <BackgroundWizard
             caretPos={caretPos} windowId={windowId} sendAction={sendAction}
             onClose={() => setOpenName(null)}
           />

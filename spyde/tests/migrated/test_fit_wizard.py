@@ -664,6 +664,36 @@ class TestTheResultMaps:
         for c in wiz.spec.active_components:
             assert c.name in maps
 
+    def test_closing_the_caret_closes_the_maps_window(self, window, fitted):
+        """The live maps window belongs to the CARET — it is a preview of the
+        model as it stands, so one left behind is a window that has silently
+        stopped tracking. Same scoping the Remove Background span needed."""
+        session, plot, tree, _ = fitted
+        wiz, _result = TestARunFillsTheStore._run(window, fitted)
+        maps = wiz.show_maps()
+        assert maps is not None and not getattr(maps, "_spyde_closed", False)
+        fit_close(session, plot, {})
+        assert getattr(maps, "_spyde_closed", False), \
+            "the maps window outlived the caret that owns it"
+
+    def test_the_committed_tree_is_NOT_closed_with_the_caret(self, window, fitted):
+        """"Commit components" is how you get one that stays."""
+        session, plot, tree, _ = fitted
+        wiz, _result = TestARunFillsTheStore._run(window, fitted)
+        kept = wiz.commit()
+        assert kept is not None
+        fit_close(session, plot, {})
+        assert not getattr(kept, "_spyde_closed", False)
+
+    def test_the_store_survives_the_caret(self, window, fitted):
+        """Only the controller and its on-plot artefacts go — the model and
+        every position already fitted live on the tree."""
+        session, plot, tree, _ = fitted
+        wiz, _result = TestARunFillsTheStore._run(window, fitted)
+        before = tree.fit_store.coverage()
+        fit_close(session, plot, {})
+        assert tree.fit_store.coverage() == before
+
     def test_there_is_ONE_maps_window_refreshed_in_place(self, window, fitted):
         """One window for the life of the caret. Creating a new one per fit
         stacked identical-looking windows with no way to tell which was

@@ -77,6 +77,11 @@ export function FitWizard({ caretPos, windowId, sendAction, onClose }: Props) {
   // How many positions fit worse than their neighbours — the number the
   // "Refit poor" button acts on, and the honest headline for a scan fit.
   const [poor, setPoor] = React.useState(0)
+  // Models already stored on the signal. These are HyperSpy's own — `m.store`
+  // puts the components AND every position's fit into the signal's `models`,
+  // so they travel with the dataset rather than in a format of ours.
+  const [storedModels, setStoredModels] = React.useState<string[]>([])
+  const [modelName, setModelName] = React.useState('spyde fit')
   // Read inside the navigator listener, which is registered once — a state
   // value captured there would be the value at registration forever.
   const adaptiveRef = React.useRef(adaptive)
@@ -129,11 +134,12 @@ export function FitWizard({ caretPos, windowId, sendAction, onClose }: Props) {
     const d = detail as {
       components?: CompState[]; fitted?: boolean; status?: string
       fitted_count?: number; nav_total?: number; position_fitted?: boolean
-      poor_count?: number
+      poor_count?: number; stored_models?: string[]
     }
     if (d.components) setComponents(d.components)
     setFitted(Boolean(d.fitted))
     setPoor(d.poor_count ?? 0)
+    if (d.stored_models) setStoredModels(d.stored_models)
     // Every backend edit ends in a `fit_state`, so this is the completion
     // signal the navigator coalescer waits on — see sendNavigated.
     navDone()
@@ -355,7 +361,39 @@ export function FitWizard({ caretPos, windowId, sendAction, onClose }: Props) {
               )}
               {fitted && (
                 <CommitButton wizardKey="fit" windowId={windowId} sendAction={sendAction}
-                  label="Keep these maps" />
+                  label="Commit components" />
+              )}
+            </div>
+
+            {/* ── save / load, through HyperSpy's own model store ──
+                `m.store(name)` puts the components AND every position's fit
+                into the signal's `models`, so saving the .hspy/.zspy saves the
+                fit with it. Nothing here is a SpyDE format. */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6,
+                          flexWrap: 'wrap', borderTop: '1px solid #313244',
+                          paddingTop: 6 }}>
+              <span style={S.lbl}>Model</span>
+              <input data-testid="fit-model-name" value={modelName}
+                onChange={(e) => setModelName(e.target.value)}
+                style={{ background: '#11111b', border: '1px solid #313244',
+                         borderRadius: 4, color: '#cdd6f4', fontSize: 11,
+                         padding: '2px 5px', width: 110 }} />
+              <button data-testid="fit-save-model" style={S.primary}
+                title="Store this model on the signal — it saves with the dataset"
+                onClick={() => sendAction('fit_save_model', { name: modelName }, windowId)}>
+                Save
+              </button>
+              {storedModels.length > 0 && (
+                <>
+                  <Select testid="fit-stored-models" value={modelName}
+                    options={storedModels.map((n) => ({ value: n, label: n }))}
+                    onChange={(v) => setModelName(v)} />
+                  <button data-testid="fit-load-model" style={S.primary}
+                    title="Restore a stored model, per-position fits and all"
+                    onClick={() => sendAction('fit_load_model', { name: modelName }, windowId)}>
+                    Load
+                  </button>
+                </>
               )}
             </div>
           </div>
