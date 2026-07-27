@@ -61,15 +61,29 @@ channels, power law + 2 gaussians, `multifit(optimizer="lm")`:
 | | |
 |---|---|
 | single `fit()` | 17.6 ms |
-| `multifit` | **10.83 s** = 10.6 ms/spectrum = **95 spectra/s** |
-| extrapolated to 256×256 | **11.6 min** |
+| `multifit` (cold, single run) | 10.83 s = 10.6 ms/spectrum = 95 spectra/s |
+| `multifit` (best of 3, warm) | **9.1 ms/spectrum = 110 spectra/s** |
+| extrapolated to 256×256 | **~10 min** |
 
 Single-threaded, one pixel at a time. That is the number to beat.
 
-Free win found while measuring: **`numexpr` is not installed**, so every
-hyperspy `Expression` component falls back to numpy (it warns on each model
-build). Add it to core deps — costs nothing, speeds up the CPU reference path
-and the live single-spectrum preview.
+**A trap found while measuring — do not "fix" it.** HyperSpy warns
+`Numexpr is not installed, falling back to numpy, which is slower to calculate
+model` on every model build. That advice is **wrong at spectrum sizes**, and
+following it is a pessimisation:
+
+| numexpr | threads | spectra/s |
+|---|---|---|
+| absent | — | **110** |
+| 2.14.2 | 1 | 77 |
+| 2.14.2 | 4 | 75 |
+| 2.14.2 | 48 | 70 |
+
+(best of 3 warm runs, 256 spectra × 1024 channels). numexpr's per-call setup
+and thread dispatch dominate arrays of ~1k elements; it wins on large arrays,
+and a single spectrum is not one. It is deliberately **not** a dependency, with
+a comment in `pyproject.toml` saying so — the warning will keep inviting
+someone to add it.
 
 The engine is the `vector_orientation_gpu.py` playbook applied to curve
 fitting: pack the whole nav grid into `(P, C)` on the GPU and run one batched
