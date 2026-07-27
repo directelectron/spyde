@@ -345,6 +345,58 @@ def _cubic_plane_normals() -> tuple[np.ndarray, np.ndarray]:
     return np.array(normals), np.array(weights)
 
 
+def detector_directions(detector=(60, 60), pc=(0.5, 0.5, 0.55)) -> np.ndarray:
+    """Unit vectors from the sample to each detector pixel (gnomonic).
+
+    ``(dy, dx, 3)``. Shared by the pattern generator and by dictionary
+    simulation so an indexing test cannot pass by having both sides make the
+    same geometry mistake in the same place — they use the identical geometry
+    on purpose, and the thing under test is the MATCHING, not the projection.
+    """
+    pcx, pcy, L = float(pc[0]), float(pc[1]), float(pc[2])
+    dy, dx = int(detector[0]), int(detector[1])
+    gy, gx = np.mgrid[0:dy, 0:dx].astype(float)
+    rx = (gx + 0.5) / dx - pcx
+    ry = pcy - (gy + 0.5) / dy                    # detector y is flipped
+    r = np.stack([rx, ry, np.full_like(rx, L)], -1)
+    return r / np.linalg.norm(r, axis=-1, keepdims=True)
+
+
+def simulate_patterns(euler, detector=(60, 60), pc=(0.5, 0.5, 0.55),
+                      *, background: bool = False) -> np.ndarray:
+    """Kikuchi patterns for a list of orientations -> ``(N, dy, dx)`` float32.
+
+    *euler* is ``(N, 3)`` Bunge angles in radians. This is what builds an
+    indexing DICTIONARY: sample orientation space, simulate each, match against
+    it (#71).
+
+    ``background=False`` by default because a dictionary is matched by
+    normalised cross-correlation, which is invariant to the smooth gradient a
+    real detector adds — and the experimental side has background removal
+    applied before matching anyway (#70).
+    """
+    euler = np.atleast_2d(np.asarray(euler, float))
+    rot = _euler_to_matrix(euler[:, 0], euler[:, 1], euler[:, 2])   # (N, 3, 3)
+    r = detector_directions(detector, pc)
+    dy, dx = r.shape[:2]
+    flat_r = r.reshape(-1, 3)
+
+    normals, weights = _cubic_plane_normals()
+    widths = 0.055 * (weights / weights.max()) + 0.012
+
+    out = np.empty((len(euler), dy, dx), np.float32)
+    for i in range(len(euler)):
+        n_rot = normals @ rot[i].T
+        d = flat_r @ n_rot.T
+        band = np.exp(-0.5 * (d / widths) ** 2) * weights
+        out[i] = band.sum(1).reshape(dy, dx).astype(np.float32)
+    if background:
+        gy, gx = np.mgrid[0:dy, 0:dx].astype(np.float32)
+        out = out / max(out.max(), 1e-9) + (
+            0.35 + 0.30 * ((gy / dy) * 0.6 + (gx / dx) * 0.4))
+    return out
+
+
 def ebsd_patterns(nav=(16, 16), detector=(60, 60), *, pc=(0.5, 0.5, 0.55),
                   seed: int = 0, noise: float = 0.06):
     """Synthetic EBSD patterns with **exact known orientations**.
