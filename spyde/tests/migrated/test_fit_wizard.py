@@ -420,6 +420,7 @@ class TestARunFillsTheStore:
         wiz = tree._fit_wizard
         result = fit_batched(wiz.spec, wiz.signal.data, wiz.axis(),
                              device="cpu", max_iter=60)
+        wiz.result = result                       # as `_done` does
         wiz.record_run(result, wiz.nav_shape())
         return wiz, result
 
@@ -432,14 +433,32 @@ class TestARunFillsTheStore:
             assert len(key) == 2
             assert len(values) == len(tree.fit_spec.parameter_names())
 
-    def test_an_unconverged_position_is_not_remembered(self, window, fitted):
-        """A failed fit is not an answer. Storing it would make an adaptive
-        pass recall the failure instead of retrying from a better seed."""
+    def test_a_poor_position_is_remembered_and_flagged(self, window, fitted):
+        """EVERY position is stored, including the ones that fitted badly.
+
+        Moving the navigator has to show the fit that was made there; a
+        position left out of the store shows whatever the last one left in the
+        model instead, which reads as the fit being stale. A poor fit is still
+        that position's answer — it is FLAGGED, so `fit_refit_poor` can come
+        back to it, not withheld.
+        """
         _session, _plot, tree, _ = fitted
         wiz, result = self._run(window, fitted)
         result.converged[:] = False
         wiz.record_run(result, wiz.nav_shape())
-        assert tree.fit_store == {}
+        assert len(tree.fit_store) == 4 * 5
+        assert len(tree.fit_poor) == 4 * 5
+        assert set(tree.fit_chisq) == set(tree.fit_store)
+
+    def test_refitting_a_position_clears_its_poor_flag(self, window, fitted):
+        _session, _plot, tree, _ = fitted
+        wiz, result = self._run(window, fitted)
+        result.converged[:] = False
+        wiz.record_run(result, wiz.nav_shape())
+        key = next(iter(tree.fit_poor))
+        _fake_nav(tree, key)
+        wiz.remember(np.zeros(len(tree.fit_spec.parameter_names())))
+        assert key not in tree.fit_poor
 
     def test_navigating_after_a_run_recalls_instead_of_refitting(self, window,
                                                                  fitted):
@@ -624,6 +643,42 @@ class TestTwoOfAKindCanBeFitted:
         assert float(c["origin"].value) == origin
 
 
+class TestTheResultMaps:
+    """"Fit all Spectra" has to produce something you can look at."""
+
+    def test_the_maps_include_chi_squared(self, window, fitted):
+        """A component map read WITHOUT it can be a picture of the fit falling
+        over rather than of the sample."""
+        wiz, _result = TestARunFillsTheStore._run(window, fitted)
+        maps = wiz.result_maps()
+        assert "chi squared" in maps
+        assert maps["chi squared"].shape == wiz.nav_shape()
+
+    def test_there_is_one_map_per_component(self, window, fitted):
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Offset"})
+        fit_add_component(session, plot, {"kind": "Gaussian"})
+        wiz = tree._fit_wizard
+        from spyde.fitting.engine import fit_batched
+        wiz.result = fit_batched(wiz.spec, wiz.signal.data, wiz.axis(),
+                                 device="cpu", max_iter=40)
+        maps = wiz.result_maps()
+        for c in wiz.spec.active_components:
+            assert c.name in maps
+
+    def test_the_automatic_window_is_replaced_not_stacked(self, window, fitted):
+        """Three fits used to leave three identical-looking result windows and
+        no way to tell which was current."""
+        wiz, _result = TestARunFillsTheStore._run(window, fitted)
+        first = wiz.show_maps()
+        assert first is not None
+        second = wiz.show_maps()
+        assert second is not None and second is not first
+        assert getattr(first, "_spyde_closed", False), \
+            "the previous fit-maps window was left open"
+
+
 class TestBackgroundSeeding:
     """A new background arrives ON the data.
 
@@ -749,6 +804,33 @@ class TestHandlesStayOnTheComponent:
         assert point.get("x") == pytest.approx(20.0)
         assert point.get("y") == pytest.approx(_height_from_amp(
             _DRAG["Gaussian"], comp["A"].value, comp["sigma"].value))
+
+    def test_moving_the_handles_does_not_discard_the_fit(self, window, fitted):
+        """anyplotlib fires a `pointer_move` on a PROGRAMMATIC widget move as
+        well as a dragged one, so every handle written by `update_widgets`
+        re-enters the drag handler — which treats it as a user edit and throws
+        the fit away. Moving the handles onto a freshly fitted model therefore
+        discarded that fit: the maps would not open ("run the fit before
+        committing") and the Commit button vanished.
+        """
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Gaussian"})
+        wiz = tree._fit_wizard
+        wiz.result = object()
+        wiz.update_widgets()
+        assert wiz.result is not None, "moving the handles discarded the fit"
+
+    def test_a_real_drag_still_discards_it(self, window, fitted):
+        """The guard must not swallow the case it exists for: a genuine drag
+        means the fitted parameters no longer describe the model."""
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Gaussian"})
+        wiz = tree._fit_wizard
+        wiz.result = object()
+        wiz._on_widget_drag("Gaussian", "point", {"x": 20.0, "y": 1.0})
+        assert wiz.result is None
 
     def test_the_handle_being_dragged_is_not_written_back(self, window, fitted):
         """Writing a position back to the handle under the user's finger fights

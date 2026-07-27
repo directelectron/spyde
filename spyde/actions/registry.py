@@ -57,6 +57,7 @@ STAGED_HANDLERS: dict[str, str] = {
     "fit_from_composition": "spyde.actions.fit_action.fit_from_composition",
     "fit_current":          "spyde.actions.fit_action.fit_current",
     "fit_navigated":        "spyde.actions.fit_action.fit_navigated",
+    "fit_refit_poor":       "spyde.actions.fit_action.fit_refit_poor",
     "bg_open":              "spyde.actions.background_action.bg_open",
     "bg_close":             "spyde.actions.background_action.bg_close",
     "bg_set_model":         "spyde.actions.background_action.bg_set_model",

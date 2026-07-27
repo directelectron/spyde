@@ -74,6 +74,9 @@ export function FitWizard({ caretPos, windowId, sendAction, onClose }: Props) {
   const [weighting, setWeighting] = React.useState<'none' | 'poisson'>('none')
   const [adaptive, setAdaptive] = React.useState(false)
   const [coverage, setCoverage] = React.useState({ done: 0, total: 0, here: false })
+  // How many positions fit worse than their neighbours — the number the
+  // "Refit poor" button acts on, and the honest headline for a scan fit.
+  const [poor, setPoor] = React.useState(0)
   // Read inside the navigator listener, which is registered once — a state
   // value captured there would be the value at registration forever.
   const adaptiveRef = React.useRef(adaptive)
@@ -95,9 +98,11 @@ export function FitWizard({ caretPos, windowId, sendAction, onClose }: Props) {
     const d = detail as {
       components?: CompState[]; fitted?: boolean; status?: string
       fitted_count?: number; nav_total?: number; position_fitted?: boolean
+      poor_count?: number
     }
     if (d.components) setComponents(d.components)
     setFitted(Boolean(d.fitted))
+    setPoor(d.poor_count ?? 0)
     setCoverage({
       done: d.fitted_count ?? 0,
       total: d.nav_total ?? 0,
@@ -296,12 +301,28 @@ export function FitWizard({ caretPos, windowId, sendAction, onClose }: Props) {
               <Check testid="fit-seeded" checked={seeded} onChange={setSeeded}
                 label="Seed from a coarse grid" />
             </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8,
+                          flexWrap: 'wrap' }}>
               <button data-testid="fit-run" style={S.primary}
-                disabled={components.length === 0} onClick={run}>Run scan</button>
+                disabled={components.length === 0}
+                title="Fit every spectrum in the dataset; the maps open when it finishes"
+                onClick={run}>Fit all Spectra</button>
+              {/* Refitting the poor positions runs automatically at the end of
+                  a fit. This is the button for doing it again — after changing
+                  the model, or to push harder on what is left. */}
+              {fitted && (
+                <button data-testid="fit-refit-poor" style={S.primary}
+                  title="Restart the positions that fit worse than their neighbours from the best neighbour's answer"
+                  onClick={() => {
+                    setStatus('Refitting the poor positions…')
+                    sendAction('fit_refit_poor', {}, windowId)
+                  }}>
+                  Refit poor{poor > 0 ? ` (${poor})` : ''}
+                </button>
+              )}
               {fitted && (
                 <CommitButton wizardKey="fit" windowId={windowId} sendAction={sendAction}
-                  label="Commit component maps" />
+                  label="Keep these maps" />
               )}
             </div>
           </div>
