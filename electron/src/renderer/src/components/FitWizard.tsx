@@ -66,6 +66,11 @@ export function FitWizard({ caretPos, windowId, sendAction, onClose }: Props) {
   const [maxIter, setMaxIter] = React.useState(60)
   const [seeded, setSeeded] = React.useState(true)
   const [weighting, setWeighting] = React.useState<'none' | 'poisson'>('none')
+  const [adaptive, setAdaptive] = React.useState(false)
+  // Read inside the navigator listener, which is registered once — a state
+  // value captured there would be the value at registration forever.
+  const adaptiveRef = React.useRef(adaptive)
+  adaptiveRef.current = adaptive
 
   useWizardLifecycle({
     windowId, sendAction,
@@ -85,6 +90,26 @@ export function FitWizard({ caretPos, windowId, sendAction, onClose }: Props) {
     setFitted(Boolean(d.fitted))
     if (d.status) setStatus(d.status)
   })
+
+  // ── follow the navigator ────────────────────────────────────────────────
+  // The navigator's crosshair lives on a DIFFERENT window, so this listens to
+  // `spyde:figure_event` unfiltered and ignores anything from this window's own
+  // figures — `useWizardEvent` filters by window_id, which would drop exactly
+  // the events wanted here.
+  //
+  // Fires on pointer_up, not pointer_move: a fit per pointer frame while
+  // dragging the navigator would queue work faster than it completes.
+  React.useEffect(() => {
+    const on = (e: Event) => {
+      const d = (e as CustomEvent).detail as
+        { window_id?: number; event?: { type?: string } }
+      if (d.window_id === windowId) return          // our own plot, not the nav
+      if (d.event?.type && !/up|click/i.test(String(d.event.type))) return
+      sendAction('fit_navigated', { adaptive: adaptiveRef.current }, windowId)
+    }
+    window.addEventListener('spyde:figure_event', on)
+    return () => window.removeEventListener('spyde:figure_event', on)
+  }, [windowId, sendAction])
 
   const add = (kind: string) => {
     sendAction('fit_add_component', { kind }, windowId)
@@ -171,6 +196,11 @@ export function FitWizard({ caretPos, windowId, sendAction, onClose }: Props) {
                 onClick={() => sendAction('fit_current', {}, windowId)}>
                 Fit spectrum
               </button>
+              {/* Refit automatically as the navigator moves. Each position's
+                  answer is remembered, so scrubbing back shows what was found
+                  there rather than the last pixel's model. */}
+              <Check testid="fit-adaptive" checked={adaptive}
+                onChange={setAdaptive} label="Adaptive" />
               {pickerOpen && (
                 <div data-testid="fit-palette"
                   style={{

@@ -128,6 +128,11 @@ class FitWizard(WizardController):
         # took a minute to fit. `BaseSignalTree.close()` still disposes both.
         if getattr(tree, "fit_spec", None) is None:
             tree.fit_spec = ModelSpec()
+        # Position tuple -> fitted parameter vector, filled in as the user
+        # explores. Sparse on purpose: a full (P, n) array would claim every
+        # position had been fitted when only a handful have.
+        if getattr(tree, "fit_store", None) is None:
+            tree.fit_store = {}
         # One overlay line per component, plus the dashed sum.
         self._comp_lines: dict = {}
         self._sum_line = None
@@ -163,6 +168,62 @@ class FitWizard(WizardController):
 
     def axis(self) -> np.ndarray:
         return np.asarray(self.signal.axes_manager.signal_axes[0].axis, float)
+
+    # ── where the navigator is, and what was fitted there ─────────────────
+    def current_indices(self):
+        """The navigator's position, as a tuple, or None.
+
+        Read from the SELECTOR, not the plot: ``current_indices`` lives on the
+        navigation selector. Looking for it on the Plot (as this first did)
+        always returned None, which is what made "Fit spectrum" silently fit
+        the navigation mean.
+        """
+        npm = getattr(self.tree, "navigator_plot_manager", None)
+        if npm is None:
+            return None
+        for sels in (getattr(npm, "navigation_selectors", {}) or {}).values():
+            for sel in sels:
+                idx = getattr(sel, "current_indices", None)
+                if idx is None:
+                    continue
+                try:
+                    flat = np.atleast_1d(np.asarray(idx)).ravel()
+                    return tuple(int(v) for v in flat)
+                except Exception as e:
+                    log.debug("reading navigator indices failed: %s", e)
+        return None
+
+    def remember(self, values) -> None:
+        """Store the fitted parameters for the CURRENT navigator position.
+
+        The store is keyed by position and lives on the tree beside the model,
+        so scrubbing back to a pixel shows the fit that was made there rather
+        than whatever the last pixel left behind. It is deliberately SPARSE —
+        a dict, not a (P, n) array — because it fills in as the user explores
+        and a full allocation would claim every position had been fitted.
+        """
+        key = self.current_indices()
+        if key is None:
+            return
+        self.tree.fit_store[key] = np.asarray(values, float).copy()
+
+    def recall(self) -> bool:
+        """Load this position's stored fit into the model. True if there was one."""
+        key = self.current_indices()
+        stored = self.tree.fit_store.get(key) if key is not None else None
+        if stored is None or len(stored) != len(self.spec.parameter_names()):
+            return False
+        self.spec.set_flat_values(stored)
+        return True
+
+    def forget_all(self) -> None:
+        """Drop every stored fit.
+
+        Called whenever the component LIST changes: the stored vectors are
+        positional, so after an add or remove they would be silently
+        reinterpreted against the wrong parameters.
+        """
+        self.tree.fit_store.clear()
 
     def current_spectrum(self) -> np.ndarray:
         """The spectrum ON SCREEN — what the preview and "Fit spectrum" fit.
@@ -328,13 +389,27 @@ class FitWizard(WizardController):
         return pos, width, height
 
     def _wire(self, widget, name: str, role: str) -> None:
-        cb = event_handler_fn(
-            lambda event, n=name, r=role: self._on_widget_drag(n, r, event))
-        # Hold the reference: anyplotlib registers callbacks weakly, so a
+        """Register the drag handlers, MOVE and UP separately.
+
+        They do different amounts of work, and that is the whole point. A
+        pointer_move fires at pointer rate; every one of them crossing the IPC
+        boundary to re-send the full model state is what made dragging feel
+        like it was catching. A move now redraws the curve and nothing else;
+        the state message, the partner handle and any refit wait for the
+        release.
+        """
+        move = event_handler_fn(
+            lambda event, n=name, r=role: self._on_widget_drag(n, r, event,
+                                                              live=True))
+        up = event_handler_fn(
+            lambda event, n=name, r=role: self._on_widget_drag(n, r, event,
+                                                              live=False))
+        # Hold the references: anyplotlib registers callbacks weakly, so a
         # handler owned only by this call is collected and the handle goes dead
         # the moment it is grabbed.
-        self._widget_cbs.append(cb)
-        widget.add_event_handler(cb, "pointer_move", "pointer_up")
+        self._widget_cbs.extend((move, up))
+        widget.add_event_handler(move, "pointer_move")
+        widget.add_event_handler(up, "pointer_up")
 
     def update_widgets(self, skip: str | None = None) -> None:
         """MOVE the handles to match the model, in place.
@@ -375,7 +450,7 @@ class FitWizard(WizardController):
         self._widgets.clear()
         self._widget_cbs.clear()
 
-    def _on_widget_drag(self, name: str, role: str, event) -> None:
+    def _on_widget_drag(self, name: str, role: str, event, live: bool = False) -> None:
         """A handle moved — write it back into the model and redraw.
 
         The dragged widget arrives on ``event.source``. Reading ``event.x``
@@ -424,9 +499,14 @@ class FitWizard(WizardController):
                         info, height, float(comp[info["width"]].value))
 
             self.result = None          # the old fit no longer describes it
+            # DURING the drag: redraw the curve and nothing else. Moving the
+            # partner handle and re-sending the model both cross the IPC
+            # boundary, and doing either at pointer rate is what made the curve
+            # lag behind the cursor.
             self.refresh_lines()
-            self.update_widgets(skip=role)
-            self.emit_state()
+            if not live:
+                self.update_widgets(skip=role)
+                self.emit_state()
         except Exception as e:
             log.debug("fit widget drag failed: %s", e)
         finally:
@@ -700,6 +780,7 @@ def fit_add_component(session, plot, payload) -> None:
         cspec.name = f"{base} {n}"
     wiz.spec.append(cspec)
     wiz.result = None                       # the old fit no longer describes it
+    wiz.forget_all()   # stored vectors are positional; the parameters changed
     wiz.draw_preview()
     wiz.sync_widgets()
     wiz.emit_state(f"Added {cspec.name}.")
@@ -758,6 +839,7 @@ def fit_from_composition(session, plot, payload) -> None:
 
     wiz.spec = spec
     wiz.result = None
+    wiz.forget_all()   # stored vectors are positional; the parameters changed
     wiz.draw_preview()
     wiz.sync_widgets()
     dropped = info.get("dropped") or []
@@ -774,6 +856,7 @@ def fit_remove_component(session, plot, payload) -> None:
     name = (payload or {}).get("name")
     wiz.spec.components = [c for c in wiz.spec.components if c.name != name]
     wiz.result = None
+    wiz.forget_all()   # stored vectors are positional; the parameters changed
     wiz.clear_preview()
     wiz.draw_preview()
     wiz.sync_widgets()
@@ -849,10 +932,42 @@ def fit_current(session, plot, payload=None) -> None:
         return
 
     wiz.result = None          # a single-spectrum fit is NOT a scan result
+    wiz.remember(res.values[0])          # this position's answer, kept
     wiz.draw_preview()
     wiz.update_widgets()
     ok = "converged" if bool(res.converged[0]) else "did not converge"
-    wiz.emit_state(f"This spectrum {ok} (chi2 {res.chisq[0]:.3g}).")
+    wiz.emit_state(f"This spectrum {ok} (chi2 {res.chisq[0]:.3g}). "
+                   f"{len(wiz.tree.fit_store)} position(s) fitted.")
+
+
+def fit_navigated(session, plot, payload=None) -> None:
+    """The navigator moved — show this position's fit.
+
+    Two behaviours, in order:
+
+    1. If this position has been fitted before, RECALL it. Scrubbing back to a
+       pixel should show what was found there, not whatever the last pixel left
+       in the model.
+    2. Otherwise, if adaptive fitting is on, fit this spectrum now — seeded
+       from the model as it stands, which after step 1 is a neighbouring
+       position's answer and therefore a good starting point (the same reason
+       seeded propagation works for the whole scan, #54).
+
+    With adaptive off and nothing stored, only the preview is redrawn: the
+    model stays put and the user sees it against the new spectrum.
+    """
+    wiz, _tree = _wizard(session, plot)
+    if wiz is None or not len(wiz.spec):
+        return
+    if wiz.recall():
+        wiz.draw_preview()
+        wiz.update_widgets()
+        wiz.emit_state("Recalled this position's fit.")
+        return
+    if bool((payload or {}).get("adaptive")):
+        fit_current(session, plot, payload)
+        return
+    wiz.draw_preview()          # same model, new spectrum underneath
 
 
 def fit_run(session, plot, payload=None) -> None:

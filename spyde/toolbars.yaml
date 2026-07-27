@@ -325,7 +325,7 @@ functions:
 
   Remove Background:
     description: Fit a background over a dragged window and subtract it. The window is the primary input — drag the green band over a region that is background only; the model is fitted there and extrapolated across the whole axis, per navigation position.
-    icon: drawing/toolbars/icons/fit.svg
+    icon: drawing/toolbars/icons/remove_background.svg
     function: spyde.actions.background_action.bg_toolbar
     plot_dim: [1]
     toolbar_side: bottom

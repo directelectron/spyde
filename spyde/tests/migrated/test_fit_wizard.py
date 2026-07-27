@@ -680,3 +680,201 @@ class TestFitsWhatIsOnScreen:
         fit_current(session, plot, {})
         assert wiz.spec["Gaussian"]["A"].value == pytest.approx(
             float(amp[iy, ix]), rel=0.05)
+
+
+def _fake_nav(tree, idx):
+    """Stand in for the navigation selector.
+
+    `current_indices` lives on the SELECTOR, not the plot — reading it off the
+    plot is what made "Fit spectrum" silently fit the navigation mean, so the
+    fake deliberately mirrors the real shape.
+    """
+    class _Sel:
+        current_indices = idx
+
+    class _NPM:
+        navigation_selectors = {0: [_Sel()]}
+
+    tree.navigator_plot_manager = _NPM()
+
+
+class TestPerPositionMemory:
+    """Each navigator position remembers its own fit.
+
+    Scrubbing back to a pixel should show what was found THERE, not whatever
+    the last pixel left in the model.
+    """
+
+    def test_reads_the_position_from_the_selector(self, window, fitted):
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        _fake_nav(tree, (2, 3))
+        assert tree._fit_wizard.current_indices() == (2, 3)
+
+    def test_no_selector_means_no_position(self, window, fitted):
+        """With nothing to ask, the answer is None — and `remember` then stores
+        nothing rather than inventing a key that would collide with every other
+        position that also had no selector."""
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        tree.navigator_plot_manager = None
+        wiz = tree._fit_wizard
+        assert wiz.current_indices() is None
+        wiz.remember([1.0])
+        assert not tree.fit_store
+
+    def test_a_real_session_exposes_a_position(self, window, fitted):
+        """The accessor works against the REAL selector, not just the fake —
+        this is the half that was wrong before (it read the plot, not the
+        selector, and so always saw None)."""
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        assert tree._fit_wizard.current_indices() is not None
+
+    def test_remembers_and_recalls_per_position(self, window, fitted):
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Offset"})
+        wiz = tree._fit_wizard
+
+        _fake_nav(tree, (0, 0))
+        wiz.remember([11.0])
+        _fake_nav(tree, (1, 1))
+        wiz.remember([22.0])
+
+        _fake_nav(tree, (0, 0))
+        assert wiz.recall() is True
+        assert wiz.spec["Offset"]["offset"].value == pytest.approx(11.0)
+        _fake_nav(tree, (1, 1))
+        assert wiz.recall() is True
+        assert wiz.spec["Offset"]["offset"].value == pytest.approx(22.0)
+
+    def test_an_unvisited_position_recalls_nothing(self, window, fitted):
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Offset"})
+        wiz = tree._fit_wizard
+        _fake_nav(tree, (0, 0))
+        wiz.remember([11.0])
+        _fake_nav(tree, (3, 3))
+        assert wiz.recall() is False
+
+    def test_changing_the_model_clears_the_store(self, window, fitted):
+        """Stored vectors are POSITIONAL. After an add or remove they would be
+        reinterpreted against the wrong parameters — a stored sigma arriving as
+        an amplitude — and nothing would look obviously wrong."""
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Offset"})
+        wiz = tree._fit_wizard
+        _fake_nav(tree, (0, 0))
+        wiz.remember([11.0])
+        assert tree.fit_store
+
+        fit_add_component(session, plot, {"kind": "Gaussian"})
+        assert not tree.fit_store, "stale positional vectors survived a model change"
+
+    def test_a_wrong_length_vector_is_refused(self, window, fitted):
+        """Belt and braces for the same hazard."""
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Offset"})
+        wiz = tree._fit_wizard
+        _fake_nav(tree, (0, 0))
+        tree.fit_store[(0, 0)] = np.array([1.0, 2.0, 3.0])   # wrong width
+        assert wiz.recall() is False
+
+    def test_the_store_survives_close_and_reopen(self, window, fitted):
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Offset"})
+        _fake_nav(tree, (0, 0))
+        tree._fit_wizard.remember([7.0])
+        fit_close(session, plot, {})
+        fit_open(session, plot, {})
+        assert tree._fit_wizard.recall() is True
+
+
+class TestAdaptiveFit:
+    def test_navigating_recalls_before_it_refits(self, window, fitted):
+        """A stored answer wins over a fresh fit — same computation, already
+        done, and re-running it could land somewhere slightly different."""
+        from spyde.actions.fit_action import fit_navigated
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Offset"})
+        wiz = tree._fit_wizard
+        _fake_nav(tree, (0, 0))
+        wiz.remember([42.0])
+        wiz.spec["Offset"]["offset"].value = 0.0
+
+        fit_navigated(session, plot, {"adaptive": True})
+        assert wiz.spec["Offset"]["offset"].value == pytest.approx(42.0)
+
+    def test_adaptive_off_leaves_the_model_alone(self, window, fitted):
+        from spyde.actions.fit_action import fit_navigated
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Offset"})
+        wiz = tree._fit_wizard
+        _fake_nav(tree, (3, 3))
+        before = wiz.spec["Offset"]["offset"].value
+        fit_navigated(session, plot, {"adaptive": False})
+        assert wiz.spec["Offset"]["offset"].value == before
+
+    def test_adaptive_on_fits_an_unvisited_position(self, window, fitted):
+        from spyde.actions.fit_action import fit_navigated
+        session, plot, tree, amp = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Offset"})
+        wiz = tree._fit_wizard
+        _fake_nav(tree, (0, 0))
+        plot.current_data = np.asarray(wiz.signal.data, float)[0, 0]
+        wiz.spec["Offset"]["offset"].value = 0.0
+
+        fit_navigated(session, plot, {"adaptive": True})
+        # The data sits on a constant 5.0.
+        assert wiz.spec["Offset"]["offset"].value == pytest.approx(5.0, abs=0.5)
+        assert (0, 0) in tree.fit_store, "an adaptive fit was not remembered"
+
+    def test_navigating_with_no_model_does_nothing(self, window, fitted):
+        from spyde.actions.fit_action import fit_navigated
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_navigated(session, plot, {"adaptive": True})   # must not raise
+
+
+class TestDragSmoothness:
+    """A pointer_move must do LESS work than a pointer_up.
+
+    Every move crossing the IPC boundary to re-send the whole model is what
+    made dragging feel like it was catching. A move redraws the curve; the
+    state message and the partner handle wait for the release.
+    """
+
+    def test_a_live_move_does_not_emit_state(self, window, fitted):
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Gaussian"})
+        wiz = tree._fit_wizard
+        before = len(_messages_of(window, "fit_state"))
+        wiz._on_widget_drag("Gaussian", "point", {"x": 30.0}, live=True)
+        assert len(_messages_of(window, "fit_state")) == before
+
+    def test_the_release_emits_state(self, window, fitted):
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Gaussian"})
+        wiz = tree._fit_wizard
+        before = len(_messages_of(window, "fit_state"))
+        wiz._on_widget_drag("Gaussian", "point", {"x": 30.0}, live=False)
+        assert len(_messages_of(window, "fit_state")) > before
+
+    def test_a_live_move_still_updates_the_model(self, window, fitted):
+        """Cheaper, not inert — the curve must still follow the cursor."""
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Gaussian"})
+        wiz = tree._fit_wizard
+        wiz._on_widget_drag("Gaussian", "point", {"x": 33.0}, live=True)
+        assert wiz.spec["Gaussian"]["centre"].value == pytest.approx(33.0)
