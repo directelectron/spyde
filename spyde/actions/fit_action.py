@@ -887,7 +887,6 @@ def component_catalogue(x: np.ndarray) -> list[dict]:
     """
     import torch
     from spyde.fitting import components as tcomp
-    from spyde.fitting.spec import spec_from_component
 
     lo, hi = float(np.min(x)), float(np.max(x))
     # The shapes depend only on the axis they are sampled over, so reopening the
