@@ -23,6 +23,8 @@ from spyde.ebsd.indexing import (
     sample_orientations,
 )
 from spyde.ebsd.preprocess import average_dot_product_map, remove_background
+from spyde.ebsd.refine import RefinementResult, refine_orientations
 
 __all__ = ["dictionary_index", "sample_orientations", "IndexingResult",
-           "remove_background", "average_dot_product_map"]
+           "remove_background", "average_dot_product_map",
+           "refine_orientations", "RefinementResult"]
