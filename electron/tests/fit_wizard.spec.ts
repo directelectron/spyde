@@ -82,18 +82,6 @@ test('Fit caret: build a model, run it, commit component maps', async () => {
       }
     }
 
-    // ── teardown / reopen, checked BEFORE any work is done ───────────────
-    // Ordered here on purpose. Closing the caret disposes the wizard, and with
-    // it any fitted result — so a close/reopen after Run would discard the fit
-    // and leave nothing to commit. Doing it now costs nothing and still pins
-    // the StrictMode contract (open, close, open must leave exactly ONE live
-    // caret), which the backend test cannot observe.
-    await page.locator('[data-testid="fit-close"]').click()
-    await expect(caret).toBeHidden({ timeout: 15_000 })
-    await sig.getByTestId('subwindow-titlebar').hover()
-    await fitBtn.click()
-    await expect(page.locator('[data-testid="fit-wizard"]')).toHaveCount(1, { timeout: 15_000 })
-    await caretSettled()
 
     const addComponent = async (kind: string) => {
       // The picker is a POPUP behind "+ Component" and closes after each pick.
@@ -125,7 +113,30 @@ test('Fit caret: build a model, run it, commit component maps', async () => {
     await centre.blur()
     await page.waitForTimeout(1_500)
     await expect(centre).toHaveValue(/^53[12]/, { timeout: 10_000 })
+    // This screenshot is where the LIVE PREVIEW and the on-plot drag handles
+    // (#57) are checked — both live inside the anyplotlib figure, so there is
+    // no DOM assertion for them and the pixels are the test. A silently broken
+    // preview looks exactly like a working one to every other check here: the
+    // first version passed this whole spec while drawing nothing, because
+    // add_line takes `label` and was being given `name`.
     await page.screenshot({ path: `${SHOTS}/06-param-edited.png`, fullPage: true })
+
+    // ── the model must SURVIVE close / reopen ────────────────────────────
+    // The model and the fit live on the TREE, not on the caret controller: a
+    // model costs real effort to build and a fit costs minutes, so closing the
+    // caret to get it out of the way must not discard either.
+    await page.locator('[data-testid="fit-close"]').click()
+    await expect(caret).toBeHidden({ timeout: 15_000 })
+    await sig.getByTestId('subwindow-titlebar').hover()
+    await fitBtn.click()
+    // Exactly ONE caret — the StrictMode open/close/open contract.
+    await expect(page.locator('[data-testid="fit-wizard"]')).toHaveCount(1, { timeout: 15_000 })
+    await expect(page.locator('[data-testid="fit-comp-Gaussian"]'))
+      .toBeVisible({ timeout: 15_000 })
+    await expect(page.locator('[data-testid="fit-p-Gaussian-centre"]'))
+      .toHaveValue(/^53[12]/, { timeout: 10_000 })
+    await caretSettled()
+    await page.screenshot({ path: `${SHOTS}/06b-model-restored.png`, fullPage: true })
 
     // ── run the fit (second tab) ─────────────────────────────────────────
     await page.locator('[data-testid="fit-tab-Run"]').click()

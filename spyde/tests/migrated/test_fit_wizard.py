@@ -113,6 +113,155 @@ class TestOpenClose:
         fit_close(session, plot, {})
 
 
+class TestPersistence:
+    """The model and the fit live on the TREE, not the controller.
+
+    A fit costs minutes; closing the caret to get it out of the way must not
+    throw it away. Only `tree.close()` disposes them.
+    """
+
+    def test_the_model_survives_close_and_reopen(self, window, fitted):
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Gaussian"})
+        fit_set_param(session, plot, {"component": "Gaussian",
+                                      "parameter": "centre", "value": 25.0})
+        fit_close(session, plot, {})
+        fit_open(session, plot, {})
+        state = _messages_of(window, "fit_state")[-1]
+        assert [c["kind"] for c in state["components"]] == ["Gaussian"]
+        assert tree._fit_wizard.spec["Gaussian"]["centre"].value == 25.0
+
+    def test_the_fit_survives_close_and_reopen(self, window, fitted):
+        """So Commit is still offered after the caret has been closed."""
+        session, plot, tree, amp = fitted
+        from spyde.fitting.engine import fit_batched
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Offset"})
+        wiz = tree._fit_wizard
+        wiz.result = fit_batched(wiz.spec, wiz.signal.data, wiz.axis(),
+                                 device="cpu", max_iter=20)
+        fit_close(session, plot, {})
+        fit_open(session, plot, {})
+        assert tree._fit_wizard.result is not None
+        assert _messages_of(window, "fit_state")[-1]["fitted"] is True
+
+    def test_the_model_lives_on_the_tree_not_the_controller(self, window, fitted):
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Gaussian"})
+        fit_close(session, plot, {})
+        assert getattr(tree, "_fit_wizard", None) is None   # controller gone
+        assert len(tree.fit_spec) == 1                       # model stayed
+
+    def test_reopening_reports_the_restored_model(self, window, fitted):
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Gaussian"})
+        fit_close(session, plot, {})
+        fit_open(session, plot, {})
+        assert "restored" in (_messages_of(window, "fit_state")[-1]["status"] or "")
+
+
+class TestDragHandles:
+    """The on-plot handles (#57).
+
+    The conversions are the substance: for most components the fitted amplitude
+    is an AREA, so storing a dragged height straight into `A` would jump the
+    curve by a factor of sigma*sqrt(2*pi).
+    """
+
+    def test_height_and_amplitude_round_trip(self):
+        from spyde.actions.fit_action import (
+            _DRAG, _amp_from_height, _height_from_amp,
+        )
+        for kind, info in _DRAG.items():
+            width = 3.0
+            amp = _amp_from_height(info, 7.0, width)
+            assert _height_from_amp(info, amp, width) == pytest.approx(7.0), kind
+
+    def test_a_gaussians_amplitude_is_an_area_not_a_height(self):
+        """The specific trap: dragging a Gaussian handle to y=1 must store an
+        AREA, not 1 — otherwise the curve leaps as soon as it is touched."""
+        from spyde.actions.fit_action import _DRAG, _amp_from_height
+        got = _amp_from_height(_DRAG["Gaussian"], 1.0, 2.0)
+        assert got == pytest.approx(2.0 * np.sqrt(2 * np.pi))
+
+    def test_a_height_parameterised_component_is_left_alone(self):
+        from spyde.actions.fit_action import _DRAG, _amp_from_height
+        assert _amp_from_height(_DRAG["GaussianHF"], 5.0, 2.0) == 5.0
+
+    def test_only_positioned_components_get_handles(self):
+        """A background has nothing on the plot to point at."""
+        from spyde.actions.fit_action import _DRAG
+        assert "Gaussian" in _DRAG and "Lorentzian" in _DRAG
+        for background in ("Offset", "PowerLaw", "Polynomial", "Exponential"):
+            assert background not in _DRAG
+
+    def test_every_drag_target_names_real_parameters(self):
+        """A typo in the drag table would silently disable the handles for that
+        component — the KeyError is swallowed per-component."""
+        import hyperspy.components1d as c1d
+        from spyde.actions.fit_action import _DRAG
+        for kind, info in _DRAG.items():
+            names = {p.name for p in getattr(c1d, kind)().parameters}
+            assert info["pos"] in names, kind
+            assert info["amp"] in names, kind
+            if info["width"]:
+                assert info["width"] in names, kind
+
+    def test_drag_writes_back_into_the_model(self, window, fitted):
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Gaussian"})
+        wiz = tree._fit_wizard
+        # Stand in for the widget: register a handle and feed it a drag event.
+        wiz._widgets["w1"] = ("Gaussian", "point")
+        wiz._on_widget_drag({"id": "w1", "x": 31.5, "y": 2.0})
+        assert wiz.spec["Gaussian"]["centre"].value == pytest.approx(31.5)
+
+    def test_dragging_invalidates_a_previous_fit(self, window, fitted):
+        """Moving a component means the fitted parameters no longer describe
+        the model — offering Commit would export a stale map."""
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Gaussian"})
+        wiz = tree._fit_wizard
+        wiz.result = object()
+        wiz._widgets["w1"] = ("Gaussian", "point")
+        wiz._on_widget_drag({"id": "w1", "x": 20.0, "y": 1.0})
+        assert wiz.result is None
+
+    def test_an_unknown_widget_id_is_ignored(self, window, fitted):
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Gaussian"})
+        before = tree._fit_wizard.spec["Gaussian"]["centre"].value
+        tree._fit_wizard._on_widget_drag({"id": "nope", "x": 999.0})
+        assert tree._fit_wizard.spec["Gaussian"]["centre"].value == before
+
+    def test_width_drag_keeps_the_peak_height(self, window, fitted):
+        """Changing sigma alone would change the peak HEIGHT under the cursor
+        for an area-parameterised component, which reads as the curve fighting
+        the drag."""
+        from spyde.actions.fit_action import _DRAG, _height_from_amp
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Gaussian"})
+        wiz = tree._fit_wizard
+        comp = wiz.spec["Gaussian"]
+        info = _DRAG["Gaussian"]
+        before = _height_from_amp(info, comp["A"].value, comp["sigma"].value)
+
+        wiz._widgets["r1"] = ("Gaussian", "range")
+        centre = comp["centre"].value
+        wiz._on_widget_drag({"id": "r1", "x0": centre - 9.0, "x1": centre + 9.0})
+
+        after = _height_from_amp(info, comp["A"].value, comp["sigma"].value)
+        assert after == pytest.approx(before, rel=1e-6)
+        assert comp["sigma"].value != pytest.approx(3.0)
+
+
 class TestBuildingTheModel:
     def test_add_component_appears_in_the_state(self, window, fitted):
         session, plot, tree, _ = fitted

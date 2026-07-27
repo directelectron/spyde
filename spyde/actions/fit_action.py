@@ -26,6 +26,7 @@ Three things specific to this wizard:
 from __future__ import annotations
 
 import logging
+import math
 
 import numpy as np
 
@@ -39,6 +40,8 @@ from spyde.actions.wizard import WizardController
 from spyde.backend import ipc
 
 log = logging.getLogger(__name__)
+
+_SQRT_2PI = math.sqrt(2.0 * math.pi)
 
 # Offered in the picker, in the order a user is likely to want them: the
 # backgrounds first, then the peak shapes, then the steps.
@@ -55,6 +58,49 @@ CATALOGUE = [
 ]
 
 _PREVIEW_POINTS = 64
+
+# How each component maps onto the on-plot drag handles (#57).
+#
+#   pos    the parameter the POINT widget's x drives
+#   width  the parameter the RANGE widget's span drives
+#   amp    the parameter the POINT widget's y drives
+#   kind   how amp relates to the curve's HEIGHT at the peak, because for most
+#          components the fitted amplitude is an AREA, not a height — dragging
+#          a handle to y and storing y as `A` would jump the curve by a factor
+#          of sigma*sqrt(2*pi).
+#
+# A component with no `pos` (a background) gets no handles: there is nothing on
+# the plot to point at.
+_DRAG = {
+    "Gaussian":   {"pos": "centre", "width": "sigma", "amp": "A", "amp_kind": "area_gauss"},
+    "Lorentzian": {"pos": "centre", "width": "gamma", "amp": "A", "amp_kind": "area_lorentz"},
+    "GaussianHF": {"pos": "centre", "width": "fwhm", "amp": "height", "amp_kind": "height"},
+    "Erf":        {"pos": "origin", "width": "sigma", "amp": "A", "amp_kind": "height"},
+    "Arctan":     {"pos": "x0", "width": None, "amp": "A", "amp_kind": "height"},
+}
+
+# Half-width of the RANGE widget, per width parameter, so the band a user drags
+# corresponds to something they recognise (a Gaussian's band is its FWHM).
+_WIDTH_TO_HALF = {"sigma": 1.1774, "gamma": 1.0, "fwhm": 0.5}
+
+
+def _amp_from_height(kind_info, height: float, width: float) -> float:
+    """Curve height at the peak -> the component's amplitude parameter."""
+    k = kind_info["amp_kind"]
+    if k == "area_gauss":
+        return float(height) * max(width, 1e-9) * _SQRT_2PI
+    if k == "area_lorentz":
+        return float(height) * math.pi * max(width, 1e-9)
+    return float(height)
+
+
+def _height_from_amp(kind_info, amp: float, width: float) -> float:
+    k = kind_info["amp_kind"]
+    if k == "area_gauss":
+        return float(amp) / max(width * _SQRT_2PI, 1e-9)
+    if k == "area_lorentz":
+        return float(amp) / max(math.pi * width, 1e-9)
+    return float(amp)
 
 
 class FitWizard(WizardController):
@@ -73,9 +119,35 @@ class FitWizard(WizardController):
         super().__init__(session, tree)
         from spyde.fitting import ModelSpec
         self.plot = plot
-        self.spec = ModelSpec()
-        self.result = None
-        self._preview_name = "fit_preview"
+        # The MODEL and the FIT live on the TREE, not on this controller.
+        # They are RESULTS (the ownership map in actions/README.md §3 puts
+        # results on the tree and controllers alongside them), and a fit is
+        # expensive — closing the caret to get it out of the way should not
+        # throw away a model the user spent minutes building or a scan that
+        # took a minute to fit. `BaseSignalTree.close()` still disposes both.
+        if getattr(tree, "fit_spec", None) is None:
+            tree.fit_spec = ModelSpec()
+        self._preview_label = "fit_preview"
+        self._preview_line = None
+        # widget id -> (component name, role) for the on-plot drag handles.
+        self._widgets: dict = {}
+        self._widget_cb = None
+
+    @property
+    def spec(self):
+        return self.tree.fit_spec
+
+    @spec.setter
+    def spec(self, value):
+        self.tree.fit_spec = value
+
+    @property
+    def result(self):
+        return getattr(self.tree, "fit_result", None)
+
+    @result.setter
+    def result(self, value):
+        self.tree.fit_result = value
 
     # ── the signal being fitted ───────────────────────────────────────────
     @property
@@ -118,24 +190,135 @@ class FitWizard(WizardController):
             log.debug("evaluating the fit preview failed: %s", e)
             return
         try:
-            p1.add_line(np.asarray(y, np.float32), x_axis=self.axis(),
-                        name=self._preview_name, color="#f5a97f", linewidth=1.6)
+            # `label`, NOT `name` — Plot1D.add_line takes `label`, and passing
+            # `name` raised a TypeError this method's own except swallowed, so
+            # the preview silently never drew.
+            self.clear_preview()
+            self._preview_line = p1.add_line(
+                np.asarray(y, np.float32), x_axis=self.axis(),
+                label=self._preview_label, color="#f5a97f", linewidth=1.8)
         except Exception as e:
             log.debug("drawing the fit preview failed: %s", e)
 
     def clear_preview(self) -> None:
+        """Remove the previous preview line.
+
+        Keeps the HANDLE ``add_line`` returned — ``remove_line`` takes an id or
+        a ``Line1D``, NOT the label. Passing the label raises a KeyError that
+        was swallowed here, so every redraw stacked another line and the legend
+        filled up with `fit_preview` entries.
+        """
+        p1 = getattr(self.plot, "_plot1d", None)
+        line = getattr(self, "_preview_line", None)
+        if p1 is None or line is None:
+            return
+        try:
+            p1.remove_line(line)
+        except Exception as e:
+            log.debug("clearing the fit preview failed: %s", e)
+        finally:
+            self._preview_line = None
+
+    # ── on-plot drag handles (#57) ────────────────────────────────────────
+    def sync_widgets(self) -> None:
+        """Put a POINT handle (centre + height) and a RANGE handle (width) on
+        each component that has a position on the axis.
+
+        Rebuilt wholesale rather than diffed: a model is a handful of
+        components, and reconciling handle-to-component identity across an
+        add/remove is exactly the kind of bookkeeping that leaves an orphaned
+        handle dragging a component that no longer exists.
+        """
         p1 = getattr(self.plot, "_plot1d", None)
         if p1 is None:
             return
-        for meth in ("remove_line", "remove_lines"):
-            fn = getattr(p1, meth, None)
-            if fn is None:
-                continue
+        self.clear_widgets()
+        from spyde.drawing.selectors.base_selector import event_handler_fn
+        self._widget_cb = event_handler_fn(self._on_widget_drag)
+
+        for comp in self.spec.active_components:
+            info = _DRAG.get(comp.kind)
+            if info is None:
+                continue                      # a background has nothing to point at
             try:
-                fn(self._preview_name)
-                return
+                pos = float(comp[info["pos"]].value)
+                width = (float(comp[info["width"]].value)
+                         if info["width"] else (self.axis().ptp() / 20.0))
+                height = _height_from_amp(info, float(comp[info["amp"]].value),
+                                          width)
+                pw = p1.add_point_widget(x=pos, y=height, color="#f5a97f")
+                self._widgets[pw.id] = (comp.name, "point")
+                pw.add_event_handler(self._widget_cb, "pointer_move", "pointer_up")
+                if info["width"]:
+                    half = width * _WIDTH_TO_HALF.get(info["width"], 1.0)
+                    rw = p1.add_range_widget(x0=pos - half, x1=pos + half,
+                                             color="#89b4fa", y=height / 2)
+                    self._widgets[rw.id] = (comp.name, "range")
+                    rw.add_event_handler(self._widget_cb, "pointer_move",
+                                         "pointer_up")
             except Exception as e:
-                log.debug("clearing the fit preview via %s failed: %s", meth, e)
+                log.debug("adding drag handles for %s failed: %s", comp.name, e)
+
+    def clear_widgets(self) -> None:
+        p1 = getattr(self.plot, "_plot1d", None)
+        for wid in list(self._widgets):
+            try:
+                if p1 is not None:
+                    p1.remove_widget(wid)
+            except Exception as e:
+                log.debug("removing fit widget %s failed: %s", wid, e)
+        self._widgets.clear()
+
+    def _on_widget_drag(self, event) -> None:
+        """A handle moved — write it back into the model and redraw.
+
+        Handles are the PRIMARY input for shape (the anyplotlib
+        interactive-fitting example's idiom): the numeric fields stay editable
+        and are refreshed from here, so both directions agree.
+        """
+        try:
+            wid = getattr(event, "id", None) or (event or {}).get("id")
+            target = self._widgets.get(wid)
+            if target is None:
+                return
+            name, role = target
+            comp = self.spec[name]
+            info = _DRAG.get(comp.kind)
+            if info is None:
+                return
+            get = (lambda k: getattr(event, k, None)
+                   if not isinstance(event, dict) else event.get(k))
+
+            if role == "point":
+                x, y = get("x"), get("y")
+                if x is not None:
+                    comp[info["pos"]].value = float(x)
+                if y is not None and info["amp"]:
+                    width = (float(comp[info["width"]].value)
+                             if info["width"] else 1.0)
+                    comp[info["amp"]].value = _amp_from_height(info, float(y),
+                                                               width)
+            else:
+                x0, x1 = get("x0"), get("x1")
+                if x0 is not None and x1 is not None and info["width"]:
+                    half = abs(float(x1) - float(x0)) / 2.0
+                    factor = _WIDTH_TO_HALF.get(info["width"], 1.0)
+                    # Keep the AMPLITUDE fixed as the width changes: for an
+                    # area-parameterised component, changing sigma alone would
+                    # otherwise change the peak HEIGHT under the user's cursor,
+                    # which reads as the curve fighting the drag.
+                    height = _height_from_amp(
+                        info, float(comp[info["amp"]].value),
+                        float(comp[info["width"]].value))
+                    comp[info["width"]].value = max(half / max(factor, 1e-9),
+                                                    1e-6)
+                    comp[info["amp"]].value = _amp_from_height(
+                        info, height, float(comp[info["width"]].value))
+            self.result = None            # the old fit no longer describes it
+            self.draw_preview()
+            self.emit_state()
+        except Exception as e:
+            log.debug("fit widget drag failed: %s", e)
 
     def emit_state(self, status: str | None = None) -> None:
         """Send the whole model to the caret — components, parameters, values.
@@ -164,6 +347,10 @@ class FitWizard(WizardController):
             return
         self._closed = True
         self.clear_preview()
+        self.clear_widgets()
+        # The MODEL and the RESULT deliberately SURVIVE — they live on the
+        # tree, so reopening the caret restores what the user built. Only the
+        # controller and its on-plot artefacts go.
         if getattr(self.tree, "_fit_wizard", None) is self:
             self.tree._fit_wizard = None
 
@@ -265,6 +452,40 @@ def component_catalogue(x: np.ndarray) -> list[dict]:
     return out
 
 
+def scale_to_data(cspec, x: np.ndarray, y: np.ndarray, fraction: float = 0.5) -> None:
+    """Set a component's LINEAR amplitude so it is visible against the data.
+
+    Without this a new component arrives with an amplitude of 1 against counts
+    of 1e5 — the preview curve is a flat line on the axis, the drag handles sit
+    at y=0, and the fit starts five orders of magnitude away from its answer.
+    All three read as "the model does nothing".
+
+    Generic rather than per-component: evaluate the component with its linear
+    parameter at 1, then scale so its peak reaches *fraction* of the data's
+    range. Works for any component the batched library can evaluate, including
+    ones added later.
+    """
+    import torch
+    from spyde.fitting import components as tcomp
+
+    linear = next((p for p in cspec.scalar_parameters if p.linear), None)
+    if linear is None:
+        return
+    try:
+        comp = tcomp.get_component(cspec.kind,
+                                   n_params=len(cspec.scalar_parameters))
+        original, linear.value = linear.value, 1.0
+        vals = np.array([[p.value for p in cspec.scalar_parameters]])
+        unit = comp(torch.as_tensor(np.asarray(x, float)),
+                    torch.as_tensor(vals)).numpy()[0]
+        unit = np.nan_to_num(unit, nan=0.0, posinf=0.0, neginf=0.0)
+        peak = float(np.max(np.abs(unit)))
+        target = float(np.nanmax(np.asarray(y, float))) * float(fraction)
+        linear.value = (target / peak) if peak > 0 else original
+    except Exception as e:
+        log.debug("scaling %s to the data failed: %s", cspec.kind, e)
+
+
 def _seed_for_preview(cspec, lo: float, hi: float) -> None:
     """Put a component somewhere visible on THIS axis.
 
@@ -322,7 +543,10 @@ def fit_open(session, plot, payload=None) -> None:
               "components": component_catalogue(wiz.axis())})
     except Exception as e:
         log.debug("emitting the component catalogue failed: %s", e)
-    wiz.emit_state("Add a component to begin.")
+    wiz.draw_preview()
+    wiz.sync_widgets()
+    wiz.emit_state("Add a component to begin." if not len(wiz.spec)
+                   else "Model restored.")
 
 
 def fit_close(session, plot, payload=None) -> None:
@@ -352,6 +576,9 @@ def fit_add_component(session, plot, payload) -> None:
 
     x = wiz.axis()
     _seed_for_preview(cspec, float(np.min(x)), float(np.max(x)))
+    # Scale the amplitude to THIS spectrum, or the component arrives five
+    # orders of magnitude below the data and looks like it does nothing.
+    scale_to_data(cspec, x, wiz.current_spectrum())
     # A unique name per instance — two Gaussians must be separately addressable
     # by the caret and produce two distinct area maps at commit.
     existing = {c.name for c in wiz.spec.components}
@@ -362,6 +589,7 @@ def fit_add_component(session, plot, payload) -> None:
     wiz.spec.append(cspec)
     wiz.result = None                       # the old fit no longer describes it
     wiz.draw_preview()
+    wiz.sync_widgets()
     wiz.emit_state(f"Added {cspec.name}.")
 
 
@@ -374,6 +602,7 @@ def fit_remove_component(session, plot, payload) -> None:
     wiz.result = None
     wiz.clear_preview()
     wiz.draw_preview()
+    wiz.sync_widgets()
     wiz.emit_state(f"Removed {name}.")
 
 
@@ -393,6 +622,7 @@ def fit_set_param(session, plot, payload) -> None:
         log.debug("fit_set_param %s failed: %s", p, e)
         return
     wiz.draw_preview()
+    wiz.sync_widgets()
     wiz.emit_state()
 
 
