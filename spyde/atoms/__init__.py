@@ -26,6 +26,13 @@ from spyde.atoms.finding import (
     refine_center_of_mass,
     refine_gaussian,
 )
+from spyde.atoms.dumbbell import (
+    dumbbell_properties,
+    estimate_dumbbell_vector,
+    find_dumbbells,
+    pair_atoms,
+    refine_pairs,
+)
 from spyde.atoms.properties import (
     displacement_from_ideal,
     displacement_magnitude,
@@ -43,4 +50,6 @@ __all__ = [
     "ellipticity", "ellipticity_angle", "intensity",
     "nearest_neighbour_distance", "displacement_from_ideal",
     "displacement_magnitude", "property_maps", "to_map",
+    "find_dumbbells", "estimate_dumbbell_vector", "pair_atoms",
+    "dumbbell_properties", "refine_pairs",
 ]
