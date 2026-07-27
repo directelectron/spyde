@@ -67,6 +67,7 @@ export function FitWizard({ caretPos, windowId, sendAction, onClose }: Props) {
   const [seeded, setSeeded] = React.useState(true)
   const [weighting, setWeighting] = React.useState<'none' | 'poisson'>('none')
   const [adaptive, setAdaptive] = React.useState(false)
+  const [coverage, setCoverage] = React.useState({ done: 0, total: 0, here: false })
   // Read inside the navigator listener, which is registered once — a state
   // value captured there would be the value at registration forever.
   const adaptiveRef = React.useRef(adaptive)
@@ -85,9 +86,17 @@ export function FitWizard({ caretPos, windowId, sendAction, onClose }: Props) {
   })
 
   useWizardEvent('spyde:fit_state', windowId, (detail) => {
-    const d = detail as { components?: CompState[]; fitted?: boolean; status?: string }
+    const d = detail as {
+      components?: CompState[]; fitted?: boolean; status?: string
+      fitted_count?: number; nav_total?: number; position_fitted?: boolean
+    }
     if (d.components) setComponents(d.components)
     setFitted(Boolean(d.fitted))
+    setCoverage({
+      done: d.fitted_count ?? 0,
+      total: d.nav_total ?? 0,
+      here: Boolean(d.position_fitted),
+    })
     if (d.status) setStatus(d.status)
   })
 
@@ -201,6 +210,14 @@ export function FitWizard({ caretPos, windowId, sendAction, onClose }: Props) {
                   there rather than the last pixel's model. */}
               <Check testid="fit-adaptive" checked={adaptive}
                 onChange={setAdaptive} label="Adaptive" />
+              {/* Coverage, so a skipped position is visible rather than
+                  something you discover when a map comes out patchy. */}
+              {coverage.total > 0 && (
+                <span data-testid="fit-coverage" style={{ ...S.lbl,
+                  color: coverage.here ? '#a6da95' : '#a6adc8' }}>
+                  {coverage.here ? '●' : '○'} {coverage.done}/{coverage.total} fitted
+                </span>
+              )}
               {pickerOpen && (
                 <div data-testid="fit-palette"
                   style={{
