@@ -203,9 +203,14 @@ def model_for_composition(signal, elements=None, *, prune: bool = True,
         "energy_range": (lo, hi),
     }
     if not info["engine_supported"]:
-        unsupported = sorted({c.kind for c in spec.active_components
-                              if c.kind not in tcomp.available()})
-        info["unsupported_components"] = unsupported
-        log.info("model uses %s, which the batched engine cannot fit yet "
-                 "(#63) — HyperSpy will do this fit", unsupported)
+        # Why each one is unfittable, from actually trying to build it — an
+        # EELS edge is a SUPPORTED kind that still needs its GOS curves
+        # precomputed, so a kind-only check would call it fittable and then
+        # fail inside the engine. `prepare_eels_edges` is what resolves it.
+        blocked = tcomp.unsupported(spec)
+        info["unsupported_components"] = sorted(
+            {c.kind for c in spec.active_components if c.name in blocked})
+        info["unsupported_reasons"] = blocked
+        log.info("the batched engine cannot fit %s yet — %s",
+                 sorted(blocked), "; ".join(sorted(set(blocked.values()))))
     return spec, info

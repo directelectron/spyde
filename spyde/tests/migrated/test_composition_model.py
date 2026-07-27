@@ -84,13 +84,30 @@ class TestEELS:
             assert comp is not None, f"{name} missing from {list(by_name)}"
             assert comp["onset_energy"].value == pytest.approx(onset, abs=5.0)
 
-    def test_reports_that_the_engine_cannot_fit_it_yet(self, eels):
-        """EELSCLEdge is a tabulated GOS lookup with no batched port (#63).
-        The fallback to HyperSpy is correct, just slower — but it must be
-        REPORTED, not a surprise."""
+    def test_a_raw_edge_is_not_yet_batchable_and_says_why(self, eels):
+        """An EELS edge IS a supported kind, but only once its GOS curves have
+        been precomputed — the integral is per-element, not per-pixel, so it is
+        done once by `prepare_eels_edges`. Until then the engine must decline
+        rather than fail inside itself, and it must say what is missing."""
         spec, info = model_for_composition(eels, ["C", "N", "O"])
         assert info["engine_supported"] is False
         assert "EELSCLEdge" in info["unsupported_components"]
+        assert any("prepare_eels_edges" in why
+                   for why in info["unsupported_reasons"].values())
+
+    def test_preparing_the_edges_makes_it_batchable(self, eels):
+        """And the fine structure is FITTED, not frozen — the coefficients are
+        spline weights, so the edge is linear in them."""
+        from spyde.fitting import components as tcomp
+        from spyde.spectroscopy import prepare_eels_edges
+
+        spec, _ = model_for_composition(eels, ["C", "N", "O"])
+        prepared, einfo = prepare_eels_edges(spec, eels)
+        assert einfo["prepared"], "no edges were prepared"
+        assert tcomp.supports(prepared)
+        # Still real exspy edges — that is what keeps the model storable.
+        assert {c.kind for c in prepared.components if c.name in
+                einfo["prepared"]} == {"EELSCLEdge"}
 
 
 class TestPruning:

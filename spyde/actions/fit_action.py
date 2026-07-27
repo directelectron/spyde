@@ -1445,7 +1445,7 @@ def fit_from_composition(session, plot, payload) -> None:
 
     try:
         from spyde.spectroscopy import (
-            MissingExtra, model_for_composition, tabulate_model,
+            MissingExtra, model_for_composition, prepare_eels_edges,
         )
     except ImportError:
         ipc.emit_error('Composition models need exspy — '
@@ -1462,15 +1462,23 @@ def fit_from_composition(session, plot, payload) -> None:
         return
 
     note = ""
-    if not info.get("engine_supported") and bool(p.get("tabulate", True)):
+    if not info.get("engine_supported"):
+        # An EELS edge's GOS integral depends on the element and the
+        # microscope, not the pixel, so it is computed once here and the edge
+        # becomes batchable. The component stays an `EELSCLEdge` — the model
+        # remains a real exspy model and stores on its own signal.
         try:
-            spec, tinfo = tabulate_model(spec, wiz.signal)
-            if tinfo["tabulated"]:
-                note = (f" {len(tinfo['tabulated'])} edge(s) tabulated — "
-                        f"fine structure is fixed.")
+            spec, einfo = prepare_eels_edges(
+                spec, wiz.signal,
+                fit_fine_structure=bool(p.get("fit_fine_structure", True)))
+            n_coeff = sum(einfo["coefficients"].values())
+            if einfo["prepared"]:
+                note = (f" {len(einfo['prepared'])} edge(s) batched"
+                        + (f", {n_coeff} fine-structure coefficients fitted."
+                           if n_coeff else "."))
         except Exception as e:
-            log.info("tabulating the composition model failed (%s); the fit "
-                     "will fall back to hyperspy", e)
+            log.info("preparing the EELS edges failed (%s); the fit will fall "
+                     "back to hyperspy", e)
 
     wiz.spec = spec
     wiz.result = None

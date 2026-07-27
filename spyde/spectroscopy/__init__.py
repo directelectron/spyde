@@ -28,8 +28,8 @@ from spyde.spectroscopy.quantify import (
     quantify,
     quantify_result,
 )
-from spyde.spectroscopy.tabulate import onset_energies, tabulate_model
+from spyde.spectroscopy.eels_batch import onset_energies, prepare_eels_edges
 
 __all__ = ["model_for_composition", "prune_to_range", "MissingExtra",
-           "tabulate_model", "onset_energies",
+           "prepare_eels_edges", "onset_energies",
            "element_intensity_maps", "quantify", "quantify_result"]

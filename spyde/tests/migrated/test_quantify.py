@@ -33,7 +33,7 @@ from spyde.spectroscopy.quantify import (
 def _spec(*names_kinds):
     comps = []
     for name, kind in names_kinds:
-        pname = {"Gaussian": "A", "TabulatedShape": "intensity"}[kind]
+        pname = {"Gaussian": "A", "EELSCLEdge": "intensity"}[kind]
         comps.append(ComponentSpec(
             kind=kind, name=name,
             parameters=[ParameterSpec(pname, 1.0, linear=True)]
@@ -114,7 +114,7 @@ class TestBridge:
     def test_reads_a_tabulated_edge_intensity(self):
         """EELS edges carry `intensity`, EDS lines carry `A` — one bridge must
         handle both or the EELS path silently produces no maps."""
-        spec = _spec(("O_K", "TabulatedShape"))
+        spec = _spec(("O_K", "EELSCLEdge"))
         res = _result(spec, [[7.0, 0.0]])
         assert element_intensity_maps(spec, res)["O"][0] == pytest.approx(7.0)
 
