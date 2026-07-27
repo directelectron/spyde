@@ -457,7 +457,7 @@ def supports(spec) -> bool:
     """
     for c in getattr(spec, "active_components", []):
         try:
-            get_component(c.kind, n_params=len(c.parameters))
+            get_component(c.kind, n_params=len(c.scalar_parameters))
         except NotImplementedError:
             return False
     return True
@@ -468,7 +468,7 @@ def has_analytic_grad(spec) -> bool:
     the engine can build the whole Jacobian without autodiff."""
     for c in getattr(spec, "active_components", []):
         try:
-            if not get_component(c.kind, n_params=len(c.parameters)).has_analytic_grad:
+            if not get_component(c.kind, n_params=len(c.scalar_parameters)).has_analytic_grad:
                 return False
         except NotImplementedError:
             return False
@@ -497,7 +497,7 @@ def evaluate_with_grad(spec, x, values):
 
     i = 0
     for c in spec.active_components:
-        n = len(c.parameters)
+        n = len(c.scalar_parameters)
         comp = get_component(c.kind, n_params=n)
         block = values[:, i:i + n]
         out = out + comp(x, block)
@@ -517,7 +517,7 @@ def evaluate(spec, x, values):
     out = None
     i = 0
     for c in spec.active_components:
-        n = len(c.parameters)
+        n = len(c.scalar_parameters)
         comp = get_component(c.kind, n_params=n)
         y = comp(x, values[:, i:i + n])
         out = y if out is None else out + y
