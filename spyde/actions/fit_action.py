@@ -259,6 +259,51 @@ class FitWizard(WizardController):
             except Exception as e:
                 log.debug("adding drag handles for %s failed: %s", comp.name, e)
 
+    def update_widgets(self, skip_id=None) -> None:
+        """MOVE the existing handles to match the model, in place.
+
+        Distinct from :meth:`sync_widgets`, which tears them down and rebuilds.
+        Rebuilding on every parameter keystroke destroys and recreates every
+        widget several times a second — the handles flicker, a widget the user
+        is reaching for vanishes under the cursor, and the plot spends its time
+        re-pushing widget state instead of redrawing the curve. Rebuild only
+        when the component LIST changes; move them otherwise.
+
+        *skip_id* is the widget currently being dragged: writing a position
+        back to the handle under the user's finger fights the drag.
+        """
+        p1 = getattr(self.plot, "_plot1d", None)
+        if p1 is None:
+            return
+        by_name: dict = {}
+        for wid, (name, role) in self._widgets.items():
+            by_name.setdefault(name, {})[role] = wid
+
+        for comp in self.spec.active_components:
+            info = _DRAG.get(comp.kind)
+            roles = by_name.get(comp.name)
+            if info is None or not roles:
+                continue
+            try:
+                pos = float(comp[info["pos"]].value)
+                width = (float(comp[info["width"]].value)
+                         if info["width"] else (self.axis().ptp() / 20.0))
+                height = _height_from_amp(info, float(comp[info["amp"]].value),
+                                          width)
+                pid = roles.get("point")
+                if pid is not None and pid != skip_id:
+                    w = p1.get_widget(pid)
+                    if w is not None:
+                        w.set(x=pos, y=height)
+                rid = roles.get("range")
+                if rid is not None and rid != skip_id and info["width"]:
+                    half = width * _WIDTH_TO_HALF.get(info["width"], 1.0)
+                    w = p1.get_widget(rid)
+                    if w is not None:
+                        w.set(x0=pos - half, x1=pos + half, y=height / 2)
+            except Exception as e:
+                log.debug("moving handles for %s failed: %s", comp.name, e)
+
     def clear_widgets(self) -> None:
         p1 = getattr(self.plot, "_plot1d", None)
         for wid in list(self._widgets):
@@ -316,6 +361,7 @@ class FitWizard(WizardController):
                         info, height, float(comp[info["width"]].value))
             self.result = None            # the old fit no longer describes it
             self.draw_preview()
+            self.update_widgets(skip_id=wid)   # never fight the dragged handle
             self.emit_state()
         except Exception as e:
             log.debug("fit widget drag failed: %s", e)
@@ -593,6 +639,68 @@ def fit_add_component(session, plot, payload) -> None:
     wiz.emit_state(f"Added {cspec.name}.")
 
 
+def fit_from_composition(session, plot, payload) -> None:
+    """Populate the model from the elements present (#65, on top of #62).
+
+    The point of the wave: type "Fe, Ni, Cu" and get a model, then drag the
+    lines where they belong. Everything after this call is the ordinary Fit
+    caret — the drag handles from #57 work on an edge or an X-ray line exactly
+    as they do on a hand-placed gaussian, which is why #65 is mostly wiring.
+
+    EELS models are TABULATED on the way in (#63), because ``EELSCLEdge`` has no
+    batched port: without that step the model is correct but falls back to
+    HyperSpy's one-pixel-at-a-time fitting, which is the difference between
+    seconds and minutes on a real scan.
+    """
+    wiz, tree = _wizard(session, plot)
+    if wiz is None:
+        ipc.emit_error("Fit: open the Fit caret first")
+        return
+    p = payload or {}
+    raw = p.get("elements")
+    elements = ([e.strip() for e in raw.replace(",", " ").split() if e.strip()]
+                if isinstance(raw, str) else list(raw or []))
+
+    try:
+        from spyde.spectroscopy import (
+            MissingExtra, model_for_composition, tabulate_model,
+        )
+    except ImportError:
+        ipc.emit_error('Composition models need exspy — '
+                       'pip install "spyde[eels]"')
+        return
+
+    try:
+        spec, info = model_for_composition(wiz.signal, elements or None)
+    except MissingExtra as e:
+        ipc.emit_error(str(e))
+        return
+    except Exception as e:
+        ipc.emit_error(f"Fit: could not build a model for {elements or 'this signal'} ({e})")
+        return
+
+    note = ""
+    if not info.get("engine_supported") and bool(p.get("tabulate", True)):
+        try:
+            spec, tinfo = tabulate_model(spec, wiz.signal)
+            if tinfo["tabulated"]:
+                note = (f" {len(tinfo['tabulated'])} edge(s) tabulated — "
+                        f"fine structure is fixed.")
+        except Exception as e:
+            log.info("tabulating the composition model failed (%s); the fit "
+                     "will fall back to hyperspy", e)
+
+    wiz.spec = spec
+    wiz.result = None
+    wiz.draw_preview()
+    wiz.sync_widgets()
+    dropped = info.get("dropped") or []
+    wiz.emit_state(
+        f"Built {len(spec)} components for {', '.join(info['elements'])}."
+        + (f" {len(dropped)} outside the range dropped." if dropped else "")
+        + note)
+
+
 def fit_remove_component(session, plot, payload) -> None:
     wiz, _tree = _wizard(session, plot)
     if wiz is None:
@@ -622,7 +730,7 @@ def fit_set_param(session, plot, payload) -> None:
         log.debug("fit_set_param %s failed: %s", p, e)
         return
     wiz.draw_preview()
-    wiz.sync_widgets()
+    wiz.update_widgets()      # MOVE, do not rebuild — see update_widgets
     wiz.emit_state()
 
 
@@ -631,6 +739,54 @@ def fit_tune(session, plot, payload=None) -> None:
     wiz, _tree = _wizard(session, plot)
     if wiz is not None:
         wiz.draw_preview()
+
+
+def fit_current(session, plot, payload=None) -> None:
+    """Fit ONLY the spectrum on screen — the iterate-quickly button.
+
+    Building a model is a loop: place a component, see where it lands, nudge it.
+    Fitting the whole scan to check one guess is the wrong unit of work — it
+    costs seconds to minutes and answers a question about one pixel. This fits
+    the displayed spectrum, writes the result back into the model, and redraws,
+    so the next nudge starts from a fitted position.
+
+    It is the same engine and the same spec as :func:`fit_run`; the only
+    difference is that the data is one row.
+    """
+    wiz, tree = _wizard(session, plot)
+    if wiz is None:
+        ipc.emit_error("Fit: open the Fit caret first")
+        return
+    if not len(wiz.spec):
+        ipc.emit_error("Fit: add at least one component first")
+        return
+
+    from spyde.fitting import components as tcomp
+    if not tcomp.supports(wiz.spec):
+        unsupported = sorted({c.kind for c in wiz.spec.active_components
+                              if c.kind not in tcomp.available()})
+        ipc.emit_error(f"Fit: {', '.join(unsupported)} has no batched "
+                       f"implementation yet")
+        return
+
+    from spyde.fitting.engine import fit_batched
+    try:
+        res = fit_batched(wiz.spec, wiz.current_spectrum()[None, :], wiz.axis(),
+                          device="cpu", max_iter=int((payload or {}).get(
+                              "max_iter", 120)))
+        # Write the fitted values back into the MODEL so the caret, the handles
+        # and the next fit all start from them. This is the difference between
+        # a preview and a step in the workflow.
+        wiz.spec.set_flat_values(res.values[0])
+    except Exception as e:
+        ipc.emit_error(f"Fit: fitting this spectrum failed ({e})")
+        return
+
+    wiz.result = None          # a single-spectrum fit is NOT a scan result
+    wiz.draw_preview()
+    wiz.update_widgets()
+    ok = "converged" if bool(res.converged[0]) else "did not converge"
+    wiz.emit_state(f"This spectrum {ok} (chi2 {res.chisq[0]:.3g}).")
 
 
 def fit_run(session, plot, payload=None) -> None:

@@ -207,8 +207,18 @@ export function FitWizard({ caretPos, windowId, sendAction, onClose }: Props) {
                 label="Seed from a coarse grid" />
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              {/* Fitting the whole scan to check one guess is the wrong unit of
+                  work — it costs seconds to minutes and answers a question about
+                  one pixel. This fits the spectrum on screen and writes the
+                  result back into the model, so the next nudge starts fitted. */}
+              <button data-testid="fit-spectrum" style={S.primary}
+                disabled={components.length === 0}
+                title="Fit only the spectrum on screen — quick, for checking a guess"
+                onClick={() => sendAction('fit_current', {}, windowId)}>
+                Fit spectrum
+              </button>
               <button data-testid="fit-run" style={S.primary}
-                disabled={components.length === 0} onClick={run}>Run fit</button>
+                disabled={components.length === 0} onClick={run}>Run scan</button>
               {fitted && (
                 <CommitButton wizardKey="fit" windowId={windowId} sendAction={sendAction}
                   label="Commit component maps" />

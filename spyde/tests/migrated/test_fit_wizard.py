@@ -472,3 +472,106 @@ class TestToolbarGating:
         from spyde.actions import registry
         schema = registry.wizard_parameters("fit")
         assert set(schema) == {"max_iter", "seeded", "weighting"}
+
+
+class TestFitCurrentSpectrum:
+    """The "Fit spectrum" button (#57 workflow).
+
+    Building a model is a loop — place, look, nudge. Fitting the whole scan to
+    check one guess is the wrong unit of work, so this fits only what is on
+    screen and writes the answer back into the model.
+    """
+
+    def test_fits_only_the_displayed_spectrum(self, window, fitted):
+        from spyde.actions.fit_action import fit_current
+        session, plot, tree, amp = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Offset"})
+        fit_add_component(session, plot, {"kind": "Gaussian"})
+        wiz = tree._fit_wizard
+        wiz.spec["Gaussian"]["centre"].value = 25.0
+        wiz.spec["Gaussian"]["sigma"].value = 3.0
+
+        fit_current(session, plot, {})
+        # The OFFSET is the easy check: the data sits on a constant 5.0.
+        assert wiz.spec["Offset"]["offset"].value == pytest.approx(5.0, abs=0.5)
+
+    def test_writes_the_result_back_into_the_model(self, window, fitted):
+        """So the next nudge starts from a fitted position, and the handles
+        move to it — the difference between a preview and a workflow step."""
+        from spyde.actions.fit_action import fit_current
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Offset"})
+        before = tree._fit_wizard.spec["Offset"]["offset"].value
+        fit_current(session, plot, {})
+        assert tree._fit_wizard.spec["Offset"]["offset"].value != before
+
+    def test_does_not_produce_a_scan_result(self, window, fitted):
+        """One spectrum is not a map. Offering Commit after it would export a
+        component map built from a single pixel repeated everywhere."""
+        from spyde.actions.fit_action import fit_current
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Offset"})
+        fit_current(session, plot, {})
+        assert tree._fit_wizard.result is None
+        assert _messages_of(window, "fit_state")[-1]["fitted"] is False
+
+    def test_refuses_with_no_components(self, window, fitted):
+        from spyde.actions.fit_action import fit_current
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_current(session, plot, {})
+        assert any("component" in (m.get("text") or "").lower()
+                   for m in _messages_of(window, "error"))
+
+    def test_reports_whether_it_converged(self, window, fitted):
+        from spyde.actions.fit_action import fit_current
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Offset"})
+        fit_current(session, plot, {})
+        assert "converge" in (_messages_of(window, "fit_state")[-1]["status"] or "")
+
+
+class TestParameterEditsMoveTheHandles:
+    """A typed value and a dragged handle must agree — both directions.
+
+    Handles are MOVED in place rather than rebuilt: rebuilding on every
+    keystroke destroys and recreates every widget several times a second, which
+    makes them flicker and can pull one out from under the cursor.
+    """
+
+    def test_editing_a_parameter_moves_its_handle(self, window, fitted):
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Gaussian"})
+        wiz = tree._fit_wizard
+
+        moved = {}
+
+        class _FakeWidget:
+            def set(self, **kw):
+                moved.update(kw)
+
+        class _FakeP1:
+            def get_widget(self, wid):
+                return _FakeWidget()
+
+        wiz.plot._plot1d = _FakeP1()
+        wiz._widgets = {"p1": ("Gaussian", "point")}
+        fit_set_param(session, plot, {"component": "Gaussian",
+                                      "parameter": "centre", "value": 41.0})
+        assert moved.get("x") == pytest.approx(41.0)
+
+    def test_a_parameter_edit_does_not_rebuild_the_handles(self, window, fitted):
+        """Rebuilding is for a changed component LIST, not for a keystroke."""
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Gaussian"})
+        wiz = tree._fit_wizard
+        wiz._widgets = {"p1": ("Gaussian", "point")}
+        fit_set_param(session, plot, {"component": "Gaussian",
+                                      "parameter": "centre", "value": 30.0})
+        assert "p1" in wiz._widgets, "handles were torn down by a value edit"

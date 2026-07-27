@@ -54,6 +54,13 @@ STAGED_HANDLERS: dict[str, str] = {
     "fit_tune":             "spyde.actions.fit_action.fit_tune",
     "fit_run":              "spyde.actions.fit_action.fit_run",
     "fit_commit":           "spyde.actions.fit_action.fit_commit",
+    "fit_from_composition": "spyde.actions.fit_action.fit_from_composition",
+    "fit_current":          "spyde.actions.fit_action.fit_current",
+    "bg_open":              "spyde.actions.background_action.bg_open",
+    "bg_close":             "spyde.actions.background_action.bg_close",
+    "bg_set_model":         "spyde.actions.background_action.bg_set_model",
+    "bg_set_region":        "spyde.actions.background_action.bg_set_region",
+    "bg_apply":             "spyde.actions.background_action.bg_apply",
     "om_generate_library": "spyde.actions.orientation_action.om_generate_library",
     "om_refine":           "spyde.actions.orientation_action.om_refine",
     "om_run":              "spyde.actions.orientation_action.om_run",
@@ -212,6 +219,7 @@ _WIZARD_SCHEMAS: dict[str, tuple[str, str]] = {
     # key: (module, attribute) — attribute is a controller class (its
     # `parameters`) or a dict.
     "fit":    ("spyde.actions.fit_action", "FitWizard"),
+    "bg":     ("spyde.actions.background_action", "PARAMETERS"),
     "strain": ("spyde.actions.strain_action", "StrainController"),
     "vom":    ("spyde.actions.vector_orientation_om", "VomWizard"),
     "czb":    ("spyde.actions.center_zero_beam", "PARAMETERS"),
