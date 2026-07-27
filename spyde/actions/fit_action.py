@@ -1476,11 +1476,21 @@ def fit_run(session, plot, payload=None) -> None:
 
     def _fit():
         from spyde.fitting.engine import fit_batched
+        from spyde.fitting.relabel import relabel_scan
         from spyde.fitting.seeding import fit_seeded
-        fn = fit_seeded if (seeded and data.ndim > 2) else fit_batched
-        return fn(spec, data, x, max_iter=max_iter, weights=weights,
-                  progress=lambda d, t: ipc.emit_status(
-                      f"Fitting {d}/{t} spectra…"))
+        use_seeded = seeded and data.ndim > 2
+        fn = fit_seeded if use_seeded else fit_batched
+        res = fn(spec, data, x, max_iter=max_iter, weights=weights,
+                 progress=lambda d, t: ipc.emit_status(
+                     f"Fitting {d}/{t} spectra…"))
+        if not use_seeded and nav_shape:
+            # `fit_seeded` relabels internally (it has to, so the seeds agree
+            # before they propagate). A cold batched fit has had no such pass,
+            # and two components of a kind land in whichever slot each position
+            # happens to pick — measured at 43% agreement on a real scan.
+            res.values = relabel_scan(spec, res.values, nav_shape,
+                                      converged=res.converged)
+        return res
 
     def _done(result):
         if not wiz.still(gen) or wiz._closed:

@@ -1,0 +1,179 @@
+/**
+ * fit_navigate.spec.ts — after fitting the scan, does moving the navigator
+ * show THAT position's fit?
+ *
+ * "Maybe it's just using the fit from the previous position." This settles it:
+ * fit the whole scan, then move the navigator between positions whose true
+ * parameters differ, and require the caret AND the overlaid model to change.
+ *
+ * two_gaussians has a narrow component whose centre varies across the scan
+ * (`50 + 10*sin(3*pi*x/32)*cos(4*pi*y/32)`), so two well-chosen positions have
+ * genuinely different answers — if the caret shows the same numbers at both,
+ * it is showing a stale model, not this position's fit.
+ *
+ * Run: npx playwright test tests/fit_navigate.spec.ts \
+ *        --project=electron --reporter=line --retries=0
+ */
+import { test, expect } from '@playwright/test'
+const {
+  launchApp, backendAction, waitForSubwindowCount, sigWindow,
+} = require('./_harness.cjs')
+
+const SHOTS = 'fit_navigate_shots'
+
+test('the overlaid model follows the navigator after a scan fit', async () => {
+  test.setTimeout(600_000)
+
+  const ctx = await launchApp({ dask: true, env: { SPYDE_LOG_LEVEL: 'WARNING' } })
+  const { page, backend, assertNoJsErrors } = ctx
+
+  try {
+    await backendAction(page, 'tutorial_load', { name: 'spectroscopy' })
+    await waitForSubwindowCount(page, 2, 180_000)
+    await page.waitForTimeout(2_500)
+
+    // Both figure ids: the navigator's crosshair is what we drive, the
+    // signal's panel state is where the overlaid model lives.
+    const figIds = await page.evaluate(() => {
+      const out: Record<string, string> = {}
+      for (const s of Array.from(document.querySelectorAll('[data-testid="subwindow"]'))) {
+        const tid = s.querySelector('iframe')?.getAttribute('data-testid') ?? ''
+        const crumb = s.querySelector('[data-testid="window-breadcrumb"]')?.textContent ?? ''
+        if (!tid.startsWith('figure-')) continue
+        out[crumb.startsWith('N-') ? 'nav' : 'sig'] = tid.slice('figure-'.length)
+      }
+      return out
+    })
+    expect(figIds.nav, 'no navigator figure').toBeTruthy()
+    expect(figIds.sig, 'no signal figure').toBeTruthy()
+
+    const sig = sigWindow(page)
+    await sig.getByTestId('subwindow-titlebar').hover()
+    await sig.getByTestId('action-btn-Fit').click()
+    await expect(page.locator('[data-testid="fit-wizard"]')).toBeVisible({ timeout: 20_000 })
+
+    for (let i = 0; i < 2; i++) {
+      await page.locator('[data-testid="fit-add-toggle"]').click()
+      await expect(page.locator('[data-testid="fit-add-Gaussian"]')).toBeVisible({ timeout: 30_000 })
+      await page.locator('[data-testid="fit-add-Gaussian"]').click()
+      await page.waitForTimeout(800)
+    }
+
+    // ── fit the whole scan ───────────────────────────────────────────────
+    await page.getByTestId('fit-tab-Run').click()
+    await page.locator('[data-testid="fit-run"]').click()
+    await expect(page.locator('[data-testid="fit-status"]'))
+      .toContainText(/converged/i, { timeout: 300_000 })
+    await page.getByTestId('fit-tab-Model').click()
+    await page.waitForTimeout(1_500)
+    await page.screenshot({ path: `${SHOTS}/01-scan-fitted.png`, fullPage: true })
+
+    // ── move the navigator and read the model at each stop ───────────────
+    const navCrosshair = async () => {
+      const ws = await page.evaluate((f) => (window as any)._spyde_test_widgets(f), figIds.nav)
+      const w = ws.find((v: any) => v.type === 'crosshair')
+      expect(w, 'the navigator has no crosshair').toBeTruthy()
+      return w
+    }
+    const cross = await navCrosshair()
+
+    const goTo = async (cx: number, cy: number) => {
+      await page.evaluate(({ f, panel, id, x, y }) => {
+        window.postMessage({
+          type: 'awi_event', figId: f,
+          data: JSON.stringify({
+            source: 'js', panel_id: panel, widget_id: id,
+            event_type: 'pointer_up', cx: x, cy: y,
+          }),
+        }, '*')
+      }, { f: figIds.nav, panel: cross.panel_id, id: cross.id, x: cx, y: cy })
+      await page.waitForTimeout(2_500)
+    }
+
+    const readModel = async () => {
+      const names = await page.locator('[data-testid^="fit-comp-"]')
+        .evaluateAll((els) => els.map((e) =>
+          e.getAttribute('data-testid')!.replace('fit-comp-', '')))
+      const out: Record<string, number> = {}
+      for (const n of names) {
+        for (const p of ['A', 'centre', 'sigma']) {
+          const loc = page.locator(`[data-testid="fit-p-${n}-${p}"]`)
+          if (await loc.count()) out[`${n}.${p}`] = Number(await loc.inputValue())
+        }
+      }
+      return out
+    }
+
+    // The narrow gaussian's true centre swings +/-10 across the scan, so
+    // these two corners have genuinely different answers.
+    await goTo(6, 6)
+    const at66 = await readModel()
+    await page.screenshot({ path: `${SHOTS}/02-at-6-6.png`, fullPage: true })
+
+    await goTo(26, 26)
+    const at2626 = await readModel()
+    await page.screenshot({ path: `${SHOTS}/03-at-26-26.png`, fullPage: true })
+
+    console.log('model at (6,6)  :', JSON.stringify(at66))
+    console.log('model at (26,26):', JSON.stringify(at2626))
+
+    const changed = Object.keys(at66).filter(
+      (k) => Math.abs(at66[k] - at2626[k]) > 1e-9)
+    expect(
+      changed.length,
+      `the model is IDENTICAL at two different navigator positions ` +
+      `(${JSON.stringify(at66)}) — the caret is showing a stale fit, not ` +
+      `this position's`,
+    ).toBeGreaterThan(0)
+
+    // ── and each named component must be the SAME PEAK at both stops ─────
+    // Two gaussians are exchangeable, so an unconstrained fit puts the broad
+    // one in whichever slot each position happens to pick. Measured before
+    // this was fixed: component 1 was the broad peak at 43% of positions —
+    // so scrubbing made one component's amplitude drop by an order of
+    // magnitude (it read as "the fit suppresses a component to zero") and a
+    // committed map would be a checkerboard of two different peaks.
+    const names = Object.keys(at66)
+      .filter((k) => k.endsWith('.sigma')).sort()
+    expect(names.length).toBe(2)
+    const widthOrder = (m: Record<string, number>) =>
+      m[names[0]] < m[names[1]] ? 'narrow-first' : 'wide-first'
+    expect(
+      widthOrder(at2626),
+      `the components SWAPPED identity between positions: ` +
+      `${names[0]}=${at66[names[0]].toFixed(2)}/${at2626[names[0]].toFixed(2)}, ` +
+      `${names[1]}=${at66[names[1]].toFixed(2)}/${at2626[names[1]].toFixed(2)}`,
+    ).toBe(widthOrder(at66))
+
+    // And the overlaid curve must have moved too, not just the numbers.
+    const modelCurve = async () => page.evaluate((f) => {
+      const hook = (window as any)._spyde_test_panel_json
+      for (const raw of hook ? hook(f) : []) {
+        const d = JSON.parse(raw)
+        for (const ln of d.extra_lines ?? []) {
+          if (ln.label !== 'model') continue
+          const bin = atob(ln.data_b64)
+          const bytes = new Uint8Array(bin.length)
+          for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+          const v = Array.from(new Float64Array(bytes.buffer))
+          return { peak: Math.max(...v), argmax: v.indexOf(Math.max(...v)) }
+        }
+      }
+      return null
+    }, figIds.sig)
+
+    const curveHere = await modelCurve()
+    expect(curveHere, 'no overlaid model curve on the signal plot').toBeTruthy()
+    await goTo(6, 6)
+    const curveThere = await modelCurve()
+    expect(
+      JSON.stringify(curveThere),
+      'the overlaid model curve did not change between positions',
+    ).not.toEqual(JSON.stringify(curveHere))
+
+    await assertNoJsErrors()
+  } finally {
+    console.log(`\n──── backend log (tail) ────\n${backend.logBuffer.slice(-20).join('\n')}\n`)
+    await ctx.app.close().catch(() => {})
+  }
+})
