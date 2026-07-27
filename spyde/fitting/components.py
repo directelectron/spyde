@@ -31,6 +31,8 @@ import logging
 import math
 from typing import Callable, Sequence
 
+import numpy as np
+
 log = logging.getLogger(__name__)
 
 _SQRT_2PI = math.sqrt(2.0 * math.pi)
@@ -364,6 +366,61 @@ def _d_logistic(x, p):
                   -a * E * c / D ** 2)         # df/dorigin
 
 
+def _interp_uniform(xq, x0, dx, table):
+    """Linear interpolation of ``table`` (sampled uniformly from ``x0``) at
+    ``xq``, differentiable with respect to ``xq``.
+
+    ``torch.searchsorted`` is not needed because the table is on the signal
+    axis, which is uniform — index arithmetic is exact and far cheaper. The
+    index itself is a floor and carries no gradient, which is correct: the
+    function is piecewise linear, so the gradient comes entirely from the
+    interpolation weight.
+
+    Outside the table the value is held at the end sample rather than
+    extrapolated. Extrapolating a GOS tail would invent signal where the
+    measurement has none.
+    """
+    import torch
+
+    n = table.shape[-1]
+    pos = (xq - x0) / dx
+    idx = torch.clamp(pos.floor(), 0, n - 2)
+    t = torch.clamp(pos - idx, 0.0, 1.0)
+    i0 = idx.long()
+    y0 = table[i0]
+    y1 = table[torch.clamp(i0 + 1, max=n - 1)]
+    return y0 + t * (y1 - y0)
+
+
+def _tabulated_fn(table, x0, dx):
+    def fn(x, p):
+        intensity, onset_shift = p
+        # Shifting the SAMPLE point left is the same as moving the edge right,
+        # so a positive onset_shift moves the edge up in energy as a user
+        # expects.
+        return intensity * _interp_uniform(x - onset_shift, x0, dx, table)
+
+    return fn
+
+
+def _tabulated_grad(table, x0, dx):
+    def grad(x, p):
+        intensity, onset_shift = p
+        shape = _interp_uniform(x - onset_shift, x0, dx, table)
+        # d/d(shift) is minus the local slope. Taken as a CENTRAL difference
+        # over one sample rather than the exact piecewise-linear derivative,
+        # deliberately: the exact one is a step function that jumps at every
+        # segment boundary, so LM chatters as the shift crosses a channel. The
+        # smoothed version differs from autodiff only within one channel of a
+        # kink and converges to the same place.
+        half = dx / 2
+        slope = (_interp_uniform(x - onset_shift + half, x0, dx, table)
+                 - _interp_uniform(x - onset_shift - half, x0, dx, table)) / dx
+        return _stack(shape, -intensity * slope)
+
+    return grad
+
+
 def _d_polynomial_fn(order: int):
     def grad(x, p):
         return _stack(*[x ** k + 0.0 * p[0] for k in range(order + 1)])
@@ -443,9 +500,58 @@ def get_component(kind: str, *, n_params: int | None = None) -> TorchComponent:
         ) from None
 
 
+TABULATED_KIND = "TabulatedShape"
+
+
+def tabulated_component(table, x0: float, dx: float, *, device=None,
+                        dtype=None) -> TorchComponent:
+    """A component whose SHAPE comes from a lookup table (#63).
+
+    Fits two parameters against it: ``intensity`` (linear — the amplitude that
+    scales the whole shape) and ``onset_shift`` (how far the shape slides along
+    the energy axis). That is the right pair for an EELS core-loss edge, whose
+    form is a GOS table rather than a formula: the shape is fixed physics and
+    the fit is asking "how much of this element, and exactly where does its
+    edge start".
+
+    What this deliberately does NOT fit is the fine structure and effective
+    angle, which are FROZEN at the values the table was sampled with. Those are
+    what make an edge a tabulated lookup in the first place, and refitting them
+    would mean re-sampling the table every iteration — which is exactly the
+    per-item Python work the batched engine exists to avoid.
+    """
+    import torch
+
+    t = torch.as_tensor(np.asarray(table, float), device=device,
+                        dtype=dtype or torch.float64)
+    return TorchComponent(TABULATED_KIND, ("intensity", "onset_shift"),
+                          (True, False),
+                          _tabulated_fn(t, float(x0), float(dx)),
+                          _tabulated_grad(t, float(x0), float(dx)))
+
+
+def component_for(cspec, *, device=None, dtype=None) -> TorchComponent:
+    """Resolve the batched component for a :class:`ComponentSpec`.
+
+    Everything analytic resolves by ``kind`` alone; a tabulated component also
+    needs its own table, which lives on the spec. Callers that have a spec
+    should use this rather than :func:`get_component`, so a data-bound
+    component is never silently looked up as if it were stateless.
+    """
+    if cspec.kind == TABULATED_KIND:
+        if cspec.data is None:
+            raise ValueError(f"{cspec.name}: {TABULATED_KIND} has no table — "
+                             f"build it with spyde.spectroscopy.tabulate")
+        x0 = float(cspec.init_args.get("x0", 0.0))
+        dx = float(cspec.init_args.get("dx", 1.0))
+        return tabulated_component(cspec.data, x0, dx, device=device,
+                                   dtype=dtype)
+    return get_component(cspec.kind, n_params=len(cspec.scalar_parameters))
+
+
 def available() -> list[str]:
     """Component kinds the batched engine can fit."""
-    return sorted(_REGISTRY) + ["Polynomial"]
+    return sorted(_REGISTRY) + ["Polynomial", TABULATED_KIND]
 
 
 def supports(spec) -> bool:
@@ -457,8 +563,8 @@ def supports(spec) -> bool:
     """
     for c in getattr(spec, "active_components", []):
         try:
-            get_component(c.kind, n_params=len(c.scalar_parameters))
-        except NotImplementedError:
+            component_for(c)
+        except (NotImplementedError, ValueError):
             return False
     return True
 
@@ -468,9 +574,9 @@ def has_analytic_grad(spec) -> bool:
     the engine can build the whole Jacobian without autodiff."""
     for c in getattr(spec, "active_components", []):
         try:
-            if not get_component(c.kind, n_params=len(c.scalar_parameters)).has_analytic_grad:
+            if not component_for(c).has_analytic_grad:
                 return False
-        except NotImplementedError:
+        except (NotImplementedError, ValueError):
             return False
     return True
 
@@ -498,7 +604,7 @@ def evaluate_with_grad(spec, x, values):
     i = 0
     for c in spec.active_components:
         n = len(c.scalar_parameters)
-        comp = get_component(c.kind, n_params=n)
+        comp = component_for(c, device=values.device, dtype=values.dtype)
         block = values[:, i:i + n]
         out = out + comp(x, block)
         jac[:, :, i:i + n] = comp.grad(x, block).expand(P, C, n)
@@ -518,7 +624,7 @@ def evaluate(spec, x, values):
     i = 0
     for c in spec.active_components:
         n = len(c.scalar_parameters)
-        comp = get_component(c.kind, n_params=n)
+        comp = component_for(c, device=values.device, dtype=values.dtype)
         y = comp(x, values[:, i:i + n])
         out = y if out is None else out + y
         i += n

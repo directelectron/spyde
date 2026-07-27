@@ -23,4 +23,7 @@ from spyde.spectroscopy.composition import (
     prune_to_range,
 )
 
-__all__ = ["model_for_composition", "prune_to_range", "MissingExtra"]
+from spyde.spectroscopy.tabulate import onset_energies, tabulate_model
+
+__all__ = ["model_for_composition", "prune_to_range", "MissingExtra",
+           "tabulate_model", "onset_energies"]

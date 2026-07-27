@@ -110,6 +110,12 @@ class ComponentSpec:
     # silently rebuilds at its DEFAULT order, quietly dropping every
     # coefficient beyond it. See ``_INIT_ARGS``.
     init_args: dict[str, Any] = field(default_factory=dict)
+    # Tabulated SHAPE for components whose form is a lookup rather than a
+    # formula — an EELS core-loss edge is a GOS table, not an expression
+    # (#63). Sampled on the signal axis; the component then fits an intensity
+    # (linear) and an onset shift against it. None for every analytic
+    # component, which is nearly all of them.
+    data: np.ndarray | None = None
 
     def __post_init__(self):
         if not self.name:
@@ -136,15 +142,21 @@ class ComponentSpec:
     def to_dict(self) -> dict[str, Any]:
         return {"kind": self.kind, "name": self.name, "active": bool(self.active),
                 "parameters": [p.to_dict() for p in self.parameters],
-                "init_args": dict(self.init_args)}
+                "init_args": dict(self.init_args),
+                # A tabulated shape is one float per channel, so it does go
+                # through JSON — but only for the components that have one.
+                "data": (None if self.data is None
+                         else [float(v) for v in np.ravel(self.data)])}
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ComponentSpec":
+        raw = d.get("data")
         return cls(kind=d["kind"], name=d.get("name", ""),
                    active=bool(d.get("active", True)),
                    parameters=[ParameterSpec.from_dict(p)
                                for p in d.get("parameters", [])],
-                   init_args=dict(d.get("init_args") or {}))
+                   init_args=dict(d.get("init_args") or {}),
+                   data=None if raw is None else np.asarray(raw, float))
 
 
 @dataclass
