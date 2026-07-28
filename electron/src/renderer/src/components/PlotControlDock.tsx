@@ -762,6 +762,25 @@ export function PlotControlDock() {
               </button>
             </div>
           ))}
+          {/* Sum N frames under a POINT selector. Distinct from Integrate:
+              that gives you a draggable span with two edges to place; this
+              keeps the single pointer and widens what it reads — n frames of
+              a movie summed for signal, or the exposure of a sparse event
+              stream, without turning the slider into a range. Only offered
+              for a 1-D navigator (the backend omits sumFrames otherwise). */}
+          {navSelectors.filter((s) => s.sumFrames != null && s.mode === 'crosshair')
+            .map((s) => (
+              <div key={`sum-${s.selectorId ?? s.windowId}`} style={styles.sumRow}>
+                <span style={styles.sumLabel}>Sum frames</span>
+                <Dropdown
+                  testid="selector-sum-frames"
+                  value={String(s.sumFrames ?? 1)}
+                  options={sumFrameOptions(s.navSize ?? 0, s.navScale ?? 0)}
+                  onChange={(v) => sendAction('set_selector_sum',
+                    { frames: Number(v), selector_id: s.selectorId }, s.windowId)}
+                />
+              </div>
+            ))}
         </div>
       )}
       </div>
@@ -769,7 +788,32 @@ export function PlotControlDock() {
   )
 }
 
+/** The Sum-frames ladder: powers of two up to the navigation length.
+ *
+ *  Powers of two rather than round frame rates because a rate cannot generally
+ *  divide the acquisition cadence — asking for "60 fps" on a 2564 fps camera
+ *  silently rounds to 43 frames, so the number you picked is not the number
+ *  you got. A frame count is always exact, and the rate it produces is shown
+ *  beside it when the axis is time. */
+function sumFrameOptions(navSize: number, navScale: number) {
+  const opts: { value: string; label: string }[] = []
+  for (let n = 1; n <= Math.max(1, navSize); n *= 2) {
+    const rate = navScale > 0 ? 1 / (n * navScale) : 0
+    const hz = rate >= 1000 ? `${(rate / 1000).toFixed(1)} kfps`
+      : rate >= 1 ? `${rate.toFixed(0)} fps`
+        : rate > 0 ? `${rate.toFixed(2)} fps` : ''
+    const frames = n === 1 ? '1 frame' : `${n} frames`
+    opts.push({ value: String(n), label: hz ? `${frames} — ${hz}` : frames })
+    if (n >= 64) break
+  }
+  return opts
+}
+
 const styles: Record<string, React.CSSProperties> = {
+  sumRow: {
+    display: 'flex', alignItems: 'center', gap: 8, marginTop: 6,
+  },
+  sumLabel: { fontSize: 11.5, color: '#a6adc8', flex: '0 0 auto' },
   dock: {
     width: 300, flexShrink: 0,
     height: '100%',

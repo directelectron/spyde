@@ -114,6 +114,31 @@ test('dragging the time slider shows a DIFFERENT integrated plane', async () => 
   ctx.assertNoJsErrors()
 })
 
+test('Sum frames widens the point selector without moving it', async () => {
+  const { page } = ctx
+  await backendAction(page, 'test_nav_drag', { targets: [[25, 0]] })
+  const one = await planeSignature(page)
+
+  const dd = page.getByTestId('selector-sum-frames')
+  await expect(dd, 'no Sum-frames control on a 1-D navigator').toBeVisible({
+    timeout: 30_000,
+  })
+  await page.screenshot({ path: `${SHOTS}/09-sum-frames-control.png` })
+
+  // Themed dropdown: click the trigger, then the option (selectOption is dead
+  // on it — see Dropdown.tsx).
+  await dd.click()
+  await page.getByTestId('selector-sum-frames-opt-8').click()
+
+  await expect.poll(() => planeSignature(page), {
+    timeout: 60_000,
+    message: 'summing 8 frames did not change the image',
+  }).not.toBe(one)
+  await page.screenshot({ path: `${SHOTS}/10-summed-8.png` })
+  await sigWindow(page).screenshot({ path: `${SHOTS}/11-summed-plane.png` })
+  ctx.assertNoJsErrors()
+})
+
 test('To Frames adds an in-situ dataset to the signal tree', async () => {
   const { page } = ctx
   const sig = sigWindow(page)
