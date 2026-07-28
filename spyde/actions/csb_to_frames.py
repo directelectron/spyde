@@ -115,8 +115,15 @@ def _rebuild(session, tree, src, path: str, params) -> None:
             f"a {exposure * 1e3:.4g} ms exposure selects no frames from this "
             f"{ds.duration * 1e3:.4g} ms movie")
 
+    # Report the exposure in RAW FRAMES as well as in time. "16 planes at
+    # 10 ms" does not tell you how much of the stream each one summed, and at
+    # 1 frame/plane you are looking at the camera's actual output rather than
+    # any integration of it — which is a different thing to be looking at.
+    per_plane = bounds[0][1] - bounds[0][0]
+    raw = ("1 raw frame each — no integration" if per_plane == 1
+           else f"{per_plane} raw frames each")
     emit_status(f"To Frames: {len(bounds)} planes at "
-                f"{exposure * 1e3:.4g} ms ({1.0 / exposure:.4g} fps)…")
+                f"{exposure * 1e3:.4g} ms ({1.0 / exposure:.4g} fps), {raw}…")
 
     data = lazy_stack(path, bounds, ds.shape, bin_factor, np.float32, backend)
     sig = hs.signals.Signal2D(data).as_lazy()
@@ -156,7 +163,7 @@ def _rebuild(session, tree, src, path: str, params) -> None:
     def _add():
         session._add_signal(sig, source_path=path, navigator_override=nav)
         emit_status(f"To Frames: {len(bounds)} planes at "
-                    f"{exposure * 1e3:.4g} ms ({1.0 / exposure:.4g} fps)")
+                    f"{exposure * 1e3:.4g} ms ({1.0 / exposure:.4g} fps), {raw}")
 
     dispatch = getattr(session, "_dispatch_to_main", None)
     if dispatch is not None:
