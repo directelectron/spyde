@@ -93,14 +93,33 @@ def _reader_navigator(sig):
     if counts is None or not len(counts):
         return None
     try:
-        import hyperspy.api as hs
-        import numpy as _np
-        nav = hs.signals.Signal1D(_np.asarray(counts, _np.float32))
-        nav.metadata.General.title = "Total counts"
-        return nav
+        return calibrated_nav_signal(counts, sig)
     except Exception as e:
         log.debug("building the reader-supplied navigator failed: %s", e)
         return None
+
+
+def calibrated_nav_signal(counts, sig):
+    """A 1-D navigator carrying *sig*'s NAVIGATION calibration.
+
+    The calibration is not cosmetic. A 1-D selector turns the widget's position
+    into an index with ``(x - offset) / scale`` read from **the navigator
+    plot's own signal axis** (``selector1d._signal_axis``) — so an uncalibrated
+    navigator means dividing a position in seconds by a scale of 1, and every
+    position on a 0.156 s movie resolves to index 0. The image then never
+    changes as you scrub, which looks like a broken reader rather than a
+    missing axis.
+    """
+    import hyperspy.api as hs
+    import numpy as _np
+
+    nav = hs.signals.Signal1D(_np.asarray(counts, _np.float32))
+    src = sig.axes_manager.navigation_axes[0]
+    dst = nav.axes_manager.signal_axes[0]
+    dst.name, dst.units = src.name, src.units
+    dst.scale, dst.offset = float(src.scale), float(src.offset)
+    nav.metadata.General.title = "Total counts"
+    return nav
 
 
 _DEFAULT_EXAMPLE_NAMES = (
