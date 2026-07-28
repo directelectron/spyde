@@ -164,6 +164,9 @@ class ActionRouterMixin:
             # dialog) on the active signal, so the E2E workflow can be driven
             # headlessly / in Playwright. payload={"phase":"si"|"ag"} (default si).
             self._run_test_orientation(plot, payload)
+        elif action == "set_selector_sum":
+            self.set_selector_sum(window_id, int(payload.get("frames", 1)),
+                                  payload.get("selector_id"))
         elif action == "set_selector_mode":
             self.set_selector_mode(window_id, bool(payload.get("integrate")),
                                    payload.get("selector_id"))

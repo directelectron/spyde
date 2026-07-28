@@ -139,6 +139,15 @@ export interface SelectorInfo {
   selectorId?: number
   /** Widget colour — the dock row's dot. */
   color?: string
+  /** How many navigation positions a POINT selector sums (1 = plain
+   *  crosshair). Only sent for a 1-D (movie/time) navigator; its absence is
+   *  what hides the control on a 2-D one, where "n frames" has no direction. */
+  sumFrames?: number
+  /** Length of that navigation axis, so the dock can cap the ladder. */
+  navSize?: number
+  /** Seconds per navigation position (0 when the axis isn't time), so a
+   *  summed window can be labelled with the rate it works out to. */
+  navScale?: number
 }
 /** The named navigators a navigator window offers (its top chip strip). */
 export interface NavigatorOptions { names: string[]; current?: string | null }
@@ -1111,6 +1120,11 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
               // creation-time title/colour on a mode-only re-emit.
               ...(msg.title != null ? { title: msg.title } : {}),
               ...(msg.color != null ? { color: msg.color } : {}),
+              ...(msg.sum_frames != null
+                ? { sumFrames: Number(msg.sum_frames) } : {}),
+              ...(msg.nav_size != null ? { navSize: Number(msg.nav_size) } : {}),
+              ...(msg.nav_scale != null
+                ? { navScale: Number(msg.nav_scale) } : {}),
             },
           })
           break

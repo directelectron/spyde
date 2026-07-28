@@ -231,14 +231,37 @@ class MultiplotManager:
             idx = len(self.navigation_selectors[plot_window])
             self.session.register_nav_selector(plot_window.window_id, selector)
             from spyde.backend.ipc import emit
-            emit({
+            # `sum_frames` / `nav_size` are only sent for a selector that can
+            # widen a POINT into a summed window — a 1-D (movie/time) navigator.
+            # Their absence is what tells the dock not to offer the control on a
+            # 2-D navigator, where "n frames" has no unambiguous direction and
+            # Integrate is the right tool anyway.
+            info = {
                 "type": "selector_info",
                 "window_id": plot_window.window_id,
                 "selector_id": id(selector),
                 "color": color,
                 "mode": mode,
                 "title": "Navigator" if idx <= 1 else f"Navigator {idx}",
-            })
+            }
+            if hasattr(selector, "sum_frames"):
+                info["sum_frames"] = int(getattr(selector, "sum_frames", 1) or 1)
+                try:
+                    ax = (selector.current_plot.plot_state.current_signal
+                          .axes_manager.signal_axes[0])
+                    info["nav_size"] = int(ax.size)
+                    # Seconds per navigation position, so the dock can label a
+                    # summed window with the effective rate it produces. Only
+                    # meaningful on a time axis; 0 tells it to label in frames
+                    # alone.
+                    units = str(getattr(ax, "units", "") or "").lower()
+                    info["nav_scale"] = (float(ax.scale)
+                                         if units in ("s", "sec", "second",
+                                                      "seconds") else 0.0)
+                except Exception:
+                    info["nav_size"] = 0
+                    info["nav_scale"] = 0.0
+            emit(info)
         except Exception as e:
             logger.debug("emitting navigator selector_info failed: %s", e)
 
