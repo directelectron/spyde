@@ -1,0 +1,10 @@
+name: "CSB"
+name_aliases: ["DE_CSB"]
+description: "Direct Electron CSB (compressed sparse block) centroid-streaming
+  files: a sparse event stream rather than a dense frame stack. Reading
+  integrates events over a time window per plane."
+full_support: False
+file_extensions: ["csb", "CSB"]
+default_extension: 0
+writes: False
+non_uniform_axis: False

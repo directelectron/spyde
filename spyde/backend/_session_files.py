@@ -25,7 +25,7 @@ from spyde.backend.ipc import emit, emit_status, emit_error
 
 log = logging.getLogger(__name__)
 
-SUPPORTED_EXTS = (".hspy", ".zspy", ".mrc", ".tif", ".tiff", ".de5")
+SUPPORTED_EXTS = (".hspy", ".zspy", ".mrc", ".tif", ".tiff", ".de5", ".csb")
 
 # Extensions whose "file" is actually a DIRECTORY (a Zarr store). `.zspy` (and a
 # bare `.zarr`) is a nested-group folder, not a single file — so `os.path.isfile`
@@ -65,6 +65,42 @@ def _dataset_size_bytes(path: str) -> float:
         return float(os.path.getsize(path))
     except OSError:
         return 0.0
+
+
+def _reader_navigator(sig):
+    """A navigator the READER already knew, or None.
+
+    Normally SpyDE builds the scrub overview by reducing over every frame,
+    which for most formats is the cheapest thing available. For an event
+    stream it is the most expensive: a CSB navigator built that way would
+    integrate the entire movie just to draw a thumbnail, when the per-plane
+    totals are sitting in the block table for free (``rsciio_csb`` computes
+    them at open, costing no payload reads at all).
+
+    Readers publish it as ``original_metadata.csb.plane_counts``. (Not the
+    signal dict's ``attributes`` key — HyperSpy does not propagate that onto
+    the signal object, so a navigator sent that way silently vanishes and the
+    expensive reduction happens anyway.)
+    """
+    try:
+        om = getattr(sig, "original_metadata", None)
+        if om is None or not om.has_item("csb.plane_counts"):
+            return None
+        counts = om.get_item("csb.plane_counts")
+    except Exception as e:
+        log.debug("reading the reader-supplied navigator failed: %s", e)
+        return None
+    if counts is None or not len(counts):
+        return None
+    try:
+        import hyperspy.api as hs
+        import numpy as _np
+        nav = hs.signals.Signal1D(_np.asarray(counts, _np.float32))
+        nav.metadata.General.title = "Total counts"
+        return nav
+    except Exception as e:
+        log.debug("building the reader-supplied navigator failed: %s", e)
+        return None
 
 
 _DEFAULT_EXAMPLE_NAMES = (
@@ -230,6 +266,13 @@ class FileLoaderMixin:
             # Wait for the Dask cluster (see _load_example_thread) — a file opened
             # during startup queues here rather than racing ahead with no client.
             self._await_dask()
+            # And make sure spyde.external's patches have landed BEFORE the
+            # read. They register formats and reader fast paths, so a load that
+            # beats the startup prewarm would otherwise see an unpatched
+            # rosettasciio — silently no CSB reader, silently the slow MRC path.
+            # Single-flighted and idempotent, so this costs nothing once warm.
+            from spyde.backend.heavy_imports import ensure_heavy_imports
+            ensure_heavy_imports()
             signal = hs.load(path, lazy=True)
             if not isinstance(signal, list):
                 signal = [signal]
@@ -273,7 +316,8 @@ class FileLoaderMixin:
                 return
             for sig in signal:
                 self._maybe_set_insitu_signal_type(sig)
-                self._add_signal(sig, source_path=path)
+                self._add_signal(sig, source_path=path,
+                                 navigator_override=_reader_navigator(sig))
             self._add_recent(path)
             ipc.emit({"type": "recent_files", "paths": self._recent_files[:20]})
         except Exception as e:
