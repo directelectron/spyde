@@ -18,13 +18,13 @@ Download
      (scripts/update-download-links.mjs) — edit the markers, not the table. -->
 <!-- spyde:download-table:start -->
 
-**[⬇ Download SpyDE v0.2.0-rc.9](https://github.com/CSSFrancis/spyde/releases/tag/v0.2.0-rc.9)** — pick your platform:
+**[⬇ Download SpyDE v0.2.0](https://github.com/CSSFrancis/spyde/releases/tag/v0.2.0)** — pick your platform:
 
 | Platform | Download |
 |----------|----------|
-| **Windows** | [SpyDE-Setup-0.2.0-rc.9.exe](https://github.com/CSSFrancis/spyde/releases/download/v0.2.0-rc.9/SpyDE-Setup-0.2.0-rc.9.exe) |
-| **macOS** (Apple Silicon) | [SpyDE-0.2.0-rc.9-arm64-mac.zip](https://github.com/CSSFrancis/spyde/releases/download/v0.2.0-rc.9/SpyDE-0.2.0-rc.9-arm64-mac.zip) |
-| **Linux** | [SpyDE-0.2.0-rc.9.AppImage](https://github.com/CSSFrancis/spyde/releases/download/v0.2.0-rc.9/SpyDE-0.2.0-rc.9.AppImage) |
+| **Windows** | [SpyDE-Setup-0.2.0.exe](https://github.com/CSSFrancis/spyde/releases/download/v0.2.0/SpyDE-Setup-0.2.0.exe) |
+| **macOS** (Apple Silicon) | [SpyDE-0.2.0-arm64-mac.zip](https://github.com/CSSFrancis/spyde/releases/download/v0.2.0/SpyDE-0.2.0-arm64-mac.zip) |
+| **Linux** | [SpyDE-0.2.0.AppImage](https://github.com/CSSFrancis/spyde/releases/download/v0.2.0/SpyDE-0.2.0.AppImage) |
 
 All releases: <https://github.com/CSSFrancis/spyde/releases>
 
