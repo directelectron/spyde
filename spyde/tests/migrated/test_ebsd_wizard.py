@@ -246,6 +246,170 @@ class TestRunStage:
                    for m in ebsd_session["messages"] if m.get("type") == "error")
 
 
+class TestNeverMaterialisesTheScan:
+    """Memory safety (CLAUDE.md rule #1) — the scan is read in navigation
+    BLOCKS and the whole thing is never resident.
+
+    An EBSD pattern is small, which makes "just load it" tempting and wrong:
+    at float32 a 512x512 map of 60x60 patterns is 3.8 GB, and a real detector
+    is far bigger than 60x60. kikuchipy indexes over a chunked dask array for
+    the same reason.
+
+    This is guarded rather than reasoned about, because the failure is silent
+    until someone opens a big scan: the guard below raises if anything ever
+    computes a dask array the shape of the full dataset.
+    """
+
+    NAV, DET = (8, 8), (40, 40)
+
+    @pytest.fixture
+    def lazy_session(self, captured_messages, monkeypatch):
+        from spyde.backend.session import Session
+        import spyde.actions.ebsd_action as ebsd_mod
+
+        monkeypatch.setattr(ebsd_mod, "emit", captured_messages.append)
+
+        session = Session(n_workers=1, threads_per_worker=1)
+        s = ebsd_patterns(nav=self.NAV, detector=self.DET).as_lazy()
+        # Several nav chunks, so a correct implementation never asks for a
+        # slice the shape of the whole scan (which on a single-chunk 8-row scan
+        # it legitimately would, and the guard could not tell the difference).
+        s.data = s.data.rechunk((2, 4, -1, -1))
+        session._add_signal(s, source_path=None)
+        time.sleep(0.8)
+        yield {"session": session, "signal": s, "messages": captured_messages,
+               "trees": session.signal_trees, "plots": session._plots}
+        session.shutdown()
+
+    @pytest.fixture
+    def no_full_compute(self, monkeypatch):
+        """Raise if any dask array the shape of the whole dataset is computed."""
+        import dask.array as da
+
+        full = tuple(self.NAV) + tuple(self.DET)
+        original = da.Array.compute
+        seen: list[tuple] = []
+
+        def guard(self, *args, **kwargs):
+            if tuple(self.shape) == full:
+                raise AssertionError(
+                    f"computed the FULL dataset {full} — the scan must be read "
+                    f"in navigation blocks (CLAUDE.md memory-safety rule)")
+            seen.append(tuple(self.shape))
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(da.Array, "compute", guard)
+        return seen
+
+    def test_indexing_reads_the_scan_chunk_by_chunk(self, lazy_session,
+                                                    no_full_compute):
+        session, plot = lazy_session["session"], _signal_plot(lazy_session["session"])
+        tree = plot.signal_tree
+        ebsd_build_dictionary(session, plot, {"step_deg": 12.0,
+                                              "background": "dynamic"})
+        assert _wait(lambda: getattr(tree, "_ebsd_wizard", None) is not None)
+
+        ebsd_run(session, plot, {"keep": 4, "refine": False})
+        assert _wait(lambda: getattr(tree, "orientation_map", None) is not None,
+                     timeout=180), "indexing never finished"
+        assert tree.orientation_map.nav_shape == self.NAV
+
+    def test_the_static_reference_is_streamed_too(self, lazy_session,
+                                                  no_full_compute):
+        """The static background reference is a whole-scan MEAN — exactly the
+        kind of reduction that invites reading everything to compute it."""
+        session, plot = lazy_session["session"], _signal_plot(lazy_session["session"])
+        tree = plot.signal_tree
+        ebsd_build_dictionary(session, plot, {"step_deg": 12.0,
+                                              "background": "both"})
+        assert _wait(lambda: getattr(tree, "_ebsd_wizard", None) is not None)
+        wiz = tree._ebsd_wizard
+        assert wiz.static_ref is not None
+        assert wiz.static_ref.shape == self.DET
+
+        # And it is the real WHOLE-scan mean, not one block's. The reference
+        # comes from a fresh eager copy (the generator is deterministic) rather
+        # than from computing the lazy signal — which the guard above would,
+        # correctly, refuse.
+        expected = np.asarray(ebsd_patterns(nav=self.NAV, detector=self.DET).data,
+                              np.float32).mean(axis=(0, 1))
+        assert np.allclose(wiz.static_ref, expected, atol=1e-3)
+
+    def test_the_adp_map_is_seamless_across_chunks(self):
+        """Everything else in the run is per-pattern, so chunking cannot change
+        it. The ADP map is the exception — it compares each position with its
+        four NEIGHBOURS, so the rows either side of every chunk boundary would
+        be computed against nothing above/below them without the halo that
+        ``map_overlap`` adds. That shows up as faint lines at the seams, which
+        is easy to mistake for real structure.
+        """
+        import dask.array as da
+        from spyde.actions.ebsd_action import _adp_graph
+        from spyde.ebsd import average_dot_product_map
+
+        s = ebsd_patterns(nav=(8, 8), detector=self.DET)
+        raw = np.asarray(s.data, np.float32)
+
+        class _Passthrough:            # the halo, not the correction, is the test
+            background = "none"
+
+            def correct(self, patterns):
+                return np.asarray(patterns, float)
+
+        whole = average_dot_product_map(raw)
+        for chunk in (8, 4, 3, 1):     # 1 chunk, exact split, ragged, per-row
+            scan = da.from_array(raw, chunks=(chunk, chunk, -1, -1))
+            got = _adp_graph(scan, _Passthrough()).compute(scheduler="threads")
+            assert got.shape == whole.shape
+            assert np.allclose(got, whole, atol=1e-5), \
+                f"the ADP map has seams at {chunk}-row chunk boundaries"
+
+    def test_indexing_is_one_lazy_graph_over_the_chunks(self):
+        """The index is a dask graph, so nothing is read by BUILDING it — the
+        patterns only exist inside a worker, a chunk at a time."""
+        import dask.array as da
+        from spyde.actions.ebsd_action import _lazy_scan, _packed_index_graph
+
+        s = ebsd_patterns(nav=(8, 8), detector=self.DET).as_lazy()
+        scan = _lazy_scan(s)
+        assert isinstance(scan, da.Array)
+
+        class _Wiz:
+            euler = np.zeros((2, 3))
+
+        graph = _packed_index_graph(scan, _Wiz(), keep=3, refine=False, steps=1)
+        assert isinstance(graph, da.Array)
+        assert graph.shape == (8, 8, 4 + 3)
+        # Nav chunking is carried through, so the result assembles per chunk.
+        assert graph.chunks[:2] == scan.chunks[:2]
+
+    def test_eager_data_still_gets_a_bounded_chunking(self):
+        """An eager scan has no chunks of its own; it must still be given a
+        nav chunking, sized by BYTES, so a bigger detector means fewer rows
+        rather than the same rows and more memory."""
+        from spyde.actions.ebsd_action import _lazy_scan, _nav_block_rows
+        small = ebsd_patterns(nav=(64, 64), detector=(40, 40))
+        big = ebsd_patterns(nav=(64, 64), detector=(80, 80))
+        budget = 4 << 20
+        assert _nav_block_rows(big, budget) < _nav_block_rows(small, budget)
+        assert _nav_block_rows(small, 1 << 40) == 64        # never more than ny
+        scan = _lazy_scan(small)
+        assert len(scan.chunks[2]) == 1 and len(scan.chunks[3]) == 1, \
+            "patterns must not be split across chunks"
+
+    def test_patterns_split_across_chunks_are_merged(self):
+        """A chunk holding PART of a pattern makes every read useless. EBSD
+        readers do not normally split the detector, but if one does the graph
+        has to fix it rather than index garbage."""
+        import dask.array as da
+        from spyde.actions.ebsd_action import _lazy_scan
+
+        s = ebsd_patterns(nav=(4, 4), detector=(40, 40)).as_lazy()
+        s.data = da.from_array(np.asarray(s.data), chunks=(2, 2, 20, 20))
+        scan = _lazy_scan(s)
+        assert len(scan.chunks[2]) == 1 and len(scan.chunks[3]) == 1
+
+
 class TestWiring:
     def test_the_schema_is_registered_and_matches_the_defaults(self):
         """One source of truth for every host — a schema default that drifts

@@ -69,8 +69,6 @@ def dictionary_index(patterns, dictionary, *, keep: int = 1, device=None,
                      dtype="float32", tile_elements: int = _TILE_ELEMENTS,
                      pattern_chunk: int | None = None,
                      progress: Callable[[int, int], None] | None = None,
-                     on_chunk: Callable[[int, int, np.ndarray, np.ndarray],
-                                        None] | None = None,
                      stopped_flag=None):
     """Match every pattern against every dictionary entry.
 
@@ -92,14 +90,10 @@ def dictionary_index(patterns, dictionary, *, keep: int = 1, device=None,
         conditioned quantity and the matmul is memory-bound, so float64 would
         halve throughput to protect digits that do not affect the ranking.
     pattern_chunk : int, optional
-        Cap on the experimental tile size. The tiling *alone* would put every
-        pattern in one chunk whenever the dictionary is small enough — correct
-        and fastest, but it means *progress* and *on_chunk* fire exactly once,
-        at the end. A UI filling a map in as it indexes passes this to get
-        intermediate results; nothing else should.
-    on_chunk : callable, optional
-        ``(lo, hi, indices, scores)`` for each completed slice of patterns, so
-        a caller can paint partial results. Called on the calling thread.
+        Cap on the experimental tile size, on top of the *tile_elements*
+        budget. Callers that already stream the scan in navigation blocks
+        (``spyde.actions.ebsd_action``) do not need it; it is here for a caller
+        holding a large in-memory stack that wants a tighter bound.
     stopped_flag : list[bool], optional
         Polled between chunks; a truthy first element abandons the run and
         returns None. This is how closing the window cancels an index.
@@ -177,11 +171,6 @@ def dictionary_index(patterns, dictionary, *, keep: int = 1, device=None,
 
         out_scores[p0:p1] = best_s.detach().cpu().numpy()
         out_index[p0:p1] = best_i.detach().cpu().numpy()
-        if on_chunk is not None:
-            try:
-                on_chunk(p0, p1, out_index[p0:p1], out_scores[p0:p1])
-            except Exception as e:                          # pragma: no cover
-                log.debug("indexing on_chunk callback failed: %s", e)
         if progress is not None:
             try:
                 progress(p1, P)

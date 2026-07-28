@@ -29,6 +29,8 @@ preprocessing, band geometry); this module is only the interactive wiring.
 from __future__ import annotations
 
 import logging
+import os
+import threading
 
 import numpy as np
 
@@ -253,25 +255,63 @@ def _nav_shape(signal) -> tuple[int, int]:
     return (int(nav[1]), int(nav[0]))
 
 
-def _read_scan(signal) -> np.ndarray:
-    """The whole scan as ``(ny, nx, dy, dx)`` float32.
+#: Target bytes per navigation chunk (float32) when the scan arrives EAGER and
+#: has to be given a chunking of its own. A lazy signal keeps the chunking it
+#: was loaded with.
+NAV_BLOCK_BYTES = 256 << 20        # 256 MiB
 
-    Deliberately materialised: every step of :mod:`spyde.ebsd` — background
-    correction, the ADP map, indexing, refinement — is written whole-field, so
-    there is nothing to stream into. EBSD patterns are small (a 60x60 detector
-    is 3.6 kB), which is what makes that reasonable where the 4D-STEM memory
-    rule forbids it.
 
-    It is not free, though: at float32 a 256x256 scan of 60x60 patterns is
-    940 MB and a 512x512 one is 3.8 GB. Indexing a scan that large wants the
-    read chunked over navigation and fed to ``dictionary_index`` a block at a
-    time — the function already tiles internally and takes a ``stopped_flag``,
-    so the change is here rather than there.
+def _nav_block_rows(signal, budget_bytes: int | None = None) -> int:
+    """Navigation rows per chunk for a scan that has no chunking yet."""
+    ny, nx = _nav_shape(signal)
+    dy, dx = _detector_shape(signal)
+    per_row = max(1, nx * dy * dx * 4)
+    budget = int(budget_bytes if budget_bytes is not None else NAV_BLOCK_BYTES)
+    return int(max(1, min(budget // per_row, ny)))
+
+
+def _lazy_scan(signal):
+    """The scan as a dask array chunked over NAVIGATION, patterns whole.
+
+    **Never materialise the scan** (CLAUDE.md's memory-safety rule): at float32
+    a 512x512 map of 60x60 patterns is 3.8 GB, and a real detector is far
+    bigger than 60x60. kikuchipy indexes over a chunked dask array for exactly
+    this reason and so does everything below — every stage is per-pattern
+    (correction, indexing, refinement) or needs only the four nearest
+    neighbours (the ADP map), so it is embarrassingly parallel over navigation
+    chunks and nothing ever needs more than a chunk resident.
+
+    A lazy signal keeps the chunking it was loaded with. An eager one is
+    wrapped with a nav chunking of its own — patterns are already in RAM there,
+    so this buys parallelism rather than memory.
     """
+    import dask.array as da
+
     data = signal.data
-    if hasattr(data, "compute"):
-        data = data.compute()
-    return np.asarray(data, np.float32)
+    if not hasattr(data, "chunks"):
+        rows = _nav_block_rows(signal)
+        return da.from_array(data, chunks=(rows, -1, -1, -1))
+    # A chunk holding PART of a pattern makes every read useless — the same
+    # storage-alignment argument as the live-display path (CLAUDE.md §1), and
+    # the only case where merging chunks is worth the shuffle. EBSD readers do
+    # not normally split the detector, hence the warning if one has.
+    if len(data.chunks[2]) > 1 or len(data.chunks[3]) > 1:
+        log.warning("EBSD patterns are split across chunks %s — merging the "
+                    "signal axes so a chunk holds whole patterns",
+                    (data.chunks[2], data.chunks[3]))
+        data = data.rechunk({2: -1, 3: -1})
+    return data
+
+
+def _scan_mean(scan) -> np.ndarray:
+    """The mean pattern over the whole scan, as a dask reduction.
+
+    This is the ``static`` background reference (what a flat-field image
+    approximates) — a whole-scan reduction, which is exactly the kind of thing
+    that invites reading the whole scan. dask streams it chunk by chunk.
+    """
+    return np.asarray(scan.mean(axis=(0, 1)).compute(scheduler="threads"),
+                      np.float32)
 
 
 def _phase_for(payload, signal):
@@ -371,10 +411,11 @@ def ebsd_build_dictionary(session, plot, payload) -> None:
             indexer = SinglePatternIndexer(dic, euler)
 
             # The static reference for background correction is the scan mean;
-            # compute it once here, not per preview frame.
+            # computed once here (streamed, never the whole scan at once), not
+            # per preview frame.
             static_ref = None
             if background in ("static", "both"):
-                static_ref = _read_scan(root).mean(axis=(0, 1))
+                static_ref = _scan_mean(_lazy_scan(root))
 
             # A rebuilt dictionary replaces the previous wizard wholesale, so
             # its overlay tears down with it rather than stacking a second set
@@ -498,6 +539,145 @@ def ebsd_run(session, plot, payload) -> None:
     run_on_worker(session, _work, name="ebsd-run")
 
 
+# torch's CUDA backward is not something to run from several dask threads at
+# once on Windows (CLAUDE.md, GPU Computing). Indexing is a forward matmul and
+# parallelises freely; refinement takes this lock, which costs nothing real —
+# the GPU serialises those kernels anyway.
+_REFINE_LOCK = threading.Lock()
+
+
+def _index_chunk(block, wiz, keep, refine, steps, dict_euler):
+    """One navigation chunk → ``(by, bx, 3 + 1 + keep)``.
+
+    Runs on a dask worker thread with only this chunk's patterns in hand.
+    Packed into one array rather than returned as a tuple because that is what
+    ``map_blocks`` can express; float64 so the dictionary indices riding in the
+    tail stay exact.
+    """
+    from spyde.ebsd.indexing import dictionary_index
+
+    by, bx = block.shape[:2]
+    out = np.zeros((by, bx, 4 + keep), np.float64)
+    if by == 0 or bx == 0:
+        return out
+
+    corrected = wiz.correct(np.asarray(block, np.float32))
+    res = dictionary_index(corrected, wiz.indexer, keep=keep)
+    eul = dict_euler[res.best].reshape(by, bx, 3)
+    sc = res.best_score.reshape(by, bx)
+
+    if refine:
+        from spyde.ebsd.refine import refine_orientations
+        with _REFINE_LOCK:
+            ref = refine_orientations(
+                corrected, eul, detector=wiz.detector, pc=wiz.pc,
+                reflectors=wiz.reflectors, background_sigma=wiz.sim_sigma,
+                steps=steps)
+        eul = ref.euler_map((by, bx))
+        sc = ref.score.reshape(by, bx)
+
+    out[..., :3] = eul
+    out[..., 3] = sc
+    out[..., 4:] = res.indices.reshape(by, bx, keep)
+    return out
+
+
+def _packed_index_graph(scan, wiz, *, keep, refine, steps):
+    """The lazy per-chunk index (+ refine) over the whole scan."""
+    nav_chunks = (scan.chunks[0], scan.chunks[1])
+    return scan.map_blocks(
+        _index_chunk, wiz, keep, refine, steps, wiz.euler,
+        dtype=np.float64, drop_axis=[2, 3], new_axis=[2],
+        chunks=nav_chunks + ((4 + keep,),),
+    )
+
+
+def _adp_chunk(block, *, wiz):
+    """Average dot-product map for one HALOED navigation chunk."""
+    from spyde.ebsd.preprocess import average_dot_product_map
+
+    if block.shape[0] == 0 or block.shape[1] == 0:
+        return np.zeros(block.shape[:2], np.float32)
+    return average_dot_product_map(
+        wiz.correct(np.asarray(block, np.float32))).astype(np.float32)
+
+
+def _adp_graph(scan, wiz):
+    """The lazy ADP map — ``map_overlap`` with a one-position halo, so a
+    chunk's edge rows still see the neighbours that live in the next chunk.
+
+    The module-level form, with *wiz* bound in: ``Array.map_overlap`` takes
+    ``depth`` as its second positional argument, so an extra positional here
+    collides with it.
+    """
+    import dask.array as da
+    from functools import partial
+
+    return da.map_overlap(
+        partial(_adp_chunk, wiz=wiz), scan,
+        depth={0: 1, 1: 1, 2: 0, 3: 0}, boundary="none", trim=True,
+        dtype=np.float32, drop_axis=[2, 3],
+        chunks=(scan.chunks[0], scan.chunks[1]),
+    )
+
+
+def _compute_nav_chunks(lazy, stopped, *, on_chunk=None, label="computing"):
+    """Compute a nav-chunked lazy array chunk-by-chunk, in parallel.
+
+    Chunks are independent, so they go to a thread pool and land as they
+    finish — which is both the parallelism and the progressive fill. dask's
+    threaded scheduler is used deliberately rather than the session's compute
+    backend: the dictionary is a torch tensor resident on the LOCAL device, so
+    shipping these tasks to distributed workers would mean shipping it too.
+
+    ONLY for a graph built with ``map_blocks``, where a nav-chunk slice selects
+    exactly one block. Slicing a ``map_overlap`` result this way re-derives the
+    halo per slice and does not line up — compute those whole (see
+    :func:`_adp_graph`, whose output is one small map either way).
+
+    Returns the assembled array, or None if cancelled.
+    """
+    import itertools
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    nav_chunks = lazy.chunks[:2]
+    spans = []
+    for axis in nav_chunks:
+        pos, start = [], 0
+        for size in axis:
+            pos.append((start, size))
+            start += size
+        spans.append(pos)
+    blocks = list(itertools.product(*spans))
+    out = np.zeros(lazy.shape, lazy.dtype)
+
+    workers = max(1, min(8, (os.cpu_count() or 4) - 1))
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers,
+                            thread_name_prefix="ebsd-chunk") as pool:
+        futures = {}
+        for (y0, hy), (x0, wx) in blocks:
+            sl = (slice(y0, y0 + hy), slice(x0, x0 + wx))
+            full = sl + (slice(None),) * (lazy.ndim - 2)
+            futures[pool.submit(lazy[full].compute, scheduler="threads")] = sl
+        for fut in as_completed(futures):
+            sl = futures[fut]
+            if stopped[0]:
+                for f in futures:
+                    f.cancel()
+                return None
+            chunk = fut.result()
+            out[sl] = chunk
+            done += 1
+            emit_status(f"EBSD: {label}… {int(100 * done / max(len(blocks), 1))}%")
+            if on_chunk is not None:
+                try:
+                    on_chunk(chunk, sl)
+                except Exception as e:
+                    log.debug("EBSD chunk callback failed: %s", e)
+    return None if stopped[0] else out
+
+
 def _run_indexing(session, tree, wiz, *, keep, refine, steps):
     """Whole-field index (+ optional refine) → the IPF window. Synchronous;
     call from a worker."""
@@ -507,8 +687,7 @@ def _run_indexing(session, tree, wiz, *, keep, refine, steps):
 
     root = tree.root
     ny, nx = _nav_shape(root)
-    scan = wiz.correct(_read_scan(root))
-    dict_euler = wiz.euler
+    scan = _lazy_scan(root)
 
     ipf_tree = _open_ipf_window(session, root, ny, nx)
     # Closing EITHER the source or the result window stops the run — an index
@@ -521,53 +700,49 @@ def _run_indexing(session, tree, wiz, *, keep, refine, steps):
             t.register_cancel(flag=stopped)
 
     try:
-        painter = _ProgressivePainter(session, ipf_tree, wiz, (ny, nx), dict_euler)
-        # Cap the pattern tile so the map fills in as it goes: left alone the
-        # tiling puts the whole scan in one chunk and nothing paints until the
-        # end (see dictionary_index's pattern_chunk).
-        chunk = max(1, (ny * nx) // 16)
-        result = dictionary_index(
-            scan, wiz.indexer, keep=keep, pattern_chunk=chunk,
-            on_chunk=painter, stopped_flag=stopped,
-            progress=lambda d, t: emit_status(
-                f"EBSD: indexing… {int(100 * d / max(t, 1))}%"),
-        )
-        if result is None:
+        painter = _ProgressivePainter(session, ipf_tree, wiz, (ny, nx), wiz.euler)
+        # ONE lazy graph over the chunked scan: per nav chunk, correct →
+        # index → optionally refine, packed into (by, bx, 3 euler + 1 score +
+        # keep indices). Nothing here reads anything; the patterns only ever
+        # exist a chunk at a time, inside the worker that is using them.
+        packed = _packed_index_graph(scan, wiz, keep=keep, refine=refine,
+                                     steps=steps)
+        results = _compute_nav_chunks(
+            packed, stopped,
+            on_chunk=lambda blk, sl: painter.paint(blk[..., :3], sl),
+            label="indexing")
+        if results is None:
             if not getattr(tree, "_spyde_closed", False) and not stopped[0]:
                 emit_error("EBSD: indexing returned no result")
             return None
 
-        euler = dict_euler[result.best].reshape(ny, nx, 3)
-        score = result.best_score.reshape(ny, nx)
+        euler = np.ascontiguousarray(results[..., :3], np.float64)
+        score = np.ascontiguousarray(results[..., 3], np.float32)
+        indices = results[..., 4:].reshape(ny * nx, -1).astype(np.int64)
 
-        # Refinement is the tail of the SAME run, so it stays inside the
-        # cancellation registration — unregistering after the index would let
-        # a window closed during refinement carry on to paint into it.
-        if refine and not stopped[0]:
-            emit_status(f"EBSD: refining {ny * nx:,} orientations…")
-            from spyde.ebsd.refine import refine_orientations
-            ref = refine_orientations(
-                scan, euler, detector=wiz.detector, pc=wiz.pc,
-                reflectors=wiz.reflectors, background_sigma=wiz.sim_sigma,
-                steps=steps,
-                progress=lambda d, t: emit_status(
-                    f"EBSD: refining… {int(100 * d / max(t, 1))}%"))
-            euler = ref.euler_map((ny, nx))
-            score = ref.score.reshape(ny, nx)
-            log.debug("refinement improved %d/%d orientations",
-                      int(ref.improved.sum()), ref.improved.size)
+        # The ADP map is the ONE stage that is not per-pattern: it compares
+        # each position with its four neighbours, so it goes through
+        # map_overlap with a one-position halo rather than plain map_blocks —
+        # otherwise the rows either side of every chunk boundary would be
+        # computed against nothing and the map would show faint seams.
+        # Computed whole (the scheduler still runs the chunks in parallel and
+        # still only holds a chunk of patterns at a time); its output is one
+        # small map, so there is nothing to fill in progressively.
+        emit_status("EBSD: quality maps…")
+        adp = None
+        if not stopped[0]:
+            try:
+                adp = np.asarray(
+                    _adp_graph(scan, wiz).compute(scheduler="threads"), np.float32)
+            except Exception as e:
+                log.debug("ADP map failed: %s", e)
 
         if stopped[0]:
             return None
-
         om = _orientation_map(euler, score, wiz, root)
-        osm = (orientation_similarity_map(result.indices, (ny, nx))
-               if keep > 1 else None)
-        try:
-            adp = average_dot_product_map(scan)
-        except Exception as e:
-            log.debug("ADP map failed: %s", e)
-            adp = None
+        # A neighbour comparison over the FULL map, so it runs once at the end
+        # — on the accumulated indices, which are small.
+        osm = orientation_similarity_map(indices, (ny, nx)) if keep > 1 else None
     finally:
         for t in trees.values():
             if t is not None and hasattr(t, "unregister_cancel"):
@@ -582,12 +757,11 @@ def _run_indexing(session, tree, wiz, *, keep, refine, steps):
 
 
 class _ProgressivePainter:
-    """Paint the IPF map as indexing completes each slice of patterns.
+    """Paint the IPF map as each navigation chunk finishes indexing.
 
-    A dictionary index reports per chunk of PATTERNS, which in scan order is a
-    contiguous run of positions — so the map fills top to bottom and you can
-    see the grain structure emerge instead of watching a blank window. Costs
-    one IPF colouring per chunk over the positions done so far.
+    Chunks land as they complete, so the map fills in and you watch the grain
+    structure emerge instead of a blank window. Costs one IPF colouring per
+    chunk, over that chunk's positions only.
     """
 
     def __init__(self, session, ipf_tree, wiz, nav_shape, dict_euler):
@@ -608,15 +782,18 @@ class _ProgressivePainter:
         self._pg = wiz.phase.point_group
         self._key = IPFColorKeyTSL(self._pg.laue)
 
-    def __call__(self, lo, hi, indices, scores) -> None:
+    def paint(self, euler, nav_slice) -> None:
+        """Colour one finished navigation chunk into the map and push it."""
         if self.plot is None:
             return
         try:
             from orix.quaternion import Orientation, Rotation
-            rot = Rotation.from_euler(self.dict_euler[indices[:, 0]])
+            eul = np.asarray(euler, float).reshape(-1, 3)
+            rot = Rotation.from_euler(eul)
             rgb = self._key.orientation2color(Orientation(rot, symmetry=self._pg))
-            self.rgb.reshape(-1, 3)[lo:hi] = np.clip(
-                np.asarray(rgb) * 255.0, 0, 255).astype(np.uint8)
+            self.rgb[nav_slice] = np.clip(
+                np.asarray(rgb) * 255.0, 0, 255).astype(np.uint8).reshape(
+                    self.rgb[nav_slice].shape)
         except Exception as e:
             log.debug("progressive IPF colouring failed: %s", e)
             return
