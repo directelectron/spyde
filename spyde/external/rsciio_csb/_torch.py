@@ -121,10 +121,34 @@ class TorchAccumulator:
         return v.reshape(cs.padded_height, cs.padded_width)
 
     def image(self, dtype=None) -> np.ndarray:
+        """The summed image as a host ndarray.
+
+        THIS is where a plane's time goes, not the events: accumulating 2.5 M
+        events takes ~10 ms, while shipping the 8192² result back over PCIe
+        takes ~200 ms. So the copy is done once, into pinned memory — a
+        pageable D2H has to bounce through a driver staging buffer, which on
+        this box costs roughly 2x. Use :meth:`preview` for anything that only
+        needs to be looked at; at bin 4 it moves 1/16th of the bytes.
+        """
+        import torch
+
         cs = self.csb
-        v = self._untile()[:cs.frame_height, :cs.frame_width]
-        out = v.contiguous().cpu().numpy()
+        v = self._untile()[:cs.frame_height, :cs.frame_width].contiguous()
+        host = self._pinned_like(v)
+        host.copy_(v, non_blocking=False)
+        out = host.numpy()
         return out if dtype is None else out.astype(dtype)
+
+    def _pinned_like(self, v):
+        """A reusable pinned host buffer matching *v* — allocating (and
+        page-locking) 268 MB per plane would cost more than the copy saves."""
+        import torch
+
+        buf = getattr(self, "_pin", None)
+        if buf is None or buf.shape != v.shape or buf.dtype != v.dtype:
+            buf = torch.empty(v.shape, dtype=v.dtype, pin_memory=True)
+            self._pin = buf
+        return buf
 
     def preview(self, bin_factor: int = 4, dtype=np.float32) -> np.ndarray:
         if bin_factor < 1:
