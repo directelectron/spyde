@@ -301,6 +301,81 @@ def eds_si(nav=(16, 16), n_channels: int = 2048, *, e_stop: float = 20.0,
 # EBSD
 # ---------------------------------------------------------------------------
 
+def atom_lattice(grid=(8, 10), spacing: float = 16.0, *, sigma: float = 2.6,
+                 dumbbell: float = 0.0, displacement: float = 0.0,
+                 ellipticity: float = 0.0, noise: float = 0.01,
+                 seed: int = 0):
+    """A HAADF-like atomic-resolution image with **exactly known positions**.
+
+    Atoms sit on a rectangular lattice of gaussians. Every optional feature
+    exists so a downstream measurement has something real to recover:
+
+    ``dumbbell``
+        Split each site into a PAIR separated by this many pixels along x, for
+        the dumbbell workflow. 0 leaves single atoms.
+    ``displacement``
+        Amplitude of a smooth sinusoidal displacement field, so a
+        displacement/strain map is non-trivial rather than uniformly zero.
+    ``ellipticity``
+        Stretches sigma_x against sigma_y across the field, so an ellipticity
+        map has a known gradient to reproduce.
+
+    The grid is deliberately NON-SQUARE and the spacing along x and y is the
+    same, so a transposed result is obvious rather than plausible.
+
+    Ground truth (``metadata.Spyde.synthetic``, read with :func:`ground_truth`)
+    carries ``positions`` as ``(N, 2)`` in ``(x, y)`` pixel order — atomap's
+    convention, so a comparison needs no reindexing.
+    """
+    import hyperspy.api as hs
+
+    ny, nx = int(grid[0]), int(grid[1])
+    rng = np.random.default_rng(seed)
+    margin = spacing
+    h = int(round(margin * 2 + spacing * (ny - 1)))
+    w = int(round(margin * 2 + spacing * (nx - 1)))
+
+    gy, gx = np.mgrid[0:ny, 0:nx].astype(float)
+    xs = margin + gx * spacing
+    ys = margin + gy * spacing
+    if displacement:
+        xs = xs + displacement * np.sin(2 * np.pi * gy / max(ny - 1, 1))
+        ys = ys + displacement * np.cos(2 * np.pi * gx / max(nx - 1, 1))
+
+    sx = sigma * (1.0 + ellipticity * gx / max(nx - 1, 1))
+    sy = np.full_like(sx, sigma)
+
+    centres = []
+    for iy in range(ny):
+        for ix in range(nx):
+            if dumbbell:
+                centres.append((xs[iy, ix] - dumbbell / 2, ys[iy, ix],
+                                sx[iy, ix], sy[iy, ix]))
+                centres.append((xs[iy, ix] + dumbbell / 2, ys[iy, ix],
+                                sx[iy, ix], sy[iy, ix]))
+            else:
+                centres.append((xs[iy, ix], ys[iy, ix], sx[iy, ix], sy[iy, ix]))
+
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    img = np.zeros((h, w), np.float32)
+    for cx, cy, s_x, s_y in centres:
+        img += np.exp(-0.5 * (((xx - cx) / s_x) ** 2 + ((yy - cy) / s_y) ** 2))
+    img /= max(img.max(), 1e-9)
+    if noise:
+        img = img + rng.normal(0.0, noise, img.shape).astype(np.float32)
+
+    s = hs.signals.Signal2D(np.clip(img, 0, None).astype(np.float32))
+    for a in s.axes_manager.signal_axes:
+        a.units, a.scale = "nm", 0.01
+    s.metadata.General.title = "Synthetic atom lattice"
+    _stamp(s, kind="atoms",
+           positions=np.array([[c[0], c[1]] for c in centres], float),
+           grid=(ny, nx), spacing=float(spacing), sigma=float(sigma),
+           dumbbell=float(dumbbell), displacement=float(displacement),
+           ellipticity=float(ellipticity))
+    return s
+
+
 def _euler_to_matrix(phi1, Phi, phi2) -> np.ndarray:
     """Bunge ZXZ Euler angles -> rotation matrices, batched over the leading
     axes. Returns ``(..., 3, 3)``."""
