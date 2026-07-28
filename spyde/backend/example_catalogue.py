@@ -335,6 +335,13 @@ def entry(key: str, ds) -> dict:
         "tags": list(md.get("tags") or []),
         "microscope": str(md.get("microscope") or ""),
         "voltage": str(md.get("voltage") or ""),
+        # The camera, as top-level dataset fields rather than metadata keys.
+        # Worth surfacing: which detector a dataset came off is most of what
+        # tells you what to expect from it (counted vs integrating, frame rate,
+        # pixel size), and it is the field a user picking an example to test
+        # their own data against actually looks for.
+        "detector": str(getattr(ds, "detector", "") or ""),
+        "detector_manufacturer": str(getattr(ds, "detector_manufacturer", "") or ""),
         "license": str(getattr(ds, "license", "") or ""),
         "source": str(getattr(ds, "source", "") or ""),
     }

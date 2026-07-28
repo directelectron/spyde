@@ -44,6 +44,17 @@ class TestCatalogue:
                 assert isinstance(item["downloaded"], bool)
                 assert item["size"], f"{item['key']} has no size to show"
 
+    def test_the_camera_is_carried_through(self):
+        """`detector` / `detector_manufacturer` are top-level dataset fields,
+        not metadata keys — easy to miss, and the hover card shows them."""
+        items = [it for g in ec.catalogue()["groups"] for it in g["items"]]
+        assert all("detector" in it and "detector_manufacturer" in it
+                   for it in items)
+        with_camera = [it for it in items
+                       if it["detector"] or it["detector_manufacturer"]]
+        assert len(with_camera) > len(items) // 2, \
+            "almost nothing carried a camera — the field name probably moved"
+
     def test_the_base_class_is_not_a_dataset(self):
         """``em_database.data`` also holds the DownloadableDataset base and an
         incidental ``Path`` import; neither is an example."""

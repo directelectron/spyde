@@ -92,6 +92,9 @@ test('hovering a dataset shows a themed info card', async () => {
   await expect(card).toContainText('SPEDAg')
   await expect(card).toContainText('4D-STEM')
   await expect(card).toContainText(/Size/)
+  // The camera is most of what tells you what to expect from a dataset.
+  await expect(card).toContainText('Camera')
+  await expect(card).toContainText('Merlin (Quantum Detectors)')
   await expect(card).toContainText(/On disk|Not downloaded/)
   await page.screenshot({ path: `${SHOTS}/04-hover-card.png` })
 

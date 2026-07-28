@@ -40,6 +40,16 @@ export interface ExampleItem {
   file?: string
   microscope?: string
   voltage?: string
+  detector?: string
+  detector_manufacturer?: string
+}
+
+/** "CeleritasXS (Direct Electron)" — either half alone when that is all there
+ *  is (a HAADF dataset has a manufacturer but no named detector). */
+function cameraOf(it: ExampleItem): string {
+  const [name, make] = [it.detector?.trim(), it.detector_manufacturer?.trim()]
+  if (name && make) return `${name} (${make})`
+  return name || make || ''
 }
 interface ExampleGroup { technique: string; items: ExampleItem[] }
 
@@ -160,11 +170,12 @@ export function MenuBar({ onStartGuide }: { onStartGuide: (g: Guide) => void }) 
           tip: {
             title: it.label,
             meta: [it.technique, it.microscope, it.voltage].filter(Boolean).join(' · '),
-            facts: [
-              ...(it.shape ? [['Shape', it.shape] as [string, string]] : []),
-              ['Size', it.size] as [string, string],
-              ...(it.file ? [['File', it.file] as [string, string]] : []),
-            ],
+            facts: ([
+              it.shape ? ['Shape', it.shape] : null,
+              ['Size', it.size],
+              cameraOf(it) ? ['Camera', cameraOf(it)] : null,
+              it.file ? ['File', it.file] : null,
+            ].filter(Boolean)) as [string, string][],
             body: it.description,
             downloaded: it.downloaded,
           },
