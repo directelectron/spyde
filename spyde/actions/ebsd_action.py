@@ -281,26 +281,36 @@ def _lazy_scan(signal):
     neighbours (the ADP map), so it is embarrassingly parallel over navigation
     chunks and nothing ever needs more than a chunk resident.
 
-    A lazy signal keeps the chunking it was loaded with. An eager one is
-    wrapped with a nav chunking of its own — patterns are already in RAM there,
-    so this buys parallelism rather than memory.
-    """
-    import dask.array as da
+    Chunking is hyperspy's own ``LazySignal.rechunk``, which is what
+    ``BaseSignal.map`` uses to prepare its input — it takes navigation and
+    signal chunks separately off the axes manager, so this does not have to
+    know which array axes are which:
 
-    data = signal.data
-    if not hasattr(data, "chunks"):
-        rows = _nav_block_rows(signal)
-        return da.from_array(data, chunks=(rows, -1, -1, -1))
-    # A chunk holding PART of a pattern makes every read useless — the same
-    # storage-alignment argument as the live-display path (CLAUDE.md §1), and
-    # the only case where merging chunks is worth the shuffle. EBSD readers do
-    # not normally split the detector, hence the warning if one has.
-    if len(data.chunks[2]) > 1 or len(data.chunks[3]) > 1:
+    * ``sig_chunks=-1`` — a chunk holds WHOLE patterns. A chunk holding part
+      of one makes every read useless (the storage-alignment argument from the
+      live-display notes) and is the one case where merging is worth the
+      shuffle. EBSD readers do not normally split the detector, hence the
+      warning when one has.
+    * ``nav_chunks=None`` for an already-lazy signal — keep the chunking it was
+      loaded with rather than reshuffling a multi-GB array to a theoretical
+      optimum. An eager one gets a nav chunking sized by the byte budget;
+      its patterns are already in RAM, so that buys parallelism, not memory.
+
+    ``inplace=False`` throughout: this must not repoint the live signal's own
+    chunking, which the navigator reads through.
+    """
+    lazy = signal if getattr(signal, "_lazy", False) else signal.as_lazy()
+    chunks = getattr(lazy.data, "chunks", None)
+    sig_split = chunks and any(len(c) > 1 for c in chunks[-2:])
+    if sig_split:
         log.warning("EBSD patterns are split across chunks %s — merging the "
                     "signal axes so a chunk holds whole patterns",
-                    (data.chunks[2], data.chunks[3]))
-        data = data.rechunk({2: -1, 3: -1})
-    return data
+                    tuple(chunks[-2:]))
+    # Array order: (ny, nx) rows-first, matching signal.data.
+    nav_chunks = None if getattr(signal, "_lazy", False) else (
+        _nav_block_rows(signal), -1)
+    return lazy.rechunk(nav_chunks=nav_chunks, sig_chunks=-1,
+                        inplace=False).data
 
 
 def _scan_mean(scan) -> np.ndarray:

@@ -401,13 +401,33 @@ class TestNeverMaterialisesTheScan:
         """A chunk holding PART of a pattern makes every read useless. EBSD
         readers do not normally split the detector, but if one does the graph
         has to fix it rather than index garbage."""
-        import dask.array as da
         from spyde.actions.ebsd_action import _lazy_scan
 
-        s = ebsd_patterns(nav=(4, 4), detector=(40, 40)).as_lazy()
-        s.data = da.from_array(np.asarray(s.data), chunks=(2, 2, 20, 20))
+        s = ebsd_patterns(nav=(8, 8), detector=(40, 40)).as_lazy()
+        s.rechunk(nav_chunks=(4, 4), sig_chunks=(20, 20), inplace=True)
         scan = _lazy_scan(s)
         assert len(scan.chunks[2]) == 1 and len(scan.chunks[3]) == 1
+
+    def test_the_lazy_signals_own_chunking_is_left_alone(self):
+        """Two things at once, both load-bearing.
+
+        The nav chunking a lazy signal arrived with is KEPT — reshuffling a
+        multi-GB array to a theoretical optimum is the mistake CLAUDE.md's
+        live-display notes record (419 s against 184 s), and storage alignment
+        beats any after-the-fact rechunk.
+
+        And the signal itself is not repointed: the navigator reads through
+        the same array, so preparing the compute must not mutate it.
+        """
+        from spyde.actions.ebsd_action import _lazy_scan
+
+        s = ebsd_patterns(nav=(8, 8), detector=(40, 40)).as_lazy()
+        s.rechunk(nav_chunks=(4, 4), sig_chunks=(20, 20), inplace=True)
+        before = s.data.chunks
+
+        scan = _lazy_scan(s)
+        assert s.data.chunks == before, "the live signal's chunking was mutated"
+        assert scan.chunks[:2] == before[:2], "the nav chunking was reshuffled"
 
 
 class TestWiring:
