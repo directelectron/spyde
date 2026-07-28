@@ -24,6 +24,7 @@ import type { ToolbarAction, ParamSpec, SubAction } from '../kernel/SpyDEContext
 import { OrientationWizard } from './OrientationWizard'
 import { FindVectorsWizard } from './FindVectorsWizard'
 import { VectorOrientationWizard } from './VectorOrientationWizard'
+import { EbsdWizard } from './EbsdWizard'
 import { CenterZeroBeamWizard } from './CenterZeroBeamWizard'
 import { StrainWizard } from './StrainWizard'
 import { CropWizard } from './CropWizard'
@@ -32,6 +33,7 @@ import { BackgroundWizard } from './BackgroundWizard'
 
 const WIZARD_ACTIONS = new Set([
   'Orientation Mapping', 'Find Diffraction Vectors', 'Vector Orientation Mapping',
+  'EBSD Indexing',
   'Center Zero Beam', 'Strain Mapping', 'Crop', 'Fit', 'Remove Background',
 ])
 
@@ -52,6 +54,7 @@ function fileUrl(p: string): string {
 // while the action's caret is selected, and hidden when it's deselected.
 const OVERLAY_ACTIONS = new Set([
   'Find Diffraction Vectors', 'Orientation Mapping', 'Vector Orientation Mapping',
+  'EBSD Indexing',
 ])
 
 const EMPTY = new Set<string>()
@@ -284,6 +287,12 @@ export function FloatingToolbar({
         )}
         {openAction && openAction.name === 'Vector Orientation Mapping' && (
           <VectorOrientationWizard
+            caretPos={caretPos} windowId={windowId} sendAction={sendAction}
+            onClose={() => setOpenName(null)}
+          />
+        )}
+        {openAction && openAction.name === 'EBSD Indexing' && (
+          <EbsdWizard
             caretPos={caretPos} windowId={windowId} sendAction={sendAction}
             onClose={() => setOpenName(null)}
           />

@@ -865,7 +865,7 @@ class BaseSignalTree:
                     logger.debug("removing %s on tree close failed: %s", attr, e)
             if hasattr(self, attr):
                 setattr(self, attr, None)
-        for wiz_attr in ("_om_wizard", "_vom_wizard"):
+        for wiz_attr in ("_om_wizard", "_vom_wizard", "_ebsd_wizard"):
             wiz = getattr(self, wiz_attr, None)
             if wiz is not None and hasattr(wiz, "remove"):
                 try:

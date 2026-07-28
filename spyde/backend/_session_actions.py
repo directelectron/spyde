@@ -381,6 +381,10 @@ class ActionRouterMixin:
             wiz = getattr(tree, "_vom_wizard", None)
             if wiz is not None:
                 overlays.append(getattr(wiz, "overlay", None))
+        elif name == "EBSD Indexing":
+            wiz = getattr(tree, "_ebsd_wizard", None)
+            if wiz is not None:
+                overlays.append(getattr(wiz, "overlay", None))
         for ov in overlays:
             if ov is not None and hasattr(ov, "set_visible"):
                 try:

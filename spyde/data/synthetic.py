@@ -298,7 +298,7 @@ def eds_si(nav=(16, 16), n_channels: int = 2048, *, e_stop: float = 20.0,
 
 
 # ---------------------------------------------------------------------------
-# EBSD
+# Atoms
 # ---------------------------------------------------------------------------
 
 def atom_lattice(grid=(8, 10), spacing: float = 16.0, *, sigma: float = 2.6,
@@ -376,48 +376,33 @@ def atom_lattice(grid=(8, 10), spacing: float = 16.0, *, sigma: float = 2.6,
     return s
 
 
-def _euler_to_matrix(phi1, Phi, phi2) -> np.ndarray:
-    """Bunge ZXZ Euler angles -> rotation matrices, batched over the leading
-    axes. Returns ``(..., 3, 3)``."""
-    c1, s1 = np.cos(phi1), np.sin(phi1)
-    c, s = np.cos(Phi), np.sin(Phi)
-    c2, s2 = np.cos(phi2), np.sin(phi2)
-    m = np.empty(np.shape(phi1) + (3, 3), float)
-    m[..., 0, 0] = c1 * c2 - s1 * s2 * c
-    m[..., 0, 1] = s1 * c2 + c1 * s2 * c
-    m[..., 0, 2] = s2 * s
-    m[..., 1, 0] = -c1 * s2 - s1 * c2 * c
-    m[..., 1, 1] = -s1 * s2 + c1 * c2 * c
-    m[..., 1, 2] = c2 * s
-    m[..., 2, 0] = s1 * s
-    m[..., 2, 1] = -c1 * s
-    m[..., 2, 2] = c
-    return m
+# ---------------------------------------------------------------------------
+# EBSD
+# ---------------------------------------------------------------------------
+
+# The projection, the band set and the pattern renderer live in
+# `spyde.ebsd.bands` — the ONE place that geometry is written down. The
+# generator, the dictionary simulator and the live band overlay all import it
+# from there, so an indexing test cannot pass by having two sides make the same
+# mistake in the same place, and the overlay's lines cannot drift away from the
+# bands they are drawn on. Re-exported here under the names this module has
+# always used. (`spyde.ebsd.bands` is numpy-only and imports nothing from
+# spyde, so this cannot cycle.)
+from spyde.ebsd.bands import (                                      # noqa: E402
+    cubic_reflectors as _cubic_reflectors,
+    detector_directions,
+    euler_to_matrix as _euler_to_matrix,
+    normals_to_sample as _normals_to_sample,
+    simulate_patterns,
+)
 
 
 def _cubic_plane_normals() -> tuple[np.ndarray, np.ndarray]:
     """{111}, {200} and {220} plane normals for a cubic crystal, with rough
     structure-factor weights. One normal per Friedel pair (a band and its
     inverse are the same band)."""
-    fams = [((1, 1, 1), 1.00), ((2, 0, 0), 0.70), ((2, 2, 0), 0.45)]
-    normals, weights = [], []
-    for hkl, w in fams:
-        seen = set()
-        h, k, l = hkl
-        for perm in {(h, k, l), (h, l, k), (k, h, l), (k, l, h), (l, h, k), (l, k, h)}:
-            for sx in (1, -1):
-                for sy in (1, -1):
-                    for sz in (1, -1):
-                        v = (perm[0] * sx, perm[1] * sy, perm[2] * sz)
-                        if v == (0, 0, 0) or tuple(-x for x in v) in seen:
-                            continue
-                        seen.add(v)
-        for v in seen:
-            n = np.array(v, float)
-            normals.append(n / np.linalg.norm(n))
-            # Band width goes as 1/|g|: bigger d-spacing -> wider band.
-            weights.append(w / np.linalg.norm(np.array(v, float)))
-    return np.array(normals), np.array(weights)
+    refl = _cubic_reflectors()
+    return refl.normals, refl.weights
 
 
 def ebsd_patterns(nav=(16, 16), detector=(60, 60), *, pc=(0.5, 0.5, 0.55),
@@ -459,24 +444,19 @@ def ebsd_patterns(nav=(16, 16), detector=(60, 60), *, pc=(0.5, 0.5, 0.55),
     rot = _euler_to_matrix(phi1, Phi, phi2)       # (ny, nx, 3, 3)
 
     # --- detector directions (gnomonic) -----------------------------------
-    pcx, pcy, L = float(pc[0]), float(pc[1]), float(pc[2])
     gy, gx = np.mgrid[0:dy, 0:dx].astype(float)
-    rx = (gx + 0.5) / dx - pcx
-    ry = pcy - (gy + 0.5) / dy                    # detector y is flipped
-    r = np.stack([rx, ry, np.full_like(rx, L)], -1)
-    r /= np.linalg.norm(r, axis=-1, keepdims=True)      # (dy, dx, 3)
+    r = detector_directions(detector, pc)               # (dy, dx, 3)
 
-    normals, weights = _cubic_plane_normals()
-    # Band half-width in units of cos(angle to the normal); scaled by |g| so
-    # low-index planes give the wide bands, as in a real pattern.
-    widths = 0.055 * (weights / weights.max()) + 0.012
+    refl = _cubic_reflectors()
+    normals, weights, widths = refl.normals, refl.weights, refl.widths
 
     data = np.empty((ny, nx, dy, dx), dtype=np.float32)
     flat_r = r.reshape(-1, 3)
     for iy in range(ny):
         for ix in range(nx):
-            # Rotate the plane normals into the sample frame for this pixel.
-            n_rot = normals @ rot[iy, ix].T                 # (B, 3)
+            # Rotate the plane normals into the sample frame for this pixel
+            # (bands.normals_to_sample owns the direction and why it matters).
+            n_rot = _normals_to_sample(normals, rot[iy, ix])   # (B, 3)
             d = flat_r @ n_rot.T                            # (dy*dx, B)
             band = np.exp(-0.5 * (d / widths) ** 2) * weights
             data[iy, ix] = band.sum(1).reshape(dy, dx).astype(np.float32)
@@ -498,6 +478,6 @@ def ebsd_patterns(nav=(16, 16), detector=(60, 60), *, pc=(0.5, 0.5, 0.55),
     s.metadata.General.title = "Synthetic EBSD"
     _try_signal_type(s, "EBSD")
     _stamp(s, kind="ebsd", euler=np.stack([phi1, Phi, phi2], -1),
-           pc=np.array([pcx, pcy, L]), n_bands=int(len(normals)),
+           pc=np.asarray(pc, float), n_bands=int(len(normals)),
            grain2_mask=grain2)
     return s

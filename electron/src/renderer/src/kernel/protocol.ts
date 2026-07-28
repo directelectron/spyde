@@ -779,6 +779,9 @@ export interface WizardEventMessage extends MsgBase {
     | 'vom_fit'
     | 'vom_library_ready'
     | 'om_library_ready'
+    // EBSD Indexing: the dictionary-ready ack and the live best-match readout.
+    | 'ebsd_dictionary_ready'
+    | 'ebsd_match'
     // Fit wizard: the component palette's sampled shapes (once, on open) and
     // the whole model after every edit. See spyde/actions/fit_action.py.
     | 'fit_catalogue'

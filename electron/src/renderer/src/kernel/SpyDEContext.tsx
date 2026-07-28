@@ -1262,6 +1262,10 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'vom_fit':
         case 'vom_library_ready':
         case 'om_library_ready':
+        // EBSD Indexing caret: the dictionary-ready ack and the live
+        // best-match readout under the crosshair.
+        case 'ebsd_dictionary_ready':
+        case 'ebsd_match':
         // Fit wizard (spyde/actions/fit_action.py) — `fit_catalogue` is the
         // component picker's shapes, sent once on open; `fit_state` is the
         // whole model after every edit. Consumed by FitWizard.
