@@ -147,8 +147,11 @@ def _rebuild(session, tree, src, path: str, params) -> None:
 
     # The free navigator again — re-cutting the exposure changes the planes, so
     # the overview has to be recomputed, but it still costs no payload reads.
-    nav = hs.signals.Signal1D(np.asarray(plane_counts(ds, bounds), np.float32))
-    nav.metadata.General.title = "Total counts"
+    # Calibrated from the NEW signal: a 1-D selector derives its index from the
+    # navigator's own axis, so an uncalibrated one pins every scrub position to
+    # plane 0.
+    from spyde.backend._session_files import calibrated_nav_signal
+    nav = calibrated_nav_signal(plane_counts(ds, bounds), sig)
 
     def _add():
         session._add_signal(sig, source_path=path, navigator_override=nav)

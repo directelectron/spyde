@@ -9,6 +9,7 @@
  * "look at the pixels" check CLAUDE.md requires for anything UI.
  */
 import { existsSync } from 'fs'
+import { createHash } from 'crypto'
 import { test, expect } from '@playwright/test'
 const {
   launchApp, backendAction, waitForSubwindowCount, countColorPixels, sigWindow,
@@ -51,26 +52,65 @@ test('a CSB stream opens as a scrubbable in-situ movie', async () => {
   ctx.assertNoJsErrors()
 })
 
-test('dragging the time slider integrates a new window', async () => {
+/** A cheap signature of what the signal window is actually showing.
+ *
+ *  Counting bright pixels page-wide is NOT enough — it stays non-zero no
+ *  matter which plane is displayed (and the navigator's own canvas keeps it
+ *  non-zero regardless), which is exactly how "every scrub position showed
+ *  plane 0" passed a green test. This samples the displayed pixels so two
+ *  different planes cannot produce the same number. */
+async function planeSignature(page): Promise<string> {
+  // A hash of the SIGNAL window as composited.
+  //
+  // Two cheaper things were tried and both lied. Counting bright pixels
+  // page-wide never changes with the plane. Reading canvas pixels via
+  // getImageData returns all zeros here, because the image is drawn on a
+  // WebGPU canvas — the same trap the vectors-embed work hit, where buffer
+  // asserts "pass" against an overlay canvas that holds nothing. A screenshot
+  // is the composited truth, which is what "the image doesn't move" means.
+  try {
+    const buf = await sigWindow(page).screenshot()
+    return createHash('sha1').update(buf).digest('hex')
+  } catch {
+    return ''
+  }
+}
+
+test('dragging the time slider shows a DIFFERENT integrated plane', async () => {
   const { page } = ctx
   const nav = navWindow(page)
   const box = await nav.boundingBox()
   if (!box) throw new Error('no navigator window')
 
   await page.screenshot({ path: `${SHOTS}/03-before-scrub.png` })
-  // Drag along the 1-D time navigator: each position is a different exposure
-  // window, so the displayed image must change.
-  const y = box.y + box.height * 0.55
-  await page.mouse.move(box.x + box.width * 0.25, y)
-  await page.mouse.down()
-  await page.mouse.move(box.x + box.width * 0.75, y, { steps: 12 })
-  await page.mouse.up()
+  const before = await planeSignature(page)
+  expect(before, 'no plane was on screen to begin with').not.toBe('')
 
-  await expect.poll(() => countColorPixels(page, 'bright'), {
-    timeout: 240_000, message: 'nothing painted after the scrub',
-  }).toBeGreaterThan(0)
+  // Move the navigator with test_nav_drag, not the mouse. Clicking the plot
+  // moves the CURSOR, not the VLine widget — the readout showed x:0.0297 while
+  // the selector marker sat at 0, so a mouse-driven check "passed" on an
+  // unrelated repaint. This drives the same path a real drag ends in.
+  const goTo = async (plane: number) => {
+    await backendAction(page, 'test_nav_drag', { targets: [[plane, 0]] })
+  }
+  await goTo(30)
+  await expect.poll(() => planeSignature(page), {
+    timeout: 60_000,
+    message: 'the displayed plane did not change when the slider moved — every '
+      + 'position is resolving to the same index',
+  }).not.toBe(before)
+
+  const moved = await planeSignature(page)
   await page.screenshot({ path: `${SHOTS}/04-after-scrub.png` })
   await sigWindow(page).screenshot({ path: `${SHOTS}/05-scrubbed-plane.png` })
+
+  // And a third position differs from the second, so it is tracking rather
+  // than flipping between two cached frames.
+  await goTo(12)
+  await expect.poll(() => planeSignature(page), {
+    timeout: 60_000, message: "the plane stopped tracking after one move",
+  }).not.toBe(moved)
+  await sigWindow(page).screenshot({ path: `${SHOTS}/05b-third-position.png` })
   ctx.assertNoJsErrors()
 })
 
