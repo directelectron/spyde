@@ -31,6 +31,8 @@ declare global {
       figureEvent: (figId: string, eventJson: string) => void
       resizeFigure: (figId: string, width: number, height: number) => void
       openExternal: (url: string) => void
+      /** Reveal a local directory in the OS file manager. */
+      openPath: (path: string) => void
       getUpdateInfo: () => Promise<{
         channel: 'stable' | 'beta'
         supported: boolean

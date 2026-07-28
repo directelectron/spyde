@@ -824,6 +824,20 @@ wheels = [
 ]
 
 [[package]]
+name = "em-database"
+version = "0.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pooch", marker = "python_full_version >= '3.12'" },
+    { name = "pyyaml", marker = "python_full_version >= '3.12'" },
+    { name = "tqdm", marker = "python_full_version >= '3.12'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c8/1f/c009752d22cf7274b193313ac9616087c4eaa1167ec9aba59766b14c7a01/em_database-0.1.0.tar.gz", hash = "sha256:1a6bff7e9e8df843e3df457070d068fb892cdfa76faca1f6c1c5a37d040ea945", size = 19675, upload-time = "2026-07-28T13:35:13.731Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/1e/ab/a3c64005115d0ab50f09869ea66d1c9d1d1290db040946fbe67aba42d843/em_database-0.1.0-py3-none-any.whl", hash = "sha256:858d1235e471e1f6647d9fd5e3332c570b663b2418a9defa00c757ab29235212", size = 30632, upload-time = "2026-07-28T13:35:12.692Z" },
+]
+
+[[package]]
 name = "exceptiongroup"
 version = "1.3.1"
 source = { registry = "https://pypi.org/simple" }
@@ -3543,6 +3557,7 @@ dependencies = [
     { name = "bokeh" },
     { name = "dask" },
     { name = "distributed" },
+    { name = "em-database", marker = "python_full_version >= '3.12'" },
     { name = "huggingface-hub" },
     { name = "hyperspy" },
     { name = "imagecodecs", version = "2025.3.30", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -3612,6 +3627,7 @@ requires-dist = [
     { name = "bokeh" },
     { name = "dask" },
     { name = "distributed" },
+    { name = "em-database", marker = "python_full_version >= '3.12'", specifier = ">=0.1.0" },
     { name = "exspy", marker = "extra == 'eels'", specifier = ">=0.3.2" },
     { name = "huggingface-hub" },
     { name = "hyperspy", git = "https://github.com/cssfrancis/hyperspy.git?rev=f314cf42aa16a06d82449cd8dc8c8f57df2e3e72" },

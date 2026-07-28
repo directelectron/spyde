@@ -223,6 +223,10 @@ class ActionRouterMixin:
             self._set_signal_type(plot, payload.get("signal_type", ""))
         elif action == "load_example":
             self.load_example_data(payload["name"])
+        elif action == "example_catalogue":
+            self.emit_example_catalogue(warm=bool(payload.get("warm", True)))
+        elif action == "show_example_dir":
+            self.show_example_dir()
         elif action == "set_active":
             wid = payload.get("window_id", window_id)
             if wid is not None:

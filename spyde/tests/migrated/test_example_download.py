@@ -1,9 +1,8 @@
 """Examples-menu download progress + cancel (spyde/backend/example_download.py).
 
 Covers the pooch progress-object protocol (total / update / reset / close),
-message throttling, the cancel flag → DownloadCancelled abort, the scoped
-pyxem pooch proxy patch, and the download_cancel staged action. No network —
-pooch itself is never invoked.
+message throttling, the cancel flag → DownloadCancelled abort, and the
+download_cancel staged action. No network — pooch itself is never invoked.
 """
 from __future__ import annotations
 
@@ -60,29 +59,31 @@ class TestIpcProgress:
 
 
 class TestPatchedDownloader:
-    def test_proxy_scoped_and_restored(self, monkeypatch):
-        """Inside the context pyxem's pooch.HTTPDownloader pins progressbar= to
-        the monitor; outside, the real module is back."""
-        import pyxem.data._data as _pxdata
+    def test_the_monitor_is_a_pooch_progressbar(self, monkeypatch):
+        """The monitor is handed straight to
+        ``em_database…download(progressbar=…)``, which forwards it to
+        ``pooch.HTTPDownloader``. So it has to BE a pooch progressbar — that is
+        what replaced the old proxy that swapped out pyxem's view of the pooch
+        module to reach the same hook."""
+        import pooch
         dl, _ = _capture(monkeypatch)
-        real = _pxdata.pooch
-        with dl.patched_example_downloader("example:t", "t") as monitor:
-            assert _pxdata.pooch is not real
-            d = _pxdata.pooch.HTTPDownloader(progressbar=True)
-            assert d.progressbar is monitor
-            # everything else delegates to the real pooch
-            assert _pxdata.pooch.os_cache is real.os_cache
-        assert _pxdata.pooch is real
+        with dl.example_progress("example:t", "t") as monitor:
+            downloader = pooch.HTTPDownloader(progressbar=monitor)
+            assert downloader.progressbar is monitor
+            # pooch's contract: assignable total, update/reset/close.
+            monitor.total = 10
+            monitor.update(5)
+            monitor.reset()
+            monitor.close()
 
     def test_done_emitted_only_when_started(self, monkeypatch):
-        import pyxem.data._data  # noqa: F401 — ensure importable
         dl, msgs = _capture(monkeypatch)
         # Cache hit: no bytes flowed → no download_done.
-        with dl.patched_example_downloader("example:hit", "hit"):
+        with dl.example_progress("example:hit", "hit"):
             pass
         assert not [m for m in msgs if m["type"] == "download_done"]
         # Download happened → ok:true done.
-        with dl.patched_example_downloader("example:miss", "miss") as mon:
+        with dl.example_progress("example:miss", "miss") as mon:
             mon.total = 10
             mon.update(10)
         done = [m for m in msgs if m["type"] == "download_done"]
@@ -91,10 +92,9 @@ class TestPatchedDownloader:
     def test_cancel_flow(self, monkeypatch):
         """download_cancel (the staged action) flags the token; the next chunk
         raises, the context re-raises and reports cancelled:true."""
-        import pyxem.data._data  # noqa: F401
         dl, msgs = _capture(monkeypatch)
         with pytest.raises(dl.DownloadCancelled):
-            with dl.patched_example_downloader("example:c", "c") as mon:
+            with dl.example_progress("example:c", "c") as mon:
                 mon.total = 100
                 mon.update(10)
                 dl.download_cancel(None, None, {"token": "example:c"})

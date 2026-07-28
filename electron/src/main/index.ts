@@ -5,10 +5,10 @@ import {
   app, BrowserWindow, dialog, ipcMain, Menu, shell, nativeTheme, net, protocol,
   clipboard, nativeImage,
 } from 'electron'
-import { join, basename } from 'path'
+import { join, basename, resolve } from 'path'
 import { pathToFileURL } from 'url'
 import { tmpdir } from 'os'
-import { existsSync, realpathSync, writeFileSync, rmSync } from 'fs'
+import { existsSync, realpathSync, statSync, writeFileSync, rmSync } from 'fs'
 import { execFile } from 'child_process'
 import {
   startSpyDE, sendAction, sendFigureEvent, sendResize,
@@ -852,6 +852,27 @@ ipcMain.on('open-external', (_, url: string) => {
     return
   }
   shell.openExternal(parsed.href)
+})
+
+// Reveal a LOCAL DIRECTORY in the OS file manager (Examples → Show Example Data
+// Directory). Deliberately separate from open-external, which allowlists
+// web/mail protocols precisely so it can never be talked into opening a local
+// path: this one takes a filesystem path and opens it as a FOLDER only.
+// `openPath` on a directory opens it in the file manager; it will not execute a
+// file, and the isDirectory check means a path that somehow named an executable
+// is refused rather than run.
+ipcMain.on('open-path', async (_, target: string) => {
+  try {
+    const resolved = resolve(String(target ?? ''))
+    if (!existsSync(resolved) || !statSync(resolved).isDirectory()) {
+      console.warn(`[spyde] open-path rejected non-directory: ${resolved}`)
+      return
+    }
+    const err = await shell.openPath(resolved)
+    if (err) console.warn(`[spyde] open-path failed: ${err}`)
+  } catch (e) {
+    console.warn(`[spyde] open-path error: ${String(e)}`)
+  }
 })
 
 // ── Update / GPU-status IPC ───────────────────────────────────────────────────

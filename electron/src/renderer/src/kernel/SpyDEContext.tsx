@@ -1080,6 +1080,13 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
           dispatch({ type: 'NAV_SHAPE_PROMPT', prompt: msg })
           break
 
+        // Examples → Show Example Data Directory. The BACKEND owns where that
+        // is (em-database, overridable via EM_DATABASE_DATA_DIR) but only the
+        // main process can open a folder, so it round-trips through here.
+        case 'open_path':
+          if (msg.path) window.electron.openPath(String(msg.path))
+          break
+
         case 'loading':
           dispatch({ type: 'LOADING', busy: Boolean(msg.busy), text: String(msg.text ?? '') })
           break
@@ -1266,6 +1273,10 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         // best-match readout under the crosshair.
         case 'ebsd_dictionary_ready':
         case 'ebsd_match':
+        // The Examples menu's contents (em-database): techniques, sizes,
+        // shapes and which datasets are already downloaded. Consumed by
+        // MenuBar, which asks for it every time the menu opens.
+        case 'example_catalogue':
         // Fit wizard (spyde/actions/fit_action.py) — `fit_catalogue` is the
         // component picker's shapes, sent once on open; `fit_state` is the
         // whole model after every edit. Consumed by FitWizard.

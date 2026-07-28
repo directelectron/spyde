@@ -33,6 +33,19 @@ dependencies = [
     # [hdf5,image] extras cover .hspy / .tif reading (hyperspy pins the same).
     "rosettasciio[hdf5,image]>=0.14.0",
     "pyxem",
+    # The Examples menu's datasets. One curated, checksummed, cited collection
+    # (grouped by technique, with real acquisition metadata) instead of each
+    # analysis library's own fixtures — adding a dataset is a YAML file
+    # upstream rather than a loader here. See spyde/backend/example_catalogue.
+    #
+    # MARKER, not a plain dependency: em-database 0.1.0 declares
+    # requires-python >=3.12 while SpyDE supports >=3.10, so depending on it
+    # unconditionally makes the whole project unresolvable on 3.10/3.11 — the
+    # backend then fails to start at all, taking the app with it. On those
+    # versions the Examples menu falls back to Dummy Data only
+    # (example_catalogue.available() is False). Drop the marker once upstream
+    # relaxes its floor.
+    "em-database>=0.1.0; python_version >= '3.12'",
     "imageio-ffmpeg",
     "imagecodecs",
     "psygnal>=0.10.0",

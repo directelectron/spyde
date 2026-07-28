@@ -209,6 +209,13 @@ export interface NavShapePromptMessage extends MsgBase, NavShapePrompt {
   type: 'nav_shape_prompt'
 }
 
+/** Reveal a local directory in the OS file manager (Examples → Show Example
+ *  Data Directory). The backend owns the location, the main process opens it. */
+export interface OpenPathMessage extends MsgBase {
+  type: 'open_path'
+  path: string
+}
+
 export interface LoadingMessage extends MsgBase {
   type: 'loading'
   busy?: unknown
@@ -782,6 +789,8 @@ export interface WizardEventMessage extends MsgBase {
     // EBSD Indexing: the dictionary-ready ack and the live best-match readout.
     | 'ebsd_dictionary_ready'
     | 'ebsd_match'
+    // The Examples menu's contents, from em-database.
+    | 'example_catalogue'
     // Fit wizard: the component palette's sampled shapes (once, on open) and
     // the whole model after every edit. See spyde/actions/fit_action.py.
     | 'fit_catalogue'
@@ -858,6 +867,7 @@ export type PlotAppMessage =
   | SubItemMessage
   | HistogramMessage
   | NavShapePromptMessage
+  | OpenPathMessage
   | LoadingMessage
   | SignalTypeInfoMessage
   | SelectorInfoMessage
