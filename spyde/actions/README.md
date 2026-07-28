@@ -15,7 +15,7 @@ parity) lives in [`NOTEBOOK_PARITY_PLAN.md`](../../NOTEBOOK_PARITY_PLAN.md).
 | **View action** | one-shot UI command, no tree change | plain `fn(ctx, …)` | zoom, reset, `tile_views` |
 | **TransformAction** | signal + params → a **new node in the SAME tree** | `action.TransformAction` | Rebin (`Rebin2DAction`), CZB apply |
 | **RegionAction** | interactive ROI → a **linked live output plot** | `action.RegionAction` | Virtual Imaging, FFT, Line Profile, Vector VI |
-| **Wizard** | staged caret: open → tune → run → commit → close | `wizard.WizardController` + staged handlers | Find Vectors, Orientation, Vector-OM, Strain, CZB |
+| **Wizard** | staged caret: open → tune → run → commit → close | `wizard.WizardController` + staged handlers | Find Vectors, Orientation, Vector-OM, EBSD, Strain, CZB |
 | **Commit** | promote a live/finished result to a **NEW SignalTree** | `commit.commit_result_tree` | strain Commit, VOM result windows |
 
 Deciding: does it need an ROI? → RegionAction. Does it produce a new node of

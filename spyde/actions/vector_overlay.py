@@ -152,6 +152,19 @@ class _DPOverlay:
     def _marker_kwargs(self, offsets) -> dict:
         return {"offsets": offsets}
 
+    def _empty(self) -> np.ndarray:
+        """The payload that draws nothing — what ``set_visible(False)`` pushes."""
+        return np.zeros((0, 2), dtype=np.float32)
+
+    def _make_markers(self, plot2d):
+        """Create this overlay's anyplotlib marker group(s). Circles by default;
+        override for a different primitive (the EBSD band overlay draws lines)."""
+        return plot2d.add_circles(
+            np.zeros((0, 2), dtype=np.float32), name=self.name,
+            radius=float(self._radius_px), edgecolors=self._color, facecolors=None,
+            linewidths=1.5, alpha=1.0, transform="data",
+        )
+
     def attach(self, tree):
         plot2d = getattr(self.dp_plot, "_plot2d", None)
         if plot2d is None:
@@ -161,11 +174,7 @@ class _DPOverlay:
                         "yet (figure iframe not loaded?)",
                         getattr(self, "name", type(self).__name__))
             return self
-        self._mg = plot2d.add_circles(
-            np.zeros((0, 2), dtype=np.float32), name=self.name,
-            radius=float(self._radius_px), edgecolors=self._color, facecolors=None,
-            linewidths=1.5, alpha=1.0, transform="data",
-        )
+        self._mg = self._make_markers(plot2d)
         self._engine = self._make_engine(tree)
         self._selectors = _navigator_selectors_for(tree, self.dp_plot)
         seeded = False
@@ -256,7 +265,7 @@ class _DPOverlay:
     def set_visible(self, visible: bool) -> None:
         self._hidden = not bool(visible)
         if self._hidden:
-            self._push(np.zeros((0, 2), dtype=np.float32))
+            self._push(self._empty())
         elif self._engine is not None:
             self._engine.request(*self._last_iyix)      # recompute current frame
         else:

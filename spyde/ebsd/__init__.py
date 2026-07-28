@@ -17,10 +17,21 @@ with ``requires_package``.
 """
 from __future__ import annotations
 
+from spyde.ebsd.bands import (
+    Reflectors,
+    band_lines,
+    cubic_reflectors,
+    detector_directions,
+    reflectors_from_phase,
+    simulate_patterns,
+    zone_axis_points,
+)
 from spyde.ebsd.indexing import (
     IndexingResult,
+    SinglePatternIndexer,
     dictionary_index,
     sample_orientations,
+    simulate_dictionary,
 )
 from spyde.ebsd.preprocess import average_dot_product_map, remove_background
 from spyde.ebsd.crystal_map import (
@@ -31,8 +42,12 @@ from spyde.ebsd.crystal_map import (
 )
 from spyde.ebsd.refine import RefinementResult, refine_orientations
 
-__all__ = ["dictionary_index", "sample_orientations", "IndexingResult",
+__all__ = ["dictionary_index", "sample_orientations", "simulate_dictionary",
+           "IndexingResult", "SinglePatternIndexer",
            "remove_background", "average_dot_product_map",
            "refine_orientations", "RefinementResult",
            "to_crystal_map", "ipf_colors", "orientation_similarity_map",
-           "merge_phases"]
+           "merge_phases",
+           "Reflectors", "cubic_reflectors", "reflectors_from_phase",
+           "band_lines", "zone_axis_points", "detector_directions",
+           "simulate_patterns"]

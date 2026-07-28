@@ -49,6 +49,9 @@ STAGED_HANDLERS: dict[str, str] = {
     "om_generate_library": "spyde.actions.orientation_action.om_generate_library",
     "om_refine":           "spyde.actions.orientation_action.om_refine",
     "om_run":              "spyde.actions.orientation_action.om_run",
+    "ebsd_build_dictionary": "spyde.actions.ebsd_action.ebsd_build_dictionary",
+    "ebsd_refine":         "spyde.actions.ebsd_action.ebsd_refine",
+    "ebsd_run":            "spyde.actions.ebsd_action.ebsd_run",
     "fv_open":             "spyde.actions.find_vectors_action.fv_open",
     "fv_tune":             "spyde.actions.find_vectors_action.fv_tune",
     "fv_run":              "spyde.actions.find_vectors_action.fv_run",
@@ -205,6 +208,7 @@ _WIZARD_SCHEMAS: dict[str, tuple[str, str]] = {
     # `parameters`) or a dict.
     "strain": ("spyde.actions.strain_action", "StrainController"),
     "vom":    ("spyde.actions.vector_orientation_om", "VomWizard"),
+    "ebsd":   ("spyde.actions.ebsd_action", "EbsdWizard"),
     "czb":    ("spyde.actions.center_zero_beam", "PARAMETERS"),
     # YAML-declared (resolved from spyde.TOOLBAR_ACTIONS):
     "fv":     ("__yaml__", "Find Diffraction Vectors"),

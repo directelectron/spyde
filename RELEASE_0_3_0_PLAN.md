@@ -230,6 +230,19 @@ rotation-branch ambiguity and coarse-stage bias (CLAUDE.md, GPU Computing).
 **3.5 CrystalMap → existing IPF display**, phase merging
 (`merge_crystal_maps`), orientation similarity map.
 
+**3.6 The EBSD Indexing wizard** — the whole wave made drivable, as the SAME
+four-stage caret as 4D-STEM orientation mapping (Load → Library → Refine →
+Run), because it is the same job on a different signal. The one thing that is
+genuinely different is what the Refine stage draws: a 4D-STEM template match
+is a set of SPOTS, an EBSD match is a set of BANDS, and a band centre is a
+straight LINE on a flat detector — so `spyde/ebsd/bands.py` projects the
+matched orientation's Kikuchi lines (and zone axes) onto the live pattern.
+
+Downstream of the fit nothing is new: the result is packed into a
+`SpyDEOrientationMap`, so the IPF colouring, the 3-D explorer, the point
+selector and the direction toggle all work unchanged, with the NCC /
+orientation-similarity / ADP quality maps as chip views beside the IPF map.
+
 ---
 
 ## Wave 4 — Atom position mapping (`spyde/atoms/`, extra `atoms`) — uses Wave 1's engine

@@ -76,10 +76,16 @@ def euler_to_matrix_torch(euler):
 class BandSimulator:
     """Differentiable Kikuchi-band pattern simulator.
 
-    Renders the same geometry as :func:`spyde.data.synthetic.simulate_patterns`
-    — a band appears where a detector direction is near-perpendicular to a
-    plane normal — but in torch, so the pattern is differentiable with respect
-    to the orientation.
+    Renders the same geometry as :func:`spyde.ebsd.bands.simulate_patterns` —
+    a band appears where a detector direction is near-perpendicular to a plane
+    normal — but in torch, so the pattern is differentiable with respect to the
+    orientation, and batched, so a whole DICTIONARY is one forward pass.
+
+    The band set comes from :class:`spyde.ebsd.bands.Reflectors`: the generic
+    cubic set by default, or a real crystal structure's reflectors when the
+    wizard has loaded a .cif. Whatever it is, the live band overlay projects
+    THE SAME reflectors, so the lines it draws are the centres of the bands
+    this simulator rendered.
 
     Stands in for a master-pattern lookup (#69). The optimiser does not care
     which it is: anything mapping ``(P, 3)`` Euler angles to ``(P, K)`` patterns
@@ -87,27 +93,58 @@ class BandSimulator:
     """
 
     def __init__(self, detector=(60, 60), pc=(0.5, 0.5, 0.55), *,
-                 device="cpu", dtype=None):
+                 reflectors=None, background_sigma=None, device="cpu",
+                 dtype=None):
         import torch
-        from spyde.data.synthetic import _cubic_plane_normals, detector_directions
+        from spyde.ebsd.bands import cubic_reflectors, detector_directions
 
         dtype = dtype or torch.float32
+        refl = reflectors if reflectors is not None else cubic_reflectors()
         r = detector_directions(detector, pc).reshape(-1, 3)
-        normals, weights = _cubic_plane_normals()
+        self.reflectors = refl
         self.r = torch.as_tensor(r, dtype=dtype, device=device)
-        self.normals = torch.as_tensor(normals, dtype=dtype, device=device)
-        self.weights = torch.as_tensor(weights, dtype=dtype, device=device)
-        self.widths = torch.as_tensor(
-            0.055 * (weights / weights.max()) + 0.012, dtype=dtype, device=device)
+        self.normals = torch.as_tensor(refl.normals, dtype=dtype, device=device)
+        self.weights = torch.as_tensor(refl.weights, dtype=dtype, device=device)
+        self.widths = torch.as_tensor(refl.widths, dtype=dtype, device=device)
         self.shape = tuple(detector)
+        self.device = device
+        self.dtype = dtype
+        self.background_sigma = (None if background_sigma in (None, 0)
+                                 else float(background_sigma))
 
     def __call__(self, euler):
         """``(P, 3)`` -> ``(P, K)``."""
         rot = euler_to_matrix_torch(euler)                    # (P, 3, 3)
-        n_rot = self.normals @ rot.transpose(1, 2)            # (P, B, 3)
+        # normals @ rot, NOT rot.T — see bands.normals_to_sample for why the
+        # transposed version passes every score-based test and still colours
+        # the IPF map from the inverse orientation.
+        n_rot = self.normals @ rot                            # (P, B, 3)
         d = n_rot @ self.r.T                                  # (P, B, K)
         band = (-0.5 * (d / self.widths[None, :, None]) ** 2).exp()
-        return (band * self.weights[None, :, None]).sum(1)    # (P, K)
+        out = (band * self.weights[None, :, None]).sum(1)     # (P, K)
+        return self._high_pass(out) if self.background_sigma else out
+
+    def _high_pass(self, flat):
+        """Apply the SAME dynamic-background high-pass the experimental
+        patterns get (:func:`spyde.ebsd.preprocess.remove_background`).
+
+        Both sides must go through the same filter or the correction makes the
+        mismatch *different* rather than smaller: high-passing the experimental
+        patterns alone leaves the simulated ones carrying low-frequency content
+        their counterparts no longer have, and scores stay mediocre for a
+        reason that looks like bad indexing. (kikuchipy preprocesses its
+        dictionary for exactly this reason; ``test_ebsd_indexing`` pins it.)
+
+        Done here rather than as a post-pass so it holds through REFINEMENT
+        too — the separable blur is a convolution, so the filtered pattern is
+        still differentiable with respect to the orientation.
+        """
+        from spyde.ebsd.preprocess import _blur
+
+        h, w = self.shape
+        img = flat.reshape(-1, h, w)
+        return (img - _blur(img, self.background_sigma, self.device,
+                            self.dtype)).reshape(flat.shape)
 
 
 def _ncc(a, b, eps=1e-12):
@@ -120,7 +157,8 @@ def _ncc(a, b, eps=1e-12):
 
 
 def refine_orientations(patterns, euler_start, *, simulator=None,
-                        detector=None, pc=(0.5, 0.5, 0.55), device=None,
+                        detector=None, pc=(0.5, 0.5, 0.55), reflectors=None,
+                        background_sigma=None, device=None,
                         steps: int = 120, lr: float = 0.01, chunk=None,
                         on_yield: Callable[[], None] | None = None,
                         yield_every: int = 12,
@@ -138,6 +176,11 @@ def refine_orientations(patterns, euler_start, *, simulator=None,
     simulator : callable, optional
         ``(P, 3) -> (P, K)``, differentiable. Defaults to :class:`BandSimulator`
         on *detector*.
+    background_sigma : float, optional
+        High-pass the SIMULATED patterns the same way the experimental ones
+        were corrected. Pass it whenever *patterns* has been through
+        :func:`~spyde.ebsd.preprocess.remove_background`, or the two sides are
+        being compared through different filters.
     steps, lr :
         Adam budget. The default is deliberately generous: refinement runs once
         per scan, and the cost is one batched forward+backward per step.
@@ -168,7 +211,9 @@ def refine_orientations(patterns, euler_start, *, simulator=None,
     if simulator is None:
         if detector is None:
             detector = tuple(exp.shape[-2:])
-        simulator = BandSimulator(detector, pc, device=device)
+        simulator = BandSimulator(detector, pc, reflectors=reflectors,
+                                  background_sigma=background_sigma,
+                                  device=device)
 
     P = len(E)
     chunk = int(chunk) if chunk else P

@@ -779,6 +779,8 @@ export interface WizardEventMessage extends MsgBase {
     | 'vom_fit'
     | 'vom_library_ready'
     | 'om_library_ready'
+    | 'ebsd_dictionary_ready'
+    | 'ebsd_match'
     | 'fv_auto_params'
     | 'fv_models'
     | 'fv_calibration'

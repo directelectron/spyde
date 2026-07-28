@@ -294,6 +294,16 @@ functions:
             type: enum
             default: intensity
             options: [intensity, count]
+  EBSD Indexing:
+    description: Dictionary indexing of EBSD patterns. Build a simulated pattern dictionary, check the matched orientation's Kikuchi bands live under the crosshair, then index the whole scan into an IPF orientation map.
+    icon: drawing/toolbars/icons/ebsd.svg
+    function: spyde.actions.ebsd_action.ebsd_indexing
+    signal_types: [EBSD]
+    plot_dim: [2]
+    toolbar_side: bottom
+    navigation: False
+    toggle: True
+
   Vector Orientation Mapping:
     description: Orientation + strain mapping from diffraction vectors (sparse point-set fit). Live refine under the crosshair.
     icon: drawing/toolbars/icons/orientation_mapping.svg
