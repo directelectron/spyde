@@ -28,7 +28,7 @@ from spyde.backend.ipc import emit_error, emit_status
 
 log = logging.getLogger(__name__)
 
-DEFAULTS = dict(fps=0.0, exposure_ms=0.0, frames_per_plane=0, bin=1)
+DEFAULTS = dict(fps=0.0, exposure_ms=0.0, frames_per_plane=0, bin=0)
 
 
 def _source_path(signal) -> str | None:
@@ -102,12 +102,12 @@ def _rebuild(session, tree, src, path: str, params) -> None:
     """Re-cut the stream at a new exposure and add it to the tree."""
     import hyperspy.api as hs
     from spyde.external.rsciio_csb._api import (
-        _dataset, _axes, lazy_stack, plane_counts,
+        _dataset, _axes, _resolve_bin, lazy_stack, plane_counts,
     )
 
     backend = str(params.get("backend") or "auto")
-    bin_factor = max(1, int(params.get("bin") or 1))
     ds = _dataset(path, backend)
+    bin_factor = _resolve_bin(ds, params.get("bin"))
     exposure = _resolve_exposure(ds, params)
     bounds = ds._time_bounds(exposure, 0.0, ds.duration)
     if not bounds:
