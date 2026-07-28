@@ -53,6 +53,17 @@ class ParameterSpec:
     bmax: float | None = None
     linear: bool = False
     units: str = ""
+    # Some HyperSpy parameters are VECTORS — EELSCLEdge's fine_structure_coeff
+    # holds 8 values. Those round-trip faithfully (``value`` becomes a list) but
+    # are excluded from the packed parameter vector, because the batched engine
+    # solves one scalar per column. Nothing that uses the flat view can fit such
+    # a component anyway (``components.supports`` already says no), so this
+    # keeps storage honest without complicating the solver.
+    n_elements: int = 1
+
+    @property
+    def is_scalar(self) -> bool:
+        return self.n_elements == 1
 
     def bounds(self) -> tuple[float, float]:
         """Finite bounds for the engine (``None`` becomes ±inf)."""
@@ -61,16 +72,22 @@ class ParameterSpec:
         return lo, hi
 
     def to_dict(self) -> dict[str, Any]:
-        return {"name": self.name, "value": float(self.value),
+        value = ([float(v) for v in np.ravel(self.value)] if self.n_elements > 1
+                 else float(self.value))
+        return {"name": self.name, "value": value,
                 "free": bool(self.free), "bmin": self.bmin, "bmax": self.bmax,
-                "linear": bool(self.linear), "units": self.units}
+                "linear": bool(self.linear), "units": self.units,
+                "n_elements": int(self.n_elements)}
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ParameterSpec":
-        return cls(name=d["name"], value=float(d.get("value", 0.0)),
+        raw = d.get("value", 0.0)
+        n = int(d.get("n_elements", 1))
+        value = [float(v) for v in raw] if n > 1 else float(raw)
+        return cls(name=d["name"], value=value,
                    free=bool(d.get("free", True)), bmin=d.get("bmin"),
                    bmax=d.get("bmax"), linear=bool(d.get("linear", False)),
-                   units=d.get("units", ""))
+                   units=d.get("units", ""), n_elements=n)
 
 
 @dataclass
@@ -87,10 +104,33 @@ class ComponentSpec:
     name: str = ""
     active: bool = True
     parameters: list[ParameterSpec] = field(default_factory=list)
+    # CONSTRUCTOR arguments, for components that cannot be built bare.
+    # Without these a spec cannot be turned back into a HyperSpy model:
+    # ``EELSCLEdge`` raises (element_subshell is required) and ``Polynomial``
+    # silently rebuilds at its DEFAULT order, quietly dropping every
+    # coefficient beyond it. See ``_INIT_ARGS``.
+    init_args: dict[str, Any] = field(default_factory=dict)
+    # Tabulated SHAPE for components whose form is a lookup rather than a
+    # formula — an EELS core-loss edge is a GOS table, not an expression
+    # (#63). Sampled on the signal axis; the component then fits an intensity
+    # (linear) and an onset shift against it. None for every analytic
+    # component, which is nearly all of them.
+    data: np.ndarray | None = None
 
     def __post_init__(self):
         if not self.name:
             self.name = self.kind
+
+    @property
+    def scalar_parameters(self) -> list[ParameterSpec]:
+        """The parameters that occupy a column in the packed vector.
+
+        Vector-valued parameters (EELSCLEdge.fine_structure_coeff) are stored
+        and round-tripped but never packed — the solver puts one scalar per
+        column, and no component with such a parameter is fittable by the
+        batched engine anyway.
+        """
+        return [p for p in self.parameters if p.is_scalar]
 
     def __getitem__(self, name: str) -> ParameterSpec:
         for p in self.parameters:
@@ -101,14 +141,22 @@ class ComponentSpec:
 
     def to_dict(self) -> dict[str, Any]:
         return {"kind": self.kind, "name": self.name, "active": bool(self.active),
-                "parameters": [p.to_dict() for p in self.parameters]}
+                "parameters": [p.to_dict() for p in self.parameters],
+                "init_args": dict(self.init_args),
+                # A tabulated shape is one float per channel, so it does go
+                # through JSON — but only for the components that have one.
+                "data": (None if self.data is None
+                         else [float(v) for v in np.ravel(self.data)])}
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ComponentSpec":
+        raw = d.get("data")
         return cls(kind=d["kind"], name=d.get("name", ""),
                    active=bool(d.get("active", True)),
                    parameters=[ParameterSpec.from_dict(p)
-                               for p in d.get("parameters", [])])
+                               for p in d.get("parameters", [])],
+                   init_args=dict(d.get("init_args") or {}),
+                   data=None if raw is None else np.asarray(raw, float))
 
 
 @dataclass
@@ -170,27 +218,27 @@ class ModelSpec:
         re-deriving an order of its own.
         """
         return [f"{c.name}.{p.name}"
-                for c in self.active_components for p in c.parameters]
+                for c in self.active_components for p in c.scalar_parameters]
 
     def flat_values(self) -> np.ndarray:
         return np.array([p.value for c in self.active_components
-                         for p in c.parameters], dtype=np.float64)
+                         for p in c.scalar_parameters], dtype=np.float64)
 
     def free_mask(self) -> np.ndarray:
         """True where a parameter is fitted. Fixed parameters keep their value
         and are dropped from the Jacobian rather than being fitted and ignored."""
         return np.array([p.free for c in self.active_components
-                         for p in c.parameters], dtype=bool)
+                         for p in c.scalar_parameters], dtype=bool)
 
     def linear_mask(self) -> np.ndarray:
         """True where the model is LINEAR in the parameter — the columns
         variable projection can solve by least squares (#53)."""
         return np.array([p.linear for c in self.active_components
-                         for p in c.parameters], dtype=bool)
+                         for p in c.scalar_parameters], dtype=bool)
 
     def bounds_arrays(self) -> tuple[np.ndarray, np.ndarray]:
         """``(lower, upper)`` with ``None`` expanded to ±inf."""
-        pairs = [p.bounds() for c in self.active_components for p in c.parameters]
+        pairs = [p.bounds() for c in self.active_components for p in c.scalar_parameters]
         if not pairs:
             return np.empty(0), np.empty(0)
         lo, hi = zip(*pairs)
@@ -200,13 +248,13 @@ class ModelSpec:
         """Write a packed parameter vector back onto the spec (the inverse of
         :meth:`flat_values`)."""
         values = np.asarray(values, dtype=float).ravel()
-        expected = sum(len(c.parameters) for c in self.active_components)
+        expected = sum(len(c.scalar_parameters) for c in self.active_components)
         if values.size != expected:
             raise ValueError(f"expected {expected} values for this spec, "
                              f"got {values.size}")
         i = 0
         for c in self.active_components:
-            for p in c.parameters:
+            for p in c.scalar_parameters:
                 p.value = float(values[i])
                 i += 1
 
@@ -215,7 +263,7 @@ class ModelSpec:
         what the component-area maps (#58) need to isolate one component."""
         out, i = {}, 0
         for c in self.active_components:
-            n = len(c.parameters)
+            n = len(c.scalar_parameters)
             out[c.name] = slice(i, i + n)
             i += n
         return out
@@ -229,11 +277,17 @@ class ModelSpec:
             params = []
             for p in c.parameters:
                 bmin, bmax = getattr(p, "bmin", None), getattr(p, "bmax", None)
+                n_el = int(getattr(p, "_number_of_elements", 1) or 1)
                 params.append(ParameterSpec(
                     name=p.name,
                     # A multidimensional parameter's `.value` is the value at
                     # the CURRENT nav index; that is the right seed to carry.
-                    value=float(np.ravel(p.value)[0]),
+                    # A VECTOR parameter (EELSCLEdge.fine_structure_coeff has 8
+                    # elements) keeps all of them, or to_model would assign a
+                    # scalar and hyperspy would reject the length.
+                    value=([float(v) for v in np.ravel(p.value)] if n_el > 1
+                           else float(np.ravel(p.value)[0])),
+                    n_elements=n_el,
                     free=bool(p.free),
                     bmin=None if bmin is None else float(bmin),
                     bmax=None if bmax is None else float(bmax),
@@ -242,7 +296,8 @@ class ModelSpec:
                 ))
             comps.append(ComponentSpec(
                 kind=getattr(c, "_id_name", type(c).__name__),
-                name=c.name, active=bool(c.active), parameters=params))
+                name=c.name, active=bool(c.active), parameters=params,
+                init_args=_init_args_for(c)))
 
         mask = getattr(model, "_channel_switches", None)
         if mask is not None:
@@ -276,7 +331,8 @@ class ModelSpec:
                     continue
                 # Bounds BEFORE value: HyperSpy clips an out-of-range assignment.
                 par.bmin, par.bmax = pspec.bmin, pspec.bmax
-                par.value = float(pspec.value)
+                par.value = (list(np.ravel(pspec.value)) if pspec.n_elements > 1
+                             else float(pspec.value))
                 par.free = bool(pspec.free)
 
         if apply_range and self.channel_mask is not None:
@@ -309,6 +365,35 @@ class ModelSpec:
 # helpers
 # ---------------------------------------------------------------------------
 
+# How to recover the CONSTRUCTOR arguments of components that cannot be built
+# bare. Each entry maps a component kind to a function of the live HyperSpy
+# component returning the kwargs needed to rebuild it.
+#
+# This is not a nicety: without it `to_model` either raises (EELSCLEdge needs
+# element_subshell) or — far worse — silently succeeds with the WRONG model.
+# A `Polynomial` rebuilt at its default order simply has no a3..a6, so
+# `to_model` skips those parameters and an order-6 EDS background becomes an
+# order-2 one that still fits and still looks plausible.
+_INIT_ARGS = {
+    "EELSCLEdge": lambda c: {"element_subshell": getattr(
+        c, "element_subshell", None) or c.name},
+    "Polynomial": lambda c: {"order": max(0, len(c.parameters) - 1)},
+    "Expression": lambda c: {"expression": getattr(c, "_expression", ""),
+                             "name": c.name},
+}
+
+
+def _init_args_for(comp) -> dict[str, Any]:
+    fn = _INIT_ARGS.get(getattr(comp, "_id_name", type(comp).__name__))
+    if fn is None:
+        return {}
+    try:
+        return {k: v for k, v in fn(comp).items() if v is not None}
+    except Exception as e:                                    # pragma: no cover
+        log.debug("could not capture init args for %r: %s", comp, e)
+        return {}
+
+
 def _make_component(cspec: ComponentSpec):
     """Instantiate the HyperSpy component named by ``cspec.kind``.
 
@@ -328,7 +413,14 @@ def _make_component(cspec: ComponentSpec):
     for mod in mods:
         cls = getattr(mod, cspec.kind, None)
         if cls is not None:
-            comp = cls()
+            try:
+                comp = cls(**cspec.init_args) if cspec.init_args else cls()
+            except TypeError as e:
+                raise ValueError(
+                    f"cannot rebuild {cspec.kind!r} from the spec: {e}. It "
+                    f"needs constructor arguments that were not captured — add "
+                    f"an entry to spec._INIT_ARGS so from_model() records them."
+                ) from e
             if cspec.name and cspec.name != cspec.kind:
                 comp.name = cspec.name
             return comp
@@ -345,6 +437,7 @@ def spec_from_component(comp) -> ComponentSpec:
     return ComponentSpec(
         kind=getattr(comp, "_id_name", type(comp).__name__),
         name=comp.name, active=bool(comp.active),
+        init_args=_init_args_for(comp),
         parameters=[ParameterSpec(
             name=p.name, value=float(np.ravel(p.value)[0]), free=bool(p.free),
             bmin=getattr(p, "bmin", None), bmax=getattr(p, "bmax", None),
