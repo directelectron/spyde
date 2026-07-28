@@ -108,13 +108,20 @@ def _find_vectors_single_frame_neural(
     replaced by the robust disk-mean frame intensity)."""
     from spyde import models
     from spyde.actions.find_vectors import _disk_mean_intensity
+    from spyde.device_lock import accelerator_lock
 
     f = np.asarray(frame, dtype=np.float32)
     model, device = models.get_model(model_id)
-    pred = models.detect(model, f, device, thresh=float(threshold),
-                         min_distance=int(min_distance),
-                         bg_sigma=(float(bg_sigma) if bg_sigma is not None else None),
-                         spot_diameter=(2.0 * spot_radius) if spot_radius else None)
+    # Serialise the MPS forward against every other torch user in the process.
+    # This single-frame path is the LIVE PREVIEW: it fires from navigator moves on
+    # worker threads, so two previews (or a preview and a batch/orientation fit)
+    # could submit to Metal at once — an uncatchable SIGSEGV that killed the whole
+    # backend. The batch path was already locked; this one silently was not.
+    with accelerator_lock(device):
+        pred = models.detect(model, f, device, thresh=float(threshold),
+                             min_distance=int(min_distance),
+                             bg_sigma=(float(bg_sigma) if bg_sigma is not None else None),
+                             spot_diameter=(2.0 * spot_radius) if spot_radius else None)
     pred = np.asarray(pred, dtype=np.float32).reshape(-1, 3)
     pred = _apply_beamstop(pred, beamstop_mask, f.shape)
 
@@ -205,14 +212,20 @@ NEURAL_GPU_LANE_DEFAULT = "4"
 def _mps_forward_lock():
     """Whole-device lock that serialises the MPS forward on Mac — ONE forward at a
     time per process (fix 3). Thread-race crashes on MPS come from concurrent
-    forwards hitting a single Metal context; this gives the neural path the same
-    serial discipline the NXCORR torch path has via ``_GPU_LOCK``. Reuses that
-    same lock object so a mixed neural+NXCORR run shares one device-serialisation
-    budget. Off Mac this returns a null context (CUDA keeps its own concurrency)."""
+    forwards hitting a single Metal context.
+
+    This is ``spyde.device_lock.DEVICE_LOCK``, THE process-wide accelerator lock —
+    the same object the NXCORR torch paths, the single-frame preview, the neural
+    calibration and the batched vector-orientation fit take, so every torch user
+    in the process shares one serialisation budget. (It used to be a lock private
+    to ``find_vectors_torch``, and only some of those callers took it — which is
+    exactly how a preview or an orientation fit ended up submitting to Metal
+    concurrently and segfaulting the backend.) Off Mac this returns a null context
+    (CUDA keeps its own concurrency)."""
     if sys.platform != "darwin":
         return None
-    from spyde.actions.find_vectors_torch import _GPU_LOCK
-    return _GPU_LOCK
+    from spyde.device_lock import DEVICE_LOCK
+    return DEVICE_LOCK
 
 
 def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
@@ -383,6 +396,7 @@ def calibrate_neural(sample_frames, *, sigma=1.0, model_id=None, spot_radius=Non
     from scipy.ndimage import gaussian_filter
 
     from spyde import models
+    from spyde.device_lock import accelerator_lock
 
     model, device = models.get_model(model_id)
     frames = []
@@ -390,8 +404,11 @@ def calibrate_neural(sample_frames, *, sigma=1.0, model_id=None, spot_radius=Non
         f = np.asarray(f, np.float32)
         # light single-frame smoothing as a stand-in for nav-blur on isolated samples
         frames.append(gaussian_filter(f, 0.6) if sigma else f)
-    cal = models.calibrate(model, frames, device,
-                           spot_diameter=(2.0 * spot_radius) if spot_radius else None)
+    # Calibration runs a sweep of real forwards, so it needs the same device
+    # serialisation as the preview and the batch (see device_lock.py).
+    with accelerator_lock(device):
+        cal = models.calibrate(model, frames, device,
+                               spot_diameter=(2.0 * spot_radius) if spot_radius else None)
     log.info("[find_vectors] neural calibration: bg_sigma=%.1f thresh=%.2f "
              "scale=%.2f conf=%.2f", cal["bg_sigma"], cal["thresh"],
              cal["scale_factor"], cal.get("confidence", float("nan")))

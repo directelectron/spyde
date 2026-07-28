@@ -15,7 +15,7 @@ Download
 
 .. spyde:download-table:start
 
-**Download SpyDE v0.2.0-rc.8:** `all releases <https://github.com/CSSFrancis/spyde/releases>`__
+**Download SpyDE v0.2.0-rc.9:** `all releases <https://github.com/CSSFrancis/spyde/releases>`__
 
 .. list-table::
    :header-rows: 1
@@ -24,11 +24,11 @@ Download
    * - Platform
      - Download
    * - **Windows**
-     - `SpyDE-Setup-0.2.0-rc.8.exe <https://github.com/CSSFrancis/spyde/releases/download/v0.2.0-rc.8/SpyDE-Setup-0.2.0-rc.8.exe>`__
+     - `SpyDE-Setup-0.2.0-rc.9.exe <https://github.com/CSSFrancis/spyde/releases/download/v0.2.0-rc.9/SpyDE-Setup-0.2.0-rc.9.exe>`__
    * - **macOS** (Apple Silicon)
-     - `SpyDE-0.2.0-rc.8-arm64-mac.zip <https://github.com/CSSFrancis/spyde/releases/download/v0.2.0-rc.8/SpyDE-0.2.0-rc.8-arm64-mac.zip>`__
+     - `SpyDE-0.2.0-rc.9-arm64-mac.zip <https://github.com/CSSFrancis/spyde/releases/download/v0.2.0-rc.9/SpyDE-0.2.0-rc.9-arm64-mac.zip>`__
    * - **Linux**
-     - `SpyDE-0.2.0-rc.8.AppImage <https://github.com/CSSFrancis/spyde/releases/download/v0.2.0-rc.8/SpyDE-0.2.0-rc.8.AppImage>`__
+     - `SpyDE-0.2.0-rc.9.AppImage <https://github.com/CSSFrancis/spyde/releases/download/v0.2.0-rc.9/SpyDE-0.2.0-rc.9.AppImage>`__
 
 .. spyde:download-table:end
 

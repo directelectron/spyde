@@ -29,6 +29,9 @@ from typing import Optional
 
 import numpy as np
 
+from spyde.device_lock import (
+    DEVICE_LOCK, accelerator_lock, is_mps, mps_sync,
+)
 from spyde.signals.diffraction_vectors import COL_KX, COL_KY, COL_INTENSITY
 
 log = logging.getLogger(__name__)
@@ -388,7 +391,61 @@ def compute_vector_orientation_gpu(
     shm_name: Optional[str] = None, n_seed_angles: int = 72,
     refine_steps: int = 60, on_yield=None,
 ) -> Optional[VectorOrientationResult]:
+    """Public entry point for the batched fit — see ``_compute_vector_orientation_batched``
+    for the fit itself. This wrapper adds Apple-MPS device serialisation.
+
+    On MPS, torch is NOT thread-safe: two threads submitting to the Metal
+    command encoder at once is an uncatchable native SIGSEGV that kills the whole
+    backend process (the user sees "Analysis backend stopped"). This fit runs on a
+    worker thread and can easily overlap the neural spot detector's live preview
+    or a find-vectors batch, so it must hold THE process-wide device lock
+    (``spyde.device_lock``) like every other torch user.
+
+    The lock is handed back at each ``on_yield`` point (the fit already yields
+    every ~12 refine steps to keep the UI responsive), so a concurrent live
+    preview waits for one yield window rather than the whole anneal. The device is
+    synchronised before each hand-off so no kernels are still in flight.
+
+    Off MPS this is a straight pass-through — CUDA is thread-safe and its
+    concurrency is a deliberate throughput win, so that path is unchanged.
+    """
+    fit_kwargs = dict(
+        params=params, t=t, progress=progress, stopped_flag=stopped_flag,
+        shm_name=shm_name, n_seed_angles=n_seed_angles,
+        refine_steps=refine_steps, on_yield=on_yield,
+    )
+    dev = select_device()
+    if not is_mps(dev):
+        return _compute_vector_orientation_batched(vectors, lib, **fit_kwargs)
+
+    def _yield_releasing():
+        # Called from inside the fit while we hold the lock: quiesce Metal, let
+        # any waiting torch user through, then take the device back.
+        mps_sync()
+        DEVICE_LOCK.release()
+        try:
+            if on_yield is not None:
+                on_yield()
+        finally:
+            DEVICE_LOCK.acquire()
+
+    # Installed even when the caller passed no on_yield: the hand-off window is
+    # the whole point, and the fit calls this on a cadence it already chose.
+    fit_kwargs["on_yield"] = _yield_releasing
+    with accelerator_lock(dev):
+        return _compute_vector_orientation_batched(vectors, lib, **fit_kwargs)
+
+
+def _compute_vector_orientation_batched(
+    vectors, lib: TemplateLibrary, params: Optional[dict] = None,
+    t: Optional[int] = None, progress=None, stopped_flag=None,
+    shm_name: Optional[str] = None, n_seed_angles: int = 72,
+    refine_steps: int = 60, on_yield=None,
+) -> Optional[VectorOrientationResult]:
     """Fit the whole field on the GPU in one batched pass. See module docstring.
+
+    NB: call the public ``compute_vector_orientation_gpu`` wrapper instead — it
+    adds the Apple-MPS device serialisation this function does NOT do.
 
     progress(done, total) is called a handful of times (seed, each anneal
     stage, decode) so the GUI can show coarse progress + paint the live buffer.

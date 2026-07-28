@@ -31,6 +31,8 @@ import logging
 import math
 from typing import Callable, Sequence
 
+import numpy as np
+
 log = logging.getLogger(__name__)
 
 _SQRT_2PI = math.sqrt(2.0 * math.pi)
@@ -62,10 +64,10 @@ class TorchComponent:
     autodiff, which is the ideal oracle for exactly this.
     """
 
-    __slots__ = ("kind", "params", "linear", "_fn", "_grad")
+    __slots__ = ("kind", "params", "linear", "_fn", "_grad", "ndim")
 
     def __init__(self, kind: str, params: Sequence[str], linear: Sequence[bool],
-                 fn: Callable, grad: Callable | None = None):
+                 fn: Callable, grad: Callable | None = None, ndim: int = 1):
         if len(params) != len(linear):
             raise ValueError(f"{kind}: {len(params)} params vs "
                              f"{len(linear)} linear flags")
@@ -74,6 +76,11 @@ class TorchComponent:
         self.linear = tuple(bool(b) for b in linear)
         self._fn = fn
         self._grad = grad
+        # 1 for a spectrum (x is the signal axis), 2 for an image (x carries
+        # (x, y) coordinate PAIRS). A 2-D model is otherwise identical: the
+        # image is flattened to C sample points and everything downstream —
+        # packing, the Jacobian, the LM solve — is unchanged.
+        self.ndim = int(ndim)
 
     @property
     def n_params(self) -> int:
@@ -87,9 +94,15 @@ class TorchComponent:
         if p.shape[-1] != self.n_params:
             raise ValueError(f"{self.kind} expects {self.n_params} parameters "
                              f"{self.params}, got {p.shape[-1]}")
+        cols = [p[:, i:i + 1] for i in range(self.n_params)]
+        if self.ndim == 2:
+            # x is (C, 2) or (P, C, 2): coordinate PAIRS, not a single axis.
+            if x.dim() == 2:
+                x = x.unsqueeze(0)                  # (1, C, 2)
+            return (x[..., 0], x[..., 1]), cols
         if x.dim() == 1:
             x = x.unsqueeze(0)                      # (1, C), broadcasts over P
-        return x, [p[:, i:i + 1] for i in range(self.n_params)]
+        return x, cols
 
     def __call__(self, x, p):
         """``x``: ``(C,)`` or ``(P, C)``. ``p``: ``(P, n_params)``. -> ``(P, C)``."""
@@ -152,8 +165,9 @@ def _power_law(x, p):
 
 def _offset(x, p):
     (offset,) = p
-    return offset.expand(-1, x.shape[-1]) if x.shape[0] == 1 else \
-        offset + 0.0 * x
+    # Broadcast rather than expand — see _polynomial_fn for why expand-based
+    # shaping breaks as soon as there is more than one spectrum.
+    return offset + 0.0 * x
 
 
 def _exponential(x, p):
@@ -188,6 +202,48 @@ def _logistic(x, p):
     # "a / (1 + b * exp(-c * (x - origin)))"
     a, b, c, origin = p
     return a / (1.0 + b * (-c * (x - origin)).exp())
+
+
+def _gaussian_2d(xy, p):
+    # "A * (1 / (sigma_x * sigma_y * 2 * pi))
+    #  * exp(-((x - centre_x)**2 / (2*sigma_x**2)
+    #        + (y - centre_y)**2 / (2*sigma_y**2)))"
+    # As in 1-D, A is the VOLUME under the surface, not the peak height.
+    x, y = xy
+    A, cx, cy, sx, sy = p
+    sxe, sye = sx + _EPS, sy + _EPS
+    return A / (sxe * sye * 2.0 * math.pi) * (
+        -((x - cx) ** 2 / (2 * sxe ** 2) + (y - cy) ** 2 / (2 * sye ** 2))).exp()
+
+
+def _d_gaussian_2d(xy, p):
+    x, y = xy
+    A, cx, cy, sx, sy = p
+    sxe, sye = sx + _EPS, sy + _EPS
+    dx, dy = x - cx, y - cy
+    shape = (-(dx ** 2 / (2 * sxe ** 2) + dy ** 2 / (2 * sye ** 2))).exp() \
+        / (sxe * sye * 2.0 * math.pi)
+    f = A * shape
+    return _stack(shape,                                   # df/dA
+                  f * dx / sxe ** 2,                       # df/dcentre_x
+                  f * dy / sye ** 2,                       # df/dcentre_y
+                  f * (dx ** 2 / sxe ** 3 - 1.0 / sxe),    # df/dsigma_x
+                  f * (dy ** 2 / sye ** 3 - 1.0 / sye))    # df/dsigma_y
+
+
+def image_coordinates(shape, *, device=None, dtype=None):
+    """``(H*W, 2)`` of ``(x, y)`` sample points for a 2-D model.
+
+    This is the "signal axis" a 2-D fit uses: the image is flattened to H*W
+    sample points, exactly as a spectrum is C channels, so nothing downstream
+    (packing, the Jacobian, the LM solve) needs to know it came from an image.
+    """
+    import torch
+    h, w = int(shape[0]), int(shape[1])
+    yy, xx = torch.meshgrid(torch.arange(h, device=device, dtype=dtype),
+                            torch.arange(w, device=device, dtype=dtype),
+                            indexing="ij")
+    return torch.stack([xx.reshape(-1), yy.reshape(-1)], dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +366,61 @@ def _d_logistic(x, p):
                   -a * E * c / D ** 2)         # df/dorigin
 
 
+def _interp_uniform(xq, x0, dx, table):
+    """Linear interpolation of ``table`` (sampled uniformly from ``x0``) at
+    ``xq``, differentiable with respect to ``xq``.
+
+    ``torch.searchsorted`` is not needed because the table is on the signal
+    axis, which is uniform — index arithmetic is exact and far cheaper. The
+    index itself is a floor and carries no gradient, which is correct: the
+    function is piecewise linear, so the gradient comes entirely from the
+    interpolation weight.
+
+    Outside the table the value is held at the end sample rather than
+    extrapolated. Extrapolating a GOS tail would invent signal where the
+    measurement has none.
+    """
+    import torch
+
+    n = table.shape[-1]
+    pos = (xq - x0) / dx
+    idx = torch.clamp(pos.floor(), 0, n - 2)
+    t = torch.clamp(pos - idx, 0.0, 1.0)
+    i0 = idx.long()
+    y0 = table[i0]
+    y1 = table[torch.clamp(i0 + 1, max=n - 1)]
+    return y0 + t * (y1 - y0)
+
+
+def _tabulated_fn(table, x0, dx):
+    def fn(x, p):
+        intensity, onset_shift = p
+        # Shifting the SAMPLE point left is the same as moving the edge right,
+        # so a positive onset_shift moves the edge up in energy as a user
+        # expects.
+        return intensity * _interp_uniform(x - onset_shift, x0, dx, table)
+
+    return fn
+
+
+def _tabulated_grad(table, x0, dx):
+    def grad(x, p):
+        intensity, onset_shift = p
+        shape = _interp_uniform(x - onset_shift, x0, dx, table)
+        # d/d(shift) is minus the local slope. Taken as a CENTRAL difference
+        # over one sample rather than the exact piecewise-linear derivative,
+        # deliberately: the exact one is a step function that jumps at every
+        # segment boundary, so LM chatters as the shift crosses a channel. The
+        # smoothed version differs from autodiff only within one channel of a
+        # kink and converges to the same place.
+        half = dx / 2
+        slope = (_interp_uniform(x - onset_shift + half, x0, dx, table)
+                 - _interp_uniform(x - onset_shift - half, x0, dx, table)) / dx
+        return _stack(shape, -intensity * slope)
+
+    return grad
+
+
 def _d_polynomial_fn(order: int):
     def grad(x, p):
         return _stack(*[x ** k + 0.0 * p[0] for k in range(order + 1)])
@@ -322,8 +433,12 @@ def _polynomial_fn(order: int):
     Parameters are ``a0..a{order}`` and ``aK`` multiplies ``x**K``."""
 
     def fn(x, p):
-        out = p[0].expand_as(x) if len(p) else None
-        acc = out
+        # `p[0] + 0.0 * x`, NOT `p[0].expand_as(x)`. The parameter block is
+        # (P, 1) and the axis is (1, C), so expand_as tries to force P down to
+        # 1 and raises for any batch bigger than one spectrum — which single-
+        # spectrum tests never reach. Plain broadcasting gives (P, C) for both
+        # a shared axis and a per-position one.
+        acc = p[0] + 0.0 * x
         for k in range(1, order + 1):
             acc = acc + p[k] * x ** k
         return acc
@@ -355,6 +470,9 @@ _register("Arctan",        ("A", "k", "x0"),                (True, False, False)
 _register("Erf",           ("A", "origin", "sigma"),        (True, False, False),  _erf, _d_erf)
 _register("HeavisideStep", ("A", "n"),                      (True, False),         _heaviside, _d_heaviside)
 _register("Logistic",      ("a", "b", "c", "origin"),       (True, False, False, False), _logistic, _d_logistic)
+_REGISTRY["Gaussian2D"] = TorchComponent(
+    "Gaussian2D", ("A", "centre_x", "centre_y", "sigma_x", "sigma_y"),
+    (True, False, False, False, False), _gaussian_2d, _d_gaussian_2d, ndim=2)
 
 
 def get_component(kind: str, *, n_params: int | None = None) -> TorchComponent:
@@ -382,9 +500,150 @@ def get_component(kind: str, *, n_params: int | None = None) -> TorchComponent:
         ) from None
 
 
+EELS_EDGE_KIND = "EELSCLEdge"
+
+
+def _interp_stack(xq, x0, dx, table):
+    """:func:`_interp_uniform` for a STACK of tables — ``(K, C)`` -> ``(K, P, C)``.
+
+    Every row is sampled at the same query points, which is the whole point:
+    the base shape and each fine-structure basis function slide together when
+    the onset moves, because they are one edge.
+    """
+    import torch
+
+    n = table.shape[-1]
+    pos = (xq - x0) / dx
+    idx = torch.clamp(pos.floor(), 0, n - 2)
+    t = torch.clamp(pos - idx, 0.0, 1.0)
+    i0 = idx.long()
+    y0 = table[:, i0]
+    y1 = table[:, torch.clamp(i0 + 1, max=n - 1)]
+    return y0 + t * (y1 - y0)
+
+
+def _eels_bracket(tables, x0, dx, onset_ref, x, cols):
+    """``shape(E - delta)`` and its fine-structure part, at unit intensity."""
+    onset = cols[1]
+    delta = onset - onset_ref
+    stack = _interp_stack(x - delta, x0, dx, tables)     # (1+N, P, C)
+    total = stack[0]
+    for i, c in enumerate(cols[2:]):
+        total = total + c * stack[i + 1]
+    return total, stack
+
+
+def eels_edge_component(tables, x0: float, dx: float, onset_ref: float, *,
+                        device=None, dtype=None) -> TorchComponent:
+    """A batched EELS core-loss edge — GOS shape AND fittable fine structure.
+
+    ``EELSCLEdge`` is not a formula: exspy integrates a generalised-oscillator-
+    strength table to get the cross-section. That integral is what has no place
+    in a batched inner loop — but it depends on the ELEMENT and the MICROSCOPE
+    GEOMETRY, not on the pixel, so it is the same curve for every spectrum in
+    the scan and is computed once.
+
+    What is left is linear or nearly so, which is why this works:
+
+    * ``intensity`` scales the whole edge — linear.
+    * ``fine_structure_coeff`` are cubic B-spline coefficients, and a spline
+      with fixed knots is a LINEAR combination of basis functions. Probing
+      exspy's own ``function`` once per coefficient gives those basis curves,
+      after which the edge is exactly ``base + sum(c_i * basis_i)``. Verified
+      against exspy at 0.0 relative error, not approximately.
+    * ``onset_energy`` slides the edge. Moving it in exspy re-integrates the
+      GOS and re-places the knots; here the precomputed curves are interpolated
+      instead, which is exact for the shape and differs only in how the far
+      tail is re-derived — well inside the few channels a fit actually moves.
+
+    ``tables`` is ``(1 + N, C)``: the base shape at unit intensity with every
+    coefficient zero, then one row per fine-structure basis function.
+
+    This REPLACED a component that discarded the fine structure altogether and
+    fitted only intensity and a shift. That was a bad trade twice over: fine
+    structure is the *linear* part and so the cheapest thing here to batch, and
+    dropping it produced a component HyperSpy could not represent, so a fitted
+    EELS model could not be stored on its own signal.
+    """
+    import torch
+
+    t = torch.as_tensor(np.asarray(tables, float), device=device,
+                        dtype=dtype or torch.float64)
+    if t.dim() == 1:
+        t = t.unsqueeze(0)
+    n_basis = int(t.shape[0]) - 1
+    params = ("intensity", "onset_energy") + tuple(
+        f"fine_structure_coeff_{i}" for i in range(n_basis))
+    linear = (True, False) + (True,) * n_basis
+    x0, dx, ref = float(x0), float(dx), float(onset_ref)
+
+    def fn(x, cols):
+        total, _ = _eels_bracket(t, x0, dx, ref, x, cols)
+        return cols[0] * total
+
+    def grad(x, cols):
+        intensity = cols[0]
+        total, stack = _eels_bracket(t, x0, dx, ref, x, cols)
+        # d/d(onset) is minus the local slope, as a CENTRAL difference over one
+        # channel — the exact piecewise-linear derivative is a step function
+        # that jumps at every segment boundary, so LM chatters as the onset
+        # crosses a channel.
+        half = dx / 2.0
+        shifted = []
+        for sign in (+1.0, -1.0):
+            moved = list(cols)
+            moved[1] = cols[1] - sign * half
+            tot, _ = _eels_bracket(t, x0, dx, ref, x, moved)
+            shifted.append(tot)
+        slope = (shifted[0] - shifted[1]) / dx
+        return _stack(total, -intensity * slope,
+                      *[intensity * stack[i + 1] for i in range(n_basis)])
+
+    return TorchComponent(EELS_EDGE_KIND, params, linear, fn, grad)
+
+
+def component_for(cspec, *, device=None, dtype=None) -> TorchComponent:
+    """Resolve the batched component for a :class:`ComponentSpec`.
+
+    Everything analytic resolves by ``kind`` alone; an EELS edge also needs its
+    own precomputed curves, which live on the spec. Callers that have a spec
+    should use this rather than :func:`get_component`, so a data-bound
+    component is never silently looked up as if it were stateless.
+    """
+    if cspec.kind == EELS_EDGE_KIND:
+        if cspec.data is None:
+            raise ValueError(
+                f"{cspec.name}: this EELS edge has not been prepared for the "
+                f"batched engine — call spyde.spectroscopy.prepare_eels_edges")
+        meta = (cspec.init_args or {}).get("spyde") or {}
+        return eels_edge_component(
+            cspec.data, float(meta.get("x0", 0.0)), float(meta.get("dx", 1.0)),
+            float(meta.get("onset_reference", 0.0)),
+            device=device, dtype=dtype)
+    return get_component(cspec.kind, n_params=len(cspec.scalar_parameters))
+
+
 def available() -> list[str]:
     """Component kinds the batched engine can fit."""
-    return sorted(_REGISTRY) + ["Polynomial"]
+    return sorted(_REGISTRY) + ["Polynomial", EELS_EDGE_KIND]
+
+
+def unsupported(spec) -> dict[str, str]:
+    """``{component name: why the batched engine cannot fit it}``.
+
+    Resolved by actually TRYING to build each component, not by checking the
+    kind against :func:`available`. The two differ for an EELS edge, which is
+    a supported kind but only once its GOS curves have been precomputed — so a
+    kind-only check would report a raw edge as fittable and then fail inside
+    the engine.
+    """
+    out = {}
+    for c in getattr(spec, "active_components", []):
+        try:
+            component_for(c)
+        except (NotImplementedError, ValueError) as e:
+            out[c.name] = str(e)
+    return out
 
 
 def supports(spec) -> bool:
@@ -394,12 +653,7 @@ def supports(spec) -> bool:
     unsupported falls back to HyperSpy's own fitting rather than silently
     dropping a component from the model.
     """
-    for c in getattr(spec, "active_components", []):
-        try:
-            get_component(c.kind, n_params=len(c.parameters))
-        except NotImplementedError:
-            return False
-    return True
+    return not unsupported(spec)
 
 
 def has_analytic_grad(spec) -> bool:
@@ -407,9 +661,9 @@ def has_analytic_grad(spec) -> bool:
     the engine can build the whole Jacobian without autodiff."""
     for c in getattr(spec, "active_components", []):
         try:
-            if not get_component(c.kind, n_params=len(c.parameters)).has_analytic_grad:
+            if not component_for(c).has_analytic_grad:
                 return False
-        except NotImplementedError:
+        except (NotImplementedError, ValueError):
             return False
     return True
 
@@ -426,17 +680,18 @@ def evaluate_with_grad(spec, x, values):
     """
     import torch
 
-    xb = x.unsqueeze(0) if x.dim() == 1 else x
+    # Sample count is the LAST axis for a 1-D axis and the second-to-last for
+    # 2-D coordinate pairs — `x` is (C,)/(P, C) or (C, 2)/(P, C, 2).
+    C = x.shape[-2] if x.shape[-1] == 2 and x.dim() >= 2 else x.shape[-1]
     P = values.shape[0]
-    C = xb.shape[-1]
     n_total = values.shape[1]
     out = torch.zeros((P, C), dtype=values.dtype, device=values.device)
     jac = torch.zeros((P, C, n_total), dtype=values.dtype, device=values.device)
 
     i = 0
     for c in spec.active_components:
-        n = len(c.parameters)
-        comp = get_component(c.kind, n_params=n)
+        n = len(c.scalar_parameters)
+        comp = component_for(c, device=values.device, dtype=values.dtype)
         block = values[:, i:i + n]
         out = out + comp(x, block)
         jac[:, :, i:i + n] = comp.grad(x, block).expand(P, C, n)
@@ -455,12 +710,13 @@ def evaluate(spec, x, values):
     out = None
     i = 0
     for c in spec.active_components:
-        n = len(c.parameters)
-        comp = get_component(c.kind, n_params=n)
+        n = len(c.scalar_parameters)
+        comp = component_for(c, device=values.device, dtype=values.dtype)
         y = comp(x, values[:, i:i + n])
         out = y if out is None else out + y
         i += n
     if out is None:
         p = values.shape[0] if values.dim() > 1 else 1
-        return torch.zeros((p, x.shape[-1]), dtype=x.dtype, device=x.device)
+        c = x.shape[-2] if x.shape[-1] == 2 and x.dim() >= 2 else x.shape[-1]
+        return torch.zeros((p, c), dtype=x.dtype, device=x.device)
     return out

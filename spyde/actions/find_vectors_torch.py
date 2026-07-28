@@ -19,13 +19,18 @@ from many threads at once.
 """
 from __future__ import annotations
 
-import threading
 from typing import Optional
 
 import numpy as np
 
+from spyde.device_lock import DEVICE_LOCK
+
 _TORCH_DEV = "unset"        # cache: torch.device | None
-_GPU_LOCK = threading.Lock()
+# THE process-wide accelerator lock (spyde.device_lock) — NOT a lock private to
+# this module. Every torch user in the process must serialise against the SAME
+# object or concurrent Metal submission segfaults the backend; see device_lock.py
+# for the crash stacks. Kept under the old name because callers import it.
+_GPU_LOCK = DEVICE_LOCK
 
 
 def torch_gpu_device():

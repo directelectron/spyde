@@ -37,18 +37,27 @@ from spyde.fitting.engine import FitResult, fit_batched
 log = logging.getLogger(__name__)
 
 
+def _coarse_grids(nav_shape, stride):
+    """The per-axis coarse sample positions (last index always included)."""
+    grids = [np.arange(0, n, stride) for n in nav_shape]
+    return [g if g[-1] == n - 1 else np.append(g, n - 1)
+            for g, n in zip(grids, nav_shape)]
+
+
+def _coarse_shape(nav_shape, stride):
+    return tuple(len(g) for g in _coarse_grids(nav_shape, stride))
+
+
 def _coarse_indices(nav_shape, stride):
     """Positions of the coarse grid, and the map from every full-grid position
     to its nearest coarse position.
 
     Returns ``(flat_coarse_idx, nearest_flat_coarse_for_each_position)``.
     """
-    grids = [np.arange(0, n, stride) for n in nav_shape]
-    # Always include the LAST index along each axis. Without it a grid whose
-    # size is not a multiple of the stride has an unseeded strip down its far
-    # edge — which is where a scan's contrast often changes most.
-    grids = [g if g[-1] == n - 1 else np.append(g, n - 1)
-             for g, n in zip(grids, nav_shape)]
+    # The LAST index along each axis is always included. Without it a grid
+    # whose size is not a multiple of the stride has an unseeded strip down its
+    # far edge — which is where a scan's contrast often changes most.
+    grids = _coarse_grids(nav_shape, stride)
 
     mesh = np.meshgrid(*grids, indexing="ij")
     flat_coarse = np.ravel_multi_index([m.ravel() for m in mesh], nav_shape)
@@ -134,9 +143,26 @@ def fit_seeded(spec, data, x, *, stride: int = 4, coarse_max_iter: int = 120,
         log.warning("seeding: no coarse fit converged — every position falls "
                     "back to the model's starting values")
 
+    # The coarse grid is fitted in one batch, so each coarse position picks its
+    # own arrangement of interchangeable components — and the propagation then
+    # spreads whichever way each one happened to land. Walking the coarse grid
+    # serpentine and matching each to its neighbour makes the SEEDS agree
+    # before they are handed out, so the refine starts consistent and stays
+    # there. Without this the whole point of seeding is undone for any model
+    # with two components of a kind.
+    from spyde.fitting.relabel import relabel_scan
+    coarse_shape = _coarse_shape(nav_shape, int(stride))
+    if int(np.prod(coarse_shape)) == coarse_idx.size:
+        coarse.values = relabel_scan(spec, coarse.values, coarse_shape,
+                                     converged=coarse.converged)
+        seeds = np.array(coarse.values[nearest], dtype=np.float64, copy=True)
+        seeds[~usable] = defaults[~usable]
+
     # -- 3. one batched refine --------------------------------------------
     result = fit_batched(spec, data, x, initial=seeds, progress=progress,
                          **kwargs)
+    result.values = relabel_scan(spec, result.values, nav_shape,
+                                 converged=result.converged)
     result.seed_converged = float(coarse.converged.mean())
     result.n_seeds = int(coarse_idx.size)
     return result

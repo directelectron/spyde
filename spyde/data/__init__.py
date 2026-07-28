@@ -21,10 +21,12 @@ live in ``spyde/backend/tutorial_data.py`` (user-reachable) and
 from __future__ import annotations
 
 from spyde.data.synthetic import (
+    atom_lattice,
     ebsd_patterns,
     eds_si,
     eels_si,
     ground_truth,
 )
 
-__all__ = ["eels_si", "eds_si", "ebsd_patterns", "ground_truth"]
+__all__ = ["eels_si", "eds_si", "ebsd_patterns", "atom_lattice",
+           "ground_truth"]
