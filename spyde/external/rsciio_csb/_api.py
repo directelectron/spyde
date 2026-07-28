@@ -65,13 +65,44 @@ _DATASETS: dict[tuple, SparseCSB] = {}
 _DATASETS_LOCK = threading.Lock()
 
 
+class _TorchSparseCSB(SparseCSB):
+    """A SparseCSB whose integrations run on torch-CUDA.
+
+    ``_core``'s GPU lane needs CuPy, which SpyDE does not install — its GPU
+    stack is torch. Subclassing rather than editing ``_sparse`` keeps both
+    vendored modules diffable against upstream de-csb.
+    """
+
+    def _accumulator(self):
+        if self._acc is None:
+            from ._torch import TorchAccumulator
+            self._acc = TorchAccumulator(self.csb)
+        return self._acc
+
+
 def _dataset(path: str, backend: str) -> SparseCSB:
-    """The process-wide dataset for one file, opened once."""
+    """The process-wide dataset for one file, opened once.
+
+    ``backend="auto"`` prefers torch-CUDA when there is a device, because that
+    is the GPU SpyDE actually ships; it falls back to ``_core``'s own auto
+    (CuPy if somehow present, else numba, else numpy).
+    """
     key = (os.path.abspath(path), backend)
     with _DATASETS_LOCK:
         ds = _DATASETS.get(key)
         if ds is None:
-            ds = SparseCSB(CSBFile(path), backend=backend)
+            csb = CSBFile(path)
+            use_torch = backend == "torch"
+            if backend == "auto":
+                from ._core import gpu_available
+                from ._torch import torch_gpu_available
+                use_torch = not gpu_available() and torch_gpu_available()
+            if use_torch:
+                ds = _TorchSparseCSB(csb, backend=backend)
+                _logger.debug("CSB %s: integrating on torch-CUDA",
+                              os.path.basename(path))
+            else:
+                ds = SparseCSB(csb, backend=backend)
             _DATASETS[key] = ds
         return ds
 

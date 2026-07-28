@@ -476,10 +476,11 @@ function buildMenu(): void {
             const result = await dialog.showOpenDialog(win!, {
               properties: ['openFile', 'multiSelections'],
               filters: [
-                { name: 'EM Data', extensions: ['hspy', 'zspy', 'mrc', 'tif', 'tiff', 'de5'] },
+                { name: 'EM Data', extensions: ['hspy', 'zspy', 'mrc', 'tif', 'tiff', 'de5', 'csb'] },
                 { name: 'HyperSpy', extensions: ['hspy', 'zspy'] },
                 { name: 'MRC', extensions: ['mrc'] },
                 { name: 'TIFF', extensions: ['tif', 'tiff'] },
+                { name: 'DE CSB (.csb)', extensions: ['csb'] },
               ],
             })
             if (!result.canceled) {
@@ -607,7 +608,7 @@ ipcMain.handle('spyde:open-file', async () => {
   const result = await dialog.showOpenDialog(win!, {
     properties: ['openFile', 'multiSelections'],
     filters: [
-      { name: 'EM Data', extensions: ['hspy', 'zspy', 'mrc', 'tif', 'tiff', 'de5'] },
+      { name: 'EM Data', extensions: ['hspy', 'zspy', 'mrc', 'tif', 'tiff', 'de5', 'csb'] },
     ],
   })
   if (!result.canceled) {
