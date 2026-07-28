@@ -294,10 +294,20 @@ class ModelSpec:
                     linear=bool(getattr(p, "_linear", False)),
                     units=getattr(p, "units", "") or "",
                 ))
+            init = _init_args_for(c)
+            settings = _spyde_settings(c)
+            if settings:
+                # An edge's `fine_structure_active` is neither a constructor
+                # argument nor a parameter, so a spec that dropped it would
+                # rebuild the edge with fine structure OFF and no coefficients
+                # to fit — silently, and only visible as a model that will not
+                # follow the data.
+                init = dict(init)
+                init["spyde"] = {**(init.get("spyde") or {}), **settings}
             comps.append(ComponentSpec(
                 kind=getattr(c, "_id_name", type(c).__name__),
                 name=c.name, active=bool(c.active), parameters=params,
-                init_args=_init_args_for(c)))
+                init_args=init))
 
         mask = getattr(model, "_channel_switches", None)
         if mask is not None:
@@ -322,7 +332,28 @@ class ModelSpec:
             comp = _make_component(cspec)
             model.append(comp)
             comp.active = bool(cspec.active)
+            # Non-constructor state (an edge's fine_structure_active) — set
+            # BEFORE the parameters, because switching fine structure on is
+            # what gives the coefficients somewhere to land.
+            for name, value in ((cspec.init_args or {}).get("spyde") or {}).items():
+                if hasattr(comp, name):
+                    try:
+                        setattr(comp, name, value)
+                    except Exception as e:
+                        log.debug("setting %s on %s failed: %s",
+                                  name, cspec.kind, e)
+            # A VECTOR parameter is carried as one scalar per element
+            # (`fine_structure_coeff_0`, `_1`, …) because the packed parameter
+            # vector holds one scalar per column — see
+            # spyde.spectroscopy.eels_batch. Reassemble them here so the round
+            # trip to HyperSpy is lossless.
+            expanded: dict[str, dict[int, float]] = {}
             for pspec in cspec.parameters:
+                base, _, tail = pspec.name.rpartition("_")
+                if base and tail.isdigit() and hasattr(comp, base) \
+                        and not hasattr(comp, pspec.name):
+                    expanded.setdefault(base, {})[int(tail)] = float(pspec.value)
+                    continue
                 try:
                     par = getattr(comp, pspec.name)
                 except AttributeError:
@@ -334,6 +365,18 @@ class ModelSpec:
                 par.value = (list(np.ravel(pspec.value)) if pspec.n_elements > 1
                              else float(pspec.value))
                 par.free = bool(pspec.free)
+            for base, values in expanded.items():
+                try:
+                    par = getattr(comp, base)
+                    n = max(int(np.size(par.value)), max(values) + 1)
+                    vec = list(np.ravel(np.asarray(par.value, float)))
+                    vec += [0.0] * (n - len(vec))
+                    for i, v in values.items():
+                        vec[i] = v
+                    par.value = tuple(vec[:n])
+                except Exception as e:
+                    log.debug("reassembling %s.%s failed: %s",
+                              cspec.kind, base, e)
 
         if apply_range and self.channel_mask is not None:
             try:
@@ -410,11 +453,16 @@ def _make_component(cspec: ComponentSpec):
     except ImportError:
         pass
 
+    # `init_args` are the component's CONSTRUCTOR arguments. `spyde` is the
+    # reserved key for anything SpyDE needs to carry alongside (an EELS edge's
+    # precomputed axis and onset reference) — handing those to exspy would be
+    # a TypeError from a keyword it has never heard of.
+    kwargs = {k: v for k, v in (cspec.init_args or {}).items() if k != "spyde"}
     for mod in mods:
         cls = getattr(mod, cspec.kind, None)
         if cls is not None:
             try:
-                comp = cls(**cspec.init_args) if cspec.init_args else cls()
+                comp = cls(**kwargs) if kwargs else cls()
             except TypeError as e:
                 raise ValueError(
                     f"cannot rebuild {cspec.kind!r} from the spec: {e}. It "
@@ -431,13 +479,38 @@ def _make_component(cspec: ComponentSpec):
                                     'spyde[eels] for EELS/EDS components)'))
 
 
+def _spyde_settings(comp) -> dict:
+    """Component state that is NOT a constructor argument and NOT a parameter.
+
+    ``fine_structure_active`` decides whether an EELS edge has a fittable
+    spline at all, so a spec that dropped it would silently rebuild the edge
+    with fine structure off and no coefficients to fit. It goes under the
+    reserved ``spyde`` key, which ``_make_component`` keeps out of the
+    constructor.
+    """
+    out = {}
+    for name in ("fine_structure_active", "fine_structure_width",
+                 "fine_structure_spline_active"):
+        if hasattr(comp, name):
+            try:
+                out[name] = getattr(comp, name)
+            except Exception as e:                        # pragma: no cover
+                log.debug("reading %s off %r failed: %s", name, comp, e)
+    return out
+
+
 def spec_from_component(comp) -> ComponentSpec:
     """One live HyperSpy component -> a ComponentSpec (used by the picker,
     which instantiates a component just to show its default shape, #56)."""
+    init = _init_args_for(comp)
+    settings = _spyde_settings(comp)
+    if settings:
+        init = dict(init)
+        init["spyde"] = {**(init.get("spyde") or {}), **settings}
     return ComponentSpec(
         kind=getattr(comp, "_id_name", type(comp).__name__),
         name=comp.name, active=bool(comp.active),
-        init_args=_init_args_for(comp),
+        init_args=init,
         parameters=[ParameterSpec(
             name=p.name, value=float(np.ravel(p.value)[0]), free=bool(p.free),
             bmin=getattr(p, "bmin", None), bmax=getattr(p, "bmax", None),

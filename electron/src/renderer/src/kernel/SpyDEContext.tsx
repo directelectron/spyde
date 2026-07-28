@@ -1262,6 +1262,12 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'vom_fit':
         case 'vom_library_ready':
         case 'om_library_ready':
+        // Fit wizard (spyde/actions/fit_action.py) — `fit_catalogue` is the
+        // component picker's shapes, sent once on open; `fit_state` is the
+        // whole model after every edit. Consumed by FitWizard.
+        case 'fit_catalogue':
+        case 'fit_state':
+        case 'bg_state':
         case 'fv_auto_params':
         case 'fv_models':
         case 'fv_calibration':
@@ -1343,6 +1349,20 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
           } catch { /* */ }
         }
         return widgets
+      }
+
+      // Test hook: the raw panel-state JSON of a figure, so a spec can read the
+      // LINES as well as the widgets. Checking that a drag handle sits ON its
+      // component's curve needs both, and a screenshot cannot tell "on the
+      // curve" from "a few pixels off it".
+      window._spyde_test_panel_json = (figId: string) => {
+        const states = latestStates.current.get(figId)
+        if (!states) return []
+        const out: string[] = []
+        for (const [key, value] of states) {
+          if (key.startsWith('panel_') && key.endsWith('_json')) out.push(value as string)
+        }
+        return out
       }
 
       // Test hook: return the authoritative report doc (read-only snapshot) so a
@@ -1432,6 +1452,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
       if (testHooksEnabled) {
         delete window._spyde_test_inject
         delete window._spyde_test_widgets
+        delete window._spyde_test_panel_json
         delete window._spyde_test_report
         delete window._spyde_test_image_sig
       }

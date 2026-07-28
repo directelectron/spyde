@@ -42,7 +42,6 @@ _INTENSITY_PARAM = {
     "Gaussian": "A",
     "GaussianHF": "height",
     "Lorentzian": "A",
-    "TabulatedShape": "intensity",
     "EELSCLEdge": "intensity",
 }
 

@@ -500,58 +500,150 @@ def get_component(kind: str, *, n_params: int | None = None) -> TorchComponent:
         ) from None
 
 
-TABULATED_KIND = "TabulatedShape"
+EELS_EDGE_KIND = "EELSCLEdge"
 
 
-def tabulated_component(table, x0: float, dx: float, *, device=None,
-                        dtype=None) -> TorchComponent:
-    """A component whose SHAPE comes from a lookup table (#63).
+def _interp_stack(xq, x0, dx, table):
+    """:func:`_interp_uniform` for a STACK of tables — ``(K, C)`` -> ``(K, P, C)``.
 
-    Fits two parameters against it: ``intensity`` (linear — the amplitude that
-    scales the whole shape) and ``onset_shift`` (how far the shape slides along
-    the energy axis). That is the right pair for an EELS core-loss edge, whose
-    form is a GOS table rather than a formula: the shape is fixed physics and
-    the fit is asking "how much of this element, and exactly where does its
-    edge start".
-
-    What this deliberately does NOT fit is the fine structure and effective
-    angle, which are FROZEN at the values the table was sampled with. Those are
-    what make an edge a tabulated lookup in the first place, and refitting them
-    would mean re-sampling the table every iteration — which is exactly the
-    per-item Python work the batched engine exists to avoid.
+    Every row is sampled at the same query points, which is the whole point:
+    the base shape and each fine-structure basis function slide together when
+    the onset moves, because they are one edge.
     """
     import torch
 
-    t = torch.as_tensor(np.asarray(table, float), device=device,
+    n = table.shape[-1]
+    pos = (xq - x0) / dx
+    idx = torch.clamp(pos.floor(), 0, n - 2)
+    t = torch.clamp(pos - idx, 0.0, 1.0)
+    i0 = idx.long()
+    y0 = table[:, i0]
+    y1 = table[:, torch.clamp(i0 + 1, max=n - 1)]
+    return y0 + t * (y1 - y0)
+
+
+def _eels_bracket(tables, x0, dx, onset_ref, x, cols):
+    """``shape(E - delta)`` and its fine-structure part, at unit intensity."""
+    onset = cols[1]
+    delta = onset - onset_ref
+    stack = _interp_stack(x - delta, x0, dx, tables)     # (1+N, P, C)
+    total = stack[0]
+    for i, c in enumerate(cols[2:]):
+        total = total + c * stack[i + 1]
+    return total, stack
+
+
+def eels_edge_component(tables, x0: float, dx: float, onset_ref: float, *,
+                        device=None, dtype=None) -> TorchComponent:
+    """A batched EELS core-loss edge — GOS shape AND fittable fine structure.
+
+    ``EELSCLEdge`` is not a formula: exspy integrates a generalised-oscillator-
+    strength table to get the cross-section. That integral is what has no place
+    in a batched inner loop — but it depends on the ELEMENT and the MICROSCOPE
+    GEOMETRY, not on the pixel, so it is the same curve for every spectrum in
+    the scan and is computed once.
+
+    What is left is linear or nearly so, which is why this works:
+
+    * ``intensity`` scales the whole edge — linear.
+    * ``fine_structure_coeff`` are cubic B-spline coefficients, and a spline
+      with fixed knots is a LINEAR combination of basis functions. Probing
+      exspy's own ``function`` once per coefficient gives those basis curves,
+      after which the edge is exactly ``base + sum(c_i * basis_i)``. Verified
+      against exspy at 0.0 relative error, not approximately.
+    * ``onset_energy`` slides the edge. Moving it in exspy re-integrates the
+      GOS and re-places the knots; here the precomputed curves are interpolated
+      instead, which is exact for the shape and differs only in how the far
+      tail is re-derived — well inside the few channels a fit actually moves.
+
+    ``tables`` is ``(1 + N, C)``: the base shape at unit intensity with every
+    coefficient zero, then one row per fine-structure basis function.
+
+    This REPLACED a component that discarded the fine structure altogether and
+    fitted only intensity and a shift. That was a bad trade twice over: fine
+    structure is the *linear* part and so the cheapest thing here to batch, and
+    dropping it produced a component HyperSpy could not represent, so a fitted
+    EELS model could not be stored on its own signal.
+    """
+    import torch
+
+    t = torch.as_tensor(np.asarray(tables, float), device=device,
                         dtype=dtype or torch.float64)
-    return TorchComponent(TABULATED_KIND, ("intensity", "onset_shift"),
-                          (True, False),
-                          _tabulated_fn(t, float(x0), float(dx)),
-                          _tabulated_grad(t, float(x0), float(dx)))
+    if t.dim() == 1:
+        t = t.unsqueeze(0)
+    n_basis = int(t.shape[0]) - 1
+    params = ("intensity", "onset_energy") + tuple(
+        f"fine_structure_coeff_{i}" for i in range(n_basis))
+    linear = (True, False) + (True,) * n_basis
+    x0, dx, ref = float(x0), float(dx), float(onset_ref)
+
+    def fn(x, cols):
+        total, _ = _eels_bracket(t, x0, dx, ref, x, cols)
+        return cols[0] * total
+
+    def grad(x, cols):
+        intensity = cols[0]
+        total, stack = _eels_bracket(t, x0, dx, ref, x, cols)
+        # d/d(onset) is minus the local slope, as a CENTRAL difference over one
+        # channel — the exact piecewise-linear derivative is a step function
+        # that jumps at every segment boundary, so LM chatters as the onset
+        # crosses a channel.
+        half = dx / 2.0
+        shifted = []
+        for sign in (+1.0, -1.0):
+            moved = list(cols)
+            moved[1] = cols[1] - sign * half
+            tot, _ = _eels_bracket(t, x0, dx, ref, x, moved)
+            shifted.append(tot)
+        slope = (shifted[0] - shifted[1]) / dx
+        return _stack(total, -intensity * slope,
+                      *[intensity * stack[i + 1] for i in range(n_basis)])
+
+    return TorchComponent(EELS_EDGE_KIND, params, linear, fn, grad)
 
 
 def component_for(cspec, *, device=None, dtype=None) -> TorchComponent:
     """Resolve the batched component for a :class:`ComponentSpec`.
 
-    Everything analytic resolves by ``kind`` alone; a tabulated component also
-    needs its own table, which lives on the spec. Callers that have a spec
+    Everything analytic resolves by ``kind`` alone; an EELS edge also needs its
+    own precomputed curves, which live on the spec. Callers that have a spec
     should use this rather than :func:`get_component`, so a data-bound
     component is never silently looked up as if it were stateless.
     """
-    if cspec.kind == TABULATED_KIND:
+    if cspec.kind == EELS_EDGE_KIND:
         if cspec.data is None:
-            raise ValueError(f"{cspec.name}: {TABULATED_KIND} has no table — "
-                             f"build it with spyde.spectroscopy.tabulate")
-        x0 = float(cspec.init_args.get("x0", 0.0))
-        dx = float(cspec.init_args.get("dx", 1.0))
-        return tabulated_component(cspec.data, x0, dx, device=device,
-                                   dtype=dtype)
+            raise ValueError(
+                f"{cspec.name}: this EELS edge has not been prepared for the "
+                f"batched engine — call spyde.spectroscopy.prepare_eels_edges")
+        meta = (cspec.init_args or {}).get("spyde") or {}
+        return eels_edge_component(
+            cspec.data, float(meta.get("x0", 0.0)), float(meta.get("dx", 1.0)),
+            float(meta.get("onset_reference", 0.0)),
+            device=device, dtype=dtype)
     return get_component(cspec.kind, n_params=len(cspec.scalar_parameters))
 
 
 def available() -> list[str]:
     """Component kinds the batched engine can fit."""
-    return sorted(_REGISTRY) + ["Polynomial", TABULATED_KIND]
+    return sorted(_REGISTRY) + ["Polynomial", EELS_EDGE_KIND]
+
+
+def unsupported(spec) -> dict[str, str]:
+    """``{component name: why the batched engine cannot fit it}``.
+
+    Resolved by actually TRYING to build each component, not by checking the
+    kind against :func:`available`. The two differ for an EELS edge, which is
+    a supported kind but only once its GOS curves have been precomputed — so a
+    kind-only check would report a raw edge as fittable and then fail inside
+    the engine.
+    """
+    out = {}
+    for c in getattr(spec, "active_components", []):
+        try:
+            component_for(c)
+        except (NotImplementedError, ValueError) as e:
+            out[c.name] = str(e)
+    return out
 
 
 def supports(spec) -> bool:
@@ -561,12 +653,7 @@ def supports(spec) -> bool:
     unsupported falls back to HyperSpy's own fitting rather than silently
     dropping a component from the model.
     """
-    for c in getattr(spec, "active_components", []):
-        try:
-            component_for(c)
-        except (NotImplementedError, ValueError):
-            return False
-    return True
+    return not unsupported(spec)
 
 
 def has_analytic_grad(spec) -> bool:
