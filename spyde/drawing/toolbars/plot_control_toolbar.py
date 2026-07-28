@@ -32,6 +32,60 @@ def resolve_icon_path(icon_value: str) -> str:
     return str((base / icon_value).resolve())
 
 
+# Optional-extra name for each gated package, so a hidden action can tell the
+# user what to install rather than just not existing (0.3.0 Wave 0, #49).
+_EXTRA_FOR_PACKAGE = {
+    "exspy": "eels",
+    "kikuchipy": "ebsd",
+    "atomap": "atoms",
+}
+
+_PACKAGE_CACHE: dict[str, bool] = {}
+
+
+def package_available(name: str) -> bool:
+    """True when an optional dependency is importable.
+
+    Uses ``importlib.util.find_spec`` rather than an actual import: resolving a
+    toolbar must never pay the multi-second cost of importing exspy/kikuchipy,
+    and must never execute a broken third-party package's import side effects
+    just to decide whether to draw a button.
+
+    Cached because the toolbar filter runs on every rebuild, and an extra
+    cannot appear or vanish inside a session.
+    """
+    hit = _PACKAGE_CACHE.get(name)
+    if hit is None:
+        try:
+            hit = importlib.util.find_spec(name) is not None
+        except (ImportError, ValueError):
+            # A namespace-package parent or a half-installed dist can raise
+            # here; treat anything unresolvable as absent.
+            hit = False
+        _PACKAGE_CACHE[name] = hit
+    return hit
+
+
+def install_hint(name: str) -> str:
+    """The pip line that would make a gated action appear."""
+    extra = _EXTRA_FOR_PACKAGE.get(name)
+    return f'pip install "spyde[{extra}]"' if extra else f"pip install {name}"
+
+
+def _packages_present(meta: dict) -> bool:
+    """``requires_package:`` gate — a str or list of importable module names.
+
+    Mirrors ``requires_vectors``: the action is hidden until its optional
+    extra is installed, instead of appearing and then raising ImportError on
+    click.
+    """
+    req = meta.get("requires_package")
+    if not req:
+        return True
+    names = [req] if isinstance(req, str) else list(req)
+    return all(package_available(n) for n in names)
+
+
 _SIGNAL_CLASS_CACHE: dict[str, type] = {}
 
 
@@ -140,6 +194,10 @@ def get_toolbar_actions_for_plot(
                 or isinstance(signal, _resolve_signal_class(signal_class))
             )
             and (not requires_vectors or has_vectors)
+            # requires_package: hide until the optional extra is installed
+            # (exspy / kikuchipy / atomap). Checked by find_spec, so this
+            # costs nothing and never imports the package.
+            and _packages_present(meta)
             and (plot_state.dimensions in plot_dim)
             and (
                 navigation_only is None
@@ -218,6 +276,7 @@ def _action_matches_plot(action: str, meta: dict, plot_state: "PlotState") -> bo
             or isinstance(signal, _resolve_signal_class(signal_class))
         )
         and (not requires_vectors or has_vectors)
+        and _packages_present(meta)
         and (plot_state.dimensions in plot_dim)
         and (
             navigation_only is None

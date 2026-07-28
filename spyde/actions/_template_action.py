@@ -19,6 +19,8 @@ To wire a TOOLBAR action, add a `spyde/toolbars.yaml` entry:
       # signal_types: [spyde_diffraction_vectors_image]     # _signal_type gate
       # exclude_signal_types: [...]                         # blacklist
       # requires_vectors: True          # hide until tree.diffraction_vectors
+      # requires_package: exspy         # hide until the optional extra is
+      #                                 # installed (or a list: [a, b])
       plot_dim: [2]                     # 1-D / 2-D plots it applies to
       toolbar_side: bottom
       navigation: False                 # navigator vs signal windows

@@ -36,6 +36,7 @@ _TEST_ACTIONS_ENABLED = os.environ.get("SPYDE_PACKAGED") != "1"
 _TEST_ACTIONS = frozenset({
     "load_test_data", "load_test_data_lazy", "load_test_data_lazy_chunked",
     "load_test_data_si_grains", "load_test_data_sped_ag",
+    "load_test_data_eels", "load_test_data_eds", "load_test_data_ebsd",
     "load_test_data_line", "load_test_data_movie", "test_nav_drag",
     "test_region_scrub", "test_add_second_navigator",
     "load_test_vectors", "run_test_orientation", "dump_dask_state",
@@ -115,6 +116,12 @@ class ActionRouterMixin:
             self._load_test_data_si_grains()
         elif action == "load_test_data_sped_ag":
             self._load_test_data_sped_ag()
+        elif action == "load_test_data_eels":
+            self._load_test_data_eels(payload)
+        elif action == "load_test_data_eds":
+            self._load_test_data_eds(payload)
+        elif action == "load_test_data_ebsd":
+            self._load_test_data_ebsd(payload)
         elif action == "load_test_data_line":
             self._load_test_data_line(payload)
         elif action == "load_test_data_movie":

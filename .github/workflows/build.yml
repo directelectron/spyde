@@ -67,6 +67,51 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
 
+  # ── Domain extras (0.3.0) ──────────────────────────────────────────────────
+  # The `test` job above runs with NO optional extras, which is the important
+  # half of the contract: SpyDE must work for a user who only does 4D-STEM, and
+  # the `requires_package:` gate must hide the EELS/EBSD/atoms actions rather
+  # than raising ImportError. This job is the other half — with exspy,
+  # kikuchipy and atomap installed the gated code actually executes, so a broken
+  # EELS/EBSD/atom path fails here instead of silently never running.
+  #
+  # One OS / one Python: the extras are pure-Python scientific packages and the
+  # cross-platform surface is already covered by `test`. Not part of the main
+  # matrix because that would quadruple install time for every leg.
+  test-extras:
+    name: extras (ubuntu, py3.12)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.10.11"
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      # NOT --frozen: the domain extras are not in uv.lock (they are optional
+      # and resolve differently per platform), so the lock cannot satisfy them.
+      - name: Install with all domain extras
+        run: uv sync --extra tests --extra all --python 3.12
+
+      - name: Versions
+        run: |
+          uv run python -V
+          uv run python -c "import exspy, kikuchipy, atomap; \
+            print('exspy', exspy.__version__); \
+            print('kikuchipy', kikuchipy.__version__); \
+            print('atomap', atomap.__version__)"
+
+      - name: Run tests (extras present)
+        run: uv run pytest spyde/tests/migrated
+
   # ── Renderer/main TypeScript typecheck ─────────────────────────────────────
   # Pure TS compile (tsc --noEmit) of the Electron main + renderer. No Python /
   # display server needed, so it's a fast standalone job that gates the PR.

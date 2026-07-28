@@ -38,6 +38,13 @@ dependencies = [
     "psygnal>=0.10.0",
     "anyplotlib>=0.4.2",
     "pyyaml",
+    # NOT numexpr. HyperSpy warns "Numexpr is not installed ... which is slower
+    # to calculate model" on every model build, but that advice is wrong at
+    # spectrum sizes and installing it is a PESSIMISATION: measured on a 1024-
+    # channel EELS multifit, 110 spectra/s without it vs 77 with it (best of 3;
+    # 70 at 48 threads — numexpr's per-call setup and thread dispatch dominate
+    # arrays this small). See RELEASE_0_3_0_PLAN.md §0.4. Do not "fix" the
+    # warning by adding it back.
     # GPU-accelerated batched compute (vector orientation mapping, etc.).
     "torch",
     # Remote model registry for the SpotUNet disk detector: pulls upgraded
@@ -170,6 +177,17 @@ doc = [
     "pydata_sphinx_theme",
     "sphinx-gallery",
     "sphinx_design",
+]
+# Domain extras (0.3.0). Deliberately NOT core dependencies: each pulls a large
+# dependency tree, and the frozen app must stay installable for a user who only
+# does 4D-STEM. Actions gate on them with the `requires_package:` toolbar key,
+# so a missing extra hides the buttons instead of raising ImportError on click.
+# `spyde.data`'s synthetic generators never need them.
+eels = ["exspy>=0.3.2"]           # EELS + EDS models, edges, quantification
+ebsd = ["kikuchipy>=0.11.0"]      # EBSD signals, IO, detector, master patterns
+atoms = ["atomap>=0.4.1"]         # atom finding, sublattices, dumbbells
+all = [
+    "spyde[eels,ebsd,atoms]",
 ]
 
 [project.urls]
