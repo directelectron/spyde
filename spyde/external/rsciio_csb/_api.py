@@ -33,6 +33,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from collections import OrderedDict
 
 import numpy as np
 
@@ -45,6 +46,18 @@ _logger = logging.getLogger(__name__)
 #: slider has somewhere to go, few enough that each plane has real signal in it
 #: — a single frame of a sparse stream is mostly empty pixels.
 DEFAULT_PLANES = 50
+
+#: Longest plane edge to integrate at by default. A CSB frame can be 8192², and
+#: at float32 that is a 268 MB readback per plane — which IS the cost of a
+#: scrub (accumulating the events is ~10 ms of it). de-csb's own README says
+#: the same thing under "Readout is a separate cost": the full image caps you
+#: at ~11 Hz while a 4x-binned one runs at ~84 Hz, so display from the binned
+#: one and pull the full image only when something is actually measured.
+#:
+#: Binning is a SUM, so no counts are lost — and on data this sparse (the test
+#: movie is ~1.9 counts/px for the entire 125.8M-event movie) binning is what
+#: makes a plane visible at all. Pass ``bin=1`` for the full grid.
+DEFAULT_MAX_EDGE = 2048
 
 # One integration at a time (see the module docstring).
 _ACC_LOCK = threading.Lock()
@@ -78,6 +91,23 @@ class _TorchSparseCSB(SparseCSB):
             from ._torch import TorchAccumulator
             self._acc = TorchAccumulator(self.csb)
         return self._acc
+
+    def _sum_frames(self, f0, f1, bin_factor, dtype):
+        """Integrate, binning ON THE DEVICE before the readback.
+
+        ``_sparse``'s version pulls the full image and bins on the host, so
+        asking for bin=4 costs MORE than bin=1 — it pays the full 268 MB
+        transfer and then bins it. Binning first is the entire reason
+        ``preview()`` exists: it moves 1/16th of the bytes, which is where a
+        scrub's time actually goes.
+        """
+        acc = self._accumulator()
+        acc.reset()
+        acc.add_frames(int(f0), int(f1))
+        acc.synchronize()
+        if bin_factor and int(bin_factor) > 1:
+            return acc.preview(int(bin_factor), dtype)
+        return acc.image(dtype)
 
 
 def _dataset(path: str, backend: str) -> SparseCSB:
@@ -127,6 +157,23 @@ def _resolve_step(ds: SparseCSB, step, frames_per_plane) -> float:
     return max(ds.duration / DEFAULT_PLANES, dt)
 
 
+def _resolve_bin(ds: SparseCSB, requested) -> int:
+    """Spatial binning per plane. ``None``/0 picks one for the frame size.
+
+    The default keeps a plane's longest edge at or under
+    :data:`DEFAULT_MAX_EDGE` by the next power of two, so an 8192² movie
+    integrates 2048² planes (16 MB, ~36 ms) instead of 8192² ones (268 MB,
+    ~180 ms). An explicit ``bin`` — including ``bin=1`` — is always honoured.
+    """
+    if requested:
+        return max(1, int(requested))
+    edge = max(ds.shape)
+    factor = 1
+    while edge // factor > DEFAULT_MAX_EDGE and factor < 16:
+        factor *= 2
+    return factor
+
+
 def plane_counts(ds: SparseCSB, bounds) -> np.ndarray:
     """Total events per plane, straight from the block table.
 
@@ -139,18 +186,75 @@ def plane_counts(ds: SparseCSB, bounds) -> np.ndarray:
     return np.array([per_frame[f0:f1].sum() for f0, f1 in bounds], np.float64)
 
 
+#: Bytes of integrated planes to keep. Scrubbing revisits planes constantly —
+#: a drag goes back and forth over the same handful — and re-integrating one is
+#: a fresh readback, which is the whole cost (see integrate_plane). Sized to
+#: hold a decent run of binned planes (16 MB each at 2048²) or a couple of
+#: full-resolution ones.
+PLANE_CACHE_BYTES = 512 << 20
+
+_plane_cache: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
+_plane_cache_bytes = 0
+_PLANE_CACHE_LOCK = threading.Lock()
+
+
+def _cache_get(key):
+    with _PLANE_CACHE_LOCK:
+        hit = _plane_cache.get(key)
+        if hit is not None:
+            _plane_cache.move_to_end(key)          # LRU
+        return hit
+
+
+def _cache_put(key, arr: np.ndarray) -> None:
+    global _plane_cache_bytes
+    nbytes = int(arr.nbytes)
+    if nbytes > PLANE_CACHE_BYTES:
+        return                                     # one plane over budget
+    with _PLANE_CACHE_LOCK:
+        if key in _plane_cache:
+            return
+        _plane_cache[key] = arr
+        _plane_cache_bytes += nbytes
+        while _plane_cache_bytes > PLANE_CACHE_BYTES and len(_plane_cache) > 1:
+            _k, old = _plane_cache.popitem(last=False)
+            _plane_cache_bytes -= int(old.nbytes)
+
+
+def clear_plane_cache() -> None:
+    """Drop every cached plane (a different exposure invalidates nothing —
+    the key carries the window — so this is only for tests and teardown)."""
+    global _plane_cache_bytes
+    with _PLANE_CACHE_LOCK:
+        _plane_cache.clear()
+        _plane_cache_bytes = 0
+
+
 def integrate_plane(path: str, backend: str, f0: int, f1: int,
                     bin_factor: int, dtype) -> np.ndarray:
     """One plane: integrate frames ``[f0, f1)`` -> ``(1, H, W)``.
 
     Takes the file PATH, not an open dataset — see :data:`_DATASETS`. Every
-    argument is small and hashable, so the graph is cheap to build and can be
-    shipped to a worker.
+    argument is small and hashable, so the graph is cheap to build, it can be
+    shipped to a worker, and it doubles as the cache key.
+
+    Cached because a scrub is not a linear pass: dragging the slider walks back
+    and forth over the same few planes, and each repeat would otherwise pay the
+    full readback again. Accumulating the events is ~10 ms; pulling the result
+    back is the rest.
     """
+    key = (os.path.abspath(path), backend, int(f0), int(f1), int(bin_factor),
+           np.dtype(dtype).str)
+    hit = _cache_get(key)
+    if hit is not None:
+        return hit
+
     ds = _dataset(path, backend)
     with _ACC_LOCK:
         img = ds._sum_frames(f0, f1, bin_factor, dtype)
-    return np.asarray(img, dtype)[None]
+    out = np.asarray(img, dtype)[None]
+    _cache_put(key, out)
+    return out
 
 
 def lazy_stack(path: str, bounds, shape, bin_factor: int = 1,
@@ -194,7 +298,7 @@ def _axes(ds: SparseCSB, bounds, bin_factor: int):
 
 
 def file_reader(filename, lazy=False, step=None, frames_per_plane=None,
-                start=0.0, stop=None, bin=1, backend="auto", **kwds):
+                start=0.0, stop=None, bin=None, backend="auto", **kwds):
     """Read a CSB centroid stream as a stack of integrated time planes.
 
     Parameters
@@ -211,8 +315,11 @@ def file_reader(filename, lazy=False, step=None, frames_per_plane=None,
         Takes precedence over *step*.
     start, stop : float
         Time range to cover, in seconds. Defaults to the whole movie.
-    bin : int
-        Integer spatial binning, summed.
+    bin : int, optional
+        Integer spatial binning, summed. Defaults to whatever keeps a plane's
+        longest edge at :data:`DEFAULT_MAX_EDGE` — see :func:`_resolve_bin`,
+        and note that binning is what makes a scrub interactive AND what makes
+        sparse counted data visible. Pass ``1`` for the full pixel grid.
     backend : {"auto", "gpu", "cpu", "cpu-numba", "cpu-numpy"}
         Integration backend; ``"auto"`` takes the GPU when there is one.
     """
@@ -220,7 +327,7 @@ def file_reader(filename, lazy=False, step=None, frames_per_plane=None,
         _logger.debug("CSB reader ignoring unknown kwargs: %s", sorted(kwds))
     path = str(filename)
     ds = _dataset(path, backend)
-    bin_factor = max(1, int(bin))
+    bin_factor = _resolve_bin(ds, bin)
     exposure = _resolve_step(ds, step, frames_per_plane)
     bounds = ds._time_bounds(exposure, float(start),
                              ds.duration if stop is None else float(stop))
