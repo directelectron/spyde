@@ -674,6 +674,24 @@ class Session(
             except Exception as e:
                 log.debug("console shutdown failed: %s", e)
         self._closed = True   # block compute_backend from recreating _nav_executor
+        # Stop the trees' in-flight compute BEFORE the executors go away.
+        #
+        # BaseSignalTree.close() exists for exactly this — it flips every
+        # registered stopped_flag, cancels every registered future, and sets
+        # _nav_stop so the progressive-navigator thread bails on its next poll —
+        # but shutdown() never called it. That did not show while shutdown()
+        # slept half a second on its way out: the background fill usually
+        # finished inside the sleep. With that gone, a live `_bg_nav` submits
+        # into an executor that is already shutting down and logs "threaded
+        # navigator compute failed" during interpreter teardown.
+        #
+        # Cancel-then-teardown is the same order close() itself uses, and it is
+        # the order that matters: reversing it is what produces the raise.
+        for tree in list(getattr(self, "signal_trees", []) or []):
+            try:
+                tree.close()
+            except Exception as e:
+                log.debug("closing signal tree during shutdown failed: %s", e)
         stats = getattr(self, "_dask_stats", None)
         if stats is not None:
             try:
