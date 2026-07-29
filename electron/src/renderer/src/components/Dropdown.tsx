@@ -17,12 +17,19 @@
  */
 import React from 'react'
 
-export function Dropdown<T extends string>({ value, options, onChange, testid, width }: {
+export function Dropdown<T extends string>({
+  value, options, onChange, testid, width, triggerText,
+}: {
   value: T
   options: readonly { value: T; label: string }[]
   onChange: (v: T) => void
   testid: string
   width?: number | string
+  /** Override what the TRIGGER shows, while the menu keeps the full labels.
+   *  For a dropdown attached to another control, where the selection is
+   *  already displayed beside it and repeating the whole label would just be
+   *  noise — pass '' for a bare caret. */
+  triggerText?: string
 }) {
   const [open, setOpen] = React.useState(false)
   // Auto drop-UP when the menu would clip the bottom of the window (e.g. the
@@ -63,7 +70,11 @@ export function Dropdown<T extends string>({ value, options, onChange, testid, w
         style={{ ...S.trigger, ...(open ? S.triggerOpen : {}) }}
         onClick={toggle}
       >
-        <span style={S.triggerLabel}>{current?.label ?? String(value)}</span>
+        {triggerText !== '' && (
+          <span style={S.triggerLabel}>
+            {triggerText ?? current?.label ?? String(value)}
+          </span>
+        )}
         <span style={S.caret}>▾</span>
       </button>
       {open && (
