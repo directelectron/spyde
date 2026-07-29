@@ -11,6 +11,13 @@ matrix past its job timeout.
 Both halves matter, so both are pinned here: skip when nothing ran, and
 still reap when something did. The second is the one that protects users —
 a leaked Dask worker outlives the app and holds its memory.
+
+These stub the cluster rather than spinning one: a real ``LocalCluster``
+costs ~15 s, which is precisely the kind of thing this change exists to
+remove from the suite. The real path was verified out-of-band instead —
+a 2-worker cluster, ``shutdown()`` taking 1.99 s (so the settle + psutil
+walk + ``wait_procs`` all ran) and zero surviving children. Re-run that
+by hand if you touch the reap; do not add it here.
 """
 from __future__ import annotations
 
