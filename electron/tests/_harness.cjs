@@ -58,8 +58,10 @@ async function launchApp(opts = {}) {
     env: {
       ...process.env,
       ...(dask ? {} : { SPYDE_NO_DASK: '1' }),
-      SPYDE_SETTINGS_DIR: _seenSettingsDir(),
-      ...env,          // a spec's own SPYDE_SETTINGS_DIR wins
+      // Only mint a scratch dir if the spec didn't bring its own — otherwise
+      // every first_run launch would also leave an unused one behind.
+      ...(env.SPYDE_SETTINGS_DIR ? {} : { SPYDE_SETTINGS_DIR: _seenSettingsDir() }),
+      ...env,
     },
   })
 
