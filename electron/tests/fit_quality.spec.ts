@@ -160,17 +160,19 @@ test('the fitted model matches the spectrum on screen', async () => {
     }, figIds.nav)
     expect(cross, 'the navigator has no crosshair').toBeTruthy()
 
-    /** Cheap signature of the DATA curve — changes when the panel actually
-     *  moves to a different navigator position. */
-    const dataSig = async () => {
+    const sigOf = (a: number[] | null) =>
+      a ? `${a.length}:${a[0]}:${a[a.length >> 1]}:${a[a.length - 1]}` : ''
+
+    /** Signatures of BOTH curves. They update independently, which is the
+     *  whole problem: the spectrum can be this position's while the model
+     *  overlay is still the previous one's. */
+    const sigs = async () => {
       const c = await curves()
-      if (!c) return ''
-      const d = c.data
-      return `${d.length}:${d[0]}:${d[d.length >> 1]}:${d[d.length - 1]}`
+      return { data: sigOf(c?.data ?? null), model: sigOf(c?.model ?? null) }
     }
 
     const goTo = async (cx: number, cy: number) => {
-      const before = await dataSig()
+      const before = await sigs()
       await page.evaluate(({ f, panel, id, x, y }) => {
         window.postMessage({
           type: 'awi_event', figId: f,
@@ -180,18 +182,26 @@ test('the fitted model matches the spectrum on screen', async () => {
           }),
         }, '*')
       }, { f: figIds.nav, panel: cross.panel_id, id: cross.id, x: cx, y: cy })
-      // Wait for the SPECTRUM to become this position's, not a flat 1.2s.
-      // settledMisfit alone was not enough: "two consecutive reads agree" can
-      // agree on the OLD value when the move has not been applied yet, which
-      // is why [2,2] — the first sweep stop after the tab switch — still read
-      // 191.6% while re-measuring it later gave 3.7%. Confirming the panel
-      // moved before judging the model is what closes that window.
+
+      // Wait for BOTH curves to become this position's.
+      //
+      // Neither weaker version held on CI. A flat 1.2s: [2,2] read 191.6%
+      // where re-measuring gave 3.7%. "Sample until two reads agree": a stale
+      // overlay is perfectly stable, so stability cannot tell "finished
+      // updating" from "has not started". Waiting only for the DATA: the
+      // spectrum arrives first and the model follows separately, so [16,2]
+      // still scored 28.3% mid-sweep on a loaded runner.
+      //
+      // The MODEL changing is the signal that the overlay is this position's,
+      // and it is what made fit_navigate stable. Falls through on timeout
+      // rather than hanging — two positions could in principle fit alike, and
+      // settledMisfit below is still the final guard.
       const deadline = Date.now() + 30_000
       while (Date.now() < deadline) {
         await page.waitForTimeout(100)
-        if ((await dataSig()) !== before) break
+        const now = await sigs()
+        if (now.data !== before.data && now.model !== before.model) break
       }
-      await page.waitForTimeout(400)   // let the model overlay follow the data
     }
 
     let worst = { m: 0, at: [0, 0] as number[] }
