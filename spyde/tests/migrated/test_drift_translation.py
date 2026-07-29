@@ -202,7 +202,11 @@ class TestSolveTranslationAccuracy:
         assert np.allclose(model.shifts, truth, atol=GATE_PX), model.shifts
 
     def test_running_reference_survives_one_corrupt_frame(self):
-        """Why 'running' is the default: a single bad frame must not poison it."""
+        """Why 'running' is the default: a single bad frame must not poison it.
+
+        The frames AFTER the corrupt one are what matters. The corrupt frame's own
+        shift is meaningless by construction and is not asserted on.
+        """
         truth = np.array([[0, 0], [2, 1], [4, 2], [6, 3], [8, 4]], dtype=float)
         stack = _shifted_stack(truth).copy()
         rng = np.random.default_rng(0)
@@ -211,6 +215,32 @@ class TestSolveTranslationAccuracy:
         good = [1, 3, 4]
         err = np.abs(model.shifts[good] - truth[good]).max()
         assert err < 0.5, f"good frames drifted after a corrupt frame: {model.shifts}"
+        assert model.params["rejected_from_reference"] >= 1, (
+            "nothing was kept out of the reference, so this passed by luck rather "
+            "than by the outlier rejection it is meant to exercise")
+
+    def test_outlier_rejection_can_be_disabled(self):
+        """And with it off, the corrupt frame really does poison the reference —
+        which is what makes the test above non-vacuous."""
+        truth = np.array([[0, 0], [2, 1], [4, 2], [6, 3], [8, 4]], dtype=float)
+        stack = _shifted_stack(truth).copy()
+        rng = np.random.default_rng(0)
+        stack[2] = rng.standard_normal(stack.shape[1:]).astype(np.float32)
+        model = solve_translation(stack, device="numpy", upsample=8, max_shift=20,
+                                  reject_outliers=False)
+        assert model.params["rejected_from_reference"] == 0
+        good = [3, 4]
+        assert np.abs(model.shifts[good] - truth[good]).max() > 1.0, (
+            "the corrupt frame no longer poisons an unprotected reference — if the "
+            "solver became robust some other way, check deliberately")
+
+    def test_clean_stack_rejects_nothing(self):
+        """The rejection must not fire on ordinary frame-to-frame variation."""
+        truth = np.array([[0, 0], [1.5, 0.5], [3, 1], [4.5, 1.5], [6, 2]], float)
+        model = solve_translation(_shifted_stack(truth), device="numpy",
+                                  upsample=8, max_shift=20)
+        assert model.params["rejected_from_reference"] == 0
+        assert np.abs(model.shifts - truth).max() < GATE_PX
 
 
 class TestSolveTranslationGuards:

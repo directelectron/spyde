@@ -46,6 +46,58 @@ log = logging.getLogger(__name__)
 # the coarse peak. Matches skimage's `phase_cross_correlation` so the two agree.
 _UPSAMPLED_REGION_FACTOR = 1.5
 
+# Magnitude FLOOR for phase normalisation — NOT an additive epsilon.
+#
+# Pure phase correlation divides the cross-power spectrum by its own magnitude,
+# which is only meaningful where there is signal. Bins whose magnitude is
+# numerically zero must be left alone; dividing them by a tiny epsilon amplifies
+# rounding noise to UNIT magnitude, and since there are far more empty bins than
+# populated ones, that noise then dominates the inverse transform.
+#
+# This is not theoretical. With an additive `1e-12` the solver recovered the
+# synthetic particle movie's drift to 25 px (worse than not correcting at all)
+# as soon as apodisation was enabled — because windowing concentrates spectral
+# energy and pushes many more bins down into the numerical floor. With the floor
+# below it: 0.06 px. Matches skimage's `100 * finfo(float32).eps`.
+_PHASE_FLOOR = 100.0 * float(np.finfo(np.float32).eps)      # ~1.19e-5
+
+# A frame whose correlation peak is weaker than this fraction of the running
+# MEDIAN peak is kept out of the accumulated reference.
+#
+# The running-average reference exists to be robust to one bad frame, but folding
+# every frame in unconditionally does the opposite: a dropped / blanked / saturated
+# frame has a broadband spectrum, so after phase normalisation it contributes as
+# much to the reference as a good frame and drags every subsequent registration
+# with it. Measured on a 5-frame stack with one frame replaced by pure noise, the
+# two frames AFTER the bad one came back ~3.9 px wrong; with this rejection they
+# are correct and only the bad frame itself is wrong.
+#
+# Both constants come from measurement, not taste. Peak strength relative to the
+# running median, measured across four stacks:
+#
+#   worst NATURAL frame (clean sub-pixel stack, erratic peaks)   0.388
+#   a frame replaced by pure noise                              0.007
+#
+# So there is a ~50x gap to put a threshold in, and 0.25 sits inside it with margin
+# both ways. 0.5 was tried first and produced a FALSE rejection on the clean
+# sub-pixel stack — which is why this is not simply "half".
+#
+# _REJECT_MIN_SAMPLES is 1, not 3, and that is deliberate: a short stack cannot
+# afford a warm-up. On a 5-frame stack the bad frame arrives before three good ones
+# have been seen, so a 3-sample warm-up let it into the reference and the rule never
+# fired (measured: 0 rejections, and the two frames after it came back 3.9 px wrong).
+# With a 1-sample warm-up those two frames are recovered EXACTLY.
+#
+# The asymmetry justifies being aggressive: keeping a good frame OUT of the
+# reference only slows the averaging, while letting a bad frame IN corrupts every
+# registration after it. A rejected frame still gets its own shift reported.
+#
+# Windowing the median over the last N accepted frames was tried and made NO
+# difference at N=3, 5 or unbounded — the natural decay in peak strength as the
+# reference averages more frames is not steep enough to matter. Don't add it back.
+_REJECT_FRACTION = 0.25
+_REJECT_MIN_SAMPLES = 1
+
 
 # ── operator adapters ────────────────────────────────────────────────────────
 # The algorithm below is written once against this interface. `_TorchOps` is the
@@ -71,6 +123,9 @@ class _NumpyOps:
 
     def abs(self, a):
         return np.abs(a)
+
+    def clamp_min(self, a, floor):
+        return np.maximum(a, floor)
 
     def fftfreq(self, n):
         return np.fft.fftfreq(n).astype(np.float32)
@@ -127,6 +182,9 @@ class _TorchOps:
 
     def abs(self, a):
         return self._torch.abs(a)
+
+    def clamp_min(self, a, floor):
+        return self._torch.clamp(a, min=float(floor))
 
     def fftfreq(self, n):
         return self._torch.fft.fftfreq(n, device=self.device, dtype=self._torch.float32)
@@ -204,25 +262,51 @@ def _resolve_ops(device: str | None):
 
 # ── windows and masks (built once per solve) ──────────────────────────────────
 
-def _hann2d(ops, h: int, w: int):
-    """Separable Hann window.
+#: Default Tukey taper fraction. 0.25 tapers the outer ~12.5% at each edge and
+#: leaves the middle 75% at unit weight. See :func:`_taper2d` for why this is
+#: NOT 1.0 (a full Hann window).
+DEFAULT_TAPER_ALPHA = 0.25
 
-    Without apodisation a feature entering or leaving at the frame edge correlates
-    against the *border discontinuity* rather than the sample, which reads as a
-    spurious jump in the drift curve exactly when something interesting is moving
-    through the field of view.
+
+def _tukey1d(n: int, alpha: float) -> np.ndarray:
+    """Tukey (cosine-tapered) window. ``alpha=0`` rectangular, ``alpha=1`` Hann."""
+    if n < 2:
+        return np.ones(max(1, n), dtype=np.float32)
+    alpha = float(min(1.0, max(0.0, alpha)))
+    if alpha <= 0.0:
+        return np.ones(n, dtype=np.float32)
+    x = np.arange(n, dtype=np.float64) / (n - 1)
+    w = np.ones(n, dtype=np.float64)
+    lo = x < alpha / 2.0
+    hi = x > 1.0 - alpha / 2.0
+    w[lo] = 0.5 * (1.0 + np.cos(2.0 * np.pi / alpha * (x[lo] - alpha / 2.0)))
+    w[hi] = 0.5 * (1.0 + np.cos(2.0 * np.pi / alpha * (x[hi] - 1.0 + alpha / 2.0)))
+    return w.astype(np.float32)
+
+
+def _taper2d(ops, h: int, w: int, alpha: float):
+    """Separable Tukey taper, built in numpy once per solve then moved on-device.
+
+    **Why a Tukey taper and NOT a full Hann window.** Some apodisation is needed:
+    a feature entering or leaving at the frame edge otherwise correlates against
+    the *border discontinuity* rather than the sample. But a full Hann window
+    (``alpha=1``) reweights the entire frame, and once the drift is large the two
+    frames have different content under the taper — which manufactures a spurious
+    correlation peak that can outrank the true one.
+
+    Measured on the synthetic particle movie, frame 23 (true drift ``(6.0, 2.9)``):
+    with a full Hann window the strongest peak sits at ``(-19, 19)`` scoring 0.121
+    while the TRUE peak scores only 0.088, so the solve returns ``(-19.2, 18.6)``
+    — a 25 px error, worse than not correcting at all. **skimage's
+    ``phase_cross_correlation`` returns the same wrong answer on the same windowed
+    input**, so this is a property of full-frame windowing, not of either
+    implementation. Tapering only the outer edge leaves the interior comparable
+    between frames and recovers 0.06 px.
+
+    Do not "simplify" this back to a Hann window.
     """
-    n = ops.arange(h)
-    m = ops.arange(w)
-    wy = 0.5 - 0.5 * _cos(ops, 2.0 * math.pi * n / max(1, h - 1))
-    wx = 0.5 - 0.5 * _cos(ops, 2.0 * math.pi * m / max(1, w - 1))
-    return wy.reshape(h, 1) * wx.reshape(1, w)
-
-
-def _cos(ops, a):
-    if ops.name == "torch":
-        return ops._torch.cos(a)
-    return np.cos(a)
+    win = _tukey1d(h, alpha)[:, None] * _tukey1d(w, alpha)[None, :]
+    return ops.to_backend(win)
 
 
 def _shift_mask(ops, h: int, w: int, max_shift: float | None,
@@ -303,8 +387,8 @@ def _peak_shift(ops, ref_fft, mov_fft, mask, upsample: float,
         # Phase correlation proper: discard magnitude, keep only phase. Gives a
         # far sharper peak than plain cross-correlation on images whose spectra
         # are dominated by low frequencies, which every real micrograph is.
-        eps = 1e-12
-        product = product / (ops.abs(product) + eps)
+        # The divisor is FLOORED, not offset — see _PHASE_FLOOR.
+        product = product / ops.clamp_min(ops.abs(product), _PHASE_FLOOR)
 
     cc = ops.ifft2(product)
     mag = ops.abs(cc)
@@ -334,6 +418,21 @@ def _peak_shift(ops, ref_fft, mov_fft, mask, upsample: float,
     return dy, dx, sharpness
 
 
+def _accept_into_reference(sharpness: float, accepted: list[float],
+                           enabled: bool) -> bool:
+    """Whether this frame is credible enough to join the running reference.
+
+    Always True until there are :data:`_REJECT_MIN_SAMPLES` accepted frames to
+    take a median over — with nothing to compare against, rejecting would just be
+    guessing. See :data:`_REJECT_FRACTION`.
+    """
+    if not enabled or len(accepted) < _REJECT_MIN_SAMPLES:
+        return True
+    if not math.isfinite(sharpness):
+        return False
+    return sharpness >= _REJECT_FRACTION * float(np.median(accepted))
+
+
 def _phase_ramp(ops, h: int, w: int, dy: float, dx: float):
     """FFT multiplier that translates a frame by ``(dy, dx)`` exactly.
 
@@ -358,8 +457,9 @@ def solve_translation(
     max_shift: float | None = 32.0,
     min_shift: float | None = None,
     reference: str = "running",
-    apodize: bool = True,
+    apodize: bool | float = True,
     normalize: bool = True,
+    reject_outliers: bool = True,
     device: str | None = None,
     progress: Callable[[int, int], None] | None = None,
     cancel: Callable[[], bool] | None = None,
@@ -389,9 +489,17 @@ def solve_translation(
         (handles large excursions, accumulates error); ``"first"`` or
         ``"fixed:<i>"`` — one fixed reference frame.
     apodize
-        Apply a Hann window before transforming. See :func:`_hann2d`.
+        Edge taper before transforming. ``True`` uses a Tukey window with
+        ``alpha=DEFAULT_TAPER_ALPHA``; a float sets alpha explicitly
+        (``1.0`` = full Hann, which is a trap — see :func:`_taper2d`);
+        ``False`` disables it.
     normalize
         True phase correlation (unit-magnitude spectrum). Sharper peak.
+    reject_outliers
+        ``running`` mode only: keep a frame out of the accumulated reference when
+        its correlation peak is not credible (see :data:`_REJECT_FRACTION`). Its
+        own shift is still reported — only the reference is protected. This is
+        what makes "robust to one bad frame" true rather than aspirational.
     device
         ``None`` auto-selects CUDA/MPS then falls back to numpy; ``"numpy"``
         forces the reference path; or an explicit torch device string.
@@ -427,7 +535,9 @@ def solve_translation(
     # runs on a worker thread and per-frame acquire/release would be pure
     # overhead at thousands of frames.
     with accelerator_lock(ops.device):
-        window = _hann2d(ops, h, w) if apodize else None
+        alpha = (DEFAULT_TAPER_ALPHA if apodize is True
+                 else (0.0 if apodize is False else float(apodize)))
+        window = _taper2d(ops, h, w, alpha) if alpha > 0 else None
         mask = _shift_mask(ops, h, w, max_shift, min_shift)
 
         def frame_fft(i: int):
@@ -452,6 +562,8 @@ def solve_translation(
         ref_count = 1
         prev_fft = first         # sequential mode
         cumulative = np.zeros(2, dtype=np.float64)
+        accepted_sharp: list[float] = []   # peak strengths folded into the reference
+        rejected = 0
 
         if progress is not None:
             progress(1, n_frames)
@@ -471,12 +583,19 @@ def solve_translation(
             else:
                 dy, dx, s = _peak_shift(ops, ref_fft, mov, mask, upsample, normalize)
                 shifts[i] = (dy, dx)
-                if reference == "running":
+                if reference == "running" and _accept_into_reference(
+                        s, accepted_sharp, reject_outliers):
                     # Fold the ALIGNED frame in via a phase ramp — exact, and no
                     # resampling blur accumulates over the stack.
                     aligned = mov * _phase_ramp(ops, h, w, dy, dx)
                     ref_fft = (ref_fft * ref_count + aligned) / (ref_count + 1)
                     ref_count += 1
+                    accepted_sharp.append(s)
+                elif reference == "running":
+                    rejected += 1
+                    log.debug("[drift] frame %d kept out of the reference "
+                              "(peak %.2f vs median %.2f)", i, s,
+                              float(np.median(accepted_sharp)))
             sharp[i] = s
 
             if progress is not None:
@@ -487,8 +606,10 @@ def solve_translation(
         "max_shift": None if max_shift is None else float(max_shift),
         "min_shift": None if min_shift is None else float(min_shift),
         "reference": reference,
-        "apodize": bool(apodize),
+        "apodize": float(alpha),
         "normalize": bool(normalize),
+        "reject_outliers": bool(reject_outliers),
+        "rejected_from_reference": int(rejected),
         "backend": ops.name,
         "n_frames": int(n_frames),
         "frame_shape": [int(h), int(w)],

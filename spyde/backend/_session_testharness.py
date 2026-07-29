@@ -415,6 +415,51 @@ class TestHarnessMixin:
         s.set_signal_type("insitu")   # gates the Play/Fast Forward toolbar buttons
         self._add_signal(s, source_path="test_data_movie")
 
+    def _load_test_data_particles(self, payload: dict | None = None) -> None:
+        """The synthetic in-situ PARTICLE movie — the drift/segmentation fixture.
+
+        Wraps :func:`spyde.data.synthetic.particle_movie`, whose ground truth
+        (per-frame drift, particle radii, and the nucleation / dissolution / merge
+        frames) is stamped into ``metadata.Spyde.synthetic`` — so an e2e spec can
+        assert against the numbers the data was built from instead of a golden
+        screenshot. See DRIFT_AND_PARTICLES_PLAN.md step 0.
+
+        Loaded **lazy at one frame per chunk**, like ``load_test_data_movie`` and
+        like a real ``.mrc`` in-situ movie: each nav move is then a small cold read
+        of just that frame, which is the path a user actually drags.
+
+        Payload: ``{"frames": int, "size": [ny, nx], "eager": bool}``. ``eager``
+        keeps it in RAM, which skips the whole array-cache path — useful only for a
+        test that wants to isolate something else (an eager fixture is how
+        ``si_grains`` silently made a cache benchmark measure nothing).
+        """
+        import dask.array as da
+
+        from spyde.backend.heavy_imports import ensure_heavy_imports
+        from spyde.data.synthetic import particle_movie
+
+        # BEFORE set_signal_type: racing the startup prewarm's pyxem import
+        # partially initialises the module and the cast then silently fails,
+        # taking every gated toolbar action with it.
+        ensure_heavy_imports()
+
+        payload = payload or {}
+        n_frames = int(payload.get("frames", 24))
+        shape = tuple(payload.get("size", (96, 112)))
+
+        s = particle_movie(n_frames=n_frames, shape=shape)
+        if not payload.get("eager"):
+            eager = s.data
+            ny, nx = eager.shape[1:]
+            # `as_lazy()` carries the axes, the signal type AND the stamped ground
+            # truth across (metadata has no setter, so copying it by hand is not an
+            # option), then swap in the correctly-chunked array. Assigning `.data`
+            # rather than calling `.rechunk()` keeps this a graph construction over
+            # an array already in RAM — never a scheduler shuffle.
+            s = s.as_lazy()
+            s.data = da.from_array(eager, chunks=(1, ny, nx))
+        self._add_signal(s, source_path="test_data_particles")
+
     @staticmethod
     def _write_movie_mrc(frames) -> str:
         """Write ``frames`` as a minimal MRC2014 stack (mode 6 = uint16) into the
