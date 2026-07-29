@@ -612,6 +612,18 @@ They surface three ways:
   age, and a bright dot marks the current position so "now" is unambiguous —
   a bare fade leaves direction inferable only by close inspection of one track.
   N adjustable. One extra primitive per track.
+  > **A DEAD track must stop drawing its head dot.** Found by looking at a render:
+  > with a trailing window of N frames, a track that died at frame 16 was still
+  > painting a head dot at frame 18, because its trajectory still intersected the
+  > window. The dot means "the particle is HERE NOW", so on a dead track it is a
+  > lie — it reads as a real particle the segmenter has stopped filling. Either
+  > drop the head dot once a track has died and let the line fade out alone, or
+  > drop the whole trail at death. Same applies to a track inside its `memory` gap:
+  > it has no current position, so it gets no dot.
+- **Integer lanes are STEP plots.** The count lane is integer data; drawing it as a
+  straight interpolation between frames puts the visual transition half a frame
+  early and makes a nucleation look like it happened at 7 when the event is at 8.
+  Use `steps-post` for count, a plain line for continuous quantities like mean size.
 - **Kymograph (v1), user-sortable** — tracks × time as an image, one row per
   track, coloured by a chosen property. Row order is a control, not a constant,
   matching the table dock's mental model: **by birth time** the leading edge's
