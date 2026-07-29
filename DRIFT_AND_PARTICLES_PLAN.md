@@ -560,11 +560,34 @@ The floating strip (B0) mirrors the class colours for in-canvas switching.
 `scipy.optimize.linear_sum_assignment` on a cost matrix of centroid distance
 (gated by `max_dist`), optionally weighted by property similarity — trackpy's
 model, no new dependency. `memory=k` lets a track survive k frames of
-non-detection. Runs on drift-corrected coordinates, or raw minus `tree.drift`.
+non-detection.
 
-**C2. Events on the navigator — the headline.** The linker's unmatched rows and
-columns *are* the event stream: **birth** (nucleation), **death** (dissolution),
-**merge** (coalescence), **split** (fragmentation).
+To report trajectories in the sample frame, use **`DriftModel.to_sample_frame`,
+which ADDS the shifts**. An earlier draft of this plan said "raw minus
+`tree.drift`" — that is `to_lab_frame`, the inverse, and implementing it literally
+*doubles* the drift instead of removing it. That is precisely the sign trap
+`drift/model.py`'s docstring exists to warn about, and it got into the plan anyway;
+always go through the named methods rather than writing the arithmetic out.
+
+**Units:** `max_dist` is in the particles' **calibrated units** (nm), because the
+measured centroids are. `DriftModel` is in **pixels**. One function owns that
+seam (`sample_frame_positions`) — do not convert anywhere else. The caret must
+render the unit label beside the field or users will type pixels.
+
+**C2. Events on the navigator — the headline.** **birth** (nucleation), **death**
+(dissolution), **merge** (coalescence), **split** (fragmentation).
+
+Birth and death fall out of the assignment for free — an unmatched detection is a
+birth, an unmatched track is a death. **Merge and split do NOT**, and an earlier
+draft of this plan wrongly implied they did: a one-to-one assignment cannot
+represent two-to-one, so they need an explicit post-pass with its own radius
+parameter and its own failure modes. The implemented rule: a track that ends at
+`t-1` whose last position is within a merge radius of a track present in *both*
+`t-1` and `t` is a merge rather than a death (split is the mirror), with the radius
+defaulting to the particle's own `equiv_diameter` so a large body absorbs from
+further away. Merge/split **replace** the death/birth they explain, which gives the
+checkable invariant `Δcount = births + splits − deaths − merges` — verified to hold
+on every frame of the fixture.
 
 They surface three ways:
 
@@ -709,9 +732,31 @@ test** — not "it converged", not "the screenshot looks right".
 | B3 scribble | Matches the sklearn RandomForest reference on identical labels/features (IoU threshold) |
 | B3 sensitivity | Detects the faint low-contrast particles in `load_test_data_particles` — the §0.9 priority made measurable |
 | B5 measure | Matches `regionprops` on synthetic shapes; physical units correct under non-unit axis scale |
-| C1 link | Recovers known trajectories, births, deaths and the merge exactly |
+| C1 link | Recovers the known trajectories, births and deaths **exactly** (measured: mover is one track over all frames, 0.175 px max error; one birth at frame 8; one death at frame 16) |
+| C2 merge | Exactly one merge, involving both merge-pair tracks, coinciding with the frame the count drops. **NOT** asserted at a fixed frame — see below |
+| C1 gate | No link ever exceeds `max_dist`, at any `max_dist`; and `Δcount = births + splits − deaths − merges` on every frame |
 | Scale | A full run on thousands of 2048² frames completes in minutes without exceeding a fixed memory ceiling |
 | Perf | Every stage beats its §0.11 baseline, recorded in `benchmarks.md` |
+
+### Why the merge frame is not a fixed number
+
+The merge event's *frame* is a property of the **segmenter**, not the linker, and an
+acceptance gate demanding a specific frame would only be satisfiable by tuning the
+segmenter. Measured on the fixture, whose two merging discs first make geometric
+contact at frame 14:
+
+| | frame |
+|---|---|
+| discs' centres within `r₁+r₂` (geometric truth) | 14 |
+| segmenter resolves ONE region, watershed **on** | 18 |
+| segmenter resolves ONE region, watershed **off** | 12 |
+
+Watershed exists to split touching particles, so it correctly keeps them apart for
+four frames *past* first contact; without it the soft-edged tails connect two frames
+*before*. The truth is bracketed, `12 < 14 < 18`, on one boolean. So the gate asserts
+the invariants that genuinely belong to the linker — exactly one merge, the right two
+tracks, coinciding with the count drop — and a separate test asserts the bracketing,
+which is what proves the offset is a segmentation property rather than a linker bug.
 
 ## Verification standard
 
