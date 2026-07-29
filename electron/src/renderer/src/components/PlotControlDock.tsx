@@ -746,12 +746,34 @@ export function PlotControlDock() {
               />
               <button
                 data-testid="selector-crosshair"
-                style={s.mode === 'crosshair' ? styles.toggleActive : styles.toggle}
+                style={{
+                  ...(s.mode === 'crosshair' ? styles.toggleActive : styles.toggle),
+                  ...(s.sumFrames != null && s.mode === 'crosshair'
+                    ? styles.toggleJoined : {}),
+                }}
                 onClick={() => sendAction('set_selector_mode',
                   { integrate: false, selector_id: s.selectorId }, s.windowId)}
               >
                 ✛ Point
+                {/* The width, subtly, on the button itself — so you can see
+                    what the pointer is reading without opening anything. */}
+                {s.sumFrames != null && s.sumFrames > 1 && (
+                  <span style={styles.sumBadge}>{s.sumFrames}f</span>
+                )}
               </button>
+              {/* …and the picker hangs off it, a bare caret since the count is
+                  already on the button. */}
+              {s.sumFrames != null && s.mode === 'crosshair' && (
+                <Dropdown
+                  testid="selector-sum-frames"
+                  value={String(s.sumFrames ?? 1)}
+                  triggerText=""
+                  width={26}
+                  options={sumFrameOptions(s.navSize ?? 0, s.navScale ?? 0)}
+                  onChange={(v) => sendAction('set_selector_sum',
+                    { frames: Number(v), selector_id: s.selectorId }, s.windowId)}
+                />
+              )}
               <button
                 data-testid="selector-integrate"
                 style={s.mode === 'integrate' ? styles.toggleActive : styles.toggle}
@@ -762,25 +784,6 @@ export function PlotControlDock() {
               </button>
             </div>
           ))}
-          {/* Sum N frames under a POINT selector. Distinct from Integrate:
-              that gives you a draggable span with two edges to place; this
-              keeps the single pointer and widens what it reads — n frames of
-              a movie summed for signal, or the exposure of a sparse event
-              stream, without turning the slider into a range. Only offered
-              for a 1-D navigator (the backend omits sumFrames otherwise). */}
-          {navSelectors.filter((s) => s.sumFrames != null && s.mode === 'crosshair')
-            .map((s) => (
-              <div key={`sum-${s.selectorId ?? s.windowId}`} style={styles.sumRow}>
-                <span style={styles.sumLabel}>Sum frames</span>
-                <Dropdown
-                  testid="selector-sum-frames"
-                  value={String(s.sumFrames ?? 1)}
-                  options={sumFrameOptions(s.navSize ?? 0, s.navScale ?? 0)}
-                  onChange={(v) => sendAction('set_selector_sum',
-                    { frames: Number(v), selector_id: s.selectorId }, s.windowId)}
-                />
-              </div>
-            ))}
         </div>
       )}
       </div>
@@ -810,10 +813,15 @@ function sumFrameOptions(navSize: number, navScale: number) {
 }
 
 const styles: Record<string, React.CSSProperties> = {
-  sumRow: {
-    display: 'flex', alignItems: 'center', gap: 8, marginTop: 6,
+  // Square off the Point button's right edge so the picker reads as attached
+  // to it rather than as a third control in the row.
+  toggleJoined: {
+    borderTopRightRadius: 0, borderBottomRightRadius: 0, marginRight: -1,
   },
-  sumLabel: { fontSize: 11.5, color: '#a6adc8', flex: '0 0 auto' },
+  sumBadge: {
+    marginLeft: 6, fontSize: 10, fontWeight: 600, opacity: 0.62,
+    fontVariantNumeric: 'tabular-nums',
+  },
   dock: {
     width: 300, flexShrink: 0,
     height: '100%',

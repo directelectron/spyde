@@ -504,9 +504,12 @@ class Session(
         try:
             sel.sum_frames = max(1, int(frames))
             # Re-read at the new width immediately; the pointer has not moved,
-            # so nothing else would trigger it.
+            # so nothing else would trigger it. update_data() takes no `force`
+            # — passing one raised, and since the raise happened BEFORE the
+            # emit below, the width applied but the dock never heard about it
+            # and its badge kept reading the old value.
             if hasattr(sel, "update_data"):
-                sel.update_data(force=True)
+                sel.update_data()
             emit({
                 "type": "selector_info",
                 "window_id": window_id,

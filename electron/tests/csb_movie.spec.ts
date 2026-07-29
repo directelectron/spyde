@@ -134,6 +134,13 @@ test('Sum frames widens the point selector without moving it', async () => {
     timeout: 60_000,
     message: 'summing 8 frames did not change the image',
   }).not.toBe(one)
+
+  // The button must REPORT the width back. The image changing is not enough:
+  // the backend applied the width fine while its confirming emit raised and
+  // was swallowed, so the pointer read 8 frames and the button still said 1.
+  await expect(page.getByTestId('selector-crosshair'),
+    'the Point button does not show the width it is reading')
+    .toContainText('8f')
   await page.screenshot({ path: `${SHOTS}/10-summed-8.png` })
   await sigWindow(page).screenshot({ path: `${SHOTS}/11-summed-plane.png` })
   ctx.assertNoJsErrors()
