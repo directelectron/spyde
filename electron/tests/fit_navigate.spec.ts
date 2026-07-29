@@ -77,7 +77,24 @@ test('the overlaid model follows the navigator after a scan fit', async () => {
     }
     const cross = await navCrosshair()
 
+    /** Signature of the SPECTRUM on the signal plot — changes when the
+     *  navigator actually lands on a different position. */
+    const dataSig = async () => page.evaluate((f) => {
+      const hook = (window as any)._spyde_test_panel_json
+      for (const raw of hook ? hook(f) : []) {
+        const d = JSON.parse(raw)
+        if (!d.data_b64) continue
+        const bin = atob(d.data_b64)
+        const bytes = new Uint8Array(bin.length)
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+        const v = Array.from(new Float64Array(bytes.buffer))
+        return `${v.length}:${v[0]}:${v[v.length >> 1]}:${v[v.length - 1]}`
+      }
+      return ''
+    }, figIds.sig)
+
     const goTo = async (cx: number, cy: number) => {
+      const before = await dataSig()
       await page.evaluate(({ f, panel, id, x, y }) => {
         window.postMessage({
           type: 'awi_event', figId: f,
@@ -87,7 +104,16 @@ test('the overlaid model follows the navigator after a scan fit', async () => {
           }),
         }, '*')
       }, { f: figIds.nav, panel: cross.panel_id, id: cross.id, x: cx, y: cy })
-      await page.waitForTimeout(2_500)
+      // Confirm the navigator LANDED before reading anything, instead of
+      // assuming 2.5s was enough. When it was not, the caret never showed the
+      // new position and the reads below compared a position against itself —
+      // "the model stayed IDENTICAL at two different navigator positions",
+      // which is a moved-too-early failure, not a stale-fit one.
+      const deadline = Date.now() + 60_000
+      while (Date.now() < deadline) {
+        await page.waitForTimeout(100)
+        if ((await dataSig()) !== before) break
+      }
     }
 
     const readModel = async () => {
