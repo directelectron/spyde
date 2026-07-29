@@ -195,6 +195,11 @@ export interface SelectorInfo {
   /** Seconds per navigation position (0 when the axis isn't time), so a
    *  summed window can be labelled with the rate it works out to. */
   navScale?: number
+  /** Raw camera frames integrated into ONE navigation position, when the
+   *  source streams finer than it was loaded at (a CSB event stream). Its
+   *  presence is what lets the width ladder go BELOW one position to a single
+   *  raw frame; absent for an ordinary movie, where nothing lies underneath. */
+  rawPerPlane?: number
 }
 /** The named navigators a navigator window offers (its top chip strip). */
 export interface NavigatorOptions { names: string[]; current?: string | null }
@@ -1254,6 +1259,8 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
               ...(msg.nav_size != null ? { navSize: Number(msg.nav_size) } : {}),
               ...(msg.nav_scale != null
                 ? { navScale: Number(msg.nav_scale) } : {}),
+              ...(msg.raw_per_plane != null
+                ? { rawPerPlane: Number(msg.raw_per_plane) } : {}),
             },
           })
           break

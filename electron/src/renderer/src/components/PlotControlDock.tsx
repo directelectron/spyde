@@ -770,6 +770,10 @@ export function PlotControlDock() {
                   ✛ Point
                   {/* The width, subtly, so you can see what the pointer is
                       reading without opening the menu. */}
+                  {/* 0 is raw — a single camera frame, below one position. */}
+                  {s.sumFrames === 0 && (
+                    <span style={styles.sumBadge}>raw</span>
+                  )}
                   {s.sumFrames != null && s.sumFrames > 1 && (
                     <span style={styles.sumBadge}>{s.sumFrames}f</span>
                   )}
@@ -781,7 +785,8 @@ export function PlotControlDock() {
                     triggerText=""
                     bare
                     caretColor={s.mode === 'crosshair' ? '#11111b' : '#6c7086'}
-                    options={sumFrameOptions(s.navSize ?? 0, s.navScale ?? 0)}
+                    options={sumFrameOptions(s.navSize ?? 0, s.navScale ?? 0,
+                                             s.rawPerPlane ?? 0)}
                     onChange={(v) => sendAction('set_selector_sum',
                       { frames: Number(v), selector_id: s.selectorId }, s.windowId)}
                   />
@@ -811,8 +816,19 @@ export function PlotControlDock() {
  *  silently rounds to 43 frames, so the number you picked is not the number
  *  you got. A frame count is always exact, and the rate it produces is shown
  *  beside it when the axis is time. */
-function sumFrameOptions(navSize: number, navScale: number) {
+function sumFrameOptions(navSize: number, navScale: number, rawPerPlane = 0) {
   const opts: { value: string; label: string }[] = []
+  // Below one position, when the source streams finer than it was loaded at.
+  // A .csb arrives as integrated planes because one raw 390 us frame of an
+  // 8192^2 detector is ~0.5% occupied and mostly noise — the right default to
+  // look at, but it hides what the format is actually streaming. "0" is the
+  // wire value for raw (every real width is >= 1 position).
+  if (rawPerPlane > 1) {
+    const raw = navScale > 0 ? (rawPerPlane / navScale) : 0
+    const hz = raw >= 1000 ? `${(raw / 1000).toFixed(1)} kfps`
+      : raw >= 1 ? `${raw.toFixed(0)} fps` : ''
+    opts.push({ value: '0', label: hz ? `1 raw frame — ${hz}` : '1 raw frame' })
+  }
   for (let n = 1; n <= Math.max(1, navSize); n *= 2) {
     const rate = navScale > 0 ? 1 / (n * navScale) : 0
     const hz = rate >= 1000 ? `${(rate / 1000).toFixed(1)} kfps`

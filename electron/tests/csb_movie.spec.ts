@@ -170,3 +170,41 @@ test('To Frames adds an in-situ dataset to the signal tree', async () => {
   await page.screenshot({ path: `${SHOTS}/08-to-frames-result.png` })
   ctx.assertNoJsErrors()
 })
+
+test('the Point width can drop BELOW a plane to one raw camera frame', async () => {
+  const { page } = ctx
+  await backendAction(page, 'test_nav_drag', { targets: [[25, 0]] })
+  const dd = page.getByTestId('selector-sum-frames')
+  await expect(dd).toBeVisible({ timeout: 30_000 })
+
+  // Back to one plane first, so the comparison is plane-vs-raw.
+  await dd.click()
+  await page.getByTestId('selector-sum-frames-opt-1').click()
+  await page.waitForTimeout(2_000)
+  const plane = await planeSignature(page)
+
+  // The raw option only exists when the source streams finer than it loaded.
+  await dd.click()
+  const rawOpt = page.getByTestId('selector-sum-frames-opt-0')
+  await expect(rawOpt, 'no raw-frame option on a CSB stream').toBeVisible()
+  await expect(rawOpt).toContainText(/raw frame/)
+  await rawOpt.click()
+
+  await expect.poll(() => planeSignature(page), {
+    timeout: 60_000,
+    message: 'one raw frame looks identical to the 8-frame plane',
+  }).not.toBe(plane)
+
+  // And the button says which it is reading.
+  await expect(page.getByTestId('selector-crosshair')).toContainText('raw')
+  await page.screenshot({ path: `${SHOTS}/12-raw-frame.png` })
+  await sigWindow(page).screenshot({ path: `${SHOTS}/13-raw-frame-plane.png` })
+
+  // Going back to a plane restores the integrated view.
+  await dd.click()
+  await page.getByTestId('selector-sum-frames-opt-1').click()
+  await expect.poll(() => planeSignature(page), {
+    timeout: 60_000, message: 'leaving raw mode did not restore the plane',
+  }).toBe(plane)
+  ctx.assertNoJsErrors()
+})

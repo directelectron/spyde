@@ -502,7 +502,14 @@ class Session(
         if sel is None or not hasattr(sel, "sum_frames"):
             return
         try:
-            sel.sum_frames = max(1, int(frames))
+            from spyde.actions import csb_raw_frame
+            # 0 means "go BELOW a plane" — show one raw camera frame. It is a
+            # different integration, not a slice of the loaded plane stack, so
+            # it swaps the selector's producer rather than widening the window.
+            # The width itself stays 1: raw is a single frame by definition.
+            raw = int(frames) == csb_raw_frame.RAW
+            csb_raw_frame.install(sel, raw)
+            sel.sum_frames = 1 if raw else max(1, int(frames))
             # Re-read at the new width immediately; the pointer has not moved,
             # so nothing else would trigger it. update_data() takes no `force`
             # — passing one raised, and since the raise happened BEFORE the
@@ -515,7 +522,7 @@ class Session(
                 "window_id": window_id,
                 "selector_id": id(sel),
                 "color": getattr(sel, "color", None),
-                "sum_frames": int(sel.sum_frames),
+                "sum_frames": csb_raw_frame.RAW if raw else int(sel.sum_frames),
             })
         except Exception as e:
             log.warning("set_selector_sum failed: %s", e)
