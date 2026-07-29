@@ -6,7 +6,12 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    # Long-lived INTEGRATION branches too, not just main. `feat/0.3.0` collects
+    # a whole release, and with `[main]` alone a PR into it ran no tests at all
+    # — #82 through #88 each landed a wave that way, and the matrix first saw
+    # them only when 0.3.0 itself went at main. A PR whose checks are green
+    # because nothing ran is worse than a red one.
+    branches: [main, "feat/[0-9]*"]
 
 concurrency:
   group: build-${{ github.ref }}

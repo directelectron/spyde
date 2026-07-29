@@ -71,13 +71,49 @@ class InfiniteLineSelector(BaseSelector):
     def _on_pointer_up(self, event):
         self.update_data()
 
+    #: How many consecutive navigation positions this point sums. 1 is a plain
+    #: crosshair; >1 keeps the single pointer but reads a window around it.
+    #:
+    #: This is NOT the same thing as Integrate. Integrate hands you a draggable
+    #: span with two edges to place; this keeps one pointer and gives it a
+    #: width, which is what you want when the exposure is a property of the
+    #: acquisition rather than a region you are choosing — summing n frames of
+    #: an in-situ movie for signal, or picking the exposure of a sparse event
+    #: stream (1 raw frame vs 8) without turning the slider into a range.
+    #:
+    #: Downstream this needs no special path at all: emitting n index rows is
+    #: exactly what a region selector emits, so the existing region-integration
+    #: machinery (array_cache, region_sum's threaded bands and incremental +-1)
+    #: handles it unchanged.
+    sum_frames: int = 1
+
     def _get_selected_indices(self) -> np.ndarray:
         if self._widget is None:
             return np.array([[0]])
         scale, offset = _signal_axis(self)
         pos = float(self._widget.x)
         index = int(round((pos - offset) / scale))
-        return np.array([[index]])
+        n = max(1, int(getattr(self, "sum_frames", 1) or 1))
+        if n == 1:
+            return np.array([[index]])
+        # Centre the window on the pointer, then SLIDE it to stay in range
+        # rather than letting the clip in _get_selected_indices_and_clip fold
+        # it — a clipped window would sum the edge frame several times and
+        # quietly report a brighter first/last position than the rest.
+        size = self._nav_size()
+        n = min(n, size) if size else n
+        start = index - n // 2
+        if size:
+            start = max(0, min(start, size - n))
+        return np.arange(start, start + n, dtype=int).reshape(-1, 1)
+
+    def _nav_size(self) -> int:
+        """Length of the navigation axis this selector indexes, or 0."""
+        try:
+            return int(self.current_plot.plot_state.current_signal
+                       .axes_manager.signal_axes[0].size)
+        except Exception:
+            return 0
 
     def translate_pixels(self, shift_x: int) -> None:
         if self._widget is not None:
@@ -380,6 +416,22 @@ class IntegratingSelector1D(IntegratingSelectorMixin):
                 plot1d._push()
         except Exception as e:
             logger.debug("pushing 1-D panel overlay state failed: %s", e)
+
+    @property
+    def sum_frames(self) -> int:
+        """How many positions the POINT sub-selector sums.
+
+        An explicit property, not left to ``__getattr__``: that only delegates
+        READS of undefined attributes, so a plain ``composite.sum_frames = 8``
+        would bind on the composite and the inner line selector — the one that
+        actually computes the indices — would keep its default of 1. Silently:
+        the attribute reads back as 8 and nothing sums.
+        """
+        return int(getattr(self._inf_line_selector, "sum_frames", 1) or 1)
+
+    @sum_frames.setter
+    def sum_frames(self, n) -> None:
+        self._inf_line_selector.sum_frames = max(1, int(n or 1))
 
     def __getattr__(self, name):
         """Delegate undefined attributes to the active sub-selector."""

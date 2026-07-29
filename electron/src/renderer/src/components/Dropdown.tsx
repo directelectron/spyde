@@ -17,12 +17,26 @@
  */
 import React from 'react'
 
-export function Dropdown<T extends string>({ value, options, onChange, testid, width }: {
+export function Dropdown<T extends string>({
+  value, options, onChange, testid, width, triggerText, bare, caretColor,
+}: {
   value: T
   options: readonly { value: T; label: string }[]
   onChange: (v: T) => void
   testid: string
   width?: number | string
+  /** Override what the TRIGGER shows, while the menu keeps the full labels.
+   *  For a dropdown attached to another control, where the selection is
+   *  already displayed beside it and repeating the whole label would just be
+   *  noise — pass '' for a bare caret. */
+  triggerText?: string
+  /** Drop the trigger's own border and background so it can sit INSIDE
+   *  another control as a caret. Buttons cannot nest, so a split control has
+   *  to be a styled wrapper around two siblings — this makes the second one
+   *  disappear into it. `caretColor` keeps the caret legible on whatever the
+   *  wrapper's background is. */
+  bare?: boolean
+  caretColor?: string
 }) {
   const [open, setOpen] = React.useState(false)
   // Auto drop-UP when the menu would clip the bottom of the window (e.g. the
@@ -60,11 +74,21 @@ export function Dropdown<T extends string>({ value, options, onChange, testid, w
       <button
         type="button" data-testid={testid} data-value={value}
         aria-haspopup="listbox" aria-expanded={open}
-        style={{ ...S.trigger, ...(open ? S.triggerOpen : {}) }}
+        style={{
+          ...S.trigger,
+          ...(open && !bare ? S.triggerOpen : {}),
+          ...(bare ? S.triggerBare : {}),
+        }}
         onClick={toggle}
       >
-        <span style={S.triggerLabel}>{current?.label ?? String(value)}</span>
-        <span style={S.caret}>▾</span>
+        {triggerText !== '' && (
+          <span style={S.triggerLabel}>
+            {triggerText ?? current?.label ?? String(value)}
+          </span>
+        )}
+        <span style={{ ...S.caret, ...(caretColor ? { color: caretColor } : {}) }}>
+          ▾
+        </span>
       </button>
       {open && (
         <div role="listbox"
@@ -102,6 +126,10 @@ const S: Record<string, React.CSSProperties> = {
     textAlign: 'left',
   },
   triggerOpen: { borderColor: '#45475a', background: '#181825' },
+  triggerBare: {
+    background: 'transparent', border: 'none', padding: '0 5px 0 2px',
+    width: 'auto',
+  },
   triggerLabel: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
   caret: { fontSize: 9, color: '#6c7086', flex: '0 0 auto' },
   // The panel is a copy of MenuBar's `styles.dropdown` / `styles.item`.

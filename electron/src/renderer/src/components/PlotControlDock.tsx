@@ -629,14 +629,54 @@ export function PlotControlDock() {
                 style={{ ...styles.selectorDot, background: s.color ?? '#00e676' }}
                 title={s.title ?? 'Navigator'}
               />
-              <button
-                data-testid="selector-crosshair"
-                style={s.mode === 'crosshair' ? styles.toggleActive : styles.toggle}
-                onClick={() => sendAction('set_selector_mode',
-                  { integrate: false, selector_id: s.selectorId }, s.windowId)}
-              >
-                ✛ Point
-              </button>
+              {/* Point is a SPLIT control: the button picks the mode, and a
+                  caret at its right edge opens the frame-width menu. It has to
+                  be a styled wrapper around two siblings rather than a caret
+                  nested in the button, because buttons cannot contain buttons
+                  — so the wrapper carries the active/inactive look and both
+                  children are transparent inside it. */}
+              <div style={{
+                ...(s.mode === 'crosshair' ? styles.toggleActive : styles.toggle),
+                ...styles.splitWrap,
+              }}>
+                <button
+                  data-testid="selector-crosshair"
+                  style={{
+                    ...styles.splitMain,
+                    // Explicit, not inherited: a <button> does not take the
+                    // parent's colour from the UA stylesheet, and the `font`
+                    // shorthand in an inline style wiped the label entirely.
+                    color: s.mode === 'crosshair' ? '#11111b' : '#a6adc8',
+                    fontWeight: s.mode === 'crosshair' ? 600 : 400,
+                  }}
+                  onClick={() => sendAction('set_selector_mode',
+                    { integrate: false, selector_id: s.selectorId }, s.windowId)}
+                >
+                  ✛ Point
+                  {/* The width, subtly, so you can see what the pointer is
+                      reading without opening the menu. */}
+                  {/* 0 is raw — a single camera frame, below one position. */}
+                  {s.sumFrames === 0 && (
+                    <span style={styles.sumBadge}>raw</span>
+                  )}
+                  {s.sumFrames != null && s.sumFrames > 1 && (
+                    <span style={styles.sumBadge}>{s.sumFrames}f</span>
+                  )}
+                </button>
+                {s.sumFrames != null && s.mode === 'crosshair' && (
+                  <Dropdown
+                    testid="selector-sum-frames"
+                    value={String(s.sumFrames ?? 1)}
+                    triggerText=""
+                    bare
+                    caretColor={s.mode === 'crosshair' ? '#11111b' : '#6c7086'}
+                    options={sumFrameOptions(s.navSize ?? 0, s.navScale ?? 0,
+                                             s.rawPerPlane ?? 0)}
+                    onChange={(v) => sendAction('set_selector_sum',
+                      { frames: Number(v), selector_id: s.selectorId }, s.windowId)}
+                  />
+                )}
+              </div>
               <button
                 data-testid="selector-integrate"
                 style={s.mode === 'integrate' ? styles.toggleActive : styles.toggle}
@@ -653,7 +693,53 @@ export function PlotControlDock() {
   )
 }
 
+/** The Sum-frames ladder: powers of two up to the navigation length.
+ *
+ *  Powers of two rather than round frame rates because a rate cannot generally
+ *  divide the acquisition cadence — asking for "60 fps" on a 2564 fps camera
+ *  silently rounds to 43 frames, so the number you picked is not the number
+ *  you got. A frame count is always exact, and the rate it produces is shown
+ *  beside it when the axis is time. */
+function sumFrameOptions(navSize: number, navScale: number, rawPerPlane = 0) {
+  const opts: { value: string; label: string }[] = []
+  // Below one position, when the source streams finer than it was loaded at.
+  // A .csb arrives as integrated planes because one raw 390 us frame of an
+  // 8192^2 detector is ~0.5% occupied and mostly noise — the right default to
+  // look at, but it hides what the format is actually streaming. "0" is the
+  // wire value for raw (every real width is >= 1 position).
+  if (rawPerPlane > 1) {
+    const raw = navScale > 0 ? (rawPerPlane / navScale) : 0
+    const hz = raw >= 1000 ? `${(raw / 1000).toFixed(1)} kfps`
+      : raw >= 1 ? `${raw.toFixed(0)} fps` : ''
+    opts.push({ value: '0', label: hz ? `1 raw frame — ${hz}` : '1 raw frame' })
+  }
+  for (let n = 1; n <= Math.max(1, navSize); n *= 2) {
+    const rate = navScale > 0 ? 1 / (n * navScale) : 0
+    const hz = rate >= 1000 ? `${(rate / 1000).toFixed(1)} kfps`
+      : rate >= 1 ? `${rate.toFixed(0)} fps`
+        : rate > 0 ? `${rate.toFixed(2)} fps` : ''
+    const frames = n === 1 ? '1 frame' : `${n} frames`
+    opts.push({ value: String(n), label: hz ? `${frames} — ${hz}` : frames })
+    if (n >= 64) break
+  }
+  return opts
+}
+
 const styles: Record<string, React.CSSProperties> = {
+  // The wrapper owns the button's look; the children sit transparently in it.
+  // NO overflow:hidden — the caret's menu is absolutely positioned inside this
+  // wrapper, so clipping it renders the options in the DOM but never visible.
+  splitWrap: {
+    display: 'flex', alignItems: 'center', padding: 0,
+  },
+  splitMain: {
+    flex: 1, background: 'transparent', border: 'none', fontSize: 11,
+    padding: '4px 2px 4px 6px', cursor: 'pointer', textAlign: 'center',
+  },
+  sumBadge: {
+    marginLeft: 6, fontSize: 10, fontWeight: 600, opacity: 0.62,
+    fontVariantNumeric: 'tabular-nums',
+  },
   dock: {
     width: 300, flexShrink: 0,
     height: '100%',

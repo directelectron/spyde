@@ -16,14 +16,21 @@ Modules:
 * :mod:`~spyde.external.rosettasciio.tiff` — home for the per-page lazy TIFF
   chunking patch (rsciio's lazy TIFF returns ONE monolithic chunk). Currently a
   documented no-op in this branch — see the module docstring.
+* :mod:`~spyde.external.rosettasciio.csb_format` — ADDS a format rather than
+  patching one: registers the Direct Electron ``.csb`` centroid-stream reader
+  (:mod:`spyde.external.rsciio_csb`, written as a drop-in rsciio plugin) so
+  ``hs.load`` dispatches ``.csb`` to it. Deleted when that plugin lands in
+  rosettasciio proper.
 """
 from __future__ import annotations
 
 from spyde.external import register
+from spyde.external.rosettasciio.csb_format import apply as _apply_csb
 from spyde.external.rosettasciio.mrc import apply as _apply_mrc
 from spyde.external.rosettasciio.tiff import apply as _apply_tiff
 
 register("rosettasciio", _apply_mrc)
 register("rosettasciio", _apply_tiff)
+register("rosettasciio", _apply_csb)
 
-__all__ = ["_apply_mrc", "_apply_tiff"]
+__all__ = ["_apply_mrc", "_apply_tiff", "_apply_csb"]
