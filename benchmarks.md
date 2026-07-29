@@ -769,3 +769,62 @@ each frame pays a host→device transfer that a batched formulation would amorti
 That is the accepted trade for the Memory-Safety rule (a 3000 × 4096² movie is
 tens of GB and cannot be batched wholesale). If the transfer ever dominates, the
 fix is a bounded read-ahead of a few frames, not materialising the stack.
+
+### Apodisation and reference robustness -- two traps the fixture found (2026-07-29)
+
+Both found by `spyde.data.synthetic.particle_movie` on its FIRST run, which is the
+argument for building a ground-truth fixture before the thing it grades.
+
+**A full Hann window destroys the registration.** Synthetic movie, true drift at
+frame 23 = `(6.0, 2.9)` px:
+
+| taper alpha | max error over 24 frames |
+|---|---|
+| 0.00 (none) | 0.125 px |
+| 0.10 | 0.125 px |
+| **0.25 (default)** | **0.124 px** |
+| 0.50 | 0.227 px |
+| 1.00 (full Hann) | **25.25 px** |
+
+At alpha=1 the strongest correlation peak sits at `(-19, 19)` scoring 0.121 while
+the TRUE peak scores 0.088. **skimage's `phase_cross_correlation` returns the same
+wrong answer on the same windowed input**, so this is a property of full-frame
+windowing, not of either implementation: once the drift is large the window
+reweights different content in each frame. `max_shift=20` does not save you -- the
+false peak is inside the band. Taper the EDGE only.
+
+**The running reference needed explicit outlier rejection.** Peak strength relative
+to the running median:
+
+| case | ratio |
+|---|---|
+| worst NATURAL frame (clean sub-pixel stack) | 0.388 |
+| a frame replaced by pure noise | 0.007 |
+
+A ~50x gap, so the threshold is 0.25. Without rejection, one noise frame in a
+5-frame stack dragged the two frames AFTER it 3.9 px off. With it, those two are
+recovered exactly and only the bad frame is wrong. Two settings that did not
+survive measurement: a 3-sample warm-up (too slow -- the bad frame is already in
+the reference on a short stack) and windowing the median over the last N accepted
+(no difference at N=3, 5 or unbounded).
+
+### Fixture + classical segmentation cost (2026-07-29)
+
+| stage | time | note |
+|---|---|---|
+| build fixture (24 x 96x112) | 98 ms | eager, deterministic |
+| drift solve, 24 frames | 32 ms | 0.124 px max error |
+| `segment_frame`, one 96x112 frame | 3.7 ms | 272 frames/s |
+| `measure_frame`, one 96x112 frame | 13.7 ms | 73 frames/s |
+| combined | 17.4 ms | 58 frames/s |
+
+**`measure_frame` is 3.7x the cost of `segment_frame`, which is the wrong way
+round and is the thing to watch.** Segmentation is vectorised over pixels;
+measurement still loops over PARTICLES to crop each bbox for the intensity ring and
+to trace each contour. At 3000 frames of this size that is 52 s -- fine -- but the
+plan's target frames are 2048-4096 square, and the loop cost grows with particle
+count as well as pixels. If the combined figure misses the "minutes" target at real
+scale, `measure_frame` is where to look first, not the segmenter.
+
+Regenerate all of the above with `python scripts/bench_drift_particles.py`.
+Verify the whole feature with `python scripts/verify_drift_particles.py --all`.
