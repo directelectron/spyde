@@ -946,6 +946,13 @@ class FitWizard(WizardController):
         one per fit stacked identical-looking windows with no way to tell which
         was current; and creating it only when a fit finished meant there was
         nothing to watch fill in.
+
+        It is titled "(live)" to separate it from the snapshot commit() keeps.
+        Both used to be "Fit components", which is the same
+        no-way-to-tell-which-is-which problem one paragraph up — after a
+        commit the user had two identical titles side by side, and
+        fit_wizard.spec.ts could not target either (its locator matched both
+        and failed strict mode).
         """
         maps = self.result_maps()
         if not maps:
@@ -965,14 +972,19 @@ class FitWizard(WizardController):
                 self.session._close_tree(tree)
             except Exception as e:
                 log.debug("closing the previous maps window failed: %s", e)
-        self._maps_tree = self._open_maps(maps)
+        self._maps_tree = self._open_maps(maps, self.LIVE_MAPS_TITLE)
         self._maps_labels = labels
         return self._maps_tree
 
-    def _open_maps(self, maps):
+    #: The caret's live maps window, refreshed in place as positions fit.
+    LIVE_MAPS_TITLE = "Fit components (live)"
+    #: The snapshot commit() keeps. Plain name: it is the one that persists.
+    COMMITTED_MAPS_TITLE = "Fit components"
+
+    def _open_maps(self, maps, title: str = COMMITTED_MAPS_TITLE):
         names = list(maps)
         return commit_result_tree(
-            self.session, title="Fit components",
+            self.session, title=title,
             primary=maps[names[0]], primary_label=names[0],
             views=[(n, maps[n]) for n in names[1:]],
             levels=None, cmap="viridis",

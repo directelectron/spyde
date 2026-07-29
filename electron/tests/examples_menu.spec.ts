@@ -138,5 +138,16 @@ test('Show Example Data Directory reports a real path', async () => {
     (l: string) => l.includes('revealing example data directory'))
   expect(line, 'the backend never reported the directory').toBeTruthy()
   expect(line).toContain('em_database')
+
+  // …and that the path actually reached the MAIN process, which is the half
+  // the backend log cannot see. The harness sets SPYDE_NO_SHELL_OPEN so main
+  // logs the resolved directory instead of handing it to the desktop — on a
+  // headless runner xdg-open has no file manager to reach and left the app
+  // unable to exit, so this test's afterAll timed out for 120s on app.close()
+  // even though the assertion above had already passed.
+  await backend.waitForLog('open-path (suppressed)', 20_000)
+  const mainLine = backend.logBuffer.find(
+    (l: string) => l.includes('open-path (suppressed)'))
+  expect(mainLine, 'the main process never received the path').toContain('em_database')
   ctx.assertNoJsErrors()
 })

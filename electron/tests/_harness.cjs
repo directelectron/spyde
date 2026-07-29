@@ -61,6 +61,11 @@ async function launchApp(opts = {}) {
       // Only mint a scratch dir if the spec didn't bring its own — otherwise
       // every first_run launch would also leave an unused one behind.
       ...(env.SPYDE_SETTINGS_DIR ? {} : { SPYDE_SETTINGS_DIR: _seenSettingsDir() }),
+      // Never hand a path to the desktop from a test. On a headless runner
+      // xdg-open has no file manager to reach and leaves the app unable to
+      // exit — examples_menu's afterAll timed out for 120s on app.close().
+      // See the open-path handler in src/main/index.ts.
+      SPYDE_NO_SHELL_OPEN: '1',
       ...env,
     },
   })

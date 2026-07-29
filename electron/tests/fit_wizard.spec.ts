@@ -155,8 +155,22 @@ test('Fit caret: build a model, run it, commit component maps', async () => {
     await page.waitForTimeout(2_500)
     // The committed window carries one chip per component — the same
     // click-one / cmd-click-to-tile toggle the strain components use (#58).
-    await expect(page.getByTestId('subwindow').filter({ hasText: 'Fit components' }))
-      .toBeVisible({ timeout: 20_000 })
+    //
+    // Match the BREADCRUMB, anchored. Two maps windows exist by design — the
+    // caret's live one (refreshed as positions fit) and this snapshot — and
+    // `filter({hasText})` is a substring match over the whole subwindow, so
+    // the old locator matched both and failed strict mode. `$` is what
+    // separates "Fit components" from "Fit components (live)".
+    const committed = page.getByTestId('subwindow').filter({
+      has: page.getByTestId('window-breadcrumb').filter({ hasText: /Fit components$/ }),
+    })
+    await expect(committed).toBeVisible({ timeout: 20_000 })
+    await expect(committed, 'the committed snapshot must be exactly one window')
+      .toHaveCount(1)
+    // And the live one is still there under its own name, so a user can tell
+    // the moving window from the kept one.
+    await expect(page.getByTestId('window-breadcrumb')
+      .filter({ hasText: 'Fit components (live)' })).toHaveCount(1)
     await page.screenshot({ path: `${SHOTS}/09-committed.png`, fullPage: true })
 
     const errs = backend.logBuffer.filter((l: string) => /Traceback|CRITICAL/.test(l))
