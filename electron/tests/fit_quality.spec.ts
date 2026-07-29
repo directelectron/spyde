@@ -94,11 +94,15 @@ test('the fitted model matches the spectrum on screen', async () => {
     const settledMisfit = async (timeout = 30_000) => {
       const deadline = Date.now() + timeout
       let prev = misfit((await curves())!)
+      // THREE consecutive agreements, not two: one repeat can land in a lull
+      // while the model overlay is still catching up with the data.
+      let stable = 0
       while (Date.now() < deadline) {
         await page.waitForTimeout(150)
         const now = misfit((await curves())!)
-        if (Math.abs(now - prev) < 1e-9) return now
+        stable = Math.abs(now - prev) < 1e-9 ? stable + 1 : 0
         prev = now
+        if (stable >= 2) return now
       }
       return prev
     }
@@ -156,7 +160,17 @@ test('the fitted model matches the spectrum on screen', async () => {
     }, figIds.nav)
     expect(cross, 'the navigator has no crosshair').toBeTruthy()
 
+    /** Cheap signature of the DATA curve — changes when the panel actually
+     *  moves to a different navigator position. */
+    const dataSig = async () => {
+      const c = await curves()
+      if (!c) return ''
+      const d = c.data
+      return `${d.length}:${d[0]}:${d[d.length >> 1]}:${d[d.length - 1]}`
+    }
+
     const goTo = async (cx: number, cy: number) => {
+      const before = await dataSig()
       await page.evaluate(({ f, panel, id, x, y }) => {
         window.postMessage({
           type: 'awi_event', figId: f,
@@ -166,7 +180,18 @@ test('the fitted model matches the spectrum on screen', async () => {
           }),
         }, '*')
       }, { f: figIds.nav, panel: cross.panel_id, id: cross.id, x: cx, y: cy })
-      await page.waitForTimeout(1_200)
+      // Wait for the SPECTRUM to become this position's, not a flat 1.2s.
+      // settledMisfit alone was not enough: "two consecutive reads agree" can
+      // agree on the OLD value when the move has not been applied yet, which
+      // is why [2,2] — the first sweep stop after the tab switch — still read
+      // 191.6% while re-measuring it later gave 3.7%. Confirming the panel
+      // moved before judging the model is what closes that window.
+      const deadline = Date.now() + 30_000
+      while (Date.now() < deadline) {
+        await page.waitForTimeout(100)
+        if ((await dataSig()) !== before) break
+      }
+      await page.waitForTimeout(400)   // let the model overlay follow the data
     }
 
     let worst = { m: 0, at: [0, 0] as number[] }
