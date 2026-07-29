@@ -306,11 +306,24 @@ class TestNavPositionResolution:
 
     @staticmethod
     def _set_indices(sel, value):
-        """Set current_indices on *sel*, going through the inner active selector
-        for a composite (IntegratingSSelector2D exposes current_indices as a
-        read-only property that delegates to ``.selector``)."""
+        """Park *sel* at *value*, going through the inner active selector for a
+        composite (IntegratingSSelector2D exposes current_indices as a
+        read-only property that delegates to ``.selector``).
+
+        Pin what the WIDGET reports as well as the committed value. These tests
+        never move a real widget, and ``_run_update`` does
+        ``self.current_indices = self.get_selected_indices()`` on the dispatcher
+        thread — so setting ``current_indices`` alone is reverted to the
+        widget's own (unmoved) position the moment a settle timer or any other
+        update fires. ``_settle_cursor`` then re-applies, gets reverted again,
+        and is really flipping a coin every 50 ms: on windows-py3.11 it lost for
+        the whole 30 s budget and failed as "cursor never settled at (1, 2)".
+        Pinning both makes the state self-consistent, so nothing has anything to
+        revert — the same technique the NAV_CHANGE_HOOKS test below already uses.
+        """
         inner = getattr(sel, "selector", None)
         target = inner if inner is not None else sel
+        target.get_selected_indices = lambda: value
         target.current_indices = value
 
     def _move_all(self, session, tree, value):
