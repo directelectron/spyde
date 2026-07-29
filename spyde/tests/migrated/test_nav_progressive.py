@@ -229,9 +229,25 @@ class TestProgressiveNavigator:
         last_size = [0]
         orig = Plot.set_data
 
+        # The session first, so the tracker can tell OUR navigator from anyone
+        # else's. The patch is on the CLASS, so it sees every Plot in the
+        # process — including one belonging to an earlier test whose poller
+        # thread has not wound down yet. That is not hypothetical: this test
+        # failed in CI with `assert 256 == (12 * 12)`, i.e. it measured a
+        # leftover 16x16 navigator and never looked at its own.
+        session = _make_session()
+
+        def own(p):
+            if any(p is q for q in session._plots):
+                return True
+            # Registration in _plots can trail the first paint, so also accept
+            # a plot whose tree is one of ours.
+            tree = getattr(p, "signal_tree", None)
+            return tree is not None and any(tree is t for t in session.signal_trees)
+
         def _track(self, data, *a, **k):
             try:
-                if getattr(self, "is_navigator", False):
+                if getattr(self, "is_navigator", False) and own(self):
                     arr = np.asarray(data)
                     last_finite[0] = int(np.isfinite(arr).sum())
                     last_size[0] = int(arr.size)
@@ -241,7 +257,6 @@ class TestProgressiveNavigator:
 
         monkeypatch.setattr(Plot, "set_data", _track)
 
-        session = _make_session()
         try:
             ny = nx = 12
             base = np.arange(ny * nx * 8 * 8, dtype=np.float32).reshape(ny, nx, 8, 8)
