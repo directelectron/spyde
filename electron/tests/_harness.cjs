@@ -18,12 +18,38 @@
  */
 const { _electron: electron } = require('@playwright/test')
 const { join } = require('path')
+const { mkdtempSync, mkdirSync, writeFileSync } = require('fs')
+const { tmpdir } = require('os')
+
+/** A scratch ~/.spyde with the welcome tour already dismissed.
+ *
+ * On a machine that has never RUN SpyDE — i.e. every CI runner — settings.json
+ * is absent, `tutorial_seen` is unset, and FirstRunGate auto-opens the welcome
+ * tour. Its full-screen `tour-overlay` then swallows pointer events, so a spec
+ * that hovers a titlebar fails with "<div> from <div data-testid=tour-overlay>
+ * subtree intercepts pointer events" — while passing on any dev box, because
+ * there the real ~/.spyde has tutorial_seen persisted from actual use.
+ *
+ * SPYDE_SETTINGS_DIR redirects only settings.json, never Electron's own
+ * profile (Chromium refuses to launch without a real one — see the note in
+ * first_run.spec.ts). A fresh dir per launch also means no spec can leak a
+ * persisted setting into the next.
+ */
+function _seenSettingsDir() {
+  const dir = join(mkdtempSync(join(tmpdir(), 'spyde-e2e-')), '.spyde')
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, 'settings.json'),
+                JSON.stringify({ tutorial_seen: true }))
+  return dir
+}
 
 /**
  * Launch the app. Returns { app, page, backend, jsErrors, assertNoJsErrors }.
  * @param {{dask?: boolean, env?: Record<string,string>}} opts
  *   dask=false (default) → SPYDE_NO_DASK=1 (renderer-only / eager, fast).
  *   dask=true            → real LocalCluster + client.
+ *   env.SPYDE_SETTINGS_DIR → pass your own to opt OUT of the tour suppression
+ *     above (first_run.spec.ts does exactly this to get a genuine first launch).
  */
 async function launchApp(opts = {}) {
   const { dask = false, env = {} } = opts
@@ -32,7 +58,8 @@ async function launchApp(opts = {}) {
     env: {
       ...process.env,
       ...(dask ? {} : { SPYDE_NO_DASK: '1' }),
-      ...env,
+      SPYDE_SETTINGS_DIR: _seenSettingsDir(),
+      ...env,          // a spec's own SPYDE_SETTINGS_DIR wins
     },
   })
 
