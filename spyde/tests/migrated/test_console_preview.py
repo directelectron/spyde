@@ -42,6 +42,7 @@ from spyde.backend import console_preview as cp
 # initialized-module circular import). Warming it here removes the race (the
 # established testharness pattern: ensure_heavy_imports BEFORE set_signal_type).
 from spyde.backend.heavy_imports import ensure_heavy_imports
+from spyde.tests.migrated.conftest import _settle
 ensure_heavy_imports()
 
 
@@ -182,6 +183,7 @@ class TestPreviewNeverComputesFull:
         sig = _lazy_4d()
         full_shape = sig.data.shape
         session._add_signal(sig, source_path=None)
+        _settle(session)   # the load's own settle timer must fire BEFORE the test drives the selector
         _wait_vars(session, msgs, lambda c: any(v["name"] == "s1" for v in c["vars"]))
 
         computed = {"full": False}
@@ -214,6 +216,7 @@ class TestCostGuard:
         # 1 nav position per chunk → 3*4 = 12 source chunks for a full-nav sum.
         sig = _lazy_4d(nav=(3, 4))
         session._add_signal(sig, source_path=None)
+        _settle(session)   # the load's own settle timer must fire BEFORE the test drives the selector
         _wait_vars(session, msgs, lambda c: any(v["name"] == "s1" for v in c["vars"]))
 
         with patch.object(da.Array, "compute",
@@ -268,6 +271,7 @@ class TestRenderKinds:
         _ = session.console
         sig = _lazy_4d()
         session._add_signal(sig, source_path=None)
+        _settle(session)   # the load's own settle timer must fire BEFORE the test drives the selector
         _wait_vars(session, msgs, lambda c: any(v["name"] == "s1" for v in c["vars"]))
         res = _preview(session, msgs, "s1")
         assert res["kind"] == "image"
@@ -302,11 +306,24 @@ class TestNavPositionResolution:
 
     @staticmethod
     def _set_indices(sel, value):
-        """Set current_indices on *sel*, going through the inner active selector
-        for a composite (IntegratingSSelector2D exposes current_indices as a
-        read-only property that delegates to ``.selector``)."""
+        """Park *sel* at *value*, going through the inner active selector for a
+        composite (IntegratingSSelector2D exposes current_indices as a
+        read-only property that delegates to ``.selector``).
+
+        Pin what the WIDGET reports as well as the committed value. These tests
+        never move a real widget, and ``_run_update`` does
+        ``self.current_indices = self.get_selected_indices()`` on the dispatcher
+        thread — so setting ``current_indices`` alone is reverted to the
+        widget's own (unmoved) position the moment a settle timer or any other
+        update fires. ``_settle_cursor`` then re-applies, gets reverted again,
+        and is really flipping a coin every 50 ms: on windows-py3.11 it lost for
+        the whole 30 s budget and failed as "cursor never settled at (1, 2)".
+        Pinning both makes the state self-consistent, so nothing has anything to
+        revert — the same technique the NAV_CHANGE_HOOKS test below already uses.
+        """
         inner = getattr(sel, "selector", None)
         target = inner if inner is not None else sel
+        target.get_selected_indices = lambda: value
         target.current_indices = value
 
     def _move_all(self, session, tree, value):
@@ -338,6 +355,7 @@ class TestNavPositionResolution:
         _ = session.console
         sig, arr = _stamped_4d()
         session._add_signal(sig, source_path=None)
+        _settle(session)   # the load's own settle timer must fire BEFORE the test drives the selector
         _wait_vars(session, msgs, lambda c: any(v["name"] == "s1" for v in c["vars"]))
         tree = session.signal_trees[0]
 
@@ -359,6 +377,7 @@ class TestNavPositionResolution:
         _ = session.console
         sig, arr = _stamped_4d()
         session._add_signal(sig, source_path=None)
+        _settle(session)   # the load's own settle timer must fire BEFORE the test drives the selector
         _wait_vars(session, msgs, lambda c: any(v["name"] == "s1" for v in c["vars"]))
         tree = session.signal_trees[0]
         # Clear any resolved indices so _nav_indices_for returns (None, None) —
@@ -438,6 +457,7 @@ class TestNavRefresh:
         _ = session.console
         sig, arr = _stamped_4d()
         session._add_signal(sig, source_path=None)
+        _settle(session)   # the load's own settle timer must fire BEFORE the test drives the selector
         _wait_vars(session, msgs, lambda c: any(v["name"] == "s1" for v in c["vars"]))
         tree = session.signal_trees[0]
         nav = TestNavPositionResolution()
@@ -526,6 +546,7 @@ class TestNavRefresh:
         session, msgs = window["window"], window["messages"]
         sig = _lazy_4d()
         session._add_signal(sig, source_path=None)
+        _settle(session)   # the load's own settle timer must fire BEFORE the test drives the selector
         tree = session.signal_trees[0]
         sel = TestNavPositionResolution()._signal_selector(session, tree)
         assert sel is not None

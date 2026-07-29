@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- Model fitting: scattered data points with a smooth fitted peak through
+     them. Same white-on-transparent, 512x512, heavy-stroke style as the other
+     toolbar icons so it reads at 20 px. -->
+<svg
+   width="512"
+   height="512"
+   viewBox="0 0 512 512"
+   version="1.1"
+   id="svg1"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <g id="layer1">
+    <!-- the fitted curve: a gaussian-ish peak -->
+    <path
+       style="fill:none;stroke:#ffffff;stroke-width:34;stroke-linecap:round;stroke-linejoin:round;stroke-opacity:1"
+       d="M 40,420 C 130,415 165,400 205,300 235,225 250,120 275,120 300,120 315,225 345,300 385,400 420,415 472,420"
+       id="curve" />
+    <!-- data points scattered about it -->
+    <circle style="fill:#ffffff;fill-opacity:1" cx="96"  cy="408" r="26" id="p1" />
+    <circle style="fill:#ffffff;fill-opacity:1" cx="196" cy="330" r="26" id="p2" />
+    <circle style="fill:#ffffff;fill-opacity:1" cx="272" cy="152" r="26" id="p3" />
+    <circle style="fill:#ffffff;fill-opacity:1" cx="352" cy="322" r="26" id="p4" />
+    <circle style="fill:#ffffff;fill-opacity:1" cx="440" cy="398" r="26" id="p5" />
+  </g>
+</svg>

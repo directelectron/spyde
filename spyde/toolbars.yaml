@@ -294,6 +294,16 @@ functions:
             type: enum
             default: intensity
             options: [intensity, count]
+  EBSD Indexing:
+    description: Dictionary indexing of EBSD patterns. Build a simulated pattern dictionary, check the matched orientation's Kikuchi bands live under the crosshair, then index the whole scan into an IPF orientation map.
+    icon: drawing/toolbars/icons/ebsd.svg
+    function: spyde.actions.ebsd_action.ebsd_indexing
+    signal_types: [EBSD]
+    plot_dim: [2]
+    toolbar_side: bottom
+    navigation: False
+    toggle: True
+
   Vector Orientation Mapping:
     description: Orientation + strain mapping from diffraction vectors (sparse point-set fit). Live refine under the crosshair.
     icon: drawing/toolbars/icons/orientation_mapping.svg
@@ -312,5 +322,21 @@ functions:
     signal_types: [spyde_diffraction_vectors_image]
     requires_vectors: True
     plot_dim: [2]
+    toolbar_side: bottom
+    navigation: False
+
+  Fit:
+    description: Fit a model to every spectrum. Add components line by line, watch the model curve on the spectrum, then Run to fit the whole scan on the GPU. Commit turns each component's integrated area into a map.
+    icon: drawing/toolbars/icons/fit.svg
+    function: spyde.actions.fit_action.fit_toolbar
+    plot_dim: [1]
+    toolbar_side: bottom
+    navigation: False
+
+  Remove Background:
+    description: Fit a background over a dragged window and subtract it. The window is the primary input — drag the green band over a region that is background only; the model is fitted there and extrapolated across the whole axis, per navigation position.
+    icon: drawing/toolbars/icons/remove_background.svg
+    function: spyde.actions.background_action.bg_toolbar
+    plot_dim: [1]
     toolbar_side: bottom
     navigation: False

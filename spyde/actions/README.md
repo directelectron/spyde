@@ -15,7 +15,7 @@ parity) lives in [`NOTEBOOK_PARITY_PLAN.md`](../../NOTEBOOK_PARITY_PLAN.md).
 | **View action** | one-shot UI command, no tree change | plain `fn(ctx, …)` | zoom, reset, `tile_views` |
 | **TransformAction** | signal + params → a **new node in the SAME tree** | `action.TransformAction` | Rebin (`Rebin2DAction`), CZB apply |
 | **RegionAction** | interactive ROI → a **linked live output plot** | `action.RegionAction` | Virtual Imaging, FFT, Line Profile, Vector VI |
-| **Wizard** | staged caret: open → tune → run → commit → close | `wizard.WizardController` + staged handlers | Find Vectors, Orientation, Vector-OM, Strain, CZB |
+| **Wizard** | staged caret: open → tune → run → commit → close | `wizard.WizardController` + staged handlers | Find Vectors, Orientation, Vector-OM, EBSD, Strain, CZB |
 | **Commit** | promote a live/finished result to a **NEW SignalTree** | `commit.commit_result_tree` | strain Commit, VOM result windows |
 
 Deciding: does it need an ROI? → RegionAction. Does it produce a new node of
@@ -39,6 +39,10 @@ reach `update_live_params`.
 YAML gate keys: `signal_types` / `exclude_signal_types` (match the signal's
 `_signal_type` string — covers lazy+eager), `signal_class` (isinstance),
 `requires_vectors` (hidden until `tree.diffraction_vectors` attaches),
+`requires_package` (a module name or list of them — hidden until the optional
+extra is installed; resolved with `find_spec`, so it never imports the package
+and never pays its import cost. `install_hint(pkg)` gives the `pip install
+"spyde[eels]"` line. Add BOTH filter paths' gates — see below),
 `plot_dim` (`[1, 2]`), `navigation` (navigator vs signal window), `toggle`,
 `submenu`/`subfunctions`, `parameters` (rendered by the Electron param panel;
 supports `type`, `default`, `min`/`max`/`step`, `options`, `tab`,
@@ -168,6 +172,11 @@ teardown (`_forget_window`), and when a dispatched action raises.
   `wait_for_vectors(…, strict=True)` (strict = only the clicked plot's tree
   counts — the any-tree fallback would re-dispatch forever into a
   tree-specific gate).
+- **Two filter paths, one gate**: `get_toolbar_actions_for_plot` (resolves the
+  function) and `_action_matches_plot` (used by `get_toolbar_config_for_plot`,
+  imports nothing) apply the SAME gates in two places. Add a new gate key to
+  both — one alone renders a button that never dispatches, or vice versa.
+  `test_requires_package_gate.py` asserts this for `requires_package`.
 - **Bare-figure windows**: a window emitted as a raw `figure` message is NOT
   a registered Plot — `_plot_by_window_id` returns None and generic dispatch
   silently no-ops. Register a controller (`own_window`) and resolve via

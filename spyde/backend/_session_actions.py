@@ -36,6 +36,7 @@ _TEST_ACTIONS_ENABLED = os.environ.get("SPYDE_PACKAGED") != "1"
 _TEST_ACTIONS = frozenset({
     "load_test_data", "load_test_data_lazy", "load_test_data_lazy_chunked",
     "load_test_data_si_grains", "load_test_data_sped_ag",
+    "load_test_data_eels", "load_test_data_eds", "load_test_data_ebsd",
     "load_test_data_line", "load_test_data_movie", "test_nav_drag",
     "test_region_scrub", "test_add_second_navigator",
     "load_test_vectors", "run_test_orientation", "dump_dask_state",
@@ -115,6 +116,12 @@ class ActionRouterMixin:
             self._load_test_data_si_grains()
         elif action == "load_test_data_sped_ag":
             self._load_test_data_sped_ag()
+        elif action == "load_test_data_eels":
+            self._load_test_data_eels(payload)
+        elif action == "load_test_data_eds":
+            self._load_test_data_eds(payload)
+        elif action == "load_test_data_ebsd":
+            self._load_test_data_ebsd(payload)
         elif action == "load_test_data_line":
             self._load_test_data_line(payload)
         elif action == "load_test_data_movie":
@@ -216,6 +223,10 @@ class ActionRouterMixin:
             self._set_signal_type(plot, payload.get("signal_type", ""))
         elif action == "load_example":
             self.load_example_data(payload["name"])
+        elif action == "example_catalogue":
+            self.emit_example_catalogue(warm=bool(payload.get("warm", True)))
+        elif action == "show_example_dir":
+            self.show_example_dir()
         elif action == "set_active":
             wid = payload.get("window_id", window_id)
             if wid is not None:
@@ -372,6 +383,10 @@ class ActionRouterMixin:
                 overlays.append(getattr(wiz, "overlay", None))
         elif name == "Vector Orientation Mapping":
             wiz = getattr(tree, "_vom_wizard", None)
+            if wiz is not None:
+                overlays.append(getattr(wiz, "overlay", None))
+        elif name == "EBSD Indexing":
+            wiz = getattr(tree, "_ebsd_wizard", None)
             if wiz is not None:
                 overlays.append(getattr(wiz, "overlay", None))
         for ov in overlays:

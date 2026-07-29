@@ -170,6 +170,12 @@ contextBridge.exposeInMainWorld('electron', {
 
   openExternal: (url: string) => ipcRenderer.send('open-external', url),
 
+  /** Reveal a local DIRECTORY in the OS file manager (Examples → Show Example
+   *  Data Directory). Separate from openExternal, which allowlists web/mail
+   *  protocols so it can never open a local path; main verifies the target is
+   *  a real directory. */
+  openPath: (path: string) => ipcRenderer.send('open-path', path),
+
   // ── Updates / GPU status ──────────────────────────────────────────────────
 
   /** Current channel, whether this build supports auto-update, last known

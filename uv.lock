@@ -82,6 +82,23 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/2d/6a/885bc91484e1aa8f618f6f0228d76d0e67000b0fdd6090673b777e311913/asciitree-0.3.3.tar.gz", hash = "sha256:4aa4b9b649f85e3fcb343363d97564aa1fb62e249677f2e18a96765145cc0f6e", size = 3951, upload-time = "2016-09-05T19:10:42.681Z" }
 
 [[package]]
+name = "ase"
+version = "3.29.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "matplotlib" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/aa/36/cfe17324ea701d2caa479f25b134c54aeb36998443fd88c13e4f1af06f52/ase-3.29.0.tar.gz", hash = "sha256:ef4e2caa38169e3fbbc4164764a060d1877a6692519a4bed82521328eeb0d9aa", size = 2466051, upload-time = "2026-06-21T16:03:06.499Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/66/a6/a3d29378618d3d9ba0962473f8bbf09a5ad15eb8b210c5153fb88d0b8aad/ase-3.29.0-py3-none-any.whl", hash = "sha256:7b9dd103f007810339c24acfee2f6b677c0c48443b21d3c98e52959246cf4ebf", size = 3014724, upload-time = "2026-06-21T16:03:03.794Z" },
+]
+
+[[package]]
 name = "asteval"
 version = "1.0.8"
 source = { registry = "https://pypi.org/simple" }
@@ -97,6 +114,31 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/be/a5/8e3f9b6771b0b408517c82d97aed8f2036509bc247d46114925e32fe33f0/asttokens-3.0.1.tar.gz", hash = "sha256:71a4ee5de0bde6a31d64f6b13f2293ac190344478f081c3d1bccfcf5eacb0cb7", size = 62308, upload-time = "2025-11-15T16:43:48.578Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d2/39/e7eaf1799466a4aef85b6a4fe7bd175ad2b1c6345066aa33f1f58d4b18d0/asttokens-3.0.1-py3-none-any.whl", hash = "sha256:15a3ebc0f43c2d0a50eeafea25e19046c68398e487b9f1f5b517f7c0f40f976a", size = 27047, upload-time = "2025-11-15T16:43:16.109Z" },
+]
+
+[[package]]
+name = "atomap"
+version = "0.4.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "ase" },
+    { name = "exspy" },
+    { name = "h5py" },
+    { name = "hyperspy" },
+    { name = "matplotlib" },
+    { name = "numba" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "scikit-image", version = "0.25.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "scikit-image", version = "0.26.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "scikit-learn", version = "1.7.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "scikit-learn", version = "1.8.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/36/44/d18163873601ca5cc792d7c67932303cc2afc9b2853cc9f3775fd84966c4/atomap-0.4.2.tar.gz", hash = "sha256:d5e4283535f1f2da687ee4aa5f8eedfb5c5e570873ac4f52e46b10cf0bee9375", size = 864998, upload-time = "2025-01-05T08:01:13.23Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8e/b3/99fe4e761f03be130929dda567a351a1f5bac4d95b348d89fe1b52df5a9a/atomap-0.4.2-py3-none-any.whl", hash = "sha256:646784ff74e23d07cd6e1acbe831cbaafb725af28197688be50f65bce1e39313", size = 868859, upload-time = "2025-01-05T08:01:10.556Z" },
 ]
 
 [[package]]
@@ -782,6 +824,20 @@ wheels = [
 ]
 
 [[package]]
+name = "em-database"
+version = "0.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pooch", marker = "python_full_version >= '3.12'" },
+    { name = "pyyaml", marker = "python_full_version >= '3.12'" },
+    { name = "tqdm", marker = "python_full_version >= '3.12'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c8/1f/c009752d22cf7274b193313ac9616087c4eaa1167ec9aba59766b14c7a01/em_database-0.1.0.tar.gz", hash = "sha256:1a6bff7e9e8df843e3df457070d068fb892cdfa76faca1f6c1c5a37d040ea945", size = 19675, upload-time = "2026-07-28T13:35:13.731Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/1e/ab/a3c64005115d0ab50f09869ea66d1c9d1d1290db040946fbe67aba42d843/em_database-0.1.0-py3-none-any.whl", hash = "sha256:858d1235e471e1f6647d9fd5e3332c570b663b2418a9defa00c757ab29235212", size = 30632, upload-time = "2026-07-28T13:35:12.692Z" },
+]
+
+[[package]]
 name = "exceptiongroup"
 version = "1.3.1"
 source = { registry = "https://pypi.org/simple" }
@@ -800,6 +856,30 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/cc/28/c14e053b6762b1044f34a13aab6859bbf40456d37d23aa286ac24cfd9a5d/executing-2.2.1.tar.gz", hash = "sha256:3632cc370565f6648cc328b32435bd120a1e4ebb20c77e3fdde9a13cd1e533c4", size = 1129488, upload-time = "2025-09-01T09:48:10.866Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c1/ea/53f2148663b321f21b5a606bd5f191517cf40b7072c0497d3c92c4a13b1e/executing-2.2.1-py2.py3-none-any.whl", hash = "sha256:760643d3452b4d777d295bb167ccc74c64a81df23fb5e08eff250c425a4b2017", size = 28317, upload-time = "2025-09-01T09:48:08.5Z" },
+]
+
+[[package]]
+name = "exspy"
+version = "0.3.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "dask", extra = ["array"] },
+    { name = "hyperspy" },
+    { name = "matplotlib" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "pint", version = "0.24.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "pint", version = "0.25.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "pooch" },
+    { name = "prettytable" },
+    { name = "requests" },
+    { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "traits" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ab/6d/f6c8531a2762c42b8c5c8a6fe111ae2a0984fafa6dd5d8cc10697f712a3c/exspy-0.3.2.tar.gz", hash = "sha256:c22ab6a3d5785f3194b4aead8f32d11f4161c55b042fe1d270caacfbf26f2397", size = 1424787, upload-time = "2025-03-02T18:26:51.825Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/26/18/afa22f8adf4fa6e6bb70dc683f1fcfcece9e88ffcf35d1c984309d5aaf65/exspy-0.3.2-py3-none-any.whl", hash = "sha256:3596ea40eb754055d6ef343a56f6c7f63ea2433951146f8a8df2e91595928660", size = 603814, upload-time = "2025-03-02T18:26:48.53Z" },
 ]
 
 [[package]]
@@ -1366,6 +1446,42 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/26/2d/ef58fed122b268c69c0aa099da20bc67657cdfb2e222688d5731bd5b971d/jupyterlab_widgets-3.0.16.tar.gz", hash = "sha256:423da05071d55cf27a9e602216d35a3a65a3e41cdf9c5d3b643b814ce38c19e0", size = 897423, upload-time = "2025-11-01T21:11:29.724Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ab/b5/36c712098e6191d1b4e349304ef73a8d06aed77e56ceaac8c0a306c7bda1/jupyterlab_widgets-3.0.16-py3-none-any.whl", hash = "sha256:45fa36d9c6422cf2559198e4db481aa243c7a32d9926b500781c830c80f7ecf8", size = 914926, upload-time = "2025-11-01T21:11:28.008Z" },
+]
+
+[[package]]
+name = "kikuchipy"
+version = "0.13.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "dask", extra = ["array"] },
+    { name = "diffpy-structure", version = "3.2.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "diffpy-structure", version = "3.3.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
+    { name = "diffpy-structure", version = "3.4.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "diffsims" },
+    { name = "h5py" },
+    { name = "hyperspy" },
+    { name = "imageio" },
+    { name = "lazy-loader" },
+    { name = "matplotlib" },
+    { name = "numba" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "orix" },
+    { name = "packaging" },
+    { name = "pyyaml" },
+    { name = "rosettasciio" },
+    { name = "scikit-image", version = "0.25.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "scikit-image", version = "0.26.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "scikit-learn", version = "1.7.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "scikit-learn", version = "1.8.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "tqdm" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/63/d5/7199e39e6e45429be4dbacfc8c0e5e026433afa9b7f2c39f72bc61f61b8d/kikuchipy-0.13.0.tar.gz", hash = "sha256:ab706cfd370d463ab0ba424db80c89b8fc35f3fc352b1d051ee3c0d52ee50e3e", size = 21001908, upload-time = "2026-06-14T12:58:52.908Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2d/1f/f8f651969bd7c12956c2a14963afb8c3de4f1c2528e3814e6df550aee17a/kikuchipy-0.13.0-py3-none-any.whl", hash = "sha256:5e03dffa1162c0c3f031a5cca86338e32b6259459f6fb779fd117c3a0b478fc3", size = 1799201, upload-time = "2026-06-14T12:58:50.553Z" },
 ]
 
 [[package]]
@@ -3441,6 +3557,7 @@ dependencies = [
     { name = "bokeh" },
     { name = "dask" },
     { name = "distributed" },
+    { name = "em-database", marker = "python_full_version >= '3.12'" },
     { name = "huggingface-hub" },
     { name = "hyperspy" },
     { name = "imagecodecs", version = "2025.3.30", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -3466,6 +3583,14 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+all = [
+    { name = "atomap" },
+    { name = "exspy" },
+    { name = "kikuchipy" },
+]
+atoms = [
+    { name = "atomap" },
+]
 doc = [
     { name = "pydata-sphinx-theme" },
     { name = "sphinx", version = "8.1.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -3474,6 +3599,12 @@ doc = [
     { name = "sphinx-design", version = "0.6.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "sphinx-design", version = "0.7.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "sphinx-gallery" },
+]
+ebsd = [
+    { name = "kikuchipy" },
+]
+eels = [
+    { name = "exspy" },
 ]
 tests = [
     { name = "playwright" },
@@ -3492,13 +3623,17 @@ tests = [
 [package.metadata]
 requires-dist = [
     { name = "anyplotlib", specifier = ">=0.4.2" },
+    { name = "atomap", marker = "extra == 'atoms'", specifier = ">=0.4.1" },
     { name = "bokeh" },
     { name = "dask" },
     { name = "distributed" },
+    { name = "em-database", marker = "python_full_version >= '3.12'", specifier = ">=0.1.0" },
+    { name = "exspy", marker = "extra == 'eels'", specifier = ">=0.3.2" },
     { name = "huggingface-hub" },
     { name = "hyperspy", git = "https://github.com/cssfrancis/hyperspy.git?rev=f314cf42aa16a06d82449cd8dc8c8f57df2e3e72" },
     { name = "imagecodecs" },
     { name = "imageio-ffmpeg" },
+    { name = "kikuchipy", marker = "extra == 'ebsd'", specifier = ">=0.11.0" },
     { name = "matplotlib" },
     { name = "numpy", specifier = ">=1.20.0" },
     { name = "pillow" },
@@ -3520,12 +3655,13 @@ requires-dist = [
     { name = "sphinx-design", marker = "extra == 'doc'" },
     { name = "sphinx-gallery", marker = "extra == 'doc'" },
     { name = "sphinx-gallery", marker = "extra == 'tests'" },
+    { name = "spyde", extras = ["atoms", "ebsd", "eels"], marker = "extra == 'all'" },
     { name = "sympy" },
     { name = "tifffile", marker = "extra == 'tests'" },
     { name = "torch", marker = "sys_platform != 'win32'" },
     { name = "torch", marker = "sys_platform == 'win32'", index = "https://download.pytorch.org/whl/cu124" },
 ]
-provides-extras = ["tests", "doc"]
+provides-extras = ["tests", "doc", "eels", "ebsd", "atoms", "all"]
 
 [[package]]
 name = "sqlalchemy"

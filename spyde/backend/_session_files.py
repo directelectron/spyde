@@ -21,7 +21,7 @@ import hyperspy.api as hs
 from hyperspy.signal import BaseSignal
 
 from spyde.backend import ipc
-from spyde.backend.ipc import emit_status, emit_error
+from spyde.backend.ipc import emit, emit_status, emit_error
 
 log = logging.getLogger(__name__)
 
@@ -617,9 +617,57 @@ class FileLoaderMixin:
             except Exception:
                 pass
 
-    def load_example_data(self, name: str) -> None:
-        import pyxem.data as _pxd
+    def emit_example_catalogue(self, warm: bool = False) -> None:
+        """Send the Examples menu its contents.
 
+        Cheap by construction (no file is opened), so the renderer can ask for
+        it every time the menu opens and always show current download state.
+        With *warm*, any downloaded dataset whose shape we have not read yet is
+        read on a worker and the catalogue re-sent — that pass opens files, so
+        it must never be on the menu's own path.
+        """
+        from spyde.backend import example_catalogue as catalogue
+
+        emit({"type": "example_catalogue", **catalogue.catalogue()})
+        if not warm:
+            return
+
+        def _warm() -> None:
+            try:
+                if catalogue.warm_shapes():
+                    self._dispatch_to_main(
+                        lambda: emit({"type": "example_catalogue",
+                                      **catalogue.catalogue()}))
+            except Exception as e:
+                log.debug("warming example shapes failed: %s", e)
+
+        threading.Thread(target=_warm, daemon=True,
+                         name="example-shapes").start()
+
+    def show_example_dir(self) -> None:
+        """Reveal the example-data directory in the OS file manager.
+
+        The backend knows where it is (em-database owns the location and it is
+        overridable via ``EM_DATABASE_DATA_DIR``); only the main process can
+        open a folder, so it goes out as a message rather than being opened
+        here. The directory is created first — revealing a path that does not
+        exist yet does nothing on every platform, which reads as a dead menu
+        item before the first download.
+        """
+        from spyde.backend import example_catalogue as catalogue
+
+        path = catalogue.data_dir()
+        try:
+            os.makedirs(path, exist_ok=True)
+        except OSError as e:
+            log.debug("creating the example data dir failed: %s", e)
+        # Logged, not just emitted: `open_path` is consumed by the renderer and
+        # never echoed back on the PLOTAPP channel, so this line is the only
+        # thing an e2e (or a bug report) can observe.
+        log.info("[examples] revealing example data directory: %s", path)
+        emit({"type": "open_path", "path": path})
+
+    def load_example_data(self, name: str) -> None:
         emit_status(f"Loading example: {name}…")
         threading.Thread(
             target=self._load_example_thread,
@@ -629,56 +677,62 @@ class FileLoaderMixin:
         ).start()
 
     def _load_example_thread(self, name: str) -> None:
+        """Download (if needed) and open one **em-database** dataset, lazily.
+
+        em-database is the single source of example data (see
+        ``example_catalogue``): it downloads through pooch with a checksum, so
+        this only has to supply the progress/cancel monitor and then open the
+        file it hands back.
+        """
+        from spyde.backend import example_catalogue as catalogue
         from spyde.backend.example_download import (
-            DownloadCancelled, patched_example_downloader,
+            DownloadCancelled, example_progress,
         )
         try:
             # Wait for the Dask cluster before registering the signal — _add_signal
             # builds the navigator compute, which needs the client. A load fired
             # during startup queues here instead of racing ahead with a None client.
             self._await_dask()
-            import pyxem.data as _pxd
-            loader = getattr(_pxd, name, None)
-            if loader is None:
+            ds = catalogue.resolve(name)
+            if ds is None:
                 emit_error(f"Unknown example dataset: {name}")
                 return
-            # Progress + cancel for the (possible) pooch download: the renderer
-            # shows a toast with a bar and a Cancel button (download_progress /
-            # download_done messages; download_cancel action). A cache hit never
-            # downloads → no toast.
+            # Progress + cancel for the (possible) download: the renderer shows
+            # a toast with a bar and a Cancel button (download_progress /
+            # download_done messages; download_cancel action). Already on disk
+            # → pooch never streams → no toast.
             try:
-                with patched_example_downloader(f"example:{name}", name):
-                    sig = self._load_example_lazy(loader)
+                with example_progress(f"example:{name}", name) as monitor:
+                    path = ds.download(progressbar=monitor)
             except DownloadCancelled:
                 emit_status(f"Download cancelled: {name}")
                 return
+
+            sig = self._load_example_lazy(str(path))
+            # Now that it is open, remember its shape so the Examples menu can
+            # show it without ever reopening the file.
+            catalogue.record_shape(str(path), sig)
             _apply_example_calibration(sig, name)
             self._maybe_set_insitu_signal_type(sig)
-            self._add_signal(sig, source_path=None)
+            self._add_signal(sig, source_path=str(path))
+            self.emit_example_catalogue()      # the entry is downloaded now
         except Exception as e:
             import traceback
             traceback.print_exc()
             emit_error(f"Failed to load example {name}: {e}")
 
-    def _load_example_lazy(self, loader) -> BaseSignal:
-        """Load a pyxem example as a LAZY (Dask-backed) signal.
+    def _load_example_lazy(self, path: str) -> BaseSignal:
+        """Open a downloaded example as a LAZY (Dask-backed) signal.
 
-        pyxem example loaders forward ``**kwargs`` to ``hs.load``, so passing
-        ``lazy=True`` reads the already-downloaded file straight off disk as a
-        dask array — no eager 668 MB materialise, no zspy re-save. Falls back to
-        an in-place ``as_lazy()`` wrap only if a loader doesn't honour ``lazy``.
+        Lazy so a multi-GB store is never materialised just to display it (the
+        navigator reads it a chunk at a time). Falls back to kikuchipy for the
+        EBSD files hyperspy's reader sniffing refuses to disambiguate — the
+        same fallback the catalogue uses to read their shape.
         """
-        for kwargs in ({"allow_download": True, "lazy": True}, {"lazy": True}):
-            try:
-                sig = loader(**kwargs)
-            except TypeError:
-                continue
-            return sig if getattr(sig, "_lazy", False) else sig.as_lazy()
-        # Loader doesn't accept those kwargs at all → eager once, wrap lazy.
-        try:
-            sig = loader(allow_download=True)
-        except TypeError:
-            sig = loader()
+        from spyde.backend.example_catalogue import _open_lazily
+        sig = _open_lazily(path)
+        if isinstance(sig, (list, tuple)):
+            sig = sig[0]
         return sig if getattr(sig, "_lazy", False) else sig.as_lazy()
 
     def _to_lazy(self, sig: BaseSignal, name: str) -> BaseSignal:

@@ -209,6 +209,13 @@ export interface NavShapePromptMessage extends MsgBase, NavShapePrompt {
   type: 'nav_shape_prompt'
 }
 
+/** Reveal a local directory in the OS file manager (Examples → Show Example
+ *  Data Directory). The backend owns the location, the main process opens it. */
+export interface OpenPathMessage extends MsgBase {
+  type: 'open_path'
+  path: string
+}
+
 export interface LoadingMessage extends MsgBase {
   type: 'loading'
   busy?: unknown
@@ -779,6 +786,19 @@ export interface WizardEventMessage extends MsgBase {
     | 'vom_fit'
     | 'vom_library_ready'
     | 'om_library_ready'
+    // EBSD Indexing: the dictionary-ready ack and the live best-match readout.
+    | 'ebsd_dictionary_ready'
+    | 'ebsd_match'
+    // The Examples menu's contents, from em-database.
+    | 'example_catalogue'
+    // Fit wizard: the component palette's sampled shapes (once, on open) and
+    // the whole model after every edit. See spyde/actions/fit_action.py.
+    | 'fit_catalogue'
+    | 'fit_state'
+    // Remove Background: the model kind and where the dragged band is. The
+    // caret follows the band, so it needs this relayed — without it the
+    // fields sat at 0..0 while the band was somewhere else.
+    | 'bg_state'
     | 'fv_auto_params'
     | 'fv_models'
     | 'fv_calibration'
@@ -847,6 +867,7 @@ export type PlotAppMessage =
   | SubItemMessage
   | HistogramMessage
   | NavShapePromptMessage
+  | OpenPathMessage
   | LoadingMessage
   | SignalTypeInfoMessage
   | SelectorInfoMessage

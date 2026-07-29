@@ -24,13 +24,17 @@ import type { ToolbarAction, ParamSpec, SubAction } from '../kernel/SpyDEContext
 import { OrientationWizard } from './OrientationWizard'
 import { FindVectorsWizard } from './FindVectorsWizard'
 import { VectorOrientationWizard } from './VectorOrientationWizard'
+import { EbsdWizard } from './EbsdWizard'
 import { CenterZeroBeamWizard } from './CenterZeroBeamWizard'
 import { StrainWizard } from './StrainWizard'
 import { CropWizard } from './CropWizard'
+import { FitWizard } from './FitWizard'
+import { BackgroundWizard } from './BackgroundWizard'
 
 const WIZARD_ACTIONS = new Set([
   'Orientation Mapping', 'Find Diffraction Vectors', 'Vector Orientation Mapping',
-  'Center Zero Beam', 'Strain Mapping', 'Crop',
+  'EBSD Indexing',
+  'Center Zero Beam', 'Strain Mapping', 'Crop', 'Fit', 'Remove Background',
 ])
 
 /**
@@ -50,6 +54,7 @@ function fileUrl(p: string): string {
 // while the action's caret is selected, and hidden when it's deselected.
 const OVERLAY_ACTIONS = new Set([
   'Find Diffraction Vectors', 'Orientation Mapping', 'Vector Orientation Mapping',
+  'EBSD Indexing',
 ])
 
 const EMPTY = new Set<string>()
@@ -286,6 +291,12 @@ export function FloatingToolbar({
             onClose={() => setOpenName(null)}
           />
         )}
+        {openAction && openAction.name === 'EBSD Indexing' && (
+          <EbsdWizard
+            caretPos={caretPos} windowId={windowId} sendAction={sendAction}
+            onClose={() => setOpenName(null)}
+          />
+        )}
         {openAction && openAction.name === 'Center Zero Beam' && (
           <CenterZeroBeamWizard
             caretPos={caretPos} windowId={windowId} sendAction={sendAction}
@@ -300,6 +311,18 @@ export function FloatingToolbar({
         )}
         {openAction && openAction.name === 'Crop' && (
           <CropWizard
+            caretPos={caretPos} windowId={windowId} sendAction={sendAction}
+            onClose={() => setOpenName(null)}
+          />
+        )}
+        {openAction && openAction.name === 'Fit' && (
+          <FitWizard
+            caretPos={caretPos} windowId={windowId} sendAction={sendAction}
+            onClose={() => setOpenName(null)}
+          />
+        )}
+        {openAction && openAction.name === 'Remove Background' && (
+          <BackgroundWizard
             caretPos={caretPos} windowId={windowId} sendAction={sendAction}
             onClose={() => setOpenName(null)}
           />

@@ -480,6 +480,26 @@ class DaskManager:
             finally:
                 self._cluster = None
 
+        # Nothing was ever brought up -> nothing to settle, reap or collect.
+        #
+        # `start()` is what spawns the cluster, and it is the only thing that
+        # sets `_thread`. Under SPYDE_NO_DASK (every pytest Session, plus
+        # headless scripts) it is never called, so there is no client, no
+        # cluster, no nanny and no worker grandchild in existence — yet the
+        # tail below still slept 0.5s, walked the machine's whole process tree
+        # via psutil, and ran a full gc.collect(). That is ~670ms per Session
+        # teardown, and the test fixtures build one per test: 2372 tests x 0.67s
+        # was ~26 of the suite's ~28 minutes, and it is why the CI matrix
+        # started getting cancelled at its 30-minute timeout.
+        #
+        # Deliberately gated on `_thread`, not just on client/cluster being
+        # None: `start()` builds the cluster on a background thread, so a
+        # shutdown racing a startup can legitimately see both attributes still
+        # unset while a LocalCluster is spawning. If start() was ever called we
+        # always reap, exactly as before.
+        if self._thread is None and client is None and cluster is None:
+            return
+
         time.sleep(0.5)
         # Reap multiprocessing children we own directly.
         try:

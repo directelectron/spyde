@@ -1,10 +1,8 @@
 """example_download.py — IPC progress + cancel for the Examples-menu downloads.
 
-pyxem's example loaders fetch their data through pooch
-(``Dataset.fetch_file_path`` → ``pooch.HTTPDownloader(progressbar=…)`` →
-``kipper.fetch``). pooch accepts an arbitrary tqdm-like object as the
-``progressbar`` — that one hook gives us both a byte-level progress stream and
-a cancellation point, without touching how any individual loader works:
+em-database fetches through pooch, and pooch accepts an arbitrary tqdm-like
+object as its ``progressbar`` — that one hook gives us both a byte-level
+progress stream and a cancellation point:
 
 - :class:`_IpcProgress` implements pooch's progress protocol (assignable
   ``total``, ``update(n)``, ``reset()``, ``close()``) and emits throttled
@@ -13,10 +11,7 @@ a cancellation point, without touching how any individual loader works:
   file and deletes it on error, so no partial file is left in the cache; the
   exception is not a ``ValueError``/requests error, so pooch's retry loop does
   NOT re-attempt a cancelled download).
-- :func:`patched_example_downloader` scopes the hook: for the duration of one
-  example load it swaps ``pyxem.data._data``'s view of the ``pooch`` module for
-  a proxy whose ``HTTPDownloader`` pins ``progressbar=`` to our monitor. On
-  exit it restores the real module and emits ``download_done``.
+- :func:`example_progress` scopes one download and emits ``download_done``.
 - ``download_cancel`` (a staged action, wired in ``actions/registry.py``) sets
   the cancel flag for a token — the renderer's toast Cancel button sends it.
 
@@ -123,39 +118,29 @@ class _IpcProgress:
               "total": int(self._total)})
 
 
-class _PoochProxy:
-    """A stand-in for the ``pooch`` module inside ``pyxem.data._data`` whose
-    ``HTTPDownloader`` pins ``progressbar=`` to our monitor. Everything else
-    delegates to the real module."""
-
-    def __init__(self, real, monitor: _IpcProgress):
-        self._real = real
-        self._monitor = monitor
-
-    def __getattr__(self, name):
-        return getattr(self._real, name)
-
-    def HTTPDownloader(self, *args, **kwargs):        # noqa: N802 (pooch API name)
-        kwargs["progressbar"] = self._monitor
-        return self._real.HTTPDownloader(*args, **kwargs)
-
-
 @contextmanager
-def patched_example_downloader(token: str, label: str):
-    """Scope the progress/cancel hook around one example load.
+def example_progress(token: str, label: str):
+    """Scope the progress/cancel monitor around one example download.
 
-    Progress messages only flow when pooch actually downloads (a cache hit
-    never constructs a progress bar), so the toast simply never appears for
-    already-cached data. ``download_done`` is emitted on exit iff a download
-    started."""
-    import pyxem.data._data as _pxdata
+    Yields the monitor to hand straight to
+    ``em_database.DownloadableDataset.download(progressbar=…)``. That method
+    forwards whatever it is given to ``pooch.HTTPDownloader``, and pooch's
+    ``progressbar`` contract is "any tqdm-like object" — so :class:`_IpcProgress`
+    plugs in with no interception at all.
 
+    (This used to swap out ``pyxem.data._data``'s view of the ``pooch`` module
+    to reach the same hook, because pyxem's loaders construct the downloader
+    themselves and take no progress argument. em-database exposing the
+    parameter is what let that monkey-patch go.)
+
+    Progress messages only flow when pooch actually streams — a file already on
+    disk never constructs a progress bar — so the toast simply never appears
+    for cached data, and ``download_done`` is emitted iff a download started.
+    """
     cancel = threading.Event()
     with _LOCK:
         _CANCELS[token] = cancel
     monitor = _IpcProgress(token, label, cancel)
-    real_pooch = _pxdata.pooch
-    _pxdata.pooch = _PoochProxy(real_pooch, monitor)
     ok = False
     cancelled = False
     try:
@@ -165,7 +150,6 @@ def patched_example_downloader(token: str, label: str):
         cancelled = True
         raise
     finally:
-        _pxdata.pooch = real_pooch
         with _LOCK:
             _CANCELS.pop(token, None)
         if monitor.started:

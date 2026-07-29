@@ -50,28 +50,42 @@ class TestLazyExampleLoading:
         # Navigator + signal windows were created.
         assert len(session._plots) >= 2
 
-    def test_load_example_requests_a_lazy_load(self, window):
-        """The example loader must be asked for a LAZY load (pyxem forwards
-        lazy=True to hs.load → reads the downloaded file as dask, no eager
-        materialise, no zspy re-save)."""
+    def test_load_example_opens_the_file_lazily(self, window, monkeypatch):
+        """A downloaded example is opened as dask, never materialised — some of
+        them are gigabytes, and the navigator reads a chunk at a time."""
+        import spyde.backend.example_catalogue as ec
         session = window["window"]
-        calls = []
+        opened = []
 
-        def fake_loader(**kwargs):
-            calls.append(kwargs)
-            return _eager_4d().as_lazy()   # pretend the loader honoured lazy
+        def fake_open(path):
+            opened.append(path)
+            return _eager_4d().as_lazy()
 
-        sig = session._load_example_lazy(fake_loader)
+        monkeypatch.setattr(ec, "_open_lazily", fake_open)
+        sig = session._load_example_lazy("/tmp/example.zspy")
         assert sig._lazy is True
-        assert calls and calls[0].get("lazy") is True
+        assert opened == ["/tmp/example.zspy"]
 
-    def test_load_example_wraps_an_eager_only_loader(self, window):
-        """If a loader ignores lazy and returns eager, wrap via as_lazy() —
+    def test_load_example_wraps_an_eager_reader(self, window, monkeypatch):
+        """A reader that hands back an eager signal is wrapped via as_lazy() —
         still Dask-backed, still no disk round-trip."""
+        import spyde.backend.example_catalogue as ec
         session = window["window"]
-        sig = session._load_example_lazy(lambda **k: _eager_4d())
+        monkeypatch.setattr(ec, "_open_lazily", lambda path: _eager_4d())
+        sig = session._load_example_lazy("/tmp/example.hspy")
         assert sig._lazy is True
         assert isinstance(sig.data, da.Array)
+
+    def test_load_example_takes_the_first_of_a_multi_signal_file(self, window,
+                                                                 monkeypatch):
+        """Some readers return a LIST of signals for one file; loading one must
+        not hand a list to _add_signal."""
+        import spyde.backend.example_catalogue as ec
+        session = window["window"]
+        monkeypatch.setattr(ec, "_open_lazily",
+                            lambda path: [_eager_4d(), _eager_4d()])
+        sig = session._load_example_lazy("/tmp/multi.h5")
+        assert sig._lazy is True and not isinstance(sig, list)
 
 
 class TestNonBlockingNavigator:

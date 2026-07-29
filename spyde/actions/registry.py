@@ -46,9 +46,31 @@ import importlib
 from typing import Callable
 
 STAGED_HANDLERS: dict[str, str] = {
+    "fit_open":             "spyde.actions.fit_action.fit_open",
+    "fit_close":            "spyde.actions.fit_action.fit_close",
+    "fit_add_component":    "spyde.actions.fit_action.fit_add_component",
+    "fit_remove_component": "spyde.actions.fit_action.fit_remove_component",
+    "fit_set_param":        "spyde.actions.fit_action.fit_set_param",
+    "fit_tune":             "spyde.actions.fit_action.fit_tune",
+    "fit_run":              "spyde.actions.fit_action.fit_run",
+    "fit_commit":           "spyde.actions.fit_action.fit_commit",
+    "fit_from_composition": "spyde.actions.fit_action.fit_from_composition",
+    "fit_current":          "spyde.actions.fit_action.fit_current",
+    "fit_navigated":        "spyde.actions.fit_action.fit_navigated",
+    "fit_refit_poor":       "spyde.actions.fit_action.fit_refit_poor",
+    "fit_save_model":       "spyde.actions.fit_action.fit_save_model",
+    "fit_load_model":       "spyde.actions.fit_action.fit_load_model",
+    "bg_open":              "spyde.actions.background_action.bg_open",
+    "bg_close":             "spyde.actions.background_action.bg_close",
+    "bg_set_model":         "spyde.actions.background_action.bg_set_model",
+    "bg_set_region":        "spyde.actions.background_action.bg_set_region",
+    "bg_apply":             "spyde.actions.background_action.bg_apply",
     "om_generate_library": "spyde.actions.orientation_action.om_generate_library",
     "om_refine":           "spyde.actions.orientation_action.om_refine",
     "om_run":              "spyde.actions.orientation_action.om_run",
+    "ebsd_build_dictionary": "spyde.actions.ebsd_action.ebsd_build_dictionary",
+    "ebsd_refine":         "spyde.actions.ebsd_action.ebsd_refine",
+    "ebsd_run":            "spyde.actions.ebsd_action.ebsd_run",
     "fv_open":             "spyde.actions.find_vectors_action.fv_open",
     "fv_tune":             "spyde.actions.find_vectors_action.fv_tune",
     "fv_run":              "spyde.actions.find_vectors_action.fv_run",
@@ -203,8 +225,11 @@ def register_staged(name: str, dotted_path: str) -> None:
 _WIZARD_SCHEMAS: dict[str, tuple[str, str]] = {
     # key: (module, attribute) — attribute is a controller class (its
     # `parameters`) or a dict.
+    "fit":    ("spyde.actions.fit_action", "FitWizard"),
+    "bg":     ("spyde.actions.background_action", "PARAMETERS"),
     "strain": ("spyde.actions.strain_action", "StrainController"),
     "vom":    ("spyde.actions.vector_orientation_om", "VomWizard"),
+    "ebsd":   ("spyde.actions.ebsd_action", "EbsdWizard"),
     "czb":    ("spyde.actions.center_zero_beam", "PARAMETERS"),
     # YAML-declared (resolved from spyde.TOOLBAR_ACTIONS):
     "fv":     ("__yaml__", "Find Diffraction Vectors"),

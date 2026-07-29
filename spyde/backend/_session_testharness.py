@@ -210,6 +210,51 @@ class TestHarnessMixin:
             ax.offset = -(ax.size / 2.0) * float(ax.scale)
         self._add_signal(s, source_path="test_data_si_grains")
 
+    def _load_test_data_eels(self, payload: dict | None = None) -> None:
+        """Test-only: BUNDLED synthetic EELS spectrum image (``spyde.data``) —
+        16×16 nav × 1024 channels, power-law background + C/N/O K edges whose
+        intensities follow known asymmetric concentration maps. No download.
+
+        Ground truth is on ``metadata.Spyde.synthetic`` (read it with
+        ``spyde.data.ground_truth``), so a fit or quantification result is
+        scored against the numbers the data was built from."""
+        from spyde.backend.heavy_imports import ensure_heavy_imports
+        ensure_heavy_imports()   # see _load_test_data — don't race the prewarm
+        from spyde.data import eels_si
+        p = payload or {}
+        s = eels_si(nav=tuple(p.get("nav", (16, 16))),
+                    n_channels=int(p.get("n_channels", 1024)))
+        self._add_signal(s, source_path="test_data_eels")
+
+    def _load_test_data_eds(self, payload: dict | None = None) -> None:
+        """Test-only: BUNDLED synthetic EDS spectrum image (``spyde.data``) —
+        16×16 nav × 2048 channels, bremsstrahlung + Fe/Ni/Cu K families at
+        their real energies, with Fe-Kβ/Ni-Kα deliberately overlapping so
+        family-aware fitting is actually exercised. No download."""
+        from spyde.backend.heavy_imports import ensure_heavy_imports
+        ensure_heavy_imports()   # see _load_test_data — don't race the prewarm
+        from spyde.data import eds_si
+        p = payload or {}
+        s = eds_si(nav=tuple(p.get("nav", (16, 16))),
+                   n_channels=int(p.get("n_channels", 2048)))
+        self._add_signal(s, source_path="test_data_eds")
+
+    def _load_test_data_ebsd(self, payload: dict | None = None) -> None:
+        """Test-only: BUNDLED synthetic EBSD patterns (``spyde.data``) — 16×16
+        nav × 60×60 detector, real gnomonic Kikuchi-band geometry for a cubic
+        crystal over a two-grain orientation field. No download.
+
+        The exact Euler angles are stamped on the signal, so dictionary
+        indexing / refinement is checked against ground truth rather than
+        against a fixture of its own output."""
+        from spyde.backend.heavy_imports import ensure_heavy_imports
+        ensure_heavy_imports()   # see _load_test_data — don't race the prewarm
+        from spyde.data import ebsd_patterns
+        p = payload or {}
+        s = ebsd_patterns(nav=tuple(p.get("nav", (16, 16))),
+                          detector=tuple(p.get("detector", (60, 60))))
+        self._add_signal(s, source_path="test_data_ebsd")
+
     def _load_test_data_sped_ag(self) -> None:
         """Test-only: load the REAL sped_ag 4-D STEM scan (pyxem.data.sped_ag —
         208×64 patterns of 112×112, a strained Ag SPED dataset with genuine
