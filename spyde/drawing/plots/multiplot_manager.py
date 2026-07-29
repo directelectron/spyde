@@ -261,6 +261,23 @@ class MultiplotManager:
                 except Exception:
                     info["nav_size"] = 0
                     info["nav_scale"] = 0.0
+                # How many RAW camera frames one navigation position
+                # integrates, when the source has a cadence finer than the
+                # positions it was loaded at (a CSB event stream). Absent
+                # otherwise, which is what tells the dock not to offer a width
+                # below one position for an ordinary movie — there is nothing
+                # underneath it to show.
+                # Off the TREE ROOT, not `selector.current_plot` (that is the
+                # navigator, whose signal is the free plane-counts overview and
+                # carries no source metadata) and not `child` (which has no
+                # signal yet — create_plot_states runs after this emit).
+                try:
+                    from spyde.actions.csb_raw_frame import raw_frames_per_plane
+                    per = raw_frames_per_plane(self.signal_tree.root)
+                    if per:
+                        info["raw_per_plane"] = int(per)
+                except Exception as e:
+                    logger.debug("raw-frame availability check failed: %s", e)
             emit(info)
         except Exception as e:
             logger.debug("emitting navigator selector_info failed: %s", e)
