@@ -57,9 +57,52 @@ def _make_session():
     return Session(n_workers=1, threads_per_worker=1)
 
 
+def _settled(session) -> bool:
+    """Have the selector debounce/settle timers fired and their updates landed?"""
+    from spyde.drawing.selectors import base_selector as bs
+
+    # A queued nav update is still to run (the dispatcher is latest-wins, so a
+    # non-empty pending map means work is outstanding).
+    if bs._nav_dispatcher._pending:
+        return False
+    # Any selector with a live settle timer is still going to re-fire.
+    for _wid, sel in getattr(session, "_nav_selectors", {}).items():
+        for s in (sel, getattr(sel, "selector", None)):
+            if s is not None and getattr(s, "_settle_timer", None) is not None:
+                return False
+    # And every signal plot has actually painted something.
+    plots = [p for p in session._plots if not getattr(p, "is_navigator", False)]
+    return bool(plots) and all(
+        getattr(p, "current_data", None) is not None for p in plots)
+
+
+def _settle(session, timeout: float = 3.0) -> None:
+    """Wait for the selector debounce instead of sleeping a flat 0.8s.
+
+    This was `time.sleep(0.8)`, and the fixtures below are used ~930 times
+    across the suite — about 12 minutes of the run spent sleeping. The timer
+    it was waiting on is armed for `max(0.12, live_delay + 0.1)`
+    (base_selector._arm_settle), so 0.8s was ~6x the margin actually needed.
+
+    The floor matters as much as the condition: at the instant _add_signal
+    returns, the timer may not be armed yet and no plot has painted, so a
+    pure condition poll could return immediately and hand the test a session
+    that has not settled at all. Never return before one full settle period
+    has passed, then wait for the real state. Falls through after `timeout`
+    rather than hanging, so a fixture can still fail loudly in its test.
+    """
+    start = time.monotonic()
+    floor = start + 0.13          # one settle period; the timer cannot beat it
+    deadline = start + timeout
+    while time.monotonic() < deadline:
+        if time.monotonic() >= floor and _settled(session):
+            return
+        time.sleep(0.005)
+
+
 def _load(session, signal):
     session._add_signal(signal, source_path=None)
-    time.sleep(0.8)  # let selector debounce timers fire
+    _settle(session)
 
 
 def _bright_disk_4d(nav, sig=(16, 16)):

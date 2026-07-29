@@ -869,6 +869,18 @@ ipcMain.on('open-path', async (_, target: string) => {
       console.warn(`[spyde] open-path rejected non-directory: ${resolved}`)
       return
     }
+    // Test seam, same shape as SPYDE_SETTINGS_DIR: handle the request and log
+    // it, but do not hand the path to the desktop. On a headless CI runner
+    // `shell.openPath` shells out to xdg-open, which has no file manager to
+    // reach and leaves something behind that stops the app exiting — the
+    // examples_menu spec's own assertion passed and then its afterAll timed
+    // out for 120s on app.close(). There is nothing to verify past this point
+    // in CI anyway ("did a file manager window appear" is not observable), so
+    // the spec still covers backend -> renderer -> main and stops here.
+    if (process.env.SPYDE_NO_SHELL_OPEN === '1') {
+      console.log(`[spyde] open-path (suppressed): ${resolved}`)
+      return
+    }
     const err = await shell.openPath(resolved)
     if (err) console.warn(`[spyde] open-path failed: ${err}`)
   } catch (e) {

@@ -3,6 +3,11 @@ import { join } from 'path'
 
 export default defineConfig({
   testDir: './tests',
+  // Settings isolation for EVERY spec — ~30 of them call _electron.launch()
+  // directly rather than going through _harness.cjs, and on a fresh CI runner
+  // they get the first-run welcome tour whose overlay eats pointer events.
+  // They all spread ...process.env, so setting it there is what reaches them.
+  globalSetup: require.resolve('./tests/global-setup.cjs'),
   timeout: 120_000,
   expect: { timeout: 15_000 },
   retries: 1,

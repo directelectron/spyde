@@ -103,4 +103,33 @@ test.describe('first-run welcome walkthrough', () => {
       rmSync(home, { recursive: true, force: true })
     }
   })
+
+  test('a default harness launch never auto-opens the tour', async () => {
+    // Every OTHER spec launches without its own SPYDE_SETTINGS_DIR, and none of
+    // them wants the welcome tour: its full-screen overlay swallows pointer
+    // events, so a titlebar hover fails with "<div> from <div
+    // data-testid=tour-overlay> subtree intercepts pointer events". That is
+    // exactly how action_scoping.spec.ts failed on CI while passing on every
+    // dev box — a machine that has actually RUN SpyDE has tutorial_seen
+    // persisted in the real ~/.spyde, and a fresh runner does not.
+    //
+    // launchApp now always points SPYDE_SETTINGS_DIR at a scratch dir seeded
+    // with tutorial_seen, so the outcome no longer depends on whose machine it
+    // is. The two tests above prove the opt-out still works: pass your own
+    // settings dir and you get a genuine first launch.
+    const ctx = await launchApp({ dask: false })
+    try {
+      await ctx.page.waitForTimeout(3000)   // past FirstRunGate's get_first_run
+      await expect(ctx.page.getByTestId('tour-overlay')).toHaveCount(0)
+      await ctx.page.screenshot({ path: join(SHOTS, '05-default-launch-no-tour.png') })
+
+      // And the thing the overlay was blocking — a hover — actually lands.
+      const bar = ctx.page.getByTestId('menu-bar')
+      await expect(bar).toBeVisible()
+      await bar.hover()
+      ctx.assertNoJsErrors()
+    } finally {
+      await ctx.app.close()
+    }
+  })
 })

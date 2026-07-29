@@ -75,6 +75,38 @@ test('the fitted model matches the spectrum on screen', async () => {
       return rms / (span || 1)
     }
 
+    /** misfit(), but only once the overlay has stopped changing.
+     *
+     * Every goTo below ends in a flat waitForTimeout, and repainting the model
+     * overlay is a backend round trip that can outlast it on a loaded runner.
+     * A single read then scores the PREVIOUS position's curve against THIS
+     * position's data, which is not a small error: the sweep logged worst
+     * misfits of 47%, 76%, 83% and 191% across CI runs, while re-measuring
+     * that very position a moment later gave 2-12%. So "worst" was really
+     * "where the read was most stale", and the assertion that compares it to a
+     * dedicated refit went flaky on the noise.
+     *
+     * Sampling until two consecutive reads agree fixes the measurement rather
+     * than loosening the tolerance around it — and unlike waiting for the
+     * curve to CHANGE, it makes no assumption that neighbouring positions have
+     * visibly different fits.
+     */
+    const settledMisfit = async (timeout = 30_000) => {
+      const deadline = Date.now() + timeout
+      let prev = misfit((await curves())!)
+      // THREE consecutive agreements, not two: one repeat can land in a lull
+      // while the model overlay is still catching up with the data.
+      let stable = 0
+      while (Date.now() < deadline) {
+        await page.waitForTimeout(150)
+        const now = misfit((await curves())!)
+        stable = Math.abs(now - prev) < 1e-9 ? stable + 1 : 0
+        prev = now
+        if (stable >= 2) return now
+      }
+      return prev
+    }
+
     const sig = sigWindow(page)
     await sig.getByTestId('subwindow-titlebar').hover()
     await sig.getByTestId('action-btn-Fit').click()
@@ -115,7 +147,7 @@ test('the fitted model matches the spectrum on screen', async () => {
     await page.waitForTimeout(2_000)
     await page.screenshot({ path: `${SHOTS}/01-after-fit-all.png`, fullPage: true })
 
-    const afterAll = misfit((await curves())!)
+    const afterAll = await settledMisfit()
     console.log(`misfit right after Fit all Spectra: ${(afterAll * 100).toFixed(1)}% of range`)
 
     // ── sweep the navigator: ONE position proves nothing ─────────────────
@@ -128,7 +160,19 @@ test('the fitted model matches the spectrum on screen', async () => {
     }, figIds.nav)
     expect(cross, 'the navigator has no crosshair').toBeTruthy()
 
+    const sigOf = (a: number[] | null) =>
+      a ? `${a.length}:${a[0]}:${a[a.length >> 1]}:${a[a.length - 1]}` : ''
+
+    /** Signatures of BOTH curves. They update independently, which is the
+     *  whole problem: the spectrum can be this position's while the model
+     *  overlay is still the previous one's. */
+    const sigs = async () => {
+      const c = await curves()
+      return { data: sigOf(c?.data ?? null), model: sigOf(c?.model ?? null) }
+    }
+
     const goTo = async (cx: number, cy: number) => {
+      const before = await sigs()
       await page.evaluate(({ f, panel, id, x, y }) => {
         window.postMessage({
           type: 'awi_event', figId: f,
@@ -138,7 +182,26 @@ test('the fitted model matches the spectrum on screen', async () => {
           }),
         }, '*')
       }, { f: figIds.nav, panel: cross.panel_id, id: cross.id, x: cx, y: cy })
-      await page.waitForTimeout(1_200)
+
+      // Wait for BOTH curves to become this position's.
+      //
+      // Neither weaker version held on CI. A flat 1.2s: [2,2] read 191.6%
+      // where re-measuring gave 3.7%. "Sample until two reads agree": a stale
+      // overlay is perfectly stable, so stability cannot tell "finished
+      // updating" from "has not started". Waiting only for the DATA: the
+      // spectrum arrives first and the model follows separately, so [16,2]
+      // still scored 28.3% mid-sweep on a loaded runner.
+      //
+      // The MODEL changing is the signal that the overlay is this position's,
+      // and it is what made fit_navigate stable. Falls through on timeout
+      // rather than hanging — two positions could in principle fit alike, and
+      // settledMisfit below is still the final guard.
+      const deadline = Date.now() + 30_000
+      while (Date.now() < deadline) {
+        await page.waitForTimeout(100)
+        const now = await sigs()
+        if (now.data !== before.data && now.model !== before.model) break
+      }
     }
 
     let worst = { m: 0, at: [0, 0] as number[] }
@@ -146,7 +209,7 @@ test('the fitted model matches the spectrum on screen', async () => {
     for (const cy of [2, 10, 16, 24, 30]) {
       for (const cx of [2, 10, 16, 24, 30]) {
         await goTo(cx, cy)
-        const m = misfit((await curves())!)
+        const m = await settledMisfit()
         swept.push(m)
         if (m > worst.m) worst = { m, at: [cx, cy] }
         if (swept.length <= 3) {
@@ -163,12 +226,12 @@ test('the fitted model matches the spectrum on screen', async () => {
 
     await goTo(worst.at[0], worst.at[1])
     await page.screenshot({ path: `${SHOTS}/03-worst-position.png`, fullPage: true })
-    const worstBefore = misfit((await curves())!)
+    const worstBefore = await settledMisfit()
     await page.locator('[data-testid="fit-spectrum"]').click()
     await expect(page.locator('[data-testid="fit-status"]'))
       .toContainText(/chi2/i, { timeout: 60_000 })
     await page.waitForTimeout(1_500)
-    const worstAfter = misfit((await curves())!)
+    const worstAfter = await settledMisfit()
     await page.screenshot({ path: `${SHOTS}/04-worst-refitted.png`, fullPage: true })
     console.log(`worst position: ${(worstBefore * 100).toFixed(1)}% -> ` +
       `${(worstAfter * 100).toFixed(1)}% after Fit spectrum`)
@@ -191,7 +254,7 @@ test('the fitted model matches the spectrum on screen', async () => {
       .toContainText(/chi2/i, { timeout: 60_000 })
     await page.waitForTimeout(1_500)
     await page.screenshot({ path: `${SHOTS}/02-after-fit-spectrum.png`, fullPage: true })
-    const afterOne = misfit((await curves())!)
+    const afterOne = await settledMisfit()
     console.log(`misfit after Fit spectrum here    : ${(afterOne * 100).toFixed(1)}% of range`)
 
     expect(

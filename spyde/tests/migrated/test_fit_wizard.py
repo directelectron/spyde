@@ -65,6 +65,27 @@ def _messages_of(window, kind):
     return [m for m in window["messages"] if m.get("type") == kind]
 
 
+def _await_messages(window, kind, timeout=30.0):
+    """Same, but for a message the handler emits ASYNCHRONOUSLY.
+
+    `fit_open` returns before the palette exists on purpose: `_send_catalogue`
+    samples it via `run_on_worker` because the first call in a process builds
+    nine hyperspy components (~680 ms of sympy lambdify) and used to stall the
+    caret. A real Session has `_dispatch_to_main`, so that genuinely lands on
+    another thread — asserting straight after the call only passed when an
+    earlier test happened to warm the catalogue first. It was the flakiest
+    test in CI (5 of 12 legs).
+    """
+    import time
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        got = _messages_of(window, kind)
+        if got:
+            return got
+        time.sleep(0.01)
+    return []
+
+
 class TestOpenClose:
     def test_open_creates_a_wizard_and_sends_state(self, window, fitted):
         session, plot, tree, _ = fitted
@@ -76,7 +97,7 @@ class TestOpenClose:
         """#56 — the picker needs SHAPES, not just names."""
         session, plot, tree, _ = fitted
         fit_open(session, plot, {})
-        cat = _messages_of(window, "fit_catalogue")
+        cat = _await_messages(window, "fit_catalogue")
         assert cat, "no catalogue was sent"
         kinds = {c["kind"] for c in cat[-1]["components"]}
         assert {"Gaussian", "PowerLaw", "Offset"} <= kinds

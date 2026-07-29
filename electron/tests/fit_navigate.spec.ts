@@ -77,7 +77,24 @@ test('the overlaid model follows the navigator after a scan fit', async () => {
     }
     const cross = await navCrosshair()
 
+    /** Signature of the SPECTRUM on the signal plot — changes when the
+     *  navigator actually lands on a different position. */
+    const dataSig = async () => page.evaluate((f) => {
+      const hook = (window as any)._spyde_test_panel_json
+      for (const raw of hook ? hook(f) : []) {
+        const d = JSON.parse(raw)
+        if (!d.data_b64) continue
+        const bin = atob(d.data_b64)
+        const bytes = new Uint8Array(bin.length)
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+        const v = Array.from(new Float64Array(bytes.buffer))
+        return `${v.length}:${v[0]}:${v[v.length >> 1]}:${v[v.length - 1]}`
+      }
+      return ''
+    }, figIds.sig)
+
     const goTo = async (cx: number, cy: number) => {
+      const before = await dataSig()
       await page.evaluate(({ f, panel, id, x, y }) => {
         window.postMessage({
           type: 'awi_event', figId: f,
@@ -87,7 +104,16 @@ test('the overlaid model follows the navigator after a scan fit', async () => {
           }),
         }, '*')
       }, { f: figIds.nav, panel: cross.panel_id, id: cross.id, x: cx, y: cy })
-      await page.waitForTimeout(2_500)
+      // Confirm the navigator LANDED before reading anything, instead of
+      // assuming 2.5s was enough. When it was not, the caret never showed the
+      // new position and the reads below compared a position against itself —
+      // "the model stayed IDENTICAL at two different navigator positions",
+      // which is a moved-too-early failure, not a stale-fit one.
+      const deadline = Date.now() + 60_000
+      while (Date.now() < deadline) {
+        await page.waitForTimeout(100)
+        if ((await dataSig()) !== before) break
+      }
     }
 
     const readModel = async () => {
@@ -111,20 +137,27 @@ test('the overlaid model follows the navigator after a scan fit', async () => {
     await page.screenshot({ path: `${SHOTS}/02-at-6-6.png`, fullPage: true })
 
     await goTo(26, 26)
-    const at2626 = await readModel()
+    // Poll rather than read once, for the same reason as the curve read at the
+    // bottom: goTo's flat 2.5s can be shorter than the caret's refresh on a
+    // loaded runner, and a stale read here fails as "the model is IDENTICAL".
+    // The assertion keeps its teeth — if the fields never diverge, the poll
+    // times out and reports it.
+    let at2626: Record<string, number> = {}
+    await expect
+      .poll(async () => {
+        at2626 = await readModel()
+        return Object.keys(at66)
+          .filter((k) => Math.abs(at66[k] - at2626[k]) > 1e-9).length
+      }, {
+        timeout: 60_000,
+        message: 'the model stayed IDENTICAL at two different navigator '
+          + 'positions — the caret is showing a stale fit, not this position\'s',
+      })
+      .toBeGreaterThan(0)
     await page.screenshot({ path: `${SHOTS}/03-at-26-26.png`, fullPage: true })
 
     console.log('model at (6,6)  :', JSON.stringify(at66))
     console.log('model at (26,26):', JSON.stringify(at2626))
-
-    const changed = Object.keys(at66).filter(
-      (k) => Math.abs(at66[k] - at2626[k]) > 1e-9)
-    expect(
-      changed.length,
-      `the model is IDENTICAL at two different navigator positions ` +
-      `(${JSON.stringify(at66)}) — the caret is showing a stale fit, not ` +
-      `this position's`,
-    ).toBeGreaterThan(0)
 
     // ── and each named component must be the SAME PEAK at both stops ─────
     // Two gaussians are exchangeable, so an unconstrained fit puts the broad
@@ -165,11 +198,19 @@ test('the overlaid model follows the navigator after a scan fit', async () => {
     const curveHere = await modelCurve()
     expect(curveHere, 'no overlaid model curve on the signal plot').toBeTruthy()
     await goTo(6, 6)
-    const curveThere = await modelCurve()
-    expect(
-      JSON.stringify(curveThere),
-      'the overlaid model curve did not change between positions',
-    ).not.toEqual(JSON.stringify(curveHere))
+    // POLL, don't read once. goTo ends in a flat waitForTimeout(2_500), and
+    // repainting the overlay is a backend round trip — on a loaded CI runner
+    // it can outlast that, so a single read returns the PREVIOUS position's
+    // curve and the assertion below fires on two identical values. That is
+    // exactly how this went flaky (peak 404.84/argmax 486 at both stops).
+    // Waiting for the change is also faster than the fixed sleep in the
+    // common case, and it is the property the test is named for.
+    await expect
+      .poll(async () => JSON.stringify(await modelCurve()), {
+        timeout: 60_000,
+        message: 'the overlaid model curve did not change between positions',
+      })
+      .not.toEqual(JSON.stringify(curveHere))
 
     await assertNoJsErrors()
   } finally {

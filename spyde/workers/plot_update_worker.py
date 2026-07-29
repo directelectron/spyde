@@ -60,10 +60,26 @@ class PlotUpdateWorker:
         )
         self._thread.start()
 
-    def stop(self) -> None:
-        """Request the worker to stop. Returns immediately; thread exits on next tick."""
+    def stop(self, timeout: float = 1.0) -> None:
+        """Stop the worker and wait for its thread to actually be gone.
+
+        This used to set the flag and return, leaving the poll thread alive for
+        up to one more tick — plus however long a `_check()` already in flight
+        took, which can emit. A poller still walking a shut-down Session's
+        plots is a small leak in the app and outright confusing in tests: with
+        `Session.shutdown()` now fast, a previous test's worker could still be
+        painting while the next one measured, and one test read a leftover
+        16x16 navigator as its own 12x12 (`assert 256 == (12 * 12)`).
+
+        Bounded, and never joins from inside the poll thread, so it cannot
+        wedge — the thread is a daemon either way.
+        """
         self._running = False
         self._seen.clear()
+        t = self._thread
+        if t is not None and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout=timeout)
+        self._thread = None
 
     def _loop(self) -> None:
         while self._running:
