@@ -21,7 +21,12 @@ jobs:
   test:
     name: ${{ matrix.os }}-py${{ matrix.python-version }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # 30 was too tight once 0.3.0 grew the suite to 2372 tests: legs landed at
+    # 28m30s and half the matrix was CANCELLED mid-run at exactly 30m, which
+    # reads as a test failure but is a clock. The run is much shorter now (see
+    # the coverage note below); this is headroom, and a timeout never reached
+    # costs nothing.
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -58,11 +63,18 @@ jobs:
 
       # The single canonical Qt-free suite (testpaths=spyde/tests/migrated).
       # GPU tests skip themselves without CUDA/MPS. No display server required.
+      #
+      # Coverage on ONE leg only. `--cov` costs +45% wall-clock (measured
+      # 171s -> 248s over the same 25 files) and the upload below only runs on
+      # directelectron/spyde, so on every fork the other 11 legs paid ~9 minutes
+      # to write a coverage.xml nobody reads — which is what pushed half the
+      # matrix past timeout-minutes and got it cancelled mid-suite.
       - name: Run tests
-        run: uv run pytest spyde/tests/migrated --cov=spyde --cov-report=xml
+        run: uv run pytest spyde/tests/migrated ${{ (matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12') && '--cov=spyde --cov-report=xml' || '' }}
 
       - name: Upload coverage to Codecov
-        if: ${{ github.repository_owner == 'directelectron' }}
+        if: ${{ github.repository_owner == 'directelectron'
+                && matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12' }}
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -104,10 +116,14 @@ jobs:
       - name: Versions
         run: |
           uv run python -V
-          uv run python -c "import exspy, kikuchipy, atomap; \
-            print('exspy', exspy.__version__); \
-            print('kikuchipy', kikuchipy.__version__); \
-            print('atomap', atomap.__version__)"
+          # importlib.metadata, not `pkg.__version__` — atomap imports fine but
+          # exposes no `__version__`, which failed this job before a single test
+          # ran. The point of the step is "the extra installed and imports", so
+          # ask the installed distribution, which every package answers.
+          uv run python -c "import importlib.metadata as m; \
+            import exspy, kikuchipy, atomap; \
+            print('\n'.join(f'{p} {m.version(p)}' \
+              for p in ('exspy', 'kikuchipy', 'atomap')))"
 
       - name: Run tests (extras present)
         run: uv run pytest spyde/tests/migrated
@@ -183,24 +199,24 @@ jobs:
   # Best-effort for now (continue-on-error): the e2e launches a real Electron app
   # + Dask LocalCluster and has not yet been validated green on a hosted runner.
   # Drop continue-on-error once it's confirmed stable in CI.
-  # Sharded ×3: the suite is deliberately serial WITHIN a run (one Electron +
+  # Sharded ×4: the suite is deliberately serial WITHIN a run (one Electron +
   # Dask cluster at a time — see playwright.config.ts), so wall-clock scales
   # only by splitting the spec files across independent runners. Each shard is
   # still fully serial, so the cluster-contention flakiness that forced
   # workers:1 cannot recur across shards (separate VMs). Playwright balances
-  # shards by FILE COUNT, not duration — ×2 measured 22.7m vs 10.0m — so ×3
-  # keeps the worst shard under ~15m even while the known-failing specs pay
-  # retry + app-reboot tax (2026-07-11: 16 failing tests account for ~23 of
-  # the 33 spec-minutes; fixing them is the real speedup).
+  # shards by FILE COUNT, not duration — ×2 measured 22.7m vs 10.0m, and ×3
+  # still ran 8.1m / 14.5m / >30m (shard 1 was CANCELLED at the timeout on
+  # test 76 of 115, so it produced no report at all). ×4 plus the domain
+  # extras below brings the worst shard back under the budget.
   e2e:
-    name: electron-e2e (ubuntu, shard ${{ matrix.shard }}/3)
+    name: electron-e2e (ubuntu, shard ${{ matrix.shard }}/4)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3]
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -220,8 +236,15 @@ jobs:
           version: "0.10.11"
           enable-cache: true
 
+      # WITH the domain extras. Without them the `requires_package:` gate hides
+      # every EELS/EBSD/atoms action, so the 0.3.0 specs that click those
+      # buttons cannot pass — 9 of them failed for that reason alone, and with
+      # retries:1 each one paid a second full app boot. Installing the extras
+      # makes them testable AND takes ~10 minutes of dead retry off shard 1.
+      # Not --frozen: the extras resolve per-platform, so the lock can't satisfy
+      # them (same reason as the `extras` job above).
       - name: Pre-sync the Python backend env
-        run: uv sync --frozen --extra tests
+        run: uv sync --extra tests --extra all
 
       - name: Install Electron dependencies
         working-directory: electron
@@ -237,7 +260,7 @@ jobs:
       # downloads + screenshot writes) that is meant to be opt-in.
       - name: Run Electron e2e
         working-directory: electron
-        run: xvfb-run --auto-servernum npm run test:build -- --project=electron --shard=${{ matrix.shard }}/3
+        run: xvfb-run --auto-servernum npm run test:build -- --project=electron --shard=${{ matrix.shard }}/4
 
       - name: Upload Playwright report
         if: ${{ always() }}
