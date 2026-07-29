@@ -64,11 +64,14 @@ jobs:
       # The single canonical Qt-free suite (testpaths=spyde/tests/migrated).
       # GPU tests skip themselves without CUDA/MPS. No display server required.
       #
-      # Coverage on ONE leg only. `--cov` costs +45% wall-clock (measured
-      # 171s -> 248s over the same 25 files) and the upload below only runs on
-      # directelectron/spyde, so on every fork the other 11 legs paid ~9 minutes
-      # to write a coverage.xml nobody reads — which is what pushed half the
-      # matrix past timeout-minutes and got it cancelled mid-suite.
+      # Coverage on ONE leg only: the upload below runs solely on
+      # directelectron/spyde, so on every fork the other 11 legs wrote a
+      # coverage.xml nobody reads. Cost is +45% on a Windows dev box (measured
+      # 171s -> 248s over the same 25 files) but only ~15% on a hosted Linux
+      # runner (12.5m with vs ~10.8m without, same commit) — so this is tidiness
+      # and ~1.5m a leg, NOT the reason the matrix used to time out. That was
+      # DaskManager.shutdown() sleeping 0.5s per Session teardown; see
+      # test_dask_shutdown_fast.py.
       - name: Run tests
         run: uv run pytest spyde/tests/migrated ${{ (matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12') && '--cov=spyde --cov-report=xml' || '' }}
 
