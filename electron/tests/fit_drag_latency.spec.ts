@@ -107,9 +107,24 @@ test('the fit keeps up with a navigator drag', async () => {
     const posted = Date.now() - t0
 
     const target = await (async () => {
-      // Whatever the final position settles to, given enough time.
-      await page.waitForTimeout(6_000)
-      return shownA()
+      // Whatever the final position settles to — sampled until it STOPS
+      // moving, not after a flat 6s. If the first drag has not finished
+      // settling, `target` is a moving goalpost and the 2%-of-swing window
+      // below can never be hit: on CI this reported settled = -1, i.e. never
+      // converged in 12s, rather than merely exceeding the 700 ms budget it
+      // is actually there to measure. Making the reference real keeps that
+      // budget honest instead of loosening it.
+      const deadline = Date.now() + 30_000
+      let prev = await shownA()
+      let stable = 0
+      while (Date.now() < deadline) {
+        await page.waitForTimeout(200)
+        const now = await shownA()
+        stable = Math.abs(now - prev) <= Math.abs(now) * 1e-9 ? stable + 1 : 0
+        prev = now
+        if (stable >= 3) break
+      }
+      return prev
     })()
     expect(target).not.toBeCloseTo(start, 3)
 
