@@ -727,3 +727,45 @@ Three things this pins down:
   it (50.2 s) and neither does a bigger window — if the progressive fill is ever
   worth optimising further, the lever is fewer, larger display chunks, not more
   in-flight ones.
+
+## Rigid drift solve — phase correlation backends + accuracy vs upsample (2026-07-29)
+
+`spyde/drift/translation.py` step A1. Synthetic stack built by Fourier phase ramp
+so sub-pixel ground truth is exact (no interpolation in the truth).
+
+**Accuracy** — 5 frames, 96×112, truth shifts deliberately OFF the `1/upsample`
+grid (`1.37, -2.83, …`). This matters: shifts that happen to be multiples of
+`1/upsample` come back at 0.00000 px, which looks superb and tests nothing.
+
+| upsample | max error |
+|---|---|
+| 1 | 0.440 px |
+| 2 | 0.220 px |
+| 8 | **0.065 px** ← inside the 0.1 px acceptance gate |
+| 32 | 0.015 px |
+| 64 | 0.014 px (floor) |
+
+Halves as expected until ~u=32, where it hits the scene's own noise floor. `u=8`
+is the default: comfortably inside the gate at a fraction of the refinement cost.
+
+**Throughput** — 120 frames × 512², upsample=8, warm (cold CUDA run discarded).
+
+| backend | time | frames/s | |
+|---|---|---|---|
+| numpy | 6.57 s | 18 | reference path |
+| torch **cpu** | 0.86 s | **139** | **7.7× numpy** |
+| torch cuda | 0.42 s | 284 | 16× numpy |
+
+**Do NOT default to numpy on a CPU-only machine.** `_resolve_ops` originally
+preferred numpy when no GPU was present, reasoning that torch's per-call dispatch
+would dominate at one frame at a time. Wrong by 7.7×: `np.fft.fft2` is
+single-threaded and `torch.fft.fft2` uses every core, and a per-frame FFT is the
+entire cost of this solver. Order is now cuda > mps > **torch cpu** > numpy, with
+numpy kept only as the explicitly-selectable parity reference.
+
+CUDA's 2× over torch-CPU is smaller than the batched-compute wins elsewhere in
+SpyDE because this solver is deliberately *streaming* — one frame at a time, so
+each frame pays a host→device transfer that a batched formulation would amortise.
+That is the accepted trade for the Memory-Safety rule (a 3000 × 4096² movie is
+tens of GB and cannot be batched wholesale). If the transfer ever dominates, the
+fix is a bounded read-ahead of a few frames, not materialising the stack.
