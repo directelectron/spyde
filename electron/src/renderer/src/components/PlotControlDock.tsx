@@ -744,36 +744,49 @@ export function PlotControlDock() {
                 style={{ ...styles.selectorDot, background: s.color ?? '#00e676' }}
                 title={s.title ?? 'Navigator'}
               />
-              <button
-                data-testid="selector-crosshair"
-                style={{
-                  ...(s.mode === 'crosshair' ? styles.toggleActive : styles.toggle),
-                  ...(s.sumFrames != null && s.mode === 'crosshair'
-                    ? styles.toggleJoined : {}),
-                }}
-                onClick={() => sendAction('set_selector_mode',
-                  { integrate: false, selector_id: s.selectorId }, s.windowId)}
-              >
-                ✛ Point
-                {/* The width, subtly, on the button itself — so you can see
-                    what the pointer is reading without opening anything. */}
-                {s.sumFrames != null && s.sumFrames > 1 && (
-                  <span style={styles.sumBadge}>{s.sumFrames}f</span>
+              {/* Point is a SPLIT control: the button picks the mode, and a
+                  caret at its right edge opens the frame-width menu. It has to
+                  be a styled wrapper around two siblings rather than a caret
+                  nested in the button, because buttons cannot contain buttons
+                  — so the wrapper carries the active/inactive look and both
+                  children are transparent inside it. */}
+              <div style={{
+                ...(s.mode === 'crosshair' ? styles.toggleActive : styles.toggle),
+                ...styles.splitWrap,
+              }}>
+                <button
+                  data-testid="selector-crosshair"
+                  style={{
+                    ...styles.splitMain,
+                    // Explicit, not inherited: a <button> does not take the
+                    // parent's colour from the UA stylesheet, and the `font`
+                    // shorthand in an inline style wiped the label entirely.
+                    color: s.mode === 'crosshair' ? '#11111b' : '#a6adc8',
+                    fontWeight: s.mode === 'crosshair' ? 600 : 400,
+                  }}
+                  onClick={() => sendAction('set_selector_mode',
+                    { integrate: false, selector_id: s.selectorId }, s.windowId)}
+                >
+                  ✛ Point
+                  {/* The width, subtly, so you can see what the pointer is
+                      reading without opening the menu. */}
+                  {s.sumFrames != null && s.sumFrames > 1 && (
+                    <span style={styles.sumBadge}>{s.sumFrames}f</span>
+                  )}
+                </button>
+                {s.sumFrames != null && s.mode === 'crosshair' && (
+                  <Dropdown
+                    testid="selector-sum-frames"
+                    value={String(s.sumFrames ?? 1)}
+                    triggerText=""
+                    bare
+                    caretColor={s.mode === 'crosshair' ? '#11111b' : '#6c7086'}
+                    options={sumFrameOptions(s.navSize ?? 0, s.navScale ?? 0)}
+                    onChange={(v) => sendAction('set_selector_sum',
+                      { frames: Number(v), selector_id: s.selectorId }, s.windowId)}
+                  />
                 )}
-              </button>
-              {/* …and the picker hangs off it, a bare caret since the count is
-                  already on the button. */}
-              {s.sumFrames != null && s.mode === 'crosshair' && (
-                <Dropdown
-                  testid="selector-sum-frames"
-                  value={String(s.sumFrames ?? 1)}
-                  triggerText=""
-                  width={26}
-                  options={sumFrameOptions(s.navSize ?? 0, s.navScale ?? 0)}
-                  onChange={(v) => sendAction('set_selector_sum',
-                    { frames: Number(v), selector_id: s.selectorId }, s.windowId)}
-                />
-              )}
+              </div>
               <button
                 data-testid="selector-integrate"
                 style={s.mode === 'integrate' ? styles.toggleActive : styles.toggle}
@@ -813,10 +826,15 @@ function sumFrameOptions(navSize: number, navScale: number) {
 }
 
 const styles: Record<string, React.CSSProperties> = {
-  // Square off the Point button's right edge so the picker reads as attached
-  // to it rather than as a third control in the row.
-  toggleJoined: {
-    borderTopRightRadius: 0, borderBottomRightRadius: 0, marginRight: -1,
+  // The wrapper owns the button's look; the children sit transparently in it.
+  // NO overflow:hidden — the caret's menu is absolutely positioned inside this
+  // wrapper, so clipping it renders the options in the DOM but never visible.
+  splitWrap: {
+    display: 'flex', alignItems: 'center', padding: 0,
+  },
+  splitMain: {
+    flex: 1, background: 'transparent', border: 'none', fontSize: 11,
+    padding: '4px 2px 4px 6px', cursor: 'pointer', textAlign: 'center',
   },
   sumBadge: {
     marginLeft: 6, fontSize: 10, fontWeight: 600, opacity: 0.62,
