@@ -42,6 +42,7 @@ from spyde.backend import console_preview as cp
 # initialized-module circular import). Warming it here removes the race (the
 # established testharness pattern: ensure_heavy_imports BEFORE set_signal_type).
 from spyde.backend.heavy_imports import ensure_heavy_imports
+from spyde.tests.migrated.conftest import _settle
 ensure_heavy_imports()
 
 
@@ -182,6 +183,7 @@ class TestPreviewNeverComputesFull:
         sig = _lazy_4d()
         full_shape = sig.data.shape
         session._add_signal(sig, source_path=None)
+        _settle(session)   # the load's own settle timer must fire BEFORE the test drives the selector
         _wait_vars(session, msgs, lambda c: any(v["name"] == "s1" for v in c["vars"]))
 
         computed = {"full": False}
@@ -214,6 +216,7 @@ class TestCostGuard:
         # 1 nav position per chunk → 3*4 = 12 source chunks for a full-nav sum.
         sig = _lazy_4d(nav=(3, 4))
         session._add_signal(sig, source_path=None)
+        _settle(session)   # the load's own settle timer must fire BEFORE the test drives the selector
         _wait_vars(session, msgs, lambda c: any(v["name"] == "s1" for v in c["vars"]))
 
         with patch.object(da.Array, "compute",
@@ -268,6 +271,7 @@ class TestRenderKinds:
         _ = session.console
         sig = _lazy_4d()
         session._add_signal(sig, source_path=None)
+        _settle(session)   # the load's own settle timer must fire BEFORE the test drives the selector
         _wait_vars(session, msgs, lambda c: any(v["name"] == "s1" for v in c["vars"]))
         res = _preview(session, msgs, "s1")
         assert res["kind"] == "image"
@@ -338,6 +342,7 @@ class TestNavPositionResolution:
         _ = session.console
         sig, arr = _stamped_4d()
         session._add_signal(sig, source_path=None)
+        _settle(session)   # the load's own settle timer must fire BEFORE the test drives the selector
         _wait_vars(session, msgs, lambda c: any(v["name"] == "s1" for v in c["vars"]))
         tree = session.signal_trees[0]
 
@@ -359,6 +364,7 @@ class TestNavPositionResolution:
         _ = session.console
         sig, arr = _stamped_4d()
         session._add_signal(sig, source_path=None)
+        _settle(session)   # the load's own settle timer must fire BEFORE the test drives the selector
         _wait_vars(session, msgs, lambda c: any(v["name"] == "s1" for v in c["vars"]))
         tree = session.signal_trees[0]
         # Clear any resolved indices so _nav_indices_for returns (None, None) —
@@ -438,6 +444,7 @@ class TestNavRefresh:
         _ = session.console
         sig, arr = _stamped_4d()
         session._add_signal(sig, source_path=None)
+        _settle(session)   # the load's own settle timer must fire BEFORE the test drives the selector
         _wait_vars(session, msgs, lambda c: any(v["name"] == "s1" for v in c["vars"]))
         tree = session.signal_trees[0]
         nav = TestNavPositionResolution()
@@ -526,6 +533,7 @@ class TestNavRefresh:
         session, msgs = window["window"], window["messages"]
         sig = _lazy_4d()
         session._add_signal(sig, source_path=None)
+        _settle(session)   # the load's own settle timer must fire BEFORE the test drives the selector
         tree = session.signal_trees[0]
         sel = TestNavPositionResolution()._signal_selector(session, tree)
         assert sel is not None
