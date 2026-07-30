@@ -122,7 +122,14 @@ torch = [
 # pattern). When actively editing anyplotlib locally, temporarily re-add the
 # editable path override below (do NOT commit it — the path doesn't exist on CI
 # runners and breaks `uv sync --frozen`):
-# anyplotlib = { path = "../anyplotlib", editable = true }
+# ACTIVE while the brush widget (CSSFrancis/anyplotlib#47) is in flight — the
+# Segment wizard's Scribble tab cannot paint without it, and a plain
+# `pip install -e` does NOT survive: any `uv sync` re-resolves from the lockfile
+# and puts PyPI's 0.4.2 back, which is how scribbling silently broke twice.
+# Declaring the source here is what makes uv PRESERVE the local checkout.
+# DO NOT COMMIT the line below — ../anyplotlib does not exist on CI runners and
+# it breaks `uv sync --frozen`. Delete it once #47 lands and the pin is bumped.
+anyplotlib = { path = "../anyplotlib", editable = true }
 
 [tool.pycrucible]
 entrypoint = "main.py"

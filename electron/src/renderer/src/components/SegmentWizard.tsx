@@ -225,6 +225,13 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
       local_size: v.localSize, clear_border: v.clearBorder,
       store_masks: v.storeMasks, track: v.track, max_dist: v.maxDist,
       brush: v.brush,
+      // The brush WIDGET lives in Python, so the strip's state has to travel or
+      // it cannot affect painting. These two were missing, and the symptoms were
+      // exactly that: every stroke came out in class 0 ("I can only scribble one
+      // colour") and the eraser never erased ("delete doesn't work"), because
+      // the backend read `active_class`/`erase` from params that nothing set.
+      active_class: v.activeClass,
+      erase: v.eraser,
     }
   }
 
@@ -409,7 +416,11 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
               <div data-testid="seg-trained-note" style={okNoteStyle}>{trainReport}</div>
             )}
             <ClassList classes={classes} activeClass={activeClass}
-              onSelect={(id) => { setEraser(false); setActiveClass(id) }} />
+              onSelect={(id) => {
+                setEraser(false); setActiveClass(id)
+                vals.current = { ...vals.current, activeClass: id, eraser: false }
+                tune()
+              }} />
             <button data-testid="seg-train" style={canTrain ? secondaryBtnStyle : disabledSecondaryStyle}
               disabled={!canTrain}
               title={canTrain ? 'Fit the scribble classifier on every labelled pixel'
@@ -552,10 +563,21 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
       {stripPos && classes.length > 0 && method === 'scribble' && (
         <ClassStrip
           classes={classes} activeId={activeClass}
-          onSelect={setActiveClass}
+          // Push to the backend, don't just set React state: the widget that
+          // does the painting is Python-side.
+          onSelect={(id) => {
+            setActiveClass(id); setEraser(false)
+            vals.current = { ...vals.current, activeClass: id, eraser: false }
+            tune()
+          }}
           brush={brush}
           onBrush={(b) => { setBrush(b); vals.current = { ...vals.current, brush: b }; tune() }}
-          eraser={eraser} onEraser={setEraser}
+          eraser={eraser}
+          onEraser={(on) => {
+            setEraser(on)
+            vals.current = { ...vals.current, eraser: on }
+            tune()
+          }}
           posStyle={stripPos}
         />
       )}

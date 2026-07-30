@@ -103,6 +103,12 @@ DEFAULTS: dict[str, Any] = dict(
     track=True,
     max_dist=10.0,
     brush=3.0,
+    # The paint state the ClassStrip owns. These MUST be real parameters: the
+    # brush widget lives in Python, so the strip's choices only reach the paint
+    # by travelling through here. They were read but never declared or set, which
+    # pinned every stroke to class 0 and made the eraser a no-op.
+    active_class=0,
+    erase=False,
 )
 
 
@@ -694,6 +700,9 @@ def seg_tune(session, plot, payload) -> None:
     if wiz is None:
         return
     wiz.params = _coerce({**wiz.params, **(payload or {})})
+    # Paint state must reach the WIDGET, not just the params dict — the widget is
+    # what tags a stroke, so a class change that stops here paints the old colour.
+    _sync_brush(wiz)
     gen = wiz.guard()
     _preview(wiz, gen)
 
@@ -847,6 +856,30 @@ def _attach_brush(wiz) -> bool:
     wiz.tree._seg_brush_handler = handler      # weak callbacks: keep a hard ref
     wiz._brush_seen = 0
     return True
+
+
+def _sync_brush(wiz) -> None:
+    """Push the caret's paint state onto the live brush widget.
+
+    The widget tags each stroke with its OWN ``class_id`` at paint time in JS, so
+    a class change that only reaches ``wiz.params`` paints the previous colour
+    forever — which is precisely what "I can only scribble one colour" was.
+    Likewise ``erase``: the eraser is a widget mode, not something the handler can
+    decide after the fact, because the stroke has already been tagged.
+
+    No-op when there is no brush (Classical, or an anyplotlib without one).
+    """
+    brush = getattr(wiz.tree, "_seg_brush", None)
+    if brush is None:
+        return
+    try:
+        brush.set(
+            class_id=int(wiz.params.get("active_class", 0)),
+            radius=float(wiz.params.get("brush", 3.0)),
+            erase=bool(wiz.params.get("erase", False)),
+        )
+    except Exception as exc:
+        log.debug("[seg] syncing brush state failed: %s", exc)
 
 
 def _arm_brush(wiz) -> None:

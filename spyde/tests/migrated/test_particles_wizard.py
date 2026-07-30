@@ -641,3 +641,107 @@ class TestBrushActuallyPaints:
                    or "brush" in str(m.get("text", "")).lower() for m in new), (
             "switching to Scribble with no brush available emitted nothing — "
             "the user gets a picture that ignores them and no explanation")
+
+
+class TestPaintStateReachesTheWidget:
+    """Class and eraser must travel to the WIDGET, not stop at wiz.params.
+
+    Both bugs here shipped and were user-visible: every stroke came out in class
+    0 ("I can only scribble one colour") and the eraser did nothing ("delete
+    doesn't work"). One root cause — the ClassStrip set React state, nothing sent
+    it to Python, and the backend read `active_class` / `erase` from params that
+    were never declared and never set.
+
+    The widget tags each stroke with its OWN class at paint time in JS, so a
+    change that only reaches ``wiz.params`` paints the previous colour forever.
+    That is why these assert on the WIDGET's attributes and on what actually
+    landed in the store — not on the params dict, which was already "right" while
+    the paint was wrong.
+    """
+
+    def _scribbling(self, session):
+        from spyde.actions.particles_action import seg_open, seg_set_method
+        session._load_test_data_particles({"frames": 4})
+        plots = (list(session._plots) if isinstance(session._plots, list)
+                 else list(session._plots.values()))
+        plot = next(p for p in plots
+                    if getattr(p, "signal_tree", None) is not None
+                    and getattr(p, "_plot2d", None) is not None)
+        seg_open(session, plot, {"window_id": getattr(plot, "window_id", None)})
+        seg_set_method(session, plot, {"method": "scribble"})
+        return plot, plot.signal_tree
+
+    @staticmethod
+    def _stroke(tree, wiz, pts):
+        from spyde.actions.particles_action import _on_stroke
+        brush = tree._seg_brush
+        strokes = list(getattr(brush, "strokes", []) or [])
+        classes = list(getattr(brush, "stroke_classes", []) or [])
+        brush.set(strokes=strokes + [pts],
+                  stroke_classes=classes + [int(brush.class_id)])
+        _on_stroke(wiz, None)
+
+    def test_defaults_declare_the_paint_state(self):
+        """They were read but never declared, so params.get() always won."""
+        from spyde.actions.particles_action import DEFAULTS
+        assert "active_class" in DEFAULTS, (
+            "active_class is read by the brush but not a declared parameter, so "
+            "nothing can ever set it and every stroke is class 0")
+        assert "erase" in DEFAULTS
+
+    def test_switching_class_retags_the_next_stroke(self, window):
+        from spyde.actions.particles_action import _brush_supported, seg_tune
+        session = window["window"]
+        plot, tree = self._scribbling(session)
+        if not _brush_supported():
+            pytest.skip("installed anyplotlib has no brush widget (needs >= 0.5.0)")
+        wiz = tree._seg_wizard
+        store = wiz.label_store()
+
+        self._stroke(tree, wiz, [[20.0, 30.0], [26.0, 32.0]])
+        seg_tune(session, plot, {"active_class": 1})
+        assert int(tree._seg_brush.class_id) == 1, (
+            "seg_tune did not reach the widget — the strip's choice stops at "
+            "wiz.params and the next stroke paints the OLD class")
+        self._stroke(tree, wiz, [[60.0, 40.0], [66.0, 42.0]])
+        seg_tune(session, plot, {"active_class": 2})
+        self._stroke(tree, wiz, [[80.0, 20.0], [86.0, 22.0]])
+
+        counts = dict(store.counts())
+        assert counts[0] > 0 and counts[1] > 0 and counts[2] > 0, (
+            f"only some classes were painted: {counts}")
+
+    def test_eraser_removes_and_leaves_other_classes_alone(self, window):
+        from spyde.actions.particles_action import _brush_supported, seg_tune
+        session = window["window"]
+        plot, tree = self._scribbling(session)
+        if not _brush_supported():
+            pytest.skip("installed anyplotlib has no brush widget (needs >= 0.5.0)")
+        wiz = tree._seg_wizard
+        store = wiz.label_store()
+
+        path = [[20.0, 30.0], [26.0, 32.0]]
+        self._stroke(tree, wiz, path)
+        seg_tune(session, plot, {"active_class": 1})
+        self._stroke(tree, wiz, [[60.0, 40.0], [66.0, 42.0]])
+        before = dict(store.counts())
+        assert before[0] > 0 and before[1] > 0
+
+        seg_tune(session, plot, {"erase": True})
+        assert bool(tree._seg_brush.erase) is True, (
+            "the eraser is a WIDGET mode — a stroke is tagged before the handler "
+            "sees it, so an erase flag that stops at wiz.params does nothing")
+        self._stroke(tree, wiz, path)          # retrace the class-0 stroke
+
+        after = dict(store.counts())
+        assert after[0] < before[0], "the eraser removed nothing"
+        assert after[1] == before[1], "the eraser hit a class it was not over"
+
+    def test_brush_size_reaches_the_widget_too(self, window):
+        from spyde.actions.particles_action import _brush_supported, seg_tune
+        session = window["window"]
+        plot, tree = self._scribbling(session)
+        if not _brush_supported():
+            pytest.skip("installed anyplotlib has no brush widget (needs >= 0.5.0)")
+        seg_tune(session, plot, {"brush": 9.0})
+        assert float(tree._seg_brush.radius) == pytest.approx(9.0)
