@@ -231,6 +231,37 @@ Locked, and it applies to both wizards:
    so closing the tree or hitting stop kills in-flight compute.
 4. **Target: minutes, not hours.** ~20–100 frames/s for segment + measure.
 
+### 0.9a The caret shows ONE control. Everything else is Advanced.
+
+Added after the first carets were reviewed: *"way too complicated. Too many
+options. Information overload."* That was a fair verdict on a Segment caret with
+~15 visible controls, and it is a drift from §0.9's own instruction ("expose one
+sensitivity control, not independent knobs") that happened one reasonable-looking
+addition at a time.
+
+The rule, for every action in this feature:
+
+- **The default face carries the task, not the algorithm.** One control that
+  changes the answer, the answer itself, and the button that commits it.
+- **Everything else lives behind a collapsed `Advanced`**, including parameters
+  that are genuinely important (min-size) but that a user should not normally
+  touch. Nothing is deleted — the Python API and the provenance keep everything.
+- **A warning belongs next to the control it is about**, inside Advanced, not on
+  the primary face. The min_size floor notice was a large orange block on the
+  front of the caret for a parameter most users will never open.
+- **Buttons are named for the job** — "Find in all frames", not "Run All".
+
+The measured couplings from §0.9 still hold; they just are not the *front* of the
+caret. Sensitivity and min-size stay adjacent **inside Advanced**.
+
+**Drift is the same rule applied harder.** Its parameters (reference mode,
+upsample, max-shift) have one right answer we already know, so the caret is a
+button, a progress bar, and 2–3 toggles — one of which is *"use ROI for
+alignment"*. The dx/dy curve is not caret furniture: it is **its own plot window**,
+filled progressively as the solve runs. And discovery comes before commitment — a
+draggable ROI with a live drift-corrected sum over ~20 frames, so the user *sees*
+whether alignment works on a subset before paying for the whole movie.
+
 ### 0.9 Detection sensitivity is the priority, not instance splitting
 
 Given hundreds of frequently-touching particles, the instinct is to pour effort
