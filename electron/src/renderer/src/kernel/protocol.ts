@@ -873,6 +873,130 @@ export interface ParticlesTableMessage extends MsgBase {
   partial?: boolean
 }
 
+// ── Segment Particles caret (spyde/actions/particles_action.py, plan B7) ─────
+
+/** One scribble class as the backend reports it — `ScribbleClass.to_dict()`
+ *  plus the labelled-pixel count `SegmentWizard.class_report()` adds.
+ *
+ *  `pixels` is NOT decoration: under-training a class is the failure mode
+ *  plan §B3 calls out, and this count is how the user notices. A class with
+ *  zero pixels is present in the list rather than absent from it. */
+export interface SegClassInfo {
+  id: number
+  name: string
+  /** CSS hex — the renderer's units; the backend never converts it. */
+  colour: string
+  /** Counts toward the foreground probability map (several classes may). */
+  particle: boolean
+  pixels: number
+}
+
+/** The caret's authoritative state, emitted by `_emit_state` after open,
+ *  method switch, paint and train. `params` are the EFFECTIVE (coerced)
+ *  values, not what the caret last sent. */
+export interface SegStateMessage extends MsgBase {
+  type: 'seg_state'
+  window_id: number | null
+  /** 'classical' | 'scribble' | 'prompt'. */
+  method: string
+  /** Navigator frame the preview is showing. */
+  frame: number
+  n_frames: number
+  frame_shape: [number, number]
+  classes: SegClassInfo[]
+  /** Frame indices carrying at least one scribble. */
+  labelled_frames: number[]
+  trained: boolean
+  params: Record<string, unknown>
+}
+
+/** One frame's preview result. `min_size` is the EFFECTIVE value that ran and
+ *  `min_size_floored` says the backend raised what the caret asked for — the
+ *  caret must show the effective number (plan §0.9: at min_size=0 the split
+ *  returns background speckle as particles). `count` is already post-filter. */
+export interface SegPreviewMessage extends MsgBase {
+  type: 'seg_preview'
+  window_id: number | null
+  frame: number
+  count: number
+  /** Per-instance areas in calibrated units², capped at 2000 entries. */
+  areas: number[]
+  median_area: number
+  /** Signal-axis unit ("nm"); areas are in unit². */
+  units: string
+  method: string
+  min_size: number
+  min_size_floored: boolean
+  elapsed_ms: number
+}
+
+/** Scribble classifier fit report (`ScribbleClassifier.fit`). */
+export interface SegTrainedMessage extends MsgBase {
+  type: 'seg_trained'
+  window_id: number | null
+  report: {
+    device?: string
+    n_pixels?: number
+    n_channels?: number
+    n_classes?: number
+    labelled_frames?: number[]
+    train_accuracy?: number
+    [k: string]: unknown
+  }
+}
+
+// ── Drift Correction caret (spyde/actions/drift_action.py, plan A8) ──────────
+
+/** Caret state. `window_id` is the SOURCE plot's window (where the caret
+ *  lives); `check_window_id` is the separate bare-figure Drift Check window
+ *  that holds the before/after sums. */
+export interface DriftStateMessage extends MsgBase {
+  type: 'drift_state'
+  window_id: number | null
+  check_window_id: number | null
+  /** 'rigid' | 'rigid_affine' | 'nonrigid' — only rigid has a solver. */
+  method: string
+  solved: boolean
+  params: Record<string, unknown>
+  /** Present on the open/ready emissions. */
+  n_frames?: number
+}
+
+/** A `drift_tune` result — the FIRST PAIR only (two FFTs, lands inside a
+ *  slider drag). NOT a per-frame stream: the whole-movie trace arrives once,
+ *  in `drift_result`. */
+export interface DriftPreviewMessage extends MsgBase {
+  type: 'drift_preview'
+  window_id: number | null
+  dy: number
+  dx: number
+  /** Solver residual for the pair; NaN when the model carries none. */
+  sharpness: number
+  params: Record<string, unknown>
+}
+
+/** Whole-movie solve progress (also emitted as a plain `progress` message). */
+export interface DriftProgressMessage extends MsgBase {
+  type: 'drift_progress'
+  window_id: number | null
+  done: number
+  total: number
+}
+
+/** The solved model. `shifts[i]` is the correction ADDED to frame i, `[dy, dx]`
+ *  in pixels; a cancelled solve leaves NaN rows for frames it never reached. */
+export interface DriftResultMessage extends MsgBase {
+  type: 'drift_result'
+  window_id: number | null
+  shifts: [number, number][]
+  kind: string
+  reference: string
+  max_abs_shift: number
+  /** Frames dropped from the running reference by the outlier rejector. */
+  rejected: number
+  cancelled: boolean
+}
+
 /**
  * Wizard-scoped events re-broadcast verbatim as DOM CustomEvents (the caret
  * components subscribe directly). The payload beyond `type` is consumer-defined,
@@ -999,6 +1123,13 @@ export type PlotAppMessage =
   | DaskStatsMessage
   | IoThroughputMessage
   | ParticlesTableMessage
+  | SegStateMessage
+  | SegPreviewMessage
+  | SegTrainedMessage
+  | DriftStateMessage
+  | DriftPreviewMessage
+  | DriftProgressMessage
+  | DriftResultMessage
 
 /**
  * Narrow a raw incoming message (`Record<string, unknown>` from the IPC bridge)

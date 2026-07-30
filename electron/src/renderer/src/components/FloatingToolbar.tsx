@@ -30,12 +30,21 @@ import { StrainWizard } from './StrainWizard'
 import { CropWizard } from './CropWizard'
 import { FitWizard } from './FitWizard'
 import { BackgroundWizard } from './BackgroundWizard'
+import { SegmentWizard } from './SegmentWizard'
+import { DriftWizard } from './DriftWizard'
 
 const WIZARD_ACTIONS = new Set([
   'Orientation Mapping', 'Find Diffraction Vectors', 'Vector Orientation Mapping',
   'EBSD Indexing',
   'Center Zero Beam', 'Strain Mapping', 'Crop', 'Fit', 'Remove Background',
+  'Segment Particles', 'Drift Correction',
 ])
+
+/** Height of SubWindow's title bar (its module-private `TITLE_H`). Duplicated
+ *  rather than imported because SubWindow imports THIS module — a back-import
+ *  would close an ES-module cycle for one integer. Used to drop the Segment
+ *  brush strip just under the title bar, over the figure's top-left. */
+const WIN_TITLE_H = 32
 
 /**
  * Turn an OS filesystem path into a `spyde-fig://icons/<path>` URL. The Python
@@ -224,6 +233,17 @@ export function FloatingToolbar({
         ? { position: 'absolute', top: -barTopInWin, left: '50%', marginLeft: wr.w / 2 + CARET_GAP, transform: 'none' }
         : { position: 'absolute', top: -barTopInWin, right: '50%', marginRight: wr.w / 2 + CARET_GAP, left: 'auto', transform: 'none' }
 
+  // The Segment brush strip sits ON the figure (plan B0: while painting you are
+  // looking at the image), not in the caret. Same coordinate trick the side
+  // placements use: the bar is centred on the window, so `left:50%` of the BAR
+  // lands on the window's midline, and `-wr.w/2` walks back to its left edge.
+  const stripPos: React.CSSProperties = {
+    position: 'absolute',
+    top: -barTopInWin + WIN_TITLE_H + 8,
+    left: '50%', marginLeft: -(wr.w / 2) + 8,
+    transform: 'none',
+  }
+
   return (
     <div
       ref={rootRef}
@@ -323,6 +343,18 @@ export function FloatingToolbar({
         )}
         {openAction && openAction.name === 'Remove Background' && (
           <BackgroundWizard
+            caretPos={caretPos} windowId={windowId} sendAction={sendAction}
+            onClose={() => setOpenName(null)}
+          />
+        )}
+        {openAction && openAction.name === 'Segment Particles' && (
+          <SegmentWizard
+            caretPos={caretPos} windowId={windowId} sendAction={sendAction}
+            onClose={() => setOpenName(null)} stripPos={stripPos}
+          />
+        )}
+        {openAction && openAction.name === 'Drift Correction' && (
+          <DriftWizard
             caretPos={caretPos} windowId={windowId} sendAction={sendAction}
             onClose={() => setOpenName(null)}
           />

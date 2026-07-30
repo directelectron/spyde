@@ -947,7 +947,15 @@ def _finalize(session, result, placeholder, per_frame, contours, p,
         log.debug("[seg] clearing stale cached dask array failed: %s", exc)
 
     _paint_count_trace(result, placeholder.count_series())
+    _repaint_label_movie(result)
     _rebuild_toolbars(result)
+
+    # TERMINAL progress. Without it `state.loading.busy` never clears in the
+    # renderer: the StatusBar spinner spins forever and — because it prefers
+    # `loading.text` while busy (StatusBar.tsx) — "Segmenting (33%)" permanently
+    # masks the "Found N particles" line emitted immediately below. Found by
+    # driving the real UI; no headless test could see it.
+    emit_progress(n_frames, n_frames, "Segmenting")
 
     n = placeholder.n_particles
     if cancelled:
@@ -955,6 +963,36 @@ def _finalize(session, result, placeholder, per_frame, contours, p,
                     f"first {done} of {n_frames} frames")
     else:
         emit_status(f"Found {n} particles in {n_frames} frames")
+
+
+def _repaint_label_movie(result) -> None:
+    """Push the finalized frame to the label-movie window.
+
+    Clearing the stale cached dask array (above) makes the NEXT read correct, but
+    nothing triggers a read — so the window keeps showing the placeholder's zeros
+    and the result looks empty until the user happens to scrub. Re-read the
+    currently-displayed frame and paint it.
+
+    Best-effort: a failure here costs a stale frame until the next scrub, which is
+    exactly the state we were in before, so it must never take the finalize down
+    with it.
+    """
+    from spyde.actions.lifecycle import paint_signal_plots
+
+    try:
+        particles = result.particles
+        if particles is None or particles.n_frames == 0:
+            return
+        t = 0
+        for plot in getattr(result, "plots", None) or ():
+            idx = getattr(plot, "current_indices", None)
+            if idx:
+                t = int(np.atleast_1d(idx)[0])
+                break
+        t = max(0, min(t, particles.n_frames - 1))
+        paint_signal_plots(result, particles.render_frame(t, value="track"))
+    except Exception as exc:
+        log.debug("[seg] repainting the label movie after finalize failed: %s", exc)
 
 
 def _adopt(placeholder, final) -> None:

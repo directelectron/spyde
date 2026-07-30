@@ -1481,6 +1481,21 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         // A panel-local payload, so it gets a CustomEvent rather than reducer
         // state, exactly like layers_state.
         case 'particles_table':
+        // Segment Particles caret (spyde/actions/particles_action.py) —
+        // `seg_state` is the authoritative caret state (classes + per-class
+        // labelled-pixel counts, effective params), `seg_preview` one frame's
+        // result (count, size histogram, the EFFECTIVE min_size), `seg_trained`
+        // the scribble classifier's fit report. Consumed by SegmentWizard.
+        case 'seg_state':
+        case 'seg_preview':
+        case 'seg_trained':
+        // Drift Correction caret (spyde/actions/drift_action.py) — caret state,
+        // the first-pair tune readout, whole-movie solve progress, and the
+        // solved shift trace. Consumed by DriftWizard.
+        case 'drift_state':
+        case 'drift_preview':
+        case 'drift_progress':
+        case 'drift_result':
         // Cluster telemetry — consumed by the StatusBar DaskMonitor HUD.
         case 'dask_stats':
         // Read-throughput readout — consumed by the StatusBar IoThroughput HUD.

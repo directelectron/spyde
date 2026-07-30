@@ -71,6 +71,12 @@ _UNAVAILABLE = {
 #: for both sums, or the comparison means nothing.
 _SUM_MAX_FRAMES = 64
 
+# Frames per streamed drift-trace message. One message per frame would flood the
+# PLOTAPP line protocol at the plan's target scale (thousands of frames) for a
+# curve the eye cannot follow at that resolution; batching by 16 keeps the trace
+# visibly live while cutting the message count by the same factor.
+_TRACE_BATCH = 16
+
 DEFAULTS: dict[str, Any] = dict(
     method="rigid",
     upsample=8,
@@ -520,10 +526,29 @@ def drift_run(session, plot, payload) -> None:
             emit({"type": "drift_progress", "window_id": wiz.src_window_id,
                   "done": int(done), "total": int(total)})
 
+        # Stream the curve as it solves. `progress` carries only a count and the
+        # shift array is solver-local until the return, so without this callback
+        # the caret can show a bar but not a trace. Batched rather than emitted
+        # per frame: at thousands of frames one message each would flood the
+        # PLOTAPP line protocol for a curve the eye cannot follow that finely.
+        pending: list[tuple[int, float, float]] = []
+
+        def _on_shift(i, dy, dx, _sharp):
+            pending.append((int(i), float(dy), float(dx)))
+            if len(pending) >= _TRACE_BATCH:
+                emit({"type": "drift_trace", "window_id": wiz.src_window_id,
+                      "points": pending[:]})
+                pending.clear()
+
         model = solve_translation(
-            wiz.signal(), progress=_progress, cancel=lambda: stopped[0],
+            wiz.signal(), progress=_progress, on_shift=_on_shift,
+            cancel=lambda: stopped[0],
             provenance={"action": "Drift Correction", "params": dict(p)},
             **_solver_kwargs(p))
+        if pending:
+            emit({"type": "drift_trace", "window_id": wiz.src_window_id,
+                  "points": pending[:]})
+            pending.clear()
         if stopped[0]:
             return model, None
         # One extra streaming pass over the SAME bounded subset the raw sum
