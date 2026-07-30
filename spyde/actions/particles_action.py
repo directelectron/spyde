@@ -484,6 +484,57 @@ def _emit_state(wiz: SegmentWizard) -> None:
 
 # ── preview (the CURRENT frame, and only the current frame) ──────────────────
 
+#: Pixel budget for ONE preview segmentation. Above this the preview runs on a
+#: centred CROP at full resolution instead of the whole frame.
+#:
+#: Measured, one frame, classical path (segment + measure):
+#:
+#:   ===========  =========
+#:   frame         cost
+#:   ===========  =========
+#:   256^2          0.27 s
+#:   1024^2         0.57 s
+#:   2048^2         1.69 s
+#:   **4096^2**   **8.36 s**
+#:   ===========  =========
+#:
+#: ``segment_frame`` is 7.6 s of that 8.36 s — watershed over 16.7 M pixels. The
+#: caret re-previews on every sensitivity nudge, so on a real 4k in-situ movie the
+#: whole caret reads as hung. It was not hung; it was doing 8 seconds of work per
+#: keystroke.
+#:
+#: **Crop, do NOT downsample.** Downsampling would be cheaper still, but it makes
+#: the preview a DIFFERENT computation from the run it is supposed to predict:
+#: plan §0.9 records that the fine feature scales are what find small faint
+#: particles, and a preview that silently detects a different population is worse
+#: than a slow one. A crop at full resolution runs the identical algorithm on
+#: identical pixels, so what it shows is exactly what the run will do there.
+#:
+#: 1024^2 keeps a preview near half a second — inside the interaction budget with
+#: room for a slower machine.
+_PREVIEW_PIXEL_BUDGET = 1024 * 1024
+
+
+def _preview_window(frame: np.ndarray) -> tuple[np.ndarray, tuple[int, int, int, int] | None]:
+    """``(frame_or_crop, box)`` — bound one preview's cost by AREA, not by scale.
+
+    Returns the frame untouched (and ``box=None``) when it already fits the
+    budget, which is the common case for a tutorial-sized movie and means the
+    fast path pays nothing for this. Otherwise a centred crop of the same aspect
+    ratio, at full resolution, plus its ``(y0, x0, h, w)`` so the caller can tell
+    the user what it measured.
+    """
+    h, w = frame.shape[:2]
+    if h * w <= _PREVIEW_PIXEL_BUDGET:
+        return frame, None
+    shrink = (h * w / _PREVIEW_PIXEL_BUDGET) ** 0.5
+    ch = max(64, int(h / shrink))
+    cw = max(64, int(w / shrink))
+    y0 = max(0, (h - ch) // 2)
+    x0 = max(0, (w - cw) // 2)
+    return frame[y0:y0 + ch, x0:x0 + cw], (y0, x0, ch, cw)
+
+
 def _preview(wiz: SegmentWizard, gen: int) -> None:
     """Segment the displayed frame on a worker and paint the result.
 
@@ -499,13 +550,15 @@ def _preview(wiz: SegmentWizard, gen: int) -> None:
 
     def _work():
         _n, get_frame, _shape = wiz.frames()
-        frame = np.asarray(get_frame(t))
+        full = np.asarray(get_frame(t))
+        frame, box = _preview_window(full)
         t0 = time.perf_counter()
         labels = engine(frame)
         from spyde.particles import measure_frame
         rows, contours = measure_frame(labels, frame, t=t, scale=scale)
         return {"frame": t, "labels": labels, "rows": rows,
-                "contours": contours, "elapsed": time.perf_counter() - t0}
+                "contours": contours, "elapsed": time.perf_counter() - t0,
+                "box": box, "full_shape": full.shape}
 
     def _done(res):
         if not wiz.still(gen) or wiz._closed:
@@ -516,8 +569,20 @@ def _preview(wiz: SegmentWizard, gen: int) -> None:
                  else np.zeros(0, np.float32))
         wiz.preview = {"frame": res["frame"], "labels": res["labels"],
                        "rows": rows, "contours": res["contours"],
-                       "count": int(len(rows)), "areas": areas}
-        wiz.set_overlay(res["labels"])
+                       "count": int(len(rows)), "areas": areas,
+                       "box": res.get("box")}
+        # An overlay of a CROP cannot be painted onto the full frame as-is — it
+        # would land in the corner instead of over the region it describes. Place
+        # it back at its offset, leaving the rest unlabelled (which is honest:
+        # nothing was segmented out there).
+        labels = res["labels"]
+        box = res.get("box")
+        if box is not None:
+            y0, x0, ch, cw = box
+            placed = np.zeros(res["full_shape"][:2], labels.dtype)
+            placed[y0:y0 + ch, x0:x0 + cw] = labels
+            labels = placed
+        wiz.set_overlay(labels)
         # The count reported is the count AFTER the size filter (plan §0.9b) —
         # `split_instances` applies min_size last, so `rows` is already filtered
         # and this number is the one the histogram below describes.
@@ -532,6 +597,11 @@ def _preview(wiz: SegmentWizard, gen: int) -> None:
             "min_size": int(p["min_size"]),
             "min_size_floored": bool(p["min_size_floored"]),
             "elapsed_ms": round(1000.0 * res["elapsed"], 1),
+            # Present only when the frame was too big to preview whole. The caret
+            # must say so: otherwise "12 particles on this frame" is a lie about a
+            # 4096² frame where only the middle megapixel was looked at.
+            "preview_box": (None if res.get("box") is None
+                            else [int(v) for v in res["box"]]),
         })
         if p["min_size_floored"]:
             emit_status(

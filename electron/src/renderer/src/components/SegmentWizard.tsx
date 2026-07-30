@@ -152,6 +152,9 @@ interface Preview {
   minSize: number
   floored: boolean
   elapsedMs: number
+  /** `[y0, x0, h, w]` when the frame was too big to segment whole, else null —
+   *  the count then describes that window, not the frame. */
+  preview_box: [number, number, number, number] | null
   /** Monotonic per-caret preview counter. The COUNT is not a reliable "did it
    *  re-run" signal (two sensitivities can find the same number of particles),
    *  so the caret publishes this as `data-seq` for the e2e to poll instead. */
@@ -264,6 +267,9 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
       frame: Number(d.frame ?? 0), count: Number(d.count ?? 0), areas,
       median: Number(d.median_area ?? 0), units: String(d.units ?? 'px'),
       minSize: eff, floored, elapsedMs: Number(d.elapsed_ms ?? 0),
+      preview_box: (Array.isArray(d.preview_box) && d.preview_box.length === 4
+        ? (d.preview_box.map(Number) as [number, number, number, number])
+        : null),
       seq: (prev?.seq ?? 0) + 1,
     }))
     // Never leave a number on screen that is not the one that ran. Snapping is
@@ -347,8 +353,14 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
   }
 
   const areaUnits = preview ? `${preview.units}²` : 'px²'
+  // On a frame too large to segment whole the backend previews a centred crop,
+  // so say "in this region" rather than "on this frame" — the number is true of
+  // the box, not of the frame, and claiming otherwise would understate the count
+  // by whatever fraction was skipped.
+  const box = preview?.preview_box ?? null
   const countText = preview
-    ? `${preview.count} particle${preview.count === 1 ? '' : 's'} on this frame`
+    ? `${preview.count} particle${preview.count === 1 ? '' : 's'} ` +
+      (box ? 'in this region' : 'on this frame')
     : 'no preview yet'
 
   return (
@@ -413,9 +425,19 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
         )}
 
         <div data-testid="seg-preview-stats" data-seq={preview?.seq ?? 0}
-          data-count={preview?.count ?? -1} style={countStyle}>
+          data-count={preview?.count ?? -1}
+          data-cropped={box ? 'true' : 'false'} style={countStyle}>
           {countText}
         </div>
+        {box && (
+          <div data-testid="seg-preview-cropped" style={hintStyle}
+            title={`Previewing a ${box[3]}x${box[2]} px window at full resolution `
+              + `from (${box[1]}, ${box[0]}). Segmenting a whole 4k frame costs `
+              + `~8 s, which makes every adjustment feel like a hang. The full `
+              + `run uses the entire frame.`}>
+            preview window {box[3]}x{box[2]} px · full run uses every pixel
+          </div>
+        )}
 
         <button data-testid="seg-run" style={canRun ? primaryWideStyle : disabledWideStyle}
           disabled={!canRun}
@@ -719,6 +741,9 @@ const classNameStyle: React.CSSProperties = {
 }
 const classPxStyle: React.CSSProperties = {
   fontSize: 10, fontVariantNumeric: 'tabular-nums', flex: '0 0 auto',
+}
+const hintStyle: React.CSSProperties = {
+  fontSize: 9.5, color: '#6c7086', fontStyle: 'italic', marginTop: -2,
 }
 const primaryWideStyle: React.CSSProperties = {
   ...S.primary, alignSelf: 'stretch', textAlign: 'center',

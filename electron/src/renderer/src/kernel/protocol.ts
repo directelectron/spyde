@@ -928,6 +928,16 @@ export interface SegPreviewMessage extends MsgBase {
   min_size: number
   min_size_floored: boolean
   elapsed_ms: number
+  /**
+   * `[y0, x0, h, w]` when the frame was too big to preview whole, else null.
+   *
+   * A 4096² frame costs 8.4 s to segment, so the backend previews a centred
+   * megapixel crop at FULL resolution instead (cropping rather than
+   * downsampling, so the preview runs the identical algorithm the real run
+   * will). The caret MUST surface this: otherwise "12 particles on this frame"
+   * is a lie about a frame where only the middle sixteenth was looked at.
+   */
+  preview_box: [number, number, number, number] | null
 }
 
 /** Scribble classifier fit report (`ScribbleClassifier.fit`). */

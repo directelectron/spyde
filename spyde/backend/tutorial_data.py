@@ -213,6 +213,42 @@ class TutorialDataMixin:
         s.metadata.set_item("General.title", "Tutorial: In-Situ Movie")
         self._add_signal(s, source_path="tutorial_movie")
 
+    def tutorial_particles(self) -> None:
+        """Tutorial: particle segmentation, drift correction and tracking.
+
+        The synthetic particle movie from ``spyde.data.synthetic`` — 24 frames of
+        96x112 with nine particles on a drifting support film, including one
+        nucleation, one dissolution, one merge, one mover and two deliberately
+        faint low-contrast probes.
+
+        **Deliberately tiny, and that is the point.** The classical preview costs
+        roughly 270 ms on a frame this size and **8.4 s on a 4096² one** (measured:
+        `segment_frame` alone is 7.6 s of that, watershed over 16.7 M pixels), so
+        a real in-situ movie makes every sensitivity nudge feel like a hang. Learn
+        the workflow here, where the whole loop is interactive, then take the
+        parameters to the real data.
+
+        It also carries its ground truth in ``metadata.Spyde.synthetic``
+        (per-frame drift, radii, and the nucleation / dissolution / merge frames),
+        so what the tools report can be checked against what the data was built
+        from — read it with ``spyde.data.synthetic.ground_truth``.
+        """
+        import dask.array as da
+
+        from spyde.backend.heavy_imports import ensure_heavy_imports
+        from spyde.data.synthetic import particle_movie
+        ensure_heavy_imports()   # don't race the startup prewarm's pyxem import
+
+        eager = particle_movie(n_frames=24)
+        ny, nx = eager.data.shape[1:]
+        # Lazy at one frame per chunk, like tutorial_movie and like a real .mrc:
+        # each nav move is then a small cold read of just that frame. `as_lazy()`
+        # carries the axes, the signal type AND the stamped ground truth across.
+        s = eager.as_lazy()
+        s.data = da.from_array(eager.data, chunks=(1, ny, nx))
+        s.metadata.set_item("General.title", "Tutorial: Particles (small)")
+        self._add_signal(s, source_path="tutorial_particles")
+
 
 # name -> bound-method lookup used by the (ungated) `tutorial_load` action in
 # _session_actions.py. Keys are the same names used as tutorial_<name> testids
@@ -225,4 +261,5 @@ TUTORIAL_LOADERS = {
     "strain": TutorialDataMixin.tutorial_strain,
     "spectroscopy": TutorialDataMixin.tutorial_spectroscopy,
     "movie": TutorialDataMixin.tutorial_movie,
+    "particles": TutorialDataMixin.tutorial_particles,
 }
