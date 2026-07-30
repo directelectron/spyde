@@ -662,6 +662,7 @@ def seg_close(session, plot, payload=None) -> None:
     bump_generation(tree, "_seg_run_gen")
     wiz = getattr(tree, "_seg_wizard", None)
     if wiz is not None:
+        _detach_brush(wiz)
         wiz.remove()
 
 
@@ -675,6 +676,13 @@ def seg_set_method(session, plot, payload) -> None:
         emit_error(f"Segment Particles: unknown engine {method!r}")
         return
     wiz.params["method"] = method
+    # The brush exists only while Scribble is the engine: it floats over the
+    # image, so leaving it armed on Classical would put a paint cursor over data
+    # with nothing to paint into.
+    if method == "scribble":
+        _arm_brush(wiz)
+    else:
+        _detach_brush(wiz)
     gen = wiz.guard()
     _emit_state(wiz)
     _preview(wiz, gen)
@@ -707,11 +715,30 @@ def seg_paint(session, plot, payload) -> None:
     points = payload.get("points") or []
     if not len(points):
         return
+    if _paint_stroke(wiz, int(payload.get("frame", wiz.frame_index())), points,
+                     int(payload.get("class_id", 0)),
+                     bool(payload.get("erase")),
+                     float(payload.get("brush", wiz.params["brush"]))):
+        _emit_state(wiz)
+
+
+def _paint_stroke(wiz, t: int, points, class_id: int, erase: bool,
+                  brush: float) -> int:
+    """Rasterise ONE stroke into the label store. Returns pixels changed.
+
+    Shared by the on-plot brush (:func:`_on_stroke`) and the renderer's
+    ``seg_paint``, deliberately: two rasterisers would let the brush and the
+    eraser — or the widget and a scripted stroke — disagree about which pixels a
+    given path covers, and that divergence is invisible until a trained model
+    behaves oddly.
+
+    *points* are ``(y, x)`` in **image pixels**, no scale or offset applied
+    (anyplotlib 2-D widgets report pixels).
+    """
     store = wiz.label_store()
-    t = int(payload.get("frame", wiz.frame_index()))
-    brush = float(payload.get("brush", wiz.params["brush"]))
+    before = int(sum(store.counts().values())) if hasattr(store, "counts") else -1
     try:
-        if payload.get("erase"):
+        if erase:
             # No `erase_stroke` on LabelStore, and the eraser must cover exactly
             # what the brush would paint. Rasterise the stroke into a scratch
             # store with the same geometry and erase by the indices it produced,
@@ -722,12 +749,208 @@ def seg_paint(session, plot, payload) -> None:
             scratch.paint_stroke(0, points, 0, brush=brush)
             store.erase(t, scratch.at(0)[0])
         else:
-            store.paint_stroke(t, points, int(payload.get("class_id", 0)),
-                               brush=brush)
+            store.paint_stroke(t, points, int(class_id), brush=brush)
     except (KeyError, ValueError) as exc:
         emit_error(f"Segment Particles: {exc}")
+        return 0
+    after = int(sum(store.counts().values())) if hasattr(store, "counts") else -1
+    # -1 when the store cannot report counts: assume it painted rather than
+    # swallowing a stroke the user definitely made.
+    return max(1, abs(after - before)) if before >= 0 else 1
+
+
+# ── the on-plot brush ────────────────────────────────────────────────────────
+#
+# The scribble engine needs strokes, and the ONLY thing that can produce them is
+# an anyplotlib brush widget living on the signal plot. Two things were wrong
+# before this existed, and both made painting impossible rather than merely
+# awkward:
+#
+#   1. Nothing ever called ``add_brush_widget``, so there was no brush on the
+#      plot at all — Shift+drag had nothing to hit.
+#   2. The caret listened for a RENDERER-side ``spyde:figure_event`` carrying a
+#      points array. A brush stroke does not travel that way: anyplotlib emits it
+#      to PYTHON (``event_json`` → ``Figure._dispatch_event`` →
+#      ``Widget._update_from_js`` → ``plot.callbacks.fire``), which the renderer
+#      never sees. So even with a brush present, no stroke could have arrived.
+#
+# The widget is therefore created, owned and read HERE. The renderer's job shrinks
+# to telling us which class is active and how fat the brush is; ``seg_paint``
+# survives only as the programmatic/test door.
+_BRUSH_COLORS = ("#f9a03f", "#89b4fa", "#585b70", "#f38ba8", "#a6e3a1", "#cba6f7")
+
+
+def _brush_supported() -> bool:
+    """Whether the installed anyplotlib has the brush widget.
+
+    It landed in 0.5.0 (CSSFrancis/anyplotlib#47); SpyDE's floor is still 0.4.2,
+    so a user on PyPI's 0.4.2 has no brush and must be TOLD that rather than left
+    dragging at an image that never responds.
+    """
+    try:
+        from anyplotlib.plot2d._plot2d import Plot2D
+        return hasattr(Plot2D, "add_brush_widget")
+    except Exception:
+        return False
+
+
+def _attach_brush(wiz) -> bool:
+    """Put a brush on the source plot and wire its strokes into the label store.
+
+    Idempotent: an existing brush is re-shown and re-armed rather than duplicated,
+    so switching tabs or re-tuning never stacks two brushes on one plot.
+
+    Returns True when a brush is live.
+    """
+    if not _brush_supported():
+        return False
+    src = wiz.src_plot
+    plot2d = getattr(src, "_plot2d", None) if src is not None else None
+    if plot2d is None:
+        return False
+
+    existing = getattr(wiz.tree, "_seg_brush", None)
+    if existing is not None:
+        try:
+            existing.set(active=True, visible=True)
+            return True
+        except Exception as exc:
+            log.debug("[seg] re-arming the existing brush failed: %s", exc)
+
+    try:
+        classes = wiz.class_report()
+        brush = plot2d.add_brush_widget(
+            radius=float(wiz.params.get("brush", 6.0)),
+            colors=[c.get('colour', '#f9a03f') for c in classes] or list(_BRUSH_COLORS),
+            class_id=int(wiz.params.get("active_class", 0)),
+            alpha=0.55,
+            active=True,
+        )
+    except Exception as exc:
+        log.debug("[seg] add_brush_widget failed: %s", exc)
+        return False
+
+    from spyde.drawing.selectors.base_selector import event_handler_fn
+
+    # pointer_up ONLY. The brush deliberately emits once per finished stroke
+    # rather than per pointer_move — a growing stroke re-serialised every frame is
+    # quadratic over one drag (see anyplotlib's BrushWidget docs) — so there is
+    # nothing to listen for mid-stroke and listening would fire on other widgets.
+    handler = event_handler_fn(lambda event: _on_stroke(wiz, event))
+    try:
+        brush.add_event_handler(handler, "pointer_up")
+    except Exception as exc:
+        log.debug("[seg] wiring the brush handler failed: %s", exc)
+        return False
+
+    wiz.tree._seg_brush = brush
+    wiz.tree._seg_brush_handler = handler      # weak callbacks: keep a hard ref
+    wiz._brush_seen = 0
+    return True
+
+
+def _arm_brush(wiz) -> None:
+    """Attach the brush and TELL THE USER how to use it.
+
+    The instruction is not optional. A brush that arms silently on Shift+drag is
+    undiscoverable — there is no cursor change to find it by and no affordance on
+    the image, so the honest outcome is a user dragging at a picture that never
+    responds. That is exactly what happened on first use.
+    """
+    if _attach_brush(wiz):
+        emit_status("Shift+drag on the image to paint labels · plain drag still "
+                    "pans · pick the class and brush size on the strip beside "
+                    "the plot")
+        _emit(wiz, {"type": "seg_brush", "available": True,
+                    "hint": "Shift+drag to paint"})
         return
-    _emit_state(wiz)
+    # No brush: say WHY, with the actionable part. Silence here reads as a bug.
+    if not _brush_supported():
+        import anyplotlib as apl
+        emit_error(
+            f"Painting needs anyplotlib 0.5.0 or newer for the brush widget; "
+            f"this environment has {getattr(apl, '__version__', 'unknown')}. "
+            "Until then, use the Classical engine, or install the brush build.")
+    else:
+        emit_error("Painting could not attach a brush to this plot.")
+    _emit(wiz, {"type": "seg_brush", "available": False,
+                "hint": "brush unavailable — see the log"})
+
+
+def _detach_brush(wiz) -> None:
+    """Remove the brush. Called from ``seg_close`` and on leaving Scribble.
+
+    Best-effort and idempotent — teardown must never raise, or closing the caret
+    leaves the wizard half-torn-down.
+    """
+    brush = getattr(wiz.tree, "_seg_brush", None)
+    if brush is not None:
+        for attempt in ("remove", "hide"):
+            fn = getattr(brush, attempt, None)
+            if fn is None:
+                continue
+            try:
+                fn()
+                break
+            except Exception as exc:
+                log.debug("[seg] brush %s() failed: %s", attempt, exc)
+    for attr in ("_seg_brush", "_seg_brush_handler"):
+        if hasattr(wiz.tree, attr):
+            try:
+                setattr(wiz.tree, attr, None)
+            except Exception as exc:                      # pragma: no cover
+                log.debug("[seg] clearing %s failed: %s", attr, exc)
+
+
+def _on_stroke(wiz, event) -> None:
+    """A finished brush stroke → label pixels → re-preview.
+
+    Reads the widget rather than the event payload. ``Widget._update_from_js``
+    has already merged the JS fields into ``_data`` by the time a plot-level
+    handler runs, so ``brush.strokes`` is authoritative and the event's own copy
+    is redundant.
+
+    Only strokes we have not consumed are applied: the widget accumulates them
+    for as long as it lives, so replaying the whole list on every stroke would
+    re-paint everything and make the pixel counts grow quadratically.
+    """
+    if wiz._closed:
+        return
+    brush = getattr(wiz.tree, "_seg_brush", None)
+    if brush is None:
+        return
+    try:
+        strokes = list(getattr(brush, "strokes", ()) or ())
+        classes = list(getattr(brush, "stroke_classes", ()) or ())
+    except Exception as exc:
+        log.debug("[seg] reading brush strokes failed: %s", exc)
+        return
+
+    seen = int(getattr(wiz, "_brush_seen", 0))
+    fresh = strokes[seen:]
+    if not fresh:
+        return
+    wiz._brush_seen = len(strokes)
+
+    erase = bool(wiz.params.get("erase", False))
+    radius = float(getattr(brush, "radius", wiz.params.get("brush", 6.0)) or 6.0)
+    default_cls = int(wiz.params.get("active_class", 0))
+
+    painted = 0
+    for i, stroke in enumerate(fresh, start=seen):
+        cls = int(classes[i]) if i < len(classes) else default_cls
+        # anyplotlib gives [[x, y], ...] in IMAGE PIXELS; LabelStore works in
+        # (y, x). Swapping these silently mirrors every scribble about the
+        # diagonal, which on a non-square frame also puts half of them outside
+        # the image — see spyde/actions/masks.py for this bug class.
+        pts = [[float(p[1]), float(p[0])] for p in (stroke or ()) if len(p) >= 2]
+        if pts:
+            painted += _paint_stroke(wiz, wiz.frame_index(), pts, cls,
+                                    erase, radius)
+
+    if painted:
+        _emit_state(wiz)
+        _preview(wiz, wiz.guard())
 
 
 def seg_train(session, plot, payload) -> None:

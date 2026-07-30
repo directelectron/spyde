@@ -26,6 +26,11 @@ const TUTORIAL_DATA: { key: string; label: string }[] = [
   { key: 'strain', label: 'Strain Mapping' },
   { key: 'spectroscopy', label: 'Spectroscopy (1D)' },
   { key: 'movie', label: 'In-situ Movie' },
+  // Deliberately tiny (24 x 96x112). The classical segmentation preview costs
+  // ~0.3 s on a frame this size and ~8 s on a 4096² one, so learning the
+  // segment / drift / track workflow on real 4k data means every adjustment
+  // feels like a hang. Carries its own ground truth in metadata.
+  { key: 'particles', label: 'Particles & Drift (small)' },
 ]
 
 /** One dataset row of the Examples catalogue (spyde/backend/example_catalogue). */

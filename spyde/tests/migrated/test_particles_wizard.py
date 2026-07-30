@@ -525,3 +525,119 @@ class TestCoercion:
     def test_a_junk_value_keeps_the_default(self):
         assert pa._coerce({"min_separation": "wat"})["min_separation"] == \
             pa.DEFAULTS["min_separation"]
+
+
+class TestBrushActuallyPaints:
+    """The regression guard for "I can't scribble".
+
+    Shipped broken once, in two independent ways, and neither was visible to any
+    test that existed at the time:
+
+    1. **Nothing ever created a brush widget.** ``add_brush_widget`` was called
+       nowhere, so Shift+drag had nothing to hit.
+    2. **The caret listened on a path the brush cannot reach.** It waited for a
+       renderer-side ``spyde:figure_event`` carrying a points array, but an
+       anyplotlib stroke travels to PYTHON (``event_json`` →
+       ``Figure._dispatch_event`` → ``Widget._update_from_js`` →
+       ``plot.callbacks.fire``). The renderer never sees it, so even with a brush
+       present nothing would have arrived.
+
+    The old tests passed because they posted a synthetic ``seg_paint`` payload —
+    which exercises the rasteriser and proves nothing about whether a real stroke
+    can ever get there. These drive the widget.
+    """
+
+    def _scribble_wizard(self, session):
+        from spyde.actions.particles_action import seg_open, seg_set_method
+        plots = (list(session._plots) if isinstance(session._plots, list)
+                 else list(session._plots.values()))
+        plot = next(p for p in plots
+                    if getattr(p, "signal_tree", None) is not None
+                    and getattr(p, "_plot2d", None) is not None)
+        seg_open(session, plot, {"window_id": getattr(plot, "window_id", None)})
+        seg_set_method(session, plot, {"method": "scribble"})
+        return plot, plot.signal_tree
+
+    def test_a_brush_is_attached_on_the_scribble_tab(self, window):
+        from spyde.actions.particles_action import _brush_supported
+        session = window["window"]
+        session._load_test_data_particles({"frames": 4})
+        _plot, tree = self._scribble_wizard(session)
+        if not _brush_supported():
+            pytest.skip("installed anyplotlib has no brush widget (needs >= 0.5.0)")
+        assert getattr(tree, "_seg_brush", None) is not None, (
+            "no brush on the plot — Shift+drag has nothing to hit")
+
+    def test_a_stroke_from_the_WIDGET_reaches_the_label_store(self, window):
+        """Drives the widget, not a synthetic seg_paint payload."""
+        from spyde.actions.particles_action import _brush_supported, _on_stroke
+        session = window["window"]
+        session._load_test_data_particles({"frames": 4})
+        _plot, tree = self._scribble_wizard(session)
+        if not _brush_supported():
+            pytest.skip("installed anyplotlib has no brush widget (needs >= 0.5.0)")
+        wiz = tree._seg_wizard
+        brush = tree._seg_brush
+        store = wiz.label_store()
+        before = dict(store.counts())
+        # What anyplotlib delivers: [[x, y], …] in IMAGE PIXELS, then pointer_up.
+        brush.set(strokes=[[[20.0, 30.0], [24.0, 32.0], [28.0, 34.0]]],
+                  stroke_classes=[0])
+        _on_stroke(wiz, None)
+        after = dict(store.counts())
+        assert after != before, "the stroke never reached the label store"
+        assert after[0] > 0
+
+    def test_a_second_stroke_only_paints_its_own_points(self, window):
+        """The widget accumulates strokes for its whole life, so replaying the
+        full list on every event would re-paint everything and make the class
+        counts grow quadratically."""
+        from spyde.actions.particles_action import _brush_supported, _on_stroke
+        session = window["window"]
+        session._load_test_data_particles({"frames": 4})
+        _plot, tree = self._scribble_wizard(session)
+        if not _brush_supported():
+            pytest.skip("installed anyplotlib has no brush widget (needs >= 0.5.0)")
+        wiz, brush = tree._seg_wizard, tree._seg_brush
+        store = wiz.label_store()
+        s1 = [[20.0, 30.0], [24.0, 32.0]]
+        brush.set(strokes=[s1], stroke_classes=[0])
+        _on_stroke(wiz, None)
+        one = dict(store.counts())
+        # Fire again with NO new stroke: nothing may change.
+        _on_stroke(wiz, None)
+        assert dict(store.counts()) == one, "re-fired the same stroke"
+        # A genuinely new stroke adds, and by a sane amount.
+        brush.set(strokes=[s1, [[60.0, 40.0], [64.0, 42.0]]],
+                  stroke_classes=[0, 1])
+        _on_stroke(wiz, None)
+        two = dict(store.counts())
+        assert two[1] > 0, "the second stroke's class was not painted"
+        assert two[0] == one[0], "the first stroke was painted twice"
+
+    def test_leaving_scribble_detaches_the_brush(self, window):
+        """It floats over the image; on Classical there is nothing to paint."""
+        from spyde.actions.particles_action import _brush_supported, seg_set_method
+        session = window["window"]
+        session._load_test_data_particles({"frames": 4})
+        plot, tree = self._scribble_wizard(session)
+        if not _brush_supported():
+            pytest.skip("installed anyplotlib has no brush widget (needs >= 0.5.0)")
+        assert tree._seg_brush is not None
+        seg_set_method(session, plot, {"method": "classical"})
+        assert getattr(tree, "_seg_brush", None) is None
+
+    def test_missing_brush_says_so_instead_of_failing_silently(self, window,
+                                                              monkeypatch):
+        """A user dragging at an image that never responds must be TOLD why."""
+        import spyde.actions.particles_action as pa
+        monkeypatch.setattr(pa, "_brush_supported", lambda: False)
+        session = window["window"]
+        session._load_test_data_particles({"frames": 4})
+        before = len(window["messages"])
+        self._scribble_wizard(session)
+        new = window["messages"][before:]
+        assert any("anyplotlib" in str(m.get("text", "")).lower()
+                   or "brush" in str(m.get("text", "")).lower() for m in new), (
+            "switching to Scribble with no brush available emitted nothing — "
+            "the user gets a picture that ignores them and no explanation")
