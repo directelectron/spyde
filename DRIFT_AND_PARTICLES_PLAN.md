@@ -247,6 +247,31 @@ Consequences:
   separation trade off against each other (a threshold loose enough to catch
   faint particles also merges neighbours), so it should be one axis the user
   moves with live feedback, with splitting parameters secondary.
+
+> **But `min_size` is NOT secondary — it is where the sensitivity/specificity
+> trade actually lands, and `min_size=0` is a footgun.** Measured on the fixture at
+> one frame, adding a single faint scribble to bright-only labels:
+>
+> | labels | `min_size` | instances | true hit | spurious |
+> |---|---|---|---|---|
+> | bright only | any | 7 | 7/9 | 0 |
+> | + one faint dab | **0** | 33 | 8/9 | **25** |
+> | + one faint dab | 10 | 9 | 8/9 | 1 |
+>
+> Teaching the classifier faint contrast necessarily teaches it to fire on film
+> speckle of *similar* contrast — foreground pixels go 977 → 1334, and the
+> probability map visibly sprays across the background. `min_size=10` removes 24 of
+> the 25 spurious instances. So the classifier is not what buys specificity; the
+> instance-split's size filter is.
+>
+> Consequences: (a) a user who zeroes `min_size` to "catch the small ones" gets the
+> opposite of what they want, so the caret should floor it or warn; (b) the live
+> preview must show the count *after* the size filter, or the number moves for a
+> reason the user cannot see; (c) sensitivity and `min_size` are coupled and the two
+> should sit adjacent in the caret, not in separate tabs.
+>
+> Found by looking at the rendered probability map, not by a failing test — the
+> tests were green and asserted only on the probes' own probabilities.
 - Small-object detection needs the feature stack's fine scales — do not
   downsample frames for speed without a documented sensitivity measurement.
 
