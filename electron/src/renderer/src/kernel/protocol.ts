@@ -811,6 +811,68 @@ export interface IoThroughputMessage extends MsgBase {
   color: 'green' | 'yellow' | 'red'
 }
 
+// ── Particle table dock ─────────────────────────────────────────────────────
+
+/** One column of the particle table, as the backend describes it. Mirrors the
+ *  renderer-side `DataColumn` (components/DataTable.tsx) minus the function
+ *  fields, which cannot cross IPC. */
+export interface ParticlesTableColumn {
+  /** Property read from each row — e.g. a name from
+   *  `spyde.signals.particles.COLUMNS`. */
+  key: string
+  label: string
+  /** Fixed pixel width; omitted → the column flexes. */
+  width?: number
+  align?: 'left' | 'center' | 'right'
+  /** Right-aligned + tabular figures. */
+  numeric?: boolean
+  /** Default true. */
+  sortable?: boolean
+  /** 'swatch' prefixes a colour chip keyed on the cell value (track id). */
+  kind?: 'text' | 'swatch'
+  /** Decimal places for a numeric cell. */
+  precision?: number
+  /** Appended to the value ("nm", "nm²"). */
+  units?: string
+}
+
+/** One row of the Events tab — exactly `ParticleEvent.to_dict()` from
+ *  `spyde/particles/track.py`. */
+export interface ParticleEventRecord {
+  frame: number
+  /** 'birth' | 'death' | 'merge' | 'split' (track.py EVENT_KINDS). */
+  kind: string
+  tracks: number[]
+  particles: number[]
+}
+
+/**
+ * The particle/track table for one result window, in reply to a
+ * `particles_query {window_id}` action (and pushed again when a segmentation
+ * batch finalises). Re-broadcast as a `spyde:particles_table` CustomEvent and
+ * consumed by BottomDock — the renderer holds no reducer state for it.
+ *
+ * `columns` is backend-supplied so the dock stays data-agnostic: sending a
+ * different column set is the whole mechanism for showing tracks instead of
+ * particles. `events` is fixed-shape and drives the Events tab.
+ */
+export interface ParticlesTableMessage extends MsgBase {
+  type: 'particles_table'
+  /** The window this table belongs to; `null` = unscoped (always shown). */
+  window_id: number | null
+  /** Dock header text. Defaults to "Particles" when absent. */
+  title?: string
+  columns: ParticlesTableColumn[]
+  /** One object per row, keyed by `columns[].key`. An optional numeric `id`
+   *  field is used as the stable selection key when present. */
+  rows: Record<string, unknown>[]
+  events?: ParticleEventRecord[]
+  /** Calibrated unit of the length columns (`SpyDEParticles.units`). */
+  units?: string
+  /** True while a batch is still streaming rows in — shows a "streaming…" pill. */
+  partial?: boolean
+}
+
 /**
  * Wizard-scoped events re-broadcast verbatim as DOM CustomEvents (the caret
  * components subscribe directly). The payload beyond `type` is consumer-defined,
@@ -936,6 +998,7 @@ export type PlotAppMessage =
   | DownloadDoneMessage
   | DaskStatsMessage
   | IoThroughputMessage
+  | ParticlesTableMessage
 
 /**
  * Narrow a raw incoming message (`Record<string, unknown>` from the IPC bridge)

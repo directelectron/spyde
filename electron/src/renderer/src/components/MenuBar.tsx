@@ -79,6 +79,10 @@ type Item =
       shape?: string
       /** Present on dataset rows: already on disk, or a download. */
       downloaded?: boolean
+      /** Present on TOGGLE rows (the View menu's panels): renders a ✓ in the
+       *  same left-hand mark column the download dot uses, so a menu never
+       *  mixes two different marker alignments. */
+      checked?: boolean
       tip?: Tip
     }
   | { label: string; submenu: Item[]; testId?: string; detail?: string }
@@ -98,7 +102,9 @@ export function MenuBar({ onStartGuide, onShowInfo }: {
   /** Help → <technique> → Info… — opens GuideInfoDialog for that technique. */
   onShowInfo: (g: Guide) => void
 }) {
-  const { sendAction, openStackDialog, openUpdateDialog, openGpuStatusDialog, openGpuHelpDialog, state } = useSpyDE()
+  const { sendAction, openStackDialog, openUpdateDialog, openGpuStatusDialog,
+          openGpuHelpDialog, state,
+          tableDockOpen, openTableDock, closeTableDock } = useSpyDE()
   const [open, setOpen] = useState<string | null>(null)
   const barRef = useRef<HTMLDivElement>(null)
   const [exampleGroups, setExampleGroups] = useState<ExampleGroup[]>([])
@@ -239,6 +245,17 @@ export function MenuBar({ onStartGuide, onShowInfo }: {
         title: dataDir || undefined,
         onClick: () => sendAction('show_example_dir', {}),
       } as Item,
+    ],
+    // Panels the user can show/hide. The bottom TABLE dock lives here (and in
+    // the status bar) because its open flag is context state — the control
+    // panel / report / log toggles are App-local and stay in the title bar.
+    View: [
+      {
+        label: 'Table Dock',
+        testId: 'menu-item-table-dock',
+        checked: tableDockOpen,
+        onClick: () => (tableDockOpen ? closeTableDock() : openTableDock()),
+      },
     ],
     Help: [
       // One row per TECHNIQUE, each opening a two-entry sub-menu: Info (the
@@ -414,6 +431,11 @@ function MenuList({ items, onClose, testId, nested = false, onTip }: {
             {it.downloaded !== undefined && (
               <span style={it.downloaded ? styles.markOn : styles.markOff}>
                 {it.downloaded ? DOWNLOADED_MARK : NOT_DOWNLOADED_MARK}
+              </span>
+            )}
+            {it.checked !== undefined && (
+              <span style={it.checked ? styles.markOn : styles.markOff}>
+                {it.checked ? '✓' : ''}
               </span>
             )}
             <span style={styles.label}>{it.label}</span>

@@ -14,7 +14,8 @@ export function StatusBar({ logOpen, onToggleLog }: {
   logOpen?: boolean
   onToggleLog?: () => void
 }) {
-  const { state, openStackDialog, tileWindowsRef } = useSpyDE()
+  const { state, openStackDialog, tileWindowsRef,
+          tableDockOpen, openTableDock, closeTableDock } = useSpyDE()
   const hasWindows = Array.from(state.windows.values()).some(w => w.visible)
   // Badge unseen warnings/errors so problems are noticeable while the log is hidden.
   // Memoised: this bar re-renders on every context change (window moves, status
@@ -48,6 +49,16 @@ export function StatusBar({ logOpen, onToggleLog }: {
       >
         Log
         {problems > 0 && <span style={styles.badge} data-testid="log-badge">{problems}</span>}
+      </button>
+      {/* The other bottom dock (particle/track table). Sits beside Log because
+          that is where the app's bottom-panel toggles live. */}
+      <button
+        data-testid="toggle-table-dock"
+        style={{ ...styles.btn, ...(tableDockOpen ? styles.btnActive : null) }}
+        onClick={() => (tableDockOpen ? closeTableDock() : openTableDock())}
+        title={tableDockOpen ? 'Hide the table dock' : 'Show the table dock'}
+      >
+        Table
       </button>
       <button
         data-testid="tile-windows"

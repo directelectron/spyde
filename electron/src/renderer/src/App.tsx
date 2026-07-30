@@ -6,6 +6,7 @@ import { ReportSidebar } from './components/ReportSidebar'
 import { ConsoleBar } from './components/ConsoleBar'
 import { StatusBar } from './components/StatusBar'
 import { LogPanel } from './components/LogPanel'
+import { BottomDock } from './components/BottomDock'
 import { Tour } from './components/Tour'
 import { NavShapeGate } from './components/NavShapeGate'
 import { StackGate } from './components/StackGate'
@@ -65,6 +66,11 @@ export function App() {
           {sidebarOpen && <PlotControlDock />}
           {reportOpen && <ReportSidebar />}
         </div>
+        {/* Table dock above the log: a data surface belongs next to the plots,
+            diagnostics below it. Both are flexShrink:0 siblings of the body —
+            BottomDock's own maxHeight:50% is what stops the pair starving the
+            MDI area. Visibility comes from the context (View menu / StatusBar). */}
+        <BottomDock />
         <LogPanel open={logOpen} onClose={() => setLogOpen(false)} />
         <ConsoleBar />
         <StatusBar logOpen={logOpen} onToggleLog={() => setLogOpen(v => !v)} />
