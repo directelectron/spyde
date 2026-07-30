@@ -306,6 +306,89 @@ class TestSolveTranslationGuards:
             "a cancelled solve must be detectable, not quietly truncated")
 
 
+class TestAlignmentROI:
+    """Correlating on a sub-region. Not a speed switch — often the RIGHT answer.
+
+    Whole-frame correlation averages over everything that moved, so on a movie
+    where the sample itself evolves, the sample's motion contaminates the estimate
+    of the stage's. Restricting to a static landmark measures the stage alone.
+    """
+
+    def test_roi_recovers_the_same_shift_as_the_full_frame(self):
+        truth = np.array([[0, 0], [2.5, -1.75], [-3.25, 4.0]], dtype=float)
+        stack = _shifted_stack(truth, h=96, w=112)
+        full = solve_translation(stack, device="numpy", upsample=8,
+                                 reference="first")
+        roi = solve_translation(stack, device="numpy", upsample=8,
+                                reference="first", roi=(20, 20, 56, 64))
+        assert np.abs(roi.shifts - truth).max() < 0.3, roi.shifts
+        assert np.abs(roi.shifts - full.shifts).max() < 0.3, (
+            "the ROI solve disagrees with the full-frame solve on the same data")
+
+    def test_shifts_apply_to_the_whole_frame(self):
+        """A translation is a translation; the ROI only chooses where to measure."""
+        truth = np.array([[0, 0], [3.0, -2.0]], dtype=float)
+        stack = _shifted_stack(truth, h=96, w=112)
+        model = solve_translation(stack, device="numpy", upsample=8,
+                                  reference="first", roi=(30, 30, 40, 48))
+        from spyde.drift import shift_frame
+        aligned = shift_frame(stack[1], model.shifts[1], fill=0.0)
+        core = (slice(40, -40), slice(40, -40))     # far OUTSIDE the ROI
+        resid = np.abs(aligned[core] - stack[0][core]).max()
+        raw = np.abs(stack[1][core] - stack[0][core]).max()
+        assert resid < 0.25 * raw, (
+            "correcting with an ROI-derived shift did not align the region "
+            "outside the ROI")
+
+    def test_roi_is_recorded_in_params(self):
+        stack = _shifted_stack(np.zeros((2, 2)), h=64, w=64)
+        m = solve_translation(stack, device="numpy", roi=(8, 8, 32, 32))
+        assert m.params["roi"] == [8, 8, 32, 32]
+        assert m.params["frame_shape"] == [64, 64], (
+            "frame_shape must stay the FULL frame — the shifts apply to it")
+
+    def test_out_of_bounds_roi_raises_rather_than_clamping(self):
+        """A silently shrunk ROI would correlate on a region the user never chose."""
+        stack = _shifted_stack(np.zeros((2, 2)), h=64, w=64)
+        for bad in [(0, 0, 80, 32), (40, 40, 32, 32), (-4, 0, 32, 32)]:
+            with pytest.raises(ValueError, match="outside"):
+                solve_translation(stack, device="numpy", roi=bad)
+
+    def test_tiny_roi_raises(self):
+        stack = _shifted_stack(np.zeros((2, 2)), h=64, w=64)
+        with pytest.raises(ValueError, match="at least"):
+            solve_translation(stack, device="numpy", roi=(0, 0, 8, 8))
+
+    def test_malformed_roi_raises(self):
+        stack = _shifted_stack(np.zeros((2, 2)), h=64, w=64)
+        with pytest.raises(ValueError, match=r"\(y0, x0, h, w\)"):
+            solve_translation(stack, device="numpy", roi=(1, 2, 3))
+
+    def test_roi_ignores_motion_outside_it(self):
+        """The point of the feature, on data built to punish whole-frame."""
+        rng = np.random.default_rng(3)
+        h, w, n = 96, 128, 5
+        base = _scene(h, w, noise=0.0)
+        frames = []
+        for t in range(n):
+            f = base.copy()
+            # A big bright square that moves the OTHER way, far from the ROI.
+            y, x = 60, 78 + 5 * t
+            f[y:y + 26, x:x + 26] += 3.0
+            frames.append(f.astype(np.float32))
+        stack = np.stack(frames)
+        roi = solve_translation(stack, device="numpy", upsample=8,
+                                reference="first", roi=(4, 4, 44, 56))
+        full = solve_translation(stack, device="numpy", upsample=8,
+                                 reference="first")
+        # The landmark region is STATIC, so the ROI answer should be ~zero.
+        assert np.abs(roi.shifts).max() < 0.6, (
+            f"ROI solve drifted although its region never moved: {roi.shifts}")
+        assert np.abs(full.shifts).max() > np.abs(roi.shifts).max(), (
+            "the whole-frame solve was not contaminated by the moving square, so "
+            "this fixture no longer demonstrates why the ROI exists")
+
+
 class TestBackendParity:
     """The GPU path has no independent reference, so it is pinned to numpy."""
 

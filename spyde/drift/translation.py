@@ -98,6 +98,11 @@ _PHASE_FLOOR = 100.0 * float(np.finfo(np.float32).eps)      # ~1.19e-5
 _REJECT_FRACTION = 0.25
 _REJECT_MIN_SAMPLES = 1
 
+# Smallest alignment ROI worth correlating. Below roughly this the upsampled
+# refinement window (1.5 x upsample, so 12 px at the default) approaches the box
+# itself and the peak has nowhere to sit.
+_MIN_ROI = 16
+
 
 # ── operator adapters ────────────────────────────────────────────────────────
 # The algorithm below is written once against this interface. `_TorchOps` is the
@@ -418,6 +423,31 @@ def _peak_shift(ops, ref_fft, mov_fft, mask, upsample: float,
     return dy, dx, sharpness
 
 
+def _validate_roi(roi, full_h: int, full_w: int):
+    """Normalise and bounds-check an ``(y0, x0, h, w)`` alignment ROI.
+
+    Rejects rather than clamps. A silently shrunk ROI would correlate on a
+    different region than the one the user dragged, and the drift curve would be
+    wrong in a way nothing on screen could explain.
+    """
+    if roi is None:
+        return None
+    try:
+        y0, x0, h, w = (int(v) for v in roi)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"roi must be (y0, x0, h, w) in pixels; got {roi!r}") from None
+    if h < _MIN_ROI or w < _MIN_ROI:
+        raise ValueError(
+            f"roi is {h}x{w} px; the correlation needs at least "
+            f"{_MIN_ROI}x{_MIN_ROI} to locate a peak at all")
+    if y0 < 0 or x0 < 0 or y0 + h > full_h or x0 + w > full_w:
+        raise ValueError(
+            f"roi (y0={y0}, x0={x0}, h={h}, w={w}) falls outside the "
+            f"{full_h}x{full_w} frame")
+    return (y0, x0, h, w)
+
+
 def _accept_into_reference(sharpness: float, accepted: list[float],
                            enabled: bool) -> bool:
     """Whether this frame is credible enough to join the running reference.
@@ -457,6 +487,7 @@ def solve_translation(
     max_shift: float | None = 32.0,
     min_shift: float | None = None,
     reference: str = "running",
+    roi: tuple[int, int, int, int] | None = None,
     apodize: bool | float = True,
     normalize: bool = True,
     reject_outliers: bool = True,
@@ -489,6 +520,26 @@ def solve_translation(
         frame); ``"sequential"`` — register to the previous frame and accumulate
         (handles large excursions, accumulates error); ``"first"`` or
         ``"fixed:<i>"`` — one fixed reference frame.
+    roi
+        ``(y0, x0, h, w)`` in pixels — correlate on this sub-region only. The
+        returned shifts still apply to the WHOLE frame; a translation is a
+        translation regardless of which window you measured it in.
+
+        This is not merely a speed switch, it is often the more CORRECT answer.
+        Whole-frame correlation averages over everything that moved, so on an
+        in-situ movie where the sample is genuinely evolving — particles growing,
+        drifting, appearing — the sample's own motion contaminates the estimate of
+        the stage's. Restricting to a static, feature-rich landmark (a support
+        film edge, a fiducial, a stationary grain) measures the stage and nothing
+        else. It is also how a user can rescue a dataset where the field of view
+        is mostly featureless.
+
+        **The ROI is FIXED in frame coordinates**, so the landmark drifts within
+        it. That is fine while the drift is small compared with the box, and it is
+        why the box wants to be comfortably larger than the total excursion —
+        the caret's preview exists so this is judged by eye rather than guessed.
+        A box smaller than the drift will lose the landmark and the solve will
+        wander.
     apodize
         Edge taper before transforming. ``True`` uses a Tukey window with
         ``alpha=DEFAULT_TAPER_ALPHA``; a float sets alpha explicitly
@@ -534,7 +585,9 @@ def solve_translation(
     if upsample < 1:
         raise ValueError(f"upsample must be >= 1; got {upsample}")
 
-    n_frames, get_frame, (h, w) = frame_source(data)
+    n_frames, get_frame, (full_h, full_w) = frame_source(data)
+    crop = _validate_roi(roi, full_h, full_w)
+    h, w = (full_h, full_w) if crop is None else (crop[2], crop[3])
     ops = _resolve_ops(device)
 
     shifts = np.full((n_frames, 2), np.nan, dtype=np.float32)
@@ -554,7 +607,11 @@ def solve_translation(
         mask = _shift_mask(ops, h, w, max_shift, min_shift)
 
         def frame_fft(i: int):
-            f = ops.to_backend(get_frame(i))
+            raw = get_frame(i)
+            if crop is not None:
+                y0, x0, ch, cw = crop
+                raw = raw[y0:y0 + ch, x0:x0 + cw]
+            f = ops.to_backend(raw)
             if window is not None:
                 f = f * window
             return ops.fft2(f)
@@ -629,7 +686,8 @@ def solve_translation(
         "rejected_from_reference": int(rejected),
         "backend": ops.name,
         "n_frames": int(n_frames),
-        "frame_shape": [int(h), int(w)],
+        "frame_shape": [int(full_h), int(full_w)],
+        "roi": None if crop is None else [int(v) for v in crop],
     }
     return DriftModel(
         shifts=shifts,
