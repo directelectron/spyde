@@ -197,26 +197,181 @@ class TestMethodStubs:
                    for m in _of_type(msgs, "error"))
 
 
-class TestTune:
-    def test_tune_solves_only_the_first_pair(self, window):
-        """Two frames, so it lands inside a slider drag — and it must not
-        materialise the movie."""
+class _Box:
+    """Stand-in for an anyplotlib RectangleWidget (x/y/w/h in IMAGE PIXELS).
+
+    The headless session does build a real ``_plot2d``, so the wizard's own box
+    exists — but a test that wants a SPECIFIC region needs to place one, and
+    dragging a real widget means faking pointer events. Swapping this in is the
+    smaller lie, and it exercises the same ``roi_box()`` conversion.
+    """
+
+    def __init__(self, x, y, w, h):
+        self.x, self.y, self.w, self.h = float(x), float(y), float(w), float(h)
+
+    def set(self, **kw):
+        for k, v in kw.items():
+            setattr(self, k, float(v))
+
+    def hide(self):
+        pass
+
+
+class TestDiscoveryPreview:
+    """The centrepiece: a draggable box + a drift-corrected sum of it over ~20
+    frames, so the user sees whether alignment works BEFORE paying for the whole
+    movie."""
+
+    def test_open_previews_the_default_box(self, window):
+        session, _plot, _tree, wiz = _opened(window)
+        msgs = window["messages"]
+        assert _wait(lambda: _of_type(msgs, "drift_preview")), \
+            "opening the caret never produced a discovery preview"
+        prev = _of_type(msgs, "drift_preview")[-1]
+        assert prev["frames"] >= 2
+        assert prev["gain"] > 1.0, (
+            "the aligned sum of the default box is not sharper than the raw one "
+            "— the preview cannot discriminate anything if it never improves")
+
+    def test_the_preview_never_computes_the_whole_movie(self, window):
         session, plot, tree, _wiz = _opened(window)
         msgs = window["messages"]
+        del msgs[:]
         with _FullComputeGuard(tree.root.data.shape) as guard:
             dr.drift_tune(session, plot, {"upsample": 4, "max_shift": 12})
             assert _wait(lambda: _of_type(msgs, "drift_preview"))
         assert guard.hits == 0
-        prev = _of_type(msgs, "drift_preview")[-1]
-        truth = _ground_truth(tree)[1]
-        assert abs(prev["dy"] - truth[0]) < 0.5
-        assert abs(prev["dx"] - truth[1]) < 0.5
 
     def test_tune_stores_the_new_parameters(self, window):
         session, plot, _tree, wiz = _opened(window)
         dr.drift_tune(session, plot, {"upsample": 16, "max_shift": 9.0})
         assert wiz.params["upsample"] == 16
         assert wiz.params["max_shift"] == 9.0
+
+    def test_the_preview_uses_the_box_even_with_the_toggle_off(self, window):
+        """The toggle is the COMMITMENT (does the full solve restrict to the
+        box); the preview is the QUESTION and always asks it about the box."""
+        session, plot, _tree, wiz = _opened(window)
+        msgs = window["messages"]
+        assert wiz.params["use_roi"] is False
+        wiz._roi_widget = _Box(10, 12, 60, 48)
+        del msgs[:]
+        dr.drift_tune(session, plot, {})
+        assert _wait(lambda: _of_type(msgs, "drift_preview"))
+        assert _of_type(msgs, "drift_preview")[-1]["roi"] == [12, 10, 48, 60]
+
+    def test_the_box_is_read_in_image_pixels_as_y0_x0_h_w(self, window):
+        """anyplotlib 2-D widgets report IMAGE PIXELS and solve_translation's
+        roi is in pixels — the two meet with NO scale conversion."""
+        _s, _p, _t, wiz = _opened(window)
+        wiz._frame_shape = (96, 112)
+        wiz._roi_widget = _Box(x=20, y=8, w=40, h=32)
+        assert wiz.roi_box() == (8, 20, 32, 40)
+
+    def test_the_box_is_clamped_into_the_frame(self, window):
+        _s, _p, _t, wiz = _opened(window)
+        wiz._frame_shape = (96, 112)
+        wiz._roi_widget = _Box(x=100, y=90, w=400, h=400)
+        y0, x0, h, w = wiz.roi_box()
+        assert 0 <= y0 and 0 <= x0
+        assert y0 + h <= 96 and x0 + w <= 112
+
+    def test_a_box_below_the_solver_floor_is_refused(self, window):
+        """solve_translation REJECTS a too-small roi rather than clamping it, so
+        the caret must never hand it one."""
+        from spyde.drift.translation import _MIN_ROI
+        assert dr._ROI_MIN_PX >= _MIN_ROI
+        _s, _p, _t, wiz = _opened(window)
+        wiz._frame_shape = (96, 112)
+        wiz._roi_widget = _Box(x=0, y=0, w=4, h=4)
+        y0, x0, h, w = wiz.roi_box()
+        assert h >= _MIN_ROI and w >= _MIN_ROI
+
+    def test_a_superseded_preview_does_not_paint(self, window):
+        """Latest-wins: a drag that outruns the solve must drop the stale
+        result, not paint it over the newer one."""
+        _s, _p, tree, wiz = _opened(window)
+        gen = dr.bump_generation(tree, "_drift_preview_gen")
+        painted = []
+        wiz.show_preview = lambda res: painted.append(res)
+        dr.bump_generation(tree, "_drift_preview_gen")     # a newer drag lands
+        assert not dr.is_current(tree, "_drift_preview_gen", gen)
+        assert painted == []
+
+    def test_the_settle_timer_coalesces_a_drag(self, window):
+        """The widget's pointer_move fires at renderer frame rate; only the
+        RESTING geometry may solve."""
+        _s, _p, _t, wiz = _opened(window)
+        fired = []
+        wiz._fire_preview = lambda: fired.append(1)
+        for _ in range(20):
+            wiz.schedule_preview(delay=0.05)
+        assert fired == []
+        assert _wait(lambda: len(fired) >= 1, timeout=3.0)
+        time.sleep(0.2)
+        assert len(fired) == 1, f"{len(fired)} solves for one drag"
+
+
+class TestSharpnessNumber:
+    """The gain has to be an ANSWER, not decoration: a landmark and a
+    featureless patch must come out clearly different."""
+
+    @staticmethod
+    def _stack(n=16, size=140, pad=20):
+        """Textured on the left half, flat on the right, drifting rigidly."""
+        from scipy.ndimage import gaussian_filter, map_coordinates
+        rng = np.random.default_rng(3)
+        canvas = np.zeros((size + 2 * pad, size + 2 * pad), np.float32) + 1.0
+        tex = gaussian_filter(rng.standard_normal(canvas.shape), 1.5) * 0.6
+        half = size // 2 + pad
+        canvas[:, :half] += tex[:, :half]
+        drift = np.stack([np.linspace(0, 8.0, n), np.linspace(0, -5.0, n)], 1)
+        yy, xx = np.mgrid[0:size, 0:size].astype(np.float64)
+        frames = np.empty((n, size, size), np.float32)
+        for t in range(n):
+            dy, dx = drift[t]
+            frames[t] = map_coordinates(canvas, [yy + pad - dy, xx + pad - dx],
+                                        order=1, mode="nearest")
+        frames += rng.normal(0, 0.02, frames.shape).astype(np.float32)
+        return frames
+
+    def test_a_landmark_beats_a_featureless_patch(self):
+        frames = self._stack()
+        idx = np.arange(frames.shape[0])
+        params = dict(dr.DEFAULTS)
+        good = dr.preview_alignment(frames.__getitem__, idx, (30, 5, 80, 55),
+                                    params=params)
+        bad = dr.preview_alignment(frames.__getitem__, idx, (30, 82, 80, 55),
+                                   params=params)
+        assert good["gain"] > 2.0, f"a real landmark only scored {good['gain']:.2f}"
+        assert bad["gain"] < 1.0, f"a featureless patch scored {bad['gain']:.2f}"
+        assert good["gain"] > 3 * bad["gain"]
+
+    def test_the_nan_border_does_not_inflate_the_number(self):
+        """A shifted frame's uncovered edge is NaN (plan A7). Zero-filling it
+        manufactures a step whose gradient energy dwarfs the image's own — every
+        ROI would look brilliant."""
+        a = np.ones((32, 32), np.float32)
+        a[:4, :] = np.nan
+        assert dr._gradient_energy(a) == 0.0
+
+    def test_the_two_sums_are_measured_on_the_same_pixels(self):
+        raw = np.ones((16, 16), np.float32)
+        aligned = raw.copy()
+        aligned[:3, :] = np.nan
+        both = np.isfinite(raw) & np.isfinite(aligned)
+        assert dr._gradient_energy(raw, both) == dr._gradient_energy(aligned, both)
+
+    def test_the_preview_sample_spans_the_whole_movie(self):
+        """20 CONSECUTIVE frames of a long movie drift by almost nothing, so a
+        contiguous window would say "looks fine" for every box."""
+        idx = dr._preview_indices(3000, 20, 64 * 64 * 4)
+        assert idx[0] == 0 and idx[-1] == 2999 and idx.size <= 20
+
+    def test_the_sample_is_thinned_to_fit_the_byte_cap(self):
+        """With no ROI the crop IS the frame — 20 × 4096² float32 is 1.3 GB."""
+        idx = dr._preview_indices(3000, 20, 4096 * 4096 * 4)
+        assert 2 <= idx.size < 20
 
 
 def _ground_truth(tree):
@@ -285,6 +440,96 @@ class TestSolve:
         dr.drift_run(session, plot, {})
         assert any("caret is not open" in str(m.get("text", ""))
                    for m in _of_type(msgs, "error"))
+
+    def test_use_roi_feeds_the_box_to_the_solver(self, window):
+        """The toggle's whole job: the same rectangle the preview tested is the
+        one the full solve correlates on."""
+        session, plot, _tree, wiz = _opened(window)
+        msgs = window["messages"]
+        wiz._frame_shape = (96, 112)
+        wiz._roi_widget = _Box(x=16, y=12, w=64, h=64)
+        dr.drift_run(session, plot, {"use_roi": True})
+        assert _wait(lambda: wiz.model is not None)
+        assert wiz.model.params["roi"] == [12, 16, 64, 64]
+        assert _of_type(msgs, "drift_result")[-1]["roi"] == [12, 16, 64, 64]
+
+
+class TestTraceWindow:
+    """The dy/dx curve is its OWN plot window, filled as the solve runs — not
+    caret furniture (plan §0.9a)."""
+
+    def test_the_solve_opens_a_second_figure_window(self, window):
+        session, plot, _tree, wiz = _opened(window)
+        msgs = window["messages"]
+        dr.drift_run(session, plot, {})
+        assert _wait(lambda: wiz.trace_window_id is not None)
+        figs = [m for m in _of_type(msgs, "figure")
+                if m.get("window_id") == wiz.trace_window_id]
+        assert figs and figs[-1]["title"] == "Drift dy/dx"
+        assert session.controller_by_window_id(wiz.trace_window_id) is wiz, \
+            "a bare figure is only reachable through the controller registry"
+        assert session._plot_by_window_id(wiz.trace_window_id) is None
+
+    def test_it_fills_from_the_on_shift_stream(self, window):
+        session, plot, _tree, wiz = _opened(window)
+        msgs = window["messages"]
+        dr.drift_run(session, plot, {})
+        assert _wait(lambda: wiz.model is not None)
+        assert _wait(lambda: int(wiz._trace.get("filled", 0)) == N_FRAMES)
+        # …and the same batches went out as `drift_trace` messages.
+        streamed = sum(len(m["points"]) for m in _of_type(msgs, "drift_trace"))
+        assert streamed == N_FRAMES
+
+    def test_the_trace_matches_the_model(self, window):
+        _s, _p, _t, wiz = _solved(window)
+        assert _wait(lambda: int(wiz._trace.get("filled", 0)) == N_FRAMES)
+        np.testing.assert_allclose(wiz._trace["dy_data"], wiz.model.shifts[:, 0],
+                                   atol=1e-5)
+        np.testing.assert_allclose(wiz._trace["dx_data"], wiz.model.shifts[:, 1],
+                                   atol=1e-5)
+
+    def test_only_the_solved_prefix_is_pushed(self, window):
+        """Pushing the NaN-padded whole array would leave anyplotlib's auto
+        y-range looking at one finite point."""
+        _s, _p, _t, wiz = _opened(window)
+        wiz.trace_window_id = None
+        wiz.open_trace_window(50)
+        wiz.push_trace([(1, 3.0, -2.0), (2, 4.0, -3.0)])
+        assert wiz._trace["filled"] == 3
+        assert np.isnan(wiz._trace["dy_data"][3:]).all()
+
+    def test_close_takes_both_windows(self, window):
+        session, plot, tree, wiz = _solved(window)
+        assert _wait(lambda: wiz.trace_window_id is not None)
+        check, trace = wiz.window_id, wiz.trace_window_id
+        dr.drift_close(session, plot, {})
+        from spyde.actions.figure_registry import _FIGS
+        for wid in (check, trace):
+            assert session.controller_by_window_id(wid) is None
+            assert wid not in _FIGS, f"figure {wid} outlived its window"
+
+
+class TestDiscard:
+    def test_discard_drops_the_model_and_the_trace_window(self, window):
+        session, plot, tree, wiz = _solved(window)
+        assert _wait(lambda: wiz.trace_window_id is not None)
+        trace = wiz.trace_window_id
+        dr.drift_discard(session, plot, {})
+        assert wiz.model is None
+        assert getattr(tree, "drift", None) is None
+        assert wiz.trace_window_id is None
+        assert session.controller_by_window_id(trace) is None
+        assert wiz.window_id is not None, "Discard must not close the caret"
+
+    def test_discard_stops_a_solve_in_flight(self, window):
+        """Same user intent as Stop, so it is the same handler: bumping the run
+        generation FIRST means a solve that finishes anyway never installs."""
+        session, plot, tree, wiz = _opened(window, frames=24)
+        dr.drift_run(session, plot, {})
+        dr.drift_discard(session, plot, {})
+        assert wiz._stop[0] is True
+        time.sleep(1.0)
+        assert wiz.model is None
 
 
 class TestCommitIsLazy:
@@ -412,9 +657,20 @@ class TestSchema:
     def test_every_stage_is_registered(self):
         from spyde.actions.registry import STAGED_HANDLERS, resolve_staged
         for stage in ("drift_open", "drift_close", "drift_set_method",
-                      "drift_tune", "drift_run", "drift_commit"):
+                      "drift_tune", "drift_run", "drift_discard",
+                      "drift_commit"):
             assert stage in STAGED_HANDLERS
             assert callable(resolve_staged(stage))
+
+    def test_the_default_face_is_two_toggles(self):
+        """§0.9a: everything that is not the task itself is tagged Advanced, so
+        any host renders the same small face. The caret is the enforcement; this
+        is the schema saying the same thing."""
+        from spyde.actions import registry
+        schema = registry.wizard_parameters("drift")
+        face = [k for k, s in schema.items() if not s.get("tab")]
+        assert face == ["use_roi", "reject_outliers"], \
+            f"the caret's default face grew to {face}"
 
     def test_toolbar_entry_gates_on_a_movie(self):
         import spyde

@@ -1490,10 +1490,13 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'seg_preview':
         case 'seg_trained':
         // Drift Correction caret (spyde/actions/drift_action.py) — caret state,
-        // the first-pair tune readout, whole-movie solve progress, and the
-        // solved shift trace. Consumed by DriftWizard.
+        // the ROI discovery preview (~20 frames aligned on the box, with its
+        // sharpening gain), whole-movie solve progress, the streamed dy/dx
+        // batches, and the solved model. Consumed by DriftWizard; the dy/dx
+        // curve itself is painted by the backend into its own figure window.
         case 'drift_state':
         case 'drift_preview':
+        case 'drift_trace':
         case 'drift_progress':
         case 'drift_result':
         // Cluster telemetry — consumed by the StatusBar DaskMonitor HUD.

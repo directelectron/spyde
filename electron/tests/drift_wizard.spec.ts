@@ -4,12 +4,14 @@
  * `metadata.Spyde.synthetic`).
  *
  * What this proves that tsc + headless tests cannot:
- *   1. `drift_open` opens the SEPARATE Drift Check window (plan A8 — a 240 px
- *      caret cannot show a sum image at a size where sharpness is judgeable,
- *      and judging sharpness IS the check), and the caret is not clipped.
- *   2. The two unimplemented models are LOCKED with the backend's own reason —
- *      not silently falling back to rigid under a caret claiming otherwise.
- *   3. Solve fills the inline dy/dx trace from `drift_result`.
+ *   1. The caret's default face is SMALL (plan §0.9a) — two toggles, one
+ *      readout, one button, and a collapsed Advanced. The count is asserted,
+ *      not eyeballed, because "too many options" is exactly what regressed.
+ *   2. The discovery loop is real: a draggable box on the movie, a live
+ *      drift-corrected sum of just that box in the Drift Check window, and a
+ *      sharpness number that MOVES when the box moves.
+ *   3. The dy/dx curve is its OWN window, opened by the solve and filled while
+ *      it runs — not caret furniture.
  *   4. Apply adds the lazy corrected node.
  */
 import { test, expect } from '@playwright/test'
@@ -24,12 +26,19 @@ let ctx: Awaited<ReturnType<typeof launchApp>>
 test.describe.configure({ mode: 'serial' })
 test.setTimeout(300_000)
 
+/** Every interactive control the caret shows by default. If this list grows,
+ *  §0.9a has been walked back and the review comment applies again. */
+const FACE = ['drift-use-roi', 'drift-reject', 'drift-solve', 'drift-advanced-toggle']
+
 test.beforeAll(async () => {
   mkdirSync(SHOTS, { recursive: true })
   ctx = await launchApp({ dask: true, env: { SPYDE_LOG_LEVEL: 'INFO' } })
   const { page } = ctx
   await page.waitForTimeout(1500)
-  await backendAction(page, 'load_test_data_particles', { frames: 8 })
+  // Enough frames that the solve takes about a second — a 12-frame movie
+  // finishes before a screenshot can catch the dy/dx window mid-fill, which is
+  // the thing this spec has to see.
+  await backendAction(page, 'load_test_data_particles', { frames: 40 })
   await waitForSubwindowCount(page, 2, 120_000)
   await page.waitForTimeout(2000)
 })
@@ -38,50 +47,103 @@ test.afterAll(async () => {
   await ctx?.app?.close()
 })
 
-test('the caret opens its Drift Check window and locks the stub models', async () => {
+test('the caret opens small: 2 toggles, 1 button, Advanced collapsed', async () => {
   const { page } = ctx
   const sig = sigWindow(page)
   await sig.getByTestId('subwindow-title').click()
   await sig.getByTestId('subwindow-titlebar').hover()
   await sig.getByTestId('action-btn-Drift Correction').click()
   await expect(page.getByTestId('drift-wizard')).toBeVisible()
-  await page.screenshot({ path: `${SHOTS}/01-caret-open.png` })
 
-  // The verification surface is a WINDOW, not the caret (plan A8): raw sum +
-  // corrected sum + dy/dx panels.
+  // The verification surface is a WINDOW, not the caret (plan A8): whole-movie
+  // raw/corrected sums on top, the ROI discovery pair beneath.
   await waitForSubwindowCount(page, 3, 120_000)
-  await page.waitForTimeout(3000)
-  await page.screenshot({ path: `${SHOTS}/02-check-window.png` })
+  // …and the discovery preview lands on its own, with no click at all.
+  await expect.poll(
+    async () => await page.getByTestId('drift-roi-readout').getAttribute('data-gain'),
+    { timeout: 120_000, message: 'the discovery preview never reported a gain' },
+  ).toBeTruthy()
+  await page.waitForTimeout(1500)
+  await page.screenshot({ path: `${SHOTS}/01-caret-open.png` })
+  await page.getByTestId('drift-wizard').screenshot({ path: `${SHOTS}/02-caret-face.png` })
 
-  await expect(page.getByTestId('drift-tab-rigid_affine')).toBeDisabled()
-  await expect(page.getByTestId('drift-tab-nonrigid')).toBeDisabled()
-  await expect(page.getByTestId('drift-unavailable')).toContainText('not implemented')
+  for (const id of FACE) await expect(page.getByTestId(id)).toBeVisible()
+  await expect(page.getByTestId('drift-advanced')).toHaveCount(0)
+  // Everything algorithmic is behind the disclosure.
+  for (const id of ['drift-reference', 'drift-upsample', 'drift-max-shift',
+    'drift-order', 'drift-tab-rigid', 'drift-apodize']) {
+    await expect(page.getByTestId(id)).toHaveCount(0)
+  }
+  // Count what a user actually sees: buttons + inputs inside the caret.
+  const shown = await page.getByTestId('drift-wizard')
+    .locator('button, input, [data-testid$="-trigger"]').count()
+  expect(shown, 'controls visible on the default face').toBeLessThanOrEqual(5)
 
-  await page.getByTestId('drift-wizard').screenshot({ path: `${SHOTS}/03-caret-detail.png` })
+  await page.getByTestId('drift-solve').click({ trial: true })   // enabled
   ctx.assertNoJsErrors()
 })
 
-test('Solve fills the shift trace and Apply adds the corrected node', async () => {
+test('Advanced holds the algorithm, and the stubs stay locked there', async () => {
   const { page } = ctx
+  await page.getByTestId('drift-advanced-toggle').click()
+  await expect(page.getByTestId('drift-advanced')).toBeVisible()
+  await expect(page.getByTestId('drift-tab-rigid_affine')).toBeDisabled()
+  await expect(page.getByTestId('drift-tab-nonrigid')).toBeDisabled()
+  await expect(page.getByTestId('drift-unavailable')).toContainText('not implemented')
+  await page.getByTestId('drift-wizard').screenshot({ path: `${SHOTS}/03-advanced.png` })
 
-  // A tune re-solves the FIRST PAIR only (two FFTs) — the cheap answer to "is
-  // max_shift in the right range for this movie".
   await page.getByTestId('drift-max-shift').fill('24')
   await page.getByTestId('drift-max-shift').blur()
-  await expect(page.getByTestId('drift-preview-readout')).toBeVisible({ timeout: 60_000 })
-  await page.getByTestId('drift-wizard').screenshot({ path: `${SHOTS}/04-first-pair.png` })
+  await page.getByTestId('drift-advanced-toggle').click()
+  await expect(page.getByTestId('drift-advanced')).toHaveCount(0)
+  ctx.assertNoJsErrors()
+})
 
+test('dragging the ROI re-solves the preview and moves the sharpness number', async () => {
+  const { page } = ctx
+  const sig = sigWindow(page)
+  const gain = () => page.getByTestId('drift-roi-readout').getAttribute('data-gain')
+  const before = await gain()
+  expect(before, 'no gain before the drag').toBeTruthy()
+
+  // Drag the box's centre a long way — the widget lives inside the signal
+  // window's figure iframe, so this is a real pointer drag on real pixels.
+  const box = await sig.locator('iframe').first().boundingBox()
+  expect(box).toBeTruthy()
+  const cx = box!.x + box!.width / 2, cy = box!.y + box!.height / 2
+  await page.mouse.move(cx, cy)
+  await page.mouse.down()
+  for (let i = 1; i <= 8; i++) {
+    await page.mouse.move(cx - i * 6, cy - i * 4)
+    await page.waitForTimeout(30)
+  }
+  await page.screenshot({ path: `${SHOTS}/04-roi-mid-drag.png` })
+  await page.mouse.up()
+
+  await expect.poll(async () => await gain(),
+    { timeout: 90_000, message: 'the preview never re-solved after the drag' },
+  ).not.toBe(before)
+  await page.waitForTimeout(1500)
+  await page.screenshot({ path: `${SHOTS}/05-roi-settled.png` })
+  ctx.assertNoJsErrors()
+})
+
+test('Correct Drift opens the dy/dx window and fills it, then Apply lands the node', async () => {
+  const { page } = ctx
   await page.getByTestId('drift-solve').click()
-  // The trace is drawn from drift_result's whole shifts array (the solver
-  // returns nothing partial — see the DriftWizard header), so wait for one
-  // point per frame.
-  await expect.poll(
-    async () => Number(await page.getByTestId('drift-trace').getAttribute('data-points')),
-    { timeout: 180_000, message: 'the shift trace never filled from drift_result' },
-  ).toBeGreaterThan(2)
+
+  // The curve is its OWN window (plan §0.9a), opened by the solve and filled
+  // from the on_shift stream — so it has points BEFORE the solve finishes.
+  await waitForSubwindowCount(page, 4, 120_000)
+  await expect(page.getByTestId('drift-progress')).toBeVisible({ timeout: 60_000 })
+  await page.screenshot({ path: `${SHOTS}/06-trace-filling.png` })
+
+  await expect(page.getByTestId('drift-result')).toBeVisible({ timeout: 180_000 })
+  await expect(page.getByTestId('drift-result')).toContainText('px drift')
   await expect(page.getByTestId('drift-status')).toContainText('Solved')
-  await page.getByTestId('drift-wizard').screenshot({ path: `${SHOTS}/05-solved.png` })
-  await page.screenshot({ path: `${SHOTS}/06-solved-full.png` })
+  await page.waitForTimeout(2000)
+  await page.getByTestId('drift-wizard').screenshot({ path: `${SHOTS}/07-solved-caret.png` })
+  await page.screenshot({ path: `${SHOTS}/08-solved-full.png` })
 
   // Apply adds the LAZY corrected node to the tree (map_blocks, nothing copied)
   // and shows it — so it appears in the Plot Control workflow list.
@@ -89,7 +151,7 @@ test('Solve fills the shift trace and Apply adds the corrected node', async () =
   await expect(page.getByTestId('tree-node-Drift corrected')).toBeVisible({ timeout: 60_000 })
   await expect(page.getByTestId('status-text')).toContainText('Drift corrected node added')
   await page.waitForTimeout(2000)
-  await page.screenshot({ path: `${SHOTS}/07-applied.png` })
+  await page.screenshot({ path: `${SHOTS}/09-applied.png` })
 
   const errors = backendErrorLines(ctx.backend)
   expect(errors, `backend errors:\n${errors.join('\n')}`).toEqual([])

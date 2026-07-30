@@ -130,6 +130,7 @@ STAGED_HANDLERS: dict[str, str] = {
     "drift_set_method":    "spyde.actions.drift_action.drift_set_method",
     "drift_tune":          "spyde.actions.drift_action.drift_tune",
     "drift_run":           "spyde.actions.drift_action.drift_run",
+    "drift_discard":       "spyde.actions.drift_action.drift_discard",
     "drift_commit":        "spyde.actions.drift_action.drift_commit",
     "download_cancel":     "spyde.backend.example_download.download_cancel",
     "compute_configure":   "spyde.backend.compute_config.compute_configure",
