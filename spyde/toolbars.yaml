@@ -384,6 +384,30 @@ functions:
     navigation: False
     toggle: True
 
+  Particle Overlay:
+    description: Draw the found particles on the frame — filled outlines coloured by track, labels on the selected one, optional fading motion trails. Double-click a particle to select it; delete, merge and split corrections are recorded on the dataset.
+    icon: drawing/toolbars/icons/peak_finding.svg
+    function: spyde.actions.particle_overlay.particle_overlay
+    requires_particles: True
+    plot_dim: [2]
+    toolbar_side: bottom
+    navigation: False
+    toggle: True
+    # NO `parameters:` block, deliberately. The Electron toolbar renders a
+    # parameter POPOVER with its own Run button for any action that declares
+    # one, so declaring the trail knobs here turned a one-click toggle into a
+    # form the user has to submit — verified in the app: the overlay never drew
+    # because the click only opened the panel. The knobs live in the caret's
+    # schema instead (registry.wizard_parameters("part") → part_tune).
+
+  Particle Lanes:
+    description: Stack count-vs-time, mean size and the birth/death/merge/split event lane as one navigator with a shared time cursor.
+    icon: drawing/toolbars/icons/peak_finding.svg
+    function: spyde.actions.particle_overlay.particle_lanes
+    requires_particles: True
+    plot_dim: [1, 2]
+    toolbar_side: bottom
+
   Fit:
     description: Fit a model to every spectrum. Add components line by line, watch the model curve on the spectrum, then Run to fit the whole scan on the GPU. Commit turns each component's integrated area into a map.
     icon: drawing/toolbars/icons/fit.svg

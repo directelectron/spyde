@@ -114,6 +114,16 @@ STAGED_HANDLERS: dict[str, str] = {
     "seg_train":           "spyde.actions.particles_action.seg_train",
     "seg_run":             "spyde.actions.particles_action.seg_run",
     "seg_commit":          "spyde.actions.particles_action.seg_commit",
+    # Particle overlay + editing (spyde/actions/particle_overlay.py) — plan B9/C2/C3.
+    "part_open":           "spyde.actions.particle_overlay.part_open",
+    "part_close":          "spyde.actions.particle_overlay.part_close",
+    "part_tune":           "spyde.actions.particle_overlay.part_tune",
+    "part_select":         "spyde.actions.particle_overlay.part_select",
+    "part_region_mode":    "spyde.actions.particle_overlay.part_region_mode",
+    "part_delete":         "spyde.actions.particle_overlay.part_delete",
+    "part_merge":          "spyde.actions.particle_overlay.part_merge",
+    "part_split":          "spyde.actions.particle_overlay.part_split",
+    "part_lanes":          "spyde.actions.particle_overlay.part_lanes",
     # Drift Correction (spyde/actions/drift_action.py) — plan A8.
     "drift_open":          "spyde.actions.drift_action.drift_open",
     "drift_close":         "spyde.actions.drift_action.drift_close",
@@ -252,6 +262,7 @@ _WIZARD_SCHEMAS: dict[str, tuple[str, str]] = {
     "ebsd":   ("spyde.actions.ebsd_action", "EbsdWizard"),
     "czb":    ("spyde.actions.center_zero_beam", "PARAMETERS"),
     "seg":    ("spyde.actions.particles_action", "SegmentWizard"),
+    "part":   ("spyde.actions.particle_overlay", "PARAMETERS"),
     "drift":  ("spyde.actions.drift_action", "DriftWizard"),
     # YAML-declared (resolved from spyde.TOOLBAR_ACTIONS):
     "fv":     ("__yaml__", "Find Diffraction Vectors"),

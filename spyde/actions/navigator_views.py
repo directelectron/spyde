@@ -98,6 +98,12 @@ def select_navigator(session, plot, payload) -> None:
         _switch_navigator(tree, plot, names[0])
         emit_navigator_options(tree)
     elif _tree_nav_is_1d(tree):
+        # A PARTICLE tree's lanes render themselves — the count lane is integer
+        # data and must be a step, and the event lane is coloured markers, not a
+        # trace. Delegate before falling back to the generic plain-line stacker.
+        from spyde.actions.particle_overlay import maybe_stack_particle_lanes
+        if maybe_stack_particle_lanes(session, plot, tree, names):
+            return
         # In-situ movie / time series: stack the 1-D traces with a shared,
         # linked time cursor (see module docstring).
         _stack_navigators(session, plot, tree, names)
