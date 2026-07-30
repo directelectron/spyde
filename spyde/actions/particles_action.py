@@ -954,7 +954,6 @@ def _on_stroke(wiz, event) -> None:
         return
     try:
         strokes = list(getattr(brush, "strokes", ()) or ())
-        classes = list(getattr(brush, "stroke_classes", ()) or ())
     except Exception as exc:
         log.debug("[seg] reading brush strokes failed: %s", exc)
         return
@@ -965,13 +964,31 @@ def _on_stroke(wiz, event) -> None:
         return
     wiz._brush_seen = len(strokes)
 
+    # PYTHON is the authority for all three, and the class one is load-bearing.
+    #
+    # `stroke_classes` is what the JS widget tagged the stroke with, and reading
+    # it made class switching silently not work: `Figure._push_widget` sends a
+    # targeted update that never writes `panel_<id>_json`, so a Python-side
+    # `brush.class_id = 1` does not reliably reach the widget before the next
+    # stroke — anyplotlib's own brush test has to press Shift BEFORE pushing the
+    # class to dodge exactly this.
+    #
+    # The natural experiment that proved it: `erase` read from `wiz.params` and
+    # WORKED, `class` read from `stroke_classes` and did not, in the same handler
+    # on the same stroke. So the strip → seg_tune → params path is sound; the
+    # Python → JS widget push is what is unreliable.
+    #
+    # Nothing is lost by preferring params: a stroke cannot change class midway,
+    # so the active class when it completes IS its class. The widget push stays
+    # (see `_sync_brush`) purely so the stroke DRAWS in the right colour while
+    # the user paints — cosmetic, and no longer load-bearing.
     erase = bool(wiz.params.get("erase", False))
     radius = float(getattr(brush, "radius", wiz.params.get("brush", 6.0)) or 6.0)
-    default_cls = int(wiz.params.get("active_class", 0))
+    active_cls = int(wiz.params.get("active_class", 0))
 
     painted = 0
     for i, stroke in enumerate(fresh, start=seen):
-        cls = int(classes[i]) if i < len(classes) else default_cls
+        cls = active_cls
         # anyplotlib gives [[x, y], ...] in IMAGE PIXELS; LabelStore works in
         # (y, x). Swapping these silently mirrors every scribble about the
         # diagonal, which on a non-square frame also puts half of them outside

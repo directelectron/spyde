@@ -591,25 +591,32 @@ class TestBrushActuallyPaints:
     def test_a_second_stroke_only_paints_its_own_points(self, window):
         """The widget accumulates strokes for its whole life, so replaying the
         full list on every event would re-paint everything and make the class
-        counts grow quadratically."""
-        from spyde.actions.particles_action import _brush_supported, _on_stroke
+        counts grow quadratically.
+
+        The class is switched through ``seg_tune``, NOT by handing the widget
+        different ``stroke_classes``: the caret's params are the authority,
+        precisely because the JS widget's own value is not reliably in sync (see
+        :meth:`test_class_comes_from_PARAMS_not_from_the_js_widget`).
+        """
+        from spyde.actions.particles_action import (_brush_supported, _on_stroke,
+                                                    seg_tune)
         session = window["window"]
         session._load_test_data_particles({"frames": 4})
-        _plot, tree = self._scribble_wizard(session)
+        plot, tree = self._scribble_wizard(session)
         if not _brush_supported():
             pytest.skip("installed anyplotlib has no brush widget (needs >= 0.5.0)")
         wiz, brush = tree._seg_wizard, tree._seg_brush
         store = wiz.label_store()
         s1 = [[20.0, 30.0], [24.0, 32.0]]
-        brush.set(strokes=[s1], stroke_classes=[0])
+        brush.set(strokes=[s1])
         _on_stroke(wiz, None)
         one = dict(store.counts())
         # Fire again with NO new stroke: nothing may change.
         _on_stroke(wiz, None)
         assert dict(store.counts()) == one, "re-fired the same stroke"
-        # A genuinely new stroke adds, and by a sane amount.
-        brush.set(strokes=[s1, [[60.0, 40.0], [64.0, 42.0]]],
-                  stroke_classes=[0, 1])
+        # A genuinely new stroke, in a class chosen the way the strip chooses it.
+        seg_tune(session, plot, {"active_class": 1})
+        brush.set(strokes=[s1, [[60.0, 40.0], [64.0, 42.0]]])
         _on_stroke(wiz, None)
         two = dict(store.counts())
         assert two[1] > 0, "the second stroke's class was not painted"
@@ -688,6 +695,44 @@ class TestPaintStateReachesTheWidget:
             "active_class is read by the brush but not a declared parameter, so "
             "nothing can ever set it and every stroke is class 0")
         assert "erase" in DEFAULTS
+
+    def test_class_comes_from_PARAMS_not_from_the_js_widget(self, window):
+        """The test that would have caught it. The old one did not.
+
+        The first version set `brush.class_id` and read it back — both PYTHON
+        side — so it passed while the app was broken. In the real app the widget
+        lives in JS, and `Figure._push_widget` sends a targeted update that never
+        writes `panel_<id>_json`, so a Python-side class push does not reliably
+        reach it before the next stroke.
+
+        The natural experiment that exposed this: the ERASER worked and the CLASS
+        did not, in the same handler on the same stroke — because erase read from
+        `wiz.params` and class read from the widget's `stroke_classes`.
+
+        So this test forces the widget's own class to be STALE and wrong, and
+        asserts the stroke still lands in the class the caret asked for.
+        """
+        from spyde.actions.particles_action import _brush_supported, _on_stroke, seg_tune
+        session = window["window"]
+        plot, tree = self._scribbling(session)
+        if not _brush_supported():
+            pytest.skip("installed anyplotlib has no brush widget (needs >= 0.5.0)")
+        wiz, brush = tree._seg_wizard, tree._seg_brush
+        store = wiz.label_store()
+
+        seg_tune(session, plot, {"active_class": 2})
+        # Simulate the push NOT landing: the widget still thinks it is class 0,
+        # and tags the stroke accordingly.
+        brush.set(class_id=0)
+        brush.set(strokes=[[[20.0, 30.0], [26.0, 32.0]]], stroke_classes=[0])
+        _on_stroke(wiz, None)
+
+        counts = dict(store.counts())
+        assert counts.get(2, 0) > 0, (
+            "the stroke was filed under the WIDGET's stale class instead of the "
+            "one the caret selected — this is the 'can only scribble one colour' "
+            f"bug: {counts}")
+        assert counts.get(0, 0) == 0
 
     def test_switching_class_retags_the_next_stroke(self, window):
         from spyde.actions.particles_action import _brush_supported, seg_tune
