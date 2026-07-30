@@ -430,8 +430,23 @@ module that imports skimage.
 set, batched on GPU: gaussian, difference-of-gaussians, median / min / max (via
 `unfold`), Sobel, Hessian eigenvalues, Laplacian, membrane projections. One
 `(C, H, W)` tensor per frame, separable convolutions where the kernel allows,
-one pass over the frame rather than one pass per feature. **Fine scales are
-mandatory** — they are what detects small faint particles (§0.9).
+one pass over the frame rather than one pass per feature. 36 default channels;
+512² costs 71 ms, and sharing intermediates across the family is worth 156 → 54 ms
+(the rank family alone 205 → 33 ms by reusing one `unfold` — note `max_pool2d(stride=1)`
+measured **4× slower** than `unfold`, and a closed-form Hessian is 0.32 ms against
+`eigvalsh`'s 125 ms).
+
+**Fine scales are mandatory — but the reason stated in an earlier draft was wrong.**
+Measured: a coarse `(4, 8)` stack still *detects* both faint probes. What it loses is
+their **size**: mean radius error goes 13% → 26%, and the r=3 probe from −12% to
+−44%. So the floor must stay ≤ 1 px for **measurement fidelity**, not for detection.
+Sigma 0.5 buys nothing measurable over 1.0 on the fixture and is kept only because it
+costs 2 ms of the 71.
+
+`membrane` projections default **off**: ~8 ms/channel against ~2 ms for everything
+else, and they moved the faint-probe result neither way. They do discriminate a line
+from a blob 3:1, so they are the right switch for fibres and films — just not for
+compact particles.
 
 **B3. Scribble classifier** (`scribble.py`) — the workhorse.
 
@@ -450,7 +465,32 @@ mandatory** — they are what detects small faint particles (§0.9).
   ilastik use, and agreement on the same labels is the acceptance gate.
 - **Hard interaction budget: train + apply to the visible frame under ~1 s.**
   Train on labelled pixels only (thousands, not millions); apply to the visible
-  frame only while tuning.
+  frame only while tuning. **Measured: 0.492 s** on CPU for a 96×112 frame —
+  14 ms featurise, 457 ms for 300 Adam steps, 20 ms apply. The fit is *fixed*
+  cost (1.5 ms/step at any torch thread count from 1 to 24, i.e. pure dispatch
+  overhead, not arithmetic), so it will not degrade with frame size — only the
+  featurise and apply terms will.
+
+> **§0.9 needs at least one FAINT scribble. "Paint the obvious ones" is not
+> enough.** Measured: trained on bright particles only, with no faint example
+> anywhere in the labels, the torch head finds at most 1 of the 2 faint probes and
+> the RandomForest reference finds **0 of 2** — both exactly 0.0. No threshold
+> rescues it; the missed probe sits around 19% probability. A single seven-pixel dab
+> on one faint probe takes it to 2 of 2. An 8× contrast extrapolation from labels
+> containing no faint example is simply not available from this feature stack.
+>
+> The forest's 0.0 is *structural*, not noise — a tree ensemble cannot predict
+> outside the leaves its training data reached, while the MLP extrapolates its
+> decision boundary and gets one for free. So on sensitivity specifically, which
+> §0.9 makes the priority, the shipped head beats the reference it is validated
+> against rather than merely being faster.
+>
+> **Two consequences for B7.** The per-class labelled-pixel counts in the caret are
+> not decoration — under-training a class is *the* failure mode and the counts are
+> how a user notices. And the wizard should say so: when a class has few labelled
+> pixels and the preview finds fewer particles than the previous run, prompt for
+> more examples rather than letting the user reach for the sensitivity slider,
+> which cannot fix a missing example.
 
 **B4. Promptable segmentation** (`prompt.py`) — the bootstrap.
 

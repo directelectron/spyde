@@ -277,3 +277,55 @@ class TestNeuralPathsTakeLock:
         monkeypatch.setattr(models, "calibrate", fake_calibrate)
         fvn.calibrate_neural([np.zeros((32, 32), dtype=np.float32)])
         assert held == [True], "calibration forwards ran unserialised on MPS"
+
+
+class TestParticleEnginesTakeLock:
+    """The particle feature stack and the scribble head are the newest torch users.
+
+    They run from BOTH ends of the concurrency this lock exists for: a batch
+    segmentation run on a worker thread, and the interactive re-apply that fires on
+    every navigator move while the user tunes. That overlap is exactly the pair of
+    threads in the crash stacks at the top of this file.
+
+    These two pin the *real* lock. Finer-grained nesting — that no submission
+    inside ``fit`` / ``predict`` / ``save`` / ``load`` escapes the block, which a
+    null context on a CPU box cannot show — is pinned in
+    ``test_particles_scribble.py::TestDeviceLock``.
+    """
+
+    def test_feature_stack_locks(self, monkeypatch):
+        """``map_feature_bands`` is the single torch entry point in features.py:
+        ``feature_tensor``, ``feature_stack`` and ``sample_features`` all route
+        through it, so this one acquisition covers every channel."""
+        from spyde.particles import features as feat
+
+        held = []
+        monkeypatch.setattr(feat, "_band_stack",
+                            lambda *a, **k: held.append(_lock_is_held_by_me()))
+        feat.map_feature_bands(np.zeros((8, 8), dtype=np.float32),
+                               feat.FeatureSpec(), device=_FakeDev(),
+                               fn=lambda *a: None)
+        assert held == [True], "the particle feature stack ran unserialised on MPS"
+        assert not _lock_is_held_by_me(), "lock leaked"
+
+    def test_scribble_training_locks(self, monkeypatch):
+        from spyde.particles import scribble as scr
+
+        class _Stop(Exception):
+            """Aborts the fit at its first device submission."""
+
+        held = []
+
+        def spy(*a, **kw):
+            held.append(_lock_is_held_by_me())
+            raise _Stop
+
+        monkeypatch.setattr(scr, "sample_features", spy)
+        store = scr.LabelStore(frame_shape=(16, 16))
+        store.paint(0, [(2, 2)], 0)
+        store.paint(0, [(9, 9)], 1)
+        clf = scr.ScribbleClassifier(device=_FakeDev())
+        with pytest.raises(_Stop):
+            clf.fit(store, {0: np.zeros((16, 16), dtype=np.float32)})
+        assert held == [True], "scribble training ran unserialised on MPS"
+        assert not _lock_is_held_by_me(), "lock leaked"
