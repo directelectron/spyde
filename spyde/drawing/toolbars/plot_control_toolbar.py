@@ -189,6 +189,7 @@ def get_toolbar_actions_for_plot(
         exclude_signal_types = meta.get("exclude_signal_types")
         signal_class = meta.get("signal_class")
         requires_vectors = meta.get("requires_vectors", False)
+        requires_particles = meta.get("requires_particles", False)
         plot_dim = meta.get("plot_dim", [1, 2])
         navigation_only = meta.get("navigation")
         params = meta.get("parameters", {})
@@ -199,8 +200,11 @@ def get_toolbar_actions_for_plot(
         # requires_vectors: action only shows once the plot's signal tree has
         # diffraction_vectors attached (set after Find Vectors completes).
         # PlotState.rebuild_toolbars() re-runs this filter at that point.
+        # requires_particles is the same gate for tree.particles, set when a
+        # segmentation run finalizes.
         tree = getattr(plot_state.plot, "signal_tree", None)
         has_vectors = getattr(tree, "diffraction_vectors", None) is not None
+        has_particles = getattr(tree, "particles", None) is not None
 
         add_action = (
             (signal_types is None or plot_signal_type in signal_types)
@@ -221,6 +225,7 @@ def get_toolbar_actions_for_plot(
                 or isinstance(signal, _resolve_signal_class(signal_class))
             )
             and (not requires_vectors or has_vectors)
+            and (not requires_particles or has_particles)
             # requires_original_metadata: hide unless the signal came from the
             # format this action is about (see _has_original_metadata).
             and _has_original_metadata(
@@ -290,6 +295,7 @@ def _action_matches_plot(action: str, meta: dict, plot_state: "PlotState") -> bo
     exclude_signal_types = meta.get("exclude_signal_types")
     signal_class = meta.get("signal_class")
     requires_vectors = meta.get("requires_vectors", False)
+    requires_particles = meta.get("requires_particles", False)
     plot_dim = meta.get("plot_dim", [1, 2])
     navigation_only = meta.get("navigation")
 
@@ -298,6 +304,7 @@ def _action_matches_plot(action: str, meta: dict, plot_state: "PlotState") -> bo
 
     tree = getattr(plot_state.plot, "signal_tree", None)
     has_vectors = getattr(tree, "diffraction_vectors", None) is not None
+    has_particles = getattr(tree, "particles", None) is not None
 
     return (
         (signal_types is None or plot_signal_type in signal_types)
@@ -307,6 +314,7 @@ def _action_matches_plot(action: str, meta: dict, plot_state: "PlotState") -> bo
             or isinstance(signal, _resolve_signal_class(signal_class))
         )
         and (not requires_vectors or has_vectors)
+        and (not requires_particles or has_particles)
         and _has_original_metadata(signal, meta.get("requires_original_metadata"))
         and _packages_present(meta)
         and (plot_state.dimensions in plot_dim)

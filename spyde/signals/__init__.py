@@ -8,6 +8,7 @@ code and are constructible + saveable standalone.
 from spyde.signals.diffraction_vectors import SpyDEDiffractionVectors
 from spyde.signals.orientation_map import SpyDEOrientationMap
 from spyde.signals.insitu import InSitu, LazyInSitu
+from spyde.signals.particle_map import LazyParticleMap, ParticleMap
 from spyde.signals.particles import SpyDEParticles
 
 __all__ = [
@@ -16,4 +17,6 @@ __all__ = [
     "InSitu",
     "LazyInSitu",
     "SpyDEParticles",
+    "ParticleMap",
+    "LazyParticleMap",
 ]

@@ -29,3 +29,15 @@ signals:
     dtype: real
     lazy: True
     module: spyde.signals.insitu
+  ParticleMap:
+    signal_type: particles
+    signal_dimension: 2
+    dtype: real
+    lazy: False
+    module: spyde.signals.particle_map
+  LazyParticleMap:
+    signal_type: particles
+    signal_dimension: 2
+    dtype: real
+    lazy: True
+    module: spyde.signals.particle_map
