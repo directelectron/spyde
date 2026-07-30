@@ -4,16 +4,22 @@
  *
  * What this actually proves (headless tests + tsc cannot see any of it):
  *   1. The caret opens from the real toolbar button and the backend previews
- *      the DISPLAYED frame — the size histogram has bars, not an empty box.
- *   2. The floating brush strip renders NEXT TO THE PLOT (plan B0) with one
+ *      the DISPLAYED frame — the count line names a number of particles.
+ *   2. The DEFAULT face is calm: one slider, one count, one button, one
+ *      disclosure. Everything else is behind `▸ Advanced`, which is collapsed
+ *      on open and remembers its state.
+ *   3. The floating brush strip renders NEXT TO THE PLOT (plan B0) with one
  *      swatch per backend class, and is not clipped by the window.
- *   3. `min_size` = 0 is FLOORED by the backend and the caret shows the
+ *   4. The size histogram (inside Advanced) has bars, not an empty box.
+ *   5. `min_size` = 0 is FLOORED by the backend and the caret shows the
  *      EFFECTIVE value, not the 0 the user typed (plan §0.9 — at 0 the split
- *      returns background speckle as particles).
- *   4. Run All opens a real particle result window.
- *   5. A brush stroke reaches `seg_paint` and the per-class labelled-pixel
+ *      returns background speckle as particles). Both the field and the warning
+ *      live inside Advanced.
+ *   6. "Find in all frames" opens a real particle result window.
+ *   7. A brush stroke reaches `seg_paint` and the per-class labelled-pixel
  *      counts in the caret update — the counts are how a user notices an
- *      under-trained class, so a count stuck at 0 is a real failure.
+ *      under-trained class, so a count stuck at 0 is a real failure. The class
+ *      list is the SCRIBBLE tab's business and is not shown on Classical.
  *
  * Real Dask + `load_test_data_particles` (lazy, 1 frame/chunk, ground truth
  * stamped into metadata) — the path a user actually drags.
@@ -79,6 +85,43 @@ async function openCaret() {
   return sig
 }
 
+/**
+ * Drive the `▸ Advanced` disclosure to a known state. Everything the primary
+ * face no longer shows is in there, so most of the assertions below have to open
+ * it first — which is the point of the redesign, not an inconvenience.
+ *
+ * ONE click has to do it, deliberately: the caret is a DOM child of
+ * FloatingToolbar, whose placement effect moves it (below ↔ right) when its
+ * height changes. Toggling the disclosure changes that height from the WIZARD's
+ * own state, which does not re-render the toolbar — so before the toolbar's
+ * ResizeObserver existed the placement stayed stale and the caret jumped on the
+ * NEXT render, i.e. between the mousedown and the mouseup of the following
+ * click. The browser then emits no `click` at all: the control takes focus and
+ * silently does nothing, and every other click is ignored. A retry loop here
+ * would hide exactly that, so there isn't one.
+ */
+async function setAdvanced(open: boolean) {
+  const { page } = ctx
+  const adv = page.getByTestId('seg-advanced')
+  const toggle = page.getByTestId('seg-advanced-toggle')
+  if (((await adv.count()) > 0) === open) return
+  await toggle.click()
+  await expect(adv).toHaveCount(open ? 1 : 0)
+  await expect(toggle).toHaveAttribute('aria-expanded', String(open))
+}
+
+/** The caret box has NO scroller of its own — the Threshold dropdown's menu is
+ *  absolutely positioned, so an `overflow:auto` ancestor would clip it. That
+ *  makes "does it fit" a real assertion: anything past the bottom of the MDI
+ *  area is simply unreachable, and an expanded Advanced is where it happens. */
+async function expectCaretFits() {
+  const { page } = ctx
+  const box = await page.getByTestId('segment-wizard').boundingBox()
+  const mdi = await page.getByTestId('mdi-area').boundingBox()
+  expect(box && mdi && box.y + box.height <= mdi.y + mdi.height + 1,
+    `caret ${JSON.stringify(box)} runs past the MDI area ${JSON.stringify(mdi)}`).toBe(true)
+}
+
 test('caret opens, previews the displayed frame, and shows the brush strip', async () => {
   const { page } = ctx
   await page.screenshot({ path: `${SHOTS}/01-movie-loaded.png` })
@@ -91,32 +134,84 @@ test('caret opens, previews the displayed frame, and shows the brush strip', asy
   await page.screenshot({ path: `${SHOTS}/02-caret-open.png` })
 
   // The preview is a real backend round trip (seg_open → worker → seg_preview),
-  // so wait for the stats line to stop saying "no preview yet".
+  // so wait for the count line to stop saying "no preview yet".
   await expect.poll(
     () => page.getByTestId('seg-preview-stats').textContent(),
     { timeout: 60_000, message: 'seg_preview never reached the caret' },
-  ).toMatch(/found/)
+  ).toMatch(/\d+ particles? on this frame/)
 
+  // ── the DEFAULT face is the whole point of the redesign ──────────────────
+  // Advanced is collapsed on open, and everything it holds is genuinely absent
+  // from the DOM (not merely visually quiet).
+  await expect(page.getByTestId('seg-advanced-toggle')).toHaveAttribute('aria-expanded', 'false')
+  await expect(page.getByTestId('seg-advanced')).toHaveCount(0)
+  for (const hidden of [
+    'seg-min-size', 'seg-max-size', 'seg-watershed', 'seg-store-masks',
+    'seg-track', 'seg-threshold', 'seg-gaussian', 'seg-rb-kernel',
+    'seg-local-size', 'seg-min-separation', 'seg-marker-smooth', 'seg-max-dist',
+    'seg-invert', 'seg-clear-border', 'seg-histogram', 'seg-counts',
+    'seg-commit',
+  ]) {
+    await expect(page.getByTestId(hidden),
+      `${hidden} must be behind Advanced, not on the default face`).toHaveCount(0)
+  }
+  // Exactly ONE interactive control besides the tabs, the ✕ and the disclosure.
+  const primaryControls = await page.getByTestId('segment-wizard')
+    .locator('input, select, textarea, button').count()
+  // ✕, 3 tabs, sensitivity range, Find-in-all-frames, Advanced = 7.
+  expect(primaryControls, 'the default face grew a control back').toBe(7)
+  await expect(page.getByTestId('seg-sensitivity')).toBeVisible()
+  await expect(page.getByTestId('seg-run')).toHaveText('Find in all frames')
+
+  await page.getByTestId('segment-wizard').screenshot({ path: `${SHOTS}/03-caret-detail.png` })
+
+  // ── Advanced still holds everything, and it still works ──────────────────
+  await setAdvanced(true)
   // An EMPTY histogram is the classic "it rendered but says nothing" failure —
   // assert on the bar count the component publishes, not on pixels.
   await expect.poll(
     async () => Number(await page.getByTestId('seg-histogram').getAttribute('data-nonzero')),
     { timeout: 30_000, message: 'size histogram has no populated bins' },
   ).toBeGreaterThan(0)
+  await expect(page.getByTestId('seg-min-size')).toBeVisible()
+  await expect(page.getByTestId('seg-commit')).toBeVisible()
+  await page.getByTestId('segment-wizard').screenshot({ path: `${SHOTS}/03b-caret-advanced.png` })
+  // Expanded, IN PLACE: Advanced makes the caret tall enough that the toolbar
+  // re-places it beside the window. It must still fit inside the MDI area — the
+  // caret box has no scroller of its own, so anything past the bottom is simply
+  // unreachable.
+  await page.screenshot({ path: `${SHOTS}/03c-advanced-full.png` })
+  await expectCaretFits()
+  await setAdvanced(false)
 
-  // The brush strip is next to the PLOT, not in the caret (plan B0).
+  // The brush strip belongs to the SCRIBBLE tab only. It floats over the image,
+  // so on Classical — where there is nothing to paint — it would be chrome
+  // covering the data for no reason.
+  await expect(page.getByTestId('seg-class-strip'),
+    'the brush strip is showing on Classical, where there is nothing to paint',
+  ).toHaveCount(0)
+
+  // The class list carries NAMES + per-class pixel counts (the caret is the
+  // authoritative list; the strip is swatches only) — also Scribble's business.
+  await expect(page.getByTestId('seg-class-list')).toHaveCount(0)
+
+  await page.getByTestId('seg-tab-scribble').click()
+  await expect(page.getByTestId('seg-class-0')).toBeVisible({ timeout: 30_000 })
+  await expect(page.getByTestId('seg-class-pixels-0')).toBeVisible()
+  // ...and NOW the strip appears, next to the plot rather than in the caret.
   const strip = page.getByTestId('seg-class-strip')
-  await expect(strip).toBeVisible()
+  await expect(strip).toBeVisible({ timeout: 30_000 })
   await expect(page.getByTestId('seg-strip-class-0')).toBeVisible()
   await expect(page.getByTestId('seg-strip-brush')).toBeVisible()
   await expect(page.getByTestId('seg-strip-eraser')).toBeVisible()
+  // No `+ add class`: the backend has no seg_add_class verb, and a permanently
+  // disabled control is noise on a face this redesign just emptied out.
+  await expect(page.getByTestId('seg-add-class')).toHaveCount(0)
 
-  // The class list carries NAMES + per-class pixel counts (the caret is the
-  // authoritative list; the strip is swatches only).
-  await expect(page.getByTestId('seg-class-0')).toBeVisible()
-  await expect(page.getByTestId('seg-class-pixels-0')).toBeVisible()
+  await page.getByTestId('seg-tab-classical').click()
+  await expect(page.getByTestId('seg-sensitivity')).toBeVisible({ timeout: 30_000 })
+  await expect(page.getByTestId('seg-class-strip')).toHaveCount(0)
 
-  await page.getByTestId('segment-wizard').screenshot({ path: `${SHOTS}/03-caret-detail.png` })
   await page.screenshot({ path: `${SHOTS}/04-preview.png` })
   ctx.assertNoJsErrors()
 })
@@ -125,15 +220,21 @@ test('sensitivity re-previews and min_size=0 is floored to the EFFECTIVE value',
   const { page } = ctx
   const stats = page.getByTestId('seg-preview-stats')
 
-  const before = await stats.textContent()
+  // The COUNT alone is not a reliable "did it re-run" signal — two sensitivities
+  // can legitimately find the same number of particles — so poll the caret's own
+  // monotonic preview counter instead of diffing the label text.
+  const seq0 = Number(await stats.getAttribute('data-seq'))
   await page.getByTestId('seg-sensitivity').fill('0.85')
-  await expect.poll(() => stats.textContent(), {
+  await expect.poll(async () => Number(await stats.getAttribute('data-seq')), {
     timeout: 60_000, message: 'dragging sensitivity did not re-preview',
-  }).not.toBe(before)
+  }).toBeGreaterThan(seq0)
   await page.screenshot({ path: `${SHOTS}/05-sensitivity.png` })
 
   // min_size=0 is the footgun plan §0.9 measured (33 instances where 9 are
-  // real). The backend floors it to 10 and the caret must show 10.
+  // real). The backend floors it to 10 and the caret must show 10. Both the
+  // field and the warning are inside Advanced now: the floor is applied
+  // unconditionally, so the primary face never has to mention it.
+  await setAdvanced(true)
   const minSize = page.getByTestId('seg-min-size')
   await minSize.fill('0')
   await minSize.blur()
@@ -144,16 +245,21 @@ test('sensitivity re-previews and min_size=0 is floored to the EFFECTIVE value',
 
   await page.getByTestId('segment-wizard').screenshot({ path: `${SHOTS}/06-minsize-floored.png` })
 
-  // Back to a sane value for the batch below.
+  // Back to a sane value for the batch below, and back to the calm face.
   await minSize.fill('20')
   await minSize.blur()
+  await setAdvanced(false)
   ctx.assertNoJsErrors()
 })
 
-test('Run All segments the movie into a new particle window', async () => {
+test('Find in all frames segments the movie into a new particle window', async () => {
   const { page } = ctx
   const before = await page.getByTestId('subwindow').count()
   await page.getByTestId('seg-run').click()
+  // The button's own status line is the proof the React handler ran at all —
+  // a swallowed click leaves the last preview's text sitting there and the
+  // 3-minute window poll below then fails for the wrong reason.
+  await expect(page.getByTestId('seg-status')).toHaveText(/Segmenting the movie/)
   await expect.poll(() => page.getByTestId('subwindow').count(), {
     timeout: 180_000, message: 'the particle result window never opened',
   }).toBeGreaterThan(before)
@@ -238,8 +344,11 @@ test('a brush stroke reaches seg_paint and the class pixel counts update', async
     `rows with a visible border: ${JSON.stringify(borders)}`).toHaveLength(1)
   await page.screenshot({ path: `${SHOTS}/09-painted-full.png` })
 
-  // The counts line is the "did I label enough" readout.
+  // The counts line is the "did I label enough" readout — demoted into Advanced
+  // (the class list already carries the per-class numbers on the face).
+  await setAdvanced(true)
   await expect(page.getByTestId('seg-counts')).toContainText('frames labelled')
+  await setAdvanced(false)
   ctx.assertNoJsErrors()
 })
 
@@ -248,7 +357,7 @@ test('Train fits the scribble classifier and the caret reports it', async () => 
   await raiseSource()
   const train = page.getByTestId('seg-train')
   await expect(train).toBeEnabled()
-  await train.click()
+  await page.getByTestId('seg-train').click()
 
   // Assert on the PERSISTENT report line, not the status: the backend follows
   // seg_trained with a re-preview whose status overwrites it milliseconds later
@@ -261,6 +370,27 @@ test('Train fits the scribble classifier and the caret reports it', async () => 
 
   await page.getByTestId('segment-wizard').screenshot({ path: `${SHOTS}/10-trained.png` })
   await page.screenshot({ path: `${SHOTS}/11-trained-full.png` })
+
+  // The Scribble face, expanded — its parameters share the SAME disclosure, so
+  // nothing moved to a second place.
+  await setAdvanced(true)
+  await expect(page.getByTestId('seg-min-size')).toBeVisible()
+  await expect(page.getByTestId('seg-track')).toBeVisible()
+  // The classical MASK knobs are absent here, and not just to save room: the
+  // scribble engine hands split_instances a probability map thresholded at 0.5
+  // and never reads them (spyde/particles/classical.py::split_instances). Six
+  // knobs that do nothing is the overload complaint in miniature.
+  for (const dead of ['seg-threshold', 'seg-gaussian', 'seg-rb-kernel',
+    'seg-local-size', 'seg-invert', 'seg-sensitivity']) {
+    await expect(page.getByTestId(dead),
+      `${dead} does not affect the scribble engine and must not be shown`).toHaveCount(0)
+  }
+  // Scribble's Advanced is the TALLEST state the caret has (class list + train
+  // report + parameters); if anything is going to run off the bottom, it is this.
+  await expectCaretFits()
+  await page.getByTestId('segment-wizard').screenshot({ path: `${SHOTS}/12-scribble-advanced.png` })
+  await setAdvanced(false)
+  await page.getByTestId('segment-wizard').screenshot({ path: `${SHOTS}/13-scribble-collapsed.png` })
 
   const errors = backendErrorLines(ctx.backend)
   expect(errors, `backend errors:\n${errors.join('\n')}`).toEqual([])

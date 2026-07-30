@@ -142,7 +142,10 @@ export function FloatingToolbar({
   // room again.
   const wr = winRect ?? { x: 0, y: 0, w: 0, h: 0 }
   const area = areaSize ?? { w: 100000, h: 100000 }
-  React.useLayoutEffect(() => {
+  // Held in a ref so the ResizeObserver below always runs the LATEST closure —
+  // `wr`/`area` change on every window move and resize.
+  const place = React.useRef<() => void>(() => {})
+  place.current = () => {
     if (!openName) return
     const el = caretWrapRef.current?.firstElementChild as HTMLElement | null
     if (el) {
@@ -157,7 +160,27 @@ export function FloatingToolbar({
       next = wr.x + wr.w + CARET_GAP + cw <= area.w ? 'right' : 'left'
     }
     setPlacement(p => (p === next ? p : next))
-  })
+  }
+  React.useLayoutEffect(() => { place.current() })
+
+  // A caret's height can change WITHOUT this component re-rendering: a wizard's
+  // disclosure (Segment's `▸ Advanced`, a growing class list, a result note) is
+  // the WIZARD's own React state, and a child's state update does not re-render
+  // its parent. The layout effect above then never re-runs, the placement stays
+  // stale, and the caret finally JUMPS on some unrelated later render.
+  //
+  // That is not merely cosmetic: a jump that lands between a mousedown and a
+  // mouseup means the two land on DIFFERENT elements, so the browser emits no
+  // `click` at all. The control takes focus and silently does nothing, and the
+  // next click works — "every other click is ignored". Observing the caret's own
+  // box is what makes the placement track its content.
+  React.useLayoutEffect(() => {
+    const el = caretWrapRef.current?.firstElementChild as HTMLElement | null
+    if (!el || typeof ResizeObserver === 'undefined') return
+    const ro = new ResizeObserver(() => place.current())
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [openName])
 
   React.useEffect(() => {
     if (!openName) return

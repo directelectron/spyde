@@ -2,41 +2,57 @@
  * SegmentWizard.tsx — the Segment Particles caret (`seg_` staged actions,
  * backend: spyde/actions/particles_action.py; plan §B7).
  *
- * A WIDE 2-COLUMN caret (330 px). Left column = the parameters you turn, right
- * column = the feedback that tells you whether turning them helped:
+ * ONE KNOB AND A BUTTON. The caret used to show ~15 controls at once (a
+ * sensitivity slider, min-size, three checkboxes, a `▸ more` block of ten more
+ * parameters, a histogram, a stats line, the class list, three buttons and two
+ * status lines) and the verdict on it was "information overload". The task is
+ * "find the particles"; everything else is tuning for someone who already knows
+ * the answer is wrong.
  *
- *   ┌ Segment Particles ─────────────── ✕ ┐
- *   │ [Classical] [Scribble] [Prompt]      │
- *   ├── params ──────────┬── feedback ─────┤
- *   │ Sensitivity ▓▓▓▓░  │ SIZE nm² histo  │
- *   │ Min size      24   │ ▁▃▅█▆▃▁         │
- *   │ Split          on  │ 212 · med 96    │
- *   │ Store masks   off  ├── classes ──────┤
- *   │                    │ ■ particle 1204 │
- *   ├──────────────────────────────────────┤
- *   │ [Train] [Run all]                    │
- *   └──────────────────────────────────────┘
+ *   ┌ Segment Particles ──────── ✕ ┐
+ *   │ [Classical] [Scribble] [Prompt]│
+ *   │  Fewer ────●──── More          │
+ *   │  6 particles on this frame     │
+ *   │  [    Find in all frames    ]  │
+ *   │  ▸ Advanced                    │
+ *   └────────────────────────────────┘
  *
- * Three things here are load-bearing, none of them cosmetic:
+ * Four things here are load-bearing, none of them cosmetic:
  *
- * 1. **Sensitivity is the headline control and `min_size` sits next to it.**
- *    Measured (plan §0.9), not taste: teaching the classifier faint contrast
- *    buys +1 true particle and 25 spurious ones, and `min_size=10` removes 24
- *    of the 25. The classifier is not what buys specificity — the size filter
- *    is. Two coupled knobs in separate tabs would be tuned against each other
- *    blind, so they are adjacent and both above the fold.
+ * 1. **Sensitivity is the ONLY control on the default face.** Measured (plan
+ *    §0.9), not taste: teaching the classifier faint contrast buys +1 true
+ *    particle and 25 spurious ones, and `min_size=10` removes 24 of the 25.
+ *    But the floor is applied by the BACKEND unconditionally, so the user does
+ *    not have to know that — `min_size` is a recovery knob, not a tuning knob,
+ *    and it lives in Advanced next to the floor warning that explains it.
  *
  * 2. **The EFFECTIVE `min_size` is what is shown.** The backend floors it and
  *    reports the floored value + a flag in every `seg_preview`; the caret snaps
  *    its field to that value rather than leaving the user's 0 on screen while a
  *    10 ran. Showing a number different from the one that ran is exactly the
- *    failure `SegmentParams` refuses for `local_size`.
+ *    failure `SegmentParams` refuses for `local_size`. The warning that explains
+ *    the snap renders INSIDE Advanced, immediately under the field it is about —
+ *    as a block on the primary face it was a large orange alarm for a parameter
+ *    nobody should normally touch.
  *
- * 3. **Per-class labelled-pixel counts are the point of the class list.**
- *    Under-training a class is *the* failure mode and these counts are how you
- *    notice; a class below `LOW_PIXELS` is dimmed and flagged so "the preview
- *    got worse" pushes you toward painting another example instead of toward
- *    the sensitivity slider, which cannot fix a missing example.
+ * 3. **Per-class labelled-pixel counts are the point of the class list, and the
+ *    class list is the SCRIBBLE tab's business.** Under-training a class is *the*
+ *    failure mode and these counts are how you notice; a class below `LOW_PIXELS`
+ *    is dimmed and flagged so "the preview got worse" pushes you toward painting
+ *    another example instead of toward the sensitivity slider, which cannot fix a
+ *    missing example. On the Classical tab there is nothing to train, so the list
+ *    is not shown there.
+ *
+ * 4. **Nothing was deleted, only demoted.** Every control that left the primary
+ *    face is inside `▸ Advanced` and sends the identical action with the
+ *    identical payload — `params()` is unchanged and the backend schema is
+ *    untouched. Advanced is collapsed by default and remembers its state for the
+ *    session (module-scope, not per-window: it is a preference about the UI, not
+ *    about a dataset). The one place Advanced is tab-scoped is the classical
+ *    MASK block (threshold / pre-blur / rolling ball / local window / dark), and
+ *    that is correctness rather than tidiness: the scribble engine hands
+ *    `split_instances` a probability map thresholded at 0.5 and never reads
+ *    them, so on the Scribble tab they would be knobs that do nothing.
  *
  * The brush swatches / size / eraser are NOT here — they live on the floating
  * ClassStrip next to the plot (plan B0), because while painting you are looking
@@ -122,6 +138,11 @@ const DEFAULTS: SegSaved = {
 // closing the caret to look at the frame doesn't lose the tuning.
 const _segStore = new Map<number, SegSaved>()
 
+// Whether `▸ Advanced` is open. Module scope, NOT per-window and NOT persisted
+// to disk: a user who opened it once is mid-tuning and wants it open on the next
+// caret too, but a fresh session starts calm again.
+let _advancedOpen = false
+
 interface Preview {
   frame: number
   count: number
@@ -131,6 +152,10 @@ interface Preview {
   minSize: number
   floored: boolean
   elapsedMs: number
+  /** Monotonic per-caret preview counter. The COUNT is not a reliable "did it
+   *  re-run" signal (two sensitivities can find the same number of particles),
+   *  so the caret publishes this as `data-seq` for the e2e to poll instead. */
+  seq: number
 }
 
 export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPos }: Props) {
@@ -154,7 +179,7 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
   const [brush, setBrush] = React.useState(saved.brush)
   const [activeClass, setActiveClass] = React.useState(saved.activeClass)
   const [eraser, setEraser] = React.useState(saved.eraser)
-  const [more, setMore] = React.useState(false)
+  const [advanced, setAdvanced] = React.useState(_advancedOpen)
 
   // Backend-owned state (never edited here, only rendered).
   const [classes, setClasses] = React.useState<SegClassInfo[]>([])
@@ -167,8 +192,7 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
   // whose "N particles on frame M" status overwrites it within milliseconds —
   // so a transient status is a report the user never gets to read.
   const [trainReport, setTrainReport] = React.useState<string | null>(null)
-  const [status, setStatus] = React.useState(
-    'Tune on the displayed frame, then Run all.')
+  const [status, setStatus] = React.useState('Drag Fewer / More, then find in all frames.')
 
   const vals = React.useRef<SegSaved>(saved)
   vals.current = {
@@ -178,7 +202,16 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
   }
   React.useEffect(() => { _segStore.set(windowId, vals.current) })
 
-  /** The backend's parameter names (`particles_action.DEFAULTS` keys). */
+  // Mirror the disclosure into module scope from an EFFECT, never from inside
+  // the state updater: React may invoke an updater more than once per dispatch
+  // (StrictMode's double-invoke, the eager-bailout probe, a replayed queue), so
+  // a write in there is not a "toggle once" — it is a toggle per invocation, and
+  // the disclosure sticks open.
+  React.useEffect(() => { _advancedOpen = advanced }, [advanced])
+  const toggleAdvanced = () => setAdvanced(a => !a)
+
+  /** The backend's parameter names (`particles_action.DEFAULTS` keys). Demoting
+   *  a control into Advanced changes NOTHING here — same keys, same shape. */
   const params = (): Record<string, unknown> => {
     const v = vals.current
     return {
@@ -227,11 +260,12 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
     const areas = Array.isArray(d.areas) ? (d.areas as number[]) : []
     const eff = Number(d.min_size ?? vals.current.minSize)
     const floored = Boolean(d.min_size_floored)
-    setPreview({
+    setPreview(prev => ({
       frame: Number(d.frame ?? 0), count: Number(d.count ?? 0), areas,
       median: Number(d.median_area ?? 0), units: String(d.units ?? 'px'),
       minSize: eff, floored, elapsedMs: Number(d.elapsed_ms ?? 0),
-    })
+      seq: (prev?.seq ?? 0) + 1,
+    }))
     // Never leave a number on screen that is not the one that ran. Snapping is
     // loop-free: the backend coerces the snapped value to itself, so the next
     // tune round-trips unchanged.
@@ -239,7 +273,9 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
       setMinSize(eff)
       vals.current = { ...vals.current, minSize: eff }
     }
-    setStatus(`${d.count} particles on frame ${d.frame} · ${d.elapsed_ms} ms`)
+    // The COUNT now has its own line above the button, so the footer carries
+    // only what that line does not: which frame, and how long it took.
+    setStatus(`Frame ${d.frame} · ${d.elapsed_ms} ms`)
   })
 
   useWizardEvent('spyde:seg_trained', windowId, (d) => {
@@ -297,6 +333,7 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
 
   const labelledPixels = classes.reduce((a, c) => a + (c.pixels || 0), 0)
   const isPrompt = method === 'prompt'
+  const isScribble = method === 'scribble'
   const canTrain = labelledPixels > 0 && !isPrompt
   const canRun = !isPrompt && (method !== 'scribble' || trained)
 
@@ -310,13 +347,16 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
   }
 
   const areaUnits = preview ? `${preview.units}²` : 'px²'
+  const countText = preview
+    ? `${preview.count} particle${preview.count === 1 ? '' : 's'} on this frame`
+    : 'no preview yet'
 
   return (
     <>
       <WizardShell
         testid="segment-wizard" title="Segment Particles" posStyle={caretPos}
         onClose={onClose} closeTestid="seg-close"
-        status={status} statusTestid="seg-status" width={330}
+        status={status} statusTestid="seg-status" width={262}
       >
         <TabRow
           tabs={TABS} active={TAB_OF[method]}
@@ -329,46 +369,113 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
             Prompt segmentation is not installed yet — use Classical or Scribble.
           </div>
         )}
-        {method === 'scribble' && !trained && (
-          <div data-testid="seg-scribble-note" style={noteStyle}>
-            Paint with the strip on the image — include at least one FAINT
-            particle — then Train.
+
+        {/* ── Classical: one knob ──────────────────────────────────────────── */}
+        {method === 'classical' && (
+          <div style={sensRowStyle}>
+            <span style={endLabelStyle}>Fewer</span>
+            {/* No numeric readout: "0.50" of what? The endpoints ARE the units.
+                The value is still stored and sent unchanged. */}
+            <input data-testid="seg-sensitivity" type="range"
+              min={0} max={1} step={0.01} value={sensitivity}
+              style={{ flex: 1, minWidth: 40 }}
+              onChange={(e) => { const n = Number(e.target.value); setSensitivity(n); tune() }} />
+            <span style={endLabelStyle}>More</span>
           </div>
         )}
-        {trainReport && (
+
+        {/* ── Scribble: the class list + Train ─────────────────────────────── */}
+        {isScribble && (
+          <>
+            {!trained && (
+              <div data-testid="seg-scribble-note" style={noteStyle}>
+                Paint with the strip on the image — include at least one FAINT
+                particle — then Train.
+              </div>
+            )}
+            {trainReport && (
+              <div data-testid="seg-trained-note" style={okNoteStyle}>{trainReport}</div>
+            )}
+            <ClassList classes={classes} activeClass={activeClass}
+              onSelect={(id) => { setEraser(false); setActiveClass(id) }} />
+            <button data-testid="seg-train" style={canTrain ? secondaryBtnStyle : disabledSecondaryStyle}
+              disabled={!canTrain}
+              title={canTrain ? 'Fit the scribble classifier on every labelled pixel'
+                : 'Paint a few scribbles first'}
+              onClick={train}>Train</button>
+          </>
+        )}
+
+        {/* The train report is the direct answer to the Train button, so on any
+            other tab it would be a report with no question. */}
+        {!isScribble && trainReport && (
           <div data-testid="seg-trained-note" style={okNoteStyle}>{trainReport}</div>
         )}
 
-        <div style={colsStyle}>
-          {/* ── left: params ─────────────────────────────────────────────── */}
-          <div style={colStyle}>
-            <div style={S.hint}>params</div>
-            <Cell label="Sensitivity">
-              <Slider testid="seg-sensitivity" value={sensitivity} min={0} max={1} step={0.01}
-                onChange={live(setSensitivity)} fmt={(n) => n.toFixed(2)} />
-            </Cell>
+        <div data-testid="seg-preview-stats" data-seq={preview?.seq ?? 0}
+          data-count={preview?.count ?? -1} style={countStyle}>
+          {countText}
+        </div>
+
+        <button data-testid="seg-run" style={canRun ? primaryWideStyle : disabledWideStyle}
+          disabled={!canRun}
+          title={canRun ? 'Segment every frame into a new particle dataset'
+            : (isPrompt ? 'Prompt segmentation is not installed'
+              : 'Train the scribble classifier first')}
+          onClick={runAll}>Find in all frames</button>
+
+        {/* ── everything else ──────────────────────────────────────────────── */}
+        <button data-testid="seg-advanced-toggle" style={discloseStyle}
+          aria-expanded={advanced} onClick={toggleAdvanced}>
+          {advanced ? '▾ Advanced' : '▸ Advanced'}
+        </button>
+
+        {advanced && (
+          <div data-testid="seg-advanced" style={advStyle}>
+            <div style={S.hint}>size filter</div>
             <Row label="Min size (px)">
               <NumInput testid="seg-min-size" value={minSize} step="1" width={54}
                 onChange={live(setMinSize)} />
             </Row>
+            {/* The floor warning belongs HERE, under the field it explains — on
+                the primary face it was a large orange alarm about a parameter
+                the backend already fixed on the user's behalf. */}
             {preview?.floored && (
               <div data-testid="seg-min-size-floor" style={warnStyle}>
                 floored to {preview.minSize} px — at 0 the split returns
                 background speckle as particles
               </div>
             )}
+            <Row label="Max size (0=off)">
+              <NumInput testid="seg-max-size" value={maxSize} step="1" width={54}
+                onChange={live(setMaxSize)} />
+            </Row>
+
+            <div style={secStyle}>splitting</div>
             <Check testid="seg-watershed" checked={watershed} onChange={live(setWatershed)}
               label="Split touching" />
-            <Check testid="seg-store-masks" checked={storeMasks} onChange={live(setStoreMasks)}
-              label="Store outlines" />
-            <Check testid="seg-track" checked={track} onChange={live(setTrack)}
-              label="Link tracks" />
+            <Row label="Min separation">
+              <NumInput testid="seg-min-separation" value={minSeparation} step="1" width={54}
+                onChange={live(setMinSeparation)} />
+            </Row>
+            <Cell label="Marker smoothing">
+              <Slider testid="seg-marker-smooth" value={markerSmooth} min={0} max={10} step={0.1}
+                onChange={live(setMarkerSmooth)} fmt={(n) => n.toFixed(1)} />
+            </Cell>
+            <Check testid="seg-clear-border" checked={clearBorder} onChange={live(setClearBorder)}
+              label="Drop edge particles" />
 
-            <button data-testid="seg-more" style={moreStyle} onClick={() => setMore(m => !m)}>
-              {more ? '▾ fewer' : '▸ more'}
-            </button>
-            {more && (
-              <div style={colStyle}>
+            {/* CLASSICAL ONLY, and not merely for space: these build the
+                classical MASK. The scribble engine hands `split_instances` a
+                probability map thresholded at 0.5, so it never reads threshold /
+                sensitivity / gaussian / rb_kernel / invert / local_size — see
+                `spyde/particles/classical.py::split_instances`. Rendering them
+                on the Scribble tab would be six knobs that do nothing, which is
+                the overload complaint in miniature. They keep their stored
+                values and are still sent in every payload. */}
+            {method === 'classical' && (
+              <>
+                <div style={secStyle}>detection</div>
                 <Cell label="Threshold">
                   <Select testid="seg-threshold" value={threshold} options={THRESHOLD_OPTS}
                     onChange={live(setThreshold)} />
@@ -385,117 +492,42 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
                   <NumInput testid="seg-local-size" value={localSize} step="2" width={54}
                     onChange={live(setLocalSize)} />
                 </Row>
-                <Row label="Max size (0=off)">
-                  <NumInput testid="seg-max-size" value={maxSize} step="1" width={54}
-                    onChange={live(setMaxSize)} />
-                </Row>
-                <Row label="Min separation">
-                  <NumInput testid="seg-min-separation" value={minSeparation} step="1" width={54}
-                    onChange={live(setMinSeparation)} />
-                </Row>
-                <Cell label="Marker smoothing">
-                  <Slider testid="seg-marker-smooth" value={markerSmooth} min={0} max={10} step={0.1}
-                    onChange={live(setMarkerSmooth)} fmt={(n) => n.toFixed(1)} />
-                </Cell>
-                <Row label="Link radius">
-                  <NumInput testid="seg-max-dist" value={maxDist} step="0.1" width={54}
-                    onChange={live(setMaxDist)} />
-                </Row>
                 <Check testid="seg-invert" checked={invert} onChange={live(setInvert)}
                   label="Dark particles" />
-                <Check testid="seg-clear-border" checked={clearBorder} onChange={live(setClearBorder)}
-                  label="Drop edge particles" />
-              </div>
+              </>
             )}
-          </div>
 
-          {/* ── right: feedback + classes ────────────────────────────────── */}
-          <div style={colStyle}>
+            <div style={secStyle}>output</div>
+            <Check testid="seg-store-masks" checked={storeMasks} onChange={live(setStoreMasks)}
+              label="Store outlines" />
+            <Check testid="seg-track" checked={track} onChange={live(setTrack)}
+              label="Link tracks" />
+            <Row label="Link radius">
+              <NumInput testid="seg-max-dist" value={maxDist} step="0.1" width={54}
+                onChange={live(setMaxDist)} />
+            </Row>
+
+            <div style={secStyle}>this frame</div>
             <div style={S.hint}>size {areaUnits}</div>
             <SizeHistogram areas={preview?.areas ?? []} />
-            <div data-testid="seg-preview-stats" style={statsStyle}>
-              {preview
-                ? `${preview.count} found · med ${fmtArea(preview.median)}`
-                : 'no preview yet'}
+            <div data-testid="seg-size-stats" style={statsStyle}>
+              {preview ? `med ${fmtArea(preview.median)} ${areaUnits}` : '—'}
             </div>
-
-            <div style={{ ...S.hint, borderTop: '1px solid #313244', paddingTop: 4 }}>
-              classes
+            <div data-testid="seg-counts" style={S.hint}>
+              {labelledFrames.length} frames labelled · {classes.length} classes
+              {labelledPixels > 0 ? ` · ${labelledPixels.toLocaleString()} px` : ''}
+              {` · frame ${frame}`}
             </div>
-            <div data-testid="seg-class-list" style={classListStyle}>
-              {classes.length === 0 && <div style={S.hint}>—</div>}
-              {classes.map(c => {
-                const low = c.pixels < LOW_PIXELS
-                return (
-                  <button
-                    key={c.id}
-                    data-testid={`seg-class-${c.id}`}
-                    data-active={c.id === activeClass ? 'true' : 'false'}
-                    data-low={low ? 'true' : 'false'}
-                    title={low
-                      ? `${c.name}: only ${c.pixels} labelled px — paint another example`
-                      : `${c.name}: ${c.pixels.toLocaleString()} labelled px`}
-                    onClick={() => { setEraser(false); setActiveClass(c.id) }}
-                    style={{
-                      ...classRowStyle,
-                      ...(c.id === activeClass ? classRowActiveStyle : {}),
-                      // Under-training is THE failure mode; a starved class is
-                      // dimmed so it reads as a problem, not as a row.
-                      opacity: low ? 0.55 : 1,
-                    }}
-                  >
-                    <span style={{ ...classDotStyle, background: c.colour }} />
-                    <span style={{
-                      ...classNameStyle,
-                      // The active row must read as active next to a UA focus
-                      // ring on some other control — colour alone is too close
-                      // to the panel background at this size.
-                      fontWeight: c.id === activeClass ? 700 : 400,
-                    }}>{c.name}</span>
-                    <span data-testid={`seg-class-pixels-${c.id}`}
-                      style={{ ...classPxStyle, color: low ? '#f9e2af' : '#cdd6f4' }}>
-                      {low && '! '}{c.pixels.toLocaleString()}
-                    </span>
-                  </button>
-                )
-              })}
-              {/* The backend has no `seg_add_class` staged verb (LabelStore
-                  .add_class exists but nothing routes to it), so this is an
-                  affordance with the reason on it rather than a button that
-                  silently does nothing. */}
-              <button data-testid="seg-add-class" style={addClassStyle} disabled
-                title="Adding a class needs a seg_add_class backend verb — not wired yet">
-                + add class
-              </button>
-            </div>
+            <CommitButton wizardKey="seg" windowId={windowId} sendAction={sendAction}
+              label="Commit Frame" />
           </div>
-        </div>
-
-        <div style={btnRowStyle}>
-          <button data-testid="seg-train" style={canTrain ? S.primary : disabledBtnStyle}
-            disabled={!canTrain}
-            title={canTrain ? 'Fit the scribble classifier on every labelled pixel'
-              : 'Paint a few scribbles first (Scribble engine)'}
-            onClick={train}>Train</button>
-          <button data-testid="seg-run" style={canRun ? S.primary : disabledBtnStyle}
-            disabled={!canRun}
-            title={canRun ? 'Segment every frame into a new particle dataset'
-              : 'Train the scribble classifier first'}
-            onClick={runAll}>Run All</button>
-          <CommitButton wizardKey="seg" windowId={windowId} sendAction={sendAction}
-            label="Commit Frame" />
-        </div>
-        <div data-testid="seg-counts" style={S.hint}>
-          {labelledFrames.length} frames labelled · {classes.length} classes
-          {labelledPixels > 0 ? ` · ${labelledPixels.toLocaleString()} px` : ''}
-          {` · frame ${frame}`}
-        </div>
+        )}
       </WizardShell>
 
       {/* Painting controls go NEXT TO THE PLOT, not in the caret (plan B0).
           Rendered AFTER the shell so FloatingToolbar's placement effect still
           measures the caret (it reads the wrapper's firstElementChild). */}
-      {stripPos && classes.length > 0 && (
+      {stripPos && classes.length > 0 && method === 'scribble' && (
         <ClassStrip
           classes={classes} activeId={activeClass}
           onSelect={setActiveClass}
@@ -509,6 +541,65 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
   )
 }
 
+// ── the class list ───────────────────────────────────────────────────────────
+
+/**
+ * Class NAMES + per-class labelled-pixel counts — the authoritative list (the
+ * ClassStrip is swatches only). Under-training a class is THE failure mode, so
+ * a starved class is dimmed and flagged rather than merely listed.
+ */
+function ClassList({ classes, activeClass, onSelect }: {
+  classes: SegClassInfo[]; activeClass: number; onSelect: (id: number) => void
+}) {
+  return (
+    <div data-testid="seg-class-list" style={classListStyle}>
+      {classes.length === 0 && <div style={S.hint}>—</div>}
+      {classes.map(c => {
+        const low = c.pixels < LOW_PIXELS
+        return (
+          <button
+            key={c.id}
+            data-testid={`seg-class-${c.id}`}
+            data-active={c.id === activeClass ? 'true' : 'false'}
+            data-low={low ? 'true' : 'false'}
+            title={low
+              ? `${c.name}: only ${c.pixels} labelled px — paint another example`
+              : `${c.name}: ${c.pixels.toLocaleString()} labelled px`}
+            onClick={() => onSelect(c.id)}
+            style={{
+              ...classRowStyle,
+              ...(c.id === activeClass ? classRowActiveStyle : {}),
+              // Under-training is THE failure mode; a starved class is dimmed
+              // so it reads as a problem, not as a row.
+              opacity: low ? 0.55 : 1,
+            }}
+          >
+            <span style={{ ...classDotStyle, background: c.colour }} />
+            <span style={{
+              ...classNameStyle,
+              // The active row must read as active next to a UA focus ring on
+              // some other control — colour alone is too close to the panel
+              // background at this size.
+              fontWeight: c.id === activeClass ? 700 : 400,
+            }}>{c.name}</span>
+            <span data-testid={`seg-class-pixels-${c.id}`}
+              style={{ ...classPxStyle, color: low ? '#f9e2af' : '#cdd6f4' }}>
+              {low && '! '}{c.pixels.toLocaleString()}
+            </span>
+          </button>
+        )
+      })}
+      {/* No `+ add class` button here on purpose. The backend has no
+          `seg_add_class` verb (LabelStore.add_class exists but nothing routes to
+          it), and a permanently disabled control is pure noise on a face this
+          feature has just spent a redesign emptying out — it advertises
+          something that cannot happen. Bring it back WITH the backend verb, not
+          before. The three default classes cover every case the engine
+          currently distinguishes. */}
+    </div>
+  )
+}
+
 // ── the size histogram ───────────────────────────────────────────────────────
 
 const N_BINS = 18
@@ -517,7 +608,8 @@ const N_BINS = 18
  * A tiny inline SVG sparkline of the per-instance area distribution — no
  * charting dependency, and it re-renders on every preview so you SEE the
  * distribution shift as sensitivity is dragged instead of guessing from one
- * count.
+ * count. It lives in Advanced: it answers "why is the count wrong", which is a
+ * question you only ask once the count already looks wrong.
  *
  * Binned to the 98th percentile rather than the max: one 50× outlier (two
  * merged particles, or the support film caught as one body) otherwise squashes
@@ -576,20 +668,29 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
   )
 }
 
-const colsStyle: React.CSSProperties = {
-  display: 'grid', gridTemplateColumns: '1fr 1fr', columnGap: 10,
-  // NO overflow here: the Threshold Dropdown's menu is absolutely positioned
-  // and any overflow:auto ancestor clips it (PlotControlDock.tsx:730).
-  alignItems: 'start',
-}
-const colStyle: React.CSSProperties = {
-  display: 'flex', flexDirection: 'column', gap: 5, minWidth: 0,
-}
 const cellStyle: React.CSSProperties = {
   display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0,
 }
+const sensRowStyle: React.CSSProperties = {
+  display: 'flex', alignItems: 'center', gap: 7, padding: '2px 0',
+}
+const endLabelStyle: React.CSSProperties = {
+  fontSize: 10, color: '#a6adc8', flex: '0 0 auto', whiteSpace: 'nowrap',
+}
+const countStyle: React.CSSProperties = {
+  fontSize: 11, color: '#cdd6f4', fontVariantNumeric: 'tabular-nums',
+}
 const statsStyle: React.CSSProperties = {
   fontSize: 10, color: '#cdd6f4', fontVariantNumeric: 'tabular-nums',
+}
+const advStyle: React.CSSProperties = {
+  display: 'flex', flexDirection: 'column', gap: 5, minWidth: 0,
+  // NO overflow here: the Threshold Dropdown's menu is absolutely positioned
+  // and any overflow:auto ancestor clips it (PlotControlDock.tsx:730).
+  borderTop: '1px solid #313244', paddingTop: 6,
+}
+const secStyle: React.CSSProperties = {
+  ...S.hint, borderTop: '1px solid #313244', paddingTop: 5, marginTop: 1,
 }
 const classListStyle: React.CSSProperties = {
   display: 'flex', flexDirection: 'column', gap: 2,
@@ -619,19 +720,24 @@ const classNameStyle: React.CSSProperties = {
 const classPxStyle: React.CSSProperties = {
   fontSize: 10, fontVariantNumeric: 'tabular-nums', flex: '0 0 auto',
 }
-const addClassStyle: React.CSSProperties = {
-  background: 'none', border: '1px dashed #45475a', borderRadius: 4,
-  color: '#6c7086', fontSize: 10, padding: '2px 4px', cursor: 'not-allowed',
-  textAlign: 'left',
+const primaryWideStyle: React.CSSProperties = {
+  ...S.primary, alignSelf: 'stretch', textAlign: 'center',
 }
-const btnRowStyle: React.CSSProperties = {
-  display: 'flex', gap: 6, flexWrap: 'wrap', borderTop: '1px solid #313244',
-  paddingTop: 6,
+const disabledWideStyle: React.CSSProperties = {
+  ...primaryWideStyle, background: '#313244', color: '#6c7086', cursor: 'not-allowed',
 }
-const disabledBtnStyle: React.CSSProperties = {
-  ...S.primary, background: '#313244', color: '#6c7086', cursor: 'not-allowed',
+// Train is a step ON THE WAY to the primary button, not a second primary — two
+// equally-blue buttons is exactly the "which one do I press" the redesign is
+// removing.
+const secondaryBtnStyle: React.CSSProperties = {
+  background: 'none', color: '#cdd6f4', border: '1px solid #45475a',
+  borderRadius: 5, padding: '4px 10px', fontSize: 11, cursor: 'pointer',
+  alignSelf: 'flex-start',
 }
-const moreStyle: React.CSSProperties = {
+const disabledSecondaryStyle: React.CSSProperties = {
+  ...secondaryBtnStyle, color: '#6c7086', cursor: 'not-allowed',
+}
+const discloseStyle: React.CSSProperties = {
   background: 'none', border: 'none', color: '#89b4fa', fontSize: 10,
   cursor: 'pointer', padding: 0, textAlign: 'left', alignSelf: 'flex-start',
 }
