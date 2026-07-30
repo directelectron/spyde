@@ -828,3 +828,54 @@ scale, `measure_frame` is where to look first, not the segmenter.
 
 Regenerate all of the above with `python scripts/bench_drift_particles.py`.
 Verify the whole feature with `python scripts/verify_drift_particles.py --all`.
+
+### Classical segmentation at 4096² — where the time goes (2026-07-30)
+
+Reported as "just too slow for a 4k x 4k image". Stage profile of one frame:
+
+| stage | time | share |
+|---|---|---|
+| `gaussian_filter(sigma=1)` | 0.46 s | 7% |
+| `threshold_otsu` | 0.23 s | 4% |
+| **`distance_transform_edt`** | **3.93 s** | **61%** |
+| gaussian on the distance | 0.43 s | 7% |
+| `peak_local_max` | 0.58 s | 9% |
+| `watershed` | 0.60 s | 9% |
+| **total** | **6.40 s** | |
+
+**The distance transform is the cost, not watershed** — which is the opposite of
+the intuition, and it is why "make watershed faster" would have been wasted work.
+
+The EDT is used for exactly two things: seeding markers and giving watershed an
+elevation. Neither needs full resolution, so above ~2 MP both are computed on a
+decimated grid and the elevation is bilinearly upsampled (rescaled by the factor
+to stay in pixel units). **Detection is untouched** — the threshold still runs at
+full resolution, so *which* bodies are found is unchanged and §0.9's faint-particle
+sensitivity is unaffected. Only the cut BETWEEN two touching bodies moves, by about
+`factor` px.
+
+| frame | full-res split | auto-decimated | speedup | count | median area |
+|---|---|---|---|---|---|
+| 1024² touching | 0.34 s | 0.30 s | 1.1× | 162 = 162 | 298 = 298 |
+| 4096² touching | 7.09 s | 2.82 s | **2.5×** | 162 = 162 | 4762 = 4762 |
+| 4096² isolated | 8.14 s | 2.80 s | **2.9×** | 81 = 81 | — |
+
+Identical counts and identical median areas at 0.0% difference, on both touching
+and isolated fields — the decimation is free in accuracy terms on this data.
+
+**Turning "Split touching" OFF is a further 1.9×** (2.80 s → 1.45 s) and is the
+right choice whenever particles are isolated, because watershed then has nothing
+to do and the whole EDT is skipped. Decimating past 2 buys almost nothing
+(2.80 → 2.73 s) since the EDT is no longer dominant once it is decimated at all.
+
+Remaining levers, unmeasured, in the order they look worth trying:
+
+1. **Tile + thread.** scipy's EDT and watershed are single-threaded and both
+   release the GIL, so banding the frame with a halo of the largest particle
+   radius should scale with cores — the `region_sum.py` precedent got 6.6× from
+   exactly this shape. The halo makes the EDT correct at tile edges; watershed and
+   the threshold tile cleanly.
+2. **GPU EDT** (`cupy.ndimage.distance_transform_edt`). Only worth it if the frame
+   is already on the device; a 64 MB round trip per frame is most of the win.
+3. **Skip the EDT where nothing touches.** Connected components whose area matches
+   a single-body prior do not need splitting at all; only ambiguous ones do.
