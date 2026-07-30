@@ -272,6 +272,27 @@ class TestSolveTranslationGuards:
         solve_translation(stack, device="numpy", progress=lambda d, t: seen.append((d, t)))
         assert seen[0] == (1, 4) and seen[-1] == (4, 4)
 
+    def test_on_shift_streams_every_frame_as_it_solves(self):
+        """The drift caret draws its curve live; `progress` cannot carry that.
+
+        `progress` is only a count, and the shift array is solver-local until the
+        return — so without this callback a UI can show a bar but not a trace.
+        """
+        truth = np.array([[0, 0], [2, 1], [4, 2], [6, 3]], dtype=float)
+        seen = []
+        model = solve_translation(_shifted_stack(truth), device="numpy",
+                                  upsample=8, reference="first",
+                                  on_shift=lambda i, dy, dx, s: seen.append((i, dy, dx)))
+        assert [i for i, _, _ in seen] == list(range(len(truth))), (
+            f"expected one callback per frame in order, got {seen}")
+        streamed = np.array([[dy, dx] for _, dy, dx in seen])
+        assert np.allclose(streamed, model.shifts, equal_nan=True), (
+            "the streamed values disagree with the returned array")
+
+    def test_on_shift_is_optional(self):
+        stack = _shifted_stack(np.array([[0, 0], [1, 1]], float))
+        assert solve_translation(stack, device="numpy").n_frames == 2
+
     def test_cancel_leaves_nan_not_a_silent_partial(self):
         stack = _shifted_stack(np.array([[0, 0], [1, 1], [2, 2], [3, 3]], float))
         calls = {"n": 0}

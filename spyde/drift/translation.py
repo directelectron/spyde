@@ -462,6 +462,7 @@ def solve_translation(
     reject_outliers: bool = True,
     device: str | None = None,
     progress: Callable[[int, int], None] | None = None,
+    on_shift: Callable[[int, float, float, float], None] | None = None,
     cancel: Callable[[], bool] | None = None,
     provenance: dict[str, Any] | None = None,
 ) -> DriftModel:
@@ -507,6 +508,18 @@ def solve_translation(
         ``progress(done, total)`` is called as frames complete.
         ``cancel()`` returning True aborts; frames not yet reached keep NaN
         shifts, so a cancelled solve is detectable rather than silently partial.
+    on_shift
+        ``on_shift(index, dy, dx, sharpness)`` per frame, as each is solved.
+
+        This exists so a UI can draw the drift curve **while** it solves, which
+        ``progress`` cannot support: it carries only a count, and the shift array
+        is solver-local until the return. Splitting the solve into chunks and
+        concatenating would not be equivalent either — the running Fourier
+        reference accumulates across the whole stack, so a restarted solve gives a
+        different (worse) answer. A callback is the only way to stream the trace
+        without changing the result.
+
+        Called on the solver thread, so a UI implementation must marshal.
 
     Notes
     -----
@@ -557,6 +570,8 @@ def solve_translation(
         first = frame_fft(fixed_index if reference.startswith("fixed:") else 0)
         shifts[0] = (0.0, 0.0)
         sharp[0] = np.inf if n_frames else np.nan
+        if on_shift is not None and n_frames:
+            on_shift(0, 0.0, 0.0, float("inf"))
 
         ref_fft = first          # running accumulator / fixed reference
         ref_count = 1
@@ -598,6 +613,8 @@ def solve_translation(
                               float(np.median(accepted_sharp)))
             sharp[i] = s
 
+            if on_shift is not None:
+                on_shift(i, float(shifts[i, 0]), float(shifts[i, 1]), float(s))
             if progress is not None:
                 progress(i + 1, n_frames)
 

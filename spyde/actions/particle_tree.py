@@ -98,7 +98,8 @@ def _navigator_traces(particles, events=None) -> dict[str, np.ndarray]:
 def open_particle_tree(session, *, particles, source_node, source_tree=None,
                        title: str | None = None, events=None,
                        nav_map=None, params: dict[str, Any] | None = None,
-                       provenance: dict[str, Any] | None = None):
+                       provenance: dict[str, Any] | None = None,
+                       attach: bool = True):
     """Create the particle tree for a finished segmentation.
 
     Parameters
@@ -118,11 +119,27 @@ def open_particle_tree(session, *, particles, source_node, source_tree=None,
         Optional ``(n_frames,)`` int array mapping each particle frame back to a
         source navigation index. ``None`` means identity, which is the case for a
         movie; a 4D-STEM virtual image passes the parent's grid.
+    attach
+        ``True`` (the default) publishes the store as ``tree.particles``
+        immediately — right for a finished result.
+
+        A **progressive** run passes ``attach=False``. The plan is explicit that
+        ``tree.particles`` appears only when the batch finalizes, because
+        ``requires_particles`` gates on it: attaching an empty placeholder would
+        unlock the whole particle toolbar against a store holding nothing, and the
+        user would click Track on zero particles.
+
+        The store still has to be handed in, though, because the lazy label movie
+        **closes over this exact object** — the frames it renders come from it. So
+        the placeholder is retained (as ``tree._seg_pending_particles``) and must
+        later be MUTATED IN PLACE by the caller at finalize. Swapping in a freshly
+        built ``SpyDEParticles`` would leave the already-open window rendering the
+        placeholder's zeros forever.
 
     Returns
     -------
-    The new tree, with ``particles``, ``source_node``, ``nav_map`` and
-    ``nav_traces`` attached.
+    The new tree, with ``source_node``, ``nav_map`` and ``nav_traces`` attached,
+    and ``particles`` set unless *attach* is False.
     """
     import hyperspy.api as hs
 
@@ -149,7 +166,13 @@ def open_particle_tree(session, *, particles, source_node, source_tree=None,
                                   "params": dict(params or {})},
     )
 
-    tree.particles = particles
+    if attach:
+        tree.particles = particles
+    else:
+        # Gated off until the batch finalizes (see `attach`). The store is still
+        # kept, because the lazy label movie renders from THIS object.
+        tree.particles = None
+        tree._seg_pending_particles = particles
     tree.source_node = source_node
     tree.source_tree = source_tree
     tree.nav_map = (np.arange(n, dtype=np.int64) if nav_map is None

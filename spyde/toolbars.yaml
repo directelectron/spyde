@@ -364,6 +364,26 @@ functions:
     toolbar_side: bottom
     navigation: False
 
+  Drift Correction:
+    description: Solve and remove sample drift across an image stack. Check the result in a separate window — an aligned stack sums sharp, a misaligned one blurs — then Apply to add a lazy corrected node (nothing is copied).
+    icon: drawing/toolbars/icons/center_zero_beam.svg
+    function: spyde.actions.drift_action.drift_correction
+    signal_types: [insitu]
+    plot_dim: [2]
+    toolbar_side: bottom
+    navigation: False
+    toggle: True
+
+  Segment Particles:
+    description: Find and measure particles frame by frame. Tune on the displayed frame (classical threshold or a scribble-trained classifier), then run the whole movie into a new particle dataset with count-vs-time and tracks.
+    icon: drawing/toolbars/icons/peak_finding.svg
+    function: spyde.actions.particles_action.segment_particles
+    exclude_signal_types: [spyde_diffraction_vectors_image, particles, electron_diffraction]
+    plot_dim: [2]
+    toolbar_side: bottom
+    navigation: False
+    toggle: True
+
   Fit:
     description: Fit a model to every spectrum. Add components line by line, watch the model curve on the spectrum, then Run to fit the whole scan on the GPU. Commit turns each component's integrated area into a map.
     icon: drawing/toolbars/icons/fit.svg
