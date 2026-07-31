@@ -107,6 +107,20 @@ locked symmetric levels for signed components, `attrs` on the tree,
 provenance stamped on `tree._commit_provenance` +
 `metadata.General.spyde_provenance`).
 
+**The progressive window's SIGNAL half** ([`live_signal.py`](live_signal.py)):
+an `open_result_tree` window that is a navigator **and** a signal plot only
+half-fills — the navigator fills block by block while the signal plot sits on
+its placeholder. `attach_signal_preview(session, tree, render=…,
+nav_shape=…)` drives the signal plot from the same per-block results: each
+landing block paints one deterministic sample position, and the
+navigator→signal slice function is swapped for one that renders any
+already-computed position on demand (an un-computed one returns `None`, so
+the last good frame stays up). Feed it `preview.note_block(nav_slices)` from
+the compute's per-chunk callback and `preview.close()` when the batch
+finalizes — close never clobbers a final display installed in the meantime.
+Returns `None` on a window with no navigator (the Orientation / EBSD IPF map
+is a single 2-D plot); that is a documented no-op, not an error.
+
 ## 4. Adding an action, step by step
 
 **TransformAction / RegionAction** (copy from `_template_action.py`):

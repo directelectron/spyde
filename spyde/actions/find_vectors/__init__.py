@@ -20,6 +20,8 @@ package; the submodules are:
   - ``kernels``     — numba @cuda.jit kernels + CuPy/cuFFT NXCORR
   - ``detectors``   — per-frame algorithm cores (NXCORR, DoG, beam-stop, …)
   - ``chunk``       — ghost-block chunk pipeline (GPU + CPU + DoG paths)
+  - ``live_frames`` — renders a completed position from its raw peaks block, so
+    the progressive result window's signal plot is live during the batch
   - ``orchestrate`` — dask/distributed batch orchestration (_do_compute_vectors)
 
 The names re-exported below form this package's public API — the surface that
@@ -68,6 +70,9 @@ from spyde.actions.find_vectors.chunk import (  # noqa: E402,F401
     _find_vectors_chunk_gpu,
     _find_vectors_chunk_gpu_impl,
     _nav_blur_trim,
+)
+from spyde.actions.find_vectors.live_frames import (  # noqa: E402,F401
+    LiveVectorFrames,
 )
 from spyde.actions.find_vectors.orchestrate import (  # noqa: E402,F401
     _balanced_nav_chunks,

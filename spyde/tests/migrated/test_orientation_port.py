@@ -67,6 +67,43 @@ class TestOrientationPort:
         finally:
             session.shutdown()
 
+    def test_source_overlay_attaches_before_the_batch(self, monkeypatch):
+        """The source DP's matched-template overlay must be wired BEFORE the
+        whole-field match, not after it.
+
+        Orientation's progressive window is the IPF map alone — a single 2-D
+        plot with no navigator, so it has no signal plot to preview into
+        (``live_signal.attach_signal_preview`` returns None there). The SOURCE
+        window is the navigator + signal pair, and its diffraction pattern is
+        where a live orientation result shows up: attaching first makes the
+        whole (minutes-long) fill navigable instead of leaving the source inert
+        until the map lands. The staged wizard path already worked this way.
+        """
+        from spyde.backend.session import Session
+        import spyde.actions.orientation_action as oa
+        session = Session(n_workers=1, threads_per_worker=1)
+        try:
+            session._add_signal(_diffraction_4d())
+            time.sleep(0.3)
+            src_tree = session.signal_trees[0]
+            order: list[str] = []
+
+            monkeypatch.setattr(oa, "_overlay_template_on_source",
+                                lambda *a, **k: order.append("overlay"))
+            monkeypatch.setattr(oa, "_compute_with_live_ipf",
+                                lambda *a, **k: order.append("compute") or None)
+            monkeypatch.setattr(oa, "emit_error", lambda *a, **k: None)
+
+            run_orientation = oa.run_orientation
+            run_orientation(
+                session, src_tree.root, src_tree, [_make_phase()],
+                dict(accelerating_voltage=200.0, resolution=10.0),
+                dict(n_best=3, gamma=0.5),
+            )
+            assert order == ["overlay", "compute"], order
+        finally:
+            session.shutdown()
+
     def test_entry_rejects_missing_cif(self):
         from spyde.backend.session import Session
         from spyde.actions.context import ActionContext

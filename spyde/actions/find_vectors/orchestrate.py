@@ -287,6 +287,7 @@ def _do_compute_vectors(
     shm_name: str = None,
     beamstop_mask: np.ndarray = None,
     on_chunk_done=None,
+    on_chunk_block=None,
     stopped_flag=None,
     client=None,
 ):
@@ -317,6 +318,15 @@ def _do_compute_vectors(
         authoritative write when the compute completes.
     on_chunk_done : callable(nav_slice_2d, count_subarray) | None
         Called once after the full compute completes with the full-nav slice.
+    on_chunk_block : callable(nav_slices, padded_block) | None
+        Called from the Dask done-callback thread as each nav chunk lands, with
+        the chunk's GLOBAL nav slice and its RAW padded peaks block
+        ``(nav…, MAX_PEAKS, 3)`` — the same block the live count map is derived
+        from, handed over before it is discarded so a caller can render those
+        positions (``find_vectors.LiveVectorFrames`` → the progressive window's
+        live signal plot).  Must be thread-safe and never raise; exceptions are
+        swallowed.  Costs nothing extra: the block is already in the client
+        process, so this never re-reads the dataset.
     stopped_flag : list[bool] | None
         Polled while waiting on the future; setting it cancels the compute
         and returns None.
@@ -577,7 +587,12 @@ def _do_compute_vectors(
     # top-left of the buffer.  The global nav slice the callback receives is
     # always correct, and the write stays on the client (no worker-subprocess
     # shm write → no Windows teardown access-violation; cf. the VI path).
-    if shm_name is not None:
+    #
+    # The same callback also hands the RAW block to ``on_chunk_block`` so the
+    # caller can render those positions while the batch is still running (the
+    # progressive window's live signal plot) — the block is already here, so
+    # this adds no compute and no dataset access.
+    if shm_name is not None or on_chunk_block is not None:
         from multiprocessing import shared_memory as _shm_mod
 
         def _live_count_chunk(nav_slices, block):
@@ -585,18 +600,24 @@ def _do_compute_vectors(
             write them to the live shm buffer at the chunk's GLOBAL location.
             ``nav_slices`` indexes only the nav axes; ``block`` is the padded
             (nav…, n_peaks, cols) chunk result.  Best-effort, never raises."""
-            try:
-                counts = np.isfinite(block[..., 0]).sum(axis=-1).astype(np.float32)
-                shm = _shm_mod.SharedMemory(name=shm_name, create=False)
+            if shm_name is not None:
                 try:
-                    buf = np.ndarray(tuple(nav_shape_full), dtype=np.float32,
-                                     buffer=shm.buf)
-                    buf[tuple(nav_slices)] = counts
-                finally:
-                    shm.close()
-            except Exception as e:
-                log.debug("live count-map shm write for %r failed: %s",
-                          nav_slices, e)
+                    counts = np.isfinite(block[..., 0]).sum(axis=-1).astype(np.float32)
+                    shm = _shm_mod.SharedMemory(name=shm_name, create=False)
+                    try:
+                        buf = np.ndarray(tuple(nav_shape_full), dtype=np.float32,
+                                         buffer=shm.buf)
+                        buf[tuple(nav_slices)] = counts
+                    finally:
+                        shm.close()
+                except Exception as e:
+                    log.debug("live count-map shm write for %r failed: %s",
+                              nav_slices, e)
+            if on_chunk_block is not None:
+                try:
+                    on_chunk_block(tuple(nav_slices), block)
+                except Exception as e:
+                    log.debug("on_chunk_block for %r failed: %s", nav_slices, e)
     else:
         _live_count_chunk = None
 
