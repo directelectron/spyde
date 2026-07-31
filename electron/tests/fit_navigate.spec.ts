@@ -95,6 +95,9 @@ test('the overlaid model follows the navigator after a scan fit', async () => {
 
     const goTo = async (cx: number, cy: number) => {
       const before = await dataSig()
+      const seqBefore = await page.evaluate(() =>
+        (window as unknown as { _spyde_fit_state_seq?: number })
+          ._spyde_fit_state_seq ?? 0)
       await page.evaluate(({ f, panel, id, x, y }) => {
         window.postMessage({
           type: 'awi_event', figId: f,
@@ -114,6 +117,26 @@ test('the overlaid model follows the navigator after a scan fit', async () => {
         await page.waitForTimeout(100)
         if ((await dataSig()) !== before) break
       }
+      // …and then for the CARET to have processed this move. The spectrum and
+      // the fit arrive separately: the data landing above says the navigator
+      // moved, not that `fit_navigated` has run for the new position, so the
+      // model read below could still be the previous position's.
+      //
+      // `fit_navigated` pushes the overlay and THEN emits its state down the
+      // same ordered protocol, so a new fit_state is proof the caret is now
+      // showing THIS position — the same completion signal its own navigator
+      // coalescer waits on (navDone), and the one fit_quality's sweep uses.
+      //
+      // Bounded, not fatal: the caret coalesces moves by keeping one request
+      // in flight, so a move posted while another is pending can legitimately
+      // be folded into it and produce no additional state. The assertion below
+      // is still the real check.
+      await page.waitForFunction(
+        (s: number) =>
+          ((window as unknown as { _spyde_fit_state_seq?: number })
+            ._spyde_fit_state_seq ?? 0) > s,
+        seqBefore, { timeout: 30_000 },
+      ).catch(() => { /* coalesced; the assertion below still decides */ })
     }
 
     const readModel = async () => {
