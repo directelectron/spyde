@@ -210,7 +210,7 @@ def record_shape(path: str | None, sig) -> None:
         _save_shape_cache()
 
 
-def _open_lazily(path: str):
+def _open_lazily(path: str, chunks=None):
     """Lazily open a downloaded example, metadata only.
 
     hyperspy's reader sniffing is ambiguous for some EBSD ``.h5`` files (it
@@ -218,10 +218,16 @@ def _open_lazily(path: str):
     exactly the files whose reader lives in kikuchipy. So: hyperspy first,
     kikuchipy as the fallback — which also keeps kikuchipy optional, since a
     dataset it cannot open simply has no shape shown.
+
+    *chunks* is passed through so the caller can re-open with storage-aligned
+    (whole-signal) chunks; see ``Session.load_aligned``. Only hyperspy takes it
+    — the kikuchipy fallback opens with its own default, which is correct for
+    the EBSD files it exists for.
     """
     import hyperspy.api as hs
+    kw = {} if chunks is None else {"chunks": chunks}
     try:
-        return hs.load(path, lazy=True)
+        return hs.load(path, lazy=True, **kw)
     except Exception as e:
         log.debug("hyperspy could not open %s (%s); trying kikuchipy", path, e)
         import kikuchipy as kp

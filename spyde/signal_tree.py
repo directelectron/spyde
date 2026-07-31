@@ -137,9 +137,18 @@ class BaseSignalTree:
             except Exception as e:
                 logger.debug("setting cancel flag on close failed: %s", e)
         client = self.client
+        try:
+            from dask.distributed import Future as _Future
+        except Exception:
+            _Future = ()
         for fut in list(self._cancel_futures):
             try:
-                if client is not None:
+                # `client.cancel(x)` runs futures_of(x), which silently returns
+                # [] for anything that isn't a dask Future — so a duck-typed
+                # handle (the navigator fill's _AssembledFuture, which cancels
+                # the whole dispatch) would never be cancelled at all. Route it
+                # to its own .cancel().
+                if client is not None and isinstance(fut, _Future):
                     client.cancel(fut)
                 elif hasattr(fut, "cancel"):
                     fut.cancel()
@@ -436,10 +445,13 @@ class BaseSignalTree:
         def _on_chunk(chunk_result, nav_slices):
             relay.chunk_ready.emit(chunk_result, nav_slices)
 
-        # Register every nav future (per-chunk + whole-array) so a tree close
-        # mid-fill cancels them on the cluster instead of letting the whole
-        # dataset sum run to completion. Tracked locally too so the poll loop
-        # can unregister them all when the fill finishes normally.
+        # Register the fill for cancellation so a tree close mid-fill stops it
+        # on the cluster instead of letting the whole dataset sum run to
+        # completion. This is now ONE handle (compute_dispatch owns the
+        # per-chunk futures and cancels them from its own stopped_flag) rather
+        # than one entry per nav chunk — on a 977-frame movie that was 978
+        # registrations. Tracked locally too so the poll loop can unregister
+        # when the fill finishes normally.
         nav_futures: list = []
 
         def _register_nav_future(fut, _futs=nav_futures):
@@ -505,14 +517,13 @@ class BaseSignalTree:
                     self.unregister_cancel(future=_f)
                 if _stop.is_set():
                     return
-                # Final repaint of the COMPLETED navigator. The per-chunk shm
-                # writes race the whole-array `future` (separate computations —
-                # the chunk add_done_callbacks can still be pending when
-                # future.done() is True), so the chunk-built buffer may miss the
-                # last slice(s) → holes. The navigator is small (nav-shaped,
-                # ~MB), so paint the AUTHORITATIVE full result directly —
-                # guaranteed complete, no hole possible. Fall back to the buffer
-                # if the result isn't fetchable.
+                # Final repaint of the COMPLETED navigator. `future.result()` is
+                # the dispatcher's client-side assembly of every chunk, so it is
+                # complete by construction — whereas the shm buffer is written
+                # from a psygnal relay whose last emits can still be in flight,
+                # and painting that would leave holes. The navigator is small
+                # (nav-shaped, ~MB), so paint the AUTHORITATIVE result directly.
+                # Fall back to the buffer if the result isn't fetchable.
                 try:
                     res = future.result()
                     arr = np.asarray(res, dtype=np.float32)
@@ -856,7 +867,7 @@ class BaseSignalTree:
                 logger.debug("removing strain controller on tree close failed: %s", e)
             self._strain_controller = None
         for attr in ("_fv_preview", "_vector_overlay", "_result_vector_overlay",
-                     "_orientation_overlay"):
+                     "_orientation_overlay", "_particle_overlay"):
             ov = getattr(self, attr, None)
             if ov is not None and hasattr(ov, "remove"):
                 try:
@@ -865,7 +876,8 @@ class BaseSignalTree:
                     logger.debug("removing %s on tree close failed: %s", attr, e)
             if hasattr(self, attr):
                 setattr(self, attr, None)
-        for wiz_attr in ("_om_wizard", "_vom_wizard", "_ebsd_wizard"):
+        for wiz_attr in ("_om_wizard", "_vom_wizard", "_ebsd_wizard",
+                         "_seg_wizard", "_drift_wizard"):
             wiz = getattr(self, wiz_attr, None)
             if wiz is not None and hasattr(wiz, "remove"):
                 try:
@@ -898,9 +910,17 @@ class BaseSignalTree:
         self.signal_plots = []
         self.navigator_signals = {}
         self.navigator_plot_manager = None
+        # `source_node` / `source_tree` are the reason this list matters as much
+        # as the teardown above: a particle tree holds a back-reference to the
+        # movie it was segmented FROM, so leaving them set keeps the source
+        # signal — a lazy multi-GB array — alive for as long as the result tree
+        # is referenced anywhere. Closing the source would then free nothing.
         for attr in ("diffraction_vectors", "orientation_map", "vector_orientation",
                      "_vom_field", "_ipf_result", "_ipf_p3d", "_ipf_picker",
-                     "_render_frame_fn"):
+                     "_render_frame_fn",
+                     "particles", "_seg_pending_particles", "particle_events",
+                     "particle_edits", "nav_traces", "drift",
+                     "source_node", "source_tree", "nav_map"):
             if hasattr(self, attr):
                 try:
                     setattr(self, attr, None)

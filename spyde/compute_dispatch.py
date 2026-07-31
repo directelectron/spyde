@@ -157,7 +157,7 @@ def dispatch_chunks(
     result_array,
     nav_dim: int,
     gpu_addrs: list,
-    cpu_addrs: list,
+    cpu_addrs: "list | None",
     stopped_flag=None,
     postprocess=None,
     fill_value=np.nan,
@@ -167,15 +167,60 @@ def dispatch_chunks(
     on_chunk_done=None,
     lane_default_mode: str = "one",
     gpu_only: bool = False,
+    assemble=None,
+    cap=None,
+    on_start=None,
 ):
     """
     Compute `result_array` (a dask array with nav dims leading) chunk by
     chunk with explicit lane placement, assembling into one host ndarray.
 
+    THIS IS THE ONLY PLACE THAT MAY SUBMIT PER-CHUNK COMPUTES IN A LOOP.
+    Every other progressive-chunk path (navigator fill, VI/FFT stream, the
+    single-lane find-vectors preview) routes through here — see
+    ``test_chunk_dispatch_guard.py``, which fails the build if a new
+    ``client.compute()`` appears inside a chunk loop elsewhere.  A hand-rolled
+    loop always ends up missing at least one of the three properties below:
+    batched submit, a bounded in-flight window, and the stall watchdog.
+
+    cpu_addrs : list | None
+        ``None`` means ONE UNPINNED LANE over the whole cluster — chunks are
+        submitted with no ``workers=`` restriction, so the scheduler places
+        them by data locality.  That is the plain progressive-chunk case (no
+        GPU/CPU asymmetry to exploit) and it is what the navigator fill / VI
+        stream want.  An empty LIST keeps its existing, different meaning: a
+        lane that must NEVER be submitted to (the ``gpu_only`` pin — a
+        ``workers=[]`` submit silently leaks chunks to any worker, which for
+        neural is the 10-50x-slower torch-CPU path).
+    cap : int | None
+        Explicit in-flight window for the unpinned lane.  Default is HALF the
+        cluster's threads (min 4): a progressive chunk is read-bound, so full
+        saturation buys no throughput while every in-flight chunk pins a whole
+        source chunk in worker RAM — a full-thread window was effectively no
+        throttle at all on medium scans and pushed workers into spill.
+
     postprocess : callable(np.ndarray) -> np.ndarray | None
         Applied on the worker to each chunk's result before transfer (e.g.
         trimming NaN padding).  May shorten axis -2; the assembly writes the
         result into slots [0:n) of that axis, the rest keeps `fill_value`.
+    assemble : callable(result, nav_slices, chunk_result) | None
+        How a landed chunk is written into the output array.  The default is
+        find_vectors' NaN-padded convention (slots [0:n) of axis -2), which
+        assumes at least two trailing axes.  Segmentation's per-frame result is
+        RAGGED — a variable number of particle rows plus a variable number of
+        contours per frame — so it dispatches a 1-D **object** array (one
+        ``(rows, contours)`` tuple per frame) and passes an assembler that just
+        writes the slice.  Everything else about the lane machinery is
+        identical, which is the point: one dispatcher, two payload shapes.
+    on_start : callable(cancel) | None
+        Called once, before the first submission, with a zero-argument
+        ``cancel()`` that requests an IMMEDIATE stop: it flips the stop flag AND
+        wakes the wait loop, so outstanding futures are cancelled right away
+        instead of on the next 0.5 s poll.  Interactive callers need this — the
+        VI/FFT stream restarts on every ROI drag tick and a superseded stream
+        that keeps computing for another half second is exactly the "every drag
+        tick stacks another dataset pass" pathology, only smaller.  Batch
+        callers can ignore it and use ``stopped_flag`` alone.
     on_chunk_done : callable(nav_slices, chunk_result) | None
         Called from the Dask done-callback thread as each chunk lands, with
         the chunk's GLOBAL nav slice (a tuple of slices into the full nav
@@ -207,17 +252,44 @@ def dispatch_chunks(
 
     result = np.full(result_array.shape, fill_value, dtype=result_array.dtype)
 
-    info = client.scheduler_info(n_workers=-1)["workers"]
+    # cpu_addrs is None -> one UNPINNED lane over the whole cluster (see the
+    # docstring).  `lanes["cpu"]` stays [] in that mode and the empty-lane guard
+    # in _submit_next is bypassed for it, so `[]` keeps meaning "never submit".
+    unpinned = cpu_addrs is None
+    cpu_addrs = [] if unpinned else cpu_addrs
+
+    # Thread counts only SIZE the windows — a client that can't answer (a test
+    # double, a scheduler hiccup) must degrade to the conservative default, not
+    # fail the whole dispatch.
+    try:
+        info = client.scheduler_info(n_workers=-1)["workers"]
+    except Exception as e:
+        log.debug("[%s] scheduler_info unavailable (%s); using default windows",
+                  label, e)
+        info = {}
     gpu_threads = sum(int(info[a].get("nthreads", 1)) for a in gpu_addrs if a in info)
-    cpu_threads = sum(int(info[a].get("nthreads", 1)) for a in cpu_addrs if a in info)
+    if unpinned:
+        cpu_threads = sum(int(w.get("nthreads", 1)) for w in info.values())
+    else:
+        cpu_threads = sum(int(info[a].get("nthreads", 1)) for a in cpu_addrs if a in info)
     # GPU lane gets a deeper window (chunks overlap loads/transfers/kernels on
     # per-thread streams); CPU margin stays small — every in-flight chunk pins
     # its inputs on a worker and over-prefetching pushes workers into spill.
+    if cap is not None:
+        cpu_cap = max(1, int(cap))
+    elif unpinned:
+        cpu_cap = max(4, cpu_threads // 2)
+    else:
+        cpu_cap = max(2, cpu_threads + 2)
     caps = {
         "gpu": max(2, 2 * gpu_threads + 2),
-        "cpu": max(2, cpu_threads + 2),
+        "cpu": cpu_cap,
     }
-    lane_threads = {"gpu": gpu_threads, "cpu": cpu_threads}
+    # _lane_cap halves THIS number under memory pressure. For a pinned lane it
+    # is the lane's thread count (the natural sizing); the unpinned lane has no
+    # thread-based sizing, so feed it the window itself and hot => window/2.
+    lane_threads = {"gpu": gpu_threads,
+                    "cpu": cpu_cap if unpinned else cpu_threads}
     lanes = {"gpu": list(gpu_addrs), "cpu": list(cpu_addrs)}
 
     # Banded (2-row) submission order: vertical ghost-zone neighbours stay
@@ -256,14 +328,19 @@ def dispatch_chunks(
             return
         if stopped_flag is not None and stopped_flag[0]:
             return
-        if not lanes[lane]:
+        if not lanes[lane] and not (unpinned and lane == "cpu"):
             # Empty lane (gpu_only dispatch: torch-CPU inference is 10-50x
             # slower than the GPU batch, so the CPU lane would only stretch
             # the tail — and `workers=[] + allow_other_workers` would leak
             # chunks to ANY worker). Never submit here.
+            # The UNPINNED lane is the deliberate exception: it has no address
+            # list precisely because it wants no placement restriction.
             return
-        cap = _lane_cap(caps[lane], lane_threads[lane], state["mem_hot"])
-        n = min(submit_batch, len(pending), cap - outstanding[lane])
+        # NB `lane_cap`, not `cap` — `cap` is the caller's window override and is
+        # already folded into `caps` above; shadowing it here would read as if
+        # the parameter were being recomputed per top-up.
+        lane_cap = _lane_cap(caps[lane], lane_threads[lane], state["mem_hot"])
+        n = min(submit_batch, len(pending), lane_cap - outstanding[lane])
         if n <= 0:
             return
         idxs = [pending.popleft() for _ in range(n)]
@@ -276,14 +353,25 @@ def dispatch_chunks(
             ]
         else:
             delayeds = [result_array[chunk_slices[i] + trailing] for i in idxs]
+        # ONE batched client.compute per top-up, never one per chunk: a
+        # per-chunk submit is a blocking scheduler round trip with the GIL held
+        # in the client process (14.2 ms each measured on a real memmap graph —
+        # 13.8 s of dead UI before the first of 977 navigator chunks painted).
+        # `client.compute(list)` returns futures in the SAME ORDER as the input.
+        #
         # gpu_only dispatch pins tasks HARD to the lane: with
         # allow_other_workers=True the list is only a soft preference, and a
         # busy GPU lane silently leaks chunks onto CPU workers — for neural
         # that is the 10-50x-slower torch-CPU path (the e2e batch timed out
         # exactly this way). Dual-lane mode keeps the soft placement.
-        futs = client.compute(
-            delayeds, workers=lanes[lane], allow_other_workers=not gpu_only,
-        )
+        if unpinned and lane == "cpu":
+            futs = client.compute(delayeds)
+        else:
+            futs = client.compute(
+                delayeds, workers=lanes[lane], allow_other_workers=not gpu_only,
+            )
+        if not isinstance(futs, (list, tuple)):
+            futs = [futs]          # a 1-element submit can come back bare
         for i, fut in zip(idxs, futs):
             futures.add(fut)
             outstanding[lane] += 1
@@ -297,9 +385,12 @@ def dispatch_chunks(
         try:
             chunk_result = fut.result()
             # Disjoint nav slices — safe to write without holding the lock.
-            n_found = chunk_result.shape[-2]
-            result[chunk_slices[idx] + (slice(0, n_found), slice(None))] = \
-                chunk_result
+            if assemble is not None:
+                assemble(result, chunk_slices[idx], chunk_result)
+            else:
+                n_found = chunk_result.shape[-2]
+                result[chunk_slices[idx] + (slice(0, n_found), slice(None))] = \
+                    chunk_result
             if on_chunk_done is not None:
                 # Live preview: hand the caller this chunk's GLOBAL nav slice
                 # and its result so it can paint/write shm at the right place.
@@ -334,6 +425,18 @@ def dispatch_chunks(
                 done_event.set()
 
     t0 = time.time()
+    if stopped_flag is None:
+        stopped_flag = [False]
+    if on_start is not None:
+        # Hand the caller a zero-latency stop: flipping the flag alone would
+        # only take effect on the next 0.5 s wait-loop poll.
+        def _request_stop(_flag=stopped_flag, _evt=done_event):
+            _flag[0] = True
+            _evt.set()
+        try:
+            on_start(_request_stop)
+        except Exception as e:
+            log.debug("[%s] on_start hook failed: %s", label, e)
     with lock:
         for lane in ("gpu", "cpu"):
             while outstanding[lane] < caps[lane] and pending:
@@ -388,8 +491,10 @@ def dispatch_chunks(
         if now - state["last_progress"] > 5.0 and now - last_poke > 5.0:
             last_poke = now
             poke_scheduler(client, label)
-        # Lane refresh: fold in workers that registered after dispatch start
-        if time.time() - last_lane_refresh > 5.0:
+        # Lane refresh: fold in workers that registered after dispatch start.
+        # The unpinned lane has nothing to refresh — it never restricts
+        # placement, so a late worker picks up chunks on its own.
+        if not unpinned and time.time() - last_lane_refresh > 5.0:
             last_lane_refresh = time.time()
             try:
                 # Same unset-default as the initial split — a refresh must not
