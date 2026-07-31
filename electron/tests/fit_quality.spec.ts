@@ -160,19 +160,14 @@ test('the fitted model matches the spectrum on screen', async () => {
     }, figIds.nav)
     expect(cross, 'the navigator has no crosshair').toBeTruthy()
 
-    const sigOf = (a: number[] | null) =>
-      a ? `${a.length}:${a[0]}:${a[a.length >> 1]}:${a[a.length - 1]}` : ''
-
-    /** Signatures of BOTH curves. They update independently, which is the
-     *  whole problem: the spectrum can be this position's while the model
-     *  overlay is still the previous one's. */
-    const sigs = async () => {
-      const c = await curves()
-      return { data: sigOf(c?.data ?? null), model: sigOf(c?.model ?? null) }
-    }
+    /** How many `fit_state` messages the wizard has taken so far. The backend
+     *  emits exactly one per navigator move, AFTER pushing that position's
+     *  overlay — see the note in goTo. */
+    const fitSeq = () => page.evaluate(() =>
+      (window as unknown as { _spyde_fit_state_seq?: number })._spyde_fit_state_seq ?? 0)
 
     const goTo = async (cx: number, cy: number) => {
-      const before = await sigs()
+      const seqBefore = await fitSeq()
       await page.evaluate(({ f, panel, id, x, y }) => {
         window.postMessage({
           type: 'awi_event', figId: f,
@@ -183,25 +178,29 @@ test('the fitted model matches the spectrum on screen', async () => {
         }, '*')
       }, { f: figIds.nav, panel: cross.panel_id, id: cross.id, x: cx, y: cy })
 
-      // Wait for BOTH curves to become this position's.
+      // Wait for the BACKEND to say this position is drawn, rather than
+      // guessing from the curves.
       //
-      // Neither weaker version held on CI. A flat 1.2s: [2,2] read 191.6%
-      // where re-measuring gave 3.7%. "Sample until two reads agree": a stale
-      // overlay is perfectly stable, so stability cannot tell "finished
-      // updating" from "has not started". Waiting only for the DATA: the
-      // spectrum arrives first and the model follows separately, so [16,2]
-      // still scored 28.3% mid-sweep on a loaded runner.
+      // Every earlier version guessed, and each failed on a loaded runner:
+      //   - a flat 1.2 s wait          → [2,2] read 191.6% (re-measure: 3.7%)
+      //   - "sample until reads agree" → a stale overlay is perfectly stable,
+      //     so quiescence cannot tell "finished" from "not started"
+      //   - "wait for the DATA to change" → the spectrum lands first and the
+      //     model follows separately; [16,2] still scored 28.3% mid-sweep
+      //   - "wait for the MODEL to change" → fails the other way when two
+      //     positions fit alike (fit_navigate: "the overlaid model curve did
+      //     not change between positions"). One trick, both failure modes.
       //
-      // The MODEL changing is the signal that the overlay is this position's,
-      // and it is what made fit_navigate stable. Falls through on timeout
-      // rather than hanging — two positions could in principle fit alike, and
-      // settledMisfit below is still the final guard.
-      const deadline = Date.now() + 30_000
-      while (Date.now() < deadline) {
-        await page.waitForTimeout(100)
-        const now = await sigs()
-        if (now.data !== before.data && now.model !== before.model) break
-      }
+      // `fit_navigated` pushes the overlay (draw_preview) and THEN emits its
+      // state, both down the same ordered stdout protocol — so a NEW fit_state
+      // proves the overlay for this position has already been applied. That is
+      // a fact about the protocol, not a timing assumption, and it is the same
+      // signal the caret's own navigator coalescer waits on (navDone).
+      await page.waitForFunction(
+        (s: number) =>
+          ((window as unknown as { _spyde_fit_state_seq?: number })
+            ._spyde_fit_state_seq ?? 0) > s,
+        seqBefore, { timeout: 30_000 })
     }
 
     let worst = { m: 0, at: [0, 0] as number[] }
