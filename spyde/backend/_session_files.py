@@ -628,7 +628,15 @@ class FileLoaderMixin:
         """
         from spyde.backend import example_catalogue as catalogue
 
-        emit({"type": "example_catalogue", **catalogue.catalogue()})
+        payload = catalogue.catalogue()
+        # One terse line per send: it says the catalogue was actually built and
+        # what it found, which is otherwise invisible (the payload goes out on the
+        # PLOTAPP channel, not the log). It is also the only signal an E2E test can
+        # wait on to know the menu is populated — see examples_menu.spec.ts, the
+        # same reason show_example_dir logs its reveal.
+        log.info("examples catalogue: %d datasets, %d downloaded",
+                 payload.get("n_total", 0), payload.get("n_downloaded", 0))
+        emit({"type": "example_catalogue", **payload})
         if not warm:
             return
 

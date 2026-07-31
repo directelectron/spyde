@@ -106,15 +106,40 @@ export function MenuBar({ onStartGuide }: { onStartGuide: (g: Guide) => void }) 
   // stranded on screen.
   useEffect(() => { if (!open) setTip(null) }, [open])
 
-  // The catalogue is cheap to build (it opens no files), so ask for a fresh one
-  // every time the Examples menu opens — that is what keeps the downloaded
-  // markers honest after a download finishes or a file is deleted outside the
-  // app. `warm` lets the backend fill in shapes for anything downloaded but not
-  // yet measured, off this path, and re-send when it has.
+  // `sendAction` is a fresh closure on EVERY provider render (SpyDEContext builds
+  // its value inline), so an effect that lists it as a dependency re-runs on every
+  // unrelated context update. Held in a ref instead, the two catalogue effects
+  // below depend only on what should genuinely re-trigger them — before this, one
+  // menu open fired a dozen `example_catalogue` requests in ~40 ms, each one
+  // spawning a shape-warming thread on the backend.
+  const sendActionRef = useRef(sendAction)
+  sendActionRef.current = sendAction
+
+  // Prefetch as soon as the backend is up, so the menu is already populated the
+  // first time it is opened. Two reasons this is not just a nicety: the window
+  // exists well BEFORE the Python sidecar does (main/index.ts creates it, then
+  // awaits resolvePythonEnv — a whole `uv sync` on a first packaged run), and
+  // main/runner.ts's sendAction silently no-ops while `proc.stdin` is null. So a
+  // menu opened during startup dropped its request and sat on "Loading examples…"
+  // until the user closed and reopened it. `state.ready` is set by the backend's
+  // own `ready` message, which it emits immediately before entering its stdin
+  // loop — i.e. exactly when an action can first be received.
+  const prefetched = useRef(false)
+  useEffect(() => {
+    if (!state.ready || prefetched.current) return
+    prefetched.current = true
+    sendActionRef.current('example_catalogue', { warm: true })
+  }, [state.ready])
+
+  // The catalogue is cheap to build once em-database is imported (~1 ms; it opens
+  // no files), so ask for a fresh one every time the Examples menu opens — that is
+  // what keeps the downloaded markers honest after a download finishes or a file is
+  // deleted outside the app. `warm` lets the backend fill in shapes for anything
+  // downloaded but not yet measured, off this path, and re-send when it has.
   useEffect(() => {
     if (open !== 'Examples') return
-    sendAction('example_catalogue', { warm: true })
-  }, [open, sendAction])
+    sendActionRef.current('example_catalogue', { warm: true })
+  }, [open])
 
   useEffect(() => {
     const onCatalogue = (e: Event) => {
