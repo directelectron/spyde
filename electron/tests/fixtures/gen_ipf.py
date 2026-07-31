@@ -57,7 +57,7 @@ def main():
     a1 = np.array(axes1, dtype=object).ravel()[0]
     a1.imshow(rgb)
     html1 = finalize_figure_html(f1, "ipfdirect")
-    with open(os.path.join(HERE, "ipf_direct.html"), "w") as fh:
+    with open(os.path.join(HERE, "ipf_direct.html"), "w", encoding="utf-8") as fh:
         fh.write(html1)
 
     # 3) anyplotlib LIVE path (what the IPF window does): scalar+gray imshow,
@@ -75,9 +75,9 @@ def main():
         p2.set_data(rgb)
     finally:
         el.emit = orig
-    with open(os.path.join(HERE, "ipf_live_scalar.html"), "w") as fh:
+    with open(os.path.join(HERE, "ipf_live_scalar.html"), "w", encoding="utf-8") as fh:
         fh.write(html2)
-    with open(os.path.join(HERE, "ipf_live_updates.json"), "w") as fh:
+    with open(os.path.join(HERE, "ipf_live_updates.json"), "w", encoding="utf-8") as fh:
         json.dump([{"key": m.get("key"), "value": m.get("value")}
                    for m in updates if m.get("type") == "state_update"], fh)
 

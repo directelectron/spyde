@@ -38,14 +38,14 @@ def bright_image(n=64):
 fig, ax = apl.subplots(1, 1)
 ax.imshow(bright_image(), cmap="viridis")
 html = _dark(build_standalone_html(fig, fig_id="bright"))
-with open(os.path.join(HERE, "real_bright.html"), "w") as f:
+with open(os.path.join(HERE, "real_bright.html"), "w", encoding="utf-8") as f:
     f.write(html)
 
 # ── black placeholder + replay state ─────────────────────────────────────────
 fig2, ax2 = apl.subplots(1, 1)
 plot2 = ax2.imshow(np.zeros((10, 10), dtype=np.float32), cmap="viridis")
 placeholder_html = _dark(build_standalone_html(fig2, fig_id="replay"))
-with open(os.path.join(HERE, "black_placeholder.html"), "w") as f:
+with open(os.path.join(HERE, "black_placeholder.html"), "w", encoding="utf-8") as f:
     f.write(placeholder_html)
 
 # Now set bright data and capture the panel traits as awi_state messages.
@@ -56,7 +56,7 @@ for tname in fig2.trait_names():
     if tname.startswith("panel_") and (tname.endswith("_json") or tname.endswith("_geom")):
         panel_states.append({"key": tname, "value": getattr(fig2, tname)})
 
-with open(os.path.join(HERE, "replay_state.json"), "w") as f:
+with open(os.path.join(HERE, "replay_state.json"), "w", encoding="utf-8") as f:
     json.dump({"fig_id": "replay", "states": panel_states}, f)
 
 print("wrote fixtures:", os.listdir(HERE))

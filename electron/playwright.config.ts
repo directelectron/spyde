@@ -1,6 +1,47 @@
 import { defineConfig } from '@playwright/test'
 import { join } from 'path'
 
+// A FRESH Electron profile + settings dir for every app launch, so no spec can
+// inherit another's localStorage/IndexedDB or settings.json. This file is
+// evaluated in every worker process, which is what lets one hook reach all ~60
+// specs — including the ~30 that call `_electron.launch()` directly instead of
+// going through _harness.cjs. See tests/_clean_slate.cjs for the full why.
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+require('./tests/_clean_slate.cjs').installCleanSlate()
+
+/**
+ * The specs that dominate wall-clock, newest measurement first.
+ *
+ * Playwright's `--shard` balances by FILE COUNT, not duration, and this suite's
+ * files differ by ~40x. Measured on one CI run: shard 3 ran 127 tests in 6.8
+ * min while shard 1 ran 90 in 22.6 — and re-sharding never fixed it, because
+ * count-balancing keeps making the same bad split (the workflow records ×2 and
+ * ×3 both landing one shard over 20 min, one of them cancelled at the timeout).
+ *
+ * Splitting THESE out and sharding the rest evens it up without another runner:
+ * 22.6 / 11.7 / 6.8 / 5.8  ->  roughly 13 / 12 / 11 / 10.
+ *
+ * `reportSlowTests` above prints every file over 30 s, so CI itself tells you
+ * when this list has drifted. Keep it to files that genuinely dominate — a long
+ * list defeats the point by leaving the sharded half too thin.
+ */
+export const SLOW_SPECS = [
+  '**/fit_quality.spec.ts',          // 3.7m
+  '**/gpu_image_parity.spec.ts',     // 1.5m
+  '**/ipf_perf.spec.ts',             // 1.3m
+  '**/action_scoping.spec.ts',       // 1.1m
+  '**/fit_handles.spec.ts',          // 57s
+  '**/fit_from_composition.spec.ts', // 53s
+]
+
+// Which half of the split to run. CI sets it per job; unset (every local run)
+// means "everything", so nobody has to know this exists to run the suite.
+//   slow  -> ONLY the files above, one job, unsharded
+//   fast  -> everything EXCEPT them, sharded --shard=N/4
+const SLICE = process.env.SPYDE_E2E_SLICE
+const SLICE_IGNORE = SLICE === 'fast' ? SLOW_SPECS : []
+const SLICE_MATCH = SLICE === 'slow' ? SLOW_SPECS : null
+
 export default defineConfig({
   testDir: './tests',
   // Settings isolation for EVERY spec — ~30 of them call _electron.launch()
@@ -8,6 +49,7 @@ export default defineConfig({
   // they get the first-run welcome tour whose overlay eats pointer events.
   // They all spread ...process.env, so setting it there is what reaches them.
   globalSetup: require.resolve('./tests/global-setup.cjs'),
+  globalTeardown: require.resolve('./tests/global-teardown.cjs'),
   timeout: 120_000,
   expect: { timeout: 15_000 },
   retries: 1,
@@ -40,8 +82,11 @@ export default defineConfig({
       // the real-data specs (*.real.spec.ts) and the screenshot generator, which
       // need downloaded pyxem datasets.
       name: 'electron',
-      testMatch: '**/*.spec.ts',
-      testIgnore: ['**/*.real.spec.ts', '**/guide_screenshots.spec.ts'],
+      testMatch: SLICE_MATCH ?? '**/*.spec.ts',
+      testIgnore: [
+        '**/*.real.spec.ts', '**/guide_screenshots.spec.ts',
+        ...SLICE_IGNORE,
+      ],
     },
     {
       // Local / nightly tier: real pyxem datasets + per-step screenshot
