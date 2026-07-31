@@ -31,6 +31,7 @@ import math
 import numpy as np
 
 from spyde.actions.commit import commit_result_tree
+from spyde.fitting.components import EELS_EDGE_KIND
 from spyde.fitting.store import FitStore
 from spyde.actions.context import src_plot_tree as _src_plot_tree
 from spyde.actions.wizard import WizardController
@@ -58,6 +59,12 @@ CATALOGUE = [
     ("Erf", "Smeared step"),
     ("Arctan", "Arctan step"),
 ]
+
+# exspy's core-loss edge is deliberately NOT in CATALOGUE, and cannot be: every
+# entry there is a bare `Kind()` the picker draws as one button, whereas an edge
+# is `EELSCLEdge("Fe_L3")` — one button per SUBSHELL, only on an EELS signal,
+# and only once the microscope is described. `eels_offer` builds that half of
+# the picker; see spyde/spectroscopy/edges.py.
 
 _PREVIEW_POINTS = 64
 
@@ -1119,6 +1126,47 @@ def component_catalogue(x: np.ndarray) -> list[dict]:
     return out
 
 
+def eels_offer(signal) -> dict:
+    """The EELS half of the picker: which edges can be added, and what blocks them.
+
+    Always returns the same keys, so the renderer never has to guess why the
+    edge section is empty — an EELS signal without exspy gets the install line,
+    one without the microscope gets the field names, and a non-EELS signal gets
+    ``eels: False`` and no section at all.
+
+    Every failure here is swallowed: the picker's analytic components must
+    still arrive if the edge lookup goes wrong.
+    """
+    out = {"eels": False, "exspy": False, "edges": [],
+           "microscope_missing": [], "install_hint": ""}
+    try:
+        from spyde.drawing.toolbars.plot_control_toolbar import (
+            install_hint, package_available,
+        )
+        from spyde.spectroscopy import edges as eels_edges
+    except Exception as e:                                # pragma: no cover
+        log.debug("the EELS edge offer is unavailable: %s", e)
+        return out
+
+    if signal is None or not eels_edges.is_eels(signal):
+        return out
+    out["eels"] = True
+    # `package_available` uses find_spec — asking does not pay exspy's import.
+    if not package_available("exspy"):
+        out["install_hint"] = install_hint("exspy")
+        return out
+    out["exspy"] = True
+    try:
+        out["microscope_missing"] = eels_edges.missing_microscope_parameters(signal)
+    except Exception as e:                                # pragma: no cover
+        log.debug("reading the microscope parameters failed: %s", e)
+    try:
+        out["edges"] = eels_edges.available_edges(signal)
+    except Exception as e:
+        log.info("listing the EELS edges for the picker failed: %s", e)
+    return out
+
+
 def scale_to_data(cspec, x: np.ndarray, y: np.ndarray, fraction: float = 0.5) -> None:
     """Set a component's LINEAR amplitude so it is visible against the data.
 
@@ -1145,8 +1193,12 @@ def scale_to_data(cspec, x: np.ndarray, y: np.ndarray, fraction: float = 0.5) ->
     if linear is None:
         return
     try:
-        comp = tcomp.get_component(cspec.kind,
-                                   n_params=len(cspec.scalar_parameters))
+        # `component_for`, not `get_component`: an EELS edge is a supported
+        # kind that resolves only from its SPEC (the precomputed GOS curves
+        # live there). Looking it up by kind alone raises, which this except
+        # swallowed — so an added edge kept intensity=1 against counts of 1e5
+        # and drew as a flat line on the axis.
+        comp = tcomp.component_for(cspec)
         original, linear.value = linear.value, 1.0
         vals = np.array([[p.value for p in cspec.scalar_parameters]])
         unit = comp(torch.as_tensor(np.asarray(x, float)),
@@ -1348,15 +1400,24 @@ def _send_catalogue(session, wiz, src, gen: int) -> None:
     """
     from spyde.actions.lifecycle import run_on_worker
     x = wiz.axis()
+    signal = wiz.signal
 
-    def _emit(components):
+    def _build():
+        # The EELS edges ride the SAME worker call as the sparklines. They are
+        # cheap (a table lookup), but the first `import exspy` is not, and
+        # paying it on the main thread would put the caret's open back where
+        # the sympy lambdify used to have it.
+        return component_catalogue(x), eels_offer(signal)
+
+    def _emit(result):
         if not wiz.still(gen):
             return                      # the caret closed while we sampled
+        components, offer = result
         ipc.emit({"type": "fit_catalogue",
                   "window_id": getattr(src, "window_id", None),
-                  "components": components})
+                  "components": components, **offer})
 
-    run_on_worker(session, lambda: component_catalogue(x),
+    run_on_worker(session, _build,
                   name="fit-catalogue", on_done=_emit,
                   on_error=lambda e: log.debug("component catalogue: %s", e))
 
@@ -1388,6 +1449,53 @@ def fit_close(session, plot, payload=None) -> None:
         wiz.remove()
 
 
+def _eels_edge_spec(wiz, payload):
+    """A ready-to-append ComponentSpec for one ``EELSCLEdge``, or None.
+
+    Every rejection path emits its own message, because the native failures are
+    unactionable: no exspy is an ``ImportError`` on a package the user has
+    never heard of, and no microscope geometry is
+    ``AttributeError('Acquisition_instrument')`` raised from inside exspy's
+    ``model.append``.
+    """
+    subshell = ((payload or {}).get("element_subshell")
+                or (payload or {}).get("subshell"))
+    if not subshell:
+        ipc.emit_error("Fit: no edge given — pick one (e.g. O_K) from the list")
+        return None
+    try:
+        from spyde.fitting import ModelSpec
+        from spyde.spectroscopy import edges as eels_edges
+        from spyde.spectroscopy import prepare_eels_edges
+    except ImportError as e:                              # pragma: no cover
+        ipc.emit_error(f"Fit: EELS edges are unavailable ({e})")
+        return None
+
+    try:
+        cspec = eels_edges.edge_component_spec(wiz.signal, subshell)
+    except (eels_edges.MissingExtra,
+            eels_edges.MissingMicroscopeParameters, ValueError) as e:
+        ipc.emit_error(f"Fit: {e}")
+        return None
+    except Exception as e:
+        ipc.emit_error(f"Fit: cannot add the {subshell} edge ({e})")
+        return None
+
+    # Attach the batched GOS curves NOW rather than at fit time. The integral
+    # depends on the element and the microscope, not the pixel, so it is
+    # computed once — and without it the whole model drops off the batched
+    # engine onto HyperSpy's one-pixel-at-a-time path (#63). Best-effort: a
+    # raw edge still fits, just slowly.
+    try:
+        prepared, _info = prepare_eels_edges(
+            ModelSpec(components=[cspec]), wiz.signal)
+        cspec = prepared.components[0]
+    except Exception as e:
+        log.info("preparing the %s edge for the batched engine failed (%s); "
+                 "the fit will fall back to hyperspy", subshell, e)
+    return cspec
+
+
 def fit_add_component(session, plot, payload) -> None:
     wiz, _tree = _wizard(session, plot)
     if wiz is None:
@@ -1396,17 +1504,27 @@ def fit_add_component(session, plot, payload) -> None:
     if not kind:
         ipc.emit_error("Fit: no component kind given")
         return
-    try:
-        cspec = new_component_spec(
-            kind, int((payload or {}).get("order", 2)) if kind == "Polynomial"
-            else None)
-    except Exception as e:
-        ipc.emit_error(f"Fit: cannot add {kind} ({e})")
-        return
 
     x = wiz.axis()
     lo, hi = float(np.min(x)), float(np.max(x))
-    _seed_for_preview(cspec, lo, hi)
+
+    if kind == EELS_EDGE_KIND:
+        cspec = _eels_edge_spec(wiz, payload)
+        if cspec is None:
+            return
+        # NO `_seed_for_preview`: an edge's position is the tabulated onset,
+        # which is the whole point of picking it by subshell. Moving it to
+        # mid-axis like a gaussian's centre would put O-K wherever the window
+        # happens to be centred.
+    else:
+        try:
+            cspec = new_component_spec(
+                kind, int((payload or {}).get("order", 2))
+                if kind == "Polynomial" else None)
+        except Exception as e:
+            ipc.emit_error(f"Fit: cannot add {kind} ({e})")
+            return
+        _seed_for_preview(cspec, lo, hi)
     # Put it on THIS spectrum, or the component arrives five orders of
     # magnitude below the data and looks like it does nothing. A background
     # needs its shape solved through the data, not just its amplitude scaled.
