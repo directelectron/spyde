@@ -46,6 +46,26 @@ interface CompState {
   share?: number
 }
 interface CatalogueItem { kind: string; description: string; preview: number[] }
+/** One offerable exspy core-loss edge — see spyde/spectroscopy/edges.py. */
+interface EdgeItem {
+  subshell: string; element: string; shell: string; onset: number
+  relevance: string; description: string
+  /** Belongs to an element the user declared in the Composition panel. */
+  suggested: boolean
+}
+interface EelsOffer {
+  eels: boolean; exspy: boolean; edges: EdgeItem[]
+  microscope_missing: string[]; install_hint: string
+}
+const NO_EELS: EelsOffer = {
+  eels: false, exspy: false, edges: [], microscope_missing: [], install_hint: '',
+}
+
+/** How many non-suggested edges the picker lists before asking for a filter.
+ *  The list scrolls inside its own box, so this only bounds how many buttons
+ *  are rendered — a 600 eV window contains ~64 major edges and all of them are
+ *  worth having, since without a composition the filter is the only way in. */
+const EDGE_LIMIT = 80
 
 /** Inline sparkline of a component's shape — the picker's whole point. */
 function Spark({ points }: { points: number[] }) {
@@ -65,6 +85,8 @@ export function FitWizard({ caretPos, windowId, sendAction, onClose }: Props) {
   const { state } = useSpyDE()
   const [tab, setTab] = React.useState<Tab>('Model')
   const [catalogue, setCatalogue] = React.useState<CatalogueItem[]>([])
+  const [eels, setEels] = React.useState<EelsOffer>(NO_EELS)
+  const [edgeFilter, setEdgeFilter] = React.useState('')
   const [components, setComponents] = React.useState<CompState[]>([])
   const [fitted, setFitted] = React.useState(false)
   const [status, setStatus] = React.useState('Add a component to begin.')
@@ -130,8 +152,15 @@ export function FitWizard({ caretPos, windowId, sendAction, onClose }: Props) {
   })
 
   useWizardEvent('spyde:fit_catalogue', windowId, (detail) => {
-    const d = detail as { components?: CatalogueItem[] }
+    const d = detail as Partial<EelsOffer> & { components?: CatalogueItem[] }
     if (d.components) setCatalogue(d.components)
+    setEels({
+      eels: Boolean(d.eels),
+      exspy: Boolean(d.exspy),
+      edges: d.edges ?? [],
+      microscope_missing: d.microscope_missing ?? [],
+      install_hint: d.install_hint ?? '',
+    })
   })
 
   useWizardEvent('spyde:fit_state', windowId, (detail) => {
@@ -190,6 +219,28 @@ export function FitWizard({ caretPos, windowId, sendAction, onClose }: Props) {
     sendAction('fit_add_component', { kind }, windowId)
     setPickerOpen(false)
   }
+
+  /** An exspy core-loss edge takes its subshell — there is no bare EELSCLEdge. */
+  const addEdge = (subshell: string) => {
+    setStatus(`Adding the ${subshell} edge…`)
+    sendAction('fit_add_component',
+      { kind: 'EELSCLEdge', element_subshell: subshell }, windowId)
+    setPickerOpen(false)
+  }
+
+  // Suggested edges (the elements in the Composition panel) are ALWAYS listed:
+  // "I know there is oxygen here, give me O-K" is the common case, and hunting
+  // for it among the ~130 edges a 600 eV window contains is not. The rest are
+  // shown major-first and capped, until a filter narrows them.
+  const q = edgeFilter.trim().toLowerCase()
+  const suggestedEdges = eels.edges.filter((e) => e.suggested)
+  const otherEdges = eels.edges
+    .filter((e) => !e.suggested)
+    .filter((e) => (q
+      ? e.subshell.toLowerCase().includes(q) || e.element.toLowerCase() === q
+      : e.relevance === 'Major'))
+  const shownEdges = otherEdges.slice(0, EDGE_LIMIT)
+  const edgesBlocked = eels.microscope_missing.length > 0
 
   const setParam = (component: string, parameter: string, value: number) =>
     sendAction('fit_set_param', { component, parameter, value }, windowId)
@@ -322,22 +373,120 @@ export function FitWizard({ caretPos, windowId, sendAction, onClose }: Props) {
                     position: 'absolute', top: 30, left: 0, zIndex: 20,
                     background: '#181825', border: '1px solid #45475a',
                     borderRadius: 6, padding: 5, boxShadow: '0 8px 24px rgba(0,0,0,0.6)',
-                    display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 3,
-                    width: 340,
+                    // The popup hangs BELOW an already-low button row, so its
+                    // height is the caret-overhang budget: taller than this and
+                    // it runs under the status bar. The edge list scrolls
+                    // inside itself rather than growing this box.
+                    width: 340, maxHeight: 300, overflowY: 'auto',
                   }}>
-                  {catalogue.map((c) => (
-                    <button key={c.kind} data-testid={`fit-add-${c.kind}`}
-                      title={c.description} onClick={() => add(c.kind)}
-                      style={{
-                        display: 'flex', alignItems: 'center', gap: 7,
-                        background: '#11111b', border: '1px solid #313244',
-                        borderRadius: 4, padding: '3px 6px', color: '#cdd6f4',
-                        fontSize: 11, cursor: 'pointer', textAlign: 'left',
-                      }}>
-                      <Spark points={c.preview} />
-                      <span style={{ flex: 1 }}>{c.kind}</span>
-                    </button>
-                  ))}
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr',
+                                gap: 3 }}>
+                    {catalogue.map((c) => (
+                      <button key={c.kind} data-testid={`fit-add-${c.kind}`}
+                        title={c.description} onClick={() => add(c.kind)}
+                        style={{
+                          display: 'flex', alignItems: 'center', gap: 7,
+                          background: '#11111b', border: '1px solid #313244',
+                          borderRadius: 4, padding: '3px 6px', color: '#cdd6f4',
+                          fontSize: 11, cursor: 'pointer', textAlign: 'left',
+                        }}>
+                        <Spark points={c.preview} />
+                        <span style={{ flex: 1 }}>{c.kind}</span>
+                      </button>
+                    ))}
+                  </div>
+
+                  {/* ── EELS core-loss edges ──
+                      Only on an EELS signal, because EELSCLEdge is the one
+                      component that is not a bare `Kind()`: it takes a
+                      subshell, so it is one button per edge rather than one
+                      button for the kind. */}
+                  {eels.eels && (
+                    <div data-testid="fit-edge-section"
+                      style={{ marginTop: 6, borderTop: '1px solid #313244',
+                               paddingTop: 5 }}>
+                      <div style={{ display: 'flex', alignItems: 'center',
+                                    gap: 6, marginBottom: 4 }}>
+                        <span style={{ ...S.lbl, fontWeight: 600,
+                                       color: '#cdd6f4' }}>EELS edges</span>
+                        {eels.exspy && (
+                          <input data-testid="fit-edge-filter" value={edgeFilter}
+                            placeholder="filter, e.g. Fe"
+                            onChange={(e) => setEdgeFilter(e.target.value)}
+                            style={{ flex: 1, background: '#11111b',
+                                     border: '1px solid #313244',
+                                     borderRadius: 4, color: '#cdd6f4',
+                                     fontSize: 11, padding: '2px 5px' }} />
+                        )}
+                      </div>
+
+                      {/* exspy is an optional extra, so say which one and how
+                          — an ImportError on a package the user has never
+                          heard of is not actionable. */}
+                      {!eels.exspy && (
+                        <span data-testid="fit-edge-no-exspy"
+                          style={{ ...S.hint, color: '#f5a97f' }}>
+                          EELS edges need exspy — {eels.install_hint}
+                        </span>
+                      )}
+
+                      {/* An edge integrates its cross-section at an effective
+                          angle derived from these, so exspy raises deep inside
+                          model.append without them. Name the fields instead. */}
+                      {eels.exspy && edgesBlocked && (
+                        <span data-testid="fit-edge-no-microscope"
+                          style={{ ...S.hint, color: '#f5a97f' }}>
+                          Set the {eels.microscope_missing.join(', ')} in the
+                          {' '}Metadata panel before adding an edge.
+                        </span>
+                      )}
+
+                      {eels.exspy && !edgesBlocked && eels.edges.length === 0 && (
+                        <span style={S.hint}>
+                          No tabulated edge onsets fall inside this energy range.
+                        </span>
+                      )}
+
+                      {eels.exspy && !edgesBlocked && (
+                        <div data-testid="fit-edge-list"
+                          style={{ display: 'grid',
+                                   gridTemplateColumns: '1fr 1fr', gap: 3,
+                                   maxHeight: 132, overflowY: 'auto' }}>
+                          {[...suggestedEdges, ...shownEdges].map((e) => (
+                            <button key={e.subshell}
+                              data-testid={`fit-add-edge-${e.subshell}`}
+                              title={e.description}
+                              onClick={() => addEdge(e.subshell)}
+                              style={{
+                                display: 'flex', alignItems: 'baseline', gap: 6,
+                                background: '#11111b',
+                                // Composition-seeded edges read as the
+                                // recommendation they are.
+                                border: `1px solid ${e.suggested ? '#89b4fa' : '#313244'}`,
+                                borderRadius: 4, padding: '3px 6px',
+                                color: '#cdd6f4', fontSize: 11,
+                                cursor: 'pointer', textAlign: 'left',
+                              }}>
+                              <span style={{ flex: 1 }}>
+                                {e.element} {e.shell}
+                              </span>
+                              <span style={{ color: '#a6adc8', fontSize: 10 }}>
+                                {e.onset.toFixed(0)} eV
+                              </span>
+                            </button>
+                          ))}
+                        </div>
+                      )}
+
+                      {eels.exspy && !edgesBlocked
+                        && otherEdges.length > shownEdges.length && (
+                        <span style={S.hint}>
+                          {otherEdges.length - shownEdges.length} more — type an
+                          element symbol to narrow the list.
+                        </span>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
             </div>

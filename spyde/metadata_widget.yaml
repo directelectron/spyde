@@ -24,6 +24,16 @@ metadata_widget:
         description: "The convergence angle of the electron beam."
         default: "--"
         units: "mrad"
+    # An EELSCLEdge integrates its cross-section at an effective angle derived
+    # from the acceleration voltage and these two. Without a collection angle
+    # the Fit caret cannot add an edge at all — and it used to be the one of
+    # the three with nowhere in the UI to set it.
+    Coll. Angle:
+        key: "Acquisition_instrument.TEM.Detector.EELS.collection_angle"
+        type: float
+        description: "The EELS spectrometer collection semi-angle."
+        default: "--"
+        units: "mrad"
   Movie / In-Situ:
     FPS:
       key: "Acquisition_instrument.TEM.frames_per_second"

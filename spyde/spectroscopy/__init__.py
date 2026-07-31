@@ -29,7 +29,16 @@ from spyde.spectroscopy.quantify import (
     quantify_result,
 )
 from spyde.spectroscopy.eels_batch import onset_energies, prepare_eels_edges
+from spyde.spectroscopy.edges import (
+    MissingMicroscopeParameters,
+    available_edges,
+    edge_component_spec,
+    is_eels,
+    missing_microscope_parameters,
+)
 
 __all__ = ["model_for_composition", "prune_to_range", "MissingExtra",
            "prepare_eels_edges", "onset_energies",
-           "element_intensity_maps", "quantify", "quantify_result"]
+           "element_intensity_maps", "quantify", "quantify_result",
+           "available_edges", "edge_component_spec", "is_eels",
+           "missing_microscope_parameters", "MissingMicroscopeParameters"]
