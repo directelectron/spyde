@@ -97,13 +97,26 @@ test('one menu open asks the backend for the catalogue exactly once', async () =
   // is what makes this independent of how long backend startup happens to take
   // on a given runner. (Seen in CI as a flat "Expected: 1, Received: 2" whose
   // real cause was startup timing.)
-  let settled = count()
+  // FIRST it must have happened at all. Polling only for "stopped changing"
+  // is satisfied instantly by a count that has not started moving — the
+  // previous version compared the count to itself on its first call and so
+  // returned true before the prefetch had landed, leaving before=0. The open
+  // below then sent one, the prefetch landed inside the settle window, and the
+  // assertion saw 2 for reasons that had nothing to do with re-renders.
+  await expect.poll(count,
+    { timeout: 30_000, message: 'the catalogue was never prefetched' })
+    .toBeGreaterThanOrEqual(1)
+
+  // THEN it must stop moving — comparing each read against the PREVIOUS one,
+  // a real interval apart, rather than against itself.
+  let last = -1
   await expect.poll(async () => {
     const now = count()
-    const stable = now === settled
-    settled = now
+    const stable = now === last
+    last = now
     return stable
-  }, { timeout: 30_000, message: 'the catalogue prefetch never settled' }).toBe(true)
+  }, { timeout: 30_000, intervals: [500], message: 'the catalogue prefetch never settled' })
+    .toBe(true)
 
   const before = count()
   await openExamples()
