@@ -36,6 +36,66 @@ async function openExamples() {
   await expect(page.getByTestId('menu-examples-items')).toBeVisible()
 }
 
+test('the catalogue is prefetched, so the first open is already populated', async () => {
+  const { page, backend } = ctx
+  // MenuBar asks for the catalogue when the BACKEND REPORTS READY, not when the
+  // menu opens, so the groups are already in state before the first click.
+  // Without that prefetch the first open renders the empty "Loading examples…"
+  // placeholder while its own request round-trips (~210 ms on a cold backend —
+  // the first build imports em-database) — or, if the menu is opened before the
+  // Python sidecar is up at all, forever: main/runner.ts's sendAction drops the
+  // action when there is no stdin and nothing ever retries it.
+  //
+  // The backend's own catalogue log is the signal that the prefetch happened; no
+  // menu has been opened at this point in the file, so nothing else could have
+  // asked for it. On the un-prefetched build this wait is what fails.
+  await backend.waitForLog('examples catalogue:', 30_000)
+
+  // A MutationObserver rather than a poll because the placeholder is a one-frame
+  // state — far too short for expect() to catch, but it cannot escape a subtree
+  // observer armed BEFORE the menu opens.
+  await page.evaluate(() => {
+    const w = window as unknown as { _sawLoadingExamples?: boolean }
+    w._sawLoadingExamples = false
+    new MutationObserver(() => {
+      if (document.body.innerText.includes('Loading examples')) {
+        w._sawLoadingExamples = true
+      }
+    }).observe(document.body, { childList: true, subtree: true, characterData: true })
+  })
+
+  await openExamples()
+  await expect(page.getByTestId('examples-tech-4d-stem'))
+    .toBeVisible({ timeout: 30_000 })
+
+  const sawPlaceholder = await page.evaluate(
+    () => (window as unknown as { _sawLoadingExamples?: boolean })._sawLoadingExamples)
+  expect(sawPlaceholder,
+    'the menu rendered its empty "Loading examples…" state — the catalogue ' +
+    'was not prefetched on backend-ready').toBe(false)
+  await page.screenshot({ path: `${SHOTS}/00-first-open-populated.png` })
+  ctx.assertNoJsErrors()
+})
+
+test('one menu open asks the backend for the catalogue exactly once', async () => {
+  // `sendAction` is a new closure on every provider render, so listing it in the
+  // effect's dep array re-fired the request on every unrelated context update —
+  // measured at a dozen sends in ~40 ms for a single open, each spawning a
+  // shape-warming thread in the backend. The log line is per SEND, so counting it
+  // across one open is the regression test.
+  const { backend } = ctx
+  const count = () => backend.logBuffer.filter(
+    (l: string) => l.includes('examples catalogue:')).length
+  const before = count()
+  await openExamples()
+  await expect(ctx.page.getByTestId('examples-tech-4d-stem')).toBeVisible()
+  // A short settle so any render-triggered re-fires would have landed.
+  await ctx.page.waitForTimeout(1000)
+  expect(count() - before,
+    'the Examples menu re-requested its catalogue on unrelated re-renders').toBe(1)
+  ctx.assertNoJsErrors()
+})
+
 test('Examples groups the datasets into technique submenus', async () => {
   const { page } = ctx
   await openExamples()
