@@ -86,6 +86,25 @@ test('one menu open asks the backend for the catalogue exactly once', async () =
   const { backend } = ctx
   const count = () => backend.logBuffer.filter(
     (l: string) => l.includes('examples catalogue:')).length
+
+  // SETTLE FIRST. Two things send `example_catalogue`: MenuBar's startup
+  // prefetch (once, when the backend reports ready) and each menu open. This
+  // test is about the OPEN, so the prefetch has to be fully landed before the
+  // snapshot — otherwise its log line arrives inside the window below and the
+  // assertion sees 2 for reasons that have nothing to do with re-renders.
+  //
+  // Waiting on the count to stop moving, rather than sleeping a fixed amount,
+  // is what makes this independent of how long backend startup happens to take
+  // on a given runner. (Seen in CI as a flat "Expected: 1, Received: 2" whose
+  // real cause was startup timing.)
+  let settled = count()
+  await expect.poll(async () => {
+    const now = count()
+    const stable = now === settled
+    settled = now
+    return stable
+  }, { timeout: 30_000, message: 'the catalogue prefetch never settled' }).toBe(true)
+
   const before = count()
   await openExamples()
   await expect(ctx.page.getByTestId('examples-tech-4d-stem')).toBeVisible()
