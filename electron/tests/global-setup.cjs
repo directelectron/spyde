@@ -4,11 +4,13 @@
  * Two things bite only on a machine that has never RUN SpyDE, i.e. every CI
  * runner, and neither is visible on a dev box:
  *
- *  1. `tutorial_seen` is unset, so FirstRunGate auto-opens the welcome tour and
- *     its full-screen `tour-overlay` swallows pointer events. A hover or click
- *     on a titlebar then fails with "<div> from <div data-testid=tour-overlay>
- *     subtree intercepts pointer events" — which is how action_scoping and
- *     center_zero_beam failed on CI while passing locally.
+ *  1. `tutorial_seen` is unset, so FirstRunGate auto-opens the welcome tour —
+ *     which loads a tutorial dataset and floats a callout bubble over the UI a
+ *     spec is trying to drive. (It no longer swallows every pointer event: the
+ *     overlay is `pointerEvents:none` apart from the bubble, see Tour.tsx. But
+ *     the bubble is still a real hit-target, and the auto-loaded dataset still
+ *     adds subwindows.) This is how action_scoping and center_zero_beam failed
+ *     on CI while passing locally.
  *
  *  2. `shell.openPath` shells out to xdg-open, which has no file manager to
  *     reach and leaves the app unable to exit (examples_menu's afterAll timed

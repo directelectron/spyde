@@ -121,6 +121,40 @@ export function DocsApp() {
               )}
             </section>
           ))}
+
+          {/* "More information" — the same `guide.info` the in-app tour shows as
+              its final step and Help → <technique> → Info… shows in a dialog.
+              One source, three renderings. */}
+          {guide.info && (
+            <section data-testid="docs-more-info" style={styles.step}>
+              <div style={styles.stepHead}>
+                <h2 style={styles.h2}>More information</h2>
+              </div>
+              <div style={styles.stepBody}>
+                <Markdown
+                  text={guide.info.blurb}
+                  styles={{ paragraph: styles.p, callout: styles.callout }}
+                />
+              </div>
+              {guide.info.links.length > 0 && (
+                <div style={styles.links}>
+                  <div style={styles.linksLabel}>Further reading</div>
+                  {guide.info.links.map((l) => (
+                    <a
+                      key={l.url}
+                      href={l.url}
+                      target="_blank"
+                      rel="noreferrer noopener"
+                      style={styles.linkCard}
+                    >
+                      <span style={styles.linkLabel}>{l.label} ↗</span>
+                      {l.note && <span style={styles.linkNote}>{l.note}</span>}
+                    </a>
+                  ))}
+                </div>
+              )}
+            </section>
+          )}
         </article>
       </main>
     </div>
@@ -199,4 +233,16 @@ const styles: Record<string, React.CSSProperties> = {
     display: 'block', width: '100%', height: 520, border: 'none',
     background: '#1e1e2e',
   },
+  links: { marginTop: 18, display: 'flex', flexDirection: 'column', gap: 8 },
+  linksLabel: {
+    fontSize: 11, fontWeight: 700, letterSpacing: 0.7, color: '#6c7086',
+    textTransform: 'uppercase', marginBottom: 2,
+  },
+  linkCard: {
+    display: 'block', textDecoration: 'none',
+    background: 'rgba(137,180,250,0.08)', border: '1px solid #313244',
+    borderRadius: 8, padding: '10px 12px',
+  },
+  linkLabel: { display: 'block', fontSize: 14, color: ACCENT, fontWeight: 500 },
+  linkNote: { display: 'block', fontSize: 12.5, color: '#7f849c', marginTop: 3, lineHeight: 1.45 },
 }

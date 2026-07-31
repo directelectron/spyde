@@ -309,6 +309,25 @@ class Session(
         )
         self.signal_trees.append(tree)
 
+        # Guided-walkthrough bookkeeping. Between `tutorial_session_begin` and
+        # `tutorial_close_all` (sent by the in-app Tour on open/exit), record
+        # every tree the walkthrough causes to appear — the tutorial dataset
+        # itself AND everything derived from it during the tour (a find-vectors
+        # result, a virtual image, an orientation map: they all land here, since
+        # `commit_result_tree`/`vector_virtual_imaging` create their trees
+        # through this same method). `tutorial_close_all` then closes the whole
+        # set, so a finished tour leaves a clean workspace rather than a pile of
+        # dummy-data windows.
+        #
+        # A tree backed by a real FILE ON DISK is the user's own data and is
+        # never recorded — opening your own dataset mid-tour is safe.
+        if getattr(self, "_tutorial_session_active", False):
+            on_disk = bool(source_path) and os.path.exists(source_path)
+            if not on_disk:
+                if getattr(self, "_tutorial_session_trees", None) is None:
+                    self._tutorial_session_trees = []
+                self._tutorial_session_trees.append(tree)
+
         # Open the MDI windows for this tree
         tree.open()
 

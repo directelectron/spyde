@@ -106,12 +106,14 @@ test.describe('first-run welcome walkthrough', () => {
 
   test('a default harness launch never auto-opens the tour', async () => {
     // Every OTHER spec launches without its own SPYDE_SETTINGS_DIR, and none of
-    // them wants the welcome tour: its full-screen overlay swallows pointer
-    // events, so a titlebar hover fails with "<div> from <div
-    // data-testid=tour-overlay> subtree intercepts pointer events". That is
-    // exactly how action_scoping.spec.ts failed on CI while passing on every
-    // dev box — a machine that has actually RUN SpyDE has tutorial_seen
-    // persisted in the real ~/.spyde, and a fresh runner does not.
+    // them wants the welcome tour: it auto-loads a tutorial dataset and floats
+    // a callout bubble over the UI they are driving. (The overlay itself is now
+    // `pointerEvents:none` — see Tour.tsx — so the old "<div> from <div
+    // data-testid=tour-overlay> subtree intercepts pointer events" failure is
+    // gone, but the bubble is still a hit-target.) That is exactly how
+    // action_scoping.spec.ts failed on CI while passing on every dev box — a
+    // machine that has actually RUN SpyDE has tutorial_seen persisted in the
+    // real ~/.spyde, and a fresh runner does not.
     //
     // launchApp now always points SPYDE_SETTINGS_DIR at a scratch dir seeded
     // with tutorial_seen, so the outcome no longer depends on whose machine it

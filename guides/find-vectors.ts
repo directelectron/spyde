@@ -17,6 +17,44 @@ export const findVectorsGuide: Guide = {
     action: 'backend', backend: 'tutorial_load', payload: { name: 'find_vectors' },
     waitFor: { subwindows: 2 }, timeoutMs: 60_000, settleMs: 1000,
   },
+  info: {
+    blurb:
+      'Peak (Bragg-disk) finding turns each diffraction pattern into a short ' +
+      'list of **diffraction vectors** — a position in reciprocal space plus an ' +
+      'intensity — instead of a dense image. Across a scan that is a ragged, ' +
+      'sparse representation of the whole 4D dataset, typically a few hundred ' +
+      'times smaller, and it is the input every downstream vector method needs: ' +
+      'virtual dark-field imaging, strain from disk positions, and ' +
+      'vector-based orientation mapping.\n\n' +
+      'The two knobs that matter are the pre-detection blur **σ** (suppresses ' +
+      'shot noise; too large and neighbouring disks merge) and the ' +
+      '**threshold** (minimum peak strength). Tune them on the live preview of ' +
+      'a single pattern before committing to the full scan.\n\n' +
+      '> 💡 SpyDE runs the peak finding from **pyxem**; the pages below are ' +
+      'pyxem’s own worked examples of the same operations in a notebook.',
+    links: [
+      {
+        label: 'pyxem — Finding diffraction vectors',
+        url: 'https://pyxem.org/v0.21.0/examples/processing/vector_finding.html',
+        note: 'Template-matching peak finding and subpixel refinement, with the vectors plotted as markers.',
+      },
+      {
+        label: 'pyxem — Template matching',
+        url: 'https://pyxem.org/v0.21.0/examples/processing/template_matching.html',
+        note: 'Window-normalised cross-correlation: how template size and shape change what is detected.',
+      },
+      {
+        label: 'pyxem — Data processing gallery',
+        url: 'https://pyxem.org/v0.21.0/examples/processing/index.html',
+        note: 'The wider gallery: centring the zero beam, circular Hough transform, filtering.',
+      },
+      {
+        label: 'pyxem — Working with diffraction vectors',
+        url: 'https://pyxem.org/v0.21.0/examples/vectors/index.html',
+        note: 'What to do next with a vector set: clustering, unique vectors, sub-pixel positions.',
+      },
+    ],
+  },
   steps: [
     {
       anchor: null,
@@ -112,9 +150,9 @@ export const findVectorsGuide: Guide = {
         'When the status bar reports completion, the diffraction vectors are ' +
         'ready. From here you can run **Vector Virtual Imaging** or **Vector ' +
         'Orientation Mapping** on them.\n\n' +
-        '> 💡 The demo below is the real vector explorer, running in your ' +
-        'browser: drag the crosshair across the scan to see each grain’s ' +
-        'diffraction pattern, integrate a region, or virtual-image a spot.',
+        '> 💡 Drag the crosshair across the scan to see each grain’s ' +
+        'diffraction pattern with its detected peaks, integrate a region, or ' +
+        'virtual-image a single spot.',
       placement: 'top',
       image: 'find-vectors-done.png',
       // Interactive web embed: the self-contained vectors explorer (navigate +

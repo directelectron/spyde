@@ -18,6 +18,44 @@ export const virtualImagingGuide: Guide = {
     action: 'backend', backend: 'tutorial_load', payload: { name: 'navigation' },
     waitFor: { subwindows: 2 }, timeoutMs: 60_000, settleMs: 1000,
   },
+  info: {
+    blurb:
+      'A **virtual image** is formed after the fact, in software, from a 4D-STEM ' +
+      'dataset: you choose a region of the diffraction pattern (a virtual ' +
+      'detector) and integrate the intensity inside it at every scan position. ' +
+      'Because the choice is made after acquisition, one dataset yields as many ' +
+      'images as you want — a small disk on the direct beam gives virtual ' +
+      'bright field, an annulus gives virtual annular dark field, and a disk on ' +
+      'one Bragg reflection gives a **virtual dark-field** image showing only ' +
+      'the grains that satisfy that reflection.\n\n' +
+      'The detector shape is the experiment. Moving it across the pattern and ' +
+      'watching the real-space image change is usually more informative than ' +
+      'any single fixed choice, which is why SpyDE recomputes it live as you ' +
+      'drag.\n\n' +
+      '> 💡 The same operation in a notebook, with pyxem, is linked below.',
+    links: [
+      {
+        label: 'pyxem — Interactive virtual images',
+        url: 'https://pyxem.org/v0.21.0/examples/virtual_imaging/interactive_virtual_images.html',
+        note: 'A draggable ROI over the pattern with a live-updating virtual image — the closest analogue to this tour.',
+      },
+      {
+        label: 'pyxem — Virtual images from diffraction vectors',
+        url: 'https://pyxem.org/v0.21.0/examples/virtual_imaging/creating_virtual_images_from_vectors.html',
+        note: 'Turn a set of unique vectors into one virtual dark-field image per reflection.',
+      },
+      {
+        label: 'pyxem — Virtual imaging gallery',
+        url: 'https://pyxem.org/v0.21.0/examples/virtual_imaging/index.html',
+        note: 'All four pyxem virtual-imaging examples, including integration over non-rectangular detectors.',
+      },
+      {
+        label: 'HyperSpy — Data visualisation',
+        url: 'https://hyperspy.org/hyperspy-doc/current/user_guide/visualisation.html',
+        note: 'How the navigator/signal pairing and region-of-interest widgets work in the library underneath.',
+      },
+    ],
+  },
   steps: [
     {
       anchor: null,

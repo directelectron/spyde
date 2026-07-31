@@ -25,10 +25,15 @@ const { tmpdir } = require('os')
  *
  * On a machine that has never RUN SpyDE — i.e. every CI runner — settings.json
  * is absent, `tutorial_seen` is unset, and FirstRunGate auto-opens the welcome
- * tour. Its full-screen `tour-overlay` then swallows pointer events, so a spec
- * that hovers a titlebar fails with "<div> from <div data-testid=tour-overlay>
- * subtree intercepts pointer events" — while passing on any dev box, because
- * there the real ~/.spyde has tutorial_seen persisted from actual use.
+ * tour, while on any dev box the real ~/.spyde has tutorial_seen persisted from
+ * actual use. That difference alone made specs pass locally and fail on CI.
+ *
+ * The tour overlay no longer SWALLOWS pointer events (it is `pointerEvents:
+ * none` everywhere except its callout bubble — see Tour.tsx), so the old
+ * "<div> from <div data-testid=tour-overlay> subtree intercepts pointer events"
+ * failure is gone. The isolation still matters: the bubble itself is a real
+ * interactive region and can sit over whatever a spec wants to click, and an
+ * auto-loaded tutorial dataset would add subwindows nobody asked for.
  *
  * SPYDE_SETTINGS_DIR redirects only settings.json, never Electron's own
  * profile (Chromium refuses to launch without a real one — see the note in

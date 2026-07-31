@@ -206,6 +206,12 @@ class TestTutorialLoadDispatch:
         session.dispatch_action({"action": "tutorial_close_all", "payload": {}})
         assert len(session.signal_trees) == keep
 
+    def test_session_begin_is_not_test_gated(self):
+        """The in-app Tour sends `tutorial_session_begin` on open in EVERY
+        build, so it must not be swept up by the packaged-build test gate."""
+        from spyde.backend._session_actions import _TEST_ACTIONS
+        assert "tutorial_session_begin" not in _TEST_ACTIONS
+
     def test_tutorial_load_not_in_test_actions_gate(self):
         """The un-gate is the whole point of Phase 1: tutorial_load must not
         be listed among the packaged-build-disabled test actions."""
@@ -234,3 +240,87 @@ class TestTutorialLoadDispatch:
         n_trees_before = len(session.signal_trees)
         session.dispatch_action({"action": "load_test_data", "payload": {}})
         assert len(session.signal_trees) == n_trees_before
+
+
+class TestTutorialSessionTeardown:
+    """A guided walkthrough must be SELF-CONTAINED at both ends: it brings its
+    own example dataset, and on exit it takes away everything it put on screen
+    — including the RESULT windows the walkthrough created along the way (a
+    find-vectors result tree, a virtual image, an orientation map). Before this,
+    `tutorial_close_all` closed only the tutorial dataset itself and every
+    derived window was left behind.
+
+    The lifecycle is: the Tour sends `tutorial_session_begin` on open, and
+    `Session._add_signal` records every non-file-backed tree created while the
+    session is active; `tutorial_close_all` closes the lot.
+    """
+
+    def _derived(self, session):
+        """Stand in for what an action does mid-tour: create a new tree from a
+        result signal, via the same `_add_signal` every result path uses."""
+        import hyperspy.api as hs
+        import numpy as np
+        sig = hs.signals.Signal2D(np.arange(4 * 5 * 6, dtype=float).reshape(4, 5, 6))
+        return session._add_signal(sig)
+
+    def test_derived_result_windows_are_closed_too(self, window):
+        session = window["window"]
+        keep = len(session.signal_trees)
+        session.dispatch_action({"action": "tutorial_session_begin", "payload": {}})
+        session.dispatch_action(
+            {"action": "tutorial_load", "payload": {"name": "navigation"}})
+        _settle()
+        # …and now the walkthrough runs an analysis, which opens a result tree.
+        derived = self._derived(session)
+        _settle()
+        assert len(session.signal_trees) == keep + 2
+        assert derived in session.signal_trees
+
+        session.dispatch_action({"action": "tutorial_close_all", "payload": {}})
+        _settle()
+        # BOTH the tutorial dataset and the derived result are gone.
+        assert derived not in session.signal_trees
+        assert len(session.signal_trees) == keep
+
+    def test_only_active_session_records(self, window):
+        """Outside a session (`tutorial_session_begin` never sent, or already
+        torn down) a new tree is NOT recorded — so a later tour's teardown
+        can't reach back and close a window the user made on their own."""
+        session = window["window"]
+        before = self._derived(session)
+        _settle()
+        n = len(session.signal_trees)
+        session.dispatch_action({"action": "tutorial_close_all", "payload": {}})
+        _settle()
+        assert before in session.signal_trees
+        assert len(session.signal_trees) == n
+
+    def test_user_file_backed_tree_is_never_closed(self, window, tmp_path):
+        """Opening your OWN dataset mid-tour is safe: a tree backed by a real
+        file on disk is never recorded for teardown."""
+        import hyperspy.api as hs
+        import numpy as np
+        path = tmp_path / "mine.hspy"
+        hs.signals.Signal2D(np.zeros((3, 4, 5))).save(str(path))
+        session = window["window"]
+        session.dispatch_action({"action": "tutorial_session_begin", "payload": {}})
+        session.dispatch_action(
+            {"action": "tutorial_load", "payload": {"name": "navigation"}})
+        _settle()
+        mine = session._add_signal(hs.load(str(path)), source_path=str(path))
+        _settle()
+        session.dispatch_action({"action": "tutorial_close_all", "payload": {}})
+        _settle()
+        assert mine in session.signal_trees
+
+    def test_close_all_ends_the_session(self, window):
+        """After teardown the session is INACTIVE — a tree created later is not
+        recorded, so a second `tutorial_close_all` cannot close it."""
+        session = window["window"]
+        session.dispatch_action({"action": "tutorial_session_begin", "payload": {}})
+        session.dispatch_action({"action": "tutorial_close_all", "payload": {}})
+        after = self._derived(session)
+        _settle()
+        session.dispatch_action({"action": "tutorial_close_all", "payload": {}})
+        _settle()
+        assert after in session.signal_trees

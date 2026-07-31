@@ -25,6 +25,41 @@ export const strainGuide: Guide = {
     action: 'backend', backend: 'tutorial_load', payload: { name: 'strain' },
     waitFor: { subwindows: 2 }, timeoutMs: 60_000, settleMs: 1000,
   },
+  info: {
+    blurb:
+      'Strain mapping in 4D-STEM reads lattice distortion straight off the ' +
+      'diffraction pattern. Reciprocal-space disk positions are the inverse of ' +
+      'the real-space lattice, so a lattice that is stretched by a few tenths ' +
+      'of a percent moves its Bragg disks by a correspondingly small amount. ' +
+      'Fitting the shift of every disk in a pattern against an **unstrained ' +
+      'reference region** of the same scan gives a 2×2 displacement-gradient ' +
+      'tensor per position, decomposed into the strain components **εxx, εyy, ' +
+      'εxy** and a rigid **rotation ω**.\n\n' +
+      'It is a relative measurement: the numbers are only as good as the ' +
+      'reference. Pick a region that really is unstrained and single-crystal, ' +
+      'and remember that everything is measured with respect to it. Accuracy ' +
+      'also depends on sub-pixel disk positions, which is why strain runs on a ' +
+      'refined **diffraction-vector** set rather than the raw patterns.\n\n' +
+      '> 💡 Run the Find Vectors tour first — strain mapping only appears on a ' +
+      'vectors result window.',
+    links: [
+      {
+        label: 'pyxem — Strain mapping',
+        url: 'https://pyxem.org/v0.21.0/examples/strain_mapping/strain_mapping.html',
+        note: 'The full notebook workflow: find peaks, filter vectors, fit a DisplacementGradientMap, plot the components.',
+      },
+      {
+        label: 'pyxem — Finding diffraction vectors',
+        url: 'https://pyxem.org/v0.21.0/examples/processing/vector_finding.html',
+        note: 'The prerequisite step, including the sub-pixel refinement that sets the strain precision.',
+      },
+      {
+        label: 'pyxem — Data processing gallery',
+        url: 'https://pyxem.org/v0.21.0/examples/processing/index.html',
+        note: 'Centring the zero beam and other corrections worth applying before a strain fit.',
+      },
+    ],
+  },
   steps: [
     {
       anchor: null,

@@ -16,6 +16,34 @@
 /** Where the callout bubble sits relative to its anchored element. */
 export type Placement = 'top' | 'bottom' | 'left' | 'right' | 'center'
 
+/** One piece of further reading for a technique (an EXTERNAL docs page). */
+export interface GuideLink {
+  /** Link text, e.g. "pyxem — Diffraction vector examples". */
+  label: string
+  /** Absolute https URL. Opened in the user's browser, never in-app. */
+  url: string
+  /** One line on what the reader will find there. */
+  note?: string
+}
+
+/**
+ * The "Info" half of a technique — the BACKGROUND, as opposed to the click-by-
+ * click `steps`. Rendered in three places, all from this one source:
+ *   • Help → <technique> → Info…  (an in-app dialog),
+ *   • the LAST step of the in-app tour ("More info"),
+ *   • the "More information" section of the technique's docs page.
+ *
+ * `links` point at the upstream projects that actually own the science
+ * (pyxem / HyperSpy / eXSpy / kikuchipy / orix). We link and attribute rather
+ * than copying their prose.
+ */
+export interface GuideInfo {
+  /** Markdown: what the technique IS and when to reach for it (2-4 sentences). */
+  blurb: string
+  /** Curated further reading. */
+  links: GuideLink[]
+}
+
 /**
  * How a guide step is REACHED when generating screenshots automatically (the
  * `guide_screenshots.spec.ts` Playwright run walks these). A guide with `drive`
@@ -118,6 +146,13 @@ export interface Guide {
   summary: string
   /** Ordered steps. */
   steps: GuideStep[]
+  /**
+   * Background + further reading for the technique. The in-app tour appends it
+   * as a final "More info" step, Help → <technique> → Info… shows it on its
+   * own, and the docs page ends with it. Omit only for a guide that teaches the
+   * APP rather than a technique.
+   */
+  info?: GuideInfo
   /**
    * In-app opt-in: a drive the coachmark Tour runs automatically ON OPEN, before
    * showing step 1 — typically `{action:'backend', backend:'tutorial_load',
