@@ -1927,7 +1927,13 @@ def _resolve_source_plot(session, source_window_id):
         source_window_id = getattr(session, "_active_window_id", None)
     if source_window_id is None:
         return None
-    return session._plot_by_window_id(int(source_window_id))
+    plot = session._plot_by_window_id(int(source_window_id))
+    if plot is not None:
+        return plot
+    # A controller-backed BARE figure window (the IPF explorer) has no Plot of
+    # its own; it stands in for the map window it belongs to.
+    ctrl = session.controller_by_window_id(int(source_window_id))
+    return getattr(ctrl, "source_plot", None) if ctrl is not None else None
 
 
 # ── handlers ───────────────────────────────────────────────────────────────────
@@ -2915,7 +2921,17 @@ def report_add_figure(session, plot, payload) -> None:
     # the viewer-vs-image prompt is skipped for it.
     _tgt = mgr.doc.cell_by_id(payload.get("at_cell")) if payload.get("at_cell") else None
     _target_is_split = _tgt is not None and _tgt.cell_type == "split"
-    if str(payload.get("view", "") or "") == "3d":
+    _view = str(payload.get("view", "") or "")
+    if _view in ("ipf2d", "density", "density3d"):
+        # The other three IPF EXPLORER views are native anyplotlib figures with
+        # no backing Plot array, and the report's snapshot paths capture a Plot
+        # (static) or the scene3d point cloud. Say so plainly rather than
+        # silently capturing the wrong thing (the map window's image, or a
+        # points sphere where the user dragged a density one).
+        ipc.emit_error("report_add_figure: only the 3-D Points IPF view can be "
+                       "captured into a report — switch to [3D] · [Points].")
+        return
+    if _view == "3d":
         snap = _snapshot_scene3d(session, src)
         if snap is None:
             ipc.emit_error("report_add_figure: source window has no 3-D "

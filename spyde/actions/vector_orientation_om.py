@@ -237,7 +237,7 @@ def _build_ipf_heatmap(session, src, result, title="Orientation (IPF-Z, live)"):
 
     def _attach(tree):
         from spyde.actions.ipf_view import attach_ipf_3d, attach_ipf_point_selector
-        attach_ipf_3d(tree, result, "z")
+        attach_ipf_3d(tree, result, "z", session=session)
         attach_ipf_point_selector(tree, result, "z")
 
     return commit_result_tree(

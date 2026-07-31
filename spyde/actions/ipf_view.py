@@ -77,19 +77,29 @@ def ipf_scene_data(result, direction: str = "z"):
 
 def scatter_ipf_sphere(ax, xyz: np.ndarray, rgb: np.ndarray, *,
                        point_size: float = IPF3D_POINT_SIZE,
-                       bounds=IPF3D_BOUNDS, zoom: float = IPF3D_ZOOM):
+                       bounds=IPF3D_BOUNDS, zoom: float = IPF3D_ZOOM,
+                       azimuth: float | None = None,
+                       elevation: float | None = None):
     """Draw the IPF unit-sphere scatter onto *ax* → the live ``Plot3D``. The one
     ``scatter3d`` call both the live explorer and the report scene3d panel make
     (crystal-axis labels, fixed unit bounds, GPU instanced points, reference
-    sphere)."""
+    sphere).
+
+    ``azimuth``/``elevation`` aim the opening camera; omit them for
+    ``scatter3d``'s default (-60°, 30°)."""
     colors = np.clip(np.asarray(rgb).astype(np.float32) / 255.0, 0.0, 1.0)
     xyz = np.asarray(xyz)
+    aim = {}
+    if azimuth is not None:
+        aim["azimuth"] = float(azimuth)
+    if elevation is not None:
+        aim["elevation"] = float(elevation)
     p3d = ax.scatter3d(
         xyz[:, 0], xyz[:, 1], xyz[:, 2],
         colors=colors, point_size=float(point_size),
         x_label="[100]", y_label="[010]", z_label="[001]",
         bounds=tuple(tuple(b) for b in bounds), zoom=float(zoom),
-        gpu=True,
+        gpu=True, **aim,
     )
     try:
         p3d.set_sphere(1.0)
@@ -106,9 +116,12 @@ def build_ipf_3d_figure(xyz: np.ndarray, rgb: np.ndarray, highlight=None):
     import anyplotlib._electron as _electron
     from spyde.drawing.plots.plot import finalize_figure_html
 
+    from spyde.actions.ipf_window import _aim_at
+
     fig, axes = apl.subplots(1, 1)
     ax = axes[0][0] if isinstance(axes, list) else axes
-    p3d = scatter_ipf_sphere(ax, xyz, rgb)
+    az, el = _aim_at(xyz)          # open looking AT the cloud, not past it
+    p3d = scatter_ipf_sphere(ax, xyz, rgb, azimuth=az, elevation=el)
     if highlight is not None:
         try:
             p3d.set_highlight(float(highlight[0]), float(highlight[1]),
@@ -264,15 +277,87 @@ def emit_ipf_key(window_id: int, result, direction: str = "z") -> bool:
     return True
 
 
-def attach_ipf_3d(tree, result, direction: str = "z") -> bool:
-    """Add the 3-D IPF view + the colour-key triangle legend to *tree*'s IPF
-    window (its first signal plot)."""
+#: The map window's three projection chips, in canonical order.
+PROJECTION_LABELS = ("IPF-X", "IPF-Y", "IPF-Z")
+
+
+def attach_ipf_projections(tree, result, direction: str = "z") -> bool:
+    """**Window 1** — turn *tree*'s orientation-map window into the X / Y / Z
+    PROJECTION window.
+
+    The map plot itself is tagged as one chip (the *direction* it is painted
+    with) and the other two sample directions are emitted as sibling
+    ``view_label`` figures, so the window gets the app's ordinary chip strip:
+    click a chip to show one projection, ⌘-click to tile them side by side with
+    linked crosshairs (:mod:`spyde.actions.views`).
+
+    Appends to any views the caller already registered (EBSD's NCC / Similarity
+    / ADP quality maps) rather than replacing them.
+    """
+    from spyde.actions.views import emit_view_figure, register_views
+
+    sp = next(iter(getattr(tree, "signal_plots", []) or []), None)
+    wid = getattr(sp, "window_id", None)
+    if wid is None:
+        return False
+    om = _as_orientation_map(result)
+    d = str(direction).lower()
+    try:
+        maps = [(lbl, om.ipf_color_map(lbl[-1].lower())) for lbl in PROJECTION_LABELS]
+    except Exception as e:
+        log.debug("building IPF projection maps failed: %s", e)
+        return False
+    own = f"IPF-{d.upper()}"
+
+    def _pick(iy, ix):
+        """Resolved LAZILY: attach_ipf_point_selector (which owns the pick
+        function) runs after this, so binding it now would capture None."""
+        fn = getattr(tree, "_ipf_pick_fn", None)
+        if fn is not None:
+            fn(int(iy), int(ix))
+
+    register_views(wid, maps, cmap="gray", levels=None, append=True,
+                   pick_hook=_pick)
+    # Emit the OTHER two first: `set_view_tag` re-emits the live map plot, and
+    # the frontend's figure reducer moves a replaced figure to the end — so
+    # tagging last is what puts the chips in X, Y, Z order.
+    for lbl, m in maps:
+        if lbl == own:
+            continue                               # already on screen as the plot
+        emit_view_figure(wid, m, lbl, kind="2d", pick_hook=_pick)
+    try:
+        sp.set_view_tag(own, "2d")                 # the painted map IS one chip
+    except Exception as e:
+        log.debug("tagging the IPF map view failed: %s", e)
+    return True
+
+
+def attach_ipf_3d(tree, result, direction: str = "z", session=None) -> bool:
+    """Attach the IPF views for an orientation result.
+
+    With a *session* this opens the TWO-window layout: the colour-key legend and
+    the X/Y/Z projection chips stay on the map window (window 1), and the
+    inverse pole figure itself moves to its own explorer window (window 2 —
+    :func:`spyde.actions.ipf_window.open_ipf_window`, the ``[2D|3D]`` ×
+    ``[Points|Heatmap]`` toggles).
+
+    Without one (older callers, unit tests) it falls back to the historical
+    single-window behaviour: 3-D sphere + density heatmap emitted onto the map
+    window as extra ``view`` figures.
+    """
     sp = next(iter(getattr(tree, "signal_plots", []) or []), None)
     wid = getattr(sp, "window_id", None)
     if wid is None:
         return False
     tree._ipf_result = result          # remember it for X/Y/Z re-colouring
+    tree._ipf_direction = str(direction).lower()
     emit_ipf_key(wid, result, direction)
+
+    if session is not None:
+        from spyde.actions.ipf_window import open_ipf_window
+        attach_ipf_projections(tree, result, direction)
+        return open_ipf_window(session, tree, result, direction) is not None
+
     ok = emit_ipf_3d(wid, result, direction, tree=tree)
     try:                               # native IPDF density heatmap (3rd toggle)
         from spyde.actions.ipf_density import emit_ipf_density
@@ -285,8 +370,13 @@ def attach_ipf_3d(tree, result, direction: str = "z") -> bool:
 
 def attach_ipf_point_selector(tree, result, direction: str = "z") -> None:
     """Add a white crosshair POINT SELECTOR to the IPF map's first plot. Picking a
-    pixel re-emits the 3-D IPF sphere with that orientation marked — the "pick on
-    the map, see it on the IPF legend" interaction."""
+    pixel shows that position's orientation on the IPF explorer window — marked
+    on all four views, with the spheres rotated to face it.
+
+    The pick FUNCTION is published as ``tree._ipf_pick_fn`` so the sibling
+    projection views (IPF-X / IPF-Y and the ⌘-tiled comparison, wired by
+    :func:`attach_ipf_projections`) drive the exact same interaction — the
+    crosshair has to keep working whichever projection chip is showing."""
     sp = next(iter(getattr(tree, "signal_plots", []) or []), None)
     plot2d = getattr(sp, "_plot2d", None) if sp is not None else None
     wid = getattr(sp, "window_id", None)
@@ -304,16 +394,17 @@ def attach_ipf_point_selector(tree, result, direction: str = "z") -> None:
     tree._ipf_picker = widget
     tree._ipf_result = result
 
-    def _on_pick(event=None):
-        try:
-            ix = int(round(float(widget.cx)))
-            iy = int(round(float(widget.cy)))
-        except Exception:
-            return
+    def _pick(iy, ix):
         if not (0 <= iy < ny and 0 <= ix < nx):
             return
         res = getattr(tree, "_ipf_result", result)
         d = getattr(tree, "_ipf_direction", direction)
+        # Two-window layout: the IPF explorer window owns every view, and it
+        # both marks the orientation AND rotates its spheres to face it.
+        ctrl = getattr(tree, "_ipf_window", None)
+        if ctrl is not None and not getattr(ctrl, "_closed", False):
+            if ctrl.show_orientation(iy, ix):
+                return
         p3d = getattr(tree, "_ipf_p3d", None)
         if p3d is not None:
             # Camera-preserving: move the highlight on the existing 3-D figure in
@@ -327,6 +418,14 @@ def attach_ipf_point_selector(tree, result, direction: str = "z") -> None:
                 log.debug("in-place IPF highlight failed, rebuilding: %s", e)
         emit_ipf_3d(wid, res, d, (iy, ix), tree=tree)   # fallback: rebuild
 
+    tree._ipf_pick_fn = _pick          # the sibling projection views call this
+
+    def _on_pick(event=None):
+        try:
+            _pick(int(round(float(widget.cy))), int(round(float(widget.cx))))
+        except Exception as e:
+            log.debug("IPF pick from the map crosshair failed: %s", e)
+
     try:
         widget.add_event_handler(_on_pick, "pointer_up")
     except Exception as e:
@@ -334,15 +433,28 @@ def attach_ipf_point_selector(tree, result, direction: str = "z") -> None:
 
 
 def ipf_set_direction(session, plot, payload) -> None:
-    """Re-colour an IPF window's 2-D map AND its 3-D explorer by sample direction
-    x | y | z (the IPF axis selector). The orientation result is cached on the
-    tree by ``attach_ipf_3d``; works for raw-OM (`orientation_map`) and vector-OM
-    (`vector_orientation`)."""
+    """Re-colour an IPF window's views by sample direction x | y | z (the IPF
+    axis selector). The orientation result is cached on the tree by
+    ``attach_ipf_3d``; works for raw-OM (`orientation_map`) and vector-OM
+    (`vector_orientation`).
+
+    The X/Y/Z buttons live on the IPF EXPLORER window (window 2), which is a
+    BARE figure window — dispatch resolves ``plot=None`` there, so fall back to
+    the window controller the dispatcher's injected ``window_id`` points at.
+    """
     direction = str(payload.get("direction", "z")).lower()
     if direction not in ("x", "y", "z"):
         return
     tree = getattr(plot, "signal_tree", None)
     if tree is None:
+        ctrl = None
+        if session is not None:
+            try:
+                ctrl = session.controller_by_window_id(payload.get("window_id"))
+            except Exception as e:
+                log.debug("resolving IPF window controller failed: %s", e)
+        if ctrl is not None and hasattr(ctrl, "set_direction"):
+            ctrl.set_direction(direction)
         return
     result = tree_orientation_result(tree)
     if result is None:
@@ -357,6 +469,11 @@ def ipf_set_direction(session, plot, payload) -> None:
             except Exception as e:
                 log.debug("painting IPF map for new direction failed: %s", e)
         tree._ipf_direction = direction
+        # Two-window layout: the explorer window owns the 3-D / density views.
+        ctrl = getattr(tree, "_ipf_window", None)
+        if ctrl is not None and not getattr(ctrl, "_closed", False):
+            ctrl.set_direction(direction)
+            return
         wid = getattr(plot, "window_id", None)
         if wid is not None:
             emit_ipf_3d(wid, result, direction, tree=tree)   # frontend replaces the old 3-D

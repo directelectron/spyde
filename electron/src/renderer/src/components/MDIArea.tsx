@@ -30,7 +30,8 @@ function windowPayloadFor(
   // enough for a drag hint; the backend can resolve the window's true active
   // figure if this is stale.
   const shownFig = win.figures.find(f =>
-    f.view !== '3d' && f.view !== 'density' && f.view !== 'ipf_key'
+    f.view !== '3d' && f.view !== 'density' && f.view !== 'density3d'
+    && f.view !== 'ipf2d' && f.view !== 'ipf_key'
     && f.viewLabel !== '__tiled__' && f.viewLabel !== '__stacked__') ?? win.figures[0]
   return {
     windowId: win.windowId,

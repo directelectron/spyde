@@ -35,17 +35,76 @@ _VIEW_DATA: dict[int, dict] = {}
 TILED_LABEL = "__tiled__"
 
 
-def register_views(window_id: int, items, *, cmap: str = "gray", levels=None) -> None:
+def _wire_pick(plot2d, image, pick_hook):
+    """Put a white crosshair on *plot2d* that reports the picked ``(iy, ix)``
+    scan pixel to *pick_hook*. Returns the widget (or None).
+
+    A window whose views are several maps of ONE navigation field wants the
+    same pick on every one of them — otherwise the interaction silently dies
+    when the user switches chips (the IPF explorer follows the orientation map's
+    crosshair, so picking had to keep working on IPF-X and IPF-Y too, and on the
+    ⌘-tiled comparison)."""
+    if pick_hook is None or plot2d is None:
+        return None
+    try:
+        widget = plot2d.add_crosshair_widget(color="#ffffff")
+    except Exception as e:
+        logger.debug("adding a view pick crosshair failed: %s", e)
+        return None
+    return _wire_pick_widget(widget, image, pick_hook)
+
+
+def _wire_pick_widget(widget, image, pick_hook):
+    """Report an EXISTING crosshair widget's position to *pick_hook* as an
+    ``(iy, ix)`` scan pixel, bounds-checked against *image*."""
+    if widget is None or pick_hook is None:
+        return None
+    h, w = np.asarray(image).shape[:2]
+
+    def _on_pick(_ev=None):
+        try:
+            ix = int(round(float(widget.cx)))
+            iy = int(round(float(widget.cy)))
+        except Exception:
+            return
+        if 0 <= iy < h and 0 <= ix < w:
+            try:
+                pick_hook(iy, ix)
+            except Exception as e:
+                logger.debug("view pick hook failed: %s", e)
+
+    try:
+        widget.add_event_handler(_on_pick, "pointer_up")
+    except Exception as e:
+        logger.debug("wiring the view pick handler failed: %s", e)
+    return widget
+
+
+def register_views(window_id: int, items, *, cmap: str = "gray", levels=None,
+                   append: bool = False, pick_hook=None) -> None:
     """Stash the source arrays for a window's named views so ``tile_views`` can
     rebuild a side-by-side figure for any subset. ``items`` = list of
-    ``(label, image)``."""
-    images = {}
-    order = []
+    ``(label, image)``.
+
+    ``append=True`` MERGES into what the window already has instead of replacing
+    it — needed when two independent attachers contribute chips to one window
+    (an EBSD result window carries the IPF-X/Y/Z projections *and* the
+    NCC / Similarity / ADP quality maps; whichever ran second used to erase the
+    other's arrays, so ⌘-tiling silently dropped half the chips)."""
+    prev = _VIEW_DATA.get(int(window_id)) if append else None
+    images = dict(prev["images"]) if prev else {}
+    order = list(prev["order"]) if prev else []
     for label, image in items:
         images[label] = np.asarray(image)
-        order.append(label)
+        if label not in order:
+            order.append(label)
     _VIEW_DATA[int(window_id)] = {
-        "images": images, "order": order, "cmap": cmap, "levels": levels,
+        "images": images, "order": order,
+        "cmap": (prev or {}).get("cmap", cmap) if append else cmap,
+        "levels": (prev or {}).get("levels", levels) if append else levels,
+        # Carried so the TILED comparison figure gets the same pick behaviour
+        # its single-view siblings have.
+        "pick_hook": pick_hook or ((prev or {}).get("pick_hook") if append else None),
     }
 
 
@@ -64,9 +123,12 @@ def _imshow_view(ax, image, cmap, levels):
 
 
 def emit_view_figure(window_id: int, image, label: str, *, kind: str = "2d",
-                     cmap: str = "gray", levels=None) -> str | None:
+                     cmap: str = "gray", levels=None, pick_hook=None) -> str | None:
     """Emit a single-axis map figure tagged as the named view ``label``. Returns
-    the fig id (or None on failure)."""
+    the fig id (or None on failure).
+
+    ``pick_hook(iy, ix)`` adds a white pick crosshair to this view (see
+    :func:`_wire_pick`)."""
     try:
         import anyplotlib as apl
         import anyplotlib._electron as _electron
@@ -75,7 +137,8 @@ def emit_view_figure(window_id: int, image, label: str, *, kind: str = "2d",
 
         fig, axes = apl.subplots(1, 1)
         ax = axes[0][0] if isinstance(axes, list) else axes
-        _imshow_view(ax, image, cmap, levels)
+        p = _imshow_view(ax, image, cmap, levels)
+        _wire_pick(p, image, pick_hook)
 
         fig_id = _electron.register(fig)
         html = finalize_figure_html(fig, fig_id)
@@ -149,6 +212,7 @@ def build_tiled_figure(window_id: int, labels):
     from spyde.drawing.plots.plot import finalize_figure_html
 
     cmap, levels = data.get("cmap", "gray"), data.get("levels")
+    pick_hook = data.get("pick_hook")
     fig, axes = apl.subplots(1, len(pairs), sharex=True, sharey=True)
     arr = np.array(axes, dtype=object).ravel()
     widgets = []
@@ -164,6 +228,10 @@ def build_tiled_figure(window_id: int, labels):
         except Exception as e:
             logger.debug("adding crosshair to tiled view failed: %s", e)
     _link_crosshairs(widgets)
+    if pick_hook is not None and widgets:
+        # ONE hook on the linked set: _link_crosshairs already mirrors the drag
+        # onto the others, so wiring every widget would fire N times per pick.
+        _wire_pick_widget(widgets[0], pairs[0][1], pick_hook)
 
     fig_id = _electron.register(fig)
     html = finalize_figure_html(fig, fig_id)

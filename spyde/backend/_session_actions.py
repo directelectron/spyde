@@ -165,6 +165,8 @@ class ActionRouterMixin:
             ).start()
         elif action == "load_test_vectors":
             self._load_test_vectors()
+        elif action == "test_ipf_pick":
+            self._test_ipf_pick(payload)
         elif action == "dump_dask_state":
             self._dump_dask_state(only=payload.get("only"))
         elif action in STAGED_HANDLERS:
