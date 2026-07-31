@@ -10,6 +10,7 @@ import type { TreeNode, AxisRow } from '../kernel/SpyDEContext'
 import type { LayerState, LayersStateMessage } from '../kernel/protocol'
 import { WORKFLOW_NODE_DRAG_MIME } from '../kernel/dnd'
 import { COLORMAPS } from '../kernel/colormaps'
+import { UnitText } from '../kernel/units'
 import { useKeyedDebounce } from './wizardHooks'
 import { CompositionPanel } from './CompositionPanel'
 import { MetadataPanel } from './MetadataPanel'
@@ -82,14 +83,15 @@ function TreeNodes({ nodes, depth, activeId, windowId, onPick }:
 
 // Click-to-edit cell (Qt-like): shows the value as text; click turns it into an
 // input that commits on blur/Enter and reverts on Escape. Avoids the "wall of
-// always-on input boxes" look. ``display`` is the (possibly rounded) text shown
-// when not editing; editing always exposes the full-precision ``value``. A
-// non-editable cell falls back to showing ``value`` itself (real read-only
-// content, e.g. a derived metadata field) UNLESS the caller has no value at
-// all (the axes table's null scale/offset), signalled by passing "" — that
-// still renders as "—" via the placeholder branch below.
+// always-on input boxes" look. ``display`` is the (possibly rounded, possibly
+// LaTeX-rendered) content shown when not editing; editing always exposes the
+// raw, full-precision ``value``. A non-editable cell falls back to showing
+// ``value`` itself (real read-only content, e.g. a derived metadata field)
+// UNLESS the caller has no value at all (the axes table's null scale/offset),
+// signalled by passing "" — that still renders as "—" via the placeholder
+// branch below.
 function EditableCell({ value, display, editable, onCommit, testid }:
-  { value: string; display?: string; editable: boolean
+  { value: string; display?: React.ReactNode; editable: boolean
     onCommit: (v: string) => void; testid: string }) {
   const [editing, setEditing] = React.useState(false)
   const [draft, setDraft] = React.useState(value)
@@ -139,7 +141,15 @@ function AxesTable({ axes, onEdit, offsetPick, onToggleOffsetPick }:
   // Display scale/offset rounded to 2 dp (full precision shows on click-to-edit).
   // Very small / large magnitudes fall back to 2-sig-fig exponential so a tiny
   // calibration (e.g. 0.0042 Å⁻¹/px) doesn't render as "0.00".
-  const disp = (ax: AxisRow, field: keyof AxisRow) => {
+  //
+  // `units` is the same idea with a different renderer: HyperSpy stores the
+  // units as raw LaTeX ("$\AA^{-1}$"), so the cell DISPLAYS it rendered (Å⁻¹)
+  // and click-to-edit still exposes — and commits — the raw string unchanged.
+  const disp = (ax: AxisRow, field: keyof AxisRow): React.ReactNode => {
+    if (field === 'units') {
+      const u = txt(ax, field)
+      return u === '' ? undefined : <UnitText raw={u} />
+    }
     if (field !== 'scale' && field !== 'offset') return undefined
     const v = ax[field]
     if (v == null) return undefined
