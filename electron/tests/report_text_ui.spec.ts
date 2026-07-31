@@ -43,6 +43,29 @@ test.afterAll(async () => {
 const rendered = () => ctx.page.locator('[data-testid^="report-cell-rendered-"]').first()
 const textarea = () => ctx.page.locator('[data-testid^="report-cell-textarea-"]').first()
 
+/**
+ * Put the caret at the end of the editor and KEEP it there.
+ *
+ * A plain `setSelectionRange` races `ReportCell.runCommand`, which restores
+ * focus+selection in a `requestAnimationFrame` after React re-renders the
+ * controlled value — so a caret set between the re-render and that frame is
+ * silently replaced. Polling re-applies until it sticks, which absorbs any
+ * pending restore no matter when it lands.
+ */
+async function setCaretToEnd() {
+  await expect.poll(async () => await textarea().evaluate((el: HTMLTextAreaElement) => {
+    const n = el.value.length
+    el.focus(); el.setSelectionRange(n, n)
+    return el.selectionStart === n && el.selectionEnd === n
+  }), { message: 'the caret would not stay at the end of the editor' }).toBe(true)
+  // One more frame, so a restore scheduled by an earlier click cannot still be
+  // queued behind us when the next toolbar button reads the selection.
+  await textarea().evaluate(() => new Promise<void>((r) => requestAnimationFrame(() => r())))
+  await expect.poll(async () => await textarea().evaluate((el: HTMLTextAreaElement) =>
+    el.selectionStart === el.value.length && el.selectionEnd === el.value.length),
+    { message: 'a pending selection restore moved the caret off the end' }).toBe(true)
+}
+
 async function setCellSource(src: string) {
   const { page } = ctx
   await rendered().dblclick()
@@ -114,11 +137,13 @@ test('3) heading + math-block toolbar buttons produce H2 and $$ block', async ()
   })
   await page.locator('[data-testid^="report-fmt-h2-"]').click()
   await expect(textarea()).toHaveValue('## Section title')
-  // Append a math block at the end via the √x button.
-  await textarea().evaluate((el: HTMLTextAreaElement) => {
-    const n = el.value.length
-    el.focus(); el.setSelectionRange(n, n)
-  })
+  // Append a math block at the end via the √x button — with the caret ACTUALLY
+  // at the end. `runCommand` restores focus+selection in a requestAnimationFrame
+  // AFTER React re-renders the controlled value, so the value assertion above can
+  // pass while that restore is still pending; a caret set in the gap is silently
+  // overwritten by it, and the math button then wraps the whole line instead of
+  // inserting at the end ("$$\n## Section title\n$$" — the CI flake).
+  await setCaretToEnd()
   await page.locator('[data-testid^="report-fmt-math-"]').click()
   await expect(textarea()).toHaveValue(/## Section title\n\$\$\nE = mc\^2\n\$\$\n/)
   await textarea().press('Control+Enter')

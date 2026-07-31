@@ -161,10 +161,18 @@ async function openEdit(page: any): Promise<{ cellId: string; figId: string }> {
  * a WebGPU context), so we SCREENSHOT the iframe element (captures WebGPU or
  * Canvas2D alike, per the report_export.spec.ts pattern) and decode the PNG.
  */
-async function accentBands(page: any, figId: string): Promise<any> {
-  const iframe = page.locator(`iframe[data-testid="figure-${figId}"]`)
+async function accentBands(page: any): Promise<any> {
+  // Located STRUCTURALLY, never by a captured figId. Every annotation edit
+  // REBUILDS the figure under a new id, so an id read a moment ago can already be
+  // dead by the time we measure — and then `boundingBox()` sits out its full
+  // 30 s timeout and throws instead of returning a reading. That is the CI flake
+  // (each attempt waited on a different `figure-<hash>`); this selector always
+  // resolves to whatever figure the cell holds right now.
+  const iframe = page.locator('[data-testid^="report-figcell-"] iframe[data-testid^="figure-"]')
   if (!(await iframe.count())) return { center: 0, cornerTL: 0, cornerAll: 0 }
-  const box = await iframe.boundingBox()
+  // Short timeout: a missing box means "no reading", which the callers poll on.
+  // The default would turn a transient rebuild into a 30 s stall.
+  const box = await iframe.first().boundingBox({ timeout: 2_000 }).catch(() => null)
   if (!box) return { center: 0, cornerTL: 0, cornerAll: 0 }
   // FULL-PAGE screenshot (proven to capture the WebGPU-composited orange marker;
   // a clipped shot of the OOPIF misses it), then classify pixels RESTRICTED to the
@@ -267,8 +275,8 @@ test('coordinate fix: "+ Text" places the annotation at the image CENTER', async
   expect(p0, 'no panel in the report doc').toBeTruthy()
   const panelId = p0!.id
 
-  // Baseline accent pixels (should be ~0 — no annotation yet). Re-read figId.
-  const before = await accentBands(page, (await reportFigId(page))!)
+  // Baseline accent pixels (should be ~0 — no annotation yet).
+  const before = await accentBands(page)
   console.log('[annotations] accent bands BEFORE +Text =', JSON.stringify(before))
 
   // Click "+ Text" → the backend appends a text annotation at the panel center +
@@ -278,11 +286,16 @@ test('coordinate fix: "+ Text" places the annotation at the image CENTER', async
   await expect.poll(async () => (await firstPanel(page, cellId))?.annCount ?? 0, {
     timeout: 10_000, message: '+ Text did not append a panel annotation',
   }).toBe(p0!.annCount + 1)
-  await page.waitForTimeout(2500)   // let the rebuilt figure paint the marker
+  // Wait for the REBUILT figure to actually paint the marker, rather than
+  // guessing at a duration: a fixed sleep is either dead time or too short on a
+  // loaded runner, and the rebuild can land mid-read (see accentBands).
+  await expect.poll(async () => (await accentBands(page)).center, {
+    timeout: 20_000, message: 'the marker never painted accent pixels',
+  }).toBeGreaterThan(0)
 
   await page.screenshot({ path: join(SHOTS, 'C-01-text-centered.png') })
 
-  const after = await accentBands(page, (await reportFigId(page))!)
+  const after = await accentBands(page)
   console.log('[annotations] accent bands AFTER +Text =', JSON.stringify(after))
 
   // The marker drew accent pixels, and they cluster in the CENTER band — NOT the
@@ -357,10 +370,14 @@ test('drag persistence: a widget pointer_up moves the annotation + persists', as
     .dispatchEvent('mouseover', { bubbles: true })
   await page.getByTestId(`report-figcell-edit-toggle-${cellId}`).click()
   await expect(page.getByTestId(`figcell-edit-${cellId}`)).toHaveCount(0, { timeout: 10_000 })
-  await page.waitForTimeout(2000)   // static-marker rebuild + paint
+  // Wait for the static-marker rebuild to PAINT rather than sleeping through it —
+  // the rebuild swaps the iframe, so a fixed wait can land mid-swap on a loaded
+  // runner and read zero accent pixels from a figure that is about to be replaced.
+  await expect.poll(async () => (await accentBands(page)).total, {
+    timeout: 20_000, message: 'the static marker never painted after exiting edit mode',
+  }).toBeGreaterThan(0)
 
-  figId = (await reportFigId(page))!   // rebuilt on edit-mode OFF
-  const bands = await accentBands(page, figId)
+  const bands = await accentBands(page)
   console.log('[annotations] accent bands after drag+exit =', JSON.stringify(bands))
   await page.screenshot({ path: join(SHOTS, 'C-02b-annotation-moved-static.png') })
   // The static marker re-rendered AT THE MOVED position: accent pixels exist and
@@ -463,7 +480,7 @@ test('figure-level annotation: add draws + a marker drag persists + popover open
 
   // The figure-marker drew accent pixels centered over the whole figure (default
   // fraction 0.5, 0.5). Assert some accent pixels landed in the center band.
-  const bands = await accentBands(page, figId)
+  const bands = await accentBands(page)
   console.log('[annotations] fig-annotation accent bands =', JSON.stringify(bands))
   expect(bands.center, 'figure-level text annotation drew no centered accent pixels')
     .toBeGreaterThan(0)
