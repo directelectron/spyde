@@ -158,6 +158,83 @@ class TestOriginalMetadataGate:
         assert _has_original_metadata(Boom(), "csb.us_per_frame") is False
 
 
+# ── 1c. the lazy contract: one time plane per dask block ──────────────────────
+
+class TestLazyStackChunking:
+    """`chunks == ((1,)*n_planes, (h,), (w,))` — the reader's whole premise.
+
+    A CSB has no dense array; a plane exists only once its own events are
+    integrated. So each dask block must integrate ONE plane and nothing else.
+    Any block spanning several planes means scrubbing to position *i* pays for
+    its neighbours too — which is precisely the shape CLAUDE.md records as a
+    40x scrub regression on the MRC path, and is invisible to every other test
+    here because the VALUES stay correct either way.
+    """
+
+    def _read(self, path, **kw):
+        from spyde.external.rsciio_csb import file_reader
+        return file_reader(path, lazy=True, **kw)[0]
+
+    def test_each_block_is_exactly_one_plane(self, csb_path):
+        d = self._read(csb_path, frames_per_plane=1)
+        data = d["data"]
+        n = data.shape[0]
+        assert data.chunks[0] == (1,) * n, (
+            f"expected one plane per block, got {data.chunks[0]}")
+        # ...and whole frames in the other two, never a split signal axis.
+        assert data.chunks[1] == (data.shape[1],)
+        assert data.chunks[2] == (data.shape[2],)
+
+    def test_the_exposure_does_not_change_the_block_shape(self, csb_path):
+        # 3 frames, so 1/plane gives 3 planes and 3/plane gives 1 — either way
+        # a block is one plane.
+        for fpp in (1, 3):
+            data = self._read(csb_path, frames_per_plane=fpp)["data"]
+            assert data.chunks[0] == (1,) * data.shape[0]
+
+    def test_reading_one_plane_does_not_compute_the_others(self, csb_path):
+        """The point of the chunking, stated as behaviour rather than shape."""
+        data = self._read(csb_path, frames_per_plane=1)["data"]
+        assert data.shape[0] >= 2
+        one = data[0].compute()
+        assert one.shape == data.shape[1:]
+
+
+# ── 1d. the GPU backend is guarded, and falls back ────────────────────────────
+
+class TestBackendSelection:
+    """`backend="torch"` must not require a CUDA device to be SURVIVABLE.
+
+    The check used to apply only to `backend="auto"`, so an explicit "torch"
+    built the CUDA accumulator unconditionally. It constructs fine (the buffer
+    is lazy) and then raises on the first integrate — inside a dask block, per
+    plane, with no fallback. Guarding every GPU path with an availability check
+    and a working CPU fallback is the codebase-wide rule.
+    """
+
+    def _fresh(self, path, backend):
+        from spyde.external.rsciio_csb import _api
+        _api._DATASETS.clear()
+        return _api._dataset(path, backend)
+
+    def test_torch_without_a_device_falls_back_and_still_integrates(
+            self, csb_path):
+        from spyde.external.rsciio_csb._torch import torch_gpu_available
+        if torch_gpu_available():
+            pytest.skip("this box has CUDA; the fallback cannot be exercised")
+        from spyde.external.rsciio_csb._sparse import SparseCSB
+        ds = self._fresh(csb_path, "torch")
+        assert type(ds) is SparseCSB, "torch was selected with no CUDA device"
+        # And the fallback must hand _core a backend name it actually knows —
+        # it raises ValueError on anything outside {auto, gpu, cpu, cpu-*}.
+        assert ds.backend != "torch"
+        assert np.asarray(ds._sum_frames(0, 1, 1, np.float32)).size > 0
+
+    def test_an_explicit_cpu_backend_is_passed_through(self, csb_path):
+        ds = self._fresh(csb_path, "cpu-numpy")
+        assert ds.backend == "cpu-numpy"
+
+
 # ── 2. header parsing + geometry ──────────────────────────────────────────────
 
 class TestHeader:

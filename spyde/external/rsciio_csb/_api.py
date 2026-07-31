@@ -122,17 +122,36 @@ def _dataset(path: str, backend: str) -> SparseCSB:
         ds = _DATASETS.get(key)
         if ds is None:
             csb = CSBFile(path)
-            use_torch = backend == "torch"
+            from ._torch import torch_gpu_available
+            # The availability check applies to an EXPLICIT "torch" too, not
+            # just to "auto". Without it, `backend="torch"` on a CPU-only or
+            # Apple machine built a _TorchSparseCSB whose accumulator does
+            # `torch.zeros(..., device="cuda")` — raising inside a dask block,
+            # per plane, with no fallback and nothing to catch it. Falling back
+            # is the contract every GPU path in this codebase keeps; it is
+            # logged rather than silent because the caller did ask for torch.
+            use_torch = False
+            cpu_backend = backend
             if backend == "auto":
                 from ._core import gpu_available
-                from ._torch import torch_gpu_available
-                use_torch = not gpu_available() and torch_gpu_available()
+                use_torch = torch_gpu_available() and not gpu_available()
+            elif backend == "torch":
+                use_torch = torch_gpu_available()
+                # _core only knows {auto, gpu, cpu, cpu-numba, cpu-numpy} and
+                # raises ValueError on anything else, so the fallback must hand
+                # it a name it recognises rather than "torch".
+                cpu_backend = "auto"
+                if not use_torch:
+                    _logger.warning(
+                        "CSB %s: backend='torch' requested but no CUDA device "
+                        "is visible — integrating on the CPU instead",
+                        os.path.basename(path))
             if use_torch:
-                ds = _TorchSparseCSB(csb, backend=backend)
+                ds = _TorchSparseCSB(csb, backend=cpu_backend)
                 _logger.debug("CSB %s: integrating on torch-CUDA",
                               os.path.basename(path))
             else:
-                ds = SparseCSB(csb, backend=backend)
+                ds = SparseCSB(csb, backend=cpu_backend)
             _DATASETS[key] = ds
         return ds
 
