@@ -1,6 +1,14 @@
 import { defineConfig } from '@playwright/test'
 import { join } from 'path'
 
+// A FRESH Electron profile + settings dir for every app launch, so no spec can
+// inherit another's localStorage/IndexedDB or settings.json. This file is
+// evaluated in every worker process, which is what lets one hook reach all ~60
+// specs — including the ~30 that call `_electron.launch()` directly instead of
+// going through _harness.cjs. See tests/_clean_slate.cjs for the full why.
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+require('./tests/_clean_slate.cjs').installCleanSlate()
+
 /**
  * The specs that dominate wall-clock, newest measurement first.
  *
@@ -41,6 +49,7 @@ export default defineConfig({
   // they get the first-run welcome tour whose overlay eats pointer events.
   // They all spread ...process.env, so setting it there is what reaches them.
   globalSetup: require.resolve('./tests/global-setup.cjs'),
+  globalTeardown: require.resolve('./tests/global-teardown.cjs'),
   timeout: 120_000,
   expect: { timeout: 15_000 },
   retries: 1,

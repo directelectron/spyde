@@ -30,9 +30,23 @@ const { tmpdir } = require('os')
 const { join } = require('path')
 
 module.exports = async () => {
-  const dir = join(mkdtempSync(join(tmpdir(), 'spyde-e2e-global-')), '.spyde')
+  // One run-scoped root for every per-launch scratch dir (_clean_slate.cjs
+  // creates them here), so global-teardown can remove the whole lot instead of
+  // leaving a profile per launch behind in the system temp.
+  const root = mkdtempSync(join(tmpdir(), 'spyde-e2e-'))
+  process.env.SPYDE_E2E_TMP_ROOT = root
+
+  const dir = join(root, 'shared', '.spyde')
   mkdirSync(dir, { recursive: true })
   writeFileSync(join(dir, 'settings.json'), JSON.stringify({ tutorial_seen: true }))
+  // This stays as the FALL-BACK only. _clean_slate.cjs replaces it with a fresh
+  // dir per launch; it recognises the inherited default by comparing against
+  // SPYDE_E2E_SHARED_SETTINGS_DIR below. Keeping it set means that if the patch
+  // ever fails to install, the suite degrades to the old shared-dir behaviour
+  // rather than to the developer's real ~/.spyde (which would auto-open the
+  // welcome tour and break dozens of specs in a way that looks like anything
+  // but a settings problem).
   process.env.SPYDE_SETTINGS_DIR = dir
+  process.env.SPYDE_E2E_SHARED_SETTINGS_DIR = dir
   process.env.SPYDE_NO_SHELL_OPEN = '1'
 }
