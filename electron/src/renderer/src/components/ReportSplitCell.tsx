@@ -35,6 +35,7 @@ import { renderMarkdown } from '../kernel/markdown'
 import { reportClipboard } from '../kernel/reportClipboard'
 import type { ReportCell } from '../kernel/protocol'
 import { FIGURE_DRAG_MIME, WINDOW_DRAG_MIME } from '../kernel/dnd'
+import { AnchoredMenu } from './AnchoredMenu'
 import { CellChrome } from './CellChrome'
 import { SeamlessFigureFrame, FigureEditOverlay } from './ReportFigureCell'
 
@@ -100,6 +101,10 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
   const stacked = layout === 'text-top' || layout === 'text-bottom'
   const textFirst = layout === 'text-left' || layout === 'text-top'
   const [layoutMenu, setLayoutMenu] = useState(false)
+  // The layout picker is an AnchoredMenu (position:fixed) — see AnchoredMenu.tsx:
+  // this cell lives in the sidebar's `overflowY:auto` body, which clips an
+  // `absolute` panel wherever the cell happens to sit in the scroll.
+  const layoutBtnRef = useRef<HTMLButtonElement>(null)
   const empty = !!cell.split_empty
   // The figure side rides in the same fig_id/reportFigures plumbing as a figure
   // cell (keyed by the CELL id). A photo side ships `image` instead of a spec.
@@ -397,8 +402,9 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
                   onClick={refreshFigure}
                 >⟳</button>
               )}
-              <div style={{ position: 'relative' }}>
+              <div style={{ display: 'inline-flex' }}>
                 <button
+                  ref={layoutBtnRef}
                   data-testid={`report-split-layout-${cell.id}`}
                   style={styles.chromeBtn}
                   title="Split layout (text vs figure arrangement)"
@@ -406,9 +412,14 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
                   aria-expanded={layoutMenu}
                   onClick={() => setLayoutMenu(v => !v)}
                 >{LAYOUT_OPTS.find(o => o.value === layout)?.glyph ?? '◧'} ▾</button>
-                {layoutMenu && (
-                  <div style={styles.layoutMenu} role="menu"
-                    data-testid={`report-split-layout-menu-${cell.id}`}>
+                {layoutMenu && layoutBtnRef.current && (
+                  <AnchoredMenu
+                    anchorEl={layoutBtnRef.current}
+                    testid={`report-split-layout-menu-${cell.id}`}
+                    align="right"
+                    minWidth={130}
+                    onClose={() => setLayoutMenu(false)}
+                  >
                     {LAYOUT_OPTS.map(o => (
                       <button key={o.value} role="menuitemradio"
                         aria-checked={layout === o.value}
@@ -419,7 +430,7 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
                         {layout === o.value && <span style={{ marginLeft: 'auto' }}>✓</span>}
                       </button>
                     ))}
-                  </div>
+                  </AnchoredMenu>
                 )}
               </div>
             </>
@@ -469,12 +480,7 @@ const styles: Record<string, React.CSSProperties> = {
     display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, alignItems: 'stretch',
   },
   pane: { minWidth: 0, display: 'flex', flexDirection: 'column' },
-  layoutMenu: {
-    position: 'absolute', top: '100%', right: 0, marginTop: 4, zIndex: 20,
-    background: '#1e1e2e', border: '1px solid #313244', borderRadius: 6,
-    padding: 4, minWidth: 130, boxShadow: '0 6px 18px rgba(0,0,0,0.5)',
-    display: 'flex', flexDirection: 'column', gap: 2,
-  },
+  // (the layout picker's panel is AnchoredMenu — position:fixed)
   layoutMenuItem: {
     display: 'flex', alignItems: 'center', gap: 8, width: '100%',
     background: 'none', border: 'none', color: '#cdd6f4', cursor: 'pointer',

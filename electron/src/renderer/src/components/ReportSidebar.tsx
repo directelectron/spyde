@@ -27,6 +27,7 @@ import { ReportImageCell } from './ReportImageCell'
 import { ReportSplitCell } from './ReportSplitCell'
 import { ReportMovieCell } from './ReportMovieCell'
 import { SlideNotesEditor } from './SlideNotesEditor'
+import { AnchoredMenu } from './AnchoredMenu'
 import { GUIDES } from '@guides/index'
 import type { ReportCell as ReportCellType } from '../kernel/protocol'
 
@@ -186,12 +187,18 @@ export function ReportSidebar() {
   // Presentation slide-native chrome state:
   //  • which slides' Speaker-notes editors are expanded (keyed by the slide's
   //    first-cell id — the per-slide attribute owner),
-  //  • which slide's Background picker popover is open (first-cell id or null),
+  //  • which slide's Background picker popover is open (first-cell id or null,
+  //    plus the toggle element it hangs off),
   //  • whether the "+ Add slide" starter menu is open.
+  //
+  // Both popovers are AnchoredMenu (position:fixed) rather than an `absolute`
+  // child, because this dock's body is a scroller and clipped them — see
+  // AnchoredMenu.tsx. Both therefore keep the ELEMENT they were opened from.
   const [openNotes, setOpenNotes] = useState<Set<string>>(new Set())
-  const [bgPickerFor, setBgPickerFor] = useState<string | null>(null)
+  const [bgPicker, setBgPicker] = useState<{ id: string; el: HTMLElement } | null>(null)
+  const bgPickerFor = bgPicker?.id ?? null
   const [addSlideMenu, setAddSlideMenu] = useState(false)
-  const addSlideRef = useRef<HTMLDivElement>(null)
+  const addSlideBtnRef = useRef<HTMLButtonElement>(null)
   // Whole-slide reorder DnD (drag a slide's grip onto another slide group).
   const dragSlideN = useRef<number | null>(null)
   const [dragSlide, setDragSlide] = useState<number | null>(null)
@@ -469,20 +476,8 @@ export function ReportSidebar() {
     if (exportNoteTimer.current) clearTimeout(exportNoteTimer.current)
   }, [])
 
-  // Close the "+ Add slide" starter menu on outside click / Escape.
-  useEffect(() => {
-    if (!addSlideMenu) return
-    const onDown = (e: MouseEvent) => {
-      if (!addSlideRef.current?.contains(e.target as Node)) setAddSlideMenu(false)
-    }
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setAddSlideMenu(false) }
-    window.addEventListener('mousedown', onDown)
-    window.addEventListener('keydown', onKey)
-    return () => {
-      window.removeEventListener('mousedown', onDown)
-      window.removeEventListener('keydown', onKey)
-    }
-  }, [addSlideMenu])
+  // (The "+ Add slide" starter menu and the per-slide Background picker dismiss
+  // themselves — AnchoredMenu owns Escape + outside-press, anchor excluded.)
 
   const commitTitle = () => {
     setTitleEditing(false)
@@ -535,7 +530,7 @@ export function ReportSidebar() {
     sendAction('report_set_slide_kind', { cell_id: firstCellId })
   const setSlideStyle = (firstCellId: string, style: '' | 'plain' | 'accent') => {
     sendAction('report_set_slide_style', { cell_id: firstCellId, slide_style: style })
-    setBgPickerFor(null)
+    setBgPicker(null)
   }
   const setSlideNotes = (firstCellId: string, notes: string) =>
     sendAction('report_set_slide_notes', { cell_id: firstCellId, notes })
@@ -1119,16 +1114,21 @@ export function ReportSidebar() {
                         title="Slide background"
                         aria-haspopup="menu"
                         aria-expanded={bgPickerFor === firstId}
-                        onClick={() => setBgPickerFor(v => (v === firstId ? null : firstId))}
+                        onClick={(e) => {
+                          const el = e.currentTarget
+                          setBgPicker(v => (v?.id === firstId ? null : { id: firstId, el }))
+                        }}
                       >
                         <span style={{ ...styles.bgSwatch, background: swatchOf(meta.style) }} />
                         {labelOf(meta.style)} ▾
                       </button>
-                      {bgPickerFor === firstId && (
-                        <div
-                          style={styles.bgMenu}
-                          data-testid={`report-slide-bg-menu-${slide.n}`}
-                          role="menu"
+                      {bgPicker?.id === firstId && (
+                        <AnchoredMenu
+                          anchorEl={bgPicker.el}
+                          testid={`report-slide-bg-menu-${slide.n}`}
+                          align="right"
+                          minWidth={120}
+                          onClose={() => setBgPicker(null)}
                         >
                           {SLIDE_STYLES.map(s => (
                             <button
@@ -1146,7 +1146,7 @@ export function ReportSidebar() {
                               {meta.style === s.value && <span style={styles.bgCheck}>✓</span>}
                             </button>
                           ))}
-                        </div>
+                        </AnchoredMenu>
                       )}
                     </div>
                   </div>
@@ -1191,8 +1191,9 @@ export function ReportSidebar() {
         {/* Add row: slide-native for a presentation, cell-native for a report. */}
         {isPresentation ? (
           <div style={styles.addRow}>
-            <div ref={addSlideRef} style={styles.addSlideWrap}>
+            <div style={styles.addSlideWrap}>
               <button
+                ref={addSlideBtnRef}
                 data-testid="report-add-slide"
                 style={styles.addSlideBtn}
                 title="Add a new slide"
@@ -1200,13 +1201,17 @@ export function ReportSidebar() {
                 aria-expanded={addSlideMenu}
                 onClick={() => setAddSlideMenu(v => !v)}
               >+ Add slide ▾</button>
-              {addSlideMenu && (
-                <div style={styles.addSlideMenu} data-testid="report-add-slide-menu" role="menu">
+              {addSlideMenu && addSlideBtnRef.current && (
+                <AnchoredMenu
+                  anchorEl={addSlideBtnRef.current}
+                  testid="report-add-slide-menu"
+                  onClose={() => setAddSlideMenu(false)}
+                >
                   <MenuItem testid="add-slide-text" label="Add text slide" onClick={addTextSlide} />
                   <MenuItem testid="add-slide-split" label="Add split slide" onClick={addSplitSlide} />
                   <MenuItem testid="add-slide-title" label="Add title slide" onClick={addTitleSlide} />
                   <MenuItem testid="add-slide-figure" label="Add figure slide" onClick={addFigureSlide} />
-                </div>
+                </AnchoredMenu>
               )}
             </div>
           </div>
@@ -1574,17 +1579,12 @@ const styles: Record<string, React.CSSProperties> = {
     fontWeight: 600, whiteSpace: 'nowrap',
   },
   slideCheck: { fontSize: 11, lineHeight: 1 },
-  bgPickerWrap: { position: 'relative', display: 'inline-flex' },
+  bgPickerWrap: { display: 'inline-flex' },
   bgSwatch: {
     width: 10, height: 10, borderRadius: 3, border: '1px solid #45475a',
     display: 'inline-block', flexShrink: 0,
   },
-  bgMenu: {
-    position: 'absolute', top: '100%', right: 0, marginTop: 4, zIndex: 20,
-    minWidth: 128, background: '#1e1e2e', border: '1px solid #45475a',
-    borderRadius: 6, padding: 4, display: 'flex', flexDirection: 'column', gap: 1,
-    boxShadow: '0 6px 22px rgba(0,0,0,0.5)',
-  },
+  // (the bg picker's panel is AnchoredMenu — position:fixed, see AnchoredMenu.tsx)
   bgMenuItem: {
     display: 'flex', alignItems: 'center', gap: 7,
     background: 'transparent', border: 'none', color: '#cdd6f4', cursor: 'pointer',
@@ -1611,17 +1611,14 @@ const styles: Record<string, React.CSSProperties> = {
     flexShrink: 0,
   },
   notesChevron: { fontSize: 9, color: '#6c7086' },
-  addSlideWrap: { position: 'relative', flex: 1, display: 'flex' },
+  addSlideWrap: { flex: 1, display: 'flex' },
   addSlideBtn: {
     flex: 1, minWidth: 0,
     background: 'rgba(137,180,250,0.10)', color: '#89b4fa',
     border: '1px dashed #89b4fa', borderRadius: 6, padding: '8px',
     fontSize: 12.5, fontWeight: 600, cursor: 'pointer',
   },
-  addSlideMenu: {
-    position: 'absolute', bottom: '100%', left: 0, right: 0, marginBottom: 4,
-    zIndex: 20, background: '#1e1e2e', border: '1px solid #45475a',
-    borderRadius: 6, padding: 4, display: 'flex', flexDirection: 'column', gap: 1,
-    boxShadow: '0 -6px 22px rgba(0,0,0,0.5)',
-  },
+  // The "+ Add slide" starter panel is AnchoredMenu (position:fixed). It USED to
+  // be `absolute; bottom:100%` here, which the body's `overflowY:auto` sliced in
+  // half whenever the add row sat near the top of the scroller.
 }
