@@ -49,7 +49,7 @@ dependencies = [
     "imageio-ffmpeg",
     "imagecodecs",
     "psygnal>=0.10.0",
-    "anyplotlib>=0.6.0",
+    "anyplotlib>=0.7.0",
     "pyyaml",
     # NOT numexpr. HyperSpy warns "Numexpr is not installed ... which is slower
     # to calculate model" on every model build, but that advice is wrong at
@@ -116,11 +116,12 @@ torch = [
 # (releases track this repo's needs). The report builder needs the 0.4.0 widget/
 # layer/inset APIs (shape-widget linewidth, add_layer tint, inset_geometry_change
 # dispatch), and the integrating selectors need 0.4.1's widget-side `max_extent`
-# to cap the ROI DURING the drag. The floor is now >=0.6.0 for
-# `Plot3D.set_texture`, which is what lets the 3-D IPF heatmap be a continuous
-# textured skin on the sphere instead of a dense point patch
-# (`actions/ipf_window.py`). While an unreleased
-# anyplotlib feature is in
+# to cap the ROI DURING the drag. The floor is >=0.7.0 for two 0.3.0 features:
+# `Plot3D.set_texture` (0.6.0) paints the 3-D IPF heatmap as a continuous skin
+# on the sphere instead of a dense point patch, and `add_key` (0.7.0) pins the
+# IPF colour-key triangle over the map as a native overlay — which replaced a
+# whole second figure + iframe. Both live in `actions/ipf_view.py` /
+# `actions/ipf_window.py`. While an unreleased anyplotlib feature is in
 # flight, pin a git sha in [project.dependencies] (the hyperspy/rosettasciio
 # pattern). When actively editing anyplotlib locally, temporarily re-add the
 # editable path override below (do NOT commit it — the path doesn't exist on CI

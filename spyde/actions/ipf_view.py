@@ -221,60 +221,79 @@ def _ipf_key_color_grid(phase, direction: str, n: int):
            np.asarray(xy_edges), np.asarray(label_xy), labels)
 
 
-def build_ipf_key_figure(result, direction: str = "z", *, n: int = 120):
-    """Build the IPF colour-KEY triangle legend as a NATIVE anyplotlib figure →
-    ``(fig, fig_id, html)``.
+#: Fraction of the panel's short edge the pinned colour key occupies.
+IPF_KEY_SIZE = 0.26
 
-    The standard stereographic fundamental-sector colour key (e.g. cubic
-    [001]/[101]/[111]) rendered as a single stretched RGBA raster
-    (:meth:`anyplotlib.Plot1D.add_raster`) — the per-cell orix IPF colour
-    (``direction2color``) baked into an image and clipped to the curved sector
-    boundary, instead of one polygon per grid cell (~n² polygons for the same
-    visual). Same key for sample X/Y/Z (it's the crystal-direction colour map)."""
-    import anyplotlib as apl
-    import anyplotlib._electron as _electron
 
-    from spyde.actions.ipf_density import _sector_limits
-    from spyde.drawing.plots.plot import finalize_figure_html
+def ipf_key_overlay(result, direction: str = "z", *, n: int = 120):
+    """``(rgba, labels)`` for :meth:`anyplotlib.Plot2D.add_key` → the colour-key
+    triangle as a floating overlay, or ``None`` if it cannot be built.
 
+    ``labels`` are dicts with ``x``/``y`` in FRACTIONS OF THE KEY IMAGE
+    (``add_key``'s convention) rather than data coordinates, so the corner
+    indices track the triangle through a panel resize. ``y`` is measured from
+    the TOP because :func:`_ipf_key_color_grid` already flipped the raster so
+    row 0 is max-y.
+
+    Each label is ALIGNED AWAY FROM ITS EDGE — a ``[h k l]`` sitting at x=1.0
+    is right-aligned, so it grows inwards. Centre-aligning everything (the
+    obvious first cut) clips the outermost indices against the panel edge,
+    which is exactly where the cubic sector puts two of its three corners.
+    """
     om = _as_orientation_map(result)
-    phase = om.orix_phase(0)                       # primary phase's point group
-
-    rgba, extent, xy_edges, label_xy, labels = _ipf_key_color_grid(
+    phase = om.orix_phase(0)
+    rgba, extent, _xy_edges, label_xy, labels = _ipf_key_color_grid(
         phase, direction, n)
-    xlim, ylim = _sector_limits(xy_edges)
+    x0, x1, y0, y1 = (float(v) for v in extent)
+    w, h = (x1 - x0) or 1.0, (y1 - y0) or 1.0
 
-    fig, axes = apl.subplots(1, 1)
-    ax = axes[0][0] if isinstance(axes, list) else axes
-    xy = ax.axes2d(xlim=xlim, ylim=ylim, aspect="equal")
-    # One drawImage instead of ~n² polygons; clip to the curved sector boundary.
-    xy.add_raster(rgba, extent=extent, clip_path=xy_edges, smooth=False)
-    xy.plot(xy_edges[:, 0], xy_edges[:, 1], color="#ffffff", linewidth=1.5)
+    out = []
     for (lx, ly), txt in zip(np.asarray(label_xy, dtype=float), labels):
-        xy.text(float(lx), float(ly), str(txt), color="#ffffff", fontsize=12)
+        fx = min(max((float(lx) - x0) / w, 0.0), 1.0)
+        fy = min(max((y1 - float(ly)) / h, 0.0), 1.0)
+        # Inset a hair as well as aligning: the glyph box still has a little
+        # bearing on the side it is anchored by.
+        if fx > 0.75:
+            align, fx = "right", min(fx, 0.98)
+        elif fx < 0.25:
+            align, fx = "left", max(fx, 0.02)
+        else:
+            align = "center"
+        fy = min(max(fy, 0.06), 0.94)
+        out.append({"x": fx, "y": fy, "text": str(txt), "align": align})
+    return rgba, out
 
-    fig_id = _electron.register(fig)
-    html = finalize_figure_html(fig, fig_id)
-    return fig, fig_id, html
 
+def attach_ipf_key(plot, result, direction: str = "z", *,
+                   hover_only: bool = True) -> bool:
+    """Pin the IPF colour key over *plot* as a native anyplotlib key overlay.
 
-def emit_ipf_key(window_id: int, result, direction: str = "z") -> bool:
-    """Emit the IPF colour-key triangle legend for *window_id* as a native
-    anyplotlib ``view="ipf_key"`` figure (pinned in a corner of the IPF map)."""
-    from spyde.backend.ipc import emit
-    try:
-        _fig, fig_id, html = build_ipf_key_figure(result, direction)
-    except Exception as e:
-        import logging
-        logging.getLogger(__name__).debug("ipf key figure failed: %s", e)
+    Replaces what used to be an entire second anyplotlib FIGURE — its own
+    ``view="ipf_key"`` emit, its own iframe, its own resize and state-replay
+    plumbing in the renderer — with one call on the map plot itself. A key
+    floats in screen space and neither pans nor zooms with the data, which is
+    exactly what a legend wants and what the separate figure was faking.
+
+    ``hover_only`` keeps the map unobstructed until the pointer is over it; the
+    key is still baked into a PNG export either way, so what you save is what
+    you see while reading the map.
+    """
+    p2d = getattr(plot, "_plot2d", plot)
+    add_key = getattr(p2d, "add_key", None)
+    if add_key is None:                        # anyplotlib < 0.7.0
+        log.debug("this anyplotlib has no add_key; skipping the IPF key")
         return False
-    keep_alive(int(window_id), _fig)
-    emit({
-        "type": "figure", "fig_id": fig_id, "window_id": int(window_id),
-        "html": html, "title": "IPF colour key", "is_navigator": False,
-        "view": "ipf_key",
-    })
-    return True
+    try:
+        built = ipf_key_overlay(result, direction)
+        if built is None:
+            return False
+        rgba, labels = built
+        add_key(rgba, corner="bottom-right", size=IPF_KEY_SIZE,
+                hover_only=bool(hover_only), labels=labels, name="ipf_key")
+        return True
+    except Exception as e:
+        log.debug("attaching the IPF key overlay failed: %s", e)
+        return False
 
 
 #: The map window's three projection chips, in canonical order.
@@ -318,13 +337,24 @@ def attach_ipf_projections(tree, result, direction: str = "z") -> bool:
 
     register_views(wid, maps, cmap="gray", levels=None, append=True,
                    pick_hook=_pick)
+    # One key image, reused by every projection: it is the CRYSTAL-direction
+    # colour map, identical for sample X, Y and Z.
+    key = None
+    try:
+        key = ipf_key_overlay(result, d)
+    except Exception as e:
+        log.debug("building the IPF key overlay failed: %s", e)
     # Emit the OTHER two first: `set_view_tag` re-emits the live map plot, and
     # the frontend's figure reducer moves a replaced figure to the end — so
     # tagging last is what puts the chips in X, Y, Z order.
     for lbl, m in maps:
         if lbl == own:
             continue                               # already on screen as the plot
-        emit_view_figure(wid, m, lbl, kind="2d", pick_hook=_pick)
+        emit_view_figure(wid, m, lbl, kind="2d", pick_hook=_pick, key=key)
+    # The painted map is a chip too, and it is a live Plot rather than a figure
+    # emit_view_figure built — so it needs the key attached directly. Do it
+    # BEFORE set_view_tag, which re-emits the plot's html.
+    attach_ipf_key(sp, result, d)
     try:
         sp.set_view_tag(own, "2d")                 # the painted map IS one chip
     except Exception as e:
@@ -351,7 +381,11 @@ def attach_ipf_3d(tree, result, direction: str = "z", session=None) -> bool:
         return False
     tree._ipf_result = result          # remember it for X/Y/Z re-colouring
     tree._ipf_direction = str(direction).lower()
-    emit_ipf_key(wid, result, direction)
+    # The colour key rides on the map figures themselves (attach_ipf_projections
+    # below, and attach_ipf_key for the single-window fallback) rather than
+    # being emitted as its own `view="ipf_key"` figure.
+    if session is None:
+        attach_ipf_key(sp, result, direction)
 
     if session is not None:
         from spyde.actions.ipf_window import open_ipf_window

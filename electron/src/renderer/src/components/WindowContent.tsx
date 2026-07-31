@@ -189,9 +189,6 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction }: Prop
   const figDensity3d = useMemo(() => figs.find(f => f.view === 'density3d'), [figs]) // 3D · Heatmap
   const hasDensity = !!(figDensity || figDensity3d)
   const hasIpfViews = has3d || hasDensity || !!figPoints2d
-  // The IPF colour-key triangle legend — a native anyplotlib figure pinned in
-  // the corner of the 2-D map (not a switchable view).
-  const figIpfKey = useMemo(() => figs.find(f => f.view === 'ipf_key'), [figs])
   const tiledFig = useMemo(() => figs.find(f => f.viewLabel === TILED), [figs])
   const stackedFig = useMemo(() => figs.find(f => f.viewLabel === STACKED), [figs])
   // Unique chip labels in stable first-seen order (the tiled figure is not a chip).
@@ -256,7 +253,7 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction }: Prop
   // The plain map / primary figure — anything that isn't one of the tagged
   // secondary views or a tiled/stacked composite.
   const plainFig = useMemo(() => figs.find(f => !IPF_VIEWS.has(f.view ?? '')
-    && f.view !== 'ipf_key' && f.viewLabel !== TILED && f.viewLabel !== STACKED),
+    && f.viewLabel !== TILED && f.viewLabel !== STACKED),
     [figs])
 
   // The IPF figure for the current [2D|3D] × [Points|Heatmap] combination.
@@ -391,7 +388,7 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction }: Prop
       )}
 
       <div ref={boxRef} data-testid={`figure-box-${id}`} style={styles.box}>
-        {figs.filter(f => f.view !== 'ipf_key').map(fig => (
+        {figs.map(fig => (
           <iframe
             key={fig.figId}
             ref={el => {
@@ -426,27 +423,11 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction }: Prop
           </div>
         )}
 
-        {/* IPF colour-key triangle legend — a native anyplotlib figure pinned in
-            the corner of the 2-D map (the stereographic fundamental-sector key
-            matplotlib/pyxem show), only over the RGB map (mode==='2d'). */}
-        {figIpfKey && shownFig != null && !IPF_VIEWS.has(shownFig.view ?? '') && (
-          <iframe
-            key={figIpfKey.figId}
-            ref={el => {
-              if (el) iframeRefs.current.set(figIpfKey.figId, el)
-              else iframeRefs.current.delete(figIpfKey.figId)
-            }}
-            src={figIpfKey.filePath ?? undefined}
-            onLoad={(e) => {
-              replayState(figIpfKey.figId)
-              const el = e.currentTarget
-              window.electron.resizeFigure(figIpfKey.figId, Math.max(80, el.clientWidth), Math.max(80, el.clientHeight))
-            }}
-            style={styles.ipfKey}
-            title={figIpfKey.title}
-            data-testid={`ipf-key-${id}`}
-          />
-        )}
+        {/* The IPF colour-key triangle is no longer a figure of its own. It is
+            an anyplotlib KEY overlay drawn by the map figure that it annotates
+            (`Plot2D.add_key`, >=0.7.0 — see actions/ipf_view.attach_ipf_key),
+            so it needs no iframe, no resize plumbing and no state replay here,
+            and it follows whichever projection chip is on screen. */}
 
         {/* MDI overlay-drop shield — mounted ONLY while a window/figure pill is
             being dragged, so it never interferes otherwise. Catches the DnD the
@@ -520,11 +501,6 @@ const styles: Record<string, React.CSSProperties> = {
   computingDot: {
     width: 7, height: 7, borderRadius: '50%', background: '#89b4fa',
     flex: '0 0 auto',
-  },
-  ipfKey: {
-    position: 'absolute', right: 6, bottom: 6, width: 132, height: 120,
-    border: 'none', zIndex: 4,
-    background: 'rgba(24,24,37,0.72)', borderRadius: 6,
   },
   // MDI overlay-drop shield (over the figure iframe, only during a window drag).
   overlayShield: {

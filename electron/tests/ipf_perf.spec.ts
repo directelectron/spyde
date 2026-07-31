@@ -233,8 +233,12 @@ test('IPF raster/GPU render paths render correctly in the real app', async () =>
   await raiseOm()
 
   // ── STEP 1: 2-D IPF map + colour-KEY triangle raster (change #2) ────────────
+  // The key is no longer a figure of its own with its own testid — it is an
+  // anyplotlib KEY overlay drawn INSIDE the map figure (Plot2D.add_key), so
+  // there is no DOM node to wait on. Wait for the map figure itself; the
+  // colourfulness assertion below is what actually proves it painted.
   await page.getByTestId(`ipf-view-2d-${omId}`).click({ force: true })
-  await expect(page.getByTestId(`ipf-key-${omId}`)).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByTestId(`figure-box-${omId}`)).toBeVisible({ timeout: 20_000 })
   await page.waitForTimeout(800)
   await raiseOm()                                        // raise the 2-D map iframe
   await page.waitForTimeout(1500)                        // key + map paint

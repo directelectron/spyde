@@ -123,12 +123,20 @@ def _imshow_view(ax, image, cmap, levels):
 
 
 def emit_view_figure(window_id: int, image, label: str, *, kind: str = "2d",
-                     cmap: str = "gray", levels=None, pick_hook=None) -> str | None:
+                     cmap: str = "gray", levels=None, pick_hook=None,
+                     key=None) -> str | None:
     """Emit a single-axis map figure tagged as the named view ``label``. Returns
     the fig id (or None on failure).
 
     ``pick_hook(iy, ix)`` adds a white pick crosshair to this view (see
-    :func:`_wire_pick`)."""
+    :func:`_wire_pick`).
+
+    ``key`` is an optional ``(rgba, labels)`` pinned image overlay
+    (``Plot2D.add_key``). Each chip is its own FIGURE, so a key belongs to the
+    figure it annotates — attaching it here is what makes the IPF colour key
+    follow whichever projection chip is on screen, which the old separate
+    ``view="ipf_key"`` figure had to fake by floating an iframe over the whole
+    window."""
     try:
         import anyplotlib as apl
         import anyplotlib._electron as _electron
@@ -139,6 +147,14 @@ def emit_view_figure(window_id: int, image, label: str, *, kind: str = "2d",
         ax = axes[0][0] if isinstance(axes, list) else axes
         p = _imshow_view(ax, image, cmap, levels)
         _wire_pick(p, image, pick_hook)
+        if key is not None and getattr(p, "add_key", None) is not None:
+            rgba, key_labels = key
+            try:
+                from spyde.actions.ipf_view import IPF_KEY_SIZE
+                p.add_key(rgba, corner="bottom-right", size=IPF_KEY_SIZE,
+                          hover_only=True, labels=key_labels, name="ipf_key")
+            except Exception as e:
+                logger.debug("add_key on view %s failed: %s", label, e)
 
         fig_id = _electron.register(fig)
         html = finalize_figure_html(fig, fig_id)

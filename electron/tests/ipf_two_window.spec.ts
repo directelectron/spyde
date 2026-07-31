@@ -134,6 +134,62 @@ test('2) window 1 shows the X, Y and Z projections', async () => {
   ctx.assertNoJsErrors()
 })
 
+test('2b) the IPF colour key appears on HOVER, inside the map figure', async () => {
+  // The key used to be a separate figure floated over the window by the
+  // renderer; it is now an anyplotlib key overlay owned by the map figure
+  // (Plot2D.add_key, hover_only). So there is no DOM node to assert on — the
+  // only honest check is that hovering the panel changes the pixels, and that
+  // moving away puts them back.
+  const { page } = ctx
+  await page.getByTestId(`view-chip-IPF-Z-${mapId}`).click()
+  await page.waitForTimeout(1500)
+  const mapWin = page.getByTestId('subwindow')
+    .filter({ has: page.getByTestId(`view-chip-IPF-X-${mapId}`) }).first()
+  const bb = (await mapWin.boundingBox())!
+
+  await page.mouse.move(5, 5)                       // pointer well away
+  await page.waitForTimeout(600)
+  const cold = await page.screenshot({ clip: bb, path: join(SHOTS, '11-key-cold.png') })
+
+  // Into the bottom-right quadrant, where the key is pinned.
+  await page.mouse.move(bb.x + bb.width * 0.72, bb.y + bb.height * 0.75)
+  await page.waitForTimeout(900)
+  const hot = await page.screenshot({ clip: bb, path: join(SHOTS, '12-key-hover.png') })
+
+  const changed = await page.evaluate(async ([a, b]) => {
+    const load = (d: string) => new Promise<HTMLImageElement>(res => {
+      const i = new Image(); i.onload = () => res(i); i.src = 'data:image/png;base64,' + d
+    })
+    const [ia, ib] = await Promise.all([load(a), load(b)])
+    const c = document.createElement('canvas')
+    c.width = ia.width; c.height = ia.height
+    const cx = c.getContext('2d')!
+    cx.drawImage(ia, 0, 0)
+    const pa = cx.getImageData(0, 0, c.width, c.height).data
+    cx.clearRect(0, 0, c.width, c.height); cx.drawImage(ib, 0, 0)
+    const pb = cx.getImageData(0, 0, c.width, c.height).data
+    let n = 0
+    for (let i = 0; i < pa.length; i += 4) {
+      if (Math.abs(pa[i] - pb[i]) + Math.abs(pa[i + 1] - pb[i + 1])
+          + Math.abs(pa[i + 2] - pb[i + 2]) > 30) n++
+    }
+    return { changed: n, total: pa.length / 4 }
+  }, [cold.toString('base64'), hot.toString('base64')])
+
+  // Park the pointer OUTSIDE the map before asserting: these tests share one
+  // app instance serially, and leaving the cursor hovering a panel would carry
+  // a hover state (and a drawn key) into the crosshair test below.
+  await page.mouse.move(5, 5)
+  await page.waitForTimeout(300)
+
+  console.log('[two-window] hover-key diff =', JSON.stringify(changed))
+  // The key occupies ~0.26 of the short edge, so it is a small but unmistakable
+  // fraction of the panel. A zero here means hover_only never drew.
+  expect(changed.changed, 'hovering the map did not reveal the IPF colour key')
+    .toBeGreaterThan(300)
+  ctx.assertNoJsErrors()
+})
+
 test('3) window 2 has BOTH toggle pairs and renders all four states', async () => {
   const { page } = ctx
   for (const t of ['ipf-view-2d', 'ipf-view-3d', 'ipf-style-points', 'ipf-style-heatmap']) {
