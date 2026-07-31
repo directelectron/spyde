@@ -202,14 +202,33 @@ def reflectors_from_phase(phase, *, min_dspacing: float = 0.7,
 def detector_directions(detector=(60, 60), pc=(0.5, 0.5, 0.55)) -> np.ndarray:
     """Unit vectors from the sample to each detector pixel (gnomonic).
 
-    ``(dy, dx, 3)``. ``pc`` is ``(pcx, pcy, L)`` in the fractional convention:
-    the pattern centre as a fraction of the detector width/height, and the
-    detector distance as a fraction of the width.
+    ``(dy, dx, 3)``. ``pc`` is ``(pcx, pcy, pcz)`` in **Bruker's convention**,
+    which is the one kikuchipy stores internally and the one every vendor PC is
+    converted to:
+
+    * ``pcx`` — the pattern centre measured from the LEFT edge, as a fraction
+      of the detector WIDTH,
+    * ``pcy`` — measured from the TOP edge, as a fraction of the detector
+      HEIGHT (so gnomonic y grows UPWARDS, opposite to the image row index),
+    * ``pcz`` — the sample-to-detector distance as a fraction of the detector
+      **HEIGHT** (Bruker's :math:`z_B^* = L / (N_y b \\delta)`).
+
+    Detector pixels are SQUARE, so the two in-plane components have to be
+    measured in the SAME unit — here, fractions of the detector height. That is
+    why ``x`` carries the aspect ratio :math:`N_x / N_y` and ``y`` does not:
+    a step of one pixel must subtend the same angle across the detector as down
+    it. Normalising both by their own axis length instead (``x`` by the width,
+    ``y`` by the height) silently assumes non-square pixels of exactly the
+    detector's aspect ratio, which anisotropically shears every band on a
+    non-square detector — invisible on the square detectors the synthetic data
+    uses, and a several-degree error in band ORIENTATION on a 4:3 one.
+    ``test_ebsd_bands_kikuchipy_parity`` pins this against kikuchipy.
     """
     pcx, pcy, L = float(pc[0]), float(pc[1]), float(pc[2])
     dy, dx = int(detector[0]), int(detector[1])
+    aspect = dx / dy                              # N_x / N_y; 1 when square
     gy, gx = np.mgrid[0:dy, 0:dx].astype(float)
-    rx = (gx + 0.5) / dx - pcx
+    rx = aspect * ((gx + 0.5) / dx - pcx)
     ry = pcy - (gy + 0.5) / dy                    # detector y is flipped
     r = np.stack([rx, ry, np.full_like(rx, L)], -1)
     return r / np.linalg.norm(r, axis=-1, keepdims=True)
@@ -365,13 +384,17 @@ def band_lines(euler, reflectors: Reflectors | None = None,
 
     dy, dx = int(detector[0]), int(detector[1])
     pcx, pcy, L = float(pc[0]), float(pc[1]), float(pc[2])
+    aspect = dx / dy
     nx, ny, nz = n_rot[:, 0], n_rot[:, 1], n_rot[:, 2]
 
-    # r·n = 0 with r = ((u/dx - pcx), (pcy - v/dy), L) and u, v the continuous
-    # pixel coordinates. Linear in (u, v) — the band centre IS a straight line.
-    a = nx / dx
+    # r·n = 0 with r = (aspect*(u/dx - pcx), (pcy - v/dy), L) — the same square
+    # -pixel gnomonic frame detector_directions builds — and u, v the continuous
+    # pixel coordinates. Linear in (u, v): the band centre IS a straight line.
+    # Note aspect/dx == 1/dy, i.e. BOTH in-plane axes are measured in fractions
+    # of the detector height. See detector_directions for why.
+    a = nx / dy
     b = -ny / dy
-    c = L * nz - pcx * nx + pcy * ny
+    c = L * nz - aspect * pcx * nx + pcy * ny
 
     segs, keep = _clip_line_to_box(a, b, c, float(dx), float(dy))
     # u, v measure from the frame edge; anyplotlib pixel coordinates put pixel
@@ -437,7 +460,9 @@ def zone_axis_points(euler, reflectors: Reflectors | None = None,
     tz = uniq_arr[:, 2]
     front = tz > 1e-6                              # behind the detector = invisible
     uniq_arr, tz = uniq_arr[front], tz[front]
-    u = dx * (pcx + uniq_arr[:, 0] * L / tz) - 0.5
+    # Inverting r = (aspect*(u/dx - pcx), pcy - v/dy, L) ∝ t: the x offset is
+    # dx/aspect == dy pixels per unit gnomonic x, not dx (detector_directions).
+    u = dx * pcx + dy * uniq_arr[:, 0] * L / tz - 0.5
     v = dy * (pcy - uniq_arr[:, 1] * L / tz) - 0.5
     inside = (u >= -0.5) & (u <= dx - 0.5) & (v >= -0.5) & (v <= dy - 0.5)
     return np.column_stack([u[inside], v[inside]]).astype(np.float32)
