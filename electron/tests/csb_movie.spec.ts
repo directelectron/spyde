@@ -16,7 +16,14 @@ const {
   navWindow,
 } = require('./_harness.cjs')
 
-const CSB = 'C:\\Users\\CarterFrancis\\Downloads'
+// Point this at any .csb to run the spec — SPYDE_CSB_TEST_FILE=/path/to/x.csb.
+// The default is the 8192² Apollo XS movie on the author's machine; hard-coding
+// it alone made the spec unrunnable (silently skipped) for everyone else,
+// including CI and any second machine. `spyde/tests/migrated/test_csb_events.py`
+// builds real CSB bytes (`_csb_with_events`), so a synthetic stream large
+// enough to drive this is a few lines away when the real movie is not around.
+const CSB = process.env.SPYDE_CSB_TEST_FILE
+  || 'C:\\Users\\CarterFrancis\\Downloads'
   + '\\directelectron_csb-data-for-testing-de_csb-py_2026-07-22_1739'
   + '\\20240604_00001_ces_movie_234.csb'
 const SHOTS = 'csb_shots'

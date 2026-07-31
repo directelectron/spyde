@@ -44,7 +44,7 @@ Python deps are in `pyproject.toml`. Key non-PyPI deps from custom forks (check 
 
 Frontend deps (Electron, React, electron-vite, Playwright) are in `electron/package.json`.
 
-Supported file extensions: `.hspy`, `.zspy`, `.mrc`, `.tif`, `.tiff`, `.de5` (see `SUPPORTED_EXTS` in `session.py`).
+Supported file extensions: `.hspy`, `.zspy`, `.mrc`, `.tif`, `.tiff`, `.de5`, `.csb` (see `SUPPORTED_EXTS` in `backend/_session_files.py`, re-exported from `session.py`). Adding one means updating that tuple **and** the Open-dialog `filters` in `electron/src/main/index.ts` (two places: the File menu and the `spyde:open-file` IPC handler) — the dialog will not offer an extension the tuple accepts.
 
 ## Architecture
 
@@ -98,6 +98,14 @@ WIP modules for live microscope control: camera, stage, STEM, TEM, particle scan
 ### Vector orientation mapping (`spyde/actions/`)
 - `vector_orientation.py`: CPU reference — per-pattern scipy-LM fit of pose `(θ, A, t)` where `v ≈ A·Rot(θ)·g_template + t`. `_residual` (soft-assign + no-match sink + strain-band penalty) is the cost both paths must agree on. Strain via polar decomposition of `M = A·Rot(θ)`.
 - `vector_orientation_gpu.py`: **the production path** — fits the *whole field at once* on the GPU (batched torch + Adam), no dask, no per-pattern loop. The vectors and library are tiny, so the entire scan is one batched optimisation. `compute_vector_orientation_gpu()` is dispatched first when `gpu_available()`; CPU is the fallback. On SpEd Ag (13k patterns × 1081 templates) it runs in ~8s. See the GPU Computing section for the non-obvious constraints baked into it.
+
+### CSB event-stream reader (`spyde/external/rsciio_csb/`, `spyde/actions/csb_*.py`)
+A Direct Electron `.csb` file is a **sparse event stream, not a frame stack** — an image only exists once you pick a time window and integrate the events in it. So "opening" one means choosing an exposure, and the reader exists to make that choice cheap to change and cheap to scrub.
+- `external/rsciio_csb/` is laid out as a **stock rsciio plugin** (`__init__` re-exporting `file_reader`, `_api.py`, `specifications.yaml`) and imports nothing from SpyDE — so it can be moved into RosettaSciIO as `rsciio/csb/` unchanged. `external/rosettasciio/csb_format.py` appends its spec to `rsciio.IO_PLUGINS` at runtime, which is what makes `hs.load("movie.csb", lazy=True)` resolve to it through ordinary extension dispatch. Delete both when the plugin lands upstream.
+- **`lazy=True` returns one time plane per dask block**, each integrating only its own window. Load-bearing, not incidental — it is the same constraint as Live-Display §1: a graph that read a whole chunk to yield one frame cost the MRC path a 40× scrub regression.
+- **The navigator is free**: per-plane total counts come from the block table alone, reading zero payload bytes. The reader publishes it as `original_metadata.csb.plane_counts` and `_session_files._reader_navigator` turns it into a calibrated navigator. Without it, building the overview means integrating the *entire movie* — the one thing this reader exists to avoid. It must carry the nav axis calibration, or a 1-D selector resolves every position to index 0 (`calibrated_nav_signal`).
+- **The accumulator is NOT concurrency-safe** — `reset()` + `add_frames()` mutate one shared device/host buffer, so integrations take a lock rather than each getting an accumulator (at 8192² one buffer is 268 MB).
+- `actions/csb_to_frames.py` re-cuts the stream at a different exposure; `actions/csb_raw_frame.py` swaps the selector's producer to show ONE raw camera frame (the dock's Point width "0"). Toolbar gating uses the `requires_original_metadata:` YAML key (`plot_control_toolbar._has_original_metadata`) — a format-specific gate, because a CSB movie is an ordinary `insitu` signal and `signal_type` cannot express it.
 
 ### Backend IPC / logging (`spyde/backend/`)
 - `ipc.py`: `emit()` / `emit_status` / `emit_error` / `emit_progress` — write JSON messages to stdout for the Electron main process to relay to the renderer.
