@@ -1,5 +1,6 @@
 from __future__ import annotations
 import importlib
+import logging
 from typing import TYPE_CHECKING
 from pathlib import Path
 
@@ -9,6 +10,8 @@ if TYPE_CHECKING:
 from spyde import TOOLBAR_ACTIONS
 
 from functools import partial
+
+logger = logging.getLogger(__name__)
 
 
 def resolve_icon_path(icon_value: str) -> str:
@@ -70,6 +73,30 @@ def install_hint(name: str) -> str:
     """The pip line that would make a gated action appear."""
     extra = _EXTRA_FOR_PACKAGE.get(name)
     return f'pip install "spyde[{extra}]"' if extra else f"pip install {name}"
+
+
+def _has_original_metadata(signal, dotted: str | None) -> bool:
+    """``requires_original_metadata:`` gate — a dotted path that must exist in
+    the signal's ``original_metadata``.
+
+    The FORMAT-specific gate, mirroring ``requires_vectors`` (which gates on a
+    result being attached). Some actions only mean anything for one file
+    format: "To Frames" re-cuts an exposure, which is a question you can only
+    ask of a CSB event stream, not of the dense movie it produces. Gating on
+    signal_type cannot express that — a CSB movie is an ordinary ``insitu``
+    signal, and should stay one, so every in-situ feature keeps working on it.
+    """
+    if not dotted:
+        return True
+    om = getattr(signal, "original_metadata", None)
+    if om is None:
+        return False
+    try:
+        return bool(om.has_item(dotted))
+    except Exception as e:
+        logger.debug("requires_original_metadata check for %r failed: %s",
+                     dotted, e)
+        return False
 
 
 def _packages_present(meta: dict) -> bool:
@@ -194,6 +221,10 @@ def get_toolbar_actions_for_plot(
                 or isinstance(signal, _resolve_signal_class(signal_class))
             )
             and (not requires_vectors or has_vectors)
+            # requires_original_metadata: hide unless the signal came from the
+            # format this action is about (see _has_original_metadata).
+            and _has_original_metadata(
+                signal, meta.get("requires_original_metadata"))
             # requires_package: hide until the optional extra is installed
             # (exspy / kikuchipy / atomap). Checked by find_spec, so this
             # costs nothing and never imports the package.
@@ -276,6 +307,7 @@ def _action_matches_plot(action: str, meta: dict, plot_state: "PlotState") -> bo
             or isinstance(signal, _resolve_signal_class(signal_class))
         )
         and (not requires_vectors or has_vectors)
+        and _has_original_metadata(signal, meta.get("requires_original_metadata"))
         and _packages_present(meta)
         and (plot_state.dimensions in plot_dim)
         and (

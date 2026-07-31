@@ -484,6 +484,49 @@ class Session(
         except Exception as e:
             log.warning("set_selector_mode failed: %s", e)
 
+    def set_selector_sum(self, window_id: int, frames: int,
+                         selector_id: int | None = None) -> None:
+        """Set how many navigation positions a POINT selector sums.
+
+        1 is a plain crosshair. Higher keeps the single pointer and widens what
+        it reads — n frames of an in-situ movie summed for signal, or the
+        exposure of a sparse event stream chosen without turning the slider
+        into a draggable range (which is what Integrate is for).
+        """
+        sel = None
+        if selector_id is not None:
+            window_id, sel = getattr(self, "_nav_selectors_by_id", {}).get(
+                selector_id, (window_id, None))
+        if sel is None:
+            sel = getattr(self, "_nav_selectors", {}).get(window_id)
+        if sel is None or not hasattr(sel, "sum_frames"):
+            return
+        try:
+            from spyde.actions import csb_raw_frame
+            # 0 means "go BELOW a plane" — show one raw camera frame. It is a
+            # different integration, not a slice of the loaded plane stack, so
+            # it swaps the selector's producer rather than widening the window.
+            # The width itself stays 1: raw is a single frame by definition.
+            raw = int(frames) == csb_raw_frame.RAW
+            csb_raw_frame.install(sel, raw)
+            sel.sum_frames = 1 if raw else max(1, int(frames))
+            # Re-read at the new width immediately; the pointer has not moved,
+            # so nothing else would trigger it. update_data() takes no `force`
+            # — passing one raised, and since the raise happened BEFORE the
+            # emit below, the width applied but the dock never heard about it
+            # and its badge kept reading the old value.
+            if hasattr(sel, "update_data"):
+                sel.update_data()
+            emit({
+                "type": "selector_info",
+                "window_id": window_id,
+                "selector_id": id(sel),
+                "color": getattr(sel, "color", None),
+                "sum_frames": csb_raw_frame.RAW if raw else int(sel.sum_frames),
+            })
+        except Exception as e:
+            log.warning("set_selector_sum failed: %s", e)
+
     def _select_signal_node(self, plot, signal_id) -> None:
         """Switch to the signal-tree node with the given id (the id(node.signal)
         emitted in the signal_tree message). The pick can come from ANY of the

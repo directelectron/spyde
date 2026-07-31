@@ -294,6 +294,45 @@ functions:
             type: enum
             default: intensity
             options: [intensity, count]
+  To Frames:
+    description: Re-cut a CSB event stream into an in-situ movie at a chosen frame rate, integrating the events in each exposure. Adds a new lazy dataset to the signal tree.
+    icon: drawing/toolbars/icons/playback.svg
+    function: spyde.actions.csb_to_frames.csb_to_frames
+    requires_original_metadata: csb
+    plot_dim: [2]
+    toolbar_side: bottom
+    navigation: False
+    parameters:
+      fps:
+        name: Frame rate (fps)
+        type: float
+        default: 100.0
+        min: 0.001
+        max: 100000.0
+      exposure_ms:
+        name: or Exposure (ms)
+        type: float
+        default: 0.0
+        min: 0.0
+        max: 60000.0
+      # The raw camera frame is the atomic exposure — 390 us on the test movie,
+      # ~0.005 counts/px, which is why integrating is the default. But it has to
+      # be REACHABLE: 1 here gives one plane per raw frame, which is the only
+      # way to see what the camera actually recorded rather than a sum of it.
+      # Takes precedence over both fields above (see _resolve_exposure).
+      frames_per_plane:
+        name: or Raw frames per plane
+        type: int
+        default: 0
+        min: 0
+        max: 100000
+      bin:
+        name: Bin (0 = auto)
+        type: int
+        default: 0
+        min: 0
+        max: 16
+
   EBSD Indexing:
     description: Dictionary indexing of EBSD patterns. Build a simulated pattern dictionary, check the matched orientation's Kikuchi bands live under the crosshair, then index the whole scan into an IPF orientation map.
     icon: drawing/toolbars/icons/ebsd.svg

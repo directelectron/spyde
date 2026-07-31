@@ -171,6 +171,13 @@ spyde = [
     "drawing/toolbars/icons/*.svg",
     "models/weights/*.pt",
     "models/weights/registry.json",
+    # The CSB plugin's rsciio spec. `"*.yaml"` above only matches spyde/*.yaml —
+    # a glob does not cross directories — so without this line the file is
+    # absent from a built wheel. Nothing reads it at RUNTIME (csb_format._SPEC
+    # mirrors it deliberately), but it is the copy that becomes authoritative
+    # the day the plugin moves into rosettasciio, and test_csb_reader.py reads
+    # it back to assert the two have not drifted.
+    "external/rsciio_csb/*.yaml",
 ]
 
 [project.optional-dependencies]

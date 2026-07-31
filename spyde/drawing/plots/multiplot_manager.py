@@ -231,14 +231,54 @@ class MultiplotManager:
             idx = len(self.navigation_selectors[plot_window])
             self.session.register_nav_selector(plot_window.window_id, selector)
             from spyde.backend.ipc import emit
-            emit({
+            # `sum_frames` / `nav_size` are only sent for a selector that can
+            # widen a POINT into a summed window — a 1-D (movie/time) navigator.
+            # Their absence is what tells the dock not to offer the control on a
+            # 2-D navigator, where "n frames" has no unambiguous direction and
+            # Integrate is the right tool anyway.
+            info = {
                 "type": "selector_info",
                 "window_id": plot_window.window_id,
                 "selector_id": id(selector),
                 "color": color,
                 "mode": mode,
                 "title": "Navigator" if idx <= 1 else f"Navigator {idx}",
-            })
+            }
+            if hasattr(selector, "sum_frames"):
+                info["sum_frames"] = int(getattr(selector, "sum_frames", 1) or 1)
+                try:
+                    ax = (selector.current_plot.plot_state.current_signal
+                          .axes_manager.signal_axes[0])
+                    info["nav_size"] = int(ax.size)
+                    # Seconds per navigation position, so the dock can label a
+                    # summed window with the effective rate it produces. Only
+                    # meaningful on a time axis; 0 tells it to label in frames
+                    # alone.
+                    units = str(getattr(ax, "units", "") or "").lower()
+                    info["nav_scale"] = (float(ax.scale)
+                                         if units in ("s", "sec", "second",
+                                                      "seconds") else 0.0)
+                except Exception:
+                    info["nav_size"] = 0
+                    info["nav_scale"] = 0.0
+                # How many RAW camera frames one navigation position
+                # integrates, when the source has a cadence finer than the
+                # positions it was loaded at (a CSB event stream). Absent
+                # otherwise, which is what tells the dock not to offer a width
+                # below one position for an ordinary movie — there is nothing
+                # underneath it to show.
+                # Off the TREE ROOT, not `selector.current_plot` (that is the
+                # navigator, whose signal is the free plane-counts overview and
+                # carries no source metadata) and not `child` (which has no
+                # signal yet — create_plot_states runs after this emit).
+                try:
+                    from spyde.actions.csb_raw_frame import raw_frames_per_plane
+                    per = raw_frames_per_plane(self.signal_tree.root)
+                    if per:
+                        info["raw_per_plane"] = int(per)
+                except Exception as e:
+                    logger.debug("raw-frame availability check failed: %s", e)
+            emit(info)
         except Exception as e:
             logger.debug("emitting navigator selector_info failed: %s", e)
 
