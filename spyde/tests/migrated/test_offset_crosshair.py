@@ -174,6 +174,79 @@ class TestOffsetCrosshair:
         finally:
             session.shutdown()
 
+    # ── the "+" toggle is BACKEND-owned: button ON ⟺ crosshair alive ────────
+    #
+    # The dock used to keep its own boolean, which drifted: focusing another
+    # window reset it (the "+" went dark) while the crosshair stayed on the
+    # first plot, and the next click then targeted the NEW active plot — so the
+    # stale crosshair could never be dismissed from the UI. Every toggle now
+    # answers with the state the backend actually reached.
+
+    def test_toggle_emits_pick_state(self, captured_messages):
+        session, plot = self._session_with_plot()
+        try:
+            plot._plot2d = _FakePlot2D()
+            captured_messages.clear()
+            session._set_offset_crosshair(plot, {"on": True})
+            picks = [m for m in captured_messages if m.get("type") == "offset_pick"]
+            assert picks and picks[-1]["on"] is True
+            assert picks[-1]["window_id"] == plot.window_id
+
+            captured_messages.clear()
+            session._set_offset_crosshair(plot, {"on": False})
+            picks = [m for m in captured_messages if m.get("type") == "offset_pick"]
+            assert picks and picks[-1]["on"] is False
+        finally:
+            session.shutdown()
+
+    def test_refused_toggle_reports_off(self, captured_messages):
+        """A toggle-on the backend can't honour (no figure to hang the widget
+        on) must report OFF — otherwise the dock lights a button with no
+        crosshair under it, and the next click sends `on: False` (a no-op),
+        which is the "have to toggle it twice" symptom."""
+        session, plot = self._session_with_plot()
+        try:
+            plot._plot2d = None
+            captured_messages.clear()
+            session._set_offset_crosshair(plot, {"on": True})
+            picks = [m for m in captured_messages if m.get("type") == "offset_pick"]
+            assert picks and picks[-1]["on"] is False
+            assert getattr(plot, "_offset_cross", None) is None
+        finally:
+            session.shutdown()
+
+    def test_node_switch_clears_the_crosshair(self, captured_messages):
+        """The crosshair captured THIS node's signal axes, so a node switch
+        would leave it recalibrating the node the user just left. It is torn
+        down, and the dock is told so the "+" goes with it."""
+        session, plot = self._session_with_plot()
+        try:
+            plot._plot2d = _FakePlot2D()
+            session._set_offset_crosshair(plot, {"on": True})
+            w = plot._plot2d.widget
+            assert w is not None
+            captured_messages.clear()
+            # Switch to the node the plot already displays — the switch path is
+            # what's under test, not the transform.
+            current = plot.plot_state.current_signal
+            session._select_signal_node(plot, id(current))
+            assert getattr(plot, "_offset_cross", None) is None
+            picks = [m for m in captured_messages if m.get("type") == "offset_pick"]
+            assert picks and picks[-1]["on"] is False
+        finally:
+            session.shutdown()
+
+    def test_clear_is_a_noop_without_a_crosshair(self, captured_messages):
+        session, plot = self._session_with_plot()
+        try:
+            plot._plot2d = _FakePlot2D()
+            captured_messages.clear()
+            session._clear_offset_crosshair(plot)
+            assert not [m for m in captured_messages
+                        if m.get("type") == "offset_pick"]
+        finally:
+            session.shutdown()
+
     def test_starts_at_current_offset_no_change_until_drag(self):
         """Toggling on must NOT change the offset — the crosshair starts at the
         current origin; the offset only moves when the user drags."""

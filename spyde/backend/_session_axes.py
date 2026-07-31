@@ -199,7 +199,55 @@ class AxesEditorMixin:
             "title": title,
         })
 
+    def _emit_offset_pick(self, plot) -> None:
+        """Tell the dock whether ``plot`` currently HAS an origin crosshair.
+
+        The backend owns the widget (``plot._offset_cross``), so it is also the
+        source of truth for the Axes table's "+" toggle: the dock renders the
+        button from this message, keyed by window id, instead of keeping its own
+        boolean. That is the whole invariant — **button ON ⟺ crosshair alive** —
+        and it is what a renderer-local flag could not hold: switching the active
+        window silently reset the flag while the widget stayed on the plot (and a
+        toggle-on that the backend REFUSED — 1-D signal, no plot2d — lit a button
+        with no crosshair under it).
+        """
+        wid = getattr(plot, "window_id", None)
+        if wid is None:
+            return
+        ipc.emit({
+            "type": "offset_pick",
+            "window_id": wid,
+            "on": getattr(plot, "_offset_cross", None) is not None,
+        })
+
+    def _clear_offset_crosshair(self, plot) -> None:
+        """Remove ``plot``'s origin crosshair if it has one (and tell the dock).
+
+        Used where the crosshair's TARGET stops being valid — e.g. a signal-tree
+        node switch, after which the captured signal axes belong to the node the
+        user just left. A no-op when there's no crosshair, so callers can fire it
+        unconditionally.
+        """
+        if plot is None or getattr(plot, "_offset_cross", None) is None:
+            return
+        self._set_offset_crosshair(plot, {"on": False})
+
     def _set_offset_crosshair(self, plot, payload: dict) -> None:
+        """Toggle the "set origin" crosshair, then report the resulting state.
+
+        The report is in a ``finally`` so EVERY exit path (including the early
+        returns for a plot with no figure / fewer than two display axes, and a
+        widget that failed to build) tells the dock what actually happened —
+        never "the renderer asked for on, so it must be on".
+        """
+        if plot is None:
+            return
+        try:
+            self._apply_offset_crosshair(plot, payload)
+        finally:
+            self._emit_offset_pick(plot)
+
+    def _apply_offset_crosshair(self, plot, payload: dict) -> None:
         """Toggle a draggable "set origin" crosshair on the ACTIVE plot.
 
         The crosshair edits the offsets of the axes the active plot is drawn
@@ -212,8 +260,6 @@ class AxesEditorMixin:
         payload {"on": True}  → drop the crosshair and update offsets as it moves.
                 {"on": False} → remove the crosshair.
         """
-        if plot is None:
-            return
         tree = getattr(plot, "signal_tree", None)
         if tree is None:
             return

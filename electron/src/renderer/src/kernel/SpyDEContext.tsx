@@ -177,6 +177,11 @@ interface State {
   signalTreeActive: Map<number, number>   // windowId → active node signal_id
   navigatorOptions: Map<number, NavigatorOptions>   // navigator windowId → named navigators
   axes: Map<number, AxisRow[]>
+  // windowId → the Axes table "+" origin-pick is live on that window's plot.
+  // BACKEND-OWNED (the `offset_pick` message): it owns the crosshair widget, so
+  // it owns the toggle. A renderer-local boolean drifted — switching windows
+  // reset it while the crosshair stayed on the plot.
+  offsetPick: Map<number, boolean>
   composition: Map<number, Composition>     // windowId → sample elements + percentages
   activeActions: Map<number, Set<string>>   // windowId → action names with live output
   subItems: Map<number, Map<string, SubItem[]>>  // windowId → action → dynamic chips
@@ -235,6 +240,7 @@ type Action =
   | { type: 'METADATA'; windowIds: number[]; metadata: MetadataDict; editable?: Record<string, Record<string, string>> }
   | { type: 'COMPOSITION'; windowIds: number[]; composition: Composition }
   | { type: 'AXES'; windowIds: number[]; axes: AxisRow[] }
+  | { type: 'OFFSET_PICK'; windowId: number; on: boolean }
   | { type: 'ACTION_ACTIVE'; windowId: number; name: string; active: boolean }
   | { type: 'SUB_ITEM'; windowId: number; action: string; name: string; color: string; vtype?: string; calculation?: string; active: boolean }
   | { type: 'HISTOGRAM'; windowId: number; histogram: Histogram }
@@ -408,6 +414,7 @@ function spydeReducer(state: State, action: Action): State {
         metadata: drop(state.metadata),
         metadataEditable: drop(state.metadataEditable),
         axes: drop(state.axes),
+        offsetPick: drop(state.offsetPick),
         composition: drop(state.composition),
         signalTrees: drop(state.signalTrees),
         signalTreeActive: drop(state.signalTreeActive),
@@ -442,6 +449,13 @@ function spydeReducer(state: State, action: Action): State {
       const axes = new Map(state.axes)
       for (const wid of action.windowIds) axes.set(wid, action.axes)
       return { ...state, axes }
+    }
+
+    case 'OFFSET_PICK': {
+      if ((state.offsetPick.get(action.windowId) ?? false) === action.on) return state
+      const offsetPick = new Map(state.offsetPick)
+      offsetPick.set(action.windowId, action.on)
+      return { ...state, offsetPick }
     }
 
     case 'ACTION_ACTIVE': {
@@ -705,6 +719,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     signalTreeActive: new Map(),
     navigatorOptions: new Map(),
     axes: new Map(),
+    offsetPick: new Map(),
     activeActions: new Map(),
     subItems: new Map(),
     computingWindows: new Set<number>(),
@@ -1037,6 +1052,14 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
             type: 'AXES',
             windowIds: msg.window_ids ?? [],
             axes: msg.axes ?? [],
+          })
+          break
+
+        case 'offset_pick':
+          dispatch({
+            type: 'OFFSET_PICK',
+            windowId: msg.window_id,
+            on: !!msg.on,
           })
           break
 

@@ -477,6 +477,12 @@ class Session(
         for p in cands:
             for sig in list(getattr(p, "plot_states", {}) or {}):
                 if id(sig) == signal_id:
+                    # The origin crosshair captured THIS plot's current signal
+                    # axes; after the switch those belong to the node the user
+                    # just left, so dragging it would recalibrate the wrong
+                    # signal. Tear it down (and tell the dock, so the "+" goes
+                    # with it — button ON ⟺ crosshair alive).
+                    self._clear_offset_crosshair(p)
                     from spyde.actions.lifecycle import show_tree_node
                     show_tree_node(p, tree, sig)
                     emit({"type": "status", "text": "Switched signal node"})
