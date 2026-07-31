@@ -87,6 +87,31 @@ test('periodic-table picker writes the composition (set_composition)', async () 
   expect((setc!.payload.percentages as Record<string, number>).Fe).toBe(70)
 })
 
+test('the f-block rows are full-height, not squashed into the spacer', async () => {
+  await aSignalWindow()
+  await page.getByTestId('composition-edit').click()
+  await expect(page.getByTestId('periodic-table')).toBeVisible()
+
+  // The gap between the main table and the detached f-block is a REAL grid row,
+  // and the lanthanides used to be placed on it — so La…Lu rendered 8 px tall,
+  // unreadable and barely clickable. Compare against a d-block cell rather than
+  // a magic number, so this stays true if the cell size ever changes.
+  const fe = (await page.getByTestId('ptable-el-Fe').boundingBox())!
+  for (const sym of ['La', 'Lu', 'Ac', 'Lr']) {
+    const box = (await page.getByTestId(`ptable-el-${sym}`).boundingBox())!
+    expect(box.height, `${sym} is not a full-height cell`).toBeCloseTo(fe.height, 0)
+  }
+  // …and the two f-block rows are still separate rows, below the main table.
+  const la = (await page.getByTestId('ptable-el-La').boundingBox())!
+  const ac = (await page.getByTestId('ptable-el-Ac').boundingBox())!
+  const ra = (await page.getByTestId('ptable-el-Ra').boundingBox())!
+  expect(la.y).toBeGreaterThan(ra.y + ra.height)
+  expect(ac.y).toBeGreaterThan(la.y + la.height * 0.9)
+
+  await page.screenshot({ path: join(__dirname, '..', 'periodic_table_fblock.png') })
+  await page.getByTestId('ptable-close').click()
+})
+
 test('dock shows composition chips from the backend echo', async () => {
   await aSignalWindow()
   // Backend echo (set in metadata.Sample) → chips with element + atomic %.

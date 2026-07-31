@@ -10,8 +10,21 @@ interface El { z: number; sym: string; row: number; col: number; cat: Cat }
 type Cat = 'alkali' | 'alkaline' | 'tm' | 'post' | 'metalloid' | 'nonmetal'
   | 'halogen' | 'noble' | 'lanth' | 'act'
 
-// One entry per element with its (row, col) on the standard grid. The f-block
-// sits in rows 8/9 (cols 3–17); period 6/7 group 3 is the gap.
+// Grid geometry. The f-block is conventionally drawn detached below the main
+// table, so there is a thin SPACER row between them — and that row is a real
+// grid row, which is what made the lanthanides render 8 px tall: they were
+// placed on row 8, the spacer itself. Named here (and used to build
+// gridTemplateRows in S.grid) so the two can't drift apart again.
+const MAIN_ROWS = 7          // periods 1–7
+const CELL_PX = 30
+const SPACER_PX = 8
+const SPACER_ROW = MAIN_ROWS + 1     // 8
+const LANTH_ROW = SPACER_ROW + 1     // 9
+const ACT_ROW = LANTH_ROW + 1        // 10
+
+// One entry per element with its (row, col) on the grid above. The f-block
+// occupies cols 3–17 of its two rows; period 6/7 group 3 is the gap it came out
+// of.
 const E = (z: number, sym: string, row: number, col: number, cat: Cat): El => ({ z, sym, row, col, cat })
 
 const ELEMENTS: El[] = [
@@ -42,11 +55,11 @@ const ELEMENTS: El[] = [
   E(108, 'Hs', 7, 8, 'tm'), E(109, 'Mt', 7, 9, 'tm'), E(110, 'Ds', 7, 10, 'tm'), E(111, 'Rg', 7, 11, 'tm'),
   E(112, 'Cn', 7, 12, 'tm'), E(113, 'Nh', 7, 13, 'post'), E(114, 'Fl', 7, 14, 'post'), E(115, 'Mc', 7, 15, 'post'),
   E(116, 'Lv', 7, 16, 'post'), E(117, 'Ts', 7, 17, 'halogen'), E(118, 'Og', 7, 18, 'noble'),
-  // f-block (rows 8/9, cols 3–17)
+  // f-block — BELOW the spacer row, cols 3–17.
   ...['La', 'Ce', 'Pr', 'Nd', 'Pm', 'Sm', 'Eu', 'Gd', 'Tb', 'Dy', 'Ho', 'Er', 'Tm', 'Yb', 'Lu']
-    .map((s, i) => E(57 + i, s, 8, 3 + i, 'lanth')),
+    .map((s, i) => E(57 + i, s, LANTH_ROW, 3 + i, 'lanth')),
   ...['Ac', 'Th', 'Pa', 'U', 'Np', 'Pu', 'Am', 'Cm', 'Bk', 'Cf', 'Es', 'Fm', 'Md', 'No', 'Lr']
-    .map((s, i) => E(89 + i, s, 9, 3 + i, 'act')),
+    .map((s, i) => E(89 + i, s, ACT_ROW, 3 + i, 'act')),
 ]
 
 const CAT_COLOR: Record<Cat, string> = {
@@ -158,8 +171,10 @@ const S: Record<string, React.CSSProperties> = {
   x: { background: 'none', border: 'none', color: '#f38ba8', cursor: 'pointer', fontSize: 14 },
   grid: {
     display: 'grid',
-    gridTemplateColumns: 'repeat(18, 30px)',
-    gridTemplateRows: 'repeat(7, 30px) 8px repeat(2, 30px)',
+    gridTemplateColumns: `repeat(18, ${CELL_PX}px)`,
+    // periods 1–7, the detached-f-block spacer, then the two f-block rows.
+    gridTemplateRows:
+      `repeat(${MAIN_ROWS}, ${CELL_PX}px) ${SPACER_PX}px repeat(2, ${CELL_PX}px)`,
     gap: 2,
   },
   cell: {
