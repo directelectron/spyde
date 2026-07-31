@@ -289,6 +289,91 @@ async function countColorPixels(page, kind) {
 }
 
 /**
+ * The crosshair's centre inside a navigator window's figure iframe, in CSS px
+ * RELATIVE TO THAT IFRAME (add the iframe's bounding box to get page coords).
+ * Returns null when no crosshair is on screen.
+ *
+ * Found by locating the pure-green guide lines the widget overlay draws — the
+ * column and the row carrying the most green pixels intersect at the centre.
+ * (Pure green, blue≈0: the same signature `countColorPixels` deliberately
+ * EXCLUDES from its '#30ff60' marker count.)
+ *
+ * **Use this to drive a navigator — do not press at an arbitrary point.** An
+ * anyplotlib crosshair is grabbed, not clicked to: the hit-test only matches
+ * within a few px of the centre, and the drag then moves it by the pointer
+ * DELTA. A press anywhere else does nothing at all, silently — which is how a
+ * spec can "pass" a navigate-and-observe assertion while the navigator never
+ * moved and the picture only changed for unrelated reasons.
+ */
+async function crosshairAt(win) {
+  const ifel = await win.locator('iframe').first().elementHandle()
+  if (!ifel) return null
+  const frame = await ifel.contentFrame()
+  if (!frame) return null
+  return frame.evaluate(() => {
+    let best = null
+    for (const c of Array.from(document.querySelectorAll('canvas'))) {
+      const g = c.getContext('2d')
+      if (!g || !c.width || !c.height) continue
+      const d = g.getImageData(0, 0, c.width, c.height).data
+      const cols = new Int32Array(c.width), rows = new Int32Array(c.height)
+      let total = 0
+      for (let y = 0; y < c.height; y++) {
+        for (let x = 0; x < c.width; x++) {
+          const p = (y * c.width + x) * 4
+          const r = d[p], gr = d[p + 1], b = d[p + 2], a = d[p + 3]
+          if (a > 40 && gr > 110 && gr > r + 45 && gr > b + 45) {
+            cols[x]++; rows[y]++; total++
+          }
+        }
+      }
+      if (!total || (best && total <= best.green)) continue
+      let bx = 0, by = 0
+      for (let x = 1; x < c.width; x++) if (cols[x] > cols[bx]) bx = x
+      for (let y = 1; y < c.height; y++) if (rows[y] > rows[by]) by = y
+      // Canvas backing store px → CSS px (devicePixelRatio makes them differ).
+      const rect = c.getBoundingClientRect()
+      best = {
+        x: rect.left + (bx + 0.5) * (rect.width / c.width),
+        y: rect.top + (by + 0.5) * (rect.height / c.height),
+        green: total,
+      }
+    }
+    return best
+  })
+}
+
+/**
+ * Grab the crosshair in navigator window *win* and walk it, calling
+ * `onStep(i)` after each move has had `settleMs` to paint. `dx`/`dy` are the
+ * per-step offsets in page px.
+ *
+ * Returns `{ start, end, moved }` (iframe-relative positions + the distance the
+ * crosshair actually travelled) so the caller can ASSERT it moved — without
+ * that guard a navigate-and-observe spec cannot tell a working navigator from a
+ * press that missed.
+ */
+async function dragCrosshair(page, win, { dx = -26, dy = 0, steps = 5,
+                                          settleMs = 450, onStep } = {}) {
+  const box = await win.locator('iframe').first().boundingBox()
+  const start = await crosshairAt(win)
+  if (!box || !start) return { start: null, end: null, moved: 0 }
+  const gx = box.x + start.x, gy = box.y + start.y
+  await page.mouse.move(gx, gy)
+  await page.mouse.down()
+  for (let i = 1; i <= steps; i++) {
+    await page.mouse.move(gx + dx * i, gy + dy * i, { steps: 3 })
+    await page.waitForTimeout(settleMs)
+    if (onStep) await onStep(i)
+  }
+  await page.mouse.up()
+  await page.waitForTimeout(400)
+  const end = await crosshairAt(win)
+  const moved = end ? Math.hypot(end.x - start.x, end.y - start.y) : 0
+  return { start, end, moved }
+}
+
+/**
  * Window pickers. The breadcrumb Pill replaced the old "<name> Navigator"
  * title text with an S-/N- kind-prefix chip, so `filter({ hasText:
  * 'Navigator' })` no longer distinguishes windows — select by prefix instead.
@@ -368,6 +453,8 @@ module.exports = {
   loadTestVectors,
   dumpDaskState,
   countColorPixels,
+  crosshairAt,
+  dragCrosshair,
   sigWindow,
   navWindow,
   navWindows,

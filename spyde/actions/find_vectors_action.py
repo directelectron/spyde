@@ -226,6 +226,37 @@ def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = Tr
             nav_plot.needs_auto_level = True
             nav_plot.set_data(np.nan_to_num(display).astype(np.float32))
 
+    # ── Progressive (live) SIGNAL plot: the result window is a navigator + a
+    #    signal plot, and only the navigator used to come alive during the run —
+    #    the diffraction pattern sat on its zero placeholder until _finalize.
+    #    The client already receives every chunk's raw peaks block (that is what
+    #    the count map above is derived from), so keep them and render from them:
+    #    each landing block paints one sample position (so the DP visibly updates
+    #    alongside the count map), and the navigator→signal slice function reads
+    #    any ALREADY-computed position on demand. _finalize's real render display
+    #    takes over at the end; preview.close() never clobbers it. See
+    #    spyde/actions/live_signal.py.
+    from spyde.actions.find_vectors import LiveVectorFrames
+    from spyde.actions.live_signal import attach_signal_preview
+    # (H, W) from the SIGNAL AXES, exactly like SpyDEDiffractionVectors.
+    # render_frame (axis 0 = kx = columns, axis 1 = ky = rows) — so a
+    # non-square detector previews at the same shape it finalizes at.
+    live_frames = LiveVectorFrames(
+        sig_hw=(int(am.signal_axes[1].size), int(am.signal_axes[0].size)),
+        kernel_radius_px=float(p.get("kernel_radius", 5)),
+    )
+    preview = attach_signal_preview(
+        session, new_tree, render=live_frames.render,
+        nav_shape=nav_shape_full, name="fv-signal",
+    )
+
+    def _on_chunk_block(nav_slices, block):
+        """Per-chunk hand-off from the compute (a Dask callback thread)."""
+        if preview is None:
+            return
+        if live_frames.add(nav_slices, block):
+            preview.note_block(nav_slices)
+
     # Marks the batch as in-flight so a downstream action opened in the gap
     # (e.g. Strain Mapping) can tell "still computing, keep waiting" apart from
     # "nothing is running, give up" instead of guessing off a fixed timeout —
@@ -257,6 +288,7 @@ def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = Tr
             log.info("[fv-batch] compute starting (shm=%s)", shm_name)
             vecs = _do_compute_vectors(src, p, main_window=session,
                                        signal_tree=src_tree, shm_name=shm_name,
+                                       on_chunk_block=_on_chunk_block,
                                        stopped_flag=stopped_flag)
             log.info("[fv-batch] compute returned in %.1fs (vecs=%s)",
                      _time.monotonic() - t0, "none" if vecs is None else "ok")
@@ -276,6 +308,14 @@ def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = Tr
             log.exception("Find Vectors compute failed")
         finally:
             stop_poll()
+            # Hand the signal plot back. AFTER _finalize on purpose: close()
+            # restores the placeholder slice function only while the preview's
+            # own one is still installed, so the real render display that
+            # _finalize just wired stays put and a cancelled/failed run still
+            # gets its original slice function back.
+            if preview is not None:
+                preview.close()
+            live_frames.clear()
             new_tree._fv_batch_running = False
             src_tree._fv_batch_running = False
             # Reset the workers' RSS accounting after the batch churn — see
