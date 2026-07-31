@@ -41,10 +41,10 @@ puts a white crosshair on the map window; every pick calls
    (:func:`face_camera` — the turntable-camera aim from anyplotlib's
    ``plot_ipf_explorer`` gallery example).
 
-Both 3-D figures are point clouds. A *continuous textured surface* on the sphere
-(the density painted as a skin rather than as dense points) needs
-``Plot3D.set_texture`` from anyplotlib PR #48, which is not merged — see the
-module note in :func:`build_ipf_density_3d_figure`. No Qt.
+3-D · Points stays a point cloud (it *is* one orientation per pixel). 3-D ·
+Heatmap is a **continuous textured surface** — ``Plot3D.set_texture``,
+anyplotlib >= 0.6.0 — with the density painted on as a skin rather than
+approximated by a dense dot grid. No Qt.
 """
 from __future__ import annotations
 
@@ -57,11 +57,10 @@ from spyde.actions.ipf_view import _as_orientation_map
 
 logger = logging.getLogger(__name__)
 
-#: Sphere-patch point size for the 3-D density heatmap. Big enough that the
-#: equal-area cells read as a continuous skin rather than a dot grid.
-DENSITY3D_POINT_SIZE = 9.0
-#: Angular bin size (degrees) for the 3-D density sampling. Finer than the 2-D
-#: default (2.0) because the sphere patch is drawn as discrete points.
+#: Angular bin size (degrees) for the 3-D density sampling. This now sets BOTH
+#: the surface mesh and the texture resolution — one texel per equal-area cell
+#: — and the texture is interpolated across each triangle, so it no longer has
+#: to be fine enough to hide a dot grid the way the old point patch did.
 DENSITY3D_RESOLUTION = 1.0
 #: 2-D scatter cap — a big EBSD map is millions of positions and the IPF is a
 #: DISTRIBUTION, so a uniform subsample shows the same picture far faster.
@@ -198,15 +197,27 @@ def build_ipf_points_2d_figure(result, direction: str = "z", *,
 # 3-D · Heatmap — the density field sampled ON the sphere
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _density_sphere_points(om, pidx: int, direction: str, *,
-                           resolution: float, sigma: float, cmap: str):
-    """``(xyz (M,3), rgb01 (M,3), mrd (M,))`` — the phase's inverse-pole density
-    lifted back onto the unit sphere.
+def _density_sphere_grid(om, pidx: int, direction: str, *,
+                         resolution: float, sigma: float, cmap: str):
+    """``(X, Y, Z, rgba (H,W,4) uint8)`` — the phase's inverse-pole density as a
+    SURFACE grid on the unit sphere plus the texture that paints it.
 
     ``pole_density_function`` bins the crystal directions on an EQUAL-AREA grid
-    in stereographic coordinates; each cell centre is inverse-projected to the
-    unit vector it came from, keeping only cells inside the fundamental sector,
-    and coloured by its MRD value. Returns ``None`` when nothing survives.
+    in stereographic coordinates. Each cell centre inverse-projects to the unit
+    vector it came from, and because the grid keeps its ``(H, W)`` shape here
+    (rather than being flattened to a point list) it *is* a surface mesh —
+    which is what lets the density be painted on as a skin.
+
+    The fundamental sector is not rectangular and the grid is, so the mask
+    travels in the texture's **alpha channel** rather than in the geometry:
+    cells outside the sector, and cells whose density is undefined, get
+    ``alpha = 0``. The surface is built everywhere and simply not painted
+    there. Keeping the geometry complete matters — a NaN vertex would tear the
+    mesh, and anyplotlib's textured-surface pipeline blends per-texel alpha
+    (``srcFactor: 'src-alpha'``), so an unpainted cell costs nothing but is
+    genuinely invisible.
+
+    Returns ``None`` when nothing survives.
     """
     from anyplotlib._utils import _build_colormap_lut
     from orix.measure import pole_density_function
@@ -237,20 +248,37 @@ def _density_sphere_points(om, pidx: int, direction: str, *,
                      xc.shape, hc.shape)
         return None
 
+    shape = hc.shape
     xr, yr, hr = np.ravel(xc), np.ravel(yc), np.ravel(hc)
     vec = InverseStereographicProjection().xy2vector(xr, yr)
     inside = np.asarray(vec < phase.point_group.fundamental_sector).reshape(-1)
-    keep = inside & np.isfinite(hr)
-    if not np.any(keep):
+    xyz = np.asarray(vec.data, dtype=np.float64).reshape(-1, 3)
+
+    # A cell can fall outside the projection's unit disk, where the inverse is
+    # undefined. Those vertices must still be FINITE or the mesh tears, so give
+    # them a harmless point on the sphere and mask them in alpha with the rest.
+    bad_xyz = ~np.isfinite(xyz).all(axis=1)
+    if bad_xyz.any():
+        xyz[bad_xyz] = (0.0, 0.0, 1.0)
+    norm = np.linalg.norm(xyz, axis=1, keepdims=True)
+    xyz = xyz / np.where(norm > 0, norm, 1.0)
+
+    painted = inside & np.isfinite(hr) & ~bad_xyz
+    if not np.any(painted):
         return None
 
-    xyz = np.asarray(vec.data, dtype=np.float32).reshape(-1, 3)[keep]
-    vals = hr[keep]
-    hi = float(np.nanmax(vals)) or 1.0
+    vals = np.where(painted, hr, 0.0)
+    hi = float(np.nanmax(vals[painted])) or 1.0
     lut = np.asarray(_build_colormap_lut(cmap), dtype=np.uint8)      # (256, 3)
     idx = np.rint(np.clip(vals / hi, 0.0, 1.0) * 255).astype(np.intp)
-    rgb01 = (lut[idx].astype(np.float32) / 255.0)
-    return xyz, rgb01, vals
+    rgba = np.zeros((idx.size, 4), dtype=np.uint8)
+    rgba[:, :3] = lut[idx]
+    rgba[:, 3] = np.where(painted, 255, 0).astype(np.uint8)
+
+    X = xyz[:, 0].reshape(shape)
+    Y = xyz[:, 1].reshape(shape)
+    Z = xyz[:, 2].reshape(shape)
+    return X, Y, Z, rgba.reshape(shape + (4,))
 
 
 def build_ipf_density_3d_figure(result, direction: str = "z", *,
@@ -263,13 +291,17 @@ def build_ipf_density_3d_figure(result, direction: str = "z", *,
     as a dense IPF-density-coloured point patch inside the reference sphere, one
     axis per phase. ``plots`` maps ``phase_index → Plot3D``.
 
-    **Why points and not a surface.** anyplotlib 0.4/0.5's ``plot_surface``
-    colour-maps by the Z COORDINATE, so a sphere patch can only be coloured by
-    height, not by an independent scalar. Painting the density as a genuine skin
-    needs ``Plot3D.set_texture`` — anyplotlib PR #48, still open. When that
-    lands, this builder can wrap the 2-D density raster (which
-    :mod:`ipf_density` already produces) straight onto the sector surface and
-    the point patch goes away; nothing else here changes.
+    **A textured skin, not a point patch** (anyplotlib >= 0.6.0). Earlier
+    versions' ``plot_surface`` colour-mapped by the Z COORDINATE, so a sphere
+    patch could only be coloured by height and the density had to be faked with
+    a dense point cloud — visibly a dot grid at any real zoom, and it cost one
+    vertex per cell. ``Plot3D.set_texture`` paints an image across the mesh
+    instead, so the density is now a continuous surface: the grid carries the
+    geometry and the raster carries the colour.
+
+    The mapping is parametric — image column ``j`` to grid column ``j`` — and
+    :func:`_density_sphere_grid` returns both at the same ``(H, W)``, so they
+    line up by construction with no ``uv`` needed.
     """
     import anyplotlib as apl
     import anyplotlib._electron as _electron
@@ -281,25 +313,35 @@ def build_ipf_density_3d_figure(result, direction: str = "z", *,
     pidxs = _present_phases(om)
     built = []
     for pidx in pidxs:
-        pts = _density_sphere_points(om, pidx, direction, resolution=resolution,
-                                     sigma=sigma, cmap=cmap)
-        if pts is not None:
-            built.append((pidx, pts))
+        grid = _density_sphere_grid(om, pidx, direction, resolution=resolution,
+                                    sigma=sigma, cmap=cmap)
+        if grid is not None:
+            built.append((pidx, grid))
     if not built:
         return None
 
     fig, axes = apl.subplots(1, len(built))
     arr = np.array(axes, dtype=object).ravel()
     plots: dict[int, object] = {}
-    for ax, (pidx, (xyz, rgb01, _vals)) in zip(arr, built):
-        az, el = _aim_at(xyz)
-        p3d = ax.scatter3d(
-            xyz[:, 0], xyz[:, 1], xyz[:, 2],
-            colors=rgb01, point_size=DENSITY3D_POINT_SIZE,
+    for ax, (pidx, (X, Y, Z, rgba)) in zip(arr, built):
+        # Aim at the PAINTED cells only — the grid spans the whole hemisphere
+        # but the sector is a small part of it, and aiming at the full grid's
+        # centroid would open the view on blank sphere.
+        lit = rgba[..., 3] > 0
+        az, el = _aim_at(np.stack([X[lit], Y[lit], Z[lit]], axis=1))
+        p3d = ax.plot_surface(
+            X, Y, Z,
             x_label="[100]", y_label="[010]", z_label="[001]",
             bounds=IPF3D_BOUNDS, zoom=IPF3D_ZOOM, gpu=True,
             azimuth=az, elevation=el,
         )
+        try:
+            # cull_backfaces stays FALSE: this is an open patch, not a closed
+            # solid, so its far side is exactly what you look at after the
+            # sphere rotates a picked orientation to the centre.
+            p3d.set_texture(rgba, cull_backfaces=False, shade=False)
+        except Exception as e:
+            logger.debug("texturing the IPF density sphere failed: %s", e)
         try:
             p3d.set_sphere(1.0)
         except Exception as e:

@@ -47,7 +47,7 @@ wheels = [
 
 [[package]]
 name = "anyplotlib"
-version = "0.4.2"
+version = "0.6.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anywidget" },
@@ -56,9 +56,9 @@ dependencies = [
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "traitlets" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/26/b2/74147510e82c0f7b8645f8b9f307c398e4ca56df05313588c05ce442de91/anyplotlib-0.4.2.tar.gz", hash = "sha256:32e4cf8315497bb083d834a9d6d91b8333bc7e2b46a8b6a57af6398516b2a123", size = 1403418, upload-time = "2026-07-26T20:53:38.167Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/46/a6/e4c4e0c0cdfcf73d81127027cf6bba8b6e764d1243ba8e5b76f05dd7bef9/anyplotlib-0.6.0.tar.gz", hash = "sha256:5c005eac9dcc191ef61a96ac552885fc33b768c8a465625297a644c6faba8726", size = 1495909, upload-time = "2026-07-31T15:15:53.587Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/9e/5a/b7a07b3859d17c3eb865e5e6aeeda4d2eb13964072e6472b1bd6d0e81a5f/anyplotlib-0.4.2-py3-none-any.whl", hash = "sha256:6b965fbc356fff2749e39056499fe7f0563a3228fad2bf99cf522a1f0918e194", size = 282798, upload-time = "2026-07-26T20:53:35.992Z" },
+    { url = "https://files.pythonhosted.org/packages/0b/07/0d9c59b12ef1784b24f0370eacdf92cad79810ac4d37e765dca61668d23b/anyplotlib-0.6.0-py3-none-any.whl", hash = "sha256:66576b4c541304a0c5806e048c3cfaacd846d3740eeb0f88e6b2597f421dbaab", size = 316208, upload-time = "2026-07-31T15:15:52.1Z" },
 ]
 
 [[package]]
@@ -3622,7 +3622,7 @@ tests = [
 
 [package.metadata]
 requires-dist = [
-    { name = "anyplotlib", specifier = ">=0.4.2" },
+    { name = "anyplotlib", specifier = ">=0.6.0" },
     { name = "atomap", marker = "extra == 'atoms'", specifier = ">=0.4.1" },
     { name = "bokeh" },
     { name = "dask" },

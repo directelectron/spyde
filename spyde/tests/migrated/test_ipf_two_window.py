@@ -118,19 +118,48 @@ class TestIpfFigureBuilders:
         _f, _i, html, _p = iw.build_ipf_points_2d_figure(om, "z", max_points=500)
         assert len(html) < 2_000_000
 
-    def test_density_3d_points_lie_on_the_unit_sphere(self):
-        from spyde.actions.ipf_window import _density_sphere_points
+    def _grid(self, resolution=2.0):
+        from spyde.actions.ipf_window import _density_sphere_grid
         om = _al_orientation_map(20, 25)
-        pts = _density_sphere_points(om, 0, "z", resolution=2.0, sigma=5.0,
-                                     cmap="fire")
-        assert pts is not None
-        xyz, rgb01, mrd = pts
-        assert xyz.shape[0] > 50 and xyz.shape[1] == 3
-        assert np.allclose(np.linalg.norm(xyz, axis=1), 1.0, atol=1e-4)
-        # Coloured by DENSITY, so the patch is not one flat colour.
-        assert rgb01.min() >= 0.0 and rgb01.max() <= 1.0
-        assert len(np.unique(rgb01.round(3), axis=0)) > 1
-        assert np.isfinite(mrd).all()
+        grid = _density_sphere_grid(om, 0, "z", resolution=resolution,
+                                    sigma=5.0, cmap="fire")
+        assert grid is not None
+        return grid
+
+    def test_density_3d_grid_lies_on_the_unit_sphere(self):
+        X, Y, Z, _rgba = self._grid()
+        r = np.sqrt(X ** 2 + Y ** 2 + Z ** 2)
+        assert np.allclose(r, 1.0, atol=1e-4)
+
+    def test_density_3d_grid_is_a_surface_not_a_point_list(self):
+        """The whole point of the texture path: the grid keeps its 2-D shape,
+        so it IS a mesh and the raster lines up with it index for index."""
+        X, Y, Z, rgba = self._grid()
+        assert X.ndim == 2 and X.shape == Y.shape == Z.shape
+        assert rgba.shape == X.shape + (4,)
+
+    def test_every_vertex_is_finite(self):
+        """A NaN vertex tears the mesh. Cells outside the projection's unit
+        disk have no inverse, so they must be given a finite placeholder and
+        masked in alpha instead of being left undefined."""
+        X, Y, Z, _rgba = self._grid()
+        assert np.isfinite(X).all() and np.isfinite(Y).all()
+        assert np.isfinite(Z).all()
+
+    def test_the_sector_is_masked_in_alpha(self):
+        """The fundamental sector is not rectangular and the grid is, so the
+        mask has to live in the texture rather than the geometry."""
+        _X, _Y, _Z, rgba = self._grid()
+        alpha = rgba[..., 3]
+        assert (alpha == 255).any(), "nothing painted"
+        assert (alpha == 0).any(), "nothing masked — the sector filled the grid"
+        assert set(np.unique(alpha)) <= {0, 255}
+
+    def test_painted_cells_are_coloured_by_density(self):
+        _X, _Y, _Z, rgba = self._grid()
+        lit = rgba[..., 3] > 0
+        assert len(np.unique(rgba[lit][:, :3], axis=0)) > 1, \
+            "the painted sector is one flat colour"
 
     def test_density_3d_figure_builds(self):
         from spyde.actions.ipf_window import build_ipf_density_3d_figure
