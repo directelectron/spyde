@@ -593,6 +593,25 @@ class Session(
         except Exception as e:
             log.warning("set_clim failed: %s", e)
 
+    def _auto_clim(self, plot, mode: str = "robust") -> None:
+        """Re-derive the display range from the data on screen (Auto / Reset).
+
+        Duck-typed like set_clim/set_colormap: a Plot and a bare-figure
+        controller (strain map, …) each implement ``auto_clim`` in their own
+        terms — robust percentiles of the frame, or a symmetric strain scale.
+        ``mode`` is "robust" (Auto) or "full" (Reset, the whole data range).
+        """
+        if plot is None:
+            return
+        fn = getattr(plot, "auto_clim", None)
+        if not callable(fn):
+            log.debug("auto_clim: %s does not support it", type(plot).__name__)
+            return
+        try:
+            fn(mode)
+        except Exception as e:
+            log.warning("auto_clim failed: %s", e)
+
     # ── Settings & recent files ────────────────────────────────────────────────
 
     def _load_settings(self) -> dict:

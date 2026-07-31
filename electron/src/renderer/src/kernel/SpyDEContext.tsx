@@ -80,6 +80,9 @@ export interface Histogram {
   vmin: number
   vmax: number
   threshold?: number | null   // dotted marker line (Find-Vectors detector threshold)
+  dataMin?: number            // full data extent; the bins may cover less of it
+  dataMax?: number
+  clipped?: boolean           // bins are robust quantiles — end bins are overflow
 }
 
 /** One application-log record streamed from the Python backend. */
@@ -1072,6 +1075,9 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
               vmin: msg.vmin,
               vmax: msg.vmax,
               threshold: msg.threshold ?? null,
+              dataMin: msg.data_min,
+              dataMax: msg.data_max,
+              clipped: msg.clipped ?? false,
             },
           })
           break

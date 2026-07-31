@@ -202,26 +202,66 @@ function AxesTable({ axes, onEdit, offsetPick, onToggleOffsetPick }:
   )
 }
 
-function Histogram({ counts, edges, vmin, vmax, threshold, onClim }:
+/** Small dock button that tints on hover and again while held — inline styles
+ *  can't express :hover/:active, and the dock has no stylesheet, so the state is
+ *  local (the same idiom Pill.tsx uses). */
+function TintButton({ children, onClick, testid, title }: {
+  children: React.ReactNode
+  onClick: () => void
+  testid?: string
+  title?: string
+}) {
+  const [hover, setHover] = React.useState(false)
+  const [held, setHeld] = React.useState(false)
+  return (
+    <button
+      data-testid={testid}
+      title={title}
+      onClick={onClick}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => { setHover(false); setHeld(false) }}
+      onPointerDown={() => setHeld(true)}
+      onPointerUp={() => setHeld(false)}
+      style={{
+        ...styles.autoBtn,
+        background: held ? '#585b70' : hover ? '#313244' : '#1e1e2e',
+        borderColor: held || hover ? '#585b70' : '#313244',
+        color: held || hover ? '#cdd6f4' : '#a6adc8',
+      }}
+    >{children}</button>
+  )
+}
+
+function Histogram({ counts, edges, vmin, vmax, threshold, clipped, onClim, onAuto, onReset }:
   { counts: number[]; edges: number[]; vmin: number; vmax: number
     threshold?: number | null
-    onClim: (mn: number, mx: number) => void }) {
+    clipped?: boolean
+    onClim: (mn: number, mx: number) => void
+    onAuto: () => void
+    onReset: () => void }) {
   if (!counts.length) return null
   const max = Math.max(...counts) || 1
   const lo = edges[0], hi = edges[edges.length - 1]
   const dataSpan = hi - lo || 1
-  // Draw an axis that extends PAST the data max so the upper-contrast handle can
-  // be pulled above 100% (darkens the image). Headroom = 2× the data span beyond
-  // the data max; also stretch to cover a held vmax (e.g. a brighter frame in a
-  // 5-D series whose contrast was carried over). The bars only span [lo, hi].
+  // Draw a little axis PAST the binned range so the upper handle can be pulled
+  // above 100% (darkens the image), and stretch to cover a held vmax (e.g. a
+  // brighter frame in a 5-D series whose contrast was carried over). The bars
+  // only span [lo, hi].
+  //
+  // The headroom used to be 2× the data span, which cost two thirds of the
+  // widget. That was survivable when the bins covered min–max; now that the
+  // backend bins over robust quantiles (see Plot._hist_range) the drawn range is
+  // the range worth resolving, so the handles get essentially all of the width.
+  // Dragging is not limited by it either way — neither xOf nor vOf clamps.
   const axLo = lo
-  const axHi = Math.max(hi + 2 * dataSpan, vmax + 0.05 * dataSpan)
+  const axHi = Math.max(hi + 0.25 * dataSpan, vmax + 0.05 * dataSpan)
   const span = axHi - axLo || 1
   const W = 276, H = 84
   const bw = (dataSpan / span) * W / counts.length
-  // No right-edge clamp: dragging past the drawn area maps to values > data max.
+  // No clamping either side: dragging past the drawn area maps to values outside
+  // the binned range, which is the only way to reach a clipped tail.
   const xOf = (v: number) => ((v - axLo) / span) * W
-  const vOf = (x: number) => axLo + (Math.max(0, x) / W) * span
+  const vOf = (x: number) => axLo + (x / W) * span
   const fmt = (v: number) => (Math.abs(v) >= 1000 || (v !== 0 && Math.abs(v) < 0.01))
     ? v.toExponential(1) : v.toFixed(2)
 
@@ -244,13 +284,29 @@ function Histogram({ counts, edges, vmin, vmax, threshold, onClim }:
   }, [drag, vmin, vmax, lo, span])
 
   const handle = (which: 'min' | 'max', v: number) => {
-    const x = xOf(v)
+    // PIN the handle inside the widget when its value falls outside the drawn
+    // range. Dragging is unclamped (that is how you reach a clipped tail), so
+    // without this a handle dragged past an edge is drawn off-canvas — invisible
+    // AND unreachable, with no way to drag it back. Pinned, it stays grabbable
+    // and the first inward drag brings the value back into range; the arrow says
+    // the real value is further out that way.
+    const raw = xOf(v)
+    const x = Math.min(Math.max(raw, 3), W - 3)
+    const off = raw < 0 ? -1 : raw > W ? 1 : 0
+    const mid = H / 2
     return (
       <g key={which}>
         <line x1={x} y1={0} x2={x} y2={H} stroke="#f38ba8" strokeWidth={3} />
         {/* grip caps so the thick lines read as draggable handles */}
         <rect x={x - 3} y={0} width={6} height={5} rx={1.5} fill="#f38ba8" />
         <rect x={x - 3} y={H - 5} width={6} height={5} rx={1.5} fill="#f38ba8" />
+        {off !== 0 && (
+          <polygon data-testid={`hist-${which}-offscreen`}
+            points={off < 0
+              ? `${x - 3},${mid} ${x + 6},${mid - 5} ${x + 6},${mid + 5}`
+              : `${x + 3},${mid} ${x - 6},${mid - 5} ${x - 6},${mid + 5}`}
+            fill="#f38ba8" />
+        )}
         {/* fat invisible grab target */}
         <rect
           data-testid={`hist-${which}-handle`}
@@ -270,11 +326,22 @@ function Histogram({ counts, edges, vmin, vmax, threshold, onClim }:
         <rect x={xOf(vmin)} y={0} width={Math.max(0, xOf(vmax) - xOf(vmin))} height={H}
           fill="#89b4fa" opacity={0.12} />
         {counts.map((c, i) => {
-          const h = (c / max) * (H - 4)
-          return <rect key={i} x={i * bw} y={H - h} width={Math.max(1, bw - 0.5)} height={h} fill="#89b4fa" />
+          // LOG-scaled bars. Counting electrons is Poisson, so a frame's
+          // occupancy falls off by orders of magnitude away from the background
+          // peak: on a linear axis the peak is one full-height bar and the entire
+          // useful tail — the diffraction spots you are setting contrast for —
+          // rounds to zero pixels. log1p keeps 0 at 0 and still separates a count
+          // of 1 from a count of 10.
+          const h = (Math.log1p(c) / Math.log1p(max)) * (H - 4)
+          // The end bins are overflow when the range is clipped: everything
+          // beyond the quantiles piled in. Shaded differently so a tall edge bar
+          // is not misread as a real population at that value.
+          const overflow = clipped && (i === 0 || i === counts.length - 1) && c > 0
+          return <rect key={i} x={i * bw} y={H - h} width={Math.max(1, bw - 0.5)}
+            height={h} fill={overflow ? '#585b70' : '#89b4fa'} />
         })}
-        {/* data-max marker: dragging the max handle to the RIGHT of this line
-            pushes the upper clim above the data range (image gets darker). */}
+        {/* end-of-bins marker: dragging the max handle to the RIGHT of this line
+            pushes the upper clim past the binned range (image gets darker). */}
         {xOf(hi) < W && (
           <line data-testid="hist-datamax" x1={xOf(hi)} y1={0} x2={xOf(hi)} y2={H}
             stroke="#585b70" strokeWidth={1} strokeDasharray="2 2" />
@@ -288,9 +355,18 @@ function Histogram({ counts, edges, vmin, vmax, threshold, onClim }:
         {handle('min', vmin)}
         {handle('max', vmax)}
       </svg>
-      {/* min / max display-range labels (replaces the old Scale section) */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 2 }}>
+      {/* min / max display-range labels (replaces the old Scale section), with
+          the two range buttons BETWEEN them — the dock is crowded, and the label
+          row already exists, so they cost no vertical space at all. */}
+      <div style={{ display: 'flex', justifyContent: 'space-between',
+        alignItems: 'center', marginTop: 2 }}>
         <span data-testid="clim-min" style={{ fontSize: 10, color: '#a6adc8' }}>{fmt(vmin)}</span>
+        <div style={{ display: 'flex', gap: 4 }}>
+          <TintButton testid="clim-auto" onClick={onAuto}
+            title="Contrast from the robust levels for this frame (2–99%)">Auto</TintButton>
+          <TintButton testid="clim-reset" onClick={onReset}
+            title="Show the full data range, tail included">Reset</TintButton>
+        </div>
         <span data-testid="clim-max" style={{ fontSize: 10, color: '#a6adc8' }}>{fmt(vmax)}</span>
       </div>
     </div>
@@ -502,6 +578,23 @@ export function PlotControlDock() {
     setClim({ min: mn, max: mx })
     if (activeId != null) sendAction('set_clim', { vmin: mn, vmax: mx }, activeId)
   }
+  // Auto: hand the range back to the backend, which re-derives it from the frame
+  // currently on screen and re-emits the histogram. Drop the local override up
+  // front so the handles follow that answer rather than sticking where the user
+  // last dragged them (the histogram effect above would clear it anyway; doing it
+  // here means the handles don't sit stale for the round trip).
+  const onAuto = () => {
+    setClim(null)
+    if (activeId != null) sendAction('auto_clim', { mode: 'robust' }, activeId)
+  }
+  // Reset: the OTHER thing you want when the contrast is unhelpful — show
+  // everything, tail included. Same round trip as Auto, so the histogram comes
+  // back binned over the full extent (nothing clipped) rather than leaving the
+  // handles pinned outside a robust view of it.
+  const onReset = () => {
+    setClim(null)
+    if (activeId != null) sendAction('auto_clim', { mode: 'full' }, activeId)
+  }
 
   // Section order (per spec): Histogram, Colormap, Signal type, Metadata,
   // Axes (editable calibration), Scale (display range), Navigator Selector.
@@ -519,9 +612,10 @@ export function PlotControlDock() {
           <div style={styles.label}>Histogram</div>
           {hist
             ? <Histogram counts={hist.counts} edges={hist.edges} vmin={vmin} vmax={vmax}
-                threshold={hist.threshold} onClim={onClim} />
+                threshold={hist.threshold} clipped={hist.clipped} onClim={onClim}
+                onAuto={onAuto} onReset={onReset} />
             : <div style={styles.empty} data-testid="histogram-empty">—</div>}
-          <div style={styles.hint}>drag the handles to set contrast</div>
+          <div style={styles.hint}>drag the handles to set contrast · log counts</div>
         </div>
       )}
 
@@ -704,6 +798,13 @@ const styles: Record<string, React.CSSProperties> = {
   metaVal: { color: '#cdd6f4', fontSize: 11, whiteSpace: 'nowrap',
              overflow: 'hidden', textOverflow: 'ellipsis' },
   hint: { fontSize: 10, color: '#6c7086', marginTop: 4 },
+  // Sits between the clim min/max labels, so it must stay small enough not to
+  // crowd them (the same palette as `toggle`, one size down).
+  autoBtn: {
+    background: '#1e1e2e', color: '#a6adc8', border: '1px solid #313244',
+    borderRadius: 3, padding: '1px 8px', fontSize: 10, lineHeight: '14px',
+    cursor: 'pointer',
+  },
   toggleRow: { display: 'flex', gap: 6, alignItems: 'center' },
   selectorDot: {
     width: 10, height: 10, borderRadius: '50%', flexShrink: 0,

@@ -203,6 +203,11 @@ export interface HistogramMessage extends MsgBase {
   vmin: number
   vmax: number
   threshold?: number | null
+  // Full data extent, and whether the bins cover less than it (the tail was
+  // clipped into the end bins — see Plot._hist_range).
+  data_min?: number
+  data_max?: number
+  clipped?: boolean
 }
 
 export interface NavShapePromptMessage extends MsgBase, NavShapePrompt {

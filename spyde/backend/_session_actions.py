@@ -244,6 +244,10 @@ class ActionRouterMixin:
         elif action == "set_clim":
             self._set_clim(plot or self.controller_by_window_id(window_id),
                            payload.get("vmin"), payload.get("vmax"))
+        elif action == "auto_clim":
+            # Dock's Auto / Reset buttons — same controller fallback as set_clim.
+            self._auto_clim(plot or self.controller_by_window_id(window_id),
+                            str(payload.get("mode", "robust")))
         elif action == "close_window":
             self._close_window(window_id)
         elif action == "resize_figure":

@@ -351,6 +351,35 @@ class StrainController(WizardController):
         except Exception as e:
             log.debug("strain set_clim failed: %s", e)
 
+    def auto_clim(self, mode: str = "robust") -> None:
+        """Dock's Auto / Reset buttons → back to a derived strain scale.
+
+        Dropping ``self.clim`` is most of the operation: it is the manual
+        override ``_emit_histogram`` prefers, so clearing it re-derives the scale
+        from the component map (and keeps doing so across component switches
+        until the handles are dragged again). ``full`` (Reset) spans the finite
+        extent instead of the robust 98th-percentile band."""
+        import numpy as np
+        from spyde.actions.strain_display import _auto_clim, _component_map
+        if self.field is None:
+            return
+        try:
+            self.clim = None
+            arr = np.asarray(_component_map(self.field, self.component), float)
+            if mode == "full":
+                finite = arr[np.isfinite(arr)]
+                clim = ((float(np.min(finite)), float(np.max(finite)))
+                        if finite.size else (-1.0, 1.0))
+                if clim[1] <= clim[0]:
+                    clim = (clim[0], clim[0] + 1.0)
+                self.clim = clim            # a full range IS an override
+            else:
+                clim = _auto_clim(arr)
+            self.p.set_clim(*clim)
+            self._emit_histogram()
+        except Exception as e:
+            log.debug("strain auto_clim failed: %s", e)
+
     def set_colormap(self, name: str) -> None:
         """Dock colormap picker → the strain map."""
         try:
