@@ -18,6 +18,7 @@ import { DownloadToasts } from './components/DownloadToasts'
 import { PresentGate } from './components/PresentGate'
 import { MovieGate } from './components/MovieGate'
 import { FirstRunGate } from './components/FirstRunGate'
+import { GuideInfoDialog } from './components/GuideInfoDialog'
 import { GUIDES, getGuide, type Guide } from '@guides/index'
 
 export function App() {
@@ -25,6 +26,10 @@ export function App() {
   const [reportOpen, setReportOpen] = useState(false)
   const [logOpen, setLogOpen] = useState(false)
   const [tour, setTour] = useState<Guide | null>(null)
+  // Help → <technique> → Info… — the background/further-reading half of a
+  // technique, as opposed to `tour` (the click-by-click half). Local state
+  // rather than a SpyDEContext flag: it needs no backend round trip.
+  const [infoGuide, setInfoGuide] = useState<Guide | null>(null)
 
   // The Help menu (main process) can launch a guide by id via spyde:start-guide.
   useEffect(() => {
@@ -53,6 +58,7 @@ export function App() {
           reportOpen={reportOpen}
           onToggleReport={() => setReportOpen(v => !v)}
           onStartGuide={(g) => setTour(g)}
+          onShowInfo={(g) => setInfoGuide(g)}
         />
         <div style={styles.body}>
           <MDIArea />
@@ -69,6 +75,16 @@ export function App() {
           DownloadToasts corner. Shows the whole updater lifecycle incl. errors. */}
       <UpdateCard />
       {tour && <Tour guide={tour} onClose={() => setTour(null)} />}
+      {/* Help → <technique> → Info…: what the technique is + curated external
+          reading (pyxem / HyperSpy / eXSpy / kikuchipy / orix). Same
+          `guide.info` the tour's final "More info" step and the docs page show. */}
+      {infoGuide && (
+        <GuideInfoDialog
+          guide={infoGuide}
+          onClose={() => setInfoGuide(null)}
+          onStartGuide={(g) => setTour(g)}
+        />
+      )}
       {/* Present mode (Phase 6): renders the open Report as full-screen slides,
           launched from the Report sidebar's "Present" button (via the
           spyde:report_present event). Owns the slide-index persistence + the
@@ -97,8 +113,18 @@ export function App() {
   )
 }
 
-// A "?" button that opens a small menu of available guided tours.
-function HelpButton({ onStartGuide }: { onStartGuide: (g: Guide) => void }) {
+/**
+ * The "?" help bar: one row per TECHNIQUE, each with a two-button subtoolbar —
+ * **Info** (background + further reading, GuideInfoDialog) and **Guided tour**
+ * (the in-app coachmark walkthrough). It used to be a flat list where the only
+ * possible action was "start a tour", with no way to just read about a
+ * technique first. Both entries render from the same `Guide` (guides/), which
+ * is also what the docs pages are generated from.
+ */
+function HelpButton({ onStartGuide, onShowInfo }: {
+  onStartGuide: (g: Guide) => void
+  onShowInfo: (g: Guide) => void
+}) {
   const [open, setOpen] = useState(false)
   const [hover, setHover] = useState(false)
   // Close the menu on any outside click.
@@ -112,8 +138,8 @@ function HelpButton({ onStartGuide }: { onStartGuide: (g: Guide) => void }) {
     <div style={{ position: 'relative', ...noDrag }}>
       <button
         data-testid="help-button"
-        aria-label="Guided tours"
-        title="Guided tours"
+        aria-label="Help and guided tours"
+        title="Help and guided tours"
         onClick={(e) => { e.stopPropagation(); setOpen(v => !v) }}
         onMouseEnter={() => setHover(true)}
         onMouseLeave={() => setHover(false)}
@@ -128,17 +154,34 @@ function HelpButton({ onStartGuide }: { onStartGuide: (g: Guide) => void }) {
       </button>
       {open && (
         <div data-testid="help-menu" style={styles.helpMenu} onClick={(e) => e.stopPropagation()}>
-          <div style={styles.helpMenuTitle}>Guided Tours</div>
+          <div style={styles.helpMenuTitle}>Techniques</div>
           {GUIDES.map((g) => (
-            <button
-              key={g.id}
-              data-testid={`help-guide-${g.id}`}
-              style={styles.helpMenuItem}
-              onClick={() => { setOpen(false); onStartGuide(g) }}
-            >
+            <div key={g.id} data-testid={`help-technique-${g.id}`} style={styles.helpTechnique}>
               <div style={styles.helpMenuItemTitle}>{g.title}</div>
               <div style={styles.helpMenuItemSummary}>{g.summary}</div>
-            </button>
+              {/* The per-technique subtoolbar: read about it, or walk it. */}
+              <div style={styles.helpSubBar}>
+                <button
+                  data-testid={`help-info-${g.id}`}
+                  style={styles.helpSubBtn}
+                  title={`About ${g.title}`}
+                  onClick={() => { setOpen(false); onShowInfo(g) }}
+                >
+                  Info
+                </button>
+                <button
+                  // Kept as help-guide-<id> as well as the clearer help-tour-<id>
+                  // so existing specs/bookmarks that target the tour entry by its
+                  // old testid keep working.
+                  data-testid={`help-guide-${g.id}`}
+                  style={styles.helpSubBtnPrimary}
+                  title={`Start the ${g.title} walkthrough`}
+                  onClick={() => { setOpen(false); onStartGuide(g) }}
+                >
+                  Guided tour ›
+                </button>
+              </div>
+            </div>
           ))}
         </div>
       )}
@@ -179,12 +222,13 @@ function ReportIcon({ open }: { open: boolean }) {
 // Frameless-window top bar. The whole bar is a drag region (so the OS window can
 // be moved); interactive controls opt out with -webkit-app-region: no-drag. Left
 // padding clears the macOS traffic-light buttons (titleBarStyle: hiddenInset).
-function AppBar({ sidebarOpen, onToggleSidebar, reportOpen, onToggleReport, onStartGuide }: {
+function AppBar({ sidebarOpen, onToggleSidebar, reportOpen, onToggleReport, onStartGuide, onShowInfo }: {
   sidebarOpen: boolean
   onToggleSidebar: () => void
   reportOpen: boolean
   onToggleReport: () => void
   onStartGuide: (g: Guide) => void
+  onShowInfo: (g: Guide) => void
 }) {
   const [hover, setHover] = useState(false)
   const isMac = window.electron?.platform === 'darwin'
@@ -205,10 +249,10 @@ function AppBar({ sidebarOpen, onToggleSidebar, reportOpen, onToggleReport, onSt
           <span style={styles.logoDot} />
           <span style={styles.appTitle}>SpyDE</span>
         </div>
-        <MenuBar onStartGuide={onStartGuide} />
+        <MenuBar onStartGuide={onStartGuide} onShowInfo={onShowInfo} />
       </div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 2, ...noDrag }}>
-        <HelpButton onStartGuide={onStartGuide} />
+        <HelpButton onStartGuide={onStartGuide} onShowInfo={onShowInfo} />
         <ReportToggle open={reportOpen} onToggle={onToggleReport} />
         <button
           data-testid="toggle-sidebar"
@@ -314,4 +358,18 @@ const styles: Record<string, React.CSSProperties> = {
   },
   helpMenuItemTitle: { fontSize: 13, fontWeight: 600, color: '#cdd6f4' },
   helpMenuItemSummary: { fontSize: 11, color: '#7f849c', marginTop: 2, lineHeight: 1.35 },
+  helpTechnique: {
+    padding: '8px', borderRadius: 6, marginBottom: 2,
+    borderTop: '1px solid #232334',
+  },
+  helpSubBar: { display: 'flex', gap: 6, marginTop: 7 },
+  helpSubBtn: {
+    background: 'transparent', border: '1px solid #313244', color: '#bac2de',
+    borderRadius: 5, padding: '4px 10px', cursor: 'pointer', fontSize: 11.5,
+  },
+  helpSubBtnPrimary: {
+    background: 'rgba(137,180,250,0.14)', border: '1px solid rgba(137,180,250,0.4)',
+    color: '#89b4fa', borderRadius: 5, padding: '4px 10px', cursor: 'pointer',
+    fontSize: 11.5, fontWeight: 600,
+  },
 }

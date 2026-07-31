@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 import importlib.util
+import shutil
+from pathlib import Path
+
+_HERE = Path(__file__).parent
 
 
 # -- Project information -----------------------------------------------------
@@ -22,6 +26,32 @@ extensions = [
 ]
 templates_path = ["_templates"]
 exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
+
+
+# -- Tutorial screenshots ----------------------------------------------------
+# doc/tutorials/*.rst is GENERATED from the guides/ walkthroughs (the single
+# source the in-app guided tour also renders) by
+# ``node scripts/gen_guide_docs.mjs``. Its ``.. image::`` targets live under
+# ``doc/tutorials/media/<guide>/`` — but the PNGs themselves are produced by the
+# Playwright run ``guide_screenshots.spec.ts``, which writes them into
+# ``docs-site/public/media/`` for the docs website.
+#
+# Rather than commit the same PNGs twice, mirror that tree into the doc source
+# at build time. A missing source dir is not an error: a step whose screenshot
+# has not been captured yet simply renders without one.
+def _copy_guide_media(app=None):
+    src = _HERE.parent / "docs-site" / "public" / "media"
+    dst = _HERE / "tutorials" / "media"
+    if not src.is_dir():
+        return
+    if dst.exists():
+        shutil.rmtree(dst)
+    shutil.copytree(src, dst, ignore=shutil.ignore_patterns("*.html"))
+
+
+def setup(app):
+    app.connect("builder-inited", _copy_guide_media)
+    return {"parallel_read_safe": True, "parallel_write_safe": True}
 
 # -- Options for HTML output -------------------------------------------------
 # Ensure pydata-sphinx-theme is available

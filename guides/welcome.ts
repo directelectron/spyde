@@ -23,6 +23,37 @@ export const welcomeGuide: Guide = {
     action: 'backend', backend: 'tutorial_load', payload: { name: 'navigation' },
     waitFor: { subwindows: 2 }, timeoutMs: 60_000, settleMs: 1000,
   },
+  info: {
+    blurb:
+      'SpyDE is a desktop front end for the Python electron-microscopy stack: ' +
+      '**HyperSpy** for the multidimensional signal model and lazy/out-of-core ' +
+      'loading, **pyxem** for the 4D-STEM methods, **orix** for crystal ' +
+      'orientations. Everything you do in the interface is a call into those ' +
+      'libraries, so an analysis you build here has a direct equivalent in a ' +
+      'notebook — and vice versa.\n\n' +
+      'The navigator/signal window pair is HyperSpy’s own idea of navigation ' +
+      'and signal axes made interactive, which is why the same layout appears ' +
+      'whether the signal is a diffraction pattern, an image or a spectrum.\n\n' +
+      '> 💡 Pick a technique from the Help menu for a walkthrough of a specific ' +
+      'workflow.',
+    links: [
+      {
+        label: 'HyperSpy — Data visualisation',
+        url: 'https://hyperspy.org/hyperspy-doc/current/user_guide/visualisation.html',
+        note: 'Navigation and signal axes, customising the navigator, plotting several signals together.',
+      },
+      {
+        label: 'HyperSpy — User guide',
+        url: 'https://hyperspy.org/hyperspy-doc/current/user_guide/index.html',
+        note: 'The library SpyDE is built on: signals, axes, regions of interest, lazy big-data handling.',
+      },
+      {
+        label: 'pyxem — Example gallery',
+        url: 'https://pyxem.org/v0.21.0/examples/index.html',
+        note: 'Worked 4D-STEM examples for every technique SpyDE exposes.',
+      },
+    ],
+  },
   steps: [
     {
       anchor: null,

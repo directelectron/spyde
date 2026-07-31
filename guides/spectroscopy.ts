@@ -26,6 +26,49 @@ export const spectroscopyGuide: Guide = {
     action: 'backend', backend: 'tutorial_load', payload: { name: 'spectroscopy' },
     waitFor: { subwindows: 2 }, timeoutMs: 60_000, settleMs: 1000,
   },
+  info: {
+    blurb:
+      'A **spectrum image** stores a full spectrum — EELS or EDS — at every ' +
+      'position of a scan. The data has the same navigator/signal shape as ' +
+      '4D-STEM, only the signal is one-dimensional: navigating the map plays ' +
+      'the spectrum back position by position, and integrating a real-space ' +
+      'region averages spectra to trade spatial resolution for signal-to-noise.\n\n' +
+      'The usual analysis is quantitative rather than visual: subtract a ' +
+      'background (a power law before an EELS edge, a bremsstrahlung model ' +
+      'under EDS lines), fit a model of components to the remaining signal, and ' +
+      'map a fitted parameter — an edge intensity, a peak position, a ' +
+      'composition — back over the scan.\n\n' +
+      '> 💡 SpyDE reads and displays this data through **HyperSpy**; the ' +
+      'quantitative EELS/EDS methods live in **eXSpy**, HyperSpy’s ' +
+      'spectroscopy extension.',
+    links: [
+      {
+        label: 'eXSpy — EELS user guide',
+        url: 'https://hyperspy.org/exspy/user_guide/eels.html',
+        note: 'Thickness, zero-loss alignment, deconvolution, Kramers-Kronig analysis and EELS curve fitting.',
+      },
+      {
+        label: 'eXSpy — EDS user guide',
+        url: 'https://hyperspy.org/exspy/user_guide/eds.html',
+        note: 'Background subtraction, line fitting and quantification for energy-dispersive X-ray data.',
+      },
+      {
+        label: 'eXSpy — EELS curve fitting example',
+        url: 'https://hyperspy.org/exspy/auto_examples/model_fitting/EELS_curve_fitting.html',
+        note: 'A complete worked example: load, set microscope parameters, build a model, fit, plot.',
+      },
+      {
+        label: 'HyperSpy — Signal1D tools',
+        url: 'https://hyperspy.org/hyperspy-doc/current/user_guide/signal1d.html',
+        note: 'Background removal, smoothing, peak finding and spectrum alignment.',
+      },
+      {
+        label: 'HyperSpy — Model fitting',
+        url: 'https://hyperspy.org/hyperspy-doc/current/user_guide/model/index.html',
+        note: 'Components, fitting strategies and fitting a model across a whole spectrum image.',
+      },
+    ],
+  },
   steps: [
     {
       anchor: null,

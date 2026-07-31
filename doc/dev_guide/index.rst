@@ -10,3 +10,4 @@ out, start contributing code, or help us improve the documentation.
    :maxdepth: 2
 
    performance
+   tutorials

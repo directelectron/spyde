@@ -95,16 +95,35 @@ class ActionRouterMixin:
                     new_trees = [t for t in self.signal_trees if t not in before]
                     if new_trees:
                         registry[name] = new_trees[-1]
+        elif action == "tutorial_session_begin":
+            # A guided walkthrough just opened. From here until
+            # `tutorial_close_all`, Session._add_signal records every tree the
+            # walkthrough causes to appear (the tutorial dataset AND anything
+            # derived from it) so the teardown below can close ALL of it — a
+            # tour that ran Find Vectors must not leave its result window
+            # behind. Data backed by a real file on disk is never recorded.
+            self._tutorial_session_active = True
+            if getattr(self, "_tutorial_session_trees", None) is None:
+                self._tutorial_session_trees = []
         elif action == "tutorial_close_all":
-            # Close every tutorial dataset opened this session (walkthrough
-            # teardown) — leaves the user's own data untouched.
+            # Close everything the walkthrough opened this session — the tutorial
+            # datasets themselves (`_tutorial_trees`, keyed by name) AND every
+            # tree created while the session was active (`_tutorial_session_trees`
+            # — result windows, virtual images, orientation maps). Leaves the
+            # user's own data untouched.
+            self._tutorial_session_active = False
             registry = getattr(self, "_tutorial_trees", None) or {}
-            for tree in list(registry.values()):
+            derived = getattr(self, "_tutorial_session_trees", None) or []
+            # Derived trees FIRST: closing a parent does not close its results,
+            # and closing them in creation order keeps any controller teardown
+            # (overlays, index hooks) in the order it was wired up.
+            for tree in list(derived) + list(registry.values()):
                 if tree in self.signal_trees:
                     try:
                         self._close_tree(tree)
                     except Exception as e:
                         log.debug("tutorial_close_all: closing tree failed: %s", e)
+            derived.clear()
             registry.clear()
         elif action == "load_test_data":
             self._load_test_data()

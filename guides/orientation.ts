@@ -22,6 +22,51 @@ export const orientationGuide: Guide = {
     action: 'backend', backend: 'tutorial_load', payload: { name: 'orientation' },
     waitFor: { subwindows: 2 }, timeoutMs: 60_000, settleMs: 1000,
   },
+  info: {
+    blurb:
+      'Orientation mapping (template matching / ACOM) assigns a crystal ' +
+      'orientation to every scan position. A **template library** is simulated ' +
+      'from a known phase — one pattern per candidate orientation, sampled over ' +
+      'the fundamental zone — and each measured pattern is correlated against ' +
+      'the whole library; the best-correlating template wins. Adding a second ' +
+      'phase to the library turns the same machinery into **phase mapping**: ' +
+      'whichever phase’s templates match best is the phase assigned there.\n\n' +
+      'The result is usually shown as an **IPF map**, colouring each position ' +
+      'by which crystal direction points along a chosen sample axis, with the ' +
+      'correlation score as a confidence map beside it. Two things dominate ' +
+      'quality: how finely the library samples orientation space, and how well ' +
+      'the pattern centre and camera length are calibrated.\n\n' +
+      '> 💡 SpyDE builds the library and matches with **pyxem**, and renders ' +
+      'the IPF colouring with **orix**. For EBSD rather than 4D-STEM, ' +
+      '**kikuchipy** solves the same problem from Kikuchi patterns.',
+    links: [
+      {
+        label: 'pyxem — Single-phase orientation mapping',
+        url: 'https://pyxem.org/v0.21.0/examples/orientation_mapping/single_phase_orientation.html',
+        note: 'The reference workflow: simulate a library, match it, read the orientation map.',
+      },
+      {
+        label: 'pyxem — Orientation mapping gallery',
+        url: 'https://pyxem.org/v0.21.0/examples/orientation_mapping/index.html',
+        note: 'Also covers multi-phase indexing and the on-zone case.',
+      },
+      {
+        label: 'orix — Visualising orientations',
+        url: 'https://orix.readthedocs.io/en/stable/examples/plotting/visualizing_orientations.html',
+        note: 'What the IPF colouring means, plus axis-angle / Rodrigues / homochoric views of the same data.',
+      },
+      {
+        label: 'orix — Inverse pole density function',
+        url: 'https://orix.readthedocs.io/en/stable/examples/inverse_pole_figures/inverse_pole_density_function.html',
+        note: 'The density (texture) view behind SpyDE’s IPF “PDF” toggle.',
+      },
+      {
+        label: 'kikuchipy — Pattern matching (dictionary indexing)',
+        url: 'https://kikuchipy.org/en/stable/tutorials/pattern_matching.html',
+        note: 'The EBSD counterpart: dictionary indexing and orientation refinement.',
+      },
+    ],
+  },
   steps: [
     {
       anchor: null,

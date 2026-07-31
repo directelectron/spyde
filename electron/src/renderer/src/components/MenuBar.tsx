@@ -93,7 +93,11 @@ const hasSubmenu = (it: Item): it is { label: string; submenu: Item[]; testId?: 
 const DOWNLOADED_MARK = '●'      // ●
 const NOT_DOWNLOADED_MARK = '○'  // ○
 
-export function MenuBar({ onStartGuide }: { onStartGuide: (g: Guide) => void }) {
+export function MenuBar({ onStartGuide, onShowInfo }: {
+  onStartGuide: (g: Guide) => void
+  /** Help → <technique> → Info… — opens GuideInfoDialog for that technique. */
+  onShowInfo: (g: Guide) => void
+}) {
   const { sendAction, openStackDialog, openUpdateDialog, openGpuStatusDialog, openGpuHelpDialog, state } = useSpyDE()
   const [open, setOpen] = useState<string | null>(null)
   const barRef = useRef<HTMLDivElement>(null)
@@ -237,9 +241,26 @@ export function MenuBar({ onStartGuide }: { onStartGuide: (g: Guide) => void }) 
       } as Item,
     ],
     Help: [
+      // One row per TECHNIQUE, each opening a two-entry sub-menu: Info (the
+      // background + further reading) and Guided tour (the in-app walkthrough).
+      // Previously this was a flat list of "Guided Tour: <title>" items, which
+      // offered no way to read about a technique without starting a tour.
+      { header: 'Techniques' },
       ...GUIDES.map((g) => ({
-        label: `Guided Tour: ${g.title}`,
-        onClick: () => onStartGuide(g),
+        label: g.title,
+        testId: `help-technique-${g.id}`,
+        submenu: [
+          {
+            label: 'Info…',
+            testId: `help-info-${g.id}`,
+            onClick: () => onShowInfo(g),
+          },
+          {
+            label: 'Guided tour',
+            testId: `help-tour-${g.id}`,
+            onClick: () => onStartGuide(g),
+          },
+        ],
       })),
       { separator: true },
       {
