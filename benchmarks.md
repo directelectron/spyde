@@ -729,7 +729,6 @@ Three things this pins down:
   in-flight ones.
 
 
-
 ## Rigid drift solve — phase correlation backends + accuracy vs upsample (2026-07-29)
 
 `spyde/drift/translation.py` step A1. Synthetic stack built by Fourier phase ramp
@@ -1746,3 +1745,84 @@ of GIL-held client time for 977 chunks.
 next chunk so a ~30x-faster GPU lane and the CPU lane drain one pool and finish
 together — real work stealing the scheduler cannot do, and the reason this
 module exists. Only the unpinned lane changed.
+
+
+## Apple-MPS for the 0.3.0 compute paths (2026-07-31)
+
+**Test system:** MacBookAir10,1 (M1, 4 performance + 4 efficiency cores, 8-core
+GPU), macOS 26.4, torch 2.13.0, `torch.get_num_threads() == 4`. This is the
+*smallest* Apple GPU paired with a strong CPU — the pessimistic end for MPS, not
+a typical Mac. Every row is float32 both sides (Metal has no float64).
+
+### Does it work at all?
+
+Yes. Every op these paths need runs on Metal: batched `matmul`, `linalg.solve`,
+`linalg.cholesky_ex`, `cholesky_solve`, `diag_embed`, `topk`, `fft.rfft2/irfft2`
+and `torch.func.vmap(jacfwd)`. The only failure is `float64`, which raises — hence
+`resolve_dtype()` in `fitting/engine.py` and `ebsd/_device.py`.
+
+### Accuracy: float32 vs float64, and MPS vs CPU
+
+Max relative deviation from HyperSpy `multifit` on the same data:
+
+| case | cpu f64 | cpu f32 | **mps f32** |
+|---|---|---|---|
+| Offset + Gaussian | 8.4e-8 | 9.3e-6 | **9.6e-6** |
+| PowerLaw (A~1e6, r~3) | 2.1e-13 | 8.9e-8 | **7.8e-8** |
+
+MPS tracks CPU-float32 to the last digit, so the device contributes essentially
+nothing — the whole difference is dtype, and it is 4 orders inside the 1e-4
+parity tolerance. EBSD indexing agrees with `kikuchipy.indexing`'s NCC to
+**1.8e-7** (float32 rounding) with 100% best-match agreement, on CPU and MPS
+alike; pinned by `test_ebsd_indexing.py::TestKikuchipyParity`.
+
+### Two bugs this uncovered (both dtype, neither MPS-specific)
+
+1. **`convergence_rate` collapsed to 0.00 in float32.** The `ftol/xtol/gtol`
+   defaults are 1e-8; float32 epsilon is 1.19e-7, so all three tests were
+   unreachable. Every position reported "did not converge" and burned all 60
+   iterations while its parameters were correct to ~1e-5 — the user-visible
+   symptom is a 0% coverage map on a good fit. Fixed by `floor_tolerances()`
+   (10x eps, a no-op in float64).
+2. **The gradient test is 0/0 on a near-perfect fit.** `|Jᵀr| / ||r||` is
+   meaningless once the residual reaches the rounding floor: on CLEAN data in
+   float32 an exact fit (chisq 1e-11, 8 correct digits) still reported 50%
+   converged. Fixed with an absolute noise-floor test — a residual at the
+   representation limit cannot be improved, so it IS converged.
+
+### Speed
+
+Removing the two per-iteration device->host syncs from the LM loop (`solvable.any()`
+and the `converged.all()` early exit; one `.any()` costs 367 us on MPS against
+30 us left on-device) was worth **4.3x** on a small fit — MPS 1303 ms -> 304 ms —
+and helps CUDA for the same reason.
+
+Raw float32 GEMM ceiling on this box: **MPS 1747 vs CPU 868 GFLOP/s = 2.0x.**
+
+| path | size | CPU | MPS | MPS/CPU |
+|---|---|---|---|---|
+| fitting engine | P=64, C=1024 | 171 ms | 173 ms | 0.99x |
+| fitting engine | P=1024 | 1.72 s | 2.48 s | 0.69x |
+| fitting engine | P=16384 | 28.4 s | 41.6 s | 0.68x |
+| EBSD indexing | P=256, D=1k, 60² | 4.7 ms | 9.3 ms | 0.50x |
+| EBSD indexing | P=1024, D=5k, 60² | 54.7 ms | 64.0 ms | 0.85x |
+| EBSD indexing | P=4096, D=20k, 60² | 727 ms | 685 ms | **1.06x** |
+| EBSD indexing | P=4096, D=20k, 80² | 1286 ms | 1112 ms | **1.16x** |
+
+**The split is the workload, not the backend.** EBSD indexing is one big
+`E @ Dᵀ`, so it amortises launch overhead and crosses over at production scale,
+rising with size exactly as a GEMM-bound path should. The fitting engine is the
+opposite shape: `n <= 20` free parameters make `JᵀJ` a batch of *tiny* matrices,
+so an LM iteration is many small kernels — the case CLAUDE.md's GPU section warns
+about — and it stays below 1.0 here.
+
+**Do not turn this table into a size threshold.** It is one small GPU; a
+Pro/Max/Ultra part has 2-8x the GPU compute against the same per-launch cost and
+moves every row. Both paths therefore prefer the accelerator and expose an
+override (`SPYDE_FIT_DEVICE`, `SPYDE_EBSD_DEVICE`) so a real box can be measured
+rather than guessed.
+
+**Measurement trap:** the un-warmed version of the EBSD table reported 0.02x at
+the smallest size and 0.72x at the largest, which reads as "MPS never wins". That
+was Metal context creation (~0.5 s) landing inside the first timed call. Always
+warm up before timing MPS.

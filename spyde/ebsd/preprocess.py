@@ -21,6 +21,9 @@ import logging
 
 import numpy as np
 
+from spyde.device_lock import accelerator_lock
+from spyde.ebsd._device import default_device, resolve_dtype
+
 log = logging.getLogger(__name__)
 
 
@@ -88,21 +91,23 @@ def remove_background(patterns, *, method: str = "dynamic", sigma: float = 8.0,
         raise ValueError(f"unknown background method {method!r} "
                          f"(dynamic, static or both)")
 
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    tdtype = getattr(torch, dtype)
+    device = device or default_device()
+    tdtype = getattr(torch, resolve_dtype(device, dtype))
     stack, nav_shape = _as_stack(patterns)
-    t = torch.as_tensor(stack, dtype=tdtype, device=device)
 
-    if method in ("static", "both"):
-        ref = (torch.as_tensor(np.asarray(static_reference), dtype=tdtype,
-                               device=device)
-               if static_reference is not None else t.mean(0))
-        t = t - ref
+    with accelerator_lock(device):
+        t = torch.as_tensor(stack, dtype=tdtype, device=device)
 
-    if method in ("dynamic", "both"):
-        t = t - _blur(t, sigma, device, tdtype)
+        if method in ("static", "both"):
+            ref = (torch.as_tensor(np.asarray(static_reference), dtype=tdtype,
+                                   device=device)
+                   if static_reference is not None else t.mean(0))
+            t = t - ref
 
-    return t.detach().cpu().numpy().reshape(*nav_shape, *stack.shape[-2:])
+        if method in ("dynamic", "both"):
+            t = t - _blur(t, sigma, device, tdtype)
+
+        return t.detach().cpu().numpy().reshape(*nav_shape, *stack.shape[-2:])
 
 
 def average_dot_product_map(patterns, *, device=None, dtype="float32"):
@@ -114,24 +119,26 @@ def average_dot_product_map(patterns, *, device=None, dtype="float32"):
     """
     import torch
 
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    tdtype = getattr(torch, dtype)
+    device = device or default_device()
+    tdtype = getattr(torch, resolve_dtype(device, dtype))
     a = np.asarray(patterns)
     if a.ndim != 4:
         raise ValueError("ADP needs a 2-D scan of 2-D patterns (ny, nx, H, W)")
     ny, nx = a.shape[:2]
-    t = torch.as_tensor(a.reshape(ny, nx, -1), dtype=tdtype, device=device)
-    t = t - t.mean(-1, keepdim=True)
-    t = t / t.norm(dim=-1, keepdim=True).clamp_min(1e-12)
 
-    total = torch.zeros((ny, nx), dtype=tdtype, device=device)
-    count = torch.zeros((ny, nx), dtype=tdtype, device=device)
-    for dy, dx in ((0, 1), (0, -1), (1, 0), (-1, 0)):
-        ys = slice(max(0, dy), ny + min(0, dy))
-        xs = slice(max(0, dx), nx + min(0, dx))
-        ys2 = slice(max(0, -dy), ny + min(0, -dy))
-        xs2 = slice(max(0, -dx), nx + min(0, -dx))
-        dot = (t[ys, xs] * t[ys2, xs2]).sum(-1)
-        total[ys, xs] += dot
-        count[ys, xs] += 1.0
-    return (total / count.clamp_min(1.0)).detach().cpu().numpy()
+    with accelerator_lock(device):
+        t = torch.as_tensor(a.reshape(ny, nx, -1), dtype=tdtype, device=device)
+        t = t - t.mean(-1, keepdim=True)
+        t = t / t.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+
+        total = torch.zeros((ny, nx), dtype=tdtype, device=device)
+        count = torch.zeros((ny, nx), dtype=tdtype, device=device)
+        for dy, dx in ((0, 1), (0, -1), (1, 0), (-1, 0)):
+            ys = slice(max(0, dy), ny + min(0, dy))
+            xs = slice(max(0, dx), nx + min(0, dx))
+            ys2 = slice(max(0, -dy), ny + min(0, -dy))
+            xs2 = slice(max(0, -dx), nx + min(0, -dx))
+            dot = (t[ys, xs] * t[ys2, xs2]).sum(-1)
+            total[ys, xs] += dot
+            count[ys, xs] += 1.0
+        return (total / count.clamp_min(1.0)).detach().cpu().numpy()

@@ -28,11 +28,16 @@ from typing import Callable
 
 import numpy as np
 
+from spyde.device_lock import accelerator_lock
+from spyde.ebsd._device import default_device, resolve_dtype
+
 log = logging.getLogger(__name__)
 
 # Elements per similarity tile. 2**26 float32 = 268 MB — big enough to keep a
 # GPU busy, small enough that the (P, D) product never materialises.
 _TILE_ELEMENTS = 1 << 26
+
+
 
 
 @dataclass
@@ -107,7 +112,8 @@ def dictionary_index(patterns, dictionary, *, keep: int = 1, device=None,
     resident = getattr(dictionary, "normalised", None)   # SinglePatternIndexer
     if resident is not None:
         device = device or dictionary.device
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    device = device or default_device()
+    dtype = resolve_dtype(device, dtype)
     tdtype = getattr(torch, dtype)
 
     exp = np.asarray(patterns)
@@ -131,9 +137,15 @@ def dictionary_index(patterns, dictionary, *, keep: int = 1, device=None,
 
     # The dictionary is normalised ONCE and kept resident — it is reused by
     # every tile, and re-normalising it per tile would dominate the matmul.
-    d_t = (resident if resident is not None
-           else _normalise(torch.as_tensor(dic.reshape(-1, dic_k), dtype=tdtype,
-                                           device=device)))
+    # Under the lock like everything else that touches the device: this uploads
+    # D x K floats and reduces over them, which is the single largest transfer
+    # the function makes.
+    if resident is not None:
+        d_t = resident
+    else:
+        with accelerator_lock(device):
+            d_t = _normalise(torch.as_tensor(dic.reshape(-1, dic_k),
+                                             dtype=tdtype, device=device))
     tdtype = d_t.dtype
     P, Dn = E.shape[0], int(d_t.shape[0])
     keep = int(min(keep, Dn))
@@ -152,25 +164,34 @@ def dictionary_index(patterns, dictionary, *, keep: int = 1, device=None,
             log.debug("dictionary indexing cancelled at %d/%d patterns", p0, P)
             return None
         p1 = min(P, p0 + p_chunk)
-        e_t = _normalise(torch.as_tensor(E[p0:p1], dtype=tdtype, device=device))
+        # Held per PATTERN TILE, not around the whole index. On MPS this shares
+        # one process-wide lock with every other torch user (device_lock.py), and
+        # a full index runs for minutes — so releasing between tiles bounds any
+        # concurrent preview's wait to a single tile. The `stopped_flag` check
+        # above stays OUTSIDE the lock so cancelling never waits on the device.
+        with accelerator_lock(device):
+            e_t = _normalise(torch.as_tensor(E[p0:p1], dtype=tdtype,
+                                             device=device))
 
-        best_s = torch.full((p1 - p0, keep), -2.0, dtype=tdtype, device=device)
-        best_i = torch.zeros((p1 - p0, keep), dtype=torch.int64, device=device)
+            best_s = torch.full((p1 - p0, keep), -2.0, dtype=tdtype,
+                                device=device)
+            best_i = torch.zeros((p1 - p0, keep), dtype=torch.int64,
+                                 device=device)
 
-        for d0 in range(0, Dn, d_chunk):
-            d1 = min(Dn, d0 + d_chunk)
-            sim = e_t @ d_t[d0:d1].T                       # (p, d) tile
-            k = min(keep, d1 - d0)
-            s, i = torch.topk(sim, k, dim=1)
-            # Merge this tile's best with the running best, then re-reduce —
-            # so the full (P, D) similarity never has to exist at once.
-            cat_s = torch.cat([best_s, s], 1)
-            cat_i = torch.cat([best_i, i + d0], 1)
-            best_s, order = torch.topk(cat_s, keep, dim=1)
-            best_i = torch.gather(cat_i, 1, order)
+            for d0 in range(0, Dn, d_chunk):
+                d1 = min(Dn, d0 + d_chunk)
+                sim = e_t @ d_t[d0:d1].T                   # (p, d) tile
+                k = min(keep, d1 - d0)
+                s, i = torch.topk(sim, k, dim=1)
+                # Merge this tile's best with the running best, then re-reduce —
+                # so the full (P, D) similarity never has to exist at once.
+                cat_s = torch.cat([best_s, s], 1)
+                cat_i = torch.cat([best_i, i + d0], 1)
+                best_s, order = torch.topk(cat_s, keep, dim=1)
+                best_i = torch.gather(cat_i, 1, order)
 
-        out_scores[p0:p1] = best_s.detach().cpu().numpy()
-        out_index[p0:p1] = best_i.detach().cpu().numpy()
+            out_scores[p0:p1] = best_s.detach().cpu().numpy()
+            out_index[p0:p1] = best_i.detach().cpu().numpy()
         if progress is not None:
             try:
                 progress(p1, P)
@@ -202,14 +223,15 @@ class SinglePatternIndexer:
     def __init__(self, dictionary, euler, *, device=None, dtype="float32"):
         import torch
 
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        tdtype = getattr(torch, dtype)
+        self.device = device or default_device()
+        tdtype = getattr(torch, resolve_dtype(self.device, dtype))
         dic = np.asarray(dictionary)
         self.euler = np.asarray(euler, float).reshape(-1, 3)
         self.pattern_shape = tuple(dic.shape[1:])
         self.k = int(np.prod(self.pattern_shape))
-        self._d = _normalise(torch.as_tensor(dic.reshape(-1, self.k),
-                                             dtype=tdtype, device=self.device))
+        with accelerator_lock(self.device):
+            self._d = _normalise(torch.as_tensor(
+                dic.reshape(-1, self.k), dtype=tdtype, device=self.device))
         self._dtype = tdtype
 
     def __len__(self) -> int:
@@ -229,12 +251,15 @@ class SinglePatternIndexer:
         if p.size != self.k:
             raise ValueError(f"pattern has {p.size} pixels but the dictionary "
                              f"has {self.k}")
-        with torch.no_grad():
+        # This is the LIVE path — it fires on every navigator move while the
+        # band overlay is up, so it is exactly the concurrent submitter the
+        # device lock exists to serialise against a running index or refine.
+        with accelerator_lock(self.device), torch.no_grad():
             e = _normalise(torch.as_tensor(p, dtype=self._dtype,
                                            device=self.device))
             sim = self._d @ e
             score, idx = torch.max(sim, 0)
-        return self.euler[int(idx.item())], float(score.item())
+            return self.euler[int(idx.item())], float(score.item())
 
 
 def simulate_dictionary(euler, detector=(60, 60), pc=(0.5, 0.5, 0.55), *,
@@ -263,24 +288,27 @@ def simulate_dictionary(euler, detector=(60, 60), pc=(0.5, 0.5, 0.55), *,
     import torch
     from spyde.ebsd.refine import BandSimulator
 
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    device = device or default_device()
     eul = np.atleast_2d(np.asarray(euler, float))
     sim = BandSimulator(detector, pc, reflectors=reflectors,
                         background_sigma=background_sigma, device=device)
     dy, dx = int(detector[0]), int(detector[1])
     out = np.empty((len(eul), dy, dx), np.float32)
-    with torch.no_grad():
-        for lo in range(0, len(eul), int(chunk)):
-            if stopped_flag is not None and stopped_flag[0]:
-                return None
-            hi = min(len(eul), lo + int(chunk))
-            ang = torch.as_tensor(eul[lo:hi], dtype=torch.float32, device=device)
+    for lo in range(0, len(eul), int(chunk)):
+        if stopped_flag is not None and stopped_flag[0]:
+            return None
+        hi = min(len(eul), lo + int(chunk))
+        # Per chunk, so a long simulation hands the device back — same rule as
+        # the indexing tiles above.
+        with accelerator_lock(device), torch.no_grad():
+            ang = torch.as_tensor(eul[lo:hi], dtype=torch.float32,
+                                  device=device)
             out[lo:hi] = sim(ang).reshape(-1, dy, dx).detach().cpu().numpy()
-            if progress is not None:
-                try:
-                    progress(hi, len(eul))
-                except Exception as e:                      # pragma: no cover
-                    log.debug("dictionary progress callback failed: %s", e)
+        if progress is not None:
+            try:
+                progress(hi, len(eul))
+            except Exception as e:                          # pragma: no cover
+                log.debug("dictionary progress callback failed: %s", e)
     return out
 
 

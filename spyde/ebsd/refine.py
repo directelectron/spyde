@@ -33,6 +33,9 @@ from typing import Callable
 
 import numpy as np
 
+from spyde.device_lock import DEVICE_LOCK, accelerator_lock, is_mps, mps_sync
+from spyde.ebsd._device import default_device
+
 log = logging.getLogger(__name__)
 
 
@@ -198,7 +201,7 @@ def refine_orientations(patterns, euler_start, *, simulator=None,
     """
     import torch
 
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    device = device or default_device()
     exp = np.asarray(patterns)
     nav_shape = exp.shape[:-2]
     K = int(np.prod(exp.shape[-2:]))
@@ -221,61 +224,84 @@ def refine_orientations(patterns, euler_start, *, simulator=None,
     out_score = np.empty(P, np.float32)
     out_before = np.empty(P, np.float32)
 
+    # On MPS the refine holds the one process-wide device lock, and it runs for
+    # a long time — so hand the device back at the SAME cadence the UI yield
+    # already uses (quiesce Metal, release, yield, re-acquire). A concurrent
+    # preview then waits one yield window rather than the whole refinement.
+    # This mirrors compute_vector_orientation_gpu; see CLAUDE.md, GPU Computing.
+    yield_fn = on_yield
+    if is_mps(device):
+        def yield_fn():                                       # noqa: F811
+            mps_sync()
+            DEVICE_LOCK.release()
+            try:
+                if on_yield is not None:
+                    on_yield()
+            finally:
+                DEVICE_LOCK.acquire()
+
     for lo in range(0, P, chunk):
         hi = min(P, lo + chunk)
-        e_t = torch.as_tensor(E[lo:hi], dtype=torch.float32, device=device)
-        e_t = e_t - e_t.mean(-1, keepdim=True)
-        e_t = e_t / e_t.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+        with accelerator_lock(device):
+            e_t = torch.as_tensor(E[lo:hi], dtype=torch.float32, device=device)
+            e_t = e_t - e_t.mean(-1, keepdim=True)
+            e_t = e_t / e_t.norm(dim=-1, keepdim=True).clamp_min(1e-12)
 
-        ang = torch.as_tensor(start[lo:hi], dtype=torch.float32,
-                              device=device).clone().requires_grad_(True)
-        with torch.no_grad():
-            out_before[lo:hi] = _ncc(simulator(ang), e_t).cpu().numpy()
+            ang = torch.as_tensor(start[lo:hi], dtype=torch.float32,
+                                  device=device).clone().requires_grad_(True)
+            with torch.no_grad():
+                out_before[lo:hi] = _ncc(simulator(ang), e_t).cpu().numpy()
 
-        opt = torch.optim.Adam([ang], lr=lr)
-        # Pin backward to this thread; see the module docstring.
-        prev_mt = torch.is_grad_enabled()
-        try:
-            torch.autograd.set_multithreading_enabled(False)
-        except Exception as exc:                              # pragma: no cover
-            log.debug("set_multithreading_enabled unavailable: %s", exc)
-
-        try:
-            for step in range(steps):
-                opt.zero_grad(set_to_none=True)
-                # Maximise similarity == minimise its negative. Summed, not
-                # averaged: each pattern's gradient is independent, so the sum
-                # keeps every one at full strength regardless of batch size.
-                loss = -_ncc(simulator(ang), e_t).sum()
-                loss.backward()
-                opt.step()
-                if on_yield is not None and step % yield_every == 0:
-                    try:
-                        on_yield()
-                    except Exception as exc:                  # pragma: no cover
-                        log.debug("refine on_yield failed: %s", exc)
-        finally:
+            opt = torch.optim.Adam([ang], lr=lr)
+            # Pin backward to this thread; see the module docstring.
+            prev_mt = torch.is_grad_enabled()
             try:
-                torch.autograd.set_multithreading_enabled(prev_mt)
-            except Exception:                                 # pragma: no cover
-                pass
+                torch.autograd.set_multithreading_enabled(False)
+            except Exception as exc:                          # pragma: no cover
+                log.debug("set_multithreading_enabled unavailable: %s", exc)
 
-        with torch.no_grad():
-            final = _ncc(simulator(ang), e_t)
-            better = final >= torch.as_tensor(out_before[lo:hi], device=device)
-            # NEVER return a worse orientation than we were given. Refinement
-            # is an improvement step on top of indexing; if Adam wandered off
-            # (a bad starting point, too large an lr) the indexed answer is
-            # still the better estimate.
-            keep = torch.where(better.unsqueeze(1), ang,
-                               torch.as_tensor(start[lo:hi],
-                                               dtype=torch.float32,
-                                               device=device))
-            out_euler[lo:hi] = keep.detach().cpu().numpy()
-            out_score[lo:hi] = torch.maximum(
-                final, torch.as_tensor(out_before[lo:hi],
-                                       device=device)).cpu().numpy()
+            try:
+                for step in range(steps):
+                    opt.zero_grad(set_to_none=True)
+                    # Maximise similarity == minimise its negative. Summed, not
+                    # averaged: each pattern's gradient is independent, so the
+                    # sum keeps every one at full strength regardless of batch
+                    # size.
+                    loss = -_ncc(simulator(ang), e_t).sum()
+                    loss.backward()
+                    opt.step()
+                    if yield_fn is not None and step % yield_every == 0:
+                        try:
+                            yield_fn()
+                        except Exception as exc:              # pragma: no cover
+                            log.debug("refine on_yield failed: %s", exc)
+            finally:
+                try:
+                    torch.autograd.set_multithreading_enabled(prev_mt)
+                except Exception:                             # pragma: no cover
+                    pass
 
+            # Still INSIDE the device lock — this scores on the device and
+            # reads `ang`/`e_t` back off it.
+            with torch.no_grad():
+                final = _ncc(simulator(ang), e_t)
+                better = final >= torch.as_tensor(out_before[lo:hi],
+                                                  device=device)
+                # NEVER return a worse orientation than we were given.
+                # Refinement is an improvement step on top of indexing; if Adam
+                # wandered off (a bad starting point, too large an lr) the
+                # indexed answer is still the better estimate.
+                keep = torch.where(better.unsqueeze(1), ang,
+                                   torch.as_tensor(start[lo:hi],
+                                                   dtype=torch.float32,
+                                                   device=device))
+                out_euler[lo:hi] = keep.detach().cpu().numpy()
+                out_score[lo:hi] = torch.maximum(
+                    final, torch.as_tensor(out_before[lo:hi],
+                                           device=device)).cpu().numpy()
+
+        # Outside the lock on purpose: a progress callback runs arbitrary
+        # caller code (IPC, UI) and must never do so holding the device.
         if progress is not None:
             try:
                 progress(hi, P)
