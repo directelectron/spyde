@@ -163,6 +163,47 @@ class FileLoaderMixin:
     _NAV_CHUNK_MAX = 32             # never span more than this many nav positions
 
     @classmethod
+    def load_aligned(cls, path: str, **kw):
+        """``hs.load(path, lazy=True)`` with STORAGE-ALIGNED chunks, always.
+
+        THE one door for opening a file. Every caller gets whole-signal chunks
+        without having to remember the two-step, because forgetting it is
+        invisible until someone opens a big file and waits.
+
+        Measured on a real 977 x 4096² uint8 in-situ MRC (15.3 GB), which the
+        reader auto-chunks as balanced 511³ cubes — i.e. it SPLITS the signal
+        axes, the exact failure CLAUDE.md Live-Display §1 is about::
+
+            reader default (511³ cubes)   chunks=(1, -1, -1)
+            nav chunks             2                    977
+            first nav chunk    14.60 s                0.032 s
+            whole nav sum      24.37 s       4.52 s (3.38 GB/s)
+
+        The re-load costs **0.08 s** — a lazy re-load only rebuilds the dask
+        graph, it does NOT read or move data (never `.rechunk()` instead: that
+        shuffles the whole array through the scheduler).
+
+        This existed as copy-pasted load-then-reload in ``_load_file_thread``
+        and ``_load_stack_thread`` and was simply ABSENT from
+        ``example_catalogue`` and the test harness — so an example dataset or a
+        harness movie silently got the balanced-cube chunking and every
+        navigator sum and frame read on it paid the 5x above.
+        """
+        sig = hs.load(path, lazy=True, **kw)
+        first = sig[0] if isinstance(sig, list) else sig
+        ch = cls._signal_spanning_chunks(first)
+        if ch is None:
+            return sig
+        try:
+            return hs.load(path, lazy=True, chunks=ch, **kw)
+        except Exception as e:
+            # A reader that rejects `chunks=` (rsciio's lazy TIFF does) keeps
+            # the default rather than failing the open.
+            log.debug("signal-spanning re-load of %s failed (%s); using the "
+                      "reader default", os.path.basename(path), e)
+            return sig
+
+    @classmethod
     def _signal_spanning_chunks(cls, sig, nav_chunk: "int | None" = None):
         """Chunks for a lazy 2-D-signal dataset where each chunk holds WHOLE
         signal frames (``-1`` on the signal axes) and a small contiguous nav
@@ -230,24 +271,11 @@ class FileLoaderMixin:
             # Wait for the Dask cluster (see _load_example_thread) — a file opened
             # during startup queues here rather than racing ahead with no client.
             self._await_dask()
-            signal = hs.load(path, lazy=True)
+            # `load_aligned` IS the load-then-reload; whole-signal chunks are
+            # not this call site's business to remember.
+            signal = self.load_aligned(path)
             if not isinstance(signal, list):
                 signal = [signal]
-            # Re-load with whole-signal chunks when the reader split the signal
-            # axes (cheap: a lazy reload only rebuilds the dask graph, ~0 s — it
-            # does NOT read or shuffle data, unlike a rechunk()).
-            for i, sig in enumerate(signal):
-                ch = self._signal_spanning_chunks(sig)
-                if ch is not None:
-                    try:
-                        reloaded = hs.load(path, lazy=True, chunks=ch)
-                        signal = reloaded if isinstance(reloaded, list) else [reloaded]
-                        log.debug("re-loaded %s with whole-signal chunks %s",
-                                  os.path.basename(path), ch)
-                    except Exception as e:
-                        log.debug("re-load with signal-spanning chunks failed "
-                                  "(%s); using reader default", e)
-                    break
             # File read done — clear the busy flag (a nav-shape prompt or the
             # opened windows take over from here).
             ipc.emit({"type": "loading", "busy": False, "text": ""})
@@ -488,7 +516,10 @@ class FileLoaderMixin:
         try:
             sigs = []
             for p in paths:
-                s = hs.load(p, lazy=True)
+                # Aligned BEFORE stacking, deliberately: members that are already
+                # signal-spanning-chunked mean the (huge) 5-D stack never has to
+                # be rechunked afterwards — see "never rechunk live" in CLAUDE.md.
+                s = self.load_aligned(p)
                 if isinstance(s, list):
                     if len(s) != 1:
                         raise ValueError(
@@ -496,19 +527,6 @@ class FileLoaderMixin:
                             "stack only supports single-signal files."
                         )
                     s = s[0]
-                # Re-load with whole-signal chunks if the reader split the signal
-                # axes — a lazy reload is ~0 s (rebuilds the graph, no data move),
-                # and stacking members that are ALREADY signal-spanning-chunked
-                # avoids ever rechunking the (huge) 5-D stack afterward. See the
-                # "storage-aligned chunking — never rechunk live" rule in CLAUDE.md.
-                ch = self._signal_spanning_chunks(s)
-                if ch is not None:
-                    try:
-                        r = hs.load(p, lazy=True, chunks=ch)
-                        s = r[0] if isinstance(r, list) else r
-                    except Exception as e:
-                        log.debug("stack member %s signal-chunk reload failed: %s",
-                                  os.path.basename(p), e)
                 sigs.append(s)
 
             # All members must share the SAME ndim/axis layout to stack coherently.
@@ -741,6 +759,19 @@ class FileLoaderMixin:
         sig = _open_lazily(path)
         if isinstance(sig, (list, tuple)):
             sig = sig[0]
+        # Storage-aligned chunks here TOO. This path had none, so an example
+        # whose reader auto-chunks a balanced cube (which is what rsciio does
+        # for a big MRC) paid a 5x-slower navigator sum and a whole-chunk read
+        # per frame — the same failure `load_aligned` documents, just reached
+        # through the Examples menu instead of File→Open.
+        ch = self._signal_spanning_chunks(sig)
+        if ch is not None:
+            try:
+                re = _open_lazily(path, chunks=ch)
+                sig = re[0] if isinstance(re, (list, tuple)) else re
+            except Exception as e:
+                log.debug("example %s signal-chunk reload failed: %s",
+                          os.path.basename(path), e)
         return sig if getattr(sig, "_lazy", False) else sig.as_lazy()
 
     def _to_lazy(self, sig: BaseSignal, name: str) -> BaseSignal:

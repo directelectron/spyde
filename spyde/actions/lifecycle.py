@@ -172,6 +172,81 @@ def wait_for_vectors(session, plot, then: Callable[[], None], *, what: str,
     return True
 
 
+def wait_for_particles(session, plot, then: Callable[[], None], *, what: str,
+                       grace: float = 6.0, timeout: float = 600.0,
+                       status_every: float = 5.0) -> bool:
+    """Wait out the segmentation attach gap, then re-dispatch.
+
+    The particle-tree twin of :func:`wait_for_vectors`, and it exists for the
+    same reason: ``seg_run`` opens its result window EARLY with a placeholder
+    count trace and attaches ``tree.particles`` only when the batch finalizes on
+    a worker thread, so a particle-dependent action (track, export, per-particle
+    DP) can fire in the gap and find ``None`` on a tree that gets it seconds
+    later. Polls on a worker thread and re-dispatches *then* via
+    ``_dispatch_to_main`` once the particles land.
+
+    Unlike the vectors version there is **no ``strict`` switch** — and that is
+    deliberate. ``wait_for_vectors`` needs one because vectors attach to the tree
+    the user clicked, so an any-tree fallback could satisfy the wait from an
+    unrelated tree and re-dispatch forever into a tree-specific gate. Particles
+    live on their OWN tree (plan §0.6: segmentation spawns a new tree rather than
+    decorating the source), so the only sensible question is whether *this* tree
+    has them. There is no ambiguity to resolve, so there is no knob.
+
+    The default *timeout* is longer than the vectors one (600 s vs 300 s):
+    segmenting thousands of frames is the plan's stated target scale, and a run
+    that legitimately takes eight minutes must not be abandoned at five.
+
+    Returns True if a wait was started (the caller must return immediately);
+    False when there is no event loop to wait on (bare test stubs) — the caller
+    should emit its own error then.
+    """
+    from spyde.backend.ipc import emit_error, emit_status
+    if getattr(session, "_dispatch_to_main", None) is None:
+        return False
+
+    def _tree():
+        return getattr(plot, "signal_tree", None) if plot is not None else None
+
+    def _wait():
+        from spyde.compute_dispatch import reliable_sleep
+        waited = 0.0
+        status_at = 0.0
+        while True:
+            tree = _tree()
+            if tree is not None and getattr(tree, "particles", None) is not None:
+                session._dispatch_to_main(then)
+                return
+            running = seg_batch_running(session)
+            if not running and waited >= grace:
+                emit_error(f"{what} needs a segmentation result (no particles).")
+                return
+            if running and waited - status_at >= status_every:
+                emit_status("Waiting for particle segmentation to finish…")
+                status_at = waited
+            if waited >= timeout:
+                emit_error(f"{what} timed out waiting for particles.")
+                return
+            reliable_sleep(0.1)
+            waited += 0.1
+
+    threading.Thread(target=_wait, daemon=True, name="wait-particles").start()
+    return True
+
+
+def seg_batch_running(session) -> bool:
+    """True while any tree has a segmentation batch in flight.
+
+    Mirrors :func:`fv_batch_running`. The flag lives on the tree
+    (``_seg_batch_running``) so ``BaseSignalTree.close()`` clears it along with
+    everything else, per the ownership map in ``actions/README.md`` §3.
+    """
+    for tree in getattr(session, "signal_trees", []) or []:
+        if getattr(tree, "_seg_batch_running", False):
+            return True
+    return False
+
+
 # ── overlays / painting ───────────────────────────────────────────────────────
 
 def replace_tree_attr(tree, attr: str, factory: Callable[[], Any] | None):
@@ -317,6 +392,7 @@ class window_computing:
         return False
 
 
+
 # ── progressive shared-memory fill ────────────────────────────────────────────
 
 def live_fill_poller(shape: Sequence[int], shm_name: str | None,
@@ -340,9 +416,32 @@ def live_fill_poller(shape: Sequence[int], shm_name: str | None,
     from spyde.drawing.update_functions import read_live_buffer
 
     def _poller():
+        # Skip a paint when the buffer has not CHANGED since the last one.
+        #
+        # Measured on a real 256x256-nav fill: ~195 paints for ~26 distinct
+        # buffer states — 7x redundant. Two painters run concurrently and
+        # neither knows about the other (this poller on its interval, plus the
+        # per-chunk relay), and during the long "0%" stretch before the first
+        # chunk lands they were repainting an ALL-NaN array several times a
+        # second. Every one of those pays `_set_array` + levels + histogram +
+        # a binary push, on the same main thread that has to submit and collect
+        # the compute they are waiting for.
+        #
+        # The digest is over the raw bytes, so NaN-vs-NaN compares equal (unlike
+        # `==`) and an unfilled buffer reads as "unchanged" rather than as a
+        # change every tick. ~50 us for a 256 KB nav — three orders below the
+        # paint it avoids.
+        import hashlib
+        last = [None]
         while not stop_flag[0]:
             try:
-                paint(read_live_buffer(tuple(shape), shm_name))
+                arr = read_live_buffer(tuple(shape), shm_name)
+                digest = hashlib.blake2b(
+                    np.ascontiguousarray(arr).view(np.uint8),
+                    digest_size=16).digest()
+                if digest != last[0]:
+                    last[0] = digest
+                    paint(arr)
             except Exception as e:
                 log.debug("live-fill poll paint failed: %s", e)
             reliable_sleep(interval)

@@ -160,77 +160,44 @@ def _compute_chunks_with_live_counts(
 ):
     """Single-lane distributed compute with a live per-chunk preview.
 
-    Submits one Future per nav chunk (so chunks land progressively, each with
-    its correct global nav slice) and calls ``on_chunk_done(nav_slices, chunk)``
-    from the Dask done-callback thread as each completes — mirroring the VI
-    progressive path.  Assembles the full padded result and returns it, or
-    ``None`` if stopped.  Used when there is exactly one compute lane but a live
-    count map is wanted; the dual-lane GPU dispatcher handles its own case.
+    Used when there is exactly one compute lane but a live count map is wanted;
+    ``_dispatch_chunks_gpu_aware`` handles the dual-lane case.  Both now go
+    through the SAME dispatcher — this used to be its own
+    ``for combo in itertools.product(...): client.compute(...)`` loop, which
+    submitted EVERY nav chunk up front (no backpressure) one blocking scheduler
+    round trip at a time.  The per-chunk compute here is expensive enough to
+    amortise that, which is why it never showed up as a hang the way the
+    navigator fill did — but the loop had the same three defects.
+
+    ``cap`` keeps the old effective concurrency: the unpinned default is HALF
+    the cluster threads (sized for read-bound progressive chunks), whereas a
+    find-vectors chunk is compute-bound and wants the full lane, matching the
+    dual-lane CPU window (``threads + 2``).
+
+    Assembles the full padded result and returns it, or ``None`` if stopped.
+
+    ONE deliberate semantic change: a failed chunk now RAISES (the dispatcher's
+    behaviour, already what the dual-lane path did) instead of being logged at
+    debug and leaving that nav slice NaN.  A silently hole-punched vector map is
+    worse than an error — the holes look like "no peaks found there" and survive
+    into every downstream action.
     """
-    import itertools
+    from spyde.compute_dispatch import dispatch_chunks
 
-    nav_chunks = result_array.chunks[:nav_dim]
-    axes_ranges = []
-    for axis_chunks in nav_chunks:
-        positions, start = [], 0
-        for size in axis_chunks:
-            positions.append((start, size))
-            start += size
-        axes_ranges.append(positions)
-    trailing = (slice(None),) * (result_array.ndim - nav_dim)
-
-    result = np.full(result_array.shape, np.nan, dtype=result_array.dtype)
-    futures = []
-    chunk_slices = []
-    for combo in itertools.product(*axes_ranges):
-        nav_sl = tuple(slice(s, s + n) for s, n in combo)
-        fut = client.compute(result_array[nav_sl + trailing])
-        futures.append(fut)
-        chunk_slices.append(nav_sl)
-
-    for fut, nav_sl in zip(futures, chunk_slices):
-        def _cb(f, _sl=nav_sl):
-            try:
-                block = f.result()
-            except Exception as e:
-                log.debug("live-count chunk %r failed: %s", _sl, e)
-                return
-            result[_sl + trailing] = block
-            try:
-                on_chunk_done(_sl, block)
-            except Exception as e:
-                log.debug("on_chunk_done for %r failed: %s", _sl, e)
-        fut.add_done_callback(_cb)
-
-    from spyde.compute_dispatch import poke_scheduler, reliable_sleep
-    pending = list(futures)
-    n_done_prev = 0
-    last_progress = time.time()
-    last_poke = time.time()
-    while pending:
-        if stopped_flag is not None and stopped_flag[0]:
-            for fut in pending:
-                try:
-                    fut.cancel()
-                except Exception as e:
-                    log.debug("cancelling live-count future failed: %s", e)
-            return None
-        pending = [f for f in pending if not f.done()]
-        n_done = len(futures) - len(pending)
-        now = time.time()
-        if n_done != n_done_prev:
-            n_done_prev = n_done
-            last_progress = now
-        elif now - last_progress > 5.0 and now - last_poke > 5.0:
-            # No-progress watchdog (frozen task delivery — see poke_scheduler).
-            last_poke = now
-            poke_scheduler(client, "find_vectors-live")
-        if pending:
-            # NB reliable_sleep, NOT time.sleep — time.sleep froze for 15 s on
-            # the throttled Electron-spawned backend, so this loop (and its
-            # watchdog above) never ran on schedule.
-            reliable_sleep(0.05)
-    return result
+    try:
+        info = client.scheduler_info(n_workers=-1)["workers"]
+        threads = sum(int(w.get("nthreads", 1)) for w in info.values())
+    except Exception:
+        threads = 0
+    return dispatch_chunks(
+        client, result_array, nav_dim,
+        [],        # no GPU lane
+        None,      # ONE UNPINNED lane over the whole cluster
+        stopped_flag=stopped_flag, postprocess=_compact_padded_chunk,
+        fill_value=np.nan, label="find_vectors-live",
+        on_chunk_done=on_chunk_done, lane_default_mode="off",
+        cap=max(2, threads + 2),
+    )
 
 
 def _dispatch_chunks_gpu_aware(

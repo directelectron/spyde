@@ -265,6 +265,15 @@ class TestLiveFillPoller:
         stop()   # must not raise
 
     def test_polls_until_stopped(self):
+        """It keeps polling until stopped — demonstrated by CHANGING the buffer.
+
+        This used to assert ``len(calls) >= 2`` on a buffer nobody wrote to,
+        which quietly made "repaints identical data" the contract. The poller
+        now skips an unchanged buffer (see ``test_live_fill_poller.py``: ~195
+        paints for ~26 distinct states on a real fill), so liveness has to be
+        shown the honest way — write something new and watch it land.
+        """
+        import numpy as np
         from spyde.drawing.update_functions import ensure_live_buffer
         name = "spyde_test_lifecycle_poll"
         shm = ensure_live_buffer((4, 4), name)
@@ -272,10 +281,18 @@ class TestLiveFillPoller:
         try:
             stop = lifecycle.live_fill_poller(
                 (4, 4), name, lambda arr: calls.append(arr.shape), interval=0.05)
-            assert _wait_until(lambda: len(calls) >= 2, 5.0), "poller never painted"
+            assert _wait_until(lambda: len(calls) >= 1, 5.0), "poller never painted"
             assert calls[0] == (4, 4)
+
+            # Mutate the buffer: a live poller must notice and repaint.
+            buf = np.ndarray((4, 4), dtype=np.float32, buffer=shm.buf)
+            buf[0, 0] = 123.0
+            assert _wait_until(lambda: len(calls) >= 2, 5.0), \
+                "poller did not repaint after the buffer changed — it is not polling"
+
             stop()
             n = len(calls)
+            buf[1, 1] = 456.0            # a change AFTER stop must be ignored
             time.sleep(0.3)
             assert len(calls) <= n + 1, "poller kept painting after stop()"
         finally:

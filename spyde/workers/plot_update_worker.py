@@ -14,6 +14,18 @@ from spyde.drawing.update_functions import read_shared_array
 log = logging.getLogger(__name__)
 
 
+def _is_future(obj) -> bool:
+    """True for a dask ``distributed.Future`` OR a SpyDE duck-typed future.
+
+    Mirrors ``update_functions.is_future_like`` (see there for why the marker
+    exists) but resolves ``Future`` from THIS module's global on purpose: tests
+    substitute ``plot_update_worker.Future`` with their fake future classes to
+    exercise the shm/cancelled paths, and importing the shared helper would make
+    that monkeypatch a silent no-op (``test_shm_read_robust``).
+    """
+    return isinstance(obj, Future) or getattr(obj, "_spyde_future", False) is True
+
+
 class PlotUpdateWorker:
     """
     Worker that periodically scans plots for completed Dask Futures and emits results.
@@ -118,18 +130,21 @@ class PlotUpdateWorker:
 
     def _future_from_signal(self, sig) -> Optional[Future]:
         data = getattr(sig, "data", None)
-        if isinstance(data, Future):
+        if _is_future(data):
             return data
         # NB: `and data` on an ndarray with >1 element raises "truth value of an
         # array is ambiguous" — check length explicitly. A lazy signal whose
         # data is a length-1 object array holding a Future is the case we want
         # (a plain numeric ndarray has data[0] that isn't a Future → None).
+        # This IS the normal case, not a corner: hyperspy's `data` setter runs
+        # `np.atleast_1d(np.asanyarray(value))`, so `signal.data = <future>`
+        # always lands as a length-1 object array.
         if isinstance(data, (list, tuple, np.ndarray)) and len(data) > 0:
             try:
                 first = data[0]
             except Exception:
                 return None
-            if isinstance(first, Future):
+            if _is_future(first):
                 return data[0]
         return None
 
@@ -140,7 +155,13 @@ class PlotUpdateWorker:
         plot=None,
         extra=None,
     ) -> None:
-        if not isinstance(fut, Future) or not fut.done():
+        if not _is_future(fut) or not fut.done():
+            return
+        # A CANCELLED duck future has no result to deliver — the shm rationale
+        # below is specific to the distributed write_shared_array path, and
+        # pushing its `None` onto the plot/signal would blank them. Distributed
+        # futures keep their existing do-not-skip behaviour.
+        if not isinstance(fut, Future) and getattr(fut, "cancelled", False):
             return
         # NB: do NOT skip cancelled futures here. The QT worker didn't, and the
         # shared-memory buffer is read defensively (read_shared_array rejects an

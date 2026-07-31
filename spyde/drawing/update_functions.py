@@ -7,6 +7,7 @@ called on the move or change events of a selector.
 """
 
 import contextlib
+import itertools
 import logging
 import sys
 import threading
@@ -1038,6 +1039,32 @@ def update_from_navigation_selection(
 
     current_signal = child.plot_state.current_signal
 
+    # A signal whose `.data` is still a pending FUTURE has nothing to slice yet,
+    # and that is independent of `_lazy` — so it must be checked here rather
+    # than inside the lazy branch below.
+    #
+    # `signal.data = <future>` does not store the object: hyperspy's setter runs
+    # `np.atleast_1d(np.asanyarray(value))`, so it lands as a length-1 OBJECT
+    # array. Indexing that with nav coordinates raises
+    # "too many indices for array: array is 1-dimensional, but 2 were indexed" —
+    # the long-standing "second-signal IndexError", which the eager branch below
+    # logs and re-raises.
+    #
+    # This was always latent: the progressive navigator fill parks a future on
+    # the base navigator signal, and `PlotUpdateWorker` swaps in the real array
+    # once it resolves. With a distributed Future that window was milliseconds,
+    # so the race effectively never fired. The client-side `_AssembledFuture`
+    # only reports done when the WHOLE dispatch finishes — ~50 s on a 977-chunk
+    # movie — which widens the window enough that ordinary navigator moves land
+    # inside it. Returning None leaves the last good frame up, which is what the
+    # caller already does for a superseded read.
+    if _pending_future_data(current_signal):
+        log.debug("nav read skipped: %s still carries a pending future",
+                  getattr(current_signal, "metadata", None) and
+                  getattr(current_signal.metadata, "General", None) and
+                  getattr(current_signal.metadata.General, "title", "<signal>"))
+        return None
+
     # Per-frame trace — gated behind SPYDE_NAV_TIMING because it fires on EVERY
     # crosshair move and floods the IPC log/panel at DEBUG (which itself adds lag).
     if _NAV_TIMING:
@@ -1098,7 +1125,7 @@ def update_from_navigation_selection(
     indices = _prepare_nav_indices(current_signal, indices, selector.is_integrating)
 
     if current_signal._lazy:
-        if isinstance(current_signal.data[0], Future):
+        if is_future_like(current_signal.data[0]):
             current_img = np.ones(current_signal.axes_manager.signal_shape, dtype=np.int8)
             if current_img.ndim == 2:
                 #make checkerboard pattern to indicate loading
@@ -1343,13 +1370,18 @@ def compute_virtual_image_kernel(
 
 
 class _ProgressiveFuture:
-    """Future-like handle for the WINDOWED progressive compute (duck-typed
-    ``done``/``result``/``cancel`` — the VI stream polls it itself; it is never
-    handed to PlotUpdateWorker, whose isinstance(distributed.Future) checks
-    require the real thing — that is why the navigator-fill path keeps the
-    un-windowed full-graph future)."""
+    """Future-like handle for a progressive chunk dispatch (duck-typed
+    ``done``/``result``/``cancel``).
 
-    def __init__(self):
+    The VI/FFT stream polls this itself and it is deliberately INVISIBLE to
+    PlotUpdateWorker (no ``_spyde_future`` marker) — the stream paints from its
+    shm buffer, and letting the worker also deliver the assembled array would
+    push a second, unrelated frame onto the plot. The navigator fill wants the
+    opposite and uses :class:`_AssembledFuture`.
+    """
+
+    def __init__(self, label: str = "progressive"):
+        self.label = label
         self._done_evt = threading.Event()
         self._error: Exception | None = None
         self._value = None
@@ -1376,119 +1408,188 @@ class _ProgressiveFuture:
                 log.debug("progressive cancel callback failed: %s", e)
 
 
-def _windowed_progressive(result_array, nav_shape, client, chunk_slices,
-                          on_chunk_done, on_future, stop_event, window=None):
-    """Bounded-in-flight per-chunk compute for the VI/FFT stream.
+_ASSEMBLED_SEQ = itertools.count()
 
-    The old path submitted EVERY nav chunk at once PLUS the whole array as a
-    second graph — the scheduler was then free to load the entire source
-    dataset immediately (the "VI spills tons to disk" pathology), and an ROI
-    move could not cancel the per-chunk futures at all, so each drag tick
-    stacked another complete full-dataset pass. Here at most ``window``
-    (~2× cluster threads) chunk futures exist at a time, every future is
-    reported via ``on_future`` AND cancellable through the returned handle,
-    a set ``stop_event`` halts further submission, and the full result is
-    assembled CLIENT-side from the same chunk results (no second graph).
-    Completed futures are held until the end (releasing mid-run races shared
-    input keys — see compute_dispatch) — chunk results are nav-sized floats,
-    so holding them is KBs."""
-    import collections
-    import functools
+
+def _pending_future_data(signal) -> bool:
+    """True when *signal*'s ``.data`` is a future that has not resolved yet.
+
+    Covers both shapes the future can take, because hyperspy's `data` setter
+    runs ``np.atleast_1d(np.asanyarray(value))``: the bare object, and the
+    length-1 OBJECT array it actually becomes. Mirrors
+    ``plot_update_worker._future_from_signal``, which unwraps the same two.
+
+    A RESOLVED future is not "pending" — `PlotUpdateWorker` will swap the real
+    array in on its next tick, and until then there is nothing to slice either
+    way; reporting it as pending simply skips one frame instead of raising.
+    """
+    data = getattr(signal, "data", None)
+    if is_future_like(data):
+        return True
+    # `if data` on an ndarray raises "truth value is ambiguous" — test length.
+    if isinstance(data, np.ndarray) and data.dtype == object and data.size == 1:
+        try:
+            return is_future_like(data.reshape(-1)[0])
+        except Exception:
+            return False
+    return False
+
+
+def is_future_like(obj) -> bool:
+    """True for a dask ``distributed.Future`` OR a SpyDE duck-typed future.
+
+    The progressive navigator fill no longer submits a second whole-array graph
+    just to have a real ``distributed.Future`` to hand over: the per-chunk
+    futures already computed every value, so the dispatcher assembles them
+    client-side and returns an :class:`_AssembledFuture` (``_spyde_future``)
+    with the same ``done()``/``result()``/``key`` surface.  Anything without the
+    marker — a plain ndarray, a ``_ProgressiveFuture`` from the VI stream, the
+    synchronous ``_SyncResult`` — is ignored exactly as before.
+
+    NB ``signal.data = <future>`` does NOT store the object as-is: hyperspy's
+    setter runs it through ``np.atleast_1d(np.asanyarray(...))``, so it lands as
+    a length-1 OBJECT array.  Callers that test a signal's data must look at
+    ``data[0]``, not ``data``.
+    """
+    return isinstance(obj, Future) or getattr(obj, "_spyde_future", False) is True
+
+
+class _AssembledFuture(_ProgressiveFuture):
+    """Future-like handle whose value is the CLIENT-SIDE ASSEMBLY of a chunk
+    dispatch — the replacement for the second whole-array ``client.compute()``.
+
+    The navigator fill used to submit every nav chunk AND then
+    ``client.compute(result_array)``: a complete SECOND pass over the dataset
+    computing values the chunks had already produced.  It existed only because
+    ``PlotUpdateWorker`` isinstance-checks ``distributed.Future`` on
+    ``plot.current_data`` / ``signal.data``.  The chunks ARE the result, so the
+    dispatcher assembles them and this handle carries the assembly with the
+    same ``done()``/``result()``/``key`` surface; the worker accepts it via the
+    ``_spyde_future`` marker (see ``plot_update_worker._is_future``).
+
+    ``key`` must be UNIQUE per instance: the worker dedups by
+    ``(key, id(plot))``, so a shared constant would make a second fill on the
+    same plot never emit.  It must also not contain ``write_shared_array``,
+    which the worker routes to a shm read instead of ``result()``.
+    """
+
+    _spyde_future = True
+
+    def __init__(self, label: str = "assembled"):
+        super().__init__(label)
+        self.key = f"spyde-{label}-{next(_ASSEMBLED_SEQ)}"
+
+
+class _StopFlag(list):
+    """A ``[False]`` stopped_flag that ALSO reports a set ``threading.Event``.
+
+    ``dispatch_chunks`` polls ``stopped_flag[0]``; SpyDE's progressive callers
+    stop in three different ways — ``handle.cancel()``, a ``stop_event``
+    (``_stop_progressive_stream`` sets one before it unlinks the shm), and
+    ``BaseSignalTree.register_cancel`` writing ``flag[0] = True`` on tree close.
+    Folding the event into ``__getitem__`` lets one flag serve all three.
+    """
+
+    def __init__(self, event=None):
+        super().__init__([False])
+        self._event = event
+
+    def __getitem__(self, i):
+        if i == 0 and self._event is not None and self._event.is_set():
+            return True
+        return super().__getitem__(i)
+
+
+def _dispatched_progressive(result_array, nav_shape, client, on_chunk_done,
+                            on_future, stop_event, label="navigator",
+                            cap=None, future_cls=_AssembledFuture):
+    """Progressive per-nav-chunk compute through the SHARED dispatcher
+    (:func:`spyde.compute_dispatch.dispatch_chunks`).
+
+    Serves BOTH progressive paths — the navigator fill and the VI/FFT stream —
+    which had grown two hand-rolled submit loops with different bug sets.  What
+    the shared dispatcher brings that neither loop had in full:
+
+      * **Batched submit.** One ``client.compute(list)`` per top-up instead of a
+        blocking scheduler round trip per chunk with the GIL held in the client
+        process.  Measured end to end on a 977-frame / 15.3 GB in-situ movie
+        (977 nav chunks, 4 workers — ``benchmark_nav_fill_dispatch.py``):
+        **9.86 s** of submission during which NOTHING else in the backend could
+        run (blank navigator, silent paint threads) and a first painted chunk at
+        16.4 s, versus 0.00 s / **0.08 s** here.
+      * **Backpressure.** A bounded in-flight window (half the cluster threads),
+        so the scheduler is never handed the whole dataset at once — the
+        prefetch-everything-then-spill pathology.  The navigator fill had NO
+        window at all: it submitted all 977 up front.
+      * **The stall watchdog + scheduler poke** the find-vectors batch depends
+        on (task delivery freezes on the hidden Electron-spawned backend until
+        client traffic arrives).
+      * **No second whole-array graph** — see :class:`_AssembledFuture`.
+
+    Observable behaviour is unchanged: chunks land progressively in submission
+    order, ``on_chunk_done(chunk_result, nav_slices)`` fires from the dask
+    done-callback thread IN THE CLIENT PROCESS (worker-side shm writes
+    access-violate on Windows teardown), the result is assembled client-side,
+    and ``cancel()`` still stops outstanding work immediately (via
+    ``dispatch_chunks``' ``on_start`` hook, not on its next 0.5 s poll — a
+    superseded VI stream must not keep computing through an ROI drag).
+
+    ``dispatch_chunks`` BLOCKS, so it runs on a daemon thread and this returns
+    immediately, exactly like the old submit loops did.
+    """
+    from spyde.compute_dispatch import dispatch_chunks
 
     nav_ndim = len(nav_shape)
     trailing = (slice(None),) * (result_array.ndim - nav_ndim)
-    dtype = (result_array.dtype if np.issubdtype(result_array.dtype, np.floating)
-             else np.float32)
-    assembled = np.full(result_array.shape, np.nan, dtype=dtype)
+    handle = future_cls(label)
+    stopped = _StopFlag(stop_event)
+    # Filled in by dispatch_chunks' on_start hook (see below); until then a
+    # cancel still registers on the flag.
+    handle._cancel_cb = lambda: stopped.__setitem__(0, True)
 
-    if window is None:
-        # HALF the cluster threads: a VI chunk is read-bound (the disk is the
-        # bottleneck, not the CPU), so full saturation buys no throughput but
-        # every in-flight chunk pins a full source chunk in RAM. 2x threads
-        # was effectively NO throttle on medium scans (64-chunk graph, 72-deep
-        # window) — the "sum memory usage is still crazy" report.
+    if on_future is not None:
+        # ONE registration instead of one per chunk (978 of them on the
+        # 977-frame movie). BaseSignalTree.close -> _cancel_all_compute calls
+        # .cancel() on a non-distributed future.
         try:
-            info = client.scheduler_info(n_workers=-1)["workers"]
-            window = max(4, sum(int(w.get("nthreads", 1))
-                                for w in info.values()) // 2)
-        except Exception:
-            window = 8
+            on_future(handle)
+        except Exception as e:
+            log.debug("on_future(%s dispatch handle) registration failed: %s",
+                      label, e)
 
-    handle = _ProgressiveFuture()
-    lock = threading.Lock()
-    pending = collections.deque(range(len(chunk_slices)))
-    outstanding: set = set()
-    held: list = []
-    state = {"completed": 0, "error": None}
-    n_total = len(chunk_slices)
+    def _assemble(result, nav_slices, chunk_result):
+        result[nav_slices + trailing] = chunk_result
 
-    def _stopped() -> bool:
-        return handle.cancelled or (stop_event is not None and stop_event.is_set())
+    def _chunk_done(nav_slices, chunk_result):
+        # dispatch_chunks calls (slices, result); the live-buffer callers have
+        # always taken (result, slices) — flip here, not at every call site.
+        if on_chunk_done is not None and not stopped[0]:
+            on_chunk_done(chunk_result, nav_slices)
 
-    def _finish():
-        if state["error"] is not None:
-            handle._error = state["error"]
-        else:
-            handle._value = assembled
-        handle._done_evt.set()
+    def _on_start(request_stop):
+        handle._cancel_cb = request_stop
 
-    def _submit_up_to():
-        """Top up to the window (lock held). Deferred-only — a stop simply
-        drains what's in flight."""
-        while pending and len(outstanding) < window and not _stopped() \
-                and state["error"] is None:
-            idx = pending.popleft()
-            nav_sl = chunk_slices[idx]
-            fut = client.compute(result_array[nav_sl + trailing])
-            outstanding.add(fut)
-            if on_future is not None:
-                try:
-                    on_future(fut)
-                except Exception as e:
-                    log.debug("on_future(chunk) registration failed: %s", e)
-            fut.add_done_callback(functools.partial(_on_done, nav_sl=nav_sl))
+    # An integer navigator sum can't hold NaN; only a stopped run ever leaves
+    # the fill value visible (every chunk overwrites its own slice).
+    fill = np.nan if np.issubdtype(result_array.dtype, np.floating) else 0
 
-    def _on_done(fut, nav_sl):
+    def _run():
         try:
-            chunk_result = fut.result()
-            assembled[nav_sl + trailing] = chunk_result
-            if on_chunk_done is not None and not _stopped():
-                try:
-                    on_chunk_done(chunk_result, nav_sl)
-                except Exception as e:
-                    log.debug("progressive on_chunk_done failed: %s", e)
+            arr = dispatch_chunks(
+                client, result_array, nav_ndim,
+                [],            # no GPU lane
+                None,          # ONE UNPINNED lane over the whole cluster
+                stopped_flag=stopped, assemble=_assemble, fill_value=fill,
+                label=label, on_chunk_done=_chunk_done, cap=cap,
+                lane_default_mode="off", on_start=_on_start,
+            )
+            handle._value = arr          # None when stopped
         except Exception as exc:
-            with lock:
-                if state["error"] is None and not _stopped():
-                    state["error"] = exc
-        with lock:
-            outstanding.discard(fut)
-            held.append(fut)
-            state["completed"] += 1
-            _submit_up_to()
-            if (state["completed"] >= n_total or _stopped()
-                    or state["error"] is not None) and not outstanding:
-                _finish()
+            handle._error = exc
+        finally:
+            handle._done_evt.set()
 
-    def _cancel_outstanding():
-        with lock:
-            pending.clear()
-            futs = list(outstanding)
-        for f in futs:
-            try:
-                f.cancel()
-            except Exception as e:
-                log.debug("cancelling progressive chunk future failed: %s", e)
-        with lock:
-            if not outstanding:
-                _finish()
-
-    handle._cancel_cb = _cancel_outstanding
-
-    with lock:
-        _submit_up_to()
-        if not outstanding:      # zero chunks (degenerate) — finish immediately
-            _finish()
+    threading.Thread(target=_run, daemon=True, name=f"{label}-dispatch").start()
     return handle
 
 
@@ -1501,12 +1602,16 @@ def compute_with_live_buffer(
     on_future=None,
     windowed: bool = False,
     stop_event=None,
-) -> distributed.Future:
+):
     """
-    Progressive compute: submits one Future per nav chunk and calls
-    ``on_chunk_done(chunk_result, nav_slices)`` from a Dask callback thread
-    as each chunk completes.  The caller is responsible for marshalling
-    back to the GUI thread (e.g. via a Qt Signal).
+    Progressive per-nav-chunk compute: calls ``on_chunk_done(chunk_result,
+    nav_slices)`` from a Dask callback thread as each chunk completes.  The
+    caller is responsible for marshalling back to the GUI thread.
+
+    Returns a future-like handle (``done``/``result``/``cancel``) whose value is
+    the CLIENT-SIDE ASSEMBLY of the chunks — NOT a ``distributed.Future`` over a
+    second whole-array graph, which is what this used to return.  See
+    :func:`_dispatched_progressive` and :class:`_AssembledFuture`.
 
     Shared memory is written from the GUI process (not from worker
     subprocesses) to avoid Windows access-violation crashes when the shm
@@ -1522,15 +1627,12 @@ def compute_with_live_buffer(
     on_chunk_done : callable(chunk_result, nav_slices) | None
                    Called from a Dask callback thread as each chunk finishes.
     on_future     : callable(future) | None
-                   Called synchronously with every Future created (per-chunk and
-                   the whole-array one) so the caller can register them for
-                   cancellation on teardown. Not called on the synchronous path.
+                   Called synchronously with every Future created so the caller
+                   can register them for cancellation on teardown. Not called on
+                   the synchronous path. The navigator path now creates exactly
+                   ONE handle (the dispatcher owns the per-chunk futures and
+                   cancels them itself), so this fires once there.
     """
-    import itertools
-
-    nav_ndim = len(nav_shape)
-    nav_chunks = result_array.chunks
-
     if client is None:
         # Synchronous fallback: compute the whole array and write shm once
         result = result_array.compute()
@@ -1553,69 +1655,22 @@ def compute_with_live_buffer(
 
         return _SyncResult()
 
-    # Build per-nav-chunk slice list
-    axes_ranges = []
-    for axis_chunks in nav_chunks:
-        positions, start = [], 0
-        for size in axis_chunks:
-            positions.append((start, size))
-            start += size
-        axes_ranges.append(positions)
-    all_slices = [tuple(slice(s, s + n) for s, n in combo)
-                  for combo in itertools.product(*axes_ranges)]
-
+    # Both progressive paths go through the SHARED dispatcher: batched submit +
+    # bounded in-flight window + stall watchdog + client-side assembly, and no
+    # second whole-array graph. See _dispatched_progressive.
     if windowed:
-        # Bounded, fully-cancellable VI/FFT stream — see _windowed_progressive.
-        # Returns a duck-typed Future (done/result/cancel), NOT a
-        # distributed.Future, so it must never be handed to PlotUpdateWorker.
-        return _windowed_progressive(result_array, nav_shape, client,
-                                     all_slices, on_chunk_done, on_future,
-                                     stop_event)
+        # VI/FFT stream. Its handle is a plain _ProgressiveFuture, deliberately
+        # invisible to PlotUpdateWorker — the stream paints from its own shm
+        # buffer and must not also have the assembled array pushed at it.
+        return _dispatched_progressive(
+            result_array, nav_shape, client, on_chunk_done, on_future,
+            stop_event, label="vi", future_cls=_ProgressiveFuture)
 
-    # ── Legacy unbounded path (navigator fill ONLY) ─────────────────────────
-    # Submits every chunk up front + the full graph below: the full future IS
-    # the contract here — PlotUpdateWorker isinstance-checks distributed.Future
-    # on plot.current_data. The navigator fill runs once per dataset load (not
-    # per ROI drag), so the unbounded submission is tolerable there.
-    chunk_futures = []
-    chunk_slices = []
-    for slices in all_slices:
-        full_slice = slices + (slice(None),) * (result_array.ndim - nav_ndim)
-        chunk_da = result_array[full_slice]
-        fut = client.compute(chunk_da)
-        chunk_futures.append(fut)
-        chunk_slices.append(slices)
-        if on_future is not None:
-            try:
-                on_future(fut)
-            except Exception as e:
-                log.debug("on_future(chunk) registration failed: %s", e)
-
-    # Attach callbacks — run in Dask callback threads, must be thread-safe
-    def _make_cb(fut, nav_slices):
-        def _cb(f):
-            try:
-                chunk_result = f.result()
-                if on_chunk_done is not None:
-                    on_chunk_done(chunk_result, nav_slices)
-            except Exception as e:
-                # This is the live-preview path only; a genuinely failed chunk
-                # re-raises when the commit path calls full_future.result().
-                log.debug("live chunk callback for %r failed: %s", nav_slices, e)
-        return _cb
-
-    if on_chunk_done is not None:
-        for fut, nav_slices in zip(chunk_futures, chunk_slices):
-            fut.add_done_callback(_make_cb(fut, nav_slices))
-
-    # Return the whole-array future for progress indicator and commit path
-    full_future = client.compute(result_array)
-    if on_future is not None:
-        try:
-            on_future(full_future)
-        except Exception as e:
-            log.debug("on_future(full) registration failed: %s", e)
-    return full_future
+    # Navigator fill. Its handle IS the contract PlotUpdateWorker polls, so it
+    # carries the _spyde_future marker (_AssembledFuture).
+    return _dispatched_progressive(result_array, nav_shape, client,
+                                   on_chunk_done, on_future, stop_event,
+                                   label="navigator")
 
 
 def ensure_live_buffer(nav_shape: tuple, shm_name: str) -> "shared_memory.SharedMemory":

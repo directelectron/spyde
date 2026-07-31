@@ -166,3 +166,103 @@ class TestMovieFixture:
         assert str(tax.units) == "sec"
         # Stayed lazy — no materialise of the movie.
         assert root._lazy is True
+
+
+class TestEveryLoadPathIsAligned:
+    """`load_aligned` is THE door, and every open must go through it.
+
+    The alignment used to be copy-pasted load-then-reload in `_load_file_thread`
+    and `_load_stack_thread`, and was simply MISSING from the Examples path — so
+    a dataset opened from the Examples menu silently kept the reader's balanced
+    cube chunking. Measured on a real 977 x 4096² uint8 MRC, that costs 5x on
+    the navigator sum (24.37 s vs 4.52 s) and turns the first nav chunk from
+    0.032 s into 14.60 s, because the nav ends up with TWO ~8 GB chunks instead
+    of 977 one-frame ones.
+
+    These assert on the SOURCE, not on behaviour, deliberately: the failure is a
+    call site that forgets, and no runtime assertion catches a path nobody
+    exercised in a test.
+    """
+
+    def _src(self, name):
+        import pathlib
+        import spyde.backend as pkg
+        return (pathlib.Path(pkg.__file__).parent / name).read_text(encoding="utf-8")
+
+    def test_no_bare_hs_load_in_the_file_session(self):
+        src = self._src("_session_files.py")
+        # `load_aligned` itself is allowed to call hs.load (it IS the two-step).
+        body = src.split("def load_aligned", 1)[1].split("\n    @classmethod", 1)[0]
+        rest = src.replace(body, "")
+        bare = [ln.strip() for ln in rest.splitlines()
+                if "hs.load(" in ln and "chunks" not in ln and not ln.strip().startswith("#")]
+        assert not bare, (
+            "a bare hs.load() outside load_aligned — it will keep the reader's "
+            f"split-signal chunking: {bare}")
+
+    def test_the_examples_path_aligns_too(self):
+        src = self._src("_session_files.py")
+        body = src.split("def _load_example_lazy", 1)[1].split("\n    def ", 1)[0]
+        assert "_signal_spanning_chunks" in body, (
+            "_load_example_lazy does not align chunks — every Examples dataset "
+            "keeps the reader default")
+
+    def test_open_lazily_can_take_chunks(self):
+        """The Examples opener must be ABLE to re-open aligned; without the
+        parameter the alignment above cannot be applied at all."""
+        import inspect
+        from spyde.backend.example_catalogue import _open_lazily
+        assert "chunks" in inspect.signature(_open_lazily).parameters
+
+
+class TestLoadAligned:
+    """`load_aligned` on a REAL file, per format.
+
+    Format matters and it is NOT obvious: **only the MRC reader honours
+    ``chunks=``**. Both `.hspy` and `.zspy` raise ``TypeError: 'chunks' is an
+    invalid keyword argument`` — their chunking is fixed when the file is
+    WRITTEN, so no load-time argument can reach it. That is exactly why
+    `load_aligned` catches and falls back rather than trusting the re-load: the
+    fallback is load-bearing, and without it this change would make every
+    hspy/zspy file fail to open.
+    """
+
+    def _mrc(self, tmp_path, n=6, size=64):
+        """A minimal MRC2014 uint16 stack — the format whose reader auto-chunks
+        into balanced cubes, which is what this whole fix is about."""
+        import numpy as _np
+        path = tmp_path / "movie.mrc"
+        hdr = _np.zeros(256, _np.int32)
+        hdr[0], hdr[1], hdr[2] = size, size, n      # nx, ny, nz
+        hdr[3] = 6                                   # mode 6 = uint16
+        hdr[7], hdr[8], hdr[9] = size, size, n       # mx, my, mz
+        with open(path, "wb") as fh:
+            fh.write(hdr.tobytes())
+            fh.write(_np.zeros((n, size, size), _np.uint16).tobytes())
+        return str(path)
+
+    def test_mrc_comes_back_with_whole_signal_chunks(self, tmp_path):
+        got = Session.load_aligned(self._mrc(tmp_path))
+        got = got[0] if isinstance(got, list) else got
+        ch = got.data.chunks
+        assert len(ch[1]) == 1 and len(ch[2]) == 1, (
+            f"signal axes still split after load_aligned: {ch}")
+
+    def test_a_reader_that_rejects_chunks_still_loads(self, tmp_path):
+        """`.hspy` raises TypeError on `chunks=`; that must degrade to the
+        reader default, never propagate."""
+        import numpy as _np
+        p = tmp_path / "m.hspy"
+        hs.signals.Signal2D(_np.zeros((6, 128, 128), _np.uint8)).save(
+            str(p), chunks=(3, 64, 64))
+        got = Session.load_aligned(str(p))           # must not raise
+        got = got[0] if isinstance(got, list) else got
+        assert got.data.shape == (6, 128, 128)
+
+    def test_it_leaves_a_good_chunking_alone(self, tmp_path):
+        import numpy as _np
+        p = tmp_path / "ok.hspy"
+        hs.signals.Signal2D(_np.zeros((6, 64, 64), _np.uint8)).save(str(p))
+        got = Session.load_aligned(str(p))
+        got = got[0] if isinstance(got, list) else got
+        assert got.data.chunks is not None

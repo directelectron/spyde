@@ -469,14 +469,38 @@ class DaskManager:
                     cluster.scale(0)
                 except Exception as e:
                     logger.debug("scaling Dask cluster to 0 failed: %s", e)
+                # NEVER fall back to a bare `cluster.close()`. It takes no
+                # timeout, and `distributed.utils.sync` then goes down its
+                # `else: while not e.is_set(): wait(10)` branch — an UNBOUNDED
+                # wait on the cluster's IO loop. A cluster whose workers are
+                # mid-task cannot close promptly, so the bounded call raises
+                # TimeoutError, and the old `except Exception: cluster.close()`
+                # retried it with no bound at all: the guard meant to cap the
+                # close is what removed the cap.
+                #
+                # The result was a backend that never exited. Measured with
+                # py-spy on an orphan: MainThread parked forever in
+                # `sync -> wait` under `cluster.close()`, called from here.
+                # Every e2e run leaked a ~900 MB, 85-thread backend; seven of
+                # them were alive on this box at once. In CI it surfaces as
+                # "Worker teardown timeout of 120000ms exceeded" with every
+                # test green, which is why the failing shard's test name moved
+                # around between runs. `shutdown.spec.ts` pins the behaviour.
+                #
+                # Abandoning the close is safe: the process is exiting anyway,
+                # and `backend.process_guard` reaps orphaned worker
+                # subprocesses via a Windows Job Object. A cluster we could not
+                # close politely in 2 s is better left to that than allowed to
+                # wedge the interpreter.
                 try:
-                    cluster.close(timeout="2s")
-                except TypeError:
                     cluster.close(timeout=2)
-                except Exception:
-                    cluster.close()
+                except TypeError:
+                    # Older/newer signatures that reject a plain number.
+                    cluster.close(timeout="2s")
             except Exception as e:
-                logger.debug("Dask cluster close failed during shutdown: %s", e)
+                logger.debug("Dask cluster close failed during shutdown "
+                             "(abandoning it; process_guard reaps the "
+                             "workers): %s", e)
             finally:
                 self._cluster = None
 

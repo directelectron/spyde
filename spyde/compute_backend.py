@@ -233,12 +233,57 @@ class ComputeBackend:
         Submit per-nav-chunk computations; call on_chunk_done(chunk, slices)
         from a worker thread as each chunk finishes.
 
-        Returns a Future that resolves to the full result array.
+        Returns a Future that resolves to the full result array — ASSEMBLED
+        from the chunks, not recomputed as a second whole-array graph.
+
+        The distributed mode routes through ``compute_dispatch.dispatch_chunks``
+        (the one dispatcher: batched submit, bounded in-flight window, stall
+        watchdog).  This used to be a ``for combo in itertools.product(...):
+        client.compute(chunk)`` loop that submitted every chunk up front, one
+        blocking scheduler round trip at a time, and then computed the whole
+        array AGAIN — see ``test_chunk_dispatch_guard.py``.
         """
         import itertools
 
         nav_chunks = result_array.chunks[:nav_ndim]
+        trailing = (slice(None),) * (result_array.ndim - nav_ndim)
 
+        if self._executor is None:
+            from spyde.compute_dispatch import dispatch_chunks
+
+            fill = (np.nan if np.issubdtype(result_array.dtype, np.floating)
+                    else 0)
+
+            def _assemble(result, slices, chunk):
+                result[slices + trailing] = chunk
+
+            def _chunk_done(slices, chunk):
+                # dispatch_chunks calls (slices, chunk); this API is (chunk,
+                # slices).
+                if on_chunk_done is not None:
+                    on_chunk_done(chunk, slices)
+
+            out: concurrent.futures.Future = concurrent.futures.Future()
+
+            def _run():
+                if not out.set_running_or_notify_cancel():
+                    return
+                try:
+                    out.set_result(dispatch_chunks(
+                        self._client, result_array, nav_ndim, [], None,
+                        assemble=_assemble, fill_value=fill,
+                        on_chunk_done=_chunk_done, label="chunks-progressive",
+                        lane_default_mode="off",
+                    ))
+                except Exception as exc:
+                    out.set_exception(exc)
+
+            threading.Thread(target=_run, daemon=True,
+                             name="chunks-progressive").start()
+            return out
+
+        # Threaded mode: no scheduler to round-trip, so the per-chunk submit is
+        # a local pool.submit() — cheap, and the pool already bounds concurrency.
         axes_ranges = []
         for axis_chunks in nav_chunks:
             positions, start = [], 0
@@ -247,21 +292,11 @@ class ComputeBackend:
                 start += size
             axes_ranges.append(positions)
 
-        chunk_futures = []
-        chunk_slices = []
         for combo in itertools.product(*axes_ranges):
             slices = tuple(slice(s, s + n) for s, n in combo)
-            full_slice = slices + (slice(None),) * (result_array.ndim - nav_ndim)
-            chunk_da = result_array[full_slice]
-
-            if self._executor is not None:
-                fut = self._executor.submit(chunk_da.compute, scheduler="threads")
-            else:
-                dask_fut = self._client.compute(chunk_da)
-                fut = _DistributedFutureAdapter(dask_fut)
-
+            chunk_da = result_array[slices + trailing]
+            fut = self._executor.submit(chunk_da.compute, scheduler="threads")
             if on_chunk_done is not None:
-                _slices = slices  # capture
                 def _make_cb(nav_slices):
                     def _cb(f):
                         try:
@@ -271,13 +306,6 @@ class ComputeBackend:
                             # re-raises a genuine chunk error on the commit path.
                             log.debug("chunk callback %r failed: %s", nav_slices, e)
                     return _cb
-                fut.add_done_callback(_make_cb(_slices))
+                fut.add_done_callback(_make_cb(slices))
 
-            chunk_futures.append(fut)
-            chunk_slices.append(slices)
-
-        # Full-array future
-        if self._executor is not None:
-            return self._executor.submit(result_array.compute, scheduler="threads")
-        else:
-            return _DistributedFutureAdapter(self._client.compute(result_array))
+        return self._executor.submit(result_array.compute, scheduler="threads")

@@ -649,3 +649,81 @@ agreement ~1 pt (25/4/67% -> 27/6/66%) for ~40% more time. Same for adding a
 measured-side coverage term to the candidate score: neutral on real data. Both
 reverted — the scipy path's accuracy limit is somewhere else, and that path is
 the fallback anyway.
+
+### Storage-aligned chunks at LOAD time, everywhere (2026-07-30)
+
+RosettaSciIO hands the array to dask with `chunks="auto"`, and dask balances all
+axes to hit its 128 MiB target with no idea which of them is navigation. On a
+977 x 4096² uint8 in-situ MRC that is **(511, 511, 511)** — a 133 MB cube that
+SPLITS the signal axes, so 4096 = 511x8 + 8 spreads every frame across **81
+chunks**. `Session._signal_spanning_chunks` already computed the right answer
+`(1, -1, -1)`; the bug was that only two of four load paths called it, and the
+Examples path called it not at all.
+
+Measured on that file:
+
+| | reader default (511³) | `chunks=(1, -1, -1)` |
+|---|---|---|
+| nav chunks | 2 (each spanning ~8.5 GB of reads) | 977 |
+| first nav chunk | **14.60 s** | **0.032 s** |
+| whole nav sum | **24.37 s** | **4.52 s** (3.38 GB/s) |
+| cost of the re-load | — | 0.08 s |
+
+The re-load is a graph rebuild, not a data move — never `.rechunk()` instead.
+
+Two things worth knowing before touching this:
+
+* **`("auto", -1, -1)` is NOT strictly better than `(1, -1, -1)`.** Measured:
+  auto gives 8 frames/chunk (134 MB) and wins the nav sum 4.84 s vs 5.57 s, but
+  it makes every navigator scrub read 134 MB instead of 16.8 MB — an 8x
+  regression on the interactive path, against a sum that runs once per file and
+  is then cached in the `.spyde-nav.npz` sidecar. Hence the adaptive nav block.
+* **Only `.mrc` honours `chunks=`.** Both `.hspy` and `.zspy` raise
+  `TypeError: 'chunks' is an invalid keyword argument` — their chunking is fixed
+  when the file is WRITTEN, so no load-time argument can reach it. That is why
+  `load_aligned` catches and falls back: the fallback is load-bearing, and
+  without it this change would make every hspy/zspy file fail to open.
+
+### Navigator fill: the per-chunk submit loop vs the shared dispatcher (2026-07-30)
+
+Real file: `20251117_88075_run3 some growth_1236_movie.mrc` — 977 x 4096² uint8,
+15.27 GB, 1-D nav, loaded via `load_aligned` (1 frame/chunk => **977 nav chunks**).
+Real `LocalCluster`, 4 worker processes x 2 threads. `--purge` evicts the file
+from the Windows page cache (FILE_FLAG_NO_BUFFERING) before each run.
+Harness: `spyde/tests/benchmark_nav_fill_dispatch.py`.
+
+The old `compute_with_live_buffer` navigator branch did
+`for slices in all_slices: client.compute(chunk)` — one blocking scheduler round
+trip per nav chunk, all 977 up front, with the GIL held in the client process the
+whole time — and then `client.compute(result_array)` again for the whole array.
+It now routes through `compute_dispatch.dispatch_chunks` (batched submit, bounded
+in-flight window, stall watchdog) and the result is ASSEMBLED from the chunks.
+
+Cold (page cache purged before each run):
+
+| | submit (client-side, GIL held) | first chunk painted | total fill |
+|---|---|---|---|
+| per-chunk loop | **9.86 s** | 16.41 s | 50.83 s |
+| dispatch_chunks | **0.00 s** | **0.08 s** | 50.64 s |
+
+Warm (one throwaway pass first, so I/O is held constant): submit 10.12 s -> 0.00 s,
+total 50.21 s -> 46.53 s. Checksums MATCH in every run: the client-side assembly
+is identical to the whole-array compute it replaced.
+
+Three things this pins down:
+
+* **The submit time is the bug.** 9.9 s during which nothing else in the backend
+  process can run — the navigator sits blank and the paint threads go silent. It
+  is client-side, so it is the same cold or warm. First-visible-pixel goes
+  16.4 s -> 0.08 s (**200x**).
+* **The bounded window costs nothing.** The window here is 4 (half of 8 cluster
+  threads) versus the old path's 977-in-flight, and the total fill did not
+  regress — it improved, because the old path also submitted the duplicate
+  whole-array graph.
+* **A progressive fill is ~7x a monolithic sum, and that is per-TASK overhead,
+  not concurrency.** Warm, one `nav.compute()` of the whole graph is **6.4 s**;
+  977 separate per-chunk futures are 46-50 s either way (~47 ms of scheduler
+  round trip for a task whose work is ~6 ms). Unbounded submission does not fix
+  it (50.2 s) and neither does a bigger window — if the progressive fill is ever
+  worth optimising further, the lever is fewer, larger display chunks, not more
+  in-flight ones.
