@@ -80,18 +80,20 @@ test('changing the type dispatches set_signal_type for the active window', async
   })
 })
 
-test('signal-type section sits between colormap and metadata', async () => {
+test('signal-type shares a row with colormap, both above metadata', async () => {
   await openSignal()
   await inject({ type: 'signal_type_info', window_ids: [1], current: '', options: ['', 'EELS'] })
   await inject({ type: 'metadata', window_ids: [1], metadata: { Group: { K: 'v' } } })
 
-  const order = await page.getByTestId('plot-control-dock').evaluate((dock) => {
-    const ids = ['colormap-select', 'signal-type-section', 'metadata-panel']
-    return ids.map(id => {
-      const el = dock.querySelector(`[data-testid="${id}"]`)
-      return el ? (el as HTMLElement).getBoundingClientRect().top : Infinity
-    })
-  })
-  expect(order[0]).toBeLessThan(order[1])   // colormap above signal-type
-  expect(order[1]).toBeLessThan(order[2])   // signal-type above metadata
+  const box = (id: string) => page.getByTestId(id).boundingBox()
+  const cmap = (await box('colormap-select'))!
+  const sig = (await box('signal-type-select'))!
+  const meta = (await box('metadata-panel'))!
+
+  // Side by side (they are set once in a while and cost two stacked sections),
+  // colormap on the left.
+  expect(Math.round(cmap.y)).toBe(Math.round(sig.y))
+  expect(cmap.x + cmap.width).toBeLessThanOrEqual(sig.x + 1)
+  // …and the pair still sits above the metadata panel.
+  expect(sig.y + sig.height).toBeLessThan(meta.y)
 })

@@ -127,8 +127,8 @@ class TestAutoClim:
         assert (hg[-1]["vmin"], hg[-1]["vmax"]) == expected
 
     def test_reset_spans_the_full_range(self, stem_4d_dataset):
-        """Reset is the escape hatch from a robust view: everything, tail
-        included — so nothing may be clipped out of the bins either."""
+        """Reset is the escape hatch from a robust view: the display range
+        becomes the actual min–max, tail included."""
         session = stem_4d_dataset["window"]
         plot = self._signal_plot(stem_4d_dataset)
         data = plot.current_data
@@ -139,9 +139,32 @@ class TestAutoClim:
 
         assert plot._last_levels == (float(data.min()), float(data.max()))
         hg = [m for m in stem_4d_dataset["messages"] if m.get("type") == "histogram"]
-        assert hg and hg[-1]["clipped"] is False
-        assert hg[-1]["edges"][0] == hg[-1]["data_min"]
-        assert hg[-1]["edges"][-1] == hg[-1]["data_max"]
+        assert hg
+        assert (hg[-1]["vmin"], hg[-1]["vmax"]) == (float(data.min()), float(data.max()))
+
+    def test_reset_moves_the_handles_not_the_bins(self, stem_4d_dataset):
+        """Reset changes the DISPLAY RANGE, so it must not redraw the histogram
+        underneath it. Binning off the live clim meant Reset re-binned over the
+        whole tail and crushed the bars back into the left edge — the exact
+        squish this widget's binning exists to prevent. The bars belong to the
+        frame; only the handles move."""
+        session = stem_4d_dataset["window"]
+        plot = self._signal_plot(stem_4d_dataset)
+        wid = plot.window_id
+
+        stem_4d_dataset["messages"].clear()
+        session.dispatch_action({"action": "auto_clim", "window_id": wid,
+                                 "payload": {}})
+        auto = [m for m in stem_4d_dataset["messages"] if m.get("type") == "histogram"][-1]
+
+        stem_4d_dataset["messages"].clear()
+        session.dispatch_action({"action": "auto_clim", "window_id": wid,
+                                 "payload": {"mode": "full"}})
+        reset = [m for m in stem_4d_dataset["messages"] if m.get("type") == "histogram"][-1]
+
+        assert reset["edges"] == auto["edges"], "Reset re-binned the histogram"
+        assert reset["counts"] == auto["counts"], "Reset redrew the bars"
+        assert reset["vmax"] >= auto["vmax"], "Reset did not widen the display range"
 
     def test_keeps_the_threshold_marker(self, stem_4d_dataset):
         """Auto re-emits the histogram; the Find-Vectors threshold line must

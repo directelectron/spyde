@@ -88,6 +88,28 @@ test('Reset widens to the full data range and Auto brings it back', async () => 
   ctx.assertNoJsErrors()
 })
 
+test('the handles are a hover affordance, not permanent furniture', async () => {
+  const { page } = ctx
+  const hist = page.getByTestId('histogram')
+  // Grip caps mark an "armed" handle: pink 6px-wide rects at the top/bottom.
+  const grips = () => hist.evaluate((svg: SVGSVGElement) =>
+    Array.from(svg.querySelectorAll('rect')).filter((r) =>
+      r.getAttribute('fill') === '#f38ba8' && r.getAttribute('width') === '6').length)
+
+  // At rest: hairlines only. Park the pointer somewhere else in the dock first —
+  // an earlier test may have left it over the widget.
+  await page.getByTestId('plot-control-dock').hover({ position: { x: 5, y: 5 } })
+  await expect.poll(grips, { message: 'grip caps are drawn without hovering' }).toBe(0)
+  await page.getByTestId('histogram-section').screenshot({ path: `${SHOTS}/05-rest.png` })
+  // Whole dock: Auto/Reset must read as the same control as Point/Integrate.
+  await page.getByTestId('plot-control-dock').screenshot({ path: `${SHOTS}/05b-dock.png` })
+
+  await hist.hover()
+  await expect.poll(grips, { message: 'hovering did not arm the handles' }).toBe(4)
+  await page.getByTestId('histogram-section').screenshot({ path: `${SHOTS}/06-hover.png` })
+  ctx.assertNoJsErrors()
+})
+
 test('a handle dragged off the drawn range stays grabbable', async () => {
   const { page } = ctx
   const hist = page.getByTestId('histogram')

@@ -17,6 +17,8 @@
 import type {
   ToolbarAction,
   MetadataDict,
+  MetadataInfo,
+  ChunkInfo,
   AxisRow,
   TreeNode,
   LogEntry,
@@ -169,6 +171,15 @@ export interface MetadataMessage extends MsgBase {
   // the inline editor pre-fills with — the `metadata` strings have units baked
   // in ("12000.5 x") and would fail the backend's numeric parse if sent back.
   editable?: Record<string, Record<string, string>>
+  // {group: {prop: {description, key, units, derived}}} — the STATIC config
+  // text behind each field, for the dock's detail popover. The panel shows a
+  // curated summary, so this is what explains a field the summary abbreviates
+  // (or hides entirely, like Mode / Cam.).
+  info?: MetadataInfo
+  // Dask block layout of the displayed node, or null/absent when it is eager.
+  // Numbers, not dask's own HTML: the dock draws it in the app's palette and
+  // flags a nav/signal split dask has no way to know about.
+  chunking?: ChunkInfo | null
 }
 
 export interface AxesInfoMessage extends MsgBase {

@@ -995,7 +995,16 @@ class Plot:
                 finite = sub[np.isfinite(sub)]
             if finite.size == 0:
                 return
-            lo, hi, clipped = self._hist_range(finite, vmin, vmax)
+            # Bin over the ROBUST band, NOT the display range currently set. The
+            # histogram describes the FRAME; the handles describe the contrast on
+            # top of it. Deriving the bins from the live clim instead made the
+            # bars jump every time the range changed — Reset (min–max) re-binned
+            # over the whole tail and squashed them back into the left sliver
+            # this binning exists to prevent. Stable bins mean Reset moves only
+            # the handles, which is all it is asking for.
+            band = (self._robust_levels(data, signal=not self.is_navigator)
+                    if getattr(data, "ndim", 0) == 2 else (vmin, vmax))
+            lo, hi, clipped = self._hist_range(finite, *band)
             # CLIP rather than restrict the range: np.histogram(range=…) DROPS
             # out-of-range samples, which would silently hide the tail. Clipping
             # piles it into the end bins instead — an overflow bin, still counted,
@@ -1079,11 +1088,12 @@ class Plot:
         short of reloading.
 
         * ``robust`` (Auto) — the same percentile band a fresh frame gets.
-        * ``full`` (Reset) — the actual min–max, tail included. Since the
-          histogram bins around the display range, this is also how you get a
-          look at what the robust view clips.
+        * ``full`` (Reset) — the actual min–max, tail included.
 
-        Either way the histogram is re-emitted, so the handles follow.
+        Either way the histogram is re-emitted so the handles follow, but the
+        BINS do not move (see ``_emit_histogram``): after Reset the upper handle
+        simply sits past the binned range, pinned at the widget's edge with the
+        off-range arrow. The bars are a property of the frame and stay put.
         """
         data = self.current_data
         if not isinstance(data, np.ndarray) or data.ndim != 2:
