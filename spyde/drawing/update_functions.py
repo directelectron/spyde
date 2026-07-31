@@ -1039,6 +1039,32 @@ def update_from_navigation_selection(
 
     current_signal = child.plot_state.current_signal
 
+    # A signal whose `.data` is still a pending FUTURE has nothing to slice yet,
+    # and that is independent of `_lazy` — so it must be checked here rather
+    # than inside the lazy branch below.
+    #
+    # `signal.data = <future>` does not store the object: hyperspy's setter runs
+    # `np.atleast_1d(np.asanyarray(value))`, so it lands as a length-1 OBJECT
+    # array. Indexing that with nav coordinates raises
+    # "too many indices for array: array is 1-dimensional, but 2 were indexed" —
+    # the long-standing "second-signal IndexError", which the eager branch below
+    # logs and re-raises.
+    #
+    # This was always latent: the progressive navigator fill parks a future on
+    # the base navigator signal, and `PlotUpdateWorker` swaps in the real array
+    # once it resolves. With a distributed Future that window was milliseconds,
+    # so the race effectively never fired. The client-side `_AssembledFuture`
+    # only reports done when the WHOLE dispatch finishes — ~50 s on a 977-chunk
+    # movie — which widens the window enough that ordinary navigator moves land
+    # inside it. Returning None leaves the last good frame up, which is what the
+    # caller already does for a superseded read.
+    if _pending_future_data(current_signal):
+        log.debug("nav read skipped: %s still carries a pending future",
+                  getattr(current_signal, "metadata", None) and
+                  getattr(current_signal.metadata, "General", None) and
+                  getattr(current_signal.metadata.General, "title", "<signal>"))
+        return None
+
     # Per-frame trace — gated behind SPYDE_NAV_TIMING because it fires on EVERY
     # crosshair move and floods the IPC log/panel at DEBUG (which itself adds lag).
     if _NAV_TIMING:
@@ -1383,6 +1409,30 @@ class _ProgressiveFuture:
 
 
 _ASSEMBLED_SEQ = itertools.count()
+
+
+def _pending_future_data(signal) -> bool:
+    """True when *signal*'s ``.data`` is a future that has not resolved yet.
+
+    Covers both shapes the future can take, because hyperspy's `data` setter
+    runs ``np.atleast_1d(np.asanyarray(value))``: the bare object, and the
+    length-1 OBJECT array it actually becomes. Mirrors
+    ``plot_update_worker._future_from_signal``, which unwraps the same two.
+
+    A RESOLVED future is not "pending" — `PlotUpdateWorker` will swap the real
+    array in on its next tick, and until then there is nothing to slice either
+    way; reporting it as pending simply skips one frame instead of raising.
+    """
+    data = getattr(signal, "data", None)
+    if is_future_like(data):
+        return True
+    # `if data` on an ndarray raises "truth value is ambiguous" — test length.
+    if isinstance(data, np.ndarray) and data.dtype == object and data.size == 1:
+        try:
+            return is_future_like(data.reshape(-1)[0])
+        except Exception:
+            return False
+    return False
 
 
 def is_future_like(obj) -> bool:
