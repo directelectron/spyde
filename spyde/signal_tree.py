@@ -23,6 +23,24 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _materialise_signal(signal: BaseSignal, array: np.ndarray) -> None:
+    """Swap a LAZY signal's dask data for an in-RAM array, the way hyperspy's own
+    ``LazySignal.compute`` does it (``data`` + ``_lazy`` + ``_assign_subclass``).
+
+    Leaving ``_lazy`` set with numpy data would route every navigator read down
+    the LAZY branch of ``update_from_navigation_selection``, which needs a dask
+    array (``.compute``/``.chunks``) and would fall through to a
+    ``_get_cache_dask_chunk`` that has nothing to read."""
+    try:
+        signal.data = array
+        if getattr(signal, "_lazy", False):
+            signal._lazy = False
+            signal._assign_subclass()
+    except Exception as e:
+        logger.debug("materialising %r after the navigator fill failed: %s",
+                     signal, e)
+
+
 class BaseSignalTree:
     """
     A class to manage the signal tree — the DAG of signal transformations.
@@ -55,6 +73,15 @@ class BaseSignalTree:
         self._client_override = distributed_client
         self._selector_type = selector_type
         self._pending_nav_dask: da.Array | None = None
+        # True when _pending_nav_dask is the DEEP (…lead…, y, x) nav-sum of a
+        # 5-D+ dataset rather than an already-reduced navigator image — that
+        # array feeds BOTH navigators in one pass (see
+        # _start_progressive_nav_compute's recursive branch).
+        self._pending_nav_deep: bool = False
+        # Set by _compute_navigator when a DEEP navigator was served from the
+        # sidecar cache, so _preprocess_navigator can hand the cached array to
+        # the child navigator's signal too. Consumed immediately.
+        self._nav_deep_cached: np.ndarray | None = None
         # On-disk origin of the root signal (None for derived/test trees) —
         # enables the navigator sidecar cache (spyde.nav_sidecar).
         self.source_path = source_path
@@ -239,7 +266,9 @@ class BaseSignalTree:
         during the wait (e.g. add_navigator_signal) can't be mistaken for the
         base navigator."""
         nav_dask = self._pending_nav_dask
+        deep = self._pending_nav_deep
         self._pending_nav_dask = None
+        self._pending_nav_deep = False
         if nav_dask is None:
             return
         stop = threading.Event()
@@ -254,7 +283,7 @@ class BaseSignalTree:
                 time.sleep(0.05)
             if not stop.is_set():
                 try:
-                    self._start_progressive_nav_compute(nav_dask)
+                    self._start_progressive_nav_compute(nav_dask, deep=deep)
                 except Exception:
                     # Session may be tearing down mid-wait; a blank navigator
                     # beats an unhandled thread exception.
@@ -263,7 +292,8 @@ class BaseSignalTree:
         threading.Thread(target=_wait_then_start, daemon=True,
                          name="nav-defer").start()
 
-    def _start_progressive_nav_compute(self, nav_dask: "da.Array | None" = None) -> None:
+    def _start_progressive_nav_compute(self, nav_dask: "da.Array | None" = None,
+                                       deep: "bool | None" = None) -> None:
         """
         Replace the single-future nav compute with a per-chunk progressive
         compute that live-updates the navigator image as chunks finish.
@@ -271,6 +301,10 @@ class BaseSignalTree:
         ``nav_dask`` is normally handed over by the deferral
         (_start_nav_compute_after_first_frame, which consumed the stash up
         front); falling back to the stash keeps direct calls working.
+
+        ``deep`` marks ``nav_dask`` as the DEEP ``(…lead…, y, x)`` nav-sum of a
+        5-D+ dataset, which drives BOTH of that dataset's navigators from ONE
+        pass over the data — see the recursive branch below.
         """
         from spyde.drawing.update_functions import (
             compute_with_live_buffer,
@@ -281,9 +315,13 @@ class BaseSignalTree:
 
         if nav_dask is None:
             nav_dask = self._pending_nav_dask
+            if deep is None:
+                deep = self._pending_nav_deep
             self._pending_nav_dask = None
+            self._pending_nav_deep = False
         if nav_dask is None:
             return
+        deep = bool(deep)
 
         nav_signals = self.navigator_signals.get("base")
         nav_plot_windows = list(self.navigator_plot_manager.plot_windows.keys())
@@ -294,14 +332,33 @@ class BaseSignalTree:
         if not nav_plots:
             return
         nav_plot = nav_plots[0]
+
+        # ── RECURSIVE (5-D+) fill: ONE pass feeds BOTH navigators ────────────
+        # A 5-D stack opens TWO navigators — a 2-D real-space image and a 1-D
+        # time line. They are not independent: the real-space image at time t IS
+        # the deep nav-sum's plane ``deep[t]``, and the time line is that plane
+        # summed. So the fill computes the DEEP array progressively and derives
+        # the top navigator from the planes it already has, instead of a second
+        # full pass over the dataset (which is what stashing the already-reduced
+        # 1-D sum used to force — one whole-dataset read per point of a 4-point
+        # line, so the fill looked frozen and the real-space navigator got no
+        # progressive fill at all).
+        #
+        # If the child navigator can't be resolved, reduce the deep array here
+        # and take the ordinary single-navigator path (the old behaviour).
+        deep_targets = self._deep_nav_targets() if deep else None
+        if deep and deep_targets is None:
+            logger.debug("deep navigator fill: child navigator not resolvable; "
+                         "falling back to the single-navigator sum")
+            nav_dask = nav_dask.sum(axis=(-2, -1))
+            deep = False
         nav_shape = tuple(nav_dask.shape)
 
-
         logger.debug(
-            "NAV-DEBUG _start_progressive_nav_compute: path=%s nav_shape=%s "
-            "chunks=%s client=%s",
+            "NAV-DEBUG _start_progressive_nav_compute: path=%s deep=%s "
+            "nav_shape=%s chunks=%s client=%s",
             "THREADED (no client)" if self.client is None else "DISTRIBUTED",
-            nav_shape, nav_dask.chunks, type(self.client).__name__,
+            deep, nav_shape, nav_dask.chunks, type(self.client).__name__,
         )
 
         # No cluster yet (it takes ~10 s to start; examples load sooner, and a
@@ -316,15 +373,19 @@ class BaseSignalTree:
         if self.client is None:
             import itertools
 
-            placeholder = np.full(nav_shape, np.nan, dtype=np.float32)
-            nav_plot.current_data = placeholder
+            if not deep:
+                # DEEP: nav_shape is the (…lead…, y, x) accumulator's shape, which
+                # is NOT the top navigator's — its placeholder/levels are owned by
+                # _paint_deep_nav instead.
+                nav_plot.current_data = np.full(nav_shape, np.nan, dtype=np.float32)
             # Stop flag so the thread bails out cleanly on tree/session shutdown
             # instead of painting onto a torn-down plot.
             stop = threading.Event()
             self._nav_stop = stop
 
             def _bg_nav(_dask=nav_dask, _plot=nav_plot, _sig=nav_signals,
-                        _shape=nav_shape, _stop=stop):
+                        _shape=nav_shape, _stop=stop, _deep=deep,
+                        _targets=deep_targets):
                 # window_computing brackets the WHOLE fill (both early-return
                 # paths on _stop AND the exception handler below) so a
                 # cancelled/failed fill still clears the renderer's overlay —
@@ -363,6 +424,14 @@ class BaseSignalTree:
                         acc[nav_slices] = block
                         done_chunks += 1
                         self._emit_nav_progress(done_chunks / max(1, total_chunks))
+                        if _stop.is_set():
+                            return
+                        if _deep:
+                            # Recursive paint: the real-space plane the child
+                            # navigator is showing, then the top navigator DERIVED
+                            # from the planes finished so far.
+                            self._paint_deep_nav(acc, _targets)
+                            continue
                         finite = acc[np.isfinite(acc)]
                         if finite.size:
                             # Robust percentile levels (2–98%), computed over ALL
@@ -373,8 +442,6 @@ class BaseSignalTree:
                             # stretch stable across the progressive fill.
                             lo, hi = np.percentile(finite, (2.0, 98.0))
                             levels[0] = (float(lo), float(hi) if hi > lo else float(lo) + 1)
-                        if _stop.is_set():
-                            return
                         _plot.set_data(acc.copy(), levels=levels[0])
                     # Final uniform repaint: now that every chunk is in, set the
                     # definitive levels over the whole image so no transient
@@ -383,17 +450,23 @@ class BaseSignalTree:
                     # contrast handles (set_data with explicit levels otherwise
                     # skips _emit_histogram, leaving the navigator histogram-less).
                     if not _stop.is_set():
-                        finite = acc[np.isfinite(acc)]
-                        if finite.size:
-                            lo, hi = np.percentile(finite, (2.0, 98.0))
-                            lvl = (float(lo), float(hi) if hi > lo else float(lo) + 1)
-                            _plot.set_data(acc.copy(), levels=lvl)
-                            try:
-                                _plot._emit_histogram(acc, lvl[0], lvl[1])
-                            except Exception as e:
-                                logger.debug("navigator histogram emit failed: %s", e)
+                        if _deep:
+                            self._paint_deep_nav(acc, _targets, final=True)
+                        else:
+                            finite = acc[np.isfinite(acc)]
+                            if finite.size:
+                                lo, hi = np.percentile(finite, (2.0, 98.0))
+                                lvl = (float(lo), float(hi) if hi > lo else float(lo) + 1)
+                                _plot.set_data(acc.copy(), levels=lvl)
+                                try:
+                                    _plot._emit_histogram(acc, lvl[0], lvl[1])
+                                except Exception as e:
+                                    logger.debug("navigator histogram emit failed: %s", e)
                     if _sig:
-                        _sig[0].data = acc
+                        if _deep:
+                            self._commit_deep_nav(acc, _sig)
+                        else:
+                            _sig[0].data = acc
                     if not _stop.is_set():
                         self._save_nav_sidecar(acc)
                 except Exception:
@@ -420,9 +493,12 @@ class BaseSignalTree:
         shm = ensure_live_buffer(nav_shape, shm_name)
         self._nav_shm = shm
 
-        nav_plot.current_data = np.full(nav_shape, np.nan, dtype=np.float32)
-        nav_plot.needs_auto_level = True
-        nav_plot.update()
+        if not deep:
+            # DEEP: nav_shape belongs to the (…lead…, y, x) accumulator, not to
+            # this plot — _paint_deep_nav owns both navigators' pixels.
+            nav_plot.current_data = np.full(nav_shape, np.nan, dtype=np.float32)
+            nav_plot.needs_auto_level = True
+            nav_plot.update()
 
         # Psygnal relay — emitted from the Dask callback thread, slots run on
         # calling thread (safe for anyplotlib's _push which is GIL-protected).
@@ -464,10 +540,16 @@ class BaseSignalTree:
         )
         self._nav_futures = nav_futures
 
-        if nav_signals:
-            nav_signals[0].data = future
-        nav_plot.current_data = future
-        nav_plot.needs_auto_level = True
+        if not deep:
+            # DEEP: this future resolves to the (…lead…, y, x) array, which is
+            # neither navigator's displayed image and must never reach
+            # PlotUpdateWorker via current_data. The poll loop below paints both
+            # navigators from the shm buffer, and _commit_deep_nav hands the
+            # finished array to the signals at the end.
+            if nav_signals:
+                nav_signals[0].data = future
+            nav_plot.current_data = future
+            nav_plot.needs_auto_level = True
 
         # Periodic poll: update the displayed image as chunks arrive
         _nav_levels: list = [None]
@@ -478,13 +560,17 @@ class BaseSignalTree:
             arr = read_live_buffer(nav_shape, shm_name)
             finite = arr[np.isfinite(arr)]
             self._emit_nav_progress(finite.size / max(1, arr.size))
-            if finite.size > 0:
-                lo, hi = float(finite.min()), float(finite.max())
-                if _nav_levels[0] is None:
-                    _nav_levels[0] = (lo, hi if hi > lo else lo + 1)
-                elif hi > _nav_levels[0][1]:
-                    _nav_levels[0] = (_nav_levels[0][0], hi)
-                nav_plot.set_data(arr, levels=_nav_levels[0])
+            if finite.size == 0:
+                return
+            if deep:
+                self._paint_deep_nav(arr, deep_targets)
+                return
+            lo, hi = float(finite.min()), float(finite.max())
+            if _nav_levels[0] is None:
+                _nav_levels[0] = (lo, hi if hi > lo else lo + 1)
+            elif hi > _nav_levels[0][1]:
+                _nav_levels[0] = (_nav_levels[0][0], hi)
+            nav_plot.set_data(arr, levels=_nav_levels[0])
 
         def _poll_loop():
             # window_computing brackets the whole poll (incl. the early return
@@ -528,12 +614,16 @@ class BaseSignalTree:
                     res = future.result()
                     arr = np.asarray(res, dtype=np.float32)
                     if arr.shape == tuple(nav_shape):
-                        finite = arr[np.isfinite(arr)]
-                        if finite.size > 0:
-                            lo, hi = float(finite.min()), float(finite.max())
-                            lv = (_nav_levels[0] if _nav_levels[0] is not None
-                                  else (lo, hi if hi > lo else lo + 1))
-                            nav_plot.set_data(arr, levels=lv)
+                        if deep:
+                            self._paint_deep_nav(arr, deep_targets, final=True)
+                            self._commit_deep_nav(arr, nav_signals)
+                        else:
+                            finite = arr[np.isfinite(arr)]
+                            if finite.size > 0:
+                                lo, hi = float(finite.min()), float(finite.max())
+                                lv = (_nav_levels[0] if _nav_levels[0] is not None
+                                      else (lo, hi if hi > lo else lo + 1))
+                                nav_plot.set_data(arr, levels=lv)
                         self._save_nav_sidecar(arr)
                     else:
                         _paint_from_buffer()
@@ -550,6 +640,159 @@ class BaseSignalTree:
         t = threading.Thread(target=_poll_loop, daemon=True, name="nav-poll")
         t.start()
         self._nav_poll_thread = t
+
+    # ── Recursive (5-D+) two-navigator fill ───────────────────────────────────
+    #
+    # A 5-D dataset (t, y, x | ky, kx) opens TWO navigators: the top window is
+    # the 1-D time line and its selector drives a child 2-D real-space image
+    # (MultiplotManager's ``navigation_depth == 2`` branch). Both are reductions
+    # of ONE array — the deep nav-sum ``deep[t, y, x] = data[t, y, x].sum()``:
+    #
+    #     child (real space) = deep[t_selected]        ← a plane
+    #     top   (time line)  = deep.sum(axis=(-2, -1)) ← that plane, summed
+    #
+    # so the fill computes ``deep`` progressively and DERIVES the top navigator
+    # from the planes it already has. Before this, ``_compute_navigator`` stashed
+    # the already-reduced 1-D sum, which threw the real-space plane away: the
+    # dataset was read once per point of a 4-point line (each "chunk" of the fill
+    # being a whole 4-D member — no visible progress), and the real-space
+    # navigator got no progressive fill at all.
+
+    def _deep_nav_targets(self):
+        """``(top_plot, child_plot, top_selector)`` for a DEEP (5-D+) navigator,
+        or ``None`` when this tree has no child navigator to fill.
+
+        The top navigator is the tree's only top-level navigator plot window;
+        the child is the plot its selector drives that is itself a navigator
+        (the third window in the chain is the diffraction pattern, not a
+        navigator, and is driven by the child's own selector)."""
+        mgr = self.navigator_plot_manager
+        if mgr is None:
+            return None
+        top_windows = list(mgr.plot_windows.keys())
+        if not top_windows:
+            return None
+        top_pw = top_windows[0]
+        top_plots = mgr.plots.get(top_pw) or []
+        if not top_plots:
+            return None
+        for selector in mgr.navigation_selectors.get(top_pw) or []:
+            for child in selector.children:
+                if getattr(child, "is_navigator", False):
+                    return top_plots[0], child, selector
+        return None
+
+    @staticmethod
+    def _reduce_deep_nav(acc: np.ndarray) -> np.ndarray:
+        """Reduce a DEEP nav array ``(…lead…, y, x)`` to the top navigator's
+        ``(…lead…,)`` by summing each real-space plane.
+
+        A plane that is not FULLY filled yet stays NaN: a partially-summed time
+        point is a WRONG value, not a dim one, and the chunk walk completes one
+        lead index at a time (``itertools.product`` iterates the leading axis
+        outermost), so the line grows point-by-point instead of dipping and
+        jumping as each chunk lands."""
+        acc = np.asarray(acc)
+        flat = acc.reshape(acc.shape[: acc.ndim - 2] + (-1,))
+        finite = np.isfinite(flat)
+        out = np.where(finite, flat, 0.0).sum(axis=-1, dtype=np.float64)
+        out = out.astype(np.float32)
+        out[~finite.all(axis=-1)] = np.nan
+        return out
+
+    @staticmethod
+    def _robust_levels(arr: np.ndarray):
+        """Robust 2–98% display levels over the FULL accumulated finite data —
+        the same stretch the 4-D fill uses, so a bright outlier in one chunk
+        can't yank the contrast around as the fill progresses."""
+        finite = np.asarray(arr)[np.isfinite(arr)]
+        if not finite.size:
+            return None
+        lo, hi = np.percentile(finite, (2.0, 98.0))
+        return (float(lo), float(hi) if hi > lo else float(lo) + 1)
+
+    def _deep_nav_plane(self, acc: np.ndarray, selector) -> np.ndarray:
+        """The real-space plane the CHILD navigator is currently showing — the
+        mean over whichever lead (time) positions the top selector covers, so an
+        integrating span reads the same as the selector's own frame."""
+        acc = np.asarray(acc)
+        lead_ndim = acc.ndim - 2
+        rows = [(0,) * lead_ndim]
+        try:
+            idx = np.atleast_2d(np.asarray(selector.get_selected_indices()))
+            idx = idx[:, :lead_ndim].astype(int)
+            if lead_ndim >= 2:
+                # A 2-D top navigator reports widget (x, y); the innermost pair
+                # must be swapped to data order — same rule as
+                # update_functions._prepare_nav_indices.
+                idx[:, -2:] = idx[:, -2:][:, ::-1]
+            limits = np.asarray(acc.shape[:lead_ndim]) - 1
+            rows = list(dict.fromkeys(
+                tuple(int(v) for v in np.clip(row, 0, limits)) for row in idx))
+        except Exception as e:
+            logger.debug("resolving the deep navigator's lead position failed: %s", e)
+        planes = np.stack([acc[row] for row in rows]) if len(rows) > 1 else acc[rows[0]]
+        if planes.ndim == 2:
+            return planes
+        finite = np.isfinite(planes)
+        count = finite.sum(axis=0)
+        total = np.where(finite, planes, 0.0).sum(axis=0)
+        return np.divide(total, count, where=count > 0,
+                         out=np.full(count.shape, np.nan, dtype=np.float64)
+                         ).astype(np.float32)
+
+    def _paint_deep_nav(self, acc: np.ndarray, targets, *, final: bool = False) -> None:
+        """Paint BOTH navigators from the deep accumulator.
+
+        The child navigator is only repainted when the fill's plane holds MORE
+        finite pixels than what is already displayed (or on the final pass), so
+        a half-filled plane can never clobber a complete frame the child's own
+        selector read just painted. The top navigator has no other writer."""
+        if targets is None:
+            return
+        top_plot, child_plot, selector = targets
+        try:
+            plane = self._deep_nav_plane(acc, selector)
+            n_new = int(np.isfinite(plane).sum())
+            current = getattr(child_plot, "current_data", None)
+            n_cur = (int(np.isfinite(current).sum())
+                     if isinstance(current, np.ndarray)
+                     and current.shape == plane.shape else -1)
+            if n_new > 0 and (final or n_new > n_cur):
+                levels = self._robust_levels(plane)
+                child_plot.set_data(plane.copy(), levels=levels)
+                if final and levels is not None:
+                    child_plot._emit_histogram(plane, levels[0], levels[1])
+        except Exception as e:
+            logger.debug("deep navigator child paint failed: %s", e)
+        try:
+            curve = self._reduce_deep_nav(acc)
+            levels = self._robust_levels(curve)
+            if levels is not None:
+                top_plot.set_data(curve.copy(), levels=levels)
+                if final:
+                    top_plot._emit_histogram(curve, levels[0], levels[1])
+        except Exception as e:
+            logger.debug("deep navigator top paint failed: %s", e)
+
+    def _commit_deep_nav(self, acc: np.ndarray, nav_signals) -> None:
+        """Hand the COMPLETED deep array to the signals it backs.
+
+        The child navigator's ``(…lead…| y, x)`` signal becomes the in-RAM array
+        so a later time-slider move is a numpy slice instead of another
+        whole-time-slice dask read; the top navigator gets the derived curve."""
+        if not nav_signals:
+            return
+        acc = np.asarray(acc, dtype=np.float32)
+        if len(nav_signals) > 1:
+            _materialise_signal(nav_signals[1], acc)
+        try:
+            nav_signals[0].data = self._reduce_deep_nav(acc)
+        except Exception as e:
+            logger.debug("committing the derived top navigator failed: %s", e)
+        logger.info(
+            "navigator fill complete (recursive): deep %s → real-space %s + "
+            "derived %s", acc.shape, acc.shape[-2:], acc.shape[:-2])
 
     # ── Navigator processing ───────────────────────────────────────────────────
 
@@ -605,17 +848,33 @@ class BaseSignalTree:
             return [navigator, signal]
 
         elif signal.axes_manager.signal_dimension > 2:
+            # DEEP navigator (5-D+): `signal` is the (…lead…| y, x) nav-sum that
+            # backs the CHILD real-space navigator, `navigator` its reduction over
+            # real space — the TOP (time) navigator. Hand the progressive fill the
+            # DEEP array: one pass over the data fills both (the child is a plane
+            # of it, the top the sum of that plane). Stashing the already-reduced
+            # `navigator.data` instead threw the real-space plane away, so the
+            # child navigator got no progressive fill at all and the top one
+            # advanced a point per whole-dataset read.
             signal = signal.transpose(2)
             navigator = signal.sum(signal.axes_manager.signal_axes).T
             if navigator._lazy:
-                navigator.data = self._compute_navigator(navigator.data, heavy_workers)
+                self._nav_deep_cached = None
+                navigator.data = self._compute_navigator(
+                    navigator.data, heavy_workers, deep_nav_dask=signal.data)
+                cached, self._nav_deep_cached = self._nav_deep_cached, None
+                if cached is not None:
+                    # Sidecar hit: the deep array is already in RAM, so the child
+                    # navigator reads it directly (no compute at all).
+                    _materialise_signal(signal, cached)
             return [navigator, signal]
 
         if signal._lazy:
             signal.data = self._compute_navigator(signal.data, heavy_workers)
         return [signal]
 
-    def _compute_navigator(self, nav_dask: da.Array, heavy_workers):
+    def _compute_navigator(self, nav_dask: da.Array, heavy_workers,
+                           deep_nav_dask: "da.Array | None" = None):
         """Stash the navigator sum for the progressive compute — NEVER blocking.
 
         The display must not wait on the navigator compute (tree ``__init__``
@@ -637,21 +896,35 @@ class BaseSignalTree:
         read is skipped and the cached array IS the navigator. Base navigator
         only (``_sidecar_eligible``) — overrides/extra navigators can share the
         shape but hold different quantities.
+
+        ``deep_nav_dask`` (5-D+ only) is the UNREDUCED ``(…lead…, y, x)`` nav-sum.
+        When given it — not ``nav_dask`` — is what the progressive fill computes
+        and what the sidecar caches, because that one array drives BOTH of the
+        dataset's navigators; the returned placeholder still has ``nav_dask``'s
+        (top-navigator) shape, and a sidecar hit is handed back to the caller via
+        ``_nav_deep_cached`` so the child navigator's signal gets it too.
         """
+        source = nav_dask if deep_nav_dask is None else deep_nav_dask
         if getattr(self, "_sidecar_eligible", False) and self.source_path:
             from spyde.nav_sidecar import load_nav_sidecar
-            cached = load_nav_sidecar(self.source_path, tuple(nav_dask.shape))
+            cached = load_nav_sidecar(self.source_path, tuple(source.shape))
             if cached is not None:
                 logger.info("navigator loaded from sidecar for %s (shape=%s) — "
                             "skipping the full-dataset compute",
                             self.source_path, cached.shape)
-                return cached.astype(np.float32, copy=False)
-        self._pending_nav_dask = nav_dask
+                cached = cached.astype(np.float32, copy=False)
+                if deep_nav_dask is None:
+                    return cached
+                self._nav_deep_cached = cached
+                return self._reduce_deep_nav(cached)
+        self._pending_nav_dask = source
+        self._pending_nav_deep = deep_nav_dask is not None
         logger.debug(
-            "NAV-DEBUG _compute_navigator: stashed nav sum (%s); progressive "
-            "compute owns it. shape=%s chunks=%s heavy_workers=%s",
+            "NAV-DEBUG _compute_navigator: stashed nav sum (%s, deep=%s); "
+            "progressive compute owns it. shape=%s chunks=%s heavy_workers=%s",
             "DISTRIBUTED" if self.client is not None else "THREADED",
-            tuple(nav_dask.shape), nav_dask.chunks, heavy_workers,
+            deep_nav_dask is not None,
+            tuple(source.shape), source.chunks, heavy_workers,
         )
         return np.full(tuple(nav_dask.shape), np.nan, dtype=np.float32)
 

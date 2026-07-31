@@ -150,11 +150,11 @@ class TestNavFillDeferral:
         started = {"t": None, "had_frame": None}
         orig = BaseSignalTree._start_progressive_nav_compute
 
-        def spy(self, nav_dask=None):
+        def spy(self, nav_dask=None, deep=None):
             started["t"] = time.monotonic()
             started["had_frame"] = any(
                 isinstance(p.current_data, np.ndarray) for p in self.signal_plots)
-            return orig(self, nav_dask)
+            return orig(self, nav_dask, deep=deep)
 
         monkeypatch.setattr(
             BaseSignalTree, "_start_progressive_nav_compute", spy)
