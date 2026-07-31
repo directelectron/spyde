@@ -848,12 +848,19 @@ const styles: Record<string, React.CSSProperties> = {
   splitWrap: {
     display: 'flex', alignItems: 'center', padding: 0,
   },
+  // Type metrics track `toggle`/`toggleActive` EXACTLY (fontSize 10,
+  // lineHeight 15px, 2px vertical padding). This half sits beside Integrate in
+  // the same row, so any difference makes the split control taller than its
+  // neighbour and the row stops lining up — the one metric the dock's paired
+  // buttons (Auto/Reset, Point/Integrate) all share. Only the HORIZONTAL
+  // padding is asymmetric, to leave the caret its room on the right.
   splitMain: {
-    flex: 1, background: 'transparent', border: 'none', fontSize: 11,
-    padding: '4px 2px 4px 6px', cursor: 'pointer', textAlign: 'center',
+    flex: 1, background: 'transparent', border: 'none', fontSize: 10,
+    lineHeight: '15px', padding: '2px 2px 2px 6px', cursor: 'pointer',
+    textAlign: 'center',
   },
   sumBadge: {
-    marginLeft: 6, fontSize: 10, fontWeight: 600, opacity: 0.62,
+    marginLeft: 6, fontSize: 9, fontWeight: 600, opacity: 0.62,
     fontVariantNumeric: 'tabular-nums',
   },
   dock: {
