@@ -261,8 +261,16 @@ jobs:
       # so ONLY the synthetic/bundled-data project runs; without it Playwright runs
       # every project, including the heavy real-data 'electron-real' (pyxem
       # downloads + screenshot writes) that is meant to be opt-in.
+      # SPYDE_E2E_SLICE=fast excludes the handful of files that dominate
+      # wall-clock (see SLOW_SPECS in playwright.config.ts); they run in the
+      # e2e-slow job below. Playwright shards by FILE COUNT, not duration, so
+      # without this split one shard reliably lands at 2-4x the others — 127
+      # tests in 6.8 min on one against 90 in 22.6 on another, and re-sharding
+      # never fixed it because count-balancing keeps making the same choice.
       - name: Run Electron e2e
         working-directory: electron
+        env:
+          SPYDE_E2E_SLICE: fast
         run: xvfb-run --auto-servernum npm run test:build -- --project=electron --shard=${{ matrix.shard }}/4
 
       - name: Upload Playwright report
@@ -270,6 +278,63 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: playwright-report-shard-${{ matrix.shard }}
+          path: electron/playwright-report/
+          if-no-files-found: ignore
+
+  # The handful of spec files that dominate wall-clock, split out of the shard
+  # matrix above. Playwright balances shards by FILE COUNT, not duration, so
+  # leaving these in the matrix reliably parked one shard at 2-4x the others
+  # (measured: 127 tests in 6.8 min on shard 3 against 90 in 22.6 on shard 1).
+  # Re-sharding does not help — count-balancing keeps making the same split, and
+  # the workflow history above records both x2 and x3 landing a shard over
+  # 20 min. Moving them here costs no extra wall-clock overall and needs no
+  # additional runner beyond this one.
+  #
+  # The file list lives in ONE place: SLOW_SPECS in electron/playwright.config.ts.
+  # `reportSlowTests` prints every file over 30 s, so CI says when it has drifted.
+  e2e-slow:
+    name: electron-e2e (ubuntu, slow specs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.10.11"
+          enable-cache: true
+
+      - name: Pre-sync the Python backend env
+        run: uv sync --extra tests --extra all
+
+      - name: Install Electron dependencies
+        working-directory: electron
+        run: npm ci
+
+      - name: Install Playwright browsers
+        working-directory: electron
+        run: npx playwright install --with-deps chromium
+
+      - name: Run the slow Electron e2e specs
+        working-directory: electron
+        env:
+          SPYDE_E2E_SLICE: slow
+        run: xvfb-run --auto-servernum npm run test:build -- --project=electron
+
+      - name: Upload Playwright report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-slow
           path: electron/playwright-report/
           if-no-files-found: ignore
 
