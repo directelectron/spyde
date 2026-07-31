@@ -54,36 +54,32 @@ test('a session closes after a navigator fill has finished', async () => {
     'a settled session with data loaded did not exit').toBeLessThan(CLOSE_BUDGET_MS)
 })
 
-// ── KNOWN PRE-EXISTING HANGS ────────────────────────────────────────────────
-// Both reproduce on clean `main` (verified at 1db9ffa by checking the branch
-// out and running these same tests), so they are NOT owned by any feature
-// branch. They are `fixme` rather than deleted because each is a real
-// user-facing defect — the backend refusing to exit leaves an orphaned process
-// holding the dataset — and this file is the only place that records how to
-// reproduce them.
+// ── the two cases that used to HANG ────────────────────────────────────────
+// Both of these wedged the backend forever until `DaskManager.shutdown` stopped
+// falling back to an unbounded `cluster.close()`. They are the expensive cases:
+// a cluster whose workers are mid-task, or still spawning, cannot close
+// promptly, so these take ~15 s where idle takes ~2.6 s. That is the price of
+// bounding it, and it is bounded — which is the whole point.
 //
-// They also explain a CI failure mode that is otherwise very hard to trace:
-// a shard goes red with every test green, reporting only
-// "Worker teardown timeout of 120000ms exceeded" and
-// "1 error was not a part of any test". Any spec that happens to close its app
-// while a fill is in flight can trigger it, which is why the failing test name
-// moves around between runs.
+// Keep them: this is the only place that exercises shutdown against a cluster
+// that is genuinely busy, and it is the shape a regression here would take.
 
-test.fixme('closing WHILE a navigator fill runs hangs (pre-existing)', async () => {
+test('closing WHILE a navigator fill is still running', async () => {
   const ctx = await launchApp({ dask: true })
   await ctx.page.waitForTimeout(2000)
   await backendAction(ctx.page, 'load_test_data_movie')
   await waitForSubwindowCount(ctx.page, 2, 120_000)
-  // Deliberately do NOT wait for the fill: `BaseSignalTree.close()` cancels the
-  // in-flight dispatch, but something downstream still does not unwind.
-  // Contrast the two passing cases above — idle and after-fill both close in
-  // ~2.6 s, so it is specifically an IN-FLIGHT compute that wedges shutdown.
+  // Deliberately do NOT wait for the fill. Workers that are mid-task cannot
+  // close politely, so this is the path that used to wedge: the bounded
+  // `cluster.close(timeout=2)` raises, and the old code retried it WITHOUT a
+  // timeout. ~15 s here against ~2.6 s idle is the cost of giving up on a busy
+  // cluster and letting `process_guard` reap it.
   expect(await timeClose(ctx, 'mid-fill'),
-    'closing mid-fill hung: the in-flight compute was not cancelled')
+    'closing mid-fill hung: cluster.close() is unbounded again')
     .toBeLessThan(CLOSE_BUDGET_MS)
 })
 
-test.fixme('closing DURING cluster startup hangs (pre-existing)', async () => {
+test('closing DURING cluster startup', async () => {
   const ctx = await launchApp({ dask: true })
   await ctx.page.waitForTimeout(1500)            // mid-startup, on purpose
   expect(await timeClose(ctx, 'during-startup')).toBeLessThan(CLOSE_BUDGET_MS)
