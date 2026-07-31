@@ -188,6 +188,19 @@ export interface AxesInfoMessage extends MsgBase {
   axes?: AxisRow[]
 }
 
+/**
+ * The Axes table's "+" origin-pick state for one window. The BACKEND owns the
+ * draggable crosshair (`plot._offset_cross`), so it also owns this flag: the
+ * dock renders the button from the last `offset_pick` it heard for the ACTIVE
+ * window rather than from a local boolean, keeping "button ON ⟺ crosshair
+ * alive" true across window switches, node switches and refused toggles.
+ */
+export interface OffsetPickMessage extends MsgBase {
+  type: 'offset_pick'
+  window_id: number
+  on: boolean
+}
+
 export interface ActionActiveMessage extends MsgBase {
   type: 'action_active'
   window_id: number
@@ -879,6 +892,7 @@ export type PlotAppMessage =
   | CompositionMessage
   | MetadataMessage
   | AxesInfoMessage
+  | OffsetPickMessage
   | ActionActiveMessage
   | SubItemMessage
   | HistogramMessage

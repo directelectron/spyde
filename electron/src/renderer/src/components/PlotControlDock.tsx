@@ -173,6 +173,11 @@ function AxesTable({ axes, onEdit, offsetPick, onToggleOffsetPick }:
                 {hasSignal && (
                   <button
                     data-testid="offset-pick-toggle"
+                    // Mirrors the backend's live crosshair state, so a test (and
+                    // an accessibility reader) can see on/off without decoding
+                    // the inline style.
+                    data-on={offsetPick ? 'true' : 'false'}
+                    aria-pressed={offsetPick}
                     title="Set origin: drag a crosshair on the image to mark (0,0)"
                     onClick={onToggleOffsetPick}
                     style={offsetPick ? styles.offPickOn : styles.offPick}
@@ -570,15 +575,22 @@ export function PlotControlDock() {
 
   // "Set origin" crosshair tool: toggles a draggable crosshair on the signal
   // plot whose position the backend turns into the signal-axis offsets live.
-  const [offsetPick, setOffsetPick] = React.useState(false)
-  // Drop the tool when the active window changes (the crosshair lives on that
-  // window's plot).
-  React.useEffect(() => { setOffsetPick(false) }, [activeId])
+  //
+  // The state is BACKEND-OWNED, per window (`offset_pick` messages →
+  // state.offsetPick): the backend holds the widget on the plot, so it is the
+  // only thing that knows whether a crosshair is alive. A renderer-local
+  // boolean drifted out of sync — focusing another window reset the flag (the
+  // "+" went dark) while the crosshair stayed on the first window's plot, and
+  // the next click then targeted the NEW active plot, so the stale crosshair
+  // could never be dismissed from the UI. Reading per-window state also means
+  // clicking back onto the window that owns the crosshair shows "+" lit again.
+  const offsetPick = activeId != null && (state.offsetPick.get(activeId) ?? false)
   const onToggleOffsetPick = () => {
     if (activeId == null) return
-    const next = !offsetPick
-    setOffsetPick(next)
-    sendAction('set_offset_crosshair', { on: next }, activeId)
+    // Fire-and-follow: the backend answers with the state it actually reached
+    // (a toggle it refuses — e.g. a 1-D signal with < 2 display axes — must not
+    // leave a lit button with no crosshair under it).
+    sendAction('set_offset_crosshair', { on: !offsetPick }, activeId)
   }
 
   // The colormap dropdown mirrors the old uncontrolled <select>: local state,
