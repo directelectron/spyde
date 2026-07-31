@@ -1,5 +1,6 @@
 from __future__ import annotations
 import importlib
+import logging
 from typing import TYPE_CHECKING
 from pathlib import Path
 
@@ -9,6 +10,8 @@ if TYPE_CHECKING:
 from spyde import TOOLBAR_ACTIONS
 
 from functools import partial
+
+logger = logging.getLogger(__name__)
 
 
 def resolve_icon_path(icon_value: str) -> str:
@@ -91,7 +94,8 @@ def _has_original_metadata(signal, dotted: str | None) -> bool:
     try:
         return bool(om.has_item(dotted))
     except Exception as e:
-        log.debug("requires_original_metadata check for %r failed: %s", dotted, e)
+        logger.debug("requires_original_metadata check for %r failed: %s",
+                     dotted, e)
         return False
 
 

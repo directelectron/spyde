@@ -110,6 +110,54 @@ class TestRegistration:
         assert ".csb" in SUPPORTED_EXTS
 
 
+# ── 1b. the toolbar gate that reveals the CSB-only actions ────────────────────
+
+class TestOriginalMetadataGate:
+    """``requires_original_metadata:`` — the gate "To Frames" is hidden behind.
+
+    Its ``except`` branch is the interesting one. It logs and returns False,
+    which is the safe answer; but the module had no logger, so a signal whose
+    ``has_item`` raised turned a hidden button into a ``NameError`` raised
+    inside ``get_toolbar_actions_for_plot`` — i.e. the whole toolbar failing to
+    build, for a signal that merely was not a CSB. Cheap to assert, and the
+    kind of thing only an odd signal in the wild would ever reach.
+    """
+
+    def test_a_matching_path_shows_the_action(self):
+        from spyde.drawing.toolbars.plot_control_toolbar import (
+            _has_original_metadata)
+        from hyperspy.misc.utils import DictionaryTreeBrowser as DTB
+
+        class Sig:
+            original_metadata = DTB({"csb": {"us_per_frame": 390.0}})
+
+        assert _has_original_metadata(Sig(), "csb.us_per_frame") is True
+        assert _has_original_metadata(Sig(), "csb.nope") is False
+
+    def test_no_gate_means_always_visible(self):
+        from spyde.drawing.toolbars.plot_control_toolbar import (
+            _has_original_metadata)
+        assert _has_original_metadata(object(), None) is True
+        assert _has_original_metadata(object(), "") is True
+
+    def test_a_signal_without_original_metadata_is_refused(self):
+        from spyde.drawing.toolbars.plot_control_toolbar import (
+            _has_original_metadata)
+        assert _has_original_metadata(object(), "csb.us_per_frame") is False
+
+    def test_a_raising_lookup_is_refused_not_propagated(self):
+        from spyde.drawing.toolbars.plot_control_toolbar import (
+            _has_original_metadata)
+
+        class Boom:
+            class _OM:
+                def has_item(self, dotted):
+                    raise RuntimeError("no such tree")
+            original_metadata = _OM()
+
+        assert _has_original_metadata(Boom(), "csb.us_per_frame") is False
+
+
 # ── 2. header parsing + geometry ──────────────────────────────────────────────
 
 class TestHeader:
