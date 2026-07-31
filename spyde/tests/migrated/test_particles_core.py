@@ -189,6 +189,240 @@ class TestSplitInstances:
             split_instances(np.zeros((2, 4, 4), bool), SegmentParams())
 
 
+def _pair_mask(h=80, w=120, r=14, cy=40, cx1=48, cx2=72):
+    """The two overlapping discs of :func:`_touching`, as a boolean mask."""
+    return (_disc((h, w), cy, cx1, r).astype(bool)
+            | _disc((h, w), cy, cx2, r).astype(bool))
+
+
+def _seam(mask, width=2):
+    """The join between the two bodies: the geometric stand-in for what a
+    trained boundary class predicts, and for the strokes a user paints along it."""
+    from scipy import ndimage as ndi
+    ws = split_instances(mask, SegmentParams(min_size=20))
+    # A boundary is the seam BETWEEN two instances, never the outline of one —
+    # a mask of outlines teaches a head to shrink every body and split nothing,
+    # which is the failure this helper's shape exists to avoid reproducing.
+    grown = [ndi.binary_dilation(ws == i, iterations=width)
+             for i in range(1, int(ws.max()) + 1)]
+    seam = np.zeros(mask.shape, bool)
+    for i in range(len(grown)):
+        for j in range(i + 1, len(grown)):
+            seam |= grown[i] & grown[j]
+    return seam & mask
+
+
+class TestBoundarySplit:
+    """The connected-components route: ``split_instances(fg, p, boundary=...)``.
+
+    This exists for speed — a taught boundary lets the split skip the distance
+    transform, the marker/elevation upsample and the watershed, together 1.62 s
+    of a 1.78 s split at 4096². So the bar is not "it produces something": it
+    has to produce **what the watershed produced**, or the speed is not worth
+    having.
+    """
+
+    def test_splits_touching_particles(self):
+        mask = _pair_mask()
+        p = SegmentParams(min_size=40)
+        assert split_instances(mask, p, boundary=_seam(mask)).max() == 2
+
+    def test_matches_the_watershed_count_and_areas(self):
+        """The gate: same count, the same pixels claimed in total, and the same
+        areas to within a fraction of a percent.
+
+        NOT bit-identical, and the difference is inherent rather than a bug: the
+        watershed cuts at the point equidistant from two markers, while reclaim
+        grows both sides one pixel per pass and breaks a tie toward the higher
+        label id. On this pair that moves the cut by four pixels — 0.7% of a 590
+        px body — while the union of the two instances is exactly the same set
+        of pixels. Asserting bit-equality here would be asserting that two
+        different algorithms agree by luck.
+        """
+        mask = _pair_mask()
+        p = SegmentParams(min_size=40)
+        ws = split_instances(mask, p)
+        bd = split_instances(mask, p, boundary=_seam(mask))
+
+        def areas(lab):
+            c = np.bincount(lab.ravel())[1:]
+            return np.sort(c[c > 0])
+
+        a_ws, a_bd = areas(ws), areas(bd)
+        assert bd.max() == ws.max() == 2
+        assert (bd > 0).sum() == (ws > 0).sum(), (
+            "the two routes claimed a different amount of foreground")
+        assert np.array_equal(bd > 0, ws > 0), (
+            "the two routes disagree about which pixels belong to a particle")
+        rel = np.abs(a_bd - a_ws) / a_ws
+        assert rel.max() < 0.02, (
+            f"boundary areas {a_bd.tolist()} differ from watershed "
+            f"{a_ws.tolist()} by {rel.max() * 100:.1f}%")
+
+    def test_the_distance_transform_and_watershed_never_run(self, monkeypatch):
+        """The whole point. If either is still called the route saves nothing,
+        and a passing count test would hide that completely."""
+        from scipy import ndimage as ndi
+        from skimage import segmentation as skseg
+
+        mask = _pair_mask()
+        seam = _seam(mask)                       # built BEFORE the spies go in —
+        # `_seam` runs a watershed itself, standing in for the user's eye.
+        called = []
+        monkeypatch.setattr(ndi, "distance_transform_edt",
+                            lambda *a, **k: called.append("edt"))
+        monkeypatch.setattr(skseg, "watershed",
+                            lambda *a, **k: called.append("watershed"))
+
+        split_instances(mask, SegmentParams(min_size=40), boundary=seam)
+        assert called == [], f"the boundary route still ran {called}"
+
+    def test_no_boundary_falls_back_to_the_watershed(self):
+        """A user who has never painted a boundary must not silently get worse
+        splitting — so an absent boundary is the old behaviour, bit for bit."""
+        mask = _pair_mask()
+        p = SegmentParams(min_size=40)
+        ws = split_instances(mask, p)
+        assert np.array_equal(split_instances(mask, p, boundary=None), ws)
+
+    def test_an_all_false_boundary_also_falls_back(self):
+        """"The class exists but nothing is painted yet" is the same situation as
+        "there is no boundary", and it is the common one mid-session. Treating an
+        empty mask as a real boundary would hand watershed's job to plain
+        connected components and merge every touching pair."""
+        mask = _pair_mask()
+        p = SegmentParams(min_size=40)
+        ws = split_instances(mask, p)
+        empty = split_instances(mask, p, boundary=np.zeros_like(mask))
+        assert np.array_equal(empty, ws)
+
+    def test_isolated_particles_are_untouched(self):
+        """An isolated body has no seam through it, so its core IS the body and
+        the two routes cannot disagree."""
+        mask = np.zeros((80, 120), bool)
+        mask |= _disc((80, 120), 25, 25, 12).astype(bool)
+        mask |= _disc((80, 120), 25, 90, 12).astype(bool)
+        p = SegmentParams(min_size=40)
+        seam = _seam(mask)
+        assert not seam.any(), "these discs do not touch; there is no seam"
+        assert np.array_equal(split_instances(mask, p, boundary=seam),
+                              split_instances(mask, p))
+
+    def test_a_probability_boundary_is_thresholded_like_the_foreground(self):
+        mask = _pair_mask()
+        seam = _seam(mask)
+        soft = np.where(seam, 0.9, 0.1).astype(np.float32)
+        p = SegmentParams(min_size=40)
+        assert np.array_equal(split_instances(mask, p, boundary=soft),
+                              split_instances(mask, p, boundary=seam))
+
+    def test_a_weak_probability_boundary_is_ignored(self):
+        """Below 0.5 everywhere is no boundary at all — and must therefore fall
+        back rather than run the fast route on an empty seam."""
+        mask = _pair_mask()
+        soft = np.where(_seam(mask), 0.3, 0.05).astype(np.float32)
+        p = SegmentParams(min_size=40)
+        assert np.array_equal(split_instances(mask, p, boundary=soft),
+                              split_instances(mask, p))
+
+    def test_a_mismatched_boundary_shape_raises(self):
+        with pytest.raises(ValueError, match="must describe the same frame"):
+            split_instances(np.zeros((10, 10), bool), SegmentParams(),
+                            boundary=np.zeros((10, 12), bool))
+
+    def test_rejects_a_3d_boundary(self):
+        with pytest.raises(ValueError, match="boundary must be 2-D"):
+            split_instances(np.zeros((10, 10), bool), SegmentParams(),
+                            boundary=np.zeros((2, 10, 10), bool))
+
+    def test_a_tiny_particle_survives_the_boundary_route(self):
+        """§0.9 again, on the new path: the split step may never delete a small
+        body. A 3x3 particle has no seam through it, so it must come out whole."""
+        mask = np.zeros((60, 60), bool)
+        mask[10:30, 10:30] = True
+        mask[45:48, 45:48] = True                    # 9 px
+        bnd = np.zeros((60, 60), bool)
+        bnd[19:21, 10:30] = True                     # a seam across the big one
+        labels = split_instances(mask, SegmentParams(min_size=5), boundary=bnd)
+        assert labels[46, 46] != 0, "the tiny particle was dropped"
+        assert labels.max() == 3, "the seam should have cut the large body in two"
+
+
+class TestBoundaryReclaim:
+    """Growing the instances back over the seam — what keeps the areas honest."""
+
+    def test_the_seam_is_fully_reclaimed_by_default(self):
+        """Default is grow-to-convergence, so every foreground pixel reachable
+        from a core ends up owned by one."""
+        mask = _pair_mask()
+        labels = split_instances(mask, SegmentParams(min_size=40),
+                                 boundary=_seam(mask, width=3))
+        assert int((labels > 0).sum()) == int(mask.sum()), (
+            "some foreground was left unassigned with reclaim running to "
+            "convergence")
+
+    def test_capping_the_passes_leaves_part_of_the_seam_unassigned(self):
+        """Confirms the previous test measures something: with one pass a wide
+        seam cannot be closed, so the areas come out low."""
+        mask = _pair_mask()
+        seam = _seam(mask, width=3)
+        capped = split_instances(
+            mask, SegmentParams(min_size=40, boundary_reclaim=1), boundary=seam)
+        assert int((capped > 0).sum()) < int(mask.sum())
+
+    def test_the_count_is_the_same_however_many_passes_run(self):
+        """Reclaim moves pixels between instances; it must never create or
+        destroy one. That is what makes the cap a quality knob and not a
+        correctness one."""
+        mask = _pair_mask()
+        seam = _seam(mask, width=3)
+        counts = {
+            int(split_instances(mask,
+                                SegmentParams(min_size=40, boundary_reclaim=k),
+                                boundary=seam).max())
+            for k in (1, 2, 3, 5, 0)
+        }
+        assert counts == {2}, f"the pass count changed the particle count: {counts}"
+
+    def test_foreground_with_no_core_at_all_stays_unassigned(self):
+        """A body entirely covered by boundary belongs to no instance, and
+        inventing an owner for it would be worse than leaving it out."""
+        mask = np.zeros((40, 40), bool)
+        mask[5:25, 5:25] = True                      # a real body
+        mask[32:35, 32:35] = True                    # fully fenced in below
+        bnd = np.zeros((40, 40), bool)
+        bnd[32:35, 32:35] = True
+        labels = split_instances(mask, SegmentParams(min_size=4), boundary=bnd)
+        assert labels.max() == 1
+        assert not labels[32:35, 32:35].any()
+
+
+class TestFinalizeLabels:
+    """``_finalize_labels`` fuses the size filter and the sequential relabel."""
+
+    def test_identical_to_the_chain_it_replaces(self):
+        """It reads the raster twice instead of six times, so it has to be
+        proven equal to the obvious version rather than merely similar."""
+        from spyde.particles.classical import (_drop_large, _drop_small,
+                                               _finalize_labels,
+                                               _relabel_sequential)
+        rng = np.random.default_rng(0)
+        for trial in range(60):
+            lab = rng.integers(0, 12, size=(24, 24)).astype(np.int32)
+            if trial % 3 == 0:
+                lab[lab == 5] = 0                    # punch a gap in the ids
+            p = SegmentParams(min_size=int(rng.integers(0, 10)),
+                              max_size=int(rng.integers(0, 60)))
+            ref = lab
+            if p.max_size > 0:
+                ref = _drop_large(ref, p.max_size)
+            if p.min_size > 0:
+                ref = _drop_small(ref, p.min_size)
+            ref = _relabel_sequential(ref)
+            assert np.array_equal(_finalize_labels(lab, p), ref), (
+                f"trial {trial}: min_size={p.min_size} max_size={p.max_size}")
+
+
 class TestNaNBorder:
     """Plan trap #2 / gate A7 — the drift↔segmentation seam."""
 

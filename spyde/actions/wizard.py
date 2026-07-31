@@ -74,6 +74,18 @@ class WizardController:
         """True if *gen* is still the current run generation."""
         return is_current(self.tree, self._gen_key, gen)
 
+    def current_gen(self) -> int:
+        """The live generation WITHOUT opening a new one.
+
+        For deferred work that belongs to the interaction ALREADY in progress
+        rather than starting a new one — the case being a re-preview triggered by
+        the navigator moving. Calling :meth:`guard` for that would bump the shared
+        generation and silently cancel an in-flight train or run the user
+        actually asked for, which is a failure with no error message: the worker
+        completes, sees a newer generation, and drops its result.
+        """
+        return int(getattr(self.tree, self._gen_key, 0) or 0)
+
     def cancel_inflight(self) -> None:
         """Invalidate any in-flight open (call FIRST in the close handler)."""
         bump_generation(self.tree, self._gen_key)

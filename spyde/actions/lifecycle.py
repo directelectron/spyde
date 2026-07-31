@@ -392,6 +392,123 @@ class window_computing:
         return False
 
 
+# ── the standard "this is computing" surface for a batch action ──────────────
+
+class batch_feedback:
+    """The THREE things every long batch run should show, in one object.
+
+    Batch actions had each grown their own subset of these and no two agreed:
+    the navigator/VI fills raised the "Calculating…" overlay but no action run
+    did, ``emit_progress`` labels ranged from ``"Segmenting"`` to
+    ``"Encoding movie 3/40"`` (counts baked into the label for one caller and
+    not the others), and only some paths showed anything at all on the plot
+    while they worked. From the outside that reads as "some of these are
+    broken" — the ones that look idle are the ones that say nothing.
+
+    The three surfaces, and why each earns its place:
+
+    * **The window overlay** (:class:`window_computing`) — answers "is this
+      thing doing anything", and is the only one visible when the status bar is
+      off-screen or covered.
+    * **Status-bar progress** (:func:`~spyde.backend.ipc.emit_progress`) —
+      answers "how far, and how much longer". Rate-limited, because a 900-frame
+      run emitting per frame puts 900 messages on the same stdout line protocol
+      the nav painter uses.
+    * **The most recent RESULT, painted live** — answers the question the other
+      two cannot: *is it working properly?* A progress bar advancing through a
+      900-frame run that is quietly finding nothing looks exactly like one that
+      is working. Showing the newest frame's result turns a 20-minute wait into
+      something you can abandon in the first ten seconds.
+
+    ``publish`` is the caller's "paint this result" function; it is called on
+    the **asyncio main thread** (this class marshals), rate-limited by the same
+    clock as the progress emission, and always called for the FINAL result
+    regardless of the rate limit — the last frame is the one left on screen.
+
+    Every surface is None-guarded, so a caller with no window, or no result to
+    paint, uses the same code path as one that has both.
+
+    Usage from a worker thread::
+
+        fb = batch_feedback(session, result.window_id, "Segmenting", n_frames,
+                            publish=lambda r: wiz.set_overlay(*r))
+        with fb:
+            for i in range(n):
+                ...
+                fb.step(i + 1, result=(contours, box))
+    """
+
+    def __init__(self, session, window_id: int | None, label: str, total: int,
+                 *, publish: "Callable[[Any], None] | None" = None,
+                 min_interval: float = 0.35):
+        self.session = session
+        self.label = str(label)
+        self.total = int(total)
+        self.publish = publish
+        self.min_interval = float(min_interval)
+        self._overlay = window_computing(window_id)
+        self._last = 0.0
+        self._done = 0
+
+    # -- lifecycle ----------------------------------------------------------
+    def __enter__(self) -> "batch_feedback":
+        self._overlay.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        # Unconditional, like `window_computing`: a cancelled or failed batch
+        # must not leave the overlay spinning forever over a window that has
+        # stopped working. This is the failure the pairing contract exists for.
+        self._overlay.stop()
+        return False
+
+    # -- during the run -----------------------------------------------------
+    def step(self, done: int, *, result: "Any" = None, force: bool = False) -> None:
+        """One unit finished. Emits progress and paints *result*, rate-limited.
+
+        Safe to call from a worker thread — the paint is marshalled. Call with
+        ``force=True`` for the final unit so the last result is the one left on
+        screen even if it lands inside the rate-limit window.
+        """
+        self._done = int(done)
+        now = time.monotonic()
+        if not force and self._done < self.total and now - self._last < self.min_interval:
+            return
+        self._last = now
+        from spyde.backend.ipc import emit_progress
+        emit_progress(self._done, self.total, self.label)
+        if result is not None and self.publish is not None:
+            self._paint(result)
+
+    def _paint(self, result) -> None:
+        publish = self.publish
+        if publish is None:
+            return
+        dispatch = getattr(self.session, "_dispatch_to_main", None)
+        if dispatch is None:                 # no loop (tests) — paint inline
+            _safe_publish(publish, result)
+            return
+        dispatch(lambda: _safe_publish(publish, result))
+
+    def finish(self) -> None:
+        """Terminal progress tick, so the status bar's spinner actually stops.
+
+        Without it a run that ends early (cancelled, or a rate-limited final
+        step) leaves the bar mid-way and the user reads a finished job as hung —
+        which is exactly what `seg_run` did before it emitted a final
+        ``emit_progress(n, n)``.
+        """
+        from spyde.backend.ipc import emit_progress
+        emit_progress(self.total, self.total, self.label)
+
+
+def _safe_publish(publish, result) -> None:
+    """A live-preview paint must never take the batch down with it."""
+    try:
+        publish(result)
+    except Exception as exc:
+        log.debug("[batch] live result paint failed: %s", exc)
+
 
 # ── progressive shared-memory fill ────────────────────────────────────────────
 

@@ -9,7 +9,7 @@ produce a foreground probability map, and one shared downstream stage.**
                                                           │
                                   split_instances()  (watershed)
                                                           │
-                                  measure_frame()    (regionprops → units)
+                                  measure_frame()    (props + hull → units)
                                                           │
                                   SpyDEParticles     (CSR, per frame)
                                                           │

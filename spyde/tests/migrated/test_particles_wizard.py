@@ -790,3 +790,207 @@ class TestPaintStateReachesTheWidget:
             pytest.skip("installed anyplotlib has no brush widget (needs >= 0.5.0)")
         seg_tune(session, plot, {"brush": 9.0})
         assert float(tree._seg_brush.radius) == pytest.approx(9.0)
+
+
+class TestBrushDrawColour:
+    """The brush must DRAW in the selected class's colour, not just tag strokes.
+
+    Reported twice as "I can only scribble one colour" / "support film still
+    doesn't change the painting colour". The first fix made the STROKE land in
+    the right class, which it now does — the per-class pixel counts in the caret
+    prove it. But the colour on screen comes from the WIDGET's own `class_id`
+    (`figure_esm.js::_brushLiveBegin` reads `w.class_id` at stroke start and
+    draws in `colors[class_id]`), so the data can be right while the paint is
+    still orange. These assert the widget state, which is the thing the eye sees.
+    """
+
+    def _scribble_wizard(self, session):
+        from spyde.actions.particles_action import seg_open, seg_set_method
+        plots = session._plots
+        plots = list(plots.values()) if hasattr(plots, "values") else list(plots)
+        plot = next(p for p in plots
+                    if getattr(p, "signal_tree", None) is not None
+                    and getattr(p, "_plot2d", None) is not None)
+        seg_open(session, plot, {"window_id": getattr(plot, "window_id", None)})
+        seg_set_method(session, plot, {"method": "scribble"})
+        return plot, plot.signal_tree
+
+    def test_selecting_a_class_changes_the_widget_class_id(self, window):
+        from spyde.actions.particles_action import _brush_supported, seg_tune
+        session = window["window"]
+        session._load_test_data_particles({"frames": 4})
+        plot, tree = self._scribble_wizard(session)
+        if not _brush_supported():
+            pytest.skip("installed anyplotlib has no brush widget")
+        brush = getattr(tree, "_seg_brush", None)
+        assert brush is not None
+
+        # What the ClassStrip sends when you click "support film".
+        seg_tune(session, plot, {"active_class": 1})
+        assert int(brush._data["class_id"]) == 1, (
+            "the widget still paints class 0 — the strip's selection reached "
+            "wiz.params but not the widget, so every stroke DRAWS orange")
+
+        seg_tune(session, plot, {"active_class": 2})
+        assert int(brush._data["class_id"]) == 2
+
+    def test_the_new_class_reaches_the_PANEL_state(self, window):
+        """The JS draws from ``panel_<id>_json``, not from the Python object.
+
+        This is the assertion the previous two miss and the reason the bug
+        survived a "fix": ``Widget.set`` reaches JS via ``_push_widget``, which
+        writes ``event_json`` ONLY and leaves the panel's own widget state
+        stale. ``_brushLiveBegin`` reads ``w.class_id`` from
+        ``p.state.overlay_widgets`` and paints ``colors[class_id]`` — so
+        ``brush._data`` can say 1 while every stroke still draws in class 0's
+        colour. Assert the serialised panel, which is what the eye sees.
+        """
+        from spyde.actions.particles_action import _brush_supported, seg_tune
+        session = window["window"]
+        session._load_test_data_particles({"frames": 4})
+        plot, tree = self._scribble_wizard(session)
+        if not _brush_supported():
+            pytest.skip("installed anyplotlib has no brush widget")
+
+        # Spy on the panel push. Asserting `_state` alone would be VACUOUS:
+        # `overlay_widgets` holds the widget's own `_data` BY REFERENCE, so
+        # `brush.set()` mutates it in place and the dict always looks current
+        # whether or not anything was ever sent to JS. What the renderer sees is
+        # the re-serialised trait, so the assertion has to be "a push happened".
+        pushes = []
+        real_push = plot._plot2d._push
+        plot._plot2d._push = lambda *a, **k: (pushes.append(1), real_push(*a, **k))[1]
+        try:
+            seg_tune(session, plot, {"active_class": 2})
+        finally:
+            plot._plot2d._push = real_push
+
+        assert pushes, (
+            "no panel push after the class changed — the targeted widget update "
+            "writes event_json only, so panel_<id>_json keeps the OLD class and "
+            "JS goes on painting the previous class's colour")
+
+        widgets = (plot._plot2d._state.get("overlay_widgets") or [])
+        brushes = [w for w in widgets if (w or {}).get("type") == "brush"]
+        assert brushes, f"no brush in the panel state: {widgets}"
+        assert int(brushes[0].get("class_id", -1)) == 2
+
+    def test_an_unrelated_tune_does_NOT_force_a_panel_push(self, window):
+        """`seg_tune` fires for every sensitivity-slider tick too.
+
+        A full panel push re-serialises the image bytes, so doing one per tick
+        on a 4096² frame would trade the colour bug for a much worse drag. Only
+        an actual brush change (class / eraser / size) may pay for it.
+        """
+        from spyde.actions.particles_action import _brush_supported, seg_tune
+        session = window["window"]
+        session._load_test_data_particles({"frames": 4})
+        plot, _tree = self._scribble_wizard(session)
+        if not _brush_supported():
+            pytest.skip("installed anyplotlib has no brush widget")
+
+        seg_tune(session, plot, {"active_class": 1})      # settle the state
+
+        pushes = []
+        real_push = plot._plot2d._push
+        plot._plot2d._push = lambda *a, **k: (pushes.append(1), real_push(*a, **k))[1]
+        try:
+            seg_tune(session, plot, {"sensitivity": 0.6})
+            seg_tune(session, plot, {"sensitivity": 0.7})
+            seg_tune(session, plot, {"active_class": 1})   # SAME class, no change
+        finally:
+            plot._plot2d._push = real_push
+
+        assert pushes == [], (
+            f"{len(pushes)} panel pushes for tunes that did not change the "
+            "brush — a sensitivity drag would re-serialise the whole image")
+
+    def test_the_widget_has_a_colour_for_every_class(self, window):
+        """`colors` is indexed by class_id in JS, so a short list means the
+        later classes draw with `undefined` — no colour change on screen even
+        though class_id updated correctly."""
+        from spyde.actions.particles_action import _brush_supported
+        session = window["window"]
+        session._load_test_data_particles({"frames": 4})
+        _plot, tree = self._scribble_wizard(session)
+        if not _brush_supported():
+            pytest.skip("installed anyplotlib has no brush widget")
+        brush = tree._seg_brush
+        from spyde.particles import default_classes
+        n_classes = len(default_classes())
+        colours = list(brush._data.get("colors") or [])
+        assert len(colours) >= n_classes, (
+            f"brush carries {len(colours)} colours for {n_classes} classes — "
+            f"class ids >= {len(colours)} draw with no colour: {colours}")
+
+
+class TestBatchComputingOverlay:
+    """The "Calculating…" chip over the RESULT window, and when it appears.
+
+    Reported as: "there is a lot of lag between the subwindow appearing and then
+    [calculating]". The chip was not raised at all, and the obvious place to add
+    it — next to the first progress emission, inside the worker — is far too
+    late: the window opens, then the placeholder store is built, the cancel
+    flags registered, the generation bumped, the worker scheduled, the thread
+    hop paid, and the first frame COMPUTED. On 4096² frames that is seconds of a
+    window that looks finished and empty.
+
+    So the contract is SYNCHRONOUS: by the time `seg_run` returns to the event
+    loop, the chip is already up.
+    """
+
+    def _seg_run(self, session, **params):
+        from spyde.actions.particles_action import seg_run
+        plots = session._plots
+        plots = list(plots.values()) if hasattr(plots, "values") else list(plots)
+        plot = next(p for p in plots
+                    if getattr(p, "signal_tree", None) is not None
+                    and getattr(p, "_plot2d", None) is not None)
+        seg_run(session, plot, dict(params))
+        return plot
+
+    def test_the_chip_is_raised_before_seg_run_returns(self, window):
+        session = window["window"]
+        msgs = window["messages"]
+        session._load_test_data_particles({"frames": 4})
+        del msgs[:]
+
+        self._seg_run(session, method="classical", track=False)
+
+        # No waiting, no polling: the chip must already be on the wire.
+        raised = [m for m in msgs
+                  if m.get("type") == "window_computing" and m.get("computing")]
+        assert raised, (
+            "no window_computing raised synchronously — the chip only appears "
+            "once the worker gets going, which is the reported lag")
+
+    def test_the_chip_names_the_RESULT_window(self, window):
+        """Not the source window: the source is where you were scribbling and it
+        is not the thing sitting there looking empty."""
+        session = window["window"]
+        msgs = window["messages"]
+        session._load_test_data_particles({"frames": 4})
+        src = self._seg_run(session, method="classical", track=False)
+        del msgs[:]
+
+        raised = [m for m in window["messages"]
+                  if m.get("type") == "window_computing"]
+        # Re-read from the full list: the run may already have finished.
+        all_ids = {m.get("window_id") for m in raised}
+        src_id = getattr(src, "window_id", None)
+        if all_ids:
+            assert all_ids != {src_id}, (
+                "the chip was put on the SOURCE window, not the result")
+
+    def test_the_chip_comes_down_when_the_batch_ends(self, window):
+        session = window["window"]
+        msgs = window["messages"]
+        session._load_test_data_particles({"frames": 4})
+        del msgs[:]
+        self._seg_run(session, method="classical", track=False)
+
+        assert _wait(lambda: any(
+            m.get("type") == "window_computing" and not m.get("computing")
+            for m in msgs), timeout=180), (
+            "the Calculating chip never came down — it will spin forever over a "
+            "window that has finished")

@@ -1,11 +1,45 @@
 """
 measure.py — turn a label image into calibrated particle property rows.
 
-ParticleSpy's measured-property set, computed with ``regionprops_table`` (one
-vectorised pass, never a Python loop over regions) and converted to physical units
-exactly once, here. Every downstream consumer — the table, the histogram, the
-kymograph, the CSV — reads the already-calibrated numbers, so there is one place
-a unit can be wrong instead of a dozen.
+ParticleSpy's measured-property set, converted to physical units exactly once,
+here. Every downstream consumer — the table, the histogram, the kymograph, the
+CSV — reads the already-calibrated numbers, so there is one place a unit can be
+wrong instead of a dozen.
+
+The property table itself no longer comes from ``regionprops_table``
+--------------------------------------------------------------------
+``regionprops_table`` walks a Python object per region, so its cost is per
+PARTICLE — and a real 4096² in-situ growth frame has **26 566** of them. Measured
+(``benchmarks.md``): 53.5 s to measure a frame against 3.0 s to segment it, of
+which ``solidity`` alone was 30.5 s and the axis/eccentricity trio 12 s. Whole
+frame now: **1.37 s**.
+
+Four modules replace it, keeping skimage's definitions to the bit:
+
+* :mod:`spyde.particles.props` — every column that is a **label-wise reduction
+  over the raster** (``bincount``: area, centroid, bbox, equivalent diameter, the
+  second central moments behind the axes and eccentricity, and the perimeter's
+  border-crossing weights). 43.7 s → 1.1 s.
+* :mod:`spyde.particles.hull` — ``solidity``, the one property that is a convex
+  hull per region rather than a reduction, in a numba kernel that does every
+  region in one ``prange`` with the GIL released. 30.2 s → 0.18 s, and the hull
+  is reproduced in exact integer arithmetic, so ``area_convex`` matches skimage
+  on **all 26 566** regions with zero differing pixels.
+* :mod:`spyde.particles.intensity` — the intensity statistics as the same
+  ``bincount`` the moments turned out to be, and the local background RING (a
+  dilation per particle, which overlapping neighbours may each claim, so it is
+  not a partition and no ``bincount`` expresses it) as a second numba kernel.
+  4.92 s → 0.19 s, and all four columns are **bit-identical** on the real frame.
+* :mod:`spyde.particles.contours` — marching squares and the segment assembly
+  behind them, for every region in one ``prange``. 4.77 s → 0.15 s, and the
+  FILLED polygon — which is what ``render_frame`` and ``mask_at`` consume — is
+  identical on **26 566 of 26 566** regions. The vertices are NOT, and cannot be:
+  a closed contour is a cycle and the two tracers cut it at different vertices.
+  See that module for why the fill is the right gate and vertex identity is not.
+
+``SPYDE_PARTICLE_PROPS=legacy`` (or ``measure_frame(..., fast=False)``) restores
+the ``regionprops_table`` + ``find_contours`` path. It is what the parity tests
+compare against, and what runs if numba cannot compile.
 
 Two things that look like details and are not:
 
@@ -22,12 +56,16 @@ Two things that look like details and are not:
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
 from spyde.signals.particles import COL, N_COLUMNS
 
 # regionprops names we ask for. Kept minimal: each extra property is another pass
 # over every region, and the ones omitted here are cheap to derive from these.
+# This is now the LEGACY path's property list and the parity test's reference —
+# `spyde.particles.props.label_props` produces exactly these columns.
 _PROPS = (
     "label",
     "centroid",
@@ -42,6 +80,45 @@ _PROPS = (
 )
 
 
+def _fast_default() -> bool:
+    """Whether the vectorised property path is on. ``SPYDE_PARTICLE_PROPS=legacy``
+    turns it off, for a bug report or an A/B against skimage."""
+    return os.environ.get("SPYDE_PARTICLE_PROPS", "").lower() not in (
+        "legacy", "skimage", "0", "off")
+
+
+def property_table(labels: np.ndarray, *, fast: bool | None = None) -> dict:
+    """The per-region property table, as ``regionprops_table`` would return it.
+
+    Split out from :func:`measure_frame` so the parity test can compare the two
+    paths column by column on a real label image, which is the only reason it is
+    safe to have replaced the reference implementation at all.
+    """
+    if fast is None:
+        fast = _fast_default()
+    if fast:
+        from spyde.particles.props import label_props
+        return label_props(labels)
+    from skimage.measure import regionprops_table
+    return regionprops_table(labels, properties=_PROPS)
+
+
+def warm_kernels() -> None:
+    """Compile every numba kernel ``measure_frame`` uses, before the first frame.
+
+    Three of them now (hull, ring, contours), and paying any of their first-use
+    compiles inside a measured frame makes that frame look like a regression.
+    Idempotent; each module short-circuits once compiled.
+    """
+    from spyde.particles.contours import warmup as warm_contours
+    from spyde.particles.hull import warmup as warm_hull
+    from spyde.particles.intensity import warmup as warm_ring
+
+    warm_hull()
+    warm_ring()
+    warm_contours()
+
+
 def measure_frame(
     labels: np.ndarray,
     intensity: np.ndarray | None = None,
@@ -50,6 +127,7 @@ def measure_frame(
     scale: float = 1.0,
     background_ring: int = 3,
     min_area_px: int = 0,
+    fast: bool | None = None,
 ) -> tuple[np.ndarray, list[np.ndarray]]:
     """Measure every instance in *labels*.
 
@@ -71,6 +149,10 @@ def measure_frame(
     min_area_px
         Drop instances smaller than this many pixels. Applied here, in pixels,
         because it is a detector-resolution question, not a physical one.
+    fast
+        Force the vectorised property path on/off. ``None`` reads
+        ``SPYDE_PARTICLE_PROPS``. The two paths are asserted equal column by
+        column in ``test_particles_props_parity.py``.
 
     Returns
     -------
@@ -81,8 +163,6 @@ def measure_frame(
         row and in the same order — the 1:1 correspondence
         ``SpyDEParticles.from_frames`` requires.
     """
-    from skimage.measure import regionprops_table
-
     lab = np.asarray(labels)
     if lab.ndim != 2:
         raise ValueError(f"labels must be 2-D; got shape {lab.shape}")
@@ -98,7 +178,7 @@ def measure_frame(
     if lab.max() <= 0:
         return np.zeros((0, N_COLUMNS), np.float32), []
 
-    tbl = regionprops_table(lab, properties=_PROPS)
+    tbl = property_table(lab, fast=fast)
     n = len(tbl["label"])
 
     area_px = tbl["area"].astype(np.float64)
@@ -135,23 +215,37 @@ def measure_frame(
     rows[:, COL["background"]] = np.nan
 
     if inten is not None:
-        _fill_intensity(rows, lab, inten, tbl, keep, background_ring)
+        _fill_intensity(rows, lab, inten, tbl, keep, background_ring, fast=fast)
 
-    contours = _contours(lab, tbl)
+    contours = _contours(lab, tbl, fast=fast)
 
     rows = rows[keep]
     contours = [c for c, k in zip(contours, keep) if k]
     return np.ascontiguousarray(rows), contours
 
 
-def _fill_intensity(rows, lab, inten, tbl, keep, ring: int) -> None:
+def _table_bboxes(tbl) -> np.ndarray:
+    """``(n, 4)`` int64 ``(y0, x0, y1, x1)`` from the property table's columns."""
+    return np.stack([np.asarray(tbl[f"bbox-{k}"], np.int64) for k in range(4)],
+                    axis=1)
+
+
+def _fill_intensity(rows, lab, inten, tbl, keep, ring: int, *,
+                    fast: bool | None = None) -> None:
     """Intensity statistics over FINITE pixels only, plus a local background ring.
 
-    Done with per-particle bbox crops rather than one pass per statistic over the
-    whole frame: a crop is tiny, and it is also the only way to compute the ring
-    without dilating a full-frame mask once per particle (which at hundreds of
-    particles on a 4096^2 frame is the dominant cost of the whole measure step).
+    ``intensity_mean/max/std`` are label-wise reductions over the foreground and
+    go through :func:`spyde.particles.intensity.label_intensity_stats`; the
+    background ring is a per-particle dilation that overlapping neighbours may
+    each claim, so it goes through that module's numba kernel instead. The
+    per-region loop below is the definition both are checked against, and the
+    path that runs when numba is unavailable.
     """
+    if fast is None:
+        fast = _fast_default()
+    if fast and _fill_intensity_fast(rows, lab, inten, tbl, keep, ring):
+        return
+
     from scipy.ndimage import binary_dilation
 
     h, w = lab.shape
@@ -191,14 +285,57 @@ def _fill_intensity(rows, lab, inten, tbl, keep, ring: int) -> None:
                 rows[i, COL["background"]] = bvals.mean()
 
 
-def _contours(lab: np.ndarray, tbl) -> list[np.ndarray]:
+def _fill_intensity_fast(rows, lab, inten, tbl, keep, ring: int) -> bool:
+    """The vectorised half of :func:`_fill_intensity`. False if numba is missing.
+
+    Returns False WITHOUT writing anything when the ring kernel is unavailable,
+    so the caller can run the per-region loop instead — a half-filled row would
+    be worse than a slow one.
+    """
+    from spyde.particles.intensity import label_intensity_stats, ring_backgrounds
+
+    labels = np.asarray(tbl["label"], np.int64)
+    if labels.size == 0:
+        return True
+    bg = ring_backgrounds(lab, inten, labels, _table_bboxes(tbl), int(ring))
+    if bg is None:
+        return False
+
+    mean, mx, std = label_intensity_stats(lab, inten, labels)
+    keep = np.asarray(keep, bool)
+    rows[keep, COL["intensity_mean"]] = mean[keep]
+    rows[keep, COL["intensity_max"]] = mx[keep]
+    rows[keep, COL["intensity_std"]] = std[keep]
+    if int(ring) > 0:
+        rows[keep, COL["background"]] = bg[keep]
+    return True
+
+
+def _contours(lab: np.ndarray, tbl, *, fast: bool | None = None
+              ) -> list[np.ndarray]:
     """One int16 outline per region, in ``tbl`` order.
 
     Traced inside each region's padded bbox crop, not on the whole frame: a
     frame-wide ``find_contours`` would return every region's outline in arbitrary
     order with no label attached, and re-associating them is both slow and
     ambiguous where particles touch.
+
+    :mod:`spyde.particles.contours` does exactly that, for every region in one
+    ``prange``, and produces the same FILLED polygon (the thing ``render_frame``
+    and ``mask_at`` consume) per region. The loop below is the definition it is
+    checked against, and the path that runs without numba.
     """
+    if fast is None:
+        fast = _fast_default()
+    if fast:
+        from spyde.particles.contours import label_contours
+
+        got = label_contours(lab, np.asarray(tbl["label"], np.int64),
+                             _table_bboxes(tbl),
+                             np.asarray(tbl["area"], np.int64))
+        if got is not None:
+            return got
+
     from skimage.measure import find_contours
 
     h, w = lab.shape

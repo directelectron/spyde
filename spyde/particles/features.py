@@ -92,10 +92,32 @@ DEFAULT_RANK_RADII: tuple[int, ...] = (1, 2)
 MEMBRANE_PROJECTIONS: tuple[str, ...] = ("sum", "mean", "std", "median",
                                          "max", "min")
 
-#: Target working-set size for one row band. Not a hard cap — a band is always at
-#: least ``4·halo`` rows tall, because a band shorter than its own halo would
-#: recompute more halo than payload.
+#: Window size (in taps) at or above which the median reduces along a
+#: transposed, contiguous axis. See :meth:`_Pass._compute_rank` for the numbers;
+#: 25 is r=2, the largest default radius, and 9 (r=1) stays on the direct path.
+_MEDIAN_TRANSPOSE_TAPS: int = 25
+
+#: Target working-set size for one row band on the CPU. Not a hard cap — a band
+#: is always at least ``4·halo`` rows tall, because a band shorter than its own
+#: halo would recompute more halo than payload.
 BAND_BYTES: int = 256 << 20
+
+#: Ceiling for one band on an accelerator. Every band re-featurises ``halo`` rows
+#: above and below itself, so at 4096² a 256 MB band means 22 bands and **36%**
+#: of the work is halo; a 1 GiB band means 6 bands and 11%. Measured, CUDA,
+#: featurise+head over a 4096² frame: 1366 ms at 184 rows/band, **1012 ms** at
+#: 768.
+#:
+#: It is a ceiling and not a target because overshooting is far worse than
+#: undershooting: the same sweep at 1536 rows/band took **12.8 s** and at one
+#: band 26.7 s, thrashing the allocator against a 12.9 GB card. So the budget is
+#: also clamped to a fraction of *free* device memory rather than assumed.
+GPU_BAND_BYTES: int = 1 << 30
+
+#: Fraction of free device memory a single band may claim. A band's peak is
+#: several times the figure `band_rows_for` estimates (autograd-free, but torch's
+#: caching allocator holds freed blocks), and the cliff above is steep.
+_GPU_FREE_FRACTION: float = 0.25
 
 #: Robust per-frame statistics are estimated from at most this many pixels.
 #: ``np.percentile`` on a 4096² frame is a full sort (~1.5 s here) and would
@@ -652,6 +674,23 @@ class _Pass:
         4x the unfold. And the unfold is *shared* with the median, which needs the
         window materialised regardless, so the whole rank family costs one pass:
         170 ms → 27 ms for the default two radii.
+
+        **The median reduces along the CONTIGUOUS axis**, which is not a
+        micro-optimisation — it is over half the cost of the whole feature stack.
+        ``unfold`` returns ``(1, k*k, h*w)``, so ``median(dim=1)`` reduces along
+        the *strided* axis and every one of the k² reads is a stride of h·w
+        floats. Transposing to ``(1, h*w, k*k)`` first makes each window's taps
+        adjacent. Measured on a 768x4096 band, CUDA, r=2::
+
+            u.median(dim=1)                        52.2 ms
+            u.transpose(1, 2).contiguous()          3.7 ms
+                    then .median(dim=2)            19.6 ms   -> 23.4 ms total
+
+        Bit-identical — for an odd window the median is a *selection*, so any
+        correct algorithm returns the same element, and a test pins it against
+        ``scipy.ndimage.median_filter``. Only worth the extra copy for the larger
+        windows: at r=1 the transposed form measured 19.0 ms against 20.4 ms, so
+        the copy is skipped there and the memory is not spent.
         """
         import torch.nn.functional as F
         spec = self.spec
@@ -660,7 +699,11 @@ class _Pass:
                      kernel_size=(k, k))                          # (1, k*k, h*w)
         shape = (1, 1, self.h, self.w)
         if spec.median:
-            self._rank[(radius, "median")] = u.median(dim=1).values.view(shape)
+            if k * k >= _MEDIAN_TRANSPOSE_TAPS:
+                med = u.transpose(1, 2).contiguous().median(dim=2).values
+            else:
+                med = u.median(dim=1).values
+            self._rank[(radius, "median")] = med.view(shape)
         if spec.minimum:
             self._rank[(radius, "minimum")] = u.amin(dim=1).view(shape)
         if spec.maximum:
@@ -774,8 +817,35 @@ def _band_stack(image, spec: FeatureSpec, device):
 
 # ── banding ──────────────────────────────────────────────────────────────────
 
+def band_budget_bytes(device=None) -> int:
+    """Bytes one row band may occupy, for *device*.
+
+    CPU keeps :data:`BAND_BYTES`. An accelerator gets a bigger band, because the
+    halo it re-featurises is pure overhead and fewer bands means less of it — but
+    clamped to :data:`GPU_BAND_BYTES` and to a fraction of *free* device memory,
+    since overshooting is catastrophic rather than merely slower (see
+    :data:`GPU_BAND_BYTES`).
+    """
+    kind = getattr(device, "type", None) or (str(device) if device else "cpu")
+    if kind not in ("cuda", "mps"):
+        return BAND_BYTES
+    budget = GPU_BAND_BYTES
+    try:
+        torch = import_torch()
+        if kind == "cuda":
+            free, _total = torch.cuda.mem_get_info(device)
+            budget = min(budget, int(free * _GPU_FREE_FRACTION))
+    except Exception as exc:                              # pragma: no cover
+        # A driver that will not report free memory is not a reason to guess
+        # high — fall back to the CPU budget, which is known to fit anywhere.
+        log.debug("device memory probe failed (%s); using the CPU band budget",
+                  exc)
+        return BAND_BYTES
+    return max(BAND_BYTES, budget)
+
+
 def band_rows_for(spec: FeatureSpec, width: int,
-                  budget_bytes: int = BAND_BYTES) -> int:
+                  budget_bytes: int | None = None, *, device=None) -> int:
     """How many rows one band should cover, given the per-band memory budget.
 
     The working set is bigger than the output stack — the pass also holds one
@@ -783,12 +853,23 @@ def band_rows_for(spec: FeatureSpec, width: int,
     so the divisor counts those too rather than only ``n_channels``. Getting this
     wrong does not produce a wrong answer, only a larger peak allocation, but the
     plan's frame size leaves no headroom to be casual about it.
+
+    *budget_bytes* defaults to :func:`band_budget_bytes` for *device*, so the
+    same spec bands differently on a GPU than on the CPU. Pass it explicitly to
+    pin the banding regardless of hardware, which is what the banding tests do.
     """
+    if budget_bytes is None:
+        budget_bytes = band_budget_bytes(device)
     working = spec.n_channels + 4 * len(spec.sigmas) + 8
     if (spec.median or spec.minimum or spec.maximum) and spec.rank_radii:
         # One unfolded window is alive at a time (see `_Pass._compute_rank`), so
         # it is the LARGEST radius that sets the peak, not the sum over radii.
-        working += (2 * max(spec.rank_radii) + 1) ** 2
+        taps = (2 * max(spec.rank_radii) + 1) ** 2
+        # ...except that the median's transposed reduction holds a second copy
+        # of that window while it runs. Unaccounted for, the band would be sized
+        # to a peak it does not actually have.
+        working += taps * (2 if spec.median and taps >= _MEDIAN_TRANSPOSE_TAPS
+                           else 1)
     rows = int(max(1, budget_bytes // max(1, working * int(width) * 4)))
     return max(rows, 4 * spec.halo)
 
@@ -823,7 +904,7 @@ def map_feature_bands(
         device = select_device()
 
     halo = spec.halo
-    rows = int(band_rows or band_rows_for(spec, w))
+    rows = int(band_rows or band_rows_for(spec, w, device=device))
 
     with accelerator_lock(device):
         if rows >= h:

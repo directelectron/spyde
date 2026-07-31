@@ -295,9 +295,17 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
     const r = (d.report ?? {}) as Record<string, unknown>
     const acc = typeof r.train_accuracy === 'number' ? r.train_accuracy.toFixed(3) : '—'
     const dev = typeof r.device === 'string' ? ` · ${r.device}` : ''
+    // WHICH SPLIT ROUTE the training just selected, on the persistent line for
+    // the reason spelled out where `trainReport` is declared: the backend also
+    // says this in a status, and that status is overwritten by the re-preview
+    // milliseconds later, so as a status it is a report nobody reads. It earns
+    // the room because it is the difference between a 0.33 s and a 1.78 s split
+    // at 4096², the user is the one who decides it by painting, and nothing else
+    // on screen distinguishes the two.
+    const route = r.has_boundary ? ' · seam split' : ' · watershed split'
     setTrainReport(
       `Trained on ${r.n_pixels ?? '?'} px, ${r.n_classes ?? '?'} classes` +
-      ` · acc ${acc}${dev}`)
+      ` · acc ${acc}${dev}${route}`)
     setStatus('Trained — re-previewing the frame…')
   })
 
@@ -638,8 +646,16 @@ function ClassList({ classes, activeClass, onSelect }: {
           it), and a permanently disabled control is pure noise on a face this
           feature has just spent a redesign emptying out — it advertises
           something that cannot happen. Bring it back WITH the backend verb, not
-          before. The three default classes cover every case the engine
-          currently distinguishes. */}
+          before. The four default classes — particle, support film, vacuum and
+          boundary — cover every case the engine currently distinguishes.
+
+          `boundary` is the one worth knowing about: painting the JOINS between
+          touching particles lets the backend split them by connected components
+          and skip the distance transform and watershed entirely (measured 1.78 s
+          -> 0.33 s on a 4096 frame). Paint the seam between two bodies, never
+          the outline of one — a head taught outlines shrinks everything and
+          splits nothing. Leaving it unpainted is safe: the split falls back to
+          the watershed. */}
     </div>
   )
 }

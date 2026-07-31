@@ -662,18 +662,19 @@ class TestLabelStore:
         store = LabelStore(frame_shape=(8, 8))
         store.paint_disc(0, 4, 4, 2, 0)
         counts = store.counts()
-        assert set(counts) == {0, 1, 2}
-        assert counts[1] == counts[2] == 0
+        # 0 particle, 1 support film, 2 vacuum, 3 boundary.
+        assert set(counts) == {0, 1, 2, 3}
+        assert counts[1] == counts[2] == counts[3] == 0
         assert store.n_classes_used == 1
 
     def test_add_and_remove_classes(self):
         store = LabelStore(frame_shape=(8, 8))
         extra = store.add_class("beam stop", "#ff0000")
-        assert extra.id == 3 and store.class_by_id(3).name == "beam stop"
-        store.paint(0, [(1, 1)], 3)
+        assert extra.id == 4 and store.class_by_id(4).name == "beam stop"
+        store.paint(0, [(1, 1)], 4)
         store.paint(0, [(2, 2)], 0)
-        store.remove_class(3)
-        assert 3 not in store.class_ids
+        store.remove_class(4)
+        assert 4 not in store.class_ids
         assert len(store) == 1, "removing a class must drop its pixels too"
 
     def test_removing_the_only_labelled_class_drops_the_frame(self):
@@ -974,6 +975,160 @@ class TestTheClassicalBaselineMissesThem:
             "raising the classical sensitivity now finds both faint probes "
             "without flooding the frame — if that is a real improvement this "
             "test has served its purpose, but check deliberately")
+
+
+def paint_seam(store, geom, t: int = FRAME_T, width: int = 2):
+    """Add boundary strokes along the joins between touching particles.
+
+    The seam BETWEEN two bodies, never the outline of a lone one. That
+    distinction is the whole art of using this class and getting it wrong is
+    silent: a head taught particle outlines shrinks every body and splits
+    nothing, which measured as a MERGED touching pair and a 40% area loss on the
+    fixture's merge frame.
+    """
+    from scipy import ndimage as ndi
+
+    pos, radii, present, _faint, shape = geom
+    h, w = shape
+    yy, xx = np.mgrid[0:h, 0:w]
+    idx = list(np.flatnonzero(present))
+    grown = [ndi.binary_dilation(
+        ((yy - pos[i, 0]) ** 2 + (xx - pos[i, 1]) ** 2) <= radii[i] ** 2,
+        iterations=width) for i in idx]
+    seam = np.zeros((h, w), bool)
+    for a in range(len(grown)):
+        for b in range(a + 1, len(grown)):
+            seam |= grown[a] & grown[b]
+    if seam.any():
+        store.paint(t, seam, 3)
+    return store
+
+
+class TestBoundaryClass:
+    """The ilastik third class, and the route it unlocks.
+
+    It is a **performance** feature: a taught boundary lets ``split_instances``
+    skip the distance transform and the watershed — 1.78 s down to 0.33 s at
+    4096². So these check both that it is wired up and that turning it on
+    does not cost detection — a faster segmentation that finds fewer particles
+    is a regression, not an optimisation (plan §0.9).
+    """
+
+    def test_the_default_class_set_has_one(self):
+        classes = default_classes()
+        edge = [c for c in classes if c.boundary]
+        assert len(edge) == 1 and edge[0].name == "boundary"
+        assert not edge[0].particle, (
+            "a seam is not part of a body; counting it as foreground would glue "
+            "back together exactly the particles it separates")
+
+    def test_a_class_cannot_be_both_particle_and_boundary(self):
+        with pytest.raises(ValueError, match="both particle and boundary"):
+            ScribbleClass(0, "confused", particle=True, boundary=True)
+
+    def test_round_trips_through_a_dict(self):
+        c = ScribbleClass(3, "boundary", "#f38ba8", boundary=True)
+        assert ScribbleClass.from_dict(c.to_dict()) == c
+
+    def test_a_dict_from_before_the_class_existed_still_loads(self):
+        """A session or a saved model written by an older build has no
+        ``boundary`` key, and must come back as the particle/background-only
+        setup it was — not fail, and not silently become a boundary."""
+        old = {"id": 0, "name": "particle", "colour": "#f9a03f", "particle": True}
+        c = ScribbleClass.from_dict(old)
+        assert c.particle and not c.boundary
+
+    def test_untrained_boundary_reports_none(self, trained, movie):
+        """The default fixture paints no seam, so there is no boundary — and the
+        answer must be None rather than an all-zero map. The two mean different
+        things to the split: "use the watershed" versus "a boundary was taught
+        and this frame has none", which would leave every touching pair merged.
+        """
+        s, _gt = movie
+        assert not trained.has_boundary
+        assert trained.boundary_class_ids == []
+        fg, bnd = trained.predict_foreground_boundary(s.data[FRAME_T])
+        assert bnd is None
+        assert fg.shape == s.data[FRAME_T].shape
+
+    def test_a_trained_boundary_is_reported_and_predicted(self, movie, geom):
+        s, _gt = movie
+        store = paint_seam(paint_scribbles(geom), geom)
+        clf = ScribbleClassifier(FeatureSpec(), device=DEVICE, seed=0)
+        report = clf.fit(store, {FRAME_T: s.data[FRAME_T]})
+        assert report["has_boundary"] is True
+        assert clf.has_boundary and clf.boundary_class_ids == [3]
+        _fg, bnd = clf.predict_foreground_boundary(s.data[FRAME_T])
+        assert bnd is not None and bnd.shape == tuple(geom[4])
+        assert (bnd > 0.5).any(), "a trained boundary class predicted nothing"
+
+    def test_segment_takes_the_boundary_route_when_one_is_trained(
+            self, movie, geom, monkeypatch):
+        """The wizard calls ``segment``; this is what makes the fast route
+        automatic without the caret having to know about it."""
+        from skimage import segmentation as skseg
+
+        s, _gt = movie
+        store = paint_seam(paint_scribbles(geom), geom)
+        clf = ScribbleClassifier(FeatureSpec(), device=DEVICE, seed=0)
+        clf.fit(store, {FRAME_T: s.data[FRAME_T]})
+
+        called = []
+        monkeypatch.setattr(skseg, "watershed",
+                            lambda *a, **k: called.append("watershed"))
+        clf.segment(s.data[FRAME_T], SegmentParams(min_size=10))
+        assert called == [], "segment ran the watershed despite a trained boundary"
+
+    def test_segment_still_uses_the_watershed_without_one(self, trained, movie,
+                                                          monkeypatch):
+        """A user who never paints a boundary must not silently get worse
+        splitting — the fallback is the whole safety of making this automatic."""
+        from skimage import segmentation as skseg
+
+        s, _gt = movie
+        real = skseg.watershed
+        called = []
+        monkeypatch.setattr(skseg, "watershed", lambda *a, **k: (
+            called.append("watershed"), real(*a, **k))[1])
+        trained.segment(s.data[FRAME_T], SegmentParams(min_size=10))
+        assert called == ["watershed"]
+
+    def test_the_faint_probes_survive_the_boundary_route(self, movie, geom):
+        """**Plan §0.9 on the new path.** The boundary class exists to make the
+        split cheap; if it costs a faint detection it is not worth having."""
+        s, _gt = movie
+        pos, _radii, _present, faint, _shape = geom
+        store = paint_seam(paint_scribbles(geom), geom)
+        clf = ScribbleClassifier(FeatureSpec(), device=DEVICE, seed=0)
+        clf.fit(store, {FRAME_T: s.data[FRAME_T]})
+        labels = clf.segment(s.data[FRAME_T], SegmentParams(min_size=5))
+        missed = [int(i) for i in np.flatnonzero(faint)
+                  if not hit(labels, pos, i)]
+        assert not missed, f"the boundary route lost faint probe(s) {missed}"
+
+    def test_the_boundary_route_agrees_with_the_watershed_on_the_fixture(
+            self, movie, geom):
+        """Same classifier, both routes: the count and the median area must
+        agree, or the speed is not worth having."""
+        s, _gt = movie
+        store = paint_seam(paint_scribbles(geom), geom)
+        clf = ScribbleClassifier(FeatureSpec(), device=DEVICE, seed=0)
+        clf.fit(store, {FRAME_T: s.data[FRAME_T]})
+        p = SegmentParams(min_size=5)
+        fg, bnd = clf.predict_foreground_boundary(s.data[FRAME_T])
+        by_boundary = split_instances(fg, p, boundary=bnd)
+        by_watershed = split_instances(fg, p)
+
+        def areas(lab):
+            c = np.bincount(lab.ravel())[1:]
+            return np.sort(c[c > 0])
+
+        assert int(by_boundary.max()) == int(by_watershed.max()), (
+            f"boundary found {by_boundary.max()} particles, watershed "
+            f"{by_watershed.max()}")
+        a_b, a_w = areas(by_boundary), areas(by_watershed)
+        assert abs(np.median(a_b) - np.median(a_w)) / np.median(a_w) < 0.15, (
+            f"median area {np.median(a_b)} vs watershed {np.median(a_w)}")
 
 
 class TestSensitivityGate:
@@ -1592,6 +1747,31 @@ class TestDeviceLock:
         assert inside == [True]
         assert spy.devices == [trained.device]
         assert spy.depth == 0
+
+    @pytest.mark.parametrize("call", [
+        "predict_foreground_boundary", "predict_proba",
+        "predict_boundary_proba", "segment",
+    ])
+    def test_every_boundary_accessor_takes_the_lock(self, movie, trained, call,
+                                                    monkeypatch):
+        """The boundary route added three new public doors onto the device.
+
+        A lock only works if every participant takes it, and the last crash of
+        this class happened precisely because a newly added entry point reached
+        the device through an existing helper and nobody re-checked that the
+        helper's lock covered it. So all four doors are pinned, not just the one
+        the wizard happens to call today — and ONE acquisition each, because
+        reading two maps out of one softmax must not featurise twice.
+        """
+        from spyde.particles import scribble as scr
+
+        s, _gt = movie
+        spy = _LockSpy()
+        monkeypatch.setattr(scr, "accelerator_lock", spy)
+        getattr(trained, call)(s.data[FRAME_T])
+        assert spy.devices == [trained.device], (
+            f"{call} took {len(spy.devices)} acquisitions; expected exactly one")
+        assert spy.depth == 0, f"{call} leaked the lock"
 
     def test_save_and_load_take_the_lock(self, trained, tmp_path, monkeypatch):
         """Both move tensors across the host/device boundary, which is a

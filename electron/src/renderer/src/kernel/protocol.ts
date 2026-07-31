@@ -888,6 +888,11 @@ export interface SegClassInfo {
   colour: string
   /** Counts toward the foreground probability map (several classes may). */
   particle: boolean
+  /** Marks the SEAM between two touching particles (the ilastik third class).
+   *  Painting it lets the backend split by connected components and skip the
+   *  distance transform and watershed entirely. Mutually exclusive with
+   *  `particle` — the backend raises if a class claims both. */
+  boundary: boolean
   pixels: number
 }
 

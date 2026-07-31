@@ -20,6 +20,13 @@
  *      counts in the caret update — the counts are how a user notices an
  *      under-trained class, so a count stuck at 0 is a real failure. The class
  *      list is the SCRIBBLE tab's business and is not shown on Classical.
+ *   8. The BOUNDARY class is offered, is paintable, and painting it flips the
+ *      split route — the caret says `watershed split` before and `seam split`
+ *      after, which is the only thing on screen that distinguishes a 0.33 s
+ *      split from a 1.78 s one at 4096². Its hover text has to carry the
+ *      "paint the seam, not the outline" warning, because the intuitive reading
+ *      trains a head that MERGES touching particles (benchmarks.md) and nothing
+ *      else on screen says which reading is right.
  *
  * Real Dask + `load_test_data_particles` (lazy, 1 frame/chunk, ground truth
  * stamped into metadata) — the path a user actually drags.
@@ -391,6 +398,75 @@ test('Train fits the scribble classifier and the caret reports it', async () => 
   await page.getByTestId('segment-wizard').screenshot({ path: `${SHOTS}/12-scribble-advanced.png` })
   await setAdvanced(false)
   await page.getByTestId('segment-wizard').screenshot({ path: `${SHOTS}/13-scribble-collapsed.png` })
+
+  const errors = backendErrorLines(ctx.backend)
+  expect(errors, `backend errors:\n${errors.join('\n')}`).toEqual([])
+  ctx.assertNoJsErrors()
+})
+
+test('painting the boundary class flips the split to the seam route', async () => {
+  const { page } = ctx
+  await raiseSource()
+
+  // The previous test trained with no boundary painted, so the caret is sitting
+  // on the watershed route. That is the BEFORE half of this test — without it,
+  // asserting "seam split" afterwards would not prove anything flipped.
+  await expect(page.getByTestId('seg-trained-note')).toContainText('watershed split')
+  await page.getByTestId('segment-wizard').screenshot({
+    path: `${SHOTS}/14-before-boundary.png` })
+
+  // The boundary class is offered at all. It is the 4th default class and it is
+  // opt-in by construction: unpainted, the split falls back to the watershed.
+  const swatch = page.getByTestId('seg-strip-class-3')
+  await expect(swatch).toBeVisible()
+
+  // Its hover text must say WHICH boundary to paint. "Boundary" reads as "the
+  // outline of a particle" to almost everyone, and a head trained on outlines
+  // learns "shrink everything" — measured, it merged the touching pair and lost
+  // 40% of the median area while still reporting a trained boundary class and
+  // still taking the fast route. The wrong reading is worse than not painting at
+  // all AND it is silent, so this tooltip is the only guard there is.
+  const tip = await swatch.getAttribute('title')
+  expect(tip, `boundary swatch tooltip: ${tip}`).toMatch(/SEAM BETWEEN/)
+  expect(tip, 'the tooltip must warn against the outline reading').toMatch(/never the outline/)
+
+  await swatch.click()
+  await expect(page.getByTestId('seg-class-3')).toHaveAttribute('data-active', 'true')
+
+  // Paint a seam. Points are IMAGE PIXELS [[y, x], …] — plan trap 6.
+  const stroke = async (y: number, x0: number, x1: number) => {
+    await page.evaluate(({ id, y, x0, x1 }) => {
+      const points: number[][] = []
+      for (let x = x0; x <= x1; x += 1) points.push([y, x])
+      window.dispatchEvent(new CustomEvent('spyde:figure_event', {
+        detail: { figId: id, event: { type: 'brush_stroke', points } },
+      }))
+    }, { id: figId, y, x0, x1 })
+  }
+  await page.getByTestId('seg-strip-brush').fill('3')
+  await stroke(56, 34, 76)
+  await expect.poll(() => page.getByTestId('seg-class-pixels-3').textContent(), {
+    timeout: 30_000, message: 'painting the boundary class did not update its count',
+  }).not.toMatch(/^!?\s*0$/)
+
+  await page.getByTestId('seg-train').click()
+  // Assert on the PERSISTENT report line, not the status: the backend follows
+  // seg_trained with a re-preview whose status overwrites it milliseconds later.
+  await expect(page.getByTestId('seg-trained-note')).toContainText('seam split', {
+    timeout: 180_000 })
+
+  await page.getByTestId('segment-wizard').screenshot({
+    path: `${SHOTS}/15-seam-route.png` })
+  await page.getByTestId('seg-class-list').screenshot({
+    path: `${SHOTS}/15b-class-list-boundary.png` })
+  await page.screenshot({ path: `${SHOTS}/16-seam-route-full.png` })
+
+  // A boundary that was painted must still segment — the fast route returning
+  // nothing would be a "faster" result that found no particles.
+  await expect.poll(async () =>
+    Number(await page.getByTestId('seg-preview-stats').getAttribute('data-count')), {
+    timeout: 120_000, message: 'no preview after switching to the seam route',
+  }).toBeGreaterThan(0)
 
   const errors = backendErrorLines(ctx.backend)
   expect(errors, `backend errors:\n${errors.join('\n')}`).toEqual([])

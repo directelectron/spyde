@@ -37,6 +37,24 @@ interface Props {
   posStyle: React.CSSProperties
 }
 
+/** Hover text for one swatch.
+ *
+ *  The BOUNDARY class gets its own, and that is not politeness — it is the only
+ *  warning against a failure that is both intuitive and silent. "Boundary" reads
+ *  as "the outline of a particle" to almost everyone, and a head trained on
+ *  outlines learns "shrink everything": measured on the fixture's merge frame it
+ *  MERGED the touching pair and lost 40% of the median area, while still
+ *  reporting a trained boundary class and still taking the fast route. So the
+ *  wrong reading is worse than never painting it, and nothing else on screen
+ *  says which reading is right. See `benchmarks.md`. */
+function classTitle(c: SegClassInfo): string {
+  const px = `${c.pixels.toLocaleString()} px labelled`
+  if (!c.boundary) return `${c.name} — ${px}`
+  return `${c.name} — paint the SEAM BETWEEN two touching particles, `
+    + `never the outline of one. Splits them without a watershed, which is `
+    + `much faster on a large frame. Leaving it empty is safe. (${px})`
+}
+
 export function ClassStrip({
   classes, activeId, onSelect, brush, onBrush, eraser, onEraser, posStyle,
 }: Props) {
@@ -49,7 +67,7 @@ export function ClassStrip({
             key={c.id}
             data-testid={`seg-strip-class-${c.id}`}
             data-active={active ? 'true' : 'false'}
-            title={`${c.name} — ${c.pixels.toLocaleString()} px labelled`}
+            title={classTitle(c)}
             onClick={() => { onEraser(false); onSelect(c.id) }}
             style={{
               ...S.swatch,

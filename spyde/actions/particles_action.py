@@ -53,7 +53,10 @@ import numpy as np
 
 from spyde.actions.context import current_signal as _current_signal
 from spyde.actions.context import src_plot_tree as _src_plot_tree
-from spyde.actions.lifecycle import bump_generation, is_current, run_on_worker
+from spyde.actions.lifecycle import (
+    bump_generation, is_current, run_on_worker, window_computing,
+)
+from spyde.actions.particle_overlay import _navigator_selectors_for, _push_groups
 from spyde.actions.wizard import WizardController
 from spyde.backend.ipc import emit, emit_error, emit_progress, emit_status
 
@@ -212,6 +215,15 @@ class SegmentWizard(WizardController):
         #: frame the caret is showing — what ``commit()`` snapshots.
         self.preview: dict[str, Any] | None = None
         self.result_tree = None
+        #: The live preview outline group, and the navigator hooks that keep it
+        #: on the displayed frame. See :meth:`set_overlay` / :meth:`wire_navigator`.
+        self._ov_group = None
+        self._ov_box_group = None
+        self._ov_selectors: list = []
+        #: Latest frame the navigator asked for, and whether a preview for it is
+        #: already running — the latest-wins pair, see :func:`_preview_for_nav`.
+        self._nav_frame: int | None = None
+        self._nav_busy = False
 
     # ── the signal this wizard segments ──────────────────────────────────────
 
@@ -290,21 +302,148 @@ class SegmentWizard(WizardController):
         if self._closed:
             return
         self._closed = True
-        self.set_overlay(None)
+        self._unwire_navigator()
+        self._drop_overlay()
         if getattr(self.tree, "_seg_wizard", None) is self:
             self.tree._seg_wizard = None
 
-    def set_overlay(self, labels) -> None:
-        """Show (or clear) the previewed instances as a translucent mask on the
-        source plot. Client-side compositing — no image re-push."""
-        plot = self.src_plot
-        if plot is None or not hasattr(plot, "set_overlay_mask"):
+    def set_overlay(self, contours=None, box=None) -> None:
+        """Draw (or clear) the previewed instances as OUTLINES on the source plot.
+
+        Outlines and not a translucent raster mask, for two independent reasons —
+        the first is a bug, the second is why the bug could not just be patched:
+
+        * **A raster mask does not survive GPU tile mode.** A signal frame at or
+          above 1024 px is handed to anyplotlib's tiled display, whose base image
+          is drawn by WebGPU; ``set_overlay_mask`` composites onto the Canvas2D
+          context underneath it and is simply not visible. That is the whole
+          "106 particles and no overlay" report — the mask WAS being pushed
+          (``[plot] overlay mask set: N px`` in the log), it just never appeared.
+          Markers draw over the GPU base correctly, which is why the brush strokes
+          were visible in the same screenshot that had no overlay.
+        * **A full-resolution mask cannot follow the navigator.** At 4096² the
+          mask is 16.7 M px — ~16 MB down the PLOTAPP line protocol *per frame*.
+          This overlay re-draws on every navigator move, so the payload has to be
+          proportional to the number of PARTICLES, not to the number of pixels.
+          The same 106 particles are ~100 kB of polygon, and they stay crisp when
+          the user zooms in, which a mask rasterised at frame resolution does not.
+
+        *contours* are ``(k, 2)`` arrays of ``(y, x)`` **crop** pixels as
+        :func:`spyde.particles.measure_frame` returns them; *box* is the
+        ``(y0, x0, h, w)`` preview window they were measured in, or None when the
+        whole frame was segmented. The offset is applied here rather than by the
+        caller so that whatever ``_preview`` decided to crop stays in one place.
+        """
+        plot2d = getattr(self.src_plot, "_plot2d", None)
+        if plot2d is None:
             return
+        group = self._overlay_group(plot2d)
+        if group is None:
+            return
+        polys = _contour_polys(contours, box)
+        updates = {group: {"vertices_list": polys}}
+        # The preview window's own outline. Without it "only the middle of my
+        # 4k frame has any segmentation" reads as a BUG rather than as the
+        # documented 1-megapixel budget: the caret says "preview window
+        # 1024x1024 px" in small print, but it cannot say WHERE, and on a 4096²
+        # frame the window is 1/16 of the area sitting in the middle of an
+        # otherwise untouched image. Drawing the boundary makes the empty region
+        # obviously "not looked at yet" instead of "looked at and found
+        # nothing".
+        frame_group = self._window_group(plot2d)
+        if frame_group is not None:
+            updates[frame_group] = {"vertices_list": _box_poly(box)}
         try:
-            plot.set_overlay_mask(None if labels is None else (labels > 0),
-                                  color="#a6e3a1", alpha=0.35)
+            # `vertices_list` is the polygon group's own key — the same one
+            # `particle_overlay._payload` writes. A key the group does not know
+            # is accepted silently by `_push_groups` and simply never drawn.
+            _push_groups(plot2d, updates)
         except Exception as exc:
             log.debug("[seg] overlay push failed: %s", exc)
+
+    def _overlay_group(self, plot2d):
+        """The lazily-created polygon group the preview outlines live in."""
+        if self._ov_group is not None:
+            return self._ov_group
+        try:
+            self._ov_group = plot2d.add_polygons(
+                [], name="seg_preview_outline",
+                facecolors=_PREVIEW_COLOR, edgecolors=_PREVIEW_COLOR,
+                linewidths=_PREVIEW_WIDTH, alpha=_PREVIEW_ALPHA,
+                transform="data")
+        except Exception as exc:
+            log.debug("[seg] creating the preview overlay group failed: %s", exc)
+        return self._ov_group
+
+    def _window_group(self, plot2d):
+        """The lazily-created outline of the PREVIEW WINDOW (empty when whole)."""
+        if self._ov_box_group is not None:
+            return self._ov_box_group
+        try:
+            self._ov_box_group = plot2d.add_polygons(
+                [], name="seg_preview_window",
+                facecolors=None, edgecolors=_PREVIEW_WINDOW_COLOR,
+                linewidths=1.0, transform="data")
+        except Exception as exc:
+            log.debug("[seg] creating the preview-window outline failed: %s", exc)
+        return self._ov_box_group
+
+    def _drop_overlay(self) -> None:
+        for attr in ("_ov_group", "_ov_box_group"):
+            group = getattr(self, attr, None)
+            if group is None:
+                continue
+            try:
+                group.remove()
+            except Exception as exc:
+                log.debug("[seg] removing %s failed: %s", attr, exc)
+            setattr(self, attr, None)
+
+    # ── following the navigator ──────────────────────────────────────────────
+
+    def wire_navigator(self) -> None:
+        """Re-preview when the navigator moves, so the outlines follow the frame.
+
+        Nothing subscribed to the navigator before this: ``frame_index()`` only
+        READ the selector when something else asked for a preview, so scrolling
+        through a movie left the outlines describing whichever frame was showing
+        when you last touched the caret.
+        """
+        self._ov_selectors = _navigator_selectors_for(self.tree, self.src_plot)
+        for sel in self._ov_selectors:
+            if self._on_indices not in sel.index_hooks:
+                sel.index_hooks.append(self._on_indices)
+        if not self._ov_selectors:
+            log.debug("[seg] no navigator selectors — the preview will not "
+                      "follow the frame (a single image has none, which is fine)")
+
+    def _unwire_navigator(self) -> None:
+        for sel in self._ov_selectors:
+            if self._on_indices in sel.index_hooks:
+                sel.index_hooks.remove(self._on_indices)
+        self._ov_selectors = []
+
+    def _on_indices(self, indices) -> None:
+        """Navigation moved. **Runs on the ``_NavDispatcher`` thread.**
+
+        Does no figure work here and submits no compute here — both are the main
+        thread's business (CLAUDE.md's threading contract), so this only records
+        the frame and marshals.
+        """
+        if self._closed:
+            return
+        try:
+            frame = int(np.asarray(indices).ravel()[0])
+        except Exception:
+            return
+        if frame == self._nav_frame:
+            return
+        self._nav_frame = frame
+        dispatch = getattr(self.session, "_dispatch_to_main", None)
+        if dispatch is None:
+            _preview_for_nav(self)
+            return
+        dispatch(lambda: _preview_for_nav(self))
 
     def commit(self):
         """Snapshot the PREVIEWED frame as a committed label-image tree.
@@ -381,9 +520,15 @@ def _coerce(payload: dict | None) -> dict:
     return p
 
 
-def _segment_params(p: dict):
-    from spyde.particles import SegmentParams
-    return SegmentParams(
+def _segment_kwargs(p: dict) -> dict:
+    """The ``SegmentParams`` fields, as a plain dict.
+
+    A dict and not the dataclass because this crosses to dask workers inside
+    :class:`~spyde.particles.batch.EngineSpec`, and a spec that pickles without
+    dragging the segmentation modules onto the client's import path is one less
+    thing to go wrong in a worker with a different import order.
+    """
+    return dict(
         threshold=p["threshold"], sensitivity=p["sensitivity"],
         rb_kernel=int(p["rb_kernel"]), gaussian=float(p["gaussian"]),
         invert=bool(p["invert"]), local_size=int(p["local_size"]),
@@ -391,6 +536,60 @@ def _segment_params(p: dict):
         marker_smooth=float(p["marker_smooth"]), min_size=int(p["min_size"]),
         max_size=int(p["max_size"]), clear_border=bool(p["clear_border"]),
     )
+
+
+def _segment_params(p: dict):
+    from spyde.particles import SegmentParams
+    return SegmentParams(**_segment_kwargs(p))
+
+
+def _movie_array(signal):
+    """The ``(n, h, w)`` array behind *signal*, or None when there isn't one.
+
+    None is a legitimate answer (a frame source that is a callable or a
+    sequence), and :func:`~spyde.particles.batch.segment_movie` falls back to
+    the streaming accessor for it. Never touches the data itself — reading
+    ``.data`` on a lazy signal hands back the dask graph, not the movie.
+    """
+    data = getattr(signal, "data", None)
+    return data if getattr(data, "ndim", 0) == 3 else None
+
+
+#: How long the batch waits for the cluster before running locally. The cluster
+#: is built on a background thread, so a run fired seconds after a load can
+#: arrive first; falling straight through would silently cost the whole fan-out.
+_CLIENT_WAIT_S = 30.0
+
+
+def _batch_client(session, stopped=None):
+    """The distributed client for the batch, waiting briefly for it to come up.
+
+    Mirrors ``_do_compute_vectors``: we are already on a worker thread, so
+    blocking here doesn't freeze the UI, and the alternative — silently taking
+    the local thread-pool path — is exactly the "why is this slow" report this
+    work exists to fix. Returns None under ``SPYDE_NO_DASK=1`` (the migrated-test
+    mode, where the manager exists but never starts).
+    """
+    import os
+    if os.environ.get("SPYDE_NO_DASK") == "1":
+        return None
+    dm = getattr(session, "dask_manager", None)
+    if dm is None:
+        return None
+    client = getattr(dm, "client", None)
+    if client is not None:
+        return client
+    from spyde.compute_dispatch import reliable_sleep
+    deadline = time.monotonic() + _CLIENT_WAIT_S
+    while client is None and time.monotonic() < deadline:
+        if stopped is not None and stopped[0]:
+            return None
+        reliable_sleep(0.1)
+        client = getattr(dm, "client", None)
+    if client is None:
+        log.warning("[seg] no Dask client after %.0f s — segmenting locally",
+                    _CLIENT_WAIT_S)
+    return client
 
 
 def frames_of(signal):
@@ -541,6 +740,107 @@ def _preview_window(frame: np.ndarray) -> tuple[np.ndarray, tuple[int, int, int,
     return frame[y0:y0 + ch, x0:x0 + cw], (y0, x0, ch, cw)
 
 
+#: The live preview outline: a SATURATED green, filled at the same 25% the
+#: committed result overlay uses (``particle_overlay.FILL_ALPHA``) so tuning and
+#: result look like the same thing.
+#:
+#: Green because the particle brush class paints ORANGE and both are on screen
+#: at once while you scribble — "what I told it" and "what it found" have to be
+#: separable at a glance. Saturated rather than the retired mask's pale sage
+#: (``#a6e3a1``): that was chosen for a 35%-alpha area fill, and as a 1 px
+#: outline on grey EM data it is very close to invisible.
+_PREVIEW_COLOR = "#40e070"
+_PREVIEW_ALPHA = 0.25
+_PREVIEW_WIDTH = 1.0
+
+#: The preview WINDOW's outline. Deliberately a neutral light grey rather than
+#: any of the data colours: it is UI chrome saying "this is the region that was
+#: looked at", and must not be mistaken for a found particle (green) or for a
+#: painted class (orange / blue / grey / pink).
+_PREVIEW_WINDOW_COLOR = "#cdd6f4"
+
+
+def _box_poly(box) -> list:
+    """The preview window as a one-polygon list, or empty when there is none.
+
+    ``box`` is ``(y0, x0, h, w)``; markers want ``(x, y)``. An absent box means
+    the WHOLE frame was segmented, and then the outline must be cleared rather
+    than left showing the previous frame's window — the caret can switch between
+    cropped and whole (a small frame, or a changed budget) without closing.
+    """
+    if box is None:
+        return []
+    y0, x0, h, w = (float(v) for v in box)
+    return [np.array([[x0, y0], [x0 + w, y0], [x0 + w, y0 + h], [x0, y0 + h]],
+                     dtype=np.float32)]
+
+
+def _contour_polys(contours, box) -> list:
+    """``measure_frame`` contours → marker polygons, offset back onto the frame.
+
+    Two conversions, both of which are silent-wrong-picture bugs if skipped:
+
+    * **(y, x) → (x, y).** Contours are stored row-major like the array they came
+      from; marker offsets are ``(x, y)``. Getting this wrong transposes every
+      outline about the diagonal, which on a square frame still *looks* like
+      plausible particles (``particle_overlay.contour_xy`` is the same swap).
+    * **The crop offset.** A preview of a big frame is measured on a 1024² CROP
+      (``_preview_window``), so its contours start at ``(0, 0)`` of that window.
+      Drawn unshifted they pile up in the frame's corner instead of over the
+      region they describe — the same trap the mask path documented.
+    """
+    if contours is None:
+        return []
+    dy, dx = (float(box[0]), float(box[1])) if box is not None else (0.0, 0.0)
+    polys = []
+    for c in contours:
+        arr = np.asarray(c, dtype=np.float32)
+        if arr.ndim != 2 or len(arr) < 3:
+            continue                       # a polygon needs three vertices
+        polys.append(np.column_stack([arr[:, 1] + dx, arr[:, 0] + dy])
+                     .astype(np.float32))
+    return polys
+
+
+def _preview_for_nav(wiz: SegmentWizard) -> None:
+    """Re-preview because the navigator moved. LATEST FRAME WINS.
+
+    A 4096² preview is ~600 ms and a scroll emits an index change per step, so
+    firing one preview per step would queue dozens of them and paint the frames
+    out of order as they landed. Only ONE is ever in flight; a frame requested
+    while it runs replaces any other waiting frame and is fired when it lands.
+
+    This is Live-Display §2's latest-wins coalescing, not a queue and not a
+    self-pacing gate: ``_nav_busy`` is cleared by BOTH the success and the
+    failure path of the preview it guards, so a failing frame cannot wedge it.
+    """
+    if wiz._closed or wiz._nav_busy:
+        return                            # the in-flight one will re-fire
+    wiz._nav_busy = True
+    # `current_gen()`, NOT `guard()`. Scrolling is not a new interaction, and
+    # bumping the generation here cancels whatever the user actually started —
+    # a navigator move during `seg_train` made the trained classifier land on a
+    # stale generation and get dropped, so Train silently never finished.
+    _preview(wiz, wiz.current_gen())
+
+
+def _chase_nav(wiz: SegmentWizard) -> None:
+    """After a preview lands: if the navigator has moved on, go again.
+
+    Called only once the new ``wiz.preview`` is in place, because the comparison
+    is "is what we are now showing the frame that was last asked for" — run
+    before the assignment it would read the PREVIOUS frame and re-fire forever.
+    Releasing the gate is deliberately NOT done here (see the call sites): it has
+    to happen even when the result is superseded or failed, and this function
+    returns early in both cases.
+    """
+    if wiz._closed or wiz._nav_frame is None:
+        return
+    if (wiz.preview or {}).get("frame") == wiz._nav_frame:
+        return                # what just landed IS the newest frame — nothing to chase
+    _preview_for_nav(wiz)
+
+
 def _preview(wiz: SegmentWizard, gen: int) -> None:
     """Segment the displayed frame on a worker and paint the result.
 
@@ -567,6 +867,12 @@ def _preview(wiz: SegmentWizard, gen: int) -> None:
                 "box": box, "full_shape": full.shape}
 
     def _done(res):
+        # Release the navigator gate BEFORE the generation guard: a superseded or
+        # closed preview still has to hand the gate back, or the next navigator
+        # move finds `_nav_busy` set forever and the outlines stop following the
+        # frame. The retired self-pacing gates in Live-Display §2 wedged exactly
+        # like this.
+        wiz._nav_busy = False
         if not wiz.still(gen) or wiz._closed:
             return
         rows = res["rows"]
@@ -577,18 +883,10 @@ def _preview(wiz: SegmentWizard, gen: int) -> None:
                        "rows": rows, "contours": res["contours"],
                        "count": int(len(rows)), "areas": areas,
                        "box": res.get("box")}
-        # An overlay of a CROP cannot be painted onto the full frame as-is — it
-        # would land in the corner instead of over the region it describes. Place
-        # it back at its offset, leaving the rest unlabelled (which is honest:
-        # nothing was segmented out there).
-        labels = res["labels"]
-        box = res.get("box")
-        if box is not None:
-            y0, x0, ch, cw = box
-            placed = np.zeros(res["full_shape"][:2], labels.dtype)
-            placed[y0:y0 + ch, x0:x0 + cw] = labels
-            labels = placed
-        wiz.set_overlay(labels)
+        # The outlines carry the crop offset themselves (`_contour_polys`), so
+        # unlike the retired mask path nothing has to be re-rasterised onto a
+        # full-frame array first — at 4096² that array alone was 16 MB per frame.
+        wiz.set_overlay(res["contours"], res.get("box"))
         # The count reported is the count AFTER the size filter (plan §0.9b) —
         # `split_instances` applies min_size last, so `rows` is already filtered
         # and this number is the one the histogram below describes.
@@ -614,8 +912,10 @@ def _preview(wiz: SegmentWizard, gen: int) -> None:
                 f"Segment Particles: min size raised to {MIN_SIZE_FLOOR} px — "
                 "at 0 the split returns background speckle as particles "
                 "(measured: 33 instances where 9 are real).")
+        _chase_nav(wiz)
 
     def _fail(exc):
+        wiz._nav_busy = False              # never wedge the gate — see `_done`
         if wiz.still(gen):
             emit_error(f"Segment Particles preview failed: {exc}")
 
@@ -653,6 +953,10 @@ def seg_open(session, plot, payload) -> None:
     # synchronously, so the close's bump must be able to invalidate this open.
     gen = wiz.guard()
     tree._seg_wizard = wiz
+    # Follow the navigator from the moment the caret opens, not from the first
+    # Train: scrolling with the caret up should keep the outlines on the frame
+    # you are looking at whichever engine is selected.
+    wiz.wire_navigator()
     _emit_state(wiz)
     _preview(wiz, gen)
 
@@ -872,14 +1176,53 @@ def _sync_brush(wiz) -> None:
     brush = getattr(wiz.tree, "_seg_brush", None)
     if brush is None:
         return
+    state = (int(wiz.params.get("active_class", 0)),
+             float(wiz.params.get("brush", 3.0)),
+             bool(wiz.params.get("erase", False)))
+    if state == getattr(wiz, "_brush_state", None):
+        return
+    wiz._brush_state = state
     try:
-        brush.set(
-            class_id=int(wiz.params.get("active_class", 0)),
-            radius=float(wiz.params.get("brush", 3.0)),
-            erase=bool(wiz.params.get("erase", False)),
-        )
+        brush.set(class_id=state[0], radius=state[1], erase=state[2])
     except Exception as exc:
         log.debug("[seg] syncing brush state failed: %s", exc)
+        return
+    _force_widget_push(wiz)
+
+
+def _force_widget_push(wiz) -> None:
+    """Make the brush's new state AUTHORITATIVE in the panel JSON.
+
+    ``Widget.set`` reaches JS through ``Figure._push_widget``, which writes
+    ``event_json`` **only** — deliberately, because re-serialising a whole panel
+    per drag frame is the cost that path exists to avoid. The documented
+    consequence is that ``panel_<id>_json`` keeps stale widget state between
+    plot-level pushes, and the brush's *drawing* reads exactly that: JS takes
+    ``w.class_id`` from ``p.state.overlay_widgets`` at stroke start
+    (``figure_esm.js::_brushLiveBegin``) and paints in ``colors[class_id]``.
+
+    So a class switch that only goes through ``set()`` leaves every stroke
+    painting in the PREVIOUS class's colour — reported twice, as "I can only
+    scribble one colour" and then "support film still doesn't change the
+    painting colour". The strokes were landing in the right class the whole
+    time (the caret's per-class counts prove it); only the colour was stale,
+    which makes it look like nothing switched.
+
+    A full ``_push`` is the fix, and it is gated on the brush state having
+    actually CHANGED (``_sync_brush``'s ``_brush_state`` compare) because
+    ``seg_tune`` also fires for every sensitivity-slider tick — re-serialising a
+    4096² panel, image bytes and all, on each one would trade a colour bug for a
+    much worse drag. Painting itself still goes through the cheap targeted path
+    untouched; this costs one push per class/eraser/size click.
+    """
+    plot2d = getattr(wiz.src_plot, "_plot2d", None)
+    push = getattr(plot2d, "_push", None)
+    if push is None:
+        return
+    try:
+        push()
+    except Exception as exc:
+        log.debug("[seg] forcing the panel push failed: %s", exc)
 
 
 def _arm_brush(wiz) -> None:
@@ -1041,10 +1384,18 @@ def seg_train(session, plot, payload) -> None:
         wiz.classifier = clf
         wiz.params["method"] = "scribble"
         _emit(wiz, {"type": "seg_trained", "report": report})
+        # Say which split route the training just selected. A painted boundary
+        # class is what lets `split_instances` skip the distance transform and
+        # the watershed (1.78 s -> 0.33 s at 4096²), and the user is the one who
+        # decides it by painting — so it has to be visible that they did.
+        route = ("boundary class painted — touching particles split by "
+                 "connected components, no watershed"
+                 if report.get("has_boundary") else
+                 "no boundary painted — touching particles split by watershed")
         emit_status(
             f"Segment Particles: trained on {report['n_pixels']} px across "
             f"{report['n_classes']} classes "
-            f"(accuracy {report['train_accuracy']:.3f})")
+            f"(accuracy {report['train_accuracy']:.3f}); {route}")
         _emit_state(wiz)
         _preview(wiz, gen)
 
@@ -1152,6 +1503,19 @@ def seg_run(session, plot, payload) -> None:
         params=dict(p), title=f"Particles — {n_frames} frames", attach=False)
     wiz.result_tree = result
 
+    # RAISE THE "Calculating…" OVERLAY NOW — synchronously, the statement after
+    # the window exists and BEFORE any of the setup below.
+    #
+    # It used to be raised nowhere at all, and the natural place to add it (the
+    # worker, next to the first progress emission) is far too late: the window
+    # opens, then the placeholder store is built, the cancel flags registered,
+    # the generation bumped, the worker scheduled, the thread hop paid, and the
+    # first frame COMPUTED — on a 4096² frame that is seconds of a window that
+    # looks finished and empty. Every one of those steps is between the window
+    # appearing and the user learning it is working, which is the lag reported.
+    computing = window_computing(_result_window_id(result))
+    computing.start()
+
     result._seg_batch_running = True
     tree._seg_batch_running = True
 
@@ -1172,32 +1536,67 @@ def seg_run(session, plot, payload) -> None:
         _paint_count_trace(result, counts.copy())
 
     def _work():
-        per_frame: list[np.ndarray] = []
-        contours: list[list[np.ndarray]] = []
-        from spyde.particles import measure_frame
-        done = 0
-        for t_i in range(n_frames):
-            if stopped[0]:
-                break
-            frame = np.asarray(get_frame(t_i))
-            labels = engine(frame)
-            rows, cs = measure_frame(labels, frame, t=t_i, scale=scale)
-            per_frame.append(rows)
-            contours.append(cs)
-            counts[t_i] = float(len(rows))
-            done = t_i + 1
+        # The batch fans out over the cluster (spyde.particles.batch): one dask
+        # task per block of frames, dual-lane so the GPU workers run the torch
+        # head while the rest run the CPU path in parallel. It used to be a
+        # plain serial for-loop on this one thread — 90 minutes for 900 frames
+        # of 4096², with 47 cores and 78% of the GPU idle.
+        from spyde.particles.batch import (EngineSpec, drop_engine_model,
+                                           save_engine_model, segment_movie)
+        done = [0]
+        # Frames finished so far, indexed by frame so an out-of-order block
+        # lands in the right slot; the unfinished ones stay empty, which renders
+        # as "nothing found there yet" rather than as a shorter movie.
+        live_rows = [np.zeros((0, N_COLUMNS), np.float32)] * n_frames
+        live_contours: list = [[] for _ in range(n_frames)]
+        model_path = None
+        if p["method"] == "scribble":
+            # The trained head crosses to the workers as a FILE, never as a
+            # pickled CUDA tensor — see EngineSpec.
+            model_path = save_engine_model(wiz.classifier)
+        spec = EngineSpec(method=p["method"], params=_segment_kwargs(p),
+                          model_path=model_path)
+
+        def _on_frames(t0, t1, vals):
+            """One block landed. Runs on a dask/worker callback thread, so it
+            only touches `counts` and marshals the paint (CLAUDE.md threading)."""
+            for i, (rows, cs) in enumerate(vals):
+                counts[t0 + i] = float(len(rows))
+                # Keep the finished frames so the label movie can render them
+                # WHILE the rest compute. Blocks land out of order under the
+                # fan-out, so index by frame rather than appending.
+                live_rows[t0 + i] = rows
+                live_contours[t0 + i] = cs
+            done[0] += int(t1 - t0)
             now = time.monotonic()
             if now - last_paint[0] >= _PROGRESS_INTERVAL:
                 last_paint[0] = now
-                emit_progress(done, n_frames, "Segmenting")
+                emit_progress(done[0], n_frames, "Segmenting")
                 _to_main(session, _paint_counts)
-        # Frames never reached keep an empty block, so the CSR store always
-        # spans the movie and a cancelled run reads as "no particles after
-        # frame N" rather than a shorter movie.
-        while len(per_frame) < n_frames:
-            per_frame.append(np.zeros((0, N_COLUMNS), np.float32))
-            contours.append([])
-        return per_frame, contours, done
+                # The navigator's count trace shows that SOMETHING is happening;
+                # the signal shows whether it is happening CORRECTLY. That is
+                # the difference between abandoning a bad 900-frame run in the
+                # first ten seconds and after it finishes. Snapshot the lists —
+                # the callback thread keeps writing into them.
+                snap = (list(live_rows), list(live_contours), int(t1) - 1)
+                _to_main(session, lambda s=snap: _publish_partial(
+                    session, result, placeholder, s[0], s[1],
+                    p, scale, units, s[2]))
+
+        try:
+            # Frames never reached keep an empty block, so the CSR store always
+            # spans the movie and a cancelled run reads as "no particles after
+            # frame N" rather than a shorter movie — segment_movie guarantees
+            # both lists are n_frames long.
+            per_frame, contours, n_done = segment_movie(
+                _movie_array(source), spec, n_frames=n_frames,
+                get_frame=get_frame, scale=scale,
+                store_masks=bool(p["store_masks"]),
+                client=_batch_client(session, stopped), stopped=stopped,
+                on_frames=_on_frames)
+        finally:
+            drop_engine_model(model_path)
+        return per_frame, contours, n_done
 
     def _done(res):
         per_frame, contours, done = res
@@ -1207,12 +1606,12 @@ def seg_run(session, plot, payload) -> None:
             _finalize(session, result, placeholder, per_frame, contours,
                       p, scale, units, done, n_frames, cancelled=stopped[0])
         finally:
-            _teardown_batch(tree, result, stopped)
+            _teardown_batch(tree, result, stopped, computing)
 
     def _fail(exc):
         emit_error(f"Segment Particles failed: {exc}")
         log.exception("segmentation batch failed")
-        _teardown_batch(tree, result, stopped)
+        _teardown_batch(tree, result, stopped, computing)
 
     run_on_worker(session, _work, name="seg-batch", on_done=_done, on_error=_fail)
 
@@ -1237,7 +1636,17 @@ def _run_single_frame(session, wiz, get_frame, engine, scale) -> None:
                   on_error=lambda e: emit_error(f"Segment Particles failed: {e}"))
 
 
-def _teardown_batch(tree, result, stopped) -> None:
+def _teardown_batch(tree, result, stopped, computing=None) -> None:
+    # The Calculating chip comes down HERE, the one place every exit path goes
+    # through — success, failure and cancellation alike. Clearing it only on the
+    # success path is how an overlay ends up spinning forever over a window that
+    # stopped working, which is the failure `window_computing`'s pairing
+    # contract exists to prevent.
+    if computing is not None:
+        try:
+            computing.stop()
+        except Exception as exc:
+            log.debug("[seg] clearing the computing overlay failed: %s", exc)
     result._seg_batch_running = False
     tree._seg_batch_running = False
     for t_ in {id(tree): tree, id(result): result}.values():
@@ -1302,8 +1711,12 @@ def _finalize(session, result, placeholder, per_frame, contours, p,
 
     n = placeholder.n_particles
     if cancelled:
-        emit_status(f"Segmentation cancelled — found {n} particles in the "
-                    f"first {done} of {n_frames} frames")
+        # "{done} of {n_frames}", NOT "the first {done}": under the block
+        # fan-out the finished frames are not a contiguous prefix — blocks land
+        # out of order, so a cancelled run has holes rather than a clean cut.
+        # Saying "first" would misdescribe which frames actually have particles.
+        emit_status(f"Segmentation cancelled — found {n} particles in "
+                    f"{done} of {n_frames} frames")
     else:
         emit_status(f"Found {n} particles in {n_frames} frames")
 
@@ -1362,6 +1775,72 @@ def _to_main(session, fn) -> None:
         fn()
         return
     dispatch(fn)
+
+
+def _result_window_id(tree):
+    """The result tree's SIGNAL window — what the Calculating chip sits on.
+
+    The signal plot and not the navigator: the navigator fills in visibly as the
+    count trace grows, so it is self-evidently working; the signal plot is the
+    one that sits there looking empty and finished.
+    """
+    for plot in (getattr(tree, "signal_plots", None) or []):
+        wid = getattr(plot, "window_id", None)
+        if wid is not None:
+            return wid
+    return None
+
+
+def _publish_partial(session, result, placeholder, per_frame, contours,
+                     p, scale, units, t_latest: int) -> None:
+    """Adopt the frames finished SO FAR so the label movie renders them live.
+
+    Same three steps as :func:`_finalize`, minus the tracking and the attach:
+    build a store from what exists, adopt it into the placeholder the lazy label
+    movie closed over, and drop the stale cached dask array so the next slice
+    re-reads. Without the cache drop the movie keeps serving the zeros it
+    captured when the window first rendered, which is exactly the bug
+    ``_finalize`` documents.
+
+    Deliberately NOT attached to ``result.particles``: the particle toolbar is
+    ``requires_particles``-gated and must not unlock against a store that is
+    still filling — that is the attach gap the module docstring is about. This
+    only makes the movie SHOW the work.
+
+    Then paint the MOST RECENTLY COMPUTED frame, not whatever frame the
+    navigator happens to sit on — "show the newest result" is the whole point,
+    and on a 900-frame run the navigator is parked on frame 0 the entire time,
+    so painting its frame would show one image for twenty minutes.
+
+    Cheap enough to run on the feedback clock (a few times a second): the rows
+    are small float arrays and the rebuild is a concatenate, not a recompute.
+    """
+    from spyde.actions.lifecycle import paint_signal_plots
+    from spyde.signals.particles import SpyDEParticles
+
+    # EVERYTHING here is inside the guard, deliberately. This runs on the
+    # asyncio MAIN thread (marshalled from the batch's callback), so an
+    # exception does not merely lose one preview frame — it escapes into the
+    # event loop. A cosmetic live fill must never be able to damage the run it
+    # is describing, and the correct result is still produced by `_finalize`
+    # whatever happens here.
+    try:
+        if getattr(result, "_spyde_closed", False):
+            return                      # window torn down mid-run
+        partial = SpyDEParticles.from_frames(
+            per_frame, frame_shape=placeholder.frame_shape,
+            contours_per_frame=(contours if p["store_masks"] else None),
+            scale=scale, units=units, params=dict(p))
+        _adopt(placeholder, partial)
+        try:
+            result.root.cached_dask_array = None
+            result.root._clear_cache_dask_data()
+        except Exception as exc:
+            log.debug("[seg] clearing the cache for the live fill failed: %s", exc)
+        t = max(0, min(int(t_latest), placeholder.n_frames - 1))
+        paint_signal_plots(result, placeholder.render_frame(t, value="track"))
+    except Exception as exc:
+        log.debug("[seg] live label-movie fill failed: %s", exc)
 
 
 def _nav_plots(tree) -> list:
