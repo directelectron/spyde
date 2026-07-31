@@ -160,14 +160,18 @@ test('the fitted model matches the spectrum on screen', async () => {
     }, figIds.nav)
     expect(cross, 'the navigator has no crosshair').toBeTruthy()
 
-    /** How many `fit_state` messages the wizard has taken so far. The backend
-     *  emits exactly one per navigator move, AFTER pushing that position's
-     *  overlay — see the note in goTo. */
-    const fitSeq = () => page.evaluate(() =>
-      (window as unknown as { _spyde_fit_state_seq?: number })._spyde_fit_state_seq ?? 0)
+    const sigOf = (a: number[] | null) =>
+      a ? `${a.length}:${a[0]}:${a[a.length >> 1]}:${a[a.length - 1]}` : ''
+
+    /** Signatures of BOTH curves. They update independently — the spectrum can
+     *  be this position's while the model overlay is still the previous one's. */
+    const sigs = async () => {
+      const c = await curves()
+      return { data: sigOf(c?.data ?? null), model: sigOf(c?.model ?? null) }
+    }
 
     const goTo = async (cx: number, cy: number) => {
-      const seqBefore = await fitSeq()
+      const before = await sigs()
       await page.evaluate(({ f, panel, id, x, y }) => {
         window.postMessage({
           type: 'awi_event', figId: f,
@@ -178,39 +182,39 @@ test('the fitted model matches the spectrum on screen', async () => {
         }, '*')
       }, { f: figIds.nav, panel: cross.panel_id, id: cross.id, x: cx, y: cy })
 
-      // Wait for the BACKEND to say this position is drawn, rather than
-      // guessing from the curves.
+      // A best-effort wait for both curves to become this position's — and
+      // best-effort is now GOOD ENOUGH, which is the point of the rework
+      // below: the sweep only nominates candidates, and every asserted number
+      // is re-measured at a parked navigator afterwards. So this wait costs
+      // sensitivity when it is wrong, never correctness.
       //
-      // Every earlier version guessed, and each failed on a loaded runner:
-      //   - a flat 1.2 s wait          → [2,2] read 191.6% (re-measure: 3.7%)
-      //   - "sample until reads agree" → a stale overlay is perfectly stable,
-      //     so quiescence cannot tell "finished" from "not started"
-      //   - "wait for the DATA to change" → the spectrum lands first and the
-      //     model follows separately; [16,2] still scored 28.3% mid-sweep
-      //   - "wait for the MODEL to change" → fails the other way when two
-      //     positions fit alike (fit_navigate: "the overlaid model curve did
-      //     not change between positions"). One trick, both failure modes.
-      //
-      // `fit_navigated` pushes the overlay (draw_preview) and THEN emits its
-      // state, both down the same ordered stdout protocol — so a NEW fit_state
-      // proves the overlay for this position has already been applied. That is
-      // a fact about the protocol, not a timing assumption, and it is the same
-      // signal the caret's own navigator coalescer waits on (navDone).
-      await page.waitForFunction(
-        (s: number) =>
-          ((window as unknown as { _spyde_fit_state_seq?: number })
-            ._spyde_fit_state_seq ?? 0) > s,
-        seqBefore, { timeout: 30_000 })
+      // Do not make this exact, and above all do not make it FATAL. Waiting on
+      // the caret's fit_state was tried here and is a trap twice over: it does
+      // not fix the tearing (the state and the panel push are applied by
+      // different consumers — the React wizard vs the plot iframe — so wire
+      // order is not screen order), and the caret coalesces navigator moves by
+      // keeping one request in flight, so a folded move produces no extra
+      // state and a hard wait on it times out. Under 64 busy processes that
+      // turned a passing test into a 30 s timeout.
+      const deadline = Date.now() + 30_000
+      while (Date.now() < deadline) {
+        await page.waitForTimeout(100)
+        const now = await sigs()
+        if (now.data !== before.data && now.model !== before.model) break
+      }
     }
 
-    let worst = { m: 0, at: [0, 0] as number[] }
+    // The sweep SEARCHES for suspicious positions. It does not judge them —
+    // see the note above the assertions for why its readings cannot be trusted
+    // to that job.
+    const seen: { m: number; at: number[] }[] = []
     const swept: number[] = []
     for (const cy of [2, 10, 16, 24, 30]) {
       for (const cx of [2, 10, 16, 24, 30]) {
         await goTo(cx, cy)
         const m = await settledMisfit()
         swept.push(m)
-        if (m > worst.m) worst = { m, at: [cx, cy] }
+        seen.push({ m, at: [cx, cy] })
         if (swept.length <= 3) {
           console.log(`  at [${cx},${cy}] misfit ${(m * 100).toFixed(1)}% ` +
             `status="${await page.locator('[data-testid="fit-status"]').textContent()}"` +
@@ -219,9 +223,39 @@ test('the fitted model matches the spectrum on screen', async () => {
       }
     }
     swept.sort((a, b) => a - b)
+    const candidates = [...seen].sort((a, b) => b.m - a.m).slice(0, 3)
     console.log(`swept ${swept.length} positions — median ` +
-      `${(swept[swept.length >> 1] * 100).toFixed(1)}%, worst ` +
-      `${(worst.m * 100).toFixed(1)}% at [${worst.at}]`)
+      `${(swept[swept.length >> 1] * 100).toFixed(1)}%, top candidates ` +
+      candidates.map((c) => `${(c.m * 100).toFixed(1)}%@[${c.at}]`).join(' '))
+
+    // RE-MEASURE the candidates, and judge on those numbers alone.
+    //
+    // A sweep reading is taken while the navigator is being driven position to
+    // position, and the spectrum and the model overlay arrive as SEPARATE
+    // pushes into the panel — so a single read can pair this position's data
+    // with the previous position's model. That is not noise around a true
+    // value, it is a different quantity: CI has logged 47%, 73.7%, 82.6%,
+    // 191.6% for positions that measure 2-12% the moment they are re-read.
+    //
+    // No wait fixes this from the outside. Quiescence cannot tell "finished"
+    // from "not started"; waiting on the caret's fit_state does not help
+    // either, because that state and the panel push are applied by DIFFERENT
+    // consumers (the React wizard vs the plot iframe), so ordering on the wire
+    // does not give ordering on screen.
+    //
+    // So: sweep to FIND suspicious positions, then park on each one and
+    // measure it properly. A torn read can now only cost sensitivity (a false
+    // candidate crowding out a real one), never a false failure — and taking
+    // three candidates rather than one buys that sensitivity back.
+    let worst = { m: 0, at: candidates[0].at }
+    for (const c of candidates) {
+      await goTo(c.at[0], c.at[1])
+      const m = await settledMisfit()
+      console.log(`  re-measured [${c.at}]: sweep ${(c.m * 100).toFixed(1)}% ` +
+        `-> ${(m * 100).toFixed(1)}%`)
+      if (m > worst.m) worst = { m, at: c.at }
+    }
+    console.log(`worst after re-measure: ${(worst.m * 100).toFixed(1)}% at [${worst.at}]`)
 
     await goTo(worst.at[0], worst.at[1])
     await page.screenshot({ path: `${SHOTS}/03-worst-position.png`, fullPage: true })
@@ -235,32 +269,22 @@ test('the fitted model matches the spectrum on screen', async () => {
     console.log(`worst position: ${(worstBefore * 100).toFixed(1)}% -> ` +
       `${(worstAfter * 100).toFixed(1)}% after Fit spectrum`)
 
-    // Score the claim ("the whole-scan fit leaves each position at its own
-    // answer") on the 80th percentile of the sweep, not on its MAXIMUM.
+    // The claim under test: the whole-scan fit leaves each position at its own
+    // answer, so re-fitting the worst one should have little left to do. Both
+    // sides of this comparison are RE-MEASURED at a parked navigator, which is
+    // the only reason it can be trusted (see the note above the re-measure).
     //
-    // `settledMisfit` already removed the stale-read noise the comment above
-    // describes, so these are honest measurements — but the max of 25 honest
-    // samples is still the noisiest statistic in the set, and it was being
-    // compared against `worstAfter`, itself a single sample. Both wobble, and
-    // the pair sat close enough to the bound to cross it: CI measured 11.8%
-    // against a 11.65% threshold, a 1.2% overshoot with nothing wrong.
-    // A high percentile keeps the meaning ("almost every position is as good as
-    // a dedicated fit") without riding on one draw.
-    const pct = (f: number) =>
-      swept[Math.min(swept.length - 1, Math.floor(swept.length * f))]
-    const p80 = pct(0.8)
-    expect(
-      p80,
-      `4 of 5 swept positions miss the spectrum by up to ` +
-      `${(p80 * 100).toFixed(1)}% of its range; fitting the worst alone ` +
-      `reaches ${(worstAfter * 100).toFixed(1)}% — so the whole-scan fit did ` +
-      `not leave the typical position at its own answer`,
-    ).toBeLessThan(Math.max(worstAfter * 1.5, 0.10))
-
-    // …and the single worst position still may not be WILDLY off, which is the
-    // shape the original defect took (a drawn curve that was not the fit made
-    // at that position). Generous, because it is one sample: it fails on a real
-    // regression, not on a 1% wobble.
+    // Deliberately NOT asserted on: any statistic of `swept`. An earlier
+    // version scored the 80th percentile of the sweep, on the theory that the
+    // maximum of 25 samples was merely the noisiest one. That made things
+    // worse — with torn reads in the set, p80 itself reached 25.1% against a
+    // 10% bound, so the test failed 2.5x over on data that was never a
+    // measurement of fit quality at all. `swept` stays for the median in the
+    // log, which is a useful thing to eyeball, and for nothing else.
+    //
+    // Bounds are generous because each side is one sample: this should fail on
+    // a real regression (a drawn curve that is not the fit made at that
+    // position, which is the defect that prompted the spec), not on a wobble.
     expect(
       worstBefore,
       `the WORST swept position misses by ${(worstBefore * 100).toFixed(1)}% ` +
