@@ -55,7 +55,7 @@ def main():
 
     html = finalize_figure_html(fig, fig_id)      # re-finalize → embeds the heatmap
     out = os.path.join(HERE, "ipf_refine.html")
-    with open(out, "w") as fh:
+    with open(out, "w", encoding="utf-8") as fh:
         fh.write(html)
     print(f"phases={len(infos)} templates={len(corr)} corrmax={corr.max():.3f} -> {out}")
 
