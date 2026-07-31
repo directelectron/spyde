@@ -147,6 +147,14 @@ export function FitWizard({ caretPos, windowId, sendAction, onClose }: Props) {
     // Every backend edit ends in a `fit_state`, so this is the completion
     // signal the navigator coalescer waits on — see sendNavigated.
     navDone()
+    // TEST SEAM. `fit_navigated` pushes the model overlay (draw_preview) and
+    // THEN emits this state, both down the same ordered stdout protocol — so
+    // the arrival of a fit_state proves this position's overlay has already
+    // landed. That makes this counter the only sound "the curves are now this
+    // position's" signal available to e2e; everything else is a guess about
+    // quiescence, and a stale overlay is perfectly quiescent.
+    const w = window as unknown as { _spyde_fit_state_seq?: number }
+    w._spyde_fit_state_seq = (w._spyde_fit_state_seq ?? 0) + 1
     setCoverage({
       done: d.fitted_count ?? 0,
       total: d.nav_total ?? 0,
