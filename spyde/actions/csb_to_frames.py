@@ -9,8 +9,11 @@ integrated time planes in the first place.
 
 This action re-cuts that choice. Given an exposure — or the frame rate you want
 in fps, which is how it is usually thought about — it rebuilds the movie at
-that cadence as a **new node in the same signal tree**, lazily, one plane per
-dask block. From there it is an ordinary lazy in-situ signal: the navigator
+that cadence as **its own dataset** (``_add_signal`` → a new signal tree and
+its own navigator/signal window pair, not a node under the source), lazily, one
+plane per dask block. A different exposure is a different movie, not a
+transformation of the one on screen, and keeping the source open beside it is
+the point. From there it is an ordinary lazy in-situ signal: the navigator
 scrub, Play/Fast-Forward, virtual imaging, the movie editor and everything else
 work on it with no knowledge that it came from an event stream.
 
