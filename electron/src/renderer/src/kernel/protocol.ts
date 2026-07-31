@@ -379,6 +379,8 @@ export interface LogMessage extends MsgBase {
   type: 'log'
   level: unknown
   name: unknown
+  /** Subsystem tag from log_stream._area_for (e.g. 'navigator', 'dask'). */
+  area?: unknown
   msg: unknown
   time: unknown
 }

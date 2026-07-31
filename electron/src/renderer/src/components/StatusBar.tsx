@@ -17,9 +17,14 @@ export function StatusBar({ logOpen, onToggleLog }: {
   const { state, openStackDialog, tileWindowsRef } = useSpyDE()
   const hasWindows = Array.from(state.windows.values()).some(w => w.visible)
   // Badge unseen warnings/errors so problems are noticeable while the log is hidden.
-  const problems = state.logEntries.filter(
-    (e) => e.level === 'WARNING' || e.level === 'ERROR' || e.level === 'CRITICAL',
-  ).length
+  // Memoised: this bar re-renders on every context change (window moves, status
+  // text, dask ticks), and the scan is over the whole 1000-record log buffer.
+  const problems = React.useMemo(() => {
+    let n = 0
+    for (const e of state.logEntries)
+      if (e.level === 'WARNING' || e.level === 'ERROR' || e.level === 'CRITICAL') n++
+    return n
+  }, [state.logEntries])
 
   const busy = state.loading.busy
 
