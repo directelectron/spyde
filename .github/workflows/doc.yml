@@ -11,8 +11,14 @@ permissions:
   pages: write
   id-token: write
 
+# One lane PER REF, not one lane globally. A bare `pages` group makes every ref
+# share a single slot with cancel-in-progress, so any PR pushed while another
+# docs build is running CANCELS it — including builds on main. That reported as a
+# failed "Build" check on PRs that had nothing wrong with them, and it got worse
+# the more branches were in flight. Deploys are unaffected: they only run on main
+# (see the deploy step's `if`), which is still a single lane under this key.
 concurrency:
-  group: pages
+  group: pages-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
