@@ -189,6 +189,61 @@ class TestHarnessMixin:
             log.debug("set_signal_type on chunked lazy data failed: %s", e)
         self._add_signal(s, source_path="test_data_lazy_chunked")
 
+    def _load_test_data_5d(self, payload: dict | None = None) -> None:
+        """Test-only: LAZY **5-D** stack (time × real-space y,x × ky,kx) — the
+        TWO-navigator dataset (1-D time line driving a 2-D real-space image
+        driving the DP), which is what the recursive progressive navigator fill
+        exists for. No file, no download.
+
+        Storage-aligned per Live-Display §1: chunks span the WHOLE signal frame
+        and one time step, ``(1, 8, 8, ky, kx)`` — so the deep nav-sum has a
+        ``n_t × 3 × 3`` chunk grid and the fill paints ~54 progressive steps
+        instead of one per whole time slice.
+
+        The content makes a wrong/blank/stale navigator obvious at a glance
+        (same philosophy as ``load_test_data_movie``'s asymmetric frames):
+          * per-position brightness ramps with ``ix`` and a diagonal stripe runs
+            through real space, so the 2-D navigator has clear structure and a
+            transposed or half-filled image is visible;
+          * the stripe's PHASE shifts with ``t``, so the real-space navigator
+            changes SHAPE (not just brightness) when the time axis moves — a
+            per-frame auto-levelled display hides a pure scale change;
+          * each time step also scales by ``(t + 1)``, so the 1-D time navigator
+            is a strictly increasing ramp — a navigator derived from the wrong
+            axis (or one that never fills) is unmistakable.
+        """
+        import numpy as np
+        import dask.array as da
+        from spyde.backend.heavy_imports import ensure_heavy_imports
+        ensure_heavy_imports()   # see _load_test_data — don't race the prewarm
+        payload = payload or {}
+        nt = int(payload.get("frames", 6))
+        ny = int(payload.get("nav", 24))
+        nx = ny
+        ky = kx = int(payload.get("sig", 32))
+
+        yy, xx = np.mgrid[0:ky, 0:kx]
+        disk = ((xx - kx // 2) ** 2 + (yy - ky // 2) ** 2 <= 20).astype(np.float32)
+        iy_i, ix_i = np.mgrid[0:ny, 0:nx]
+        weights = np.empty((nt, ny, nx), dtype=np.float32)
+        for t in range(nt):
+            stripe = np.where((iy_i + ix_i + 3 * t) % 8 == 0, 30.0, 0.0)
+            weights[t] = (10.0 + 4.0 * ix_i + stripe) * (t + 1)
+        stack = weights[..., None, None] * disk
+        # A bright per-(iy, ix) pixel so every DP is distinguishable too.
+        ty, tx = iy_i % ky, ix_i % kx
+        for t in range(nt):
+            stack[t, iy_i, ix_i, ty, tx] += 200.0 * (t + 1)
+        arr = da.from_array(stack, chunks=(1, 8, 8, ky, kx))
+        s = hs.signals.Signal2D(arr).as_lazy()
+        try:
+            s.set_signal_type("electron_diffraction")
+        except Exception as e:
+            log.debug("set_signal_type on 5-D test data failed: %s", e)
+        tax = s.axes_manager.navigation_axes[-1]   # the SLOWEST nav axis = time
+        tax.name, tax.units, tax.scale = "time", "s", 1.0
+        self._add_signal(s, source_path="test_data_5d")
+
     def _load_test_data_si_grains(self) -> None:
         """Test-only: BUNDLED synthetic Si-grains 4-D STEM (pyxem.data.si_grains —
         6×6 nav × 128×128 signal, generated on the fly, NO download). Unlike the
