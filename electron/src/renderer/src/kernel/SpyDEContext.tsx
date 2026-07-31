@@ -73,6 +73,32 @@ export interface SpyDEFigure {
 }
 
 export type MetadataDict = Record<string, Record<string, string>>
+/** Static per-field config text (description / storage key / units), keyed
+ *  {group: {prop: …}} — see `MetadataMessage.info`. */
+export interface MetadataField {
+  description?: string
+  key?: string
+  units?: string
+  derived?: string
+}
+export type MetadataInfo = Record<string, Record<string, MetadataField>>
+/** Dask block layout of the displayed node — the dock's chunk viewer draws it.
+ *  `chunks[d]` is truncated to the first 128 entries; `counts[d]` is the real
+ *  number of blocks along that dimension. */
+export interface ChunkInfo {
+  shape: number[]
+  chunks: number[][]
+  counts: number[]
+  names: string[]
+  nav_ndim: number
+  dtype: string
+  itemsize: number
+  nbytes: number
+  chunk_bytes: number
+  n_chunks: number
+  /** A chunk does NOT hold whole signal frames — the navigator-killer. */
+  signal_split: boolean
+}
 export interface Composition { elements: string[]; percentages: Record<string, number> }
 export interface Histogram {
   counts: number[]
@@ -80,6 +106,9 @@ export interface Histogram {
   vmin: number
   vmax: number
   threshold?: number | null   // dotted marker line (Find-Vectors detector threshold)
+  dataMin?: number            // full data extent; the bins may cover less of it
+  dataMax?: number
+  clipped?: boolean           // bins are robust quantiles — end bins are overflow
 }
 
 /** One application-log record streamed from the Python backend. */
@@ -171,6 +200,11 @@ interface State {
   // inline editor pre-fills with. Sent as a sibling field on the same
   // `metadata` message (see protocol.ts).
   metadataEditable: Map<number, Record<string, Record<string, string>>>
+  // Static field descriptions for the dock's detail popover. One config-derived
+  // table for the whole app (not per window), so the last one received wins.
+  metadataInfo: MetadataInfo
+  // windowId → dask block layout, absent for eager data.
+  chunking: Map<number, ChunkInfo>
   histograms: Map<number, Histogram>
   selectors: Map<number, SelectorInfo>
   signalTrees: Map<number, TreeNode>
@@ -232,7 +266,9 @@ type Action =
   | { type: 'WINDOW_CLOSED'; windowId: number }
   | { type: 'WINDOW_COMPUTING'; windowId: number; computing: boolean }
   | { type: 'SET_ACTIVE'; windowId: number }
-  | { type: 'METADATA'; windowIds: number[]; metadata: MetadataDict; editable?: Record<string, Record<string, string>> }
+  | { type: 'METADATA'; windowIds: number[]; metadata: MetadataDict
+      editable?: Record<string, Record<string, string>>; info?: MetadataInfo
+      chunking?: ChunkInfo | null }
   | { type: 'COMPOSITION'; windowIds: number[]; composition: Composition }
   | { type: 'AXES'; windowIds: number[]; axes: AxisRow[] }
   | { type: 'ACTION_ACTIVE'; windowId: number; name: string; active: boolean }
@@ -407,6 +443,7 @@ function spydeReducer(state: State, action: Action): State {
         histograms: drop(state.histograms),
         metadata: drop(state.metadata),
         metadataEditable: drop(state.metadataEditable),
+        chunking: drop(state.chunking),
         axes: drop(state.axes),
         composition: drop(state.composition),
         signalTrees: drop(state.signalTrees),
@@ -425,11 +462,16 @@ function spydeReducer(state: State, action: Action): State {
     case 'METADATA': {
       const metadata = new Map(state.metadata)
       const metadataEditable = new Map(state.metadataEditable)
+      const chunking = new Map(state.chunking)
       for (const wid of action.windowIds) {
         metadata.set(wid, action.metadata)
         metadataEditable.set(wid, action.editable ?? {})
+        // Eager data sends null — drop any stale layout from a lazy ancestor.
+        if (action.chunking) chunking.set(wid, action.chunking)
+        else chunking.delete(wid)
       }
-      return { ...state, metadata, metadataEditable }
+      return { ...state, metadata, metadataEditable, chunking,
+               metadataInfo: action.info ?? state.metadataInfo }
     }
 
     case 'COMPOSITION': {
@@ -698,6 +740,8 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     report: null,
     metadata: new Map(),
     metadataEditable: new Map(),
+    metadataInfo: {},
+    chunking: new Map(),
     composition: new Map(),
     histograms: new Map(),
     selectors: new Map(),
@@ -1029,6 +1073,8 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
             windowIds: msg.window_ids ?? [],
             metadata: msg.metadata ?? {},
             editable: msg.editable,
+            info: msg.info,
+            chunking: msg.chunking,
           })
           break
 
@@ -1072,6 +1118,9 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
               vmin: msg.vmin,
               vmax: msg.vmax,
               threshold: msg.threshold ?? null,
+              dataMin: msg.data_min,
+              dataMax: msg.data_max,
+              clipped: msg.clipped ?? false,
             },
           })
           break

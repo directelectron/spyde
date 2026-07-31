@@ -103,6 +103,100 @@ def build_metadata_editable(signal_tree: "BaseSignalTree") -> dict[str, dict[str
     return editable
 
 
+#: Per dimension, the most chunk boundaries worth sending. A 1-frame-per-chunk
+#: movie has one entry per frame — thousands of numbers nobody can draw and
+#: nobody can read. The viewer draws the first ``_MAX_CHUNK_ENTRIES`` and says
+#: how many there really are.
+_MAX_CHUNK_ENTRIES = 128
+
+
+def build_chunk_info(signal_tree: "BaseSignalTree") -> dict | None:
+    """Describe the displayed node's dask chunking, or ``None`` if it is not lazy.
+
+    Structured numbers, NOT rendered HTML: dask's own ``_repr_html_`` is a
+    light-themed block of markup that would have to be restyled from the outside,
+    and it knows nothing about which axes are NAVIGATION and which are SIGNAL —
+    the distinction that decides whether this chunking is good or ruinous here (a
+    chunk that splits the signal axes makes every navigator frame read several
+    chunks; see the storage-alignment note in CLAUDE.md). So the backend sends
+    the facts and the dock draws them in its own palette, flagging that split.
+    """
+    sig = _displayed_signal(signal_tree)
+    data = getattr(sig, "data", None)
+    chunks = getattr(data, "chunks", None)
+    if data is None or chunks is None:
+        return None
+    try:
+        am = sig.axes_manager
+        # hyperspy stores navigation axes as the LEADING array dimensions.
+        nav_ndim = int(am.navigation_dimension)
+        itemsize = int(data.dtype.itemsize)
+        per_dim = [[int(c) for c in dim] for dim in chunks]
+        # The largest block the scheduler can hand out, which is the number that
+        # decides whether a single-frame read is cheap.
+        max_block = 1
+        for dim in per_dim:
+            max_block *= max(dim) if dim else 1
+        n_chunks = 1
+        for dim in per_dim:
+            n_chunks *= len(dim)
+        sig_dims = per_dim[nav_ndim:]
+        return {
+            "shape": [int(s) for s in data.shape],
+            "chunks": [d[:_MAX_CHUNK_ENTRIES] for d in per_dim],
+            "counts": [len(d) for d in per_dim],
+            "names": [_clean(getattr(ax, "name", "")) for ax in am._axes],
+            "nav_ndim": nav_ndim,
+            "dtype": str(data.dtype),
+            "itemsize": itemsize,
+            "nbytes": int(np.prod(data.shape)) * itemsize,
+            "chunk_bytes": int(max_block) * itemsize,
+            "n_chunks": int(n_chunks),
+            # THE thing worth knowing: does one chunk hold whole signal frames?
+            "signal_split": any(len(d) > 1 for d in sig_dims),
+        }
+    except Exception as e:
+        log.debug("building chunk info failed: %s", e)
+        return None
+
+
+def _displayed_signal(signal_tree: "BaseSignalTree"):
+    """The signal actually on screen for this tree (which may be a derived node),
+    falling back to the root."""
+    for p in getattr(signal_tree, "signal_plots", []) or []:
+        ps = getattr(p, "plot_state", None)
+        if ps is not None and getattr(ps, "current_signal", None) is not None:
+            return ps.current_signal
+    return signal_tree.root
+
+
+def build_metadata_info() -> dict[str, dict[str, dict[str, str]]]:
+    """Return ``{group: {prop: {description, key, units}}}`` — the STATIC part of
+    the config, for the dock's field-detail popover.
+
+    The sidebar only has room for a curated summary (a four-across instrument
+    row, three experiment fields), so every field also gets a detail box that
+    explains what it is and where it is stored. That text already exists as the
+    YAML ``description``; without it the popover could only repeat the number
+    the user is already looking at. Config-derived and signal-independent, so no
+    signal tree is needed to build it.
+    """
+    info: dict[str, dict[str, dict[str, str]]] = {}
+    for subsection, props in METADATA_WIDGET_CONFIG["metadata_widget"].items():
+        cells: dict[str, dict[str, str]] = {}
+        for prop, value in props.items():
+            cells[prop] = {
+                "description": str(value.get("description", "")),
+                # The stored path for a writable cell; an attr/function entry is
+                # derived, and says so instead of naming a path that isn't one.
+                "key": str(value.get("key", "")),
+                "units": str(value.get("units", "")),
+                "derived": "" if "key" in value else "yes",
+            }
+        info[subsection] = cells
+    return info
+
+
 def build_metadata_dict(signal_tree: "BaseSignalTree") -> dict[str, dict[str, str]]:
     """Return metadata for *signal_tree* as a nested plain dict."""
     subsections: dict[str, dict[str, str]] = {}
@@ -117,13 +211,7 @@ def build_metadata_dict(signal_tree: "BaseSignalTree") -> dict[str, dict[str, st
     # Dataset shape/dtype — surfaced here so the axes table doesn't need a size
     # column (the displayed signal node, which may differ from root).
     try:
-        sig = None
-        for p in getattr(signal_tree, "signal_plots", []) or []:
-            ps = getattr(p, "plot_state", None)
-            if ps is not None and getattr(ps, "current_signal", None) is not None:
-                sig = ps.current_signal
-                break
-        sig = sig if sig is not None else signal_tree.root
+        sig = _displayed_signal(signal_tree)
         am = sig.axes_manager
         nav = " × ".join(str(int(s)) for s in am.navigation_shape) or "—"
         sg = " × ".join(str(int(s)) for s in am.signal_shape) or "—"

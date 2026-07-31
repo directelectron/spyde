@@ -29,14 +29,18 @@ export function CompositionPanel({ activeId, composition, sendAction }: Props) {
     <div style={S.section} data-testid="composition-section">
       <div style={S.head}>
         <span style={S.label}>Composition</span>
+        {/* The empty state rides ON the header row rather than costing a line of
+            its own — it says nothing an inline note can't. */}
+        {elements.length === 0 && (
+          <span style={{ ...S.empty, flex: 1, marginLeft: 6 }}
+            data-testid="composition-empty">No elements set</span>
+        )}
         <button data-testid="composition-edit" style={S.editBtn} onClick={() => setOpen(true)}>
           {elements.length ? 'Edit' : '＋ Elements'}
         </button>
       </div>
 
-      {elements.length === 0 ? (
-        <div style={S.empty} data-testid="composition-empty">No elements set</div>
-      ) : (
+      {elements.length > 0 && (
         <div style={S.chips} data-testid="composition-chips">
           {elements.map(el => (
             <span key={el} style={S.chip} data-testid={`composition-chip-${el}`}>
@@ -60,16 +64,18 @@ export function CompositionPanel({ activeId, composition, sendAction }: Props) {
 }
 
 const S: Record<string, React.CSSProperties> = {
+  // Metrics track PlotControlDock's `section`/`label` — this panel renders inline
+  // among that dock's sections, so it has to compress with them.
   section: {
-    padding: '8px 10px', borderTop: '1px solid #1e1e2e',
+    padding: '6px 10px', borderTop: '1px solid #1e1e2e', flexShrink: 0,
   },
-  head: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 },
-  label: { fontSize: 11, color: '#a6adc8' },
+  head: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 },
+  label: { fontSize: 10, color: '#a6adc8' },
   editBtn: {
     background: 'none', border: '1px solid #313244', color: '#89b4fa', cursor: 'pointer',
-    fontSize: 10, fontWeight: 600, padding: '2px 8px', borderRadius: 6,
+    fontSize: 10, fontWeight: 600, padding: '1px 8px', borderRadius: 4,
   },
-  empty: { fontSize: 11, color: '#6c7086' },
+  empty: { fontSize: 10, color: '#6c7086' },
   chips: { display: 'flex', flexWrap: 'wrap', gap: 4 },
   chip: {
     display: 'flex', alignItems: 'center', gap: 3, background: '#1e1e2e',

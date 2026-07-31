@@ -12,6 +12,7 @@ import { WORKFLOW_NODE_DRAG_MIME } from '../kernel/dnd'
 import { COLORMAPS } from '../kernel/colormaps'
 import { useKeyedDebounce } from './wizardHooks'
 import { CompositionPanel } from './CompositionPanel'
+import { MetadataPanel } from './MetadataPanel'
 import { Dropdown } from './Dropdown'
 
 // Dropdown options are {value,label}; the colormap list is shared app-wide.
@@ -50,7 +51,7 @@ function TreeNodes({ nodes, depth, activeId, windowId, onPick }:
               style={{
                 display: 'flex', alignItems: 'center', gap: 6, width: '100%',
                 textAlign: 'left', border: 'none', cursor: 'pointer',
-                fontSize: 11, padding: '3px 6px', borderRadius: 5,
+                fontSize: 10, padding: '2px 6px', borderRadius: 4,
                 paddingLeft: 6 + depth * 12,
                 color: active ? '#cdd6f4' : '#a6adc8',
                 fontWeight: active ? 600 : 400,
@@ -202,31 +203,81 @@ function AxesTable({ axes, onEdit, offsetPick, onToggleOffsetPick }:
   )
 }
 
-function Histogram({ counts, edges, vmin, vmax, threshold, onClim }:
+/** Small dock button that tints on hover and again while held — inline styles
+ *  can't express :hover/:active, and the dock has no stylesheet, so the state is
+ *  local (the same idiom Pill.tsx uses). */
+function TintButton({ children, onClick, testid, title }: {
+  children: React.ReactNode
+  onClick: () => void
+  testid?: string
+  title?: string
+}) {
+  const [hover, setHover] = React.useState(false)
+  const [held, setHeld] = React.useState(false)
+  return (
+    <button
+      data-testid={testid}
+      title={title}
+      onClick={onClick}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => { setHover(false); setHeld(false) }}
+      onPointerDown={() => setHeld(true)}
+      onPointerUp={() => setHeld(false)}
+      style={{
+        ...styles.autoBtn,
+        background: held ? '#585b70' : hover ? '#313244' : '#1e1e2e',
+        borderColor: held || hover ? '#585b70' : '#313244',
+        color: held || hover ? '#cdd6f4' : '#a6adc8',
+      }}
+    >{children}</button>
+  )
+}
+
+function Histogram({ counts, edges, vmin, vmax, threshold, clipped, onClim, onAuto, onReset }:
   { counts: number[]; edges: number[]; vmin: number; vmax: number
     threshold?: number | null
-    onClim: (mn: number, mx: number) => void }) {
+    clipped?: boolean
+    onClim: (mn: number, mx: number) => void
+    onAuto: () => void
+    onReset: () => void }) {
   if (!counts.length) return null
   const max = Math.max(...counts) || 1
   const lo = edges[0], hi = edges[edges.length - 1]
   const dataSpan = hi - lo || 1
-  // Draw an axis that extends PAST the data max so the upper-contrast handle can
-  // be pulled above 100% (darkens the image). Headroom = 2× the data span beyond
-  // the data max; also stretch to cover a held vmax (e.g. a brighter frame in a
-  // 5-D series whose contrast was carried over). The bars only span [lo, hi].
+  // Draw a little axis PAST the binned range so the upper handle can be pulled
+  // above 100% (darkens the image). The bars only span [lo, hi].
+  //
+  // The headroom used to be 2× the data span, which cost two thirds of the
+  // widget. That was survivable when the bins covered min–max; now that the
+  // backend bins over robust quantiles (see Plot._hist_range) the drawn range is
+  // the range worth resolving, so the handles get essentially all of the width.
+  // Dragging is not limited by it either way — neither xOf nor vOf clamps.
+  //
+  // The axis deliberately does NOT stretch to cover an out-of-range vmax (after
+  // Reset, or a contrast held from a brighter frame): that stretch re-created
+  // the squish, since a vmax out at a hot-pixel value compresses every bar into
+  // the left edge. A handle beyond the axis pins at the border with the
+  // off-range arrow instead — visible, grabbable, and the bars keep the width.
   const axLo = lo
-  const axHi = Math.max(hi + 2 * dataSpan, vmax + 0.05 * dataSpan)
+  const axHi = hi + 0.25 * dataSpan
   const span = axHi - axLo || 1
-  const W = 276, H = 84
+  const W = 276, H = 62
   const bw = (dataSpan / span) * W / counts.length
-  // No right-edge clamp: dragging past the drawn area maps to values > data max.
+  // No clamping either side: dragging past the drawn area maps to values outside
+  // the binned range, which is the only way to reach a clipped tail.
   const xOf = (v: number) => ((v - axLo) / span) * W
-  const vOf = (x: number) => axLo + (Math.max(0, x) / W) * span
+  const vOf = (x: number) => axLo + (x / W) * span
   const fmt = (v: number) => (Math.abs(v) >= 1000 || (v !== 0 && Math.abs(v) < 0.01))
     ? v.toExponential(1) : v.toFixed(2)
 
   const svgRef = React.useRef<SVGSVGElement>(null)
   const [drag, setDrag] = React.useState<null | 'min' | 'max'>(null)
+  // The handles are a HOVER affordance: at rest the clim edges are just a hairline
+  // (the tinted range already shows where they are), and the grabbable pink bars
+  // fade in when the pointer is over the widget. Two fat pink bars parked over the
+  // data all the time read as part of the plot and hide the left-most bins.
+  const [hover, setHover] = React.useState(false)
+  const armed = hover || drag != null
 
   React.useEffect(() => {
     if (!drag) return
@@ -244,13 +295,36 @@ function Histogram({ counts, edges, vmin, vmax, threshold, onClim }:
   }, [drag, vmin, vmax, lo, span])
 
   const handle = (which: 'min' | 'max', v: number) => {
-    const x = xOf(v)
+    // PIN the handle inside the widget when its value falls outside the drawn
+    // range. Dragging is unclamped (that is how you reach a clipped tail), so
+    // without this a handle dragged past an edge is drawn off-canvas — invisible
+    // AND unreachable, with no way to drag it back. Pinned, it stays grabbable
+    // and the first inward drag brings the value back into range; the arrow says
+    // the real value is further out that way.
+    const raw = xOf(v)
+    const x = Math.min(Math.max(raw, 3), W - 3)
+    const off = raw < 0 ? -1 : raw > W ? 1 : 0
+    const mid = H / 2
     return (
       <g key={which}>
-        <line x1={x} y1={0} x2={x} y2={H} stroke="#f38ba8" strokeWidth={3} />
-        {/* grip caps so the thick lines read as draggable handles */}
-        <rect x={x - 3} y={0} width={6} height={5} rx={1.5} fill="#f38ba8" />
-        <rect x={x - 3} y={H - 5} width={6} height={5} rx={1.5} fill="#f38ba8" />
+        <line x1={x} y1={0} x2={x} y2={H} stroke="#f38ba8"
+          strokeWidth={armed ? 3 : 1} opacity={armed ? 1 : 0.5}
+          style={{ transition: 'stroke-width 90ms, opacity 90ms' }} />
+        {/* grip caps so the thick lines read as draggable handles — only once
+            hovered, since that is the only time they can be grabbed */}
+        {armed && <>
+          <rect x={x - 3} y={0} width={6} height={5} rx={1.5} fill="#f38ba8" />
+          <rect x={x - 3} y={H - 5} width={6} height={5} rx={1.5} fill="#f38ba8" />
+        </>}
+        {/* the off-range arrow is NOT part of the hover affordance: it says the
+            real value is outside the drawn range, which is worth showing at rest */}
+        {off !== 0 && (
+          <polygon data-testid={`hist-${which}-offscreen`}
+            points={off < 0
+              ? `${x - 3},${mid} ${x + 6},${mid - 5} ${x + 6},${mid + 5}`
+              : `${x + 3},${mid} ${x - 6},${mid - 5} ${x - 6},${mid + 5}`}
+            fill="#f38ba8" />
+        )}
         {/* fat invisible grab target */}
         <rect
           data-testid={`hist-${which}-handle`}
@@ -265,16 +339,30 @@ function Histogram({ counts, edges, vmin, vmax, threshold, onClim }:
   return (
     <div>
       <svg ref={svgRef} width={W} height={H} data-testid="histogram"
+        onPointerEnter={() => setHover(true)}
+        onPointerLeave={() => setHover(false)}
         style={{ background: '#1e1e2e', borderRadius: 4, touchAction: 'none', display: 'block' }}>
+        <title>Drag the handles to set contrast</title>
         {/* selected range tint */}
         <rect x={xOf(vmin)} y={0} width={Math.max(0, xOf(vmax) - xOf(vmin))} height={H}
           fill="#89b4fa" opacity={0.12} />
         {counts.map((c, i) => {
-          const h = (c / max) * (H - 4)
-          return <rect key={i} x={i * bw} y={H - h} width={Math.max(1, bw - 0.5)} height={h} fill="#89b4fa" />
+          // LOG-scaled bars. Counting electrons is Poisson, so a frame's
+          // occupancy falls off by orders of magnitude away from the background
+          // peak: on a linear axis the peak is one full-height bar and the entire
+          // useful tail — the diffraction spots you are setting contrast for —
+          // rounds to zero pixels. log1p keeps 0 at 0 and still separates a count
+          // of 1 from a count of 10.
+          const h = (Math.log1p(c) / Math.log1p(max)) * (H - 4)
+          // The end bins are overflow when the range is clipped: everything
+          // beyond the quantiles piled in. Shaded differently so a tall edge bar
+          // is not misread as a real population at that value.
+          const overflow = clipped && (i === 0 || i === counts.length - 1) && c > 0
+          return <rect key={i} x={i * bw} y={H - h} width={Math.max(1, bw - 0.5)}
+            height={h} fill={overflow ? '#585b70' : '#89b4fa'} />
         })}
-        {/* data-max marker: dragging the max handle to the RIGHT of this line
-            pushes the upper clim above the data range (image gets darker). */}
+        {/* end-of-bins marker: dragging the max handle to the RIGHT of this line
+            pushes the upper clim past the binned range (image gets darker). */}
         {xOf(hi) < W && (
           <line data-testid="hist-datamax" x1={xOf(hi)} y1={0} x2={xOf(hi)} y2={H}
             stroke="#585b70" strokeWidth={1} strokeDasharray="2 2" />
@@ -289,9 +377,18 @@ function Histogram({ counts, edges, vmin, vmax, threshold, onClim }:
         {handle('max', vmax)}
       </svg>
       {/* min / max display-range labels (replaces the old Scale section) */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 2 }}>
-        <span data-testid="clim-min" style={{ fontSize: 10, color: '#a6adc8' }}>{fmt(vmin)}</span>
-        <span data-testid="clim-max" style={{ fontSize: 10, color: '#a6adc8' }}>{fmt(vmax)}</span>
+      <div style={{ display: 'flex', justifyContent: 'space-between',
+        alignItems: 'center', marginTop: 2 }}>
+        <span data-testid="clim-min" style={{ fontSize: 9, color: '#a6adc8' }}>{fmt(vmin)}</span>
+        <span data-testid="clim-max" style={{ fontSize: 9, color: '#a6adc8' }}>{fmt(vmax)}</span>
+      </div>
+      {/* …and the two range buttons on their own row, sized/styled like the
+          Point / Integrate selector-mode pair so the dock reads as one system. */}
+      <div style={{ ...styles.toggleRow, marginTop: 3 }}>
+        <TintButton testid="clim-auto" onClick={onAuto}
+          title="Contrast from the robust levels for this frame (2–99%)">◐ Auto</TintButton>
+        <TintButton testid="clim-reset" onClick={onReset}
+          title="Show the full data range, tail included">↺ Reset</TintButton>
       </div>
     </div>
   )
@@ -502,12 +599,34 @@ export function PlotControlDock() {
     setClim({ min: mn, max: mx })
     if (activeId != null) sendAction('set_clim', { vmin: mn, vmax: mx }, activeId)
   }
+  // Auto: hand the range back to the backend, which re-derives it from the frame
+  // currently on screen and re-emits the histogram. Drop the local override up
+  // front so the handles follow that answer rather than sticking where the user
+  // last dragged them (the histogram effect above would clear it anyway; doing it
+  // here means the handles don't sit stale for the round trip).
+  const onAuto = () => {
+    setClim(null)
+    if (activeId != null) sendAction('auto_clim', { mode: 'robust' }, activeId)
+  }
+  // Reset: the OTHER thing you want when the contrast is unhelpful — show
+  // everything, tail included. Same round trip as Auto, so the histogram comes
+  // back binned over the full extent (nothing clipped) rather than leaving the
+  // handles pinned outside a robust view of it.
+  const onReset = () => {
+    setClim(null)
+    if (activeId != null) sendAction('auto_clim', { mode: 'full' }, activeId)
+  }
 
   // Section order (per spec): Histogram, Colormap, Signal type, Metadata,
   // Axes (editable calibration), Scale (display range), Navigator Selector.
   return (
     <div data-testid="plot-control-dock" style={styles.dock}>
-      <div style={styles.header}>Plot Control{win ? ` — ${win.title}` : ''}</div>
+      <div style={styles.header} title={win?.title}>
+        Plot Control{win ? ` — ${win.title}` : ''}
+      </div>
+
+      {/* Single scroll region for every section — see `styles.body`. */}
+      <div style={styles.body} data-testid="dock-body">
 
       {win == null && navSelectors.length === 0 && (
         <div style={styles.empty} data-testid="dock-empty">No active plot</div>
@@ -519,28 +638,33 @@ export function PlotControlDock() {
           <div style={styles.label}>Histogram</div>
           {hist
             ? <Histogram counts={hist.counts} edges={hist.edges} vmin={vmin} vmax={vmax}
-                threshold={hist.threshold} onClim={onClim} />
+                threshold={hist.threshold} clipped={hist.clipped} onClim={onClim}
+                onAuto={onAuto} onReset={onReset} />
             : <div style={styles.empty} data-testid="histogram-empty">—</div>}
-          <div style={styles.hint}>drag the handles to set contrast</div>
         </div>
       )}
 
-      {/* 2. Colormap */}
+      {/* 2 + 3. Colormap and signal type (HyperSpy signal_type — re-casts the
+          signal class) share ONE row: two labelled dropdowns, each set once in a
+          while, that cost two full sections stacked. `signal-type-section` stays
+          a wrapper so the section-order test and anything targeting it hold. */}
       {win && (
         <div style={styles.section}>
-          <div style={styles.label}>Colormap</div>
-          <Dropdown testid="colormap-select" value={cmapSel}
-            options={CMAP_OPTS} onChange={onColormap} />
-        </div>
-      )}
-
-      {/* 3. Signal type (HyperSpy signal_type — re-casts the signal class) */}
-      {win && sigType && (
-        <div style={styles.section} data-testid="signal-type-section">
-          <div style={styles.label}>Signal type</div>
-          <Dropdown testid="signal-type-select" value={sigType.current}
-            options={sigType.options.map((t) => ({ value: t, label: sigTypeLabel(t) }))}
-            onChange={onSignalType} />
+          <div style={styles.row}>
+            <div style={styles.half}>
+              <div style={styles.label}>Colormap</div>
+              <Dropdown testid="colormap-select" value={cmapSel}
+                options={CMAP_OPTS} onChange={onColormap} />
+            </div>
+            {sigType && (
+              <div style={styles.half} data-testid="signal-type-section">
+                <div style={styles.label}>Signal type</div>
+                <Dropdown testid="signal-type-select" value={sigType.current}
+                  options={sigType.options.map((t) => ({ value: t, label: sigTypeLabel(t) }))}
+                  onChange={onSignalType} />
+              </div>
+            )}
+          </div>
         </div>
       )}
 
@@ -567,43 +691,12 @@ export function PlotControlDock() {
         />
       )}
 
-      {/* 4. Metadata — two columns to save vertical space. Cells the backend
-          flagged as writable (metaEditable[group]) click-to-edit exactly like
-          an axes-table cell; everything else (Dtype, Dim., the whole Dataset
-          section) stays plain text. */}
+      {/* 4. Metadata — a curated summary + a per-field detail popover, and the
+          ONLY part of the dock that scrolls (see MetadataPanel's design note). */}
       {win && meta && (
-        <div style={{ ...styles.section, overflowY: 'auto' }} data-testid="metadata-panel">
-          {Object.entries(meta).map(([group, fields]) => {
-            const rawByProp = metaEditable?.[group]
-            return (
-              <div key={group} style={{ marginBottom: 8 }}>
-                <div style={{ ...styles.label, fontWeight: 600, marginBottom: 4 }}>{group}</div>
-                <div style={styles.metaGrid}>
-                  {Object.entries(fields).map(([k, v]) => {
-                    // value/display split (same as the axes table's rounded
-                    // scale/offset): the cell DISPLAYS the formatted string
-                    // with units ("12000.5 x") but the editor pre-fills the
-                    // RAW unit-free value ("12000.5") — committing the
-                    // display string back would fail the backend's float().
-                    const raw = rawByProp?.[k]
-                    return (
-                      <div key={k} style={styles.metaCell}>
-                        <span style={styles.metaKey}>{k}</span>
-                        <EditableCell
-                          testid={`meta-${group}-${k}`}
-                          value={raw ?? ''}
-                          display={v}
-                          editable={raw !== undefined}
-                          onCommit={(next) => onMetadataEdit(group, k, next)}
-                        />
-                      </div>
-                    )
-                  })}
-                </div>
-              </div>
-            )
-          })}
-        </div>
+        <MetadataPanel meta={meta} editable={metaEditable ?? {}}
+          info={state.metadataInfo} onEdit={onMetadataEdit}
+          chunking={activeId != null ? state.chunking.get(activeId) : undefined} />
       )}
 
       {/* 5. Axes (editable calibration table — written back to the dataset) */}
@@ -649,6 +742,7 @@ export function PlotControlDock() {
           ))}
         </div>
       )}
+      </div>
     </div>
   )
 }
@@ -663,61 +757,69 @@ const styles: Record<string, React.CSSProperties> = {
     color: '#cdd6f4',
   },
   header: {
-    padding: '10px 12px', fontSize: 13, fontWeight: 600,
-    borderBottom: '1px solid #313244', color: '#cdd6f4',
+    padding: '6px 10px', fontSize: 12, fontWeight: 600,
+    borderBottom: '1px solid #313244', color: '#cdd6f4', flexShrink: 0,
+    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
   },
-  empty: { padding: 16, fontSize: 12, color: '#6c7086' },
+  // The controls below the header are PINNED (every `section` is flexShrink:0):
+  // the metadata panel is the one elastic child, so it absorbs the height and is
+  // the only thing that scrolls. Without that the dock was a fixed-height column
+  // whose bottom sections (Layers, Navigator Selector) were cut off unreachably
+  // on a laptop screen. `overflowY` here is the last resort for a window too
+  // short even for the pinned controls plus the panel's minimum.
+  body: { flex: 1, minHeight: 0, overflowY: 'auto', display: 'flex',
+          flexDirection: 'column' },
+  empty: { padding: 12, fontSize: 11, color: '#6c7086' },
   section: {
-    padding: '10px 12px',
+    padding: '6px 10px', flexShrink: 0,
     borderBottom: '1px solid #1e1e2e',
-    display: 'flex', flexDirection: 'column', gap: 6,
+    display: 'flex', flexDirection: 'column', gap: 4,
   },
-  label: { fontSize: 11, color: '#a6adc8' },
+  label: { fontSize: 10, color: '#a6adc8' },
   select: {
     background: '#1e1e2e', color: '#cdd6f4',
-    border: '1px solid #313244', borderRadius: 4, padding: '4px 6px',
-    fontSize: 12,
+    border: '1px solid #313244', borderRadius: 4, padding: '2px 6px',
+    fontSize: 11,
   },
-  row: { display: 'flex', gap: 6 },
+  row: { display: 'flex', gap: 4 },
+  // One of two equal columns in a shared section row. minWidth:0 so a long
+  // dropdown value (signal types are wordy) truncates instead of pushing its
+  // neighbour out of the dock.
+  half: { flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 4 },
   input: {
     flex: 1, minWidth: 0,
     background: '#1e1e2e', color: '#cdd6f4',
-    border: '1px solid #313244', borderRadius: 4, padding: '4px 6px',
-    fontSize: 12,
+    border: '1px solid #313244', borderRadius: 4, padding: '2px 6px',
+    fontSize: 11,
   },
   btn: {
     background: '#313244', color: '#cdd6f4', border: 'none',
     borderRadius: 4, padding: '4px 10px', fontSize: 12, cursor: 'pointer',
     alignSelf: 'flex-start',
   },
-  metaRow: {
-    display: 'flex', justifyContent: 'space-between', gap: 8,
-    fontSize: 11, padding: '1px 0',
+  hint: { fontSize: 10, color: '#6c7086', marginTop: 2 },
+  // ONE metric for every paired button in the dock (Auto/Reset, Point/Integrate):
+  // same height, same radius, same type size, so the rows line up and none of
+  // them costs more vertical space than it has to on a laptop screen.
+  autoBtn: {
+    flex: 1, background: '#1e1e2e', color: '#a6adc8',
+    border: '1px solid #313244', borderRadius: 4, padding: '2px 6px',
+    fontSize: 10, lineHeight: '15px', cursor: 'pointer',
   },
-  // Two-column metadata grid: each cell is a compact key (tiny, top) + value.
-  metaGrid: {
-    display: 'grid', gridTemplateColumns: '1fr 1fr', columnGap: 10, rowGap: 3,
-  },
-  metaCell: { display: 'flex', flexDirection: 'column', minWidth: 0 },
-  metaKey: { color: '#6c7086', fontSize: 9, whiteSpace: 'nowrap',
-             overflow: 'hidden', textOverflow: 'ellipsis' },
-  metaVal: { color: '#cdd6f4', fontSize: 11, whiteSpace: 'nowrap',
-             overflow: 'hidden', textOverflow: 'ellipsis' },
-  hint: { fontSize: 10, color: '#6c7086', marginTop: 4 },
-  toggleRow: { display: 'flex', gap: 6, alignItems: 'center' },
+  toggleRow: { display: 'flex', gap: 4, alignItems: 'center' },
   selectorDot: {
-    width: 10, height: 10, borderRadius: '50%', flexShrink: 0,
+    width: 8, height: 8, borderRadius: '50%', flexShrink: 0,
     border: '1px solid rgba(0,0,0,0.4)',
   },
   toggle: {
     flex: 1, background: '#1e1e2e', color: '#a6adc8',
-    border: '1px solid #313244', borderRadius: 4, padding: '4px 6px',
-    fontSize: 11, cursor: 'pointer',
+    border: '1px solid #313244', borderRadius: 4, padding: '2px 6px',
+    fontSize: 10, lineHeight: '15px', cursor: 'pointer',
   },
   toggleActive: {
     flex: 1, background: '#89b4fa', color: '#11111b',
-    border: '1px solid #89b4fa', borderRadius: 4, padding: '4px 6px',
-    fontSize: 11, cursor: 'pointer', fontWeight: 600,
+    border: '1px solid #89b4fa', borderRadius: 4, padding: '2px 6px',
+    fontSize: 10, lineHeight: '15px', cursor: 'pointer', fontWeight: 600,
   },
   axTable: { width: '100%', borderCollapse: 'collapse', fontSize: 10 },
   axHeadRow: { color: '#6c7086' },
@@ -731,7 +833,11 @@ const styles: Record<string, React.CSSProperties> = {
     border: '1px solid #313244', borderRadius: 3, padding: '2px 3px',
     fontSize: 10,
   },
-  axCellRO: { color: '#6c7086' },
+  // Read-only twin of `axText`. It carried no fontSize, so every non-editable
+  // cell (Dtype, Shape, the axes units) inherited the 16px document default and
+  // rendered LARGER than its own key — the single biggest space waster in the
+  // dock, and enough to wrap "nav 6 × 6 · sig 128 × 128" onto a second line.
+  axCellRO: { color: '#6c7086', fontSize: 10 },
   axText: {
     display: 'block', minWidth: 0, padding: '2px 4px', borderRadius: 3,
     color: '#cdd6f4', fontSize: 10, cursor: 'text',
@@ -751,11 +857,11 @@ const styles: Record<string, React.CSSProperties> = {
     padding: 0, cursor: 'pointer', fontWeight: 700,
   },
   layerRow: {
-    display: 'flex', flexDirection: 'column', gap: 4,
-    padding: '6px 0', borderBottom: '1px solid #1e1e2e',
+    display: 'flex', flexDirection: 'column', gap: 3,
+    padding: '4px 0', borderBottom: '1px solid #1e1e2e',
   },
   layerTitle: {
-    flex: 1, fontSize: 11, color: '#cdd6f4', minWidth: 0,
+    flex: 1, fontSize: 10, color: '#cdd6f4', minWidth: 0,
     overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
   },
   eyeOn: {

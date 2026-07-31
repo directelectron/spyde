@@ -247,6 +247,10 @@ class Plot:
         # diffraction pattern's brightness doesn't rescale (flash) on every move —
         # contrast only re-computes on an explicit auto-level (new data / request).
         self._last_levels: tuple[float, float] | None = None
+        # Whatever the last histogram said about the Find-Vectors threshold
+        # marker, so re-emitting one (auto_clim) reproduces the CURRENT marker
+        # state instead of silently dropping the line.
+        self._last_threshold: float | None = None
         self.current_data: np.ndarray | object | None = None
 
         # PlotState management
@@ -991,7 +995,22 @@ class Plot:
                 finite = sub[np.isfinite(sub)]
             if finite.size == 0:
                 return
-            counts, edges = np.histogram(finite, bins=64)
+            # Bin over the ROBUST band, NOT the display range currently set. The
+            # histogram describes the FRAME; the handles describe the contrast on
+            # top of it. Deriving the bins from the live clim instead made the
+            # bars jump every time the range changed — Reset (min–max) re-binned
+            # over the whole tail and squashed them back into the left sliver
+            # this binning exists to prevent. Stable bins mean Reset moves only
+            # the handles, which is all it is asking for.
+            band = (self._robust_levels(data, signal=not self.is_navigator)
+                    if getattr(data, "ndim", 0) == 2 else (vmin, vmax))
+            lo, hi, clipped = self._hist_range(finite, *band)
+            # CLIP rather than restrict the range: np.histogram(range=…) DROPS
+            # out-of-range samples, which would silently hide the tail. Clipping
+            # piles it into the end bins instead — an overflow bin, still counted,
+            # just no longer able to own the axis.
+            counts, edges = np.histogram(np.clip(finite, lo, hi), bins=64,
+                                         range=(lo, hi))
             from spyde.backend.ipc import emit
             msg = {
                 "type": "histogram",
@@ -1000,15 +1019,98 @@ class Plot:
                 "edges": [float(e) for e in edges],
                 "vmin": float(vmin),
                 "vmax": float(vmax),
+                # Full extent, so the UI can still say what the data really spans
+                # and let the handles be dragged out to it.
+                "data_min": float(np.min(finite)),
+                "data_max": float(np.max(finite)),
+                "clipped": bool(clipped),
             }
             # threshold marker: None clears it (raw view), a value draws the line
             msg["threshold"] = None if threshold is None else float(threshold)
+            self._last_threshold = msg["threshold"]
             emit(msg)
             logger.debug("[plot] histogram emit window=%s vmin=%.3g vmax=%.3g "
-                         "threshold=%s n=%d", self.window_id, vmin, vmax,
+                         "bins=[%.3g,%.3g]%s threshold=%s n=%d", self.window_id,
+                         vmin, vmax, lo, hi, " clipped" if clipped else "",
                          msg["threshold"], int(finite.size))
         except Exception as e:
             logger.debug("histogram emit failed: %s", e)
+
+    #: Margin around the display range that the histogram bins over, as a
+    #: fraction of that range. Wider above than below: pulling the upper handle
+    #: PAST the data is how you darken an image, so that is the direction that
+    #: needs somewhere to go.
+    _HIST_MARGIN = (0.25, 0.5)
+
+    @classmethod
+    def _hist_range(cls, finite: np.ndarray, vmin: float, vmax: float) -> tuple:
+        """``(lo, hi, clipped)`` — the range to bin over, and whether it hides
+        part of the data.
+
+        Binned over the neighbourhood of the DISPLAY RANGE, not over min–max.
+        Counting electrons is a Poisson process, so an EM frame's maximum sits
+        far above its bulk — hot pixels, or a central beam one to two orders of
+        magnitude brighter than the diffraction spots. Spanning min–max then
+        spends the whole widget on that tail: every real count lands in the
+        leftmost bin or two and the contrast handles have a sliver to grab (the
+        reported symptom).
+
+        Quantiles were the obvious alternative and are worse: a central beam is
+        ~1% of a diffraction pattern's pixels, so even the 99.9th percentile
+        keeps it and the axis stays stretched. ``vmin``/``vmax`` come from
+        :meth:`_robust_levels`, which already decides what band is worth
+        looking at (2–99% for a signal, min–99.5% for a navigator) — so the
+        band, plus margin, is by construction the range the handles need to
+        work in. Anything outside is clipped into the end bins by the caller,
+        never dropped.
+        """
+        full_lo, full_hi = float(np.min(finite)), float(np.max(finite))
+        span = float(vmax) - float(vmin)
+        if not np.isfinite(span) or span <= 0:
+            lo, hi = full_lo, full_hi              # degenerate levels
+        else:
+            below, above = cls._HIST_MARGIN
+            lo = max(float(vmin) - below * span, full_lo)
+            hi = min(float(vmax) + above * span, full_hi)
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            lo, hi = full_lo, full_hi
+        if hi <= lo:            # every pixel identical — give the bins width
+            hi = lo + 1.0
+        return lo, hi, (full_lo < lo or full_hi > hi)
+
+    def auto_clim(self, mode: str = "robust") -> None:
+        """Recompute the display range from the frame ON SCREEN and repaint.
+
+        The dock's two range buttons. Needed because contrast is deliberately
+        HELD across navigator frames (see ``_set_array``) — so after scrubbing to
+        a much brighter or dimmer position, or after dragging the handles
+        somewhere unhelpful, there is otherwise no way back to sensible levels
+        short of reloading.
+
+        * ``robust`` (Auto) — the same percentile band a fresh frame gets.
+        * ``full`` (Reset) — the actual min–max, tail included.
+
+        Either way the histogram is re-emitted so the handles follow, but the
+        BINS do not move (see ``_emit_histogram``): after Reset the upper handle
+        simply sits past the binned range, pinned at the widget's edge with the
+        off-range arrow. The bars are a property of the frame and stay put.
+        """
+        data = self.current_data
+        if not isinstance(data, np.ndarray) or data.ndim != 2:
+            return          # 1-D / line plots have no display range
+        if mode == "full":
+            finite = data[np.isfinite(data)] if not np.issubdtype(data.dtype,
+                                                                  np.integer) else data
+            if finite.size == 0:
+                return
+            vmin, vmax = float(np.min(finite)), float(np.max(finite))
+            if vmax <= vmin:
+                vmax = vmin + 1.0
+        else:
+            vmin, vmax = self._robust_levels(data, signal=not self.is_navigator)
+        self.set_clim(vmin, vmax)
+        self.needs_auto_level = False
+        self._emit_histogram(data, vmin, vmax, threshold=self._last_threshold)
 
     @staticmethod
     def _robust_levels(img: np.ndarray, signal: bool = False) -> tuple:

@@ -35,12 +35,20 @@ class AxesEditorMixin:
         load/type-change). Shared so ``_set_metadata`` and any other mutator
         can trigger the same refresh instead of duplicating the emit."""
         try:
-            from spyde.metadata_extract import build_metadata_dict, build_metadata_editable
+            from spyde.metadata_extract import (
+                build_chunk_info, build_metadata_dict, build_metadata_editable,
+                build_metadata_info,
+            )
             ipc.emit({
                 "type": "metadata",
                 "window_ids": self._tree_window_ids(tree),
                 "metadata": build_metadata_dict(tree),
                 "editable": build_metadata_editable(tree),
+                # Static per-field description/key/units for the dock's detail
+                # popover — the summary shows only a curated subset of fields.
+                "info": build_metadata_info(),
+                # Dask block layout for the dock's chunk viewer (None if eager).
+                "chunking": build_chunk_info(tree),
             })
         except Exception as e:
             log.debug("metadata emit failed: %s", e)
