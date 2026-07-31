@@ -208,6 +208,37 @@ class TestProgressiveSignalPreview:
         assert preview.slice_fn(_nav_selector(tree), None, [[3, 0]]) is None
         preview.close()
 
+    def test_served_and_declined_reads_are_counted(self, window):
+        """The (b) counters the e2e spec asserts on.
+
+        A pixel signature cannot tell "the drag was answered" apart from "a
+        block landed just then" — both repaint the same plot — so the backend
+        counts navigator-driven reads itself and the spec reads that count.
+        """
+        session = window["window"]
+        tree = _result_tree(session)
+        store = LiveVectorFrames(sig_hw=(16, 16), kernel_radius_px=2)
+        preview = attach_signal_preview(session, tree, render=store.render,
+                                        nav_shape=(4, 5))
+        sel = _nav_selector(tree)
+        assert (preview.frames_served, preview.reads_declined) == (0, 0)
+
+        # Nothing computed yet → every read is declined, nothing served.
+        assert preview.slice_fn(sel, None, [[1, 2]]) is None
+        assert (preview.frames_served, preview.reads_declined) == (0, 1)
+
+        store.add((slice(2, 4), slice(0, 2)),
+                  _block(2, 2, 4, {(0, 1): [(6.0, 7.0, 4.0)]}))
+        preview.note_block((slice(2, 4), slice(0, 2)))
+
+        # Now the SAME position is answered from the computed region.
+        assert preview.slice_fn(sel, None, [[1, 2]]) is not None
+        assert preview.frames_served == 1
+        # A position outside the landed block is still declined.
+        assert preview.slice_fn(sel, None, [[3, 0]]) is None
+        assert (preview.frames_served, preview.reads_declined) == (1, 2)
+        preview.close()
+
     def test_block_paints_a_sample_frame(self, window):
         """(a) — a landing block puts a frame on the signal plot."""
         session = window["window"]

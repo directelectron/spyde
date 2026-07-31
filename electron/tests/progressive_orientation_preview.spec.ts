@@ -22,7 +22,7 @@ import { test, expect } from '@playwright/test'
 import { mkdirSync } from 'fs'
 import { join } from 'path'
 const {
-  launchApp, backendAction, waitForSubwindowCount, sigWindow,
+  launchApp, backendAction, waitForSubwindowCount, dragCrosshair,
 } = require('./_harness.cjs')
 
 const SHOTS = join(__dirname, '..', 'progressive_orientation_shots')
@@ -41,6 +41,28 @@ test.afterAll(async () => {
 })
 
 test.setTimeout(600_000)
+
+/** Checksum of one subwindow's figure canvases — "is this a different frame?" */
+async function figureSignature(win: any): Promise<number> {
+  const ifel = await win.locator('iframe').first().elementHandle()
+  if (!ifel) return -1
+  const frame = await ifel.contentFrame()
+  if (!frame) return -1
+  try {
+    return await frame.evaluate(() => {
+      let sum = 0
+      for (const c of Array.from(document.querySelectorAll('canvas')) as HTMLCanvasElement[]) {
+        const g = c.getContext('2d')
+        if (!g || !c.width || !c.height) continue
+        const d = g.getImageData(0, 0, c.width, c.height).data
+        for (let p = 0; p < d.length; p += 4) {
+          sum = (sum + (d[p] + d[p + 1] + d[p + 2]) * (1 + (p % 7))) % 2147483647
+        }
+      }
+      return sum
+    })
+  } catch { return -1 }
+}
 
 test('the IPF map fills in while the source DP stays navigable', async () => {
   const { page } = ctx
@@ -62,18 +84,34 @@ test('the IPF map fills in while the source DP stays navigable', async () => {
   const srcNav = page.getByTestId('subwindow')
     .filter({ has: page.getByTestId('window-breadcrumb').filter({ hasText: /^N-test/ }) })
     .first()
-  const navBox = await srcNav.locator('iframe').first().boundingBox()
-  expect(navBox).not.toBeNull()
-  for (let i = 0; i < 4; i++) {
-    const fx = 0.25 + 0.15 * i
-    await page.mouse.move(navBox!.x + navBox!.width * fx, navBox!.y + navBox!.height * 0.5)
-    await page.mouse.down()
-    await page.mouse.move(navBox!.x + navBox!.width * fx + 3,
-                          navBox!.y + navBox!.height * 0.5 + 3, { steps: 4 })
-    await page.mouse.up()
-    await page.waitForTimeout(1200)
-    await page.screenshot({ path: join(SHOTS, `${String(i + 2).padStart(2, '0')}-during-fill.png`) })
-  }
+  const srcSig = page.getByTestId('subwindow')
+    .filter({ has: page.getByTestId('window-breadcrumb').filter({ hasText: /^S-test/ }) })
+    .first()
+
+  const dpSigs: number[] = []
+  const walk = await dragCrosshair(page, srcNav, {
+    dx: -30, steps: 4, settleMs: 1200,
+    onStep: async (i: number) => {
+      dpSigs.push(await figureSignature(srcSig))
+      await page.screenshot({
+        path: join(SHOTS, `${String(i + 1).padStart(2, '0')}-during-fill.png`),
+      })
+    },
+  })
+  // eslint-disable-next-line no-console
+  console.log('source nav during OM fill: crosshair moved', walk.moved, 'px',
+              'DP signatures', JSON.stringify(dpSigs))
+
+  // The point of the change: the SOURCE window is navigable throughout the
+  // (minutes-long) match. Without the crosshair-moved guard this would pass
+  // even if the press missed the widget entirely and the DP never changed.
+  expect(walk.moved,
+    'the source navigator crosshair never moved during the orientation fill',
+  ).toBeGreaterThan(20)
+  expect(new Set(dpSigs).size,
+    `the source diffraction pattern did not follow the navigator while the
+     orientation map was filling: ${JSON.stringify(dpSigs)}`,
+  ).toBeGreaterThan(1)
 
   // Deliberately NOT waiting out the whole dense match (many minutes on 13k
   // patterns): everything this spec is about happens in the first blocks, and

@@ -111,15 +111,22 @@ class ProgressiveSignalPreview:
         self._last_paint = 0.0
         self._last_user = 0.0
         self._last_log = 0.0
+        self._last_serve_log = 0.0
         self._installed: list[tuple[Any, Any, Any]] = []
         # ONE bound method, kept for the lifetime of the preview: `self._slice_fn`
         # builds a fresh bound object on every attribute access, so the identity
         # checks that install/close rely on ("is this slice function still ours?")
         # would never match.
         self.slice_fn = self._slice_fn
-        #: counters the tests (and the log line) assert on
+        #: counters the tests (and the log lines) assert on
         self.blocks_seen = 0
+        #: (a) auto-sample paints driven by a landing block
         self.frames_painted = 0
+        #: (b) navigator-driven reads answered from the already-computed region
+        self.frames_served = 0
+        #: navigator-driven reads that landed on a position the batch has not
+        #: reached yet (returned None → the last good frame stays up)
+        self.reads_declined = 0
 
     # ── the readiness feed ───────────────────────────────────────────────────
 
@@ -272,14 +279,34 @@ class ProgressiveSignalPreview:
         the batch has not reached yet, which ``BaseSelector._run_update`` treats
         as "nothing to paint" — the last good frame stays up.
         """
-        self._last_user = time.monotonic()
+        now = time.monotonic()
+        self._last_user = now
         if self._closed:
             return None
         try:
             index = self._resolve_index(indices)
             if index is None or not self.is_ready(index):
+                self.reads_declined += 1
                 return None
-            return self.render(index)
+            frame = self.render(index)
+            if frame is None:
+                self.reads_declined += 1
+                return None
+            self.frames_served += 1
+            # Narrate the READ path separately from the auto-sample paint above:
+            # this line is the only direct evidence that dragging the navigator
+            # over an ALREADY-COMPUTED region returned that position's real
+            # frame (as opposed to the display merely being repainted by a
+            # landing block). The e2e spec asserts on it, because a pixel
+            # signature alone cannot tell those two causes apart.
+            if self.frames_served == 1 or now - self._last_serve_log >= LOG_MIN_INTERVAL:
+                self._last_serve_log = now
+                log.info("[live-signal] %s: navigator read served at %s from the "
+                         "already-computed region (%d/%d positions ready, "
+                         "%d served / %d not yet computed)",
+                         self.name, index, self.ready_count, self.n_positions,
+                         self.frames_served, self.reads_declined)
+            return frame
         except Exception as e:
             log.debug("[%s] preview slice failed: %s", self.name, e)
             return None

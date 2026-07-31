@@ -17,6 +17,14 @@
  * (208x64 patterns) so the batch spans MANY nav chunks — si_grains is 6x6 and
  * computes as a SINGLE chunk, i.e. it has no progressive phase to observe.
  *
+ * (b) is asserted on the BACKEND's own served-read count, not on pixels alone:
+ * the signal plot is simultaneously being repainted by landing blocks (that is
+ * (a)), so "the picture changed after I dragged" cannot distinguish "the drag
+ * was answered" from "a block happened to land just then". The drag itself goes
+ * through the harness's `dragCrosshair` — an anyplotlib crosshair is GRABBED,
+ * not clicked to, and an earlier version of this spec pressed at an arbitrary
+ * point, moved the navigator not at all, and passed anyway.
+ *
  * Screenshots land in electron/progressive_signal_shots/ (gitignored; the ones
  * in the PR were copied from there).
  */
@@ -24,7 +32,7 @@ import { test, expect } from '@playwright/test'
 import { mkdirSync } from 'fs'
 import { join } from 'path'
 const {
-  launchApp, backendAction, waitForSubwindowCount, sigWindow,
+  launchApp, backendAction, waitForSubwindowCount, sigWindow, dragCrosshair,
 } = require('./_harness.cjs')
 
 const SHOTS = join(__dirname, '..', 'progressive_signal_shots')
@@ -80,13 +88,41 @@ const logLines = (needle: string): string[] =>
 
 const finalized = () => logLines('[fv-batch] finalized').length > 0
 
-/** `(N/M positions ready)` pairs from the preview's own log line. */
+/**
+ * `(N/M positions ready)` pairs from the AUTO-SAMPLE paint line — behaviour (a).
+ *
+ * Deliberately keyed on `preview frame at`, not on `[live-signal]`: the same
+ * subsystem also logs the navigator-read line for (b), which carries the same
+ * `(N/M positions ready` text, and counting both would let a navigator read
+ * satisfy the "a landing block painted a frame" assertion.
+ */
 function previewProgress(): Array<[number, number]> {
-  return logLines('[live-signal]')
-    .map((l) => /\((\d+)\/(\d+) positions ready\)/.exec(l))
+  return logLines('preview frame at')
+    .map((l) => /\((\d+)\/(\d+) positions ready/.exec(l))
     .filter(Boolean)
     .map((m) => [parseInt(m![1], 10), parseInt(m![2], 10)] as [number, number])
 }
+
+/**
+ * How many navigator-driven reads the preview has ANSWERED from the
+ * already-computed region — the backend's own count, parsed from the
+ * `navigator read served` line.
+ *
+ * This is the direct evidence for behaviour (b), and a pixel signature is not a
+ * substitute for it: the signal plot is also being repainted by landing blocks
+ * (behaviour (a)), so "the picture changed after I dragged" cannot distinguish
+ * "the drag was answered" from "a block happened to land just then".
+ */
+function servedCount(): number {
+  const lines = logLines('navigator read served')
+  if (!lines.length) return 0
+  const m = /(\d+) served/.exec(lines[lines.length - 1])
+  return m ? parseInt(m[1], 10) : 0
+}
+
+// The crosshair drag itself lives in the harness (`dragCrosshair`): an
+// anyplotlib crosshair is GRABBED, not clicked to, so a press at an arbitrary
+// point moves nothing — see the helper's own note.
 
 test('the vectors signal plot fills in while the batch is still running', async () => {
   const { page } = ctx
@@ -119,15 +155,24 @@ test('the vectors signal plot fills in while the batch is still running', async 
   await page.screenshot({ path: join(SHOTS, '02-result-window-opened.png') })
 
   // ── (a) the signal plot repaints WHILE the batch is still running ─────────
+  // The baseline: nothing computed yet, so the vectors DP is still its black
+  // placeholder. Every later shot is compared against this one.
+  const baseline = await figureSignature(vecSig)
+  await page.screenshot({ path: join(SHOTS, '03-fill-start-both-black.png') })
+
   const during: Array<{ sum: number; bright: number; ready: number; total: number }> = []
-  let shot = 3
+  let shot = 4
   for (let i = 0; i < 400 && !finalized(); i++) {
     const sig = await figureSignature(vecSig)
     const prog = previewProgress()
-    const last = prog.length ? prog[prog.length - 1] : [0, 0]
-    // One capture per NEW fill stage: the preview's own `(ready/total)` counter
-    // moving is what makes two shots worth keeping.
-    if (during.length === 0 || during[during.length - 1].ready !== last[0]) {
+    // Only start capturing once the PREVIEW has painted at least once —
+    // before that the plot can still repaint for unrelated reasons (chrome,
+    // the hover toolbar) and those frames say nothing about the fill.
+    if (!prog.length) { await page.waitForTimeout(400); continue }
+    const last = prog[prog.length - 1]
+    // One capture per REPAINT: a changed content signature is the thing being
+    // asserted, and the `(ready/total)` the preview last logged labels it.
+    if (during.length === 0 || during[during.length - 1].sum !== sig.sum) {
       during.push({ ...sig, ready: last[0], total: last[1] })
       await page.screenshot({
         path: join(SHOTS, `${String(shot++).padStart(2, '0')}-during-fill-${last[0]}of${last[1]}.png`),
@@ -137,7 +182,14 @@ test('the vectors signal plot fills in while the batch is still running', async 
     await page.waitForTimeout(400)
   }
   // eslint-disable-next-line no-console
-  console.log('during-fill samples:', JSON.stringify(during))
+  console.log('during-fill samples:', JSON.stringify(during),
+              'baseline:', JSON.stringify(baseline))
+
+  // It came off the black placeholder, not merely "changed somehow".
+  expect(during.every((d) => d.bright > baseline.bright),
+    `the vectors DP never got brighter than its black placeholder
+     (baseline ${JSON.stringify(baseline)}): ${JSON.stringify(during)}`,
+  ).toBeTruthy()
 
   const progress = previewProgress()
   expect(progress.length,
@@ -156,27 +208,36 @@ test('the vectors signal plot fills in while the batch is still running', async 
   const vecNav = results
     .filter({ has: page.getByTestId('window-breadcrumb').filter({ hasText: /^N-/ }) })
     .last()
-  const navBox = await vecNav.locator('iframe').first().boundingBox()
-  expect(navBox).not.toBeNull()
-  // Walk across the count map: the already-filled part of the scan reads back
-  // straight away, so each position paints ITS OWN pattern (a distinct
-  // signature) instead of leaving the DP on one stale frame.
+  // Walk LEFT from the crosshair: the result window's right edge sits under the
+  // Plot Control dock, and a press that lands on the dock drives nothing.
+  const servedBefore = servedCount()
   const dragSigs: number[] = []
-  for (const fx of [0.3, 0.45, 0.6, 0.75]) {
-    await page.mouse.move(navBox!.x + navBox!.width * fx,
-                          navBox!.y + navBox!.height * 0.5)
-    await page.mouse.down()
-    await page.mouse.move(navBox!.x + navBox!.width * fx + 3,
-                          navBox!.y + navBox!.height * 0.5 + 3, { steps: 4 })
-    await page.mouse.up()
-    await page.waitForTimeout(700)
-    dragSigs.push((await figureSignature(vecSig)).sum)
-  }
+  const walk = await dragCrosshair(page, vecNav, {
+    dx: -26, steps: 5,
+    onStep: async (i: number) => {
+      dragSigs.push((await figureSignature(vecSig)).sum)
+      await page.screenshot({ path: join(SHOTS, `8${i}-drag-step-${i}.png`) })
+    },
+  })
+
   const stillRunning = !finalized()
+  const servedAfter = servedCount()
   await page.screenshot({ path: join(SHOTS, '90-drag-over-computed.png') })
   // eslint-disable-next-line no-console
-  console.log('drag over computed region: signatures', JSON.stringify(dragSigs),
+  console.log('drag over computed region: crosshair moved', walk.moved, 'px',
+              'signatures', JSON.stringify(dragSigs),
+              'served', servedBefore, '→', servedAfter,
               'batch still running:', stillRunning)
+
+  // The guard the previous version of this spec lacked: if the crosshair never
+  // moved, everything below is measuring landing blocks, not the drag.
+  expect(walk.moved,
+    'the navigator crosshair never moved, so nothing about reading an '
+    + 'already-computed position was exercised').toBeGreaterThan(20)
+  // The backend answering navigator reads from its ready mask IS behaviour (b).
+  expect(servedAfter - servedBefore,
+    'dragging the navigator over the computed region did not serve a single '
+    + 'frame from the already-computed vectors').toBeGreaterThan(0)
   expect(new Set(dragSigs).size,
     `the diffraction pattern did not follow the navigator over the computed
      region (identical frames at every position): ${JSON.stringify(dragSigs)}`,
