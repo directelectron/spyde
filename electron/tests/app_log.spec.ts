@@ -88,6 +88,107 @@ test('status-bar badge counts warnings/errors while the log is hidden', async ()
   await expect(page.locator('[data-testid="log-badge"]')).toHaveText('2')
 })
 
+/**
+ * PERF REGRESSION GUARD. The panel used to render EVERY buffered record, so each
+ * incoming line re-ran ~1000 row components and reconciled ~5000 DOM nodes —
+ * measured 5.4 ms of main-thread time per line once the buffer hit its 1000 cap
+ * (vs 0.05 ms now), which is why the app got sluggish "around 1000 log lines".
+ *
+ * Two independent things are asserted, because either one regressing brings the
+ * cost back:
+ *   1. the MOUNTED row count stays bounded by the viewport, not the buffer
+ *      (virtualisation — LogPanel's useWindowed)
+ *   2. appends are COALESCED, so N records cost far fewer than N React commits
+ *      (SpyDEContext's queueLog)
+ * The wall-time bound is deliberately loose (a shared CI box is noisy); the two
+ * structural assertions are the sharp ones and cannot flake.
+ */
+test('PERF: 2000 log lines stay bounded in DOM and cost bounded main-thread time', async () => {
+  test.setTimeout(120_000)
+  await page.click('[data-testid="toggle-log"]')
+  await expect(page.locator('[data-testid="log-panel"]')).toBeVisible()
+  // The open triggers a backend log_backfill that REPLACES the buffer; let it
+  // land before injecting or it wipes the injected records mid-run.
+  await page.waitForTimeout(1500)
+
+  const result = await page.evaluate(async () => {
+    const inject = (window as any)._spyde_test_inject
+    const yieldTask = () => new Promise<void>((r) => {
+      const ch = new MessageChannel()
+      ch.port1.onmessage = () => r()
+      ch.port2.postMessage(0)
+    })
+    const N = 2000
+    const t0 = performance.now()
+    for (let i = 0; i < N; i++) {
+      inject({
+        type: 'log', level: i % 7 === 0 ? 'WARNING' : 'INFO',
+        name: 'spyde.drawing.update_functions', area: 'navigator',
+        msg: '[NAV-PROFILE] read=1.8ms levels=0.4ms transport=6.2ms idx=' + i,
+        time: Date.now() / 1000,
+      })
+      await yieldTask()
+      await yieldTask()
+    }
+    const elapsed = performance.now() - t0
+    // Let the final coalesced batch flush + commit.
+    await new Promise<void>((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())))
+    const body = document.querySelector('[data-testid="log-body"]')
+    return {
+      elapsed,
+      msPerLine: elapsed / N,
+      rows: document.querySelectorAll('[data-testid="log-row"]').length,
+      bodyNodes: body ? body.querySelectorAll('*').length : 0,
+    }
+  })
+
+  // Virtualised: the ~220 px body shows ~13 rows; overscan and a taller panel
+  // give plenty of head-room, but 2000 buffered records must never all mount.
+  expect(result.rows).toBeGreaterThan(0)
+  expect(result.rows).toBeLessThan(120)
+  expect(result.bodyNodes).toBeLessThan(700)
+  // Wall time per injected line. Measured ~0.05 ms/line with the fix and
+  // ~5.4 ms/line without it, so 1.5 ms leaves a 30× cushion for a loaded box
+  // while still failing hard if the whole buffer starts rendering again.
+  expect(result.msPerLine).toBeLessThan(1.5)
+})
+
+test('PERF: a burst of records is coalesced into far fewer React renders', async () => {
+  test.setTimeout(120_000)
+  await page.click('[data-testid="toggle-log"]')
+  await expect(page.locator('[data-testid="log-panel"]')).toBeVisible()
+  await page.waitForTimeout(1500)
+
+  // Count renders by observing the log body's DOM instead of hooking React: one
+  // commit that changes the visible rows produces one batch of mutation records.
+  const renders = await page.evaluate(async () => {
+    const inject = (window as any)._spyde_test_inject
+    const body = document.querySelector('[data-testid="log-body"]')!
+    let batches = 0
+    const obs = new MutationObserver(() => { batches++ })
+    obs.observe(body, { childList: true, subtree: true, characterData: true })
+    // 400 records delivered back-to-back, each in its own task (how IPC arrives).
+    for (let i = 0; i < 400; i++) {
+      inject({
+        type: 'log', level: 'INFO', name: 'spyde.x', area: 'navigator',
+        msg: 'burst ' + i, time: Date.now() / 1000,
+      })
+      await new Promise<void>((r) => {
+        const ch = new MessageChannel()
+        ch.port1.onmessage = () => r()
+        ch.port2.postMessage(0)
+      })
+    }
+    await new Promise<void>((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())))
+    obs.disconnect()
+    return batches
+  })
+
+  // One dispatch per record would give ≥400 mutation batches. Coalescing per
+  // animation frame caps it at roughly the number of frames the burst spanned.
+  expect(renders).toBeLessThan(150)
+})
+
 test('SCREENSHOT: populated application log for visual approval', async () => {
   await page.click('[data-testid="toggle-log"]')
   // Let the panel-open backfill round-trip with the (persistent) backend settle

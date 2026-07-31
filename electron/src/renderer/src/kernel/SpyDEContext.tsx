@@ -5,7 +5,7 @@
  * toolbar configs, and status, and re-renders the MDI when things change.
  */
 import React, {
-  createContext, useContext, useEffect, useReducer, useRef, useState,
+  createContext, useCallback, useContext, useEffect, useReducer, useRef, useState,
 } from 'react'
 import { asPlotAppMessage } from './protocol'
 import type { ReportDocState, ReportCell } from './protocol'
@@ -111,8 +111,26 @@ export interface Histogram {
   clipped?: boolean           // bins are robust quantiles — end bins are overflow
 }
 
-/** One application-log record streamed from the Python backend. */
-export interface LogEntry { level: string; name: string; area?: string; msg: string; time: number }
+/**
+ * One application-log record streamed from the Python backend.
+ *
+ * `seq` is a renderer-assigned monotonic id, stamped once as the record enters
+ * the buffer. It is the STABLE React key + height-cache key for the virtualised
+ * log list: the buffer is a ring (old records drop off the front), so an array
+ * INDEX identifies a different record after every shift, which would defeat both
+ * row memoisation and the measured-height cache.
+ */
+export interface LogEntry {
+  level: string
+  name: string
+  area?: string
+  msg: string
+  time: number
+  seq?: number
+}
+
+/** Max buffered log records (the renderer-side ring buffer). */
+export const LOG_MAX = 1000
 
 /** A console_result/console_vars value description (shape × dtype badge). */
 export interface ConsoleVarKind {
@@ -288,7 +306,7 @@ type Action =
   | { type: 'SIGNAL_TREE'; windowId: number; tree: TreeNode; activeSignalId?: number }
   | { type: 'NAVIGATOR_OPTIONS'; windowId: number; names: string[]; current?: string | null }
   | { type: 'STREAM'; text: string; kind: 'stdout' | 'stderr' }
-  | { type: 'LOG'; entry: LogEntry }
+  | { type: 'LOG'; entries: LogEntry[] }
   | { type: 'LOG_BACKFILL'; entries: LogEntry[] }
   | { type: 'LOG_LEVEL'; level: string }
   | { type: 'BACKEND_EXITED'; code: number | null; reason?: string }
@@ -634,11 +652,19 @@ function spydeReducer(state: State, action: Action): State {
         streamLines: [...state.streamLines.slice(-500), { text: action.text, kind: action.kind }],
       }
 
-    case 'LOG':
-      return { ...state, logEntries: [...state.logEntries.slice(-999), action.entry] }
+    // A BATCH of records (coalesced per animation frame by `queueLog` below) —
+    // one array copy + one render for a whole burst, instead of one per line.
+    case 'LOG': {
+      if (action.entries.length === 0) return state
+      const merged = state.logEntries.concat(action.entries)
+      return {
+        ...state,
+        logEntries: merged.length > LOG_MAX ? merged.slice(-LOG_MAX) : merged,
+      }
+    }
 
     case 'LOG_BACKFILL':
-      return { ...state, logEntries: action.entries.slice(-1000) }
+      return { ...state, logEntries: action.entries.slice(-LOG_MAX) }
 
     case 'LOG_LEVEL':
       return { ...state, logLevel: action.level }
@@ -884,6 +910,37 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
   )
 
   // ── Python → Renderer message dispatch ──────────────────────────────────
+
+  // Log-record COALESCING. The backend can spray hundreds of records a second
+  // (a [NAV-PROFILE] trace, a dask storm). One dispatch per record = one React
+  // commit per record, each of which re-renders every consumer of this context.
+  // Buffer them and flush ONE batched dispatch per animation frame instead, so a
+  // burst costs one render, not N. The setTimeout is a backstop: rAF does not
+  // fire while the window is hidden/minimised, and records must still land.
+  const pendingLogs = useRef<LogEntry[]>([])
+  const logRaf = useRef<number | null>(null)
+  const logTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const logSeq = useRef(0)
+
+  const flushLogs = useCallback(() => {
+    if (logRaf.current != null) { cancelAnimationFrame(logRaf.current); logRaf.current = null }
+    if (logTimer.current != null) { clearTimeout(logTimer.current); logTimer.current = null }
+    const batch = pendingLogs.current
+    if (batch.length === 0) return
+    pendingLogs.current = []
+    dispatch({ type: 'LOG', entries: batch })
+  }, [])
+
+  const queueLog = useCallback((entry: LogEntry) => {
+    entry.seq = logSeq.current++
+    const pending = pendingLogs.current
+    pending.push(entry)
+    // Never let the pending queue outgrow what the buffer can hold (a flood
+    // while the window is hidden would otherwise pin unbounded memory).
+    if (pending.length > LOG_MAX) pending.splice(0, pending.length - LOG_MAX)
+    if (logRaf.current == null) logRaf.current = requestAnimationFrame(flushLogs)
+    if (logTimer.current == null) logTimer.current = setTimeout(flushLogs, 250)
+  }, [flushLogs])
 
   useEffect(() => {
     const handleMessage = (raw: Record<string, unknown>) => {
@@ -1320,15 +1377,27 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
           break
 
         case 'log':
-          dispatch({ type: 'LOG', entry: {
+          // Coalesced (see queueLog) — NOT dispatched per record. `area` is the
+          // backend's authoritative subsystem tag (log_stream._area_for); it used
+          // to be dropped here, forcing the panel to re-derive a worse guess from
+          // the logger name for every row on every render.
+          queueLog({
             level: String(msg.level), name: String(msg.name),
+            area: msg.area != null ? String(msg.area) : undefined,
             msg: String(msg.msg), time: Number(msg.time),
-          } })
+          })
           break
 
-        case 'log_backfill':
-          dispatch({ type: 'LOG_BACKFILL', entries: msg.entries ?? [] })
+        case 'log_backfill': {
+          // Authoritative history replace — the backend's ring already contains
+          // anything still queued, so drop the pending batch rather than letting
+          // it re-append duplicates after the replace.
+          pendingLogs.current = []
+          const entries = (msg.entries ?? []) as LogEntry[]
+          for (const e of entries) e.seq = logSeq.current++
+          dispatch({ type: 'LOG_BACKFILL', entries })
           break
+        }
 
         case 'log_level':
           dispatch({ type: 'LOG_LEVEL', level: String(msg.level) })
@@ -1531,6 +1600,11 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
       // every message dispatched twice, growing over time → doubled logs + lag).
       disposeMessage?.()
       disposeStream?.()
+      // Drop any coalesced log batch still waiting on its rAF/timeout — a
+      // StrictMode remount would otherwise flush into the new reducer instance.
+      if (logRaf.current != null) { cancelAnimationFrame(logRaf.current); logRaf.current = null }
+      if (logTimer.current != null) { clearTimeout(logTimer.current); logTimer.current = null }
+      pendingLogs.current = []
       disposeStackDialog?.()
       disposeUpdateDialog?.()
       disposeGpuStatusDialog?.()
