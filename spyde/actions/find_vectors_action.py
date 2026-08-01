@@ -471,16 +471,48 @@ def _finalize(tree, vecs) -> None:
         count_map = vecs.count_map_at_t(0).astype(np.float32)    # slice 0 to start
     else:
         count_map = vecs.count_map().astype(np.float32)
+    # For a stack, the vectors-per-slice curve — what the 1-D TIME navigator
+    # should show. Without it that window stayed on whatever it held (an
+    # all-zero flat line), so a 5-D result gave no indication of how many
+    # vectors each slice held, or which slice you were looking at.
+    per_slice = None
+    if vecs.n_time > 0:
+        try:
+            series = np.asarray(vecs.count_map_series(), dtype=np.float32)
+            per_slice = series.reshape(series.shape[0], -1).sum(axis=1)
+        except Exception as e:
+            log.debug("building the per-slice vector counts failed: %s", e)
+
+    if vecs.n_time > 0:
+        # The 5-D result tree currently registers ONE navigator signal ('base',
+        # the 2-D spatial count map) — there is no (n_time,) plot here to paint,
+        # so the per-slice branch below finds nothing. Logged at INFO because it
+        # is the signal the 5-D e2e reads; see the note on the time-nav paint.
+        log.info("[fv-5d] nav plots: %s | navsigs=%s | spatial=%s n_time=%d",
+                 [tuple(getattr(getattr(p, "current_data", None), "shape", ()))
+                  for p in _all_nav_plots(tree)],
+                 list(getattr(tree, "navigator_signals", {}) or {}),
+                 tuple(spatial_2d), vecs.n_time)
+
     painted = False
     for nav_plot in _all_nav_plots(tree):
         try:
             cur = getattr(nav_plot, "current_data", None)
             exp = tuple(cur.shape) if hasattr(cur, "shape") else None
-            if exp is not None and tuple(exp) != tuple(spatial_2d):
-                continue   # not the 2-D spatial plot (e.g. the 1-D stack nav)
-            nav_plot.needs_auto_level = True
-            nav_plot.set_data(count_map)
-            painted = True
+            if exp is not None and tuple(exp) == tuple(spatial_2d):
+                nav_plot.needs_auto_level = True
+                nav_plot.set_data(count_map)
+                painted = True
+            elif (per_slice is not None and exp is not None
+                    and tuple(exp) == (int(per_slice.shape[0]),)):
+                # The 1-D stack navigator: total vectors in each slice.
+                nav_plot.needs_auto_level = True
+                nav_plot.set_data(per_slice)
+                # INFO, not debug: this is the signal the 5-D e2e waits on (a
+                # 1-D line plot's values can't be read back from a screenshot).
+                log.info("[fv-5d] time-nav painted: %d slices, totals %s",
+                         int(per_slice.shape[0]),
+                         [int(x) for x in per_slice[:8]])
         except Exception as e:
             log.debug("painting final count map onto navigator failed: %s", e)
     if not painted:
@@ -504,6 +536,7 @@ def _finalize(tree, vecs) -> None:
             log.debug("re-sending toolbar config after find-vectors failed: %s", e)
     _install_render_display(tree, vecs)
     _overlay_on_result(tree, vecs)
+    _attach_time_slice_repaint(tree, vecs)
 
     total = int(len(vecs.flat_buffer))   # total over ALL slices, not one slice
     emit_status(f"Found {total} diffraction vectors")
@@ -589,6 +622,89 @@ def _install_render_display(tree, vecs) -> None:
         _refresh_signal_from_navigator(tree)
 
 
+def _attach_time_slice_repaint(tree, vecs) -> None:
+    """Repaint the 2-D count map when the TIME axis moves (5-D stacks only).
+
+    `count_map_at_t(0)` is painted once when the vectors attach, and nothing
+    used to update it — so scrubbing the time navigator left the count map
+    showing slice 0 forever while the DP and the vector overlay moved on. The
+    map silently disagreed with everything else on screen.
+
+    Rides the SAME `BaseSelector.index_hooks` the vector overlay uses
+    (`vector_overlay._on_indices`), so the repaint is driven by exactly the
+    navigator event the overlay already follows — one mechanism, one ordering,
+    nothing new to keep in sync. Idempotent: re-running Find Vectors removes the
+    previous hook first, or a second run would paint twice per move.
+    """
+    from spyde.actions.vector_overlay import (
+        _indices_lead_nav, _navigator_selectors_for,
+    )
+
+    _detach_time_slice_repaint(tree)
+    if getattr(vecs, "n_time", 0) <= 0:
+        return                                   # 4-D: nothing to slice
+    spatial_2d = tuple(int(s) for s in vecs.nav_shape)
+    n_t = int(vecs.n_time)
+    state = {"t": 0}
+
+    def _targets():
+        out = []
+        for nav_plot in _all_nav_plots(tree):
+            cur = getattr(nav_plot, "current_data", None)
+            exp = tuple(cur.shape) if hasattr(cur, "shape") else None
+            if exp is not None and exp == spatial_2d:
+                out.append(nav_plot)
+        return out
+
+    def _on_indices(indices):
+        lead = _indices_lead_nav(indices)
+        if not lead:
+            return
+        t = int(lead[0])
+        if not (0 <= t < n_t) or t == state["t"]:
+            return                               # same slice — nothing to redo
+        state["t"] = t
+        try:
+            cm = np.asarray(vecs.count_map_at_t(t), dtype=np.float32)
+        except Exception as e:
+            log.debug("count_map_at_t(%s) failed: %s", t, e)
+            return
+        n_painted = 0
+        for nav_plot in _targets():
+            try:
+                nav_plot.needs_auto_level = True
+                nav_plot.set_data(cm)
+                n_painted += 1
+            except Exception as e:
+                log.debug("repainting the count map for t=%s failed: %s", t, e)
+        # INFO for the same reason as the time-nav paint: the e2e's only honest
+        # handle on "the map followed the time axis".
+        log.info("[fv-5d] count map -> slice %d (%d plot(s))", t, n_painted)
+
+    hooked = []
+    for sp in list(getattr(tree, "signal_plots", [])):
+        for sel in _navigator_selectors_for(tree, sp):
+            if _on_indices not in sel.index_hooks:
+                sel.index_hooks.append(_on_indices)
+                hooked.append(sel)
+    tree._vectors_time_repaint = (_on_indices, hooked)
+
+
+def _detach_time_slice_repaint(tree) -> None:
+    """Drop a previous run's time-slice hook (see the idempotence note above)."""
+    prev = getattr(tree, "_vectors_time_repaint", None)
+    if not prev:
+        return
+    fn, sels = prev
+    for sel in sels:
+        try:
+            if fn in sel.index_hooks:
+                sel.index_hooks.remove(fn)
+        except Exception as e:
+            log.debug("detaching the time-slice repaint failed: %s", e)
+    tree._vectors_time_repaint = None
+
+
 def _overlay_on_result(tree, vecs) -> None:
     """Overlay the found vectors as red circle markers on the RESULT window's
     rendered diffraction pattern, tracking its count-map navigator (Qt parity:
@@ -624,13 +740,29 @@ def _first_nav_plot(tree):
 
 def _all_nav_plots(tree):
     """All navigator plots across every navigator window (a 5-D stack has more
-    than one: an outer stack navigator + the 2-D spatial count map)."""
+    than one: an outer stack navigator + the 2-D spatial count map).
+
+    ``MultiplotManager.plot_windows`` is a dict of PARENT window -> its
+    SUB-windows (see ``add_plot_states_for_navigation_signals``, which fills the
+    top level from ``signals[0]`` and the nested level from ``signals[1]``).
+    Iterating only ``.keys()`` therefore returned ONE level — which is why this
+    function, despite its docstring, handed back a single plot for a 5-D stack
+    and the time navigator was never found, let alone painted."""
     npm = getattr(tree, "navigator_plot_manager", None)
     if npm is None:
         return []
-    out = []
-    for pw in list(npm.plot_windows.keys()):
-        out.extend(npm.plots.get(pw, []))
+    out, seen = [], set()
+
+    def _add(pw):
+        for p in npm.plots.get(pw, []) or []:
+            if id(p) not in seen:
+                seen.add(id(p))
+                out.append(p)
+
+    for pw, subs in list(npm.plot_windows.items()):
+        _add(pw)
+        for sub in list(subs or []):
+            _add(sub)
     return out
 
 
