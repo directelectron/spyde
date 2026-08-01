@@ -914,3 +914,105 @@ class TestConfidenceScore:
         rows[:, COL["background"]] = np.nan          # ring fell outside the frame
         rows[:, COL["intensity_std"]] = np.nan
         assert particle_scores(rows)[0] == 1.0
+
+
+class TestPerComponentWatershed:
+    """Large frames watershed each component in its own bbox.
+
+    A whole-frame watershed allocates several full-frame rasters — measured at
+    4096², `split_instances` alone peaks at 546 MB of an 852 MB total. With
+    dask's `threads_per_worker=4` that is ~3.4 GB of concurrent peak per worker,
+    which drove a 9.24 GiB worker into a pause/resume/restart loop with
+    "unmanaged memory" warnings (the arrays are ours, inside the task, so dask
+    can neither see nor spill them).
+
+    Cropping is EXACT, not an approximation: a connected component is surrounded
+    by background by definition, so a 1 px pad contains every pixel the distance
+    transform, the markers and the watershed can depend on, and no watershed can
+    flow between two components that do not touch.
+    """
+
+    @staticmethod
+    def _field(n, k, seed=0):
+        rng = np.random.default_rng(seed)
+        fg = np.zeros((n, n), bool)
+        y, x = np.mgrid[0:n, 0:n]
+        for _ in range(k):
+            cy, cx = rng.uniform(20, n - 20), rng.uniform(20, n - 20)
+            r = rng.uniform(8, 22)
+            fg |= (y - cy) ** 2 + (x - cx) ** 2 < r * r     # overlapping on purpose
+        return fg
+
+    def test_identical_to_the_whole_frame_route_when_neither_decimates(self):
+        """The exactness claim, where it can be checked directly.
+
+        Below `_SPLIT_DECIMATE_ABOVE` both routes compute the split geometry at
+        full resolution, so they must agree pixel for pixel. Above it they do
+        NOT, and that is decimation rather than a cropping error — see the next
+        test.
+        """
+        import spyde.particles.classical as C
+        from spyde.particles.classical import SegmentParams, split_instances
+
+        fg = self._field(1024, 90)
+        p = SegmentParams(min_size=5, watershed=True)
+        assert C._split_factor(fg.shape, p) == 1, "fixture must not decimate"
+
+        orig = C._COMPONENT_ROUTE_PX
+        try:
+            C._COMPONENT_ROUTE_PX = 1 << 60          # force whole-frame
+            whole = split_instances(fg, p)
+            C._COMPONENT_ROUTE_PX = 0                # force per-component
+            comp = split_instances(fg, p)
+        finally:
+            C._COMPONENT_ROUTE_PX = orig
+
+        assert whole.max() == comp.max(), (
+            f"instance COUNT differs with no decimation in play: "
+            f"{whole.max()} vs {comp.max()}")
+        # Ids may be numbered differently; the PARTITION must be the same.
+        for v in np.unique(whole):
+            if v == 0:
+                continue
+            m = whole == v
+            ids = np.unique(comp[m])
+            assert len(ids) == 1 and ids[0] != 0, (
+                "a whole-frame instance was split across the crop boundary")
+
+    def test_a_component_spanning_a_crop_is_not_broken_up(self):
+        """One long diagonal particle — the shape a naive band split ruins."""
+        import spyde.particles.classical as C
+        from spyde.particles.classical import SegmentParams, split_instances
+
+        n = 512
+        fg = np.zeros((n, n), bool)
+        for i in range(40, n - 40):
+            fg[i - 3:i + 3, i - 3:i + 3] = True       # corner to corner
+        orig = C._COMPONENT_ROUTE_PX
+        try:
+            C._COMPONENT_ROUTE_PX = 0
+            lab = split_instances(fg, SegmentParams(min_size=5, watershed=True))
+        finally:
+            C._COMPONENT_ROUTE_PX = orig
+        assert lab.max() >= 1
+        # every foreground pixel belongs to a labelled instance
+        assert (lab[fg] > 0).all(), "pixels were dropped at a crop edge"
+
+    def test_labels_are_globally_unique_across_components(self):
+        """Each crop labels 1..k locally; the offset into the global space is
+        where an off-by-one silently merges two particles."""
+        import spyde.particles.classical as C
+        from spyde.particles.classical import SegmentParams, split_instances
+
+        fg = np.zeros((256, 256), bool)
+        fg[20:60, 20:60] = True          # three well-separated squares
+        fg[20:60, 120:160] = True
+        fg[120:160, 20:60] = True
+        orig = C._COMPONENT_ROUTE_PX
+        try:
+            C._COMPONENT_ROUTE_PX = 0
+            lab = split_instances(fg, SegmentParams(min_size=5, watershed=True))
+        finally:
+            C._COMPONENT_ROUTE_PX = orig
+        assert lab.max() == 3, f"expected 3 instances, got {lab.max()}"
+        assert len(set(np.unique(lab)) - {0}) == 3

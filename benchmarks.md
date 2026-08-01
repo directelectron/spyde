@@ -1744,3 +1744,57 @@ of GIL-held client time for 977 chunks.
 next chunk so a ~30x-faster GPU lane and the CPU lane drain one pool and finish
 together — real work stealing the scheduler cannot do, and the reason this
 module exists. Only the unpinned lane changed.
+
+### Batch segmentation paused dask workers — the per-FRAME peak, not the graph (2026-08-01)
+
+Reported from a real run: workers pausing at 80% of a 9.24 GiB limit, restarting
+at 95%, and `Unmanaged memory: 6.47 GiB`.
+
+The graph was never the problem. `segment_movie` is a plain `map_blocks` over
+time chunks and nothing calls `.compute()` on the movie — it is genuinely
+embarrassingly parallel. What was wrong is that ONE unit of that parallel work
+is enormous. Measured, 4096² frame, classical engine:
+
+| stage | peak | time |
+|---|---|---|
+| input frame (float32) | 64 MB | — |
+| `_prepare` | 24 MB | 0.04 s |
+| threshold | 7 MB | 0.02 s |
+| **`split_instances` (watershed)** | **546 MB** | **4.15 s** |
+| **whole frame** | **852 MB** | 4.4 s |
+
+The cluster runs `threads_per_worker=4`, so that is **~3.4 GB of concurrent peak
+on one worker** before frames in flight or allocator fragmentation. And
+"unmanaged" is the correct label: the rasters are ours, inside the task, so dask
+can neither account for them nor spill them.
+
+The watershed is 64% of the peak because the distance transform, its smoothed
+copy, the marker labelling and the watershed each materialise a full-frame
+float32/int32 raster.
+
+**Fix: watershed each connected component in its own bbox.** This is EXACT, not
+an approximation — a component is surrounded by background by definition, so a
+1 px pad contains every pixel the distance transform, the markers and the
+watershed can depend on, and no watershed can flow between components that do
+not touch. It is the same shape `measure.py` already uses to trace contours.
+
+| 4096², 400 overlapping discs | peak | time |
+|---|---|---|
+| whole-frame | 538 MB | 1.59 s |
+| **per-component** | **272 MB** | **1.09 s** |
+
+**2x less memory and 1.5x faster.** Faster because the distance transform now
+runs over the particles' own bboxes instead of 16.7 M pixels of mostly
+background.
+
+**One behaviour change, and it is an improvement.** The counts differ on large
+frames (395 vs 388 above) because `_split_factor` decimates the whole-frame
+split geometry 4x at 4096² (the earlier 7.1 s -> 2.8 s optimisation), while a
+per-component crop is a few hundred pixels and so gets factor 1 — full
+resolution markers. At 1024², where neither route decimates, the two agree
+PIXEL FOR PIXEL, which is what the parity test pins. So the per-component route
+is more accurate as well as smaller; the decimation that bought the original
+speedup is simply no longer needed on this path.
+
+Gated at `_COMPONENT_ROUTE_PX` (4 MP): below it the per-crop bookkeeping costs
+more than the memory it saves.

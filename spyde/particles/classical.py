@@ -80,6 +80,13 @@ class SegmentParams:
     #: maxima (a 3x3 particle's marker is one pixel, so any area floor erases it).
     #: That is precisely the sensitivity failure plan §0.9 exists to prevent.
     min_separation: int = 3
+    #: Instances whose gap is smaller than this many PIXELS are merged back into
+    #: one particle (:func:`merge_close_instances`). This is the control for
+    #: "some of these should be one particle" -- a real particle comes back as
+    #: several instances when the watershed splits a lumpy blob or a ragged edge
+    #: sheds a fragment, and both are answered by the same question: how far
+    #: apart must two pieces be to count as separate? 0 disables.
+    merge_distance: float = 0.0
     #: Gaussian sigma applied to the distance transform BEFORE peak finding.
     #: Suppresses spurious maxima from a ragged boundary without merging genuinely
     #: separate particles. 0 disables.
@@ -355,7 +362,14 @@ def split_instances(
     if not fg.any():
         return np.zeros(fg.shape, dtype=np.int32)
 
-    if p.watershed:
+    if p.watershed and fg.size >= _COMPONENT_ROUTE_PX:
+        # Big frame: watershed each connected component in its own bbox. Exact
+        # (a component is surrounded by background, so nothing crosses a crop)
+        # and it is what keeps a dask worker off its memory limit — the
+        # whole-frame route below allocates several full-frame rasters, 546 MB
+        # of the 852 MB peak measured at 4096². See _watershed_per_component.
+        labels = _watershed_per_component(fg, p, distance_from)
+    elif p.watershed:
         seed_src = fg
         if p.watershed_erosion > 0:
             seed_src = fg.copy()
@@ -533,6 +547,12 @@ def _finalize_labels(labels: np.ndarray, p: SegmentParams) -> np.ndarray:
     twice, which is why they are one function rather than two composed ones.
     """
     labels = np.asarray(labels)
+    # MERGE first, size-filter second. Two fragments of one particle are each
+    # small; merged they are one particle of the real size, and filtering before
+    # merging would delete the pieces and leave nothing to join. This is also why
+    # it lives here rather than in either split path: every engine reaches
+    # `_finalize_labels`, so the control means the same thing in all of them.
+    labels = merge_close_instances(labels, getattr(p, "merge_distance", 0.0))
     counts = np.bincount(labels.ravel())
     # `counts > 0` and not `slice(1, None)`: a label id absent from the raster
     # (a gap left by clear_border) must not be handed an output number, which is
@@ -715,3 +735,148 @@ def segment_frame(frame: np.ndarray, p: SegmentParams | None = None) -> np.ndarr
     prepared = _prepare(frame, p)
     fg = threshold_mask(prepared, p)
     return split_instances(fg, p)
+
+
+def merge_close_instances(labels: np.ndarray, merge_px: float) -> np.ndarray:
+    """Merge instances separated by a gap smaller than *merge_px* pixels.
+
+    The user-facing answer to "some of these should be one particle". A real
+    particle can come back as several instances for two very different reasons
+    — the watershed split a lumpy blob, or a ragged edge broke off a fragment —
+    and BOTH are fixed by the same question: how far apart do two pieces have
+    to be before they are genuinely separate particles? That is a distance the
+    user can see in the image, which is what the abstract 0-1 confidence
+    control was not.
+
+    Implemented by growing every instance by half the gap and taking connected
+    components of the result: two instances whose boundaries come within
+    *merge_px* touch once grown, so they land in one component and are
+    relabelled together. Growing by HALF is what makes the parameter mean the
+    gap between them rather than the radius each one is inflated by.
+
+    The instances themselves are NOT dilated in the output — only their
+    identities change. Areas, centroids and outlines are still measured from
+    the original mask, so merging cannot inflate a measurement.
+
+    ``merge_px <= 0`` returns *labels* unchanged.
+    """
+    if merge_px is None or merge_px <= 0:
+        return labels
+    lab = np.asarray(labels)
+    n = int(lab.max()) if lab.size else 0
+    if n < 2:
+        return lab
+
+    from scipy import ndimage as ndi
+
+    radius = max(1, int(round(float(merge_px) / 2.0)))
+    # A cross/disk structuring element applied `radius` times is far cheaper
+    # than building a (2r+1)² disk and is close enough for a gap test.
+    grown = ndi.binary_dilation(lab > 0, iterations=radius)
+    comp, n_comp = ndi.label(grown)
+    if n_comp >= n:
+        return lab                      # nothing came together
+
+    # Each original instance lies wholly inside one grown component (it can
+    # only have grown outward), so sampling the component at the instance's
+    # own pixels is exact — take the max for safety on a degenerate label.
+    comp_of = ndi.maximum(comp, lab, index=np.arange(1, n + 1))
+    comp_of = np.asarray(comp_of, np.int64).ravel()
+
+    # Renumber the surviving components 1..k so the output is a dense label
+    # image, which everything downstream (measure, contours) assumes.
+    uniq, dense = np.unique(comp_of, return_inverse=True)
+    lut = np.zeros(n + 1, np.int32)
+    lut[1:] = dense.astype(np.int32) + 1
+    return lut[lab]
+
+
+#: Frames at or above this many pixels take the per-component watershed route
+#: instead of the whole-frame one. Below it the bookkeeping costs more than the
+#: memory it saves; above it the whole-frame route is what pauses a dask worker.
+_COMPONENT_ROUTE_PX: int = 4 << 20          # ~2048², i.e. 4 megapixels
+
+
+def _watershed_per_component(fg: np.ndarray, p: SegmentParams,
+                             distance_from: np.ndarray | None = None
+                             ) -> np.ndarray:
+    """Watershed each connected component inside its own bounding box.
+
+    **This is exact, not an approximation.** A connected component is
+    surrounded by background by definition, so within its (1 px padded) bbox
+    every quantity the watershed needs is already correct: the distance
+    transform measures distance to the nearest background pixel, and that
+    pixel is inside the pad; markers are local maxima of that distance; and a
+    watershed cannot flow between two components because they do not touch.
+    Cropping therefore changes nothing about the answer, only the peak memory.
+
+    Why it matters. Measured on a 4096² frame, whole-frame classical
+    segmentation peaks at **852 MB**, of which `split_instances` alone is
+    546 MB — the distance transform, its smoothed copy, the marker labelling
+    and the watershed each materialise a full-frame float32/int32 raster. With
+    dask running ``threads_per_worker=4`` that is ~3.4 GB of concurrent peak
+    per worker, which is what drives a 9.24 GiB worker into the pause/restart
+    loop with "unmanaged memory" warnings: the arrays are ours, inside the
+    task, so dask cannot see or spill them.
+
+    Per component the peak is one particle's bbox — kilobytes — plus the two
+    full-frame rasters that cannot be avoided (the input mask and the output
+    labels).
+
+    It is also the same shape `measure.py` already uses to trace contours
+    ("inside each region's padded bbox crop, not on the whole frame").
+    """
+    from scipy import ndimage as ndi
+
+    comp, n_comp = ndi.label(fg)
+    out = np.zeros(fg.shape, np.int32)
+    if n_comp == 0:
+        return out
+    slices = ndi.find_objects(comp)
+    next_label = 1
+    h, w = fg.shape
+    for i, sl in enumerate(slices, start=1):
+        if sl is None:
+            continue
+        # 1 px pad so the crop's border is background and the distance
+        # transform inside sees the true nearest zero.
+        y0 = max(0, sl[0].start - 1); y1 = min(h, sl[0].stop + 1)
+        x0 = max(0, sl[1].start - 1); x1 = min(w, sl[1].stop + 1)
+        sub_fg = comp[y0:y1, x0:x1] == i
+        sub_dist_src = (None if distance_from is None
+                        else np.asarray(distance_from[y0:y1, x0:x1], np.float32))
+        sub = _split_one_component(sub_fg, p, sub_dist_src)
+        if sub is None:
+            continue
+        m = sub > 0
+        if not m.any():
+            continue
+        # Renumber this component's instances into the global label space.
+        out[y0:y1, x0:x1][m] = sub[m] + (next_label - 1)
+        next_label += int(sub.max())
+    return out
+
+
+def _split_one_component(sub_fg: np.ndarray, p: SegmentParams,
+                         distance_from: np.ndarray | None):
+    """The watershed body, on ONE component's crop. Labels are 1..k locally."""
+    from skimage.morphology import binary_erosion, disk
+    from skimage.segmentation import watershed
+    from scipy import ndimage as ndi
+
+    seed_src = sub_fg
+    if p.watershed_erosion > 0:
+        seed_src = sub_fg.copy()
+        for _ in range(int(p.watershed_erosion)):
+            seed_src = binary_erosion(seed_src, disk(1))
+
+    if distance_from is not None:
+        dist = np.asarray(distance_from, np.float32) * seed_src
+        markers = _distance_markers(dist, sub_fg, p)
+    else:
+        dist, markers = _distance_and_markers(seed_src, sub_fg, p)
+
+    if markers.max() > 0:
+        return np.asarray(watershed(-dist, markers, mask=sub_fg), np.int32)
+    lab, _ = ndi.label(sub_fg)
+    return np.asarray(lab, np.int32)

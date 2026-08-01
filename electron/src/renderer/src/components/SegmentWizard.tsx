@@ -109,6 +109,8 @@ interface SegSaved {
   method: Method
   sensitivity: number
   minScore: number
+  mergeNm: number
+  minNm: number
   threshold: Threshold
   minSize: number
   maxSize: number
@@ -128,7 +130,8 @@ interface SegSaved {
   eraser: boolean
 }
 const DEFAULTS: SegSaved = {
-  method: 'classical', sensitivity: 0.5, minScore: 0, threshold: 'otsu', minSize: 20,
+  method: 'classical', sensitivity: 0.5, minScore: 0, mergeNm: 0, minNm: 0,
+  threshold: 'otsu', minSize: 20,
   maxSize: 0, watershed: true, minSeparation: 3, markerSmooth: 1.0,
   gaussian: 0.0, rbKernel: 0, invert: false, localSize: 31, clearBorder: false,
   storeMasks: true, track: true, maxDist: 10.0, brush: 3.0,
@@ -167,6 +170,8 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
   const [method, setMethod] = React.useState<Method>(saved.method)
   const [sensitivity, setSensitivity] = React.useState(saved.sensitivity)
   const [minScore, setMinScore] = React.useState(saved.minScore)
+  const [mergeNm, setMergeNm] = React.useState(saved.mergeNm)
+  const [minNm, setMinNm] = React.useState(saved.minNm)
   const [threshold, setThreshold] = React.useState<Threshold>(saved.threshold)
   const [minSize, setMinSize] = React.useState(saved.minSize)
   const [maxSize, setMaxSize] = React.useState(saved.maxSize)
@@ -201,7 +206,7 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
 
   const vals = React.useRef<SegSaved>(saved)
   vals.current = {
-    method, sensitivity, minScore, threshold, minSize, maxSize, watershed, minSeparation,
+    method, sensitivity, minScore, mergeNm, minNm, threshold, minSize, maxSize, watershed, minSeparation,
     markerSmooth, gaussian, rbKernel, invert, localSize, clearBorder,
     storeMasks, track, maxDist, brush, activeClass, eraser,
   }
@@ -221,6 +226,7 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
     const v = vals.current
     return {
       method: v.method, sensitivity: v.sensitivity, min_score: v.minScore,
+      merge_nm: v.mergeNm, min_nm: v.minNm,
       threshold: v.threshold,
       min_size: v.minSize, max_size: v.maxSize, watershed: v.watershed,
       min_separation: v.minSeparation, marker_smooth: v.markerSmooth,
@@ -414,20 +420,34 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
           </div>
         )}
 
-        {/* ── Confidence: the ONE "too many particles" control ─────────────
-            Shown for EVERY engine and meaning the same thing in each, because
-            it acts on the measured OUTPUT (each instance's contrast-to-noise
-            score) rather than on any one method's parameters. Filtering an
-            already-measured result is a numpy mask over a few hundred rows, so
-            dragging re-filters instantly and never re-segments. */}
-        <div style={sensRowStyle}>
-          <span style={endLabelStyle}>All</span>
-          <input data-testid="seg-min-score" type="range"
-            min={0} max={0.99} step={0.01} value={minScore}
-            style={{ flex: 1, minWidth: 40 }}
-            onChange={(e) => { const n = Number(e.target.value); setMinScore(n); tune() }} />
-          <span style={endLabelStyle}>Strong</span>
-        </div>
+        {/* ── The two face controls, both in NANOMETRES ────────────────────
+            A distance in the image is something the eye can judge against the
+            scale bar; a 0-1 "confidence" is not, which is why that control read
+            as meaningless. Both are engine-independent — they act on the
+            measured instances, not on any one method's parameters — so the
+            caret's face is the same on Classical, Scribble and Prompt.
+
+            `merge` answers "some of these should be one particle": pieces whose
+            gap is under it are relabelled as one. `min` drops anything smaller
+            than that across. Confidence is still available under Advanced. */}
+        <Field label="Merge closer than">
+          <div style={sensRowStyle}>
+            <input data-testid="seg-merge-nm" type="range"
+              min={0} max={100} step={1} value={mergeNm}
+              style={{ flex: 1, minWidth: 40 }}
+              onChange={(e) => { const n = Number(e.target.value); setMergeNm(n); tune() }} />
+            <span style={endLabelStyle}>{mergeNm ? `${mergeNm} nm` : 'off'}</span>
+          </div>
+        </Field>
+        <Field label="Ignore smaller than">
+          <div style={sensRowStyle}>
+            <input data-testid="seg-min-nm" type="range"
+              min={0} max={200} step={1} value={minNm}
+              style={{ flex: 1, minWidth: 40 }}
+              onChange={(e) => { const n = Number(e.target.value); setMinNm(n); tune() }} />
+            <span style={endLabelStyle}>{minNm ? `${minNm} nm` : 'off'}</span>
+          </div>
+        </Field>
 
         {/* ── Scribble: the class list + Train ─────────────────────────────── */}
         {isScribble && (

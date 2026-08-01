@@ -97,6 +97,14 @@ DEFAULTS: dict[str, Any] = dict(
     # every engine, because it acts on the OUTPUT rather than on any one
     # method's parameters. 0 keeps everything (the old behaviour).
     min_score=0.0,
+    # THE two face controls, both in NANOMETRES because a distance in the image
+    # is something the eye can judge and a 0-1 confidence is not.
+    #   merge_nm  — pieces closer than this are ONE particle
+    #   min_nm    — smallest particle worth keeping (diameter)
+    # Both are converted to pixels with the signal's own scale at dispatch, so
+    # they mean the same thing at any magnification. 0 disables either.
+    merge_nm=0.0,
+    min_nm=0.0,
     min_size=20,
     max_size=0,
     watershed=True,
@@ -681,9 +689,45 @@ def _segment_kwargs(p: dict) -> dict:
         rb_kernel=int(p["rb_kernel"]), gaussian=float(p["gaussian"]),
         invert=bool(p["invert"]), local_size=int(p["local_size"]),
         watershed=bool(p["watershed"]), min_separation=int(p["min_separation"]),
-        marker_smooth=float(p["marker_smooth"]), min_size=int(p["min_size"]),
+        marker_smooth=float(p["marker_smooth"]), min_size=_min_size_px(p),
         max_size=int(p["max_size"]), clear_border=bool(p["clear_border"]),
+        merge_distance=_nm_to_px(p.get("merge_nm", 0.0), p),
     )
+
+
+def _nm_to_px(value_nm: float, p: dict) -> float:
+    """A face control in nanometres -> pixels, using the signal's own scale.
+
+    The face controls are physical so they mean the same thing at any
+    magnification, and so the number matches what the scale bar says. `scale` is
+    stashed on the params at dispatch (nm per pixel); a missing or zero scale
+    means the signal is uncalibrated, and then the value IS pixels rather than
+    being silently divided by nothing.
+    """
+    try:
+        v = float(value_nm or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    if v <= 0:
+        return 0.0
+    try:
+        scale = float(p.get("scale") or 0.0)
+    except (TypeError, ValueError):
+        scale = 0.0
+    return v / scale if scale > 0 else v
+
+
+def _min_size_px(p: dict) -> int:
+    """`min_nm` (a DIAMETER) wins over the raw pixel `min_size` when set.
+
+    Area, not diameter, is what the size filter compares -- a particle of
+    diameter d covers ~pi/4 d^2 pixels -- so converting the physical control
+    means going through the area, not handing the diameter straight over.
+    """
+    d_px = _nm_to_px(p.get("min_nm", 0.0), p)
+    if d_px > 0:
+        return max(1, int(round(3.14159265 / 4.0 * d_px * d_px)))
+    return int(p["min_size"])
 
 
 def _segment_params(p: dict):
