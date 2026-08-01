@@ -632,6 +632,31 @@ function Slide({ cells, active, reportFigures, iframeRefs, replayState, onLaunch
     meta.style === 'plain' ? styles.slideBgPlain
       : meta.style === 'accent' ? styles.slideBgAccent : {}
 
+  // SHARE the vertical budget between the visual cells on this slide.
+  //
+  // Every figure used to get a fixed 58vh box, so a slide holding a navigator
+  // AND its signal asked for 116vh of an ~85vh stage: the deck overflowed, the
+  // second figure was clipped, and the pager sat on top of it. Dividing the
+  // budget keeps the whole slide on screen, which is the thing a presentation
+  // has to guarantee.
+  //
+  // It rides on a CSS custom property rather than a computed inline height so
+  // the split cell's two panes inherit the same budget without plumbing a prop
+  // through every cell type.
+  const visualCells = cells.filter(
+    c => c.cell_type === 'figure' || c.cell_type === 'split' || c.cell_type === 'image'
+      || c.cell_type === 'movie').length
+  // Leave room for the markdown around them; never shrink below something
+  // readable, and never grow past the single-figure case.
+  //
+  // `vh` is only the STARTING point — each figure also carries a caption and
+  // margins (~28px measured), and hand-computing that against the viewport was
+  // wrong twice (24vh and 18vh both still overflowed at five figures). So the
+  // boxes also FLEX: `slideInner` is a flex column and each box is
+  // `flex: 1 1 <figVh>`, which lets the browser do the arithmetic against the
+  // real stage height whatever the captions and markdown around them cost.
+  const figVh = visualCells <= 1 ? 58 : Math.max(16, Math.round(62 / visualCells))
+
   const renderCell = (cell: ReportCell) => (
     <SlideCell
       key={cell.id}
@@ -649,9 +674,11 @@ function Slide({ cells, active, reportFigures, iframeRefs, replayState, onLaunch
       data-active={active ? '1' : '0'}
       data-kind={isTitle ? 'title' : 'content'}
       data-style={meta.style || 'default'}
+      data-fig-vh={figVh}
       style={{ ...styles.slide, ...styleBg,
         ...(isTitle ? styles.slideTitle : {}),
-        ...(active ? styles.slideActive : {}) }}
+        ...(active ? styles.slideActive : {}),
+        ['--spyde-fig-vh' as any]: `${figVh}vh` }}
     >
       <div style={{ ...styles.slideInner, ...(isTitle ? styles.slideInnerTitle : {}) }}>
         {cells.map(cell => (
@@ -825,7 +852,9 @@ const styles: Record<string, React.CSSProperties> = {
     alignItems: 'center', justifyContent: 'center',
   },
   splitFigBox: {
-    position: 'relative', width: '100%', height: '48vh',
+    position: 'relative', width: '100%',
+    height: 'var(--spyde-fig-vh, 48vh)',
+    flex: '1 1 var(--spyde-fig-vh, 48vh)', minHeight: 0,
     border: '1px solid #313244', borderRadius: 8, overflow: 'hidden',
     background: '#0e0e16',
   },
@@ -835,7 +864,16 @@ const styles: Record<string, React.CSSProperties> = {
     padding: '5vh 8vw', overflowY: 'auto',
   },
   slideActive: { display: 'flex' },
-  slideInner: { maxWidth: '60rem', margin: '0 auto', width: '100%' },
+  slideInner: {
+    maxWidth: '60rem', margin: '0 auto', width: '100%',
+    // A flex COLUMN so the figure boxes above can shrink to share the stage.
+    // minHeight:0 lets it actually shrink inside the slide's own flex context.
+    // flex:1 1 0 (not the default 1 1 auto) so this TAKES the slide's height
+    // instead of sizing to its content — only then can the figure boxes inside
+    // shrink to share it rather than overflowing.
+    display: 'flex', flexDirection: 'column', minHeight: 0,
+    flex: '1 1 0',
+  },
   // A title slide: content vertically + horizontally centered, tighter column.
   slideTitle: { justifyContent: 'center', textAlign: 'center' },
   slideInnerTitle: { maxWidth: '48rem' },
@@ -852,7 +890,12 @@ const styles: Record<string, React.CSSProperties> = {
     // ancestor. Without this the iframe escaped its box and filled the whole
     // slide.
     position: 'relative',
-    width: '100%', height: '58vh',
+    // The slide sets --spyde-fig-vh so N figures share the stage; 58vh is the
+    // single-figure fallback (and what a stray box outside a slide gets).
+    width: '100%', height: 'var(--spyde-fig-vh, 58vh)',
+    // flex-shrink so several figures share the stage instead of overflowing it;
+    // minHeight:0 is required or a flex item refuses to go below its content.
+    flex: '1 1 var(--spyde-fig-vh, 58vh)', minHeight: 0,
     border: '1px solid #313244', borderRadius: 8, overflow: 'hidden',
     background: '#0e0e16',
   },
