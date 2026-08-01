@@ -1586,3 +1586,68 @@ parity, and it is not close on sparse labels. If this is revisited, the thing to
 attack is label efficiency (pretraining, heavier augmentation, or a loss that
 does not reward over-segmentation), not step count or model size: `small` has
 16x the parameters of `tiny` and is WORSE on the fixture.
+
+---
+
+## Non-rigid drift at scale — 4096² x hundreds of frames (2026-07-31)
+
+`python -m spyde.tests.benchmark_drift_nonrigid --frames 300`, CUDA (TITAN X
+Pascal), 120 steps.
+
+The first fact is that the stack CANNOT be held: 300 x 4096² float32 is
+**20.1 GB**. So the cost is two separate numbers that scale differently, and only
+one of them is paid per frame. Quoting a single blended figure would hide the
+one thing a caller has to decide — how much to decimate.
+
+### The FIT is cheap — the whole movie at once
+
+A drift field is smooth by construction (that IS the modelling assumption), so it
+does not need full resolution to be measured. The fit is over a handful of
+parameters per frame — 2 x n_knots, or 2 x gh x gw — and decimation is the
+dominant knob:
+
+| fit size | decimation | scan-knot | dense (6x6) |
+|---|---|---|---|
+| 128² | 32x | 2.73 s | 2.29 s |
+| 256² | 16x | 2.41 s | 7.71 s |
+| 512² | 8x | **9.08 s** | **28.39 s** |
+
+That is for all 300 frames together, i.e. 8-95 ms per frame. Scan-knot barely
+notices the resolution (it has ~6 parameters per frame); dense scales with it,
+because a 6x6 grid bicubically upsampled to 512² is real work per step.
+
+`_NONRIGID_FIT_SIDE = 512` is the conservative choice — more signal for the
+correlation. 256² is 1.2x cheaper for scan-knot and **3.7x** for dense, and a
+smooth field should be perfectly measurable there; that is worth testing against
+recovery accuracy before anyone pays the 28 s.
+
+### The APPLY is the expensive half, and it is PER FRAME
+
+| | ms/frame at 4096² | 300 frames |
+|---|---|---|
+| scan-knot | **385 ms** | 115 s |
+| dense | **432 ms** | 130 s |
+
+**This is the number that matters operationally.** 385 ms is ~23x the 16.7 ms
+60 fps budget, so a non-rigid corrected movie CANNOT be scrubbed frame-by-frame
+the way a rigid one can — rigid applies as an `np.roll` for integer shifts and
+preserves dtype exactly (see `DriftModel.is_integer`), while non-rigid resamples
+every pixel through `grid_sample`. Two consequences worth stating plainly:
+
+* For EXPORT / batch, ~2 minutes over a 300-frame movie is a reasonable price
+  and is dominated by the per-frame resample, not the fit.
+* For INTERACTIVE display, the corrected node needs the same treatment as any
+  other expensive per-frame read — the tiered nav read routes it async
+  (Live-Display §3), or the field is applied to a decimated view for scrubbing
+  and only at full resolution on commit.
+
+The fit is therefore NOT the thing to optimise. Even the slowest fit measured
+(dense at 512², 28 s) is a quarter of the apply cost over the same movie.
+
+### Reading the movie to fit it
+
+The decimated read is one full streaming pass — `_decimated_stack` reads frames
+ONE AT A TIME and strides each immediately, so the 20 GB is never resident. On a
+real `.mrc` at ~3 GB/s that pass is ~7 s, i.e. comparable to the 128²/256² fits
+and cheap against the apply. Strided rather than area-averaged on purpose: the
+fit needs crisp gradients to correlate, and a box mean blurs exactly those.

@@ -174,15 +174,31 @@ class TestCheckWindow:
 
 
 class TestMethodStubs:
-    def test_nonrigid_says_so_and_stays_rigid(self, window):
+    def test_nonrigid_is_selectable_now_that_it_is_implemented(self, window):
+        """Non-rigid used to be a stub that silently reverted to rigid.
+
+        It is implemented (``spyde.drift.nonrigid``), so selecting it must
+        STICK — a caret that quietly reverts would put the wrong ``kind`` in
+        provenance, which is what the stub test was guarding against.
+        """
         session, plot, _tree, wiz = _opened(window)
-        msgs = window["messages"]
         dr.drift_set_method(session, plot, {"method": "nonrigid"})
-        assert wiz.params["method"] == "rigid", (
-            "a stub must not leave the caret claiming a model the solve does "
-            "not implement — the wrong `kind` would land in provenance")
-        assert any("not implemented" in str(m.get("text", ""))
-                   for m in _of_type(msgs, "status"))
+        assert wiz.params["method"] == "nonrigid"
+        assert "nonrigid" not in dr._UNAVAILABLE
+
+    def test_the_nonrigid_field_parameterisation_is_selectable(self, window):
+        """Both parameterisations describe different physics; neither is a default
+        the user should be stuck with."""
+        session, plot, _tree, wiz = _opened(window)
+        dr.drift_set_method(session, plot, {"method": "nonrigid"})
+        for name in dr.NONRIGID_MODELS:
+            wiz.params = dr._coerce({**wiz.params, "nonrigid_model": name})
+            assert wiz.params["nonrigid_model"] == name
+
+    def test_an_unknown_field_falls_back_rather_than_raising(self, window):
+        session, plot, _tree, wiz = _opened(window)
+        wiz.params = dr._coerce({**wiz.params, "nonrigid_model": "banana"})
+        assert wiz.params["nonrigid_model"] == dr.DEFAULTS["nonrigid_model"]
 
     def test_rigid_affine_says_so_too(self, window):
         session, plot, _tree, wiz = _opened(window)

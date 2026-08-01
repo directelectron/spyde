@@ -88,9 +88,21 @@ METHODS: tuple[str, ...] = ("rigid", "rigid_affine", "nonrigid")
 _UNAVAILABLE = {
     "rigid_affine": ("the affine drift search (plan A4) is not implemented in "
                      "spyde.drift yet"),
-    "nonrigid": ("non-rigid warping (plan A5) is not implemented in spyde.drift "
-                 "yet"),
 }
+
+#: The two non-rigid parameterisations (:mod:`spyde.drift.nonrigid`). Scan-knot
+#: describes a SCANNING artifact (displacement varies down the slow axis only);
+#: dense describes the SAMPLE deforming (varies in both directions). Both causes
+#: are real, which is why this is a choice and not an assumption.
+NONRIGID_MODELS: tuple[str, ...] = ("scan_knot", "dense")
+
+#: Longest side the non-rigid fit sees. The stack CANNOT be held at full size —
+#: 300 x 4096² float32 is 20 GB — and it does not need to be: a drift field is
+#: smooth by construction, which is the whole modelling assumption, so it is
+#: measurable from a decimated copy. The fit's parameters are resolution-
+#: independent (fractions of the frame), so the field rebuilds at full size for
+#: the apply. Numbers in benchmarks.md.
+_NONRIGID_FIT_SIDE = 512
 
 #: Frames summed for the whole-movie before/after check images. A sum is a
 #: SHARPNESS test, not a measurement — a few dozen frames already show the blur
@@ -194,6 +206,8 @@ DEFAULTS: dict[str, Any] = dict(
     use_roi=False,
     reject_outliers=True,
     method="rigid",
+    nonrigid_model="scan_knot",
+    nonrigid_steps=120,
     upsample=8,
     max_shift=32.0,
     reference="running",
@@ -225,6 +239,16 @@ class DriftWizard(WizardController):
         "method": {
             "name": "Model", "type": "enum", "default": DEFAULTS["method"],
             "choices": list(METHODS), "tab": "Advanced",
+        },
+        "nonrigid_model": {
+            "name": "Non-rigid field", "type": "enum",
+            "default": DEFAULTS["nonrigid_model"],
+            "choices": list(NONRIGID_MODELS), "tab": "Advanced",
+        },
+        "nonrigid_steps": {
+            "name": "Non-rigid steps", "type": "int",
+            "default": DEFAULTS["nonrigid_steps"],
+            "min": 10, "max": 1000, "tab": "Advanced",
         },
         "reference": {
             "name": "Reference", "type": "enum", "default": DEFAULTS["reference"],
@@ -720,6 +744,10 @@ def _coerce(payload: dict | None) -> dict:
     p["method"] = str(p["method"]).lower()
     if p["method"] not in METHODS:
         p["method"] = DEFAULTS["method"]
+    p["nonrigid_model"] = str(p["nonrigid_model"]).lower()
+    if p["nonrigid_model"] not in NONRIGID_MODELS:
+        p["nonrigid_model"] = DEFAULTS["nonrigid_model"]
+    p["nonrigid_steps"] = int(min(1000, max(10, p["nonrigid_steps"])))
     if p["reference"] not in ("running", "sequential", "first"):
         p["reference"] = DEFAULTS["reference"]
     p["upsample"] = max(1, int(p["upsample"]))
@@ -727,6 +755,64 @@ def _coerce(payload: dict | None) -> dict:
     p["order"] = int(min(3, max(0, p["order"])))
     p["preview_frames"] = int(min(200, max(4, p["preview_frames"])))
     return p
+
+
+def _decimated_stack(get_frame, n_frames: int, side: int = _NONRIGID_FIT_SIDE,
+                     cancel=None) -> np.ndarray:
+    """Read every frame at reduced resolution for the non-rigid fit.
+
+    Strided, not area-averaged. The fit needs STRUCTURE to correlate, and a
+    stride keeps edges crisp where a box mean blurs exactly the gradients the
+    solve reads; it is also ~free where the mean costs a pass over every pixel
+    (the same reasoning as the navigator's base-frame subsample, Live-Display
+    §3). Frames are read ONE AT A TIME and decimated immediately, so the full
+    stack is never held — 300 x 4096² float32 would be 20 GB.
+    """
+    out: list[np.ndarray] = []
+    for i in range(int(n_frames)):
+        if cancel is not None and cancel():
+            break
+        f = np.asarray(get_frame(int(i)), np.float32)
+        step = max(1, int(max(f.shape) // max(1, side)))
+        out.append(np.ascontiguousarray(f[::step, ::step], dtype=np.float32))
+    if not out:
+        return np.zeros((0, 1, 1), np.float32)
+    return np.stack(out)
+
+
+def _solve_nonrigid_step(wiz, p: dict, rigid_model, get_frame, n_frames: int,
+                         *, progress=None, cancel=None):
+    """Fit the non-rigid residual on top of a solved rigid model.
+
+    Returns the non-rigid :class:`DriftModel` (which carries the rigid
+    ``shifts`` forward unchanged), or the rigid model untouched if the fit
+    cannot run. A failure here must NOT lose the rigid answer — that is a good
+    result the user already waited for.
+    """
+    from spyde.drift import solve_nonrigid
+
+    stack = _decimated_stack(get_frame, n_frames, cancel=cancel)
+    if stack.shape[0] < 2:
+        return rigid_model
+    try:
+        return solve_nonrigid(
+            stack,
+            model=str(p["nonrigid_model"]),
+            rigid=rigid_model,
+            steps=int(p["nonrigid_steps"]),
+            device=None,
+            progress=progress,
+            cancel=cancel,
+            provenance={"action": "Drift Correction (non-rigid)",
+                        "params": dict(p)},
+        )
+    except Exception as exc:
+        # torch missing, CUDA OOM, a device that will not take the graph — all
+        # end here. Say so and keep the rigid model rather than failing the run.
+        log.warning("[drift] non-rigid fit failed (%s); keeping the rigid model", exc)
+        emit_status(f"Drift Correction: non-rigid fit failed ({exc}) — "
+                    "keeping the rigid result.")
+        return rigid_model
 
 
 def _solver_kwargs(p: dict, roi=None) -> dict:
@@ -1145,6 +1231,25 @@ def drift_run(session, plot, payload) -> None:
         _flush()
         if stopped[0]:
             return model, None, float("nan")
+
+        # The non-rigid residual, on top of the rigid solve. Runs AFTER it (and
+        # only on request) because it is a correction to what rigid leaves
+        # behind: the rigid pass has already removed everything that moves the
+        # whole frame, so what this fits is scan distortion or sample
+        # deformation rather than a mixture of those and the stage.
+        if p["method"] == "nonrigid":
+            emit_status(f"Fitting the non-rigid field ({p['nonrigid_model']})…")
+
+            def _nr_progress(done, total):
+                emit_progress(int(done), int(total), "Drift (non-rigid)")
+                emit({"type": "drift_progress", "window_id": wiz.src_window_id,
+                      "done": int(done), "total": int(total)})
+
+            model = _solve_nonrigid_step(
+                wiz, p, model, get_frame, int(n_frames),
+                progress=_nr_progress, cancel=lambda: stopped[0])
+            if stopped[0]:
+                return model, None, float("nan")
         # One extra streaming pass over the SAME bounded subset the raw sum
         # used, so the two check images are comparable.
         after = _stack_sum(get_frame, wiz.sum_indices(n_frames), model.shifts,
