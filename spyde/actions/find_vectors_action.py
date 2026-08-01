@@ -25,6 +25,7 @@ import hyperspy.api as hs
 log = logging.getLogger(__name__)
 
 from spyde.backend.ipc import emit, emit_status, emit_error
+from spyde.backend import test_hold as _hold
 from spyde.actions.context import src_plot_tree as _src_plot_tree
 from spyde.actions.find_vectors import _do_compute_vectors, _copy_nav_axes_to
 
@@ -256,6 +257,14 @@ def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = Tr
             return
         if live_frames.add(nav_slices, block):
             preview.note_block(nav_slices)
+            # Optional deterministic pause so a test can inspect a PARTIALLY
+            # filled result (see backend/test_hold.py). No-op unless
+            # SPYDE_TEST_HOLD names this point; blocking this Dask callback
+            # thread is what keeps the half-filled display up and interactive
+            # while the asyncio main thread carries on serving the UI.
+            if _hold.armed():
+                _hold.hold_point("fv-batch", preview.ready_count,
+                                 preview.n_positions)
 
     # Marks the batch as in-flight so a downstream action opened in the gap
     # (e.g. Strain Mapping) can tell "still computing, keep waiting" apart from
@@ -925,3 +934,14 @@ def fv_close(session, plot, payload=None) -> None:
         except Exception as e:
             log.debug("removing find-vectors preview on stop failed: %s", e)
         tree._fv_preview = None
+
+
+def test_hold_release(session, plot, payload=None) -> None:
+    """Release a deterministic test hold (``SPYDE_TEST_HOLD``) by name.
+
+    Test-only wiring, and inert in production: with the env var unset there is
+    no hold to release and this reports as much. See backend/test_hold.py.
+    """
+    name = str((payload or {}).get("name") or "fv-batch")
+    ok = _hold.release(name)
+    emit_status(f"test hold {name}: {'released' if ok else 'not configured'}")

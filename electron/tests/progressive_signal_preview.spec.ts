@@ -43,7 +43,16 @@ test.beforeAll(async () => {
   mkdirSync(SHOTS, { recursive: true })
   // INFO tees the backend's logging to stderr, which the harness buffers — the
   // `[live-signal]` lines are how we know the preview fired during the fill.
-  ctx = await launchApp({ dask: true, env: { SPYDE_LOG_LEVEL: 'INFO' } })
+  // SPYDE_TEST_HOLD parks the find-vectors batch once ~35% of the scan has
+  // been computed and keeps it parked until this spec releases it
+  // (backend/test_hold.py). That turns "observe a partially-computed result"
+  // from a race into a state we can take our time over — which is what part
+  // (b) needs, since it must have the batch RUNNING and the navigator over
+  // COMPUTED data at the same instant.
+  ctx = await launchApp({
+    dask: true,
+    env: { SPYDE_LOG_LEVEL: 'INFO', SPYDE_TEST_HOLD: 'fv-batch@0.35' },
+  })
   await backendAction(ctx.page, 'load_test_data_sped_ag')
   await waitForSubwindowCount(ctx.page, 2, 420_000)
 })
@@ -241,14 +250,22 @@ test('the vectors signal plot fills in while the batch is still running', async 
   // into that band before measuring. The claim under test is "dragging over an
   // ALREADY-COMPUTED region serves that region's frames", which needs the drag
   // to actually be over one.
-  // Waiting for a fraction of the fill first does NOT work: `previewProgress()`
-  // reads the preview's own throttled PAINT log, which stops updating once
-  // painting stops, so it under-reports and a "wait until 30%" poll never
-  // clears. Aim instead — drag the crosshair (unmeasured) to the TOP of the
-  // map, the part that is ready earliest.
+  // The batch is PARKED at ~35% by SPYDE_TEST_HOLD (see beforeAll and
+  // backend/test_hold.py), so from here to the release below the partially
+  // computed state is a fact rather than a race. Two earlier attempts at this
+  // without the hold both failed: polling `previewProgress()` for a fraction
+  // reads the preview's throttled PAINT log, which stops updating once
+  // painting stops and so never clears; and simply dragging fast enough lost
+  // to a batch that had already finished (`batch still running: false`).
+  await ctx.backend.waitForLog('[test-hold] fv-batch parked', 240_000)
+
+  // Aim into the COMPUTED band. The batch fills in nav order, so ~35% ready is
+  // the top ~35% of rows; the crosshair starts at the CENTRE, and walking left
+  // from there dragged over uncomputed data by construction — which is why
+  // `served` stayed 0 no matter how the drag was tuned.
   const navBox = await vecNav.locator('iframe').first().boundingBox()
   await dragCrosshair(page, vecNav, {
-    dx: 0, dy: -Math.round((navBox?.height ?? 300) * 0.45), steps: 1,
+    dx: 0, dy: -Math.round((navBox?.height ?? 300) * 0.35), steps: 1,
   })
 
   // Walk LEFT from there: the result window's right edge sits under the Plot
@@ -291,6 +308,9 @@ test('the vectors signal plot fills in while the batch is still running', async 
 
   // Let the batch finish before the app closes (closing mid-batch wedges the
   // hidden backend's stdin tick — see find_vectors_workflow.spec.ts).
+  // Let the parked batch run to completion — without this the finalize wait
+  // below would sit until the hold's own MAX_HOLD_S timeout.
+  await backendAction(page, 'test_hold_release', { name: 'fv-batch' })
   await ctx.backend.waitForLog('[fv-batch] finalized', 420_000)
   await expect.poll(() => figureSignature(vecSig).then((s) => s.bright), {
     timeout: 30_000, message: 'the finalized vectors window is blank',
