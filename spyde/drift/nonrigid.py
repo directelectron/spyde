@@ -461,6 +461,27 @@ def _yield_device(torch, device, on_yield) -> None:
 
 # ── applying a fitted model ──────────────────────────────────────────────────
 
+def _field_on_device(torch, model: DriftModel, index: int, device):
+    """Build one frame's ``(dy, dx)`` DIRECTLY on *device*.
+
+    Separate from :func:`displacement_for_frame` because that one returns numpy
+    for inspection, and routing the apply through it would build a 4096² field
+    on the CPU and then ship 134 MB of it across PCIe — the transfer is already
+    the dominant cost (see :func:`apply_nonrigid`), so adding two more arrays to
+    it is the wrong direction. The parameters are a few hundred bytes; send
+    those instead and expand on the far side.
+    """
+    p = np.asarray(model.extra["params"], np.float32)
+    if not 0 <= index < p.shape[0]:
+        raise IndexError(f"frame {index} out of range for {p.shape[0]} fitted frames")
+    shape = tuple(model.extra["field_shape"])
+    t = torch.as_tensor(p[index: index + 1], device=device)
+    if model.kind == SCAN_KNOT:
+        return scan_knot_field(
+            torch, t, shape, float(model.extra.get("scan_direction_degrees", 0.0)))
+    return dense_field(torch, t, shape)
+
+
 def displacement_for_frame(model: DriftModel, index: int) -> tuple[np.ndarray, np.ndarray]:
     """Rebuild the ``(dy, dx)`` field for one frame of a fitted model.
 
@@ -487,19 +508,67 @@ def displacement_for_frame(model: DriftModel, index: int) -> tuple[np.ndarray, n
     return (dy[0].numpy().copy(), dx[0].numpy().copy())
 
 
-def apply_nonrigid(frame, model: DriftModel, index: int) -> np.ndarray:
+def apply_nonrigid(frame, model: DriftModel, index: int,
+                   *, device: str | None = None) -> np.ndarray:
     """Apply a fitted non-rigid model to ONE frame. NaN outside coverage.
 
     Per-frame by design, like :func:`spyde.drift.warp.shift_frame` — the aligned
     movie is never materialised.
+
+    Parameters
+    ----------
+    device
+        ``None`` (default) picks CUDA when it is available, else CPU. This is
+        the dominant performance knob and it is worth being explicit about why.
+
+    Performance
+    -----------
+    Measured at 4096², TITAN X Pascal:
+
+    ==========================  =========
+    CPU total                     392 ms
+    build field (CPU)              68 ms
+    warp (CPU)                    262 ms
+    CUDA, frame resident          **7.9 ms**
+    CUDA, incl. both transfers     41 ms
+    ==========================  =========
+
+    So the GPU path is ~9.5x end to end, and note WHAT it is bound by: the warp
+    itself is 7.9 ms and the host<->device copies are the other ~33 ms. It is
+    **transfer-bound, not compute-bound**, which has two consequences:
+
+    * Micro-optimising the warp buys almost nothing. The lever is not moving the
+      data — a batch pipeline that keeps frames resident on the device pays only
+      the 7.9 ms, i.e. ~2.4 s for a 300-frame movie instead of ~12 s.
+    * The field is built on the device from the PARAMETERS (a few hundred bytes)
+      rather than built on the host and shipped, which would add 134 MB of
+      transfer to the very thing that dominates.
+
+    A 4096² frame is ~1.4 GB/s each way of pure copy, so on a machine with no
+    CUDA device this stays the 392 ms CPU path and the caller should expect a
+    non-rigid movie to be an export-time operation, not a scrub-time one.
     """
     torch = _torch()
-    dy, dx = displacement_for_frame(model, index)
     f = np.asarray(frame, np.float32)
-    if f.shape != dy.shape:
-        raise ValueError(f"frame is {f.shape}, model was fitted at {dy.shape}")
-    t = torch.as_tensor(f)[None]
-    out = warp_frame(torch, t,
-                     torch.as_tensor(dy)[None], torch.as_tensor(dx)[None],
-                     fill_nan=True)
-    return out[0].numpy().copy()
+    shape = tuple(model.extra["field_shape"])
+    if f.shape != shape:
+        raise ValueError(f"frame is {f.shape}, model was fitted at {shape}")
+
+    dev = _resolve_device(device)
+    # MPS is excluded deliberately: the win here is a fused grid_sample, and the
+    # shared device lock makes an unsolicited MPS submission a contention risk
+    # for whatever else holds it. Opt in explicitly with device="mps".
+    if device is None and getattr(dev, "type", None) == "mps":
+        dev = torch.device("cpu")
+
+    from spyde.device_lock import accelerator_lock
+    with accelerator_lock(dev):
+        dy, dx = _field_on_device(torch, model, index, dev)
+        t = torch.as_tensor(f, device=dev)[None]
+        out = warp_frame(torch, t, dy, dx, fill_nan=True)
+        # No trailing .copy(): `.to("cpu")` already returns a tensor that OWNS
+        # its memory (it is a device->host copy, or a no-op clone-free view of a
+        # CPU tensor we just built), and `.numpy()` keeps that storage alive
+        # through the array's base. An extra copy here is 67 MB at 4096² and was
+        # measurably a fifth of the GPU path's total cost.
+        return out[0].detach().to("cpu").numpy()

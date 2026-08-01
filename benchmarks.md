@@ -1651,3 +1651,44 @@ ONE AT A TIME and strides each immediately, so the 20 GB is never resident. On a
 real `.mrc` at ~3 GB/s that pass is ~7 s, i.e. comparable to the 128²/256² fits
 and cheap against the apply. Strided rather than area-averaged on purpose: the
 fit needs crisp gradients to correlate, and a box mean blurs exactly those.
+
+### Making the apply faster — it is TRANSFER-bound, not compute-bound
+
+The 385 ms above was a CPU number: `apply_nonrigid` had no `device` argument and
+always ran on the host, on a machine whose GPU the *fit* was already using.
+Profiling the stages at 4096² says where it goes and what is worth attacking:
+
+| CPU stage | | CUDA | |
+|---|---|---|---|
+| build field | 68 ms | warp, frame resident | **7.9 ms** |
+| warp (grid_sample) | 262 ms | + both host<->device copies | 41 ms |
+| **total** | **392 ms** | | |
+
+**The warp itself is 7.9 ms; the other ~33 ms is PCIe.** So micro-optimising the
+resample buys almost nothing — the lever is not moving the data. Two things
+follow, and the second is the interesting one:
+
+* The field is now built on the DEVICE from the fitted parameters (a few hundred
+  bytes) instead of on the host and shipped. Building it host-side would add
+  134 MB to the very thing that already dominates.
+* A batch pipeline that keeps frames RESIDENT pays only the 7.9 ms — **~2.4 s for
+  a 300-frame movie** instead of ~14 s. That is the shape any future
+  "correct the whole movie on the GPU" path should take; per-frame calls from
+  host memory can never beat the copy.
+
+After adding `device=` (auto: CUDA when present) and dropping a redundant 67 MB
+`.copy()` on the way out — which was itself a fifth of the GPU path's cost:
+
+| | ms/frame at 4096² | 300 frames | |
+|---|---|---|---|
+| CPU (was 392) | 278 ms | 83.5 s | the field build no longer round-trips numpy |
+| **CUDA (default when present)** | **47.8 ms** | **14.4 s** | **5.8x** |
+
+CPU/CUDA agreement is `max|diff| = 4.2e-04` on data in [0, 1] with identical NaN
+masks — float32 `grid_sample` kernels differ slightly between backends, so this
+is close-but-not-bit-identical, unlike the region-integrator's exact contract.
+Fine for a resampled display frame; do not build an equality test on it.
+
+MPS is deliberately NOT selected by `device=None`. The win here is one fused
+kernel, and an unsolicited MPS submission contends for the shared device lock
+that the neural/scribble paths hold. Opt in with `device="mps"`.
