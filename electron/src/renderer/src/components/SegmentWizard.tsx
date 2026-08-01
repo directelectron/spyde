@@ -108,6 +108,7 @@ const LOW_PIXELS = 200
 interface SegSaved {
   method: Method
   sensitivity: number
+  minScore: number
   threshold: Threshold
   minSize: number
   maxSize: number
@@ -127,7 +128,7 @@ interface SegSaved {
   eraser: boolean
 }
 const DEFAULTS: SegSaved = {
-  method: 'classical', sensitivity: 0.5, threshold: 'otsu', minSize: 20,
+  method: 'classical', sensitivity: 0.5, minScore: 0, threshold: 'otsu', minSize: 20,
   maxSize: 0, watershed: true, minSeparation: 3, markerSmooth: 1.0,
   gaussian: 0.0, rbKernel: 0, invert: false, localSize: 31, clearBorder: false,
   storeMasks: true, track: true, maxDist: 10.0, brush: 3.0,
@@ -165,6 +166,7 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
   const saved = _segStore.get(windowId) ?? DEFAULTS
   const [method, setMethod] = React.useState<Method>(saved.method)
   const [sensitivity, setSensitivity] = React.useState(saved.sensitivity)
+  const [minScore, setMinScore] = React.useState(saved.minScore)
   const [threshold, setThreshold] = React.useState<Threshold>(saved.threshold)
   const [minSize, setMinSize] = React.useState(saved.minSize)
   const [maxSize, setMaxSize] = React.useState(saved.maxSize)
@@ -199,7 +201,7 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
 
   const vals = React.useRef<SegSaved>(saved)
   vals.current = {
-    method, sensitivity, threshold, minSize, maxSize, watershed, minSeparation,
+    method, sensitivity, minScore, threshold, minSize, maxSize, watershed, minSeparation,
     markerSmooth, gaussian, rbKernel, invert, localSize, clearBorder,
     storeMasks, track, maxDist, brush, activeClass, eraser,
   }
@@ -218,7 +220,8 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
   const params = (): Record<string, unknown> => {
     const v = vals.current
     return {
-      method: v.method, sensitivity: v.sensitivity, threshold: v.threshold,
+      method: v.method, sensitivity: v.sensitivity, min_score: v.minScore,
+      threshold: v.threshold,
       min_size: v.minSize, max_size: v.maxSize, watershed: v.watershed,
       min_separation: v.minSeparation, marker_smooth: v.markerSmooth,
       gaussian: v.gaussian, rb_kernel: v.rbKernel, invert: v.invert,
@@ -410,6 +413,21 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
             <span style={endLabelStyle}>More</span>
           </div>
         )}
+
+        {/* ── Confidence: the ONE "too many particles" control ─────────────
+            Shown for EVERY engine and meaning the same thing in each, because
+            it acts on the measured OUTPUT (each instance's contrast-to-noise
+            score) rather than on any one method's parameters. Filtering an
+            already-measured result is a numpy mask over a few hundred rows, so
+            dragging re-filters instantly and never re-segments. */}
+        <div style={sensRowStyle}>
+          <span style={endLabelStyle}>All</span>
+          <input data-testid="seg-min-score" type="range"
+            min={0} max={0.99} step={0.01} value={minScore}
+            style={{ flex: 1, minWidth: 40 }}
+            onChange={(e) => { const n = Number(e.target.value); setMinScore(n); tune() }} />
+          <span style={endLabelStyle}>Strong</span>
+        </div>
 
         {/* ── Scribble: the class list + Train ─────────────────────────────── */}
         {isScribble && (

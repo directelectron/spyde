@@ -714,16 +714,48 @@ class TestSpyDEParticles:
             SpyDEParticles.load(path)
 
     def test_load_rejects_changed_column_layout(self, tmp_path):
+        """A REORDERED/renamed layout is unreadable — but see the test below:
+        columns merely APPENDED since are not a layout change."""
         import json
+        from spyde.signals.particles import FORMAT_VERSION
         path = str(tmp_path / "cols.npz")
         np.savez_compressed(
-            path, flat_buffer=np.zeros((0, N_COLUMNS), np.float32),
+            path, flat_buffer=np.zeros((0, 2), np.float32),
             t_offsets=np.array([0]),
-            meta=np.array(json.dumps({"format_version": 1,
-                                      "columns": ["t", "label"],
+            meta=np.array(json.dumps({"format_version": FORMAT_VERSION,
+                                      "columns": ["label", "t"],   # swapped
                                       "frame_shape": [4, 4]})))
         with pytest.raises(ValueError, match="column layout changed"):
             SpyDEParticles.load(path)
+
+    def test_load_migrates_a_file_written_before_a_column_was_appended(self, tmp_path):
+        """An older file must still open.
+
+        New columns go at the END precisely so this is possible. Refusing the
+        file would make every previously-saved particle result unopenable in
+        order to add one DERIVED number — and it is derived, so it never needed
+        to have been stored.
+
+        The migrated `score` is 1.0, not 0.0: absent evidence is not evidence of
+        a bad particle, and the caret's confidence filter must not silently
+        delete instances measured before the score existed.
+        """
+        import json
+        from spyde.signals.particles import COLUMNS as _COLS, COL as _COL
+        old_cols = _COLS[:-1]                      # everything before `score`
+        path = str(tmp_path / "old.npz")
+        buf = np.zeros((3, len(old_cols)), np.float32)
+        buf[:, 0] = [0, 0, 1]                      # t
+        np.savez_compressed(
+            path, flat_buffer=buf, t_offsets=np.array([0, 2, 3]),
+            meta=np.array(json.dumps({"format_version": 1,
+                                      "columns": list(old_cols),
+                                      "frame_shape": [4, 4]})))
+        p = SpyDEParticles.load(path)
+        assert p.flat_buffer.shape == (3, N_COLUMNS)
+        assert np.all(p.flat_buffer[:, _COL["score"]] == 1.0), (
+            "migrated particles must not be filtered away by the confidence "
+            "slider — they carry no evidence, not bad evidence")
 
     def test_to_csv_writes_a_header_and_every_row(self, tmp_path):
         p = _build()
@@ -784,3 +816,101 @@ class TestNaNBorderPolarity:
         assert not on_border, (
             f"invert={invert}: instances {on_border} were found on the NaN "
             f"border, which is padding and not data")
+
+
+class TestConfidenceScore:
+    """One slider that means "fewer / more particles" on every engine.
+
+    The reported failure was 547 instances where ~30 were real, and six Advanced
+    knobs none of which says "fewer particles": min size, max size, split
+    touching, min separation, marker smoothing, drop-edge. Size and shape cannot
+    fix it — over-split support-film texture is often SMALL and ROUND, which is
+    exactly what a size/circularity filter keeps.
+
+    Contrast-to-noise against the instance's own dilated background ring is the
+    statistic that does separate them: a real particle sits well away from its
+    surroundings, while a fragment of textured film is by construction the same
+    brightness as the texture around it.
+    """
+
+    @staticmethod
+    def _field():
+        """~30 genuinely dark particles in a noisy support film, plus ~300
+        labelled fragments OF that film — the reported failure, in miniature."""
+        rng = np.random.default_rng(0)
+        h = w = 256
+        frame = np.full((h, w), 200.0, np.float32)
+        frame += rng.normal(0, 6.0, (h, w)).astype(np.float32)
+        labels = np.zeros((h, w), np.int32)
+        truth, nxt = {}, 1
+        y, x = np.mgrid[0:h, 0:w]
+        for _ in range(30):
+            cy, cx, r = rng.uniform(15, h - 15), rng.uniform(15, w - 15), rng.uniform(5, 10)
+            m = (y - cy) ** 2 + (x - cx) ** 2 < r * r
+            frame[m] = 120.0 + rng.normal(0, 5.0, int(m.sum())).astype(np.float32)
+            labels[m] = nxt; truth[nxt] = True; nxt += 1
+        for _ in range(300):
+            cy, cx, r = rng.uniform(8, h - 8), rng.uniform(8, w - 8), rng.uniform(3, 6)
+            m = ((y - cy) ** 2 + (x - cx) ** 2 < r * r) & (labels == 0)
+            if m.sum() < 20:
+                continue
+            labels[m] = nxt; truth[nxt] = False; nxt += 1
+        return frame, labels, truth
+
+    def test_the_score_separates_particles_from_textured_film(self):
+        from spyde.particles.measure import measure_frame
+        from spyde.signals.particles import COL
+
+        frame, labels, truth = self._field()
+        rows, _ = measure_frame(labels, frame, t=0)
+        scores = rows[:, COL["score"]]
+        real = np.array([truth.get(int(l), False)
+                         for l in rows[:, COL["label"]].astype(int)])
+        assert real.sum() and (~real).sum(), "the fixture built only one population"
+        # A gap, not merely a difference in means: the slider is only usable if
+        # SOME threshold cleanly separates them.
+        assert np.percentile(scores[real], 10) > np.percentile(scores[~real], 90), (
+            f"no separating threshold exists: real p10="
+            f"{np.percentile(scores[real], 10):.3f} vs texture p90="
+            f"{np.percentile(scores[~real], 90):.3f}")
+
+    def test_filtering_keeps_rows_and_contours_aligned(self):
+        """A misalignment draws one particle's outline on another's row."""
+        from spyde.actions.particles_action import filter_by_score
+        from spyde.signals.particles import COL, N_COLUMNS
+
+        rows = np.zeros((5, N_COLUMNS), np.float32)
+        rows[:, COL["score"]] = [0.05, 0.2, 0.6, 0.95, 0.99]
+        rows[:, COL["label"]] = [1, 2, 3, 4, 5]
+        contours = [np.full((3, 2), i, np.int16) for i in range(5)]
+        kept_rows, kept_contours = filter_by_score(rows, contours, 0.5)
+        assert len(kept_rows) == len(kept_contours) == 3
+        # the SURVIVING contours must be the ones belonging to the kept rows
+        assert [int(c[0, 0]) for c in kept_contours] == [2, 3, 4]
+
+    def test_zero_is_the_old_behaviour_untouched(self):
+        from spyde.actions.particles_action import filter_by_score
+        from spyde.signals.particles import COL, N_COLUMNS
+
+        rows = np.zeros((3, N_COLUMNS), np.float32)
+        rows[:, COL["score"]] = [0.0, 0.5, 1.0]
+        cont = [np.zeros((2, 2), np.int16)] * 3
+        out_rows, out_cont = filter_by_score(rows, cont, 0.0)
+        assert out_rows is rows and out_cont is cont, (
+            "the default must be a no-op, not a copy")
+
+    def test_unmeasurable_particles_are_kept_not_hidden(self):
+        """No background ring => no evidence => not marginal.
+
+        Scoring an unmeasurable instance 0 would let the slider silently delete
+        particles it knows nothing about, which is the opposite of what a
+        'hide the marginal ones' control should do.
+        """
+        from spyde.particles.measure import particle_scores
+        from spyde.signals.particles import COL, N_COLUMNS
+
+        rows = np.zeros((1, N_COLUMNS), np.float32)
+        rows[:, COL["intensity_mean"]] = 100.0
+        rows[:, COL["background"]] = np.nan          # ring fell outside the frame
+        rows[:, COL["intensity_std"]] = np.nan
+        assert particle_scores(rows)[0] == 1.0

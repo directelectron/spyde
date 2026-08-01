@@ -221,6 +221,10 @@ def measure_frame(
 
     rows = rows[keep]
     contours = [c for c, k in zip(contours, keep) if k]
+    # Score LAST: it is derived from the intensity columns filled above, so it
+    # costs no extra pass over the frame. That is what lets the caret filter on
+    # it without re-segmenting — see `particle_scores`.
+    rows[:, COL["score"]] = particle_scores(rows)
     return np.ascontiguousarray(rows), contours
 
 
@@ -364,3 +368,57 @@ def _contours(lab: np.ndarray, tbl, *, fast: bool | None = None
         np.clip(c[:, 1], 0, w - 1, out=c[:, 1])
         out.append(c.astype(np.int16))
     return out
+
+
+def particle_scores(rows: np.ndarray) -> np.ndarray:
+    """Per-particle confidence in [0, 1] — "is this a particle, or texture?"
+
+    Derived from columns already measured, which is the whole point: scoring
+    costs no extra pass over the frame, so the caret can filter on it without
+    re-segmenting and a slider drag is instant.
+
+    The statistic is CONTRAST-TO-NOISE against the particle's own dilated
+    background ring::
+
+        |intensity_mean - background| / spread
+
+    with *spread* the particle's own intensity spread. That is the quantity
+    that separates the two populations in the failure this exists for: a real
+    particle sits well away from its immediate surroundings, while a fragment
+    of textured support film is, by construction, the same brightness as the
+    texture around it however large or round it happens to be. Size, circularity
+    and solidity all fail here — over-split speckle is often small AND round.
+
+    Squashed to [0, 1] with ``cnr / (cnr + 1)`` so the caret's slider is a plain
+    0-100% control with no dataset-dependent range to explain: 0.5 means "as far
+    from its background as its own noise", which is a weak particle, and real
+    ones land well above it.
+
+    NaN (no background ring measured — ``background_ring=0``, or a particle
+    whose ring fell entirely outside the frame) scores 1.0 rather than 0.0.
+    An unmeasurable particle must not be silently filtered away; the slider is
+    a "hide the marginal ones" control, and something with no evidence against
+    it is not marginal.
+    """
+    if rows.size == 0:
+        return np.zeros((0,), np.float32)
+    mean = rows[:, COL["intensity_mean"]].astype(np.float64)
+    bg = rows[:, COL["background"]].astype(np.float64)
+    std = rows[:, COL["intensity_std"]].astype(np.float64)
+
+    contrast = np.abs(mean - bg)
+    # `intensity_std` is already normalised by the particle's max (see
+    # _fill_intensity), so put it back on the intensity scale before using it
+    # as a noise estimate. Guard the degenerate flat particle.
+    noise = np.where(np.isfinite(std) & (std > 0), std * np.abs(mean), np.nan)
+    floor = np.nanmedian(noise) if np.isfinite(noise).any() else 1.0
+    if not np.isfinite(floor) or floor <= 0:
+        floor = 1.0
+    noise = np.where(np.isfinite(noise) & (noise > 0), noise, floor)
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        cnr = contrast / noise
+    score = cnr / (cnr + 1.0)
+    # Unmeasurable => not marginal => keep. See the docstring.
+    score = np.where(np.isfinite(score), score, 1.0)
+    return np.clip(score, 0.0, 1.0).astype(np.float32)

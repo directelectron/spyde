@@ -41,7 +41,7 @@ from typing import Any, Sequence
 
 import numpy as np
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 
 #: Column layout of ``flat_buffer``. Order is load-bearing — it is the on-disk
 #: layout. Append new columns at the END and bump ``FORMAT_VERSION``.
@@ -60,6 +60,14 @@ COLUMNS: tuple[str, ...] = (
     "background",       # mean intensity in the dilated boundary ring
     "bbox_y0", "bbox_x0", "bbox_y1", "bbox_x1",   # pixel indices, half-open
     "track_id",         # -1 until the linker runs
+    # How confidently this is a PARTICLE rather than a fragment of textured
+    # background, in [0, 1]. Contrast-to-noise against the particle's own
+    # dilated background ring by default (see spyde.particles.measure), which
+    # an engine with a real probability may overwrite. It exists so the caret
+    # can offer ONE control that means "fewer / more particles": the score is
+    # computed with the measurement, so filtering on it needs no
+    # re-segmentation and a drag is instant.
+    "score",
 )
 COL: dict[str, int] = {name: i for i, name in enumerate(COLUMNS)}
 N_COLUMNS = len(COLUMNS)
@@ -70,6 +78,7 @@ MEASURED_COLUMNS: tuple[str, ...] = (
     "area", "equiv_diameter", "major_axis", "minor_axis", "perimeter",
     "circularity", "eccentricity", "solidity",
     "intensity_mean", "intensity_max", "intensity_std", "background",
+    "score",
 )
 
 #: Which measured columns scale with length, area, or not at all — used to apply
@@ -339,19 +348,38 @@ class SpyDEParticles:
         with np.load(path, allow_pickle=False) as z:
             meta = json.loads(str(z["meta"].item()))
             ver = meta.get("format_version")
-            if ver != FORMAT_VERSION:
+            if not isinstance(ver, int) or ver > FORMAT_VERSION:
                 raise ValueError(
                     f"unsupported SpyDEParticles format version {ver!r} "
                     f"(this build reads {FORMAT_VERSION})"
                 )
             saved_cols = tuple(meta.get("columns") or ())
+            buf = z["flat_buffer"]
+            # An OLDER file is readable when the only difference is columns
+            # APPENDED since — which is the documented way to extend this
+            # layout, and the reason new columns go at the end. Refusing it
+            # would make every previously-saved particle result unopenable to
+            # add one derived number, and the number is derived precisely so it
+            # need not have been stored at the time.
             if saved_cols != COLUMNS:
-                raise ValueError(
-                    "column layout changed since this file was written "
-                    f"({len(saved_cols)} columns on disk, {N_COLUMNS} expected)"
-                )
+                if saved_cols != COLUMNS[:len(saved_cols)]:
+                    raise ValueError(
+                        "column layout changed since this file was written "
+                        f"({len(saved_cols)} columns on disk, {N_COLUMNS} "
+                        "expected)"
+                    )
+                pad = np.full((buf.shape[0], N_COLUMNS - len(saved_cols)),
+                              np.nan, np.float32)
+                for i, name in enumerate(COLUMNS[len(saved_cols):]):
+                    # `score` is a confidence, and an absent one means "no
+                    # evidence against this particle" — the caret's filter must
+                    # not silently delete instances measured before it existed.
+                    if name == "score":
+                        pad[:, i] = 1.0
+                buf = np.ascontiguousarray(
+                    np.concatenate([buf, pad], axis=1), np.float32)
             return cls(
-                flat_buffer=z["flat_buffer"],
+                flat_buffer=buf,
                 t_offsets=z["t_offsets"],
                 frame_shape=tuple(meta["frame_shape"]),
                 contours=z["contours"] if "contours" in z.files else None,

@@ -90,6 +90,13 @@ DEFAULTS: dict[str, Any] = dict(
     # secondary and sits below it in the caret.
     sensitivity=0.5,
     threshold="otsu",
+    # THE control for "too many particles". Filters the measured instances by
+    # their confidence score (spyde.particles.measure.particle_scores), which is
+    # computed WITH the measurement — so this re-filters an existing result and
+    # never re-segments, and a drag is instant. It also means the same thing on
+    # every engine, because it acts on the OUTPUT rather than on any one
+    # method's parameters. 0 keeps everything (the old behaviour).
+    min_score=0.0,
     min_size=20,
     max_size=0,
     watershed=True,
@@ -565,6 +572,7 @@ def _coerce(payload: dict | None) -> dict:
         p["local_size"] += 1
 
     p["min_size"] = int(p["min_size"])
+    p["min_score"] = float(min(0.99, max(0.0, p.get("min_score", 0.0) or 0.0)))
     p["min_size_floored"] = p["min_size"] < MIN_SIZE_FLOOR
     if p["min_size_floored"]:
         p["min_size"] = MIN_SIZE_FLOOR
@@ -892,6 +900,33 @@ def _chase_nav(wiz: SegmentWizard) -> None:
     _preview_for_nav(wiz)
 
 
+def filter_by_score(rows, contours, min_score: float):
+    """Keep only instances scoring at or above *min_score*.
+
+    Separate from the measurement on purpose: this is what the caret's single
+    "Confidence" slider calls, and it must be able to run WITHOUT re-segmenting
+    — the score already lives in the row (see
+    :func:`spyde.particles.measure.particle_scores`), so a drag is a numpy mask
+    over a few hundred rows rather than a fresh segmentation of a 1-megapixel
+    window.
+
+    ``min_score <= 0`` returns the inputs untouched, so the default costs
+    nothing and behaves exactly as before this control existed.
+    """
+    import numpy as _np
+    from spyde.signals.particles import COL as _COL
+
+    if min_score is None or float(min_score) <= 0.0 or len(rows) == 0:
+        return rows, contours
+    keep = _np.asarray(rows[:, _COL["score"]] >= float(min_score), bool)
+    if keep.all():
+        return rows, contours
+    kept_rows = _np.ascontiguousarray(rows[keep])
+    kept_contours = ([c for c, k in zip(contours, keep) if k]
+                     if contours is not None else contours)
+    return kept_rows, kept_contours
+
+
 def _preview(wiz: SegmentWizard, gen: int) -> None:
     """Segment the displayed frame on a worker and paint the result.
 
@@ -926,7 +961,9 @@ def _preview(wiz: SegmentWizard, gen: int) -> None:
         labels = engine(frame)
         from spyde.particles import measure_frame
         rows, contours = measure_frame(labels, frame, t=t, scale=scale)
-        return {"frame": t, "labels": labels, "rows": rows,
+        n_all = len(rows)
+        rows, contours = filter_by_score(rows, contours, p.get("min_score", 0.0))
+        return {"frame": t, "labels": labels, "rows": rows, "n_all": n_all,
                 "contours": contours, "elapsed": time.perf_counter() - t0,
                 "box": box, "full_shape": full.shape}
 
