@@ -165,11 +165,24 @@ def _rolling_ball(img: np.ndarray, radius: int) -> np.ndarray:
 def _prepare(frame: np.ndarray, p: SegmentParams) -> np.ndarray:
     """Rolling-ball → gaussian → invert, returning float32.
 
-    NaN is filled with the finite minimum BEFORE filtering. A drift-corrected
-    frame carries a NaN border (``spyde.drift.warp``), and every skimage filter
-    propagates NaN outward, which would erase a band of real data around the edge.
-    Filling with the minimum makes the padding read as background — the one value
-    guaranteed not to threshold as a particle.
+    NaN is filled BEFORE filtering. A drift-corrected frame carries a NaN border
+    (``spyde.drift.warp``), and every skimage filter propagates NaN outward,
+    which would erase a band of real data around the edge.
+
+    **The fill polarity follows ``invert``.** The padding has to read as
+    background in the image that is finally THRESHOLDED, and `invert` maps
+    ``x -> -x`` after this fill — so filling with the finite minimum when
+    inverting makes the border the brightest thing in the frame, and it
+    segments as one enormous particle hugging the edge. Measured on a 96²
+    frame with a 12 px NaN border: a 240 px instance on the padding, with the
+    border reading as the frame maximum.
+
+    That is the failure ``spyde.drift.warp`` names as the most likely
+    integration bug in the whole feature ("a threshold applied to NaN … invents
+    a large 'particle' along the edge that then nucleates a spurious track"),
+    so it is fixed here rather than papered over downstream. Filling with the
+    finite MAXIMUM when ``invert`` is set leaves the padding at the minimum
+    after inversion, which is what the rest of this function already assumes.
     """
     from scipy.ndimage import gaussian_filter
     from skimage.util import invert as sk_invert
@@ -179,7 +192,10 @@ def _prepare(frame: np.ndarray, p: SegmentParams) -> np.ndarray:
     if bad.any():
         finite = img[~bad]
         img = img.copy()
-        img[bad] = finite.min() if finite.size else 0.0
+        if finite.size:
+            img[bad] = finite.max() if p.invert else finite.min()
+        else:
+            img[bad] = 0.0
 
     if p.rb_kernel > 0:
         img = _rolling_ball(img, p.rb_kernel)

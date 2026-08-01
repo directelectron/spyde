@@ -736,3 +736,51 @@ class TestSpyDEParticles:
 
     def test_repr_is_informative(self):
         assert "particles over" in repr(_build())
+
+
+class TestNaNBorderPolarity:
+    """The drift-padded border must never segment — in EITHER polarity.
+
+    `spyde.drift.warp` names this as the most likely integration bug in the
+    feature: "a threshold applied to NaN ... invents a large 'particle' along
+    the edge that then nucleates a spurious track". `_prepare` fills NaN before
+    filtering (filters propagate NaN outward and would erase real data), so the
+    fill value has to read as background in the image that is finally
+    THRESHOLDED — and `invert` flips that image after the fill.
+
+    Filling with the finite minimum while inverting made the padding the
+    BRIGHTEST region: measured, a 240 px instance sitting on the border of a
+    96x96 frame.
+    """
+
+    @staticmethod
+    def _frame(dark_particles: bool):
+        import numpy as _np
+        h = w = 96
+        bg, fg = (200.0, 40.0) if dark_particles else (40.0, 200.0)
+        img = _np.full((h, w), bg, _np.float32)
+        y, x = _np.mgrid[0:h, 0:w]
+        for cy, cx in ((40, 40), (65, 70)):
+            img[(y - cy) ** 2 + (x - cx) ** 2 < 8 ** 2] = fg
+        img[:12, :] = _np.nan          # the drift-corrected border
+        img[:, :12] = _np.nan
+        return img
+
+    @pytest.mark.parametrize("invert", [False, True])
+    def test_the_padded_border_never_becomes_a_particle(self, invert):
+        from spyde.particles.classical import SegmentParams, _prepare, segment_frame
+
+        img = self._frame(dark_particles=invert)
+        p = SegmentParams(invert=invert, rb_kernel=0, gaussian=0)
+
+        prep = _prepare(img, p)
+        border = prep[:12, :12]
+        assert border.mean() < prep.max() - 1e-3, (
+            f"invert={invert}: the NaN padding is the brightest region in the "
+            f"thresholded image, so it segments as one huge edge particle")
+
+        labels = segment_frame(img, p)
+        on_border = sorted(set(np.unique(labels[:12, :12])) - {0})
+        assert not on_border, (
+            f"invert={invert}: instances {on_border} were found on the NaN "
+            f"border, which is padding and not data")
