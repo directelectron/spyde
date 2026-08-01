@@ -194,19 +194,25 @@ test('the vectors signal plot fills in while the batch is still running', async 
   console.log('during-fill samples:', JSON.stringify(during),
               'baseline:', JSON.stringify(baseline))
 
-  // It came off the black placeholder, not merely "changed somehow".
+  // The two claims are asserted from DIFFERENT evidence, deliberately.
   //
-  // `some`, not `every`: samples are CAPTURED on "the content signature moved"
-  // but ASSERTED on "it got brighter", and those are not the same condition. A
-  // repaint that changes `sum` without changing `bright` (chrome, a re-layout,
-  // the hover toolbar) is not a failure of the progressive fill, yet `every`
-  // failed the whole test on one — observed with a first sample whose `bright`
-  // equalled the baseline exactly while later ones were far brighter. What the
-  // check is for is that the DP demonstrably came off black at some point.
-  expect(during.some((d) => d.bright > baseline.bright),
-    `the vectors DP never got brighter than its black placeholder
-     (baseline ${JSON.stringify(baseline)}): ${JSON.stringify(during)}`,
-  ).toBeTruthy()
+  // "The fill was PROGRESSIVE" is proved by the backend log (below): a preview
+  // frame logged with `ready < total` can only have been painted mid-run. That
+  // is exact, and it is why the handler logs at INFO.
+  //
+  // "The DP came off its black placeholder" is proved by PIXELS — but sampled
+  // when the answer is settled, not while racing the fill. Polling for a
+  // brighter frame mid-run is what made this spec flaky: samples are captured
+  // when the content signature MOVES, which is not the same condition as
+  // having got BRIGHTER, so a capture could legitimately land on a repaint
+  // that changed `sum` and nothing else. Observed both ways — a first sample
+  // exactly at baseline brightness, and a whole run where no sample was
+  // brighter — while the fill itself was working fine.
+  await expect
+    .poll(async () => (await figureSignature(vecSig)).bright,
+      { timeout: 180_000, message: 'the vectors DP never came off its black placeholder' })
+    .toBeGreaterThan(baseline.bright)
+  await page.screenshot({ path: join(SHOTS, '20-came-off-black.png') })
 
   const progress = previewProgress()
   expect(progress.length,
@@ -214,25 +220,39 @@ test('the vectors signal plot fills in while the batch is still running', async 
   expect(progress.some(([r, t]) => r < t),
     `every preview frame arrived only after the whole scan was ready: ${JSON.stringify(progress)}`,
   ).toBeTruthy()
-  expect(new Set(during.map((d) => d.sum)).size,
-    `the vectors signal plot never changed while the batch was running: ${JSON.stringify(during)}`,
-  ).toBeGreaterThan(1)
-  // At least one sample was taken while the batch was still running. This is
-  // what the old `expect(finalized()).toBeFalsy()` was reaching for, without
-  // the race — it does not care whether the batch has since finished, only
-  // that what we measured was measured mid-run. The `ready < total` assertion
-  // above is the independent, backend-side proof of the same thing.
-  expect(during.some((d) => d.mid),
-    `every sample was taken after the batch had already finalized — nothing was
-     proven about the PROGRESSIVE fill: ${JSON.stringify(during)}`,
-  ).toBeTruthy()
+  // The pixel samples are kept for the screenshots and the log line above, but
+  // are no longer ASSERTED on: how many distinct repaints a poll happens to
+  // catch is a property of the sampling, not of the fill. `ready < total`
+  // already proves the fill was progressive, and the brightness poll above
+  // proves it reached the display — neither depends on catching a transient.
 
   // ── (b) drag the count-map navigator over an already-computed region ──────
   const vecNav = results
     .filter({ has: page.getByTestId('window-breadcrumb').filter({ hasText: /^N-/ }) })
     .last()
-  // Walk LEFT from the crosshair: the result window's right edge sits under the
-  // Plot Control dock, and a press that lands on the dock drives nothing.
+  // AIM AT THE COMPUTED BAND. `_slice_for_navigator` only serves a position
+  // `is_ready()` reports as computed, and the batch fills in NAV ORDER — so the
+  // ready region is the TOP rows of the count map. The crosshair starts at the
+  // CENTRE, and this walked left from there: at the ~880/13312 (6.6%) that was
+  // ready by this point it was dragging over uncomputed data by construction,
+  // and served 0 frames on CI and locally alike. Nothing to do with the drag.
+  //
+  // So: wait until a usable fraction has landed, then move the crosshair up
+  // into that band before measuring. The claim under test is "dragging over an
+  // ALREADY-COMPUTED region serves that region's frames", which needs the drag
+  // to actually be over one.
+  // Waiting for a fraction of the fill first does NOT work: `previewProgress()`
+  // reads the preview's own throttled PAINT log, which stops updating once
+  // painting stops, so it under-reports and a "wait until 30%" poll never
+  // clears. Aim instead — drag the crosshair (unmeasured) to the TOP of the
+  // map, the part that is ready earliest.
+  const navBox = await vecNav.locator('iframe').first().boundingBox()
+  await dragCrosshair(page, vecNav, {
+    dx: 0, dy: -Math.round((navBox?.height ?? 300) * 0.45), steps: 1,
+  })
+
+  // Walk LEFT from there: the result window's right edge sits under the Plot
+  // Control dock, and a press that lands on the dock drives nothing.
   const servedBefore = servedCount()
   const dragSigs: number[] = []
   const walk = await dragCrosshair(page, vecNav, {
