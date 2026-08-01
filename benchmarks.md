@@ -1692,3 +1692,55 @@ Fine for a resampled display frame; do not build an equality test on it.
 MPS is deliberately NOT selected by `device=None`. The win here is one fused
 kernel, and an unsolicited MPS submission contends for the shared device lock
 that the neural/scribble paths hold. Opt in with `device="mps"`.
+
+### The navigator fill was submitting ONE task at a time (2026-08-01)
+
+Reported as "why is the computing navigator using a single worker" — the dask
+dashboard showed the distributed backend live, the cluster idle, and tasks
+arriving one by one. It got worse with dataset size (an 800 GB 4D-STEM scan and
+a long movie both), which is the tell.
+
+Not a placement bug. `dispatch_chunks` tops up on EVERY completion, so on the
+**unpinned** lane `lane_cap - outstanding` is 1 in steady state and
+
+    n = min(submit_batch, len(pending), lane_cap - outstanding[lane])
+
+collapses to **n = 1**. `submit_batch=8` only ever applied to the first fill.
+Every subsequent chunk was its own blocking scheduler round trip with the GIL
+held in the client process — the exact cost #95 was written to remove,
+reintroduced through the back door, and scaling with chunk count.
+
+The window was never justified for this lane anyway:
+
+* **It did not measure as backpressure.** Bounded 46-50 s vs unbounded 50.2 s on
+  the same 977-chunk movie (above) — within noise.
+* **`distributed` >= 2022.3 already does it**, queuing root tasks at the
+  scheduler. We were duplicating the scheduler's job, worse, in our process.
+* There is **no placement decision** to make on an unpinned lane, so there is
+  nothing for a window to balance.
+
+Fixed by priming with one small batch and then sending the rest in a single
+submit. 977 chunks, 6 workers x 2 threads:
+
+| | submits | first chunk | total |
+|---|---|---|---|
+| one-at-a-time (the bug) | **970** | 656 ms | 12.40 s |
+| all-at-once | 1 | **1292 ms** | 5.03 s |
+| **prime + bulk (shipped)** | **2** | **45 ms** | **5.28 s** |
+
+**485x fewer round trips, 14.6x faster to first paint, 2.3x faster overall** —
+and note the middle row. Going straight to one all-at-once submit is fastest in
+total but DOUBLES time-to-first-chunk, because the client serialises the whole
+graph before anything comes back. The progressive fill exists so the navigator
+starts filling immediately, so that regression matters as much as the total; the
+priming batch buys it back for one extra round trip. Measuring only wall-clock
+would have shipped the wrong one.
+
+On a synthetic graph each round trip is cheap, so these totals UNDERSTATE the
+real gain: on a real memmap-backed graph a submit is ~14 ms (above), i.e. ~13.6 s
+of GIL-held client time for 977 chunks.
+
+**The dual-lane path keeps its window.** There a completion genuinely pulls the
+next chunk so a ~30x-faster GPU lane and the CPU lane drain one pool and finish
+together — real work stealing the scheduler cannot do, and the reason this
+module exists. Only the unpinned lane changed.
