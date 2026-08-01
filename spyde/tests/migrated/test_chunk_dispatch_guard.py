@@ -249,18 +249,43 @@ def _wait(pred, timeout=10.0, required=True):
 
 
 class TestNavigatorFillThroughDispatcher:
-    def test_batched_submit_and_bounded_window(self):
-        """16 one-frame nav chunks on a 4-thread cluster: window =
-        max(4, 4 // 2) = 4, and each top-up is ONE submit call."""
+    def test_batched_submit_prime_then_bulk(self):
+        """16 one-frame nav chunks: a small priming batch, then the rest — and
+        only a couple of scheduler round trips in total.
+
+        This test used to assert ``max_in_flight <= 4`` as BACKPRESSURE, on the
+        reasoning that the navigator fill must not "submit all 977 up front".
+        That guard is retired deliberately, so here is the argument against my
+        own fence:
+
+        * It did not measure as backpressure. benchmarks.md has the bounded
+          window at 46-50 s against unbounded at 50.2 s on the same 977-chunk
+          movie — within noise. The window never bought throughput or safety
+          that anyone demonstrated.
+        * ``distributed`` >= 2022.3 QUEUES root tasks at the scheduler
+          (worker-saturation), which is exactly this guard's job, done in the
+          right process, without holding OUR GIL. We were duplicating it badly.
+        * Keeping it was actively harmful: ``_submit_next`` runs on every
+          completion, so ``lane_cap - outstanding`` was 1 in steady state and
+          the batch collapsed to ONE task per submit — 970 blocking round trips
+          for 977 chunks, which scaled with dataset size and read to users as
+          "big datasets only use one worker".
+
+        What replaces it: the assertion below that the whole job goes out in a
+        couple of submits, and the scheduler's own queuing for memory. The
+        DUAL-LANE path keeps its window (see the module docstring) because
+        there a completion genuinely pulls the next chunk so a ~30x-faster GPU
+        lane and the CPU lane finish together — that is real work stealing the
+        scheduler cannot do.
+        """
         src, client, handle, seen, futs, max_in_flight = _run_nav_fill(
             nav=(16,), chunks=(1,))
         assert len(seen) == 16                       # every chunk streamed
-        assert len(client.created) == 16
-        # The old loop made 16 submit calls (+1 for the duplicate whole-array
-        # graph) — one blocking scheduler round trip each.
-        assert client.submit_calls < 16
-        # BACKPRESSURE: the navigator fill used to submit all 977 up front.
-        assert max_in_flight <= 4
+        assert len(client.created) == 16             # one future per chunk
+        # The bug this replaced made ~one submit per chunk.
+        assert client.submit_calls <= 3, (
+            f"{client.submit_calls} submits for 16 chunks — the unpinned lane "
+            f"is back to per-completion top-ups")
         np.testing.assert_array_equal(handle.result(), src.compute())
 
     def test_result_is_assembled_not_recomputed(self):

@@ -44,6 +44,13 @@ class _FakeFuture:
     def add_done_callback(self, cb):
         self._cbs.append(cb)
 
+    @property
+    def fired(self):
+        """Already completed. The tests fire ONE future to release the bulk
+        submit and then fire "the rest"; without this guard the first one runs
+        its done-callback twice and the assembly counts 17 chunks out of 16."""
+        return self._done
+
     def done(self):
         return self._done
 
@@ -139,40 +146,66 @@ class TestVirtualImageMaskedSum:
 
 
 class TestWindowedProgressive:
-    def test_bounded_in_flight_and_assembly(self):
+    def test_primes_small_then_sends_the_rest_in_one_submit(self):
+        """The UNPINNED lane submits in TWO calls: a small priming batch, then
+        everything else.
+
+        It used to keep a bounded in-flight window and top up on every
+        completion — which meant `lane_cap - outstanding` was 1 in steady state
+        and the batch collapsed to ONE task per submit, i.e. a blocking
+        GIL-held round trip per chunk. Measured on 977 chunks: 970 submits,
+        12.4 s. There is nothing to balance on an unpinned lane (no placement
+        decision), so the window bought nothing; `distributed` queues root
+        tasks at the scheduler anyway.
+
+        The priming batch is why this is two calls and not one: going straight
+        to a single all-at-once submit doubled time-to-first-chunk (642 ->
+        1292 ms) because the client serialises the whole graph before anything
+        returns. Priming keeps the first paint fast — measured 45 ms, better
+        than the windowed version's 656 ms — for one extra round trip.
+        """
         src, client, handle, seen = _run()
-        # 16 chunks total, but only the window (4) submitted up front...
-        assert len(client.created) == 4
-        # ...and that whole window went out in ONE submit call, not four
-        # blocking scheduler round trips.
-        assert client.submit_calls == 1
-        assert not handle.done()
-        # Completing futures tops up the window without ever exceeding it.
-        fired = 0
-        while fired < len(client.created):
-            client.created[fired].fire()
-            fired += 1
-            in_flight = len(client.created) - fired
-            assert in_flight <= 4
-            _wait(lambda f=fired: len(client.created) > f or handle.done(),
-                  timeout=2.0, required=False)
-        # Every chunk streamed a callback and the assembly equals the source.
+        # The priming batch only — the bulk submit follows the first completion
+        # (or the wait loop's next top-up), which is what keeps first paint fast.
+        primed = len(client.created)
+        assert primed <= 8, f"priming batch was {primed}, expected <= 8"
+        client.created[0].fire()
+        _wait(lambda: len(client.created) == 16, timeout=5.0)
+        assert client.submit_calls <= 2, (
+            f"{client.submit_calls} submits for 16 chunks — the unpinned lane "
+            f"is back to per-completion top-ups")
+        for f in list(client.created):
+            if not f.fired:
+                f.fire()
         np.testing.assert_array_equal(handle.result(timeout=10.0), src.compute())
         assert len(seen) == 16
 
-    def test_cancel_stops_submission_and_outstanding(self):
+    def test_cancel_cancels_every_outstanding_chunk(self):
+        """Cancellation still stops the work.
+
+        With the whole job submitted up front there is no pending queue left to
+        withhold, so "stop" means CANCELLING the outstanding futures rather than
+        declining to submit more. That is the property that actually matters —
+        a superseded VI stream must not keep computing through an ROI drag —
+        and dask cancels queued tasks it has not started.
+        """
         src, client, handle, seen = _run()
-        assert len(client.created) == 4
+        client.created[0].fire()          # let the bulk submit go out
+        _wait(lambda: len(client.created) == 16, timeout=5.0)
         handle.cancel()
         # Cancel is IMMEDIATE (dispatch_chunks' on_start hook wakes the wait
         # loop) — a superseded VI stream must not keep computing through an ROI
         # drag while the next tick's stream is already running.
-        _wait(lambda: all(f.cancelled for f in client.created))
+        # Every future that had NOT already completed. The one fired above to
+        # release the bulk submit is done, and a completed future is not
+        # cancellable — asserting "all cancelled" would just be wrong.
+        _wait(lambda: all(f.cancelled for f in client.created if not f.fired))
         # Firing the cancelled futures must not submit more work.
         for f in list(client.created):
-            f.fire()
+            if not f.fired:
+                f.fire()
         _wait(handle.done)
-        assert len(client.created) == 4
+        assert len(client.created) == 16, "firing cancelled futures resubmitted work"
 
     def test_stop_event_halts_topups(self):
         stop = threading.Event()
@@ -181,7 +214,9 @@ class TestWindowedProgressive:
         for f in list(client.created):
             f.fire()
         _wait(handle.done)
-        assert len(client.created) == 4        # no top-ups after stop
+        # No BULK submit after the stop: only the priming batch was ever sent.
+        # (It was 4 when the lane kept a window; the priming batch is 8.)
+        assert len(client.created) <= 8, "work was submitted after the stop"
 
     def test_error_propagates_via_result(self):
         from spyde.drawing.update_functions import compute_with_live_buffer

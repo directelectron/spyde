@@ -163,6 +163,7 @@ def dispatch_chunks(
     fill_value=np.nan,
     stall_timeout_s: float = 600.0,
     submit_batch: int = 8,
+    batch_unpinned: bool = True,
     label: str = "dispatch",
     on_chunk_done=None,
     lane_default_mode: str = "one",
@@ -313,7 +314,17 @@ def dispatch_chunks(
     completed_futures: list = []  # held until the end — see module docstring
     outstanding = {"gpu": 0, "cpu": 0}
     state = {"completed": 0, "error": None, "last_progress": time.time(),
-             "lane_done": {"gpu": 0, "cpu": 0}, "mem_hot": False}
+             "lane_done": {"gpu": 0, "cpu": 0}, "mem_hot": False,
+             # The unpinned lane PRIMES with one small batch before sending the
+             # rest in a single submit. Measured on 977 chunks: going straight
+             # to one all-at-once submit cut round trips 970 -> 1 and total
+             # 12.1 s -> 5.0 s, but DOUBLED time-to-first-chunk (642 -> 1292 ms)
+             # because the client serialises the whole graph before anything
+             # comes back. The progressive fill exists so the navigator starts
+             # filling immediately, so that regression matters as much as the
+             # total. Priming keeps the fast first paint and still costs only
+             # two submits.
+             "primed": False}
 
     def _submit_next(lane):
         """Top up `lane` with a batch of pending chunks (lock held).
@@ -340,7 +351,38 @@ def dispatch_chunks(
         # already folded into `caps` above; shadowing it here would read as if
         # the parameter were being recomputed per top-up.
         lane_cap = _lane_cap(caps[lane], lane_threads[lane], state["mem_hot"])
-        n = min(submit_batch, len(pending), lane_cap - outstanding[lane])
+        if unpinned and lane == "cpu" and batch_unpinned and state["primed"]:
+            # ONE submit for the whole job. There is no placement decision to
+            # make on the unpinned lane and therefore nothing for a window to
+            # balance — so the window bought nothing and cost a blocking,
+            # GIL-held scheduler round trip PER CHUNK.
+            #
+            # It was worse than "no benefit": `_submit_next` runs on every
+            # completion, so `lane_cap - outstanding` is 1 in steady state and
+            # `min(submit_batch, …)` collapsed to ONE task per submit. The
+            # batching applied only to the very first fill. On a 977-chunk
+            # movie that is 977 round trips at ~14 ms with the GIL held —
+            # exactly the cost this module was written to remove, reintroduced
+            # through the back door. It scaled with dataset size, so it looked
+            # like "big datasets use one worker".
+            #
+            # Unbounded is measured-safe here: benchmarks.md has bounded at
+            # 46-50 s against unbounded at 50.2 s on the 977-chunk movie —
+            # within noise. And distributed >=2022.3 QUEUES root tasks at the
+            # scheduler (worker-saturation), which is this window's stated job
+            # done properly, in the right process, without our GIL.
+            #
+            # The DUAL-LANE path below keeps its window: there a completion
+            # genuinely pulls the next chunk so a ~30x-faster GPU lane and the
+            # CPU lane drain one pool and finish together. That is real work
+            # stealing the scheduler cannot do, and it is why this module
+            # exists at all.
+            n = len(pending)
+        elif unpinned and lane == "cpu" and batch_unpinned:
+            n = min(submit_batch, len(pending))      # priming batch
+            state["primed"] = True
+        else:
+            n = min(submit_batch, len(pending), lane_cap - outstanding[lane])
         if n <= 0:
             return
         idxs = [pending.popleft() for _ in range(n)]
