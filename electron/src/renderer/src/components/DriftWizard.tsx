@@ -57,11 +57,24 @@ const METHOD_OF: Record<TabLabel, Method> = {
 const TAB_OF: Record<Method, TabLabel> = {
   rigid: 'Rigid', rigid_affine: 'Rigid+Affine', nonrigid: 'Non-rigid',
 }
-/** Verbatim from `drift_action._UNAVAILABLE` — the reason the backend gives. */
+/** Verbatim from `drift_action._UNAVAILABLE` — the reason the backend gives.
+ *
+ *  This list is DUPLICATED from the backend, which is a trap worth naming: when
+ *  non-rigid was implemented, removing it from `_UNAVAILABLE` there left the tab
+ *  locked HERE, so the finished feature was unreachable and every headless test
+ *  still passed. If a model is added or implemented, both ends move. */
 const UNAVAILABLE: Partial<Record<Method, string>> = {
   rigid_affine: 'the affine drift search (plan A4) is not implemented in spyde.drift yet',
-  nonrigid: 'non-rigid warping (plan A5) is not implemented in spyde.drift yet',
 }
+
+/** The two non-rigid parameterisations — `drift_action.NONRIGID_MODELS`.
+ *  Scan-knot is a SCANNING artifact (displacement varies down the slow axis
+ *  only); dense is the SAMPLE deforming (varies in both directions). */
+type NonrigidModel = 'scan_knot' | 'dense'
+const NONRIGID_MODELS: readonly { value: NonrigidModel; label: string }[] = [
+  { value: 'scan_knot', label: 'Scan distortion' },
+  { value: 'dense', label: 'Sample deformation' },
+]
 
 type Reference = 'running' | 'sequential' | 'first'
 const REFERENCES: readonly { value: Reference; label: string }[] = [
@@ -75,6 +88,8 @@ interface DriftSaved {
   useRoi: boolean
   rejectOutliers: boolean
   method: Method
+  nonrigidModel: NonrigidModel
+  nonrigidSteps: number
   reference: Reference
   upsample: number
   maxShift: number
@@ -84,7 +99,8 @@ interface DriftSaved {
   previewFrames: number
 }
 const DEFAULTS: DriftSaved = {
-  useRoi: false, rejectOutliers: true, method: 'rigid', reference: 'running',
+  useRoi: false, rejectOutliers: true, method: 'rigid',
+  nonrigidModel: 'scan_knot', nonrigidSteps: 120, reference: 'running',
   upsample: 8, maxShift: 32, apodize: true, normalize: true, order: 1,
   previewFrames: 20,
 }
@@ -98,6 +114,9 @@ export function DriftWizard({ caretPos, windowId, sendAction, onClose }: Props) 
   const [useRoi, setUseRoi] = React.useState(saved.useRoi)
   const [rejectOutliers, setRejectOutliers] = React.useState(saved.rejectOutliers)
   const [method, setMethod] = React.useState<Method>(saved.method)
+  const [nonrigidModel, setNonrigidModel] =
+    React.useState<NonrigidModel>(saved.nonrigidModel)
+  const [nonrigidSteps, setNonrigidSteps] = React.useState(saved.nonrigidSteps)
   const [reference, setReference] = React.useState<Reference>(saved.reference)
   const [upsample, setUpsample] = React.useState(saved.upsample)
   const [maxShift, setMaxShift] = React.useState(saved.maxShift)
@@ -117,8 +136,8 @@ export function DriftWizard({ caretPos, windowId, sendAction, onClose }: Props) 
 
   const vals = React.useRef<DriftSaved>(saved)
   vals.current = {
-    useRoi, rejectOutliers, method, reference, upsample, maxShift, apodize,
-    normalize, order, previewFrames,
+    useRoi, rejectOutliers, method, nonrigidModel, nonrigidSteps, reference,
+    upsample, maxShift, apodize, normalize, order, previewFrames,
   }
   React.useEffect(() => { _driftStore.set(windowId, vals.current) })
 
@@ -127,6 +146,7 @@ export function DriftWizard({ caretPos, windowId, sendAction, onClose }: Props) 
     const v = vals.current
     return {
       use_roi: v.useRoi, reject_outliers: v.rejectOutliers, method: v.method,
+      nonrigid_model: v.nonrigidModel, nonrigid_steps: v.nonrigidSteps,
       reference: v.reference, upsample: v.upsample, max_shift: v.maxShift,
       apodize: v.apodize, normalize: v.normalize, order: v.order,
       preview_frames: v.previewFrames,
@@ -271,8 +291,24 @@ export function DriftWizard({ caretPos, windowId, sendAction, onClose }: Props) 
         {/* Both stubs are locked, so this names them rather than waiting for a
             click that cannot happen. Text is the backend's own wording. */}
         <div data-testid="drift-unavailable" style={S.hint}>
-          {locked ?? 'Rigid+Affine and Non-rigid are not implemented in spyde.drift yet.'}
+          {locked ?? (method === 'nonrigid'
+            ? 'Fitted on top of the rigid solve, on a decimated copy of the movie.'
+            : 'Rigid+Affine is not implemented in spyde.drift yet.')}
         </div>
+        {/* Only when the model that uses them is selected — these mean nothing
+            under a rigid solve, and §0.9a is that the caret shows the task. */}
+        {method === 'nonrigid' && (
+          <>
+            <Field label="Field">
+              <Select testid="drift-nonrigid-model" value={nonrigidModel}
+                options={NONRIGID_MODELS} onChange={live(setNonrigidModel)} />
+            </Field>
+            <Field label="Fit steps">
+              <NumInput testid="drift-nonrigid-steps" value={nonrigidSteps}
+                step="10" width={56} onChange={live(setNonrigidSteps)} />
+            </Field>
+          </>
+        )}
         <Field label="Reference">
           <Select testid="drift-reference" value={reference} options={REFERENCES}
             onChange={live(setReference)} />

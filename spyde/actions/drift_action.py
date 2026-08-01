@@ -791,11 +791,15 @@ def _solve_nonrigid_step(wiz, p: dict, rigid_model, get_frame, n_frames: int,
     """
     from spyde.drift import solve_nonrigid
 
+    t0 = time.monotonic()
     stack = _decimated_stack(get_frame, n_frames, cancel=cancel)
     if stack.shape[0] < 2:
         return rigid_model
+    log.info("[drift] non-rigid fit: %s, %d frames at %dx%d (decimated from %s)",
+             p["nonrigid_model"], stack.shape[0], stack.shape[1], stack.shape[2],
+             "the movie")
     try:
-        return solve_nonrigid(
+        model = solve_nonrigid(
             stack,
             model=str(p["nonrigid_model"]),
             rigid=rigid_model,
@@ -806,6 +810,14 @@ def _solve_nonrigid_step(wiz, p: dict, rigid_model, get_frame, n_frames: int,
             provenance={"action": "Drift Correction (non-rigid)",
                         "params": dict(p)},
         )
+        # Say what actually happened, with the KIND. Without this there is no
+        # way — from a log, a test, or the UI — to tell a real non-rigid solve
+        # from one that fell back to rigid, and "the caret said non-rigid" is
+        # exactly the claim that must not be taken on trust.
+        log.info("[drift] non-rigid fit done: kind=%s in %.2fs (mse %.4g)",
+                 model.kind, time.monotonic() - t0,
+                 model.extra.get("final_mse", float("nan")))
+        return model
     except Exception as exc:
         # torch missing, CUDA OOM, a device that will not take the graph — all
         # end here. Say so and keep the rigid model rather than failing the run.

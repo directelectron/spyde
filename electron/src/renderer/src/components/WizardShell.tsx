@@ -47,12 +47,16 @@ export function TabRow<T extends string>({ tabs, active, onSelect, locked, testi
   locked?: (t: T) => boolean
   testid: (t: T) => string
 }) {
+  // `aria-selected` carries which tab is active. Style alone did, which left
+  // the state invisible to a screen reader AND to any test — asserting on an
+  // inline style is the kind of check that passes for the wrong reason.
   return (
-    <div style={S.tabRow}>
+    <div style={S.tabRow} role="tablist">
       {tabs.map(t => {
         const isLocked = locked?.(t) ?? false
         return (
           <button key={t} data-testid={testid(t)} disabled={isLocked}
+            role="tab" aria-selected={t === active}
             style={t === active ? S.tabActive : (isLocked ? S.tabLocked : S.tab)}
             onClick={() => !isLocked && onSelect(t)}>{t}</button>
         )

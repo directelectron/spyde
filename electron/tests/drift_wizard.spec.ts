@@ -83,19 +83,72 @@ test('the caret opens small: 2 toggles, 1 button, Advanced collapsed', async () 
   ctx.assertNoJsErrors()
 })
 
-test('Advanced holds the algorithm, and the stubs stay locked there', async () => {
+test('Advanced holds the algorithm; non-rigid is selectable, affine stays locked', async () => {
   const { page } = ctx
   await page.getByTestId('drift-advanced-toggle').click()
   await expect(page.getByTestId('drift-advanced')).toBeVisible()
   await expect(page.getByTestId('drift-tab-rigid_affine')).toBeDisabled()
-  await expect(page.getByTestId('drift-tab-nonrigid')).toBeDisabled()
-  await expect(page.getByTestId('drift-unavailable')).toContainText('not implemented')
+  // Non-rigid is IMPLEMENTED (spyde.drift.nonrigid). This assertion is the one
+  // that catches the trap that actually happened: the backend's _UNAVAILABLE
+  // list is duplicated in the renderer, so implementing the solve while leaving
+  // the tab locked here made a finished feature unreachable — with every
+  // headless test still green, because none of them can see a disabled tab.
+  await expect(page.getByTestId('drift-tab-nonrigid')).toBeEnabled()
   await page.getByTestId('drift-wizard').screenshot({ path: `${SHOTS}/03-advanced.png` })
 
   await page.getByTestId('drift-max-shift').fill('24')
   await page.getByTestId('drift-max-shift').blur()
   await page.getByTestId('drift-advanced-toggle').click()
   await expect(page.getByTestId('drift-advanced')).toHaveCount(0)
+  ctx.assertNoJsErrors()
+})
+
+test('selecting Non-rigid reveals its field controls and the choice sticks', async () => {
+  const { page } = ctx
+  await page.getByTestId('drift-advanced-toggle').click()
+  await expect(page.getByTestId('drift-advanced')).toBeVisible()
+
+  // Under RIGID the non-rigid controls must not be on screen at all — they mean
+  // nothing to a rigid solve, and §0.9a is that the caret shows the task.
+  await expect(page.getByTestId('drift-nonrigid-model')).toHaveCount(0)
+
+  await page.getByTestId('drift-tab-nonrigid').click()
+  await expect(page.getByTestId('drift-nonrigid-model')).toBeVisible()
+  await expect(page.getByTestId('drift-nonrigid-steps')).toBeVisible()
+  await page.getByTestId('drift-wizard')
+    .screenshot({ path: `${SHOTS}/10-nonrigid-selected.png` })
+
+  // The tab follows what the BACKEND selected, not what was clicked — so this
+  // failing means the backend refused it and silently stayed on rigid.
+  await expect(page.getByTestId('drift-tab-nonrigid')).toHaveAttribute('aria-selected', 'true')
+
+  // Both parameterisations reach the backend. NB `Select` renders the themed
+  // Dropdown, not a native <select>, so `selectOption`/`inputValue` do nothing
+  // here — click the trigger, then the option, and read `data-value`.
+  await expect(page.getByTestId('drift-nonrigid-model'))
+    .toHaveAttribute('data-value', 'scan_knot')
+  await page.getByTestId('drift-nonrigid-model').click()
+  await page.getByTestId('drift-nonrigid-model-opt-dense').click()
+  await expect(page.getByTestId('drift-nonrigid-model'))
+    .toHaveAttribute('data-value', 'dense')
+  await page.getByTestId('drift-wizard')
+    .screenshot({ path: `${SHOTS}/11-nonrigid-dense.png` })
+  ctx.assertNoJsErrors()
+})
+
+test('a Non-rigid solve actually runs the non-rigid fit, not a quiet fallback', async () => {
+  const { page, backend } = ctx
+  // The caret showing "Non-rigid" proves nothing about what the SOLVER did:
+  // drift_run falls back to rigid whenever the fit cannot run (no torch, OOM,
+  // a device that will not take the graph) and that fallback is deliberate.
+  // So assert on the backend's own report of the KIND it produced.
+  await page.getByTestId('drift-solve').click()
+  await backend.waitForLog('non-rigid fit:', 120_000)
+  const done = await backend.waitForLog('non-rigid fit done:', 300_000)
+  expect(String(done), 'the solve fell back to rigid').toContain('kind=dense')
+  await page.screenshot({ path: `${SHOTS}/12-nonrigid-solved.png` })
+  expect(backendErrorLines(backend), 'backend errors during the non-rigid solve')
+    .toEqual([])
   ctx.assertNoJsErrors()
 })
 
