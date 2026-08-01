@@ -304,6 +304,8 @@ class SegmentWizard(WizardController):
         self._closed = True
         self._unwire_navigator()
         self._drop_overlay()
+        self._ov_cleared = False
+        self._ov_box_state = None
         if getattr(self.tree, "_seg_wizard", None) is self:
             self.tree._seg_wizard = None
 
@@ -358,8 +360,57 @@ class SegmentWizard(WizardController):
             # `particle_overlay._payload` writes. A key the group does not know
             # is accepted silently by `_push_groups` and simply never drawn.
             _push_groups(plot2d, updates)
+            # Real outlines are up now, so the no-engine path must redraw rather
+            # than skip on its cached "already cleared" state.
+            self._ov_cleared = False
+            self._ov_box_state = None
         except Exception as exc:
             log.debug("[seg] overlay push failed: %s", exc)
+
+    def show_preview_window(self) -> None:
+        """Draw the preview-window box ALONE, with no instance outlines.
+
+        For the states that have no engine to run: an untrained Scribble, or
+        Prompt before anything is prompted. Callers that DO have a result go
+        through :meth:`set_overlay`, which draws both.
+
+        Clearing the outlines here is the other half of the fix — switching to
+        an untrained engine must not leave the previous one's instances on
+        screen looking like the new engine's answer.
+        """
+        plot2d = getattr(self.src_plot, "_plot2d", None)
+        if plot2d is None:
+            return
+        try:
+            _n, get_frame, _shape = self.frames()
+            _frame, box = _preview_window(np.asarray(get_frame(self.frame_index())))
+        except Exception as exc:
+            log.debug("[seg] preview-window box: no frame to size it from: %s", exc)
+            return
+        # Only push when something actually CHANGES. `seg_tune` fires on every
+        # slider tick and lands here whenever there is no engine, and
+        # `_push_groups` falls back to `MarkerGroup.set`, which re-serialises
+        # the panel — so an unconditional push would put a full serialisation
+        # on every tick of a drag to redraw a rectangle that did not move.
+        state = (tuple(box) if box is not None else None,
+                 getattr(self, "_ov_cleared", False))
+        if state == getattr(self, "_ov_box_state", None):
+            return
+        updates = {}
+        group = self._overlay_group(plot2d)
+        if group is not None and not getattr(self, "_ov_cleared", False):
+            updates[group] = {"vertices_list": []}          # no instances yet
+        frame_group = self._window_group(plot2d)
+        if frame_group is not None:
+            updates[frame_group] = {"vertices_list": _box_poly(box)}
+        if not updates:
+            return
+        try:
+            _push_groups(plot2d, updates)
+            self._ov_cleared = True
+            self._ov_box_state = (tuple(box) if box is not None else None, True)
+        except Exception as exc:
+            log.debug("[seg] preview-window push failed: %s", exc)
 
     def _overlay_group(self, plot2d):
         """The lazily-created polygon group the preview outlines live in."""
@@ -850,6 +901,19 @@ def _preview(wiz: SegmentWizard, gen: int) -> None:
     p = dict(wiz.params)
     engine = _engine(wiz, p)
     if engine is None:
+        # No engine yet — an untrained Scribble, or Prompt before any prompt.
+        # Still show WHERE the preview window is, and clear any outlines the
+        # previous engine left.
+        #
+        # The window box used to be drawn only as a side effect of a successful
+        # segmentation, which made it lie in three ways: it appeared only under
+        # Classical (the one engine that always has a solver), it SURVIVED a
+        # switch to an untrained Scribble because this early return painted
+        # nothing and cleared nothing, and after toggling the caret off and on
+        # it never came back. The box documents where the 1-megapixel budget
+        # looks; that is true whenever the caret is open and has nothing to do
+        # with whether an engine is trained.
+        wiz.show_preview_window()
         return
     t = wiz.frame_index()
     scale, units = wiz.scale_units()

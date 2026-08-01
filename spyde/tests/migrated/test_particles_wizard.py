@@ -994,3 +994,72 @@ class TestBatchComputingOverlay:
             for m in msgs), timeout=180), (
             "the Calculating chip never came down — it will spin forever over a "
             "window that has finished")
+
+
+class TestPreviewWindowBoxLifecycle:
+    """The 1-megapixel preview-window box must not depend on an ENGINE.
+
+    Reported: "the 1k x 1k outline only shows in classical; if you move to a
+    different mode it continues to show, but toggle out/back in and it won't
+    show up again." All three symptoms are one cause — the box was drawn only
+    as a side effect of a successful segmentation, and `_preview` returns early
+    when there is no engine (an untrained Scribble, or Prompt before any
+    prompt), painting nothing and CLEARING nothing:
+
+      * Classical always has a solver, so only it drew the box.
+      * Switching to an untrained engine left the previous box on screen,
+        because the early return cleared nothing.
+      * Toggling the caret dropped the overlay groups, and reopening in an
+        untrained engine early-returned again, so it never came back.
+
+    The box documents WHERE the budget looks. That is true whenever the caret
+    is open.
+    """
+
+    @staticmethod
+    def _wiz():
+        import types
+        import spyde.actions.particles_action as pa
+
+        class _Grp:                     # hashable by identity, unlike SimpleNamespace
+            def __init__(self, name):
+                self.name, self.removed = name, False
+
+            def remove(self):
+                self.removed = True
+
+        class _P2D:
+            def add_polygons(self, *a, **k):
+                return _Grp(k.get("name"))
+
+        wiz = object.__new__(pa.SegmentWizard)
+        wiz._ov_group = None
+        wiz._ov_box_group = None
+        wiz.src_plot = types.SimpleNamespace(_plot2d=_P2D())
+        wiz.frames = lambda: (1, lambda i: np.zeros((2048, 2048), np.float32),
+                              (2048, 2048))
+        wiz.frame_index = lambda: 0
+        return wiz
+
+    def test_box_is_drawn_with_no_engine(self, monkeypatch):
+        import spyde.actions.particles_action as pa
+        pushed = {}
+        monkeypatch.setattr(pa, "_push_groups", lambda p, u: pushed.update(
+            {g.name: pl.get("vertices_list") for g, pl in u.items()}))
+        self._wiz().show_preview_window()
+        box = pushed.get("seg_preview_window")
+        assert box, "no preview-window box without an engine — the untrained " \
+                    "Scribble/Prompt states show nothing at all"
+        assert len(box[0]) >= 4, "the box is not a closed rectangle"
+
+    def test_switching_to_an_untrained_engine_clears_stale_outlines(self, monkeypatch):
+        """A previous engine's instances must not linger looking like the new
+        engine's answer."""
+        import spyde.actions.particles_action as pa
+        pushed = {}
+        monkeypatch.setattr(pa, "_push_groups", lambda p, u: pushed.update(
+            {g.name: pl.get("vertices_list") for g, pl in u.items()}))
+        self._wiz().show_preview_window()
+        assert pushed.get("seg_preview_outline") == [], (
+            "the outline group was not cleared, so the old engine's particles "
+            "stay on screen")
