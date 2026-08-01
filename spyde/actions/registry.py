@@ -130,6 +130,9 @@ STAGED_HANDLERS: dict[str, str] = {
     "report_split_remove_figure": "spyde.actions.report.handlers.report_split_remove_figure",
     "report_update_cell":      "spyde.actions.report.handlers.report_update_cell",
     "report_remove_cell":      "spyde.actions.report.handlers.report_remove_cell",
+    # Test-only: release a SPYDE_TEST_HOLD pause point (backend/test_hold.py).
+    # Inert in production — with the env var unset there is no hold to release.
+    "test_hold_release":       "spyde.actions.find_vectors_action.test_hold_release",
     "report_move_cell":        "spyde.actions.report.handlers.report_move_cell",
     "report_move_slide":       "spyde.actions.report.handlers.report_move_slide",
     "report_set_caption":      "spyde.actions.report.handlers.report_set_caption",
