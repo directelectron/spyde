@@ -10,15 +10,39 @@ Two properties matter more than the feature itself, because this code ships:
 from __future__ import annotations
 
 import importlib
+import os
 import threading
 import time
 
+import pytest
 
+
+
+
+@pytest.fixture(autouse=True)
+def _disarm_after_each():
+    """Re-import the module DISARMED after every test in this file.
+
+    Load-bearing, and the reason is a bug this file caused: `_SPEC` is parsed
+    once at import (that is what makes the unset case free), so a
+    `monkeypatch.setenv` + `importlib.reload` leaves the module ARMED for the
+    rest of the pytest session even though monkeypatch has faithfully restored
+    the environment variable. `find_vectors_action` holds a module reference,
+    so a later test's batch then hit a live hold point and parked for
+    `MAX_HOLD_S` — surfacing as "the landing block painted no frame" and
+    "assert 0.0 > 0" in tests that have nothing to do with holds, on whichever
+    shard happened to run them afterwards.
+    """
+    yield
+    import spyde.backend.test_hold as th
+    os.environ.pop("SPYDE_TEST_HOLD", None)
+    importlib.reload(th).reset()
 
 
 def _fresh(monkeypatch, spec: "str | None"):
     """Re-import the module with ``SPYDE_TEST_HOLD`` set to *spec* — the spec is
-    parsed once at import, which is what makes the unset case free."""
+    parsed once at import, which is what makes the unset case free. The autouse
+    fixture above puts it back."""
     import spyde.backend.test_hold as th
     if spec is None:
         monkeypatch.delenv("SPYDE_TEST_HOLD", raising=False)

@@ -108,6 +108,14 @@ def hold_point(name: str, done: int, total: int) -> None:
     where = _SPEC.get(name)
     if where is None:
         return
+    # Belt and braces: confirm the variable is STILL set before parking anything.
+    # `_SPEC` is module state, and module state can be resurrected — a unit test
+    # that reloads this module with the variable set leaves it armed for the rest
+    # of the process even after the environment is restored. Re-checking here
+    # means a stale `_SPEC` can never park a real compute; the cost is one dict
+    # lookup, and only on a build that is armed at all.
+    if not os.environ.get("SPYDE_TEST_HOLD"):
+        return
     ev = _event(name)
     if ev.is_set():
         return                                  # already released — sail through
