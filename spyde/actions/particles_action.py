@@ -316,7 +316,8 @@ class SegmentWizard(WizardController):
         if getattr(self.tree, "_seg_wizard", None) is self:
             self.tree._seg_wizard = None
 
-    def set_overlay(self, contours=None, box=None) -> None:
+    def set_overlay(self, contours=None, box=None, labels=None,
+                    full_shape=None) -> None:
         """Draw (or clear) the previewed instances as OUTLINES on the source plot.
 
         Outlines and not a translucent raster mask, for two independent reasons —
@@ -349,6 +350,27 @@ class SegmentWizard(WizardController):
         group = self._overlay_group(plot2d)
         if group is None:
             return
+        # Hundreds of polygons is what makes the whole app sluggish — each is a
+        # path the renderer re-transforms every pan/zoom frame. Above the
+        # threshold draw ONE mask instead; the particle COUNT and every
+        # measurement are unaffected, only how they are drawn.
+        n = len(contours) if contours is not None else 0
+        if n > _RASTER_ABOVE and labels is not None:
+            if self._set_raster_overlay(labels, box, full_shape):
+                self._ov_raster = True
+                # Drop the vector outlines so the two do not double up.
+                updates = {group: {"vertices_list": []}}
+                frame_group = self._window_group(plot2d)
+                if frame_group is not None:
+                    updates[frame_group] = {"vertices_list": _box_poly(box)}
+                try:
+                    _push_groups(plot2d, updates)
+                    self._ov_cleared = False
+                    self._ov_box_state = None
+                except Exception as exc:
+                    log.debug("[seg] overlay push failed: %s", exc)
+                return
+        self._clear_raster_overlay()
         polys = _contour_polys(contours, box)
         updates = {group: {"vertices_list": polys}}
         # The preview window's own outline. Without it "only the middle of my
@@ -373,6 +395,72 @@ class SegmentWizard(WizardController):
             self._ov_box_state = None
         except Exception as exc:
             log.debug("[seg] overlay push failed: %s", exc)
+
+    def _set_raster_overlay(self, labels, box, full_shape) -> bool:
+        """Draw the instances as ONE mask instead of N polygons. True if drawn.
+
+        Uses ``Plot2D.set_overlay_mask``, which composites client-side onto the
+        transparent 2-D canvas that sits ABOVE the WebGPU canvas — so this works
+        on a GPU-rendered base, which a marker-layer raster would not.
+
+        THE TILING TRAP. When a large frame is in tile mode the renderer's mask
+        check is ``bytes.length === iw * ih`` where ``iw = base_width ||
+        image_width`` — i.e. the OVERVIEW size, not the native frame. A
+        native-resolution mask therefore fails that check and is dropped
+        SILENTLY: no error, no overlay, and nothing in the log to say why. So
+        the mask is built at the frame size and then reduced to the overview
+        grid whenever ``base_width`` is set.
+
+        The reduction is a block ANY, not a subsample: particles here are often
+        a few pixels across, and a strided sample of a 4096² mask at 1024²
+        drops three quarters of them at random.
+        """
+        plot2d = getattr(self.src_plot, "_plot2d", None)
+        if plot2d is None or not hasattr(plot2d, "set_overlay_mask"):
+            return False
+        try:
+            lab = np.asarray(labels)
+            if lab.ndim != 2 or not lab.any():
+                return False
+            fh, fw = (int(full_shape[0]), int(full_shape[1])) if full_shape \
+                else lab.shape
+            mask = np.zeros((fh, fw), bool)
+            if box is not None:
+                y0, x0, h, w = (int(v) for v in box)
+                mask[y0:y0 + h, x0:x0 + w] = lab[:h, :w] > 0
+            else:
+                mask[:lab.shape[0], :lab.shape[1]] = lab > 0
+
+            state = getattr(plot2d, "_state", {}) or {}
+            bw, bh = int(state.get("base_width") or 0), int(state.get("base_height") or 0)
+            if bw > 0 and bh > 0 and (bw, bh) != (fw, fh):
+                ys = max(1, fh // bh)
+                xs = max(1, fw // bw)
+                # Block ANY via a reshape-reduce, then pad/crop to exactly the
+                # overview grid — the renderer's length check is exact.
+                cut = mask[:(fh // ys) * ys, :(fw // xs) * xs]
+                small = cut.reshape(fh // ys, ys, fw // xs, xs).any(axis=(1, 3))
+                out = np.zeros((bh, bw), bool)
+                sh, sw = min(bh, small.shape[0]), min(bw, small.shape[1])
+                out[:sh, :sw] = small[:sh, :sw]
+                mask = out
+            plot2d.set_overlay_mask(mask, color=_PREVIEW_COLOR, alpha=_RASTER_ALPHA)
+            return True
+        except Exception as exc:
+            log.debug("[seg] raster overlay failed (%s); using outlines", exc)
+            return False
+
+    def _clear_raster_overlay(self) -> None:
+        plot2d = getattr(self.src_plot, "_plot2d", None)
+        if plot2d is None or not hasattr(plot2d, "set_overlay_mask"):
+            return
+        if not getattr(self, "_ov_raster", False):
+            return
+        try:
+            plot2d.set_overlay_mask(None)
+        except Exception as exc:
+            log.debug("[seg] clearing the raster overlay failed: %s", exc)
+        self._ov_raster = False
 
     def show_preview_window(self) -> None:
         """Draw the preview-window box ALONE, with no instance outlines.
@@ -447,6 +535,7 @@ class SegmentWizard(WizardController):
         return self._ov_box_group
 
     def _drop_overlay(self) -> None:
+        self._clear_raster_overlay()
         for attr in ("_ov_group", "_ov_box_group"):
             group = getattr(self, attr, None)
             if group is None:
@@ -818,6 +907,20 @@ _PREVIEW_WIDTH = 1.0
 #: painted class (orange / blue / grey / pink).
 _PREVIEW_WINDOW_COLOR = "#cdd6f4"
 
+#: Above this many instances the overlay switches from one polygon per particle
+#: to a SINGLE raster mask. Measured symptom: several hundred vector contours
+#: make the whole app sluggish, because every one is a path the renderer
+#: re-transforms on each pan/zoom frame. A mask is one image however many
+#: particles it contains.
+#:
+#: Below the threshold the vector outlines stay, and they are worth keeping:
+#: they are crisp at any zoom and each is a real object the UI can hover.
+_RASTER_ABOVE = 100
+
+#: The raster overlay's colour/opacity. Deliberately the same green as the
+#: vector outlines so crossing the threshold does not look like a mode change.
+_RASTER_ALPHA = 0.45
+
 
 def _box_poly(box) -> list:
     """The preview window as a one-polygon list, or empty when there is none.
@@ -987,7 +1090,9 @@ def _preview(wiz: SegmentWizard, gen: int) -> None:
         # The outlines carry the crop offset themselves (`_contour_polys`), so
         # unlike the retired mask path nothing has to be re-rasterised onto a
         # full-frame array first — at 4096² that array alone was 16 MB per frame.
-        wiz.set_overlay(res["contours"], res.get("box"))
+        wiz.set_overlay(res["contours"], res.get("box"),
+                        labels=res.get("labels"),
+                        full_shape=res.get("full_shape"))
         # The count reported is the count AFTER the size filter (plan §0.9b) —
         # `split_instances` applies min_size last, so `rows` is already filtered
         # and this number is the one the histogram below describes.

@@ -1063,3 +1063,94 @@ class TestPreviewWindowBoxLifecycle:
         assert pushed.get("seg_preview_outline") == [], (
             "the outline group was not cleared, so the old engine's particles "
             "stay on screen")
+
+
+class TestRasterOverlayAboveThreshold:
+    """Hundreds of vector contours make the app sluggish; draw one mask instead.
+
+    Every contour is a path the renderer re-transforms on each pan/zoom frame,
+    so a few hundred of them cost real interactivity. A mask is ONE image
+    however many particles it contains. Below the threshold the outlines stay —
+    crisp at any zoom, and each is an object the UI can hover.
+    """
+
+    @staticmethod
+    def _p2d(base_w=0, base_h=0):
+        class _P2D:
+            def __init__(self):
+                self._state = {"base_width": base_w, "base_height": base_h,
+                               "image_width": 4096, "image_height": 4096}
+                self.mask = "unset"
+
+            def set_overlay_mask(self, mask, color=None, alpha=None):
+                self.mask = mask
+
+            def add_polygons(self, *a, **k):
+                return None
+        return _P2D()
+
+    @staticmethod
+    def _wiz(p2d):
+        import types
+        import spyde.actions.particles_action as pa
+        w = object.__new__(pa.SegmentWizard)
+        w._ov_group = None
+        w._ov_box_group = None
+        w._ov_raster = False
+        w.src_plot = types.SimpleNamespace(_plot2d=p2d)
+        return w
+
+    @staticmethod
+    def _labels():
+        lab = np.zeros((1024, 1024), np.int32)
+        y, x = np.mgrid[0:1024, 0:1024]
+        for i, (cy, cx) in enumerate([(200, 200), (500, 700), (800, 300)], start=1):
+            lab[(y - cy) ** 2 + (x - cx) ** 2 < 25] = i     # 5 px radius
+        return lab
+
+    def test_untiled_mask_is_the_native_frame_size(self):
+        p = self._p2d()
+        assert self._wiz(p)._set_raster_overlay(
+            self._labels(), (1536, 1536, 1024, 1024), (4096, 4096))
+        assert p.mask.shape == (4096, 4096)
+
+    def test_tiled_mask_is_built_at_the_OVERVIEW_size(self):
+        """The trap this exists for.
+
+        In tile mode the renderer checks ``bytes.length === iw * ih`` where
+        ``iw = base_width || image_width`` — the OVERVIEW size. A
+        native-resolution mask fails that check and is dropped SILENTLY: no
+        error, no overlay, nothing in the log. So the mask must be reduced to
+        the overview grid, exactly.
+        """
+        p = self._p2d(1024, 1024)
+        assert self._wiz(p)._set_raster_overlay(
+            self._labels(), (1536, 1536, 1024, 1024), (4096, 4096))
+        assert p.mask.shape == (1024, 1024), (
+            f"mask is {p.mask.shape} but the renderer expects the overview "
+            f"grid (1024, 1024) — it would draw nothing at all")
+
+    def test_the_reduction_keeps_small_particles(self):
+        """Block ANY, not a subsample.
+
+        Particles are often a few pixels across; striding a 4096² mask down to
+        1024² would drop three quarters of them at random.
+        """
+        p = self._p2d(1024, 1024)
+        self._wiz(p)._set_raster_overlay(
+            self._labels(), (1536, 1536, 1024, 1024), (4096, 4096))
+        assert p.mask.sum() > 0, "every particle vanished in the reduction"
+
+    def test_below_the_threshold_nothing_is_rastered(self):
+        """Few particles → keep the crisp, hoverable vector outlines."""
+        import spyde.actions.particles_action as pa
+        assert pa._RASTER_ABOVE > 1
+        p = self._p2d()
+        wiz = self._wiz(p)
+        wiz._ov_cleared = False
+        wiz._ov_box_state = None
+        contours = [np.zeros((3, 2), np.int16) for _ in range(3)]
+        wiz.set_overlay(contours, None, labels=self._labels(),
+                        full_shape=(4096, 4096))
+        assert p.mask in ("unset", None), (
+            "a 3-particle frame was rastered; the outlines are better there")
