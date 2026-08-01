@@ -26,6 +26,11 @@ from spyde.drift.frames import frame_source
 from spyde.drift.model import DriftModel
 from spyde.drift.translation import solve_translation
 from spyde.drift.warp import coverage_mask, shift_frame
+# Safe to import eagerly: nonrigid resolves torch lazily inside its functions,
+# so this does not drag a heavy import into every `spyde.drift` user.
+from spyde.drift.nonrigid import (
+    DENSE, SCAN_KNOT, apply_nonrigid, displacement_for_frame, solve_nonrigid,
+)
 
 __all__ = [
     "DriftModel",
@@ -33,4 +38,10 @@ __all__ = [
     "shift_frame",
     "coverage_mask",
     "frame_source",
+    # non-rigid (plan A2-A5)
+    "solve_nonrigid",
+    "apply_nonrigid",
+    "displacement_for_frame",
+    "SCAN_KNOT",
+    "DENSE",
 ]
