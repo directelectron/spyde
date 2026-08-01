@@ -151,6 +151,42 @@ class ReportManager:
         self._offline: set[str] = set()
         # pending save handshake: token -> {cells, path, remaining}
         self._pending_save: dict[str, dict] = {}
+        # UNDO stack of {"label": str, "restore": callable}. Bounded, because an
+        # entry pins a removed cell's pixels (snapshots are numpy arrays and a
+        # baked PNG can be megabytes) — an unbounded stack would quietly hold
+        # every slide the user ever deleted for the life of the document.
+        self._undo: list[dict] = []
+
+    #: How many destructive report actions can be undone.
+    UNDO_DEPTH = 20
+
+    def push_undo(self, label: str, restore) -> None:
+        """Record a way to reverse the action just performed.
+
+        *restore* takes no arguments and puts the document back; it captures
+        whatever state it needs by closure. Callers must build it BEFORE
+        mutating, since the point is to hold the only remaining reference to
+        what is about to be dropped.
+        """
+        self._undo.append({"label": str(label), "restore": restore})
+        del self._undo[:-self.UNDO_DEPTH]
+
+    def undo(self) -> str | None:
+        """Reverse the most recent undoable action → its label, or None."""
+        if not self._undo:
+            return None
+        entry = self._undo.pop()
+        try:
+            entry["restore"]()
+        except Exception as e:                              # pragma: no cover
+            log.debug("report undo (%s) failed: %s", entry["label"], e)
+            return None
+        return entry["label"]
+
+    def clear_undo(self) -> None:
+        """Drop the stack — on new/close/open, where the entries refer to cells
+        of a document that is no longer loaded."""
+        self._undo.clear()
 
     # ── per-(cell, panel, layer) snapshot accessors ─────────────────────────────
 
@@ -212,6 +248,7 @@ class ReportManager:
         self._edit_wiring.clear()
         self._ann_widgets.clear()
         self._selected.clear()
+        self.clear_undo()
         self._clear_movie_sessions()
         _clear_vectors_explorer_cache()
 
@@ -269,6 +306,7 @@ class ReportManager:
         self._edit_wiring.clear()
         self._ann_widgets.clear()
         self._selected.clear()
+        self.clear_undo()
         self._clear_movie_sessions()
         _clear_vectors_explorer_cache()
 
@@ -410,6 +448,9 @@ class ReportManager:
             # Wave A — the document TYPE ("report" | "presentation" | "movie").
             "type": self.doc.doc_type,
             "dirty": bool(self.dirty),
+            # What the next Cmd-Z would reverse (None = nothing). The UI uses it
+            # to label the Undo affordance rather than offering a dead button.
+            "undo": (self._undo[-1]["label"] if self._undo else None),
             "cells": cells,
         }
 
@@ -2406,6 +2447,51 @@ def report_remove_cell(session, plot, payload) -> None:
     cell = mgr.doc.cell_by_id(payload.get("cell_id"))
     if cell is None:
         return
+
+    # ── capture for UNDO, BEFORE anything is dropped ───────────────────────────
+    # Deleting a cell is the most destructive thing the report editor does and
+    # it is one click away from the editor's Close button, so it has to be
+    # reversible. Everything below is popped from a side table in a moment; the
+    # closure becomes the only remaining reference to it.
+    #
+    # The figure WINDOW is deliberately not restored — a cell renders from its
+    # snapshots/baked pixels, and reopening the live window is what the editor
+    # does on demand. Undo brings the slide back, not the window it was
+    # authored in.
+    _index = mgr.doc.index_of(cell.id)
+    _saved = {
+        "cell": cell,
+        "snapshots": mgr._snapshots.get(cell.id),
+        "baked": mgr._baked.get(cell.id),
+        "images": mgr._images.get(cell.id),
+        "offline": cell.id in mgr._offline,
+        "editing": cell.id in mgr._editing,
+        "selected": mgr._selected.get(cell.id),
+    }
+
+    def _restore(saved=_saved, at=_index):
+        c = saved["cell"]
+        cells = mgr.doc.cells
+        # Clamp rather than assume: other cells may have been added or removed
+        # between the delete and the undo.
+        cells.insert(max(0, min(at, len(cells))), c)
+        if saved["snapshots"] is not None:
+            mgr._snapshots[c.id] = saved["snapshots"]
+        if saved["baked"] is not None:
+            mgr._baked[c.id] = saved["baked"]
+        if saved["images"] is not None:
+            mgr._images[c.id] = saved["images"]
+        if saved["offline"]:
+            mgr._offline.add(c.id)
+        if saved["editing"]:
+            mgr._editing.add(c.id)
+        if saved["selected"] is not None:
+            mgr._selected[c.id] = saved["selected"]
+        mgr.dirty = True
+        mgr.emit_state()
+
+    mgr.push_undo(f"Delete {cell.cell_type} cell", _restore)
+
     # Tear down the figure window (if any) so nothing leaks. A SPLIT cell holds a
     # figure side (same figure-window resources) AND possibly a held photo, so it
     # gets BOTH cleanups.
@@ -2439,6 +2525,19 @@ def report_remove_cell(session, plot, payload) -> None:
     mgr.doc.cells = [c for c in mgr.doc.cells if c.id != cell.id]
     mgr.dirty = True
     mgr.emit_state()
+
+
+def report_undo(session, plot, payload=None) -> None:
+    """Reverse the last destructive report action (Cmd/Ctrl-Z, or the Undo
+    button on the delete toast)."""
+    mgr = _manager(session)
+    if not mgr.open:
+        return
+    label = mgr.undo()
+    if label is None:
+        ipc.emit_status("Nothing to undo")
+        return
+    ipc.emit_status(f"Undone: {label}")
 
 
 def report_move_cell(session, plot, payload) -> None:

@@ -457,6 +457,25 @@ export function ReportSidebar() {
   }
 
   // Close the File menu on outside click / Escape.
+  // Cmd/Ctrl-Z while a report is open → undo the last destructive action.
+  // Bound on window so it works wherever focus is, but deliberately NOT while
+  // the pointer is in a text field: inside an input the browser's own
+  // text-undo is what the user means, and stealing it would be worse than not
+  // having the shortcut.
+  useEffect(() => {
+    if (report == null) return
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== 'z' || e.shiftKey) return
+      const el = document.activeElement as HTMLElement | null
+      const tag = el?.tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || el?.isContentEditable) return
+      e.preventDefault()
+      sendAction('report_undo', {})
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [report == null, sendAction])
+
   useEffect(() => {
     if (!menuOpen) return
     const onDown = (e: MouseEvent) => {
@@ -980,6 +999,17 @@ export function ReportSidebar() {
           title={isPresentation ? 'Presentation (slide deck)' : 'Report (scrolling article)'}
         >{isPresentation ? 'Presentation' : 'Report'}</span>
         <div style={{ flex: 1 }} />
+        {/* Undo — appears only when there is something to reverse, labelled with
+            what that is. A permanently-present greyed button teaches nothing;
+            this way its arrival IS the signal that the delete landed. */}
+        {report.undo && (
+          <button
+            data-testid="report-undo"
+            style={styles.undoBtn}
+            title={`Undo: ${report.undo}`}
+            onClick={() => sendAction('report_undo', {})}
+          >↶ Undo</button>
+        )}
         {/* Present ▶ — presentations only (a scrolling report has no slides). */}
         {isPresentation && (
           <button
@@ -1402,6 +1432,11 @@ const styles: Record<string, React.CSSProperties> = {
   dirtyDot: {
     width: 7, height: 7, borderRadius: '50%', background: '#fab387',
     flexShrink: 0, marginLeft: 1,
+  },
+  undoBtn: {
+    background: '#313244', color: '#cdd6f4', border: '1px solid #45475a',
+    borderRadius: 5, padding: '2px 8px', fontSize: 10.5, cursor: 'pointer',
+    flexShrink: 0, marginRight: 4, whiteSpace: 'nowrap',
   },
   templateBadge: {
     fontSize: 9, fontWeight: 700, color: '#a6adc8',
