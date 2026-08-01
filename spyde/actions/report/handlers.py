@@ -2459,6 +2459,12 @@ def report_remove_cell(session, plot, payload) -> None:
     # does on demand. Undo brings the slide back, not the window it was
     # authored in.
     _index = mgr.doc.index_of(cell.id)
+    # The successor's slide fields BEFORE _inherit_slide_identity may rewrite
+    # them: undo has to put the slide identity back where it was, or restoring
+    # the head cell would leave BOTH cells carrying slide_break and the one
+    # slide would come back as two.
+    _cells_now = list(mgr.doc.cells)
+    _succ = _cells_now[_index + 1] if 0 <= _index + 1 < len(_cells_now) else None
     _saved = {
         "cell": cell,
         "snapshots": mgr._snapshots.get(cell.id),
@@ -2467,11 +2473,23 @@ def report_remove_cell(session, plot, payload) -> None:
         "offline": cell.id in mgr._offline,
         "editing": cell.id in mgr._editing,
         "selected": mgr._selected.get(cell.id),
+        "succ": _succ,
+        "succ_slide": None if _succ is None else {
+            "slide_break": getattr(_succ, "slide_break", False),
+            **{a: getattr(_succ, a, None) for a in _SLIDE_ATTRS},
+        },
     }
 
     def _restore(saved=_saved, at=_index):
         c = saved["cell"]
         cells = mgr.doc.cells
+        succ, succ_slide = saved["succ"], saved["succ_slide"]
+        if succ is not None and succ_slide is not None:
+            for attr, val in succ_slide.items():
+                try:
+                    setattr(succ, attr, val)
+                except Exception as e:                    # pragma: no cover
+                    log.debug("restoring %s on the successor failed: %s", attr, e)
         # Clamp rather than assume: other cells may have been added or removed
         # between the delete and the undo.
         cells.insert(max(0, min(at, len(cells))), c)
@@ -2522,9 +2540,54 @@ def report_remove_cell(session, plot, payload) -> None:
             from spyde.actions.report.movie import _teardown_session
             _teardown_session(session, st)
         mgr._baked.pop(cell.id, None)
+    _inherit_slide_identity(mgr.doc, cell)
     mgr.doc.cells = [c for c in mgr.doc.cells if c.id != cell.id]
     mgr.dirty = True
     mgr.emit_state()
+
+
+#: The per-slide attributes that ride on a slide's FIRST cell (model.py: "Only
+#: the slide's FIRST cell's values matter"). They describe the SLIDE, not the
+#: cell, so they must survive that cell being deleted.
+_SLIDE_ATTRS = ("slide_kind", "slide_style", "notes", "live_action")
+
+
+def _inherit_slide_identity(doc, cell) -> None:
+    """Hand a slide's identity to the next cell before its HEAD cell is removed.
+
+    ``slide_break=True`` marks the cell that STARTS a slide, and the slide's
+    kind / style / notes / live-action all ride on that same cell. So deleting
+    the first cell of a slide — very often the figure, since a slide is
+    frequently just a figure plus a caption — did not merely remove that
+    figure: the break went with it, the slide's remaining cells were absorbed
+    into the PREVIOUS slide, and its title-kind, background and speaker notes
+    were silently lost. Deleting a figure deleted the slide.
+
+    Moving the flags to the next cell in the same slide keeps the slide intact
+    with one fewer cell, which is what "delete the figure" should mean. If the
+    cell was the slide's ONLY cell there is nothing to inherit and the slide
+    genuinely goes away — correct, since nothing of it remains.
+    """
+    cells = list(getattr(doc, "cells", []) or [])
+    try:
+        i = next(k for k, c in enumerate(cells) if c.id == cell.id)
+    except StopIteration:
+        return
+    if not getattr(cell, "slide_break", False):
+        return                       # not a slide head — nothing to hand over
+    nxt = cells[i + 1] if i + 1 < len(cells) else None
+    # A following cell that already starts its OWN slide is a different slide;
+    # this one really is ending.
+    if nxt is None or getattr(nxt, "slide_break", False):
+        return
+    nxt.slide_break = True
+    for attr in _SLIDE_ATTRS:
+        # Don't clobber a value the successor already carries.
+        if not getattr(nxt, attr, None):
+            try:
+                setattr(nxt, attr, getattr(cell, attr))
+            except Exception as e:                        # pragma: no cover
+                log.debug("inheriting %s failed: %s", attr, e)
 
 
 def report_undo(session, plot, payload=None) -> None:

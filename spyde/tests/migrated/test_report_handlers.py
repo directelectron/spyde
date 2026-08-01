@@ -191,6 +191,78 @@ class TestReportDocument:
         h.report_undo(session, None, {})
         assert _last_state(messages)["cells"] == []
 
+    # ── deleting a slide's HEAD cell must not delete the slide ────────────────
+    #
+    # `slide_break=True` marks the cell that STARTS a slide, and the slide's
+    # kind/style/notes ride on that same cell. A slide is very often just a
+    # figure plus a caption, so deleting the figure used to take the break with
+    # it: the caption was absorbed into the PREVIOUS slide and the slide's
+    # styling and speaker notes vanished. Deleting the figure deleted the slide.
+
+    def _deck(self, session, messages):
+        """[A] | [B1 B2] — two slides, the second headed by B1, which carries
+        the slide's kind/style/notes (the model puts them on the FIRST cell)."""
+        h.report_new(session, None, {"type": "presentation"})
+        h.report_add_cell(session, None, {"cell_type": "markdown", "source": "A"})
+        h.report_add_cell(session, None, {
+            "cell_type": "markdown", "source": "B1", "slide_break": True,
+            "slide_kind": "title", "slide_style": "accent", "notes": "say this"})
+        h.report_add_cell(session, None, {"cell_type": "markdown", "source": "B2"})
+        return {c["source"]: c["id"] for c in _last_state(messages)["cells"]}
+
+    def _slides(self, session):
+        return [[c.source for c in s] for s in h._manager(session).doc.slides()]
+
+    def test_deleting_a_slide_head_keeps_the_slide(self, window):
+        session, messages = window["window"], window["messages"]
+        ids = self._deck(session, messages)
+        assert self._slides(session) == [["A"], ["B1", "B2"]]
+        h.report_remove_cell(session, None, {"cell_id": ids["B1"]})
+        # B2 must still be its OWN slide, not swallowed by A's.
+        assert self._slides(session) == [["A"], ["B2"]]
+
+    def test_the_slide_keeps_its_style_and_notes(self, window):
+        session, messages = window["window"], window["messages"]
+        ids = self._deck(session, messages)
+        h.report_remove_cell(session, None, {"cell_id": ids["B1"]})
+        b2 = h._manager(session).doc.cells[-1]
+        assert b2.slide_break is True
+        assert b2.slide_kind == "title"
+        assert b2.slide_style == "accent"
+        assert b2.notes == "say this"
+
+    def test_a_slides_only_cell_really_does_end_the_slide(self, window):
+        """Nothing of it remains, so there is no slide to keep."""
+        session, messages = window["window"], window["messages"]
+        ids = self._deck(session, messages)
+        h.report_remove_cell(session, None, {"cell_id": ids["B2"]})
+        h.report_remove_cell(session, None, {"cell_id": ids["B1"]})
+        assert self._slides(session) == [["A"]]
+
+    def test_the_next_slides_head_is_not_absorbed(self, window):
+        """A successor that already starts its OWN slide is a different slide —
+        it must not inherit this one's styling."""
+        session, messages = window["window"], window["messages"]
+        ids = self._deck(session, messages)
+        h.report_toggle_slide_break(session, None, {"cell_id": ids["B2"]})
+        assert self._slides(session) == [["A"], ["B1"], ["B2"]]
+        h.report_remove_cell(session, None, {"cell_id": ids["B1"]})
+        assert self._slides(session) == [["A"], ["B2"]]
+        b2 = h._manager(session).doc.cells[-1]
+        assert b2.slide_kind == "", "B2 had its own slide; it must not inherit"
+
+    def test_undo_does_not_split_the_slide_in_two(self, window):
+        """Restoring the head cell has to hand the identity BACK, or both cells
+        end up carrying slide_break and one slide returns as two."""
+        session, messages = window["window"], window["messages"]
+        ids = self._deck(session, messages)
+        h.report_remove_cell(session, None, {"cell_id": ids["B1"]})
+        h.report_undo(session, None, {})
+        assert self._slides(session) == [["A"], ["B1", "B2"]]
+        b1, b2 = h._manager(session).doc.cells[1], h._manager(session).doc.cells[2]
+        assert b1.slide_break is True and b2.slide_break is False
+        assert b1.slide_kind == "title" and b2.slide_kind == ""
+
     def test_move_cell(self, window):
         session, messages = window["window"], window["messages"]
         h.report_new(session, None, {})
