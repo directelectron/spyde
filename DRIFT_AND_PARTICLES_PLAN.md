@@ -254,6 +254,37 @@ The rule, for every action in this feature:
 The measured couplings from §0.9 still hold; they just are not the *front* of the
 caret. Sensitivity and min-size stay adjacent **inside Advanced**.
 
+> **"Demoted, not deleted" needs checking, because the caret has broken twice on
+> exactly that seam.** Both times the visible symptom was in the Segment caret and
+> neither was visible to pytest or `tsc`:
+>
+> 1. A control was taken off the face and its replacement was written *as if* it
+>    had landed in Advanced, but it never did. `min_score` was left with state, a
+>    payload field and a backend filter — and no control anywhere able to move it,
+>    so the feature was unreachable while every test still passed.
+> 2. The face grew to three controls, the two new ones used a `Field` helper the
+>    file never imported, and the whole caret threw on first render. A blank
+>    window; `pytest` green, `tsc` green, and `segment_wizard.spec.ts` — which
+>    asserts the caret is visible on line one — simply had not been run.
+>
+> So: after moving a control, grep that its state has a **live setter**, and run
+> the area's e2e spec. The renderer payload and `particles_action.DEFAULTS` should
+> stay a 1:1 key match; that comparison catches both classes at once.
+
+**Advanced is TWO COLUMNS, and that is a fitting constraint, not a style.** The
+caret has no scroller of its own — the Threshold dropdown's menu is absolutely
+positioned, so any `overflow:auto` ancestor clips it — which makes height a hard
+budget rather than a comfort question. Stacked in one column, Advanced measured
+**907 px in an 805 px MDI area**, putting the size histogram and Commit Frame
+off-screen with no way to reach them. Two columns (params you SET | feedback the
+frame gives you, B7's original layout) halves it without demoting or deleting
+anything, and the caret widens only while Advanced is open so the collapsed face
+stays calm. `expectCaretFits` in `segment_wizard.spec.ts` holds it, and it checks
+**both axes**: the first two-column attempt fit vertically and was then placed off
+the LEFT edge of the app, because a side-placed caret anchors its right edge to
+the window's left and a wide one walks straight out of the viewport
+(`FloatingToolbar` now clamps side placements into the MDI area).
+
 **Drift is the same rule applied harder.** Its parameters (reference mode,
 upsample, max-shift) have one right answer we already know, so the caret is a
 button, a progress bar, and 2–3 toggles — one of which is *"use ROI for
@@ -794,6 +825,61 @@ store:
 ---
 
 ## Traps — each previously paid for
+
+0. **The overlay's raster path was UNREACHABLE on exactly the frames it was
+   written for, and the fallback was unbounded.** Reported on a real in-situ
+   movie: "14028 particles in this region", the preview window a flat sheet of
+   green, the renderer hung, the Scribble tab unusable. Three defects, one
+   screenshot:
+   - The renderer sizes the overlay mask against `base_width || image_width` —
+     the tile OVERVIEW grid — while tile mode sets `image_width` to the FULL
+     native frame. `_set_raster_overlay` reduced to the overview grid (right for
+     the renderer); anyplotlib's `set_overlay_mask` validated that against the
+     image shape and raised; SpyDE logged it at **DEBUG** and fell back to one
+     filled polygon per instance. So above 1024 px — every frame big enough to
+     need a mask — the mask could never draw. **Verified both ways**: an
+     overview-sized mask was rejected by Python, and a full-sized one encoded
+     22.4 MB that the renderer silently discards (`maskCache=null`). anyplotlib
+     now owns the reduction (`_reduce_mask_any`, block ANY) and accepts either
+     shape; SpyDE logs a failure at WARNING because the fallback is a hang.
+   - Nothing capped the polygon fallback (`_MAX_OUTLINE_POLYS` now does).
+   - `show_preview_window` cleared the vector outlines but NOT the raster, so
+     the previous engine's mask survived a switch to an untrained Scribble and
+     covered the image you have to paint on.
+
+   **Assert on the bytes that SHIP, never on what the caller built.** The test
+   that existed for this faked `set_overlay_mask` and asserted the mask SpyDE
+   handed it, so it was green throughout — the contract that failed was the one
+   the fake did not enforce.
+
+0b. **A failed threshold is not a result, and no caret knob rescues one.** Otsu
+   on a low-contrast frame has no bimodal histogram to find, lands inside the
+   noise, and the split shatters the support film. Measured on a synthetic
+   stand-in (noisy film, 8 faint particles, 1024²):
+
+   | settings | instances | coverage |
+   |---|---|---|
+   | defaults | 4873 | 39% |
+   | `min_size=200` | 208 | 14% |
+   | `min_size=2000` | 17 | 7.2% |
+   | watershed off | 751 | 40% |
+   | `gaussian=2` + `min_size=200` + no watershed | 8 | **52%** |
+
+   The last row is the trap: 8 instances looks like the 8 real particles, but at
+   52% coverage those 8 bodies ARE the film. Hence `_threshold_failed` tests
+   **count AND coverage** — neither alone is diagnostic — and the caret names
+   the failure and points at Scribble (§0.9) instead of presenting "14028
+   particles". Reproduce it in the app with
+   `load_test_data_particles {noise: 0.35, size: [1200, 1200]}`; at the default
+   `noise=0.015` the fixture is clean and every spec stays green through all of
+   the above (`seg_oversegment.spec.ts`).
+
+0c. **The nm face controls need a LENGTH axis.** `merge_nm`/`min_nm` divide by
+   the signal's scale, and a reciprocal-space signal reports a perfectly healthy
+   positive scale in `nm⁻¹` — so the conversion ran and produced a merge radius
+   wrong by the camera length, with the caret still reading "nm". Convert
+   through `_NM_PER` (so µm and Å work too) and fall back to PIXELS, relabelling
+   the sliders via `face_units`, whenever the unit is not a length.
 
 1. **Never materialise the movie.** No `.compute()` / `.result()` on the full
    dataset in `spyde/drift/` or `spyde/particles/`. Mirror

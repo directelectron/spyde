@@ -1798,3 +1798,51 @@ speedup is simply no longer needed on this path.
 
 Gated at `_COMPONENT_ROUTE_PX` (4 MP): below it the per-crop bookkeeping costs
 more than the memory it saves.
+
+---
+
+## Segmentation preview on a LOW-CONTRAST frame (2026-08-02)
+
+Reported from a real in-situ movie: "14028 particles in this region", a solid
+green preview window, and 4.1 s per tune. Reproduced on a synthetic stand-in —
+noisy support film, 8 faint dark particles, 1024², `invert=True`, otsu.
+
+**Otsu has no bimodal histogram to find here, so no caret knob rescues it:**
+
+| settings | instances | coverage | block-ANY coverage at 1/4 | time |
+|---|---|---|---|---|
+| defaults (`min_size=20`, watershed) | 4873 | 39.0% | 51.1% | 810 ms |
+| `min_size=200` | 208 | 14.4% | 16.5% | 595 ms |
+| `min_size=2000` | 17 | 7.2% | 7.9% | 577 ms |
+| watershed off | 751 | 39.8% | 52.3% | 67 ms |
+| `gaussian=2` | 431 | 52.7% | 55.0% | 392 ms |
+| rolling ball 64 + `gaussian=2` | 2280 | 26.4% | 39.4% | 11191 ms |
+| `gaussian=2` + `min_size=200` + no watershed | 8 | 52.4% | 54.2% | 101 ms |
+
+The last row is why `_threshold_failed` tests count AND coverage: 8 instances
+looks like the 8 real particles, but at 52% coverage those 8 bodies are the
+film. And note the block-ANY column — the overview reduction the tiled overlay
+uses turns 39% coverage into 51%, so a shattered frame composites into a sheet.
+
+**Where the preview's time goes** (same frame, warm):
+
+| stage | over-segmented (n=4873) | filtered (n=17) |
+|---|---|---|
+| `segment_frame` (threshold + watershed + filter) | 706 ms | 569 ms |
+| `measure_frame` (props + contours) | 647 ms | 62 ms |
+| **total** | **1353 ms** | **631 ms** |
+
+`watershed=True` is 700 ms of that vs 61 ms off — the split itself is ~639 ms
+and is inherent to a mask covering 39% of the frame, so it is NOT the part to
+optimise; the fix is to stop producing such a mask.
+
+The contours are, though: they are the bulk of `measure_frame` at high instance
+counts and are thrown away above the overlay's draw cap. `want_contours=False`
+takes the preview **1513 -> 969 ms (36% faster)** at n=4873 with the measured
+rows **bit-identical** (`np.array_equal`), so the count, histogram, median and
+confidence filter are unaffected. The saving scales with instance count, so the
+reported 14028-instance frame gains proportionally more.
+
+Reproduce in the app: `load_test_data_particles {noise: 0.35, size: [1200,1200]}`
+(`seg_oversegment.spec.ts`). At the default `noise=0.015` the fixture is clean,
+a global threshold works on it, and none of this is visible.
