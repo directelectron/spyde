@@ -26,6 +26,42 @@ import { DECK_THEME_DEFAULTS, type DeckTheme } from '../kernel/protocol'
  *  broadcast, so a 10 MB PNG would bloat both for a 30 px-tall mark. */
 const LOGO_MAX_BYTES = 2 * 1024 * 1024
 
+/**
+ * A text field that ECHOES LOCALLY and pushes on a debounce.
+ *
+ * Every field here is ultimately owned by the backend: `value` comes from
+ * report_state, which only arrives after the action round-trips. Bound directly,
+ * each keystroke would render the PREVIOUS value until the reply landed —
+ * characters appear late, and the caret jumps if the reply is reordered. So the
+ * input renders local state immediately and the backend write is debounced.
+ *
+ * `dirty` keeps an in-flight edit from being clobbered by the echo of an
+ * earlier keystroke, and clears once our own write has been sent, so an
+ * external change (Reset, Use my default, a preset) still updates the field.
+ */
+function useEchoedField(value: string, push: (v: string) => void, delay = 220) {
+  const [local, setLocal] = React.useState(value)
+  const dirty = useRef(false)
+  const timer = useRef<number | null>(null)
+
+  React.useEffect(() => { if (!dirty.current) setLocal(value) }, [value])
+  React.useEffect(() => () => {
+    if (timer.current != null) window.clearTimeout(timer.current)
+  }, [])
+
+  const onChange = (v: string) => {
+    dirty.current = true
+    setLocal(v)
+    if (timer.current != null) window.clearTimeout(timer.current)
+    timer.current = window.setTimeout(() => {
+      timer.current = null
+      dirty.current = false
+      push(v)
+    }, delay)
+  }
+  return [local, onChange] as const
+}
+
 /** One-click starting points. Not a replacement for the controls — a way to be
  *  somewhere reasonable in one click rather than picking six colours cold. */
 const PRESETS: { name: string; theme: Partial<DeckTheme> }[] = [
@@ -42,6 +78,30 @@ export function ThemePanel({ theme, onClose }: {
   const { sendAction } = useSpyDE()
   const fileRef = useRef<HTMLInputElement>(null)
   const [note, setNote] = useState<string>('')
+
+  /**
+   * Which scope button was just pressed, so it can confirm itself.
+   *
+   * "Set as default" writes to settings.json and "Use my default" / "Reset"
+   * usually land on a theme that LOOKS similar to what you had — so all three
+   * could be pressed with no visible consequence whatsoever, which reads as a
+   * dead button. Each now flips to a ✓ label for a moment. Held in state
+   * (not a CSS animation) because the confirmation has to survive the report_state
+   * round-trip that re-renders this panel.
+   */
+  const [confirmed, setConfirmed] = useState<string | null>(null)
+  const confirmTimer = useRef<number | null>(null)
+  const confirm = (key: string) => {
+    setConfirmed(key)
+    if (confirmTimer.current != null) window.clearTimeout(confirmTimer.current)
+    confirmTimer.current = window.setTimeout(() => {
+      confirmTimer.current = null
+      setConfirmed(null)
+    }, 1800)
+  }
+  React.useEffect(() => () => {
+    if (confirmTimer.current != null) window.clearTimeout(confirmTimer.current)
+  }, [])
 
   const patch = (p: Partial<DeckTheme>) => sendAction('report_set_theme', { theme: p })
 
@@ -69,27 +129,14 @@ export function ThemePanel({ theme, onClose }: {
   }
 
   const colorRow = (label: string, key: keyof DeckTheme, hint: string) => (
-    <label style={styles.colorRow} key={key}>
-      <input
-        type="color"
-        data-testid={`theme-color-${key}`}
-        value={String(theme[key] ?? '#000000')}
-        onChange={(e) => patch({ [key]: e.target.value } as Partial<DeckTheme>)}
-        style={styles.swatch}
-      />
-      <span style={styles.colorLabel}>
-        {label}
-        <span style={styles.hint}>{hint}</span>
-      </span>
-      <input
-        type="text"
-        data-testid={`theme-hex-${key}`}
-        value={String(theme[key] ?? '')}
-        onChange={(e) => patch({ [key]: e.target.value } as Partial<DeckTheme>)}
-        style={styles.hex}
-        spellCheck={false}
-      />
-    </label>
+    <ColorRow
+      key={key}
+      label={label}
+      hint={hint}
+      fieldKey={key}
+      value={String(theme[key] ?? '')}
+      onPush={(v) => patch({ [key]: v } as Partial<DeckTheme>)}
+    />
   )
 
   return (
@@ -140,14 +187,11 @@ export function ThemePanel({ theme, onClose }: {
           {/* ── Type ────────────────────────────────────────────────────────── */}
           <div style={styles.section}>
             <div style={styles.sectionTitle}>Type</div>
-            <input
-              type="text"
-              data-testid="theme-font"
+            <TextField
+              testid="theme-font"
               value={theme.font}
               placeholder="Font stack — blank for the app default"
-              onChange={(e) => patch({ font: e.target.value })}
-              style={styles.textInput}
-              spellCheck={false}
+              onPush={(v) => patch({ font: v })}
             />
           </div>
 
@@ -212,15 +256,13 @@ export function ThemePanel({ theme, onClose }: {
               />
               Show the footer bar
             </label>
-            <input type="text" data-testid="theme-footer-name" value={theme.footer_name}
-                   placeholder="Name" style={styles.textInput}
-                   onChange={(e) => patch({ footer_name: e.target.value })} />
-            <input type="text" data-testid="theme-footer-email" value={theme.footer_email}
-                   placeholder="Email" style={styles.textInput}
-                   onChange={(e) => patch({ footer_email: e.target.value })} />
-            <input type="text" data-testid="theme-footer-note" value={theme.footer_note}
-                   placeholder="Affiliation, conference, date…" style={styles.textInput}
-                   onChange={(e) => patch({ footer_note: e.target.value })} />
+            <TextField testid="theme-footer-name" value={theme.footer_name}
+                       placeholder="Name" onPush={(v) => patch({ footer_name: v })} />
+            <TextField testid="theme-footer-email" value={theme.footer_email}
+                       placeholder="Email" onPush={(v) => patch({ footer_email: v })} />
+            <TextField testid="theme-footer-note" value={theme.footer_note}
+                       placeholder="Affiliation, conference, date…"
+                       onPush={(v) => patch({ footer_note: v })} />
             <label style={styles.checkRow}>
               <input
                 type="checkbox"
@@ -238,27 +280,87 @@ export function ThemePanel({ theme, onClose }: {
         {/* ── Scope actions ─────────────────────────────────────────────────── */}
         <div style={styles.footerBar}>
           <button
-            style={styles.btnQuiet}
+            style={confirmed === 'reset' ? styles.btnQuietDone : styles.btnQuiet}
             data-testid="theme-reset"
+            data-confirmed={confirmed === 'reset' ? '1' : '0'}
             title="Back to SpyDE's built-in look (not your saved default)"
-            onClick={() => sendAction('report_theme_reset', {})}
-          >Reset</button>
+            onClick={() => { sendAction('report_theme_reset', {}); confirm('reset') }}
+          >{confirmed === 'reset' ? '✓ Reset' : 'Reset'}</button>
           <button
-            style={styles.btnQuiet}
+            style={confirmed === 'use' ? styles.btnQuietDone : styles.btnQuiet}
             data-testid="theme-use-default"
+            data-confirmed={confirmed === 'use' ? '1' : '0'}
             title="Apply your saved default theme to this deck"
-            onClick={() => sendAction('report_theme_use_default', {})}
-          >Use my default</button>
+            onClick={() => { sendAction('report_theme_use_default', {}); confirm('use') }}
+          >{confirmed === 'use' ? '✓ Applied' : 'Use my default'}</button>
           <div style={{ flex: 1 }} />
           <button
-            style={styles.btnPrimary}
+            style={confirmed === 'default' ? styles.btnPrimaryDone : styles.btnPrimary}
             data-testid="theme-set-default"
+            data-confirmed={confirmed === 'default' ? '1' : '0'}
             title="Every new deck will start from this theme"
-            onClick={() => { sendAction('report_theme_set_default', {}); setNote('Saved as your default.') }}
-          >Set as default</button>
+            onClick={() => { sendAction('report_theme_set_default', {}); confirm('default') }}
+          >{confirmed === 'default' ? '✓ Saved as default' : 'Set as default'}</button>
         </div>
       </div>
     </div>
+  )
+}
+
+/** One colour: a swatch and a hex field, both echoing locally (see
+ *  useEchoedField) so dragging the picker and typing a hex both feel immediate
+ *  rather than waiting on the backend's echo. */
+function ColorRow({ label, hint, fieldKey, value, onPush }: {
+  label: string
+  hint: string
+  fieldKey: string
+  value: string
+  onPush: (v: string) => void
+}) {
+  const [local, setLocal] = useEchoedField(value, onPush, 120)
+  return (
+    <label style={styles.colorRow}>
+      <input
+        type="color"
+        data-testid={`theme-color-${fieldKey}`}
+        value={/^#[0-9a-fA-F]{6}$/.test(local) ? local : '#000000'}
+        onChange={(e) => setLocal(e.target.value)}
+        style={styles.swatch}
+      />
+      <span style={styles.colorLabel}>
+        {label}
+        <span style={styles.hint}>{hint}</span>
+      </span>
+      <input
+        type="text"
+        data-testid={`theme-hex-${fieldKey}`}
+        value={local}
+        onChange={(e) => setLocal(e.target.value)}
+        style={styles.hex}
+        spellCheck={false}
+      />
+    </label>
+  )
+}
+
+/** A debounced, locally-echoing text input for the plain theme fields. */
+function TextField({ testid, value, placeholder, onPush }: {
+  testid: string
+  value: string
+  placeholder: string
+  onPush: (v: string) => void
+}) {
+  const [local, setLocal] = useEchoedField(value, onPush)
+  return (
+    <input
+      type="text"
+      data-testid={testid}
+      value={local}
+      placeholder={placeholder}
+      onChange={(e) => setLocal(e.target.value)}
+      style={styles.textInput}
+      spellCheck={false}
+    />
   )
 }
 
@@ -353,5 +455,19 @@ const styles: Record<string, React.CSSProperties> = {
   btnPrimary: {
     background: '#89b4fa', color: '#11111b', border: 'none', borderRadius: 6,
     padding: '6px 12px', fontSize: 12, fontWeight: 700, cursor: 'pointer',
+    transition: 'background 120ms ease, color 120ms ease',
+  },
+  // Confirmed states — green, so "it worked" is legible at a glance rather than
+  // inferred from a slide that may look identical to what you had.
+  btnPrimaryDone: {
+    background: '#a6e3a1', color: '#11111b', border: 'none', borderRadius: 6,
+    padding: '6px 12px', fontSize: 12, fontWeight: 700, cursor: 'pointer',
+    transition: 'background 120ms ease, color 120ms ease',
+  },
+  btnQuietDone: {
+    background: 'rgba(166,227,161,0.16)', color: '#a6e3a1',
+    border: '1px solid #a6e3a1', borderRadius: 6,
+    padding: '5px 10px', fontSize: 12, cursor: 'pointer',
+    transition: 'background 120ms ease, color 120ms ease, border-color 120ms ease',
   },
 }

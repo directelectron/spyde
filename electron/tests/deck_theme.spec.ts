@@ -183,3 +183,56 @@ test('4) a colour change reaches the MARKDOWN, not just the chrome', async () =>
   await page.screenshot({ path: join(SHOTS, '06-paper-theme.png') })
   await exitPresent(page)
 })
+
+/**
+ * The scope buttons have to CONFIRM themselves. "Set as default" writes to
+ * settings.json and "Use my default" / "Reset" usually land on a theme that
+ * looks similar to what you had — so without feedback all three can be pressed
+ * with no visible consequence at all, which reads as a dead button.
+ */
+test('5) Set as default / Use my default / Reset each confirm visibly', async () => {
+  const { page } = ctx
+  await page.getByTestId('report-theme').click()
+  await expect(page.getByTestId('theme-panel')).toBeVisible()
+
+  for (const [testid, label] of [
+    ['theme-set-default', '✓ Saved as default'],
+    ['theme-use-default', '✓ Applied'],
+    ['theme-reset', '✓ Reset'],
+  ] as const) {
+    const btn = page.getByTestId(testid)
+    await expect(btn).toHaveAttribute('data-confirmed', '0')
+    await btn.click()
+    await expect(btn, `${testid} gave no confirmation`).toHaveAttribute('data-confirmed', '1')
+    await expect(btn).toHaveText(label)
+    await page.screenshot({ path: join(SHOTS, `07-confirm-${testid}.png`) })
+    // …and it must go back on its own, or the panel is stuck looking "saved".
+    await expect(btn).toHaveAttribute('data-confirmed', '0', { timeout: 5_000 })
+  }
+})
+
+/**
+ * Typing must echo IMMEDIATELY. The fields are owned by the backend
+ * (report_state), so bound directly each keystroke would render the previous
+ * value until the reply landed. This types fast and checks the input holds the
+ * whole string straight away, then that it reaches the document.
+ */
+test('6) typing in a theme field echoes immediately and still persists', async () => {
+  const { page } = ctx
+  const field = page.getByTestId('theme-footer-name')
+  await field.fill('')
+  await page.waitForTimeout(400)
+
+  const typed = 'Dr Carter Francis'
+  await field.pressSequentially(typed, { delay: 12 })
+  // No wait: the input must already show every character.
+  expect(await field.inputValue(),
+    'the field lagged behind typing — it is bound to the backend echo').toBe(typed)
+
+  // And the debounced write still lands in the document.
+  await expect.poll(async () => (await docTheme(page))?.footer_name, {
+    timeout: 5_000, message: 'the debounced theme write never reached the backend',
+  }).toBe(typed)
+
+  await page.getByTestId('theme-close').click()
+})
