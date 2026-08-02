@@ -839,7 +839,10 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
   // LATEST frame per key (retained across postMessage's transfer, which
   // detaches the original ArrayBuffer) — matches the "latest-wins" paint
   // philosophy used throughout the nav/paint pipeline (see CLAUDE.md).
-  const latestBinaryStates = useRef<Map<string, Map<string, { header: unknown; buffer: Uint8Array }>>>(new Map())
+  // figId → (`${geom}::${pixelField}` → the frame). Keyed per PANEL, not per
+  // pixel field — see the state_update_binary handler for why that matters.
+  const latestBinaryStates = useRef<Map<string, Map<string,
+    { key: string; header: unknown; buffer: Uint8Array }>>>(new Map())
   // Mirror reportFigures into a ref so the (stable-identity, deps-[]) message
   // effect below can read the LATEST cell→figure map synchronously — e.g. to
   // find a report cell's OLD figId before it's replaced, so its shadow state
@@ -871,7 +874,10 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     }
     const binStates = latestBinaryStates.current.get(figId)
     if (binStates) {
-      for (const [key, { header, buffer }] of binStates) {
+      // The MAP key is `geom::pixelField` (one entry per panel); the message
+      // must carry the original pixel-field `key` + its header, which is what
+      // the figure routes on.
+      for (const { key, header, buffer } of binStates.values()) {
         // Send a COPY (transfer detaches the buffer) — the stash must survive
         // a later iframe remount (e.g. window re-tile / dev StrictMode).
         const copy = buffer.slice()
@@ -1182,8 +1188,30 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
               if (!latestBinaryStates.current.has(figId)) {
                 latestBinaryStates.current.set(figId, new Map())
               }
+              // STASH PER PANEL, not per pixel-field.
+              //
+              // `key` is the pixel FIELD ("image_b64" / "overlay_mask_b64" /
+              // "detail_b64") and is the SAME for every panel; the panel is
+              // identified by `header.geom`, the trait name anyplotlib routes
+              // the bytes back through (see _electron.py's emit_binary). Keying
+              // the stash by `key` alone therefore let each panel of a
+              // multi-panel figure OVERWRITE the previous one's pixels, leaving
+              // exactly one frame stashed however many panels the figure has.
+              //
+              // A figure only replays from this stash when it is mounted a
+              // SECOND time — which is what a presented slide is, the sidebar
+              // cell being the first. So a composed grid rendered correctly in
+              // the sidebar and then presented with every panel blank except
+              // the last one composed: no image, no ticks, no title, only the
+              // HTML scale-bar overlay, which is not part of the canvas.
+              // Single-panel cells (everything else in the app) push one frame
+              // and never noticed.
+              //
+              // Mirrors the figure ESM's own slot convention, `geom::pixelKey`.
+              const geom = (msg.header as { geom?: string } | undefined)?.geom
+              const stashKey = geom ? `${geom}::${key}` : key
               latestBinaryStates.current.get(figId)!.set(
-                key, { header: msg.header, buffer: bytes.slice() },
+                stashKey, { key, header: msg.header, buffer: bytes.slice() },
               )
             }
             const iframe = iframeRefs.current.get(figId)

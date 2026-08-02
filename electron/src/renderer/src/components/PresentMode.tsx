@@ -288,6 +288,49 @@ function SlideFooter({ theme, slideNumber, slideCount }: {
   )
 }
 
+/**
+ * The figure diagnostic, drawn ON THE SLIDE (press D while presenting).
+ *
+ * A report figure is mounted twice — sidebar cell and presented slide — and both
+ * register under the SAME figId, so the presented copy draws from whatever
+ * `replayState` re-sends to whichever element holds that registration. When a
+ * panel comes up blank, the question is simply: did the PRESENTED iframe win
+ * the registration, and does the pixel stash still hold a state per panel.
+ *
+ * Rendered rather than logged so answering it needs a keypress and a
+ * screenshot, not a DevTools session mid-talk.
+ */
+function FigureDiag({ slideCells }: { slideCells: ReportCell[] }) {
+  const rows = React.useMemo(() => {
+    const fn = (window as unknown as Record<string, unknown>).__spydeFigureDump
+    if (typeof fn !== 'function') return null
+    try { return (fn as () => Record<string, unknown>[])() } catch { return null }
+  }, [])
+  // Panels expected on THIS slide, from the report doc — the number each
+  // figure's stash has to be compared against.
+  const expected = slideCells
+    .filter(c => c.cell_type === 'figure' || c.cell_type === 'split')
+    .map(c => `${c.id}: ${c.figure?.panels?.length ?? 0} panel(s)`)
+
+  return (
+    <div style={styles.diag} data-testid="present-figure-diag">
+      <div style={styles.diagTitle}>Figure diagnostic — press D to hide</div>
+      <div style={styles.diagLine}>this slide → {expected.join(' · ') || 'no figure cells'}</div>
+      {rows == null ? (
+        <div style={styles.diagLine}>__spydeFigureDump unavailable (old build?)</div>
+      ) : rows.length === 0 ? (
+        <div style={styles.diagLine}>no figures registered at all</div>
+      ) : rows.map((r, i) => (
+        <div key={i} style={styles.diagLine}>
+          {String(r.figId)} · in={String(r.registeredIn)} · size={String(r.size)}
+          {' · json='}{String(r.jsonKeys)}{' · binary='}{String(r.binaryKeys)}
+          {r.binaryKeyNames ? ` (${String(r.binaryKeyNames)})` : ''}
+        </div>
+      ))}
+    </div>
+  )
+}
+
 /** mm:ss for an elapsed-seconds count (the presenter timer). */
 function fmtElapsed(sec: number): string {
   const s = Math.max(0, Math.floor(sec))
@@ -326,6 +369,8 @@ export function PresentMode({ initialSlide, onSlideChange, onExit, onLaunchLive 
   // While it's open, present-mode navigation keys are suppressed (the overview
   // owns the keyboard) so arrows/Esc don't leak through to the deck behind it.
   const [overview, setOverview] = React.useState(false)
+  // The on-screen figure diagnostic (press D while presenting).
+  const [diag, setDiag] = React.useState(false)
   // On Windows the native title-bar overlay (min/max/close) sits at the very
   // top-right, ~38px tall. Push the presentation top controls BELOW it so they
   // aren't clipped/covered (macOS traffic lights are on the left, no conflict).
@@ -365,6 +410,14 @@ export function PresentMode({ initialSlide, onSlideChange, onExit, onLaunchLive 
       else if (k === 's' || k === 'S') { e.preventDefault(); setPresenter(p => !p) }
       else if (k === 'o' || k === 'O' || k === 'g' || k === 'G') {
         e.preventDefault(); setOverview(true)
+      }
+      // D — the figure DIAGNOSTIC readout, on screen. Not in DevTools: asking
+      // someone to open a console mid-presentation to debug a panel that
+      // didn't draw is a bad trade, and console.table prints NOTHING at all
+      // when the array is empty, which is indistinguishable from "the function
+      // isn't there".
+      else if (k === 'd' || k === 'D') {
+        e.preventDefault(); setDiag(v => !v)
       }
       else if (k === 'Escape') { e.preventDefault(); onExit() }
     }
@@ -411,6 +464,8 @@ export function PresentMode({ initialSlide, onSlideChange, onExit, onLaunchLive 
         ))}
       </div>
 
+      {diag && <FigureDiag slideCells={slides[index] ?? []} />}
+
       {presenter && (
         <PresenterView
           slides={slides}
@@ -450,8 +505,15 @@ export function PresentMode({ initialSlide, onSlideChange, onExit, onLaunchLive 
         />
       )}
 
-      {/* Top-right controls: overview grid + presenter-view toggle + exit. */}
+      {/* Top-right controls: diagnostic + overview grid + presenter toggle + exit. */}
       <div style={topBarStyle}>
+        <button
+          data-testid="present-diag-toggle"
+          data-active={diag ? '1' : '0'}
+          style={{ ...styles.iconBtn, ...(diag ? styles.iconBtnActive : {}) }}
+          title="Figure diagnostic — why a panel didn't draw (D)"
+          onClick={() => setDiag(v => !v)}
+        >{'⚠'}</button>
         <button
           data-testid="present-overview-toggle"
           data-active={overview ? '1' : '0'}
@@ -1090,6 +1152,17 @@ const styles: Record<string, React.CSSProperties> = {
     flex: '0 0 auto', fontVariantNumeric: 'tabular-nums',
     color: 'var(--spyde-deck-muted, #a6adc8)',
   },
+  // ── figure diagnostic (D) ───────────────────────────────────────────────────
+  diag: {
+    position: 'fixed', left: 16, bottom: 16, zIndex: 40,
+    maxWidth: '70vw', padding: '10px 12px',
+    background: 'rgba(10,10,16,0.94)', border: '1px solid #f9e2af',
+    borderRadius: 8, color: '#f9e2af',
+    font: '12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+    whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+  },
+  diagTitle: { fontWeight: 700, marginBottom: 6, color: '#fab387' },
+  diagLine: { margin: '1px 0' },
   liveRow: { marginTop: '1.5rem', textAlign: 'center' },
   liveBtn: {
     background: '#89b4fa', color: '#11111b', border: 'none',

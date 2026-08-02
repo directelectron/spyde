@@ -215,6 +215,21 @@ test('SPED-Ag: navigator + DP grid, presented, both panels must draw', async () 
   // figure this is the baseline the reported failure has to be compared
   // against: if a broken deck shows fewer binary pixel states than panels,
   // that is the bug.
+  // The ON-SCREEN readout (press D) — the whole point is that it needs no
+  // DevTools, so it has to be verified as visible, not just as a function that
+  // returns data.
+  // Via the BUTTON, not the key: a keypress that silently does nothing is
+  // indistinguishable from a stale build, and that ambiguity cost a round.
+  await page.getByTestId('present-diag-toggle').click()
+  const diagPanel = page.getByTestId('present-figure-diag')
+  await expect(diagPanel).toBeVisible({ timeout: 5_000 })
+  const diagText = (await diagPanel.innerText()).replace(/\n/g, ' | ')
+  console.log('[sped-ag] on-screen diagnostic =', diagText)
+  expect(diagText).toContain('in=present-slide')
+  await page.screenshot({ path: join(SHOTS, '04-diagnostic.png') })
+  await page.getByTestId('present-diag-toggle').click()
+  await expect(diagPanel).toBeHidden({ timeout: 5_000 })
+
   const dump = await page.evaluate(() => (window as any).__spydeFigureDump?.() ?? null)
   console.log('[sped-ag] figure replay stash =', JSON.stringify(dump, null, 1))
   const presented = (dump ?? []).find((r: any) => r.registeredIn === 'present-slide')
@@ -222,11 +237,22 @@ test('SPED-Ag: navigator + DP grid, presented, both panels must draw', async () 
   console.log('[sped-ag] presented figure: panels=2',
               'binaryKeys=', presented.binaryKeys, 'jsonKeys=', presented.jsonKeys)
 
-  const counts = await panelPixelCounts(page, 2)
-  console.log('[sped-ag] per-panel non-background pixel counts =', JSON.stringify(counts))
+  // THE REGRESSION ASSERTION: one stashed pixel frame PER PANEL.
+  //
+  // Not the pixel probe. That counts anything brighter than the background, so
+  // an empty panel's own fill and its HTML scale-bar overlay score as
+  // "content" — it reported healthy numbers for the broken figure all the way
+  // through this investigation and is why the bug survived so long. The stash
+  // count is exact: `binary` short of the panel count means a panel's pixels
+  // were overwritten and it WILL present blank.
+  expect(presented.binaryKeys,
+    `the presented figure stashed ${presented.binaryKeys} pixel frame(s) for 2 panels — `
+    + 'a panel will render as an empty box with only its scale bar').toBe(2)
+  const names = String(presented.binaryKeyNames)
+  expect(names, 'the stash is not keyed per panel (geom::field)').toContain('::image_b64')
+  expect(names.split(',').length, 'both panels must be represented in the stash').toBe(2)
 
-  expect(counts.length, 'could not sample the presented figure canvas').toBe(2)
-  for (const [i, n] of counts.entries()) {
-    expect(n, `SPED-Ag: presented panel ${i} is EMPTY (no image pixels)`).toBeGreaterThan(500)
-  }
+  const counts = await panelPixelCounts(page, 2)
+  console.log('[sped-ag] per-panel non-background pixel counts (indicative only) =',
+              JSON.stringify(counts))
 })
