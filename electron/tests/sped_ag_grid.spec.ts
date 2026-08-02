@@ -186,6 +186,20 @@ test('SPED-Ag: navigator + DP grid, presented, both panels must draw', async () 
       hasAxes: !!p.axes, units: p.axes?.units,
     })), null, 1))
 
+  // MATCH THE REPORTER'S WINDOW SIZE before presenting.
+  //
+  // "If I press it it doesn't work but if you do it does" — the remaining
+  // difference between that session and this one is the stage the figure has to
+  // re-lay out onto. A figure slide now takes a 96rem column, so on a large
+  // display the presented iframe is far wider than the sidebar cell it was
+  // built in, and the figure has to relayout to a size this suite never
+  // exercised at ~1400x811.
+  await ctx.app.evaluate(async ({ BrowserWindow }: any) => {
+    const w = BrowserWindow.getAllWindows()[0]
+    if (w) { w.setSize(2000, 1250); w.center() }
+  })
+  await page.waitForTimeout(2500)
+
   // Present, then ADVANCE to slide 2 — the figure's iframe has been mounted
   // inside a display:none slide the whole time.
   await page.getByTestId('report-present').click()
@@ -196,6 +210,17 @@ test('SPED-Ag: navigator + DP grid, presented, both panels must draw', async () 
   await page.keyboard.press('ArrowRight')
   await page.waitForTimeout(12000)
   await page.screenshot({ path: join(SHOTS, '03-presented.png') })
+
+  // What the presented iframe was given to draw from. On a WORKING 2-panel
+  // figure this is the baseline the reported failure has to be compared
+  // against: if a broken deck shows fewer binary pixel states than panels,
+  // that is the bug.
+  const dump = await page.evaluate(() => (window as any).__spydeFigureDump?.() ?? null)
+  console.log('[sped-ag] figure replay stash =', JSON.stringify(dump, null, 1))
+  const presented = (dump ?? []).find((r: any) => r.registeredIn === 'present-slide')
+  expect(presented, 'no figure registered to the presented slide').toBeTruthy()
+  console.log('[sped-ag] presented figure: panels=2',
+              'binaryKeys=', presented.binaryKeys, 'jsonKeys=', presented.jsonKeys)
 
   const counts = await panelPixelCounts(page, 2)
   console.log('[sped-ag] per-panel non-background pixel counts =', JSON.stringify(counts))

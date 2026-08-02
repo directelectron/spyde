@@ -882,7 +882,59 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         )
       }
     }
+    dlog('replayState', {
+      figId,
+      jsonKeys: states ? states.size : 0,
+      binaryKeys: binStates ? binStates.size : 0,
+      target: iframe.getAttribute('data-testid'),
+    })
   }
+
+  /**
+   * What a figure would replay into a freshly-mounted iframe.
+   *
+   * A report figure is mounted TWICE — once in the sidebar cell, once on the
+   * presented slide — and both register under the SAME figId, so the present
+   * copy draws entirely from what `replayState` re-sends. A multi-panel figure
+   * whose panels arrive as separate binary pixel states will therefore render
+   * only the panels still present in the stash: a panel whose binary state is
+   * missing draws NOTHING, while its HTML scale-bar overlay survives, which is
+   * exactly the reported "empty panel with a scale bar and no ticks".
+   *
+   * So the discriminator is simply: how many panels does the spec have, and how
+   * many binary pixel states are stashed for that figure? Run
+   * `__spydeFigureDump()` in DevTools while the bad slide is up.
+   */
+  const figureDump = React.useCallback(() => {
+    const rows: Record<string, unknown>[] = []
+    const figIds = new Set<string>([
+      ...latestStates.current.keys(),
+      ...latestBinaryStates.current.keys(),
+      ...iframeRefs.current.keys(),
+    ])
+    for (const figId of figIds) {
+      const el = iframeRefs.current.get(figId)
+      const rect = el?.getBoundingClientRect()
+      const bin = latestBinaryStates.current.get(figId)
+      rows.push({
+        figId,
+        jsonKeys: latestStates.current.get(figId)?.size ?? 0,
+        binaryKeys: bin?.size ?? 0,
+        binaryKeyNames: bin ? Array.from(bin.keys()).join(',') : '',
+        registeredIn: el?.closest('[data-testid="present-slide"]') ? 'present-slide'
+          : el?.closest('[data-testid="report-sidebar"]') ? 'report-sidebar'
+            : el ? 'other' : 'NONE',
+        size: rect ? `${Math.round(rect.width)}x${Math.round(rect.height)}` : 'n/a',
+      })
+    }
+    // eslint-disable-next-line no-console
+    console.table(rows)
+    return rows
+  }, [])
+
+  React.useEffect(() => {
+    ;(window as unknown as Record<string, unknown>).__spydeFigureDump = figureDump
+  }, [figureDump])
 
   // Ask a figure's iframe for a rendered PNG (the anyplotlib export protocol).
   // Posts `{type:'anyplotlib_export_png', requestId, opts}` into the iframe and
