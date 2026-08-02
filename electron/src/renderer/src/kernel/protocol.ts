@@ -687,6 +687,10 @@ export interface ReportDocState {
    *  Absent on an older backend/file → 'report'. */
   type?: string
   dirty: boolean
+  /** Label of the action the next undo would reverse (e.g. "Delete figure
+   *  cell"), or null/absent when the stack is empty. Drives the Undo button's
+   *  label and enabled state. */
+  undo?: string | null
   cells: ReportCell[]
 }
 

@@ -119,6 +119,150 @@ class TestReportDocument:
         h.report_remove_cell(session, None, {"cell_id": cid})
         assert _last_state(messages)["cells"] == []
 
+    def test_undo_restores_a_deleted_cell(self, window):
+        """Deleting a cell is one click from the editor's Close button and
+        destroys the slide's content outright, so it has to be reversible."""
+        session, messages = window["window"], window["messages"]
+        h.report_new(session, None, {})
+        h.report_add_cell(session, None, {"cell_type": "markdown", "source": "keep me"})
+        cid = _last_state(messages)["cells"][0]["id"]
+        h.report_remove_cell(session, None, {"cell_id": cid})
+        assert _last_state(messages)["cells"] == []
+
+        h.report_undo(session, None, {})
+        cells = _last_state(messages)["cells"]
+        assert [c["source"] for c in cells] == ["keep me"]
+        assert cells[0]["id"] == cid, "undo must restore the SAME cell, not a copy"
+
+    def test_undo_puts_the_cell_back_where_it_was(self, window):
+        """Restoring to the end would silently reorder a deck."""
+        session, messages = window["window"], window["messages"]
+        h.report_new(session, None, {})
+        for s in ("A", "B", "C"):
+            h.report_add_cell(session, None, {"cell_type": "markdown", "source": s})
+        mid = _last_state(messages)["cells"][1]["id"]
+        h.report_remove_cell(session, None, {"cell_id": mid})
+        assert [c["source"] for c in _last_state(messages)["cells"]] == ["A", "C"]
+        h.report_undo(session, None, {})
+        assert [c["source"] for c in _last_state(messages)["cells"]] == ["A", "B", "C"]
+
+    def test_state_advertises_what_undo_would_do(self, window):
+        """The UI only shows the Undo button when there IS something to undo,
+        and labels it with what — so the label is part of the contract."""
+        session, messages = window["window"], window["messages"]
+        h.report_new(session, None, {})
+        assert _last_state(messages).get("undo") is None
+        h.report_add_cell(session, None, {"cell_type": "markdown", "source": "a"})
+        cid = _last_state(messages)["cells"][0]["id"]
+        h.report_remove_cell(session, None, {"cell_id": cid})
+        assert "markdown" in (_last_state(messages).get("undo") or "")
+        h.report_undo(session, None, {})
+        assert _last_state(messages).get("undo") is None
+
+    def test_undo_is_bounded(self, window):
+        """An entry pins the deleted cell's pixels, so the stack cannot grow
+        without limit."""
+        from spyde.actions.report.handlers import ReportManager
+        session, messages = window["window"], window["messages"]
+        h.report_new(session, None, {})
+        mgr = h._manager(session)
+        for i in range(ReportManager.UNDO_DEPTH + 5):
+            h.report_add_cell(session, None,
+                              {"cell_type": "markdown", "source": str(i)})
+            cid = _last_state(messages)["cells"][-1]["id"]
+            h.report_remove_cell(session, None, {"cell_id": cid})
+        assert len(mgr._undo) == ReportManager.UNDO_DEPTH
+
+    def test_undo_with_an_empty_stack_is_harmless(self, window):
+        session, messages = window["window"], window["messages"]
+        h.report_new(session, None, {})
+        h.report_undo(session, None, {})          # must not raise
+        assert _last_state(messages)["cells"] == []
+
+    def test_new_clears_the_undo_stack(self, window):
+        """The entries reference cells of a document that is gone."""
+        session, messages = window["window"], window["messages"]
+        h.report_new(session, None, {})
+        h.report_add_cell(session, None, {"cell_type": "markdown", "source": "a"})
+        cid = _last_state(messages)["cells"][0]["id"]
+        h.report_remove_cell(session, None, {"cell_id": cid})
+        h.report_new(session, None, {})
+        assert _last_state(messages).get("undo") is None
+        h.report_undo(session, None, {})
+        assert _last_state(messages)["cells"] == []
+
+    # ── deleting a slide's HEAD cell must not delete the slide ────────────────
+    #
+    # `slide_break=True` marks the cell that STARTS a slide, and the slide's
+    # kind/style/notes ride on that same cell. A slide is very often just a
+    # figure plus a caption, so deleting the figure used to take the break with
+    # it: the caption was absorbed into the PREVIOUS slide and the slide's
+    # styling and speaker notes vanished. Deleting the figure deleted the slide.
+
+    def _deck(self, session, messages):
+        """[A] | [B1 B2] — two slides, the second headed by B1, which carries
+        the slide's kind/style/notes (the model puts them on the FIRST cell)."""
+        h.report_new(session, None, {"type": "presentation"})
+        h.report_add_cell(session, None, {"cell_type": "markdown", "source": "A"})
+        h.report_add_cell(session, None, {
+            "cell_type": "markdown", "source": "B1", "slide_break": True,
+            "slide_kind": "title", "slide_style": "accent", "notes": "say this"})
+        h.report_add_cell(session, None, {"cell_type": "markdown", "source": "B2"})
+        return {c["source"]: c["id"] for c in _last_state(messages)["cells"]}
+
+    def _slides(self, session):
+        return [[c.source for c in s] for s in h._manager(session).doc.slides()]
+
+    def test_deleting_a_slide_head_keeps_the_slide(self, window):
+        session, messages = window["window"], window["messages"]
+        ids = self._deck(session, messages)
+        assert self._slides(session) == [["A"], ["B1", "B2"]]
+        h.report_remove_cell(session, None, {"cell_id": ids["B1"]})
+        # B2 must still be its OWN slide, not swallowed by A's.
+        assert self._slides(session) == [["A"], ["B2"]]
+
+    def test_the_slide_keeps_its_style_and_notes(self, window):
+        session, messages = window["window"], window["messages"]
+        ids = self._deck(session, messages)
+        h.report_remove_cell(session, None, {"cell_id": ids["B1"]})
+        b2 = h._manager(session).doc.cells[-1]
+        assert b2.slide_break is True
+        assert b2.slide_kind == "title"
+        assert b2.slide_style == "accent"
+        assert b2.notes == "say this"
+
+    def test_a_slides_only_cell_really_does_end_the_slide(self, window):
+        """Nothing of it remains, so there is no slide to keep."""
+        session, messages = window["window"], window["messages"]
+        ids = self._deck(session, messages)
+        h.report_remove_cell(session, None, {"cell_id": ids["B2"]})
+        h.report_remove_cell(session, None, {"cell_id": ids["B1"]})
+        assert self._slides(session) == [["A"]]
+
+    def test_the_next_slides_head_is_not_absorbed(self, window):
+        """A successor that already starts its OWN slide is a different slide —
+        it must not inherit this one's styling."""
+        session, messages = window["window"], window["messages"]
+        ids = self._deck(session, messages)
+        h.report_toggle_slide_break(session, None, {"cell_id": ids["B2"]})
+        assert self._slides(session) == [["A"], ["B1"], ["B2"]]
+        h.report_remove_cell(session, None, {"cell_id": ids["B1"]})
+        assert self._slides(session) == [["A"], ["B2"]]
+        b2 = h._manager(session).doc.cells[-1]
+        assert b2.slide_kind == "", "B2 had its own slide; it must not inherit"
+
+    def test_undo_does_not_split_the_slide_in_two(self, window):
+        """Restoring the head cell has to hand the identity BACK, or both cells
+        end up carrying slide_break and one slide returns as two."""
+        session, messages = window["window"], window["messages"]
+        ids = self._deck(session, messages)
+        h.report_remove_cell(session, None, {"cell_id": ids["B1"]})
+        h.report_undo(session, None, {})
+        assert self._slides(session) == [["A"], ["B1", "B2"]]
+        b1, b2 = h._manager(session).doc.cells[1], h._manager(session).doc.cells[2]
+        assert b1.slide_break is True and b2.slide_break is False
+        assert b1.slide_kind == "title" and b2.slide_kind == ""
+
     def test_move_cell(self, window):
         session, messages = window["window"], window["messages"]
         h.report_new(session, None, {})

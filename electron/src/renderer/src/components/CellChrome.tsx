@@ -59,12 +59,40 @@ interface Props {
   trailing?: React.ReactNode
 }
 
+/** How long an armed delete stays armed before disarming itself. Long enough to
+ *  move the pointer a few px and click again; short enough that a stray armed
+ *  button never survives to the next time you reach for the chrome. */
+const ARM_MS = 2600
+
 export function CellChrome({
   cellId, styles, onCopy, onDuplicate, onDelete, deleteTestid,
   deleteTitle = 'Delete cell', leading, trailing,
 }: Props) {
+  // TWO-STEP DELETE. This chrome is shown on `hover || showEditor`, so opening a
+  // figure's edit toolbar MAKES this ✕ appear — top-right, exactly where the
+  // editor's own "Close" × sits, and one click from destroying the slide. The
+  // first click now only ARMS it; the second confirms. Undo (report_undo) is the
+  // safety net underneath, but not losing the slide in the first place beats
+  // getting it back.
+  const [armed, setArmed] = React.useState(false)
+  const timer = React.useRef<number | null>(null)
+
+  const disarm = React.useCallback(() => {
+    if (timer.current != null) { window.clearTimeout(timer.current); timer.current = null }
+    setArmed(false)
+  }, [])
+
+  React.useEffect(() => disarm, [disarm])   // never leave a timer behind
+
+  const clickDelete = () => {
+    if (armed) { disarm(); onDelete(); return }
+    setArmed(true)
+    if (timer.current != null) window.clearTimeout(timer.current)
+    timer.current = window.setTimeout(() => { timer.current = null; setArmed(false) }, ARM_MS)
+  }
+
   return (
-    <div style={styles.chrome}>
+    <div style={styles.chrome} onMouseLeave={disarm}>
       {leading}
       <button
         data-testid={`cell-copy-${cellId}`}
@@ -83,11 +111,21 @@ export function CellChrome({
       {trailing}
       <button
         data-testid={deleteTestid}
-        style={styles.deleteBtn ?? styles.chromeBtn}
-        title={deleteTitle}
-        onClick={onDelete}
+        data-armed={armed ? 'true' : 'false'}
+        style={armed
+          ? { ...(styles.deleteBtn ?? styles.chromeBtn), ...armedStyle }
+          : (styles.deleteBtn ?? styles.chromeBtn)}
+        title={armed ? 'Click again to delete' : deleteTitle}
+        onClick={clickDelete}
         {...hoverProps}
-      >✕</button>
+      >{armed ? 'Delete?' : '✕'}</button>
     </div>
   )
+}
+
+// Armed state reads as a warning, and the label change is the real signal — a
+// recolour alone is easy to miss on a small glyph in a dark UI.
+const armedStyle: React.CSSProperties = {
+  background: '#f38ba8', color: '#11111b', fontWeight: 700,
+  borderRadius: 4, padding: '0 6px', fontSize: 10.5, width: 'auto',
 }

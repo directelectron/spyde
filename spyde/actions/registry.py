@@ -133,6 +133,7 @@ STAGED_HANDLERS: dict[str, str] = {
     # Test-only: release a SPYDE_TEST_HOLD pause point (backend/test_hold.py).
     # Inert in production — with the env var unset there is no hold to release.
     "test_hold_release":       "spyde.actions.find_vectors_action.test_hold_release",
+    "report_undo":             "spyde.actions.report.handlers.report_undo",
     "report_move_cell":        "spyde.actions.report.handlers.report_move_cell",
     "report_move_slide":       "spyde.actions.report.handlers.report_move_slide",
     "report_set_caption":      "spyde.actions.report.handlers.report_set_caption",
