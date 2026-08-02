@@ -428,10 +428,18 @@ class TestHarnessMixin:
         like a real ``.mrc`` in-situ movie: each nav move is then a small cold read
         of just that frame, which is the path a user actually drags.
 
-        Payload: ``{"frames": int, "size": [ny, nx], "eager": bool}``. ``eager``
-        keeps it in RAM, which skips the whole array-cache path — useful only for a
-        test that wants to isolate something else (an eager fixture is how
-        ``si_grains`` silently made a cache benchmark measure nothing).
+        Payload: ``{"frames": int, "size": [ny, nx], "eager": bool,
+        "noise": float}``. ``eager`` keeps it in RAM, which skips the whole
+        array-cache path — useful only for a test that wants to isolate
+        something else (an eager fixture is how ``si_grains`` silently made a
+        cache benchmark measure nothing).
+
+        ``noise`` exists to make the OVER-SEGMENTATION failure reproducible. At
+        the default 0.015 the fixture is clean and a global threshold works on
+        it, which is why every spec here was green while a real low-contrast
+        in-situ frame produced 14028 instances and a solid overlay. Around 0.3
+        there is no bimodal histogram left for otsu to find, it lands inside the
+        noise, and the split shatters the film exactly as reported.
         """
         import dask.array as da
 
@@ -447,7 +455,10 @@ class TestHarnessMixin:
         n_frames = int(payload.get("frames", 24))
         shape = tuple(payload.get("size", (96, 112)))
 
-        s = particle_movie(n_frames=n_frames, shape=shape)
+        kw = {}
+        if payload.get("noise") is not None:
+            kw["noise"] = float(payload["noise"])
+        s = particle_movie(n_frames=n_frames, shape=shape, **kw)
         if not payload.get("eager"):
             eager = s.data
             ny, nx = eager.shape[1:]
