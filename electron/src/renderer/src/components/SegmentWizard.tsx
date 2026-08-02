@@ -12,6 +12,8 @@
  *   ┌ Segment Particles ──────── ✕ ┐
  *   │ [Classical] [Scribble] [Prompt]│
  *   │  Fewer ────●──── More          │
+ *   │  Merge closer than ──●── 12 nm │
+ *   │  Ignore smaller than ─●── off  │
  *   │  6 particles on this frame     │
  *   │  [    Find in all frames    ]  │
  *   │  ▸ Advanced                    │
@@ -19,12 +21,19 @@
  *
  * Four things here are load-bearing, none of them cosmetic:
  *
- * 1. **Sensitivity is the ONLY control on the default face.** Measured (plan
- *    §0.9), not taste: teaching the classifier faint contrast buys +1 true
- *    particle and 25 spurious ones, and `min_size=10` removes 24 of the 25.
- *    But the floor is applied by the BACKEND unconditionally, so the user does
- *    not have to know that — `min_size` is a recovery knob, not a tuning knob,
- *    and it lives in Advanced next to the floor warning that explains it.
+ * 1. **The default face carries the task, and its two shared controls are
+ *    PHYSICAL.** `merge_nm` and `min_nm` are distances the eye can check against
+ *    the scale bar, and they act on the measured instances rather than on any one
+ *    method's parameters — so the face is identical on all three engines, and only
+ *    Classical adds the sensitivity slider above them. Their nm→px conversion
+ *    needs the DISPLAYED signal's scale, which `SegmentWizard.set_params` stashes
+ *    on every dispatch; without it the backend silently reads nanometres as pixels.
+ *    Everything else is Advanced. Measured (plan §0.9), not taste: teaching the
+ *    classifier faint contrast buys +1 true particle and 25 spurious ones, and
+ *    `min_size=10` removes 24 of the 25. But the floor is applied by the BACKEND
+ *    unconditionally, so the user does not have to know that — `min_size` is a
+ *    recovery knob, not a tuning knob, and it lives in Advanced next to the floor
+ *    warning that explains it.
  *
  * 2. **The EFFECTIVE `min_size` is what is shown.** The backend floors it and
  *    reports the floored value + a flag in every `seg_preview`; the caret snaps
@@ -43,12 +52,20 @@
  *    missing example. On the Classical tab there is nothing to train, so the list
  *    is not shown there.
  *
- * 4. **Nothing was deleted, only demoted.** Every control that left the primary
- *    face is inside `▸ Advanced` and sends the identical action with the
- *    identical payload — `params()` is unchanged and the backend schema is
- *    untouched. Advanced is collapsed by default and remembers its state for the
- *    session (module-scope, not per-window: it is a preference about the UI, not
- *    about a dataset). The one place Advanced is tab-scoped is the classical
+ * 4. **Nothing was deleted, only demoted — and Advanced is TWO COLUMNS.** Every
+ *    control that left the primary face is inside `▸ Advanced` and sends the
+ *    identical action with the identical payload — `params()` is unchanged and
+ *    the backend schema is untouched. Stacked in one column that block reached
+ *    907 px in an 805 px MDI area, and the caret cannot scroll (the Threshold
+ *    menu is absolutely positioned and any `overflow:auto` ancestor clips it),
+ *    so the histogram and Commit Frame were unreachable rather than merely
+ *    cramped. Two columns — params you SET on the left, feedback the frame
+ *    gives you on the right — is plan B7's own answer and the only one that
+ *    neither deletes a control nor needs a scroller; the caret widens to
+ *    `ADV_WIDTH` only while it is open. Advanced is collapsed by default and
+ *    remembers its state for the session (module-scope, not per-window: it is a
+ *    preference about the UI, not about a dataset). The one place it is
+ *    tab-scoped is the classical
  *    MASK block (threshold / pre-blur / rolling ball / local window / dark), and
  *    that is correctness rather than tidiness: the scribble engine hands
  *    `split_instances` a probability map thresholded at 0.5 and never reads
@@ -60,7 +77,7 @@
  * list.
  */
 import React from 'react'
-import { WizardShell, TabRow, Slider, Select, Check, NumInput, S } from './WizardShell'
+import { WizardShell, TabRow, Slider, Select, Check, NumInput, Field, S } from './WizardShell'
 import { useWizardLifecycle, useDebouncedAction, useWizardEvent, CommitButton } from './wizardHooks'
 import type { SendAction } from './wizardHooks'
 import { ClassStrip } from './ClassStrip'
@@ -159,6 +176,13 @@ interface Preview {
   /** `[y0, x0, h, w]` when the frame was too big to segment whole, else null —
    *  the count then describes that window, not the frame. */
   preview_box: [number, number, number, number] | null
+  /** Fraction of the previewed window called foreground, and the backend's
+   *  verdict that this is a failed threshold rather than a result. */
+  coverage: number
+  thresholdFailed: boolean
+  /** What the two FACE sliders are in: 'nm' on a real-space axis, 'px' when
+   *  the signal's axis is not a length (reciprocal space, mrad, uncalibrated). */
+  faceUnits: string
   /** Monotonic per-caret preview counter. The COUNT is not a reliable "did it
    *  re-run" signal (two sensitivities can find the same number of particles),
    *  so the caret publishes this as `data-seq` for the e2e to poll instead. */
@@ -286,6 +310,9 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
       preview_box: (Array.isArray(d.preview_box) && d.preview_box.length === 4
         ? (d.preview_box.map(Number) as [number, number, number, number])
         : null),
+      coverage: Number(d.coverage ?? 0),
+      thresholdFailed: Boolean(d.threshold_failed),
+      faceUnits: String(d.face_units ?? 'nm'),
       seq: (prev?.seq ?? 0) + 1,
     }))
     // Never leave a number on screen that is not the one that ran. Snapping is
@@ -377,6 +404,13 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
   }
 
   const areaUnits = preview ? `${preview.units}²` : 'px²'
+  // The two face sliders are in nm ONLY when the signal's axis is a real-space
+  // length. On a reciprocal-space signal (axis in nm⁻¹) there is no distance to
+  // convert to, the backend falls back to pixels, and the label has to follow —
+  // a slider reading "50 nm" that acts on 50 px is a claim about the scale bar
+  // that is false.
+  const faceUnits = preview?.faceUnits ?? 'nm'
+  const fmtFace = (v: number) => (v ? `${v} ${faceUnits}` : 'off')
   // On a frame too large to segment whole the backend previews a centred crop,
   // so say "in this region" rather than "on this frame" — the number is true of
   // the box, not of the frame, and claiming otherwise would understate the count
@@ -392,7 +426,12 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
       <WizardShell
         testid="segment-wizard" title="Segment Particles" posStyle={caretPos}
         onClose={onClose} closeTestid="seg-close"
-        status={status} statusTestid="seg-status" width={262}
+        status={status} statusTestid="seg-status"
+        // The face stays NARROW; only Advanced widens (plan B7's "wide
+        // 2-column caret, using WizardShell's existing width override"). A
+        // caret that is 520 px wide while showing three controls would undo
+        // the §0.9a calm the collapsed face is for.
+        width={advanced ? ADV_WIDTH : 262}
       >
         <TabRow
           tabs={TABS} active={TAB_OF[method]}
@@ -436,7 +475,7 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
               min={0} max={100} step={1} value={mergeNm}
               style={{ flex: 1, minWidth: 40 }}
               onChange={(e) => { const n = Number(e.target.value); setMergeNm(n); tune() }} />
-            <span style={endLabelStyle}>{mergeNm ? `${mergeNm} nm` : 'off'}</span>
+            <span style={endLabelStyle}>{fmtFace(mergeNm)}</span>
           </div>
         </Field>
         <Field label="Ignore smaller than">
@@ -445,7 +484,7 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
               min={0} max={200} step={1} value={minNm}
               style={{ flex: 1, minWidth: 40 }}
               onChange={(e) => { const n = Number(e.target.value); setMinNm(n); tune() }} />
-            <span style={endLabelStyle}>{minNm ? `${minNm} nm` : 'off'}</span>
+            <span style={endLabelStyle}>{fmtFace(minNm)}</span>
           </div>
         </Field>
 
@@ -483,9 +522,34 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
 
         <div data-testid="seg-preview-stats" data-seq={preview?.seq ?? 0}
           data-count={preview?.count ?? -1}
+          data-failed={preview?.thresholdFailed ? 'true' : 'false'}
           data-cropped={box ? 'true' : 'false'} style={countStyle}>
           {countText}
         </div>
+
+        {/* ── the threshold-failed verdict ─────────────────────────────────
+            A global threshold on a low-contrast frame has no bimodal histogram
+            to find, so it lands inside the noise and the split shatters the
+            support film into thousands of pieces. Reported as "14028 particles
+            in this region" that reads as a real (if bad) answer, and the
+            natural response is to reach for the sliders — none of which can fix
+            it. Measured on a stand-in for the reported frame: min_size alone
+            takes 4873 → 17 instances but coverage only 39% → 7%, and the
+            settings that DO yield 8 instances cover 52% of the frame, i.e. the
+            8 bodies are the film.
+
+            So the caret names the failure and points at the engine that does
+            work on this data (plan §0.9: the learned classifier is the primary
+            path, not threshold tuning). It does NOT silently re-tune. */}
+        {preview?.thresholdFailed && (
+          <div data-testid="seg-threshold-failed" style={warnStyle}>
+            The threshold landed inside the noise — {preview.count.toLocaleString()}
+            {' '}pieces covering {Math.round(preview.coverage * 100)}% of the
+            {box ? ' region' : ' frame'}. That is the film being segmented, not
+            particles.{isScribble ? ' Paint a few examples and Train.'
+              : ' Try Scribble: paint a few examples and Train.'}
+          </div>
+        )}
         {box && (
           <div data-testid="seg-preview-cropped" style={hintStyle}
             title={`Previewing a ${box[3]}x${box[2]} px window at full resolution `
@@ -509,96 +573,150 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
           {advanced ? '▾ Advanced' : '▸ Advanced'}
         </button>
 
+        {/* ── Advanced: TWO COLUMNS (plan B7) ──────────────────────────────
+            Single-column, this ran 907 px tall in an 805 px MDI area, and the
+            caret has no scroller of its own (the Threshold menu is absolutely
+            positioned, so an `overflow:auto` ancestor clips it) — so the
+            histogram and Commit Frame were not merely awkward, they were
+            unreachable. Two columns is plan B7's own answer to that, and it
+            halves the height without demoting anything further or deleting
+            anything, which §0.9a rules out.
+
+            The split is params | feedback: the left column is everything you
+            SET, the right is everything the frame TELLS you plus the button
+            that keeps it. Balance matters as much as the grouping — the
+            classical-only `detection` block is the tallest thing here, and
+            with it on the left the two columns come out close to even. */}
         {advanced && (
           <div data-testid="seg-advanced" style={advStyle}>
-            <div style={S.hint}>size filter</div>
-            <Row label="Min size (px)">
-              <NumInput testid="seg-min-size" value={minSize} step="1" width={54}
-                onChange={live(setMinSize)} />
-            </Row>
-            {/* The floor warning belongs HERE, under the field it explains — on
-                the primary face it was a large orange alarm about a parameter
-                the backend already fixed on the user's behalf. */}
-            {preview?.floored && (
-              <div data-testid="seg-min-size-floor" style={warnStyle}>
-                floored to {preview.minSize} px — at 0 the split returns
-                background speckle as particles
+            <div style={advColsStyle}>
+              <div data-testid="seg-advanced-params" style={advColStyle}>
+                <div style={colHeadStyle}>params</div>
+
+                {/* ── Confidence ─────────────────────────────────────────
+                    The per-instance contrast-to-noise filter. It came OFF the
+                    default face when the two nm controls replaced it — a 0-1
+                    "confidence" is not something the eye can judge against the
+                    scale bar, while a distance is — but it is the only control
+                    that cuts over-split support-film texture, which is small
+                    AND round and so survives every size and shape filter here.
+                    It is demoted, not deleted (plan §0.9a); it was briefly
+                    BOTH, which left `min_score` pinned at 0 with no control
+                    able to move it.
+
+                    It acts on the measured OUTPUT, so it means the same thing
+                    on all three engines and dragging re-filters an existing
+                    result instead of re-segmenting. */}
+                <div style={S.hint}>confidence</div>
+                <div style={sensRowStyle}>
+                  <span style={endLabelStyle}>All</span>
+                  <input data-testid="seg-min-score" type="range"
+                    min={0} max={0.99} step={0.01} value={minScore}
+                    style={{ flex: 1, minWidth: 40 }}
+                    onChange={(e) => { const n = Number(e.target.value); setMinScore(n); tune() }} />
+                  <span style={endLabelStyle}>
+                    {minScore ? `${Math.round(minScore * 100)}%` : 'off'}
+                  </span>
+                </div>
+
+                <div style={secStyle}>size filter</div>
+                <Row label="Min size (px)">
+                  <NumInput testid="seg-min-size" value={minSize} step="1" width={54}
+                    onChange={live(setMinSize)} />
+                </Row>
+                {/* The floor warning belongs HERE, under the field it explains
+                    — on the primary face it was a large orange alarm about a
+                    parameter the backend already fixed on the user's behalf. */}
+                {preview?.floored && (
+                  <div data-testid="seg-min-size-floor" style={warnStyle}>
+                    floored to {preview.minSize} px — at 0 the split returns
+                    background speckle as particles
+                  </div>
+                )}
+                <Row label="Max size (0=off)">
+                  <NumInput testid="seg-max-size" value={maxSize} step="1" width={54}
+                    onChange={live(setMaxSize)} />
+                </Row>
+
+                <div style={secStyle}>splitting</div>
+                <Check testid="seg-watershed" checked={watershed} onChange={live(setWatershed)}
+                  label="Split touching" />
+                <Row label="Min separation">
+                  <NumInput testid="seg-min-separation" value={minSeparation} step="1" width={54}
+                    onChange={live(setMinSeparation)} />
+                </Row>
+                <Cell label="Marker smoothing">
+                  <Slider testid="seg-marker-smooth" value={markerSmooth} min={0} max={10} step={0.1}
+                    onChange={live(setMarkerSmooth)} fmt={(n) => n.toFixed(1)} />
+                </Cell>
+                <Check testid="seg-clear-border" checked={clearBorder} onChange={live(setClearBorder)}
+                  label="Drop edge particles" />
+
+                {/* CLASSICAL ONLY, and not merely for space: these build the
+                    classical MASK. The scribble engine hands `split_instances`
+                    a probability map thresholded at 0.5, so it never reads
+                    threshold / sensitivity / gaussian / rb_kernel / invert /
+                    local_size — see
+                    `spyde/particles/classical.py::split_instances`. Rendering
+                    them on the Scribble tab would be six knobs that do nothing,
+                    which is the overload complaint in miniature. They keep
+                    their stored values and are still sent in every payload. */}
+                {method === 'classical' && (
+                  <>
+                    <div style={secStyle}>detection</div>
+                    <Cell label="Threshold">
+                      <Select testid="seg-threshold" value={threshold} options={THRESHOLD_OPTS}
+                        onChange={live(setThreshold)} />
+                    </Cell>
+                    <Cell label="Pre-blur σ (px)">
+                      <Slider testid="seg-gaussian" value={gaussian} min={0} max={10} step={0.1}
+                        onChange={live(setGaussian)} fmt={(n) => n.toFixed(1)} />
+                    </Cell>
+                    <Row label="Rolling ball">
+                      <NumInput testid="seg-rb-kernel" value={rbKernel} step="1" width={54}
+                        onChange={live(setRbKernel)} />
+                    </Row>
+                    <Row label="Local window">
+                      <NumInput testid="seg-local-size" value={localSize} step="2" width={54}
+                        onChange={live(setLocalSize)} />
+                    </Row>
+                    <Check testid="seg-invert" checked={invert} onChange={live(setInvert)}
+                      label="Dark particles" />
+                  </>
+                )}
               </div>
-            )}
-            <Row label="Max size (0=off)">
-              <NumInput testid="seg-max-size" value={maxSize} step="1" width={54}
-                onChange={live(setMaxSize)} />
-            </Row>
 
-            <div style={secStyle}>splitting</div>
-            <Check testid="seg-watershed" checked={watershed} onChange={live(setWatershed)}
-              label="Split touching" />
-            <Row label="Min separation">
-              <NumInput testid="seg-min-separation" value={minSeparation} step="1" width={54}
-                onChange={live(setMinSeparation)} />
-            </Row>
-            <Cell label="Marker smoothing">
-              <Slider testid="seg-marker-smooth" value={markerSmooth} min={0} max={10} step={0.1}
-                onChange={live(setMarkerSmooth)} fmt={(n) => n.toFixed(1)} />
-            </Cell>
-            <Check testid="seg-clear-border" checked={clearBorder} onChange={live(setClearBorder)}
-              label="Drop edge particles" />
+              <div data-testid="seg-advanced-feedback" style={advColStyle}>
+                <div style={colHeadStyle}>feedback</div>
 
-            {/* CLASSICAL ONLY, and not merely for space: these build the
-                classical MASK. The scribble engine hands `split_instances` a
-                probability map thresholded at 0.5, so it never reads threshold /
-                sensitivity / gaussian / rb_kernel / invert / local_size — see
-                `spyde/particles/classical.py::split_instances`. Rendering them
-                on the Scribble tab would be six knobs that do nothing, which is
-                the overload complaint in miniature. They keep their stored
-                values and are still sent in every payload. */}
-            {method === 'classical' && (
-              <>
-                <div style={secStyle}>detection</div>
-                <Cell label="Threshold">
-                  <Select testid="seg-threshold" value={threshold} options={THRESHOLD_OPTS}
-                    onChange={live(setThreshold)} />
-                </Cell>
-                <Cell label="Pre-blur σ (px)">
-                  <Slider testid="seg-gaussian" value={gaussian} min={0} max={10} step={0.1}
-                    onChange={live(setGaussian)} fmt={(n) => n.toFixed(1)} />
-                </Cell>
-                <Row label="Rolling ball">
-                  <NumInput testid="seg-rb-kernel" value={rbKernel} step="1" width={54}
-                    onChange={live(setRbKernel)} />
+                <div style={S.hint}>size {areaUnits}</div>
+                <SizeHistogram areas={preview?.areas ?? []} />
+                <div data-testid="seg-size-stats" style={statsStyle}>
+                  {preview ? `med ${fmtArea(preview.median)} ${areaUnits}` : '—'}
+                </div>
+                <div data-testid="seg-counts" style={S.hint}>
+                  {labelledFrames.length} frames labelled · {classes.length} classes
+                  {labelledPixels > 0 ? ` · ${labelledPixels.toLocaleString()} px` : ''}
+                  {` · frame ${frame}`}
+                </div>
+
+                {/* `output` describes what the RUN produces, so it belongs with
+                    the button that produces one rather than among the detection
+                    knobs. It is also what keeps the two columns near even once
+                    `detection` renders on the left. */}
+                <div style={secStyle}>output</div>
+                <Check testid="seg-store-masks" checked={storeMasks} onChange={live(setStoreMasks)}
+                  label="Store outlines" />
+                <Check testid="seg-track" checked={track} onChange={live(setTrack)}
+                  label="Link tracks" />
+                <Row label="Link radius">
+                  <NumInput testid="seg-max-dist" value={maxDist} step="0.1" width={54}
+                    onChange={live(setMaxDist)} />
                 </Row>
-                <Row label="Local window">
-                  <NumInput testid="seg-local-size" value={localSize} step="2" width={54}
-                    onChange={live(setLocalSize)} />
-                </Row>
-                <Check testid="seg-invert" checked={invert} onChange={live(setInvert)}
-                  label="Dark particles" />
-              </>
-            )}
-
-            <div style={secStyle}>output</div>
-            <Check testid="seg-store-masks" checked={storeMasks} onChange={live(setStoreMasks)}
-              label="Store outlines" />
-            <Check testid="seg-track" checked={track} onChange={live(setTrack)}
-              label="Link tracks" />
-            <Row label="Link radius">
-              <NumInput testid="seg-max-dist" value={maxDist} step="0.1" width={54}
-                onChange={live(setMaxDist)} />
-            </Row>
-
-            <div style={secStyle}>this frame</div>
-            <div style={S.hint}>size {areaUnits}</div>
-            <SizeHistogram areas={preview?.areas ?? []} />
-            <div data-testid="seg-size-stats" style={statsStyle}>
-              {preview ? `med ${fmtArea(preview.median)} ${areaUnits}` : '—'}
+                <CommitButton wizardKey="seg" windowId={windowId} sendAction={sendAction}
+                  label="Commit Frame" />
+              </div>
             </div>
-            <div data-testid="seg-counts" style={S.hint}>
-              {labelledFrames.length} frames labelled · {classes.length} classes
-              {labelledPixels > 0 ? ` · ${labelledPixels.toLocaleString()} px` : ''}
-              {` · frame ${frame}`}
-            </div>
-            <CommitButton wizardKey="seg" windowId={windowId} sendAction={sendAction}
-              label="Commit Frame" />
           </div>
         )}
       </WizardShell>
@@ -781,11 +899,31 @@ const countStyle: React.CSSProperties = {
 const statsStyle: React.CSSProperties = {
   fontSize: 10, color: '#cdd6f4', fontVariantNumeric: 'tabular-nums',
 }
+/** The caret's width while Advanced is open — two ~236 px columns plus the
+ *  gap, divider and the shell's own padding. */
+const ADV_WIDTH = 520
+
 const advStyle: React.CSSProperties = {
   display: 'flex', flexDirection: 'column', gap: 5, minWidth: 0,
   // NO overflow here: the Threshold Dropdown's menu is absolutely positioned
-  // and any overflow:auto ancestor clips it (PlotControlDock.tsx:730).
+  // and any overflow:auto ancestor clips it (PlotControlDock.tsx:730). That
+  // constraint is exactly why this block is two COLUMNS rather than a scroller
+  // — see the comment at the JSX.
   borderTop: '1px solid #313244', paddingTop: 6,
+}
+const advColsStyle: React.CSSProperties = {
+  display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12,
+  alignItems: 'start', minWidth: 0,
+}
+const advColStyle: React.CSSProperties = {
+  display: 'flex', flexDirection: 'column', gap: 5,
+  // `minWidth: 0` on a grid child is what lets the Threshold trigger and the
+  // histogram shrink to the column instead of forcing it wider than 1fr.
+  minWidth: 0,
+}
+const colHeadStyle: React.CSSProperties = {
+  fontSize: 9.5, color: '#6c7086', textTransform: 'uppercase',
+  letterSpacing: 0.6, paddingBottom: 2, borderBottom: '1px solid #313244',
 }
 const secStyle: React.CSSProperties = {
   ...S.hint, borderTop: '1px solid #313244', paddingTop: 5, marginTop: 1,

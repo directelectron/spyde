@@ -127,6 +127,9 @@ export function FloatingToolbar({
   // caret's absolute positioning) used only to measure the caret's real size.
   const caretWrapRef = React.useRef<HTMLDivElement>(null)
   const caretBox = React.useRef<{ w: number; h: number } | null>(null)
+  /** The measured caret width, mirrored into state so the side-placement clamp
+   *  re-runs when a caret changes width without changing placement. */
+  const [caretW, setCaretW] = React.useState(240)
   const live = state.activeActions.get(windowId) ?? EMPTY
 
   // Keep the toolbar shown while a popout/caret is open or an action is live —
@@ -160,6 +163,12 @@ export function FloatingToolbar({
       next = wr.x + wr.w + CARET_GAP + cw <= area.w ? 'right' : 'left'
     }
     setPlacement(p => (p === next ? p : next))
+    // The WIDTH has to be state, not just the ref: the side placements clamp
+    // with it (see `caretPos`), and the ref is written in a layout effect. If
+    // the placement itself does not change there is no re-render, so the
+    // clamp would keep using the previous caret's width — which for a caret
+    // that widens on a disclosure is exactly the case that needs it.
+    setCaretW(w => (w === cw ? w : cw))
   }
   React.useLayoutEffect(() => { place.current() })
 
@@ -249,12 +258,30 @@ export function FloatingToolbar({
   // Where the bar's TOP edge sits in window coords — carets are DOM children of
   // the bar, so the side placements are expressed relative to it.
   const barTopInWin = inside ? wr.h - BAR_H - BAR_GAP : wr.h + BAR_GAP
+  // Where a SIDE-placed caret's left edge wants to be, in MDI-area coords, then
+  // CLAMPED into the area. `left` anchors the caret's RIGHT edge to the
+  // window's left edge, so a caret wider than the room beside the window simply
+  // walked off the edge of the app and its controls became unclickable —
+  // Playwright's "element is outside of the viewport", and for a user a panel
+  // with its labels sliced off. Segment's two-column Advanced (520 px) is the
+  // first caret wide enough to hit it. Overlapping the owning window is
+  // recoverable; being off-screen is not, so the clamp wins.
+  //
+  // When there IS room this is arithmetically identical to the old
+  // marginLeft/marginRight pair — the clamp is a no-op and nothing moves.
+  const sideLeft = placement === 'right'
+    ? wr.x + wr.w + CARET_GAP
+    : wr.x - CARET_GAP - caretW
+  const clampedLeft = Math.max(0, Math.min(sideLeft, area.w - caretW))
   const caretPos: React.CSSProperties =
     placement === 'below'
       ? { position: 'absolute', top: '100%', left: '50%', transform: 'translateX(-50%)', marginTop: CARET_GAP }
-      : placement === 'right'
-        ? { position: 'absolute', top: -barTopInWin, left: '50%', marginLeft: wr.w / 2 + CARET_GAP, transform: 'none' }
-        : { position: 'absolute', top: -barTopInWin, right: '50%', marginRight: wr.w / 2 + CARET_GAP, left: 'auto', transform: 'none' }
+      : {
+        position: 'absolute', top: -barTopInWin, left: '50%',
+        // The bar is centred on the window, so `left:50%` is the window's
+        // midline — walk from there to the clamped absolute position.
+        marginLeft: clampedLeft - (wr.x + wr.w / 2), transform: 'none',
+      }
 
   // The Segment brush strip sits ON the figure (plan B0: while painting you are
   // looking at the image), not in the caret. Same coordinate trick the side

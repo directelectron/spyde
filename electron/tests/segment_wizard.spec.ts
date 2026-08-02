@@ -117,16 +117,37 @@ async function setAdvanced(open: boolean) {
   await expect(toggle).toHaveAttribute('aria-expanded', String(open))
 }
 
-/** The caret box has NO scroller of its own — the Threshold dropdown's menu is
- *  absolutely positioned, so an `overflow:auto` ancestor would clip it. That
- *  makes "does it fit" a real assertion: anything past the bottom of the MDI
- *  area is simply unreachable, and an expanded Advanced is where it happens. */
+/**
+ * The caret box has NO scroller of its own — the Threshold dropdown's menu is
+ * absolutely positioned, so an `overflow:auto` ancestor would clip it. That
+ * makes "does it fit" a real assertion rather than a cosmetic one: anything
+ * past the bottom of the MDI area is simply unreachable, and an expanded
+ * Advanced is where it happens.
+ *
+ * It HAS happened: single-column Advanced measured 907 px in an 805 px area,
+ * putting the size histogram and Commit Frame off-screen with no way to reach
+ * them. The two-column layout (plan B7) is what buys the room back, so this
+ * assertion is the thing holding that layout in place — if a future edit
+ * re-stacks Advanced into one column, this is what says so.
+ *
+ * BOTH AXES, because checking only the bottom is how the next one got through:
+ * the two-column caret fit vertically and then FloatingToolbar placed it off
+ * the LEFT edge of the app (a side-placed caret anchors its right edge to the
+ * window's left, so one wider than the room beside the window walks straight
+ * out of the viewport). Vertically-only, this function passed while half the
+ * caret was unreachable.
+ */
 async function expectCaretFits() {
   const { page } = ctx
   const box = await page.getByTestId('segment-wizard').boundingBox()
   const mdi = await page.getByTestId('mdi-area').boundingBox()
-  expect(box && mdi && box.y + box.height <= mdi.y + mdi.height + 1,
-    `caret ${JSON.stringify(box)} runs past the MDI area ${JSON.stringify(mdi)}`).toBe(true)
+  const where = `caret ${JSON.stringify(box)} vs MDI area ${JSON.stringify(mdi)}`
+  expect(box && mdi, where).toBeTruthy()
+  expect(box!.y + box!.height <= mdi!.y + mdi!.height + 1,
+    `${where}: runs past the BOTTOM`).toBe(true)
+  expect(box!.x >= mdi!.x - 1, `${where}: runs past the LEFT edge`).toBe(true)
+  expect(box!.x + box!.width <= mdi!.x + mdi!.width + 1,
+    `${where}: runs past the RIGHT edge`).toBe(true)
 }
 
 test('caret opens, previews the displayed frame, and shows the brush strip', async () => {
@@ -157,17 +178,23 @@ test('caret opens, previews the displayed frame, and shows the brush strip', asy
     'seg-track', 'seg-threshold', 'seg-gaussian', 'seg-rb-kernel',
     'seg-local-size', 'seg-min-separation', 'seg-marker-smooth', 'seg-max-dist',
     'seg-invert', 'seg-clear-border', 'seg-histogram', 'seg-counts',
-    'seg-commit',
+    'seg-commit', 'seg-min-score',
   ]) {
     await expect(page.getByTestId(hidden),
       `${hidden} must be behind Advanced, not on the default face`).toHaveCount(0)
   }
-  // Exactly ONE interactive control besides the tabs, the ✕ and the disclosure.
+  // THREE sliders and the button, nothing else besides the tabs, ✕ and the
+  // disclosure. ✕, 3 tabs, sensitivity, merge-nm, min-nm, Find-in-all-frames,
+  // Advanced = 9. This count is the guard against the face refilling one
+  // reasonable-looking addition at a time (plan §0.9a), so it is exact on
+  // purpose — if you add a control here, justify it in the diff.
   const primaryControls = await page.getByTestId('segment-wizard')
     .locator('input, select, textarea, button').count()
-  // ✕, 3 tabs, sensitivity range, Find-in-all-frames, Advanced = 7.
-  expect(primaryControls, 'the default face grew a control back').toBe(7)
+  expect(primaryControls, 'the default face grew a control back').toBe(9)
   await expect(page.getByTestId('seg-sensitivity')).toBeVisible()
+  // The two PHYSICAL controls, the ones that are the same on every engine.
+  await expect(page.getByTestId('seg-merge-nm')).toBeVisible()
+  await expect(page.getByTestId('seg-min-nm')).toBeVisible()
   await expect(page.getByTestId('seg-run')).toHaveText('Find in all frames')
 
   await page.getByTestId('segment-wizard').screenshot({ path: `${SHOTS}/03-caret-detail.png` })
@@ -256,6 +283,72 @@ test('sensitivity re-previews and min_size=0 is floored to the EFFECTIVE value',
   await minSize.fill('20')
   await minSize.blur()
   await setAdvanced(false)
+  ctx.assertNoJsErrors()
+})
+
+/**
+ * The three filters that had NO coverage, which is how all three shipped broken
+ * at once: the two nm sliders crashed the whole caret on first render (`Field`
+ * was used but never imported — a blank window, and every headless test still
+ * green), and Confidence was taken off the face and never re-added to Advanced,
+ * so `min_score` sat at 0 with no control able to move it.
+ *
+ * Each assertion below is therefore "the control exists AND reaches the
+ * backend", polling the caret's monotonic `data-seq`. Existence alone is what
+ * the previous specs checked, and it is exactly what a dead slider passes.
+ */
+test('the nm face filters and the demoted Confidence slider all re-preview', async () => {
+  const { page } = ctx
+  const stats = page.getByTestId('seg-preview-stats')
+  const reran = async (what: string, act: () => Promise<void>) => {
+    const seq = Number(await stats.getAttribute('data-seq'))
+    await act()
+    await expect.poll(async () => Number(await stats.getAttribute('data-seq')), {
+      timeout: 60_000, message: `${what} did not reach the backend`,
+    }).toBeGreaterThan(seq)
+  }
+
+  // ── the face: both controls are PHYSICAL and read out in nm ───────────────
+  // The readout is the assertion that matters. `_nm_to_px` converts with the
+  // signal's scale, and nothing stashed that scale on the params — so the
+  // backend took its uncalibrated branch and merged at N PIXELS while the label
+  // said N nm. A label in nm is a claim about the scale bar; if the conversion
+  // is skipped the caret is lying by exactly the magnification.
+  await expect(page.getByTestId('seg-merge-nm')).toHaveValue('0')
+  await reran('the merge-nm slider', () => page.getByTestId('seg-merge-nm').fill('25'))
+  await expect(page.getByTestId('segment-wizard')).toContainText('25 nm')
+
+  await reran('the min-nm slider', () => page.getByTestId('seg-min-nm').fill('4'))
+  await expect(page.getByTestId('segment-wizard')).toContainText('4 nm')
+
+  await page.getByTestId('segment-wizard').screenshot({ path: `${SHOTS}/06b-nm-filters.png` })
+
+  // Both are engine-independent, so unlike sensitivity they stay on the face
+  // when the engine changes. (Scribble is untrained here, which does not matter
+  // — this is about which controls render.)
+  await page.getByTestId('seg-tab-scribble').click()
+  await expect(page.getByTestId('seg-merge-nm')).toBeVisible()
+  await expect(page.getByTestId('seg-min-nm')).toBeVisible()
+  await expect(page.getByTestId('seg-sensitivity'),
+    'sensitivity is classical-only — the scribble engine never reads it').toHaveCount(0)
+  await page.getByTestId('seg-tab-classical').click()
+  await expect(page.getByTestId('seg-sensitivity')).toBeVisible({ timeout: 30_000 })
+
+  // ── Advanced: Confidence is demoted, NOT deleted (plan §0.9a) ─────────────
+  await setAdvanced(true)
+  const score = page.getByTestId('seg-min-score')
+  await expect(score, 'Confidence left the face and never arrived in Advanced')
+    .toBeVisible()
+  await expect(page.getByTestId('seg-advanced')).toContainText('off')
+  await reran('the Confidence slider', () => score.fill('0.5'))
+  await expect(page.getByTestId('seg-advanced')).toContainText('50%')
+  await page.getByTestId('segment-wizard').screenshot({ path: `${SHOTS}/06c-confidence.png` })
+
+  // Everything back to default so the batch run below is the plain path.
+  await reran('resetting Confidence', () => score.fill('0'))
+  await setAdvanced(false)
+  await reran('resetting merge-nm', () => page.getByTestId('seg-merge-nm').fill('0'))
+  await reran('resetting min-nm', () => page.getByTestId('seg-min-nm').fill('0'))
   ctx.assertNoJsErrors()
 })
 
