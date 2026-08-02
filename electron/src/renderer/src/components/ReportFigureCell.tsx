@@ -42,36 +42,22 @@ import React, { useState } from 'react'
 import { useSpyDE } from '../kernel/SpyDEContext'
 import { reportClipboard, type SerializedFigureCell } from '../kernel/reportClipboard'
 import type { ReportCell, RepfigPanel, RepfigLayer, RepfigSpec } from '../kernel/protocol'
-import { FIGURE_DRAG_MIME, WINDOW_DRAG_MIME } from '../kernel/dnd'
+import { FIGURE_DRAG_MIME, WINDOW_DRAG_MIME, peekWindowDrag } from '../kernel/dnd'
+import { dlog, dlogOnce } from '../kernel/dragDiag'
 import { COLORMAPS } from '../kernel/colormaps'
 import { useKeyedDebounce } from './wizardHooks'
 import { CellChrome } from './CellChrome'
+import { AddFigureMenu } from './AddFigureMenu'
+import {
+  ComposeZones, ZONE_TILE, hoverZoneAt, panelLabel, PANEL_LETTERS,
+  type ComposeMode, type HoverZone,
+} from './composeDrop'
 
-// The compose modes the backend can return (subset of these per drop).
-type ComposeMode =
-  | 'overlay' | 'callout'
-  | 'tile-up' | 'tile-down' | 'tile-left' | 'tile-right'
-
-// The five drop zones on a figure cell (or, on a multi-panel grid, within the
-// hovered PANEL's cell rect).
-type Zone = 'center' | 'up' | 'down' | 'left' | 'right'
-const ZONE_TILE: Record<Exclude<Zone, 'center'>, ComposeMode> = {
-  up: 'tile-up', down: 'tile-down', left: 'tile-left', right: 'tile-right',
-}
-
-// The currently-hovered zone PLUS which panel it's relative to (for a grid
-// figure) and the panel's on-screen rect (fraction of the shield box, 0..1) so
-// ComposeZones can position itself over just that cell. `panelId` is null for a
-// single-panel figure (whole-box zones, today's behaviour) and `panelRect` is
-// the full box (0,0,1,1) in that case.
-interface HoverZone {
-  zone: Zone
-  panelId: string | null
-  panelLabel: string | null
-  panelRect: { left: number; top: number; width: number; height: number }
-}
-
-const FULL_RECT = { left: 0, top: 0, width: 1, height: 1 }
+// The compose-zone primitives (types, the tile map, hit-testing and the overlay
+// component) live in ./composeDrop so the SPLIT block mounts the IDENTICAL
+// overlay — a split's figure side used to have a bare replace-only drop, which
+// is how "combine two figures into a subplot grid" became unreachable on the
+// slide layout that uses it most. See that file's header.
 
 // The figure cell's CSS box has no native pixel width/height to key an
 // aspect-ratio off — the `figure` message (host:"report") carries no `aspect`
@@ -146,27 +132,13 @@ function panelAnnAnchor(
   }
 }
 
-// Map a cursor fraction (fx, fy) WITHIN a cell rect (0..1 local to that rect)
-// to a Zone: a ~30%-wide edge strip on each side, center otherwise. Shared by
-// the single-panel (whole box) and grid (per-panel cell) paths.
-function zoneFromLocalFraction(fx: number, fy: number): Zone {
-  const edge = 0.3
-  const dl = fx, dr = 1 - fx, dt = fy, db = 1 - fy
-  const m = Math.min(dl, dr, dt, db)
-  if (m > edge) return 'center'
-  if (m === dl) return 'left'
-  if (m === dr) return 'right'
-  if (m === dt) return 'up'
-  return 'down'
-}
-
 // The figure payload of a pill drop: the source window id plus — when the
 // FIGURE_DRAG_MIME payload carries them — the dragged window's shown-figure id
 // and view tag (view:'3d' while its 3-D IPF explorer was up; the placeholder
 // fill forwards these so report_add_figure can snapshot the 3-D scene).
 interface DropFigurePayload { windowId: number; figId?: string; view?: string }
 
-function figurePayloadFromDrop(dt: DataTransfer): DropFigurePayload | null {
+export function figurePayloadFromDrop(dt: DataTransfer): DropFigurePayload | null {
   const fig = dt.getData(FIGURE_DRAG_MIME)
   if (fig) {
     try {
@@ -181,7 +153,11 @@ function figurePayloadFromDrop(dt: DataTransfer): DropFigurePayload | null {
     const n = parseInt(win, 10)
     if (Number.isFinite(n)) return { windowId: n }
   }
-  return null
+  // getData() came back empty even though the MIME was advertised in `types`
+  // (which is what let the drop zones light up). Fall back to the in-process
+  // payload the drag source stashed — see dnd.ts. Without this the compose
+  // handlers return null here and the drop is a silent no-op.
+  return peekWindowDrag()
 }
 
 // Resolve just the source window id from a drop (compose paths — a compose
@@ -274,6 +250,8 @@ export function ReportFigureCell({ cell, onRemove, index, dragProps, reorderActi
   // Which compose zone the cursor is over (non-placeholder live cell only), plus
   // which panel it targets on a multi-panel grid.
   const [hoverZone, setHoverZone] = useState<HoverZone | null>(null)
+  // The ＋ chrome button's window picker (the click path to a subplot grid).
+  const [addMenu, setAddMenu] = useState(false)
   // A center-drop compose prompt (popover) awaiting / showing options.
   const [prompt, setPrompt] = useState<ComposePrompt | null>(null)
   // The floating annotation style popover (edit mode; opened by clicking an
@@ -305,6 +283,22 @@ export function ReportFigureCell({ cell, onRemove, index, dragProps, reorderActi
         sendAction('repfig_set_edit_mode', { cell_id: cell.id, editing: false })
       }
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cell.id])
+
+  // PRESENTING closes the editor. In edit mode the backend rebuilds the figure
+  // WITH draggable widgets — per-panel grips and selection outlines — and the
+  // presented slide re-mounts that same live figure, so leaving the editor open
+  // put editing chrome on screen in front of an audience. The sidebar stays
+  // mounted behind Present mode, so the unmount cleanup above never fires here.
+  React.useEffect(() => {
+    const onPresent = () => {
+      if (!editOpenRef.current) return
+      setEditOpen(false)
+      sendAction('repfig_set_edit_mode', { cell_id: cell.id, editing: false })
+    }
+    window.addEventListener('spyde:report_present', onPresent)
+    return () => window.removeEventListener('spyde:report_present', onPresent)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cell.id])
 
@@ -462,69 +456,22 @@ export function ReportFigureCell({ cell, onRemove, index, dragProps, reorderActi
   }
 
   // ── Compose drop zones (live figure cell) ─────────────────────────────────
-  // Panels laid out in a grid (cell.figure.layout.kind === 'grid' with >1
-  // panel). Single-panel / non-grid figures keep the whole-box 5-zone behaviour.
-  const gridPanels = cell.figure?.layout?.kind === 'grid' ? (cell.figure.panels ?? []) : []
-  const gridRows = Math.max(1, Number(cell.figure?.layout?.rows) || 1)
-  const gridCols = Math.max(1, Number(cell.figure?.layout?.cols) || 1)
-  const isGridFigure = gridPanels.length > 1
-
-  // Nearest occupied grid panel to a (row, col) cell (by grid-cell center
-  // distance) — used when the cursor is over a HOLE in a sparse grid.
-  const nearestPanelAt = (row: number, col: number): RepfigPanel | null => {
-    if (!gridPanels.length) return null
-    let best: RepfigPanel | null = null
-    let bestDist = Infinity
-    for (const p of gridPanels) {
-      const [pr, pc] = p.grid_pos
-      const d = (pr - row) ** 2 + (pc - col) ** 2
-      if (d < bestDist) { bestDist = d; best = p }
-    }
-    return best
-  }
-
-  // Map the cursor position within the shield box to a HoverZone. On a grid
-  // figure this first resolves WHICH panel cell the cursor is over (uniform
-  // rows/cols — report grids have no ratios), then computes the zone from the
-  // LOCAL fraction within that cell; on a single-panel figure it's the whole
-  // box (today's behaviour, panelId null).
-  const hoverZoneAt = (e: React.DragEvent): HoverZone => {
-    const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
-    const fx = (e.clientX - r.left) / Math.max(1, r.width)
-    const fy = (e.clientY - r.top) / Math.max(1, r.height)
-    if (!isGridFigure) {
-      return { zone: zoneFromLocalFraction(fx, fy), panelId: null, panelLabel: null, panelRect: FULL_RECT }
-    }
-    const col = Math.min(gridCols - 1, Math.max(0, Math.floor(fx * gridCols)))
-    const row = Math.min(gridRows - 1, Math.max(0, Math.floor(fy * gridRows)))
-    let panel = gridPanels.find(p => p.grid_pos[0] === row && p.grid_pos[1] === col) ?? null
-    let cellRow = row, cellCol = col
-    if (!panel) {
-      // Hole — target the nearest occupied panel instead, but keep the
-      // highlighted rect on the HOVERED (empty) cell so the overlay tracks the
-      // cursor.
-      panel = nearestPanelAt(row, col)
-    }
-    const panelRect = {
-      left: cellCol / gridCols, top: cellRow / gridRows,
-      width: 1 / gridCols, height: 1 / gridRows,
-    }
-    const localFx = fx * gridCols - cellCol
-    const localFy = fy * gridRows - cellRow
-    const idx = gridPanels.indexOf(panel as RepfigPanel)
-    return {
-      zone: zoneFromLocalFraction(localFx, localFy),
-      panelId: panel ? panel.id : null,
-      panelLabel: panel ? panelLabel(idx) : null,
-      panelRect,
-    }
-  }
+  // Hit-testing lives in ./composeDrop (shared with the split block): it
+  // resolves the hovered PANEL on a grid figure and the zone within it, or the
+  // whole box on a single-panel figure.
   const onComposeDragOver = (e: React.DragEvent) => {
-    if (!isComposeDrag(e.dataTransfer)) return
+    if (!isComposeDrag(e.dataTransfer)) {
+      dlogOnce('4.shield/dragover-REJECTED', {
+        cell: cell.id, types: Array.from(e.dataTransfer.types),
+      })
+      return
+    }
     e.preventDefault()
     e.stopPropagation()
     e.dataTransfer.dropEffect = 'copy'
-    setHoverZone(hoverZoneAt(e))
+    const hz = hoverZoneAt(e, cell.figure)
+    dlogOnce('4.shield/dragover', { cell: cell.id, zone: hz.zone })
+    setHoverZone(hz)
   }
   const onComposeDragLeave = (e: React.DragEvent) => {
     // Only clear when actually leaving the box (not crossing a child overlay).
@@ -533,16 +480,34 @@ export function ReportFigureCell({ cell, onRemove, index, dragProps, reorderActi
     }
   }
   const onComposeDrop = (e: React.DragEvent) => {
-    if (!isComposeDrag(e.dataTransfer)) return
+    if (!isComposeDrag(e.dataTransfer)) {
+      dlog('5.shield/drop-REJECTED-not-compose-drag', {
+        cell: cell.id, types: Array.from(e.dataTransfer.types),
+      })
+      return
+    }
     e.preventDefault()
     e.stopPropagation()
-    const hz = hoverZoneAt(e)
+    const hz = hoverZoneAt(e, cell.figure)
     setHoverZone(null)
     const src = sourceWindowIdFromDrop(e.dataTransfer)
-    if (src == null) return
+    dlog('5.shield/drop', {
+      cell: cell.id, zone: hz.zone, resolvedSourceWindow: src,
+      rawFigureData: (e.dataTransfer.getData(FIGURE_DRAG_MIME) || '').slice(0, 60),
+      rawWindowData: e.dataTransfer.getData(WINDOW_DRAG_MIME) || '',
+      usedStash: !e.dataTransfer.getData(FIGURE_DRAG_MIME)
+        && !e.dataTransfer.getData(WINDOW_DRAG_MIME),
+    })
+    if (src == null) {
+      dlog('5b.drop-ABORTED-no-source-window', { cell: cell.id })
+      return
+    }
     if (hz.zone !== 'center') {
       // Edge → tile immediately on that side, relative to the targeted panel
       // (undefined on a single-panel figure → backend legacy default).
+      dlog('6.sendAction/repfig_compose', {
+        cell: cell.id, mode: ZONE_TILE[hz.zone], source_window_id: src,
+      })
       sendAction('repfig_compose', {
         cell_id: cell.id, mode: ZONE_TILE[hz.zone], source_window_id: src,
         ...(hz.panelId != null ? { target_panel_id: hz.panelId } : {}),
@@ -641,12 +606,46 @@ export function ReportFigureCell({ cell, onRemove, index, dragProps, reorderActi
       try { await window.electron.clipboardWritePng(ser.png) } catch { /* ignore */ }
     }
   }
-  const doDuplicate = async () => {
-    // Duplicate = copy → paste at own index+1 immediately; the internal
-    // clipboard is NOT touched (a plain Copy would be lost otherwise).
-    const ser = await serialize()
-    sendAction('report_paste_cell', { cell: ser, index: index + 1 })
+  // Which branch this cell renders decides whether a compose drop is even
+  // POSSIBLE, so record it — a cell whose live figure never arrived used to
+  // render a shield-less fallback, and a drop onto it did nothing at all with
+  // no way to tell that from a hit-testing failure.
+  if (dragKind === 'window') {
+    dlogOnce('3.cell/render-branch', {
+      cell: cell.id,
+      branch: cell.placeholder ? 'placeholder'
+        : cell.data_offline ? 'data_offline'
+          : fig ? 'live-figure'
+            : cell.png ? 'baked-png' : 'pending',
+    })
   }
+
+  /**
+   * The compose drop shield — one definition, used by EVERY non-placeholder
+   * branch.
+   *
+   * It used to live only in the live-figure branch, so a cell showing its baked
+   * PNG (figure not yet rebuilt) or flagged data-offline had NO drop target over
+   * its figure box: dragover fell through to whatever was underneath, nothing
+   * accepted it, and the release produced `dragend` with no `drop`. Identical
+   * symptom to a hit-testing failure, entirely different cause.
+   */
+  const composeShieldNode = dragKind === 'window' ? (
+    <div
+      ref={() => dlogOnce('3.shield/mounted', { cell: cell.id })}
+      data-testid={`figcell-compose-shield-${cell.id}`}
+      style={styles.composeShield}
+      onDragEnter={onComposeDragOver}
+      onDragOver={onComposeDragOver}
+      onDragLeave={onComposeDragLeave}
+      onDrop={onComposeDrop}
+    >
+      {hoverZone != null && (
+        <ComposeZones active={hoverZone.zone} cellId={cell.id}
+          panelRect={hoverZone.panelRect} panelLabel={hoverZone.panelLabel} />
+      )}
+    </div>
+  ) : null
 
   return (
     <div
@@ -667,12 +666,18 @@ export function ReportFigureCell({ cell, onRemove, index, dragProps, reorderActi
           Refresh-from-live + delete (not on a placeholder). Only the ⠿ handle is
           draggable — the cell root can't be (the figure iframe needs its own
           pointer gestures), so the handle sets the ROOT as the drag image. */}
-      {hover && !cell.placeholder && (
+      {/* ALWAYS mounted (dimmed), not hover-gated — see styles.chrome for why
+          hover is unreliable over a figure. Hover, or an open ＋ picker, just
+          brightens it. */}
+      {!cell.placeholder && (
         <CellChrome
           cellId={cell.id}
-          styles={{ chrome: styles.chrome, chromeBtn: styles.chromeBtn }}
+          styles={{
+            chrome: { ...styles.chrome, ...((hover || addMenu) ? styles.chromeHover : {}) },
+            chromeBtn: styles.chromeBtn,
+          }}
           onCopy={doCopy}
-          onDuplicate={doDuplicate}
+          onAddFigure={() => setAddMenu(v => !v)}
           onDelete={onRemove}
           deleteTestid={`report-figcell-delete-${cell.id}`}
           deleteTitle="Delete figure"
@@ -708,6 +713,10 @@ export function ReportFigureCell({ cell, onRemove, index, dragProps, reorderActi
         />
       )}
 
+      {addMenu && (
+        <AddFigureMenu cellId={cell.id} hasFigure onClose={() => setAddMenu(false)} />
+      )}
+
       {cell.placeholder ? (
         // Template placeholder — dashed drop zone.
         <div
@@ -731,6 +740,7 @@ export function ReportFigureCell({ cell, onRemove, index, dragProps, reorderActi
           <span style={styles.offlineBadge} data-testid={`report-figcell-offline-${cell.id}`}>
             data offline
           </span>
+          {composeShieldNode}
         </div>
       ) : fig ? (
         // Live report figure — a seamless (no-flash) iframe swap host + the
@@ -743,26 +753,7 @@ export function ReportFigureCell({ cell, onRemove, index, dragProps, reorderActi
             iframeRefs={iframeRefs}
             replayState={replayState}
           />
-          {/* Drag shield: the figure iframe is out-of-process and swallows DnD, so
-              while a window/figure pill is in flight we mount a transparent shield
-              over it to catch dragover/drop (same reason SubWindow shields during
-              gestures). Mounted ONLY during the drag → no interference otherwise.
-              The zone overlay renders inside it once a zone is hovered. Sits ABOVE
-              the frames (composeShield z 3) so pointer capture still works. */}
-          {dragKind === 'window' && (
-            <div
-              data-testid={`figcell-compose-shield-${cell.id}`}
-              style={styles.composeShield}
-              onDragOver={onComposeDragOver}
-              onDragLeave={onComposeDragLeave}
-              onDrop={onComposeDrop}
-            >
-              {hoverZone != null && (
-                <ComposeZones active={hoverZone.zone} cellId={cell.id}
-                  panelRect={hoverZone.panelRect} panelLabel={hoverZone.panelLabel} />
-              )}
-            </div>
-          )}
+          {composeShieldNode}
           {/* Reorder shield: same iframe-swallows-DnD problem as compose, but
               for CELL reorder drags — a bare transparent layer (no handlers;
               dragover/drop bubble to the cell root's dragProps wiring). */}
@@ -779,6 +770,7 @@ export function ReportFigureCell({ cell, onRemove, index, dragProps, reorderActi
           {cell.png
             ? <img src={cell.png} alt={cell.caption ?? ''} style={styles.offlineImg} />
             : <div style={styles.pending} data-testid={`report-figcell-pending-${cell.id}`}>rendering…</div>}
+          {composeShieldNode}
         </div>
       )}
 
@@ -912,6 +904,9 @@ export function SeamlessFigureFrame({ figId, filePath, title, iframeRefs, replay
   iframeRefs: React.MutableRefObject<Map<string, HTMLIFrameElement>>
   replayState: (figId: string) => void
 }) {
+  // Read here rather than taking a prop so EVERY host of this frame (report
+  // cell, split block, Present mode) gets the drag fix without threading it.
+  const { dragKind } = useSpyDE()
   // The figId currently PROMOTED (opacity 1). Starts as the first figId; updated
   // only once a newer frame has painted.
   const [shownFigId, setShownFigId] = React.useState(figId)
@@ -996,7 +991,34 @@ export function SeamlessFigureFrame({ figId, filePath, title, iframeRefs, replay
   )
 
   return (
-    <div ref={boxRef} style={styles.frameHost}>
+    <div
+      ref={boxRef}
+      style={{
+        ...styles.frameHost,
+        // ── THE COMPOSE-DROP FIX ────────────────────────────────────────────
+        // While a window pill is in flight, make the figure iframe untouchable
+        // so the compose shield above it actually receives the drag.
+        //
+        // The shield is `z-index: 3` over a `z-index: auto` frame host, so by
+        // CSS stacking it is on top and should win — and under a synthesized
+        // test drag it does, which is why every e2e passed. But a REAL drag is
+        // routed by the BROWSER process using compositor surface hit-testing,
+        // and this iframe is out-of-process: the compositor answers with the
+        // IFRAME's surface, so dragenter/dragover/drop are delivered to that
+        // frame, whose document has no drop handler. Nothing calls
+        // preventDefault, so the release yields `dragend` with no `drop` — the
+        // drag simply dies over the figure.
+        //
+        // The trace showed it exactly: dragover events stop arriving the moment
+        // the cursor crosses the figure, then dragend ~3 s later with no drop.
+        //
+        // `pointer-events: none` removes the iframe from hit-testing entirely,
+        // so the parent's shield is what the compositor reports. Scoped to the
+        // drag: the figure stays fully interactive the rest of the time (its
+        // widgets, zoom and click-to-select all still work).
+        ...(dragKind === 'window' ? { pointerEvents: 'none' as const } : {}),
+      }}
+    >
       {renderFrame(shownFigId, true)}
       {pendingFigId != null && pendingFigId !== shownFigId &&
         renderFrame(pendingFigId, false)}
@@ -1004,63 +1026,7 @@ export function SeamlessFigureFrame({ figId, filePath, title, iframeRefs, replay
   )
 }
 
-// ── 5-zone drop overlay ───────────────────────────────────────────────────────
-
-// `panelRect` positions the zones overlay INSIDE the hovered grid cell (percent
-// of the shield box); defaults to the full box on a single-panel figure.
-// `panelLabel` (e.g. "Panel B"), when present, is appended to the tile labels
-// so a multi-panel drop reads as "Tile → of Panel B".
-function ComposeZones({ active, cellId, panelRect, panelLabel: targetLabel }: {
-  active: Zone
-  cellId: string
-  panelRect?: { left: number; top: number; width: number; height: number }
-  panelLabel?: string | null
-}) {
-  const zStyle = (z: Zone): React.CSSProperties => ({
-    ...styles.zone,
-    ...(active === z ? styles.zoneHot : {}),
-  })
-  const rootStyle: React.CSSProperties = panelRect
-    ? {
-        ...styles.zonesRoot,
-        inset: 'auto',
-        left: `${panelRect.left * 100}%`, top: `${panelRect.top * 100}%`,
-        width: `${panelRect.width * 100}%`, height: `${panelRect.height * 100}%`,
-        right: 'auto', bottom: 'auto',
-      }
-    : styles.zonesRoot
-  const ofSuffix = targetLabel ? ` of ${targetLabel}` : ''
-  // Only the cell under the cursor shows zones, so the bare spec testids
-  // (figcell-zone-<zone>) are unambiguous; data-cell disambiguates in the DOM.
-  return (
-    <div style={rootStyle} data-testid="figcell-zones" data-cell={cellId}>
-      {/* Edges first (thin strips), center last so it sits between them. */}
-      <div data-testid="figcell-zone-up" style={{ ...zStyle('up'), ...styles.zoneUp }}>
-        <span style={styles.zoneLabel}>{`Tile ↑${ofSuffix}`}</span>
-      </div>
-      <div data-testid="figcell-zone-down" style={{ ...zStyle('down'), ...styles.zoneDown }}>
-        <span style={styles.zoneLabel}>{`Tile ↓${ofSuffix}`}</span>
-      </div>
-      <div data-testid="figcell-zone-left" style={{ ...zStyle('left'), ...styles.zoneLeft }}>
-        <span style={styles.zoneLabel}>{`Tile ←${ofSuffix}`}</span>
-      </div>
-      <div data-testid="figcell-zone-right" style={{ ...zStyle('right'), ...styles.zoneRight }}>
-        <span style={styles.zoneLabel}>{`Tile →${ofSuffix}`}</span>
-      </div>
-      <div data-testid="figcell-zone-center" style={{ ...zStyle('center'), ...styles.zoneCenter }}>
-        <span style={styles.zoneLabel}>{targetLabel ? `Combine${ofSuffix}` : 'Overlay / Combine'}</span>
-      </div>
-    </div>
-  )
-}
-
 // ── Edit panel (layers + annotations) ─────────────────────────────────────────
-
-// A1, B2… panel labels from grid position: row-major letter per panel index.
-const PANEL_LETTERS = 'ABCDEFGHIJKLMNOP'
-function panelLabel(index: number): string {
-  return `Panel ${PANEL_LETTERS[index] ?? String(index + 1)}`
-}
 
 // A short human label for an annotation entry.
 const ANNOT_LABEL: Record<string, string> = {
@@ -2104,7 +2070,17 @@ const styles: Record<string, React.CSSProperties> = {
     display: 'flex', alignItems: 'center', gap: 2,
     background: 'rgba(24,24,37,0.96)', borderRadius: 8, padding: 3,
     border: '1px solid #313244', boxShadow: '0 3px 10px rgba(0,0,0,0.35)',
+    // Dimmed-but-present rather than hover-gated. The cell's onMouseEnter never
+    // fires while the pointer is over the FIGURE, because that is an
+    // out-of-process iframe and it keeps the mouse events (the same routing
+    // that broke compose drops) — so hover-gated chrome was unreachable from
+    // the one place you naturally point at, and ＋/Copy/Delete could only be
+    // hit from the thin margin. Matches ReportSplitCell, which made its chrome
+    // always-visible for the same discoverability reason.
+    opacity: 0.35,
+    transition: 'opacity 120ms ease',
   },
+  chromeHover: { opacity: 1 },
   chromeBtn: {
     background: 'none', border: 'none', color: '#cdd6f4', cursor: 'pointer',
     fontSize: 15, lineHeight: 1, borderRadius: 6,
@@ -2177,31 +2153,7 @@ const styles: Record<string, React.CSSProperties> = {
   composeShield: {
     position: 'absolute', inset: 0, zIndex: 3,
   },
-  zonesRoot: {
-    position: 'absolute', inset: 0, pointerEvents: 'none',
-  },
-  zone: {
-    position: 'absolute', display: 'flex', alignItems: 'center',
-    justifyContent: 'center',
-    border: '1.5px dashed rgba(137,180,250,0.35)',
-    background: 'rgba(24,24,37,0.10)',
-    boxSizing: 'border-box',
-    transition: 'background 70ms, border-color 70ms',
-  },
-  zoneHot: {
-    borderColor: '#89b4fa',
-    background: 'rgba(137,180,250,0.22)',
-  },
-  zoneUp: { left: '28%', right: '28%', top: 0, height: '28%' },
-  zoneDown: { left: '28%', right: '28%', bottom: 0, height: '28%' },
-  zoneLeft: { top: '28%', bottom: '28%', left: 0, width: '28%' },
-  zoneRight: { top: '28%', bottom: '28%', right: 0, width: '28%' },
-  zoneCenter: { left: '28%', right: '28%', top: '28%', bottom: '28%' },
-  zoneLabel: {
-    fontSize: 9.5, fontWeight: 600, color: '#bac2de',
-    textShadow: '0 1px 2px rgba(0,0,0,0.8)', textAlign: 'center',
-    padding: '0 2px', lineHeight: 1.15,
-  },
+  // (The zone overlay's own styles moved to ./composeDrop with the component.)
   // ── Compose prompt popover ───────────────────────────────────────────────
   promptWrap: {
     position: 'absolute', left: '50%', top: '46%', transform: 'translate(-50%, -50%)',

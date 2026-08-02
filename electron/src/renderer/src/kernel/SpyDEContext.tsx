@@ -9,7 +9,8 @@ import React, {
 } from 'react'
 import { asPlotAppMessage } from './protocol'
 import type { ReportDocState, ReportCell } from './protocol'
-import { WINDOW_DRAG_MIME, FIGURE_DRAG_MIME } from './dnd'
+import { WINDOW_DRAG_MIME, FIGURE_DRAG_MIME, stashWindowDrag } from './dnd'
+import { dlog, dragDumpToConsole } from './dragDiag'
 import { EnvSetupOverlay } from '../components/EnvSetupOverlay'
 
 // Re-export the report doc types so components import them from the kernel
@@ -1708,22 +1709,79 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
       // file/text dragover doesn't clobber an active window drag.
       return WINDOW_TYPES.some(t => arr.includes(t)) ? 'window' : null
     }
-    const onDragStart = (e: DragEvent) => setDragKind(classify(e))
+    const onDragStart = (e: DragEvent) => {
+      const k = classify(e)
+      dlog('2.classify/dragstart', {
+        types: e.dataTransfer ? Array.from(e.dataTransfer.types) : null,
+        kind: k,
+        target: (e.target as HTMLElement)?.getAttribute?.('data-testid') ?? null,
+      })
+      setDragKind(k)
+    }
     // dragover is a belt-and-braces re-classify: if dragstart's read raced the
     // source's setData (ordering across the React-root vs window listeners), the
     // first dragover — where types are reliably populated — sets it. Only ever
     // PROMOTES to 'window'; never clears (clearing is dragend/drop's job).
-    const onDragOver = (e: DragEvent) => {
-      if (classify(e) === 'window') setDragKind(prev => (prev === 'window' ? prev : 'window'))
+    let promoted = false
+    // Trail of WHAT the drag is actually over. A drop that never fires means no
+    // dragover preventDefault()ed under the cursor — and the only way to know
+    // why is to see which element was receiving them. Logged on TARGET CHANGE
+    // (dragover fires ~60 Hz) with the topmost hit-test result alongside, since
+    // an out-of-process iframe swallows the event entirely and never appears as
+    // a target here at all.
+    let lastPath = ''
+    const describe = (el: Element | null): string => {
+      if (!el) return 'null'
+      const t = el.getAttribute?.('data-testid')
+      if (t) return t
+      const tag = el.tagName.toLowerCase()
+      return tag === 'iframe' ? 'IFRAME' : tag
     }
-    const clear = () => setDragKind(null)
+    const onDragOver = (e: DragEvent) => {
+      if (classify(e) === 'window') {
+        if (!promoted) {
+          promoted = true
+          dlog('2b.classify/first-dragover', {
+            types: e.dataTransfer ? Array.from(e.dataTransfer.types) : null,
+          })
+        }
+        setDragKind(prev => (prev === 'window' ? prev : 'window'))
+      }
+    }
+    // CAPTURE phase for the trail: the shield calls stopPropagation() when it
+    // accepts, so a bubble-phase listener goes silent exactly when things are
+    // working and can't distinguish that from the event never arriving.
+    const onDragOverCapture = (e: DragEvent) => {
+      const tgt = describe(e.target as Element)
+      const top = describe(document.elementFromPoint(e.clientX, e.clientY))
+      const path = `${tgt}|${top}`
+      if (path !== lastPath) {
+        lastPath = path
+        dlog('2c.dragover-over', { target: tgt, topmostAtPoint: top })
+      }
+    }
+    // Clearing the in-process payload stash here (not in the drag source's own
+    // dragend) keeps it alive for the whole drag — including the drop, which
+    // fires BEFORE dragend — while guaranteeing it can never leak into a later,
+    // unrelated drop.
+    const clear = (e: Event) => {
+      dlog(`6.end/${e.type}`, {
+        target: (e.target as HTMLElement)?.getAttribute?.('data-testid') ?? null,
+      })
+      dragDumpToConsole(e.type)
+      promoted = false
+      setDragKind(null)
+      stashWindowDrag(null)
+    }
     window.addEventListener('dragstart', onDragStart)
     window.addEventListener('dragover', onDragOver)
+    window.addEventListener('dragover', onDragOverCapture, true)
     window.addEventListener('dragend', clear)
     window.addEventListener('drop', clear)
     return () => {
       window.removeEventListener('dragstart', onDragStart)
       window.removeEventListener('dragover', onDragOver)
+      window.removeEventListener('dragover', onDragOverCapture, true)
       window.removeEventListener('dragend', clear)
       window.removeEventListener('drop', clear)
     }

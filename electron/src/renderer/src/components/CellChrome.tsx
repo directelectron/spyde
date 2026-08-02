@@ -3,20 +3,25 @@
  * shown on a Report cell (ReportCell: markdown; ReportFigureCell: figure;
  * ReportImageCell: photo; ReportSplitCell: split block).
  *
- * All cells show the SAME Copy / Duplicate / Delete trio; each caller adds its
- * own extras via the `leading` / `trailing` slots (a drag handle, a figure Edit
- * toggle + Refresh, a split's layout switch). CellChrome owns just the chrome
- * wrapper + the three shared buttons so the copy/duplicate/delete markup +
- * styling lives once.
+ * All cells show Copy / Delete; a FIGURE-bearing cell also gets ＋ "Add another
+ * figure". Each caller adds its own extras via the `leading` / `trailing` slots
+ * (a drag handle, a figure Edit toggle + Refresh, a split's layout switch).
+ *
+ * The ＋ used to be "Duplicate cell". Duplicating a slide's cell is a thing
+ * nobody asked for, while COMBINING two figures into a subplot grid had no
+ * button at all — it was reachable only by dragging a window pill onto an
+ * existing figure and hitting a 28%-wide edge strip, which is fiddly to aim at
+ * and easy to miss entirely. ＋ now opens a window picker and tiles the choice
+ * in, so the grid has a click path that can't be fumbled.
  *
  * Wave B de-clutter: the per-cell SLIDE chrome (title-slide 'T', background
  * style '◐', and speaker-notes '📝') was REMOVED. Those roles are re-surfaced
  * slide-natively in Wave C; the backend fields (slide_kind/slide_style/notes)
  * remain untouched.
  *
- * Every surviving `data-testid` is preserved EXACTLY (both e2e suites select on
- * them): `cell-copy-<id>`, `cell-duplicate-<id>`, plus a caller-supplied delete
- * testid (`report-cell-delete-<id>` / `report-figcell-delete-<id>` / …).
+ * Testids: `cell-copy-<id>`, `cell-add-figure-<id>` (was `cell-duplicate-<id>`),
+ * plus a caller-supplied delete testid (`report-cell-delete-<id>` /
+ * `report-figcell-delete-<id>` / …).
  */
 import React from 'react'
 
@@ -47,7 +52,10 @@ interface Props {
   cellId: string
   styles: CellChromeStyles
   onCopy: () => void
-  onDuplicate: () => void
+  /** Figure-bearing cells only: the ＋ button. Opens a picker of open windows
+   *  and tiles the chosen one in beside this figure (→ a subplot grid). Omitted
+   *  on cells with no figure, which simply don't render a ＋. */
+  onAddFigure?: () => void
   onDelete: () => void
   deleteTestid: string
   deleteTitle?: string
@@ -65,7 +73,7 @@ interface Props {
 const ARM_MS = 2600
 
 export function CellChrome({
-  cellId, styles, onCopy, onDuplicate, onDelete, deleteTestid,
+  cellId, styles, onCopy, onAddFigure, onDelete, deleteTestid,
   deleteTitle = 'Delete cell', leading, trailing,
 }: Props) {
   // TWO-STEP DELETE. This chrome is shown on `hover || showEditor`, so opening a
@@ -101,13 +109,15 @@ export function CellChrome({
         onClick={onCopy}
         {...hoverProps}
       >⧉</button>
-      <button
-        data-testid={`cell-duplicate-${cellId}`}
-        style={styles.chromeBtn}
-        title="Duplicate cell"
-        onClick={onDuplicate}
-        {...hoverProps}
-      >＋</button>
+      {onAddFigure && (
+        <button
+          data-testid={`cell-add-figure-${cellId}`}
+          style={styles.chromeBtn}
+          title="Add another figure — tiles it beside this one"
+          onClick={onAddFigure}
+          {...hoverProps}
+        >＋</button>
+      )}
       {trailing}
       <button
         data-testid={deleteTestid}
