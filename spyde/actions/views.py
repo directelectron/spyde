@@ -150,9 +150,12 @@ def emit_view_figure(window_id: int, image, label: str, *, kind: str = "2d",
         if key is not None and getattr(p, "add_key", None) is not None:
             rgba, key_labels = key
             try:
-                from spyde.actions.ipf_view import IPF_KEY_SIZE
+                from spyde.actions.ipf_view import (
+                    IPF_KEY_BG, IPF_KEY_BORDER, IPF_KEY_SIZE,
+                )
                 p.add_key(rgba, corner="bottom-right", size=IPF_KEY_SIZE,
-                          hover_only=True, labels=key_labels, name="ipf_key")
+                          hover_only=True, labels=key_labels, name="ipf_key",
+                          bgcolor=IPF_KEY_BG, border=IPF_KEY_BORDER)
             except Exception as e:
                 logger.debug("add_key on view %s failed: %s", label, e)
 

@@ -224,6 +224,16 @@ def _ipf_key_color_grid(phase, direction: str, n: int):
 #: Fraction of the panel's short edge the pinned colour key occupies.
 IPF_KEY_SIZE = 0.26
 
+#: The key's card. An IPF map is saturated colour edge to edge — including pale
+#: yellows and lavenders — and the corner indices are drawn in white, so on a
+#: bare key they land on whatever the map happens to be underneath and are
+#: unreadable over the light regions. A translucent dark slab makes them legible
+#: over ANY orientation without hiding much of the map (the key is ~26% of the
+#: short edge, pinned in a corner). Matches the app's surface colour at the same
+#: opacity the report's own overlay cards use.
+IPF_KEY_BG = "rgba(24,24,37,0.72)"
+IPF_KEY_BORDER = "#45475a"
+
 
 def ipf_key_overlay(result, direction: str = "z", *, n: int = 120):
     """``(rgba, labels)`` for :meth:`anyplotlib.Plot2D.add_key` → the colour-key
@@ -289,7 +299,8 @@ def attach_ipf_key(plot, result, direction: str = "z", *,
             return False
         rgba, labels = built
         add_key(rgba, corner="bottom-right", size=IPF_KEY_SIZE,
-                hover_only=bool(hover_only), labels=labels, name="ipf_key")
+                hover_only=bool(hover_only), labels=labels, name="ipf_key",
+                bgcolor=IPF_KEY_BG, border=IPF_KEY_BORDER)
         return True
     except Exception as e:
         log.debug("attaching the IPF key overlay failed: %s", e)
