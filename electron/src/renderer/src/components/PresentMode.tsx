@@ -45,7 +45,7 @@ import { useSpyDE } from '../kernel/SpyDEContext'
 import { renderMarkdown } from '../kernel/markdown'
 import { SeamlessFigureFrame } from './ReportFigureCell'
 import { SlideOverview } from './SlideOverview'
-import type { ReportCell } from '../kernel/protocol'
+import { DECK_THEME_DEFAULTS, type DeckTheme, type ReportCell } from '../kernel/protocol'
 
 // Crisp inline SVG icons for the top-right present controls (replacing the emoji
 // glyphs — the 🗣 speaker in particular read as "voice/audio", not "presenter").
@@ -90,8 +90,19 @@ if (typeof document !== 'undefined' && !document.getElementById('spyde-present-m
   const el = document.createElement('style')
   el.id = 'spyde-present-md-css'
   el.textContent = `
-.present-md { font-size: 1.15rem; line-height: 1.6; color: #e8e8f0; word-break: break-word; }
+/* Colours come from the deck THEME via custom properties set on the present
+   overlay (themeVars). The literals are the fallback for anything rendering
+   this markdown outside a themed deck. */
+.present-md { font-size: 1.15rem; line-height: 1.6;
+  color: var(--spyde-deck-text, #e8e8f0); word-break: break-word; }
 .present-md > *:first-child { margin-top: 0; }
+/* Headings carry an explicit colour: the BASE .spyde-md sheet hard-codes
+   #cdd6f4 on h1-h6, which wins over the colour .present-md inherits, so
+   without this a themed deck restyled its chrome and its body text while every
+   heading stayed the old lavender.
+   (No backticks in this block — it lives inside a JS template literal.) */
+.present-md h1, .present-md h2, .present-md h3,
+.present-md h4, .present-md h5, .present-md h6 { color: var(--spyde-deck-text, #cdd6f4); }
 .present-md h1 { font-size: 2.4rem; line-height: 1.15; margin: 0 0 1.2rem; font-weight: 700;
   border-bottom: none; padding-bottom: 0; }
 .present-md h2 { font-size: 1.8rem; margin: 1.4rem 0 0.7rem; border-bottom: none; padding-bottom: 0; }
@@ -103,23 +114,26 @@ if (typeof document !== 'undefined' && !document.getElementById('spyde-present-m
   font-size: 0.9em; background: #22222f; padding: 0.1em 0.35em; border-radius: 4px; color: #f5c2e7; }
 .present-md pre { background: #1c1c28; padding: 1rem; border-radius: 8px; overflow-x: auto; }
 .present-md pre code { background: none; padding: 0; color: #cdd6f4; }
-.present-md blockquote { border-left: 4px solid #45475a; margin: 0.8rem 0; padding: 0.2rem 1rem;
-  color: #a6adc8; }
-.present-md a { color: #89b4fa; }
-.present-md strong { color: #ffffff; }
+.present-md blockquote { border-left: 4px solid var(--spyde-deck-accent, #45475a);
+  margin: 0.8rem 0; padding: 0.2rem 1rem;
+  color: var(--spyde-deck-muted, #a6adc8); }
+.present-md a { color: var(--spyde-deck-accent, #89b4fa); }
+.present-md strong { color: var(--spyde-deck-text, #ffffff); }
 .present-md .katex-display { display: block; margin: 1rem 0; text-align: center;
   overflow-x: auto; overflow-y: hidden; }
 /* ── presentation polish: TITLE / SECTION slides ──────────────────────────────
    A title slide centers a large title block — first heading huge, the rest a
    muted subtitle. Scoped to .present-title-md so a content slide is unchanged. */
 .present-title-md { text-align: center; }
-.present-title-md h1 { font-size: 4.2rem; line-height: 1.08; margin: 0 0 0.6rem;
+.present-title-md h1 { color: var(--spyde-deck-text, #cdd6f4);
+  font-size: 4.2rem; line-height: 1.08; margin: 0 0 0.6rem;
   font-weight: 800; letter-spacing: -0.01em; }
-.present-title-md h2 { font-size: 2.2rem; margin: 0.2rem 0; font-weight: 600; color: #cdd6f4; }
-.present-title-md h3 { font-size: 1.6rem; color: #a6adc8; font-weight: 500; }
-.present-title-md p { font-size: 1.6rem; color: #a6adc8; margin: 0.3rem 0; }
+.present-title-md h2 { font-size: 2.2rem; margin: 0.2rem 0; font-weight: 600;
+  color: var(--spyde-deck-text, #cdd6f4); }
+.present-title-md h3 { font-size: 1.6rem; color: var(--spyde-deck-muted, #a6adc8); font-weight: 500; }
+.present-title-md p { font-size: 1.6rem; color: var(--spyde-deck-muted, #a6adc8); margin: 0.3rem 0; }
 .present-title-md h1::after { content: ""; display: block; width: 4rem; height: 3px;
-  margin: 1.2rem auto 0; background: #89b4fa; border-radius: 2px; }
+  margin: 1.2rem auto 0; background: var(--spyde-deck-accent, #89b4fa); border-radius: 2px; }
 /* ── presenter-view speaker notes ─────────────────────────────────────────────
    The big readable notes panel in the presenter dashboard — larger, roomy line
    height, scoped so it doesn't affect the audience slide markdown. */
@@ -195,6 +209,85 @@ export function slideNotes(cells: ReportCell[]): string {
  *  the Slide Overview grid uses the SAME grouping as Present mode. */
 export { groupSlides }
 
+/**
+ * The theme as CSS CUSTOM PROPERTIES on the deck root.
+ *
+ * Variables rather than inline styles on each element: the markdown inside a
+ * slide is `dangerouslySetInnerHTML`, so its h1/p/li/code are styled by the
+ * injected `.present-md` stylesheet and can't take React inline styles at all.
+ * A variable set on the overlay reaches them, and the same value drives the
+ * chrome — one source of truth, no per-element plumbing.
+ */
+function themeVars(t: DeckTheme): React.CSSProperties {
+  return {
+    ['--spyde-deck-bg' as any]: t.bg,
+    ['--spyde-deck-text' as any]: t.text,
+    ['--spyde-deck-muted' as any]: t.muted,
+    ['--spyde-deck-accent' as any]: t.accent,
+    background: t.bg,
+    color: t.text,
+    ...(t.font ? { fontFamily: t.font } : {}),
+  }
+}
+
+/**
+ * Is this footer worth drawing at all?
+ *
+ * IDENTITY only — name, email, note, logo. Deliberately NOT the slide number:
+ * `slide_numbers` defaults to true, so counting it would give every untouched
+ * deck a footer bar it never asked for (and move its page count out of the
+ * pager). The number rides along once there IS a footer; on a deck with no
+ * identity set, the pager keeps showing it exactly as before.
+ */
+function footerHasContent(t: DeckTheme): boolean {
+  return Boolean(t.footer_name || t.footer_email || t.footer_note || t.logo)
+}
+
+/**
+ * The footer bar: logo, name / email / note, and the slide number.
+ *
+ * NOT drawn on a title slide — a title card carries its own attribution and a
+ * repeated footer under it reads as clutter. That is the usual convention and
+ * what was asked for.
+ */
+function SlideFooter({ theme, slideNumber, slideCount }: {
+  theme: DeckTheme
+  slideNumber: number
+  slideCount: number
+}) {
+  const bits = [theme.footer_name, theme.footer_email, theme.footer_note]
+    .map(s => s.trim()).filter(Boolean)
+  return (
+    <div style={styles.footer} data-testid="present-footer">
+      <div style={styles.footerLeft}>
+        {theme.logo && (
+          <img
+            src={theme.logo}
+            alt=""
+            data-testid="present-footer-logo"
+            style={{ ...styles.footerLogo, height: theme.logo_height }}
+          />
+        )}
+        {bits.length > 0 && (
+          <span style={styles.footerText} data-testid="present-footer-text">
+            {bits.map((b, i) => (
+              <React.Fragment key={i}>
+                {i > 0 && <span style={styles.footerSep}>·</span>}
+                {b}
+              </React.Fragment>
+            ))}
+          </span>
+        )}
+      </div>
+      {theme.slide_numbers && (
+        <span style={styles.footerNum} data-testid="present-footer-number">
+          {slideNumber} / {slideCount}
+        </span>
+      )}
+    </div>
+  )
+}
+
 /** mm:ss for an elapsed-seconds count (the presenter timer). */
 function fmtElapsed(sec: number): string {
   const s = Math.max(0, Math.floor(sec))
@@ -210,6 +303,13 @@ export function PresentMode({ initialSlide, onSlideChange, onExit, onLaunchLive 
 
   const slides = useMemo(() => groupSlides(cells), [cells])
   const count = slides.length
+  // The deck's look. The backend always ships a full theme; DECK_THEME_DEFAULTS
+  // covers an older backend that ships none.
+  const theme: DeckTheme = { ...DECK_THEME_DEFAULTS, ...(report?.theme ?? {}) }
+  // Whether the PAGER shows "n / N". Off when the deck's footer already does,
+  // so the projected screen never carries the same number twice.
+  const showPagerCount = !(theme.footer_show && theme.slide_numbers
+                           && footerHasContent(theme))
 
   // Clamp the incoming index into range (a deck edited down mid-excursion could
   // leave it past the end).
@@ -285,7 +385,11 @@ export function PresentMode({ initialSlide, onSlideChange, onExit, onLaunchLive 
   }
 
   return (
-    <div style={styles.overlay} data-testid="present-mode" data-presenter={presenter ? '1' : '0'}>
+    <div
+      style={{ ...styles.overlay, ...themeVars(theme) }}
+      data-testid="present-mode"
+      data-presenter={presenter ? '1' : '0'}
+    >
       {/* Every slide is RENDERED (so figure iframes stay mounted across
           navigation and never tear down); only the active one is displayed.
           In presenter mode the whole audience stack is hidden (kept MOUNTED so
@@ -300,6 +404,9 @@ export function PresentMode({ initialSlide, onSlideChange, onExit, onLaunchLive 
             iframeRefs={iframeRefs}
             replayState={replayState}
             onLaunchLive={onLaunchLive}
+            theme={theme}
+            slideNumber={si + 1}
+            slideCount={count}
           />
         ))}
       </div>
@@ -380,9 +487,17 @@ export function PresentMode({ initialSlide, onSlideChange, onExit, onLaunchLive 
             disabled={index === 0}
             onClick={() => go(index - 1)}
           >‹</button>
-          <span data-testid="present-counter" style={styles.counter}>
-            {index + 1} / {count}
-          </span>
+          {/* The pager's counter is SUPPRESSED when the deck's own footer is
+              already showing slide numbers — the whole window is what gets
+              projected, so both drawing "2 / 2" reads as a bug. The arrows
+              stay: they are navigation, not information. */}
+          {showPagerCount ? (
+            <span data-testid="present-counter" style={styles.counter}>
+              {index + 1} / {count}
+            </span>
+          ) : (
+            <span data-testid="present-counter" style={styles.counterQuiet} aria-hidden />
+          )}
           <button
             data-testid="present-next"
             style={{ ...styles.navBtn, ...(index >= count - 1 ? styles.navBtnDisabled : {}) }}
@@ -614,13 +729,17 @@ function PreviewCell({ cell, titleSlide }: { cell: ReportCell; titleSlide: boole
 // One slide: its cells' rendered content, plus (if any cell carries a
 // live_action) a "Launch live ▶" button. Kept always-mounted; visibility toggled
 // so figure embeds survive navigation.
-function Slide({ cells, active, reportFigures, iframeRefs, replayState, onLaunchLive }: {
+function Slide({ cells, active, reportFigures, iframeRefs, replayState, onLaunchLive,
+                 theme, slideNumber, slideCount }: {
   cells: ReportCell[]
   active: boolean
   reportFigures: ReturnType<typeof useSpyDE>['state']['reportFigures']
   iframeRefs: ReturnType<typeof useSpyDE>['iframeRefs']
   replayState: ReturnType<typeof useSpyDE>['replayState']
   onLaunchLive: (action: LiveAction) => void
+  theme: DeckTheme
+  slideNumber: number
+  slideCount: number
 }) {
   // The go-live handle for this slide: the first cell that carries one.
   const live = cells.find(c => c.live_action)?.live_action as LiveAction | undefined
@@ -701,6 +820,12 @@ function Slide({ cells, active, reportFigures, iframeRefs, replayState, onLaunch
           </div>
         )}
       </div>
+      {/* Footer on every slide EXCEPT the title card (which carries its own
+          attribution). Outside slideInner so it pins to the slide's bottom
+          rather than joining the centred content column. */}
+      {!isTitle && theme.footer_show && footerHasContent(theme) && (
+        <SlideFooter theme={theme} slideNumber={slideNumber} slideCount={slideCount} />
+      )}
     </section>
   )
 }
@@ -942,6 +1067,29 @@ const styles: Record<string, React.CSSProperties> = {
     // Never let the caption be squeezed away when the box above it grows.
     flex: '0 0 auto',
   },
+  // ── Footer bar ──────────────────────────────────────────────────────────────
+  // Pinned to the slide's bottom, INSIDE the slide's horizontal padding, and
+  // clear of the pager (which is centred). flex:0 0 auto so it never competes
+  // with the figures for the vertical budget.
+  footer: {
+    flex: '0 0 auto',
+    display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+    gap: '1.5rem', marginTop: '1.2rem', paddingTop: '0.7rem',
+    borderTop: '1px solid var(--spyde-deck-accent, #89b4fa)',
+    // The keyline is a hint, not a rule — full-strength accent across the whole
+    // slide width reads as a divider competing with the content.
+    borderTopColor: 'color-mix(in srgb, var(--spyde-deck-accent, #89b4fa) 35%, transparent)',
+    fontSize: '0.8rem', lineHeight: 1.3,
+    color: 'var(--spyde-deck-muted, #a6adc8)',
+  },
+  footerLeft: { display: 'flex', alignItems: 'center', gap: '0.9rem', minWidth: 0 },
+  footerLogo: { display: 'block', width: 'auto', objectFit: 'contain', flex: '0 0 auto' },
+  footerText: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  footerSep: { margin: '0 0.5rem', opacity: 0.55 },
+  footerNum: {
+    flex: '0 0 auto', fontVariantNumeric: 'tabular-nums',
+    color: 'var(--spyde-deck-muted, #a6adc8)',
+  },
   liveRow: { marginTop: '1.5rem', textAlign: 'center' },
   liveBtn: {
     background: '#89b4fa', color: '#11111b', border: 'none',
@@ -1075,6 +1223,9 @@ const styles: Record<string, React.CSSProperties> = {
   },
   navBtnDisabled: { color: '#45475a', cursor: 'default' },
   counter: { fontSize: 14, color: '#a6adc8', minWidth: 60, textAlign: 'center' },
+  // Same footprint, no text — keeps the two arrows from jumping together when
+  // the count moves to the deck footer.
+  counterQuiet: { display: 'inline-block', minWidth: 60 },
   emptyMsg: {
     position: 'absolute', top: '50%', left: '50%',
     transform: 'translate(-50%, -50%)', textAlign: 'center',

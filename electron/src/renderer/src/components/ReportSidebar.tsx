@@ -31,6 +31,7 @@ import { AnchoredMenu } from './AnchoredMenu'
 import { GUIDES } from '@guides/index'
 import type { ReportCell as ReportCellType } from '../kernel/protocol'
 import { dlog, dlogOnce } from '../kernel/dragDiag'
+import { ThemePanel, resolveTheme } from './ThemePanel'
 
 const MIN_W = 300
 const MAX_W = 800
@@ -199,6 +200,8 @@ export function ReportSidebar() {
   const [bgPicker, setBgPicker] = useState<{ id: string; el: HTMLElement } | null>(null)
   const bgPickerFor = bgPicker?.id ?? null
   const [addSlideMenu, setAddSlideMenu] = useState(false)
+  // The deck-theme modal (presentations only).
+  const [themeOpen, setThemeOpen] = useState(false)
   const addSlideBtnRef = useRef<HTMLButtonElement>(null)
   // Whole-slide reorder DnD (drag a slide's grip onto another slide group).
   const dragSlideN = useRef<number | null>(null)
@@ -1044,6 +1047,15 @@ export function ReportSidebar() {
             onClick={() => sendAction('report_undo', {})}
           >↶ Undo</button>
         )}
+        {/* Theme — presentations only. Colours, type, footer bar, logo. */}
+        {isPresentation && (
+          <button
+            data-testid="report-theme"
+            style={styles.hdrBtn}
+            title="Deck theme — colours, footer, logo"
+            onClick={() => setThemeOpen(true)}
+          >Theme</button>
+        )}
         {/* Present ▶ — presentations only (a scrolling report has no slides). */}
         {isPresentation && (
           <button
@@ -1310,6 +1322,10 @@ export function ReportSidebar() {
           onChange={onBrowsePicked}
         />
       </div>
+
+      {themeOpen && (
+        <ThemePanel theme={resolveTheme(report.theme)} onClose={() => setThemeOpen(false)} />
+      )}
     </div>
   )
 }
