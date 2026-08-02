@@ -680,7 +680,13 @@ function Slide({ cells, active, reportFigures, iframeRefs, replayState, onLaunch
         ...(active ? styles.slideActive : {}),
         ['--spyde-fig-vh' as any]: `${figVh}vh` }}
     >
-      <div style={{ ...styles.slideInner, ...(isTitle ? styles.slideInnerTitle : {}) }}>
+      <div style={{ ...styles.slideInner,
+        // A slide carrying a figure gets the WIDE column: 60rem is a prose
+        // measure (right for text, wrong for data), and capping a figure slide
+        // at it left most of a wide screen empty while the plot rendered small.
+        // Text-only slides keep the readable measure.
+        ...(visualCells > 0 ? styles.slideInnerWide : {}),
+        ...(isTitle ? styles.slideInnerTitle : {}) }}>
         {cells.map(cell => (
           <React.Fragment key={cell.id}>{renderCell(cell)}</React.Fragment>
         ))}
@@ -844,17 +850,22 @@ const styles: Record<string, React.CSSProperties> = {
   },
   splitRow: {
     display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '2rem',
-    alignItems: 'center', margin: '1rem 0',
+    // STRETCH, not center: the figure pane has to fill the row's height or the
+    // grid sizes to the tallest CONTENT and the slide keeps a band of dead
+    // space under it. The text pane opts back out via splitText's alignSelf.
+    alignItems: 'stretch', margin: '1rem 0',
+    // Grow into the stage like a plain figure cell does.
+    flex: '1 1 var(--spyde-fig-vh, 58vh)', minHeight: 0,
   },
-  splitText: { minWidth: 0, alignSelf: 'center' },
+  splitText: { minWidth: 0, alignSelf: 'center', maxHeight: '100%', overflow: 'hidden' },
   splitFig: {
-    minWidth: 0, display: 'flex', flexDirection: 'column',
+    minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column',
     alignItems: 'center', justifyContent: 'center',
   },
   splitFigBox: {
     position: 'relative', width: '100%',
-    height: 'var(--spyde-fig-vh, 48vh)',
-    flex: '1 1 var(--spyde-fig-vh, 48vh)', minHeight: 0,
+    // Fill the stretched pane rather than a fixed vh (see splitRow).
+    flex: '1 1 auto', minHeight: 0,
     border: '1px solid #313244', borderRadius: 8, overflow: 'hidden',
     background: '#0e0e16',
   },
@@ -873,7 +884,16 @@ const styles: Record<string, React.CSSProperties> = {
     // shrink to share it rather than overflowing.
     display: 'flex', flexDirection: 'column', minHeight: 0,
     flex: '1 1 0',
+    // CENTER the column's content. Load-bearing since `flex: 1 1 0` above: this
+    // box now takes the slide's FULL height, so the slide's own
+    // `justifyContent:center` has no free space left to distribute and stopped
+    // centering anything — a title slide's text jammed against the top of the
+    // stage. Centering HERE restores it, and costs nothing on a slide whose
+    // figures grow to fill (no free space → nothing to center).
+    justifyContent: 'center',
   },
+  // A slide with a figure on it: let the data have the screen.
+  slideInnerWide: { maxWidth: '96rem' },
   // A title slide: content vertically + horizontally centered, tighter column.
   slideTitle: { justifyContent: 'center', textAlign: 'center' },
   slideInnerTitle: { maxWidth: '48rem' },
@@ -883,28 +903,35 @@ const styles: Record<string, React.CSSProperties> = {
     background:
       'radial-gradient(ellipse at 50% 30%, rgba(137,180,250,0.18), transparent 70%), #14141f',
   },
-  figure: { margin: '1rem 0', textAlign: 'center' },
+  // A visual cell is a flex COLUMN that GROWS. The `--spyde-fig-vh` basis still
+  // divides the stage between N figures, but grow:1 means one figure on a
+  // half-empty slide expands into the dead space instead of stopping at 58vh
+  // and leaving the bottom third of the screen blank.
+  figure: {
+    margin: '1rem 0', textAlign: 'center',
+    display: 'flex', flexDirection: 'column',
+    flex: '1 1 var(--spyde-fig-vh, 58vh)', minHeight: 0,
+  },
   figBox: {
     // position:relative is LOAD-BEARING — SeamlessFigureFrame's frameHost is
     // `position:absolute; inset:0`, so it anchors to the nearest positioned
     // ancestor. Without this the iframe escaped its box and filled the whole
     // slide.
     position: 'relative',
-    // The slide sets --spyde-fig-vh so N figures share the stage; 58vh is the
-    // single-figure fallback (and what a stray box outside a slide gets).
-    width: '100%', height: 'var(--spyde-fig-vh, 58vh)',
-    // flex-shrink so several figures share the stage instead of overflowing it;
-    // minHeight:0 is required or a flex item refuses to go below its content.
-    flex: '1 1 var(--spyde-fig-vh, 58vh)', minHeight: 0,
+    // Fill whatever height the <figure> above was given, minus the caption.
+    // (The vh budget lives on the <figure> now — a fixed height here would
+    // pin the box and re-open the dead-space gap.)
+    width: '100%', flex: '1 1 auto', minHeight: 0,
     border: '1px solid #313244', borderRadius: 8, overflow: 'hidden',
     background: '#0e0e16',
   },
   figImg: { maxWidth: '100%', maxHeight: '100%', height: 'auto' },
-  // A photo cell on a slide — large + centered, capped so it stays on-screen
-  // with room for the caption.
+  // A photo cell on a slide — fills its share of the stage, aspect preserved.
   slideImg: {
     display: 'block', margin: '0 auto',
-    maxWidth: '100%', maxHeight: '68vh', height: 'auto', borderRadius: 8,
+    maxWidth: '100%', maxHeight: '100%',
+    flex: '1 1 auto', minHeight: 0,
+    objectFit: 'contain', borderRadius: 8,
   },
   figPending: {
     display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -912,6 +939,8 @@ const styles: Record<string, React.CSSProperties> = {
   },
   figCaption: {
     marginTop: '0.5rem', fontSize: '0.85rem', color: '#a6adc8', fontStyle: 'italic',
+    // Never let the caption be squeezed away when the box above it grows.
+    flex: '0 0 auto',
   },
   liveRow: { marginTop: '1.5rem', textAlign: 'center' },
   liveBtn: {
