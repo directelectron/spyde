@@ -77,23 +77,34 @@ async function panelPixelCounts(page: any, cols: number): Promise<number[]> {
   for (const frame of target) {
     try {
       const out = await frame.evaluate((nCols: number) => {
-        const canvases = Array.from(document.querySelectorAll('canvas')) as HTMLCanvasElement[]
-        if (!canvases.length) return null
-        const cv = canvases.sort((a, b) => (b.width * b.height) - (a.width * a.height))[0]
-        const c2 = cv.getContext('2d')
-        if (!c2) return null
-        const { width, height } = cv
-        const bandW = Math.floor(width / nCols)
-        const res: number[] = []
-        for (let c = 0; c < nCols; c++) {
-          const img = c2.getImageData(c * bandW, 0, bandW, height).data
-          let n = 0
-          for (let i = 0; i < img.length; i += 4) {
-            if (img[i] > 60 || img[i + 1] > 60 || img[i + 2] > 60) n++
-          }
-          res.push(n)
+        // Score EVERY 2-D canvas and keep the one carrying the most drawn
+        // pixels. Picking the LARGEST is wrong: anyplotlib stacks a transparent
+        // widget-overlay canvas at the same size over the plot, so "largest"
+        // can land on a canvas that is empty by construction.
+        const cvs = Array.from(document.querySelectorAll('canvas')) as HTMLCanvasElement[]
+        let best: number[] | null = null
+        let bestTotal = -1
+        for (const cv of cvs) {
+          if (!cv.width || !cv.height) continue
+          const c2 = cv.getContext('2d')
+          if (!c2) continue                      // WebGL/WebGPU surface
+          const bandW = Math.floor(cv.width / nCols)
+          if (bandW <= 0) continue
+          const res: number[] = []
+          let total = 0
+          try {
+            for (let c = 0; c < nCols; c++) {
+              const img = c2.getImageData(c * bandW, 0, bandW, cv.height).data
+              let n = 0
+              for (let i = 0; i < img.length; i += 4) {
+                if (img[i] > 60 || img[i + 1] > 60 || img[i + 2] > 60) n++
+              }
+              res.push(n); total += n
+            }
+          } catch { continue }                   // tainted canvas
+          if (total > bestTotal) { bestTotal = total; best = res }
         }
-        return res
+        return best
       }, cols)
       if (out && out.length) return out
     } catch { /* cross-origin / detached frame */ }
