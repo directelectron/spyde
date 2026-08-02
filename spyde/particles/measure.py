@@ -128,6 +128,7 @@ def measure_frame(
     background_ring: int = 3,
     min_area_px: int = 0,
     fast: bool | None = None,
+    want_contours: bool = True,
 ) -> tuple[np.ndarray, list[np.ndarray]]:
     """Measure every instance in *labels*.
 
@@ -153,6 +154,13 @@ def measure_frame(
         Force the vectorised property path on/off. ``None`` reads
         ``SPYDE_PARTICLE_PROPS``. The two paths are asserted equal column by
         column in ``test_particles_props_parity.py``.
+    want_contours
+        Extract the per-instance outlines. ``False`` returns an EMPTY contour
+        list and skips that work — for a caller that only needs the measured
+        properties. Every stored result needs the outlines (the 1:1
+        correspondence below is what ``SpyDEParticles.from_frames`` requires),
+        so this is only safe for a transient consumer such as a live preview
+        that has already decided the instances are too numerous to draw.
 
     Returns
     -------
@@ -161,7 +169,8 @@ def measure_frame(
         :data:`spyde.signals.particles.COLUMNS`, with ``track_id`` set to -1.
         ``contours`` is a list of ``(k, 2)`` int16 ``(y, x)`` outlines, one per
         row and in the same order — the 1:1 correspondence
-        ``SpyDEParticles.from_frames`` requires.
+        ``SpyDEParticles.from_frames`` requires. Empty when *want_contours* is
+        False, which breaks that correspondence by design.
     """
     lab = np.asarray(labels)
     if lab.ndim != 2:
@@ -217,10 +226,17 @@ def measure_frame(
     if inten is not None:
         _fill_intensity(rows, lab, inten, tbl, keep, background_ring, fast=fast)
 
-    contours = _contours(lab, tbl, fast=fast)
+    # Outlines are ~half the cost of a measure once the instance count runs into
+    # the thousands (measured on a 1024² over-segmented frame: 647 ms total, of
+    # which the 4873 contours are the bulk; the same frame filtered to 17
+    # instances measures in 62 ms). The live PREVIEW asks for them only when it
+    # is actually going to draw them, which it will not do above the overlay's
+    # draw cap. Every other caller keeps the default and is unaffected.
+    contours = _contours(lab, tbl, fast=fast) if want_contours else []
 
     rows = rows[keep]
-    contours = [c for c, k in zip(contours, keep) if k]
+    if want_contours:
+        contours = [c for c, k in zip(contours, keep) if k]
     # Score LAST: it is derived from the intensity columns filled above, so it
     # costs no extra pass over the frame. That is what lets the caret filter on
     # it without re-segmenting — see `particle_scores`.

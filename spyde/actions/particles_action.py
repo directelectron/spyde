@@ -260,6 +260,36 @@ class SegmentWizard(WizardController):
             log.debug("[seg] reading signal calibration failed: %s", exc)
             return 1.0, "px"
 
+    def set_params(self, payload: dict | None, *, merge: bool = False) -> None:
+        """Coerce *payload* into ``self.params``, WITH the signal's scale.
+
+        The one place params are assigned, because of the second line. The face
+        controls `merge_nm` / `min_nm` are physical, and :func:`_nm_to_px`
+        converts them with ``p["scale"]`` — but :func:`_coerce` builds `p` from
+        the ``DEFAULTS`` keys alone, so nothing put a scale there and the
+        conversion took its uncalibrated branch on EVERY signal. The slider said
+        "50 nm" and the backend merged at 50 *pixels*: silent, and wrong by
+        exactly the magnification. Stashing it at dispatch is what `_nm_to_px`
+        already documents ("stashed on the params at dispatch"); it just was
+        never done.
+
+        Assigning `wiz.params = _coerce(...)` directly re-opens that hole, so
+        don't — the scale is only correct if it is refreshed here, on the
+        DISPLAYED node, which is what a rebinned or cropped view changes.
+
+        The stashed value is **nm per pixel**, not the raw axis scale, and it is
+        0.0 when the axis is not a real-space length at all. A signal calibrated
+        in `nm^-1` reported a perfectly good positive scale, so converting
+        against it produced a merge radius that was silently wrong by the camera
+        length; 0.0 routes those signals to the pixel fallback instead, and
+        `_face_units` relabels the sliders so the caret does not claim nm.
+        """
+        base = {**self.params, **(payload or {})} if merge else payload
+        p = _coerce(base)
+        scale, units = self.scale_units()
+        p["scale"] = _length_nm_per_px(scale, units)
+        self.params = p
+
     def frame_index(self) -> int:
         """Where the navigator is sitting.
 
@@ -325,7 +355,7 @@ class SegmentWizard(WizardController):
             self.tree._seg_wizard = None
 
     def set_overlay(self, contours=None, box=None, labels=None,
-                    full_shape=None) -> None:
+                    full_shape=None, n_instances=None) -> None:
         """Draw (or clear) the previewed instances as OUTLINES on the source plot.
 
         Outlines and not a translucent raster mask, for two independent reasons —
@@ -362,7 +392,14 @@ class SegmentWizard(WizardController):
         # path the renderer re-transforms every pan/zoom frame. Above the
         # threshold draw ONE mask instead; the particle COUNT and every
         # measurement are unaffected, only how they are drawn.
-        n = len(contours) if contours is not None else 0
+        # The true instance count, which is NOT `len(contours)`: the preview
+        # skips outline extraction above the draw cap precisely because this
+        # branch is about to discard them. Keying the decision off the contour
+        # list would then read "0 instances", fall through to the polygon path,
+        # draw nothing, and leave the frame bare in exactly the case that most
+        # needs a mask.
+        n = n_instances if n_instances is not None else (
+            len(contours) if contours is not None else 0)
         if n > _RASTER_ABOVE and labels is not None:
             if self._set_raster_overlay(labels, box, full_shape):
                 self._ov_raster = True
@@ -380,6 +417,19 @@ class SegmentWizard(WizardController):
                 return
         self._clear_raster_overlay()
         polys = _contour_polys(contours, box)
+        # HARD CAP, independent of `_RASTER_ABOVE`. Reaching here with a huge n
+        # means the raster path was unavailable or failed, and the honest answer
+        # is then "too many to draw" — NOT 14028 paths the renderer must
+        # re-transform on every pan and zoom frame. That is a hang, and because
+        # thousands of translucent fills overlap into one flat sheet it is not
+        # even a legible one: the user sees a solid green block and no data.
+        # The COUNT still reports every instance; only the drawing is dropped,
+        # and the caret says so rather than leaving a silently empty frame.
+        if len(polys) > _MAX_OUTLINE_POLYS:
+            log.warning("[seg] %d outlines exceeds the %d draw cap and the raster "
+                        "overlay was unavailable; drawing none",
+                        len(polys), _MAX_OUTLINE_POLYS)
+            polys = []
         updates = {group: {"vertices_list": polys}}
         # The preview window's own outline. Without it "only the middle of my
         # 4k frame has any segmentation" reads as a BUG rather than as the
@@ -411,17 +461,22 @@ class SegmentWizard(WizardController):
         transparent 2-D canvas that sits ABOVE the WebGPU canvas — so this works
         on a GPU-rendered base, which a marker-layer raster would not.
 
-        THE TILING TRAP. When a large frame is in tile mode the renderer's mask
-        check is ``bytes.length === iw * ih`` where ``iw = base_width ||
-        image_width`` — i.e. the OVERVIEW size, not the native frame. A
-        native-resolution mask therefore fails that check and is dropped
-        SILENTLY: no error, no overlay, and nothing in the log to say why. So
-        the mask is built at the frame size and then reduced to the overview
-        grid whenever ``base_width`` is set.
+        THE TILING TRAP, and why the reduction is NOT done here any more. When a
+        large frame is in tile mode the renderer sizes the mask against
+        ``base_width || image_width`` — the OVERVIEW grid — while tile mode sets
+        ``image_width`` to the FULL native frame. This method used to reduce the
+        mask to the overview grid itself, which was right for the renderer and
+        REJECTED by ``set_overlay_mask``'s own shape check (it compared against
+        the image shape). The ``ValueError`` landed in the ``except`` below, was
+        logged at DEBUG, and every large-frame preview fell back to N polygons —
+        so on a 4096² frame the raster path could never run, which is precisely
+        the case it was added for. At N=14028 that fallback is what hangs the
+        renderer and paints the frame a solid sheet of green.
 
-        The reduction is a block ANY, not a subsample: particles here are often
-        a few pixels across, and a strided sample of a 4096² mask at 1024²
-        drops three quarters of them at random.
+        anyplotlib now accepts a full-resolution mask in tile mode and does the
+        block-ANY reduction itself (``_reduce_mask_any``), so there is ONE owner
+        of that arithmetic and it cannot disagree with the shape check sitting
+        next to it. Hand it the native-resolution mask and let it decide.
         """
         plot2d = getattr(self.src_plot, "_plot2d", None)
         if plot2d is None or not hasattr(plot2d, "set_overlay_mask"):
@@ -438,24 +493,15 @@ class SegmentWizard(WizardController):
                 mask[y0:y0 + h, x0:x0 + w] = lab[:h, :w] > 0
             else:
                 mask[:lab.shape[0], :lab.shape[1]] = lab > 0
-
-            state = getattr(plot2d, "_state", {}) or {}
-            bw, bh = int(state.get("base_width") or 0), int(state.get("base_height") or 0)
-            if bw > 0 and bh > 0 and (bw, bh) != (fw, fh):
-                ys = max(1, fh // bh)
-                xs = max(1, fw // bw)
-                # Block ANY via a reshape-reduce, then pad/crop to exactly the
-                # overview grid — the renderer's length check is exact.
-                cut = mask[:(fh // ys) * ys, :(fw // xs) * xs]
-                small = cut.reshape(fh // ys, ys, fw // xs, xs).any(axis=(1, 3))
-                out = np.zeros((bh, bw), bool)
-                sh, sw = min(bh, small.shape[0]), min(bw, small.shape[1])
-                out[:sh, :sw] = small[:sh, :sw]
-                mask = out
             plot2d.set_overlay_mask(mask, color=_PREVIEW_COLOR, alpha=_RASTER_ALPHA)
             return True
         except Exception as exc:
-            log.debug("[seg] raster overlay failed (%s); using outlines", exc)
+            # WARNING, not debug. The fallback from here is N polygons, and N is
+            # only large enough to be here because it was already too large to
+            # draw — so a silent failure trades a missing overlay for a hung
+            # renderer. If this line appears, that is the bug.
+            log.warning("[seg] raster overlay failed (%s); falling back to outlines",
+                        exc)
             return False
 
     def _clear_raster_overlay(self) -> None:
@@ -480,10 +526,18 @@ class SegmentWizard(WizardController):
         Clearing the outlines here is the other half of the fix — switching to
         an untrained engine must not leave the previous one's instances on
         screen looking like the new engine's answer.
+
+        BOTH drawing routes, which is the half that was missing. This cleared
+        the vector outlines and left any RASTER mask in place, so above
+        `_RASTER_ABOVE` instances the previous engine's result survived the
+        switch untouched. On the Scribble tab that is not merely stale, it is
+        disabling: the mask covers the image you have to paint on, and the
+        reported symptom was exactly "moved to scribble, immediately unusable".
         """
         plot2d = getattr(self.src_plot, "_plot2d", None)
         if plot2d is None:
             return
+        self._clear_raster_overlay()
         try:
             _n, get_frame, _shape = self.frames()
             _frame, box = _preview_window(np.asarray(get_frame(self.frame_index())))
@@ -623,6 +677,19 @@ class SegmentWizard(WizardController):
         if prev is None or self.session is None:
             emit_error("Segment Particles: nothing previewed to commit")
             return None
+        # `SpyDEParticles.from_frames` requires one contour PER ROW, in order.
+        # The preview skips outline extraction above the draw cap, so committing
+        # that preview would build a store whose outlines silently do not
+        # correspond to its rows. Refuse, and say why — the only way to be here
+        # is a preview with thousands of instances, which is the failed-threshold
+        # case (`_threshold_failed`) and not something worth committing anyway.
+        if len(prev["contours"]) != len(prev["rows"]):
+            emit_error(
+                f"Segment Particles: {len(prev['rows'])} instances is too many "
+                "to commit as outlines — this is usually a threshold that "
+                "landed in the noise. Tighten the size filter, or train the "
+                "Scribble classifier, then commit.")
+            return None
         return commit_single_frame(
             self.session, self, prev["labels"], prev["rows"], prev["contours"],
             int(prev["frame"]))
@@ -695,14 +762,52 @@ def _segment_kwargs(p: dict) -> dict:
     )
 
 
+#: Axis units that are a REAL-SPACE LENGTH, and their size in nanometres. The
+#: face controls are in nm, so an axis calibrated in µm or Å converts through
+#: this rather than being divided by a raw number in the wrong unit.
+#:
+#: Anything NOT in here — `nm^-1` and friends from a reciprocal-space signal,
+#: `mrad`, `px`, an empty unit — is not a length, and then there is no physical
+#: distance to convert to. Those signals fall back to PIXELS and the caret
+#: relabels the two sliders accordingly (`_face_units`). A reciprocal axis is
+#: the case that made this necessary: dividing a nanometre by a value in nm⁻¹
+#: is dimensionally meaningless, and it silently produced a merge radius wrong
+#: by whatever the camera length happened to be.
+_NM_PER: dict[str, float] = {
+    "m": 1e9, "cm": 1e7, "mm": 1e6,
+    "um": 1e3, "µm": 1e3, "μm": 1e3, "micron": 1e3,
+    "nm": 1.0,
+    "a": 0.1, "å": 0.1, "ang": 0.1, "angstrom": 0.1,
+    "pm": 1e-3,
+}
+
+
+def _length_nm_per_px(scale: float, units: str) -> float:
+    """*scale* in nm/px, or 0.0 when the axis is not a real-space length."""
+    try:
+        s = float(scale)
+    except (TypeError, ValueError):
+        return 0.0
+    if not (s > 0):
+        return 0.0
+    factor = _NM_PER.get(str(units or "").strip().lower())
+    return s * factor if factor else 0.0
+
+
+def _face_units(scale: float, units: str) -> str:
+    """What the two face sliders are actually in: 'nm' or 'px'."""
+    return "nm" if _length_nm_per_px(scale, units) > 0 else "px"
+
+
 def _nm_to_px(value_nm: float, p: dict) -> float:
     """A face control in nanometres -> pixels, using the signal's own scale.
 
     The face controls are physical so they mean the same thing at any
     magnification, and so the number matches what the scale bar says. `scale` is
-    stashed on the params at dispatch (nm per pixel); a missing or zero scale
-    means the signal is uncalibrated, and then the value IS pixels rather than
-    being silently divided by nothing.
+    stashed on the params at dispatch **already converted to nm per pixel**
+    (:meth:`SegmentWizard.set_params`); a missing or zero scale means the signal
+    is uncalibrated *or its axis is not a length at all*, and then the value IS
+    pixels rather than being silently divided by a number in the wrong unit.
     """
     try:
         v = float(value_nm or 0.0)
@@ -961,9 +1066,52 @@ _PREVIEW_WINDOW_COLOR = "#cdd6f4"
 #: they are crisp at any zoom and each is a real object the UI can hover.
 _RASTER_ABOVE = 100
 
+#: The absolute ceiling on polygons handed to the renderer, whatever route got
+#: us here. `_RASTER_ABOVE` chooses the nicer drawing; this one is the seatbelt
+#: for when the raster is unavailable or fails, because the fallback used to be
+#: unbounded — a report of 14028 instances on a real in-situ frame meant 14028
+#: filled paths, which hangs the renderer and composites into one flat green
+#: sheet that shows nothing at all. Well above any legitimate outline count.
+_MAX_OUTLINE_POLYS = 1500
+
 #: The raster overlay's colour/opacity. Deliberately the same green as the
 #: vector outlines so crossing the threshold does not look like a mode change.
 _RASTER_ALPHA = 0.45
+
+#: A preview that calls this much of the window foreground, AND shatters it into
+#: this many pieces, is a FAILED THRESHOLD being reported as a result.
+#:
+#: Measured on a synthetic stand-in for the reported frame (low-contrast noisy
+#: support film, 8 faint dark particles, 1024²) — a global threshold has no
+#: bimodal histogram to find here, so otsu lands in the middle of the noise:
+#:
+#:     defaults ............................. 4873 instances, 39% coverage
+#:     min_size=200 .......................... 208 instances, 14% coverage
+#:     min_size=2000 .......................... 17 instances, 7.2% coverage
+#:     watershed off .......................... 751 instances, 40% coverage
+#:     gaussian=2 + min_size=200 + no watershed . 8 instances, 52% coverage
+#:
+#: The last row is the trap and the reason the test is on BOTH numbers: 8
+#: instances looks like the 8 real particles, but at 52% coverage those 8 bodies
+#: ARE the film. Neither number alone is diagnostic — a genuinely crowded frame
+#: can be 40% covered by real particles, and a coarse threshold can find 8 real
+#: objects. Together they are: thousands of pieces AND half the frame is the
+#: signature of noise being segmented.
+#:
+#: Deliberately NOT a silent auto-correction. The plan's §0.9 answer to this
+#: data is the scribble classifier, and no threshold tweak substitutes for it —
+#: so the caret's job is to say the threshold failed and point at Scribble, not
+#: to quietly pick different parameters that fail differently.
+_FAIL_COVERAGE = 0.25
+_FAIL_COUNT = 500
+
+
+def _threshold_failed(count: int, coverage: float) -> bool:
+    """True when a preview is noise being reported as particles.
+
+    Both conditions, for the reason spelled out on `_FAIL_COVERAGE`.
+    """
+    return count >= _FAIL_COUNT and coverage >= _FAIL_COVERAGE
 
 
 def _box_poly(box) -> list:
@@ -1107,12 +1255,26 @@ def _preview(wiz: SegmentWizard, gen: int) -> None:
         t0 = time.perf_counter()
         labels = engine(frame)
         from spyde.particles import measure_frame
-        rows, contours = measure_frame(labels, frame, t=t, scale=scale)
+        # Outlines only when they can actually be drawn. `labels.max()` is the
+        # instance count for the price of one pass, and above the draw cap the
+        # overlay discards the polygons anyway — extracting thousands of them
+        # first is pure latency on the tune the user is waiting for (measured:
+        # ~half of a 1353 ms preview at 4873 instances). The measured PROPERTIES
+        # are all still computed, so the count, the histogram, the median and
+        # the confidence filter are unaffected.
+        n_lab = int(np.asarray(labels).max()) if np.asarray(labels).size else 0
+        rows, contours = measure_frame(
+            labels, frame, t=t, scale=scale,
+            want_contours=n_lab <= _MAX_OUTLINE_POLYS)
         n_all = len(rows)
         rows, contours = filter_by_score(rows, contours, p.get("min_score", 0.0))
+        # What FRACTION of the previewed window was called foreground. This is
+        # the one number that separates "found the particles" from "the
+        # threshold landed inside the noise" — see `_threshold_failed`.
+        coverage = float((np.asarray(labels) > 0).mean()) if labels.size else 0.0
         return {"frame": t, "labels": labels, "rows": rows, "n_all": n_all,
                 "contours": contours, "elapsed": time.perf_counter() - t0,
-                "box": box, "full_shape": full.shape}
+                "coverage": coverage, "box": box, "full_shape": full.shape}
 
     def _done(res):
         # Release the navigator gate BEFORE the generation guard: a superseded or
@@ -1136,7 +1298,8 @@ def _preview(wiz: SegmentWizard, gen: int) -> None:
         # full-frame array first — at 4096² that array alone was 16 MB per frame.
         wiz.set_overlay(res["contours"], res.get("box"),
                         labels=res.get("labels"),
-                        full_shape=res.get("full_shape"))
+                        full_shape=res.get("full_shape"),
+                        n_instances=int(len(rows)))
         # The count reported is the count AFTER the size filter (plan §0.9b) —
         # `split_instances` applies min_size last, so `rows` is already filtered
         # and this number is the one the histogram below describes.
@@ -1156,6 +1319,18 @@ def _preview(wiz: SegmentWizard, gen: int) -> None:
             # 4096² frame where only the middle megapixel was looked at.
             "preview_box": (None if res.get("box") is None
                             else [int(v) for v in res["box"]]),
+            # The threshold-failure verdict (see `_threshold_failed`). Reported
+            # rather than silently swallowed: the count is still true, it just
+            # is not an ANSWER, and the caret has to say which of the two it is
+            # holding.
+            "coverage": round(float(res.get("coverage") or 0.0), 4),
+            "threshold_failed": _threshold_failed(
+                int(len(rows)), float(res.get("coverage") or 0.0)),
+            # What the two FACE sliders are in — 'nm' on a real-space axis, 'px'
+            # when the axis is not a length (a reciprocal-space signal reports a
+            # healthy positive scale in nm^-1, and labelling that 'nm' is a
+            # claim about the scale bar that is simply false).
+            "face_units": _face_units(scale, units),
         })
         if p["min_size_floored"]:
             emit_status(
@@ -1191,14 +1366,14 @@ def seg_open(session, plot, payload) -> None:
     if existing is not None and not existing._closed:
         # Idempotent re-open: adopt the new parameters and re-preview rather
         # than building a second controller with its own scribbles.
-        existing.params = _coerce(payload)
+        existing.set_params(payload)
         gen = existing.guard()
         _emit_state(existing)
         _preview(existing, gen)
         return
 
     wiz = SegmentWizard(session, tree, src)
-    wiz.params = _coerce(payload)
+    wiz.set_params(payload)
     # BEFORE anything deferred: React StrictMode fires open/close/open
     # synchronously, so the close's bump must be able to invalidate this open.
     gen = wiz.guard()
@@ -1253,7 +1428,7 @@ def seg_tune(session, plot, payload) -> None:
     wiz = _wizard(session, plot)
     if wiz is None:
         return
-    wiz.params = _coerce({**wiz.params, **(payload or {})})
+    wiz.set_params(payload, merge=True)
     # Paint state must reach the WIDGET, not just the params dict — the widget is
     # what tags a stroke, so a class change that stops here paints the old colour.
     _sync_brush(wiz)
@@ -1716,7 +1891,7 @@ def seg_run(session, plot, payload) -> None:
     if wiz is None:
         wiz = SegmentWizard(session, tree, src)
         tree._seg_wizard = wiz
-    wiz.params = _coerce({**wiz.params, **(payload or {})})
+    wiz.set_params(payload, merge=True)
     p = dict(wiz.params)
 
     engine = _engine(wiz, p)

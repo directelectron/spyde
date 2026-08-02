@@ -527,6 +527,226 @@ class TestCoercion:
             pa.DEFAULTS["min_separation"]
 
 
+class TestPhysicalFaceControls:
+    """`merge_nm` / `min_nm` are the two controls on the caret's face, and they
+    are in NANOMETRES — so the whole feature is the nm→px conversion.
+
+    It was dead on arrival. ``_nm_to_px`` divides by ``p["scale"]`` and falls
+    back to "the value IS pixels" when there is no scale, which is the right
+    behaviour for an uncalibrated signal — but ``_coerce`` builds the dict from
+    the ``DEFAULTS`` keys alone, so no dispatch path ever put a scale in it and
+    EVERY signal took the uncalibrated branch. A slider reading "50 nm" merged
+    at 50 pixels, wrong by exactly the magnification and silent about it.
+
+    Hence the first test: it asserts the scale is on the params after each
+    dispatch verb, which is the thing that was missing, rather than asserting
+    ``_nm_to_px`` divides — that part was always correct.
+    """
+
+    def test_every_dispatch_stashes_the_signal_scale(self, window):
+        session, plot, _tree, wiz = _opened(window)
+        scale = wiz.scale_units()[0]
+        assert scale > 0, "the fixture must be calibrated or this proves nothing"
+
+        assert wiz.params["scale"] == scale, "seg_open did not stash the scale"
+        pa.seg_tune(session, plot, {"merge_nm": 30.0})
+        assert _wait(lambda: wiz.params.get("merge_nm") == 30.0)
+        assert wiz.params["scale"] == scale, "seg_tune dropped the scale"
+        pa.seg_set_method(session, plot, {"method": "classical"})
+        assert wiz.params["scale"] == scale, "seg_set_method dropped the scale"
+
+    # The particle fixture is calibrated at 1.0 nm/px, which makes every
+    # conversion below the identity — so these pass an explicit NON-UNIT scale
+    # instead of reading the fixture's. At 1.0 the arithmetic tests hold whether
+    # or not the conversion happens at all, which is exactly how it shipped
+    # unconverted. Only the dispatch test above needs a real wizard.
+
+    def test_merge_nm_reaches_the_solver_in_PIXELS(self):
+        """A nm distance must be divided by the scale before it is a radius."""
+        p = pa._coerce({"merge_nm": 30.0})
+        assert pa._segment_kwargs({**p, "scale": 0.4})["merge_distance"] == \
+            pytest.approx(75.0)
+
+    def test_min_nm_is_a_DIAMETER_and_converts_through_the_AREA(self):
+        """`min_size` filters on AREA, so handing it a diameter straight over
+        under-filters by a factor of ~d — a face control that barely does
+        anything is worse than one that is not there."""
+        p = pa._coerce({"min_nm": 20.0})
+        d_px = 20.0 / 0.4
+        assert pa._min_size_px({**p, "scale": 0.4}) == \
+            int(round(np.pi / 4.0 * d_px * d_px))
+        # and not the diameter, which is the plausible wrong answer
+        assert pa._min_size_px({**p, "scale": 0.4}) != int(d_px)
+
+    def test_min_nm_wins_over_the_pixel_min_size(self):
+        """Both exist (one on the face, one in Advanced) and they filter the same
+        thing, so the physical one has to be the tie-break — otherwise the face
+        control is silently overridden by a value the user cannot see."""
+        p = pa._coerce({"min_nm": 20.0, "min_size": 25})
+        assert pa._min_size_px({**p, "scale": 0.4}) != 25
+        assert pa._min_size_px({**p, "min_nm": 0.0, "scale": 0.4}) == 25
+
+    def test_an_uncalibrated_signal_reads_the_value_as_pixels(self):
+        """No scale is the only case where nm==px is correct, and it must not
+        divide by zero to get there."""
+        assert pa._nm_to_px(12.0, {}) == 12.0
+        assert pa._nm_to_px(12.0, {"scale": 0.0}) == 12.0
+        assert pa._nm_to_px(0.0, {"scale": 0.5}) == 0.0
+
+    def test_a_length_axis_converts_through_NANOMETRES(self):
+        """An axis in µm or Å is still a length; the slider is still nm."""
+        assert pa._length_nm_per_px(2.0, "nm") == pytest.approx(2.0)
+        assert pa._length_nm_per_px(2.0, "um") == pytest.approx(2000.0)
+        assert pa._length_nm_per_px(2.0, "µm") == pytest.approx(2000.0)
+        assert pa._length_nm_per_px(2.0, "Å") == pytest.approx(0.2)
+        # ...so "20 nm" is 10 px at 2 nm/px and 0.01 px at 2 µm/px.
+        assert pa._nm_to_px(20.0, {"scale": pa._length_nm_per_px(2.0, "nm")}) \
+            == pytest.approx(10.0)
+
+    def test_a_RECIPROCAL_axis_is_not_a_length_and_falls_back_to_pixels(self):
+        """The reported bug: the caret said 'nm' on an axis reading nm⁻¹.
+
+        A reciprocal-space signal reports a perfectly healthy positive scale, so
+        the conversion ran and produced a merge radius wrong by whatever the
+        camera length was — silently, because nothing checked the UNIT. There is
+        no distance to convert to here, so the controls are pixels and the caret
+        has to relabel; claiming nm is a claim about the scale bar that is false.
+        """
+        for units in ("nm^-1", "1/nm", "nm⁻¹", "mrad", "px", "", None):
+            assert pa._length_nm_per_px(0.9, units) == 0.0, units
+            assert pa._face_units(0.9, units) == "px", units
+        assert pa._face_units(0.5, "nm") == "nm"
+        # and the pixel fallback is the IDENTITY, not a division by a number in
+        # the wrong unit
+        assert pa._nm_to_px(30.0, {"scale": pa._length_nm_per_px(0.9, "nm^-1")}) \
+            == 30.0
+
+    def test_the_wizard_stashes_nm_per_px_not_the_raw_axis_scale(self, window):
+        _s, _p, _t, wiz = _opened(window)
+        scale, units = wiz.scale_units()
+        assert wiz.params["scale"] == pytest.approx(
+            pa._length_nm_per_px(scale, units))
+
+
+class TestThresholdFailureIsNotAResult:
+    """14028 'particles' covering the frame is a failed threshold, not an answer.
+
+    Measured on a low-contrast noisy stand-in for the reported frame: otsu has
+    no bimodal histogram to find, lands inside the noise, and the split shatters
+    the support film. `min_size` alone moves 4873 -> 17 instances but coverage
+    only 39% -> 7%, and the settings that DO yield 8 instances cover 52% of the
+    frame -- those 8 bodies ARE the film. So neither number alone is diagnostic
+    and the verdict needs both.
+    """
+
+    def test_both_conditions_are_required(self):
+        assert pa._threshold_failed(5000, 0.40) is True
+        # A crowded frame of REAL particles: many instances, but they do not
+        # blanket the frame.
+        assert pa._threshold_failed(5000, 0.05) is False
+        # A coarse threshold that found a few big real objects.
+        assert pa._threshold_failed(12, 0.40) is False
+        assert pa._threshold_failed(0, 0.0) is False
+
+    def test_a_normal_preview_is_not_flagged(self, window):
+        """The fixture must stay UNflagged or the notice is just noise."""
+        session, plot, _tree, _wiz = _opened(window)
+        msgs = window["messages"]
+        pa.seg_tune(session, plot, {"sensitivity": 0.55})
+        assert _wait(lambda: len(_of_type(msgs, "seg_preview")) >= 2)
+        msg = _of_type(msgs, "seg_preview")[-1]
+        assert msg["threshold_failed"] is False, msg
+        assert 0.0 <= msg["coverage"] <= 1.0
+
+    def test_the_preview_reports_coverage_and_face_units(self, window):
+        session, plot, _tree, _wiz = _opened(window)
+        msgs = window["messages"]
+        pa.seg_tune(session, plot, {"sensitivity": 0.5})
+        assert _wait(lambda: len(_of_type(msgs, "seg_preview")) >= 2)
+        msg = _of_type(msgs, "seg_preview")[-1]
+        assert "coverage" in msg and "face_units" in msg
+        assert msg["face_units"] in ("nm", "px")
+
+
+class TestOutlineDrawCap:
+    """No route may hand the renderer an unbounded number of polygons.
+
+    `_RASTER_ABOVE` picks the nicer drawing; this cap is the seatbelt for when
+    the raster is unavailable. It had none, so a tile-mode raster failure fell
+    back to one filled path per instance -- 14028 of them, which hangs the
+    renderer and composites into a flat green sheet showing nothing.
+    """
+
+    def test_the_cap_is_well_above_any_real_outline_count(self):
+        assert pa._MAX_OUTLINE_POLYS > pa._RASTER_ABOVE * 5
+
+    def test_a_huge_contour_list_draws_NONE_rather_than_all(self, monkeypatch):
+        import types
+        pushed = {}
+        monkeypatch.setattr(pa, "_push_groups", lambda p, u: pushed.update(
+            {g.name: pl.get("vertices_list") for g, pl in u.items()}))
+
+        w = object.__new__(pa.SegmentWizard)
+        w._ov_group = None
+        w._ov_box_group = None
+        w._ov_raster = False
+        w._ov_cleared = False
+        w._ov_box_state = None
+        # No `set_overlay_mask` on this plot => the raster path is unavailable,
+        # which is exactly the state the tile-mode ValueError used to produce.
+        w.src_plot = types.SimpleNamespace(_plot2d=types.SimpleNamespace())
+
+        # A plain class, NOT SimpleNamespace: the group is used as a dict KEY in
+        # the `_push_groups` payload, and SimpleNamespace defines __eq__ so it
+        # is unhashable.
+        class _Group:
+            name = "seg_preview_outline"
+
+        monkeypatch.setattr(pa.SegmentWizard, "_overlay_group",
+                            lambda self, p: _Group())
+        monkeypatch.setattr(pa.SegmentWizard, "_window_group", lambda self, p: None)
+
+        n = pa._MAX_OUTLINE_POLYS + 1
+        w.set_overlay([np.zeros((3, 2), np.int16) for _ in range(n)], None,
+                      labels=None, n_instances=n)
+        assert pushed.get("seg_preview_outline") == [], (
+            f"{n} polygons reached the renderer; the cap is "
+            f"{pa._MAX_OUTLINE_POLYS}")
+
+
+class TestMeasureSkipsOutlinesItCannotDraw:
+    """Contours are ~half a preview's cost once instances run to thousands."""
+
+    def test_want_contours_false_skips_them_but_keeps_every_measurement(self):
+        from spyde.particles import measure_frame
+
+        lab = np.zeros((64, 64), np.int32)
+        lab[5:15, 5:15] = 1
+        lab[30:40, 30:40] = 2
+        frame = np.random.default_rng(0).random((64, 64)).astype(np.float32)
+
+        rows_a, cont_a = measure_frame(lab, frame, t=0, scale=0.5)
+        rows_b, cont_b = measure_frame(lab, frame, t=0, scale=0.5,
+                                       want_contours=False)
+        assert len(cont_a) == 2 and cont_b == []
+        # The ROWS -- every measured property, including the score the
+        # confidence filter reads -- must be untouched by the flag.
+        assert np.array_equal(rows_a, rows_b)
+
+    def test_commit_refuses_a_preview_whose_outlines_were_skipped(self, window):
+        """A store needs one contour PER ROW; committing without them would
+        build a silently mis-corresponding dataset."""
+        session, plot, _tree, wiz = _opened(window)
+        msgs = window["messages"]
+        wiz.preview = {"frame": 0, "labels": np.zeros((8, 8), np.int32),
+                       "rows": np.zeros((3, 4), np.float32), "contours": [],
+                       "count": 3, "areas": np.zeros(3), "box": None}
+        assert wiz.commit() is None
+        assert any("too many to commit" in str(m.get("text", ""))
+                   for m in msgs if isinstance(m, dict)), \
+            "commit failed silently instead of saying why"
+
+
 class TestBrushActuallyPaints:
     """The regression guard for "I can't scribble".
 
@@ -1064,6 +1284,25 @@ class TestPreviewWindowBoxLifecycle:
             "the outline group was not cleared, so the old engine's particles "
             "stay on screen")
 
+    def test_switching_to_an_untrained_engine_clears_the_RASTER_too(self, monkeypatch):
+        """The other drawing route, which this used to miss entirely.
+
+        Above `_RASTER_ABOVE` instances the overlay is ONE mask, not outlines.
+        `show_preview_window` cleared only the outlines, so the previous
+        engine's mask survived the switch — and on the Scribble tab that covers
+        the image you have to paint on. The reported symptom was exactly "moved
+        to scribble, immediately unusable".
+        """
+        import spyde.actions.particles_action as pa
+        monkeypatch.setattr(pa, "_push_groups", lambda p, u: None)
+        wiz = self._wiz()
+        cleared = []
+        monkeypatch.setattr(pa.SegmentWizard, "_clear_raster_overlay",
+                            lambda self: cleared.append(True))
+        wiz.show_preview_window()
+        assert cleared, ("the raster mask was left on screen; on Scribble it "
+                         "covers the frame the user has to paint on")
+
 
 class TestRasterOverlayAboveThreshold:
     """Hundreds of vector contours make the app sluggish; draw one mask instead.
@@ -1074,20 +1313,46 @@ class TestRasterOverlayAboveThreshold:
     crisp at any zoom, and each is an object the UI can hover.
     """
 
+    # A REAL Plot2D, not a stub that records whatever it is handed.
+    #
+    # This class used to fake `set_overlay_mask`, and that fake is why the bug
+    # it was written to prevent shipped anyway: SpyDE reduced the mask to the
+    # overview grid (right for the renderer), the REAL `set_overlay_mask`
+    # rejected that shape against `image_width` (the full frame in tile mode),
+    # `_set_raster_overlay` swallowed the ValueError at DEBUG, and every
+    # large-frame preview fell back to N polygons — at 14028 instances, a hung
+    # renderer painted solid green. The stub asserted the mask SpyDE built and
+    # was green throughout, because it never enforced the contract that failed.
+    #
+    # So these tests now assert on the bytes that actually SHIP. Whichever layer
+    # does the reduction, the renderer's rule is the same and is the only thing
+    # worth pinning: `bytes.length === (base_width || image_width) * (…)`.
     @staticmethod
     def _p2d(base_w=0, base_h=0):
-        class _P2D:
-            def __init__(self):
-                self._state = {"base_width": base_w, "base_height": base_h,
-                               "image_width": 4096, "image_height": 4096}
-                self.mask = "unset"
+        from anyplotlib.plot2d import Plot2D
+        full = np.zeros((4096, 4096), np.uint8)
+        if base_w:
+            p = Plot2D(full, tile="auto")
+            assert p._state.get("base_width"), "tile mode did not set a base grid"
+        else:
+            p = Plot2D(full)
+        return p
 
-            def set_overlay_mask(self, mask, color=None, alpha=None):
-                self.mask = mask
+    @staticmethod
+    def _p2d_small(n):
+        """A plot small enough that anyplotlib does NOT put it in tile mode."""
+        from anyplotlib.plot2d import Plot2D
+        return Plot2D(np.zeros((n, n), np.uint8))
 
-            def add_polygons(self, *a, **k):
-                return None
-        return _P2D()
+    @staticmethod
+    def _shipped(p2d):
+        """(bytes_len, expected_len) for the mask currently on *p2d*."""
+        import base64
+        st = p2d._state
+        b64 = st.get("overlay_mask_b64") or ""
+        want = (int(st.get("base_width") or 0) or int(st["image_width"])) * \
+               (int(st.get("base_height") or 0) or int(st["image_height"]))
+        return len(base64.b64decode(b64)), want
 
     @staticmethod
     def _wiz(p2d):
@@ -1109,26 +1374,38 @@ class TestRasterOverlayAboveThreshold:
         return lab
 
     def test_untiled_mask_is_the_native_frame_size(self):
-        p = self._p2d()
-        assert self._wiz(p)._set_raster_overlay(
-            self._labels(), (1536, 1536, 1024, 1024), (4096, 4096))
-        assert p.mask.shape == (4096, 4096)
+        """A frame small enough to escape tile mode ships at its native size.
 
-    def test_tiled_mask_is_built_at_the_OVERVIEW_size(self):
-        """The trap this exists for.
+        Small ON PURPOSE: anyplotlib tiles anything with a >=1024 px edge, so
+        there is no such thing as an untiled 4096² plot and asking for one here
+        tested nothing. 512² is the branch where `base_width` stays 0 and the
+        renderer falls back to `image_width`.
+        """
+        p = self._p2d_small(512)
+        lab = np.zeros((512, 512), np.int32)
+        lab[100:110, 100:110] = 1
+        assert self._wiz(p)._set_raster_overlay(lab, None, (512, 512))
+        assert not p._state.get("base_width"), "512² unexpectedly tiled"
+        sent, want = self._shipped(p)
+        assert sent == want == 512 * 512
+
+    def test_tiled_mask_SHIPS_at_the_OVERVIEW_size(self):
+        """The trap this exists for, asserted where it actually bites.
 
         In tile mode the renderer checks ``bytes.length === iw * ih`` where
-        ``iw = base_width || image_width`` — the OVERVIEW size. A
-        native-resolution mask fails that check and is dropped SILENTLY: no
-        error, no overlay, nothing in the log. So the mask must be reduced to
-        the overview grid, exactly.
+        ``iw = base_width || image_width`` — the OVERVIEW size — and on a
+        mismatch sets ``maskCache=null``: no error, no overlay, nothing in the
+        log. So what matters is not which layer reduces the mask but that the
+        bytes leaving Python are the size the renderer will accept.
         """
         p = self._p2d(1024, 1024)
         assert self._wiz(p)._set_raster_overlay(
-            self._labels(), (1536, 1536, 1024, 1024), (4096, 4096))
-        assert p.mask.shape == (1024, 1024), (
-            f"mask is {p.mask.shape} but the renderer expects the overview "
-            f"grid (1024, 1024) — it would draw nothing at all")
+            self._labels(), (1536, 1536, 1024, 1024), (4096, 4096)), \
+            "the raster overlay refused to draw on a tiled frame"
+        sent, want = self._shipped(p)
+        assert sent == want, (
+            f"mask ships {sent} bytes but the renderer expects {want} — it "
+            f"would silently draw nothing at all")
 
     def test_the_reduction_keeps_small_particles(self):
         """Block ANY, not a subsample.
@@ -1136,10 +1413,13 @@ class TestRasterOverlayAboveThreshold:
         Particles are often a few pixels across; striding a 4096² mask down to
         1024² would drop three quarters of them at random.
         """
+        import base64
         p = self._p2d(1024, 1024)
         self._wiz(p)._set_raster_overlay(
             self._labels(), (1536, 1536, 1024, 1024), (4096, 4096))
-        assert p.mask.sum() > 0, "every particle vanished in the reduction"
+        sent = np.frombuffer(
+            base64.b64decode(p._state["overlay_mask_b64"]), np.uint8)
+        assert sent.any(), "every particle vanished in the reduction"
 
     def test_below_the_threshold_nothing_is_rastered(self):
         """Few particles → keep the crisp, hoverable vector outlines."""
@@ -1152,5 +1432,5 @@ class TestRasterOverlayAboveThreshold:
         contours = [np.zeros((3, 2), np.int16) for _ in range(3)]
         wiz.set_overlay(contours, None, labels=self._labels(),
                         full_shape=(4096, 4096))
-        assert p.mask in ("unset", None), (
+        assert not (p._state.get("overlay_mask_b64") or ""), (
             "a 3-particle frame was rastered; the outlines are better there")
