@@ -337,7 +337,15 @@ class TestProgressiveNavigator5D:
                 session.signal_trees[-1].navigator_signals["base"][1].data,
                 np.ndarray))
             from spyde.nav_sidecar import sidecar_path
-            assert os.path.exists(sidecar_path(str(src))), "no sidecar written"
+            # Wait for the SIDECAR, not just for the navigator data. The two are
+            # different events: the nav array becoming an ndarray means the
+            # compute produced it, while the sidecar is written afterwards by
+            # the same background work — so asserting the file the instant the
+            # array appears is a race the test loses on a loaded runner
+            # ("no sidecar written" on macos-py3.13, green on every other job
+            # and on a local full run of the same platform + Python).
+            assert _wait(lambda: os.path.exists(sidecar_path(str(src)))), \
+                "no sidecar written"
         finally:
             session.shutdown()
 
