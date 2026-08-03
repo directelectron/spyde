@@ -39,17 +39,23 @@ test.beforeAll(async () => {
     ?? (process.platform === 'win32' ? 'python' : 'python3')
   execFileSync(py, ['-m', 'spyde.tests.gen_orientation_embed', htmlPath],
     { cwd: root })
-  // `channel: 'chromium'` + --enable-unsafe-webgpu is what gives headless a real
-  // navigator.gpu. The 3-D panel does NOT require it (anyplotlib falls back to
-  // Canvas2D), and the assertions below are about pixels either way — this just
-  // exercises the path a reader with a GPU actually gets.
-  browser = await chromium.launch({
-    channel: 'chromium', args: ['--enable-unsafe-webgpu'],
-  })
+  // Plain launch, exactly like vectors_report_embed — the default headless
+  // shell, which is what CI has and what a report reader's browser stands in
+  // for here. NOT `channel: 'chromium'` + --enable-unsafe-webgpu: that gets
+  // headless a real navigator.gpu, and it paints fine locally, but on the CI
+  // runner it produced three correctly-sized panels with ZERO pixels in any of
+  // them, the plain 2-D map included. The 3-D panel does not need WebGPU
+  // (anyplotlib falls back to Canvas2D) and every assertion here is about
+  // pixels rather than which path drew them.
+  browser = await chromium.launch()
   page = await browser.newPage({ viewport: { width: 1400, height: 700 } })
   await page.goto('file:///' + htmlPath.replace(/\\/g, '/'))
   await page.waitForSelector('#ox-root[data-ready="1"]', { timeout: 60_000 })
-  await page.waitForTimeout(2_000)      // first 3-D draw + async key decode
+  // Wait for the PIXELS, not for a guess at how long they take: `data-ready`
+  // only says the script finished, and a fixed sleep is what turns a slow
+  // runner into "nothing painted".
+  await expect.poll(async () => (await canvasInk()).filter((c) => c.ink > 200).length,
+    { timeout: 60_000, message: 'the panels never painted' }).toBeGreaterThanOrEqual(3)
 })
 
 test.afterAll(async () => { await browser?.close() })
