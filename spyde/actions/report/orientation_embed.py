@@ -4,9 +4,14 @@ The sibling of :mod:`vectors_embed`, and the same bargain: an orientation result
 is small enough to inline into a self-contained page, and rich enough to drive
 the whole IPF explorer client-side. Per nav position it is one best-match
 orientation — a stereographic ``(x, y)`` in the fundamental sector, a reduced
-crystal direction on the unit sphere, and an IPF colour. At 20 bytes per
-position per sample direction that is ~0.8 MB for a 13k-position scan, against
-the vectors explorer's ~21 MB.
+crystal direction on the unit sphere, and an IPF colour. 20 bytes per position
+per sample direction.
+
+Measured at sped_ag scale (208x64 = 13,312 positions): packing 0.38 s for a
+1.24 MB base64 blob, 0.30 s more to build the page, 3.04 MB of HTML all told —
+against the vectors explorer's ~21 MB. Most of the difference between the blob
+and the page is the drawn cloud's scatter offsets, which ride the figure's own
+state as JSON text; that is what ``CLOUD_MAX`` bounds.
 
 ONE anyplotlib figure with THREE panels, mirroring the app's two windows:
 
