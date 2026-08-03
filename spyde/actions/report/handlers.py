@@ -29,11 +29,16 @@ from spyde.actions.figure_registry import keep_alive
 from spyde.actions.report.figure_builder import (
     ReportFigureController, build_cell_figure,
 )
+from spyde.actions.report import model
 from spyde.actions.report.model import (
-    IMAGE_EXTS, Cell, FigureSpec, LayerSpec, PanelSpec, ReportDoc, SignalRef,
-    bake_fallback_png, bake_line_fallback_png, move_slide, new_cell_id,
-    read_report, write_report,
+    IMAGE_EXTS, THEME_DEFAULTS, Cell, FigureSpec, LayerSpec, PanelSpec,
+    ReportDoc, SignalRef, bake_fallback_png, bake_line_fallback_png,
+    move_slide, new_cell_id, normalize_theme, read_report, write_report,
 )
+
+#: settings.json key holding the user's DEFAULT deck theme (the "set as default"
+#: verb). Distinct from the per-document theme: this one seeds a NEW deck.
+_DEFAULT_THEME_KEY = "report_default_theme"
 
 log = logging.getLogger(__name__)
 
@@ -343,7 +348,8 @@ class ReportManager:
         """The authoritative ``report_state`` message body."""
         if self.doc is None:
             return {"open": False, "path": None, "title": "", "template": False,
-                    "type": "report", "dirty": False, "cells": []}
+                    "type": "report", "dirty": False,
+                    "theme": dict(model.THEME_DEFAULTS), "cells": []}
         cells = []
         nav_dims_cache: dict = {}
         for c in self.doc.cells:
@@ -451,6 +457,9 @@ class ReportManager:
             # What the next Cmd-Z would reverse (None = nothing). The UI uses it
             # to label the Undo affordance rather than offering a dead button.
             "undo": (self._undo[-1]["label"] if self._undo else None),
+            # The deck's look (colours / type / footer / logo). Always a FULL
+            # dict, so the renderer indexes it without a fallback per use site.
+            "theme": model.normalize_theme(getattr(self.doc, "theme", None)),
             "cells": cells,
         }
 
@@ -1924,10 +1933,89 @@ def _resolve_source_plot(session, source_window_id):
 # ── handlers ───────────────────────────────────────────────────────────────────
 
 
+def _saved_default_theme(session) -> dict:
+    """The user's "set as default" theme from settings.json, normalised. Absent
+    / unreadable → the built-in look."""
+    try:
+        return normalize_theme(session._settings.get(_DEFAULT_THEME_KEY))
+    except Exception as e:
+        log.debug("reading the default deck theme failed: %s", e)
+        return dict(THEME_DEFAULTS)
+
+
 def report_new(session, plot, payload) -> None:
     mgr = _manager(session)
     mgr.new(template=bool(payload.get("template", False)),
             doc_type=str(payload.get("type", "report") or "report"))
+    # A NEW deck starts from the user's default look — that is the whole point
+    # of "set as default" (the per-document theme is what a saved deck carries).
+    mgr.doc.theme = _saved_default_theme(session)
+    mgr.emit_state()
+
+
+def report_set_theme(session, plot, payload) -> None:
+    """Merge ``payload['theme']`` into the open document's theme.
+
+    A MERGE, not a replace: the theme editor sends only the field the user just
+    changed, so a partial payload must not reset the other eleven."""
+    mgr = _manager(session)
+    if mgr.doc is None:
+        ipc.emit_error("report_set_theme: no open report.")
+        return
+    patch = payload.get("theme")
+    if not isinstance(patch, dict):
+        ipc.emit_error("report_set_theme: no theme.")
+        return
+    merged = dict(normalize_theme(getattr(mgr.doc, "theme", None)))
+    # Only keys the patch actually carries — normalize_theme would otherwise
+    # fill every absent key from the DEFAULTS and wipe the user's other values.
+    merged.update({k: v for k, v in patch.items() if k in THEME_DEFAULTS})
+    mgr.doc.theme = normalize_theme(merged)
+    mgr.doc.touch()
+    mgr.dirty = True
+    mgr.emit_state()
+
+
+def report_theme_set_default(session, plot, payload) -> None:
+    """Persist the OPEN document's theme as the default for every new deck."""
+    mgr = _manager(session)
+    if mgr.doc is None:
+        ipc.emit_error("report_theme_set_default: no open report.")
+        return
+    theme = normalize_theme(getattr(mgr.doc, "theme", None))
+    try:
+        session._settings[_DEFAULT_THEME_KEY] = theme
+        session._save_settings()
+    except Exception as e:
+        ipc.emit_error(f"Saving the default theme failed: {e}")
+        return
+    ipc.emit_status("Saved as your default deck theme")
+
+
+def report_theme_reset(session, plot, payload) -> None:
+    """Drop this document's theme back to the built-in look.
+
+    Deliberately the BUILT-IN look, not the saved default: "reset" that landed
+    you on a customised default would give you no way back to the stock one."""
+    mgr = _manager(session)
+    if mgr.doc is None:
+        ipc.emit_error("report_theme_reset: no open report.")
+        return
+    mgr.doc.theme = dict(THEME_DEFAULTS)
+    mgr.doc.touch()
+    mgr.dirty = True
+    mgr.emit_state()
+
+
+def report_theme_use_default(session, plot, payload) -> None:
+    """Apply the user's saved default theme to the OPEN document."""
+    mgr = _manager(session)
+    if mgr.doc is None:
+        ipc.emit_error("report_theme_use_default: no open report.")
+        return
+    mgr.doc.theme = _saved_default_theme(session)
+    mgr.doc.touch()
+    mgr.dirty = True
     mgr.emit_state()
 
 

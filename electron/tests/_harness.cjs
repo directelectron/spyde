@@ -59,7 +59,23 @@ function _seenSettingsDir() {
 async function launchApp(opts = {}) {
   const { dask = false, env = {} } = opts
   const app = await electron.launch({
-    args: [join(__dirname, '..', 'out', 'main', 'index.js')],
+    args: [
+      join(__dirname, '..', 'out', 'main', 'index.js'),
+      // ISOLATE Chromium's profile per launch.
+      //
+      // Electron defaults to ~/Library/Application Support/spyde-electron (or
+      // the platform equivalent), which is the SAME profile a developer's
+      // `npm run dev` app uses. Chromium takes a singleton lock on it, so a
+      // test launched while the dev app is open does not fail with an error —
+      // it HANGS, and Playwright reports `electron.launch: Timeout` with no
+      // hint that another instance owns the directory. Three dev windows open
+      // at once made every spec in this suite look broken.
+      //
+      // SPYDE_SETTINGS_DIR below only redirects settings.json; this is the
+      // Chromium profile, which is a separate thing and has to be a real
+      // directory (Chromium refuses to launch without one).
+      `--user-data-dir=${mkdtempSync(join(tmpdir(), 'spyde-e2e-profile-'))}`,
+    ],
     env: {
       ...process.env,
       ...(dask ? {} : { SPYDE_NO_DASK: '1' }),
@@ -78,10 +94,32 @@ async function launchApp(opts = {}) {
   const backend = createBackend(app)
   const page = await app.firstWindow()
   await page.waitForLoadState('domcontentloaded')
+
+  // Capture renderer errors from the FIRST paint, not after the mount wait
+  // below. A module-level throw (a bad import, a TDZ reference) means React
+  // never mounts, so `mdi-area` never appears and the only symptom is an opaque
+  // 30 s selector timeout with the actual stack trapped in a console nobody
+  // reads. These listeners are attached before the wait so the error is
+  // reported INSTEAD of the timeout.
+  const bootErrors = []
+  page.on('pageerror', (err) => bootErrors.push(`pageerror: ${err.message}\n${err.stack ?? ''}`))
+  page.on('console', (msg) => {
+    if (msg.type() === 'error') bootErrors.push(`console.error: ${msg.text()}`)
+  })
+
   // The renderer must have mounted (window.electron + IPC wired) before we fire
   // any action, and the Python backend must be ready to receive it. Without this
   // an action sent too early is silently dropped (no window ever opens).
-  await page.waitForSelector('[data-testid="mdi-area"]', { timeout: 30_000 })
+  try {
+    await page.waitForSelector('[data-testid="mdi-area"]', { timeout: 30_000 })
+  } catch (e) {
+    if (bootErrors.length) {
+      throw new Error(
+        'The renderer never mounted. Errors from the page:\n\n'
+        + bootErrors.slice(0, 5).join('\n\n'))
+    }
+    throw e
+  }
   await backend.waitForLog('[spyde backend] ready', 60_000).catch(() => {})
   if (dask) await backend.waitForDask(60_000).catch(() => {})
 

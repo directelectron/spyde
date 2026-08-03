@@ -103,9 +103,6 @@ export function ReportImageCell({ cell, onRemove, index, dragProps }: Props) {
       try { await window.electron.clipboardWritePng(ser.image) } catch { /* ignore */ }
     }
   }
-  const doDuplicate = () =>
-    sendAction('report_paste_cell', { cell: serialize(), index: index + 1 })
-
   return (
     <div
       ref={rootRef}
@@ -126,7 +123,6 @@ export function ReportImageCell({ cell, onRemove, index, dragProps }: Props) {
           cellId={cell.id}
           styles={{ chrome: styles.chrome, chromeBtn: styles.chromeBtn }}
           onCopy={doCopy}
-          onDuplicate={doDuplicate}
           onDelete={onRemove}
           deleteTestid={`report-imgcell-delete-${cell.id}`}
           deleteTitle="Delete image"

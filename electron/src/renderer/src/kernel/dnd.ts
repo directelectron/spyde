@@ -37,3 +37,37 @@ export const SIGNAL_REF_DRAG_MIME = 'application/x-spyde-signal-ref'
 export const CONSOLE_VAR_DRAG_MIME = 'application/x-spyde-console-var'
 export const WORKFLOW_NODE_DRAG_MIME = 'application/x-spyde-workflow-node'
 export const FIGURE_DRAG_MIME = 'application/x-spyde-figure'
+
+// ── In-process fallback for the dragged window payload ───────────────────────
+//
+// `dataTransfer.types` is readable throughout a drag, but `getData()` is only
+// permitted on DROP — and the drop is where it can come back EMPTY. A drag that
+// leaves the renderer for the OS drag pasteboard (a real trackpad drag in the
+// packaged app, unlike a synthesized one in a test) can arrive back with the
+// custom MIME listed in `types` but with no readable payload behind it. The
+// compose handlers then resolve a null source window and silently `return`,
+// which presents as: the drop zones light up correctly, you release, and
+// NOTHING HAPPENS.
+//
+// Both drag source and drop target are in this one renderer process, so the
+// payload never actually needs to survive a round trip through the OS. The Pill
+// stashes it here at dragstart; the drop reads it only when `getData()` yields
+// nothing. Cleared on dragend/drop (SpyDEContext) so a stale payload can never
+// be applied to an unrelated later drop.
+export interface WindowDragPayload {
+  windowId: number
+  figId?: string
+  view?: string
+}
+
+let _dragStash: WindowDragPayload | null = null
+
+/** Called by the drag SOURCE at dragstart. */
+export function stashWindowDrag(payload: WindowDragPayload | null): void {
+  _dragStash = payload
+}
+
+/** Read by a drop target when `dataTransfer.getData()` came back empty. */
+export function peekWindowDrag(): WindowDragPayload | null {
+  return _dragStash
+}

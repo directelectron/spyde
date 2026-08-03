@@ -30,6 +30,8 @@ import { SlideNotesEditor } from './SlideNotesEditor'
 import { AnchoredMenu } from './AnchoredMenu'
 import { GUIDES } from '@guides/index'
 import type { ReportCell as ReportCellType } from '../kernel/protocol'
+import { dlog, dlogOnce } from '../kernel/dragDiag'
+import { ThemePanel, resolveTheme } from './ThemePanel'
 
 const MIN_W = 300
 const MAX_W = 800
@@ -198,6 +200,8 @@ export function ReportSidebar() {
   const [bgPicker, setBgPicker] = useState<{ id: string; el: HTMLElement } | null>(null)
   const bgPickerFor = bgPicker?.id ?? null
   const [addSlideMenu, setAddSlideMenu] = useState(false)
+  // The deck-theme modal (presentations only).
+  const [themeOpen, setThemeOpen] = useState(false)
   const addSlideBtnRef = useRef<HTMLButtonElement>(null)
   // Whole-slide reorder DnD (drag a slide's grip onto another slide group).
   const dragSlideN = useRef<number | null>(null)
@@ -650,10 +654,36 @@ export function ReportSidebar() {
     const isPill = DROP_MIMES.some(m => e.dataTransfer.types.includes(m))
     const isImageFile = e.dataTransfer.types.includes('Files') &&
       hasImageFiles(e.dataTransfer)
+    dlogOnce('4.BODY/dragover', {
+      isPill, isImageFile, types: Array.from(e.dataTransfer.types),
+    })
     if (!isPill && !isImageFile) return
     e.preventDefault()
     e.dataTransfer.dropEffect = 'copy'
     setDropIndex(computeDropIndex(e.clientY))
+  }
+
+  /**
+   * CAPTURE-phase accept for the whole report body.
+   *
+   * A drop only fires if the dragover under the cursor called preventDefault().
+   * Bubble phase makes that conditional on every handler between the cursor and
+   * the body choosing to pass the event along — the figure cell's reorder
+   * handler, the slide group's reorder handler, the compose shield. Each of
+   * those early-returns for a drag it doesn't own, and any one of them failing
+   * to hand off means NOTHING accepts the drop: the cursor shows no-drop, the
+   * release produces `dragend` with no `drop`, and the app looks inert. That is
+   * the reported failure, and it is invisible to a synthesized test drag.
+   *
+   * Capture runs before every child, so a pill dragged anywhere over the report
+   * is ALWAYS droppable. Which handler then CLAIMS the drop is unchanged — the
+   * compose shield still stops propagation to take it, otherwise it falls
+   * through to the body. This only guarantees a drop event exists to claim.
+   */
+  const onBodyDragOverCapture = (e: React.DragEvent) => {
+    if (!DROP_MIMES.some(m => e.dataTransfer.types.includes(m))) return
+    e.preventDefault()
+    e.dataTransfer.dropEffect = 'copy'
   }
   const onBodyDrop = (e: React.DragEvent) => {
     // An image FILE drop → add a photo cell (branch FIRST so it never collides
@@ -667,11 +697,18 @@ export function ReportSidebar() {
       files.forEach((f, k) => { void addImageFile(f, imageExtOf(f), idx + k) })
       return
     }
-    if (!DROP_MIMES.some(m => e.dataTransfer.types.includes(m))) return
+    if (!DROP_MIMES.some(m => e.dataTransfer.types.includes(m))) {
+      dlog('5.BODY/drop-REJECTED', { types: Array.from(e.dataTransfer.types) })
+      return
+    }
     e.preventDefault()
     const idx = computeDropIndex(e.clientY)
     setDropIndex(null)
     const src = figurePayloadFromDrop(e.dataTransfer)
+    // Reaching HERE during a compose attempt means the drop missed the figure's
+    // shield and landed on the sidebar body — which ADDS A NEW CELL rather than
+    // combining. That is a distinct failure from "the drop did nothing".
+    dlog('5.BODY/drop', { index: idx, resolvedSourceWindow: src?.windowId ?? null })
     if (src != null) {
       sendAction('report_add_figure', {
         source_window_id: src.windowId, index: idx,
@@ -1010,6 +1047,15 @@ export function ReportSidebar() {
             onClick={() => sendAction('report_undo', {})}
           >↶ Undo</button>
         )}
+        {/* Theme — presentations only. Colours, type, footer bar, logo. */}
+        {isPresentation && (
+          <button
+            data-testid="report-theme"
+            style={styles.hdrBtn}
+            title="Deck theme — colours, footer, logo"
+            onClick={() => setThemeOpen(true)}
+          >Theme</button>
+        )}
         {/* Present ▶ — presentations only (a scrolling report has no slides). */}
         {isPresentation && (
           <button
@@ -1078,6 +1124,7 @@ export function ReportSidebar() {
         ref={bodyRef}
         data-testid="report-body"
         style={styles.body}
+        onDragOverCapture={onBodyDragOverCapture}
         onDragOver={onBodyDragOver}
         onDrop={onBodyDrop}
         onDragLeave={onBodyDragLeave}
@@ -1275,6 +1322,10 @@ export function ReportSidebar() {
           onChange={onBrowsePicked}
         />
       </div>
+
+      {themeOpen && (
+        <ThemePanel theme={resolveTheme(report.theme)} onClose={() => setThemeOpen(false)} />
+      )}
     </div>
   )
 }

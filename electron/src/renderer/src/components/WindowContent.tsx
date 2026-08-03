@@ -27,7 +27,7 @@ function sourceWindowIdFromDrop(dt: DataTransfer): number | null {
 interface Props {
   win: SpyDEWindow
   iframeRefs: React.MutableRefObject<Map<string, HTMLIFrameElement>>
-  replayState: (figId: string) => void
+  replayState: (figId: string, target?: HTMLIFrameElement) => void
   sendAction: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
 }
 

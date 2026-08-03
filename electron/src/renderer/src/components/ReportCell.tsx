@@ -286,9 +286,6 @@ export function ReportCell({ cell, onUpdate, onRemove, index, dragProps }: Props
     html: rendered,
   })
   const doCopy = () => reportClipboard.set(serialize())
-  const doDuplicate = () =>
-    sendAction('report_paste_cell', { cell: serialize(), index: index + 1 })
-
   return (
     <div
       data-testid={`report-cell-${cell.id}`}
@@ -311,7 +308,6 @@ export function ReportCell({ cell, onUpdate, onRemove, index, dragProps }: Props
           cellId={cell.id}
           styles={{ chrome: styles.chrome, chromeBtn: styles.chromeBtn, deleteBtn: styles.deleteBtn }}
           onCopy={doCopy}
-          onDuplicate={doDuplicate}
           onDelete={onRemove}
           deleteTestid={`report-cell-delete-${cell.id}`}
           deleteTitle="Delete cell"
