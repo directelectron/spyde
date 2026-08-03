@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- Segment Particles.
+
+     Deliberately NOT peak_finding.svg, which it used to borrow: that icon says
+     "find the positions of points" (crosshairs on dots), and this action does
+     not find points — it finds BODIES and traces their outlines, which is what
+     everything downstream measures.
+
+     The first draft of this failed that test when rendered: near-circular
+     blobs at 26 px are indistinguishable from peak_finding's dots. So the
+     shapes here are deliberately LUMPY and few and large — an irregular mass
+     with a traced edge is the one silhouette a ring of dots cannot be
+     mistaken for — and the touching pair actually touches, cut by a red seam.
+     Splitting touching bodies is the hard part of the instance step and the
+     only feature of this action worth spending an icon on. -->
+<svg
+   width="512"
+   height="512"
+   viewBox="0 0 512 512"
+   version="1.1"
+   id="svg-segment"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <g id="layer-segment">
+
+    <!-- One big irregular particle, upper left. The wobble is the point: a
+         real particle is not a disc, and a traced outline is not a marker. -->
+    <path d="M 70,128 C 58,84 96,50 144,54 C 178,56 194,38 222,58
+             C 254,80 242,118 230,148 C 218,180 226,206 188,214
+             C 144,222 110,204 90,178 C 74,156 78,156 70,128 Z"
+       style="fill:#ffffff;stroke:#fe0000;stroke-width:20;
+              stroke-linejoin:round" />
+
+    <!-- The TOUCHING pair, sharing an edge, split by the seam. Drawn as one
+         outer silhouette with a red cut through it rather than two shapes with
+         a gap, because a gap reads as "two separate particles" and the whole
+         difficulty is that they are NOT separate in the data. -->
+    <path d="M 300,318 C 288,268 322,232 372,236 C 424,240 452,278 448,330
+             C 444,382 408,414 358,410 C 306,406 284,368 300,318 Z"
+       style="fill:#ffffff;stroke:#fe0000;stroke-width:20;
+              stroke-linejoin:round" />
+    <path d="M 106,330 C 94,282 128,244 178,248 C 230,252 262,290 258,342
+             C 254,394 216,424 166,420 C 116,416 92,378 106,330 Z"
+       style="fill:#ffffff;stroke:#fe0000;stroke-width:20;
+              stroke-linejoin:round" />
+    <!-- the seam: where the split cut them apart -->
+    <path d="M 268,254 C 282,296 280,360 268,404"
+       style="fill:none;stroke:#fe0000;stroke-width:20;stroke-linecap:round" />
+
+    <!-- A small faint one — the low-contrast case §0.9 makes the priority.
+         Half-opacity so it reads as "only just found". -->
+    <path d="M 366,110 C 358,82 380,62 408,66 C 436,70 448,92 442,118
+             C 436,144 414,154 390,148 C 368,142 372,132 366,110 Z"
+       style="fill:#ffffff;fill-opacity:0.5;stroke:#fe0000;stroke-width:18;
+              stroke-opacity:0.5;stroke-linejoin:round" />
+  </g>
+</svg>

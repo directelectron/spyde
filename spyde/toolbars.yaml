@@ -366,7 +366,7 @@ functions:
 
   Drift Correction:
     description: Solve and remove sample drift across an image stack. Check the result in a separate window — an aligned stack sums sharp, a misaligned one blurs — then Apply to add a lazy corrected node (nothing is copied).
-    icon: drawing/toolbars/icons/center_zero_beam.svg
+    icon: drawing/toolbars/icons/drift_correction.svg
     function: spyde.actions.drift_action.drift_correction
     signal_types: [insitu]
     plot_dim: [2]
@@ -376,7 +376,7 @@ functions:
 
   Segment Particles:
     description: Find and measure particles frame by frame. Tune on the displayed frame (classical threshold or a scribble-trained classifier), then run the whole movie into a new particle dataset with count-vs-time and tracks.
-    icon: drawing/toolbars/icons/peak_finding.svg
+    icon: drawing/toolbars/icons/segment_particles.svg
     function: spyde.actions.particles_action.segment_particles
     exclude_signal_types: [spyde_diffraction_vectors_image, particles, electron_diffraction]
     plot_dim: [2]
@@ -386,7 +386,7 @@ functions:
 
   Particle Overlay:
     description: Draw the found particles on the frame — filled outlines coloured by track, labels on the selected one, optional fading motion trails. Double-click a particle to select it; delete, merge and split corrections are recorded on the dataset.
-    icon: drawing/toolbars/icons/peak_finding.svg
+    icon: drawing/toolbars/icons/segment_particles.svg
     function: spyde.actions.particle_overlay.particle_overlay
     requires_particles: True
     plot_dim: [2]
