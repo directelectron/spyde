@@ -250,6 +250,22 @@ def _render_figure_side_html(mgr, cell: Cell, assets: dict, *, interactive: bool
                         html_frag = _figure_iframe_html(cell.caption, vx_html)
             except Exception as e:
                 log.debug("vectors embed for cell %s failed: %s", cell.id, e)
+        # ORIENTATION explorer — the same swap for a tree carrying an
+        # orientation result. After vectors, because a vector-OM tree carries
+        # BOTH and the vectors explorer is the one that cell was dragged from.
+        if not html_frag and cell.spec.orientation_mode != "image":
+            try:
+                from spyde.actions.report.orientation_embed import (
+                    orientation_explorer_html, orientation_for_cell,
+                )
+                result = orientation_for_cell(session, cell)
+                if result is not None:
+                    ox_html = orientation_explorer_html(result,
+                                                        caption=cell.caption)
+                    if ox_html is not None:
+                        html_frag = _figure_iframe_html(cell.caption, ox_html)
+            except Exception as e:
+                log.debug("orientation embed for cell %s failed: %s", cell.id, e)
         # Tinted-overlay blender (vectors swap above wins when both
         # apply — a vectors cell stays a vectors explorer).
         if not html_frag:

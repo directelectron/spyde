@@ -667,12 +667,20 @@ class FigureSpec:
     ``vectors_mode`` records the user's drop-time choice for a source tree that
     carries diffraction vectors: ``"viewer"`` embeds the interactive explorer in
     HTML exports, ``"image"`` forces the static snapshot. ``""`` (older files /
-    non-vectors sources) keeps the viewer-when-available default."""
+    non-vectors sources) keeps the viewer-when-available default.
+
+    ``orientation_mode`` is the same switch for a tree carrying an ORIENTATION
+    result (the IPF explorer embed). Unlike vectors it has no drop-time prompt:
+    the vectors blob can reach tens of MB, which is worth asking about, while a
+    packed orientation map is ~20 bytes per position per direction — so the
+    viewer is simply the default and ``"image"`` exists for pinning a cell to
+    its static snapshot."""
     layout: dict = field(default_factory=lambda: {"kind": "single"})
     panels: list = field(default_factory=list)          # [PanelSpec]
     nav_context: dict | None = None            # {"indices": [iy, ix]}
     annotations: list = field(default_factory=list)     # [dict] figure-fraction markers
     vectors_mode: str = ""                     # "" | "viewer" | "image"
+    orientation_mode: str = ""                 # "" | "viewer" | "image"
 
     def to_dict(self) -> dict:
         d = {
@@ -684,6 +692,8 @@ class FigureSpec:
         }
         if self.vectors_mode:
             d["vectors_mode"] = self.vectors_mode
+        if self.orientation_mode:
+            d["orientation_mode"] = self.orientation_mode
         return d
 
     @classmethod
@@ -696,6 +706,7 @@ class FigureSpec:
                          if d.get("nav_context") is not None else None),
             annotations=[dict(a) for a in (d.get("annotations") or [])],
             vectors_mode=str(d.get("vectors_mode", "") or ""),
+            orientation_mode=str(d.get("orientation_mode", "") or ""),
         )
 
     def to_yaml(self) -> str:

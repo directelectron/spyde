@@ -537,6 +537,42 @@ class ReportManager:
         import uuid
         return f"vx_{cell.id}_{uuid.uuid4().hex[:8]}", html
 
+    def _orientation_explorer_for_cell(self, cell: Cell) -> "tuple[str, str] | None":
+        """The vectors explorer's sibling for an ORIENTATION cell: resolved
+        source tree carries an orientation result and
+        ``spec.orientation_mode != "image"`` → the self-contained IPF explorer
+        (map + triangle + sphere), as ``(fig_id, html)``, else None.
+
+        Same contract as :meth:`_vectors_explorer_for_cell` in every respect
+        that matters here — one page, one figure, emitted through the ordinary
+        bare-figure path — so the sidebar and the HTML export show the same
+        thing. Tried AFTER vectors: a tree can carry both (find-vectors then
+        vector-OM), and the vectors explorer is the one the user dragged from."""
+        spec = cell.spec
+        if spec is None:
+            return None
+        if getattr(spec, "orientation_mode", "") == "image":
+            return None
+        if _is_scene3d_cell(cell):
+            return None            # a scene cell is already a 3-D snapshot
+        try:
+            from spyde.actions.report.orientation_embed import (
+                orientation_explorer_html, orientation_for_cell,
+            )
+            result = orientation_for_cell(self.session, cell)
+            if result is None:
+                return None
+            html = orientation_explorer_html(result, caption=cell.caption or "",
+                                             cache_key=cell.id)
+            if html is None:       # over the embed cap / no indexed positions
+                return None
+        except Exception as e:
+            log.debug("[report] sidebar orientation explorer build failed "
+                      "(cell %s): %s", cell.id, e)
+            return None
+        import uuid
+        return f"ox_{cell.id}_{uuid.uuid4().hex[:8]}", html
+
     def build_figure_window(self, cell: Cell) -> None:
         """Build (or rebuild) the live figure window for a figure cell and emit
         it through the bare-figure path with ``host:"report"`` + ``cell_id``.
@@ -568,7 +604,8 @@ class ReportManager:
         # EDIT mode (the annotation editor targets the anyplotlib figure, so a cell
         # being edited falls back to the plain snapshot figure it can annotate).
         if cell.id not in self._editing:
-            explorer = self._vectors_explorer_for_cell(cell)
+            explorer = (self._vectors_explorer_for_cell(cell)
+                        or self._orientation_explorer_for_cell(cell))
             if explorer is not None:
                 self._emit_vectors_explorer(cell, explorer)
                 return
@@ -1408,14 +1445,27 @@ def _widget_geometry_to_data(kind, widget, axes, coords) -> "dict | None":
 
 
 def _clear_vectors_explorer_cache(cell_id: "str | None" = None) -> None:
-    """Drop the memoized vectors-explorer page(s) (fix #6). Best-effort; a lazy
-    import so vectors_embed (which pulls anyplotlib) isn't loaded at handler
-    import time. ``cell_id`` clears one cell; ``None`` clears all."""
+    """Drop the memoized explorer page(s) — vectors AND orientation (fix #6).
+    Best-effort; a lazy import so the embed modules (which pull anyplotlib)
+    aren't loaded at handler import time. ``cell_id`` clears one cell; ``None``
+    clears all.
+
+    Both are cleared together because both are keyed by cell id and both are
+    invalidated by exactly the same events; a cell that stopped being a vectors
+    cell and became an orientation one would otherwise keep serving the old
+    page from the sibling cache."""
     try:
         from spyde.actions.report.vectors_embed import clear_explorer_cache
         clear_explorer_cache(cell_id)
     except Exception as e:
         log.debug("clear vectors explorer cache failed: %s", e)
+    try:
+        from spyde.actions.report.orientation_embed import (
+            clear_explorer_cache as clear_orientation_cache,
+        )
+        clear_orientation_cache(cell_id)
+    except Exception as e:
+        log.debug("clear orientation explorer cache failed: %s", e)
 
 
 def _manager(session) -> ReportManager:
