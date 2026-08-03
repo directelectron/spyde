@@ -55,49 +55,89 @@ class TestIpf3D:
         assert len(xyz) == len(rgb) <= 1_000_000
         assert len(xyz) > 0
 
-    def test_build_ipf_key_figure(self):
-        # The colour-key triangle legend builds as a native anyplotlib figure.
-        from spyde.actions.ipf_view import build_ipf_key_figure
-        fig, fig_id, html = build_ipf_key_figure(_al_orientation_map(), "z")
-        assert isinstance(fig_id, str) and fig_id
-        assert isinstance(html, str) and "<body>" in html
-        assert len(html) > 2000                      # a real figure, not empty
+    def test_ipf_key_overlay_is_an_rgba_image(self):
+        """add_key takes a picture, and the sector mask has to live in ALPHA —
+        that is what lets the triangle sit on the map with no square card."""
+        from spyde.actions.ipf_view import ipf_key_overlay
+        rgba, _labels = ipf_key_overlay(_al_orientation_map(), "z")
+        assert rgba.ndim == 3 and rgba.shape[2] == 4
+        assert rgba.dtype == np.uint8
+        alpha = rgba[..., 3]
+        assert (alpha == 255).any() and (alpha == 0).any()
+        # Coloured by crystal DIRECTION, so the sector is not one flat colour.
+        assert len(np.unique(rgba[alpha > 0][:, :3], axis=0)) > 1
 
-    def test_ipf_key_uses_raster_not_thousands_of_polygons(self):
-        # The colour-key triangle is drawn as a single stretched RGBA raster
-        # (add_raster), not ~n^2 individual polygons.
-        from spyde.actions.ipf_view import build_ipf_key_figure
-        fig, _id, _html = build_ipf_key_figure(_al_orientation_map(), "z")
-        plot = list(fig._plots_map.values())[0]
-        markers = plot.to_state_dict().get("markers", [])
-        rasters = [m for m in markers if m.get("type") == "raster"]
-        assert rasters, "expected a raster marker for the colour key"
-        r = rasters[0]
-        assert r["image_width"] > 1 and r["image_height"] > 1
-        assert "clip_path" in r                       # clipped to the sector
-        assert len(r["clip_path"]) >= 3
-        polys = [m for m in markers if m.get("type") == "polygons"]
-        assert not polys, "should not also draw the slow per-cell polygon mesh"
-        lines = [m for m in markers if m.get("type") == "lines"]
-        assert lines, "sector outline should still be present"
-        texts = [m for m in markers if m.get("type") == "texts"]
-        assert texts, "[hkl] corner labels should still be present"
+    def test_key_labels_are_fractions_of_the_image(self):
+        """add_key positions labels in fractions of the KEY image, not in data
+        coordinates — that is what makes them track a panel resize."""
+        from spyde.actions.ipf_view import ipf_key_overlay
+        _rgba, labels = ipf_key_overlay(_al_orientation_map(), "z")
+        assert labels, "the [hkl] corner indices should still be drawn"
+        for d in labels:
+            assert 0.0 <= d["x"] <= 1.0 and 0.0 <= d["y"] <= 1.0, d
+            assert isinstance(d["text"], str) and d["text"]
 
-    def test_emit_ipf_key_message(self):
-        # emit_ipf_key posts a `figure` message tagged view="ipf_key" (the legend
-        # is now a native anyplotlib figure, not a matplotlib PNG data URL).
+    def test_edge_labels_align_inwards_so_they_do_not_clip(self):
+        """Two of the cubic sector's three corners sit hard against the key's
+        edge; centre-aligned text there is cut off by the panel."""
+        from spyde.actions.ipf_view import ipf_key_overlay
+        _rgba, labels = ipf_key_overlay(_al_orientation_map(), "z")
+        for d in labels:
+            if d["x"] > 0.75:
+                assert d["align"] == "right", d
+            elif d["x"] < 0.25:
+                assert d["align"] == "left", d
+            assert 0.02 <= d["x"] <= 0.98, d
+            assert 0.06 <= d["y"] <= 0.94, d
+
+    def test_attach_ipf_key_registers_one_key_on_the_plot(self):
+        """The key rides on the map figure now, instead of being a second
+        figure floated over the window by the renderer."""
+        import anyplotlib as apl
+        from spyde.actions.ipf_view import attach_ipf_key
+
+        fig, axes = apl.subplots(1, 1)
+        ax = axes[0][0] if isinstance(axes, list) else axes
+        p = ax.imshow(np.zeros((8, 8), np.float32))
+        assert attach_ipf_key(p, _al_orientation_map(), "z") is True
+        keys = p.list_keys()
+        assert len(keys) == 1
+
+    def test_the_key_is_hover_only_by_default(self):
+        """It should not sit permanently on top of the data."""
+        import anyplotlib as apl
+        from spyde.actions.ipf_view import attach_ipf_key
+
+        fig, axes = apl.subplots(1, 1)
+        ax = axes[0][0] if isinstance(axes, list) else axes
+        p = ax.imshow(np.zeros((8, 8), np.float32))
+        attach_ipf_key(p, _al_orientation_map(), "z")
+        assert p.get_key("ipf_key").hover_only is True
+
+    def test_no_ipf_key_figure_is_emitted_any_more(self):
+        """The separate `view="ipf_key"` figure is gone — a regression here
+        means two colour keys on screen, or a stray iframe with no renderer
+        left to place it."""
         import spyde.backend.ipc as ipc
-        from spyde.actions.ipf_view import emit_ipf_key
+        from spyde.actions.ipf_view import attach_ipf_3d
+
+        class _Plot:
+            window_id = 77
+
+            def set_view_tag(self, *a, **k):
+                pass
+
+        class _Tree:
+            signal_plots = [_Plot()]
+
         captured, orig = [], ipc.emit
         ipc.emit = lambda m: captured.append(m)
         try:
-            assert emit_ipf_key(77, _al_orientation_map(), "z") is True
+            attach_ipf_3d(_Tree(), _al_orientation_map(), "z")
         finally:
             ipc.emit = orig
-        figs = [m for m in captured if m.get("type") == "figure"
-                and m.get("view") == "ipf_key"]
-        assert figs and figs[-1]["window_id"] == 77
-        assert "<body>" in figs[-1]["html"]
+        assert captured, "the fallback path should still emit its view figures"
+        assert not [m for m in captured if m.get("view") == "ipf_key"]
 
     def test_build_3d_figure_html(self):
         om = _al_orientation_map()

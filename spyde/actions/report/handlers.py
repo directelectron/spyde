@@ -537,6 +537,42 @@ class ReportManager:
         import uuid
         return f"vx_{cell.id}_{uuid.uuid4().hex[:8]}", html
 
+    def _orientation_explorer_for_cell(self, cell: Cell) -> "tuple[str, str] | None":
+        """The vectors explorer's sibling for an ORIENTATION cell: resolved
+        source tree carries an orientation result and
+        ``spec.orientation_mode != "image"`` → the self-contained IPF explorer
+        (map + triangle + sphere), as ``(fig_id, html)``, else None.
+
+        Same contract as :meth:`_vectors_explorer_for_cell` in every respect
+        that matters here — one page, one figure, emitted through the ordinary
+        bare-figure path — so the sidebar and the HTML export show the same
+        thing. Tried AFTER vectors: a tree can carry both (find-vectors then
+        vector-OM), and the vectors explorer is the one the user dragged from."""
+        spec = cell.spec
+        if spec is None:
+            return None
+        if getattr(spec, "orientation_mode", "") == "image":
+            return None
+        if _is_scene3d_cell(cell):
+            return None            # a scene cell is already a 3-D snapshot
+        try:
+            from spyde.actions.report.orientation_embed import (
+                orientation_explorer_html, orientation_for_cell,
+            )
+            result = orientation_for_cell(self.session, cell)
+            if result is None:
+                return None
+            html = orientation_explorer_html(result, caption=cell.caption or "",
+                                             cache_key=cell.id)
+            if html is None:       # over the embed cap / no indexed positions
+                return None
+        except Exception as e:
+            log.debug("[report] sidebar orientation explorer build failed "
+                      "(cell %s): %s", cell.id, e)
+            return None
+        import uuid
+        return f"ox_{cell.id}_{uuid.uuid4().hex[:8]}", html
+
     def build_figure_window(self, cell: Cell) -> None:
         """Build (or rebuild) the live figure window for a figure cell and emit
         it through the bare-figure path with ``host:"report"`` + ``cell_id``.
@@ -568,7 +604,8 @@ class ReportManager:
         # EDIT mode (the annotation editor targets the anyplotlib figure, so a cell
         # being edited falls back to the plain snapshot figure it can annotate).
         if cell.id not in self._editing:
-            explorer = self._vectors_explorer_for_cell(cell)
+            explorer = (self._vectors_explorer_for_cell(cell)
+                        or self._orientation_explorer_for_cell(cell))
             if explorer is not None:
                 self._emit_vectors_explorer(cell, explorer)
                 return
@@ -1408,14 +1445,27 @@ def _widget_geometry_to_data(kind, widget, axes, coords) -> "dict | None":
 
 
 def _clear_vectors_explorer_cache(cell_id: "str | None" = None) -> None:
-    """Drop the memoized vectors-explorer page(s) (fix #6). Best-effort; a lazy
-    import so vectors_embed (which pulls anyplotlib) isn't loaded at handler
-    import time. ``cell_id`` clears one cell; ``None`` clears all."""
+    """Drop the memoized explorer page(s) — vectors AND orientation (fix #6).
+    Best-effort; a lazy import so the embed modules (which pull anyplotlib)
+    aren't loaded at handler import time. ``cell_id`` clears one cell; ``None``
+    clears all.
+
+    Both are cleared together because both are keyed by cell id and both are
+    invalidated by exactly the same events; a cell that stopped being a vectors
+    cell and became an orientation one would otherwise keep serving the old
+    page from the sibling cache."""
     try:
         from spyde.actions.report.vectors_embed import clear_explorer_cache
         clear_explorer_cache(cell_id)
     except Exception as e:
         log.debug("clear vectors explorer cache failed: %s", e)
+    try:
+        from spyde.actions.report.orientation_embed import (
+            clear_explorer_cache as clear_orientation_cache,
+        )
+        clear_orientation_cache(cell_id)
+    except Exception as e:
+        log.debug("clear orientation explorer cache failed: %s", e)
 
 
 def _manager(session) -> ReportManager:
@@ -1927,7 +1977,13 @@ def _resolve_source_plot(session, source_window_id):
         source_window_id = getattr(session, "_active_window_id", None)
     if source_window_id is None:
         return None
-    return session._plot_by_window_id(int(source_window_id))
+    plot = session._plot_by_window_id(int(source_window_id))
+    if plot is not None:
+        return plot
+    # A controller-backed BARE figure window (the IPF explorer) has no Plot of
+    # its own; it stands in for the map window it belongs to.
+    ctrl = session.controller_by_window_id(int(source_window_id))
+    return getattr(ctrl, "source_plot", None) if ctrl is not None else None
 
 
 # ── handlers ───────────────────────────────────────────────────────────────────
@@ -2915,7 +2971,17 @@ def report_add_figure(session, plot, payload) -> None:
     # the viewer-vs-image prompt is skipped for it.
     _tgt = mgr.doc.cell_by_id(payload.get("at_cell")) if payload.get("at_cell") else None
     _target_is_split = _tgt is not None and _tgt.cell_type == "split"
-    if str(payload.get("view", "") or "") == "3d":
+    _view = str(payload.get("view", "") or "")
+    if _view in ("ipf2d", "density", "density3d"):
+        # The other three IPF EXPLORER views are native anyplotlib figures with
+        # no backing Plot array, and the report's snapshot paths capture a Plot
+        # (static) or the scene3d point cloud. Say so plainly rather than
+        # silently capturing the wrong thing (the map window's image, or a
+        # points sphere where the user dragged a density one).
+        ipc.emit_error("report_add_figure: only the 3-D Points IPF view can be "
+                       "captured into a report — switch to [3D] · [Points].")
+        return
+    if _view == "3d":
         snap = _snapshot_scene3d(session, src)
         if snap is None:
             ipc.emit_error("report_add_figure: source window has no 3-D "

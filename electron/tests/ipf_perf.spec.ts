@@ -233,8 +233,12 @@ test('IPF raster/GPU render paths render correctly in the real app', async () =>
   await raiseOm()
 
   // ── STEP 1: 2-D IPF map + colour-KEY triangle raster (change #2) ────────────
+  // The key is no longer a figure of its own with its own testid — it is an
+  // anyplotlib KEY overlay drawn INSIDE the map figure (Plot2D.add_key), so
+  // there is no DOM node to wait on. Wait for the map figure itself; the
+  // colourfulness assertion below is what actually proves it painted.
   await page.getByTestId(`ipf-view-2d-${omId}`).click({ force: true })
-  await expect(page.getByTestId(`ipf-key-${omId}`)).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByTestId(`figure-box-${omId}`)).toBeVisible({ timeout: 20_000 })
   await page.waitForTimeout(800)
   await raiseOm()                                        // raise the 2-D map iframe
   await page.waitForTimeout(1500)                        // key + map paint
@@ -245,7 +249,10 @@ test('IPF raster/GPU render paths render correctly in the real app', async () =>
   assertNoJsErrors()
 
   // ── STEP 2: DENSITY / PDF raster (change #3) ────────────────────────────────
-  await page.getByTestId(`ipf-view-density-${omId}`).click({ force: true })
+  // Density is no longer a third projection alongside 2D/3D — it is the
+  // `Heatmap` half of the SECOND, independent toggle pair, so it composes with
+  // the 2D chosen in step 1 rather than replacing it.
+  await page.getByTestId(`ipf-style-heatmap-${omId}`).click({ force: true })
   await page.waitForTimeout(1000)
   await raiseOm()                                        // raise the now-shown density iframe
   await page.waitForTimeout(2000)                        // griddata resample + raster
@@ -256,6 +263,11 @@ test('IPF raster/GPU render paths render correctly in the real app', async () =>
   assertNoJsErrors()
 
   // ── STEP 4: 3-D sphere scatter on WebGPU (change #4) ────────────────────────
+  // Back to Points first: the style pair is independent of 2D/3D, so step 2
+  // would otherwise leave this on the 3-D textured heatmap and the "scatter"
+  // this step exists to prove would never be drawn.
+  await page.getByTestId(`ipf-style-points-${omId}`).click({ force: true })
+  await page.waitForTimeout(500)
   await page.getByTestId(`ipf-view-3d-${omId}`).click({ force: true })
   await page.waitForTimeout(1000)
   await raiseOm()                                        // raise the now-shown 3-D iframe
