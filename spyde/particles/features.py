@@ -55,7 +55,7 @@ A drift-corrected frame carries a NaN-padded border
 (:mod:`spyde.drift.warp`), and every convolution propagates NaN outward, which
 would erase a band of real data. :func:`prepare_frame` fills the non-finite
 pixels with the finite **minimum** — the same choice, for the same reason, as
-:func:`spyde.particles.classical._prepare`: the padding then reads as background,
+:func:`spyde.particles.instances._prepare`: the padding then reads as background,
 the one value guaranteed not to classify as a particle. It also returns the
 validity mask, and the classifier is required to force those pixels to zero
 probability (plan trap 2).
@@ -175,7 +175,62 @@ class FeatureSpec:
     hessian: bool = True
     laplacian: bool = True
     rank_radii: tuple[int, ...] = DEFAULT_RANK_RADII
-    median: bool = True
+    #: OFF by default: it costs **28% of the whole feature stack** for **2 of
+    #: 36 channels**, which is the worst ratio in the set by a wide margin.
+    #:
+    #: Profiled on a 4096² frame, CUDA (TITAN X Pascal, 373 GB/s), 36 channels,
+    #: 875 ms wall with the GPU 92% busy — so this is real work, not launch
+    #: overhead:
+    #:
+    #:     aten::median               226 ms   x  32   7046 us each
+    #:     aten::cudnn_convolution    228 ms   x 400    570 us each
+    #:     aten::copy_                191 ms   x 472    406 us each
+    #:     aten::amin + aten::amax     15 ms   x  32    ~470 us each
+    #:
+    #: The last line is the argument. ``minimum`` and ``maximum`` are the SAME
+    #: unfold over the SAME windows for twice as many channels, and together
+    #: they cost 15 ms against the median's 226 — because a median is a *sort*
+    #: of every window (9 and 25 taps per pixel over 16.7 M pixels) while a
+    #: min/max is a single pass. The transposed-reduction trick below already
+    #: took it 52 ms → 23 ms per band; it is still 15x its own family.
+    #:
+    #: Set ``median=True`` to bring it back — the implementation is unchanged
+    #: and a head saved with it keeps working, because a saved model carries
+    #: its own ``FeatureSpec`` (``ScribbleClassifier.save``/``load``) and is
+    #: never re-specced from this default.
+    median: bool = False
+    #: ``sobel`` / ``minimum`` / ``maximum`` stay ON, and the failed attempt to
+    #: drop them is worth recording because the first metric said they were free.
+    #:
+    #: Scored over six seeds by the probability at each faint probe's centre —
+    #: the margin above the 0.5 cliff — dropping sobel and min/max looked
+    #: STRICTLY better than keeping them: 25 channels, 32% faster to featurise,
+    #: and the HIGHEST minimum margin of anything tried (0.990 against the
+    #: 34-channel 0.952), with nothing lost in 12 runs.
+    #:
+    #: It is not free. That metric only asked whether a particle is FOUND, and
+    #: these channels also feed the boundary class, i.e. instance SPLITTING.
+    #: Counting instances from both split routes over eight seeds on the
+    #: nine-particle fixture:
+    #:
+    #:     variant                  boundary route   watershed route
+    #:     25 ch (-sobel -minmax)   WRONG 2/8        ok
+    #:     30 ch (-minmax)          ok               WRONG 1/8
+    #:     20 ch (-sobel)           WRONG 1/8        ok
+    #:     34 ch (median off only)  ok               ok
+    #:     36 ch (original)         ok               ok
+    #:
+    #: Only the median drop is clean on both routes. Sobel is an edge detector
+    #: and a seam between two touching particles IS an edge, so a head asked to
+    #: predict boundaries without it over-splits — 1 or 2 runs in 8 return ten
+    #: particles where there are nine. A detection metric cannot see that,
+    #: which is the whole lesson: score the thing you are about to rely on.
+    #:
+    #: Anything further here needs BOTH gates — the six-seed faint margin AND
+    #: the eight-seed two-route instance count. A sigma cut needs a third: the
+    #: fixture's particles are 3-9 px and the largest sigma is exactly what a
+    #: big particle needs, so ``sigmas=(1,2,4)`` (22 ch, margin 0.880) is
+    #: untested for real data and must not be taken on this evidence.
     minimum: bool = True
     maximum: bool = True
     membrane: bool = False
@@ -441,7 +496,7 @@ def prepare_frame(frame, spec: FeatureSpec | None = None) -> PreparedFrame:
     Non-finite pixels are filled with the finite **minimum**, not with zero and
     not with the mean: the padding has to read as background, and the minimum is
     the one value that cannot threshold or classify as a particle. This mirrors
-    :func:`spyde.particles.classical._prepare` deliberately — two engines that
+    :func:`spyde.particles.instances._prepare` deliberately — two engines that
     disagree about what the padding *is* would disagree about the frame border
     for no reason a user could see.
 
