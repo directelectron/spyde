@@ -276,6 +276,11 @@ export function SubWindow({
   return (
     <div
       data-testid="subwindow"
+      // The backend's window id, exposed for e2e. A staged action is routed by
+      // it (`window.electron.action(a, p, windowId)`), so a spec that needs to
+      // send one — rather than click the control that sends it — has no other
+      // way to name the target window.
+      data-window-id={windowId}
       style={{ ...styles.window, ...frame, zIndex, ...(hidden ? { display: 'none' } : {}) }}
       onMouseDown={() => onFocus(id)}
       onMouseEnter={showToolbar}

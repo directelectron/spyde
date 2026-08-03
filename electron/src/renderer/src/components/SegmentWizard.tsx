@@ -9,15 +9,32 @@
  * "find the particles"; everything else is tuning for someone who already knows
  * the answer is wrong.
  *
- *   ┌ Segment Particles ──────── ✕ ┐
- *   │ [Classical] [Scribble] [Prompt]│
- *   │  Fewer ────●──── More          │
- *   │  Merge closer than ──●── 12 nm │
- *   │  Ignore smaller than ─●── off  │
- *   │  6 particles on this frame     │
- *   │  [    Find in all frames    ]  │
- *   │  ▸ Advanced                    │
- *   └────────────────────────────────┘
+ *   ┌ Segment Particles ──────────── ✕ ┐
+ *   │ Paint an example of each class,  │
+ *   │ include one FAINT particle, then │
+ *   │ Train.                           │
+ *   │  Merge closer than ──●── 12 nm   │
+ *   │  Ignore smaller than ─●── off    │
+ *   │  ■ particle    387               │
+ *   │  ■ support film 527              │
+ *   │  [ Train ]                       │
+ *   │  6 particles on this frame       │
+ *   │  [    Find in all frames    ]    │
+ *   │  ▸ Advanced                      │
+ *   └──────────────────────────────────┘
+ *
+ * ONE ENGINE, so no tab row. Classical / Scribble / Prompt used to sit at the
+ * top; the classical engine is DELETED (a global threshold has no bimodal
+ * histogram to find on low-contrast in-situ data — it returned the support film
+ * as thousands of particles, and no control on this caret could fix that; see
+ * `spyde/particles/instances.py`), and Prompt is not installed. A tab row over
+ * one usable tab is furniture. It comes back with plan B4's prompt head.
+ *
+ * The consequence worth stating: the caret opens having found NOTHING, because
+ * an untrained classifier has no opinion. That is deliberate. The old face
+ * showed a classical result the instant it opened, which looked like progress
+ * and was usually the film — so the untrained caret's primary content is the
+ * instruction, not a result.
  *
  * Four things here are load-bearing, none of them cosmetic:
  *
@@ -44,13 +61,11 @@
  *    as a block on the primary face it was a large orange alarm for a parameter
  *    nobody should normally touch.
  *
- * 3. **Per-class labelled-pixel counts are the point of the class list, and the
- *    class list is the SCRIBBLE tab's business.** Under-training a class is *the*
- *    failure mode and these counts are how you notice; a class below `LOW_PIXELS`
- *    is dimmed and flagged so "the preview got worse" pushes you toward painting
- *    another example instead of toward the sensitivity slider, which cannot fix a
- *    missing example. On the Classical tab there is nothing to train, so the list
- *    is not shown there.
+ * 3. **Per-class labelled-pixel counts are the point of the class list.**
+ *    Under-training a class is *the* failure mode and these counts are how you
+ *    notice; a class below `LOW_PIXELS` is dimmed and flagged so "the preview
+ *    got worse" pushes you toward painting another example — which is the only
+ *    thing that can fix a missing example.
  *
  * 4. **Nothing was deleted, only demoted — and Advanced is TWO COLUMNS.** Every
  *    control that left the primary face is inside `▸ Advanced` and sends the
@@ -77,7 +92,7 @@
  * list.
  */
 import React from 'react'
-import { WizardShell, TabRow, Slider, Select, Check, NumInput, Field, S } from './WizardShell'
+import { WizardShell, Slider, Check, NumInput, Field, S } from './WizardShell'
 import { useWizardLifecycle, useDebouncedAction, useWizardEvent, CommitButton } from './wizardHooks'
 import type { SendAction } from './wizardHooks'
 import { ClassStrip } from './ClassStrip'
@@ -94,28 +109,6 @@ interface Props {
   stripPos?: React.CSSProperties
 }
 
-/** The three mask sources of plan §0.2 = `particles_action.METHODS`. */
-type Method = 'classical' | 'scribble' | 'prompt'
-const METHODS: readonly Method[] = ['classical', 'scribble', 'prompt']
-// TabRow renders the tab VALUE as its label, so the tabs are the Title Case
-// strings and the lowercase backend key is recovered for the action + testid.
-type TabLabel = 'Classical' | 'Scribble' | 'Prompt'
-const TABS: readonly TabLabel[] = ['Classical', 'Scribble', 'Prompt']
-const METHOD_OF: Record<TabLabel, Method> = {
-  Classical: 'classical', Scribble: 'scribble', Prompt: 'prompt',
-}
-const TAB_OF: Record<Method, TabLabel> = {
-  classical: 'Classical', scribble: 'Scribble', prompt: 'Prompt',
-}
-
-/** `particles_action.THRESHOLD_METHODS`, in the backend's order. */
-const THRESHOLDS = [
-  'otsu', 'mean', 'minimum', 'yen', 'isodata', 'li',
-  'local', 'local_otsu', 'niblack', 'sauvola',
-] as const
-type Threshold = typeof THRESHOLDS[number]
-const THRESHOLD_OPTS = THRESHOLDS.map(v => ({ value: v, label: v }))
-
 /** Below this many labelled pixels a class is flagged as under-trained. A
  *  scribble is a few hundred pixels per dab, so ~200 is "one dab or less". */
 const LOW_PIXELS = 200
@@ -123,21 +116,14 @@ const LOW_PIXELS = 200
 /** Mirrors `particles_action.DEFAULTS`. Kept in sync by shape, not by import —
  *  the backend re-coerces everything anyway and echoes the effective values. */
 interface SegSaved {
-  method: Method
-  sensitivity: number
   minScore: number
   mergeNm: number
   minNm: number
-  threshold: Threshold
   minSize: number
   maxSize: number
   watershed: boolean
   minSeparation: number
   markerSmooth: number
-  gaussian: number
-  rbKernel: number
-  invert: boolean
-  localSize: number
   clearBorder: boolean
   storeMasks: boolean
   track: boolean
@@ -147,10 +133,9 @@ interface SegSaved {
   eraser: boolean
 }
 const DEFAULTS: SegSaved = {
-  method: 'classical', sensitivity: 0.5, minScore: 0, mergeNm: 0, minNm: 0,
-  threshold: 'otsu', minSize: 20,
+  minScore: 0, mergeNm: 0, minNm: 0, minSize: 20,
   maxSize: 0, watershed: true, minSeparation: 3, markerSmooth: 1.0,
-  gaussian: 0.0, rbKernel: 0, invert: false, localSize: 31, clearBorder: false,
+  clearBorder: false,
   storeMasks: true, track: true, maxDist: 10.0, brush: 3.0,
   activeClass: 0, eraser: false,
 }
@@ -191,21 +176,14 @@ interface Preview {
 
 export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPos }: Props) {
   const saved = _segStore.get(windowId) ?? DEFAULTS
-  const [method, setMethod] = React.useState<Method>(saved.method)
-  const [sensitivity, setSensitivity] = React.useState(saved.sensitivity)
   const [minScore, setMinScore] = React.useState(saved.minScore)
   const [mergeNm, setMergeNm] = React.useState(saved.mergeNm)
   const [minNm, setMinNm] = React.useState(saved.minNm)
-  const [threshold, setThreshold] = React.useState<Threshold>(saved.threshold)
   const [minSize, setMinSize] = React.useState(saved.minSize)
   const [maxSize, setMaxSize] = React.useState(saved.maxSize)
   const [watershed, setWatershed] = React.useState(saved.watershed)
   const [minSeparation, setMinSeparation] = React.useState(saved.minSeparation)
   const [markerSmooth, setMarkerSmooth] = React.useState(saved.markerSmooth)
-  const [gaussian, setGaussian] = React.useState(saved.gaussian)
-  const [rbKernel, setRbKernel] = React.useState(saved.rbKernel)
-  const [invert, setInvert] = React.useState(saved.invert)
-  const [localSize, setLocalSize] = React.useState(saved.localSize)
   const [clearBorder, setClearBorder] = React.useState(saved.clearBorder)
   const [storeMasks, setStoreMasks] = React.useState(saved.storeMasks)
   const [track, setTrack] = React.useState(saved.track)
@@ -226,12 +204,13 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
   // whose "N particles on frame M" status overwrites it within milliseconds —
   // so a transient status is a report the user never gets to read.
   const [trainReport, setTrainReport] = React.useState<string | null>(null)
-  const [status, setStatus] = React.useState('Drag Fewer / More, then find in all frames.')
+  const [status, setStatus] = React.useState(
+    'Paint an example of each class, then Train.')
 
   const vals = React.useRef<SegSaved>(saved)
   vals.current = {
-    method, sensitivity, minScore, mergeNm, minNm, threshold, minSize, maxSize, watershed, minSeparation,
-    markerSmooth, gaussian, rbKernel, invert, localSize, clearBorder,
+    minScore, mergeNm, minNm, minSize, maxSize, watershed, minSeparation,
+    markerSmooth, clearBorder,
     storeMasks, track, maxDist, brush, activeClass, eraser,
   }
   React.useEffect(() => { _segStore.set(windowId, vals.current) })
@@ -249,13 +228,14 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
   const params = (): Record<string, unknown> => {
     const v = vals.current
     return {
-      method: v.method, sensitivity: v.sensitivity, min_score: v.minScore,
+      // `method` is still sent, and is still a backend parameter: plan B4's
+      // prompt head is a second engine, and a saved result's provenance records
+      // which one produced it. There is simply nothing to CHOOSE right now.
+      method: 'scribble', min_score: v.minScore,
       merge_nm: v.mergeNm, min_nm: v.minNm,
-      threshold: v.threshold,
       min_size: v.minSize, max_size: v.maxSize, watershed: v.watershed,
       min_separation: v.minSeparation, marker_smooth: v.markerSmooth,
-      gaussian: v.gaussian, rb_kernel: v.rbKernel, invert: v.invert,
-      local_size: v.localSize, clear_border: v.clearBorder,
+      clear_border: v.clearBorder,
       store_masks: v.storeMasks, track: v.track, max_dist: v.maxDist,
       brush: v.brush,
       // The brush WIDGET lives in Python, so the strip's state has to travel or
@@ -292,11 +272,6 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
     if (Array.isArray(d.labelled_frames)) setLabelledFrames(d.labelled_frames as number[])
     if (typeof d.trained === 'boolean') setTrained(d.trained)
     if (typeof d.frame === 'number') setFrame(d.frame)
-    // The engine can change WITHOUT the caret asking (seg_train switches to
-    // scribble on success), so the tab follows the backend.
-    if (typeof d.method === 'string' && METHODS.includes(d.method as Method)) {
-      setMethod(d.method as Method)
-    }
   })
 
   useWizardEvent('spyde:seg_preview', windowId, (d) => {
@@ -381,18 +356,9 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
 
   // ── actions ───────────────────────────────────────────────────────────────
 
-  const onMethod = (m: Method) => {
-    setMethod(m)
-    vals.current = { ...vals.current, method: m }
-    // The backend re-previews on set_method, so this is NOT a tune.
-    sendAction('seg_set_method', { method: m }, windowId)
-  }
-
   const labelledPixels = classes.reduce((a, c) => a + (c.pixels || 0), 0)
-  const isPrompt = method === 'prompt'
-  const isScribble = method === 'scribble'
-  const canTrain = labelledPixels > 0 && !isPrompt
-  const canRun = !isPrompt && (method !== 'scribble' || trained)
+  const canTrain = labelledPixels > 0
+  const canRun = trained
 
   const train = () => {
     setStatus('Training…')
@@ -433,38 +399,34 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
         // the §0.9a calm the collapsed face is for.
         width={advanced ? ADV_WIDTH : 262}
       >
-        <TabRow
-          tabs={TABS} active={TAB_OF[method]}
-          onSelect={(t) => onMethod(METHOD_OF[t])}
-          testid={(t) => `seg-tab-${METHOD_OF[t]}`}
-        />
+        {/* NO TAB ROW. There was one — Classical / Scribble / Prompt — and it
+            is gone with the classical engine: a global threshold has no bimodal
+            histogram to find on low-contrast in-situ data, so it returned the
+            support film as thousands of particles and no knob on this caret
+            could fix that (measured, see `particles_action.METHODS`). Prompt is
+            not installed. One remaining engine and one unimplemented one is not
+            a choice, and a tab row over a single tab is furniture.
 
-        {isPrompt && (
-          <div data-testid="seg-prompt-note" style={noteStyle}>
-            Prompt segmentation is not installed yet — use Classical or Scribble.
-          </div>
-        )}
+            Bring the row back WITH plan B4's prompt head, not before. */}
 
-        {/* ── Classical: one knob ──────────────────────────────────────────── */}
-        {method === 'classical' && (
-          <div style={sensRowStyle}>
-            <span style={endLabelStyle}>Fewer</span>
-            {/* No numeric readout: "0.50" of what? The endpoints ARE the units.
-                The value is still stored and sent unchanged. */}
-            <input data-testid="seg-sensitivity" type="range"
-              min={0} max={1} step={0.01} value={sensitivity}
-              style={{ flex: 1, minWidth: 40 }}
-              onChange={(e) => { const n = Number(e.target.value); setSensitivity(n); tune() }} />
-            <span style={endLabelStyle}>More</span>
+        {/* ── Step 1: teach it ─────────────────────────────────────────────
+            The caret now opens with NOTHING found, because a classifier that
+            has not been trained has no opinion — and that is the honest state.
+            The old face showed a classical result immediately, which looked
+            like progress and was usually the film. So the untrained caret's
+            primary content is the instruction, not a result. */}
+        {!trained && (
+          <div data-testid="seg-scribble-note" style={noteStyle}>
+            Paint an example of each class on the image with the strip —
+            <b> include at least one FAINT particle</b> — then press Train.
           </div>
         )}
 
         {/* ── The two face controls, both in NANOMETRES ────────────────────
             A distance in the image is something the eye can judge against the
             scale bar; a 0-1 "confidence" is not, which is why that control read
-            as meaningless. Both are engine-independent — they act on the
-            measured instances, not on any one method's parameters — so the
-            caret's face is the same on Classical, Scribble and Prompt.
+            as meaningless. Both act on the measured instances rather than on
+            the engine, so they survive a change of engine.
 
             `merge` answers "some of these should be one particle": pieces whose
             gap is under it are relabelled as one. `min` drops anything smaller
@@ -488,66 +450,52 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
           </div>
         </Field>
 
-        {/* ── Scribble: the class list + Train ─────────────────────────────── */}
-        {isScribble && (
-          <>
-            {!trained && (
-              <div data-testid="seg-scribble-note" style={noteStyle}>
-                Paint with the strip on the image — include at least one FAINT
-                particle — then Train.
-              </div>
-            )}
-            {trainReport && (
-              <div data-testid="seg-trained-note" style={okNoteStyle}>{trainReport}</div>
-            )}
-            <ClassList classes={classes} activeClass={activeClass}
-              onSelect={(id) => {
-                setEraser(false); setActiveClass(id)
-                vals.current = { ...vals.current, activeClass: id, eraser: false }
-                tune()
-              }} />
-            <button data-testid="seg-train" style={canTrain ? secondaryBtnStyle : disabledSecondaryStyle}
-              disabled={!canTrain}
-              title={canTrain ? 'Fit the scribble classifier on every labelled pixel'
-                : 'Paint a few scribbles first'}
-              onClick={train}>Train</button>
-          </>
-        )}
-
-        {/* The train report is the direct answer to the Train button, so on any
-            other tab it would be a report with no question. */}
-        {!isScribble && trainReport && (
+        {/* ── the class list + Train ──────────────────────────────────────── */}
+        {trainReport && (
           <div data-testid="seg-trained-note" style={okNoteStyle}>{trainReport}</div>
         )}
+        <ClassList classes={classes} activeClass={activeClass}
+          onSelect={(id) => {
+            setEraser(false); setActiveClass(id)
+            vals.current = { ...vals.current, activeClass: id, eraser: false }
+            tune()
+          }} />
+        <button data-testid="seg-train" style={canTrain ? secondaryBtnStyle : disabledSecondaryStyle}
+          disabled={!canTrain}
+          title={canTrain ? 'Fit the scribble classifier on every labelled pixel'
+            : 'Paint a few scribbles first'}
+          onClick={train}>{trained ? 'Re-train' : 'Train'}</button>
 
         <div data-testid="seg-preview-stats" data-seq={preview?.seq ?? 0}
           data-count={preview?.count ?? -1}
           data-failed={preview?.thresholdFailed ? 'true' : 'false'}
+          data-coverage={preview ? preview.coverage.toFixed(4) : ''}
           data-cropped={box ? 'true' : 'false'} style={countStyle}>
           {countText}
         </div>
 
-        {/* ── the threshold-failed verdict ─────────────────────────────────
-            A global threshold on a low-contrast frame has no bimodal histogram
-            to find, so it lands inside the noise and the split shatters the
-            support film into thousands of pieces. Reported as "14028 particles
-            in this region" that reads as a real (if bad) answer, and the
-            natural response is to reach for the sliders — none of which can fix
-            it. Measured on a stand-in for the reported frame: min_size alone
-            takes 4873 → 17 instances but coverage only 39% → 7%, and the
-            settings that DO yield 8 instances cover 52% of the frame, i.e. the
-            8 bodies are the film.
+        {/* ── the "this is noise, not particles" verdict ───────────────────
+            Kept after the classical engine was deleted, and not as a leftover:
+            it tests the measured OUTPUT (how many instances, and what fraction
+            of the window they cover), so an under-trained head that has learnt
+            "film is particle" trips it exactly as a bad threshold did. That is
+            a real and common way to mis-train — one dab on the film and the
+            classifier will happily return the whole support.
 
-            So the caret names the failure and points at the engine that does
-            work on this data (plan §0.9: the learned classifier is the primary
-            path, not threshold tuning). It does NOT silently re-tune. */}
+            Naming it matters because the raw number does not read as a failure:
+            "14028 particles in this region" looks like a bad answer rather than
+            no answer, and the instinct is to reach for the size sliders. They
+            cannot fix it. Measured on the classical engine, min_size took 4873
+            → 17 instances while coverage only went 39% → 7%, and the settings
+            that produced a plausible 8 instances covered 52% of the frame —
+            those eight bodies WERE the film. */}
         {preview?.thresholdFailed && (
           <div data-testid="seg-threshold-failed" style={warnStyle}>
-            The threshold landed inside the noise — {preview.count.toLocaleString()}
-            {' '}pieces covering {Math.round(preview.coverage * 100)}% of the
-            {box ? ' region' : ' frame'}. That is the film being segmented, not
-            particles.{isScribble ? ' Paint a few examples and Train.'
-              : ' Try Scribble: paint a few examples and Train.'}
+            {preview.count.toLocaleString()} pieces covering{' '}
+            {Math.round(preview.coverage * 100)}% of the
+            {box ? ' region' : ' frame'} — that is the support film being
+            segmented, not particles. Paint the film as its own class and
+            re-train.
           </div>
         )}
         {box && (
@@ -563,8 +511,7 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
         <button data-testid="seg-run" style={canRun ? primaryWideStyle : disabledWideStyle}
           disabled={!canRun}
           title={canRun ? 'Segment every frame into a new particle dataset'
-            : (isPrompt ? 'Prompt segmentation is not installed'
-              : 'Train the scribble classifier first')}
+            : 'Train the classifier first'}
           onClick={runAll}>Find in all frames</button>
 
         {/* ── everything else ──────────────────────────────────────────────── */}
@@ -652,38 +599,12 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
                 <Check testid="seg-clear-border" checked={clearBorder} onChange={live(setClearBorder)}
                   label="Drop edge particles" />
 
-                {/* CLASSICAL ONLY, and not merely for space: these build the
-                    classical MASK. The scribble engine hands `split_instances`
-                    a probability map thresholded at 0.5, so it never reads
-                    threshold / sensitivity / gaussian / rb_kernel / invert /
-                    local_size — see
-                    `spyde/particles/classical.py::split_instances`. Rendering
-                    them on the Scribble tab would be six knobs that do nothing,
-                    which is the overload complaint in miniature. They keep
-                    their stored values and are still sent in every payload. */}
-                {method === 'classical' && (
-                  <>
-                    <div style={secStyle}>detection</div>
-                    <Cell label="Threshold">
-                      <Select testid="seg-threshold" value={threshold} options={THRESHOLD_OPTS}
-                        onChange={live(setThreshold)} />
-                    </Cell>
-                    <Cell label="Pre-blur σ (px)">
-                      <Slider testid="seg-gaussian" value={gaussian} min={0} max={10} step={0.1}
-                        onChange={live(setGaussian)} fmt={(n) => n.toFixed(1)} />
-                    </Cell>
-                    <Row label="Rolling ball">
-                      <NumInput testid="seg-rb-kernel" value={rbKernel} step="1" width={54}
-                        onChange={live(setRbKernel)} />
-                    </Row>
-                    <Row label="Local window">
-                      <NumInput testid="seg-local-size" value={localSize} step="2" width={54}
-                        onChange={live(setLocalSize)} />
-                    </Row>
-                    <Check testid="seg-invert" checked={invert} onChange={live(setInvert)}
-                      label="Dark particles" />
-                  </>
-                )}
+                {/* There is NO `detection` block any more. It held the
+                    classical mask's six knobs — threshold / sensitivity /
+                    pre-blur / rolling ball / local window / dark particles —
+                    and every one of them went with that engine. What counts as
+                    foreground is now the classifier's business, and the
+                    classifier is taught by painting, not by a slider. */}
               </div>
 
               <div data-testid="seg-advanced-feedback" style={advColStyle}>
@@ -723,8 +644,11 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
 
       {/* Painting controls go NEXT TO THE PLOT, not in the caret (plan B0).
           Rendered AFTER the shell so FloatingToolbar's placement effect still
-          measures the caret (it reads the wrapper's firstElementChild). */}
-      {stripPos && classes.length > 0 && method === 'scribble' && (
+          measures the caret (it reads the wrapper's firstElementChild).
+
+          No engine gate any more — painting is the ONLY way to teach the one
+          engine there is, so the strip is up whenever the caret is. */}
+      {stripPos && classes.length > 0 && (
         <ClassStrip
           classes={classes} activeId={activeClass}
           // Push to the backend, don't just set React state: the widget that
