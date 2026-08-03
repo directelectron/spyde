@@ -210,23 +210,52 @@ class TestExplorerStackPanel:
         np.testing.assert_array_equal(totals, [36, 72, 108, 144])
         assert totals.sum() == len(v.flat_buffer)
 
-    def test_the_page_wires_the_stack_panel_not_a_slider(self):
+    def test_the_page_wires_the_stack_panel(self):
         from spyde.actions.report.vectors_embed import vectors_explorer_html
         page = vectors_explorer_html(_vecs_5d(nt=4))
         assert page is not None
-        assert 'id="vx-stackid"' in page
         assert re.search(r'id="vx-stackid">\w+<', page), \
             "the page must carry a real stack panel id"
-        assert 'data-testid="vx-slice"' not in page, \
-            "the range slider is the fallback — not shipped alongside the panel"
         assert "setSlice" in page
+
+    def test_a_stack_page_carries_a_phone_layout_too(self):
+        """Both layouts ride in one file: the wide figure state (stack |
+        navigator | DP) and a narrow one (navigator | DP) for phones, where
+        three panels across 390 px leave each ~95-130 px. Only the small figure
+        state is duplicated — the point block, which is what makes these pages
+        big, is emitted once and shared."""
+        from spyde.actions.report.vectors_embed import vectors_explorer_html
+        page = vectors_explorer_html(_vecs_5d(nt=4))
+        assert 'id="vx-state-narrow"' in page, "no phone layout was built"
+        assert re.search(r'id="vx-navid-narrow">\w+<', page)
+        assert re.search(r'id="vx-dpid-narrow">\w+<', page)
+        # The narrow layout has NO stack panel, so the slider is its slice
+        # control — shipped, but CSS-gated on the layout that actually mounted.
+        assert 'data-testid="vx-slice"' in page
+        assert "vx-slice-wrap { display: none; }" in page
+        assert 'body[data-slice-control="1"] .vx-slice-wrap' in page
+        assert "matchMedia('(max-width: 700px)')" in page
+
+    def test_the_phone_layout_drops_the_stack_panel(self):
+        """`stack_panel=False` must yield the 2-panel figure — that IS the
+        phone layout, not a degraded copy of the wide one."""
+        from spyde.actions.report.vectors_embed import (
+            _build_figure, pack_vectors)
+        v = _vecs_5d(nt=4)
+        built = _build_figure(v, pack_vectors(v), stack_panel=False)
+        state, nav_id, dp_id, stack_id, _esm = built
+        assert stack_id == "", "the phone layout must not build a stack panel"
+        panels = [k for k in state
+                  if k.startswith("panel_") and k.endswith("_json")]
+        assert len(panels) == 2, f"expected 2 panels, got {len(panels)}"
+        assert nav_id != dp_id
 
     def test_the_slider_is_the_fallback_when_the_panel_cannot_build(self, monkeypatch):
         import spyde.actions.report.vectors_embed as ve
         real = ve._build_figure
 
-        def _no_stack(vecs, payload):
-            built = real(vecs, payload)
+        def _no_stack(vecs, payload, **kw):
+            built = real(vecs, payload, **kw)
             if built is None:
                 return None
             state, nav_id, dp_id, _stack_id, esm = built
@@ -237,6 +266,8 @@ class TestExplorerStackPanel:
         assert 'data-testid="vx-slice"' in page, \
             "with no stack panel the page must still offer a slice control"
         assert re.search(r'id="vx-slice"[^>]*max="3"', page)
+        assert 'id="vx-state-narrow"' not in page, \
+            "no stack panel means no wide/narrow split to make"
 
     def test_a_4d_page_has_neither(self):
         from spyde.actions.report.vectors_embed import vectors_explorer_html
@@ -244,6 +275,7 @@ class TestExplorerStackPanel:
         assert stack_id == "" and len(widgets) == 2
         page = vectors_explorer_html(_vecs())
         assert 'data-testid="vx-slice"' not in page
+        assert 'id="vx-state-narrow"' not in page
 
     def test_a_single_slice_stack_gets_no_stack_panel(self):
         _nav, _dp, stack_id, widgets = self._panels(_vecs_5d(nt=1))

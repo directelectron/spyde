@@ -245,9 +245,23 @@ def _count_map_u8(vecs, ny: int, nx: int) -> np.ndarray:
         cm = np.zeros((ny, nx), dtype=np.float32)
     if cm.shape != (ny, nx):
         cm = cm.reshape(ny, nx) if cm.size == ny * nx else np.zeros((ny, nx), np.float32)
-    img = np.log1p(cm)
-    mx = float(img.max()) or 1.0
-    return (255 * img / mx).astype(np.uint8)
+    # ROBUST levels, not 0..max. A scan where every position holds a similar
+    # number of vectors — the normal case once a detector is finding anything —
+    # has its whole range sitting near the top: counts of 8 to 11 through
+    # log1p/max land between 224 and 255, i.e. a washed-out near-white square
+    # with the structure invisible. The 2-98% window is what the app's own
+    # navigator auto-level uses, so the embedded panel reads the same.
+    finite = cm[np.isfinite(cm)]
+    if finite.size:
+        lo, hi = (float(v) for v in np.percentile(finite, (2.0, 98.0)))
+        if not hi > lo:                      # near-uniform → fall back to range
+            lo, hi = float(finite.min()), float(finite.max())
+    else:
+        lo, hi = 0.0, 1.0
+    if not hi > lo:
+        return np.zeros((ny, nx), np.uint8)
+    img = (np.clip(cm, lo, hi) - lo) / (hi - lo)
+    return (255 * img).astype(np.uint8)
 
 
 def _per_slice_totals(vecs, n_time: int) -> np.ndarray:
@@ -261,7 +275,8 @@ def _per_slice_totals(vecs, n_time: int) -> np.ndarray:
         return np.zeros(max(1, n_time), dtype=np.float64)
 
 
-def _build_figure(vecs, payload) -> "tuple[dict, str, str, str, str] | None":
+def _build_figure(vecs, payload, *, stack_panel: bool = True
+                  ) -> "tuple[dict, str, str, str, str] | None":
     """Build ONE anyplotlib figure and return
     ``(state, nav_panel_id, dp_panel_id, stack_panel_id, esm_text)``.
 
@@ -269,6 +284,13 @@ def _build_figure(vecs, payload) -> "tuple[dict, str, str, str, str] | None":
     stack | navigator | DP, mirroring the app's own three-level vectors window
     (1-D stack navigator → 2-D real-space count map → diffraction pattern).
     ``stack_panel_id`` is ``""`` when there is no stack axis.
+
+    ``stack_panel=False`` builds the two-panel layout even for a stack. That is
+    the PHONE layout: three panels across a 390 px screen leaves each about
+    95–130 px, too small to aim at, and a 1-D curve is the least useful of the
+    three at that size. Dropping it gives the other two ~175 px each and hands
+    slice selection to the range slider, which is a far better touch target than
+    a draggable line. The caller emits both layouts and picks at mount.
 
     A single figure/single ``mount()`` renders in the report SIDEBAR for free via
     the SeamlessFigureFrame (the previous two-figure layout showed only a plain
@@ -309,11 +331,12 @@ def _build_figure(vecs, payload) -> "tuple[dict, str, str, str, str] | None":
     # curve, not an image, so its width is a fixed pleasant ratio rather than a
     # content aspect.
     stack_aspect = 1.15
-    ratios = ([stack_aspect] if n_time > 1 else []) + [nav_aspect, dp_aspect]
+    want_stack = n_time > 1 and stack_panel
+    ratios = ([stack_aspect] if want_stack else []) + [nav_aspect, dp_aspect]
     fig_w = int(round(FIG_PX * sum(ratios))) + 20
     fig, axs = apl.subplots(1, len(ratios), figsize=(fig_w, FIG_PX),
                             width_ratios=ratios)
-    if n_time > 1:
+    if want_stack:
         ax_stack, ax_nav, ax_dp = axs[0], axs[1], axs[2]
     else:
         ax_stack, (ax_nav, ax_dp) = None, (axs[0], axs[1])
@@ -447,8 +470,22 @@ body { margin: 0; font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
 .vx-seg-btn[aria-pressed="true"] {
   background: #89b4fa; color: #11111b; }
 .vx-seg-btn[aria-pressed="true"]:hover { background: #a0c4ff; }
-/* Stack slider (5-D): accent-tinted, sized so it doesn't dominate the row. */
+/* Stack slider (5-D): accent-tinted, sized so it doesn't dominate the row.
+   Hidden by default — a wide page scrubs by dragging the stack navigator's
+   vline, and only the NARROW (phone) layout, which has no stack panel, promotes
+   the slider. `[data-slice-control]` is set on <body> by the page script once it
+   knows which layout mounted; the media query alone would show the slider on a
+   narrow desktop window that still mounted the wide layout. */
+.vx-slice-wrap { display: none; }
+body[data-slice-control="1"] .vx-slice-wrap { display: inline-flex; }
 .vx-slice { width: 160px; accent-color: #89b4fa; vertical-align: middle; }
+/* On a phone the slider IS the time axis — give it the full row and a thumb
+   big enough to hit. */
+@media (max-width: 700px) {
+  .vx-slice { width: 100%; min-width: 180px; height: 28px; }
+  .vx-slice-wrap { width: 100%; }
+  .vx-controls { gap: 8px; }
+}
 .vx-status-dot { width: 8px; height: 8px; border-radius: 50%;
                  background: #a6e3a1; box-shadow: 0 0 4px #a6e3a1;
                  display: inline-block; }
@@ -463,12 +500,31 @@ body { margin: 0; font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
 _EXPLORER_JS_TMPL = r"""
 const HDR = JSON.parse(document.getElementById('vx-header').textContent);
 const B64 = document.getElementById('vx-data').textContent.trim();
-const STATE = JSON.parse(document.getElementById('vx-state').textContent);
-const NAV_ID = document.getElementById('vx-navid').textContent.trim();
-const DP_ID = document.getElementById('vx-dpid').textContent.trim();
-// The STACK (1-D) navigator panel — 5-D only; '' for a plain 4-D scan.
-const STACK_ID = (document.getElementById('vx-stackid') || { textContent: '' })
-  .textContent.trim();
+
+// LAYOUT PICK (once, at mount). A stack page carries two anyplotlib figure
+// states: the wide one (stack | navigator | DP) and, for phones, a narrow one
+// (navigator | DP) whose slice control is the range slider — three panels across
+// a 390 px screen leaves each about 95-130 px, which is not a target you can
+// aim at with a thumb. Only the small figure state differs; the point block
+// below is shared, so this costs kilobytes.
+//
+// Deliberately NOT re-mounted on resize: re-running mount() would drop the
+// reader's pointer, region and detector. A rotated phone gets a scaled figure,
+// which is the lesser evil.
+const _txt = (id) => {
+  const el = document.getElementById(id)
+  return el ? el.textContent.trim() : ''
+}
+const NARROW_STATE_EL = document.getElementById('vx-state-narrow');
+const USE_NARROW = Boolean(NARROW_STATE_EL)
+  && window.matchMedia('(max-width: 700px)').matches;
+const STATE = JSON.parse(
+  (USE_NARROW ? NARROW_STATE_EL : document.getElementById('vx-state')).textContent);
+const NAV_ID = _txt(USE_NARROW ? 'vx-navid-narrow' : 'vx-navid');
+const DP_ID = _txt(USE_NARROW ? 'vx-dpid-narrow' : 'vx-dpid');
+// The STACK (1-D) navigator panel — wide stack layout only; '' for a plain 4-D
+// scan AND for the narrow layout, which scrubs with the slider instead.
+const STACK_ID = USE_NARROW ? '' : _txt('vx-stackid');
 const ESM = document.getElementById('vx-esm').textContent;
 
 const esmUrl = URL.createObjectURL(new Blob([ESM], { type: 'text/javascript' }));
@@ -691,6 +747,47 @@ const stats = { hit: 0, leftMean: 0, rightMean: 0, max: 0, viHit: 0, viMax: 0 };
 const readout = document.getElementById('vx-readout');
 let ovDP = null, ovVI = null;
 
+// ROBUST CONTRAST for the NAVIGATOR image (count map / virtual image).
+//
+// Scaling 0..max washes that panel out: a scan where every position holds a
+// similar number of vectors maps to a narrow band near white, with the
+// structure — which is a few percent of the range — invisible. The app's own
+// navigator does not do this; it auto-levels on robust percentiles, and this
+// is the same idea, so the embedded panel reads like the window it mirrors.
+//
+// Percentiles over a 256-bin histogram (values are small non-negative counts /
+// summed intensities, so a linear histogram is plenty) rather than a sort: the
+// nav grid can be tens of thousands of positions and this runs on every
+// detector drag. The DP is deliberately left on 0..max — a diffraction pattern
+// is mostly true black with a few bright disks, which is exactly the case
+// where a percentile floor would eat the background it should keep.
+function levels(arr) {
+  let lo = Infinity, hi = -Infinity;
+  for (let i = 0; i < arr.length; i++) {
+    const v = arr[i];
+    if (v < lo) lo = v;
+    if (v > hi) hi = v;
+  }
+  if (!(hi > lo)) return [0, hi > 0 ? hi : 1];
+  const BINS = 256, hist = new Int32Array(BINS), sc = (BINS - 1) / (hi - lo);
+  for (let i = 0; i < arr.length; i++) hist[Math.round((arr[i] - lo) * sc) | 0]++;
+  const n = arr.length;
+  const at = (frac) => {
+    let acc = 0;
+    const want = frac * n;
+    for (let b = 0; b < BINS; b++) {
+      acc += hist[b];
+      if (acc >= want) return lo + b / sc;
+    }
+    return hi;
+  };
+  let vlo = at(0.02), vhi = at(0.98);
+  // A degenerate window (a nearly uniform map) falls back to the full range so
+  // the panel never goes flat grey.
+  if (!(vhi > vlo)) { vlo = lo; vhi = hi; }
+  return [vlo, vhi];
+}
+
 function computeDP() {
   accDP.fill(0);
   const idx = idxScratch;
@@ -801,11 +898,16 @@ function computeVI() {
   // map is also what should change as you scrub. Fall back to this slice's count
   // map so the navigator always shows the scan.
   if (hit === 0 && sliceCountMap(accVI) === null) accVI.fill(0);
+  const [vlo, vhi] = levels(accVI);
+  const s = vhi > vlo ? 255 / (vhi - vlo) : 0;
+  for (let i = 0; i < accVI.length; i++) {
+    const v = Math.round((accVI[i] - vlo) * s);
+    u8VI[i] = v < 0 ? 0 : (v > 255 ? 255 : v);
+  }
   let m = 0;
   for (let i = 0; i < accVI.length; i++) if (accVI[i] > m) m = accVI[i];
-  const s = m > 0 ? 255 / m : 0;
-  for (let i = 0; i < accVI.length; i++) u8VI[i] = Math.round(accVI[i] * s);
   stats.viHit = hit; stats.viMax = m;
+  stats.viLevels = [vlo, vhi];
   if (ovVI) pushImage(ovVI, u8VI, navW, navH);
 }
 
@@ -984,11 +1086,14 @@ for (const b of document.querySelectorAll('.vx-seg-btn')) {
   b.addEventListener('click', () => { setMode(b.dataset.mode === 'integrate'); });
 }
 
-// Stack slider — the FALLBACK control, emitted only when the stack navigator
-// panel could not be built (a stack normally scrubs by dragging that panel's
-// vline). Absent entirely for a 4-D scan.
+// Stack slider. It is the slice control whenever the MOUNTED layout has no
+// stack panel — the phone layout by design, or a wide layout whose panel could
+// not be built. The CSS keeps it hidden until this flag says it is in charge, so
+// a narrow desktop window that still mounted the wide layout does not show two
+// competing controls.
 {
   const sld = document.getElementById('vx-slice');
+  if (sld && NT > 1 && !STACK_ID) document.body.dataset.sliceControl = '1';
   if (sld) sld.addEventListener('input', () => { setSlice(Number(sld.value)); });
 }
 // Park the stack vline on slice 0 and give the panel handle to the test hook.
@@ -1023,6 +1128,37 @@ window.__vx = {
 
 syncSeg();
 refresh();
+
+// The heading is baked for the wide layout; say what actually mounted.
+if (USE_NARROW) {
+  const h = document.getElementById('vx-heading');
+  if (h) h.textContent = 'Diffraction vectors — the slider picks the slice; '
+    + 'the navigator drives the pattern; the DP detector drives the virtual image';
+}
+
+// Tell a host page how tall we actually are, so it can size its iframe instead
+// of guessing. Reports embed this in a fixed-height frame, which leaves a large
+// dead band under the controls — worst on a phone, where the figure scales down
+// and the gap is most of the screen. Harmless where nobody listens.
+{
+  let last = 0;
+  const report = () => {
+    const h = Math.ceil(
+      document.getElementById('vx-root').getBoundingClientRect().height) + 16;
+    if (h > 0 && Math.abs(h - last) > 2) {
+      last = h;
+      try { parent.postMessage({ vxHeight: h }, '*'); } catch (e) { /* no host */ }
+    }
+  };
+  report();
+  // The figure settles over a couple of frames (fit transform, overlay measure),
+  // and the fit re-runs on container resize.
+  requestAnimationFrame(() => setTimeout(report, 60));
+  if (typeof ResizeObserver !== 'undefined') {
+    new ResizeObserver(report).observe(document.getElementById('vx-root'));
+  }
+}
+
 document.getElementById('vx-root').dataset.ready = '1';
 """
 
@@ -1038,7 +1174,7 @@ def _slice_control(n_time: int, have_stack_panel: bool) -> str:
     if n_time <= 1 or have_stack_panel:
         return ""
     return (
-        "<span class=\"vx-seg\">"
+        "<span class=\"vx-seg vx-slice-wrap\">"
         "<span class=\"vx-seg-label\">slice</span>"
         f"<input type=\"range\" id=\"vx-slice\" class=\"vx-slice\" "
         f"data-testid=\"vx-slice\" min=\"0\" max=\"{n_time - 1}\" step=\"1\" "
@@ -1093,6 +1229,18 @@ def vectors_explorer_html(vecs, caption: str = "",
     hdr = payload["header"]
     cap = _html.escape(caption or "")
 
+    # A NARROW (phone) layout alongside the wide one, for a stack. Only the
+    # anyplotlib figure state differs — tens of KB — while the thing that makes
+    # this page big, the point block, is emitted ONCE and shared. So carrying
+    # both layouts costs almost nothing, and the page picks at mount instead of
+    # shipping two files or bouncing phones through a redirect.
+    narrow = None
+    if stack_id:
+        alt = _build_figure(vecs, payload, stack_panel=False)
+        if alt is not None:
+            n_state, n_nav, n_dp, _n_stack, _esm = alt
+            narrow = (n_state, n_nav, n_dp)
+
     def _json_script(el_id: str, obj) -> str:
         # </script> can't appear inside a script element — escape the slash.
         txt = json.dumps(obj).replace("</", "<\\/")
@@ -1104,7 +1252,9 @@ def vectors_explorer_html(vecs, caption: str = "",
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
         f"<style>{_EXPLORER_CSS}</style></head><body>"
         "<div id=\"vx-root\" class=\"vx-wrap\">"
-        f"<h4>{_html.escape(_explorer_heading(hdr, stack_id))}</h4>"
+        # Baked for the WIDE layout; the page script rewrites it if the narrow
+        # one mounts, which has no stack navigator to describe.
+        f"<h4 id=\"vx-heading\">{_html.escape(_explorer_heading(hdr, stack_id))}</h4>"
         "<div id=\"vx-fig\"></div>"
         "<div class=\"vx-controls\">"
         "<span class=\"vx-status-dot\" title=\"live\"></span>"
@@ -1116,7 +1266,10 @@ def vectors_explorer_html(vecs, caption: str = "",
         "<button type=\"button\" class=\"vx-seg-btn\" data-mode=\"integrate\" "
         "data-testid=\"vx-mode-integrate\" aria-pressed=\"false\">Integrate</button>"
         "</span></span>"
-        f"{_slice_control(hdr.get('nt', 0), bool(stack_id))}"
+        # The slider is emitted whenever a NARROW layout exists (it is that
+        # layout's slice control) as well as when no stack panel could be built
+        # at all. CSS hides it unless the narrow layout actually mounted.
+        f"{_slice_control(hdr.get('nt', 0), bool(stack_id) and narrow is None)}"
         "</div>"
         f"<div id=\"vx-readout\" class=\"vx-meta\"></div>"
         f"<div class=\"vx-meta\">{cap}</div>"
@@ -1127,7 +1280,11 @@ def vectors_explorer_html(vecs, caption: str = "",
         f"<script type=\"text/plain\" id=\"vx-navid\">{nav_id}</script>"
         f"<script type=\"text/plain\" id=\"vx-dpid\">{dp_id}</script>"
         f"<script type=\"text/plain\" id=\"vx-stackid\">{stack_id}</script>"
-        f"<script type=\"text/plain\" id=\"vx-esm\">{esm_safe}</script>"
+        + (f"{_json_script('vx-state-narrow', narrow[0])}"
+           f"<script type=\"text/plain\" id=\"vx-navid-narrow\">{narrow[1]}</script>"
+           f"<script type=\"text/plain\" id=\"vx-dpid-narrow\">{narrow[2]}</script>"
+           if narrow else "")
+        + f"<script type=\"text/plain\" id=\"vx-esm\">{esm_safe}</script>"
         f"<script type=\"module\">{_EXPLORER_JS_TMPL}</script>"
         "</body></html>"
     )

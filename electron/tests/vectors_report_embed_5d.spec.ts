@@ -90,8 +90,11 @@ test('the stack gets its own navigator PANEL, and its vline drives the page', as
   expect(new Set([ids.nav, ids.dp, ids.stack]).size,
          'the three panels must be distinct').toBe(3)
   expect(ids.mounted, 'the stack panel never mounted').toBe(true)
-  // The fallback slider is NOT emitted when the real panel exists.
-  expect(await page.getByTestId('vx-slice').count()).toBe(0)
+  // The slider IS shipped (it is the phone layout's slice control) but must
+  // stay hidden wherever the stack panel mounted — two competing controls for
+  // one axis is worse than either alone.
+  expect(await page.getByTestId('vx-slice').count()).toBe(1)
+  await expect(page.getByTestId('vx-slice')).toBeHidden()
 
   // Drag the stack panel's ORANGE vline to the right → a later slice.
   await page.evaluate(() => (window as any).__vx.setSlice(0))
