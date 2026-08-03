@@ -111,6 +111,11 @@ STAGED_HANDLERS: dict[str, str] = {
     "seg_set_method":      "spyde.actions.particles_action.seg_set_method",
     "seg_tune":            "spyde.actions.particles_action.seg_tune",
     "seg_paint":           "spyde.actions.particles_action.seg_paint",
+    # TEST DOOR — paints labels from a synthetic fixture's stamped ground truth
+    # so a spec whose subject is something else (the overlay, the batch) can get
+    # a trained head without hand-placing brush strokes. It only replaces the
+    # PAINTING; `seg_train` after it is the real thing. See its docstring.
+    "seg_autolabel":       "spyde.actions.particles_action.seg_autolabel",
     "seg_train":           "spyde.actions.particles_action.seg_train",
     "seg_run":             "spyde.actions.particles_action.seg_run",
     "seg_commit":          "spyde.actions.particles_action.seg_commit",

@@ -102,7 +102,7 @@ def train_scribble(frame, labels, *, device=None, crop: int = 1024):
 
 def stage_profile(frame, sp, clf=None) -> None:
     """Where one 4096^2 frame's time goes, engine by engine and stage by stage."""
-    from spyde.particles.classical import split_instances
+    from spyde.particles.instances import split_instances
     from spyde.particles.measure import _contours, _fill_intensity
     from spyde.particles import measure_frame, segment_frame
 

@@ -11,11 +11,11 @@ device, many cores.
 
 Why the find-vectors mechanism and not a pipeline
 -------------------------------------------------
-The obvious reading is that the two engines want different parallelism — the
-classical engine is pure scipy so it should fan out, while the scribble engine
-holds ONE torch model on ONE GPU so fanning eight workers at it would mean eight
-CUDA contexts fighting over one device. That reading is wrong, and SpyDE already
-has the answer: :func:`~spyde.actions.find_vectors.gpu_runtime._gpu_task_allowed`.
+The scribble engine holds ONE torch model on ONE GPU, so the naive reading is
+that fanning eight workers at it would mean eight CUDA contexts fighting over
+one device and it therefore needs its own architecture. That reading is wrong,
+and SpyDE already has the answer:
+:func:`~spyde.actions.find_vectors.gpu_runtime._gpu_task_allowed`.
 
 Dask fans every chunk out over every worker as normal. Each task then asks
 whether **this** worker may touch the GPU: workers named ``"1".."N"`` may, and
@@ -24,10 +24,9 @@ DaskMonitor popover, :mod:`spyde.backend.compute_config`) overrides the policy
 for segmentation exactly as it does for find-vectors, and
 :data:`PARTICLE_GPU_LANE_DEFAULT` is the unset-default.
 
-So the two engines do NOT need different architectures. Both go through one
-fan-out; the lane policy decides who uses the GPU, and the classical engine
-simply never asks for it — which means it uses every worker, since a lane it
-never asks about cannot exclude it.
+So one fan-out serves the engine; the lane policy decides who uses the GPU. When
+plan B4's prompt head lands it slots into the same dispatch with its own answer
+to that question, which is why the lane gate is per-task and not per-run.
 
 Why the lane default is "one" and NOT the neural path's "4"
 -----------------------------------------------------------
@@ -141,6 +140,82 @@ log = logging.getLogger(__name__)
 #: for the neural path, where the docstring said "2" while the code passed "4".
 PARTICLE_GPU_LANE_DEFAULT = "one"
 
+#: HARD CEILING on how many worker PROCESSES segmentation will put on the
+#: device — applied even when ``SPYDE_FV_GPU`` asks for more, which is the one
+#: place this path deliberately does NOT obey the shared setting.
+#:
+#: `PARTICLE_GPU_LANE_DEFAULT` is only the unset-default. The DaskMonitor's "GPU
+#: feeders" control writes ``SPYDE_FV_GPU``, and at "all" the lane split returns
+#: no lane at all, every worker gets chunks, and `_gpu_task_allowed` then
+#: answers True for every one of them — so nine processes each load a scribble
+#: head onto CUDA. Observed: six busy workers and **11.5 of 12.0 GB** of VRAM
+#: gone, at which point the card stops responding rather than merely slowing.
+#:
+#: `_gpu_slots` cannot prevent this. It is a per-PROCESS semaphore; the number
+#: of processes is the lane's job, and nothing was bounding it.
+#:
+#: Why segmentation needs a ceiling where find-vectors does not: its device
+#: cost is not a fixed buffer. Each worker holds a torch model AND a row band
+#: sized at `features._GPU_FREE_FRACTION` of *free* VRAM, read per call — so N
+#: workers claim N x 25% of a figure that ignores the other N-1
+#: (`PARTICLE_DEVICE_CONC` has the arithmetic). The numba NXCORR kernels the
+#: shared setting was written for allocate small fixed buffers and tolerate
+#: more feeders; this does not.
+#:
+#: Raise it only with a VRAM measurement on the target card, and keep
+#: ``(PARTICLE_GPU_LANE_MAX + 1) * _GPU_FREE_FRACTION <= 1`` — the +1 being the
+#: app process, which is never in the lane.
+PARTICLE_GPU_LANE_MAX = 2
+
+
+#: One-shot latch for the clamp warning. `_clamped_lane_mode` is called per
+#: worker per task, so an unlatched `log.warning` is a flood — measured: the
+#: same line dozens of times in the app log for one run, which buries anything
+#: else the run was trying to say.
+_lane_warned: list = [None]
+
+
+def _clamped_lane_mode() -> str:
+    """The effective lane mode: the shared setting, capped at
+    :data:`PARTICLE_GPU_LANE_MAX`.
+
+    ``"off"`` passes through (fewer feeders is always allowed). ``"all"`` and
+    any number above the ceiling are clamped down to it, with a warning —
+    silently ignoring what the user asked for would be worse than saying so.
+    """
+    raw = os.environ.get("SPYDE_FV_GPU", PARTICLE_GPU_LANE_DEFAULT).strip().lower()
+    if raw == "off":
+        return "off"
+    if raw in ("one", ""):
+        return "one"
+    try:
+        n = int(raw)
+    except ValueError:
+        n = PARTICLE_GPU_LANE_MAX if raw == "all" else 1
+    if raw == "all" or n > PARTICLE_GPU_LANE_MAX:
+        # ASCII only. This goes through the Windows log stream, where a
+        # non-ASCII dash arrives as mojibake and makes the line harder to read
+        # than the punctuation was worth.
+        if _lane_warned[0] != raw:
+            _lane_warned[0] = raw
+            log.warning(
+                "[seg-batch] GPU feeders is %r; segmentation is capping it at "
+                "%d. Each feeder holds a torch head plus a row band sized at a "
+                "fraction of FREE VRAM, so feeders multiply on the device: an "
+                "uncapped lane was measured at 11.5/12.0 GB with six busy "
+                "workers, where the card stops responding. Vector finding "
+                "tolerates more because its kernels use small fixed buffers. "
+                "Raise the ceiling with SPYDE_SEG_GPU_LANE_MAX if the card has "
+                "the memory.",
+                raw, PARTICLE_GPU_LANE_MAX)
+        n = PARTICLE_GPU_LANE_MAX
+    try:
+        n = min(n, max(1, int(os.environ.get("SPYDE_SEG_GPU_LANE_MAX",
+                                             PARTICLE_GPU_LANE_MAX))))
+    except ValueError:
+        n = min(n, PARTICLE_GPU_LANE_MAX)
+    return "one" if n <= 1 else str(n)
+
 #: Target bytes of RAW FRAMES per dask task. Not a chunk-alignment number — a
 #: working-set one: a task also holds an int32 label raster (4 bytes/px, i.e.
 #: 64 MB for one 4096² frame) plus the float probability maps, and several tasks
@@ -198,20 +273,22 @@ class EngineSpec:
     Parameters
     ----------
     method
-        ``"classical"`` or ``"scribble"``.
+        ``"scribble"``. Kept as a field rather than dropped because the batch
+        is meant to grow a second engine (plan B4's prompt head) and because a
+        saved result's provenance records which one produced it.
     params
         ``SegmentParams`` keyword arguments. A plain dict so the spec pickles
         without importing the segmentation modules on the client.
     model_path
-        Scribble only: an ``.npz`` written by ``ScribbleClassifier.save``.
+        An ``.npz`` written by ``ScribbleClassifier.save``.
     """
 
-    method: str
+    method: str = "scribble"
     params: dict = field(default_factory=dict)
     model_path: str | None = None
 
     def segment_params(self):
-        from spyde.particles.classical import SegmentParams
+        from spyde.particles.instances import SegmentParams
         return SegmentParams(**self.params)
 
 
@@ -288,57 +365,102 @@ def _warm_measure() -> None:
 def _gpu_allowed() -> bool:
     """Whether THIS worker may use the GPU, per the shared lane policy.
 
-    Delegates to find-vectors' ``_gpu_task_allowed`` rather than re-deriving the
-    rule: it is the same ``SPYDE_FV_GPU`` setting, surfaced in the same
-    DaskMonitor control, and a second implementation is a second thing to get
-    out of step.
+    Same ``SPYDE_FV_GPU`` setting and the same DaskMonitor control as
+    find-vectors, but the rule is applied HERE rather than delegated to
+    ``_gpu_task_allowed``, because segmentation's answer is genuinely different:
+    it is capped at :data:`PARTICLE_GPU_LANE_MAX` regardless of what the setting
+    asks for. Delegating would answer True for every worker at "all", which is
+    the nine-CUDA-contexts case that fills the card.
+
+    (The obvious shortcut — set ``SPYDE_FV_GPU`` to the clamped value around the
+    delegated call — is a data race: this runs on several worker task threads at
+    once, and a process-global env var is not a place to keep per-call state.)
     """
-    try:
-        from spyde.actions.find_vectors.gpu_runtime import _gpu_task_allowed
-        return bool(_gpu_task_allowed(default_mode=PARTICLE_GPU_LANE_DEFAULT))
-    except Exception as exc:                                  # pragma: no cover
-        log.debug("[seg-batch] GPU lane policy unavailable (%s); using CPU", exc)
+    mode = _clamped_lane_mode()
+    if mode == "off":
         return False
+    n_gpu = 1 if mode == "one" else max(1, int(mode))
+    try:
+        from distributed import get_worker
+        name = str(get_worker().name)
+    except Exception:
+        # Not on a dask worker — the app process (caret preview, training fit).
+        # It is not IN the lane and never has been; what bounds it is
+        # `_gpu_slots`, and the ceiling above leaves room for it (see
+        # PARTICLE_GPU_LANE_MAX's closing note about the +1).
+        return True
+    try:
+        return 1 <= int(name) <= n_gpu
+    except (TypeError, ValueError):
+        return name == "1"
+
+
+#: How many frames may occupy the device at once, **per process**, for
+#: segmentation. ONE, and the number is arithmetic rather than caution.
+#:
+#: ``features.band_budget_bytes`` sizes each row band at
+#: ``_GPU_FREE_FRACTION`` = **25% of FREE VRAM**, read by
+#: ``torch.cuda.mem_get_info`` at the moment it is called. Concurrent feeders
+#: each read the same "free" and each claim their 25% of it, so the claim is
+#: ``feeders x 25%`` against a figure that already ignores the others. FOUR
+#: feeders claim 100% of free VRAM simultaneously — and ``GPU_BAND_BYTES``
+#: records what overshooting costs: 1012 ms per frame at the right band size,
+#: **12.8 s** one step too big, **26.7 s** at one band, "thrashing the
+#: allocator against a 12.9 GB card". At that point the card is not slow, it is
+#: hung, which is the reported symptom.
+#:
+#: The default was find-vectors' ``SPYDE_FV_GPU_CONC`` = 2, which combined with
+#: the "one" lane and an app process that is NOT in the lane (see
+#: ``_gpu_allowed``: ``_gpu_task_allowed`` returns True off a dask worker) gave
+#: exactly 1x2 + 1x2 = 4.
+#:
+#: Dropping it to 1 costs NOTHING here, which is the point: batch.py's own lane
+#: measurement is flat — 1/2/4 GPU feeders give 0.270/0.252/0.260 frames/s on a
+#: real 4096² movie, i.e. the device is not the constraint. So the concurrency
+#: that buys no throughput was buying a VRAM multiplier instead.
+#:
+#: THE INVARIANT, if you change either number: keep
+#: ``total_feeders * _GPU_FREE_FRACTION <= 1``, where total_feeders counts the
+#: app process as well as the lane's workers.
+PARTICLE_DEVICE_CONC = 1
+
+_device_sem: dict = {"sem": None, "n": None}
 
 
 def _gpu_slots():
-    """The device-concurrency semaphore (``SPYDE_FV_GPU_CONC``), or a null
-    context when find-vectors is not importable.
+    """The device-concurrency semaphore for segmentation. See
+    :data:`PARTICLE_DEVICE_CONC` for why it is 1 and not find-vectors' 2.
 
-    Bounds how many frames occupy the device at once **per process**. The
-    feature stack sizes each row band at a fraction of *free* VRAM
-    (``features.band_budget_bytes``), and overshooting that is catastrophic
-    rather than merely slow — so unbounded concurrency across a worker's task
-    threads is exactly the allocator thrash ``GPU_BAND_BYTES`` documents.
+    Process-wide, and shared by BOTH device paths — the batch's per-worker
+    engine and the caret's interactive preview — so a preview fired while a
+    batch runs cannot add a feeder the batch did not account for.
     """
+    import threading
+
     try:
-        from spyde.actions.find_vectors.gpu_runtime import _gpu_slots as _slots
-        return _slots()
-    except Exception:                                         # pragma: no cover
-        import contextlib
-        return contextlib.nullcontext()
+        n = max(1, int(os.environ.get("SPYDE_SEG_GPU_CONC",
+                                      str(PARTICLE_DEVICE_CONC))))
+    except ValueError:
+        n = PARTICLE_DEVICE_CONC
+    if _device_sem["sem"] is None or _device_sem["n"] != n:
+        _device_sem["sem"] = threading.BoundedSemaphore(n)
+        _device_sem["n"] = n
+    return _device_sem["sem"]
 
 
 def resolve_engine(spec: EngineSpec, *, force_cpu: bool = False):
     """``(engine, device_str)`` for this worker — the lane decision made once.
 
-    ``engine(frame) -> int32 labels``. The classical engine never asks for the
-    GPU, so it runs on every worker regardless of lane; the scribble engine
-    loads its head onto CUDA/MPS only on a GPU-lane worker and onto the CPU
-    everywhere else.
+    ``engine(frame) -> int32 labels``. The scribble head loads onto CUDA/MPS
+    only on a GPU-lane worker and onto the CPU everywhere else.
     """
     _cap_torch_threads()
     _warm_measure()
     method = str(spec.method).lower()
-    if method == "classical":
-        from spyde.particles.classical import segment_frame
-        sp = spec.segment_params()
-        return (lambda frame: segment_frame(frame, sp)), "cpu"
-
     if method != "scribble":
         raise ValueError(
             f"batch segmentation has no engine for method {spec.method!r}; "
-            "expected 'classical' or 'scribble'")
+            "expected 'scribble'")
     if not spec.model_path:
         raise ValueError(
             "the scribble engine needs a trained model — EngineSpec.model_path "
@@ -366,7 +488,7 @@ def resolve_engine(spec: EngineSpec, *, force_cpu: bool = False):
         # four GPU feeders back into one).
         with _gpu_slots():
             fg, bnd = _clf.predict_foreground_boundary(frame)
-        from spyde.particles.classical import split_instances
+        from spyde.particles.instances import split_instances
         return split_instances(fg, _sp, boundary=bnd)
 
     return engine, str(clf.device)
@@ -680,7 +802,18 @@ def _dispatch(data, spec, n_frames, scale, store_masks, client, stopped,
     from spyde.compute_dispatch import dispatch_chunks, split_workers_for_gpu
 
     scribble = str(spec.method).lower() == "scribble"
-    lane_mode = PARTICLE_GPU_LANE_DEFAULT if scribble else "off"
+    # The CLAMPED mode, not the raw setting. `split_workers_for_gpu` reads
+    # SPYDE_FV_GPU itself and returns NO LANE for "all" — and `_dispatch`'s
+    # own fallback below then hands every worker to the CPU lane, so "all"
+    # does not mean "all workers on the GPU", it means "the lane is off and
+    # everyone gets chunks" while `_gpu_allowed` separately says yes to each
+    # of them. That combination is what put nine heads on a 12 GB card.
+    #
+    # Passing the clamped value keeps the split and the per-worker gate
+    # agreeing, which is the exact failure `split_workers_for_gpu`'s own
+    # docstring records for the neural path ("a mismatched lane split ... was
+    # exactly the all-workers contention").
+    lane_mode = _clamped_lane_mode() if scribble else "off"
     gpu_only = False
     gpu_addrs, cpu_addrs = ([], [])
     if lane_mode != "off":

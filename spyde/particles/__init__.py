@@ -2,10 +2,10 @@
 spyde.particles — particle segmentation, measurement and tracking.
 
 See ``DRIFT_AND_PARTICLES_PLAN.md`` (repo root) for the full design. The shape of
-this package is its most important property: **three interchangeable ways to
-produce a foreground probability map, and one shared downstream stage.**
+this package is its most important property: **interchangeable ways to produce a
+foreground probability map, and one shared downstream stage.**
 
-    frame ──► [ classical | scribble | prompt ] ──► probability / mask
+    frame ──► [ scribble | (prompt, B4) ] ──────► probability / mask
                                                           │
                                   split_instances()  (watershed)
                                                           │
@@ -15,12 +15,20 @@ produce a foreground probability map, and one shared downstream stage.**
                                                           │
                                   link()             (Hungarian) → tracks + events
 
-The three engines are not alternatives to choose between — they are three ways to
-fill the first box, and they compose (plan §0.4): a promptable model's masks become
+The engines are not alternatives to choose between — they are ways to fill the
+first box, and they compose (plan §0.4): a promptable model's masks become
 scribble training labels via :func:`~spyde.particles.scribble.masks_to_labels`.
 Everything after the first box is written once, in
-:mod:`~spyde.particles.classical` (the instance split) and
+:mod:`~spyde.particles.instances` (the instance split) and
 :mod:`~spyde.particles.measure`.
+
+**A third engine used to fill that box and was DELETED**: a port of
+ParticleSpy's classical threshold pipeline. On low-contrast in-situ data a
+global threshold has no bimodal histogram to find, so it returned the support
+film as thousands of instances and no parameter recovered the real particles —
+and because otsu is computed from whatever array it is handed, the caret's
+preview crop and the batch's full frame disagreed, so tuning the preview did not
+control the run. :mod:`~spyde.particles.instances` records the measurements.
 
 torch is imported **lazily**, inside the functions that need it — importing this
 package must never pay for CUDA init. :func:`~spyde.particles.features.gpu_available`
@@ -40,12 +48,10 @@ answers the capability question without loading it.
 """
 from __future__ import annotations
 
-from spyde.particles.classical import (
-    THRESHOLD_METHODS,
+from spyde.particles.instances import (
     SegmentParams,
-    segment_frame,
+    merge_close_instances,
     split_instances,
-    threshold_mask,
 )
 from spyde.particles.features import (
     DEFAULT_RANK_RADII,
@@ -83,12 +89,10 @@ from spyde.particles.track import (
 )
 
 __all__ = [
-    # classical engine + the shared instance split
+    # the shared instance split
     "SegmentParams",
-    "THRESHOLD_METHODS",
-    "segment_frame",
+    "merge_close_instances",
     "split_instances",
-    "threshold_mask",
     # measurement
     "measure_frame",
     # feature stack

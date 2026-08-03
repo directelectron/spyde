@@ -17,7 +17,7 @@ and emits per-class logits at input resolution. Everything downstream is
 unchanged, and that is the whole point of the design:
 
 * :meth:`predict_foreground_boundary` returns the same ``(foreground,
-  boundary)`` pair, so :func:`spyde.particles.classical.split_instances` takes
+  boundary)`` pair, so :func:`spyde.particles.instances.split_instances` takes
   its connected-components route exactly as it already does for the MLP — no new
   instance decoder, no star-convex head, no second downstream path to maintain.
 * The class list is :class:`~spyde.particles.scribble.ScribbleClass`, so
@@ -541,7 +541,7 @@ class ScribbleCNN:
 
         *boundary* is None when no trained class is marked
         :attr:`~spyde.particles.scribble.ScribbleClass.boundary` — None and not
-        a zero map, because :func:`spyde.particles.classical.split_instances`
+        a zero map, because :func:`spyde.particles.instances.split_instances`
         reads the two differently ("no boundary taught, use the watershed"
         versus "a boundary was taught and this frame has none of it").
         """
@@ -573,7 +573,7 @@ class ScribbleCNN:
         prototype exists to test: a CNN that predicts the boundary class plugs
         into machinery that already exists.
         """
-        from spyde.particles.classical import SegmentParams, split_instances
+        from spyde.particles.instances import SegmentParams, split_instances
         fg, bnd = self.predict_foreground_boundary(frame)
         return split_instances(fg, params or SegmentParams(), boundary=bnd)
 

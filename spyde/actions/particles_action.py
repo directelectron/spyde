@@ -5,7 +5,7 @@ Plan B7, honouring the §0.8 interaction contract literally:
 
     seg_open        caret mounted → preview the CURRENT frame, emit caret state
     seg_close       caret unmounted → clear the overlay, drop the controller
-    seg_set_method  classical | scribble | prompt
+    seg_set_method  scribble | prompt (one engine today; plan B4 adds the other)
     seg_tune        debounced param change → re-preview the CURRENT frame only
     seg_paint       one brush stroke → LabelStore
     seg_train       fit the scribble classifier on the accumulated labels
@@ -40,7 +40,7 @@ were real, and ``min_size=10`` removed 24 of the 25 spurious ones. A user who
 zeroes it to "catch the small ones" gets the opposite. So it is floored — and
 the EFFECTIVE value goes back to the caret in every preview, because silently
 running a number different from the one on screen is the failure mode
-``classical.SegmentParams`` refuses for ``local_size`` and this must not
+``instances.SegmentParams`` refuses for its own fields, and this must not
 reintroduce it.
 """
 from __future__ import annotations
@@ -62,10 +62,20 @@ from spyde.backend.ipc import emit, emit_error, emit_progress, emit_status
 
 log = logging.getLogger(__name__)
 
-#: The three mask sources of plan §0.2. ``prompt`` is declared here so the caret
-#: can render its tab from the schema before the engine lands (plan B4); every
-#: code path that would run it emits a "not installed yet" status instead.
-METHODS: tuple[str, ...] = ("classical", "scribble", "prompt")
+#: The mask sources. ``classical`` (a port of ParticleSpy's threshold pipeline)
+#: was REMOVED, not deprecated: measured on the low-contrast in-situ data this
+#: feature exists for, a global threshold has no bimodal histogram to find, so
+#: otsu lands inside the noise and the split shatters the support film — 4873
+#: instances at 39% coverage on one 1024² frame, and no parameter combination
+#: recovered the real particles. It also made the caret lie, because otsu on the
+#: preview's centred crop (120.0) is not otsu on the whole frame (146.0), so
+#: tuning the preview did not control the run. See
+#: :mod:`spyde.particles.instances` and ``benchmarks.md``.
+#:
+#: ``prompt`` is declared so the caret can offer it from the schema before the
+#: engine lands (plan B4); the code path that would run it emits a "not
+#: installed yet" status instead.
+METHODS: tuple[str, ...] = ("scribble", "prompt")
 
 #: Floor applied to ``min_size``. NOT a taste default — plan §0.9's measurement:
 #: on the fixture, one faint scribble added to bright-only labels gave 33
@@ -85,11 +95,7 @@ _MAX_AREAS_SENT = 2000
 _PROGRESS_INTERVAL = 0.35
 
 DEFAULTS: dict[str, Any] = dict(
-    method="classical",
-    # The one sensitivity axis of plan §0.9. Everything else about the split is
-    # secondary and sits below it in the caret.
-    sensitivity=0.5,
-    threshold="otsu",
+    method="scribble",
     # THE control for "too many particles". Filters the measured instances by
     # their confidence score (spyde.particles.measure.particle_scores), which is
     # computed WITH the measurement — so this re-filters an existing result and
@@ -110,10 +116,6 @@ DEFAULTS: dict[str, Any] = dict(
     watershed=True,
     min_separation=3,
     marker_smooth=1.0,
-    gaussian=0.0,
-    rb_kernel=0,
-    invert=False,
-    local_size=31,
     clear_border=False,
     # Outlines are what make the overlay and the label movie possible, so they
     # default ON; plan §0.5 turns them off for very long movies.
@@ -144,35 +146,6 @@ class SegmentWizard(WizardController):
             "name": "Engine", "type": "enum", "default": DEFAULTS["method"],
             "choices": list(METHODS),
         },
-        "sensitivity": {
-            "name": "Sensitivity", "type": "float", "default": DEFAULTS["sensitivity"],
-            "min": 0.0, "max": 1.0, "step": 0.01, "tab": "Classical",
-        },
-        "threshold": {
-            "name": "Threshold", "type": "enum", "default": DEFAULTS["threshold"],
-            "choices": ["otsu", "mean", "minimum", "yen", "isodata", "li",
-                        "local", "local_otsu", "niblack", "sauvola"],
-            "tab": "Classical",
-        },
-        "gaussian": {
-            "name": "Pre-blur σ (px)", "type": "float", "default": DEFAULTS["gaussian"],
-            "min": 0.0, "max": 10.0, "step": 0.1, "tab": "Classical",
-        },
-        "rb_kernel": {
-            "name": "Rolling ball (px)", "type": "int", "default": DEFAULTS["rb_kernel"],
-            "min": 0, "max": 256, "tab": "Classical",
-        },
-        "invert": {
-            "name": "Dark particles", "type": "bool", "default": DEFAULTS["invert"],
-            "tab": "Classical",
-        },
-        "local_size": {
-            "name": "Local window (px, odd)", "type": "int",
-            "default": DEFAULTS["local_size"], "min": 3, "max": 255,
-            "tab": "Classical",
-        },
-        # min_size sits next to sensitivity deliberately (plan §0.9: the two are
-        # coupled and must not be in separate tabs).
         "min_size": {
             "name": "Min size (px)", "type": "int", "default": DEFAULTS["min_size"],
             "min": 0, "max": 100000, "tab": "Split",
@@ -702,12 +675,14 @@ def _coerce(payload: dict | None) -> dict:
 
     Every out-of-range value is corrected rather than raised on: these arrive
     from a slider mid-drag, and a caret that errors while you are moving it is
-    unusable. The corrections that change what the user asked for
-    (``min_size``, ``local_size``) are echoed back in every preview so the
-    number on screen is the number that ran.
-    """
-    from spyde.particles import THRESHOLD_METHODS
+    unusable. The correction that changes what the user asked for
+    (``min_size``) is echoed back in every preview so the number on screen is
+    the number that ran.
 
+    Keys are taken from ``DEFAULTS`` only, so a payload — or a reloaded
+    provenance dict — carrying a parameter of the deleted classical engine is
+    dropped here rather than raising.
+    """
     p = dict(DEFAULTS)
     payload = payload or {}
     for k, default in DEFAULTS.items():
@@ -723,18 +698,7 @@ def _coerce(payload: dict | None) -> dict:
     p["method"] = str(p["method"]).lower()
     if p["method"] not in METHODS:
         p["method"] = DEFAULTS["method"]
-    p["threshold"] = str(p["threshold"]).lower()
-    if p["threshold"] not in THRESHOLD_METHODS:
-        p["threshold"] = DEFAULTS["threshold"]
-    p["sensitivity"] = float(min(1.0, max(0.0, p["sensitivity"])))
-
-    # skimage's local thresholds require an odd window and SegmentParams raises
-    # rather than bumping it silently. Bump here (the caret gets the effective
-    # value back) so a slider that lands on an even number doesn't error.
-    p["local_size"] = max(3, int(p["local_size"]))
-    if p["local_size"] % 2 == 0:
-        p["local_size"] += 1
-
+    p["min_separation"] = max(1, int(p["min_separation"]))
     p["min_size"] = int(p["min_size"])
     p["min_score"] = float(min(0.99, max(0.0, p.get("min_score", 0.0) or 0.0)))
     p["min_size_floored"] = p["min_size"] < MIN_SIZE_FLOOR
@@ -750,11 +714,14 @@ def _segment_kwargs(p: dict) -> dict:
     :class:`~spyde.particles.batch.EngineSpec`, and a spec that pickles without
     dragging the segmentation modules onto the client's import path is one less
     thing to go wrong in a worker with a different import order.
+
+    Naming EVERY field explicitly is also what makes a stale saved result load:
+    a `.spyde` written before the classical engine was removed carries
+    ``threshold`` / ``sensitivity`` / ``gaussian`` / ``rb_kernel`` / ``invert``
+    / ``local_size`` in its provenance, and they are simply not read here, so
+    they can never reach ``SegmentParams`` and raise.
     """
     return dict(
-        threshold=p["threshold"], sensitivity=p["sensitivity"],
-        rb_kernel=int(p["rb_kernel"]), gaussian=float(p["gaussian"]),
-        invert=bool(p["invert"]), local_size=int(p["local_size"]),
         watershed=bool(p["watershed"]), min_separation=int(p["min_separation"]),
         marker_smooth=float(p["marker_smooth"]), min_size=_min_size_px(p),
         max_size=int(p["max_size"]), clear_border=bool(p["clear_border"]),
@@ -932,22 +899,60 @@ def _engine(wiz: SegmentWizard, p: dict) -> Callable[[np.ndarray], np.ndarray] |
     sp = _segment_params(p)
     method = p["method"]
 
-    if method == "classical":
-        from spyde.particles import segment_frame
-        return lambda frame: segment_frame(frame, sp)
-
     if method == "scribble":
         clf = wiz.classifier
         if clf is None or not clf.is_trained:
             emit_status("Segment Particles: paint a few scribbles — including at "
                         "least one FAINT particle — then press Train.")
             return None
-        return lambda frame: clf.segment(frame, sp)
 
-    # plan B4: EfficientSAM-Ti through the existing model registry. The tab
-    # exists so the caret can render it; the engine does not.
+        # SAME DEVICE POLICY AS THE BATCH, which is find-vectors' policy.
+        #
+        # This path had none of it, and that was invisible while `classical`
+        # was the default engine: classical is pure scipy and never touched the
+        # device, so the interactive preview never submitted to the GPU.
+        # Deleting it made EVERY preview a torch submission — one per tune, one
+        # per navigator move, each on its own `run_on_worker` thread — with
+        # nothing bounding how many occupy the device at once. That is exactly
+        # the opportunistic-GPU collapse `_gpu_task_allowed` was written for on
+        # the vectors path: the kernels serialise, the allocator thrashes, and
+        # the feature stack's band budget (sized against *free* VRAM) is
+        # divided by however many submitters happen to be in flight.
+        #
+        # What is borrowed is `_gpu_slots()` — segmentation's process-wide
+        # device semaphore (`PARTICLE_DEVICE_CONC`, `SPYDE_SEG_GPU_CONC`) — and
+        # ONLY that.
+        #
+        # It is the SAME semaphore the batch's workers take, deliberately: this
+        # process is not in the dask lane (`_gpu_task_allowed` returns True off
+        # a worker), so a preview fired while a batch runs is a feeder the lane
+        # never counted. Sharing the semaphore is what stops the caret adding
+        # one. See `PARTICLE_DEVICE_CONC` for the VRAM arithmetic — every
+        # feeder claims 25% of *free* device memory, so they multiply.
+        #
+        # NOT `_cap_torch_threads()`, deliberately, even though the batch calls
+        # it: it is documented as a no-op off a dask worker precisely because
+        # "the interactive preview and the training fit are single,
+        # latency-sensitive calls that should keep the whole machine". Capping
+        # intra-op threads is right for nine workers × four task slots and
+        # wrong for one preview the user is waiting on. The two paths want the
+        # same DEVICE policy and opposite CPU policies.
+        #
+        # The split stays OUTSIDE the slot: it is numpy/scipy and holding a
+        # device slot across it is what turns N feeders back into one.
+        from spyde.particles.batch import _gpu_slots
+        from spyde.particles.instances import split_instances
+
+        def _engine_fn(frame, _clf=clf, _sp=sp):
+            with _gpu_slots():
+                fg, bnd = _clf.predict_foreground_boundary(frame)
+            return split_instances(fg, _sp, boundary=bnd)
+
+        return _engine_fn
+
+    # plan B4: EfficientSAM-Ti through the existing model registry.
     emit_status("Segment Particles: prompt segmentation is not installed yet — "
-                "use the Classical or Scribble tab.")
+                "paint a few scribbles and press Train instead.")
     return None
 
 
@@ -960,7 +965,29 @@ def _wizard(session, plot) -> SegmentWizard | None:
 
 
 def _emit(wiz: SegmentWizard, msg: dict) -> None:
-    msg.setdefault("window_id", wiz.window_id)
+    """Send a caret message, resolving the window id AT SEND TIME.
+
+    `SegmentWizard.window_id` is copied from `src_plot.window_id` when the
+    controller is built, and `Plot.window_id` is itself copied from
+    `plot_window` when the PLOT is built — so a plot that acquired its window
+    afterwards carries None, the wizard copies the None, and every message this
+    caret sends is addressed to nobody. The renderer filters `seg_state` by
+    window id (`useWizardEvent`), so the caret then shows an empty class list
+    and no brush strip: it opens, and silently cannot be used.
+
+    Re-reading the plot each time costs nothing and fixes the ordering. The
+    stale captured value is the fallback, not the source of truth.
+    """
+    wid = getattr(wiz.src_plot, "window_id", None)
+    if wid is None:
+        wid = wiz.window_id
+    else:
+        wiz.window_id = wid           # keep the cached one honest
+    if wid is None:
+        # Unroutable. Never silent: the caret will look merely empty.
+        log.warning("[seg] %s has no window_id — the caret cannot receive it",
+                    msg.get("type", "message"))
+    msg.setdefault("window_id", wid)
     emit(msg)
 
 
@@ -971,13 +998,31 @@ def _emit_state(wiz: SegmentWizard) -> None:
         n_frames, _get, shape = wiz.frames()
     except Exception:
         n_frames, shape = 1, (0, 0)
+    # The CLASS LIST is the load-bearing part of this message: the caret gates
+    # its brush strip on `classes.length > 0`, so a `seg_state` that does not
+    # arrive — or arrives without classes — is a caret that opens, shows "—"
+    # where the classes should be, and has nothing to paint with. That is
+    # indistinguishable from "segmentation is broken" and it is silent.
+    #
+    # So every OTHER field is best-effort, and the message goes out regardless.
+    try:
+        classes = wiz.class_report()
+    except Exception as exc:
+        log.warning("[seg] class report failed (%s); falling back to defaults",
+                    exc)
+        from spyde.particles import default_classes
+        classes = [dict(c.to_dict(), pixels=0) for c in default_classes()]
+    try:
+        frame = wiz.frame_index()
+    except Exception:
+        frame = 0
     _emit(wiz, {
         "type": "seg_state",
-        "method": wiz.params["method"],
-        "frame": wiz.frame_index(),
+        "method": wiz.params.get("method", DEFAULTS["method"]),
+        "frame": frame,
         "n_frames": int(n_frames),
         "frame_shape": [int(shape[0]), int(shape[1])],
-        "classes": wiz.class_report(),
+        "classes": classes,
         "labelled_frames": (wiz.labels.labelled_frames() if wiz.labels else []),
         "trained": bool(wiz.classifier is not None and wiz.classifier.is_trained),
         "params": {k: v for k, v in wiz.params.items()},
@@ -1105,12 +1150,34 @@ _RASTER_ALPHA = 0.45
 _FAIL_COVERAGE = 0.25
 _FAIL_COUNT = 500
 
+#: Coverage at which the count stops mattering. A field of REAL particles can be
+#: 40% of a frame — crowded, but a legitimate answer — so the shatter test above
+#: needs the count as well. Nothing legitimate is most of the frame: at 60% the
+#: "particles" are the support film whether there are 200 of them or 20 000.
+#:
+#: This second branch exists because the first one MISSED the failure it was
+#: written for, in the only way that matters — on screen. A head mis-trained to
+#: call film "particle" (`seg_autolabel {"mislabel": true}`) returned **228**
+#: instances covering essentially the whole frame: a solid green sheet, plainly
+#: wrong, and under `_FAIL_COUNT`. The two engines fail with different SHAPES —
+#: a threshold shatters the film into thousands of fragments, a bad classifier
+#: merges it into a few hundred blobs — and a rule tuned on one shape does not
+#: see the other.
+_FAIL_COVERAGE_ALONE = 0.60
+
 
 def _threshold_failed(count: int, coverage: float) -> bool:
-    """True when a preview is noise being reported as particles.
+    """True when a preview is the support film being reported as particles.
 
-    Both conditions, for the reason spelled out on `_FAIL_COVERAGE`.
+    Two shapes of the same failure; see `_FAIL_COVERAGE` and
+    `_FAIL_COVERAGE_ALONE`. Deliberately NOT about thresholds any more, despite
+    the name it kept: it reads the measured output, so it catches a bad
+    classifier as readily as it caught a bad threshold.
     """
+    if count <= 0:
+        return False
+    if coverage >= _FAIL_COVERAGE_ALONE:
+        return True
     return count >= _FAIL_COUNT and coverage >= _FAIL_COVERAGE
 
 
@@ -1367,6 +1434,7 @@ def seg_open(session, plot, payload) -> None:
         # Idempotent re-open: adopt the new parameters and re-preview rather
         # than building a second controller with its own scribbles.
         existing.set_params(payload)
+        _arm_brush(existing)
         gen = existing.guard()
         _emit_state(existing)
         _preview(existing, gen)
@@ -1382,6 +1450,18 @@ def seg_open(session, plot, payload) -> None:
     # Train: scrolling with the caret up should keep the outlines on the frame
     # you are looking at whichever engine is selected.
     wiz.wire_navigator()
+    # ARM THE BRUSH HERE, not on an engine switch.
+    #
+    # It used to be armed only by `seg_set_method("scribble")`, which the caret
+    # sent when you clicked the Scribble tab. Deleting the classical engine
+    # deleted the tab row, so nothing sent that verb any more and the brush was
+    # never attached: the caret opened, told you to paint, and there was nothing
+    # to paint with. Reported as "I can't scribble".
+    #
+    # Opening is the right trigger now. There is one engine, painting is the
+    # only way to teach it, and the caret's own UI already assumes this — the
+    # ClassStrip renders unconditionally.
+    _arm_brush(wiz)
     _emit_state(wiz)
     _preview(wiz, gen)
 
@@ -1402,7 +1482,8 @@ def seg_close(session, plot, payload=None) -> None:
 
 
 def seg_set_method(session, plot, payload) -> None:
-    """Switch engine (classical | scribble | prompt) and re-preview."""
+    """Switch engine and re-preview. One engine ships today; the verb stays
+    because plan B4's prompt head is the second."""
     wiz = _wizard(session, plot)
     if wiz is None:
         return
@@ -1495,6 +1576,92 @@ def _paint_stroke(wiz, t: int, points, class_id: int, erase: bool,
     # -1 when the store cannot report counts: assume it painted rather than
     # swallowing a stroke the user definitely made.
     return max(1, abs(after - before)) if before >= 0 else 1
+
+
+def seg_autolabel(session, plot, payload=None) -> None:
+    """TEST DOOR: paint labels from a synthetic fixture's stamped ground truth.
+
+    With the classical engine gone there is no result until something is
+    trained, so every spec whose subject is something ELSE — the overlay
+    reaching a tiled frame, the batch opening a result window, the caret's
+    layout — would otherwise have to hand-place brush strokes at coordinates it
+    has no way to know, and would silently stop testing its own subject the day
+    the fixture moved a particle.
+
+    So this replaces the PAINTING only. It rasterises through ``_paint_stroke``,
+    the same function the real brush and ``seg_paint`` use, and it stops there:
+    the spec then presses Train like a user, and ``seg_train`` is untouched.
+    What is faked is *where the strokes are*, which is exactly the part a spec
+    about the overlay has no opinion about.
+
+    Refuses on a signal with no stamped truth — this must never quietly become
+    a way to get a trained head on real data, where the labels would be wrong
+    and the test would pass anyway.
+
+    Payload: ``{"frame": int, "mislabel": bool}``. ``mislabel`` SWAPS the two
+    classes — the support film is painted as *particle* and the particles as
+    *film* — which is the realistic way a user breaks this: one careless dab on
+    the background and the head learns that the film is what you are looking
+    for. It is how a spec reproduces the over-segmentation the coverage verdict
+    (:func:`_threshold_failed`) exists to name, now that the classical engine
+    that used to produce it by accident is gone. A correctly trained head does
+    NOT over-segment even a heavily noisy frame — measured, which is the whole
+    argument for having deleted the other engine.
+    """
+    wiz = _wizard(session, plot)
+    if wiz is None:
+        return
+    from spyde.data.synthetic import ground_truth, particle_truth_at
+
+    signal = wiz.signal()
+    try:
+        gt = ground_truth(signal)
+    except (ValueError, AttributeError) as exc:
+        emit_error(f"seg_autolabel is a test door and needs a synthetic "
+                   f"fixture's stamped ground truth: {exc}")
+        return
+
+    payload = payload or {}
+    t = int(payload.get("frame", wiz.frame_index()))
+    # Swapped, so "paint a dab on each particle" teaches FILM and the sweeps
+    # across the background teach PARTICLE.
+    c_particle, c_film = (1, 0) if payload.get("mislabel") else (0, 1)
+    pos, radii, present = particle_truth_at(gt, t)
+    h, w = (int(v) for v in gt["frame_shape"])
+    idx = [int(i) for i in np.flatnonzero(present)]
+    if not idx:
+        emit_error(f"seg_autolabel: no particles present at frame {t}")
+        return
+
+    # PARTICLE: a dab at each centre, well inside the body so a radius that is
+    # slightly off cannot label film as particle.
+    painted = 0
+    for i in idx:
+        cy, cx = float(pos[i, 0]), float(pos[i, 1])
+        painted += _paint_stroke(wiz, t, [[cy, cx]], c_particle, False,
+                                 max(1.5, float(radii[i]) * 0.5))
+
+    # FILM: sweeps that clear every particle by a margin. Painting background is
+    # not optional politeness — a head that has never seen a not-quite-particle
+    # pixel returns visibly fat masks (measured in test_particles_scribble).
+    yy, xx = np.mgrid[0:h, 0:w]
+    clear = np.ones((h, w), bool)
+    for i in idx:
+        d2 = (yy - pos[i, 0]) ** 2 + (xx - pos[i, 1]) ** 2
+        clear &= d2 > (float(radii[i]) + max(3.0, 0.05 * h)) ** 2
+    band = max(2, h // 24)
+    sweeps = np.zeros((h, w), bool)
+    sweeps[:band, :] = True
+    sweeps[-band:, :] = True
+    sweeps[:, :band] = True
+    sweeps[h // 2:h // 2 + band, :] = True
+    store = wiz.label_store()
+    store.paint(t, sweeps & clear, c_film)
+    painted += int((sweeps & clear).sum())
+
+    log.info("[seg] autolabel: %d px across %d particles + film on frame %d",
+             painted, len(idx), t)
+    _emit_state(wiz)
 
 
 # ── the on-plot brush ────────────────────────────────────────────────────────
@@ -2021,6 +2188,7 @@ def seg_run(session, plot, payload) -> None:
                 on_frames=_on_frames)
         finally:
             drop_engine_model(model_path)
+            _report_stage_costs(session, n_frames)
         return per_frame, contours, n_done
 
     def _done(res):
@@ -2080,6 +2248,61 @@ def _teardown_batch(tree, result, stopped, computing=None) -> None:
                 t_.unregister_cancel(flag=stopped)
             except Exception as exc:
                 log.debug("[seg] unregister_cancel failed: %s", exc)
+
+
+def _report_stage_costs(session, n_frames: int) -> None:
+    """Log where a finished batch actually spent its time, per stage per lane.
+
+    Every worker already records ``(t0, n, device, engine_s, measure_s,
+    block_s)`` for every task (``batch._STAGE_LOG``) — and until now only the
+    benchmark ever drained it, so a real run threw the numbers away and left
+    "it's slow" with nothing attached.
+
+    That matters here more than usual because the three stages have completely
+    different fixes and roughly comparable costs on a 4096² frame (measured:
+    ~1.0 s featurise+head, ~1.8 s split, ~1.4 s measure). Optimising the wrong
+    one is the default outcome of guessing, and CLAUDE.md's benchmarking rule
+    says so in as many words: time each stage separately, because "it's slow"
+    is usually one of them.
+
+    Best-effort and never fatal: this is diagnostics on the way out of a run
+    that has already produced its result.
+    """
+    try:
+        from spyde.particles.batch import drain_stage_log
+
+        client = _batch_client(session)
+        recs: list = []
+        if client is not None:
+            for per_worker in (client.run(drain_stage_log) or {}).values():
+                recs.extend(per_worker or [])
+        else:
+            recs.extend(drain_stage_log())
+        if not recs:
+            return
+
+        by_dev: dict[str, list] = {}
+        for _t0, n, dev, eng, meas, block in recs:
+            by_dev.setdefault(str(dev), []).append((n, eng, meas, block))
+        for dev, rows in sorted(by_dev.items()):
+            frames = sum(r[0] for r in rows)
+            eng = sum(r[1] for r in rows)
+            meas = sum(r[2] for r in rows)
+            block = sum(r[3] for r in rows)
+            other = max(0.0, block - eng - meas)
+            if frames <= 0:
+                continue
+            log.info(
+                "[seg-batch] %s: %d frames in %d tasks | per frame: "
+                "engine %.2fs (%.0f%%), measure %.2fs (%.0f%%), other %.2fs "
+                "(%.0f%%) | %.3f frames/s",
+                dev, frames, len(rows),
+                eng / frames, 100.0 * eng / max(block, 1e-9),
+                meas / frames, 100.0 * meas / max(block, 1e-9),
+                other / frames, 100.0 * other / max(block, 1e-9),
+                frames / max(block, 1e-9))
+    except Exception as exc:                                  # pragma: no cover
+        log.debug("[seg-batch] stage-cost report unavailable: %s", exc)
 
 
 def _finalize(session, result, placeholder, per_frame, contours, p,

@@ -53,7 +53,7 @@ from spyde.data.synthetic import (
     particle_movie,
     particle_truth_at,
 )
-from spyde.particles.classical import SegmentParams, split_instances
+from spyde.particles.instances import SegmentParams, split_instances
 from spyde.particles.features import FeatureSpec, select_device
 from spyde.particles.scribble import LabelStore, ScribbleClassifier, default_classes
 from spyde.particles.scribble_cnn import CONFIGS, ScribbleCNN, build_net
@@ -252,7 +252,7 @@ def evaluate(engine, movie_data, gt, geom) -> dict:
 
     Both engines expose ``predict_foreground_boundary`` and ``segment``, which
     is the design claim being tested — so this function cannot tell them apart,
-    and neither can :func:`spyde.particles.classical.split_instances`.
+    and neither can :func:`spyde.particles.instances.split_instances`.
     """
     pos, radii, present, faint, shape = geom
     out: dict = {}

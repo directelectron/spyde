@@ -2,7 +2,7 @@
 scribble.py — the scribble-trained pixel classifier. Plan step B3, the workhorse.
 
 The user paints a few strokes on a frame; this learns *their* data and produces a
-per-frame foreground probability map that :func:`spyde.particles.classical.
+per-frame foreground probability map that :func:`spyde.particles.instances.
 split_instances` turns into instances. Same shared downstream stage as the
 classical and prompt engines — the only thing that changes is how the first box
 in the plan's §0.2 pipeline gets filled.
@@ -33,7 +33,7 @@ probability map.
 **A BOUNDARY class, and it is a performance feature.** The ilastik convention is
 particle / background / **boundary**, and the third one is not a refinement — it
 is the only way out of the cost that dominates a large frame. Every engine ends
-at :func:`spyde.particles.classical.split_instances`, whose watershed route needs
+at :func:`spyde.particles.instances.split_instances`, whose watershed route needs
 a global distance transform, a marker/elevation upsample and a flood — together
 1.62 s of a 1.78 s split at 4096². All of that exists to *guess* where two
 touching particles should be cut. A head that has
@@ -116,7 +116,7 @@ UNLABELLED = -1
 #: ``(id, name, colour, particle, boundary)``. The **boundary** class is the
 #: ilastik convention and it is here for speed as much as for quality: painting
 #: the joins between touching particles lets
-#: :func:`~spyde.particles.classical.split_instances` take its connected-
+#: :func:`~spyde.particles.instances.split_instances` take its connected-
 #: components route and skip the distance transform and watershed entirely —
 #: 1.78 s down to 0.33 s at 4096². It is not a particle class — a boundary
 #: pixel is the seam, not the body — so it does not enter the foreground sum.
@@ -148,7 +148,7 @@ class ScribbleClass:
     boundary
         Whether this class marks the **seam between touching particles**. Summed
         the same way *particle* is, into a separate map that
-        :func:`~spyde.particles.classical.split_instances` uses to skip the
+        :func:`~spyde.particles.instances.split_instances` uses to skip the
         watershed. A class is one or the other, never both: a boundary pixel is
         not part of any body, and counting it as foreground would glue the two
         bodies it separates back together — which is the exact failure the class
@@ -888,7 +888,7 @@ class ScribbleClassifier:
 
         The sum over every class with :attr:`ScribbleClass.particle` set, which is
         the per-frame probability map the plan's §0.2 spine consumes — hand it
-        straight to :func:`spyde.particles.classical.split_instances`.
+        straight to :func:`spyde.particles.instances.split_instances`.
 
         Zero inside a NaN-padded region (plan trap 2).
         """
@@ -898,7 +898,7 @@ class ScribbleClassifier:
         """``(H, W)`` float32 **boundary** probability, or None if untrained.
 
         None and not a zero map, because the two mean different things to
-        :func:`~spyde.particles.classical.split_instances`: "no boundary was
+        :func:`~spyde.particles.instances.split_instances`: "no boundary was
         taught, use the watershed" versus "a boundary was taught and this frame
         has none of it", which would leave every touching pair merged.
         """
@@ -959,7 +959,7 @@ class ScribbleClassifier:
         so a user who has not painted any boundary gets exactly the behaviour
         they had before — never a silently worse split.
         """
-        from spyde.particles.classical import SegmentParams, split_instances
+        from spyde.particles.instances import SegmentParams, split_instances
         fg, bnd = self.predict_foreground_boundary(frame)
         return split_instances(fg, params or SegmentParams(), boundary=bnd)
 

@@ -1,17 +1,33 @@
 """
-classical.py — the always-available segmentation engine, and the SHARED
-instance-split every engine uses.
+instances.py — foreground probability/mask → individual particles.
 
-Two halves, and the split between them is the important part:
+The SHARED instance split. :func:`split_instances` takes a foreground
+**probability or mask** and cuts it into separate particles; every engine
+funnels into it, and it is the only place in the package that imports skimage's
+segmentation machinery.
 
-* :func:`threshold_mask` / :func:`segment_frame` — the classical engine, a port of
-  ParticleSpy's ``segptcls.process``. Parameter *names* are kept identical so the
-  caret is recognisable to anyone arriving from ParticleSpy.
-* :func:`split_instances` — takes a foreground **probability or mask** and splits
-  it into individual particles. This is used by all three engines (classical,
-  scribble, prompt), which is why it lives here as its own function rather than
-  inside the classical pipeline. It is the only place in the package that imports
-  skimage's segmentation machinery.
+**This file used to be `classical.py`** and carried a second half: a port of
+ParticleSpy's ``segptcls.process`` (``threshold_mask`` / ``segment_frame``,
+plus ``sensitivity`` / ``gaussian`` / ``rb_kernel`` / ``invert`` /
+``local_size`` and the ten-method ``THRESHOLD_METHODS`` table). That engine is
+**gone**, and it is worth recording why so nobody restores it:
+
+* **It did not work on the data this feature exists for.** A global threshold
+  needs a bimodal histogram; a low-contrast in-situ frame has none, so otsu
+  lands inside the noise and the split shatters the support film. Measured on
+  one such 1024² frame: 4873 instances at 39% coverage with the defaults, and
+  *no* parameter combination recovered the real particles — the settings that
+  produced a plausible count (8 instances) covered 52% of the frame, i.e. those
+  eight bodies WERE the film. See ``benchmarks.md``.
+* **The threshold is data-dependent, so the preview lied.** The caret previews a
+  centred ~1 MP crop and the batch segments the whole frame; otsu computed 120.0
+  on the crop and 146.0 on the full frame of the same image. Tuning against the
+  preview therefore did not control the run.
+* Plan §0.9 had already made the learned classifier the primary path.
+
+A trained scribble head has neither problem: it is a fixed function, so it gives
+the same answer on a crop, on a tile and on the whole frame. Deleting the
+classical engine removed a class of bug rather than fixing it.
 
 Two routes through the split, and which one runs is the performance story
 -------------------------------------------------------------------------
@@ -34,15 +50,6 @@ transform nor the watershed runs at all**. Only the scribble engine can produce
 that mask, which is why the boundary class lives in
 :mod:`~spyde.particles.scribble` and the route it unlocks lives here.
 
-Sensitivity is one axis, deliberately
---------------------------------------
-Plan §0.9 makes detection sensitivity the priority over instance splitting, and
-notes that sensitivity and separation trade off against each other — a threshold
-loose enough to catch a faint particle also merges neighbours. So
-:attr:`SegmentParams.sensitivity` is a single 0..1 control that biases the
-threshold, and the splitting parameters are secondary. Exposing "threshold offset"
-and "split aggressiveness" as independent knobs invites the user to chase one with
-the other.
 """
 from __future__ import annotations
 
@@ -51,27 +58,23 @@ from typing import Any
 
 import numpy as np
 
-#: Thresholding methods, matching ParticleSpy's vocabulary.
-THRESHOLD_METHODS: tuple[str, ...] = (
-    "otsu", "mean", "minimum", "yen", "isodata", "li",
-    "local", "local_otsu", "niblack", "sauvola",
-)
-
-_LOCAL_METHODS = frozenset({"local", "local_otsu", "niblack", "sauvola"})
-
 
 @dataclass
 class SegmentParams:
-    """Classical-pipeline parameters. ParticleSpy names where they correspond."""
+    """How a foreground map is cut into instances, and which are kept.
 
-    threshold: str = "otsu"
-    #: 0..1. 0.5 is the method's own threshold; >0.5 is more sensitive (lower
-    #: threshold, catches fainter particles, merges more); <0.5 is stricter.
-    sensitivity: float = 0.5
-    rb_kernel: int = 0          # rolling-ball radius, 0 = off
-    gaussian: float = 0.0       # pre-blur sigma, 0 = off
-    invert: bool = False        # dark particles on a bright background
-    local_size: int = 31        # window for the local threshold methods (odd)
+    Split and size only. There are no detection parameters here any more — what
+    counts as foreground is the classifier's business, and this dataclass never
+    sees the frame.
+
+    Unknown keys are NOT accepted, but a result saved before the classical
+    engine was removed carries ``threshold`` / ``sensitivity`` / ``gaussian`` /
+    ``rb_kernel`` / ``invert`` / ``local_size`` in its provenance. Those are
+    dropped on load rather than rejected — see
+    ``particles_action._segment_kwargs``, which builds this from a coerced dict
+    of known keys, so a stale param can never reach the constructor.
+    """
+
     watershed: bool = True      # split touching particles
     #: Minimum distance between watershed markers, px. **This replaces
     #: ParticleSpy's ``watershed_size``**, whose semantics do not transfer: it
@@ -137,168 +140,13 @@ class SegmentParams:
     extra: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if self.threshold not in THRESHOLD_METHODS:
+        if self.min_size < 0 or self.max_size < 0:
             raise ValueError(
-                f"unknown threshold {self.threshold!r}; expected one of "
-                f"{', '.join(THRESHOLD_METHODS)}"
-            )
-        if not 0.0 <= self.sensitivity <= 1.0:
-            raise ValueError(f"sensitivity must be in 0..1; got {self.sensitivity}")
-        if self.threshold in _LOCAL_METHODS and self.local_size % 2 == 0:
-            # skimage requires an odd window; silently bumping it would make the
-            # caret's number disagree with what actually ran.
+                f"size bounds must be >= 0; got min_size={self.min_size}, "
+                f"max_size={self.max_size}")
+        if self.min_separation < 1:
             raise ValueError(
-                f"local_size must be odd for threshold={self.threshold!r}; "
-                f"got {self.local_size}"
-            )
-
-
-# ── preprocessing ────────────────────────────────────────────────────────────
-
-def _rolling_ball(img: np.ndarray, radius: int) -> np.ndarray:
-    """Background flatten via white top-hat, as ParticleSpy does it.
-
-    Note this is the morphological top-hat, not skimage's newer
-    ``restoration.rolling_ball``. Keeping ParticleSpy's actual operation matters
-    for the parity gate — the two give visibly different backgrounds on a sloping
-    carbon film.
-    """
-    from skimage.morphology import square, white_tophat
-    if radius <= 0:
-        return img
-    return white_tophat(img, footprint=square(int(radius)))
-
-
-def _prepare(frame: np.ndarray, p: SegmentParams) -> np.ndarray:
-    """Rolling-ball → gaussian → invert, returning float32.
-
-    NaN is filled BEFORE filtering. A drift-corrected frame carries a NaN border
-    (``spyde.drift.warp``), and every skimage filter propagates NaN outward,
-    which would erase a band of real data around the edge.
-
-    **The fill polarity follows ``invert``.** The padding has to read as
-    background in the image that is finally THRESHOLDED, and `invert` maps
-    ``x -> -x`` after this fill — so filling with the finite minimum when
-    inverting makes the border the brightest thing in the frame, and it
-    segments as one enormous particle hugging the edge. Measured on a 96²
-    frame with a 12 px NaN border: a 240 px instance on the padding, with the
-    border reading as the frame maximum.
-
-    That is the failure ``spyde.drift.warp`` names as the most likely
-    integration bug in the whole feature ("a threshold applied to NaN … invents
-    a large 'particle' along the edge that then nucleates a spurious track"),
-    so it is fixed here rather than papered over downstream. Filling with the
-    finite MAXIMUM when ``invert`` is set leaves the padding at the minimum
-    after inversion, which is what the rest of this function already assumes.
-    """
-    from scipy.ndimage import gaussian_filter
-    from skimage.util import invert as sk_invert
-
-    img = np.asarray(frame, dtype=np.float32)
-    bad = ~np.isfinite(img)
-    if bad.any():
-        finite = img[~bad]
-        img = img.copy()
-        if finite.size:
-            img[bad] = finite.max() if p.invert else finite.min()
-        else:
-            img[bad] = 0.0
-
-    if p.rb_kernel > 0:
-        img = _rolling_ball(img, p.rb_kernel)
-    if p.gaussian > 0:
-        img = gaussian_filter(img, float(p.gaussian))
-    if p.invert:
-        # sk_invert on a float image maps x -> -x, which is all thresholding needs.
-        img = sk_invert(img)
-    return img
-
-
-# ── thresholding ─────────────────────────────────────────────────────────────
-
-def _sensitivity_offset(img: np.ndarray, sensitivity: float) -> float:
-    """Convert 0..1 sensitivity into an additive threshold offset.
-
-    Scaled by the image's own robust spread (5-95 percentile), so the control
-    behaves the same on a uint16 frame and a normalised float one. At 0.5 the
-    offset is exactly zero, i.e. the method's own threshold is used unmodified —
-    which keeps the default path bit-identical to plain Otsu and makes the parity
-    test against ParticleSpy meaningful.
-    """
-    if sensitivity == 0.5:
-        return 0.0
-    finite = img[np.isfinite(img)]
-    if finite.size == 0:
-        return 0.0
-    lo, hi = np.percentile(finite, [5, 95])
-    spread = float(hi - lo)
-    if spread <= 0:
-        return 0.0
-    # sensitivity 1.0 lowers the threshold by half the spread; 0.0 raises it.
-    return -(float(sensitivity) - 0.5) * spread
-
-
-def threshold_mask(img: np.ndarray, p: SegmentParams) -> np.ndarray:
-    """Boolean foreground mask for a prepared image.
-
-    Raises
-    ------
-    ValueError
-        If the chosen method cannot be computed on this image. Some methods
-        genuinely have preconditions — ``minimum`` needs a bimodal histogram and
-        skimage raises ``RuntimeError`` when it cannot find two maxima, which
-        happens on a sparse field of small bright particles (nearly all background,
-        so the histogram is one spike). Re-raised here with the method named and a
-        suggestion, because the bare skimage error gives the user nothing to act on.
-    """
-    from skimage import filters
-
-    offset = _sensitivity_offset(img, p.sensitivity)
-
-    try:
-        return _apply_threshold(img, p, offset)
-    except RuntimeError as exc:
-        raise ValueError(
-            f"threshold method {p.threshold!r} failed on this frame ({exc}). "
-            "It requires a clearly bimodal intensity histogram; a sparse field of "
-            "small particles does not have one. Try 'otsu', 'yen' or 'li', or a "
-            "local method such as 'sauvola'."
-        ) from exc
-
-
-def _apply_threshold(img: np.ndarray, p: SegmentParams, offset: float) -> np.ndarray:
-    from skimage import filters
-
-    if p.threshold == "otsu":
-        t = filters.threshold_otsu(img)
-    elif p.threshold == "mean":
-        t = filters.threshold_mean(img)
-    elif p.threshold == "minimum":
-        t = filters.threshold_minimum(img)
-    elif p.threshold == "yen":
-        t = filters.threshold_yen(img)
-    elif p.threshold == "isodata":
-        t = filters.threshold_isodata(img)
-    elif p.threshold == "li":
-        t = filters.threshold_li(img)
-    elif p.threshold == "local":
-        t = filters.threshold_local(img, block_size=p.local_size)
-    elif p.threshold == "niblack":
-        t = filters.threshold_niblack(img, window_size=p.local_size)
-    elif p.threshold == "sauvola":
-        t = filters.threshold_sauvola(img, window_size=p.local_size)
-    elif p.threshold == "local_otsu":
-        from skimage.filters.rank import otsu as rank_otsu
-        from skimage.morphology import disk
-        from skimage.util import img_as_ubyte
-        lo, hi = float(np.nanmin(img)), float(np.nanmax(img))
-        norm = np.zeros_like(img) if hi <= lo else (img - lo) / (hi - lo)
-        t_u8 = rank_otsu(img_as_ubyte(norm), disk(max(1, p.local_size // 2)))
-        t = lo + (t_u8.astype(np.float32) / 255.0) * (hi - lo)
-    else:                                        # pragma: no cover — guarded above
-        raise ValueError(f"unknown threshold {p.threshold!r}")
-
-    return img > (np.asarray(t, dtype=np.float32) + np.float32(offset))
+                f"min_separation must be >= 1 px; got {self.min_separation}")
 
 
 # ── the shared instance split ────────────────────────────────────────────────
@@ -721,20 +569,6 @@ def _relabel_sequential(labels: np.ndarray) -> np.ndarray:
     lut = np.zeros(int(labels.max()) + 1, dtype=np.int32)
     lut[present] = np.arange(1, present.size + 1, dtype=np.int32)
     return lut[labels]
-
-
-# ── the classical engine ─────────────────────────────────────────────────────
-
-def segment_frame(frame: np.ndarray, p: SegmentParams | None = None) -> np.ndarray:
-    """Classical segmentation of one frame → int32 label image.
-
-    ``prepare → threshold → split_instances``. The whole ParticleSpy pipeline,
-    with the instance step factored out so the other two engines share it.
-    """
-    p = p or SegmentParams()
-    prepared = _prepare(frame, p)
-    fg = threshold_mask(prepared, p)
-    return split_instances(fg, p)
 
 
 def merge_close_instances(labels: np.ndarray, merge_px: float) -> np.ndarray:
