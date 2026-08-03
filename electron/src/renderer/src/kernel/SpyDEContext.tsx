@@ -751,7 +751,10 @@ interface SpyDEContextValue {
   latestStates: React.MutableRefObject<Map<string, Map<string, unknown>>>
   sendAction: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
   setActiveWindow: (windowId: number) => void
-  replayState: (figId: string) => void
+  /** Re-send a figure's stashed state. `target` names WHICH iframe — needed
+   *  when a figure is mounted twice (sidebar cell + presented slide), where the
+   *  shared figId→element map holds only the last-registered one. */
+  replayState: (figId: string, target?: HTMLIFrameElement) => void
   // Harvest a rendered PNG from a figure's iframe (the anyplotlib export
   // protocol). Resolves null on timeout/error. Used by the report save flow +
   // any future PNG-export path.
@@ -863,8 +866,21 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
   const [dragKind, setDragKind] = useState<'window' | null>(null)
 
   // Post every stored state for a figure to its iframe (called on iframe load).
-  const replayState = (figId: string) => {
-    const iframe = iframeRefs.current.get(figId)
+  /**
+   * Re-send a figure's stashed state into an iframe.
+   *
+   * `target` names WHICH iframe. Load-bearing when a figure is mounted more
+   * than once — a report figure lives in the sidebar cell AND on its presented
+   * slide, and both register under the same figId in a Map that holds one
+   * element. Resolving the target from that map means whichever mounted LAST
+   * wins, so a freshly-loaded frame calling replayState would push its state
+   * into its SIBLING and receive nothing itself. Which mount won is a race, so
+   * the presented deck came up blank on some machines and not others.
+   *
+   * A frame that has just loaded passes itself here and is always served.
+   */
+  const replayState = (figId: string, target?: HTMLIFrameElement) => {
+    const iframe = target ?? iframeRefs.current.get(figId)
     if (!iframe?.contentWindow) return
     const states = latestStates.current.get(figId)
     if (states) {

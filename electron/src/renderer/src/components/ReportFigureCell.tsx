@@ -902,7 +902,7 @@ export function SeamlessFigureFrame({ figId, filePath, title, iframeRefs, replay
   filePath: string | null
   title: string
   iframeRefs: React.MutableRefObject<Map<string, HTMLIFrameElement>>
-  replayState: (figId: string) => void
+  replayState: (figId: string, target?: HTMLIFrameElement) => void
 }) {
   // Read here rather than taking a prop so EVERY host of this frame (report
   // cell, split block, Present mode) gets the drag fix without threading it.
@@ -937,7 +937,7 @@ export function SeamlessFigureFrame({ figId, filePath, title, iframeRefs, replay
 
   // Promote the pending frame once it has painted: load → replayState → 2 rAFs.
   const onFrameLoad = (loadedFigId: string, el: HTMLIFrameElement) => {
-    replayState(loadedFigId)
+    replayState(loadedFigId, el)   // ITSELF — never whichever mount won the map
     window.electron.resizeFigure(loadedFigId,
       Math.max(80, el.clientWidth), Math.max(80, el.clientHeight))
     if (loadedFigId === shownRef.current) return   // the currently-shown frame

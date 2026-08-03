@@ -307,11 +307,23 @@ test('LAZY dataset: navigator + DP grid presents with BOTH panels filled', async
   await page.waitForTimeout(8000)
   await page.screenshot({ path: join(SHOTS, '04-lazy-grid-presented.png') })
 
-  const counts = await panelPixelCounts(page, 2)
-  console.log('[lazy-grid] per-panel non-background pixel counts =', JSON.stringify(counts))
+  // ASSERT ON THE STASH, not on pixels.
+  //
+  // The probe below counts anything brighter than the background, so an empty
+  // panel's own fill and its HTML scale-bar overlay score as "content" — it
+  // reported healthy numbers for a genuinely broken figure throughout the
+  // investigation that produced this spec, and its absolute values swing with
+  // the renderer (it failed on CI's headless Linux while passing locally on
+  // the SAME build). One stashed pixel frame per panel is exact and is the
+  // property that actually decides whether a presented panel can draw.
+  const dump = await page.evaluate(() => (window as any).__spydeFigureDump?.() ?? [])
+  const presented = (dump as any[]).find(r => r.registeredIn === 'present-slide')
+    ?? (dump as any[]).find(r => r.binaryKeys >= 2)
+  console.log('[lazy-grid] figure replay stash =', JSON.stringify(dump))
+  expect(presented, 'no figure carried the presented grid').toBeTruthy()
+  expect(presented.binaryKeys,
+    'a panel of the presented grid has no stashed pixels and will render empty').toBe(2)
 
-  expect(counts.length, 'could not sample the presented figure canvas').toBe(2)
-  for (const [i, n] of counts.entries()) {
-    expect(n, `LAZY: presented panel ${i} is EMPTY (no image pixels)`).toBeGreaterThan(500)
-  }
+  const counts = await panelPixelCounts(page, 2)
+  console.log('[lazy-grid] per-panel pixel counts (indicative only) =', JSON.stringify(counts))
 })

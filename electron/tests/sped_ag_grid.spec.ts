@@ -225,15 +225,23 @@ test('SPED-Ag: navigator + DP grid, presented, both panels must draw', async () 
   await expect(diagPanel).toBeVisible({ timeout: 5_000 })
   const diagText = (await diagPanel.innerText()).replace(/\n/g, ' | ')
   console.log('[sped-ag] on-screen diagnostic =', diagText)
-  expect(diagText).toContain('in=present-slide')
+  // NB deliberately NOT asserting which mount holds the figId registration.
+  // Sidebar cell and presented slide both register under the same id and the
+  // winner is a race — it came out 'present-slide' locally and 'report-sidebar'
+  // on CI, on the same build. It no longer decides anything: a frame replays
+  // into ITSELF on load (replayState's `target`). What matters is the stash.
+  expect(diagText).toContain('2 panel(s)')
   await page.screenshot({ path: join(SHOTS, '04-diagnostic.png') })
   await page.getByTestId('present-diag-toggle').click()
   await expect(diagPanel).toBeHidden({ timeout: 5_000 })
 
   const dump = await page.evaluate(() => (window as any).__spydeFigureDump?.() ?? null)
   console.log('[sped-ag] figure replay stash =', JSON.stringify(dump, null, 1))
-  const presented = (dump ?? []).find((r: any) => r.registeredIn === 'present-slide')
-  expect(presented, 'no figure registered to the presented slide').toBeTruthy()
+  // The GRID figure — identified by carrying more than one panel's pixels, not
+  // by which mount won the registration race (see the note above).
+  const presented = (dump ?? []).find((r: any) => String(r.binaryKeyNames).includes(','))
+    ?? (dump ?? []).find((r: any) => r.registeredIn === 'present-slide')
+  expect(presented, 'no figure carried the composed grid').toBeTruthy()
   console.log('[sped-ag] presented figure: panels=2',
               'binaryKeys=', presented.binaryKeys, 'jsonKeys=', presented.jsonKeys)
 
