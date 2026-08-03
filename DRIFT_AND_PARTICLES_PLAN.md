@@ -59,10 +59,52 @@ foreground probability map — and then shares one downstream stage:
                                     link (Hungarian) ──► tracks + events
 ```
 
-The three engines are **not** competing implementations to choose between —
-they are three ways to fill the first box, and they compose (§0.4). The
-instance-split + measure stage is written once and is the only code that ever
-touches skimage.
+The engines are **not** competing implementations to choose between — they are
+ways to fill the first box, and they compose (§0.4). The instance-split +
+measure stage is written once and is the only code that ever touches skimage.
+
+> **UPDATE 2026-08-02 — `classical` is DELETED, and the caret has no tabs.**
+> It shipped, was tried on a real 132.8 GB in-situ movie, and did not work; the
+> decision to remove rather than retune is measured, not aesthetic.
+>
+> * **No parameter setting recovers the particles.** On a low-contrast frame a
+>   global threshold has no bimodal histogram to find, so otsu lands inside the
+>   noise and the split shatters the support film: 4873 instances at 39%
+>   coverage with the defaults, and the settings that yield a plausible 8
+>   instances cover **52%** of the frame — those eight bodies are the film.
+> * **The preview could not predict the run.** The caret previews a centred
+>   ~1 MP crop and the batch segments the whole frame, and otsu is computed from
+>   whatever array it is given: 120.0 on the crop, 146.0 on the full frame of the
+>   same image. Tuning the preview therefore did not control the run, which is
+>   the "I had it well fit and then it blew up" report.
+> * A trained scribble head has neither problem — it is a fixed function, so a
+>   crop, a tile and the whole frame all get the same answer. Deleting the engine
+>   removed a class of bug rather than fixing one, and it removes the per-tile
+>   threshold-consistency problem that progressive preview tiling would otherwise
+>   have to solve.
+>
+> `classical.py` is now `instances.py` and holds only the shared split, which is
+> what every engine funnels into. Six `SegmentParams` fields went with the
+> engine; a `.spyde` saved with them still loads, because `_coerce` and
+> `_segment_kwargs` name known keys rather than passing a dict through.
+>
+> **The caret lost its tab row with it.** One shipping engine and one
+> unimplemented one is not a choice. The consequence is deliberate and is the
+> headline UI change: the caret now opens having found **nothing**, with the
+> instruction as its primary content, because an untrained classifier has no
+> opinion. The old face showed a result the instant it opened and on real data
+> that result was the film.
+>
+> **What survived the deletion, and why:** the coverage verdict. It reads the
+> measured OUTPUT rather than any threshold, so a head mis-trained to call the
+> film "particle" trips it too — and that is a common mistake, one careless dab
+> on the background. It needed a second branch to do so: the two engines fail
+> with different SHAPES. A threshold shatters the film into thousands of tiny
+> fragments; a bad classifier merges it into a few hundred large blobs. Measured
+> in the app, the mis-trained head returned **228 instances covering ~100% of the
+> frame** — a solid sheet, obviously wrong, and under the 500-instance bar that
+> was tuned on the shatter. Past `_FAIL_COVERAGE_ALONE` (60%) the count stops
+> being evidence either way.
 
 ### 0.3 Package layout and dependencies
 
