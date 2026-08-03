@@ -209,15 +209,13 @@ def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = Tr
 
     def _spatial_nav_plot():
         """The navigator plot whose displayed shape is the 2-D spatial grid
-        (nav_shape_2d). For a 5-D stack _first_nav_plot may be the OUTER (1-D
+        (nav_shape_2d). For a 5-D stack the first nav plot is the OUTER (1-D
         stack) plot — painting the 2-D live count map there leaves the spatial
-        navigator black, which is the bug. Match on shape; fall back to first."""
-        want = tuple(int(s) for s in nav_shape_2d)
-        for npl in _all_nav_plots(new_tree):
-            cur = getattr(npl, "current_data", None)
-            if hasattr(cur, "shape") and tuple(cur.shape) == want:
-                return npl
-        return _first_nav_plot(new_tree)
+        navigator black AND wedges the time navigator, so there is deliberately
+        NO fallback: no match means skip this paint and try again next poll.
+        Uses _display_shape, which resolves before the first async paint lands
+        (a 4-D tree has one nav plot and matches immediately either way)."""
+        return _nav_plot_with_shape(new_tree, nav_shape_2d)
 
     def _paint(arr):
         nav_plot = _spatial_nav_plot()
@@ -484,21 +482,18 @@ def _finalize(tree, vecs) -> None:
             log.debug("building the per-slice vector counts failed: %s", e)
 
     if vecs.n_time > 0:
-        # The 5-D result tree currently registers ONE navigator signal ('base',
-        # the 2-D spatial count map) — there is no (n_time,) plot here to paint,
-        # so the per-slice branch below finds nothing. Logged at INFO because it
-        # is the signal the 5-D e2e reads; see the note on the time-nav paint.
+        # Logged at INFO because it is the signal the 5-D e2e reads; see the note
+        # on the time-nav paint. Shapes come from _display_shape, so an unpainted
+        # plot reports its real display shape rather than ().
         log.info("[fv-5d] nav plots: %s | navsigs=%s | spatial=%s n_time=%d",
-                 [tuple(getattr(getattr(p, "current_data", None), "shape", ()))
-                  for p in _all_nav_plots(tree)],
+                 [_display_shape(p) for p in _all_nav_plots(tree)],
                  list(getattr(tree, "navigator_signals", {}) or {}),
                  tuple(spatial_2d), vecs.n_time)
 
     painted = False
     for nav_plot in _all_nav_plots(tree):
         try:
-            cur = getattr(nav_plot, "current_data", None)
-            exp = tuple(cur.shape) if hasattr(cur, "shape") else None
+            exp = _display_shape(nav_plot)
             if exp is not None and tuple(exp) == tuple(spatial_2d):
                 nav_plot.needs_auto_level = True
                 nav_plot.set_data(count_map)
@@ -515,8 +510,10 @@ def _finalize(tree, vecs) -> None:
                          [int(x) for x in per_slice[:8]])
         except Exception as e:
             log.debug("painting final count map onto navigator failed: %s", e)
-    if not painted:
-        # Fallback: paint the first nav plot (4-D, or shape unknown).
+    if not painted and per_slice is None:
+        # Fallback for a 4-D tree only: one navigator, shape unresolvable.
+        # NEVER for a stack — its first nav plot is the 1-D time line, and
+        # pushing a 2-D count map there is what left it blank (see _display_shape).
         np0 = _first_nav_plot(tree)
         if np0 is not None:
             try:
@@ -603,7 +600,44 @@ def _install_render_display(tree, vecs) -> None:
     # MultiplotManager.add_navigation_selector_and_signal_plot.
     tree._render_frame_fn = _fn
 
-    sig_plots = set(getattr(tree, "signal_plots", []))
+    # 5-D stack: the TOP (time) selector drives the 2-D REAL-SPACE navigator, and
+    # its signal is the tree's zero count-map placeholder — so scrubbing time
+    # sliced zeros over the count map. Give that child its own slice function:
+    # the count map OF THAT SLICE. (This is a navigator, NOT a signal plot — it
+    # must never get `_fn`, which is what drew diffraction patterns in the
+    # real-space window.)
+    spatial_2d = tuple(int(s) for s in vecs.nav_shape)
+    n_time = int(getattr(vecs, "n_time", 0) or 0)
+
+    def _count_fn(selector, child, indices):
+        idx = np.asarray(indices)
+        if idx.ndim >= 2:
+            ts = sorted({int(r[-1]) for r in idx})
+        else:
+            ts = [int(idx[-1])] if idx.size else [0]
+        ts = [t for t in ts if 0 <= t < n_time] or [0]
+        try:
+            # A span (integrate mode) sums the slices it covers, mirroring
+            # render_region: a 1-wide span equals the single-slice count map.
+            out = np.zeros(spatial_2d, dtype=np.float32)
+            for t in ts:
+                out += np.asarray(vecs.count_map_at_t(t), dtype=np.float32)
+            return out
+        except Exception as e:
+            log.debug("count_map_at_t(%s) failed, showing blank: %s", ts, e)
+            return np.zeros(spatial_2d, dtype=np.float32)
+
+    nav_targets = set()
+    if n_time > 0:
+        nav_targets = {id(p) for p in _all_nav_plots(tree)
+                       if getattr(p, "is_navigator", False)
+                       and _display_shape(p) == spatial_2d}
+
+    # Navigator plots are NOT signal plots (MultiplotManager files only real
+    # signal plots), but filter defensively — installing the DP renderer on a
+    # navigator is the exact failure this guards.
+    sig_plots = {p for p in getattr(tree, "signal_plots", [])
+                 if not getattr(p, "is_navigator", False)}
     npm = getattr(tree, "navigator_plot_manager", None)
     touched = set()
     if npm is not None:
@@ -611,8 +645,12 @@ def _install_render_display(tree, vecs) -> None:
             for child in list(getattr(sel, "children", {}).keys()):
                 if child in sig_plots:
                     sel.children[child] = _fn
-                    child.needs_auto_level = True
-                    touched.add(sel)
+                elif id(child) in nav_targets:
+                    sel.children[child] = _count_fn
+                else:
+                    continue
+                child.needs_auto_level = True
+                touched.add(sel)
     for sel in touched:
         try:
             sel.delayed_update_data(force=True)
@@ -711,20 +749,40 @@ def _overlay_on_result(tree, vecs) -> None:
     the computed-vectors window drew red circles over the rendered disks).
     Replaces any prior overlay so re-running doesn't stack markers."""
     from spyde.actions.vector_overlay import attach_vector_overlay
-    old = getattr(tree, "_result_vector_overlay", None)
-    if old is not None:
+    for old in _result_overlays(tree):
         try:
             old.remove()
         except Exception as e:
             log.debug("removing prior vector overlay failed: %s", e)
-        tree._result_vector_overlay = None
+    tree._result_vector_overlay = None
+
+    # SIGNAL plots only. A 5-D stack's intermediate real-space navigator used to
+    # land in `signal_plots`, so it got a circle overlay in k-space coordinates
+    # too — and its driving selector is the 1-D time selector, whose one-coord
+    # index blew up the (iy, ix) unpack mid-attach and left a raising hook wired
+    # to that selector for the rest of the session.
+    attached = []
     for sp in list(getattr(tree, "signal_plots", [])):
+        if getattr(sp, "is_navigator", False):
+            continue
         try:
-            tree._result_vector_overlay = attach_vector_overlay(sp, vecs, tree)
+            attached.append(attach_vector_overlay(sp, vecs, tree))
         except Exception as e:
-            import logging
-            logging.getLogger(__name__).debug(
-                "result vector overlay attach failed: %s", e)
+            log.debug("result vector overlay attach failed: %s", e)
+    # Every overlay is retained so re-running Find Vectors removes them ALL;
+    # `_result_vector_overlay` stays the primary (first signal plot) for callers
+    # and tests that reach for one.
+    tree._result_vector_overlays = attached
+    tree._result_vector_overlay = attached[0] if attached else None
+
+
+def _result_overlays(tree) -> list:
+    """Every result-window vector overlay attached by a previous run."""
+    out = list(getattr(tree, "_result_vector_overlays", None) or [])
+    primary = getattr(tree, "_result_vector_overlay", None)
+    if primary is not None and primary not in out:
+        out.append(primary)
+    return out
 
 
 def _first_nav_plot(tree):
@@ -764,6 +822,46 @@ def _all_nav_plots(tree):
         for sub in list(subs or []):
             _add(sub)
     return out
+
+
+def _display_shape(plot):
+    """The numpy shape this plot DISPLAYS, or None if it can't be resolved.
+
+    ``current_data`` is the honest answer once the plot has painted — but the
+    first paint is dispatched ASYNCHRONOUSLY on the nav thread, so for the first
+    fraction of a second after a window opens it is still None. Matching a
+    navigator purely on ``current_data.shape`` therefore MISSES during exactly
+    the window in which Find-Vectors starts its live count-map poller, and the
+    "no match" fallback then painted a 2-D count map onto the 1-D TIME navigator
+    of a 5-D stack (set_data raises on the shape mismatch, leaving that plot's
+    ``current_data`` None forever — which is why the time navigator stayed a
+    flat zero line even after the batch finished).
+
+    So fall back to the plot state's own signal: its SIGNAL axes are what the
+    figure draws, and they exist the moment the state is created. ``signal_shape``
+    is fastest-axis-first, so reverse it for numpy row-major order."""
+    cur = getattr(plot, "current_data", None)
+    if hasattr(cur, "shape"):
+        return tuple(int(s) for s in cur.shape)
+    am = getattr(getattr(getattr(plot, "plot_state", None),
+                         "current_signal", None), "axes_manager", None)
+    if am is None:
+        return None
+    try:
+        return tuple(int(s) for s in reversed(am.signal_shape))
+    except Exception as e:
+        log.debug("resolving plot display shape failed: %s", e)
+        return None
+
+
+def _nav_plot_with_shape(tree, want) -> "object | None":
+    """The navigator plot that displays exactly ``want`` — or None. Never
+    substitutes a differently-shaped plot (see :func:`_display_shape`)."""
+    want = tuple(int(s) for s in want)
+    for npl in _all_nav_plots(tree):
+        if _display_shape(npl) == want:
+            return npl
+    return None
 
 
 def _refresh_signal_from_navigator(tree) -> None:
