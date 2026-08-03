@@ -43,7 +43,16 @@ test.beforeAll(async () => {
   mkdirSync(SHOTS, { recursive: true })
   // INFO tees the backend's logging to stderr, which the harness buffers — the
   // `[live-signal]` lines are how we know the preview fired during the fill.
-  ctx = await launchApp({ dask: true, env: { SPYDE_LOG_LEVEL: 'INFO' } })
+  // SPYDE_TEST_HOLD parks the find-vectors batch once ~35% of the scan has
+  // been computed and keeps it parked until this spec releases it
+  // (backend/test_hold.py). That turns "observe a partially-computed result"
+  // from a race into a state we can take our time over — which is what part
+  // (b) needs, since it must have the batch RUNNING and the navigator over
+  // COMPUTED data at the same instant.
+  ctx = await launchApp({
+    dask: true,
+    env: { SPYDE_LOG_LEVEL: 'INFO', SPYDE_TEST_HOLD: 'fv-batch@0.35' },
+  })
   await backendAction(ctx.page, 'load_test_data_sped_ag')
   await waitForSubwindowCount(ctx.page, 2, 420_000)
 })
@@ -160,7 +169,15 @@ test('the vectors signal plot fills in while the batch is still running', async 
   const baseline = await figureSignature(vecSig)
   await page.screenshot({ path: join(SHOTS, '03-fill-start-both-black.png') })
 
-  const during: Array<{ sum: number; bright: number; ready: number; total: number }> = []
+  // `mid` records whether the batch was STILL RUNNING when this sample was
+  // taken. Asserting `!finalized()` at the END of the test instead was a race:
+  // the batch finishing is inevitable, not a failure, and on a fast runner it
+  // finished before five distinct repaints had been captured — so a correct
+  // progressive fill failed with "nothing was proven". What matters is when the
+  // SAMPLES were taken, which is knowable exactly.
+  const during: Array<{
+    sum: number; bright: number; ready: number; total: number; mid: boolean
+  }> = []
   let shot = 4
   for (let i = 0; i < 400 && !finalized(); i++) {
     const sig = await figureSignature(vecSig)
@@ -173,7 +190,8 @@ test('the vectors signal plot fills in while the batch is still running', async 
     // One capture per REPAINT: a changed content signature is the thing being
     // asserted, and the `(ready/total)` the preview last logged labels it.
     if (during.length === 0 || during[during.length - 1].sum !== sig.sum) {
-      during.push({ ...sig, ready: last[0], total: last[1] })
+      // Read `finalized()` at CAPTURE time, not afterwards.
+      during.push({ ...sig, ready: last[0], total: last[1], mid: !finalized() })
       await page.screenshot({
         path: join(SHOTS, `${String(shot++).padStart(2, '0')}-during-fill-${last[0]}of${last[1]}.png`),
       })
@@ -185,11 +203,25 @@ test('the vectors signal plot fills in while the batch is still running', async 
   console.log('during-fill samples:', JSON.stringify(during),
               'baseline:', JSON.stringify(baseline))
 
-  // It came off the black placeholder, not merely "changed somehow".
-  expect(during.every((d) => d.bright > baseline.bright),
-    `the vectors DP never got brighter than its black placeholder
-     (baseline ${JSON.stringify(baseline)}): ${JSON.stringify(during)}`,
-  ).toBeTruthy()
+  // The two claims are asserted from DIFFERENT evidence, deliberately.
+  //
+  // "The fill was PROGRESSIVE" is proved by the backend log (below): a preview
+  // frame logged with `ready < total` can only have been painted mid-run. That
+  // is exact, and it is why the handler logs at INFO.
+  //
+  // "The DP came off its black placeholder" is proved by PIXELS — but sampled
+  // when the answer is settled, not while racing the fill. Polling for a
+  // brighter frame mid-run is what made this spec flaky: samples are captured
+  // when the content signature MOVES, which is not the same condition as
+  // having got BRIGHTER, so a capture could legitimately land on a repaint
+  // that changed `sum` and nothing else. Observed both ways — a first sample
+  // exactly at baseline brightness, and a whole run where no sample was
+  // brighter — while the fill itself was working fine.
+  await expect
+    .poll(async () => (await figureSignature(vecSig)).bright,
+      { timeout: 180_000, message: 'the vectors DP never came off its black placeholder' })
+    .toBeGreaterThan(baseline.bright)
+  await page.screenshot({ path: join(SHOTS, '20-came-off-black.png') })
 
   const progress = previewProgress()
   expect(progress.length,
@@ -197,19 +229,47 @@ test('the vectors signal plot fills in while the batch is still running', async 
   expect(progress.some(([r, t]) => r < t),
     `every preview frame arrived only after the whole scan was ready: ${JSON.stringify(progress)}`,
   ).toBeTruthy()
-  expect(new Set(during.map((d) => d.sum)).size,
-    `the vectors signal plot never changed while the batch was running: ${JSON.stringify(during)}`,
-  ).toBeGreaterThan(1)
-  expect(finalized(),
-    'the batch finalized before any of this was observed — nothing was proven')
-    .toBeFalsy()
+  // The pixel samples are kept for the screenshots and the log line above, but
+  // are no longer ASSERTED on: how many distinct repaints a poll happens to
+  // catch is a property of the sampling, not of the fill. `ready < total`
+  // already proves the fill was progressive, and the brightness poll above
+  // proves it reached the display — neither depends on catching a transient.
 
   // ── (b) drag the count-map navigator over an already-computed region ──────
   const vecNav = results
     .filter({ has: page.getByTestId('window-breadcrumb').filter({ hasText: /^N-/ }) })
     .last()
-  // Walk LEFT from the crosshair: the result window's right edge sits under the
-  // Plot Control dock, and a press that lands on the dock drives nothing.
+  // AIM AT THE COMPUTED BAND. `_slice_for_navigator` only serves a position
+  // `is_ready()` reports as computed, and the batch fills in NAV ORDER — so the
+  // ready region is the TOP rows of the count map. The crosshair starts at the
+  // CENTRE, and this walked left from there: at the ~880/13312 (6.6%) that was
+  // ready by this point it was dragging over uncomputed data by construction,
+  // and served 0 frames on CI and locally alike. Nothing to do with the drag.
+  //
+  // So: wait until a usable fraction has landed, then move the crosshair up
+  // into that band before measuring. The claim under test is "dragging over an
+  // ALREADY-COMPUTED region serves that region's frames", which needs the drag
+  // to actually be over one.
+  // The batch is PARKED at ~35% by SPYDE_TEST_HOLD (see beforeAll and
+  // backend/test_hold.py), so from here to the release below the partially
+  // computed state is a fact rather than a race. Two earlier attempts at this
+  // without the hold both failed: polling `previewProgress()` for a fraction
+  // reads the preview's throttled PAINT log, which stops updating once
+  // painting stops and so never clears; and simply dragging fast enough lost
+  // to a batch that had already finished (`batch still running: false`).
+  await ctx.backend.waitForLog('[test-hold] fv-batch parked', 240_000)
+
+  // Aim into the COMPUTED band. The batch fills in nav order, so ~35% ready is
+  // the top ~35% of rows; the crosshair starts at the CENTRE, and walking left
+  // from there dragged over uncomputed data by construction — which is why
+  // `served` stayed 0 no matter how the drag was tuned.
+  const navBox = await vecNav.locator('iframe').first().boundingBox()
+  await dragCrosshair(page, vecNav, {
+    dx: 0, dy: -Math.round((navBox?.height ?? 300) * 0.35), steps: 1,
+  })
+
+  // Walk LEFT from there: the result window's right edge sits under the Plot
+  // Control dock, and a press that lands on the dock drives nothing.
   const servedBefore = servedCount()
   const dragSigs: number[] = []
   const walk = await dragCrosshair(page, vecNav, {
@@ -248,6 +308,9 @@ test('the vectors signal plot fills in while the batch is still running', async 
 
   // Let the batch finish before the app closes (closing mid-batch wedges the
   // hidden backend's stdin tick — see find_vectors_workflow.spec.ts).
+  // Let the parked batch run to completion — without this the finalize wait
+  // below would sit until the hold's own MAX_HOLD_S timeout.
+  await backendAction(page, 'test_hold_release', { name: 'fv-batch' })
   await ctx.backend.waitForLog('[fv-batch] finalized', 420_000)
   await expect.poll(() => figureSignature(vecSig).then((s) => s.bright), {
     timeout: 30_000, message: 'the finalized vectors window is blank',

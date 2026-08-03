@@ -465,41 +465,34 @@ test('6) figure Copy → Paste appends a live cell; markdown Duplicate; OS clipb
   const clipEmpty = await ctx.app.evaluate(({ clipboard }) => clipboard.readImage().isEmpty())
   expect(clipEmpty, 'OS clipboard image is empty after figure Copy').toBe(false)
 
-  // Wave B removed the header Paste button (Ctrl+V still pastes an image; the
-  // internal cell clipboard is consumed by the per-cell Duplicate). Duplicate the
-  // figure cell → a SECOND figure cell appears with LIVE pixels.
+  // The per-cell ＋ is no longer "Duplicate cell" — duplicating a slide's cell
+  // was a verb nobody reached for, while COMBINING two figures into a subplot
+  // grid had no button at all. ＋ now opens the add-a-figure window picker; a
+  // pick tiles that window in beside this one (see compose_real_drag.spec.ts
+  // for the grid assertions). Here we only pin that the old Duplicate button is
+  // GONE and the new picker opens in its place.
   await figCell.dispatchEvent('mouseover', { bubbles: true })
-  const figDupBtn = page.getByTestId(`cell-duplicate-${figCellId}`)
-  await expect(figDupBtn).toBeVisible()
-  await figDupBtn.click()
-  await expect.poll(async () => countFigCells(page), {
-    timeout: 15_000, message: 'Duplicate did not append a second figure cell',
-  }).toBe(2)
-  // The newly-pasted (last) figure cell should render live pixels.
-  await expect.poll(async () => figCellPixels(page, 1), {
-    timeout: 30_000, message: 'pasted figure cell drew no pixels (not live)',
-  }).toBeGreaterThan(500)
-  await page.waitForTimeout(1000)
-  await page.screenshot({ path: join(SHOTS, '06b-after-paste.png') })
+  expect(await page.getByTestId(`cell-duplicate-${figCellId}`).count(),
+    'the Duplicate button should be gone').toBe(0)
+  const addFigBtn = page.getByTestId(`cell-add-figure-${figCellId}`)
+  await expect(addFigBtn).toBeVisible()
+  await addFigBtn.click()
+  await expect(page.getByTestId(`add-figure-menu-${figCellId}`)).toBeVisible({ timeout: 5_000 })
+  await page.waitForTimeout(400)
+  await page.screenshot({ path: join(SHOTS, '06b-add-figure-menu.png') })
+  await page.keyboard.press('Escape')
 
-  // Duplicate the markdown cell → a duplicate appears immediately below it.
+  // A markdown cell has no figure, so it gets NO ＋ at all.
   const mdCell = page.locator('[data-testid^="report-cell-rendered-"]').first()
   const mdCellId = await mdCell.evaluate((el) =>
     (el.getAttribute('data-testid') || '').replace('report-cell-rendered-', ''))
-  const mdCountBefore = await page.locator('[data-testid^="report-cell-rendered-"]').count()
   const mdContainer = page.getByTestId(`report-cell-${mdCellId}`)
   await mdContainer.dispatchEvent('mouseover', { bubbles: true })
-  const dupBtn = page.getByTestId(`cell-duplicate-${mdCellId}`)
-  await expect(dupBtn).toBeVisible()
-  await dupBtn.click()
-  await expect.poll(async () => page.locator('[data-testid^="report-cell-rendered-"]').count(), {
-    timeout: 10_000, message: 'markdown Duplicate did not add a cell',
-  }).toBe(mdCountBefore + 1)
-  // The duplicate carries the same rendered H1.
-  const h1s = page.locator('[data-testid^="report-cell-rendered-"] h1')
-  await expect.poll(async () => h1s.count(), { timeout: 5_000 }).toBeGreaterThanOrEqual(2)
-  await page.waitForTimeout(600)
-  await page.screenshot({ path: join(SHOTS, '06c-after-duplicate.png') })
+  await expect(page.getByTestId(`cell-copy-${mdCellId}`)).toBeVisible()
+  expect(await page.getByTestId(`cell-add-figure-${mdCellId}`).count(),
+    'a markdown cell should not offer ＋ Add figure').toBe(0)
+  await page.waitForTimeout(400)
+  await page.screenshot({ path: join(SHOTS, '06c-markdown-chrome.png') })
 
   ctx.assertNoJsErrors()
 })

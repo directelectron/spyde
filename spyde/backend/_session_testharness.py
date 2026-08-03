@@ -19,7 +19,7 @@ import numpy as np
 import hyperspy.api as hs
 
 from spyde.backend import ipc
-from spyde.backend.ipc import emit_error
+from spyde.backend.ipc import emit_error, emit_status
 
 log = logging.getLogger(__name__)
 
@@ -721,6 +721,39 @@ class TestHarnessMixin:
             ctx, sigma=1.0, kernel_radius=5, threshold=0.4,
             min_distance=3, subpixel=True,
         )
+
+    def _test_ipf_pick(self, payload=None) -> None:
+        """Test-only: move the IPF map's white PICK crosshair to scan pixel
+        ``(iy, ix)`` exactly the way a user drag does, and fire the same
+        ``pointer_up`` handler.
+
+        The pick handler is what drives the IPF explorer window (window 2) — it
+        marks the orientation on all four views and rotates both spheres to face
+        it. Playwright can screenshot the result but cannot reliably GRAB a
+        crosshair inside an out-of-process figure iframe at an arbitrary zoom,
+        so this drives the widget + handler directly. The handler itself, and
+        everything downstream of it, is the real code path.
+        ``payload={"iy": int, "ix": int}``.
+        """
+        payload = payload or {}
+        iy, ix = int(payload.get("iy", 0)), int(payload.get("ix", 0))
+        picked = 0
+        for tree in list(self.signal_trees):
+            pick = getattr(tree, "_ipf_pick_fn", None)
+            if pick is None:
+                continue
+            widget = getattr(tree, "_ipf_picker", None)
+            if widget is not None:
+                try:
+                    widget.set(cx=float(ix), cy=float(iy))   # what the drag pushes
+                except Exception as e:
+                    log.debug("test_ipf_pick: moving the picker failed: %s", e)
+            try:
+                pick(iy, ix)                                 # the real handler body
+                picked += 1
+            except Exception as e:
+                log.debug("test_ipf_pick: pick failed: %s", e)
+        emit_status(f"test_ipf_pick: {picked} IPF window(s) → ({iy}, {ix})")
 
     def _run_test_orientation(self, plot, payload=None) -> None:
         """Test-only Orientation Mapping with a built-in phase (no CIF dialog), so

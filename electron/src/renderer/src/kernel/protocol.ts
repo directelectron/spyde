@@ -687,7 +687,59 @@ export interface ReportDocState {
    *  Absent on an older backend/file → 'report'. */
   type?: string
   dirty: boolean
+  /** Label of the action the next undo would reverse (e.g. "Delete figure
+   *  cell"), or null/absent when the stack is empty. Drives the Undo button's
+   *  label and enabled state. */
+  undo?: string | null
+  /** The deck's look — colours, type, footer bar, logo. Always a FULL dict from
+   *  the backend (every key present), so consumers index it without a fallback
+   *  at each use site. Absent only on an older backend → DECK_THEME_DEFAULTS. */
+  theme?: DeckTheme
   cells: ReportCell[]
+}
+
+/** A presentation's theme. Saved INSIDE the document, so a talk keeps its look
+ *  when reopened or handed on; "set as default" separately seeds new decks. */
+export interface DeckTheme {
+  /** Slide background. */
+  bg: string
+  /** Body copy. */
+  text: string
+  /** Subtitles, captions, the footer. */
+  muted: string
+  /** Headings, the title rule, the footer keyline. */
+  accent: string
+  /** CSS font stack; '' = the app's own. */
+  font: string
+  /** Logo as a data: URL, embedded in the deck ('' = none). */
+  logo: string
+  /** Logo height in px as drawn in the footer. */
+  logo_height: number
+  /** Draw the footer bar on content slides. */
+  footer_show: boolean
+  footer_name: string
+  footer_email: string
+  /** Affiliation / conference / date — the third footer slot. */
+  footer_note: string
+  /** Show "n / N" in the footer. */
+  slide_numbers: boolean
+}
+
+/** Mirrors spyde/actions/report/model.py THEME_DEFAULTS. Used when an older
+ *  backend ships no theme at all. */
+export const DECK_THEME_DEFAULTS: DeckTheme = {
+  bg: '#14141f',
+  text: '#e8e8f0',
+  muted: '#a6adc8',
+  accent: '#89b4fa',
+  font: '',
+  logo: '',
+  logo_height: 30,
+  footer_show: true,
+  footer_name: '',
+  footer_email: '',
+  footer_note: '',
+  slide_numbers: true,
 }
 
 /** Full report document — the backend re-broadcasts this on every change. */

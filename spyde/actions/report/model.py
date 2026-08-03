@@ -217,6 +217,76 @@ def _normalize_slide_style(val) -> str:
     return s if s in _SLIDE_STYLES else ""
 
 
+# ── Deck theme ───────────────────────────────────────────────────────────────
+#
+# The look of a PRESENTATION: colours, type, the footer bar (name / email /
+# affiliation), and a logo. It belongs to the DOCUMENT — a talk keeps its look
+# when you reopen it or hand the file to someone — so it round-trips through the
+# ``theme:`` front-matter key. A separate "set as default" copies the current
+# theme into settings.json, and every NEW deck starts from that; the two are
+# deliberately different scopes (this talk vs how I always present).
+#
+# Every field is optional with a sane fallback, so a deck written before themes
+# existed loads with the built-in look and no migration.
+
+#: The built-in look — the colours Present mode has always used.
+THEME_DEFAULTS: dict = {
+    "bg": "#14141f",            # slide background
+    "text": "#e8e8f0",          # body copy
+    "muted": "#a6adc8",         # subtitles, captions, footer
+    "accent": "#89b4fa",        # headings, the title rule, footer keyline
+    "font": "",                 # "" = the app's own stack
+    "logo": "",                 # data: URL, embedded in the deck
+    "logo_height": 30,          # px, as drawn in the footer
+    "footer_show": True,        # footer bar on content slides
+    "footer_name": "",
+    "footer_email": "",
+    "footer_note": "",          # affiliation / conference / date
+    "slide_numbers": True,
+}
+
+#: Keys whose value must be a bool / int rather than a string.
+_THEME_BOOL_KEYS = ("footer_show", "slide_numbers")
+_THEME_INT_KEYS = ("logo_height",)
+
+
+def normalize_theme(raw) -> dict:
+    """Coerce *raw* into a full theme dict, filling every missing key from
+    :data:`THEME_DEFAULTS`.
+
+    Unknown keys are DROPPED rather than carried: the theme is written into
+    front matter and read straight back into CSS, so an unrecognised key is at
+    best dead weight and at worst something a hand-edited file smuggled in.
+    Colour/text values are kept as plain strings and clamped in length; the
+    renderer is what ultimately decides whether a value is a usable colour."""
+    out = dict(THEME_DEFAULTS)
+    if not isinstance(raw, dict):
+        return out
+    for key, default in THEME_DEFAULTS.items():
+        if key not in raw:
+            continue
+        val = raw[key]
+        if key in _THEME_BOOL_KEYS:
+            out[key] = bool(val)
+        elif key in _THEME_INT_KEYS:
+            try:
+                out[key] = max(8, min(200, int(val)))
+            except (TypeError, ValueError):
+                out[key] = default
+        else:
+            s = "" if val is None else str(val)
+            # A logo is a data: URL and can be large; everything else is short.
+            out[key] = s if key == "logo" else s[:200]
+    return out
+
+
+def theme_is_default(theme: dict) -> bool:
+    """True when *theme* carries nothing worth serializing (it equals the
+    built-in look), so an untouched deck writes no ``theme:`` front matter and
+    stays byte-identical to how it serialized before themes existed."""
+    return normalize_theme(theme) == dict(THEME_DEFAULTS)
+
+
 def _encode_notes(notes) -> str:
     """utf-8 speaker notes → a single-line, comment-safe base64 token (standard
     base64, no newlines). Empty / whitespace-only notes → ``""`` (the marker is
@@ -597,12 +667,20 @@ class FigureSpec:
     ``vectors_mode`` records the user's drop-time choice for a source tree that
     carries diffraction vectors: ``"viewer"`` embeds the interactive explorer in
     HTML exports, ``"image"`` forces the static snapshot. ``""`` (older files /
-    non-vectors sources) keeps the viewer-when-available default."""
+    non-vectors sources) keeps the viewer-when-available default.
+
+    ``orientation_mode`` is the same switch for a tree carrying an ORIENTATION
+    result (the IPF explorer embed). Unlike vectors it has no drop-time prompt:
+    the vectors blob can reach tens of MB, which is worth asking about, while a
+    packed orientation map is ~20 bytes per position per direction — so the
+    viewer is simply the default and ``"image"`` exists for pinning a cell to
+    its static snapshot."""
     layout: dict = field(default_factory=lambda: {"kind": "single"})
     panels: list = field(default_factory=list)          # [PanelSpec]
     nav_context: dict | None = None            # {"indices": [iy, ix]}
     annotations: list = field(default_factory=list)     # [dict] figure-fraction markers
     vectors_mode: str = ""                     # "" | "viewer" | "image"
+    orientation_mode: str = ""                 # "" | "viewer" | "image"
 
     def to_dict(self) -> dict:
         d = {
@@ -614,6 +692,8 @@ class FigureSpec:
         }
         if self.vectors_mode:
             d["vectors_mode"] = self.vectors_mode
+        if self.orientation_mode:
+            d["orientation_mode"] = self.orientation_mode
         return d
 
     @classmethod
@@ -626,6 +706,7 @@ class FigureSpec:
                          if d.get("nav_context") is not None else None),
             annotations=[dict(a) for a in (d.get("annotations") or [])],
             vectors_mode=str(d.get("vectors_mode", "") or ""),
+            orientation_mode=str(d.get("orientation_mode", "") or ""),
         )
 
     def to_yaml(self) -> str:
@@ -846,6 +927,10 @@ class ReportDoc:
     created: str = ""
     modified: str = ""
     cells: list = field(default_factory=list)  # [Cell]
+    #: The deck's look — colours, type, footer, logo. See THEME_DEFAULTS.
+    #: Always a FULL dict (normalize_theme fills the gaps) so every reader can
+    #: index it without a fallback at each use site.
+    theme: dict = field(default_factory=lambda: dict(THEME_DEFAULTS))
 
     def __post_init__(self):
         now = _utcnow()
@@ -853,6 +938,7 @@ class ReportDoc:
             self.created = now
         if not self.modified:
             self.modified = now
+        self.theme = normalize_theme(self.theme)
 
     # ── cell operations ────────────────────────────────────────────────────────
 
@@ -1036,6 +1122,12 @@ def serialize_report_md(doc: ReportDoc) -> str:
         "created": doc.created,
         "modified": doc.modified,
     }
+    # Only serialize a theme that differs from the built-in look, so an
+    # untouched document is byte-identical to how it serialized before themes
+    # existed (and no diff appears just from opening and saving one).
+    theme = normalize_theme(getattr(doc, "theme", None))
+    if not theme_is_default(theme):
+        front["theme"] = theme
     parts = ["---\n", _dump_yaml(front), "---\n"]
     body_blocks: list[str] = []
     for c in doc.cells:
@@ -1126,6 +1218,8 @@ def parse_report_md(text: str) -> ReportDoc:
         doc_type=_normalize_doc_type(front.get("type", "report")),
         created=str(front.get("created", "")),
         modified=str(front.get("modified", "")),
+        # Absent (every pre-theme document) → the built-in look.
+        theme=normalize_theme(front.get("theme")),
     )
     doc.cells = _parse_body_cells(body)
     return doc

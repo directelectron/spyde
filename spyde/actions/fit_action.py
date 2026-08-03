@@ -317,6 +317,22 @@ class FitWizard(WizardController):
         navigation selector. Looking for it on the Plot (as this first did)
         always returned None, which is what made "Fit spectrum" silently fit
         the navigation mean.
+
+        …and from the selector's LIVE geometry, not its ``current_indices``
+        snapshot. That attribute is written by ``_run_update`` on the
+        ``_NavDispatcher`` THREAD, while this runs on the asyncio main thread —
+        and the renderer sends ``fit_navigated`` off the same pointer event that
+        started the navigator update, so a handler can easily arrive before the
+        dispatcher has committed the new position. It then recalls the PREVIOUS
+        pixel's fit, and nothing re-fires to correct it: the caret sits on a
+        stale model until the next navigator move. ``get_selected_indices`` is
+        the same pure geometry call ``_run_update`` itself makes (the snapshot is
+        just its last result), so reading it here is the same number, only never
+        behind.
+
+        Which selector wins is unchanged — still the first with a committed
+        position — so this cannot resurrect the fit-the-navigation-mean bug
+        above; only the VALUE is made current.
         """
         npm = getattr(self.tree, "navigator_plot_manager", None)
         if npm is None:
@@ -326,6 +342,13 @@ class FitWizard(WizardController):
                 idx = getattr(sel, "current_indices", None)
                 if idx is None:
                     continue
+                try:
+                    live = sel.get_selected_indices()
+                    if live is not None:
+                        idx = live
+                except Exception as e:
+                    log.debug("live navigator indices unavailable (%s); "
+                              "using the dispatcher's snapshot", e)
                 try:
                     flat = np.atleast_1d(np.asarray(idx)).ravel()
                     return tuple(int(v) for v in flat)

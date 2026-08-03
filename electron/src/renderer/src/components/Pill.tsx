@@ -14,8 +14,9 @@
 import React, { useState } from 'react'
 import {
   WINDOW_DRAG_MIME, NAVIGATOR_DRAG_MIME, SIGNAL_REF_DRAG_MIME, CONSOLE_VAR_DRAG_MIME,
-  WORKFLOW_NODE_DRAG_MIME, FIGURE_DRAG_MIME,
+  WORKFLOW_NODE_DRAG_MIME, FIGURE_DRAG_MIME, stashWindowDrag,
 } from '../kernel/dnd'
+import { dlog } from '../kernel/dragDiag'
 import { getActiveFigure } from '../kernel/activeFigure'
 
 export interface PillSegment {
@@ -106,6 +107,18 @@ export function Pill({
       if (title !== undefined) figPayload.title = title
       if (view !== undefined) figPayload.view = view
       dt.setData(FIGURE_DRAG_MIME, JSON.stringify(figPayload))
+      // Same payload kept in-process, for drop targets whose getData() comes
+      // back empty (see dnd.ts stashWindowDrag).
+      stashWindowDrag({
+        windowId: win.windowId,
+        ...(figId !== undefined ? { figId } : {}),
+        ...(view !== undefined ? { view } : {}),
+      })
+      dlog('1.dragstart/pill', {
+        windowId: win.windowId,
+        typesAfterSet: Array.from(dt.types),
+        stashed: true,
+      })
     }
     if (consoleVar) dt.setData(CONSOLE_VAR_DRAG_MIME, JSON.stringify({ name: consoleVar.name }))
     if (workflowNode) dt.setData(WORKFLOW_NODE_DRAG_MIME, JSON.stringify(workflowNode))

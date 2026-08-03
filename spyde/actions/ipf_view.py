@@ -77,19 +77,29 @@ def ipf_scene_data(result, direction: str = "z"):
 
 def scatter_ipf_sphere(ax, xyz: np.ndarray, rgb: np.ndarray, *,
                        point_size: float = IPF3D_POINT_SIZE,
-                       bounds=IPF3D_BOUNDS, zoom: float = IPF3D_ZOOM):
+                       bounds=IPF3D_BOUNDS, zoom: float = IPF3D_ZOOM,
+                       azimuth: float | None = None,
+                       elevation: float | None = None):
     """Draw the IPF unit-sphere scatter onto *ax* → the live ``Plot3D``. The one
     ``scatter3d`` call both the live explorer and the report scene3d panel make
     (crystal-axis labels, fixed unit bounds, GPU instanced points, reference
-    sphere)."""
+    sphere).
+
+    ``azimuth``/``elevation`` aim the opening camera; omit them for
+    ``scatter3d``'s default (-60°, 30°)."""
     colors = np.clip(np.asarray(rgb).astype(np.float32) / 255.0, 0.0, 1.0)
     xyz = np.asarray(xyz)
+    aim = {}
+    if azimuth is not None:
+        aim["azimuth"] = float(azimuth)
+    if elevation is not None:
+        aim["elevation"] = float(elevation)
     p3d = ax.scatter3d(
         xyz[:, 0], xyz[:, 1], xyz[:, 2],
         colors=colors, point_size=float(point_size),
         x_label="[100]", y_label="[010]", z_label="[001]",
         bounds=tuple(tuple(b) for b in bounds), zoom=float(zoom),
-        gpu=True,
+        gpu=True, **aim,
     )
     try:
         p3d.set_sphere(1.0)
@@ -106,9 +116,12 @@ def build_ipf_3d_figure(xyz: np.ndarray, rgb: np.ndarray, highlight=None):
     import anyplotlib._electron as _electron
     from spyde.drawing.plots.plot import finalize_figure_html
 
+    from spyde.actions.ipf_window import _aim_at
+
     fig, axes = apl.subplots(1, 1)
     ax = axes[0][0] if isinstance(axes, list) else axes
-    p3d = scatter_ipf_sphere(ax, xyz, rgb)
+    az, el = _aim_at(xyz)          # open looking AT the cloud, not past it
+    p3d = scatter_ipf_sphere(ax, xyz, rgb, azimuth=az, elevation=el)
     if highlight is not None:
         try:
             p3d.set_highlight(float(highlight[0]), float(highlight[1]),
@@ -208,71 +221,188 @@ def _ipf_key_color_grid(phase, direction: str, n: int):
            np.asarray(xy_edges), np.asarray(label_xy), labels)
 
 
-def build_ipf_key_figure(result, direction: str = "z", *, n: int = 120):
-    """Build the IPF colour-KEY triangle legend as a NATIVE anyplotlib figure →
-    ``(fig, fig_id, html)``.
+#: Fraction of the panel's short edge the pinned colour key occupies.
+IPF_KEY_SIZE = 0.26
 
-    The standard stereographic fundamental-sector colour key (e.g. cubic
-    [001]/[101]/[111]) rendered as a single stretched RGBA raster
-    (:meth:`anyplotlib.Plot1D.add_raster`) — the per-cell orix IPF colour
-    (``direction2color``) baked into an image and clipped to the curved sector
-    boundary, instead of one polygon per grid cell (~n² polygons for the same
-    visual). Same key for sample X/Y/Z (it's the crystal-direction colour map)."""
-    import anyplotlib as apl
-    import anyplotlib._electron as _electron
+#: The key's card. An IPF map is saturated colour edge to edge — including pale
+#: yellows and lavenders — and the corner indices are drawn in white, so on a
+#: bare key they land on whatever the map happens to be underneath and are
+#: unreadable over the light regions. A translucent dark slab makes them legible
+#: over ANY orientation without hiding much of the map (the key is ~26% of the
+#: short edge, pinned in a corner). Matches the app's surface colour at the same
+#: opacity the report's own overlay cards use.
+IPF_KEY_BG = "rgba(24,24,37,0.72)"
+IPF_KEY_BORDER = "#45475a"
 
-    from spyde.actions.ipf_density import _sector_limits
-    from spyde.drawing.plots.plot import finalize_figure_html
 
+def ipf_key_overlay(result, direction: str = "z", *, n: int = 120):
+    """``(rgba, labels)`` for :meth:`anyplotlib.Plot2D.add_key` → the colour-key
+    triangle as a floating overlay, or ``None`` if it cannot be built.
+
+    ``labels`` are dicts with ``x``/``y`` in FRACTIONS OF THE KEY IMAGE
+    (``add_key``'s convention) rather than data coordinates, so the corner
+    indices track the triangle through a panel resize. ``y`` is measured from
+    the TOP because :func:`_ipf_key_color_grid` already flipped the raster so
+    row 0 is max-y.
+
+    Each label is ALIGNED AWAY FROM ITS EDGE — a ``[h k l]`` sitting at x=1.0
+    is right-aligned, so it grows inwards. Centre-aligning everything (the
+    obvious first cut) clips the outermost indices against the panel edge,
+    which is exactly where the cubic sector puts two of its three corners.
+    """
     om = _as_orientation_map(result)
-    phase = om.orix_phase(0)                       # primary phase's point group
-
-    rgba, extent, xy_edges, label_xy, labels = _ipf_key_color_grid(
+    phase = om.orix_phase(0)
+    rgba, extent, _xy_edges, label_xy, labels = _ipf_key_color_grid(
         phase, direction, n)
-    xlim, ylim = _sector_limits(xy_edges)
+    x0, x1, y0, y1 = (float(v) for v in extent)
+    w, h = (x1 - x0) or 1.0, (y1 - y0) or 1.0
 
-    fig, axes = apl.subplots(1, 1)
-    ax = axes[0][0] if isinstance(axes, list) else axes
-    xy = ax.axes2d(xlim=xlim, ylim=ylim, aspect="equal")
-    # One drawImage instead of ~n² polygons; clip to the curved sector boundary.
-    xy.add_raster(rgba, extent=extent, clip_path=xy_edges, smooth=False)
-    xy.plot(xy_edges[:, 0], xy_edges[:, 1], color="#ffffff", linewidth=1.5)
+    out = []
     for (lx, ly), txt in zip(np.asarray(label_xy, dtype=float), labels):
-        xy.text(float(lx), float(ly), str(txt), color="#ffffff", fontsize=12)
+        fx = min(max((float(lx) - x0) / w, 0.0), 1.0)
+        fy = min(max((y1 - float(ly)) / h, 0.0), 1.0)
+        # Inset a hair as well as aligning: the glyph box still has a little
+        # bearing on the side it is anchored by.
+        if fx > 0.75:
+            align, fx = "right", min(fx, 0.98)
+        elif fx < 0.25:
+            align, fx = "left", max(fx, 0.02)
+        else:
+            align = "center"
+        fy = min(max(fy, 0.06), 0.94)
+        out.append({"x": fx, "y": fy, "text": str(txt), "align": align})
+    return rgba, out
 
-    fig_id = _electron.register(fig)
-    html = finalize_figure_html(fig, fig_id)
-    return fig, fig_id, html
 
+def attach_ipf_key(plot, result, direction: str = "z", *,
+                   hover_only: bool = True) -> bool:
+    """Pin the IPF colour key over *plot* as a native anyplotlib key overlay.
 
-def emit_ipf_key(window_id: int, result, direction: str = "z") -> bool:
-    """Emit the IPF colour-key triangle legend for *window_id* as a native
-    anyplotlib ``view="ipf_key"`` figure (pinned in a corner of the IPF map)."""
-    from spyde.backend.ipc import emit
-    try:
-        _fig, fig_id, html = build_ipf_key_figure(result, direction)
-    except Exception as e:
-        import logging
-        logging.getLogger(__name__).debug("ipf key figure failed: %s", e)
+    Replaces what used to be an entire second anyplotlib FIGURE — its own
+    ``view="ipf_key"`` emit, its own iframe, its own resize and state-replay
+    plumbing in the renderer — with one call on the map plot itself. A key
+    floats in screen space and neither pans nor zooms with the data, which is
+    exactly what a legend wants and what the separate figure was faking.
+
+    ``hover_only`` keeps the map unobstructed until the pointer is over it; the
+    key is still baked into a PNG export either way, so what you save is what
+    you see while reading the map.
+    """
+    p2d = getattr(plot, "_plot2d", plot)
+    add_key = getattr(p2d, "add_key", None)
+    if add_key is None:                        # anyplotlib < 0.7.0
+        log.debug("this anyplotlib has no add_key; skipping the IPF key")
         return False
-    keep_alive(int(window_id), _fig)
-    emit({
-        "type": "figure", "fig_id": fig_id, "window_id": int(window_id),
-        "html": html, "title": "IPF colour key", "is_navigator": False,
-        "view": "ipf_key",
-    })
+    try:
+        built = ipf_key_overlay(result, direction)
+        if built is None:
+            return False
+        rgba, labels = built
+        add_key(rgba, corner="bottom-right", size=IPF_KEY_SIZE,
+                hover_only=bool(hover_only), labels=labels, name="ipf_key",
+                bgcolor=IPF_KEY_BG, border=IPF_KEY_BORDER)
+        return True
+    except Exception as e:
+        log.debug("attaching the IPF key overlay failed: %s", e)
+        return False
+
+
+#: The map window's three projection chips, in canonical order.
+PROJECTION_LABELS = ("IPF-X", "IPF-Y", "IPF-Z")
+
+
+def attach_ipf_projections(tree, result, direction: str = "z") -> bool:
+    """**Window 1** — turn *tree*'s orientation-map window into the X / Y / Z
+    PROJECTION window.
+
+    The map plot itself is tagged as one chip (the *direction* it is painted
+    with) and the other two sample directions are emitted as sibling
+    ``view_label`` figures, so the window gets the app's ordinary chip strip:
+    click a chip to show one projection, ⌘-click to tile them side by side with
+    linked crosshairs (:mod:`spyde.actions.views`).
+
+    Appends to any views the caller already registered (EBSD's NCC / Similarity
+    / ADP quality maps) rather than replacing them.
+    """
+    from spyde.actions.views import emit_view_figure, register_views
+
+    sp = next(iter(getattr(tree, "signal_plots", []) or []), None)
+    wid = getattr(sp, "window_id", None)
+    if wid is None:
+        return False
+    om = _as_orientation_map(result)
+    d = str(direction).lower()
+    try:
+        maps = [(lbl, om.ipf_color_map(lbl[-1].lower())) for lbl in PROJECTION_LABELS]
+    except Exception as e:
+        log.debug("building IPF projection maps failed: %s", e)
+        return False
+    own = f"IPF-{d.upper()}"
+
+    def _pick(iy, ix):
+        """Resolved LAZILY: attach_ipf_point_selector (which owns the pick
+        function) runs after this, so binding it now would capture None."""
+        fn = getattr(tree, "_ipf_pick_fn", None)
+        if fn is not None:
+            fn(int(iy), int(ix))
+
+    register_views(wid, maps, cmap="gray", levels=None, append=True,
+                   pick_hook=_pick)
+    # One key image, reused by every projection: it is the CRYSTAL-direction
+    # colour map, identical for sample X, Y and Z.
+    key = None
+    try:
+        key = ipf_key_overlay(result, d)
+    except Exception as e:
+        log.debug("building the IPF key overlay failed: %s", e)
+    # Emit the OTHER two first: `set_view_tag` re-emits the live map plot, and
+    # the frontend's figure reducer moves a replaced figure to the end — so
+    # tagging last is what puts the chips in X, Y, Z order.
+    for lbl, m in maps:
+        if lbl == own:
+            continue                               # already on screen as the plot
+        emit_view_figure(wid, m, lbl, kind="2d", pick_hook=_pick, key=key)
+    # The painted map is a chip too, and it is a live Plot rather than a figure
+    # emit_view_figure built — so it needs the key attached directly. Do it
+    # BEFORE set_view_tag, which re-emits the plot's html.
+    attach_ipf_key(sp, result, d)
+    try:
+        sp.set_view_tag(own, "2d")                 # the painted map IS one chip
+    except Exception as e:
+        log.debug("tagging the IPF map view failed: %s", e)
     return True
 
 
-def attach_ipf_3d(tree, result, direction: str = "z") -> bool:
-    """Add the 3-D IPF view + the colour-key triangle legend to *tree*'s IPF
-    window (its first signal plot)."""
+def attach_ipf_3d(tree, result, direction: str = "z", session=None) -> bool:
+    """Attach the IPF views for an orientation result.
+
+    With a *session* this opens the TWO-window layout: the colour-key legend and
+    the X/Y/Z projection chips stay on the map window (window 1), and the
+    inverse pole figure itself moves to its own explorer window (window 2 —
+    :func:`spyde.actions.ipf_window.open_ipf_window`, the ``[2D|3D]`` ×
+    ``[Points|Heatmap]`` toggles).
+
+    Without one (older callers, unit tests) it falls back to the historical
+    single-window behaviour: 3-D sphere + density heatmap emitted onto the map
+    window as extra ``view`` figures.
+    """
     sp = next(iter(getattr(tree, "signal_plots", []) or []), None)
     wid = getattr(sp, "window_id", None)
     if wid is None:
         return False
     tree._ipf_result = result          # remember it for X/Y/Z re-colouring
-    emit_ipf_key(wid, result, direction)
+    tree._ipf_direction = str(direction).lower()
+    # The colour key rides on the map figures themselves (attach_ipf_projections
+    # below, and attach_ipf_key for the single-window fallback) rather than
+    # being emitted as its own `view="ipf_key"` figure.
+    if session is None:
+        attach_ipf_key(sp, result, direction)
+
+    if session is not None:
+        from spyde.actions.ipf_window import open_ipf_window
+        attach_ipf_projections(tree, result, direction)
+        return open_ipf_window(session, tree, result, direction) is not None
+
     ok = emit_ipf_3d(wid, result, direction, tree=tree)
     try:                               # native IPDF density heatmap (3rd toggle)
         from spyde.actions.ipf_density import emit_ipf_density
@@ -285,8 +415,13 @@ def attach_ipf_3d(tree, result, direction: str = "z") -> bool:
 
 def attach_ipf_point_selector(tree, result, direction: str = "z") -> None:
     """Add a white crosshair POINT SELECTOR to the IPF map's first plot. Picking a
-    pixel re-emits the 3-D IPF sphere with that orientation marked — the "pick on
-    the map, see it on the IPF legend" interaction."""
+    pixel shows that position's orientation on the IPF explorer window — marked
+    on all four views, with the spheres rotated to face it.
+
+    The pick FUNCTION is published as ``tree._ipf_pick_fn`` so the sibling
+    projection views (IPF-X / IPF-Y and the ⌘-tiled comparison, wired by
+    :func:`attach_ipf_projections`) drive the exact same interaction — the
+    crosshair has to keep working whichever projection chip is showing."""
     sp = next(iter(getattr(tree, "signal_plots", []) or []), None)
     plot2d = getattr(sp, "_plot2d", None) if sp is not None else None
     wid = getattr(sp, "window_id", None)
@@ -304,16 +439,17 @@ def attach_ipf_point_selector(tree, result, direction: str = "z") -> None:
     tree._ipf_picker = widget
     tree._ipf_result = result
 
-    def _on_pick(event=None):
-        try:
-            ix = int(round(float(widget.cx)))
-            iy = int(round(float(widget.cy)))
-        except Exception:
-            return
+    def _pick(iy, ix):
         if not (0 <= iy < ny and 0 <= ix < nx):
             return
         res = getattr(tree, "_ipf_result", result)
         d = getattr(tree, "_ipf_direction", direction)
+        # Two-window layout: the IPF explorer window owns every view, and it
+        # both marks the orientation AND rotates its spheres to face it.
+        ctrl = getattr(tree, "_ipf_window", None)
+        if ctrl is not None and not getattr(ctrl, "_closed", False):
+            if ctrl.show_orientation(iy, ix):
+                return
         p3d = getattr(tree, "_ipf_p3d", None)
         if p3d is not None:
             # Camera-preserving: move the highlight on the existing 3-D figure in
@@ -327,6 +463,14 @@ def attach_ipf_point_selector(tree, result, direction: str = "z") -> None:
                 log.debug("in-place IPF highlight failed, rebuilding: %s", e)
         emit_ipf_3d(wid, res, d, (iy, ix), tree=tree)   # fallback: rebuild
 
+    tree._ipf_pick_fn = _pick          # the sibling projection views call this
+
+    def _on_pick(event=None):
+        try:
+            _pick(int(round(float(widget.cy))), int(round(float(widget.cx))))
+        except Exception as e:
+            log.debug("IPF pick from the map crosshair failed: %s", e)
+
     try:
         widget.add_event_handler(_on_pick, "pointer_up")
     except Exception as e:
@@ -334,15 +478,28 @@ def attach_ipf_point_selector(tree, result, direction: str = "z") -> None:
 
 
 def ipf_set_direction(session, plot, payload) -> None:
-    """Re-colour an IPF window's 2-D map AND its 3-D explorer by sample direction
-    x | y | z (the IPF axis selector). The orientation result is cached on the
-    tree by ``attach_ipf_3d``; works for raw-OM (`orientation_map`) and vector-OM
-    (`vector_orientation`)."""
+    """Re-colour an IPF window's views by sample direction x | y | z (the IPF
+    axis selector). The orientation result is cached on the tree by
+    ``attach_ipf_3d``; works for raw-OM (`orientation_map`) and vector-OM
+    (`vector_orientation`).
+
+    The X/Y/Z buttons live on the IPF EXPLORER window (window 2), which is a
+    BARE figure window — dispatch resolves ``plot=None`` there, so fall back to
+    the window controller the dispatcher's injected ``window_id`` points at.
+    """
     direction = str(payload.get("direction", "z")).lower()
     if direction not in ("x", "y", "z"):
         return
     tree = getattr(plot, "signal_tree", None)
     if tree is None:
+        ctrl = None
+        if session is not None:
+            try:
+                ctrl = session.controller_by_window_id(payload.get("window_id"))
+            except Exception as e:
+                log.debug("resolving IPF window controller failed: %s", e)
+        if ctrl is not None and hasattr(ctrl, "set_direction"):
+            ctrl.set_direction(direction)
         return
     result = tree_orientation_result(tree)
     if result is None:
@@ -357,6 +514,11 @@ def ipf_set_direction(session, plot, payload) -> None:
             except Exception as e:
                 log.debug("painting IPF map for new direction failed: %s", e)
         tree._ipf_direction = direction
+        # Two-window layout: the explorer window owns the 3-D / density views.
+        ctrl = getattr(tree, "_ipf_window", None)
+        if ctrl is not None and not getattr(ctrl, "_closed", False):
+            ctrl.set_direction(direction)
+            return
         wid = getattr(plot, "window_id", None)
         if wid is not None:
             emit_ipf_3d(wid, result, direction, tree=tree)   # frontend replaces the old 3-D

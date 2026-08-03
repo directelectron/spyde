@@ -118,3 +118,112 @@ class TestVectors5D:
         assert series.shape == (2, 2, 3)
         # count weighting → 1 vector per position per slice.
         assert np.all(series == 1.0)
+
+
+class TestFiveDResultDisplay:
+    """The 5-D vectors RESULT WINDOW, which used to stop at slice 0.
+
+    Two separate faults, both visible in the app on a real 5-D stack:
+
+      * the 1-D TIME navigator was never painted — the paint loop skipped every
+        nav plot whose shape wasn't the 2-D spatial grid — so it sat on an
+        all-zero flat line, showing neither how many vectors a slice held nor
+        which slice was current;
+      * `count_map_at_t(0)` was painted once at attach and had exactly ONE call
+        site in the whole app, so scrubbing time left the count map on slice 0
+        while the DP and the vector overlay moved on.
+    """
+
+    class _Plot:
+        """Minimal nav-plot stand-in: records what was painted onto it."""
+
+        def __init__(self, shape):
+            self.current_data = np.zeros(shape, dtype=np.float32)
+            self.painted = []
+            self.needs_auto_level = False
+
+        def set_data(self, arr):
+            self.painted.append(np.asarray(arr))
+            self.current_data = np.asarray(arr)
+
+    class _Sel:
+        def __init__(self):
+            self.index_hooks = []
+            self.active_children = []
+            self.current_indices = None
+
+    def _tree(self, vecs):
+        """A tree carrying both nav plots a 5-D stack opens, plus one selector."""
+        from types import SimpleNamespace
+        spatial = self._Plot(vecs.nav_shape)          # 2-D count map
+        timeline = self._Plot((vecs.n_time,))         # 1-D stack navigator
+        sel = self._Sel()
+        npm = SimpleNamespace(
+            plot_windows={"w": None}, plots={"w": [spatial, timeline]},
+            all_navigation_selectors=[sel])
+        tree = SimpleNamespace(navigator_plot_manager=npm, signal_plots=[object()])
+        return tree, spatial, timeline, sel
+
+    def test_the_time_navigator_gets_per_slice_totals(self):
+        """The flat-zero line: the 1-D navigator must show vectors-per-slice."""
+        from spyde.actions.find_vectors_action import _all_nav_plots
+        v = _make_5d()
+        tree, _spatial, timeline, _sel = self._tree(v)
+        assert set(_all_nav_plots(tree)) >= {timeline}
+
+        series = np.asarray(v.count_map_series(), dtype=np.float32)
+        per_slice = series.reshape(series.shape[0], -1).sum(axis=1)
+        assert per_slice.shape == (v.n_time,)
+        assert per_slice.sum() == len(v.flat_buffer), \
+            "per-slice totals must account for every vector"
+        assert (per_slice > 0).all(), "a flat-zero time navigator is the bug"
+
+    def test_moving_time_repaints_the_count_map(self):
+        from spyde.actions.find_vectors_action import _attach_time_slice_repaint
+        v = _make_5d()
+        tree, spatial, _timeline, sel = self._tree(v)
+        _attach_time_slice_repaint(tree, v)
+        assert sel.index_hooks, "no hook registered on the navigator selector"
+
+        # A 5-D index is (t, iy, ix); the leading coord is the slice.
+        sel.index_hooks[0](np.array([[1, 0, 0]]))
+        assert spatial.painted, "moving the time axis repainted nothing"
+        np.testing.assert_array_equal(spatial.painted[-1], v.count_map_at_t(1))
+
+    def test_a_repeat_of_the_same_slice_does_not_repaint(self):
+        """The hook fires on every nav move, not just time changes."""
+        from spyde.actions.find_vectors_action import _attach_time_slice_repaint
+        v = _make_5d()
+        tree, spatial, _t, sel = self._tree(v)
+        _attach_time_slice_repaint(tree, v)
+        sel.index_hooks[0](np.array([[1, 0, 0]]))
+        n = len(spatial.painted)
+        sel.index_hooks[0](np.array([[1, 2, 2]]))     # same t, different x/y
+        assert len(spatial.painted) == n
+
+    def test_reattaching_does_not_double_paint(self):
+        """Re-running Find Vectors must not leave two hooks painting per move."""
+        from spyde.actions.find_vectors_action import _attach_time_slice_repaint
+        v = _make_5d()
+        tree, spatial, _t, sel = self._tree(v)
+        _attach_time_slice_repaint(tree, v)
+        _attach_time_slice_repaint(tree, v)
+        assert len(sel.index_hooks) == 1
+        sel.index_hooks[0](np.array([[1, 0, 0]]))
+        assert len(spatial.painted) == 1
+
+    def test_a_4d_result_registers_no_hook(self):
+        """4-D has no time axis — nothing to slice, nothing to subscribe to."""
+        from spyde.actions.find_vectors_action import _attach_time_slice_repaint
+        from types import SimpleNamespace
+        flat = np.zeros((4, N_COLS), dtype=np.float32)
+        flat[:, COL_KX] = 4.0
+        flat[:, COL_KY] = 4.0
+        v4 = SpyDEDiffractionVectors.from_arrays(
+            flat_buffer=flat, full_nav_shape=(2, 2), sig_shape=(8, 8),
+            sig_axes=(_Ax(8), _Ax(8)), kernel_radius_px=1.0,
+            kernel_radius_data=1.0)
+        assert v4.n_time == 0
+        tree, _s, _t, sel = self._tree(v4)
+        _attach_time_slice_repaint(tree, v4)
+        assert sel.index_hooks == []

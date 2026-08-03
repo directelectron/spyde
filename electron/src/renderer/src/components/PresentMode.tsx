@@ -45,7 +45,7 @@ import { useSpyDE } from '../kernel/SpyDEContext'
 import { renderMarkdown } from '../kernel/markdown'
 import { SeamlessFigureFrame } from './ReportFigureCell'
 import { SlideOverview } from './SlideOverview'
-import type { ReportCell } from '../kernel/protocol'
+import { DECK_THEME_DEFAULTS, type DeckTheme, type ReportCell } from '../kernel/protocol'
 
 // Crisp inline SVG icons for the top-right present controls (replacing the emoji
 // glyphs — the 🗣 speaker in particular read as "voice/audio", not "presenter").
@@ -90,8 +90,19 @@ if (typeof document !== 'undefined' && !document.getElementById('spyde-present-m
   const el = document.createElement('style')
   el.id = 'spyde-present-md-css'
   el.textContent = `
-.present-md { font-size: 1.15rem; line-height: 1.6; color: #e8e8f0; word-break: break-word; }
+/* Colours come from the deck THEME via custom properties set on the present
+   overlay (themeVars). The literals are the fallback for anything rendering
+   this markdown outside a themed deck. */
+.present-md { font-size: 1.15rem; line-height: 1.6;
+  color: var(--spyde-deck-text, #e8e8f0); word-break: break-word; }
 .present-md > *:first-child { margin-top: 0; }
+/* Headings carry an explicit colour: the BASE .spyde-md sheet hard-codes
+   #cdd6f4 on h1-h6, which wins over the colour .present-md inherits, so
+   without this a themed deck restyled its chrome and its body text while every
+   heading stayed the old lavender.
+   (No backticks in this block — it lives inside a JS template literal.) */
+.present-md h1, .present-md h2, .present-md h3,
+.present-md h4, .present-md h5, .present-md h6 { color: var(--spyde-deck-text, #cdd6f4); }
 .present-md h1 { font-size: 2.4rem; line-height: 1.15; margin: 0 0 1.2rem; font-weight: 700;
   border-bottom: none; padding-bottom: 0; }
 .present-md h2 { font-size: 1.8rem; margin: 1.4rem 0 0.7rem; border-bottom: none; padding-bottom: 0; }
@@ -103,23 +114,26 @@ if (typeof document !== 'undefined' && !document.getElementById('spyde-present-m
   font-size: 0.9em; background: #22222f; padding: 0.1em 0.35em; border-radius: 4px; color: #f5c2e7; }
 .present-md pre { background: #1c1c28; padding: 1rem; border-radius: 8px; overflow-x: auto; }
 .present-md pre code { background: none; padding: 0; color: #cdd6f4; }
-.present-md blockquote { border-left: 4px solid #45475a; margin: 0.8rem 0; padding: 0.2rem 1rem;
-  color: #a6adc8; }
-.present-md a { color: #89b4fa; }
-.present-md strong { color: #ffffff; }
+.present-md blockquote { border-left: 4px solid var(--spyde-deck-accent, #45475a);
+  margin: 0.8rem 0; padding: 0.2rem 1rem;
+  color: var(--spyde-deck-muted, #a6adc8); }
+.present-md a { color: var(--spyde-deck-accent, #89b4fa); }
+.present-md strong { color: var(--spyde-deck-text, #ffffff); }
 .present-md .katex-display { display: block; margin: 1rem 0; text-align: center;
   overflow-x: auto; overflow-y: hidden; }
 /* ── presentation polish: TITLE / SECTION slides ──────────────────────────────
    A title slide centers a large title block — first heading huge, the rest a
    muted subtitle. Scoped to .present-title-md so a content slide is unchanged. */
 .present-title-md { text-align: center; }
-.present-title-md h1 { font-size: 4.2rem; line-height: 1.08; margin: 0 0 0.6rem;
+.present-title-md h1 { color: var(--spyde-deck-text, #cdd6f4);
+  font-size: 4.2rem; line-height: 1.08; margin: 0 0 0.6rem;
   font-weight: 800; letter-spacing: -0.01em; }
-.present-title-md h2 { font-size: 2.2rem; margin: 0.2rem 0; font-weight: 600; color: #cdd6f4; }
-.present-title-md h3 { font-size: 1.6rem; color: #a6adc8; font-weight: 500; }
-.present-title-md p { font-size: 1.6rem; color: #a6adc8; margin: 0.3rem 0; }
+.present-title-md h2 { font-size: 2.2rem; margin: 0.2rem 0; font-weight: 600;
+  color: var(--spyde-deck-text, #cdd6f4); }
+.present-title-md h3 { font-size: 1.6rem; color: var(--spyde-deck-muted, #a6adc8); font-weight: 500; }
+.present-title-md p { font-size: 1.6rem; color: var(--spyde-deck-muted, #a6adc8); margin: 0.3rem 0; }
 .present-title-md h1::after { content: ""; display: block; width: 4rem; height: 3px;
-  margin: 1.2rem auto 0; background: #89b4fa; border-radius: 2px; }
+  margin: 1.2rem auto 0; background: var(--spyde-deck-accent, #89b4fa); border-radius: 2px; }
 /* ── presenter-view speaker notes ─────────────────────────────────────────────
    The big readable notes panel in the presenter dashboard — larger, roomy line
    height, scoped so it doesn't affect the audience slide markdown. */
@@ -195,6 +209,128 @@ export function slideNotes(cells: ReportCell[]): string {
  *  the Slide Overview grid uses the SAME grouping as Present mode. */
 export { groupSlides }
 
+/**
+ * The theme as CSS CUSTOM PROPERTIES on the deck root.
+ *
+ * Variables rather than inline styles on each element: the markdown inside a
+ * slide is `dangerouslySetInnerHTML`, so its h1/p/li/code are styled by the
+ * injected `.present-md` stylesheet and can't take React inline styles at all.
+ * A variable set on the overlay reaches them, and the same value drives the
+ * chrome — one source of truth, no per-element plumbing.
+ */
+function themeVars(t: DeckTheme): React.CSSProperties {
+  return {
+    ['--spyde-deck-bg' as any]: t.bg,
+    ['--spyde-deck-text' as any]: t.text,
+    ['--spyde-deck-muted' as any]: t.muted,
+    ['--spyde-deck-accent' as any]: t.accent,
+    background: t.bg,
+    color: t.text,
+    ...(t.font ? { fontFamily: t.font } : {}),
+  }
+}
+
+/**
+ * Is this footer worth drawing at all?
+ *
+ * IDENTITY only — name, email, note, logo. Deliberately NOT the slide number:
+ * `slide_numbers` defaults to true, so counting it would give every untouched
+ * deck a footer bar it never asked for (and move its page count out of the
+ * pager). The number rides along once there IS a footer; on a deck with no
+ * identity set, the pager keeps showing it exactly as before.
+ */
+function footerHasContent(t: DeckTheme): boolean {
+  return Boolean(t.footer_name || t.footer_email || t.footer_note || t.logo)
+}
+
+/**
+ * The footer bar: logo, name / email / note, and the slide number.
+ *
+ * NOT drawn on a title slide — a title card carries its own attribution and a
+ * repeated footer under it reads as clutter. That is the usual convention and
+ * what was asked for.
+ */
+function SlideFooter({ theme, slideNumber, slideCount }: {
+  theme: DeckTheme
+  slideNumber: number
+  slideCount: number
+}) {
+  const bits = [theme.footer_name, theme.footer_email, theme.footer_note]
+    .map(s => s.trim()).filter(Boolean)
+  return (
+    <div style={styles.footer} data-testid="present-footer">
+      <div style={styles.footerLeft}>
+        {theme.logo && (
+          <img
+            src={theme.logo}
+            alt=""
+            data-testid="present-footer-logo"
+            style={{ ...styles.footerLogo, height: theme.logo_height }}
+          />
+        )}
+        {bits.length > 0 && (
+          <span style={styles.footerText} data-testid="present-footer-text">
+            {bits.map((b, i) => (
+              <React.Fragment key={i}>
+                {i > 0 && <span style={styles.footerSep}>·</span>}
+                {b}
+              </React.Fragment>
+            ))}
+          </span>
+        )}
+      </div>
+      {theme.slide_numbers && (
+        <span style={styles.footerNum} data-testid="present-footer-number">
+          {slideNumber} / {slideCount}
+        </span>
+      )}
+    </div>
+  )
+}
+
+/**
+ * The figure diagnostic, drawn ON THE SLIDE (press D while presenting).
+ *
+ * A report figure is mounted twice — sidebar cell and presented slide — and both
+ * register under the SAME figId, so the presented copy draws from whatever
+ * `replayState` re-sends to whichever element holds that registration. When a
+ * panel comes up blank, the question is simply: did the PRESENTED iframe win
+ * the registration, and does the pixel stash still hold a state per panel.
+ *
+ * Rendered rather than logged so answering it needs a keypress and a
+ * screenshot, not a DevTools session mid-talk.
+ */
+function FigureDiag({ slideCells }: { slideCells: ReportCell[] }) {
+  const rows = React.useMemo(() => {
+    const fn = (window as unknown as Record<string, unknown>).__spydeFigureDump
+    if (typeof fn !== 'function') return null
+    try { return (fn as () => Record<string, unknown>[])() } catch { return null }
+  }, [])
+  // Panels expected on THIS slide, from the report doc — the number each
+  // figure's stash has to be compared against.
+  const expected = slideCells
+    .filter(c => c.cell_type === 'figure' || c.cell_type === 'split')
+    .map(c => `${c.id}: ${c.figure?.panels?.length ?? 0} panel(s)`)
+
+  return (
+    <div style={styles.diag} data-testid="present-figure-diag">
+      <div style={styles.diagTitle}>Figure diagnostic — press D to hide</div>
+      <div style={styles.diagLine}>this slide → {expected.join(' · ') || 'no figure cells'}</div>
+      {rows == null ? (
+        <div style={styles.diagLine}>__spydeFigureDump unavailable (old build?)</div>
+      ) : rows.length === 0 ? (
+        <div style={styles.diagLine}>no figures registered at all</div>
+      ) : rows.map((r, i) => (
+        <div key={i} style={styles.diagLine}>
+          {String(r.figId)} · in={String(r.registeredIn)} · size={String(r.size)}
+          {' · json='}{String(r.jsonKeys)}{' · binary='}{String(r.binaryKeys)}
+          {r.binaryKeyNames ? ` (${String(r.binaryKeyNames)})` : ''}
+        </div>
+      ))}
+    </div>
+  )
+}
+
 /** mm:ss for an elapsed-seconds count (the presenter timer). */
 function fmtElapsed(sec: number): string {
   const s = Math.max(0, Math.floor(sec))
@@ -210,6 +346,13 @@ export function PresentMode({ initialSlide, onSlideChange, onExit, onLaunchLive 
 
   const slides = useMemo(() => groupSlides(cells), [cells])
   const count = slides.length
+  // The deck's look. The backend always ships a full theme; DECK_THEME_DEFAULTS
+  // covers an older backend that ships none.
+  const theme: DeckTheme = { ...DECK_THEME_DEFAULTS, ...(report?.theme ?? {}) }
+  // Whether the PAGER shows "n / N". Off when the deck's footer already does,
+  // so the projected screen never carries the same number twice.
+  const showPagerCount = !(theme.footer_show && theme.slide_numbers
+                           && footerHasContent(theme))
 
   // Clamp the incoming index into range (a deck edited down mid-excursion could
   // leave it past the end).
@@ -226,6 +369,8 @@ export function PresentMode({ initialSlide, onSlideChange, onExit, onLaunchLive 
   // While it's open, present-mode navigation keys are suppressed (the overview
   // owns the keyboard) so arrows/Esc don't leak through to the deck behind it.
   const [overview, setOverview] = React.useState(false)
+  // The on-screen figure diagnostic (press D while presenting).
+  const [diag, setDiag] = React.useState(false)
   // On Windows the native title-bar overlay (min/max/close) sits at the very
   // top-right, ~38px tall. Push the presentation top controls BELOW it so they
   // aren't clipped/covered (macOS traffic lights are on the left, no conflict).
@@ -266,6 +411,14 @@ export function PresentMode({ initialSlide, onSlideChange, onExit, onLaunchLive 
       else if (k === 'o' || k === 'O' || k === 'g' || k === 'G') {
         e.preventDefault(); setOverview(true)
       }
+      // D — the figure DIAGNOSTIC readout, on screen. Not in DevTools: asking
+      // someone to open a console mid-presentation to debug a panel that
+      // didn't draw is a bad trade, and console.table prints NOTHING at all
+      // when the array is empty, which is indistinguishable from "the function
+      // isn't there".
+      else if (k === 'd' || k === 'D') {
+        e.preventDefault(); setDiag(v => !v)
+      }
       else if (k === 'Escape') { e.preventDefault(); onExit() }
     }
     window.addEventListener('keydown', onKey)
@@ -285,7 +438,11 @@ export function PresentMode({ initialSlide, onSlideChange, onExit, onLaunchLive 
   }
 
   return (
-    <div style={styles.overlay} data-testid="present-mode" data-presenter={presenter ? '1' : '0'}>
+    <div
+      style={{ ...styles.overlay, ...themeVars(theme) }}
+      data-testid="present-mode"
+      data-presenter={presenter ? '1' : '0'}
+    >
       {/* Every slide is RENDERED (so figure iframes stay mounted across
           navigation and never tear down); only the active one is displayed.
           In presenter mode the whole audience stack is hidden (kept MOUNTED so
@@ -300,9 +457,14 @@ export function PresentMode({ initialSlide, onSlideChange, onExit, onLaunchLive 
             iframeRefs={iframeRefs}
             replayState={replayState}
             onLaunchLive={onLaunchLive}
+            theme={theme}
+            slideNumber={si + 1}
+            slideCount={count}
           />
         ))}
       </div>
+
+      {diag && <FigureDiag slideCells={slides[index] ?? []} />}
 
       {presenter && (
         <PresenterView
@@ -343,8 +505,15 @@ export function PresentMode({ initialSlide, onSlideChange, onExit, onLaunchLive 
         />
       )}
 
-      {/* Top-right controls: overview grid + presenter-view toggle + exit. */}
+      {/* Top-right controls: diagnostic + overview grid + presenter toggle + exit. */}
       <div style={topBarStyle}>
+        <button
+          data-testid="present-diag-toggle"
+          data-active={diag ? '1' : '0'}
+          style={{ ...styles.iconBtn, ...(diag ? styles.iconBtnActive : {}) }}
+          title="Figure diagnostic — why a panel didn't draw (D)"
+          onClick={() => setDiag(v => !v)}
+        >{'⚠'}</button>
         <button
           data-testid="present-overview-toggle"
           data-active={overview ? '1' : '0'}
@@ -380,9 +549,17 @@ export function PresentMode({ initialSlide, onSlideChange, onExit, onLaunchLive 
             disabled={index === 0}
             onClick={() => go(index - 1)}
           >‹</button>
-          <span data-testid="present-counter" style={styles.counter}>
-            {index + 1} / {count}
-          </span>
+          {/* The pager's counter is SUPPRESSED when the deck's own footer is
+              already showing slide numbers — the whole window is what gets
+              projected, so both drawing "2 / 2" reads as a bug. The arrows
+              stay: they are navigation, not information. */}
+          {showPagerCount ? (
+            <span data-testid="present-counter" style={styles.counter}>
+              {index + 1} / {count}
+            </span>
+          ) : (
+            <span data-testid="present-counter" style={styles.counterQuiet} aria-hidden />
+          )}
           <button
             data-testid="present-next"
             style={{ ...styles.navBtn, ...(index >= count - 1 ? styles.navBtnDisabled : {}) }}
@@ -614,13 +791,17 @@ function PreviewCell({ cell, titleSlide }: { cell: ReportCell; titleSlide: boole
 // One slide: its cells' rendered content, plus (if any cell carries a
 // live_action) a "Launch live ▶" button. Kept always-mounted; visibility toggled
 // so figure embeds survive navigation.
-function Slide({ cells, active, reportFigures, iframeRefs, replayState, onLaunchLive }: {
+function Slide({ cells, active, reportFigures, iframeRefs, replayState, onLaunchLive,
+                 theme, slideNumber, slideCount }: {
   cells: ReportCell[]
   active: boolean
   reportFigures: ReturnType<typeof useSpyDE>['state']['reportFigures']
   iframeRefs: ReturnType<typeof useSpyDE>['iframeRefs']
   replayState: ReturnType<typeof useSpyDE>['replayState']
   onLaunchLive: (action: LiveAction) => void
+  theme: DeckTheme
+  slideNumber: number
+  slideCount: number
 }) {
   // The go-live handle for this slide: the first cell that carries one.
   const live = cells.find(c => c.live_action)?.live_action as LiveAction | undefined
@@ -631,6 +812,31 @@ function Slide({ cells, active, reportFigures, iframeRefs, replayState, onLaunch
   const styleBg =
     meta.style === 'plain' ? styles.slideBgPlain
       : meta.style === 'accent' ? styles.slideBgAccent : {}
+
+  // SHARE the vertical budget between the visual cells on this slide.
+  //
+  // Every figure used to get a fixed 58vh box, so a slide holding a navigator
+  // AND its signal asked for 116vh of an ~85vh stage: the deck overflowed, the
+  // second figure was clipped, and the pager sat on top of it. Dividing the
+  // budget keeps the whole slide on screen, which is the thing a presentation
+  // has to guarantee.
+  //
+  // It rides on a CSS custom property rather than a computed inline height so
+  // the split cell's two panes inherit the same budget without plumbing a prop
+  // through every cell type.
+  const visualCells = cells.filter(
+    c => c.cell_type === 'figure' || c.cell_type === 'split' || c.cell_type === 'image'
+      || c.cell_type === 'movie').length
+  // Leave room for the markdown around them; never shrink below something
+  // readable, and never grow past the single-figure case.
+  //
+  // `vh` is only the STARTING point — each figure also carries a caption and
+  // margins (~28px measured), and hand-computing that against the viewport was
+  // wrong twice (24vh and 18vh both still overflowed at five figures). So the
+  // boxes also FLEX: `slideInner` is a flex column and each box is
+  // `flex: 1 1 <figVh>`, which lets the browser do the arithmetic against the
+  // real stage height whatever the captions and markdown around them cost.
+  const figVh = visualCells <= 1 ? 58 : Math.max(16, Math.round(62 / visualCells))
 
   const renderCell = (cell: ReportCell) => (
     <SlideCell
@@ -649,11 +855,19 @@ function Slide({ cells, active, reportFigures, iframeRefs, replayState, onLaunch
       data-active={active ? '1' : '0'}
       data-kind={isTitle ? 'title' : 'content'}
       data-style={meta.style || 'default'}
+      data-fig-vh={figVh}
       style={{ ...styles.slide, ...styleBg,
         ...(isTitle ? styles.slideTitle : {}),
-        ...(active ? styles.slideActive : {}) }}
+        ...(active ? styles.slideActive : {}),
+        ['--spyde-fig-vh' as any]: `${figVh}vh` }}
     >
-      <div style={{ ...styles.slideInner, ...(isTitle ? styles.slideInnerTitle : {}) }}>
+      <div style={{ ...styles.slideInner,
+        // A slide carrying a figure gets the WIDE column: 60rem is a prose
+        // measure (right for text, wrong for data), and capping a figure slide
+        // at it left most of a wide screen empty while the plot rendered small.
+        // Text-only slides keep the readable measure.
+        ...(visualCells > 0 ? styles.slideInnerWide : {}),
+        ...(isTitle ? styles.slideInnerTitle : {}) }}>
         {cells.map(cell => (
           <React.Fragment key={cell.id}>{renderCell(cell)}</React.Fragment>
         ))}
@@ -668,6 +882,12 @@ function Slide({ cells, active, reportFigures, iframeRefs, replayState, onLaunch
           </div>
         )}
       </div>
+      {/* Footer on every slide EXCEPT the title card (which carries its own
+          attribution). Outside slideInner so it pins to the slide's bottom
+          rather than joining the centred content column. */}
+      {!isTitle && theme.footer_show && footerHasContent(theme) && (
+        <SlideFooter theme={theme} slideNumber={slideNumber} slideCount={slideCount} />
+      )}
     </section>
   )
 }
@@ -817,15 +1037,22 @@ const styles: Record<string, React.CSSProperties> = {
   },
   splitRow: {
     display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '2rem',
-    alignItems: 'center', margin: '1rem 0',
+    // STRETCH, not center: the figure pane has to fill the row's height or the
+    // grid sizes to the tallest CONTENT and the slide keeps a band of dead
+    // space under it. The text pane opts back out via splitText's alignSelf.
+    alignItems: 'stretch', margin: '1rem 0',
+    // Grow into the stage like a plain figure cell does.
+    flex: '1 1 var(--spyde-fig-vh, 58vh)', minHeight: 0,
   },
-  splitText: { minWidth: 0, alignSelf: 'center' },
+  splitText: { minWidth: 0, alignSelf: 'center', maxHeight: '100%', overflow: 'hidden' },
   splitFig: {
-    minWidth: 0, display: 'flex', flexDirection: 'column',
+    minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column',
     alignItems: 'center', justifyContent: 'center',
   },
   splitFigBox: {
-    position: 'relative', width: '100%', height: '48vh',
+    position: 'relative', width: '100%',
+    // Fill the stretched pane rather than a fixed vh (see splitRow).
+    flex: '1 1 auto', minHeight: 0,
     border: '1px solid #313244', borderRadius: 8, overflow: 'hidden',
     background: '#0e0e16',
   },
@@ -835,7 +1062,25 @@ const styles: Record<string, React.CSSProperties> = {
     padding: '5vh 8vw', overflowY: 'auto',
   },
   slideActive: { display: 'flex' },
-  slideInner: { maxWidth: '60rem', margin: '0 auto', width: '100%' },
+  slideInner: {
+    maxWidth: '60rem', margin: '0 auto', width: '100%',
+    // A flex COLUMN so the figure boxes above can shrink to share the stage.
+    // minHeight:0 lets it actually shrink inside the slide's own flex context.
+    // flex:1 1 0 (not the default 1 1 auto) so this TAKES the slide's height
+    // instead of sizing to its content — only then can the figure boxes inside
+    // shrink to share it rather than overflowing.
+    display: 'flex', flexDirection: 'column', minHeight: 0,
+    flex: '1 1 0',
+    // CENTER the column's content. Load-bearing since `flex: 1 1 0` above: this
+    // box now takes the slide's FULL height, so the slide's own
+    // `justifyContent:center` has no free space left to distribute and stopped
+    // centering anything — a title slide's text jammed against the top of the
+    // stage. Centering HERE restores it, and costs nothing on a slide whose
+    // figures grow to fill (no free space → nothing to center).
+    justifyContent: 'center',
+  },
+  // A slide with a figure on it: let the data have the screen.
+  slideInnerWide: { maxWidth: '96rem' },
   // A title slide: content vertically + horizontally centered, tighter column.
   slideTitle: { justifyContent: 'center', textAlign: 'center' },
   slideInnerTitle: { maxWidth: '48rem' },
@@ -845,23 +1090,35 @@ const styles: Record<string, React.CSSProperties> = {
     background:
       'radial-gradient(ellipse at 50% 30%, rgba(137,180,250,0.18), transparent 70%), #14141f',
   },
-  figure: { margin: '1rem 0', textAlign: 'center' },
+  // A visual cell is a flex COLUMN that GROWS. The `--spyde-fig-vh` basis still
+  // divides the stage between N figures, but grow:1 means one figure on a
+  // half-empty slide expands into the dead space instead of stopping at 58vh
+  // and leaving the bottom third of the screen blank.
+  figure: {
+    margin: '1rem 0', textAlign: 'center',
+    display: 'flex', flexDirection: 'column',
+    flex: '1 1 var(--spyde-fig-vh, 58vh)', minHeight: 0,
+  },
   figBox: {
     // position:relative is LOAD-BEARING — SeamlessFigureFrame's frameHost is
     // `position:absolute; inset:0`, so it anchors to the nearest positioned
     // ancestor. Without this the iframe escaped its box and filled the whole
     // slide.
     position: 'relative',
-    width: '100%', height: '58vh',
+    // Fill whatever height the <figure> above was given, minus the caption.
+    // (The vh budget lives on the <figure> now — a fixed height here would
+    // pin the box and re-open the dead-space gap.)
+    width: '100%', flex: '1 1 auto', minHeight: 0,
     border: '1px solid #313244', borderRadius: 8, overflow: 'hidden',
     background: '#0e0e16',
   },
   figImg: { maxWidth: '100%', maxHeight: '100%', height: 'auto' },
-  // A photo cell on a slide — large + centered, capped so it stays on-screen
-  // with room for the caption.
+  // A photo cell on a slide — fills its share of the stage, aspect preserved.
   slideImg: {
     display: 'block', margin: '0 auto',
-    maxWidth: '100%', maxHeight: '68vh', height: 'auto', borderRadius: 8,
+    maxWidth: '100%', maxHeight: '100%',
+    flex: '1 1 auto', minHeight: 0,
+    objectFit: 'contain', borderRadius: 8,
   },
   figPending: {
     display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -869,7 +1126,43 @@ const styles: Record<string, React.CSSProperties> = {
   },
   figCaption: {
     marginTop: '0.5rem', fontSize: '0.85rem', color: '#a6adc8', fontStyle: 'italic',
+    // Never let the caption be squeezed away when the box above it grows.
+    flex: '0 0 auto',
   },
+  // ── Footer bar ──────────────────────────────────────────────────────────────
+  // Pinned to the slide's bottom, INSIDE the slide's horizontal padding, and
+  // clear of the pager (which is centred). flex:0 0 auto so it never competes
+  // with the figures for the vertical budget.
+  footer: {
+    flex: '0 0 auto',
+    display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+    gap: '1.5rem', marginTop: '1.2rem', paddingTop: '0.7rem',
+    borderTop: '1px solid var(--spyde-deck-accent, #89b4fa)',
+    // The keyline is a hint, not a rule — full-strength accent across the whole
+    // slide width reads as a divider competing with the content.
+    borderTopColor: 'color-mix(in srgb, var(--spyde-deck-accent, #89b4fa) 35%, transparent)',
+    fontSize: '0.8rem', lineHeight: 1.3,
+    color: 'var(--spyde-deck-muted, #a6adc8)',
+  },
+  footerLeft: { display: 'flex', alignItems: 'center', gap: '0.9rem', minWidth: 0 },
+  footerLogo: { display: 'block', width: 'auto', objectFit: 'contain', flex: '0 0 auto' },
+  footerText: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  footerSep: { margin: '0 0.5rem', opacity: 0.55 },
+  footerNum: {
+    flex: '0 0 auto', fontVariantNumeric: 'tabular-nums',
+    color: 'var(--spyde-deck-muted, #a6adc8)',
+  },
+  // ── figure diagnostic (D) ───────────────────────────────────────────────────
+  diag: {
+    position: 'fixed', left: 16, bottom: 16, zIndex: 40,
+    maxWidth: '70vw', padding: '10px 12px',
+    background: 'rgba(10,10,16,0.94)', border: '1px solid #f9e2af',
+    borderRadius: 8, color: '#f9e2af',
+    font: '12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+    whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+  },
+  diagTitle: { fontWeight: 700, marginBottom: 6, color: '#fab387' },
+  diagLine: { margin: '1px 0' },
   liveRow: { marginTop: '1.5rem', textAlign: 'center' },
   liveBtn: {
     background: '#89b4fa', color: '#11111b', border: 'none',
@@ -1003,6 +1296,9 @@ const styles: Record<string, React.CSSProperties> = {
   },
   navBtnDisabled: { color: '#45475a', cursor: 'default' },
   counter: { fontSize: 14, color: '#a6adc8', minWidth: 60, textAlign: 'center' },
+  // Same footprint, no text — keeps the two arrows from jumping together when
+  // the count moves to the deck footer.
+  counterQuiet: { display: 'inline-block', minWidth: 60 },
   emptyMsg: {
     position: 'absolute', top: '50%', left: '50%',
     transform: 'translate(-50%, -50%)', textAlign: 'center',

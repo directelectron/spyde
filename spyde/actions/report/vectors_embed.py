@@ -253,7 +253,20 @@ def _build_figure(vecs, payload) -> "tuple[dict, str, str, str] | None":
 
     nav_u8 = _count_map_u8(vecs, ny, nx)
 
-    fig, axs = apl.subplots(1, 2, figsize=(2 * FIG_PX + 20, FIG_PX))
+    # PANEL WIDTHS FOLLOW THE CONTENT'S ASPECT. Both panels used to be the same
+    # square-ish box, so a non-square navigator letterboxed inside its panel and
+    # rendered as a small strip in a sea of background while the (square) DP
+    # filled its own — which reads as the navigator being squished.
+    #
+    # Both panels share a height, so a panel's width ratio IS its aspect
+    # (width/height). Clamped because an extreme scan (a 1-D line, or 512x8)
+    # would otherwise demand an absurdly wide figure and squeeze the DP to
+    # nothing.
+    nav_aspect = min(3.0, max(1 / 3.0, (nx / ny) if ny else 1.0))
+    dp_aspect = min(3.0, max(1 / 3.0, (W / H) if H else 1.0))
+    fig_w = int(round(FIG_PX * (nav_aspect + dp_aspect))) + 20
+    fig, axs = apl.subplots(1, 2, figsize=(fig_w, FIG_PX),
+                            width_ratios=[nav_aspect, dp_aspect])
     ax_nav, ax_dp = axs[0], axs[1]
 
     # NAVIGATOR (panel 0): count map + crosshair (pointer) + rectangle

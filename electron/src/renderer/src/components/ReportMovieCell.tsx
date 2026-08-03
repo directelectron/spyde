@@ -99,7 +99,6 @@ export function ReportMovieCell({ cell, onRemove, onEdit, onSetSource, dragProps
           cellId={cell.id}
           styles={{ chrome: styles.chrome, chromeBtn: styles.chromeBtn }}
           onCopy={() => { /* movie copy is a Phase-3 nicety; no-op for now */ }}
-          onDuplicate={() => { /* handled in a later phase */ }}
           onDelete={onRemove}
           deleteTestid={`report-moviecell-delete-${cell.id}`}
           deleteTitle="Delete movie"

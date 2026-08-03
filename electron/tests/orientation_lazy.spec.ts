@@ -59,9 +59,12 @@ test('orientation mapping runs on lazy data and opens the IPF map window', async
   await expect(page.getByTestId(/^ipf-view-3d-/).first()).toBeVisible()
 
   // The native IPF density heatmap (inverse pole density function) is also
-  // attached → a "PDF" toggle (view:"density"). Switching to it shows the
-  // density iframe; screenshot it for the inverse-pole-density-function view.
-  const pdf = page.getByTestId(/^ipf-view-density-/).first()
+  // attached. It is no longer a third entry in the projection toggle — the
+  // explorer window carries TWO independent pairs, [2D|3D] and
+  // [Points|Heatmap], so the density view is `ipf-style-heatmap`, orthogonal to
+  // the 2D/3D choice above. Switching to it shows the density iframe;
+  // screenshot it for the inverse-pole-density-function view.
+  const pdf = page.getByTestId(/^ipf-style-heatmap-/).first()
   await expect(pdf).toBeVisible({ timeout: 20_000 })
   await pdf.click()
   await page.waitForTimeout(1500)

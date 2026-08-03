@@ -29,11 +29,16 @@ from spyde.actions.figure_registry import keep_alive
 from spyde.actions.report.figure_builder import (
     ReportFigureController, build_cell_figure,
 )
+from spyde.actions.report import model
 from spyde.actions.report.model import (
-    IMAGE_EXTS, Cell, FigureSpec, LayerSpec, PanelSpec, ReportDoc, SignalRef,
-    bake_fallback_png, bake_line_fallback_png, move_slide, new_cell_id,
-    read_report, write_report,
+    IMAGE_EXTS, THEME_DEFAULTS, Cell, FigureSpec, LayerSpec, PanelSpec,
+    ReportDoc, SignalRef, bake_fallback_png, bake_line_fallback_png,
+    move_slide, new_cell_id, normalize_theme, read_report, write_report,
 )
+
+#: settings.json key holding the user's DEFAULT deck theme (the "set as default"
+#: verb). Distinct from the per-document theme: this one seeds a NEW deck.
+_DEFAULT_THEME_KEY = "report_default_theme"
 
 log = logging.getLogger(__name__)
 
@@ -151,6 +156,42 @@ class ReportManager:
         self._offline: set[str] = set()
         # pending save handshake: token -> {cells, path, remaining}
         self._pending_save: dict[str, dict] = {}
+        # UNDO stack of {"label": str, "restore": callable}. Bounded, because an
+        # entry pins a removed cell's pixels (snapshots are numpy arrays and a
+        # baked PNG can be megabytes) — an unbounded stack would quietly hold
+        # every slide the user ever deleted for the life of the document.
+        self._undo: list[dict] = []
+
+    #: How many destructive report actions can be undone.
+    UNDO_DEPTH = 20
+
+    def push_undo(self, label: str, restore) -> None:
+        """Record a way to reverse the action just performed.
+
+        *restore* takes no arguments and puts the document back; it captures
+        whatever state it needs by closure. Callers must build it BEFORE
+        mutating, since the point is to hold the only remaining reference to
+        what is about to be dropped.
+        """
+        self._undo.append({"label": str(label), "restore": restore})
+        del self._undo[:-self.UNDO_DEPTH]
+
+    def undo(self) -> str | None:
+        """Reverse the most recent undoable action → its label, or None."""
+        if not self._undo:
+            return None
+        entry = self._undo.pop()
+        try:
+            entry["restore"]()
+        except Exception as e:                              # pragma: no cover
+            log.debug("report undo (%s) failed: %s", entry["label"], e)
+            return None
+        return entry["label"]
+
+    def clear_undo(self) -> None:
+        """Drop the stack — on new/close/open, where the entries refer to cells
+        of a document that is no longer loaded."""
+        self._undo.clear()
 
     # ── per-(cell, panel, layer) snapshot accessors ─────────────────────────────
 
@@ -212,6 +253,7 @@ class ReportManager:
         self._edit_wiring.clear()
         self._ann_widgets.clear()
         self._selected.clear()
+        self.clear_undo()
         self._clear_movie_sessions()
         _clear_vectors_explorer_cache()
 
@@ -269,6 +311,7 @@ class ReportManager:
         self._edit_wiring.clear()
         self._ann_widgets.clear()
         self._selected.clear()
+        self.clear_undo()
         self._clear_movie_sessions()
         _clear_vectors_explorer_cache()
 
@@ -305,7 +348,8 @@ class ReportManager:
         """The authoritative ``report_state`` message body."""
         if self.doc is None:
             return {"open": False, "path": None, "title": "", "template": False,
-                    "type": "report", "dirty": False, "cells": []}
+                    "type": "report", "dirty": False,
+                    "theme": dict(model.THEME_DEFAULTS), "cells": []}
         cells = []
         nav_dims_cache: dict = {}
         for c in self.doc.cells:
@@ -410,6 +454,12 @@ class ReportManager:
             # Wave A — the document TYPE ("report" | "presentation" | "movie").
             "type": self.doc.doc_type,
             "dirty": bool(self.dirty),
+            # What the next Cmd-Z would reverse (None = nothing). The UI uses it
+            # to label the Undo affordance rather than offering a dead button.
+            "undo": (self._undo[-1]["label"] if self._undo else None),
+            # The deck's look (colours / type / footer / logo). Always a FULL
+            # dict, so the renderer indexes it without a fallback per use site.
+            "theme": model.normalize_theme(getattr(self.doc, "theme", None)),
             "cells": cells,
         }
 
@@ -487,6 +537,42 @@ class ReportManager:
         import uuid
         return f"vx_{cell.id}_{uuid.uuid4().hex[:8]}", html
 
+    def _orientation_explorer_for_cell(self, cell: Cell) -> "tuple[str, str] | None":
+        """The vectors explorer's sibling for an ORIENTATION cell: resolved
+        source tree carries an orientation result and
+        ``spec.orientation_mode != "image"`` → the self-contained IPF explorer
+        (map + triangle + sphere), as ``(fig_id, html)``, else None.
+
+        Same contract as :meth:`_vectors_explorer_for_cell` in every respect
+        that matters here — one page, one figure, emitted through the ordinary
+        bare-figure path — so the sidebar and the HTML export show the same
+        thing. Tried AFTER vectors: a tree can carry both (find-vectors then
+        vector-OM), and the vectors explorer is the one the user dragged from."""
+        spec = cell.spec
+        if spec is None:
+            return None
+        if getattr(spec, "orientation_mode", "") == "image":
+            return None
+        if _is_scene3d_cell(cell):
+            return None            # a scene cell is already a 3-D snapshot
+        try:
+            from spyde.actions.report.orientation_embed import (
+                orientation_explorer_html, orientation_for_cell,
+            )
+            result = orientation_for_cell(self.session, cell)
+            if result is None:
+                return None
+            html = orientation_explorer_html(result, caption=cell.caption or "",
+                                             cache_key=cell.id)
+            if html is None:       # over the embed cap / no indexed positions
+                return None
+        except Exception as e:
+            log.debug("[report] sidebar orientation explorer build failed "
+                      "(cell %s): %s", cell.id, e)
+            return None
+        import uuid
+        return f"ox_{cell.id}_{uuid.uuid4().hex[:8]}", html
+
     def build_figure_window(self, cell: Cell) -> None:
         """Build (or rebuild) the live figure window for a figure cell and emit
         it through the bare-figure path with ``host:"report"`` + ``cell_id``.
@@ -518,7 +604,8 @@ class ReportManager:
         # EDIT mode (the annotation editor targets the anyplotlib figure, so a cell
         # being edited falls back to the plain snapshot figure it can annotate).
         if cell.id not in self._editing:
-            explorer = self._vectors_explorer_for_cell(cell)
+            explorer = (self._vectors_explorer_for_cell(cell)
+                        or self._orientation_explorer_for_cell(cell))
             if explorer is not None:
                 self._emit_vectors_explorer(cell, explorer)
                 return
@@ -1358,14 +1445,27 @@ def _widget_geometry_to_data(kind, widget, axes, coords) -> "dict | None":
 
 
 def _clear_vectors_explorer_cache(cell_id: "str | None" = None) -> None:
-    """Drop the memoized vectors-explorer page(s) (fix #6). Best-effort; a lazy
-    import so vectors_embed (which pulls anyplotlib) isn't loaded at handler
-    import time. ``cell_id`` clears one cell; ``None`` clears all."""
+    """Drop the memoized explorer page(s) — vectors AND orientation (fix #6).
+    Best-effort; a lazy import so the embed modules (which pull anyplotlib)
+    aren't loaded at handler import time. ``cell_id`` clears one cell; ``None``
+    clears all.
+
+    Both are cleared together because both are keyed by cell id and both are
+    invalidated by exactly the same events; a cell that stopped being a vectors
+    cell and became an orientation one would otherwise keep serving the old
+    page from the sibling cache."""
     try:
         from spyde.actions.report.vectors_embed import clear_explorer_cache
         clear_explorer_cache(cell_id)
     except Exception as e:
         log.debug("clear vectors explorer cache failed: %s", e)
+    try:
+        from spyde.actions.report.orientation_embed import (
+            clear_explorer_cache as clear_orientation_cache,
+        )
+        clear_orientation_cache(cell_id)
+    except Exception as e:
+        log.debug("clear orientation explorer cache failed: %s", e)
 
 
 def _manager(session) -> ReportManager:
@@ -1877,16 +1977,101 @@ def _resolve_source_plot(session, source_window_id):
         source_window_id = getattr(session, "_active_window_id", None)
     if source_window_id is None:
         return None
-    return session._plot_by_window_id(int(source_window_id))
+    plot = session._plot_by_window_id(int(source_window_id))
+    if plot is not None:
+        return plot
+    # A controller-backed BARE figure window (the IPF explorer) has no Plot of
+    # its own; it stands in for the map window it belongs to.
+    ctrl = session.controller_by_window_id(int(source_window_id))
+    return getattr(ctrl, "source_plot", None) if ctrl is not None else None
 
 
 # ── handlers ───────────────────────────────────────────────────────────────────
+
+
+def _saved_default_theme(session) -> dict:
+    """The user's "set as default" theme from settings.json, normalised. Absent
+    / unreadable → the built-in look."""
+    try:
+        return normalize_theme(session._settings.get(_DEFAULT_THEME_KEY))
+    except Exception as e:
+        log.debug("reading the default deck theme failed: %s", e)
+        return dict(THEME_DEFAULTS)
 
 
 def report_new(session, plot, payload) -> None:
     mgr = _manager(session)
     mgr.new(template=bool(payload.get("template", False)),
             doc_type=str(payload.get("type", "report") or "report"))
+    # A NEW deck starts from the user's default look — that is the whole point
+    # of "set as default" (the per-document theme is what a saved deck carries).
+    mgr.doc.theme = _saved_default_theme(session)
+    mgr.emit_state()
+
+
+def report_set_theme(session, plot, payload) -> None:
+    """Merge ``payload['theme']`` into the open document's theme.
+
+    A MERGE, not a replace: the theme editor sends only the field the user just
+    changed, so a partial payload must not reset the other eleven."""
+    mgr = _manager(session)
+    if mgr.doc is None:
+        ipc.emit_error("report_set_theme: no open report.")
+        return
+    patch = payload.get("theme")
+    if not isinstance(patch, dict):
+        ipc.emit_error("report_set_theme: no theme.")
+        return
+    merged = dict(normalize_theme(getattr(mgr.doc, "theme", None)))
+    # Only keys the patch actually carries — normalize_theme would otherwise
+    # fill every absent key from the DEFAULTS and wipe the user's other values.
+    merged.update({k: v for k, v in patch.items() if k in THEME_DEFAULTS})
+    mgr.doc.theme = normalize_theme(merged)
+    mgr.doc.touch()
+    mgr.dirty = True
+    mgr.emit_state()
+
+
+def report_theme_set_default(session, plot, payload) -> None:
+    """Persist the OPEN document's theme as the default for every new deck."""
+    mgr = _manager(session)
+    if mgr.doc is None:
+        ipc.emit_error("report_theme_set_default: no open report.")
+        return
+    theme = normalize_theme(getattr(mgr.doc, "theme", None))
+    try:
+        session._settings[_DEFAULT_THEME_KEY] = theme
+        session._save_settings()
+    except Exception as e:
+        ipc.emit_error(f"Saving the default theme failed: {e}")
+        return
+    ipc.emit_status("Saved as your default deck theme")
+
+
+def report_theme_reset(session, plot, payload) -> None:
+    """Drop this document's theme back to the built-in look.
+
+    Deliberately the BUILT-IN look, not the saved default: "reset" that landed
+    you on a customised default would give you no way back to the stock one."""
+    mgr = _manager(session)
+    if mgr.doc is None:
+        ipc.emit_error("report_theme_reset: no open report.")
+        return
+    mgr.doc.theme = dict(THEME_DEFAULTS)
+    mgr.doc.touch()
+    mgr.dirty = True
+    mgr.emit_state()
+
+
+def report_theme_use_default(session, plot, payload) -> None:
+    """Apply the user's saved default theme to the OPEN document."""
+    mgr = _manager(session)
+    if mgr.doc is None:
+        ipc.emit_error("report_theme_use_default: no open report.")
+        return
+    mgr.doc.theme = _saved_default_theme(session)
+    mgr.doc.touch()
+    mgr.dirty = True
     mgr.emit_state()
 
 
@@ -2406,6 +2591,69 @@ def report_remove_cell(session, plot, payload) -> None:
     cell = mgr.doc.cell_by_id(payload.get("cell_id"))
     if cell is None:
         return
+
+    # ── capture for UNDO, BEFORE anything is dropped ───────────────────────────
+    # Deleting a cell is the most destructive thing the report editor does and
+    # it is one click away from the editor's Close button, so it has to be
+    # reversible. Everything below is popped from a side table in a moment; the
+    # closure becomes the only remaining reference to it.
+    #
+    # The figure WINDOW is deliberately not restored — a cell renders from its
+    # snapshots/baked pixels, and reopening the live window is what the editor
+    # does on demand. Undo brings the slide back, not the window it was
+    # authored in.
+    _index = mgr.doc.index_of(cell.id)
+    # The successor's slide fields BEFORE _inherit_slide_identity may rewrite
+    # them: undo has to put the slide identity back where it was, or restoring
+    # the head cell would leave BOTH cells carrying slide_break and the one
+    # slide would come back as two.
+    _cells_now = list(mgr.doc.cells)
+    _succ = _cells_now[_index + 1] if 0 <= _index + 1 < len(_cells_now) else None
+    _saved = {
+        "cell": cell,
+        "snapshots": mgr._snapshots.get(cell.id),
+        "baked": mgr._baked.get(cell.id),
+        "images": mgr._images.get(cell.id),
+        "offline": cell.id in mgr._offline,
+        "editing": cell.id in mgr._editing,
+        "selected": mgr._selected.get(cell.id),
+        "succ": _succ,
+        "succ_slide": None if _succ is None else {
+            "slide_break": getattr(_succ, "slide_break", False),
+            **{a: getattr(_succ, a, None) for a in _SLIDE_ATTRS},
+        },
+    }
+
+    def _restore(saved=_saved, at=_index):
+        c = saved["cell"]
+        cells = mgr.doc.cells
+        succ, succ_slide = saved["succ"], saved["succ_slide"]
+        if succ is not None and succ_slide is not None:
+            for attr, val in succ_slide.items():
+                try:
+                    setattr(succ, attr, val)
+                except Exception as e:                    # pragma: no cover
+                    log.debug("restoring %s on the successor failed: %s", attr, e)
+        # Clamp rather than assume: other cells may have been added or removed
+        # between the delete and the undo.
+        cells.insert(max(0, min(at, len(cells))), c)
+        if saved["snapshots"] is not None:
+            mgr._snapshots[c.id] = saved["snapshots"]
+        if saved["baked"] is not None:
+            mgr._baked[c.id] = saved["baked"]
+        if saved["images"] is not None:
+            mgr._images[c.id] = saved["images"]
+        if saved["offline"]:
+            mgr._offline.add(c.id)
+        if saved["editing"]:
+            mgr._editing.add(c.id)
+        if saved["selected"] is not None:
+            mgr._selected[c.id] = saved["selected"]
+        mgr.dirty = True
+        mgr.emit_state()
+
+    mgr.push_undo(f"Delete {cell.cell_type} cell", _restore)
+
     # Tear down the figure window (if any) so nothing leaks. A SPLIT cell holds a
     # figure side (same figure-window resources) AND possibly a held photo, so it
     # gets BOTH cleanups.
@@ -2436,9 +2684,67 @@ def report_remove_cell(session, plot, payload) -> None:
             from spyde.actions.report.movie import _teardown_session
             _teardown_session(session, st)
         mgr._baked.pop(cell.id, None)
+    _inherit_slide_identity(mgr.doc, cell)
     mgr.doc.cells = [c for c in mgr.doc.cells if c.id != cell.id]
     mgr.dirty = True
     mgr.emit_state()
+
+
+#: The per-slide attributes that ride on a slide's FIRST cell (model.py: "Only
+#: the slide's FIRST cell's values matter"). They describe the SLIDE, not the
+#: cell, so they must survive that cell being deleted.
+_SLIDE_ATTRS = ("slide_kind", "slide_style", "notes", "live_action")
+
+
+def _inherit_slide_identity(doc, cell) -> None:
+    """Hand a slide's identity to the next cell before its HEAD cell is removed.
+
+    ``slide_break=True`` marks the cell that STARTS a slide, and the slide's
+    kind / style / notes / live-action all ride on that same cell. So deleting
+    the first cell of a slide — very often the figure, since a slide is
+    frequently just a figure plus a caption — did not merely remove that
+    figure: the break went with it, the slide's remaining cells were absorbed
+    into the PREVIOUS slide, and its title-kind, background and speaker notes
+    were silently lost. Deleting a figure deleted the slide.
+
+    Moving the flags to the next cell in the same slide keeps the slide intact
+    with one fewer cell, which is what "delete the figure" should mean. If the
+    cell was the slide's ONLY cell there is nothing to inherit and the slide
+    genuinely goes away — correct, since nothing of it remains.
+    """
+    cells = list(getattr(doc, "cells", []) or [])
+    try:
+        i = next(k for k, c in enumerate(cells) if c.id == cell.id)
+    except StopIteration:
+        return
+    if not getattr(cell, "slide_break", False):
+        return                       # not a slide head — nothing to hand over
+    nxt = cells[i + 1] if i + 1 < len(cells) else None
+    # A following cell that already starts its OWN slide is a different slide;
+    # this one really is ending.
+    if nxt is None or getattr(nxt, "slide_break", False):
+        return
+    nxt.slide_break = True
+    for attr in _SLIDE_ATTRS:
+        # Don't clobber a value the successor already carries.
+        if not getattr(nxt, attr, None):
+            try:
+                setattr(nxt, attr, getattr(cell, attr))
+            except Exception as e:                        # pragma: no cover
+                log.debug("inheriting %s failed: %s", attr, e)
+
+
+def report_undo(session, plot, payload=None) -> None:
+    """Reverse the last destructive report action (Cmd/Ctrl-Z, or the Undo
+    button on the delete toast)."""
+    mgr = _manager(session)
+    if not mgr.open:
+        return
+    label = mgr.undo()
+    if label is None:
+        ipc.emit_status("Nothing to undo")
+        return
+    ipc.emit_status(f"Undone: {label}")
 
 
 def report_move_cell(session, plot, payload) -> None:
@@ -2665,7 +2971,17 @@ def report_add_figure(session, plot, payload) -> None:
     # the viewer-vs-image prompt is skipped for it.
     _tgt = mgr.doc.cell_by_id(payload.get("at_cell")) if payload.get("at_cell") else None
     _target_is_split = _tgt is not None and _tgt.cell_type == "split"
-    if str(payload.get("view", "") or "") == "3d":
+    _view = str(payload.get("view", "") or "")
+    if _view in ("ipf2d", "density", "density3d"):
+        # The other three IPF EXPLORER views are native anyplotlib figures with
+        # no backing Plot array, and the report's snapshot paths capture a Plot
+        # (static) or the scene3d point cloud. Say so plainly rather than
+        # silently capturing the wrong thing (the map window's image, or a
+        # points sphere where the user dragged a density one).
+        ipc.emit_error("report_add_figure: only the 3-D Points IPF view can be "
+                       "captured into a report — switch to [3D] · [Points].")
+        return
+    if _view == "3d":
         snap = _snapshot_scene3d(session, src)
         if snap is None:
             ipc.emit_error("report_add_figure: source window has no 3-D "

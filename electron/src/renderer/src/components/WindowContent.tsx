@@ -27,7 +27,7 @@ function sourceWindowIdFromDrop(dt: DataTransfer): number | null {
 interface Props {
   win: SpyDEWindow
   iframeRefs: React.MutableRefObject<Map<string, HTMLIFrameElement>>
-  replayState: (figId: string) => void
+  replayState: (figId: string, target?: HTMLIFrameElement) => void
   sendAction: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
 }
 
@@ -36,6 +36,10 @@ interface Props {
 // navigators, rows) — see navigator_views.py TILED_LABEL / STACKED_LABEL.
 const TILED = '__tiled__'
 const STACKED = '__stacked__'
+/** The IPF EXPLORER window's four switchable views — [2D|3D] × [Points|Heatmap].
+ *  `3d` and `density` keep their historical tags (the Report Builder's scene3d
+ *  drag payload and the density tests both key on them). */
+const IPF_VIEWS = new Set(['ipf2d', 'density', '3d', 'density3d'])
 const STRAIN_LABEL: Record<string, string> = { exx: 'εxx', eyy: 'εyy', exy: 'εxy', omega: 'ω' }
 
 // Don't show the "Calculating…" chip for a compute that finishes fast — most
@@ -174,13 +178,17 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction }: Prop
     })
   }
 
-  const fig3d = useMemo(() => figs.find(f => f.view === '3d'), [figs])
+  // ── The IPF EXPLORER window (window 2 of an orientation result) ───────────
+  // Four pre-built figures behind two INDEPENDENT toggles, [2D|3D] × [Points|
+  // Heatmap]. Switching is client-side (show/hide iframes) — no backend round
+  // trip; only the X/Y/Z sample direction goes back to Python.
+  const fig3d = useMemo(() => figs.find(f => f.view === '3d'), [figs])            // 3D · Points
   const has3d = !!fig3d
-  const figDensity = useMemo(() => figs.find(f => f.view === 'density'), [figs])
-  const hasDensity = !!figDensity
-  // The IPF colour-key triangle legend — a native anyplotlib figure pinned in
-  // the corner of the 2-D map (not a switchable view).
-  const figIpfKey = useMemo(() => figs.find(f => f.view === 'ipf_key'), [figs])
+  const figDensity = useMemo(() => figs.find(f => f.view === 'density'), [figs])  // 2D · Heatmap
+  const figPoints2d = useMemo(() => figs.find(f => f.view === 'ipf2d'), [figs])   // 2D · Points
+  const figDensity3d = useMemo(() => figs.find(f => f.view === 'density3d'), [figs]) // 3D · Heatmap
+  const hasDensity = !!(figDensity || figDensity3d)
+  const hasIpfViews = has3d || hasDensity || !!figPoints2d
   const tiledFig = useMemo(() => figs.find(f => f.viewLabel === TILED), [figs])
   const stackedFig = useMemo(() => figs.find(f => f.viewLabel === STACKED), [figs])
   // Unique chip labels in stable first-seen order (the tiled figure is not a chip).
@@ -196,15 +204,17 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction }: Prop
   const strainFig = useMemo(() => figs.find(f => f.strainComponents && f.strainComponents.length), [figs])
   const strainComponents = strainFig?.strainComponents
 
-  const [mode, setMode] = useState<'2d' | '3d' | 'density'>('2d')
+  const [dim, setDim] = useState<'2d' | '3d'>('2d')
+  const [ipfStyle, setIpfStyle] = useState<'points' | 'heatmap'>('points')
   const [dir, setDir] = useState<'x' | 'y' | 'z'>('z')
   const [strainComp, setStrainComp] = useState('exx')
 
-  // Fall back to the 2-D map if the active mode's figure disappears (e.g. a
-  // result re-run before the 3-D / density figure re-arrives).
+  // Fall back to 2-D / Points if the active combination's figure disappears
+  // (e.g. a result re-run before the 3-D / density figures re-arrive).
   useEffect(() => {
-    if ((mode === '3d' && !has3d) || (mode === 'density' && !hasDensity)) setMode('2d')
-  }, [mode, has3d, hasDensity])
+    if (dim === '3d' && !has3d && !figDensity3d) setDim('2d')
+    if (ipfStyle === 'heatmap' && !hasDensity) setIpfStyle('points')
+  }, [dim, ipfStyle, has3d, hasDensity, figDensity3d])
   const [selected, setSelected] = useState<string[]>([])
 
   // Keep `selected` a non-empty subset of the available labels (repairs after a
@@ -240,17 +250,35 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction }: Prop
     })
   }
 
+  // The plain map / primary figure — anything that isn't one of the tagged
+  // secondary views or a tiled/stacked composite.
+  const plainFig = useMemo(() => figs.find(f => !IPF_VIEWS.has(f.view ?? '')
+    && f.viewLabel !== TILED && f.viewLabel !== STACKED),
+    [figs])
+
+  // The IPF figure for the current [2D|3D] × [Points|Heatmap] combination.
+  // `plainFig` backs 2-D/Points for the LEGACY single-window layout, where the
+  // RGB orientation map lived on the same window as the 3-D / density views.
+  const ipfFig = useMemo<SpyDEFigure | null>(() => {
+    const grid: Record<string, SpyDEFigure | undefined> = {
+      '2d:points': figPoints2d ?? plainFig,
+      '2d:heatmap': figDensity,
+      '3d:points': fig3d,
+      '3d:heatmap': figDensity3d,
+    }
+    return grid[`${dim}:${ipfStyle}`] ?? grid[`${dim}:points`]
+      ?? grid['2d:points'] ?? null
+  }, [dim, ipfStyle, figPoints2d, plainFig, figDensity, fig3d, figDensity3d])
+
   // The single figure to show right now.
   const shownFig = useMemo<SpyDEFigure | null>(() => {
-    if (has3d && mode === '3d' && fig3d) return fig3d
-    if (hasDensity && mode === 'density' && figDensity) return figDensity
+    if (hasIpfViews && ipfFig) return ipfFig
     if (multi && tiledFig) return tiledFig                     // anyplotlib N-axis compare
     if (navMulti && tiledFig) return tiledFig                  // tiled navigators (2-D)
     if (navMulti && stackedFig) return stackedFig              // stacked navigators (1-D/movie)
     if (hasChips) return [...figs].reverse().find(f => f.viewLabel === selected[0]) ?? null
-    return figs.find(f => f.view !== '3d' && f.view !== 'density' && f.view !== 'ipf_key'
-      && f.viewLabel !== TILED && f.viewLabel !== STACKED) ?? figs[0] ?? null
-  }, [has3d, mode, fig3d, hasDensity, figDensity, multi, navMulti, tiledFig, stackedFig, hasChips, selected, figs])
+    return plainFig ?? figs[0] ?? null
+  }, [hasIpfViews, ipfFig, multi, navMulti, tiledFig, stackedFig, hasChips, selected, figs, plainFig])
 
   const shownId = shownFig?.figId
 
@@ -281,7 +309,7 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction }: Prop
     return () => { cancelAnimationFrame(raf); ro.disconnect() }
   }, [shownId, iframeRefs])
 
-  const showBar = hasChips || has3d || !!strainComponents || hasNavChips
+  const showBar = hasChips || hasIpfViews || !!strainComponents || hasNavChips
 
   return (
     <div style={styles.root}>
@@ -320,13 +348,21 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction }: Prop
             </div>
           )}
           <div style={{ flex: 1 }} />
-          {(has3d || hasDensity) && (
+          {hasIpfViews && (
+            // Two INDEPENDENT toggle pairs — projection [2D|3D] and rendering
+            // [Points|Heatmap] — then the sample direction X/Y/Z (the only one
+            // that goes back to the backend; it re-colours all four views).
             <div style={styles.group} data-testid={`ipf-view-toggle-${id}`}>
-              {([['2d', '2D'], ...(has3d ? [['3d', '3D']] : []),
-                 ...(hasDensity ? [['density', 'PDF']] : [])] as const).map(([m, lbl]) => (
+              {(has3d || figDensity3d) && ([['2d', '2D'], ['3d', '3D']] as const).map(([m, lbl]) => (
                 <button key={m} data-testid={`ipf-view-${m}-${id}`}
-                  onClick={() => setMode(m as '2d' | '3d' | 'density')}
-                  style={m === mode ? styles.btnActive : styles.btn}>{lbl}</button>
+                  onClick={() => setDim(m)}
+                  style={m === dim ? styles.btnActive : styles.btn}>{lbl}</button>
+              ))}
+              {hasDensity && <span style={{ width: 6 }} />}
+              {hasDensity && ([['points', 'Points'], ['heatmap', 'Heatmap']] as const).map(([m, lbl]) => (
+                <button key={m} data-testid={`ipf-style-${m}-${id}`}
+                  onClick={() => setIpfStyle(m)}
+                  style={m === ipfStyle ? styles.btnActive : styles.btn}>{lbl}</button>
               ))}
               <span style={{ width: 6 }} />
               {(['x', 'y', 'z'] as const).map(d => (
@@ -352,7 +388,7 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction }: Prop
       )}
 
       <div ref={boxRef} data-testid={`figure-box-${id}`} style={styles.box}>
-        {figs.filter(f => f.view !== 'ipf_key').map(fig => (
+        {figs.map(fig => (
           <iframe
             key={fig.figId}
             ref={el => {
@@ -387,27 +423,11 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction }: Prop
           </div>
         )}
 
-        {/* IPF colour-key triangle legend — a native anyplotlib figure pinned in
-            the corner of the 2-D map (the stereographic fundamental-sector key
-            matplotlib/pyxem show), only over the RGB map (mode==='2d'). */}
-        {figIpfKey && mode === '2d' && (
-          <iframe
-            key={figIpfKey.figId}
-            ref={el => {
-              if (el) iframeRefs.current.set(figIpfKey.figId, el)
-              else iframeRefs.current.delete(figIpfKey.figId)
-            }}
-            src={figIpfKey.filePath ?? undefined}
-            onLoad={(e) => {
-              replayState(figIpfKey.figId)
-              const el = e.currentTarget
-              window.electron.resizeFigure(figIpfKey.figId, Math.max(80, el.clientWidth), Math.max(80, el.clientHeight))
-            }}
-            style={styles.ipfKey}
-            title={figIpfKey.title}
-            data-testid={`ipf-key-${id}`}
-          />
-        )}
+        {/* The IPF colour-key triangle is no longer a figure of its own. It is
+            an anyplotlib KEY overlay drawn by the map figure that it annotates
+            (`Plot2D.add_key`, >=0.7.0 — see actions/ipf_view.attach_ipf_key),
+            so it needs no iframe, no resize plumbing and no state replay here,
+            and it follows whichever projection chip is on screen. */}
 
         {/* MDI overlay-drop shield — mounted ONLY while a window/figure pill is
             being dragged, so it never interferes otherwise. Catches the DnD the
@@ -481,11 +501,6 @@ const styles: Record<string, React.CSSProperties> = {
   computingDot: {
     width: 7, height: 7, borderRadius: '50%', background: '#89b4fa',
     flex: '0 0 auto',
-  },
-  ipfKey: {
-    position: 'absolute', right: 6, bottom: 6, width: 132, height: 120,
-    border: 'none', zIndex: 4,
-    background: 'rgba(24,24,37,0.72)', borderRadius: 6,
   },
   // MDI overlay-drop shield (over the figure iframe, only during a window drag).
   overlayShield: {
