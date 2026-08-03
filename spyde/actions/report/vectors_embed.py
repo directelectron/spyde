@@ -329,12 +329,19 @@ def _build_figure(vecs, payload) -> "tuple[dict, str, str, str, str] | None":
             p_stack = ax_stack.plot(
                 totals, axes=[np.arange(n_time, dtype=np.float64)],
                 units="slice", y_units="vectors", color="#89b4fa")
-            # Snap to whole slices: the vline IS the slice index, so a position
-            # between two slices has no meaning and would round-trip visibly
-            # out of step with the DP.
-            p_stack.add_vline_widget(
-                0.0, color="#f6c177",
-                snap_values=[float(i) for i in range(n_time)])
+            # Snap to whole slices where the widget supports it: the vline IS
+            # the slice index, so a position between two has no meaning.
+            # `snap_values` post-dates the pinned anyplotlib floor (>=0.4.2),
+            # and losing the WHOLE stack panel over a cosmetic nicety is a bad
+            # trade — the page's setSlice rounds and clamps regardless, so
+            # unsnapped just means the line rests between ticks. Caught
+            # narrowly: only the unknown-kwarg TypeError falls through.
+            try:
+                p_stack.add_vline_widget(
+                    0.0, color="#f6c177",
+                    snap_values=[float(i) for i in range(n_time)])
+            except TypeError:
+                p_stack.add_vline_widget(0.0, color="#f6c177")
         except Exception as e:
             log.warning("[report] stack navigator panel failed, falling back "
                         "to the slider: %s", e)
