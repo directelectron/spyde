@@ -1398,6 +1398,17 @@ def _widget_geometry_to_data(kind, widget, axes, coords) -> "dict | None":
     return None
 
 
+def _max_embed_vectors() -> int:
+    """The interactive-embed vector cap. Lazily imported so ``vectors_embed``
+    (which pulls anyplotlib) isn't loaded just to import this module."""
+    try:
+        from spyde.actions.report.vectors_embed import MAX_EMBED_VECTORS
+        return int(MAX_EMBED_VECTORS)
+    except Exception as e:
+        log.debug("reading the vectors embed cap failed: %s", e)
+        return 3_000_000
+
+
 def _clear_vectors_explorer_cache(cell_id: "str | None" = None) -> None:
     """Drop the memoized vectors-explorer page(s) (fix #6). Best-effort; a lazy
     import so vectors_embed (which pulls anyplotlib) isn't loaded at handler
@@ -2846,16 +2857,27 @@ def report_add_figure(session, plot, payload) -> None:
                     # show 0 rather than crash the choice prompt, but don't swallow
                     # an unrelated error (that would be a real bug worth surfacing).
                     count = 0
-                ipc.emit({
-                    "type": "report_vectors_choice",
-                    "source_window_id": payload.get("source_window_id"),
-                    "index": payload.get("index"),
-                    "at_cell": payload.get("at_cell"),
-                    "caption": str(payload.get("caption", "") or ""),
-                    "count": count,
-                    "slide_break": payload.get("slide_break"),
-                })
-                return
+                # Over the embed cap the explorer CANNOT be built (the blob would
+                # run to hundreds of MB). Prompting anyway meant "viewer" silently
+                # fell back to the static snapshot — a cell that looks broken with
+                # no explanation. Skip the prompt, say why, take the image.
+                cap = _max_embed_vectors()
+                if count > cap:
+                    ipc.emit_status(
+                        f"Report: {count:,} vectors exceeds the {cap:,} "
+                        "interactive-embed limit — added as a static image.")
+                    vectors_mode = "image"
+                else:
+                    ipc.emit({
+                        "type": "report_vectors_choice",
+                        "source_window_id": payload.get("source_window_id"),
+                        "index": payload.get("index"),
+                        "at_cell": payload.get("at_cell"),
+                        "caption": str(payload.get("caption", "") or ""),
+                        "count": count,
+                        "slide_break": payload.get("slide_break"),
+                    })
+                    return
         snap = _snapshot_plot(src)
         if snap is None:
             ipc.emit_error("report_add_figure: source window has no image to snapshot.")

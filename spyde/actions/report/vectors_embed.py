@@ -15,6 +15,13 @@ panel that shows the pointed position's vectors as intensity DISKS.
   browser (mirroring ``_render_disks_block`` / ``render_region``), so no
   rendered frames are ever shipped.
 
+A 5-D STACK gets a THIRD panel in front of those two — a 1-D STACK navigator
+plotting vectors-per-slice with a draggable vline — so the embed has the same
+plots the app's own vectors window does (stack → real space → DP). The whole
+stack rides in the same 16-byte/vector block: the run-length index is built over
+``(t, iy, ix)``, which slices a position, a whole slice, and the per-slice count
+map, so no per-vector time column or per-slice image is shipped.
+
 Because it's a single figure/single ``mount()``, it renders in the report
 SIDEBAR for free via the SeamlessFigureFrame (the old two-figure layout showed
 only a plain snapshot there). The glue rides anyplotlib's standalone machinery
@@ -105,23 +112,24 @@ def _axis_extent(ax) -> tuple[float, float]:
 
 
 def _nav_offsets_flat(vecs, ny: int, nx: int, n: int) -> "np.ndarray | None":
-    """A ``(ny*nx + 1,)`` uint32 run-length index over the packed point block so
-    the page can O(1)-slice one nav position's vectors (pointer mode) instead of
-    scanning all ``n``.
+    """A ``(prod(full_nav_shape) + 1,)`` uint32 run-length index over the packed
+    point block so the page can O(1)-slice one nav position's vectors (pointer
+    mode) instead of scanning all ``n``.
 
-    The point block is packed in ``flat_buffer`` row order (sorted
-    outermost-nav-first). For a 4-D scan that order groups each ``(iy, ix)``
-    position contiguously, so ``nav_offsets[-1]`` (or the legacy spatial
-    ``offsets``) IS the run-length index directly. Returns None when a valid
-    contiguous per-position index can't be produced (e.g. a 5-D stack, where one
-    ``(iy, ix)`` position's vectors are spread across time steps) — the page then
-    falls back to a full scan, still correct, just O(n)."""
-    want = ny * nx + 1
-    # 5-D stacks (an outer nav dim above the 2-D scan) aren't contiguous per
-    # (iy, ix) — bail so the page scans instead of mis-slicing.
+    The point block is packed in ``flat_buffer`` row order, which the CSR
+    container guarantees is sorted outermost-nav-first. For a 4-D scan that
+    groups each ``(iy, ix)`` contiguously; for a 5-D STACK it groups each
+    ``(t, iy, ix)`` contiguously — and, because ``t`` is outermost, a whole time
+    SLICE is contiguous too. So the same ``nav_offsets[-1]`` array indexes both:
+    position ``p = (t * ny + iy) * nx + ix``, slice ``t`` spanning
+    ``[off[t*ny*nx], off[(t+1)*ny*nx])``. That one index is what makes the page's
+    time slider free — no per-vector time column is shipped.
+
+    Returns None when a valid contiguous index can't be produced. For a 5-D stack
+    that is FATAL to the embed (the caller refuses), because without it the page
+    has no way to tell one slice's vectors from another's."""
     full = tuple(int(s) for s in getattr(vecs, "full_nav_shape", vecs.nav_shape))
-    if len(full) > 2:
-        return None
+    want = int(np.prod(full)) + 1 if len(full) > 2 else ny * nx + 1
     for cand in (getattr(vecs, "nav_offsets", None), None):
         arr = None
         if cand is not None and len(cand):
@@ -182,6 +190,15 @@ def pack_vectors(vecs) -> "dict | None":
     if nav_off is not None:
         blob += nav_off.tobytes()
 
+    # 5-D stack: the run-length index IS the time index (see _nav_offsets_flat).
+    # Without it every slice's vectors would pile onto the same (iy, ix) and the
+    # page could neither slice nor scrub — refuse rather than embed a wrong page.
+    n_time = int(getattr(vecs, "n_time", 0) or 0)
+    if n_time > 0 and nav_off is None:
+        log.warning("[report] vectors embed skipped: %d-slice stack has no "
+                    "usable per-position offset index", n_time)
+        return None
+
     sig_axes = list(getattr(vecs, "sig_axes", []) or [])
     if len(sig_axes) >= 2:
         kx_lo, kx_hi = _axis_extent(sig_axes[0])
@@ -204,15 +221,22 @@ def pack_vectors(vecs) -> "dict | None":
         "r0": float(getattr(vecs, "kernel_radius_data", 0.0) or 0.0),
         "r_px": float(getattr(vecs, "kernel_radius_px", 0.0) or 0.0),
         "nav_off": nav_off_len,         # 0 = no run-length index (scan instead)
+        "nt": n_time,                   # 0 = 4-D; >0 = stack slices (time slider)
     }
     return {"header": header, "b64": base64.b64encode(blob).decode("ascii")}
 
 
 def _count_map_u8(vecs, ny: int, nx: int) -> np.ndarray:
     """Log-scaled uint8 count-map image — the navigator background (mirrors the
-    MDI vector window's count-map navigator)."""
+    MDI vector window's count-map navigator).
+
+    For a STACK this is slice 0, not the all-slice sum: the page opens on slice 0
+    and its time slider moves from there, so a summed background would disagree
+    with everything else on the page from the first frame."""
     try:
-        cm = np.asarray(vecs.count_map(), dtype=np.float32)
+        cm = np.asarray(
+            vecs.count_map_at_t(0) if int(getattr(vecs, "n_time", 0) or 0) > 0
+            else vecs.count_map(), dtype=np.float32)
     except (ValueError, TypeError, AttributeError, IndexError) as e:
         # A broken count-map (bad CSR shape/buffer) degrades to a blank navigator
         # rather than failing the whole embed — but warn, since a zero nav reads as
@@ -226,18 +250,34 @@ def _count_map_u8(vecs, ny: int, nx: int) -> np.ndarray:
     return (255 * img / mx).astype(np.uint8)
 
 
-def _build_figure(vecs, payload) -> "tuple[dict, str, str, str] | None":
-    """Build ONE anyplotlib figure with TWO panels — navigator | DP — and return
-    ``(state, nav_panel_id, dp_panel_id, esm_text)``.
+def _per_slice_totals(vecs, n_time: int) -> np.ndarray:
+    """(n_time,) total vectors per stack slice — the STACK navigator's curve,
+    the same quantity the app's 1-D vectors navigator shows."""
+    try:
+        series = np.asarray(vecs.count_map_series(), dtype=np.float64)
+        return series.reshape(series.shape[0], -1).sum(axis=1)
+    except Exception as e:
+        log.debug("[report] per-slice totals failed: %s", e)
+        return np.zeros(max(1, n_time), dtype=np.float64)
+
+
+def _build_figure(vecs, payload) -> "tuple[dict, str, str, str, str] | None":
+    """Build ONE anyplotlib figure and return
+    ``(state, nav_panel_id, dp_panel_id, stack_panel_id, esm_text)``.
+
+    Two panels for a 4-D scan — navigator | DP — and THREE for a 5-D STACK:
+    stack | navigator | DP, mirroring the app's own three-level vectors window
+    (1-D stack navigator → 2-D real-space count map → diffraction pattern).
+    ``stack_panel_id`` is ``""`` when there is no stack axis.
 
     A single figure/single ``mount()`` renders in the report SIDEBAR for free via
     the SeamlessFigureFrame (the previous two-figure layout showed only a plain
-    snapshot there). The navigator (panel 0) shows the count map with a draggable
-    CROSSHAIR (pointer mode) and a RECTANGLE (integrate mode); the DP panel
-    (panel 1) starts as zeros and is repainted client-side via the overlay-canvas
-    push. Panel ids are discovered from the serialized state (the state dict does
-    NOT guarantee navigator-first ordering), keyed by which panel carries the
-    widgets and by image size."""
+    snapshot there). The navigator shows the count map with a draggable CROSSHAIR
+    (pointer mode) and a RECTANGLE (integrate mode); the DP panel starts as zeros
+    and is repainted client-side via the overlay-canvas push; the stack panel
+    plots vectors-per-slice with a draggable VLINE that selects the slice. Panel
+    ids are discovered from the serialized state (the state dict does NOT
+    guarantee panel ordering), keyed by which widget types each panel carries."""
     try:
         import json as _json
         import anyplotlib as apl
@@ -249,6 +289,7 @@ def _build_figure(vecs, payload) -> "tuple[dict, str, str, str] | None":
     hdr = payload["header"]
     ny, nx = hdr["nav"]
     H, W = hdr["sig"]
+    n_time = int(hdr.get("nt", 0) or 0)
     r_px = max(1.0, float(hdr.get("r_px", 1.0)))
 
     nav_u8 = _count_map_u8(vecs, ny, nx)
@@ -264,12 +305,42 @@ def _build_figure(vecs, payload) -> "tuple[dict, str, str, str] | None":
     # nothing.
     nav_aspect = min(3.0, max(1 / 3.0, (nx / ny) if ny else 1.0))
     dp_aspect = min(3.0, max(1 / 3.0, (W / H) if H else 1.0))
-    fig_w = int(round(FIG_PX * (nav_aspect + dp_aspect))) + 20
-    fig, axs = apl.subplots(1, 2, figsize=(fig_w, FIG_PX),
-                            width_ratios=[nav_aspect, dp_aspect])
-    ax_nav, ax_dp = axs[0], axs[1]
+    # A stack adds the 1-D navigator as a THIRD panel (app parity). It carries a
+    # curve, not an image, so its width is a fixed pleasant ratio rather than a
+    # content aspect.
+    stack_aspect = 1.15
+    ratios = ([stack_aspect] if n_time > 1 else []) + [nav_aspect, dp_aspect]
+    fig_w = int(round(FIG_PX * sum(ratios))) + 20
+    fig, axs = apl.subplots(1, len(ratios), figsize=(fig_w, FIG_PX),
+                            width_ratios=ratios)
+    if n_time > 1:
+        ax_stack, ax_nav, ax_dp = axs[0], axs[1], axs[2]
+    else:
+        ax_stack, (ax_nav, ax_dp) = None, (axs[0], axs[1])
 
-    # NAVIGATOR (panel 0): count map + crosshair (pointer) + rectangle
+    # STACK navigator (5-D only): vectors per slice + a draggable vline that
+    # picks the slice — the report's stand-in for the app's 1-D vectors
+    # navigator. Built BEFORE the others so a failure here degrades to the plain
+    # two-panel layout instead of losing the whole embed.
+    p_stack = None
+    if ax_stack is not None:
+        totals = _per_slice_totals(vecs, n_time)
+        try:
+            p_stack = ax_stack.plot(
+                totals, axes=[np.arange(n_time, dtype=np.float64)],
+                units="slice", y_units="vectors", color="#89b4fa")
+            # Snap to whole slices: the vline IS the slice index, so a position
+            # between two slices has no meaning and would round-trip visibly
+            # out of step with the DP.
+            p_stack.add_vline_widget(
+                0.0, color="#f6c177",
+                snap_values=[float(i) for i in range(n_time)])
+        except Exception as e:
+            log.warning("[report] stack navigator panel failed, falling back "
+                        "to the slider: %s", e)
+            p_stack = None
+
+    # REAL-SPACE NAVIGATOR: count map + crosshair (pointer) + rectangle
     # (integrate). BOTH widgets are serialized so their exact dicts exist; the
     # page's mode toggle keeps only the active one visible.
     p_nav = ax_nav.imshow(nav_u8, cmap="gray", vmin=0, vmax=255)
@@ -279,7 +350,7 @@ def _build_figure(vecs, payload) -> "tuple[dict, str, str, str] | None":
                      x=max(0, nx / 2 - 2), y=max(0, ny / 2 - 2),
                      w=min(nx, 4), h=min(ny, 4))
 
-    # DP (panel 1): fixed 0..255 levels — the page pushes fresh uint8 frames, and
+    # DIFFRACTION PATTERN: fixed 0..255 levels — the page pushes fresh uint8 frames, and
     # auto-levels from the initial all-zero frame would pin display_max at 0. A
     # CIRCLE DETECTOR widget rides here (VI, fix #4): dragging/resizing it in the
     # page recomputes a virtual image (per vector: if its (kx, ky) falls inside
@@ -299,6 +370,7 @@ def _build_figure(vecs, payload) -> "tuple[dict, str, str, str] | None":
     # rectangle) vs the DP (carries the circle detector). Keyed by which widget
     # types the panel holds so ordering isn't assumed.
     nav_id = dp_id = None
+    stack_id = ""
     for k in state:
         if not (k.startswith("panel_") and k.endswith("_json")):
             continue
@@ -313,11 +385,18 @@ def _build_figure(vecs, payload) -> "tuple[dict, str, str, str] | None":
             nav_id = pid
         elif "circle" in types:
             dp_id = pid
+        elif "vline" in types:
+            stack_id = pid
     if nav_id is None or dp_id is None:
         log.debug("[report] could not identify nav/DP panels for vectors embed")
         return None
+    if p_stack is not None and not stack_id:
+        # The panel was built but carries no identifiable widget — the page
+        # would show a curve nothing drives. Say so; the slice is still
+        # reachable through window.__vx.setSlice.
+        log.warning("[report] stack navigator panel has no vline widget id")
 
-    return state, nav_id, dp_id, _esm_text()
+    return state, nav_id, dp_id, stack_id, _esm_text()
 
 
 # Dark theme (fix #2) — matches the SpyDE app surface (Catppuccin Mocha): page
@@ -361,6 +440,8 @@ body { margin: 0; font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
 .vx-seg-btn[aria-pressed="true"] {
   background: #89b4fa; color: #11111b; }
 .vx-seg-btn[aria-pressed="true"]:hover { background: #a0c4ff; }
+/* Stack slider (5-D): accent-tinted, sized so it doesn't dominate the row. */
+.vx-slice { width: 160px; accent-color: #89b4fa; vertical-align: middle; }
 .vx-status-dot { width: 8px; height: 8px; border-radius: 50%;
                  background: #a6e3a1; box-shadow: 0 0 4px #a6e3a1;
                  display: inline-block; }
@@ -378,6 +459,9 @@ const B64 = document.getElementById('vx-data').textContent.trim();
 const STATE = JSON.parse(document.getElementById('vx-state').textContent);
 const NAV_ID = document.getElementById('vx-navid').textContent.trim();
 const DP_ID = document.getElementById('vx-dpid').textContent.trim();
+// The STACK (1-D) navigator panel — 5-D only; '' for a plain 4-D scan.
+const STACK_ID = (document.getElementById('vx-stackid') || { textContent: '' })
+  .textContent.trim();
 const ESM = document.getElementById('vx-esm').textContent;
 
 const esmUrl = URL.createObjectURL(new Blob([ESM], { type: 'text/javascript' }));
@@ -387,6 +471,13 @@ const n = HDR.n, navH = HDR.nav[0], navW = HDR.nav[1];
 const DPH = HDR.sig[0], DPW = HDR.sig[1];              // DP frame [H, W] in px
 const R_PX = Math.max(1, Math.round(HDR.r_px || 1));   // disk radius (px)
 const NAV_OFF_LEN = HDR.nav_off || 0;                  // 0 = no run-length index
+// STACK (5-D) support. NT = number of slices (0 for a plain 4-D scan). The
+// run-length index covers (t, iy, ix) — see _nav_offsets_flat — so a slice is
+// just an offset base, and no per-vector time column is shipped.
+const NT = HDR.nt || 0;
+const NAVN = navH * navW;
+let T_CUR = 0;
+const sliceBase = () => (NT ? T_CUR * NAVN : 0);
 
 const ab = await (await fetch('data:application/octet-stream;base64,' + B64))
   .arrayBuffer();
@@ -410,7 +501,7 @@ const kxToCol = (kx) => Math.round((kx - kxLo) / (kSpanX || 1));
 const kyToRow = (ky) => Math.round((ky - kyLo) / (kSpanY || 1));
 
 // The single mount handle + panel objects (looked up by id from the render API).
-let H = null, navPanel = null, dpPanel = null;
+let H = null, navPanel = null, dpPanel = null, stackPanel = null;
 
 // The DP repaint lands on a PASS-THROUGH OVERLAY canvas over the DP panel's
 // image rect. Pushing pixels through the figure's own state keys proved
@@ -453,12 +544,23 @@ function rowsAt(iy, ix, out) {
   out.length = 0;
   if (iy < 0 || iy >= navH || ix < 0 || ix >= navW) return out;
   if (NAV_OFF) {
-    const p = iy * navW + ix;
+    const p = sliceBase() + iy * navW + ix;
     const s = NAV_OFF[p], e = NAV_OFF[p + 1];
     for (let i = s; i < e; i++) out.push(i);
     return out;
   }
+  // Scan fallback — 4-D only (a stack without the index is refused at pack time).
   for (let i = 0; i < n; i++) if (Y[i] === iy && X[i] === ix) out.push(i);
+  return out;
+}
+
+// The CURRENT slice's count map, straight out of the run-length index (each
+// position's vector count is the gap between consecutive offsets). Free — no
+// per-slice count image is shipped.
+function sliceCountMap(out) {
+  if (!NAV_OFF) return null;
+  const base = sliceBase();
+  for (let p = 0; p < NAVN; p++) out[p] = NAV_OFF[base + p + 1] - NAV_OFF[base + p];
   return out;
 }
 
@@ -544,7 +646,7 @@ function splatSummedRegion(y0, y1, x0, x1) {
   // [s, e) slice; without it we scan once and bin by region membership.
   if (NAV_OFF) {
     for (let iy = y0; iy < y1; iy++) {
-      const base = iy * navW;
+      const base = sliceBase() + iy * navW;
       for (let ix = x0; ix < x1; ix++) {
         const p = base + ix, s = NAV_OFF[p], e = NAV_OFF[p + 1];
         for (let i = s; i < e; i++) hit += _sumVector(i);
@@ -623,10 +725,46 @@ function computeDP() {
   }
   stats.leftMean = lS / (nL || 1); stats.rightMean = rS / (nR || 1);
   if (ovDP) pushImage(ovDP, u8DP, DPW, DPH);
-  readout.textContent = mode.integrate
+  const sl = NT ? ('slice ' + T_CUR + '/' + (NT - 1) + ' — ') : '';
+  readout.textContent = sl + (mode.integrate
     ? ('integrate: nav [' + y0 + ':' + y1 + ', ' + x0 + ':' + x1 + '] — '
        + hit + ' vectors summed')
-    : ('pointer: nav (' + y0 + ', ' + x0 + ') — ' + hit + ' vectors');
+    : ('pointer: nav (' + y0 + ', ' + x0 + ') — ' + hit + ' vectors'));
+}
+
+// Move to stack slice `t`: repaint BOTH panels (the DP for the pointed position
+// in that slice, and the navigator's virtual image / count map for that slice).
+function setSlice(t, fromWidget) {
+  if (!NT) return;
+  const nt = Math.max(0, Math.min(NT - 1, Math.round(t)));
+  if (nt === T_CUR) return;
+  T_CUR = nt;
+  const lab = document.getElementById('vx-slice-label');
+  if (lab) lab.textContent = T_CUR + ' / ' + (NT - 1);
+  const sld = document.getElementById('vx-slice');
+  if (sld && Number(sld.value) !== T_CUR) sld.value = String(T_CUR);
+  // Keep the stack panel's vline on the selected slice when the move came from
+  // somewhere else (the test hook / the fallback slider). Skipped for a drag —
+  // re-applying the panel mid-drag fights the widget the user is holding.
+  if (!fromWidget) syncStackWidget();
+  refresh();
+  refreshVI();
+}
+
+// Move the stack panel's vline to T_CUR through the LIVE model state (same
+// patch-through rule as the navigator widgets: never re-apply the page-load
+// parse, which would reset the fitted view).
+function syncStackWidget() {
+  if (!STACK_ID || !H) return;
+  const key = 'panel_' + STACK_ID + '_json';
+  try {
+    const live = JSON.parse(H.get(key));
+    let moved = false;
+    for (const w of (live.overlay_widgets || [])) {
+      if (w.type === 'vline' && w.x !== T_CUR) { w.x = T_CUR; moved = true; }
+    }
+    if (moved) H.applyUpdate(key, JSON.stringify(live));
+  } catch (e) { /* panel not mounted yet */ }
 }
 
 // VIRTUAL IMAGE (fix #4): scan EVERY vector once; if its (kx, ky) — mapped to DP
@@ -639,13 +777,23 @@ function computeVI() {
   accVI.fill(0);
   const cx = det.cx, cy = det.cy, r2 = det.r * det.r;
   let hit = 0;
-  for (let i = 0; i < n; i++) {
+  // A stack's VI is the CURRENT SLICE's virtual image, not every slice summed
+  // onto one map. `t` is the outermost sort key, so one slice is a contiguous
+  // row range — the scan stays one linear pass, just a shorter one.
+  const i0 = (NT && NAV_OFF) ? NAV_OFF[sliceBase()] : 0;
+  const i1 = (NT && NAV_OFF) ? NAV_OFF[sliceBase() + NAVN] : n;
+  for (let i = i0; i < i1; i++) {
     const dx = kxToCol(KX[i]) - cx, dy = kyToRow(KY[i]) - cy;
     if (dx * dx + dy * dy <= r2) {
       accVI[Y[i] * navW + X[i]] += IN[i];
       hit++;
     }
   }
+  // A detector that catches nothing gave an all-zero (black) navigator with no
+  // way to tell "empty aperture" from "broken page" — and on a stack the count
+  // map is also what should change as you scrub. Fall back to this slice's count
+  // map so the navigator always shows the scan.
+  if (hit === 0 && sliceCountMap(accVI) === null) accVI.fill(0);
   let m = 0;
   for (let i = 0; i < accVI.length; i++) if (accVI[i] > m) m = accVI[i];
   const s = m > 0 ? 255 / m : 0;
@@ -679,6 +827,12 @@ function refreshVI() {
 function onEvent(ev) {
   if (ev.event_type !== 'pointer_move' && ev.event_type !== 'pointer_up') return;
   const pid = String(ev.panel_id == null ? '' : ev.panel_id);
+  // STACK panel → the vline picks the slice. Its `x` is in DATA units, and the
+  // curve is plotted against slice index, so x IS the slice.
+  if ((STACK_ID && pid === STACK_ID) || ev.type === 'vline') {
+    if (typeof ev.x === 'number') setSlice(ev.x, true);
+    return;
+  }
   // DP panel → the detector circle: recompute the virtual image on the navigator.
   if (pid === DP_ID || ev.type === 'circle') {
     if (typeof ev.cx === 'number') {
@@ -823,6 +977,16 @@ for (const b of document.querySelectorAll('.vx-seg-btn')) {
   b.addEventListener('click', () => { setMode(b.dataset.mode === 'integrate'); });
 }
 
+// Stack slider — the FALLBACK control, emitted only when the stack navigator
+// panel could not be built (a stack normally scrubs by dragging that panel's
+// vline). Absent entirely for a 4-D scan.
+{
+  const sld = document.getElementById('vx-slice');
+  if (sld) sld.addEventListener('input', () => { setSlice(Number(sld.value)); });
+}
+// Park the stack vline on slice 0 and give the panel handle to the test hook.
+if (STACK_ID) stackPanel = H.api.panels.get(STACK_ID);
+
 // Test hook: nav geometry in IMAGE PIXELS (== nav index), same code path as the
 // widget events. setPointer moves the crosshair; setRegion moves the rectangle;
 // setDetector moves the DP detector (VI). setMode drives the segmented toggle.
@@ -841,14 +1005,51 @@ window.__vx = {
     refreshVI();
   },
   setMode,
+  setSlice,
+  slice: () => T_CUR,
+  nSlices: NT,
+  hasStackPanel: () => Boolean(STACK_ID),
   cross, region, mode, stats, det,
-  _h: () => ({ H, navKey, NAV_ID, DP_ID, navPanel, dpPanel }),
+  _h: () => ({ H, navKey, NAV_ID, DP_ID, STACK_ID,
+               navPanel, dpPanel, stackPanel }),
 };
 
 syncSeg();
 refresh();
 document.getElementById('vx-root').dataset.ready = '1';
 """
+
+
+def _slice_control(n_time: int, have_stack_panel: bool) -> str:
+    """The stack slider markup — the FALLBACK control only.
+
+    A stack normally gets a real 1-D stack navigator PANEL (app parity: stack →
+    real space → DP), and that panel's draggable vline is the slice control. The
+    slider is emitted only when that panel could not be built, so the page is
+    never left with no way to change slice. Empty for a 4-D scan."""
+    n_time = int(n_time or 0)
+    if n_time <= 1 or have_stack_panel:
+        return ""
+    return (
+        "<span class=\"vx-seg\">"
+        "<span class=\"vx-seg-label\">slice</span>"
+        f"<input type=\"range\" id=\"vx-slice\" class=\"vx-slice\" "
+        f"data-testid=\"vx-slice\" min=\"0\" max=\"{n_time - 1}\" step=\"1\" "
+        "value=\"0\">"
+        "<span id=\"vx-slice-label\" class=\"vx-seg-label\" "
+        f"data-testid=\"vx-slice-label\">0 / {n_time - 1}</span>"
+        "</span>"
+    )
+
+
+def _explorer_heading(hdr: dict, stack_id: str) -> str:
+    """One line naming the panels, so the page says what drives what."""
+    if stack_id:
+        return ("Diffraction vectors — stack navigator picks the slice; "
+                "real-space navigator drives the pattern; "
+                "the DP detector drives the virtual image")
+    return ("Diffraction vectors — navigator drives the pattern; "
+            "the DP detector drives the virtual image")
 
 
 def vectors_explorer_html(vecs, caption: str = "",
@@ -881,7 +1082,7 @@ def vectors_explorer_html(vecs, caption: str = "",
     built = _build_figure(vecs, payload)
     if built is None:
         return None
-    state, nav_id, dp_id, esm = built
+    state, nav_id, dp_id, stack_id, esm = built
     hdr = payload["header"]
     cap = _html.escape(caption or "")
 
@@ -896,8 +1097,7 @@ def vectors_explorer_html(vecs, caption: str = "",
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
         f"<style>{_EXPLORER_CSS}</style></head><body>"
         "<div id=\"vx-root\" class=\"vx-wrap\">"
-        "<h4>Diffraction vectors — navigator drives the pattern; "
-        "the DP detector drives the virtual image</h4>"
+        f"<h4>{_html.escape(_explorer_heading(hdr, stack_id))}</h4>"
         "<div id=\"vx-fig\"></div>"
         "<div class=\"vx-controls\">"
         "<span class=\"vx-status-dot\" title=\"live\"></span>"
@@ -909,6 +1109,7 @@ def vectors_explorer_html(vecs, caption: str = "",
         "<button type=\"button\" class=\"vx-seg-btn\" data-mode=\"integrate\" "
         "data-testid=\"vx-mode-integrate\" aria-pressed=\"false\">Integrate</button>"
         "</span></span>"
+        f"{_slice_control(hdr.get('nt', 0), bool(stack_id))}"
         "</div>"
         f"<div id=\"vx-readout\" class=\"vx-meta\"></div>"
         f"<div class=\"vx-meta\">{cap}</div>"
@@ -918,6 +1119,7 @@ def vectors_explorer_html(vecs, caption: str = "",
         f"{_json_script('vx-state', state)}"
         f"<script type=\"text/plain\" id=\"vx-navid\">{nav_id}</script>"
         f"<script type=\"text/plain\" id=\"vx-dpid\">{dp_id}</script>"
+        f"<script type=\"text/plain\" id=\"vx-stackid\">{stack_id}</script>"
         f"<script type=\"text/plain\" id=\"vx-esm\">{esm_safe}</script>"
         f"<script type=\"module\">{_EXPLORER_JS_TMPL}</script>"
         "</body></html>"
