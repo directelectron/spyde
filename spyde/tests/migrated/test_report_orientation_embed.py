@@ -94,6 +94,12 @@ class TestPackOrientation:
         assert payload["header"]["stride"] == 4
 
 
+def _figs(html):
+    """The ``ox-figs`` payload: ``{view: {"state", "panels"}}``."""
+    raw = re.search(r'id="ox-figs">(.*?)</script>', html, re.S).group(1)
+    return json.loads(raw.replace("<\\/", "</"))
+
+
 class TestExplorerHtml:
     def test_selfcontained_page(self):
         from spyde.actions.report.orientation_embed import (
@@ -101,21 +107,23 @@ class TestExplorerHtml:
         )
         html = orientation_explorer_html(_om(), caption="cap & <text>")
         assert html is not None
-        assert "ox-header" in html and "ox-data" in html
-        # ONE mounted anyplotlib figure (three panels) + state + ESM + ids.
-        assert 'id="ox-fig"' in html
-        assert "ox-state" in html
-        assert "ox-mapid" in html and "ox-xyid" in html and "ox-sphid" in html
+        assert "ox-header" in html and "ox-data" in html and "ox-figs" in html
+        # The map is its own mount; the explorer is a slot of lazily-mounted views.
+        assert 'id="ox-map"' in html and 'id="ox-slot"' in html
         assert "ox-esm" in html and "createLocalModel" in html
         # The map's crosshair is the only interaction that moves the pick.
         assert "crosshair" in html
-        # X / Y / Z direction toggle, themed like the vectors explorer's.
+        # BOTH toggle pairs, plus the X/Y/Z direction — the app's own controls.
         assert "ox-seg-btn" in html
+        for v in ("2d", "3d"):
+            assert f'data-dim="{v}"' in html
+        for s in ("points", "heatmap"):
+            assert f'data-style="{s}"' in html
         for d in ("x", "y", "z"):
             assert f'data-dir="{d}"' in html
         assert "color-scheme: dark" in html and "#1e1e2e" in html
-        # A pick moves BOTH the triangle marker and the sphere highlight, and
-        # turns the camera — the live IpfWindowController.show_orientation.
+        # A pick moves the scatter marker AND both spheres' highlight, and turns
+        # the camera — the live IpfWindowController.show_orientation.
         assert "setPick" in html and "highlight" in html
         assert "_view_from_python" in html
         assert "cap &amp; &lt;text&gt;" in html          # caption escaped
@@ -123,31 +131,55 @@ class TestExplorerHtml:
         hdr = json.loads(
             re.search(r'id="ox-header">(.*?)</script>', html, re.S).group(1))
         assert hdr["nav"] == [4, 5] and hdr["m"] == 20
-        # The three panel ids are distinct and all present in the figure state.
-        ids = [re.search(rf'id="ox-{k}">(.*?)</script>', html, re.S).group(1)
-               for k in ("mapid", "xyid", "sphid")]
-        assert len(set(ids)) == 3
-        for pid in ids:
-            assert f"panel_{pid}_json" in html
         # Single-file contract: nothing external.
         assert "<script src=" not in html and "<link " not in html
 
-    def test_panels_are_map_triangle_sphere(self):
-        """The three panels are the three KINDS the explorer needs, and the ids
-        are resolved by kind — not by the order the axes happened to be made."""
+    def test_all_four_views_plus_the_map_are_built(self):
+        """Every toggle state ships as its own figure, and each is the panel
+        KIND that view needs — the 2-D ones on PlotXY (the '1d' panel kind), the
+        3-D ones on a 3-D panel."""
+        from spyde.actions.report.orientation_embed import (
+            VIEWS, orientation_explorer_html,
+        )
+        figs = _figs(orientation_explorer_html(_om()))
+        assert set(figs) == {"map", *VIEWS}
+        kinds = {}
+        for name, rec in figs.items():
+            pj = json.loads(rec["state"][f"panel_{rec['panels'][0]}_json"])
+            kinds[name] = pj["kind"]
+        assert kinds["map"] == "2d"                 # the IPF colour image
+        assert kinds["3d-points"] == "3d"
+        assert kinds["3d-heat"] == "3d"
+        assert kinds["2d-points"] not in ("2d", "3d")   # PlotXY → the '1d' kind
+        assert kinds["2d-heat"] not in ("2d", "3d")
+
+    def test_panels_are_in_axis_order(self):
+        """``panels`` must be the ORDER the axes were created, because every
+        per-phase update maps panel i to phase i. ``figure_state``'s own key
+        order is not that, so the list comes from ``layout_json``."""
         from spyde.actions.report.orientation_embed import (
             orientation_explorer_html,
         )
-        html = orientation_explorer_html(_om())
-        ids = {k: re.search(rf'id="ox-{k}">(.*?)</script>', html, re.S).group(1)
-               for k in ("mapid", "xyid", "sphid")}
-        state = json.loads(
-            re.search(r'id="ox-state">(.*?)</script>', html, re.S).group(1))
-        kinds = {k: json.loads(state[f"panel_{pid}_json"])["kind"]
-                 for k, pid in ids.items()}
-        assert kinds["mapid"] == "2d"        # the IPF colour map image
-        assert kinds["sphid"] == "3d"        # the unit-sphere scatter
-        assert kinds["xyid"] not in ("2d", "3d")   # PlotXY → the 1-D panel kind
+        figs = _figs(orientation_explorer_html(_om()))
+        for name, rec in figs.items():
+            layout = json.loads(rec["state"]["layout_json"])
+            want = [s["id"] for s in layout["panel_specs"]]
+            assert rec["panels"] == want, name
+
+    def test_density_images_are_png_urls_not_raw_bytes(self):
+        """A density field is smooth and mostly transparent; PNG crushes it, and
+        the 3-D texture wants a data URL anyway. Raw RGBA in the blob was ~1 MB
+        of the page for a 256px raster."""
+        from spyde.actions.report.orientation_embed import (
+            DIRECTIONS, pack_orientation,
+        )
+        rec = pack_orientation(_om())["header"]["phases"][0]
+        for key in ("raster", "texture"):
+            assert set(rec[key]) == set(DIRECTIONS), key
+            for url in rec[key].values():
+                assert url.startswith("data:image/png;base64,")
+        # Each direction really is a different picture.
+        assert len(set(rec["raster"].values())) == len(DIRECTIONS)
 
     def test_over_cap_returns_none(self, monkeypatch):
         import spyde.actions.report.orientation_embed as oe
