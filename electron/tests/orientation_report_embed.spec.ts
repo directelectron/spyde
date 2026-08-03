@@ -258,6 +258,55 @@ test('4) X / Y / Z re-colours every panel from the packed blob', async () => {
   // the diff above would happily call a pass.
   const inks = await canvasInk()
   expect(inks.filter((c) => c.ink > 200).length).toBeGreaterThanOrEqual(3)
+  await page.evaluate(() => (window as any).__ox.setDirection('z'))
+  await page.waitForTimeout(1_000)
+})
+
+test('4b) …including the SPHERE, whose points ride a separate channel', async () => {
+  // Test 4's whole-figure diff passes on the map and the triangle alone, and
+  // that is exactly what happened first: the 3-D cloud lives in
+  // `panel_<id>_geom`, not in the view json, so writing `vertices` into the
+  // view json re-coloured nothing and no assertion noticed. Crop the sphere.
+  const sphereShot = async (name: string) => {
+    const b = (await page.locator('#ox-fig').boundingBox())!
+    return await page.screenshot({
+      clip: { x: b.x + b.width * (2 / 3), y: b.y, width: b.width / 3, height: b.height },
+      path: join(SHOTS, name),
+    })
+  }
+  await page.evaluate(() => (window as any).__ox.setPick(8, 13))
+  await page.waitForTimeout(900)
+  const z = await sphereShot('09-sphere-dir-z.png')
+  await page.evaluate(() => (window as any).__ox.setDirection('y'))
+  await page.waitForTimeout(1_500)
+  const y = await sphereShot('10-sphere-dir-y.png')
+
+  const changed = await page.evaluate(async ([p, q]: [string, string]) => {
+    const load = (t: string) => new Promise<HTMLImageElement>((res, rej) => {
+      const i = new Image(); i.onload = () => res(i); i.onerror = rej
+      i.src = 'data:image/png;base64,' + t
+    })
+    const [ia, ib] = await Promise.all([load(p), load(q)])
+    const cv = document.createElement('canvas')
+    cv.width = ia.width; cv.height = ia.height
+    const cx = cv.getContext('2d')!
+    cx.drawImage(ia, 0, 0)
+    const da = cx.getImageData(0, 0, cv.width, cv.height).data
+    cx.clearRect(0, 0, cv.width, cv.height); cx.drawImage(ib, 0, 0)
+    const db = cx.getImageData(0, 0, cv.width, cv.height).data
+    let n = 0
+    for (let i = 0; i < da.length; i += 4) {
+      if (Math.abs(da[i] - db[i]) + Math.abs(da[i + 1] - db[i + 1])
+        + Math.abs(da[i + 2] - db[i + 2]) > 30) n++
+    }
+    return { n, total: da.length / 4 }
+  }, [z.toString('base64'), y.toString('base64')])
+  console.log('[ox] sphere Z→Y diff =', JSON.stringify(changed))
+  expect(changed.n / changed.total,
+    'the sphere is identical for IPF-Z and IPF-Y — its geometry channel never updated')
+    .toBeGreaterThan(0.01)
+  await page.evaluate(() => (window as any).__ox.setDirection('z'))
+  await page.waitForTimeout(1_000)
 })
 
 test('5) a REAL crosshair drag moves the pick', async () => {

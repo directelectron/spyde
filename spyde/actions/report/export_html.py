@@ -253,7 +253,9 @@ def _render_figure_side_html(mgr, cell: Cell, assets: dict, *, interactive: bool
         # ORIENTATION explorer — the same swap for a tree carrying an
         # orientation result. After vectors, because a vector-OM tree carries
         # BOTH and the vectors explorer is the one that cell was dragged from.
-        if not html_frag and cell.spec.orientation_mode != "image":
+        # getattr, not attribute access: a spec here is whatever the caller
+        # built, and the vectors path's own stubs predate this field.
+        if not html_frag and getattr(cell.spec, "orientation_mode", "") != "image":
             try:
                 from spyde.actions.report.orientation_embed import (
                     orientation_explorer_html, orientation_for_cell,

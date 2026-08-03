@@ -97,10 +97,14 @@ def clear_explorer_cache(cell_id: "str | None" = None) -> None:
 
 
 def _as_orientation_map(result):
-    """Normalise a raw-OM or vector-OM result to a ``SpyDEOrientationMap``."""
-    if hasattr(result, "to_orientation_map"):
-        return result.to_orientation_map()
-    return result
+    """Normalise a raw-OM or vector-OM result to a ``SpyDEOrientationMap``.
+
+    Delegates to the live IPF window's own normaliser rather than repeating the
+    rule, so a third producer only has to be taught to one of them. Lazy: this
+    module is imported from the report handlers, and ``ipf_view`` pulls the
+    figure registry."""
+    from spyde.actions.ipf_view import _as_orientation_map as _norm
+    return _norm(result)
 
 
 # ── packing ───────────────────────────────────────────────────────────────────
@@ -489,6 +493,27 @@ function readout() {
     : `IPF-${dir.toUpperCase()} · scan (${ix}, ${iy}) · no indexed orientation`;
 }
 
+function b64(bytes) {
+  let s = '';
+  const CH = 0x8000;                 // chunked: apply() blows the arg limit
+  for (let i = 0; i < bytes.length; i += CH) {
+    s += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
+  }
+  return btoa(s);
+}
+
+// The 3-D panel's point cloud does NOT live in `panel_<id>_json` — anyplotlib
+// hoists vertices and per-point colours into a separate `panel_<id>_geom` trait
+// (see _applyGeom / _loadGeom in figure_esm.js) so a camera nudge never
+// re-transmits the geometry. Writing `vertices` into the view json therefore
+// changes nothing at all; it has to go through the geom channel, which has its
+// own change observer that reloads and redraws.
+const sphGeomKey = 'panel_' + SPH_ID + '_geom';
+function liveGeom() {
+  try { return JSON.parse(H.get(sphGeomKey)); }
+  catch (e) { return JSON.parse(STATE[sphGeomKey] || '{}'); }
+}
+
 // Switching the sample direction re-colours all three panels from the packed
 // arrays — the same "re-colour every view" the app's X/Y/Z buttons do, with no
 // backend to ask.
@@ -496,24 +521,37 @@ function setDirection(d) {
   if (!D[d]) return;
   dir = d;
   const { rgb, xy, xyz } = D[d];
-
-  // MAP: repaint the RGB image. The image bytes ride the geometry channel, so
-  // push them through the layer the same way the figure built it.
   const idx = cloudIndices(d);
 
+  // TRIANGLE: point markers keep their offsets inline in the view json.
   const xj = live(xyKey);
-  const g = markerGroups(xj);
-  if (g.cloud) {
-    g.cloud.offsets = idx.map((i) => [xy[2 * i], xy[2 * i + 1]]);
-    g.cloud.facecolors = idx.map((i) => hex(rgb, i));
+  const g = markerGroups(xj).cloud;
+  if (g) {
+    g.offsets = idx.map((i) => [xy[2 * i], xy[2 * i + 1]]);
+    g.facecolors = idx.map((i) => hex(rgb, i));
   }
   H.applyUpdate(xyKey, JSON.stringify(xj));
 
+  // SPHERE: vertices float32 (N*3), point colours uint8 (N*3), z float32 (N) —
+  // the exact wire dtypes the Python side encodes.
+  const n = idx.length;
+  const v = new Float32Array(n * 3);
+  const c = new Uint8Array(n * 3);
+  const z = new Float32Array(n);
+  for (let k = 0; k < n; k++) {
+    const i = idx[k];
+    v[3 * k] = xyz[3 * i]; v[3 * k + 1] = xyz[3 * i + 1]; v[3 * k + 2] = xyz[3 * i + 2];
+    c[3 * k] = rgb[3 * i]; c[3 * k + 1] = rgb[3 * i + 1]; c[3 * k + 2] = rgb[3 * i + 2];
+    z[k] = xyz[3 * i + 2];
+  }
+  const geom = liveGeom();
+  geom.vertices_b64 = b64(new Uint8Array(v.buffer));
+  geom.point_colors_b64 = b64(c);
+  geom.z_values_b64 = b64(new Uint8Array(z.buffer));
+  H.applyUpdate(sphGeomKey, JSON.stringify(geom));
   const sj = live(sphKey);
-  sj.vertices = idx.flatMap((i) => [xyz[3 * i], xyz[3 * i + 1], xyz[3 * i + 2]]);
-  sj.colors = idx.flatMap((i) => {
-    return [rgb[3 * i] / 255, rgb[3 * i + 1] / 255, rgb[3 * i + 2] / 255];
-  });
+  sj.vertices_count = n;
+  sj._geom_rev = (sj._geom_rev || 0) + 1;
   H.applyUpdate(sphKey, JSON.stringify(sj));
 
   pushMap(rgb);
