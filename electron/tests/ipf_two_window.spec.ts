@@ -72,6 +72,37 @@ async function shotStats(page: any, buf: Buffer):
 const ipfWin = (page: any) => page.getByTestId('subwindow')
   .filter({ has: page.getByTestId(`ipf-view-toggle-${ipfId}`) }).first()
 
+/** The state of every key-overlay canvas (anyplotlib draws keys on their own
+ *  canvas at z-index 7) across all figure iframes.
+ *
+ *  Exists because "the key did not appear" has three very different causes and
+ *  a pixel diff cannot tell them apart: NO canvas means `add_key` never reached
+ *  the figure; `display:none` means the figure declares no key; `painted:0`
+ *  means the key IS declared but either the hover flag never flipped or the key
+ *  image has not decoded (anyplotlib decodes key images asynchronously and
+ *  redraws from onload, so a still-decoding key draws nothing). */
+async function keyCanvases(page: any) {
+  const out: any[] = []
+  for (const fr of page.frames()) {
+    try {
+      const r = await fr.evaluate(() => {
+        const cs = Array.from(document.querySelectorAll('canvas')) as HTMLCanvasElement[]
+        return cs.filter(c => c.style.zIndex === '7').map(c => {
+          let painted = -1
+          try {
+            const d = c.getContext('2d')!.getImageData(0, 0, c.width, c.height).data
+            painted = 0
+            for (let i = 3; i < d.length; i += 4) if (d[i] > 0) painted++
+          } catch { /* tainted or no 2-D context */ }
+          return { w: c.width, h: c.height, display: c.style.display, painted }
+        })
+      })
+      out.push(...r)
+    } catch { /* a frame can detach mid-walk */ }
+  }
+  return out
+}
+
 /** Screenshot window 2 and return its pixel stats. */
 async function shootIpf(name: string) {
   const { page } = ctx
@@ -150,11 +181,21 @@ test('2b) the IPF colour key appears on HOVER, inside the map figure', async () 
   await page.mouse.move(5, 5)                       // pointer well away
   await page.waitForTimeout(600)
   const cold = await page.screenshot({ clip: bb, path: join(SHOTS, '11-key-cold.png') })
+  console.log('[two-window] key canvases COLD =', JSON.stringify(await keyCanvases(page)))
 
-  // Into the bottom-right quadrant, where the key is pinned.
-  await page.mouse.move(bb.x + bb.width * 0.72, bb.y + bb.height * 0.75)
-  await page.waitForTimeout(900)
+  // Onto the panel. Aim at the CENTRE of the map window, not the bottom-right
+  // quadrant: `mouseenter` fires off the panel's OVERLAY canvas, which anyplotlib
+  // sizes to the IMAGE rect alone (_resizePanelDOM), not to the whole panel — so
+  // a corner-ward point sits inside the letterbox margin on any aspect ratio but
+  // the one this was eyeballed at. The key is pinned bottom-right regardless of
+  // where the pointer is, so the centre proves the same thing with no geometry
+  // assumption. Two moves: the first lands in the panel, the second keeps the
+  // pointer there and gives Chromium a second hit-test to derive enter from.
+  await page.mouse.move(bb.x + bb.width * 0.5, bb.y + bb.height * 0.55)
+  await page.mouse.move(bb.x + bb.width * 0.5, bb.y + bb.height * 0.56)
+  await page.waitForTimeout(2000)                   // + async key-image decode
   const hot = await page.screenshot({ clip: bb, path: join(SHOTS, '12-key-hover.png') })
+  console.log('[two-window] key canvases HOT =', JSON.stringify(await keyCanvases(page)))
 
   const changed = await page.evaluate(async ([a, b]) => {
     const load = (d: string) => new Promise<HTMLImageElement>(res => {
