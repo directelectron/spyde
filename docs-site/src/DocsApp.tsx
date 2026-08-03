@@ -1,14 +1,20 @@
 /**
  * DocsApp.tsx — the SpyDE docs website.
  *
- * Renders the SAME guides the in-app coachmark tour uses (imported from the
- * repo-root guides/ via the @guides alias), so the website and the app never
- * drift. Each guide is shown as a numbered, scrollable walkthrough; steps with a
- * screenshot show it, matching what the in-app tour spotlights live.
+ * Two things live here, both imported from the repo root rather than copied:
+ *
+ * - **Guides** — the SAME guides the in-app coachmark tour uses (@guides), so
+ *   the website and the app never drift. Each is a numbered, scrollable
+ *   walkthrough; steps with a screenshot show it, matching what the in-app tour
+ *   spotlights live.
+ * - **Reports** — published SpyDE reports (@reports): whole analyses of real
+ *   datasets, exported by the app's own interactive HTML export and hosted here
+ *   verbatim. The site frames them, it does not re-render them.
  */
 import React, { useEffect, useState } from 'react'
 import { GUIDES, type Guide } from '@guides/index'
 import { Markdown } from '@guides/markdown'
+import { REPORTS, type Report } from '@reports/index'
 
 /**
  * InteractiveEmbed — renders a step's self-contained interactive HTML embed in a
@@ -63,8 +69,109 @@ function InteractiveEmbed({ guideId, embed, title }:
   )
 }
 
+/**
+ * ReportView — a published report, framed.
+ *
+ * The report file is a COMPLETE self-contained page (its own article CSS, its
+ * own interactive panels), so it gets an iframe of its own rather than being
+ * pulled apart and re-styled: whatever the app exported is what the reader sees.
+ * Above it sits the catalogue entry — summary, facts, source, and the commands
+ * that rebuild it.
+ *
+ * Same graceful degradation as the guide embeds: a report .html can be large
+ * enough that it is generated rather than committed, so HEAD-probe it first and
+ * say "not built" instead of mounting a broken frame.
+ */
+function ReportView({ report }: { report: Report }) {
+  const src = `./media/reports/${report.file}`
+  const [state, setState] = useState<'checking' | 'ok' | 'missing'>('checking')
+  useEffect(() => {
+    let live = true
+    setState('checking')
+    fetch(src, { method: 'HEAD' })
+      .then((r) => { if (live) setState(r.ok ? 'ok' : 'missing') })
+      .catch(() => { if (live) setState('missing') })
+    return () => { live = false }
+  }, [src])
+
+  return (
+    <article style={styles.article} data-testid={`docs-report-${report.id}`}>
+      <h1 style={styles.h1}>{report.title}</h1>
+      <p style={styles.summary}>{report.summary}</p>
+
+      <div style={styles.facts}>
+        {report.facts.map((f) => (
+          <div key={f.label} style={styles.fact}>
+            <span style={styles.factLabel}>{f.label}</span>
+            <span style={styles.factValue}>{f.value}</span>
+          </div>
+        ))}
+      </div>
+
+      {report.source && (
+        <p style={styles.sourceLine}>
+          Data:{' '}
+          {report.source.url ? (
+            <a href={report.source.url} target="_blank" rel="noreferrer noopener"
+               style={styles.sourceLink}>
+              {report.source.label} ↗
+            </a>
+          ) : report.source.label}
+        </p>
+      )}
+
+      {state === 'missing' ? (
+        <div style={styles.notBuilt} data-testid="docs-report-missing">
+          <strong>Not in this checkout.</strong> The exported report file is
+          missing, so there is nothing to show. Rebuild it with:
+          {report.build && (
+            <pre style={styles.buildPre}>{report.build.join('\n')}</pre>
+          )}
+        </div>
+      ) : (
+        <div style={styles.reportWrap}>
+          <div style={styles.embedBadge}>
+            <span style={styles.embedDot} />
+            full report — scroll inside
+          </div>
+          {state === 'ok' && (
+            <iframe
+              src={src}
+              title={report.title}
+              // allow-scripts only: the report's own interactive panels run, but
+              // it stays cross-origin isolated from the docs site.
+              sandbox="allow-scripts"
+              style={styles.reportFrame}
+            />
+          )}
+        </div>
+      )}
+
+      {state !== 'missing' && (
+        <p style={styles.openWhole}>
+          <a href={src} target="_blank" rel="noreferrer noopener"
+             style={styles.sourceLink} data-testid="docs-report-open">
+            Open the report on its own ↗
+          </a>
+        </p>
+      )}
+    </article>
+  )
+}
+
+type Selection =
+  | { kind: 'guide'; guide: Guide }
+  | { kind: 'report'; report: Report }
+
 export function DocsApp() {
-  const [guide, setGuide] = useState<Guide>(GUIDES[0])
+  const [sel, setSel] = useState<Selection>({ kind: 'guide', guide: GUIDES[0] })
+  const guide = sel.kind === 'guide' ? sel.guide : null
+  const activeId = sel.kind === 'guide' ? sel.guide.id : sel.report.id
+  const navStyle = (id: string) => ({
+    ...styles.navItem,
+    background: id === activeId ? 'rgba(137,180,250,0.14)' : 'transparent',
+    color: id === activeId ? '#cdd6f4' : '#a6adc8',
+  })
   return (
     <div style={styles.root}>
       <aside style={styles.sidebar}>
@@ -77,19 +184,31 @@ export function DocsApp() {
           <button
             key={g.id}
             data-testid={`docs-nav-${g.id}`}
-            onClick={() => setGuide(g)}
-            style={{
-              ...styles.navItem,
-              background: g.id === guide.id ? 'rgba(137,180,250,0.14)' : 'transparent',
-              color: g.id === guide.id ? '#cdd6f4' : '#a6adc8',
-            }}
+            onClick={() => setSel({ kind: 'guide', guide: g })}
+            style={navStyle(g.id)}
           >
             {g.title}
           </button>
         ))}
+        {REPORTS.length > 0 && (
+          <>
+            <div style={{ ...styles.navLabel, marginTop: 18 }}>Reports</div>
+            {REPORTS.map((r) => (
+              <button
+                key={r.id}
+                data-testid={`docs-nav-${r.id}`}
+                onClick={() => setSel({ kind: 'report', report: r })}
+                style={navStyle(r.id)}
+              >
+                {r.title}
+              </button>
+            ))}
+          </>
+        )}
       </aside>
 
       <main style={styles.main}>
+        {guide === null ? <ReportView report={(sel as { report: Report }).report} /> : (
         <article style={styles.article}>
           <h1 style={styles.h1}>{guide.title}</h1>
           <p style={styles.summary}>{guide.summary}</p>
@@ -156,6 +275,7 @@ export function DocsApp() {
             </section>
           )}
         </article>
+        )}
       </main>
     </div>
   )
@@ -232,6 +352,44 @@ const styles: Record<string, React.CSSProperties> = {
   embedFrame: {
     display: 'block', width: '100%', height: 520, border: 'none',
     background: '#1e1e2e',
+  },
+  // Report view: a facts strip, then the exported report in its own tall frame.
+  // The frame is deliberately large — a report is a document, not a thumbnail —
+  // and scrolls internally so the reader never loses the docs chrome.
+  facts: {
+    display: 'flex', flexWrap: 'wrap', gap: 10, margin: '0 0 14px',
+  },
+  fact: {
+    display: 'flex', flexDirection: 'column', gap: 2,
+    background: 'rgba(137,180,250,0.08)', border: '1px solid #313244',
+    borderRadius: 8, padding: '8px 12px', minWidth: 120,
+  },
+  factLabel: {
+    fontSize: 10.5, letterSpacing: 0.6, textTransform: 'uppercase',
+    color: '#6c7086', fontWeight: 700,
+  },
+  factValue: { fontSize: 13.5, color: '#cdd6f4' },
+  sourceLine: { fontSize: 12.5, color: '#7f849c', margin: '0 0 18px' },
+  sourceLink: { color: ACCENT, textDecoration: 'none' },
+  reportWrap: {
+    borderRadius: 8, border: '1px solid #313244', background: '#181825',
+    overflow: 'hidden',
+  },
+  reportFrame: {
+    display: 'block', width: '100%', height: '78vh', minHeight: 560,
+    border: 'none', background: '#ffffff',
+  },
+  openWhole: { fontSize: 13, margin: '12px 0 0' },
+  notBuilt: {
+    borderRadius: 8, border: '1px solid #313244',
+    background: 'rgba(249,226,175,0.08)', padding: '14px 16px',
+    fontSize: 13.5, color: '#bac2de', lineHeight: 1.6,
+  },
+  buildPre: {
+    margin: '10px 0 0', padding: '10px 12px', borderRadius: 6,
+    background: '#11111b', border: '1px solid #313244', color: '#a6adc8',
+    fontSize: 12.5, overflowX: 'auto',
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
   },
   links: { marginTop: 18, display: 'flex', flexDirection: 'column', gap: 8 },
   linksLabel: {
