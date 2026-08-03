@@ -27,8 +27,9 @@ from spyde.data.synthetic import (
     particle_truth_at,
 )
 from spyde.drift import solve_translation
-from spyde.particles import SegmentParams, measure_frame, segment_frame
+from spyde.particles import SegmentParams, measure_frame
 from spyde.signals.particles import COL
+from spyde.tests.migrated._labels import labels_from
 
 
 @pytest.fixture(scope="module")
@@ -338,7 +339,7 @@ class TestSegmentationOnTheFixture:
     def test_finds_every_bright_particle(self, movie):
         s, gt = movie
         t = 12                                   # all nine present
-        labels = segment_frame(s.data[t], SegmentParams(min_size=25, gaussian=1.0))
+        labels = labels_from(s.data[t], min_size=25, blur=1.0)
         pos, _, present = particle_truth_at(gt, t)
         faint = np.asarray(gt["p_faint"], bool)
         want = np.flatnonzero(present & ~faint)
@@ -353,7 +354,7 @@ class TestSegmentationOnTheFixture:
         """Establishes that the sensitivity gate below is not vacuous."""
         s, gt = movie
         t = 12
-        labels = segment_frame(s.data[t], SegmentParams(min_size=25, gaussian=1.0))
+        labels = labels_from(s.data[t], min_size=25, blur=1.0)
         pos = particle_truth_at(gt, t)[0]
         faint = np.flatnonzero(np.asarray(gt["p_faint"], bool))
         hit = sum(labels[int(round(pos[i, 0])), int(round(pos[i, 1]))] != 0
@@ -365,7 +366,7 @@ class TestSegmentationOnTheFixture:
     def test_measured_radii_match_the_truth(self, movie):
         s, gt = movie
         t = 12
-        labels = segment_frame(s.data[t], SegmentParams(min_size=25, gaussian=1.0))
+        labels = labels_from(s.data[t], min_size=25, blur=1.0)
         rows, _ = measure_frame(labels, s.data[t], t=t, scale=1.0)
         pos, radii, present = particle_truth_at(gt, t)
         faint = np.asarray(gt["p_faint"], bool)

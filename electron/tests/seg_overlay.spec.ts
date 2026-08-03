@@ -13,7 +13,8 @@
  * So the frame size is the whole point of this spec. `load_test_data_particles`
  * defaults to 96×112 — BELOW the tile threshold — which is exactly why the
  * existing `segment_wizard.spec.ts` never caught this. Here it is loaded at
- * 1200² so the tiled path is the one under test.
+ * 1024² so the tiled path is the one under test (see beforeAll for why that
+ * exact number, and not something larger).
  *
  * What it proves:
  *   1. After a preview finds particles, outlines are actually DRAWN (green
@@ -24,6 +25,7 @@
  */
 import { test, expect } from '@playwright/test'
 import { mkdirSync } from 'fs'
+import { trainFromGroundTruth, windowIdOf } from './_seg'
 const {
   launchApp, backendAction, waitForSubwindowCount, sigWindow,
   countColorPixels, backendErrorLines,
@@ -40,9 +42,19 @@ test.beforeAll(async () => {
   ctx = await launchApp({ dask: true, env: { SPYDE_LOG_LEVEL: 'INFO' } })
   const { page } = ctx
   await page.waitForTimeout(1500)
-  // 1200² is ABOVE anyplotlib's 1024 tile threshold — the display path the 4k
-  // dataset uses, and the one the 96×112 default never exercises.
-  await backendAction(page, 'load_test_data_particles', { frames: 6, size: [1200, 1200] })
+  // 1024², and BOTH halves of that number matter:
+  //   * `>= 1024` on an edge is anyplotlib's tile threshold (`_GPU_TILE_MIN_EDGE`),
+  //     so this is the tiled display path — the one the raster-overlay bug lived on.
+  //   * `1024*1024` is exactly `_PREVIEW_PIXEL_BUDGET`, so the preview segments the
+  //     WHOLE frame rather than a centred crop.
+  // That second point is load-bearing here and was not obvious: `particle_movie`
+  // does NOT scale its particles with `shape` — they stay at their original
+  // 16..102 px coordinates with 3-9 px radii. At 1200² they therefore sit in a
+  // corner OUTSIDE the centred 1024² preview crop, the trained head correctly
+  // finds nothing in the crop, and the spec fails for a reason that has nothing
+  // to do with what it is testing.
+  await backendAction(page, 'load_test_data_particles',
+    { frames: 6, size: [1024, 1024] })
   await waitForSubwindowCount(page, 2, 180_000)
   await page.waitForTimeout(3000)
 })
@@ -81,6 +93,12 @@ test('outlines are drawn on a tiled frame once the preview lands', async () => {
   await page.screenshot({ path: `${SHOTS}/01-before-caret.png` })
 
   await openCaret()
+  // There is no result until something is trained — the classical engine that
+  // used to preview on open is gone. Labels come from the fixture's stamped
+  // ground truth via the `seg_autolabel` test door; Train is the real thing.
+  // See `_seg.ts` for why this spec does not hand-place brush strokes.
+  const windowId = await windowIdOf(sigWindow(page))
+  await trainFromGroundTruth(page, windowId)
   await expect.poll(previewCount, {
     timeout: 180_000, message: 'seg_preview never reached the caret',
   }).toBeGreaterThan(0)

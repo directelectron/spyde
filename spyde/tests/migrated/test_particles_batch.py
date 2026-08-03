@@ -6,11 +6,12 @@ The contract this file exists to pin, in the order it matters:
 **1. A frame's particles must not change because it was computed in parallel.**
 Everything else here is throughput, and throughput that alters the answer is
 worthless. Asserted with ``array_equal`` against the serial loop, never
-``allclose`` — the per-frame work is deterministic and device-free on the
-classical engine, so exact equality is the honest bar. (The scribble engine adds
-a device, and a CUDA frame and a CPU frame differ in the last bits of a float32
-convolution; that is why the lane policy is what it is and why the GPU/CPU
-agreement gate lives in ``test_particles_gpu.py``, in a subprocess.)
+``allclose``. The reference is the SAME resolved engine run one frame at a time
+on this thread, so the only thing that differs between it and the run is the
+dispatch, and exact equality is the honest bar. (Across DEVICES it would not be:
+a CUDA frame and a CPU frame differ in the last bits of a float32 convolution,
+which is why the GPU/CPU agreement gate lives in ``test_particles_gpu.py``, in a
+subprocess.)
 
 **2. A cancelled run still spans the movie.** The CSR store is built from these
 lists, so a short list is a shorter movie, not a stopped one.
@@ -40,7 +41,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from spyde.particles import SegmentParams, measure_frame, segment_frame
+from spyde.particles import measure_frame
 from spyde.particles.batch import (
     EngineSpec,
     PARTICLE_GPU_LANE_DEFAULT,
@@ -51,7 +52,7 @@ from spyde.particles.batch import (
 )
 from spyde.signals.particles import COL, N_COLUMNS
 
-PARAMS = dict(min_size=10, sensitivity=0.6)
+PARAMS = dict(min_size=10)
 
 
 def _disc(shape, cy, cx, r):
@@ -76,11 +77,19 @@ def _movie(n=7, h=90, w=110):
     return out
 
 
-def _serial(data, scale=1.0):
-    p = SegmentParams(**PARAMS)
+def _serial(data, spec, scale=1.0):
+    """The reference: the SAME engine, one frame at a time on this thread.
+
+    It used to call the classical ``segment_frame`` directly. Comparing against
+    the dispatcher's own resolved engine is both what survives that engine's
+    removal and a sharper statement of contract 1 — the answer may not depend on
+    how it was computed, so the only thing allowed to differ between reference
+    and run is the dispatch.
+    """
+    engine, _dev = resolve_engine(spec)
     rows, contours = [], []
     for t in range(data.shape[0]):
-        labels = segment_frame(data[t], p)
+        labels = engine(data[t])
         r, c = measure_frame(labels, data[t], t=t, scale=scale)
         rows.append(r)
         contours.append(c)
@@ -93,13 +102,40 @@ def movie():
 
 
 @pytest.fixture(scope="module")
-def reference(movie):
-    return _serial(movie)
+def spec(movie, tmp_path_factory):
+    """A REAL trained scribble spec — the only engine there is.
+
+    Trained once for the module on frame 0's discs: the disc interiors are the
+    particle class, the corners are background. The head crosses to the workers
+    as a FILE (see ``EngineSpec``), so this is also the shape a real run has.
+
+    CPU explicitly: torch-CUDA work segfaults under the pytest process on
+    Windows (CLAUDE.md).
+    """
+    from spyde.particles import (FeatureSpec, LabelStore, ScribbleClassifier,
+                                 default_classes, select_device)
+
+    frame = movie[0]
+    h, w = frame.shape
+    store = LabelStore(frame_shape=(h, w), classes=default_classes())
+    for cy, cx, r in ((25, 30, 8), (60, 70, 6), (25, 85, 5)):
+        store.paint_disc(0, cy, cx, max(1.5, r * 0.5), 0)
+    background = np.zeros((h, w), bool)
+    background[:10, :] = True
+    background[-10:, :] = True
+    background[:, :10] = True
+    store.paint(0, background, 1)
+
+    clf = ScribbleClassifier(FeatureSpec(), device=select_device("cpu"), seed=0)
+    clf.fit(store, {0: frame})
+    path = str(tmp_path_factory.mktemp("seg-batch") / "head.npz")
+    clf.save(path)
+    return EngineSpec(method="scribble", params=dict(PARAMS), model_path=path)
 
 
-@pytest.fixture
-def spec():
-    return EngineSpec(method="classical", params=dict(PARAMS))
+@pytest.fixture(scope="module")
+def reference(movie, spec):
+    return _serial(movie, spec)
 
 
 class TestParallelIsBitIdentical:
@@ -145,7 +181,7 @@ class TestParallelIsBitIdentical:
         """A calibrated axis must not be applied twice by the parallel path."""
         rows, _c, _d = segment_movie(movie, spec, n_frames=len(movie),
                                      client=None, scale=2.5)
-        ref, _ = _serial(movie, scale=2.5)
+        ref, _ = _serial(movie, spec, scale=2.5)
         for t, (r, e) in enumerate(zip(rows, ref)):
             assert np.array_equal(r, e), f"frame {t}"
 
@@ -317,16 +353,24 @@ class TestNoRechunkShuffle:
 
 
 class TestEngineSpec:
-    def test_classical_needs_no_model(self, spec):
+    def test_the_resolved_engine_labels_a_frame(self, movie, spec):
         engine, dev = resolve_engine(spec)
-        assert dev == "cpu"
-        labels = engine(_movie(1)[0])
+        assert dev  # a device string, whichever lane this worker is on
+        labels = engine(movie[0])
         assert labels.dtype == np.int32
+        assert labels.max() > 0, "the trained head found nothing at all"
 
-    def test_classical_engine_matches_segment_frame(self, movie, spec):
-        engine, _dev = resolve_engine(spec)
-        assert np.array_equal(engine(movie[0]),
-                              segment_frame(movie[0], SegmentParams(**PARAMS)))
+    def test_resolving_twice_gives_the_same_answer(self, movie, spec):
+        """The per-worker engine cache must not change what a frame segments to."""
+        first, _ = resolve_engine(spec)
+        second, _ = resolve_engine(spec)
+        assert np.array_equal(first(movie[0]), second(movie[0]))
+
+    def test_there_is_no_classical_engine_any_more(self):
+        """Deleted, not deprecated — asking for it must fail loudly rather than
+        silently falling back to something that behaves differently."""
+        with pytest.raises(ValueError, match="no engine for method"):
+            resolve_engine(EngineSpec(method="classical", params=dict(PARAMS)))
 
     def test_scribble_without_a_model_says_so(self):
         with pytest.raises(ValueError, match="model_path"):
@@ -339,7 +383,17 @@ class TestEngineSpec:
     def test_segment_params_round_trip(self, spec):
         p = spec.segment_params()
         assert p.min_size == PARAMS["min_size"]
-        assert p.sensitivity == PARAMS["sensitivity"]
+        assert p.watershed is True                       # the dataclass default
+
+    def test_a_stale_classical_param_does_not_reach_SegmentParams(self):
+        """A result saved before the classical engine was removed carries
+        ``sensitivity`` and friends in its provenance. Re-running from it must
+        not explode — the action drops unknown keys, so the spec never sees
+        them; this pins that the dataclass would indeed have refused."""
+        from spyde.particles import SegmentParams
+
+        with pytest.raises(TypeError):
+            SegmentParams(sensitivity=0.6, min_size=10)
 
     def test_the_spec_pickles(self, spec):
         """It crosses to a worker process; a spec that only cloudpickles would
@@ -351,27 +405,50 @@ class TestEngineSpec:
 class TestLanePolicy:
     """Contract 4 — one value, given to both halves."""
 
-    def test_the_worker_gate_and_the_lane_split_get_the_same_default(
-            self, monkeypatch):
+    @pytest.mark.parametrize("setting", [None, "one", "2", "4", "8", "all"])
+    def test_the_worker_gate_and_the_lane_split_agree(self, setting,
+                                                      monkeypatch):
+        """They must be given the SAME mode, whatever the shared setting says.
+
+        `split_workers_for_gpu`'s docstring records the real bug this prevents:
+        a lane split sized for one GPU worker while every worker actually
+        submitted CUDA, which is all-workers contention wearing a lane's
+        clothes.
+
+        This used to assert that `_gpu_allowed` DELEGATES to
+        `_gpu_task_allowed` with `PARTICLE_GPU_LANE_DEFAULT`. It no longer
+        delegates, on purpose: segmentation caps the lane at
+        `PARTICLE_GPU_LANE_MAX` regardless of the setting (a torch head plus a
+        band sized against free VRAM does not tolerate what the numba kernels
+        do), and reaching that through the shared helper would have meant
+        mutating a process-global env var around a call made from several
+        worker threads. So the AGREEMENT is asserted directly, which is what
+        the test was ever about.
+        """
         from spyde.particles import batch as batch_mod
 
-        seen = {}
+        monkeypatch.delenv("SPYDE_FV_GPU", raising=False)
+        monkeypatch.delenv("SPYDE_SEG_GPU_LANE_MAX", raising=False)
+        if setting is not None:
+            monkeypatch.setenv("SPYDE_FV_GPU", setting)
 
-        def _fake_allowed(default_mode="one"):
-            seen["gate"] = default_mode
-            return False
+        mode = batch_mod._clamped_lane_mode()
+        n_lane = 0 if mode == "off" else (1 if mode == "one" else int(mode))
+        assert n_lane <= batch_mod.PARTICLE_GPU_LANE_MAX
 
-        def _fake_split(client, default_mode="one"):
-            seen["split"] = default_mode
-            return [], []
+        # The gate, per worker name, must admit exactly the lane's workers.
+        class _W:
+            def __init__(self, name): self.name = name
 
-        monkeypatch.setattr(
-            "spyde.actions.find_vectors.gpu_runtime._gpu_task_allowed",
-            _fake_allowed)
-        monkeypatch.setattr("spyde.compute_dispatch.split_workers_for_gpu",
-                            _fake_split)
-        batch_mod._gpu_allowed()
-        assert seen["gate"] == PARTICLE_GPU_LANE_DEFAULT
+        import spyde.particles.batch as bm
+        for name in ("0", "1", "2", "3", "9"):
+            monkeypatch.setattr("distributed.get_worker",
+                                lambda n=name: _W(n), raising=False)
+            allowed = bm._gpu_allowed()
+            expect = 1 <= int(name) <= n_lane
+            assert allowed == expect, (
+                f"setting={setting!r} mode={mode!r}: worker {name} gate says "
+                f"{allowed}, the lane admits {expect}")
 
     def test_the_default_is_a_value_the_shared_policy_understands(self):
         """``SPYDE_FV_GPU`` accepts one/N/all/off; anything else silently

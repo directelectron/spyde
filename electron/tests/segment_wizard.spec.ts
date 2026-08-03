@@ -3,23 +3,25 @@
  * bundled synthetic particle movie.
  *
  * What this actually proves (headless tests + tsc cannot see any of it):
- *   1. The caret opens from the real toolbar button and the backend previews
- *      the DISPLAYED frame — the count line names a number of particles.
- *   2. The DEFAULT face is calm: one slider, one count, one button, one
- *      disclosure. Everything else is behind `▸ Advanced`, which is collapsed
- *      on open and remembers its state.
+ *   1. The caret opens UNTRAINED and says so. There is one engine now — the
+ *      classical threshold pipeline was deleted — so an unfitted classifier has
+ *      no opinion, and the caret's primary content is the instruction rather
+ *      than a result. NO tab row, no sensitivity slider.
+ *   2. The DEFAULT face is calm: two nm sliders, the class list, Train, the
+ *      count, the run button, one disclosure. Everything else is behind
+ *      `▸ Advanced`, which is collapsed on open and remembers its state.
  *   3. The floating brush strip renders NEXT TO THE PLOT (plan B0) with one
- *      swatch per backend class, and is not clipped by the window.
+ *      swatch per backend class, and is up from the start — painting is the
+ *      only way to teach the only engine.
  *   4. The size histogram (inside Advanced) has bars, not an empty box.
  *   5. `min_size` = 0 is FLOORED by the backend and the caret shows the
  *      EFFECTIVE value, not the 0 the user typed (plan §0.9 — at 0 the split
  *      returns background speckle as particles). Both the field and the warning
  *      live inside Advanced.
  *   6. "Find in all frames" opens a real particle result window.
- *   7. A brush stroke reaches `seg_paint` and the per-class labelled-pixel
- *      counts in the caret update — the counts are how a user notices an
- *      under-trained class, so a count stuck at 0 is a real failure. The class
- *      list is the SCRIBBLE tab's business and is not shown on Classical.
+ *   7. A brush stroke reaches `seg_paint` and moves the per-class labelled-pixel
+ *      counts — and moves ONLY the painted class, which is how the "I can only
+ *      scribble one colour" bug would show.
  *   8. The BOUNDARY class is offered, is paintable, and painting it flips the
  *      split route — the caret says `watershed split` before and `seam split`
  *      after, which is the only thing on screen that distinguishes a 0.33 s
@@ -33,6 +35,7 @@
  */
 import { test, expect } from '@playwright/test'
 import { mkdirSync } from 'fs'
+import { trainFromGroundTruth, windowIdOf } from './_seg'
 const {
   launchApp, backendAction, waitForSubwindowCount, sigWindow, backendErrorLines,
 } = require('./_harness.cjs')
@@ -150,7 +153,7 @@ async function expectCaretFits() {
     `${where}: runs past the RIGHT edge`).toBe(true)
 }
 
-test('caret opens, previews the displayed frame, and shows the brush strip', async () => {
+test('the caret opens UNTRAINED: an instruction, not a result', async () => {
   const { page } = ctx
   await page.screenshot({ path: `${SHOTS}/01-movie-loaded.png` })
 
@@ -161,80 +164,53 @@ test('caret opens, previews the displayed frame, and shows the brush strip', asy
 
   await page.screenshot({ path: `${SHOTS}/02-caret-open.png` })
 
-  // The preview is a real backend round trip (seg_open → worker → seg_preview),
-  // so wait for the count line to stop saying "no preview yet".
-  await expect.poll(
-    () => page.getByTestId('seg-preview-stats').textContent(),
-    { timeout: 60_000, message: 'seg_preview never reached the caret' },
-  ).toMatch(/\d+ particles? on this frame/)
+  // THE headline behaviour change. The caret used to open on Classical and
+  // show a count within a second; on real low-contrast data that count was the
+  // support film shattered into thousands of pieces, which reads as progress.
+  // An untrained classifier has no opinion, and saying so is the honest state.
+  await expect(page.getByTestId('seg-scribble-note')).toBeVisible()
+  await expect(page.getByTestId('seg-scribble-note')).toContainText('FAINT')
+  await expect(page.getByTestId('seg-preview-stats')).toHaveText(/no preview yet/)
+  await expect(page.getByTestId('seg-run'),
+    'Find in all frames is live before anything is trained').toBeDisabled()
 
-  // ── the DEFAULT face is the whole point of the redesign ──────────────────
-  // Advanced is collapsed on open, and everything it holds is genuinely absent
-  // from the DOM (not merely visually quiet).
+  // NO TAB ROW. One engine ships and one is unimplemented; that is not a choice.
+  for (const gone of ['seg-tab-classical', 'seg-tab-scribble', 'seg-tab-prompt',
+    'seg-sensitivity', 'seg-prompt-note']) {
+    await expect(page.getByTestId(gone),
+      `${gone} belongs to the deleted classical/tabbed caret`).toHaveCount(0)
+  }
+
+  // Advanced is collapsed on open and everything it holds is genuinely absent
+  // from the DOM, not merely visually quiet.
   await expect(page.getByTestId('seg-advanced-toggle')).toHaveAttribute('aria-expanded', 'false')
   await expect(page.getByTestId('seg-advanced')).toHaveCount(0)
   for (const hidden of [
     'seg-min-size', 'seg-max-size', 'seg-watershed', 'seg-store-masks',
-    'seg-track', 'seg-threshold', 'seg-gaussian', 'seg-rb-kernel',
-    'seg-local-size', 'seg-min-separation', 'seg-marker-smooth', 'seg-max-dist',
-    'seg-invert', 'seg-clear-border', 'seg-histogram', 'seg-counts',
+    'seg-track', 'seg-min-separation', 'seg-marker-smooth', 'seg-max-dist',
+    'seg-clear-border', 'seg-histogram', 'seg-counts',
     'seg-commit', 'seg-min-score',
   ]) {
     await expect(page.getByTestId(hidden),
       `${hidden} must be behind Advanced, not on the default face`).toHaveCount(0)
   }
-  // THREE sliders and the button, nothing else besides the tabs, ✕ and the
-  // disclosure. ✕, 3 tabs, sensitivity, merge-nm, min-nm, Find-in-all-frames,
-  // Advanced = 9. This count is the guard against the face refilling one
-  // reasonable-looking addition at a time (plan §0.9a), so it is exact on
-  // purpose — if you add a control here, justify it in the diff.
+  // ✕, merge-nm, min-nm, the 4 class rows, Train, Find-in-all-frames,
+  // Advanced = 10. Exact on purpose: this is the guard against the face
+  // refilling one reasonable-looking addition at a time (plan §0.9a). If you
+  // add a control here, justify it in the diff.
   const primaryControls = await page.getByTestId('segment-wizard')
     .locator('input, select, textarea, button').count()
-  expect(primaryControls, 'the default face grew a control back').toBe(9)
-  await expect(page.getByTestId('seg-sensitivity')).toBeVisible()
-  // The two PHYSICAL controls, the ones that are the same on every engine.
+  expect(primaryControls, 'the default face grew a control back').toBe(10)
   await expect(page.getByTestId('seg-merge-nm')).toBeVisible()
   await expect(page.getByTestId('seg-min-nm')).toBeVisible()
   await expect(page.getByTestId('seg-run')).toHaveText('Find in all frames')
 
-  await page.getByTestId('segment-wizard').screenshot({ path: `${SHOTS}/03-caret-detail.png` })
-
-  // ── Advanced still holds everything, and it still works ──────────────────
-  await setAdvanced(true)
-  // An EMPTY histogram is the classic "it rendered but says nothing" failure —
-  // assert on the bar count the component publishes, not on pixels.
-  await expect.poll(
-    async () => Number(await page.getByTestId('seg-histogram').getAttribute('data-nonzero')),
-    { timeout: 30_000, message: 'size histogram has no populated bins' },
-  ).toBeGreaterThan(0)
-  await expect(page.getByTestId('seg-min-size')).toBeVisible()
-  await expect(page.getByTestId('seg-commit')).toBeVisible()
-  await page.getByTestId('segment-wizard').screenshot({ path: `${SHOTS}/03b-caret-advanced.png` })
-  // Expanded, IN PLACE: Advanced makes the caret tall enough that the toolbar
-  // re-places it beside the window. It must still fit inside the MDI area — the
-  // caret box has no scroller of its own, so anything past the bottom is simply
-  // unreachable.
-  await page.screenshot({ path: `${SHOTS}/03c-advanced-full.png` })
-  await expectCaretFits()
-  await setAdvanced(false)
-
-  // The brush strip belongs to the SCRIBBLE tab only. It floats over the image,
-  // so on Classical — where there is nothing to paint — it would be chrome
-  // covering the data for no reason.
-  await expect(page.getByTestId('seg-class-strip'),
-    'the brush strip is showing on Classical, where there is nothing to paint',
-  ).toHaveCount(0)
-
-  // The class list carries NAMES + per-class pixel counts (the caret is the
-  // authoritative list; the strip is swatches only) — also Scribble's business.
-  await expect(page.getByTestId('seg-class-list')).toHaveCount(0)
-
-  await page.getByTestId('seg-tab-scribble').click()
-  await expect(page.getByTestId('seg-class-0')).toBeVisible({ timeout: 30_000 })
+  // The class list and the strip are up from the START now — painting is the
+  // only way to teach the only engine, so gating them behind a tab (as the
+  // Scribble tab used to) would hide the one thing the user must do first.
+  await expect(page.getByTestId('seg-class-0')).toBeVisible()
   await expect(page.getByTestId('seg-class-pixels-0')).toBeVisible()
-  // ...and NOW the strip appears, next to the plot rather than in the caret.
-  const strip = page.getByTestId('seg-class-strip')
-  await expect(strip).toBeVisible({ timeout: 30_000 })
+  await expect(page.getByTestId('seg-class-strip')).toBeVisible({ timeout: 30_000 })
   await expect(page.getByTestId('seg-strip-class-0')).toBeVisible()
   await expect(page.getByTestId('seg-strip-brush')).toBeVisible()
   await expect(page.getByTestId('seg-strip-eraser')).toBeVisible()
@@ -242,27 +218,86 @@ test('caret opens, previews the displayed frame, and shows the brush strip', asy
   // disabled control is noise on a face this redesign just emptied out.
   await expect(page.getByTestId('seg-add-class')).toHaveCount(0)
 
-  await page.getByTestId('seg-tab-classical').click()
-  await expect(page.getByTestId('seg-sensitivity')).toBeVisible({ timeout: 30_000 })
-  await expect(page.getByTestId('seg-class-strip')).toHaveCount(0)
-
-  await page.screenshot({ path: `${SHOTS}/04-preview.png` })
+  await page.getByTestId('segment-wizard').screenshot({ path: `${SHOTS}/03-caret-untrained.png` })
+  await page.screenshot({ path: `${SHOTS}/04-untrained-full.png` })
   ctx.assertNoJsErrors()
 })
 
-test('sensitivity re-previews and min_size=0 is floored to the EFFECTIVE value', async () => {
+test('a REAL Shift+drag on the figure paints — the widget, not a fake event', async () => {
   const { page } = ctx
-  const stats = page.getByTestId('seg-preview-stats')
 
-  // The COUNT alone is not a reliable "did it re-run" signal — two sensitivities
-  // can legitimately find the same number of particles — so poll the caret's own
-  // monotonic preview counter instead of diffing the label text.
-  const seq0 = Number(await stats.getAttribute('data-seq'))
-  await page.getByTestId('seg-sensitivity').fill('0.85')
-  await expect.poll(async () => Number(await stats.getAttribute('data-seq')), {
-    timeout: 60_000, message: 'dragging sensitivity did not re-preview',
-  }).toBeGreaterThan(seq0)
-  await page.screenshot({ path: `${SHOTS}/05-sensitivity.png` })
+  // THE regression this exists for, and the one every other test here missed.
+  // The brush widget was armed only by `seg_set_method("scribble")`, which the
+  // caret sent when you clicked the Scribble tab. Deleting the classical engine
+  // deleted the tab row, nothing sent that verb, and the caret opened telling
+  // you to paint with nothing to paint with — "I can't scribble".
+  //
+  // Every test stayed green through it because none of them touched the widget:
+  // the paint test below dispatches a synthetic `spyde:figure_event` straight at
+  // `seg_paint`, and the python helpers called `seg_set_method` themselves. So
+  // this one drives the actual DOM — Shift held, mouse down, move, up, over the
+  // figure canvas — which is the only path a user has.
+  const sig = sigWindow(page)
+  const frame = sig.locator('iframe').first()
+  const box = await frame.boundingBox()
+  expect(box, 'no figure iframe to paint on').toBeTruthy()
+
+  const before = await page.getByTestId('seg-class-pixels-0').textContent()
+  expect(before, 'expected a fresh caret with nothing painted').toMatch(/^!?\s*0$/)
+
+  // Shift+drag: plan B0 keeps pan/zoom on the BARE drag, so the modifier is
+  // what distinguishes painting from navigating and has to be held throughout.
+  const y = box!.y + box!.height * 0.5
+  await page.keyboard.down('Shift')
+  await page.mouse.move(box!.x + box!.width * 0.35, y)
+  await page.mouse.down()
+  for (let i = 1; i <= 8; i++) {
+    await page.mouse.move(box!.x + box!.width * (0.35 + 0.03 * i), y)
+    await page.waitForTimeout(30)
+  }
+  await page.mouse.up()
+  await page.keyboard.up('Shift')
+
+  await expect.poll(() => page.getByTestId('seg-class-pixels-0').textContent(), {
+    timeout: 30_000,
+    message: 'a real Shift+drag over the figure painted nothing — either no '
+      + 'brush is armed, or its strokes are not reaching the label store',
+  }).not.toMatch(/^!?\s*0$/)
+
+  await page.getByTestId('segment-wizard').screenshot({
+    path: `${SHOTS}/04b-real-brush.png` })
+  await sig.screenshot({ path: `${SHOTS}/04c-real-brush-figure.png` })
+  ctx.assertNoJsErrors()
+})
+
+/**
+ * Everything past this point needs a TRAINED head, because that is now the only
+ * way to get a preview at all. Painting for real — a brush event reaching
+ * `seg_paint`, the per-class counts moving, the eraser, the boundary class — is
+ * still tested for real further down; this one gets the caret into the state
+ * the rest of the file assumes, using the `seg_autolabel` test door.
+ */
+test('autolabel + Train produces a live preview', async () => {
+  const { page } = ctx
+  const windowId = await windowIdOf(srcWindow())
+  expect(Number.isFinite(windowId), 'no data-window-id on the source window')
+    .toBe(true)
+
+  await trainFromGroundTruth(page, windowId)
+
+  // The engine's own report, and the count it now has an opinion about.
+  await expect(page.getByTestId('seg-trained-note')).toContainText(/Trained on \d+ px/)
+  await expect(page.getByTestId('seg-scribble-note')).toHaveCount(0)
+  await expect(page.getByTestId('seg-run')).toBeEnabled()
+  await expect(page.getByTestId('seg-train')).toHaveText('Re-train')
+
+  await page.getByTestId('segment-wizard').screenshot({ path: `${SHOTS}/05-trained.png` })
+  await page.screenshot({ path: `${SHOTS}/05b-trained-full.png` })
+  ctx.assertNoJsErrors()
+})
+
+test('min_size=0 is floored to the EFFECTIVE value', async () => {
+  const { page } = ctx
 
   // min_size=0 is the footgun plan §0.9 measured (33 instances where 9 are
   // real). The backend floors it to 10 and the caret must show 10. Both the
@@ -323,17 +358,6 @@ test('the nm face filters and the demoted Confidence slider all re-preview', asy
 
   await page.getByTestId('segment-wizard').screenshot({ path: `${SHOTS}/06b-nm-filters.png` })
 
-  // Both are engine-independent, so unlike sensitivity they stay on the face
-  // when the engine changes. (Scribble is untrained here, which does not matter
-  // — this is about which controls render.)
-  await page.getByTestId('seg-tab-scribble').click()
-  await expect(page.getByTestId('seg-merge-nm')).toBeVisible()
-  await expect(page.getByTestId('seg-min-nm')).toBeVisible()
-  await expect(page.getByTestId('seg-sensitivity'),
-    'sensitivity is classical-only — the scribble engine never reads it').toHaveCount(0)
-  await page.getByTestId('seg-tab-classical').click()
-  await expect(page.getByTestId('seg-sensitivity')).toBeVisible({ timeout: 30_000 })
-
   // ── Advanced: Confidence is demoted, NOT deleted (plan §0.9a) ─────────────
   await setAdvanced(true)
   const score = page.getByTestId('seg-min-score')
@@ -387,11 +411,18 @@ test('a brush stroke reaches seg_paint and the class pixel counts update', async
   const { page } = ctx
 
   await raiseSource()
-  await page.getByTestId('seg-tab-scribble').click()
-  await expect(page.getByTestId('seg-scribble-note')).toBeVisible()
 
-  const pixels0 = page.getByTestId('seg-class-pixels-0')
-  expect(await pixels0.textContent()).toContain('0')
+  // The head is already trained by the autolabel step above, so this asserts
+  // that a stroke MOVES the counts rather than that it lifts them off zero —
+  // painting more examples onto an existing label set is the normal case
+  // anyway (scrub, find a missed particle, dab it, re-train).
+
+  const readCount = async (id: number) => {
+    const t = await page.getByTestId(`seg-class-pixels-${id}`).textContent()
+    return Number((t ?? '').replace(/[^\d]/g, '')) || 0
+  }
+  const before0 = await readCount(0)
+  const before1 = await readCount(1)
 
   // Fatten the brush first, then paint with the strip's ACTIVE class — i.e.
   // drive the same state the strip owns, not a synthetic payload.
@@ -416,17 +447,28 @@ test('a brush stroke reaches seg_paint and the class pixel counts update', async
   await expect(page.getByTestId('seg-class-0')).toHaveAttribute('data-active', 'false')
 
   await stroke(20, 20, 90)                       // class 1 (support film)
-  await expect.poll(() => page.getByTestId('seg-class-pixels-1').textContent(), {
+  await expect.poll(() => readCount(1), {
     timeout: 30_000, message: 'seg_paint never updated the class pixel counts',
-  }).not.toMatch(/^!?\s*0$/)
+  }).toBeGreaterThan(before1)
+
+  // Snapshot class 1 AFTER its own stroke, so the next assertion can prove the
+  // class-0 stroke left it alone.
+  const film = await readCount(1)
 
   await page.getByTestId('seg-strip-class-0').click()
   await expect(page.getByTestId('seg-class-0')).toHaveAttribute('data-active', 'true')
   await expect(page.getByTestId('seg-class-1')).toHaveAttribute('data-active', 'false')
   await stroke(48, 30, 80)                       // class 0 (particle)
-  await expect.poll(() => pixels0.textContent(), {
+  await expect.poll(() => readCount(0), {
     timeout: 30_000, message: 'painting class 0 did not update its count',
-  }).not.toMatch(/^!?\s*0$/)
+  }).toBeGreaterThan(before0)
+  // ...and class 1 must not have GROWN. It may shrink — a pixel carries one
+  // label, so painting class 0 over previously-film pixels correctly moves them
+  // — but a class-0 stroke that ADDS to class 1 means the strip's selection
+  // never reached the rasteriser, which is the "I can only scribble one colour"
+  // bug that an increases-monotonically check on class 0 alone would miss.
+  expect(await readCount(1),
+    'the class-0 stroke added pixels to class 1').toBeLessThanOrEqual(film)
 
   await page.getByTestId('segment-wizard').screenshot({ path: `${SHOTS}/08-painted.png` })
   // A close-up of the class list on its own: the per-class counts and the
@@ -476,17 +518,16 @@ test('Train fits the scribble classifier and the caret reports it', async () => 
   await setAdvanced(true)
   await expect(page.getByTestId('seg-min-size')).toBeVisible()
   await expect(page.getByTestId('seg-track')).toBeVisible()
-  // The classical MASK knobs are absent here, and not just to save room: the
-  // scribble engine hands split_instances a probability map thresholded at 0.5
-  // and never reads them (spyde/particles/classical.py::split_instances). Six
-  // knobs that do nothing is the overload complaint in miniature.
+  // The classical MASK knobs are gone from the app entirely, not merely hidden
+  // — the engine that read them was deleted. Asserted here because Advanced is
+  // where they used to live and where a revert would put them back.
   for (const dead of ['seg-threshold', 'seg-gaussian', 'seg-rb-kernel',
     'seg-local-size', 'seg-invert', 'seg-sensitivity']) {
     await expect(page.getByTestId(dead),
-      `${dead} does not affect the scribble engine and must not be shown`).toHaveCount(0)
+      `${dead} belongs to the deleted classical engine`).toHaveCount(0)
   }
-  // Scribble's Advanced is the TALLEST state the caret has (class list + train
-  // report + parameters); if anything is going to run off the bottom, it is this.
+  // Advanced + the class list + the train report is the TALLEST state the caret
+  // has; if anything is going to run off the bottom, it is this.
   await expectCaretFits()
   await page.getByTestId('segment-wizard').screenshot({ path: `${SHOTS}/12-scribble-advanced.png` })
   await setAdvanced(false)

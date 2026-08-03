@@ -18,14 +18,12 @@ import numpy as np
 import pytest
 
 from spyde.particles import (
-    THRESHOLD_METHODS,
     SegmentParams,
     measure_frame,
-    segment_frame,
     split_instances,
-    threshold_mask,
 )
 from spyde.signals.particles import COL, COLUMNS, N_COLUMNS, SpyDEParticles
+from spyde.tests.migrated._labels import labels_from
 
 
 # ── synthetic scenes ─────────────────────────────────────────────────────────
@@ -52,73 +50,47 @@ def _touching(h=80, w=120):
 
 
 class TestSegmentParams:
-    def test_rejects_unknown_threshold(self):
-        with pytest.raises(ValueError, match="unknown threshold"):
-            SegmentParams(threshold="magic")
+    """What is left to validate once detection is not this dataclass's job.
 
-    def test_rejects_sensitivity_out_of_range(self):
-        with pytest.raises(ValueError, match="sensitivity must be in 0..1"):
-            SegmentParams(sensitivity=1.5)
+    It used to guard ``threshold`` / ``sensitivity`` / ``local_size``; all three
+    went with the classical engine. The remaining fields are the split and the
+    size filter, and they still have values that make no sense.
+    """
 
-    def test_rejects_even_local_size_for_local_methods(self):
-        """Bumping it silently would make the caret disagree with what ran."""
-        with pytest.raises(ValueError, match="local_size must be odd"):
-            SegmentParams(threshold="sauvola", local_size=30)
-        SegmentParams(threshold="otsu", local_size=30)   # global: irrelevant
+    def test_rejects_negative_size_bounds(self):
+        with pytest.raises(ValueError, match="size bounds must be"):
+            SegmentParams(min_size=-1)
+        with pytest.raises(ValueError, match="size bounds must be"):
+            SegmentParams(max_size=-5)
 
+    def test_rejects_a_sub_pixel_marker_separation(self):
+        """0 would ask peak_local_max for markers closer than one pixel."""
+        with pytest.raises(ValueError, match="min_separation must be"):
+            SegmentParams(min_separation=0)
 
-class TestThresholding:
-    @pytest.mark.parametrize("method", THRESHOLD_METHODS)
-    def test_every_method_runs_and_finds_the_discs(self, method):
-        # Blurred, so the histogram has real structure. A hard-edged synthetic
-        # field is essentially two delta spikes, which several legitimate methods
-        # cannot work with (see test_minimum_reports_actionably_on_a_spiky_field).
-        from scipy.ndimage import gaussian_filter
-        img = gaussian_filter(_field(), 2.0)
-        p = SegmentParams(threshold=method, local_size=31)
-        mask = threshold_mask(img.astype(np.float32), p)
-        assert mask.shape == img.shape and mask.dtype == bool
-        # All four discs are bright and large; any sane threshold finds signal.
-        assert mask.sum() > 100, f"{method} found almost nothing"
+    def test_the_defaults_are_constructible(self):
+        p = SegmentParams()
+        assert p.watershed is True and p.min_size == 20
 
-    def test_minimum_reports_actionably_on_a_spiky_field(self):
-        """skimage raises a bare RuntimeError; the user needs to know what to do."""
-        img = _field().astype(np.float32)      # hard edges → one-spike histogram
-        with pytest.raises(ValueError, match="requires a clearly bimodal"):
-            threshold_mask(img, SegmentParams(threshold="minimum"))
-
-    def test_sensitivity_half_is_exactly_the_plain_method(self):
-        """0.5 must be a no-op offset, or the ParticleSpy parity gate is meaningless."""
-        from skimage.filters import threshold_otsu
-        img = _field().astype(np.float32)
-        mask = threshold_mask(img, SegmentParams(threshold="otsu", sensitivity=0.5))
-        assert np.array_equal(mask, img > threshold_otsu(img))
-
-    def test_higher_sensitivity_never_shrinks_the_mask(self):
-        img = _field(amp=0.4, bg=0.1).astype(np.float32)
-        prev = -1
-        for s in (0.1, 0.3, 0.5, 0.7, 0.9):
-            n = int(threshold_mask(img, SegmentParams(sensitivity=s)).sum())
-            assert n >= prev, f"sensitivity {s} shrank the mask ({n} < {prev})"
-            prev = n
-
-    def test_invert_finds_dark_particles(self):
-        img = 1.0 - _field(amp=1.0, bg=0.05)        # dark discs on bright ground
-        labels = segment_frame(img, SegmentParams(invert=True, min_size=30))
-        assert labels.max() == 4, f"found {labels.max()} dark particles, expected 4"
+    def test_a_deleted_classical_param_is_refused(self):
+        """`particles_action._coerce` drops unknown keys before they get here,
+        so this is the backstop rather than the front line — but a stale
+        provenance dict must never silently construct a DIFFERENT segmentation."""
+        with pytest.raises(TypeError):
+            SegmentParams(sensitivity=0.9)
 
 
 class TestSplitInstances:
     def test_separates_touching_discs(self):
         img = _touching()
-        labels = segment_frame(img, SegmentParams(watershed=True, min_size=40))
+        labels = labels_from(img, watershed=True, min_size=40)
         assert labels.max() == 2, (
             f"watershed merged the pair into {labels.max()} region(s)")
 
     def test_without_watershed_they_merge(self):
         """Confirms the previous test is actually measuring the watershed."""
         img = _touching()
-        labels = segment_frame(img, SegmentParams(watershed=False, min_size=40))
+        labels = labels_from(img, watershed=False, min_size=40)
         assert labels.max() == 1
 
     def test_does_not_oversplit_a_single_round_disc(self):
@@ -126,7 +98,7 @@ class TestSplitInstances:
         several coincident peaks and watershed cuts one disc into wedges."""
         img = np.full((80, 80), 0.05, np.float32)
         img += _disc((80, 80), 40, 40, 20).astype(np.float32)
-        labels = segment_frame(img, SegmentParams(watershed=True, min_size=50))
+        labels = labels_from(img, watershed=True, min_size=50)
         assert labels.max() == 1, f"one disc split into {labels.max()} pieces"
 
     def test_accepts_a_probability_map(self):
@@ -403,7 +375,7 @@ class TestFinalizeLabels:
     def test_identical_to_the_chain_it_replaces(self):
         """It reads the raster twice instead of six times, so it has to be
         proven equal to the obvious version rather than merely similar."""
-        from spyde.particles.classical import (_drop_large, _drop_small,
+        from spyde.particles.instances import (_drop_large, _drop_small,
                                                _finalize_labels,
                                                _relabel_sequential)
         rng = np.random.default_rng(0)
@@ -432,7 +404,7 @@ class TestNaNBorder:
         shifted = shift_frame(img, (12, -15))       # NaN band top and right
         assert np.isnan(shifted).any(), "test setup produced no NaN border"
 
-        labels = segment_frame(shifted, SegmentParams(min_size=30))
+        labels = labels_from(shifted, min_size=30)
         nan_mask = ~np.isfinite(shifted)
         assert not np.any(labels[nan_mask]), (
             "found a particle inside the NaN-padded border — the padding was "
@@ -443,7 +415,7 @@ class TestNaNBorder:
         from spyde.drift import shift_frame
         img = _field()
         shifted = shift_frame(img, (5, 0))
-        labels = segment_frame(shifted, SegmentParams(gaussian=2.0, min_size=30))
+        labels = labels_from(shifted, blur=2.0, min_size=30)
         assert labels.max() == 4, (
             f"found {labels.max()} of 4 particles — NaN bled through the blur")
 
@@ -563,7 +535,7 @@ def _build(n_frames=4, seed=1):
             cy = 20 + 25 * (i % 3)
             cx = 20 + 25 * (i // 3) + int(rng.integers(0, 3))
             img += _disc((90, 90), cy, cx, 8).astype(np.float32)
-        labels = segment_frame(img, SegmentParams(min_size=30))
+        labels = labels_from(img, min_size=30)
         rows, cs = measure_frame(labels, img, t=t, scale=0.5)
         per_frame.append(rows)
         contours.append(cs)
@@ -770,52 +742,20 @@ class TestSpyDEParticles:
         assert "particles over" in repr(_build())
 
 
-class TestNaNBorderPolarity:
-    """The drift-padded border must never segment — in EITHER polarity.
-
-    `spyde.drift.warp` names this as the most likely integration bug in the
-    feature: "a threshold applied to NaN ... invents a large 'particle' along
-    the edge that then nucleates a spurious track". `_prepare` fills NaN before
-    filtering (filters propagate NaN outward and would erase real data), so the
-    fill value has to read as background in the image that is finally
-    THRESHOLDED — and `invert` flips that image after the fill.
-
-    Filling with the finite minimum while inverting made the padding the
-    BRIGHTEST region: measured, a 240 px instance sitting on the border of a
-    96x96 frame.
-    """
-
-    @staticmethod
-    def _frame(dark_particles: bool):
-        import numpy as _np
-        h = w = 96
-        bg, fg = (200.0, 40.0) if dark_particles else (40.0, 200.0)
-        img = _np.full((h, w), bg, _np.float32)
-        y, x = _np.mgrid[0:h, 0:w]
-        for cy, cx in ((40, 40), (65, 70)):
-            img[(y - cy) ** 2 + (x - cx) ** 2 < 8 ** 2] = fg
-        img[:12, :] = _np.nan          # the drift-corrected border
-        img[:, :12] = _np.nan
-        return img
-
-    @pytest.mark.parametrize("invert", [False, True])
-    def test_the_padded_border_never_becomes_a_particle(self, invert):
-        from spyde.particles.classical import SegmentParams, _prepare, segment_frame
-
-        img = self._frame(dark_particles=invert)
-        p = SegmentParams(invert=invert, rb_kernel=0, gaussian=0)
-
-        prep = _prepare(img, p)
-        border = prep[:12, :12]
-        assert border.mean() < prep.max() - 1e-3, (
-            f"invert={invert}: the NaN padding is the brightest region in the "
-            f"thresholded image, so it segments as one huge edge particle")
-
-        labels = segment_frame(img, p)
-        on_border = sorted(set(np.unique(labels[:12, :12])) - {0})
-        assert not on_border, (
-            f"invert={invert}: instances {on_border} were found on the NaN "
-            f"border, which is padding and not data")
+# The drift-padded NaN border used to be guarded HERE, against the classical
+# engine's `_prepare`: it asserted the fill polarity followed `invert`, because
+# filling with the finite minimum while inverting made the padding the brightest
+# thing in the frame and it segmented as one 240 px edge-hugging instance.
+#
+# That function is gone with the engine, and the concern moved to the path that
+# actually runs: `features.prepare_frame` fills non-finite pixels with the finite
+# minimum AND returns a validity mask, and the classifier forces those pixels to
+# zero probability (plan trap 2 / gate A7). It is covered end-to-end, on a real
+# warped frame with a trained head, by
+# `test_particles_scribble.py::TestNaNBorder` — which asserts the stronger thing
+# this class could not: no INSTANCE lands in the padding, the padding reports
+# UNLABELLED rather than a class, and real data next to the border still
+# classifies (a filter propagating NaN outward would blank ~33 px of it).
 
 
 class TestConfidenceScore:
@@ -951,8 +891,8 @@ class TestPerComponentWatershed:
         NOT, and that is decimation rather than a cropping error — see the next
         test.
         """
-        import spyde.particles.classical as C
-        from spyde.particles.classical import SegmentParams, split_instances
+        import spyde.particles.instances as C
+        from spyde.particles.instances import SegmentParams, split_instances
 
         fg = self._field(1024, 90)
         p = SegmentParams(min_size=5, watershed=True)
@@ -981,8 +921,8 @@ class TestPerComponentWatershed:
 
     def test_a_component_spanning_a_crop_is_not_broken_up(self):
         """One long diagonal particle — the shape a naive band split ruins."""
-        import spyde.particles.classical as C
-        from spyde.particles.classical import SegmentParams, split_instances
+        import spyde.particles.instances as C
+        from spyde.particles.instances import SegmentParams, split_instances
 
         n = 512
         fg = np.zeros((n, n), bool)
@@ -1001,8 +941,8 @@ class TestPerComponentWatershed:
     def test_labels_are_globally_unique_across_components(self):
         """Each crop labels 1..k locally; the offset into the global space is
         where an off-by-one silently merges two particles."""
-        import spyde.particles.classical as C
-        from spyde.particles.classical import SegmentParams, split_instances
+        import spyde.particles.instances as C
+        from spyde.particles.instances import SegmentParams, split_instances
 
         fg = np.zeros((256, 256), bool)
         fg[20:60, 20:60] = True          # three well-separated squares

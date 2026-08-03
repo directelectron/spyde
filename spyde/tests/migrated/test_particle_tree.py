@@ -23,12 +23,11 @@ from spyde.actions.particle_tree import (
 )
 from spyde.particles import (
     LinkParams,
-    SegmentParams,
     link,
     measure_frame,
-    segment_frame,
 )
 from spyde.signals.particles import COL, SpyDEParticles
+from spyde.tests.migrated._labels import labels_from
 
 N_FRAMES = 8
 
@@ -41,7 +40,7 @@ def built():
     scale = float(gt["scale"])
     per_frame, contours = [], []
     for t in range(N_FRAMES):
-        lab = segment_frame(s.data[t], SegmentParams(min_size=25, gaussian=1.0))
+        lab = labels_from(s.data[t], min_size=25, blur=1.0)
         rows, cs = measure_frame(lab, s.data[t], t=t, scale=scale)
         per_frame.append(rows)
         contours.append(cs)

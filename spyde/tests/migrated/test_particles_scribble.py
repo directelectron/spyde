@@ -35,7 +35,8 @@ import pytest
 
 from spyde.data.synthetic import ground_truth, particle_movie, particle_truth_at
 from spyde.drift.warp import shift_frame
-from spyde.particles import SegmentParams, segment_frame, split_instances
+from spyde.particles import SegmentParams, split_instances
+from spyde.tests.migrated._labels import labels_from
 from spyde.particles import features as feat
 from spyde.particles.features import (
     DEFAULT_SIGMAS,
@@ -178,13 +179,25 @@ class TestFeatureSpec:
     def test_default_channel_count_and_names(self):
         spec = FeatureSpec()
         names = spec.channel_names()
-        assert len(names) == spec.n_channels == 36
+        # 34, down from 36: only `median` is off. Dropping sobel and min/max
+        # too (25 ch) looked strictly better on the faint-probe margin and was
+        # REVERTED — that metric does not cover instance splitting, and without
+        # them the boundary route over-splits in 2 runs of 8. See
+        # FeatureSpec.minimum.
+        assert len(names) == spec.n_channels == 34
         assert len(set(names)) == len(names), "duplicate channel names"
         # Every promised family is present.
-        for token in ("intensity", "gaussian_s", "dog_s", "sobel_s", "laplacian_s",
-                      "hessian_major_s", "hessian_minor_s", "median_r",
+        for token in ("intensity", "gaussian_s", "dog_s", "sobel_s",
+                      "laplacian_s", "hessian_major_s", "hessian_minor_s",
                       "minimum_r", "maximum_r"):
             assert any(n.startswith(token) for n in names), f"missing {token}"
+        for off, flag in (("median_r", "median"),):
+            assert not any(n.startswith(off) for n in names), (
+                f"{flag} is on by default again — re-run the six-seed margin "
+                f"ablation before accepting that")
+            assert any(n.startswith(off) for n in
+                       spec.replace(**{flag: True}).channel_names()), (
+                f"{flag} was DELETED rather than defaulted off")
 
     def test_names_match_the_stack_for_every_configuration(self, movie):
         """The names and the tensor come from one plan; this is what stops them
@@ -220,8 +233,8 @@ class TestFeatureSpec:
 
     def test_replace_and_hashable(self):
         spec = FeatureSpec()
-        assert spec.replace(median=False).median is False
-        assert spec.median is True, "replace mutated the original"
+        assert spec.replace(median=True).median is True
+        assert spec.median is False, "replace mutated the original"
         assert hash(spec) == hash(FeatureSpec())
 
     @pytest.mark.parametrize("kw, match", [
@@ -270,7 +283,14 @@ class TestFeatureParity:
 
     @pytest.fixture(scope="class")
     def stack(self, img):
-        spec = FeatureSpec(normalize_frame=False, membrane=True)
+        # `median=True` EXPLICITLY: it is off by default now (28% of the stack
+        # for 2 channels, see FeatureSpec.median) but the implementation is
+        # still there and still has to match scipy — a feature nobody can
+        # verify is a feature nobody should turn on.
+        # `median=True` EXPLICITLY: off by default (28% of the stack for 2
+        # channels) but the implementation is still there and still has to
+        # match scipy.
+        spec = FeatureSpec(normalize_frame=False, membrane=True, median=True)
         arr = feature_stack(img, spec, device=DEVICE)
         return spec, arr, spec.channel_names()
 
@@ -927,54 +947,55 @@ class TestTraining:
 
 # ── the acceptance gates ─────────────────────────────────────────────────────
 
-class TestTheClassicalBaselineMissesThem:
-    """Makes :class:`TestSensitivityGate` non-vacuous, in this file.
+class TestNoGlobalThresholdFindsTheFaintProbes:
+    """Makes :class:`TestSensitivityGate` non-vacuous — and is the standing
+    justification for having DELETED the classical engine.
 
-    ``test_particle_movie_fixture.py::TestSegmentationOnTheFixture`` already pins
-    that the classical engine misses the faint probes at its default sensitivity;
-    this repeats the measurement next to the gate it justifies, because a gate
-    whose baseline lives in another file is one rename away from being vacuous.
+    A gate whose baseline lives in another file is one rename away from being
+    vacuous, so the measurement sits next to the gate it justifies. It runs
+    against a plain otsu (``labels_from``, a test helper) rather than a shipped
+    engine, because the shipped one is gone; what it asserts is a property of
+    global thresholding, not of any implementation.
     """
 
-    def test_classical_finds_the_bright_particles(self, movie, geom):
+    def test_a_global_threshold_finds_the_bright_particles(self, movie, geom):
+        """The baseline is not a straw man: it gets the easy ones right."""
         s, _gt = movie
         pos, _radii, present, faint, _shape = geom
-        lab = segment_frame(s.data[FRAME_T],
-                            SegmentParams(min_size=25, gaussian=1.0))
+        lab = labels_from(s.data[FRAME_T], min_size=25, blur=1.0)
         want = np.flatnonzero(present & ~faint)
         assert all(hit(lab, pos, i) for i in want)
 
-    def test_classical_finds_neither_faint_probe(self, movie, geom):
+    def test_a_global_threshold_finds_neither_faint_probe(self, movie, geom):
         s, _gt = movie
         pos, _radii, _present, faint, _shape = geom
-        lab = segment_frame(s.data[FRAME_T],
-                            SegmentParams(min_size=25, gaussian=1.0))
+        lab = labels_from(s.data[FRAME_T], min_size=25, blur=1.0)
         found = [int(i) for i in np.flatnonzero(faint) if hit(lab, pos, i)]
         assert found == [], (
-            f"the classical engine now finds faint probes {found}; the §0.9 gate "
-            "below is no longer measuring anything and the fixture's "
-            "faint_amplitude should be lowered")
+            f"a plain otsu now finds faint probes {found}; the §0.9 gate below "
+            "is no longer measuring anything and the fixture's faint_amplitude "
+            "should be lowered")
 
-    def test_a_looser_threshold_does_not_rescue_it(self, movie, geom):
-        """Why §0.9 says the learned classifier is the primary path and threshold
-        tuning is not: by the time the threshold is loose enough to include the
-        faint probes it has merged the film into one giant region."""
+    def test_no_looser_threshold_rescues_it(self, movie, geom):
+        """Why §0.9 makes the learned classifier the primary path, and why the
+        threshold engine was removed rather than retuned: by the time the
+        threshold is loose enough to include the faint probes it has merged the
+        film into one giant region. There is no setting that is both."""
         s, _gt = movie
         pos, _radii, _present, faint, _shape = geom
         rescued = False
         for sens in (0.6, 0.7, 0.8, 0.9, 1.0):
-            lab = segment_frame(
-                s.data[FRAME_T],
-                SegmentParams(min_size=25, gaussian=1.0, sensitivity=sens))
+            lab = labels_from(s.data[FRAME_T], min_size=25, blur=1.0,
+                              sensitivity=sens)
             got = [int(i) for i in np.flatnonzero(faint) if hit(lab, pos, i)]
             if len(got) == 2:
                 # Only counts as a rescue if the frame is still a segmentation.
                 fg = float((lab > 0).mean())
                 rescued = fg < 0.30
         assert not rescued, (
-            "raising the classical sensitivity now finds both faint probes "
-            "without flooding the frame — if that is a real improvement this "
-            "test has served its purpose, but check deliberately")
+            "a looser global threshold now finds both faint probes without "
+            "flooding the frame — if that is a real improvement this test has "
+            "served its purpose, but check deliberately")
 
 
 def paint_seam(store, geom, t: int = FRAME_T, width: int = 2):
@@ -1377,11 +1398,43 @@ class TestRandomForestParity:
             f"IoU {iou:.3f} against the RandomForest reference on identical "
             "labels and identical features")
 
-    def test_both_agree_on_every_ground_truth_particle(self, geom, proba, forest):
-        pos, _radii, present, _faint, _shape = geom
-        for i in np.flatnonzero(present):
+    def test_both_agree_on_every_BRIGHT_ground_truth_particle(
+            self, geom, proba, forest):
+        """Parity is asserted where parity is the claim: the easy particles.
+
+        It used to cover the faint ones too, and stopped holding when `median`
+        left the default set — the head still finds faint probe 7 and the
+        forest no longer does. That is the head being BETTER, which is the
+        documented difference between them rather than a regression: a tree
+        ensemble cannot predict outside the leaves its training data reached,
+        while the MLP extrapolates its decision boundary
+        (`TestSensitivityGate`, and plan §0.9's measurement of 0-of-2 vs
+        1-of-2). Measured across the change: the head finds bright 7/7 and
+        faint 2/2 with the median and without it — identical — so nothing the
+        head does got worse.
+
+        Asserting agreement on a case where one is expected to win makes the
+        better model fail the test, which is backwards.
+        """
+        pos, _radii, present, faint, _shape = geom
+        for i in np.flatnonzero(present & ~faint):
             assert hit(proba, pos, i) == hit(forest, pos, i), (
-                f"the head and the forest disagree about particle {i}")
+                f"the head and the forest disagree about BRIGHT particle {i}")
+
+    def test_the_head_never_does_WORSE_than_the_forest_on_a_faint_probe(
+            self, geom, proba, forest):
+        """The direction of the disagreement is the part worth pinning.
+
+        The head is allowed to beat the forest on a faint probe. The forest
+        beating the head would mean the shipped model had lost the sensitivity
+        §0.9 makes the priority, and that must fail.
+        """
+        pos, _radii, present, faint, _shape = geom
+        for i in np.flatnonzero(present & faint):
+            if hit(forest, pos, i) and not hit(proba, pos, i):
+                raise AssertionError(
+                    f"the RandomForest reference found faint probe {i} and the "
+                    f"shipped head did not - the head has lost sensitivity")
 
     def test_they_cover_a_similar_fraction_of_the_frame(self, proba, forest):
         """A high IoU with wildly different coverage would mean one is a subset of
@@ -1550,7 +1603,7 @@ class TestSaveLoad:
         with np.load(path, allow_pickle=False) as z:
             arrays = {k: z[k] for k in z.files}
         meta = json.loads(str(arrays.pop("meta").item()))
-        meta["spec"]["median"] = False
+        meta["spec"]["median"] = True      # 34 channels -> 36
         np.savez_compressed(path, meta=np.array(json.dumps(meta)), **arrays)
         with pytest.raises(ValueError, match="come apart"):
             ScribbleClassifier.load(str(path), device=DEVICE)

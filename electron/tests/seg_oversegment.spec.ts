@@ -3,10 +3,10 @@
  *
  * Reported with a screenshot on a real in-situ movie: "14028 particles in this
  * region", the whole preview window painted a flat sheet of green, the renderer
- * hung, and the Scribble tab unusable because the image you have to paint on was
- * under that sheet.
+ * hung, and the caret unusable because the image you have to paint on was under
+ * that sheet.
  *
- * THREE separate defects produced that one screenshot, and every existing spec
+ * Three separate defects produced that one screenshot, and every existing spec
  * was green throughout because the bundled fixture is small, clean and
  * high-contrast:
  *
@@ -20,19 +20,22 @@
  *      sheet. So the path added to avoid N polygons could never run on the only
  *      frames big enough to need it.
  *   2. Nothing capped the polygon fallback.
- *   3. A failed threshold was reported as a result. Otsu on a low-contrast frame
- *      has no bimodal histogram to find, lands inside the noise, and the split
- *      shatters the support film — but the caret said "14028 particles", which
- *      reads as a bad answer rather than as no answer, and sends the user to
- *      sliders that cannot fix it.
+ *   3. Segmenting the support film was reported as a RESULT. It was otsu landing
+ *      inside the noise then; that engine is deleted, but the failure is not
+ *      engine-specific — an under-trained head that learnt "film is particle"
+ *      produces the same thing, which is why the verdict tests the measured
+ *      OUTPUT (instance count AND coverage) rather than anything about a
+ *      threshold. "14028 particles" reads as a bad answer rather than as no
+ *      answer, and sends the user to sliders that cannot fix it.
  *
  * `noise: 0.35` is what makes the fixture fail this way; at its default 0.015 it
- * is clean and a global threshold works fine on it. 1200² is above anyplotlib's
- * 1024 tile threshold, so the tiled path is the one under test — that pairing is
- * the entire point, and either one alone reproduces nothing.
+ * is clean and the head trains cleanly on it. 1200² is above anyplotlib's 1024
+ * tile threshold, so the tiled path is the one under test — that pairing is the
+ * entire point, and either one alone reproduces nothing.
  */
 import { test, expect } from '@playwright/test'
 import { mkdirSync } from 'fs'
+import { trainFromGroundTruth, windowIdOf } from './_seg'
 const {
   launchApp, backendAction, waitForSubwindowCount, sigWindow, countColorPixels,
 } = require('./_harness.cjs')
@@ -48,8 +51,19 @@ test.beforeAll(async () => {
   ctx = await launchApp({ dask: true, env: { SPYDE_LOG_LEVEL: 'INFO' } })
   const { page } = ctx
   await page.waitForTimeout(1500)
+  // 1024², and BOTH halves of that number matter:
+  //   * `>= 1024` on an edge is anyplotlib's tile threshold (`_GPU_TILE_MIN_EDGE`),
+  //     so this is the tiled display path — the one the raster-overlay bug lived on.
+  //   * `1024*1024` is exactly `_PREVIEW_PIXEL_BUDGET`, so the preview segments the
+  //     WHOLE frame rather than a centred crop.
+  // That second point is load-bearing here and was not obvious: `particle_movie`
+  // does NOT scale its particles with `shape` — they stay at their original
+  // 16..102 px coordinates with 3-9 px radii. At 1200² they therefore sit in a
+  // corner OUTSIDE the centred 1024² preview crop, the trained head correctly
+  // finds nothing in the crop, and the spec fails for a reason that has nothing
+  // to do with what it is testing.
   await backendAction(page, 'load_test_data_particles',
-    { frames: 4, size: [1200, 1200], noise: 0.35 })
+    { frames: 4, size: [1024, 1024], noise: 0.35 })
   await waitForSubwindowCount(page, 2, 180_000)
   await page.waitForTimeout(3000)
 })
@@ -68,9 +82,18 @@ async function openCaret() {
   return sig
 }
 
+/** Open, MIS-label (film taught as particle) and Train — the realistic way a
+ *  user produces the over-segmentation the coverage verdict is for. */
+async function openAndTrain() {
+  const { page } = ctx
+  const sig = await openCaret()
+  await trainFromGroundTruth(page, await windowIdOf(sig), { mislabel: true })
+  return sig
+}
+
 test('a noise frame over-segments, and the caret NAMES it instead of counting it', async () => {
   const { page } = ctx
-  await openCaret()
+  await openAndTrain()
 
   const stats = page.getByTestId('seg-preview-stats')
   await expect.poll(async () => Number(await stats.getAttribute('data-count')), {
@@ -78,19 +101,28 @@ test('a noise frame over-segments, and the caret NAMES it instead of counting it
   }).toBeGreaterThan(0)
 
   const count = Number(await stats.getAttribute('data-count'))
-  // The fixture has to actually FAIL or this spec proves nothing — the whole
+  const coverage = Number(await stats.getAttribute('data-coverage'))
+  // The head has to actually FAIL or this spec proves nothing — the whole
   // reason the bug shipped is that the clean fixture never got here.
-  expect(count, `only ${count} instances; noise:0.35 did not over-segment, so `
-    + 'this spec is not exercising the reported failure').toBeGreaterThan(200)
+  expect(coverage,
+    `coverage ${(100 * coverage).toFixed(0)}%: the mislabelled head did not `
+    + 'return the film, so this spec is not exercising the reported failure')
+    .toBeGreaterThan(0.6)
+  // ...and note the SHAPE. A bad classifier merges the film into a few hundred
+  // large blobs; the deleted threshold engine shattered it into thousands of
+  // small ones. The verdict has to catch both, and a rule tuned on the count
+  // alone caught only the second — measured: 228 instances over ~the whole
+  // frame sailed under a 500-instance bar while looking like a green sheet.
+  expect(count, 'no instances at all').toBeGreaterThan(0)
 
   // The verdict, not just the number. "14028 particles" reads as an answer.
   await expect(stats).toHaveAttribute('data-failed', 'true')
   const notice = page.getByTestId('seg-threshold-failed')
   await expect(notice).toBeVisible()
-  await expect(notice).toContainText('landed inside the noise')
-  // ...and it points at the engine that DOES work on this data (plan §0.9),
-  // rather than leaving the user on sliders that cannot fix a bad threshold.
-  await expect(notice).toContainText('Scribble')
+  await expect(notice).toContainText('support film')
+  // ...and it says the ONE thing that fixes it. Size and shape sliders
+  // cannot: over-segmented film is small AND round.
+  await expect(notice).toContainText('re-train')
 
   await page.screenshot({ path: `${SHOTS}/01-threshold-failed.png` })
   await page.getByTestId('segment-wizard').screenshot({
@@ -134,22 +166,28 @@ test('the overlay is ONE mask, not thousands of polygons, and does not blanket t
   ctx.assertNoJsErrors()
 })
 
-test('Scribble stays usable: the image is not buried under the failed preview', async () => {
+test('closing the caret takes the RASTER overlay with it', async () => {
   const { page } = ctx
-  await page.getByTestId('seg-tab-scribble').click()
-  await expect(page.getByTestId('seg-class-strip')).toBeVisible({ timeout: 30_000 })
 
-  // The reported symptom, in one number: you cannot paint on an image you
-  // cannot see. The untrained Scribble engine has produced no result, so the
-  // previous engine's drawing must be GONE — not merely thinner. It used to
-  // survive because `show_preview_window` cleared the vector outlines and left
-  // the raster mask, and above 100 instances the mask is the whole drawing.
+  // `seg_overlay.spec.ts` already pins close-clears-overlay, but on a frame with
+  // few enough instances to be drawn as OUTLINES. This is the other drawing
+  // route, and it has its own teardown (`_clear_raster_overlay`) that was
+  // missed once already: `show_preview_window` cleared the vector group and
+  // left the mask, so a dead result stayed on the image. Above
+  // `_RASTER_ABOVE` the mask IS the whole drawing, so a teardown that forgets
+  // it leaves the frame unusable rather than merely untidy.
+  const before = await countColorPixels(page, 'green')
+  expect(before, 'no raster overlay to clear — this test needs one drawn')
+    .toBeGreaterThan(100)
+
+  await page.getByTestId('seg-close').click()
+  await expect(page.getByTestId('segment-wizard')).toHaveCount(0)
+
   await expect.poll(() => countColorPixels(page, 'green'), {
     timeout: 30_000,
-    message: 'the classical result is still drawn on the Scribble tab, over '
-      + 'the image the user has to paint on',
+    message: 'the raster mask outlived the caret that drew it',
   }).toBeLessThan(2000)
 
-  await page.screenshot({ path: `${SHOTS}/04-scribble-usable.png` })
+  await page.screenshot({ path: `${SHOTS}/04-closed-clean.png` })
   ctx.assertNoJsErrors()
 })

@@ -33,7 +33,7 @@ from spyde.data.synthetic import (
     particle_truth_at,
 )
 from spyde.drift.model import DriftModel
-from spyde.particles import SegmentParams, measure_frame, segment_frame
+from spyde.particles import measure_frame
 from spyde.particles.track import (
     EVENT_KINDS,
     LinkParams,
@@ -47,6 +47,7 @@ from spyde.particles.track import (
     sample_frame_positions,
 )
 from spyde.signals.particles import COL, N_COLUMNS, SpyDEParticles
+from spyde.tests.migrated._labels import labels_from
 
 # The gate used for every fixture test. 3.0 nm = 6 px at the fixture's 0.5 nm/px,
 # i.e. ~3x the fastest particle's 2.2 px/frame lab-frame step. Deliberately not the
@@ -58,17 +59,18 @@ FIXTURE_MAX_DIST = 3.0
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _segment_movie(sig, gt, params=None, scale=None) -> SpyDEParticles:
-    """Run the real classical pipeline over every frame → a real particle table.
+    """Segment + measure every frame → a real particle table for the linker.
 
-    Deliberately not a synthetic table: the linker's input is whatever
-    ``segment_frame`` + ``measure_frame`` produce, including their misses (the two
-    faint probes are never found at default sensitivity) and their merges.
+    Deliberately not a synthetic table: the linker's input is whatever a real
+    segmentation produces, including its misses (the two faint probes are never
+    found by a global threshold) and its merges. *params* is a kwargs dict for
+    :func:`~spyde.tests.migrated._labels.labels_from`.
     """
-    params = params or SegmentParams(min_size=25, gaussian=1.0)
+    params = dict(params) if params else dict(min_size=25, blur=1.0)
     scale = float(gt["scale"]) if scale is None else float(scale)
     rows, contours = [], []
     for t in range(int(gt["n_frames"])):
-        labels = segment_frame(sig.data[t], params)
+        labels = labels_from(sig.data[t], **params)
         r, c = measure_frame(labels, sig.data[t], t=t, scale=scale)
         rows.append(r)
         contours.append(c)
@@ -304,7 +306,7 @@ class TestEventGates:
         s, gt = movie
         with_ws = link(_segment_movie(s, gt), max_dist=FIXTURE_MAX_DIST)
         no_ws = link(_segment_movie(
-            s, gt, SegmentParams(min_size=25, gaussian=1.0, watershed=False)),
+            s, gt, dict(min_size=25, blur=1.0, watershed=False)),
             max_dist=FIXTURE_MAX_DIST)
         f_on = with_ws.events_of("merge")[0].frame
         f_off = no_ws.events_of("merge")[0].frame
