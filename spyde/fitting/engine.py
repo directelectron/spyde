@@ -36,6 +36,7 @@ from typing import Callable
 
 import numpy as np
 
+from spyde.device_lock import accelerator_lock
 from spyde.fitting import components as tcomp
 
 log = logging.getLogger(__name__)
@@ -86,13 +87,78 @@ class FitResult:
 
 
 def default_device() -> str:
+    """CUDA > MPS > CPU, overridable with ``SPYDE_FIT_DEVICE``.
+
+    **MPS is real but modest, and it is not free.** Every op this engine needs
+    works on Metal (cholesky_ex, cholesky_solve, vmap(jacfwd), batched matmul),
+    and float32 reproduces ``multifit`` to ~1e-5 — see
+    ``test_fitting_engine.py::TestFloat32AndMPSParity``. What it does NOT buy is
+    a speed-up on every Mac. Measured on an M1 MacBook Air (8 GPU cores),
+    float32 both sides, after the sync removal below:
+
+    | raw float32 GEMM     | MPS 1747 vs CPU 868 GFLOP/s -> 2.0x ceiling |
+    | this engine, P=64    | 173 ms vs 171 ms            -> 0.99x        |
+    | this engine, P=16384 | 41.6 s vs 28.4 s            -> 0.68x        |
+
+    So on THIS box the CPU still wins. The engine is not GEMM-bound — ``n <= 20``
+    free parameters make ``JᵀJ`` a batch of tiny matrices, so an LM iteration is
+    many small kernels, exactly the shape Metal's launch overhead punishes
+    (CLAUDE.md, GPU Computing). An M1 Air pairs a strong 8-core CPU with the
+    smallest Apple GPU, which is the pessimistic end of the range; a Pro/Max/
+    Ultra part carries the same per-launch cost against 2-8x the GPU compute.
+    EBSD indexing, which IS one big matmul, already crosses over on this same
+    laptop (``spyde/ebsd/_device.py``) — the difference is the workload, not the
+    backend.
+
+    Hence: prefer the accelerator and let anyone measure their own box with
+    ``SPYDE_FIT_DEVICE``, rather than bake this laptop's ratio into a threshold
+    that would be wrong on every other Mac.
+    """
+    import os
+    forced = os.environ.get("SPYDE_FIT_DEVICE")
+    if forced:
+        return forced
     try:
         import torch
         if torch.cuda.is_available():
             return "cuda"
+        if torch.backends.mps.is_available():
+            return "mps"
     except Exception as e:                                # pragma: no cover
-        log.debug("probing CUDA failed: %s", e)
+        log.debug("probing the accelerator failed: %s", e)
     return "cpu"
+
+
+def resolve_dtype(device: str, dtype: str) -> str:
+    """Metal has no float64 — asking for one raises rather than downcasting.
+
+    Coercing here (instead of at every call site) keeps ``dtype="float64"``
+    usable as the default it is everywhere else.
+    """
+    if str(device).startswith("mps") and dtype == "float64":
+        log.debug("MPS does not support float64; fitting in float32")
+        return "float32"
+    return dtype
+
+
+def floor_tolerances(tdtype, ftol, xtol, gtol):
+    """Raise the convergence tolerances to something the dtype can express.
+
+    THE BUG THIS FIXES: the defaults are 1e-8, but float32's epsilon is 1.19e-7.
+    All three tests — gradient, step and cost — are then strictly unreachable,
+    so a fit that has genuinely converged reports ``converged=False`` for every
+    position, burns its whole ``max_iter`` budget, and surfaces to the user as
+    "did not converge" / "0 fitted" while the parameters are in fact correct to
+    ~1e-5. Measured before this floor: ``convergence_rate`` 1.00 in float64 and
+    **0.00** in float32, on identical data with identical answers.
+
+    10x epsilon is the floor: comfortably above the noise a float32 residual
+    carries, and far below the 1e-8 default in float64 (eps 2.2e-16), so
+    double-precision behaviour is untouched.
+    """
+    import torch
+    floor = 10.0 * float(torch.finfo(tdtype).eps)
+    return (max(ftol, floor), max(xtol, floor), max(gtol, floor))
 
 
 def _selection_matrix(free_mask, n_total, dtype, device):
@@ -165,7 +231,9 @@ def fit_batched(spec, data, x, *, weights=None, device=None, max_iter=60,
             f"path for this model (see components.supports)")
 
     device = device or default_device()
+    dtype = resolve_dtype(device, dtype)
     tdtype = getattr(torch, dtype)
+    ftol, xtol, gtol = floor_tolerances(tdtype, ftol, xtol, gtol)
 
     data = np.asarray(data)
     nav_shape = data.shape[:-1]
@@ -220,17 +288,25 @@ def fit_batched(spec, data, x, *, weights=None, device=None, max_iter=60,
     out_chisq = np.full(P, np.inf)
     iters_used = 0
 
+    # PER CHUNK, not around the whole loop. On MPS every torch user in the
+    # process shares one lock (spyde/device_lock.py), and a whole-scan fit runs
+    # for minutes — holding it end-to-end would stall the live navigator preview
+    # for the entire run. Releasing between chunks bounds any other thread's
+    # wait to a single chunk, which is the same "hand the device back at your
+    # yield points" rule compute_vector_orientation_gpu follows.
     for lo_i in range(0, P, chunk):
         hi_i = min(P, lo_i + chunk)
-        v, c, q, it = _fit_chunk(
-            spec, x_t, S, free_t, tdtype, device,
-            y=torch.as_tensor(y_np[lo_i:hi_i], dtype=tdtype, device=device),
-            w=torch.as_tensor(w_np[lo_i:hi_i] if w_np.shape[0] > 1 else w_np,
-                              dtype=tdtype, device=device),
-            start=torch.as_tensor(start_np[lo_i:hi_i], dtype=tdtype, device=device),
-            lo=lo_t, hi=hi_t, max_iter=max_iter, ftol=ftol, xtol=xtol,
-            gtol=gtol,
-        )
+        with accelerator_lock(device):
+            v, c, q, it = _fit_chunk(
+                spec, x_t, S, free_t, tdtype, device,
+                y=torch.as_tensor(y_np[lo_i:hi_i], dtype=tdtype, device=device),
+                w=torch.as_tensor(w_np[lo_i:hi_i] if w_np.shape[0] > 1 else w_np,
+                                  dtype=tdtype, device=device),
+                start=torch.as_tensor(start_np[lo_i:hi_i], dtype=tdtype,
+                                      device=device),
+                lo=lo_t, hi=hi_t, max_iter=max_iter, ftol=ftol, xtol=xtol,
+                gtol=gtol,
+            )
         out_values[lo_i:hi_i] = v
         out_conv[lo_i:hi_i] = c
         out_chisq[lo_i:hi_i] = q
@@ -291,12 +367,24 @@ def _fit_chunk(spec, x, S, free_mask, tdtype, device, *, y, w, start, lo, hi,
             return (_res_v(pf, y_i, w_i, fixed_i),
                     _jac_v(pf, y_i, w_i, fixed_i))
 
+    # The scale the residual is measured against, for the noise-floor test in
+    # the loop. Weighted, because `r` is.
+    ynorm = (y * w).norm(dim=1).clamp_min(1e-300)
+    # A residual this small IS zero as far as the dtype is concerned. 4x eps
+    # rather than 1x so the test survives the few rounding steps between `y`
+    # and `r` (the model evaluation, the subtraction, the weighting).
+    noise_floor = 4.0 * float(torch.finfo(tdtype).eps)
+
     lam = torch.full((n_chunk,), 1e-3, dtype=tdtype, device=device)
     cost = torch.full((n_chunk,), float("inf"), dtype=tdtype, device=device)
     converged = torch.zeros(n_chunk, dtype=torch.bool, device=device)
     used = 0
 
     eye = torch.eye(p.shape[1], dtype=tdtype, device=device)
+    # Reading a device tensor on the host stalls the queue; on the CPU it is a
+    # plain memory read. So poll convergence every iteration there and rarely
+    # on an accelerator.
+    check_every = 1 if str(device).startswith("cpu") else 8
 
     for it in range(max_iter):
         used = it + 1
@@ -332,11 +420,17 @@ def _fit_chunk(spec, x, S, free_mask, tdtype, device, *, y, w, start, lo, hi,
         # singular pixel cannot abort the whole batch.
         L, info = torch.linalg.cholesky_ex(A)
         solvable = info == 0
-        delta = torch.zeros_like(p)
-        if solvable.any():
-            sol = torch.cholesky_solve((-Jtr).unsqueeze(2)[solvable],
-                                       L[solvable]).squeeze(2)
-            delta[solvable] = sol
+        # Solve the WHOLE batch and mask afterwards, rather than gathering the
+        # solvable rows first. `if solvable.any():` and `L[solvable]` both need
+        # the mask's VALUE on the host, and on MPS each such round trip costs
+        # ~367 us against ~30 us for the same reduction left on the device —
+        # twice per iteration, every iteration. Substituting the identity where
+        # the factorisation failed is arithmetically the same answer (those rows
+        # are discarded by the `where` below, exactly as `delta` stayed zero for
+        # them before) and keeps the whole step on-device.
+        L_safe = torch.where(solvable[:, None, None], L, eye)
+        sol = torch.cholesky_solve((-Jtr).unsqueeze(2), L_safe).squeeze(2)
+        delta = torch.where(solvable[:, None], sol, torch.zeros_like(sol))
         delta = delta / colnorm                            # back to real units
 
         p_new = torch.clamp(p + delta, lo, hi)             # bounds by projection
@@ -374,8 +468,23 @@ def _fit_chunk(spec, x, S, free_mask, tdtype, device, *, y, w, start, lo, hi,
         grad_small = (Jtr.abs().amax(1) / rnorm) < gtol
         step_small = better & (delta.abs() <= xtol * (p.abs() + xtol)).all(1)
         cost_small = better & (rel.abs() < ftol)
-        converged = converged | ((grad_small | step_small | cost_small) & solvable)
-        if bool(converged.all()):
+        # NOISE FLOOR — the test the three relative ones cannot make on a
+        # near-perfect fit. `grad_small` divides by `rnorm`, so once the fit is
+        # exact it is 0/0: on CLEAN data in float32 the residual falls to the
+        # rounding floor (~3e-6 against data of order 50), and `Jᵀr` is then
+        # rounding noise of the same relative size, so the ratio is O(1) and
+        # never passes. Measured: an exact fit — chisq 1e-11, parameters right
+        # to 8 digits — reported 50% converged and burned all 60 iterations.
+        # A residual at the representation limit cannot be improved, so it IS
+        # converged, and saying so absolutely is the only way to say it.
+        at_floor = rnorm <= noise_floor * ynorm
+        converged = converged | ((grad_small | step_small | cost_small
+                                  | at_floor) & solvable)
+        # The early exit needs the answer on the HOST, so on an accelerator it
+        # is a pipeline barrier (see the cholesky comment above). Amortise it:
+        # checking every 8th iteration costs at most 7 wasted iterations once,
+        # against a stall on all 60. On CPU the read is free, so keep it exact.
+        if it % check_every == check_every - 1 and bool(converged.all()):
             break
 
     # Final cost from the FINAL p. The loop's `cost` belongs to the start of
