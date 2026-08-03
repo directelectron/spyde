@@ -249,7 +249,10 @@ test('IPF raster/GPU render paths render correctly in the real app', async () =>
   assertNoJsErrors()
 
   // ── STEP 2: DENSITY / PDF raster (change #3) ────────────────────────────────
-  await page.getByTestId(`ipf-view-density-${omId}`).click({ force: true })
+  // Density is no longer a third projection alongside 2D/3D — it is the
+  // `Heatmap` half of the SECOND, independent toggle pair, so it composes with
+  // the 2D chosen in step 1 rather than replacing it.
+  await page.getByTestId(`ipf-style-heatmap-${omId}`).click({ force: true })
   await page.waitForTimeout(1000)
   await raiseOm()                                        // raise the now-shown density iframe
   await page.waitForTimeout(2000)                        // griddata resample + raster
@@ -260,6 +263,11 @@ test('IPF raster/GPU render paths render correctly in the real app', async () =>
   assertNoJsErrors()
 
   // ── STEP 4: 3-D sphere scatter on WebGPU (change #4) ────────────────────────
+  // Back to Points first: the style pair is independent of 2D/3D, so step 2
+  // would otherwise leave this on the 3-D textured heatmap and the "scatter"
+  // this step exists to prove would never be drawn.
+  await page.getByTestId(`ipf-style-points-${omId}`).click({ force: true })
+  await page.waitForTimeout(500)
   await page.getByTestId(`ipf-view-3d-${omId}`).click({ force: true })
   await page.waitForTimeout(1000)
   await raiseOm()                                        // raise the now-shown 3-D iframe
