@@ -727,3 +727,1022 @@ Three things this pins down:
   it (50.2 s) and neither does a bigger window — if the progressive fill is ever
   worth optimising further, the lever is fewer, larger display chunks, not more
   in-flight ones.
+
+
+
+## Rigid drift solve — phase correlation backends + accuracy vs upsample (2026-07-29)
+
+`spyde/drift/translation.py` step A1. Synthetic stack built by Fourier phase ramp
+so sub-pixel ground truth is exact (no interpolation in the truth).
+
+**Accuracy** — 5 frames, 96×112, truth shifts deliberately OFF the `1/upsample`
+grid (`1.37, -2.83, …`). This matters: shifts that happen to be multiples of
+`1/upsample` come back at 0.00000 px, which looks superb and tests nothing.
+
+| upsample | max error |
+|---|---|
+| 1 | 0.440 px |
+| 2 | 0.220 px |
+| 8 | **0.065 px** ← inside the 0.1 px acceptance gate |
+| 32 | 0.015 px |
+| 64 | 0.014 px (floor) |
+
+Halves as expected until ~u=32, where it hits the scene's own noise floor. `u=8`
+is the default: comfortably inside the gate at a fraction of the refinement cost.
+
+**Throughput** — 120 frames × 512², upsample=8, warm (cold CUDA run discarded).
+
+| backend | time | frames/s | |
+|---|---|---|---|
+| numpy | 6.57 s | 18 | reference path |
+| torch **cpu** | 0.86 s | **139** | **7.7× numpy** |
+| torch cuda | 0.42 s | 284 | 16× numpy |
+
+**Do NOT default to numpy on a CPU-only machine.** `_resolve_ops` originally
+preferred numpy when no GPU was present, reasoning that torch's per-call dispatch
+would dominate at one frame at a time. Wrong by 7.7×: `np.fft.fft2` is
+single-threaded and `torch.fft.fft2` uses every core, and a per-frame FFT is the
+entire cost of this solver. Order is now cuda > mps > **torch cpu** > numpy, with
+numpy kept only as the explicitly-selectable parity reference.
+
+CUDA's 2× over torch-CPU is smaller than the batched-compute wins elsewhere in
+SpyDE because this solver is deliberately *streaming* — one frame at a time, so
+each frame pays a host→device transfer that a batched formulation would amortise.
+That is the accepted trade for the Memory-Safety rule (a 3000 × 4096² movie is
+tens of GB and cannot be batched wholesale). If the transfer ever dominates, the
+fix is a bounded read-ahead of a few frames, not materialising the stack.
+
+### Apodisation and reference robustness -- two traps the fixture found (2026-07-29)
+
+Both found by `spyde.data.synthetic.particle_movie` on its FIRST run, which is the
+argument for building a ground-truth fixture before the thing it grades.
+
+**A full Hann window destroys the registration.** Synthetic movie, true drift at
+frame 23 = `(6.0, 2.9)` px:
+
+| taper alpha | max error over 24 frames |
+|---|---|
+| 0.00 (none) | 0.125 px |
+| 0.10 | 0.125 px |
+| **0.25 (default)** | **0.124 px** |
+| 0.50 | 0.227 px |
+| 1.00 (full Hann) | **25.25 px** |
+
+At alpha=1 the strongest correlation peak sits at `(-19, 19)` scoring 0.121 while
+the TRUE peak scores 0.088. **skimage's `phase_cross_correlation` returns the same
+wrong answer on the same windowed input**, so this is a property of full-frame
+windowing, not of either implementation: once the drift is large the window
+reweights different content in each frame. `max_shift=20` does not save you -- the
+false peak is inside the band. Taper the EDGE only.
+
+**The running reference needed explicit outlier rejection.** Peak strength relative
+to the running median:
+
+| case | ratio |
+|---|---|
+| worst NATURAL frame (clean sub-pixel stack) | 0.388 |
+| a frame replaced by pure noise | 0.007 |
+
+A ~50x gap, so the threshold is 0.25. Without rejection, one noise frame in a
+5-frame stack dragged the two frames AFTER it 3.9 px off. With it, those two are
+recovered exactly and only the bad frame is wrong. Two settings that did not
+survive measurement: a 3-sample warm-up (too slow -- the bad frame is already in
+the reference on a short stack) and windowing the median over the last N accepted
+(no difference at N=3, 5 or unbounded).
+
+### Fixture + classical segmentation cost (2026-07-29)
+
+| stage | time | note |
+|---|---|---|
+| build fixture (24 x 96x112) | 98 ms | eager, deterministic |
+| drift solve, 24 frames | 32 ms | 0.124 px max error |
+| `segment_frame`, one 96x112 frame | 3.7 ms | 272 frames/s |
+| `measure_frame`, one 96x112 frame | 13.7 ms | 73 frames/s |
+| combined | 17.4 ms | 58 frames/s |
+
+**`measure_frame` is 3.7x the cost of `segment_frame`, which is the wrong way
+round and is the thing to watch.** Segmentation is vectorised over pixels;
+measurement still loops over PARTICLES to crop each bbox for the intensity ring and
+to trace each contour. At 3000 frames of this size that is 52 s -- fine -- but the
+plan's target frames are 2048-4096 square, and the loop cost grows with particle
+count as well as pixels. If the combined figure misses the "minutes" target at real
+scale, `measure_frame` is where to look first, not the segmenter.
+
+Regenerate all of the above with `python scripts/bench_drift_particles.py`.
+Verify the whole feature with `python scripts/verify_drift_particles.py --all`.
+
+### Classical segmentation at 4096² — where the time goes (2026-07-30)
+
+Reported as "just too slow for a 4k x 4k image". Stage profile of one frame:
+
+| stage | time | share |
+|---|---|---|
+| `gaussian_filter(sigma=1)` | 0.46 s | 7% |
+| `threshold_otsu` | 0.23 s | 4% |
+| **`distance_transform_edt`** | **3.93 s** | **61%** |
+| gaussian on the distance | 0.43 s | 7% |
+| `peak_local_max` | 0.58 s | 9% |
+| `watershed` | 0.60 s | 9% |
+| **total** | **6.40 s** | |
+
+**The distance transform is the cost, not watershed** — which is the opposite of
+the intuition, and it is why "make watershed faster" would have been wasted work.
+
+The EDT is used for exactly two things: seeding markers and giving watershed an
+elevation. Neither needs full resolution, so above ~2 MP both are computed on a
+decimated grid and the elevation is bilinearly upsampled (rescaled by the factor
+to stay in pixel units). **Detection is untouched** — the threshold still runs at
+full resolution, so *which* bodies are found is unchanged and §0.9's faint-particle
+sensitivity is unaffected. Only the cut BETWEEN two touching bodies moves, by about
+`factor` px.
+
+| frame | full-res split | auto-decimated | speedup | count | median area |
+|---|---|---|---|---|---|
+| 1024² touching | 0.34 s | 0.30 s | 1.1× | 162 = 162 | 298 = 298 |
+| 4096² touching | 7.09 s | 2.82 s | **2.5×** | 162 = 162 | 4762 = 4762 |
+| 4096² isolated | 8.14 s | 2.80 s | **2.9×** | 81 = 81 | — |
+
+Identical counts and identical median areas at 0.0% difference, on both touching
+and isolated fields — the decimation is free in accuracy terms on this data.
+
+**Turning "Split touching" OFF is a further 1.9×** (2.80 s → 1.45 s) and is the
+right choice whenever particles are isolated, because watershed then has nothing
+to do and the whole EDT is skipped. Decimating past 2 buys almost nothing
+(2.80 → 2.73 s) since the EDT is no longer dominant once it is decimated at all.
+
+Remaining levers, unmeasured, in the order they look worth trying:
+
+1. **Tile + thread.** scipy's EDT and watershed are single-threaded and both
+   release the GIL, so banding the frame with a halo of the largest particle
+   radius should scale with cores — the `region_sum.py` precedent got 6.6× from
+   exactly this shape. The halo makes the EDT correct at tile edges; watershed and
+   the threshold tile cleanly.
+2. **GPU EDT** (`cupy.ndimage.distance_transform_edt`). Only worth it if the frame
+   is already on the device; a 64 MB round trip per frame is most of the win.
+3. **Skip the EDT where nothing touches.** Connected components whose area matches
+   a single-body prior do not need splitting at all; only ambiguous ones do.
+
+#### The profile moved after decimation shipped — re-measure before optimising
+
+Re-profiled 2026-07-30 on the same 4096² touching field (162 bodies, median area
+4762 px) with the decimation in place. The EDT is **no longer the cost** — it is
+4% of the frame. Optimising it further would have been wasted work, exactly as
+optimising the watershed would have been before:
+
+| stage | 4096² |
+|---|---|
+| `gaussian_filter(sigma=1)` | 0.42 s |
+| `threshold_otsu` | 0.24 s |
+| label + min_size pre-filter | 0.19 s |
+| `distance_transform_edt` (decimated ×4) | **0.11 s** |
+| marker smooth + `peak_local_max` | 0.05 s |
+| upsample markers + elevation | 0.70 s |
+| `watershed` | 0.67 s |
+| size filter + sequential relabel | 0.33 s |
+| **total** | **2.69 s** |
+
+Two things that are *not* levers, measured rather than assumed:
+
+* **`ndi.distance_transform_edt` and `skimage.watershed` do not thread well.**
+  Per-connected-component processing (exact, since a masked watershed cannot flood
+  between components — no halo or union-find needed) got 4096² from 1.53 s to
+  0.39 s serial, but only to **0.17 s at 4 threads and got *worse* past that**
+  (0.22 s at 16). `gaussian_filter` and `ndi.label` *do* release the GIL — banded
+  they give 452→71 ms (bit-identical) and 92→21 ms — but the EDT/watershed pair
+  saturates at ~2.2×. Row-band threading is not the `region_sum.py` story here.
+* **`np.isin`/`np.unique` on the label raster cost more than the algorithm.**
+  `_relabel_sequential`'s `np.unique` alone is a 139 ms full sort of 16.7 M
+  elements. Fusing the size filter and the relabel into one `bincount` + one LUT
+  gather (`_finalize_labels`) is 302 → 164 ms and bit-identical.
+
+### The boundary class: making the split unnecessary (2026-07-30)
+
+`split_instances` is shared by all three engines, so no engine-level work changes
+what a big frame costs while every engine funnels into a 2 s watershed. The way
+out is not to make the split faster but to make it **unnecessary**: the ilastik
+convention paints particle / background / **boundary**, and a head that has been
+shown the joins returns touching particles already separated. Instances are then
+plain connected components and neither the EDT nor the watershed runs.
+
+Measured at 4096², CUDA (TITAN X Pascal), 162-body touching field, scribble engine
+trained on a 1024² crop:
+
+| stage | watershed route | boundary route |
+|---|---|---|
+| predict (featurise + head + readback) | 0.96 s | 0.96 s |
+| threshold | — | 0.02 s |
+| `ndi.label(fg & ~boundary)` | — | 0.07 s |
+| reclaim the seam | — | 0.08 s |
+| EDT + markers + watershed | 1.62 s | **0 s** |
+| size filter + relabel | 0.16 s | 0.16 s |
+| **split subtotal** | **1.78 s** | **0.33 s** (5.4×) |
+| **end to end** | **2.73 s** | **1.29 s** |
+
+**Accuracy is better, not merely comparable**: the boundary route found n=162 —
+the exact ground truth — where the watershed found 173 (11 spurious), at the same
+median area (5670 vs 5668, +0.0%). On the `particle_movie()` fixture both routes
+give the same count and the same areas, both faint §0.9 probes are still found,
+and the deliberately-touching pair is split at the merge frame.
+
+**The one thing that must be got right is what "boundary" is trained on.** It is
+the seam BETWEEN two bodies, never the outline of one. A head taught outlines
+learns "shrink everything": measured on the fixture's merge frame it MERGED the
+touching pair and lost 40% of the median area. Training on 30 px of seam is
+likewise useless — it took the fast route and returned 81 bodies where the
+watershed found 162. The caret's per-class pixel counts are what surface this,
+and `seg_train` now says which route the training selected.
+
+#### Feature stack — the remaining floor
+
+The split is no longer the cost; **featurising is**, at 0.68 s of the 1.29 s.
+Two bit-identical fixes, measured at 4096² on CUDA:
+
+| | old banding (143 rows, 29 bands) | device banding (574 rows, 8 bands) |
+|---|---|---|
+| median reduced along the strided axis | 1.27 s | 0.85 s |
+| median reduced along a contiguous axis | 1.04 s | **0.68 s** |
+
+* **Band size.** Every band re-featurises `halo` rows above and below, so a
+  256 MB band at 4096² spends 36% of its work on halo. A device-sized band
+  (`GPU_BAND_BYTES`, clamped to ¼ of *free* VRAM) cuts that to 11%. It is a
+  ceiling and not a target because overshooting is catastrophic rather than
+  merely slower: the same sweep at 1536 rows/band took **12.8 s** and at one band
+  **26.7 s**, thrashing the allocator on a 12.9 GB card.
+* **Median layout.** `F.unfold` returns `(1, k², h·w)`, so `median(dim=1)` reduces
+  along the *strided* axis. Transposing first makes each window's taps adjacent:
+  52.2 → 19.6 ms + 3.7 ms for the copy, on a 768×4096 band at r=2. Bit-identical
+  (an odd-window median is a selection). Not worth it at r=1 (19.0 vs 20.4 ms),
+  so it is gated on window size.
+
+Remaining, unmeasured, in the order they look worth trying:
+
+1. **A sorting network for the r=1 median** — measured 20.4 → **5.2 ms** per band,
+   bit-identical, but 24 hand-written compare-exchanges. Worth ~80 ms/frame.
+2. **The convolutions are ~30× off memory-bandwidth peak.** The 5-sigma gaussian
+   pyramid moves ~134 MB per separable pass and should be ~4 ms on this card;
+   it measures 118 ms. `F.pad` allocates a fresh padded copy per convolution and
+   cuDNN is being handed 1-channel images. Batching the sigmas into the channel
+   dimension is the obvious shape.
+3. **Threading `_finalize_labels`** (158 ms: 93 ms `bincount` + 66 ms gather).
+   Both are memory-bound and band cleanly; banded `bincount` measured 116 → 51 ms.
+
+#### Two independent reproductions of the outline trap (2026-07-30)
+
+The boundary route's hazard is not theoretical and it is not rare — it is what a
+first attempt produces. Both of these were meant to be routine verification and
+both hit it instead:
+
+* **In the app** (`segment_wizard.spec.ts`, bundled 6-frame movie): one straight
+  seam stroke, 135 px, took the preview from **9 particles to 2**. The caret
+  reported `Trained on 1049 px, 3 classes · acc 1.000 · cuda · seam split` — a
+  perfect training accuracy and the fast route, on a result 78% worse.
+* **At 4096²** (648 touching discs, seam synthesised as `grey_dilation(lab) != lab`,
+  i.e. a RING around each body rather than the join between two): the seam route
+  returned **324 bodies — exactly half the ground truth**, every pair merged, at
+  2.6× the correct median area. 1.31 M px (7.8% of the frame) came back as
+  boundary. Speed was as advertised: split 2.66 s → 0.375 s (7.1×), end to end
+  3.78 s → 1.49 s (2.5×).
+
+The second one is the informative one: the ring is the *intuitive* reading of the
+word "boundary", it is what an automated seam-builder writes on the first try, and
+it produces a confidently wrong answer with a clean training accuracy. Speed and
+correctness are independent here — the route was fast in both reproductions and
+right in neither.
+
+What is on screen today: the caret's persistent line says `seam split` vs
+`watershed split`, and the strip's hover text says to paint the seam and not the
+outline. Neither is a guard. **There is currently nothing that stops a wrongly
+trained boundary from silently replacing a good answer with a bad one.**
+
+### The batch run at real scale: 900 x 4096² (2026-07-30)
+
+Reported as "scribble segmentation over 900 frames of 4096x4096 is far too slow,
+and the GPU is hardly used, as are the CPUs". Measured on a REAL in-situ growth
+movie (`20251117_88075_run3…mrc`, 977 x 4096² uint8, 15.3 GB) — 48 cores, one
+TITAN X Pascal, 9 workers x 4 threads, which is what `_compute_worker_plan`
+builds here.
+
+#### Where one frame goes, and it is not where the previous sections say
+
+| stage | classical | scribble |
+|---|---|---|
+| read one frame (lazy MRC, memmap) | 0.12 s | 0.12 s |
+| segment / predict | 3.0 s | 1.5 s |
+| split | (in segment) | 2.0 s |
+| **measure** | **53.5 s** | **2.4 s** |
+| **total** | **56.6 s** | **6.0 s** |
+| particles found | 26 566 | 1 139 |
+
+**`measure_frame` is the run.** The 2026-07-29 fixture note predicted this
+("`measure_frame` is 3.7x the cost of `segment_frame`, which is the wrong way
+round and is the thing to watch… if the combined figure misses the *minutes*
+target at real scale, `measure_frame` is where to look first") and it is worse
+than predicted, because the cost is per PARTICLE and a real frame has tens of
+thousands. Inside it, at 26 566 particles:
+
+| `regionprops_table` property | time |
+|---|---|
+| **solidity** | **29.4 s** |
+| eccentricity | 11.3 s |
+| major_axis_length | 11.5 s |
+| minor_axis_length | 11.3 s |
+| perimeter | 4.1 s |
+| centroid | 2.1 s |
+| equivalent_diameter_area | 1.2 s |
+| area | 1.2 s |
+| bbox | 1.1 s |
+| **all together (shared intermediates)** | **43.8 s** |
+| `_fill_intensity` | 4.9 s |
+| `_contours` | 4.8 s |
+
+`solidity` is a convex hull per region; the three axis/eccentricity properties
+share one inertia tensor. Every scipy.ndimage equivalent of the cheap ones is
+1-2 orders faster on the same raster (`bincount` area 0.13 s vs 1.2 s;
+`find_objects` bbox 0.065 s vs 1.1 s; `center_of_mass` 1.0 s vs 2.1 s), so the
+whole table is vectorisable in principle — but that changes what a particle's
+measured properties ARE, so it is a proposal, not a drive-by.
+
+#### It is GIL-bound, so PROCESSES are the unit of parallelism, not threads
+
+`regionprops_table` releases the GIL essentially never. Four 2048² quadrants of
+the same frame, in four threads of one process:
+
+| threads | wall | speedup |
+|---|---|---|
+| 1 quadrant, serial | 10.4 s | — |
+| 2 quadrants, 2 threads | 21.2 s | **0.99x** |
+| 4 quadrants, 4 threads | 45.0 s | **0.93x** |
+| 8 quadrants, 8 threads | 168.8 s | **0.49x** |
+
+`_contours` (1.23 s -> 6.35 s for 4x the work) and `_fill_intensity`
+(1.25 -> 5.74 s) are the same. So banding a frame across threads — the
+`region_sum.py` trick — cannot work here, and a dask worker's four task slots
+are worth one core, not four. **The effective parallelism of a segmentation
+batch is the WORKER COUNT.**
+
+#### The dual-lane fan-out (spyde/particles/batch.py)
+
+| engine | frames | config | frames/s | 900-frame projection |
+|---|---|---|---|---|
+| scribble | — | serial (the retired loop) | 0.166 | 1h30m |
+| scribble | 24 | dual lane, 4 GPU feeders, torch unpinned | 0.159 | 1h34m |
+| scribble | 60 | dual lane, 1 GPU feeder, torch 1 thread | 0.222 | 1h07m |
+| scribble | 60 | **GPU-only, 1 feeder** | **0.270** | **55m** |
+| scribble | 60 | GPU-only, 2 feeders | 0.252 | 59m |
+| scribble | 60 | GPU-only, 4 feeders | 0.260 | 58m |
+| classical | — | serial | 0.0177 | 14h09m |
+| classical | 36 | fan-out, 9 workers x 4 threads | 0.052 | 4h48m |
+
+Classical gets **2.9x**, scribble **1.6x**. Both are far short of the 9-ish the
+worker count allows, and the reason is the same in both: the frame's dominant
+stage holds the GIL, so four task slots per worker do not add throughput, and
+what is left competes for memory bandwidth.
+
+#### Three things that are NOT true, measured
+
+* **"Four GPU feeders keep the device fed" (the neural default) does not
+  transfer.** The first measurement said 4 feeders made a frame 13x slower
+  (110 s vs 8 s of predict+split) — but that run also had five CPU-lane workers
+  running 48-thread torch predicts, so it was contention, not the lane count.
+  Re-measured cleanly with an empty CPU lane, 1/2/4 feeders are 0.270 / 0.252 /
+  0.260 frames/s: **flat**. More feeders neither help nor (much) hurt, because
+  the device is not the constraint — a single worker process is, and it is
+  GIL-bound. The segmentation lane default is `"one"` on that basis.
+* **The CPU lane is worse than nothing for scribble**, which is the opposite of
+  what the isolated numbers suggest. One CPU predict at 4096² costs 65.8
+  core-seconds at 1 torch thread (35.1 s x 2 threads = 70.2, 18.8 x 4 = 75.2,
+  11.2 x 8 = 89.8, 7.0 x 16 = 111.6, 9.0 x 48 = 430.5 — intra-op threading
+  costs MORE work the wider it goes, so every worker pins
+  `torch.set_num_threads(1)` and lets frame-level parallelism do the work).
+  Against 1.6 s on the GPU that is 41x in core-seconds but only ~2x per frame,
+  which looks like most of a doubling. In the cluster the CPU lane contributed
+  0.16 frames/s and cost the GPU lane 0.5 (its frames went 5.8 s -> 25-29 s),
+  so the run went 0.270 -> 0.222. GPU-only, as the neural batch already does.
+* **Batching the gaussian sigmas into the channel dimension is SLOWER.** The
+  "Feature stack — the remaining floor" note above proposed it as "the obvious
+  shape" for the convolutions that sit ~30x off memory-bandwidth peak. Measured
+  on a 574x4096 band and on a full 4096², one conv2d per axis with all five
+  sigmas as output channels (zero-padded to the widest radius, `groups=5` on the
+  second axis): **18.9 -> 22.0 ms** and **100.0 -> 135.1 ms**, i.e. **0.86x and
+  0.74x**. It is bit-identical (`torch.equal` True — a zero tap contributes
+  exactly 0.0), so the idea is sound and only the economics are wrong: padding
+  every kernel to radius 32 turns 129 taps of work into 325. The 30x-off-peak
+  observation stands; batching is not the way to collect it. NB the pyramid is
+  ~0.15 s of a 6.0 s scribble frame, so the whole remaining prize there is 2.5%.
+
+#### The trap this benchmark hit first, which the app does not
+
+The first cluster run spent 90 s in stall pokes on a
+`rechunk-merge-rechunk-transfer` before segmenting a single frame. RosettaSciIO
+auto-chunks this movie as a balanced cube — `(511, 511, 511)` — which SPLITS the
+signal axes, so one frame spans 64 blocks and 8.5 GB, and asking for whole
+frames one at a time is a full P2P shuffle of the movie (CLAUDE.md
+Live-Display §1). The app never sees this: `Session._signal_spanning_chunks`
+re-loads every movie with `chunks=(1, -1, -1)`, free, at load. `batch._dispatch`
+now REFUSES to rechunk the signal axes and falls back to the streaming accessor
+with a warning naming the fix, and the benchmark loads the way the app loads.
+
+### Vectorising `measure_frame`: 53.5 s -> 10.2 s, every column bit-identical (2026-07-30)
+
+The section above says `measure_frame` **is** the run and that fixing it "changes
+what a particle's properties ARE". It turns out it does not have to. Measured on
+the same real frame (`20251117_88075_run3…mrc` frame 10, 4096², **26 566**
+particles) with `spyde/tests/migrated/test_particles_props_parity.py` as the gate.
+
+#### Almost every column is a label-wise reduction, and one is not
+
+| `regionprops_table` column, alone | s | replaced by |
+|---|---|---|
+| solidity | **30.5** | `hull.convex_areas` — numba, exact integer hull |
+| major_axis_length | 11.9 | second central moments (`bincount`) |
+| minor_axis_length | 12.0 | " |
+| eccentricity | 11.8 | " |
+| perimeter | 4.1 | border-crossing weights, whole frame at once |
+| centroid | 2.3 | `bincount` |
+| equivalent_diameter_area | 1.5 | a function of `area` |
+| area | 1.4 | `bincount` |
+| bbox | 1.1 | `ndi.find_objects` |
+| **whole table (shared intermediates)** | **43.7** | **1.09 s (40x)** |
+
+`regionprops_table`'s cost is per REGION — a Python object, and for `solidity` two
+Qhull calls and a polygon rasterisation, ~1.1 ms each, 26 566 times. The
+arithmetic is nothing; the per-region overhead is everything.
+
+#### The parity is not "close", it is the same numbers
+
+Per column against `regionprops_table` on the real 26 566-region raster:
+
+| column | agreement |
+|---|---|
+| label, area, bbox-* | **exact** (integers) |
+| centroid-0/1 | **exact** — both sum exact integers in float64 |
+| equivalent_diameter_area | **exact** (a function of `area`) |
+| **solidity** | **exact** — `area_convex` matches on **26 566 / 26 566** regions, zero differing pixels |
+| perimeter | 3.5e-16 relative |
+| major/minor_axis_length | 1.0e-15 / 4.9e-15 relative |
+| eccentricity | 1.6e-14 relative |
+
+The float differences are summation ORDER and nothing else, and at the float32
+resolution the property rows are stored in, **all 21 output columns and every
+contour come out bit-identical** between the two paths.
+
+Three things made that possible rather than lucky:
+
+* **Central moments in skimage's own frame, two-pass.** `RegionProperties` takes
+  `moments_central(image, centroid_local, …)` — about the LOCAL centroid, in the
+  bbox crop's coordinates. Doing the algebraically-equal raw-to-central expansion
+  in GLOBAL coordinates instead cancels, and that is where a first attempt lost
+  eccentricity to 1.4e-5. Subtracting the bbox origin per pixel costs one gather.
+* **The same 2x2 eigenproblem.** `np.linalg.eigvalsh` on a stacked `(N, 2, 2)` is
+  the same LAPACK call skimage makes one at a time, so `4*sqrt(l1)` agrees to
+  1e-15 instead of to a closed-form solver's 1e-9.
+* **The hull in exact integers.** skimage's `convex_hull_image` replaces each
+  pixel with the four diamond offsets `(r±0.5, c)`, `(r, c±0.5)`. **Double every
+  coordinate and those are integers** — so the monotone chain's cross products and
+  the inside-or-on test are `int64` comparisons with no tolerance to tune and no
+  tie to lose. Reducing to the first/last pixel of each row first is not an
+  approximation (a pixel between them is in their hull, so it is never a vertex).
+
+`SPYDE_PARTICLE_PROPS=legacy` restores `regionprops_table`; it is what the parity
+test compares against and what runs if numba cannot compile.
+
+#### Where the frame now goes — the remaining floor moved, it did not vanish
+
+| stage | before | after |
+|---|---|---|
+| property table | 43.7 s | **1.09 s** |
+| `_fill_intensity` | 4.7 s | 4.7 s (untouched) |
+| `_contours` | 4.7 s | 4.7 s (untouched) |
+| **`measure_frame`** | **53.2 s** | **10.2 s (5.2x)** |
+
+**`_fill_intensity` + `_contours` are now 92% of the measurement**, and both are
+exactly what the property table used to be: a Python `for` loop over regions, one
+`binary_dilation` and one `find_contours` per particle. The intensity statistics
+are the same shape of `bincount` the moments turned out to be; the local
+background RING (a dilation per particle, which overlapping neighbours can each
+claim) and marching-squares contours are not, and are the reason they were left.
+
+#### The GIL half of the prize did NOT land, and the reason is measurable
+
+The point of removing `regionprops_table` was twofold — the per-frame cost, and
+the fact that it never releases the GIL, so a worker's four task slots are worth
+one core. Re-running the same threaded-quadrants experiment (four 2048² quadrants,
+four threads, one process):
+
+| what | 1 quadrant | 4 quadrants / 4 threads | scaling |
+|---|---|---|---|
+| property table, `regionprops_table` | 10.68 s | 33.79 s | 1.26x |
+| property table, **vectorised** | 0.26 s | 0.43 s | **2.48x** |
+| `measure_frame`, legacy | 12.78 s | 42.64 s | 1.20x |
+| `measure_frame`, **vectorised** | 2.47 s | 10.53 s | **0.94x** |
+
+The table itself now scales — 1.26x to 2.48x, and its own numba kernel is already
+using every core inside one call, so 2.48x on top of that is the honest ceiling for
+four threads. But **`measure_frame` as a whole still does not**, because the 9.4 s
+that is left is the two Python loops, and they hold the GIL exactly as
+`regionprops_table` did. So "the effective parallelism of a segmentation batch is
+the WORKER COUNT" is still true, and it will stay true until `_fill_intensity` and
+`_contours` go the same way.
+
+#### End to end, same cluster, same movie, same frame count
+
+`benchmark_particles_batch --frames 36 --engine both`, 9 workers x 4 threads, one
+TITAN X Pascal — the identical configuration the 4h48m / 55m numbers above were
+taken on.
+
+| | one frame | throughput | **900 frames** |
+|---|---|---|---|
+| classical, before | 56.6 s | 0.052 frames/s | 4h48m |
+| classical, **after** | **14.3 s** (3.1 segment + 11.2 measure) | **0.319 frames/s** | **47m** |
+| scribble, before | 6.0 s | 0.270 frames/s | 55m |
+| scribble, **after** | **4.7 s** (1.4 predict + 2.0 split + 1.3 measure) | **0.419 frames/s** | **36m** |
+
+**Classical is 6.1x, and only 4.0x of that is the frame getting cheaper** — the
+rest is the fan-out working better than it did. Serial classical is now
+0.070 frames/s, so the cluster multiplies it by **4.6x** where it managed 2.9x
+before: the property table releases the GIL (numba `nogil`, numpy ufuncs), so a
+worker's four task slots are finally worth more than one core. Scribble gains
+1.55x, which is all it can — it segments 1 139 particles per frame, not 26 566, so
+measurement was never its bottleneck (2.4 s -> 1.3 s of a 4.7 s frame).
+
+In-cluster per-frame stages (`drain_stage_log`), which say where the rest went:
+
+| lane | frames | engine/f | measure/f | block/f |
+|---|---|---|---|---|
+| classical, cpu x9 | 36 | 7.32 s | 54.31 s | 61.63 s |
+| scribble, cuda x1 | 36 | 7.47 s | 1.56 s | 9.03 s |
+
+A classical frame measures in 11.2 s alone and **54.3 s** with 36 of them in
+flight — a 4.9x contention factor, against 2.4x for the segmentation. That is the
+signature of the remaining GIL-bound Python loops plus memory bandwidth, and it is
+the next thing worth attacking: `_fill_intensity` and `_contours`.
+
+**Minutes is still not reached.** 47m is 6x better and not 60x, and the arithmetic
+says why: 900 frames in 5 minutes across 9 workers is ~3 s of wall per frame, and
+one classical frame is 14.3 s of work of which 9.4 s is two Python `for` loops
+over 26 566 regions. Vectorising those the way the property table was vectorised
+is worth roughly another 2.5x on the frame **and** should lift the fan-out again,
+which together is the difference between 47 minutes and ~10.
+
+### The last two loops: `measure_frame` 10.2 s -> 1.37 s, and the fan-out unblocked (2026-07-30)
+
+The section above ends by naming exactly what was left — "one classical frame is
+14.3 s of work of which 9.4 s is two Python `for` loops over 26 566 regions" — and
+predicting the prize: "roughly another 2.5x on the frame **and** should lift the
+fan-out again, which together is the difference between 47 minutes and ~10." Both
+halves landed. Same real frame (`20251117_88075_run3…mrc` frame 10, 4096²,
+**26 566** particles), same box, same cluster.
+
+#### `_fill_intensity`: three `bincount`s and one kernel
+
+`intensity_mean` / `intensity_max` / `intensity_std` are label-wise reductions over
+the foreground and go the way the moments went — `bincount` with weights for the
+sums, one label-grouped `np.maximum.reduceat` for the max (`np.maximum.at` is an
+unbuffered per-pixel ufunc call and is ~50x slower than the radix sort it avoids).
+`intensity_std` is computed the way `np.std` computes it, mean first and then the
+mean of squared deviations, NOT as `E[x²] - E[x]²` — algebraically equal, and it
+cancels away the digits that matter exactly where a particle is bright and
+uniform, which is the normal case.
+
+`background` is the half that is not a reduction: it is the mean over the pixels a
+**dilation of THIS particle by `ring`** adds and that belong to no particle. That
+is a per-particle neighbourhood which overlapping neighbours may each claim, so it
+is not a partition of the raster and no `bincount` expresses it. It keeps the
+definition exactly — an iterated 4-connected dilation inside the same padded bbox
+crop, which is what `binary_dilation`'s default structure and `border_value=0`
+do — in a numba `prange` kernel with the GIL released, the way `hull.py` does for
+the convex hull.
+
+| | before | after |
+|---|---|---|
+| `_fill_intensity` at 26 566 regions | **4.92 s** | **0.187 s (26x)** |
+
+**All four columns are bit-identical on the real frame** — `max |diff| = 0.0` on
+all 26 566 rows for `intensity_mean`, `intensity_max`, `intensity_std` and
+`background`, with the same NaN pattern, and the same again with a 64-row
+NaN-padded border (the drift-corrected case) blanked into the frame. The pixel
+SETS are identical by construction; only summation order differs, and at the
+float32 resolution the rows are stored in that is nine orders below the last bit.
+
+#### `_contours`: marching squares is a case table, and assembly is a walk
+
+`find_contours` is Cython, but `_assemble_contours` — the part that joins its
+segments into contours — is a pure-Python dict-and-deque walk, and the whole call
+is ~177 us per region. Two observations collapse it:
+
+* **On a BINARY mask at level 0.5, every vertex is an edge midpoint.**
+  `_get_fraction` is `(0.5 - 0) / (1 - 0)` for every edge the case table actually
+  uses, so a vertex is at `(i + 0.5, j)` or `(i, j + 0.5)` — it IS the crack
+  between two 4-adjacent pixels, and can be named by an integer index with no
+  floating point anywhere.
+* **The segments form disjoint paths and cycles, and nothing else.** Each cell
+  emits its segments oriented low-on-the-left, and a crack interior to the crop is
+  shared by exactly two cells, appearing once as a tail and once as a head. So
+  in-degree and out-degree are both <= 1, `_assemble_contours` recovers exactly the
+  maximal chains, and following a `succ` array recovers the same ones in the same
+  direction.
+
+| | before | after |
+|---|---|---|
+| `_contours` at 26 566 regions | **4.77 s** | **0.149 s (32x)** |
+
+##### The parity gate here is NOT vertex identity — and it is not "close enough" either
+
+A closed contour is a CYCLE. skimage's assembly and a `succ`-following walk cut it
+at different vertices, so the arrays differ **by a rotation while describing the
+same shape**. Demanding bit-identical vertices rejects a correct implementation,
+and that is where a first attempt stops and declares the loop untouchable.
+
+The opposite conclusion is the more dangerous one, and it is also wrong: outlines
+are not a display choice. `SpyDEParticles.render_frame` FILLS them to rebuild the
+label movie, and `mask_at` fills one to produce the per-particle mask a mean
+diffraction pattern is sliced with. A different contour is a different mask is a
+different measurement. So the gate is the thing those two consume, and nothing
+weaker:
+
+> **`skimage.draw.polygon` on the new outline must select EXACTLY the same pixels
+> as on the old one, for every region.** A boolean set equality — not a tolerance,
+> not an IoU.
+
+On the real frame: **26 566 / 26 566 regions fill to an identical pixel set**, and
+the vertex COUNT matches on 26 566 / 26 566 as well. On 14 581 regions of random
+thresholded noise the same holds, and additionally every closed contour is a
+literal rotation of skimage's while every open one is bit-identical.
+
+Two details that look like trivia and decide the answer:
+
+* **`np.rint` is round-half-to-EVEN, and it is applied in CROP coordinates.** Every
+  vertex here is a half-integer, so the rounding is entirely in the tie case and
+  resolves on the PARITY of the crop-local coordinate — which depends on where the
+  padded bbox happens to start. Two congruent particles at different positions
+  therefore get genuinely different integer outlines. That is the behaviour on disk
+  today; reproducing it means rounding in the crop frame and offsetting afterwards,
+  never the reverse.
+* **Which contour is "the" contour.** The caller takes `max(cs, key=len)`, and `cs`
+  is ordered by `_assemble_contours`'s creation counter, which after every merge
+  keeps the smaller of the two keys — so it equals the order of each contour's
+  SMALLEST segment index. Ties in length break to the chain containing the earliest
+  cell in raster order, and that is reproduced explicitly rather than left to
+  whatever order a walk happens to discover.
+
+#### Where the frame goes now
+
+| stage | original | after props+hull | after this |
+|---|---|---|---|
+| property table | 43.7 s | 1.09 s | 1.08 s |
+| `_fill_intensity` | 4.9 s | 4.9 s | **0.19 s** |
+| `_contours` | 4.8 s | 4.8 s | **0.15 s** |
+| **`measure_frame`** | **53.2 s** | **10.2 s** | **1.37 s (38x)** |
+
+#### The GIL half of the prize, which is why this was worth doing at all
+
+The previous pass got the property table to 2.48x in four threads but left
+`measure_frame` as a whole at **0.94x**, "because the 9.4 s that is left is the two
+Python loops, and they hold the GIL exactly as `regionprops_table` did". Same
+experiment — four 2048² quadrants of the same frame, in one process:
+
+| what | 1 quadrant | 4 quadrants / 4 threads | scaling |
+|---|---|---|---|
+| property table, `regionprops_table` | 10.86 s | 34.08 s | 1.27x |
+| property table, vectorised | 0.27 s | 0.41 s | 2.63x |
+| `measure_frame`, legacy | 12.75 s | 41.43 s | 1.23x |
+| `measure_frame`, **vectorised** | **0.40 s** | **0.56 s** | **2.82x** |
+
+`measure_frame` now scales BETTER than the property table alone, because all three
+of its stages are numba `nogil` kernels or numpy ufuncs and the Python that remains
+is per-FRAME rather than per-region. "The effective parallelism of a segmentation
+batch is the WORKER COUNT" — asserted twice in the sections above — is no longer
+true: a worker's four task slots are finally worth more than one core.
+
+#### End to end, same cluster, same movie, same frame count
+
+`benchmark_particles_batch --frames 36 --engine both`, 9 workers x 4 threads, one
+TITAN X Pascal — the identical configuration every row above was taken on. One run
+per engine.
+
+| | one frame | throughput | **900 frames** |
+|---|---|---|---|
+| classical, original | 56.6 s | 0.052 frames/s | 4h48m |
+| classical, after props+hull | 14.3 s | 0.319 frames/s | 47m |
+| classical, **after this** | **5.1 s** (3.2 segment + 1.9 measure) | **1.152 frames/s** | **13m01s** |
+| scribble, original | 6.0 s | 0.270 frames/s | 55m |
+| scribble, after props+hull | 4.7 s | 0.419 frames/s | 36m |
+| scribble, **after this** | **4.3 s** (1.4 predict + 1.9 split + 1.0 measure) | **0.499 frames/s** | **30m04s** |
+
+**Classical is 3.6x on top of the previous pass and 22x on the original**, and only
+2.8x of this pass is the frame getting cheaper — the rest is the fan-out finally
+working. Scribble gains 1.19x, which is all it can: it segments 1 139 particles per
+frame, not 26 566, so measurement was never its bottleneck (1.56 s -> 1.06 s
+in-cluster).
+
+In-cluster per-frame stages (`drain_stage_log`), which say where the rest went:
+
+| lane | frames | engine/f | measure/f | block/f |
+|---|---|---|---|---|
+| classical, cpu x9, before | 36 | 7.32 s | **54.31 s** | 61.63 s |
+| classical, cpu x9, **after** | 36 | 7.53 s | **3.97 s** | 11.51 s |
+| scribble, cuda x1, **after** | 36 | 6.53 s | 1.06 s | 7.59 s |
+
+A classical frame used to measure in 11.2 s alone and 54.3 s with 36 in flight — a
+**4.9x** contention factor that was the signature of the GIL-bound loops. It now
+measures in 1.4 s alone and 4.0 s in flight: **2.9x**, and what is left there is
+memory bandwidth (nine workers each streaming a 16.7 MP frame), not a lock.
+
+**Minutes is reached** — 13m01s, against the ~10m the previous section projected
+from 47m. And the bottleneck has MOVED: `segment_frame` is now 7.5 s of the 11.5 s
+in-cluster block and `measure_frame` is 1.4 s of a 5.1 s solo frame, so the next
+thing worth attacking on the classical path is the segmentation, not the
+measurement. Note also that the classical run finds **1 283 491 particles across 36
+frames** and the scribble run 44 846 — the two engines are not measuring the same
+scene, and their per-frame numbers are not comparable to each other, only to their
+own previous rows.
+
+### Navigator fill: the per-chunk submit loop vs the shared dispatcher (2026-07-30)
+
+Real file: `20251117_88075_run3 some growth_1236_movie.mrc` — 977 x 4096² uint8,
+15.27 GB, 1-D nav, loaded via `load_aligned` (1 frame/chunk => **977 nav chunks**).
+Real `LocalCluster`, 4 worker processes x 2 threads. `--purge` evicts the file
+from the Windows page cache (FILE_FLAG_NO_BUFFERING) before each run.
+Harness: `spyde/tests/benchmark_nav_fill_dispatch.py`.
+
+The old `compute_with_live_buffer` navigator branch did
+`for slices in all_slices: client.compute(chunk)` — one blocking scheduler round
+trip per nav chunk, all 977 up front, with the GIL held in the client process the
+whole time — and then `client.compute(result_array)` again for the whole array.
+It now routes through `compute_dispatch.dispatch_chunks` (batched submit, bounded
+in-flight window, stall watchdog) and the result is ASSEMBLED from the chunks.
+
+Cold (page cache purged before each run):
+
+| | submit (client-side, GIL held) | first chunk painted | total fill |
+|---|---|---|---|
+| per-chunk loop | **9.86 s** | 16.41 s | 50.83 s |
+| dispatch_chunks | **0.00 s** | **0.08 s** | 50.64 s |
+
+Warm (one throwaway pass first, so I/O is held constant): submit 10.12 s -> 0.00 s,
+total 50.21 s -> 46.53 s. Checksums MATCH in every run: the client-side assembly
+is identical to the whole-array compute it replaced.
+
+Three things this pins down:
+
+* **The submit time is the bug.** 9.9 s during which nothing else in the backend
+  process can run — the navigator sits blank and the paint threads go silent. It
+  is client-side, so it is the same cold or warm. First-visible-pixel goes
+  16.4 s -> 0.08 s (**200x**).
+* **The bounded window costs nothing.** The window here is 4 (half of 8 cluster
+  threads) versus the old path's 977-in-flight, and the total fill did not
+  regress — it improved, because the old path also submitted the duplicate
+  whole-array graph.
+* **A progressive fill is ~7x a monolithic sum, and that is per-TASK overhead,
+  not concurrency.** Warm, one `nav.compute()` of the whole graph is **6.4 s**;
+  977 separate per-chunk futures are 46-50 s either way (~47 ms of scheduler
+  round trip for a task whose work is ~6 ms). Unbounded submission does not fix
+  it (50.2 s) and neither does a bigger window — if the progressive fill is ever
+  worth optimising further, the lever is fewer, larger display chunks, not more
+  in-flight ones.
+
+---
+
+## CNN scribble engine vs the shipped MLP — the prototype does NOT replace it
+
+`python -m spyde.tests.benchmark_scribble_cnn` (CUDA, TITAN X Pascal, 300 steps
+unless swept). Both engines train on the SAME `LabelStore` and are scored by one
+evaluator, so neither gets a scoring path that could flatter it.
+
+The question was whether one small U-Net over the raw frame could replace the
+36 hand-crafted channels + per-pixel MLP. On these numbers: no.
+
+### Train time — the interactive constraint
+
+The caret's tuning loop re-fits on every stroke, so `fit` is the budget that
+matters, and the shipped engine sets it at ~0.5-1.6 s.
+
+| | fixture 96x112, 1.4k labelled px | realistic 2048², 34.8k labelled px |
+|---|---|---|
+| MLP (36ch + head) | **1.64 s** | **1.11 s** |
+| CNN tiny b16/L2 | 2.53 s | 4.30 s |
+| CNN small b32/L3 | 3.39 s | 7.23 s |
+
+**4-6.5x slower to train**, and it grows with label count while the MLP's
+shrinks (the MLP fits a per-pixel head; the CNN pays per crop — 176 of them).
+
+### Quality — worse everywhere, and catastrophically so when labels are sparse
+
+Frame 12 of `particle_movie()`, 9 true particles, against exact ground truth:
+
+| route | engine | IoU | n found / 9 | faint | merge-split |
+|---|---|---|---|---|---|
+| watershed | MLP | **0.745** | **9** | 2/2 | True |
+| watershed | CNN tiny | 0.332 | **78** | 2/2 | True |
+| watershed | CNN small | 0.264 | **65** | 2/2 | True |
+| boundary | MLP | 0.654 | **9** | 2/2 | False |
+| boundary | CNN tiny | 0.647 | 11 | 2/2 | True |
+| boundary | CNN small | 0.511 | 21 | 2/2 | True |
+
+78 particles where there are 9 is not a tuning problem, it is a different
+answer. On the realistic 2048² field (25x more labels) the gap nearly closes —
+MLP 0.809 (n=413/404), CNN small 0.785 (n=434/404), CNN tiny 0.707 (n=388/404).
+
+**That is the finding.** The CNN is LABEL-STARVED on a few strokes, which is
+precisely the interactive scribble case it was meant to serve. It becomes
+competitive only when given a field's worth of labels — by which point the MLP
+is already better AND 6.5x faster to fit.
+
+### Training is non-monotonic in steps — more training makes it worse
+
+Fixture, foreground IoU:
+
+| steps | 50 | 100 | 200 | 300 | 600 |
+|---|---|---|---|---|---|
+| tiny | 0.597 | 0.515 | 0.639 | **0.641** | 0.518 |
+| small | 0.366 | 0.397 | 0.441 | **0.551** | 0.501 |
+
+Both peak at 300 and fall by 600, and tiny's merge-split flips to False there.
+So there is no "train it longer" fix available, and no knee to tune to — the
+step count would have to be fitted per dataset, which is not something a caret
+can ask a user for.
+
+### The one CNN win: inference
+
+| | MLP | CNN tiny | CNN small |
+|---|---|---|---|
+| fixture predict | 14-17 ms | **4-5 ms** | **4-5 ms** |
+| realistic 2048² predict | 0.28 s | **0.17 s** | 0.29 s |
+
+4096² fp32 forward, and note that tiling is not just a memory measure:
+
+| | tiled-1024 | whole frame |
+|---|---|---|
+| tiny (117k params) | 0.367 s / 457 MiB | 0.296 s / 6465 MiB |
+| small (1.93M params) | **0.901 s / 1045 MiB** | 8.781 s / 13127 MiB |
+
+`small` whole-frame wants 13 GB on a 12 GB card, so it spills and runs **10x
+slower** than tiled. Any future CNN path must tile — the whole-frame route is
+only viable for `tiny`.
+
+### Verdict
+
+Not wired in, and it should stay that way. Inference is 1.6-3.5x cheaper, which
+would matter for the 900-frame batch (55 min, above) — but only at quality
+parity, and it is not close on sparse labels. If this is revisited, the thing to
+attack is label efficiency (pretraining, heavier augmentation, or a loss that
+does not reward over-segmentation), not step count or model size: `small` has
+16x the parameters of `tiny` and is WORSE on the fixture.
+
+---
+
+## Non-rigid drift at scale — 4096² x hundreds of frames (2026-07-31)
+
+`python -m spyde.tests.benchmark_drift_nonrigid --frames 300`, CUDA (TITAN X
+Pascal), 120 steps.
+
+The first fact is that the stack CANNOT be held: 300 x 4096² float32 is
+**20.1 GB**. So the cost is two separate numbers that scale differently, and only
+one of them is paid per frame. Quoting a single blended figure would hide the
+one thing a caller has to decide — how much to decimate.
+
+### The FIT is cheap — the whole movie at once
+
+A drift field is smooth by construction (that IS the modelling assumption), so it
+does not need full resolution to be measured. The fit is over a handful of
+parameters per frame — 2 x n_knots, or 2 x gh x gw — and decimation is the
+dominant knob:
+
+| fit size | decimation | scan-knot | dense (6x6) |
+|---|---|---|---|
+| 128² | 32x | 2.73 s | 2.29 s |
+| 256² | 16x | 2.41 s | 7.71 s |
+| 512² | 8x | **9.08 s** | **28.39 s** |
+
+That is for all 300 frames together, i.e. 8-95 ms per frame. Scan-knot barely
+notices the resolution (it has ~6 parameters per frame); dense scales with it,
+because a 6x6 grid bicubically upsampled to 512² is real work per step.
+
+`_NONRIGID_FIT_SIDE = 512` is the conservative choice — more signal for the
+correlation. 256² is 1.2x cheaper for scan-knot and **3.7x** for dense, and a
+smooth field should be perfectly measurable there; that is worth testing against
+recovery accuracy before anyone pays the 28 s.
+
+### The APPLY is the expensive half, and it is PER FRAME
+
+| | ms/frame at 4096² | 300 frames |
+|---|---|---|
+| scan-knot | **385 ms** | 115 s |
+| dense | **432 ms** | 130 s |
+
+**This is the number that matters operationally.** 385 ms is ~23x the 16.7 ms
+60 fps budget, so a non-rigid corrected movie CANNOT be scrubbed frame-by-frame
+the way a rigid one can — rigid applies as an `np.roll` for integer shifts and
+preserves dtype exactly (see `DriftModel.is_integer`), while non-rigid resamples
+every pixel through `grid_sample`. Two consequences worth stating plainly:
+
+* For EXPORT / batch, ~2 minutes over a 300-frame movie is a reasonable price
+  and is dominated by the per-frame resample, not the fit.
+* For INTERACTIVE display, the corrected node needs the same treatment as any
+  other expensive per-frame read — the tiered nav read routes it async
+  (Live-Display §3), or the field is applied to a decimated view for scrubbing
+  and only at full resolution on commit.
+
+The fit is therefore NOT the thing to optimise. Even the slowest fit measured
+(dense at 512², 28 s) is a quarter of the apply cost over the same movie.
+
+### Reading the movie to fit it
+
+The decimated read is one full streaming pass — `_decimated_stack` reads frames
+ONE AT A TIME and strides each immediately, so the 20 GB is never resident. On a
+real `.mrc` at ~3 GB/s that pass is ~7 s, i.e. comparable to the 128²/256² fits
+and cheap against the apply. Strided rather than area-averaged on purpose: the
+fit needs crisp gradients to correlate, and a box mean blurs exactly those.
+
+### Making the apply faster — it is TRANSFER-bound, not compute-bound
+
+The 385 ms above was a CPU number: `apply_nonrigid` had no `device` argument and
+always ran on the host, on a machine whose GPU the *fit* was already using.
+Profiling the stages at 4096² says where it goes and what is worth attacking:
+
+| CPU stage | | CUDA | |
+|---|---|---|---|
+| build field | 68 ms | warp, frame resident | **7.9 ms** |
+| warp (grid_sample) | 262 ms | + both host<->device copies | 41 ms |
+| **total** | **392 ms** | | |
+
+**The warp itself is 7.9 ms; the other ~33 ms is PCIe.** So micro-optimising the
+resample buys almost nothing — the lever is not moving the data. Two things
+follow, and the second is the interesting one:
+
+* The field is now built on the DEVICE from the fitted parameters (a few hundred
+  bytes) instead of on the host and shipped. Building it host-side would add
+  134 MB to the very thing that already dominates.
+* A batch pipeline that keeps frames RESIDENT pays only the 7.9 ms — **~2.4 s for
+  a 300-frame movie** instead of ~14 s. That is the shape any future
+  "correct the whole movie on the GPU" path should take; per-frame calls from
+  host memory can never beat the copy.
+
+After adding `device=` (auto: CUDA when present) and dropping a redundant 67 MB
+`.copy()` on the way out — which was itself a fifth of the GPU path's cost:
+
+| | ms/frame at 4096² | 300 frames | |
+|---|---|---|---|
+| CPU (was 392) | 278 ms | 83.5 s | the field build no longer round-trips numpy |
+| **CUDA (default when present)** | **47.8 ms** | **14.4 s** | **5.8x** |
+
+CPU/CUDA agreement is `max|diff| = 4.2e-04` on data in [0, 1] with identical NaN
+masks — float32 `grid_sample` kernels differ slightly between backends, so this
+is close-but-not-bit-identical, unlike the region-integrator's exact contract.
+Fine for a resampled display frame; do not build an equality test on it.
+
+MPS is deliberately NOT selected by `device=None`. The win here is one fused
+kernel, and an unsolicited MPS submission contends for the shared device lock
+that the neural/scribble paths hold. Opt in with `device="mps"`.
+
+### The navigator fill was submitting ONE task at a time (2026-08-01)
+
+Reported as "why is the computing navigator using a single worker" — the dask
+dashboard showed the distributed backend live, the cluster idle, and tasks
+arriving one by one. It got worse with dataset size (an 800 GB 4D-STEM scan and
+a long movie both), which is the tell.
+
+Not a placement bug. `dispatch_chunks` tops up on EVERY completion, so on the
+**unpinned** lane `lane_cap - outstanding` is 1 in steady state and
+
+    n = min(submit_batch, len(pending), lane_cap - outstanding[lane])
+
+collapses to **n = 1**. `submit_batch=8` only ever applied to the first fill.
+Every subsequent chunk was its own blocking scheduler round trip with the GIL
+held in the client process — the exact cost #95 was written to remove,
+reintroduced through the back door, and scaling with chunk count.
+
+The window was never justified for this lane anyway:
+
+* **It did not measure as backpressure.** Bounded 46-50 s vs unbounded 50.2 s on
+  the same 977-chunk movie (above) — within noise.
+* **`distributed` >= 2022.3 already does it**, queuing root tasks at the
+  scheduler. We were duplicating the scheduler's job, worse, in our process.
+* There is **no placement decision** to make on an unpinned lane, so there is
+  nothing for a window to balance.
+
+Fixed by priming with one small batch and then sending the rest in a single
+submit. 977 chunks, 6 workers x 2 threads:
+
+| | submits | first chunk | total |
+|---|---|---|---|
+| one-at-a-time (the bug) | **970** | 656 ms | 12.40 s |
+| all-at-once | 1 | **1292 ms** | 5.03 s |
+| **prime + bulk (shipped)** | **2** | **45 ms** | **5.28 s** |
+
+**485x fewer round trips, 14.6x faster to first paint, 2.3x faster overall** —
+and note the middle row. Going straight to one all-at-once submit is fastest in
+total but DOUBLES time-to-first-chunk, because the client serialises the whole
+graph before anything comes back. The progressive fill exists so the navigator
+starts filling immediately, so that regression matters as much as the total; the
+priming batch buys it back for one extra round trip. Measuring only wall-clock
+would have shipped the wrong one.
+
+On a synthetic graph each round trip is cheap, so these totals UNDERSTATE the
+real gain: on a real memmap-backed graph a submit is ~14 ms (above), i.e. ~13.6 s
+of GIL-held client time for 977 chunks.
+
+**The dual-lane path keeps its window.** There a completion genuinely pulls the
+next chunk so a ~30x-faster GPU lane and the CPU lane drain one pool and finish
+together — real work stealing the scheduler cannot do, and the reason this
+module exists. Only the unpinned lane changed.

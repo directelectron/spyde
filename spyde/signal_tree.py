@@ -22,6 +22,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+#: Chunks that must still be OUTSTANDING for the threaded navigator fill to hand
+#: over to the cluster mid-flight. Handing over recomputes the chunks already
+#: painted, so with only a handful left that costs more than it saves; with a
+#: movie's worth left it is the difference between seconds and minutes. The
+#: check runs per chunk, so in practice this fires within the first few.
+_NAV_HANDOVER_MIN_CHUNKS = 8
+
+
 
 def _materialise_signal(signal: BaseSignal, array: np.ndarray) -> None:
     """Swap a LAZY signal's dask data for an in-RAM array, the way hyperspy's own
@@ -408,6 +416,39 @@ class BaseSignalTree:
                     done_chunks = 0
                     for combo in itertools.product(*axes_ranges):
                         if _stop.is_set():
+                            return
+                        # HAND OVER to the cluster the moment it exists.
+                        #
+                        # This branch was chosen because `self.client` was None
+                        # at the START — the cluster takes ~10 s and a file
+                        # opened right after launch beats it. Without this check
+                        # that decision was PERMANENT: the whole fill then ran
+                        # single-threaded, one chunk at a time, however many
+                        # workers turned up a second later. On a 977-frame movie
+                        # that is the difference between seconds and minutes,
+                        # and it looked exactly like "the cluster is idle".
+                        #
+                        # It bit movies and not 4D-STEM scans purely by timing:
+                        # a scan goes through the nav-shape prompt (a human
+                        # round trip) so the cluster is always up by the time
+                        # its tree is built, while a movie opens straight
+                        # through.
+                        #
+                        # Re-enter rather than switch in place: the distributed
+                        # branch below owns cancellation, the sidecar save and
+                        # the final repaint, and duplicating any of that here is
+                        # how the two paths drift apart. The chunks already
+                        # painted are recomputed, which is why the threshold
+                        # exists — a handover is only worth it with real work
+                        # left, and this fires within the first few chunks.
+                        if (self.client is not None
+                                and (total_chunks - done_chunks)
+                                > _NAV_HANDOVER_MIN_CHUNKS):
+                            logger.info(
+                                "navigator fill: cluster came up after %d/%d "
+                                "chunks — handing the rest to the dispatcher",
+                                done_chunks, total_chunks)
+                            self._start_progressive_nav_compute(_dask, deep=_deep)
                             return
                         # Yield the disk to active scrubbing: for a large movie
                         # this per-chunk sum reads the whole file, which otherwise
