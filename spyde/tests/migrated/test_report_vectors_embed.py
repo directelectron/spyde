@@ -75,6 +75,182 @@ class TestPackVectors:
         assert ve.pack_vectors(_vecs()) is None      # 8*8*3 = 192 > 10
 
 
+def _vecs_5d(nt=4, ny=5, nx=3):
+    """A 5-D stack whose per-position vector COUNT varies with (t, iy, ix), so a
+    page that slices the wrong stack slice is detectable."""
+    from spyde.signals.diffraction_vectors import (
+        SpyDEDiffractionVectors, _AxisLite, N_COLS,
+        COL_NAV_X, COL_NAV_Y, COL_KX, COL_KY, COL_TIME, COL_INTENSITY)
+    rows = []
+    for t in range(nt):
+        for iy in range(ny):
+            for ix in range(nx):
+                for j in range(1 + (t + iy + ix) % 3):
+                    r = np.zeros(N_COLS, np.float32)
+                    r[COL_NAV_X], r[COL_NAV_Y], r[COL_TIME] = ix, iy, t
+                    r[COL_KX] = -1.0 + 0.1 * (j + t)
+                    r[COL_KY] = -1.0 + 0.1 * (j + iy)
+                    r[COL_INTENSITY] = 10.0 + j
+                    rows.append(r)
+    ax = [_AxisLite(scale=0.1, offset=-1.6, size=32, units="1/nm", name="kx"),
+          _AxisLite(scale=0.1, offset=-1.6, size=32, units="1/nm", name="ky")]
+    return SpyDEDiffractionVectors.from_arrays(
+        flat_buffer=np.asarray(rows, np.float32), full_nav_shape=(nt, ny, nx),
+        sig_shape=(32, 32), sig_axes=ax, kernel_radius_px=3.0,
+        kernel_radius_data=0.3, params={})
+
+
+class TestPackVectors5D:
+    """A 5-D stack used to collapse onto one map in the report.
+
+    ``_nav_offsets_flat`` bailed for any nav shape deeper than 2-D, so the page
+    got NO run-length index and fell back to scanning by ``(iy, ix)`` — which
+    matches EVERY slice's vectors at that position. The explorer showed all
+    slices piled on one pattern, with no way to tell them apart or scrub.
+
+    The fix ships the index over the FULL ``(t, iy, ix)`` grid. That single array
+    is enough for everything: a position slice, a whole-slice row range (t is the
+    outermost sort key, so a slice is contiguous), and the per-slice count map
+    (consecutive offsets differ by that position's count) — so no per-vector time
+    column and no per-slice count image are shipped."""
+
+    def test_index_covers_every_stack_position(self):
+        from spyde.actions.report.vectors_embed import pack_vectors
+        nt, ny, nx = 4, 5, 3
+        vecs = _vecs_5d(nt, ny, nx)
+        payload = pack_vectors(vecs)
+        assert payload is not None, "a 5-D stack must still embed"
+        hdr = payload["header"]
+        assert hdr["nt"] == nt, "the page needs the slice count for its slider"
+        assert hdr["nav_off"] == nt * ny * nx + 1, \
+            "the index must span (t, iy, ix), not just (iy, ix)"
+
+        blob = base64.b64decode(payload["b64"])
+        n = hdr["n"]
+        x = np.frombuffer(blob, "<u2", n, 0)
+        y = np.frombuffer(blob, "<u2", n, 2 * n)
+        off = np.frombuffer(blob, "<u4", hdr["nav_off"], 16 * n)
+        assert off[0] == 0 and off[-1] == n
+
+        for t in range(nt):
+            cm = np.asarray(vecs.count_map_at_t(t))
+            for iy in range(ny):
+                for ix in range(nx):
+                    p = (t * ny + iy) * nx + ix
+                    s, e = int(off[p]), int(off[p + 1])
+                    assert e - s == int(cm[iy, ix]), \
+                        f"slice {t} position ({iy},{ix}) count mismatch"
+                    np.testing.assert_array_equal(x[s:e], np.full(e - s, ix, np.uint16))
+                    np.testing.assert_array_equal(y[s:e], np.full(e - s, iy, np.uint16))
+
+    def test_a_whole_slice_is_one_contiguous_range(self):
+        """What the page's virtual-image scan relies on: one slice = one span."""
+        from spyde.actions.report.vectors_embed import pack_vectors
+        nt, ny, nx = 4, 5, 3
+        vecs = _vecs_5d(nt, ny, nx)
+        payload = pack_vectors(vecs)
+        blob = base64.b64decode(payload["b64"])
+        n = payload["header"]["n"]
+        off = np.frombuffer(blob, "<u4", payload["header"]["nav_off"], 16 * n)
+        for t in range(nt):
+            s, e = int(off[t * ny * nx]), int(off[(t + 1) * ny * nx])
+            assert e - s == int(np.asarray(vecs.count_map_at_t(t)).sum())
+
+    def test_a_stack_without_an_index_is_refused(self, monkeypatch):
+        """No index means no way to tell slices apart — refuse rather than
+        embed a page that silently piles every slice onto one pattern."""
+        import spyde.actions.report.vectors_embed as ve
+        monkeypatch.setattr(ve, "_nav_offsets_flat",
+                            lambda *a, **k: None)
+        assert ve.pack_vectors(_vecs_5d()) is None
+
+    def test_a_4d_scan_is_unchanged(self):
+        from spyde.actions.report.vectors_embed import pack_vectors
+        hdr = pack_vectors(_vecs())["header"]
+        assert hdr["nt"] == 0
+        assert hdr["nav_off"] == 8 * 8 + 1
+
+
+class TestExplorerStackPanel:
+    """A 5-D embed mirrors the app's own vectors window: THREE panels — stack
+    navigator → real-space count map → diffraction pattern. The stack panel's
+    draggable vline is the slice control (the range slider survives only as the
+    fallback for when that panel can't be built)."""
+
+    def _panels(self, vecs):
+        from spyde.actions.report.vectors_embed import (
+            _build_figure, pack_vectors)
+        built = _build_figure(vecs, pack_vectors(vecs))
+        assert built is not None
+        state, nav_id, dp_id, stack_id, _esm = built
+        widgets = {}
+        for k, v in state.items():
+            if k.startswith("panel_") and k.endswith("_json"):
+                pid = k[len("panel_"):-len("_json")]
+                widgets[pid] = {w.get("type")
+                                for w in (json.loads(v).get("overlay_widgets") or [])}
+        return nav_id, dp_id, stack_id, widgets
+
+    def test_a_stack_gets_three_panels(self):
+        nav_id, dp_id, stack_id, widgets = self._panels(_vecs_5d(nt=4))
+        assert stack_id, "no stack navigator panel was built"
+        assert len({nav_id, dp_id, stack_id}) == 3
+        assert len(widgets) == 3, f"expected 3 panels, got {sorted(widgets)}"
+        assert widgets[stack_id] == {"vline"}
+        assert widgets[nav_id] == {"crosshair", "rectangle"}
+        assert widgets[dp_id] == {"circle"}
+
+    def test_the_stack_curve_is_vectors_per_slice(self):
+        from spyde.actions.report.vectors_embed import _per_slice_totals
+        from spyde.tests.gen_vectors_embed import synthetic_vectors_5d
+        v = synthetic_vectors_5d(nt=4, nav=(6, 6))
+        totals = _per_slice_totals(v, v.n_time)
+        assert totals.shape == (4,)
+        # that fixture puts t+1 vectors at each of 36 positions in slice t
+        np.testing.assert_array_equal(totals, [36, 72, 108, 144])
+        assert totals.sum() == len(v.flat_buffer)
+
+    def test_the_page_wires_the_stack_panel_not_a_slider(self):
+        from spyde.actions.report.vectors_embed import vectors_explorer_html
+        page = vectors_explorer_html(_vecs_5d(nt=4))
+        assert page is not None
+        assert 'id="vx-stackid"' in page
+        assert re.search(r'id="vx-stackid">\w+<', page), \
+            "the page must carry a real stack panel id"
+        assert 'data-testid="vx-slice"' not in page, \
+            "the range slider is the fallback — not shipped alongside the panel"
+        assert "setSlice" in page
+
+    def test_the_slider_is_the_fallback_when_the_panel_cannot_build(self, monkeypatch):
+        import spyde.actions.report.vectors_embed as ve
+        real = ve._build_figure
+
+        def _no_stack(vecs, payload):
+            built = real(vecs, payload)
+            if built is None:
+                return None
+            state, nav_id, dp_id, _stack_id, esm = built
+            return state, nav_id, dp_id, "", esm
+
+        monkeypatch.setattr(ve, "_build_figure", _no_stack)
+        page = ve.vectors_explorer_html(_vecs_5d(nt=4))
+        assert 'data-testid="vx-slice"' in page, \
+            "with no stack panel the page must still offer a slice control"
+        assert re.search(r'id="vx-slice"[^>]*max="3"', page)
+
+    def test_a_4d_page_has_neither(self):
+        from spyde.actions.report.vectors_embed import vectors_explorer_html
+        _nav, _dp, stack_id, widgets = self._panels(_vecs())
+        assert stack_id == "" and len(widgets) == 2
+        page = vectors_explorer_html(_vecs())
+        assert 'data-testid="vx-slice"' not in page
+
+    def test_a_single_slice_stack_gets_no_stack_panel(self):
+        _nav, _dp, stack_id, widgets = self._panels(_vecs_5d(nt=1))
+        assert stack_id == "" and len(widgets) == 2, \
+            "one slice is nothing to scrub"
+
+
 class TestExplorerHtml:
     def test_selfcontained_page(self):
         from spyde.actions.report.vectors_embed import vectors_explorer_html
