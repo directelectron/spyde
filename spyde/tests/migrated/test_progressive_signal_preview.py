@@ -214,6 +214,14 @@ class TestProgressiveSignalPreview:
         A pixel signature cannot tell "the drag was answered" apart from "a
         block landed just then" — both repaint the same plot — so the backend
         counts navigator-driven reads itself and the spec reads that count.
+
+        Asserted as DELTAS around each call, not as absolute totals. The preview
+        installs its slice function on the live navigator selector, so the
+        session's own background updates (the initial paint, a settle re-fire)
+        legitimately call it too and bump the same counters. Absolute totals made
+        this test a race that only lost on a loaded CI machine; what it actually
+        means to pin is that a declined read increments `reads_declined` by one
+        and a served read increments `frames_served` by one.
         """
         session = window["window"]
         tree = _result_tree(session)
@@ -221,22 +229,27 @@ class TestProgressiveSignalPreview:
         preview = attach_signal_preview(session, tree, render=store.render,
                                         nav_shape=(4, 5))
         sel = _nav_selector(tree)
-        assert (preview.frames_served, preview.reads_declined) == (0, 0)
 
-        # Nothing computed yet → every read is declined, nothing served.
+        def counts():
+            return preview.frames_served, preview.reads_declined
+
+        # Nothing computed yet → this read is declined, nothing served.
+        served, declined = counts()
         assert preview.slice_fn(sel, None, [[1, 2]]) is None
-        assert (preview.frames_served, preview.reads_declined) == (0, 1)
+        assert counts() == (served, declined + 1)
 
         store.add((slice(2, 4), slice(0, 2)),
                   _block(2, 2, 4, {(0, 1): [(6.0, 7.0, 4.0)]}))
         preview.note_block((slice(2, 4), slice(0, 2)))
 
         # Now the SAME position is answered from the computed region.
+        served, declined = counts()
         assert preview.slice_fn(sel, None, [[1, 2]]) is not None
-        assert preview.frames_served == 1
+        assert preview.frames_served == served + 1
         # A position outside the landed block is still declined.
+        served, declined = counts()
         assert preview.slice_fn(sel, None, [[3, 0]]) is None
-        assert (preview.frames_served, preview.reads_declined) == (1, 2)
+        assert counts() == (served, declined + 1)
         preview.close()
 
     # KNOWN FLAKE, rerun rather than hidden. This paints a sample frame and then

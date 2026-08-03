@@ -234,6 +234,30 @@ class TestHarnessMixin:
         ty, tx = iy_i % ky, ix_i % kx
         for t in range(nt):
             stack[t, iy_i, ix_i, ty, tx] += 200.0 * (t + 1)
+
+        # `spots=True` makes that per-position feature a DISK rather than a
+        # single pixel, so a peak finder actually DETECTS it and the found
+        # vectors — not just the frame brightness — move with the scan position.
+        #
+        # Opt-in because it is only needed to make a test able to FAIL. With the
+        # single-pixel default every position yields one central disk, so every
+        # rendered vectors frame is the same shape and differs only in absolute
+        # intensity — which per-frame auto-levelling then erases. A display stuck
+        # on one frame is pixel-identical to a working one, and a spec asserting
+        # "the DP repainted" can never catch a regression. Off by default so the
+        # navigator-fill tests that assert on this fixture's sums are unaffected.
+        if bool(payload.get("spots")):
+            r = 3
+            yy2, xx2 = np.mgrid[-r:r + 1, -r:r + 1]
+            spot = ((xx2 ** 2 + yy2 ** 2) <= r * r).astype(np.float32)
+            for iy in range(ny):
+                for ix in range(nx):
+                    cy = r + 2 + (iy * 3) % max(1, ky - 2 * r - 4)
+                    cx = r + 2 + (ix * 5) % max(1, kx - 2 * r - 4)
+                    for t in range(nt):
+                        stack[t, iy, ix,
+                              cy - r:cy + r + 1, cx - r:cx + r + 1] += (
+                            spot * 400.0)
         arr = da.from_array(stack, chunks=(1, 8, 8, ky, kx))
         s = hs.signals.Signal2D(arr).as_lazy()
         try:

@@ -825,16 +825,16 @@ wheels = [
 
 [[package]]
 name = "em-database"
-version = "0.1.0"
+version = "0.2.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pooch", marker = "python_full_version >= '3.12'" },
     { name = "pyyaml", marker = "python_full_version >= '3.12'" },
     { name = "tqdm", marker = "python_full_version >= '3.12'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c8/1f/c009752d22cf7274b193313ac9616087c4eaa1167ec9aba59766b14c7a01/em_database-0.1.0.tar.gz", hash = "sha256:1a6bff7e9e8df843e3df457070d068fb892cdfa76faca1f6c1c5a37d040ea945", size = 19675, upload-time = "2026-07-28T13:35:13.731Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d3/eb/b01cecc4aa9430b9d40b97e1cf15c7c321fbfde17ddac69af7c28132674c/em_database-0.2.0.tar.gz", hash = "sha256:f38d8dca5026de1509ff1fa72dafd4492ee5c044bff8e4d40b1d56ca477363cb", size = 20414, upload-time = "2026-08-03T02:12:45.497Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/1e/ab/a3c64005115d0ab50f09869ea66d1c9d1d1290db040946fbe67aba42d843/em_database-0.1.0-py3-none-any.whl", hash = "sha256:858d1235e471e1f6647d9fd5e3332c570b663b2418a9defa00c757ab29235212", size = 30632, upload-time = "2026-07-28T13:35:12.692Z" },
+    { url = "https://files.pythonhosted.org/packages/79/b7/5a0c1d10c7f4597b76d2b6d148e179503fe651293f0dfc8d64fd0467ffcf/em_database-0.2.0-py3-none-any.whl", hash = "sha256:375a7ea417158c2a28dbeea34eb92fc90622022ddb2d7345a1371bb4f6743d07", size = 31903, upload-time = "2026-08-03T02:12:44.369Z" },
 ]
 
 [[package]]
@@ -3627,7 +3627,7 @@ requires-dist = [
     { name = "bokeh" },
     { name = "dask" },
     { name = "distributed" },
-    { name = "em-database", marker = "python_full_version >= '3.12'", specifier = ">=0.1.0" },
+    { name = "em-database", marker = "python_full_version >= '3.12'", specifier = ">=0.2.0" },
     { name = "exspy", marker = "extra == 'eels'", specifier = ">=0.3.2" },
     { name = "huggingface-hub" },
     { name = "hyperspy", git = "https://github.com/cssfrancis/hyperspy.git?rev=f314cf42aa16a06d82449cd8dc8c8f57df2e3e72" },

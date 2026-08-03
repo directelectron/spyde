@@ -8,7 +8,10 @@
     "skipLibCheck": true,
     "lib": ["ESNext", "DOM"],
     "baseUrl": ".",
-    "paths": { "@guides/*": ["../guides/*"] }
+    "paths": {
+      "@guides/*": ["../guides/*"],
+      "@reports/*": ["../report-catalogue/*"]
+    }
   },
-  "include": ["src/**/*", "../guides/**/*"]
+  "include": ["src/**/*", "../guides/**/*", "../report-catalogue/**/*"]
 }

@@ -1139,14 +1139,19 @@ class BaseSignalTree:
             except Exception as e:
                 logger.debug("removing strain controller on tree close failed: %s", e)
             self._strain_controller = None
+        # `_result_vector_overlays` is a LIST (one per signal plot on a vectors
+        # result window — "Add Selector" opens more than one); the rest are single
+        # overlays. Both shapes tear down here so none outlives the tree.
         for attr in ("_fv_preview", "_vector_overlay", "_result_vector_overlay",
+                     "_result_vector_overlays",
                      "_orientation_overlay", "_particle_overlay"):
             ov = getattr(self, attr, None)
-            if ov is not None and hasattr(ov, "remove"):
-                try:
-                    ov.remove()
-                except Exception as e:
-                    logger.debug("removing %s on tree close failed: %s", attr, e)
+            for one in (ov if isinstance(ov, (list, tuple)) else [ov]):
+                if one is not None and hasattr(one, "remove"):
+                    try:
+                        one.remove()
+                    except Exception as e:
+                        logger.debug("removing %s on tree close failed: %s", attr, e)
             if hasattr(self, attr):
                 setattr(self, attr, None)
         for wiz_attr in ("_om_wizard", "_vom_wizard", "_ebsd_wizard",

@@ -45,7 +45,7 @@ dependencies = [
     # versions the Examples menu falls back to Dummy Data only
     # (example_catalogue.available() is False). Drop the marker once upstream
     # relaxes its floor.
-    "em-database>=0.1.0; python_version >= '3.12'",
+    "em-database>=0.2.0; python_version >= '3.12'",
     "imageio-ffmpeg",
     "imagecodecs",
     "psygnal>=0.10.0",

@@ -534,6 +534,32 @@ class IntegratingSSelector2D(IntegratingSelectorMixin):
                 if hasattr(child, "parent_selector"):
                     child.parent_selector = self
 
+        # ONE children dict, shared by the composite and BOTH sub-selectors.
+        #
+        # Updates run on the ACTIVE SUB-SELECTOR (delayed_update_data delegates to
+        # self.selector), so `_run_update` iterates the SUB-selector's mapping —
+        # but every caller that swaps a child's update function reaches for the
+        # composite, because that is what `all_navigation_selectors` yields:
+        #
+        #     sel.children[child] = render_fn      # find_vectors_action,
+        #                                          # live_signal, multiplot_manager
+        #
+        # With three separate dicts those writes landed on the one dict nothing
+        # reads. On a 5-D vectors result — the only case that gets a composite
+        # here, since MultiplotManager ignores `selector_type` below nav level 3
+        # — the diffraction pattern therefore kept slicing the lazy ZERO
+        # placeholder and stayed blank forever, while the vector overlay (which
+        # rides `index_hooks` on the sub-selector) tracked the cursor normally.
+        # Circles moving over a dead image was exactly the reported symptom.
+        #
+        # Sharing the object keeps every view in step whichever one is written
+        # through. The sub-selectors built their own equivalent dicts from the
+        # same arguments a moment ago, so nothing is lost by discarding them.
+        self._rect_selector.children = self.children
+        self._crosshair_selector.children = self.children
+        self._rect_selector.active_children = self.active_children
+        self._crosshair_selector.active_children = self.active_children
+
         self.selector = self._crosshair_selector
         self._crosshair_selector.is_integrating = False
         self._rect_selector.is_integrating = True

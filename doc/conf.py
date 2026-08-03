@@ -49,6 +49,40 @@ def _copy_guide_media(app=None):
     shutil.copytree(src, dst, ignore=shutil.ignore_patterns("*.html"))
 
 
+# -- Published reports -------------------------------------------------------
+# A report is a whole analysis of a real dataset, exported by SpyDE as ONE
+# self-contained .html with its figures baked in and its explorer running
+# client-side. Unlike the tutorial media above — where *.html is deliberately
+# skipped because a walkthrough embed only makes sense inside the docs-site
+# React page — a report IS the page, and it needs a stable public URL of its
+# own: the poster QR codes point straight at it.
+#
+# `html_extra_path` copies a tree into the build output VERBATIM (no Sphinx
+# parsing), so staging the report files into `doc/_extra/reports/` publishes
+# them at `<pages-url>/reports/<file>.html`. Staged rather than committed twice:
+# the one copy lives under docs-site/public/media/reports/, which is also what
+# the docs-site Reports tab serves.
+def _stage_reports() -> None:
+    # Called at CONF IMPORT, not from a `builder-inited` hook: Sphinx validates
+    # `html_extra_path` while reading the config, so a directory created later
+    # gets a "does not exist" warning and is silently never copied. Import time
+    # is the only point early enough.
+    src = _HERE.parent / "docs-site" / "public" / "media" / "reports"
+    dst = _HERE / "_extra" / "reports"
+    if dst.exists():
+        shutil.rmtree(dst)
+    dst.mkdir(parents=True, exist_ok=True)     # keep the extra path valid even
+    if not src.is_dir():                       # with nothing to publish yet
+        return
+    for pat in ("*.html", "*.svg", "*.png"):
+        for f in src.glob(pat):
+            shutil.copy2(f, dst / f.name)
+
+
+_stage_reports()
+html_extra_path = ["_extra"]
+
+
 def setup(app):
     app.connect("builder-inited", _copy_guide_media)
     return {"parallel_read_safe": True, "parallel_write_safe": True}

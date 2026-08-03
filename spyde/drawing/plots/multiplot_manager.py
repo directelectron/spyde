@@ -299,7 +299,17 @@ class MultiplotManager:
         selector.update_data()
         if child.current_data is not None:
             child.update_data(child.current_data)
-        self.signal_tree.signal_plots.append(child)
+        # ONLY a real signal plot is filed as one. For a 5-D stack this method
+        # also builds the INTERMEDIATE real-space NAVIGATOR (window level 1 of 2),
+        # and filing that as a signal plot made every consumer of
+        # `tree.signal_plots` address the wrong window: `signal_plots[0]` is "the
+        # DP" to strain / IPF / EBSD / fit / commit / report-movie, and
+        # `paint_signal_plots` paints ALL of them. Find-Vectors was the visible
+        # case — it installed the DP's render-frame slice function on the time
+        # selector, so the real-space navigator drew diffraction patterns.
+        # No-op for nav_dim < 3 (is_navigator is always False there).
+        if not is_navigator:
+            self.signal_tree.signal_plots.append(child)
         child.needs_auto_level = True
         return window
 
