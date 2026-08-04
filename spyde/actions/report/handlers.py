@@ -154,6 +154,16 @@ class ReportManager:
         self._selected: dict[str, "str | None"] = {}
         # cell_id -> True while a figure's rebuild is pending
         self._offline: set[str] = set()
+        # DETACHED cells: rebuilt from the report's OWN saved pixels
+        # (data/<id>.npz) because the source signal wasn't available. The figure
+        # is fully live and interactive — pan, zoom, widgets — it just has
+        # nothing to refresh FROM, so the UI hides "refresh from data".
+        # Deliberately NOT _offline: offline means "show the flat PNG".
+        self._detached: set[str] = set()
+        # cell_id -> {(panel_id, layer_id): ndarray} loaded from data/<id>.npz on
+        # open. Kept separately from _snapshots so a re-save can round-trip the
+        # pixels of a cell that was never rebuilt this session.
+        self._loaded_snapshots: dict[str, dict] = {}
         # pending save handshake: token -> {cells, path, remaining}
         self._pending_save: dict[str, dict] = {}
         # UNDO stack of {"label": str, "restore": callable}. Bounded, because an
@@ -249,6 +259,8 @@ class ReportManager:
         self._baked.clear()
         self._images.clear()
         self._offline.clear()
+        self._detached.clear()
+        self._loaded_snapshots.clear()
         self._editing.clear()
         self._edit_wiring.clear()
         self._ann_widgets.clear()
@@ -306,6 +318,8 @@ class ReportManager:
         self._baked.clear()
         self._images.clear()
         self._offline.clear()
+        self._detached.clear()
+        self._loaded_snapshots.clear()
         self._pending_save.clear()
         self._editing.clear()
         self._edit_wiring.clear()
@@ -369,6 +383,12 @@ class ReportManager:
                 "fig_id": (c.id if c.cell_type in ("figure", "split") else None),
                 "data_offline": bool(
                     c.cell_type in ("figure", "split") and c.id in self._offline),
+                # Rebuilt from the report's OWN saved pixels: a real, interactive
+                # figure with no signal behind it. Distinct from data_offline
+                # (which means "there are no pixels, show the PNG") — the UI
+                # keeps every interaction and hides only refresh-from-data.
+                "data_detached": bool(
+                    c.cell_type in ("figure", "split") and c.id in self._detached),
                 # Present-mode fields (Phase 6): slide grouping + go-live handle
                 # + per-slide kind/style (title/section slide + background preset —
                 # carried on the slide's first cell).
@@ -883,6 +903,44 @@ class ReportManager:
             log.debug("push_ann_widget failed (cell %s panel %s idx %s): %s",
                       cell_id, panel_id, ann_index, e)
             return False
+
+    #: Per-cell cap on saved figure pixels. A report is a file people email; a
+    #: multi-panel figure of 4096² float64 layers would otherwise quietly add
+    #: hundreds of MB. Over the cap the cell simply saves without its data and
+    #: reloads as the baked PNG — the pre-existing behaviour, not a failure.
+    SNAPSHOT_MAX_BYTES = 32 * 1024 * 1024
+
+    def assemble_snapshots(self) -> dict:
+        """``{cell_id -> npz bytes}`` of the per-layer pixels behind every figure
+        cell, for ``data/<id>.npz`` in the zip.
+
+        This is what makes a reopened figure INTERACTIVE rather than a flat PNG:
+        ``figure_builder.build_figure`` wants a spec AND a snapshot map, the spec
+        already round-trips through ``figures/<id>.yaml``, and this is the other
+        half. Prefers the LIVE snapshots; falls back to the ones loaded from the
+        opened report so re-saving a report whose sources were never available
+        doesn't silently drop the pixels it came with."""
+        out: dict[str, bytes] = {}
+        for c in self.doc.cells:
+            if c.cell_type not in ("figure", "split") or c.spec is None:
+                continue
+            snap = self._snapshots.get(c.id) or self._loaded_snapshots.get(c.id)
+            if not snap:
+                continue
+            try:
+                blob = model.snapshots_to_npz(snap)
+            except Exception as e:                     # pragma: no cover
+                log.debug("snapshot pack failed for cell %s: %s", c.id, e)
+                continue
+            if blob and len(blob) <= self.SNAPSHOT_MAX_BYTES:
+                out[c.id] = blob
+            elif blob:
+                log.info(
+                    "figure %s: %.1f MB of pixels exceeds the %.0f MB save cap — "
+                    "it will reopen as a static image",
+                    c.id, len(blob) / (1024 * 1024),
+                    self.SNAPSHOT_MAX_BYTES / (1024 * 1024))
+        return out
 
     def assemble_assets(self, harvested: dict) -> dict:
         """Build ``{cell_id -> bytes}`` for every non-placeholder figure cell AND
@@ -2119,6 +2177,10 @@ def report_open(session, plot, payload) -> None:
             or (c.cell_type == "split" and c.spec is None and c.image_ext))
     }
     mgr._offline.clear()
+    mgr._detached.clear()
+    # The figure PIXELS this report was saved with — empty for a report written
+    # before they were persisted, which then behaves exactly as it always did.
+    mgr._loaded_snapshots = model.read_report_snapshots(path)
     # Rebind each figure cell: resolve EVERY layer of EVERY panel against open trees
     # / files. The cell rebinds live only when ALL its layers resolve; if any layer's
     # source is offline the whole cell is offline (renderer shows the baked PNG).
@@ -2153,10 +2215,26 @@ def report_open(session, plot, payload) -> None:
                     mgr.set_snapshot(c.id, panel.id, layer.id, arr)
         if all_resolved:
             mgr.build_figure_window(c)
-        else:
-            # Unresolved → offline: renderer shows the baked PNG (data URL in state).
+            continue
+        # The source is unavailable — but the report may carry its OWN pixels.
+        # Rebuild from those: spec + saved snapshots is exactly what
+        # build_figure_window consumes, so the figure comes back fully
+        # interactive (pan, zoom, widgets) and is merely DETACHED — there is no
+        # signal behind it to refresh from. That is strictly better than the flat
+        # PNG this used to fall back to.
+        saved = mgr._loaded_snapshots.get(c.id)
+        if saved:
+            mgr._snapshots[c.id] = dict(saved)
+            mgr.build_figure_window(c)
+            if mgr._window_by_cell.get(c.id) is not None:
+                mgr._detached.add(c.id)
+                continue
+            # The rebuild produced no window (an unusable spec / snapshot pair):
+            # fall through to the static path rather than leaving a dead box.
             mgr._snapshots.pop(c.id, None)
-            mgr._offline.add(c.id)
+        # No saved pixels → offline: renderer shows the baked PNG (data URL in state).
+        mgr._snapshots.pop(c.id, None)
+        mgr._offline.add(c.id)
     # A figure whose spec yaml was corrupt (read_report recorded spec_error) is shown
     # as its baked PNG but can no longer be edited/refreshed — tell the user loudly
     # rather than leaving them to discover the dead Edit button.
@@ -2270,9 +2348,12 @@ def _finish_save(session, mgr: ReportManager, path: str,
     """Assemble the asset PNGs (harvested → held-baked → offline-baked) and write
     the zip atomically, then emit ``report_saved`` + refresh state."""
     assets = mgr.assemble_assets(harvested)
+    # The figure PIXELS as well as the baked stills, so reopening this report
+    # without its source data still gives a figure you can pan, zoom and drag.
+    snapshots = mgr.assemble_snapshots()
     try:
         mgr.doc.touch()
-        write_report(mgr.doc, path, assets=assets)
+        write_report(mgr.doc, path, assets=assets, snapshots=snapshots)
     except Exception as e:
         ipc.emit_error(f"Saving report failed: {e}")
         return

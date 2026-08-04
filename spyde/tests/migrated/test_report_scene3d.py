@@ -267,7 +267,7 @@ class TestScene3DReopen:
         assert ("p1", "xyz") in mgr._snapshots[cell["id"]]
         assert _report_figures(messages)
 
-    def test_reopen_without_result_goes_offline_gracefully(
+    def test_reopen_without_result_rebuilds_from_saved_points(
             self, tem_2d_dataset, tmp_path):
         session = tem_2d_dataset["window"]
         messages = tem_2d_dataset["messages"]
@@ -278,7 +278,11 @@ class TestScene3DReopen:
         h.report_close(session, None, {})
 
         # The orientation result is gone (e.g. a fresh session where OM was
-        # never recomputed) → the cell must open OFFLINE, never crash.
+        # never recomputed). The scene's POINT CLOUD was saved with the report
+        # (data/<id>.npz holds the xyz/rgb pseudo-layers), so the cell reopens
+        # DETACHED — a real, spinnable 3-D scene with no result behind it —
+        # rather than the flat PNG it used to degrade to. Either way it must
+        # never crash, which is what this test has always been about.
         tree.orientation_map = None
         if hasattr(tree, "_ipf_result"):
             tree._ipf_result = None
@@ -286,7 +290,8 @@ class TestScene3DReopen:
         h.report_open(session, None, {"path": path})
         st = _last_state(messages)
         cell = [c for c in st["cells"] if c["cell_type"] == "figure"][0]
-        assert cell["data_offline"] is True
+        assert cell["data_detached"] is True
+        assert cell["data_offline"] is False
         json.dumps(st)   # state still serializable (badge path, maybe no png)
 
 

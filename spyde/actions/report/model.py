@@ -1608,8 +1608,97 @@ def bake_fallback_png(array2d: np.ndarray, cmap: str = "viridis",
 REPORT_SUFFIX = ".spyde-report"
 
 
+# ── figure PIXEL data (detached-interactive round trip) ───────────────────────
+#
+# A figure cell persists as a RECIPE (``figures/<id>.yaml``) plus a baked still
+# (``assets/<id>.png``). The recipe references the SOURCE signal, so reopening a
+# report without that data loaded left the figure as a flat PNG — you could look
+# at it but not pan, zoom, or touch a widget.
+#
+# ``data/<id>.npz`` closes that gap: the per-layer arrays the figure was built
+# from, which is exactly the other half of what
+# ``figure_builder.build_figure(spec, snapshots)`` consumes. Reopening rebuilds a
+# REAL anyplotlib figure from recipe + saved pixels — fully interactive, just
+# detached from the signal, so "refresh from data" is the one thing it can't do.
+#
+# Purely additive: a reader that doesn't know about ``data/`` ignores it, and a
+# report saved without it loads exactly as before.
+
+#: Separator packing a ``(panel_id, layer_id)`` key into one npz member name.
+#: A record separator, so it cannot collide with an id.
+_SNAP_KEY_SEP = "\x1f"
+
+
+def snapshots_to_npz(snap_map: dict) -> bytes:
+    """A cell's ``{(panel_id, layer_id): ndarray}`` map → compressed npz bytes.
+
+    Non-array values and object-dtype arrays are skipped rather than pickled:
+    ``allow_pickle`` on the way back in would make opening a report a code-
+    execution path, and a report is a file people email each other."""
+    import io as _io
+    out = {}
+    for key, arr in (snap_map or {}).items():
+        try:
+            panel_id, layer_id = key
+        except (TypeError, ValueError):
+            continue
+        a = np.asarray(arr)
+        if a.dtype == object or a.size == 0:
+            continue
+        out[f"{panel_id}{_SNAP_KEY_SEP}{layer_id}"] = a
+    if not out:
+        return b""
+    buf = _io.BytesIO()
+    np.savez_compressed(buf, **out)
+    return buf.getvalue()
+
+
+def npz_from_snapshots(raw: bytes) -> dict:
+    """npz bytes → ``{(panel_id, layer_id): ndarray}``. Unreadable / unexpected
+    content yields ``{}`` — a corrupt data blob must degrade to "the figure is a
+    static PNG", never to a failed open."""
+    import io as _io
+    if not raw:
+        return {}
+    out: dict = {}
+    try:
+        with np.load(_io.BytesIO(raw), allow_pickle=False) as z:
+            for name in z.files:
+                if _SNAP_KEY_SEP not in name:
+                    continue
+                panel_id, layer_id = name.split(_SNAP_KEY_SEP, 1)
+                out[(panel_id, layer_id)] = z[name]
+    except Exception:
+        return {}
+    return out
+
+
+def read_report_snapshots(path: str) -> "dict[str, dict]":
+    """Read the saved figure pixels from a ``.spyde-report`` → ``{cell_id ->
+    {(panel_id, layer_id): ndarray}}``. Empty for a report written before this
+    existed, or one saved with the data omitted.
+
+    A SIBLING of :func:`read_report` rather than another element in its tuple:
+    that tuple is unpacked at ~20 call sites, and widening it would churn every
+    one of them to carry something most do not want."""
+    out: dict[str, dict] = {}
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            for name in zf.namelist():
+                if not name.startswith("data/") or not name.endswith(".npz"):
+                    continue
+                cell_id = name[len("data/"):-len(".npz")]
+                snap = npz_from_snapshots(zf.read(name))
+                if snap:
+                    out[cell_id] = snap
+    except Exception:
+        return {}
+    return out
+
+
 def write_report(doc: ReportDoc, path: str,
-                 assets: "dict[str, bytes] | None" = None) -> None:
+                 assets: "dict[str, bytes] | None" = None,
+                 snapshots: "dict[str, dict] | None" = None) -> None:
     """Write *doc* to a ``.spyde-report`` zip at *path*, ATOMICALLY (tmp file in
     the same dir + ``os.replace``) so a crash never leaves a torn container.
 
@@ -1618,12 +1707,19 @@ def write_report(doc: ReportDoc, path: str,
     are written without an asset (the caller is expected to always provide one via
     harvest or bake for figures, and the held image bytes for image cells)."""
     assets = assets or {}
+    snapshots = snapshots or {}
     directory = os.path.dirname(os.path.abspath(path)) or "."
     os.makedirs(directory, exist_ok=True)
     tmp = os.path.join(directory, f".{os.path.basename(path)}.{uuid.uuid4().hex}.tmp")
     try:
         with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("report.md", serialize_report_md(doc))
+            # Figure PIXELS, so a reopened figure is interactive rather than a
+            # flat PNG. Already-compressed npz — stored, not deflated again.
+            for cell_id, blob in snapshots.items():
+                if blob:
+                    zf.writestr(f"data/{cell_id}.npz", blob,
+                                compress_type=zipfile.ZIP_STORED)
             for c in doc.cells:
                 if c.cell_type == "image":
                     # A photo: the raw image bytes at assets/<id>.<ext>, NO yaml

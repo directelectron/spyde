@@ -731,12 +731,24 @@ export function ReportFigureCell({ cell, onRemove, index, dragProps, reorderActi
             </>
           }
           trailing={
-            <button
-              data-testid={`report-figcell-refresh-${cell.id}`}
-              style={styles.chromeBtn}
-              title="Refresh all panels from live plots"
-              onClick={() => sendAction('report_refresh_figure', { cell_id: cell.id })}
-            >⟳</button>
+            // A DETACHED figure was rebuilt from the report's own saved pixels,
+            // so there is no live plot to refresh FROM. Everything else about it
+            // works; offering a button that can only fail is worse than not
+            // offering one.
+            cell.data_detached ? (
+              <span
+                data-testid={`report-figcell-detached-${cell.id}`}
+                style={{ ...styles.chromeBtn, cursor: 'default', opacity: 0.75 }}
+                title="Interactive, but detached — this figure was restored from the report's own saved data, so there is no source to refresh from."
+              >⛓︎</span>
+            ) : (
+              <button
+                data-testid={`report-figcell-refresh-${cell.id}`}
+                style={styles.chromeBtn}
+                title="Refresh all panels from live plots"
+                onClick={() => sendAction('report_refresh_figure', { cell_id: cell.id })}
+              >⟳</button>
+            )
           }
         />
       )}

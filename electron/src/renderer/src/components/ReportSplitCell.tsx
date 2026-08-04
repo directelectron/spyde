@@ -132,6 +132,11 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
   const fig = state.reportFigures.get(cell.id)
   const hasImage = !empty && !cell.figure && !!cell.image
   const isLive = !empty && !!cell.figure && !!fig
+  // The saved still, shown when the figure side has a spec but no live window
+  // and no photo — i.e. the data is offline and no pixels were saved with the
+  // report. `isLive` is checked first, so a DETACHED figure (rebuilt from the
+  // report's own data) renders as the real interactive figure, not this.
+  const hasBakedPng = !empty && !isLive && !hasImage && !!cell.png
 
   // Keep the text draft in sync when the backing source changes and we're not
   // actively editing (a live report_state update from elsewhere).
@@ -448,6 +453,20 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
             >✕</button>
           )}
         </div>
+      ) : hasBakedPng ? (
+        // OFFLINE: the source signal is unavailable AND the report carries no
+        // saved pixels for this cell, so all that is left is the baked still.
+        // Without this branch the pane fell through to "rendering…" and sat
+        // there forever — Present mode has always shown the PNG here, the
+        // editor just never looked at it.
+        <div style={styles.figBox}>
+          <img src={cell.png} alt={cell.caption ?? ''} style={styles.img} />
+          <div style={styles.offlineBadge}
+               data-testid={`report-split-offline-${cell.id}`}
+               title="The data behind this figure isn't loaded — showing the saved image.">
+            data offline
+          </div>
+        </div>
       ) : (
         <div style={styles.figBox}>
           <div style={styles.pending} data-testid={`report-split-pending-${cell.id}`}>rendering…</div>
@@ -665,6 +684,12 @@ const styles: Record<string, React.CSSProperties> = {
   pending: {
     display: 'flex', alignItems: 'center', justifyContent: 'center',
     width: '100%', height: '100%', color: '#6c7086', fontSize: 11,
+  },
+  offlineBadge: {
+    position: 'absolute', left: 6, bottom: 6,
+    background: 'rgba(24,24,37,0.9)', border: '1px solid #45475a',
+    borderRadius: 5, padding: '2px 7px', fontSize: 10, color: '#a6adc8',
+    pointerEvents: 'none',
   },
   shield: {
     position: 'absolute', inset: 0, zIndex: 3, background: 'transparent',
