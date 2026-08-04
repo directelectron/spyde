@@ -219,3 +219,95 @@ Phase 0 grows one question: *is the cluster alive after resume?* — answered by
 8.2, not by the UI. If it is dead, that is a second workstream (detect death,
 re-arm the gate, restart or report) that this document does **not** currently
 scope, and it should not be folded into the resync work.
+
+---
+
+## 9. Second workstream: cluster liveness
+
+Scoped here at your request. **Separate from the resync work above** — different
+trigger, different code, different failure mode — and shipped independently.
+Fold them together only if §8.2 shows they share a root cause.
+
+### 9.1 The gap is DETECTION, not recovery
+
+Recovery already exists and is proven in production code. `compute_config.py`'s
+restart path does exactly the right three things:
+
+```python
+session._dask_ready.clear()                  # loads wait instead of racing a dead client
+session.dask_manager.restart(n_workers, threads_per_worker)
+# … _on_dask_ready re-opens the gate when the new cluster registers
+```
+
+That is the whole recovery primitive, already written, already used. What is
+missing is **anything that calls it when a cluster dies on its own**. Today the
+only trigger is a user changing compute settings.
+
+So the work is: notice, then reuse.
+
+### 9.2 Where detection could live
+
+| option | how | cost | verdict |
+|---|---|---|---|
+| **Poll the scheduler** | periodic `client.scheduler_info()` on a worker thread | one timer, no new deps | plausible default; must not run on the asyncio main thread |
+| **Consume what already exists** | `DaskStatsSampler` (backend/dask_stats.py) already samples worker CPU/mem for the StatusBar HUD — a sampler that starts failing IS the signal | near-zero: the loop exists | **preferred if its failure mode is distinguishable** — verify before committing |
+| **distributed's own callbacks** | scheduler/client status hooks | least polling | needs a check that they fire for the death modes we care about (sleep, OOM-kill, worker loss ≠ scheduler loss) |
+| **On `power:resume` only** | probe once after a wake | trivial | too narrow — this bug is not sleep-specific |
+
+`DaskStatsSampler` is the interesting one: there is already a loop talking to the
+cluster on a cadence, so a liveness signal may cost nothing beyond reading its
+failures. **Check that first.**
+
+### 9.3 Policy: what to do once it is noticed
+
+Three defensible behaviours, in increasing ambition:
+
+1. **Report.** Clear the gate, emit an error, let the user restart the cluster
+   from the existing compute-settings UI. Smallest change; makes a silent
+   failure loud, which is the actual harm.
+2. **Restart automatically, once.** Call the §9.1 primitive; emit status while it
+   comes back. Good UX, but see the traps.
+3. **Restart and resubmit.** Re-run whatever was in flight. **Not recommended** —
+   see 9.6.
+
+I would ship (1), then (2) behind the same status-bar surface the HUD already
+owns.
+
+### 9.4 Phasing
+
+- **9-A — measure.** Answer §8.2: does the cluster actually die on a Mac
+  lid-close? If it does not, this workstream is still worth doing (nothing
+  detects death from *any* cause) but drops in priority.
+- **9-B — detect.** Whichever of 9.2 survives inspection. Ship it as a log line
+  + status message only; no behaviour change. Confirms the detector fires when
+  it should and, more importantly, does **not** fire when it shouldn't.
+- **9-C — re-arm the gate.** On detection, `_dask_ready.clear()`. This alone
+  converts "silently computes against a dead client" into "waits, then times out
+  with a real message" — a large improvement for a tiny diff.
+- **9-D — restart.** Wire the existing primitive to the detector.
+
+### 9.5 Decisions needed
+
+1. **Auto-restart, or report and let the user act?** (9.3 (1) vs (2).)
+2. **What counts as "dead"?** A lost *worker* is not a lost *cluster* —
+   `distributed` replaces workers routinely, and treating that as death would
+   restart the cluster under normal operation. The detector must distinguish
+   scheduler loss from worker churn, and that distinction is the whole risk.
+3. **Behaviour mid-compute.** If detection fires while a long compute is in
+   flight, does it cancel and restart, or wait?
+
+### 9.6 Traps
+
+- **A false positive is worse than the bug.** Restarting a healthy cluster
+  cancels in-flight work. Whatever detector is chosen needs a consecutive-failure
+  threshold, not a single miss — and 9.5(2) is why.
+- **Do not probe from the asyncio main thread.** The existing code is careful
+  about this (`_await_dask` documents "never call on the main asyncio thread");
+  a liveness probe has the same constraint.
+- **Do not auto-resubmit.** SpyDE's computes are not all idempotent, results
+  land through `_dispatch_to_main` into plot state, and a resubmit racing a
+  rebuilt window is a much harder bug than the one being fixed.
+- **Threaded mode has no cluster.** `ComputeBackend` runs threaded by default in
+  some configurations and `SPYDE_NO_DASK=1` sets the gate pre-opened; the
+  detector must no-op there rather than reporting a permanently dead cluster.
+- Nothing here touches the navigator read path, chunking, or the signal tree.
