@@ -9,7 +9,16 @@ script writes. Slides are plain markdown cells (and SPLIT cells for the
 text-beside-screenshot slides); the screenshots are IMAGE cells, so the deck
 carries no live signal bindings and opens standalone with no data loaded.
 
-Rebuild after editing the SLIDES table below::
+Three tables are the whole file, and they are the things you edit:
+
+* :data:`SPEAKER` — who is giving the talk. It feeds the title slide, the
+  closing slide AND the theme's footer bar, so a venue change is one edit.
+* :data:`THEME`   — the deck's look, written into the document's ``theme:``
+  front matter. It travels with the file: hand the deck to a colleague and it
+  still looks like this.
+* :data:`SLIDES`  — the talk itself.
+
+Rebuild after editing any of them::
 
     python doc/presentations/build_spyde_overview.py
 
@@ -23,17 +32,21 @@ stays small.
 """
 from __future__ import annotations
 
+import base64
 import io
 import os
 import sys
 
 # Import spyde from the repo checkout when run in-place (no install needed).
-_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# THREE levels up: <repo>/doc/presentations/<this file>. Two levels lands on
+# doc/, which still imported fine from a repo-root cwd — and silently made the
+# logo lookup below miss.
+_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
 from spyde.actions.report.model import (  # noqa: E402
-    Cell, ReportDoc, new_cell_id, write_report,
+    Cell, ReportDoc, new_cell_id, normalize_theme, write_report,
 )
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -58,6 +71,87 @@ CROPS: dict[str, tuple[int, int, int, int]] = {
     "04-virtual-imaging.png":     (20, 95, 2075, 1165),
     "05-eels.png":                (20, 95, 1350, 790),
 }
+
+
+# ── who is giving the talk ────────────────────────────────────────────────────
+#
+# One place, three consumers: the title slide, the closing slide, and the theme
+# footer that runs along the bottom of every content slide. VENUE and DATE are
+# blank by default — set them for a specific booking and the title slide picks
+# them up; leave them blank and the line is simply omitted rather than printing
+# an empty separator.
+
+SPEAKER = {
+    "name": "Carter Francis",
+    "role": "R&D Scientist",
+    "org": "Direct Electron",
+    "email": "cfrancis@directelectron.com",
+    "venue": "",       # e.g. "M&M 2026"
+    "date": "",        # e.g. "August 2026"
+}
+
+# The links the audience is asked to write down. Both are verified live; the
+# directelectron.github.io/spyde and github.com/directelectron/spyde URLs in
+# pyproject.toml are NOT yet published, so pointing the room at them would send
+# it to a 404. Change these here if the project moves.
+REPO_URL = "github.com/CSSFrancis/spyde"
+DOCS_URL = "cssfrancis.github.io/spyde"
+
+
+# ── the deck's look ───────────────────────────────────────────────────────────
+#
+# Serialized into the document's ``theme:`` front matter, so it travels with the
+# file. Colours reach the slide markdown as CSS custom properties on the deck
+# root; the footer is drawn on every slide EXCEPT title/section cards, which
+# carry their own attribution.
+#
+# The palette is the app's own: every screenshot in this deck is a dark SpyDE
+# window, so a light deck would frame each one in a bright box. The accent is
+# SpyDE's blue (#89b4fa) for the same reason — the slide headings and the app
+# chrome in the screenshots then agree.
+
+#: Footer logo. The dark-background variant, because the deck is dark — the
+#: light `icon.png` carries black web lines that vanish on a dark bar.
+LOGO_SRC = os.path.join(_REPO, "spyde", "SpydeDark.png")
+LOGO_PX = 96          # the logo is drawn ~28 px tall; 96 px covers 3× displays
+
+THEME = {
+    "bg": "#12121c",
+    "text": "#e9ecf3",
+    "muted": "#a6adc8",
+    "accent": "#89b4fa",
+    # Interface stacks in preference order; every entry after the first is a
+    # fallback for a machine that lacks it, so the deck degrades to the host's
+    # own UI font rather than to Times.
+    "font": ('Inter, "Segoe UI", -apple-system, BlinkMacSystemFont, '
+             'system-ui, Roboto, "Helvetica Neue", Arial, sans-serif'),
+    "logo_height": 28,
+    "footer_show": True,
+    "footer_name": SPEAKER["name"],
+    "footer_email": SPEAKER["email"],
+    "footer_note": SPEAKER["org"],
+    "slide_numbers": True,
+}
+
+
+def _logo_data_url() -> str:
+    """The footer logo as a ``data:`` URL, downscaled to :data:`LOGO_PX`.
+
+    A data URL rather than a path because the deck has to survive being emailed
+    to someone whose disk has never had this repo on it."""
+    try:
+        from PIL import Image
+    except ImportError:                      # Pillow is a core dep; be forgiving.
+        return ""
+    if not os.path.exists(LOGO_SRC):
+        return ""
+    img = Image.open(LOGO_SRC).convert("RGBA")
+    if img.width > LOGO_PX:
+        img = img.resize((LOGO_PX, round(img.height * LOGO_PX / img.width)),
+                         Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
 def _png(name: str) -> bytes:
@@ -86,6 +180,34 @@ def _png(name: str) -> bytes:
     return buf.getvalue()
 
 
+def _title_slide_text() -> str:
+    """The title card, composed from :data:`SPEAKER` so a venue change is one
+    edit. Blank fields drop out instead of leaving dangling separators."""
+    who = " · ".join(x for x in (SPEAKER["name"], SPEAKER["role"],
+                                 SPEAKER["org"]) if x)
+    where = " · ".join(x for x in (SPEAKER["venue"], SPEAKER["date"]) if x)
+    lines = [
+        "# SpyDE\n",
+        "## Interactive analysis for electron microscopy\n",
+        f"{who}\n",
+        f"{SPEAKER['email']}\n",
+    ]
+    if where:
+        lines.append(f"*{where}*\n")
+    return "\n".join(lines)
+
+
+def _closing_slide_text() -> str:
+    return (
+        "# Thank you\n\n"
+        "## Questions?\n\n"
+        f"{SPEAKER['name']} · {SPEAKER['email']}\n\n"
+        # Plain, not a code span: on a title card the code chip's pink is the
+        # only pink on the slide and pulls the eye off the address.
+        f"{REPO_URL}\n"
+    )
+
+
 # ── the deck ──────────────────────────────────────────────────────────────────
 #
 # Each entry is one SLIDE:
@@ -97,177 +219,244 @@ def _png(name: str) -> bytes:
 #   notes    — speaker notes (presenter view only, never shown to the audience)
 #   seconds  — the time budget; the total is asserted at the bottom of this file
 #
-# TOTAL BUDGET: ~12 minutes.
+# TOTAL BUDGET: ~12.5 minutes. Nothing on a slide is a placeholder — anything
+# still to be decided lives in the speaker notes, where the audience can't read
+# it off a projector.
 
 SLIDES: list[dict] = [
     # ── 1 ──────────────────────────────────────────────────────────────────────
     dict(
         kind="title", style="accent", seconds=20,
-        text=(
-            "# SpyDE\n\n"
-            "## Interactive analysis for electron microscopy\n\n"
-            "HyperSpy · pyxem · anyplotlib · Electron\n\n"
-            "*[TODO: your name · affiliation · venue · date]*\n"
-        ),
+        text=_title_slide_text(),
         notes=(
-            "Introduce yourself. One sentence on the plan: what SpyDE is, what it\n"
-            "stands on, how it's built, and where it's going.\n\n"
-            "Timing: this deck is budgeted at ~12.5 min of talking. The two\n"
-            "'Active development' slides are yours to fill — they are the slack."
+            "Introduce yourself, then set the plan in one sentence: where this\n"
+            "came from, what it is built on, how it works, and where it is going.\n\n"
+            "Timing: the deck is budgeted at ~12.5 min of talking, printed by the\n"
+            "build script on every rebuild. If you are given 15, the two slides\n"
+            "with the most give are 'Active development' and 'Roadmap'.\n\n"
+            "Set SPEAKER['venue'] / SPEAKER['date'] in the build script and the\n"
+            "line under your name appears; leave them blank and it is omitted."
         ),
     ),
     # ── 2 ──────────────────────────────────────────────────────────────────────
     dict(
         seconds=45,
         text=(
-            "## Big data, small patience\n\n"
-            "- A modern 4D-STEM scan is **hundreds of gigabytes**. A notebook asks "
-            "you to decide what to look at *before* you have looked at it.\n"
-            "- The loop that actually matters — *move the probe, see the pattern* — "
-            "is the one a script is worst at.\n"
-            "- HyperSpy already had the data model and the science. What was missing "
-            "was a **responsive GUI** that never asks you to down-sample first.\n\n"
-            "> \"No data should be too big to analyze.\" — SpyDE docs, FAQ\n"
+            "## Where this comes from\n\n"
+            "**Graduate school.** A PhD with Paul Voyles at UW–Madison, measuring "
+            "disorder in glasses with 4D-STEM. The microscope was ready years "
+            "before the analysis was.\n\n"
+            "**Open source.** So I wrote some of the analysis, and then helped "
+            "maintain it — **HyperSpy** and **pyxem**, which is where most of my "
+            "open-source time still goes.\n\n"
+            "**Direct Electron.** Now the same problem from the other side: a "
+            "modern detector produces data faster than any person can look at it.\n\n"
+            "SpyDE is what those two jobs look like when you do them at the same "
+            "time.\n"
         ),
         notes=(
-            "The pitch: exploration is interactive, and interactivity is an\n"
-            "engineering problem, not a science problem.\n\n"
-            "If you want a concrete anecdote here, describe the last time you\n"
-            "waited on a re-run because you cropped to the wrong region.\n\n"
-            "The quote is verbatim from doc/intro.rst (FAQ)."
+            "Keep this to about 45 seconds — it is context, not a CV.\n\n"
+            "The honest through-line: every job I have had has been the same\n"
+            "complaint from a different chair. In grad school the data outran the\n"
+            "tools; on the detector side the tools have to keep up with hardware\n"
+            "that got much faster.\n\n"
+            "If the room is mostly pyxem/HyperSpy users, this is also the moment\n"
+            "to say that SpyDE is not a competitor to either — it is a front end\n"
+            "for both, and the fixes go upstream."
         ),
     ),
     # ── 3 ──────────────────────────────────────────────────────────────────────
     dict(
-        seconds=50, image="01-navigator-and-dp.png", layout="text-left",
+        seconds=35,
         text=(
-            "## What SpyDE is\n\n"
-            "A **desktop application** for visualising and analysing electron "
-            "microscopy data — TEM, STEM, Cryo-EM, 4D-STEM, EELS.\n\n"
-            "- Navigator on the left, signal on the right, **live** — including on "
-            "lazy data\n"
-            "- Opens `.hspy` `.zspy` `.mrc` `.tif` `.tiff` `.de5`\n"
-            "- GPL-3.0-or-later, with original support from **Direct Electron**\n"
-            "- ~63k lines of Python + ~25k lines of TypeScript\n"
+            "## Big data, small patience\n\n"
+            "- A modern 4D-STEM scan is **hundreds of gigabytes**. A script asks "
+            "you to decide what to look at *before* you have looked at it.\n"
+            "- The loop that actually matters — *move the probe, see the pattern* "
+            "— is the one a notebook is worst at.\n"
+            "- HyperSpy already had the data model and the science. What was "
+            "missing was a **responsive interface** that never asks you to "
+            "down-sample first.\n\n"
+            "> \"No data should be too big to analyze.\"\n"
         ),
         notes=(
-            "Point at the screenshot: navigator (N-) and signal (S-) windows, the\n"
-            "green crosshair, the calibrated k-axis and scale bar on the pattern,\n"
-            "the Plot Control dock on the right (histogram/contrast, colormap,\n"
-            "signal type, workflow chip, axes table).\n\n"
-            "Line counts are `find`+`wc` over spyde/ excluding tests, and\n"
-            "electron/src/. Extensions are SUPPORTED_EXTS in\n"
-            "spyde/backend/_session_files.py."
+            "The pitch: exploration is interactive, and interactivity is an\n"
+            "engineering problem rather than a science problem.\n\n"
+            "A concrete anecdote lands well here — the last time you waited on a\n"
+            "re-run because you had cropped to the wrong region.\n\n"
+            "The quote is verbatim from doc/intro.rst (FAQ)."
         ),
     ),
     # ── 4 ──────────────────────────────────────────────────────────────────────
+    dict(
+        seconds=45, image="01-navigator-and-dp.png", layout="text-left",
+        text=(
+            "## What SpyDE is\n\n"
+            "A **desktop application** for visualising and analysing electron "
+            "microscopy data — TEM, STEM, cryo-EM, 4D-STEM, EELS.\n\n"
+            "- Navigator beside the signal, **live**, including on data far larger "
+            "than memory\n"
+            "- Opens `.hspy` `.zspy` `.mrc` `.tif` `.de5`, and DE's sparse `.csb` "
+            "event streams\n"
+            "- Every operation is a HyperSpy operation, so nothing you do here "
+            "traps you here\n"
+            "- Free software — **GPL-3.0-or-later**, developed at Direct Electron\n"
+        ),
+        notes=(
+            "Point at the screenshot: the navigator (N-) and signal (S-) windows,\n"
+            "the green crosshair, the calibrated k-axis and scale bar on the\n"
+            "pattern, and the Plot Control dock on the right — histogram and\n"
+            "contrast, colormap, signal type, workflow chip, axes table.\n\n"
+            "'Nothing traps you here' is worth saying slowly: the signal tree is\n"
+            "HyperSpy objects, so you can drop into the built-in Python console\n"
+            "at any point and keep working in code.\n\n"
+            "Extensions are SUPPORTED_EXTS in spyde/backend/_session_files.py.\n"
+            "Scale, if asked: ~65k lines of Python plus ~26k of TypeScript."
+        ),
+    ),
+    # ── 5 ──────────────────────────────────────────────────────────────────────
     dict(
         seconds=50,
         text=(
             "## HyperSpy is the data model\n\n"
             "Everything in SpyDE **is** a HyperSpy `BaseSignal`.\n\n"
-            "- **Navigation vs signal axes** — a 4D-STEM scan is 2 nav × 2 signal. "
-            "That split is what makes \"move the probe, show the pattern\" a *slice* "
-            "rather than a special case.\n"
-            "- **Calibrated axes** — scale / offset / units ride with the data, so a "
-            "scale bar and a reciprocal-space axis come for free.\n"
-            "- **Metadata + signal type** — `electron_diffraction`, `EELS`, … the "
-            "type decides which actions are even offered.\n"
-            "- **Lazy = Dask** — a signal can be backed by a dask array; nothing "
-            "forces it into RAM.\n\n"
-            "SpyDE tracks a HyperSpy fork (`cssfrancis/hyperspy`, pinned to a "
-            "commit) — the navigator's cached-chunk read lives there.\n"
+            "- **Navigation vs signal axes** — a 4D-STEM scan is 2 nav × 2 signal, "
+            "which makes \"move the probe, show the pattern\" a *slice* rather than "
+            "a special case\n"
+            "- **Calibrated axes and metadata** — scale, offset, units and signal "
+            "type ride with the data; the signal type decides which actions are "
+            "even offered\n"
+            "- **Lazy = Dask** — nothing forces a dataset into RAM\n\n"
+            "Transformations form a **tree, not a script**. Non-breaking steps "
+            "update the plot in place; breaking ones branch a new node; a finished "
+            "result is committed with its provenance. You can walk back and compare "
+            "states instead of re-running a cell and losing the previous one.\n"
         ),
         notes=(
             "This is the slide that earns the rest of the talk: SpyDE did not\n"
-            "invent a data model, it adopted one.\n\n"
-            "The fork is a pinned COMMIT in pyproject.toml, not a branch. The delta\n"
-            "is the CachedDaskArray / get_index cache logic the navigator reads\n"
-            "through — worth saying it is intended to go upstream if that's the\n"
-            "plan. [TODO: say whether upstreaming is planned]"
-        ),
-    ),
-    # ── 5 ──────────────────────────────────────────────────────────────────────
-    dict(
-        seconds=40,
-        text=(
-            "## Transformations form a tree, not a script\n\n"
-            "`BaseSignalTree` tracks a DAG of signal transformations.\n\n"
-            "- **Non-breaking** (filter, centre the direct beam) updates the current "
-            "plot in place\n"
-            "- **Breaking** (azimuthal integration) branches a **new node**\n"
-            "- Every window shows its position in the tree — the *workflow* chip\n"
-            "- A finished result (virtual image, strain, orientation) is "
-            "**committed** to a new tree, carrying its provenance\n\n"
-            "You can walk back up the tree and compare states instead of re-running "
-            "a cell and losing the previous one.\n"
-        ),
-        notes=(
-            "Contrast with the notebook: in a notebook, re-running a cell destroys\n"
-            "the previous state. Here both states stay addressable.\n\n"
-            "'Commit to New Tree' is visible in the virtual-imaging screenshot two\n"
-            "slides from now — you can forward-reference it."
+            "invent a data model, it adopted one. That is why five other packages\n"
+            "drop straight in two slides from now.\n\n"
+            "The tree is the contrast with a notebook: re-running a cell destroys\n"
+            "the previous state, and here both states stay addressable.\n\n"
+            "SpyDE currently tracks a HyperSpy fork pinned to a commit — the delta\n"
+            "is the cached-chunk read the navigator goes through, and it is meant\n"
+            "to go upstream. Say so if anyone asks; don't volunteer it."
         ),
     ),
     # ── 6 ──────────────────────────────────────────────────────────────────────
     dict(
-        seconds=55,
+        seconds=40,
         text=(
             "## Don't reimplement the science — inherit it\n\n"
             "| package | what it brings |\n"
             "|---|---|\n"
-            "| **pyxem** | 4D-STEM / diffraction: template matching, orientation, strain |\n"
+            "| **pyxem** | 4D-STEM: template matching, orientation, strain |\n"
             "| **exspy** | EELS + EDS: edges, models, quantification |\n"
             "| **kikuchipy** | EBSD pattern indexing |\n"
             "| **orix** | orientations, symmetry, IPF colouring |\n"
             "| **atomap** | atomic column finding |\n\n"
-            "**pyxem** is a core dependency. **exspy / kikuchipy / atomap** are "
-            "extras — `pip install spyde[eels,ebsd,atoms]`; **orix** arrives through "
-            "pyxem and kikuchipy.\n\n"
-            "A missing extra **hides the buttons** instead of raising — the toolbar's "
-            "`requires_package` gate.\n"
+            "An enormous amount of excellent work already exists. SpyDE's job is to "
+            "put one consistent interface on it and hand it back to the "
+            "community — **free**.\n\n"
+            "`pip install spyde[eels,ebsd,atoms]`; a missing extra **hides the "
+            "buttons** rather than raising.\n"
         ),
         notes=(
             "The ecosystem argument: these packages are where the domain expertise\n"
             "lives, and they already share HyperSpy's data model, so adopting them\n"
             "costs almost nothing.\n\n"
-            "Accuracy note: orix is NOT declared in pyproject.toml — it comes in\n"
-            "transitively via pyxem and kikuchipy. lumispy is not a dependency at\n"
-            "all; it is deliberately absent from this table.\n"
-            "[TODO: mention lumispy / any other package only if you actually use it]\n\n"
-            "The requires_package gate is a nice detail: the UI adapts to what is\n"
-            "installed rather than erroring."
+            "Accuracy, in case it comes up: pyxem is a core dependency. orix is\n"
+            "not declared directly — it arrives through pyxem and kikuchipy.\n"
+            "lumispy is not a dependency at all, which is why it is not listed.\n\n"
+            "The requires_package gate is a good detail: the UI adapts to what is\n"
+            "installed instead of erroring at the user."
         ),
     ),
     # ── 7 ──────────────────────────────────────────────────────────────────────
     dict(
-        seconds=40, image="05-eels.png", layout="text-right",
+        seconds=30, image="05-eels.png", layout="text-right",
         text=(
             "## One app, several techniques\n\n"
-            "The signal type drives the UI, so the same shell serves very different "
-            "data.\n\n"
+            "The signal type drives the interface, so one shell serves very "
+            "different data.\n\n"
             "- A **4D-STEM** scan gets a diffraction toolbar and a k-calibrated "
             "pattern\n"
-            "- An **EELS** spectrum image gets an energy-loss axis, edges and "
-            "model fitting\n"
-            "- Same navigator, same tree, same report\n\n"
-            "*Synthetic EELS spectrum image — nav 16 × 16, 1024 channels, "
-            "power-law background with C / N / O K edges.*\n"
+            "- An **EELS** spectrum image gets an energy-loss axis, edges and model "
+            "fitting\n"
+            "- Same navigator, same tree, same report\n"
         ),
         notes=(
             "Point at the energy-loss axis in eV, the acceleration voltage and\n"
             "convergence angle picked up from metadata, and the signal type set to\n"
             "EELS in the dock.\n\n"
-            "This is bundled synthetic data (spyde.data.eels_si) whose ground truth\n"
-            "is stored on the metadata, so a fit can be scored against the numbers\n"
-            "the data was built from.\n\n"
-            "[TODO: swap in a screenshot of YOUR real EELS data if you'd rather "
-            "show that]"
+            "This is bundled synthetic data (spyde.data.eels_si) — nav 16 x 16,\n"
+            "1024 channels, power-law background with C / N / O K edges — whose\n"
+            "ground truth is stored on the metadata, so a fit can be scored against\n"
+            "the numbers the data was built from.\n\n"
+            "Swap in a screenshot of your own EELS data if you would rather show\n"
+            "that; re-crop in CROPS afterwards."
         ),
     ),
     # ── 8 ──────────────────────────────────────────────────────────────────────
     dict(
-        seconds=55,
+        seconds=40,
+        text=(
+            "## Open, or it isn't reproducible\n\n"
+            "There are two ways to ship software. **Apple's** — polished, closed, "
+            "and you take its word for it. **Linux's** — you can read every line, "
+            "and it still runs in ten years.\n\n"
+            "- A number you cannot re-derive is an anecdote. If the analysis lives "
+            "in a black box, *\"processed in version 4.2\"* is the whole methods "
+            "section.\n"
+            "- Science needs the other property: open the same file years later, "
+            "run the same pipeline, get the same answer — or see exactly what "
+            "changed.\n"
+            "- Every layer here is readable — the data model, the algorithms, the "
+            "file format, the application itself.\n\n"
+            "SpyDE wants the polish of the first and the guarantees of the second.\n"
+        ),
+        notes=(
+            "This is the argument slide. Deliver the Apple/Linux line as a\n"
+            "compliment to both — the point is not that closed software is badly\n"
+            "made, it is that 'well made' and 'checkable' are different properties\n"
+            "and science needs the second one.\n\n"
+            "Concrete backing if someone pushes: the report format is markdown in\n"
+            "a zip, dependency versions are pinned in a lock file, and the deck on\n"
+            "screen is itself a file in the repository that anyone can rebuild.\n\n"
+            "A good place to name the failure mode out loud: a student graduates,\n"
+            "and two years later nobody can reproduce the figure."
+        ),
+    ),
+    # ── 9 ──────────────────────────────────────────────────────────────────────
+    dict(
+        seconds=40,
+        text=(
+            "## Direct Electron's bet on open source\n\n"
+            "DE pays for this work and then gives it away. That is a position, not "
+            "charity.\n\n"
+            "- **SpyDE is free and GPL-3.0** — for any detector, not only ours. No "
+            "paid tier, no licence server.\n"
+            "- **The work goes upstream** — into HyperSpy, pyxem and RosettaSciIO, "
+            "where it outlives any one application.\n"
+            "- **`deapi`**, our detector control API, is MIT and on PyPI. So is "
+            "**`anyplotlib`**.\n"
+            "- A camera is only as useful as what you can do with the data. Locking "
+            "that up helps nobody — least of all the person who bought it.\n"
+        ),
+        notes=(
+            "Say the commitment plainly, because the audience will assume a vendor\n"
+            "talk otherwise: the licence is GPL-3.0, the repository is public, and\n"
+            "SpyDE opens other manufacturers' formats.\n\n"
+            "The business case, if asked: detectors are the product, and every\n"
+            "hour a customer spends fighting file formats is an hour the detector\n"
+            "isn't earning its keep. Open tooling is the cheapest way to make the\n"
+            "hardware worth more.\n\n"
+            "deapi: github.com/directelectron/deapi (MIT, pip install deapi)."
+        ),
+    ),
+    # ── 10 ─────────────────────────────────────────────────────────────────────
+    dict(
+        seconds=40,
         text=(
             "## Two processes, one line protocol\n\n"
             "```\n"
@@ -278,235 +467,294 @@ SLIDES: list[dict] = [
             "         ▼                                 │\n"
             "  React + TypeScript renderer  ◀───────────┘\n"
             "```\n\n"
-            "- The **scientific stack stays in Python** — HyperSpy, pyxem, Dask, torch\n"
-            "- The **UI is a modern web stack** — React 18, TypeScript 5, Electron 34\n"
+            "- The **scientific stack stays in Python** — HyperSpy, pyxem, Dask, "
+            "torch\n"
+            "- The **interface is a modern web stack** — React, TypeScript, "
+            "Electron\n"
             "- The boundary is a **line protocol**, so the backend tests headlessly "
             "and the frontend tests under Playwright\n"
-            "- Image pixels bypass JSON entirely (raw binary frames)\n"
+            "- Image pixels bypass JSON entirely, as raw binary frames\n"
         ),
         notes=(
-            "Why not PyQt: SpyDE started as a PySide6/pyqtgraph app and was migrated.\n"
-            "The split buys a modern UI toolkit without dragging the scientific\n"
-            "stack into it, and a hard testable seam between the two.\n\n"
-            "The protocol is `PLOTAPP:`-prefixed JSON lines on stdout, from\n"
-            "anyplotlib._electron. Binary frames ride a separate PLOTBIN path.\n\n"
-            "[TODO: add a sentence on the migration if the audience knows the old "
-            "Qt app]"
+            "Why not PyQt: SpyDE started as a PySide6/pyqtgraph app and was\n"
+            "migrated. The split buys a modern UI toolkit without dragging the\n"
+            "scientific stack into it, and a hard, testable seam between the two.\n\n"
+            "The protocol is PLOTAPP:-prefixed JSON lines on stdout, from\n"
+            "anyplotlib._electron. Binary frames ride a separate PLOTBIN path — a\n"
+            "base64 round-trip per frame was measurably slower.\n\n"
+            "Add a sentence on the Qt migration only if the audience saw the old\n"
+            "app."
         ),
     ),
-    # ── 9 ──────────────────────────────────────────────────────────────────────
+    # ── 11 ─────────────────────────────────────────────────────────────────────
     dict(
-        seconds=50, image="04-virtual-imaging.png", layout="text-left",
+        seconds=45, image="04-virtual-imaging.png", layout="text-left",
         text=(
-            "## anyplotlib — the plotting layer\n\n"
-            "Figures are **HTML embedded in the renderer**, not a native widget.\n\n"
-            "- Interactive widgets — crosshair, ROI, span — are anyplotlib's; SpyDE "
-            "binds them to navigation axes\n"
-            "- **Tiled display** for large frames: a downsampled overview plus a "
-            "hi-res detail tile of exactly what's on screen — crisp zoom without "
-            "shipping 16 megapixels\n"
-            "- Co-developed alongside SpyDE, released on PyPI (`anyplotlib>=0.4.2`)\n\n"
-            "One renderer serves the app, the exported HTML report, and the docs.\n"
+            "## anyplotlib — plotting that stays interactive\n\n"
+            "matplotlib's object-oriented API, rendered in the **browser** instead "
+            "of in Python. `apl.subplots()`, `ax.imshow()`, `ax.plot()` — switching "
+            "is often a one-line change.\n\n"
+            "- Pan, zoom and drag **never touch the kernel**, so interaction stays "
+            "at frame rate on large data\n"
+            "- Widgets — crosshair, ROI, span — report positions back to Python; "
+            "SpyDE binds them to navigation axes\n"
+            "- Deliberately light: `anywidget`, `numpy`, `traitlets`, `colorcet`. "
+            "**No matplotlib required.**\n"
         ),
         notes=(
-            "The screenshot: a virtual detector (the red disk) dropped on the\n"
+            "The screenshot: a virtual detector — the red disk — dropped on the\n"
             "diffraction pattern, and the virtual image on the right building live\n"
             "as you drag it. That interaction is an anyplotlib widget bound to a\n"
             "HyperSpy ROI.\n\n"
-            "Browser-native was the right call because the figure you interact with\n"
-            "and the figure you export are literally the same object."
+            "Be fair to matplotlib: it is still the right tool for print-quality\n"
+            "vector figures, and anyplotlib deliberately does not try to be. The\n"
+            "trade is the opposite one — raster canvas, browser rendering, and\n"
+            "interactivity that does not degrade with data size.\n\n"
+            "ipympl is the honest comparison: it re-renders on the Python side\n"
+            "every frame, which is exactly the round-trip this avoids."
         ),
     ),
-    # ── 10 ─────────────────────────────────────────────────────────────────────
+    # ── 12 ─────────────────────────────────────────────────────────────────────
     dict(
-        seconds=55,
+        seconds=35,
+        text=(
+            "## anyplotlib is a bridge\n\n"
+            "Written **for** SpyDE. Not owned by it — MIT, on PyPI, with no SpyDE "
+            "anywhere inside it.\n\n"
+            "| where it runs | how |\n"
+            "|---|---|\n"
+            "| **Jupyter Lab** | an `anywidget` — the design target |\n"
+            "| **SpyDE** | the renderer mounted directly in Electron |\n"
+            "| **`deapi`** | live plots while a detector is running |\n"
+            "| **HyperSpy** | the goal: an interactive backend for `s.plot()` |\n"
+            "| **A report, a website** | `fig.save_html()` — one self-contained "
+            "file, still interactive, no kernel |\n\n"
+            "The figure you explored is the figure you ship.\n"
+        ),
+        notes=(
+            "This is the slide to linger on if the room is Jupyter-heavy. The\n"
+            "argument: the same plotting layer serves the notebook, the desktop\n"
+            "app, the detector's live view and the exported document, so a widget\n"
+            "written once shows up in all four.\n\n"
+            "Status, stated accurately: the anywidget, Electron and save_html\n"
+            "paths all ship today. The HyperSpy backend is intent, not released —\n"
+            "call it a goal, not a feature.\n\n"
+            "The Sphinx extension is a nice aside for the docs-minded: figures in\n"
+            "the gallery are live in the browser via Pyodide, with no server."
+        ),
+    ),
+    # ── 13 ─────────────────────────────────────────────────────────────────────
+    dict(
+        seconds=40,
         text=(
             "## The hard part: staying live on lazy data\n\n"
             "Moving the probe has to feel instant on a dataset that does not fit in "
             "RAM.\n\n"
             "- **Storage-aligned chunking** — load with chunks that span whole "
-            "signal frames, so one pattern is one chunk read. Never `rechunk()` a "
-            "multi-gigabyte array to fix it after the fact.\n"
-            "- **One serial dispatcher, latest-position-wins** — no locks, no "
+            "signal frames, so one pattern is one chunk read. Never re-chunk a "
+            "multi-gigabyte array to fix it afterwards.\n"
+            "- **One serial dispatcher, latest-position-wins** — no locks and no "
             "thread per move; a superseded position is dropped before it ever runs.\n"
             "- **Two caches** — decoded frames, and decoded navigation *blocks*, "
-            "because a compressed chunk is atomic: reading one frame costs what "
-            "reading all of them costs.\n"
-            "- **Tiered reads** — cheap reads run synchronously on the dispatcher; "
-            "only reads that would genuinely freeze the UI go async and cancellable.\n\n"
+            "because a compressed chunk is atomic: one frame costs what all of them "
+            "cost.\n\n"
             "Region integration on a 64 × 64 × 256² scan: **2850 ms → ~5 ms** per "
             "drag step.\n"
         ),
         notes=(
-            "This is the engineering slide — the one that separates 'a GUI over\n"
-            "HyperSpy' from 'a GUI that stays live'.\n\n"
-            "The honest framing: almost every obvious fix here was tried and made\n"
-            "it worse. Per-update threads raced the chunk cache. A lock held across\n"
-            "the compute wedged. A one-entry block memo re-decoded on every chunk\n"
-            "crossing. What survives is serial + latest-wins + LRU caches.\n\n"
-            "Numbers are from the project's own benchmarks (CLAUDE.md /\n"
-            "benchmarks.md).\n"
-            "[TODO: confirm the machine these were measured on if asked]"
+            "The engineering slide — what separates 'a GUI over HyperSpy' from 'a\n"
+            "GUI that stays live'.\n\n"
+            "The honest framing, and the part people remember: almost every obvious\n"
+            "fix here was tried and made it worse. Per-update threads raced the\n"
+            "chunk cache. A lock held across the compute wedged the UI. A\n"
+            "one-entry block cache re-decoded on every chunk crossing. What\n"
+            "survived is serial, latest-wins, and two LRU caches.\n\n"
+            "Numbers are from the project's own benchmarks (benchmarks.md). If\n"
+            "asked what they were measured on, say the dev workstation rather\n"
+            "than inventing a spec."
         ),
     ),
-    # ── 11 ─────────────────────────────────────────────────────────────────────
+    # ── 14 ─────────────────────────────────────────────────────────────────────
     dict(
-        seconds=50, image="03-find-vectors-result.png", layout="text-right",
+        seconds=40, image="03-find-vectors-result.png", layout="text-right",
         text=(
             "## GPU where it pays\n\n"
             "- **Peak finding** — classical (difference-of-Gaussians, normalised "
             "cross-correlation) *and* a neural detector, both on torch\n"
             "- **Orientation mapping** — the whole scan is fit **at once**: every "
             "pattern packed into one batched tensor, coarse-seeded by angular "
-            "cross-correlation, refined with Adam. No dask, no per-pattern loop.\n"
-            "- Rewriting the coarse seed from a Python loop over templates into one "
-            "batched FFT correlation: **289 s → 1.6 s**\n"
-            "- CUDA *and* Apple MPS, always with a working CPU fallback\n"
+            "cross-correlation, refined with Adam. No Dask, no per-pattern loop.\n"
+            "- Rewriting that coarse seed from a Python loop over templates into "
+            "one batched FFT correlation: **289 s → 1.6 s**\n"
+            "- CUDA *and* Apple Metal, always with a working CPU fallback\n"
         ),
         notes=(
             "The screenshot is a real run on bundled synthetic Si grains — 701\n"
-            "diffraction vectors found (see the status bar), overlaid in red on the\n"
-            "pattern, with the vector count map as a new window.\n\n"
-            "The lesson worth stating out loud: when a GPU step is slow the cause is\n"
-            "almost always a Python loop launching tiny kernels, not the arithmetic.\n"
-            "289s -> 1.6s was a restructuring, not a faster card.\n\n"
-            "[TODO: confirm the GPU these numbers were measured on]"
+            "diffraction vectors found, overlaid in red on the pattern, with the\n"
+            "vector count map opened as a new window.\n\n"
+            "The lesson worth saying out loud: when a GPU step is slow, the cause\n"
+            "is almost always a Python loop launching tiny kernels, not the\n"
+            "arithmetic. 289 s -> 1.6 s was a restructuring, not a faster card.\n\n"
+            "Apple Metal has a sharp edge worth a sentence if there are Mac users\n"
+            "in the room: it is not thread-safe, so every torch call site in the\n"
+            "app takes one shared device lock."
         ),
     ),
-    # ── 12 ─────────────────────────────────────────────────────────────────────
+    # ── 15 ─────────────────────────────────────────────────────────────────────
     dict(
-        seconds=40, image="02-find-vectors-wizard.png", layout="text-left",
+        seconds=30, image="02-find-vectors-wizard.png", layout="text-left",
         text=(
             "## Interaction is the feature\n\n"
             "Heavy compute is staged behind a **live preview**: tune the parameters "
             "against the pattern under the crosshair, *then* commit to the full "
             "scan.\n\n"
-            "- Preview updates as you move the navigator — before any full-dataset "
-            "compute\n"
-            "- The same shape serves virtual imaging, FFT, line profiles, strain and "
-            "orientation mapping\n"
+            "- The preview follows the navigator, before any full-dataset compute\n"
+            "- The same shape serves virtual imaging, FFT, line profiles, strain "
+            "and orientation mapping\n"
             "- Results open **early** and fill in progressively\n"
         ),
         notes=(
-            "Point at the red circles on the pattern — that is the peak finder\n"
-            "running live under the crosshair with the parameters currently in the\n"
-            "wizard. You never launch a 20-minute job on a guess.\n\n"
-            "Note the neural detector (SpotUNet) in the Method dropdown alongside\n"
-            "the classical methods.\n\n"
-            "This is the 'Wizard' shape in spyde/actions/README.md: open, tune, run,\n"
-            "commit, close."
+            "Point at the red circles on the pattern — the peak finder running\n"
+            "live under the crosshair with the parameters currently in the wizard.\n"
+            "You never launch a twenty-minute job on a guess.\n\n"
+            "Note the neural detector in the Method dropdown alongside the\n"
+            "classical ones — same preview, same commit.\n\n"
+            "This is the 'Wizard' shape in spyde/actions/README.md: open, tune,\n"
+            "run, commit, close."
         ),
     ),
-    # ── 13 ─────────────────────────────────────────────────────────────────────
+    # ── 16 ─────────────────────────────────────────────────────────────────────
     dict(
-        seconds=45,
+        seconds=40,
         text=(
             "## …and this talk is a SpyDE document\n\n"
             "The Report Builder turns a session into a document. Drag a figure out "
             "of a window into the report and it stays **live and re-bindable** — "
-            "reopen the report with the data loaded and the figure re-renders from "
-            "the signal.\n\n"
+            "reopen the report with the data loaded and it re-renders from the "
+            "signal.\n\n"
             "- `.spyde-report` is a plain **zip**: `report.md` + `figures/*.yaml` + "
             "`assets/*.png` — valid markdown you can unzip and hand to pandoc\n"
             "- One document, several surfaces: scrolling report, **slide deck**, "
             "movie editor\n"
-            "- Exports to static HTML, interactive HTML, PDF, or a markdown folder\n"
-            "- Present mode has a presenter view with speaker notes — press **S**\n\n"
+            "- Themed in the document, so a deck still looks like yours on someone "
+            "else's machine\n"
+            "- Exports to static HTML, interactive HTML, PDF, or a markdown folder\n\n"
             "**This deck is `doc/presentations/spyde-overview.spyde-report`.**\n"
         ),
         notes=(
-            "The reveal. Worth pausing on: you are looking at the feature.\n\n"
-            "Press S here if you want to show the presenter view live — it is the\n"
-            "same screen (SpyDE is a single Electron window), showing the current\n"
-            "slide, the next one, these notes, and a timer.\n\n"
-            "The 'no JSON anywhere' choice is deliberate: the document stays\n"
-            "readable and diffable in git."
+            "The reveal. Worth a pause: the audience is looking at the feature.\n\n"
+            "Press S here to show the presenter view live — same screen, since\n"
+            "SpyDE is a single Electron window: current slide, next slide, these\n"
+            "notes, and a timer.\n\n"
+            "The 'no JSON anywhere' choice is deliberate — the document stays\n"
+            "readable and diffable in git, which is the same reproducibility\n"
+            "argument from a few slides ago applied to the write-up."
         ),
     ),
-    # ── 14 ── section divider ──────────────────────────────────────────────────
+    # ── 17 ── section divider ──────────────────────────────────────────────────
     dict(
         kind="title", style="accent", seconds=10,
-        text="# Active development\n\n## Where this is going\n",
-        notes="Breath. Transition into the part of the talk that is yours.",
+        text="# What's next\n\n## Active development and roadmap\n",
+        notes="Breath, and a change of gear from 'what it is' to 'where it goes'.",
     ),
-    # ── 15 ── OPEN PLACEHOLDER ─────────────────────────────────────────────────
+    # ── 18 ─────────────────────────────────────────────────────────────────────
     dict(
-        seconds=55,
-        # OPEN PLACEHOLDER — deliberately unwritten. A bare "-" renders as an
-        # invisible empty <li>, so the blanks are "…" instead: visible bullets
-        # that unmistakably read as "fill me in" on the projected slide.
+        seconds=45,
         text=(
             "## Active development\n\n"
-            "- …\n"
-            "- …\n"
-            "- …\n"
-            "- …\n\n"
-            "*[TODO: fill these in — the speaker notes suggest a shape.]*\n"
+            "- **Spectroscopy** — EELS and EDS model fitting across a whole "
+            "spectrum image: edges, backgrounds, quantification\n"
+            "- **EBSD** — kikuchipy indexing, IPF maps and refinement in the same "
+            "shell\n"
+            "- **Atomic resolution** — column finding through atomap\n"
+            "- **In situ** — drift correction, particle segmentation and tracking, "
+            "and DE's sparse `.csb` event streams, re-cut at any exposure without "
+            "re-reading the movie\n"
+            "- **Apple silicon** — the fitting and EBSD paths run on Metal\n"
         ),
         notes=(
-            "[TODO: FILL IN — this slide is deliberately empty.]\n\n"
-            "Suggested shape: what is being built right now, who is using it, what\n"
-            "changed since the last time this audience saw it. Add or remove bullets\n"
-            "freely; the deck's time budget gives this slide ~60 s."
+            "Pick the two items closest to this audience and spend the time there\n"
+            "rather than reading all five.\n\n"
+            "The .csb point is the one that surprises people: the file is an event\n"
+            "stream, not a frame stack, so an image only exists once you choose an\n"
+            "exposure — and changing that choice is cheap, because the per-frame\n"
+            "totals come from the block table without reading any payload.\n\n"
+            "This slide is a snapshot of the tree as of v0.3.0; refresh it before\n"
+            "you give the talk."
         ),
     ),
-    # ── 16 ── OPEN PLACEHOLDER ─────────────────────────────────────────────────
+    # ── 19 ─────────────────────────────────────────────────────────────────────
     dict(
         seconds=40,
-        # OPEN PLACEHOLDER — see the note on the previous slide.
         text=(
             "## Roadmap\n\n"
-            "- …\n"
-            "- …\n"
-            "- …\n\n"
-            "*[TODO: fill these in — the speaker notes suggest a shape.]*\n"
+            "**quantem** — a PyTorch-native toolkit for quantitative EM: "
+            "ptychographic phase retrieval, HAADF tomography, neural object "
+            "representations. It makes the same bet SpyDE's GPU paths already "
+            "make — put the whole problem on the device and batch it.\n\n"
+            "- Bring those reconstructions in as SpyDE actions, so a phase map is "
+            "another **node on the tree** rather than another script\n"
+            "- **anyplotlib as an interactive backend for HyperSpy** — the same "
+            "figures in the notebook and in the app\n"
+            "- **Analyse during acquisition, not after it** — the detector API is "
+            "already open\n"
         ),
         notes=(
-            "[TODO: FILL IN — this slide is deliberately empty.]\n\n"
-            "Suggested shape: the next milestone, what you want help with, and how\n"
-            "someone in the room could contribute. Budgeted ~45 s."
+            "quantem is the next-generation piece: github.com/electronmicroscopy/\n"
+            "quantem, pip install quantem. Ptychography and tomography are exactly\n"
+            "the workloads SpyDE has no answer for today, and its PyTorch backend\n"
+            "means it already thinks in batched device tensors — the integration\n"
+            "is a data-model question, not a rewrite.\n\n"
+            "Be clear that these are directions, not shipped features, and say\n"
+            "which one you want help with. This is the slide that turns a talk\n"
+            "into a collaboration.\n\n"
+            "Refresh before each delivery — a roadmap slide ages fastest."
         ),
     ),
-    # ── 17 ─────────────────────────────────────────────────────────────────────
+    # ── 20 ─────────────────────────────────────────────────────────────────────
     dict(
         seconds=25,
         text=(
             "## Try it\n\n"
-            "- **Download** — signed macOS build, Windows installer, Linux AppImage: "
-            "`github.com/CSSFrancis/spyde/releases`\n"
-            "- **From source** — Node 18+ and `uv`, then `uv sync --extra tests` and "
-            "`npm run dev`\n"
-            "- **Docs** — `directelectron.github.io/spyde`\n"
+            f"- **Download** — macOS, Windows and Linux builds: `{REPO_URL}/releases`\n"
+            "- **From source** — Node 18+ and `uv`, then `uv sync --extra tests` "
+            "and `npm run dev`\n"
+            f"- **Docs** — `{DOCS_URL}`\n"
             "- Python **3.10–3.13** · **GPL-3.0-or-later**\n\n"
-            "Built on the work of the HyperSpy and pyxem communities.\n"
+            "Built on the work of the HyperSpy and pyxem communities — and given "
+            "back to them.\n"
         ),
         notes=(
             "First launch bootstraps its own Python environment with uv, including\n"
             "the GPU-correct torch wheel, so 'download and run' really is the path.\n"
-            "Windows installers are currently unsigned — expect a SmartScreen\n"
-            "warning.\n\n"
-            "[TODO: confirm which release/version you want to point people at]"
+            "The macOS build is signed and notarised; Windows installers are not\n"
+            "yet signed, so warn people about the SmartScreen prompt.\n\n"
+            "Confirm the version you want to point people at before you present —\n"
+            "REPO_URL and DOCS_URL are constants at the top of the build script."
         ),
     ),
-    # ── 18 ─────────────────────────────────────────────────────────────────────
+    # ── 21 ─────────────────────────────────────────────────────────────────────
     dict(
         kind="title", style="accent", seconds=10,
-        text=(
-            "# Thank you\n\n"
-            "## Questions?\n\n"
-            "`github.com/CSSFrancis/spyde`\n"
+        text=_closing_slide_text(),
+        notes=(
+            "Leave this up for questions.\n\n"
+            "Acknowledgements worth naming out loud: Paul Voyles and the Voyles\n"
+            "group, the HyperSpy and pyxem maintainers, and Direct Electron for\n"
+            "funding the work and agreeing to give it away."
         ),
-        notes="[TODO: add your contact details / acknowledgements]",
     ),
 ]
 
 
-def build() -> ReportDoc:
+def build() -> tuple[ReportDoc, dict[str, bytes]]:
     """Assemble :data:`SLIDES` into a presentation ``ReportDoc`` + its assets."""
-    doc = ReportDoc(title="SpyDE — an overview", doc_type="presentation")
+    theme = normalize_theme({**THEME, "logo": _logo_data_url()})
+    doc = ReportDoc(title="SpyDE — an overview", doc_type="presentation",
+                    theme=theme)
     assets: dict[str, bytes] = {}
 
-    for i, s in enumerate(SLIDES):
+    for s in SLIDES:
         cid = new_cell_id()
         image = s.get("image")
         layout = s.get("layout", "full")
@@ -538,7 +786,6 @@ def build() -> ReportDoc:
                                   image_ext="png", caption=""))
             assets[img_id] = _png(image)
 
-        del i
     return doc, assets
 
 
@@ -552,8 +799,14 @@ def main() -> None:
     print(f"wrote {OUT}")
     print(f"  {n_slides} slides · {len(doc.cells)} cells · {size_kb:.0f} KB")
     print(f"  budget {total} s = {total / 60:.1f} min")
+    print(f"  theme  {doc.theme['bg']} / accent {doc.theme['accent']} · "
+          f"footer {'on' if doc.theme['footer_show'] else 'off'} · "
+          f"logo {'embedded' if doc.theme['logo'] else 'MISSING'}")
     assert n_slides == len(SLIDES), (
         f"slide grouping mismatch: {n_slides} groups vs {len(SLIDES)} entries")
+    # The talk has a slot. Fail the build rather than discover it on stage.
+    assert 660 <= total <= 810, (
+        f"budget {total} s is outside the ~11-13.5 min slot this deck targets")
 
 
 if __name__ == "__main__":
