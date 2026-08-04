@@ -41,6 +41,9 @@ import { AddFigureMenu } from './AddFigureMenu'
 import { SeamlessFigureFrame, FigureEditOverlay } from './ReportFigureCell'
 import { ComposeZones, ZONE_TILE, hoverZoneAt, type HoverZone } from './composeDrop'
 import { dlog, dlogOnce } from '../kernel/dragDiag'
+import {
+  hasImageFiles, imageExtOf, imageFilesFrom, readFileAsDataURL,
+} from './imageDrop'
 
 const DROP_MIMES = [FIGURE_DRAG_MIME, WINDOW_DRAG_MIME]
 const isComposeDrag = (dt: DataTransfer) => DROP_MIMES.some(m => dt.types.includes(m))
@@ -206,14 +209,39 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
   ]
 
   // ── Figure-side drop (fill the empty figure side in place) ─────────────────
+  //
+  // TWO transports land here, and the handler has to test for both: a figure /
+  // window PILL (`application/x-spyde-*` data) and an image FILE dragged in from
+  // the OS (`Files`). Gating on the pill alone made a dropped PNG fail the test,
+  // bubble to the sidebar body, and get APPENDED as a new image cell below —
+  // the slot the user aimed at stayed empty.
   const onFigDragOver = (e: React.DragEvent) => {
-    if (!isComposeDrag(e.dataTransfer)) return
+    if (!isComposeDrag(e.dataTransfer) && !hasImageFiles(e.dataTransfer)) return
     e.preventDefault()
     e.stopPropagation()   // don't also trigger the sidebar-body insertion logic
     e.dataTransfer.dropEffect = 'copy'
     setDropHover(true)
   }
   const onFigDrop = (e: React.DragEvent) => {
+    // A dropped PHOTO fills this cell's slot in place. Checked FIRST so it can
+    // never collide with the pill path below.
+    if (hasImageFiles(e.dataTransfer)) {
+      e.preventDefault()
+      e.stopPropagation()
+      setDropHover(false)
+      const file = imageFilesFrom(e.dataTransfer)[0]
+      if (!file) return
+      void (async () => {
+        try {
+          const dataUrl = await readFileAsDataURL(file)
+          if (!dataUrl) return
+          sendAction('report_set_cell_image', {
+            cell_id: cell.id, image_b64: dataUrl, image_ext: imageExtOf(file),
+          })
+        } catch { /* unreadable file — leave the slot empty */ }
+      })()
+      return
+    }
     if (!isComposeDrag(e.dataTransfer)) return
     e.preventDefault()
     e.stopPropagation()
