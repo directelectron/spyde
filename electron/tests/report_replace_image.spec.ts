@@ -103,6 +103,39 @@ test('a dropped PNG replaces an existing picture instead of stacking below it',
   expect(errs, `backend errors:\n${errs.join('\n')}`).toEqual([])
 })
 
+test('dropping a picture on a TEXT slide turns it into a split slide', async () => {
+  const { page } = ctx
+
+  await backendAction(page, 'report_new', { type: 'presentation' })
+  await backendAction(page, 'report_add_cell', {
+    source: '## Motivation\n\n- a point worth making\n',
+  })
+  const textCell = page.locator('[data-testid^="report-cell-"]').first()
+  await expect(textCell).toBeVisible({ timeout: 30_000 })
+  const cellId = (await textCell.getAttribute('data-testid'))!
+    .replace('report-cell-', '')
+  const cellsBefore = await page.locator('[data-report-cell="1"]').count()
+  await page.screenshot({ path: join(SHOTS, '04-text-before.png') })
+
+  await dropPngOn(page, `[data-testid="report-cell-${cellId}"]`, 140)
+
+  // The markdown cell became a SPLIT cell — same id, so the slide is still one
+  // slide and keeps whatever was riding on it.
+  await expect(page.getByTestId(`report-splitcell-${cellId}`),
+               'the text cell never became a split').toBeVisible({ timeout: 20_000 })
+  await expect(page.getByTestId(`report-split-figure-${cellId}`).locator('img'))
+    .toBeVisible({ timeout: 20_000 })
+  // The prose came with it.
+  await expect(page.getByTestId(`report-split-rendered-${cellId}`))
+    .toContainText('a point worth making')
+  expect(await page.locator('[data-report-cell="1"]').count(),
+         'a layout change must not add a cell').toBe(cellsBefore)
+  await page.screenshot({ path: join(SHOTS, '05-text-became-split.png') })
+
+  const errs = backendErrorLines(ctx.backend)
+  expect(errs, `backend errors:\n${errs.join('\n')}`).toEqual([])
+})
+
 test("a split cell's FILLED photo side accepts a replacement too", async () => {
   const { page } = ctx
 

@@ -2516,8 +2516,11 @@ def report_set_cell_image(session, plot, payload) -> None:
     the user aimed at stayed empty and the picture landed somewhere else. There
     was no verb that could fill a slot that already existed.
 
-    Three accepted targets:
+    Four accepted targets:
 
+    * a ``markdown`` cell — the text slide BECOMES a split slide: its prose moves
+      to the text side and the photo fills the other. ``layout`` picks the side
+      (default ``text-left``).
     * a ``split`` cell — the photo becomes its figure side; the TEXT side
       (``source``) and ``split_layout`` are untouched. Works whether the side
       was empty or already held a photo/figure, so this is also the REPLACE
@@ -2540,7 +2543,7 @@ def report_set_cell_image(session, plot, payload) -> None:
     if cell is None:
         ipc.emit_error("report_set_cell_image: unknown cell.")
         return
-    if cell.cell_type not in ("split", "figure", "image"):
+    if cell.cell_type not in ("split", "figure", "image", "markdown"):
         ipc.emit_error(
             f"report_set_cell_image: cell is a {cell.cell_type!r}, which has no "
             f"figure slot to fill.")
@@ -2569,6 +2572,16 @@ def report_set_cell_image(session, plot, payload) -> None:
         # A placeholder becomes a real photo cell — same id, same slide flags.
         cell.cell_type = "image"
         cell.placeholder = False
+    elif cell.cell_type == "markdown":
+        # A TEXT slide becomes a SPLIT slide: the prose it already had moves to
+        # the text side and the picture fills the other. Converting in place
+        # (rather than adding an image cell after it) is what makes this a
+        # layout change instead of a new slide — the cell keeps its id, so the
+        # slide break, kind, style and speaker notes riding on it survive, and
+        # a slide that WAS one text block stays one slide.
+        cell.cell_type = "split"
+        cell.split_layout = model._normalize_split_layout(
+            payload.get("layout") or cell.split_layout)
     cell.image_ext = ext
     mgr._images[cell.id] = data
     caption = str(payload.get("caption", "") or "")
@@ -3223,6 +3236,20 @@ def report_add_figure(session, plot, payload) -> None:
         # Fill an existing SPLIT cell's FIGURE SIDE in place (Wave B's figure-drop-
         # onto-a-split path) — keeps the split cell's text side + layout, replaces
         # any prior photo side with this figure.
+        cell.spec = spec
+        cell.image_ext = ""
+        mgr._images.pop(cell.id, None)
+        if caption:
+            cell.caption = caption
+    elif cell is not None and cell.cell_type == "markdown":
+        # A TEXT slide becomes a SPLIT slide with a LIVE figure beside its prose.
+        # Same in-place conversion as the photo path in report_set_cell_image —
+        # a layout change, not a new slide, so the cell id (and the slide break /
+        # kind / style / speaker notes on it) survives.
+        cell.cell_type = "split"
+        cell.split_layout = model._normalize_split_layout(
+            payload.get("layout") or cell.split_layout)
+        cell.placeholder = False
         cell.spec = spec
         cell.image_ext = ""
         mgr._images.pop(cell.id, None)

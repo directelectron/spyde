@@ -218,19 +218,75 @@ class TestReplaceAnExistingPhoto:
         assert len(session._report.doc.slides()) == 2
 
 
-class TestSetCellImageRejects:
-    def test_markdown_cell_has_no_slot(self, window):
+class TestTextSlideBecomesASplit:
+    """Drop a picture on a TEXT slide and it becomes a SPLIT slide."""
+
+    def test_markdown_converts_in_place_and_keeps_its_prose(self, window):
         session, messages = window["window"], window["messages"]
         h.report_new(session, None, {})
-        h.report_add_cell(session, None, {"source": "just text"})
+        h.report_add_cell(session, None, {"source": "## Motivation\n\n- a point\n"})
         cell_id = session._report.doc.cells[0].id
         messages.clear()
 
         h.report_set_cell_image(session, None, {
             "cell_id": cell_id, "image_b64": _PNG_URL, "image_ext": "png"})
+        assert not _errors(messages)
+
+        cells = _last_state(messages)["cells"]
+        assert len(cells) == 1, "a layout change must not add a second cell"
+        cell = session._report.doc.cells[0]
+        assert cell.id == cell_id
+        assert cell.cell_type == "split"
+        assert cell.source == "## Motivation\n\n- a point\n"   # prose preserved
+        assert cell.image_ext == "png"
+        assert session._report._images[cell_id] == _PNG_1x1
+        assert cell.split_layout == "text-left"               # sane default
+
+    def test_the_layout_can_be_chosen_at_conversion(self, window):
+        session = window["window"]
+        h.report_new(session, None, {})
+        h.report_add_cell(session, None, {"source": "text"})
+        cell_id = session._report.doc.cells[0].id
+        h.report_set_cell_image(session, None, {
+            "cell_id": cell_id, "image_b64": _PNG_URL, "image_ext": "png",
+            "layout": "text-top"})
+        assert session._report.doc.cells[0].split_layout == "text-top"
+
+    def test_the_slide_stays_one_slide(self, window):
+        """The conversion is a LAYOUT change, so a slide that was one text block
+        must not become two slides — and its notes must survive."""
+        session = window["window"]
+        h.report_new(session, None, {})
+        h.report_add_cell(session, None, {"source": "slide one"})
+        h.report_add_cell(session, None, {"source": "## Two\n", "slide_break": True})
+        cell = session._report.doc.cells[1]
+        cell.notes = "remember the aside"
+        cell.slide_style = "accent"
+
+        h.report_set_cell_image(session, None, {
+            "cell_id": cell.id, "image_b64": _PNG_URL, "image_ext": "png"})
+
+        after = session._report.doc.cells[1]
+        assert after.slide_break is True
+        assert after.notes == "remember the aside"
+        assert after.slide_style == "accent"
+        assert len(session._report.doc.slides()) == 2
+
+
+class TestSetCellImageRejects:
+    def test_a_movie_cell_has_no_slot(self, window):
+        session, messages = window["window"], window["messages"]
+        h.report_new(session, None, {})
+        h.report_add_cell(session, None, {"source": "x"})
+        cell = session._report.doc.cells[0]
+        cell.cell_type = "movie"
+        messages.clear()
+
+        h.report_set_cell_image(session, None, {
+            "cell_id": cell.id, "image_b64": _PNG_URL, "image_ext": "png"})
 
         assert _errors(messages), "a slot-less cell must report why, not no-op"
-        assert session._report.doc.cells[0].cell_type == "markdown"
+        assert session._report.doc.cells[0].cell_type == "movie"
 
     def test_unknown_cell_id_errors(self, window):
         session, messages = window["window"], window["messages"]

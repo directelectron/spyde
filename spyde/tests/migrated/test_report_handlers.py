@@ -779,6 +779,44 @@ class TestReplaceAPhotoWithALiveFigure:
         assert len(session._report.doc.slides()) == 2
 
 
+class TestTextSlideBecomesASplitWithALiveFigure:
+    def test_markdown_converts_in_place_keeping_its_prose(self, tem_2d_dataset):
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        _prime_plot_data(session)
+        wid = _signal_window_id(session)
+        h.report_new(session, None, {})
+        h.report_add_cell(session, None, {"source": "## Live\n\n- a point\n"})
+        cell_id = session._report.doc.cells[0].id
+        messages.clear()
+
+        h.report_add_figure(session, None,
+                            {"source_window_id": wid, "at_cell": cell_id})
+
+        cells = _last_state(messages)["cells"]
+        assert len(cells) == 1, "a layout change must not add a second cell"
+        cell = session._report.doc.cells[0]
+        assert cell.id == cell_id
+        assert cell.cell_type == "split"
+        assert cell.source == "## Live\n\n- a point\n"
+        assert cell.spec is not None
+        # The figure side really is live.
+        assert session._report._window_by_cell.get(cell_id) is not None
+
+    def test_conversion_respects_an_explicit_layout(self, tem_2d_dataset):
+        session = tem_2d_dataset["window"]
+        _prime_plot_data(session)
+        wid = _signal_window_id(session)
+        h.report_new(session, None, {})
+        h.report_add_cell(session, None, {"source": "text"})
+        cell_id = session._report.doc.cells[0].id
+
+        h.report_add_figure(session, None, {
+            "source_window_id": wid, "at_cell": cell_id, "layout": "text-right"})
+
+        assert session._report.doc.cells[0].split_layout == "text-right"
+
+
 class TestReportOpenRebind:
     def test_save_then_open_rebinds_live(self, tem_2d_dataset, tmp_path):
         session = tem_2d_dataset["window"]

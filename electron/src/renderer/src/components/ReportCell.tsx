@@ -19,6 +19,7 @@ import { renderMarkdown } from '../kernel/markdown'
 import { reportClipboard } from '../kernel/reportClipboard'
 import type { ReportCell as ReportCellType } from '../kernel/protocol'
 import { CellChrome } from './CellChrome'
+import { useReplaceDrop } from './useReplaceDrop'
 
 // One-time scoped markdown stylesheet for the dark theme. Injected under a
 // `.spyde-md` wrapper so it never leaks into the rest of the app. Sizes are in
@@ -229,6 +230,9 @@ const TOOLBAR: Array<[ToolbarCommand, string, string, React.CSSProperties?]> = [
 ]
 
 export function ReportCell({ cell, onUpdate, onRemove, index, dragProps }: Props) {
+  // Drop a figure/window or an image file here to turn this TEXT slide into a
+  // SPLIT slide (the backend converts the cell in place, keeping its prose).
+  const replace = useReplaceDrop(cell.id)
   const { sendAction } = useSpyDE()
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(cell.source ?? '')
@@ -291,8 +295,20 @@ export function ReportCell({ cell, onUpdate, onRemove, index, dragProps }: Props
       data-testid={`report-cell-${cell.id}`}
       draggable={!showEditor}
       onDragStart={dragProps.onDragStart}
-      onDragOver={dragProps.onDragOver}
-      onDrop={dragProps.onDrop}
+      // TWO kinds of drag land on this element and they must not fight. A
+      // figure/window PILL or an image FILE turns this text slide into a SPLIT
+      // slide; a cell REORDER drag moves it. `replace` claims only the former
+      // (it preventDefaults when it does), so anything it declines falls
+      // through to the reorder wiring exactly as before.
+      onDragOver={(e) => {
+        replace.handlers.onDragOver(e)
+        if (!e.defaultPrevented) dragProps.onDragOver(e)
+      }}
+      onDragLeave={replace.handlers.onDragLeave}
+      onDrop={(e) => {
+        replace.handlers.onDrop(e)
+        if (!e.defaultPrevented) dragProps.onDrop(e)
+      }}
       onDragEnd={dragProps.onDragEnd}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
@@ -300,8 +316,15 @@ export function ReportCell({ cell, onUpdate, onRemove, index, dragProps }: Props
         ...styles.cell,
         ...(dragProps.dragging ? styles.cellDragging : {}),
         ...(dragProps.dropBefore ? styles.cellDropBefore : {}),
+        ...(replace.active ? styles.cellSplitDropOn : {}),
       }}
     >
+      {replace.active && (
+        <div style={styles.splitDropHint}
+             data-testid={`report-cell-splithint-${cell.id}`}>
+          Drop to make this a split slide
+        </div>
+      )}
       {/* Hover chrome: drag handle (reorder) + copy + duplicate + delete. */}
       {(hover || showEditor) && (
         <CellChrome
@@ -390,6 +413,14 @@ const styles: Record<string, React.CSSProperties> = {
   },
   cellDragging: { opacity: 0.4 },
   cellDropBefore: { borderTop: '2px solid #89b4fa' },
+  cellSplitDropOn: { outline: '2px dashed #89b4fa', outlineOffset: 2 },
+  splitDropHint: {
+    position: 'absolute', top: 4, right: 6, zIndex: 5,
+    background: 'rgba(17,17,27,0.92)', color: '#89b4fa',
+    border: '1px solid #89b4fa', borderRadius: 5,
+    padding: '2px 8px', fontSize: 10, fontWeight: 700,
+    pointerEvents: 'none',
+  },
   chrome: {
     position: 'absolute', top: 2, right: 4, zIndex: 2,
     display: 'flex', alignItems: 'center', gap: 4,
