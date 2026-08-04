@@ -176,6 +176,48 @@ class TestSetCellImageOnPlaceholder:
         assert len(session._report.doc.slides()) == 2
 
 
+class TestReplaceAnExistingPhoto:
+    """Drop another image onto a picture that is already there."""
+
+    def test_image_cell_bytes_are_swapped_in_place(self, window):
+        session, messages = window["window"], window["messages"]
+        h.report_new(session, None, {})
+        h.report_add_image_cell(session, None, {
+            "image_b64": _PNG_URL, "image_ext": "png", "caption": "keep me"})
+        cell_id = session._report.doc.cells[0].id
+        messages.clear()
+
+        h.report_set_cell_image(session, None, {
+            "cell_id": cell_id, "image_b64": _GIF_URL, "image_ext": "gif"})
+        assert not _errors(messages)
+
+        cells = _last_state(messages)["cells"]
+        assert len(cells) == 1, "replacing must not append a second picture"
+        assert cells[0]["id"] == cell_id
+        assert cells[0]["cell_type"] == "image"
+        assert cells[0]["image_ext"] == "gif"
+        assert session._report._images[cell_id] == _GIF_1x1
+        # The identity that hangs off the cell survives the swap.
+        assert cells[0]["caption"] == "keep me"
+
+    def test_slide_attributes_survive_an_image_swap(self, window):
+        session = window["window"]
+        h.report_new(session, None, {})
+        h.report_add_cell(session, None, {"source": "slide one"})
+        h.report_add_image_cell(session, None, {
+            "image_b64": _PNG_URL, "image_ext": "png", "slide_break": True})
+        cell = session._report.doc.cells[1]
+        cell.notes = "say the thing"
+
+        h.report_set_cell_image(session, None, {
+            "cell_id": cell.id, "image_b64": _GIF_URL, "image_ext": "gif"})
+
+        after = session._report.doc.cells[1]
+        assert after.slide_break is True
+        assert after.notes == "say the thing"
+        assert len(session._report.doc.slides()) == 2
+
+
 class TestSetCellImageRejects:
     def test_markdown_cell_has_no_slot(self, window):
         session, messages = window["window"], window["messages"]

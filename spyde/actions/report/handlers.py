@@ -2516,10 +2516,14 @@ def report_set_cell_image(session, plot, payload) -> None:
     the user aimed at stayed empty and the picture landed somewhere else. There
     was no verb that could fill a slot that already existed.
 
-    Two accepted targets:
+    Three accepted targets:
 
     * a ``split`` cell — the photo becomes its figure side; the TEXT side
-      (``source``) and ``split_layout`` are untouched.
+      (``source``) and ``split_layout`` are untouched. Works whether the side
+      was empty or already held a photo/figure, so this is also the REPLACE
+      path.
+    * an ``image`` cell — swap the bytes in place. Same cell, so its caption,
+      size and slide attributes all survive; only the picture changes.
     * a ``figure`` PLACEHOLDER — there is no "figure cell holding a photo" in
       the model, so it converts IN PLACE to an ``image`` cell. Converting rather
       than replacing is what preserves the cell's identity: its id, and with it
@@ -2536,7 +2540,7 @@ def report_set_cell_image(session, plot, payload) -> None:
     if cell is None:
         ipc.emit_error("report_set_cell_image: unknown cell.")
         return
-    if cell.cell_type not in ("split", "figure"):
+    if cell.cell_type not in ("split", "figure", "image"):
         ipc.emit_error(
             f"report_set_cell_image: cell is a {cell.cell_type!r}, which has no "
             f"figure slot to fill.")
@@ -3219,6 +3223,21 @@ def report_add_figure(session, plot, payload) -> None:
         # Fill an existing SPLIT cell's FIGURE SIDE in place (Wave B's figure-drop-
         # onto-a-split path) — keeps the split cell's text side + layout, replaces
         # any prior photo side with this figure.
+        cell.spec = spec
+        cell.image_ext = ""
+        mgr._images.pop(cell.id, None)
+        if caption:
+            cell.caption = caption
+    elif cell is not None and cell.cell_type == "image":
+        # Dropping a live window onto a PHOTO replaces the picture with the
+        # figure. There is no "image cell holding a figure", so it converts IN
+        # PLACE to a figure cell — same id, so the caption, the display size and
+        # the slide attributes riding on a slide's first cell (break / kind /
+        # style / speaker notes) all survive. Appending a new cell instead (what
+        # the else-branch below used to do for an image target) left the photo
+        # sitting above an unrelated new figure.
+        cell.cell_type = "figure"
+        cell.placeholder = False
         cell.spec = spec
         cell.image_ext = ""
         mgr._images.pop(cell.id, None)
