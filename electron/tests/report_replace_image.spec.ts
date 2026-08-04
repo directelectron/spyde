@@ -106,7 +106,11 @@ test('a dropped PNG replaces an existing picture instead of stacking below it',
 test('dropping a picture on a TEXT slide turns it into a split slide', async () => {
   const { page } = ctx
 
+  if (!(await page.getByTestId('report-sidebar').isVisible())) {
+    await page.getByTestId('toggle-report').click()
+  }
   await backendAction(page, 'report_new', { type: 'presentation' })
+  await page.waitForTimeout(600)
   await backendAction(page, 'report_add_cell', {
     source: '## Motivation\n\n- a point worth making\n',
   })
@@ -136,15 +140,34 @@ test('dropping a picture on a TEXT slide turns it into a split slide', async () 
   expect(errs, `backend errors:\n${errs.join('\n')}`).toEqual([])
 })
 
+// NOT COVERED HERE: dropping a file on a LIVE figure cell.
+//
+// The backend half is pinned by test_report_handlers.py
+// (TestPhotoReplacesALiveFigure — the figure cell converts to a photo cell and
+// its window is torn down). The RENDERER half — a shield mounting over the
+// out-of-process iframe for an OS file drag, so the iframe cannot swallow the
+// drop — is NOT verified end-to-end. An attempt using load_test_data_si_grains
+// resolved a window id of 0 from the first breadcrumb (the NAVIGATOR window,
+// not the signal one) and report_add_figure then produced no figure cell with
+// no backend error, so the spec was measuring nothing. Getting a real painted
+// signal window and a real figure cell into this fixture is the work; it is
+// worth doing, and it is not done.
+
 test("a split cell's FILLED photo side accepts a replacement too", async () => {
   const { page } = ctx
 
+  // Self-sufficient: the sidebar may not be open when this test runs alone.
+  if (!(await page.getByTestId('report-sidebar').isVisible())) {
+    await page.getByTestId('toggle-report').click()
+  }
   await backendAction(page, 'report_new', {})
+  await page.waitForTimeout(600)
   await backendAction(page, 'report_add_split_cell', {
     source: '## Split\n\ntext side\n', layout: 'text-left',
   })
-  const splitTestId = await page.locator('[data-testid^="report-splitcell-"]')
-    .first().getAttribute('data-testid')
+  const splitLoc = page.locator('[data-testid^="report-splitcell-"]').first()
+  await expect(splitLoc).toBeVisible({ timeout: 30_000 })
+  const splitTestId = await splitLoc.getAttribute('data-testid')
   const splitId = (splitTestId || '').replace('report-splitcell-', '')
   // Fill it first — the bug was specifically that a FILLED side had no target.
   await backendAction(page, 'report_set_cell_image', {

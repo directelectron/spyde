@@ -46,6 +46,51 @@ function pillPayload(dt: DataTransfer): {
   return peekWindowDrag()
 }
 
+/**
+ * True while an image FILE is being dragged over the window from the OS.
+ *
+ * Needed because a report figure is an OUT-OF-PROCESS IFRAME, which swallows
+ * drag events over itself — the cell only ever sees them through a transparent
+ * shield mounted on top. That shield was gated on `dragKind`, which is set at
+ * dragstart of an IN-APP pill; an OS file drag never sets it, so no shield
+ * mounted, the iframe ate the dragover, and the drop reached the sidebar body
+ * instead (appending a new image cell below the figure).
+ *
+ * Detected by a window-level `dragover` refreshing a short timer rather than by
+ * `dragend`: for a drag originating OUTSIDE the page, dragend fires on the
+ * source, which isn't in this document, so it never arrives here. The timer is
+ * the only signal that reliably says "the drag has gone".
+ */
+export function useFileDragActive(): boolean {
+  const [active, setActive] = React.useState(false)
+  React.useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const clear = () => { setActive(false); if (timer) { clearTimeout(timer); timer = null } }
+    const onOver = (e: DragEvent) => {
+      if (!e.dataTransfer || !hasImageFiles(e.dataTransfer)) return
+      setActive(true)
+      if (timer) clearTimeout(timer)
+      // Comfortably longer than the ~50-100 ms dragover cadence, short enough
+      // that the shield doesn't linger after the pointer leaves.
+      timer = setTimeout(() => setActive(false), 220)
+    }
+    const onLeave = (e: DragEvent) => {
+      // Leaving the window entirely (no related target) — not crossing a child.
+      if (!e.relatedTarget) clear()
+    }
+    window.addEventListener('dragover', onOver)
+    window.addEventListener('drop', clear)
+    window.addEventListener('dragleave', onLeave)
+    return () => {
+      window.removeEventListener('dragover', onOver)
+      window.removeEventListener('drop', clear)
+      window.removeEventListener('dragleave', onLeave)
+      if (timer) clearTimeout(timer)
+    }
+  }, [])
+  return active
+}
+
 export interface ReplaceDrop {
   active: boolean
   handlers: {

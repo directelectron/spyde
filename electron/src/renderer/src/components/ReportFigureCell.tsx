@@ -55,6 +55,7 @@ import {
 import {
   hasImageFiles, imageExtOf, imageFilesFrom, readFileAsDataURL,
 } from './imageDrop'
+import { useFileDragActive, useReplaceDrop } from './useReplaceDrop'
 
 // The compose-zone primitives (types, the tile map, hit-testing and the overlay
 // component) live in ./composeDrop so the SPLIT block mounts the IDENTICAL
@@ -239,6 +240,10 @@ export function ReportFigureCell({ cell, onRemove, index, dragProps, reorderActi
   const [captionEditing, setCaptionEditing] = useState(false)
   const [captionDraft, setCaptionDraft] = useState(cell.caption ?? '')
   const [hover, setHover] = useState(false)
+  // A dropped image REPLACES this figure (the cell converts to a photo cell).
+  // fileDragActive is what mounts the shield over the iframe for an OS drag.
+  const fileDragActive = useFileDragActive()
+  const replace = useReplaceDrop(cell.id)
   const [dropHover, setDropHover] = useState(false)     // placeholder fill hover
   const [editOpen, setEditOpen] = useState(false)
   // The SELECTED spec panel id (null = figure-level), mirrored from the backend's
@@ -658,17 +663,27 @@ export function ReportFigureCell({ cell, onRemove, index, dragProps, reorderActi
    * accepted it, and the release produced `dragend` with no `drop`. Identical
    * symptom to a hit-testing failure, entirely different cause.
    */
-  const composeShieldNode = dragKind === 'window' ? (
+  const composeShieldNode = (dragKind === 'window' || fileDragActive) ? (
     <div
       ref={() => dlogOnce('3.shield/mounted', { cell: cell.id })}
       data-testid={`figcell-compose-shield-${cell.id}`}
-      style={styles.composeShield}
-      onDragEnter={onComposeDragOver}
-      onDragOver={onComposeDragOver}
-      onDragLeave={onComposeDragLeave}
-      onDrop={onComposeDrop}
+      style={{ ...styles.composeShield,
+               ...(replace.active ? styles.composeShieldFileOn : {}) }}
+      // A FILE drag gets the shield too. It is gated on `dragKind` for pills,
+      // which an OS file drag never sets — so nothing covered the iframe, the
+      // iframe swallowed the dragover, and the drop fell through to the sidebar
+      // body and appended a new image cell BELOW the figure.
+      onDragEnter={fileDragActive ? replace.handlers.onDragOver : onComposeDragOver}
+      onDragOver={fileDragActive ? replace.handlers.onDragOver : onComposeDragOver}
+      onDragLeave={fileDragActive ? replace.handlers.onDragLeave : onComposeDragLeave}
+      onDrop={fileDragActive ? replace.handlers.onDrop : onComposeDrop}
     >
-      {hoverZone != null && (
+      {fileDragActive ? (
+        <div style={styles.fileDropHint}
+             data-testid={`figcell-filedrop-hint-${cell.id}`}>
+          Drop to replace with this image
+        </div>
+      ) : hoverZone != null && (
         <ComposeZones active={hoverZone.zone} cellId={cell.id}
           panelRect={hoverZone.panelRect} panelLabel={hoverZone.panelLabel} />
       )}
@@ -2192,6 +2207,16 @@ const styles: Record<string, React.CSSProperties> = {
   // ── Compose zones ──────────────────────────────────────────────────────────
   composeShield: {
     position: 'absolute', inset: 0, zIndex: 3,
+  },
+  composeShieldFileOn: {
+    outline: '2px dashed #89b4fa', outlineOffset: -2,
+    background: 'rgba(17,17,27,0.55)',
+  },
+  fileDropHint: {
+    position: 'absolute', inset: 0, display: 'flex',
+    alignItems: 'center', justifyContent: 'center',
+    color: '#89b4fa', fontSize: 12, fontWeight: 700,
+    pointerEvents: 'none',
   },
   // (The zone overlay's own styles moved to ./composeDrop with the component.)
   // ── Compose prompt popover ───────────────────────────────────────────────
