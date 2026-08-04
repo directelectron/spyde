@@ -5,7 +5,7 @@ presentation document, not a PDF.
 
 | file | what it is | length |
 |---|---|---|
-| `spyde-overview.spyde-report` | "SpyDE — an overview": what SpyDE is, the HyperSpy stack it builds on, the Electron/anyplotlib architecture, and what makes it fast | 18 slides, ~12 min |
+| `spyde-overview.spyde-report` | "SpyDE — an overview": where the project came from, the HyperSpy stack it builds on, the Electron/anyplotlib architecture, the case for open and reproducible analysis, and where it is going | 21 slides, ~12.4 min |
 
 ## Opening a deck
 
@@ -35,11 +35,23 @@ script:
 python doc/presentations/build_spyde_overview.py
 ```
 
-Edit the `SLIDES` table in `build_spyde_overview.py` (text, layout, speaker
-notes, per-slide time budget) and re-run it. The script prints the slide count
-and the total time budget so the talk stays inside its slot. If you edit the deck
-in the app instead and save over the file, the script becomes stale — that is
-fine, but say so in the commit.
+Three tables in `build_spyde_overview.py` are what you edit:
+
+| table | what it controls |
+|---|---|
+| `SPEAKER` | name, role, affiliation, email, **venue and date**. Feeds the title card, the closing card and the footer bar, so booking a new venue is one edit. Leave `venue`/`date` blank and the line is omitted rather than left dangling. |
+| `THEME` | the deck's look — background, text, muted, accent, font stack, logo, footer. Written into the document's `theme:` front matter, so it travels with the file. |
+| `SLIDES` | the talk: text, layout, speaker notes, per-slide time budget. |
+
+The script prints the slide count, the total time budget and the resolved theme
+on every rebuild, and **fails the build** if the budget leaves the ~11–13.5 min
+slot the deck targets — better to find that here than on stage.
+
+If you edit the deck in the app instead and save over the file, the script
+becomes stale — that is fine, but say so in the commit.
+
+Nothing on a slide is a placeholder. Anything still to be decided lives in the
+speaker notes, where a projector can't show it to the room.
 
 ### Screenshots
 
@@ -64,7 +76,14 @@ slides afterwards.
 `electron/tests/talk_present.spec.ts` opens the committed deck in the real app,
 pages through every slide in Present mode, screenshots each one to
 `electron/talk_present_shots/`, and fails on a slide that renders no text or
-overflows horizontally. Look at the screenshots — that is the actual check.
+overflows horizontally. It also asserts the **theme** survives the round trip:
+the deck's background and accent, the footer bar with its embedded logo and
+contact line, that a title card carries *no* footer, and that slide headings
+take the themed colour rather than the stylesheet's hard-coded one.
+
+Look at the screenshots — that is the actual check. `N_SLIDES` and the theme
+colours in the spec are duplicated from the build script on purpose: if you
+change one, the other fails loudly.
 
 ```bash
 cd electron
@@ -86,7 +105,10 @@ assets/<id>.png    # the baked snapshot / embedded image, per cell
 Presentation-only attributes — slide breaks, title slides, background styles,
 speaker notes — ride as invisible HTML comments, so an external markdown renderer
 shows the prose and ignores the rest. `type: presentation` in the front matter is
-what makes the document a deck rather than a scrolling report.
+what makes the document a deck rather than a scrolling report, and `theme:`
+carries its look. The logo is embedded as a `data:` URL rather than a path, so
+the deck survives being emailed to someone whose disk has never had this repo on
+it.
 
 This deck uses only markdown, image, and split cells, so it carries no live
 signal bindings and opens standalone with no data loaded. A deck built from your
