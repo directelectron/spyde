@@ -44,6 +44,7 @@ import { dlog, dlogOnce } from '../kernel/dragDiag'
 import {
   hasImageFiles, imageExtOf, imageFilesFrom, readFileAsDataURL,
 } from './imageDrop'
+import { useReplaceDrop } from './useReplaceDrop'
 
 const DROP_MIMES = [FIGURE_DRAG_MIME, WINDOW_DRAG_MIME]
 const isComposeDrag = (dt: DataTransfer) => DROP_MIMES.some(m => dt.types.includes(m))
@@ -107,6 +108,8 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
   // window on its EDGE must tile into a subplot grid exactly as it does on a
   // plain figure cell — before this it only ever replaced the figure.
   const [hoverZone, setHoverZone] = useState<HoverZone | null>(null)
+  // Swap a FILLED photo side for another file / a live figure, in place.
+  const replace = useReplaceDrop(cell.id)
   // The ＋ chrome button's window picker (the click path to a subplot grid).
   const [addMenu, setAddMenu] = useState(false)
   const taRef = useRef<HTMLTextAreaElement>(null)
@@ -429,11 +432,22 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
         </div>
       ) : hasImage ? (
         <div
-          style={styles.figBox}
+          style={{ ...styles.figBox,
+                   ...(replace.active ? styles.figBoxDropOn : {}) }}
           onMouseEnter={() => setFigHover(true)}
           onMouseLeave={() => setFigHover(false)}
+          // A FILLED photo side had no drop target at all — the dropzone below
+          // only ever rendered while the side was empty — so swapping the
+          // picture meant removing the figure side and re-adding it.
+          {...replace.handlers}
         >
           <img src={cell.image} alt={cell.caption ?? ''} style={styles.img} />
+          {replace.active && (
+            <div style={styles.dropHint}
+                 data-testid={`report-split-drophint-${cell.id}`}>
+              Replace this image
+            </div>
+          )}
           {figHover && (
             <button
               data-testid={`report-split-remove-figure-${cell.id}`}
@@ -684,6 +698,13 @@ const styles: Record<string, React.CSSProperties> = {
   pending: {
     display: 'flex', alignItems: 'center', justifyContent: 'center',
     width: '100%', height: '100%', color: '#6c7086', fontSize: 11,
+  },
+  figBoxDropOn: { outline: '2px dashed #89b4fa', outlineOffset: 2 },
+  dropHint: {
+    position: 'absolute', inset: 0, display: 'flex',
+    alignItems: 'center', justifyContent: 'center',
+    background: 'rgba(17,17,27,0.66)', color: '#89b4fa',
+    fontSize: 11, fontWeight: 700, pointerEvents: 'none',
   },
   offlineBadge: {
     position: 'absolute', left: 6, bottom: 6,

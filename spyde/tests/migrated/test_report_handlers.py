@@ -714,6 +714,71 @@ class TestReportSave:
 # ── open + rebind round-trip ───────────────────────────────────────────────────
 
 
+class TestReplaceAPhotoWithALiveFigure:
+    """Dropping a plot window onto a PICTURE replaces it with a live figure.
+
+    ``report_add_figure {at_cell}`` knew how to fill a figure cell and a split
+    cell's figure side, but an ``image`` target fell through to the append
+    branch — so the photo stayed put and an unrelated figure landed underneath
+    it."""
+
+    def test_image_cell_becomes_a_live_figure_in_place(self, tem_2d_dataset):
+        import base64
+        png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgYGAAAAAE"
+            "AAH2FzhVAAAAAElFTkSuQmCC")
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        _prime_plot_data(session)
+        wid = _signal_window_id(session)
+        h.report_new(session, None, {})
+        h.report_add_image_cell(session, None, {
+            "image_b64": "data:image/png;base64," +
+                         base64.b64encode(png).decode("ascii"),
+            "image_ext": "png", "caption": "a photo"})
+        cell_id = session._report.doc.cells[0].id
+        messages.clear()
+
+        h.report_add_figure(session, None,
+                            {"source_window_id": wid, "at_cell": cell_id})
+
+        cells = _last_state(messages)["cells"]
+        assert len(cells) == 1, "the figure must REPLACE the photo, not follow it"
+        cell = session._report.doc.cells[0]
+        assert cell.id == cell_id                 # same cell, converted
+        assert cell.cell_type == "figure"
+        assert cell.spec is not None
+        assert cell.image_ext == ""
+        assert cell_id not in session._report._images
+        # And it really is live.
+        assert session._report._window_by_cell.get(cell_id) is not None
+
+    def test_the_photo_cell_keeps_its_slide_role(self, tem_2d_dataset):
+        import base64
+        png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgYGAAAAAE"
+            "AAH2FzhVAAAAAElFTkSuQmCC")
+        session = tem_2d_dataset["window"]
+        _prime_plot_data(session)
+        wid = _signal_window_id(session)
+        h.report_new(session, None, {})
+        h.report_add_cell(session, None, {"source": "slide one"})
+        h.report_add_image_cell(session, None, {
+            "image_b64": "data:image/png;base64," +
+                         base64.b64encode(png).decode("ascii"),
+            "image_ext": "png", "slide_break": True})
+        cell = session._report.doc.cells[1]
+        cell.notes = "point at the peak"
+
+        h.report_add_figure(session, None,
+                            {"source_window_id": wid, "at_cell": cell.id})
+
+        after = session._report.doc.cells[1]
+        assert after.slide_break is True
+        assert after.notes == "point at the peak"
+        assert len(session._report.doc.slides()) == 2
+
+
 class TestReportOpenRebind:
     def test_save_then_open_rebinds_live(self, tem_2d_dataset, tmp_path):
         session = tem_2d_dataset["window"]
