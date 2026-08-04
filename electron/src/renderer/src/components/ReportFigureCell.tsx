@@ -2185,7 +2185,7 @@ const styles: Record<string, React.CSSProperties> = {
     transition: 'border-color 90ms, background 90ms',
   },
   placeholderHot: {
-    borderColor: '#89b4fa', background: 'rgba(137,180,250,0.08)', color: '#89b4fa',
+    border: '2px dashed #89b4fa', background: 'rgba(137,180,250,0.08)', color: '#89b4fa',
   },
   placeholderIcon: { fontSize: 26, opacity: 0.6 },
   placeholderText: { fontSize: 12, textAlign: 'center', padding: '0 12px' },

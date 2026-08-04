@@ -535,7 +535,7 @@ const styles: Record<string, React.CSSProperties> = {
     transition: 'background 70ms, border-color 70ms',
   },
   overlayZoneHot: {
-    borderColor: '#89b4fa', background: 'rgba(137,180,250,0.24)',
+    border: '2px dashed #89b4fa', background: 'rgba(137,180,250,0.24)',
   },
   overlayZoneLabel: {
     fontSize: 12, fontWeight: 600, color: '#cdd6f4',

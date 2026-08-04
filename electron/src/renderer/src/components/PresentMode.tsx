@@ -1282,7 +1282,7 @@ const styles: Record<string, React.CSSProperties> = {
     padding: 0,
   },
   iconBtnActive: {
-    background: '#89b4fa', color: '#11111b', borderColor: '#89b4fa',
+    background: '#89b4fa', color: '#11111b', border: '1px solid #89b4fa',
   },
   // The whole audience slide stack is hidden (but kept MOUNTED) while the
   // presenter dashboard is up, so the live figure iframes never tear down.

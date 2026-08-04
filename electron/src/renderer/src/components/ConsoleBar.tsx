@@ -801,8 +801,9 @@ const styles: Record<string, React.CSSProperties> = {
     transition: 'border-color 90ms ease',
     borderTop: '1px solid transparent', borderBottom: '1px solid transparent',
   },
-  inputRowFlash: { borderColor: '#f38ba8' },
-  inputRowDrop: { borderColor: '#89b4fa', background: 'rgba(137,180,250,0.06)' },
+  inputRowFlash: { borderTop: '1px solid #f38ba8', borderBottom: '1px solid #f38ba8' },
+  inputRowDrop: { borderTop: '1px solid #89b4fa', borderBottom: '1px solid #89b4fa',
+    background: 'rgba(137,180,250,0.06)' },
   prompt: {
     fontFamily: MONO, fontSize: 12, color: '#89b4fa', fontWeight: 700, flexShrink: 0,
     userSelect: 'none',
