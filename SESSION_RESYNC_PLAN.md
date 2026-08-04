@@ -144,8 +144,9 @@ selectors come back, not just the windows.
 
 - Persisting the workspace to disk across an app *quit* (that is session
   restore, a different feature — §2's pattern 2).
-- Reconnecting or restarting the Dask cluster. Not implicated: the backend and
-  its cluster survived, which is why re-loading data works.
+- Reconnecting or restarting the Dask cluster — but **not because it is
+  unaffected**. See §8: it is a genuinely open question and probably a second,
+  independent bug.
 - Any change to the navigator read path, chunking, or signal-tree internals.
 
 ## 7. Cost
@@ -154,3 +155,67 @@ Phase 1 is under a day and is what makes the rest estimable. Phase 2 is the bulk
 and is bounded by 3.3's answers — cheap if the figure HTML and `awi_state`
 survive, considerably more if every figure must re-render. **I would not commit
 to a Phase 2 estimate before Phase 1 runs.**
+
+---
+
+## 8. Correction: does the Dask cluster survive?
+
+An earlier draft of this document asserted that the cluster survived, "which is
+why re-loading data works". **That claim was wrong and is withdrawn.** Neither
+observed symptom tells us anything about the cluster.
+
+**Re-loading data working proves nothing.** `Session._await_dask()` gates every
+load on `self._dask_ready`, which is a `threading.Event` — a **one-shot latch**.
+It is `set()` once when the cluster first comes up and is cleared in exactly one
+place in the codebase (`compute_config.py`, on an explicit user-driven cluster
+restart). Nothing clears it when a cluster *dies*. So after a resume, a load
+sails straight through the gate and proceeds against a **dead client**, exactly
+as it would against a live one. The load succeeding is evidence about the latch,
+not about the cluster.
+
+**The dashboard disappearing proves nothing either.** `dashboardUrl` lives in
+the *same* `SpyDEContext` React state as `windows`. Whatever loses the workspace
+loses the dashboard link with it — one state object, one loss. (It is also the
+field that commit `6731786` just fixed for an unrelated reason: a late `ready`
+message with no dashboard field was overwriting it. Same field, different bug.)
+
+So there are now **two independent unknowns**, and the two symptoms are
+consistent with either or both:
+
+| | cluster alive | cluster dead |
+|---|---|---|
+| **renderer state lost** | windows + dashboard link both gone; compute still fine | windows + dashboard gone; compute silently broken |
+| **renderer state kept** | not what is observed | dashboard link would persist but be dead |
+
+### 8.1 The latent bug, independent of sleep
+
+**Nothing in SpyDE detects cluster death.** There is no liveness check, no
+heartbeat consumed, and no path that re-arms `_dask_ready`. Whenever a cluster
+dies for any reason, the app keeps accepting loads and computes against a dead
+client instead of waiting, restarting, or saying so. Sleep may simply be the
+easiest way to trigger it.
+
+This is worth fixing on its own merits and is **separable** from the resync
+work. It is also the more dangerous of the two: a vanished window is obvious,
+whereas a silently dead compute backend is not.
+
+### 8.2 How to actually tell
+
+Cheap discriminators, in order of effort:
+
+1. **Look for the workers.** After a resume, `ps` for the `dask-worker` /
+   spawned Python children (macOS: `pgrep -fl distributed`). Present and
+   parented correctly → the cluster lived.
+2. **Ask the backend, not the UI.** The dashboard *link* is renderer state; the
+   cluster is not. A backend-side probe (`client.scheduler_info()` in the
+   console cell, or a log line on `power:resume`) answers the question directly
+   without going through the state that we already know gets lost.
+3. **Try a compute, not a load.** A load passes the latch either way. Something
+   that actually round-trips through the scheduler is the real test.
+
+### 8.3 Consequence for this plan
+
+Phase 0 grows one question: *is the cluster alive after resume?* — answered by
+8.2, not by the UI. If it is dead, that is a second workstream (detect death,
+re-arm the gate, restart or report) that this document does **not** currently
+scope, and it should not be folded into the resync work.
