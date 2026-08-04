@@ -2527,8 +2527,9 @@ def report_set_cell_image(session, plot, payload) -> None:
       path.
     * an ``image`` cell — swap the bytes in place. Same cell, so its caption,
       size and slide attributes all survive; only the picture changes.
-    * a ``figure`` PLACEHOLDER — there is no "figure cell holding a photo" in
-      the model, so it converts IN PLACE to an ``image`` cell. Converting rather
+    * a ``figure`` cell, placeholder OR filled — there is no "figure cell
+      holding a photo" in the model, so it converts IN PLACE to an ``image``
+      cell, tearing down the live figure window first. Converting rather
       than replacing is what preserves the cell's identity: its id, and with it
       the slide attributes that ride on a slide's first cell (``slide_break``,
       kind, style, speaker notes). Re-creating the cell would silently drop the

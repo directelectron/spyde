@@ -779,6 +779,48 @@ class TestReplaceAPhotoWithALiveFigure:
         assert len(session._report.doc.slides()) == 2
 
 
+class TestPhotoReplacesALiveFigure:
+    """A dropped image onto a FILLED figure cell replaces the figure.
+
+    The renderer gap this pairs with: a report figure is an out-of-process
+    iframe that swallows drag events, and the shield that normally covers it was
+    mounted only for in-app pill drags — so an OS file drag never reached the
+    cell at all."""
+
+    def test_filled_figure_converts_to_a_photo_cell(self, tem_2d_dataset):
+        import base64
+        png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgYGAAAAAE"
+            "AAH2FzhVAAAAAElFTkSuQmCC")
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        _prime_plot_data(session)
+        wid = _signal_window_id(session)
+        h.report_new(session, None, {})
+        h.report_add_figure(session, None,
+                            {"source_window_id": wid, "caption": "DP"})
+        cell_id = session._report.doc.cells[0].id
+        assert session._report._window_by_cell.get(cell_id) is not None
+        messages.clear()
+
+        h.report_set_cell_image(session, None, {
+            "cell_id": cell_id,
+            "image_b64": "data:image/png;base64," +
+                         base64.b64encode(png).decode("ascii"),
+            "image_ext": "png"})
+
+        cells = _last_state(messages)["cells"]
+        assert len(cells) == 1, "replacing must not append a second cell"
+        cell = session._report.doc.cells[0]
+        assert cell.id == cell_id
+        assert cell.cell_type == "image"
+        assert cell.spec is None
+        assert session._report._images[cell_id] == png
+        # The live figure is torn down, not orphaned.
+        assert session._report._window_by_cell.get(cell_id) is None
+        assert cell_id not in session._report._snapshots
+
+
 class TestTextSlideBecomesASplitWithALiveFigure:
     def test_markdown_converts_in_place_keeping_its_prose(self, tem_2d_dataset):
         session = tem_2d_dataset["window"]
