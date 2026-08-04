@@ -293,9 +293,11 @@ def _render_figure_side_html(mgr, cell: Cell, assets: dict, *, interactive: bool
 
 def _split_cell_html(mgr, cell: Cell, assets: dict, *, interactive: bool,
                      session=None) -> str:
-    """A SPLIT cell (Wave A) → a 2-column ``.split-block`` grid: the TEXT side
-    (its markdown) BESIDE the FIGURE/PHOTO side, ordered by ``split_layout``
-    (``text-left`` → text then figure; ``text-right`` → figure then text). The
+    """A SPLIT cell (Wave A) → a ``.split-block`` grid: the TEXT side (its
+    markdown) beside — or above — the FIGURE/PHOTO side, ordered and oriented by
+    ``split_layout``. All FOUR layouts: ``text-left``/``text-right`` are two
+    columns, ``text-top``/``text-bottom`` add ``--stacked`` for two rows; the
+    ``text-left``/``text-top`` pair puts the text first. The
     figure side reuses :func:`_render_figure_side_html` (interactive iframe / baked
     PNG / photo data URL — all self-contained). An empty figure side just renders
     the text beside an empty column. Reused by the article/static export AND (via

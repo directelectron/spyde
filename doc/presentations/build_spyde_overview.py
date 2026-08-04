@@ -46,7 +46,7 @@ if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
 from spyde.actions.report.model import (  # noqa: E402
-    Cell, ReportDoc, new_cell_id, normalize_theme, write_report,
+    _SPLIT_LAYOUTS, Cell, ReportDoc, new_cell_id, normalize_theme, write_report,
 )
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -213,7 +213,11 @@ def _closing_slide_text() -> str:
 # Each entry is one SLIDE:
 #   text     — the slide's markdown (a split slide's TEXT side)
 #   image    — a media/ filename; present → the slide carries a screenshot
-#   layout   — "full" (image below the text) or "text-left"/"text-right" (split)
+#   layout   — "full" (a separate full-width image cell BELOW the text), or one
+#              of the four SPLIT layouts, which put the text and the picture in
+#              ONE atomic cell: "text-left" / "text-right" (side by side) and
+#              "text-top" / "text-bottom" (stacked). An unrecognised value is an
+#              error, not a silent fallback.
 #   kind     — "title" for a title/section slide, "" for a content slide
 #   style    — "" (default stage) | "plain" | "accent"
 #   notes    — speaker notes (presenter view only, never shown to the audience)
@@ -754,14 +758,22 @@ def build() -> tuple[ReportDoc, dict[str, bytes]]:
                     theme=theme)
     assets: dict[str, bytes] = {}
 
-    for s in SLIDES:
+    for i, s in enumerate(SLIDES, start=1):
         cid = new_cell_id()
         image = s.get("image")
         layout = s.get("layout", "full")
+        if layout != "full" and layout not in _SPLIT_LAYOUTS:
+            raise ValueError(
+                f"slide {i}: layout {layout!r} is not one of "
+                f"{('full',) + _SPLIT_LAYOUTS}")
         # A slide with an image and a split layout is ONE atomic split cell (text
         # beside the screenshot). Anything else is a markdown cell, optionally
         # followed by a full-width image cell.
-        is_split = bool(image) and layout in ("text-left", "text-right")
+        # All FOUR model layouts, not just the side-by-side pair: text-top and
+        # text-bottom used to fall through to the full-width path SILENTLY, so a
+        # slide asking for them got a markdown cell plus a detached image cell
+        # and no error to say why.
+        is_split = bool(image) and layout in _SPLIT_LAYOUTS
         cell = Cell(
             id=cid,
             cell_type="split" if is_split else "markdown",

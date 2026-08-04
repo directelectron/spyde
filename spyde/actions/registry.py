@@ -146,6 +146,7 @@ _SPYDE_STAGED_HANDLERS: dict[str, str] = {
     "report_close":            "spyde.actions.report.handlers.report_close",
     "report_add_cell":         "spyde.actions.report.handlers.report_add_cell",
     "report_add_image_cell":   "spyde.actions.report.handlers.report_add_image_cell",
+    "report_set_cell_image":   "spyde.actions.report.handlers.report_set_cell_image",
     # Report/Presentation redesign Wave A — the split-block primitive (text side
     # BESIDE a figure/photo side, one atomic cell).
     "report_add_split_cell":   "spyde.actions.report.handlers.report_add_split_cell",
