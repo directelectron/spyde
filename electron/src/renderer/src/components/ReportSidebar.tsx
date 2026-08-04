@@ -1549,7 +1549,7 @@ const styles: Record<string, React.CSSProperties> = {
     transition: 'border-color 120ms ease, background 120ms ease, transform 120ms ease',
   },
   docCardHover: {
-    background: '#1e1e2e', borderColor: '#89b4fa', transform: 'translateY(-1px)',
+    background: '#1e1e2e', border: '1px solid #89b4fa', transform: 'translateY(-1px)',
   },
   docCardIcon: {
     display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
@@ -1602,7 +1602,7 @@ const styles: Record<string, React.CSSProperties> = {
     marginBottom: 12,
   },
   slideGroupDragging: { opacity: 0.4 },
-  slideGroupDropOn: { borderColor: '#89b4fa', boxShadow: '0 0 0 1px #89b4fa inset' },
+  slideGroupDropOn: { border: '1px solid #89b4fa', boxShadow: '0 0 0 1px #89b4fa inset' },
   slideHeader: {
     display: 'flex', alignItems: 'center', gap: 6,
     padding: '5px 2px 6px', borderBottom: '1px solid #313244',

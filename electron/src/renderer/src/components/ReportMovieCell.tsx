@@ -232,8 +232,8 @@ const styles: Record<string, React.CSSProperties> = {
     color: '#6c7086', fontSize: 11.5, textAlign: 'center', padding: '14px 10px',
     cursor: 'default', width: '100%', boxSizing: 'border-box',
   },
-  dropZoneActive: { borderColor: '#89b4fa', color: '#89b4fa' },
-  dropZoneReady: { cursor: 'pointer', borderStyle: 'solid', color: '#a6adc8' },
+  dropZoneActive: { border: '1px dashed #89b4fa', color: '#89b4fa' },
+  dropZoneReady: { cursor: 'pointer', border: '1px solid #45475a', color: '#a6adc8' },
   filmIcon: { fontSize: 22, lineHeight: 1 },
   summary: {
     display: 'flex', alignItems: 'center', gap: 8,

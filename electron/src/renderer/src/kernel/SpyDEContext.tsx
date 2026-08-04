@@ -340,7 +340,18 @@ function spydeReducer(state: State, action: Action): State {
       return {
         ...state,
         ready: true,
-        dashboardUrl: action.dashboardUrl ?? null,
+        // NEVER erase a dashboard URL we already have.
+        //
+        // Two different messages dispatch READY: `ready` (the backend's stdin
+        // loop is up — carries NO dashboard) and `dask_ready` (the cluster is
+        // up — carries one). Their order is NOT fixed: `ready` is emitted after
+        // _prewarm_io() + prewarm_torch_cuda(), which costs seconds, while the
+        // cluster comes up on a background thread — so `dask_ready` frequently
+        // lands FIRST. With `?? null`, the later `ready` then wiped the URL,
+        // which disabled the "Open full Dask dashboard" menu item and hid the
+        // button in DaskMonitor. A READY without a URL carries no information
+        // about the dashboard, so it must not overwrite one.
+        dashboardUrl: action.dashboardUrl ?? state.dashboardUrl ?? null,
         status: 'Ready',
       }
 

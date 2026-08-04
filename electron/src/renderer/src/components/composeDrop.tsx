@@ -179,7 +179,7 @@ const styles: Record<string, React.CSSProperties> = {
     transition: 'background 70ms, border-color 70ms',
   },
   zoneHot: {
-    borderColor: '#89b4fa', borderWidth: 2,
+    border: '2px solid #89b4fa',
     background: 'rgba(137,180,250,0.42)',
     boxShadow: 'inset 0 0 0 1px rgba(255,255,255,0.25)',
   },
