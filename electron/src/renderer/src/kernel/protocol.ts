@@ -527,6 +527,11 @@ export interface ReportCell {
   fig_id?: string | null
   /** figure cells: the SignalRef couldn't be rebound → show the baked PNG. */
   data_offline?: boolean
+  /** figure cells: rebuilt from the report's OWN saved pixels (data/<id>.npz)
+   *  because the source signal wasn't available. A REAL, interactive figure —
+   *  pan, zoom and widgets all work — with nothing behind it to refresh FROM,
+   *  so only the refresh-from-data affordance is withheld. Not data_offline. */
+  data_detached?: boolean
   /** figure cells: a data-URL PNG fallback (present only for offline cells). */
   png?: string
   /** figure cells: the pixel-free FigureSpec recipe (panels/layers/annotations)

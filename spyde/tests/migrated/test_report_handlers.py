@@ -743,9 +743,15 @@ class TestReportOpenRebind:
         # A live report figure was re-emitted.
         assert len(_report_figures(messages)) == 1
 
-    def test_open_offline_when_source_gone_includes_png(self, tem_2d_dataset, tmp_path):
-        """With NO matching open tree, a figure cell is offline and its baked PNG
-        rides along in the state as a data URL (renderer has no zip access)."""
+    def test_open_detached_when_source_gone_but_pixels_were_saved(
+            self, tem_2d_dataset, tmp_path):
+        """With NO matching open tree, a figure saved WITH its pixels
+        (``data/<id>.npz``) comes back DETACHED — a real, interactive figure
+        rebuilt from the report's own data — rather than the flat PNG this used
+        to fall back to. See test_report_detached_figures.py.
+
+        The offline-PNG path is still exercised by the sibling test below, which
+        strips the data from the zip first."""
         session = tem_2d_dataset["window"]
         messages = tem_2d_dataset["messages"]
         _prime_plot_data(session)
@@ -764,7 +770,43 @@ class TestReportOpenRebind:
 
         st = _last_state(messages)
         fig_cell = [c for c in st["cells"] if c["cell_type"] == "figure"][0]
+        assert fig_cell["data_detached"] is True
+        assert fig_cell["data_offline"] is False
+        # A detached cell IS live — that is the whole point.
+        assert _report_figures(messages) != []
+
+    def test_open_offline_when_no_saved_pixels_includes_png(
+            self, tem_2d_dataset, tmp_path):
+        """With no matching open tree AND no saved pixels, the cell is offline
+        and its baked PNG rides in the state as a data URL (the renderer has no
+        zip access). This is the pre-existing fallback, still reachable for any
+        report written before figure data was persisted."""
+        import zipfile
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        _prime_plot_data(session)
+        wid = _signal_window_id(session)
+        h.report_new(session, None, {})
+        h.report_add_figure(session, None, {"source_window_id": wid, "caption": "DP"})
+        path = str(tmp_path / "off.spyde-report")
+        h.report_save(session, None, {"path": path})
+
+        # Rewrite the zip WITHOUT its data/ members — a pre-data report.
+        stripped = str(tmp_path / "off_nodata.spyde-report")
+        with zipfile.ZipFile(path) as src, zipfile.ZipFile(stripped, "w") as dst:
+            for item in src.namelist():
+                if not item.startswith("data/"):
+                    dst.writestr(item, src.read(item))
+
+        session._plots = []
+        h.report_close(session, None, {})
+        messages.clear()
+        h.report_open(session, None, {"path": stripped})
+
+        st = _last_state(messages)
+        fig_cell = [c for c in st["cells"] if c["cell_type"] == "figure"][0]
         assert fig_cell["data_offline"] is True
+        assert fig_cell["data_detached"] is False
         assert isinstance(fig_cell.get("png"), str)
         assert fig_cell["png"].startswith("data:image/png;base64,")
         # No live figure emitted for an offline cell.

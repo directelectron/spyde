@@ -893,9 +893,20 @@ function Slide({ cells, active, reportFigures, iframeRefs, replayState, onLaunch
   // big type, a dense one keeps prose size so it can't overflow into the
   // pager. Deterministic, no layout thrash, no reflow loop — and the tier is
   // exported as `data-fill` so a spec can assert it without reading font sizes.
-  const textOnly = visualCells === 0 && !isTitle
+  // SPLIT slides qualify too. Their text side is its own column, so scaling it
+  // cannot crowd the picture — and a split left at prose size was the same
+  // complaint: a heading and four bullets adrift in half a dark rectangle.
+  // A slide with a full-width figure/image/movie does NOT qualify: there the
+  // text shares the vertical budget with the visual and bigger type pushes it
+  // off the stage.
+  const splitCells = cells.filter(c => c.cell_type === 'split').length
+  const splitOnly = splitCells > 0 && visualCells === splitCells
+  const fillable = !isTitle && (visualCells === 0 || splitOnly)
   const textLen = cells.reduce((n, c) => n + (c.source ?? '').length, 0)
-  const fill = !textOnly ? '' : textLen < 400 ? 'lg' : textLen < 850 ? 'md' : ''
+  // A split's text lives in HALF the width, so the same character count fills
+  // twice the height — the tiers step down accordingly.
+  const [lgMax, mdMax] = splitOnly ? [260, 520] : [400, 850]
+  const fill = !fillable ? '' : textLen < lgMax ? 'lg' : textLen < mdMax ? 'md' : ''
 
   const renderCell = (cell: ReportCell) => (
     <SlideCell
@@ -1124,7 +1135,12 @@ const styles: Record<string, React.CSSProperties> = {
     // Grow into the stage like a plain figure cell does.
     flex: '1 1 var(--spyde-fig-vh, 58vh)', minHeight: 0,
   },
-  splitText: { minWidth: 0, alignSelf: 'center', maxHeight: '100%', overflow: 'hidden' },
+  // START, not center: the row is stretched to the stage, so centring the text
+  // inside it floats the heading at a height that depends on how many bullets
+  // follow — the same drift the content slides had, and it puts the heading out
+  // of line with the top of the picture beside it. Long text fills the column
+  // either way, so this only changes the sparse case, which is the broken one.
+  splitText: { minWidth: 0, alignSelf: 'start', maxHeight: '100%', overflow: 'hidden' },
   splitFig: {
     minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column',
     alignItems: 'center', justifyContent: 'center',
