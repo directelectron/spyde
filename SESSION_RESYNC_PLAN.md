@@ -483,3 +483,68 @@ But if §11.2 holds, resync would be **papering over** a specific state-clearing
 bug rather than fixing it, and that bug would still be there afterwards —
 clearing the workspace on every future occurrence, just with a recovery path
 behind it. Worth one round of §11.3 before committing to Phase 2.
+
+---
+
+## 12. The control is answered — and it reopens the diagnosis
+
+Log from the real lid-close:
+
+```
+[spyde lifecycle 2026-08-05T12:28:01.801Z] power:lock-screen
+[spyde lifecycle 2026-08-05T12:30:41.274Z] power:resume
+[spyde lifecycle 2026-08-05T12:30:41.441Z] power:unlock-screen
+```
+
+**The diagnostics were live.** `power:resume` printed, so the absence of
+`render-process-gone` / `child-process-gone` is a genuine negative, not a dead
+listener. §11.2 is now a **finding**: the renderer process survived.
+
+### 12.1 Which means the workspace was not necessarily "lost"
+
+`SpyDEProvider`'s state is a `useReducer` initialised once (`SpyDEContext.tsx`
+:805). Nothing in the reducer clears `windows` wholesale. With the process alive,
+that leaves only two mechanisms — and they are **very** different jobs:
+
+**A. The page reloaded.** A navigation resets the React tree and every Map with
+it. Would appear in the log as `renderer-navigation` and
+`renderer-did-finish-load` around `power:resume`. If this is it, §3's resync is
+the right fix and Phase 2 proceeds.
+
+**B. The windows were never lost — they are off-screen or unrendered.**
+`MDIArea` positions subwindows at **absolute pixel coordinates** derived from
+`areaRef.clientWidth/clientHeight` (`MDIArea.tsx` :134, :211) and caches them in
+`placedRef` (:113, :230). A Mac lid-close routinely changes the display
+configuration; if the area measures 0 — or much smaller — during resume, cached
+placements can land outside the visible region. The windows would still be in
+state, still streaming, and simply **not where you can see them**.
+
+If B is the mechanism, this is a *layout* bug, and the fix is re-clamping
+placements on an area-size change — dramatically smaller than §3, and it would
+make the resync work unnecessary for THIS symptom (though still correct for
+genuine renderer loss, per §10.1).
+
+### 12.2 The two-second discriminator
+
+`MDIArea` keeps hidden windows **listed in the top bar** (:108 — a hidden window
+is `display:none` and still enumerated).
+
+So, next time it happens: **does the window bar still list the windows?**
+
+| top bar | mechanism | fix |
+|---|---|---|
+| Still lists them | **B** — state intact, they are off-screen / hidden | re-clamp placements on resize; small |
+| Empty too | **A** — state genuinely gone | §3 resync; Phase 2 as scoped |
+
+Second confirmation for A, from the same log you already have: whether
+`renderer-navigation` / `renderer-did-finish-load` appear near `power:resume`.
+Those lines are already being written — they just were not in the excerpt.
+
+### 12.3 Status
+
+**Phase 2 is on hold.** Not because the resync is wrong — §10.1 measured the
+workspace dying under a plain renderer reload, so it remains a real robustness
+gap — but because building it now risks papering over a much cheaper layout bug
+while leaving the actual cause in place.
+
+One look at the window bar decides it.
