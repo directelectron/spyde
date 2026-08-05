@@ -418,3 +418,68 @@ is untouched by that explanation and remains §9's to answer.
   is added, which is the point.
 - Phase 2: **cheaper than feared** — re-send existing `file_url`s.
 - Phase 3 (`awi_state` replay) is now the main remaining unknown.
+
+---
+
+## 11. Phase 0 results — and a hypothesis that did NOT survive
+
+Reported from a real Mac lid-close (2026-08-05):
+
+| observation | result |
+|---|---|
+| Dask worker count, before vs after | **unchanged** |
+| A real distributed compute after resume | **worked** |
+| `render-process-gone` | **did not fire** |
+| `child-process-gone` | **did not fire** |
+
+### 11.1 The cluster survives
+
+Settled, and by the right test — a compute that round-trips through the
+scheduler, not a load that the §10.3 latch would wave through regardless.
+
+**§9 drops in priority.** It does *not* go away: nothing detects cluster death
+from *any* cause, and §10.3 shows the app would keep queueing work against a
+dead cluster silently. That is still a real latent bug. It is just no longer
+implicated in *this* one.
+
+### 11.2 The leading hypothesis is now in doubt
+
+§1 concluded the renderer lost its state, and the natural mechanism was the
+renderer *process* being recreated. **Neither process-gone event fired**, which
+argues against exactly that.
+
+If the renderer process genuinely survived, then something inside the app
+**cleared** the workspace — and that is a different, more specific, and probably
+much cheaper bug than the one this document scopes. Candidates worth eliminating
+before building anything:
+
+- the renderer received `window_closed` (or equivalent) for every window;
+- a React remount high enough in the tree to reset `SpyDEContext`;
+- an error boundary or a thrown render that reset state without killing the
+  process.
+
+### 11.3 The control question — unresolved
+
+**Did `[spyde lifecycle …] power:suspend` / `power:resume` print at all?**
+
+This is the difference between two very different conclusions:
+
+- **They printed, process-gone did not** → real finding. The renderer survived,
+  §11.2 applies, and there is a root cause still to find.
+- **Nothing printed** → the diagnostics were not live (packaged build, stale
+  `out/`, or the run predating `4e1af8b`), and the test is **inconclusive** —
+  absence of evidence, not evidence of absence.
+
+Until that is answered, §11.2 is a hypothesis, not a result.
+
+### 11.4 What this changes about "good to go"
+
+The resync work in §3 is still the right *robustness* fix and is unaffected by
+any of this — a workspace that cannot be rebuilt from the backend is a bug under
+any renderer loss (devtools reload, hot restart, future crash), which §10.1
+measured directly.
+
+But if §11.2 holds, resync would be **papering over** a specific state-clearing
+bug rather than fixing it, and that bug would still be there afterwards —
+clearing the workspace on every future occurrence, just with a recovery path
+behind it. Worth one round of §11.3 before committing to Phase 2.
