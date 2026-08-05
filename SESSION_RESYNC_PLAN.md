@@ -1,7 +1,9 @@
 # Session resync — surviving a renderer loss
 
-**Status:** proposal. Nothing implemented beyond the lifecycle diagnostics in
-`electron/src/main/index.ts` (commit `4e1af8b`), which only log.
+**Status:** proposal, with **Phase 1 complete and measured** (§10). Nothing
+behavioural implemented — only the lifecycle diagnostics in
+`electron/src/main/index.ts` (`4e1af8b`, logging only) and the two Phase 1
+probes. Phase 2 onwards is unbuilt and awaiting the decisions in §5.
 
 **Symptom.** Close a Mac laptop lid, reopen it, and every plot window is gone
 from the workspace. The app still works — you just re-load the data.
@@ -12,10 +14,12 @@ from the workspace. The app still works — you just re-load the data.
 
 Two facts from the code rule out the obvious suspects before any reproduction.
 
-**The Python backend is alive.** `runner.ts` never respawns it: on `close` it
-sets `proc = null`, and every later `sendAction` silently no-ops. If the backend
-had died, re-loading data afterwards would be impossible. It isn't — so Python
-survived the sleep with its signal trees intact.
+**The Python backend is alive.** Originally inferred: `runner.ts` never
+respawns it (on `close` it sets `proc = null` and every later `sendAction`
+no-ops), so if it had died, re-loading data afterwards would be impossible.
+**Since confirmed directly — the Python process is still running after a real
+Mac lid-close** (§10.4). Python survives the sleep with its signal trees
+intact.
 
 **The workspace is renderer-only state.** The window list lives in
 `SpyDEContext`'s `windows: Map<number, SpyDEWindow>`, in memory. Nothing
@@ -372,17 +376,43 @@ is now the only significant unknown left.
 So "re-loading data works" is evidence about the latch, not the cluster. §8's
 withdrawal holds, and §9's premise is now measured rather than argued.
 
-### 10.4 What this does NOT tell us
+### 10.4 Corroborated on a real Mac lid-close
 
-The probe simulates a **renderer loss**. It does not simulate a Mac sleep, so it
-still cannot say whether the cluster dies on a real lid-close — that needs
-§8.2 on your machine. What it does establish is that the workspace loss is fully
-explained *without* any cluster death, and that the cluster question is
-genuinely independent.
+The probe uses a proxy, so its "backend survives" result could in principle have
+been an artefact of reloading the renderer rather than genuinely sleeping the
+machine. It is not: **on the real Mac lid-close, the Python process is still
+running** (observed directly, 2026-08-05).
 
-### 10.5 Effect on the plan
+That closes the loop on §1. The backend surviving is no longer an inference from
+"re-loading data works" — it is observed on the actual failure, on the actual
+platform, and it agrees with the proxy. The proxy is therefore a sound stand-in
+for this bug, and Phase 2 has something real to resync from.
 
-- §1 premise: **confirmed by measurement.**
+### 10.5 What is STILL open
+
+**A running Python process is not a healthy cluster.** The Dask workers are
+*separate child processes* of the backend (and the scheduler is its own
+endpoint), so "the backend is alive" says nothing about whether the workers
+survived the sleep. §8's two unknowns collapse to one, not zero:
+
+| question | status |
+|---|---|
+| Does the backend survive a Mac sleep? | **answered — yes**, observed directly |
+| Do the Dask workers / scheduler survive it? | **still open** — needs §8.2 |
+
+And §10.3 is exactly why the app cannot answer the second one for us: the gate
+is a latch, so a load succeeds either way. The discriminators in §8.2 are still
+the only way to tell — look for the worker processes (`pgrep -fl distributed`),
+probe from the backend rather than the UI, and run a *compute* rather than a
+load.
+
+So: the workspace loss is now fully explained and measured. The cluster question
+is untouched by that explanation and remains §9's to answer.
+
+### 10.6 Effect on the plan
+
+- §1 premise: **confirmed by measurement, and corroborated on a real Mac
+  lid-close** (§10.4).
 - Phase 1: **complete.** Its two probes stay in the tree as characterisation
   tests — `test_dask_ready_latch.py` is written to FAIL when a liveness detector
   is added, which is the point.
