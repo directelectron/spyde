@@ -311,3 +311,80 @@ owns.
   some configurations and `SPYDE_NO_DASK=1` sets the gate pre-opened; the
   detector must no-op there rather than reporting a permanently dead cluster.
 - Nothing here touches the navigator read path, chunking, or the signal tree.
+
+---
+
+## 10. Phase 1 results — MEASURED, not assumed
+
+Phase 1 is done. Two probes, both committed and re-runnable:
+
+- `electron/tests/resume_probe.spec.ts` — drives the real app.
+- `spyde/tests/migrated/test_dask_ready_latch.py` — characterises the load gate.
+
+A lid-close cannot be driven from CI, so the app probe uses the faithful proxy:
+**reload the renderer with data loaded**. That destroys the renderer's in-memory
+React state exactly as a renderer-process death would, while leaving Python and
+its cluster untouched — the situation §1 reasons about.
+
+### 10.1 What survives a renderer loss
+
+```
+BEFORE  windows=2 iframes=2 dashboardLink=true  figureFiles=2
+AFTER   windows=0 iframes=0 dashboardLink=false figureFilesStillOnDisk=2/2
+BACKEND exited=false logGrew=true
+RELOAD  worked=true windows=2
+```
+
+| thing | survives? | consequence |
+|---|---|---|
+| Plot windows | **NO** — 2 → 0 | §1's premise is confirmed, not assumed |
+| Figure iframes | **NO** — 2 → 0 | follows from the windows |
+| Dask dashboard link | **NO** | confirms §8: same React state as `windows`, so it proves nothing about the cluster |
+| Python backend | **YES** — never exited, log kept growing | resync has something to resync FROM |
+| **Figure HTML files on disk** | **YES — 2/2** | **the Phase 2 cost driver, and it is the cheap answer** |
+| Usability | **YES** — re-loading data rebuilt both windows | matches the reported "it still works" |
+
+### 10.2 The important one
+
+**The figure HTML files outlive the renderer.** Figures are served over the
+custom `spyde-fig://figures/<name>` protocol, which resolves to a real file in
+the OS tmpdir (`main/index.ts` `resolveFigPath`); the *main* process writes
+them, so a renderer loss does not touch them.
+
+That answers §3.3 Q1 and puts Phase 2 on its cheap branch: a resync can re-send
+the **same `file_url`s** and the iframes remount from files that are already
+there. No figure re-render, no backend recompute. §3.3 Q2 (`awi_state` replay)
+is now the only significant unknown left.
+
+### 10.3 The gate is a latch — confirmed
+
+`test_dask_ready_latch.py` pins three things:
+
+- `_await_dask()` returns immediately from a pure `Event` read; **no cluster is
+  consulted**.
+- With the client torn out from under the session — the state a *death* leaves,
+  as opposed to a *restart* — the gate **still opens instantly**. A load
+  proceeds against a dead client and cannot tell.
+- Structurally, there is **exactly one** `_dask_ready.clear()` in the codebase
+  (the user-driven restart in `compute_config.py`), and **no** liveness path of
+  any shape.
+
+So "re-loading data works" is evidence about the latch, not the cluster. §8's
+withdrawal holds, and §9's premise is now measured rather than argued.
+
+### 10.4 What this does NOT tell us
+
+The probe simulates a **renderer loss**. It does not simulate a Mac sleep, so it
+still cannot say whether the cluster dies on a real lid-close — that needs
+§8.2 on your machine. What it does establish is that the workspace loss is fully
+explained *without* any cluster death, and that the cluster question is
+genuinely independent.
+
+### 10.5 Effect on the plan
+
+- §1 premise: **confirmed by measurement.**
+- Phase 1: **complete.** Its two probes stay in the tree as characterisation
+  tests — `test_dask_ready_latch.py` is written to FAIL when a liveness detector
+  is added, which is the point.
+- Phase 2: **cheaper than feared** — re-send existing `file_url`s.
+- Phase 3 (`awi_state` replay) is now the main remaining unknown.
