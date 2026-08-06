@@ -576,13 +576,17 @@ class TestOverlays:
             "cell_id": cell_id, "source_window_id": line_plot.window_id,
             "label": "T"})
         cell = session._report.doc.cell_by_id(cell_id)
-        assert len(cell.movie.text_overlays) == 1
-        ov = cell.movie.text_overlays[0]
+        # The timestamp is a burn-in overlay now, so a movie always has one
+        # before anything is added; count only the dragged-in signal.
+        added = [o for o in cell.movie.text_overlays if not o.get('builtin')]
+        assert len(added) == 1
+        ov = added[0]
         assert ov["label"] == "T"
         assert isinstance(ov.get("source"), dict)      # a SignalRef dict
         # The editor state ships the overlay WITHOUT the ephemeral _trace.
         st = _latest(messages, "movie_state")
-        assert len(st["text_overlays"]) == 1
+        emitted = [o for o in st["text_overlays"] if not o.get("builtin")]
+        assert len(emitted) == 1
         assert "_trace" not in st["text_overlays"][0]
 
     def test_text_overlay_live_value_on_figure(self, movie_dataset):
@@ -614,8 +618,10 @@ class TestOverlays:
         M.movie_add_text_overlay(session, None, {
             "cell_id": cell_id, "source_window_id": tline.window_id, "label": "T"})
         sess = M._sessions(session._report)[cell_id]
-        assert len(sess._text_overlay_widgets) == 1, "no live text-overlay widget"
-        lw = sess._text_overlay_widgets[0][0]
+        widgets = [w for w in sess._text_overlay_widgets.values()
+                   if not w[1].get("builtin")]
+        assert len(widgets) == 1, "no live text-overlay widget"
+        lw = widgets[0][0]
         assert "100" in lw.text, lw.text          # frame 0 → 100
         M.movie_scrub(session, None, {"cell_id": cell_id, "t": 5})
         _wait_until(lambda: sess.current_index() == 5)

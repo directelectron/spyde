@@ -171,11 +171,69 @@ def _text_with_shadow(draw, xy, text, font, fill, shadow):
     draw.text((x, y), text, font=font, fill=fill)
 
 
-def _draw_timestamp(img, t_sec: float, font):
+def label_overlay(frame_h: int = 512, *, text: str = "Label",
+                  color: str = "#ffffff") -> dict:
+    """A STATIC text burn-in, as an ordinary text-overlay dict.
+
+    Free text used to live in ``annotations`` (``kind: "text"``) while a live
+    value lived in ``text_overlays`` — two representations, two add paths, two
+    timeline lanes and two inspectors for what is, on the frame, the same
+    thing: some text at a position. Both are text overlays now; only the SOURCE
+    of the string differs (``builtin: "label"`` carries it literally,
+    ``builtin: "time"`` derives it from the frame, an instrument channel reads
+    it per frame).
+    """
+    return {
+        "builtin": "label",
+        "text": str(text),
+        "xy": [8, max(4, int(frame_h * 0.08))],
+        "size": 18,
+        "color": color,
+    }
+
+
+def time_overlay(frame_h: int = 512, *, color: str = "#ffffff") -> dict:
+    """The built-in elapsed-time overlay, as an ordinary text-overlay dict.
+
+    The timestamp used to be a boolean param drawn at a fixed ``(6, 4)`` with
+    its own font rule and no presence in the editor — so toggling it changed
+    nothing on screen, and it could not be moved, recoloured or time-gated like
+    every other burnt-in value. Expressing it as a normal overlay makes one set
+    of controls cover all of them.
+    """
+    return {
+        "builtin": "time",
+        "label": "t",
+        "units": "s",
+        "xy": [8, max(4, int(frame_h * 0.02))],
+        "size": 18,
+        "color": color,
+    }
+
+
+def has_time_overlay(overlays) -> bool:
+    return any(isinstance(o, dict) and o.get("builtin") == "time"
+               for o in (overlays or ()))
+
+
+def _hex_to_rgb(value, default=_TS_COLOR) -> tuple:
+    """``"#ff9100"`` → ``(255, 145, 0)``; anything unparseable → *default*."""
+    text = str(value or "").strip().lstrip("#")
+    if len(text) == 3:
+        text = "".join(c * 2 for c in text)
+    if len(text) != 6:
+        return default
+    try:
+        return tuple(int(text[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return default
+
+
+def _draw_timestamp(img, t_sec: float, font, color=None):
     from PIL import ImageDraw
     draw = ImageDraw.Draw(img)
     _text_with_shadow(draw, (6, 4), f"t = {t_sec:.2f} s", font,
-                      _TS_COLOR, _TS_SHADOW)
+                      _hex_to_rgb(color), _TS_SHADOW)
 
 
 def _draw_scalebar(img, scale_x: float, units: str, font):
@@ -286,6 +344,48 @@ def _draw_annotations(img, anns, t_sec: float, k: int, crop_origin=(0, 0)):
             log.debug("annotation %r draw failed: %s", kind, e)
 
 
+# A burnt-in text size is quoted at this output height and scaled from it.
+# 512 px matches the timestamp's own rule (out_h // 28) closely enough that a
+# default-sized overlay and the timestamp read as the same size.
+_TEXT_REF_H = 512
+
+
+def _overlay_font_px(size, out_h: int) -> int:
+    """A burnt-in text size in OUTPUT pixels.
+
+    The size on an overlay is quoted against a reference frame, not in absolute
+    pixels, because the same movie exports at wildly different resolutions —
+    the timestamp already scales itself (``out_h // 28``) while text overlays
+    did not, so on a 4096 px source an 18 pt overlay came out as an unreadable
+    speck beside a 36 px timestamp. That is what "the voltage doesn't show on
+    export" was: drawn, but hair-thin.
+    """
+    try:
+        pt = float(size)
+    except (TypeError, ValueError):
+        pt = 18.0
+    return max(10, int(round(pt * max(1, int(out_h)) / _TEXT_REF_H)))
+
+
+def _overlay_number(val) -> str:
+    """Format a live overlay value legibly across the ranges these carry.
+
+    A fixed ``.2f`` is right for a potential (0.56 V) and useless for the
+    current beside it (2.1e-04 mA renders as "0.00"). Small magnitudes get
+    significant figures instead.
+    """
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return "—"
+    if v != v:                      # NaN — outside the instrument record
+        return "—"
+    mag = abs(v)
+    if mag and (mag < 0.01 or mag >= 1e5):
+        return f"{v:.3g}"
+    return f"{v:.2f}"
+
+
 def _draw_text_overlays(img, overlays, values_at_t, t_sec: float, k: int,
                         crop_origin=(0, 0)):
     """Draw each 1-D-signal-as-text overlay: a live value formatted as text (e.g.
@@ -304,12 +404,27 @@ def _draw_text_overlays(img, overlays, values_at_t, t_sec: float, k: int,
     def sc(v, o=0.0):
         return (float(v) - o) / max(1, k)
 
+    out_h = img.size[1]
     for ov, val in zip(overlays, values_at_t):
         if not isinstance(ov, dict) or not _in_time_range(t_sec, ov):
             continue
+        # The elapsed-time overlay is a BUILT-IN: its value is the frame's own
+        # time, so it needs no captured trace. Everything else about it — the
+        # position, size, colour, time gate, the editor's live widget — is the
+        # ordinary overlay machinery, which is the point of routing it here
+        # rather than drawing it from its own special case.
+        if ov.get("builtin") == "time":
+            val = t_sec
         try:
             xy = ov.get("xy", [8, 8])
-            font = _load_font(int(ov.get("size", 18)))
+            font = _load_font(_overlay_font_px(ov.get("size", 18), out_h))
+            if ov.get("builtin") == "label":
+                # A static label: the string IS the content, no value to format.
+                _text_with_shadow(
+                    draw, (sc(xy[0], ox), sc(xy[1], oy)),
+                    str(ov.get("text", "") or ""), font,
+                    _color(ov.get("color", "#ffffff")), (0, 0, 0, 220))
+                continue
             color = _color(ov.get("color", "#ffffff"))
             label = str(ov.get("label", "") or "")
             units = str(ov.get("units", "") or "")
@@ -321,9 +436,9 @@ def _draw_text_overlays(img, overlays, values_at_t, t_sec: float, k: int,
                 try:
                     text = fmt.format(label=label, value=float(val), units=units)
                 except (KeyError, IndexError, ValueError):
-                    text = f"{label} = {float(val):.2f} {units}".strip()
+                    text = f"{label} = {_overlay_number(val)} {units}".strip()
             else:
-                text = f"{label} = {float(val):.2f} {units}".strip()
+                text = f"{label} = {_overlay_number(val)} {units}".strip()
             _text_with_shadow(draw, (sc(xy[0], ox), sc(xy[1], oy)), text, font,
                               color, (0, 0, 0, 220))
         except Exception as e:
@@ -581,10 +696,77 @@ def _segment_end_frame(segments, t_sec, sc, t1) -> float:
     return t_sec / sc
 
 
-def _base_frame(raw, t: int, crop, k: int) -> np.ndarray:
-    """Read source frame *t*, apply the CROP (source px, before downsample), then
-    the spatial downsample. Memory-safe: one :func:`read_frame` slice."""
-    return downsample(apply_crop(read_frame(raw, t), crop), k)
+def speed_at_frame(speed_segments, src_frame: float, scale_s: float) -> float:
+    """The speed multiplier in force at source frame *src_frame* (1× outside
+    every segment)."""
+    t_sec = float(src_frame) * (float(scale_s) or 1.0)
+    for seg in (speed_segments or ()):
+        try:
+            tr = seg.get("time_range")
+            if tr and float(tr[0]) <= t_sec <= float(tr[1]):
+                return max(0.0, float(seg.get("speed", 1.0)))
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return 1.0
+
+
+def integration_window(fps: float, scale_s: float, speed: float = 1.0) -> int:
+    """How many SOURCE frames to average into one output frame.
+
+    Dropping from a 30.5 frame/s acquisition to a 12 frame/s movie means each
+    output frame stands for ~2.5 source frames. Picking one and discarding the
+    rest throws away real signal — on noisy electron-microscope data the
+    integrated frame is visibly cleaner — so the fps reduction INTEGRATES, the
+    same way the spatial ``downsample`` box-means rather than decimating.
+
+    Speed never increases the window. A 32× segment advances the cursor ~81
+    source frames per output frame, but integrating 81 would smear a second of
+    real change into one picture; a fast-forward is a SUB-SELECTION, so it
+    keeps the same short window and simply jumps further between them.
+
+    Speed does reduce it: in slow motion the output advances a fraction of a
+    frame, and integrating more than it advances would double-count the same
+    source frames into consecutive output frames and blur the result. Hence
+    ``min(1, speed)`` — the window is what fps asks for, capped by what the
+    output frame actually spans.
+    """
+    if fps <= 0 or scale_s <= 0:
+        return 1
+    span = (1.0 / float(fps)) / float(scale_s)
+    return max(1, int(round(span * min(1.0, max(0.0, float(speed))))))
+
+
+def read_frame_integrated(raw, t: int, n: int, n_frames: int) -> np.ndarray:
+    """Mean of source frames ``[t, t+n)``, clamped to the dataset.
+
+    Reads ONE FRAME AT A TIME into a running accumulator — never a stacked
+    slice — so the memory-safety contract holds exactly as it does for the
+    single-frame path, whatever ``n`` is.
+    """
+    n = max(1, int(n))
+    if n == 1:
+        return read_frame(raw, t)
+    stop = min(int(n_frames), int(t) + n)
+    start = max(0, min(int(t), stop - 1))
+    acc = None
+    count = 0
+    for i in range(start, stop):
+        frame = np.asarray(read_frame(raw, i), dtype=np.float32)
+        acc = frame if acc is None else acc + frame
+        count += 1
+    if acc is None or count == 0:
+        return read_frame(raw, t)
+    return acc / float(count)
+
+
+def _base_frame(raw, t: int, crop, k: int, n_int: int = 1,
+                n_frames: int = 0) -> np.ndarray:
+    """Read source frame *t* (optionally integrating *n_int* frames), apply the
+    CROP (source px, before downsample), then the spatial downsample.
+    Memory-safe: one :func:`read_frame` slice at a time."""
+    frame = (read_frame(raw, t) if n_int <= 1
+             else read_frame_integrated(raw, t, n_int, n_frames))
+    return downsample(apply_crop(frame, crop), k)
 
 
 def _resolve_clim(first: np.ndarray, clim):
@@ -605,6 +787,7 @@ def _resolve_clim(first: np.ndarray, clim):
 
 def _compose_frame(frame, lut, lo, hi, out_h, out_w, *, t_sec, k,
                    anns, text_overlays, text_values, timestamp, scalebar,
+                   ts_color=None,
                    sb_scale, sig_units, ts_font, sb_font, inset=None, inset_i=0,
                    overlay=None, raw_over=None, src_t=0, crop_origin=(0, 0)):
     """LUT + fit + the whole overlay stack for ONE already-read (cropped +
@@ -627,8 +810,11 @@ def _compose_frame(frame, lut, lo, hi, out_h, out_w, *, t_sec, k,
     _draw_annotations(img, anns, t_sec, k, crop_origin)
     if text_overlays:
         _draw_text_overlays(img, text_overlays, text_values, t_sec, k, crop_origin)
-    if timestamp:
-        _draw_timestamp(img, t_sec, ts_font)
+    # Only the LEGACY path draws it here: a spec that has been migrated carries
+    # a `builtin: "time"` entry in text_overlays and gets it drawn there, with
+    # the position/size/colour/time-gate every other overlay has.
+    if timestamp and not has_time_overlay(text_overlays):
+        _draw_timestamp(img, t_sec, ts_font, ts_color)
     if scalebar:
         _draw_scalebar(img, sb_scale, sig_units, sb_font)
     if inset is not None:
@@ -649,10 +835,16 @@ def render_single_frame(raw, t: int, *, params: dict, n_frames: int,
     crop = p.get("crop")
     cmap = str(p.get("cmap", "gray") or "gray")
     timestamp = bool(p.get("timestamp", True))
+    ts_color = p.get("timestamp_color")
     scalebar = bool(p.get("scalebar", True)) and sig_scale_x > 0
     anns = p.get("annotations") or []
     lut = build_lut(cmap)
-    frame = _base_frame(raw, int(t), crop, k)
+    frame = _base_frame(
+        raw, int(t), crop, k,
+        integration_window(float(p.get("fps", 10.0) or 10.0), scale_s,
+                           speed_at_frame(p.get("speed_segments") or [],
+                                          int(t), scale_s)),
+        n_frames)
     lo, hi = _resolve_clim(frame, p.get("clim"))
     rgb0 = even_crop(apply_lut(frame, lut, lo, hi))
     out_h, out_w = rgb0.shape[:2]
@@ -665,7 +857,8 @@ def render_single_frame(raw, t: int, *, params: dict, n_frames: int,
     return _compose_frame(
         frame, lut, lo, hi, out_h, out_w, t_sec=t_sec, k=k,
         anns=anns, text_overlays=(text_overlays or []),
-        text_values=(text_values or []), timestamp=timestamp, scalebar=scalebar,
+        text_values=(text_values or []), timestamp=timestamp, ts_color=ts_color,
+        scalebar=scalebar,
         sb_scale=sb_scale, sig_units=sig_units, ts_font=ts_font, sb_font=sb_font,
         crop_origin=crop_origin, overlay=overlay, raw_over=raw_over, src_t=int(t))
 
@@ -741,6 +934,7 @@ def export_movie(raw, *, path: str, params: dict, n_frames: int,
     clim = p.get("clim")
     crop = p.get("crop")
     timestamp = bool(p.get("timestamp", True))
+    ts_color = p.get("timestamp_color")
     scalebar = bool(p.get("scalebar", True)) and sig_scale_x > 0
     anns = p.get("annotations") or []
     text_overlays = list(text_overlays or [])
@@ -767,7 +961,13 @@ def export_movie(raw, *, path: str, params: dict, n_frames: int,
         raise _Cancelled()
 
     # Auto contrast from the FIRST rendered frame when clim is unset (robust 2-98%).
-    first = _base_frame(raw, idxs[0], crop, k)
+    # Frames to integrate per output frame. Sized by the FPS reduction and
+    # capped by the local speed (see integration_window) — a fast-forward
+    # sub-selects with the same short window, it does not average more.
+    segs = p.get("speed_segments") or []
+    n_ints = [integration_window(fps, scale_s,
+                                 speed_at_frame(segs, i, scale_s)) for i in idxs]
+    first = _base_frame(raw, idxs[0], crop, k, n_ints[0], n_frames)
 
     # Cancel immediately AFTER the probe read too (a cancel that arrived while the
     # read was in flight stops us before we open the writer / encode any frame).
@@ -820,12 +1020,13 @@ def export_movie(raw, *, path: str, params: dict, n_frames: int,
         for fi, t in enumerate(idxs):
             if should_cancel is not None and should_cancel():
                 raise _Cancelled()
-            frame = first if fi == 0 else _base_frame(raw, t, crop, k)
+            frame = (first if fi == 0 else
+                     _base_frame(raw, t, crop, k, n_ints[fi], n_frames))
             text_values = [(r[fi] if r is not None else None) for r in text_resampled]
             img = _compose_frame(
                 frame, lut, lo, hi, out_h, out_w, t_sec=times[fi], k=k,
                 anns=anns, text_overlays=text_overlays, text_values=text_values,
-                timestamp=timestamp, scalebar=scalebar, sb_scale=sb_scale,
+                timestamp=timestamp, ts_color=ts_color, scalebar=scalebar, sb_scale=sb_scale,
                 sig_units=sig_units, ts_font=ts_font, sb_font=sb_font,
                 inset=inset, inset_i=fi,
                 overlay=overlay, raw_over=raw_over, src_t=t,
