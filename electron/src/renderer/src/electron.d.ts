@@ -19,6 +19,7 @@ declare global {
       action: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
       openFile: () => Promise<void>
       openZarrFolder: () => Promise<void>
+      loadInsituData: () => Promise<void>
       quit: () => Promise<void>
       saveDialog: () => Promise<void>
       pickFile: (opts: { name?: string; extensions?: string[] }) => Promise<string | null>
