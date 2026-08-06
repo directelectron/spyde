@@ -181,6 +181,7 @@ export function MenuBar({ onStartGuide, onShowInfo }: {
         testId: 'menu-load-multiangle',
         onClick: () => openMultiAngleLoader(),
       },
+      { label: 'Load In-Situ Data…', onClick: () => window.electron.loadInsituData() },
       { separator: true },
       { label: 'Save Signal…', onClick: () => window.electron.saveDialog() },
       { separator: true },

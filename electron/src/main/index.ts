@@ -712,6 +712,14 @@ function buildMenu(): void {
           // acquisition is opened.
           click: () => win?.webContents.send('spyde:open_multiangle_loader'),
         },
+        {
+          label: 'Load In-Situ Data…',
+          // A potentiostat / holder log recorded alongside a movie. Auto-
+          // discovery already scans the movie's own folder on open; this is
+          // for a record that lives elsewhere, or one the duration scorer
+          // passed over.
+          click: () => pickInsituData(),
+        },
         { type: 'separator' },
         {
           label: 'Save Signal…',
@@ -821,6 +829,26 @@ ipcMain.handle('spyde:open-file', async () => {
     }
   }
 })
+
+/** Pick an instrument record (potentiostat / holder log) and attach it.
+ *  `.txt` is offered because EC-Lab's ASCII export is routinely saved that way;
+ *  Python dispatches on the file's own magic, not on the extension. */
+async function pickInsituData(): Promise<void> {
+  const result = await dialog.showOpenDialog(win!, {
+    title: 'Load in-situ instrument data',
+    properties: ['openFile'],
+    filters: [
+      { name: 'In-Situ Data', extensions: ['mpr', 'mpt', 'txt', 'mps'] },
+      { name: 'BioLogic EC-Lab', extensions: ['mpr', 'mpt', 'mps'] },
+      { name: 'All Files', extensions: ['*'] },
+    ],
+  })
+  if (!result.canceled) {
+    for (const p of result.filePaths) sendAction('load_insitu_data', { path: p })
+  }
+}
+
+ipcMain.handle('spyde:load-insitu-data', () => pickInsituData())
 
 /** Open a .zspy/.zarr DIRECTORY store (folder picker → load). */
 ipcMain.handle('spyde:open-zarr-folder', async () => {
