@@ -47,7 +47,7 @@ wheels = [
 
 [[package]]
 name = "anyplotlib"
-version = "0.5.0"
+version = "0.7.1"
 source = { editable = "../anyplotlib" }
 dependencies = [
     { name = "anywidget" },

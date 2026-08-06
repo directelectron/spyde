@@ -100,7 +100,7 @@ test('segment a second signal window after closing the first', async () => {
   await expect(page.getByTestId('seg-trained-note')).toContainText(/Trained on \d+ px/)
   await expect.poll(
     async () => Number(await page.getByTestId('seg-preview-stats')
-      .getAttribute('data-count')),
+      .getAttribute('data-coverage')),
     { timeout: 120_000, message: 'the second window never previewed' },
   ).toBeGreaterThan(0)
 
@@ -148,7 +148,7 @@ test('after a full RUN and a close, a third window still segments', async () => 
   await trainFromGroundTruth(page, id)
   await expect.poll(
     async () => Number(await page.getByTestId('seg-preview-stats')
-      .getAttribute('data-count')),
+      .getAttribute('data-coverage')),
     { timeout: 120_000, message: 'a fresh window after a run + close never previewed' },
   ).toBeGreaterThan(0)
 

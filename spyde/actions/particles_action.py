@@ -427,6 +427,59 @@ class SegmentWizard(WizardController):
         except Exception as exc:
             log.debug("[seg] overlay push failed: %s", exc)
 
+    def set_mask_overlay(self, mask, box, full_shape) -> None:
+        """Paint a boolean mask, clearing any outlines the full preview left.
+
+        The mask-only live preview's drawing path. It reuses
+        :meth:`_set_raster_overlay` unchanged — that method already thresholds
+        ``> 0``, so a boolean array is a valid ``labels`` argument, and reusing it
+        means the tiled-frame contract (hand anyplotlib a NATIVE-resolution mask,
+        let IT reduce) has exactly one implementation rather than a second one to
+        get wrong the same way.
+
+        The outlines must be cleared explicitly: switching from a full preview to
+        a mask leaves the previous frame's polygons on the figure otherwise, and
+        they would sit there looking like a current result.
+        """
+        plot2d = getattr(self.src_plot, "_plot2d", None)
+        if plot2d is None:
+            return
+        group = self._overlay_group(plot2d)
+        updates = {}
+        if group is not None:
+            updates[group] = {"vertices_list": []}
+        # NO PREVIEW-WINDOW BOX on this path, and the existing one is cleared.
+        #
+        # The box existed to admit that only the middle megapixel of a large
+        # frame had been looked at — without it, an untouched 15/16 of a 4096²
+        # frame reads as "found nothing" rather than "not examined". The mask
+        # preview covers a full 4096² frame (`_PREVIEW_PIXEL_BUDGET_MASK`), so
+        # there is nothing left to disclaim and the box is just a rectangle drawn
+        # over the data.
+        #
+        # It is CLEARED rather than merely not drawn, because switching from the
+        # full preview to the mask must take the old box with it.
+        #
+        # Above the mask budget a crop is still possible (an 8192² cryo movie),
+        # and that case is still reported — `preview_box` goes out in the
+        # `seg_preview` payload and the caret says so in text.
+        frame_group = self._window_group(plot2d)
+        if frame_group is not None:
+            updates[frame_group] = {"vertices_list": []}
+        if updates:
+            try:
+                _push_groups(plot2d, updates)
+            except Exception as exc:
+                log.debug("[seg] overlay clear failed: %s", exc)
+        if not self._set_raster_overlay(mask, box, full_shape):
+            # No raster path available (an old anyplotlib, or a plot with no
+            # `set_overlay_mask`). Say so — silently drawing nothing is how the
+            # "106 particles and no overlay" report happened.
+            log.warning("[seg] raster overlay unavailable; the mask preview has "
+                        "nothing to draw with")
+        self._ov_cleared = False
+        self._ov_box_state = None
+
     def _set_raster_overlay(self, labels, box, full_shape) -> bool:
         """Draw the instances as ONE mask instead of N polygons. True if drawn.
 
@@ -467,6 +520,13 @@ class SegmentWizard(WizardController):
             else:
                 mask[:lab.shape[0], :lab.shape[1]] = lab > 0
             plot2d.set_overlay_mask(mask, color=_PREVIEW_COLOR, alpha=_RASTER_ALPHA)
+            # Register for teardown HERE, in the method that actually draws,
+            # rather than in the caller. `_clear_raster_overlay` refuses to clear
+            # unless this is set, so a second drawing caller that forgot it left
+            # a mask the caret could not take down with it — which is exactly
+            # what `set_mask_overlay` did when the mask-only preview landed.
+            # One owner: whoever draws it, arms the teardown.
+            self._ov_raster = True
             return True
         except Exception as exc:
             # WARNING, not debug. The fallback from here is N polygons, and N is
@@ -530,9 +590,11 @@ class SegmentWizard(WizardController):
         group = self._overlay_group(plot2d)
         if group is not None and not getattr(self, "_ov_cleared", False):
             updates[group] = {"vertices_list": []}          # no instances yet
+        # No preview-window box: the mask preview covers a whole 4096² frame, so
+        # there is no untouched remainder left to disclaim. See `set_mask_overlay`.
         frame_group = self._window_group(plot2d)
         if frame_group is not None:
-            updates[frame_group] = {"vertices_list": _box_poly(box)}
+            updates[frame_group] = {"vertices_list": []}
         if not updates:
             return
         try:
@@ -956,6 +1018,44 @@ def _engine(wiz: SegmentWizard, p: dict) -> Callable[[np.ndarray], np.ndarray] |
     return None
 
 
+def _mask_engine(wiz: SegmentWizard, p: dict) -> Callable[[np.ndarray], np.ndarray] | None:
+    """A ``frame → bool mask`` callable: the classifier, and NOTHING after it.
+
+    This is the live-preview path, and it exists because the split and the
+    measurement — neither of which a live preview needs — are 87% of it.
+    Measured per stage on one 4096² frame, warm:
+
+        FrameNorm                 48 ms
+        featurise + head         162 ms
+        softmax + device->host    52 ms
+        split_instances          732 ms   <- skipped here
+        measure_frame + contours 958 ms   <- skipped here
+        ------------------------------
+        full preview            1953 ms       mask only ~262 ms
+
+    "Is my scribble good enough yet?" is a question about the CLASSIFICATION, so
+    the answer does not require deciding which pixels belong to which instance,
+    nor measuring any of them. Instance identity and the size distribution come
+    from the real run (and from `seg_commit`), where they are worth their price.
+
+    Shares :func:`_gpu_slots` with :func:`_engine` and the batch, for the reasons
+    written there.
+    """
+    if p["method"] != "scribble":
+        return None
+    clf = wiz.classifier
+    if clf is None or not clf.is_trained:
+        return None
+    from spyde.particles.batch import _gpu_slots
+
+    def _mask_fn(frame, _clf=clf):
+        with _gpu_slots():
+            fg, _bnd = _clf.predict_foreground_boundary(frame)
+        return np.asarray(fg) > 0.5
+
+    return _mask_fn
+
+
 # ── controller resolution ────────────────────────────────────────────────────
 
 def _wizard(session, plot) -> SegmentWizard | None:
@@ -1061,8 +1161,24 @@ def _emit_state(wiz: SegmentWizard) -> None:
 #: room for a slower machine.
 _PREVIEW_PIXEL_BUDGET = 1024 * 1024
 
+#: Area budget for the MASK-ONLY preview, which does not split or measure.
+#:
+#: The 1-megapixel figure above was set by what a FULL preview cost: 8.36 s on a
+#: 4096² frame, 7.6 s of it the watershed. That is why a 4k frame only ever
+#: previewed its middle sixteenth, with a drawn box saying so — the rest of the
+#: frame read as "not looked at" because it genuinely had not been.
+#:
+#: The mask path does not split and does not measure, and a whole 4096² frame
+#: through it measures ~262 ms (FrameNorm 48 + featurise/head 162 + softmax and
+#: readback 52). So the crop no longer buys anything worth its cost in
+#: comprehensibility, and the budget is raised to cover a full 4096² frame with
+#: headroom. Above this — an 8192² cryo movie — the crop still applies, and the
+#: preview-window box still tells the truth about what was looked at.
+_PREVIEW_PIXEL_BUDGET_MASK = 20 * 1024 * 1024
 
-def _preview_window(frame: np.ndarray) -> tuple[np.ndarray, tuple[int, int, int, int] | None]:
+
+def _preview_window(frame: np.ndarray, budget: int | None = None
+                    ) -> tuple[np.ndarray, tuple[int, int, int, int] | None]:
     """``(frame_or_crop, box)`` — bound one preview's cost by AREA, not by scale.
 
     Returns the frame untouched (and ``box=None``) when it already fits the
@@ -1070,11 +1186,16 @@ def _preview_window(frame: np.ndarray) -> tuple[np.ndarray, tuple[int, int, int,
     fast path pays nothing for this. Otherwise a centred crop of the same aspect
     ratio, at full resolution, plus its ``(y0, x0, h, w)`` so the caller can tell
     the user what it measured.
+
+    *budget* overrides :data:`_PREVIEW_PIXEL_BUDGET`. The mask-only preview passes
+    :data:`_PREVIEW_PIXEL_BUDGET_MASK` — see there for why the 1-megapixel figure
+    stopped being the right one.
     """
     h, w = frame.shape[:2]
-    if h * w <= _PREVIEW_PIXEL_BUDGET:
+    budget = int(budget or _PREVIEW_PIXEL_BUDGET)
+    if h * w <= budget:
         return frame, None
-    shrink = (h * w / _PREVIEW_PIXEL_BUDGET) ** 0.5
+    shrink = (h * w / budget) ** 0.5
     ch = max(64, int(h / shrink))
     cw = max(64, int(w / shrink))
     y0 = max(0, (h - ch) // 2)
@@ -1289,6 +1410,72 @@ def filter_by_score(rows, contours, min_score: float):
     return kept_rows, kept_contours
 
 
+def _preview_mask(wiz: SegmentWizard, gen: int, p: dict, t: int, units: str,
+                  mask_fn) -> None:
+    """The live preview: classify the displayed frame and paint the mask.
+
+    No ``split_instances``, no ``measure_frame``, no contours — see
+    :func:`_mask_engine` for the measurement that motivates it. The mask goes up
+    through the SAME raster overlay the >100-instance path already uses, so
+    nothing new had to learn about tiled frames (the raster path must be handed a
+    NATIVE-resolution mask and let anyplotlib reduce it — reducing it here is the
+    bug that made the overlay unreachable on every frame it was written for).
+    """
+    def _work():
+        _n, get_frame, _shape = wiz.frames()
+        full = np.asarray(get_frame(t))
+        frame, box = _preview_window(full, _PREVIEW_PIXEL_BUDGET_MASK)
+        t0 = time.perf_counter()
+        mask = mask_fn(frame)
+        return {"frame": t, "mask": mask, "box": box,
+                "full_shape": full.shape,
+                "coverage": float(mask.mean()) if mask.size else 0.0,
+                "elapsed": time.perf_counter() - t0}
+
+    def _done(res):
+        # Hand the navigator gate back BEFORE the generation guard, exactly as
+        # the full preview does — a superseded or closed preview that keeps it
+        # wedges every later navigator move.
+        wiz._nav_busy = False
+        if not wiz.still(gen) or wiz._closed:
+            return
+        wiz.preview = {"frame": res["frame"], "mask": res["mask"],
+                       "count": -1, "areas": np.zeros(0, np.float32),
+                       "box": res.get("box")}
+        wiz.set_mask_overlay(res["mask"], res.get("box"), res.get("full_shape"))
+        _emit(wiz, {
+            "type": "seg_preview",
+            "frame": int(res["frame"]),
+            # -1 is "not counted", NOT "found nothing". The caret must render
+            # these differently or a good mask reads as a failed segmentation.
+            "count": -1,
+            "mask_only": True,
+            "areas": [],
+            "median_area": 0.0,
+            "units": units,
+            "method": p["method"],
+            "min_size": int(p["min_size"]),
+            "min_size_floored": bool(p["min_size_floored"]),
+            "elapsed_ms": round(1000.0 * res["elapsed"], 1),
+            "preview_box": (None if res.get("box") is None
+                            else [int(v) for v in res["box"]]),
+            "coverage": round(float(res.get("coverage") or 0.0), 4),
+            # Coverage alone still catches the threshold landing in the noise —
+            # it is the half of `_threshold_failed` that does not need a count.
+            "threshold_failed": bool(float(res.get("coverage") or 0.0) > 0.35),
+            "face_units": _face_units(*wiz.scale_units()),
+        })
+        _chase_nav(wiz)
+
+    def _fail(exc):
+        wiz._nav_busy = False
+        if wiz.still(gen):
+            emit_error(f"Segment Particles preview failed: {exc}")
+
+    run_on_worker(wiz.session, _work, name="seg-preview-mask",
+                  on_done=_done, on_error=_fail)
+
+
 def _preview(wiz: SegmentWizard, gen: int) -> None:
     """Segment the displayed frame on a worker and paint the result.
 
@@ -1314,6 +1501,16 @@ def _preview(wiz: SegmentWizard, gen: int) -> None:
         return
     t = wiz.frame_index()
     scale, units = wiz.scale_units()
+
+    # THE LIVE PREVIEW IS MASK-ONLY. See `_mask_engine` for the per-stage
+    # measurement: the split and the measurement are 87% of a full preview and a
+    # live preview needs neither, so this path stops at the classification.
+    # `count` is reported as -1, meaning "not counted" — the caret shows coverage
+    # instead, and the real count comes from the run.
+    mask_fn = _mask_engine(wiz, p)
+    if mask_fn is not None:
+        _preview_mask(wiz, gen, p, t, units, mask_fn)
+        return
 
     def _work():
         _n, get_frame, _shape = wiz.frames()
@@ -1962,9 +2159,9 @@ def seg_train(session, plot, payload) -> None:
     emit_status("Segment Particles: training…")
 
     def _work():
-        from spyde.particles import ScribbleClassifier
+        from spyde.particles import FastScribbleClassifier
         _n, get_frame, _shape = wiz.frames()
-        clf = ScribbleClassifier(device=device)
+        clf = FastScribbleClassifier(device=device)
         report = clf.fit(snapshot, get_frame,
                          progress=lambda d, n: emit_progress(d, n, "Training"))
         return clf, report

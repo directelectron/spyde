@@ -96,11 +96,14 @@ test('a noise frame over-segments, and the caret NAMES it instead of counting it
   await openAndTrain()
 
   const stats = page.getByTestId('seg-preview-stats')
-  await expect.poll(async () => Number(await stats.getAttribute('data-count')), {
+  // Coverage, not an instance count: the live preview is MASK-ONLY (it stops
+  // at the classification, because the split and the measurement are 87% of a
+  // full preview), so `data-count` is -1 by design and polling it for >0 waits
+  // forever. Coverage states the same claim — the preview produced foreground.
+  await expect.poll(async () => Number(await stats.getAttribute('data-coverage')), {
     timeout: 180_000, message: 'seg_preview never reached the caret',
   }).toBeGreaterThan(0)
 
-  const count = Number(await stats.getAttribute('data-count'))
   const coverage = Number(await stats.getAttribute('data-coverage'))
   // The head has to actually FAIL or this spec proves nothing — the whole
   // reason the bug shipped is that the clean fixture never got here.
@@ -113,7 +116,12 @@ test('a noise frame over-segments, and the caret NAMES it instead of counting it
   // small ones. The verdict has to catch both, and a rule tuned on the count
   // alone caught only the second — measured: 228 instances over ~the whole
   // frame sailed under a 500-instance bar while looking like a green sheet.
-  expect(count, 'no instances at all').toBeGreaterThan(0)
+  // The instance-count half of this claim is GONE with the mask-only preview:
+  // the caret no longer splits, so it cannot say whether the film came back as
+  // 228 blobs or 14028. Coverage above is what survives, and it is the half that
+  // actually caught the reported failure (a rule tuned on the count alone missed
+  // 228 instances over ~the whole frame). The count-shape assertion belongs on a
+  // committed run now, not on the preview.
 
   // The verdict, not just the number. "14028 particles" reads as an answer.
   await expect(stats).toHaveAttribute('data-failed', 'true')

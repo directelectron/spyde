@@ -77,6 +77,11 @@ from spyde.particles.scribble import (
     masks_to_labels,
     random_forest_reference,
 )
+from spyde.particles.fast_engine import (
+    FastFeatureBank,
+    FastScribbleClassifier,
+    FrameNorm,
+)
 from spyde.particles.track import (
     EVENT_KINDS,
     LinkParams,
@@ -116,6 +121,10 @@ __all__ = [
     "default_classes",
     "masks_to_labels",
     "random_forest_reference",
+    # fast engine (the one the caret dispatches)
+    "FastScribbleClassifier",
+    "FastFeatureBank",
+    "FrameNorm",
     # tracking
     "link",
     "LinkParams",

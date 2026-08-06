@@ -475,8 +475,17 @@ def resolve_engine(spec: EngineSpec, *, force_cpu: bool = False):
     key = (spec.model_path, mtime, str(device))
     clf = _ENGINE_CACHE.get(key)
     if clf is None:
-        from spyde.particles.scribble import ScribbleClassifier
-        clf = ScribbleClassifier.load(spec.model_path, device=device)
+        # The engine kind is stamped in the .npz, so a head saved by either
+        # engine loads on a worker without the caller having to say which.
+        import numpy as _np
+        with _np.load(spec.model_path, allow_pickle=False) as _z:
+            _kind = str(_z["_engine"]) if "_engine" in _z.files else "scribble"
+        if _kind == "fast":
+            from spyde.particles.fast_engine import FastScribbleClassifier
+            clf = FastScribbleClassifier.load(spec.model_path, device=device)
+        else:
+            from spyde.particles.scribble import ScribbleClassifier
+            clf = ScribbleClassifier.load(spec.model_path, device=device)
         _ENGINE_CACHE[key] = clf
         log.info("[seg-batch] scribble head loaded on %s (gpu lane: %s)",
                  clf.device, want_gpu)

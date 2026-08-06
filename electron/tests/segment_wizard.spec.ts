@@ -597,8 +597,18 @@ test('painting the boundary class flips the split to the seam route', async () =
 
   // A boundary that was painted must still segment — the fast route returning
   // nothing would be a "faster" result that found no particles.
+  //
+  // Measured on COVERAGE, not on an instance count. The live preview is
+  // mask-only (it stops at the classification, because the split and the
+  // measurement are 87% of a full preview), so `data-count` is -1 by design and
+  // polling it for >0 waits forever. The claim being made here is about the
+  // segmentation still producing foreground, which coverage states directly.
+  //
+  // NOTE the split route itself is no longer observable from the preview — the
+  // preview does not split. `seg-trained-note` above is what proves the flip,
+  // and it is the report the backend actually derives the route from.
   await expect.poll(async () =>
-    Number(await page.getByTestId('seg-preview-stats').getAttribute('data-count')), {
+    Number(await page.getByTestId('seg-preview-stats').getAttribute('data-coverage')), {
     timeout: 120_000, message: 'no preview after switching to the seam route',
   }).toBeGreaterThan(0)
 

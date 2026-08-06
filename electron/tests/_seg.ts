@@ -61,9 +61,13 @@ export async function trainFromGroundTruth(page: Page, windowId: number,
 
   await page.getByTestId('seg-train').click()
   await expect(page.getByTestId('seg-trained-note')).toBeVisible({ timeout })
+  // The live preview is MASK-ONLY, so `data-count` is -1 ("not counted") — the
+  // split and the measurement are 87% of a full preview and a live preview needs
+  // neither. Coverage is what the mask preview actually reports, so it is what
+  // "a preview landed" means now.
   await expect
     .poll(async () => Number(await page.getByTestId('seg-preview-stats')
-      .getAttribute('data-count')),
+      .getAttribute('data-coverage')),
       { timeout, message: 'no preview after training' })
     .toBeGreaterThan(0)
 }

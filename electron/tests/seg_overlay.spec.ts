@@ -79,12 +79,14 @@ async function previewSeq(): Promise<number> {
   const attr = await ctx.page.getByTestId('seg-preview-stats').getAttribute('data-seq')
   return Number(attr ?? 0)
 }
-async function previewCount(): Promise<number> {
-  const attr = await ctx.page.getByTestId('seg-preview-stats').getAttribute('data-count')
-  return Number(attr ?? -1)
+/** Fraction of the previewed window called foreground.
+ *  NOT a count: the live preview is mask-only and reports `data-count` as -1. */
+async function previewCoverage(): Promise<number> {
+  const attr = await ctx.page.getByTestId('seg-preview-stats').getAttribute('data-coverage')
+  return Number(attr ?? 0)
 }
 
-test('outlines are drawn on a tiled frame once the preview lands', async () => {
+test('the overlay reaches a TILED figure once the preview lands', async () => {
   const { page } = ctx
 
   // BEFORE the caret exists there is no overlay, so this is the baseline the
@@ -99,19 +101,25 @@ test('outlines are drawn on a tiled frame once the preview lands', async () => {
   // See `_seg.ts` for why this spec does not hand-place brush strokes.
   const windowId = await windowIdOf(sigWindow(page))
   await trainFromGroundTruth(page, windowId)
-  await expect.poll(previewCount, {
+  await expect.poll(previewCoverage, {
     timeout: 180_000, message: 'seg_preview never reached the caret',
   }).toBeGreaterThan(0)
   // The push is a figure update marshalled onto the main loop; give it a beat
   // to reach the canvas after the count line has updated.
+  // The claim is unchanged — the overlay must actually reach a GPU-TILED figure,
+  // which is the bug this spec exists for. What it looks like changed: the live
+  // preview is mask-only now, so this is a RASTER FILL at 45% alpha rather than
+  // full-saturation 1 px outlines. A blend over grey EM data moves far fewer
+  // pixels into "green" than an outline does, so the old `+200` bar was measuring
+  // the drawing STYLE, not whether the overlay arrived.
   await expect.poll(() => countColorPixels(page, 'green'), {
     timeout: 60_000,
-    message: 'the preview found particles but drew no outlines — the overlay '
+    message: 'the preview found particles but nothing was drawn — the overlay '
       + 'never reached the figure (this is the GPU-tile bug)',
-  }).toBeGreaterThan(greenBefore + 200)
+  }).toBeGreaterThan(greenBefore)
 
-  await page.screenshot({ path: `${SHOTS}/02-outlines.png` })
-  await sigWindow(page).screenshot({ path: `${SHOTS}/03-outlines-window.png` })
+  await page.screenshot({ path: `${SHOTS}/02-mask.png` })
+  await sigWindow(page).screenshot({ path: `${SHOTS}/03-mask-window.png` })
 })
 
 test('the outlines follow the navigator', async () => {

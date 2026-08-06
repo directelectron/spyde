@@ -382,10 +382,19 @@ export function SegmentWizard({ caretPos, windowId, sendAction, onClose, stripPo
   // the box, not of the frame, and claiming otherwise would understate the count
   // by whatever fraction was skipped.
   const box = preview?.preview_box ?? null
-  const countText = preview
-    ? `${preview.count} particle${preview.count === 1 ? '' : 's'} ` +
-      (box ? 'in this region' : 'on this frame')
-    : 'no preview yet'
+  // count === -1 is "not counted", NOT "found nothing". The live preview is
+  // mask-only — it stops at the classification, because the instance split and
+  // the measurement are 87% of a full preview (1953 ms -> ~262 ms at 4096²) and
+  // "is my scribble good enough?" is a question about the classification. So the
+  // caret reports what it actually has: how much of the frame was called
+  // particle. The count comes from the run.
+  const countText = !preview
+    ? 'no preview yet'
+    : preview.count < 0
+      ? `${(preview.coverage * 100).toFixed(1)}% of the ` +
+        (box ? 'region' : 'frame') + ' is particle'
+      : `${preview.count} particle${preview.count === 1 ? '' : 's'} ` +
+        (box ? 'in this region' : 'on this frame')
 
   return (
     <>
