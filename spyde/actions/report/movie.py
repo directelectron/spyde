@@ -57,6 +57,7 @@ from de_shell import ipc
 from spyde.actions.lifecycle import bump_generation, is_current, run_on_worker
 from spyde.actions.playback import _units_to_seconds
 from spyde.actions.movie_export import traces as _traces
+from spyde.actions.movie_export import pipeline as _pipeline
 from spyde.actions.movie_export.pipeline import (
     export_movie, render_single_frame, _Cancelled,
 )
@@ -75,7 +76,7 @@ _PREVIEW_MAX_EDGE = 720
 # (seeded properly from the signal's time axis + the plot's cmap on movie_open).
 _DEFAULT_PARAMS = dict(
     fps=12, downsample=1, stride=1, cmap="gray", clim=None,
-    timestamp=True, scalebar=True, t_start=0, t_end=0,
+    timestamp=True, timestamp_color="#ffffff", scalebar=True, t_start=0, t_end=0,
 )
 
 # fps auto-seed clamp band (real-time can be absurd) — mirrors the old wizard.
@@ -235,12 +236,18 @@ class MovieEditSession:
         if p2 is None:
             return
         # Drop the previous widgets (a rebuild supersedes them wholesale).
+        # BOTH sets: the text-overlay labels used to have their dict cleared
+        # without ever being removed from the plot, so every resync stacked
+        # another copy of every label on the figure — one add read as two.
         try:
             for w in self._ann_widgets.values():
                 p2._widgets.pop(getattr(w, "id", None), None)
+            for lw, _ov in getattr(self, "_text_overlay_widgets", {}).values():
+                p2._widgets.pop(getattr(lw, "id", None), None)
         except Exception as e:
             log.debug("movie clear overlay widgets failed: %s", e)
         self._ann_widgets = {}
+        self._text_overlay_widgets = {}
         self._widget_handlers = []
         cur_sec = self.current_index() * self.scale_seconds()
         anns = (self.cell.movie.annotations if self.cell.movie else None) or []
@@ -299,6 +306,13 @@ class MovieEditSession:
                     color=str(ov.get("color", "#ffffff") or "#ffffff"),
                     show_handles=False)
                 self._text_overlay_widgets[i] = (lw, ov)
+                # PERSIST a drag. Without this the label moves on screen and the
+                # spec keeps its original xy, so the export draws it somewhere
+                # else entirely — the editor and the movie disagreeing about
+                # where the timestamp and the voltage sit.
+                handler = _make_burnin_widget_handler(self, i)
+                lw.add_event_handler(handler, "pointer_up")
+                self._widget_handlers.append(handler)
             except Exception as e:
                 log.debug("movie add text-overlay widget failed: %s", e)
         try:
@@ -677,6 +691,125 @@ class MovieEditSession:
 
     # ── text-overlay trace captures ──────────────────────────────────────────────
 
+    def _overlays_with_time(self, spec) -> list:
+        """The spec's burn-in overlays, MIGRATING the two legacy shapes into it.
+
+        Everything that draws text on a frame is one kind of object now, so a
+        spec written before that has to be upgraded in place the first time it
+        is read:
+
+        * ``params["timestamp"]`` — a bool with a hardcoded position — becomes
+          a ``builtin: "time"`` overlay;
+        * ``annotations`` entries with ``kind: "text"`` — free labels that had
+          their own add button, lane and inspector — become ``builtin:
+          "label"`` overlays.
+
+        After this there is ONE list, ONE add path and ONE set of controls for
+        burnt-in text, which is the whole point; the shapes (rect/circle/arrow)
+        stay in ``annotations`` because they are not text.
+        """
+        overlays = list(spec.text_overlays or [])
+        params = spec.params or {}
+        # Migrate ONCE. Re-deriving on every read means the legacy flags stay
+        # authoritative forever: deleting the timestamp clip from the timeline
+        # left `params["timestamp"]` true, so the very next read put it back and
+        # the removal never stuck. After this flag is set the overlay LIST is
+        # the only truth.
+        if params.get("burnin_migrated"):
+            return overlays
+        changed = False
+
+        # Legacy free-text annotations → static label overlays.
+        anns = list(spec.annotations or [])
+        legacy_text = [a for a in anns
+                       if isinstance(a, dict) and a.get("kind") == "text"]
+        if legacy_text:
+            for ann in legacy_text:
+                ov = _pipeline.label_overlay(
+                    self.frame_size()[1],
+                    text=str(ann.get("text", "") or "Label"),
+                    color=str(ann.get("color", "#ffffff") or "#ffffff"))
+                ov["xy"] = [int(v) for v in (ann.get("xy") or ov["xy"])]
+                ov["size"] = int(ann.get("size", ov["size"]) or ov["size"])
+                if ann.get("time_range"):
+                    ov["time_range"] = list(ann["time_range"])
+                overlays.append(ov)
+            spec.annotations = [a for a in anns
+                                if not (isinstance(a, dict)
+                                        and a.get("kind") == "text")]
+            changed = True
+
+        if bool(params.get("timestamp", True)) and not _pipeline.has_time_overlay(overlays):
+            overlays.insert(0, _pipeline.time_overlay(
+                self.frame_size()[1],
+                color=str(params.get("timestamp_color") or "#ffffff")))
+            changed = True
+
+        if changed:
+            spec.text_overlays = overlays
+        spec.params = {**params, "burnin_migrated": True}
+        return overlays
+
+    # The burn-in sources the editor can add. `label` and `time` are always
+    # available; the rest are whatever instrument channels are attached.
+    def burnin_sources(self) -> list:
+        """``[{source, label, units}]`` — everything addable as burnt-in text."""
+        out = [{"source": "label", "label": "Text", "units": ""},
+               {"source": "time", "label": "Timestamp", "units": "s"}]
+        for opt in self.insitu_channel_options():
+            out.append({"source": opt["channel"], "label": opt["label"],
+                        "units": opt["units"]})
+        return out
+
+    def add_burnin(self, source: str, xy=None) -> bool:
+        """Add ONE burnt-in text overlay of any kind. The single add path.
+
+        *source* is ``"label"``, ``"time"``, or an instrument channel key. All
+        three produce an entry in ``text_overlays`` differing only in where the
+        string comes from.
+        """
+        spec = self.cell.movie
+        if spec is None:
+            return False
+        existing = self._overlays_with_time(spec)
+        fw, fh = self.frame_size()
+        if source == "label":
+            ov = _pipeline.label_overlay(fh)
+        elif source == "time":
+            if _pipeline.has_time_overlay(existing):
+                return False          # only one clock makes sense
+            ov = _pipeline.time_overlay(fh)
+        else:
+            option = {o["channel"]: o
+                      for o in self.insitu_channel_options()}.get(str(source))
+            if option is None:
+                return False
+            ov = {"insitu_channel": option["channel"], "label": option["label"],
+                  "units": option["units"], "size": 18}
+        ov["color"] = _traces.color_for_index(len(existing))
+        ov["xy"] = ([int(xy[0]), int(xy[1])] if xy is not None
+                    else [int(fw * 0.06),
+                          int(fh * 0.9) - _overlay_row_step(fh) * len(existing)])
+        spec.text_overlays = list(existing) + [ov]
+        return True
+
+    def set_timestamp_enabled(self, on: bool) -> None:
+        """Add or remove the built-in time overlay (the Timestamp checkbox)."""
+        spec = self.cell.movie
+        if spec is None:
+            return
+        self._overlays_with_time(spec)          # migrate first, then edit
+        overlays = [o for o in (spec.text_overlays or [])
+                    if not (isinstance(o, dict) and o.get("builtin") == "time")]
+        if on:
+            params = spec.params or {}
+            overlays.insert(0, _pipeline.time_overlay(
+                self.frame_size()[1],
+                color=str(params.get("timestamp_color") or "#ffffff")))
+        spec.text_overlays = overlays
+        # Keep the legacy flag honest for anything still reading it.
+        spec.params = {**(spec.params or {}), "timestamp": bool(on)}
+
     def rebuild_text_traces(self) -> list:
         """For every 1-D-signal-as-text overlay on the spec, attach a live
         ``_trace`` (a captured :class:`TraceSpec`) so export/preview can resample
@@ -689,10 +822,27 @@ class MovieEditSession:
         spec = self.cell.movie
         cache = getattr(self, "_overlay_traces", None) or {}
         out = []
-        for ov in (spec.text_overlays or []):
+        for ov in self._overlays_with_time(spec):
             ov = dict(ov)
+            # The elapsed-time overlay's value is the frame's own time, so it
+            # carries no trace — the drawing/format paths read `builtin`.
+            if ov.get("builtin") == "time":
+                out.append(ov)
+                continue
             ref = ov.get("source")
             tr = None
+            # An INSTRUMENT channel (electrochemistry potential/current, holder
+            # temperature) is already per-frame on the tree — no source window
+            # has to exist, and it is re-read every rebuild rather than cached,
+            # so re-attaching a different record updates the overlay too.
+            channel = ov.get("insitu_channel")
+            if channel:
+                tr = _traces.from_insitu_channel(
+                    self.tree, str(channel), color=ov.get("color"))
+                if tr is not None:
+                    ov["_trace"] = tr
+                out.append(ov)
+                continue
             key = _overlay_key(ref)
             if key is not None and key in cache:
                 tr = cache[key]
@@ -881,10 +1031,46 @@ class MovieEditSession:
             "signal_window_id": self.signal_window_id(),
             "nav_fig_id": self.nav_fig_id(),
             "current_index": self.current_index(),
+            # Instrument channels attached to this movie (electrochemistry
+            # potential/current, holder temperature…). Already per-frame, so
+            # the editor can offer them as burn-in overlays directly — no 1-D
+            # source window has to be open and dragged in.
+            "insitu_channels": self.insitu_channel_options(),
+            # Everything addable as burnt-in text, in one list — the editor
+            # renders one button per entry instead of a text button here, a
+            # checkbox there and a channel list somewhere else.
+            "burnin_sources": self.burnin_sources(),
         }
+
+    def insitu_channel_options(self) -> list:
+        """Instrument channels this movie can burn in (see
+        :func:`spyde.actions.movie_export.traces.insitu_channel_options`)."""
+        try:
+            return _traces.insitu_channel_options(self.tree)
+        except Exception as e:
+            log.debug("listing in-situ overlay channels failed: %s", e)
+            return []
+
+    def add_insitu_overlay(self, channel: str, xy=None, **kw) -> bool:
+        """Add a burn-in for one attached instrument channel.
+
+        Kept as a name; :meth:`add_burnin` is the one implementation.
+        """
+        return self.add_burnin(str(channel), xy=xy)
 
     def emit(self) -> None:
         ipc.emit(self.state())
+
+
+def _overlay_row_step(frame_h: int) -> int:
+    """Vertical gap between stacked burn-in overlays, in SOURCE pixels.
+
+    It has to scale with the frame. A fixed 30 px is a readable row on a 512 px
+    frame and 0.7 % of a 4096 px one — on a real DE movie two overlays landed
+    30 px apart on a 4096 px frame, which on screen is the same line twice and
+    reads as a duplicated text box rather than as two overlays.
+    """
+    return max(30, int(round(frame_h * 0.045)))
 
 
 def _public_overlay(ov: dict) -> dict:
@@ -937,7 +1123,12 @@ def _format_overlay_value(ov: dict, frame: int, scale_s: float,
     label = str(ov.get("label", "") or "")
     units = str(ov.get("units", "") or "")
     fmt = str(ov.get("fmt", "") or "")
-    val = _overlay_value_at(ov.get("_trace"), frame, scale_s, n_frames)
+    if ov.get("builtin") == "time":
+        # Its value IS the frame's time — no trace to resolve, which is why it
+        # would otherwise render as a dash in the editor.
+        val = float(frame) * float(scale_s or 0.0)
+    else:
+        val = _overlay_value_at(ov.get("_trace"), frame, scale_s, n_frames)
     if val is None:
         return f"{label} = —" if label else "—"
     if fmt:
@@ -945,7 +1136,9 @@ def _format_overlay_value(ov: dict, frame: int, scale_s: float,
             return fmt.format(label=label, value=val, units=units)
         except (KeyError, IndexError, ValueError):
             pass
-    return f"{label} = {val:.2f} {units}".strip()
+    # Same formatter the burnt-in frames use, so the editor preview and the
+    # export never disagree about how a value reads.
+    return f"{label} = {_pipeline._overlay_number(val)} {units}".strip()
 
 
 def _make_movie_crop_handler(st):
@@ -974,6 +1167,41 @@ def _make_movie_crop_handler(st):
                 st.emit()
         except Exception as e:
             log.debug("movie crop persist failed: %s", e)
+    return _on_drag_end
+
+
+def _make_burnin_widget_handler(st, index: int):
+    """``pointer_up`` handler persisting a dragged BURN-IN label's position.
+
+    The sibling of :func:`_make_movie_widget_handler` for ``text_overlays``.
+    Geometry is in IMAGE pixels, which for a signal frame ARE source pixels —
+    the same units the export's ``xy`` is in — so it maps straight across with
+    no conversion.
+
+    ``rebuild_text_traces`` returns copies IN SPEC ORDER, so the widget index is
+    the spec index; the bounds check below is what keeps that assumption honest
+    if an overlay is removed between the build and the drag.
+    """
+    def _on_drag_end(event):
+        try:
+            widget = getattr(event, "source", None)
+            g = getattr(widget, "_data", None) if widget is not None else None
+            if not isinstance(g, dict):
+                return
+            spec = st.cell.movie
+            overlays = (spec.text_overlays if spec else None) or []
+            if not (0 <= index < len(overlays)):
+                return
+            nx = int(round(float(g.get("x", 0))))
+            ny = int(round(float(g.get("y", 0))))
+            if overlays[index].get("xy") != [nx, ny]:
+                overlays[index]["xy"] = [nx, ny]
+                spec.text_overlays = overlays
+                st.mgr.dirty = True
+                st.emit()
+        except Exception as e:
+            log.debug("burn-in drag persist failed (idx %s): %s", index, e)
+
     return _on_drag_end
 
 
@@ -1290,6 +1518,7 @@ def movie_tune(session, plot, payload) -> None:
     if cell is None or cell.cell_type != "movie" or cell.movie is None:
         return
     spec = cell.movie
+    want_timestamp = None
     if "params" in payload and isinstance(payload["params"], dict):
         p = dict(spec.params or {})
         incoming = payload["params"]
@@ -1306,9 +1535,20 @@ def movie_tune(session, plot, payload) -> None:
             p["clim"] = ([float(cl[0]), float(cl[1])]
                          if cl and len(cl) == 2
                          and cl[0] is not None and cl[1] is not None else None)
-        for key in ("timestamp", "scalebar", "axes"):
+        for key in ("scalebar", "axes"):
             if key in incoming:
                 p[key] = bool(incoming[key])
+        if incoming.get("timestamp_color"):
+            p["timestamp_color"] = str(incoming["timestamp_color"])
+        # The Timestamp checkbox adds/removes the built-in time OVERLAY, so the
+        # editor shows the change immediately (it used to flip a render-time
+        # param that nothing on screen reflected) and the timestamp is then
+        # movable, recolourable and time-gateable like every other overlay.
+        if "timestamp" in incoming:
+            p["timestamp"] = bool(incoming["timestamp"])
+            # Applied AFTER the text_overlays replacement below — a payload
+            # carrying both would otherwise clobber the overlay we just added.
+            want_timestamp = p["timestamp"]
         # Clamp the time range to the dataset (n_frames known only with a source).
         n = st.n_frames() if st is not None and st.has_source else None
         if n:
@@ -1331,10 +1571,16 @@ def movie_tune(session, plot, payload) -> None:
     if "out_size" in payload:
         os_ = payload["out_size"]
         spec.out_size = ([int(v) for v in os_] if os_ and len(os_) == 2 else None)
+    if want_timestamp is not None and st is not None:
+        st.set_timestamp_enabled(want_timestamp)
     mgr.dirty = True
-    # An annotation change → rebuild the draggable widgets on the live figure so a
-    # newly-added / removed / retimed overlay is immediately editable on the figure.
-    if st is not None and "annotations" in payload:
+    # An annotation / overlay change → rebuild the draggable widgets on the live
+    # figure so a newly-added, removed or retimed overlay is immediately visible
+    # and editable there. `text_overlays` is in this list because toggling the
+    # timestamp now adds/removes one, and without a resync the editor showed no
+    # change at all — the original "toggling Timestamp does nothing" report.
+    if st is not None and ("annotations" in payload or "text_overlays" in payload
+                           or want_timestamp is not None):
         st.sync_overlay_widgets()
     # A render-param change (cmap / clim / axes) → push it to the live figure.
     if st is not None and "params" in payload:
@@ -1449,7 +1695,10 @@ def movie_add_text_overlay(session, plot, payload) -> None:
     if tr is None:
         ipc.emit_error("Add text overlay: source window is not a 1-D plot.")
         return
-    xy = payload.get("xy") or [8, 8 + 26 * len(cell.movie.text_overlays)]
+    st_for_size = _sessions(mgr).get(cell.id)
+    fh = st_for_size.frame_size()[1] if st_for_size is not None else 512
+    xy = payload.get("xy") or [
+        8, 8 + _overlay_row_step(fh) * len(cell.movie.text_overlays)]
     ov = {
         "source": SignalRef.from_plot(src).to_dict(),
         "label": str(payload.get("label") or tr.label or "value"),
@@ -1467,6 +1716,52 @@ def movie_add_text_overlay(session, plot, payload) -> None:
         st.sync_overlay_widgets()                  # show the live value on the figure
         st.emit()
     mgr.emit_state()
+
+
+def movie_add_burnin(session, plot, payload) -> None:
+    """Add ONE burnt-in text overlay (``{cell_id, source, xy?}``).
+
+    The single add path for everything that draws text on a frame: ``source``
+    is ``"label"`` (static text), ``"time"`` (the elapsed-time clock), or an
+    attached instrument channel key such as ``"Ewe/V"``. They differ only in
+    where the string comes from — position, size, colour, time gate, the
+    draggable widget and the timeline clip are identical, which is why they are
+    one object with one action rather than three. Emits ``movie_state``.
+    """
+    mgr = _manager(session)
+    if not mgr.open:
+        return
+    cell = mgr.doc.cell_by_id(payload.get("cell_id"))
+    if cell is None or cell.cell_type != "movie" or cell.movie is None:
+        return
+    st = _sessions(mgr).get(cell.id)
+    if st is None:
+        ipc.emit_error("Add burn-in: the movie editor is not open.")
+        return
+    source = str(payload.get("source") or payload.get("channel") or "label")
+    if not st.add_burnin(source, xy=payload.get("xy")):
+        if source == "time":
+            ipc.emit_error("The timestamp is already on this movie.")
+        else:
+            ipc.emit_error(
+                f"Add burn-in: no in-situ channel {source!r} on this movie. "
+                "Load its instrument data first (File ▸ Load In-Situ Data…)."
+            )
+        return
+    if source == "time":
+        # Keep the legacy flag in step so a reopened spec doesn't re-add it.
+        st.cell.movie.params = {**(st.cell.movie.params or {}), "timestamp": True}
+    mgr.dirty = True
+    st.sync_overlay_widgets()      # show it on the figure immediately
+    st.emit()
+    mgr.emit_state()
+
+
+# Back-compat alias: the previous, channel-only entry point.
+def movie_add_insitu_overlay(session, plot, payload) -> None:
+    payload = dict(payload or {})
+    payload.setdefault("source", payload.get("channel"))
+    movie_add_burnin(session, plot, payload)
 
 
 def movie_export(session, plot, payload) -> None:
@@ -1631,7 +1926,11 @@ def _bake_poster(raw, params, n_frames, scale_s, sig_scale_x, sig_units,
         tvals = None
         overlays = list(text_overlays or [])
         if overlays:
-            from spyde.actions.movie_export.pipeline import _overlay_value_at
+            # `_overlay_value_at` is defined in THIS module — the old import
+            # pulled it from `pipeline`, where it has never existed, so this
+            # raised and the poster bake was silently skipped. It only ran when
+            # a movie had text overlays, which used to be the uncommon case;
+            # the timestamp being an overlay now makes it every movie.
             tvals = [_overlay_value_at(o.get("_trace"), t0, scale_s, n_frames)
                      for o in overlays]
         img = render_single_frame(raw, t0, params=pp, n_frames=n_frames,

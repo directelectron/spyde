@@ -24,7 +24,7 @@ import React from 'react'
 import { useSpyDE } from '../kernel/SpyDEContext'
 import { SeamlessFigureFrame } from './ReportFigureCell'
 import { WINDOW_DRAG_MIME } from '../kernel/dnd'
-import type { MovieStateMessage, MovieParams, MovieAnnotation, MovieSpeedSegment } from '../kernel/protocol'
+import type { MovieStateMessage, MovieParams, MovieAnnotation, MovieSpeedSegment, MovieTextOverlay } from '../kernel/protocol'
 
 interface Props {
   cellId: string
@@ -35,7 +35,17 @@ interface Props {
 const CMAPS = ['gray', 'viridis', 'magma', 'inferno', 'plasma', 'cividis', 'hot', 'jet']
 const DOWNSAMPLES = [1, 2, 4, 8]
 // Speed presets (a segment's multiplier). 0 = hold (freeze); <1 slow-mo; >1 ff.
-const SPEEDS = [0, 0.25, 0.5, 1, 2, 4, 8]
+// Segment speed multipliers. Reaches 32x for the same reason the playback
+// cycle does: an in-situ acquisition is thousands of frames of slow change,
+// and a long uneventful stretch wants skipping hard, not merely fast.
+const SPEEDS = [0, 0.25, 0.5, 1, 2, 4, 8, 16, 32]
+
+/** A burn-in's clip label: its literal text, or the quantity it tracks. */
+function burninLabel(o: MovieTextOverlay): string {
+  if (o.builtin === 'label') return o.text || 'Text'
+  if (o.builtin === 'time') return 'Timestamp'
+  return o.label || o.insitu_channel || 'value'
+}
 const SPEED_LABEL = (s: number) => (s === 0 ? 'hold' : `${s}×`)
 
 // A selected timeline clip (which lane + index), so the inspector edits it.
@@ -185,6 +195,11 @@ export function MovieEditor({ cellId, sendAction, onClose }: Props) {
   // ── overlay + speed lists ─────────────────────────────────────────────────
   const anns = st?.annotations ?? []
   const textOverlays = st?.text_overlays ?? []
+  // Everything addable as burnt-in text (static label, clock, instrument
+  // channels) — the backend owns the list so the rail has one source of truth.
+  const burninSources = st?.burnin_sources
+    ?? [{ source: 'label', label: 'Text', units: '' },
+        { source: 'time', label: 'Timestamp', units: 's' }]
   const speedSegs = st?.speed_segments ?? []
   const setAnnotations = (list: MovieAnnotation[]) => {
     setSt(s => (s ? { ...s, annotations: list } : s)); tune({ annotations: list })
@@ -254,11 +269,28 @@ export function MovieEditor({ cellId, sendAction, onClose }: Props) {
       <div style={styles.body}>
         {/* Left rail — just the ADD buttons (compact). */}
         <div style={styles.rail}>
-          <div style={styles.railHead}>Add overlay</div>
-          <button style={styles.toolBtn} data-testid="movie-add-text" onClick={addText}>＋ Text</button>
+          {/* Burnt-in TEXT — one section, one button per source. Static text,
+              the clock and each attached instrument channel are the same kind
+              of object (they differ only in where the string comes from), so
+              they share this list, the Burn-in timeline lane and one
+              inspector. */}
+          <div style={styles.railHead}>Burn-in text</div>
+          {burninSources.map(s => (
+            <button key={s.source} style={styles.toolBtn}
+              data-testid={`movie-add-burnin-${s.source}`}
+              title={`Burn ${s.label} into every frame`}
+              onClick={() => sendAction('movie_add_burnin',
+                { cell_id: cellId, source: s.source })}>
+              ＋ {s.label}{s.units ? ` (${s.units})` : ''}
+            </button>
+          ))}
+          <div style={styles.railRule} />
+          <div style={styles.railHead}>Shapes</div>
           <button style={styles.toolBtn} data-testid="movie-add-roi" onClick={addRoi}>＋ ROI box</button>
+          <div style={styles.railRule} />
+          <div style={styles.railHead}>Timing</div>
           <button style={styles.toolBtn} data-testid="movie-add-speed" onClick={addSpeedSeg}>＋ Speed segment</button>
-          <div style={{ height: 8 }} />
+          <div style={styles.railRule} />
           <div style={styles.railHead}>Crop</div>
           <button data-testid="movie-crop-toggle"
             style={cropMode ? { ...styles.toolBtn, ...styles.toolBtnActive } : styles.toolBtn}
@@ -312,23 +344,16 @@ export function MovieEditor({ cellId, sendAction, onClose }: Props) {
 
           {/* Timeline dock: overlay lanes + speed track. */}
           <div style={styles.timeline} data-testid="movie-timeline">
-            <TimelineLane label="Text" testid="movie-lane-text">
-              <Playhead frac={frac(t * scaleS)} />
-              {anns.map((a, i) => a.kind === 'text' ? (
-                <Clip key={i} testid={`movie-clip-text-${i}`} color="#89b4fa"
-                  t0={frac(a.time_range?.[0] ?? 0)} t1={frac(a.time_range?.[1] ?? duration)}
-                  label={a.text || 'text'} selected={sel?.lane === 'text' && sel.index === i}
-                  onSelect={() => setSel({ lane: 'text', index: i })}
-                  onMove={(n0, n1) => setAnnotations(anns.map((x, j) => j === i ? { ...x, time_range: [n0 * duration, n1 * duration] } : x))}
-                  onRemove={() => { setAnnotations(anns.filter((_, j) => j !== i)); setSel(null) }} />
-              ) : null)}
-            </TimelineLane>
-            <TimelineLane label="Signal" testid="movie-lane-signal">
+            {/* ONE lane for every burnt-in text — static labels, the clock and
+                instrument channels are the same object, so they belong on the
+                same track rather than being split across "Text" and "Signal"
+                by where their string happens to come from. */}
+            <TimelineLane label="Burn-in" testid="movie-lane-signal">
               <Playhead frac={frac(t * scaleS)} />
               {textOverlays.map((o, i) => (
                 <Clip key={i} testid={`movie-clip-signal-${i}`} color="#a6e3a1"
                   t0={frac(o.time_range?.[0] ?? 0)} t1={frac(o.time_range?.[1] ?? duration)}
-                  label={o.label || 'signal'} selected={sel?.lane === 'signal' && sel.index === i}
+                  label={burninLabel(o)} selected={sel?.lane === 'signal' && sel.index === i}
                   onSelect={() => setSel({ lane: 'signal', index: i })}
                   onMove={(n0, n1) => setTextOverlays(textOverlays.map((x, j) => j === i ? { ...x, time_range: [n0 * duration, n1 * duration] as [number, number] } : x))}
                   onRemove={() => { setTextOverlays(textOverlays.filter((_, j) => j !== i)); setSel(null) }} />
@@ -442,15 +467,30 @@ function Inspector({ sel, st, anns, textOverlays, speedSegs, speeds,
     if (!o) return null
     const upd = (patch: Partial<typeof o>) =>
       setTextOverlays(textOverlays.map((x, j) => j === sel.index ? { ...x, ...patch } : x))
+    const isLabel = o.builtin === 'label'
     return (
       <div style={styles.inspSection} data-testid="movie-inspector-signal">
-        <div style={styles.inspHead}>Signal-as-text</div>
-        <Field label="Label"><input type="text" data-testid="movie-insp-siglabel" value={o.label ?? ''} style={styles.inp}
-          onChange={(e) => upd({ label: e.target.value })} /></Field>
-        <Field label="Format"><input type="text" value={o.fmt ?? ''} placeholder="{label} = {value:.1f} {units}" style={styles.inp}
-          onChange={(e) => upd({ fmt: e.target.value })} /></Field>
-        <Field label="Colour"><input type="color" value={o.color || '#ffffff'} style={styles.color}
+        <div style={styles.inspHead}>Burn-in — {burninLabel(o)}</div>
+        {isLabel ? (
+          <Field label="Text"><input type="text" data-testid="movie-insp-sigtext" value={o.text ?? ''} style={styles.inp}
+            onChange={(e) => upd({ text: e.target.value })} /></Field>
+        ) : (
+          <>
+            <Field label="Label"><input type="text" data-testid="movie-insp-siglabel" value={o.label ?? ''} style={styles.inp}
+              onChange={(e) => upd({ label: e.target.value })} /></Field>
+            <Field label="Format"><input type="text" value={o.fmt ?? ''} placeholder="{label} = {value:.1f} {units}" style={styles.inp}
+              onChange={(e) => upd({ fmt: e.target.value })} /></Field>
+          </>
+        )}
+        <Field label="Colour"><input type="color" data-testid="movie-insp-sigcolor"
+          value={o.color || '#ffffff'} style={styles.color}
           onChange={(e) => upd({ color: e.target.value })} /></Field>
+        <Field label="Size"><input type="number" data-testid="movie-insp-sigsize" min={6} max={96}
+          value={o.size ?? 18} style={styles.num}
+          onChange={(e) => upd({ size: Number(e.target.value) })} /></Field>
+        <div style={styles.hint}>
+          Drag it on the frame to move it; clip it on the Burn-in track to time-gate it.
+        </div>
       </div>
     )
   }
@@ -509,6 +549,10 @@ function RenderControls({ params, patchParams }: {
         onChange={(b) => patchParams({ axes: b })} />
       <Check testid="movie-scalebar" checked={params.scalebar !== false} label="Scale bar"
         onChange={(b) => patchParams({ scalebar: b })} />
+      {/* Timestamp is an ordinary burn-in overlay (`builtin: "time"`), so the
+          checkbox only adds/removes it — position, size and colour are edited
+          on the Signal lane like a voltage's, not with a second set of
+          controls here. */}
       <Check testid="movie-timestamp" checked={params.timestamp !== false} label="Timestamp"
         onChange={(b) => patchParams({ timestamp: b })} />
     </div>
@@ -644,6 +688,8 @@ const styles: Record<string, React.CSSProperties> = {
   body: { flex: 1, display: 'flex', minHeight: 0 },
   rail: { display: 'flex', flexDirection: 'column', gap: 5, padding: 12, borderRight: '1px solid #313244', flexShrink: 0, width: 132, overflowY: 'auto' },
   railHead: { fontSize: 10, fontWeight: 700, color: '#89b4fa', textTransform: 'uppercase', letterSpacing: 0.4 },
+  // Hairline between the rail's groups (burn-in text / shapes / timing).
+  railRule: { height: 1, background: 'rgba(255,255,255,0.10)', margin: '10px 0 8px' },
   toolBtn: { background: '#1e1e2e', color: '#cdd6f4', border: '1px solid #313244', borderRadius: 5, padding: '5px 8px', fontSize: 11.5, cursor: 'pointer', textAlign: 'left' },
   toolBtnActive: { background: '#89b4fa', color: '#11111b', borderColor: '#89b4fa', fontWeight: 700 },
   center: { flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, padding: 14, gap: 10 },

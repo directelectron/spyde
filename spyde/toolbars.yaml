@@ -34,7 +34,7 @@ functions:
     toggle: True
     toolbar_side: right
   Fast Forward:
-    description: Fast-forward — cycle the playback speed 2x → 4x → 8x → 1x. Starts playback if stopped.
+    description: Fast-forward — cycle the playback speed 2x → 4x → 8x → 16x → 32x → 1x. Starts playback if stopped.
     icon: drawing/toolbars/icons/fastforward.svg
     function: spyde.actions.base.fast_forward
     plot_dim: [ 1 ]
