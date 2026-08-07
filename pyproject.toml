@@ -63,7 +63,7 @@ dependencies = [
     # Remote model registry for the SpotUNet disk detector: pulls upgraded
     # weights + registry.json from Hugging Face (spyde/models/registry.py).
     # A hard dep — without it the documented ship-a-model-without-re-releasing
-    # path (spyde/models/RELEASING.md) silently no-ops.
+    # path (spyde/models/registry.py module docstring) silently no-ops.
     "huggingface_hub",
 ]
 description = "DE Visualization tool based on HyperSpy"

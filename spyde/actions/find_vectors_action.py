@@ -1128,8 +1128,8 @@ def fv_models(session, plot, payload) -> None:
 
 def fv_refresh_models(session, plot, payload) -> None:
     """'Check for new models': pull the latest ``registry.json`` from Hugging
-    Face (the ship-a-model-without-re-releasing path, ``models/RELEASING.md``)
-    on a worker thread — never the main loop (network) — then re-emit
+    Face (the ship-a-model-without-re-releasing path — the author-side contract
+    is in ``spyde/models/registry.py``'s module docstring) on a worker thread — never the main loop (network) — then re-emit
     ``fv_models`` with ``refreshed: true`` so the wizard dropdown updates in
     place. Offline-safe: a failed refresh keeps the current merged manifest."""
     window_id = (payload or {}).get("window_id", getattr(plot, "window_id", None))

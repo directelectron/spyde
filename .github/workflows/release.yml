@@ -244,7 +244,9 @@ jobs:
 
       # ── macOS code signing (only when secrets are present) ─────────────────────
       # Import the Developer ID Application cert into a throwaway keychain so
-      # electron-builder can sign + (with notarize:true) notarize. See SIGNING.md.
+      # electron-builder can sign + (with notarize:true) notarize. The full
+      # cert-acquisition + secret-setup walkthrough (and the six-secret table)
+      # lives in .github/workflows/verify_signing_secrets.yml's header comment.
       # Gated on both runner.os == macOS AND the cert secret being set, so a fork
       # / secret-less run skips it and electron-builder produces an unsigned build
       # (rather than failing) — matching electron-builder.yml's no-identity-null.
@@ -288,7 +290,8 @@ jobs:
       # update-feed metadata (latest.yml / latest-mac.yml / latest-linux.yml)
       # electron-updater's autoUpdater reads at runtime — publish:false builds
       # never generate these files at all. On macOS the app is signed + notarized
-      # when MAC_SIGNING_ENABLED (see the signing steps above + SIGNING.md).
+      # when MAC_SIGNING_ENABLED (see the signing steps above +
+      # verify_signing_secrets.yml).
       # -c.publish.owner/.repo pin the publish target to THE REPO THIS WORKFLOW
       # RUNS IN — the same-repo assumption the draft-release design above already
       # makes (GITHUB_TOKEN can't publish cross-repo anyway). Without the

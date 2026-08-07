@@ -23,7 +23,30 @@ Resolution + caching:
   - ``refresh_remote_registry()`` → pull the latest manifest from Hugging Face into
     the user dir (the "check for new models" path). Optional/lazy/offline-safe.
 
-See ``RELEASING.md`` for the author-side workflow of shipping a revised model.
+Shipping a revised model (the author-side contract):
+
+1. Train / iterate in the ``yoloDiffraction`` repo (the checkpoint stores its own
+   ``base`` / ``in_ch`` / ``levels`` hyperparams).
+2. Validate it beats the current default on the real-scale benchmark:
+   ``python -m spyde.tests.benchmark_neural_spots``.
+3. Upload the ``.pt`` to the HF repo (``HF_REPO``) under a NEW versioned
+   filename (e.g. ``spotunet-base16-v2.pt``) — NEVER overwrite an existing
+   file: a model ``id`` and its weights are immutable once published, so a
+   cached/downloaded ``.pt`` is never silently swapped under a user.
+4. Add a versioned entry (``id``/``label``/``version``/``arch``/``sha256``/
+   ``source``) to the repo's ``registry.json`` and, once accepted as best, set
+   ``default`` to it. Include the file's ``sha256`` — it is verified after
+   download and a mismatch falls back to the bundled default. Checkpoints are
+   loaded with ``torch.load(weights_only=True)``: plain state dicts + scalar
+   hyperparams only, never pickled objects.
+
+Users pick the new model up via Find Vectors → Model dropdown → refresh
+(``fv_refresh_models`` → ``refresh_remote_registry()``); no SpyDE release
+needed. To make a proven model the offline/first-run default for a SpyDE
+release instead: copy the ``.pt`` into ``spyde/models/weights/``, add a
+``{"type": "bundled", "file": …}`` entry to the bundled ``registry.json`` and
+bump its ``default`` (``pyproject.toml`` package-data already globs
+``models/weights/*.pt``).
 """
 from __future__ import annotations
 
