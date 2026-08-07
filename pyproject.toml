@@ -49,7 +49,7 @@ dependencies = [
     "imageio-ffmpeg",
     "imagecodecs",
     "psygnal>=0.10.0",
-    "anyplotlib>=0.7.1",
+    "anyplotlib>=0.7.2",
     "pyyaml",
     # NOT numexpr. HyperSpy warns "Numexpr is not installed ... which is slower
     # to calculate model" on every model build, but that advice is wrong at
@@ -133,11 +133,9 @@ torch = [
 # runners and breaks `uv sync --frozen`):
 # anyplotlib = { path = "../anyplotlib", editable = true }
 #
-# (The brush widget landed in 0.7.1, so the override is dormant again. NEXT in
-# flight: fix/overlay-mask-tile-mode — set_overlay_mask on a tiled frame. The
-# one test that needs it self-gates on the fix's presence
-# (test_particles_wizard.py::test_tiled_mask_SHIPS_at_the_OVERVIEW_size); once
-# that fix is released, bump the pin above and the gate lifts itself.)
+# (Dormant again: the brush widget landed in 0.7.1 and the tiled
+# set_overlay_mask fix in 0.7.2, which the pin above now requires — the
+# capability gate on test_tiled_mask_SHIPS_at_the_OVERVIEW_size lifts itself.)
 
 [tool.pycrucible]
 entrypoint = "main.py"
