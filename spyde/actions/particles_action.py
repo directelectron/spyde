@@ -707,25 +707,32 @@ class SegmentWizard(WizardController):
         is a 2-D label IMAGE, which is exactly what ``commit_result_tree``
         expects, and the store rides along in ``attrs`` so
         ``requires_particles`` unlocks the same downstream actions.
+
+        Returns the committed tree, or **None** — which means either "refused,
+        and said why" or "the split is running on a worker and the tree will
+        land when it finishes" (see :func:`_commit_mask_preview`). It is never
+        an exception: Commit is a button, and every reachable state of the
+        preview has to come back as a message.
         """
         prev = self.preview
         if prev is None or self.session is None:
             emit_error("Segment Particles: nothing previewed to commit")
             return None
-        # `SpyDEParticles.from_frames` requires one contour PER ROW, in order.
-        # The preview skips outline extraction above the draw cap, so committing
-        # that preview would build a store whose outlines silently do not
-        # correspond to its rows. Refuse, and say why — the only way to be here
-        # is a preview with thousands of instances, which is the failed-threshold
-        # case (`_threshold_failed`) and not something worth committing anyway.
-        if len(prev["contours"]) != len(prev["rows"]):
-            emit_error(
-                f"Segment Particles: {len(prev['rows'])} instances is too many "
-                "to commit as outlines — this is usually a threshold that "
-                "landed in the noise. Tighten the size filter, or train the "
-                "Scribble classifier, then commit.")
+        # THE LIVE PREVIEW IS MASK-ONLY, so the instance data this commit needs
+        # does not exist yet: `_preview_mask` stores `{frame, mask, count: -1,
+        # areas, box}` and no `labels`/`rows`/`contours` at all. Reading them
+        # here unconditionally raised `KeyError: 'contours'` on the ordinary
+        # tune-then-Commit path.
+        #
+        # Splitting NOW is the designed answer, not a workaround: plan §3(iii)
+        # is "show foreground probability live; split on demand AND ON COMMIT",
+        # and `_mask_engine` says the same in as many words — "instance identity
+        # and the size distribution come from the real run (and from
+        # `seg_commit`), where they are worth their price".
+        if "contours" not in prev:
+            _commit_mask_preview(self.session, self, prev)
             return None
-        return commit_single_frame(
+        return _commit_or_refuse(
             self.session, self, prev["labels"], prev["rows"], prev["contours"],
             int(prev["frame"]))
 
@@ -2195,6 +2202,99 @@ def seg_train(session, plot, payload) -> None:
 
 
 # ── the single-frame result ──────────────────────────────────────────────────
+
+def _commit_or_refuse(session, wiz: SegmentWizard, labels, rows, contours,
+                      frame: int):
+    """``commit_single_frame``, unless the outlines cannot describe the rows.
+
+    ``SpyDEParticles.from_frames`` requires one contour PER ROW, in order. Both
+    commit paths skip outline extraction above :data:`_MAX_OUTLINE_POLYS`, so
+    committing then would build a store whose outlines silently do not
+    correspond to its rows. Refuse, and say why — the only way to be here is
+    thousands of instances, which is the failed-threshold case
+    (:func:`_threshold_failed`) and not something worth committing anyway.
+
+    One implementation because there are now two callers (the full preview
+    commits data it already has; the mask-only preview computes it first) and
+    the check is the same contract for both.
+    """
+    if len(contours) != len(rows):
+        emit_error(
+            f"Segment Particles: {len(rows)} instances is too many "
+            "to commit as outlines — this is usually a threshold that "
+            "landed in the noise. Tighten the size filter, or train the "
+            "Scribble classifier, then commit.")
+        return None
+    return commit_single_frame(session, wiz, labels, rows, contours, int(frame))
+
+
+def _commit_mask_preview(session, wiz: SegmentWizard, prev: dict) -> None:
+    """Split + measure the MASK-ONLY preview's frame, then commit it.
+
+    Plan §3(iii): the live preview answers "is my classification good enough
+    yet", which needs no instance identity — so the split (732 ms at 4096²) and
+    the measurement (958 ms) are skipped there and paid HERE, once, when the
+    user asks to keep the result.
+
+    Three decisions worth stating, because each has a plausible cheaper wrong
+    answer:
+
+    * **Re-run the ENGINE; do not split ``prev["mask"]``.** The stored mask is
+      ``fg > 0.5`` and the boundary channel is thrown away with it, so splitting
+      it would silently take the watershed route instead of the connected-
+      components one the painted boundary class buys (plan §4: 1.29 s vs 2.73 s,
+      and *more* accurate — 162 bodies against 162 true, versus 173). A commit
+      that disagrees with the batch run over the same frame is exactly what plan
+      §6 means by keeping the commit path authoritative.
+    * **The same window the preview classified**, taken from the stored box
+      rather than recomputed, so what is committed is what was on screen.
+    * **On a WORKER**, like every other segmentation in this module: this is up
+      to seconds of numpy on a 4096² frame and the asyncio main thread runs the
+      whole backend.
+
+    Asynchronous, so :meth:`SegmentWizard.commit` returns None here and the tree
+    lands when the split does.
+    """
+    p = dict(wiz.params)
+    engine = _engine(wiz, p)
+    if engine is None:
+        # `_engine` has already said why (an untrained head, or `prompt`).
+        emit_error("Segment Particles: cannot commit — the engine that made "
+                   "this preview is no longer available. Train the Scribble "
+                   "classifier and preview again.")
+        return
+    t = int(prev.get("frame") or 0)
+    box = prev.get("box")
+    scale, _units = wiz.scale_units()
+    emit_status("Segment Particles: measuring the previewed frame…")
+
+    def _work():
+        from spyde.particles import measure_frame
+        _n, get_frame, _shape = wiz.frames()
+        full = np.asarray(get_frame(t))
+        frame = full if box is None else \
+            full[int(box[0]):int(box[0]) + int(box[2]),
+                 int(box[1]):int(box[1]) + int(box[3])]
+        labels = engine(frame)
+        # Same cap as `_preview`: above it the outlines are not extracted, and
+        # `_commit_or_refuse` then declines rather than building a store whose
+        # contours do not match its rows.
+        n_lab = int(np.asarray(labels).max()) if np.asarray(labels).size else 0
+        rows, contours = measure_frame(labels, frame, t=t, scale=scale,
+                                       want_contours=n_lab <= _MAX_OUTLINE_POLYS)
+        rows, contours = filter_by_score(rows, contours, p.get("min_score", 0.0))
+        return labels, rows, contours
+
+    def _done(res):
+        labels, rows, contours = res
+        if wiz._closed:
+            return
+        _commit_or_refuse(session, wiz, labels, rows, contours, t)
+
+    run_on_worker(session, _work, name="seg-commit-split", on_done=_done,
+                  on_error=lambda e: emit_error(
+                      f"Segment Particles: commit failed — {e}"))
+
 
 def commit_single_frame(session, wiz: SegmentWizard, labels, rows, contours,
                         frame: int):

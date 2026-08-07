@@ -4,7 +4,7 @@ import numpy as np
 from spyde.actions import particles_action as pa
 
 
-def _wait(pred, timeout=120.0):
+def _wait(pred, timeout=30.0):
     end = time.time() + timeout
     while time.time() < end:
         if pred():
@@ -33,12 +33,25 @@ class TestAutolabelDoor:
         assert counts.get(0, 0) > 0, f"no particle pixels painted: {counts}"
         assert counts.get(1, 0) > 0, f"no film pixels painted: {counts}"
 
-        pa.seg_train(session, plot, {})
+        # CPU EXPLICITLY: with no device the classifier auto-selects, i.e. CUDA
+        # on this box, and in-process torch-CUDA segfaults under pytest on
+        # Windows (CLAUDE.md).
+        pa.seg_train(session, plot, {"device": "cpu"})
         assert _wait(lambda: wiz.classifier is not None
                      and wiz.classifier.is_trained), "training never finished"
-        assert _wait(lambda: wiz.preview is not None
-                     and wiz.preview["count"] > 0, timeout=60), \
-            "the trained head found nothing on the frame"
+        # The live preview is MASK-ONLY (plan §3(iii)), so a trained head that
+        # works shows up as foreground COVERAGE, not as a count: `count` is the
+        # -1 sentinel meaning "not counted", and asserting `> 0` here was
+        # asserting against the design.
+        assert _wait(lambda: wiz.preview is not None), \
+            "the trained head never produced a preview"
+        assert wiz.preview["count"] == -1, \
+            "the live preview counted instances instead of stopping at the mask"
+        mask = np.asarray(wiz.preview["mask"])
+        assert mask.ndim == 2 and mask.any(), \
+            "the trained head called nothing on the frame foreground"
+        assert mask.mean() < 0.9, \
+            f"the head called {mask.mean():.0%} of the frame a particle"
 
     def test_it_refuses_a_signal_with_no_stamped_truth(self, tem_2d_dataset):
         w = tem_2d_dataset

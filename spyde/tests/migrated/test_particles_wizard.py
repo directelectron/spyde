@@ -39,7 +39,7 @@ from spyde.actions import particles_action as pa
 
 
 @pytest.fixture(autouse=True)
-def _capture_module_emit(window, monkeypatch):
+def _capture_module_emit(request, monkeypatch):
     """Route ``particles_action``'s own ``emit`` into the captured list.
 
     The module does ``from spyde.backend.ipc import emit`` at import, so
@@ -47,16 +47,90 @@ def _capture_module_emit(window, monkeypatch):
     hazard conftest already documents for ``session.py``, and the identical fix.
     ``emit_status``/``emit_error`` need no patch: they resolve ``emit`` inside
     ``ipc`` at call time.
+
+    GATED ON ``window``, which is the whole point of the gate: plain
+    ``autouse=True`` pulled the ``window`` fixture into EVERY test in the file,
+    so ~30 pure-function tests — the schema, the nm→px arithmetic, the
+    lane/semaphore contracts, the overlay stubs, none of which involve a session
+    at all — each built and tore down a real ``Session`` (and its Dask manager)
+    to assert on a dict. Gating on the fixture NAME rather than on a hand-kept
+    list of tests is what makes this safe: dispatching a handler REQUIRES a
+    session, so a test that needs the patch cannot fail to request ``window``.
     """
-    monkeypatch.setattr(pa, "emit", window["messages"].append)
+    if "window" not in request.fixturenames:
+        return
+    messages = request.getfixturevalue("window")["messages"]
+    monkeypatch.setattr(pa, "emit", messages.append)
+
+
+@pytest.fixture
+def brush_required():
+    """Skip unless the installed anyplotlib carries the brush widget.
+
+    Thirteen tests repeated this three-line check inline. Request it FIRST in
+    the signature so the skip is decided before the session is built.
+    """
+    if not pa._brush_supported():
+        pytest.skip("installed anyplotlib has no brush widget (needs >= 0.5.0)")
+
+
+def _plots_of(session):
+    plots = session._plots
+    return list(plots.values()) if hasattr(plots, "values") else list(plots)
 
 
 def _signal_plot(session):
-    return next((p for p in session._plots
+    return next((p for p in _plots_of(session)
                  if not p.is_navigator and p.plot_state is not None), None)
 
 
-def _wait(pred, timeout=60.0):
+def _figure_plot(session):
+    """The first plot carrying BOTH a signal tree and a real figure — the plot
+    the brush/caret tests drive.
+
+    Deliberately NOT filtered on ``is_navigator``: four copies of this lived in
+    four test classes and every one of them took the first match in ``_plots``
+    order, so preserving that exact predicate is what makes this a dedupe rather
+    than a quiet change of which plot the tests run against.
+    """
+    return next(p for p in _plots_of(session)
+                if getattr(p, "signal_tree", None) is not None
+                and getattr(p, "_plot2d", None) is not None)
+
+
+def _bare_wizard(p2d):
+    """A ``SegmentWizard`` with ONLY its overlay state — no session, no signal.
+
+    Three test classes hand-built this with slightly different subsets of the
+    attributes, so one of them depended on a default another set explicitly.
+    Callers that need frames attach ``frames``/``frame_index`` themselves.
+    """
+    import types
+
+    w = object.__new__(pa.SegmentWizard)
+    w._ov_group = None
+    w._ov_box_group = None
+    w._ov_raster = False
+    w._ov_cleared = False
+    w._ov_box_state = None
+    w.src_plot = types.SimpleNamespace(_plot2d=p2d)
+    return w
+
+
+def _scribble_wizard(session):
+    """Open the caret with ``seg_open`` ALONE.
+
+    Deliberately not ``seg_set_method`` as well: a helper that armed the brush
+    the caret itself never asks for is exactly how the missing-brush bug stayed
+    green. Two identical copies of this lived in two classes, each carrying half
+    of that note and a comment pointing at the other one.
+    """
+    plot = _figure_plot(session)
+    pa.seg_open(session, plot, {"window_id": getattr(plot, "window_id", None)})
+    return plot, plot.signal_tree
+
+
+def _wait(pred, timeout=30.0):
     end = time.time() + timeout
     while time.time() < end:
         if pred():
@@ -102,7 +176,11 @@ def _opened(window, frames: int = 6, **params):
     counts = wiz.label_store().counts()
     assert counts.get(0, 0) > 0 and counts.get(1, 0) > 0, \
         f"seg_autolabel painted nothing usable: {counts}"
-    pa.seg_train(session, plot, {})
+    # CPU EXPLICITLY. With no device the classifier auto-selects, i.e. CUDA on
+    # this box — and in-process torch-CUDA segfaults under pytest on Windows
+    # (CLAUDE.md). The two call sites that already passed it were not enough:
+    # this helper is what nearly every test in the file trains through.
+    pa.seg_train(session, plot, {"device": "cpu"})
     assert _wait(lambda: wiz.classifier is not None and wiz.classifier.is_trained), \
         "the classifier never finished training"
     assert _wait(lambda: wiz.preview is not None), \
@@ -112,6 +190,21 @@ def _opened(window, frames: int = 6, **params):
 
 def _of_type(messages, kind):
     return [m for m in messages if isinstance(m, dict) and m.get("type") == kind]
+
+
+def _tune(session, plot, payload, msgs, timeout=30.0):
+    """Dispatch a tune and return the ``seg_preview`` IT produced.
+
+    Replaces the flat ``time.sleep`` that used to stand in for "the preview has
+    landed by now". A preview is one worker hop and it ANNOUNCES itself, so
+    waiting for the message is both faster and not a guess about how long a
+    loaded box takes — the shape the rest of the file already used.
+    """
+    seen = len(_of_type(msgs, "seg_preview"))
+    pa.seg_tune(session, plot, payload)
+    assert _wait(lambda: len(_of_type(msgs, "seg_preview")) > seen, timeout), \
+        f"the tune {payload} produced no seg_preview"
+    return _of_type(msgs, "seg_preview")[-1]
 
 
 class _FullComputeGuard:
@@ -145,33 +238,50 @@ class TestPreviewIsOneFrame:
         _s, _p, tree, wiz = _opened(window)
         assert wiz is getattr(tree, "_seg_wizard")
         assert wiz.preview["frame"] == wiz.frame_index()
-        assert wiz.preview["count"] > 0, "found nothing on the fixture's frame"
+        # MASK-ONLY (plan §3(iii)): the live preview classifies and stops there,
+        # so what lands is a mask and an explicit "not counted", never a count.
+        assert wiz.preview["count"] == -1, (
+            "the live preview counted instances — the split and the measurement "
+            "are 87% of a preview and this path is supposed to skip both")
+        mask = np.asarray(wiz.preview["mask"])
+        assert mask.ndim == 2 and mask.any(), \
+            "the trained head called nothing foreground on the fixture's frame"
 
     def test_preview_never_computes_the_whole_movie(self, window):
         session, plot, tree, wiz = _opened(window)
+        msgs = window["messages"]
         assert tree.root._lazy, "the fixture must be lazy or this guards nothing"
         with _FullComputeGuard(tree.root.data.shape) as guard:
-            pa.seg_tune(session, plot, {"min_separation": 6})
-            assert _wait(lambda: wiz.params["min_separation"] == 6)
-            time.sleep(0.6)
+            _tune(session, plot, {"min_separation": 6}, msgs)
+            assert wiz.params["min_separation"] == 6
         assert guard.hits == 0, "a tune materialised the whole movie"
 
     def test_tune_opens_no_new_window(self, window):
         session, plot, _tree, wiz = _opened(window)
+        msgs = window["messages"]
         before = len(session.signal_trees)
-        pa.seg_tune(session, plot, {"min_separation": 7})
-        assert _wait(lambda: wiz.params["min_separation"] == 7)
-        time.sleep(0.4)
+        _tune(session, plot, {"min_separation": 7}, msgs)
+        assert wiz.params["min_separation"] == 7
         assert len(session.signal_trees) == before, "a tune spawned a tree"
 
-    def test_preview_message_carries_the_size_histogram(self, window):
-        session, plot, _tree, wiz = _opened(window)
+    def test_the_preview_message_says_it_did_NOT_count(self, window):
+        """``count: -1`` means "not counted", NOT "found nothing".
+
+        The caret has to be able to tell those apart — a good mask reported as
+        0 reads as a failed segmentation — so the payload carries the sentinel
+        AND the `mask_only` flag, and the size histogram it used to carry is
+        empty rather than misleading. The real count comes from the run and from
+        Commit, which is where the split is worth its price.
+        """
+        session, plot, _tree, _wiz = _opened(window)
         msgs = window["messages"]
-        pa.seg_tune(session, plot, {"marker_smooth": 1.5})
-        assert _wait(lambda: len(_of_type(msgs, "seg_preview")) >= 2)
-        msg = _of_type(msgs, "seg_preview")[-1]
-        assert msg["count"] == len(msg["areas"]) or msg["count"] > pa._MAX_AREAS_SENT
-        assert msg["median_area"] > 0 and msg["units"] == "nm"
+        msg = _tune(session, plot, {"marker_smooth": 1.5}, msgs)
+        assert msg["count"] == -1 and msg["mask_only"] is True
+        assert msg["areas"] == [] and msg["median_area"] == 0.0
+        assert msg["units"] == "nm"
+        # Coverage is what the caret shows INSTEAD of the count, so it has to be
+        # a real fraction of the previewed window.
+        assert 0.0 < msg["coverage"] < 1.0, msg
 
     def test_an_engine_that_cannot_run_keeps_the_last_preview(self, window):
         """An engine with no answer must SAY so, not clear the result on screen.
@@ -181,9 +291,14 @@ class TestPreviewIsOneFrame:
         one engine that is always selected.
         """
         session, plot, _tree, wiz = _opened(window)
+        msgs = window["messages"]
         keep = wiz.preview
         pa.seg_set_method(session, plot, {"method": "prompt"})
-        time.sleep(0.4)
+        # The stub's own status IS the signal that the switch was handled —
+        # `prompt` emits it and then returns without previewing, so there is no
+        # seg_preview to wait for and a flat sleep was standing in for it.
+        assert _wait(lambda: any("not installed yet" in str(m.get("text", ""))
+                                 for m in _of_type(msgs, "status")))
         assert wiz.params["method"] == "prompt"
         assert wiz.preview is keep
 
@@ -222,18 +337,34 @@ class TestMinSizeFloor:
         assert _wait(lambda: wiz.params["min_size"] == 40)
         assert wiz.params["min_size_floored"] is False
 
-    def test_reported_count_is_after_the_size_filter(self, window):
-        """§0.9b: the number the user sees must be the post-filter one, or it
-        moves for a reason they cannot see."""
+    def test_the_COMMITTED_count_is_after_the_size_filter(self, window):
+        """§0.9b, asserted where the count still exists.
+
+        The live preview no longer counts anything (it is mask-only), so the
+        claim "the number the user sees is the post-filter one" now belongs to
+        the two paths that DO split: the batch run, and Commit. This drives
+        Commit, because that is the one this branch had to teach to split.
+        """
         session, plot, _tree, wiz = _opened(window)
         from spyde.signals.particles import COL
-        pa.seg_tune(session, plot, {"min_size": 400})
-        assert _wait(lambda: wiz.params["min_size"] == 400)
-        assert _wait(lambda: wiz.preview is not None
-                     and (wiz.preview["rows"].size == 0
-                          or wiz.preview["rows"][:, COL["area"]].min() > 0))
-        rows = wiz.preview["rows"]
-        assert wiz.preview["count"] == len(rows)
+
+        # `measure_frame` reports area in CALIBRATED units (px² × scale²) while
+        # `min_size` filters in PIXELS, so the bar has to be converted rather
+        # than assumed — the fixture's 1 nm/px would hide the difference.
+        min_px = pa._min_size_px(dict(wiz.params))
+        min_area = min_px * wiz.scale_units()[0] ** 2
+        assert min_px > 0, "nothing is being filtered, so this proves nothing"
+
+        before = len(session.signal_trees)
+        pa.seg_commit(session, plot, {})
+        assert _wait(lambda: len(session.signal_trees) > before), \
+            "the commit never produced a tree"
+        parts = session.signal_trees[-1].particles
+        rows = parts.at(0)
+        assert parts.n_particles == len(rows) > 0
+        assert rows[:, COL["area"]].min() >= min_area, (
+            "a particle smaller than min_size survived into the committed "
+            "store — the filter the caret shows is not the filter that ran")
 
 
 class TestScribbleLabelling:
@@ -297,10 +428,10 @@ class TestScribbleLabelling:
                                      "points": [[5, 5], [5, 60], [8, 100]]})
         pa.seg_train(session, plot, {"device": "cpu"})
         assert _wait(lambda: wiz.classifier is not None
-                     and wiz.classifier.is_trained, timeout=180)
+                     and wiz.classifier.is_trained, timeout=30)
         assert wiz.params["method"] == "scribble"
         assert _wait(lambda: wiz.preview is not None
-                     and wiz.preview["frame"] == wiz.frame_index(), timeout=120)
+                     and wiz.preview["frame"] == wiz.frame_index(), timeout=30)
 
 
 class TestRunIsProgressiveAndCancellable:
@@ -393,9 +524,16 @@ class TestRunIsProgressiveAndCancellable:
 
         monkeypatch.setattr(batch, "resolve_engine", _slow)
         session, plot, _tree, _wiz = _opened(window, frames=24)
+        msgs = window["messages"]
         pa.seg_run(session, plot, {"min_size": 25})
         result = session.signal_trees[-1]
-        time.sleep(0.5)
+        # Close only once the batch is demonstrably RUNNING — cancelling before
+        # the first frame lands would pass without exercising cancellation. The
+        # batch's own progress emission is that signal (the slowed engine makes
+        # it comfortably reachable), where the flat sleep was a guess at it.
+        assert _wait(lambda: any(m.get("label") == "Segmenting"
+                                 for m in _of_type(msgs, "progress"))), \
+            "the batch never reported progress, so there was nothing to cancel"
         result.close()
         assert _wait(lambda: not result._seg_batch_running, timeout=30)
         # A cancelled run keeps its partial rows out of the torn-down tree.
@@ -415,22 +553,70 @@ class TestRunIsProgressiveAndCancellable:
 
 
 class TestCommit:
-    def test_commit_snapshots_the_previewed_frame(self, window):
+    """Commit is where the mask-only preview gets SPLIT.
+
+    Plan §3(iii) — "show foreground probability live; split on demand and on
+    commit" — and `_mask_engine`'s own docstring: "instance identity and the
+    size distribution come from the real run (and from `seg_commit`)". So when
+    the user presses Commit there are no labels, no rows and no contours yet,
+    and reading them off the preview is what raised `KeyError: 'contours'` out
+    of the handler on the ordinary tune-then-Commit path.
+
+    Committing is therefore ASYNCHRONOUS now (the split is up to seconds on a
+    4096² frame and the asyncio main thread runs the whole backend), which is
+    why these poll for the tree instead of counting it synchronously.
+    """
+
+    def test_commit_computes_the_instances_the_preview_skipped(self, window):
         session, plot, tree, wiz = _opened(window)
+        assert wiz.preview["count"] == -1 and "contours" not in wiz.preview, (
+            "this fixture no longer produces a mask-only preview, so the "
+            "regression under test cannot happen here any more")
         before = len(session.signal_trees)
         pa.seg_commit(session, plot, {})
-        assert len(session.signal_trees) == before + 1
+        assert _wait(lambda: len(session.signal_trees) > before), \
+            "Commit on a mask-only preview produced no tree at all"
         committed = session.signal_trees[-1]
         assert committed.particles.n_frames == 1
-        assert committed.particles.n_particles == wiz.preview["count"]
+        assert committed.particles.n_particles > 0, (
+            "the commit-time split found no instances in a mask that has "
+            "foreground — the preview and the commit disagree about the frame")
+        # One outline PER ROW, in order — the contract `from_frames` enforces
+        # and the reason `_commit_or_refuse` exists.
+        assert committed.particles.has_masks
+        assert all(len(committed.particles.contour_at(i)) >= 3
+                   for i in range(committed.particles.n_particles))
         assert committed.source_tree is tree
 
+    def test_commit_refuses_politely_when_the_engine_is_gone(self, window):
+        """No path may raise. The split needs the ENGINE (re-running it is what
+        keeps the boundary channel, and so the committed result, identical to
+        what the batch would produce), so a head that vanished between preview
+        and Commit has to come back as a message, not a traceback."""
+        session, plot, _tree, wiz = _opened(window)
+        msgs = window["messages"]
+        before = len(session.signal_trees)
+        wiz.classifier = None                       # the head is gone
+        del msgs[:]
+        pa.seg_commit(session, plot, {})            # must not raise
+        assert any("commit" in str(m.get("text", "")).lower()
+                   for m in _of_type(msgs, "error")), \
+            "commit failed silently instead of saying why"
+        assert len(session.signal_trees) == before, \
+            "a tree was committed with no engine to measure it"
+
     def test_commit_stamps_provenance(self, window):
-        session, plot, _tree, _wiz = _opened(window)
+        session, plot, _tree, wiz = _opened(window)
+        before = len(session.signal_trees)
+        frame = int(wiz.preview["frame"])
         pa.seg_commit(session, plot, {})
+        assert _wait(lambda: len(session.signal_trees) > before)
         prov = getattr(session.signal_trees[-1], "_commit_provenance", None) or {}
         assert prov.get("action") == "segment_particles"
         assert prov.get("params", {}).get("mode") == "single_frame"
+        # The frame it says it committed is the frame that was previewed.
+        assert prov.get("frame") == frame
+        assert prov.get("params", {}).get("frame") == frame
 
     def test_commit_without_a_preview_errors(self, window):
         session, _plot, _tree = _movie(window)
@@ -459,8 +645,12 @@ class TestDoubleFire:
             pa.seg_open(session, plot, {})
         finally:
             pa.SegmentWizard.__init__ = real_init
-        time.sleep(0.8)
 
+        # NO SLEEP. All three verbs are synchronous on an untrained caret —
+        # `_preview` finds no engine and draws the window box inline, so nothing
+        # is dispatched to a worker at all and there is nothing to wait for. The
+        # 0.8 s here was covering for a preview that no longer runs (and, being
+        # a sleep, would not have caught a late arrival anyway: it asserts once).
         alive = [w for w in built if not w._closed]
         assert len(alive) == 1, \
             f"expected 1 live controller, got {len(alive)} of {len(built)} built"
@@ -501,6 +691,43 @@ class TestSchema:
             assert key in pa.DEFAULTS, f"seg schema declares unknown param {key!r}"
             assert spec["default"] == pa.DEFAULTS[key], \
                 f"seg schema/{key} drifted from particles_action.DEFAULTS"
+
+    #: Parameters deliberately absent from the declared schema, and who owns
+    #: them instead. Everything here is rendered by the caret's own hand-written
+    #: face (``electron/src/renderer/src/components/SegmentWizard.tsx``) because
+    #: it needs a custom control, not a generic slider:
+    #:   min_score / merge_nm / min_nm  — the physical face controls
+    #:   active_class / erase           — the ClassStrip's paint state
+    #: ``scale`` is not here because it is not a DEFAULT at all: ``set_params``
+    #: stashes the signal's own nm/px onto the params after ``_coerce``.
+    CARET_OWNED = {"min_score", "merge_nm", "min_nm", "active_class", "erase"}
+
+    def test_every_default_is_DECLARED_or_KNOWINGLY_caret_owned(self):
+        """The other direction, which the test above cannot see.
+
+        Schema ⊆ DEFAULTS catches a schema entry nothing reads. It does NOT
+        catch a parameter the handlers read that no host renders — which is
+        exactly what `active_class` / `erase` shipped as: read by the brush,
+        declared nowhere, so nothing could set them and every stroke came out in
+        class 0 with a dead eraser.
+
+        The allowlist is the point. A new DEFAULT now has to be either declared
+        in the schema or added here deliberately, rather than silently becoming
+        a parameter no UI can reach.
+        """
+        from spyde.actions import registry
+        schema = registry.wizard_parameters("seg")
+        undeclared = set(pa.DEFAULTS) - set(schema) - self.CARET_OWNED
+        assert not undeclared, (
+            f"{sorted(undeclared)} are read by the seg handlers but declared "
+            f"in no schema and not listed as caret-owned, so nothing can set "
+            f"them")
+        # ...and the allowlist may not rot into a place to hide deleted params.
+        assert self.CARET_OWNED <= set(pa.DEFAULTS), \
+            f"{sorted(self.CARET_OWNED - set(pa.DEFAULTS))} no longer exist"
+        assert "scale" not in pa.DEFAULTS, (
+            "scale became a DEFAULT — `_coerce` would then build it from the "
+            "payload and a stale caret value could override the signal's own")
 
     def test_every_stage_is_registered(self):
         from spyde.actions.registry import STAGED_HANDLERS, resolve_staged
@@ -719,19 +946,13 @@ class TestThresholdFailureIsNotAResult:
     def test_a_normal_preview_is_not_flagged(self, window):
         """The fixture must stay UNflagged or the notice is just noise."""
         session, plot, _tree, _wiz = _opened(window)
-        msgs = window["messages"]
-        pa.seg_tune(session, plot, {"marker_smooth": 1.5})
-        assert _wait(lambda: len(_of_type(msgs, "seg_preview")) >= 2)
-        msg = _of_type(msgs, "seg_preview")[-1]
+        msg = _tune(session, plot, {"marker_smooth": 1.5}, window["messages"])
         assert msg["threshold_failed"] is False, msg
         assert 0.0 <= msg["coverage"] <= 1.0
 
     def test_the_preview_reports_coverage_and_face_units(self, window):
         session, plot, _tree, _wiz = _opened(window)
-        msgs = window["messages"]
-        pa.seg_tune(session, plot, {"min_separation": 4})
-        assert _wait(lambda: len(_of_type(msgs, "seg_preview")) >= 2)
-        msg = _of_type(msgs, "seg_preview")[-1]
+        msg = _tune(session, plot, {"min_separation": 4}, window["messages"])
         assert "coverage" in msg and "face_units" in msg
         assert msg["face_units"] in ("nm", "px")
 
@@ -993,15 +1214,9 @@ class TestOutlineDrawCap:
         monkeypatch.setattr(pa, "_push_groups", lambda p, u: pushed.update(
             {g.name: pl.get("vertices_list") for g, pl in u.items()}))
 
-        w = object.__new__(pa.SegmentWizard)
-        w._ov_group = None
-        w._ov_box_group = None
-        w._ov_raster = False
-        w._ov_cleared = False
-        w._ov_box_state = None
         # No `set_overlay_mask` on this plot => the raster path is unavailable,
         # which is exactly the state the tile-mode ValueError used to produce.
-        w.src_plot = types.SimpleNamespace(_plot2d=types.SimpleNamespace())
+        w = _bare_wizard(types.SimpleNamespace())
 
         # A plain class, NOT SimpleNamespace: the group is used as a dict KEY in
         # the `_push_groups` payload, and SimpleNamespace defines __eq__ so it
@@ -1074,24 +1289,7 @@ class TestBrushActuallyPaints:
     can ever get there. These drive the widget.
     """
 
-    @staticmethod
-    def _plot_of(session):
-        plots = (list(session._plots) if isinstance(session._plots, list)
-                 else list(session._plots.values()))
-        return next(p for p in plots
-                    if getattr(p, "signal_tree", None) is not None
-                    and getattr(p, "_plot2d", None) is not None)
-
-    def _scribble_wizard(self, session):
-        """Open the caret. NOTE: `seg_open` alone, deliberately — a helper that
-        also called `seg_set_method` is what hid the missing-brush bug, because
-        it armed the widget the caret itself never asked for."""
-        from spyde.actions.particles_action import seg_open
-        plot = self._plot_of(session)
-        seg_open(session, plot, {"window_id": getattr(plot, "window_id", None)})
-        return plot, plot.signal_tree
-
-    def test_a_brush_is_attached_by_seg_open_ALONE(self, window):
+    def test_a_brush_is_attached_by_seg_open_ALONE(self, brush_required, window):
         """`seg_open` and nothing else. This is the regression that shipped.
 
         The brush used to be armed only by ``seg_set_method("scribble")``,
@@ -1106,27 +1304,21 @@ class TestBrushActuallyPaints:
         arming path, so both stayed green. Hence this test calls the ONE verb
         the caret actually sends on mount, and asserts on the widget.
         """
-        from spyde.actions.particles_action import _brush_supported, seg_open
         session = window["window"]
         session._load_test_data_particles({"frames": 4})
-        plot = self._plot_of(session)
-        seg_open(session, plot, {})
-        if not _brush_supported():
-            pytest.skip("installed anyplotlib has no brush widget (needs >= 0.5.0)")
+        plot = _figure_plot(session)
+        pa.seg_open(session, plot, {})
         assert getattr(plot.signal_tree, "_seg_brush", None) is not None, (
             "seg_open left no brush on the plot — Shift+drag has nothing to "
             "hit, and painting is the only way to teach the only engine")
 
-    def test_reopening_the_caret_re_arms_the_brush(self, window):
+    def test_reopening_the_caret_re_arms_the_brush(self, brush_required, window):
         """The idempotent re-open path is a separate branch and needs it too."""
-        from spyde.actions.particles_action import (_brush_supported, seg_close,
-                                                    seg_open)
+        from spyde.actions.particles_action import seg_close, seg_open
         session = window["window"]
         session._load_test_data_particles({"frames": 4})
-        plot = self._plot_of(session)
+        plot = _figure_plot(session)
         seg_open(session, plot, {})
-        if not _brush_supported():
-            pytest.skip("installed anyplotlib has no brush widget")
         seg_open(session, plot, {})          # re-open over a live controller
         assert getattr(plot.signal_tree, "_seg_brush", None) is not None, (
             "the re-open branch does not arm the brush")
@@ -1135,14 +1327,13 @@ class TestBrushActuallyPaints:
         assert getattr(plot.signal_tree, "_seg_brush", None) is not None, (
             "reopening after a close left no brush")
 
-    def test_a_stroke_from_the_WIDGET_reaches_the_label_store(self, window):
+    def test_a_stroke_from_the_WIDGET_reaches_the_label_store(self, brush_required,
+                                                              window):
         """Drives the widget, not a synthetic seg_paint payload."""
-        from spyde.actions.particles_action import _brush_supported, _on_stroke
+        from spyde.actions.particles_action import _on_stroke
         session = window["window"]
         session._load_test_data_particles({"frames": 4})
-        _plot, tree = self._scribble_wizard(session)
-        if not _brush_supported():
-            pytest.skip("installed anyplotlib has no brush widget (needs >= 0.5.0)")
+        _plot, tree = _scribble_wizard(session)
         wiz = tree._seg_wizard
         brush = tree._seg_brush
         store = wiz.label_store()
@@ -1155,7 +1346,8 @@ class TestBrushActuallyPaints:
         assert after != before, "the stroke never reached the label store"
         assert after[0] > 0
 
-    def test_a_second_stroke_only_paints_its_own_points(self, window):
+    def test_a_second_stroke_only_paints_its_own_points(self, brush_required,
+                                                        window):
         """The widget accumulates strokes for its whole life, so replaying the
         full list on every event would re-paint everything and make the class
         counts grow quadratically.
@@ -1165,13 +1357,10 @@ class TestBrushActuallyPaints:
         precisely because the JS widget's own value is not reliably in sync (see
         :meth:`test_class_comes_from_PARAMS_not_from_the_js_widget`).
         """
-        from spyde.actions.particles_action import (_brush_supported, _on_stroke,
-                                                    seg_tune)
+        from spyde.actions.particles_action import _on_stroke, seg_tune
         session = window["window"]
         session._load_test_data_particles({"frames": 4})
-        plot, tree = self._scribble_wizard(session)
-        if not _brush_supported():
-            pytest.skip("installed anyplotlib has no brush widget (needs >= 0.5.0)")
+        plot, tree = _scribble_wizard(session)
         wiz, brush = tree._seg_wizard, tree._seg_brush
         store = wiz.label_store()
         s1 = [[20.0, 30.0], [24.0, 32.0]]
@@ -1189,7 +1378,7 @@ class TestBrushActuallyPaints:
         assert two[1] > 0, "the second stroke's class was not painted"
         assert two[0] == one[0], "the first stroke was painted twice"
 
-    def test_closing_the_caret_detaches_the_brush(self, window):
+    def test_closing_the_caret_detaches_the_brush(self, brush_required, window):
         """It floats over the image, so it must not outlive the caret.
 
         This used to switch to the Classical tab and assert the brush went with
@@ -1197,12 +1386,10 @@ class TestBrushActuallyPaints:
         only engine, so the brush is armed for as long as the caret is open —
         which makes CLOSING it the event that has to tear the widget down.
         """
-        from spyde.actions.particles_action import _brush_supported, seg_close
+        from spyde.actions.particles_action import seg_close
         session = window["window"]
         session._load_test_data_particles({"frames": 4})
-        plot, tree = self._scribble_wizard(session)
-        if not _brush_supported():
-            pytest.skip("installed anyplotlib has no brush widget (needs >= 0.5.0)")
+        plot, tree = _scribble_wizard(session)
         assert tree._seg_brush is not None
         seg_close(session, plot, {})
         assert getattr(tree, "_seg_brush", None) is None
@@ -1215,7 +1402,7 @@ class TestBrushActuallyPaints:
         session = window["window"]
         session._load_test_data_particles({"frames": 4})
         before = len(window["messages"])
-        self._scribble_wizard(session)
+        _scribble_wizard(session)
         new = window["messages"][before:]
         assert any("anyplotlib" in str(m.get("text", "")).lower()
                    or "brush" in str(m.get("text", "")).lower() for m in new), (
@@ -1240,16 +1427,17 @@ class TestPaintStateReachesTheWidget:
     """
 
     def _scribbling(self, session):
-        from spyde.actions.particles_action import seg_open, seg_set_method
+        """Load, open the caret, and select Scribble EXPLICITLY.
+
+        The extra verb is the difference from the shared `_scribble_wizard`, and
+        it is deliberate here: these tests are about what reaches the widget
+        once the strip is live, not about which verb arms it.
+        """
+        from spyde.actions.particles_action import seg_set_method
         session._load_test_data_particles({"frames": 4})
-        plots = (list(session._plots) if isinstance(session._plots, list)
-                 else list(session._plots.values()))
-        plot = next(p for p in plots
-                    if getattr(p, "signal_tree", None) is not None
-                    and getattr(p, "_plot2d", None) is not None)
-        seg_open(session, plot, {"window_id": getattr(plot, "window_id", None)})
+        plot, tree = _scribble_wizard(session)
         seg_set_method(session, plot, {"method": "scribble"})
-        return plot, plot.signal_tree
+        return plot, tree
 
     @staticmethod
     def _stroke(tree, wiz, pts):
@@ -1269,7 +1457,7 @@ class TestPaintStateReachesTheWidget:
             "nothing can ever set it and every stroke is class 0")
         assert "erase" in DEFAULTS
 
-    def test_class_comes_from_PARAMS_not_from_the_js_widget(self, window):
+    def test_class_comes_from_PARAMS_not_from_the_js_widget(self, brush_required, window):
         """The test that would have caught it. The old one did not.
 
         The first version set `brush.class_id` and read it back — both PYTHON
@@ -1285,11 +1473,9 @@ class TestPaintStateReachesTheWidget:
         So this test forces the widget's own class to be STALE and wrong, and
         asserts the stroke still lands in the class the caret asked for.
         """
-        from spyde.actions.particles_action import _brush_supported, _on_stroke, seg_tune
+        from spyde.actions.particles_action import _on_stroke, seg_tune
         session = window["window"]
         plot, tree = self._scribbling(session)
-        if not _brush_supported():
-            pytest.skip("installed anyplotlib has no brush widget (needs >= 0.5.0)")
         wiz, brush = tree._seg_wizard, tree._seg_brush
         store = wiz.label_store()
 
@@ -1307,12 +1493,10 @@ class TestPaintStateReachesTheWidget:
             f"bug: {counts}")
         assert counts.get(0, 0) == 0
 
-    def test_switching_class_retags_the_next_stroke(self, window):
-        from spyde.actions.particles_action import _brush_supported, seg_tune
+    def test_switching_class_retags_the_next_stroke(self, brush_required, window):
+        from spyde.actions.particles_action import seg_tune
         session = window["window"]
         plot, tree = self._scribbling(session)
-        if not _brush_supported():
-            pytest.skip("installed anyplotlib has no brush widget (needs >= 0.5.0)")
         wiz = tree._seg_wizard
         store = wiz.label_store()
 
@@ -1329,12 +1513,10 @@ class TestPaintStateReachesTheWidget:
         assert counts[0] > 0 and counts[1] > 0 and counts[2] > 0, (
             f"only some classes were painted: {counts}")
 
-    def test_eraser_removes_and_leaves_other_classes_alone(self, window):
-        from spyde.actions.particles_action import _brush_supported, seg_tune
+    def test_eraser_removes_and_leaves_other_classes_alone(self, brush_required, window):
+        from spyde.actions.particles_action import seg_tune
         session = window["window"]
         plot, tree = self._scribbling(session)
-        if not _brush_supported():
-            pytest.skip("installed anyplotlib has no brush widget (needs >= 0.5.0)")
         wiz = tree._seg_wizard
         store = wiz.label_store()
 
@@ -1355,12 +1537,10 @@ class TestPaintStateReachesTheWidget:
         assert after[0] < before[0], "the eraser removed nothing"
         assert after[1] == before[1], "the eraser hit a class it was not over"
 
-    def test_brush_size_reaches_the_widget_too(self, window):
-        from spyde.actions.particles_action import _brush_supported, seg_tune
+    def test_brush_size_reaches_the_widget_too(self, brush_required, window):
+        from spyde.actions.particles_action import seg_tune
         session = window["window"]
         plot, tree = self._scribbling(session)
-        if not _brush_supported():
-            pytest.skip("installed anyplotlib has no brush widget (needs >= 0.5.0)")
         seg_tune(session, plot, {"brush": 9.0})
         assert float(tree._seg_brush.radius) == pytest.approx(9.0)
 
@@ -1377,26 +1557,11 @@ class TestBrushDrawColour:
     still orange. These assert the widget state, which is the thing the eye sees.
     """
 
-    def _scribble_wizard(self, session):
-        """`seg_open` alone — see the note on the other copy of this helper:
-        calling `seg_set_method` here armed the brush that the caret never
-        asks for, which is exactly how the missing-brush bug stayed green."""
-        from spyde.actions.particles_action import seg_open
-        plots = session._plots
-        plots = list(plots.values()) if hasattr(plots, "values") else list(plots)
-        plot = next(p for p in plots
-                    if getattr(p, "signal_tree", None) is not None
-                    and getattr(p, "_plot2d", None) is not None)
-        seg_open(session, plot, {"window_id": getattr(plot, "window_id", None)})
-        return plot, plot.signal_tree
-
-    def test_selecting_a_class_changes_the_widget_class_id(self, window):
-        from spyde.actions.particles_action import _brush_supported, seg_tune
+    def test_selecting_a_class_changes_the_widget_class_id(self, brush_required, window):
+        from spyde.actions.particles_action import seg_tune
         session = window["window"]
         session._load_test_data_particles({"frames": 4})
-        plot, tree = self._scribble_wizard(session)
-        if not _brush_supported():
-            pytest.skip("installed anyplotlib has no brush widget")
+        plot, tree = _scribble_wizard(session)
         brush = getattr(tree, "_seg_brush", None)
         assert brush is not None
 
@@ -1409,7 +1574,7 @@ class TestBrushDrawColour:
         seg_tune(session, plot, {"active_class": 2})
         assert int(brush._data["class_id"]) == 2
 
-    def test_the_new_class_reaches_the_PANEL_state(self, window):
+    def test_the_new_class_reaches_the_PANEL_state(self, brush_required, window):
         """The JS draws from ``panel_<id>_json``, not from the Python object.
 
         This is the assertion the previous two miss and the reason the bug
@@ -1420,12 +1585,10 @@ class TestBrushDrawColour:
         ``brush._data`` can say 1 while every stroke still draws in class 0's
         colour. Assert the serialised panel, which is what the eye sees.
         """
-        from spyde.actions.particles_action import _brush_supported, seg_tune
+        from spyde.actions.particles_action import seg_tune
         session = window["window"]
         session._load_test_data_particles({"frames": 4})
-        plot, tree = self._scribble_wizard(session)
-        if not _brush_supported():
-            pytest.skip("installed anyplotlib has no brush widget")
+        plot, tree = _scribble_wizard(session)
 
         # Spy on the panel push. Asserting `_state` alone would be VACUOUS:
         # `overlay_widgets` holds the widget's own `_data` BY REFERENCE, so
@@ -1450,19 +1613,17 @@ class TestBrushDrawColour:
         assert brushes, f"no brush in the panel state: {widgets}"
         assert int(brushes[0].get("class_id", -1)) == 2
 
-    def test_an_unrelated_tune_does_NOT_force_a_panel_push(self, window):
+    def test_an_unrelated_tune_does_NOT_force_a_panel_push(self, brush_required, window):
         """`seg_tune` fires for every slider tick too.
 
         A full panel push re-serialises the image bytes, so doing one per tick
         on a 4096² frame would trade the colour bug for a much worse drag. Only
         an actual brush change (class / eraser / size) may pay for it.
         """
-        from spyde.actions.particles_action import _brush_supported, seg_tune
+        from spyde.actions.particles_action import seg_tune
         session = window["window"]
         session._load_test_data_particles({"frames": 4})
-        plot, _tree = self._scribble_wizard(session)
-        if not _brush_supported():
-            pytest.skip("installed anyplotlib has no brush widget")
+        plot, _tree = _scribble_wizard(session)
 
         seg_tune(session, plot, {"active_class": 1})      # settle the state
 
@@ -1501,16 +1662,13 @@ class TestBrushDrawColour:
             f"{len(pushes)} panel pushes for tunes that did not change the "
             "brush — a slider drag would re-serialise the whole image")
 
-    def test_the_widget_has_a_colour_for_every_class(self, window):
+    def test_the_widget_has_a_colour_for_every_class(self, brush_required, window):
         """`colors` is indexed by class_id in JS, so a short list means the
         later classes draw with `undefined` — no colour change on screen even
         though class_id updated correctly."""
-        from spyde.actions.particles_action import _brush_supported
         session = window["window"]
         session._load_test_data_particles({"frames": 4})
-        _plot, tree = self._scribble_wizard(session)
-        if not _brush_supported():
-            pytest.skip("installed anyplotlib has no brush widget")
+        _plot, tree = _scribble_wizard(session)
         brush = tree._seg_brush
         from spyde.particles import default_classes
         n_classes = len(default_classes())
@@ -1535,30 +1693,35 @@ class TestBatchComputingOverlay:
     loop, the chip is already up.
     """
 
-    def _plot(self, session):
-        plots = session._plots
-        plots = list(plots.values()) if hasattr(plots, "values") else list(plots)
-        return next(p for p in plots
-                    if getattr(p, "signal_tree", None) is not None
-                    and getattr(p, "_plot2d", None) is not None)
-
     def _trained_plot(self, session):
         """A plot whose caret has a trained head, via the autolabel test door."""
-        plot = self._plot(session)
+        plot = _figure_plot(session)
         pa.seg_open(session, plot, {"min_size": 25})
         assert _wait(lambda: getattr(plot.signal_tree, "_seg_wizard", None))
         wiz = plot.signal_tree._seg_wizard
         pa.seg_autolabel(session, plot, {})
-        pa.seg_train(session, plot, {})
+        # CPU explicitly — see `_opened`.
+        pa.seg_train(session, plot, {"device": "cpu"})
         assert _wait(lambda: wiz.classifier is not None
                      and wiz.classifier.is_trained), "training never finished"
         return plot
 
-    def _seg_run(self, session, **params):
-        from spyde.actions.particles_action import seg_run
-        plot = self._plot(session)
-        seg_run(session, plot, dict(params))
-        return plot
+    @staticmethod
+    def _result_window_ids(session):
+        """EVERY window of the newest tree — the result `seg_run` just opened.
+
+        Its navigator counts: the count-trace fill raises a Calculating chip of
+        its own, so "the chip is on the result" is a claim about the tree, not
+        about one plot of it.
+        """
+        result = session.signal_trees[-1]
+        plots = list(result.signal_plots) + list(pa._nav_plots(result))
+        return {getattr(p, "window_id", None) for p in plots}
+
+    @staticmethod
+    def _batch_chip_window(session):
+        """The window the BATCH's own chip is addressed to (its signal plot)."""
+        return pa._result_window_id(session.signal_trees[-1])
 
     def test_the_chip_is_raised_before_seg_run_returns(self, window):
         session = window["window"]
@@ -1570,8 +1733,7 @@ class TestBatchComputingOverlay:
         # bails early would make this pass for the wrong reason.
         plot = self._trained_plot(session)
         del msgs[:]
-        from spyde.actions.particles_action import seg_run
-        seg_run(session, plot, dict(track=False))
+        pa.seg_run(session, plot, dict(track=False))
 
         # No waiting, no polling: the chip must already be on the wire.
         raised = [m for m in msgs
@@ -1582,32 +1744,51 @@ class TestBatchComputingOverlay:
 
     def test_the_chip_names_the_RESULT_window(self, window):
         """Not the source window: the source is where you were scribbling and it
-        is not the thing sitting there looking empty."""
+        is not the thing sitting there looking empty.
+
+        This test was vacuous three times over and asserted nothing at all:
+        it ran `seg_run` on an UNTRAINED plot with `method="classical"` (which
+        `_coerce` maps to `scribble`, whose `_engine` then refuses), so the
+        handler returned before raising any chip; it cleared `msgs`, which IS
+        `window["messages"]`, deleting the very chip it went on to look for; and
+        its only assertion sat behind `if all_ids:`, so an empty list passed.
+        """
         session = window["window"]
         msgs = window["messages"]
         session._load_test_data_particles({"frames": 4})
-        src = self._seg_run(session, method="classical", track=False)
+        src = self._trained_plot(session)
         del msgs[:]
+        pa.seg_run(session, src, dict(track=False))
 
-        raised = [m for m in window["messages"]
-                  if m.get("type") == "window_computing"]
-        # Re-read from the full list: the run may already have finished.
-        all_ids = {m.get("window_id") for m in raised}
-        src_id = getattr(src, "window_id", None)
-        if all_ids:
-            assert all_ids != {src_id}, (
-                "the chip was put on the SOURCE window, not the result")
+        raised = {m.get("window_id") for m in msgs
+                  if m.get("type") == "window_computing" and m.get("computing")}
+        assert raised, "no Calculating chip was raised at all"
+        assert self._batch_chip_window(session) in raised, \
+            "the batch raised no chip on the result's signal window"
+        assert raised <= self._result_window_ids(session), (
+            f"a chip went to a window outside the result tree: "
+            f"{sorted(raised - self._result_window_ids(session))}")
+        assert getattr(src, "window_id", None) not in raised, (
+            "the chip was put on the SOURCE window — that is where you were "
+            "scribbling, not the window sitting there looking empty")
 
     def test_the_chip_comes_down_when_the_batch_ends(self, window):
         session = window["window"]
         msgs = window["messages"]
         session._load_test_data_particles({"frames": 4})
+        plot = self._trained_plot(session)
         del msgs[:]
-        self._seg_run(session, method="classical", track=False)
+        pa.seg_run(session, plot, dict(track=False))
+        chip = self._batch_chip_window(session)
 
+        # FILTERED BY WINDOW, and by the BATCH's window specifically: the result
+        # tree's navigator raises and lowers a chip of its own for the count-
+        # trace fill, so an unfiltered wait would pass on that one instead —
+        # green whether or not the batch ever cleared its own.
         assert _wait(lambda: any(
             m.get("type") == "window_computing" and not m.get("computing")
-            for m in msgs), timeout=180), (
+            and m.get("window_id") == chip
+            for m in msgs), timeout=30), (
             "the Calculating chip never came down — it will spin forever over a "
             "window that has finished")
 
@@ -1634,9 +1815,6 @@ class TestPreviewWindowBoxLifecycle:
 
     @staticmethod
     def _wiz():
-        import types
-        import spyde.actions.particles_action as pa
-
         class _Grp:                     # hashable by identity, unlike SimpleNamespace
             def __init__(self, name):
                 self.name, self.removed = name, False
@@ -1648,25 +1826,38 @@ class TestPreviewWindowBoxLifecycle:
             def add_polygons(self, *a, **k):
                 return _Grp(k.get("name"))
 
-        wiz = object.__new__(pa.SegmentWizard)
-        wiz._ov_group = None
-        wiz._ov_box_group = None
-        wiz.src_plot = types.SimpleNamespace(_plot2d=_P2D())
+        wiz = _bare_wizard(_P2D())
         wiz.frames = lambda: (1, lambda i: np.zeros((2048, 2048), np.float32),
                               (2048, 2048))
         wiz.frame_index = lambda: 0
         return wiz
 
-    def test_box_is_drawn_with_no_engine(self, monkeypatch):
+    def test_the_box_is_CLEARED_not_drawn_with_no_engine(self, monkeypatch):
+        """The box is gone by design on this branch, and this is where it shows.
+
+        It existed to admit that only the middle megapixel of a large frame had
+        been looked at. The mask-only preview raised that budget to
+        `_PREVIEW_PIXEL_BUDGET_MASK` — a whole 4096² frame — so there is no
+        untouched remainder left to disclaim, and drawing a 1-megapixel
+        rectangle over data the preview does NOT stop at would be the same lie
+        in the other direction. `set_mask_overlay` clears it for the same
+        reason, and the crop that survives above the mask budget is still
+        reported in text (`preview_box` in the `seg_preview` payload).
+
+        So what this class pins is unchanged in substance — the box must not
+        depend on an ENGINE — only the box is now consistently ABSENT rather
+        than consistently present.
+        """
         import spyde.actions.particles_action as pa
         pushed = {}
         monkeypatch.setattr(pa, "_push_groups", lambda p, u: pushed.update(
             {g.name: pl.get("vertices_list") for g, pl in u.items()}))
         self._wiz().show_preview_window()
-        box = pushed.get("seg_preview_window")
-        assert box, "no preview-window box without an engine — the untrained " \
-                    "Scribble/Prompt states show nothing at all"
-        assert len(box[0]) >= 4, "the box is not a closed rectangle"
+        assert "seg_preview_window" in pushed, (
+            "the window group was not pushed at all, so a box left over from a "
+            "previous engine would still be on screen")
+        assert pushed["seg_preview_window"] == [], (
+            f"a preview-window box was drawn: {pushed['seg_preview_window']}")
 
     def test_switching_to_an_untrained_engine_clears_stale_outlines(self, monkeypatch):
         """A previous engine's instances must not linger looking like the new
@@ -1750,16 +1941,7 @@ class TestRasterOverlayAboveThreshold:
                (int(st.get("base_height") or 0) or int(st["image_height"]))
         return len(base64.b64decode(b64)), want
 
-    @staticmethod
-    def _wiz(p2d):
-        import types
-        import spyde.actions.particles_action as pa
-        w = object.__new__(pa.SegmentWizard)
-        w._ov_group = None
-        w._ov_box_group = None
-        w._ov_raster = False
-        w.src_plot = types.SimpleNamespace(_plot2d=p2d)
-        return w
+    _wiz = staticmethod(_bare_wizard)
 
     @staticmethod
     def _labels():
@@ -1822,9 +2004,7 @@ class TestRasterOverlayAboveThreshold:
         import spyde.actions.particles_action as pa
         assert pa._RASTER_ABOVE > 1
         p = self._p2d()
-        wiz = self._wiz(p)
-        wiz._ov_cleared = False
-        wiz._ov_box_state = None
+        wiz = self._wiz(p)          # `_bare_wizard` sets the overlay state
         contours = [np.zeros((3, 2), np.int16) for _ in range(3)]
         wiz.set_overlay(contours, None, labels=self._labels(),
                         full_shape=(4096, 4096))

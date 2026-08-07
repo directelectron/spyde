@@ -81,10 +81,13 @@ class TestCloseListsCoverThisFeature:
 
     @pytest.mark.parametrize("attr", [
         "particles", "_seg_pending_particles", "particle_events",
-        "particle_edits", "nav_traces", "drift", "nav_map",
+        "particle_edits", "nav_traces", "drift", "nav_map", "_seg_batch_running",
     ])
     def test_new_results_are_cleared(self, attr):
-        assert attr in self._close_src(), f"{attr} survives tree.close()"
+        # Match the quoted token, not a bare substring: "particles" is also a
+        # substring of "_seg_pending_particles" and "drift" of "_drift_wizard",
+        # so `attr in src` can pass even when `attr` itself is never listed.
+        assert f'"{attr}"' in self._close_src(), f"{attr} survives tree.close()"
 
     @pytest.mark.parametrize("attr", ["source_node", "source_tree"])
     def test_back_references_to_the_source_are_cleared(self, attr):
@@ -183,10 +186,8 @@ class TestPendingParticlesTeardown:
         tree._seg_batch_running = True
         assert seg_batch_running(session)
         tree.close()
-        try:
-            session.signal_trees.remove(tree)
-        except ValueError:
-            pass
+        assert not getattr(tree, "_seg_batch_running", False), (
+            "close() did not clear _seg_batch_running")
         assert not seg_batch_running(session), (
             "a closed tree still reports a running segmentation batch")
 
