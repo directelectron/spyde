@@ -1,5 +1,6 @@
 # electron-builder — packages the SpyDE Electron app together with a uv-managed
-# Python sidecar (DISTRIBUTION_PLAN.md "Option A"). See electron/PACKAGING.md.
+# Python sidecar (staged by scripts/bundle-python.mjs, booted by
+# src/main/pythonEnv.ts).
 #
 # The Electron app is the shell; the Python backend (spyde) runs as a sidecar
 # spawned over stdio. The installer stays small: it ships `uv` + the project
@@ -45,7 +46,8 @@ mac:
   # payload; the dmg stays for first-time manual installs.
   target: [dmg, zip]
   icon: ../spyde/Spyde.png
-  # Code signing + notarization — see SIGNING.md. The Developer ID Application cert
+  # Code signing + notarization — the full cert/secret setup walkthrough lives in
+  # .github/workflows/verify_signing_secrets.yml. The Developer ID Application cert
   # is imported into the CI keychain by release.yml's "Import Apple signing
   # certificate" step; electron-builder auto-selects it. hardenedRuntime + the
   # entitlements below are REQUIRED for notarization; disable-library-validation in

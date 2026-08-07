@@ -20,8 +20,8 @@ and get an IPF map.
 Everything downstream of the fit is literally shared code: the result is packed
 into a :class:`~spyde.signals.orientation_map.SpyDEOrientationMap`, so the IPF
 colouring, the 3-D IPF explorer, the point selector and the direction toggle
-built for 4D-STEM all work here untouched. That reuse is the reason Wave 3's
-display half is small (RELEASE_0_3_0_PLAN.md, 3.5).
+built for 4D-STEM all work here untouched. That reuse is the reason the
+display half of this module is small.
 
 The compute lives in :mod:`spyde.ebsd` (dictionary indexing, refinement,
 preprocessing, band geometry); this module is only the interactive wiring.

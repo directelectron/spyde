@@ -12,9 +12,8 @@ Operates on the sparse `(kx, ky, intensity)` peaks of a
      soft-assign + no-match-sink cost (robust to missing/spurious peaks). The
      2×2 affine `A` yields orientation + strain directly.
 
-Design & validation: `VECTOR_ORIENTATION_MAPPING_PLAN.md` §7b–7d. Validated on
-synthetic known-strain sets and real sped_ag (residual ~1.4 px, strain ~2-3%,
-~42 ms/pattern).
+Validated on synthetic known-strain sets and real sped_ag (residual ~1.4 px,
+strain ~2-3%, ~42 ms/pattern) — see `spyde/tests/benchmark_vector_orientation.py`.
 
 No Qt imports — importable on dask workers and in tests. The matching primitives
 reuse the dense OM library generation in `orientation_compute.py`.
@@ -503,7 +502,7 @@ class VectorOrientationResult:
 
         The per-pattern strain has a ~0.02 noise floor (peak-finding limited).
         Neighbouring positions share the true strain, so field-level denoising
-        recovers it. Benchmark (plan §7h, benchmarks.md):
+        recovers it. Benchmarked (harness: ``spyde/tests/benchmark_vector_orientation.py``):
 
           - ``method="tv"`` (default) — total-variation (Chambolle). Most robust;
             the gap over the raw fit *widens* with noise/dropout (6x better at

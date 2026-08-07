@@ -9,7 +9,7 @@ single-frame navigator read stays near ~64 MB regardless of frame resolution:
   * a small diffraction pattern → many frames per chunk (capped),
   * an already-well-chunked self-describing dataset → no rebuild (returns None).
 
-See benchmarks.md "In-situ movie playback" for why: the reader chunks 8 frames ×
+Why: the reader chunks 8 frames ×
 full 4096² = a 128 MB read per single frame, and the old flat nav_chunk=32 made
 it worse.
 """

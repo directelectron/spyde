@@ -4,9 +4,11 @@ Everything a toolbar button, caret, or wizard does goes through this package.
 This document is the contract: the action shapes, the two dispatch paths, the
 lifecycle every action follows, and the step-by-step for adding a new one.
 Copyable skeletons live in [`_template_action.py`](_template_action.py) (kept
-compiling by `test_template_skeletons.py`). The plan for running these same
-actions from scripts and Jupyter notebooks (function ↔ anywidget ↔ toolbar
-parity) lives in [`NOTEBOOK_PARITY_PLAN.md`](../../NOTEBOOK_PARITY_PLAN.md).
+compiling by `test_template_skeletons.py`). These same actions are designed to
+run from scripts and Jupyter notebooks too (function ↔ anywidget ↔ toolbar
+parity): every host returns the same `spyde.signals` result objects and resolves
+wizard parameter schemas via `registry.wizard_parameters(key)` — see
+`spyde/api.py` and `spyde/signals/`.
 
 ## 1. The action taxonomy
 
@@ -140,7 +142,7 @@ is a single 2-D plot); that is a documented no-op, not an error.
    in `registry._WIZARD_SCHEMAS`, so any host (the Electron caret, a notebook
    form, `spyde.api` docs) resolves it via `registry.wizard_parameters(key)`.
    One source of truth; drift against handler `DEFAULTS` is caught by
-   `test_wizard_schemas.py`. (Three-host parity: `NOTEBOOK_PARITY_PLAN.md` §6.)
+   `test_wizard_schemas.py`.
 3. Register the stages in `registry.STAGED_HANDLERS`.
 3. Add the caret component on the renderer (see §5) and, if it's opened from
    a toolbar button, a `toolbars.yaml` entry whose `function` is a no-op

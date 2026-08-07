@@ -6,8 +6,6 @@ Two layers:
     synthetic spot sets with known transforms — fast, no library generation.
   - one integration test building a small Ag FCC library and recovering a known
     orientation + strain from simulated vectors.
-
-Design: VECTOR_ORIENTATION_MAPPING_PLAN.md §7c-7d.
 """
 import numpy as np
 import pytest

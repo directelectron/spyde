@@ -1,5 +1,5 @@
 """
-test_api_layer.py — the spyde.api script-parity contract (NOTEBOOK_PARITY_PLAN §5).
+test_api_layer.py — the spyde.api script-parity contract (script ↔ Jupyter ↔ SpyDE).
 
 Guards three things:
 

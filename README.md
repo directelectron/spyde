@@ -33,7 +33,9 @@ All releases: <https://github.com/CSSFrancis/spyde/releases>
 **First launch** sets up the Python analysis environment (including the
 GPU-correct PyTorch wheel) with `uv`. This needs a network connection and may
 take a few minutes; progress shows in the app's log panel. Subsequent launches
-are instant. See [`electron/PACKAGING.md`](electron/PACKAGING.md) for how this works.
+are instant. (How it works: the installer ships `uv` + the locked project source;
+see the header comments in [`electron/src/main/pythonEnv.ts`](electron/src/main/pythonEnv.ts)
+and [`electron/scripts/bundle-python.mjs`](electron/scripts/bundle-python.mjs).)
 
 > macOS builds are **signed + notarized** (they open without a Gatekeeper prompt).
 > Windows installers are currently **unsigned** — SmartScreen may warn: "More
@@ -80,7 +82,7 @@ npm run dist        # build → stage Python sidecar → electron-builder
 npm run dist:dir    # unpacked (faster, for smoke-testing the bundle)
 ```
 
-Artifacts land in `electron/dist/`. See [`electron/PACKAGING.md`](electron/PACKAGING.md).
+Artifacts land in `electron/dist/` (config: [`electron/electron-builder.yml`](electron/electron-builder.yml)).
 
 
 Releasing a new version

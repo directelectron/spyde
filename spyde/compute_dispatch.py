@@ -12,8 +12,7 @@ dispatcher takes over placement: per-nav-chunk slices are submitted with
 and every completion pulls the next chunk from the shared pending queue,
 so both lanes drain the same pool and finish together.
 
-Hard-won rules baked in (measured on the 60 GB benchmark — see
-benchmarks.md):
+Hard-won rules baked in (measured end-to-end on the 60 GB benchmark):
   - `scheduler_info(n_workers=-1)` everywhere (default truncates to 5!).
   - allow_other_workers=True: hard pins deadlock when a worker restarts.
   - Futures are HELD until the end (mid-run release of graphs that share
@@ -366,7 +365,7 @@ def dispatch_chunks(
             # through the back door. It scaled with dataset size, so it looked
             # like "big datasets use one worker".
             #
-            # Unbounded is measured-safe here: benchmarks.md has bounded at
+            # Unbounded is measured-safe here: bounded came in at
             # 46-50 s against unbounded at 50.2 s on the 977-chunk movie —
             # within noise. And distributed >=2022.3 QUEUES root tasks at the
             # scheduler (worker-saturation), which is this window's stated job

@@ -1,7 +1,7 @@
 """
 test_wizard_schemas.py — every wizard declares a valid parameter schema.
 
-The three-host parity contract (NOTEBOOK_PARITY_PLAN §6) requires ONE source
+The three-host parity contract (script ↔ Jupyter ↔ SpyDE) requires ONE source
 of truth for each wizard's parameters, resolvable host-agnostically via
 ``registry.wizard_parameters(key)`` and expressed in the toolbars.yaml
 ``parameters:`` dict spec. This suite enforces:

@@ -32,7 +32,7 @@ Slow benchmarks live in `spyde/tests/benchmark_*.py` — run directly (`python -
 
 **Run the Electron e2e (Playwright):** from `electron/`, `npm test` (or `npm run test:build` to build first).
 
-**Build distributable:** from `electron/`, `npm run dist` (electron-vite build + `bundle:python` + electron-builder). See `electron/electron-builder.yml` and `DISTRIBUTION_PLAN.md`.
+**Build distributable:** from `electron/`, `npm run dist` (electron-vite build + `bundle:python` + electron-builder). See `electron/electron-builder.yml`.
 
 **Commits:** do NOT add Claude/AI as a co-author. Commit messages must not include a `Co-Authored-By: Claude …` (or `Claude-Session`) trailer. (Enforced via `includeCoAuthoredBy: false` + empty `attribution` in `~/.claude/settings.json`.)
 
@@ -186,7 +186,7 @@ at chunk boundaries (partial-signal sums).
   when the reader split the signal axes.
 - **NEVER call `.rechunk()` on the full dataset to fix chunking** — that shuffles
   the entire multi-GB array through the scheduler. Storage-chunk *alignment* (load
-  with the right chunks) beats any after-the-fact rechunk; see `benchmarks.md`
+  with the right chunks) beats any after-the-fact rechunk
   (419 s vs 184 s when a "better" rechunk misaligned the ghost blocks).
 - Batch computes (`_do_compute_vectors`, orientation) keep the stored chunking
   when it's already usable rather than rechunking to a theoretical optimum.
@@ -435,7 +435,7 @@ poll for the cheap nav path. This is the fast common case and stays fully synchr
   _patch_cached_dask_client()` (applied in `ensure_heavy_imports`) removes that
   fallback so `_client = None` truly selects the synchronous branch. Tests never
   caught it because they run `SPYDE_NO_DASK=1` (no default client). See
-  `test_cache_client_patch.py`; measured numbers in `benchmarks.md`.
+  `test_cache_client_patch.py`.
 - **Latest-wins — cheap vs expensive:** for a **cheap** read the serial dispatcher
   coalesces by `id(selector)`, so a superseded position is dropped from the pending slot
   before it ever runs — no in-flight compute to cancel. For an **expensive** read the
@@ -513,7 +513,7 @@ The hot paths (vector finding, vector orientation mapping) are GPU-accelerated. 
 
 **Always benchmark on a real dataset at real scale, end-to-end.** The canonical target is `pyxem.data.sped_ag()` — 208×64 = 13,312 patterns of 112×112 (a real 4D-STEM SpEd Ag scan). Synthetic 4×4 fixtures validate *correctness* but hide the costs that actually bite (per-Python-loop overhead, Vmax-padding blowup, library size). A method that's instant on 16 patterns can be minutes on 13k.
 
-- Existing harnesses live in `spyde/tests/benchmark_*.py` (run directly with `python -m spyde.tests.benchmark_<name>`, not under pytest — they're slow). `benchmark_vector_orientation.py` builds the Ag library + sped_ag vectors and is the reference for the OM path. `benchmarks.md` records the numbers.
+- Existing harnesses live in `spyde/tests/benchmark_*.py` (run directly with `python -m spyde.tests.benchmark_<name>`, not under pytest — they're slow). `benchmark_vector_orientation.py` builds the Ag library + sped_ag vectors and is the reference for the OM path.
 - **Time each stage separately** (vector finding / library build / orientation fit) — the user's "it's slow" is usually one stage, and conflating them hides the real bottleneck. Print `progress(done, total)` with timestamps to see whether a stage is progressing or genuinely stuck.
 - For GPU timing, `torch.cuda.synchronize()` before/after the timed region (kernels are async) and **discard the first run** (cold CUDA init + kernel JIT is a one-time ~5s cost; report the warm steady-state too).
 - `torch`-CUDA work **segfaults under the pytest process on Windows** (a harness interaction, not a code bug — it runs fine in plain Python and in the real app). So: run GPU correctness tests in a **subprocess** that prints a JSON result (see `test_vector_orientation_gpu.py`), and `os._exit(0)` after printing to skip the torch/CUDA teardown crash. GUI tests that exercise the *wiring* should force the CPU path (`monkeypatch gpu_available → False`).

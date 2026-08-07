@@ -1,7 +1,7 @@
 """SpyDE's self-contained result/signal containers.
 
 These classes are the currency of the three-host parity contract
-(NOTEBOOK_PARITY_PLAN.md): the app's actions, `spyde.api` scripts, and future
+(script ↔ Jupyter ↔ SpyDE): the app's actions, `spyde.api` scripts, and future
 notebook wizards all return THE SAME objects, which import no backend/drawing
 code and are constructible + saveable standalone.
 """

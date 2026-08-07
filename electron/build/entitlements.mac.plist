@@ -4,7 +4,8 @@
 <dict>
   <!--
     Hardened-runtime entitlements for the SpyDE .app. Required once mac.hardenedRuntime
-    is enabled (which notarization requires). See SIGNING.md for the full setup.
+    is enabled (which notarization requires). Full signing setup:
+    .github/workflows/verify_signing_secrets.yml.
 
     Why each one:
       allow-jit / allow-unsigned-executable-memory

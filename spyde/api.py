@@ -28,8 +28,10 @@ Design rules (enforced by ``test_api_layer.py``):
   compute can use one; without it computes fall back to the local threaded
   scheduler.
 
-The three-host parity contract (script ↔ Jupyter ↔ SpyDE) is documented in
-``NOTEBOOK_PARITY_PLAN.md``.
+The three-host parity contract (script ↔ Jupyter ↔ SpyDE): every host returns
+THE SAME result objects (``spyde.signals``) and resolves wizard parameter
+schemas through ``spyde.actions.registry.wizard_parameters(key)`` — one source
+of truth for functions, notebook forms and the app's carets alike.
 """
 from __future__ import annotations
 

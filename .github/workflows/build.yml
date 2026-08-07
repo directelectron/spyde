@@ -323,5 +323,6 @@ jobs:
           path: electron/playwright-report/
           if-no-files-found: ignore
 
-# NOTE: packaging the desktop app (electron-builder + the uv Python sidecar) is
-# a separate, tag-triggered release workflow — see electron/PACKAGING.md.
+# NOTE: packaging the desktop app (electron-builder + the uv Python sidecar) is a
+# separate, tag-triggered release workflow — see .github/workflows/release.yml. It
+# is not wired here because it needs per-OS signing secrets / vendored uv binaries.

@@ -164,7 +164,7 @@ class _MoviePrefetcher:
     """Warm the OS page cache for the frames a movie scrub is about to reach.
 
     A cold single-frame read of a large in-situ movie is disk-bound (~50 ms);
-    once the file pages are in the OS cache a re-read is ~18 ms (benchmarks.md).
+    once the file pages are in the OS cache a re-read is ~18 ms.
     After the navigator paints frame ``t`` this reads a few upcoming frames
     (``t±1 … t±radius``) on a single background daemon thread, purely to trigger
     the page-in — so a steady scrub/playback finds each next frame already warm.
@@ -1173,7 +1173,7 @@ def update_from_navigation_selection(
             # frame/chunk → each move is a ~cold read of just that frame. This
             # matches the OLD distributed path's speed WITHOUT the scheduler
             # round-trip, the shm buffer, the client pinning, or the
-            # _inflight_getinds juggling — see benchmarks.md "unified read".
+            # _inflight_getinds juggling.
             #
             # Serial-only: the cache's block bookkeeping is not concurrency-safe
             # ("ValueError: (i, j) is not in list"); the dispatcher already
@@ -1215,7 +1215,7 @@ def update_from_navigation_selection(
             # frame dtype: a no-op on a single point's values, and the correct
             # rounded integer mean for a region — so the DP navigator shows the
             # SAME uint16 frame (same memory + contrast) it did before. Float
-            # sources keep their (un-rounded) mean. (benchmarks.md rounding gotcha.)
+            # sources keep their (un-rounded) mean. (Pinned by test_nav_cached_read.py.)
             with _prof.stage("dtype"):
                 try:
                     src_dtype = getattr(current_signal.data, "dtype", None)
@@ -1240,7 +1240,7 @@ def update_from_navigation_selection(
 
             # Read-ahead prefetch for a MOVIE scrub: warm the OS page cache for
             # the next few frames so the following move finds them warm (~18 ms
-            # vs ~50 ms cold — benchmarks.md). Only for a 1-D (time) navigator on
+            # vs ~50 ms cold). Only for a 1-D (time) navigator on
             # a crosshair (single point): a 4D-STEM scan dwells in-chunk so its
             # cache already covers neighbours, and an integrating region has no
             # single "next frame". Reads the RAW dask array (not the CachedDaskArray)

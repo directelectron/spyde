@@ -1,7 +1,7 @@
 /**
  * pythonEnv.ts — resolve (and on first run, create) the Python sidecar env.
  *
- * DISTRIBUTION_PLAN.md "Option A" (uv-managed): the installer ships a tiny
+ * The uv-managed distribution model: the installer ships a tiny
  * payload — the bundled `uv`, the project (`pyproject.toml` + `uv.lock`) and the
  * `spyde` source — under <resources>/python. On first launch we run
  * `uv sync` into a venv in the user's WRITABLE data dir (the app bundle is

@@ -4,7 +4,7 @@ The architecture/inference code (``unet``, ``preprocess``, ``decode``, ``infer``
 is a self-contained copy of the ``yoloDiffraction`` research project so SpyDE ships
 and runs without it. ``registry`` resolves which checkpoint to load — a bundled
 default now, with additional/upgraded models registered (and Hugging-Face-hosted)
-later, see ``RELEASING.md``.
+later; the ship-a-revised-model contract is in ``registry``'s module docstring.
 
 Typical use from the find-vectors detector:
 
