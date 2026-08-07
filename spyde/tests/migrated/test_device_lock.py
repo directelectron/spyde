@@ -365,6 +365,45 @@ class TestZeroThreeZeroPathsTakeLock:
             rng.normal(size=(3, 3, 6, 6)).astype("float32"), device="cpu")
         assert seen, "ADP ran unserialised"
 
+    def test_the_band_simulator_upload_locks(self, monkeypatch):
+        """``BandSimulator.__init__`` uploads the detector geometry to the
+        device — and both ``simulate_dictionary`` and ``refine_orientations``
+        construct it BEFORE their per-chunk locks, so it was the one EBSD
+        call site that submitted to Metal unserialised (the macOS-CI SIGABRT
+        at the ebsd_wizard tests)."""
+        pytest.importorskip("torch")
+        from spyde.ebsd import refine
+
+        seen = self._spy(monkeypatch, refine)
+        refine.BandSimulator((8, 8), device="cpu")
+        assert seen, "BandSimulator uploaded to the device unserialised"
+
+    def test_simulate_dictionary_locks(self, monkeypatch):
+        """The dictionary build runs on the ebsd-build-dictionary worker
+        thread while the previous wizard's band overlay may still be matching
+        — every one of its submissions must serialise."""
+        pytest.importorskip("torch")
+        from spyde.ebsd import indexing, refine
+
+        seen = self._spy(monkeypatch, indexing)
+        seen_ctor = self._spy(monkeypatch, refine)
+        out = indexing.simulate_dictionary(
+            np.zeros((3, 3)), detector=(8, 8), device="cpu")
+        assert out.shape == (3, 8, 8)
+        assert seen, "dictionary simulation submitted unserialised"
+        assert seen_ctor, "its BandSimulator construction submitted unserialised"
+
+    def test_refine_orientations_locks(self, monkeypatch):
+        pytest.importorskip("torch")
+        from spyde.ebsd import refine
+
+        seen = self._spy(monkeypatch, refine)
+        rng = np.random.default_rng(0)
+        refine.refine_orientations(
+            rng.normal(size=(2, 8, 8)).astype("float32"), np.zeros((2, 3)),
+            detector=(8, 8), device="cpu", steps=2)
+        assert seen, "refinement submitted unserialised"
+
 
 def _fit_a_tiny_model(**kw):
     """A 4-position fit, small enough to be instant on the CPU."""

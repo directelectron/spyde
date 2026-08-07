@@ -105,10 +105,19 @@ class BandSimulator:
         refl = reflectors if reflectors is not None else cubic_reflectors()
         r = detector_directions(detector, pc).reshape(-1, 3)
         self.reflectors = refl
-        self.r = torch.as_tensor(r, dtype=dtype, device=device)
-        self.normals = torch.as_tensor(refl.normals, dtype=dtype, device=device)
-        self.weights = torch.as_tensor(refl.weights, dtype=dtype, device=device)
-        self.widths = torch.as_tensor(refl.widths, dtype=dtype, device=device)
+        # Under the lock like every other device submission (device_lock.py):
+        # these uploads are Metal blits, and BOTH simulate_dictionary and
+        # refine_orientations construct the simulator BEFORE their per-chunk
+        # locks — so on MPS this was the one EBSD call site that submitted
+        # unserialised, concurrent with any live band-overlay match.
+        with accelerator_lock(device):
+            self.r = torch.as_tensor(r, dtype=dtype, device=device)
+            self.normals = torch.as_tensor(refl.normals, dtype=dtype,
+                                           device=device)
+            self.weights = torch.as_tensor(refl.weights, dtype=dtype,
+                                           device=device)
+            self.widths = torch.as_tensor(refl.widths, dtype=dtype,
+                                          device=device)
         self.shape = tuple(detector)
         self.device = device
         self.dtype = dtype
