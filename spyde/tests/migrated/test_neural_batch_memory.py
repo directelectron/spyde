@@ -28,6 +28,15 @@ import subprocess
 import sys
 import textwrap
 
+import pytest
+
+from spyde.actions.vector_orientation_gpu import gpu_available
+
+# In-process predicate (same decision test_vector_orientation_gpu.py makes):
+# a full torch-importing probe subprocess cost ~4 s only to decide skip.
+pytestmark = pytest.mark.skipif(
+    not gpu_available(), reason="no CUDA device available in this environment")
+
 _DRIVER = textwrap.dedent(r"""
     import json, sys, os
     import numpy as np
@@ -50,14 +59,7 @@ _DRIVER = textwrap.dedent(r"""
     mode = sys.argv[1]
     out = {}
 
-    if mode == "check_cuda":
-        import torch
-        out["cuda"] = bool(torch.cuda.is_available())
-        print("RESULT_JSON", json.dumps(out))
-        sys.stdout.flush()
-        os._exit(0)
-
-    elif mode == "scaling":
+    if mode == "scaling":
         import torch
         from spyde import models
 
@@ -128,11 +130,6 @@ def _run(mode, timeout=300):
 
 class TestNeuralBatchMemory:
     def test_peak_memory_scales_with_batch_not_stack_size(self):
-        cuda = _run("check_cuda")
-        if not cuda["cuda"]:
-            import pytest
-            pytest.skip("no CUDA device available in this environment")
-
         out = _run("scaling")
         assert out["peak_small_bytes"] > 0
         assert out["peak_large_bytes"] > 0
