@@ -78,6 +78,19 @@ jobs:
       # DaskManager.shutdown() sleeping 0.5s per Session teardown; see
       # test_dask_shutdown_fast.py.
       - name: Run tests
+        # NUMBA_BOUNDSCHECK=1 on the legs where numba/llvmlite (0.65.1 AND
+        # 0.66.0) MISCOMPILES the particle kernels: cp310/cp311 wheels on every
+        # OS, and macOS on every python. Uninstrumented builds corrupt the heap
+        # (0xc0000374 / SIGABRT in hull/intensity/contours/instances — wherever
+        # the corruption is DETECTED, the corruptor is the compiled kernel);
+        # the minimal pair on a Windows py3.11 venv: cold compile crashes,
+        # cold compile with boundscheck passes 13/13 with ZERO bounds
+        # violations — the kernels' indexing is in-bounds, the instrumented
+        # codegen is what dodges the miscompile. The shipped app is unaffected
+        # (the payload pins Python 3.12, a clean leg). Remove when a fixed
+        # numba lands and these legs run clean without it.
+        env:
+          NUMBA_BOUNDSCHECK: ${{ (matrix.python-version == '3.10' || matrix.python-version == '3.11' || startsWith(matrix.os, 'macos')) && '1' || '0' }}
         run: uv run pytest spyde/tests/migrated ${{ (matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12') && '--cov=spyde --cov-report=xml' || '' }}
 
       - name: Upload coverage to Codecov
