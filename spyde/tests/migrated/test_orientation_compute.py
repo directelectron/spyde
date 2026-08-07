@@ -70,6 +70,33 @@ def library():
     )
 
 
+def _reference_calibration_signal():
+    """Blank signal carrying the one signal-axis geometry every signal in
+    this module shares (KYxKX at SCALE, calibration.center=None)."""
+    s = hs.signals.Signal2D(np.zeros((KY, KX), dtype=np.float32))
+    s.set_signal_type("electron_diffraction")
+    for ax in s.axes_manager.signal_axes:
+        ax.scale = SCALE
+        ax.units = "A^-1"
+    s.calibration.center = None
+    return s
+
+
+@pytest.fixture(scope="module")
+def matching_cache(library):
+    """Module-scoped polar-geometry + template cache.
+
+    Rebuilding this cache (signal.calibration.get_slices2d + the polar
+    templates) is the dominant cost of every _do_compute_orientations call
+    (~7 s), while the cache itself is geometry- and library-dependent only
+    (build_matching_cache docstring) — and every signal in this module shares
+    one geometry.  Injecting it via the existing ``cache=`` kwarg is
+    behaviour-preserving: the dict is exactly what the call would rebuild.
+    (The no-cache branch stays exercised in-suite through the GUI om_run
+    path — orientation_action.py passes no cache.)"""
+    return build_matching_cache(_reference_calibration_signal(), library)
+
+
 def _render_pattern(coords, intensities, inplane_deg=0.0):
     """Draw gaussian spots for (kx, ky) Å^-1 coords on a KYxKX grid,
     optionally rotated in-plane by inplane_deg."""
@@ -166,14 +193,15 @@ class TestPyxemConsistency:
     orientation recovery is pyxem's own concern and needs realistic
     patterns; synthetic spot renders are too degenerate to test it.)"""
 
-    def test_rows_and_quats_match_pyxem(self, library):
+    def test_rows_and_quats_match_pyxem(self, library, matching_cache):
         quats_t, _ = template_tables(library)
         phase = sim_phases_list(library)[0]
         rng = np.random.default_rng(0)
         picks = rng.choice(len(quats_t), size=4, replace=False)
         s = _make_signal_from_templates(library, picks, nav_shape=(2, 2))
 
-        om = _do_compute_orientations(s, library, PARAMS, None, None)
+        om = _do_compute_orientations(s, library, PARAMS, None, None,
+                                      cache=matching_cache)
 
         assert isinstance(om, SpyDEOrientationMap)
         assert om.nav_shape == (2, 2) and om.n_best == 3
@@ -203,7 +231,7 @@ class TestPyxemConsistency:
             # TestResolveQuaternions on non-degenerate constructions.
             _ = ref_quats
 
-    def test_inplane_delta(self, library):
+    def test_inplane_delta(self, library, matching_cache):
         """Rotating the pattern in-plane by delta must rotate the recovered
         orientation by ~delta about the beam axis — a convention-free check
         that the in-plane angle is composed correctly."""
@@ -224,16 +252,18 @@ class TestPyxemConsistency:
             ax.scale = SCALE
         s.calibration.center = None
 
-        om = _do_compute_orientations(s, library, PARAMS, None, None)
+        om = _do_compute_orientations(s, library, PARAMS, None, None,
+                                      cache=matching_cache)
         mis = _misorientation_deg(om.quats[0, 0, 0], om.quats[0, 1, 0],
                                   phase)
         assert abs(mis - delta) < 3.0, (
             f"in-plane delta {delta} deg recovered as {mis:.1f} deg"
         )
 
-    def test_correlation_sorted_and_positive(self, library):
+    def test_correlation_sorted_and_positive(self, library, matching_cache):
         s = _make_signal_from_templates(library, [3, 11], nav_shape=(1, 2))
-        om = _do_compute_orientations(s, library, PARAMS, None, None)
+        om = _do_compute_orientations(s, library, PARAMS, None, None,
+                                      cache=matching_cache)
         c = om.corr
         assert (np.diff(c, axis=-1) <= 1e-6).all(), "corr not best-first"
         assert (c[..., 0] > 0).all()
@@ -241,14 +271,15 @@ class TestPyxemConsistency:
 
 class TestChunkingAndMemory:
 
-    def test_chunked_equals_single_chunk(self, library):
+    def test_chunked_equals_single_chunk(self, library, matching_cache):
         quats, _ = template_tables(library)
         rng = np.random.default_rng(1)
         picks = rng.choice(len(quats), size=8, replace=False)
         s_np = _make_signal_from_templates(library, picks, nav_shape=(2, 4))
 
         om_single = _do_compute_orientations(s_np, library, PARAMS,
-                                             None, None)
+                                             None, None,
+                                             cache=matching_cache)
 
         s_lazy = hs.signals.Signal2D(
             da.from_array(np.asarray(s_np.data), chunks=(1, 2, KY, KX))
@@ -258,14 +289,15 @@ class TestChunkingAndMemory:
             ax.scale = SCALE
         s_lazy.calibration.center = None
         om_chunked = _do_compute_orientations(s_lazy, library, PARAMS,
-                                              None, None)
+                                              None, None,
+                                              cache=matching_cache)
 
         np.testing.assert_allclose(om_chunked.quats, om_single.quats,
                                    atol=1e-5)
         np.testing.assert_allclose(om_chunked.corr, om_single.corr,
                                    rtol=1e-5)
 
-    def test_never_computes_full_dataset(self, library):
+    def test_never_computes_full_dataset(self, library, matching_cache):
         """Memory contract: only per-chunk slices may be materialised."""
         quats, _ = template_tables(library)
         picks = np.arange(8)
@@ -287,16 +319,18 @@ class TestChunkingAndMemory:
             return _orig(self, *a, **k)
 
         with patch.object(da.Array, "compute", _spy):
-            om = _do_compute_orientations(s, library, PARAMS, None, None)
+            om = _do_compute_orientations(s, library, PARAMS, None, None,
+                                          cache=matching_cache)
         assert om.nav_shape == (2, 4)
 
-    def test_stopped_flag_returns_none(self, library):
+    def test_stopped_flag_returns_none(self, library, matching_cache):
         s = _make_signal_from_templates(library, [0], nav_shape=(1, 1))
         out = _do_compute_orientations(s, library, PARAMS, None, None,
-                                       stopped_flag=[True])
+                                       stopped_flag=[True],
+                                       cache=matching_cache)
         assert out is None
 
-    def test_live_shm_rgb_written(self, library):
+    def test_live_shm_rgb_written(self, library, matching_cache):
         from spyde.drawing.update_functions import (
             ensure_live_buffer, read_live_buffer,
         )
@@ -308,7 +342,8 @@ class TestChunkingAndMemory:
         shm = ensure_live_buffer((2, 2, 9), shm_name)
         try:
             om = _do_compute_orientations(s, library, PARAMS, None, None,
-                                          shm_name=shm_name)
+                                          shm_name=shm_name,
+                                          cache=matching_cache)
             arr = read_live_buffer((2, 2, 9), shm_name)
             for di, direction in enumerate(("x", "y", "z")):
                 expected = om.ipf_color_map(direction).astype(np.float32)
@@ -331,6 +366,13 @@ class TestMultiphase:
             reciprocal_radius=RECIP_RADIUS,
         )
 
+    @pytest.fixture(scope="class")
+    def two_phase_cache(self, two_phase_library):
+        """Class-scoped analogue of ``matching_cache`` for the two-phase
+        library (same geometry, different template set)."""
+        return build_matching_cache(_reference_calibration_signal(),
+                                    two_phase_library)
+
     def test_template_tables_match_get_simulation(self, two_phase_library):
         sim = two_phase_library
         quats, phase_of = template_tables(sim)
@@ -342,14 +384,15 @@ class TestMultiphase:
             )
             assert int(pidx) == int(phase_of[lib_idx])
 
-    def test_phase_recovered(self, two_phase_library):
+    def test_phase_recovered(self, two_phase_library, two_phase_cache):
         sim = two_phase_library
         quats, phase_of = template_tables(sim)
         # one pattern from each phase
         i_al = int(np.where(phase_of == 0)[0][3])
         i_mg = int(np.where(phase_of == 1)[0][3])
         s = _make_signal_from_templates(sim, [i_al, i_mg], nav_shape=(1, 2))
-        om = _do_compute_orientations(s, sim, PARAMS, None, None)
+        om = _do_compute_orientations(s, sim, PARAMS, None, None,
+                                      cache=two_phase_cache)
         assert om.n_phases == 2
         assert int(om.phase_idx[0, 0, 0]) == 0
         assert int(om.phase_idx[0, 1, 0]) == 1
