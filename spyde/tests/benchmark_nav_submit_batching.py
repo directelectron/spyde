@@ -58,6 +58,16 @@ def main() -> None:
 
     out: dict = {"chunks": a.chunks, "workers": a.workers, "threads": a.threads}
 
+    # Warm the cluster BEFORE either labelled run, untimed and uncounted. A
+    # fixed try-A-then-B order on one cold cluster biases the headline
+    # first-chunk number toward whichever runs second — worker processes,
+    # comm channels and scheduler bookkeeping are still spinning up on the
+    # very first submit, and that one-time cost would otherwise land entirely
+    # on "one-at-a-time (the bug)" and flatter the fix.
+    cd.dispatch_chunks(client, nav, 1, [], None, assemble=lambda *_a: None,
+                       fill_value=np.nan, label="warmup",
+                       lane_default_mode="off", batch_unpinned=False, cap=8)
+
     # `submit_batch=1` reproduces the OLD steady-state behaviour exactly: the
     # window refilled one task at a time. Comparing against it isolates the
     # batching change from everything else in the dispatcher.
@@ -67,8 +77,10 @@ def main() -> None:
         real = client.compute
 
         def counting(x, *args, **kwargs):
-            if isinstance(x, (list, tuple)):
-                calls["n"] += 1
+            # Count EVERY submit — a lone array as well as a list/tuple batch.
+            # A regression back to single-array submits must still show up as
+            # round trips, not silently read as "submits=0".
+            calls["n"] += 1
             return real(x, *args, **kwargs)
 
         client.compute = counting
@@ -87,6 +99,11 @@ def main() -> None:
         finally:
             client.compute = real
         el = time.perf_counter() - t0
+        if first["t"] is None:
+            raise RuntimeError(
+                f"{label}: dispatch_chunks never assembled a single chunk — "
+                "no callback fired, so there is no first-chunk time to "
+                "report (check the --chunks/--workers arguments)")
         print(f"  {label:24}  submits={calls['n']:>4}  "
               f"first-chunk={first['t'] * 1e3:>6.0f} ms  total={el:>6.2f}s")
         out[label] = {"submits": calls["n"], "first_ms": first["t"] * 1e3,

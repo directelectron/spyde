@@ -421,11 +421,24 @@ def _train_row(store, frames, device, steps, *, truth=None, frame=None) -> dict:
     row: dict = {}
     n_truth = int(ndi.label(truth)[1]) if truth is not None else 0
 
+    def _sync() -> None:
+        """Explicit CUDA sync around a timed region — CUDA kernels launch
+        async, so `perf_counter` around a call that only returns HOST-side
+        results (as `.fit`/`.predict_foreground_boundary` do here, via numpy
+        arrays and Python floats) already forces an implicit sync at the
+        point of transfer. Making it explicit removes any dependence on that
+        being true of every return path, present and future."""
+        import torch
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+
     def score_into(cell: dict, engine) -> str:
         if truth is None:
             return ""
+        _sync()
         t0 = time.perf_counter()
         fg, bnd = engine.predict_foreground_boundary(frame)
+        _sync()
         dt = time.perf_counter() - t0
         pred = fg > 0.5
         iou = int((pred & truth).sum()) / max(1, int((pred | truth).sum()))
@@ -434,8 +447,10 @@ def _train_row(store, frames, device, steps, *, truth=None, frame=None) -> dict:
         return f"  | IoU {iou:.3f} n={n}/{n_truth} predict {dt:5.2f} s"
 
     mlp = ScribbleClassifier(FeatureSpec(), device=device, seed=0)
+    _sync()
     t0 = time.perf_counter()
     rep = mlp.fit(store, frames)
+    _sync()
     cell = row["mlp"] = {"total_s": time.perf_counter() - t0,
                          "featurise_s": rep["featurise_s"],
                          "fit_s": rep["fit_s"], "n_pixels": rep["n_pixels"]}
@@ -447,8 +462,10 @@ def _train_row(store, frames, device, steps, *, truth=None, frame=None) -> dict:
     for name, (base, levels) in CONFIGS.items():
         cnn = ScribbleCNN(base=base, levels=levels, steps=steps, device=device,
                           seed=0)
+        _sync()
         t0 = time.perf_counter()
         rep = cnn.fit(store, frames)
+        _sync()
         cell = row[name] = {"total_s": time.perf_counter() - t0,
                             "crops_s": rep["crops_s"], "fit_s": rep["fit_s"],
                             "n_crops": rep["n_crops"], "steps": steps,
@@ -561,6 +578,12 @@ def _warm(device) -> None:
 
     if device.type == "cuda":
         torch.cuda.init()
+        # Prime cuBLASLt too: on Pascal + cu124 + Windows its FIRST
+        # initialisation fails with CUBLAS_STATUS_NOT_INITIALIZED when it
+        # happens after cuDNN conv work (minimal pair, 2026-08-07), and the
+        # MLP arm below is exactly a post-conv first use of it.
+        F.linear(torch.zeros(1, 1, device=device),
+                 torch.zeros(1, 1, device=device))
     net = build_net(3, base=16, levels=2).to(device)
     x = torch.zeros((2, 1, 64, 64), device=device)
     y = torch.zeros((2, 64, 64), dtype=torch.long, device=device)

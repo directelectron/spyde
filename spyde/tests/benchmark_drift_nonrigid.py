@@ -86,6 +86,18 @@ def main() -> None:
           f"{a.frames * a.full * a.full * 4 / 1e9:.1f} GB -- hence decimation)\n")
     out: dict = {"device": dev, "frames": a.frames, "full": a.full, "steps": a.steps}
 
+    # Warm CUDA init + kernel JIT BEFORE the FIT table. The APPLY section below
+    # already warms itself (one throwaway `apply_nonrigid` call before its
+    # timed reps), but the FIT loop did not, so the first cell (128^2/
+    # SCAN_KNOT) silently absorbed the one-time ~1.5s cold-CUDA-context +
+    # kernel-compile cost as if it were that model's per-frame cost.
+    print("(warming CUDA / kernels before the FIT table)")
+    _warm_stack = _synth(4, 32, 32)
+    nr.solve_nonrigid(_warm_stack, model=nr.SCAN_KNOT, steps=5, device=dev,
+                      n_knots=3)
+    _sync(dev)
+    del _warm_stack
+
     # ── 1. fit cost vs decimated size ────────────────────────────────────────
     print("=== FIT (decimated stack, whole movie at once) ===")
     print(f"{'fit size':>10} {'decim':>7} {'model':>10} {'build':>8} {'fit':>9} {'per-frame':>10}")

@@ -17,17 +17,25 @@ pytest process on Windows). Run it directly::
 
     .venv/Scripts/python -m spyde.tests.benchmark_particles_batch
     .venv/Scripts/python -m spyde.tests.benchmark_particles_batch --frames 36
-    .venv/Scripts/python -m spyde.tests.benchmark_particles_batch --engine scribble
     .venv/Scripts/python -m spyde.tests.benchmark_particles_batch --stages-only
     .venv/Scripts/python -m spyde.tests.benchmark_particles_batch --serial
+    .venv/Scripts/python -m spyde.tests.benchmark_particles_batch --serial --purge-cache
 
 ``--frames`` is a frame COUNT at the real frame SIZE; the 900-frame figure is
 extrapolated from it and labelled as such. Twelve frames per worker is enough
 for the lanes to reach steady state.
+
+Scribble is the only engine now — the classical engine (``segment_frame``) this
+file used to A/B against was deleted from this branch, and ``resolve_engine``
+refuses ``method="classical"`` outright (see ``test_particles_batch.py``,
+``TestEngineSpec.test_there_is_no_classical_engine_any_more``). What remains of
+that comparison is the one that still matters: the SAME resolved scribble
+engine run serially (``--serial``) vs. through the dual-lane dispatcher.
 """
 from __future__ import annotations
 
 import argparse
+import ctypes
 import os
 import sys
 import time
@@ -58,15 +66,54 @@ def _fmt_hms(seconds: float) -> str:
     return f"{h:d}h{m:02d}m{s:02d}s" if h else f"{m:d}m{s:02d}s"
 
 
+def purge_cache(path: str) -> None:
+    """Evict *path*'s pages from the Windows file cache before an arm.
+
+    Same trick as ``benchmark_nav_fill_dispatch.purge_cache`` (see
+    ``benchmarks.md``'s page-cache trap): opening a handle with
+    ``FILE_FLAG_NO_BUFFERING`` makes the cache manager drop the cached view of
+    the file, so the NEXT read pays real disk I/O rather than RAM. Without
+    this, running the serial arm before the batch arm warms the exact pages
+    the batch arm then reads for free — a "batch is way faster" result that is
+    partly a page-cache donation from the arm that ran first, not the
+    dispatcher. Best-effort: a failed purge only weakens the A/B, so it warns
+    rather than raising.
+    """
+    if os.name != "nt":
+        try:
+            os.system("sync")
+        except Exception:
+            pass
+        return
+    GENERIC_READ = 0x80000000
+    FILE_SHARE_READ = 0x00000001
+    FILE_SHARE_WRITE = 0x00000002
+    OPEN_EXISTING = 3
+    FILE_FLAG_NO_BUFFERING = 0x20000000
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateFileW.restype = ctypes.c_void_p
+    h = k32.CreateFileW(
+        ctypes.c_wchar_p(path), ctypes.c_uint(GENERIC_READ),
+        ctypes.c_uint(FILE_SHARE_READ | FILE_SHARE_WRITE), None,
+        ctypes.c_uint(OPEN_EXISTING), ctypes.c_uint(FILE_FLAG_NO_BUFFERING), None,
+    )
+    if h in (None, -1, 2 ** 64 - 1):
+        print(f"  [purge] CreateFileW failed ({ctypes.get_last_error()})")
+        return
+    k32.CloseHandle(ctypes.c_void_p(h))
+
+
 # ── the scribble head ────────────────────────────────────────────────────────
 
 def train_scribble(frame, labels, *, device=None, crop: int = 1024):
     """A realistically-trained head, from pseudo-scribbles on a 1024^2 crop.
 
-    Painted by hand in the app; synthesised here from a classical segmentation
-    of the same frame so the benchmark is reproducible. What matters for TIMING
-    is the feature spec and the frame size, both of which are the real ones —
-    the particular strokes only move the particle count.
+    Painted by hand in the app; synthesised here from an otsu segmentation of
+    the same frame (``labels`` — see ``labels_from`` in
+    ``spyde/tests/migrated/_labels.py``) so the benchmark is reproducible.
+    What matters for TIMING is the feature spec and the frame size, both of
+    which are the real ones — the particular strokes only move the particle
+    count.
     """
     from scipy import ndimage as ndi
 
@@ -90,7 +137,17 @@ def train_scribble(frame, labels, *, device=None, crop: int = 1024):
     store = LabelStore(frame_shape=(crop, crop), classes=default_classes())
     store.paint(0, sub(core), 0)
     store.paint(0, sub(far), 1)
-    clf = ScribbleClassifier(FeatureSpec(), device=select_device(device), seed=0)
+    dev = select_device(device)
+    if getattr(dev, "type", str(dev)) == "cuda":
+        # Prime cuBLASLt before the fit's conv feature stack: on Pascal +
+        # cu124 + Windows its FIRST initialisation fails with
+        # CUBLAS_STATUS_NOT_INITIALIZED when it happens after cuDNN conv work
+        # (minimal pair, 2026-08-07), and the MLP's first linear is exactly
+        # that late first use.
+        import torch
+        torch.nn.functional.linear(torch.zeros(1, 1, device=dev),
+                                   torch.zeros(1, 1, device=dev))
+    clf = ScribbleClassifier(FeatureSpec(), device=dev, seed=0)
     rep = clf.fit(store, {0: img})
     print(f"  scribble head: {rep['n_pixels']} px / {rep['n_classes']} classes, "
           f"acc {rep['train_accuracy']:.3f}, boundary={rep['has_boundary']}, "
@@ -100,38 +157,33 @@ def train_scribble(frame, labels, *, device=None, crop: int = 1024):
 
 # ── per-stage, one frame ─────────────────────────────────────────────────────
 
-def stage_profile(frame, sp, clf=None) -> None:
-    """Where one 4096^2 frame's time goes, engine by engine and stage by stage."""
+def stage_profile(frame, sp, clf) -> None:
+    """Where one 4096^2 frame's time goes, stage by stage.
+
+    Scribble is the only engine now (see the module docstring) — this used to
+    also time the classical ``segment_frame`` arm alongside it; that arm and
+    the engine it measured are both gone.
+    """
     from spyde.particles.instances import split_instances
     from spyde.particles.measure import _contours, _fill_intensity
-    from spyde.particles import measure_frame, segment_frame
+    from spyde.particles import measure_frame
 
     print(f"\n== one frame, {frame.shape[0]}x{frame.shape[1]} {frame.dtype} ==")
 
+    import torch
+    sync = (lambda: torch.cuda.synchronize()) if clf.device.type == "cuda" \
+        else (lambda: None)
+    sync()
     t0 = time.perf_counter()
-    labels = segment_frame(frame, sp)
+    fg, bnd = clf.predict_foreground_boundary(frame)
+    sync()
     t1 = time.perf_counter()
-    rows, cs = measure_frame(labels, frame, t=0, scale=1.0)
+    labels = split_instances(fg, sp, boundary=bnd)
     t2 = time.perf_counter()
-    print(f"  classical : segment {t1-t0:6.2f}s  measure {t2-t1:7.2f}s  "
-          f"n={len(rows)}   total {t2-t0:7.2f}s")
-
-    if clf is not None:
-        import torch
-        sync = (lambda: torch.cuda.synchronize()) if clf.device.type == "cuda" \
-            else (lambda: None)
-        sync()
-        t0 = time.perf_counter()
-        fg, bnd = clf.predict_foreground_boundary(frame)
-        sync()
-        t1 = time.perf_counter()
-        lab2 = split_instances(fg, sp, boundary=bnd)
-        t2 = time.perf_counter()
-        rows2, _cs2 = measure_frame(lab2, frame, t=0, scale=1.0)
-        t3 = time.perf_counter()
-        print(f"  scribble  : predict {t1-t0:6.2f}s  split {t2-t1:6.2f}s  "
-              f"measure {t3-t2:7.2f}s  n={len(rows2)}   total {t3-t0:7.2f}s")
-        labels = lab2
+    rows, _cs = measure_frame(labels, frame, t=0, scale=1.0)
+    t3 = time.perf_counter()
+    print(f"  scribble  : predict {t1-t0:6.2f}s  split {t2-t1:6.2f}s  "
+          f"measure {t3-t2:7.2f}s  n={len(rows)}   total {t3-t0:7.2f}s")
 
     # measure_frame is the stage the whole-movie cost turns on once a real frame
     # has thousands of particles, so break it down — BOTH ways, because all three
@@ -241,10 +293,8 @@ def main(argv=None) -> int:
     ap.add_argument("--path", default=_default_path())
     ap.add_argument("--frames", type=int, default=24)
     ap.add_argument("--start", type=int, default=10)
-    ap.add_argument("--engine", default="both",
-                    choices=("classical", "scribble", "both"))
     ap.add_argument("--serial", action="store_true",
-                    help="also time the retired serial loop (slow)")
+                    help="also time the serial loop (slow)")
     ap.add_argument("--stages-only", action="store_true")
     ap.add_argument("--gpu-lane", default=None,
                     help="SPYDE_FV_GPU override for this run (one/N/all/off)")
@@ -252,6 +302,11 @@ def main(argv=None) -> int:
     ap.add_argument("--threads", type=int, default=0)
     ap.add_argument("--conc", default=None,
                     help="SPYDE_FV_GPU_CONC override (device slots per process)")
+    ap.add_argument("--purge-cache", action="store_true",
+                    help="evict the movie's cached pages (Windows) before each "
+                         "arm, so serial and batch see the same cold I/O instead "
+                         "of the second arm inheriting whatever the first one "
+                         "warmed")
     args = ap.parse_args(argv)
 
     import logging
@@ -299,14 +354,17 @@ def main(argv=None) -> int:
     t0 = args.start
     frame = np.asarray(raw[t0].compute())
 
-    clf = None
-    model_path = None
-    if args.engine in ("scribble", "both"):
-        from spyde.particles import segment_frame
-        print("\n== training the scribble head ==")
-        labels = segment_frame(frame, sp)
-        clf = train_scribble(frame, labels)
-        model_path = save_engine_model(clf)
+    # Scribble is the only engine (see module docstring): train it from a
+    # label image derived by Otsu + the shared instance split — exactly what
+    # the deleted classical engine did (`spyde/tests/migrated/_labels.py`,
+    # which the migrated tests use for the same reason). Only the STROKES this
+    # produces are synthetic; the frame, its size and the feature spec are
+    # real, which is what timing here cares about.
+    from spyde.tests.migrated._labels import labels_from
+    print("\n== training the scribble head (labels: otsu + split_instances) ==")
+    labels = labels_from(frame, **sp_kwargs)
+    clf = train_scribble(frame, labels)
+    model_path = save_engine_model(clf)
 
     stage_profile(frame, sp, clf)
     if args.stages_only:
@@ -322,22 +380,28 @@ def main(argv=None) -> int:
 
     n = int(args.frames)
     sub = raw[t0:t0 + n]
+    spec = EngineSpec(method="scribble", params=sp_kwargs, model_path=model_path)
     try:
-        for method in (("classical", "scribble") if args.engine == "both"
-                       else (args.engine,)):
-            spec = EngineSpec(method=method, params=sp_kwargs,
-                              model_path=model_path)
-            print(f"\n== {method}: {n} frames of "
-                  f"{frame.shape[0]}x{frame.shape[1]} ==")
-            if args.serial:
-                dt, total = run_serial(sub, spec, n, 1.0)
-                print(f"  serial : {dt:7.1f}s  {n/dt:6.3f} frames/s  "
-                      f"{total} particles  ->  900 frames = "
-                      f"{_fmt_hms(dt / n * TARGET_FRAMES)}")
-            dt, total = run_batch(sub, spec, n, 1.0, client)
-            print(f"  batch  : {dt:7.1f}s  {n/dt:6.3f} frames/s  "
+        print(f"\n== scribble: {n} frames of "
+              f"{frame.shape[0]}x{frame.shape[1]} ==")
+        if args.serial:
+            if args.purge_cache:
+                purge_cache(args.path)
+            dt, total = run_serial(sub, spec, n, 1.0)
+            print(f"  serial : {dt:7.1f}s  {n/dt:6.3f} frames/s  "
                   f"{total} particles  ->  900 frames = "
                   f"{_fmt_hms(dt / n * TARGET_FRAMES)}")
+        if args.purge_cache:
+            purge_cache(args.path)
+        elif args.serial:
+            print("  NOTE: no --purge-cache — the batch arm below may be "
+                  "reading pages the serial arm already faulted into RAM, so "
+                  "part of any speed-up is a warm page cache, not the "
+                  "dispatcher. Re-run with --purge-cache for a cold A/B.")
+        dt, total = run_batch(sub, spec, n, 1.0, client)
+        print(f"  batch  : {dt:7.1f}s  {n/dt:6.3f} frames/s  "
+              f"{total} particles  ->  900 frames = "
+              f"{_fmt_hms(dt / n * TARGET_FRAMES)}")
     finally:
         client.close()
         cluster.close()
@@ -345,4 +409,9 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    _rc = main()
+    # torch/CUDA teardown crashes on exit on Windows (CLAUDE.md); the numbers
+    # are already printed, so leave before it runs rather than sys.exit(main()).
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(_rc or 0)
