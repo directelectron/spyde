@@ -20,6 +20,19 @@ import dask.array as da
 import numpy as np
 
 
+def _submitted_and_armed(client, at_least: int) -> bool:
+    """``at_least`` futures exist AND every one of them has its done-callback.
+
+    ``dispatch_chunks`` appends the futures FIRST and registers the callbacks in
+    a following loop, so a predicate on the COUNT alone can wake inside that
+    gap. Firing a future whose ``_cbs`` is still empty drops the completion on
+    the floor: the bulk submit never goes out and the test times out five
+    seconds later, looking like a dispatcher bug.
+    """
+    futs = list(client.created)
+    return len(futs) >= at_least and all(f._cbs for f in futs)
+
+
 def _wait(pred, timeout=10.0, required=True):
     t0 = time.monotonic()
     evt = threading.Event()
@@ -109,8 +122,9 @@ def _run(nav=(8, 8), chunks=(2, 2), stop_event=None):
         on_chunk_done=lambda res, sl: chunks_seen.append((res, sl)),
         windowed=True, stop_event=stop_event,
     )
-    # The dispatcher runs on its own thread — wait for the first window.
-    _wait(lambda: len(client.created) >= 4)
+    # The dispatcher runs on its own thread — wait for the first window to be
+    # submitted AND armed (see _submitted_and_armed).
+    _wait(lambda: _submitted_and_armed(client, 4))
     return src, client, handle, chunks_seen
 
 
@@ -231,7 +245,7 @@ class TestWindowedProgressive:
         client = _BoomClient()
         handle = compute_with_live_buffer(src, (4, 4), client, shm_name="",
                                           windowed=True)
-        _wait(lambda: len(client.created) >= 4)
+        _wait(lambda: _submitted_and_armed(client, 4))
         for f in list(client.created):
             f.fire()
         _wait(handle.done)

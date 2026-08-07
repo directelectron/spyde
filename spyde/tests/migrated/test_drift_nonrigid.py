@@ -96,51 +96,67 @@ class TestWarp:
 
 class TestScanKnotRecovery:
     def _stack(self, amp: float = 3.0, n: int = 4):
-        """Frames distorted by a known SLOW-AXIS-varying displacement."""
+        """Frames distorted by a known SLOW-AXIS-varying displacement.
+
+        Does NOT return the per-frame truth field: nothing here asserted
+        against it directly (the recovery tests measure via ``_mse`` against
+        the reference instead), so returning it just invited every caller to
+        discard it with ``_``.
+        """
         base = _textured_frame()
         rows = np.linspace(-1.0, 1.0, H, dtype=np.float32)
-        frames, truth = [], []
+        frames = []
         for i in range(n):
             a = amp * (i + 1) / n
             dy = np.repeat((a * rows)[:, None], W, axis=1)      # varies down rows
             dx = np.zeros((H, W), np.float32)
             frames.append(_warp_np(base, dy, dx))
-            truth.append(dy)
-        return base, np.stack(frames), np.stack(truth)
+        return base, np.stack(frames)
 
-    def test_recovers_most_of_a_known_scan_distortion(self):
-        base, frames, _ = self._stack()
+    @pytest.fixture(scope="class")
+    def fitted(self):
+        """The scan-knot fit, computed ONCE and shared by every test below that
+        checks a property of it — they were re-running the identical (data,
+        params) fit from scratch."""
+        base, frames = self._stack()
         model = nr.solve_nonrigid(frames, model=nr.SCAN_KNOT, reference=base,
                                   n_knots=3, steps=220, lr=0.35,
                                   smooth_weight=0.05, temporal_weight=0.05,
                                   device=DEV)
+        return base, frames, model
+
+    def test_recovers_most_of_a_known_scan_distortion(self, fitted):
+        base, frames, model = fitted
         assert model.kind == nr.SCAN_KNOT
         before = np.mean([_mse(f, base) for f in frames])
-        after = np.mean([_mse(np.nan_to_num(nr.apply_nonrigid(f, model, i), nan=0.0)
-                              + np.isnan(nr.apply_nonrigid(f, model, i)) * base, base)
-                         for i, f in enumerate(frames)])
+        after = []
+        for i, f in enumerate(frames):
+            got = nr.apply_nonrigid(f, model, i)
+            after.append(_mse(np.where(np.isnan(got), base, got), base))
+        after = float(np.mean(after))
         assert after < 0.45 * before, (
             f"the fit removed too little of the known warp: {before:.4f} -> {after:.4f}")
 
-    def test_the_fitted_field_varies_down_the_slow_axis(self):
+    def test_the_fitted_field_varies_down_the_slow_axis(self, fitted):
         """A scan-knot fit must not collapse to a constant offset.
 
         A constant is the degenerate solution that a rigid solve already
         provides; if that is all this produces, the model is not earning its
         parameters.
         """
-        base, frames, _ = self._stack()
-        model = nr.solve_nonrigid(frames, model=nr.SCAN_KNOT, reference=base,
-                                  n_knots=3, steps=220, lr=0.35,
-                                  smooth_weight=0.05, temporal_weight=0.05,
-                                  device=DEV)
+        _base, frames, model = fitted
         dy, _dx = nr.displacement_for_frame(model, len(frames) - 1)
         spread = float(dy[:, 0].max() - dy[:, 0].min())
         assert spread > 0.5, f"fitted field is nearly constant down rows ({spread:.3f} px)"
 
     def test_a_row_is_constant_across_the_fast_axis(self):
-        """Physical contract: one row is acquired at one slow coordinate."""
-        base, frames, _ = self._stack()
+        """Physical contract: one row is acquired at one slow coordinate.
+
+        A cheap fit of its own (2 knots, 40 steps) rather than the shared
+        ``fitted`` fixture: it only checks the field's SHAPE contract, not
+        recovery quality, so it doesn't need the expensive one.
+        """
+        base, frames = self._stack()
         model = nr.solve_nonrigid(frames, model=nr.SCAN_KNOT, reference=base,
                                   n_knots=2, steps=40, device=DEV)
         dy, dx = nr.displacement_for_frame(model, 0)
@@ -165,12 +181,22 @@ class TestDenseRecovery:
             frames.append(_warp_np(base, dy, dx))
         return base, np.stack(frames)
 
-    def test_recovers_most_of_a_known_2d_deformation(self):
+    @pytest.fixture(scope="class")
+    def fitted(self):
+        """The dense fit, computed ONCE and shared by both tests below — they
+        were re-running the identical (data, params) fit from scratch, one of
+        them at a lower `steps` for no stated reason. Uses the higher of the
+        two (260): more steps only converges further, so it satisfies both
+        the recovery-quality bound and the row-variation bound."""
         base, frames = self._stack()
         model = nr.solve_nonrigid(frames, model=nr.DENSE, reference=base,
                                   grid=(6, 6), steps=260, lr=0.35,
                                   smooth_weight=0.02, temporal_weight=0.02,
                                   device=DEV)
+        return base, frames, model
+
+    def test_recovers_most_of_a_known_2d_deformation(self, fitted):
+        base, frames, model = fitted
         assert model.kind == nr.DENSE
         before = np.mean([_mse(f, base) for f in frames])
         after = []
@@ -183,13 +209,9 @@ class TestDenseRecovery:
         assert after < 0.5 * before, (
             f"the fit removed too little of the known deformation: {before:.4f} -> {after:.4f}")
 
-    def test_dense_field_is_not_forced_constant_across_a_row(self):
+    def test_dense_field_is_not_forced_constant_across_a_row(self, fitted):
         """The dense model's whole point: it can vary along the fast axis too."""
-        base, frames = self._stack()
-        model = nr.solve_nonrigid(frames, model=nr.DENSE, reference=base,
-                                  grid=(6, 6), steps=200, lr=0.35,
-                                  smooth_weight=0.02, temporal_weight=0.02,
-                                  device=DEV)
+        _base, frames, model = fitted
         dy, _ = nr.displacement_for_frame(model, len(frames) - 1)
         row_spread = float(np.abs(dy[H // 2] - dy[H // 2].mean()).max())
         assert row_spread > 0.1, f"dense field is constant across a row ({row_spread:.3f})"

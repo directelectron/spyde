@@ -366,7 +366,6 @@ class TestAlignmentROI:
 
     def test_roi_ignores_motion_outside_it(self):
         """The point of the feature, on data built to punish whole-frame."""
-        rng = np.random.default_rng(3)
         h, w, n = 96, 128, 5
         base = _scene(h, w, noise=0.0)
         frames = []

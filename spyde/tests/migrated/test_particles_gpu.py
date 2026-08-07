@@ -46,6 +46,20 @@ _DRIVER = textwrap.dedent("""
     import numpy as np
     from scipy import ndimage as ndi
 
+    import torch
+    if torch.cuda.is_available():
+        # Prime cuBLASLt while the process is young. On the dev box (TITAN X
+        # Pascal, torch 2.6.0+cu124, Windows) the FIRST cublasLt initialisation
+        # fails deterministically with CUBLAS_STATUS_NOT_INITIALIZED when it
+        # happens LATE -- after the conv feature stack has run -- and succeeds
+        # when a single linear runs first (minimal pair, 2026-08-07, on an idle
+        # GPU with 10.6 GB free: NOT contention, NOT VRAM). A torch-internal
+        # init-order fragility, not a code path this file is judging: the MLP
+        # under test is the one consumer that reaches cuBLASLt only after
+        # cuDNN work, and production ships the conv-only FastScribbleClassifier.
+        torch.nn.functional.linear(torch.zeros(1, 1, device="cuda"),
+                                   torch.zeros(1, 1, device="cuda"))
+
     from spyde.data.synthetic import (particle_movie, ground_truth,
                                       particle_truth_at)
     from spyde.particles import SegmentParams, split_instances
@@ -170,8 +184,22 @@ class TestGpuCpuAgreement:
         assert result["n_watershed_gpu"] == result["n_watershed_cpu"], result
 
     def test_the_areas_agree(self, result):
-        assert (result["areas_boundary_gpu"]
-                == result["areas_boundary_cpu"]), result
+        """Per-particle area TOLERANCE, not bit-exact equality.
+
+        Bit-exact equality here is flake by construction: the module docstring
+        already establishes that the two devices' foreground maps differ by a
+        handful of border pixels (``fg_iou > 0.99``, not 1.0), so a single
+        pixel flipping at one particle's edge would fail this on every run.
+        Matched pairs (sorted by area — legitimate here because the fixture's
+        particle radii are well separated, so a few border pixels of jitter
+        cannot reorder them) must agree within a few pixels instead."""
+        g, c = result["areas_boundary_gpu"], result["areas_boundary_cpu"]
+        assert len(g) == len(c), result
+        tol = 5
+        diffs = [abs(x - y) for x, y in zip(g, c)]
+        assert all(d <= tol for d in diffs), (
+            f"areas differ by more than {tol}px: gpu={g} cpu={c} "
+            f"diffs={diffs}")
 
     def test_the_faint_probes_are_found_on_both(self, result):
         """§0.9 on the device: the GPU path may not quietly lose a faint

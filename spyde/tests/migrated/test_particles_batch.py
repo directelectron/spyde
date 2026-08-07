@@ -86,7 +86,7 @@ def _serial(data, spec, scale=1.0):
     how it was computed, so the only thing allowed to differ between reference
     and run is the dispatch.
     """
-    engine, _dev = resolve_engine(spec)
+    engine, _dev = resolve_engine(spec, force_cpu=True)
     rows, contours = [], []
     for t in range(data.shape[0]):
         labels = engine(data[t])
@@ -316,7 +316,6 @@ class TestNoRechunkShuffle:
     def test_split_signal_axes_falls_back_instead_of_rechunking(
             self, movie, reference, spec, monkeypatch):
         import dask.array as da
-        from spyde.particles import batch as batch_mod
 
         split = da.from_array(movie, chunks=(3, 45, 55))
         assert any(len(c) > 1 for c in split.chunks[1:]), "fixture not split"
@@ -337,7 +336,6 @@ class TestNoRechunkShuffle:
         """The app loads movies at one frame per chunk, which is already the
         task size — rebuilding that graph for nothing is pure overhead."""
         import dask.array as da
-        from spyde.particles import batch as batch_mod
 
         calls = []
         real = da.Array.rechunk
@@ -354,7 +352,7 @@ class TestNoRechunkShuffle:
 
 class TestEngineSpec:
     def test_the_resolved_engine_labels_a_frame(self, movie, spec):
-        engine, dev = resolve_engine(spec)
+        engine, dev = resolve_engine(spec, force_cpu=True)
         assert dev  # a device string, whichever lane this worker is on
         labels = engine(movie[0])
         assert labels.dtype == np.int32
@@ -362,23 +360,25 @@ class TestEngineSpec:
 
     def test_resolving_twice_gives_the_same_answer(self, movie, spec):
         """The per-worker engine cache must not change what a frame segments to."""
-        first, _ = resolve_engine(spec)
-        second, _ = resolve_engine(spec)
+        first, _ = resolve_engine(spec, force_cpu=True)
+        second, _ = resolve_engine(spec, force_cpu=True)
         assert np.array_equal(first(movie[0]), second(movie[0]))
 
     def test_there_is_no_classical_engine_any_more(self):
         """Deleted, not deprecated — asking for it must fail loudly rather than
         silently falling back to something that behaves differently."""
         with pytest.raises(ValueError, match="no engine for method"):
-            resolve_engine(EngineSpec(method="classical", params=dict(PARAMS)))
+            resolve_engine(EngineSpec(method="classical", params=dict(PARAMS)),
+                          force_cpu=True)
 
     def test_scribble_without_a_model_says_so(self):
         with pytest.raises(ValueError, match="model_path"):
-            resolve_engine(EngineSpec(method="scribble", params=dict(PARAMS)))
+            resolve_engine(EngineSpec(method="scribble", params=dict(PARAMS)),
+                          force_cpu=True)
 
     def test_an_unknown_method_is_refused(self):
         with pytest.raises(ValueError, match="no engine for method"):
-            resolve_engine(EngineSpec(method="prompt"))
+            resolve_engine(EngineSpec(method="prompt"), force_cpu=True)
 
     def test_segment_params_round_trip(self, spec):
         p = spec.segment_params()
@@ -440,11 +440,10 @@ class TestLanePolicy:
         class _W:
             def __init__(self, name): self.name = name
 
-        import spyde.particles.batch as bm
         for name in ("0", "1", "2", "3", "9"):
             monkeypatch.setattr("distributed.get_worker",
                                 lambda n=name: _W(n), raising=False)
-            allowed = bm._gpu_allowed()
+            allowed = batch_mod._gpu_allowed()
             expect = 1 <= int(name) <= n_lane
             assert allowed == expect, (
                 f"setting={setting!r} mode={mode!r}: worker {name} gate says "

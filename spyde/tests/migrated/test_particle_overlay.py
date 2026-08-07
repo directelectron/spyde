@@ -1,7 +1,7 @@
 """
 The particle overlay (plan B9) and the stacked navigator lanes (C2/C3).
 
-Built on a REAL segmentation of the synthetic movie — ``segment_frame`` →
+Built on a REAL segmentation of the synthetic movie — ``labels_from`` →
 ``measure_frame`` → ``SpyDEParticles.from_frames`` → ``link`` — rather than a
 hand-made container, because three of the claims here are only meaningful
 against real geometry: the calibrated→pixel conversion (the fixture is
@@ -1020,6 +1020,123 @@ class TestLifecycle:
         assert drawn == len(tree.particles.at(4))
 
 
+# ── the actual push seam ─────────────────────────────────────────────────────
+
+class TestMarkersActuallyShip:
+    """Every assertion above — ``TestLifecycle`` included — reads
+    ``overlay._groups[key]._data``, the builder's OWN copy of what it MEANT to
+    draw. ``_push_groups`` (particle_overlay.py) mutates those dicts and then
+    calls ``plot2d._push_markers()`` exactly once, wrapped in a bare
+    ``except Exception: log.debug(...)`` — so a caller that gets the mutation
+    right and drops (or has anyplotlib silently swallow) the push would pass
+    every assertion above and draw nothing. This is the exact vacuity class that
+    shipped a real overlay bug before (project lore: "assert on bytes that SHIP,
+    not what the caller built").
+
+    These tests spy the real seam — ``plot._plot2d._push_markers`` — and read
+    back ``plot._plot2d.markers.to_wire_list()``, the wire list that actually
+    reaches the renderer. Modelled on
+    ``test_particles_wizard.py::TestRasterOverlayAboveThreshold``, which pins the
+    same standard for the raster overlay: a REAL ``Plot2D``, not a stub of
+    ``set_overlay_mask``/``_push_markers`` that only records what the caller
+    handed it.
+    """
+
+    @staticmethod
+    def _wire(plot) -> dict[str, dict]:
+        """The wire list as it last actually SHIPPED.
+
+        Deliberately reads ``plot2d._state["markers"]`` — written ONLY inside
+        the real ``_push_markers()`` (``self._state["markers"] =
+        self.markers.to_wire_list()``) — rather than calling
+        ``plot2d.markers.to_wire_list()`` directly. Calling it directly would
+        re-derive the list fresh from the registry's live ``group._data``
+        dicts, which ``_push_groups`` mutates UNCONDITIONALLY (its first loop)
+        regardless of whether the following ``pusher()`` call ever landed —
+        exactly the vacuity this class exists to avoid. A dropped push leaves
+        ``_state["markers"]`` stale; it does not leave the registry stale.
+        """
+        return {w["name"]: w for w in plot._plot2d._state.get("markers") or []}
+
+    @staticmethod
+    def _spy(plot, monkeypatch) -> list:
+        """Counts real calls to the push seam, still performing the real push."""
+        calls: list = []
+        real = plot._plot2d._push_markers
+
+        def spy():
+            calls.append(1)
+            return real()
+
+        monkeypatch.setattr(plot._plot2d, "_push_markers", spy)
+        return calls
+
+    def test_set_frame_ships_exactly_one_push(self, window, make_tree, monkeypatch):
+        tree = make_tree()
+        plot = po._first_signal_plot(tree)
+        po.attach_particle_overlay(plot, tree.particles, tree)
+        calls = self._spy(plot, monkeypatch)
+        tree._particle_overlay.set_frame(5)
+        assert calls == [1], f"set_frame shipped {len(calls)} pushes, want 1"
+
+    def test_redraw_ships_exactly_one_push(self, window, make_tree, monkeypatch):
+        tree = make_tree()
+        plot = po._first_signal_plot(tree)
+        overlay = po.attach_particle_overlay(plot, tree.particles, tree)
+        calls = self._spy(plot, monkeypatch)
+        overlay._redraw()
+        assert calls == [1], f"_redraw shipped {len(calls)} pushes, want 1"
+
+    def test_a_nav_move_ships_exactly_one_push(self, window, make_tree, monkeypatch):
+        """The path a real drag actually takes: ``_on_indices`` ->
+        ``_request_redraw`` -> ``_apply`` -> ``_push_groups`` ->
+        ``plot2d._push_markers()``."""
+        tree = make_tree()
+        plot = po._first_signal_plot(tree)
+        overlay = po.attach_particle_overlay(plot, tree.particles, tree)
+        calls = self._spy(plot, monkeypatch)
+        overlay._on_indices(np.array([6]))
+        assert calls == [1], f"a nav move shipped {len(calls)} pushes, want 1"
+
+    def _assert_shipped_fills_match(self, plot, overlay, t: int) -> None:
+        """Every shipped fill polygon's COORDINATES match ``_payload(t)``.
+
+        Not a count check: this fixture has the same particle COUNT (6) in
+        every frame, so a stale push (an old frame's data still sitting in
+        ``_state["markers"]``) would pass a bare ``len(...) == len(...)``
+        check by coincidence. The particles drift between frames, so their
+        contour coordinates do not coincide — comparing them is what actually
+        distinguishes "frame t shipped" from "some other frame shipped".
+        """
+        wire = self._wire(plot)
+        expected = overlay._payload(t)
+        n_colors = len(po.TRACK_COLORS) + 1
+        for i in range(n_colors):
+            shipped = wire[f"particles_fill_{i}"]["vertices_list"]
+            want = expected[f"fill{i}"]["vertices_list"]
+            assert len(shipped) == len(want), (
+                f"bucket {i}: shipped {len(shipped)} polygons, frame {t} has "
+                f"{len(want)}")
+            for got, exp in zip(shipped, want):
+                assert np.allclose(np.asarray(got), np.asarray(exp)), (
+                    f"bucket {i}: a shipped polygon's coordinates do not match "
+                    f"frame {t} — the wire list is showing a different frame")
+
+    def test_the_shipped_wire_list_carries_the_frames_fills(self, window, make_tree):
+        tree = make_tree()
+        plot = po._first_signal_plot(tree)
+        overlay = po.attach_particle_overlay(plot, tree.particles, tree)
+        overlay.set_frame(5)
+        self._assert_shipped_fills_match(plot, overlay, 5)
+
+    def test_the_shipped_wire_list_updates_on_a_nav_move(self, window, make_tree):
+        tree = make_tree()
+        plot = po._first_signal_plot(tree)
+        overlay = po.attach_particle_overlay(plot, tree.particles, tree)
+        overlay._on_indices(np.array([6]))
+        self._assert_shipped_fills_match(plot, overlay, 6)
+
+
 # ── the staged actions ───────────────────────────────────────────────────────
 
 class TestStagedActions:
@@ -1095,13 +1212,24 @@ class TestStagedActions:
     def test_open_without_particles_errors_rather_than_hanging(self, window):
         """No segmentation running and no particles: say so, don't wait forever.
 
-        (``wait_for_particles`` returns False with no event loop; the harness
-        Session HAS one, so the wait starts and the error arrives from the poll's
-        grace window — the assertion is only that open() does not attach.)
+        ``wait_for_particles`` returns False with no event loop; the harness
+        Session HAS one, so the wait starts on a daemon thread and only emits
+        the error once it gives up — after its GRACE window (6 s default). An
+        assertion made immediately after ``part_open`` returns is testing
+        nothing but "an attach hasn't landed yet by coincidence": an overlay
+        that attached 500 ms later (a race, or a future grace-window bug) would
+        pass undetected. Wait for the actual emitted error instead — the real
+        contract is "don't hang AND say why", not "don't attach instantly".
         """
         session = window["window"]
+        messages = window["messages"]
         session._load_test_data_particles({"frames": 4})
         assert _wait(lambda: _signal_plot(session) is not None)
         plot = _signal_plot(session)
+        messages.clear()
         po.part_open(session, plot, {})
+        assert _wait(lambda: any(
+            m.get("type") == "error"
+            and "needs a segmentation result" in m.get("text", "")
+            for m in messages)), "no error emitted after the grace window"
         assert getattr(plot.signal_tree, "_particle_overlay", None) is None

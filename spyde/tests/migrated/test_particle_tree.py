@@ -247,14 +247,20 @@ class TestRequiresParticlesGate:
         assert _action_matches_plot("X", meta, self._fake(False))
 
     def test_both_paths_read_the_same_key(self):
-        """Guards the §6 pitfall directly: the key must appear in BOTH filters."""
+        """Guards the §6 pitfall directly: the key must appear in BOTH filters.
+
+        One containment check per function, not a hit count over the whole
+        module — a module-wide ``count() >= 4`` is satisfied just as well by
+        four mentions crammed into ONE of the two paths, which is exactly the
+        bug this test exists to catch (a button that never dispatches, or one
+        hidden that would have worked)."""
         import inspect
         from spyde.drawing.toolbars import plot_control_toolbar as mod
-        src = inspect.getsource(mod)
-        assert src.count("requires_particles") >= 4, (
-            "requires_particles must be read in get_toolbar_actions_for_plot AND "
-            "_action_matches_plot — one alone renders a button that never "
-            "dispatches, or hides one that would have worked")
+        for fn in (mod.get_toolbar_actions_for_plot, mod._action_matches_plot):
+            src = inspect.getsource(fn)
+            assert "requires_particles" in src, (
+                f"{fn.__name__} does not read requires_particles — both filter "
+                "paths must gate on it independently")
 
 
 class TestWaitForParticles:
@@ -292,8 +298,14 @@ class TestWaitForParticles:
 
         plot = _Plot()
         assert wait_for_particles(_S(), plot, done.set, what="Test", grace=30.0)
-        time.sleep(0.25)
-        assert not done.is_set(), "fired before the particles attached"
+        # Poll across several of the poller's own ~0.1s cycles instead of one
+        # blind sleep-then-check: this fails as soon as an early fire happens
+        # rather than only noticing it once at the end of a fixed window (and
+        # a single post-sleep check can pass vacuously if the poller thread
+        # simply hasn't been scheduled yet).
+        for _ in range(5):
+            assert not done.is_set(), "fired before the particles attached"
+            time.sleep(0.05)
         plot.signal_tree.particles = parts
         assert done.wait(5.0), "never fired after the particles attached"
 

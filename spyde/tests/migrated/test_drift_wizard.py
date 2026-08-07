@@ -27,6 +27,7 @@ The four claims that matter:
 """
 from __future__ import annotations
 
+import threading
 import time
 
 import numpy as np
@@ -35,7 +36,7 @@ import pytest
 from spyde.actions import drift_action as dr
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture
 def _capture_module_emit(window, monkeypatch):
     """Route ``drift_action``'s own ``emit`` into the captured list.
 
@@ -44,6 +45,11 @@ def _capture_module_emit(window, monkeypatch):
     hazard conftest already documents for ``session.py``, and the identical fix.
     ``emit_status``/``emit_error`` need no patch: they resolve ``emit`` inside
     ``ipc`` at call time.
+
+    NOT autouse: requesting ``window`` (a real Session) is expensive, and the
+    pure-function classes below (``TestSharpnessNumber``, ``TestSchema``,
+    ``TestCoercion``) never dispatch a handler and so never need it. Classes
+    that DO dispatch handlers opt in via ``@pytest.mark.usefixtures``.
     """
     monkeypatch.setattr(dr, "emit", window["messages"].append)
 
@@ -58,7 +64,7 @@ def _signal_plot(session):
                  if not p.is_navigator and p.plot_state is not None), None)
 
 
-def _wait(pred, timeout=120.0):
+def _wait(pred, timeout=30.0):
     end = time.time() + timeout
     while time.time() < end:
         if pred():
@@ -128,6 +134,7 @@ class _FullComputeGuard:
         return False
 
 
+@pytest.mark.usefixtures("_capture_module_emit")
 class TestCheckWindow:
     def test_open_registers_a_controller_for_the_bare_figure(self, window):
         """README §6: a bare `figure` is not a Plot, so dispatch can only find
@@ -173,6 +180,7 @@ class TestCheckWindow:
             "frames — comparing two different subsets means nothing")
 
 
+@pytest.mark.usefixtures("_capture_module_emit")
 class TestMethodStubs:
     def test_nonrigid_is_selectable_now_that_it_is_implemented(self, window):
         """Non-rigid used to be a stub that silently reverted to rigid.
@@ -233,6 +241,7 @@ class _Box:
         pass
 
 
+@pytest.mark.usefixtures("_capture_module_emit")
 class TestDiscoveryPreview:
     """The centrepiece: a draggable box + a drift-corrected sum of it over ~20
     frames, so the user sees whether alignment works BEFORE paying for the whole
@@ -303,28 +312,84 @@ class TestDiscoveryPreview:
         y0, x0, h, w = wiz.roi_box()
         assert h >= _MIN_ROI and w >= _MIN_ROI
 
-    def test_a_superseded_preview_does_not_paint(self, window):
+    def test_a_superseded_preview_does_not_paint(self, window, monkeypatch):
         """Latest-wins: a drag that outruns the solve must drop the stale
-        result, not paint it over the newer one."""
-        _s, _p, tree, wiz = _opened(window)
-        gen = dr.bump_generation(tree, "_drift_preview_gen")
+        result, not paint it over the newer one.
+
+        Drives a REAL ``drift_tune`` (worker thread → ``_run_preview`` →
+        ``is_current``-guarded ``_done``, drift_action.py) instead of poking the
+        generation counters directly — the old version bumped the generation
+        and asserted ``is_current`` without ever calling ``drift_tune``, so the
+        guarded ``_done`` path it claims to protect never ran and the assertion
+        held trivially. ``preview_alignment`` is gated on an Event so a "newer
+        drag" can be landed deterministically while the older one is still
+        computing, rather than racing real time.
+        """
+        session, plot, tree, wiz = _opened(window)
+        msgs = window["messages"]
+        # Drain the automatic discovery preview `_opened` triggers so it can't
+        # land in the middle of the controlled run below.
+        assert _wait(lambda: _of_type(msgs, "drift_preview"))
+
         painted = []
         wiz.show_preview = lambda res: painted.append(res)
+
+        started, release = threading.Event(), threading.Event()
+        real_preview_alignment = dr.preview_alignment
+
+        def _blocking(*a, **k):
+            started.set()
+            release.wait(5.0)
+            return real_preview_alignment(*a, **k)
+
+        monkeypatch.setattr(dr, "preview_alignment", _blocking)
+
+        done = threading.Event()
+        real_is_current = dr.is_current
+
+        def _is_current(owner, key, gen_):
+            result = real_is_current(owner, key, gen_)
+            if key == "_drift_preview_gen":
+                done.set()
+            return result
+
+        monkeypatch.setattr(dr, "is_current", _is_current)
+
+        dr.drift_tune(session, plot, {"upsample": 4, "max_shift": 12})
+        assert started.wait(5.0), "the preview work never started"
         dr.bump_generation(tree, "_drift_preview_gen")     # a newer drag lands
-        assert not dr.is_current(tree, "_drift_preview_gen", gen)
+        release.set()
+
+        assert _wait(lambda: done.is_set()), \
+            "the superseded preview's _done never ran"
         assert painted == []
 
     def test_the_settle_timer_coalesces_a_drag(self, window):
         """The widget's pointer_move fires at renderer frame rate; only the
-        RESTING geometry may solve."""
+        RESTING geometry may solve.
+
+        Coalescing is asserted by POLLING until the fired count stops
+        changing, not by racing the timer's own delay: asserting
+        ``fired == []`` immediately after scheduling is only true if the test
+        process outruns the 50ms timer, which a loaded box (other agents run
+        pytest concurrently — CLAUDE.md) does not guarantee.
+        """
         _s, _p, _t, wiz = _opened(window)
         fired = []
         wiz._fire_preview = lambda: fired.append(1)
         for _ in range(20):
             wiz.schedule_preview(delay=0.05)
-        assert fired == []
-        assert _wait(lambda: len(fired) >= 1, timeout=3.0)
-        time.sleep(0.2)
+
+        assert _wait(lambda: len(fired) >= 1, timeout=3.0), \
+            "the settle timer never fired"
+        last, stable_since, start = -1, time.time(), time.time()
+        while time.time() - start < 3.0:
+            n = len(fired)
+            if n != last:
+                last, stable_since = n, time.time()
+            elif time.time() - stable_since >= 0.3:
+                break
+            time.sleep(0.02)
         assert len(fired) == 1, f"{len(fired)} solves for one drag"
 
 
@@ -395,6 +460,7 @@ def _ground_truth(tree):
     return np.asarray(sy.ground_truth(tree.root)["drift"], np.float64)
 
 
+@pytest.mark.usefixtures("_capture_module_emit")
 class TestSolve:
     def test_shifts_match_the_stamped_ground_truth(self, window):
         _s, _p, tree, wiz = _solved(window)
@@ -438,12 +504,37 @@ class TestSolve:
             f"{_sharpness(before):.5f} — check the sign convention in "
             "spyde/drift/model.py")
 
-    def test_closing_the_tree_cancels_the_solve(self, window):
+    def test_closing_the_tree_cancels_the_solve(self, window, monkeypatch):
         """Cancellation goes through BaseSignalTree.register_cancel, so closing
-        the tree has to stop it."""
+        the tree has to stop it.
+
+        Gated on an Event so ``tree.close()`` deterministically lands WHILE
+        the solve is genuinely mid-flight (right after frame 0), instead of
+        racing the solve's own speed — on this small movie an un-gated solve
+        can finish before ``close()`` ever gets a chance to cancel it, which
+        would make the "partial model" assertion below pass or fail by luck.
+        """
         session, plot, tree, wiz = _opened(window, frames=24)
+        import spyde.drift as drift_mod
+        real_solve = drift_mod.solve_translation
+        holding, proceed = threading.Event(), threading.Event()
+
+        def _gated(data, *, progress=None, **kwargs):
+            def _progress(done, total):
+                if progress is not None:
+                    progress(done, total)
+                if done == 1:
+                    holding.set()
+                    proceed.wait(10.0)
+            return real_solve(data, progress=_progress, **kwargs)
+
+        monkeypatch.setattr(drift_mod, "solve_translation", _gated)
+
         dr.drift_run(session, plot, {})
+        assert holding.wait(10.0), "the solve never reached its first frame"
         tree.close()
+        proceed.set()
+
         assert _wait(lambda: wiz.model is not None or wiz._closed, timeout=60)
         if wiz.model is not None:
             # A cancelled solve leaves NaN for the frames it never reached, so a
@@ -470,6 +561,7 @@ class TestSolve:
         assert _of_type(msgs, "drift_result")[-1]["roi"] == [12, 16, 64, 64]
 
 
+@pytest.mark.usefixtures("_capture_module_emit")
 class TestTraceWindow:
     """The dy/dx curve is its OWN plot window, filled as the solve runs — not
     caret furniture (plan §0.9a)."""
@@ -525,6 +617,7 @@ class TestTraceWindow:
             assert wid not in _FIGS, f"figure {wid} outlived its window"
 
 
+@pytest.mark.usefixtures("_capture_module_emit")
 class TestDiscard:
     def test_discard_drops_the_model_and_the_trace_window(self, window):
         session, plot, tree, wiz = _solved(window)
@@ -539,15 +632,33 @@ class TestDiscard:
 
     def test_discard_stops_a_solve_in_flight(self, window):
         """Same user intent as Stop, so it is the same handler: bumping the run
-        generation FIRST means a solve that finishes anyway never installs."""
+        generation FIRST means a solve that finishes anyway never installs.
+
+        Waits on the wizard's own ``still()`` guard actually being evaluated
+        by the in-flight run's ``_done`` — the real signal that the race
+        between the solve and the discard has resolved — rather than a flat
+        sleep long enough to "probably" cover it.
+        """
         session, plot, tree, wiz = _opened(window, frames=24)
+        done = threading.Event()
+        real_still = wiz.still
+
+        def _still(gen):
+            result = real_still(gen)
+            done.set()
+            return result
+
+        wiz.still = _still
+
         dr.drift_run(session, plot, {})
         dr.drift_discard(session, plot, {})
         assert wiz._stop[0] is True
-        time.sleep(1.0)
+        assert _wait(lambda: done.is_set(), timeout=30.0), \
+            "the in-flight solve's _done never ran"
         assert wiz.model is None
 
 
+@pytest.mark.usefixtures("_capture_module_emit")
 class TestCommitIsLazy:
     def test_commit_adds_a_lazy_node_without_computing(self, window):
         session, plot, tree, wiz = _solved(window)
@@ -620,15 +731,28 @@ class TestCommitIsLazy:
             dr.drift_corrected(tree.root, model=bad)
 
 
+@pytest.mark.usefixtures("_capture_module_emit")
 class TestDoubleFire:
     def test_open_close_open_leaves_one_controller(self, window):
         session, plot, tree = _movie(window)
-        built = []
+        msgs = window["messages"]
+        built: list = []
+        still_done: dict[int, threading.Event] = {}
         real_init = dr.DriftWizard.__init__
 
         def _tracking(self, *a, **k):
             real_init(self, *a, **k)
             built.append(self)
+            evt = threading.Event()
+            still_done[id(self)] = evt
+            real_still = self.still
+
+            def _still(gen, _real=real_still, _evt=evt):
+                result = _real(gen)
+                _evt.set()
+                return result
+
+            self.still = _still
 
         dr.DriftWizard.__init__ = _tracking
         try:
@@ -639,7 +763,19 @@ class TestDoubleFire:
             dr.DriftWizard.__init__ = real_init
         assert _wait(lambda: tree._drift_wizard is not None
                      and tree._drift_wizard.window_id is not None)
-        time.sleep(0.5)
+        assert len(built) == 2, f"expected 2 wizards built, got {len(built)}"
+        # The FIRST open's deferred worker is still in flight when close()
+        # bumps its generation; wait for that worker's own `still()` guard to
+        # actually run rather than sleeping a guessed duration.
+        assert _wait(lambda: still_done[id(built[0])].is_set(), timeout=10.0), \
+            "the superseded first open's worker never landed"
+        # The SURVIVING wizard's own open also kicks off the automatic
+        # discovery preview (drift_open's trailing `_run_preview`) on its own
+        # worker thread; drain it here too so it can't outlive the test and
+        # fire into a torn-down monkeypatch (dr.emit reverted, painting into
+        # real stdout).
+        assert _wait(lambda: _of_type(msgs, "drift_preview")), \
+            "the surviving wizard's discovery preview never landed"
 
         alive = [w for w in built if not w._closed]
         assert len(alive) == 1, \

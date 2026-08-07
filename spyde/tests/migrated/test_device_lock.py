@@ -329,3 +329,97 @@ class TestParticleEnginesTakeLock:
             clf.fit(store, {0: np.zeros((16, 16), dtype=np.float32)})
         assert held == [True], "scribble training ran unserialised on MPS"
         assert not _lock_is_held_by_me(), "lock leaked"
+
+    def test_fast_engine_fit_locks(self, monkeypatch):
+        """``FastScribbleClassifier`` (spyde/particles/fast_engine.py) is what
+        ``seg_train`` actually dispatches (particles_action.py:2162) — nothing
+        anywhere referenced it before this class. Its lock site is fit's
+        ``with accelerator_lock(self.device):`` (fast_engine.py:431).
+
+        Unlike ``ScribbleClassifier``, a literal ``_FakeDev()`` cannot be handed
+        straight to the constructor here: ``FastFeatureBank.__init__`` and
+        ``_build_logit_kernel`` (both run from ``FastScribbleClassifier.__init__``)
+        build their kernel tensors with ``torch.as_tensor(..., device=self.device)``
+        UNLOCKED, before ``fit`` is ever called, and torch itself rejects a
+        non-``torch.device`` object there (``TypeError: empty() received an
+        invalid combination of arguments``) — so the object never gets far enough
+        to reach the real lock site. Forcing ``is_mps`` True instead lets a
+        genuinely valid CPU device take the real MPS branch of
+        ``accelerator_lock``, so every actual tensor op stays valid while the
+        lock behaviour under test is exercised for real.
+        """
+        from spyde import device_lock
+        from spyde.particles import fast_engine as fe
+
+        class _Stop(Exception):
+            """Aborts the fit at its first per-sample device submission."""
+
+        held = []
+
+        def spy(*a, **kw):
+            held.append(_lock_is_held_by_me())
+            raise _Stop
+
+        monkeypatch.setattr(device_lock, "is_mps", lambda d: True)
+        store = fe.LabelStore(frame_shape=(16, 16))
+        store.paint(0, [(2, 2)], 0)
+        store.paint(0, [(9, 9)], 1)
+        clf = fe.FastScribbleClassifier(device="cpu")
+        monkeypatch.setattr(clf, "_sample", spy)
+        with pytest.raises(_Stop):
+            clf.fit(store, {0: np.zeros((16, 16), dtype=np.float32)})
+        assert held == [True], "fast-engine training ran unserialised on MPS"
+        assert not _lock_is_held_by_me(), "lock leaked"
+
+    def test_fast_engine_predict_locks(self, monkeypatch):
+        """The interactive half of the same engine — fires on every navigator
+        move while a user tunes a live preview, exactly the concurrency this
+        lock exists for. Lock site: ``_logits_banded``'s
+        ``with accelerator_lock(self.device), torch.no_grad():``
+        (fast_engine.py:546), reached from ``predict_class_proba`` /
+        ``predict_foreground_boundary`` / ``segment``.
+
+        Trains for real (cheap: 16x16, 5 epochs) rather than hand-faking a
+        trained state, so ``_mean``/``_std``/``classes``/``_net`` are exactly
+        what a real caller would have. ``is_mps`` forced True for the same
+        reason as the fit test above.
+
+        The probe wraps ``clf.bank`` rather than replacing it outright:
+        ``_logits_banded`` reads ``self.halo`` — which reads ``self.bank.halo``
+        — BEFORE the lock is even entered, so a bare stand-in function (no
+        ``.halo``) breaks on that attribute access before the real submission
+        (``self.bank(...)``, inside the lock) is ever reached.
+        """
+        from spyde import device_lock
+        from spyde.particles import fast_engine as fe
+
+        class _Stop(Exception):
+            """Aborts predict at its first feature-bank submission."""
+
+        class _BankSpy:
+            """Keeps ``.halo`` real; intercepts the forward call only."""
+
+            def __init__(self, real_bank):
+                self._real = real_bank
+
+            @property
+            def halo(self):
+                return self._real.halo
+
+            def __call__(self, *a, **kw):
+                held.append(_lock_is_held_by_me())
+                raise _Stop
+
+        held = []
+
+        monkeypatch.setattr(device_lock, "is_mps", lambda d: True)
+        store = fe.LabelStore(frame_shape=(16, 16))
+        store.paint(0, [(2, 2)], 0)
+        store.paint(0, [(9, 9)], 1)
+        clf = fe.FastScribbleClassifier(device="cpu", epochs=5)
+        clf.fit(store, {0: np.zeros((16, 16), dtype=np.float32)})
+        monkeypatch.setattr(clf, "bank", _BankSpy(clf.bank))
+        with pytest.raises(_Stop):
+            clf.predict_class_proba(np.zeros((16, 16), dtype=np.float32))
+        assert held == [True], "fast-engine predict ran unserialised on MPS"
+        assert not _lock_is_held_by_me(), "lock leaked"

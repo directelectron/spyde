@@ -281,6 +281,27 @@ class TestTaperTrap:
                                  apodize=0.3).params["apodize"] == pytest.approx(0.3)
 
 
+@pytest.fixture(scope="class")
+def loaded_particles():
+    """One ``_load_test_data_particles({"frames": 6})`` session, shared.
+
+    Same bare-Session shape as ``conftest.window`` (``SPYDE_NO_DASK`` is
+    already set at import), but class-scoped: four tests below each assert an
+    independent property of this SAME load — lazy chunking, axes/signal-type,
+    ground truth, and window count — and each was previously paying for its
+    own full ``Session`` + load just to check one of them. ``test_eager_option``
+    loads with different params (``eager: True``), so it is a genuinely
+    different state and keeps its own ``window`` fixture rather than sharing
+    this one.
+    """
+    from spyde.backend.session import Session
+    session = Session(n_workers=1, threads_per_worker=1)
+    session._load_test_data_particles({"frames": 6})
+    yield {"window": session, "signal_trees": session.signal_trees,
+           "plots": session._plots}
+    session.shutdown()
+
+
 class TestHarnessLoader:
     """``load_test_data_particles`` — the door the e2e specs come through."""
 
@@ -290,32 +311,26 @@ class TestHarnessLoader:
             "the action is not in _TEST_ACTIONS, so dispatch will reject it and "
             "every e2e spec silently loads nothing")
 
-    def test_loads_lazily_one_frame_per_chunk(self, window):
-        session = window["window"]
-        session._load_test_data_particles({"frames": 6})
-        assert len(window["signal_trees"]) == 1
-        root = window["signal_trees"][0].root
+    def test_loads_lazily_one_frame_per_chunk(self, loaded_particles):
+        assert len(loaded_particles["signal_trees"]) == 1
+        root = loaded_particles["signal_trees"][0].root
         assert root._lazy, "must be lazy — an eager fixture skips the cache path"
         assert root.data.chunksize[0] == 1, (
             f"expected one frame per chunk, got {root.data.chunksize} — that is "
             "what makes each nav move a small cold read like a real .mrc")
 
-    def test_signal_type_and_axes_survive_the_lazy_rewrap(self, window):
-        session = window["window"]
-        session._load_test_data_particles({"frames": 6})
-        root = window["signal_trees"][0].root
+    def test_signal_type_and_axes_survive_the_lazy_rewrap(self, loaded_particles):
+        root = loaded_particles["signal_trees"][0].root
         assert getattr(root, "_signal_type", None) == "insitu", (
             "the insitu cast was lost, so Play / Fast-Forward will not appear")
         tax = root.axes_manager.navigation_axes[0]
         assert tax.name == "time" and tax.scale == pytest.approx(0.05)
         assert root.axes_manager.signal_axes[0].units == "nm"
 
-    def test_ground_truth_survives_the_lazy_rewrap(self, window):
+    def test_ground_truth_survives_the_lazy_rewrap(self, loaded_particles):
         """The whole point of the fixture is its stamped truth — losing it in the
         re-wrap would leave every downstream gate asserting against nothing."""
-        session = window["window"]
-        session._load_test_data_particles({"frames": 6})
-        gt = ground_truth(window["signal_trees"][0].root)
+        gt = ground_truth(loaded_particles["signal_trees"][0].root)
         assert gt["kind"] == "particle_movie"
         assert int(gt["nucleation_frame"]) == NUCLEATION_INDEX + 5  # 8
         assert np.asarray(gt["drift"]).shape == (6, 2)
@@ -325,12 +340,11 @@ class TestHarnessLoader:
         session._load_test_data_particles({"frames": 4, "eager": True})
         assert not window["signal_trees"][0].root._lazy
 
-    def test_opens_two_windows(self, window):
+    def test_opens_two_windows(self, loaded_particles):
         """A 1-D-nav movie gives a navigator plus a signal window."""
-        session = window["window"]
-        session._load_test_data_particles({"frames": 6})
-        assert len(session._plots) >= 2, (
-            f"expected navigator + signal plots, got {len(session._plots)}")
+        assert len(loaded_particles["plots"]) >= 2, (
+            f"expected navigator + signal plots, got "
+            f"{len(loaded_particles['plots'])}")
 
 
 class TestSegmentationOnTheFixture:

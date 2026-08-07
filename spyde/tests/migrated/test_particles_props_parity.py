@@ -14,9 +14,14 @@ discs, which agree under any implementation and prove nothing.
 
 That is what this module is: one scene of ~5 000 blobs from thresholded noise (so
 the shapes are ragged and concave, and plenty of them run off the frame edge), and
-one assertion per column. The tolerances are not round numbers picked to make it
-pass — they record which columns are integer-exact, which are float-identical
-because both paths sum exact integers, and which differ only in summation order:
+one assertion per column. The table below states the tolerance actually ASSERTED
+in ``_TOL`` — the number that gates CI — with the value measured on this module's
+own scene in parentheses. They are not the same number on purpose: the gate is
+kept well clear of the measured floor (roughly 1e3-1e5x looser) so that a
+platform-dependent BLAS/LAPACK build, which can shift summation order without
+being wrong, does not turn into a flake. What the gap is NOT is agreement to the
+measured figure — read the parenthetical as "this is what we currently see", not
+as a second, tighter contract:
 
 =========================  =========================================
 column                     agreement
@@ -25,11 +30,15 @@ label, area, bbox-*        exact (integers)
 centroid-0, centroid-1     exact (both sum exact integers in float64)
 equivalent_diameter_area   exact (a function of ``area`` alone)
 solidity                   exact (the hull is integer arithmetic)
-perimeter                  ~1e-15 relative (same weights, summed in a
-                           different order)
-major/minor_axis_length    ~1e-14 relative (same 2x2 LAPACK
-eccentricity               eigenproblem, moments summed in a
-                           different order)
+perimeter                  gated at 1e-12 relative (measured ~2e-16;
+                           same weights, summed in a different order)
+major_axis_length          gated at 1e-11 relative (measured ~9e-16;
+minor_axis_length          gated at 1e-11 relative (measured ~3e-15;
+                           same 2x2 LAPACK eigenproblem, moments
+                           summed in a different order)
+eccentricity               gated at 1e-9 relative (measured ~1e-14; same
+                           eigenproblem above, but eccentricity divides
+                           by axis length so it amplifies that error)
 =========================  =========================================
 
 The same scene is used to pin ``measure_frame``'s own output rows, because the
