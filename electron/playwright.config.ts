@@ -1,4 +1,5 @@
 import { defineConfig } from '@playwright/test'
+import { readdirSync } from 'fs'
 import { join } from 'path'
 
 // A FRESH Electron profile + settings dir for every app launch, so no spec can
@@ -10,37 +11,67 @@ import { join } from 'path'
 require('./tests/_clean_slate.cjs').installCleanSlate()
 
 /**
- * The specs that dominate wall-clock, newest measurement first.
+ * Every spec file that costs >= ~45 s on a hosted runner, SLOWEST FIRST — the
+ * order IS the CI balancing (round-robin below). Playwright's `--shard`
+ * balances by FILE COUNT, not duration, and reliably parks one shard at 2-3x
+ * the others, so CI does not use `--shard` at all.
  *
- * Playwright's `--shard` balances by FILE COUNT, not duration, and this suite's
- * files differ by ~40x. Measured on one CI run: shard 3 ran 127 tests in 6.8
- * min while shard 1 ran 90 in 22.6 — and re-sharding never fixed it, because
- * count-balancing keeps making the same bad split (the workflow records ×2 and
- * ×3 both landing one shard over 20 min, one of them cancelled at the timeout).
- *
- * Splitting THESE out and sharding the rest evens it up without another runner:
- * 22.6 / 11.7 / 6.8 / 5.8  ->  roughly 13 / 12 / 11 / 10.
- *
- * `reportSlowTests` above prints every file over 30 s, so CI itself tells you
- * when this list has drifted. Keep it to files that genuinely dominate — a long
- * list defeats the point by leaving the sharded half too thin.
+ * Durations: median of the two most recent green main runs (2026-08-03).
+ * `reportSlowTests` prints every file over 30 s, so CI says when this list
+ * has drifted.
  */
 export const SLOW_SPECS = [
-  '**/fit_quality.spec.ts',          // 3.7m
-  '**/gpu_image_parity.spec.ts',     // 1.5m
-  '**/ipf_perf.spec.ts',             // 1.3m
-  '**/action_scoping.spec.ts',       // 1.1m
-  '**/fit_handles.spec.ts',          // 57s
-  '**/fit_from_composition.spec.ts', // 53s
+  '**/progressive_signal_preview.spec.ts',      // 194s
+  '**/progressive_orientation_preview.spec.ts', // 154s
+  '**/ipf_perf.spec.ts',                        // 149s
+  '**/report_edit2.spec.ts',                    // 111s
+  '**/sped_ag_grid.spec.ts',                    // 105s
+  '**/insitu_playback.spec.ts',                 // 90s
+  '**/gpu_image_parity.spec.ts',                // 90s
+  '**/ipf_two_window_vom.spec.ts',              // 90s
+  '**/eels_edge_component.spec.ts',             // 84s
+  '**/ipf_two_window.spec.ts',                  // 81s
+  '**/laundry_visual.spec.ts',                  // 80s
+  '**/vector_om_lazy.spec.ts',                  // 70s
+  '**/orientation_lazy.spec.ts',                // 70s
+  '**/ebsd_workflow.spec.ts',                   // 66s
+  '**/action_scoping.spec.ts',                  // 65s
+  '**/compose_real_drag.spec.ts',               // 61s
+  '**/om_wizard_lazy.spec.ts',                  // 60s
+  '**/nav_drag_distributed.spec.ts',            // 58s
+  '**/actions_lifecycle.spec.ts',               // 57s
+  '**/fit_handles.spec.ts',                     // 57s
+  '**/shutdown.spec.ts',                        // 56s
+  '**/grid_present.spec.ts',                    // 56s
+  '**/vector_overlay.spec.ts',                  // 54s
+  '**/find_vectors_result.spec.ts',             // 51s
+  '**/vector_vi_lazy.spec.ts',                  // 51s
+  '**/fit_from_composition.spec.ts',            // 50s
+  '**/ipf_refine_render.spec.ts',               // 49s
+  '**/vi_lazy.spec.ts',                         // 47s
 ]
 
-// Which half of the split to run. CI sets it per job; unset (every local run)
-// means "everything", so nobody has to know this exists to run the suite.
-//   slow  -> ONLY the files above, one job, unsharded
-//   fast  -> everything EXCEPT them, sharded --shard=N/4
+// Which slice to run. CI sets both; unset (every local run) means
+// "everything", so nobody has to know this exists to run the suite.
+//   SPYDE_E2E_SLICE:  slow -> ONLY the files above;  fast -> everything else
+//   SPYDE_E2E_GROUP:  'k/n' -> every n-th file of the slice, offset k (1-based)
+// Round-robin over the slice's file order spreads duration evenly: SLOW_SPECS
+// is sorted slowest-first, and the fast slice is all sub-45s files, so any
+// contiguous alphabetical cluster of heavy files lands on different jobs.
+const bare = (glob: string) => glob.slice(glob.lastIndexOf('/') + 1)
+const FAST_SPECS = readdirSync(join(__dirname, 'tests'))
+  .filter((f) => f.endsWith('.spec.ts'))
+  .filter((f) => !f.endsWith('.real.spec.ts') && f !== 'guide_screenshots.spec.ts')
+  .filter((f) => !SLOW_SPECS.some((g) => bare(g) === f))
+  .sort()
 const SLICE = process.env.SPYDE_E2E_SLICE
-const SLICE_IGNORE = SLICE === 'fast' ? SLOW_SPECS : []
-const SLICE_MATCH = SLICE === 'slow' ? SLOW_SPECS : null
+let sliceFiles = SLICE === 'slow' ? SLOW_SPECS.map(bare) : SLICE === 'fast' ? FAST_SPECS : null
+const GROUP = process.env.SPYDE_E2E_GROUP
+if (sliceFiles && GROUP) {
+  const [k, n] = GROUP.split('/').map(Number)
+  sliceFiles = sliceFiles.filter((_, i) => i % n === k - 1)
+}
+const SLICE_MATCH = sliceFiles ? sliceFiles.map((f) => '**/' + f) : null
 
 export default defineConfig({
   testDir: './tests',
@@ -52,7 +83,9 @@ export default defineConfig({
   globalTeardown: require.resolve('./tests/global-teardown.cjs'),
   timeout: 120_000,
   expect: { timeout: 15_000 },
-  retries: 1,
+  // CI: 0 — a retry of a timed-out app boot doubles the damage (a 10-min hang
+  // became 20). Locally: 1, as before.
+  retries: process.env.CI ? 0 : 1,
   // line: one timestamped row per test WITH its duration (the dot reporter made
   // CI stalls unattributable — 9 silent minutes with no test name). html: the CI
   // workflow uploads playwright-report/ as an artifact; without an html reporter
@@ -83,10 +116,7 @@ export default defineConfig({
       // need downloaded pyxem datasets.
       name: 'electron',
       testMatch: SLICE_MATCH ?? '**/*.spec.ts',
-      testIgnore: [
-        '**/*.real.spec.ts', '**/guide_screenshots.spec.ts',
-        ...SLICE_IGNORE,
-      ],
+      testIgnore: ['**/*.real.spec.ts', '**/guide_screenshots.spec.ts'],
     },
     {
       // Local / nightly tier: real pyxem datasets + per-step screenshot
