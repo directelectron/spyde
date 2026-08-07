@@ -50,8 +50,7 @@ class WizardController:
     #: Electron caret or an auto-generated notebook form — can render the
     #: wizard's controls from one source of truth. Resolved host-agnostically
     #: via ``registry.wizard_parameters(key)``; completeness is enforced by
-    #: ``test_wizard_schemas.py``. (Three-host parity contract:
-    #: NOTEBOOK_PARITY_PLAN.md §6.)
+    #: ``test_wizard_schemas.py``.
     parameters: dict = {}
 
     def __init__(self, session, tree):

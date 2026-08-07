@@ -2,8 +2,8 @@ name: Release
 
 # Fires only when a version tag (e.g. v0.1.0) is pushed.
 # Builds the Electron desktop app (with the uv-managed Python sidecar — see
-# electron/PACKAGING.md, DISTRIBUTION_PLAN.md "Option A") on each platform in
-# parallel, publishing straight to a DRAFT GitHub Release so electron-builder
+# electron/electron-builder.yml + electron/scripts/bundle-python.mjs) on each
+# platform in parallel, publishing straight to a DRAFT GitHub Release so electron-builder
 # generates the latest.yml/latest-mac.yml/latest-linux.yml feeds electron-
 # updater's autoUpdater needs. The draft only goes live once all three legs
 # succeed (`finalize`, gated on `needs: build`) so users never see a partial
@@ -170,7 +170,8 @@ jobs:
         with:
           fetch-depth: 0
 
-      # electron/package.json's "version" is hand-set (RELEASING.md) — it's
+      # electron/package.json's "version" is hand-set (bumped by the Prepare
+      # Release workflow, prepare_release.yml) — it's
       # what electron-builder/electron-updater treat as the app's semver, so a
       # drift here would ship an installer electron-updater can't reason about
       # correctly (or a release that silently doesn't offer itself as an

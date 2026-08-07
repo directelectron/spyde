@@ -25,7 +25,7 @@ problem, following the same playbook as
 ``spyde/actions/vector_orientation_gpu.py``.
 
 Correctness is defined by HyperSpy: the engine must reproduce ``multifit``'s
-parameters on the same data. See ``RELEASE_0_3_0_PLAN.md`` and GitHub #50.
+parameters on the same data. See GitHub #50.
 """
 from __future__ import annotations
 

@@ -231,7 +231,7 @@ def register_staged(name: str, dotted_path: str) -> None:
 # already render from it); this table maps each wizard key to wherever its
 # schema lives, so any host (an Electron panel, a notebook form generator, a
 # doc generator) resolves them uniformly. Completeness is enforced by
-# test_wizard_schemas.py. (Three-host parity: NOTEBOOK_PARITY_PLAN.md §6.)
+# test_wizard_schemas.py.
 _WIZARD_SCHEMAS: dict[str, tuple[str, str]] = {
     # key: (module, attribute) — attribute is a controller class (its
     # `parameters`) or a dict.

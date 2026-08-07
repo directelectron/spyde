@@ -276,7 +276,7 @@ class FileLoaderMixin:
         near ``_CHUNK_TARGET_BYTES`` regardless of frame resolution. The old flat
         ``nav_chunk=32`` was tuned for 128-256 px DP frames; for an in-situ movie
         of 8k x 8k images it would make a 512 MB chunk (32 x 64 MB) and read half
-        a gigabyte to show one frame — see benchmarks.md "movie playback". Now a
+        a gigabyte to show one frame. Now a
         big frame gets 1 frame/chunk, a small DP many. Pass ``nav_chunk`` to force
         a value (tests)."""
         try:

@@ -58,7 +58,7 @@ jobs:
       # electron/package.json is the source of truth for the app's semver
       # (electron-builder/electron-updater read it); the release tag must be
       # v<that version>. Tag shapes and the stable/beta channel mapping are
-      # documented in RELEASING.md.
+      # documented in release.yml's `channel` job.
       - name: Compute new version
         id: version
         env:
@@ -145,7 +145,7 @@ jobs:
             exit 1
           fi
 
-      # ── Pre-flight checks from RELEASING.md — fail HERE, not at release time ──
+      # ── Release pre-flight checks — fail HERE, not at release time ──────────
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
         with:

@@ -2,7 +2,7 @@
 gpu_status.py — surfaces the GPU diagnostics that vector_orientation_gpu already
 computes (select_device / gpu_available / gpu_unavailable_reason /
 torch_available) to the Help -> GPU Status dialog, so a silent CPU fallback is
-never a mystery (see DISTRIBUTION_PLAN.md Sec 3d). No new detection logic —
+never a mystery. No new detection logic —
 this module only packages the existing functions into an emitted message.
 """
 from __future__ import annotations

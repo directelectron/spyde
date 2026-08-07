@@ -7,7 +7,7 @@ missing at least one of its three properties:
   1. **batched submit** — `client.compute(list)` once per top-up, not a blocking
      scheduler round trip per chunk.  Measured end to end on the real 977-frame
      / 15.3 GB in-situ movie (977 nav chunks, 4 workers — see
-     `benchmark_nav_fill_dispatch.py` and benchmarks.md): the per-chunk loop
+     `benchmark_nav_fill_dispatch.py`): the per-chunk loop
      spent **9.86 s** in submission with the GIL held in the client process, so
      nothing else in the backend could run and the first navigator pixel
      appeared at **16.4 s**.  Through the dispatcher: submit 0.00 s, first pixel
@@ -258,7 +258,7 @@ class TestNavigatorFillThroughDispatcher:
         That guard is retired deliberately, so here is the argument against my
         own fence:
 
-        * It did not measure as backpressure. benchmarks.md has the bounded
+        * It did not measure as backpressure. Measured: the bounded
           window at 46-50 s against unbounded at 50.2 s on the same 977-chunk
           movie — within noise. The window never bought throughput or safety
           that anyone demonstrated.
