@@ -474,8 +474,13 @@ class TestIntegrationAg:
                  Atom("Ag", [.5, 0, .5]), Atom("Ag", [0, .5, .5])]
         phase = Phase(name="Ag", point_group="m-3m",
                       structure=Structure(atoms, latt))
+        # resolution 4.0 (91 beam directions, ~5 s) rather than 2.0 (300,
+        # ~15 s): the generating template below is still a library member and
+        # the test already tolerates a symmetry-equivalent coarse pick — the
+        # asserts are on the fit residual + strain cap, not on which template
+        # the coarse seed lands on.
         sim = generate_library_from_phases(
-            [phase], accelerating_voltage=200.0, resolution=2.0,
+            [phase], accelerating_voltage=200.0, resolution=4.0,
             minimum_intensity=1e-3, reciprocal_radius=0.75,
         )
         cal = hs.signals.Signal2D(np.zeros((112, 112), np.float32))
