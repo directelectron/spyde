@@ -581,12 +581,19 @@ class TestTraceWindow:
     def test_it_fills_from_the_on_shift_stream(self, window):
         session, plot, _tree, wiz = _opened(window)
         msgs = window["messages"]
+        # `_opened` fires the discovery preview, which streams `drift_trace`
+        # batches of its own (same window id, same leading indices). Under CI
+        # timing those interleave with the run's stream, so a raw point COUNT
+        # over-counts (seen: 10 for 8 frames on windows-py3.12). Snapshot the
+        # list and assert the run streamed every frame INDEX — the contract is
+        # "every solved frame went out", not "nobody else spoke".
+        start = len(msgs)
         dr.drift_run(session, plot, {})
         assert _wait(lambda: wiz.model is not None)
         assert _wait(lambda: int(wiz._trace.get("filled", 0)) == N_FRAMES)
-        # …and the same batches went out as `drift_trace` messages.
-        streamed = sum(len(m["points"]) for m in _of_type(msgs, "drift_trace"))
-        assert streamed == N_FRAMES
+        streamed = {int(p[0]) for m in _of_type(msgs[start:], "drift_trace")
+                    for p in m["points"]}
+        assert streamed == set(range(N_FRAMES))
 
     def test_the_trace_matches_the_model(self, window):
         _s, _p, _t, wiz = _solved(window)
