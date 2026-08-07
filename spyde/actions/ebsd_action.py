@@ -873,7 +873,7 @@ def _finalize_ipf_window(session, tree, om, *, score=None, osm=None,
             log.debug("painting the EBSD IPF map failed: %s", e)
     try:
         from spyde.actions.ipf_view import attach_ipf_3d, attach_ipf_point_selector
-        attach_ipf_3d(tree, om, direction="z")
+        attach_ipf_3d(tree, om, direction="z", session=session)
         attach_ipf_point_selector(tree, om, "z")
     except Exception as e:
         log.debug("attaching the 3-D IPF explorer failed: %s", e)
@@ -925,6 +925,8 @@ def _attach_quality_views(session, tree, *, score=None, osm=None,
         sp.set_view_tag("IPF-Z", "2d")
     except Exception as e:
         log.debug("tagging the EBSD IPF view failed: %s", e)
-    register_views(wid, views)
+    # append: attach_ipf_3d already registered the IPF-X/Y/Z projection chips
+    # on this window — a plain register_views would wipe them.
+    register_views(wid, views, append=True)
     for lbl, m in views:
         emit_view_figure(wid, m, lbl, kind="2d")

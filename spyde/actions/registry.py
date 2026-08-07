@@ -176,6 +176,12 @@ STAGED_HANDLERS: dict[str, str] = {
     "report_set_slide_kind":   "spyde.actions.report.handlers.report_set_slide_kind",
     "report_set_slide_style":  "spyde.actions.report.handlers.report_set_slide_style",
     "report_set_slide_notes":  "spyde.actions.report.handlers.report_set_slide_notes",
+    # Deck THEME — colours / type / footer bar / logo. Per-document, with a
+    # "set as default" that seeds every new deck (settings.json).
+    "report_set_theme":        "spyde.actions.report.handlers.report_set_theme",
+    "report_theme_set_default": "spyde.actions.report.handlers.report_theme_set_default",
+    "report_theme_use_default": "spyde.actions.report.handlers.report_theme_use_default",
+    "report_theme_reset":      "spyde.actions.report.handlers.report_theme_reset",
     "report_add_figure":       "spyde.actions.report.handlers.report_add_figure",
     "report_refresh_figure":   "spyde.actions.report.handlers.report_refresh_figure",
     "repfig_refresh_panel":    "spyde.actions.report.handlers.repfig_refresh_panel",

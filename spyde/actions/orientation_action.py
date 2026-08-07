@@ -190,8 +190,9 @@ def _create_blank_ipf_window(session, src, ny, nx):
     )
 
 
-def _finalize_ipf_window(tree, om) -> None:
-    """Paint the final IPF-Z map, attach the map + 3-D explorer + point selector."""
+def _finalize_ipf_window(tree, om, session=None) -> None:
+    """Paint the final IPF-Z map, then attach the two-window IPF layout: the
+    X/Y/Z projection chips on this (map) window and the IPF explorer window."""
     tree.orientation_map = om
     ipf = om.ipf_color_map(direction="z")        # (ny, nx, 3) uint8
     for sp in list(getattr(tree, "signal_plots", [])):
@@ -202,7 +203,7 @@ def _finalize_ipf_window(tree, om) -> None:
             log.debug("painting IPF map onto signal plot failed: %s", e)
     try:
         from spyde.actions.ipf_view import attach_ipf_3d, attach_ipf_point_selector
-        attach_ipf_3d(tree, om, direction="z")
+        attach_ipf_3d(tree, om, direction="z", session=session)
         attach_ipf_point_selector(tree, om, "z")
     except Exception as e:
         log.debug("attaching 3-D IPF explorer failed: %s", e)
@@ -258,7 +259,7 @@ def _compute_with_live_ipf(session, src, src_tree, sim, params):
             except Exception as e:
                 log.debug("cleaning up OM live-buffer shared memory failed: %s", e)
     if om is not None:
-        _finalize_ipf_window(om_tree, om)
+        _finalize_ipf_window(om_tree, om, session=session)
     return om
 
 

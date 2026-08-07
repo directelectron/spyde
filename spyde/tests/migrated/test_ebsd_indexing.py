@@ -219,3 +219,90 @@ class TestSampleOrientations:
 
     def test_finer_step_gives_a_bigger_dictionary(self):
         assert len(sample_orientations(10.0)) > len(sample_orientations(20.0))
+
+
+# --------------------------------------------------------------------------
+# parity against kikuchipy — THE acceptance gate for #71
+# --------------------------------------------------------------------------
+
+class TestKikuchipyParity:
+    """We replaced kikuchipy's dask dictionary indexing with a chunked matmul,
+    so the bar is its numbers, not our own self-consistency.
+
+    Everything else in this file shows our answer is *sensible* (it recovers
+    known orientations, tiling does not change it). Only this shows it is the
+    *same* answer the reference implementation gives. The comparison is made at
+    the similarity-metric level rather than through ``EBSD.dictionary_indexing``
+    deliberately: that wrapper also does masking, dask chunking and CrystalMap
+    assembly, none of which we reimplemented — the claim under test is
+    specifically that our ``E @ Dᵀ`` reproduces kikuchipy's NCC.
+
+    Skipped without the ``ebsd`` extra; CI's `extras` job installs it.
+    """
+
+    @staticmethod
+    def _reference(exp, dic):
+        """kikuchipy's own (P, D) NCC matrix for the same inputs."""
+        kp_indexing = pytest.importorskip("kikuchipy.indexing")
+        P, D = len(exp), len(dic)
+        metric = kp_indexing.NormalizedCrossCorrelationMetric(P, D)
+        e = metric.prepare_experimental(exp.reshape(P, -1))
+        d = metric.prepare_dictionary(dic.reshape(D, -1))
+        return np.asarray(metric.match(e, d))
+
+    @pytest.fixture(scope="class")
+    def pair(self):
+        """Random patterns, with a few dictionary entries made near-copies of
+        experimental ones so the ranking is decided by signal rather than by
+        which way ties happen to break."""
+        rng = np.random.default_rng(0)
+        P, D, H, W = 37, 53, 12, 10
+        exp = rng.normal(50, 12, (P, H, W)).astype(np.float32)
+        dic = rng.normal(50, 12, (D, H, W)).astype(np.float32)
+        dic[:8] = exp[:8] + rng.normal(0, 0.4, (8, H, W))
+        return exp, dic
+
+    def test_every_similarity_matches(self, pair):
+        """The whole (P, D) matrix, not just the winners."""
+        exp, dic = pair
+        ref = self._reference(exp, dic)
+        got = dictionary_index(exp, dic, keep=len(dic), device="cpu")
+        mine = np.empty_like(ref)
+        for p in range(len(exp)):
+            mine[p, got.indices[p]] = got.scores[p]
+        # Measured max difference 1.8e-7 — float32 rounding on a quantity
+        # bounded by 1, i.e. the two agree to the precision they are computed in.
+        np.testing.assert_allclose(mine, ref, atol=1e-5)
+
+    def test_the_same_pattern_wins(self, pair):
+        exp, dic = pair
+        ref = self._reference(exp, dic)
+        got = dictionary_index(exp, dic, device="cpu")
+        assert (got.best == ref.argmax(1)).all()
+
+    def test_the_winning_score_matches(self, pair):
+        exp, dic = pair
+        ref = self._reference(exp, dic)
+        got = dictionary_index(exp, dic, device="cpu")
+        np.testing.assert_allclose(got.best_score, ref.max(1), atol=1e-5)
+
+    def test_tiling_does_not_move_us_off_the_reference(self, pair):
+        """Parity has to survive the chunking, which is the part kikuchipy
+        does completely differently (dask blocks vs a running top-k)."""
+        exp, dic = pair
+        ref = self._reference(exp, dic)
+        got = dictionary_index(exp, dic, device="cpu", tile_elements=64)
+        assert (got.best == ref.argmax(1)).all()
+        np.testing.assert_allclose(got.best_score, ref.max(1), atol=1e-5)
+
+    @pytest.mark.skipif(
+        not (getattr(torch.backends, "mps", None)
+             and torch.backends.mps.is_available()),
+        reason="no Apple-MPS device")
+    def test_mps_matches_the_reference_too(self, pair):
+        """Metal must land on kikuchipy's answer, not merely on the CPU's."""
+        exp, dic = pair
+        ref = self._reference(exp, dic)
+        got = dictionary_index(exp, dic, device="mps")
+        assert (got.best == ref.argmax(1)).all()
+        np.testing.assert_allclose(got.best_score, ref.max(1), atol=1e-5)

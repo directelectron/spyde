@@ -75,7 +75,17 @@ electron/*_shots/
 
 # Local dev debris
 JSLog
+# `reports/` at the root is scratch output (probe logs, one-off analysis notes)
+# and stays ignored. But the pattern has no anchor, so it matched a directory of
+# that name at ANY depth and silently swallowed two trees that must be tracked:
+# the docs Reports page, and the exported report pages + poster QR codes the
+# docs build serves. Negating the DIRECTORY is what lets git descend again — an
+# excluded directory is pruned, so `!doc/reports/index.rst` alone would not have
+# worked. (The published-report catalogue lives in report-catalogue/ precisely
+# to stay clear of this.)
 reports/
+!/doc/reports/
+!/docs-site/public/media/reports/
 .claude/
 tools/rcedit.exe
 spyde/*.svg.*.svg

@@ -49,6 +49,12 @@ def _indices_to_iyix(indices):
     idx = np.asarray(indices)
     if idx.ndim >= 2:
         idx = idx[0]
+    # A 1-D navigator reports ONE coord (a movie/stack position). There is no
+    # spatial pair to unpack — `idx[-2]` raised IndexError, and because callers
+    # seed this from inside `attach`, the raise aborted the attach AFTER the hook
+    # was already registered, leaving a permanently-throwing hook on the selector.
+    if idx.shape[-1] < 2:
+        return 0, 0
     # The last two coords are the spatial (x, y) pair from the innermost
     # crosshair; anything before them is a higher-level navigator (stack) index.
     ix, iy = int(idx[-2]), int(idx[-1])
@@ -185,9 +191,16 @@ class _DPOverlay:
             if self._on_indices not in sel.index_hooks:
                 sel.index_hooks.append(self._on_indices)
             # Seed from the last-known position so markers appear immediately.
+            # Guarded: a seeding failure must not abort attach() and strand the
+            # hook registered just above — the overlay simply waits for the next
+            # nav move (and the unconditional engine seed below still runs).
             if sel.current_indices is not None:
-                self._on_indices(sel.current_indices)
-                seeded = True
+                try:
+                    self._on_indices(sel.current_indices)
+                    seeded = True
+                except Exception as e:
+                    log.debug("[overlay:%s] seeding from selector indices %r "
+                              "failed: %s", self.name, sel.current_indices, e)
             elif not seeded:
                 # current_indices is only committed by _run_update, which the
                 # navigator's initial update_data() dispatches ASYNCHRONOUSLY on

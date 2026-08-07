@@ -73,18 +73,35 @@ def _nav_blur_trim(ghost_block, depth_px, nav_dim, sigma):
     two full-chunk copies (4x the chunk's bytes) of pure waste per task, and
     with ~36 concurrent tasks it dominated the batch's RAM churn. Every
     downstream detector core converts to float32 itself exactly once."""
-    if depth_px <= 0 and (sigma is None or float(sigma) <= 0.0):
+    return trim_ghost(nav_blur(ghost_block, nav_dim, sigma), depth_px, nav_dim)
+
+
+def nav_blur(ghost_block, nav_dim, sigma):
+    """Nav-space Gaussian blur only — NO ghost trim. See ``_nav_blur_trim`` for
+    why sigma<=0 short-circuits to the raw block rather than paying an identity
+    filter plus a float32 copy of the whole chunk."""
+    if sigma is None or float(sigma) <= 0.0:
         return np.asarray(ghost_block)
     from scipy.ndimage import gaussian_filter as _gf
     sigma_tuple = tuple([0.0] * (nav_dim - 2) + [sigma, sigma, 0.0, 0.0])
-    blurred = _gf(np.asarray(ghost_block, dtype=np.float32), sigma=sigma_tuple)
-    trim = [slice(None)] * ghost_block.ndim
+    return _gf(np.asarray(ghost_block, dtype=np.float32), sigma=sigma_tuple)
+
+
+def trim_ghost(arr, depth_px, nav_dim):
+    """Cut the ghost margin off the two SPATIAL nav axes.
+
+    Works on a data block (nav…, KY, KX) or on a per-frame RESULT array
+    (nav…, MAX_PEAKS, 3) — only the leading nav axes are touched, and they sit at
+    the same positions in both."""
+    if depth_px <= 0:
+        return arr
+    trim = [slice(None)] * arr.ndim
     for d in (nav_dim - 2, nav_dim - 1):
-        s = blurred.shape[d]
+        s = arr.shape[d]
         lo = depth_px if depth_px < s else 0
         hi = s - depth_px if depth_px < s else s
         trim[d] = slice(lo, hi)
-    return blurred[tuple(trim)]
+    return arr[tuple(trim)]
 
 
 def _dog_block(b4d, sigma1, sigma2, threshold, min_dist, subpixel, beamstop_mask):

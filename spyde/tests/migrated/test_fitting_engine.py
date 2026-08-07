@@ -20,7 +20,8 @@ import hyperspy.api as hs
 from hyperspy.components1d import Gaussian, Offset, PowerLaw
 
 from spyde.fitting import ModelSpec
-from spyde.fitting.engine import default_device, fit_batched
+from spyde.fitting.engine import (default_device, fit_batched,
+                                  floor_tolerances, resolve_dtype)
 
 
 # --------------------------------------------------------------------------
@@ -278,10 +279,144 @@ class TestGuards:
 
 class TestDevice:
     def test_default_device_is_reported(self):
-        assert default_device() in ("cpu", "cuda")
+        assert default_device() in ("cpu", "cuda", "mps")
+
+    def test_env_var_forces_the_device(self, monkeypatch):
+        """The escape hatch for benchmarking one box against another."""
+        monkeypatch.setenv("SPYDE_FIT_DEVICE", "cpu")
+        assert default_device() == "cpu"
 
     def test_cpu_is_always_usable(self):
         s, x, _, _ = _make_si(ny=2, nx=2)
         got = fit_batched(ModelSpec.from_model(_seed_model(s)), s.data, x,
                           device="cpu")
         assert got.device == "cpu"
+
+
+# --------------------------------------------------------------------------
+# float32 / MPS
+# --------------------------------------------------------------------------
+
+_HAS_MPS = bool(getattr(torch.backends, "mps", None)
+                and torch.backends.mps.is_available())
+requires_mps = pytest.mark.skipif(not _HAS_MPS, reason="no Apple-MPS device")
+
+
+class TestToleranceFloor:
+    """Metal is float32-only, and the defaults are unreachable there."""
+
+    def test_float64_tolerances_are_left_alone(self):
+        """The floor must not perturb the double-precision path at all."""
+        assert floor_tolerances(torch.float64, 1e-8, 1e-8, 1e-8) == (1e-8,) * 3
+
+    def test_float32_tolerances_are_raised_above_epsilon(self):
+        ftol, xtol, gtol = floor_tolerances(torch.float32, 1e-8, 1e-8, 1e-8)
+        eps = float(torch.finfo(torch.float32).eps)
+        for t in (ftol, xtol, gtol):
+            assert t > eps, "a tolerance below eps can never be satisfied"
+
+    def test_a_coarser_request_is_honoured(self):
+        """The floor only ever RAISES — a user asking for 1e-3 gets 1e-3."""
+        assert floor_tolerances(torch.float32, 1e-3, 1e-3, 1e-3) == (1e-3,) * 3
+
+    def test_mps_downcasts_float64(self):
+        assert resolve_dtype("mps", "float64") == "float32"
+
+    def test_other_devices_keep_the_dtype(self):
+        assert resolve_dtype("cpu", "float64") == "float64"
+        assert resolve_dtype("cuda", "float64") == "float64"
+
+
+class TestFloat32Convergence:
+    """THE regression test for the 'correct fit, reported as failed' bug.
+
+    float32's epsilon is 1.19e-7, so the 1e-8 defaults were strictly
+    unsatisfiable: every position came back ``converged=False`` even though the
+    parameters matched multifit to ~1e-5. The user saw "did not converge" and a
+    0% coverage map on a fit that was fine, and every fit burned its whole
+    iteration budget getting there.
+    """
+
+    def test_clean_data_converges_in_float32(self):
+        s, x, _, _ = _make_si(noise=0.0)
+        got = fit_batched(ModelSpec.from_model(_seed_model(s)), s.data, x,
+                          device="cpu", dtype="float32")
+        assert got.convergence_rate == 1.0, (
+            f"float32 reported {got.convergence_rate:.0%} converged on clean "
+            f"data that float64 fits perfectly")
+
+    def test_float32_stops_early_instead_of_burning_the_budget(self):
+        """Non-convergence was not just cosmetic — it cost every iteration."""
+        s, x, _, _ = _make_si(noise=0.0)
+        got = fit_batched(ModelSpec.from_model(_seed_model(s)), s.data, x,
+                          device="cpu", dtype="float32", max_iter=60)
+        assert got.n_iter < 60
+
+    def test_float32_matches_multifit(self):
+        """Parity is a DTYPE question, so pin it on the CPU where every
+        machine runs it; the MPS test below then only has to show the device
+        agrees with this."""
+        s, x, _, _ = _make_si(noise=0.05)
+        ref = _seed_model(s)
+        ref.multifit(optimizer="lm", show_progressbar=False)
+        ref_maps = np.stack([
+            ref[0].offset.map["values"].ravel(),
+            ref[1].A.map["values"].ravel(),
+            ref[1].centre.map["values"].ravel(),
+            ref[1].sigma.map["values"].ravel()], axis=1)
+
+        spec = ModelSpec.from_model(_seed_model(s))
+        got = fit_batched(spec, s.data, x, device="cpu", dtype="float32")
+        order = spec.parameter_names()
+        cols = [order.index(n) for n in
+                ["Offset.offset", "Gaussian.A", "Gaussian.centre",
+                 "Gaussian.sigma"]]
+        # Measured max relative deviation 9.3e-6 (float64 gets 8.4e-8). 1e-4
+        # keeps real headroom without letting a genuine regression through.
+        np.testing.assert_allclose(got.values[:, cols], ref_maps,
+                                   rtol=1e-4, atol=1e-5)
+
+
+@requires_mps
+class TestMPSParity:
+    """Metal must agree with the CPU running the same dtype.
+
+    Separating this from the dtype test above is deliberate: if both drifted
+    together the cause is float32, and if only this one moves the cause is the
+    device. Measured on an M1 Air: CPU-float32 9.309e-6 vs MPS-float32 9.568e-6
+    against multifit — i.e. the device contributes essentially nothing.
+    """
+
+    def test_mps_agrees_with_cpu_float32(self):
+        s, x, _, _ = _make_si(noise=0.05)
+        spec_c = ModelSpec.from_model(_seed_model(s))
+        spec_m = ModelSpec.from_model(_seed_model(s))
+        cpu = fit_batched(spec_c, s.data, x, device="cpu", dtype="float32")
+        mps = fit_batched(spec_m, s.data, x, device="mps", dtype="float32")
+        np.testing.assert_allclose(mps.values, cpu.values, rtol=2e-4,
+                                   atol=1e-5)
+
+    def test_mps_matches_multifit(self):
+        s, x, _, _ = _make_si(noise=0.05)
+        ref = _seed_model(s)
+        ref.multifit(optimizer="lm", show_progressbar=False)
+        want = ref[1].centre.map["values"].ravel()
+
+        spec = ModelSpec.from_model(_seed_model(s))
+        got = fit_batched(spec, s.data, x, device="mps")
+        col = spec.parameter_names().index("Gaussian.centre")
+        np.testing.assert_allclose(got.values[:, col], want, rtol=1e-4,
+                                   atol=1e-5)
+
+    def test_float64_request_is_downcast_not_an_error(self):
+        """Metal has no float64; the default dtype must not blow up on it."""
+        s, x, _, _ = _make_si(ny=2, nx=2)
+        got = fit_batched(ModelSpec.from_model(_seed_model(s)), s.data, x,
+                          device="mps", dtype="float64")
+        assert np.isfinite(got.values).all()
+
+    def test_mps_converges(self):
+        s, x, _, _ = _make_si(noise=0.0)
+        got = fit_batched(ModelSpec.from_model(_seed_model(s)), s.data, x,
+                          device="mps")
+        assert got.convergence_rate == 1.0

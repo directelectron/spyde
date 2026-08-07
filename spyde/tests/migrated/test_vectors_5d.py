@@ -227,3 +227,145 @@ class TestFiveDResultDisplay:
         tree, _s, _t, sel = self._tree(v4)
         _attach_time_slice_repaint(tree, v4)
         assert sel.index_hooks == []
+
+
+class TestFiveDResultWiringOnARealTree:
+    """The 5-D result window built by the REAL MultiplotManager.
+
+    ``TestFiveDResultDisplay`` above stands the nav plots up by hand, and that is
+    exactly why it could not see these: both faults are in how the real
+    three-level window (1-D stack → 2-D real space → DP) is WIRED.
+
+      * ``MultiplotManager.add_navigation_selector_and_signal_plot`` filed the
+        intermediate real-space NAVIGATOR in ``tree.signal_plots``. Find-Vectors
+        then installed the DP's render-frame slice function on the stack
+        selector, so the real-space window drew diffraction patterns — and every
+        other consumer of ``signal_plots[0]`` ("the DP" to strain / IPF / EBSD /
+        fit / commit) addressed the wrong window too.
+      * plots were matched by ``current_data.shape``, which is None until the
+        first async paint lands. The miss pushed a 2-D count map onto the 1-D
+        stack navigator, whose ``set_data`` then raised — leaving it a flat zero
+        line for the rest of the session.
+    """
+
+    def _session_with_5d(self):
+        import hyperspy.api as hs
+        from spyde.backend.session import Session
+        session = Session(n_workers=1, threads_per_worker=1)
+        data = np.zeros((2, 2, 3, 8, 8), dtype=np.float32)
+        data[..., 4, 4] = 100.0
+        s = hs.signals.Signal2D(data)
+        s.metadata.General.title = "stack"
+        tree = session._add_signal(s)
+        return session, tree
+
+    def test_the_intermediate_navigator_is_not_a_signal_plot(self):
+        session, tree = self._session_with_5d()
+        try:
+            assert tree.root.axes_manager.navigation_dimension == 3
+            navs = [p for p in tree.signal_plots
+                    if getattr(p, "is_navigator", False)]
+            assert navs == [], (
+                "the real-space navigator was filed as a signal plot: "
+                f"{[(id(p), getattr(p, 'is_navigator', None)) for p in tree.signal_plots]}")
+            assert len(tree.signal_plots) == 1, \
+                "a 5-D tree has exactly one signal plot (the DP)"
+        finally:
+            session.shutdown()
+
+    def test_render_fn_goes_to_the_dp_and_the_count_map_to_the_navigator(self):
+        from spyde.actions.find_vectors_action import (
+            _install_render_display, _all_nav_plots,
+        )
+        session, tree = self._session_with_5d()
+        try:
+            v = _make_5d()
+            _install_render_display(tree, v)
+            dp = tree.signal_plots[0]
+            spatial = [p for p in _all_nav_plots(tree)
+                       if getattr(p, "is_navigator", False)
+                       and getattr(p, "current_data", None) is not None
+                       and np.asarray(p.current_data).shape == v.nav_shape]
+
+            installed = {}
+            for sel in tree.navigator_plot_manager.all_navigation_selectors:
+                for child, fn in sel.children.items():
+                    installed[id(child)] = getattr(fn, "__name__", str(fn))
+
+            assert installed.get(id(dp)) == "_fn", (
+                "the DP is not driven by the vectors renderer: "
+                f"{installed.get(id(dp))}")
+            for nav in spatial:
+                assert installed.get(id(nav)) != "_fn", (
+                    "the real-space navigator got the DP renderer — this is the "
+                    "'real space shows a diffraction pattern' bug")
+                assert installed.get(id(nav)) == "_count_fn", (
+                    "the real-space navigator should slice the per-slice count "
+                    f"map, got {installed.get(id(nav))}")
+        finally:
+            session.shutdown()
+
+    def test_the_count_fn_returns_that_slices_count_map(self):
+        from spyde.actions.find_vectors_action import _install_render_display
+        session, tree = self._session_with_5d()
+        try:
+            v = _make_5d()
+            _install_render_display(tree, v)
+            count_fn = None
+            for sel in tree.navigator_plot_manager.all_navigation_selectors:
+                for fn in sel.children.values():
+                    if getattr(fn, "__name__", "") == "_count_fn":
+                        count_fn = fn
+            assert count_fn is not None, "no count-map slice function installed"
+            for t in range(v.n_time):
+                out = count_fn(None, None, np.array([[t]]))
+                np.testing.assert_array_equal(out, v.count_map_at_t(t))
+        finally:
+            session.shutdown()
+
+    def test_an_unpainted_stack_navigator_is_still_found(self):
+        """_display_shape must resolve before the first async paint lands —
+        matching on current_data alone is what stranded the time navigator."""
+        from spyde.actions.find_vectors_action import (
+            _display_shape, _nav_plot_with_shape, _all_nav_plots,
+        )
+        session, tree = self._session_with_5d()
+        try:
+            for p in _all_nav_plots(tree):
+                p.current_data = None
+            assert _nav_plot_with_shape(tree, (2, 3)) is not None, \
+                "the 2-D count-map navigator was not found before its first paint"
+            shapes = {_display_shape(p) for p in _all_nav_plots(tree)}
+            assert (2,) in shapes, f"the 1-D stack navigator is missing: {shapes}"
+        finally:
+            session.shutdown()
+
+    def test_finalize_never_pushes_a_2d_map_onto_the_1d_navigator(self):
+        from spyde.actions.find_vectors_action import _finalize, _all_nav_plots
+        from spyde.actions.find_vectors_action import _display_shape
+        session, tree = self._session_with_5d()
+        try:
+            v = _make_5d()
+            painted: dict[int, list] = {}
+            want: dict[int, tuple] = {}
+            for p in _all_nav_plots(tree):
+                p.current_data = None            # nothing has painted yet
+                want[id(p)] = _display_shape(p) or ()
+                real = p.set_data
+
+                def _cap(arr, _p=p, _real=real):
+                    painted.setdefault(id(_p), []).append(np.asarray(arr).shape)
+                    return _real(arr)
+
+                p.set_data = _cap
+            _finalize(tree, v)
+
+            assert painted, "_finalize painted no navigator at all"
+            for pid, shapes in painted.items():
+                for got in shapes:
+                    assert len(got) == len(want[pid]), (
+                        f"a {len(got)}-D array was painted onto a "
+                        f"{len(want[pid])}-D navigator (shape {want[pid]}) — "
+                        "the flat-zero-line bug")
+        finally:
+            session.shutdown()

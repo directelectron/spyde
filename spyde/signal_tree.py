@@ -1180,14 +1180,19 @@ class BaseSignalTree:
             except Exception as e:
                 logger.debug("removing strain controller on tree close failed: %s", e)
             self._strain_controller = None
+        # `_result_vector_overlays` is a LIST (one per signal plot on a vectors
+        # result window — "Add Selector" opens more than one); the rest are single
+        # overlays. Both shapes tear down here so none outlives the tree.
         for attr in ("_fv_preview", "_vector_overlay", "_result_vector_overlay",
+                     "_result_vector_overlays",
                      "_orientation_overlay", "_particle_overlay"):
             ov = getattr(self, attr, None)
-            if ov is not None and hasattr(ov, "remove"):
-                try:
-                    ov.remove()
-                except Exception as e:
-                    logger.debug("removing %s on tree close failed: %s", attr, e)
+            for one in (ov if isinstance(ov, (list, tuple)) else [ov]):
+                if one is not None and hasattr(one, "remove"):
+                    try:
+                        one.remove()
+                    except Exception as e:
+                        logger.debug("removing %s on tree close failed: %s", attr, e)
             if hasattr(self, attr):
                 setattr(self, attr, None)
         for wiz_attr in ("_om_wizard", "_vom_wizard", "_ebsd_wizard",
@@ -1224,6 +1229,21 @@ class BaseSignalTree:
         self.signal_plots = []
         self.navigator_signals = {}
         self.navigator_plot_manager = None
+        # The IPF EXPLORER window (window 2) is a BARE figure window — it has no
+        # Plot, so it is not in the window_ids _close_tree collected and would be
+        # left orphaned on screen. Route it through the real teardown
+        # (controller close + figure eviction + window_closed to the renderer).
+        ipf_win = getattr(self, "_ipf_window", None)
+        if ipf_win is not None:
+            try:
+                self.session._forget_window(getattr(ipf_win, "window_id", None))
+            except Exception as e:
+                logger.debug("closing the IPF explorer window on tree close "
+                             "failed: %s", e)
+                try:
+                    ipf_win.close()
+                except Exception as e2:
+                    logger.debug("IPF window fallback close failed: %s", e2)
         # `source_node` / `source_tree` are the reason this list matters as much
         # as the teardown above: a particle tree holds a back-reference to the
         # movie it was segmented FROM, so leaving them set keeps the source
@@ -1231,7 +1251,7 @@ class BaseSignalTree:
         # is referenced anywhere. Closing the source would then free nothing.
         for attr in ("diffraction_vectors", "orientation_map", "vector_orientation",
                      "_vom_field", "_ipf_result", "_ipf_p3d", "_ipf_picker",
-                     "_render_frame_fn",
+                     "_ipf_window", "_ipf_pick_fn", "_render_frame_fn",
                      "particles", "_seg_pending_particles", "_seg_batch_running",
                      "particle_events",
                      "particle_edits", "nav_traces", "drift",

@@ -423,3 +423,111 @@ class TestParticleEnginesTakeLock:
             clf.predict_class_proba(np.zeros((16, 16), dtype=np.float32))
         assert held == [True], "fast-engine predict ran unserialised on MPS"
         assert not _lock_is_held_by_me(), "lock leaked"
+
+
+class TestZeroThreeZeroPathsTakeLock:
+    """The 0.3.0 compute packages — fitting, EBSD — are torch users too.
+
+    They were written CUDA-or-CPU, so on a Mac they never reached Metal and the
+    missing lock was invisible. Enabling MPS makes them submitters like any
+    other, and CLAUDE.md's rule is the one that matters here: *a lock only works
+    if EVERY participant takes it*, and a new torch call site added without one
+    silently re-opens the crash.
+
+    These assert the lock is taken on the COMPUTE PATH, using a real CPU run and
+    a recording wrapper, so they guard in CI (which has no Metal) rather than
+    skipping exactly where a regression would land. `accelerator_lock` is a null
+    context off MPS, so what is pinned is that the call site EXISTS and is
+    reached — which is the thing that gets forgotten.
+    """
+
+    @staticmethod
+    def _spy(monkeypatch, module):
+        """Wrap a module's `accelerator_lock` and record the devices it guards."""
+        seen = []
+        real = device_lock.accelerator_lock
+
+        def spy(device=None, **kw):
+            seen.append(device)
+            return real(device, **kw)
+
+        monkeypatch.setattr(module, "accelerator_lock", spy)
+        return seen
+
+    def test_fit_batched_locks_every_chunk(self, monkeypatch):
+        from spyde.fitting import engine
+
+        seen = self._spy(monkeypatch, engine)
+        _fit_a_tiny_model(chunk=2)
+        # 4 positions, chunk=2 -> one acquisition per chunk, not one overall:
+        # a whole-scan fit must not hold the device end-to-end.
+        assert len(seen) == 2, f"expected one lock per chunk, got {seen}"
+        assert all(d == "cpu" for d in seen)
+
+    def test_dictionary_index_locks(self, monkeypatch):
+        pytest.importorskip("torch")
+        from spyde.ebsd import indexing
+
+        seen = self._spy(monkeypatch, indexing)
+        rng = np.random.default_rng(0)
+        indexing.dictionary_index(rng.normal(size=(6, 5, 5)).astype("float32"),
+                                  rng.normal(size=(9, 5, 5)).astype("float32"),
+                                  device="cpu")
+        assert seen, "dictionary indexing submitted to the device unserialised"
+
+    def test_the_live_single_pattern_match_locks(self, monkeypatch):
+        """The band overlay's per-navigator-move match — the concurrent
+        submitter most likely to overlap a running index."""
+        pytest.importorskip("torch")
+        from spyde.ebsd import indexing
+
+        rng = np.random.default_rng(0)
+        idx = indexing.SinglePatternIndexer(
+            rng.normal(size=(9, 5, 5)).astype("float32"),
+            rng.normal(size=(9, 3)), device="cpu")
+        seen = self._spy(monkeypatch, indexing)
+        idx.best(rng.normal(size=(5, 5)))
+        assert seen, "live single-pattern match ran unserialised"
+
+    def test_remove_background_locks(self, monkeypatch):
+        pytest.importorskip("torch")
+        from spyde.ebsd import preprocess
+
+        seen = self._spy(monkeypatch, preprocess)
+        rng = np.random.default_rng(0)
+        # sigma small enough that the blur radius fits the pattern.
+        preprocess.remove_background(
+            rng.normal(size=(4, 16, 16)).astype("float32"), sigma=2.0,
+            device="cpu")
+        assert seen, "background removal ran unserialised"
+
+    def test_average_dot_product_map_locks(self, monkeypatch):
+        pytest.importorskip("torch")
+        from spyde.ebsd import preprocess
+
+        seen = self._spy(monkeypatch, preprocess)
+        rng = np.random.default_rng(0)
+        preprocess.average_dot_product_map(
+            rng.normal(size=(3, 3, 6, 6)).astype("float32"), device="cpu")
+        assert seen, "ADP ran unserialised"
+
+
+def _fit_a_tiny_model(**kw):
+    """A 4-position fit, small enough to be instant on the CPU."""
+    import hyperspy.api as hs
+    from hyperspy.components1d import Gaussian, Offset
+
+    from spyde.fitting import ModelSpec
+    from spyde.fitting.engine import fit_batched
+
+    x = np.linspace(0.0, 50.0, 64)
+    data = np.stack([5.0 + a * np.exp(-((x - 25.0) ** 2) / 18.0)
+                     for a in (20.0, 30.0, 40.0, 50.0)])
+    s = hs.signals.Signal1D(data)
+    s.axes_manager.signal_axes[0].offset = x[0]
+    s.axes_manager.signal_axes[0].scale = x[1] - x[0]
+    m = s.create_model()
+    m.extend([Offset(), Gaussian()])
+    m[0].offset.value = 1.0
+    m[1].A.value, m[1].centre.value, m[1].sigma.value = 30.0, 25.0, 2.0
+    return fit_batched(ModelSpec.from_model(m), data, x, device="cpu", **kw)

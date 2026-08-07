@@ -352,6 +352,24 @@ def _do_compute_vectors(
     sigma = float(params["sigma"])
     depth_px = int(np.ceil(3 * sigma))
 
+    # The NEIGHBOUR REFINE needs a ghost zone of its own. It scores each
+    # candidate by the FRACTION of its scan neighbours that show the same peak
+    # (models/refine.persistence_score), so a position at a chunk edge — which
+    # can only see the neighbours inside its own chunk — is scored against a
+    # smaller sample, where "seen in all of them" is easier to satisfy. The
+    # result is a stripe of extra vectors down every chunk seam.
+    #
+    # Measured on the PdCuSi series (47x39 scan, nav chunked 26 wide): ~+15% in
+    # the two boundary columns, and moving the chunk boundary moved the stripe
+    # with it — split at 13 and 26 put stripes at both, while a single nav chunk
+    # was flat. It bites hardest with the NEURAL detector, which is the default
+    # and forces sigma=0, so without this the ghost depth is exactly 0.
+    #
+    # One position of overlap is enough: the refine only ever looks at immediate
+    # scan neighbours.
+    if bool(params.get("persistence", False)):
+        depth_px = max(depth_px, 1)
+
     method = str(params.get("method", METHOD_NXCORR)).lower()
     kernel_r = int(params["kernel_radius"])
     threshold = float(params["threshold"])

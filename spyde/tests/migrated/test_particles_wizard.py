@@ -30,6 +30,7 @@ torch-CUDA work segfaults under the pytest process on Windows (CLAUDE.md).
 """
 from __future__ import annotations
 
+import importlib
 import time
 
 import numpy as np
@@ -1967,6 +1968,15 @@ class TestRasterOverlayAboveThreshold:
         sent, want = self._shipped(p)
         assert sent == want == 512 * 512
 
+    @pytest.mark.skipif(
+        not hasattr(importlib.import_module("anyplotlib.plot2d._plot2d"),
+                    "_reduce_mask_any"),
+        reason="needs anyplotlib fix/overlay-mask-tile-mode (a61d8658): released "
+               "0.7.1 rejects an overview-sized mask in tile mode, so this ships "
+               "broken until that fix is released and the pin is bumped. A "
+               "CAPABILITY probe, not a version gate — the editable dev checkout "
+               "also reports 0.7.1. This skip is a release gate: green-with-skip "
+               "means the tiled overlay-mask feature is NOT in the shipped app.")
     def test_tiled_mask_SHIPS_at_the_OVERVIEW_size(self):
         """The trap this exists for, asserted where it actually bites.
 

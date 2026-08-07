@@ -380,8 +380,19 @@ class IntegratingSelector1D(IntegratingSelectorMixin):
             live_delay=live_delay, multi_selector=multi_selector,
         )
         self.parent = parent
+        # ONE children mapping across the composite and BOTH sub-selectors.
+        #
+        # This shared the point selector's dict but not the region selector's, so
+        # a caller doing `sel.children[child] = fn` (the render-display
+        # installers all do — `all_navigation_selectors` hands them the
+        # composite) reached the update path in POINT mode and lost the write in
+        # INTEGRATE mode, where `_run_update` runs on the region sub-selector.
+        # The child then kept whatever function it was built with. Same fault as
+        # IntegratingSSelector2D, just hidden behind a mode toggle.
         self.children = self._inf_line_selector.children
         self.active_children = self._inf_line_selector.active_children
+        self._linear_region_selector.children = self.children
+        self._linear_region_selector.active_children = self.active_children
 
         # CRITICAL: point each child window's parent_selector at the COMPOSITE
         # (self), not at one of the two inner selectors. Each inner selector's

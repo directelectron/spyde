@@ -29,11 +29,16 @@ from spyde.actions.figure_registry import keep_alive
 from spyde.actions.report.figure_builder import (
     ReportFigureController, build_cell_figure,
 )
+from spyde.actions.report import model
 from spyde.actions.report.model import (
-    IMAGE_EXTS, Cell, FigureSpec, LayerSpec, PanelSpec, ReportDoc, SignalRef,
-    bake_fallback_png, bake_line_fallback_png, move_slide, new_cell_id,
-    read_report, write_report,
+    IMAGE_EXTS, THEME_DEFAULTS, Cell, FigureSpec, LayerSpec, PanelSpec,
+    ReportDoc, SignalRef, bake_fallback_png, bake_line_fallback_png,
+    move_slide, new_cell_id, normalize_theme, read_report, write_report,
 )
+
+#: settings.json key holding the user's DEFAULT deck theme (the "set as default"
+#: verb). Distinct from the per-document theme: this one seeds a NEW deck.
+_DEFAULT_THEME_KEY = "report_default_theme"
 
 log = logging.getLogger(__name__)
 
@@ -343,7 +348,8 @@ class ReportManager:
         """The authoritative ``report_state`` message body."""
         if self.doc is None:
             return {"open": False, "path": None, "title": "", "template": False,
-                    "type": "report", "dirty": False, "cells": []}
+                    "type": "report", "dirty": False,
+                    "theme": dict(model.THEME_DEFAULTS), "cells": []}
         cells = []
         nav_dims_cache: dict = {}
         for c in self.doc.cells:
@@ -451,6 +457,9 @@ class ReportManager:
             # What the next Cmd-Z would reverse (None = nothing). The UI uses it
             # to label the Undo affordance rather than offering a dead button.
             "undo": (self._undo[-1]["label"] if self._undo else None),
+            # The deck's look (colours / type / footer / logo). Always a FULL
+            # dict, so the renderer indexes it without a fallback per use site.
+            "theme": model.normalize_theme(getattr(self.doc, "theme", None)),
             "cells": cells,
         }
 
@@ -528,6 +537,42 @@ class ReportManager:
         import uuid
         return f"vx_{cell.id}_{uuid.uuid4().hex[:8]}", html
 
+    def _orientation_explorer_for_cell(self, cell: Cell) -> "tuple[str, str] | None":
+        """The vectors explorer's sibling for an ORIENTATION cell: resolved
+        source tree carries an orientation result and
+        ``spec.orientation_mode != "image"`` → the self-contained IPF explorer
+        (map + triangle + sphere), as ``(fig_id, html)``, else None.
+
+        Same contract as :meth:`_vectors_explorer_for_cell` in every respect
+        that matters here — one page, one figure, emitted through the ordinary
+        bare-figure path — so the sidebar and the HTML export show the same
+        thing. Tried AFTER vectors: a tree can carry both (find-vectors then
+        vector-OM), and the vectors explorer is the one the user dragged from."""
+        spec = cell.spec
+        if spec is None:
+            return None
+        if getattr(spec, "orientation_mode", "") == "image":
+            return None
+        if _is_scene3d_cell(cell):
+            return None            # a scene cell is already a 3-D snapshot
+        try:
+            from spyde.actions.report.orientation_embed import (
+                orientation_explorer_html, orientation_for_cell,
+            )
+            result = orientation_for_cell(self.session, cell)
+            if result is None:
+                return None
+            html = orientation_explorer_html(result, caption=cell.caption or "",
+                                             cache_key=cell.id)
+            if html is None:       # over the embed cap / no indexed positions
+                return None
+        except Exception as e:
+            log.debug("[report] sidebar orientation explorer build failed "
+                      "(cell %s): %s", cell.id, e)
+            return None
+        import uuid
+        return f"ox_{cell.id}_{uuid.uuid4().hex[:8]}", html
+
     def build_figure_window(self, cell: Cell) -> None:
         """Build (or rebuild) the live figure window for a figure cell and emit
         it through the bare-figure path with ``host:"report"`` + ``cell_id``.
@@ -559,7 +604,8 @@ class ReportManager:
         # EDIT mode (the annotation editor targets the anyplotlib figure, so a cell
         # being edited falls back to the plain snapshot figure it can annotate).
         if cell.id not in self._editing:
-            explorer = self._vectors_explorer_for_cell(cell)
+            explorer = (self._vectors_explorer_for_cell(cell)
+                        or self._orientation_explorer_for_cell(cell))
             if explorer is not None:
                 self._emit_vectors_explorer(cell, explorer)
                 return
@@ -1398,15 +1444,39 @@ def _widget_geometry_to_data(kind, widget, axes, coords) -> "dict | None":
     return None
 
 
+def _max_embed_vectors() -> int:
+    """The interactive-embed vector cap. Lazily imported so ``vectors_embed``
+    (which pulls anyplotlib) isn't loaded just to import this module."""
+    try:
+        from spyde.actions.report.vectors_embed import MAX_EMBED_VECTORS
+        return int(MAX_EMBED_VECTORS)
+    except Exception as e:
+        log.debug("reading the vectors embed cap failed: %s", e)
+        return 3_000_000
+
+
 def _clear_vectors_explorer_cache(cell_id: "str | None" = None) -> None:
-    """Drop the memoized vectors-explorer page(s) (fix #6). Best-effort; a lazy
-    import so vectors_embed (which pulls anyplotlib) isn't loaded at handler
-    import time. ``cell_id`` clears one cell; ``None`` clears all."""
+    """Drop the memoized explorer page(s) — vectors AND orientation (fix #6).
+    Best-effort; a lazy import so the embed modules (which pull anyplotlib)
+    aren't loaded at handler import time. ``cell_id`` clears one cell; ``None``
+    clears all.
+
+    Both are cleared together because both are keyed by cell id and both are
+    invalidated by exactly the same events; a cell that stopped being a vectors
+    cell and became an orientation one would otherwise keep serving the old
+    page from the sibling cache."""
     try:
         from spyde.actions.report.vectors_embed import clear_explorer_cache
         clear_explorer_cache(cell_id)
     except Exception as e:
         log.debug("clear vectors explorer cache failed: %s", e)
+    try:
+        from spyde.actions.report.orientation_embed import (
+            clear_explorer_cache as clear_orientation_cache,
+        )
+        clear_orientation_cache(cell_id)
+    except Exception as e:
+        log.debug("clear orientation explorer cache failed: %s", e)
 
 
 def _manager(session) -> ReportManager:
@@ -1918,16 +1988,101 @@ def _resolve_source_plot(session, source_window_id):
         source_window_id = getattr(session, "_active_window_id", None)
     if source_window_id is None:
         return None
-    return session._plot_by_window_id(int(source_window_id))
+    plot = session._plot_by_window_id(int(source_window_id))
+    if plot is not None:
+        return plot
+    # A controller-backed BARE figure window (the IPF explorer) has no Plot of
+    # its own; it stands in for the map window it belongs to.
+    ctrl = session.controller_by_window_id(int(source_window_id))
+    return getattr(ctrl, "source_plot", None) if ctrl is not None else None
 
 
 # ── handlers ───────────────────────────────────────────────────────────────────
+
+
+def _saved_default_theme(session) -> dict:
+    """The user's "set as default" theme from settings.json, normalised. Absent
+    / unreadable → the built-in look."""
+    try:
+        return normalize_theme(session._settings.get(_DEFAULT_THEME_KEY))
+    except Exception as e:
+        log.debug("reading the default deck theme failed: %s", e)
+        return dict(THEME_DEFAULTS)
 
 
 def report_new(session, plot, payload) -> None:
     mgr = _manager(session)
     mgr.new(template=bool(payload.get("template", False)),
             doc_type=str(payload.get("type", "report") or "report"))
+    # A NEW deck starts from the user's default look — that is the whole point
+    # of "set as default" (the per-document theme is what a saved deck carries).
+    mgr.doc.theme = _saved_default_theme(session)
+    mgr.emit_state()
+
+
+def report_set_theme(session, plot, payload) -> None:
+    """Merge ``payload['theme']`` into the open document's theme.
+
+    A MERGE, not a replace: the theme editor sends only the field the user just
+    changed, so a partial payload must not reset the other eleven."""
+    mgr = _manager(session)
+    if mgr.doc is None:
+        ipc.emit_error("report_set_theme: no open report.")
+        return
+    patch = payload.get("theme")
+    if not isinstance(patch, dict):
+        ipc.emit_error("report_set_theme: no theme.")
+        return
+    merged = dict(normalize_theme(getattr(mgr.doc, "theme", None)))
+    # Only keys the patch actually carries — normalize_theme would otherwise
+    # fill every absent key from the DEFAULTS and wipe the user's other values.
+    merged.update({k: v for k, v in patch.items() if k in THEME_DEFAULTS})
+    mgr.doc.theme = normalize_theme(merged)
+    mgr.doc.touch()
+    mgr.dirty = True
+    mgr.emit_state()
+
+
+def report_theme_set_default(session, plot, payload) -> None:
+    """Persist the OPEN document's theme as the default for every new deck."""
+    mgr = _manager(session)
+    if mgr.doc is None:
+        ipc.emit_error("report_theme_set_default: no open report.")
+        return
+    theme = normalize_theme(getattr(mgr.doc, "theme", None))
+    try:
+        session._settings[_DEFAULT_THEME_KEY] = theme
+        session._save_settings()
+    except Exception as e:
+        ipc.emit_error(f"Saving the default theme failed: {e}")
+        return
+    ipc.emit_status("Saved as your default deck theme")
+
+
+def report_theme_reset(session, plot, payload) -> None:
+    """Drop this document's theme back to the built-in look.
+
+    Deliberately the BUILT-IN look, not the saved default: "reset" that landed
+    you on a customised default would give you no way back to the stock one."""
+    mgr = _manager(session)
+    if mgr.doc is None:
+        ipc.emit_error("report_theme_reset: no open report.")
+        return
+    mgr.doc.theme = dict(THEME_DEFAULTS)
+    mgr.doc.touch()
+    mgr.dirty = True
+    mgr.emit_state()
+
+
+def report_theme_use_default(session, plot, payload) -> None:
+    """Apply the user's saved default theme to the OPEN document."""
+    mgr = _manager(session)
+    if mgr.doc is None:
+        ipc.emit_error("report_theme_use_default: no open report.")
+        return
+    mgr.doc.theme = _saved_default_theme(session)
+    mgr.doc.touch()
+    mgr.dirty = True
     mgr.emit_state()
 
 
@@ -2827,7 +2982,17 @@ def report_add_figure(session, plot, payload) -> None:
     # the viewer-vs-image prompt is skipped for it.
     _tgt = mgr.doc.cell_by_id(payload.get("at_cell")) if payload.get("at_cell") else None
     _target_is_split = _tgt is not None and _tgt.cell_type == "split"
-    if str(payload.get("view", "") or "") == "3d":
+    _view = str(payload.get("view", "") or "")
+    if _view in ("ipf2d", "density", "density3d"):
+        # The other three IPF EXPLORER views are native anyplotlib figures with
+        # no backing Plot array, and the report's snapshot paths capture a Plot
+        # (static) or the scene3d point cloud. Say so plainly rather than
+        # silently capturing the wrong thing (the map window's image, or a
+        # points sphere where the user dragged a density one).
+        ipc.emit_error("report_add_figure: only the 3-D Points IPF view can be "
+                       "captured into a report — switch to [3D] · [Points].")
+        return
+    if _view == "3d":
         snap = _snapshot_scene3d(session, src)
         if snap is None:
             ipc.emit_error("report_add_figure: source window has no 3-D "
@@ -2846,16 +3011,27 @@ def report_add_figure(session, plot, payload) -> None:
                     # show 0 rather than crash the choice prompt, but don't swallow
                     # an unrelated error (that would be a real bug worth surfacing).
                     count = 0
-                ipc.emit({
-                    "type": "report_vectors_choice",
-                    "source_window_id": payload.get("source_window_id"),
-                    "index": payload.get("index"),
-                    "at_cell": payload.get("at_cell"),
-                    "caption": str(payload.get("caption", "") or ""),
-                    "count": count,
-                    "slide_break": payload.get("slide_break"),
-                })
-                return
+                # Over the embed cap the explorer CANNOT be built (the blob would
+                # run to hundreds of MB). Prompting anyway meant "viewer" silently
+                # fell back to the static snapshot — a cell that looks broken with
+                # no explanation. Skip the prompt, say why, take the image.
+                cap = _max_embed_vectors()
+                if count > cap:
+                    ipc.emit_status(
+                        f"Report: {count:,} vectors exceeds the {cap:,} "
+                        "interactive-embed limit — added as a static image.")
+                    vectors_mode = "image"
+                else:
+                    ipc.emit({
+                        "type": "report_vectors_choice",
+                        "source_window_id": payload.get("source_window_id"),
+                        "index": payload.get("index"),
+                        "at_cell": payload.get("at_cell"),
+                        "caption": str(payload.get("caption", "") or ""),
+                        "count": count,
+                        "slide_break": payload.get("slide_break"),
+                    })
+                    return
         snap = _snapshot_plot(src)
         if snap is None:
             ipc.emit_error("report_add_figure: source window has no image to snapshot.")

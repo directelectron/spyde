@@ -357,15 +357,30 @@ def _find_vectors_chunk_neural(
 
     from spyde.actions.find_vectors import MAX_PEAKS, _nav_blur_trim
 
+    from spyde.actions.find_vectors.chunk import nav_blur, trim_ghost
+
     t_start = time.perf_counter()
-    blurred = _nav_blur_trim(ghost_block, depth_px, nav_dim, sigma)
+    # The NEIGHBOUR REFINE has to see the ghost ring. It scores a candidate by
+    # the FRACTION of that position's scan neighbours showing the same peak, so
+    # a frame trimmed to a chunk edge is judged against 3 neighbours instead of
+    # 4 — and the same evidence scores higher out of 3. The result was a stripe
+    # of extra vectors down every chunk seam: measured ~+15% in the boundary
+    # columns on the PdCuSi series, and moving the chunk boundary moved the
+    # stripe with it (a single nav chunk was flat).
+    #
+    # So when refining, detect on the PADDED grid and trim the RESULT instead of
+    # the input. Costs one extra frame-ring of detection per chunk (~12% on a
+    # 47x26 core) and only when persistence is on.
+    refine_padded = bool(persistence) and depth_px > 0
+    blurred = nav_blur(ghost_block, nav_dim, sigma)
+    if not refine_padded:
+        blurred = trim_ghost(blurred, depth_px, nav_dim)
     nav_shape = blurred.shape[:nav_dim]
     ny, nx = nav_shape[-2:]
     if nav_dim == 2:
         result = _neural_block(blurred, threshold, min_dist, subpixel,
                                beamstop_mask, model_id, bg_sigma, persistence,
                                spot_radius)
-        core_shape = result.shape[:2]
     else:
         n_lead = nav_shape[0]
         out = np.full((n_lead, ny, nx, MAX_PEAKS, 3), np.nan, dtype=np.float32)
@@ -374,7 +389,9 @@ def _find_vectors_chunk_neural(
                                    beamstop_mask, model_id, bg_sigma, persistence,
                                    spot_radius)
         result = out
-        core_shape = (n_lead, ny, nx)
+    if refine_padded:
+        result = trim_ghost(result, depth_px, nav_dim)
+    core_shape = result.shape[:nav_dim]
     log.debug("[find_vectors] neural chunk core=%s total=%.0fms",
               tuple(int(s) for s in core_shape), (time.perf_counter() - t_start) * 1e3)
     return result

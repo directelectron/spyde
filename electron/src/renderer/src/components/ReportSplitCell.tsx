@@ -34,16 +34,22 @@ import { useSpyDE } from '../kernel/SpyDEContext'
 import { renderMarkdown } from '../kernel/markdown'
 import { reportClipboard } from '../kernel/reportClipboard'
 import type { ReportCell } from '../kernel/protocol'
-import { FIGURE_DRAG_MIME, WINDOW_DRAG_MIME } from '../kernel/dnd'
+import { FIGURE_DRAG_MIME, WINDOW_DRAG_MIME, peekWindowDrag } from '../kernel/dnd'
 import { AnchoredMenu } from './AnchoredMenu'
 import { CellChrome } from './CellChrome'
+import { AddFigureMenu } from './AddFigureMenu'
 import { SeamlessFigureFrame, FigureEditOverlay } from './ReportFigureCell'
+import { ComposeZones, ZONE_TILE, hoverZoneAt, type HoverZone } from './composeDrop'
+import { dlog, dlogOnce } from '../kernel/dragDiag'
 
 const DROP_MIMES = [FIGURE_DRAG_MIME, WINDOW_DRAG_MIME]
 const isComposeDrag = (dt: DataTransfer) => DROP_MIMES.some(m => dt.types.includes(m))
 
 /** The figure payload of a pill drop: the source window id (+ the shown figure
- *  id / view tag when the FIGURE_DRAG_MIME payload carries them). */
+ *  id / view tag when the FIGURE_DRAG_MIME payload carries them).
+ *
+ *  Falls back to the in-process stash when `getData()` returns nothing — see
+ *  ReportFigureCell's copy and dnd.ts for why that happens. */
 interface DropFigurePayload { windowId: number; figId?: string; view?: string }
 function figurePayloadFromDrop(dt: DataTransfer): DropFigurePayload | null {
   const fig = dt.getData(FIGURE_DRAG_MIME)
@@ -60,6 +66,8 @@ function figurePayloadFromDrop(dt: DataTransfer): DropFigurePayload | null {
     const n = parseInt(win, 10)
     if (Number.isFinite(n)) return { windowId: n }
   }
+  const stashed = peekWindowDrag()
+  if (stashed) return stashed
   return null
 }
 
@@ -91,8 +99,18 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
   const [figEditOpen, setFigEditOpen] = useState(false)
   const [draft, setDraft] = useState(cell.source ?? '')
   const [dropHover, setDropHover] = useState(false)
+  // Which compose zone the cursor is over the FILLED figure side (null = none).
+  // A split block's figure is a first-class report figure, so dropping a second
+  // window on its EDGE must tile into a subplot grid exactly as it does on a
+  // plain figure cell — before this it only ever replaced the figure.
+  const [hoverZone, setHoverZone] = useState<HoverZone | null>(null)
+  // The ＋ chrome button's window picker (the click path to a subplot grid).
+  const [addMenu, setAddMenu] = useState(false)
   const taRef = useRef<HTMLTextAreaElement>(null)
   const rootRef = useRef<HTMLDivElement>(null)
+
+  // Drop the stale highlight as soon as the drag ends (the shield unmounts).
+  React.useEffect(() => { if (dragKind == null) setHoverZone(null) }, [dragKind])
 
   const LAYOUTS = ['text-left', 'text-right', 'text-top', 'text-bottom'] as const
   type Layout = typeof LAYOUTS[number]
@@ -137,6 +155,23 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
       return next
     })
   }
+  // PRESENTING closes the figure editor — edit mode rebuilds the figure WITH
+  // draggable widgets (per-panel grips, selection outlines) and the presented
+  // slide re-mounts that same live figure, so an open editor put editing chrome
+  // on screen in front of an audience. Mirrors ReportFigureCell.
+  const figEditOpenRef = useRef(figEditOpen)
+  useEffect(() => { figEditOpenRef.current = figEditOpen }, [figEditOpen])
+  useEffect(() => {
+    const onPresent = () => {
+      if (!figEditOpenRef.current) return
+      setFigEditOpen(false)
+      sendAction('repfig_set_edit_mode', { cell_id: cell.id, editing: false })
+    }
+    window.addEventListener('spyde:report_present', onPresent)
+    return () => window.removeEventListener('spyde:report_present', onPresent)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cell.id])
+
   // Remove JUST the figure/photo side — converts this block to a plain text
   // cell (report_split_remove_figure), preserving the text side. Shown on the
   // figure pane's OWN hover chrome (not the block-level CellChrome trio, which
@@ -194,6 +229,51 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
     })
   }
 
+  // ── Compose drop on the FILLED figure side ────────────────────────────────
+  // The empty-dropzone path above fills the side (onFigDrop). Once it HOLDS a
+  // figure, the same 5 zones a plain figure cell offers apply: an EDGE tiles the
+  // dropped window in beside/above it (→ an anyplotlib subplots grid), the
+  // CENTER replaces the figure (the split's long-standing behaviour, now
+  // labelled so it doesn't read as a dead drop).
+  const onComposeDragOver = (e: React.DragEvent) => {
+    if (!isComposeDrag(e.dataTransfer)) return
+    e.preventDefault()
+    e.stopPropagation()
+    e.dataTransfer.dropEffect = 'copy'
+    setHoverZone(hoverZoneAt(e, cell.figure))
+  }
+  const onComposeDragLeave = (e: React.DragEvent) => {
+    if (!(e.currentTarget as HTMLElement).contains(e.relatedTarget as Node)) {
+      setHoverZone(null)
+    }
+  }
+  const onComposeDrop = (e: React.DragEvent) => {
+    if (!isComposeDrag(e.dataTransfer)) {
+      dlog('5.split-shield/drop-REJECTED', {
+        cell: cell.id, types: Array.from(e.dataTransfer.types),
+      })
+      return
+    }
+    e.preventDefault()
+    e.stopPropagation()
+    const hz = hoverZoneAt(e, cell.figure)
+    setHoverZone(null)
+    const src = figurePayloadFromDrop(e.dataTransfer)
+    dlog('5.split-shield/drop', {
+      cell: cell.id, zone: hz.zone, resolvedSourceWindow: src?.windowId ?? null,
+    })
+    if (src == null) {
+      dlog('5b.split-drop-ABORTED-no-source-window', { cell: cell.id })
+      return
+    }
+    if (hz.zone === 'center') { onFigDrop(e); return }
+    dlog('6.split/sendAction/repfig_compose', { cell: cell.id, mode: ZONE_TILE[hz.zone] })
+    sendAction('repfig_compose', {
+      cell_id: cell.id, mode: ZONE_TILE[hz.zone], source_window_id: src.windowId,
+      ...(hz.panelId != null ? { target_panel_id: hz.panelId } : {}),
+    })
+  }
+
   // ── Copy / Duplicate ──────────────────────────────────────────────────────
   // A split block's live figure side isn't round-trippable through the internal
   // clipboard (report_paste_cell has no split branch — Wave A), so Copy mirrors
@@ -204,12 +284,6 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
   const doCopy = () => reportClipboard.set({
     cell_type: 'markdown', source: cell.source ?? '', html: rendered,
   })
-  const doDuplicate = () =>
-    sendAction('report_add_split_cell', {
-      index: index + 1, source: cell.source ?? '',
-      caption: cell.caption ?? '', layout,
-    })
-
   // ── The two panes ─────────────────────────────────────────────────────────
   const textPane = (
     <div style={styles.pane} data-testid={`report-split-text-${cell.id}`}>
@@ -279,14 +353,27 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
               bubble to the cell root's dragProps). Mounted only during a drag. */}
           {(reorderActive || dragKind === 'window') && (
             <div
+              ref={() => dlogOnce('3.split-shield/mounted', { cell: cell.id })}
               data-testid={`report-split-shield-${cell.id}`}
               style={styles.shield}
               {...(dragKind === 'window' ? {
-                onDragOver: onFigDragOver,
-                onDragLeave: () => setDropHover(false),
-                onDrop: onFigDrop,
+                // dragEnter as well as dragOver: waiting for the first dragOver
+                // to paint the zones is what made them "flash" — they showed up
+                // only after the pointer had already moved past the edge strip.
+                onDragEnter: onComposeDragOver,
+                onDragOver: onComposeDragOver,
+                onDragLeave: onComposeDragLeave,
+                onDrop: onComposeDrop,
               } : {})}
-            />
+            >
+              {hoverZone != null && (
+                <ComposeZones
+                  active={hoverZone.zone} cellId={cell.id}
+                  panelRect={hoverZone.panelRect} panelLabel={hoverZone.panelLabel}
+                  centerLabel="Replace figure"
+                />
+              )}
+            </div>
           )}
           {figHover && (
             <button
@@ -365,7 +452,7 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
           cellId={cell.id}
           styles={{ chrome: { ...styles.chrome, ...(hover ? styles.chromeHover : {}) }, chromeBtn: styles.chromeBtn }}
           onCopy={doCopy}
-          onDuplicate={doDuplicate}
+          onAddFigure={() => setAddMenu(v => !v)}
           onDelete={onRemove}
           deleteTestid={`report-splitcell-delete-${cell.id}`}
           deleteTitle="Delete split block"
@@ -435,6 +522,19 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
               </div>
             </>
           }
+        />
+      )}
+
+      {/* ＋ picker. On an EMPTY figure side it FILLS (report_add_figure at_cell);
+          once filled it tiles into a grid like a plain figure cell. */}
+      {addMenu && (
+        <AddFigureMenu
+          cellId={cell.id}
+          hasFigure={isLive && !!fig}
+          onClose={() => setAddMenu(false)}
+          onFill={(windowId) => sendAction('report_add_figure', {
+            source_window_id: windowId, at_cell: cell.id,
+          })}
         />
       )}
 
