@@ -5,6 +5,7 @@ the OM refine step (`spyde.actions.ipf_refine`), on the real Silver .cif library
 import os
 
 import numpy as np
+import pytest
 import hyperspy.api as hs
 
 CIF = os.path.join(os.path.dirname(__file__), "..", "Silver__0011135.cif")
@@ -21,7 +22,14 @@ def _sig(nav=(3, 3), sig=(64, 64), scale=0.0134):
     return s
 
 
-def _lib():
+@pytest.fixture(scope="module")
+def lib():
+    """One (signal, library, cache, n_templates) build for the whole module.
+
+    The Silver .cif library + matching cache cost ~5 s and every consumer is
+    read-only: match_correlations takes rot_mask as an argument,
+    build_refine_figure/RefineIpfController build fresh figures per test, and
+    nothing mutates sim or the cache."""
     from orix.crystal_map import Phase
     from spyde.actions.orientation_compute import (
         generate_library_from_phases, build_matching_cache, template_tables,
@@ -39,9 +47,9 @@ def _lib():
 
 
 class TestIpfRefine:
-    def test_build_phase_ipf_geometry(self):
+    def test_build_phase_ipf_geometry(self, lib):
         from spyde.actions import ipf_refine
-        _s, sim, _c, n = _lib()
+        _s, sim, _c, n = lib
         infos = ipf_refine.build_phase_ipf(sim)
         assert len(infos) == 1                       # single phase (Ag)
         info = infos[0]
@@ -52,23 +60,23 @@ class TestIpfRefine:
         assert (info["xs"] >= info["mins"][0] - 1e-6).all()
         assert (info["xs"] <= info["maxs"][0] + 1e-6).all()
 
-    def test_match_correlations_full_length(self):
+    def test_match_correlations_full_length(self, lib):
         from spyde.actions import ipf_refine
-        s, sim, cache, n = _lib()
+        s, sim, cache, n = lib
         pat = np.asarray(s.data[1, 1], float)
         corr, best = ipf_refine.match_correlations(pat, sim, cache, gamma=0.5)
         assert corr.shape == (n,)
         assert corr.max() > 0 and np.isfinite(corr).all()
         assert int(best[0]) == int(np.argmax(corr))   # best row == argmax template
 
-    def test_build_uses_single_raster_not_polygons(self):
+    def test_build_uses_single_raster_not_polygons(self, lib):
         """The heatmap is ONE RGBA raster (not ~9k recoloured polygons), and the
         static markers (mask circles, outline, corner labels, best-match scatter)
         still exist alongside it."""
         from spyde.actions import ipf_refine
         from spyde.actions.ipf_refine_render import build_refine_figure
 
-        _s, sim, _cache, _n = _lib()
+        _s, sim, _cache, _n = lib
         infos = ipf_refine.build_phase_ipf(sim)
         _fig, _fid, _html, panels = build_refine_figure(infos)
         panel = panels[0]
@@ -127,7 +135,7 @@ class TestIpfRefine:
         opaque = rgba[..., 3] == 255
         assert opaque.sum() == n * n - 1
 
-    def test_corr_rgba_matches_polygon_cell_position(self):
+    def test_corr_rgba_matches_polygon_cell_position(self, lib):
         """The raster places each correlation cell at the same (x, y) the old
         `_mesh_geometry` polygon for that cell centred on — using the real sector
         geometry: cell (i, j) sits at y = linspace(mins[1], maxs[1], n)[i], and
@@ -135,7 +143,7 @@ class TestIpfRefine:
         from spyde.actions import ipf_refine
         from spyde.actions.ipf_refine_render import _corr_rgba, _lut, _mesh_geometry
 
-        _s, sim, _cache, _n = _lib()
+        _s, sim, _cache, _n = lib
         info = ipf_refine.build_phase_ipf(sim)[0]
         n = int(info["grid_n"])
         outside = np.asarray(info["outside"]).reshape(n, n)
@@ -167,14 +175,14 @@ class TestIpfRefine:
             assert ex[j] <= cx <= ex[j + 1]
             assert ey[i] <= cy <= ey[i + 1]
 
-    def test_update_panels_pushes_image_not_facecolors(self):
+    def test_update_panels_pushes_image_not_facecolors(self, lib):
         """The live update swaps the raster's pixels (`image_b64`) — NOT per-cell
         facecolors — and still moves the best-match marker + mask circles."""
         from spyde.actions import ipf_refine
         from spyde.actions.ipf_refine_render import (
             build_refine_figure, update_panels, best_xy_for,
         )
-        s, sim, cache, _n = _lib()
+        s, sim, cache, _n = lib
         infos = ipf_refine.build_phase_ipf(sim)
         corr, best = ipf_refine.match_correlations(
             np.asarray(s.data[0, 0], float), sim, cache, gamma=0.5)
@@ -208,9 +216,9 @@ class TestIpfRefine:
         assert len(np.asarray(panel["best"]._data.get("offsets"))) == 1
         assert len(panel["circle_grp"]._data.get("vertices_list")) == 1
 
-    def test_rot_mask_from_circles_restricts(self):
+    def test_rot_mask_from_circles_restricts(self, lib):
         from spyde.actions import ipf_refine
-        s, sim, cache, n = _lib()
+        s, sim, cache, n = lib
         infos = ipf_refine.build_phase_ipf(sim)
         info = infos[0]
         corr, best = ipf_refine.match_correlations(np.asarray(s.data[1, 1], float),
@@ -228,19 +236,19 @@ class TestIpfRefine:
             np.asarray(s.data[1, 1], float), sim, cache, gamma=0.5, rot_mask=mask)
         assert mask[int(best2[0])]
 
-    def test_no_circles_returns_none(self):
+    def test_no_circles_returns_none(self, lib):
         from spyde.actions import ipf_refine
-        infos = ipf_refine.build_phase_ipf(_lib()[1])
+        infos = ipf_refine.build_phase_ipf(lib[1])
         assert ipf_refine.rot_mask_from_circles(infos, {}, 100) is None
 
 
 class TestRefineController:
-    def test_controller_recompute_and_double_click_toggle(self):
+    def test_controller_recompute_and_double_click_toggle(self, lib):
         from spyde.actions import ipf_refine
         from spyde.actions.ipf_refine_render import (
             build_refine_figure, RefineIpfController,
         )
-        s, sim, cache, _n = _lib()
+        s, sim, cache, _n = lib
         infos = ipf_refine.build_phase_ipf(sim)
         _fig, _fid, _html, panels = build_refine_figure(infos)
 
