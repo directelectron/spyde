@@ -14,6 +14,7 @@ import time
 
 import numpy as np
 import hyperspy.api as hs
+from spyde.tests.migrated.conftest import _settle
 
 
 def _nav_wid(session):
@@ -146,7 +147,7 @@ class TestSelectorCloseCleanup:
         # Second signal window + selector off the SAME navigator (the
         # add_selector toolbar action's body — see spyde.actions.base).
         mm.add_navigation_selector_and_signal_plot(navpw)
-        time.sleep(0.3)
+        _settle(session)
 
         sels = list(mm.navigation_selectors[navpw])
         assert len(sels) == 2, "expected two selectors on the navigator"
@@ -212,7 +213,7 @@ def _make_5d_session():
     s.set_signal_type("electron_diffraction")
     sess = Session(n_workers=1, threads_per_worker=1)
     sess._add_signal(s, source_path=None)
-    time.sleep(0.6)
+    _settle(sess)
     return sess
 
 

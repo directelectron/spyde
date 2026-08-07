@@ -15,6 +15,7 @@ import time
 
 import numpy as np
 import hyperspy.api as hs
+from spyde.tests.migrated.conftest import _settle
 
 
 def _signal_plot(session):
@@ -50,7 +51,7 @@ class TestFindVectorsPort:
         session = Session(n_workers=1, threads_per_worker=1)
         try:
             session._add_signal(_diffraction_4d(), source_path=None)
-            time.sleep(0.4)
+            _settle(session)
             src_plot = _signal_plot(session)
             assert src_plot is not None
             trees_before = len(session.signal_trees)
@@ -74,31 +75,12 @@ class TestFindVectorsPort:
             cm = vecs.count_map()
             assert cm.shape == (4, 5)
             assert int(cm.sum()) > 0, "no vectors found on a clear bright-disk scan"
-        finally:
-            session.shutdown()
 
-    def test_result_window_renders_vectors_and_overlays(self):
-        """Qt parity: once computed, the result window must (a) render the disk
-        frames when navigated — NOT the stale placeholder zeros — and (b) carry a
-        red found-vectors marker overlay tracking its count-map navigator."""
-        from spyde.backend.session import Session
-        session = Session(n_workers=1, threads_per_worker=1)
-        try:
-            session._add_signal(_diffraction_4d(), source_path=None)
-            time.sleep(0.4)
-            src_plot = _signal_plot(session)
-            assert src_plot is not None
-
-            session._dispatch_toolbar_action(
-                src_plot, "Find Diffraction Vectors",
-                {"sigma": 1.0, "kernel_radius": 5, "threshold": 0.4,
-                 "min_distance": 3, "subpixel": True, "method": "nxcorr"},
-            )
-            assert _wait(lambda: getattr(session.signal_trees[-1],
-                                         "diffraction_vectors", None) is not None)
-            vtree = session.signal_trees[-1]
-
-            cm = vtree.diffraction_vectors.count_map()
+            # Qt parity, on the SAME computed result (this was a separate test
+            # re-running the byte-identical dispatch): once computed, the
+            # result window must (a) render the disk frames when navigated —
+            # NOT the stale placeholder zeros — and (b) carry a red
+            # found-vectors marker overlay tracking its count-map navigator.
             iy, ix = map(int, np.argwhere(cm > 0)[0])
 
             # (a) The navigator now slices via an IN-PROCESS render_frame function
@@ -135,11 +117,11 @@ class TestFindVectorsPort:
         try:
             s = hs.signals.Signal2D(np.random.RandomState(0).rand(16, 16).astype(np.float32))
             session._add_signal(s, source_path=None)
-            time.sleep(0.3)
+            _settle(session)
             plot = _signal_plot(session)
             before = len(session.signal_trees)
             session._dispatch_toolbar_action(plot, "Find Diffraction Vectors", {})
-            time.sleep(0.3)
+            _settle(session)
             # No vectors tree created for a 2-D image.
             assert len(session.signal_trees) == before
         finally:

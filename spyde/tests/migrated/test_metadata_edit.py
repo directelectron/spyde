@@ -15,6 +15,7 @@ import time
 
 import numpy as np
 import hyperspy.api as hs
+from spyde.tests.migrated.conftest import _settle
 
 
 def _signal_plot(session):
@@ -31,7 +32,7 @@ class TestSetMetadataAction:
             s = hs.signals.Signal2D(np.zeros((4, 5, 24, 24), np.float32))
             s.set_signal_type("electron_diffraction")
             session._add_signal(s)
-            time.sleep(0.3)
+            _settle(session)
             plot = _signal_plot(session)
             tree = plot.signal_tree
 
@@ -64,7 +65,7 @@ class TestSetMetadataAction:
         try:
             s = hs.signals.Signal2D(np.zeros((8, 8), np.float32))
             session._add_signal(s)
-            time.sleep(0.3)
+            _settle(session)
             plot = _signal_plot(session)
             tree = plot.signal_tree
 
@@ -86,7 +87,7 @@ class TestSetMetadataAction:
             s = hs.signals.Signal2D(np.zeros((8, 8), np.float32))
             s.metadata.set_item("Acquisition_instrument.TEM.magnification", 5000.0)
             session._add_signal(s)
-            time.sleep(0.3)
+            _settle(session)
             plot = _signal_plot(session)
             tree = plot.signal_tree
 
@@ -111,7 +112,7 @@ class TestSetMetadataAction:
             s = hs.signals.Signal2D(np.zeros((8, 8), np.float32))
             s.metadata.set_item("Acquisition_instrument.TEM.magnification", 5000.0)
             session._add_signal(s)
-            time.sleep(0.3)
+            _settle(session)
             plot = _signal_plot(session)
             tree = plot.signal_tree
 
@@ -140,7 +141,7 @@ class TestSetMetadataAction:
             s = hs.signals.Signal2D(np.zeros((8, 8), np.float32))
             s.metadata.set_item("Acquisition_instrument.TEM.magnification", 5000.0)
             session._add_signal(s)
-            time.sleep(0.3)
+            _settle(session)
             plot = _signal_plot(session)
             tree = plot.signal_tree
 
@@ -162,7 +163,7 @@ class TestSetMetadataAction:
         try:
             s = hs.signals.Signal2D(np.zeros((8, 8), np.float32))
             session._add_signal(s)
-            time.sleep(0.3)
+            _settle(session)
             plot = _signal_plot(session)
             tree = plot.signal_tree
 
@@ -181,7 +182,7 @@ class TestSetMetadataAction:
         try:
             s = hs.signals.Signal2D(np.zeros((8, 8), np.float32))
             session._add_signal(s)
-            time.sleep(0.3)
+            _settle(session)
             plot = _signal_plot(session)
             session._set_metadata(
                 plot, {"group": "Nonexistent Group", "prop": "Nope", "value": "1"}

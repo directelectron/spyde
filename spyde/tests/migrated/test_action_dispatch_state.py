@@ -10,6 +10,7 @@ test_action_dispatch_state.py — dispatch-side state contracts:
 from __future__ import annotations
 
 import time
+from spyde.tests.migrated.conftest import _settle
 
 
 def _signal_plot(session):
@@ -26,7 +27,7 @@ class TestActionInstanceTracked:
         plot = _signal_plot(session)
 
         session._dispatch_toolbar_action(plot, "FFT", {})
-        time.sleep(0.3)
+        _settle(session)
 
         art = session._action_artifacts.get((plot.window_id, "FFT"))
         assert art is not None, "FFT artifacts not tracked"
@@ -37,7 +38,7 @@ class TestActionInstanceTracked:
         session = stem_4d_dataset["window"]
         plot = _signal_plot(session)
         session._dispatch_toolbar_action(plot, "FFT", {})
-        time.sleep(0.3)
+        _settle(session)
 
         art = session._action_artifacts.get((plot.window_id, "FFT"))
         assert art is not None

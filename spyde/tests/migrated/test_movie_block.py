@@ -20,6 +20,7 @@ import pytest
 
 from spyde.actions.report import handlers as H
 from spyde.actions.report import movie as M
+from spyde.tests.migrated.conftest import _settle
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────────
@@ -524,7 +525,14 @@ class TestOverlays:
         cell_id = _add_movie(session, messages)
         M.movie_open(session, None, {"cell_id": cell_id})
         M.movie_play(session, None, {"cell_id": cell_id})
-        time.sleep(0.8)
+        # Poll for >=2 movie_frame events (early exit) instead of a flat 0.8 s
+        # play window.
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            if len([m for m in messages
+                    if m.get("type") == "movie_frame"]) >= 2:
+                break
+            time.sleep(0.02)
         M.movie_stop(session, None, {"cell_id": cell_id})
         frames = [m for m in messages if m.get("type") == "movie_frame"]
         assert len(frames) >= 2, "play did not emit movie_frame events"
@@ -805,7 +813,7 @@ def _big_movie_dataset(session, edge=1100, n_frames=3):
     tax.name, tax.units, tax.scale = "time", "sec", 0.1
     s.set_signal_type("insitu")
     session._add_signal(s, source_path=None)
-    time.sleep(1.0)
+    _settle(session)
 
 
 class TestTileModeInEditor:

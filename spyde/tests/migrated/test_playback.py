@@ -136,9 +136,14 @@ class TestPlayback:
     def test_loop_wraps_to_start(self):
         pb, sel = _controller(n=6, scale=0.005, units="s")
         pb.play(loop=True)
-        time.sleep(0.4)
+        # Poll until the 6-frame movie has demonstrably wrapped (more fires
+        # than frames) instead of a flat 0.4 s window.
+        deadline = time.time() + 10.0
+        while sel.fires <= 6 and time.time() < deadline:
+            time.sleep(0.02)
         looping = pb.is_playing
         pb.pause()
+        assert sel.fires > 6, "playback never wrapped the 6-frame movie"
         assert looping is True, "loop playback should still be running"
 
     # ── real-time pacing ────────────────────────────────────────────────────

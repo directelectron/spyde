@@ -13,6 +13,7 @@ import pytest
 
 from spyde.drawing.selectors.base_selector import MAX_REGION_EXTENT_PER_DIM
 from spyde.drawing.selectors.roi_trace import RoiTrace
+from spyde.tests.migrated.conftest import _settle
 
 
 def _jump_records(caplog):
@@ -170,7 +171,7 @@ class TestWiredIntoTheSelectors:
         tax.name, tax.units, tax.scale = "time", "s", 0.05
         sess = Session(n_workers=1, threads_per_worker=1)
         sess._add_signal(s, source_path=None)
-        time.sleep(0.8)
+        _settle(sess)
         return sess
 
     def test_sliding_an_established_span_is_quiet(self, caplog):

@@ -18,6 +18,7 @@ import numpy as np
 import dask.array as da
 import hyperspy.api as hs
 import pytest
+from spyde.tests.migrated.conftest import _settle
 
 
 def _make_session():
@@ -76,7 +77,7 @@ class TestNavShapePrompt:
             sig = _lazy_4d(nav=(5, 4))
             session._prompt_nav_shape(sig, "scan.mrc")
             session._confirm_nav_shape({"nav_shape": [5, 4], "step_size": 3.0, "units": "nm"})
-            time.sleep(0.4)
+            _settle(session)
 
             tree = session.signal_trees[-1]
             nav_axes = tree.root.axes_manager.navigation_axes
@@ -96,7 +97,7 @@ class TestNavShapePrompt:
             session._prompt_nav_shape(sig, "stack.mrc")
             # Fold 12 → (4, 3) display scan grid with a 2 nm step.
             session._confirm_nav_shape({"nav_shape": [4, 3], "step_size": 2.0, "units": "nm"})
-            time.sleep(0.4)
+            _settle(session)
 
             root = session.signal_trees[-1].root
             assert root.axes_manager.navigation_shape == (4, 3), \
@@ -114,7 +115,7 @@ class TestNavShapePrompt:
             session._prompt_nav_shape(sig, "stack.mrc")
             # 5×3 = 15 ≠ 12 → reshape rejected; opens as-loaded + emits an error.
             session._confirm_nav_shape({"nav_shape": [5, 3], "step_size": 1.0, "units": "nm"})
-            time.sleep(0.4)
+            _settle(session)
             assert _msgs_of(captured_messages, "error"), "no error on bad shape"
             assert _msgs_of(captured_messages, "window_opened"), "should still open as-loaded"
         finally:

@@ -17,6 +17,7 @@ import hyperspy.api as hs
 
 from spyde.signal_node import SignalNode
 from spyde.array_cache.locality import resolve_locality
+from spyde.tests.migrated.conftest import _settle
 
 
 def _node(name, parent, local=None):
@@ -80,7 +81,7 @@ class TestLocalityThroughActions:
                     if not p.is_navigator and p.plot_state is not None)
         act = Rebin2DAction.for_plot(plot, scale_x=2, scale_y=2)
         new = act.run()
-        time.sleep(0.2)
+        _settle(session)
         assert new is not None
         assert tree.resolve_locality(new) is True
 
@@ -93,7 +94,7 @@ class TestLocalityThroughActions:
                     if not p.is_navigator and p.plot_state is not None)
         act = CropAction.for_plot(plot, x0=2, x1=14, y0=4, y1=10)
         new = act.run()
-        time.sleep(0.2)
+        _settle(session)
         assert new is not None
         assert tree.resolve_locality(new) is True
 
@@ -131,7 +132,7 @@ class TestLocalityThroughCZB:
         session = Session(n_workers=1, threads_per_worker=1)
         try:
             session._add_signal(_off_center_4d())
-            time.sleep(0.4)
+            _settle(session)
             src = _signal_plot(session)
             before = src.plot_state.current_signal
             czb_run(session, src, {"method": "center_of_mass"})
@@ -148,7 +149,7 @@ class TestLocalityThroughCZB:
         session = Session(n_workers=1, threads_per_worker=1)
         try:
             session._add_signal(_off_center_4d())
-            time.sleep(0.4)
+            _settle(session)
             src = _signal_plot(session)
             before = src.plot_state.current_signal
             czb_run(session, src, {"method": "center_of_mass", "make_flat_field": True})
@@ -167,7 +168,7 @@ class TestLocalityThroughCZB:
         session = Session(n_workers=1, threads_per_worker=1)
         try:
             session._add_signal(_off_center_4d())
-            time.sleep(0.4)
+            _settle(session)
             src = _signal_plot(session)
             tree = src.signal_tree
             before = src.plot_state.current_signal

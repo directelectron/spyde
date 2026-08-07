@@ -19,6 +19,7 @@ import time
 import pytest
 
 from spyde.backend.tutorial_data import TUTORIAL_LOADERS
+from spyde.tests.migrated.conftest import _settle
 
 
 def _last_tree(session):
@@ -26,10 +27,16 @@ def _last_tree(session):
     return session.signal_trees[-1]
 
 
-def _settle():
-    # Let selector/navigator debounce timers + the (threaded, no-dask) compute
-    # settle before asserting — mirrors conftest._load's own sleep.
-    time.sleep(0.5)
+def _wait_trees(session, n, timeout=5.0):
+    """Poll for the signal-tree count after a close — conftest._settle can't
+    serve there (it waits for painted plots, and a full teardown leaves
+    none)."""
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if len(session.signal_trees) == n:
+            return True
+        time.sleep(0.01)
+    return len(session.signal_trees) == n
 
 
 class TestTutorialLoadersDirect:
@@ -38,7 +45,7 @@ class TestTutorialLoadersDirect:
     def test_navigation_shape(self, window):
         session = window["window"]
         session.tutorial_navigation()
-        _settle()
+        _settle(session)
         tree = _last_tree(session)
         root = tree.root
         am = root.axes_manager
@@ -59,7 +66,7 @@ class TestTutorialLoadersDirect:
     def test_find_vectors_shape(self, window):
         session = window["window"]
         session.tutorial_find_vectors()
-        _settle()
+        _settle(session)
         tree = _last_tree(session)
         am = tree.root.axes_manager
         assert tuple(am.navigation_shape) == (6, 6)
@@ -69,7 +76,7 @@ class TestTutorialLoadersDirect:
     def test_orientation_shape(self, window):
         session = window["window"]
         session.tutorial_orientation()
-        _settle()
+        _settle(session)
         tree = _last_tree(session)
         am = tree.root.axes_manager
         assert tuple(am.navigation_shape) == (6, 6)
@@ -79,7 +86,7 @@ class TestTutorialLoadersDirect:
     def test_multiphase_shape(self, window):
         session = window["window"]
         session.tutorial_multiphase()
-        _settle()
+        _settle(session)
         tree = _last_tree(session)
         am = tree.root.axes_manager
         assert tuple(am.navigation_shape) == (20, 20)
@@ -92,7 +99,7 @@ class TestTutorialLoadersDirect:
         loader MUST use the small (16,16)/(128,128)/1e3 override."""
         session = window["window"]
         session.tutorial_strain()
-        _settle()
+        _settle(session)
         tree = _last_tree(session)
         am = tree.root.axes_manager
         assert tuple(am.navigation_shape) == (16, 16)
@@ -108,7 +115,7 @@ class TestTutorialLoadersDirect:
     def test_spectroscopy_shape(self, window):
         session = window["window"]
         session.tutorial_spectroscopy()
-        _settle()
+        _settle(session)
         tree = _last_tree(session)
         root = tree.root
         am = root.axes_manager
@@ -122,7 +129,7 @@ class TestTutorialLoadersDirect:
     def test_movie_shape_is_small_and_insitu(self, window):
         session = window["window"]
         session.tutorial_movie()
-        _settle()
+        _settle(session)
         tree = _last_tree(session)
         root = tree.root
         am = root.axes_manager
@@ -154,34 +161,29 @@ class TestTutorialLoadDispatch:
         errors = [m for m in messages if m.get("type") == "error"]
         assert errors, "expected an error message for an unknown tutorial name"
 
-    def test_dispatch_navigation_by_name(self, window):
-        session = window["window"]
-        session.dispatch_action(
-            {"action": "tutorial_load", "payload": {"name": "navigation"}}
-        )
-        _settle()
-        tree = _last_tree(session)
-        assert tuple(tree.root.axes_manager.navigation_shape) == (10, 10)
-
     def test_repeat_load_is_idempotent(self, window):
         """Loading the SAME tutorial name twice must NOT stack a duplicate copy
         (the walkthrough double/triple-load fix) — the second dispatch is a no-op
-        because that dataset is already open."""
+        because that dataset is already open.  The first load doubles as the
+        dispatch-by-name check (identical dispatch), so the nav-shape assert
+        rides it."""
         session = window["window"]
         n0 = len(session.signal_trees)
         session.dispatch_action(
             {"action": "tutorial_load", "payload": {"name": "navigation"}})
-        _settle()
+        _settle(session)
         assert len(session.signal_trees) == n0 + 1
+        tree = _last_tree(session)
+        assert tuple(tree.root.axes_manager.navigation_shape) == (10, 10)
         # Second load of the same name → no new tree.
         session.dispatch_action(
             {"action": "tutorial_load", "payload": {"name": "navigation"}})
-        _settle()
+        _settle(session)
         assert len(session.signal_trees) == n0 + 1
         # A DIFFERENT tutorial name still loads (dedup is per-name, not global).
         session.dispatch_action(
             {"action": "tutorial_load", "payload": {"name": "spectroscopy"}})
-        _settle()
+        _settle(session)
         assert len(session.signal_trees) == n0 + 2
 
     def test_close_all_tears_down_tutorial_trees(self, window):
@@ -190,18 +192,17 @@ class TestTutorialLoadDispatch:
         session = window["window"]
         # A non-tutorial dataset the close must NOT touch.
         session.dispatch_action({"action": "load_test_data", "payload": {}})
-        _settle()
+        _settle(session)
         keep = len(session.signal_trees)
         session.dispatch_action(
             {"action": "tutorial_load", "payload": {"name": "navigation"}})
         session.dispatch_action(
             {"action": "tutorial_load", "payload": {"name": "spectroscopy"}})
-        _settle()
+        _settle(session)
         assert len(session.signal_trees) == keep + 2
         # Close all tutorial trees → back to just the non-tutorial dataset.
         session.dispatch_action({"action": "tutorial_close_all", "payload": {}})
-        _settle()
-        assert len(session.signal_trees) == keep
+        assert _wait_trees(session, keep)
         # A second close is a harmless no-op.
         session.dispatch_action({"action": "tutorial_close_all", "payload": {}})
         assert len(session.signal_trees) == keep
@@ -229,7 +230,7 @@ class TestTutorialLoadDispatch:
         session.dispatch_action(
             {"action": "tutorial_load", "payload": {"name": "spectroscopy"}}
         )
-        _settle()
+        _settle(session)
         tree = _last_tree(session)
         assert tuple(tree.root.axes_manager.signal_shape) == (1024,)
 
@@ -269,18 +270,17 @@ class TestTutorialSessionTeardown:
         session.dispatch_action({"action": "tutorial_session_begin", "payload": {}})
         session.dispatch_action(
             {"action": "tutorial_load", "payload": {"name": "navigation"}})
-        _settle()
+        _settle(session)
         # …and now the walkthrough runs an analysis, which opens a result tree.
         derived = self._derived(session)
-        _settle()
+        _settle(session)
         assert len(session.signal_trees) == keep + 2
         assert derived in session.signal_trees
 
         session.dispatch_action({"action": "tutorial_close_all", "payload": {}})
-        _settle()
         # BOTH the tutorial dataset and the derived result are gone.
+        assert _wait_trees(session, keep)
         assert derived not in session.signal_trees
-        assert len(session.signal_trees) == keep
 
     def test_only_active_session_records(self, window):
         """Outside a session (`tutorial_session_begin` never sent, or already
@@ -288,10 +288,10 @@ class TestTutorialSessionTeardown:
         can't reach back and close a window the user made on their own."""
         session = window["window"]
         before = self._derived(session)
-        _settle()
+        _settle(session)
         n = len(session.signal_trees)
         session.dispatch_action({"action": "tutorial_close_all", "payload": {}})
-        _settle()
+        _settle(session)
         assert before in session.signal_trees
         assert len(session.signal_trees) == n
 
@@ -306,11 +306,11 @@ class TestTutorialSessionTeardown:
         session.dispatch_action({"action": "tutorial_session_begin", "payload": {}})
         session.dispatch_action(
             {"action": "tutorial_load", "payload": {"name": "navigation"}})
-        _settle()
+        _settle(session)
         mine = session._add_signal(hs.load(str(path)), source_path=str(path))
-        _settle()
+        _settle(session)
         session.dispatch_action({"action": "tutorial_close_all", "payload": {}})
-        _settle()
+        _settle(session)
         assert mine in session.signal_trees
 
     def test_close_all_ends_the_session(self, window):
@@ -320,7 +320,7 @@ class TestTutorialSessionTeardown:
         session.dispatch_action({"action": "tutorial_session_begin", "payload": {}})
         session.dispatch_action({"action": "tutorial_close_all", "payload": {}})
         after = self._derived(session)
-        _settle()
+        _settle(session)
         session.dispatch_action({"action": "tutorial_close_all", "payload": {}})
-        _settle()
+        _settle(session)
         assert after in session.signal_trees

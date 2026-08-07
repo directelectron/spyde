@@ -14,6 +14,7 @@ import numpy as np
 import hyperspy.api as hs
 
 import pytest
+from spyde.tests.migrated.conftest import _settle
 
 
 def _make_phase():
@@ -43,7 +44,7 @@ class TestOrientationPort:
         session = Session(n_workers=1, threads_per_worker=1)
         try:
             session._add_signal(_diffraction_4d())
-            time.sleep(0.3)
+            _settle(session)
             src_tree = session.signal_trees[0]
             before = len(session.signal_trees)
 
@@ -84,7 +85,7 @@ class TestOrientationPort:
         session = Session(n_workers=1, threads_per_worker=1)
         try:
             session._add_signal(_diffraction_4d())
-            time.sleep(0.3)
+            _settle(session)
             src_tree = session.signal_trees[0]
             order: list[str] = []
 
@@ -111,13 +112,13 @@ class TestOrientationPort:
         session = Session(n_workers=1, threads_per_worker=1)
         try:
             session._add_signal(_diffraction_4d())
-            time.sleep(0.3)
+            _settle(session)
             plot = next(p for p in session._plots
                         if not p.is_navigator and p.plot_state is not None)
             before = len(session.signal_trees)
             ctx = ActionContext(plot=plot, params={}, action_name="Orientation Mapping")
             orientation_mapping(ctx, cif_path=None)
-            time.sleep(0.2)
+            _settle(session)
             assert len(session.signal_trees) == before   # nothing created
         finally:
             session.shutdown()

@@ -14,6 +14,7 @@ import time
 
 import numpy as np
 import hyperspy.api as hs
+from spyde.tests.migrated.conftest import _settle
 
 CIF = os.path.join(os.path.dirname(__file__), "..", "Silver__0011135.cif")
 
@@ -61,7 +62,7 @@ class TestMultiPhaseOrientation:
         session = Session(n_workers=1, threads_per_worker=1)
         try:
             session._add_signal(_diffraction_4d())
-            time.sleep(0.4)
+            _settle(session)
             src = _signal_plot(session)
             tree = src.signal_tree
             before = len(session.signal_trees)
@@ -91,7 +92,7 @@ class TestMultiPhaseOrientation:
         session = Session(n_workers=1, threads_per_worker=1)
         try:
             session._add_signal(_diffraction_4d())
-            time.sleep(0.4)
+            _settle(session)
             src = _signal_plot(session)
             tree = src.signal_tree
             # Two CIFs (degenerate here, but exercises the multi-phase code path).

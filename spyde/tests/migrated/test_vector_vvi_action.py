@@ -15,6 +15,7 @@ import hyperspy.api as hs
 
 from spyde.actions.find_vectors import _do_compute_vectors
 from spyde.drawing.toolbars.plot_control_toolbar import get_toolbar_actions_for_plot
+from spyde.tests.migrated.conftest import _settle
 
 
 def _params():
@@ -328,7 +329,7 @@ class TestVectorVVI5DSpawnTree:
             ax.scale, ax.offset = 0.01, -32 * 0.005
         tree = session._add_signal(root)
         tree.diffraction_vectors = vecs
-        time.sleep(0.6)
+        _settle(session)
         return tree, vecs
 
     def test_add_vvi_spawns_navigable_3d_tree(self, window):
@@ -341,7 +342,7 @@ class TestVectorVVI5DSpawnTree:
         sig_plot = next(p for p in tree.signal_plots)
         ctx = ActionContext(plot=sig_plot, params={}, action_name="Add Vector Virtual Image")
         add_vector_virtual_image(ctx, type="disk", calculation="intensity")
-        import time; time.sleep(0.6)
+        _settle(session)
 
         # A new signal tree was spawned for the VI result …
         assert len(session.signal_trees) == n_trees_before + 1
@@ -365,7 +366,7 @@ class TestVectorVVI5DSpawnTree:
         sig_plot = next(p for p in tree.signal_plots)
         ctx = ActionContext(plot=sig_plot, params={}, action_name="Add Vector Virtual Image")
         add_vector_virtual_image(ctx, type="disk", calculation="intensity")
-        import time; time.sleep(0.6)
+        _settle(session)
 
         vi_tree = session.signal_trees[-1]
         act = next(v["action"] for v in session._action_artifacts.values()
@@ -383,7 +384,7 @@ class TestVectorVVI5DSpawnTree:
         out = act.reduce_to(act.signal, act._selector, None, None,
                             calculation="intensity")
         assert out is None                       # tree navigator owns the slice
-        time.sleep(0.3)
+        _settle(session)
         data = np.asarray(vi_tree.root.data)
         assert data.shape == (vecs.n_time, *vecs.nav_shape)
         assert data.sum() > 0                    # the moved ROI now picks up spots

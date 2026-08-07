@@ -9,6 +9,7 @@ can add several (colours cycle red→green→blue→…) and remove one via
 from __future__ import annotations
 
 import time
+from spyde.tests.migrated.conftest import _settle
 
 
 def _signal_plot(session):
@@ -23,7 +24,7 @@ def _sub_items(msgs):
 def _add_vi(session, src):
     session._dispatch_toolbar_action(
         src, "add_virtual_image", {"type": "disk", "calculation": "mean"})
-    time.sleep(0.3)
+    _settle(session)
 
 
 class TestVirtualImagingSubToolbar:
@@ -71,7 +72,7 @@ class TestVirtualImagingSubToolbar:
             "action": "update_vi", "window_id": src.window_id,
             "payload": {"name": vi["name"], "params": {"calculation": "sum"}},
         })
-        time.sleep(0.2)
+        _settle(session)
 
         # The VI's live params changed (so the next recompute uses them) and the
         # chip is re-emitted with the new value.
@@ -95,7 +96,7 @@ class TestVirtualImagingSubToolbar:
             "action": "update_vi", "window_id": src.window_id,
             "payload": {"name": vi["name"], "params": {"type": "annular"}},
         })
-        time.sleep(0.2)
+        _settle(session)
         assert isinstance(art["action"]._selector, AnnularSelector)
         assert art["action"]._selector is not old_sel
         assert art["selector"] is art["action"]._selector   # removal ref refreshed
@@ -106,7 +107,7 @@ class TestVirtualImagingSubToolbar:
             "action": "update_vi", "window_id": src.window_id,
             "payload": {"name": vi["name"], "params": {"calculation": "sum"}},
         })
-        time.sleep(0.2)
+        _settle(session)
         assert art["action"]._selector is sel_after_type
 
     def test_remove_chip_closes_window_and_drops_it(self, stem_4d_dataset):

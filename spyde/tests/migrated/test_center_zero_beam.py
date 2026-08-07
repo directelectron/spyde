@@ -13,6 +13,7 @@ import time
 
 import numpy as np
 import hyperspy.api as hs
+from spyde.tests.migrated.conftest import _settle
 
 
 def _signal_plot(session):
@@ -55,7 +56,7 @@ class TestCenterZeroBeam:
         session = Session(n_workers=1, threads_per_worker=1)
         try:
             session._add_signal(_off_center_4d(beam=(18, 14)))
-            time.sleep(0.4)
+            _settle(session)
             src = _signal_plot(session)
             before = src.plot_state.current_signal
 
@@ -85,7 +86,7 @@ class TestCenterZeroBeam:
         session = Session(n_workers=1, threads_per_worker=1)
         try:
             session._add_signal(_off_center_4d(sig=(64, 64), beam=(18, 14)))
-            time.sleep(0.4)
+            _settle(session)
             src = _signal_plot(session)
             tree = src.signal_tree
 
@@ -122,7 +123,7 @@ class TestCenterZeroBeam:
         session = Session(n_workers=1, threads_per_worker=1)
         try:
             session._add_signal(_off_center_4d(sig=(32, 32)))
-            time.sleep(0.4)
+            _settle(session)
             src = _signal_plot(session)
             tree = src.signal_tree
 
@@ -160,7 +161,7 @@ class TestCenterZeroBeam:
         session = Session(n_workers=1, threads_per_worker=1)
         try:
             session._add_signal(_off_center_4d(sig=(48, 32)))
-            time.sleep(0.4)
+            _settle(session)
             src = _signal_plot(session)
             tree = src.signal_tree
 
@@ -182,7 +183,7 @@ class TestCenterZeroBeam:
         session = Session(n_workers=1, threads_per_worker=1)
         try:
             session._add_signal(_off_center_4d(sig=(32, 32)))
-            time.sleep(0.4)
+            _settle(session)
             src = _signal_plot(session)
             tree = src.signal_tree
 
@@ -222,7 +223,7 @@ class TestCenterZeroBeam:
         session = Session(n_workers=1, threads_per_worker=1)
         try:
             session._add_signal(_off_center_4d())
-            time.sleep(0.4)
+            _settle(session)
             src = _signal_plot(session)
             tree = src.signal_tree
 
@@ -249,7 +250,7 @@ class TestCenterZeroBeam:
         session = Session(n_workers=1, threads_per_worker=1)
         try:
             session._add_signal(_off_center_4d())
-            time.sleep(0.4)
+            _settle(session)
             src = _signal_plot(session)
             tree = src.signal_tree
 
@@ -272,7 +273,7 @@ class TestCenterZeroBeam:
         session = Session(n_workers=1, threads_per_worker=1)
         try:
             session._add_signal(_off_center_4d(beam=(18, 14)))
-            time.sleep(0.4)
+            _settle(session)
             src = _signal_plot(session)
             tree = src.signal_tree
             before = src.plot_state.current_signal
