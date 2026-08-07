@@ -19,7 +19,7 @@ Default target is the 15.3 GB / 977-frame in-situ MRC.  What it reports:
   total     wall time until the whole navigator is assembled.
 
 PAGE CACHE: a 15.3 GB file fits in this box's 128 GB RAM, so a second run reads
-from RAM, not disk (see the page-cache trap in benchmarks.md).  ``--purge``
+from RAM, not disk — the classic page-cache benchmark trap.  ``--purge``
 evicts the file's cached pages via FILE_FLAG_NO_BUFFERING before each run;
 ``--warm`` deliberately does the opposite (one throwaway pass first) so the two
 implementations are compared with I/O held constant and only the dispatch

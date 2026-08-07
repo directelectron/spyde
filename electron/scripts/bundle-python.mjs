@@ -5,7 +5,8 @@
  * platform `uv` binary into electron/resources/python. electron-builder then
  * ships that dir as an extraResource (-> <app>/resources/python at runtime),
  * where pythonEnv.ts runs `uv sync` into the user's writable data dir on first
- * launch (DISTRIBUTION_PLAN.md "Option A" — tiny installer, GPU wheel by uv).
+ * launch (tiny installer; the GPU-correct torch wheel is resolved by uv per
+ * machine).
  *
  * The venv / torch are NOT bundled; only the lock + source + uv. Run before the
  * electron-builder step (npm run dist does this).

@@ -20,7 +20,7 @@ applies it as a careful per-vector RADIAL remap (direction preserved, magnitude
 corrected), done once after peak finding so the downstream affine fit — which
 assumes a linear reciprocal space — is valid again.
 
-No Qt; pure numpy; unit-tested. See VECTOR_ORIENTATION_MAPPING_PLAN.md §9 (SEM).
+No Qt; pure numpy; unit-tested.
 """
 from __future__ import annotations
 

@@ -96,7 +96,7 @@ def main() -> None:
     print(f"\n  submits: {a_['submits']} -> {b_['submits']}  "
           f"({a_['submits'] / max(b_['submits'], 1):.0f}x fewer round trips)")
     print("  NB each saved round trip is ~14 ms with the GIL held on a real "
-          "graph (benchmarks.md), which a synthetic graph does not charge us.")
+          "graph, which a synthetic graph does not charge us.")
 
     if a.json:
         with open(a.json, "w", encoding="utf-8") as fh:

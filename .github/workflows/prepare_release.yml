@@ -58,7 +58,7 @@ jobs:
       # electron/package.json is the source of truth for the app's semver
       # (electron-builder/electron-updater read it); the release tag must be
       # v<that version>. Tag shapes and the stable/beta channel mapping are
-      # documented in RELEASING.md.
+      # documented in release.yml's `channel` job.
       - name: Compute new version
         id: version
         env:
@@ -145,7 +145,7 @@ jobs:
             exit 1
           fi
 
-      # ── Pre-flight checks from RELEASING.md — fail HERE, not at release time ──
+      # ── Release pre-flight checks — fail HERE, not at release time ──────────
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
         with:
@@ -220,9 +220,27 @@ jobs:
 
           ### Review checklist
           - [ ] Version is correct in \`electron/package.json\`
-          - [ ] Manual checks from RELEASING.md done on a real machine (GPU path,
-            distributed navigator, clean shutdown)
           - [ ] CI passes
+
+          ### Manual checks the automated suite cannot cover
+          Do these on a real machine — CI has no GPU/display and the migrated
+          suite forces \`SPYDE_NO_DASK=1\`:
+          - [ ] **Distributed navigator path** — open a multi-GB 4D-STEM scan, drag the
+            navigator; the diffraction pattern must track without freezing. If the
+            \`repro_*.py\` distributed scripts are present, run them directly
+            (\`uv run python -m spyde.tests.repro_<name>\`); they spin a real
+            \`LocalCluster\` and won't run under pytest.
+          - [ ] **GPU find-vectors / orientation** — on a CUDA box, run Find Vectors and
+            Orientation Mapping on a real dataset (e.g. \`pyxem.data.sped_ag()\`); confirm
+            results look right and nothing segfaults. (The numba subpixel kernel is unit-
+            tested for arithmetic, but the live CUDA path needs a real run.)
+          - [ ] **No-GPU fallback** — on a machine without \`numba\`/CUDA, the app must still
+            launch and Find Vectors must fall back to CPU. (Guarded by
+            \`test_find_vectors_no_numba.py\`, but verify the PACKAGED app.)
+          - [ ] **IPF colour-key legend** — open an Orientation map; the colour-key triangle
+            pins in the corner on the 2-D map and hides on the 3-D view.
+          - [ ] **Clean shutdown** — quit the app; confirm no orphaned \`python.exe\` / Dask
+            worker processes remain (Task Manager / \`ps\`).
 
           ### After merging
           Tag **the merge commit on main** — the tag MUST be exactly \`${TAG}\`:
@@ -232,4 +250,10 @@ jobs:
           git push origin ${TAG}
           \`\`\`
           The tag push triggers \`release.yml\` (3-platform build → draft release →
-          publish once all legs pass)."
+          publish once all legs pass).
+          - [ ] **Confirm the release actually has installers** before announcing it:
+            \`gh release view ${TAG} --repo CSSFrancis/spyde --json assets --jq '.assets[].name'\`
+            — expect the three installers (\`SpyDE Setup *.exe\`, \`SpyDE-*.dmg\`,
+            \`SpyDE-*.AppImage\`), their \`.blockmap\`s, and the \`latest*.yml\` update
+            feeds. \`release.yml\`'s \`finalize\` job refuses to un-draft an
+            asset-less release, but check."

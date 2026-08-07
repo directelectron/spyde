@@ -1,7 +1,7 @@
 /**
  * fv_neural_calibration.spec.ts — neural model registry + auto-calibration UI.
  *
- * Covers the Phase 0/1 neural-integration wiring (NEURAL_INTEGRATION_PLAN.md):
+ * Covers the neural-integration wiring (remote model registry + auto-calibration):
  *   - the wizard shows the neural High-pass σ slider + the ↻ refresh-models
  *     button beside the Model dropdown,
  *   - opening the wizard runs the one-shot auto-calibration on the backend

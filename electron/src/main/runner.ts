@@ -180,6 +180,14 @@ export function stopSpyDE(): void {
   }
   stopping = true
   proc = null  // every sendAction() after this no-ops; prevents re-entrant kills
+  // KNOWN BUG (open): quitting while a find-vectors batch is still streaming can
+  // WEDGE shutdown on Windows. Clearing the tick timer here stops the stdin tick
+  // that keeps the hidden backend scheduled (the very starvation the tick was
+  // added for), so a mid-batch backend may never get scheduled long enough to
+  // process the graceful `quit` — only the 1.5 s taskkill backstop ends it. The
+  // e2e specs work around it by waiting for the '[fv-batch] finalized' log line
+  // before closing the app. The app-side fix (keep ticking until the backend
+  // exits, or force-reap the batch) is still open.
   if (tickTimer) { clearInterval(tickTimer); tickTimer = null }
 
   // 1. Ask the backend to quit gracefully (clean Dask shutdown).

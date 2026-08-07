@@ -10,7 +10,7 @@ memory. This pins the two behaviours that matter:
     immediately via Plot.update_data), and
   * an INTEGER integrating-region mean is ROUNDED back to the source dtype, to
     match the old distributed path (weighted_mean_round_from_sums) so the DP
-    navigator's contrast doesn't shift — the benchmarks.md rounding gotcha.
+    navigator's contrast doesn't shift — the dtype-rounding gotcha.
 """
 from __future__ import annotations
 

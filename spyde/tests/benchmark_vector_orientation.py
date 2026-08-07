@@ -14,8 +14,6 @@ Compares, on real sped_ag vectors and synthetic ground-truth:
 
 Metrics: ms/pattern, strain median, residual (px), Friedel asymmetry, and on
 synthetic data the recovered-vs-applied strain error.
-
-These numbers feed VECTOR_ORIENTATION_MAPPING_PLAN.md §7f and benchmarks.md.
 """
 from __future__ import annotations
 
