@@ -237,7 +237,7 @@ jobs:
   # vs 8.0 min on adjacent shards). SLOW_SPECS in electron/playwright.config.ts
   # lists every >=45s file slowest-first; SPYDE_E2E_GROUP=k/n takes every n-th
   # file of the slice round-robin, which spreads duration evenly. Measured
-  # per-group: fast ~7 min, slow ~6-9 min, plus ~1.5 min setup.
+  # per-group: fast ~7 min, slow ~4.5-8 min, plus ~1.5 min setup.
   #
   # retries are 0 in CI (playwright.config.ts reads CI) — a retry of a
   # timed-out app boot doubles the damage. Best-effort for now
@@ -255,11 +255,12 @@ jobs:
           - { slice: fast, group: 2, of: 4 }
           - { slice: fast, group: 3, of: 4 }
           - { slice: fast, group: 4, of: 4 }
-          - { slice: slow, group: 1, of: 5 }
-          - { slice: slow, group: 2, of: 5 }
-          - { slice: slow, group: 3, of: 5 }
-          - { slice: slow, group: 4, of: 5 }
-          - { slice: slow, group: 5, of: 5 }
+          - { slice: slow, group: 1, of: 6 }
+          - { slice: slow, group: 2, of: 6 }
+          - { slice: slow, group: 3, of: 6 }
+          - { slice: slow, group: 4, of: 6 }
+          - { slice: slow, group: 5, of: 6 }
+          - { slice: slow, group: 6, of: 6 }
     steps:
       - uses: actions/checkout@v4
         with:

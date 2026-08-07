@@ -59,11 +59,21 @@ export const SLOW_SPECS = [
 // is sorted slowest-first, and the fast slice is all sub-45s files, so any
 // contiguous alphabetical cluster of heavy files lands on different jobs.
 const bare = (glob: string) => glob.slice(glob.lastIndexOf('/') + 1)
-const FAST_SPECS = readdirSync(join(__dirname, 'tests'))
+// Recursive: a spec added in a SUBDIRECTORY must land in a slice too, not
+// silently fall out of CI. '**/'+bare matches at any depth.
+const ALL_SPEC_FILES = readdirSync(join(__dirname, 'tests'), { recursive: true })
+  .map((f) => bare(String(f).replace(/\\/g, '/')))
   .filter((f) => f.endsWith('.spec.ts'))
+  .sort()
+for (const g of SLOW_SPECS) {
+  // A renamed/deleted slow spec must fail loudly here, not silently carry a
+  // stale glob while the file drifts into the fast slice.
+  if (!ALL_SPEC_FILES.includes(bare(g)))
+    throw new Error(`SLOW_SPECS entry has no file under tests/: ${g} — update the list`)
+}
+const FAST_SPECS = ALL_SPEC_FILES
   .filter((f) => !f.endsWith('.real.spec.ts') && f !== 'guide_screenshots.spec.ts')
   .filter((f) => !SLOW_SPECS.some((g) => bare(g) === f))
-  .sort()
 const SLICE = process.env.SPYDE_E2E_SLICE
 let sliceFiles = SLICE === 'slow' ? SLOW_SPECS.map(bare) : SLICE === 'fast' ? FAST_SPECS : null
 const GROUP = process.env.SPYDE_E2E_GROUP
