@@ -12,10 +12,10 @@ mapping (``px = (coord - offset)/scale``) relies on.
 """
 from __future__ import annotations
 
-import time
-
 import numpy as np
 import hyperspy.api as hs
+
+from spyde.tests.migrated.conftest import _settle
 
 
 def _signal_plot(session):
@@ -51,7 +51,7 @@ class TestOrientationOverlay:
         session = Session(n_workers=1, threads_per_worker=1)
         try:
             session._add_signal(_centered_diffraction_4d())
-            time.sleep(0.3)
+            _settle(session)
             src_tree = session.signal_trees[0]
             src_plot = _signal_plot(session)
 
@@ -67,6 +67,11 @@ class TestOrientationOverlay:
             assert overlay is not None, "orientation overlay never attached"
             assert overlay._mg is not None
 
+            # The hook is registered on a navigator selector (real-drag path).
+            sels = [s for s in src_tree.navigator_plot_manager.all_navigation_selectors
+                    if overlay._on_indices in s.index_hooks]
+            assert sels, "overlay hook not registered on any navigator selector"
+
             # Push a concrete nav position through the hook and inspect offsets.
             overlay._on_indices(np.array([[1, 1]]))
             offsets = np.asarray(overlay._mg._data["offsets"], dtype=np.float64)
@@ -76,6 +81,15 @@ class TestOrientationOverlay:
             assert offsets.shape[1] == 2
             assert offsets.min() >= -0.5 and offsets.max() <= 32.5
             assert np.isfinite(offsets).all()
+
+            # Moving to two more positions both yield a valid (finite,
+            # in-frame) push.
+            for (iy, ix) in [(0, 0), (2, 3)]:
+                overlay._on_indices(np.array([[ix, iy]]))
+                off = np.asarray(overlay._mg._data["offsets"], dtype=np.float64)
+                assert np.isfinite(off).all()
+                if len(off):
+                    assert off.min() >= -0.5 and off.max() <= 32.5
         finally:
             session.shutdown()
 
@@ -87,7 +101,7 @@ class TestOrientationOverlay:
         session = Session(n_workers=1, threads_per_worker=1)
         try:
             session._add_signal(_centered_diffraction_4d().as_lazy())
-            time.sleep(0.3)
+            _settle(session)
             src_tree = session.signal_trees[0]
             assert src_tree.root._lazy is True          # genuinely lazy
             src_plot = _signal_plot(session)
@@ -106,33 +120,7 @@ class TestOrientationOverlay:
         finally:
             session.shutdown()
 
-    def test_overlay_hook_registered_and_updates(self):
-        from spyde.backend.session import Session
-        from spyde.actions.orientation_action import run_orientation
-        session = Session(n_workers=1, threads_per_worker=1)
-        try:
-            session._add_signal(_centered_diffraction_4d())
-            time.sleep(0.3)
-            src_tree = session.signal_trees[0]
-            src_plot = _signal_plot(session)
-            run_orientation(
-                session, src_tree.root, src_tree, [_make_phase()],
-                dict(accelerating_voltage=200.0, resolution=10.0),
-                dict(n_best=3, gamma=0.5),
-                src_dp_plot=src_plot,
-            )
-            overlay = src_tree._orientation_overlay
-            # The hook is registered on a navigator selector (real-drag path).
-            sels = [s for s in src_tree.navigator_plot_manager.all_navigation_selectors
-                    if overlay._on_indices in s.index_hooks]
-            assert sels, "overlay hook not registered on any navigator selector"
-
-            # Moving to two positions both yield a valid (finite, in-frame) push.
-            for (iy, ix) in [(0, 0), (2, 3)]:
-                overlay._on_indices(np.array([[ix, iy]]))
-                off = np.asarray(overlay._mg._data["offsets"], dtype=np.float64)
-                assert np.isfinite(off).all()
-                if len(off):
-                    assert off.min() >= -0.5 and off.max() <= 32.5
-        finally:
-            session.shutdown()
+    # test_overlay_hook_registered_and_updates was folded into
+    # test_overlay_attaches_and_draws_template_spots: identical eager session +
+    # identical run_orientation(res=10) call, reading disjoint properties of
+    # the same overlay (hook registration + two more positions).

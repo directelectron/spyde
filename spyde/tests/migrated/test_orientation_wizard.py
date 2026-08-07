@@ -16,6 +16,8 @@ import time
 import numpy as np
 import hyperspy.api as hs
 
+from spyde.tests.migrated.conftest import _settle
+
 CIF = os.path.join(os.path.dirname(__file__), "..", "Silver__0011135.cif")
 
 
@@ -53,9 +55,16 @@ class TestOrientationWizard:
         session = Session(n_workers=1, threads_per_worker=1)
         try:
             session._add_signal(_calibrated_4d())
-            time.sleep(0.4)
+            _settle(session)
             src = _signal_plot(session)
             tree = src.signal_tree
+
+            # ── Pre-generate: Compute Map without a library must error
+            #    gracefully — no new tree ──────────────────────────────────────
+            before = len(session.signal_trees)
+            om_run(session, src, {"n_best": 3})   # no library generated
+            time.sleep(0.3)
+            assert len(session.signal_trees) == before   # nothing created
 
             # ── Generate Library (coarse resolution → quick) ─────────────────
             om_generate_library(session, src, {
@@ -93,17 +102,7 @@ class TestOrientationWizard:
         finally:
             session.shutdown()
 
-    def test_run_without_library_errors_gracefully(self):
-        from spyde.backend.session import Session
-        from spyde.actions.orientation_action import om_run
-        session = Session(n_workers=1, threads_per_worker=1)
-        try:
-            session._add_signal(_calibrated_4d())
-            time.sleep(0.3)
-            src = _signal_plot(session)
-            before = len(session.signal_trees)
-            om_run(session, src, {"n_best": 3})   # no library generated
-            time.sleep(0.3)
-            assert len(session.signal_trees) == before   # nothing created
-        finally:
-            session.shutdown()
+    # test_run_without_library_errors_gracefully was folded into
+    # test_generate_refine_run as its pre-generate stage: same session build,
+    # and the error path must run against a genuinely library-less tree, which
+    # is exactly the state before om_generate_library.
