@@ -186,6 +186,8 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "24"
+          cache: npm
+          cache-dependency-path: electron/package-lock.json
 
       - name: Install Electron dependencies
         working-directory: electron
@@ -218,6 +220,8 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "24"
+          cache: npm
+          cache-dependency-path: electron/package-lock.json
 
       - name: Install Electron dependencies
         working-directory: electron
@@ -235,9 +239,10 @@ jobs:
   # Duration-balanced slicing, NOT Playwright --shard: --shard balances by
   # FILE COUNT and reliably parks one shard at 2-3x the others (measured 25.8
   # vs 8.0 min on adjacent shards). SLOW_SPECS in electron/playwright.config.ts
-  # lists every >=45s file slowest-first; SPYDE_E2E_GROUP=k/n takes every n-th
-  # file of the slice round-robin, which spreads duration evenly. Measured
-  # per-group: fast ~7 min, slow ~4.5-8 min, plus ~1.5 min setup.
+  # carries a measured slot-weight per file; SPYDE_E2E_GROUP=k/n bin-packs the
+  # slow slice by those weights (fast round-robins — its files are all small).
+  # Validation run 2026-08-07: fast groups 7.8-8.7 min wall; slow bins level
+  # out near the ~7-min progressive_signal_preview slot, worst ~9 min wall.
   #
   # retries are 0 in CI (playwright.config.ts reads CI) — a retry of a
   # timed-out app boot doubles the damage. Best-effort for now
@@ -270,6 +275,8 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "24"
+          cache: npm
+          cache-dependency-path: electron/package-lock.json
 
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
@@ -289,6 +296,14 @@ jobs:
         working-directory: electron
         run: npm ci
 
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: pw-${{ runner.os }}-${{ hashFiles('electron/package-lock.json') }}
+
+      # Idempotent: on a cache hit the download is skipped; --with-deps still
+      # apt-installs the shared libraries either way.
       - name: Install Playwright browsers
         working-directory: electron
         run: npx playwright install --with-deps chromium

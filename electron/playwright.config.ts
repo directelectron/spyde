@@ -11,53 +11,60 @@ import { join } from 'path'
 require('./tests/_clean_slate.cjs').installCleanSlate()
 
 /**
- * Every spec file that costs >= ~45 s on a hosted runner, SLOWEST FIRST — the
- * order IS the CI balancing (round-robin below). Playwright's `--shard`
- * balances by FILE COUNT, not duration, and reliably parks one shard at 2-3x
- * the others, so CI does not use `--shard` at all.
+ * Every spec file that costs >= ~45 s on a hosted runner, with its CI SLOT
+ * cost in seconds (in-file test time + ~35 s app boot/teardown). The weights
+ * are BALANCING DATA, not contracts: the slow slice is bin-packed by them
+ * (greedy longest-first below), so editing a weight rebalances the groups.
+ * Playwright's `--shard` balances by FILE COUNT, not duration, and reliably
+ * parks one shard at 2-3x the others, so CI does not use `--shard` at all.
  *
- * Durations: median of the two most recent green main runs (2026-08-03).
+ * Weights: measured slot times from the PR-tier validation run (2026-08-07);
+ * progressive_signal_preview's slot ran 2.3x its in-file time (a slow batch
+ * finalize on CI runners), so slots, not file times, are what balance.
  * `reportSlowTests` prints every file over 30 s, so CI says when this list
  * has drifted.
  */
-export const SLOW_SPECS = [
-  '**/progressive_signal_preview.spec.ts',      // 194s
-  '**/progressive_orientation_preview.spec.ts', // 154s
-  '**/ipf_perf.spec.ts',                        // 149s
-  '**/report_edit2.spec.ts',                    // 111s
-  '**/sped_ag_grid.spec.ts',                    // 105s
-  '**/insitu_playback.spec.ts',                 // 90s
-  '**/gpu_image_parity.spec.ts',                // 90s
-  '**/ipf_two_window_vom.spec.ts',              // 90s
-  '**/eels_edge_component.spec.ts',             // 84s
-  '**/ipf_two_window.spec.ts',                  // 81s
-  '**/laundry_visual.spec.ts',                  // 80s
-  '**/vector_om_lazy.spec.ts',                  // 70s
-  '**/orientation_lazy.spec.ts',                // 70s
-  '**/ebsd_workflow.spec.ts',                   // 66s
-  '**/action_scoping.spec.ts',                  // 65s
-  '**/compose_real_drag.spec.ts',               // 61s
-  '**/om_wizard_lazy.spec.ts',                  // 60s
-  '**/nav_drag_distributed.spec.ts',            // 58s
-  '**/actions_lifecycle.spec.ts',               // 57s
-  '**/fit_handles.spec.ts',                     // 57s
-  '**/shutdown.spec.ts',                        // 56s
-  '**/grid_present.spec.ts',                    // 56s
-  '**/vector_overlay.spec.ts',                  // 54s
-  '**/find_vectors_result.spec.ts',             // 51s
-  '**/vector_vi_lazy.spec.ts',                  // 51s
-  '**/fit_from_composition.spec.ts',            // 50s
-  '**/ipf_refine_render.spec.ts',               // 49s
-  '**/vi_lazy.spec.ts',                         // 47s
+export const SLOW_SPECS: Array<[string, number]> = [
+  ['**/progressive_signal_preview.spec.ts', 400],
+  ['**/gpu_image_parity.spec.ts', 125],
+  ['**/progressive_orientation_preview.spec.ts', 113],
+  ['**/ipf_perf.spec.ts', 113],
+  ['**/report_edit2.spec.ts', 101],
+  ['**/ipf_two_window.spec.ts', 101],
+  ['**/action_scoping.spec.ts', 101],
+  ['**/fit_handles.spec.ts', 95],
+  ['**/shutdown.spec.ts', 93],
+  ['**/fit_from_composition.spec.ts', 87],
+  ['**/eels_edge_component.spec.ts', 81],
+  ['**/compose_real_drag.spec.ts', 81],
+  ['**/laundry_visual.spec.ts', 76],
+  ['**/grid_present.spec.ts', 75],
+  ['**/ebsd_workflow.spec.ts', 73],
+  ['**/ipf_two_window_vom.spec.ts', 71],
+  ['**/sped_ag_grid.spec.ts', 69],
+  ['**/orientation_lazy.spec.ts', 69],
+  ['**/actions_lifecycle.spec.ts', 58],
+  ['**/insitu_playback.spec.ts', 55],
+  ['**/vector_om_lazy.spec.ts', 55],
+  ['**/nav_drag_distributed.spec.ts', 55],
+  ['**/find_vectors_result.spec.ts', 55],
+  ['**/om_wizard_lazy.spec.ts', 55],
+  ['**/vector_overlay.spec.ts', 55],
+  ['**/vi_lazy.spec.ts', 55],
+  ['**/ipf_refine_render.spec.ts', 55],
+  ['**/vector_vi_lazy.spec.ts', 50],
 ]
+const SLOW_GLOBS = SLOW_SPECS.map(([g]) => g)
 
 // Which slice to run. CI sets both; unset (every local run) means
 // "everything", so nobody has to know this exists to run the suite.
 //   SPYDE_E2E_SLICE:  slow -> ONLY the files above;  fast -> everything else
-//   SPYDE_E2E_GROUP:  'k/n' -> every n-th file of the slice, offset k (1-based)
-// Round-robin over the slice's file order spreads duration evenly: SLOW_SPECS
-// is sorted slowest-first, and the fast slice is all sub-45s files, so any
-// contiguous alphabetical cluster of heavy files lands on different jobs.
+//   SPYDE_E2E_GROUP:  'k/n' -> group k of n (1-based)
+// fast: all files are sub-45s, so round-robin over the sorted list is even.
+// slow: greedy longest-first bin-packing on the declared weights — round-robin
+// cannot isolate the one ~7-min spec that must ride alone in its group, this
+// can, and it rebalances itself whenever a weight is edited. Deterministic
+// (stable sort, ties by list order), so every CI job computes the same bins.
 const bare = (glob: string) => glob.slice(glob.lastIndexOf('/') + 1)
 // Recursive: a spec added in a SUBDIRECTORY must land in a slice too, not
 // silently fall out of CI. '**/'+bare matches at any depth.
@@ -65,7 +72,7 @@ const ALL_SPEC_FILES = readdirSync(join(__dirname, 'tests'), { recursive: true }
   .map((f) => bare(String(f).replace(/\\/g, '/')))
   .filter((f) => f.endsWith('.spec.ts'))
   .sort()
-for (const g of SLOW_SPECS) {
+for (const g of SLOW_GLOBS) {
   // A renamed/deleted slow spec must fail loudly here, not silently carry a
   // stale glob while the file drifts into the fast slice.
   if (!ALL_SPEC_FILES.includes(bare(g)))
@@ -73,13 +80,28 @@ for (const g of SLOW_SPECS) {
 }
 const FAST_SPECS = ALL_SPEC_FILES
   .filter((f) => !f.endsWith('.real.spec.ts') && f !== 'guide_screenshots.spec.ts')
-  .filter((f) => !SLOW_SPECS.some((g) => bare(g) === f))
+  .filter((f) => !SLOW_GLOBS.some((g) => bare(g) === f))
 const SLICE = process.env.SPYDE_E2E_SLICE
-let sliceFiles = SLICE === 'slow' ? SLOW_SPECS.map(bare) : SLICE === 'fast' ? FAST_SPECS : null
 const GROUP = process.env.SPYDE_E2E_GROUP
-if (sliceFiles && GROUP) {
-  const [k, n] = GROUP.split('/').map(Number)
-  sliceFiles = sliceFiles.filter((_, i) => i % n === k - 1)
+let sliceFiles: string[] | null = null
+if (SLICE === 'fast') {
+  sliceFiles = FAST_SPECS
+  if (GROUP) {
+    const [k, n] = GROUP.split('/').map(Number)
+    sliceFiles = sliceFiles.filter((_, i) => i % n === k - 1)
+  }
+} else if (SLICE === 'slow') {
+  sliceFiles = SLOW_GLOBS.map(bare)
+  if (GROUP) {
+    const [k, n] = GROUP.split('/').map(Number)
+    const bins = Array.from({ length: n }, () => ({ total: 0, files: [] as string[] }))
+    for (const [g, w] of [...SLOW_SPECS].sort((a, b) => b[1] - a[1])) {
+      const lightest = bins.reduce((m, b) => (b.total < m.total ? b : m))
+      lightest.total += w
+      lightest.files.push(bare(g))
+    }
+    sliceFiles = bins[k - 1].files
+  }
 }
 const SLICE_MATCH = sliceFiles ? sliceFiles.map((f) => '**/' + f) : null
 
