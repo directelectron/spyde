@@ -4,6 +4,10 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+# _AxisLite lives in ragged_store now; re-exported here for its existing
+# importers (orientation_map, dense_diffraction_vectors, tests, …).
+from spyde.signals.ragged_store import RaggedStore, _AxisLite  # noqa: F401
+
 # Column indices — never use bare integer literals outside this module
 COL_NAV_X     = 0
 COL_NAV_Y     = 1
@@ -114,17 +118,6 @@ def _build_nav_offsets(
 
     level_offsets.reverse()  # now outermost-first
     return level_offsets
-
-
-@dataclass
-class _AxisLite:
-    """Minimal axis record so vectors loaded from disk can be rendered
-    without HyperSpy axes objects (duck-types .scale/.offset/.size/.units/.name)."""
-    scale: float = 1.0
-    offset: float = 0.0
-    size: int = 0
-    units: str = ""
-    name: str = ""
 
 
 def _render_disks_block(
