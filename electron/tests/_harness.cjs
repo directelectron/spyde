@@ -15,6 +15,12 @@
  *    `PLOTAPP:` JSON line protocol, e.g. `nav_drag_result`).
  *  - canvas-pixel helpers (`countColorPixels`, `waitForNonBlackCanvas`) lifted
  *    from visual.spec.ts / vi_lazy.spec.ts / vector_om_lazy.spec.ts.
+ *  - NEVER FAIL BLIND: SPYDE_LOG_LEVEL defaults to WARNING (backend
+ *    warnings/errors tee to the captured stderr), and an app/window that dies
+ *    mid-test immediately console.errors the exit code + the last ~60 backend
+ *    log lines (`backend.tail()`), so "browser has been closed" is always
+ *    adjacent to the backend's last words. `app.close()` also attaches the
+ *    tail to the test report.
  */
 const { _electron: electron } = require('@playwright/test')
 const { join } = require('path')
@@ -82,6 +88,15 @@ async function launchApp(opts = {}) {
       // Only mint a scratch dir if the spec didn't bring its own — otherwise
       // every first_run launch would also leave an unused one behind.
       ...(env.SPYDE_SETTINGS_DIR ? {} : { SPYDE_SETTINGS_DIR: _seenSettingsDir() }),
+      // Backend WARNINGS/ERRORS must reach the stderr this harness captures.
+      // Setting SPYDE_LOG_LEVEL makes the backend tee logging to stderr
+      // (app.py); without it, errors travel only the PLOTAPP stdout protocol
+      // the main process consumes — so a backend that dies mid-test dies
+      // SILENTLY ("browser has been closed" with no cause in the CI log).
+      // Default WARNING when neither the spec nor the shell set a level; specs
+      // that wait on INFO/DEBUG log lines already pass their own.
+      ...(env.SPYDE_LOG_LEVEL || process.env.SPYDE_LOG_LEVEL
+        ? {} : { SPYDE_LOG_LEVEL: 'WARNING' }),
       // Never hand a path to the desktop from a test. On a headless runner
       // xdg-open has no file manager to reach and leaves the app unable to
       // exit — examples_menu's afterAll timed out for 120s on app.close().
@@ -92,8 +107,47 @@ async function launchApp(opts = {}) {
   })
 
   const backend = createBackend(app)
+
+  // ---- never fail blind ----------------------------------------------------
+  // When the app dies mid-test, Playwright reports only "Target page, context
+  // or browser has been closed" — the WHY (a backend traceback, an OOM kill)
+  // never reaches the CI log. Dump the backend's last words next to it.
+  //
+  // Best-effort handle on the current test: specs call launchApp() inside the
+  // test body, so test.info() resolves there (null outside a test).
+  let testInfo = null
+  try { testInfo = require('@playwright/test').test.info() } catch { /* not in a test */ }
+  let expectedClose = false
+  app.process().on('exit', (code, signal) => {
+    if (expectedClose) return
+    console.error(
+      `\n[harness] Electron process exited MID-TEST (code=${code}, signal=${signal}).` +
+      ` Backend log tail:\n${backend.tail()}\n`)
+  })
+  // Wrap app.close() so (a) the exit listener above stays quiet for the
+  // spec's own finally-block close, and (b) the backend log tail is attached
+  // to the test (visible in the CI report for any failure).
+  const origClose = app.close.bind(app)
+  app.close = async () => {
+    expectedClose = true
+    if (testInfo) {
+      try {
+        await testInfo.attach('backend-log-tail',
+          { body: backend.tail(), contentType: 'text/plain' })
+      } catch { /* attaching after teardown — best-effort only */ }
+    }
+    return origClose()
+  }
+
   const page = await app.firstWindow()
   await page.waitForLoadState('domcontentloaded')
+  // A window that closes without the process dying (a renderer crash) hits
+  // neither listener above — cover it too.
+  page.on('close', () => {
+    if (expectedClose) return
+    console.error(
+      `\n[harness] app window closed MID-TEST. Backend log tail:\n${backend.tail()}\n`)
+  })
 
   // Capture renderer errors from the FIRST paint, not after the mount wait
   // below. A module-level throw (a bad import, a TDZ reference) means React
@@ -224,6 +278,9 @@ function createBackend(app) {
     waitForDask(timeout = 60_000) {
       return this.waitForLog('dask_ready', timeout)
     },
+    /** The last `n` captured backend stdout+stderr lines, newline-joined —
+     *  what launchApp dumps when the app dies mid-test. */
+    tail(n = 60) { return logBuffer.slice(-n).join('\n') },
     get logBuffer() { return logBuffer },
     get messages() { return messages },
   }
