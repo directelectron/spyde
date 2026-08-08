@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import ClassVar, List, Optional
 
 # _AxisLite lives in ragged_store now; re-exported here for its existing
 # importers (orientation_map, dense_diffraction_vectors, tests, …).
@@ -188,7 +188,7 @@ def _render_disks_block(
 
 
 @dataclass
-class SpyDEDiffractionVectors:
+class SpyDEDiffractionVectors(RaggedStore):
     """
     Flat-buffer CSR storage for diffraction vectors across a scan.
 
@@ -235,6 +235,11 @@ class SpyDEDiffractionVectors:
         Falls back to numpy when CUDA is unavailable.
     """
 
+    # The packed-buffer column order IS the ABI (COL_* indexed straight into
+    # numpy slices and GPU tensors) — agreement with COLUMN_NAMES/COL_* is
+    # asserted at import, right below the class.
+    columns_schema: ClassVar[tuple] = tuple((n, "f4") for n in COLUMN_NAMES)
+
     flat_buffer:    np.ndarray          # (N_total, 6) float32
     nav_offsets:    List[np.ndarray]    # outermost-first CSR levels
     nav_shape:      tuple               # (nav_y, nav_x)
@@ -258,6 +263,33 @@ class SpyDEDiffractionVectors:
     _dense_cache: Optional[np.ndarray] = field(default=None, repr=False)
     _kdtree:      Optional[object]     = field(default=None, repr=False)
     _gpu_buffer:  Optional[object]     = field(default=None, repr=False)  # torch.Tensor on CUDA
+
+    def __post_init__(self):
+        """Wire the RaggedStore base state over the SAME memory the dataclass
+        fields hold — pure aliasing, no copies, no rebuilt arrays.
+
+        The base's leaf offsets alias ``nav_offsets[-1]`` and its packed
+        backing IS ``flat_buffer``; the level list is the stored
+        ``nav_offsets`` list itself (kept verbatim — tests construct with
+        hand-built lists, including a degenerate outer level, and those stay
+        the source of truth for this instance). The subclass field ``offsets``
+        keeps its legacy 4-D-only semantics (None for 5-D) and shadows the
+        base's public alias; base internals never read it. Identity aliasing
+        is what keeps pickling size and the 4-D
+        ``offsets is nav_offsets[-1]`` relationship unchanged.
+        """
+        self._packed = self.flat_buffer
+        self._columns = None
+        self._levels = self.nav_offsets
+        self._offsets = self.nav_offsets[-1] if len(self.nav_offsets or []) else None
+        self._index_columns = (
+            ("time", "nav_y", "nav_x") if len(self.full_nav_shape) == 3
+            else ("nav_y", "nav_x"))
+        self._finalized = True
+        self._staged = None
+        self._staged_packed = None
+        self._staged_rows = 0
+        self._append_lock = None
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -1043,3 +1075,13 @@ class SpyDEDiffractionVectors:
                 flat_buffer[s:e, COL_KX:COL_KY + 1] = arr
 
         return cls.from_arrays(flat_buffer, nav_shape, **kwargs)
+
+
+# The packed layout is the pinned ABI of orchestrate, strain_mapping,
+# vector_orientation(_gpu), vectors_embed and live_frames — COL_* index
+# straight into numpy slices and GPU tensors, so a schema/constant divergence
+# would produce plausible garbage, not an error. Freeze the agreement at import.
+assert tuple(n for n, _ in SpyDEDiffractionVectors.columns_schema) == COLUMN_NAMES
+assert (COL_NAV_X, COL_NAV_Y, COL_KX, COL_KY,
+        COL_TIME, COL_INTENSITY) == tuple(range(N_COLS))
+assert len(COLUMN_NAMES) == N_COLS
