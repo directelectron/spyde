@@ -192,6 +192,7 @@ spyde = [
 tests = [
     "pytest-instafail",
     "pytest-rerunfailures",
+    "pytest-split",
     "pytest-timeout",
     "pytest>=3.6",
     "setuptools_scm",
