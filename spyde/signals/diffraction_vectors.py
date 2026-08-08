@@ -33,15 +33,18 @@ def _build_nav_offsets(
 
     The flat_buffer must be sorted outermost-nav-dim first (e.g. t → iy → ix).
 
+    Thin wrapper over the RaggedStore builders: picks the vectors' index
+    columns by rank (the ``time = -1`` 4-D sentinel clamps to 0, as always),
+    builds the leaf level by bincount, and derives the outer levels as
+    ZERO-COPY strided views of it (element-for-element identical to the
+    historically materialised arrays — the grid is rectangular, so
+    ``level[k] == leaf[::prod(inner dims)]``).
+
     Layout
     ------
-    Returns one offsets array per navigation dimension, outermost first.
-    The outermost N-1 levels use **uniform strides** (the grid is always
-    rectangular) so they can be stored as simple `(dim_size + 1,)` arrays
-    where `offsets[k]` = k * (product of inner dim sizes).
-
-    Only the innermost level (x_offsets, over all leaf positions) stores
-    actual variable-length counts — vectors per (t, iy, ix) position.
+    Returns one offsets array per navigation dimension, outermost first; only
+    the innermost level (over all leaf positions) stores variable-length
+    counts.
 
     Lookup for nav indices (i0, i1, …, iN) where N = len(full_nav_shape):
         flat_pos = i0 * stride[0] + i1 * stride[1] + … + iN
@@ -49,8 +52,8 @@ def _build_nav_offsets(
         e = nav_offsets[-1][flat_pos + 1]
         return flat_buffer[s:e]
 
-    The outer arrays (nav_offsets[0..N-2]) are included for the partial-index
-    API (slice_at(t) → all vectors at time t).  They store vector offsets:
+    The outer arrays (nav_offsets[0..N-2]) serve the partial-index API
+    (slice_at(t) → all vectors at time t, O(1)):
         nav_offsets[k][i] = sum of vectors in all leaf positions with outer
                             index < i along dimension k.
 
@@ -61,19 +64,9 @@ def _build_nav_offsets(
                        y_vec_offsets (n_t*nav_y+1,),
                        x_vec_offsets (n_t*nav_y*nav_x+1,)]
     """
+    from spyde.signals.ragged_store import build_leaf_offsets, derive_levels
+
     n_dims = len(full_nav_shape)
-    n_patterns = int(np.prod(full_nav_shape))
-
-    if len(flat_buffer) == 0:
-        nav_offsets = []
-        product = 1
-        for dim_size in full_nav_shape:
-            product *= dim_size
-            nav_offsets.append(np.zeros(product + 1, dtype=np.int64))
-        return nav_offsets
-
-    # ── Build the innermost (leaf) offsets: one entry per (i0,…,iN) position ──
-    # Map each vector to its flat leaf index using stored coordinate columns.
     if n_dims == 2:
         col_seq = [COL_NAV_Y, COL_NAV_X]
     elif n_dims == 3:
@@ -81,43 +74,12 @@ def _build_nav_offsets(
     else:
         raise NotImplementedError("nav_offsets for >3 nav dims requires explicit outer columns")
 
-    strides = np.ones(n_dims, dtype=np.int64)
-    for i in range(n_dims - 2, -1, -1):
-        strides[i] = strides[i + 1] * full_nav_shape[i + 1]
-
-    flat_leaf = np.zeros(len(flat_buffer), dtype=np.int64)
-    for dim, col in enumerate(col_seq):
-        vals = flat_buffer[:, col].astype(np.int64)
-        if col == COL_TIME:
-            vals = np.where(vals < 0, np.int64(0), vals)
-        flat_leaf += vals * strides[dim]
-
-    leaf_counts = np.bincount(flat_leaf, minlength=n_patterns).astype(np.int64)
-    innermost = np.zeros(n_patterns + 1, dtype=np.int64)
-    np.cumsum(leaf_counts, out=innermost[1:])
-
-    # ── Build outer levels by summing leaf_counts over inner-dimension groups ──
-    # outer_level[k] stores the cumulative vector counts at dimension k,
-    # collapsing all inner dimensions.  This lets slice_at(t) return the
-    # exact flat_buffer slice for time step t in O(1).
-    #
-    # Example: full_nav_shape=(3, 4, 4), leaf_counts shape (48,):
-    #   y_level: sum groups of nav_x=4  → shape (12,)  [n_t * nav_y]
-    #   t_level: sum groups of nav_y=4  → shape (3,)   [n_t]
-    level_offsets = [innermost]
-    group_counts = leaf_counts.copy()
-
-    for dim in range(n_dims - 1, 0, -1):
-        group_size = full_nav_shape[dim]
-        n_outer = len(group_counts) // group_size
-        outer_counts = group_counts.reshape(n_outer, group_size).sum(axis=1)
-        outer_off = np.zeros(n_outer + 1, dtype=np.int64)
-        np.cumsum(outer_counts, out=outer_off[1:])
-        level_offsets.append(outer_off)
-        group_counts = outer_counts
-
-    level_offsets.reverse()  # now outermost-first
-    return level_offsets
+    if len(flat_buffer) == 0:
+        index_arrays = [np.zeros(0, dtype=np.int64)] * n_dims
+    else:
+        index_arrays = [flat_buffer[:, c] for c in col_seq]
+    leaf = build_leaf_offsets(index_arrays, full_nav_shape)
+    return derive_levels(leaf, full_nav_shape)
 
 
 def _render_disks_block(
@@ -292,26 +254,10 @@ class SpyDEDiffractionVectors(RaggedStore):
         self._append_lock = None
 
     # ── Internal helpers ──────────────────────────────────────────────────────
-
-    def _flat_pos(self, nav_indices: tuple) -> int:
-        """Convert nav indices to a flat leaf position using grid strides."""
-        pos = 0
-        stride = 1
-        for idx, dim_size in zip(reversed(nav_indices), reversed(self.full_nav_shape)):
-            pos += int(idx) * stride
-            stride *= dim_size
-        return pos
-
-    def _slice_flat(self, nav_indices: tuple) -> np.ndarray:
-        """
-        Return the flat_buffer slice for the given nav_indices.
-        Uses the innermost nav_offsets[-1] via arithmetic flat position.
-        O(n_dims) — pure arithmetic, no pointer chasing.
-        """
-        flat_pos = self._flat_pos(nav_indices)
-        s = int(self.nav_offsets[-1][flat_pos])
-        e = int(self.nav_offsets[-1][flat_pos + 1])
-        return self.flat_buffer[s:e]
+    # _flat_pos and _slice_flat are inherited from RaggedStore: the base's
+    # packed backing IS flat_buffer and its levels ARE the stored nav_offsets
+    # list (see __post_init__), so the inherited bodies read the same memory
+    # the historical methods did.
 
     def _frame_slice(self, t: int) -> np.ndarray:
         """
@@ -341,23 +287,7 @@ class SpyDEDiffractionVectors(RaggedStore):
             vecs.slice_at(t)             — all vectors at time step t (O(1))
             vecs.slice_at(t, iy)         — all vectors at time t, row iy (O(1))
         """
-        n = len(nav_indices)
-        n_dims = len(self.full_nav_shape)
-        if n == n_dims:
-            return self._slice_flat(nav_indices)
-        # Partial index: use the outer-level vector offsets
-        # nav_offsets[n-1] has cumulative vector counts at level n-1
-        # (e.g., nav_offsets[0] = time-level offsets)
-        # Compute flat position at this level
-        level_shape = self.full_nav_shape[:n]
-        pos = 0
-        stride = 1
-        for idx, dim_size in zip(reversed(nav_indices), reversed(level_shape)):
-            pos += int(idx) * stride
-            stride *= dim_size
-        level_idx = n - 1  # which nav_offsets level to use
-        s = int(self.nav_offsets[level_idx][pos])
-        e = int(self.nav_offsets[level_idx][pos + 1])
+        s, e = self._prefix_row_range(nav_indices)
         return self.flat_buffer[s:e]
 
     def at(self, iy: int, ix: int) -> np.ndarray:
@@ -434,12 +364,8 @@ class SpyDEDiffractionVectors(RaggedStore):
         stack / time dimension; this is the natural navigator for a 5-D stack
         (scrub the stack axis → that slice's spatial counts)."""
         nav_y, nav_x = self.nav_shape
-        x_off = self.nav_offsets[-1]
-        if self.n_time == 0:
-            counts = np.diff(x_off).reshape(1, nav_y, nav_x)
-        else:
-            counts = np.diff(x_off).reshape(self.n_time, nav_y, nav_x)
-        return counts.astype(np.int32)
+        return self.counts().reshape(
+            max(1, self.n_time), nav_y, nav_x).astype(np.int32)
 
     def count_map_at_t(self, t: int) -> np.ndarray:
         """(nav_y, nav_x) int32 — vector count at time step t.
@@ -454,9 +380,8 @@ class SpyDEDiffractionVectors(RaggedStore):
         t = int(np.clip(t, 0, self.n_time - 1))
         return self.count_map_series()[t]
 
-    def flatten(self) -> np.ndarray:
-        """Return the full (N_total, 6) flat buffer."""
-        return self.flat_buffer
+    # flatten() is inherited from RaggedStore (the packed backing IS
+    # flat_buffer, so it returns the same (N_total, 6) object it always did).
 
     # ── Virtual imaging ───────────────────────────────────────────────────────
 
