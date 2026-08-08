@@ -30,12 +30,24 @@ import textwrap
 
 import pytest
 
-from spyde.actions.vector_orientation_gpu import gpu_available
 
-# In-process predicate (same decision test_vector_orientation_gpu.py makes):
-# a full torch-importing probe subprocess cost ~4 s only to decide skip.
+def _cuda_available() -> bool:
+    # CUDA specifically, NOT gpu_available(): that predicate is True on Apple
+    # MPS too, and this file measures torch.cuda peak bytes — its driver
+    # asserts the model landed on cuda, so an MPS runner must SKIP, not run
+    # (the macos-latest CI leg caught exactly that). Import-and-check is safe
+    # in-process; it is torch-CUDA *work* that segfaults under pytest on
+    # Windows, and the ~4 s probe subprocess this replaces existed only to
+    # make this same decision.
+    try:
+        import torch
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
 pytestmark = pytest.mark.skipif(
-    not gpu_available(), reason="no CUDA device available in this environment")
+    not _cuda_available(), reason="needs CUDA (measures torch.cuda peak memory)")
 
 _DRIVER = textwrap.dedent(r"""
     import json, sys, os
