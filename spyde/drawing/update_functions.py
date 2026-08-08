@@ -939,7 +939,45 @@ def _try_async_expensive_nav_read(current_signal, selector, child, indices, prof
         return False
 
 
-def _prepare_nav_indices(current_signal, indices, integrating: bool):
+def _nav_readable_data(signal, data) -> bool:
+    """Can *data* (a captured ``signal.data`` binding) be sliced with this
+    signal's navigation coordinates at all?
+
+    The tripwire case is hyperspy's ``_deepcopy_with_new_data``: it TRANSIENTLY
+    rebinds ``self.data = None`` on the LIVE signal object while it deep-copies
+    (the data setter's ``np.atleast_1d(np.asanyarray(None))`` makes that an
+    ``array([None], dtype=object)``, shape ``(1,)``) — and EVERY hyperspy
+    operation (arithmetic, comparison, ``sum``, ``deepcopy``) passes through it.
+    The math console evaluates user expressions (``s1 + 0``, incl. the live
+    preview's nav-refresh re-runs) against the SAME bound signal objects on the
+    console thread, so a navigator update on the dispatcher thread can land
+    inside that window: the signal still reports nav_shape (6, 6) but its data
+    is the 1-element placeholder → "too many indices for array" — the
+    second-signal IndexError, console flavour. ``_pending_future_data`` can't
+    catch it because ``data[0]`` is None, not a future.
+
+    A None / object-dtype / under-dimensioned ``.data`` is never a readable
+    frame source, transient or not, so the caller skips the frame (returns
+    None → the last good frame stays up, same as the pending-future skip)."""
+    if data is None:
+        return False
+    if isinstance(data, np.ndarray) and data.dtype == object:
+        # The wrapped-future shape was already skipped by _pending_future_data;
+        # any OTHER object array is the deepcopy placeholder (or equally not a
+        # frame source). Catches the 1-D-navigator case the ndim check below
+        # can't (placeholder ndim 1 == nav_dim 1).
+        return False
+    ndim = getattr(data, "ndim", None)
+    if ndim is None:
+        return True   # not array-like; leave it to the branches (as before)
+    try:
+        nav_dim = int(signal.axes_manager.navigation_dimension)
+    except Exception:
+        return True
+    return int(ndim) >= nav_dim
+
+
+def _prepare_nav_indices(current_signal, indices, integrating: bool, data=None):
     """Transform RAW selector indices into DATA-ORDER, clamped array indices — the
     shared index-prep for the navigator read.
 
@@ -950,6 +988,10 @@ def _prepare_nav_indices(current_signal, indices, integrating: bool):
         integrating (a region keeps all its points),
       * clamp every coordinate to the leading (navigation) data-axis sizes so a
         stale/larger-grid selector position can't IndexError.
+
+    ``data`` (optional) is the caller's already-captured ``current_signal.data``
+    binding — pass it so the clamp bounds and the eventual read use the SAME
+    array even if ``.data`` is concurrently rebound (see ``_nav_readable_data``).
 
     Extracted so the MDI-overlay layer read (:mod:`spyde.actions.overlay`) resolves
     the SAME nav position as the base frame from the same raw selector indices.
@@ -968,7 +1010,7 @@ def _prepare_nav_indices(current_signal, indices, integrating: bool):
         indices = np.mean(indices, axis=0).astype(int)
 
     try:
-        data_obj = current_signal.data
+        data_obj = data if data is not None else current_signal.data
         data_shape = getattr(data_obj, "shape", None)
         if data_shape is None:
             nav_shape_xy = tuple(current_signal.axes_manager.navigation_shape)
@@ -1065,6 +1107,28 @@ def update_from_navigation_selection(
                   getattr(current_signal.metadata.General, "title", "<signal>"))
         return None
 
+    # Capture `.data` ONCE for this read, and skip if the captured binding
+    # cannot satisfy the nav indices. hyperspy transiently rebinds `.data` on
+    # the LIVE signal object during ordinary operations (`_deepcopy_with_new_data`
+    # parks a shape-(1,) `array([None], dtype=object)` placeholder while it
+    # deep-copies), and the math console runs user expressions (`s1 + 0` — the
+    # live preview's nav-refresh) against these SAME objects on the console
+    # thread. Working from one captured reference (rebinds are GIL-atomic) plus
+    # this guard makes that race structurally harmless: a mid-window read skips
+    # the frame (the last good frame stays up, exactly like the pending-future
+    # skip above); a post-capture swap still clamps + indexes the coherent
+    # pre-swap array. See _nav_readable_data.
+    data_now = getattr(current_signal, "data", None)
+    if not _nav_readable_data(current_signal, data_now):
+        log.debug(
+            "nav read skipped: data %s cannot satisfy nav_shape %s — transient "
+            "placeholder from a concurrent hyperspy op on this signal (e.g. a "
+            "console evaluation), or a mis-shaped signal",
+            getattr(data_now, "shape", type(data_now).__name__),
+            tuple(current_signal.axes_manager.navigation_shape),
+        )
+        return None
+
     # Per-frame trace — gated behind SPYDE_NAV_TIMING because it fires on EVERY
     # crosshair move and floods the IPC log/panel at DEBUG (which itself adds lag).
     if _NAV_TIMING:
@@ -1122,10 +1186,11 @@ def update_from_navigation_selection(
     # The swap + mean-reduce + clamp is shared with the MDI-overlay layer read
     # (spyde.actions.overlay) so a layer resolves the SAME nav position from the
     # same raw selector indices — see _prepare_nav_indices.
-    indices = _prepare_nav_indices(current_signal, indices, selector.is_integrating)
+    indices = _prepare_nav_indices(current_signal, indices,
+                                   selector.is_integrating, data=data_now)
 
     if current_signal._lazy:
-        if is_future_like(current_signal.data[0]):
+        if is_future_like(data_now[0]):
             current_img = np.ones(current_signal.axes_manager.signal_shape, dtype=np.int8)
             if current_img.ndim == 2:
                 #make checkerboard pattern to indicate loading
@@ -1218,7 +1283,7 @@ def update_from_navigation_selection(
             # sources keep their (un-rounded) mean. (Pinned by test_nav_cached_read.py.)
             with _prof.stage("dtype"):
                 try:
-                    src_dtype = getattr(current_signal.data, "dtype", None)
+                    src_dtype = getattr(data_now, "dtype", None)
                     if (src_dtype is not None
                             and np.issubdtype(src_dtype, np.integer)
                             and np.issubdtype(current_img.dtype, np.floating)):
@@ -1251,10 +1316,10 @@ def update_from_navigation_selection(
                     _idx = np.asarray(indices)
                     is_single = (not selector.is_integrating) or _idx.ndim <= 1
                     if (am.navigation_dimension == 1 and is_single
-                            and hasattr(current_signal.data, "shape")):
-                        n_time = int(current_signal.data.shape[0])
+                            and hasattr(data_now, "shape")):
+                        n_time = int(data_now.shape[0])
                         center = int(np.atleast_1d(_idx).ravel()[0])
-                        _movie_prefetcher.prime(current_signal.data, center, n_time)
+                        _movie_prefetcher.prime(data_now, center, n_time)
                 except Exception as _e:
                     log.debug("movie prefetch prime failed: %s", _e)
             _prof.done("cache=" + ("hit" if _cache_hit else "MISS"))
@@ -1269,22 +1334,25 @@ def update_from_navigation_selection(
         # 2-D-navigation diffraction pattern to 1-D. The Qt app never hit this
         # because it always loaded lazily (the Future branch above); eager
         # example datasets do.
+        # Index the CAPTURED binding (data_now), never a fresh `.data` read —
+        # the clamp above used its shape, so clamp and read stay coherent even
+        # if a console-thread hyperspy op rebinds `.data` mid-read.
         idx = np.asarray(indices)
         try:
             with _prof.stage("read"):
                 if idx.ndim <= 1:
                     point = tuple(int(v) for v in np.atleast_1d(idx))
-                    current_img = current_signal.data[point]
+                    current_img = data_now[point]
                 else:
                     sl = tuple(idx[:, k].astype(int) for k in range(idx.shape[1]))
-                    current_img = current_signal.data[sl].mean(axis=0)
+                    current_img = data_now[sl].mean(axis=0)
             _prof.set_frame(current_img)
         except Exception:
             log.exception(
                 "NAV-DEBUG eager index RAISED: indices=%s data.shape=%s "
                 "nav_shape=%s — the second-signal IndexError",
                 idx.tolist(),
-                getattr(getattr(current_signal, "data", None), "shape", None),
+                getattr(data_now, "shape", None),
                 tuple(current_signal.axes_manager.navigation_shape),
             )
             raise

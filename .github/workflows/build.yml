@@ -1,16 +1,13 @@
 name: build
 
-# push is main-only: a PR branch already gets the pull_request run; the bare
-# `push:` trigger duplicated every matrix (2x cost, 2x flake surface).
+# push is main-only: a PR branch already gets the pull_request run; a bare
+# `push:` trigger would duplicate every matrix.
 on:
   push:
     branches: [main]
   pull_request:
-    # Long-lived INTEGRATION branches too, not just main. `feat/0.3.0` collects
-    # a whole release, and with `[main]` alone a PR into it ran no tests at all
-    # — #82 through #88 each landed a wave that way, and the matrix first saw
-    # them only when 0.3.0 itself went at main. A PR whose checks are green
-    # because nothing ran is worse than a red one.
+    # Long-lived integration branches too (feat/0.3.0 style): a PR into them
+    # must run the tests, not silently run nothing.
     branches: [main, "feat/[0-9]*"]
 
 concurrency:
@@ -18,25 +15,65 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # The backend is Qt-free now (Electron + anyplotlib); no QT_QPA / X11 needed.
+  # The backend is Qt-free (Electron + anyplotlib); no QT_QPA / X11 needed.
   MPLBACKEND: agg
   PYTEST_ADDOPTS: "--timeout=600 -vv --durations=10"
 
 jobs:
+  # Two tiers, one job definition: PRs get a reduced 6-leg python matrix, each
+  # leg split into 2 duration-balanced shards (12 jobs, ~5-8 min each); pushes
+  # to main get the full 3 OS x 4 python matrix, unsharded. group 0 means
+  # "no sharding" (falsy in expressions), so `matrix.group &&` selects tier.
+  matrix-prep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      test: ${{ steps.emit.outputs.test }}
+      extras: ${{ steps.emit.outputs.extras }}
+    steps:
+      - id: emit
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            cat >> "$GITHUB_OUTPUT" <<'OUT'
+          test<<JSON
+          {"include":[
+            {"os":"ubuntu-latest","python-version":"3.10","group":1},
+            {"os":"ubuntu-latest","python-version":"3.10","group":2},
+            {"os":"ubuntu-latest","python-version":"3.11","group":1},
+            {"os":"ubuntu-latest","python-version":"3.11","group":2},
+            {"os":"ubuntu-latest","python-version":"3.12","group":1},
+            {"os":"ubuntu-latest","python-version":"3.12","group":2},
+            {"os":"ubuntu-latest","python-version":"3.13","group":1},
+            {"os":"ubuntu-latest","python-version":"3.13","group":2},
+            {"os":"windows-latest","python-version":"3.12","group":1},
+            {"os":"windows-latest","python-version":"3.12","group":2},
+            {"os":"macos-latest","python-version":"3.13","group":1},
+            {"os":"macos-latest","python-version":"3.13","group":2}
+          ]}
+          JSON
+          extras={"group":[1,2]}
+          OUT
+          else
+            cat >> "$GITHUB_OUTPUT" <<'OUT'
+          test<<JSON
+          {"os":["ubuntu-latest","windows-latest","macos-latest"],
+           "python-version":["3.10","3.11","3.12","3.13"],
+           "group":[0]}
+          JSON
+          extras={"group":[0]}
+          OUT
+          fi
+
   test:
-    name: ${{ matrix.os }}-py${{ matrix.python-version }}
+    name: ${{ matrix.os }}-py${{ matrix.python-version }}${{ matrix.group && format(' (shard {0}/2)', matrix.group) || '' }}
+    needs: matrix-prep
     runs-on: ${{ matrix.os }}
-    # 30 was too tight once 0.3.0 grew the suite to 2372 tests: legs landed at
-    # 28m30s and half the matrix was CANCELLED mid-run at exactly 30m, which
-    # reads as a test failure but is a clock. The run is much shorter now (see
-    # the coverage note below); this is headroom, and a timeout never reached
-    # costs nothing.
-    timeout-minutes: 40
+    # PR shards run ~5-8 min: 20 is headroom, and a hang costs 20 not 40.
+    # Main-tier unsharded legs keep 40 (slowest observed leg ~13 min).
+    timeout-minutes: ${{ matrix.group && 20 || 40 }}
     strategy:
       fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+      matrix: ${{ fromJSON(needs.matrix-prep.outputs.test) }}
 
     steps:
       - uses: actions/checkout@v4
@@ -68,17 +105,16 @@ jobs:
 
       # The single canonical Qt-free suite (testpaths=spyde/tests/migrated).
       # GPU tests skip themselves without CUDA/MPS. No display server required.
-      #
-      # Coverage on ONE leg only: the upload below runs solely on
-      # directelectron/spyde, so on every fork the other 11 legs wrote a
-      # coverage.xml nobody reads. Cost is +45% on a Windows dev box (measured
-      # 171s -> 248s over the same 25 files) but only ~15% on a hosted Linux
-      # runner (12.5m with vs ~10.8m without, same commit) — so this is tidiness
-      # and ~1.5m a leg, NOT the reason the matrix used to time out. That was
-      # DaskManager.shutdown() sleeping 0.5s per Session teardown; see
-      # test_dask_shutdown_fast.py.
+      # PR shards split by recorded durations (spyde/tests/.test_durations);
+      # pytest-split falls back to count-based splitting when that file is
+      # missing or stale, so a missing file degrades balance, not the run.
+      # Coverage only on ubuntu-3.12 (the only leg the upload reads); on PRs
+      # both shards upload and Codecov merges them server-side.
       - name: Run tests
-        run: uv run pytest spyde/tests/migrated ${{ (matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12') && '--cov=spyde --cov-report=xml' || '' }}
+        run: >
+          uv run pytest spyde/tests/migrated
+          ${{ matrix.group && format('--splits 2 --group {0} --durations-path spyde/tests/.test_durations', matrix.group) || '' }}
+          ${{ (matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12') && '--cov=spyde --cov-report=xml' || '' }}
 
       - name: Upload coverage to Codecov
         if: ${{ github.repository_owner == 'directelectron'
@@ -88,20 +124,18 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
 
   # ── Domain extras (0.3.0) ──────────────────────────────────────────────────
-  # The `test` job above runs with NO optional extras, which is the important
-  # half of the contract: SpyDE must work for a user who only does 4D-STEM, and
-  # the `requires_package:` gate must hide the EELS/EBSD/atoms actions rather
-  # than raising ImportError. This job is the other half — with exspy,
-  # kikuchipy and atomap installed the gated code actually executes, so a broken
-  # EELS/EBSD/atom path fails here instead of silently never running.
-  #
-  # One OS / one Python: the extras are pure-Python scientific packages and the
-  # cross-platform surface is already covered by `test`. Not part of the main
-  # matrix because that would quadruple install time for every leg.
+  # `test` runs with NO optional extras — the `requires_package:` gate must
+  # hide EELS/EBSD/atoms actions rather than raise ImportError. This job is
+  # the other half: with exspy/kikuchipy/atomap installed the gated code
+  # actually executes. One OS / one python; sharded x2 on PRs like `test`.
   test-extras:
-    name: extras (ubuntu, py3.12)
+    name: extras (ubuntu, py3.12${{ matrix.group && format(', shard {0}/2', matrix.group) || '' }})
+    needs: matrix-prep
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: ${{ matrix.group && 20 || 40 }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.matrix-prep.outputs.extras) }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -110,6 +144,8 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
         with:
+          # Pinned: resolving "latest" hits the GitHub releases API, which
+          # took out every CI leg during the 2026-07 API outage.
           version: "0.10.11"
           enable-cache: true
 
@@ -124,17 +160,17 @@ jobs:
       - name: Versions
         run: |
           uv run python -V
-          # importlib.metadata, not `pkg.__version__` — atomap imports fine but
-          # exposes no `__version__`, which failed this job before a single test
-          # ran. The point of the step is "the extra installed and imports", so
-          # ask the installed distribution, which every package answers.
+          # importlib.metadata, not `pkg.__version__` — atomap exposes no
+          # `__version__`. The point is "the extra installed and imports".
           uv run python -c "import importlib.metadata as m; \
             import exspy, kikuchipy, atomap; \
             print('\n'.join(f'{p} {m.version(p)}' \
               for p in ('exspy', 'kikuchipy', 'atomap')))"
 
       - name: Run tests (extras present)
-        run: uv run pytest spyde/tests/migrated
+        run: >
+          uv run pytest spyde/tests/migrated
+          ${{ matrix.group && format('--splits 2 --group {0} --durations-path spyde/tests/.test_durations', matrix.group) || '' }}
 
   # ── Renderer/main TypeScript typecheck ─────────────────────────────────────
   # Pure TS compile (tsc --noEmit) of the Electron main + renderer. No Python /
@@ -150,6 +186,8 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "24"
+          cache: npm
+          cache-dependency-path: electron/package-lock.json
 
       - name: Install Electron dependencies
         working-directory: electron
@@ -160,21 +198,18 @@ jobs:
         run: npm run typecheck
 
   # ── Main-process unit tests (cross-OS) ─────────────────────────────────────
-  # Pure-logic units from the Electron MAIN process (node:test, native TS type-
-  # stripping on Node 24). No display / Python / Electron runtime — just Node — so
-  # it runs fast on all three desktop OSes. Motivation: the auto-updater's
-  # friendlyError() must sanitise a raw releases.atom / HTML error body on EVERY
-  # platform (the "mac auto-update failed spectacularly" wall-of-XML regression,
-  # also reported on Windows). The mapper is platform-independent, but running it
-  # on windows/macos/ubuntu also guards against per-OS differences in node --test
-  # + TS type-stripping + glob expansion.
+  # Pure-logic units from the Electron MAIN process (node:test, native TS
+  # type-stripping on Node 24). No display / Python / Electron runtime. Runs
+  # on all desktop OSes because the auto-updater's friendlyError() must
+  # sanitise raw error bodies on EVERY platform, and per-OS differences in
+  # node --test + type-stripping + glob expansion are real.
   unit:
     name: electron-unit (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        # windows-latest ≈ Win 11 image; windows-2022 ≈ the older Win 10-era image.
-        # macos-latest = Apple Silicon. Covers Win 11 / Win 10-era / macOS as asked.
+        # windows-latest ≈ Win 11 image; windows-2022 ≈ the older Win 10-era
+        # image. macos-latest = Apple Silicon.
         os: [ubuntu-latest, windows-latest, windows-2022, macos-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
@@ -185,6 +220,8 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "24"
+          cache: npm
+          cache-dependency-path: electron/package-lock.json
 
       - name: Install Electron dependencies
         working-directory: electron
@@ -195,36 +232,40 @@ jobs:
         run: npm run test:unit
 
   # ── Electron e2e (Playwright) ──────────────────────────────────────────────
-  # Runs the DEFAULT 'electron' project only (synthetic + bundled data, no
-  # network). The opt-in 'electron-real' project (real pyxem downloads + the
-  # screenshot generator) is NOT run here.
+  # DEFAULT 'electron' project only (synthetic + bundled data, no network);
+  # the opt-in real-data 'electron-real' project is NOT run here. ubuntu +
+  # xvfb; the app spawns the backend via `uv run python -m spyde`.
   #
-  # OS choice: ubuntu-latest + xvfb. Electron headless CI is cheapest/standard on
-  # Linux, and the default project uses only synthetic/bundled data (no Windows-
-  # specific reader paths exercised). In dev mode the app spawns the backend via
-  # `uv run python -m spyde`, so the job sets up uv + pre-syncs the env.
+  # Duration-balanced slicing, NOT Playwright --shard: --shard balances by
+  # FILE COUNT and reliably parks one shard at 2-3x the others (measured 25.8
+  # vs 8.0 min on adjacent shards). SLOW_SPECS in electron/playwright.config.ts
+  # carries a measured slot-weight per file; SPYDE_E2E_GROUP=k/n bin-packs the
+  # slow slice by those weights (fast round-robins — its files are all small).
+  # Validation run 2026-08-07: fast groups 7.8-8.7 min wall; slow bins level
+  # out near the ~7-min progressive_signal_preview slot, worst ~9 min wall.
   #
-  # Best-effort for now (continue-on-error): the e2e launches a real Electron app
-  # + Dask LocalCluster and has not yet been validated green on a hosted runner.
-  # Drop continue-on-error once it's confirmed stable in CI.
-  # Sharded ×4: the suite is deliberately serial WITHIN a run (one Electron +
-  # Dask cluster at a time — see playwright.config.ts), so wall-clock scales
-  # only by splitting the spec files across independent runners. Each shard is
-  # still fully serial, so the cluster-contention flakiness that forced
-  # workers:1 cannot recur across shards (separate VMs). Playwright balances
-  # shards by FILE COUNT, not duration — ×2 measured 22.7m vs 10.0m, and ×3
-  # still ran 8.1m / 14.5m / >30m (shard 1 was CANCELLED at the timeout on
-  # test 76 of 115, so it produced no report at all). ×4 plus the domain
-  # extras below brings the worst shard back under the budget.
+  # retries are 0 in CI (playwright.config.ts reads CI) — a retry of a
+  # timed-out app boot doubles the damage. Best-effort for now
+  # (continue-on-error) until confirmed stable on hosted runners.
   e2e:
-    name: electron-e2e (ubuntu, shard ${{ matrix.shard }}/4)
+    name: electron-e2e (${{ matrix.slice }} ${{ matrix.group }}/${{ matrix.of }})
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 25
     continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        include:
+          - { slice: fast, group: 1, of: 4 }
+          - { slice: fast, group: 2, of: 4 }
+          - { slice: fast, group: 3, of: 4 }
+          - { slice: fast, group: 4, of: 4 }
+          - { slice: slow, group: 1, of: 6 }
+          - { slice: slow, group: 2, of: 6 }
+          - { slice: slow, group: 3, of: 6 }
+          - { slice: slow, group: 4, of: 6 }
+          - { slice: slow, group: 5, of: 6 }
+          - { slice: slow, group: 6, of: 6 }
     steps:
       - uses: actions/checkout@v4
         with:
@@ -234,8 +275,9 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "24"
+          cache: npm
+          cache-dependency-path: electron/package-lock.json
 
-      # The e2e launches the real Python backend (`uv run python -m spyde`).
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
         with:
@@ -244,13 +286,9 @@ jobs:
           version: "0.10.11"
           enable-cache: true
 
-      # WITH the domain extras. Without them the `requires_package:` gate hides
-      # every EELS/EBSD/atoms action, so the 0.3.0 specs that click those
-      # buttons cannot pass — 9 of them failed for that reason alone, and with
-      # retries:1 each one paid a second full app boot. Installing the extras
-      # makes them testable AND takes ~10 minutes of dead retry off shard 1.
-      # Not --frozen: the extras resolve per-platform, so the lock can't satisfy
-      # them (same reason as the `extras` job above).
+      # WITH the domain extras: the `requires_package:` gate hides the
+      # EELS/EBSD/atoms actions without them, so those specs cannot pass.
+      # NOT --frozen: the extras resolve per-platform (same as `test-extras`).
       - name: Pre-sync the Python backend env
         run: uv sync --extra tests --extra all
 
@@ -258,88 +296,30 @@ jobs:
         working-directory: electron
         run: npm ci
 
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: pw-${{ runner.os }}-${{ hashFiles('electron/package-lock.json') }}
+
+      # Idempotent: on a cache hit the download is skipped; --with-deps still
+      # apt-installs the shared libraries either way.
       - name: Install Playwright browsers
         working-directory: electron
         run: npx playwright install --with-deps chromium
 
-      # test:build = electron-vite build && playwright test. Pin --project=electron
-      # so ONLY the synthetic/bundled-data project runs; without it Playwright runs
-      # every project, including the heavy real-data 'electron-real' (pyxem
-      # downloads + screenshot writes) that is meant to be opt-in.
-      # SPYDE_E2E_SLICE=fast excludes the handful of files that dominate
-      # wall-clock (see SLOW_SPECS in playwright.config.ts); they run in the
-      # e2e-slow job below. Playwright shards by FILE COUNT, not duration, so
-      # without this split one shard reliably lands at 2-4x the others — 127
-      # tests in 6.8 min on one against 90 in 22.6 on another, and re-sharding
-      # never fixed it because count-balancing keeps making the same choice.
       - name: Run Electron e2e
         working-directory: electron
         env:
-          SPYDE_E2E_SLICE: fast
-        run: xvfb-run --auto-servernum npm run test:build -- --project=electron --shard=${{ matrix.shard }}/4
-
-      - name: Upload Playwright report
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: playwright-report-shard-${{ matrix.shard }}
-          path: electron/playwright-report/
-          if-no-files-found: ignore
-
-  # The handful of spec files that dominate wall-clock, split out of the shard
-  # matrix above. Playwright balances shards by FILE COUNT, not duration, so
-  # leaving these in the matrix reliably parked one shard at 2-4x the others
-  # (measured: 127 tests in 6.8 min on shard 3 against 90 in 22.6 on shard 1).
-  # Re-sharding does not help — count-balancing keeps making the same split, and
-  # the workflow history above records both x2 and x3 landing a shard over
-  # 20 min. Moving them here costs no extra wall-clock overall and needs no
-  # additional runner beyond this one.
-  #
-  # The file list lives in ONE place: SLOW_SPECS in electron/playwright.config.ts.
-  # `reportSlowTests` prints every file over 30 s, so CI says when it has drifted.
-  e2e-slow:
-    name: electron-e2e (ubuntu, slow specs)
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Set up Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "24"
-
-      - name: Set up uv
-        uses: astral-sh/setup-uv@v6
-        with:
-          version: "0.10.11"
-          enable-cache: true
-
-      - name: Pre-sync the Python backend env
-        run: uv sync --extra tests --extra all
-
-      - name: Install Electron dependencies
-        working-directory: electron
-        run: npm ci
-
-      - name: Install Playwright browsers
-        working-directory: electron
-        run: npx playwright install --with-deps chromium
-
-      - name: Run the slow Electron e2e specs
-        working-directory: electron
-        env:
-          SPYDE_E2E_SLICE: slow
+          SPYDE_E2E_SLICE: ${{ matrix.slice }}
+          SPYDE_E2E_GROUP: ${{ matrix.group }}/${{ matrix.of }}
         run: xvfb-run --auto-servernum npm run test:build -- --project=electron
 
       - name: Upload Playwright report
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: playwright-report-slow
+          name: playwright-report-${{ matrix.slice }}-${{ matrix.group }}
           path: electron/playwright-report/
           if-no-files-found: ignore
 

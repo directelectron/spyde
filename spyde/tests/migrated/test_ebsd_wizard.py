@@ -10,6 +10,7 @@ paths have to agree or the button renders and then dispatches into nothing.
 """
 from __future__ import annotations
 
+import os
 import time
 
 import numpy as np
@@ -22,6 +23,28 @@ from spyde.actions.ebsd_action import (
 )
 from spyde.data import ebsd_patterns, ground_truth
 from spyde.tests.migrated.conftest import _settle
+
+
+@pytest.fixture(autouse=True)
+def _cpu_device(monkeypatch):
+    """Force the EBSD device to CPU for this file — WIRING tests, like every
+    sibling (test_ebsd_indexing / test_ebsd_refine pin ``device="cpu"`` on
+    every call; kernel accuracy is theirs, not this file's).
+
+    This file never pinned a device, so on an Apple-Silicon runner every
+    handler resolved ``default_device()`` -> "mps" — the only place in the
+    whole migrated suite that touched Metal. Under pytest that means the
+    build worker, the band-overlay engine thread, up to 8 dask threads and
+    per-test teardown of MPS-resident tensors all churn the device across 7
+    Session lifecycles — the multi-threaded Metal profile CLAUDE.md documents
+    as fatally racy — and macOS CI died with SIGABRT here when the
+    macos-latest image rolled. Accelerator work belongs in a subprocess (the
+    test_vector_orientation_gpu.py pattern), not under the pytest harness.
+
+    Overridable: a maintainer reproducing on a Mac sets SPYDE_EBSD_DEVICE=mps.
+    """
+    if not os.environ.get("SPYDE_EBSD_DEVICE"):
+        monkeypatch.setenv("SPYDE_EBSD_DEVICE", "cpu")
 
 
 def _wait(pred, timeout=120.0, interval=0.05):

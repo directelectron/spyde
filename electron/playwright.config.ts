@@ -1,4 +1,5 @@
 import { defineConfig } from '@playwright/test'
+import { readdirSync } from 'fs'
 import { join } from 'path'
 
 // A FRESH Electron profile + settings dir for every app launch, so no spec can
@@ -10,37 +11,99 @@ import { join } from 'path'
 require('./tests/_clean_slate.cjs').installCleanSlate()
 
 /**
- * The specs that dominate wall-clock, newest measurement first.
+ * Every spec file that costs >= ~45 s on a hosted runner, with its CI SLOT
+ * cost in seconds (in-file test time + ~35 s app boot/teardown). The weights
+ * are BALANCING DATA, not contracts: the slow slice is bin-packed by them
+ * (greedy longest-first below), so editing a weight rebalances the groups.
+ * Playwright's `--shard` balances by FILE COUNT, not duration, and reliably
+ * parks one shard at 2-3x the others, so CI does not use `--shard` at all.
  *
- * Playwright's `--shard` balances by FILE COUNT, not duration, and this suite's
- * files differ by ~40x. Measured on one CI run: shard 3 ran 127 tests in 6.8
- * min while shard 1 ran 90 in 22.6 — and re-sharding never fixed it, because
- * count-balancing keeps making the same bad split (the workflow records ×2 and
- * ×3 both landing one shard over 20 min, one of them cancelled at the timeout).
- *
- * Splitting THESE out and sharding the rest evens it up without another runner:
- * 22.6 / 11.7 / 6.8 / 5.8  ->  roughly 13 / 12 / 11 / 10.
- *
- * `reportSlowTests` above prints every file over 30 s, so CI itself tells you
- * when this list has drifted. Keep it to files that genuinely dominate — a long
- * list defeats the point by leaving the sharded half too thin.
+ * Weights: measured slot times from the PR-tier validation run (2026-08-07);
+ * progressive_signal_preview's slot ran 2.3x its in-file time (a slow batch
+ * finalize on CI runners), so slots, not file times, are what balance.
+ * `reportSlowTests` prints every file over 30 s, so CI says when this list
+ * has drifted.
  */
-export const SLOW_SPECS = [
-  '**/fit_quality.spec.ts',          // 3.7m
-  '**/gpu_image_parity.spec.ts',     // 1.5m
-  '**/ipf_perf.spec.ts',             // 1.3m
-  '**/action_scoping.spec.ts',       // 1.1m
-  '**/fit_handles.spec.ts',          // 57s
-  '**/fit_from_composition.spec.ts', // 53s
+export const SLOW_SPECS: Array<[string, number]> = [
+  ['**/progressive_signal_preview.spec.ts', 400],
+  ['**/gpu_image_parity.spec.ts', 125],
+  ['**/progressive_orientation_preview.spec.ts', 113],
+  ['**/ipf_perf.spec.ts', 113],
+  ['**/report_edit2.spec.ts', 101],
+  ['**/ipf_two_window.spec.ts', 101],
+  ['**/action_scoping.spec.ts', 101],
+  ['**/fit_handles.spec.ts', 95],
+  ['**/shutdown.spec.ts', 93],
+  ['**/fit_from_composition.spec.ts', 87],
+  ['**/eels_edge_component.spec.ts', 81],
+  ['**/compose_real_drag.spec.ts', 81],
+  ['**/laundry_visual.spec.ts', 76],
+  ['**/grid_present.spec.ts', 75],
+  ['**/ebsd_workflow.spec.ts', 73],
+  ['**/ipf_two_window_vom.spec.ts', 71],
+  ['**/sped_ag_grid.spec.ts', 69],
+  ['**/orientation_lazy.spec.ts', 69],
+  ['**/actions_lifecycle.spec.ts', 58],
+  ['**/insitu_playback.spec.ts', 55],
+  ['**/vector_om_lazy.spec.ts', 55],
+  ['**/nav_drag_distributed.spec.ts', 55],
+  ['**/find_vectors_result.spec.ts', 55],
+  ['**/om_wizard_lazy.spec.ts', 55],
+  ['**/vector_overlay.spec.ts', 55],
+  ['**/vi_lazy.spec.ts', 55],
+  ['**/ipf_refine_render.spec.ts', 55],
+  ['**/vector_vi_lazy.spec.ts', 50],
 ]
+const SLOW_GLOBS = SLOW_SPECS.map(([g]) => g)
 
-// Which half of the split to run. CI sets it per job; unset (every local run)
-// means "everything", so nobody has to know this exists to run the suite.
-//   slow  -> ONLY the files above, one job, unsharded
-//   fast  -> everything EXCEPT them, sharded --shard=N/4
+// Which slice to run. CI sets both; unset (every local run) means
+// "everything", so nobody has to know this exists to run the suite.
+//   SPYDE_E2E_SLICE:  slow -> ONLY the files above;  fast -> everything else
+//   SPYDE_E2E_GROUP:  'k/n' -> group k of n (1-based)
+// fast: all files are sub-45s, so round-robin over the sorted list is even.
+// slow: greedy longest-first bin-packing on the declared weights — round-robin
+// cannot isolate the one ~7-min spec that must ride alone in its group, this
+// can, and it rebalances itself whenever a weight is edited. Deterministic
+// (stable sort, ties by list order), so every CI job computes the same bins.
+const bare = (glob: string) => glob.slice(glob.lastIndexOf('/') + 1)
+// Recursive: a spec added in a SUBDIRECTORY must land in a slice too, not
+// silently fall out of CI. '**/'+bare matches at any depth.
+const ALL_SPEC_FILES = readdirSync(join(__dirname, 'tests'), { recursive: true })
+  .map((f) => bare(String(f).replace(/\\/g, '/')))
+  .filter((f) => f.endsWith('.spec.ts'))
+  .sort()
+for (const g of SLOW_GLOBS) {
+  // A renamed/deleted slow spec must fail loudly here, not silently carry a
+  // stale glob while the file drifts into the fast slice.
+  if (!ALL_SPEC_FILES.includes(bare(g)))
+    throw new Error(`SLOW_SPECS entry has no file under tests/: ${g} — update the list`)
+}
+const FAST_SPECS = ALL_SPEC_FILES
+  .filter((f) => !f.endsWith('.real.spec.ts') && f !== 'guide_screenshots.spec.ts')
+  .filter((f) => !SLOW_GLOBS.some((g) => bare(g) === f))
 const SLICE = process.env.SPYDE_E2E_SLICE
-const SLICE_IGNORE = SLICE === 'fast' ? SLOW_SPECS : []
-const SLICE_MATCH = SLICE === 'slow' ? SLOW_SPECS : null
+const GROUP = process.env.SPYDE_E2E_GROUP
+let sliceFiles: string[] | null = null
+if (SLICE === 'fast') {
+  sliceFiles = FAST_SPECS
+  if (GROUP) {
+    const [k, n] = GROUP.split('/').map(Number)
+    sliceFiles = sliceFiles.filter((_, i) => i % n === k - 1)
+  }
+} else if (SLICE === 'slow') {
+  sliceFiles = SLOW_GLOBS.map(bare)
+  if (GROUP) {
+    const [k, n] = GROUP.split('/').map(Number)
+    const bins = Array.from({ length: n }, () => ({ total: 0, files: [] as string[] }))
+    for (const [g, w] of [...SLOW_SPECS].sort((a, b) => b[1] - a[1])) {
+      const lightest = bins.reduce((m, b) => (b.total < m.total ? b : m))
+      lightest.total += w
+      lightest.files.push(bare(g))
+    }
+    sliceFiles = bins[k - 1].files
+  }
+}
+const SLICE_MATCH = sliceFiles ? sliceFiles.map((f) => '**/' + f) : null
 
 export default defineConfig({
   testDir: './tests',
@@ -52,7 +115,9 @@ export default defineConfig({
   globalTeardown: require.resolve('./tests/global-teardown.cjs'),
   timeout: 120_000,
   expect: { timeout: 15_000 },
-  retries: 1,
+  // CI: 0 — a retry of a timed-out app boot doubles the damage (a 10-min hang
+  // became 20). Locally: 1, as before.
+  retries: process.env.CI ? 0 : 1,
   // line: one timestamped row per test WITH its duration (the dot reporter made
   // CI stalls unattributable — 9 silent minutes with no test name). html: the CI
   // workflow uploads playwright-report/ as an artifact; without an html reporter
@@ -83,10 +148,7 @@ export default defineConfig({
       // need downloaded pyxem datasets.
       name: 'electron',
       testMatch: SLICE_MATCH ?? '**/*.spec.ts',
-      testIgnore: [
-        '**/*.real.spec.ts', '**/guide_screenshots.spec.ts',
-        ...SLICE_IGNORE,
-      ],
+      testIgnore: ['**/*.real.spec.ts', '**/guide_screenshots.spec.ts'],
     },
     {
       // Local / nightly tier: real pyxem datasets + per-step screenshot
