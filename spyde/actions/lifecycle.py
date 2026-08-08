@@ -90,6 +90,38 @@ def is_current(owner, key: str, gen: int) -> bool:
 
 # ── the find-vectors attach gap ───────────────────────────────────────────────
 
+def attach_container(tree, store, *, name: str):
+    """Attach a ragged result container to *tree* under attribute *name* —
+    THE seam between a batch compute finalizing and the tree carrying its
+    result (``tree.diffraction_vectors`` today; ``tree.particles`` next).
+
+    setattr + provenance stamp: a container carrying no ``provenance`` record
+    of its own inherits the tree's commit provenance (the dict
+    ``commit._stamp_provenance`` stores as ``tree._commit_provenance``), so a
+    saved container self-describes the way a committed tree does. Readers are
+    unchanged: :func:`resolve_vectors`, the ``requires_vectors`` toolbar gate
+    and the Save hook all read the attribute this helper sets.
+
+    Later-PR design (recorded here, deliberately NOT implemented in this PR):
+    toolbar YAML grows a generic ``requires_container: <name>`` key with
+    ``requires_vectors`` kept as its alias, and the ``commit.*`` entry points
+    (``open_result_tree`` / ``commit_result_tree``) grow a ``container=``
+    kwarg routed through this helper — one attach/gate/commit seam for every
+    ragged family instead of each action hand-rolling the setattr.
+
+    Returns *store*.
+    """
+    setattr(tree, name, store)
+    try:
+        if getattr(store, "provenance", None) is None:
+            prov = getattr(tree, "_commit_provenance", None)
+            if prov:
+                store.provenance = dict(prov)
+    except Exception as e:
+        log.debug("stamping container provenance failed: %s", e)
+    return store
+
+
 def resolve_vectors(session, plot):
     """Resolve ``(tree, diffraction_vectors)`` for an action.
 

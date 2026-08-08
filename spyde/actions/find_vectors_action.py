@@ -456,7 +456,8 @@ def _finalize(tree, vecs) -> None:
         tree.root._clear_cache_dask_data()
     except Exception as e:
         log.debug("clearing stale cached dask array failed: %s", e)
-    tree.diffraction_vectors = vecs
+    from spyde.actions.lifecycle import attach_container
+    attach_container(tree, vecs, name="diffraction_vectors")
 
     # Paint the count map onto the SPATIAL (2-D) navigator plot. For a 5-D stack
     # the navigator is multi-level; _first_nav_plot may return the OUTER (1-D
