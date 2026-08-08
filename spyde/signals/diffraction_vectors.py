@@ -957,13 +957,32 @@ class SpyDEDiffractionVectors(RaggedStore):
         Primary constructor.  flat_buffer must already be sorted outermost-first.
         nav_offsets are built automatically.
         nav_shape is always the last two dims of full_nav_shape.
+
+        Internally this is the RaggedStore streaming seam — one staged batch,
+        then ``finalize()`` — so the ordinary construction path transitively
+        exercises the exact machinery chunked computes stream through.
+        finalize()'s already-sorted fast path ADOPTS the buffer (no copy, no
+        reorder), keeping this byte- and identity-compatible with the
+        historical build; an unsorted buffer (previously a silent contract
+        violation yielding broken CSR slices) now gets stable-sorted.
         """
-        nav_offsets = _build_nav_offsets(flat_buffer, full_nav_shape)
+        full_nav_shape = tuple(int(s) for s in full_nav_shape)
+        if len(full_nav_shape) == 2:
+            index_columns = ("nav_y", "nav_x")
+        elif len(full_nav_shape) == 3:
+            index_columns = ("time", "nav_y", "nav_x")
+        else:
+            raise NotImplementedError(
+                "nav_offsets for >3 nav dims requires explicit outer columns")
+        staged = cls.streaming(full_nav_shape, index_columns=index_columns)
+        staged.append_batch(np.asarray(flat_buffer))
+        staged.finalize()
+        nav_offsets = staged.offset_levels()
         nav_shape = full_nav_shape[-2:]
         # Legacy offsets: only meaningful for 4D
         offsets = nav_offsets[-1] if len(full_nav_shape) == 2 else None
         return cls(
-            flat_buffer=flat_buffer,
+            flat_buffer=staged.flatten(),
             nav_offsets=nav_offsets,
             nav_shape=nav_shape,
             full_nav_shape=full_nav_shape,
