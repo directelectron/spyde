@@ -16,16 +16,41 @@ printing, so partially-emitted results survive a teardown crash.
 Skipped entirely when CUDA / torch GPU is unavailable.
 """
 import json
+import os
 import subprocess
 import sys
 import textwrap
 
 import pytest
 
-from spyde.actions.vector_orientation_gpu import gpu_available
+
+def _cuda_available() -> bool:
+    """CUDA specifically, NOT ``gpu_available()`` — that is True on Apple MPS
+    too, and torch work under the pytest harness on the hosted macOS runners
+    aborts the interpreter: SIGABRT immediately after these three subprocesses
+    return their results, on main and on every branch since.  Same harness-
+    interaction class as the Windows CUDA segfault this file's subprocess
+    pattern exists for, and the same call the EBSD wizard tests make
+    (``SPYDE_EBSD_DEVICE=cpu``).
+
+    The Mac accelerator path keeps its real coverage: ``test_device_lock.py``
+    pins that every torch call site serialises through the shared device lock,
+    and the fit runs in the real app.  ``SPYDE_GPU_TESTS=1`` forces these on
+    anyway (the escape hatch for reproducing on a Mac).
+    """
+    if os.environ.get("SPYDE_GPU_TESTS") == "1":
+        from spyde.actions.vector_orientation_gpu import gpu_available
+        return gpu_available()
+    try:
+        import torch
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
 
 pytestmark = pytest.mark.skipif(
-    not gpu_available(), reason="CUDA / torch GPU not available")
+    not _cuda_available(),
+    reason="needs CUDA (torch under pytest aborts on the macOS runners)")
 
 
 # Driver script run ONCE in a subprocess. Builds synthetic vectors + a
