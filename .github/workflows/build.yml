@@ -308,6 +308,20 @@ jobs:
         working-directory: electron
         run: npx playwright install --with-deps chromium
 
+      # Example datasets (pyxem's sped_ag) download through pooch with a
+      # checksum on first use; three slow-slice specs load it, so uncached
+      # runners re-fetch it from Zenodo every run — slow, and a stalled
+      # download eats the spec's whole budget (the hyperspy orgs cache the
+      # same way, e.g. hyperspy/.github's pooch-cache workflows). Keyed on
+      # the lock so a pyxem bump re-saves; restore-keys keeps it warm across
+      # unrelated dependency changes (pooch re-verifies checksums on load).
+      - name: Cache example datasets (pooch)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pyxem
+          key: pooch-pyxem-${{ hashFiles('uv.lock') }}
+          restore-keys: pooch-pyxem-
+
       - name: Run Electron e2e
         working-directory: electron
         env:
