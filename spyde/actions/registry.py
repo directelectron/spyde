@@ -105,6 +105,14 @@ STAGED_HANDLERS: dict[str, str] = {
     "crop_open":           "spyde.actions.base.crop_open",
     "crop_close":          "spyde.actions.base.crop_close",
     "crop_set_region":     "spyde.actions.base.crop_set_region",
+    # Drift Correction (spyde/actions/drift_action.py) — plan A8.
+    "drift_open":          "spyde.actions.drift_action.drift_open",
+    "drift_close":         "spyde.actions.drift_action.drift_close",
+    "drift_set_method":    "spyde.actions.drift_action.drift_set_method",
+    "drift_tune":          "spyde.actions.drift_action.drift_tune",
+    "drift_run":           "spyde.actions.drift_action.drift_run",
+    "drift_discard":       "spyde.actions.drift_action.drift_discard",
+    "drift_commit":        "spyde.actions.drift_action.drift_commit",
     "download_cancel":     "spyde.backend.example_download.download_cancel",
     "compute_configure":   "spyde.backend.compute_config.compute_configure",
     "set_log_level":       "spyde.backend.log_stream.set_log_level",
@@ -241,6 +249,7 @@ _WIZARD_SCHEMAS: dict[str, tuple[str, str]] = {
     "vom":    ("spyde.actions.vector_orientation_om", "VomWizard"),
     "ebsd":   ("spyde.actions.ebsd_action", "EbsdWizard"),
     "czb":    ("spyde.actions.center_zero_beam", "PARAMETERS"),
+    "drift":  ("spyde.actions.drift_action", "DriftWizard"),
     # YAML-declared (resolved from spyde.TOOLBAR_ACTIONS):
     "fv":     ("__yaml__", "Find Diffraction Vectors"),
     "om":     ("__yaml__", "Orientation Mapping"),
