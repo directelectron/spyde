@@ -120,6 +120,9 @@ export function FloatingToolbar({
   // caret's absolute positioning) used only to measure the caret's real size.
   const caretWrapRef = React.useRef<HTMLDivElement>(null)
   const caretBox = React.useRef<{ w: number; h: number } | null>(null)
+  /** The measured caret width, mirrored into state so the side-placement clamp
+   *  re-runs when a caret changes width without changing placement. */
+  const [caretW, setCaretW] = React.useState(240)
   const live = state.activeActions.get(windowId) ?? EMPTY
 
   // Keep the toolbar shown while a popout/caret is open or an action is live —
@@ -135,7 +138,10 @@ export function FloatingToolbar({
   // room again.
   const wr = winRect ?? { x: 0, y: 0, w: 0, h: 0 }
   const area = areaSize ?? { w: 100000, h: 100000 }
-  React.useLayoutEffect(() => {
+  // Held in a ref so the ResizeObserver below always runs the LATEST closure —
+  // `wr`/`area` change on every window move and resize.
+  const place = React.useRef<() => void>(() => {})
+  place.current = () => {
     if (!openName) return
     const el = caretWrapRef.current?.firstElementChild as HTMLElement | null
     if (el) {
@@ -150,7 +156,33 @@ export function FloatingToolbar({
       next = wr.x + wr.w + CARET_GAP + cw <= area.w ? 'right' : 'left'
     }
     setPlacement(p => (p === next ? p : next))
-  })
+    // The WIDTH has to be state, not just the ref: the side placements clamp
+    // with it (see `caretPos`), and the ref is written in a layout effect. If
+    // the placement itself does not change there is no re-render, so the
+    // clamp would keep using the previous caret's width — which for a caret
+    // that widens on a disclosure is exactly the case that needs it.
+    setCaretW(w => (w === cw ? w : cw))
+  }
+  React.useLayoutEffect(() => { place.current() })
+
+  // A caret's height can change WITHOUT this component re-rendering: a wizard's
+  // disclosure (Drift's `▸ Advanced`, a growing result note) is the WIZARD's
+  // own React state, and a child's state update does not re-render its parent.
+  // The layout effect above then never re-runs, the placement stays stale, and
+  // the caret finally JUMPS on some unrelated later render.
+  //
+  // That is not merely cosmetic: a jump that lands between a mousedown and a
+  // mouseup means the two land on DIFFERENT elements, so the browser emits no
+  // `click` at all. The control takes focus and silently does nothing, and the
+  // next click works — "every other click is ignored". Observing the caret's own
+  // box is what makes the placement track its content.
+  React.useLayoutEffect(() => {
+    const el = caretWrapRef.current?.firstElementChild as HTMLElement | null
+    if (!el || typeof ResizeObserver === 'undefined') return
+    const ro = new ResizeObserver(() => place.current())
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [openName])
 
   React.useEffect(() => {
     if (!openName) return
@@ -219,12 +251,29 @@ export function FloatingToolbar({
   // Where the bar's TOP edge sits in window coords — carets are DOM children of
   // the bar, so the side placements are expressed relative to it.
   const barTopInWin = inside ? wr.h - BAR_H - BAR_GAP : wr.h + BAR_GAP
+  // Where a SIDE-placed caret's left edge wants to be, in MDI-area coords, then
+  // CLAMPED into the area. `left` anchors the caret's RIGHT edge to the
+  // window's left edge, so a caret wider than the room beside the window simply
+  // walked off the edge of the app and its controls became unclickable —
+  // Playwright's "element is outside of the viewport", and for a user a panel
+  // with its labels sliced off. Overlapping the owning window is recoverable;
+  // being off-screen is not, so the clamp wins.
+  //
+  // When there IS room this is arithmetically identical to the old
+  // marginLeft/marginRight pair — the clamp is a no-op and nothing moves.
+  const sideLeft = placement === 'right'
+    ? wr.x + wr.w + CARET_GAP
+    : wr.x - CARET_GAP - caretW
+  const clampedLeft = Math.max(0, Math.min(sideLeft, area.w - caretW))
   const caretPos: React.CSSProperties =
     placement === 'below'
       ? { position: 'absolute', top: '100%', left: '50%', transform: 'translateX(-50%)', marginTop: CARET_GAP }
-      : placement === 'right'
-        ? { position: 'absolute', top: -barTopInWin, left: '50%', marginLeft: wr.w / 2 + CARET_GAP, transform: 'none' }
-        : { position: 'absolute', top: -barTopInWin, right: '50%', marginRight: wr.w / 2 + CARET_GAP, left: 'auto', transform: 'none' }
+      : {
+        position: 'absolute', top: -barTopInWin, left: '50%',
+        // The bar is centred on the window, so `left:50%` is the window's
+        // midline — walk from there to the clamped absolute position.
+        marginLeft: clampedLeft - (wr.x + wr.w / 2), transform: 'none',
+      }
 
   return (
     <div
