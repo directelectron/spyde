@@ -16,6 +16,7 @@ import time
 
 import numpy as np
 import hyperspy.api as hs
+from spyde.tests.migrated.conftest import _settle
 
 
 def _signal_plot(session, tree):
@@ -51,7 +52,7 @@ def _calibrated_diffraction_4d(nav=(4, 5), sig=(24, 24), scale=0.1):
 def _make_vectors_tree(session):
     """Run Find Vectors and return the resulting vectors-image tree."""
     session._add_signal(_calibrated_diffraction_4d(scale=0.1))
-    time.sleep(0.4)
+    _settle(session)
     src_plot = next((p for p in session._plots
                      if not p.is_navigator and p.plot_state is not None), None)
     session._dispatch_toolbar_action(

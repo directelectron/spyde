@@ -12,6 +12,7 @@ import time
 
 import numpy as np
 import hyperspy.api as hs
+from spyde.tests.migrated.conftest import _settle
 
 
 def _signal_plot(session):
@@ -62,7 +63,7 @@ class TestOffsetCrosshair:
         for ax in s.axes_manager.signal_axes:
             ax.scale, ax.offset = 0.1, 0.0
         session._add_signal(s)
-        time.sleep(0.3)
+        _settle(session)
         plot = _signal_plot(session)
         return session, plot
 
@@ -155,7 +156,7 @@ class TestOffsetCrosshair:
             for a in s.axes_manager.navigation_axes:
                 a.scale, a.offset = 2.0, 0.0
             session._add_signal(s)
-            time.sleep(0.3)
+            _settle(session)
             navp = next((p for p in session._plots if p.is_navigator), None)
             assert navp is not None
             navp._plot2d = _FakePlot2D()

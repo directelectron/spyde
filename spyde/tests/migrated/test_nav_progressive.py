@@ -42,13 +42,29 @@ _NAV_COMPUTED = threading.Event()
 _ARMED = threading.Event()
 
 
-def _slow_navigator_4d(nav=(16, 16), sig=(8, 8)):
+def _slow_navigator_4d(nav=(16, 16), sig=(8, 8), free_pos=None, nav_chunks=None):
     """A lazy 4-D signal whose per-chunk read sleeps until the test releases the
-    gate — simulating a large scan whose virtual-image sum is slow to compute."""
+    gate — simulating a large scan whose virtual-image sum is slow to compute.
+
+    With ``free_pos=(iy, ix)`` (and a multi-chunk ``nav_chunks`` grid) the ONE
+    block containing that nav position passes the gate freely: the navigator
+    sum still blocks (it needs every other block), while a single-frame DP
+    read of that position can complete.  Gating EVERY block was the fixture
+    flaw that made 'DP while nav computes' untestable — the DP slice blocked
+    at the same gate as the navigator sum."""
     ny, nx = nav
+    # Identify the free block by its CONTENT (each frame is a constant, unique
+    # value), not by block_info coordinates — dask's slicing pushdown can hand
+    # the block function a rewritten task whose array-location is relative to
+    # the sliced array, so coordinate keying silently gates the wrong blocks.
+    free_value = (float(free_pos[0] * nx + free_pos[1] + 1)
+                  if free_pos is not None else None)
 
     def _slow_block(block, block_info=None):
         if _ARMED.is_set():
+            if free_value is not None and np.any(
+                    np.asarray(block)[..., 0, 0] == free_value):
+                return block              # the DP probe's block passes freely
             # The navigator sum traverses all blocks; block until released so the
             # nav image can't finish before the test checks the windows.
             _NAV_COMPUTED.set()
@@ -59,7 +75,7 @@ def _slow_navigator_4d(nav=(16, 16), sig=(8, 8)):
     for iy in range(ny):
         for ix in range(nx):
             base[iy, ix] = float(iy * nx + ix + 1)
-    arr = da.from_array(base, chunks=(ny, nx) + sig)
+    arr = da.from_array(base, chunks=(nav_chunks or (ny, nx)) + sig)
     arr = arr.map_blocks(_slow_block, dtype=np.float32)
     s = hs.signals.Signal2D(arr).as_lazy()
     s.set_signal_type("electron_diffraction")
@@ -110,27 +126,35 @@ class TestProgressiveNavigator:
             _GATE.set()
             session.shutdown()
 
-    @pytest.mark.xfail(
-        reason="Pre-existing fixture flaw (fails on clean main too): _slow_block "
-        "gates EVERY block compute, so the single-frame DP slice blocks at the "
-        "same gate as the navigator sum — the test can't actually exercise 'DP "
-        "while nav computes' with this synthetic data. Unrelated to the serial "
-        "nav-dispatcher.",
-        strict=False,
-    )
     def test_crosshair_selects_frame_while_nav_still_computing(self, monkeypatch):
         """The crosshair can move and select a diffraction pattern BEFORE the
-        navigator virtual image has finished."""
+        navigator virtual image has finished.
+
+        (Formerly a dead non-strict xfail: the fixture gated EVERY block, so
+        every DP read — including the load-time read at the crosshair's
+        DEFAULT CENTER — blocked at the same gate as the navigator sum,
+        wedging the serial dispatcher; the test could never pass and timed
+        out its poll on every run.  The fixture now exempts the ONE 8x8
+        nav-chunk holding the default center AND the probed position, so
+        DP reads complete while the sum stays blocked on the other three
+        chunks.)"""
         monkeypatch.setenv("SPYDE_NO_DASK", "1")
         session = _make_session()
         try:
             nx = 16
-            s = _slow_navigator_4d(nav=(16, nx))
+            # 2x2 nav-chunk grid.  The free block must be the one holding the
+            # crosshair's DEFAULT CENTER (8, 8): the selector fires a read
+            # there at load, on the same serial dispatcher — if that read
+            # gates, the probe below never runs.  Probe a different position
+            # inside the same chunk.
+            ix, iy = 10, 9                      # chunk (1, 1), like (8, 8)
+            s = _slow_navigator_4d(nav=(16, nx), free_pos=(iy, ix),
+                                   nav_chunks=(8, 8))
             _ARMED.set()
             session._add_signal(s, source_path=None)
-            time.sleep(0.2)   # let the background nav compute start + hit the gate
-
-            assert _NAV_COMPUTED.is_set(), "nav compute never started"
+            # The progressive fill is deferred until the first signal frame
+            # paints, so wait on the event rather than a flat sleep.
+            assert _NAV_COMPUTED.wait(timeout=10), "nav compute never started"
             assert not _GATE.is_set()   # still blocked mid-compute
 
             tree = session.signal_trees[-1]
@@ -139,24 +163,26 @@ class TestProgressiveNavigator:
             sel = mgr.navigation_selectors[pw][0]
             cross = getattr(sel, "_crosshair_selector", sel)
 
-            # Move the crosshair to (ix=4, iy=3) and force an update — must work
-            # even though the nav image is still blocked.
-            ix, iy = 4, 3
+            # Move the crosshair and force an update — must work even though
+            # the nav image is still blocked.
             cross._widget.cx = float(ix)
             cross._widget.cy = float(iy)
             sel.delayed_update_data(force=True)
 
-            # Updates now run on the serial nav-dispatcher (async); poll the
-            # crosshair's child for the painted frame instead of a fixed sleep.
+            # Updates run on the serial nav-dispatcher (async); poll the
+            # crosshair's child for the PROBE's frame (the load-time read may
+            # already have painted the default-center frame).
+            expected = float(iy * nx + ix + 1)
             child = next(iter(cross.children.keys()))
             data = None
             for _ in range(40):
                 data = child.current_data
-                if isinstance(data, np.ndarray):
+                if (isinstance(data, np.ndarray)
+                        and abs(float(np.mean(data)) - expected) < 1e-3):
                     break
                 time.sleep(0.05)
             assert isinstance(data, np.ndarray), "crosshair didn't select a DP frame"
-            assert abs(float(np.mean(data)) - float(iy * nx + ix + 1)) < 1e-3
+            assert abs(float(np.mean(data)) - expected) < 1e-3
             # The nav image compute is still blocked at the gate — proving the
             # crosshair worked WHILE the navigator was mid-compute.
             assert not _GATE.is_set(), "gate released — nav compute not blocked"

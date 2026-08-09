@@ -122,6 +122,10 @@ class ProgressiveSignalPreview:
         self.blocks_seen = 0
         #: (a) auto-sample paints driven by a landing block
         self.frames_painted = 0
+        #: of those, paints whose set_data actually SUCCEEDED on >=1 signal
+        #: plot (paint_signal_plots' return) — frames_painted counts attempts,
+        #: so a swallowed set_data failure is visible as landed < painted.
+        self.frames_landed = 0
         #: (b) navigator-driven reads answered from the already-computed region
         self.frames_served = 0
         #: navigator-driven reads that landed on a position the batch has not
@@ -210,7 +214,8 @@ class ProgressiveSignalPreview:
 
         def _apply():
             if not self._closed:
-                paint_signal_plots(tree, frame)
+                if paint_signal_plots(tree, frame) > 0:
+                    self.frames_landed += 1
 
         dispatch = getattr(self.session, "_dispatch_to_main", None)
         if dispatch is None:

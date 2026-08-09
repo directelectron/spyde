@@ -11,6 +11,7 @@ import time
 
 import numpy as np
 import hyperspy.api as hs
+from spyde.tests.migrated.conftest import _settle
 
 
 def _make_session():
@@ -29,7 +30,7 @@ class TestSignalType:
         try:
             s = hs.signals.Signal2D(np.zeros((8, 8), dtype=np.float32))
             session._add_signal(s, source_path=None)
-            time.sleep(0.4)
+            _settle(session)
             info = _msgs(captured_messages, "signal_type_info")
             assert info, "no signal_type_info emitted on load"
             assert info[-1]["current"] == ""          # generic Signal2D
@@ -43,12 +44,12 @@ class TestSignalType:
         try:
             s = hs.signals.Signal2D(np.zeros((4, 4, 8, 8), dtype=np.float32))
             session._add_signal(s, source_path=None)
-            time.sleep(0.4)
+            _settle(session)
             captured_messages.clear()
 
             plot = session._plots[-1]
             session._set_signal_type(plot, "electron_diffraction")
-            time.sleep(0.3)
+            _settle(session)
 
             tree = session.signal_trees[-1]
             assert tree.root.metadata.get_item("Signal.signal_type") == "electron_diffraction"
@@ -65,11 +66,11 @@ class TestSignalType:
             s = hs.signals.Signal2D(np.zeros((4, 4, 8, 8), dtype=np.float32))
             s.set_signal_type("electron_diffraction")
             session._add_signal(s, source_path=None)
-            time.sleep(0.4)
+            _settle(session)
 
             plot = session._plots[-1]
             session._set_signal_type(plot, "")
-            time.sleep(0.3)
+            _settle(session)
             assert (session.signal_trees[-1].root.metadata.get_item(
                 "Signal.signal_type", default="") or "") == ""
         finally:

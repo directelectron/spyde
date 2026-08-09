@@ -22,6 +22,7 @@ from spyde.actions.ebsd_action import (
     DEFAULTS, EbsdWizard, ebsd_build_dictionary, ebsd_refine, ebsd_run,
 )
 from spyde.data import ebsd_patterns, ground_truth
+from spyde.tests.migrated.conftest import _settle
 
 
 @pytest.fixture(autouse=True)
@@ -76,7 +77,7 @@ def ebsd_session(captured_messages, monkeypatch):
     session = Session(n_workers=1, threads_per_worker=1)
     s = ebsd_patterns(nav=(8, 8), detector=(40, 40))
     session._add_signal(s, source_path=None)
-    time.sleep(0.8)             # let the selector debounce timers fire
+    _settle(session)            # let the selector debounce timers fire
     yield {"session": session, "signal": s, "truth": ground_truth(s),
            "messages": captured_messages,
            "trees": session.signal_trees, "plots": session._plots}
@@ -112,15 +113,13 @@ class TestBuildDictionary:
         assert len(wiz.euler) == len(wiz.indexer)
         assert wiz.detector == (40, 40)
 
-    def test_adopts_the_projection_centre_the_data_records(self, ebsd_session):
-        """The synthetic scan stamps the PC it was rendered with. Without this
-        the first overlay is drawn with a guessed geometry and every line is
-        off, which reads as broken indexing."""
-        _s, _p, _t, wiz = _build(ebsd_session)
+        # It adopts the projection centre the data records.  The synthetic
+        # scan stamps the PC it was rendered with; without this the first
+        # overlay is drawn with a guessed geometry and every line is off,
+        # which reads as broken indexing.
         assert np.allclose(wiz.pc, ebsd_session["truth"]["pc"])
 
-    def test_announces_itself_to_the_caret(self, ebsd_session):
-        _build(ebsd_session)
+        # And it announces itself to the caret.
         msgs = [m for m in ebsd_session["messages"]
                 if m.get("type") == "ebsd_dictionary_ready"]
         assert msgs, "no ebsd_dictionary_ready — the caret stays locked"
@@ -168,7 +167,7 @@ class TestBuildDictionary:
 
 
 class TestBandOverlay:
-    def test_draws_line_segments_for_the_matched_orientation(self, ebsd_session):
+    def test_draws_line_segments_and_streams_the_match(self, ebsd_session):
         _s, _p, _t, wiz = _build(ebsd_session)
         ov = wiz.overlay
         assert ov is not None, "no band overlay attached"
@@ -178,9 +177,7 @@ class TestBandOverlay:
         assert len(segs) > 0, "the matched orientation drew no bands"
         assert len(za) == 0, "zone axes are off by default"
 
-    def test_streams_the_match_to_the_caret(self, ebsd_session):
-        _s, _p, _t, wiz = _build(ebsd_session)
-        wiz.overlay._offsets_for(2, 3)
+        # The draw call above also streams the match to the caret.
         hits = [m for m in ebsd_session["messages"] if m.get("type") == "ebsd_match"]
         assert hits and hits[-1]["ok"]
         assert 0.0 <= hits[-1]["score"] <= 1.0
@@ -197,10 +194,9 @@ class TestBandOverlay:
         b, _ = wiz.overlay._offsets_for(int(ys2[0]), int(xs2[0]))
         assert a.shape != b.shape or not np.allclose(a, b)
 
-    def test_hiding_clears_both_marker_groups(self, ebsd_session):
-        """set_visible(False) pushes a bare array, not the (segments, points)
-        tuple the overlay normally renders — it has to survive that."""
-        _s, _p, _t, wiz = _build(ebsd_session)
+        # Hiding clears both marker groups: set_visible(False) pushes a bare
+        # array, not the (segments, points) tuple the overlay normally
+        # renders — it has to survive that.
         wiz.overlay.set_visible(False)
         assert wiz.overlay._hidden
         wiz.overlay.set_visible(True)
@@ -247,19 +243,16 @@ class TestRunStage:
         assert rgb.shape == (8, 8, 3) and rgb.dtype == np.uint8
         assert len(session.signal_trees) > before, "no result window opened"
 
-    def test_the_ipf_map_shows_the_two_grains(self, ebsd_session):
-        """The end-to-end check: the wedge grain must come out a different
-        colour from the drifting background grain. This is also the only test
-        that would notice the orientations being handed to orix transposed —
-        no, it would not; see test_ebsd_bands for that. It notices indexing
-        that lost the grain structure entirely."""
-        session, plot, tree, _wiz = _build(ebsd_session)
-        ebsd_run(session, plot, {"keep": 4, "refine": False})
-        assert _wait(lambda: getattr(tree, "orientation_map", None) is not None,
-                     timeout=180)
-        rgb = tree.orientation_map.ipf_color_map("z").astype(float)
+        # And the IPF map shows the two grains.  The end-to-end check: the
+        # wedge grain must come out a different colour from the drifting
+        # background grain. This is also the only test that would notice the
+        # orientations being handed to orix transposed — no, it would not;
+        # see test_ebsd_bands for that. It notices indexing that lost the
+        # grain structure entirely.
+        grain_rgb = rgb.astype(float)
         mask = np.asarray(ebsd_session["truth"]["grain2_mask"], bool)
-        assert np.linalg.norm(rgb[mask].mean(0) - rgb[~mask].mean(0)) > 20, \
+        assert np.linalg.norm(
+            grain_rgb[mask].mean(0) - grain_rgb[~mask].mean(0)) > 20, \
             "the two grains came out the same colour"
 
     def test_refuses_before_the_dictionary_is_built(self, ebsd_session):
@@ -299,7 +292,7 @@ class TestNeverMaterialisesTheScan:
         # it legitimately would, and the guard could not tell the difference).
         s.data = s.data.rechunk((2, 4, -1, -1))
         session._add_signal(s, source_path=None)
-        time.sleep(0.8)
+        _settle(session)
         yield {"session": session, "signal": s, "messages": captured_messages,
                "trees": session.signal_trees, "plots": session._plots}
         session.shutdown()
@@ -409,13 +402,19 @@ class TestNeverMaterialisesTheScan:
     def test_eager_data_still_gets_a_bounded_chunking(self):
         """An eager scan has no chunks of its own; it must still be given a
         nav chunking, sized by BYTES, so a bigger detector means fewer rows
-        rather than the same rows and more memory."""
+        rather than the same rows and more memory.
+
+        _nav_block_rows / _lazy_scan are pure bytes/shape math, so a 16x16
+        nav grid proves the same three properties a 64x64 one did (which
+        cost ~9 s of pattern rendering).  The budget shrinks with it so BOTH
+        row counts stay bytes-derived rather than ny-clamped: at 1 MiB the
+        40x40 detector gives 10 rows and the 80x80 gives 2."""
         from spyde.actions.ebsd_action import _lazy_scan, _nav_block_rows
-        small = ebsd_patterns(nav=(64, 64), detector=(40, 40))
-        big = ebsd_patterns(nav=(64, 64), detector=(80, 80))
-        budget = 4 << 20
+        small = ebsd_patterns(nav=(16, 16), detector=(40, 40))
+        big = ebsd_patterns(nav=(16, 16), detector=(80, 80))
+        budget = 1 << 20
         assert _nav_block_rows(big, budget) < _nav_block_rows(small, budget)
-        assert _nav_block_rows(small, 1 << 40) == 64        # never more than ny
+        assert _nav_block_rows(small, 1 << 40) == 16        # never more than ny
         scan = _lazy_scan(small)
         assert len(scan.chunks[2]) == 1 and len(scan.chunks[3]) == 1, \
             "patterns must not be split across chunks"

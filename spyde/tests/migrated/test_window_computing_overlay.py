@@ -88,26 +88,16 @@ class TestWindowComputingOverlayNavFill:
             assert msgs[0]["computing"] is True
             # A stop must follow somewhere after it.
             assert any(m["computing"] is False for m in msgs[1:])
-        finally:
-            session.shutdown()
 
-    def test_stop_message_carries_same_window_id_as_start(self, monkeypatch, captured_messages):
-        monkeypatch.setenv("SPYDE_NO_DASK", "1")
-        session = _make_session()
-        try:
-            s = _lazy_4d()
-            session._add_signal(s, source_path=None)
-            assert _wait(lambda: any(
-                m.get("computing") is False for m in _computing_messages(captured_messages)
-            ))
-
+            # And every started window_id got a matching stop — a second
+            # property of the same captured message list (this ran as its own
+            # test with an identical session + fill).
             starts = [m["window_id"] for m in _computing_messages(captured_messages)
                       if m["computing"] is True]
             stops = [m["window_id"] for m in _computing_messages(captured_messages)
                      if m["computing"] is False]
             assert starts, "no start message emitted"
             assert stops, "no stop message emitted"
-            # Every started window_id eventually got a matching stop.
             assert set(starts) <= set(stops), (
                 f"started windows {set(starts)} missing a stop in {set(stops)}"
             )

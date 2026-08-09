@@ -19,6 +19,7 @@ import time
 
 import numpy as np
 import hyperspy.api as hs
+from spyde.tests.migrated.conftest import _settle
 
 
 def _signal_plot(session):
@@ -57,7 +58,7 @@ class TestVectorOverlay:
         session = Session(n_workers=1, threads_per_worker=1)
         try:
             session._add_signal(_calibrated_diffraction_4d(scale=0.1), source_path=None)
-            time.sleep(0.4)
+            _settle(session)
             src_plot = _signal_plot(session)
             src_tree = src_plot.signal_tree
 
@@ -103,7 +104,7 @@ class TestVectorOverlay:
         session = Session(n_workers=1, threads_per_worker=1)
         try:
             session._add_signal(_calibrated_diffraction_4d(scale=0.1), source_path=None)
-            time.sleep(0.4)
+            _settle(session)
             src_plot = _signal_plot(session)
             src_tree = src_plot.signal_tree
             session._dispatch_toolbar_action(

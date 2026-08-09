@@ -21,6 +21,7 @@ import hyperspy.api as hs
 
 from spyde.signals.insitu import InSitu, LazyInSitu
 from spyde.drawing.toolbars.plot_control_toolbar import get_toolbar_actions_for_plot
+from spyde.tests.migrated.conftest import _settle
 
 
 class TestInSituSignalType:
@@ -48,7 +49,7 @@ class TestTestHarnessMovieLoaderTypesInSitu:
             {"action": "load_test_data_movie", "payload": {"size": 64, "frames": 3}}
         )
         import time
-        time.sleep(0.5)
+        _settle(session)
         assert len(session.signal_trees) == 1
         tree = session.signal_trees[0]
         assert tree.root._signal_type == "insitu"
@@ -95,7 +96,7 @@ class TestPlaybackToolbarGating:
         assert s._signal_type != "insitu"
         session._add_signal(s, source_path=None)
         import time
-        time.sleep(0.5)
+        _settle(session)
         nav_plot = self._navigator_plot(session)
         assert nav_plot is not None, "1-D-nav fixture should have a navigator plot"
         names = get_toolbar_actions_for_plot(nav_plot.plot_state)[2]

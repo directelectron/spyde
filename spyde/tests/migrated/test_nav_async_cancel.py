@@ -298,10 +298,13 @@ class TestOutOfOrderFramesNeverPaint:
             data, arr = _movie()
             sig = _FakeSignal(data, nav_dim=1)
 
-            # Two reads in order; let both complete.
+            # Two reads in order; let both complete.  The pool has ONE worker,
+            # so a barrier task resolving proves both reads AND their done-
+            # callbacks (which run on the worker thread) have finished — no
+            # flat sleep needed.
             _submit_async_nav_read(plot, sig, np.array([1]), False, _Prof())
             _submit_async_nav_read(plot, sig, np.array([7]), False, _Prof())
-            time.sleep(0.6)
+            pool.submit(lambda: None).result(timeout=5.0)
             sess.drain()
 
             assert plot.painted, "the newer read should have painted"
@@ -315,7 +318,7 @@ class TestOutOfOrderFramesNeverPaint:
             newest_painted = plot._nav_painted_seq
             plot._nav_read_seq = newest_painted - 2      # this read is "behind"
             _submit_async_nav_read(plot, sig, np.array([1]), False, _Prof())
-            time.sleep(0.6)
+            pool.submit(lambda: None).result(timeout=5.0)   # read + callback done
             sess.drain()
 
             assert len(plot.painted) == painted_before, \

@@ -507,7 +507,9 @@ class TestNavRefresh:
         session.console.submit_preview("", pid + 999, True)
         n0 = _count_results(msgs, pid)
         session.console.notify_nav_changed()
-        time.sleep(0.6)
+        # Negative-evidence window (a rerun that must NOT happen has no event
+        # to poll for); 0.3 s is ~10x the preview thread's dispatch latency.
+        time.sleep(0.3)
         assert _count_results(msgs, pid) == n0, "nav move re-ran a STOPPED preview"
         # And the stop itself emitted nothing.
         assert not any(m.get("type") == "console_preview_result"
@@ -522,7 +524,9 @@ class TestNavRefresh:
         assert _exec(session, msgs, "1 + 1") is not None
         n0 = _count_results(msgs, pid)
         session.console.notify_nav_changed()
-        time.sleep(0.6)
+        # Negative-evidence window (a rerun that must NOT happen has no event
+        # to poll for); 0.3 s is ~10x the preview thread's dispatch latency.
+        time.sleep(0.3)
         assert _count_results(msgs, pid) == n0, "nav move resurrected a pre-exec preview"
 
     def test_explicit_preview_not_nav_tracked(self, window):
@@ -535,7 +539,9 @@ class TestNavRefresh:
         pid = res["preview_id"]
         n0 = _count_results(msgs, pid)
         session.console.notify_nav_changed()
-        time.sleep(0.6)
+        # Negative-evidence window (a rerun that must NOT happen has no event
+        # to poll for); 0.3 s is ~10x the preview thread's dispatch latency.
+        time.sleep(0.3)
         assert _count_results(msgs, pid) == n0
 
     def test_run_update_fires_hook_only_on_change(self, window, monkeypatch):

@@ -6,6 +6,7 @@ artifacts".
 from __future__ import annotations
 
 import time
+from spyde.tests.migrated.conftest import _settle
 
 
 def _signal_plot(session):
@@ -22,7 +23,7 @@ def _run_action(session):
     src = _signal_plot(session)
     assert src is not None
     session._dispatch_toolbar_action(src, ACTION, {})
-    time.sleep(0.4)
+    _settle(session)
     return src
 
 

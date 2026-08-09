@@ -7,14 +7,13 @@ can never accidentally sum a huge number of nav positions. A belt-and-suspenders
 clamp in _get_selected_indices bounds the index count even if the widget geometry
 wasn't clamped (e.g. a programmatic set).
 """
-import time
-
 import numpy as np
 import hyperspy.api as hs
 
 from spyde.drawing.selectors.base_selector import (
     DEFAULT_REGION_EXTENT_PER_DIM, MAX_REGION_EXTENT_PER_DIM,
 )
+from spyde.tests.migrated.conftest import _settle
 
 
 def _make_4d_session():
@@ -26,7 +25,7 @@ def _make_4d_session():
     s.set_signal_type("electron_diffraction")
     sess = Session(n_workers=1, threads_per_worker=1)
     sess._add_signal(s, source_path=None)
-    time.sleep(0.6)
+    _settle(sess)
     return sess
 
 
@@ -37,7 +36,7 @@ def _make_movie_session():
         np.random.RandomState(1).rand(64, 8, 8).astype(np.float32))
     sess = Session(n_workers=1, threads_per_worker=1)
     sess._add_signal(s, source_path=None)
-    time.sleep(0.6)
+    _settle(sess)
     return sess
 
 
@@ -142,7 +141,7 @@ class TestDefaultSpanOnFirstIntegrate:
         tax.name, tax.units, tax.scale = "time", "s", scale
         sess = Session(n_workers=1, threads_per_worker=1)
         sess._add_signal(s, source_path=None)
-        time.sleep(0.7)
+        _settle(sess)
         return sess
 
     def test_first_integrate_gives_the_default_width_not_the_whole_axis(self):

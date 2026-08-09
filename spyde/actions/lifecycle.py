@@ -314,9 +314,18 @@ def show_tree_node(plot, tree, new_signal) -> None:
             log.debug("re-emitting signal tree after transform failed: %s", e)
 
 
-def paint_signal_plots(tree, data, *, levels: tuple[float, float] | None = None) -> None:
+def paint_signal_plots(tree, data, *, levels: tuple[float, float] | None = None) -> int:
     """Paint *data* onto every signal plot of *tree*. With *levels* the plot's
-    contrast is locked to that range; otherwise it re-auto-levels."""
+    contrast is locked to that range; otherwise it re-auto-levels.
+
+    Returns the number of plots whose ``set_data`` SUCCEEDED.  A failed paint
+    is still swallowed (a progressive compute's per-chunk callback must never
+    fail the compute) and logged at DEBUG, but the count makes the swallow
+    observable — callers that ignore the return are unaffected, and a caller
+    that must know whether pixels actually landed (the live signal preview,
+    and the tests that used to infer it from counters that incremented even
+    when the paint raised) can assert on it."""
+    painted = 0
     for sp in list(getattr(tree, "signal_plots", []) or []):
         try:
             if levels is not None:
@@ -325,8 +334,10 @@ def paint_signal_plots(tree, data, *, levels: tuple[float, float] | None = None)
             else:
                 sp.needs_auto_level = True
             sp.set_data(data)
+            painted += 1
         except Exception as e:
             log.debug("painting signal plot failed: %s", e)
+    return painted
 
 
 def progress_emitter(prefix: str, *, min_interval: float = 0.5) -> Callable[[int, int], None]:

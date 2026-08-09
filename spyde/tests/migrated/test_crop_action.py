@@ -16,6 +16,7 @@ import hyperspy.api as hs
 from spyde.actions.base import (
     CropAction, _crop_signal, crop_open, crop_close, crop_set_region,
 )
+from spyde.tests.migrated.conftest import _settle
 
 
 class TestCropSlicing:
@@ -80,7 +81,7 @@ class TestCropThroughAction:
         # x 2..14 (=12 cols), y 4..10 (=6 rows) → signal_shape (12, 6).
         act = CropAction.for_plot(plot, x0=2, x1=14, y0=4, y1=10)
         new = act.run()
-        time.sleep(0.2)
+        _settle(session)
 
         assert new is not None
         assert tuple(new.axes_manager.signal_shape) == (12, 6)
@@ -96,7 +97,7 @@ class TestCropThroughAction:
                     if not p.is_navigator and p.plot_state is not None)
         act = CropAction.for_plot(plot, x0=4, x1=20, y0=6, y1=18)
         new = act.run()
-        time.sleep(0.2)
+        _settle(session)
         assert new is not None
         assert new._lazy is True
         assert isinstance(new.data, da.Array), "cropped movie must stay lazy"
@@ -148,7 +149,7 @@ class TestCropROI:
         # Run picks up the WIDGET's geometry — typed fields are stale/absent.
         act = CropAction.for_plot(plot)
         new = act.run()
-        time.sleep(0.2)
+        _settle(session)
 
         assert new is not None
         assert tuple(new.axes_manager.signal_shape) == (12, 6)
@@ -170,7 +171,7 @@ class TestCropROI:
 
         act = CropAction.for_plot(plot)
         new = act.run()
-        time.sleep(0.2)
+        _settle(session)
 
         assert new is not None
         # Clamped to the full valid frame (0..w, 0..h) rather than raising or

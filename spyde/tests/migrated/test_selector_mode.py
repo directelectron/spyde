@@ -7,6 +7,7 @@ import time
 
 import numpy as np
 import hyperspy.api as hs
+from spyde.tests.migrated.conftest import _settle
 
 
 def _make_4d_session():
@@ -15,7 +16,7 @@ def _make_4d_session():
     s.set_signal_type("electron_diffraction")
     sess = Session(n_workers=1, threads_per_worker=1)
     sess._add_signal(s, source_path=None)
-    time.sleep(0.6)
+    _settle(sess)
     return sess
 
 
@@ -63,7 +64,7 @@ class TestCompositeSharesChildren:
             s = hs.signals.Signal2D(
                 np.random.RandomState(0).rand(6, 8, 8).astype(np.float32))
             sess._add_signal(s, source_path=None)
-            time.sleep(0.6)
+            _settle(sess)
             comp = next(iter(sess._nav_selectors.values()))
             assert comp.children is comp._inf_line_selector.children
             assert comp.children is comp._linear_region_selector.children

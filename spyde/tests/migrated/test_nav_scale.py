@@ -22,6 +22,7 @@ import time
 import numpy as np
 import hyperspy.api as hs
 import pytest
+from spyde.tests.migrated.conftest import _settle
 
 
 def _make_session():
@@ -80,7 +81,7 @@ class TestNavScaleIndexMapping:
         try:
             s = _ramp_4d((4, 5), scale=scale, offset=offset)  # ny=4, nx=5
             session._add_signal(s, source_path=None)
-            time.sleep(0.6)
+            _settle(session)
             sel = _navigator_selector(session)
 
             ix, iy = 2, 1
@@ -105,13 +106,13 @@ class TestNavScaleIndexMapping:
             nx = 5
             s = _ramp_4d((4, nx), sig=(8, 8), scale=3.0, units="nm")
             session._add_signal(s, source_path=None)
-            time.sleep(0.6)
+            _settle(session)
             sel = _navigator_selector(session)
 
             ix, iy = 3, 2
             _set_crosshair_pixels(sel, ix, iy)
             sel.delayed_update_data(force=True)
-            time.sleep(0.4)
+            _settle(session)
 
             # The child (signal) plot must now hold the DP for frame k.
             child = next(iter(sel.children.keys()))

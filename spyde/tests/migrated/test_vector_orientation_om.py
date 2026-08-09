@@ -17,6 +17,8 @@ import time
 import numpy as np
 import hyperspy.api as hs
 
+from spyde.tests.migrated.conftest import _settle
+
 CIF = os.path.join(os.path.dirname(__file__), "..", "Silver__0011135.cif")
 
 
@@ -57,7 +59,7 @@ def _multi_disk_4d(nav=(3, 3), sig=(48, 48), scale=0.05):
 
 def _make_vectors_tree(session):
     session._add_signal(_multi_disk_4d())
-    time.sleep(0.4)
+    _settle(session)
     src = next((p for p in session._plots
                 if not p.is_navigator and p.plot_state is not None), None)
     session._dispatch_toolbar_action(
@@ -86,6 +88,14 @@ class TestVectorOrientationOM:
             vplot = _signal_plot(session, vtree)
             assert vplot is not None
 
+            # ── Pre-generate: Compute Maps without a library must error
+            #    gracefully — no new tree (the natural staged-wizard ordering,
+            #    so it runs against a genuinely library-less tree) ───────────
+            before = len(session.signal_trees)
+            vom_run(session, vplot, {"strain_cap": 0.05})   # no library yet
+            time.sleep(0.4)
+            assert len(session.signal_trees) == before
+
             # ── Generate Library (coarse resolution → quick) ────────────────
             vom_generate_library(session, vplot, {
                 "cif_path": CIF, "accelerating_voltage": 200.0,
@@ -95,6 +105,22 @@ class TestVectorOrientationOM:
                          and vtree._vom_wizard.lib is not None), \
                 "template library never built"
             assert len(vtree._vom_wizard.lib.spots_xy) > 0
+
+            # ── Generate also activates the live refine overlay ─────────────
+            assert _wait(lambda: vtree._vom_wizard.overlay is not None), \
+                "live refine overlay never attached"
+            ov = vtree._vom_wizard.overlay
+            # Two marker groups: measured (red) + fitted template (green).
+            assert ov._mg_meas is not None and ov._mg_tmpl is not None
+            # At a position with ≥4 vectors: measured points drawn, template
+            # fit too.
+            vecs = vtree.diffraction_vectors
+            cm = vecs.count_map()
+            ys, xs = np.nonzero(cm >= 4)
+            if len(ys):
+                meas, tmpl = ov._offsets_for(int(ys[0]), int(xs[0]))
+                assert meas.shape[0] >= 4
+                assert tmpl.shape[1] == 2     # a fitted template was produced
 
             # Generate now ALSO fits the whole field and opens the live IPF
             # heatmap window (Qt parity — the orientation map appears while you
@@ -144,33 +170,12 @@ class TestVectorOrientationOM:
         finally:
             session.shutdown()
 
-    def test_generate_activates_live_refine_overlay(self):
-        from spyde.backend.session import Session
-        from spyde.actions.vector_orientation_om import vom_generate_library
-        session = Session(n_workers=1, threads_per_worker=1)
-        try:
-            vtree = _make_vectors_tree(session)
-            vplot = _signal_plot(session, vtree)
-            vom_generate_library(session, vplot, {
-                "cif_path": CIF, "accelerating_voltage": 200.0,
-                "resolution": 12.0, "minimum_intensity": 1e-4,
-            })
-            assert _wait(lambda: getattr(vtree, "_vom_wizard", None) is not None
-                         and vtree._vom_wizard.overlay is not None), \
-                "live refine overlay never attached"
-            ov = vtree._vom_wizard.overlay
-            # Two marker groups: measured (red) + fitted template (green).
-            assert ov._mg_meas is not None and ov._mg_tmpl is not None
-            # At a position with ≥4 vectors: measured points drawn, template fit too.
-            vecs = vtree.diffraction_vectors
-            cm = vecs.count_map()
-            ys, xs = np.nonzero(cm >= 4)
-            if len(ys):
-                meas, tmpl = ov._offsets_for(int(ys[0]), int(xs[0]))
-                assert meas.shape[0] >= 4
-                assert tmpl.shape[1] == 2     # a fitted template was produced
-        finally:
-            session.shutdown()
+    # test_generate_activates_live_refine_overlay and
+    # test_run_without_library_errors_gracefully were folded into
+    # test_generate_then_run above: they re-ran the identical
+    # _make_vectors_tree + vom_generate_library flow to read other properties
+    # of the same wizard (and the overlay variant did not force the CPU fit,
+    # so its background field fit could hit CUDA in-process on dev boxes).
 
     def test_fit_field_prefers_gpu_then_falls_back(self, monkeypatch):
         """`_fit_field` must dispatch the BATCHED GPU path first (Qt parity — the
@@ -209,16 +214,3 @@ class TestVectorOrientationOM:
         assert vom._fit_field(_Vecs(), object(), {}) == "CPU_RESULT"
         assert calls == ["cpu"]
 
-    def test_run_without_library_errors_gracefully(self):
-        from spyde.backend.session import Session
-        from spyde.actions.vector_orientation_om import vom_run
-        session = Session(n_workers=1, threads_per_worker=1)
-        try:
-            vtree = _make_vectors_tree(session)
-            vplot = _signal_plot(session, vtree)
-            before = len(session.signal_trees)
-            vom_run(session, vplot, {"strain_cap": 0.05})   # no library yet
-            time.sleep(0.4)
-            assert len(session.signal_trees) == before
-        finally:
-            session.shutdown()

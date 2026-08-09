@@ -28,6 +28,27 @@ import subprocess
 import sys
 import textwrap
 
+import pytest
+
+
+def _cuda_available() -> bool:
+    # CUDA specifically, NOT gpu_available(): that predicate is True on Apple
+    # MPS too, and this file measures torch.cuda peak bytes — its driver
+    # asserts the model landed on cuda, so an MPS runner must SKIP, not run
+    # (the macos-latest CI leg caught exactly that). Import-and-check is safe
+    # in-process; it is torch-CUDA *work* that segfaults under pytest on
+    # Windows, and the ~4 s probe subprocess this replaces existed only to
+    # make this same decision.
+    try:
+        import torch
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+pytestmark = pytest.mark.skipif(
+    not _cuda_available(), reason="needs CUDA (measures torch.cuda peak memory)")
+
 _DRIVER = textwrap.dedent(r"""
     import json, sys, os
     import numpy as np
@@ -50,14 +71,7 @@ _DRIVER = textwrap.dedent(r"""
     mode = sys.argv[1]
     out = {}
 
-    if mode == "check_cuda":
-        import torch
-        out["cuda"] = bool(torch.cuda.is_available())
-        print("RESULT_JSON", json.dumps(out))
-        sys.stdout.flush()
-        os._exit(0)
-
-    elif mode == "scaling":
+    if mode == "scaling":
         import torch
         from spyde import models
 
@@ -128,11 +142,6 @@ def _run(mode, timeout=300):
 
 class TestNeuralBatchMemory:
     def test_peak_memory_scales_with_batch_not_stack_size(self):
-        cuda = _run("check_cuda")
-        if not cuda["cuda"]:
-            import pytest
-            pytest.skip("no CUDA device available in this environment")
-
         out = _run("scaling")
         assert out["peak_small_bytes"] > 0
         assert out["peak_large_bytes"] > 0

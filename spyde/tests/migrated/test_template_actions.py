@@ -1,5 +1,6 @@
 """Toolbar actions on the host-agnostic template must run end-to-end."""
 import time
+from spyde.tests.migrated.conftest import _settle
 
 
 def _signal_plot(session):
@@ -14,7 +15,7 @@ def _run(session, messages, name, params):
     plot = _signal_plot(session)
     assert plot is not None, "no signal plot"
     session._dispatch_toolbar_action(plot, name, params)
-    time.sleep(0.5)
+    _settle(session)
     opened = [m for m in messages if m.get("type") == "window_opened"]
     errors = [m.get("text") for m in messages if m.get("type") == "error"]
     return opened, errors

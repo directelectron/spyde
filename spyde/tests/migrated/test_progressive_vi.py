@@ -13,6 +13,7 @@ import time
 
 import numpy as np
 import hyperspy.api as hs
+from spyde.tests.migrated.conftest import _settle
 
 
 def _signal_plot(session):
@@ -43,7 +44,7 @@ class TestVirtualImageDisplay:
     def test_eager_virtual_image_is_nonzero(self, window):
         session = window["window"]
         session._add_signal(_bright_4d())          # eager numpy
-        time.sleep(0.4)
+        _settle(session)
         src = _signal_plot(session)
         before = list(session._plots)
         session._dispatch_toolbar_action(
@@ -58,7 +59,7 @@ class TestVirtualImageDisplay:
     def test_lazy_virtual_image_is_nonzero(self, window):
         session = window["window"]
         session._add_signal(_bright_4d().as_lazy())  # lazy, no client → sync compute
-        time.sleep(0.4)
+        _settle(session)
         src = _signal_plot(session)
         before = list(session._plots)
         session._dispatch_toolbar_action(

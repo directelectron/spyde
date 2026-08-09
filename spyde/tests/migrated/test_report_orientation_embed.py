@@ -18,18 +18,40 @@ import numpy as np
 from spyde.tests.migrated.test_ipf_3d import _al_orientation_map
 
 
+_OM_CACHE = None
+_PACKED = None
+
+
 def _om(ny=4, nx=5):
-    return _al_orientation_map(ny, nx)
+    """The default (4, 5) map is built ONCE for the module — every consumer
+    only reads it (pack_orientation / the explorer html take it as input),
+    and rebuilding re-ran the random-quat orix symmetry reduction per test.
+    Non-default shapes still build fresh."""
+    global _OM_CACHE
+    if (ny, nx) != (4, 5):
+        return _al_orientation_map(ny, nx)
+    if _OM_CACHE is None:
+        _OM_CACHE = _al_orientation_map(4, 5)
+    return _OM_CACHE
+
+
+def _packed():
+    """pack_orientation(_om()) once (orix reduction x 4 directions) — shared
+    by the read-only payload consumers.  Tests that monkeypatch the module's
+    cap/stride constants run their own pack_orientation call."""
+    global _PACKED
+    if _PACKED is None:
+        from spyde.actions.report.orientation_embed import pack_orientation
+        _PACKED = pack_orientation(_om())
+    return _PACKED
 
 
 class TestPackOrientation:
     def test_payload_roundtrip(self):
-        from spyde.actions.report.orientation_embed import (
-            DIRECTIONS, pack_orientation,
-        )
+        from spyde.actions.report.orientation_embed import DIRECTIONS
 
         om = _om()
-        payload = pack_orientation(om)
+        payload = _packed()
         assert payload is not None
         hdr = payload["header"]
         assert hdr["nav"] == [4, 5]
@@ -65,10 +87,8 @@ class TestPackOrientation:
         """Row i of every array is flat nav index i — the whole contract the
         crosshair pick rests on. Checked against the app's own per-position
         accessor rather than against the packing code's arithmetic."""
-        from spyde.actions.report.orientation_embed import pack_orientation
-
         om = _om(4, 5)
-        payload = pack_orientation(om)
+        payload = _packed()
         m = payload["header"]["m"]
         _rgb, xy, xyz = payload["arrays"]["z"]
         nx = payload["header"]["nav"][1]
@@ -173,7 +193,7 @@ class TestExplorerHtml:
         from spyde.actions.report.orientation_embed import (
             DIRECTIONS, pack_orientation,
         )
-        rec = pack_orientation(_om())["header"]["phases"][0]
+        rec = _packed()["header"]["phases"][0]
         for key in ("raster", "texture"):
             assert set(rec[key]) == set(DIRECTIONS), key
             for url in rec[key].values():
@@ -207,8 +227,10 @@ class TestBuildCaching:
             orientation_explorer_html,
         )
         self._clear()
-        a = orientation_explorer_html(_om(), cache_key="c1")
-        b = orientation_explorer_html(_om(), cache_key="c1")
+        # Two genuinely DISTINCT map objects (the module memo would hand back
+        # one identity, which is the opposite of what this test needs).
+        a = orientation_explorer_html(_al_orientation_map(4, 5), cache_key="c1")
+        b = orientation_explorer_html(_al_orientation_map(4, 5), cache_key="c1")
         assert a is not b
 
     def test_no_cache_key_never_memoizes(self):

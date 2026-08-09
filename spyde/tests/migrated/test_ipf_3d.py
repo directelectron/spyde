@@ -48,11 +48,15 @@ class TestIpf3D:
         assert len(xyz) > 20_000
 
     def test_sphere_points_still_caps_at_absurd_size(self):
-        # The 1,000,000-point safety ceiling still strides down an absurdly
-        # large input so it can't blow up memory/transport.
-        om = _al_orientation_map(ny=1200, nx=1200)         # 1,440,000 pixels
-        xyz, rgb = om.ipf_sphere_points("z", max_points=1_000_000)
-        assert len(xyz) == len(rgb) <= 1_000_000
+        # The max_points safety ceiling still strides down an over-large input
+        # so it can't blow up memory/transport.  The cap branch is
+        # input-size-relative (input > max_points engages the stride-down), so
+        # a 40,000-pixel map against max_points=1000 exercises the same path
+        # a 1.44M-pixel map against the 1M default did — without 1.44M random
+        # quats through orix symmetry reduction (~9 s).
+        om = _al_orientation_map(ny=200, nx=200)           # 40,000 pixels
+        xyz, rgb = om.ipf_sphere_points("z", max_points=1_000)
+        assert len(xyz) == len(rgb) <= 1_000
         assert len(xyz) > 0
 
     def test_ipf_key_overlay_is_an_rgba_image(self):

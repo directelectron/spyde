@@ -19,6 +19,7 @@ import time
 import numpy as np
 
 from spyde.actions import overlay as ov
+from spyde.tests.migrated.conftest import _settle
 
 
 # ── setup helpers ───────────────────────────────────────────────────────────────
@@ -48,7 +49,7 @@ def _two_signal_windows(session):
     mm = nav.multiplot_manager
     navpw = nav.plot_window
     mm.add_navigation_selector_and_signal_plot(navpw)
-    time.sleep(0.3)
+    _settle(session)
     _prime(session)
     sigs = sorted((p for p in session._plots if not p.is_navigator),
                   key=lambda p: p.window_id)

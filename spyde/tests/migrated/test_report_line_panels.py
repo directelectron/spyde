@@ -25,6 +25,7 @@ import pytest
 from spyde.actions.report import compose as cx
 from spyde.actions.report import handlers as h
 from spyde.actions.report.model import FigureSpec
+from spyde.tests.migrated.conftest import _settle
 
 
 # ── local fixture: a 1-D signal (no navigation) → one signal window ────────────
@@ -45,7 +46,7 @@ def signal1d_dataset(captured_messages):
     ax.name, ax.units, ax.scale, ax.offset = "Energy", "eV", 0.5, 0.0
     s.metadata.set_item("General.title", "1D Curve")
     session._add_signal(s, source_path=None)
-    time.sleep(0.3)
+    _settle(session)
     yield {"window": session, "signal_trees": session.signal_trees,
            "plots": session._plots, "messages": captured_messages}
     session.shutdown()

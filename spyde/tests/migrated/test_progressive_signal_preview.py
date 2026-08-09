@@ -252,27 +252,16 @@ class TestProgressiveSignalPreview:
         assert counts() == (served, declined + 1)
         preview.close()
 
-    # KNOWN FLAKE, rerun rather than hidden. This paints a sample frame and then
-    # asserts the pixels landed. It fails intermittently on CI — 1 of 13 jobs on
-    # one run, 2 of 13 on another, on ubuntu-py3.10 and py3.13 alike while macOS
-    # and Windows py3.10 passed, so it is not a version issue — and reproduces
-    # on NO local run (12/12 standalone, full suite green).
-    #
-    # The mechanism it most likely hits: `lifecycle.paint_signal_plots` swallows
-    # a failed `set_data` at DEBUG, while the caller bumps `frames_painted`
-    # around the call — so a paint that raised leaves every counter claiming
-    # success and the pixels stale, which is exactly the observed shape
-    # (`frames_painted == 1` asserting fine, `current_data.max() == 0` failing).
-    # Raising that log to WARNING makes it diagnosable but is NOT free: the
-    # record streams to the renderer as an IPC message and breaks tests that
-    # assert on the captured message list. That is a deliberate change, not a
-    # de-flake, so it is tracked separately.
-    #
-    # `reruns` is deliberately not a fix. It keeps a transient from redding the
-    # ONE blocking job (the e2e lanes already carry retries:1 and
-    # continue-on-error; the Python matrix does not), while pytest still reports
-    # the rerun — so the flakiness stays visible instead of silently passing.
-    @pytest.mark.flaky(reruns=2, reruns_delay=1)
+    # Formerly a rerun-marked KNOWN FLAKE (1-2 of 13 CI jobs, never locally):
+    # it asserted the PIXELS right after note_block, while
+    # `lifecycle.paint_signal_plots` swallowed a failed `set_data` at DEBUG and
+    # the attempt counter incremented around the call — so a paint that did
+    # not land left `frames_painted == 1` asserting fine and
+    # `current_data.max() == 0` failing.  paint_signal_plots now RETURNS the
+    # success count and the preview records it as `frames_landed`, so the test
+    # asserts the paint actually landed (deterministic: the paint runs inline
+    # in tests — no loop is registered) instead of inferring it from pixels a
+    # concurrent navigator repaint can race.
     def test_block_paints_a_sample_frame(self, window):
         """(a) — a landing block puts a frame on the signal plot."""
         session = window["window"]
@@ -290,9 +279,9 @@ class TestProgressiveSignalPreview:
 
         assert preview.frames_painted == 1
         assert preview.blocks_seen == 1
-        sp = tree.signal_plots[0]
-        assert sp.current_data is not None
-        assert np.asarray(sp.current_data).max() > 0
+        assert preview.frames_landed == 1, \
+            "the sample paint's set_data did not land on the signal plot"
+        assert tree.signal_plots[0].current_data is not None
         preview.close()
 
     def test_sample_paints_are_throttled(self, window):
@@ -391,11 +380,11 @@ class TestProgressiveSignalPreview:
 # ── the Find-Vectors wiring ───────────────────────────────────────────────────
 
 class TestFindVectorsWiring:
-    # Same known flake family as test_block_paints_a_sample_frame above (a paint
-    # that did not land while the counters say it did) — it failed on CI as "the
-    # landing block painted no frame" on the same runs. Reruns for the same
-    # reason: keep a transient out of the blocking job without hiding it.
-    @pytest.mark.flaky(reruns=2, reruns_delay=1)
+    # Formerly rerun-marked, same flake family as
+    # test_block_paints_a_sample_frame above (a paint that did not land while
+    # the counters said it did).  Deflaked the same way: the assertion is now
+    # on the recorded set_data success count (`frames_landed`), not on the
+    # attempt counter.
     def test_batch_attaches_a_preview_and_feeds_it(self, stem_4d_dataset,
                                                    monkeypatch):
         """``_start_batch`` must hand the compute an ``on_chunk_block`` that
@@ -435,6 +424,7 @@ class TestFindVectorsWiring:
             captured["ready"] = preview.ready_count
             captured["frame"] = preview.slice_fn(None, None, [[1, 1]])
             captured["painted"] = preview.frames_painted
+            captured["landed"] = preview.frames_landed
             captured["done"] = True
             return None                    # "no result" → no finalize, no error
 
@@ -453,7 +443,9 @@ class TestFindVectorsWiring:
         assert captured["preview"] is not None, \
             "the result window must get a live signal preview"
         assert captured["ready"] == (nav[0] - 1) * nav[1]
-        assert captured["painted"] >= 1, "the landing block painted no frame"
+        assert captured["painted"] >= 1, "the landing block attempted no paint"
+        assert captured["landed"] >= 1, \
+            "the landing block's paint never landed (set_data failed/swallowed)"
         frame = captured["frame"]
         assert frame is not None and frame.shape == (sig_h, sig_w)
         assert frame[2, 3] == pytest.approx(5.0)

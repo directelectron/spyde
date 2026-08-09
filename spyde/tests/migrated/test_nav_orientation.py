@@ -18,6 +18,7 @@ import numpy as np
 import hyperspy.api as hs
 
 from spyde.drawing.update_functions import update_from_navigation_selection
+from spyde.tests.migrated.conftest import _settle
 
 
 def _encoded_4d(nav=(3, 5), sig=(4, 4)):
@@ -38,7 +39,7 @@ class TestNavOrientation:
         session = Session(n_workers=1, threads_per_worker=1)
         try:
             session._add_signal(_encoded_4d(), source_path=None)
-            time.sleep(0.4)
+            _settle(session)
             tree = session.signal_trees[0]
             sel = tree.navigator_plot_manager.all_navigation_selectors[0]
             child = next(p for p in session._plots

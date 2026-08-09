@@ -8,7 +8,11 @@ no per-pattern Python loop.
 Harness note: torch's CUDA autograd backward segfaults when run *inside* the
 pytest process on Windows (a pytest/torch interaction — the same compute runs
 correctly in plain Python and in the real app, alongside QApplication + Dask).
-So each test runs the compute in a **subprocess** and checks its JSON result.
+So ONE subprocess runs all three modes sequentially (each fresh subprocess
+pays interpreter + torch import + cold CUDA init, ~5-7 s) and prints one
+tagged ``RESULT_JSON <mode> {...}`` line per mode; the tests keep their
+separate assertions on the parsed results.  The driver hard-exits after
+printing, so partially-emitted results survive a teardown crash.
 Skipped entirely when CUDA / torch GPU is unavailable.
 """
 import json
@@ -24,11 +28,23 @@ pytestmark = pytest.mark.skipif(
     not gpu_available(), reason="CUDA / torch GPU not available")
 
 
-# Driver script body shared by the subprocesses. Builds synthetic vectors +
-# a single-template library, runs the batched GPU fit, prints a JSON summary.
+# Driver script run ONCE in a subprocess. Builds synthetic vectors + a
+# single-template library, runs the batched GPU fit for every mode given on
+# argv, prints one tagged JSON summary line per mode.
 _DRIVER = textwrap.dedent("""
     import json, sys
     import numpy as np
+
+    # Prime cublasLt with a tiny F.linear BEFORE any other GPU work: on Pascal
+    # (torch cu124) the FIRST cublasLt init that happens after cuDNN conv work
+    # fails with CUBLAS_STATUS_NOT_INITIALIZED — a long multi-mode process is
+    # exactly where that ordering can arise.
+    import torch
+    if torch.cuda.is_available():
+        import torch.nn.functional as F
+        F.linear(torch.zeros(1, 1, device="cuda"),
+                 torch.zeros(1, 1, device="cuda"))
+        torch.cuda.synchronize()
     from spyde.actions import vector_orientation as vo
     from spyde.actions.vector_orientation_gpu import compute_vector_orientation_gpu
     from spyde.signals.diffraction_vectors import (
@@ -69,62 +85,74 @@ _DRIVER = textwrap.dedent("""
             full_nav_shape=(ny, nx), sig_shape=(32, 32),
             sig_axes=[Ax(), Ax()], kernel_radius_px=3.0, kernel_radius_data=0.03)
 
-    mode = sys.argv[1]
-    out = {}
-    if mode == "strain":
-        E = np.array([[0.015, 0.005],[0.005,-0.010]], np.float32)
-        res = compute_vector_orientation_gpu(
-            make_vecs(strain=E), stub_library(),
-            {"strain_cap":0.05,"sink_bw":0.04}, t=None)
-        out["exx"]=float(np.nanmedian(res.strain[...,0]))
-        out["eyy"]=float(np.nanmedian(res.strain[...,1]))
-        out["exy"]=float(np.nanmedian(res.strain[...,2]))
-        out["finite"]=bool(np.isfinite(res.strain[...,0]).all())
-        out["nav"]=list(res.nav_shape)
-    elif mode == "stop":
-        res = compute_vector_orientation_gpu(
-            make_vecs(), stub_library(), {"strain_cap":0.05,"sink_bw":0.04},
-            t=None, stopped_flag=[True])
-        out["is_none"]= res is None
-    elif mode == "progress":
-        # Use multiprocessing shared_memory directly — importing the GUI
-        # helpers (spyde.drawing.update_functions) pulls in pyqtgraph/Qt, which
-        # is unsafe to combine with torch CUDA in this same process.
-        from multiprocessing import shared_memory
-        sh = shared_memory.SharedMemory(create=True, size=4*4*12*4)
-        buf = np.ndarray((4,4,12), np.float32, buffer=sh.buf); buf[:] = np.nan
-        seen=[]
-        res = compute_vector_orientation_gpu(
-            make_vecs(), stub_library(), {"strain_cap":0.05,"sink_bw":0.04},
-            t=None, progress=lambda d,t: seen.append((d,t)),
-            shm_name=sh.name)
-        out["reached_100"]= bool(seen and seen[-1][0]==seen[-1][1])
-        out["buf_painted"]= bool(np.isfinite(buf[...,9]).any())
-        out["not_none"]= res is not None
-        sh.close(); sh.unlink()
+    def run_mode(mode):
+        out = {}
+        if mode == "strain":
+            E = np.array([[0.015, 0.005],[0.005,-0.010]], np.float32)
+            res = compute_vector_orientation_gpu(
+                make_vecs(strain=E), stub_library(),
+                {"strain_cap":0.05,"sink_bw":0.04}, t=None)
+            out["exx"]=float(np.nanmedian(res.strain[...,0]))
+            out["eyy"]=float(np.nanmedian(res.strain[...,1]))
+            out["exy"]=float(np.nanmedian(res.strain[...,2]))
+            out["finite"]=bool(np.isfinite(res.strain[...,0]).all())
+            out["nav"]=list(res.nav_shape)
+        elif mode == "stop":
+            res = compute_vector_orientation_gpu(
+                make_vecs(), stub_library(), {"strain_cap":0.05,"sink_bw":0.04},
+                t=None, stopped_flag=[True])
+            out["is_none"]= res is None
+        elif mode == "progress":
+            # Use multiprocessing shared_memory directly — importing the GUI
+            # helpers (spyde.drawing.update_functions) pulls in pyqtgraph/Qt, which
+            # is unsafe to combine with torch CUDA in this same process.
+            from multiprocessing import shared_memory
+            sh = shared_memory.SharedMemory(create=True, size=4*4*12*4)
+            buf = np.ndarray((4,4,12), np.float32, buffer=sh.buf); buf[:] = np.nan
+            seen=[]
+            res = compute_vector_orientation_gpu(
+                make_vecs(), stub_library(), {"strain_cap":0.05,"sink_bw":0.04},
+                t=None, progress=lambda d,t: seen.append((d,t)),
+                shm_name=sh.name)
+            out["reached_100"]= bool(seen and seen[-1][0]==seen[-1][1])
+            out["buf_painted"]= bool(np.isfinite(buf[...,9]).any())
+            out["not_none"]= res is not None
+            sh.close(); sh.unlink()
+        return out
 
-    print("RESULT_JSON", json.dumps(out))
-    sys.stdout.flush()
+    for mode in sys.argv[1:]:
+        print("RESULT_JSON", mode, json.dumps(run_mode(mode)))
+        sys.stdout.flush()
     # torch + CUDA + shared-memory teardown segfaults at interpreter exit on
     # Windows (harmless, post-result). Hard-exit so the parent sees rc==0.
     import os
     os._exit(0)
 """)
 
+_MODES = ("strain", "progress", "stop")
 
-def _run(mode):
-    """Run the driver in a subprocess; return the parsed JSON result dict."""
+
+@pytest.fixture(scope="module")
+def gpu_results():
+    """Run the driver once for all modes; return {mode: parsed JSON dict}."""
     proc = subprocess.run(
-        [sys.executable, "-c", _DRIVER, mode],
-        capture_output=True, text=True, timeout=300)
+        [sys.executable, "-c", _DRIVER, *_MODES],
+        capture_output=True, text=True, timeout=600)
     assert proc.returncode == 0, (
         f"subprocess failed ({proc.returncode}):\n{proc.stdout}\n{proc.stderr}")
-    line = next(l for l in proc.stdout.splitlines() if l.startswith("RESULT_JSON"))
-    return json.loads(line[len("RESULT_JSON "):])
+    results = {}
+    for line in proc.stdout.splitlines():
+        if line.startswith("RESULT_JSON "):
+            _tag, mode, payload = line.split(" ", 2)
+            results[mode] = json.loads(payload)
+    missing = [m for m in _MODES if m not in results]
+    assert not missing, (
+        f"driver emitted no result for {missing}:\n{proc.stdout}\n{proc.stderr}")
+    return results
 
 
-def test_gpu_recovers_known_strain():
-    out = _run("strain")
+def test_gpu_recovers_known_strain(gpu_results):
+    out = gpu_results["strain"]
     assert out["nav"] == [4, 4]
     assert out["finite"]
     assert abs(out["exx"] - 0.015) < 5e-3, out
@@ -132,13 +160,13 @@ def test_gpu_recovers_known_strain():
     assert abs(out["exy"] - 0.005) < 5e-3, out
 
 
-def test_gpu_progress_and_shm_preview():
-    out = _run("progress")
+def test_gpu_progress_and_shm_preview(gpu_results):
+    out = gpu_results["progress"]
     assert out["not_none"]
     assert out["reached_100"]
     assert out["buf_painted"]
 
 
-def test_gpu_stop_flag_aborts():
-    out = _run("stop")
+def test_gpu_stop_flag_aborts(gpu_results):
+    out = gpu_results["stop"]
     assert out["is_none"]
