@@ -888,7 +888,7 @@ def drift_open(session, plot, payload) -> None:
     """Caret mounted: build the controller, open the Drift Check window, draw
     the alignment ROI, and run the first discovery preview.
 
-    Nothing SOLVES here — plan A8 is explicit that drift correction is opt-in
+    Nothing SOLVES here — drift correction is deliberately opt-in:
     and never runs on load. The compute is the bounded raw sum plus the
     ~20-frame preview of the default box, which is what makes the caret's first
     frame informative instead of an empty panel and a button.

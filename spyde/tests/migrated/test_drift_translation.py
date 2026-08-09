@@ -1,7 +1,7 @@
 """
 Tests for spyde.drift — rigid translation solve, warp, and DriftModel.
 
-The acceptance gate from DRIFT_AND_PARTICLES_PLAN.md is numerical, not
+The acceptance gate is numerical, not
 structural: recover a synthetically applied shift to better than 0.1 px, and
 agree with ``skimage.registration.phase_cross_correlation`` on the same data.
 That is what most of this file asserts.

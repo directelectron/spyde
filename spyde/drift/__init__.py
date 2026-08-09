@@ -1,8 +1,7 @@
 """
 spyde.drift — drift correction for image stacks and in-situ movies.
 
-See ``DRIFT_AND_PARTICLES_PLAN.md`` (repo root) for the full design. The two
-load-bearing constraints, both from CLAUDE.md:
+The two load-bearing constraints, both from CLAUDE.md:
 
 * **Nothing materialises the stack.** The target is thousands of frames at
   2048²–4096² (tens of GB). Every solver here STREAMS: read a frame, transform

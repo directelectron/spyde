@@ -105,7 +105,7 @@ STAGED_HANDLERS: dict[str, str] = {
     "crop_open":           "spyde.actions.base.crop_open",
     "crop_close":          "spyde.actions.base.crop_close",
     "crop_set_region":     "spyde.actions.base.crop_set_region",
-    # Drift Correction (spyde/actions/drift_action.py) — plan A8.
+    # Drift Correction (spyde/actions/drift_action.py).
     "drift_open":          "spyde.actions.drift_action.drift_open",
     "drift_close":         "spyde.actions.drift_action.drift_close",
     "drift_set_method":    "spyde.actions.drift_action.drift_set_method",

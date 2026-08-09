@@ -139,7 +139,7 @@ export function DriftWizard({ caretPos, windowId, sendAction, onClose }: Props) 
   }
 
   // Mount → drift_open (Drift Check window + the alignment box + the first
-  // discovery preview; nothing SOLVES — plan A8 is explicit that drift
+  // discovery preview; nothing SOLVES — drift
   // correction never runs on load). Unmount → drift_close. StrictMode-safe.
   useWizardLifecycle({
     windowId, sendAction,
