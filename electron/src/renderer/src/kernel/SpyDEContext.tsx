@@ -1566,6 +1566,16 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         // (app-global, not wizard-scoped, but the same re-broadcast fits).
         case 'download_progress':
         case 'download_done':
+        // Drift Correction caret (spyde/actions/drift_action.py) — caret state,
+        // the ROI discovery preview (~20 frames aligned on the box, with its
+        // sharpening gain), whole-movie solve progress, the streamed dy/dx
+        // batches, and the solved model. Consumed by DriftWizard; the dy/dx
+        // curve itself is painted by the backend into its own figure window.
+        case 'drift_state':
+        case 'drift_preview':
+        case 'drift_trace':
+        case 'drift_progress':
+        case 'drift_result':
         // Cluster telemetry — consumed by the StatusBar DaskMonitor HUD.
         case 'dask_stats':
         // Read-throughput readout — consumed by the StatusBar IoThroughput HUD.

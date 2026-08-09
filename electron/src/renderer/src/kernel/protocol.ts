@@ -859,6 +859,82 @@ export interface IoThroughputMessage extends MsgBase {
   color: 'green' | 'yellow' | 'red'
 }
 
+// ── Drift Correction caret (spyde/actions/drift_action.py, plan A8) ──────────
+
+/** Caret state. `window_id` is the SOURCE plot's window (where the caret
+ *  lives); `check_window_id` is the bare-figure Drift Check window (whole-movie
+ *  before/after sums on top, the ROI discovery pair beneath) and
+ *  `trace_window_id` the bare-figure dy/dx window the solve opens. */
+export interface DriftStateMessage extends MsgBase {
+  type: 'drift_state'
+  window_id: number | null
+  check_window_id: number | null
+  trace_window_id: number | null
+  /** 'rigid' | 'rigid_affine' — only rigid has a solver. */
+  method: string
+  solved: boolean
+  /** Whether the FULL solve restricts itself to the alignment box. The preview
+   *  always uses the box regardless — the toggle is the commitment. */
+  use_roi: boolean
+  /** The alignment box as `[y0, x0, h, w]` in IMAGE PIXELS (what
+   *  `solve_translation(roi=…)` takes), or null when there is no usable box. */
+  roi: number[] | null
+  params: Record<string, unknown>
+  /** Present on the open/ready emissions. */
+  n_frames?: number
+}
+
+/** The discovery preview: ~20 frames sampled across the whole movie, aligned on
+ *  the box alone. `gain` is the gradient energy of the aligned sum over the raw
+ *  sum, measured on the pixels both cover — > 1.5 means a usable landmark,
+ *  <= 1 means aligning there changes nothing. */
+export interface DriftPreviewMessage extends MsgBase {
+  type: 'drift_preview'
+  window_id: number | null
+  roi: number[] | null
+  frames: number
+  gain: number
+  max_abs_shift: number
+  params: Record<string, unknown>
+}
+
+/** A batch of solved shifts streamed from `solve_translation`'s `on_shift`
+ *  while the solve runs — `[frame_index, dy, dx]` each. The backend paints
+ *  these into the dy/dx window itself; the message exists so any host can
+ *  follow the curve live. */
+export interface DriftTraceMessage extends MsgBase {
+  type: 'drift_trace'
+  window_id: number | null
+  points: [number, number, number][]
+}
+
+/** Whole-movie solve progress (also emitted as a plain `progress` message). */
+export interface DriftProgressMessage extends MsgBase {
+  type: 'drift_progress'
+  window_id: number | null
+  done: number
+  total: number
+}
+
+/** The solved model. `shifts[i]` is the correction ADDED to frame i, `[dy, dx]`
+ *  in pixels; a cancelled solve leaves NaN rows for frames it never reached. */
+export interface DriftResultMessage extends MsgBase {
+  type: 'drift_result'
+  window_id: number | null
+  shifts: [number, number][]
+  kind: string
+  reference: string
+  max_abs_shift: number
+  /** The box the solve correlated on (`use_roi`), or null for whole-frame. */
+  roi: number[] | null
+  /** Whole-movie sharpening: gradient energy of the corrected sum over the raw
+   *  one. The same number the preview reports, now for what actually ran. */
+  gain: number
+  /** Frames dropped from the running reference by the outlier rejector. */
+  rejected: number
+  cancelled: boolean
+}
+
 /**
  * Wizard-scoped events re-broadcast verbatim as DOM CustomEvents (the caret
  * components subscribe directly). The payload beyond `type` is consumer-defined,
@@ -984,6 +1060,11 @@ export type PlotAppMessage =
   | DownloadDoneMessage
   | DaskStatsMessage
   | IoThroughputMessage
+  | DriftStateMessage
+  | DriftPreviewMessage
+  | DriftTraceMessage
+  | DriftProgressMessage
+  | DriftResultMessage
 
 /**
  * Narrow a raw incoming message (`Record<string, unknown>` from the IPC bridge)

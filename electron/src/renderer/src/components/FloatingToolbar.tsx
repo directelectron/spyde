@@ -30,11 +30,13 @@ import { StrainWizard } from './StrainWizard'
 import { CropWizard } from './CropWizard'
 import { FitWizard } from './FitWizard'
 import { BackgroundWizard } from './BackgroundWizard'
+import { DriftWizard } from './DriftWizard'
 
 const WIZARD_ACTIONS = new Set([
   'Orientation Mapping', 'Find Diffraction Vectors', 'Vector Orientation Mapping',
   'EBSD Indexing',
   'Center Zero Beam', 'Strain Mapping', 'Crop', 'Fit', 'Remove Background',
+  'Drift Correction',
 ])
 
 /**
@@ -323,6 +325,12 @@ export function FloatingToolbar({
         )}
         {openAction && openAction.name === 'Remove Background' && (
           <BackgroundWizard
+            caretPos={caretPos} windowId={windowId} sendAction={sendAction}
+            onClose={() => setOpenName(null)}
+          />
+        )}
+        {openAction && openAction.name === 'Drift Correction' && (
+          <DriftWizard
             caretPos={caretPos} windowId={windowId} sendAction={sendAction}
             onClose={() => setOpenName(null)}
           />
