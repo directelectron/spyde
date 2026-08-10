@@ -26,7 +26,8 @@ from spyde.data.synthetic import (
     eds_si,
     eels_si,
     ground_truth,
+    particle_movie,
 )
 
 __all__ = ["eels_si", "eds_si", "ebsd_patterns", "atom_lattice",
-           "ground_truth"]
+           "particle_movie", "ground_truth"]

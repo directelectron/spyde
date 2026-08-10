@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- Drift Correction.
+
+     "The same feature, recorded twice in different places, pulled back into
+     register." A drifted frame offset from the reference, the same particle
+     visible in each, and the correction vector between them.
+
+     TWO frames, not three, and one bold arrow: the first draft used three
+     stacked frames and a thin arrow, which rendered as mush at the 26 px the
+     toolbar actually draws it at (checked in the app, not guessed). Detail
+     that only survives at 512 is detail spent on nothing.
+
+     House convention: white = what you have, red = what the action computes. -->
+<svg
+   width="512"
+   height="512"
+   viewBox="0 0 512 512"
+   version="1.1"
+   id="svg-drift"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <g id="layer-drift">
+
+    <!-- The DRIFTED frame: offset down-right, dimmer — the one that is wrong. -->
+    <rect x="186" y="186" width="250" height="250" rx="14"
+       style="fill:none;stroke:#ffffff;stroke-width:20;stroke-opacity:0.45;
+              stroke-linejoin:round" />
+    <circle cx="311" cy="311" r="40"
+       style="fill:#ffffff;fill-opacity:0.45" />
+
+    <!-- The REFERENCE frame: solid, up-left, where everything is pulled to. -->
+    <rect x="76" y="76" width="250" height="250" rx="14"
+       style="fill:none;stroke:#ffffff;stroke-width:24;stroke-linejoin:round" />
+    <circle cx="201" cy="201" r="40" style="fill:#ffffff" />
+
+    <!-- The correction: from the drifted position BACK to the reference. One
+         thick arrow, sized to survive the downscale. -->
+    <path d="M 300,300 L 218,218"
+       style="fill:none;stroke:#fe0000;stroke-width:34;stroke-linecap:round" />
+    <path d="M 218,218 L 218,286 M 218,218 L 286,218"
+       style="fill:none;stroke:#fe0000;stroke-width:34;stroke-linecap:round;
+              stroke-linejoin:round" />
+  </g>
+</svg>

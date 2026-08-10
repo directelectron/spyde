@@ -364,6 +364,16 @@ functions:
     toolbar_side: bottom
     navigation: False
 
+  Drift Correction:
+    description: Solve and remove sample drift across an image stack. Check the result in a separate window — an aligned stack sums sharp, a misaligned one blurs — then Apply to add a lazy corrected node (nothing is copied).
+    icon: drawing/toolbars/icons/drift_correction.svg
+    function: spyde.actions.drift_action.drift_correction
+    signal_types: [insitu]
+    plot_dim: [2]
+    toolbar_side: bottom
+    navigation: False
+    toggle: True
+
   Fit:
     description: Fit a model to every spectrum. Add components line by line, watch the model curve on the spectrum, then Run to fit the whole scan on the GPU. Commit turns each component's integrated area into a map.
     icon: drawing/toolbars/icons/fit.svg

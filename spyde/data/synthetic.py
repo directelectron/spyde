@@ -481,3 +481,238 @@ def ebsd_patterns(nav=(16, 16), detector=(60, 60), *, pc=(0.5, 0.5, 0.55),
            pc=np.asarray(pc, float), n_bands=int(len(normals)),
            grain2_mask=grain2)
     return s
+
+
+# ---------------------------------------------------------------------------
+# In-situ particle movie
+# ---------------------------------------------------------------------------
+
+# The particle table. Hand-written rather than randomised so every number in
+# the ground truth is exact and readable: a test that says "particle 4
+# dissolves at frame 16" can be checked against this table by eye.
+#
+# Columns: y0, x0, radius, amp, birth, death, vy, vx, faint
+#   y0/x0   position at t=0 in the SAMPLE frame, pixels
+#   birth   first frame the particle exists (0 = present from the start)
+#   death   first frame it is GONE (-1 = never dissolves)
+#   vy/vx   sample-frame velocity, px/frame
+#   faint   amplitude is scaled down to `faint_amplitude` -- the Section 0.9 probes
+_PARTICLES: tuple[dict, ...] = (
+    # two bright anchors, static and persistent
+    dict(y0=24.0, x0=22.0, radius=7.0, amp=1.00, birth=0, death=-1, vy=0.0, vx=0.0, faint=False),
+    dict(y0=70.0, x0=30.0, radius=9.0, amp=0.90, birth=0, death=-1, vy=0.0, vx=0.0, faint=False),
+    # a mover, for trails and displacement
+    dict(y0=30.0, x0=80.0, radius=6.0, amp=0.85, birth=0, death=-1, vy=1.10, vx=-0.70, faint=False),
+    # nucleation
+    dict(y0=60.0, x0=94.0, radius=5.0, amp=0.80, birth=8, death=-1, vy=0.0, vx=0.0, faint=False),
+    # dissolution
+    dict(y0=16.0, x0=58.0, radius=6.0, amp=0.75, birth=0, death=16, vy=0.0, vx=0.0, faint=False),
+    # the merge pair: converge along x until they overlap
+    dict(y0=84.0, x0=60.0, radius=5.0, amp=0.80, birth=0, death=-1, vy=0.0, vx=0.45, faint=False),
+    dict(y0=84.0, x0=82.0, radius=5.0, amp=0.80, birth=0, death=-1, vy=0.0, vx=-0.45, faint=False),
+    # faint, low-contrast -- these are what plan Section 0.9 is about
+    dict(y0=46.0, x0=102.0, radius=4.0, amp=1.00, birth=0, death=-1, vy=0.0, vx=0.0, faint=True),
+    dict(y0=88.0, x0=14.0, radius=3.0, amp=0.85, birth=0, death=-1, vy=0.0, vx=0.0, faint=True),
+)
+
+#: The two particles that merge, plus the nucleating and dissolving ones.
+MERGE_PAIR = (5, 6)
+NUCLEATION_INDEX = 3
+DISSOLUTION_INDEX = 4
+
+
+def _drift_curve(n_frames: int, amplitude: float) -> np.ndarray:
+    """``(n_frames, 2)`` per-frame CORRECTION, matching ``DriftModel``'s sign.
+
+    ``drift[t]`` is what you ADD to frame *t* to align it, so the sample appears
+    displaced by ``-drift[t]`` in the raw frame.
+
+    The two axes get deliberately DIFFERENT shapes -- y grows monotonically with
+    a slight curve, x swings negative and comes back. A swapped or negated axis
+    therefore shows up as a wrong-shaped curve rather than merely a wrong
+    number, which is the whole point of an asymmetric fixture.
+    """
+    if n_frames < 2:
+        return np.zeros((max(1, n_frames), 2), np.float64)
+    t = np.arange(n_frames, dtype=np.float64) / (n_frames - 1)
+    dy = amplitude * t ** 1.3
+    dx = -0.6 * amplitude * np.sin(1.7 * np.pi * t)
+    return np.stack([dy, dx], axis=-1)
+
+
+def _soft_disc(yy, xx, cy, cx, radius, edge=0.9):
+    """A disc with a smooth ~1 px edge, so sub-pixel centroids are meaningful.
+
+    A hard-edged disc quantises its own centroid to the pixel grid, which would
+    make any sub-pixel tracking assertion against this fixture untestable.
+    """
+    r = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
+    return 0.5 * (1.0 - np.tanh((r - radius) / edge))
+
+
+def _particle_arrays(drift: np.ndarray, faint_amplitude: float) -> dict:
+    """The per-particle arrays, in ONE place so the renderer and the stamped
+    ground truth cannot disagree about the motion model."""
+    return dict(
+        drift=drift,
+        p_y0=np.array([p["y0"] for p in _PARTICLES]),
+        p_x0=np.array([p["x0"] for p in _PARTICLES]),
+        p_radius=np.array([p["radius"] for p in _PARTICLES]),
+        p_amp=np.array([(faint_amplitude * p["amp"]) if p["faint"] else p["amp"]
+                        for p in _PARTICLES]),
+        p_birth=np.array([p["birth"] for p in _PARTICLES]),
+        p_death=np.array([p["death"] for p in _PARTICLES]),
+        p_vy=np.array([p["vy"] for p in _PARTICLES]),
+        p_vx=np.array([p["vx"] for p in _PARTICLES]),
+        p_faint=np.array([p["faint"] for p in _PARTICLES]),
+        n_particles=len(_PARTICLES),
+    )
+
+
+def particle_truth_at(truth: dict, t: int):
+    """Expected ``(positions, radii, present)`` at frame *t*.
+
+    ``positions`` is ``(N, 2)`` ``(y, x)`` in **pixels, in the LAB frame** --
+    what a segmenter looking at the RAW frame should find, drift included.
+    ``present`` is a boolean mask of which particles exist in that frame.
+
+    Every consumer computes its expectations through here rather than
+    re-deriving the motion model, so a test cannot pass by repeating the same
+    mistake the generator made.
+    """
+    t = int(t)
+    y0 = np.asarray(truth["p_y0"], float)
+    x0 = np.asarray(truth["p_x0"], float)
+    vy = np.asarray(truth["p_vy"], float)
+    vx = np.asarray(truth["p_vx"], float)
+    birth = np.asarray(truth["p_birth"], int)
+    death = np.asarray(truth["p_death"], int)
+    drift = np.asarray(truth["drift"], float)
+
+    sample = np.stack([y0 + vy * t, x0 + vx * t], axis=-1)
+    lab = sample - drift[t]                    # see _drift_curve on the sign
+    present = (t >= birth) & ((death < 0) | (t < death))
+    return lab, np.asarray(truth["p_radius"], float), present
+
+
+def _merge_frame(arrays: dict, n_frames: int) -> int:
+    """First frame where the merge pair's discs overlap.
+
+    Derived from the same motion model that draws them rather than hard-coded,
+    so the stamped truth stays correct if the table or the frame count changes.
+    Returns -1 if they never touch within the movie.
+    """
+    a, b = MERGE_PAIR
+    ra, rb = _PARTICLES[a]["radius"], _PARTICLES[b]["radius"]
+    for t in range(n_frames):
+        pos, _, present = particle_truth_at(arrays, t)
+        if present[a] and present[b] and np.hypot(*(pos[a] - pos[b])) <= ra + rb:
+            return t
+    return -1
+
+
+def particle_movie(n_frames: int = 24, shape=(96, 112), *,
+                   drift_amplitude: float = 6.0,
+                   faint_amplitude: float = 0.11,
+                   scale: float = 0.5, seed: int = 0, noise: float = 0.015):
+    """An in-situ particle movie whose every event is known exactly.
+
+    A 1-D navigation (time) axis over 2-D images: nine particles on a drifting
+    support film, with one nucleation, one dissolution, one merge, one mover and
+    two deliberately faint low-contrast probes.
+
+    Everything a downstream test needs to assert is stamped as ground truth --
+    read it with :func:`ground_truth` and evaluate the motion model with
+    :func:`particle_truth_at`.
+
+    Parameters
+    ----------
+    n_frames
+        Number of time points. The nucleation (frame 8) and dissolution
+        (frame 16) frames are fixed, so keep this above ~20 for both to occur.
+    shape
+        ``(ny, nx)``. **Deliberately non-square** so a transposed frame is
+        obvious at a glance.
+    drift_amplitude
+        Peak per-frame drift correction, pixels. The support film drifts
+        rigidly; particles move relative to it.
+    faint_amplitude
+        Peak amplitude of the two faint probes. The default puts them around
+        7x the noise sigma -- findable, but not by a threshold tuned for the
+        bright particles. This is the plan's Section 0.9 gate.
+    scale
+        Pixel size in nm, written onto both signal axes.
+    seed
+        Everything random here (film speckle, noise) comes from this.
+    noise
+        Gaussian sigma added last. 0 disables.
+
+    Notes
+    -----
+    **Why there is a speckled support film.** Drift is only recoverable if
+    something static dominates the correlation. Particles move, appear and
+    vanish, so they cannot serve; a smooth gradient has too little
+    high-frequency content to correlate sharply. A rigidly-drifting speckle
+    field is both physically right and what lets
+    :func:`spyde.drift.solve_translation` recover ``drift`` from this movie.
+
+    The film is generated once on a padded canvas and sampled per frame with
+    bilinear interpolation, so there are no edge artifacts at any drift.
+    Particles are drawn **analytically** at their lab positions, so their
+    centroids stay exact regardless of how the film was resampled.
+    """
+    import hyperspy.api as hs
+    from scipy.ndimage import gaussian_filter, map_coordinates
+
+    ny, nx = int(shape[0]), int(shape[1])
+    n_frames = int(n_frames)
+    rng = np.random.default_rng(seed)
+    drift = _drift_curve(n_frames, float(drift_amplitude))
+    arrays = _particle_arrays(drift, float(faint_amplitude))
+
+    # The support film, on a canvas padded to cover every drift.
+    pad = int(np.ceil(np.abs(drift).max())) + 3
+    fy, fx = ny + 2 * pad, nx + 2 * pad
+    yy_p, _ = np.mgrid[0:fy, 0:fx]
+    film = 0.10 + 0.12 * (yy_p / fy)           # ramp along y ONLY (asymmetric)
+    film += 0.09 * gaussian_filter(rng.standard_normal((fy, fx)), 1.6)
+
+    yy, xx = np.mgrid[0:ny, 0:nx].astype(np.float64)
+    frames = np.empty((n_frames, ny, nx), dtype=np.float32)
+
+    for t in range(n_frames):
+        dy, dx = drift[t]
+        # Sample the film at the lab-frame offset: content sits at -drift.
+        frame = map_coordinates(film, [yy + pad - dy, xx + pad - dx],
+                                order=1, mode="nearest")
+        pos, radii, present = particle_truth_at(arrays, t)
+        for i, p in enumerate(_PARTICLES):
+            if not present[i]:
+                continue
+            amp = (faint_amplitude * p["amp"]) if p["faint"] else p["amp"]
+            frame = frame + amp * _soft_disc(yy, xx, pos[i, 0], pos[i, 1], radii[i])
+        frames[t] = frame
+
+    if noise:
+        frames += (noise * rng.standard_normal(frames.shape)).astype(np.float32)
+
+    s = hs.signals.Signal2D(frames)
+    for ax in s.axes_manager.signal_axes:
+        ax.scale, ax.units = float(scale), "nm"
+    tax = s.axes_manager.navigation_axes[0]
+    tax.name, tax.units, tax.scale = "time", "s", 0.05
+    s.metadata.General.title = "Synthetic particle movie"
+    # `insitu` is registered by SpyDE's OWN hyperspy extension, so unlike the
+    # EELS/EBSD generators this cannot silently fail for a missing extra.
+    _try_signal_type(s, "insitu")
+    _stamp(s, kind="particle_movie", **arrays,
+           n_frames=n_frames, frame_shape=np.asarray([ny, nx]),
+           scale=float(scale), noise=float(noise),
+           faint_amplitude=float(faint_amplitude),
+           merge_pair=np.asarray(MERGE_PAIR),
+           nucleation_index=NUCLEATION_INDEX,
+           dissolution_index=DISSOLUTION_INDEX,
+           nucleation_frame=int(_PARTICLES[NUCLEATION_INDEX]["birth"]),
+           dissolution_frame=int(_PARTICLES[DISSOLUTION_INDEX]["death"]),
+           merge_frame=_merge_frame(arrays, n_frames))
+    return s
