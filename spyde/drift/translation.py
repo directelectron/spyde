@@ -21,20 +21,24 @@ The peak is taken from ``real(ifft2(...))``, not ``abs(...)``. A true match is a
 positive real peak; ``abs`` also promotes spurious imaginary structure, which is
 free extra chances to pick the wrong lag.
 
-**What plain correlation costs, measured.** Discarding the magnitude normalisation
-is not free, and it is worth knowing where the bill lands before changing anything
-here. Plain correlation is weighted by AMPLITUDE, so it is dominated by whatever
-is brightest; phase correlation equalises every feature, so it is dominated by
-whatever is most numerous. On a whole frame of low-dose micrograph texture that is
-a clear win for plain correlation (see ``benchmark_drift_translation.py``). On a
-SMALL ROI containing a few bright objects that move differently from the
-background it is a clear loss: on ``particle_movie``'s default half-frame box the
-old phase solver recovered the stamped drift to 0.37 px and this one manages
-~5 px, because the bright particles outweigh the low-contrast support film that
-actually carries the stage motion. ``skimage.registration.phase_cross_correlation``
-with ``normalization=None`` reproduces the same error on the same crops, so this is
-a property of the estimator, not of this implementation. The band-pass defaults
-below are chosen to claw back as much of that as a fixed filter can.
+**What plain correlation weights, and what that means for an ROI.** Plain
+correlation is weighted by AMPLITUDE, so it follows whatever is brightest; phase
+correlation equalises every frequency, so it follows whatever is most numerous.
+On a whole frame of low-dose micrograph texture that is a clear win for plain
+correlation (see ``benchmark_drift_translation.py``).
+
+It also fixes what an alignment ROI is FOR: the box must contain the thing whose
+motion you want to follow — a fiducial marker, a support-film feature, a
+recognisable landmark. Plain correlation then locks onto exactly that. An ROI
+drawn around mixed content, where the brightest objects are NOT the things
+carrying the stage motion, measures the bright objects instead: on
+``particle_movie``'s half-frame box (bright particles over the low-contrast film
+that actually drifts) this estimator returns ~5 px where the old phase solver
+returned 0.37 px, because it faithfully follows the particles.
+``skimage.registration.phase_cross_correlation`` with ``normalization=None``
+reproduces that on the same crops — it is what amplitude weighting means, not a
+defect here. Draw the ROI around the feature you mean; leave it off (whole frame)
+otherwise.
 
 **2. Banded PAIRWISE measurement + LEAST SQUARES, not a chain.**
 A sequential running-reference chain produces exactly ONE measurement per
