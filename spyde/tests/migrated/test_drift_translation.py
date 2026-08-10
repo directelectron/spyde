@@ -134,6 +134,43 @@ class TestFrameSource:
         assert f.shape == (8, 9)
         assert called["full"] == 0, "sliced a frame but computed the whole stack"
 
+    def test_dask_frame_read_ignores_the_ambient_scheduler(self):
+        """A per-frame read must NEVER resolve the scheduler from context.
+
+        This is the 60-second bug, pinned. In the running app the context holds a
+        process-global ``distributed.Client``, so a bare ``.compute()`` turns every
+        frame into a cluster round-trip — graph out, worker reads, ~8 MB of frame
+        back over IPC — for data this process consumes locally anyway. The drift
+        caret reads 64 frames for its check image, ~20 for the ROI preview and N
+        for the solve, so ONE unqualified ``.compute()`` produced three separate
+        "it hangs" reports at once.
+
+        The navigator learned this already: CLAUDE.md Live-Display §3 pins
+        ``CachedDaskArray._client = None`` for exactly this reason and records it
+        as a silent perf-only bug that survived a long time. This module held a
+        raw dask array and walked straight back into it.
+
+        A TIMING assertion could not have caught that — with no cluster in the
+        test process both paths are fast, which is precisely why it kept coming
+        back. So assert on BEHAVIOUR: install a scheduler that explodes if it is
+        ever consulted, and read a frame.
+        """
+        da = pytest.importorskip("dask.array")
+        import dask
+
+        arr = da.zeros((4, 8, 9), chunks=(1, 8, 9))
+        _n, get, _shape = frame_source(arr)
+
+        def _exploding_scheduler(*a, **k):
+            raise AssertionError(
+                "the per-frame read resolved the scheduler from context — with a "
+                "live Dask client that is one round-trip per frame; pass an "
+                "explicit local scheduler (see frames._compute_one_frame)")
+
+        with dask.config.set(scheduler=_exploding_scheduler):
+            frame = get(2)
+        assert frame.shape == (8, 9)
+
 
 class TestSolveTranslationAccuracy:
     def test_recovers_integer_shifts(self):

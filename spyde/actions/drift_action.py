@@ -79,6 +79,7 @@ from spyde.actions.lifecycle import (
     bump_generation, is_current, run_on_worker, show_tree_node,
 )
 from spyde.actions.wizard import WizardController
+from spyde.backend.action_profile import ActionProfile
 from spyde.backend.ipc import emit, emit_error, emit_progress, emit_status
 
 log = logging.getLogger(__name__)
@@ -695,9 +696,9 @@ class DriftWizard(WizardController):
         if getattr(self.tree, "_drift_wizard", None) is self:
             self.tree._drift_wizard = None
 
-    def commit(self):
+    def commit(self, payload: dict | None = None):
         """Add the lazy corrected node — see :func:`drift_commit`."""
-        return _commit(self)
+        return _commit(self, payload)
 
 
 # ── parameters ───────────────────────────────────────────────────────────────
@@ -840,7 +841,7 @@ def _preview_indices(n_frames: int, k: int, frame_bytes: int) -> np.ndarray:
     return np.unique(np.linspace(0, n - 1, k).round().astype(int))
 
 
-def preview_alignment(get_frame, indices, roi, *, params) -> dict:
+def preview_alignment(get_frame, indices, roi, *, params, prof=None) -> dict:
     """Align *indices* on *roi* alone and report how much sharper the sum got.
 
     Reads one FULL frame at a time and keeps only the crop, so the resident set
@@ -854,20 +855,25 @@ def preview_alignment(get_frame, indices, roi, *, params) -> dict:
     featureless box), and it is measured on the pixels both sums cover.
     """
     from spyde.drift import solve_translation
+    from spyde.backend.action_profile import ActionProfile
 
+    prof = prof if prof is not None else ActionProfile("drift_preview")
     crops: list[np.ndarray] = []
-    for i in indices:
-        frame = np.asarray(get_frame(int(i)), np.float32)
-        if roi is not None:
-            y0, x0, h, w = (int(v) for v in roi)
-            frame = frame[y0:y0 + h, x0:x0 + w]
-        crops.append(np.ascontiguousarray(frame, dtype=np.float32))
+    with prof.stage("crop_read"):
+        for i in indices:
+            frame = np.asarray(get_frame(int(i)), np.float32)
+            if roi is not None:
+                y0, x0, h, w = (int(v) for v in roi)
+                frame = frame[y0:y0 + h, x0:x0 + w]
+            crops.append(np.ascontiguousarray(frame, dtype=np.float32))
 
-    model = solve_translation(crops, **_solver_kwargs(params))
+    with prof.stage("solve"):
+        model = solve_translation(crops, **_solver_kwargs(params))
     take = range(len(crops))
-    raw = _stack_sum(crops.__getitem__, take)
-    aligned = _stack_sum(crops.__getitem__, take, model.shifts,
-                         order=int(params["order"]))
+    with prof.stage("sums"):
+        raw = _stack_sum(crops.__getitem__, take)
+        aligned = _stack_sum(crops.__getitem__, take, model.shifts,
+                             order=int(params["order"]))
     both = np.isfinite(raw) & np.isfinite(aligned)
     e_raw = _gradient_energy(raw, both)
     e_aligned = _gradient_energy(aligned, both)
@@ -891,6 +897,7 @@ def drift_open(session, plot, payload) -> None:
     ~20-frame preview of the default box, which is what makes the caret's first
     frame informative instead of an empty panel and a button.
     """
+    prof = ActionProfile("drift_open", payload)
     src, tree = _src_plot_tree(session, plot)
     if src is None or tree is None:
         emit_error("Drift Correction: no active dataset")
@@ -900,15 +907,20 @@ def drift_open(session, plot, payload) -> None:
     if existing is not None and not existing._closed:
         existing.params = _coerce({**existing.params, **(payload or {})})
         _emit_state(existing)
+        prof.done("reopen")
         return
 
     wiz = DriftWizard(session, tree, src)
     wiz.params = _coerce(payload)
     try:
-        n_frames, get_frame, shape = wiz.frames()
+        with prof.stage("frames"):
+            n_frames, get_frame, shape = wiz.frames()
     except TypeError as exc:
         emit_error(f"Drift Correction: {exc}")
         return
+    prof.info(n_frames=int(n_frames), frame=f"{int(shape[0])}x{int(shape[1])}",
+              lazy=bool(getattr(getattr(wiz.signal(), "data", None), "dask", None)
+                        is not None))
     # BEFORE the worker: StrictMode fires open/close/open synchronously and the
     # close's bump has to be able to invalidate this open's deferred build.
     gen = wiz.guard()
@@ -916,16 +928,24 @@ def drift_open(session, plot, payload) -> None:
     _emit_state(wiz, n_frames=int(n_frames))
 
     def _work():
-        return _stack_sum(get_frame, wiz.sum_indices(n_frames))
+        idx = wiz.sum_indices(n_frames)
+        prof.info(sum_frames=int(len(idx)))
+        with prof.stage("sum_read"):
+            return _stack_sum(get_frame, idx)
 
     def _done(raw_sum):
         if not wiz.still(gen) or wiz._closed:
+            prof.done("superseded")
             return
-        wiz.open_check_window(raw_sum, int(n_frames))
-        wiz.ensure_roi_widget(shape)
+        with prof.stage("check_window"):
+            wiz.open_check_window(raw_sum, int(n_frames))
+        with prof.stage("roi_widget"):
+            wiz.ensure_roi_widget(shape)
         _emit_state(wiz, n_frames=int(n_frames))
         emit_status("Drift Correction: drag the box onto a landmark to test it, "
                     "then Correct Drift.")
+        prof.mark("check_visible")
+        prof.done()
         _run_preview(wiz)
 
     def _fail(exc):
@@ -1001,6 +1021,7 @@ def _run_preview(wiz: DriftWizard) -> None:
     """
     if wiz._closed:
         return
+    prof = ActionProfile("drift_preview")
     tree = wiz.tree
     gen = bump_generation(tree, "_drift_preview_gen")
     params = dict(wiz.params)
@@ -1014,15 +1035,22 @@ def _run_preview(wiz: DriftWizard) -> None:
         return
     h, w = (roi[2], roi[3]) if roi is not None else (int(shape[0]), int(shape[1]))
     indices = _preview_indices(n_frames, params["preview_frames"], h * w * 4)
+    prof.info(n_frames=int(n_frames), preview_frames=int(len(indices)),
+              box=f"{w}x{h}", roi=("yes" if roi is not None else "whole-frame"))
 
     def _work():
-        return preview_alignment(get_frame, indices, roi, params=params)
+        return preview_alignment(get_frame, indices, roi, params=params,
+                                 prof=prof)
 
     def _done(result):
         if not is_current(tree, "_drift_preview_gen", gen) or wiz._closed:
+            prof.done("superseded")
             return
         wiz.preview = result
-        wiz.show_preview(result)
+        with prof.stage("paint"):
+            wiz.show_preview(result)
+        prof.mark("preview_visible")
+        prof.done()
         emit({"type": "drift_preview", "window_id": wiz.src_window_id,
               "roi": None if result["roi"] is None else list(result["roi"]),
               "frames": int(result["frames"]),
@@ -1080,12 +1108,15 @@ def drift_run(session, plot, payload) -> None:
         emit_status("Drift Correction: no usable alignment box — correlating "
                     "the whole frame.")
 
+    prof = ActionProfile("drift_run", payload)
+    prof.info(n_frames=int(n_frames), roi=("yes" if roi is not None else "whole-frame"))
     gen = wiz.guard()
     stopped = [False]
     wiz._stop = stopped
     if hasattr(tree, "register_cancel"):
         tree.register_cancel(flag=stopped)
-    wiz.open_trace_window(int(n_frames))
+    with prof.stage("trace_window"):
+        wiz.open_trace_window(int(n_frames))
     _emit_state(wiz)
     emit_status(f"Solving drift over {n_frames} frames…")
     dispatch = getattr(session, "_dispatch_to_main", None)
@@ -1130,19 +1161,21 @@ def drift_run(session, plot, payload) -> None:
                     or time.monotonic() - last_flush[0] >= _TRACE_MAX_INTERVAL):
                 _flush()
 
-        model = solve_translation(
-            wiz.signal(), progress=_progress, on_shift=_on_shift,
-            cancel=lambda: stopped[0],
-            provenance={"action": "Drift Correction", "params": dict(p),
-                        "roi": None if roi is None else [int(v) for v in roi]},
-            **_solver_kwargs(p, roi))
+        with prof.stage("solve"):
+            model = solve_translation(
+                wiz.signal(), progress=_progress, on_shift=_on_shift,
+                cancel=lambda: stopped[0],
+                provenance={"action": "Drift Correction", "params": dict(p),
+                            "roi": None if roi is None else [int(v) for v in roi]},
+                **_solver_kwargs(p, roi))
         _flush()
         if stopped[0]:
             return model, None, float("nan")
         # One extra streaming pass over the SAME bounded subset the raw sum
         # used, so the two check images are comparable.
-        after = _stack_sum(get_frame, wiz.sum_indices(n_frames), model.shifts,
-                           order=int(p["order"]))
+        with prof.stage("corrected_sum"):
+            after = _stack_sum(get_frame, wiz.sum_indices(n_frames), model.shifts,
+                               order=int(p["order"]))
         # The same number the discovery preview reports, now for the whole
         # movie — measured on the worker because a 4096² gradient energy is
         # ~100 ms and the main thread is the navigator's.
@@ -1168,9 +1201,10 @@ def drift_run(session, plot, payload) -> None:
             # been measured, so the live trace is necessarily a preview of it.
             # They agree closely; overwriting is cheap and makes the curve the
             # user keeps the one the model actually contains.
-            wiz.push_trace([(i, float(dy), float(dx))
-                            for i, (dy, dx) in enumerate(model.shifts)])
-            wiz.update_check(after=after)
+            with prof.stage("paint"):
+                wiz.push_trace([(i, float(dy), float(dx))
+                                for i, (dy, dx) in enumerate(model.shifts)])
+                wiz.update_check(after=after)
             emit({"type": "drift_result", "window_id": wiz.src_window_id,
                   "shifts": [[float(a), float(b)] for a, b in model.shifts],
                   "kind": model.kind, "reference": model.reference,
@@ -1180,6 +1214,8 @@ def drift_run(session, plot, payload) -> None:
                   "residual": float(model.params.get("ls_residual_px", float("nan"))),
                   "cancelled": bool(stopped[0])})
             _emit_state(wiz)
+            prof.mark("result_visible")
+            prof.done()
             solved = int(np.isfinite(model.shifts).all(axis=1).sum())
             if stopped[0]:
                 emit_status(f"Drift solve stopped after {solved} of "
@@ -1304,20 +1340,25 @@ def drift_corrected(signal, *, model, order: int = 1, fill: float = float("nan")
     return new
 
 
-def _commit(wiz: DriftWizard):
+def _commit(wiz: DriftWizard, payload: dict | None = None):
+    prof = ActionProfile("drift_commit", payload)
     if wiz.model is None:
         emit_error("Drift Correction: solve first, then Apply")
+        prof.done("no-model")
         return None
     parent = wiz.signal()
     try:
-        new_signal = wiz.tree.add_transformation(
-            parent, function=drift_corrected, node_name="Drift corrected",
-            local=True, model=wiz.model, order=int(wiz.params["order"]))
+        with prof.stage("add_transformation"):
+            new_signal = wiz.tree.add_transformation(
+                parent, function=drift_corrected, node_name="Drift corrected",
+                local=True, model=wiz.model, order=int(wiz.params["order"]))
     except Exception as exc:
         emit_error(f"Drift Correction: applying the model failed — {exc}")
         log.exception("drift commit failed")
+        prof.done("raised")
         return None
     if new_signal is None:
+        prof.done("add_transformation returned None")
         return None
     wiz.tree.drift = wiz.model
     try:
@@ -1328,9 +1369,12 @@ def _commit(wiz: DriftWizard):
              "roi": wiz.model.params.get("roi")})
     except Exception as exc:
         log.debug("[drift] stamping provenance failed: %s", exc)
-    show_tree_node(wiz.src_plot, wiz.tree, new_signal)
+    with prof.stage("show_node"):
+        show_tree_node(wiz.src_plot, wiz.tree, new_signal)
     emit_status(f"Drift corrected node added (max shift "
                 f"{wiz.model.max_abs_shift:.2f} px)")
+    prof.mark("node_visible")
+    prof.done()
     return new_signal
 
 
@@ -1340,7 +1384,7 @@ def drift_commit(session, plot, payload=None) -> None:
     if wiz is None:
         emit_error("Drift Correction: nothing to apply")
         return
-    wiz.commit()
+    wiz.commit(payload)
 
 
 def drift_correction(ctx, action_name: str = "Drift Correction", **params):

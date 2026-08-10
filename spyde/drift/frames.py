@@ -16,14 +16,65 @@ Accepted inputs, in the order they are tried:
 """
 from __future__ import annotations
 
+import logging
 from typing import Callable
 
 import numpy as np
+
+log = logging.getLogger(__name__)
 
 
 def _is_dask(obj) -> bool:
     """True for a dask array, WITHOUT importing dask when it isn't already in."""
     return type(obj).__module__.startswith("dask.array")
+
+
+#: Warn once per process, not once per frame — a thousand identical warnings is
+#: how you train people to ignore the log.
+_warned_distributed = False
+
+
+def _compute_one_frame(slice_) -> np.ndarray:
+    """Compute ONE frame slice on the LOCAL threaded scheduler.
+
+    **The explicit ``scheduler=`` is the whole point of this function.** A bare
+    ``.compute()`` resolves the scheduler from context, and in the running app
+    that context contains a process-global ``distributed.Client`` — so every
+    frame becomes a scheduler round-trip: serialise the graph, hand it to a
+    worker process, read there, ship the frame back over IPC. At 2048² that is
+    ~8 MB back per frame and hundreds of milliseconds each, for data this
+    process is going to consume locally anyway.
+
+    Measured consequence, and it is the whole reason this function exists: the
+    drift caret reads 64 frames for its check image, ~20 for the ROI preview and
+    N for the solve, all through here. At a few hundred ms per frame that is the
+    "the ROI spawns a drift check image which takes 60 seconds" report — one
+    unqualified ``.compute()`` accounting for three separate symptoms.
+
+    This is the SAME failure the navigator already fixed, one layer down: CLAUDE.md
+    Live-Display §3 pins ``CachedDaskArray._client = None`` precisely so the
+    per-frame read takes hyperspy's synchronous branch instead of the distributed
+    one, and records that leaving the ambient client in place was a silent
+    perf-only bug for a long time. This module bypassed that machinery entirely
+    by holding a raw dask array, and so re-acquired the bug it had already been
+    fixed. Anything here that reads frames one at a time must go through this
+    function.
+    """
+    try:
+        return np.asarray(slice_.compute(scheduler="threads"))
+    except Exception as exc:
+        # A graph whose data lives on the workers (a `.persist()`ed array) genuinely
+        # cannot be computed locally. Fall back rather than fail the solve — but say
+        # so, because on that path every frame costs a round-trip and the caller
+        # deserves to know why their drift solve is slow.
+        global _warned_distributed
+        if not _warned_distributed:
+            _warned_distributed = True
+            log.warning(
+                "[drift] local frame read failed (%s); falling back to the ambient "
+                "scheduler. Per-frame reads now cost a cluster round-trip each — "
+                "expect the drift check, preview and solve to be much slower.", exc)
+        return np.asarray(slice_.compute())
 
 
 def frame_source(data) -> tuple[int, Callable[[int], np.ndarray], tuple[int, int]]:
@@ -65,8 +116,8 @@ def frame_source(data) -> tuple[int, Callable[[int], np.ndarray], tuple[int, int
         n, h, w = data.shape
         if _is_dask(data):
             def get_frame(i: int, _d=data) -> np.ndarray:
-                # ONE frame. Never `_d.compute()`.
-                return np.asarray(_d[int(i)].compute())
+                # ONE frame, computed LOCALLY. Never `_d.compute()`.
+                return _compute_one_frame(_d[int(i)])
         else:
             def get_frame(i: int, _d=data) -> np.ndarray:
                 return np.asarray(_d[int(i)])

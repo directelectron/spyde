@@ -121,7 +121,15 @@ export function DriftWizard({ caretPos, windowId, sendAction, onClose }: Props) 
   }
   React.useEffect(() => { _driftStore.set(windowId, vals.current) })
 
-  /** The backend's parameter names (`drift_action.DEFAULTS` keys). */
+  /** The backend's parameter names (`drift_action.DEFAULTS` keys).
+   *
+   *  `_t_click` is NOT a parameter — `_coerce` builds its dict from DEFAULTS and
+   *  drops it. It is a wall-clock stamp the backend's ActionProfile subtracts to
+   *  report `queued=`: everything between the user pressing the button and the
+   *  handler starting (IPC hop, the backend's asyncio queue, whatever action is
+   *  ahead of it). Without it a profile can only say the compute was slow, never
+   *  that the button sat dead for two seconds first — which is the difference
+   *  between "slow" and "does nothing". */
   const params = (): Record<string, unknown> => {
     const v = vals.current
     return {
@@ -129,6 +137,7 @@ export function DriftWizard({ caretPos, windowId, sendAction, onClose }: Props) 
       upsample: v.upsample, max_shift: v.maxShift,
       apodize: v.apodize, order: v.order,
       preview_frames: v.previewFrames,
+      _t_click: Date.now(),
     }
   }
 
@@ -258,7 +267,8 @@ export function DriftWizard({ caretPos, windowId, sendAction, onClose }: Props) 
                 own chunking) — nothing is copied, so this is cheap even on a
                 multi-GB movie. */}
             <CommitButton wizardKey="drift" windowId={windowId}
-              sendAction={sendAction} label="Apply" />
+              sendAction={sendAction} label="Apply"
+              payload={() => ({ _t_click: Date.now() })} />
             <button data-testid="drift-discard" style={ghostStyle}
               onClick={discard}>Discard</button>
           </div>
