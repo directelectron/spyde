@@ -86,7 +86,7 @@ interface DriftSaved {
   previewFrames: number
 }
 const DEFAULTS: DriftSaved = {
-  useRoi: false, method: 'rigid', band: 12,
+  useRoi: false, method: 'rigid', band: 48,
   upsample: 8, maxShift: 32, apodize: true, order: 1,
   previewFrames: 20,
 }

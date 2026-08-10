@@ -121,7 +121,7 @@ _REFINE_STEP = 8.0
 #: 2 e/px only reaches bin 2 here and comes back ~13 px wrong; 512² and up reach
 #: bin 4-16 and stay inside 0.5 px at the same dose. Lower ``corr_size`` for such
 #: a movie — that is the knob, and it is why this is a parameter.
-DEFAULT_CORR_SIZE = 128
+DEFAULT_CORR_SIZE = 256
 
 #: Never bin below this many grid pixels per axis — a correlation grid smaller
 #: than the refinement window has nowhere to put a peak.
@@ -187,12 +187,34 @@ DEFAULT_TILT = 0.75
 # ── the least-squares solve ──────────────────────────────────────────────────
 
 #: Default half-width of the measurement band: every pair ``(i, j)`` with
-#: ``0 < j - i <= band``. Cryo-EM measures all pairs; at the thousands of frames
-#: an in-situ movie reaches that is O(N²) and not viable, and the marginal value
-#: of a pair 500 frames apart is nil anyway (they may share no field of view).
-#: 12 gives ~12 constraints per unknown, which is enough over-determination for
-#: the IRLS consensus to outvote a bad measurement several times over.
-DEFAULT_BAND = 12
+#: ``0 < j - i <= band``. Cryo-EM measures ALL pairs; at the thousands of frames
+#: an in-situ movie reaches that is O(N²) and not viable, so the band is the
+#: compromise — and how far it has to reach is the single least obvious number
+#: here.
+#:
+#: **A band accumulates bias; all-pairs does not.** The old solver registered
+#: every frame against one reference, so a per-measurement bias showed up once.
+#: A banded system chains ``N/band`` independent links from frame 0 to frame N,
+#: and ANY systematic per-pair error multiplies along that chain. Measured on the
+#: 240-frame 2048² benchmark (0.17 px/frame, i.e. 2 px across a 12-frame band):
+#:
+#:   band 12  ->  1.46 px rms,  recovered/true = 0.90
+#:   band 24  ->  0.60 px rms
+#:   band 48  ->  0.09 px rms
+#:
+#: The error is a proportional SHRINK, not noise, and it has one cause: a plain
+#: correlation peak sits on the shoulder of the window/content envelope, which
+#: pulls it toward zero, and that pull is proportionally largest when the shift
+#: being measured is a small fraction of a (binned) pixel. A wide band fixes both
+#: halves at once — the shift across it is bigger, so the bias is relatively
+#: smaller, AND there are fewer links to multiply it along.
+#:
+#: 48 is therefore the default even though the literature's rule of thumb is
+#: 10-20: it costs ~1.4x the time of 12 (the per-frame read and FFT dominate, not
+#: the pairs) and buys 16x the accuracy on real-scale data. Raise it further for
+#: a very slow drift; the ceiling is memory, since ``band + 1`` binned spectra
+#: stay resident.
+DEFAULT_BAND = 48
 
 #: IRLS passes over the solved system. Bisquare converges in 2-3; more only
 #: costs banded solves, which are microseconds.
