@@ -124,7 +124,13 @@ it). No actions and no new nodes on that tree until it finishes — the toolbar
 invoker, the staged dispatch and `BaseSignalTree.add_node` /
 `add_transformation` all call `refuse_if_locked`, which errors at the user
 rather than no-op'ing silently. Any NEW path that adds a node or runs an
-action must call it too. Read-only re-emits and teardown verbs
+action must call it too. The toolbar shows it: every action descriptor
+carries `disabled` + `disabled_reason` while locked (DISABLED, not hidden —
+`requires_vectors` hides because the action does not apply to the data, where
+the lock means "not yet"), and lock/unlock re-send the config for every plot
+of the tree so the buttons grey at the START of the fill and restore at the
+end. The backend refusal stays as the backstop. Read-only re-emits and
+teardown verbs
 (`*_query`/`*_close`/`*_stop`/`*_cancel`) are exempt — `registry.
 is_lock_exempt`: the renderer fires `overlay_query` itself on focus changes,
 and a lock that can trap a caret open is worse than no lock. The lock is not

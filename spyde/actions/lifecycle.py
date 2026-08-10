@@ -238,33 +238,61 @@ def seg_batch_running(session) -> bool:
 TREE_LOCK_ATTR = "_compute_lock"
 
 
+def refresh_toolbars(tree) -> None:
+    """Re-send the toolbar config for EVERY plot of *tree* (signal + navigator).
+
+    Both plot kinds, deliberately: the navigator's own actions (Add Selector,
+    FFT, Line Profile) act on the same tree and are refused just the same, so
+    greying only the signal window would leave buttons that look live and error.
+
+    Safe from any thread — it only emits (CLAUDE.md: ``ipc.emit*`` is
+    thread-safe), which is what lets the batch worker call it at finalize.
+    """
+    plots = list(getattr(tree, "signal_plots", []) or [])
+    npm = getattr(tree, "navigator_plot_manager", None)
+    for plot_list in (getattr(npm, "plots", {}) or {}).values():
+        plots.extend(plot_list or [])
+    for plot in plots:
+        try:
+            state = getattr(plot, "plot_state", None)
+            if state is not None and hasattr(state, "_send_toolbar_config"):
+                state._send_toolbar_config()
+        except Exception as e:
+            log.debug("re-sending toolbar config failed: %s", e)
+
+
 def lock_tree(tree, label: str) -> None:
     """Lock *tree* while a progressive compute fills it.
 
     A progressively-filled result window is only half-built: its root is a
     placeholder, its result object (``diffraction_vectors``…) attaches at
-    finalize, and its navigator→signal link is temporarily owned by the live
-    preview (``live_signal.ProgressiveSignalPreview``). Adding a node or running
-    an action on it mid-fill therefore acts on a signal that is about to be
-    replaced.
+    finalize, and its signal plots read through the live preview
+    (``live_signal.ProgressiveSignalPreview``) pinned on the root. Adding a node
+    or running an action on it mid-fill therefore acts on a signal that is about
+    to be replaced.
 
-    Locking is also what makes the preview's install-once correct BY
-    CONSTRUCTION: with the tree closed to new nodes and actions for the duration
-    of the batch, the set of navigator→signal links cannot change after
-    ``install()`` snapshots it — so the interactive-fill path needs no re-check,
-    and in particular the Live-Display nav read (CLAUDE.md §3) gets no per-read
-    branch.
+    Taking the lock RE-SENDS the toolbar config, so the buttons grey out at the
+    START of the fill rather than only at the end — the whole point is that a
+    user never clicks something that will refuse them.
     """
-    if tree is not None:
-        setattr(tree, TREE_LOCK_ATTR, str(label))
+    if tree is None or getattr(tree, TREE_LOCK_ATTR, None) == str(label):
+        return
+    setattr(tree, TREE_LOCK_ATTR, str(label))
+    refresh_toolbars(tree)
 
 
 def unlock_tree(tree) -> None:
-    """Release :func:`lock_tree`. Idempotent — safe on an unlocked tree, which
-    is what lets the batch clear it both where the result attaches and again in
-    its teardown (a cancelled or failed run must never strand a locked tree)."""
-    if tree is not None:
-        setattr(tree, TREE_LOCK_ATTR, None)
+    """Release :func:`lock_tree` and restore the toolbar.
+
+    Idempotent — safe on an unlocked tree, which is what lets the batch clear it
+    both where the result attaches and again in its teardown (a cancelled or
+    failed run must never strand a locked tree). The toolbar re-send happens
+    only on the transition, so the second call costs nothing.
+    """
+    if tree is None or getattr(tree, TREE_LOCK_ATTR, None) is None:
+        return
+    setattr(tree, TREE_LOCK_ATTR, None)
+    refresh_toolbars(tree)
 
 
 def tree_lock(tree) -> str | None:
