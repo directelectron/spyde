@@ -429,12 +429,41 @@ test('the vectors signal plot fills in while the batch is still running', async 
     'the drag happened after the batch finished, so it proves nothing about '
     + 'reading a partially-computed result').toBeTruthy()
 
+  // ── (c) the window is CLOSED for business while it fills ──────────────────
+  // The tree is locked for the duration of the batch (no actions, no new
+  // nodes), which is what makes the preview's install-once link snapshot valid.
+  // The backend refuses a click either way, but a button that looks clickable
+  // and then errors is a worse app than one that shows it is unavailable — so
+  // the toolbar config carries `disabled` while locked. The toolbar is
+  // reveal-on-hover, hence the hover before looking.
+  await vecSig.getByTestId('subwindow-titlebar').hover()
+  const lockedBtn = vecSig.getByTestId(/^action-btn-/).first()
+  await expect(lockedBtn).toBeVisible({ timeout: 10_000 })
+  await page.screenshot({ path: join(SHOTS, '95-toolbar-greyed-while-filling.png') })
+  const lockedNames = await vecSig.getByTestId(/^action-btn-/).all()
+  for (const btn of lockedNames) {
+    await expect(btn, 'a toolbar button stayed enabled on a window whose '
+      + 'find-vectors batch is still filling it').toBeDisabled()
+  }
+  // eslint-disable-next-line no-console
+  console.log('toolbar while locked:', lockedNames.length, 'buttons, all disabled')
+
   // Let the batch finish before the app closes (closing mid-batch wedges the
   // hidden backend's stdin tick — see find_vectors_workflow.spec.ts).
   // Let the parked batch run to completion — without this the finalize wait
   // below would sit until the hold's own MAX_HOLD_S timeout.
   await backendAction(page, 'test_hold_release', { name: 'fv-batch' })
   await ctx.backend.waitForLog('[fv-batch] finalized', 420_000)
+
+  // …and the lock RELEASES: the same buttons come back live once the vectors
+  // attach. (Asserted on the FIRST one only: the finished window also GAINS the
+  // requires_vectors actions, so the set is not the same set.)
+  await vecSig.getByTestId('subwindow-titlebar').hover()
+  await expect(vecSig.getByTestId(/^action-btn-/).first(),
+    'the toolbar stayed greyed after the batch finished — the lock was not '
+    + 'released, or its release did not re-send the toolbar config',
+  ).toBeEnabled({ timeout: 30_000 })
+  await page.screenshot({ path: join(SHOTS, '96-toolbar-restored.png') })
   await expect.poll(() => figureSignature(vecSig).then((s) => s.bright), {
     timeout: 30_000, message: 'the finalized vectors window is blank',
   }).toBeGreaterThan(0)

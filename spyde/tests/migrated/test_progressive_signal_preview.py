@@ -884,6 +884,80 @@ class TestResultTreeIsLockedWhileFilling:
                                  "payload": {}})
         assert ran == [key], "the staged handler stayed blocked after unlock"
 
+    def test_toolbar_config_disables_every_action_while_locked(
+            self, stem_4d_dataset, captured_messages):
+        """The VISIBLE half of the lock: the buttons must render unavailable
+        rather than look clickable and error.
+
+        Disabled, not hidden — the `requires_vectors` family HIDES because those
+        actions do not apply to the data, where the lock means "not yet", and a
+        button that vanishes and comes back reads as a glitch. Every toolbar
+        action is disabled because `_dispatch_toolbar_action` refuses every one
+        of them (`registry.is_lock_exempt` covers STAGED verbs, which never
+        appear in this config).
+        """
+        from spyde.actions.lifecycle import lock_tree, unlock_tree
+        from spyde.drawing.toolbars.plot_control_toolbar import (
+            get_toolbar_config_for_plot,
+        )
+        session = stem_4d_dataset["window"]
+        tree = session.signal_trees[0]
+        state = tree.signal_plots[0].plot_state
+
+        free = get_toolbar_config_for_plot(state)
+        assert free, "the fixture window has no toolbar actions to test with"
+        assert not any(a.get("disabled") for a in free)
+
+        lock_tree(tree, "Find Diffraction Vectors")
+        try:
+            locked = get_toolbar_config_for_plot(state)
+            assert {a["name"] for a in locked} == {a["name"] for a in free}, \
+                "locking must DISABLE the actions, never remove them"
+            assert all(a.get("disabled") is True for a in locked)
+            assert all("Find Diffraction Vectors" in a["disabled_reason"]
+                       for a in locked)
+        finally:
+            unlock_tree(tree)
+
+        restored = get_toolbar_config_for_plot(state)
+        assert not any(a.get("disabled") for a in restored)
+
+    def test_locking_pushes_the_greyed_toolbar_immediately(
+            self, stem_4d_dataset, captured_messages):
+        """Taking the lock RE-SENDS the config, so the buttons grey out at the
+        START of the fill — not only when the batch finishes and something else
+        happens to re-send. Both the signal AND the navigator windows: the
+        navigator's Add Selector would add the very navigator→signal link the
+        lock exists to freeze."""
+        from spyde.actions.lifecycle import lock_tree, unlock_tree
+        session = stem_4d_dataset["window"]
+        tree = session.signal_trees[0]
+
+        def configs():
+            return [m for m in captured_messages
+                    if m.get("type") == "toolbar_config"]
+
+        n_before = len(configs())
+        lock_tree(tree, "Find Diffraction Vectors")
+        sent = configs()[n_before:]
+        assert sent, "locking sent no toolbar config"
+        assert all(a.get("disabled") for m in sent for a in m["toolbar_actions"])
+        nav_ids = {id(p) for lst in
+                   tree.navigator_plot_manager.plots.values() for p in lst}
+        assert nav_ids & {m["plot_id"] for m in sent}, \
+            "the navigator window's toolbar was not greyed"
+
+        n_locked = len(configs())
+        unlock_tree(tree)
+        after = configs()[n_locked:]
+        assert after, "unlocking sent no toolbar config"
+        assert not any(a.get("disabled") for m in after
+                       for a in m["toolbar_actions"])
+        # Idempotent: a second unlock is not a transition, so no more traffic.
+        n_after = len(configs())
+        unlock_tree(tree)
+        assert len(configs()) == n_after
+
     def test_read_only_and_teardown_verbs_are_exempt(self, stem_4d_dataset,
                                                      captured_messages,
                                                      monkeypatch):
