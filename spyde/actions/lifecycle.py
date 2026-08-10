@@ -230,6 +230,69 @@ def seg_batch_running(session) -> bool:
     return False
 
 
+# ── the result-tree compute lock ──────────────────────────────────────────────
+
+#: Attribute a progressive action sets on its result tree while its batch runs.
+#: Per-run state lives on the TREE (ownership map, ``actions/README.md`` §3), so
+#: ``BaseSignalTree.close()`` takes it down with everything else.
+TREE_LOCK_ATTR = "_compute_lock"
+
+
+def lock_tree(tree, label: str) -> None:
+    """Lock *tree* while a progressive compute fills it.
+
+    A progressively-filled result window is only half-built: its root is a
+    placeholder, its result object (``diffraction_vectors``…) attaches at
+    finalize, and its navigator→signal link is temporarily owned by the live
+    preview (``live_signal.ProgressiveSignalPreview``). Adding a node or running
+    an action on it mid-fill therefore acts on a signal that is about to be
+    replaced.
+
+    Locking is also what makes the preview's install-once correct BY
+    CONSTRUCTION: with the tree closed to new nodes and actions for the duration
+    of the batch, the set of navigator→signal links cannot change after
+    ``install()`` snapshots it — so the interactive-fill path needs no re-check,
+    and in particular the Live-Display nav read (CLAUDE.md §3) gets no per-read
+    branch.
+    """
+    if tree is not None:
+        setattr(tree, TREE_LOCK_ATTR, str(label))
+
+
+def unlock_tree(tree) -> None:
+    """Release :func:`lock_tree`. Idempotent — safe on an unlocked tree, which
+    is what lets the batch clear it both where the result attaches and again in
+    its teardown (a cancelled or failed run must never strand a locked tree)."""
+    if tree is not None:
+        setattr(tree, TREE_LOCK_ATTR, None)
+
+
+def tree_lock(tree) -> str | None:
+    """The label of the compute holding *tree*, or ``None`` when it is free."""
+    return getattr(tree, TREE_LOCK_ATTR, None) or None
+
+
+def refuse_if_locked(tree, what: str) -> bool:
+    """THE gate. Returns True — and tells the user why — when *tree* is locked.
+
+    Every path that would add a node to a tree or run an action on one calls
+    this and bails on True: the toolbar-action invoker, the staged-wizard
+    dispatch, and ``BaseSignalTree.add_node`` / ``add_transformation``. One
+    helper, not scattered checks, so a new entry point either calls it or is
+    visibly missing it.
+
+    Refusal is a user-facing error, never a silent no-op: a button that does
+    nothing reads as a broken app.
+    """
+    label = tree_lock(tree)
+    if not label:
+        return False
+    from de_shell.ipc import emit_error
+    emit_error(f"{what} is unavailable while '{label}' is still computing into "
+               f"this window — wait for it to finish.")
+    return True
+
+
 # ── overlays / painting ───────────────────────────────────────────────────────
 
 def show_tree_node(plot, tree, new_signal) -> None:

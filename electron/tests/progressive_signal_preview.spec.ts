@@ -33,6 +33,7 @@ import { mkdirSync } from 'fs'
 import { join } from 'path'
 const {
   launchApp, backendAction, waitForSubwindowCount, sigWindow, dragCrosshair,
+  crosshairAt,
 } = require('./_harness.cjs')
 
 const SHOTS = join(__dirname, '..', 'progressive_signal_shots')
@@ -98,6 +99,15 @@ const logLines = (needle: string): string[] =>
 const finalized = () => logLines('[fv-batch] finalized').length > 0
 
 /**
+ * Has SPYDE_TEST_HOLD parked the batch? Part (a) samples the fill and part (b)
+ * needs it PARKED, so (a) must stop the moment the park lands: a parked batch
+ * produces no new blocks, so (a)'s "capture each repaint" loop would otherwise
+ * spin out its full budget against a frozen picture — and burn the hold's own
+ * MAX_HOLD_S (120 s) doing it, so (b) ran after the park had already expired.
+ */
+const parked = () => logLines('[test-hold] fv-batch parked').length > 0
+
+/**
  * `(N/M positions ready)` pairs from the AUTO-SAMPLE paint line — behaviour (a).
  *
  * Deliberately keyed on `preview frame at`, not on `[live-signal]`: the same
@@ -129,9 +139,51 @@ function servedCount(): number {
   return m ? parseInt(m[1], 10) : 0
 }
 
+/**
+ * How many navigator-driven reads the preview has DECLINED (position not yet
+ * computed → the last good frame stays up), from the cumulative count on the
+ * backend's `navigator read declined` line.
+ *
+ * The diagnostic counterpart of `servedCount`: served and declined move
+ * together on the backend (`ProgressiveSignalPreview` counts every read one
+ * way or the other), so when a drag serves nothing this tells apart "the
+ * reads ran but were over uncomputed data" (declined moves) from "no read
+ * reached the preview at all" (neither moves — a wedged dispatcher or a grab
+ * that missed). The line is throttled (~2 s) but carries the CUMULATIVE
+ * count, and a multi-second all-declined drag always emits at least one.
+ */
+function declinedCount(): number {
+  const lines = logLines('navigator read declined')
+  if (!lines.length) return 0
+  const m = /(\d+) declined/.exec(lines[lines.length - 1])
+  return m ? parseInt(m[1], 10) : 0
+}
+
 // The crosshair drag itself lives in the harness (`dragCrosshair`): an
 // anyplotlib crosshair is GRABBED, not clicked to, so a press at an arbitrary
 // point moves nothing — see the helper's own note.
+
+/**
+ * The backend's `[test-aim] walk target …` line → where to walk, in NAV INDEX
+ * deltas from wherever the crosshair currently is.
+ *
+ * The backend picks the target (only it can see the ready mask) but does NOT
+ * move anything — the drag below does, with the mouse, from the crosshair the
+ * renderer actually drew. See `_test_aim_ready_position` for why the earlier
+ * "park it from the backend, then grab it" version could not work.
+ */
+function walkTarget(): { dix: number; diy: number; readyLeft: number;
+                         navW: number; navH: number } | null {
+  const line = logLines('[test-aim] walk target').pop()
+  if (!line) return null
+  const m = /dix=(-?\d+) diy=(-?\d+), (\d+) ready columns to the left; nav (\d+)x(\d+)/
+    .exec(line)
+  if (!m) return null
+  return {
+    dix: parseInt(m[1], 10), diy: parseInt(m[2], 10), readyLeft: parseInt(m[3], 10),
+    navW: parseInt(m[4], 10), navH: parseInt(m[5], 10),
+  }
+}
 
 test('the vectors signal plot fills in while the batch is still running', async () => {
   const { page } = ctx
@@ -182,6 +234,10 @@ test('the vectors signal plot fills in while the batch is still running', async 
   for (let i = 0; i < 400 && !finalized(); i++) {
     const sig = await figureSignature(vecSig)
     const prog = previewProgress()
+    // Stop as soon as the hold parks the batch: no more blocks land, so no more
+    // repaints can be captured, and every further iteration spends the hold's
+    // own 120 s budget that part (b) below needs (see `parked`).
+    if (parked() && prog.length) break
     // Only start capturing once the PREVIEW has painted at least once —
     // before that the plot can still repaint for unrelated reasons (chrome,
     // the hover toolbar) and those frames say nothing about the fill.
@@ -239,17 +295,8 @@ test('the vectors signal plot fills in while the batch is still running', async 
   const vecNav = results
     .filter({ has: page.getByTestId('window-breadcrumb').filter({ hasText: /^N-/ }) })
     .last()
-  // AIM AT THE COMPUTED BAND. `_slice_for_navigator` only serves a position
-  // `is_ready()` reports as computed, and the batch fills in NAV ORDER — so the
-  // ready region is the TOP rows of the count map. The crosshair starts at the
-  // CENTRE, and this walked left from there: at the ~880/13312 (6.6%) that was
-  // ready by this point it was dragging over uncomputed data by construction,
-  // and served 0 frames on CI and locally alike. Nothing to do with the drag.
-  //
-  // So: wait until a usable fraction has landed, then move the crosshair up
-  // into that band before measuring. The claim under test is "dragging over an
-  // ALREADY-COMPUTED region serves that region's frames", which needs the drag
-  // to actually be over one.
+  // The claim under test is "dragging over an ALREADY-COMPUTED region serves
+  // that region's frames", which needs the drag to actually be over one.
   // The batch is PARKED at ~35% by SPYDE_TEST_HOLD (see beforeAll and
   // backend/test_hold.py), so from here to the release below the partially
   // computed state is a fact rather than a race. Two earlier attempts at this
@@ -259,21 +306,64 @@ test('the vectors signal plot fills in while the batch is still running', async 
   // to a batch that had already finished (`batch still running: false`).
   await ctx.backend.waitForLog('[test-hold] fv-batch parked', 240_000)
 
-  // Aim into the COMPUTED band. The batch fills in nav order, so ~35% ready is
-  // the top ~35% of rows; the crosshair starts at the CENTRE, and walking left
-  // from there dragged over uncomputed data by construction — which is why
-  // `served` stayed 0 no matter how the drag was tuned.
-  const navBox = await vecNav.locator('iframe').first().boundingBox()
-  await dragCrosshair(page, vecNav, {
-    dx: 0, dy: -Math.round((navBox?.height ?? 300) * 0.35), steps: 1,
-  })
+  // AIM FROM THE BACKEND'S OWN READY MASK — never from a fill-direction guess.
+  // An earlier version dragged the crosshair UP into "the top rows", assuming
+  // the batch fills row-major. It does not: dispatch_chunks submits in
+  // column-BANDED order (_band_key: 2-row bands, left→right), the sped_ag
+  // chunk grid is uneven (2×5 — the bottom-row chunks are 2.2× smaller and
+  // finish first), and completion order is scheduler-jittered across the
+  // primed in-flight window. So the parked ready set differs run to run, and
+  // the up-then-left walk sometimes crossed NO computed chunk at all: served
+  // stayed 0 and five identical DP signatures followed — the designed
+  // last-good-frame behaviour for uncomputed positions, not a serving bug
+  // (that CI failure is what `declinedCount` now makes diagnosable).
+  //
+  // `test_aim_ready_position` REPORTS a target from the live preview's ready
+  // mask (the ground truth its slice function serves from) as a nav-index
+  // DELTA from the crosshair's current position, near the right end of the
+  // longest computed run so the leftward walk stays over computed data. It
+  // moves nothing: a previous version parked the crosshair from the backend
+  // and the press on the redrawn crosshair delivered NO pointer event at all
+  // (zero nav-dispatcher submits — the renderer's widget state and the
+  // backend's had come apart), which read as a serving bug and was not one.
+  // The whole drag below is mouse-driven from the crosshair the renderer
+  // actually drew, which is the path vectors_dp_follows_nav.spec.ts already
+  // proves works on this same window.
+  //
+  // FOCUS-RAISE FIRST (the z-order trap): the first pointerdown on an
+  // unfocused subwindow raises it and is NOT delivered to the iframe widget —
+  // so a walk whose press doubles as the focus click grabs nothing and the
+  // crosshair never moves (observed: the hover readout walked to [0, 43]
+  // while the crosshair stayed parked).
+  await vecNav.getByTestId('subwindow-title').click()
+  await backendAction(page, 'test_aim_ready_position')
+  await ctx.backend.waitForLog('[test-aim] walk target', 30_000)
+  const target = walkTarget()
+  expect(target, 'the backend did not report a ready walk target').not.toBeNull()
 
-  // Walk LEFT from there: the result window's right edge sits under the Plot
-  // Control dock, and a press that lands on the dock drives nothing.
+  // Nav index → page px, from the crosshair guide lines' own extent (they span
+  // the drawn image exactly, so that rect IS the navigator image on screen).
+  const geom = await crosshairAt(vecNav)
+  expect(geom, 'no crosshair found on the vectors navigator').not.toBeNull()
+  const pxPerCol = (geom!.x1 - geom!.x0) / target!.navW
+  const pxPerRow = (geom!.y1 - geom!.y0) / target!.navH
+  // Walk LEFT over the computed run, in 5 steps that each move at least a
+  // couple of nav columns (a sub-pixel step would repaint nothing).
+  const steps = 5
+  const colsPerStep = Math.max(
+    2, Math.floor(Math.min(target!.readyLeft - 2, 80) / steps))
+  const dxPx = -Math.max(3, Math.round(colsPerStep * pxPerCol))
+  // eslint-disable-next-line no-console
+  console.log('walk target:', JSON.stringify(target), 'px/col', pxPerCol.toFixed(2),
+              'px/row', pxPerRow.toFixed(2), 'step px', dxPx)
+
   const servedBefore = servedCount()
+  const declinedBefore = declinedCount()
   const dragSigs: number[] = []
   const walk = await dragCrosshair(page, vecNav, {
-    dx: -26, steps: 5,
+    dx: dxPx, steps,
+    seekDx: Math.round(target!.dix * pxPerCol),
+    seekDy: Math.round(target!.diy * pxPerRow),
     onStep: async (i: number) => {
       dragSigs.push((await figureSignature(vecSig)).sum)
       await page.screenshot({ path: join(SHOTS, `8${i}-drag-step-${i}.png`) })
@@ -282,22 +372,55 @@ test('the vectors signal plot fills in while the batch is still running', async 
 
   const stillRunning = !finalized()
   const servedAfter = servedCount()
+  const declinedAfter = declinedCount()
   await page.screenshot({ path: join(SHOTS, '90-drag-over-computed.png') })
   // eslint-disable-next-line no-console
   console.log('drag over computed region: crosshair moved', walk.moved, 'px',
               'signatures', JSON.stringify(dragSigs),
               'served', servedBefore, '→', servedAfter,
+              'declined', declinedBefore, '→', declinedAfter,
               'batch still running:', stillRunning)
+  if (servedAfter - servedBefore <= 0) {
+    // A zero-served drag has several distinct causes (reads declined, reads
+    // never ran, the preview torn down, the hold expired mid-test) that only
+    // the backend's own narration can tell apart — dump it before asserting.
+    // eslint-disable-next-line no-console
+    console.log('zero-served diagnostics:', JSON.stringify({
+      hold: logLines('[test-hold]').slice(-4),
+      aim: logLines('[test-aim]').slice(-3),
+      live: logLines('[live-signal]').slice(-8),
+      batch: logLines('[fv-batch]').slice(-4),
+    }, null, 1))
+  }
 
   // The guard the previous version of this spec lacked: if the crosshair never
-  // moved, everything below is measuring landing blocks, not the drag.
+  // moved, everything below is measuring landing blocks, not the drag. Scored
+  // against the walk this run actually asked for (the step size is derived from
+  // the reported ready run, so a fixed threshold would be arbitrary) — and half
+  // of it, not all, because the crosshair legitimately clamps at the image edge.
+  const askedPx = Math.hypot(
+    Math.round(target!.dix * pxPerCol) + dxPx * steps,
+    Math.round(target!.diy * pxPerRow))
   expect(walk.moved,
-    'the navigator crosshair never moved, so nothing about reading an '
-    + 'already-computed position was exercised').toBeGreaterThan(20)
+    `the navigator crosshair barely moved (${walk.moved.toFixed(1)} px of the `
+    + `${askedPx.toFixed(1)} px asked for), so nothing about reading an `
+    + 'already-computed position was exercised').toBeGreaterThan(askedPx / 2)
+  // Two failure modes, told apart BEFORE the real assertion: the backend
+  // counts every navigator read one way or the other (served or declined), so
+  // neither moving means the reads never reached the preview at all (a wedged
+  // dispatcher, a grab that missed) — a different bug from an aim that landed
+  // over uncomputed data (declined moves, served does not).
+  expect(
+    (servedAfter - servedBefore) + (declinedAfter - declinedBefore),
+    'no navigator read reached the live preview during the drag at all — the '
+    + 'read path was never exercised (this is NOT an aim/ready-region problem)',
+  ).toBeGreaterThan(0)
   // The backend answering navigator reads from its ready mask IS behaviour (b).
   expect(servedAfter - servedBefore,
-    'dragging the navigator over the computed region did not serve a single '
-    + 'frame from the already-computed vectors').toBeGreaterThan(0)
+    'dragging the navigator over the aimed READY region did not serve a single '
+    + `frame (declined ${declinedBefore} → ${declinedAfter}: the reads ran but `
+    + 'landed on uncomputed positions — the ready-mask aim failed)',
+  ).toBeGreaterThan(0)
   expect(new Set(dragSigs).size,
     `the diffraction pattern did not follow the navigator over the computed
      region (identical frames at every position): ${JSON.stringify(dragSigs)}`,

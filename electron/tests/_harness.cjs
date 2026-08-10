@@ -409,6 +409,15 @@ async function countColorPixels(page, kind) {
  * DELTA. A press anywhere else does nothing at all, silently — which is how a
  * spec can "pass" a navigate-and-observe assertion while the navigator never
  * moved and the picture only changed for unrelated reasons.
+ *
+ * Also returns the guide lines' own EXTENT (`x0,x1,y0,y1`, same iframe-relative
+ * CSS px, right/bottom exclusive): the crosshair spans the drawn image exactly,
+ * so that rectangle IS the navigator image's on-screen rect and
+ * `(x1-x0)/navWidth` is its px per nav column. That is the only honest way for
+ * a spec to convert a nav-index
+ * target into a pointer delta — the alternative, writing the widget from the
+ * backend and grabbing where it lands, desynchronises the renderer's own widget
+ * state and the press silently misses (see `_test_aim_ready_position`).
  */
 async function crosshairAt(win) {
   const ifel = await win.locator('iframe').first().elementHandle()
@@ -436,12 +445,19 @@ async function crosshairAt(win) {
       let bx = 0, by = 0
       for (let x = 1; x < c.width; x++) if (cols[x] > cols[bx]) bx = x
       for (let y = 1; y < c.height; y++) if (rows[y] > rows[by]) by = y
+      // The lines' full extent = the drawn image rect (see the doc note).
+      let gx0 = -1, gx1 = -1, gy0 = -1, gy1 = -1
+      for (let x = 0; x < c.width; x++) if (cols[x]) { if (gx0 < 0) gx0 = x; gx1 = x }
+      for (let y = 0; y < c.height; y++) if (rows[y]) { if (gy0 < 0) gy0 = y; gy1 = y }
       // Canvas backing store px → CSS px (devicePixelRatio makes them differ).
       const rect = c.getBoundingClientRect()
+      const sx = rect.width / c.width, sy = rect.height / c.height
       best = {
-        x: rect.left + (bx + 0.5) * (rect.width / c.width),
-        y: rect.top + (by + 0.5) * (rect.height / c.height),
+        x: rect.left + (bx + 0.5) * sx,
+        y: rect.top + (by + 0.5) * sy,
         green: total,
+        x0: rect.left + gx0 * sx, x1: rect.left + (gx1 + 1) * sx,
+        y0: rect.top + gy0 * sy, y1: rect.top + (gy1 + 1) * sy,
       }
     }
     return best
@@ -453,19 +469,32 @@ async function crosshairAt(win) {
  * `onStep(i)` after each move has had `settleMs` to paint. `dx`/`dy` are the
  * per-step offsets in page px.
  *
+ * `seekDx`/`seekDy` are an optional FIRST move made inside the same pointer-down,
+ * before the stepped walk, for a spec that must start the walk somewhere other
+ * than where the crosshair happens to sit. Doing it as part of the drag — rather
+ * than parking the crosshair from the backend first — is deliberate: the grab
+ * must hit-test against the renderer's own widget state, and a backend-side
+ * widget write is not guaranteed to be that state (a press on the redrawn
+ * crosshair delivered no pointer event at all; see `_test_aim_ready_position`).
+ *
  * Returns `{ start, end, moved }` (iframe-relative positions + the distance the
  * crosshair actually travelled) so the caller can ASSERT it moved — without
  * that guard a navigate-and-observe spec cannot tell a working navigator from a
  * press that missed.
  */
 async function dragCrosshair(page, win, { dx = -26, dy = 0, steps = 5,
+                                          seekDx = 0, seekDy = 0,
                                           settleMs = 450, onStep } = {}) {
   const box = await win.locator('iframe').first().boundingBox()
   const start = await crosshairAt(win)
   if (!box || !start) return { start: null, end: null, moved: 0 }
-  const gx = box.x + start.x, gy = box.y + start.y
-  await page.mouse.move(gx, gy)
+  const gx = box.x + start.x + seekDx, gy = box.y + start.y + seekDy
+  await page.mouse.move(box.x + start.x, box.y + start.y)
   await page.mouse.down()
+  if (seekDx || seekDy) {
+    await page.mouse.move(gx, gy, { steps: 6 })
+    await page.waitForTimeout(settleMs)
+  }
   for (let i = 1; i <= steps; i++) {
     await page.mouse.move(gx + dx * i, gy + dy * i, { steps: 3 })
     await page.waitForTimeout(settleMs)

@@ -420,11 +420,16 @@ class BaseSelector:
             return
         self.current_indices = indices
 
-        # Per-frame index trace — gated (fires on every move).
+        # Per-frame index trace — gated (fires on every move). The per-child
+        # update-function names answer "which function does this link dispatch
+        # to?", the first question when a display does not follow the drag.
         if _NAV_TIMING:
-            logger.debug("[NAV-IDX] %s indices=%s force=%s nchildren=%d multi=%s",
-                         type(self).__name__, np.asarray(indices).tolist(), force,
-                         len(self.children), self.multi_selector)
+            logger.debug("[NAV-IDX] %s id=%d indices=%s force=%s multi=%s "
+                         "children=%s",
+                         type(self).__name__, id(self),
+                         np.asarray(indices).tolist(), force, self.multi_selector,
+                         [(id(c), getattr(f, "__qualname__", repr(f)))
+                          for c, f in self.children.items()])
 
         for child, fn in self.children.items():
             try:

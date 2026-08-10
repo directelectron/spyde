@@ -302,20 +302,57 @@ class TestProgressiveSignalPreview:
         assert preview.ready_count == 8           # …but readiness still landed
         preview.close()
 
-    def test_user_drag_holds_off_the_sampler(self, window):
-        """A landing block must not yank the frame away from a user who is
-        dragging the navigator."""
+    def test_user_drag_latches_off_the_sampler_for_good(self, window):
+        """The first crosshair MOVE ends auto-sampling for the rest of the run.
+
+        Not a timed hold: a hold hands the panel back the moment the user pauses
+        to look at what they navigated to, which is exactly when it must not.
+        Here two blocks land well after the user's read (the throttle interval is
+        stepped over between them) and NEITHER may paint.
+        """
         session = window["window"]
         tree = _result_tree(session)
         store = LiveVectorFrames(sig_hw=(16, 16), kernel_radius_px=2)
         preview = attach_signal_preview(session, tree, render=store.render,
                                         nav_shape=(4, 5))
-        _nav_selector(tree).current_indices = np.array([[4, 0]])
-        preview.read_frame((0, 0))              # user read
-        sl = (slice(0, 2), slice(0, 2))
+        sel = _nav_selector(tree)
+        sel.current_indices = np.array([[4, 0]])
+        preview._last_index = (0, 0)
+        preview.read_frame((0, 1))                     # a MOVE: (0,0) → (0,1)
+        assert preview._user_owns is True
+
+        for iy in (0, 2):
+            sl = (slice(iy, iy + 2), slice(0, 2))
+            store.add(sl, _block(2, 2, 4, {(0, 0): [(4.0, 4.0, 9.0)]}))
+            preview._last_paint = 0.0                  # step over the throttle
+            preview.note_block(sl)
+        assert preview.blocks_seen == 2
+        assert preview.frames_painted == 0
+        assert preview.ready_count == 8                # the fill itself is unaffected
+        preview.close()
+
+    def test_a_refire_at_the_same_position_does_not_latch(self, window):
+        """Only a MOVE is user intent. The preview re-fires the parked selector
+        when a block lands under it, and the selector's settle timer re-fires at
+        a resting position — both are forced reads at an UNCHANGED index, and if
+        either latched, one block landing under a resting crosshair would end
+        auto-sampling without the user having touched anything."""
+        session = window["window"]
+        tree = _result_tree(session)
+        store = LiveVectorFrames(sig_hw=(16, 16), kernel_radius_px=2)
+        preview = attach_signal_preview(session, tree, render=store.render,
+                                        nav_shape=(4, 5))
+        sel = _nav_selector(tree)
+        sel.current_indices = np.array([[4, 0]])
+        preview._last_index = (0, 1)
+        for _ in range(3):
+            preview.read_frame((0, 1))                 # same position, repeatedly
+        assert preview._user_owns is False
+
+        sl = (slice(2, 4), slice(3, 5))
         store.add(sl, _block(2, 2, 4, {(0, 0): [(4.0, 4.0, 9.0)]}))
         preview.note_block(sl)
-        assert preview.frames_painted == 0
+        assert preview.frames_painted == 1             # auto-sampling still alive
         preview.close()
 
     def test_parked_navigator_refires_instead_of_sampling(self, window):
@@ -375,6 +412,246 @@ class TestProgressiveSignalPreview:
         assert preview.is_ready((99, 99)) is False
         assert preview.is_ready((0,)) is False
         preview.close()
+
+
+# ── the reader the navigator actually reads through ───────────────────────────
+
+class TestPinnedOnTheDispatchedRead:
+    """The preview must be the reader the signal plots' navigator read resolves,
+    not merely *a* reader on the tree.
+
+    This is the explanation the e2e failure was blamed on for a whole cycle: a
+    drag served nothing, and "the preview never reached the dragged link" was
+    the natural suspect. It was not — the drag never reached the backend at all
+    (the harness had parked the crosshair from the backend, and the press
+    hit-tested against a renderer state that no longer matched). Pinning the
+    routing here means that explanation can be RULED OUT next time instead of
+    investigated.
+    """
+
+    def test_the_signal_plots_read_through_the_preview(self, window):
+        session = window["window"]
+        tree = _result_tree(session)
+        preview = attach_signal_preview(session, tree, render=lambda i: None,
+                                        nav_shape=(4, 5))
+        assert tree.signal_plots, "the result window has no signal plot"
+        for plot in tree.signal_plots:
+            assert tree.reader_override_for(tree.root, plot) is preview
+        preview.close()
+
+    def test_a_real_dispatcher_read_serves(self, window):
+        """End to end through the selector: a forced update at a COMPUTED
+        position must come back through the preview with a frame."""
+        import time
+        from spyde.drawing.selectors.base_selector import _nav_dispatcher
+        session = window["window"]
+        tree = _result_tree(session)
+        store = LiveVectorFrames(sig_hw=(16, 16), kernel_radius_px=2)
+        preview = attach_signal_preview(session, tree, render=store.render,
+                                        nav_shape=(4, 5))
+        store.add((slice(2, 4), slice(0, 2)),
+                  _block(2, 2, 4, {(0, 1): [(6.0, 7.0, 4.0)]}))
+        preview.note_block((slice(2, 4), slice(0, 2)))
+
+        served0 = preview.frames_served
+        sel = _nav_selector(tree)
+        sel.get_selected_indices = lambda: np.array([[1, 2]])   # [[ix, iy]]
+        sel.delayed_update_data(force=True)
+        end = time.monotonic() + 5.0
+        while time.monotonic() < end and preview.frames_served == served0:
+            time.sleep(0.02)
+        assert preview.frames_served > served0, (
+            "a dispatcher read at a computed position did not reach the preview"
+        )
+        assert _nav_dispatcher is not None      # the read ran on the real lane
+        preview.close()
+
+
+# ── decline narration ─────────────────────────────────────────────────────────
+
+class TestDeclineNarration:
+    """A declined navigator read is narrated at INFO with cumulative counts —
+    the log-side counterpart of `reads_declined`, so a drag that serves NOTHING
+    is distinguishable in the captured log from a drag whose reads never ran
+    (the e2e spec's `declinedCount` parses this line, mirroring `servedCount`)."""
+
+    @staticmethod
+    def _decline_records(caplog):
+        return [r for r in caplog.records
+                if r.name == "spyde.actions.live_signal"
+                and "navigator read declined" in r.getMessage()]
+
+    def test_first_decline_always_logs_with_counts(self, window, caplog):
+        import logging
+        caplog.set_level(logging.INFO, logger="spyde.actions.live_signal")
+        session = window["window"]
+        tree = _result_tree(session)
+        store = LiveVectorFrames(sig_hw=(16, 16), kernel_radius_px=2)
+        preview = attach_signal_preview(session, tree, render=store.render,
+                                        nav_shape=(4, 5))
+        sel = _nav_selector(tree)
+
+        assert preview.read_frame((2, 1)) is None   # nothing computed
+        recs = self._decline_records(caplog)
+        assert len(recs) == 1
+        msg = recs[0].getMessage()
+        # WHERE the read landed + the parseable cumulative counts.
+        assert "(2, 1)" in msg
+        assert "0 served / 1 declined" in msg
+        preview.close()
+
+    def test_declines_are_throttled_but_counted(self, window, caplog):
+        import logging
+        caplog.set_level(logging.INFO, logger="spyde.actions.live_signal")
+        session = window["window"]
+        tree = _result_tree(session)
+        store = LiveVectorFrames(sig_hw=(16, 16), kernel_radius_px=2)
+        preview = attach_signal_preview(session, tree, render=store.render,
+                                        nav_shape=(4, 5))
+        sel = _nav_selector(tree)
+
+        preview.read_frame((2, 1))
+        preview.read_frame((2, 2))   # inside the throttle window
+        assert preview.reads_declined == 2
+        assert len(self._decline_records(caplog)) == 1   # narration throttled
+
+        # Once the throttle window has passed, the next decline narrates the
+        # CUMULATIVE count — the spec reads the last line, not a per-event sum.
+        preview._last_decline_log = 0.0
+        preview.read_frame((2, 3))
+        recs = self._decline_records(caplog)
+        assert len(recs) == 2
+        assert "3 declined" in recs[-1].getMessage()
+        preview.close()
+
+
+# ── the ready-mask aim (test_aim_ready_position) ──────────────────────────────
+
+class TestReadyWalkTarget:
+    """The pure target picker behind the `test_aim_ready_position` backend
+    action: near the right end of the longest ready run in one row (backed off
+    a quarter-run so the walk starts INSIDE the computed region, not on its
+    boundary), so a leftward crosshair walk of `ready_left` columns stays over
+    computed data."""
+
+    def test_nothing_ready_is_none(self):
+        from spyde.backend._session_testharness import _ready_walk_target
+        assert _ready_walk_target(np.zeros((4, 6), dtype=bool)) is None
+
+    def test_near_the_right_end_of_the_longest_run(self):
+        from spyde.backend._session_testharness import _ready_walk_target
+        mask = np.zeros((3, 10), dtype=bool)
+        mask[0, 1:4] = True         # run of 3
+        mask[2, 2:9] = True         # run of 7 — the winner
+        # right end 8, backed off 7//4=1 → start 7, 6 ready columns to its left
+        assert _ready_walk_target(mask) == (2, 7, 6)
+
+    def test_longest_run_within_a_row_wins_over_fragments(self):
+        from spyde.backend._session_testharness import _ready_walk_target
+        mask = np.zeros((2, 12), dtype=bool)
+        mask[0, 0:2] = True
+        mask[0, 5:9] = True         # longest single run (4) despite row 1's
+        mask[1, 0:3] = True         # larger total (3 + 3 = 6, runs of 3)
+        mask[1, 6:9] = True
+        assert _ready_walk_target(mask) == (0, 7, 3)
+
+    def test_full_row_backs_off_the_edge(self):
+        """A fully-ready row must NOT start the walk at the image's right edge:
+        the spec converts the target to screen pixels and rounds, so a start on
+        the boundary can land one column outside the computed region."""
+        from spyde.backend._session_testharness import _ready_walk_target
+        mask = np.zeros((2, 12), dtype=bool)
+        mask[1, :] = True           # run of 12, right end 11
+        assert _ready_walk_target(mask) == (1, 8, 9)   # backed off 12//4=3
+
+    def test_leading_stack_dims_collapse_to_index_zero(self):
+        from spyde.backend._session_testharness import _ready_walk_target
+        mask = np.zeros((3, 4, 6), dtype=bool)
+        mask[0, 1, 2:5] = True      # visible to the spatial aim (3//4=0 backoff)
+        mask[2, 3, 0:6] = True      # a later stack plane — ignored
+        assert _ready_walk_target(mask) == (1, 4, 3)
+
+
+class TestAimReadyPositionAction:
+    """`test_aim_ready_position` on a real result tree.
+
+    It REPORTS a walk target from the preview's ready mask — as a delta from
+    where the crosshair already is — and moves nothing. Moving the widget from
+    the backend is what the first version did, and the measured consequence was
+    that the e2e spec's press on the redrawn crosshair delivered no pointer
+    event at all: the renderer hit-tests against its OWN widget state, which a
+    backend-side write had left it disagreeing with. So "the action must not
+    touch the widget" is the contract, and these tests pin it.
+    """
+
+    @staticmethod
+    def _aim_records(caplog):
+        return [r for r in caplog.records if "[test-aim]" in r.getMessage()]
+
+    @staticmethod
+    def _prepared(session, caplog):
+        tree = _result_tree(session)
+        store = LiveVectorFrames(sig_hw=(16, 16), kernel_radius_px=2)
+        preview = attach_signal_preview(session, tree, render=store.render,
+                                        nav_shape=(4, 5))
+        sl = (slice(2, 4), slice(0, 2))
+        peaks = {(iy, ix): [(4.0, 4.0, 9.0)] for iy in range(2) for ix in range(2)}
+        store.add(sl, _block(2, 2, 4, peaks))
+        preview.note_block(sl)
+        return tree, preview
+
+    def test_reports_a_ready_target_as_a_delta(self, window, caplog):
+        import logging
+        caplog.set_level(logging.INFO)
+        session = window["window"]
+        tree, preview = self._prepared(session, caplog)
+        sel = _nav_selector(tree)
+        sel.current_indices = np.array([[3, 1]])       # crosshair at iy=1, ix=3
+
+        session.dispatch_action({"action": "test_aim_ready_position"})
+
+        aimed = [r for r in self._aim_records(caplog)
+                 if "walk target" in r.getMessage()]
+        assert aimed, f"no aim narration; got: {caplog.text[-1500:]}"
+        msg = aimed[0].getMessage()
+        # Ready block rows 2..3 × cols 0..1 → longest run right end = (2, 1).
+        assert "walk target iy=2 ix=1" in msg
+        assert "from iy=1 ix=3" in msg
+        # The DELTA is what the spec converts to a pointer move, plus the nav
+        # shape it needs for the index→pixel scale.
+        assert "dix=-2 diy=1" in msg
+        assert "nav 5x4" in msg
+        preview.close()
+
+    def test_moves_nothing(self, window, caplog):
+        """The whole point: no widget write, no dispatcher submit, no read."""
+        import logging
+        caplog.set_level(logging.INFO)
+        session = window["window"]
+        tree, preview = self._prepared(session, caplog)
+        sel = _nav_selector(tree)
+        cross = getattr(sel, "_crosshair_selector", sel)
+        inner = getattr(cross, "selector", cross)
+        w = getattr(inner, "_widget", None) or getattr(cross, "_widget", None)
+        before = (float(w.cx), float(w.cy)) if w is not None else None
+        served0, declined0 = preview.frames_served, preview.reads_declined
+
+        session.dispatch_action({"action": "test_aim_ready_position"})
+
+        if w is not None:
+            assert (float(w.cx), float(w.cy)) == before
+        assert (preview.frames_served, preview.reads_declined) == (served0,
+                                                                   declined0)
+        preview.close()
+
+    def test_without_a_preview_it_narrates_and_does_not_raise(self, window,
+                                                              caplog):
+        import logging
+        caplog.set_level(logging.INFO)
+        session = window["window"]
+        session.dispatch_action({"action": "test_aim_ready_position"})
+        assert any("no live signal preview" in r.getMessage()
+                   for r in self._aim_records(caplog))
 
 
 # ── the Find-Vectors wiring ───────────────────────────────────────────────────
@@ -491,6 +768,154 @@ class TestFindVectorsWiring:
         assert done
         assert getattr(session.signal_trees[-1], "_live_signal_preview",
                        None) is None
+
+
+class TestResultTreeIsLockedWhileFilling:
+    """The result tree is LOCKED for the duration of the batch — no actions, no
+    new nodes — and released when the vectors attach.
+
+    The lock is not housekeeping: it is what makes the preview's install-ONCE
+    snapshot of the navigator→signal links correct by construction, so the
+    interactive-fill read path needs no per-read re-check (which would put a
+    branch on the Live-Display nav read, CLAUDE.md §3).
+    """
+
+    @staticmethod
+    def _run_batch(session, tree, monkeypatch, compute):
+        import time
+        import spyde.actions.find_vectors_action as fva
+        monkeypatch.setattr(fva, "_do_compute_vectors", compute)
+        monkeypatch.setattr(fva, "emit_error", lambda *a, **k: None)
+        fva._start_batch(session, tree.signal_plots[0], tree,
+                         fva._coerce(dict(fva.DEFAULTS)))
+        for _ in range(400):
+            if len(session.signal_trees) > 1:
+                break
+            time.sleep(0.01)
+        return session.signal_trees[-1]
+
+    def test_locked_during_the_batch_and_released_after(self, stem_4d_dataset,
+                                                        monkeypatch,
+                                                        captured_messages):
+        import threading
+        import time
+        from spyde.actions.lifecycle import tree_lock
+        session = stem_4d_dataset["window"]
+        tree = session.signal_trees[0]
+        inside = threading.Event()
+        release = threading.Event()
+        seen: dict = {}
+
+        def fake_compute(src, p, **kw):
+            result_tree = session.signal_trees[-1]
+            seen["lock"] = tree_lock(result_tree)
+            # A node-add on the locked tree is REFUSED, and says why.
+            before = len(list(result_tree.walk()))
+            result_tree.add_node(result_tree.root, result_tree.root, "rebin")
+            seen["nodes_added"] = len(list(result_tree.walk())) - before
+            inside.set()
+            release.wait(10.0)
+            return None                       # no result → no finalize
+
+        result_tree = self._run_batch(session, tree, monkeypatch, fake_compute)
+        assert inside.wait(10.0), "the batch worker never ran"
+        assert seen["lock"] == "Find Diffraction Vectors"
+        assert seen["nodes_added"] == 0, "a node was added to a locked tree"
+        errs = [m for m in captured_messages if m.get("type") == "error"]
+        assert any("still computing" in m.get("text", "") for m in errs), \
+            f"the refusal was silent; errors were {errs}"
+
+        release.set()
+        end = time.monotonic() + 10.0
+        while time.monotonic() < end and tree_lock(result_tree) is not None:
+            time.sleep(0.02)
+        assert tree_lock(result_tree) is None, \
+            "the batch teardown left the result tree locked"
+        # …and now a node CAN be added.
+        before = len(list(result_tree.walk()))
+        result_tree.add_node(result_tree.root, result_tree.root, "rebin")
+        assert len(list(result_tree.walk())) == before + 1
+
+    def test_a_toolbar_action_is_refused_while_locked(self, stem_4d_dataset,
+                                                      captured_messages):
+        """The dispatch gate, on the path a toolbar click takes. Both dispatch
+        paths call the same helper, so this pins the wiring rather than the
+        rule (which `test_lifecycle.TestResultTreeLock` owns)."""
+        from spyde.actions.lifecycle import lock_tree, unlock_tree
+        session = stem_4d_dataset["window"]
+        tree = session.signal_trees[0]
+        plot = tree.signal_plots[0]
+        ran: list = []
+        lock_tree(tree, "Find Diffraction Vectors")
+        try:
+            session._dispatch_toolbar_action(plot, "Rebin", {})
+        finally:
+            unlock_tree(tree)
+        assert not ran
+        errs = [m for m in captured_messages if m.get("type") == "error"]
+        assert any("still computing" in m.get("text", "") for m in errs), \
+            f"the toolbar action was not refused; errors were {errs}"
+
+    def test_a_staged_action_is_refused_while_locked(self, stem_4d_dataset,
+                                                     captured_messages,
+                                                     monkeypatch):
+        from spyde.actions import registry
+        from spyde.actions.lifecycle import lock_tree, unlock_tree
+        session = stem_4d_dataset["window"]
+        tree = session.signal_trees[0]
+        plot = tree.signal_plots[0]
+        key = next(iter(registry.STAGED_HANDLERS))
+        ran: list = []
+        monkeypatch.setattr(registry, "resolve_staged",
+                            lambda name: lambda *a, **k: ran.append(name))
+        import spyde.backend._session_actions as sa
+        monkeypatch.setattr(sa, "resolve_staged", registry.resolve_staged)
+
+        lock_tree(tree, "Find Diffraction Vectors")
+        try:
+            session.dispatch_action({"action": key,
+                                     "window_id": plot.window_id,
+                                     "payload": {}})
+        finally:
+            unlock_tree(tree)
+        assert ran == [], f"staged handler {key!r} ran on a locked tree"
+
+        session.dispatch_action({"action": key, "window_id": plot.window_id,
+                                 "payload": {}})
+        assert ran == [key], "the staged handler stayed blocked after unlock"
+
+    def test_read_only_and_teardown_verbs_are_exempt(self, stem_4d_dataset,
+                                                     captured_messages,
+                                                     monkeypatch):
+        """`overlay_query` is fired by the RENDERER itself whenever the active
+        window changes, so gating it put an unrequested error in the status bar
+        on every progressive fill (observed) and left the dock's layer state
+        stale. Teardown verbs are exempt for the mirror reason: a lock that can
+        trap a caret open is worse than no lock."""
+        from spyde.actions import registry
+        from spyde.actions.lifecycle import lock_tree, unlock_tree
+        session = stem_4d_dataset["window"]
+        tree = session.signal_trees[0]
+        plot = tree.signal_plots[0]
+        ran: list = []
+        monkeypatch.setattr(registry, "resolve_staged",
+                            lambda name: lambda *a, **k: ran.append(name))
+        import spyde.backend._session_actions as sa
+        monkeypatch.setattr(sa, "resolve_staged", registry.resolve_staged)
+
+        lock_tree(tree, "Find Diffraction Vectors")
+        try:
+            for key in ("overlay_query", "fv_close", "movie_cancel"):
+                assert key in registry.STAGED_HANDLERS
+                session.dispatch_action({"action": key,
+                                         "window_id": plot.window_id,
+                                         "payload": {}})
+        finally:
+            unlock_tree(tree)
+        assert ran == ["overlay_query", "fv_close", "movie_cancel"]
+        assert not [m for m in captured_messages
+                    if m.get("type") == "error"
+                    and "still computing" in m.get("text", "")]
 
 
 class TestOrchestratorPlumbing:
