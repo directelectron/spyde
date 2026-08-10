@@ -43,9 +43,13 @@ def _block(ny, nx, n_slots, peaks):
     return arr
 
 
-def _result_tree(session, nav=(4, 5), sig=(16, 16)):
+def _result_tree(session, nav=(4, 5), sig=(16, 16), signal_type=None):
     """A Find-Vectors-shaped result tree: lazy zero placeholder + a count-map
-    navigator override, i.e. a real navigator + signal pair."""
+    navigator override, i.e. a real navigator + signal pair.
+
+    *signal_type* mirrors what ``_start_batch`` passes
+    (``spyde_diffraction_vectors_image``) — needed by anything asserting on the
+    vector toolbar gates, which key off that type."""
     import dask.array as da
     import hyperspy.api as hs
     from spyde.actions.commit import open_result_tree
@@ -56,8 +60,21 @@ def _result_tree(session, nav=(4, 5), sig=(16, 16)):
         da.zeros(shape, chunks=shape, dtype=np.float32)).as_lazy()
     nav_sig = hs.signals.BaseSignal(np.zeros(nav, dtype=np.float32)).T
     return open_result_tree(session, title="Preview", signal=sig_placeholder,
+                            signal_type=signal_type,
                             navigator_override=nav_sig,
                             selector_type=CrosshairSelector)
+
+
+def _tiny_vectors(nav=(4, 5), sig=(16, 16)):
+    """The smallest real :class:`SpyDEDiffractionVectors` — what ``_finalize``
+    attaches, for tests that need the ``requires_vectors`` gate to flip."""
+    flat = np.zeros((1, 6), dtype=np.float32)
+    flat[0] = (0, 0, 0.0, 0.0, -1.0, 1.0)
+    axes = [_AxisLite(scale=1.0, offset=0.0, size=sig[1]),
+            _AxisLite(scale=1.0, offset=0.0, size=sig[0])]
+    return SpyDEDiffractionVectors.from_arrays(
+        flat_buffer=flat, full_nav_shape=tuple(nav), sig_shape=tuple(sig),
+        sig_axes=axes, kernel_radius_px=2.0, kernel_radius_data=2.0)
 
 
 def _nav_selector(tree):
@@ -303,7 +320,9 @@ class TestProgressiveSignalPreview:
         preview.close()
 
     def test_user_drag_latches_off_the_sampler_for_good(self, window):
-        """The first crosshair MOVE ends auto-sampling for the rest of the run.
+        """A read at a new position ends auto-sampling for the rest of the run
+        — the BACKSTOP latch (a crosshair moved without a pointer event; the
+        primary latch is the pointer hook two tests below).
 
         Not a timed hold: a hold hands the panel back the moment the user pauses
         to look at what they navigated to, which is exactly when it must not.
@@ -353,6 +372,131 @@ class TestProgressiveSignalPreview:
         store.add(sl, _block(2, 2, 4, {(0, 0): [(4.0, 4.0, 9.0)]}))
         preview.note_block(sl)
         assert preview.frames_painted == 1             # auto-sampling still alive
+        preview.close()
+
+    def test_a_pointer_grab_latches_even_with_no_read_at_a_new_index(
+            self, window):
+        """THE latch: the TOUCH decides ownership, not what the read returns.
+
+        Reported symptom: "while the vectors are computing I can drag around,
+        but it still tries to update when I let go". Inferring ownership from
+        the reads leaves holes that all look like that — `_run_update`
+        short-circuits a repeat position, so a grab-and-release (or a drag that
+        comes back to where it started, or a release at the index the crosshair
+        was already on) produces NO read at a new index at all; the sampler
+        stayed live and the next landing block repainted the panel at exactly
+        the moment the user let go.
+
+        Here the selector is already committed at the position the pointer event
+        reports, so `_run_update` reads nothing — and ownership must still be
+        taken.
+        """
+        session = window["window"]
+        tree = _result_tree(session)
+        store = LiveVectorFrames(sig_hw=(16, 16), kernel_radius_px=2)
+        preview = attach_signal_preview(session, tree, render=store.render,
+                                        nav_shape=(4, 5))
+        sel = _nav_selector(tree)
+        sel._arm_settle = lambda: None            # no trailing timer in a test
+        pos = np.array([[1, 0]])
+        sel.get_selected_indices = lambda: pos
+        sel.current_indices = pos                 # already committed here
+        preview._last_index = (0, 1)               # the prepared (iy, ix) of pos
+        assert preview._user_owns is False
+
+        sel.update_data(object(), user=True)      # grab + release, no move
+        assert preview._user_owns is True, (
+            "a pointer event that produced no read left the sampler live — a "
+            "landing block will repaint the panel as the user lets go")
+
+        # …and the sampler really is off: a block landing elsewhere may not
+        # paint over what the user is looking at.
+        sl = (slice(2, 4), slice(3, 5))
+        store.add(sl, _block(2, 2, 4, {(0, 0): [(4.0, 4.0, 9.0)]}))
+        preview._last_paint = 0.0                 # step over the throttle
+        preview.note_block(sl)
+        assert preview.frames_painted == 0
+        assert preview.ready_count == 4           # the fill itself is unaffected
+        preview.close()
+
+    def test_only_a_pointer_event_counts_as_the_user(self, window):
+        """`interaction_hooks` fire for a POINTER-driven update and nothing
+        else. Every internal re-fire reaches `update_data`/`delayed_update_data`
+        without the flag — multiplot_manager wiring a new plot, the CSB width
+        change, the strain reference selector, the settle timer — and if any of
+        them counted, auto-sampling would end with nobody having touched
+        anything."""
+        session = window["window"]
+        tree = _result_tree(session)
+        store = LiveVectorFrames(sig_hw=(16, 16), kernel_radius_px=2)
+        preview = attach_signal_preview(session, tree, render=store.render,
+                                        nav_shape=(4, 5))
+        sel = _nav_selector(tree)
+        sel._arm_settle = lambda: None
+        pos = np.array([[1, 0]])
+        sel.get_selected_indices = lambda: pos
+        sel.current_indices = pos
+        fired: list = []
+        sel.interaction_hooks.append(fired.append)
+
+        sel.update_data()                         # programmatic
+        assert fired == []
+        assert preview._user_owns is False
+
+        sel.update_data(object(), user=True)      # a pointer event
+        # len, not identity: a CompositeSelector delegates `update_data` to its
+        # active sub-selector, which is the object the hook is handed.
+        assert len(fired) == 1
+        assert preview._user_owns is True
+        preview.close()
+
+    def test_close_unregisters_the_interaction_hook(self, window):
+        """The hook is the preview's alone — a closed preview must not stay
+        wired to a selector that outlives it."""
+        session = window["window"]
+        tree = _result_tree(session)
+        store = LiveVectorFrames(sig_hw=(16, 16), kernel_radius_px=2)
+        preview = attach_signal_preview(session, tree, render=store.render,
+                                        nav_shape=(4, 5))
+        sel = _nav_selector(tree)
+        assert preview.interaction_hook in sel.interaction_hooks
+        preview.close()
+        assert preview.interaction_hook not in sel.interaction_hooks
+
+    def test_release_over_an_uncomputed_position_paints_nothing(self, window):
+        """Letting go where the batch has not reached leaves the last good
+        frame up.
+
+        Two things fire on a release and NEITHER may paint: the selector's
+        settle re-fire (a FORCED read at the resting position — the preview
+        returns None for an uncomputed one, so `_run_update` paints nothing),
+        and the blocks that keep landing meanwhile (the sampler is off once the
+        user has touched the crosshair)."""
+        session = window["window"]
+        tree = _result_tree(session)
+        store = LiveVectorFrames(sig_hw=(16, 16), kernel_radius_px=2)
+        preview = attach_signal_preview(session, tree, render=store.render,
+                                        nav_shape=(4, 5))
+        sel = _nav_selector(tree)
+        sel._arm_settle = lambda: None
+        resting = np.array([[4, 3]])              # nav (iy=3, ix=4): uncomputed
+        sel.get_selected_indices = lambda: resting
+        sel.current_indices = resting
+        sel.update_data(object(), user=True)
+        assert preview._user_owns is True
+
+        # the settle re-fire's forced read at the resting position
+        child = tree.signal_plots[0]
+        assert preview.read_frame((3, 4)) is None
+        assert preview.reads_declined >= 1
+
+        painted = preview.frames_painted
+        sl = (slice(0, 2), slice(0, 2))
+        store.add(sl, _block(2, 2, 4, {(0, 0): [(4.0, 4.0, 9.0)]}))
+        preview._last_paint = 0.0
+        preview.note_block(sl)
+        assert preview.frames_painted == painted, \
+            "a landing block repainted the panel after the user let go"
         preview.close()
 
     def test_parked_navigator_refires_instead_of_sampling(self, window):
@@ -921,6 +1065,69 @@ class TestResultTreeIsLockedWhileFilling:
 
         restored = get_toolbar_config_for_plot(state)
         assert not any(a.get("disabled") for a in restored)
+
+    def test_requires_vectors_actions_are_greyed_not_hidden_while_locked(
+            self, window):
+        """The vector actions belong on the window their own batch is filling —
+        VISIBLE and disabled, not absent until it finishes.
+
+        ``requires_vectors`` gates on ``tree.diffraction_vectors``, which a
+        Find-Vectors run attaches only at ``_finalize``. On any OTHER signal
+        that gate means "this action does not apply to this data" and hiding is
+        right. On the result window it means "the result is still computing",
+        and hiding is wrong twice over: the user cannot tell that waiting will
+        bring the buttons back, and when it does they POP IN (measured in the
+        real app: 4 buttons during the fill, 7 after). The LOCK is what tells
+        the two cases apart — it is set exactly while a batch is filling this
+        tree — so it is the only thing that relaxes the gate.
+        """
+        from spyde import TOOLBAR_ACTIONS
+        from spyde.actions.lifecycle import (
+            attach_container, lock_tree, unlock_tree,
+        )
+        from spyde.drawing.toolbars.plot_control_toolbar import (
+            get_toolbar_config_for_plot,
+        )
+        session = window["window"]
+        tree = _result_tree(session,
+                            signal_type="spyde_diffraction_vectors_image")
+        state = tree.signal_plots[0].plot_state
+        gated = {n for n, meta in TOOLBAR_ACTIONS["functions"].items()
+                 if meta.get("requires_vectors")}
+        assert gated, "no requires_vectors action is declared any more"
+
+        # 1. UNLOCKED with no vectors → hidden, exactly as before.
+        free = {a["name"] for a in get_toolbar_config_for_plot(state)}
+        assert not (gated & free), (
+            "a requires_vectors action showed on an unlocked vectorless tree: "
+            f"{sorted(gated & free)}")
+
+        # 2. LOCKED with no vectors yet → shown, and disabled like every other
+        #    action on a locked tree.
+        lock_tree(tree, "Find Diffraction Vectors")
+        try:
+            locked = {a["name"]: a for a in get_toolbar_config_for_plot(state)}
+            missing = gated - set(locked)
+            assert not missing, (
+                "requires_vectors actions stayed HIDDEN on the window their own"
+                f" batch is filling: {sorted(missing)}")
+            for name in sorted(gated):
+                assert locked[name].get("disabled") is True, \
+                    f"{name!r} was shown ENABLED on a locked tree"
+                assert "Find Diffraction Vectors" in locked[name]["disabled_reason"]
+        finally:
+            # 3. attach + unlock, the order _finalize does it in.
+            attach_container(tree, _tiny_vectors(), name="diffraction_vectors")
+            unlock_tree(tree)
+
+        live = {a["name"]: a for a in get_toolbar_config_for_plot(state)}
+        assert not any(live[n].get("disabled") for n in gated), \
+            "the vector actions stayed greyed after the vectors attached"
+        # NO POP-IN is the whole point: finishing the batch changes `disabled`,
+        # never which buttons exist.
+        assert set(live) == set(locked), (
+            "the toolbar gained/lost buttons when the batch finished: "
+            f"+{sorted(set(live) - set(locked))} -{sorted(set(locked) - set(live))}")
 
     def test_locking_pushes_the_greyed_toolbar_immediately(
             self, stem_4d_dataset, captured_messages):

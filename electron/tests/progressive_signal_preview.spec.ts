@@ -429,24 +429,103 @@ test('the vectors signal plot fills in while the batch is still running', async 
     'the drag happened after the batch finished, so it proves nothing about '
     + 'reading a partially-computed result').toBeTruthy()
 
-  // ── (c) the window is CLOSED for business while it fills ──────────────────
+  // ── (c) LETTING GO over an uncomputed position paints nothing ─────────────
+  // The other half of "the panel is the user's": a release where the batch has
+  // not reached must leave their last good frame up. Two things fire on it —
+  // the selector's settle re-fire (a FORCED read at the resting position) and
+  // whatever blocks land meanwhile — and neither may repaint. The batch is
+  // still PARKED here, so this isolates the release itself; the blocks-landing
+  // half is pinned by test_progressive_signal_preview.py (the sampler is off
+  // once `interaction_hooks` has latched ownership).
+  const farRight = Math.round(geom!.x1 - 4)
+  const navBox = (await vecNav.locator('iframe').first().boundingBox())!
+  const held = await crosshairAt(vecNav)
+  await page.mouse.move(navBox.x + held!.x, navBox.y + held!.y)
+  await page.mouse.down()
+  await page.mouse.move(navBox.x + farRight, navBox.y + held!.y, { steps: 8 })
+  // Long enough for the last SERVED frame of the jump to have painted (the
+  // paint is decoupled onto the newest-wins painter thread) — otherwise the
+  // baseline is a frame that was still in flight and the check below reads its
+  // late arrival as a repaint caused by the release.
+  await page.waitForTimeout(1200)
+  // Without this the whole check is vacuous: a press that missed the crosshair
+  // leaves the DP unchanged for the trivial reason that nothing navigated.
+  const landed = await crosshairAt(vecNav)
+  expect(Math.abs(landed!.x - held!.x),
+    'the crosshair did not move for the release check, so nothing about '
+    + 'letting go over an uncomputed position was exercised').toBeGreaterThan(10)
+  const beforeRelease = await figureSignature(vecSig)
+  await page.mouse.up()
+  const afterRelease: number[] = []
+  for (let i = 0; i < 8; i++) {           // ~2.4 s, well past the settle re-fire
+    await page.waitForTimeout(300)
+    afterRelease.push((await figureSignature(vecSig)).sum)
+  }
+  await page.screenshot({ path: join(SHOTS, '93-after-release-uncomputed.png') })
+  // eslint-disable-next-line no-console
+  console.log('release over uncomputed: before', beforeRelease.sum,
+              'after', JSON.stringify(afterRelease),
+              'ownership lines:', JSON.stringify(
+                logLines("panel is the user's").map((l: string) =>
+                  /navigator (\w+)/.exec(l)?.[1])))
+  // The claim above is only isolated while the batch is PARKED — once blocks
+  // land again a repaint at the user's own position is legitimate (the
+  // parked-position refresh). Fail with THAT diagnosis rather than a confusing
+  // pixel mismatch if the hold's own 120 s budget ran out first.
+  expect(logLines('[test-hold] fv-batch timed out').length
+         + logLines('[test-hold] fv-batch released').length,
+    'the hold expired before the release check, so blocks were landing again '
+    + 'and this measures the fill, not the release').toBe(0)
+  expect(new Set([beforeRelease.sum, ...afterRelease]).size,
+    'the vectors DP repainted after the crosshair was released over a position '
+    + 'the batch has not computed — the last good frame must stay up '
+    + `(${beforeRelease.sum} → ${JSON.stringify(afterRelease)})`).toBe(1)
+  // "grabbed", specifically: ownership must come from the POINTER EVENT
+  // (`BaseSelector.interaction_hooks`), not from a read that happened to arrive
+  // at a new index. Only the pointer path is set the instant the crosshair is
+  // touched, which is what makes a drag entirely over uncomputed data — where
+  // every read declines — end the auto-sampler at all. ("driven to …" is the
+  // read-based backstop and would also appear here; matching only "grabbed"
+  // proves the hook is wired to the selector the user actually drags.)
+  expect(logLines('navigator grabbed').length,
+    'the preview never took ownership from the pointer event, so the '
+    + 'auto-sampler is still live and a landing block can repaint the panel out '
+    + 'from under the user'
+  ).toBeGreaterThan(0)
+
+  // ── (d) the window is CLOSED for business while it fills ──────────────────
   // The tree is locked for the duration of the batch (no actions, no new
   // nodes), which is what makes the preview's install-once link snapshot valid.
   // The backend refuses a click either way, but a button that looks clickable
   // and then errors is a worse app than one that shows it is unavailable — so
   // the toolbar config carries `disabled` while locked. The toolbar is
   // reveal-on-hover, hence the hover before looking.
+  await vecSig.getByTestId('subwindow-title').click()
   await vecSig.getByTestId('subwindow-titlebar').hover()
   const lockedBtn = vecSig.getByTestId(/^action-btn-/).first()
   await expect(lockedBtn).toBeVisible({ timeout: 10_000 })
   await page.screenshot({ path: join(SHOTS, '95-toolbar-greyed-while-filling.png') })
-  const lockedNames = await vecSig.getByTestId(/^action-btn-/).all()
-  for (const btn of lockedNames) {
+  const lockedButtons = await vecSig.getByTestId(/^action-btn-/).all()
+  const lockedNames: string[] = []
+  for (const btn of lockedButtons) {
+    lockedNames.push((await btn.getAttribute('data-testid'))!
+      .replace('action-btn-', ''))
     await expect(btn, 'a toolbar button stayed enabled on a window whose '
       + 'find-vectors batch is still filling it').toBeDisabled()
   }
   // eslint-disable-next-line no-console
-  console.log('toolbar while locked:', lockedNames.length, 'buttons, all disabled')
+  console.log('toolbar while locked:', JSON.stringify(lockedNames))
+  // The VECTOR actions belong here too — greyed, not absent. `requires_vectors`
+  // gates on the container `_finalize` attaches, which on THIS window means
+  // "still computing", not "wrong data"; hiding made them pop into existence
+  // when the batch finished (measured: 4 buttons during the fill, 7 after).
+  for (const name of ['Strain Mapping', 'Vector Orientation Mapping',
+                      'Vector Virtual Imaging']) {
+    expect(lockedNames,
+      `${name} was HIDDEN on the window its own find-vectors batch is filling `
+      + '— a requires_vectors action must be shown-and-greyed while the tree is '
+      + 'locked, so it un-greys instead of popping in').toContain(name)
+  }
 
   // Let the batch finish before the app closes (closing mid-batch wedges the
   // hidden backend's stdin tick — see find_vectors_workflow.spec.ts).
@@ -455,15 +534,30 @@ test('the vectors signal plot fills in while the batch is still running', async 
   await backendAction(page, 'test_hold_release', { name: 'fv-batch' })
   await ctx.backend.waitForLog('[fv-batch] finalized', 420_000)
 
-  // …and the lock RELEASES: the same buttons come back live once the vectors
-  // attach. (Asserted on the FIRST one only: the finished window also GAINS the
-  // requires_vectors actions, so the set is not the same set.)
+  // …and the lock RELEASES: the SAME buttons come back live once the vectors
+  // attach. The same SET, not merely the same first button — finishing the
+  // batch must change `disabled` and nothing else, or the toolbar reshuffles
+  // under the cursor at the moment the run ends.
   await vecSig.getByTestId('subwindow-titlebar').hover()
   await expect(vecSig.getByTestId(/^action-btn-/).first(),
     'the toolbar stayed greyed after the batch finished — the lock was not '
     + 'released, or its release did not re-send the toolbar config',
   ).toBeEnabled({ timeout: 30_000 })
   await page.screenshot({ path: join(SHOTS, '96-toolbar-restored.png') })
+  const finalButtons = await vecSig.getByTestId(/^action-btn-/).all()
+  const finalNames: string[] = []
+  for (const btn of finalButtons) {
+    finalNames.push((await btn.getAttribute('data-testid'))!
+      .replace('action-btn-', ''))
+    await expect(btn, 'a toolbar button stayed disabled after the vectors '
+      + 'attached').toBeEnabled()
+  }
+  // eslint-disable-next-line no-console
+  console.log('toolbar after finalize:', JSON.stringify(finalNames))
+  expect(finalNames.slice().sort(),
+    'the toolbar gained or lost buttons when the batch finished — the vector '
+    + 'actions must be present-and-greyed throughout and simply un-grey',
+  ).toEqual(lockedNames.slice().sort())
   await expect.poll(() => figureSignature(vecSig).then((s) => s.bright), {
     timeout: 30_000, message: 'the finalized vectors window is blank',
   }).toBeGreaterThan(0)
