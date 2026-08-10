@@ -87,7 +87,7 @@ interface DriftSaved {
 }
 const DEFAULTS: DriftSaved = {
   useRoi: false, method: 'rigid', band: 48,
-  upsample: 8, maxShift: 32, apodize: true, order: 1,
+  upsample: 8, maxShift: 0, apodize: true, order: 1,
   previewFrames: 2,
 }
 const _driftStore = new Map<number, DriftSaved>()
@@ -297,7 +297,7 @@ export function DriftWizard({ caretPos, windowId, sendAction, onClose }: Props) 
           <NumInput testid="drift-upsample" value={upsample} step="1" width={56}
             onChange={live(setUpsample)} />
         </Field>
-        <Field label="Max shift (px)">
+        <Field label="Max shift (0=auto)">
           <NumInput testid="drift-max-shift" value={maxShift} step="1" width={56}
             onChange={live(setMaxShift)} />
         </Field>

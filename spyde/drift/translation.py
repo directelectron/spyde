@@ -242,6 +242,25 @@ _WEIGHT_FLOOR = 1e-3
 #: Smallest alignment ROI worth correlating.
 _MIN_ROI = 16
 
+#: ``max_shift=0`` (or None) means AUTO: this fraction of the correlated region's
+#: shorter edge.
+#:
+#: A FIXED default is the bug this replaces. 32 px was chosen when the solver was
+#: a chain, where max_shift bounded the shift between CONSECUTIVE frames — always
+#: small. The banded solve bounds the shift across a PAIR up to `band` frames
+#: apart, and the ROI preview compares the movie's two ENDS, i.e. the entire
+#: excursion. On a real 245 x 4096² in-situ movie with 40 px of drift, 32 px
+#: masked out the true correlation peak and the solve returned a spurious one:
+#:
+#:     max_shift=32  ->  shift (-18.9, 1.4)   gain 0.92   (truth (-40, 20))
+#:     max_shift=64  ->  shift (-40.0, 20.0)  gain 2.10
+#:
+#: A gain below 1 means the "corrected" sum is WORSE than the raw one, which is
+#: exactly what a user sees and reports as the feature being broken. Scaling with
+#: the region keeps the lattice guard the parameter exists for (a quarter of the
+#: frame still rejects a wrong lattice translation) without capping real drift.
+_AUTO_MAX_SHIFT_FRACTION = 4
+
 
 # ── operator adapters ────────────────────────────────────────────────────────
 # The algorithm below is written once against this interface. `_TorchOps` is the
@@ -856,7 +875,7 @@ def solve_translation(
     data,
     *,
     upsample: int = 8,
-    max_shift: float | None = 32.0,
+    max_shift: float | None = None,
     min_shift: float | None = None,
     band: int = DEFAULT_BAND,
     roi: tuple[int, int, int, int] | None = None,
@@ -886,7 +905,9 @@ def solve_translation(
         not dilute it: the refinement target is scaled by the bin factor.
     max_shift
         Reject correlation peaks implying a larger RELATIVE shift between a pair,
-        in pixels. Guards against a spurious peak from a periodic lattice — the
+        in pixels. ``None`` or ``0`` means AUTO — a quarter of the correlated
+        region's shorter edge (:data:`_AUTO_MAX_SHIFT_FRACTION`), which is what
+        you want unless you are deliberately hunting a lattice ambiguity. Guards against a spurious peak from a periodic lattice — the
         failure mode where a crystalline sample locks onto the wrong lattice
         translation. NB this now bounds the shift between two frames at most
         ``band`` apart, not the total excursion, so it can be much tighter than
@@ -979,6 +1000,10 @@ def solve_translation(
     n_frames, get_frame, (full_h, full_w) = frame_source(data)
     crop = _validate_roi(roi, full_h, full_w)
     src_h, src_w = (full_h, full_w) if crop is None else (crop[2], crop[3])
+    if max_shift is None or float(max_shift) <= 0:
+        # AUTO — see _AUTO_MAX_SHIFT_FRACTION. Derived from the region actually
+        # correlated (the ROI when there is one), not the full frame.
+        max_shift = float(min(src_h, src_w) // _AUTO_MAX_SHIFT_FRACTION)
     binf = _bin_factor(src_h, src_w, corr_size, max_shift)
     gh, gw = src_h // binf, src_w // binf
     ops = _resolve_ops(device)

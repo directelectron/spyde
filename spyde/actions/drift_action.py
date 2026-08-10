@@ -278,7 +278,7 @@ DEFAULTS: dict[str, Any] = dict(
     use_roi=False,
     method="rigid",
     upsample=8,
-    max_shift=32.0,
+    max_shift=0.0,          # 0 = auto, see translation._AUTO_MAX_SHIFT_FRACTION
     band=48,
     apodize=True,
     order=1,
@@ -372,8 +372,9 @@ class DriftWizard(WizardController):
             "min": 1, "max": 64, "tab": "Advanced",
         },
         "max_shift": {
-            "name": "Max shift (px)", "type": "float", "default": DEFAULTS["max_shift"],
-            "min": 1.0, "max": 4096.0, "step": 1.0, "tab": "Advanced",
+            "name": "Max shift (px, 0=auto)", "type": "float",
+            "default": DEFAULTS["max_shift"],
+            "min": 0.0, "max": 8192.0, "step": 1.0, "tab": "Advanced",
         },
         "apodize": {
             "name": "Edge taper", "type": "bool", "default": DEFAULTS["apodize"],
@@ -892,7 +893,7 @@ def _coerce(payload: dict | None) -> dict:
         p["method"] = DEFAULTS["method"]
     p["band"] = int(min(200, max(1, p["band"])))
     p["upsample"] = max(1, int(p["upsample"]))
-    p["max_shift"] = max(1.0, float(p["max_shift"]))
+    p["max_shift"] = max(0.0, float(p["max_shift"]))
     p["order"] = int(min(3, max(0, p["order"])))
     p["preview_frames"] = int(min(200, max(2, p["preview_frames"])))
     return p
