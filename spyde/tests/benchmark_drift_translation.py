@@ -105,16 +105,26 @@ def make_movie(size: int, frames: int, dose: float, amp: float, seed: int = 0):
     fx = np.fft.fftfreq(size)[None, :]
     F = np.fft.fft2(base)
     rng = np.random.default_rng(seed + 99)
-    mm = np.memmap(path, np.uint16, "w+", shape=(frames, size, size))
+    # Build under a .partial name and rename at the end. `np.memmap(mode="w+")`
+    # allocates the WHOLE file up front, so a synthesis interrupted half-way
+    # leaves a file of exactly the right size whose tail is zeros — and the reuse
+    # check above is a size check, so the next run would benchmark against a movie
+    # that is half black and report it as real. A 4 GB synthesis takes ten minutes;
+    # interrupting one is not a hypothetical.
+    tmp = path + ".partial"
+    mm = np.memmap(tmp, np.uint16, "w+", shape=(frames, size, size))
     t0 = time.perf_counter()
-    for i, (dy, dx) in enumerate(truth):
-        img = np.real(np.fft.ifft2(F * np.exp(-2j * np.pi * (-dy * fy + -dx * fx))))
-        np.clip(img, 0.0, None, out=img)
-        mm[i] = np.minimum(rng.poisson(dose * img), 65535).astype(np.uint16)
-        if (i + 1) % 25 == 0:
-            print(f"    {i + 1}/{frames}  {time.perf_counter() - t0:.0f}s")
-    mm.flush()
-    del mm
+    try:
+        for i, (dy, dx) in enumerate(truth):
+            img = np.real(np.fft.ifft2(F * np.exp(-2j * np.pi * (-dy * fy + -dx * fx))))
+            np.clip(img, 0.0, None, out=img)
+            mm[i] = np.minimum(rng.poisson(dose * img), 65535).astype(np.uint16)
+            if (i + 1) % 25 == 0:
+                print(f"    {i + 1}/{frames}  {time.perf_counter() - t0:.0f}s")
+        mm.flush()
+    finally:
+        del mm
+    os.replace(tmp, path)
     return np.memmap(path, np.uint16, "r", shape=(frames, size, size)), truth
 
 
