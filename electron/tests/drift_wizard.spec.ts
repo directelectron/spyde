@@ -4,7 +4,7 @@
  * `metadata.Spyde.synthetic`).
  *
  * What this proves that tsc + headless tests cannot:
- *   1. The caret's default face is SMALL (plan §0.9a) — two toggles, one
+ *   1. The caret's default face is SMALL (plan §0.9a) — one toggle, one
  *      readout, one button, and a collapsed Advanced. The count is asserted,
  *      not eyeballed, because "too many options" is exactly what regressed.
  *   2. The discovery loop is real: a draggable box on the movie, a live
@@ -28,7 +28,7 @@ test.setTimeout(300_000)
 
 /** Every interactive control the caret shows by default. If this list grows,
  *  §0.9a has been walked back and the review comment applies again. */
-const FACE = ['drift-use-roi', 'drift-reject', 'drift-solve', 'drift-advanced-toggle']
+const FACE = ['drift-use-roi', 'drift-solve', 'drift-advanced-toggle']
 
 test.beforeAll(async () => {
   mkdirSync(SHOTS, { recursive: true })
@@ -47,7 +47,7 @@ test.afterAll(async () => {
   await ctx?.app?.close()
 })
 
-test('the caret opens small: 2 toggles, 1 button, Advanced collapsed', async () => {
+test('the caret opens small: 1 toggle, 1 button, Advanced collapsed', async () => {
   const { page } = ctx
   const sig = sigWindow(page)
   await sig.getByTestId('subwindow-title').click()
@@ -70,7 +70,7 @@ test('the caret opens small: 2 toggles, 1 button, Advanced collapsed', async () 
   for (const id of FACE) await expect(page.getByTestId(id)).toBeVisible()
   await expect(page.getByTestId('drift-advanced')).toHaveCount(0)
   // Everything algorithmic is behind the disclosure.
-  for (const id of ['drift-reference', 'drift-upsample', 'drift-max-shift',
+  for (const id of ['drift-band', 'drift-upsample', 'drift-max-shift',
     'drift-order', 'drift-tab-rigid', 'drift-apodize']) {
     await expect(page.getByTestId(id)).toHaveCount(0)
   }

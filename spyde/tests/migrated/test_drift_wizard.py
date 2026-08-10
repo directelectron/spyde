@@ -795,15 +795,20 @@ class TestSchema:
             assert stage in STAGED_HANDLERS
             assert callable(resolve_staged(stage))
 
-    def test_the_default_face_is_two_toggles(self):
+    def test_the_default_face_is_one_toggle(self):
         """§0.9a: everything that is not the task itself is tagged Advanced, so
         any host renders the same small face. The caret is the enforcement; this
-        is the schema saying the same thing."""
+        is the schema saying the same thing.
+
+        It was TWO toggles until the second one, ``reject_outliers``, lost its
+        backing: the solver's bad-frame gate is gone and robustness is now a
+        property of the least-squares solve (``spyde/drift/translation.py``), so
+        there is nothing left there for the user to switch.
+        """
         from spyde.actions import registry
         schema = registry.wizard_parameters("drift")
         face = [k for k, s in schema.items() if not s.get("tab")]
-        assert face == ["use_roi", "reject_outliers"], \
-            f"the caret's default face grew to {face}"
+        assert face == ["use_roi"], f"the caret's default face grew to {face}"
 
     def test_toolbar_entry_gates_on_a_movie(self):
         import spyde
@@ -848,8 +853,13 @@ class TestCoercion:
     def test_unknown_method_falls_back(self):
         assert dr._coerce({"method": "warp"})["method"] == dr.DEFAULTS["method"]
 
-    def test_unknown_reference_falls_back(self):
-        assert dr._coerce({"reference": "later"})["reference"] == "running"
+    def test_band_is_clamped(self):
+        """Replaces ``test_unknown_reference_falls_back``: there is no reference
+        mode to fall back to any more, and ``band`` is the parameter a bad payload
+        can now put out of range — 0 pairs per frame would leave the solve with
+        nothing to solve."""
+        assert dr._coerce({"band": 0})["band"] == 1
+        assert dr._coerce({"band": 9999})["band"] == 200
 
     def test_order_is_clamped(self):
         assert dr._coerce({"order": 9})["order"] == 3
