@@ -163,6 +163,13 @@ def get_toolbar_actions_for_plot(
     """
     Build the action metadata lists for a given PlotState by filtering TOOLBAR_ACTIONS.
 
+    RESOLVES the action functions (importing their modules), so this is the
+    "what would actually run" view. What the renderer DRAWS comes from
+    :func:`get_toolbar_config_for_plot`, which additionally knows about the
+    result-tree compute lock — while a tree is locked that one shows the
+    ``requires_vectors`` actions greyed instead of hiding them. Nothing here
+    needs that: a locked tree refuses every action before it is resolved.
+
     Returns
     -------
     (functions, icons, names, toolbar_sides, toggles, parameters, sub_toolbars, setup_functions)
@@ -282,10 +289,30 @@ def get_toolbar_actions_for_plot(
     return functions, icons, names, toolbar_sides, toggles, parameters, sub_toolbars, setup_functions
 
 
-def _action_matches_plot(action: str, meta: dict, plot_state: "PlotState") -> bool:
+def _action_matches_plot(action: str, meta: dict, plot_state: "PlotState",
+                         *, locked: bool = False) -> bool:
     """Apply the same signal_type / dimension / vectors filters used to decide
     whether an action is offered for a plot — WITHOUT importing the action's
-    function module (so toolbar rendering never depends on heavy action code)."""
+    function module (so toolbar rendering never depends on heavy action code).
+
+    *locked* is "this plot's tree is being filled by a progressive compute"
+    (``lifecycle.tree_lock``). It relaxes ONE gate — ``requires_vectors`` —
+    because that gate cannot, on its own, tell "this action does not apply to
+    this data" from "the result it needs is still computing". On the window a
+    Find-Vectors batch is filling, the answer is always the latter: the tree
+    already carries ``signal_type: spyde_diffraction_vectors_image``, so the
+    vector actions match everything EXCEPT the container that attaches at
+    ``_finalize``. Left as-is they popped into existence when the batch
+    finished; with this they are SHOWN and DISABLED for the whole fill (the
+    caller stamps ``disabled`` on every action of a locked tree) and simply
+    un-grey when the container lands — no pop-in. (A CANCELLED or failed batch
+    unlocks with no container, so they disappear again — correctly: that window
+    really has no vectors, which is the "does not apply" case the gate is for.)
+
+    Every other gate stays absolute while locked: a lock never makes an action
+    appear on data it does not apply to (wrong signal_type, wrong dimension,
+    a missing optional package).
+    """
     signal_types = meta.get("signal_types")
     exclude_signal_types = meta.get("exclude_signal_types")
     signal_class = meta.get("signal_class")
@@ -306,7 +333,7 @@ def _action_matches_plot(action: str, meta: dict, plot_state: "PlotState") -> bo
             signal_class is None
             or isinstance(signal, _resolve_signal_class(signal_class))
         )
-        and (not requires_vectors or has_vectors)
+        and (not requires_vectors or has_vectors or locked)
         and _has_original_metadata(signal, meta.get("requires_original_metadata"))
         and _packages_present(meta)
         and (plot_state.dimensions in plot_dim)
@@ -329,15 +356,21 @@ def get_toolbar_config_for_plot(plot_state: "PlotState") -> list[dict]:
 
     Actions carry ``disabled`` (+ ``disabled_reason``) while this plot's tree is
     LOCKED by a progressive compute (``lifecycle.lock_tree``). Disabled rather
-    than HIDDEN, unlike the `requires_vectors` family: those gates say "this
-    action does not apply to this data", where the lock says "not yet" — a
-    button that vanishes and comes back reads as a glitch, and the user cannot
-    tell that waiting will bring it back. Every toolbar action is disabled,
-    because ``_dispatch_toolbar_action`` refuses every one of them on a locked
-    tree; the ``registry.is_lock_exempt`` carve-out is for STAGED verbs, which
-    are caret-internal and never appear here. The refusal stays as the backstop
-    — a renderer holding a stale config must not be able to land a node on a
-    locked tree.
+    than HIDDEN: hiding says "this action does not apply to this data", where
+    the lock says "not yet" — a button that vanishes and comes back reads as a
+    glitch, and the user cannot tell that waiting will bring it back. Every
+    toolbar action is disabled, because ``_dispatch_toolbar_action`` refuses
+    every one of them on a locked tree; the ``registry.is_lock_exempt`` carve-out
+    is for STAGED verbs, which are caret-internal and never appear here. The
+    refusal stays as the backstop — a renderer holding a stale config must not
+    be able to land a node on a locked tree.
+
+    The lock also **widens** the set: while locked, ``requires_vectors`` actions
+    are included (and disabled like everything else) instead of being filtered
+    out. See ``_action_matches_plot`` — on a filling Find-Vectors window that
+    gate is answering "the result is still computing", not "wrong data", and the
+    two must not look the same. When the container attaches the same buttons
+    simply un-grey.
     """
     from spyde.actions.lifecycle import tree_lock
     lock_label = tree_lock(getattr(plot_state.plot, "signal_tree", None))
@@ -345,7 +378,8 @@ def get_toolbar_config_for_plot(plot_state: "PlotState") -> list[dict]:
     actions = []
     for action, meta in TOOLBAR_ACTIONS["functions"].items():
         try:
-            if not _action_matches_plot(action, meta, plot_state):
+            if not _action_matches_plot(action, meta, plot_state,
+                                        locked=bool(lock_label)):
                 continue
         except Exception:
             continue

@@ -126,10 +126,14 @@ invoker, the staged dispatch and `BaseSignalTree.add_node` /
 rather than no-op'ing silently. Any NEW path that adds a node or runs an
 action must call it too. The toolbar shows it: every action descriptor
 carries `disabled` + `disabled_reason` while locked (DISABLED, not hidden —
-`requires_vectors` hides because the action does not apply to the data, where
-the lock means "not yet"), and lock/unlock re-send the config for every plot
-of the tree so the buttons grey at the START of the fill and restore at the
-end. The backend refusal stays as the backstop. Read-only re-emits and
+hiding says "does not apply to this data", where the lock says "not yet"),
+and lock/unlock re-send the config for every plot of the tree so the buttons
+grey at the START of the fill and restore at the end. The lock also relaxes
+one gate: `requires_vectors` actions are SHOWN (and disabled) while locked
+instead of filtered out, because on the window a Find-Vectors batch is filling
+that gate is answering "the container attaches at `_finalize`", not "wrong
+data" — hiding made them pop into existence when the run ended. The backend
+refusal stays as the backstop. Read-only re-emits and
 teardown verbs
 (`*_query`/`*_close`/`*_stop`/`*_cancel`) are exempt — `registry.
 is_lock_exempt`: the renderer fires `overlay_query` itself on focus changes,
