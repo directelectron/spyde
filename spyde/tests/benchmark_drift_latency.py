@@ -140,7 +140,37 @@ def main(argv=None) -> int:
         wiz = tree._drift_wizard
         _wait(lambda: wiz.preview is not None, what="the first ROI preview")
 
-        print("\n── drift_run (Correct Drift) ──")
+        print("\n-- drag: per-step live preview cost --")
+        import spyde.actions.drift_action as _dr
+
+        class _B:
+            """Stand-in for the anyplotlib rectangle widget: the wizard only ever
+            reads x/y/w/h off it, so a drag is just moving those numbers."""
+
+            def __init__(self, x, y, e):
+                self.x, self.y = float(x), float(y)
+                self.w = self.h = float(e)
+
+            def set(self, **kw):
+                for k, v in kw.items():
+                    setattr(self, k, float(v))
+
+        edge = wiz.box_size()
+        fh, fw = wiz._frame_shape
+        steps = []
+        for k in range(60):                  # a 60-step drag across the field
+            wiz._roi_widget = _B((k * 7) % max(1, fw - edge),
+                                 (k * 5) % max(1, fh - edge), edge)
+            t = time.perf_counter()
+            _dr._preview_step(wiz)
+            steps.append((time.perf_counter() - t) * 1e3)
+        steps.sort()
+        med, p95 = steps[len(steps) // 2], steps[int(len(steps) * 0.95)]
+        drag_ms = p95
+        print(f"  box {edge}x{edge}  frames {len(wiz._preview_cache)}   "
+              f"median {med:.1f} ms   p95 {p95:.1f} ms   max {steps[-1]:.1f} ms")
+
+        print("\n-- drift_run (Correct Drift) --")
         dr.drift_run(session, plot, {"upsample": 8, "max_shift": 32})
         _wait(lambda: wiz.model is not None, what="the solve")
 
@@ -164,6 +194,18 @@ def main(argv=None) -> int:
         bad = []
         print("")
         print("budget check")
+        # A drag step must fit inside a frame at ~30 fps, judged at p95 because
+        # that is the one a user feels as a stutter.
+        _drag_budget = 33.0
+        _ok = drag_ms <= _drag_budget
+        print(f"  {'drag step p95':<16} {drag_ms:8.1f} ms   budget "
+              f"{_drag_budget:8.1f} ms   {'ok' if _ok else 'OVER'}")
+        if not _ok:
+            bad.append("drag_step")
+        # A drag step must fit inside a frame at ~30 fps, measured at p95 because
+        # that is the one a user feels as a stutter.
+        _drag_budget = 33.0
+        _ok = drag_ms <= _drag_budget
         for label, limit in budgets.items():
             got = worst.get(label)
             if got is None:

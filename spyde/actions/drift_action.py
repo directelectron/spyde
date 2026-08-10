@@ -195,16 +195,16 @@ def _figure_geometry(width: int = _FIG_WIDTH) -> tuple[tuple[int, int], float]:
     return (w, _FIG_HEIGHT), w / float(_FIG_HEIGHT)
 
 
-#: Frames the discovery preview aligns. ~20 is the brief's number and it is a
-#: DEFAULT, not a law — ``preview_frames`` in Advanced moves it.
+#: Frames the LIVE preview aligns. TWO, for the same reason the check image uses
+#: two: the preview has to finish inside a drag frame, and the frame count is the
+#: only term that scales.
 #:
-#: Sampled EVENLY OVER THE WHOLE MOVIE, not the first 20 in a row. The question
-#: a preview answers is "does this landmark survive the FULL excursion", and 20
-#: consecutive frames of a 3000-frame movie drift by almost nothing — a
-#: contiguous window would answer "looks fine" for every box, including the
-#: useless ones. The same reasoning (and the same spacing) as
-#: :meth:`DriftWizard.sum_indices`.
-_PREVIEW_FRAMES = 20
+#: Sampled at the ENDS of the movie, not consecutively. The question a preview
+#: answers is "does this landmark survive the full excursion", and two adjacent
+#: frames of a long movie have drifted by almost nothing — they would report a
+#: flattering gain for every box, including the useless ones. First and last is
+#: where the drift is largest and the box is most likely to have lost the feature.
+_PREVIEW_FRAMES = 2
 
 #: Byte ceiling on the preview's retained crop stack. The preview reads one
 #: FULL frame at a time and keeps only the (usually small) ROI crop, so this
@@ -221,11 +221,35 @@ _PREVIEW_MAX_BYTES = 192 * 1024 * 1024
 #: debouncing twice just adds latency.
 _PREVIEW_SETTLE_S = 0.25
 
+#: Minimum gap between live preview repaints, seconds. The dispatcher coalesces
+#: the COMPUTE; this bounds the PAINT, which is two 512² images plus a message
+#: down the PLOTAPP line protocol. ~20/s is past the point a dragging eye can
+#: tell, and the resting update bypasses it so the final box is never stale.
+_PREVIEW_EMIT_INTERVAL = 0.05
+
+#: Target edge for the preview's two display images. They sit in ~170 px panels,
+#: and building them at the box's full 512 costs 46 ms of a 57 ms step — six
+#: times the solve it exists to illustrate.
+_PREVIEW_DISPLAY_PX = 256
+
 #: Smallest alignment box, in image pixels. MUST stay >= the solver's own
 #: ``spyde.drift.translation._MIN_ROI``, which REJECTS a smaller box rather
 #: than clamping it (a silently shrunk ROI would correlate somewhere the user
 #: did not drag). Pinned by ``test_drift_wizard.py``.
 _ROI_MIN_PX = 16
+
+#: The alignment box is a FIXED 512x512, and being fixed is the feature.
+#:
+#: A resizable ROI makes the preview cost unbounded — a box the size of the frame
+#: is a full-frame solve on every drag step — and the preview only earns its place
+#: if it keeps up with the cursor. Pinning the size turns "how expensive is this
+#: preview?" from a question about user input into a constant, which is what lets
+#: the update run per drag frame instead of after a settle.
+#:
+#: 512 is also a comfortable landmark: big enough to contain a fiducial and to
+#: survive the drift excursion moving through it, small enough that a two-frame
+#: solve at this size is a few milliseconds.
+_ROI_BOX_PX = 512
 
 #: Default alignment box: this fraction of each frame dimension, centred. Half
 #: the frame is deliberately generous — the ROI is FIXED in frame coordinates,
@@ -260,6 +284,65 @@ DEFAULTS: dict[str, Any] = dict(
     order=1,
     preview_frames=_PREVIEW_FRAMES,
 )
+
+
+class _PreviewDriver:
+    """Runs the live ROI preview on the SHARED navigator dispatcher.
+
+    Reuses ``base_selector._nav_dispatcher`` rather than growing a second serial
+    lane, and reuses it UNMODIFIED: the dispatcher is duck-typed on
+    ``_run_update``, so an object that offers one is a first-class citizen there.
+    What it gives us is exactly what a drag needs and what CLAUDE.md Live-Display
+    §2 says not to rebuild — ONE serial worker, latest-position-wins coalescing
+    (a newer box replaces a queued older one before it is ever computed), and no
+    lock anywhere. Every alternative to that pattern is documented as having made
+    things worse.
+
+    The compute is deliberately tiny so occupying the shared lane is not rude:
+    during a drag the MOVIE does not change, only the box, so the frames are read
+    once into ``wizard._preview_cache`` and each step is a crop plus a two-frame
+    solve on already-resident pixels.
+
+    Paint and emit are marshalled to the main thread (README §6); only the
+    arithmetic runs here.
+    """
+
+    __slots__ = ("_wiz",)
+
+    def __init__(self, wizard) -> None:
+        self._wiz = wizard
+
+    def submit(self, force: bool = False) -> None:
+        from spyde.drawing.selectors.base_selector import _nav_dispatcher
+        if not self._wiz._closed:
+            _nav_dispatcher.submit(self, force=force)
+
+    def _run_update(self, force: bool = False, **_kw) -> None:
+        wiz = self._wiz
+        if wiz._closed:
+            return
+        try:
+            result = _preview_step(wiz)
+        except Exception as exc:
+            log.debug("[drift] live preview step failed: %s", exc)
+            return
+        if result is None or wiz._closed:
+            return
+        result["force"] = bool(force)
+        wiz.preview = result
+        now = time.monotonic()
+        # The dispatcher already dropped every superseded BOX; this only stops
+        # the wire carrying more repaints than an eye resolves. `force` on the
+        # resting update guarantees the final position always lands.
+        if not result.get("force") and                 now - wiz._last_preview_emit < _PREVIEW_EMIT_INTERVAL:
+            return
+        wiz._last_preview_emit = now
+        dispatch = getattr(wiz.session, "_dispatch_to_main", None)
+        if dispatch is None:
+            _publish_preview(wiz, result)
+        else:
+            dispatch(lambda r=result: (None if wiz._closed
+                                       else _publish_preview(wiz, r)))
 
 
 class DriftWizard(WizardController):
@@ -302,7 +385,7 @@ class DriftWizard(WizardController):
         },
         "preview_frames": {
             "name": "Preview frames", "type": "int",
-            "default": DEFAULTS["preview_frames"], "min": 4, "max": 200,
+            "default": DEFAULTS["preview_frames"], "min": 2, "max": 200,
             "tab": "Advanced",
         },
     }
@@ -328,6 +411,15 @@ class DriftWizard(WizardController):
         self._frame_shape: tuple[int, int] | None = None
         self._settle: threading.Timer | None = None
         self.preview: dict[str, Any] | None = None
+        #: Frames the live preview crops from, read ONCE. During a drag the movie
+        #: does not change — only the box moves — so re-reading per step would be
+        #: paying repeatedly for identical bytes. Bounded by _PREVIEW_FRAMES.
+        self._preview_cache: list[np.ndarray] | None = None
+        self._preview_driver = _PreviewDriver(self)
+        #: Rate-limit for the live emit/paint; the COMPUTE is coalesced by the
+        #: dispatcher, this only stops the wire from carrying more repaints than
+        #: a human can see.
+        self._last_preview_emit = 0.0
         #: Cancel flag of the solve in flight (Discard/Stop flips it).
         self._stop: list[bool] = [False]
 
@@ -385,12 +477,14 @@ class DriftWizard(WizardController):
         if min(h, w) < 2 * _ROI_MIN_PX:
             # Nothing sensible to drag; the whole frame IS the ROI.
             return
-        bw = max(_ROI_MIN_PX, min(w, int(round(w * _ROI_DEFAULT_FRACTION))))
-        bh = max(_ROI_MIN_PX, min(h, int(round(h * _ROI_DEFAULT_FRACTION))))
+        bw = bh = self.box_size()
         try:
             widget = plot2d.add_rectangle_widget(
                 x=float((w - bw) // 2), y=float((h - bh) // 2),
-                w=float(bw), h=float(bh), color=_ROI_COLOR, show_handles=True,
+                w=float(bw), h=float(bh), color=_ROI_COLOR,
+                # No handles: the box is a fixed 512 (see _ROI_BOX_PX). Offering
+                # a resize the code then overrides would just fight the user.
+                show_handles=False,
             )
             from spyde.drawing.selectors.base_selector import event_handler_fn
             handler = event_handler_fn(lambda event: self._on_roi_drag())
@@ -417,10 +511,18 @@ class DriftWizard(WizardController):
             self._clamp_roi()
         finally:
             self._roi_clamping = False
-        self.schedule_preview()
+        # LIVE: straight onto the shared serial dispatcher, which coalesces to the
+        # latest box. No settle timer on this path — waiting 250 ms for the drag
+        # to stop is the thing that made the preview feel like a batch job.
+        self._preview_driver.submit()
+
+    def box_size(self) -> int:
+        """The fixed box edge, shrunk only if the frame itself is smaller."""
+        h, w = self._frame_shape or (_ROI_BOX_PX, _ROI_BOX_PX)
+        return int(max(_ROI_MIN_PX, min(_ROI_BOX_PX, int(h), int(w))))
 
     def _clamp_roi(self) -> None:
-        """Keep the box inside the frame and above the solver's floor.
+        """Pin the box to its fixed SIZE and keep it inside the frame.
 
         COMPARE BEFORE SET, with slack. ``Widget.set()`` pushes geometry back to
         the renderer, and writing on every ``pointer_move`` echoes
@@ -433,8 +535,7 @@ class DriftWizard(WizardController):
             return
         h, w = shape
         try:
-            ww = min(max(float(widget.w), float(_ROI_MIN_PX)), float(w))
-            hh = min(max(float(widget.h), float(_ROI_MIN_PX)), float(h))
+            ww = hh = float(self.box_size())
             x = min(max(float(widget.x), 0.0), float(w) - ww)
             y = min(max(float(widget.y), 0.0), float(h) - hh)
             now = (float(widget.x), float(widget.y),
@@ -464,8 +565,7 @@ class DriftWizard(WizardController):
         # clamping the origin to the frame edge and only then applying the
         # minimum size pushes the box back OUT past the edge, and
         # solve_translation rejects an out-of-frame roi outright.
-        bw = max(_ROI_MIN_PX, min(bw, fw))
-        bh = max(_ROI_MIN_PX, min(bh, fh))
+        bw = bh = self.box_size()
         if bw > fw or bh > fh:
             return None                  # frame smaller than the solver's floor
         x0 = max(0, min(x0, fw - bw))
@@ -757,6 +857,7 @@ class DriftWizard(WizardController):
         self._closed = True
         self._stop[0] = True             # stop a solve in flight
         self.cancel_preview()
+        self._preview_cache = None
         self.remove_roi_widget()
         self._panels = {}
         self._trace = {}
@@ -793,7 +894,7 @@ def _coerce(payload: dict | None) -> dict:
     p["upsample"] = max(1, int(p["upsample"]))
     p["max_shift"] = max(1.0, float(p["max_shift"]))
     p["order"] = int(min(3, max(0, p["order"])))
-    p["preview_frames"] = int(min(200, max(4, p["preview_frames"])))
+    p["preview_frames"] = int(min(200, max(2, p["preview_frames"])))
     return p
 
 
@@ -935,13 +1036,88 @@ def _preview_indices(n_frames: int, k: int, frame_bytes: int) -> np.ndarray:
     return np.unique(np.linspace(0, n - 1, k).round().astype(int))
 
 
+def _preview_indices_live(wiz, n_frames: int) -> np.ndarray:
+    """Frames the LIVE preview aligns. Deliberately few — see _PREVIEW_FRAMES."""
+    k = max(2, min(int(wiz.params.get("preview_frames", _PREVIEW_FRAMES)), n_frames))
+    return np.unique(np.linspace(0, n_frames - 1, k).round().astype(int))
+
+
+def _ensure_preview_cache(wiz) -> list[np.ndarray] | None:
+    """Read the preview frames ONCE and keep them.
+
+    This is what makes a per-drag-step update affordable: the box moves, the
+    movie does not, so the only per-step work should be cropping pixels that are
+    already in RAM. Bounded by the frame count (2 by default), so a 2048² movie
+    costs ~16 MB and a 4096² one ~67 MB, held only while the caret is open.
+    """
+    if wiz._preview_cache is not None:
+        return wiz._preview_cache
+    try:
+        n_frames, get_frame, _shape = wiz.frames()
+    except TypeError as exc:
+        log.debug("[drift] preview cache skipped: %s", exc)
+        return None
+    if n_frames < 2:
+        return None
+    idx = _preview_indices_live(wiz, n_frames)
+    wiz._preview_cache = [np.asarray(get_frame(int(i))) for i in idx]
+    return wiz._preview_cache
+
+
+def _preview_step(wiz) -> dict | None:
+    """One live preview: crop the cached frames to the box, align, score.
+
+    Runs on the dispatcher thread. Everything here is arithmetic on resident
+    pixels — no I/O — which is the whole reason it can run per drag frame.
+    """
+    frames = _ensure_preview_cache(wiz)
+    if not frames:
+        return None
+    roi = wiz.roi_box()
+    if roi is None:
+        return None
+    y0, x0, h, w = (int(v) for v in roi)
+    crops = [np.ascontiguousarray(f[y0:y0 + h, x0:x0 + w], dtype=np.float32)
+             for f in frames]
+    params = dict(wiz.params)
+    # Sums/gain at ~256 px: the panel is ~170 px wide, so anything finer is paid
+    # for and discarded. The solve still sees the full crop.
+    stride = max(1, min(h, w) // _PREVIEW_DISPLAY_PX)
+    result = preview_alignment(crops.__getitem__, range(len(crops)), None,
+                               params=params, display_stride=stride)
+    result["roi"] = (y0, x0, h, w)
+    return result
+
+
+def _publish_preview(wiz, result: dict) -> None:
+    """Paint the discovery pair and push the gain readout (main thread only)."""
+    if wiz._closed:
+        return
+    wiz.show_preview(result)
+    emit({"type": "drift_preview", "window_id": wiz.src_window_id,
+          "roi": None if result.get("roi") is None else list(result["roi"]),
+          "frames": int(result.get("frames", 0)),
+          "gain": float(result.get("gain", float("nan"))),
+          "max_abs_shift": float(result.get("max_abs_shift", 0.0)),
+          "params": dict(wiz.params)})
+
+
 def preview_alignment(get_frame, indices, roi, *, params, prof=None,
-                      reads_region: bool = False) -> dict:
+                      reads_region: bool = False,
+                      display_stride: int = 1) -> dict:
     """Align *indices* on *roi* alone and report how much sharper the sum got.
 
     The resident set is one frame plus ``len(indices)`` crops (bounded by
     :data:`_PREVIEW_MAX_BYTES` at the caller). The crops ARE the region to
     correlate, so the solve runs with ``roi=None`` on them.
+
+    *display_stride* decimates the two SUM images (and therefore the gain), while
+    the SOLVE keeps the full-resolution crops. That split is deliberate and
+    measured: on a 512² box the solve is 7 ms and the sums plus gradient energy
+    are 46 ms, so the expensive half is the one whose output is a ~170 px panel.
+    Decimating the solve as well is NOT an option — at stride 3 it stops
+    recovering the shift at all (31 px against a true 3.4). Both sums are
+    decimated identically, so the gain stays a like-for-like ratio.
 
     *reads_region* says whether ``get_frame`` accepts an ``(y0, x0, h, w)``
     second argument and can read only that box. Readers from
@@ -977,10 +1153,14 @@ def preview_alignment(get_frame, indices, roi, *, params, prof=None,
     with prof.stage("solve"):
         model = solve_translation(crops, **_solver_kwargs(params))
     take = range(len(crops))
+    st = max(1, int(display_stride))
+    small = crops if st == 1 else [c[::st, ::st] for c in crops]
     with prof.stage("sums"):
-        raw = _stack_sum(crops.__getitem__, take)
-        aligned = _stack_sum(crops.__getitem__, take, model.shifts,
-                             order=int(params["order"]))
+        raw = _stack_sum(small.__getitem__, take)
+        # `stride=` scales the shifts to the decimated grid — full-frame pixels
+        # applied to a decimated image would over-correct by exactly `st`.
+        aligned = _stack_sum(small.__getitem__, take, model.shifts,
+                             order=int(params["order"]), stride=st)
     both = np.isfinite(raw) & np.isfinite(aligned)
     e_raw = _gradient_energy(raw, both)
     e_aligned = _gradient_energy(aligned, both)
@@ -1121,64 +1301,24 @@ def drift_tune(session, plot, payload) -> None:
     wiz = _wizard(session, plot)
     if wiz is None:
         return
+    before = wiz.params.get("preview_frames")
     wiz.params = _coerce({**wiz.params, **(payload or {})})
+    if wiz.params.get("preview_frames") != before:
+        wiz._preview_cache = None        # a different set of frames to hold
     _emit_state(wiz)
     _run_preview(wiz)
 
 
 def _run_preview(wiz: DriftWizard) -> None:
-    """Align ~20 sampled frames on the current box and report the gain.
+    """Kick a preview that is not drag-driven (caret open, a tuned parameter).
 
-    Latest-wins on ``_drift_preview_gen``: a drag that outruns the solve drops
-    the stale result rather than painting it over the newer one. The preview
-    never touches ``tree.drift`` or the caret's solved state — it is a question,
-    not an answer.
+    Same path as the drag — one submit onto the shared dispatcher — so there is
+    exactly ONE way a preview is computed. ``force`` because this update has no
+    stream of successors to make it current: it must land.
     """
     if wiz._closed:
         return
-    prof = ActionProfile("drift_preview")
-    tree = wiz.tree
-    gen = bump_generation(tree, "_drift_preview_gen")
-    params = dict(wiz.params)
-    roi = wiz.roi_box()          # the BOX, toggle or not — see active_roi()
-    try:
-        n_frames, get_frame, shape = wiz.frames()
-    except TypeError as exc:
-        log.debug("[drift] preview skipped: %s", exc)
-        return
-    if n_frames < 2:
-        return
-    h, w = (roi[2], roi[3]) if roi is not None else (int(shape[0]), int(shape[1]))
-    indices = _preview_indices(n_frames, params["preview_frames"], h * w * 4)
-    prof.info(n_frames=int(n_frames), preview_frames=int(len(indices)),
-              box=f"{w}x{h}", roi=("yes" if roi is not None else "whole-frame"))
-
-    def _work():
-        return preview_alignment(get_frame, indices, roi, params=params,
-                                 prof=prof, reads_region=True)
-
-    def _done(result):
-        if not is_current(tree, "_drift_preview_gen", gen) or wiz._closed:
-            prof.done("superseded")
-            return
-        wiz.preview = result
-        with prof.stage("paint"):
-            wiz.show_preview(result)
-        prof.mark("preview_visible")
-        prof.done()
-        emit({"type": "drift_preview", "window_id": wiz.src_window_id,
-              "roi": None if result["roi"] is None else list(result["roi"]),
-              "frames": int(result["frames"]),
-              "gain": float(result["gain"]),
-              "max_abs_shift": float(result["max_abs_shift"]),
-              "params": dict(params)})
-
-    def _fail(exc):
-        if is_current(tree, "_drift_preview_gen", gen):
-            emit_error(f"Drift preview failed: {exc}")
-
-    run_on_worker(wiz.session, _work, name="drift-preview",
-                  on_done=_done, on_error=_fail)
+    wiz._preview_driver.submit(force=True)
 
 
 def drift_run(session, plot, payload) -> None:

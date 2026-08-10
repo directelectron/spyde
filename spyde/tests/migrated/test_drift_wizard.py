@@ -249,7 +249,13 @@ class TestDiscoveryPreview:
 
     def test_the_preview_uses_the_box_even_with_the_toggle_off(self, window):
         """The toggle is the COMMITMENT (does the full solve restrict to the
-        box); the preview is the QUESTION and always asks it about the box."""
+        box); the preview is the QUESTION and always asks it about the box.
+
+        The box is now a FIXED square (``_ROI_BOX_PX``), so the widget's w/h are
+        ignored and only its POSITION is read — that is the point of a fixed box
+        and it is why this asserts the size comes from ``box_size()`` rather than
+        from the widget it used to come from.
+        """
         session, plot, _tree, wiz = _opened(window)
         msgs = window["messages"]
         assert wiz.params["use_roi"] is False
@@ -257,15 +263,24 @@ class TestDiscoveryPreview:
         del msgs[:]
         dr.drift_tune(session, plot, {})
         assert _wait(lambda: _of_type(msgs, "drift_preview"))
-        assert _of_type(msgs, "drift_preview")[-1]["roi"] == [12, 10, 48, 60]
+        roi = _of_type(msgs, "drift_preview")[-1]["roi"]
+        edge = wiz.box_size()
+        assert roi[2] == edge and roi[3] == edge, roi
+        assert roi == list(wiz.roi_box())
 
     def test_the_box_is_read_in_image_pixels_as_y0_x0_h_w(self, window):
         """anyplotlib 2-D widgets report IMAGE PIXELS and solve_translation's
-        roi is in pixels — the two meet with NO scale conversion."""
+        roi is in pixels — the two meet with NO scale conversion.
+
+        Framed on a 1024² movie so the fixed 512 box fits with room to move: on
+        the 96x112 fixture the box clamps to the whole frame and the ordering
+        claim becomes untestable. The widget's w/h are deliberately nonsense to
+        show they are ignored.
+        """
         _s, _p, _t, wiz = _opened(window)
-        wiz._frame_shape = (96, 112)
+        wiz._frame_shape = (1024, 1024)
         wiz._roi_widget = _Box(x=20, y=8, w=40, h=32)
-        assert wiz.roi_box() == (8, 20, 32, 40)
+        assert wiz.roi_box() == (8, 20, dr._ROI_BOX_PX, dr._ROI_BOX_PX)
 
     def test_the_box_is_clamped_into_the_frame(self, window):
         _s, _p, _t, wiz = _opened(window)
@@ -286,57 +301,44 @@ class TestDiscoveryPreview:
         y0, x0, h, w = wiz.roi_box()
         assert h >= _MIN_ROI and w >= _MIN_ROI
 
-    def test_a_superseded_preview_does_not_paint(self, window, monkeypatch):
-        """Latest-wins: a drag that outruns the solve must drop the stale
-        result, not paint it over the newer one.
+    def test_a_superseded_drag_step_is_never_computed(self):
+        """Latest-wins, at the level it now happens: COALESCING, not a guard.
 
-        Drives a REAL ``drift_tune`` (worker thread → ``_run_preview`` →
-        ``is_current``-guarded ``_done``, drift_action.py) instead of poking the
-        generation counters directly — the old version bumped the generation
-        and asserted ``is_current`` without ever calling ``drift_tune``, so the
-        guarded ``_done`` path it claims to protect never ran and the assertion
-        held trivially. ``preview_alignment`` is gated on an Event so a "newer
-        drag" can be landed deterministically while the older one is still
-        computing, rather than racing real time.
+        The preview used to run on a worker with a generation counter, so a
+        superseded result was computed in full and then discarded on arrival.
+        It now goes onto the shared serial dispatcher
+        (``base_selector._nav_dispatcher``, CLAUDE.md Live-Display §2), which
+        keeps at most ONE pending job per submitter — so a box the user has
+        already dragged past is dropped BEFORE it costs anything. That is a
+        stronger property than the old one and this asserts it directly: submit
+        several positions while the worker is busy, and only the last survives.
+
+        Driven against the dispatcher itself rather than through a Session: the
+        claim is about the queue, and a real drag would race real time.
         """
-        session, plot, tree, wiz = _opened(window)
-        msgs = window["messages"]
-        # Drain the automatic discovery preview `_opened` triggers so it can't
-        # land in the middle of the controlled run below.
-        assert _wait(lambda: _of_type(msgs, "drift_preview"))
-
-        painted = []
-        wiz.show_preview = lambda res: painted.append(res)
+        from spyde.drawing.selectors.base_selector import _nav_dispatcher
 
         started, release = threading.Event(), threading.Event()
-        real_preview_alignment = dr.preview_alignment
+        ran = []
 
-        def _blocking(*a, **k):
-            started.set()
-            release.wait(5.0)
-            return real_preview_alignment(*a, **k)
+        class _Job:
+            def _run_update(self, **kw):
+                ran.append(kw.get("tag"))
+                if kw.get("tag") == "first":
+                    started.set()
+                    release.wait(5.0)
 
-        monkeypatch.setattr(dr, "preview_alignment", _blocking)
-
-        done = threading.Event()
-        real_is_current = dr.is_current
-
-        def _is_current(owner, key, gen_):
-            result = real_is_current(owner, key, gen_)
-            if key == "_drift_preview_gen":
-                done.set()
-            return result
-
-        monkeypatch.setattr(dr, "is_current", _is_current)
-
-        dr.drift_tune(session, plot, {"upsample": 4, "max_shift": 12})
-        assert started.wait(5.0), "the preview work never started"
-        dr.bump_generation(tree, "_drift_preview_gen")     # a newer drag lands
+        job = _Job()
+        _nav_dispatcher.submit(job, tag="first")
+        assert started.wait(5.0), "the dispatcher never picked the job up"
+        # Three more "drag steps" queue while the first is still running.
+        for tag in ("stale-1", "stale-2", "latest"):
+            _nav_dispatcher.submit(job, tag=tag)
         release.set()
 
-        assert _wait(lambda: done.is_set()), \
-            "the superseded preview's _done never ran"
-        assert painted == []
+        assert _wait(lambda: "latest" in ran), f"the latest box never ran: {ran}"
+        assert "stale-1" not in ran and "stale-2" not in ran, (
+            f"a superseded drag step was computed instead of coalesced: {ran}")
 
     def test_the_settle_timer_coalesces_a_drag(self, window):
         """The widget's pointer_move fires at renderer frame rate; only the
@@ -527,12 +529,12 @@ class TestSolve:
         one the full solve correlates on."""
         session, plot, _tree, wiz = _opened(window)
         msgs = window["messages"]
-        wiz._frame_shape = (96, 112)
         wiz._roi_widget = _Box(x=16, y=12, w=64, h=64)
+        expect = list(wiz.roi_box())          # the FIXED box at the widget's position
         dr.drift_run(session, plot, {"use_roi": True})
         assert _wait(lambda: wiz.model is not None)
-        assert wiz.model.params["roi"] == [12, 16, 64, 64]
-        assert _of_type(msgs, "drift_result")[-1]["roi"] == [12, 16, 64, 64]
+        assert wiz.model.params["roi"] == expect
+        assert _of_type(msgs, "drift_result")[-1]["roi"] == expect
 
 
 @pytest.mark.usefixtures("_capture_module_emit")
