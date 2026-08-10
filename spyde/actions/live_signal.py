@@ -21,12 +21,25 @@ results the navigator fill uses:
       frame stays up (no flash) exactly like the expensive-tier nav read
       (CLAUDE.md Live-Display §3).
 
-**(b) BEATS (a), permanently.** The first time the user moves this window's
+**(b) BEATS (a), permanently.** The first time the user TOUCHES this window's
 navigator, ``_user_owns`` latches and the auto-sample flash stops for the rest of
 the run — the signal panel belongs to them from then on. It is not a timed hold:
 a hold resumes the flash the moment the user pauses to look at what they
 navigated to, which is exactly when it must not. The navigator count map keeps
 filling visibly either way; only the sample paint stops.
+
+**The latch reads the POINTER EVENT, not the read.** It rides
+``BaseSelector.interaction_hooks``, fired by the widget handlers before anything
+is queued, so it is set the instant the crosshair is grabbed — whatever the read
+then does. Inferring it from the reads instead ("a read arrived at a new index,
+so the user must have dragged") has holes that all surface as the same symptom:
+a landing block repainting the panel just as the user lets go. ``_run_update``
+short-circuits a repeat position, so a grab that ends where it began produces no
+changed index at all; a drag entirely over not-yet-computed data produces only
+declines; and the dispatcher coalesces, so intermediate positions never reach the
+preview. The changed-index check is KEPT below as a backstop for a crosshair
+moved without a pointer event (a programmatic set, a linked selector) — it can
+only latch later than the hook, never instead of it.
 
 **The result tree is LOCKED while it fills** (``lifecycle.lock_tree``): no
 actions and no new nodes until the result attaches, because the root is a
@@ -89,6 +102,22 @@ def _block_sample_index(nav_slices: Sequence[slice]) -> tuple[int, ...]:
     return tuple(int(rng.integers(lo, max(lo + 1, hi))) for lo, hi in bounds)
 
 
+def _hook_targets(selector) -> list:
+    """Every object whose pointer events count as "the user touched *selector*".
+
+    Normally just the selector. A ``CompositeSelector`` (the 5-D navigator's
+    crosshair + rectangle pair) is the exception: it owns no widget of its own
+    and delegates unknown attributes to whichever sub-selector is ACTIVE, so a
+    hook registered through it would reach exactly one of the two — and would
+    silently stop being reachable the moment the user toggled Integrate. Each
+    sub-selector has its own widget and its own hook list, so register on both.
+    """
+    subs = [getattr(selector, name, None)
+            for name in ("_crosshair_selector", "_rect_selector")]
+    subs = [s for s in subs if s is not None]
+    return subs or [selector]
+
+
 class ProgressiveSignalPreview:
     """Live signal-plot preview for one progressively-filled result tree.
 
@@ -119,10 +148,12 @@ class ProgressiveSignalPreview:
         self._lock = threading.Lock()
         self._closed = False
         self._last_paint = 0.0
-        #: LATCH: set the first time the user moves this window's navigator, and
-        #: never cleared. From then on the signal panel is theirs — a landing
-        #: block may no longer paint a sample frame over what they are looking
-        #: at. The navigator COUNT MAP keeps filling regardless; only the
+        #: LATCH: set the first time the user TOUCHES this window's navigator,
+        #: and never cleared. From then on the signal panel is theirs — a
+        #: landing block may no longer paint a sample frame over what they are
+        #: looking at, and letting go over a position the batch has not reached
+        #: leaves their last good frame up rather than a sample of somewhere
+        #: else. The navigator COUNT MAP keeps filling regardless; only the
         #: auto-sample "flash" stops. (This was a 2-second hold, which meant the
         #: flash resumed and stole the panel back the moment the user paused.)
         self._user_owns = False
@@ -131,8 +162,15 @@ class ProgressiveSignalPreview:
         #: parked-position refresh, the selector's settle timer) are forced
         #: updates at an unchanged index and must NOT latch — otherwise the
         #: first block landing under a resting crosshair would end auto-sampling
-        #: without the user having touched anything.
+        #: without the user having touched anything. BACKSTOP only: the pointer
+        #: hook (`_on_user_interaction`) is the primary latch.
         self._last_index: tuple[int, ...] | None = None
+        # ONE bound method per preview: `self._on_user_interaction` builds a
+        # fresh bound object on every attribute access, and close() must be able
+        # to remove the exact object watch_navigators() appended.
+        self.interaction_hook = self._on_user_interaction
+        #: the selectors carrying that hook, so close() can take it off again
+        self._hooked: list = []
         self._last_log = 0.0
         self._last_serve_log = 0.0
         self._last_decline_log = 0.0
@@ -308,24 +346,41 @@ class ProgressiveSignalPreview:
                      self.n_positions, self.frames_served, self.reads_declined)
         return None
 
-    def _note_read_position(self, index) -> None:
-        """Latch ``_user_owns`` when a navigator read arrives at a NEW position.
+    def _take_ownership(self, why: str) -> None:
+        """Hand the signal panel to the user, permanently. Idempotent."""
+        if self._user_owns:
+            return
+        self._user_owns = True
+        log.info("[live-signal] %s: navigator %s — the signal panel is the "
+                 "user's for the rest of this run (auto-sampling stops; the "
+                 "count map keeps filling)", self.name, why)
 
-        A moved crosshair is the only thing that can produce one: ``_run_update``
-        short-circuits a repeat of the same position, and the forced re-fires the
-        preview and the selector's settle timer issue are at an unchanged index.
-        So "the index changed" IS "the user drove the navigator" — and it stays
-        true for the rest of the run.
+    def _on_user_interaction(self, selector) -> None:
+        """THE latch — a pointer event on a navigator this preview watches
+        on (``BaseSelector.interaction_hooks``).
+
+        Fires on the event thread before the read is even queued, so ownership
+        is decided by the TOUCH and not by what the read returns. That is the
+        whole point: a drag over data the batch has not reached yet returns
+        nothing at all, and if ownership waited for a served frame the sampler
+        would still be live when the user let go and the next landing block
+        would repaint the panel out from under them.
+        """
+        self._take_ownership("grabbed")
+
+    def _note_read_position(self, index) -> None:
+        """Backstop latch: a navigator read arrived at a NEW position.
+
+        Covers a crosshair moved WITHOUT a pointer event (a programmatic set, a
+        linked selector driving this one). Our own re-fires — the parked-position
+        refresh, the selector's settle timer — are forced reads at an UNCHANGED
+        index and must not latch, or the first block landing under a resting
+        crosshair would end auto-sampling with nobody having touched anything.
         """
         if index is None:
             return
         if self._last_index is not None and index != self._last_index:
-            if not self._user_owns:
-                self._user_owns = True
-                log.info("[live-signal] %s: navigator driven to %s — the signal "
-                         "panel is the user's for the rest of this run "
-                         "(auto-sampling stops; the count map keeps filling)",
-                         self.name, index)
+            self._take_ownership(f"driven to {index}")
         self._last_index = index
 
     def read_frame(self, indices):
@@ -385,20 +440,30 @@ class ProgressiveSignalPreview:
             return 0
         return int(np.prod(shape[len(self.nav_shape):])) * data.dtype.itemsize
 
-    def seed_read_position(self) -> None:
-        """Seed the latch's reference position from where the crosshair ALREADY
-        sits, so the user's FIRST move is recognised as a move (with no seed
-        the first read only establishes the baseline and the latch would trail
-        one position behind the drag). Prepared exactly as the read prepares
-        the index it hands :meth:`read_frame`, so an unmoved crosshair compares
-        equal."""
+    def watch_navigators(self) -> None:
+        """Latch on the TOUCH of any of this window's navigators, and seed the
+        backstop latch's reference position.
+
+        The hook goes on every navigation selector of the tree (both halves of
+        a composite, see :func:`_hook_targets`), and :meth:`close` removes it.
+
+        The seed is where the crosshair ALREADY sits, so a programmatic move is
+        recognised as a move (with no seed the first read only establishes the
+        baseline and the backstop would trail one position behind). It is
+        prepared exactly as the read prepares the index it hands
+        :meth:`read_frame`, so an unmoved crosshair compares equal."""
         from spyde.drawing.update_functions import (
             _NAVIGATION_AXES, _prepare_nav_indices)
 
         manager = getattr(self.tree, "navigator_plot_manager", None)
         for selector in getattr(manager, "all_navigation_selectors", None) or ():
+            for target in _hook_targets(selector):
+                hooks = getattr(target, "interaction_hooks", None)
+                if hooks is not None and self.interaction_hook not in hooks:
+                    hooks.append(self.interaction_hook)
+                    self._hooked.append(target)
             if self._last_index is not None:
-                return
+                continue
             try:
                 prepared = _prepare_nav_indices(
                     self.tree.root, selector.current_indices,
@@ -433,6 +498,14 @@ class ProgressiveSignalPreview:
                 self.tree.set_reader_override(signal, None)
         except Exception as e:
             log.debug("[%s] releasing the preview reader failed: %s", self.name, e)
+        for target in self._hooked:
+            try:
+                if self.interaction_hook in target.interaction_hooks:
+                    target.interaction_hooks.remove(self.interaction_hook)
+            except Exception as e:
+                log.debug("[%s] removing interaction hook failed: %s",
+                          self.name, e)
+        self._hooked = []
         if getattr(self.tree, "_live_signal_preview", None) is self:
             self.tree._live_signal_preview = None
 
@@ -465,7 +538,7 @@ def attach_signal_preview(session, tree, *, render: Callable[[tuple], Any],
         tree.set_reader_override(tree.root, preview)
         for plot in list(tree.signal_plots):
             plot.needs_auto_level = True
-        preview.seed_read_position()
+        preview.watch_navigators()
     except Exception as e:
         log.debug("attaching live signal preview failed: %s", e)
         return None

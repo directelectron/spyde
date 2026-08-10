@@ -69,7 +69,7 @@ class InfiniteLineSelector(BaseSelector):
         return getattr(plot, "_plot1d", None) if plot is not None else None
 
     def _on_pointer_up(self, event):
-        self.update_data()
+        self.update_data(event, user=True)
 
     #: How many consecutive navigation positions this point sums. 1 is a plain
     #: crosshair; >1 keeps the single pointer but reads a window around it.
@@ -182,7 +182,7 @@ class LinearRegionSelector(BaseSelector):
         self._clamp_extent()
         after = self._spans()
         self._trace_geometry(before, after)
-        self.update_data()
+        self.update_data(event, user=True)
 
     def _spans(self):
         """Geometry as ``[(lo, hi)]`` for RoiTrace — normalised so x0>x1 (the
