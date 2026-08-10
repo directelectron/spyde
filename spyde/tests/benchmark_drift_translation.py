@@ -239,7 +239,10 @@ def main(argv=None) -> int:
                     help="total drift excursion, px")
     ap.add_argument("--backends", default="numpy,cpu,cuda")
     ap.add_argument("--runs", type=int, default=2, help="timed runs per solver")
-    ap.add_argument("--band", type=int, default=12)
+    # None = whatever the solver ships as its default. A hard-coded number
+    # here would silently benchmark a configuration nobody runs, which is
+    # exactly what happened the first time this was used in anger.
+    ap.add_argument("--band", type=int, default=None)
     ap.add_argument("--upsample", type=int, default=8)
     ap.add_argument("--max-shift", type=float, default=96.0,
                     help="must cover the WHOLE excursion for the old solver "
@@ -261,9 +264,11 @@ def main(argv=None) -> int:
     backends = available_backends(args.backends)
     rows = []
     for device in backends:
+        band_kw = {} if args.band is None else {"band": int(args.band)}
+
         def _new(dev=device):
             return solve_new(data, device=dev, upsample=args.upsample,
-                             max_shift=args.max_shift, band=args.band)
+                             max_shift=args.max_shift, **band_kw)
         cold, warm, model = time_solve(_new, device, args.runs)
         rows.append(("new", device, cold, warm, accuracy(model, truth),
                      dict(model.params)))
