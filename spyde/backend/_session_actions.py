@@ -39,7 +39,7 @@ _TEST_ACTIONS = frozenset({
     "load_test_data_eels", "load_test_data_eds", "load_test_data_ebsd",
     "load_test_data_line", "load_test_data_movie", "load_test_data_5d",
     "load_test_data_particles", "load_test_data_dpc",
-    "test_nav_drag",
+    "test_nav_drag", "test_aim_ready_position",
     "test_region_scrub", "test_add_second_navigator",
     "load_test_vectors", "run_test_orientation", "dump_dask_state",
 })
@@ -159,6 +159,12 @@ class ActionRouterMixin:
             self._load_test_data_dpc(payload)
         elif action == "test_add_second_navigator":
             self._test_add_second_navigator()
+        elif action == "test_aim_ready_position":
+            # REPORT where a crosshair walk over already-computed data should go
+            # on a progressive result window (from the live preview's ready
+            # mask) — see _session_testharness. Read-only and synchronous: it
+            # logs a target and moves nothing.
+            self._test_aim_ready_position()
         elif action == "test_nav_drag":
             # Run on a BACKGROUND thread: the drag loop sleeps/polls, and if it ran
             # on the main asyncio thread it would block loop.call_soon_threadsafe —
@@ -191,6 +197,17 @@ class ActionRouterMixin:
             # e.g. {component: "eyy"} silently resolved to nothing.
             if "window_id" not in payload and window_id is not None:
                 payload = {**payload, "window_id": window_id}
+            # Dispatch path 2 of 2 through the result-tree compute lock (the
+            # toolbar invoker below is path 1): a staged wizard opened on a
+            # window whose batch is still filling it would tune/run against a
+            # placeholder root. Same helper, so neither path can drift.
+            # Read-only re-emits and teardown verbs are exempt — see
+            # registry.is_lock_exempt.
+            from spyde.actions.lifecycle import refuse_if_locked
+            from spyde.actions.registry import is_lock_exempt
+            if not is_lock_exempt(action) and refuse_if_locked(
+                    getattr(plot, "signal_tree", None), f"'{action}'"):
+                return
             resolve_staged(action)(self, plot, payload)
         elif action == "run_test_orientation":
             # Test-only: run Orientation Mapping with a built-in phase (no CIF
@@ -337,6 +354,14 @@ class ActionRouterMixin:
         """
         if plot is None or not name:
             emit_error("Toolbar action: no active plot or action name")
+            return
+
+        # Dispatch path 1 of 2 through the result-tree compute lock (the staged
+        # dispatch in dispatch_action is path 2). While a progressive batch is
+        # filling this tree it owns the window: the root is a placeholder and the
+        # navigator→signal link belongs to the live preview.
+        from spyde.actions.lifecycle import refuse_if_locked
+        if refuse_if_locked(getattr(plot, "signal_tree", None), f"'{name}'"):
             return
 
         # Actions whose modules still carry the Qt/interactive implementation and

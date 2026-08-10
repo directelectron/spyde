@@ -21,6 +21,18 @@ results the navigator fill uses:
       frame stays up (no flash) exactly like the expensive-tier nav read
       (CLAUDE.md Live-Display §3).
 
+**(b) BEATS (a), permanently.** The first time the user moves this window's
+navigator, ``_user_owns`` latches and the auto-sample flash stops for the rest of
+the run — the signal panel belongs to them from then on. It is not a timed hold:
+a hold resumes the flash the moment the user pauses to look at what they
+navigated to, which is exactly when it must not. The navigator count map keeps
+filling visibly either way; only the sample paint stops.
+
+**The result tree is LOCKED while it fills** (``lifecycle.lock_tree``): no
+actions and no new nodes until the result attaches, because the root is a
+placeholder the batch is about to replace and a node hung off it would describe
+data that does not exist yet.
+
 The action supplies only ``render(index) -> ndarray | None``; readiness tracking,
 sampling, throttling, the thread marshal and the handover to the final display
 live here so every progressive action gets identical behaviour.
@@ -52,10 +64,6 @@ log = logging.getLogger(__name__)
 #: Minimum seconds between two auto-sample paints (a fast cluster lands many
 #: blocks per second; painting each one is pure transport churn).
 SAMPLE_MIN_INTERVAL = 0.45
-
-#: Seconds after a navigator-driven read during which auto-sampling stays quiet,
-#: so a landing block cannot yank the frame out from under a user who is dragging.
-USER_HOLD = 2.0
 
 #: Minimum seconds between two INFO narration lines (the paints are faster).
 LOG_MIN_INTERVAL = 2.0
@@ -98,13 +106,12 @@ class ProgressiveSignalPreview:
     def __init__(self, session, tree, *, render: Callable[[tuple], Any],
                  nav_shape: Sequence[int],
                  sample_interval: float = SAMPLE_MIN_INTERVAL,
-                 user_hold: float = USER_HOLD, name: str = "live-signal"):
+                 name: str = "live-signal"):
         self.session = session
         self.tree = tree
         self.render = render
         self.nav_shape = tuple(int(s) for s in nav_shape)
         self.sample_interval = float(sample_interval)
-        self.user_hold = float(user_hold)
         self.name = name
 
         self.n_positions = int(np.prod(self.nav_shape))
@@ -112,9 +119,23 @@ class ProgressiveSignalPreview:
         self._lock = threading.Lock()
         self._closed = False
         self._last_paint = 0.0
-        self._last_user = 0.0
+        #: LATCH: set the first time the user moves this window's navigator, and
+        #: never cleared. From then on the signal panel is theirs — a landing
+        #: block may no longer paint a sample frame over what they are looking
+        #: at. The navigator COUNT MAP keeps filling regardless; only the
+        #: auto-sample "flash" stops. (This was a 2-second hold, which meant the
+        #: flash resumed and stole the panel back the moment the user paused.)
+        self._user_owns = False
+        #: The last nav index a navigator read asked for, so a genuine MOVE can
+        #: be told from a re-fire at the SAME position. Our own re-fires (the
+        #: parked-position refresh, the selector's settle timer) are forced
+        #: updates at an unchanged index and must NOT latch — otherwise the
+        #: first block landing under a resting crosshair would end auto-sampling
+        #: without the user having touched anything.
+        self._last_index: tuple[int, ...] | None = None
         self._last_log = 0.0
         self._last_serve_log = 0.0
+        self._last_decline_log = 0.0
         #: counters the tests (and the log lines) assert on
         self.blocks_seen = 0
         #: (a) auto-sample paints driven by a landing block
@@ -180,8 +201,8 @@ class ProgressiveSignalPreview:
         now = time.monotonic()
         if now - self._last_paint < self.sample_interval:
             return
-        if now - self._last_user < self.user_hold:
-            return          # the user is driving the navigator — stay out of it
+        if self._user_owns:
+            return          # the user drove the navigator — the panel is theirs
         frame = None
         try:
             frame = self.render(index)
@@ -268,6 +289,45 @@ class ProgressiveSignalPreview:
                 log.debug("[%s] re-firing parked selector failed: %s", self.name, e)
         return hit
 
+    def _decline(self, index, now: float):
+        """Count + narrate a navigator read the preview could NOT answer.
+
+        Narrated at INFO (throttled like the serve line, first one always) so a
+        drag that serves NOTHING is distinguishable in the log from a drag that
+        never reached the backend at all — the e2e spec's served-count went 0→0
+        once and the log could not say whether the reads were declined (drag
+        over uncomputed data) or never ran. The index says WHERE the drag
+        actually read; the cumulative counts make the line parseable the same
+        way as the serve line."""
+        self.reads_declined += 1
+        if self.reads_declined == 1 or now - self._last_decline_log >= LOG_MIN_INTERVAL:
+            self._last_decline_log = now
+            log.info("[live-signal] %s: navigator read declined at %s — position "
+                     "not yet computed (%d/%d positions ready, %d served / "
+                     "%d declined)", self.name, index, self.ready_count,
+                     self.n_positions, self.frames_served, self.reads_declined)
+        return None
+
+    def _note_read_position(self, index) -> None:
+        """Latch ``_user_owns`` when a navigator read arrives at a NEW position.
+
+        A moved crosshair is the only thing that can produce one: ``_run_update``
+        short-circuits a repeat of the same position, and the forced re-fires the
+        preview and the selector's settle timer issue are at an unchanged index.
+        So "the index changed" IS "the user drove the navigator" — and it stays
+        true for the rest of the run.
+        """
+        if index is None:
+            return
+        if self._last_index is not None and index != self._last_index:
+            if not self._user_owns:
+                self._user_owns = True
+                log.info("[live-signal] %s: navigator driven to %s — the signal "
+                         "panel is the user's for the rest of this run "
+                         "(auto-sampling stops; the count map keeps filling)",
+                         self.name, index)
+        self._last_index = index
+
     def read_frame(self, indices):
         """Render an already-computed position on demand.
 
@@ -276,18 +336,16 @@ class ProgressiveSignalPreview:
         nothing to paint, so the last good frame stays up.
         """
         now = time.monotonic()
-        self._last_user = now
         if self._closed:
             return None
         try:
             index = tuple(int(v) for v in np.atleast_1d(np.asarray(indices)).ravel())
+            self._note_read_position(index)
             if not self.is_ready(index):
-                self.reads_declined += 1
-                return None
+                return self._decline(index, now)
             frame = self.render(index)
             if frame is None:
-                self.reads_declined += 1
-                return None
+                return self._decline(index, now)
             self.frames_served += 1
             # Narrate the READ path separately from the auto-sample paint above:
             # this line is the only direct evidence that dragging the navigator
@@ -326,6 +384,35 @@ class ProgressiveSignalPreview:
         if len(shape) <= len(self.nav_shape):
             return 0
         return int(np.prod(shape[len(self.nav_shape):])) * data.dtype.itemsize
+
+    def seed_read_position(self) -> None:
+        """Seed the latch's reference position from where the crosshair ALREADY
+        sits, so the user's FIRST move is recognised as a move (with no seed
+        the first read only establishes the baseline and the latch would trail
+        one position behind the drag). Prepared exactly as the read prepares
+        the index it hands :meth:`read_frame`, so an unmoved crosshair compares
+        equal."""
+        from spyde.drawing.update_functions import (
+            _NAVIGATION_AXES, _prepare_nav_indices)
+
+        manager = getattr(self.tree, "navigator_plot_manager", None)
+        for selector in getattr(manager, "all_navigation_selectors", None) or ():
+            if self._last_index is not None:
+                return
+            try:
+                prepared = _prepare_nav_indices(
+                    self.tree.root, selector.current_indices,
+                    selector.is_integrating, data=_NAVIGATION_AXES)
+                if prepared is None:
+                    continue
+                if np.ndim(prepared) > 1:
+                    # A region reads through region_frame, i.e. its centre.
+                    prepared = np.mean(np.asarray(prepared), axis=0).astype(int)
+                self._last_index = tuple(
+                    int(v) for v in np.atleast_1d(np.asarray(prepared)).ravel())
+            except Exception as e:
+                log.debug("[%s] seeding the latch position failed: %s",
+                          self.name, e)
 
     # ── teardown ─────────────────────────────────────────────────────────────
 
@@ -378,6 +465,7 @@ def attach_signal_preview(session, tree, *, render: Callable[[tuple], Any],
         tree.set_reader_override(tree.root, preview)
         for plot in list(tree.signal_plots):
             plot.needs_auto_level = True
+        preview.seed_read_position()
     except Exception as e:
         log.debug("attaching live signal preview failed: %s", e)
         return None

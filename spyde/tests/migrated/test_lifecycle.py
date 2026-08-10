@@ -185,6 +185,48 @@ class TestWaitForVectors:
         assert not fired
 
 
+class TestResultTreeLock:
+    """The one gate a progressive result window is closed behind while its batch
+    fills it (lifecycle.lock_tree / refuse_if_locked). Everything that would add
+    a node or run an action calls `refuse_if_locked`; the value of ONE helper is
+    that a new entry point either calls it or is visibly missing it."""
+
+    def test_unlocked_tree_is_permitted_silently(self, captured_messages):
+        tree = _FakeTree()
+        assert lifecycle.tree_lock(tree) is None
+        assert lifecycle.refuse_if_locked(tree, "'Rebin'") is False
+        assert captured_messages == []
+
+    def test_locked_tree_is_refused_with_a_user_facing_error(self,
+                                                             captured_messages):
+        """Refusal must SAY so. A gate that silently no-ops reads as a broken
+        button, which is worse than the action running."""
+        tree = _FakeTree()
+        lifecycle.lock_tree(tree, "Find Diffraction Vectors")
+        assert lifecycle.tree_lock(tree) == "Find Diffraction Vectors"
+        assert lifecycle.refuse_if_locked(tree, "'Rebin'") is True
+        errs = [m for m in captured_messages if m.get("type") == "error"]
+        assert len(errs) == 1
+        assert "Rebin" in errs[0]["text"]
+        assert "Find Diffraction Vectors" in errs[0]["text"]
+
+    def test_unlock_releases_and_is_idempotent(self):
+        """The batch clears the lock twice — where the result attaches AND in
+        its teardown — because only the teardown runs on a cancelled or failed
+        run, and a stranded lock would leave the window refusing everything for
+        the rest of the session."""
+        tree = _FakeTree()
+        lifecycle.lock_tree(tree, "Find Diffraction Vectors")
+        lifecycle.unlock_tree(tree)
+        lifecycle.unlock_tree(tree)
+        assert lifecycle.tree_lock(tree) is None
+        assert lifecycle.refuse_if_locked(tree, "'Rebin'") is False
+
+    def test_no_tree_is_not_a_refusal(self):
+        """A bare figure window / a plot with no tree must not be gated."""
+        assert lifecycle.refuse_if_locked(None, "'Rebin'") is False
+
+
 class TestReplaceTreeAttr:
     def test_removes_old_and_sets_new(self):
         class Overlay:

@@ -52,6 +52,42 @@ def _write_minimal_mrc(path: str, frames) -> None:
         handle.write(np.ascontiguousarray(frames).tobytes())
 
 
+def _ready_walk_target(mask: np.ndarray):
+    """The nav position a leftward crosshair walk should START from, given a
+    boolean ready mask: ``(iy, ix, ready_left)`` near the right end of the
+    longest contiguous ready run in any row, or ``None`` when nothing is ready.
+
+    Starting near a run's right end means a walk of up to ``ready_left``
+    columns to the LEFT reads only computed positions — which is what
+    ``_test_aim_ready_position`` promises the e2e spec. The start is backed off
+    a quarter-run from the run's true right end, so the walk begins inside the
+    computed region rather than on its boundary (where one pixel of rounding in
+    the spec's index→screen conversion lands it on uncomputed data).
+    Leading (stack) nav dims are collapsed at index 0: the aim describes the
+    SPATIAL crosshair only.
+    """
+    m = np.asarray(mask, dtype=bool)
+    if m.ndim > 2:
+        m = m[(0,) * (m.ndim - 2)]
+    if m.ndim == 1:
+        m = m[None, :]
+    if not m.any():
+        return None
+    best = None       # (run_len, iy, stop)
+    for iy in range(m.shape[0]):
+        row = m[iy]
+        # Run-length encode: boundaries where the value changes.
+        edges = np.flatnonzero(np.diff(np.concatenate(([0], row.astype(np.int8),
+                                                       [0]))))
+        for start, stop in zip(edges[::2], edges[1::2]):
+            run = int(stop - start)
+            if best is None or run > best[0]:
+                best = (run, iy, int(stop))
+    run, iy, stop = best
+    back = run // 4
+    return iy, stop - 1 - back, run - back
+
+
 class TestHarnessMixin:
     def _dump_dask_state(self, only: str | None = None) -> None:
         """Log a compact snapshot of the dask cluster's state at WARNING level
@@ -856,6 +892,85 @@ class TestHarnessMixin:
         except Exception as e:
             log.exception("test_add_second_navigator failed")
             emit_error(f"test_add_second_navigator failed: {e}")
+
+    def _test_aim_ready_position(self) -> None:
+        """Test-only: REPORT where a crosshair walk over already-computed data
+        should go on a PROGRESSIVE result window — it does not move anything.
+
+        Narrates one line the e2e spec parses::
+
+            [test-aim] walk target iy=44 ix=98 from iy=32 ix=104
+                       (dix=-6 diy=12, 99 ready columns to the left;
+                        nav 208x64; 7152/13312 positions ready)
+
+        Why the spec cannot pick the target itself: the progressive fill's
+        *geometry* is not knowable from outside. ``dispatch_chunks`` submits
+        chunks in column-BANDED order (``_band_key``: 2-row bands, left→right),
+        the chunk grid is uneven (sped_ag: 2×5, the bottom-row chunks 2.2×
+        smaller and so faster), and completion order is scheduler-jittered
+        across the primed in-flight window — so "the ready region is the top
+        rows" (what the spec used to assume and drag towards) is wrong in every
+        regime, and the exact ready set at a ``SPYDE_TEST_HOLD`` park differs
+        run to run. The preview's ``_ready`` mask IS the ground truth its slice
+        function serves from; aiming from anything else is a guess.
+
+        **Why it REPORTS instead of moving the crosshair.** The first version
+        wrote the widget server-side (``w.set(cx=…, cy=…)``) and left the spec
+        to grab the moved crosshair. Measured result: the renderer drew the
+        crosshair at the new position, the Playwright press landed exactly on
+        it, and NO pointer event reached the backend — zero
+        ``update_data`` submits for that selector, so the preview served
+        nothing and the spec failed claiming a routing bug that did not exist.
+        The crosshair then snapped back to its pre-aim position (the drag's
+        measured travel was exactly the aim's own displacement, reversed). A
+        backend-side widget write and the renderer's own widget state had come
+        apart, so the press hit-tested against a position the renderer no
+        longer agreed with.
+
+        Reporting keeps the two in step by construction: the spec grabs the
+        crosshair where the RENDERER draws it and moves it with the mouse, which
+        is the path a user takes and the path
+        ``vectors_dp_follows_nav.spec.ts`` already proves works on this same
+        window. Everything here is expressed as a DELTA from the crosshair's
+        current position for the same reason — the spec converts nav indices to
+        screen pixels from the drawn image rect, and never needs an absolute
+        screen origin.
+        """
+        try:
+            tree = next((t for t in reversed(self.signal_trees)
+                         if getattr(t, "_live_signal_preview", None) is not None),
+                        None)
+            preview = getattr(tree, "_live_signal_preview", None)
+            if preview is None:
+                log.warning("[test-aim] no live signal preview on any tree")
+                return
+            with preview._lock:
+                mask = preview._ready.copy()
+            target = _ready_walk_target(mask)
+            if target is None:
+                log.warning("[test-aim] preview has no computed positions yet")
+                return
+            iy, ix, run = target
+
+            mgr = tree.navigator_plot_manager
+            pw = next(iter(mgr.navigation_selectors.keys()))
+            sel = mgr.navigation_selectors[pw][0]
+            # Where the crosshair is NOW, in the same (iy, ix) frame as the
+            # ready mask. `current_indices` is the selector's own committed
+            # position ([[ix, iy]] for a 2-D crosshair) and therefore agrees
+            # with the widget the renderer is drawing.
+            cur = np.asarray(sel.current_indices)
+            if cur.ndim >= 2:
+                cur = cur[0]
+            ix0, iy0 = int(cur[-2]), int(cur[-1])
+            nav_h, nav_w = preview.nav_shape[-2], preview.nav_shape[-1]
+            log.info("[test-aim] walk target iy=%d ix=%d from iy=%d ix=%d "
+                     "(dix=%d diy=%d, %d ready columns to the left; nav %dx%d; "
+                     "%d/%d positions ready)",
+                     iy, ix, iy0, ix0, ix - ix0, iy - iy0, run, nav_w, nav_h,
+                     preview.ready_count, preview.n_positions)
+        except Exception as e:
+            log.exception("[test-aim] failed: %s", e)
 
     def _test_nav_drag(self, targets: list) -> None:
         """Test-only: drive the navigator crosshair through a list of (x, y) nav

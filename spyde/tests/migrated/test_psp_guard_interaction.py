@@ -8,21 +8,19 @@ every read mid-fill.)
 Finding: NO — structurally impossible, and pinned here so it stays that way.
 
 The guard lives INSIDE ``update_from_navigation_selection``
-(update_functions.py, the capture-once + ``_nav_readable_data`` skip). But a
-progressive result window's navigator→signal reads never run that function
-while the preview is installed: ``ProgressiveSignalPreview.install()``
-REPLACES the selector's child entry wholesale (``sel.children[child] =
-self.slice_fn``, live_signal.py) and ``BaseSelector._run_update`` dispatches
-``fn = self.children[child]`` — there is no shared upstream through the
-guard. The preview's slice function renders from the retained peaks blocks
+(update_functions.py, the capture-once + ``_nav_readable_data`` skip), but a
+progressive result window's navigator→signal reads resolve the reader pinned on
+the tree (``tree.set_reader_override(tree.root, preview)``) BEFORE any guard
+that asks whether ``.data`` can be sliced — the override IS the read for that
+node. The preview renders from the retained peaks blocks
 (``LiveVectorFrames``) and consults readiness (``is_ready``), never the
 signal's ``.data`` — so even parking hyperspy's deepcopy placeholder
 (``array([None], dtype=object)``, the exact state the guard skips on) on the
 result tree's root for the WHOLE drive changes nothing: every dispatcher read
 at a computed position still serves.
 
-The guard applies exactly where #126 put it: the DEFAULT slice path — which is
-what the selector falls back to after ``preview.close()``.
+The guard applies exactly where #126 put it: the DEFAULT read — which is what
+the signal plot falls back to after ``preview.close()`` unpins the reader.
 """
 from __future__ import annotations
 
@@ -210,12 +208,12 @@ class TestGuardCannotStarvePreviewReads:
             self, window, caplog):
         """The seam, pinned from both sides with the SAME parked placeholder:
 
-        - preview installed → the read is ``preview.slice_fn`` → serves;
-        - preview closed → the selector falls back to the default
-          ``update_from_navigation_selection`` → the #126 guard skips the frame
-          (its designed behaviour), quietly.
+        - preview pinned → the read resolves the preview → serves;
+        - preview closed → the reader is unpinned and the read falls through
+          to the default path → the #126 guard skips the frame (its designed
+          behaviour), quietly.
 
-        So the guard and the preview occupy the same slot ALTERNATELY — the
+        So the guard and the preview answer the same read ALTERNATELY — the
         guard is not upstream of the preview and cannot have caused a
         zero-served drag on a preview-owned window."""
         caplog.set_level(logging.DEBUG, logger="spyde.drawing.update_functions")
@@ -224,7 +222,7 @@ class TestGuardCannotStarvePreviewReads:
         preview = _attach_ready_preview(session, tree)
         sel = _nav_selector(tree)
         child = tree.signal_plots[0]
-        assert sel.children[child] is preview.slice_fn
+        assert tree.reader_override_for(tree.root, child) is preview
         _wait_dispatcher_idle()
 
         root = tree.root
@@ -237,9 +235,7 @@ class TestGuardCannotStarvePreviewReads:
             assert not _guard_skip_records(caplog)
 
             preview.close()
-            from spyde.drawing.update_functions import (
-                update_from_navigation_selection)
-            assert sel.children[child] is update_from_navigation_selection
+            assert tree.reader_override_for(tree.root, child) is None
 
             served1 = preview.frames_served
             _drive(sel, ix=1, iy=3)
