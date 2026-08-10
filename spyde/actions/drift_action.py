@@ -15,13 +15,19 @@ options. Information overload."**
     drift_discard     drop the solved model (and stop a solve in flight)
     drift_commit      add the LAZY corrected node to the tree
 
-**The caret carries the TASK, not the algorithm.** Its default face is two
-toggles and one button. Reference mode, sub-pixel factor, max shift,
-interpolation order and the model tabs are all real and all still here — they
-sit behind a collapsed *Advanced* in the caret, and the schema below (the one
-source of truth, mirrored by ``registry._WIZARD_SCHEMAS``) tags them so any
-host renders the same split. Nothing was deleted; provenance still records
-every parameter.
+**The caret carries the TASK, not the algorithm.** Its default face is one
+toggle and one button. Pair span, sub-pixel factor, max shift, interpolation
+order and the model tabs are all real and all still here — they sit behind a
+collapsed *Advanced* in the caret, and the schema below (the one source of
+truth, mirrored by ``registry._WIZARD_SCHEMAS``) tags them so any host renders
+the same split. Provenance still records every parameter.
+
+The face used to carry a second toggle, *Ignore bad frames*. It is gone because
+the solver no longer has a bad-frame gate to switch: ``solve_translation``
+measures ~``band`` frame PAIRS per unknown and solves them by robust least
+squares, so a bad frame is outvoted by the consensus of the pairs that do not
+touch it. There is nothing left for the user to decide there — see
+``spyde/drift/translation.py``.
 
 **Discovery comes before commitment.** The centrepiece is a draggable
 rectangle on the movie plus a live drift-corrected sum of just that box over
@@ -188,13 +194,11 @@ _ROI_COLOR = "#94e2d5"
 #: discovery step, and it is what tells you the box is worth committing to.
 DEFAULTS: dict[str, Any] = dict(
     use_roi=False,
-    reject_outliers=True,
     method="rigid",
     upsample=8,
     max_shift=32.0,
-    reference="running",
+    band=12,
     apodize=True,
-    normalize=True,
     order=1,
     preview_frames=_PREVIEW_FRAMES,
 )
@@ -214,17 +218,13 @@ class DriftWizard(WizardController):
             "name": "Use ROI for alignment", "type": "bool",
             "default": DEFAULTS["use_roi"],
         },
-        "reject_outliers": {
-            "name": "Ignore bad frames", "type": "bool",
-            "default": DEFAULTS["reject_outliers"],
-        },
         "method": {
             "name": "Model", "type": "enum", "default": DEFAULTS["method"],
             "choices": list(METHODS), "tab": "Advanced",
         },
-        "reference": {
-            "name": "Reference", "type": "enum", "default": DEFAULTS["reference"],
-            "choices": ["running", "sequential", "first"], "tab": "Advanced",
+        "band": {
+            "name": "Pair span (frames)", "type": "int", "default": DEFAULTS["band"],
+            "min": 1, "max": 200, "tab": "Advanced",
         },
         "upsample": {
             "name": "Sub-pixel factor", "type": "int", "default": DEFAULTS["upsample"],
@@ -237,10 +237,6 @@ class DriftWizard(WizardController):
         "apodize": {
             "name": "Edge taper", "type": "bool", "default": DEFAULTS["apodize"],
             "tab": "Advanced",
-        },
-        "normalize": {
-            "name": "Phase correlation", "type": "bool",
-            "default": DEFAULTS["normalize"], "tab": "Advanced",
         },
         "order": {
             "name": "Interpolation order", "type": "int", "default": DEFAULTS["order"],
@@ -716,8 +712,7 @@ def _coerce(payload: dict | None) -> dict:
     p["method"] = str(p["method"]).lower()
     if p["method"] not in METHODS:
         p["method"] = DEFAULTS["method"]
-    if p["reference"] not in ("running", "sequential", "first"):
-        p["reference"] = DEFAULTS["reference"]
+    p["band"] = int(min(200, max(1, p["band"])))
     p["upsample"] = max(1, int(p["upsample"]))
     p["max_shift"] = max(1.0, float(p["max_shift"]))
     p["order"] = int(min(3, max(0, p["order"])))
@@ -727,9 +722,7 @@ def _coerce(payload: dict | None) -> dict:
 
 def _solver_kwargs(p: dict, roi=None) -> dict:
     return dict(upsample=int(p["upsample"]), max_shift=float(p["max_shift"]),
-                reference=str(p["reference"]), apodize=bool(p["apodize"]),
-                normalize=bool(p["normalize"]),
-                reject_outliers=bool(p["reject_outliers"]),
+                band=int(p["band"]), apodize=bool(p["apodize"]),
                 roi=None if roi is None else tuple(int(v) for v in roi))
 
 
@@ -1164,6 +1157,14 @@ def drift_run(session, plot, payload) -> None:
                 return
             wiz.model = model
             tree.drift = model
+            # Repaint the curve with the SOLVED values. What streamed during the
+            # solve is `solve_translation`'s provisional causal estimate — the
+            # global least-squares answer does not exist until every pair has
+            # been measured, so the live trace is necessarily a preview of it.
+            # They agree closely; overwriting is cheap and makes the curve the
+            # user keeps the one the model actually contains.
+            wiz.push_trace([(i, float(dy), float(dx))
+                            for i, (dy, dx) in enumerate(model.shifts)])
             wiz.update_check(after=after)
             emit({"type": "drift_result", "window_id": wiz.src_window_id,
                   "shifts": [[float(a), float(b)] for a, b in model.shifts],
@@ -1171,7 +1172,7 @@ def drift_run(session, plot, payload) -> None:
                   "roi": None if roi is None else [int(v) for v in roi],
                   "max_abs_shift": float(model.max_abs_shift),
                   "gain": float(gain),
-                  "rejected": int(model.params.get("rejected_from_reference", 0)),
+                  "residual": float(model.params.get("ls_residual_px", float("nan"))),
                   "cancelled": bool(stopped[0])})
             _emit_state(wiz)
             solved = int(np.isfinite(model.shifts).all(axis=1).sum())

@@ -2,15 +2,21 @@
  * DriftWizard.tsx — the Drift Correction caret (`drift_` staged actions,
  * backend: spyde/actions/drift_action.py; plan §A8 + §0.9a).
  *
- * **Two toggles and a button.** The first version of this caret had thirteen
+ * **One toggle and a button.** The first version of this caret had thirteen
  * controls on its face — three model tabs, four numeric fields, three
  * checkboxes, Solve/Apply/Cancel — and the review was "way too complicated.
  * Too many options. Information overload." Plan §0.9a is the rule that came out
- * of it: the default face carries the TASK, not the algorithm. Reference mode,
+ * of it: the default face carries the TASK, not the algorithm. Pair span,
  * sub-pixel factor, max shift, interpolation order and the model tabs all still
  * exist, all still reach the backend, and all still land in provenance — they
  * live behind the collapsed `Advanced` disclosure, because drift's parameters
  * have one right answer we already know.
+ *
+ * The face lost its second toggle, `Ignore bad frames`, when the solver stopped
+ * having a bad-frame gate: `solve_translation` now measures ~`band` frame PAIRS
+ * per unknown and solves them by robust least squares, so a bad frame is
+ * outvoted by the pairs that do not touch it rather than switched off. There is
+ * nothing left there for the user to decide.
  *
  * **What the caret does NOT show.** The dy/dx curve used to be a 40 px inline
  * SVG here; it is now its own figure window (`Drift dy/dx`), opened by
@@ -36,7 +42,7 @@
  * model's provenance, which is worse than the missing feature.
  */
 import React from 'react'
-import { WizardShell, TabRow, Field, NumInput, Select, Check, S } from './WizardShell'
+import { WizardShell, TabRow, Field, NumInput, Check, S } from './WizardShell'
 import { useWizardLifecycle, useDebouncedAction, useWizardEvent, CommitButton } from './wizardHooks'
 import type { SendAction } from './wizardHooks'
 
@@ -68,46 +74,35 @@ const UNAVAILABLE: Partial<Record<Method, string>> = {
   rigid_affine: 'the affine drift search (plan A4) is not implemented in spyde.drift yet',
 }
 
-type Reference = 'running' | 'sequential' | 'first'
-const REFERENCES: readonly { value: Reference; label: string }[] = [
-  { value: 'running', label: 'Running average' },
-  { value: 'sequential', label: 'Previous frame' },
-  { value: 'first', label: 'First frame' },
-]
-
 /** Mirrors `drift_action.DEFAULTS`. */
 interface DriftSaved {
   useRoi: boolean
-  rejectOutliers: boolean
   method: Method
-  reference: Reference
+  band: number
   upsample: number
   maxShift: number
   apodize: boolean
-  normalize: boolean
   order: number
   previewFrames: number
 }
 const DEFAULTS: DriftSaved = {
-  useRoi: false, rejectOutliers: true, method: 'rigid', reference: 'running',
-  upsample: 8, maxShift: 32, apodize: true, normalize: true, order: 1,
+  useRoi: false, method: 'rigid', band: 12,
+  upsample: 8, maxShift: 32, apodize: true, order: 1,
   previewFrames: 20,
 }
 const _driftStore = new Map<number, DriftSaved>()
 
 interface Preview { roi: number[] | null; frames: number; gain: number }
-interface Result { maxShift: number; gain: number; rejected: number; cancelled: boolean }
+interface Result { maxShift: number; gain: number; residual: number; cancelled: boolean }
 
 export function DriftWizard({ caretPos, windowId, sendAction, onClose }: Props) {
   const saved = _driftStore.get(windowId) ?? DEFAULTS
   const [useRoi, setUseRoi] = React.useState(saved.useRoi)
-  const [rejectOutliers, setRejectOutliers] = React.useState(saved.rejectOutliers)
   const [method, setMethod] = React.useState<Method>(saved.method)
-  const [reference, setReference] = React.useState<Reference>(saved.reference)
+  const [band, setBand] = React.useState(saved.band)
   const [upsample, setUpsample] = React.useState(saved.upsample)
   const [maxShift, setMaxShift] = React.useState(saved.maxShift)
   const [apodize, setApodize] = React.useState(saved.apodize)
-  const [normalize, setNormalize] = React.useState(saved.normalize)
   const [order, setOrder] = React.useState(saved.order)
   const [previewFrames, setPreviewFrames] = React.useState(saved.previewFrames)
 
@@ -122,8 +117,7 @@ export function DriftWizard({ caretPos, windowId, sendAction, onClose }: Props) 
 
   const vals = React.useRef<DriftSaved>(saved)
   vals.current = {
-    useRoi, rejectOutliers, method, reference,
-    upsample, maxShift, apodize, normalize, order, previewFrames,
+    useRoi, method, band, upsample, maxShift, apodize, order, previewFrames,
   }
   React.useEffect(() => { _driftStore.set(windowId, vals.current) })
 
@@ -131,9 +125,9 @@ export function DriftWizard({ caretPos, windowId, sendAction, onClose }: Props) 
   const params = (): Record<string, unknown> => {
     const v = vals.current
     return {
-      use_roi: v.useRoi, reject_outliers: v.rejectOutliers, method: v.method,
-      reference: v.reference, upsample: v.upsample, max_shift: v.maxShift,
-      apodize: v.apodize, normalize: v.normalize, order: v.order,
+      use_roi: v.useRoi, method: v.method, band: v.band,
+      upsample: v.upsample, max_shift: v.maxShift,
+      apodize: v.apodize, order: v.order,
       preview_frames: v.previewFrames,
     }
   }
@@ -183,10 +177,11 @@ export function DriftWizard({ caretPos, windowId, sendAction, onClose }: Props) 
 
   useWizardEvent('spyde:drift_result', windowId, (d) => {
     const gain = Number(d.gain)
+    const residual = Number(d.residual)
     setResult({
       maxShift: Number(d.max_abs_shift ?? 0),
       gain: Number.isFinite(gain) ? gain : NaN,
-      rejected: Number(d.rejected ?? 0),
+      residual: Number.isFinite(residual) ? residual : NaN,
       cancelled: Boolean(d.cancelled),
     })
     setProgress(null)
@@ -230,8 +225,6 @@ export function DriftWizard({ caretPos, windowId, sendAction, onClose }: Props) 
       {/* The whole default face: two toggles, one number, one button. */}
       <Check testid="drift-use-roi" checked={useRoi} onChange={live(setUseRoi)}
         label="Use ROI for alignment" />
-      <Check testid="drift-reject" checked={rejectOutliers}
-        onChange={live(setRejectOutliers)} label="Ignore bad frames" />
 
       <RoiReadout preview={preview} useRoi={useRoi} />
 
@@ -253,7 +246,12 @@ export function DriftWizard({ caretPos, windowId, sendAction, onClose }: Props) 
             {result.cancelled ? '◐' : '✓'}{' '}
             {Number.isFinite(result.gain) ? `${result.gain.toFixed(1)}x sharper · ` : ''}
             {result.maxShift.toFixed(1)} px drift
-            {result.rejected ? ` · ${result.rejected} bad frames` : ''}
+            {/* The least-squares residual over the measured frame pairs: how far
+                the pairwise measurements disagree with the single trajectory
+                fitted to them. Sub-pixel means the solve is self-consistent; a
+                large value means the movie has no ONE rigid motion (or the
+                landmark left the box). */}
+            {Number.isFinite(result.residual) ? ` · ${result.residual.toFixed(2)} px residual` : ''}
           </div>
           <div style={btnRowStyle}>
             {/* Apply adds the LAZY corrected node (map_blocks over the source's
@@ -278,9 +276,12 @@ export function DriftWizard({ caretPos, windowId, sendAction, onClose }: Props) 
         <div data-testid="drift-unavailable" style={S.hint}>
           {locked ?? 'Rigid+Affine is not implemented in spyde.drift yet.'}
         </div>
-        <Field label="Reference">
-          <Select testid="drift-reference" value={reference} options={REFERENCES}
-            onChange={live(setReference)} />
+        {/* How many frames back each frame is correlated against. Every pair
+            within the span is one measurement, so this is the redundancy the
+            robust solve spends to outvote a bad frame. */}
+        <Field label="Pair span">
+          <NumInput testid="drift-band" value={band} step="1" width={56}
+            onChange={live(setBand)} />
         </Field>
         <Field label="Sub-pixel factor">
           <NumInput testid="drift-upsample" value={upsample} step="1" width={56}
@@ -300,8 +301,6 @@ export function DriftWizard({ caretPos, windowId, sendAction, onClose }: Props) 
         </Field>
         <Check testid="drift-apodize" checked={apodize} onChange={live(setApodize)}
           label="Edge taper" />
-        <Check testid="drift-normalize" checked={normalize}
-          onChange={live(setNormalize)} label="Phase correlation" />
         <div data-testid="drift-frames" style={S.hint}>
           {nFrames ? `${nFrames} frames` : 'reading the movie…'}
           {solved ? ' · solved' : ''}
