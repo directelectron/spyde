@@ -307,25 +307,41 @@ class _PreviewDriver:
     arithmetic runs here.
     """
 
-    __slots__ = ("_wiz",)
+    __slots__ = ("_wiz", "_t_submit")
 
     def __init__(self, wizard) -> None:
         self._wiz = wizard
+        self._t_submit = 0.0
 
     def submit(self, force: bool = False) -> None:
         from spyde.drawing.selectors.base_selector import _nav_dispatcher
         if not self._wiz._closed:
+            self._t_submit = time.perf_counter()
             _nav_dispatcher.submit(self, force=force)
 
     def _run_update(self, force: bool = False, **_kw) -> None:
         wiz = self._wiz
         if wiz._closed:
             return
+        # QUEUE WAIT is the number that matters here and it is invisible from
+        # inside the step: the dispatcher is SHARED with every navigator update,
+        # so a preview submitted while the navigator is painting a 4096² frame
+        # waits behind it. A fast step and a slow caret are the same picture
+        # unless these two are reported separately.
+        prof = ActionProfile("drift_preview_step")
+        queue_ms = (time.perf_counter() - self._t_submit) * 1e3
+        cold = wiz._preview_cache is None
+        with prof.stage("cache"):
+            _ensure_preview_cache(wiz)
         try:
-            result = _preview_step(wiz)
+            with prof.stage("step"):
+                result = _preview_step(wiz)
         except Exception as exc:
             log.debug("[drift] live preview step failed: %s", exc)
+            prof.done("raised")
             return
+        prof.info(queue_ms=round(queue_ms, 1), cold_cache=cold)
+        prof.done()
         if result is None or wiz._closed:
             return
         result["force"] = bool(force)
@@ -655,13 +671,27 @@ class DriftWizard(WizardController):
         before = np.asarray(before, np.float32)
         zeros = np.zeros_like(before)
 
+        # The "corrected" panels start as a COPY OF THE RAW SUM, not zeros.
+        #
+        # A panel initialised to zeros renders solid black, and a solid black
+        # panel next to a real image is indistinguishable from a broken feature —
+        # which is exactly how this was reported ("nothing visibly happens").
+        # Blank-or-black is a failure state per CLAUDE.md, and the window sat in
+        # one from the moment it opened until a solve finished.
+        #
+        # Seeding with the raw sum makes the window honest at every instant: the
+        # two panels are a BEFORE/AFTER pair, and before you have corrected
+        # anything the honest "after" IS the before. They start identical, and the
+        # instant Correct Drift lands one of them changes — which is the whole
+        # comparison the window exists to show. The titles say which state you are
+        # in so "identical" cannot be misread as "correction did nothing".
         panels = {
             "before": ax[0].imshow(before, cmap="gray"),
-            "after": ax[1].imshow(zeros, cmap="gray"),
+            "after": ax[1].imshow(before.copy(), cmap="gray"),
             "roi_raw": ax[2].imshow(zeros, cmap="gray"),
             "roi_aligned": ax[3].imshow(zeros, cmap="gray"),
         }
-        titles = {"before": "Raw sum", "after": "Corrected sum",
+        titles = {"before": "Raw sum", "after": "Corrected sum — press Correct Drift",
                   "roi_raw": "ROI raw", "roi_aligned": "ROI aligned"}
         self._panels = panels
         for key, title in titles.items():
@@ -699,6 +729,7 @@ class DriftWizard(WizardController):
             return
         try:
             self._panels["after"].set_data(np.asarray(after, np.float32))
+            self._set_panel_title("after", "Corrected sum")
         except Exception as exc:
             log.debug("[drift] painting the corrected sum failed: %s", exc)
 
@@ -1152,7 +1183,12 @@ def preview_alignment(get_frame, indices, roi, *, params, prof=None,
             crops.append(np.ascontiguousarray(frame, dtype=np.float32))
 
     with prof.stage("solve"):
-        model = solve_translation(crops, **_solver_kwargs(params))
+        # torch-CPU, explicitly. Measured on the 512² preview crops: cpu 6.8 ms
+        # warm vs cuda 7.3 ms vs numpy 18.4 ms — CUDA buys nothing at this size,
+        # and pinning to CPU keeps a per-drag-frame job off the device the full
+        # solve wants. (The ~3 s the FIRST torch call costs is process-wide import
+        # + init, not device choice; the session prewarms it in the background.)
+        model = solve_translation(crops, device="cpu", **_solver_kwargs(params))
     take = range(len(crops))
     st = max(1, int(display_stride))
     small = crops if st == 1 else [c[::st, ::st] for c in crops]
