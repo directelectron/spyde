@@ -44,11 +44,18 @@ class DriftModel:
         ``"rigid"``. Reserved for future model families (affine, non-rigid),
         which will keep ``shifts`` as their rigid component.
     reference
-        How the reference was formed: ``"running"`` (running Fourier average),
-        ``"sequential"`` (frame-to-frame, cumulative) or ``"fixed:<i>"``.
+        How the per-frame positions were tied together. ``solve_translation``
+        writes ``"least-squares"``: every pair within the measurement band
+        constrains the trajectory and frame 0 is the gauge, so there is no single
+        "reference frame" to name any more. Older models on disk carry the
+        retired mode names (``"running"``, ``"sequential"``, ``"fixed:<i>"``);
+        this field is provenance and is not interpreted on load.
     residuals
-        Optional ``(N,)`` per-frame correlation peak sharpness — a weak but free
-        quality signal. NaN where not computed.
+        Optional ``(N,)`` per-frame RMS pairwise residual, in pixels — how far the
+        measurements that touch this frame disagree with the fitted trajectory.
+        This is the model's quality signal, and unlike the correlation-peak
+        sharpness it replaced it is in a unit the user can act on. NaN where not
+        computed (a frame a cancelled solve never reached).
     params
         The solver arguments, for provenance and for re-running.
     """

@@ -1096,14 +1096,13 @@ class _PassState:
     which keeps the measurement loop allocation-free.
     """
 
-    __slots__ = ("pi", "pj", "c", "quality", "count", "reached")
+    __slots__ = ("pi", "pj", "c", "count", "reached")
 
     def __init__(self, n_frames: int, band: int = DEFAULT_BAND):
         cap = max(1, int(n_frames)) * max(1, int(band))
         self.pi = np.zeros(cap, np.int64)
         self.pj = np.zeros_like(self.pi)
         self.c = np.zeros((self.pi.size, 2), np.float64)
-        self.quality = np.zeros(self.pi.size, np.float64)
         self.count = 0
         self.reached = 0
 
@@ -1115,7 +1114,7 @@ class _PassState:
         if need <= self.pi.size:
             return
         cap = max(need, self.pi.size * 2)
-        for name in ("pi", "pj", "quality"):
+        for name in ("pi", "pj"):
             old = getattr(self, name)
             new = np.zeros(cap, old.dtype)
             new[:self.count] = old[:self.count]
@@ -1125,14 +1124,13 @@ class _PassState:
         new_c[:self.count] = old_c[:self.count]
         self.c = new_c
 
-    def add(self, i, j, c, q) -> None:
+    def add(self, i, j, c) -> None:
         n = len(i)
         self._grow(n)
         s = slice(self.count, self.count + n)
         self.pi[s] = i
         self.pj[s] = j
         self.c[s] = c
-        self.quality[s] = q
         self.count += n
 
 
@@ -1178,7 +1176,7 @@ def _measure_pass(ops, spectrum, state: _PassState, n_frames: int, band: int,
                 qual_all.append(q)
             shifts = np.concatenate(cand, axis=0)
             quality = np.concatenate(qual_all, axis=0)
-            state.add(idx, np.full(idx.size, j, np.int64), shifts, quality)
+            state.add(idx, np.full(idx.size, j, np.int64), shifts)
             # Provisional, causal estimate for the live trace: the MEDIAN of what
             # each already-placed predecessor says about this frame. A median, not
             # a mean, so one bad predecessor cannot drag the curve.

@@ -183,15 +183,20 @@ _ROI_DEFAULT_FRACTION = 0.5
 _ROI_COLOR = "#94e2d5"
 
 #: **Off by default, and that is a measurement, not caution.** A guessed centre
-#: box is NOT automatically the better correlation: on the ``particle_movie``
-#: fixture (96×112 frames, the default half-frame box = 48×56) the ROI solve
-#: comes back 1.03 px from the stamped ground truth where the whole-frame solve
-#: is 0.25 px — a quarter of the pixels is a quarter of the correlation signal,
-#: and the Tukey taper eats a larger fraction of a small box. So the default
-#: stays the answer we already know is right, and the ROI is what the user
+#: box is NOT automatically the better correlation, and since the solver became a
+#: plain (unwhitened) cross-correlation the gap has WIDENED: on the
+#: ``particle_movie`` fixture (96×112 frames, the default half-frame box = 48×56)
+#: the whole-frame solve lands 0.03 px from the stamped ground truth and the ROI
+#: solve ~5 px. Plain correlation is dominated by the BRIGHTEST features, and that
+#: box is mostly bright particles that move relative to the film carrying the
+#: stage motion; the whole frame contains enough film to outweigh them.
+#: See ``spyde/drift/translation.py``'s module docstring for the measurement.
+#:
+#: So the default stays the answer we know is right, and the ROI is what the user
 #: reaches for when the whole frame is the problem (a moving sample, a mostly
-#: featureless field). The preview runs on the box either way — that is the
-#: discovery step, and it is what tells you the box is worth committing to.
+#: featureless field) — on a box they have CHOSEN, not a guessed one. The preview
+#: runs on the box either way: that is the discovery step, and reporting a gain
+#: below 1 for a bad box is it working, not failing.
 DEFAULTS: dict[str, Any] = dict(
     use_roi=False,
     method="rigid",

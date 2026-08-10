@@ -780,12 +780,35 @@ class TestSchema:
         assert schema and schema is not dr.DriftWizard.parameters
 
     def test_schema_defaults_match_the_handler_defaults(self):
+        """The caret contract, BOTH directions.
+
+        A schema key with no DEFAULTS entry coerces to nothing; a DEFAULTS entry
+        with no schema key is a parameter no host can render and no payload will
+        ever carry, so it silently stays at its default forever. This has bitten
+        twice, and only the first direction was checked — which is exactly how
+        `reference`/`normalize`/`reject_outliers` could have been left behind in
+        one place after being removed from the other.
+        """
         from spyde.actions import registry
         schema = registry.wizard_parameters("drift")
         for key, spec in schema.items():
             assert key in dr.DEFAULTS, f"drift schema declares unknown param {key!r}"
             assert spec["default"] == dr.DEFAULTS[key], \
                 f"drift schema/{key} drifted from drift_action.DEFAULTS"
+        assert set(schema) == set(dr.DEFAULTS), (
+            f"DEFAULTS keys with no schema entry: {set(dr.DEFAULTS) - set(schema)}")
+
+    def test_every_default_reaches_the_solver_or_the_warp(self):
+        """No DEFAULTS entry may be inert. `_solver_kwargs` carries the solver's
+        share; `use_roi`/`order`/`preview_frames`/`method` are consumed by the
+        wizard itself. Anything outside both sets is a control that does nothing,
+        which is the failure mode this contract exists to catch."""
+        wizard_only = {"use_roi", "order", "preview_frames", "method"}
+        solver = set(dr._solver_kwargs(dict(dr.DEFAULTS)))
+        # `roi` is passed positionally by the caller, not from DEFAULTS.
+        solver.discard("roi")
+        unused = set(dr.DEFAULTS) - wizard_only - solver
+        assert not unused, f"DEFAULTS entries that reach nothing: {unused}"
 
     def test_every_stage_is_registered(self):
         from spyde.actions.registry import STAGED_HANDLERS, resolve_staged
