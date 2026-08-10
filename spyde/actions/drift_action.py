@@ -69,6 +69,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+import time as _time
 from typing import Any
 
 import numpy as np
@@ -100,7 +101,17 @@ _UNAVAILABLE = {
 #: unambiguously, and the cap is what keeps the check window responsive on a
 #: movie whose full pass costs as much as the solve itself. Evenly spaced, and
 #: the SAME indices for both sums, or the comparison means nothing.
-_SUM_MAX_FRAMES = 64
+#:
+#: **TWO.** The budget for opening the caret is 200 ms, and a frame read is the
+#: only thing in here that scales with the movie, so the count has to be the
+#: smallest number that still answers the question. Two frames answers it: the
+#: check image exists to show blurry-vs-sharp, and :meth:`DriftWizard.sum_indices`
+#: picks the FIRST and LAST frame, which is where the drift between them is
+#: largest and therefore where the raw sum is at its blurriest. Any interior
+#: sampling shows LESS blur, so a bigger n makes the comparison weaker as well as
+#: slower. What n>2 would buy is noise-averaging, and this image is not a
+#: measurement -- the numbers come from the solve.
+_SUM_MAX_FRAMES = 2
 
 #: …but a frame COUNT is size-blind, and that is what made the caret feel broken.
 #: 64 frames of the 96x112 test fixture is nothing; 64 frames of a 2048² movie is
@@ -119,9 +130,29 @@ _SUM_MAX_FRAMES = 64
 #: floor below lifts it to 8.
 _SUM_MAX_BYTES = 96 * 1024 * 1024
 
-#: Never drop below this however large the frames are — a sum of two frames is
-#: not a sharpness comparison, it is a coin toss.
-_SUM_MIN_FRAMES = 8
+#: Floor, kept only so a byte cap on an enormous frame cannot degenerate to one
+#: frame (a "sum" of one is not a comparison at all).
+_SUM_MIN_FRAMES = 2
+
+#: Longest edge of the check images, in pixels. They are THUMBNAILS — four of
+#: them live in a 340x300 px window, so each is drawn at roughly 170x150 — and
+#: building them at the movie's native 2048² costs on every downstream stage at
+#: once. Measured on a 60-frame 2048² .mrc, drift_open = 708 ms::
+#:
+#:     sum_io    78.8 ms   the actual memmap read
+#:     sum_acc  156.0 ms   float32 accumulate over 2 x 4 Mpx
+#:     panels   293.6 ms   four anyplotlib imshow panels at 2048²
+#:     html      58.3 ms   a 5.6 MB payload
+#:
+#: i.e. the disk is 11% and the other 89% is resolution nobody can see. Striding
+#: on read (the same trick the navigator's base frame uses — CLAUDE.md
+#: Live-Display §3, "the base is just a thumbnail the GPU upscales") cuts all four
+#: together: 1/8 stride is 64x fewer pixels to add, to draw and to serialise.
+#:
+#: The *gain* number is a RATIO of gradient energies measured on these same two
+#: images, so decimating both leaves the comparison meaningful; the absolute
+#: energies change, the verdict does not.
+_CHECK_MAX_EDGE = 512
 
 # Frames per streamed drift-trace message / per dy-dx repaint. One message per
 # frame would flood the PLOTAPP line protocol at the plan's target scale
@@ -516,6 +547,7 @@ class DriftWizard(WizardController):
         from spyde.actions.figure_registry import keep_alive
         from spyde.drawing.plots.plot import finalize_figure_html
 
+        _t = _time.perf_counter()
         figsize, aspect = _figure_geometry()
         fig, axes = apl.subplots(2, 2, figsize=figsize)
         ax = np.array(axes, dtype=object).ravel()
@@ -534,13 +566,19 @@ class DriftWizard(WizardController):
         for key, title in titles.items():
             self._set_panel_title(key, title)
 
+        _t_panels = _time.perf_counter()
         wid = self.session.next_window_id()
         fig_id = _electron.register(fig)
         html = finalize_figure_html(fig, fig_id)
+        _t_html = _time.perf_counter()
         keep_alive(int(wid), fig)
         emit({"type": "figure", "fig_id": fig_id, "window_id": int(wid),
               "html": html, "title": "Drift Check", "is_navigator": False,
               "aspect": float(aspect)})
+        log.info("[ACTION-PROFILE] check_window_parts panels=%.1fms html=%.1fms "
+                 "emit=%.1fms html_kb=%.0f",
+                 (_t_panels - _t) * 1e3, (_t_html - _t_panels) * 1e3,
+                 (_time.perf_counter() - _t_html) * 1e3, len(html) / 1024)
         self.window_id = int(wid)
         self._before_sum = before
         self.own_window(wid)
@@ -801,7 +839,15 @@ def _emit_state(wiz: DriftWizard, **extra) -> None:
 
 # ── streaming sums + the sharpness number ────────────────────────────────────
 
-def _stack_sum(get_frame, indices, shifts=None, *, order: int = 1) -> np.ndarray:
+def _check_stride(shape) -> int:
+    """Decimation for the check images — see :data:`_CHECK_MAX_EDGE`."""
+    if not shape:
+        return 1
+    return max(1, int(np.ceil(max(int(shape[0]), int(shape[1])) / _CHECK_MAX_EDGE)))
+
+
+def _stack_sum(get_frame, indices, shifts=None, *, order: int = 1,
+               prof=None, stride: int = 1) -> np.ndarray:
     """Mean of the selected frames, optionally drift-corrected first.
 
     Streams: one frame resident at a time plus one float64 accumulator, so this
@@ -812,19 +858,34 @@ def _stack_sum(get_frame, indices, shifts=None, *, order: int = 1) -> np.ndarray
     """
     acc = None
     hits = None
+    t_read = 0.0
+    t_acc = 0.0
     for i in indices:
+        _t = _time.perf_counter()
         frame = np.asarray(get_frame(int(i)), dtype=np.float32)
+        t_read += _time.perf_counter() - _t
+        _t = _time.perf_counter()
         if shifts is not None:
             s = shifts[int(i)]
             if np.all(np.isfinite(s)):
                 from spyde.drift import shift_frame
-                frame = shift_frame(frame, s, order=order)
+                # The shifts are in FULL-frame pixels; this frame is decimated,
+                # so the correction must be too or the "corrected" sum is wrong
+                # by the stride factor and looks worse than the raw one.
+                frame = shift_frame(frame, np.asarray(s, np.float64) / stride,
+                                    order=order)
         if acc is None:
             acc = np.zeros(frame.shape, np.float64)
             hits = np.zeros(frame.shape, np.int32)
         good = np.isfinite(frame)
         acc[good] += frame[good]
         hits[good] += 1
+        t_acc += _time.perf_counter() - _t
+    if prof is not None:
+        # The read and the arithmetic scale differently and want different fixes;
+        # a single "sum" number hides which one is the wall.
+        prof.info(sum_io_ms=round(t_read * 1e3, 1),
+                  sum_acc_ms=round(t_acc * 1e3, 1))
     if acc is None:
         return np.zeros((1, 1), np.float32)
     with np.errstate(invalid="ignore", divide="ignore"):
@@ -874,13 +935,20 @@ def _preview_indices(n_frames: int, k: int, frame_bytes: int) -> np.ndarray:
     return np.unique(np.linspace(0, n - 1, k).round().astype(int))
 
 
-def preview_alignment(get_frame, indices, roi, *, params, prof=None) -> dict:
+def preview_alignment(get_frame, indices, roi, *, params, prof=None,
+                      reads_region: bool = False) -> dict:
     """Align *indices* on *roi* alone and report how much sharper the sum got.
 
-    Reads one FULL frame at a time and keeps only the crop, so the resident set
-    is one frame plus ``len(indices)`` crops (bounded by
+    The resident set is one frame plus ``len(indices)`` crops (bounded by
     :data:`_PREVIEW_MAX_BYTES` at the caller). The crops ARE the region to
     correlate, so the solve runs with ``roi=None`` on them.
+
+    *reads_region* says whether ``get_frame`` accepts an ``(y0, x0, h, w)``
+    second argument and can read only that box. Readers from
+    :func:`spyde.drift.frames.frame_source` can; a bare ``ndarray.__getitem__``
+    cannot. An explicit flag rather than a signature probe, because a wrong guess
+    silently reads whole frames — exactly the cost this exists to remove, and it
+    would go unnoticed until the data got large.
 
     Returns ``{roi, frames, raw, aligned, gain, raw_energy, aligned_energy,
     max_abs_shift}``. *gain* is the whole point: > 1 means aligning this region
@@ -894,10 +962,16 @@ def preview_alignment(get_frame, indices, roi, *, params, prof=None) -> dict:
     crops: list[np.ndarray] = []
     with prof.stage("crop_read"):
         for i in indices:
-            frame = np.asarray(get_frame(int(i)), np.float32)
-            if roi is not None:
-                y0, x0, h, w = (int(v) for v in roi)
-                frame = frame[y0:y0 + h, x0:x0 + w]
+            # Push the crop DOWN to the reader instead of reading a whole frame
+            # and discarding most of it — on a memmap-backed .mrc that is the
+            # difference between reading the box and reading the movie.
+            if reads_region:
+                frame = np.asarray(get_frame(int(i), roi), np.float32)
+            else:
+                frame = np.asarray(get_frame(int(i)), np.float32)
+                if roi is not None:
+                    y0, x0, h, w = (int(v) for v in roi)
+                    frame = frame[y0:y0 + h, x0:x0 + w]
             crops.append(np.ascontiguousarray(frame, dtype=np.float32))
 
     with prof.stage("solve"):
@@ -965,8 +1039,14 @@ def drift_open(session, plot, payload) -> None:
         # applied without knowing how big a frame is.
         idx = wiz.sum_indices(n_frames, shape)
         prof.info(sum_frames=int(len(idx)))
+        stride = _check_stride(shape)
+        prof.info(stride=stride)
         with prof.stage("sum_read"):
-            return _stack_sum(get_frame, idx)
+            # Decimate IN THE READER, not after: the point is not to pay for
+            # pixels we discard. `stride=` still goes to _stack_sum because the
+            # SHIFTS have to be scaled to match (see there).
+            return _stack_sum(lambda i: get_frame(i, None, stride), idx,
+                              prof=prof, stride=stride)
 
     def _done(raw_sum):
         if not wiz.still(gen) or wiz._closed:
@@ -1075,7 +1155,7 @@ def _run_preview(wiz: DriftWizard) -> None:
 
     def _work():
         return preview_alignment(get_frame, indices, roi, params=params,
-                                 prof=prof)
+                                 prof=prof, reads_region=True)
 
     def _done(result):
         if not is_current(tree, "_drift_preview_gen", gen) or wiz._closed:
@@ -1209,8 +1289,10 @@ def drift_run(session, plot, payload) -> None:
         # One extra streaming pass over the SAME bounded subset the raw sum
         # used, so the two check images are comparable.
         with prof.stage("corrected_sum"):
-            after = _stack_sum(get_frame, wiz.sum_indices(n_frames), model.shifts,
-                               order=int(p["order"]))
+            _stride = _check_stride(_shape)
+            after = _stack_sum(lambda i: get_frame(i, None, _stride),
+                               wiz.sum_indices(n_frames), model.shifts,
+                               order=int(p["order"]), stride=_stride)
         # The same number the discovery preview reports, now for the whole
         # movie — measured on the worker because a 4096² gradient energy is
         # ~100 ms and the main thread is the navigator's.

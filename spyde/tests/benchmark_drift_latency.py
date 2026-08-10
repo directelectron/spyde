@@ -40,19 +40,25 @@ import numpy as np  # noqa: E402
 
 
 def _movie(path: str, size: int, frames: int):
-    """A real file on disk, loaded lazily at 1 frame/chunk — an in-situ movie."""
+    """A real .mrc on disk, loaded lazily — MEMMAP reads, no decode.
+
+    The backing is the measurement. An earlier version of this benchmark used
+    ``.hspy`` and reported ~180 ms/frame, which is HDF5 DECODE cost — a real
+    in-situ movie is .mrc / .de5 / raw binary, where a frame is a memmap slice
+    and the only cost is moving bytes. Measuring the wrong container inflates
+    every read stage and points the fix at the wrong thing.
+    """
     import hyperspy.api as hs
-    if not os.path.exists(path):
-        rng = np.random.default_rng(0)
-        block = rng.integers(0, 4000, (frames, size, size), dtype=np.uint16)
-        # A moving bright band so the drift solve has something to lock onto.
-        for i in range(frames):
-            x = int(size * 0.3) + 2 * i
-            block[i, :, x:x + 24] = 20000
-        hs.signals.Signal2D(block).save(path)
-        del block
+    from spyde.backend._session_testharness import TestHarnessMixin
+    rng = np.random.default_rng(0)
+    block = rng.integers(0, 4000, (frames, size, size), dtype=np.uint16)
+    # A moving bright band so the drift solve has something to lock onto.
+    for i in range(frames):
+        x = int(size * 0.3) + 2 * i
+        block[i, :, x:x + 24] = 20000
+    path = TestHarnessMixin._write_movie_mrc(block)
+    del block
     sig = hs.load(path, lazy=True)
-    sig.data = sig.data.rechunk((1, size, size))
     ax = sig.axes_manager.navigation_axes[0]
     ax.name, ax.units, ax.scale = "time", "s", 0.05
     sig.set_signal_type("insitu")
@@ -72,6 +78,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--size", type=int, default=2048)
     ap.add_argument("--frames", type=int, default=60)
+    ap.add_argument("--assert-budget", action="store_true",
+                    help="exit non-zero if a stage misses its budget (CI gate)")
     args = ap.parse_args(argv)
 
     # The profile lines are INFO on the backend logger; send them to stdout so
@@ -94,9 +102,24 @@ def main(argv=None) -> int:
 
     from spyde.backend.session import Session
     import spyde.actions.drift_action as dr
+    from spyde.backend import action_profile as _ap
 
-    path = os.path.join(tempfile.gettempdir(),
-                        f"spyde-drift-latency-{args.size}-{args.frames}.hspy")
+    # Capture every profile line so --assert-budget can judge them. The lines are
+    # the contract the budgets are written against, so read them rather than
+    # re-timing independently: a gate that measures something other than what the
+    # app reports would drift away from it silently.
+    seen: list[tuple[str, float]] = []
+    _orig_done = _ap.ActionProfile.done
+
+    def _done(self, extra: str = "") -> None:
+        if getattr(self, "_on", False):
+            total = (time.perf_counter() - self._t0) * 1e3
+            seen.append((self._label, total))
+        _orig_done(self, extra)
+
+    _ap.ActionProfile.done = _done
+
+    path = ""   # _movie picks the (reused) .mrc path
     print(f"movie: {args.frames} x {args.size}^2 uint16 lazy, 1 frame/chunk")
     t0 = time.perf_counter()
     sig = _movie(path, args.size, args.frames)
@@ -129,6 +152,35 @@ def main(argv=None) -> int:
               f"in {dt * 1e3:.0f}ms")
     finally:
         session.shutdown()
+
+    if args.assert_budget:
+        # Caret-open is the number the maintainer set: 200 ms from click to the
+        # Drift Check image being on screen. The others are tripwires an order of
+        # magnitude above where they sit, to catch a pathology rather than noise.
+        budgets = {"drift_open": 200.0, "drift_commit": 500.0, "drift_run": 30_000.0}
+        worst = {}
+        for label, total in seen:
+            worst[label] = max(worst.get(label, 0.0), total)
+        bad = []
+        print("")
+        print("budget check")
+        for label, limit in budgets.items():
+            got = worst.get(label)
+            if got is None:
+                print(f"  {label:<16} MISSING (never ran)")
+                bad.append(label)
+                continue
+            ok = got <= limit
+            print(f"  {label:<16} {got:8.1f} ms   budget {limit:8.1f} ms   "
+                  f"{'ok' if ok else 'OVER'}")
+            if not ok:
+                bad.append(label)
+        if bad:
+            print("")
+            print(f"FAILED: {', '.join(bad)}")
+            return 1
+        print("")
+        print("all stages inside budget")
     return 0
 
 
