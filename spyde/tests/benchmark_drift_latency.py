@@ -24,6 +24,7 @@ are the floor — the app pays these PLUS that multiplier on the read stages.
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import logging
 import os
 import sys
@@ -85,6 +86,11 @@ def main(argv=None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
     for noisy in ("hyperspy", "rsciio", "distributed", "asyncio", "matplotlib"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    # If a stage WEDGES rather than merely being slow, a timing print never
+    # arrives and the run looks identical to "still working". Dump every thread's
+    # stack periodically so a hang names its own line instead of being guessed at.
+    faulthandler.dump_traceback_later(90, repeat=True, exit=False, file=sys.stderr)
 
     from spyde.backend.session import Session
     import spyde.actions.drift_action as dr

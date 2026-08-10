@@ -102,6 +102,27 @@ _UNAVAILABLE = {
 #: the SAME indices for both sums, or the comparison means nothing.
 _SUM_MAX_FRAMES = 64
 
+#: …but a frame COUNT is size-blind, and that is what made the caret feel broken.
+#: 64 frames of the 96x112 test fixture is nothing; 64 frames of a 2048² movie is
+#: half a gigabyte of reads. Measured with ``SPYDE_ACTION_PROFILE=1`` on a
+#: 60-frame 2048² lazy movie::
+#:
+#:     [ACTION-PROFILE] drift_open total=10365ms  sum_read=9925  check_window=432
+#:
+#: 96% of a ten-second open, spent reading frames for a picture whose only job is
+#: to look blurry beside a sharper one — and it scales with frame size, which is
+#: how it reaches the reported minute on a real movie.
+#:
+#: So budget in BYTES, exactly as the ROI preview already does
+#: (:data:`_PREVIEW_MAX_BYTES`). float32 is the honest unit because that is what
+#: the accumulator holds: a 2048² frame costs 16 MB, so this admits ~6 and the
+#: floor below lifts it to 8.
+_SUM_MAX_BYTES = 96 * 1024 * 1024
+
+#: Never drop below this however large the frames are — a sum of two frames is
+#: not a sharpness comparison, it is a coin toss.
+_SUM_MIN_FRAMES = 8
+
 # Frames per streamed drift-trace message / per dy-dx repaint. One message per
 # frame would flood the PLOTAPP line protocol at the plan's target scale
 # (thousands of frames) for a curve the eye cannot follow at that resolution;
@@ -289,9 +310,21 @@ class DriftWizard(WizardController):
         from spyde.drift import frame_source
         return frame_source(self.signal())
 
-    def sum_indices(self, n_frames: int) -> np.ndarray:
+    def sum_indices(self, n_frames: int, shape=None) -> np.ndarray:
+        """Evenly-spaced frames for the check sums, capped by BYTES not count.
+
+        Cached on first call, and that is load-bearing rather than an
+        optimisation: ``drift_run`` re-reads these same indices for the corrected
+        sum, and a before/after pair measured over different frames compares
+        nothing. So the shape only has to be known the first time.
+        """
         if self._sum_indices is None or self._sum_indices.size == 0:
             k = min(int(n_frames), _SUM_MAX_FRAMES)
+            shape = shape or self._frame_shape
+            if shape:
+                frame_bytes = max(1, int(shape[0]) * int(shape[1]) * 4)
+                k = min(k, max(_SUM_MIN_FRAMES, _SUM_MAX_BYTES // frame_bytes))
+                k = min(k, int(n_frames))
             self._sum_indices = np.unique(
                 np.linspace(0, max(0, n_frames - 1), max(1, k)).round().astype(int))
         return self._sum_indices
@@ -928,7 +961,9 @@ def drift_open(session, plot, payload) -> None:
     _emit_state(wiz, n_frames=int(n_frames))
 
     def _work():
-        idx = wiz.sum_indices(n_frames)
+        # Pass the shape: the byte cap is the whole point and it cannot be
+        # applied without knowing how big a frame is.
+        idx = wiz.sum_indices(n_frames, shape)
         prof.info(sum_frames=int(len(idx)))
         with prof.stage("sum_read"):
             return _stack_sum(get_frame, idx)
