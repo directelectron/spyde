@@ -88,7 +88,7 @@ interface DriftSaved {
 const DEFAULTS: DriftSaved = {
   useRoi: false, method: 'rigid', band: 48,
   upsample: 8, maxShift: 32, apodize: true, order: 1,
-  previewFrames: 20,
+  previewFrames: 2,
 }
 const _driftStore = new Map<number, DriftSaved>()
 

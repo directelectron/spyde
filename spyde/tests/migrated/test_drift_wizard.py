@@ -812,6 +812,57 @@ class TestSchema:
         unused = set(dr.DEFAULTS) - wizard_only - solver
         assert not unused, f"DEFAULTS entries that reach nothing: {unused}"
 
+    def test_the_caret_defaults_match_the_backend_defaults(self):
+        """The RENDERER's DEFAULTS must equal ``drift_action.DEFAULTS``.
+
+        The caret sends its own values on every action, so a renderer default that
+        drifts from the backend one silently WINS — the backend default becomes
+        dead code and every user gets the stale number. This has now bitten twice
+        in this caret: ``band`` (12 vs 48) and ``preview_frames`` (20 vs 2, which
+        made the live preview do 10x the work it was designed for). Neither was
+        caught by a Python test, a tsc pass, or a green e2e — only by reading a
+        screenshot and noticing the readout said "over 12 frames".
+
+        Parsed rather than duplicated, so the test cannot itself go stale.
+        """
+        import re
+        from pathlib import Path
+
+        tsx = (Path(__file__).resolve().parents[3] / "electron" / "src" /
+               "renderer" / "src" / "components" / "DriftWizard.tsx")
+        if not tsx.exists():                      # python-only checkout
+            pytest.skip("renderer sources not present")
+        src = tsx.read_text(encoding="utf-8")
+        m = re.search(r"const DEFAULTS: DriftSaved = \{(.*?)\}", src, re.S)
+        assert m, "could not find the caret's DEFAULTS block"
+
+        def snake(name: str) -> str:
+            return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+
+        found = {}
+        for key, raw in re.findall(r"(\w+)\s*:\s*('[^']*'|[\w.]+)", m.group(1)):
+            val = raw.strip("'")
+            if val in ("true", "false"):
+                val = val == "true"
+            else:
+                try:
+                    val = int(val)
+                except ValueError:
+                    try:
+                        val = float(val)
+                    except ValueError:
+                        pass
+            found[snake(key)] = val
+
+        assert set(found) == set(dr.DEFAULTS), (
+            f"caret/backend key mismatch: only in caret {set(found) - set(dr.DEFAULTS)}, "
+            f"only in backend {set(dr.DEFAULTS) - set(found)}")
+        for key, want in dr.DEFAULTS.items():
+            got = found[key]
+            assert got == want, (
+                f"the caret ships {key}={got!r} but the backend default is "
+                f"{want!r} — the caret wins, so every user gets {got!r}")
+
     def test_every_stage_is_registered(self):
         from spyde.actions.registry import STAGED_HANDLERS, resolve_staged
         for stage in ("drift_open", "drift_close", "drift_set_method",
