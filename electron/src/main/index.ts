@@ -3,12 +3,12 @@
  */
 import {
   app, BrowserWindow, dialog, ipcMain, Menu, shell, nativeTheme, net, protocol,
-  clipboard, nativeImage,
+  clipboard, nativeImage, powerMonitor,
 } from 'electron'
 import { join, basename, resolve } from 'path'
 import { pathToFileURL } from 'url'
 import { tmpdir } from 'os'
-import { existsSync, realpathSync, statSync, writeFileSync, rmSync } from 'fs'
+import { existsSync, realpathSync, statSync, writeFileSync, rmSync, appendFileSync } from 'fs'
 import { execFile } from 'child_process'
 import {
   startSpyDE, sendAction, sendFigureEvent, sendResize,
@@ -248,7 +248,142 @@ function createWindow(): BrowserWindow {
     win.loadFile(join(__dirname, '../renderer/index.html'))
   }
 
+  attachLifecycleDiagnostics(win)
   return win
+}
+
+/**
+ * DIAGNOSTICS ONLY — no behaviour change.
+ *
+ * Symptom being chased: after closing and reopening the laptop, every plot
+ * window is gone from the workspace, but the app still works and you can just
+ * re-load the data.
+ *
+ * Two facts narrow that a long way. The backend is NEVER respawned (see
+ * runner.ts: on close it sets `proc = null` and every later sendAction no-ops),
+ * so if it had died, loading data afterwards would be impossible — it isn't, so
+ * the backend is alive. And the workspace's window list lives ONLY in the
+ * renderer's React state (SpyDEContext `windows: Map`), which nothing persists
+ * or rebuilds from the backend.
+ *
+ * So the renderer lost its state while Python kept running. These listeners say
+ * WHICH of the two ways that happened:
+ *   • the renderer PROCESS was recreated (crash / OOM / GPU-process death on
+ *     resume) — `render-process-gone`, or a navigation the app never asked for;
+ *   • or it survived and something reset the state, in which case none of these
+ *     fire and the answer is in the renderer.
+ *
+ * `powerMonitor` is here purely to timestamp the suspend/resume boundary so the
+ * log reads as a story. Nothing acts on it yet — wiring recovery is the
+ * proposal, not this.
+ */
+/**
+ * Runs IN THE PAGE (via executeJavaScript) and reports what the workspace
+ * actually looks like. Two questions, one snapshot:
+ *
+ *   • `bootedAt` / `navType` — `performance.timeOrigin` is when THIS page
+ *     booted, and a reload cannot fake it. A boot time near a resume means the
+ *     page reloaded and took the React state with it; an old one means the
+ *     renderer lived through the sleep.
+ *   • `area` / `subwindows` — where the windows actually are. Present but
+ *     outside `area` means they were never lost, just stranded off-screen by a
+ *     display change; absent means they left React state.
+ *
+ * This exists because the two are otherwise indistinguishable from the UI. The
+ * app's own Log panel cannot answer either: opening it sends `set_log_level`,
+ * which makes the BACKEND replay its buffered records — and the backend
+ * survives, so the history looks intact after a reload too.
+ */
+const WORKSPACE_PROBE_JS = `(() => { try {
+  const box = (el) => { if (!el) return null
+    const r = el.getBoundingClientRect()
+    return { x: Math.round(r.x), y: Math.round(r.y),
+             w: Math.round(r.width), h: Math.round(r.height) } }
+  return {
+    bootedAt: new Date(performance.timeOrigin).toISOString(),
+    upMinutes: +(performance.now() / 60000).toFixed(2),
+    navType: (performance.getEntriesByType('navigation')[0] || {}).type,
+    area: box(document.querySelector('[data-testid="mdi-area"]')),
+    subwindows: [...document.querySelectorAll('[data-testid="subwindow"]')].map(
+      (el) => ({ ...box(el), display: getComputedStyle(el).display })),
+    iframes: document.querySelectorAll('iframe').length,
+  }
+} catch (e) { return { probeError: String(e) } } })()`
+
+function attachLifecycleDiagnostics(w: BrowserWindow): void {
+  const t = () => new Date().toISOString()
+  // Tee to a file as well as the console. The failure happens when it happens —
+  // typically with no terminal attached, and never on demand — so evidence that
+  // only exists in a dev server's scrollback is evidence that gets lost.
+  const logFile = join(app.getPath('userData'), 'lifecycle.log')
+  // Appended to across every launch, so cap it. Truncating at startup (rather
+  // than rotating) keeps the most recent sessions, which are the ones anyone
+  // ever reads back.
+  try {
+    if (existsSync(logFile) && statSync(logFile).size > 2_000_000) writeFileSync(logFile, '')
+  } catch { /* never break on logging */ }
+  const log = (what: string, detail?: unknown) => {
+    const line = `[spyde lifecycle ${t()}] ${what}` +
+                 (detail === undefined ? '' : ' ' + JSON.stringify(detail))
+    console.log(line)
+    try { appendFileSync(logFile, line + '\n') } catch { /* never break on logging */ }
+  }
+  log('lifecycle log started', { file: logFile })
+
+  /**
+   * Snapshot the workspace. Raced against a timeout because a renderer that
+   * CANNOT answer is itself a finding — and an un-raced executeJavaScript into
+   * a suspended renderer may simply never settle.
+   */
+  const probe = async (tag: string) => {
+    if (w.isDestroyed()) return
+    try {
+      const result = await Promise.race([
+        w.webContents.executeJavaScript(WORKSPACE_PROBE_JS, true),
+        new Promise((_r, reject) => setTimeout(() => reject(new Error('timeout')), 5000)),
+      ])
+      log(`workspace:${tag}`, result)
+    } catch (e) {
+      log(`workspace:${tag} FAILED`, String(e))
+    }
+  }
+
+  // Each registered separately: the typings give powerMonitor a per-event
+  // overload, so a loop over a union of event names doesn't narrow.
+  powerMonitor.on('suspend', () => { log('power:suspend'); void probe('suspend') })
+  powerMonitor.on('resume', () => {
+    log('power:resume')
+    // Three samples: a display configuration settles over several seconds after
+    // a lid-open, so a single reading can catch a transient (an area briefly
+    // measuring 0) and report it as the resting state, or miss one entirely.
+    void probe('resume+0s')
+    setTimeout(() => void probe('resume+5s'), 5000)
+    setTimeout(() => void probe('resume+20s'), 20000)
+  })
+  powerMonitor.on('lock-screen', () => log('power:lock-screen'))
+  powerMonitor.on('unlock-screen', () => { log('power:unlock-screen'); void probe('unlock') })
+
+  w.webContents.on('render-process-gone', (_e, details) =>
+    log('renderer-process-gone', details))
+  // macOS specifically: the GPU / utility processes are the usual casualty
+  // across a lid-close, not the renderer. A dead GPU process takes the WebGPU
+  // device with it, and Chromium may recreate the renderer to recover — which
+  // is exactly how in-memory React state would vanish while Python lives on.
+  app.on('child-process-gone', (_e, details) =>
+    log('child-process-gone', details))
+  w.webContents.on('unresponsive', () => log('renderer-unresponsive'))
+  w.webContents.on('responsive', () => log('renderer-responsive'))
+  // A reload/navigation the app never requested is the other way React state
+  // vanishes while the process lives.
+  w.webContents.on('did-start-navigation', (_e, url, isInPlace, isMainFrame) => {
+    if (isMainFrame) log('renderer-navigation', { url, isInPlace })
+  })
+  // A boot line landing right after power:resume IS the reload, stated outright.
+  w.webContents.on('did-finish-load', () => {
+    log('renderer-did-finish-load')
+    void probe('load')
+  })
+  w.on('closed', () => log('window-closed'))
 }
 
 // ── App lifecycle ─────────────────────────────────────────────────────────────

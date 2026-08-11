@@ -47,8 +47,11 @@ interface Props {
 export interface Rect { x: number; y: number; w: number; h: number }
 
 const TITLE_H = 32
-const MIN_W = 300
-const MIN_H = 200
+// Exported so MDIArea's off-screen recovery shrinks a window to the same floor
+// a manual resize would stop at, rather than to something this component would
+// then refuse to honour.
+export const MIN_W = 300
+export const MIN_H = 200
 // Distance (px) within which a dragged/resized edge snaps to another window's
 // edge or to the area bounds.
 const SNAP_DIST = 10

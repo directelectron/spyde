@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
-import { SubWindow } from './SubWindow'
+import { SubWindow, MIN_W, MIN_H } from './SubWindow'
 import type { Rect } from './SubWindow'
 import { WindowContent } from './WindowContent'
 import {
@@ -92,6 +92,50 @@ function findFreeSlot(w: number, h: number, taken: Rect[], areaW: number, areaH:
 // Vertical space reserved below each window row when tiling so the floating
 // toolbar (which hangs below the window) stays visible: bar height + gap.
 const TOOLBAR_RESERVE = 44
+
+// Margin a recovered window is pulled back to inside the area edge.
+const RECOVER_MARGIN = 8
+// An area smaller than this in either axis is not a real layout — it is what
+// gets measured while the window is hidden, minimised, or mid-display-change.
+// Clamping to such a measurement would stack every window at the origin, so it
+// is treated as "no information" and skipped. This is the guard that makes the
+// recovery safe to run on a resume, which is exactly when a bogus 0 shows up.
+const MIN_CREDIBLE_AREA = 120
+
+// Remap a rect from an area of `from` to one of `to`, keeping its position and
+// size RELATIVE to the area. This is what preserves the arrangement: a two-up
+// layout stays two-up, just smaller, instead of collapsing into a pile at the
+// left edge (clamping alone buries every window under the last one, which still
+// reads as "my plot is gone").
+//
+// The scale is capped at 1 so this only ever shrinks — a grown area must never
+// inflate a window the user sized by hand.
+function remapRect(r: Rect, from: { w: number; h: number }, to: { w: number; h: number }): Rect {
+  const sx = Math.min(1, to.w / Math.max(from.w, 1))
+  const sy = Math.min(1, to.h / Math.max(from.h, 1))
+  return {
+    x: Math.round(r.x * sx), y: Math.round(r.y * sy),
+    w: Math.round(r.w * sx), h: Math.round(r.h * sy),
+  }
+}
+
+// Pull a window back inside an area of areaW×areaH, keeping its size when it
+// fits and shrinking it (never below the manual-resize floor) when it doesn't.
+// Returns null when the window is already fully inside — the common case, so
+// recovery is a no-op that allocates nothing.
+function recoverRect(r: Rect, areaW: number, areaH: number): Rect | null {
+  const M = RECOVER_MARGIN
+  const w = Math.max(MIN_W, Math.min(r.w, areaW - 2 * M))
+  const h = Math.max(MIN_H, Math.min(r.h, areaH - 2 * M))
+  // Math.max(M, …) keeps the top-left corner reachable even when the window is
+  // larger than the area (area narrower than MIN_W): better to overflow the
+  // bottom-right, which is only clipped, than the top-left, which would put the
+  // titlebar — the sole drag handle — out of reach.
+  const x = Math.min(Math.max(r.x, M), Math.max(M, areaW - w - M))
+  const y = Math.min(Math.max(r.y, M), Math.max(M, areaH - h - M))
+  if (x === r.x && y === r.y && w === r.w && h === r.h) return null
+  return { x, y, w, h }
+}
 
 export function MDIArea() {
   const { state, iframeRefs, sendAction, setActiveWindow, replayState, tileWindowsRef } = useSpyDE()
@@ -236,6 +280,63 @@ export function MDIArea() {
     tileWindowsRef.current = tileWindows
     return () => { tileWindowsRef.current = null }
   }, [tileWindowsRef, tileWindows])
+
+  // ── Recover windows stranded outside the area ───────────────────────────────
+  // Windows live at ABSOLUTE pixel coordinates: `placedRef` caches the initial
+  // slot for the life of the window, and each SubWindow then owns its own `pos`
+  // state. NOTHING re-derives either when the AREA changes size, and the area is
+  // `overflow: hidden` — so anything that shrinks the area leaves windows sitting
+  // outside the new bounds. `clampToVisible` doesn't save them: it runs only
+  // while a titlebar is being dragged.
+  //
+  // A stranded window is not closed and not minimized. It is still in state,
+  // still streaming, and NOT listed in the top bar (which enumerates minimized
+  // windows only) — so short of Tile there is no way to reach it again. That is
+  // the "all my plots vanished after I closed and reopened the laptop" symptom:
+  // a Mac lid-close routinely changes the display configuration and resizes the
+  // app window. Measured on the real failure, the backend, the Dask cluster and
+  // the renderer PROCESS all survive the sleep — the windows were never lost,
+  // only put somewhere you can't see. Unplugging an external display or dragging
+  // the app window smaller strands them exactly the same way.
+  //
+  // So when an area change leaves ANY window out of bounds, reflow the whole
+  // layout down into the new area — proportionally, so the arrangement the user
+  // built survives as a smaller version of itself — and clamp what still
+  // doesn't fit. Nothing happens while every window is inside, which is the
+  // common case (growing the area, or a nudge that strands nothing), so an
+  // ordinary resize never disturbs a layout.
+  const recoveredAreaRef = useRef<{ w: number; h: number } | null>(null)
+  useEffect(() => {
+    const { w, h } = areaSize
+    if (w < MIN_CREDIBLE_AREA || h < MIN_CREDIBLE_AREA) return
+    const last = recoveredAreaRef.current
+    if (last && last.w === w && last.h === h) return   // measure() re-fires with equal dims
+    recoveredAreaRef.current = { w, h }
+
+    // Minimized windows are included deliberately: they are display:none, so
+    // recovering them now is what makes restoring one land in view.
+    const current = new Map<string, Rect>()
+    for (const win of state.windows.values()) {
+      if (!win.visible) continue
+      const id = String(win.windowId)
+      const placed = placedRef.current.get(id)
+      if (!placed) continue   // not laid out yet — placement below will fit it
+      current.set(id, liveRectsRef.current.get(id) ?? { ...placed, ...windowSize(win.aspect) })
+    }
+    if (![...current.values()].some(r => recoverRect(r, w, h))) return
+
+    const rects = new Map<string, Rect>()
+    for (const [id, r] of current) {
+      // Without a previous area (the very first credible measurement) there is
+      // no ratio to remap by, so fall back to clamping alone.
+      const scaled = last ? remapRect(r, last, { w, h }) : r
+      const next = recoverRect(scaled, w, h) ?? scaled
+      if (next.x === r.x && next.y === r.y && next.w === r.w && next.h === r.h) continue
+      rects.set(id, next)
+      placedRef.current.set(id, { x: next.x, y: next.y })
+    }
+    if (rects.size > 0) setForced(prev => ({ gen: prev.gen + 1, rects }))
+  }, [areaSize, state.windows])
 
   const handleAction = useCallback((action: string, windowId: number, params: Record<string, unknown> = {}) => {
     // Toolbar buttons map to the generic toolbar_action dispatcher in Python,
