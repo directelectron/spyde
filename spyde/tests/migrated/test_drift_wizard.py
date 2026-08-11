@@ -40,7 +40,7 @@ from spyde.actions import drift_action as dr
 def _capture_module_emit(window, monkeypatch):
     """Route ``drift_action``'s own ``emit`` into the captured list.
 
-    The module does ``from spyde.backend.ipc import emit`` at import, so
+    The module does ``from de_shell.ipc import emit`` at import, so
     conftest's patch of ``ipc.emit`` never reaches that binding — the identical
     hazard conftest already documents for ``session.py``, and the identical fix.
     ``emit_status``/``emit_error`` need no patch: they resolve ``emit`` inside

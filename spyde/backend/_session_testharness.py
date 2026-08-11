@@ -18,8 +18,8 @@ import threading
 import numpy as np
 import hyperspy.api as hs
 
-from spyde.backend import ipc
-from spyde.backend.ipc import emit_error, emit_status
+from de_shell import ipc
+from de_shell.ipc import emit_error, emit_status
 
 log = logging.getLogger(__name__)
 

@@ -12,7 +12,7 @@
  *
  * CHANNEL DEFAULT FOLLOWS THE RUNNING BUILD. The default channel is derived from
  * THIS build's own version: a prerelease build (…-rc.N) tracks beta, a plain
- * X.Y.Z tracks stable (defaultChannelForVersion in updater_errors.ts). So an rc
+ * X.Y.Z tracks stable (defaultChannelForVersion in updaterErrors.ts). So an rc
  * install checks the beta feed (where its updates actually are) instead of the
  * stable feed — which, with no stable release published yet, would 404 and error.
  * An explicit user choice (the dialog radio, persisted) always overrides the
@@ -35,7 +35,8 @@ import { app, BrowserWindow } from 'electron'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import { autoUpdater } from 'electron-updater'
-import { friendlyError, defaultChannelForVersion } from './updater_errors'
+import { friendlyError, defaultChannelForVersion } from './updaterErrors'
+import { channel } from './config'
 
 export type UpdateChannel = 'stable' | 'beta'
 
@@ -77,10 +78,10 @@ function clearDownloadStallTimer(): void {
   if (downloadStallTimer) { clearTimeout(downloadStallTimer); downloadStallTimer = null }
 }
 
-// friendlyError lives in updater_errors.ts (pure, dependency-free) so it's unit-
+// friendlyError lives in updaterErrors.ts (pure, dependency-free) so it's unit-
 // testable with node:test on every OS. Imported above; re-exported to keep the
 // existing public API (some callers/tests import it from updater.ts).
-export { friendlyError } from './updater_errors'
+export { friendlyError } from './updaterErrors'
 
 /** Every error/timeout path funnels through here so state stays consistent:
  *  friendly text out, in-flight guard + timers cleared so a retry works. */
@@ -94,7 +95,7 @@ function reportError(rawMessage: string): void {
 function sendStatus(status: UpdateStatus): void {
   lastStatus = status
   if (win && !win.isDestroyed() && !win.webContents.isDestroyed()) {
-    win.webContents.send('spyde:update-status', status)
+    win.webContents.send(channel('update-status'), status)
   }
 }
 
@@ -107,7 +108,7 @@ export function getLastUpdateStatus(): UpdateStatus {
  *  build's own version — a prerelease build (…-rc.N) tracks beta, a plain X.Y.Z
  *  tracks stable. This is what stops an rc install from fruitlessly checking the
  *  (non-existent) stable channel and erroring. Electron-side storage, separate
- *  from ~/.spyde/settings.json — readable before the Python sidecar is up. */
+ *  from the app's own settings file — readable before the Python sidecar is up. */
 export function readUpdateChannel(): UpdateChannel {
   try {
     const raw = readFileSync(channelFilePath, 'utf8').trim()

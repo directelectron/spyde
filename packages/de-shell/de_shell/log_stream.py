@@ -9,8 +9,8 @@ so a freshly-opened panel can backfill recent history.
 Verbosity is controlled at runtime from the frontend (the level switcher) via the
 ``set_log_level`` staged handler. To keep the panel useful rather than flooded,
 records from third-party loggers (dask/distributed/matplotlib/…) are only
-forwarded at WARNING and above; ``spyde.*`` records are forwarded at the selected
-level. So picking DEBUG shows SpyDE's own debug trail without drowning in library
+forwarded at WARNING and above; the app's own records are forwarded at the selected
+level. So picking DEBUG shows the app's own debug trail without drowning in library
 chatter, while warnings/errors from anywhere always surface.
 
 No Qt. The handler logs to the structured IPC channel; ordinary logging still
@@ -30,41 +30,47 @@ _handler: "IPCLogHandler | None" = None
 
 # Map a logger name to a short, stable AREA tag so the log panel can group and
 # filter by subsystem (the user copies only the relevant area's lines). Ordered
-# longest/most-specific prefix first; first match wins. Extend freely as new
-# subsystems get their own loggers.
-_AREA_RULES = (
-    ("spyde.dask_manager", "dask"),
-    ("spyde.compute_backend", "dask"),
-    ("spyde.drawing.update_functions", "navigator"),
-    ("spyde.drawing.selectors", "navigator"),
-    ("spyde.drawing.plots", "plots"),
-    ("spyde.drawing.live_overlay", "overlay"),
-    ("spyde.drawing", "drawing"),
-    ("spyde.signal_tree", "navigator"),
-    ("spyde.actions.find_vectors", "vectors"),
-    ("spyde.actions.vector_orientation", "orientation"),
-    ("spyde.actions.orientation", "orientation"),
-    ("spyde.actions", "actions"),
-    ("spyde.signals", "signals"),
-    ("spyde.workers", "workers"),
-    ("spyde.backend", "backend"),
-    ("spyde.mdi_manager", "ui"),
-    ("spyde.qt", "ui"),
-    ("spyde.live", "instrument"),
-    ("spyde", "spyde"),
+# longest/most-specific prefix first; first match wins.
+#
+# The shell only knows about ITSELF and the libraries every app shares. An app's
+# own subsystems are its business, so it registers them via `register_area_rules`
+# at startup — those are consulted BEFORE these, so an app can also override a
+# default (e.g. classify `de_shell.plotting` as something else).
+_SHELL_AREA_RULES = (
+    ("de_shell.plotting.selectors", "navigator"),
+    ("de_shell.plotting", "plots"),
+    ("de_shell.actions", "actions"),
+    ("de_shell", "shell"),
     ("anyplotlib.tile", "plots"),
     ("anyplotlib", "plots"),
-    ("distributed", "dask"),
-    ("dask", "dask"),
-    ("hyperspy", "hyperspy"),
-    ("rsciio", "io"),
-    ("pyxem", "pyxem"),
 )
+
+# App-registered rules, consulted first. See `register_area_rules`.
+_app_area_rules: tuple[tuple[str, str], ...] = ()
+
+# Logger prefixes whose sub-WARNING records reach the panel. Warnings and above
+# always surface, from anywhere; below that, only the app's and the shell's own
+# loggers, so the panel isn't flooded by third-party INFO/DEBUG chatter.
+_verbose_packages: tuple[str, ...] = ("de_shell",)
+
+
+def register_area_rules(rules, verbose_packages=()) -> None:
+    """Register an app's logger-name → area mapping (and which of its packages
+    are verbose enough to show below WARNING).
+
+    ``rules`` is a sequence of ``(logger_prefix, area_tag)``, most-specific
+    first. Called once at backend startup, before ``install``. Idempotent in the
+    sense that a second call REPLACES the app's rules rather than appending —
+    there is one app per process.
+    """
+    global _app_area_rules, _verbose_packages
+    _app_area_rules = tuple((str(p), str(a)) for p, a in rules)
+    _verbose_packages = ("de_shell",) + tuple(str(p) for p in verbose_packages)
 
 
 def _area_for(name: str) -> str:
     """Short subsystem tag for a logger name (e.g. 'navigator', 'dask')."""
-    for prefix, area in _AREA_RULES:
+    for prefix, area in _app_area_rules + _SHELL_AREA_RULES:
         if name == prefix or name.startswith(prefix + "."):
             return area
     # Fall back to the top-level package so unmapped third-party loggers still
@@ -106,11 +112,13 @@ class IPCLogHandler(logging.Handler):
         }
 
     def _accept(self, record: logging.LogRecord) -> bool:
-        # Always surface warnings+; otherwise only SpyDE's own loggers, so the
-        # panel isn't flooded by third-party INFO/DEBUG at low levels.
+        # Always surface warnings+; otherwise only the app's and the shell's own
+        # loggers, so the panel isn't flooded by third-party INFO/DEBUG at low
+        # levels. See `register_area_rules(verbose_packages=…)`.
         if record.levelno >= logging.WARNING:
             return True
-        return record.name == "spyde" or record.name.startswith("spyde.")
+        name = record.name
+        return any(name == p or name.startswith(p + ".") for p in _verbose_packages)
 
     def emit(self, record: logging.LogRecord) -> None:
         if getattr(self._guard, "active", False):
@@ -121,7 +129,7 @@ class IPCLogHandler(logging.Handler):
             self._guard.active = True
             entry = self._entry(record)
             self.buffer.append(entry)
-            from spyde.backend.ipc import emit as _emit
+            from de_shell.ipc import emit as _emit
             _emit(entry)
         except Exception:
             # Logging must never crash the app, and handleError() would print to
@@ -163,7 +171,7 @@ def emit_backfill() -> None:
     """Re-emit buffered records so a freshly-opened panel shows recent history."""
     if _handler is None:
         return
-    from spyde.backend.ipc import emit
+    from de_shell.ipc import emit
     emit({"type": "log_backfill", "entries": list(_handler.buffer)})
 
 
@@ -173,5 +181,5 @@ def set_log_level(session, plot, payload) -> None:
     """Frontend level switcher → set verbosity, backfill history, confirm level."""
     lv = set_level(payload.get("level", "INFO"))
     emit_backfill()
-    from spyde.backend.ipc import emit
+    from de_shell.ipc import emit
     emit({"type": "log_level", "level": logging.getLevelName(lv)})

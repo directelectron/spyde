@@ -19,7 +19,7 @@ import logging
 
 import numpy as np
 
-from spyde.backend.ipc import emit, emit_status, emit_error
+from de_shell.ipc import emit, emit_status, emit_error
 from spyde.actions.context import src_plot_tree as _src_plot_tree, current_signal as _current_signal
 
 log = logging.getLogger(__name__)

@@ -48,7 +48,7 @@ def _as_snapshot_map(spec, snapshots):
 
 
 def _resolve_cmap(name):
-    from spyde.drawing.colormaps import COLORMAPS
+    from de_shell.plotting.colormaps import COLORMAPS
     return COLORMAPS.get(name, name)
 
 

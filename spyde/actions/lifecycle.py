@@ -168,7 +168,7 @@ def wait_for_vectors(session, plot, then: Callable[[], None], *, what: str,
     False when there is no event loop to wait on (bare test stubs) — the
     caller should emit its own error then.
     """
-    from spyde.backend.ipc import emit_error, emit_status
+    from de_shell.ipc import emit_error, emit_status
     if getattr(session, "_dispatch_to_main", None) is None:
         return False
 
@@ -233,7 +233,7 @@ def wait_for_particles(session, plot, then: Callable[[], None], *, what: str,
     False when there is no event loop to wait on (bare test stubs) — the caller
     should emit its own error then.
     """
-    from spyde.backend.ipc import emit_error, emit_status
+    from de_shell.ipc import emit_error, emit_status
     if getattr(session, "_dispatch_to_main", None) is None:
         return False
 
@@ -375,7 +375,7 @@ def paint_signal_plots(tree, data, *, levels: tuple[float, float] | None = None)
 def progress_emitter(prefix: str, *, min_interval: float = 0.5) -> Callable[[int, int], None]:
     """A throttled ``progress(done, total)`` callback that emits
     ``"{prefix} {pct}%"`` status lines (always emits the 100% line)."""
-    from spyde.backend.ipc import emit_status
+    from de_shell.ipc import emit_status
     last = [0.0]
 
     def progress(done, total):
@@ -419,11 +419,11 @@ class window_computing:
         self.window_id = window_id
 
     def start(self) -> None:
-        from spyde.backend.ipc import emit_window_computing
+        from de_shell.ipc import emit_window_computing
         emit_window_computing(self.window_id, True)
 
     def stop(self) -> None:
-        from spyde.backend.ipc import emit_window_computing
+        from de_shell.ipc import emit_window_computing
         emit_window_computing(self.window_id, False)
 
     def __enter__(self) -> "window_computing":

@@ -141,7 +141,7 @@ def emit_view_figure(window_id: int, image, label: str, *, kind: str = "2d",
         import anyplotlib as apl
         import anyplotlib._electron as _electron
         from spyde.drawing.plots.plot import finalize_figure_html
-        from spyde.backend.ipc import emit
+        from de_shell.ipc import emit
 
         fig, axes = apl.subplots(1, 1)
         ax = axes[0][0] if isinstance(axes, list) else axes
@@ -267,7 +267,7 @@ def emit_tiled_figure(window_id: int, labels) -> str | None:
         return None
     _fig, fig_id, html, sel = built
     try:
-        from spyde.backend.ipc import emit
+        from de_shell.ipc import emit
         emit({
             "type": "figure", "fig_id": fig_id, "window_id": window_id,
             "html": html, "title": " / ".join(sel), "is_navigator": False,

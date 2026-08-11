@@ -40,7 +40,7 @@ from spyde.drawing.selectors.base_selector import event_handler_fn
 # `ipc.emit` to capture outgoing messages, and a from-import binds the original
 # function at import time — the patch would then never be seen and every
 # message assertion would silently observe nothing.
-from spyde.backend import ipc
+from de_shell import ipc
 
 log = logging.getLogger(__name__)
 

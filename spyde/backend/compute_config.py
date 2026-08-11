@@ -103,7 +103,7 @@ def compute_configure(session, plot, payload) -> None:
     except Exception as e:
         log.debug("persisting compute settings failed: %s", e)
 
-    from spyde.backend.ipc import emit_status
+    from de_shell.ipc import emit_status
 
     def _work():
         from spyde.backend.app import _compute_worker_plan

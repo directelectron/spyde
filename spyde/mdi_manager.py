@@ -50,7 +50,7 @@ class MDIManager:
         signal_tree: "BaseSignalTree | None" = None,
     ) -> "PlotWindow":
         from spyde.drawing.plots.plot_window import PlotWindow
-        from spyde.backend.ipc import emit
+        from de_shell.ipc import emit
 
         window_id = self.session.next_window_id()
         pw = PlotWindow(
@@ -134,7 +134,7 @@ class MDIManager:
 
     def tile_active_windows(self) -> None:
         """Send tile layout to Electron for the active tree's windows."""
-        from spyde.backend.ipc import emit
+        from de_shell.ipc import emit
 
         active_tree = (
             self._active_pw.signal_tree
@@ -165,7 +165,7 @@ class MDIManager:
 
     def organize_active_windows(self) -> None:
         """Send organize-no-resize layout to Electron."""
-        from spyde.backend.ipc import emit
+        from de_shell.ipc import emit
 
         active_tree = (
             self._active_pw.signal_tree

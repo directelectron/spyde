@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Union
 
 import numpy as np
 
-from spyde.drawing.selectors.utils import broadcast_rows_cartesian
+from de_shell.plotting.selectors.utils import broadcast_rows_cartesian
 
 logger = logging.getLogger(__name__)
 

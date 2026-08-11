@@ -31,7 +31,7 @@ NAVIGATOR_DRAG_MIME = "application/x-spyde-navigator"
 
 def _emit(obj: dict) -> None:
     try:
-        from spyde.backend.ipc import emit
+        from de_shell.ipc import emit
         emit(obj)
     except Exception as e:
         log.debug("IPC emit of %r failed: %s", obj.get("type"), e)
@@ -305,7 +305,7 @@ def crop_open(session, plot, payload) -> None:
     field values, so the user drags handles in from the full extent rather
     than starting from a to-be-guessed default."""
     from spyde.actions.context import src_plot_tree as _src_plot_tree, current_signal as _current_signal
-    from spyde.backend.ipc import emit_error
+    from de_shell.ipc import emit_error
 
     src, tree = _src_plot_tree(session, plot)
     signal = _current_signal(src)

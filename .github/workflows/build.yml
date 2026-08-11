@@ -201,10 +201,12 @@ jobs:
         with:
           node-version: "24"
           cache: npm
-          cache-dependency-path: electron/package-lock.json
+          cache-dependency-path: package-lock.json
 
+      # Root install: electron/ and packages/* are npm WORKSPACES, so the root
+      # lockfile is the authoritative one and installing here links the shared
+      # shell packages. Installing inside electron/ alone would miss them.
       - name: Install Electron dependencies
-        working-directory: electron
         run: npm ci
 
       - name: Typecheck (tsc --noEmit)
@@ -235,14 +237,17 @@ jobs:
         with:
           node-version: "24"
           cache: npm
-          cache-dependency-path: electron/package-lock.json
+          cache-dependency-path: package-lock.json
 
+      # Root install: electron/ and packages/* are npm WORKSPACES, so the root
+      # lockfile is the authoritative one and installing here links the shared
+      # shell packages. Installing inside electron/ alone would miss them.
       - name: Install Electron dependencies
-        working-directory: electron
         run: npm ci
 
+      # From the ROOT: the main-process units now live in packages/shell-main,
+      # and the root script fans out across workspaces.
       - name: Run main-process unit tests
-        working-directory: electron
         run: npm run test:unit
 
   # ── Electron e2e (Playwright) ──────────────────────────────────────────────
@@ -290,7 +295,7 @@ jobs:
         with:
           node-version: "24"
           cache: npm
-          cache-dependency-path: electron/package-lock.json
+          cache-dependency-path: package-lock.json
 
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
@@ -306,15 +311,17 @@ jobs:
       - name: Pre-sync the Python backend env
         run: uv sync --extra tests --extra all
 
+      # Root install: electron/ and packages/* are npm WORKSPACES, so the root
+      # lockfile is the authoritative one and installing here links the shared
+      # shell packages. Installing inside electron/ alone would miss them.
       - name: Install Electron dependencies
-        working-directory: electron
         run: npm ci
 
       - name: Cache Playwright browsers
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
-          key: pw-${{ runner.os }}-${{ hashFiles('electron/package-lock.json') }}
+          key: pw-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
 
       # Idempotent: on a cache hit the download is skipped; --with-deps still
       # apt-installs the shared libraries either way.

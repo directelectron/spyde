@@ -73,7 +73,7 @@ from spyde.actions.lifecycle import (
     bump_generation, is_current, run_on_worker, show_tree_node,
 )
 from spyde.actions.wizard import WizardController
-from spyde.backend.ipc import emit, emit_error, emit_progress, emit_status
+from de_shell.ipc import emit, emit_error, emit_progress, emit_status
 
 log = logging.getLogger(__name__)
 

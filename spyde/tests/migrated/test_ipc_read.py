@@ -26,7 +26,7 @@ class _BinStdin:
 
 
 def _collect(stdin) -> list[dict]:
-    from spyde.backend import ipc
+    from de_shell import ipc
 
     async def _run() -> list[dict]:
         out: list[dict] = []

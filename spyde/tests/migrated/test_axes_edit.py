@@ -35,7 +35,7 @@ class TestAxesEdit:
             captured = []
             # _set_axis lives in the AxesEditorMixin (_session_axes) and emits via
             # ipc.emit; patch that single channel to capture its messages.
-            import spyde.backend.ipc as ipc_mod
+            import de_shell.ipc as ipc_mod
             orig = ipc_mod.emit
             ipc_mod.emit = lambda m: captured.append(m)
             try:

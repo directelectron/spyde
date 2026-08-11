@@ -213,7 +213,7 @@ def best_xy_for(infos, best_lib_idx: int):
 
 def emit_refine_window(session, fig, fig_id: str, html: str, *, title: str = "IPF Refine"):
     """Emit the refine-heatmap figure to a fresh window. Returns the window id."""
-    from spyde.backend.ipc import emit
+    from de_shell.ipc import emit
     from spyde.actions.figure_registry import keep_alive
     wid = session.next_window_id()
     keep_alive(int(wid), fig)

@@ -6,7 +6,7 @@ import time
 import numpy as np
 import hyperspy.api as hs
 
-import spyde.backend.ipc as ipc
+import de_shell.ipc as ipc
 import anyplotlib._electron as ael
 
 captured = []

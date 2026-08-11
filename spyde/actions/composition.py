@@ -21,7 +21,7 @@ import tempfile
 import urllib.parse
 import urllib.request
 
-from spyde.backend.ipc import emit, emit_error, emit_status
+from de_shell.ipc import emit, emit_error, emit_status
 from spyde.actions.context import src_plot_tree as _src_plot_tree
 
 log = logging.getLogger(__name__)

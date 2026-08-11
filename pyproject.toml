@@ -16,6 +16,10 @@ classifiers = [
     "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
 ]
 dependencies = [
+    # The shared desktop-app shell (asyncio loop, PLOTAPP IPC, log streaming,
+    # window/figure registry, action + wizard framework, anyplotlib plotting).
+    # Resolved from packages/de-shell via the uv workspace below.
+    "de-shell",
     "numpy>=1.20.0",
     "pillow",
     "matplotlib",
@@ -107,7 +111,15 @@ name = "pytorch-cu124"
 url = "https://download.pytorch.org/whl/cu124"
 explicit = true
 
+# This repo is a uv workspace root: the shared shell lives in packages/, and the
+# two non-SpyDE apps in apps/. SpyDE itself is still at the repo root rather than
+# apps/spyde — that move is a pure directory rename, deliberately kept out of the
+# extraction commit (see ARCHITECTURE-SPLIT.md, "Deferred on purpose").
+[tool.uv.workspace]
+members = ["packages/de-shell", "apps/groundcrew", "apps/autopilot"]
+
 [tool.uv.sources]
+de-shell = { workspace = true }
 torch = [
     { index = "pytorch-cu124", marker = "sys_platform == 'win32'" },
 ]

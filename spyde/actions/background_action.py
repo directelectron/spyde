@@ -27,7 +27,7 @@ import numpy as np
 
 from spyde.actions.context import src_plot_tree as _src_plot_tree
 from spyde.actions.wizard import WizardController
-from spyde.backend import ipc
+from de_shell import ipc
 
 log = logging.getLogger(__name__)
 

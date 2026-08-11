@@ -239,8 +239,10 @@ jobs:
           test -f "$dest/cmd/git.exe" || test -f "$dest/bin/git.exe"
           "$dest/cmd/git.exe" --version || "$dest/bin/git.exe" --version
 
+      # Root install: electron/ and packages/* are npm WORKSPACES, so the root
+      # lockfile is the authoritative one and installing here links the shared
+      # shell packages. Installing inside electron/ alone would miss them.
       - name: Install Electron dependencies
-        working-directory: electron
         run: npm ci
 
       # ── macOS code signing (only when secrets are present) ─────────────────────

@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 from hyperspy.signal import BaseSignal
 
-from spyde.backend.ipc import emit, emit_status, emit_error, emit_progress
+from de_shell.ipc import emit, emit_status, emit_error, emit_progress
 from spyde.backend._session_axes import AxesEditorMixin
 from spyde.backend._session_actions import (
     ActionRouterMixin, _TEST_ACTIONS, _TEST_ACTIONS_ENABLED,

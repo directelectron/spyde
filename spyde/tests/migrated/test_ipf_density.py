@@ -100,7 +100,7 @@ class TestIpfDensity:
         assert int(brightness.max()) > 60
 
     def test_emit_density_message(self):
-        import spyde.backend.ipc as ipc
+        import de_shell.ipc as ipc
         from spyde.actions.ipf_density import emit_ipf_density
         captured, orig = [], ipc.emit
         ipc.emit = lambda m: captured.append(m)
@@ -122,7 +122,7 @@ class TestIpfDensity:
     def test_attach_ipf_3d_also_emits_density(self):
         # attach_ipf_3d wires the density heatmap onto the IPF window alongside
         # the 3-D explorer (so the frontend gets the PDF toggle).
-        import spyde.backend.ipc as ipc
+        import de_shell.ipc as ipc
         from spyde.actions.ipf_view import attach_ipf_3d
 
         class _SP:

@@ -234,7 +234,7 @@ class _MockVecsCM(_MockVecs):
 
 class TestStrainAction:
     def test_strain_run_emits_window_and_attaches_controller(self):
-        import spyde.backend.ipc as ipc
+        import de_shell.ipc as ipc
         from spyde.actions.strain_action import strain_open
 
         vecs = _MockVecsCM((6, 6), lambda iy, ix: np.array([[1 + 0.01 * ix, 0.0],
@@ -269,7 +269,7 @@ class TestStrainAction:
         must NOT end up building a live StrainController: the generation
         counter should let only the LATEST strain_open's window survive."""
         import threading
-        import spyde.backend.ipc as ipc
+        import de_shell.ipc as ipc
         from spyde.actions.strain_action import strain_open, strain_close
         from spyde.backend.session import Session as _RealSession
 
@@ -430,7 +430,7 @@ class TestStrainAction:
         found-vectors red circles look like they vanished when strain opened;
         they were just hidden under a same-titled window. Give it its own
         title so it's obviously a different window."""
-        import spyde.backend.ipc as ipc
+        import de_shell.ipc as ipc
         from spyde.actions.strain_action import StrainController
 
         class _FakeSelector:
@@ -490,7 +490,7 @@ class TestStrainAction:
         — and its linked DP window must have NO toolbar (it exists solely to
         host the crosshair + the click-to-select overlay, not to run actions)."""
         import anyplotlib as apl
-        import spyde.backend.ipc as ipc
+        import de_shell.ipc as ipc
         from spyde.actions.strain_action import StrainController
 
         class _FakeSelector:
@@ -743,7 +743,7 @@ class TestStrainSelectionOverlay:
         assert ov.selected.sum() == 0
 
     def test_strain_run_without_vectors_errors(self):
-        import spyde.backend.ipc as ipc
+        import de_shell.ipc as ipc
         from spyde.actions.strain_action import strain_open
         tree = type("T", (), {"diffraction_vectors": None})()
         plot = type("P", (), {"signal_tree": tree})()

@@ -388,7 +388,7 @@ class IpfWindowController:
 
     # ── emit ────────────────────────────────────────────────────────────────
     def _emit(self, fig, fig_id: str, html: str, view: str, title: str) -> None:
-        from spyde.backend.ipc import emit
+        from de_shell.ipc import emit
         keep_alive(self.window_id, fig)
         emit({
             "type": "figure", "fig_id": fig_id, "window_id": self.window_id,
@@ -570,7 +570,7 @@ def open_ipf_window(session, tree, result, direction: str = "z", *,
     if not ctrl.emit_all():
         return None
     try:                                # `view`-tagged figures never rename a
-        from spyde.backend.ipc import emit    # window, so name it explicitly
+        from de_shell.ipc import emit    # window, so name it explicitly
         emit({"type": "window_title", "window_ids": [wid], "title": win_title})
     except Exception as e:
         logger.debug("titling the IPF window failed: %s", e)

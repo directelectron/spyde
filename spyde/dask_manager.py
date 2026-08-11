@@ -200,7 +200,7 @@ class _WorkerTuningPlugin(_WorkerPluginBase):
     def setup(self, worker=None):
         _neutralize_slow_net_io_counters(force=True)
         try:
-            from spyde.backend.process_guard import unthrottle_windows_timers
+            from de_shell.process_guard import unthrottle_windows_timers
             unthrottle_windows_timers()
         except Exception as e:
             logger.debug("worker timer unthrottle failed: %s", e)

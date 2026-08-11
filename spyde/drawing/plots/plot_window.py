@@ -100,37 +100,37 @@ class PlotWindow:
 
     def show(self) -> None:
         self.visible = True
-        from spyde.backend.ipc import emit
+        from de_shell.ipc import emit
         emit({"type": "window_visibility", "window_id": self.window_id, "visible": True})
 
     def hide(self) -> None:
         self.visible = False
-        from spyde.backend.ipc import emit
+        from de_shell.ipc import emit
         emit({"type": "window_visibility", "window_id": self.window_id, "visible": False})
 
     def isVisible(self) -> bool:
         return self.visible
 
     def raise_(self) -> None:
-        from spyde.backend.ipc import emit
+        from de_shell.ipc import emit
         emit({"type": "window_raise", "window_id": self.window_id})
 
     def lower(self) -> None:
-        from spyde.backend.ipc import emit
+        from de_shell.ipc import emit
         emit({"type": "window_lower", "window_id": self.window_id})
 
     # ── Geometry (Electron manages actual pixels) ──────────────────────────────
 
     def move(self, x: int, y: int) -> None:
-        from spyde.backend.ipc import emit
+        from de_shell.ipc import emit
         emit({"type": "window_move", "window_id": self.window_id, "x": x, "y": y})
 
     def resize(self, w: int, h: int) -> None:
-        from spyde.backend.ipc import emit
+        from de_shell.ipc import emit
         emit({"type": "window_resize", "window_id": self.window_id, "width": w, "height": h})
 
     def setGeometry(self, x: int, y: int, w: int, h: int) -> None:
-        from spyde.backend.ipc import emit
+        from de_shell.ipc import emit
         emit({"type": "window_geometry",
               "window_id": self.window_id, "x": x, "y": y, "width": w, "height": h})
 
@@ -143,7 +143,7 @@ class PlotWindow:
                 opacity = effect.opacity()
             except Exception as e:
                 logger.debug("reading graphics-effect opacity failed: %s", e)
-        from spyde.backend.ipc import emit
+        from de_shell.ipc import emit
         emit({"type": "window_opacity", "window_id": self.window_id, "opacity": opacity})
 
     # ── Close ──────────────────────────────────────────────────────────────────
@@ -167,7 +167,7 @@ class PlotWindow:
                 ]
             except Exception as e:
                 logger.debug("removing window from mdi_manager registry failed: %s", e)
-        from spyde.backend.ipc import emit
+        from de_shell.ipc import emit
         emit({"type": "window_closed", "window_id": self.window_id})
 
     def close(self) -> None:

@@ -26,7 +26,7 @@ import threading
 import time
 from contextlib import contextmanager
 
-from spyde.backend.ipc import emit
+from de_shell.ipc import emit
 
 log = logging.getLogger(__name__)
 

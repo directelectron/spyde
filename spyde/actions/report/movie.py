@@ -53,7 +53,7 @@ import os
 
 import numpy as np
 
-from spyde.backend import ipc
+from de_shell import ipc
 from spyde.actions.lifecycle import bump_generation, is_current, run_on_worker
 from spyde.actions.playback import _units_to_seconds
 from spyde.actions.movie_export import traces as _traces
@@ -1473,7 +1473,7 @@ def movie_export(session, plot, payload) -> None:
     """Render the movie to ``{cell_id, path}`` on a worker thread — memory-safe,
     generation-guarded, per-frame cancellable, with partial-file cleanup and a
     poster re-bake on success. Emits progress + ``movie_done``."""
-    from spyde.backend.ipc import emit_error, emit_status, emit_progress
+    from de_shell.ipc import emit_error, emit_status, emit_progress
     mgr = _manager(session)
     if not mgr.open:
         emit_error("movie_export: no open report.")

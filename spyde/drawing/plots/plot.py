@@ -20,7 +20,7 @@ import anyplotlib as apl
 import anyplotlib._electron as _electron
 from anyplotlib.embed import build_standalone_html
 
-from spyde.drawing.colormaps import COLORMAPS, DEFAULT_COLORMAP
+from de_shell.plotting.colormaps import COLORMAPS, DEFAULT_COLORMAP
 
 if TYPE_CHECKING:
     from spyde.drawing.plots.plot_states import PlotState
@@ -105,7 +105,7 @@ import time as _time
 # update_functions so a "slow update" report shows the WHOLE pipeline (read +
 # paint). Toggle live from the Log panel's "Profile" button; state lives in
 # backend.debug_flags (read fresh each frame). No-op when off.
-from spyde.backend.debug_flags import nav_profile_on as _nav_profile_on
+from de_shell.debug_flags import nav_profile_on as _nav_profile_on
 
 
 _SUPERSCRIPTS = {
@@ -332,7 +332,7 @@ class Plot:
 
     def _ensure_figure(self, dims: int = 2) -> None:
         """Create (or recreate) the anyplotlib Figure for the given dimensionality."""
-        from spyde.backend.ipc import emit
+        from de_shell.ipc import emit
 
         if self._fig is not None:
             return  # already created
@@ -412,7 +412,7 @@ class Plot:
         """Tag this plot's figure as a named view (chip ``label`` + ``kind``) and
         RE-EMIT the figure message so the frontend's chip strip picks it up. The
         iframe is keyed by fig_id, so the metadata updates without a reload."""
-        from spyde.backend.ipc import emit
+        from de_shell.ipc import emit
         self.view_label = label
         self.view_kind = kind
         if self.fig_id is None or getattr(self, "_figure_html", None) is None:
@@ -759,7 +759,7 @@ class Plot:
                     from spyde.actions.overlay import drop_all_layers, _emit_layers_state
                     drop_all_layers(self)
                     _emit_layers_state(self)
-                    from spyde.backend.ipc import emit_status
+                    from de_shell.ipc import emit_status
                     emit_status("Overlay layers removed: image shape changed.")
                 except Exception as e:
                     logger.debug("layer drop on shape change failed: %s", e)
@@ -1011,7 +1011,7 @@ class Plot:
             # just no longer able to own the axis.
             counts, edges = np.histogram(np.clip(finite, lo, hi), bins=64,
                                          range=(lo, hi))
-            from spyde.backend.ipc import emit
+            from de_shell.ipc import emit
             msg = {
                 "type": "histogram",
                 "window_id": self.window_id,
@@ -1415,9 +1415,9 @@ class Plot:
                 logger.debug("dropping figure registry entry on close failed: %s", e)
 
     def hide(self) -> None:
-        from spyde.backend.ipc import emit
+        from de_shell.ipc import emit
         emit({"type": "window_visibility", "window_id": self.window_id, "visible": False})
 
     def show(self) -> None:
-        from spyde.backend.ipc import emit
+        from de_shell.ipc import emit
         emit({"type": "window_visibility", "window_id": self.window_id, "visible": True})

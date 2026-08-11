@@ -11,17 +11,25 @@ import { tmpdir } from 'os'
 import { existsSync, realpathSync, statSync, writeFileSync, rmSync, appendFileSync } from 'fs'
 import { execFile } from 'child_process'
 import {
-  startSpyDE, sendAction, sendFigureEvent, sendResize,
-  stopSpyDE,
-} from './runner'
-import {
+  configureShell,
+  startBackend, sendAction, sendFigureEvent, sendResize, stopBackend,
   resolvePythonEnv, managedEnvPaths, installTorchPerMachine, readLockedTorchVersion,
-} from './pythonEnv'
-import { parseUvLine } from './envProgress'
-import {
+  parseUvLine,
   initUpdater, checkForUpdates, downloadUpdate, quitAndInstall,
   readUpdateChannel, setUpdateChannel, getLastUpdateStatus, updatesSupported,
-} from './updater'
+} from '@de/shell-main'
+
+// Tell the shell who we are. MUST run before any other @de/shell-main call:
+// the IPC channel prefix, settings paths, the `python -m <module>` spawn and the
+// packaged-app env var all read from this, and they throw rather than guess.
+// Renderer-facing channel names stay `spyde:*`, so this is a pure lift with no
+// protocol change.
+configureShell({
+  appId: 'spyde',
+  appName: 'SpyDE',
+  pythonModule: 'spyde',
+  pythonDist: 'spyde',
+})
 
 let win: BrowserWindow | null = null
 
@@ -495,7 +503,7 @@ app.whenReady().then(async () => {
   if (!resolved) return
   const { cmd, cwd } = resolved
 
-  startSpyDE(cmd, {
+  startBackend(cmd, {
     onMessage: (msg) => {
       // Figure HTML must be written to disk here in the main process (the
       // renderer is a browser sandbox with no fs). It's served back to the
@@ -570,17 +578,17 @@ app.whenReady().then(async () => {
 })
 
 app.on('window-all-closed', () => {
-  stopSpyDE()
+  stopBackend()
   cleanupFigTmpFiles()
   if (process.platform !== 'darwin') app.quit()
 })
 
 // Tear the backend down on EVERY quit path, not just when the last window
 // closes (e.g. macOS Cmd-Q, the File→Quit menu role, an app.quit() from IPC).
-// stopSpyDE() is idempotent + null-safe, so overlapping with window-all-closed
+// stopBackend() is idempotent + null-safe, so overlapping with window-all-closed
 // is harmless. Without this the Python sidecar (and its Dask workers) could
 // outlive the UI on those paths.
-app.on('before-quit', () => { stopSpyDE(); cleanupFigTmpFiles() })
+app.on('before-quit', () => { stopBackend(); cleanupFigTmpFiles() })
 
 // A console SIGINT/SIGTERM (Ctrl-C in `npm run dev`, or a parent killing us)
 // bypasses the normal Electron quit events, so kill the backend explicitly then
@@ -588,7 +596,7 @@ app.on('before-quit', () => { stopSpyDE(); cleanupFigTmpFiles() })
 // a flag is unnecessary here — main is evaluated once per process.
 for (const sig of ['SIGINT', 'SIGTERM'] as const) {
   process.on(sig, () => {
-    stopSpyDE()
+    stopBackend()
     cleanupFigTmpFiles()
     app.quit()
     // Give the graceful-quit write + tree-kill a moment, then hard-exit so the

@@ -35,12 +35,22 @@ const guidesDir = resolve(__dirname, '..', 'guides')
 // connection attempt to the renderer console.
 const noHmr = process.env.SPYDE_NO_HMR === '1'
 
+// The shared main-process shell (@de/shell-main) is consumed as RAW TypeScript
+// via an alias rather than a built artifact, so editing the shell and running
+// the app needs no intermediate build. It must be aliased in BOTH the main and
+// preload configs — each gets its own rollup pass — and the tsconfig `paths`
+// entry in tsconfig.node.json has to agree, or the editor and the bundler
+// disagree about what resolves.
+const shellMain = resolve(__dirname, '..', 'packages', 'shell-main', 'src', 'index.ts')
+
 export default defineConfig({
   main: {
     build: { outDir: 'out/main', rollupOptions: { input: 'src/main/index.ts' } },
+    resolve: { alias: { '@de/shell-main': shellMain } },
   },
   preload: {
     build: { outDir: 'out/preload', rollupOptions: { input: 'src/preload/index.ts' } },
+    resolve: { alias: { '@de/shell-main': shellMain } },
   },
   renderer: {
     root: 'src/renderer',

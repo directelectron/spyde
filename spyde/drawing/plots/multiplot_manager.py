@@ -230,7 +230,7 @@ class MultiplotManager:
             mode = "integrate" if getattr(selector, "is_integrating", False) else "crosshair"
             idx = len(self.navigation_selectors[plot_window])
             self.session.register_nav_selector(plot_window.window_id, selector)
-            from spyde.backend.ipc import emit
+            from de_shell.ipc import emit
             # `sum_frames` / `nav_size` are only sent for a selector that can
             # widen a POINT into a summed window — a 1-D (movie/time) navigator.
             # Their absence is what tells the dock not to offer the control on a

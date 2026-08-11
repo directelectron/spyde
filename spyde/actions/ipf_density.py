@@ -193,7 +193,7 @@ def build_ipf_density_figure(result, direction: str = "z", *,
 def emit_ipf_density(window_id: int, result, direction: str = "z", **kw) -> bool:
     """Build + emit the IPDF heatmap as a ``view="density"`` figure for
     *window_id*. Returns True if a figure was emitted."""
-    from spyde.backend.ipc import emit
+    from de_shell.ipc import emit
     try:
         _fig, fig_id, html = build_ipf_density_figure(result, direction, **kw)
     except Exception as e:

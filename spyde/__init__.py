@@ -17,6 +17,50 @@ with files(__package__).joinpath("metadata_widget.yaml").open(
 __all__ = ["TOOLBAR_ACTIONS", "METADATA_WIDGET_CONFIG"]
 
 
+# Map SpyDE's own loggers to the log panel's area filter. The shell only knows
+# about itself and anyplotlib (de_shell.log_stream._SHELL_AREA_RULES); an app's
+# subsystems are its own business, so SpyDE declares them here. Ordered
+# most-specific prefix first — first match wins.
+#
+# Registered at package import rather than in backend/app.py so it is in effect
+# for ANY spyde process, tests included: the handler drops sub-WARNING records
+# from packages that aren't declared verbose, so a rule set that only landed on
+# the app's startup path would silently swallow INFO logs everywhere else.
+_LOG_AREA_RULES = (
+    ("spyde.dask_manager", "dask"),
+    ("spyde.compute_backend", "dask"),
+    ("spyde.drawing.update_functions", "navigator"),
+    ("spyde.drawing", "drawing"),
+    ("spyde.signal_tree", "navigator"),
+    ("spyde.array_cache", "navigator"),
+    ("spyde.actions.find_vectors", "vectors"),
+    ("spyde.actions.vector_orientation", "orientation"),
+    ("spyde.actions.orientation", "orientation"),
+    ("spyde.actions", "actions"),
+    ("spyde.signals", "signals"),
+    ("spyde.workers", "workers"),
+    ("spyde.backend", "backend"),
+    ("spyde.live", "instrument"),
+    ("spyde", "spyde"),
+    ("distributed", "dask"),
+    ("dask", "dask"),
+    ("hyperspy", "hyperspy"),
+    ("rsciio", "io"),
+    ("pyxem", "pyxem"),
+)
+
+
+def _register_log_areas() -> None:
+    try:
+        from de_shell.log_stream import register_area_rules
+        register_area_rules(_LOG_AREA_RULES, verbose_packages=("spyde",))
+    except Exception as exc:  # never block import on a logging-config hiccup
+        log.warning("SpyDE log-area registration skipped: %s", exc)
+
+
+_register_log_areas()
+
+
 def _register_signal_extensions() -> None:
     """Register SpyDE's HyperSpy signal types in-process.
 

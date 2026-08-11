@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from spyde.backend import ipc
+from de_shell import ipc
 
 if TYPE_CHECKING:
     from spyde.signal_tree import BaseSignalTree

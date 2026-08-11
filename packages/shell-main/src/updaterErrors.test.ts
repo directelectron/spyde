@@ -12,7 +12,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   friendlyError, truncateMessage, isPrereleaseVersion, defaultChannelForVersion,
-} from './updater_errors.ts'
+} from './updaterErrors.ts'
 
 test('offline / DNS errors → offline message', () => {
   for (const raw of ['net::ERR_INTERNET_DISCONNECTED', 'getaddrinfo ENOTFOUND github.com', 'EAI_AGAIN']) {
