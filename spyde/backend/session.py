@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 from hyperspy.signal import BaseSignal
 
 from de_shell.ipc import emit, emit_status, emit_error, emit_progress
+from de_shell.session import SessionBase
 from spyde.backend._session_axes import AxesEditorMixin
 from spyde.backend._session_actions import (
     ActionRouterMixin, _TEST_ACTIONS, _TEST_ACTIONS_ENABLED,
@@ -58,6 +59,7 @@ class Session(
     TestHarnessMixin,
     TutorialDataMixin,
     WindowManagerMixin,
+    SessionBase,
 ):
     """
     Top-level coordinator.  One instance per app lifetime.
@@ -67,19 +69,27 @@ class Session(
     """
 
     def __init__(self, n_workers: int, threads_per_worker: int) -> None:
+        # The shell's half: window/plot registry, main-loop marshalling, and the
+        # settings store. SPYDE_SETTINGS_DIR lets tests (e2e in particular —
+        # Electron refuses to launch if HOME is redirected to a scratch dir, so
+        # overriding the whole-process home isn't viable there) point
+        # settings.json at a throwaway directory without touching the real
+        # user's ~/.spyde. Unset in normal use. The shell takes the resolved
+        # directory rather than deriving it: the fallback and the override
+        # variable are per-app, and guessing would let one app write into
+        # another's preferences.
+        SessionBase.__init__(
+            self,
+            settings_dir=os.environ.get("SPYDE_SETTINGS_DIR") or os.path.join(
+                os.path.expanduser("~"), ".spyde"
+            ),
+        )
+
         self.signal_trees: list[BaseSignalTree] = []
-        self._plots: list[Plot] = []  # all open Plot objects (anyplotlib-backed)
-        self._next_window_id = 0
-        self._active_window_id: int | None = None  # focused window (for save etc.)
-        self._recent_files: list[str] = []
         self._example_temp_paths: list[str] = []  # temp .zspy dirs to clean up
         # (src_window_id, action_name) -> {"selector", "out_wids"} so deselecting
         # a toolbar action can hide the output window + ROI it created.
         self._action_artifacts: dict[tuple[int, str], dict] = {}
-        # window_id -> controller for windows that are NOT registered Plots
-        # (bare `figure` emits: strain map, IPF views…). See the WindowController
-        # protocol in spyde/actions/registry.py. _forget_window closes + evicts.
-        self._window_controllers: dict[int, object] = {}
         self.current_selected_signal_tree = None
 
         # MDI manager
@@ -105,11 +115,6 @@ class Session(
         if os.environ.get("SPYDE_NO_DASK") == "1":
             self._dask_ready.set()
 
-        # Plot update poller. `dispatch` marshals the result-APPLY onto the main
-        # asyncio thread (set later via set_main_loop, once the loop exists) — the
-        # poll thread only detects done futures + reads shm; plot.update()/push
-        # runs on the main thread, like the Qt app's queued plot_ready slot.
-        self._main_loop = None
         # Lazily-built ComputeBackend for the EXPENSIVE-tier navigator read (large
         # region / cold cross-chunk / derived rebin-crop view): submit_graph gives
         # a cancellable async read so an expensive frame never blocks the serial
@@ -119,9 +124,11 @@ class Session(
         self._compute_backend = None
         self._compute_backend_client = None   # identity of the client the cached backend wraps
         self._nav_executor = None             # ThreadPoolExecutor, created lazily in no-cluster mode
-        # Set by shutdown() so a nav update still draining on the process-global
-        # dispatcher thread can't recreate the nav executor after teardown.
-        self._closed = False
+
+        # Plot update poller. `dispatch` marshals the result-APPLY onto the main
+        # asyncio thread (SessionBase.set_main_loop registers it once the loop
+        # exists) — the poll thread only detects done futures + reads shm;
+        # plot.update()/push runs on the main thread.
         self._plot_worker = PlotUpdateWorker(
             get_plots_callable=lambda: list(self._plots),
             interval_ms=5,
@@ -132,29 +139,8 @@ class Session(
         self._plot_worker.debug_print.connect(lambda msg: log.debug(msg))
         self._plot_worker.start()
 
-        # Settings
-        # SPYDE_SETTINGS_DIR lets tests (e2e in particular — Electron itself
-        # refuses to launch if USERPROFILE/HOME is redirected to a scratch dir,
-        # so overriding the whole-process home isn't viable there) point the
-        # settings.json file at a throwaway directory without touching the
-        # real user's ~/.spyde. Unset in normal use.
-        settings_dir = os.environ.get("SPYDE_SETTINGS_DIR") or os.path.join(
-            os.path.expanduser("~"), ".spyde"
-        )
-        self._settings_path = os.path.join(settings_dir, "settings.json")
-        self._settings: dict[str, Any] = self._load_settings()
-        # Restore the persisted recent-files list (capped to match _add_recent).
-        try:
-            self._recent_files = list(self._settings.get("recent_files", []))[:20]
-        except Exception as e:
-            log.debug("restoring recent files from settings failed: %s", e)
-        # update_channel/skip_version mirror the Electron-side updater's choice
-        # here so they're inspectable/debuggable from the Python side too (the
-        # Electron main process is the one that actually acts on them).
-        self._update_channel: str = (
-            self._settings.get("update_channel") if self._settings.get("update_channel") in ("stable", "beta")
-            else "stable"
-        )
+    # Settings, recent files, the update channel and the first-run flag are all
+    # loaded by SessionBase.__init__ above — see de_shell/session.py.
 
     # ── Startup ────────────────────────────────────────────────────────────────
 
@@ -177,30 +163,6 @@ class Session(
             return True
         emit_status("Waiting for the compute cluster to start…")
         return self._dask_ready.wait(timeout)
-
-    def set_main_loop(self, loop) -> None:
-        """Register the main asyncio loop so the plot poller can marshal the
-        result-apply onto this (main) thread. Call from app._main once the loop
-        is running.
-
-        NB the process's frozen-timer pathology (waits only wake on process
-        I/O — see runner.ts's backend tick) is healed by Electron's 0.5 Hz
-        stdin tick; an in-process wake ticker was tried and is useless here
-        because its own sleep freezes the same way."""
-        self._main_loop = loop
-
-    def _dispatch_to_main(self, fn) -> None:
-        """Schedule fn() on the main asyncio thread (the plot poller calls this to
-        apply a finished future's result). Falls back to running inline if no loop
-        is registered yet (early startup / tests)."""
-        loop = self._main_loop
-        if loop is not None:
-            try:
-                loop.call_soon_threadsafe(fn)
-                return
-            except Exception as e:
-                log.debug("dispatch_to_main failed, running inline: %s", e)
-        fn()
 
     @property
     def compute_backend(self):
@@ -680,71 +642,6 @@ class Session(
         except Exception as e:
             log.warning("auto_clim failed: %s", e)
 
-    # ── Settings & recent files ────────────────────────────────────────────────
-
-    def _load_settings(self) -> dict:
-        try:
-            with open(self._settings_path, encoding="utf-8") as fh:
-                return json.load(fh)
-        except Exception:
-            return {}
-
-    def _save_settings(self) -> None:
-        os.makedirs(os.path.dirname(self._settings_path), exist_ok=True)
-        with open(self._settings_path, "w", encoding="utf-8") as fh:
-            json.dump(self._settings, fh, indent=2)
-
-    def _add_recent(self, path: str) -> None:
-        if path in self._recent_files:
-            self._recent_files.remove(path)
-        self._recent_files.insert(0, path)
-        self._settings["recent_files"] = self._recent_files[:20]
-        try:
-            self._save_settings()
-        except Exception as e:
-            log.debug("saving recent-files settings failed: %s", e)
-
-    def set_update_channel(self, channel: str) -> None:
-        """Persist the update channel ('stable' or 'beta') to settings.json.
-
-        This mirrors the choice the Electron main process's autoUpdater
-        actually acts on (electron/src/main/updater.ts) — kept here too so the
-        preference is visible/debuggable from the Python side and survives a
-        settings.json inspection independent of Electron's own storage.
-        """
-        if channel not in ("stable", "beta"):
-            log.warning("ignoring invalid update_channel %r", channel)
-            return
-        self._update_channel = channel
-        self._settings["update_channel"] = channel
-        try:
-            self._save_settings()
-        except Exception as e:
-            log.debug("saving update_channel setting failed: %s", e)
-
-    def get_recent_files(self) -> list[str]:
-        return list(self._recent_files[:20])
-
-    # ── First-run welcome tour ───────────────────────────────────────────────────
-
-    @property
-    def first_run(self) -> bool:
-        """True until the welcome tour has been opened/dismissed once. Mirrors
-        the ``tutorial_seen`` settings.json key: absent (never set) => first run."""
-        return not bool(self._settings.get("tutorial_seen", False))
-
-    def mark_tutorial_seen(self) -> None:
-        """Persist that the welcome tour has been shown, so it never auto-opens
-        again. Called by the renderer the moment the welcome tour is opened
-        (see App.tsx) — idempotent, safe to call more than once."""
-        if self._settings.get("tutorial_seen") is True:
-            return
-        self._settings["tutorial_seen"] = True
-        try:
-            self._save_settings()
-        except Exception as e:
-            log.debug("saving tutorial_seen setting failed: %s", e)
-
     # ── Shutdown ───────────────────────────────────────────────────────────────
 
     def shutdown(self) -> None:
@@ -808,6 +705,9 @@ class Session(
             except Exception as e:
                 log.debug("removing example temp dir %s failed: %s", tmpdir, e)
         self._example_temp_paths.clear()
+        # The shell's half last: it only clears the window-controller registry
+        # and latches _closed, and SpyDE's teardown above still needs both.
+        super().shutdown()
 
 
 # ── staged handler (dispatch_action's _STAGED_HANDLERS: fn(session, plot, payload)) ──

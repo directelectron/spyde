@@ -134,21 +134,70 @@ run dies with a native `Fatal Python error: Aborted` inside pyxem's numba matche
 passes in isolation (2 passed, 8 s); this is the concurrent-matcher crash the
 global `PYXEM_LOCK` was added for, surfacing under accumulated full-suite state.
 
+**Second pass — `SessionBase`, `de_shell.app`, and de-groundcrew**
+
+- `de_shell.session.SessionBase`: window/plot registry, main-loop marshalling,
+  the settings store. SpyDE's `Session` inherits it; `WindowManagerMixin` keeps
+  only the teardown that knows about signal trees and selectors. Lifted
+  verbatim, including the non-obvious `unregister_plot` semantics (identity, all
+  occurrences — `register_plot` does not dedupe).
+- `de_shell.app.run()`: a generic asyncio loop parameterised by a session
+  factory, with `on_message`/`on_ready` hooks. **SpyDE still uses its own
+  `backend/app.py`** — adopting this is a follow-up, not done here.
+- `@de/shell-testing`: `launchApp` parameterised by app dir + ready signals.
+  `countColorPixels` now THROWS on an unknown `kind` — the SpyDE version
+  silently counted nothing, which is how a bad assertion passes vacuously.
+- **`apps/groundcrew` — a real, working second app.** Fixed panes (control
+  sidebar, viewer, stats strip, status bar, collapsible log), its own
+  `de_groundcrew` Python package, a simulated camera with a free-running
+  acquisition thread, and newest-wins painting. Its whole dependency set is
+  `de-shell` + numpy. `packages/de-shell/tests/test_boundary.py` enforces that
+  in a subprocess and is mutation-tested (adding `import dask` to a de_shell
+  module makes it fail).
+
+**Four things the shell/app contract requires that were not obvious**
+
+Each of these cost a debug cycle building the second app, and each is a
+candidate for the shell to own rather than have every app rediscover:
+
+1. `_electron.register(fig)` must be called and its RETURNED fig_id used. A
+   made-up id leaves the figure unregistered, so no trait observers attach and
+   `set_data` emits nothing — the figure mounts, sizes and titles correctly and
+   then never updates, silently.
+2. The main process must supply an `onBinary` handler. The shell turns on
+   `APL_BINARY_TRANSPORT`, so every pixel update is a PLOTBIN frame; without the
+   handler the runner parses them and drops them.
+3. A `srcdoc` figure iframe inherits the PARENT page's CSP, so `script-src` needs
+   `blob:` or anyplotlib's ESM boot fails with "Failed to fetch dynamically
+   imported module".
+4. State updates that arrive before the iframe mounts are lost — the backend
+   only sends changes, so the first frame must be retained and replayed on load.
+
 **Not started**
 
-- The rest of `de_shell`: `SessionBase`, the window/figure registry, the actions
-  framework, and the plotting layer. Each needs its app back-reference turned
-  into a hook first — the ones found so far are `lifecycle` →
+- The rest of `de_shell`: the actions framework and the plotting layer. Each
+  needs its app back-reference turned into a hook first — `lifecycle` →
   `compute_dispatch` / `actions.base` / `actions.center_zero_beam` /
   `update_functions`, `base_selector` → `actions.overlay`,
   `plot_control_toolbar` → `spyde.TOOLBAR_ACTIONS`, `figure_registry` →
-  `actions.views`, `registry` → `import spyde`. The `log_stream` area rules are
-  the worked example of the pattern (`register_area_rules`, called from
-  `spyde/__init__.py`).
-- `@de/shell-preload`, `@de/shell-renderer`, `@de/shell-testing`.
+  `actions.views`, `registry` → `import spyde`. `log_stream` is the worked
+  example (`register_area_rules`, called from `spyde/__init__.py`).
+  NB `Plot` is NOT ready to move: it depends on `array_cache` and
+  `actions.overlay`. Ground Crew's `viewer.py` is what the shared figure wrapper
+  should look like, with SpyDE's lazy-data extras layered on top.
+- `@de/shell-preload` and `@de/shell-renderer`. Ground Crew's preload and its
+  `useFigureBridge` are a second copy of SpyDE's shapes — that duplication is
+  the argument for extracting them, and now there are two call sites to
+  generalise from instead of one.
 - The figure custom-protocol, `createWindow` + lifecycle diagnostics, and the
   generic IPC handlers are still inline in `electron/src/main/index.ts`.
-- `apps/groundcrew` and `apps/autopilot` are empty directories.
+- `apps/autopilot` is an empty directory.
+
+**Known defect in the groundcrew scaffold:** the figure does not fit its pane —
+the resize round-trip (renderer `ResizeObserver` → `groundcrew:resize` →
+`sendResize` → `de_shell.app._resize_figure`) never reaches Python, so the
+figure renders at anyplotlib's default size and overflows. Cosmetic, and
+deliberately left rather than chased further in a scaffold.
 
 **Note on the renderer.** Splitting `SpyDEContext.tsx` (2012 lines) and
 `protocol.ts` (1079) is the one part where a clean break is the wrong tool: the

@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "de-groundcrew"
+version = "0.1.0"
+description = "Direct Electron Ground Crew — camera and hardware control"
+authors = [{name = "Direct Electron"}]
+license = {text = "GPL-3.0-or-later"}
+requires-python = ">=3.10,<3.14"
+
+# The whole point of the split, visible here: a live control application whose
+# entire dependency set is the shell plus numpy. No hyperspy, no dask, no
+# rosettasciio, no pyxem. packages/de-shell/tests/test_boundary.py is what keeps
+# it that way.
+dependencies = [
+    "de-shell",
+    "numpy>=1.20.0",
+]
+
+[project.optional-dependencies]
+tests = ["pytest>=3.6", "pytest-timeout"]
+
+[tool.setuptools.packages.find]
+include = ["de_groundcrew*"]
+where = ["."]

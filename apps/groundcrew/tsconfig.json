@@ -1,0 +1,22 @@
+{
+  "include": [
+    "electron.vite.config.*",
+    "src/**/*",
+    "../../packages/shell-main/src/**/*"
+  ],
+  "exclude": ["../../packages/*/src/**/*.test.ts"],
+  "compilerOptions": {
+    "types": ["electron-vite/node"],
+    "lib": ["ESNext", "DOM", "DOM.Iterable"],
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "strict": true,
+    "skipLibCheck": true,
+    "baseUrl": ".",
+    "paths": {
+      "@de/shell-main": ["../../packages/shell-main/src/index.ts"]
+    }
+  }
+}

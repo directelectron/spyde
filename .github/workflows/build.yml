@@ -126,7 +126,7 @@ jobs:
         env:
           NUMBA_DISABLE_JIT: ${{ startsWith(matrix.os, 'macos') && '1' || '0' }}
         run: >
-          uv run pytest spyde/tests/migrated
+          uv run pytest spyde/tests/migrated packages/de-shell/tests
           ${{ matrix.group && format('--splits 2 --group {0} --durations-path spyde/tests/.test_durations', matrix.group) || '' }}
           ${{ (matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12') && '--cov=spyde --cov-report=xml' || '' }}
 
@@ -183,7 +183,7 @@ jobs:
 
       - name: Run tests (extras present)
         run: >
-          uv run pytest spyde/tests/migrated
+          uv run pytest spyde/tests/migrated packages/de-shell/tests
           ${{ matrix.group && format('--splits 2 --group {0} --durations-path spyde/tests/.test_durations', matrix.group) || '' }}
 
   # ── Renderer/main TypeScript typecheck ─────────────────────────────────────

@@ -27,33 +27,14 @@ log = logging.getLogger(__name__)
 
 
 class WindowManagerMixin:
-    def register_plot(self, plot: "Plot") -> None:
-        self._plots.append(plot)
+    """SpyDE's window teardown — the parts that know about signal trees,
+    selectors and the navigator.
 
-    def unregister_plot(self, plot: "Plot") -> None:
-        self._plots = [p for p in self._plots if p is not plot]
-
-    def next_window_id(self) -> int:
-        wid = self._next_window_id
-        self._next_window_id += 1
-        return wid
-
-    def _plot_by_window_id(self, window_id: int):
-        for p in self._plots:
-            if getattr(p, "window_id", None) == window_id:
-                return p
-        return None
-
-    def register_window_controller(self, window_id: int, controller) -> None:
-        """Give a non-Plot window (bare `figure` emit) a dispatch + teardown
-        identity. See the WindowController protocol in spyde/actions/registry.py.
-        _forget_window pops the controller and calls its close()."""
-        self._window_controllers[window_id] = controller
-
-    def controller_by_window_id(self, window_id: int | None):
-        if window_id is None:
-            return None
-        return self._window_controllers.get(window_id)
+    The plain registry underneath (``register_plot`` / ``next_window_id`` /
+    ``register_window_controller`` / ``_plot_by_window_id`` and friends) is
+    app-agnostic and now lives in ``de_shell.session.SessionBase``, which
+    ``Session`` also inherits.
+    """
 
     def _close_window(self, window_id: int) -> None:
         plot = self._plot_by_window_id(window_id)

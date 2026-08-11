@@ -8,13 +8,13 @@ Messages from Electron arrive on stdin as JSON lines (no prefix).
 
 Usage
 -----
-    from de_shell.ipc import emit, IPC
+    from de_shell.ipc import emit, read_messages
 
     # send a message to Electron
-    emit({"type": "status", "text": "Dask ready"})
+    emit({"type": "status", "text": "Cluster ready"})
 
     # read messages (async, called from the asyncio event loop)
-    async for msg in IPC.messages():
+    async for msg in read_messages(loop):
         handle(msg)
 """
 from __future__ import annotations
