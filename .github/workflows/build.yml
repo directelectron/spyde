@@ -111,6 +111,20 @@ jobs:
       # Coverage only on ubuntu-3.12 (the only leg the upload reads); on PRs
       # both shards upload and Codecov merges them server-side.
       - name: Run tests
+        # NUMBA_DISABLE_JIT=1 on macOS: the toolchain MISCOMPILES numba kernels
+        # there (every python), and the crash lands wherever a jitted kernel
+        # runs — most recently inside pyxem's indexation kernels
+        # (`_get_full_correlations` under our coarse_seed), as `Fatal Python
+        # error: Aborted`. It reads as intermittent only because pytest-split
+        # shard composition changes which jitted tests share a process.
+        # Interpreting the kernels instead of compiling them cannot miscompile,
+        # so this leg trades speed for a correct answer — unlike
+        # NUMBA_BOUNDSCHECK, which dodged the crash on the quarry's particle
+        # kernels but left them returning WRONG results. macOS is not the
+        # wall-clock driver and the shipped app pins 3.12. Remove when a fixed
+        # numba/llvmlite lands and these legs run clean without it.
+        env:
+          NUMBA_DISABLE_JIT: ${{ startsWith(matrix.os, 'macos') && '1' || '0' }}
         run: >
           uv run pytest spyde/tests/migrated
           ${{ matrix.group && format('--splits 2 --group {0} --durations-path spyde/tests/.test_durations', matrix.group) || '' }}
