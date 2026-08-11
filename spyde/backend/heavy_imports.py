@@ -32,6 +32,32 @@ _DONE = False
 _TORCH_LOCK = threading.Lock()
 _TORCH_STARTED = False
 _TORCH_READY = False        # torch imported AND a CUDA device is usable
+# Set when the prewarm thread finishes, WHETHER OR NOT a GPU was found. Distinct
+# from _TORCH_READY: a consumer that only needs torch-CPU (the drift preview
+# solve) cares that the ~3 s IMPORT is done, not whether CUDA exists.
+_TORCH_IMPORT_DONE = threading.Event()
+
+
+def torch_imported() -> bool:
+    """True iff the torch import has finished. Never blocks (see
+    :func:`torch_cuda_ready` on why touching a mid-import torch is a stall)."""
+    return _TORCH_IMPORT_DONE.is_set()
+
+
+def wait_for_torch(timeout: float = 60.0) -> bool:
+    """Block until torch is imported. Returns False on timeout.
+
+    **Never call this on the asyncio main thread or the nav dispatcher** — it can
+    block for the full ~3 s import, and both of those are latency-critical. It
+    exists so a WORKER can absorb that cost before an interactive path needs
+    torch: the drift caret waits here on a worker so the first preview step,
+    which runs on the shared dispatcher, can never be the thing that pays it.
+    """
+    prewarm_torch_cuda()                 # idempotent; starts one if none running
+    if _TORCH_IMPORT_DONE.wait(timeout):
+        return True
+    log.info("torch still importing after %.0fs; caller falls back to numpy", timeout)
+    return False
 
 
 def torch_cuda_ready() -> bool:
@@ -76,6 +102,7 @@ def prewarm_torch_cuda() -> None:
     import os
     if "PYTEST_CURRENT_TEST" in os.environ:
         log.debug("torch prewarm skipped under pytest")
+        _TORCH_IMPORT_DONE.set()     # never leave a waiter hanging
         return
 
     def _warm():
@@ -93,6 +120,10 @@ def prewarm_torch_cuda() -> None:
                 log.info("torch imported; no CUDA device — GPU paths stay off")
         except Exception as e:
             log.info("torch/CUDA prewarm failed (CPU paths only): %s", e)
+        finally:
+            # Set even on failure: a waiter must not hang because torch is
+            # missing, it must fall through to the numpy path.
+            _TORCH_IMPORT_DONE.set()
 
     threading.Thread(target=_warm, daemon=True, name="torch-prewarm").start()
 

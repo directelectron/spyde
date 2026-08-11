@@ -116,6 +116,11 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--size", type=int, default=SIZE)
     ap.add_argument("--frames", type=int, default=FRAMES)
+    ap.add_argument("--normal-load", action="store_true",
+                    help="wait for the session's torch prewarm before opening the "
+                         "caret — what a user who spent a few seconds looking at "
+                         "the data actually experiences. Without it the caret RACES "
+                         "the prewarm, which is a harness artefact, not the app.")
     args = ap.parse_args(argv)
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -146,6 +151,18 @@ def main(argv=None) -> int:
         plot = next(p for p in session._plots
                     if not p.is_navigator and p.plot_state is not None)
         tree = plot.signal_tree
+
+        if args.normal_load:
+            # A user opens a 3.8 GiB movie, looks at it, THEN reaches for the
+            # caret — by which time the session's background torch prewarm has
+            # long finished. Opening the caret microseconds after the load races
+            # that prewarm, which is a harness artefact and not what anyone
+            # experiences. Both numbers are worth having; only one is the user's.
+            from spyde.backend.heavy_imports import wait_for_torch
+            _t = time.perf_counter()
+            wait_for_torch(180.0)
+            print(f"  (waited {time.perf_counter() - _t:.1f}s for the session's "
+                  f"torch prewarm, as a browsing user would have)")
 
         print("\n== drift_open ==")
         t0 = time.perf_counter()

@@ -1183,12 +1183,18 @@ def preview_alignment(get_frame, indices, roi, *, params, prof=None,
             crops.append(np.ascontiguousarray(frame, dtype=np.float32))
 
     with prof.stage("solve"):
-        # torch-CPU, explicitly. Measured on the 512² preview crops: cpu 6.8 ms
-        # warm vs cuda 7.3 ms vs numpy 18.4 ms — CUDA buys nothing at this size,
-        # and pinning to CPU keeps a per-drag-frame job off the device the full
-        # solve wants. (The ~3 s the FIRST torch call costs is process-wide import
-        # + init, not device choice; the session prewarms it in the background.)
-        model = solve_translation(crops, device="cpu", **_solver_kwargs(params))
+        # torch-CPU once torch is RESIDENT, numpy until then. Measured on the
+        # 512² preview crops: cpu 6.8 ms warm, cuda 7.3 ms, numpy 18.4 ms — CUDA
+        # buys nothing at this size, and pinning to CPU keeps a per-drag-frame job
+        # off the device the full solve wants.
+        #
+        # The torch_imported() gate is the load-bearing part: this runs on the
+        # SHARED nav dispatcher, and importing torch here would block every
+        # navigator update for ~2.9 s. numpy is 18 ms, still inside a drag frame,
+        # so there is never a reason to stall for the import.
+        from spyde.backend.heavy_imports import torch_imported
+        device = "cpu" if torch_imported() else "numpy"
+        model = solve_translation(crops, device=device, **_solver_kwargs(params))
     take = range(len(crops))
     st = max(1, int(display_stride))
     small = crops if st == 1 else [c[::st, ::st] for c in crops]
@@ -1278,7 +1284,7 @@ def drift_open(session, plot, payload) -> None:
                     "then Correct Drift.")
         prof.mark("check_visible")
         prof.done()
-        _run_preview(wiz)
+        _kick_first_preview(wiz)
 
     def _fail(exc):
         emit_error(f"Drift Correction: reading the movie failed — {exc}")
@@ -1344,6 +1350,49 @@ def drift_tune(session, plot, payload) -> None:
         wiz._preview_cache = None        # a different set of frames to hold
     _emit_state(wiz)
     _run_preview(wiz)
+
+
+def _kick_first_preview(wiz: DriftWizard) -> None:
+    """Absorb the torch import on a WORKER, then run the first preview.
+
+    The preview solve runs on the shared nav dispatcher, and the first torch call
+    in a process costs ~2.9 s of import — measured landing squarely inside the
+    user's first interaction, because opening the caret races the session's
+    background prewarm. Blocking the dispatcher for it would freeze the navigator
+    too, so the wait happens here, on a worker, AFTER the check window is already
+    on screen. The window stays fast, and by the time the first preview reaches
+    the dispatcher torch is resident and the step is ~7 ms.
+
+    If torch never arrives (missing, or slow past the timeout) the preview falls
+    back to numpy — 18 ms warm, still inside a drag frame. Nothing waits forever.
+    """
+    from spyde.backend.heavy_imports import prewarm_torch_cuda, wait_for_torch
+
+    prewarm_torch_cuda()          # idempotent — make sure one is in flight
+    prof = ActionProfile("drift_first_preview")
+    t_kick = time.perf_counter()
+
+    def _work():
+        # Two DIFFERENT waits hide in "the caret took N seconds", and only a
+        # split tells them apart: time spent queued for a worker at all, versus
+        # time spent on the torch import once running.
+        prof.info(worker_queue_ms=round((time.perf_counter() - t_kick) * 1e3, 1))
+        with prof.stage("torch_wait"):
+            return wait_for_torch(60.0)
+
+    def _done(_ready):
+        prof.mark("preview_submitted")
+        prof.done()
+        if not wiz._closed:
+            _run_preview(wiz)
+
+    def _fail(exc):
+        log.debug("[drift] torch wait failed (%s); previewing anyway", exc)
+        if not wiz._closed:
+            _run_preview(wiz)
+
+    run_on_worker(wiz.session, _work, name="drift-torch-warm",
+                  on_done=_done, on_error=_fail)
 
 
 def _run_preview(wiz: DriftWizard) -> None:
