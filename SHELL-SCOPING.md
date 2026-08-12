@@ -105,12 +105,42 @@ way the old build script assumed.
 
 ---
 
+## 9. `deapi` version — needs a decision
+
+Verified end to end against the `FakeServer` (spawn
+`simulated_server/initialize_server.py <port>`, wait for the `started` banner,
+`Client()` with `usingMmf = False`):
+
+| | published **5.2.2** | local **5.3b6** |
+|---|---|---|
+| connect, list cameras, properties | works | works |
+| acquire + full `get_result` | **crashes** | works — (1024, 1024) uint16 |
+| windowed `get_result` (the tile call) | unreachable | works — (256, 256) |
+
+5.2.2 carries a stray unguarded `print("Response:", response.ByteSize())` at
+`client.py:1450`, immediately before the `if response != False` check on the
+next line — so it raises `AttributeError` on exactly the case the following line
+exists to handle. It is gone in 5.3b6.
+
+So the plan of record ("use the PyPI one") does not currently work for the call
+the whole viewer is built on. Either 5.3 gets released, or `apps/groundcrew`
+pins a git ref in the meantime. **Owner's call.**
+
+Aside worth knowing: a stray `print()` in any dependency writes to stdout, which
+is the PLOTAPP protocol channel. `de_shell.ipc.redirect_stray_stdout()` already
+routes every `print()` to stderr for exactly this reason, so the shell is immune
+— but it would corrupt a naive backend.
+
+## 10. Scope — settled
+
+SerialEM and the script panel are **out of v1**. No rail entry, no panel.
+
 ## Still open
 
+- **`deapi` version** — see §9; blocks the dependency declaration only, not the
+  work (the local checkout runs today).
 - **Sensor health thresholds** — deferred by agreement; the owner will help set
   them.
-- **SerialEM and the script panel** — assumed OUT of v1 (SerialEM is half broken
-  and belongs in `de-instrument`, which is early). Not yet explicitly confirmed.
 - **Corrected movie output** — back to the server, or to a file only?
 - **Retract while acquiring** — confirm dialog, or refuse?
 - **Where a failed fit surfaces** — "no ring found" has no home louder than the
