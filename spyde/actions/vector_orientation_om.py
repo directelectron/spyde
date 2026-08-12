@@ -34,7 +34,7 @@ DEFAULTS = dict(
     smooth=False,
 )
 
-from spyde.actions.wizard import WizardController
+from de_shell.actions.wizard import WizardController
 
 
 class VomWizard(WizardController):

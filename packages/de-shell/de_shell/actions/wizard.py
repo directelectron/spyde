@@ -1,12 +1,12 @@
 """
 wizard.py — WizardController, the base class for staged-wizard actions.
 
-A *wizard* is the staged action shape (see ``spyde/actions/README.md``): the
+A *wizard* is the staged action shape (see the shell's actions/registry.py): the
 renderer caret mounts → ``<key>_open`` starts a live preview / controller;
 parameter edits stream in (``<key>_tune`` / ``<key>_set_<param>``); a heavy
 stage runs (``<key>_run``); an optional Commit snapshots the live result into
 a new SignalTree (``<key>_commit`` → :meth:`commit` →
-``spyde.actions.commit.commit_result_tree``); unmount → ``<key>_close`` tears
+the app's commit helper); unmount → ``<key>_close`` tears
 everything down.
 
 The controller owns the wizard's state (library / overlay / field / windows)
@@ -31,7 +31,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable
 
-from spyde.actions.lifecycle import (
+from de_shell.actions.lifecycle import (
     bump_generation, is_current, replace_tree_attr, run_on_worker as _run_on_worker,
 )
 
@@ -110,6 +110,6 @@ class WizardController:
 
     def commit(self):
         """Snapshot the live result into a new SignalTree (the ``<key>_commit``
-        stage) — implement with ``spyde.actions.commit.commit_result_tree``.
+        stage) — implement with the app's commit helper.
         Returns the new tree."""
         raise NotImplementedError(f"{type(self).__name__} has no commit stage")

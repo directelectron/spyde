@@ -17,7 +17,7 @@ import logging
 
 import numpy as np
 
-from spyde.actions.figure_registry import keep_alive
+from de_shell.actions.figure_registry import keep_alive
 
 log = logging.getLogger(__name__)
 

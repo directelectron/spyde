@@ -268,7 +268,7 @@ def _compute_with_live_ipf(session, src, src_tree, sim, params):
 # Compute Map. State lives on the source tree as `_om_wizard` (an OmWizard).
 # ─────────────────────────────────────────────────────────────────────────────
 
-from spyde.actions.wizard import WizardController
+from de_shell.actions.wizard import WizardController
 
 
 class OmWizard(WizardController):

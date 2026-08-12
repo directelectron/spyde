@@ -195,7 +195,7 @@ class WindowManagerMixin:
             except Exception as e:
                 log.debug("window controller close failed: %s", e)
         # Figures kept alive for this window (bare-figure emits) die with it.
-        from spyde.actions.figure_registry import forget_window as _figs_forget
+        from de_shell.actions.figure_registry import forget_window as _figs_forget
         _figs_forget(window_id)
         # A stacked 1-D navigator cursor keeps an index hook on the tree's real
         # navigation selector — detach it so a closed window can't keep syncing.

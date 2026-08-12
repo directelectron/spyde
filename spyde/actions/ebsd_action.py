@@ -35,7 +35,7 @@ import threading
 import numpy as np
 
 from spyde.actions.context import src_plot_tree as _src_plot_tree
-from spyde.actions.wizard import WizardController
+from de_shell.actions.wizard import WizardController
 from de_shell.ipc import emit, emit_error, emit_status
 
 log = logging.getLogger(__name__)

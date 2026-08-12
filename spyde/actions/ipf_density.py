@@ -26,7 +26,7 @@ from spyde.actions.ipf_view import _as_orientation_map
 
 # NB: named `logger` (not `log`) — build_ipf_density_figure has a `log: bool`
 # param for log-scale density that would otherwise shadow a module-level `log`.
-from spyde.actions.figure_registry import keep_alive
+from de_shell.actions.figure_registry import keep_alive
 
 logger = logging.getLogger(__name__)
 

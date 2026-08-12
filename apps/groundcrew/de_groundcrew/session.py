@@ -2,8 +2,9 @@
 session.py — Ground Crew's backend coordinator.
 
 A thin app layer on `de_shell.session.SessionBase`: the base owns the window
-registry, main-thread marshalling and the settings file; this owns the camera,
-the acquisition loop and the live viewer figure.
+registry, main-thread marshalling and the settings file, and
+`de_shell.plotting.figure.FigureView` owns the image pane. What is left here is
+the camera and the acquisition loop — which is the whole point.
 
 Actions arrive from the renderer as `{"type": "action", "action": …, "payload":
 …}` and are dispatched by name through `_ACTIONS`. That is deliberately a plain
@@ -22,7 +23,7 @@ from de_shell.ipc import emit, emit_error, emit_status
 from de_shell.session import SessionBase
 
 from de_groundcrew.camera import AcquisitionLoop, SimulatedCamera
-from de_groundcrew.viewer import LiveViewer
+from de_shell.plotting.figure import FigureView
 
 log = logging.getLogger(__name__)
 
@@ -35,7 +36,7 @@ class GroundCrewSession(SessionBase):
 
         self.camera = SimulatedCamera()
         self._exposure_s = 0.05
-        self._viewer = LiveViewer(window_id=self.next_window_id(), title="Live view")
+        self._viewer = FigureView(self.next_window_id(), title="Live view")
         self.register_window_controller(self._viewer.window_id, self._viewer)
 
         self._loop = AcquisitionLoop(

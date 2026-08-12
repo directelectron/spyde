@@ -34,7 +34,7 @@ from spyde.actions.commit import commit_result_tree
 from spyde.fitting.components import EELS_EDGE_KIND
 from spyde.fitting.store import FitStore
 from spyde.actions.context import src_plot_tree as _src_plot_tree
-from spyde.actions.wizard import WizardController
+from de_shell.actions.wizard import WizardController
 from spyde.drawing.selectors.base_selector import event_handler_fn
 # Imported as a MODULE, not `from ... import emit`. The test fixture patches
 # `ipc.emit` to capture outgoing messages, and a from-import binds the original

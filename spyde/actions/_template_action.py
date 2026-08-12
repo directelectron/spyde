@@ -48,7 +48,7 @@ from spyde.actions.action import RegionAction, TransformAction
 from spyde.actions.commit import commit_result_tree
 from spyde.actions.context import src_plot_tree as _src_plot_tree
 from spyde.actions.lifecycle import wait_for_vectors
-from spyde.actions.wizard import WizardController
+from de_shell.actions.wizard import WizardController
 
 log = logging.getLogger(__name__)
 

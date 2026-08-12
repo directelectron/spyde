@@ -21,7 +21,7 @@ from spyde.actions.strain_mapping import (
     default_reference as _default_reference,
     zero_beam_filtered as _zero_beam_filtered,
 )
-from spyde.actions.wizard import WizardController
+from de_shell.actions.wizard import WizardController
 
 log = logging.getLogger(__name__)
 
@@ -564,7 +564,7 @@ def strain_open(session, plot, payload) -> None:
             return   # superseded by a strain_close or a newer strain_open
         _fig, fig_id, html, p = build_strain_figure(field, component="exx")
         wid = session.next_window_id()
-        from spyde.actions.figure_registry import keep_alive
+        from de_shell.actions.figure_registry import keep_alive
         keep_alive(int(wid), _fig)
         emit({"type": "figure", "fig_id": fig_id, "window_id": int(wid),
               "html": html, "title": "Strain (εxx)", "is_navigator": False,

@@ -173,18 +173,46 @@ candidate for the shell to own rather than have every app rediscover:
 4. State updates that arrive before the iframe mounts are lost — the backend
    only sends changes, so the first frame must be retained and replayed on load.
 
+**Third pass — the actions framework and a shared figure**
+
+- `de_shell.actions.lifecycle` — `run_on_worker`, `bump_generation` /
+  `is_current`, `replace_tree_attr`, `progress_emitter`, `window_computing`.
+- `de_shell.actions.registry` — the dispatch MECHANISM (lazy dotted-path
+  resolution, wizard-schema lookup, the WindowController protocol). The tables
+  stay in SpyDE and are registered at import. `spyde.actions.registry`
+  rebinds `STAGED_HANDLERS` to the shell's dict afterwards, so there is ONE
+  authority: otherwise a `register_staged()` call lands in one dict and is read
+  from the other.
+- `de_shell.actions.context` (`ActionContext`), `de_shell.actions.wizard`
+  (`WizardController`), `de_shell.actions.figure_registry`,
+  `de_shell.timing` (`reliable_sleep`).
+- `de_shell.plotting.figure` — `FigureView` + `robust_levels`. **Ground Crew now
+  uses it**; its bespoke viewer is deleted.
+
+Two API notes worth knowing:
+
+*Re-exports are deliberate, and are not compatibility shims.*
+`spyde.actions.lifecycle` re-exports the shell primitives alongside its own
+domain lifecycle, and `spyde.actions.context` / `registry` do the same. An
+action imports one module; it should not have to know which half a helper came
+from. The alternative — splitting imports across ~58 call sites — spreads that
+knowledge everywhere for no benefit.
+
+*`figure_registry` no longer reaches into the app.* It used to lazily import
+SpyDE's `actions.views` to evict per-window state. Apps now call
+`register_evictor(fn)`; `views.py` does so at import.
+
 **Not started**
 
-- The rest of `de_shell`: the actions framework and the plotting layer. Each
-  needs its app back-reference turned into a hook first — `lifecycle` →
-  `compute_dispatch` / `actions.base` / `actions.center_zero_beam` /
-  `update_functions`, `base_selector` → `actions.overlay`,
-  `plot_control_toolbar` → `spyde.TOOLBAR_ACTIONS`, `figure_registry` →
-  `actions.views`, `registry` → `import spyde`. `log_stream` is the worked
-  example (`register_area_rules`, called from `spyde/__init__.py`).
-  NB `Plot` is NOT ready to move: it depends on `array_cache` and
-  `actions.overlay`. Ground Crew's `viewer.py` is what the shared figure wrapper
-  should look like, with SpyDE's lazy-data extras layered on top.
+- SpyDE's `Plot` still does not use `FigureView`. It carries the array cache,
+  the tiered navigator read, overlay layers and tile mode, so adopting the
+  shared core means layering those on top — a real piece of work, and riskier
+  than anything done so far because the navigator read path is the app's most
+  performance-sensitive code (see the Live-Display section of CLAUDE.md).
+  `FigureView` is deliberately the in-memory core so that layering is possible.
+- `spyde/drawing/selectors/` and `toolbars/`: `base_selector` still reaches into
+  `actions.overlay`, and `plot_control_toolbar` into `spyde.TOOLBAR_ACTIONS`.
+  Both want the `register_*` hook treatment.
 - `@de/shell-preload` and `@de/shell-renderer`. Ground Crew's preload and its
   `useFigureBridge` are a second copy of SpyDE's shapes — that duplication is
   the argument for extracting them, and now there are two call sites to

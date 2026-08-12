@@ -142,7 +142,7 @@ def _tile_navigators(session, plot, tree, names) -> None:
     import anyplotlib as apl
     import anyplotlib._electron as _electron
     from spyde.drawing.plots.plot import finalize_figure_html
-    from spyde.actions.figure_registry import keep_alive
+    from de_shell.actions.figure_registry import keep_alive
     from spyde.actions.views import _link_crosshairs, TILED_LABEL
     from de_shell.ipc import emit
 
@@ -382,7 +382,7 @@ def _stack_navigators(session, plot, tree, names) -> None:
     import anyplotlib as apl
     import anyplotlib._electron as _electron
     from spyde.drawing.plots.plot import finalize_figure_html
-    from spyde.actions.figure_registry import keep_alive
+    from de_shell.actions.figure_registry import keep_alive
     from de_shell.ipc import emit
 
     wid = getattr(plot, "window_id", None)

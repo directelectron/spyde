@@ -1,51 +1,27 @@
 """
-registry.py — the staged-action registry and the window-controller protocol.
+registry.py — SpyDE's staged-action table and wizard schema map.
 
-SpyDE has exactly TWO dispatch paths for renderer→backend actions (see
-``spyde/actions/README.md``; do not invent a third):
+The registry MECHANISM (lazy dotted-path resolution, the wizard-schema lookup,
+the WindowController protocol) is app-agnostic and lives in the shell —
+``de_shell.actions.registry``, which also carries the full protocol
+documentation. What is here is SpyDE's CONTENT: which action names exist and
+where each wizard declares its parameters.
 
-1. **YAML toolbar actions** — declared in ``spyde/toolbars.yaml``, resolved and
-   invoked by ``Session._dispatch_toolbar_action`` with an ``ActionContext``.
-2. **Staged actions** — the wizard/caret protocol: each entry below maps an
-   action name to a ``"module.function"`` dotted path with the uniform
-   ``fn(session, plot, payload)`` signature. Modules are imported lazily so
-   heavy dependencies load on first use, not at startup.
-
-Staged-action NAMING CONVENTION (``<key>`` is the wizard's short prefix):
-
-    <key>_open           wizard mounted → start live preview / controller
-    <key>_close          wizard unmounted → tear everything down
-    <key>_tune           debounced live re-tune of preview params
-    <key>_set_<param>    discrete parameter change
-    <key>_run            heavy compute stage (may open a result tree)
-    <key>_commit         snapshot the live result into a NEW SignalTree
-
-Wizard-specific extra stages are allowed but must keep the ``<key>_`` prefix
-(e.g. ``om_generate_library``).
-
-WindowController protocol
--------------------------
-Windows that are NOT registered ``Plot``s (bare ``figure`` emits: the strain
-map, IPF views, tiled comparisons) must register a *controller* with
-``session.register_window_controller(window_id, controller)`` so dispatch and
-teardown can reach them. A controller is duck-typed:
-
-    window_id: int                     # the window it drives
-    close() -> None                    # full teardown; called by
-                                       # Session._forget_window when the window
-                                       # goes away for ANY reason
-    handle_action(name, payload) -> bool   # optional: consume an action aimed
-                                           # at this window; return True if
-                                           # handled
-
-``spyde.actions.wizard.WizardController`` provides a base implementation.
+Both tables are registered with the shell at import, and the shell's resolver
+functions are re-exported so callers keep importing one module.
 """
 from __future__ import annotations
 
-import importlib
-from typing import Callable
+from de_shell.actions.registry import (  # noqa: F401  (re-exported API)
+    YAML_SCHEMA, register_staged, register_staged_table, resolve_staged,
+    register_wizard_schema, register_wizard_schemas, set_yaml_schema_resolver,
+    wizard_parameters, wizard_keys,
+)
 
-STAGED_HANDLERS: dict[str, str] = {
+# SpyDE's own table. Registered into the shell below, after which the name
+# STAGED_HANDLERS is REBOUND to the shell's dict — one authority, so a later
+# register_staged() is visible to everything that reads the table.
+_SPYDE_STAGED_HANDLERS: dict[str, str] = {
     "fit_open":             "spyde.actions.fit_action.fit_open",
     "fit_close":            "spyde.actions.fit_action.fit_close",
     "fit_add_component":    "spyde.actions.fit_action.fit_add_component",
@@ -213,34 +189,7 @@ STAGED_HANDLERS: dict[str, str] = {
     "movie_cancel":            "spyde.actions.report.movie.movie_cancel",
 }
 
-
-def resolve_staged(name: str) -> Callable | None:
-    """Lazily import and return the handler for a staged action name."""
-    dotted = STAGED_HANDLERS.get(name)
-    if dotted is None:
-        return None
-    mod, fn = dotted.rsplit(".", 1)
-    return getattr(importlib.import_module(mod), fn)
-
-
-def register_staged(name: str, dotted_path: str) -> None:
-    """Register a staged action (``fn(session, plot, payload)``) by dotted path."""
-    STAGED_HANDLERS[name] = dotted_path
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Wizard parameter schemas — the single host-agnostic lookup
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Every wizard declares its parameter schema in Python (a `parameters`
-# classattr on its WizardController, or a module-level PARAMETERS for
-# controller-less wizards), in the SAME dict spec as toolbars.yaml
-# `parameters:`. FV and OM keep their schema in toolbars.yaml (their carets
-# already render from it); this table maps each wizard key to wherever its
-# schema lives, so any host (an Electron panel, a notebook form generator, a
-# doc generator) resolves them uniformly. Completeness is enforced by
-# test_wizard_schemas.py.
-_WIZARD_SCHEMAS: dict[str, tuple[str, str]] = {
+_SPYDE_WIZARD_SCHEMAS: dict[str, tuple[str, str]] = {
     # key: (module, attribute) — attribute is a controller class (its
     # `parameters`) or a dict.
     "fit":    ("spyde.actions.fit_action", "FitWizard"),
@@ -251,12 +200,14 @@ _WIZARD_SCHEMAS: dict[str, tuple[str, str]] = {
     "czb":    ("spyde.actions.center_zero_beam", "PARAMETERS"),
     "drift":  ("spyde.actions.drift_action", "DriftWizard"),
     # YAML-declared (resolved from spyde.TOOLBAR_ACTIONS):
-    "fv":     ("__yaml__", "Find Diffraction Vectors"),
-    "om":     ("__yaml__", "Orientation Mapping"),
+    "fv":     (YAML_SCHEMA, "Find Diffraction Vectors"),
+    "om":     (YAML_SCHEMA, "Orientation Mapping"),
 }
 
 
 def _yaml_parameters(action_title: str) -> dict:
+    """Resolve a wizard schema declared in toolbars.yaml (FV and OM keep theirs
+    there, because their carets already render from it)."""
     import spyde
     for group in spyde.TOOLBAR_ACTIONS.values():
         if isinstance(group, dict) and action_title in group:
@@ -264,21 +215,15 @@ def _yaml_parameters(action_title: str) -> dict:
     return {}
 
 
-def wizard_parameters(key: str) -> dict:
-    """Return wizard ``key``'s declared parameter schema (a copy).
+# Hand SpyDE's content to the shell. At import, so anything that resolves an
+# action or a wizard schema sees a populated registry regardless of import order.
+register_staged_table(_SPYDE_STAGED_HANDLERS)
+register_wizard_schemas(_SPYDE_WIZARD_SCHEMAS)
+set_yaml_schema_resolver(_yaml_parameters)
 
-    The uniform entry point for rendering a wizard's controls in ANY host —
-    same spec as toolbars.yaml ``parameters:`` (type/name/default/min/max/
-    step/choices/tab/extensions). Raises ``KeyError`` for unknown keys.
-    """
-    module, attr = _WIZARD_SCHEMAS[key]
-    if module == "__yaml__":
-        return _yaml_parameters(attr)
-    obj = getattr(importlib.import_module(module), attr)
-    schema = obj if isinstance(obj, dict) else getattr(obj, "parameters", {})
-    return dict(schema)
-
-
-def wizard_keys() -> list[str]:
-    """All wizard keys with a declared schema."""
-    return list(_WIZARD_SCHEMAS)
+# Rebind to the shell's live dicts so `spyde.actions.registry.STAGED_HANDLERS`
+# and the shell's are the SAME object — otherwise a register_staged() call
+# would land in one and be read from the other.
+from de_shell.actions.registry import (  # noqa: E402
+    STAGED_HANDLERS, _WIZARD_SCHEMAS,  # noqa: F401  (re-exported API)
+)

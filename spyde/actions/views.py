@@ -19,7 +19,7 @@ import logging
 
 import numpy as np
 
-from spyde.actions.figure_registry import keep_alive
+from de_shell.actions.figure_registry import keep_alive
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +28,25 @@ logger = logging.getLogger(__name__)
 # The source arrays for each named view, so a tiled (multi-axis) figure can be
 # rebuilt for any selected subset without recomputing.
 _VIEW_DATA: dict[int, dict] = {}
+
+
+def _evict_window(window_id: int) -> None:
+    """Drop this window's view arrays when its window goes away.
+
+    Registered with the shell's figure registry rather than being reached into
+    from there: the shell must not know SpyDE's modules. Without it these
+    arrays — full-resolution images, one per named view — leak for the process
+    lifetime.
+    """
+    _VIEW_DATA.pop(int(window_id), None)
+
+
+def _register_evictor() -> None:
+    from de_shell.actions.figure_registry import register_evictor
+    register_evictor(_evict_window)
+
+
+_register_evictor()
 
 # The figure that carries a tiled comparison is tagged with this reserved
 # view_label so the frontend (a) shows it when ≥2 chips are selected and

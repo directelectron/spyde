@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import pytest
 
-from spyde.actions import figure_registry
+from de_shell.actions import figure_registry
 from spyde.actions.registry import STAGED_HANDLERS, register_staged, resolve_staged
 
 

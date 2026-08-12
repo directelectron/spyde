@@ -52,7 +52,7 @@ import logging
 
 import numpy as np
 
-from spyde.actions.figure_registry import keep_alive
+from de_shell.actions.figure_registry import keep_alive
 from spyde.actions.ipf_view import _as_orientation_map
 
 logger = logging.getLogger(__name__)
