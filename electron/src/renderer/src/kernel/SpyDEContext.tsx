@@ -7,6 +7,7 @@
 import React, {
   createContext, useCallback, useContext, useEffect, useReducer, useRef, useState,
 } from 'react'
+import { useFigureBridge } from '@de/shell-renderer'
 import { asPlotAppMessage } from './protocol'
 import type { ReportDocState, ReportCell } from './protocol'
 import { WINDOW_DRAG_MIME, FIGURE_DRAG_MIME, stashWindowDrag } from './dnd'
@@ -830,22 +831,20 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     consolePreview: null,
   })
 
-  const iframeRefs = useRef<Map<string, HTMLIFrameElement>>(new Map())
-  const latestStates = useRef<Map<string, Map<string, unknown>>>(new Map())
-  // Latest RAW BINARY frame per figure (key → {header, buffer}), mirroring
-  // latestStates but for PLOTBIN pushes. Without this, a figure whose FIRST
-  // real paint arrives as a binary frame before its iframe's onLoad fires (the
-  // common case for a console-created window, which — unlike a
-  // navigator-driven one — gets no organic second paint) stays permanently
-  // blank: postMessage to an unmounted iframe silently no-ops and, prior to
-  // this stash, replayState() had nothing to give it on load. Keeps only the
-  // LATEST frame per key (retained across postMessage's transfer, which
-  // detaches the original ArrayBuffer) — matches the "latest-wins" paint
-  // philosophy used throughout the nav/paint pipeline (see CLAUDE.md).
-  // figId → (`${geom}::${pixelField}` → the frame). Keyed per PANEL, not per
-  // pixel field — see the state_update_binary handler for why that matters.
-  const latestBinaryStates = useRef<Map<string, Map<string,
-    { key: string; header: unknown; buffer: Uint8Array }>>>(new Map())
+  // The figure bridge — iframe registry, state retention and replay — now lives
+  // in @de/shell-renderer, shared with de-groundcrew. It exposes its maps as
+  // `{current}` boxes, so `iframeRefs` / `latestStates` / `latestBinaryStates`
+  // keep the exact shape the components that read them already expect (a
+  // React.MutableRefObject<Map<…>>), and none of them needed changing.
+  //
+  // The three subtleties that used to live here — replay taking an explicit
+  // target so a doubly-mounted figure serves ITSELF, binary frames stashed per
+  // PANEL (`geom::pixelField`) rather than per pixel field, and replaying a COPY
+  // because postMessage transfers and detaches — are documented on the bridge.
+  const figureBridge = useFigureBridge(dlog)
+  const iframeRefs = figureBridge.iframes
+  const latestStates = figureBridge.states
+  const latestBinaryStates = figureBridge.binaryStates
   // Mirror reportFigures into a ref so the (stable-identity, deps-[]) message
   // effect below can read the LATEST cell→figure map synchronously — e.g. to
   // find a report cell's OLD figId before it's replaced, so its shadow state
@@ -865,52 +864,11 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
   const [gpuHelpDialogOpen, setGpuHelpDialogOpen] = useState(false)
   const [dragKind, setDragKind] = useState<'window' | null>(null)
 
-  // Post every stored state for a figure to its iframe (called on iframe load).
-  /**
-   * Re-send a figure's stashed state into an iframe.
-   *
-   * `target` names WHICH iframe. Load-bearing when a figure is mounted more
-   * than once — a report figure lives in the sidebar cell AND on its presented
-   * slide, and both register under the same figId in a Map that holds one
-   * element. Resolving the target from that map means whichever mounted LAST
-   * wins, so a freshly-loaded frame calling replayState would push its state
-   * into its SIBLING and receive nothing itself. Which mount won is a race, so
-   * the presented deck came up blank on some machines and not others.
-   *
-   * A frame that has just loaded passes itself here and is always served.
-   */
-  const replayState = (figId: string, target?: HTMLIFrameElement) => {
-    const iframe = target ?? iframeRefs.current.get(figId)
-    if (!iframe?.contentWindow) return
-    const states = latestStates.current.get(figId)
-    if (states) {
-      for (const [key, value] of states) {
-        iframe.contentWindow.postMessage({ type: 'awi_state', key, value }, '*')
-      }
-    }
-    const binStates = latestBinaryStates.current.get(figId)
-    if (binStates) {
-      // The MAP key is `geom::pixelField` (one entry per panel); the message
-      // must carry the original pixel-field `key` + its header, which is what
-      // the figure routes on.
-      for (const { key, header, buffer } of binStates.values()) {
-        // Send a COPY (transfer detaches the buffer) — the stash must survive
-        // a later iframe remount (e.g. window re-tile / dev StrictMode).
-        const copy = buffer.slice()
-        iframe.contentWindow.postMessage(
-          { type: 'awi_state_binary', key, header, buffer: copy },
-          '*',
-          [copy.buffer],
-        )
-      }
-    }
-    dlog('replayState', {
-      figId,
-      jsonKeys: states ? states.size : 0,
-      binaryKeys: binStates ? binStates.size : 0,
-      target: iframe.getAttribute('data-testid'),
-    })
-  }
+  // Replay is the bridge's; see @de/shell-renderer/figureBridge for why it
+  // takes an explicit target (a figure mounted in both the report sidebar and
+  // a presented slide registers twice under one figId, and a freshly-loaded
+  // frame must serve itself rather than whichever mount won the map).
+  const replayState = figureBridge.replay
 
   /**
    * What a figure would replay into a freshly-mounted iframe.
@@ -928,31 +886,16 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
    * `__spydeFigureDump()` in DevTools while the bad slide is up.
    */
   const figureDump = React.useCallback(() => {
-    const rows: Record<string, unknown>[] = []
-    const figIds = new Set<string>([
-      ...latestStates.current.keys(),
-      ...latestBinaryStates.current.keys(),
-      ...iframeRefs.current.keys(),
-    ])
-    for (const figId of figIds) {
-      const el = iframeRefs.current.get(figId)
-      const rect = el?.getBoundingClientRect()
-      const bin = latestBinaryStates.current.get(figId)
-      rows.push({
-        figId,
-        jsonKeys: latestStates.current.get(figId)?.size ?? 0,
-        binaryKeys: bin?.size ?? 0,
-        binaryKeyNames: bin ? Array.from(bin.keys()).join(',') : '',
-        registeredIn: el?.closest('[data-testid="present-slide"]') ? 'present-slide'
-          : el?.closest('[data-testid="report-sidebar"]') ? 'report-sidebar'
-            : el ? 'other' : 'NONE',
-        size: rect ? `${Math.round(rect.width)}x${Math.round(rect.height)}` : 'n/a',
-      })
-    }
+    // The classifier is SpyDE's: WHERE a figure is mounted is what makes this
+    // dump diagnostic, and only this app has a report sidebar and a slide deck.
+    const rows = figureBridge.dump((el) =>
+      el?.closest('[data-testid="present-slide"]') ? 'present-slide'
+        : el?.closest('[data-testid="report-sidebar"]') ? 'report-sidebar'
+          : el ? 'other' : 'NONE')
     // eslint-disable-next-line no-console
     console.table(rows)
     return rows
-  }, [])
+  }, [figureBridge])
 
   React.useEffect(() => {
     ;(window as unknown as Record<string, unknown>).__spydeFigureDump = figureDump
@@ -1097,9 +1040,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
             // never touches an MDI figure's entry).
             const prev = reportFiguresRef.current.get(msg.cell_id)
             if (prev && prev.figId && prev.figId !== msg.fig_id) {
-              latestStates.current.delete(prev.figId)
-              latestBinaryStates.current.delete(prev.figId)
-              iframeRefs.current.delete(prev.figId)
+              figureBridge.evict(prev.figId)
             }
             dispatch({
               type: 'REPORT_FIGURE',
@@ -1170,73 +1111,20 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
           break
 
         case 'state_update':
-          // Forward anyplotlib state to the iframe AND remember it, so it can
-          // be replayed if/when the iframe (re)loads after this arrived.
-          {
-            const figId = msg.fig_id
-            const key = msg.key
-            if (!latestStates.current.has(figId)) {
-              latestStates.current.set(figId, new Map())
-            }
-            latestStates.current.get(figId)!.set(key, msg.value)
-            const iframe = iframeRefs.current.get(figId)
-            iframe?.contentWindow?.postMessage(
-              { type: 'awi_state', key, value: msg.value },
-              '*',
-            )
-          }
+          // Forward to the iframe AND remember it, so it can be replayed if the
+          // iframe (re)loads after this arrived.
+          figureBridge.applyState(msg.fig_id, msg.key, msg.value)
           break
 
         case 'state_update_binary':
-          // A raw image frame (pixels as a Uint8Array, no base64). Post it to the
-          // iframe as `awi_state_binary`; the figure ESM uses the ArrayBuffer as
-          // the texture/ImageData bytes directly (no atob). ALSO stash a retained
-          // copy in latestBinaryStates (mirrors latestStates) so replayState() can
-          // recover a figure whose iframe wasn't mounted yet when this arrived —
-          // otherwise the postMessage below silently no-ops (no listener) and the
-          // frame is lost forever: a static (e.g. console-created) window that
-          // never repaints organically stayed permanently blank.
-          {
-            const figId = msg.fig_id
-            const key = msg.key
-            const bytes = msg.buffer as Uint8Array
-            if (bytes) {
-              if (!latestBinaryStates.current.has(figId)) {
-                latestBinaryStates.current.set(figId, new Map())
-              }
-              // STASH PER PANEL, not per pixel-field.
-              //
-              // `key` is the pixel FIELD ("image_b64" / "overlay_mask_b64" /
-              // "detail_b64") and is the SAME for every panel; the panel is
-              // identified by `header.geom`, the trait name anyplotlib routes
-              // the bytes back through (see _electron.py's emit_binary). Keying
-              // the stash by `key` alone therefore let each panel of a
-              // multi-panel figure OVERWRITE the previous one's pixels, leaving
-              // exactly one frame stashed however many panels the figure has.
-              //
-              // A figure only replays from this stash when it is mounted a
-              // SECOND time — which is what a presented slide is, the sidebar
-              // cell being the first. So a composed grid rendered correctly in
-              // the sidebar and then presented with every panel blank except
-              // the last one composed: no image, no ticks, no title, only the
-              // HTML scale-bar overlay, which is not part of the canvas.
-              // Single-panel cells (everything else in the app) push one frame
-              // and never noticed.
-              //
-              // Mirrors the figure ESM's own slot convention, `geom::pixelKey`.
-              const geom = (msg.header as { geom?: string } | undefined)?.geom
-              const stashKey = geom ? `${geom}::${key}` : key
-              latestBinaryStates.current.get(figId)!.set(
-                stashKey, { key, header: msg.header, buffer: bytes.slice() },
-              )
-            }
-            const iframe = iframeRefs.current.get(figId)
-            iframe?.contentWindow?.postMessage(
-              { type: 'awi_state_binary', key, header: msg.header, buffer: bytes },
-              '*',
-              bytes?.buffer ? [bytes.buffer] : [],   // TRANSFER the ArrayBuffer
-            )
-          }
+          // A raw image frame (pixels as a Uint8Array, no base64) — posted to
+          // the iframe AND retained, so a figure whose FIRST real paint arrives
+          // before its iframe's onLoad (the common case for a console-created
+          // window, which gets no organic second paint) can be replayed rather
+          // than staying permanently blank. The bridge stashes per PANEL and
+          // transfers the buffer; both are documented there.
+          figureBridge.applyBinary(
+            msg.fig_id, msg.key, msg.header, msg.buffer as Uint8Array)
           break
 
         case 'composition':
@@ -1463,9 +1351,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
             for (const [cellId, fig] of prevFigures) {
               if (!liveIds || !liveIds.has(cellId)) {
                 if (fig.figId) {
-                  latestStates.current.delete(fig.figId)
-                  latestBinaryStates.current.delete(fig.figId)
-                  iframeRefs.current.delete(fig.figId)
+                  figureBridge.evict(fig.figId)
                 }
               }
             }

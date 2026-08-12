@@ -202,6 +202,37 @@ knowledge everywhere for no benefit.
 SpyDE's `actions.views` to evict per-window state. Apps now call
 `register_evictor(fn)`; `views.py` does so at import.
 
+**Fourth pass — `@de/shell-renderer`**
+
+The renderer kernel, taken from the top of the shopping list rather than
+wholesale. What landed is the part BOTH apps had already written twice:
+
+- `figureBridge.ts` — the iframe registry, state retention and replay. Lifted
+  from SpyDE's implementation, which was the better of the two: it already
+  carried the three subtleties Ground Crew's simpler copy lacked (replay takes
+  an explicit target; binary frames stash per PANEL by `header.geom`; replay
+  sends a COPY because postMessage transfers and detaches). Plain TypeScript,
+  no React, so it unit-tests without a renderer — 13 tests, one per shipped bug.
+- `FigureFrame.tsx` — the iframe host: registration, replay-on-load, resize
+  reporting, and `srcdoc` vs `src`.
+- `protocol.ts` — the core message union. Apps extend it additively, which works
+  because every variant carries an index signature.
+
+**Both apps use it.** Ground Crew's bridge and hand-rolled iframe are deleted.
+SpyDE DELEGATES: the bridge exposes its maps as `{current}` boxes, so
+`iframeRefs` / `latestStates` / `latestBinaryStates` keep exactly the
+`MutableRefObject<Map<…>>` shape they had, and none of the seven components that
+thread them as props needed touching.
+
+The `grid_present` spec is the evidence that the subtle behaviour survived: its
+diagnostic shows the presented slide retaining TWO panels
+(`panel_…_geom::image_b64` twice), which is precisely what breaks if the
+per-panel stash key is wrong.
+
+Still in SpyDE's `SpyDEContext.tsx`: the window/toolbar registry, the report and
+movie state, and the ~50 domain message cases. Those want the extension-hook
+treatment, and are a bigger and much less mechanical job than the bridge was.
+
 **Not started**
 
 - SpyDE's `Plot` still does not use `FigureView`. It carries the array cache,

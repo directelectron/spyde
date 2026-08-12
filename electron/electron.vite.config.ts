@@ -42,6 +42,8 @@ const noHmr = process.env.SPYDE_NO_HMR === '1'
 // entry in tsconfig.node.json has to agree, or the editor and the bundler
 // disagree about what resolves.
 const shellMain = resolve(__dirname, '..', 'packages', 'shell-main', 'src', 'index.ts')
+const shellRenderer = resolve(
+  __dirname, '..', 'packages', 'shell-renderer', 'src', 'index.ts')
 
 export default defineConfig({
   main: {
@@ -56,7 +58,7 @@ export default defineConfig({
     root: 'src/renderer',
     build: { outDir: 'out/renderer' },
     plugins: [react()],
-    resolve: { alias: { '@guides': guidesDir } },
+    resolve: { alias: { '@guides': guidesDir, '@de/shell-renderer': shellRenderer } },
     server: {
       port: 5173,
       fs: { allow: [resolve(__dirname, '..')] },

@@ -2,7 +2,8 @@
   "include": [
     "electron.vite.config.*",
     "src/**/*",
-    "../../packages/shell-main/src/**/*"
+    "../../packages/shell-main/src/**/*",
+    "../../packages/shell-renderer/src/**/*"
   ],
   "exclude": ["../../packages/*/src/**/*.test.ts"],
   "compilerOptions": {
@@ -16,7 +17,8 @@
     "skipLibCheck": true,
     "baseUrl": ".",
     "paths": {
-      "@de/shell-main": ["../../packages/shell-main/src/index.ts"]
+      "@de/shell-main": ["../../packages/shell-main/src/index.ts"],
+      "@de/shell-renderer": ["../../packages/shell-renderer/src/index.ts"]
     }
   }
 }

@@ -12,18 +12,12 @@
  * the sidebar host — are the shopping list for @de/shell-renderer, and are
  * written to be lifted rather than rewritten.
  */
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useState } from 'react'
+import { FigureFrame, useFigureBridge } from '@de/shell-renderer'
+import type { FigureMessage } from '@de/shell-renderer'
 
 // ── Backend message shapes ────────────────────────────────────────────────────
 
-interface FigureMessage {
-  type: 'figure'
-  fig_id: string
-  window_id: number
-  html: string
-  title?: string
-  aspect?: number | null
-}
 interface FrameStats {
   frame: number; shown: number; dropped: number
   min: number; max: number; mean: number; dtype: string; shape: number[]
@@ -32,61 +26,6 @@ interface LogEntry { level: string; name: string; area: string; msg: string; tim
 
 const COLORMAPS = ['gray', 'viridis', 'plasma', 'inferno', 'magma', 'cividis']
 const EXPOSURES = [10, 25, 50, 100, 250, 500]
-
-/**
- * Relays anyplotlib state into the figure iframe, and remembers the latest of
- * each key.
- *
- * The retention is the load-bearing part. A `state_update` that arrives before
- * the iframe has mounted its listener posts into the void — silently, with no
- * error — and since the backend only sends CHANGES, that frame is gone for
- * good. For a live camera the next frame covers it up; for the FIRST frame,
- * which is exactly the one that races the mount, it means an image that never
- * appears. `replay()` re-posts everything once the frame is ready.
- */
-function useFigureBridge() {
-  const iframes = useRef(new Map<string, HTMLIFrameElement>())
-  const latest = useRef(new Map<string, Map<string, unknown>>())
-  const latestBinary = useRef(new Map<string, Map<string, Uint8Array>>())
-
-  const post = useCallback((figId: string, message: Record<string, unknown>) => {
-    iframes.current.get(figId)?.contentWindow?.postMessage(message, '*')
-  }, [])
-
-  const onState = useCallback((figId: string, key: string, value: unknown) => {
-    if (!latest.current.has(figId)) latest.current.set(figId, new Map())
-    latest.current.get(figId)!.set(key, value)
-    post(figId, { type: 'awi_state', key, value })
-  }, [post])
-
-  const onBinary = useCallback((figId: string, key: string, bytes: Uint8Array,
-                                header: Record<string, unknown>) => {
-    if (!latestBinary.current.has(figId)) latestBinary.current.set(figId, new Map())
-    // Keyed by the panel's geom, not by `key`: `key` is the pixel FIELD and is
-    // identical across panels, so keying by it alone would let each panel
-    // overwrite the last and retain exactly one frame per figure.
-    const slot = `${key}:${String(header.geom ?? '')}`
-    latestBinary.current.get(figId)!.set(slot, bytes)
-    post(figId, { type: 'awi_state_binary', key, header, buffer: bytes })
-  }, [post])
-
-  const register = useCallback((figId: string, el: HTMLIFrameElement | null) => {
-    if (el) iframes.current.set(figId, el)
-    else iframes.current.delete(figId)
-  }, [])
-
-  const replay = useCallback((figId: string) => {
-    for (const [key, value] of latest.current.get(figId) ?? []) {
-      post(figId, { type: 'awi_state', key, value })
-    }
-    for (const [slot, bytes] of latestBinary.current.get(figId) ?? []) {
-      const [key] = slot.split(':')
-      post(figId, { type: 'awi_state_binary', key, buffer: bytes })
-    }
-  }, [post])
-
-  return { register, replay, onState, onBinary }
-}
 
 export function App() {
   const [figure, setFigure] = useState<FigureMessage | null>(null)
@@ -109,13 +48,13 @@ export function App() {
           setFigure(msg as unknown as FigureMessage)
           break
         case 'state_update':
-          bridge.onState(String(msg.fig_id), String(msg.key), msg.value)
+          bridge.applyState(String(msg.fig_id), String(msg.key), msg.value)
           break
         case 'state_update_binary':
-          bridge.onBinary(
+          bridge.applyBinary(
             String(msg.fig_id), String(msg.key),
-            msg.buffer as Uint8Array,
             (msg.header ?? {}) as Record<string, unknown>,
+            msg.buffer as Uint8Array,
           )
           break
         case 'frame_stats':
@@ -273,23 +212,11 @@ function FigurePane({ figure, bridge }: {
   figure: FigureMessage | null
   bridge: ReturnType<typeof useFigureBridge>
 }) {
-  const ref = useRef<HTMLIFrameElement | null>(null)
-
-  // Tell the backend the pane's size so anyplotlib lays the figure out to fit.
-  useEffect(() => {
-    if (!figure) return
-    const el = ref.current
-    if (!el) return
-    const send = () => {
-      const r = el.getBoundingClientRect()
-      if (r.width > 0 && r.height > 0) {
-        window.groundcrew?.resizeFigure(figure.fig_id, Math.round(r.width), Math.round(r.height))
-      }
-    }
-    send()
-    const ro = new ResizeObserver(send)
-    ro.observe(el)
-    return () => ro.disconnect()
+  // The backend needs the pane's size or the figure renders at anyplotlib's
+  // default and overflows. Stable identity, so FigureFrame's ResizeObserver
+  // effect does not re-run every render.
+  const onResize = useCallback((w: number, h: number) => {
+    if (figure) window.groundcrew?.resizeFigure(figure.fig_id, w, h)
   }, [figure?.fig_id])
 
   if (!figure) {
@@ -302,24 +229,17 @@ function FigurePane({ figure, bridge }: {
 
   return (
     <div style={S.viewer}>
-      {/*
-        srcdoc, not a URL: the backend inlines the figure's ESM bundle, so the
-        whole thing is self-contained and needs nothing served off disk. Keyed by
-        fig_id so React reuses the SAME iframe across frames — remounting it per
-        frame would tear down the WebGPU context and throw away the user's zoom.
-      */}
-      <iframe
-        ref={(el) => { ref.current = el; bridge.register(figure.fig_id, el) }}
-        key={figure.fig_id}
+      {/* srcdoc (`html`), not a URL: this backend inlines the figure's ESM, so
+          nothing has to be served off disk. FigureFrame owns registration,
+          replay-on-load and the resize reporting. */}
+      <FigureFrame
+        bridge={bridge}
+        figId={figure.fig_id}
+        html={figure.html}
         title={figure.title ?? 'Live view'}
-        srcDoc={figure.html}
+        onResize={onResize}
         style={S.iframe}
         data-testid="viewer-frame"
-        // Replay whatever arrived before the frame's listener existed. The
-        // FIRST pixel frame reliably loses that race, and the backend only ever
-        // sends changes — so without this the image can stay on its placeholder
-        // indefinitely with nothing to show for it.
-        onLoad={() => bridge.replay(figure.fig_id)}
       />
     </div>
   )

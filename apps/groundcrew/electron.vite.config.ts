@@ -8,6 +8,8 @@ import { resolve } from 'path'
 // disagree about what resolves. Aliased in BOTH main and preload: each gets its
 // own rollup pass.
 const shellMain = resolve(__dirname, '..', '..', 'packages', 'shell-main', 'src', 'index.ts')
+const shellRenderer = resolve(
+  __dirname, '..', '..', 'packages', 'shell-renderer', 'src', 'index.ts')
 
 export default defineConfig({
   main: {
@@ -22,6 +24,7 @@ export default defineConfig({
     root: 'src/renderer',
     build: { outDir: 'out/renderer' },
     plugins: [react()],
+    resolve: { alias: { '@de/shell-renderer': shellRenderer } },
     server: {
       port: 5273,   // not SpyDE's 5173 — both dev servers may be up at once
       fs: { allow: [resolve(__dirname, '..', '..')] },
