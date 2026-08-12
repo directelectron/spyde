@@ -105,26 +105,26 @@ way the old build script assumed.
 
 ---
 
-## 9. `deapi` version — needs a decision
+## 9. `deapi` version — settled: pin the pre-release
 
-Verified end to end against the `FakeServer` (spawn
-`simulated_server/initialize_server.py <port>`, wait for the `started` banner,
-`Client()` with `usingMmf = False`):
+`apps/groundcrew` depends on **`deapi>=5.3b6`**, from PyPI. Verified end to end
+against the `FakeServer` (spawn `simulated_server/initialize_server.py <port>`,
+wait for the `started` banner, `Client()` with `usingMmf = False`): connect,
+acquire a (1024, 1024) uint16 frame, and a **windowed `get_result` returning
+(256, 256)** with attributes populated — the tile contract the viewer is built
+on.
 
-| | published **5.2.2** | local **5.3b6** |
-|---|---|---|
-| connect, list cameras, properties | works | works |
-| acquire + full `get_result` | **crashes** | works — (1024, 1024) uint16 |
-| windowed `get_result` (the tile call) | unreachable | works — (256, 256) |
+**The specifier must name a pre-release.** pip and uv skip pre-releases unless
+the constraint itself references one, so a bare `>=5.2` silently resolves to
+5.2.2 — which carries a stray unguarded
+`print("Response:", response.ByteSize())` at `client.py:1450`, immediately
+before the `if response != False` check on the next line, and so raises
+`AttributeError` on exactly the case that check exists to handle. Removed in
+5.3b6. Keep a pre-release in the specifier until 5.3 final ships.
 
-5.2.2 carries a stray unguarded `print("Response:", response.ByteSize())` at
-`client.py:1450`, immediately before the `if response != False` check on the
-next line — so it raises `AttributeError` on exactly the case the following line
-exists to handle. It is gone in 5.3b6.
-
-So the plan of record ("use the PyPI one") does not currently work for the call
-the whole viewer is built on. Either 5.3 gets released, or `apps/groundcrew`
-pins a git ref in the meantime. **Owner's call.**
+Workspace note: `uv sync` alone syncs only the ROOT project and will *uninstall*
+the workspace members. Use **`uv sync --all-packages`**, or the apps and `deapi`
+vanish from the shared environment and both live-app e2e suites break.
 
 Aside worth knowing: a stray `print()` in any dependency writes to stdout, which
 is the PLOTAPP protocol channel. `de_shell.ipc.redirect_stray_stdout()` already
@@ -137,8 +137,6 @@ SerialEM and the script panel are **out of v1**. No rail entry, no panel.
 
 ## Still open
 
-- **`deapi` version** — see §9; blocks the dependency declaration only, not the
-  work (the local checkout runs today).
 - **Sensor health thresholds** — deferred by agreement; the owner will help set
   them.
 - **Corrected movie output** — back to the server, or to a file only?
