@@ -17,6 +17,9 @@ export type { ShellConfig } from './config'
 export {
   startBackend, stopBackend, sendAction, sendFigureEvent, sendResize,
 } from './backendProcess'
+
+export { createShellWindow } from './window'
+export type { ShellWindow, ShellWindowOptions } from './window'
 export type { BackendHandlers } from './backendProcess'
 
 export {

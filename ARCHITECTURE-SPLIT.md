@@ -256,6 +256,29 @@ needs it.
 
 Also still SpyDE's: the report/movie state and the ~50 domain message cases.
 
+**Sixth pass — `@de/shell-preload`, `createShellWindow`, and a third app**
+
+- `@de/shell-preload`: `createShellBridge({appId})` builds the channels every app
+  needs; an app spreads its own on top. SpyDE's preload 217 → 140 lines (it keeps
+  dialogs, report export, clipboard, updates, GPU triage); Ground Crew's is 9.
+- `createShellWindow` in `@de/shell-main`: the window plus the
+  buffer-until-`did-finish-load` message pipe, which both live apps had written
+  byte-identically. The buffering is the non-obvious part — `webContents.send()`
+  silently DROPS anything sent before the renderer registers its listener, which
+  swallowed the first message after any quiet period.
+- **`apps/autopilot`** — the third app, and deliberately not a copy of Ground
+  Crew. A queue rather than manual controls: a recipe of move/settle/acquire
+  steps, a runner on a daemon thread, a sidebar that lights each row. It
+  exercises `emit_progress`, which Ground Crew never touches.
+
+**Two hooks on the original plan were dropped, on inspection.** The `lifecycle`
+→ `actions.overlay` and `plot_control_toolbar` → `TOOLBAR_ACTIONS` back-references
+were listed as prerequisites for moving the selector and toolbar modules into the
+shell. But neither new app has selectors or toolbars, both modules are SpyDE
+importing SpyDE, and no boundary is being violated today — so the hooks would be
+indirection with no consumer, and the modules have nowhere to go yet. Same
+reasoning as the window registry. Revisit when an app needs a toolbar.
+
 **Not started**
 
 - SpyDE's `Plot` still does not use `FigureView`. It carries the array cache,
