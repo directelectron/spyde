@@ -42,6 +42,8 @@ const noHmr = process.env.SPYDE_NO_HMR === '1'
 // entry in tsconfig.node.json has to agree, or the editor and the bundler
 // disagree about what resolves.
 const shellMain = resolve(__dirname, '..', 'packages', 'shell-main', 'src', 'index.ts')
+const shellPreload = resolve(
+  __dirname, '..', 'packages', 'shell-preload', 'src', 'index.ts')
 const shellRenderer = resolve(
   __dirname, '..', 'packages', 'shell-renderer', 'src', 'index.ts')
 
@@ -52,7 +54,7 @@ export default defineConfig({
   },
   preload: {
     build: { outDir: 'out/preload', rollupOptions: { input: 'src/preload/index.ts' } },
-    resolve: { alias: { '@de/shell-main': shellMain } },
+    resolve: { alias: { '@de/shell-main': shellMain, '@de/shell-preload': shellPreload } },
   },
   renderer: {
     root: 'src/renderer',

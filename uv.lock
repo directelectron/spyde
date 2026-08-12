@@ -12,6 +12,7 @@ resolution-markers = [
 
 [manifest]
 members = [
+    "de-autopilot",
     "de-groundcrew",
     "de-shell",
     "spyde",
@@ -655,6 +656,31 @@ array = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
+
+[[package]]
+name = "de-autopilot"
+version = "0.1.0"
+source = { editable = "apps/autopilot" }
+dependencies = [
+    { name = "de-shell" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+]
+
+[package.optional-dependencies]
+tests = [
+    { name = "pytest" },
+    { name = "pytest-timeout" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "de-shell", editable = "packages/de-shell" },
+    { name = "numpy", specifier = ">=1.20.0" },
+    { name = "pytest", marker = "extra == 'tests'", specifier = ">=3.6" },
+    { name = "pytest-timeout", marker = "extra == 'tests'" },
+]
+provides-extras = ["tests"]
 
 [[package]]
 name = "de-groundcrew"

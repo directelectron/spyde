@@ -28,7 +28,7 @@ export default defineConfig({
     plugins: [react()],
     resolve: { alias: { '@de/shell-renderer': shellRenderer } },
     server: {
-      port: 5273,   // not SpyDE's 5173 — both dev servers may be up at once
+      port: 5373,   // not SpyDE's 5173 — both dev servers may be up at once
       fs: { allow: [resolve(__dirname, '..', '..')] },
     },
   },

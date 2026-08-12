@@ -1,5 +1,5 @@
 /**
- * preload/index.ts — Ground Crew's contextBridge surface.
+ * preload/index.ts — Autopilot's contextBridge surface.
  *
  * Entirely the shell's core (see @de/shell-preload): backend messages, raw
  * stdio, actions, figure events, resize. The app adds nothing of its own yet —
@@ -7,4 +7,4 @@
  */
 import { exposeShellBridge } from '@de/shell-preload'
 
-exposeShellBridge({ appId: 'groundcrew' })
+exposeShellBridge({ appId: 'autopilot' })

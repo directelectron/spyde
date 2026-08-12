@@ -1,108 +1,51 @@
 /**
- * preload/index.ts — contextBridge API exposed to the renderer.
+ * preload/index.ts — SpyDE's contextBridge API.
+ *
+ * The core surface (platform / isPackaged / onMessage / onStream / action /
+ * figureEvent / resizeFigure / openExternal / pathForFile) comes from
+ * @de/shell-preload, shared with de-groundcrew. What is spread on below is
+ * SpyDE's own: the file and report dialogs, PDF export, clipboard, the update
+ * controls and GPU triage, plus the menu-driven `on*` events.
+ *
+ * Every `on*` returns an UNSUBSCRIBE function — see the note in
+ * @de/shell-preload for why that is load-bearing rather than tidy.
  */
-import { contextBridge, ipcRenderer, webUtils } from 'electron'
+import { contextBridge, ipcRenderer } from 'electron'
+import { createShellBridge } from '@de/shell-preload'
+
+const shell = createShellBridge({ appId: 'spyde', packagedEnvVar: 'SPYDE_PACKAGED' })
+
+/** Register a menu-driven event, returning its exact disposer. */
+const onEvent = shell.onChannel
 
 contextBridge.exposeInMainWorld('electron', {
-  // OS platform ('darwin' | 'win32' | 'linux') — the renderer uses this to lay
-  // out the custom title bar (macOS traffic lights on the left vs Windows
-  // titleBarOverlay buttons on the right).
-  platform: process.platform,
-
-  // True only in an electron-builder–packaged production app. The main process
-  // sets SPYDE_PACKAGED=1 from `app.isPackaged` before the window loads. Dev
-  // (`npm run dev`) and the Playwright e2e (which launches the BUILT bundle by
-  // path, not a packaged app) leave it unset → false. The renderer uses this to
-  // gate test-only window hooks OFF in production while keeping them live in dev
-  // and e2e.
-  isPackaged: process.env.SPYDE_PACKAGED === '1',
-
-  // ── Python → Renderer ─────────────────────────────────────────────────────
-
-  // Each on* returns an UNSUBSCRIBE function. The renderer registers these in a
-  // useEffect; without cleanup, React StrictMode's double-invoke (and any HMR /
-  // re-mount) would stack duplicate ipcRenderer listeners, so every message gets
-  // dispatched 2×, 3×, … and the app's logs/updates appear doubled and degrade
-  // over time. Returning a disposer lets the effect remove the exact listener.
-
-  /** Listen for any PLOTAPP: message from Python. Returns an unsubscribe fn. */
-  onMessage: (cb: (msg: Record<string, unknown>) => void) => {
-    const h = (_: unknown, msg: Record<string, unknown>) => cb(msg)
-    ipcRenderer.on('spyde:message', h)
-    return () => ipcRenderer.removeListener('spyde:message', h)
-  },
-
-  /** Listen for raw stdout/stderr lines from Python. Returns an unsubscribe fn. */
-  onStream: (cb: (text: string, kind: 'stdout' | 'stderr') => void) => {
-    const h = (_: unknown, text: string, kind: 'stdout' | 'stderr') => cb(text, kind)
-    ipcRenderer.on('spyde:stream', h)
-    return () => ipcRenderer.removeListener('spyde:stream', h)
-  },
-
+  ...shell,
   /** Window tile command from menu. Returns an unsubscribe fn. */
-  onTile: (cb: () => void) => {
-    const h = () => cb()
-    ipcRenderer.on('spyde:tile', h)
-    return () => ipcRenderer.removeListener('spyde:tile', h)
-  },
+  onTile: (cb: () => void) => onEvent('spyde:tile', cb),
 
   /** Open Dask dashboard command from menu. Returns an unsubscribe fn. */
-  onOpenDashboard: (cb: () => void) => {
-    const h = () => cb()
-    ipcRenderer.on('spyde:open_dashboard', h)
-    return () => ipcRenderer.removeListener('spyde:open_dashboard', h)
-  },
+  onOpenDashboard: (cb: () => void) => onEvent('spyde:open_dashboard', cb),
 
   /** Launch a guided tour by id (from the Help menu). Returns an unsubscribe fn. */
-  onStartGuide: (cb: (id: string) => void) => {
-    const h = (_: unknown, id: string) => cb(id)
-    ipcRenderer.on('spyde:start_guide', h)
-    return () => ipcRenderer.removeListener('spyde:start_guide', h)
-  },
+  onStartGuide: (cb: (v: string) => void) => onEvent<[string]>('spyde:start_guide', cb),
 
   /** Open the in-app Load Stack dialog (from the File menu). Returns an unsubscribe fn. */
-  onOpenStackDialog: (cb: () => void) => {
-    const h = () => cb()
-    ipcRenderer.on('spyde:open_stack_dialog', h)
-    return () => ipcRenderer.removeListener('spyde:open_stack_dialog', h)
-  },
+  onOpenStackDialog: (cb: () => void) => onEvent('spyde:open_stack_dialog', cb),
 
   /** Open the "Check for Updates" dialog (from the Help menu). Returns an unsubscribe fn. */
-  onOpenUpdateDialog: (cb: () => void) => {
-    const h = () => cb()
-    ipcRenderer.on('spyde:open_update_dialog', h)
-    return () => ipcRenderer.removeListener('spyde:open_update_dialog', h)
-  },
+  onOpenUpdateDialog: (cb: () => void) => onEvent('spyde:open_update_dialog', cb),
 
   /** Open the "GPU Status" dialog (from the Help menu). Returns an unsubscribe fn. */
-  onOpenGpuStatusDialog: (cb: () => void) => {
-    const h = () => cb()
-    ipcRenderer.on('spyde:open_gpu_status_dialog', h)
-    return () => ipcRenderer.removeListener('spyde:open_gpu_status_dialog', h)
-  },
+  onOpenGpuStatusDialog: (cb: () => void) => onEvent('spyde:open_gpu_status_dialog', cb),
 
   /** Open the "GPU & CUDA" help dialog (from the Help menu). Returns an unsubscribe fn. */
-  onOpenGpuHelpDialog: (cb: () => void) => {
-    const h = () => cb()
-    ipcRenderer.on('spyde:open_gpu_help_dialog', h)
-    return () => ipcRenderer.removeListener('spyde:open_gpu_help_dialog', h)
-  },
+  onOpenGpuHelpDialog: (cb: () => void) => onEvent('spyde:open_gpu_help_dialog', cb),
 
   /** electron-updater's check/download/install progress. Returns an unsubscribe fn. */
-  onUpdateStatus: (cb: (status: Record<string, unknown>) => void) => {
-    const h = (_: unknown, status: Record<string, unknown>) => cb(status)
-    ipcRenderer.on('spyde:update-status', h)
-    return () => ipcRenderer.removeListener('spyde:update-status', h)
-  },
+  onUpdateStatus: (cb: (v: Record<string, unknown>) => void) => onEvent<[Record<string, unknown>]>('spyde:update-status', cb),
 
-  // ── Renderer → Python ─────────────────────────────────────────────────────
-
-  /** Send a toolbar/menu action to Python. */
-  action: (
-    action: string,
-    payload: Record<string, unknown> = {},
-    windowId?: number,
-  ) => ipcRenderer.send('spyde:action', action, payload, windowId),
+  // ── Renderer → Python (SpyDE's own; the core action/figure/stream
+  //    channels come from the shell spread above) ──────────────────────────
 
   /** Open a native file picker (result sent directly to Python). */
   openFile: (): Promise<void> => ipcRenderer.invoke('spyde:open-file'),
@@ -149,26 +92,6 @@ contextBridge.exposeInMainWorld('electron', {
   /** Write a PNG data URL to the OS clipboard as an image. */
   clipboardWritePng: (dataUrl: string): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('clipboard:write-png', dataUrl),
-
-  /** OS path of a dropped File (sandboxed renderers have no File.path) —
-   *  powers drag-and-drop of datasets (incl. .zspy folders) onto the MDI. */
-  pathForFile: (file: File): string | null => {
-    try {
-      return webUtils.getPathForFile(file) || null
-    } catch {
-      return null
-    }
-  },
-
-  /** Forward an interaction event from an anyplotlib iframe to Python. */
-  figureEvent: (figId: string, eventJson: string) =>
-    ipcRenderer.send('spyde:figure-event', figId, eventJson),
-
-  /** Notify Python of a subwindow resize so figure layout stays in sync. */
-  resizeFigure: (figId: string, width: number, height: number) =>
-    ipcRenderer.send('spyde:resize', figId, width, height),
-
-  openExternal: (url: string) => ipcRenderer.send('open-external', url),
 
   /** Reveal a local DIRECTORY in the OS file manager (Examples → Show Example
    *  Data Directory). Separate from openExternal, which allowlists web/mail

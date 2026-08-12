@@ -94,3 +94,6 @@ spyde/*.svg.*.svg
 apps/groundcrew/shots/
 apps/groundcrew/test-results/
 apps/groundcrew/out/
+apps/autopilot/shots/
+apps/autopilot/test-results/
+apps/autopilot/out/

@@ -6,7 +6,8 @@
     // not as a built artifact. That keeps go-to-definition, one typecheck across
     // the boundary, and no build step between editing the shell and running the
     // app — the whole point of having it in the workspace.
-    "../packages/shell-main/src/**/*"
+    "../packages/shell-main/src/**/*",
+    "../packages/shell-preload/src/**/*"
   ],
   // *.test.ts are run by `node --test` (native TS strip), not compiled into the
   // app bundle — and they use explicit .ts import specifiers node's ESM resolver
@@ -24,7 +25,8 @@
     "skipLibCheck": true,
     "baseUrl": ".",
     "paths": {
-      "@de/shell-main": ["../packages/shell-main/src/index.ts"]
+      "@de/shell-main": ["../packages/shell-main/src/index.ts"],
+      "@de/shell-preload": ["../packages/shell-preload/src/index.ts"]
     }
   }
 }
