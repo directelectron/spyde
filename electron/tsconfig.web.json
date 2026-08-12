@@ -26,5 +26,10 @@
   "include": [
     "src/renderer/src/**/*", "../guides/**/*",
     "../packages/shell-renderer/src/**/*"
-  ]
+  ],
+  // *.test.ts run under `node --test` (native TS strip), not in the browser
+  // bundle, and they use explicit .ts import specifiers that node's ESM
+  // resolver needs but tsc's bundler resolution rejects (TS5097). Their own
+  // run is the gate — see the root `npm run test:unit`.
+  "exclude": ["../packages/*/src/**/*.test.ts"]
 }

@@ -12,9 +12,11 @@
  * the sidebar host — are the shopping list for @de/shell-renderer, and are
  * written to be lifted rather than rewritten.
  */
-import React, { useCallback, useEffect, useMemo, useState } from 'react'
-import { FigureFrame, useFigureBridge } from '@de/shell-renderer'
-import type { FigureMessage } from '@de/shell-renderer'
+import React, { useCallback, useEffect, useMemo, useReducer, useState } from 'react'
+import {
+  FigureFrame, useFigureBridge, shellReducer, shellInitialState, toShellAction,
+} from '@de/shell-renderer'
+import type { FigureMessage, ShellState, ShellAction, LogEntry } from '@de/shell-renderer'
 
 // ── Backend message shapes ────────────────────────────────────────────────────
 
@@ -22,30 +24,82 @@ interface FrameStats {
   frame: number; shown: number; dropped: number
   min: number; max: number; mean: number; dtype: string; shape: number[]
 }
-interface LogEntry { level: string; name: string; area: string; msg: string; time: number }
 
 const COLORMAPS = ['gray', 'viridis', 'plasma', 'inferno', 'magma', 'cividis']
 const EXPOSURES = [10, 25, 50, 100, 250, 500]
 
+/** Ground Crew's own state, on top of the shell's chrome slice. */
+interface AppState extends ShellState {
+  figure: FigureMessage | null
+  stats: FrameStats | null
+  running: boolean
+  exposureMs: number
+  colormap: string
+  error: string | null
+}
+
+type AppAction =
+  | ShellAction
+  | { type: 'FIGURE'; figure: FigureMessage }
+  | { type: 'FRAME_STATS'; stats: FrameStats }
+  | { type: 'ACQ_STATE'; running: boolean; exposureS?: number }
+  | { type: 'ERROR'; text: string | null }
+  | { type: 'EXPOSURE'; ms: number }
+  | { type: 'COLORMAP'; name: string }
+
+function appReducer(state: AppState, action: AppAction): AppState {
+  switch (action.type) {
+    case 'FIGURE':
+      return { ...state, figure: action.figure }
+    case 'FRAME_STATS':
+      return { ...state, stats: action.stats }
+    case 'ACQ_STATE':
+      return {
+        ...state,
+        running: action.running,
+        exposureMs: action.exposureS != null ? action.exposureS * 1000 : state.exposureMs,
+      }
+    case 'ERROR':
+      return { ...state, error: action.text }
+    case 'EXPOSURE':
+      return { ...state, exposureMs: action.ms }
+    case 'COLORMAP':
+      return { ...state, colormap: action.name }
+    default:
+      // The shell owns status, the log ring, env setup and backend death.
+      return shellReducer(state, action as ShellAction)
+  }
+}
+
+const initialState: AppState = {
+  ...shellInitialState,
+  figure: null,
+  stats: null,
+  running: true,
+  exposureMs: 50,
+  colormap: 'gray',
+  error: null,
+}
+
 export function App() {
-  const [figure, setFigure] = useState<FigureMessage | null>(null)
-  const [stats, setStats] = useState<FrameStats | null>(null)
-  const [status, setStatus] = useState('Starting…')
-  const [error, setError] = useState<string | null>(null)
-  const [running, setRunning] = useState(true)
-  const [exposureMs, setExposureMs] = useState(50)
-  const [colormap, setColormap] = useState('gray')
-  const [logs, setLogs] = useState<LogEntry[]>([])
+  const [state, dispatch] = useReducer(appReducer, initialState)
   const [logOpen, setLogOpen] = useState(false)
   const bridge = useFigureBridge()
+  const { figure, stats, running, exposureMs, colormap, error, status, logEntries } = state
 
   useEffect(() => {
     // Returns a disposer — see the preload's note on StrictMode double-invoke.
     const dispose = window.groundcrew?.onMessage((raw) => {
       const msg = raw as Record<string, unknown>
+
+      // Chrome messages first — status, log backfill/level, env setup, backend
+      // death — so this switch only carries Ground Crew's own.
+      const shellAction = toShellAction(msg)
+      if (shellAction) { dispatch(shellAction); return }
+
       switch (msg.type) {
         case 'figure':
-          setFigure(msg as unknown as FigureMessage)
+          dispatch({ type: 'FIGURE', figure: msg as unknown as FigureMessage })
           break
         case 'state_update':
           bridge.applyState(String(msg.fig_id), String(msg.key), msg.value)
@@ -58,25 +112,23 @@ export function App() {
           )
           break
         case 'frame_stats':
-          setStats(msg as unknown as FrameStats)
+          dispatch({ type: 'FRAME_STATS', stats: msg as unknown as FrameStats })
           break
         case 'acq_state':
-          setRunning(Boolean(msg.running))
-          if (typeof msg.exposure_s === 'number') setExposureMs(msg.exposure_s * 1000)
-          break
-        case 'status':
-          setStatus(String(msg.text ?? ''))
+          dispatch({
+            type: 'ACQ_STATE',
+            running: Boolean(msg.running),
+            exposureS: typeof msg.exposure_s === 'number' ? msg.exposure_s : undefined,
+          })
           break
         case 'error':
-          setError(String(msg.text ?? ''))
+          dispatch({ type: 'ERROR', text: String(msg.text ?? '') })
           break
         case 'log':
-          // Bounded ring: a free-running camera logs indefinitely, and an
-          // unbounded array would grow for the life of the session.
-          setLogs((prev) => [...prev, msg as unknown as LogEntry].slice(-500))
-          break
-        case 'backend_exited':
-          setError(`Backend stopped (code ${msg.code ?? '?'})`)
+          // One record per message rather than the shell's batched LOG: a
+          // camera's log rate is nothing like a compute's, so there is no burst
+          // to coalesce.
+          dispatch({ type: 'LOG', entries: [msg as unknown as LogEntry] })
           break
         default:
           break
@@ -104,8 +156,17 @@ export function App() {
           onStart={() => act('start_acquisition')}
           onStop={() => act('stop_acquisition')}
           onSingle={() => act('single_acquisition')}
-          onExposure={(ms) => { setExposureMs(ms); act('set_exposure', { seconds: ms / 1000 }) }}
-          onColormap={(name) => { setColormap(name); act('set_colormap', { name }) }}
+          /* Optimistic local update AND the backend call: the control should
+             respond to the click, not wait for the round trip. The backend's
+             acq_state reply is authoritative and corrects it if it disagrees. */
+          onExposure={(ms) => {
+            dispatch({ type: 'EXPOSURE', ms })
+            act('set_exposure', { seconds: ms / 1000 })
+          }}
+          onColormap={(name) => {
+            dispatch({ type: 'COLORMAP', name })
+            act('set_colormap', { name })
+          }}
         />
 
         <main style={S.center}>
@@ -114,13 +175,13 @@ export function App() {
         </main>
       </div>
 
-      {logOpen && <LogPanel logs={logs} onClose={() => setLogOpen(false)} />}
+      {logOpen && <LogPanel logs={logEntries} onClose={() => setLogOpen(false)} />}
 
       <StatusBar
         status={status}
         error={error}
         running={running}
-        onDismissError={() => setError(null)}
+        onDismissError={() => dispatch({ type: 'ERROR', text: null })}
         logOpen={logOpen}
         onToggleLog={() => setLogOpen((v) => !v)}
       />

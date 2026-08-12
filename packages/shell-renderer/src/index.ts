@@ -16,6 +16,13 @@ export type { FigureBridge, BinaryFrame, RefLike } from './figureBridge'
 export { FigureFrame } from './FigureFrame'
 export type { FigureFrameProps } from './FigureFrame'
 
+export {
+  shellReducer, shellInitialState, toShellAction, LOG_MAX, STREAM_MAX,
+} from './shellState'
+export type {
+  ShellState, ShellAction, LogEntry, SubItem, EnvPhase, EnvSetupState,
+} from './shellState'
+
 export { asShellMessage } from './protocol'
 export type {
   MsgBase, ShellMessage,

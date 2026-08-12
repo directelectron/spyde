@@ -229,9 +229,32 @@ diagnostic shows the presented slide retaining TWO panels
 (`panel_…_geom::image_b64` twice), which is precisely what breaks if the
 per-panel stash key is wrong.
 
-Still in SpyDE's `SpyDEContext.tsx`: the window/toolbar registry, the report and
-movie state, and the ~50 domain message cases. Those want the extension-hook
-treatment, and are a bigger and much less mechanical job than the bridge was.
+**Fifth pass — the context carve (`shellState.ts`)**
+
+The chrome slice of the reducer, which both apps had written independently:
+status, the busy indicator, the stdout/log rings, first-run env setup, the
+backend-death latch, per-window computing overlays, and toolbar action state.
+
+Composition rather than a second context: an app's state EXTENDS `ShellState`
+and its reducer delegates in its `default:` branch. `shellReducer` is generic
+over the state type and returns it UNTOUCHED (same object identity) for an
+action it does not own, so the delegation is safe in either order and does not
+re-render on foreign actions. `toShellAction(msg)` maps the chrome messages and
+returns null for everything else, so an app writes
+`if (a) { dispatch(a); return }` and its own switch carries only its own cases.
+
+SpyDE's `State` now extends `ShellState`, 13 reducer cases are gone, and
+`LogEntry` / `LOG_MAX` / `SubItem` / `EnvPhase` / `EnvSetupState` are re-exported
+from the shell so the components importing them from the context keep working.
+Ground Crew moved from ad-hoc `useState` to the same reducer.
+
+Deliberately NOT extracted: the **window/figure registry**. SpyDE's is entangled
+with its named-view/chip system (`view`, `view_label`, strain components) and
+Ground Crew has no window registry at all — one fixed pane. Extracting it now
+would be generalising from a single consumer. It waits for a second app that
+needs it.
+
+Also still SpyDE's: the report/movie state and the ~50 domain message cases.
 
 **Not started**
 

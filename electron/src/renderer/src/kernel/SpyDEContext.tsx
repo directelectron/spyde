@@ -7,7 +7,10 @@
 import React, {
   createContext, useCallback, useContext, useEffect, useReducer, useRef, useState,
 } from 'react'
-import { useFigureBridge } from '@de/shell-renderer'
+import { useFigureBridge, shellReducer, shellInitialState, LOG_MAX } from '@de/shell-renderer'
+import type {
+  ShellState, ShellAction, LogEntry, SubItem, EnvPhase, EnvSetupState,
+} from '@de/shell-renderer'
 import { asPlotAppMessage } from './protocol'
 import type { ReportDocState, ReportCell } from './protocol'
 import { WINDOW_DRAG_MIME, FIGURE_DRAG_MIME, stashWindowDrag } from './dnd'
@@ -113,26 +116,10 @@ export interface Histogram {
   clipped?: boolean           // bins are robust quantiles — end bins are overflow
 }
 
-/**
- * One application-log record streamed from the Python backend.
- *
- * `seq` is a renderer-assigned monotonic id, stamped once as the record enters
- * the buffer. It is the STABLE React key + height-cache key for the virtualised
- * log list: the buffer is a ring (old records drop off the front), so an array
- * INDEX identifies a different record after every shift, which would defeat both
- * row memoisation and the measured-height cache.
- */
-export interface LogEntry {
-  level: string
-  name: string
-  area?: string
-  msg: string
-  time: number
-  seq?: number
-}
-
-/** Max buffered log records (the renderer-side ring buffer). */
-export const LOG_MAX = 1000
+// LogEntry and LOG_MAX are the shell's (@de/shell-renderer/shellState) —
+// re-exported so the components that import them from here keep working.
+export type { LogEntry } from '@de/shell-renderer'
+export { LOG_MAX } from '@de/shell-renderer'
 
 /** A console_result/console_vars value description (shape × dtype badge). */
 export interface ConsoleVarKind {
@@ -205,7 +192,7 @@ export interface SelectorInfo {
 }
 /** The named navigators a navigator window offers (its top chip strip). */
 export interface NavigatorOptions { names: string[]; current?: string | null }
-export interface SubItem { name: string; color: string; vtype?: string; calculation?: string }
+export type { SubItem } from '@de/shell-renderer'
 export interface TreeNode { name: string; signal_id: number; children: TreeNode[] }
 export interface AxisRow {
   index: number
@@ -217,7 +204,10 @@ export interface AxisRow {
   navigate: boolean
 }
 
-interface State {
+// Extends the shell's chrome slice (status / logs / env setup / backend
+// death / computing overlays / toolbar action state) — see
+// @de/shell-renderer's shellState.ts. Only SpyDE's own fields are listed here.
+interface State extends ShellState {
   windows: Map<number, SpyDEWindow>
   figures: Map<string, SpyDEFigure>
   // Report figure cells' iframes — same SpyDEFigure shape + same figId-keyed
@@ -251,21 +241,10 @@ interface State {
   // reset it while the crosshair stayed on the plot.
   offsetPick: Map<number, boolean>
   composition: Map<number, Composition>     // windowId → sample elements + percentages
-  activeActions: Map<number, Set<string>>   // windowId → action names with live output
-  subItems: Map<number, Map<string, SubItem[]>>  // windowId → action → dynamic chips
-  computingWindows: Set<number>   // windowIds with a long compute in flight (→ floating overlay)
-  status: string
-  ready: boolean
   dashboardUrl: string | null
   activeWindowId: number | null
-  streamLines: Array<{ text: string; kind: 'stdout' | 'stderr' }>
-  logEntries: LogEntry[]          // application-log records (the log panel)
-  logLevel: string                // current backend verbosity (DEBUG…CRITICAL)
   navShapePrompt: NavShapePrompt | null   // pending scan-shape/step-size dialog
-  loading: { busy: boolean; text: string }   // long file-read busy indicator
   signalTypes: Map<number, { current: string; options: string[] }>   // windowId → signal-type info
-  backendExited: { code: number | null; reason?: string } | null   // set when the Python sidecar dies; surfaces a blocking banner
-  envSetup: EnvSetupState | null   // first-run `uv sync` progress; drives the floating setup overlay
   playback: { playing: boolean; speed: number; loop: boolean }   // movie playback clock (session-wide)
   consoleResult: ConsoleResult | null       // last-executed cell (the ConsoleBar echo strip)
   consoleVars: ConsoleVarEntry[]            // live variable table (chips + signal-ref resolution)
@@ -273,16 +252,8 @@ interface State {
   consolePreview: ConsolePreviewResult | null   // last live-preview reply (the eye-toggled slot)
 }
 
-// First-run environment setup progress (main-process `env_setup` events, parsed
-// from uv output in envProgress.ts). Drives the floating EnvSetupOverlay.
-export type EnvPhase =
-  | 'resolving' | 'downloading' | 'installing' | 'building' | 'torch' | 'working'
-export interface EnvSetupState {
-  phase: EnvPhase
-  step: string                 // friendly current-step headline
-  percent: number | null       // 0–100 for a download we can measure, else null
-  lines: string[]              // rolling raw uv output tail (bounded)
-}
+// First-run environment setup progress: the shell's, re-exported.
+export type { EnvPhase, EnvSetupState } from '@de/shell-renderer'
 
 // Backend `nav_shape_prompt`: confirm the scan grid + step size before opening a
 // navigated dataset (4D-STEM / stack). Mirrors NavShapeDialog's prop type.
@@ -296,14 +267,13 @@ export interface NavShapePrompt {
 }
 
 type Action =
+  | ShellAction
   | { type: 'READY'; dashboardUrl?: string }
-  | { type: 'STATUS'; text: string }
   | { type: 'FIGURE'; windowId: number; figId: string; fileUrl: string | null; title: string; isNavigator: boolean; aspect?: number; view?: string; viewLabel?: string; viewKind?: string; strainComponents?: string[] }
   | { type: 'WINDOW_TITLE'; windowId: number; title: string }
   | { type: 'TOOLBAR_CONFIG'; windowId: number; plotId: number; actions: ToolbarAction[] }
   | { type: 'WINDOW_VISIBILITY'; windowId: number; visible: boolean }
   | { type: 'WINDOW_CLOSED'; windowId: number }
-  | { type: 'WINDOW_COMPUTING'; windowId: number; computing: boolean }
   | { type: 'SET_ACTIVE'; windowId: number }
   | { type: 'METADATA'; windowIds: number[]; metadata: MetadataDict
       editable?: Record<string, Record<string, string>>; info?: MetadataInfo
@@ -311,24 +281,13 @@ type Action =
   | { type: 'COMPOSITION'; windowIds: number[]; composition: Composition }
   | { type: 'AXES'; windowIds: number[]; axes: AxisRow[] }
   | { type: 'OFFSET_PICK'; windowId: number; on: boolean }
-  | { type: 'ACTION_ACTIVE'; windowId: number; name: string; active: boolean }
-  | { type: 'SUB_ITEM'; windowId: number; action: string; name: string; color: string; vtype?: string; calculation?: string; active: boolean }
   | { type: 'HISTOGRAM'; windowId: number; histogram: Histogram }
   | { type: 'NAV_SHAPE_PROMPT'; prompt: NavShapePrompt | null }
-  | { type: 'LOADING'; busy: boolean; text: string }
   | { type: 'SIGNAL_TYPE'; windowIds: number[]; current: string; options: string[] }
   | { type: 'SELECTOR_INFO'; info: SelectorInfo }
   | { type: 'SELECTOR_REMOVED'; selectorId: number }
   | { type: 'SIGNAL_TREE'; windowId: number; tree: TreeNode; activeSignalId?: number }
   | { type: 'NAVIGATOR_OPTIONS'; windowId: number; names: string[]; current?: string | null }
-  | { type: 'STREAM'; text: string; kind: 'stdout' | 'stderr' }
-  | { type: 'LOG'; entries: LogEntry[] }
-  | { type: 'LOG_BACKFILL'; entries: LogEntry[] }
-  | { type: 'LOG_LEVEL'; level: string }
-  | { type: 'BACKEND_EXITED'; code: number | null; reason?: string }
-  | { type: 'ENV_SETUP_START' }
-  | { type: 'ENV_SETUP_PROGRESS'; phase?: EnvPhase; step?: string; percent: number | null; raw: string }
-  | { type: 'ENV_SETUP_DONE' }
   | { type: 'PLAYBACK'; playing: boolean; speed: number; loop: boolean }
   | { type: 'CONSOLE_RESULT'; result: ConsoleResult }
   | { type: 'CONSOLE_VARS'; vars: ConsoleVarEntry[] }
@@ -346,9 +305,6 @@ function spydeReducer(state: State, action: Action): State {
         dashboardUrl: action.dashboardUrl ?? null,
         status: 'Ready',
       }
-
-    case 'STATUS':
-      return { ...state, status: action.text }
 
     case 'FIGURE': {
       // The main process already wrote the HTML to disk and gave us a file:// URL.
@@ -445,15 +401,6 @@ function spydeReducer(state: State, action: Action): State {
       return { ...state, windows: newWindows }
     }
 
-    case 'WINDOW_COMPUTING': {
-      const has = state.computingWindows.has(action.windowId)
-      if (action.computing === has) return state   // no-op re-emit
-      const computingWindows = new Set(state.computingWindows)
-      if (action.computing) computingWindows.add(action.windowId)
-      else computingWindows.delete(action.windowId)
-      return { ...state, computingWindows }
-    }
-
     case 'WINDOW_CLOSED': {
       const newWindows = new Map(state.windows)
       newWindows.delete(action.windowId)
@@ -532,28 +479,6 @@ function spydeReducer(state: State, action: Action): State {
       const offsetPick = new Map(state.offsetPick)
       offsetPick.set(action.windowId, action.on)
       return { ...state, offsetPick }
-    }
-
-    case 'ACTION_ACTIVE': {
-      const activeActions = new Map(state.activeActions)
-      const set = new Set(activeActions.get(action.windowId) ?? [])
-      if (action.active) set.add(action.name)
-      else set.delete(action.name)
-      activeActions.set(action.windowId, set)
-      return { ...state, activeActions }
-    }
-
-    case 'SUB_ITEM': {
-      const subItems = new Map(state.subItems)
-      const byAction = new Map(subItems.get(action.windowId) ?? new Map<string, SubItem[]>())
-      const list = (byAction.get(action.action) ?? []).filter(i => i.name !== action.name)
-      if (action.active) list.push({
-        name: action.name, color: action.color,
-        vtype: action.vtype, calculation: action.calculation,
-      })
-      byAction.set(action.action, list)
-      subItems.set(action.windowId, byAction)
-      return { ...state, subItems }
     }
 
     case 'HISTOGRAM': {
@@ -662,34 +587,8 @@ function spydeReducer(state: State, action: Action): State {
       return { ...state, signalTrees, signalTreeActive, computingWindows }
     }
 
-    case 'STREAM':
-      return {
-        ...state,
-        streamLines: [...state.streamLines.slice(-500), { text: action.text, kind: action.kind }],
-      }
-
-    // A BATCH of records (coalesced per animation frame by `queueLog` below) —
-    // one array copy + one render for a whole burst, instead of one per line.
-    case 'LOG': {
-      if (action.entries.length === 0) return state
-      const merged = state.logEntries.concat(action.entries)
-      return {
-        ...state,
-        logEntries: merged.length > LOG_MAX ? merged.slice(-LOG_MAX) : merged,
-      }
-    }
-
-    case 'LOG_BACKFILL':
-      return { ...state, logEntries: action.entries.slice(-LOG_MAX) }
-
-    case 'LOG_LEVEL':
-      return { ...state, logLevel: action.level }
-
     case 'NAV_SHAPE_PROMPT':
       return { ...state, navShapePrompt: action.prompt }
-
-    case 'LOADING':
-      return { ...state, loading: { busy: action.busy, text: action.text } }
 
     case 'SIGNAL_TYPE': {
       const signalTypes = new Map(state.signalTypes)
@@ -698,46 +597,12 @@ function spydeReducer(state: State, action: Action): State {
       return { ...state, signalTypes }
     }
 
-    case 'BACKEND_EXITED':
-      return {
-        ...state,
-        backendExited: { code: action.code, reason: action.reason },
-        // A setup failure surfaces via BACKEND_EXITED — drop the setup overlay
-        // so the two don't stack.
-        envSetup: null,
-        ready: false,
-        status: 'Backend stopped',
-      }
-
-    case 'ENV_SETUP_START':
-      return {
-        ...state,
-        envSetup: { phase: 'resolving', step: 'Preparing the analysis environment', percent: null, lines: [] },
-        status: 'Setting up the analysis environment…',
-      }
-
-    case 'ENV_SETUP_PROGRESS': {
-      const prev = state.envSetup
-        ?? { phase: 'resolving' as EnvPhase, step: 'Preparing the analysis environment', percent: null, lines: [] }
-      // Keep the last meaningful step/phase when a noisy line parses to nothing;
-      // always append the raw line to the bounded tail so it visibly moves.
-      const lines = [...prev.lines, action.raw].slice(-200)
-      return {
-        ...state,
-        envSetup: {
-          phase: action.phase ?? prev.phase,
-          step: action.step ?? prev.step,
-          percent: action.percent,
-          lines,
-        },
-      }
-    }
-
-    case 'ENV_SETUP_DONE':
-      return { ...state, envSetup: null }
-
     default:
-      return state
+      // Not one of SpyDE's — hand it to the shell, which owns the chrome slice
+      // (status / logs / env setup / backend death / computing overlays /
+      // toolbar action state) and returns `state` untouched for anything it
+      // does not own either.
+      return shellReducer(state, action as ShellAction)
   }
 }
 
