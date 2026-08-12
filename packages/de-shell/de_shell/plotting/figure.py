@@ -105,6 +105,33 @@ def robust_levels(frame: np.ndarray, *,
         return 0.0, 1.0
 
 
+#: Figure chrome background. The apps are dark; anyplotlib's template is not.
+FIGURE_BACKGROUND = "#1e1e2e"
+
+
+def fill_iframe_html(html: str, *, background: str = FIGURE_BACKGROUND,
+                     extra_head: str = "") -> str:
+    """Make a standalone figure FILL its iframe, and match the app's theme.
+
+    Load-bearing for any app that drives figure size with
+    ``_electron.resize_figure``. anyplotlib's standalone template pins
+    ``html``/``body`` to the figure's INITIAL pixel size with
+    ``overflow:hidden`` — correct for a fixed docs or notebook embed. A shell app
+    resizes the figure live, so once the pane is larger than that initial size
+    the grown figure is CLIPPED to the old body box: the image spills past the
+    panel and the bottom is cut off, while everything around it looks fine.
+
+    ``extra_head`` is injected alongside, for an app that needs its own script in
+    the frame (SpyDE relays a pointerdown to bring its subwindow to the front).
+    """
+    style = (f"<style>html,body{{background:{background} !important;color-scheme:dark;"
+             "width:100% !important;height:100% !important;overflow:hidden}"
+             f"#widget-root{{background:{background} !important;"
+             "width:100% !important;height:100% !important;display:block !important}"
+             "</style>")
+    return html.replace("<body>", style + extra_head + "<body>", 1)
+
+
 class FigureView:
     """One always-on image pane.
 
@@ -165,7 +192,8 @@ class FigureView:
         # Register BEFORE building the HTML: registration attaches the trait
         # observers AND mints the id, so the HTML must be built with that id.
         self.fig_id = _electron.register(self._fig)
-        html = build_standalone_html(self._fig, fig_id=self.fig_id, resizable=False)
+        html = fill_iframe_html(
+            build_standalone_html(self._fig, fig_id=self.fig_id, resizable=False))
 
         emit({
             "type": "figure",

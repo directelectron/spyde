@@ -21,7 +21,7 @@ import anyplotlib._electron as _electron
 from anyplotlib.embed import build_standalone_html
 
 from de_shell.plotting.colormaps import COLORMAPS, DEFAULT_COLORMAP
-from de_shell.plotting.figure import robust_levels
+from de_shell.plotting.figure import fill_iframe_html, robust_levels
 
 if TYPE_CHECKING:
     from spyde.drawing.plots.plot_states import PlotState
@@ -169,21 +169,16 @@ def _apply_figure_html_shell(html: str, fig_id) -> str:
     """SpyDE's dark-mode + fill-the-iframe + focus-relay post-processing, shared by
     the live and standalone figure-HTML paths.
 
-    The anyplotlib standalone template pins html/body to the figure's INITIAL px
-    size with overflow:hidden (sized for a fixed docs/notebook embed). SpyDE drives
-    the size live via resize_figure (fig_width/height → the panels re-layout), so
-    when the subwindow is dragged LARGER than that initial size the grown figure was
-    clipped to the old body box. Make html/body/#widget-root fill the iframe (100%)
-    so the figure always fills — and is never clipped by — the subwindow."""
-    dark = ("<style>html,body{background:#1e1e2e !important;color-scheme:dark;"
-            "width:100% !important;height:100% !important;overflow:hidden}"
-            "#widget-root{background:#1e1e2e !important;"
-            "width:100% !important;height:100% !important;display:block !important}"
-            "</style>")
+    The dark-mode + fill-the-iframe half is the shell's (`fill_iframe_html`) —
+    any app that drives figure size via resize_figure needs it, because the
+    anyplotlib standalone template pins html/body to the figure's INITIAL px size
+    with overflow:hidden and a grown figure is then clipped to the old body box.
+    SpyDE adds only the focus relay, which is about having an MDI to bring a
+    subwindow to the front of."""
     focus = ("<script>window.addEventListener('pointerdown',function(){"
              "try{window.parent.postMessage({type:'spyde_focus',figId:%r},'*');}"
              "catch(e){}},true);</script>" % str(fig_id))
-    return html.replace("<body>", dark + focus + "<body>", 1)
+    return fill_iframe_html(html, extra_head=focus)
 
 
 def finalize_figure_html(fig, fig_id, *, standalone: bool = False) -> str:

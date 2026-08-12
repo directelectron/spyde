@@ -90,9 +90,28 @@ export function createShellWindow(opts: ShellWindowOptions): ShellWindow {
   if (opts.teeConsole !== false) {
     // Renderer AND figure-iframe console output, so a JS error inside a figure
     // frame is visible without opening devtools and switching frame context.
-    // level: 0=log 1=warning 2=error 3=info.
-    win.webContents.on('console-message', (_e, level, message) => {
-      if (level >= 1 || opts.logFilter?.(message)) {
+    //
+    // TWO event signatures, and getting this wrong fails SILENTLY — the tee
+    // simply stops teeing, which is the worst way for a diagnostic to break.
+    // Electron <35: (event, level: number, message, line, sourceId), where
+    // level is 0=log 1=warning 2=error 3=info. Electron >=35: (event, details)
+    // with a STRING level. Reading `level >= 1` off the details OBJECT is
+    // always false, so every message is dropped.
+    win.webContents.on('console-message', (...args: unknown[]) => {
+      const [, second, third] = args
+      let message: string
+      let warnOrWorse: boolean
+      if (second !== null && typeof second === 'object') {
+        const d = second as { message?: string; level?: string | number }
+        message = String(d.message ?? '')
+        warnOrWorse = typeof d.level === 'number'
+          ? d.level >= 1
+          : d.level === 'warning' || d.level === 'error'
+      } else {
+        message = String(third ?? '')
+        warnOrWorse = Number(second) >= 1
+      }
+      if (warnOrWorse || opts.logFilter?.(message)) {
         console.log(`[${cfg.appId} renderer] ${message}`)
       }
     })

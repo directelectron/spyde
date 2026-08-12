@@ -110,6 +110,7 @@ test('boots on the shared shell and streams live frames', async () => {
   await expect(page.getByTestId('start-btn')).toBeEnabled({ timeout: 15_000 })
   await page.screenshot({ path: join(SHOTS, '03-stopped.png') })
 
+
   // 6. Nothing died on the way.
   const errs = backend.errorLines()
   if (errs.length) console.log('[groundcrew] backend errors:\n' + errs.join('\n'))
