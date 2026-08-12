@@ -1,139 +1,139 @@
-# Scoping the shell for Ground Crew and Autopilot
+# Ground Crew — decisions and open work
 
-What each new app needs, what the shell already gives it, and what is left. The
-Ground Crew column is measured against the real PySide6 app
-(`~/PycharmProjects/de_ground_crew`, ~7,845 lines); Autopilot is greenfield, so
-its rows are marked where they are inferred rather than observed.
+Supersedes the first version of this file, which measured the shell against the
+existing PySide app as if it were a specification. It is not: the UI and code
+are being replaced, and the numbers in that version were derived from a source
+that does not hold. What follows is only what has actually been settled.
 
-The point of this document is to answer two questions before the real builds
-start: **how much of each app is already done**, and **what should be shared but
-is not yet**.
+Answers below are from the `deapi` owner unless marked otherwise.
 
 ---
 
-## 1. Ground Crew — the PySide6 app, module by module
+## 1. Connection model — settled
 
-| Module | Lines | Shell covers it? | Notes |
-|---|---:|---|---|
-| `ui/calibration_panel.py` | 1371 | ✗ app | Dark/gain reference workflows. Pure domain. |
-| `ui/main_window.py` | 1214 | **~80%** | Window, menus, status, log docking, the busy gate, worker wiring. Most of this dissolves into `createShellWindow` + `SessionBase` + the chrome reducer. What remains is the busy gate (see §3). |
-| `ui/widgets.py` | 854 | **partly** | Generic Qt widgets. In React most become app JSX; the reusable ones overlap the shell UI components not yet extracted (§4). |
-| `workers/calibration_worker.py` | 681 | **pattern only** | `lifecycle.run_on_worker` replaces the QThread+Signal boilerplate; the calibration logic is domain. |
-| `ui/image_viewer.py` | 598 | **✓ mostly** | `FigureView` + `FrameStream`. The FFT side-by-side needs a second FigureView (see §3). |
-| `ui/control_panel.py` | 558 | ✗ app | Camera controls. The scaffold's sidebar is a sketch of this. |
-| `ui/script_panel.py` | 473 | **candidate** | A scripting console. SpyDE has one (`backend/console.py` 951 + `ConsoleBar.tsx` 899) — see §4. |
-| `ui/image_stats_panel.py` | 449 | **partly** | ADU stats strip + a 256-bin histogram. Stats strip exists in the scaffold; the histogram widget is a §4 candidate. |
-| `ui/serialem_panel.py` + `serialem_worker.py` + `serialem_console.py` | 808 | ✗ app | SerialEM integration. Pure domain. |
-| `workers/acquisition.py` | 441 | **pattern only** | Six workers, all the same shape. `run_on_worker` + `FrameStream.submit_future` is a direct translation. |
-| `ui/log_panel.py` | 116 | **✓** | `de_shell.log_stream` + the shell's log ring. |
-| `ui/camera_status_panel.py` | 111 | ✗ app (trivial) | 3-second property poll. |
-| `ui/status_bar.py` | 95 | **✓** | Shell chrome state. |
+`deapi` is single-threaded per client: **one client ↔ one connection**, and most
+calls block. Multiple clients are possible but each operates on its own port,
+and more than one is a hazard rather than a feature.
 
-**Rough split: ~40% of Ground Crew is plumbing the shell now provides, ~60% is
-domain that has to be written either way.** The domain 60% is concentrated in
-calibration, SerialEM and the control panel — none of which the scaffold has
-started.
+**Two connections, one owner each:**
 
----
-
-## 2. Autopilot — inferred, since it does not exist yet
-
-| Need | Shell covers it? | Notes |
+| Connection | `read_only` | Owns |
 |---|---|---|
-| Recipe model + runner | ✗ app | The scaffold has a working shape (`recipe.py`). |
-| Step queue UI, progress | **✓** | `emit_progress` + the shell reducer; the scaffold uses both. |
-| Last-acquisition view | **✓** | `FigureView` + `FrameStream`. |
-| Driving the camera/stage | **shared with Ground Crew, not the shell** | See §3. |
-| Scheduling / unattended runs | ✗ app | Not started. Cron-like triggers, overnight runs, failure policy. |
-| Results storage + handoff to SpyDE | ✗ app, **and undecided** | The obvious integration: Autopilot writes what SpyDE opens. Worth settling the format early. |
+| Read | `True` | Status polling, `get_result` for rendering, histogram |
+| Read/write | `False` | Acquisition, property writes, references, valve, temperature |
 
-Autopilot is the smaller app, and most of what it needs beyond the scaffold is
-policy (what to do when a step fails at 3 a.m.) rather than plumbing.
+`Client.connect(host, port, read_only=…)` takes the flag directly, and
+`set_client_read_only` exists for changing it later.
 
----
+This is why **no process-wide device gate is needed** — the earlier proposal for
+one came from the old app's docs and is withdrawn. Each connection has a single
+owner, so there is nothing to serialise. Two writers on one socket would be the
+bug; two connections with distinct roles avoids it by construction.
 
-## 3. The gap neither app can fill alone: the instrument layer
+## 2. Rendering — settled, and it changes the viewer
 
-**Both new apps drive the DE Server SDK. Neither SpyDE nor the shell should.**
+**`get_result` IS the render backend.** Not "fetch a frame, then paint it" —
+zoom and pan call back into `get_result`, and the server returns only the region
+at the resolution asked for.
 
-That is a fourth package, not a fifth shell module:
+That maps onto anyplotlib's tile protocol almost exactly:
 
 ```
-packages/de-instrument/     de_instrument
-    client.py     DEAPI.Client lifecycle, connect/reconnect
-    camera.py     Camera protocol; DEServerCamera + SimulatedCamera
-    stage.py      Stage protocol
-    serialization the shared-socket gate (below)
+TileBackend.sample(x0, x1, y0, y1, out_w, out_h, method)   # anyplotlib asks
+    ↓
+client.get_result(centerX=(x0+x1)/2, centerY=(y0+y1)/2,
+                  windowWidth=x1-x0, windowHeight=y1-y0,
+                  zoom=out_w/(x1-x0), pixel_format=…)        # server crops + scales
 ```
 
-Ground Crew and Autopilot depend on it; SpyDE does not. Putting it in `de_shell`
-would break the constraint the whole split rests on — the shell knows nothing
-about instruments any more than it knows about diffraction.
+`TileBackend` needs `full_shape`, `dtype`, `origin`, `extent()` and `sample()`;
+`get_result` supplies all of it, **and returns the histogram from the same
+call**, so Plot Control's histogram is server-side rather than recomputed in the
+client.
 
-### The one piece that IS a shell candidate
+Consequences:
 
-`DEAPI.Client` is **not thread-safe**: one socket shared between a 3-second
-status poll on the main thread and every background worker. Ground Crew handles
-it with a busy gate — `_set_busy(True)` → `cam_status.pause()` around every
-worker — and its CLAUDE.md says "never bypass it".
+- A `DeapiTileBackend` handed to `Plot2D.enable_tile(...)` is the whole viewer.
+  No frame pushing, no shared-memory buffer, no client-side downsampling.
+- Only the pixels on screen cross the wire — the thing that matters on a 4096²
+  or 8192² detector.
+- `FrameStream` still applies to the LIVE path (newest-wins painting of frames
+  arriving off-thread), but the tile path is pull, not push. Those are two
+  different mechanisms and both are needed.
 
-That is structurally identical to SpyDE's `spyde/device_lock.py`: a process-wide
-resource that corrupts under concurrent access, where **a lock only works if
-every participant takes it**, and where the failure mode is severe (SpyDE: an
-uncatchable native SIGSEGV; Ground Crew: a corrupted shared socket).
+## 3. Instrument properties — settled for now
 
-Two independent consumers, same shape, same "one missed call site re-opens it"
-hazard → this clears the bar for extraction. A `de_shell.device` offering a
-process-wide serialisation context, with SpyDE's `accelerator_lock` and Ground
-Crew's SDK gate as the two implementations, is worth doing **before** Ground
-Crew's port, not after — retrofitting a lock across an existing codebase is
-exactly how SpyDE got the bug its module docstring describes.
+`deapi` holds the instrument properties today, and that is fine for now; they
+become settable through `deapi` or a separate channel later. Ground Crew reads
+them from DE and does **not** build against the microscope-control package,
+which is too early.
+
+The `Instrument Project *` properties reading their unset sentinels (`-1`, `-1.0`)
+means **the DE↔TEM channel is not reporting** — not that calibration is missing.
+Those are separate cards on the status board.
+
+## 4. Bad pixel correction — settled
+
+It is an **instrument property holding a file reference**. If the file is set,
+the correction has been applied; if it is blank, it has not. The status card
+reads that property, and the rule is stated on the card rather than inferred.
+
+## 5. Reference health — removed
+
+Dark/gain staleness is not tracked, so the status card claiming it has been
+deleted. The dark and gain **controls** remain; only the health claim went. To
+be revisited with the owner's input later, along with sensor-health thresholds.
+
+## 6. `info.txt` vs the live TEM channel — settled
+
+**`info.txt` wins.** It records the state the image was actually acquired under;
+the live channel describes now, which may be a different microscope state
+entirely. Calibration prefills from it and every field stays editable, and the
+measurements table records the provenance of each row (`info.txt` / `edited` /
+`DEAPI`).
+
+## 7. CTF — settled
+
+A CTF finder has already been ported. No new dependency, no build-versus-buy
+question.
+
+## 8. Packaging — settled
+
+Drop PyInstaller and conda; use **uv**, matching the rest of the family.
+`deapi` is tested on macOS and Linux, so Windows is not a special case in the
+way the old build script assumed.
 
 ---
 
-## 4. Shell gaps with two consumers today
+## Still open
 
-Justified now, by the standard used throughout this split (two real consumers,
-not one plus a guess):
+- **Sensor health thresholds** — deferred by agreement; the owner will help set
+  them.
+- **SerialEM and the script panel** — assumed OUT of v1 (SerialEM is half broken
+  and belongs in `de-instrument`, which is early). Not yet explicitly confirmed.
+- **Corrected movie output** — back to the server, or to a file only?
+- **Retract while acquiring** — confirm dialog, or refuse?
+- **Where a failed fit surfaces** — "no ring found" has no home louder than the
+  status bar.
+- **Re-refining a committed calibration row** — interaction undrawn.
+- **Per-patch (5×5) shift display** in Motion.
+- **Status polling cadence.** Now much less fraught: the read-only connection
+  can poll without contending with acquisition. Still a choice.
 
-- **Shell UI components.** Ground Crew and Autopilot have near-identical
-  `LogPanel` / `StatusBar` / `Stat`. Two copies already.
-- **Histogram widget.** SpyDE has one; Ground Crew's `image_stats_panel` needs
-  one (the SDK already returns 256 bins). Two consumers once the port starts.
-- **Window registry + a `FixedLayout`.** Currently parked for want of a second
-  consumer. Ground Crew's image + FFT side-by-side is that consumer: two figures
-  in named panes. This unparks when the FFT view is built.
+## Tests
 
-Still not justified: the toolbar/selector hooks. Neither app has toolbars.
+Judgement call, per the owner: keep what is genuinely valuable. The split is
+roughly —
 
----
+- **Keep**: anything exercising SDK interaction, calibration maths, or
+  correction algorithms. These retarget onto `deapi`'s `FakeServer` (spawn
+  `simulated_server/initialize_server.py <port>`, wait for `started`, connect
+  with `usingMmf = False`; the fixture pattern is in `deapi/tests/conftest.py`).
+- **Drop**: anything asserting on PySide widgets. It dies with the UI.
 
-## 5. Suggested order
+## What the scaffold gets wrong today
 
-1. **`de-instrument` + the shared device gate.** Blocks both apps; the gate is
-   much cheaper to design in than to retrofit.
-2. **Port Ground Crew's acquisition + control panel** onto it. That is the
-   thinnest path to a Ground Crew that does something real, and it will exercise
-   the window registry (image + FFT) and the histogram — unparking §4 with
-   evidence rather than speculation.
-3. **Shell UI components**, once the port shows which ones actually recur.
-4. **Calibration and SerialEM.** The two biggest domain chunks, and the two least
-   affected by any of this.
-
-Autopilot can proceed in parallel after step 1, since its remaining work is
-mostly policy.
-
----
-
-## 6. What this does not cover
-
-- **Windows.** Ground Crew ships as a PyInstaller single exe built on Windows
-  against a conda env; the shell distributes via electron-builder + a uv-managed
-  Python. That migration is not scoped here and is not trivial — see
-  `pythonEnv.ts` for what first-run setup does today.
-- **The DE SDK's own packaging.** `sdk/DEAPI.py` and `serialem.pyd` are vendored
-  binaries in the PySide6 tree; how they reach a packaged Electron app is an open
-  question.
-- **Whether Ground Crew should be rewritten at all.** This document scopes the
-  work assuming yes. The 60/40 split above is the input to that decision, not the
-  answer to it.
+`apps/groundcrew/de_groundcrew/camera.py` invented a `Camera` protocol, a
+`SimulatedCamera`, and a `DEServerCamera` stub pointing at the wrong SDK. All of
+it should be deleted in favour of `deapi` plus its `FakeServer`. The Electron
+side and everything in `packages/` stands.
