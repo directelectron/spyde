@@ -20,9 +20,18 @@ import type { FigureMessage, ShellState, ShellAction, LogEntry } from '@de/shell
 
 // ── Backend message shapes ────────────────────────────────────────────────────
 
+/** Frame statistics as the DE Server reports them.
+ *
+ * Every field is nullable because the server signals "not measured" with an
+ * out-of-band sentinel, which the backend maps to `null` rather than letting a
+ * NaN reach the UI. These arrive on the SAME `get_result` that returns the
+ * pixels, so the strip costs no extra round trip — and they describe the whole
+ * frame, not the cropped region on screen. */
 interface FrameStats {
-  frame: number; shown: number; dropped: number
-  min: number; max: number; mean: number; dtype: string; shape: number[]
+  frame: number | null
+  min: number | null; max: number | null; mean: number | null; std: number | null
+  eppix: number | null; eppixps: number | null
+  over: number | null; under: number | null
 }
 
 const COLORMAPS = ['gray', 'viridis', 'plasma', 'inferno', 'magma', 'cividis']
@@ -75,7 +84,9 @@ const initialState: AppState = {
   ...shellInitialState,
   figure: null,
   stats: null,
-  running: true,
+  // Idle until the backend says otherwise: connecting is not acquiring, and
+  // the camera is not put into free-run without someone asking.
+  running: false,
   exposureMs: 50,
   colormap: 'gray',
   error: null,
@@ -161,7 +172,7 @@ export function App() {
              acq_state reply is authoritative and corrects it if it disagrees. */
           onExposure={(ms) => {
             dispatch({ type: 'EXPOSURE', ms })
-            act('set_exposure', { seconds: ms / 1000 })
+            act('set_property', { name: 'Exposure Time (seconds)', value: ms / 1000 })
           }}
           onColormap={(name) => {
             dispatch({ type: 'COLORMAP', name })
@@ -306,20 +317,30 @@ function FigurePane({ figure, bridge }: {
   )
 }
 
+/** `null` renders as "—": the server reports a value it did not measure with an
+ *  out-of-band sentinel, and showing a placeholder is honest where showing 0
+ *  would be a claim. */
+const num = (v: number | null | undefined, digits = 0) =>
+  v == null ? '—' : v.toFixed(digits)
+
 function StatsStrip({ stats }: { stats: FrameStats | null }) {
   if (!stats) return <div style={S.stats} data-testid="stats-strip" />
   return (
     <div style={S.stats} data-testid="stats-strip">
-      <Stat label="Frame" value={String(stats.frame)} testId="stat-frame" />
-      <Stat label="Size" value={stats.shape.join(' × ')} />
-      <Stat label="dtype" value={stats.dtype} />
-      <Stat label="Min" value={stats.min.toFixed(0)} />
-      <Stat label="Max" value={stats.max.toFixed(0)} />
-      <Stat label="Mean" value={stats.mean.toFixed(1)} />
-      <Stat label="Shown" value={String(stats.shown)} />
-      {/* Dropped frames are expected (newest-wins painting), so this is
-          information, not an error — but it should be visible. */}
-      <Stat label="Dropped" value={String(stats.dropped)} />
+      <Stat label="Frame" value={stats.frame == null ? '—' : String(stats.frame)}
+        testId="stat-frame" />
+      <Stat label="Min" value={num(stats.min)} testId="stat-min" />
+      <Stat label="Max" value={num(stats.max)} testId="stat-max" />
+      <Stat label="Mean" value={num(stats.mean, 1)} />
+      <Stat label="Std" value={num(stats.std, 1)} />
+      {/* Electrons per pixel — the number that says whether the exposure is
+          right, and the reason to read statistics off the server rather than
+          recompute them from the tile: they describe the FULL frame, not the
+          cropped region currently on screen. */}
+      <Stat label="e⁻/pix" value={num(stats.eppix, 2)} />
+      <Stat label="e⁻/pix/s" value={num(stats.eppixps, 1)} />
+      <Stat label="Over" value={num(stats.over, 2)} />
+      <Stat label="Under" value={num(stats.under, 2)} />
     </div>
   )
 }

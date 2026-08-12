@@ -135,6 +135,42 @@ routes every `print()` to stderr for exactly this reason, so the shell is immune
 
 SerialEM and the script panel are **out of v1**. No rail entry, no panel.
 
+## 11. What the simulator can and cannot support — measured
+
+Built and verified end to end against `FakeServer`: connect → tiled
+`get_result` → live acquisition → contrast → statistics, with the viewer
+rendering the simulator's seven-disc scene.
+
+Three findings from doing it, all of which constrain what can be built next.
+
+**The simulator exposes 73 properties; a real server exposes 339.** The status
+board and the top bar were designed against a dump of a real one, and **15 of
+the 22 properties they need are absent** — every temperature, valve, vacuum,
+`Instrument Project *` and image-correction property among them. `Instrument.
+properties()` returns `None` for an unsupported name (checked against
+`list_properties()`, not by inspecting the value — see below), so those
+surfaces will render "unavailable" rather than lie. But they cannot be
+*developed* against the fake server. Either the simulator grows those
+properties or those cards wait for hardware.
+`test_the_simulator_lacks_most_status_properties` fails the moment that
+changes, so this note cannot go stale silently.
+
+**`attrs.imageMin/imageMax/imageMean/imageStd` are not frame statistics on the
+simulator.** They came back `0 / 32768 / 100 / 5` — exactly 2¹⁵ and two round
+numbers — while the pixels returned by the *same* `get_result` ran 1…25 with a
+mean of 1.98. Displaying them put "MAX 32768" under a picture whose brightest
+pixel was 25. **The histogram, by contrast, is real** and agreed with the array
+exactly, so both the stats strip and the display range are derived from it.
+That is a better arrangement anyway — the histogram describes the whole frame,
+so contrast does not shift as the user pans a tiled image — but if the
+attributes are meant to be populated, this is a simulator bug worth knowing
+about.
+
+**`client[unknown_property]` returns `False`, not an exception.** Since `False`
+is also a legitimate value for a boolean property, no amount of value
+inspection can tell "unsupported" from "switched off". Unknown names are
+therefore resolved against `list_properties()`.
+
 ## Still open
 
 - **Sensor health thresholds** — deferred by agreement; the owner will help set
@@ -159,9 +195,22 @@ roughly —
   with `usingMmf = False`; the fixture pattern is in `deapi/tests/conftest.py`).
 - **Drop**: anything asserting on PySide widgets. It dies with the UI.
 
-## What the scaffold gets wrong today
+## What the scaffold got wrong — fixed
 
-`apps/groundcrew/de_groundcrew/camera.py` invented a `Camera` protocol, a
-`SimulatedCamera`, and a `DEServerCamera` stub pointing at the wrong SDK. All of
-it should be deleted in favour of `deapi` plus its `FakeServer`. The Electron
-side and everything in `packages/` stands.
+`camera.py` invented a `Camera` protocol, a `SimulatedCamera` and a
+`DEServerCamera` stub pointing at the wrong SDK. **Deleted**, and replaced by
+`instrument.py` (one connection, one owning thread) and `tile.py`
+(`get_result` as the render backend) against real `deapi` + its `FakeServer`.
+The Electron side and everything in `packages/` stands.
+
+**The UI has not been rebuilt yet.** The existing sidebar was retargeted onto
+the new backend so the path could be verified, but the mode rail (Imaging /
+Motion Correction / Calibration / Status) is still to do.
+
+### Running the e2e — a trap worth knowing
+
+`apps/groundcrew`'s Playwright config has **no build step**: the harness
+launches whatever is in `out/`, so a renderer edit is invisible until
+`npm run build` runs. This cost a debugging cycle here — a stale bundle looked
+exactly like a backend that was not sending state. Run `npm run build &&
+npx playwright test --project=groundcrew`.

@@ -21,7 +21,8 @@ log = logging.getLogger(__name__)
 # panel, because the shell only lets its own and the app's declared packages
 # through below WARNING.
 _LOG_AREA_RULES = (
-    ("de_groundcrew.camera", "camera"),
+    ("de_groundcrew.instrument", "camera"),
+    ("de_groundcrew.tile", "camera"),
     ("de_groundcrew.session", "session"),
     ("de_groundcrew", "groundcrew"),
 )

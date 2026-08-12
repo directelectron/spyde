@@ -162,6 +162,7 @@ class FigureView:
         self._colormap = colormap
         self._gpu = gpu
         self._closed = False
+        self._tiled = False
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -211,6 +212,7 @@ class FigureView:
         if self._closed:
             return
         self._closed = True
+        self._tiled = False
         self._plot2d = None
         self._axes = None
         self._fig = None
@@ -236,6 +238,71 @@ class FigureView:
             return True
         except Exception as e:
             log.debug("painting figure %s failed: %s", self.fig_id, e)
+            return False
+
+    # ── Tiled display ─────────────────────────────────────────────────────────
+
+    def enable_tile(self, backend, *, integration_method: str = "mean") -> bool:
+        """Render through a :class:`TileBackend` instead of pushed frames.
+
+        anyplotlib then owns the loop: it shows a downsampled overview as the
+        base and, on its own debounced ``view_changed``, asks the backend for a
+        hi-res tile of just the visible region at panel resolution. So the
+        source can be larger than anything worth sending whole — an 8192²
+        detector, or a camera that is only ever asked for the crop on screen.
+
+        Backends are duck-typed (``full_shape``, ``dtype``, ``origin``,
+        ``extent()``, ``sample()``); the shell requires no particular class.
+
+        Returns whether tiling was enabled — an anyplotlib without the tile API
+        is a soft failure, and the caller can fall back to :meth:`show`.
+        """
+        if not self.is_open or not hasattr(self._plot2d, "enable_tile"):
+            return False
+        try:
+            self._plot2d.enable_tile(backend, integration_method=integration_method)
+            self._tiled = True
+            return True
+        except Exception as e:
+            log.warning("enable_tile failed, falling back to pushed frames: %s", e)
+            return False
+
+    @property
+    def is_tiled(self) -> bool:
+        return self._tiled
+
+    def refresh_tile(self) -> bool:
+        """Re-read the CURRENT view from the backend — the live-data path.
+
+        The zoom and pan persist across the refresh, which is the contract that
+        matters for a live camera: new pixels arrive without the user's
+        viewport being reset out from under them.
+        """
+        if not self.is_open or not self._tiled:
+            return False
+        try:
+            self._plot2d.update_tile_source()
+            return True
+        except Exception as e:
+            log.debug("refresh_tile failed: %s", e)
+            return False
+
+    def set_clim(self, vmin: float, vmax: float) -> bool:
+        """Set the display range without touching the pixels.
+
+        The separate call matters in tile mode: :meth:`show` is never called
+        there, so there is no ``clim=`` argument to ride along with. Left
+        unset, a tiled plot keeps whatever range the placeholder passed to
+        ``imshow`` established — which renders real data as a uniform white or
+        black panel.
+        """
+        if not self.is_open:
+            return False
+        try:
+            self._plot2d.set_clim(float(vmin), float(vmax))
+            return True
+        except Exception as e:
+            log.debug("set_clim(%s, %s) failed: %s", vmin, vmax, e)
             return False
 
     def set_colormap(self, name: str) -> None:
