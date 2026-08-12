@@ -171,6 +171,53 @@ is also a legitimate value for a boolean property, no amount of value
 inspection can tell "unsupported" from "switched off". Unknown names are
 therefore resolved against `list_properties()`.
 
+## 12. `stop_acquisition()` never returns on the FakeServer — and it kills the connection
+
+Reproducible 4/4, in every case tried:
+
+| Sequence | Result |
+|---|---|
+| `stop_acquisition()` with no acquisition running | never returns |
+| `start_acquisition(1)` → wait for completion → `stop` | never returns |
+| `start_acquisition(0)` → `stop` | never returns |
+| `start_acquisition(1000)` → `stop` | never returns |
+
+In all four the connection is **dead afterwards**: every later call times out.
+Repro is ~10 lines — connect to `FakeServer`, call `stop_acquisition()`.
+
+This matters beyond the simulator, because it is the failure mode the whole
+connection design is most exposed to: **one connection, one owning thread, so a
+single call that never returns freezes every feature at once.** It presented as
+"the status board spins forever", with nothing in the log after
+`status: reading 19 properties`.
+
+Two changes came out of it, both correct on real hardware too:
+
+- **Stop does not wait.** `Instrument.call_nowait` submits `stop_acquisition`
+  and returns. The user asked for the live view to stop; that must happen
+  whether or not the camera acknowledges.
+- **The board reports an unresponsive camera instead of waiting for one.**
+  `Instrument.pending()` exposes `(label, seconds_in_flight)`, and the status
+  read is raced against a 6 s deadline. If the camera has stopped answering,
+  the board says so and names the stuck call — "no response within 6s (waiting
+  on stop_acquisition)" — which is exactly what an engineer needs. The
+  Connection card needs no device access, which is why it can still answer when
+  nothing else can.
+
+This is also the strongest argument yet for the **two-connection** design in §1:
+a wedged read/write connection would not have taken status polling down with
+it. Still blocked on `FakeServer` accepting only one connection.
+
+## 13. A separate bug this masked: the live loop out-ran the main thread
+
+`_live_loop` posted a display refresh every 50 ms regardless of whether the
+previous one had finished. Each refresh blocks the main thread for a full
+server round trip, so whenever the server was slower than the tick the main
+loop accumulated a backlog — which **outlived the acquisition**: after Stop,
+status reports and property reads queued behind refreshes that were still
+draining. The loop now waits for each refresh to land before requesting
+another.
+
 ## Still open
 
 - **Sensor health thresholds** — deferred by agreement; the owner will help set
@@ -203,9 +250,15 @@ roughly —
 (`get_result` as the render backend) against real `deapi` + its `FakeServer`.
 The Electron side and everything in `packages/` stands.
 
-**The UI has not been rebuilt yet.** The existing sidebar was retargeted onto
-the new backend so the path could be verified, but the mode rail (Imaging /
-Motion Correction / Calibration / Status) is still to do.
+**The UI is rebuilt** to the mode rail (Imaging / Motion / Calibrate / Status),
+with an instrument sidebar of editable input boxes, a Plot Control strip on the
+right, and temperature + camera position in the top bar. `theme.ts` holds the
+tokens, `ui.tsx` the primitives, `modes/` the panes.
+
+**Imaging and Status are wired; Motion and Calibrate are not.** The compute
+behind them — drift estimation, the CTF fit, ring detection, `info.txt`
+parsing — is not ported into this app yet, so those panes state that plainly
+rather than presenting controls with nothing behind them.
 
 ### Running the e2e — a trap worth knowing
 

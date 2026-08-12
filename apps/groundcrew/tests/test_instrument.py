@@ -16,6 +16,9 @@ than guessed:
 """
 from __future__ import annotations
 
+import threading
+import time
+
 import numpy as np
 import pytest
 
@@ -134,6 +137,84 @@ class TestConnection:
         inst.close()
         inst.close()
 
+
+class TestStallDetection:
+    """Telling "the camera is slow" from "the camera has stopped answering".
+
+    This is not defensive decoration. The connection has ONE owning thread, so
+    a single call that never returns silently freezes every other feature — and
+    device calls that never return are real: deapi's own `FakeServer` never
+    returns from `stop_acquisition()`, reproducibly, in all four cases tried
+    (with and without an acquisition running), and takes the connection with
+    it. Without this the status board — the one screen an engineer opens when
+    things are wrong — would spin forever instead of saying so.
+    """
+
+    def test_an_idle_connection_reports_nothing_pending(self, instrument):
+        assert instrument.pending() is None
+
+    def test_a_call_in_flight_is_visible_to_other_threads(self):
+        # No server needed: the mechanism is about the io thread, not the wire.
+        inst = Instrument(port=_free_port())
+        try:
+            release = threading.Event()
+            started = threading.Event()
+
+            def block(_client):
+                started.set()
+                release.wait(timeout=10)
+
+            fut = inst.call(block, label="wedged_call")
+            assert started.wait(timeout=5), "call never began"
+
+            p = inst.pending()
+            assert p is not None, "a call in flight must be visible"
+            assert p[0] == "wedged_call"
+            assert p[1] >= 0
+
+            time.sleep(0.15)
+            assert inst.pending()[1] > p[1], "elapsed time must advance"
+
+            release.set()
+            fut.result(timeout=5)
+            assert inst.pending() is None, "pending must clear when the call ends"
+        finally:
+            inst.close()
+
+    def test_pending_clears_even_when_the_call_raises(self):
+        # Otherwise one failed call makes the connection look wedged forever.
+        inst = Instrument(port=_free_port())
+        try:
+            def boom(_client):
+                raise RuntimeError("nope")
+            inst.call(boom, label="boom").exception(timeout=5)
+            assert inst.pending() is None
+        finally:
+            inst.close()
+
+    def test_call_nowait_does_not_block_and_swallows_failure(self):
+        # Used for Stop: the live view must stop whether or not the camera
+        # acknowledges, and a failure there must not surface as an unhandled
+        # future exception.
+        inst = Instrument(port=_free_port())
+        try:
+            done = threading.Event()
+
+            def slow(_client):
+                time.sleep(0.3)
+                done.set()
+                raise RuntimeError("late failure")
+
+            t = time.monotonic()
+            inst.call_nowait(slow, "slow")
+            assert time.monotonic() - t < 0.2, "call_nowait must not wait"
+            assert done.wait(timeout=5)
+            time.sleep(0.05)
+        finally:
+            inst.close()
+
+
+class TestLifecycle:
     def test_calls_after_close_fail_rather_than_hang(self):
         inst = Instrument(port=_free_port())
         inst.close()

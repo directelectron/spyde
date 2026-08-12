@@ -87,17 +87,56 @@ test.beforeAll(async () => {
 // figure never appeared" and knowing why.
 test.afterEach(async ({}, testInfo) => {
   if (testInfo.status !== testInfo.expectedStatus && ctx?.backend) {
-    console.log('─── backend log ───\n' + (ctx.backend.logBuffer || '(empty)'))
+    // logBuffer is an ARRAY of lines, not a string — concatenating it directly
+    // yields a comma-run that reads as empty output.
+    const lines: string[] = ctx.backend.logBuffer ?? []
+    console.log('─── backend log (last 60 of ' + lines.length + ') ───\n' +
+      lines.slice(-60).join('\n'))
   }
 })
 
 test.afterAll(async () => { await ctx?.app?.close() })
 
+test('the status board says what it cannot see', async () => {
+  const { page } = ctx
+
+  // Runs BEFORE anything stops acquisition, so this exercises the property
+  // GAP — a healthy connection to a server that simply does not expose most of
+  // what the board asks for. The other degradation (a camera that has stopped
+  // answering at all) is a different failure and is tested separately below;
+  // conflating them let this pass for the wrong reason once already.
+  await page.getByTestId('mode-status').click()
+  await expect(page.getByTestId('status-headline')).toBeVisible({ timeout: 30_000 })
+
+  const coverage = await page.getByTestId('status-coverage').innerText()
+  console.log('[groundcrew] coverage =', coverage)
+  expect(coverage).toMatch(/of \d+ checks reporting/)
+  expect(coverage, 'the simulator cannot answer every check — that must be said')
+    .toMatch(/unavailable on this server/)
+
+  // The connection itself is fine here, so THAT card must not cry fault.
+  await expect(page.getByTestId('status-card-connection')).toHaveAttribute('data-state', 'ok')
+
+  // Nothing the server failed to report may be drawn as passing.
+  const cards = page.locator('[data-testid^="status-card-"]')
+  const unreported = page.locator('[data-testid^="status-card-"][data-state="unreported"]')
+  expect(await unreported.count(),
+    'expected unreported cards on the simulator').toBeGreaterThan(0)
+  expect(await page.locator('[data-testid^="status-card-"][data-state="ok"]').count())
+    .toBeLessThan(await cards.count())
+
+  await page.screenshot({ path: join(SHOTS, '04-status.png') })
+  ctx.assertNoJsErrors()
+})
+
 test('boots on the shared shell and streams live frames', async () => {
   const { page, backend } = ctx
 
   // 1. The fixed layout rendered — this app has a permanent control sidebar
-  //    where SpyDE has an MDI workspace.
+  //    and a mode rail where SpyDE has an MDI workspace. Select the mode
+  //    explicitly: tests share one app instance, so whatever ran before has
+  //    left the rail somewhere, and the stats strip belongs to Imaging.
+  await page.getByTestId('mode-imaging').click()
   await expect(page.getByTestId('control-panel')).toBeVisible()
   await expect(page.getByTestId('stats-strip')).toBeVisible()
   await page.screenshot({ path: join(SHOTS, '01-boot.png') })
@@ -121,11 +160,10 @@ test('boots on the shared shell and streams live frames', async () => {
   // 4. The image actually PAINTED — and painted the CAMERA's pixels, not the
   //    figure's chrome.
   //
-  //    Counting bright pixels is NOT enough and gave a false pass here: the
-  //    figure's own white background is bright, so the assertion held at 322k
-  //    pixels while the image pane was uniformly black. What distinguishes a
-  //    live frame from a placeholder is that it is not uniform, so measure the
-  //    spread of DISTINCT grey levels inside the image canvas.
+  //    Measured as a FRACTION inside the image canvas, not a raw bright-pixel
+  //    count: an absolute count gave a false pass once, because the figure's
+  //    own white background is bright and held the assertion at 322k pixels
+  //    while the image pane was uniformly black.
   const bright = await brightFraction(page)
   console.log('[groundcrew] bright fraction =', bright.toFixed(3))
   // Observed ~0.009: the discs are a small part of a canvas that also carries
@@ -147,5 +185,53 @@ test('boots on the shared shell and streams live frames', async () => {
   const errs = backend.errorLines()
   if (errs.length) console.log('[groundcrew] backend errors:\n' + errs.join('\n'))
   expect(errs.join('\n')).not.toMatch(/Traceback|ModuleNotFoundError|ImportError/)
+  ctx.assertNoJsErrors()
+})
+
+test('a camera that stops answering is reported, not waited on', async () => {
+  const { page } = ctx
+
+  // Runs AFTER the live-view test, which issues `stop_acquisition` — a call
+  // deapi's FakeServer never returns from, taking the single connection with
+  // it. Whatever the server does, the board must reach a verdict rather than
+  // spin: an engineer opens this screen precisely when things are wrong.
+  await page.getByTestId('mode-imaging').click()
+  await page.getByTestId('mode-status').click()
+  await page.getByTestId('status-refresh').click()
+
+  const card = page.getByTestId('status-card-connection')
+  await expect(card).toBeVisible({ timeout: 20_000 })
+  const state = await card.getAttribute('data-state')
+  const detail = await card.innerText()
+  console.log('[groundcrew] connection card =', state, '|', detail.replace(/\n/g, ' '))
+  expect(['ok', 'bad']).toContain(state)
+  if (state === 'bad') {
+    // The simulator's wedge. Naming the stuck call is the difference between a
+    // usable report and "something went wrong".
+    expect(detail).toMatch(/no response/)
+    await page.screenshot({ path: join(SHOTS, '05-status-unresponsive.png') })
+  }
+  ctx.assertNoJsErrors()
+})
+
+test('controls with nothing behind them are disabled, not hidden', async () => {
+  const { page } = ctx
+  // A control that vanishes reads as a missing feature; one that is greyed out
+  // reads as an unavailable reading, which is the truth. The simulator reports
+  // neither temperature nor camera position.
+  await expect(page.getByTestId('temp-btn')).toBeVisible()
+  await expect(page.getByTestId('temp-btn')).toBeDisabled()
+  await expect(page.getByTestId('retract-btn')).toBeVisible()
+  await expect(page.getByTestId('retract-btn')).toBeDisabled()
+  await expect(page.getByTestId('position-value')).toHaveText('—')
+})
+
+test('every mode in the rail opens', async () => {
+  const { page } = ctx
+  for (const mode of ['imaging', 'motion', 'calibrate', 'status']) {
+    await page.getByTestId(`mode-${mode}`).click()
+    await expect(page.getByTestId(`mode-${mode}`)).toHaveAttribute('data-active', 'true')
+  }
+  await page.getByTestId('mode-imaging').click()
   ctx.assertNoJsErrors()
 })

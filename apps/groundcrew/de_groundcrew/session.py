@@ -37,6 +37,7 @@ from de_shell.ipc import emit, emit_error, emit_status
 from de_shell.plotting.figure import FigureView
 from de_shell.session import SessionBase
 
+from de_groundcrew import status
 from de_groundcrew.instrument import Instrument
 from de_groundcrew.tile import DeapiTileBackend
 
@@ -47,14 +48,35 @@ log = logging.getLogger(__name__)
 #: them (see `test_the_simulator_lacks_most_status_properties`). Unsupported
 #: names come back None and the UI shows them as unavailable rather than
 #: inventing a value.
+#: How long the live loop waits for one display refresh before giving up on it.
+#: Generous — a cold read of a large frame over a slow link is legitimately
+#: seconds — but finite, so a wedged server stops the loop instead of leaving a
+#: thread parked forever.
+REFRESH_TIMEOUT_S = 15.0
+
+#: How long a status read may take before the board reports the camera as
+#: unresponsive instead of waiting. Short on purpose: an engineer opening this
+#: screen has usually done so BECAUSE something is wrong.
+STATUS_DEADLINE_S = 6.0
+
+#: A call already in flight for longer than this means the connection is stuck,
+#: so a new read would only queue behind it.
+STALL_S = 4.0
+
 HEADER_PROPS = (
+    # Acquisition — the instrument sidebar's editable fields.
     "Frames Per Second",
     "Exposure Time (seconds)",
+    "Frame Count",
+    "Binning X",
+    "Hardware Binning X",
     "Image Size X (pixels)",
     "Image Size Y (pixels)",
-    "Binning X",
+    "Autosave Directory",
+    # Hardware state — the top bar. Absent on the simulator, which is the
+    # point: the controls disable rather than vanish.
     "Temperature - Detector (Celsius)",
-    "Temperature - Detector Status",
+    "Temperature - Cool Down Setpoint (Celsius)",
     "Camera Position Status",
 )
 
@@ -139,6 +161,15 @@ class GroundCrewSession(SessionBase):
         finally:
             self._refresh_pending = False
 
+    def _refresh_and_signal(self, done: threading.Event) -> None:
+        """`_refresh`, then release the live loop. Signals even on failure —
+        a loop waiting on an event that a raised exception skipped would hang
+        until the timeout on every frame."""
+        try:
+            self._refresh()
+        finally:
+            done.set()
+
     def _apply_levels(self) -> None:
         """Track the display range to the scene, without flickering.
 
@@ -216,13 +247,32 @@ class GroundCrewSession(SessionBase):
             return
 
         while self._live.is_set():
-            self._dispatch_to_main(self._refresh)
-            time.sleep(0.05)
+            # Wait for each refresh to LAND before asking for another.
+            #
+            # Not politeness — correctness. `_refresh` runs on the main thread
+            # and blocks it for a whole server round trip, so posting on a
+            # fixed 50 ms tick enqueues work faster than it can be drained
+            # whenever the server is slower than the tick. The backlog outlives
+            # the acquisition: after Stop, the main loop is still working
+            # through queued refreshes and every other message — status reports,
+            # property reads — waits behind them. That is what it looked like,
+            # too: the status board sat on "Reading camera status…" but only
+            # when a live view had run first.
+            done = threading.Event()
+            self._dispatch_to_main(lambda ev=done: self._refresh_and_signal(ev))
+            if not done.wait(timeout=REFRESH_TIMEOUT_S):
+                log.warning("display refresh did not complete within %ss",
+                            REFRESH_TIMEOUT_S)
+                break
+            time.sleep(0.01)
 
-        try:
-            self.instrument.call(lambda c: c.stop_acquisition()).result(timeout=30)
-        except Exception as e:
-            log.debug("stop_acquisition failed: %s", e)
+        # Submitted, NOT waited on. The user asked for the live view to stop;
+        # that must happen whether or not the camera acknowledges. deapi's
+        # FakeServer never returns from this call at all — reproducible in
+        # three lines, and it takes the connection with it — so waiting here
+        # parks this thread forever and, because the connection has one owning
+        # thread, every later read queues behind it.
+        self.instrument.call_nowait(lambda c: c.stop_acquisition(), "stop_acquisition")
 
     def _act_stop(self, payload: dict) -> None:
         self._live.clear()
@@ -284,6 +334,66 @@ class GroundCrewSession(SessionBase):
     def _act_refresh_properties(self, payload: dict) -> None:
         self._emit_properties()
 
+    def _act_refresh_status(self, payload: dict) -> None:
+        """Read the status board's properties in ONE batch and judge them.
+
+        The read is batched because every name is a round trip on the single
+        connection; the judging is a pure function, so it is unit-tested
+        without a server.
+        """
+        # A board that spins forever is the worst outcome: the one moment an
+        # engineer needs it is when the camera has stopped answering. So the
+        # read is raced against a deadline, and whichever resolves first wins.
+        sent = threading.Event()
+
+        def _publish(values: dict, link: dict) -> None:
+            if sent.is_set():
+                return
+            sent.set()
+            report = status.build_report(values, link=link)
+            log.info("status: %s, %d of %d reporting", report["summary"]["overall"],
+                     report["summary"]["reporting"], report["summary"]["total"])
+            emit({"type": "status_report", **report})
+
+        stalled = self.instrument.pending()
+        if stalled and stalled[1] > STALL_S:
+            # Do not even queue the read — it would sit behind the stuck call.
+            # This verdict needs no device access, which is exactly why the
+            # board can still answer when nothing else can.
+            _publish({}, {"state": status.BAD,
+                          "detail": f"no response to {stalled[0]} for {stalled[1]:.0f}s"})
+            return
+
+        log.info("status: reading %d properties", len(status.STATUS_PROPS))
+        fut = self.instrument.properties(list(status.STATUS_PROPS))
+
+        def _on_read(f) -> None:
+            def _apply() -> None:
+                try:
+                    values = f.result()
+                except Exception as e:
+                    log.debug("status poll failed: %s", e)
+                    _publish({}, {"state": status.BAD, "detail": f"read failed: {e}"})
+                    return
+                _publish(values, {"state": status.OK, "detail": "responding"})
+            self._dispatch_to_main(_apply)
+
+        def _on_deadline() -> None:
+            def _apply() -> None:
+                p = self.instrument.pending()
+                where = f" (waiting on {p[0]})" if p else ""
+                _publish({}, {"state": status.BAD,
+                              "detail": f"no response within {STATUS_DEADLINE_S:.0f}s{where}"})
+            self._dispatch_to_main(_apply)
+
+        fut.add_done_callback(_on_read)
+        # A one-shot timer rather than a polling thread: this fires only while a
+        # status read is outstanding, and is cancelled the moment one lands.
+        timer = threading.Timer(STATUS_DEADLINE_S, _on_deadline)
+        timer.daemon = True
+        timer.start()
+        fut.add_done_callback(lambda _f: timer.cancel())
+
     def _act_set_colormap(self, payload: dict) -> None:
         self._viewer.set_colormap(str(payload.get("name", "gray")))
 
@@ -326,5 +436,6 @@ _ACTIONS = {
     "single_acquisition": GroundCrewSession._act_single,
     "set_property": GroundCrewSession._act_set_property,
     "refresh_properties": GroundCrewSession._act_refresh_properties,
+    "refresh_status": GroundCrewSession._act_refresh_status,
     "set_colormap": GroundCrewSession._act_set_colormap,
 }

@@ -108,6 +108,8 @@ class Instrument:
         self._io = ThreadPoolExecutor(max_workers=1, thread_name_prefix="de-io")
         self._io_thread_id: int | None = None
         self._prop_names: set | None = None
+        #: (label, started_at) for the call currently on the io thread.
+        self._pending: tuple[str, float] | None = None
         self._io.submit(self._mark_thread).result(timeout=10)
 
     def _mark_thread(self) -> None:
@@ -193,7 +195,7 @@ class Instrument:
 
     # ── Submitting work ───────────────────────────────────────────────────────
 
-    def call(self, fn: Callable[[Any], Any]) -> Future:
+    def call(self, fn: Callable[[Any], Any], *, label: str = "") -> Future:
         """Run ``fn(client)`` on the io thread. Returns a Future.
 
         Calling from the io thread itself runs INLINE and returns a completed
@@ -212,7 +214,47 @@ class Instrument:
             except Exception as e:
                 fut.set_exception(e)
             return fut
-        return self._io.submit(lambda: fn(self.client))
+        return self._io.submit(self._run, fn, label or getattr(fn, "__name__", "call"))
+
+    def _run(self, fn: Callable[[Any], Any], label: str) -> Any:
+        """Run one call, recording that it is in flight.
+
+        The record is what lets the rest of the app tell "the camera is slow"
+        from "the camera has stopped answering". It is not a nicety: this is a
+        single connection owned by a single thread, so ONE call that never
+        returns silently freezes every other feature — and a device call that
+        never returns is a real thing. deapi's own `FakeServer` does it on
+        `stop_acquisition`, which reproduces in three lines and takes the
+        connection with it.
+        """
+        self._pending = (label, time.monotonic())
+        try:
+            return fn(self.client)
+        finally:
+            self._pending = None
+
+    def pending(self) -> tuple[str, float] | None:
+        """``(label, seconds_in_flight)`` for the call in flight, or None.
+
+        Safe to read from any thread: the field is only ever rebound, never
+        mutated, so a reader sees either the old tuple or the new one.
+        """
+        p = self._pending
+        if p is None:
+            return None
+        return p[0], time.monotonic() - p[1]
+
+    def call_nowait(self, fn: Callable[[Any], Any], label: str = "") -> None:
+        """Submit and do not wait, swallowing the result.
+
+        For a command whose completion the UI must not depend on — Stop being
+        the one that matters. The user asked for the live view to stop; that
+        must happen whether or not the camera acknowledges.
+        """
+        try:
+            self.call(fn, label=label).add_done_callback(lambda f: f.exception())
+        except Exception as e:
+            log.debug("submitting %s failed: %s", label, e)
 
     def get(self, prop: str) -> Future:
         return self.call(lambda c: c[prop])
