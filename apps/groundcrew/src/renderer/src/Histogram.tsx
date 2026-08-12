@@ -77,8 +77,13 @@ export function Histogram({ counts, lo, hi, vmin, vmax, clipped, onClim, onAuto,
     if (!drag) return
     const move = (e: PointerEvent) => {
       const rect = svgRef.current?.getBoundingClientRect()
-      if (!rect) return
-      const v = vOf(e.clientX - rect.left)
+      if (!rect || !rect.width) return
+      // Rescale CSS pixels into viewBox units. SpyDE's copy renders at a fixed
+      // `width={W}`, so the two coincide and it maps the offset directly; this
+      // one is `width: 100%` in a narrower panel, and dropping the scale made
+      // every drag land at the wrong value — far enough left that the handle
+      // appeared not to move at all.
+      const v = vOf((e.clientX - rect.left) * (W / rect.width))
       if (drag === 'min') onClim(Math.min(v, vmax), vmax)
       else onClim(vmin, Math.max(v, vmin))
     }

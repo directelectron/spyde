@@ -171,42 +171,50 @@ is also a legitimate value for a boolean property, no amount of value
 inspection can tell "unsupported" from "switched off". Unknown names are
 therefore resolved against `list_properties()`.
 
-## 12. `stop_acquisition()` never returns on the FakeServer — and it kills the connection
+## 12. `stop_acquisition()` is out-of-band UDP — do not put it on the io thread
 
-Reproducible 4/4, in every case tried:
+**An earlier version of this section was wrong** and is corrected here. It
+claimed `stop_acquisition()` "kills the connection". It does not. The owner
+pushed back — *"it's fundamentally the same as the live acquisition, you're
+doing something wrong which is killing the client, that shouldn't really even
+be possible"* — and was right.
 
-| Sequence | Result |
-|---|---|
-| `stop_acquisition()` with no acquisition running | never returns |
-| `start_acquisition(1)` → wait for completion → `stop` | never returns |
-| `start_acquisition(0)` → `stop` | never returns |
-| `start_acquisition(1000)` → `stop` | never returns |
+What the call actually does:
 
-In all four the connection is **dead afterwards**: every later call times out.
-Repro is ~10 lines — connect to `FakeServer`, call `stop_acquisition()`.
+```python
+sock = socket.socket(AF_INET, SOCK_DGRAM)      # UDP — not the client socket
+sock.sendto(b"PyClientStopAcq", (host, port))
+respond = sock.recv(32)                        # no timeout
+```
 
-This matters beyond the simulator, because it is the failure mode the whole
-connection design is most exposed to: **one connection, one owning thread, so a
-single call that never returns freezes every feature at once.** It presented as
-"the status board spins forever", with nothing in the log after
-`status: reading 19 properties`.
+It never touches the TCP client. deapi's own docstring says it may be called
+from another thread while `get_result` blocks — being out-of-band is the point.
 
-Two changes came out of it, both correct on real hardware too:
+So there are two separate facts, and the earlier note conflated them:
 
-- **Stop does not wait.** `Instrument.call_nowait` submits `stop_acquisition`
-  and returns. The user asked for the live view to stop; that must happen
-  whether or not the camera acknowledges.
-- **The board reports an unresponsive camera instead of waiting for one.**
-  `Instrument.pending()` exposes `(label, seconds_in_flight)`, and the status
-  read is raced against a 6 s deadline. If the camera has stopped answering,
-  the board says so and names the stuck call — "no response within 6s (waiting
-  on stop_acquisition)" — which is exactly what an engineer needs. The
-  Connection card needs no device access, which is why it can still answer when
-  nothing else can.
+1. **A real (small) deapi issue.** That `recv` has no timeout, so if nothing
+   answers the datagram the call never returns. `FakeServer` listens only on
+   TCP, so on the simulator it never returns, always. Real hardware answers.
+2. **My bug, which caused everything that looked serious.** Routing it through
+   the connection's single owning thread parked the one thread every other
+   feature needed. That is what produced "the status board spins forever".
 
-This is also the strongest argument yet for the **two-connection** design in §1:
-a wedged read/write connection would not have taken status polling down with
-it. Still blocked on `FakeServer` accepting only one connection.
+**The connection was healthy throughout.** With the stop blocked on its own
+thread, property reads and a full `start_acquisition(1)` → `get_result` cycle
+both still succeed — `TestStopIsOutOfBand` asserts exactly that, so the mistake
+cannot come back.
+
+`Instrument.stop_acquisition()` now runs it on a short-lived daemon thread,
+with one outstanding at a time (they are idempotent, and spawning more threads
+to park on an unanswered `recv` achieves nothing).
+
+The stall watchdog from the earlier pass is **kept, with its rationale
+corrected**: it was written for a failure I had caused, but a device call that
+genuinely hangs is still possible, and a status board that reports "no response
+within 6s" beats one that spins. It is ~30 lines and independently tested.
+
+This remains an argument for the **two-connection** design in §1, though a
+weaker one than claimed: the reads were never actually blocked by the server.
 
 ## 13. A separate bug this masked: the live loop out-ran the main thread
 

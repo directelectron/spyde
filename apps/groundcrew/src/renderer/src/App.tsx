@@ -77,6 +77,10 @@ type ModeKey = typeof MODES[number]['key']
 
 const COLORMAPS = ['gray', 'viridis', 'plasma', 'inferno', 'magma', 'cividis']
 
+/** Which kind of acquisition is running, if any. A single exposure can be a
+ *  60-second integration, so it needs a way out just as much as a live view. */
+type AcqMode = 'live' | 'single' | null
+
 /** Properties the instrument sidebar reads and writes. */
 const P = {
   fps: 'Frames Per Second',
@@ -102,6 +106,7 @@ interface AppState extends ShellState {
   figure: FigureMessage | null
   stats: FrameStats | null
   running: boolean
+  acqMode: AcqMode
   colormap: string
   connection: Connection | null
   props: Record<string, unknown>
@@ -116,7 +121,7 @@ type AppAction =
   | ShellAction
   | { type: 'FIGURE'; figure: FigureMessage }
   | { type: 'FRAME_STATS'; stats: FrameStats }
-  | { type: 'ACQ_STATE'; running: boolean }
+  | { type: 'ACQ_STATE'; running: boolean; mode: AcqMode }
   | { type: 'COLORMAP'; name: string }
   | { type: 'CONNECTION'; connection: Connection }
   | { type: 'PROPERTIES'; values: Record<string, unknown> }
@@ -127,7 +132,8 @@ function appReducer(state: AppState, action: AppAction): AppState {
   switch (action.type) {
     case 'FIGURE': return { ...state, figure: action.figure }
     case 'FRAME_STATS': return { ...state, stats: action.stats }
-    case 'ACQ_STATE': return { ...state, running: action.running }
+    case 'ACQ_STATE':
+      return { ...state, running: action.running, acqMode: action.mode }
     case 'COLORMAP': return { ...state, colormap: action.name }
     case 'CONNECTION': return { ...state, connection: action.connection }
     // Merge rather than replace: different callers poll different subsets, and
@@ -143,7 +149,7 @@ function appReducer(state: AppState, action: AppAction): AppState {
 
 const initialState: AppState = {
   ...shellInitialState,
-  figure: null, stats: null, running: false, colormap: 'gray',
+  figure: null, stats: null, running: false, acqMode: null, colormap: 'gray',
   connection: null, props: {}, statusCards: [], statusSummary: null, error: null,
 }
 
@@ -154,7 +160,7 @@ export function App() {
   const [mode, setMode] = useState<ModeKey>('imaging')
   const [logOpen, setLogOpen] = useState(false)
   const bridge = useFigureBridge()
-  const { figure, stats, running, colormap, error, status, logEntries,
+  const { figure, stats, running, acqMode, colormap, error, status, logEntries,
           connection, props, statusCards, statusSummary } = state
 
   // The two side panels belong to an IMAGE. Status is a board about the
@@ -185,7 +191,10 @@ export function App() {
         case 'frame_stats':
           dispatch({ type: 'FRAME_STATS', stats: msg as unknown as FrameStats }); break
         case 'acq_state':
-          dispatch({ type: 'ACQ_STATE', running: Boolean(msg.running) }); break
+          dispatch({
+            type: 'ACQ_STATE', running: Boolean(msg.running),
+            mode: (msg.mode ?? null) as AcqMode,
+          }); break
         case 'connection':
           dispatch({ type: 'CONNECTION', connection: msg as unknown as Connection }); break
         case 'properties':
@@ -246,6 +255,7 @@ export function App() {
           <div style={S.pane}>
             {mode === 'imaging' && (
               <ImagingMode figure={figure} bridge={bridge} running={running}
+                acqMode={acqMode}
                 onStart={() => act('start_acquisition')}
                 onStop={() => act('stop_acquisition')}
                 onSingle={() => act('single_acquisition')} />
@@ -503,9 +513,10 @@ function InstrumentPanel({ props, connection, onSet, onRefresh }: {
 
 // ── Imaging ───────────────────────────────────────────────────────────────────
 
-function ImagingMode({ figure, bridge, running, onStart, onStop, onSingle }: {
+function ImagingMode({ figure, bridge, running, acqMode, onStart, onStop, onSingle }: {
   figure: FigureMessage | null; bridge: ReturnType<typeof useFigureBridge>
-  running: boolean; onStart: () => void; onStop: () => void; onSingle: () => void
+  running: boolean; acqMode: AcqMode
+  onStart: () => void; onStop: () => void; onSingle: () => void
 }) {
   const onResize = useCallback((w: number, h: number) => {
     if (figure) window.groundcrew?.resizeFigure(figure.fig_id, w, h)
@@ -515,14 +526,22 @@ function ImagingMode({ figure, bridge, running, onStart, onStop, onSingle }: {
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
       <div style={S.paneBar}>
         <Btn onClick={onStart} disabled={running} tone="go" testId="start-btn"
-          active={running}>▶ Live</Btn>
-        <Btn onClick={onStop} disabled={!running} testId="stop-btn">■ Stop</Btn>
+          active={acqMode === 'live'}>▶ Live</Btn>
+        {/* Stop ends EITHER. A single exposure can be a long integration, so
+            it needs a way out just as much as a live view — and to the camera
+            it is the same command. */}
+        <Btn onClick={onStop} disabled={!running} testId="stop-btn"
+          title={acqMode === 'single' ? 'Stop this exposure'
+               : acqMode === 'live' ? 'Stop the live view'
+               : 'Nothing is running'}>■ Stop</Btn>
         <Btn onClick={onSingle} disabled={running} testId="single-btn"
-          title={running ? 'Stop the live view first' : 'Take one exposure'}>
+          active={acqMode === 'single'}
+          title={running ? 'An acquisition is already running' : 'Take one exposure'}>
           ◉ Single
         </Btn>
         <span style={{ flex: 1 }} />
-        {running && <Pill state="ok">LIVE</Pill>}
+        {acqMode === 'live' && <Pill state="ok">LIVE</Pill>}
+        {acqMode === 'single' && <Pill state="warn">EXPOSING</Pill>}
       </div>
 
       {!figure ? (
@@ -556,16 +575,26 @@ function PlotControl({ stats, colormap, onColormap, onClim, onAuto, onReset }: {
   stats: FrameStats | null; colormap: string; onColormap: (n: string) => void
   onClim: (lo: number, hi: number) => void; onAuto: () => void; onReset: () => void
 }) {
+  // While dragging, the handles must follow the POINTER, not the last frame.
+  // Statistics only arrive on a refresh — and a stopped camera never refreshes
+  // — so waiting for the backend to echo the new range would leave the handle
+  // pinned under the cursor doing nothing. The override holds until Auto or
+  // Reset hands the range back.
+  const [override, setOverride] = React.useState<[number, number] | null>(null)
   const ready = stats && stats.bins?.length && stats.min != null && stats.max != null
+  const levels = override ?? stats?.levels ?? null
+
   return (
     <aside style={S.plotControl} data-testid="plot-control">
       <Section title="Histogram">
         {ready
           ? <Histogram
               counts={stats.bins!} lo={stats.min!} hi={stats.max!}
-              vmin={stats.levels?.[0] ?? stats.min!}
-              vmax={stats.levels?.[1] ?? stats.max!}
-              onClim={onClim} onAuto={onAuto} onReset={onReset} />
+              vmin={levels?.[0] ?? stats.min!}
+              vmax={levels?.[1] ?? stats.max!}
+              onClim={(lo, hi) => { setOverride([lo, hi]); onClim(lo, hi) }}
+              onAuto={() => { setOverride(null); onAuto() }}
+              onReset={() => { setOverride(null); onReset() }} />
           : <div data-testid="histogram-empty"
               style={{ fontSize: 11.5, color: C.textMuted }}>—</div>}
       </Section>

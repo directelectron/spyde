@@ -113,6 +113,9 @@ class GroundCrewSession(SessionBase):
         self.register_window_controller(self._viewer.window_id, self._viewer)
 
         self._live = threading.Event()
+        #: A single exposure in flight. Separate from `_live` so Stop can end
+        #: either, and so the UI can say which is running.
+        self._single = threading.Event()
         self._live_thread: threading.Thread | None = None
         self._refresh_pending = False
         self._levels: tuple[float, float] | None = None
@@ -224,7 +227,15 @@ class GroundCrewSession(SessionBase):
         """
         if self.tiles is None or not self.tiles.last_stats:
             return
-        emit({"type": "frame_stats", **self.tiles.last_stats})
+        stats = dict(self.tiles.last_stats)
+        # Report the range that is actually APPLIED. `last_stats["levels"]` is
+        # the histogram's robust range, which is only the display range while
+        # the range is automatic — once someone has set one by hand, echoing
+        # the auto value would snap the histogram handles back under them on
+        # the next frame.
+        if self._levels is not None:
+            stats["levels"] = list(self._levels)
+        emit({"type": "frame_stats", **stats})
 
     def _emit_properties(self) -> None:
         fut = self.instrument.properties(list(HEADER_PROPS))
@@ -288,27 +299,38 @@ class GroundCrewSession(SessionBase):
                 break
             time.sleep(0.01)
 
-        # Submitted, NOT waited on. The user asked for the live view to stop;
-        # that must happen whether or not the camera acknowledges. deapi's
-        # FakeServer never returns from this call at all — reproducible in
-        # three lines, and it takes the connection with it — so waiting here
-        # parks this thread forever and, because the connection has one owning
-        # thread, every later read queues behind it.
-        self.instrument.call_nowait(lambda c: c.stop_acquisition(), "stop_acquisition")
+        # Out-of-band UDP, off the io thread — see Instrument.stop_acquisition.
+        self.instrument.stop_acquisition()
 
     def _act_stop(self, payload: dict) -> None:
+        """Stop whichever acquisition is running — live OR single.
+
+        A single exposure can be long (a 60 s integration is ordinary), so it
+        needs a way out just as much as a live view does. Both stop the same
+        way, because it IS the same thing to the camera: one out-of-band UDP
+        command. The only difference is which local loop notices.
+        """
+        if not (self._live.is_set() or self._single.is_set()):
+            return
         self._live.clear()
+        self._single.clear()
+        self.instrument.stop_acquisition()
         emit_status("Stopped")
         self._emit_acq_state()
 
     def _act_single(self, payload: dict) -> None:
         """One exposure, off the main thread so a long one cannot freeze the UI."""
-        if self._live.is_set():
-            emit_status("Stop the live view before a single acquisition")
+        if self._live.is_set() or self._single.is_set():
+            emit_status("An acquisition is already running")
             return
+
+        self._single.set()
+        self._emit_acq_state()
 
         def _done(fut) -> None:
             def _apply() -> None:
+                self._single.clear()
+                self._emit_acq_state()
                 try:
                     fut.result()
                 except Exception as e:
@@ -320,11 +342,15 @@ class GroundCrewSession(SessionBase):
 
         def _grab(c) -> None:
             c.start_acquisition(1)
-            while c.acquiring:
+            # Watch the STOP FLAG as well as the camera. `stop_acquisition` is
+            # a UDP command whose reply the simulator never sends, so waiting
+            # only on `c.acquiring` would leave this loop spinning on a server
+            # that never noticed — and this loop holds the io thread.
+            while c.acquiring and self._single.is_set():
                 time.sleep(0.01)
 
         emit_status("Acquiring one frame…")
-        self.instrument.call(_grab).add_done_callback(_done)
+        self.instrument.call(_grab, label="single_acquisition").add_done_callback(_done)
 
     # ── Property writes ───────────────────────────────────────────────────────
 
@@ -447,7 +473,9 @@ class GroundCrewSession(SessionBase):
         emit_status("Display range: auto")
 
     def _emit_acq_state(self) -> None:
-        emit({"type": "acq_state", "running": self._live.is_set()})
+        live, single = self._live.is_set(), self._single.is_set()
+        emit({"type": "acq_state", "running": live or single,
+              "mode": "live" if live else "single" if single else None})
 
     # ── Actions ───────────────────────────────────────────────────────────────
 

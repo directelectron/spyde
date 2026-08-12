@@ -138,6 +138,60 @@ class TestConnection:
         inst.close()
 
 
+class TestStopIsOutOfBand:
+    """`stop_acquisition` must never occupy the io thread.
+
+    It does not touch the TCP client at all — it opens its own UDP socket,
+    sends ``PyClientStopAcq`` and blocks on an untimed `recv`. deapi's own
+    docstring says it may be called from another thread while `get_result`
+    blocks; that is the point of it being out-of-band.
+
+    Routing it through the connection's single owning thread was a real bug and
+    looked exactly like a dead client: the `FakeServer` answers only TCP, so
+    that `recv` never returns, and every later read queued behind it. The
+    connection was fine the whole time, which is what these tests assert.
+    """
+
+    def test_a_stop_does_not_block_later_reads(self, instrument):
+        instrument.stop_acquisition()
+        # The stop is parked on an unanswered UDP recv right now. If it were on
+        # the io thread this would time out.
+        for _ in range(3):
+            assert float(instrument.get("Frames Per Second").result(timeout=10)) > 0
+
+    def test_a_stop_does_not_block_a_later_acquisition(self, instrument):
+        instrument.stop_acquisition()
+
+        def _go(c):
+            c.start_acquisition(1)
+            while c.acquiring:
+                time.sleep(0.02)
+            return True
+
+        assert instrument.call(_go).result(timeout=60) is True
+
+    def test_a_stop_never_occupies_the_io_thread(self, instrument):
+        instrument.stop_acquisition()
+        time.sleep(0.3)
+        p = instrument.pending()
+        assert p is None or "stop" not in p[0], (
+            f"stop_acquisition is on the io thread as {p!r} — it must not be")
+
+    def test_repeated_stops_do_not_pile_up_threads(self, instrument):
+        # Each parked stop is a thread that never returns on this server, and
+        # they are idempotent, so one outstanding is enough.
+        before = threading.active_count()
+        for _ in range(10):
+            instrument.stop_acquisition()
+        time.sleep(0.3)
+        assert threading.active_count() - before <= 2
+
+    def test_stop_after_close_is_a_no_op(self):
+        inst = Instrument(port=_free_port())
+        inst.close()
+        inst.stop_acquisition()      # must not raise, must not spawn
+
+
 class TestStallDetection:
     """Telling "the camera is slow" from "the camera has stopped answering".
 

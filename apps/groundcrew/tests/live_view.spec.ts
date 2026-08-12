@@ -275,8 +275,50 @@ test('the histogram is SpyDE\'s, with working contrast handles', async () => {
     Number(await page.getByTestId('clim-max').innerText()), { timeout: 15_000 })
     .toBeGreaterThanOrEqual(Number(before))
 
-  await page.getByTestId('clim-auto').click()
+  // ACTUALLY DRAG. Asserting the handle exists is not enough — it did, and it
+  // still did not move: the SVG is `width: 100%` here where SpyDE's is a fixed
+  // pixel width, so the pointer offset had to be rescaled into viewBox units
+  // and was not. Every drag mapped to the wrong value.
+  const climMin = page.getByTestId('clim-min')
+  const start = Number(await climMin.innerText())
+  const box = (await page.getByTestId('histogram').boundingBox())!
+  const y = box.y + box.height / 2
+
+  await page.mouse.move(box.x + 4, y)          // arm the hover affordance
+  await page.mouse.down()
+  await page.mouse.move(box.x + box.width * 0.45, y, { steps: 12 })
+  await page.mouse.up()
+
+  await expect.poll(async () => Number(await climMin.innerText()), { timeout: 10_000 })
+    .toBeGreaterThan(start)
+  console.log('[groundcrew] clim-min dragged', start, '->',
+    await climMin.innerText())
+
   await page.screenshot({ path: join(SHOTS, '06-histogram.png') })
+  await page.getByTestId('clim-auto').click()
+  ctx.assertNoJsErrors()
+})
+
+test('a single exposure can be stopped', async () => {
+  const { page } = ctx
+  await page.getByTestId('mode-imaging').click()
+
+  // A single exposure can be a long integration, so Stop must reach it too —
+  // and to the camera it is the same out-of-band command as stopping a live
+  // view. Slow the exposure right down so there is something to interrupt.
+  await page.getByTestId('field-fps').fill('1')
+  await page.getByTestId('field-fps').press('Enter')
+  await page.getByTestId('field-exposure').fill('30')
+  await page.getByTestId('field-exposure').press('Enter')
+
+  await page.getByTestId('single-btn').click()
+  // Stop must become live WHILE the single exposure runs.
+  await expect(page.getByTestId('stop-btn')).toBeEnabled({ timeout: 15_000 })
+  await page.getByTestId('stop-btn').click()
+
+  // And the app must come back to idle rather than sitting on a dead button.
+  await expect(page.getByTestId('single-btn')).toBeEnabled({ timeout: 30_000 })
+  await expect(page.getByTestId('stop-btn')).toBeDisabled()
   ctx.assertNoJsErrors()
 })
 

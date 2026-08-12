@@ -133,6 +133,8 @@ class Instrument:
         self._prop_names: set | None = None
         #: (label, started_at) for the call currently on the io thread.
         self._pending: tuple[str, float] | None = None
+        #: One outstanding out-of-band stop at a time (see `stop_acquisition`).
+        self._stopping = threading.Event()
         self._io.submit(self._mark_thread).result(timeout=10)
 
     def _mark_thread(self) -> None:
@@ -250,12 +252,15 @@ class Instrument:
         """Run one call, recording that it is in flight.
 
         The record is what lets the rest of the app tell "the camera is slow"
-        from "the camera has stopped answering". It is not a nicety: this is a
-        single connection owned by a single thread, so ONE call that never
-        returns silently freezes every other feature — and a device call that
-        never returns is a real thing. deapi's own `FakeServer` does it on
-        `stop_acquisition`, which reproduces in three lines and takes the
-        connection with it.
+        from "the camera has stopped answering". This is a single connection
+        owned by a single thread, so ONE call that never returns freezes every
+        other feature, and the status board is the one screen that must still
+        answer when that happens.
+
+        (It was written for a hang I had caused myself by putting
+        :meth:`stop_acquisition` on this thread — see that method. It is kept
+        because a device call that genuinely hangs is still possible, not
+        because that original case survives.)
         """
         self._pending = (label, time.monotonic())
         try:
@@ -273,6 +278,46 @@ class Instrument:
         if p is None:
             return None
         return p[0], time.monotonic() - p[1]
+
+    def stop_acquisition(self) -> None:
+        """Send the acquisition-stop command. **Never on the io thread.**
+
+        `stop_acquisition` does not touch the TCP client socket at all — it
+        opens its OWN UDP socket, sends ``PyClientStopAcq`` and waits for a
+        reply:
+
+            sock = socket.socket(AF_INET, SOCK_DGRAM)
+            sock.sendto(b"PyClientStopAcq", (host, port))
+            respond = sock.recv(32)          # no timeout
+
+        So it needs no serialising, and deapi's own docstring says it may be
+        called from another thread while `get_result` blocks — that is the
+        point of it being out-of-band.
+
+        Putting it on the io thread was a mistake that cost a day. That `recv`
+        has no timeout, and deapi's `FakeServer` answers only TCP, so the call
+        never returns there — and because the io thread owns the connection,
+        one parked stop made every later read queue behind it. The connection
+        was fine throughout: with the stop blocked on its own thread, property
+        reads and a full acquisition both still succeed.
+
+        At most one stop is outstanding: they are idempotent, and if one is
+        already parked on an unanswered `recv`, spawning more threads that will
+        also never return achieves nothing.
+        """
+        if self._closed or self.client is None or self._stopping.is_set():
+            return
+        self._stopping.set()
+
+        def _send() -> None:
+            try:
+                self.client.stop_acquisition()
+            except Exception as e:
+                log.debug("stop_acquisition failed: %s", e)
+            finally:
+                self._stopping.clear()
+
+        threading.Thread(target=_send, daemon=True, name="de-stop").start()
 
     def call_nowait(self, fn: Callable[[Any], Any], label: str = "") -> None:
         """Submit and do not wait, swallowing the result.
