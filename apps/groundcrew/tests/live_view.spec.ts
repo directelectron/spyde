@@ -236,6 +236,50 @@ test('controls with nothing behind them are disabled, not hidden', async () => {
   await expect(page.getByTestId('link-state')).toHaveText('Ready')
 })
 
+test('the image side panels are absent on the Status board', async () => {
+  const { page } = ctx
+
+  // Both panels belong to an IMAGE. On Status they would crowd the cards and
+  // imply the board is a view of the current frame, which it is not.
+  await page.getByTestId('mode-imaging').click()
+  await expect(page.getByTestId('plot-control')).toBeVisible()
+  await expect(page.getByTestId('control-panel')).toBeVisible()
+
+  await page.getByTestId('mode-status').click()
+  await expect(page.getByTestId('plot-control')).toHaveCount(0)
+  await expect(page.getByTestId('control-panel')).toHaveCount(0)
+
+  await page.getByTestId('mode-imaging').click()
+  await expect(page.getByTestId('plot-control')).toBeVisible()
+})
+
+test('the histogram is SpyDE\'s, with working contrast handles', async () => {
+  const { page } = ctx
+  await page.getByTestId('mode-imaging').click()
+
+  // Drawn from real counts, not a placeholder strip.
+  const hist = page.getByTestId('histogram')
+  await expect(hist).toBeVisible({ timeout: 30_000 })
+  expect(await hist.locator('rect').count(),
+    'expected one rect per histogram bin').toBeGreaterThan(10)
+
+  // Both drag handles present, and the clim labels reading real numbers.
+  await expect(page.getByTestId('hist-min-handle')).toBeAttached()
+  await expect(page.getByTestId('hist-max-handle')).toBeAttached()
+  const before = await page.getByTestId('clim-max').innerText()
+  expect(Number(before)).toBeGreaterThan(0)
+
+  // Reset widens to the full data range, so the upper clim must not shrink.
+  await page.getByTestId('clim-reset').click()
+  await expect.poll(async () =>
+    Number(await page.getByTestId('clim-max').innerText()), { timeout: 15_000 })
+    .toBeGreaterThanOrEqual(Number(before))
+
+  await page.getByTestId('clim-auto').click()
+  await page.screenshot({ path: join(SHOTS, '06-histogram.png') })
+  ctx.assertNoJsErrors()
+})
+
 test('every mode in the rail opens', async () => {
   const { page } = ctx
   for (const mode of ['imaging', 'motion', 'calibrate', 'status']) {

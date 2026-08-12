@@ -16,9 +16,11 @@
  *     │ status bar                                       Log │
  *     └──────────────────────────────────────────────────────┘
  *
- * The rail carries the four things this app does. The instrument sidebar and
- * the plot control persist across modes, because camera state is context for
- * all of them and the histogram belongs to whatever image is on screen.
+ * The rail carries the four things this app does. Both side panels belong to
+ * an IMAGE — acquisition settings and the contrast of what is on screen — so
+ * they persist across the modes that HAVE one and are dropped in Status, which
+ * is a full-width board about the camera. Leaving them up there would crowd
+ * the cards and imply the board is a view of the current frame.
  *
  * Everything here is app UI. The pieces that clearly want to be shared — the
  * message reducer, the figure iframe host, the log panel, the status bar — are
@@ -34,6 +36,7 @@ import { C, FONT_MONO, stateOf } from './theme'
 import {
   Btn, Field, FieldPair, NotBuilt, Pill, Section, SegBtn, Segmented, Select,
 } from './ui'
+import { Histogram } from './Histogram'
 import { StatusMode } from './modes/Status'
 import type { StatusCard, StatusSummary } from './modes/Status'
 import { CalibrateMode, MotionMode } from './modes/Other'
@@ -154,6 +157,10 @@ export function App() {
   const { figure, stats, running, colormap, error, status, logEntries,
           connection, props, statusCards, statusSummary } = state
 
+  // The two side panels belong to an IMAGE. Status is a board about the
+  // camera, so they are not merely empty there — they would be misleading.
+  const showPanels = mode !== 'status'
+
   useEffect(() => {
     // Returns a disposer — see the preload's note on StrictMode double-invoke.
     const dispose = window.groundcrew?.onMessage((raw) => {
@@ -226,8 +233,14 @@ export function App() {
 
       <div style={S.body}>
         <ModeRail mode={mode} onMode={setMode} summary={statusSummary} />
-        <InstrumentPanel props={props} connection={connection} onSet={setProp}
-          onRefresh={() => act('refresh_properties')} />
+        {/* Status is a full-width board about the CAMERA, not about an image:
+            the acquisition sidebar and the plot control have nothing to act on
+            there, and leaving them up both crowds the cards and implies the
+            board is a view of the current frame. */}
+        {showPanels && (
+          <InstrumentPanel props={props} connection={connection} onSet={setProp}
+            onRefresh={() => act('refresh_properties')} />
+        )}
 
         <main style={S.center}>
           <div style={S.pane}>
@@ -247,10 +260,21 @@ export function App() {
           {mode === 'imaging' && <StatsStrip stats={stats} />}
         </main>
 
-        <PlotControl stats={stats} colormap={colormap}
-          onColormap={(name) => { dispatch({ type: "COLORMAP", name }); act("set_colormap", { name }) }}
-          onClim={(low, high) => act("set_clim", { low, high })}
-          onAuto={() => act("auto_clim")} />
+        {showPanels && (
+          <PlotControl stats={stats} colormap={colormap}
+            onColormap={(name) => {
+              dispatch({ type: 'COLORMAP', name }); act('set_colormap', { name })
+            }}
+            onClim={(low, high) => act('set_clim', { low, high })}
+            onAuto={() => act('auto_clim')}
+            onReset={() => {
+              // Reset means the FULL data range, tail included — the same
+              // contract as SpyDE's. Auto is the robust 2–98%.
+              if (stats?.min != null && stats?.max != null) {
+                act('set_clim', { low: stats.min, high: stats.max })
+              }
+            }} />
+        )}
       </div>
 
       {logOpen && <LogPanel logs={logEntries} onClose={() => setLogOpen(false)} />}
@@ -528,34 +552,22 @@ function ImagingMode({ figure, bridge, running, onStart, onStop, onSingle }: {
  * so it describes the WHOLE frame — it does not shift as you pan a zoomed
  * image, which is the failure of computing it from what is on screen.
  */
-function PlotControl({ stats, colormap, onColormap, onClim, onAuto }: {
+function PlotControl({ stats, colormap, onColormap, onClim, onAuto, onReset }: {
   stats: FrameStats | null; colormap: string; onColormap: (n: string) => void
-  onClim: (lo: number, hi: number) => void; onAuto: () => void
+  onClim: (lo: number, hi: number) => void; onAuto: () => void; onReset: () => void
 }) {
-  const lo = stats?.levels?.[0] ?? null
-  const hi = stats?.levels?.[1] ?? null
-  const commit = (which: 0 | 1) => (raw: string) => {
-    const v = Number(raw)
-    if (!Number.isFinite(v) || lo == null || hi == null) return
-    onClim(which === 0 ? v : lo, which === 0 ? hi : v)
-  }
-
+  const ready = stats && stats.bins?.length && stats.min != null && stats.max != null
   return (
     <aside style={S.plotControl} data-testid="plot-control">
       <Section title="Histogram">
-        <Histogram stats={stats} />
-        <div style={{ display: 'flex', gap: 6, marginTop: 7 }}>
-          <Btn wide onClick={onAuto} testId="clim-auto"
-            title="Re-derive the display range from the current frame">Auto</Btn>
-        </div>
-        <div style={{ marginTop: 7 }}>
-          <FieldPair>
-            <Field label="Min" value={lo == null ? null : Number(lo.toPrecision(6))}
-              testId="clim-min" onCommit={lo == null ? undefined : commit(0)} />
-            <Field label="Max" value={hi == null ? null : Number(hi.toPrecision(6))}
-              testId="clim-max" onCommit={hi == null ? undefined : commit(1)} />
-          </FieldPair>
-        </div>
+        {ready
+          ? <Histogram
+              counts={stats.bins!} lo={stats.min!} hi={stats.max!}
+              vmin={stats.levels?.[0] ?? stats.min!}
+              vmax={stats.levels?.[1] ?? stats.max!}
+              onClim={onClim} onAuto={onAuto} onReset={onReset} />
+          : <div data-testid="histogram-empty"
+              style={{ fontSize: 11.5, color: C.textMuted }}>—</div>}
       </Section>
 
       <Section title="Colormap">
@@ -573,53 +585,6 @@ function PlotControl({ stats, colormap, onColormap, onClim, onAuto }: {
   )
 }
 
-/**
- * A minimal range strip.
- *
- * NOT the binned histogram: the backend has the counts, but sending 256 bins
- * on every frame of a live view is bandwidth spent on a decoration. This shows
- * where the display range sits inside the data range, which is the question
- * the control actually answers — "am I clipping?". The full histogram belongs
- * here once there is an interaction that needs it.
- */
-function Histogram({ stats }: { stats: FrameStats | null }) {
-  if (!stats || stats.min == null || stats.max == null || stats.bins == null) {
-    return <div style={{ fontSize: 11.5, color: C.textMuted }}>No frame yet</div>
-  }
-  const bins = stats.bins
-  const n = bins.length
-  // Log counts: a detector histogram is dominated by the background bin, and
-  // on a linear scale every feature that matters is a flat line on the axis.
-  const scaled = bins.map((b) => Math.log10(1 + Math.max(0, b)))
-  const peak = Math.max(...scaled, 1e-9)
-  const pts = scaled.map((v, i) => `${(i / (n - 1)) * 200},${50 - (v / peak) * 50}`)
-  const path = `M0,50 L${pts.join(' L')} L200,50 Z`
-
-  const span = Math.max(stats.max - stats.min, 1e-9)
-  const x = (v: number) => ((v - stats.min!) / span) * 200
-  const [lo, hi] = stats.levels ?? [stats.min, stats.max]
-
-  return (
-    <div>
-      <svg viewBox="0 0 200 50" preserveAspectRatio="none" role="img"
-        aria-label="Intensity histogram with display range"
-        style={{ width: '100%', height: 50, display: 'block', borderRadius: 4 }}>
-        <rect width="200" height="50" fill={C.ctl} />
-        <path d={path} fill="#3a5a8c" />
-        {/* The clim handles, over the counts — the question this control
-            answers is "am I clipping?", which needs both together. */}
-        <line x1={x(lo)} y1="0" x2={x(lo)} y2="50" stroke={C.accent} strokeWidth="1.5" />
-        <line x1={x(hi)} y1="0" x2={x(hi)} y2="50" stroke={C.accent} strokeWidth="1.5" />
-      </svg>
-      <div style={{
-        display: 'flex', justifyContent: 'space-between', marginTop: 3,
-        fontSize: 10, color: C.textMuted, fontFamily: FONT_MONO,
-      }}>
-        <span>{stats.min}</span><span>{stats.max}</span>
-      </div>
-    </div>
-  )
-}
 
 // ── Stats strip ───────────────────────────────────────────────────────────────
 
