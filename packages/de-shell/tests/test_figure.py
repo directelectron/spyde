@@ -18,10 +18,20 @@ class TestRobustLevels:
         # THE case this exists for: one saturated pixel under a min/max range
         # compresses everything else into the bottom of the scale and the image
         # renders black. Every real detector has hot pixels.
-        frame = np.full((64, 64), 100.0)
+        rng = np.random.default_rng(0)
+        frame = rng.normal(100.0, 5.0, (64, 64))
         frame[0, 0] = 65535.0
         lo, hi = robust_levels(frame)
         assert hi < 1000.0, "a single hot pixel dominated the display range"
+
+    def test_a_sparse_image_scales_to_its_spots(self):
+        # A count map that is >99.5% zeros: the percentile IS zero, so the
+        # function falls back to the true maximum. Without that the few bright
+        # spots all saturate against a 1-wide window. This is why the fallback
+        # chain is max-then-widen and not widen-only.
+        frame = np.zeros((256, 256))
+        frame[3, 4] = 5000.0
+        assert robust_levels(frame, low=None, high=99.5) == (0.0, 5000.0)
 
     def test_uniform_frame_still_gets_a_usable_range(self):
         # A zero-width window renders as a solid block, indistinguishable from a
@@ -44,15 +54,39 @@ class TestRobustLevels:
         lo, hi = robust_levels(frame)
         assert 0.0 <= lo < 50.0 and 950.0 < hi <= 1000.0
 
+    def test_low_none_uses_the_true_minimum(self):
+        # The navigator band. Clipping the floor of an image with no saturating
+        # spike throws away real dynamic range.
+        frame = np.linspace(5.0, 1000.0, 10_000).reshape(100, 100)
+        assert robust_levels(frame, low=None, high=99.5)[0] == 5.0
+        assert robust_levels(frame, low=2.0, high=99.5)[0] > 5.0
+
     def test_percentiles_are_configurable(self):
         frame = np.linspace(0.0, 100.0, 10_000).reshape(100, 100)
-        tight = robust_levels(frame, 25.0, 75.0)
-        wide = robust_levels(frame, 0.0, 100.0)
+        tight = robust_levels(frame, low=25.0, high=75.0)
+        wide = robust_levels(frame, low=0.0, high=100.0)
         assert tight[0] > wide[0] and tight[1] < wide[1]
+
+    def test_a_large_frame_is_subsampled_rather_than_measured_whole(self):
+        # Percentiles over 16 M pixels land on the paint path. Sampling must not
+        # change the answer materially — compare a small sample against a big one
+        # drawn from the same distribution.
+        rng = np.random.default_rng(1)
+        big = rng.normal(500.0, 50.0, (2048, 2048))
+        coarse = robust_levels(big, sample=64)
+        fine = robust_levels(big, sample=2048)
+        assert np.allclose(coarse, fine, rtol=0.05)
+
+    def test_a_1d_line_is_handled(self):
+        lo, hi = robust_levels(np.linspace(0.0, 10.0, 4096))
+        assert np.isfinite(lo) and np.isfinite(hi) and hi > lo
 
     def test_integer_frames_are_handled(self):
         lo, hi = robust_levels(np.arange(256, dtype=np.uint16).reshape(16, 16))
         assert np.isfinite(lo) and np.isfinite(hi) and hi > lo
+
+    def test_an_empty_frame_returns_a_safe_default(self):
+        assert robust_levels(np.zeros((0, 0))) == (0.0, 1.0)
 
 
 class TestFigureViewLifecycle:

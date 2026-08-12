@@ -24,6 +24,7 @@ from de_shell.session import SessionBase
 
 from de_groundcrew.camera import AcquisitionLoop, SimulatedCamera
 from de_shell.plotting.figure import FigureView
+from de_shell.plotting.stream import FrameStream
 
 log = logging.getLogger(__name__)
 
@@ -42,16 +43,13 @@ class GroundCrewSession(SessionBase):
         self._loop = AcquisitionLoop(
             self.camera, on_frame=self._on_frame, exposure_s=self._exposure_s)
 
-        # The newest frame, and a flag saying one is waiting to be painted.
-        # The acquisition thread produces faster than the main thread can paint,
-        # so a queue would grow without bound and show ever-staler frames.
-        # Newest-wins with a single slot is the same shape as SpyDE's nav
-        # painter: drop what you could not keep up with, never lag behind.
-        self._pending_frame: np.ndarray | None = None
-        self._paint_scheduled = False
-        self._frame_lock = threading.Lock()
-        self._frames_shown = 0
-        self._frames_dropped = 0
+        # Newest-wins painting, marshalled onto the main thread — the shell's,
+        # shared with Autopilot and (in shape) SpyDE's nav painter.
+        self._frames = FrameStream(
+            self._viewer, self._dispatch_to_main,
+            on_painted=self._emit_stats,
+            on_error=lambda e: emit_error(f"Display failed: {e}"),
+        )
 
     # ── Startup ───────────────────────────────────────────────────────────────
 
@@ -64,44 +62,16 @@ class GroundCrewSession(SessionBase):
     # ── Acquisition → paint ───────────────────────────────────────────────────
 
     def _on_frame(self, frame: np.ndarray) -> None:
-        """Acquisition thread: stash the frame and ask the main thread to paint.
-
-        Only ever schedules ONE pending paint. Without the `_paint_scheduled`
-        latch, a camera running faster than the renderer would queue a callback
-        per frame onto the event loop and the main thread would fall
-        progressively further behind while the queue grew.
-        """
-        with self._frame_lock:
-            if self._pending_frame is not None:
-                self._frames_dropped += 1
-            self._pending_frame = frame
-            if self._paint_scheduled:
-                return
-            self._paint_scheduled = True
-        self._dispatch_to_main(self._paint_pending)
-
-    def _paint_pending(self) -> None:
-        """Main thread: paint the newest frame."""
-        with self._frame_lock:
-            frame, self._pending_frame = self._pending_frame, None
-            self._paint_scheduled = False
-        if frame is None or self._closed:
-            return
-        try:
-            self._viewer.show(frame)
-            self._frames_shown += 1
-            self._emit_stats(frame)
-        except Exception as e:
-            log.exception("painting frame failed")
-            emit_error(f"Display failed: {e}")
+        """Acquisition thread → the stream, which marshals and paints."""
+        self._frames.submit(frame)
 
     def _emit_stats(self, frame: np.ndarray) -> None:
         """The stats strip under the image (the PySide6 app's image_stats_panel)."""
         emit({
             "type": "frame_stats",
-            "frame": int(getattr(self.camera, "frame_index", self._frames_shown)),
-            "shown": self._frames_shown,
-            "dropped": self._frames_dropped,
+            "frame": int(getattr(self.camera, "frame_index", self._frames.shown)),
+            "shown": self._frames.shown,
+            "dropped": self._frames.dropped,
             "min": float(frame.min()),
             "max": float(frame.max()),
             "mean": round(float(frame.mean()), 2),
@@ -175,6 +145,9 @@ class GroundCrewSession(SessionBase):
         # stopping it before the viewer means no frame can arrive for a window
         # that has already gone.
         self._loop.stop()
+        # The stream next: it cancels anything outstanding, so a frame already
+        # in flight cannot paint into a window that is about to close.
+        self._frames.close()
         try:
             self._viewer.close()
         except Exception as e:

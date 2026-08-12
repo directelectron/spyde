@@ -21,6 +21,7 @@ import anyplotlib._electron as _electron
 from anyplotlib.embed import build_standalone_html
 
 from de_shell.plotting.colormaps import COLORMAPS, DEFAULT_COLORMAP
+from de_shell.plotting.figure import robust_levels
 
 if TYPE_CHECKING:
     from spyde.drawing.plots.plot_states import PlotState
@@ -1118,28 +1119,16 @@ class Plot:
         beam is orders of magnitude brighter than the diffraction spots, so a
         99.5% upper clip still saturates everything but the beam. Use a tighter
         2–99% band there so the faint spots are visible; navigator/VI images keep
-        the wide min–99.5% range (they have no saturating central spike)."""
-        try:
-            sy = max(1, img.shape[0] // 512)
-            sx = max(1, img.shape[1] // 512) if img.ndim > 1 else 1
-            data = np.asarray(img[::sy, ::sx] if img.ndim > 1 else img[::sy],
-                              dtype=np.float64)
-            data = data[np.isfinite(data)]
-            if data.size == 0:
-                return 0.0, 1.0
-            if signal:
-                mn = float(np.percentile(data, 2.0))
-                mx = float(np.percentile(data, 99.0))
-            else:
-                mn = float(data.min())
-                mx = float(np.percentile(data, 99.5))
-            if mx <= mn:
-                mx = float(data.max())
-            if mx <= mn:
-                mx = mn + 1.0
-            return mn, mx
-        except Exception:
-            return 0.0, 1.0
+        the wide min–99.5% range (they have no saturating central spike).
+
+        The mechanism — subsample, drop non-finite, percentile, fall back to the
+        max and then to a hair's width — is the shell's; SpyDE supplies only the
+        BANDS, which is the part that is about diffraction data."""
+        if signal:
+            return robust_levels(img, low=2.0, high=99.0)
+        # low=None means "use the true minimum": a navigator has no saturating
+        # spike, and clipping its floor throws away real dynamic range.
+        return robust_levels(img, low=None, high=99.5)
 
     def set_colormap(self, name: str) -> None:
         resolved = COLORMAPS.get(name, name)

@@ -31,7 +31,6 @@ are enforced rather than documented-and-hoped:
 from __future__ import annotations
 
 import logging
-import warnings
 
 import numpy as np
 
@@ -45,44 +44,65 @@ from de_shell.plotting.colormaps import DEFAULT_COLORMAP
 log = logging.getLogger(__name__)
 
 
-def robust_levels(frame: np.ndarray,
-                  low: float = 2.0, high: float = 98.0) -> tuple[float, float]:
+#: Subsample any axis longer than this before measuring levels. Percentiles over
+#: 16 M pixels cost tens of ms and land on the paint path; a ≤512² sample gives
+#: the same answer to well within a display level.
+LEVEL_SAMPLE = 512
+
+
+def robust_levels(frame: np.ndarray, *,
+                  low: float | None = 2.0, high: float = 98.0,
+                  sample: int = LEVEL_SAMPLE) -> tuple[float, float]:
     """A display range for *frame* that a hot pixel cannot wreck.
 
-    Percentiles rather than min/max, with two fallbacks that matter in practice:
-    a frame that is all-NaN (or whose percentiles collapse) falls back to
-    min/max, and a UNIFORM frame still gets a non-degenerate range, because a
-    zero-width window renders as a solid block and is indistinguishable from a
-    broken decode.
+    Percentiles rather than min/max: one saturated pixel — which every real
+    detector has — otherwise sets the ceiling and renders everything else black.
+
+    ``low=None`` uses the true minimum instead of a low percentile. That is the
+    right choice for an image with no saturating spike (a navigator, a virtual
+    image), where clipping the floor throws away real dynamic range; an image
+    that DOES have one (a diffraction pattern, whose central beam is orders of
+    magnitude brighter than the spots) wants both ends clipped.
+
+    Lifted from SpyDE's ``Plot._robust_levels``, which had already paid for the
+    subsampling and the non-finite handling.
     """
     arr = np.asarray(frame)
-    with warnings.catch_warnings():
-        # An all-NaN frame is a case this function HANDLES (see below), so
-        # numpy's "All-NaN slice encountered" is noise, not a signal — and it
-        # would fire on every frame of a detector that is not yet streaming.
-        warnings.simplefilter("ignore", RuntimeWarning)
-        try:
-            # nanpercentile, not percentile: a single NaN makes the latter
-            # return NaN for the whole frame.
-            lo, hi = np.nanpercentile(arr, (low, high))
-        except Exception:
-            lo, hi = np.nan, np.nan
-
-    # Non-finite means there was nothing to measure (an all-NaN frame, or an
-    # empty one). Only THEN fall back to the extremes.
-    if not np.isfinite(lo) or not np.isfinite(hi):
-        finite = arr[np.isfinite(arr)] if arr.size else arr
-        lo, hi = (float(np.min(finite)), float(np.max(finite))) if finite.size else (0.0, 1.0)
-
-    # Collapsed percentiles mean the BULK of the frame is one value — a flat
-    # field, or a flat field plus a few outliers. Widen by a hair and stop.
-    #
-    # Falling back to min/max here would be actively wrong, and was: on a
-    # uniform frame carrying one hot pixel, min/max restores exactly the outlier
-    # this function exists to reject, and the image renders black again.
-    if hi <= lo:
-        hi = lo + 1.0
-    return float(lo), float(hi)
+    try:
+        sy = max(1, arr.shape[0] // sample)
+        sx = max(1, arr.shape[1] // sample) if arr.ndim > 1 else 1
+        data = np.asarray(arr[::sy, ::sx] if arr.ndim > 1 else arr[::sy],
+                          dtype=np.float64)
+        data = data[np.isfinite(data)]
+        if data.size == 0:
+            # Nothing measurable — an all-NaN frame, or an empty one.
+            return 0.0, 1.0
+        # No warnings.catch_warnings() here, deliberately. `data` is already
+        # finite-filtered above, so numpy's all-NaN RuntimeWarning cannot fire —
+        # and this runs on the PAINT path, where entering a context manager that
+        # saves and restores global warning state on every frame is pure cost.
+        lo = float(np.percentile(data, low)) if low is not None else float(data.min())
+        hi = float(np.percentile(data, high))
+        # Collapsed percentiles mean the BULK of the frame is one value. Fall
+        # back to the true maximum — load-bearing for a SPARSE image, e.g. a
+        # count map that is >99.5% zeros with a few bright spots: the percentile
+        # is zero there, and without this the spots all saturate against a
+        # 1-wide window instead of scaling properly.
+        #
+        # The cost is that a perfectly FLAT frame carrying one hot pixel scales
+        # to that pixel and renders dark. That is the right trade: a sparse real
+        # image is common and a flat synthetic one is not, and any frame with
+        # genuine variation never reaches this branch.
+        if hi <= lo:
+            hi = float(data.max())
+        # Still collapsed: genuinely uniform. Widen by a hair rather than return
+        # a zero-width window, which renders as a solid block and is
+        # indistinguishable from a broken decode.
+        if hi <= lo:
+            hi = lo + 1.0
+        return lo, hi
+    except Exception:
+        return 0.0, 1.0
 
 
 class FigureView:

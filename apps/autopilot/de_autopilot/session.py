@@ -11,12 +11,12 @@ handling is the shared one rather than something this app invented.
 from __future__ import annotations
 
 import logging
-import threading
 
 import numpy as np
 
 from de_shell.ipc import emit, emit_error, emit_progress, emit_status
 from de_shell.plotting.figure import FigureView
+from de_shell.plotting.stream import FrameStream
 from de_shell.session import SessionBase
 
 from de_autopilot.recipe import Detector, RecipeRunner, Stage, default_recipe
@@ -39,12 +39,13 @@ class AutopilotSession(SessionBase):
 
         self._runner = self._new_runner()
 
-        # Newest-wins single slot, as in Ground Crew: the runner can outrun the
-        # painter, and a queue would grow while showing ever-staler frames.
-        self._pending_frame: np.ndarray | None = None
-        self._paint_scheduled = False
-        self._frame_lock = threading.Lock()
-        self._acquired = 0
+        # Newest-wins painting, marshalled onto the main thread — the shell's,
+        # the same one Ground Crew uses.
+        self._frames = FrameStream(
+            self._viewer, self._dispatch_to_main,
+            on_painted=self._emit_frame_stats,
+            on_error=lambda e: emit_error(f"Display failed: {e}"),
+        )
 
     def _new_runner(self) -> RecipeRunner:
         return RecipeRunner(
@@ -64,29 +65,19 @@ class AutopilotSession(SessionBase):
     # ── Runner callbacks (runner thread) ──────────────────────────────────────
 
     def _on_frame(self, frame: np.ndarray) -> None:
-        with self._frame_lock:
-            self._pending_frame = frame
-            if self._paint_scheduled:
-                return
-            self._paint_scheduled = True
-        self._dispatch_to_main(self._paint_pending)
+        """Runner thread → the stream, which marshals and paints."""
+        self._frames.submit(frame)
 
-    def _paint_pending(self) -> None:
-        with self._frame_lock:
-            frame, self._pending_frame = self._pending_frame, None
-            self._paint_scheduled = False
-        if frame is None or self._closed:
-            return
-        if self._viewer.show(frame):
-            self._acquired += 1
-            emit({
-                "type": "frame_stats",
-                "acquired": self._acquired,
-                "stage": {"x": self.stage.x, "y": self.stage.y},
-                "min": float(frame.min()), "max": float(frame.max()),
-                "mean": round(float(frame.mean()), 2),
-                "shape": list(frame.shape),
-            })
+    def _emit_frame_stats(self, frame: np.ndarray) -> None:
+        """Main thread, after a frame painted."""
+        emit({
+            "type": "frame_stats",
+            "acquired": self._frames.shown,
+            "stage": {"x": self.stage.x, "y": self.stage.y},
+            "min": float(frame.min()), "max": float(frame.max()),
+            "mean": round(float(frame.mean()), 2),
+            "shape": list(frame.shape),
+        })
 
     def _on_step(self, index: int, state: str) -> None:
         self._dispatch_to_main(lambda: self._emit_step(index, state))
@@ -133,7 +124,7 @@ class AutopilotSession(SessionBase):
         # A finished runner is not restartable — its thread has exited — so a
         # second Run builds a fresh one rather than silently doing nothing.
         self._runner = self._new_runner()
-        self._acquired = 0
+        self._frames.shown = 0
         self._runner.start()
 
     def _act_pause(self, payload: dict) -> None:
@@ -158,6 +149,9 @@ class AutopilotSession(SessionBase):
             self._runner.stop()
         except Exception as e:
             log.debug("runner stop failed: %s", e)
+        # The stream next: it cancels anything outstanding, so a frame already
+        # in flight cannot paint into a window that is about to close.
+        self._frames.close()
         try:
             self._viewer.close()
         except Exception as e:

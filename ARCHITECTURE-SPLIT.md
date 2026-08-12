@@ -279,14 +279,32 @@ importing SpyDE, and no boundary is being violated today — so the hooks would 
 indirection with no consumer, and the modules have nowhere to go yet. Same
 reasoning as the window registry. Revisit when an app needs a toolbar.
 
+**Seventh pass — the live/futures refresh, and SpyDE's levels**
+
+The portable part of "refresh the image when a future completes, or as a
+background thread populates" — with no dask anywhere. `de_shell.plotting.stream`
+adds `FrameStream`: newest-wins painting marshalled onto the main thread, plus
+`submit_future()` for work that finishes elsewhere. A future here is anything
+with add_done_callback/result/cancel, so ThreadCompute's futures and SpyDE's
+distributed adapter both satisfy it without the shell knowing. Both live apps
+use it; their duplicated pending-slot/latch/lock blocks are gone.
+
+SpyDE's `Plot._robust_levels` now delegates to the shell's `robust_levels`, which
+was UPGRADED to SpyDE's implementation (subsample to 512, drop non-finite, fall
+back to max then to a hair's width) rather than SpyDE adopting the weaker one.
+SpyDE supplies only the bands, which is the part that is about diffraction data.
+Proven bit-identical on 18 frame shapes including the edge cases, and benchmarked
+within +-0.5% at 256/512/4096.
+
+**`Plot` does NOT inherit `FigureView`, on purpose.** Their overlap is
+subplots+imshow+register+emit; `Plot` diverges on the shared-ESM finalizer, tile
+mode, 1-D line plots, plot states and layers, and the extra emit fields. Making
+it inherit would mean growing FigureView a hook for each, which turns the shell's
+small core into SpyDE's Plot with extra steps. The genuinely shared logic was
+extracted instead.
+
 **Not started**
 
-- SpyDE's `Plot` still does not use `FigureView`. It carries the array cache,
-  the tiered navigator read, overlay layers and tile mode, so adopting the
-  shared core means layering those on top — a real piece of work, and riskier
-  than anything done so far because the navigator read path is the app's most
-  performance-sensitive code (see the Live-Display section of CLAUDE.md).
-  `FigureView` is deliberately the in-memory core so that layering is possible.
 - `spyde/drawing/selectors/` and `toolbars/`: `base_selector` still reaches into
   `actions.overlay`, and `plot_control_toolbar` into `spyde.TOOLBAR_ACTIONS`.
   Both want the `register_*` hook treatment.
