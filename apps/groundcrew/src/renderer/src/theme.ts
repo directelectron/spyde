@@ -24,6 +24,18 @@ export const C = {
 
   accent: '#8ab4ff',
   accentSunken: '#22304a',
+
+  /** Control surfaces — an input well is DARKER than the panel it sits on, so
+   *  an editable field reads as a well rather than a raised card. */
+  ctl: '#1e2230',
+  ctlLine: '#2f3442',
+  well: '#12141a',
+
+  /** Temperature. Its own hue, separate from the accent and from the semantic
+   *  status colours: cooling state is neither "selected" nor "good/bad", and
+   *  colouring it green would make a warm detector look like a passing check. */
+  cryo: '#5ecfd6',
+  cryoSunken: '#163234',
 } as const
 
 /**

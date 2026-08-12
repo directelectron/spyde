@@ -15,19 +15,30 @@ import { C, FONT_MONO, stateOf } from './theme'
 
 // ── Layout ────────────────────────────────────────────────────────────────────
 
-export function Section({ title, right, children }: {
-  title: string; right?: React.ReactNode; children: React.ReactNode
+/**
+ * A titled group. The rule running off to the right of the label separates
+ * groups without a heavy divider, and keeps a narrow column legible when it
+ * holds five or six of them.
+ */
+export function Section({ title, right, pinned, children }: {
+  title: string; right?: React.ReactNode; pinned?: boolean
+  children: React.ReactNode
 }) {
   return (
-    <section style={{ marginBottom: 18 }}>
+    <section style={pinned
+      // `marginTop: auto` in a flex column pins a group to the BOTTOM of the
+      // sidebar — for the things you reach for rarely and always in the same
+      // place.
+      ? { marginTop: 'auto', marginBottom: 0, paddingTop: 13,
+          borderTop: `1px solid ${C.border}` }
+      : { marginBottom: 15 }}>
       <header style={{
-        display: 'flex', alignItems: 'baseline', justifyContent: 'space-between',
-        marginBottom: 8,
+        display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8,
+        font: `600 9.5px/1 ${FONT_MONO}`, letterSpacing: '.11em',
+        textTransform: 'uppercase', color: C.textMuted,
       }}>
-        <h2 style={{
-          margin: 0, fontSize: 10.5, fontWeight: 700, letterSpacing: '.09em',
-          textTransform: 'uppercase', color: C.textMuted,
-        }}>{title}</h2>
+        <span>{title}</span>
+        <span style={{ flex: 1, height: 1, background: C.border }} />
         {right}
       </header>
       {children}
@@ -100,6 +111,7 @@ export function Field({ label, value, unit, onCommit, disabled, testId, hint }: 
   // landing mid-keystroke would overwrite what is being typed.
   useEffect(() => { if (!editing) setDraft(shown) }, [shown, editing])
 
+  const [focus, setFocus] = useState(false)
   const readOnly = !onCommit || disabled
   const commit = () => {
     setEditing(false)
@@ -107,12 +119,23 @@ export function Field({ label, value, unit, onCommit, disabled, testId, hint }: 
   }
 
   return (
-    <label style={{
-      display: 'grid', gridTemplateColumns: '1fr auto', alignItems: 'center',
-      gap: 8, marginBottom: 6,
-    }}>
-      <span style={{ fontSize: 12, color: C.textMuted }} title={hint}>{label}</span>
-      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+    <label style={{ display: 'block', marginBottom: 7 }}>
+      <span style={{
+        display: 'block', fontSize: 10.5, color: C.textMuted, marginBottom: 3,
+        letterSpacing: '.02em',
+      }} title={hint}>{label}</span>
+      {/* The unit sits OUTSIDE the input, so the editable region is the whole
+          width and there is no ambiguity about whether "s" is part of the
+          value. Squeezing an editor into a quarter-width cell is the mistake
+          SpyDE's metadata panel already learned not to make. */}
+      <span style={{
+        display: 'flex', alignItems: 'center', gap: 6,
+        background: readOnly ? 'transparent' : C.well,
+        border: `1px solid ${
+          focus ? C.accent : readOnly ? 'transparent' : C.ctlLine}`,
+        boxShadow: focus ? `0 0 0 2px ${C.accent}2e` : 'none',
+        borderRadius: 5, padding: '0 8px 0 0',
+      }}>
         <input
           ref={ref}
           value={draft}
@@ -120,26 +143,63 @@ export function Field({ label, value, unit, onCommit, disabled, testId, hint }: 
           readOnly={readOnly}
           disabled={disabled}
           onChange={(e) => { setEditing(true); setDraft(e.target.value) }}
-          onFocus={() => setEditing(true)}
-          onBlur={commit}
+          onFocus={() => { setEditing(true); setFocus(true) }}
+          onBlur={() => { setFocus(false); commit() }}
           onKeyDown={(e) => {
             if (e.key === 'Enter') { commit(); ref.current?.blur() }
             if (e.key === 'Escape') { setEditing(false); setDraft(shown); ref.current?.blur() }
           }}
           placeholder={value == null ? '—' : ''}
           style={{
-            width: 92, textAlign: 'right', padding: '4px 7px',
-            background: readOnly ? 'transparent' : C.bgSunken,
-            border: `1px solid ${readOnly ? 'transparent' : C.borderStrong}`,
-            borderRadius: 5, color: value == null ? C.textMuted : C.text,
-            fontSize: 12.5, fontFamily: FONT_MONO,
-            fontVariantNumeric: 'tabular-nums',
-            outline: 'none', cursor: readOnly ? 'default' : 'text',
+            flex: 1, minWidth: 0, background: 'transparent', border: 0, outline: 0,
+            color: value == null ? C.textMuted : C.text,
+            font: `12px/1 ${FONT_MONO}`, fontVariantNumeric: 'tabular-nums',
+            padding: '6px 8px', cursor: readOnly ? 'default' : 'text',
           }}
         />
-        <span style={{ fontSize: 11, color: C.textMuted, width: 30 }}>{unit ?? ''}</span>
+        {unit && <span style={{
+          color: C.textMuted, fontSize: 10.5, whiteSpace: 'nowrap',
+        }}>{unit}</span>}
       </span>
     </label>
+  )
+}
+
+/** Two fields side by side, for naturally paired values (frames + fps). */
+export function FieldPair({ children }: { children: React.ReactNode }) {
+  return <div style={{ display: 'flex', gap: 7 }}>
+    {React.Children.map(children, (c) => <div style={{ flex: 1 }}>{c}</div>)}
+  </div>
+}
+
+/** A segmented control: related actions welded into one unit. */
+export function Segmented({ children }: { children: React.ReactNode }) {
+  return (
+    <span style={{
+      display: 'flex', alignItems: 'stretch', border: `1px solid ${C.ctlLine}`,
+      borderRadius: 6, overflow: 'hidden',
+    }}>{children}</span>
+  )
+}
+
+export function SegBtn({ children, on, tone, disabled, onClick, testId, title }: {
+  children: React.ReactNode; on?: boolean; tone?: 'cryo'
+  disabled?: boolean; onClick?: () => void; testId?: string; title?: string
+}) {
+  const activeFg = tone === 'cryo' ? C.cryo : C.accent
+  const activeBg = tone === 'cryo' ? C.cryoSunken : C.accentSunken
+  return (
+    <button
+      onClick={onClick} disabled={disabled} title={title} data-testid={testId}
+      data-on={on ? 'true' : 'false'}
+      style={{
+        padding: '4px 9px', background: on ? activeBg : C.ctl,
+        color: disabled ? C.textMuted : on ? activeFg : C.textDim,
+        border: 0, borderRight: `1px solid ${C.ctlLine}`,
+        fontSize: 11, font: 'inherit', cursor: disabled ? 'not-allowed' : 'pointer',
+        opacity: disabled ? 0.5 : 1, whiteSpace: 'nowrap',
+      }}
+    >{children}</button>
   )
 }
 
@@ -173,28 +233,35 @@ export function Btn({ children, onClick, disabled, active, tone, testId, title, 
   )
 }
 
-export function Select({ label, value, options, onChange, testId }: {
+export function Select({ label, value, options, onChange, testId, wide }: {
   label: string; value: string; options: readonly string[]
   onChange: (v: string) => void; testId?: string
+  /** Full width with no inline label — for a control whose Section title
+   *  already names it, where a second label is just repetition. */
+  wide?: boolean
 }) {
+  const select = (
+    <select
+      value={value}
+      data-testid={testId}
+      onChange={(e) => onChange(e.target.value)}
+      style={{
+        width: wide ? '100%' : 129, padding: '5px 8px', background: C.ctl,
+        border: `1px solid ${C.ctlLine}`, borderRadius: 5,
+        color: C.text, fontSize: 12.5, outline: 'none',
+      }}
+    >
+      {options.map((o) => <option key={o} value={o}>{o}</option>)}
+    </select>
+  )
+  if (wide) return select
   return (
     <label style={{
       display: 'grid', gridTemplateColumns: '1fr auto', alignItems: 'center',
       gap: 8, marginBottom: 6,
     }}>
       <span style={{ fontSize: 12, color: C.textMuted }}>{label}</span>
-      <select
-        value={value}
-        data-testid={testId}
-        onChange={(e) => onChange(e.target.value)}
-        style={{
-          width: 129, padding: '4px 6px', background: C.bgSunken,
-          border: `1px solid ${C.borderStrong}`, borderRadius: 5,
-          color: C.text, fontSize: 12.5, outline: 'none',
-        }}
-      >
-        {options.map((o) => <option key={o} value={o}>{o}</option>)}
-      </select>
+      {select}
     </label>
   )
 }

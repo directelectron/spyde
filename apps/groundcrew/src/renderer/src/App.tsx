@@ -31,7 +31,9 @@ import {
 import type { FigureMessage, ShellState, ShellAction, LogEntry } from '@de/shell-renderer'
 
 import { C, FONT_MONO, stateOf } from './theme'
-import { Btn, Field, NotBuilt, Pill, Section, Select } from './ui'
+import {
+  Btn, Field, FieldPair, NotBuilt, Pill, Section, SegBtn, Segmented, Select,
+} from './ui'
 import { StatusMode } from './modes/Status'
 import type { StatusCard, StatusSummary } from './modes/Status'
 import { CalibrateMode, MotionMode } from './modes/Other'
@@ -51,6 +53,8 @@ interface FrameStats {
   eppix: number | null; eppixps: number | null
   over: number | null; under: number | null
   levels?: [number, number] | null
+  /** Histogram counts from the server, for the Plot Control curve. */
+  bins?: number[] | null
 }
 
 interface Connection {
@@ -86,6 +90,7 @@ const P = {
   tempControl: 'Temperature - Control',
   position: 'Camera Position Status',
   positionCtl: 'Camera Position Control',
+  waterT: 'Temperature - Chilled Water (Celsius)',
 } as const
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -243,7 +248,9 @@ export function App() {
         </main>
 
         <PlotControl stats={stats} colormap={colormap}
-          onColormap={(name) => { dispatch({ type: 'COLORMAP', name }); act('set_colormap', { name }) }} />
+          onColormap={(name) => { dispatch({ type: "COLORMAP", name }); act("set_colormap", { name }) }}
+          onClim={(low, high) => act("set_clim", { low, high })}
+          onAuto={() => act("auto_clim")} />
       </div>
 
       {logOpen && <LogPanel logs={logEntries} onClose={() => setLogOpen(false)} />}
@@ -277,6 +284,7 @@ function TopBar({ connection, props, onSet }: {
   const position = props[P.position]
   const hasTemp = temp != null
   const hasPosition = position != null
+  const extended = /extend|insert/i.test(String(position ?? ''))
 
   return (
     <header style={S.topbar}>
@@ -288,46 +296,95 @@ function TopBar({ connection, props, onSet }: {
 
       <span style={{ flex: 1 }} />
 
+      {/* Valve position and detector temperature are the two facts that make
+          an acquisition worthless if wrong, so they live here rather than in a
+          column that scrolls. Both DISABLE rather than disappear when the
+          server does not report them: a control that vanishes reads as a
+          missing feature, a greyed one reads as an unavailable reading. */}
+      <Segmented>
+        <SegBtn on={extended} disabled={!hasPosition} testId="extend-btn"
+          title={hasPosition ? 'Insert the camera'
+                             : 'This server does not report camera position'}
+          onClick={() => onSet(P.positionCtl, 'Extend')}>
+          {extended ? 'Extended' : 'Extend'}
+        </SegBtn>
+        <SegBtn disabled={!hasPosition} testId="retract-btn"
+          onClick={() => onSet(P.positionCtl, 'Retract')}>Retract</SegBtn>
+      </Segmented>
+
+      <Segmented>
+        <SegBtn tone="cryo" disabled={!hasTemp} testId="cool-btn"
+          onClick={() => onSet(P.tempControl, 'Cool Down')}>Cool</SegBtn>
+        <SegBtn disabled={!hasTemp} testId="warm-btn"
+          onClick={() => onSet(P.tempControl, 'Warm Up')}>Warm</SegBtn>
+        <SegBtn disabled={!hasTemp} testId="tempoff-btn"
+          onClick={() => onSet(P.tempControl, 'Off')}>Off</SegBtn>
+      </Segmented>
+
       <div style={{ position: 'relative' }}>
+        {/* The temperature is a BUTTON: clicking it sets a target. "Cool"
+            alone never says cool to what. */}
         <button
-          style={{ ...S.topBtn, opacity: hasTemp ? 1 : 0.5 }}
+          style={{
+            ...S.tempBtn,
+            color: hasTemp ? C.cryo : C.textMuted,
+            borderColor: openTemp ? C.cryo : C.ctlLine,
+            opacity: hasTemp ? 1 : 0.5,
+            cursor: hasTemp ? 'pointer' : 'not-allowed',
+          }}
           disabled={!hasTemp}
           onClick={() => setOpenTemp((v) => !v)}
           data-testid="temp-btn"
           title={hasTemp ? 'Set the cooling setpoint'
                          : 'This server does not report detector temperature'}
         >
-          <span style={{ color: C.textMuted, fontSize: 11 }}>SENSOR</span>
-          <span style={{ fontFamily: FONT_MONO, fontVariantNumeric: 'tabular-nums' }}>
+          <span data-testid="temp-value">
             {hasTemp ? `${Number(temp).toFixed(1)} °C` : '—'}
           </span>
+          <span style={{ color: C.textMuted }}>⌄</span>
         </button>
         {openTemp && hasTemp && (
           <div style={S.popover}>
-            <Field label="Cool to" value={props[P.coolSetpoint] as number} unit="°C"
-              onCommit={(v) => onSet(P.coolSetpoint, Number(v))} testId="cool-setpoint" />
-            <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
-              <Btn wide onClick={() => onSet(P.tempControl, 'Cool Down')}>Cool</Btn>
-              <Btn wide onClick={() => onSet(P.tempControl, 'Warm Up')}>Warm</Btn>
-              <Btn wide onClick={() => onSet(P.tempControl, 'Off')}>Off</Btn>
+            <div style={S.popTitle}>Detector temperature</div>
+            <KV label="Current" value={`${Number(temp).toFixed(1)} °C`} tone={C.cryo} />
+            <KV label="Position" value={hasPosition ? String(position) : '—'} />
+            <div style={{ marginTop: 9 }}>
+              <Field label="Setpoint" value={props[P.coolSetpoint] as number} unit="°C"
+                onCommit={(v) => onSet(P.coolSetpoint, Number(v))}
+                testId="cool-setpoint" />
             </div>
           </div>
         )}
       </div>
 
-      <div style={S.topGroup}>
-        <span style={{ color: C.textMuted, fontSize: 11 }}>CAMERA</span>
-        <span data-testid="position-value" style={{ fontSize: 12.5 }}>
-          {hasPosition ? String(position) : '—'}
+      {/* Link state only. Camera position is carried by the segmented control
+          above, whose label IS the position — putting both in one chip made a
+          server that cannot report position read as "Ready", which is a claim
+          about the wrong thing. */}
+      <span style={S.readyChip}>
+        <span style={{
+          width: 7, height: 7, borderRadius: 999,
+          background: connection?.connected ? '#41d18a' : C.textMuted,
+        }} />
+        <span data-testid="link-state">
+          {connection?.connected ? 'Ready' : 'Offline'}
         </span>
-        <Btn disabled={!hasPosition} testId="extend-btn"
-          title={hasPosition ? 'Insert the camera'
-                             : 'This server does not report camera position'}
-          onClick={() => onSet(P.positionCtl, 'Extend')}>Extend</Btn>
-        <Btn disabled={!hasPosition} testId="retract-btn" tone="danger"
-          onClick={() => onSet(P.positionCtl, 'Retract')}>Retract</Btn>
-      </div>
+      </span>
     </header>
+  )
+}
+
+function KV({ label, value, tone }: { label: string; value: string; tone?: string }) {
+  return (
+    <div style={{
+      display: 'flex', justifyContent: 'space-between', gap: 8, padding: '2.5px 0',
+    }}>
+      <span style={{ fontSize: 11.5, color: C.textMuted }}>{label}</span>
+      <span style={{
+        font: `11.5px ${FONT_MONO}`, fontVariantNumeric: 'tabular-nums',
+        color: tone ?? C.textDim,
+      }}>{value}</span>
+    </div>
   )
 }
 
@@ -471,27 +528,46 @@ function ImagingMode({ figure, bridge, running, onStart, onStop, onSingle }: {
  * so it describes the WHOLE frame — it does not shift as you pan a zoomed
  * image, which is the failure of computing it from what is on screen.
  */
-function PlotControl({ stats, colormap, onColormap }: {
+function PlotControl({ stats, colormap, onColormap, onClim, onAuto }: {
   stats: FrameStats | null; colormap: string; onColormap: (n: string) => void
+  onClim: (lo: number, hi: number) => void; onAuto: () => void
 }) {
+  const lo = stats?.levels?.[0] ?? null
+  const hi = stats?.levels?.[1] ?? null
+  const commit = (which: 0 | 1) => (raw: string) => {
+    const v = Number(raw)
+    if (!Number.isFinite(v) || lo == null || hi == null) return
+    onClim(which === 0 ? v : lo, which === 0 ? hi : v)
+  }
+
   return (
     <aside style={S.plotControl} data-testid="plot-control">
-      <Section title="Display">
-        <Select label="Colormap" value={colormap} options={COLORMAPS}
-          onChange={onColormap} testId="colormap-select" />
-        <Field label="Range low" value={stats?.levels?.[0] ?? null} />
-        <Field label="Range high" value={stats?.levels?.[1] ?? null} />
-      </Section>
-
       <Section title="Histogram">
         <Histogram stats={stats} />
+        <div style={{ display: 'flex', gap: 6, marginTop: 7 }}>
+          <Btn wide onClick={onAuto} testId="clim-auto"
+            title="Re-derive the display range from the current frame">Auto</Btn>
+        </div>
+        <div style={{ marginTop: 7 }}>
+          <FieldPair>
+            <Field label="Min" value={lo == null ? null : Number(lo.toPrecision(6))}
+              testId="clim-min" onCommit={lo == null ? undefined : commit(0)} />
+            <Field label="Max" value={hi == null ? null : Number(hi.toPrecision(6))}
+              testId="clim-max" onCommit={hi == null ? undefined : commit(1)} />
+          </FieldPair>
+        </div>
+      </Section>
+
+      <Section title="Colormap">
+        <Select label="" value={colormap} options={COLORMAPS}
+          onChange={onColormap} testId="colormap-select" wide />
       </Section>
 
       <Section title="Frame">
-        <Field label="Min" value={stats?.min} />
-        <Field label="Max" value={stats?.max} />
-        <Field label="Mean" value={stats?.mean == null ? null : stats.mean.toFixed(2)} />
-        <Field label="Std" value={stats?.std == null ? null : stats.std.toFixed(2)} />
+        <KV label="Min" value={stats?.min == null ? '—' : String(stats.min)} />
+        <KV label="Max" value={stats?.max == null ? '—' : String(stats.max)} />
+        <KV label="Mean" value={stats?.mean == null ? '—' : stats.mean.toFixed(2)} />
+        <KV label="Std" value={stats?.std == null ? '—' : stats.std.toFixed(2)} />
       </Section>
     </aside>
   )
@@ -507,33 +583,39 @@ function PlotControl({ stats, colormap, onColormap }: {
  * here once there is an interaction that needs it.
  */
 function Histogram({ stats }: { stats: FrameStats | null }) {
-  if (!stats || stats.min == null || stats.max == null) {
+  if (!stats || stats.min == null || stats.max == null || stats.bins == null) {
     return <div style={{ fontSize: 11.5, color: C.textMuted }}>No frame yet</div>
   }
+  const bins = stats.bins
+  const n = bins.length
+  // Log counts: a detector histogram is dominated by the background bin, and
+  // on a linear scale every feature that matters is a flat line on the axis.
+  const scaled = bins.map((b) => Math.log10(1 + Math.max(0, b)))
+  const peak = Math.max(...scaled, 1e-9)
+  const pts = scaled.map((v, i) => `${(i / (n - 1)) * 200},${50 - (v / peak) * 50}`)
+  const path = `M0,50 L${pts.join(' L')} L200,50 Z`
+
   const span = Math.max(stats.max - stats.min, 1e-9)
-  const lo = stats.levels ? (stats.levels[0] - stats.min) / span : 0
-  const hi = stats.levels ? (stats.levels[1] - stats.min) / span : 1
+  const x = (v: number) => ((v - stats.min!) / span) * 200
+  const [lo, hi] = stats.levels ?? [stats.min, stats.max]
+
   return (
     <div>
+      <svg viewBox="0 0 200 50" preserveAspectRatio="none" role="img"
+        aria-label="Intensity histogram with display range"
+        style={{ width: '100%', height: 50, display: 'block', borderRadius: 4 }}>
+        <rect width="200" height="50" fill={C.ctl} />
+        <path d={path} fill="#3a5a8c" />
+        {/* The clim handles, over the counts — the question this control
+            answers is "am I clipping?", which needs both together. */}
+        <line x1={x(lo)} y1="0" x2={x(lo)} y2="50" stroke={C.accent} strokeWidth="1.5" />
+        <line x1={x(hi)} y1="0" x2={x(hi)} y2="50" stroke={C.accent} strokeWidth="1.5" />
+      </svg>
       <div style={{
-        position: 'relative', height: 34, background: C.bgSunken,
-        border: `1px solid ${C.border}`, borderRadius: 5, overflow: 'hidden',
+        display: 'flex', justifyContent: 'space-between', marginTop: 3,
+        fontSize: 10, color: C.textMuted, fontFamily: FONT_MONO,
       }}>
-        <div style={{
-          position: 'absolute', top: 0, bottom: 0,
-          left: `${Math.max(0, lo) * 100}%`,
-          width: `${Math.min(1, hi - lo) * 100}%`,
-          background: `linear-gradient(90deg, ${C.accent}22, ${C.accent}55)`,
-          borderLeft: `1px solid ${C.accent}`, borderRight: `1px solid ${C.accent}`,
-        }} />
-      </div>
-      <div style={{
-        display: 'flex', justifyContent: 'space-between', marginTop: 4,
-        fontSize: 10.5, color: C.textMuted, fontFamily: FONT_MONO,
-      }}>
-        <span>{stats.min}</span>
-        <span>display range</span>
-        <span>{stats.max}</span>
+        <span>{stats.min}</span><span>{stats.max}</span>
       </div>
     </div>
   )
@@ -661,10 +743,19 @@ const S: Record<string, React.CSSProperties> = {
     background: '#e2b04a1a', color: '#e2b04a',
     fontSize: 9.5, fontWeight: 700, letterSpacing: '.06em',
   },
-  topBtn: {
-    display: 'flex', alignItems: 'center', gap: 8, padding: '5px 11px',
-    background: C.panelRaised, border: `1px solid ${C.border}`,
-    borderRadius: 6, color: C.text, fontSize: 12.5, cursor: 'pointer',
+  tempBtn: {
+    display: 'flex', alignItems: 'center', gap: 6, padding: '4px 9px',
+    background: C.ctl, border: `1px solid ${C.ctlLine}`, borderRadius: 6,
+    font: `12px ${FONT_MONO}`, fontVariantNumeric: 'tabular-nums',
+  },
+  readyChip: {
+    display: 'flex', alignItems: 'center', gap: 6, padding: '4px 10px',
+    background: C.ctl, border: `1px solid ${C.ctlLine}`, borderRadius: 999,
+    fontSize: 11.5, color: C.textDim,
+  },
+  popTitle: {
+    font: `600 9.5px/1 ${FONT_MONO}`, letterSpacing: '.11em',
+    textTransform: 'uppercase', color: C.textMuted, marginBottom: 8,
   },
   topGroup: {
     display: 'flex', alignItems: 'center', gap: 8, padding: '4px 10px',

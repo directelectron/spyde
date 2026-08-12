@@ -30,6 +30,7 @@ nothing. If it grows, `de_shell.actions.registry` is there to adopt.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 
@@ -37,17 +38,13 @@ from de_shell.ipc import emit, emit_error, emit_status
 from de_shell.plotting.figure import FigureView
 from de_shell.session import SessionBase
 
+from de_groundcrew import instrument as instrument_mod
 from de_groundcrew import status
 from de_groundcrew.instrument import Instrument
 from de_groundcrew.tile import DeapiTileBackend
 
 log = logging.getLogger(__name__)
 
-#: Properties the header reads. Deliberately short: every name here is a round
-#: trip on the one connection, and the simulator answers only a fraction of
-#: them (see `test_the_simulator_lacks_most_status_properties`). Unsupported
-#: names come back None and the UI shows them as unavailable rather than
-#: inventing a value.
 #: How long the live loop waits for one display refresh before giving up on it.
 #: Generous — a cold read of a large frame over a slow link is legitimately
 #: seconds — but finite, so a wedged server stops the loop instead of leaving a
@@ -63,6 +60,10 @@ STATUS_DEADLINE_S = 6.0
 #: so a new read would only queue behind it.
 STALL_S = 4.0
 
+#: Properties the instrument sidebar and top bar read. Deliberately short:
+#: every name is a round trip on the one connection, and the simulator answers
+#: only a fraction of them. Unsupported names come back None and the UI shows
+#: them as unavailable rather than inventing a value.
 HEADER_PROPS = (
     # Acquisition — the instrument sidebar's editable fields.
     "Frames Per Second",
@@ -81,13 +82,30 @@ HEADER_PROPS = (
 )
 
 
+def _port_from_env() -> int | None:
+    """`GROUNDCREW_PORT`, or None to let the Instrument decide.
+
+    None is not the same as the default: in fake mode an unpinned port becomes
+    a free one, so a leftover simulated server from an earlier run cannot make
+    the next launch fail to connect.
+    """
+    raw = os.environ.get(instrument_mod.PORT_ENV)
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning("ignoring non-numeric %s=%r", instrument_mod.PORT_ENV, raw)
+        return None
+
+
 class GroundCrewSession(SessionBase):
     """One instance per app lifetime."""
 
     def __init__(self, settings_dir: str) -> None:
         super().__init__(settings_dir=settings_dir)
 
-        self.instrument = Instrument()
+        self.instrument = Instrument(port=_port_from_env())
         self.info: dict = {}
         self.tiles: DeapiTileBackend | None = None
 
@@ -98,6 +116,8 @@ class GroundCrewSession(SessionBase):
         self._live_thread: threading.Thread | None = None
         self._refresh_pending = False
         self._levels: tuple[float, float] | None = None
+        #: True once the user typed a range; stops the histogram overriding it.
+        self._clim_manual = False
 
     # ── Startup ───────────────────────────────────────────────────────────────
 
@@ -182,6 +202,8 @@ class GroundCrewSession(SessionBase):
         contrast on a live view, while never re-setting it would leave the
         display wrong after an exposure change.
         """
+        if self._clim_manual:
+            return
         levels = (self.tiles.last_stats or {}).get("levels") if self.tiles else None
         if not levels:
             return
@@ -397,6 +419,33 @@ class GroundCrewSession(SessionBase):
     def _act_set_colormap(self, payload: dict) -> None:
         self._viewer.set_colormap(str(payload.get("name", "gray")))
 
+    def _act_set_clim(self, payload: dict) -> None:
+        """Pin the display range by hand.
+
+        Once set explicitly it STAYS set: `_apply_levels` only re-derives from
+        the histogram while the range is automatic. Someone who typed a range
+        to compare two frames does not want shot noise moving it back.
+        """
+        try:
+            lo, hi = float(payload["low"]), float(payload["high"])
+        except (KeyError, TypeError, ValueError):
+            emit_error(f"Invalid display range: {payload!r}")
+            return
+        if hi <= lo:
+            emit_error(f"Display range must increase: {lo} … {hi}")
+            return
+        if self._viewer.set_clim(lo, hi):
+            self._levels = (lo, hi)
+            self._clim_manual = True
+            emit_status(f"Display range {lo:g} … {hi:g}")
+
+    def _act_auto_clim(self, payload: dict) -> None:
+        """Hand the display range back to the histogram."""
+        self._clim_manual = False
+        self._levels = None
+        self._apply_levels()
+        emit_status("Display range: auto")
+
     def _emit_acq_state(self) -> None:
         emit({"type": "acq_state", "running": self._live.is_set()})
 
@@ -438,4 +487,6 @@ _ACTIONS = {
     "refresh_properties": GroundCrewSession._act_refresh_properties,
     "refresh_status": GroundCrewSession._act_refresh_status,
     "set_colormap": GroundCrewSession._act_set_colormap,
+    "set_clim": GroundCrewSession._act_set_clim,
+    "auto_clim": GroundCrewSession._act_auto_clim,
 }

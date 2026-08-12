@@ -221,9 +221,19 @@ test('controls with nothing behind them are disabled, not hidden', async () => {
   // neither temperature nor camera position.
   await expect(page.getByTestId('temp-btn')).toBeVisible()
   await expect(page.getByTestId('temp-btn')).toBeDisabled()
-  await expect(page.getByTestId('retract-btn')).toBeVisible()
-  await expect(page.getByTestId('retract-btn')).toBeDisabled()
-  await expect(page.getByTestId('position-value')).toHaveText('—')
+  await expect(page.getByTestId('temp-value')).toHaveText('—')
+  for (const id of ['extend-btn', 'retract-btn', 'cool-btn', 'warm-btn']) {
+    await expect(page.getByTestId(id), `${id} should exist`).toBeVisible()
+    await expect(page.getByTestId(id), `${id} should be disabled`).toBeDisabled()
+  }
+
+  // Disabled is not enough on its own — a greyed "Extend" could be read as
+  // "the camera is retracted". The reason has to be reachable.
+  await expect(page.getByTestId('extend-btn'))
+    .toHaveAttribute('title', /does not report camera position/)
+
+  // And the link chip must report the LINK, not stand in for hardware state.
+  await expect(page.getByTestId('link-state')).toHaveText('Ready')
 })
 
 test('every mode in the rail opens', async () => {

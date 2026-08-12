@@ -168,14 +168,20 @@ def _histogram_stats(hist) -> dict:
     plain min/max is unusable on a detector: one hot pixel at saturation drives
     the whole image black.
     """
-    empty = {"min": None, "max": None, "mean": None, "std": None, "levels": None}
+    empty = {"min": None, "max": None, "mean": None, "std": None,
+             "levels": None, "bins": None}
     try:
         counts = np.asarray(hist.data, dtype=np.float64)
         lo, hi = float(hist.min), float(hist.max)
     except (AttributeError, TypeError, ValueError):
         return empty
+    # `ndim != 1`, not `size == 0`: an unpopulated `Histogram()` yields a 0-d
+    # array, whose size is 1, so a size check passes it straight through to an
+    # "iteration over a 0-d array" TypeError — on the paint path.
+    if counts.ndim != 1 or counts.size == 0:
+        return empty
     total = counts.sum()
-    if counts.size == 0 or total <= 0 or not np.isfinite([lo, hi]).all():
+    if total <= 0 or not np.isfinite([lo, hi]).all():
         return empty
 
     # Bin CENTRES: a count in bin i means "values in [edge_i, edge_i+1)", and
@@ -193,7 +199,12 @@ def _histogram_stats(hist) -> dict:
         p_hi = p_lo + max(width, 1.0)
 
     return {"min": lo, "max": hi, "mean": mean, "std": float(np.sqrt(max(var, 0.0))),
-            "levels": (p_lo, p_hi)}
+            "levels": (p_lo, p_hi),
+            # The counts themselves, so Plot Control can draw the real
+            # distribution rather than a bar standing in for one. 256 integers
+            # per frame is a rounding error next to the pixels, and it is the
+            # only way to answer "am I clipping?" by eye.
+            "bins": [int(c) for c in counts]}
 
 
 def _num(v):

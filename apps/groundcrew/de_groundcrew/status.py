@@ -1,296 +1,386 @@
 """
 status.py — the camera status board, and what to do when the camera won't say.
 
-Every check declares the properties it needs and how to read them. Reading is
-one batched trip over the single connection; judging is pure functions on the
-values, which is what makes this testable without a server.
+A go/no-go board you check before committing microscope time. Everything should
+read green; the design's whole job is to make the one thing that is NOT read
+instantly.
+
+## One card per subsystem, not one per property
+
+An engineer thinks in subsystems — cooling, vacuum, the TEM link — so a card is
+a subsystem with several readings inside it, a headline value, and the property
+family it came from. Splitting them one-per-property produced a wall of
+identical tiles where nothing stood out, which defeats the point.
+
+Every card carries:
+
+``big``       the one value you read first, already judged
+``rows``      the supporting readings, each with its OWN state
+``source``    the property family, e.g. ``Temperature - *``. "Amber" is useless
+              if you cannot tell what to go and fix.
+``fix``       what to DO about it. Only present when something is wrong.
 
 ## Not knowing is a state
 
-The whole design turns on refusing to fake a green light. A card is:
+The board refuses to fake a green light. A card is:
 
 ``ok`` / ``warn`` / ``bad``
     The camera reported, and the value was judged against a rule.
 ``unreported``
-    The server does not expose the property at all. Measured, not hypothetical:
-    the simulator has 73 properties where a real server has 339, and 15 of the
-    22 this board wants are missing from it.
+    The server does not expose the properties at all. Measured, not
+    hypothetical: the simulator has 73 properties where a real server has 339.
 ``no_criteria``
-    The camera reported a value and there is no agreed threshold for it yet.
-    Sensor health is the case that matters — the owner deferred thresholds, so
-    the voltages are shown as readings and explicitly not judged.
+    It reported, and there is no agreed threshold yet. Sensor health is the
+    case that matters — thresholds were deferred, so the voltages are shown as
+    readings and explicitly not judged.
 
-``unreported`` and ``no_criteria`` both mean "this is not a green light", and
-they are kept apart because the fixes differ: one needs a richer server, the
-other needs a decision. Neither is counted as passing. The summary reports
-coverage — "9 of 14 checks reporting" — so a board that is green because it can
-only see four things cannot be mistaken for a healthy camera.
+``unreported`` and ``no_criteria`` are kept apart because the fixes differ: one
+needs a richer server, the other needs a decision. Neither counts as passing,
+and the banner reports coverage, so a board that is green because it can only
+see two things cannot be mistaken for a healthy camera.
 
 ## The TEM channel
 
 `Instrument Project *` reading its unset sentinel (-1) does NOT mean the
-microscope is uncalibrated — it means the DE↔TEM channel is not reporting. The
-two have completely different fixes, so they are different messages.
+microscope is uncalibrated — it means the DE↔TEM channel is not reporting.
+Different fault, different fix, so it gets its own card and its own wording.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable
 
-#: A card that passes, warns, fails, was not reported, or has no rule yet.
 OK, WARN, BAD, UNREPORTED, NO_CRITERIA = (
     "ok", "warn", "bad", "unreported", "no_criteria")
 
 #: `Instrument Project *` values when the DE↔TEM channel is not reporting.
 TEM_UNSET = (-1, -1.0)
 
-Verdict = tuple[str, str]          # (state, detail)
+#: States that do not count as a passing check.
+NOT_PASSING = (WARN, BAD, UNREPORTED, NO_CRITERIA)
+
+#: Worst-first, for reducing several row states into a card state.
+#:
+#: UNREPORTED ranks BELOW ok on purpose. A card with a live headline value and
+#: one missing supporting row is PARTIAL, not unreported — letting the missing
+#: row dominate turned "Vacuum: Ready" grey, which reads as no information at
+#: all. The gap is carried by the fix line and by the ok -> warn bump in
+#: `Card.run` instead. (An all-missing card never reaches here.)
+_SEVERITY = {BAD: 4, WARN: 3, NO_CRITERIA: 2, OK: 1, UNREPORTED: 0}
 
 
-@dataclass(frozen=True)
-class Check:
-    key: str
-    label: str
-    group: str
-    props: tuple[str, ...]
-    judge: Callable[[dict], Verdict]
-    #: Properties that may be absent without making the card unreported — used
-    #: where one reading is the check and the others are context.
-    optional: tuple[str, ...] = field(default=())
+# ── Property names ────────────────────────────────────────────────────────────
 
-    def run(self, values: dict) -> dict:
-        missing = [p for p in self.props
-                   if p not in self.optional and values.get(p) is None]
-        if missing:
-            state, detail = UNREPORTED, f"not reported by this server"
-        else:
-            try:
-                state, detail = self.judge(values)
-            except Exception as e:                  # a rule must never take the board down
-                state, detail = UNREPORTED, f"could not be read ({e})"
-        return {
-            "key": self.key, "label": self.label, "group": self.group,
-            "state": state, "detail": detail,
-            "readings": {p: values.get(p) for p in self.props},
-            "missing": missing,
-        }
+DETECTOR_T = "Temperature - Detector (Celsius)"
+DETECTOR_STATUS = "Temperature - Detector Status"
+WATER_T = "Temperature - Chilled Water (Celsius)"
+WATER_STATUS = "Temperature - Chilled Water Status"
+TEMP_CONTROL = "Temperature - Control"
+VACUUM = "Vacuum State"
+COVER = "Protection Cover Status"
+POSITION = "Camera Position Status"
+BAD_PIXEL = "Image Processing - Bad Pixel Correction"
+FLATFIELD = "Image Processing - Flatfield Correction"
+MAGNIFICATION = "Instrument Project Magnification"
+CAMERA_LENGTH = "Instrument Project Camera Length (centimeters)"
+SPECIMEN_PX = "Specimen Pixel Size X (nanometers)"
+SERVER_VERSION = "Server Software Version"
+FIRMWARE = "Firmware Version"
+
+VOLTAGES = ("System Voltage - Main Sensor 1.8 V (mV)",
+            "System Voltage - Main Sensor 3.3 VA (mV)",
+            "System Voltage - Main Sensor 3.3 VD (mV)")
+SENSOR_TEMPS = ("System Temperature - ADC 1 (0.1 K)",
+                "System Temperature - Heat Exchanger (0.1 K)")
 
 
-# ── Rules ─────────────────────────────────────────────────────────────────────
+# ── Small helpers ─────────────────────────────────────────────────────────────
 
 def _txt(v: Any) -> str:
     return "" if v is None else str(v).strip()
 
 
-def _status_word(v: Any, *, good: tuple[str, ...]) -> Verdict:
+def _num(v: Any) -> float | None:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _row(label: str, value: Any, state: str = OK, *, unit: str = "") -> dict:
+    """One reading. A missing value renders as an em dash, never as zero."""
+    if value is None:
+        return {"label": label, "value": "—", "state": UNREPORTED}
+    text = f"{value}{(' ' + unit) if unit else ''}"
+    return {"label": label, "value": text, "state": state}
+
+
+def _short(prop: str) -> str:
+    """A property name with its family prefix dropped.
+
+    The card header already carries the family (``Temperature - *``), so the
+    rows repeating it wastes the width that the value needs. ``Instrument
+    Project Magnification`` has no separator, so it is left whole.
+    """
+    return prop.rsplit(" - ", 1)[-1]
+
+
+def _worst(*states: str) -> str:
+    return max(states, key=lambda s: _SEVERITY.get(s, 0)) if states else UNREPORTED
+
+
+def _status_word(v: Any, *, good: tuple[str, ...]) -> str:
     """Judge a server status string by its wording.
 
-    Unrecognised wording is reported as a warning rather than assumed fine:
-    these strings are free text from the server, and a status this board has
-    never seen is exactly the case where quietly showing green is wrong.
+    Wording this board has never seen WARNS rather than passing: these are free
+    text from the server, and an unknown status is exactly the case where
+    quietly showing green is wrong.
     """
-    s = _txt(v)
+    s = _txt(v).lower()
     if not s:
-        return UNREPORTED, "blank"
-    low = s.lower()
-    if any(g in low for g in good):
-        return OK, s
-    if any(w in low for w in ("error", "fault", "fail", "alarm", "over", "trip")):
-        return BAD, s
-    return WARN, f"{s} (unrecognised status)"
+        return UNREPORTED
+    if any(w in s for w in ("error", "fault", "fail", "alarm", "trip", "over")):
+        return BAD
+    return OK if any(g in s for g in good) else WARN
 
 
-def _chilled_water(v: dict) -> Verdict:
-    state, detail = _status_word(v["Temperature - Chilled Water Status"],
-                                 good=("ok", "normal", "good", "ready"))
-    temp = v.get("Temperature - Chilled Water (Celsius)")
-    if temp is not None:
-        detail = f"{detail} · {float(temp):.1f} °C"
-    return state, detail
+def _switch(v: Any) -> bool | None:
+    """True/False for an on-off property, None if the wording is unrecognised."""
+    if v is True or v is False:
+        return v
+    s = _txt(v).lower()
+    if s in ("on", "true", "1", "enabled", "yes", "applied"):
+        return True
+    if s in ("off", "false", "0", "disabled", "no"):
+        return False
+    return None
 
 
-def _detector_temp(v: dict) -> Verdict:
-    state, detail = _status_word(v["Temperature - Detector Status"],
-                                 good=("ok", "normal", "stable", "ready", "cooled"))
-    temp = v.get("Temperature - Detector (Celsius)")
-    if temp is not None:
-        detail = f"{detail} · {float(temp):.1f} °C"
-    return state, detail
+# ── Cards ─────────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class Card:
+    key: str
+    title: str
+    source: str
+    props: tuple[str, ...]
+    build: Callable[[dict], dict]
+    #: Properties that are CONTEXT, not the check. Still read and still shown,
+    #: but their absence does not make the card announce a gap — a card that
+    #: says "partly reported" because one supporting reading is missing trains
+    #: people to ignore the line that matters.
+    optional: tuple[str, ...] = ()
+
+    def run(self, values: dict) -> dict:
+        missing = [p for p in self.props if values.get(p) is None]
+        essential_missing = [p for p in missing if p not in self.optional]
+
+        if len(missing) == len(self.props):
+            # Nothing at all to show. The ROWS name the properties — that is
+            # what tells someone whether the server is old or a check is
+            # pointed at the wrong name — so there is deliberately no `fix`
+            # line here: it would repeat the rows verbatim and double the
+            # height of every dark card on the board.
+            return self._card(
+                UNREPORTED, "Not reported", missing,
+                rows=[_row(_short(p), None) for p in self.props])
+        try:
+            out = self.build(values)
+        except Exception as e:                 # a rule must never take the board down
+            return self._card(UNREPORTED, "Unreadable", missing,
+                              fix=f"Could not be read: {e}")
+
+        fix = out.get("fix", "")
+        if essential_missing and not fix:
+            fix = ("Not exposed by this server: " +
+                   ", ".join(_short(p) for p in essential_missing) + ".")
+        state = out.get("state", UNREPORTED)
+        # Partial information is not a pass. The card keeps its live headline,
+        # but an absent essential reading stops it showing green.
+        if essential_missing and state == OK:
+            state = WARN
+        return self._card(state, out.get("big", ""), missing,
+                          rows=out.get("rows", []), fix=fix,
+                          chips=out.get("chips", []), tone=out.get("big_tone", ""))
+
+    def _card(self, state: str, big: str, missing: list, *, rows=(), fix="",
+              chips=(), tone="") -> dict:
+        return {"key": self.key, "title": self.title, "source": self.source,
+                "state": state, "big": big, "big_tone": tone,
+                "rows": list(rows), "chips": list(chips), "fix": fix,
+                "missing": list(missing)}
 
 
-def _camera_position(v: dict) -> Verdict:
+# ── Rules ─────────────────────────────────────────────────────────────────────
+
+def _system(v: dict) -> dict:
+    return {
+        "state": OK, "big": "OK",
+        "rows": [_row("Server", v.get(SERVER_VERSION)),
+                 _row("Firmware", v.get(FIRMWARE))],
+    }
+
+
+def _tem_channel(v: dict) -> dict:
+    mag, cl, px = (_num(v.get(MAGNIFICATION)), _num(v.get(CAMERA_LENGTH)),
+                   _num(v.get(SPECIMEN_PX)))
+    reported = [x for x in (mag, cl, px) if x is not None]
+    unset = [x for x in reported if x in TEM_UNSET]
+
+    if reported and len(unset) == len(reported):
+        return {
+            "state": BAD, "big": "No link",
+            "rows": [_row("Magnification", v.get(MAGNIFICATION), BAD),
+                     _row("Camera length", v.get(CAMERA_LENGTH), BAD),
+                     _row("Specimen px", v.get(SPECIMEN_PX), BAD)],
+            "fix": "Every Instrument Project property reads its unset sentinel — "
+                   "the microscope is not reporting to DE. Scale bars and "
+                   "calibrated pixel sizes will be wrong.",
+        }
+    st = WARN if unset else OK
+    return {
+        "state": st, "big": "Reporting" if st == OK else "Partial",
+        "rows": [_row("Magnification", None if mag is None else f"×{mag:g}",
+                      BAD if mag in TEM_UNSET else OK),
+                 _row("Camera length", None if cl is None else f"{cl:g} cm",
+                      BAD if cl in TEM_UNSET else OK),
+                 _row("Specimen px", None if px is None else f"{px:.4g} nm",
+                      BAD if px in TEM_UNSET else OK)],
+        "fix": "" if st == OK else
+               "Some Instrument Project properties read their unset sentinel.",
+    }
+
+
+def _cooling(v: dict) -> dict:
+    det_t, water_t = _num(v.get(DETECTOR_T)), _num(v.get(WATER_T))
+    det_state = _status_word(v.get(DETECTOR_STATUS),
+                             good=("ok", "normal", "stable", "ready", "cooled"))
+    water_state = _status_word(v.get(WATER_STATUS), good=("ok", "normal", "good", "ready"))
+
+    fix = ""
+    # A thermocouple reading absolute zero is an ABSENT SENSOR, not cold water.
+    # Reporting the status and the value separately is the point: averaging
+    # them into one light is how "OK · -273.1 °C" gets shown as green.
+    if water_t is not None and water_t < -270:
+        water_state = WARN
+        fix = ("Chilled-water status says OK but the value is absolute zero — "
+               "the sensor is absent, not the water.")
+    if det_t is not None and det_t < -270:
+        det_state = WARN
+        fix = fix or "Detector temperature reads absolute zero — sensor absent."
+
+    big = "—" if det_t is None else f"{det_t:.1f} °C"
+    return {
+        "state": _worst(det_state, water_state), "big": big, "big_tone": "cryo",
+        "rows": [_row("Detector", v.get(DETECTOR_STATUS), det_state),
+                 _row("Chilled water",
+                      None if water_t is None else f"{_txt(v.get(WATER_STATUS)) or '—'} · {water_t:.1f} °C",
+                      water_state),
+                 _row("Control", v.get(TEMP_CONTROL))],
+        "fix": fix,
+    }
+
+
+def _vacuum_cover(v: dict) -> dict:
+    vac = _status_word(v.get(VACUUM), good=("ok", "normal", "ready", "vacuum", "pumped"))
+    cover = _status_word(v.get(COVER), good=("open", "closed", "ok", "normal"))
     # Position is not good or bad — a retracted camera is correct when the
-    # operator retracted it. The card reports the state and flags only motion
-    # or an error, so it does not nag about a deliberate choice.
-    s = _txt(v["Camera Position Status"])
-    low = s.lower()
-    if any(w in low for w in ("moving", "inserting", "retracting", "unknown")):
-        return WARN, s
-    if any(w in low for w in ("error", "fault", "fail")):
-        return BAD, s
-    return OK, s
+    # operator retracted it. Only motion or an error is worth a colour.
+    pos_text = _txt(v.get(POSITION))
+    pos = (WARN if any(w in pos_text.lower()
+                       for w in ("moving", "inserting", "retracting", "unknown"))
+           else OK)
+    return {
+        "state": _worst(vac, cover),
+        "big": _txt(v.get(VACUUM)) or "—",
+        "rows": [_row("Cover", v.get(COVER), cover),
+                 _row("Position", v.get(POSITION), pos)],
+    }
 
 
-def _cover(v: dict) -> Verdict:
-    return _status_word(v["Protection Cover Status"],
-                        good=("open", "closed", "ok", "normal"))
+def _corrections(v: dict) -> dict:
+    bp, ff = _switch(v.get(BAD_PIXEL)), _switch(v.get(FLATFIELD))
+
+    def one(flag, raw):
+        if flag is None:
+            return (UNREPORTED, "—") if raw is None else (WARN, f"{_txt(raw)}?")
+        return (OK, "Applied") if flag else (WARN, "Not applied")
+
+    bp_state, bp_text = one(bp, v.get(BAD_PIXEL))
+    ff_state, ff_text = one(ff, v.get(FLATFIELD))
+    off = [n for n, f in (("bad pixel", bp), ("flatfield", ff)) if f is False]
+    return {
+        "state": _worst(bp_state, ff_state),
+        "big": "Applied" if bp and ff else ("Partial" if (bp or ff) else "Not applied"),
+        "rows": [_row("Bad pixel", bp_text, bp_state),
+                 _row("Flatfield", ff_text, ff_state)],
+        # Off is a WARNING, never an error: running without flatfield is a
+        # legitimate deliberate choice. The board exists to stop it happening
+        # by ACCIDENT.
+        "fix": (f"{', '.join(off).capitalize()} correction is switched off. "
+                "Deliberate is fine; by accident is not.") if off else "",
+    }
 
 
-def _vacuum(v: dict) -> Verdict:
-    return _status_word(v["Vacuum State"], good=("ok", "normal", "ready", "vacuum", "pumped"))
+def _sensor_health(v: dict) -> dict:
+    rows = [_row(p.rsplit(" - ", 1)[-1], v.get(p), NO_CRITERIA)
+            for p in (*VOLTAGES, *SENSOR_TEMPS) if v.get(p) is not None]
+    return {
+        "state": NO_CRITERIA, "big": "Not assessed", "rows": rows,
+        "fix": "Readings only — no thresholds have been agreed for these yet, "
+               "so they are not counted as a passing check.",
+    }
 
 
-def _on_off(prop: str, label: str) -> Callable[[dict], Verdict]:
-    """A correction that is either applied or not.
-
-    Off is a WARNING, never an error: running without flatfield is a legitimate
-    thing to do deliberately. The board's job is to make it impossible to do by
-    accident.
-    """
-    def judge(v: dict) -> Verdict:
-        raw = v[prop]
-        s = _txt(raw).lower()
-        on = raw is True or s in ("on", "true", "1", "enabled", "yes")
-        off = raw is False or s in ("off", "false", "0", "disabled", "no")
-        if on:
-            return OK, f"{label} applied"
-        if off:
-            return WARN, f"{label} NOT applied"
-        return WARN, f"unrecognised setting: {_txt(raw)!r}"
-    return judge
-
-
-def _magnification(v: dict) -> Verdict:
-    mag = v["Instrument Project Magnification"]
-    try:
-        as_num = float(mag)
-    except (TypeError, ValueError):
-        as_num = None
-    if as_num is not None and as_num in TEM_UNSET:
-        # The owner's correction: this is a dead channel, not a missing
-        # calibration. Saying "calibration required" would send an engineer to
-        # the wrong place entirely.
-        return BAD, "DE↔TEM channel not reporting"
-    px = v.get("Specimen Pixel Size X (nanometers)")
-    detail = f"{mag}×"
-    if px not in (None, *TEM_UNSET):
-        detail += f" · {float(px):.4g} nm/px"
-    return OK, detail
-
-
-def _camera_length(v: dict) -> Verdict:
-    cl = v["Instrument Project Camera Length (centimeters)"]
-    try:
-        as_num = float(cl)
-    except (TypeError, ValueError):
-        as_num = None
-    if as_num is not None and as_num in TEM_UNSET:
-        return BAD, "DE↔TEM channel not reporting"
-    return OK, f"{cl} cm"
-
-
-def _readings_only(label: str, props: tuple[str, ...]) -> Callable[[dict], Verdict]:
-    """Report values without judging them.
-
-    For sensor health: the owner deferred the thresholds, so there is no rule to
-    apply. Showing the numbers is useful; colouring them green would be a claim
-    nobody has made.
-
-    Takes its property names explicitly because `judge` receives the WHOLE
-    values dict, not the check's slice — iterating it would list every property
-    the board read.
-    """
-    def judge(v: dict) -> Verdict:
-        shown = [f"{p.rsplit(' - ', 1)[-1]} {v[p]}" for p in props if v.get(p) is not None]
-        return NO_CRITERIA, (f"{label}: " + ", ".join(shown)) if shown else label
-    return judge
-
-
-def _software(v: dict) -> Verdict:
-    parts = [f"server {v['Server Software Version']}"]
-    fw = v.get("Firmware Version")
-    if fw is not None:
-        parts.append(f"firmware {fw}")
-    return OK, " · ".join(parts)
-
-
-# ── The board ─────────────────────────────────────────────────────────────────
-
-_VOLTAGES = ("System Voltage - Main Sensor 1.8 V (mV)",
-             "System Voltage - Main Sensor 3.3 VA (mV)",
-             "System Voltage - Main Sensor 3.3 VD (mV)")
-_SENSOR_TEMPS = ("System Temperature - ADC 1 (0.1 K)",
-                 "System Temperature - Heat Exchanger (0.1 K)")
-
-CHECKS: tuple[Check, ...] = (
-    Check("chilled_water", "Chilled water", "Cooling",
-          ("Temperature - Chilled Water Status", "Temperature - Chilled Water (Celsius)"),
-          _chilled_water, optional=("Temperature - Chilled Water (Celsius)",)),
-    Check("detector_temp", "Detector temperature", "Cooling",
-          ("Temperature - Detector Status", "Temperature - Detector (Celsius)"),
-          _detector_temp, optional=("Temperature - Detector (Celsius)",)),
-
-    Check("camera_position", "Camera position", "Mechanics",
-          ("Camera Position Status",), _camera_position),
-    Check("cover", "Protection cover", "Mechanics",
-          ("Protection Cover Status",), _cover),
-    Check("vacuum", "Vacuum", "Mechanics", ("Vacuum State",), _vacuum),
-
-    Check("bad_pixel", "Bad pixel correction", "Corrections",
-          ("Image Processing - Bad Pixel Correction",),
-          _on_off("Image Processing - Bad Pixel Correction", "Bad pixel correction")),
-    Check("flatfield", "Flatfield correction", "Corrections",
-          ("Image Processing - Flatfield Correction",),
-          _on_off("Image Processing - Flatfield Correction", "Flatfield")),
-
-    Check("magnification", "Magnification calibration", "Calibration",
-          ("Instrument Project Magnification", "Specimen Pixel Size X (nanometers)"),
-          _magnification, optional=("Specimen Pixel Size X (nanometers)",)),
-    Check("camera_length", "Camera length", "Calibration",
-          ("Instrument Project Camera Length (centimeters)",), _camera_length),
-
-    Check("sensor_voltages", "Sensor voltages", "Sensor health",
-          _VOLTAGES, _readings_only("rails", _VOLTAGES)),
-    Check("sensor_temps", "Sensor temperatures", "Sensor health",
-          _SENSOR_TEMPS, _readings_only("sensors", _SENSOR_TEMPS)),
-
-    Check("software", "Software", "System",
-          ("Server Software Version", "Firmware Version"),
-          _software, optional=("Firmware Version",)),
+CARDS: tuple[Card, ...] = (
+    Card("system", "System", "Server Software Version",
+         (SERVER_VERSION, FIRMWARE), _system, optional=(FIRMWARE,)),
+    Card("tem", "DE ↔ TEM channel", "Instrument Project *",
+         (MAGNIFICATION, CAMERA_LENGTH, SPECIMEN_PX), _tem_channel,
+         optional=(SPECIMEN_PX,)),
+    Card("cooling", "Cooling", "Temperature - *",
+         (DETECTOR_T, DETECTOR_STATUS, WATER_T, WATER_STATUS, TEMP_CONTROL),
+         _cooling, optional=(TEMP_CONTROL,)),
+    Card("vacuum", "Vacuum & cover", "Vacuum State",
+         (VACUUM, COVER, POSITION), _vacuum_cover, optional=(POSITION,)),
+    Card("corrections", "Image corrections", "Image Processing - *",
+         (BAD_PIXEL, FLATFIELD), _corrections),
+    Card("sensor", "Sensor health", "System Voltage / Temperature - *",
+         (*VOLTAGES, *SENSOR_TEMPS), _sensor_health),
 )
 
 #: Every property the board needs, de-duplicated — ONE batched read per refresh.
 STATUS_PROPS: tuple[str, ...] = tuple(dict.fromkeys(
-    p for c in CHECKS for p in c.props))
-
-#: States that do not count as a passing check.
-NOT_PASSING = (WARN, BAD, UNREPORTED, NO_CRITERIA)
+    p for c in CARDS for p in c.props))
 
 
 def build_report(values: dict, *, link: dict | None = None) -> dict:
-    """Judge every check and summarise. Pure — no I/O, no server.
+    """Judge every card and summarise. Pure — no I/O, no server.
 
     *link* describes the CONNECTION itself, which the caller judges rather than
     this module: it is the one check that must work when nothing else does, so
-    it cannot depend on having read a property. Passing ``{"state": BAD, ...}``
-    for an unresponsive camera turns an empty *values* from a silently blank
-    board into an explicit "the camera stopped answering".
+    it cannot depend on having read a property.
     """
-    cards = [c.run(values) for c in CHECKS]
+    cards = []
     if link is not None:
-        cards.insert(0, {
-            "key": "connection", "label": "Connection", "group": "System",
-            "state": link.get("state", UNREPORTED),
-            "detail": link.get("detail", ""), "readings": {}, "missing": [],
+        state = link.get("state", UNREPORTED)
+        cards.append({
+            "key": "connection", "title": "Connection", "source": "DE Server",
+            "state": state, "big": "Responding" if state == OK else "No response",
+            "rows": [], "chips": [],
+            "fix": "" if state == OK else link.get("detail", ""),
+            "missing": [],
         })
-    by_state: dict[str, int] = {}
-    for c in cards:
-        by_state[c["state"]] = by_state.get(c["state"], 0) + 1
+    cards += [c.run(values) for c in CARDS]
 
-    reporting = len(cards) - by_state.get(UNREPORTED, 0)
-    if by_state.get(BAD):
+    counts: dict[str, int] = {}
+    for c in cards:
+        counts[c["state"]] = counts.get(c["state"], 0) + 1
+
+    reporting = len(cards) - counts.get(UNREPORTED, 0)
+    if counts.get(BAD):
         overall = BAD
-    elif by_state.get(WARN):
+    elif counts.get(WARN):
         overall = WARN
     elif reporting == 0:
         # Nothing to be green ABOUT. Without this, a server that answers
@@ -299,12 +389,6 @@ def build_report(values: dict, *, link: dict | None = None) -> dict:
     else:
         overall = OK
 
-    return {
-        "cards": cards,
-        "summary": {
-            "overall": overall,
-            "counts": by_state,
-            "reporting": reporting,
-            "total": len(cards),
-        },
-    }
+    return {"cards": cards,
+            "summary": {"overall": overall, "counts": counts,
+                        "reporting": reporting, "total": len(cards)}}

@@ -41,6 +41,16 @@ DEFAULT_PORT = 13240
 #: hardware. What `npm run dev` and the e2e suite use.
 FAKE_ENV = "GROUNDCREW_FAKE_SERVER"
 
+#: Override the port. Real hardware only — in fake mode a free port is chosen.
+PORT_ENV = "GROUNDCREW_PORT"
+
+
+def _free_port() -> int:
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
 
 class FakeServerProcess:
     """deapi's simulated DE Server, as a child process.
@@ -64,11 +74,21 @@ class FakeServerProcess:
         )
         atexit.register(self.stop)
 
+        opening: list[str] = []
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             line = self._proc.stdout.readline() if self._proc.stdout else ""
+            if line:
+                opening.append(line.rstrip())
             if not line and self._proc.poll() is not None:
-                raise RuntimeError(f"fake DE server exited with {self._proc.returncode}")
+                # Quote the child's own output. "exited with 1" says nothing,
+                # and the usual cause — the port already held by a stray server
+                # from an earlier run — is stated plainly in the traceback the
+                # child prints.
+                tail = "\n".join(opening[-8:]) or "(no output)"
+                raise RuntimeError(
+                    f"fake DE server on port {self.port} exited with "
+                    f"{self._proc.returncode}:\n{tail}")
             if "started" in line.lower():
                 log.info("fake DE server listening on %d", self.port)
                 # Drain the rest on a daemon thread: the pipe has a finite
@@ -98,9 +118,12 @@ class Instrument:
     and nothing but the io thread ever touches the client.
     """
 
-    def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
+    def __init__(self, host: str = DEFAULT_HOST, port: int | None = None) -> None:
         self.host = host
-        self.port = port
+        #: A pinned port is honoured verbatim; the default is only a default,
+        #: and in fake mode is replaced by a free one (see `_connect`).
+        self._port_pinned = port is not None
+        self.port = DEFAULT_PORT if port is None else port
         self.client: Any = None
         self._fake: FakeServerProcess | None = None
         self._closed = False
@@ -136,6 +159,13 @@ class Instrument:
         from deapi import Client
 
         if fake:
+            # In fake mode the port is OUR implementation detail — we spawn the
+            # server and we are its only client — so take a free one unless the
+            # caller pinned it. A fixed default meant one leftover server from
+            # an earlier run made every subsequent launch fail to connect, which
+            # presents as "Offline" with nothing obviously wrong.
+            if not self._port_pinned:
+                self.port = _free_port()
             self._fake = FakeServerProcess(self.port)
             self._fake.start()
 
