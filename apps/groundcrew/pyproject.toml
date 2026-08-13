@@ -23,6 +23,12 @@ dependencies = [
     # on. Keep a pre-release in the specifier until 5.3 final ships.
     "deapi>=5.3b6",
     "numpy>=1.20.0",
+    "scipy>=1.10",
+    # Movie stacks and gain references. Motion correction reads MRC and TIFF;
+    # the vendored compute imports them lazily, so a missing one is an
+    # ImportError at Open time rather than at startup.
+    "mrcfile>=1.4",
+    "tifffile>=2023.1.1",
 ]
 
 [project.optional-dependencies]

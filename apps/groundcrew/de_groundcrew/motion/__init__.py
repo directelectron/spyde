@@ -1,32 +1,26 @@
 """
-motion — the old Ground Crew's S.T.A.C.K. motion correction, Qt-free.
+motion — Ground Crew's motion correction, on this app's Qt-free plumbing.
 
-Recovered from a deleted branch of the PySide6 app and ported; MOTION.md is the
-feature inventory and records what changed and what was deliberately left out.
+The compute is **not** implemented here. It is vendored verbatim in
+`de_groundcrew.external.gc_motion` from the upstream repo, and `driver` is the
+thin layer that calls it with `progress` / `should_cancel` callbacks instead of
+Qt signals. See that package's docstring for why, and MOTION.md for the feature
+inventory.
 
-Phase 1 (`align`) is whole-frame drift correction; Phase 2 (`local`) is the
-patch-based residual field, and runs on Phase 1's output. Phase 3 (CTF) was
-planned in the old repo but never written, so there is nothing to port.
+Everything this module exports is re-exported from `driver`, so callers never
+reach into the vendored code directly — which keeps the seam small enough that
+re-syncing upstream is a file copy.
 """
-from de_groundcrew.motion.align import (
-    Cancelled, REFERENCES, align_stack, apply_shift_fourier, bandpass_filter,
-    cross_correlate, smooth_shifts, upsampled_dft)
-from de_groundcrew.motion.frames import (
-    ORIENTATION_LABELS, apply_orientation, bin_image, load_gain,
-    load_movie_stack, log_fft, match_gain_to_frame, save_image,
-    validate_gain_orientation)
-from de_groundcrew.motion.local import (
-    apply_local_shifts, build_cosine_blend_weights, correct_local_motion,
-    correlate_patches, evaluate_motion_field, fit_motion_field,
-    generate_patch_grid, smooth_patch_shifts)
+from de_groundcrew.motion.driver import (
+    Cancelled, MODES, ORIENTATION_LABELS, align_stack, apply_orientation,
+    classify_gain_tier, correct_local_motion, load_gain, load_movie_stack,
+    log_fft, match_gain_to_frame, rank_gain_orientations, save_image,
+)
 
 __all__ = [
-    "Cancelled", "REFERENCES", "ORIENTATION_LABELS",
-    "align_stack", "apply_shift_fourier", "bandpass_filter", "cross_correlate",
-    "smooth_shifts", "upsampled_dft",
-    "apply_orientation", "bin_image", "load_gain", "load_movie_stack",
-    "log_fft", "match_gain_to_frame", "save_image", "validate_gain_orientation",
-    "apply_local_shifts", "build_cosine_blend_weights", "correct_local_motion",
-    "correlate_patches", "evaluate_motion_field", "fit_motion_field",
-    "generate_patch_grid", "smooth_patch_shifts",
+    "Cancelled", "MODES", "ORIENTATION_LABELS",
+    "align_stack", "correct_local_motion",
+    "load_movie_stack", "load_gain", "save_image", "log_fft",
+    "apply_orientation", "match_gain_to_frame",
+    "rank_gain_orientations", "classify_gain_tier",
 ]

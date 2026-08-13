@@ -45,6 +45,8 @@ class MotionController:
         self.meta: dict = {}
         self.gain: np.ndarray | None = None
         self.gain_name: str = ""
+        #: "ok" / "weak" / "fail" from the last gain validation, or "".
+        self.gain_tier: str = ""
         self.orientation: int = 0
         self.result: dict | None = None
         self.local_result: dict | None = None
@@ -152,9 +154,10 @@ class MotionController:
                            (3 * size // 4, size // 5)):
                 img[cy - 2:cy + 3, cx - 2:cx + 3] += 2.0
 
-            from de_groundcrew.motion import apply_shift_fourier
-            stack = np.stack([apply_shift_fourier(img.astype(np.float32),
-                                                  1.5 * i, -1.0 * i)
+            from de_groundcrew.external.gc_motion._worker_extracts import (
+                _apply_shift_fourier)
+            stack = np.stack([_apply_shift_fourier(img.astype(np.float32),
+                                                   1.5 * i, -1.0 * i)
                               for i in range(n_frames)]).astype(np.float32)
             meta = {"n_frames": n_frames, "height": size, "width": size,
                     "filename": "synthetic_drift.mrc", "path": "",
@@ -193,29 +196,40 @@ class MotionController:
             return
 
         def _check() -> None:
-            results = motion.validate_gain_orientation(self.stack[0], self.gain)
+            scores, separation = motion.rank_gain_orientations(
+                self.stack[0], self.gain)
+            tier = motion.classify_gain_tier(separation)
 
             def _apply() -> None:
-                if not results:
+                if not scores:
                     emit_error("No gain orientation fits this frame")
                     return
-                score, label, idx = results[0]
+                _score, label, idx = scores[0]
                 self.orientation = idx
-                # The margin is the confidence: if the best two score alike,
-                # the detection has not really decided anything.
-                margin = (results[1][0] - score) / score if len(results) > 1 else 1.0
-                emit_status(f"Gain orientation: {label} "
-                            f"({'confident' if margin > 0.05 else 'weak'})")
-                emit({"type": "motion_gain_scores",
+                self.gain_tier = tier
+                # A "fail" tier means the eight orientations scored alike, i.e.
+                # this gain does not fit this sensor at all — a wrong camera
+                # type or a corrupt reference. Adopting the best of eight ties
+                # would ruin every frame silently, so say so loudly.
+                msg = f"Gain orientation: {label} · separation {separation:.2f} ({tier})"
+                if tier == "fail":
+                    emit_error(msg + " — this gain does not appear to fit this "
+                                     "sensor; check it is the right camera")
+                elif tier == "weak":
+                    emit_status(msg + " — weak, verify before relying on it")
+                else:
+                    emit_status(msg)
+                emit({"type": "motion_gain_scores", "tier": tier,
+                      "separation": float(separation),
                       "scores": [{"label": l, "index": i, "score": float(s)}
-                                 for s, l, i in results]})
+                                 for s, l, i in scores]})
                 self._emit_state()
             self._dispatch(_apply)
 
         self._run_async("Gain validation", _check)
 
-    def align(self, *, bin_factor: int, reference: str, throw: int,
-              local: bool, patch_size: int) -> None:
+    def align(self, *, mode: str, throw: int, local: bool,
+              patch_size: int, bin_factor: int = 2, apix: float = 1.0) -> None:
         if self.stack is None:
             emit_error("Load a movie stack first")
             return
@@ -223,7 +237,7 @@ class MotionController:
         def _go() -> None:
             result = motion.align_stack(
                 self.stack, gain=self.gain, gain_orientation=self.orientation,
-                bin_factor=bin_factor, reference=reference, throw=throw,
+                apix=apix, mode=mode, throw=throw,
                 progress=self._progress, should_cancel=self._cancel.is_set)
 
             local_result = None
@@ -243,9 +257,18 @@ class MotionController:
                 self._view = "corrected" if local_result else "aligned"
                 self._paint()
                 self._emit_shifts()
-                emit_status(f"Aligned {result['n_frames']} frames"
-                            + (f" + local ({local_result['n_patches']} patches)"
-                               if local_result else ""))
+                if result.get("low_confidence"):
+                    # v3 refuses an implausible alignment rather than showing
+                    # one. Surfacing it as an ERROR, not a status line, is the
+                    # point of fail-loud — the result is still displayed so it
+                    # can be inspected, but nobody uses it by accident.
+                    emit_error("Alignment is not trustworthy: "
+                               + (result.get("failure_reason")
+                                  or "confidence check failed"))
+                else:
+                    emit_status(f"Aligned {result['n_frames']} frames"
+                                + (f" + local ({local_result['n_patches']} patches)"
+                                   if local_result else ""))
             self._dispatch(_apply)
 
         self._run_async("Alignment", _go)
@@ -347,9 +370,13 @@ class MotionController:
             "frame": self._frame_idx,
             "view": self._view,
             "gain": self.gain_name or None,
+            "gain_tier": self.gain_tier,
             "orientation": self.orientation,
             "orientations": list(motion.ORIENTATION_LABELS),
             "has_result": self.result is not None,
+            "low_confidence": bool((self.result or {}).get("low_confidence", False)),
+            "failure_reason": (self.result or {}).get("failure_reason", ""),
+            "modes": list(motion.MODES),
             "has_local": self.local_result is not None,
             "image_window": self.image.window_id,
             "fft_window": self.fft.window_id,

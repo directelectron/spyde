@@ -1,371 +1,327 @@
 """
-test_motion.py — the ported motion correction.
+test_motion.py — the motion driver, and the integrity of the vendored compute.
 
-The old implementation had NO tests: everything ran inside a `QThread.run()`
-that could only be exercised through the GUI. Dropping Qt is what makes these
-possible, and the important ones are end-to-end on synthetic data with a KNOWN
-drift — an alignment that runs without error but recovers the wrong shifts is
-the failure that matters, and no unit test of a helper catches it.
+**These do not re-test upstream's numerics.** That code is vendored verbatim
+from de_ground_crew and is validated over there against cryoSPARC and EMPIAR
+data this repo does not have. Re-asserting its behaviour here would be a second
+weaker oracle that goes stale, and the first attempt at this port proved the
+cost: a hand-transcription reproduced an already-fixed bug and missed the whole
+v3 aligner.
+
+So what IS tested:
+
+* the vendored files are pristine — drift is a failure, not a discovery;
+* the boundary — no Qt, no dask, came along for the ride;
+* the DRIVER's own contract — the sign reconciliation, throw, cancellation,
+  fail-loud pass-through, and the result keys the UI indexes.
+
+One end-to-end alignment runs on a known drift, because a green unit suite over
+glue that never actually invokes v3 would be worthless.
 """
 from __future__ import annotations
+
+import hashlib
+import re
+import subprocess
+import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
 
 from de_groundcrew import motion
-from de_groundcrew.motion import align, frames, local
+from de_groundcrew.motion import driver
+
+VENDOR = Path(driver.__file__).parent.parent / "external" / "gc_motion"
 
 
-def _speckle(h=128, w=128, seed=0) -> np.ndarray:
-    """A frame with broadband texture, which is what correlation needs.
+def _shift(a, dy, dx):
+    from de_groundcrew.external.gc_motion._worker_extracts import _apply_shift_fourier
+    return _apply_shift_fourier(np.asarray(a, dtype=np.float32), dy, dx)
 
-    Smooth blobs alone give a broad, ambiguous correlation peak; pure noise
-    gives no peak at all across a shift. Blurred noise plus a few hard points
-    behaves like a real micrograph.
-    """
+
+def _scene(n=128, seed=0):
+    """Band-limited noise plus hard points — what correlation needs."""
     rng = np.random.default_rng(seed)
-    img = rng.normal(0, 1, (h, w))
-    f = np.fft.fft2(img)
-    fy = np.fft.fftfreq(h)[:, None]
-    fx = np.fft.fftfreq(w)[None, :]
-    r = np.sqrt(fy ** 2 + fx ** 2)
-    img = np.real(np.fft.ifft2(f * np.exp(-(r / 0.08) ** 2)))
-    span = float(np.ptp(img)) or 1.0        # ndarray.ptp() went in NumPy 2
-    img = (img - img.min()) / span
-    for cy, cx in [(30, 40), (70, 90), (100, 25)]:
+    img = rng.normal(0, 1, (n, n))
+    fy, fx = np.fft.fftfreq(n)[:, None], np.fft.fftfreq(n)[None, :]
+    img = np.real(np.fft.ifft2(np.fft.fft2(img)
+                               * np.exp(-(np.sqrt(fy ** 2 + fx ** 2) / 0.08) ** 2)))
+    img = (img - img.min()) / (float(np.ptp(img)) or 1.0)
+    for cy, cx in ((30, 40), (70, 90), (100, 25)):
         img[cy - 2:cy + 3, cx - 2:cx + 3] += 2.0
     return img.astype(np.float32)
 
 
-def _drifting_stack(shifts, h=128, w=128, seed=0) -> np.ndarray:
-    """A stack of one scene translated by `shifts` — the ground truth."""
-    base = _speckle(h, w, seed)
-    return np.stack([align.apply_shift_fourier(base, dy, dx)
-                     for dy, dx in shifts]).astype(np.float32)
+def _drifting(shifts, n=128):
+    base = _scene(n)
+    return np.stack([_shift(base, dy, dx) for dy, dx in shifts]).astype(np.float32)
 
 
-class TestOrientationAndGain:
-    def test_all_eight_orientations_are_distinct_and_shape_valid(self):
-        img = np.arange(12, dtype=np.float32).reshape(3, 4)
-        seen = {frames.apply_orientation(img, i).tobytes()
-                for i in range(len(frames.ORIENTATION_LABELS))}
-        assert len(seen) == 8, "two orientations produce the same array"
+class TestVendorIsPristine:
+    """The manifest's hashes, re-checked.
 
-    def test_identity_is_index_zero(self):
-        # The index is a stored setting; reordering the labels would silently
-        # change the meaning of every saved orientation.
-        assert frames.ORIENTATION_LABELS[0] == "Identity"
-        img = _speckle(16, 16)
-        assert np.array_equal(frames.apply_orientation(img, 0), img)
+    If someone edits a vendored file instead of re-syncing, this fails — which
+    is the whole reason the hashes are written down.
+    """
 
-    def test_binning_sums_blocks(self):
-        img = np.ones((4, 4), dtype=np.float32)
-        assert np.array_equal(frames.bin_image(img, 2), np.full((2, 2), 4.0))
+    def _manifest_rows(self):
+        text = (VENDOR / "MANIFEST.md").read_text()
+        # | `file.py` | `upstream/path` | lines | `hash16` |
+        return re.findall(
+            r"^\|\s*`([^`]+)`\s*\|\s*`[^`]+`\s*\|\s*(\d+)\s*\|\s*`([0-9a-f]+)`\s*\|$",
+            text, re.M)
 
-    def test_binning_drops_a_trailing_partial_block(self):
-        assert frames.bin_image(np.ones((5, 5)), 2).shape == (2, 2)
+    def test_the_manifest_lists_every_vendored_module(self):
+        listed = {r[0] for r in self._manifest_rows()}
+        on_disk = {p.name for p in VENDOR.glob("*.py")
+                   if p.name not in ("__init__.py", "_worker_extracts.py")}
+        assert listed == on_disk, (
+            f"manifest and directory disagree: only-in-manifest={listed - on_disk}, "
+            f"only-on-disk={on_disk - listed}")
 
-    def test_superres_gain_is_binned_to_an_average_not_a_sum(self):
-        # A 2x gain binned by SUMMING would multiply every frame by 4.
-        gain = np.full((8, 8), 2.0, dtype=np.float32)
-        matched = frames.match_gain_to_frame(gain, 4, 4)
-        assert matched.shape == (4, 4)
-        assert np.allclose(matched, 2.0)
+    @pytest.mark.parametrize("name,lines,digest", [
+        pytest.param(*r, id=r[0]) for r in
+        re.findall(r"^\|\s*`([^`]+)`\s*\|\s*`[^`]+`\s*\|\s*(\d+)\s*\|\s*`([0-9a-f]+)`\s*\|$",
+                   (Path(driver.__file__).parent.parent / "external" / "gc_motion"
+                    / "MANIFEST.md").read_text(), re.M)])
+    def test_file_matches_its_recorded_hash(self, name, lines, digest):
+        raw = (VENDOR / name).read_bytes()
+        # Undo the permitted IMPORT REWRITES before hashing — see MANIFEST.md —
+        # so every other byte is still checked against upstream.
+        raw = (raw
+               .replace(b"from de_groundcrew.external.gc_motion._motion_correction_v2 import (",
+                        b"from _motion_correction_v2 import (")
+               .replace(b"from de_groundcrew.external.gc_motion._worker_extracts import (",
+                        b"from workers.motion_correction_worker import (")
+               .replace(b"from de_groundcrew.external.gc_motion.dose_weighting import (\n            dose_weight_map, frame_doses)",
+                        b"from workers.dose_weighting import dose_weight_map, frame_doses"))
+        assert hashlib.sha256(raw).hexdigest()[:16] == digest, (
+            f"{name} has been edited — re-sync from upstream instead")
+        assert len(raw.decode().splitlines()) == int(lines)
 
-    def test_a_non_integer_gain_ratio_raises_rather_than_resampling(self):
-        # Silently interpolating a gain reference corrupts every frame it
-        # touches, and does it quietly.
-        with pytest.raises(ValueError, match="integer multiple"):
-            frames.match_gain_to_frame(np.ones((7, 7)), 4, 4)
-
-    def test_gain_validation_prefers_the_orientation_that_flattens(self):
-        # Build a frame that a KNOWN orientation of the gain corrects, then
-        # check that orientation scores best.
-        rng = np.random.default_rng(3)
-        pattern = 1.0 + 0.4 * rng.random((32, 32)).astype(np.float32)
-        scene = _speckle(32, 32, seed=5) + 5.0
-        gain = 1.0 / pattern
-        results = frames.validate_gain_orientation(scene * pattern, gain)
-        assert results, "no orientation scored"
-        assert results[0][2] == 0, f"expected Identity to win, got {results[0]}"
-        assert results[0][0] < results[-1][0]
-
-
-class TestCrossCorrelation:
-    @pytest.mark.parametrize("dy,dx", [(0, 0), (3, -5), (-7, 2), (1.25, -2.5)])
-    def test_recovers_a_known_shift_to_subpixel(self, dy, dx):
-        ref = _speckle()
-        moved = align.apply_shift_fourier(ref, dy, dx)
-        gy, gx = align.cross_correlate(ref, moved)
-        assert abs(gy - dy) < 0.2 and abs(gx - dx) < 0.2, f"got ({gy}, {gx})"
-
-    def test_integer_only_mode_skips_refinement(self):
-        ref = _speckle()
-        moved = align.apply_shift_fourier(ref, 4, -3)
-        gy, gx = align.cross_correlate(ref, moved, upsample_factor=1)
-        assert (gy, gx) == (4.0, -3.0)
-
-    def test_a_shift_past_the_halfway_point_unwraps_negative(self):
-        # Without the unwrap a small negative shift reads as a huge positive
-        # one, and the whole trajectory inverts.
-        ref = _speckle(64, 64)
-        moved = align.apply_shift_fourier(ref, -20, -18)
-        gy, gx = align.cross_correlate(ref, moved)
-        assert gy < 0 and gx < 0, f"expected negative, got ({gy}, {gx})"
-
-    def test_the_fourier_shift_round_trips(self):
-        img = _speckle()
-        there = align.apply_shift_fourier(img, 5.5, -3.25)
-        back = align.apply_shift_fourier(there, -5.5, 3.25)
-        # Tolerance against the DYNAMIC RANGE, not an absolute epsilon: two
-        # float32 FFT round trips over a scene with hard point features ring
-        # slightly, and a fixed atol just encodes whatever this fixture
-        # happens to produce.
-        err = float(np.max(np.abs(back - img))) / float(np.ptp(img))
-        assert err < 0.01, f"round trip lost {err:.2%} of the range"
+    def test_the_only_app_references_are_the_listed_import_rewrites(self):
+        # Vendored code may name the vendored package (that is the rewrite) but
+        # must never reach into the APP — that would make re-syncing a merge.
+        for p in VENDOR.glob("*.py"):
+            if p.name == "__init__.py":
+                continue
+            for line in p.read_text().splitlines():
+                if "de_groundcrew" in line:
+                    assert "de_groundcrew.external.gc_motion" in line, (
+                        f"{p.name}: {line.strip()!r} reaches outside the vendor")
 
 
-class TestSmoothing:
-    def test_smoothing_passes_short_trajectories_through(self):
-        # Under four points there is nothing to fit.
-        raw = [1.0, 5.0, 2.0]
-        assert np.array_equal(align.smooth_shifts(raw), np.array(raw))
+class TestBoundary:
+    def test_no_qt_came_with_the_vendored_code(self):
+        # The Qt workers were deliberately left behind; only the compute was
+        # taken. A PySide import here means one slipped through.
+        out = subprocess.run(
+            [sys.executable, "-c",
+             "import de_groundcrew.motion, sys; "
+             "print([m for m in sys.modules if m.startswith(('PySide','PyQt'))])"],
+            capture_output=True, text=True, timeout=180)
+        assert out.returncode == 0, out.stderr
+        assert out.stdout.strip() == "[]", f"Qt leaked: {out.stdout}"
 
-    def test_smoothing_preserves_a_smooth_trajectory(self):
-        t = np.arange(12, dtype=np.float64)
-        drift = 0.4 * t
-        assert np.allclose(align.smooth_shifts(drift.tolist()), drift, atol=1e-6)
+    def test_no_dask_or_hyperspy_either(self):
+        out = subprocess.run(
+            [sys.executable, "-c",
+             "import de_groundcrew.motion, sys; "
+             "print([m for m in sys.modules if m.split('.')[0] in "
+             "('dask','hyperspy','pyxem','distributed')])"],
+            capture_output=True, text=True, timeout=180)
+        assert out.stdout.strip() == "[]", f"heavy deps leaked: {out.stdout}"
 
 
-class TestGlobalAlignment:
-    def test_recovers_a_known_linear_drift(self):
-        # THE test. Everything else can pass while the answer is wrong.
-        truth = [(0.0, 0.0), (1.0, -0.5), (2.0, -1.0), (3.0, -1.5),
-                 (4.0, -2.0), (5.0, -2.5)]
-        stack = _drifting_stack(truth)
-        r = align.align_stack(stack, bin_factor=1, reference="first")
+class TestDriverContract:
+    """The glue this app actually owns."""
 
-        # Shifts are relative to the reference, so compare the trajectory's
-        # SHAPE — an overall offset is not an error.
-        got_y = np.array(r["shifts_y_smooth"]); got_y -= got_y[0]
-        got_x = np.array(r["shifts_x_smooth"]); got_x -= got_x[0]
-        want_y = np.array([t[0] for t in truth]); want_y -= want_y[0]
-        want_x = np.array([t[1] for t in truth]); want_x -= want_x[0]
-        assert np.allclose(got_y, want_y, atol=0.3), f"y: {got_y} vs {want_y}"
-        assert np.allclose(got_x, want_x, atol=0.3), f"x: {got_x} vs {want_x}"
+    def test_recovers_a_known_drift_in_both_axes(self):
+        # The one end-to-end run. Without it the rest of this file is a green
+        # suite over glue that never invokes v3.
+        truth = [(0.0, 0.0), (1.5, -1.0), (3.0, -2.0),
+                 (4.5, -3.0), (6.0, -4.0), (7.5, -5.0)]
+        r = driver.align_stack(_drifting(truth), apix=1.0)
+
+        gy = np.array(r["shifts_y_smooth"]); gy -= gy[0]
+        gx = np.array(r["shifts_x_smooth"]); gx -= gx[0]
+        assert np.allclose(gy, [t[0] for t in truth], atol=0.5), gy
+        assert np.allclose(gx, [t[1] for t in truth], atol=0.5), gx
+
+    def test_the_x_sign_is_reconciled(self):
+        # LOAD-BEARING. v3 returns x negated (MotionCor3 convention) and the
+        # rest of the pipeline wants it internal. Get this wrong and everything
+        # still runs while the drift plot is mirrored in x — so assert the
+        # DIRECTION against a drift that is unambiguous in sign.
+        truth = [(0.0, 0.0), (0.0, -2.0), (0.0, -4.0), (0.0, -6.0)]
+        r = driver.align_stack(_drifting(truth), apix=1.0)
+        gx = np.array(r["shifts_x_smooth"]); gx -= gx[0]
+        assert gx[-1] < -3.0, f"x drift came back {gx} — sign is inverted"
 
     def test_alignment_sharpens_the_sum(self):
-        # The point of the whole exercise: the aligned sum must have more
-        # high-frequency content than the smeared unaligned one.
-        stack = _drifting_stack([(0, 0), (2, 1), (4, 2), (6, 3), (8, 4)])
-        r = align.align_stack(stack, bin_factor=1, reference="central")
-        assert float(r["aligned_sum"].std()) > float(r["unaligned_sum"].std()), (
-            "aligned sum is no sharper than the unaligned one")
+        r = driver.align_stack(
+            _drifting([(0, 0), (2, 1), (4, 2), (6, 3), (8, 4)]), apix=1.0)
+        assert float(r["aligned_sum"].std()) > float(r["unaligned_sum"].std())
 
-    def test_every_reference_mode_runs_and_agrees(self):
-        truth = [(0.0, 0.0), (1.5, 1.0), (3.0, 2.0), (4.5, 3.0), (6.0, 4.0)]
-        stack = _drifting_stack(truth)
-        spans = {}
-        for mode in align.REFERENCES:
-            r = align.align_stack(stack, bin_factor=1, reference=mode)
-            ys = np.array(r["shifts_y_smooth"])
-            spans[mode] = float(ys[-1] - ys[0])
-        # Whichever frame is the reference, the total travel is the same.
-        assert max(spans.values()) - min(spans.values()) < 0.5, spans
+    def test_result_carries_every_key_the_ui_indexes(self):
+        r = driver.align_stack(_drifting([(0, 0), (1, 1), (2, 2), (3, 3)]))
+        for k in ("aligned_sum", "unaligned_sum", "aligned_fft",
+                  "shifts_x_raw", "shifts_y_raw",
+                  "shifts_x_smooth", "shifts_y_smooth",
+                  "n_frames", "bin_factor", "throw",
+                  "low_confidence", "failure_reason", "confidence_signals"):
+            assert k in r, k
 
-    def test_an_unknown_reference_raises_rather_than_defaulting(self):
-        # The old app mapped UI wording to these strings in the panel, so a
-        # typo silently became "average".
-        with pytest.raises(ValueError, match="reference must be one of"):
-            align.align_stack(_drifting_stack([(0, 0), (1, 1)]),
-                              reference="middle-ish")
+    def test_raw_aliases_smooth_because_v3_emits_no_second_curve(self):
+        # RELION does the same. Inventing a "smoothed" curve the solver never
+        # produced would put a line on the drift plot that means nothing.
+        r = driver.align_stack(_drifting([(0, 0), (1, 1), (2, 2), (3, 3)]))
+        assert r["shifts_x_raw"] == r["shifts_x_smooth"]
+        assert r["shifts_y_raw"] == r["shifts_y_smooth"]
 
     def test_throw_discards_leading_frames(self):
-        stack = _drifting_stack([(0, 0), (9, 9), (2, 2), (3, 3), (4, 4), (5, 5)])
-        r = align.align_stack(stack, bin_factor=1, throw=2)
-        assert r["throw"] == 2
-        assert r["n_frames"] == 4
+        stack = _drifting([(0, 0), (9, 9), (2, 2), (3, 3), (4, 4), (5, 5)])
+        r = driver.align_stack(stack, throw=2)
+        assert r["throw"] == 2 and r["n_frames"] == 4
         assert len(r["shifts_y_smooth"]) == 4
 
     def test_throw_always_leaves_at_least_two_frames(self):
-        stack = _drifting_stack([(0, 0), (1, 1), (2, 2)])
-        r = align.align_stack(stack, bin_factor=1, throw=99)
+        r = driver.align_stack(_drifting([(0, 0), (1, 1), (2, 2)]), throw=99)
         assert r["n_frames"] >= 2
 
-    def test_binning_scales_the_shifts_back_to_full_resolution(self):
-        truth = [(0.0, 0.0), (4.0, 4.0), (8.0, 8.0), (12.0, 12.0)]
-        stack = _drifting_stack(truth, h=256, w=256)
-        r = align.align_stack(stack, bin_factor=2, reference="first")
-        got = np.array(r["shifts_y_smooth"]); got -= got[0]
-        assert np.allclose(got, [0, 4, 8, 12], atol=1.0), got
+    def test_a_single_frame_is_refused(self):
+        with pytest.raises(ValueError, match="at least 2 frames"):
+            driver.align_stack(_drifting([(0, 0)]))
 
     def test_cancellation_raises_rather_than_returning_a_partial_result(self):
-        stack = _drifting_stack([(0, 0), (1, 1), (2, 2), (3, 3)])
-        with pytest.raises(align.Cancelled):
-            align.align_stack(stack, bin_factor=1, should_cancel=lambda: True)
+        with pytest.raises(driver.Cancelled):
+            driver.align_stack(_drifting([(0, 0), (1, 1), (2, 2), (3, 3)]),
+                               should_cancel=lambda: True)
 
-    def test_progress_reports_each_pass(self):
+    def test_progress_is_reported(self):
         msgs: list[str] = []
-        align.align_stack(_drifting_stack([(0, 0), (1, 1), (2, 2), (3, 3)]),
-                          bin_factor=1, progress=msgs.append)
-        joined = " ".join(msgs)
-        assert "Pass 1" in joined and "Pass 2" in joined
+        driver.align_stack(_drifting([(0, 0), (1, 1), (2, 2), (3, 3)]),
+                           progress=msgs.append)
+        assert msgs, "no progress was reported"
 
-    def test_gain_is_applied_to_the_sum_but_not_to_alignment(self):
-        # Gain correction destroys the correlation signal on sparse counting
-        # data, so it must touch the final sum only.
-        stack = _drifting_stack([(0, 0), (1, 1), (2, 2), (3, 3)])
-        gain = np.full(stack.shape[1:], 3.0, dtype=np.float32)
-        plain = align.align_stack(stack, bin_factor=1, reference="first")
-        gained = align.align_stack(stack, gain=gain, bin_factor=1, reference="first")
-        assert np.allclose(plain["shifts_y_smooth"], gained["shifts_y_smooth"],
-                           atol=1e-9), "gain changed the estimated shifts"
-        assert np.allclose(gained["aligned_sum"],
-                           plain["aligned_sum"] * 3.0, rtol=1e-4)
+    def test_both_modes_run(self):
+        for mode in driver.MODES:
+            r = driver.align_stack(_drifting([(0, 0), (1, 1), (2, 2), (3, 3)]),
+                                   mode=mode)
+            assert r["n_frames"] == 4
+
+    def test_an_unknown_mode_falls_back_rather_than_crashing(self):
+        # Upstream's adapter does the same. A bad preset name should not lose
+        # someone's alignment.
+        r = driver.align_stack(_drifting([(0, 0), (1, 1), (2, 2), (3, 3)]),
+                               mode="turbo")
+        assert r["n_frames"] == 4
 
 
-class TestLogFFT:
-    def test_output_is_a_display_ready_image(self):
-        out = frames.log_fft(_speckle())
-        assert out.dtype == np.float32
-        assert out.min() >= 0.0 and out.max() <= 255.0
+class TestFailLoud:
+    def test_confidence_is_reported_as_a_result_not_an_exception(self):
+        r = driver.align_stack(_drifting([(0, 0), (1, 1), (2, 2), (3, 3)]))
+        assert isinstance(r["low_confidence"], bool)
+        assert isinstance(r["failure_reason"], str)
+
+    def test_a_clean_alignment_is_not_flagged(self):
+        r = driver.align_stack(
+            _drifting([(0, 0), (1.5, -1), (3, -2), (4.5, -3)]), apix=1.0)
+        assert r["low_confidence"] is False, r["failure_reason"]
+
+
+class TestGainOrientation:
+    def test_the_index_order_is_upstreams(self):
+        # The index is a stored setting; reordering silently changes the
+        # meaning of every saved orientation.
+        assert driver.ORIENTATION_LABELS[0] == "Identity"
+        assert len(driver.ORIENTATION_LABELS) == 8
+
+    def test_ranking_returns_eight_scores_and_a_separation(self):
+        # The tier thresholds assume all EIGHT were scored — the separation is
+        # a median over them — so a short list would silently mis-tier.
+        scores, sep = driver.rank_gain_orientations(_scene(64), _scene(64, seed=2) + 1.0)
+        assert len(scores) == 8
+        assert sep > 0
+
+    def test_the_tier_boundaries_are_upstreams(self):
+        # Calibrated on 219 real gain pairings; not ours to re-pick.
+        assert driver.classify_gain_tier(6.0) == "ok"
+        assert driver.classify_gain_tier(1.0) == "fail"
+        assert driver.classify_gain_tier(1.2) == "weak"
+
+
+class TestPowerSpectrum:
+    def test_a_non_square_frame_yields_a_square_spectrum(self):
+        # Upstream's crop-to-square: Thon rings must render circular on a
+        # non-square sensor. The hand-port missed this entirely.
+        out = driver.log_fft(_scene(128)[:64, :])
+        assert out.shape[0] == out.shape[1]
 
     def test_the_dc_term_does_not_swamp_the_spectrum(self):
-        # A plain log(|F|) renders as a white dot on black. The two-anchor
-        # stretch is what makes Thon rings visible.
-        img = _speckle() + 1000.0            # huge DC offset
-        out = frames.log_fft(img)
-        bright = float((out > 128).mean())
-        assert bright < 0.5, f"{bright:.0%} of the spectrum is saturated"
-        assert out.std() > 1.0, "spectrum is flat — no structure survived"
+        out = driver.log_fft(_scene() + 1000.0)
+        assert float((out > 128).mean()) < 0.5
+        assert out.std() > 1.0
 
 
-class TestPatchGrid:
-    def test_the_grid_covers_the_whole_frame(self):
-        patches, _ = local.generate_patch_grid(300, 300, patch_size=128)
-        assert max(p[2] for p in patches) == 300
-        assert max(p[3] for p in patches) == 300
+class TestLoading:
+    def test_an_unsupported_extension_is_refused_by_name(self):
+        with pytest.raises(ValueError, match="Unsupported movie format"):
+            driver.load_movie_stack("/tmp/nope.hspy")
 
-    def test_patches_overlap_by_half(self):
-        patches, _ = local.generate_patch_grid(512, 512, patch_size=128)
-        y0s = sorted({p[0] for p in patches})
-        assert y0s[1] - y0s[0] == 64
+    def test_round_trips_through_mrc(self, tmp_path):
+        img = _scene(64)
+        p = str(tmp_path / "out.mrc")
+        assert driver.save_image(img, p) == p
+        back, meta = driver.load_movie_stack(p)
+        assert back.shape == (1, 64, 64), "a single frame must load as 3-D"
+        assert meta["n_frames"] == 1 and meta["filename"] == "out.mrc"
+        assert np.allclose(back[0], img, atol=1e-5)
 
-    def test_the_weight_normalisation_is_what_makes_the_blend_flat(self):
-        # NOT "Hann windows sum to 1". `np.hanning` is the SYMMETRIC window
-        # (endpoints exactly zero), which misses perfect overlap-add by ~1%;
-        # only the periodic variant satisfies COLA at 50%. What actually makes
-        # the composite flat is dividing by the accumulated weight map, which
-        # `apply_local_shifts` does — so THAT is the contract worth pinning.
-        n = 64
-        acc = np.zeros(n * 3)
-        for start in range(0, n * 2 + 1, n // 2):
-            acc[start:start + n] += np.hanning(n)
-        mid = acc[n:n * 2]
-        assert not np.allclose(mid, 1.0, atol=1e-6), (
-            "np.hanning now satisfies COLA — the division could be dropped")
-        assert np.allclose(mid / np.maximum(mid, 1e-6), 1.0)
-
-    def _still_composite(self, n=128, ps=64):
-        frame = _speckle(n, n)
-        patches, centers = local.generate_patch_grid(n, n, patch_size=ps)
-        out = local.apply_local_shifts(
-            np.stack([frame, frame]), None, None, None,
-            np.zeros((2, 2, 10)), (0.0, 0.0, 1.0, 1.0),
-            patches, centers, local.build_cosine_blend_weights(ps))
-        return frame, out
-
-    def test_compositing_a_still_stack_reproduces_the_interior(self):
-        # With no motion the blend must return the original frame exactly,
-        # seams and all — that is what says the weighting is right.
-        frame, out = self._still_composite()
-        err = (float(np.max(np.abs(out[1:-1, 1:-1] - frame[1:-1, 1:-1])))
-               / float(np.ptp(frame)))
-        assert err < 0.01, f"compositing changed the interior by {err:.2%}"
-
-    def test_the_outermost_pixel_ring_is_lost_to_the_hann_taper(self):
-        # A REAL artifact, inherited from the original and pinned rather than
-        # hidden. At the exact frame border the only patch covering that pixel
-        # has Hann weight 0, so the composite divides ~0 by ~0 and the ring
-        # comes out black. It is one pixel wide regardless of frame size (the
-        # next row in has weight ~0.0024, small but exact after the division),
-        # so on an 8192 frame it is 0.01% of the image — worth knowing, not
-        # worth changing the algorithm for.
-        frame, out = self._still_composite()
-        assert float(np.max(np.abs(out[0, :]))) < 1e-3, "border is no longer zeroed"
-        interior_err = float(np.max(np.abs(out[1:-1, 1:-1] - frame[1:-1, 1:-1])))
-        assert interior_err / float(np.ptp(frame)) < 0.01, (
-            "the artifact has spread beyond the outermost ring")
+    def test_round_trips_through_tiff(self, tmp_path):
+        img = _scene(64)
+        p = str(tmp_path / "out.tif")
+        driver.save_image(img, p)
+        back, _ = driver.load_movie_stack(p)
+        assert np.allclose(back[0], img, atol=1e-5)
 
 
-class TestMotionField:
-    def test_a_constant_field_is_recovered_everywhere(self):
-        centers = np.array([[y, x] for y in (0., 50., 100.)
-                            for x in (0., 50., 100.)])
-        shifts = np.zeros((1, len(centers), 2))
-        shifts[0, :, 0] = 2.0
-        shifts[0, :, 1] = -1.0
-        coeffs, norm = local.fit_motion_field(centers, shifts)
-        got = local.evaluate_motion_field(coeffs[0], norm,
-                                          np.array([[25.0, 75.0]]))
-        assert np.allclose(got[0], [2.0, -1.0], atol=1e-6)
-
-    def test_a_linear_gradient_field_is_recovered(self):
-        centers = np.array([[y, x] for y in (0., 40., 80., 120.)
-                            for x in (0., 40., 80., 120.)])
-        shifts = np.zeros((1, len(centers), 2))
-        shifts[0, :, 0] = 0.01 * centers[:, 0]
-        coeffs, norm = local.fit_motion_field(centers, shifts)
-        got = local.evaluate_motion_field(coeffs[0], norm, np.array([[60.0, 60.0]]))
-        assert abs(got[0, 0] - 0.6) < 0.05, got
-
-    def test_outlier_patches_are_replaced_by_the_frame_median(self):
-        # A patch on empty ice gives a meaningless peak; it must not drag the
-        # polynomial fit.
-        shifts = np.zeros((6, 9, 2))
-        shifts[:, :, 0] = 1.0
-        shifts[3, 4, 0] = 500.0
-        cleaned = local.smooth_patch_shifts(shifts)
-        assert abs(cleaned[3, 4, 0] - 1.0) < 0.5, cleaned[3, 4, 0]
-
-
-class TestLocalMotionEndToEnd:
-    def test_runs_and_returns_the_documented_shape(self):
-        stack = _drifting_stack([(0, 0), (1, 1), (2, 2), (3, 3)], h=128, w=128)
-        g = align.align_stack(stack, bin_factor=1, reference="first")
-        r = local.correct_local_motion(
+class TestLocalMotion:
+    def test_runs_on_phase_one_output_and_returns_its_documented_shape(self):
+        stack = _drifting([(0, 0), (1, 1), (2, 2), (3, 3)])
+        g = driver.align_stack(stack, apix=1.0)
+        r = driver.correct_local_motion(
             stack, shifts_y=g["shifts_y_smooth"], shifts_x=g["shifts_x_smooth"],
-            bin_factor=1, patch_size=64)
+            bin_factor=1, patch_size=128)
         assert r["corrected_sum"].shape == stack.shape[1:]
-        assert r["corrected_fft"].shape == stack.shape[1:]
-        assert r["n_patches"] > 1
-        assert r["coefficients"].shape[0] == stack.shape[0]
-
-    def test_a_uniformly_drifting_stack_is_not_made_worse(self):
-        # Local correction on rigid drift has nothing to add, but it must not
-        # destroy what Phase 1 achieved.
-        stack = _drifting_stack([(0, 0), (2, 1), (4, 2), (6, 3)], h=128, w=128)
-        g = align.align_stack(stack, bin_factor=1, reference="central")
-        r = local.correct_local_motion(
-            stack, shifts_y=g["shifts_y_smooth"], shifts_x=g["shifts_x_smooth"],
-            bin_factor=1, patch_size=64)
-        assert float(r["corrected_sum"].std()) > float(g["unaligned_sum"].std())
+        assert r["corrected_fft"].shape[0] == r["corrected_fft"].shape[1]
+        assert r["n_patches"] >= 1
+        assert r["ps_cc"] >= 128, "the CC patch floor is upstream's, keep it"
 
     def test_cancellation_propagates(self):
-        stack = _drifting_stack([(0, 0), (1, 1), (2, 2), (3, 3)], h=128, w=128)
-        with pytest.raises(align.Cancelled):
-            local.correct_local_motion(stack, bin_factor=1, patch_size=64,
-                                       should_cancel=lambda: True)
+        stack = _drifting([(0, 0), (1, 1), (2, 2), (3, 3)])
+        with pytest.raises(driver.Cancelled):
+            driver.correct_local_motion(
+                stack, shifts_y=[0] * 4, shifts_x=[0] * 4,
+                bin_factor=1, patch_size=128, should_cancel=lambda: True)
 
 
 class TestPublicSurface:
-    def test_the_package_exports_what_the_session_needs(self):
+    def test_the_package_exports_what_the_session_uses(self):
         for name in ("align_stack", "correct_local_motion", "load_movie_stack",
-                     "load_gain", "validate_gain_orientation", "log_fft",
-                     "save_image", "ORIENTATION_LABELS", "REFERENCES"):
+                     "load_gain", "save_image", "log_fft", "MODES",
+                     "ORIENTATION_LABELS", "rank_gain_orientations", "classify_gain_tier", "Cancelled"):
             assert hasattr(motion, name), name
 
-    def test_no_qt_leaked_into_the_port(self):
-        import sys
-        assert not any(m.startswith("PySide") or m.startswith("PyQt")
-                       for m in sys.modules), "the port dragged Qt in"
+    def test_callers_do_not_reach_into_the_vendored_package(self):
+        # The seam has to stay small enough that re-syncing is a file copy.
+        app = Path(driver.__file__).parent.parent
+        offenders = []
+        for p in app.rglob("*.py"):
+            if "external" in p.parts or p.name == "driver.py":
+                continue
+            if "gc_motion" in p.read_text():
+                offenders.append(p.name)
+        assert sorted(offenders) == ["__init__.py", "motion_session.py"], (
+            f"unexpected direct users of the vendored code: {offenders}")

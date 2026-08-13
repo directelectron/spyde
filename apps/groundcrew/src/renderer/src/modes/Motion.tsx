@@ -26,6 +26,7 @@ export interface MotionState {
   gain: string | null
   orientation: number; orientations: string[]
   has_result: boolean; has_local: boolean
+  low_confidence: boolean; failure_reason: string
   image_window: number; fft_window: number
 }
 
@@ -39,15 +40,18 @@ export const MOTION_INITIAL: MotionState = {
   loaded: false, busy: false, filename: null,
   n_frames: 0, width: 0, height: 0, frame: 0, view: 'raw',
   gain: null, orientation: 0, orientations: [],
-  has_result: false, has_local: false, image_window: -1, fft_window: -1,
+  has_result: false, has_local: false, low_confidence: false, failure_reason: '',
+  image_window: -1, fft_window: -1,
 }
 
-const BINS = ['1', '2', '4', '8']
 const PATCHES = ['256', '512', '1024']
-const REFERENCES = [
-  { key: 'central', label: 'Central frame' },
-  { key: 'first', label: 'First frame' },
-  { key: 'average', label: 'Average' },
+
+/** v3 owns its own coarse-to-fine binning schedule, so the old Bin and
+ *  Reference controls are gone — a knob that does nothing is worse than no
+ *  knob. What is left is how far the pyramid refines. */
+const MODES = [
+  { key: 'fast', label: 'Fast', hint: 'Refine to 6 Å' },
+  { key: 'fine', label: 'Fine', hint: 'Refine to 3 Å — slower' },
 ]
 
 export function MotionMode({ state, shifts, figures, bridge, act }: {
@@ -57,8 +61,7 @@ export function MotionMode({ state, shifts, figures, bridge, act }: {
   bridge: ReturnType<typeof useFigureBridge>
   act: (action: string, payload?: Record<string, unknown>) => void
 }) {
-  const [bin, setBin] = React.useState('2')
-  const [reference, setReference] = React.useState('central')
+  const [mode, setMode] = React.useState('fast')
   const [throwN, setThrowN] = React.useState(0)
   const [local, setLocal] = React.useState(false)
   const [patch, setPatch] = React.useState('512')
@@ -87,8 +90,7 @@ export function MotionMode({ state, shifts, figures, bridge, act }: {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
       <Toolbar
-        state={state} bin={bin} setBin={setBin}
-        reference={reference} setReference={setReference}
+        state={state} mode={mode} setMode={setMode}
         throwN={throwN} setThrowN={setThrowN}
         local={local} setLocal={setLocal} patch={patch} setPatch={setPatch}
         showFft={showFft} setShowFft={setShowFft}
@@ -105,6 +107,23 @@ export function MotionMode({ state, shifts, figures, bridge, act }: {
               <Pane fig={imageFig} bridge={bridge} label="Image" />
               {showFft && <Pane fig={fftFig} bridge={bridge} label="FFT" />}
             </div>
+            {/* Fail-loud. v3 judges its own result and refuses an implausible
+                one; the sum is still shown so it can be inspected, but it must
+                not be mistaken for a good alignment. */}
+            {state.low_confidence && (
+              <div data-testid="motion-low-confidence" style={{
+                display: 'flex', alignItems: 'center', gap: 8,
+                margin: '0 8px 8px', padding: '8px 11px', borderRadius: 6,
+                background: stateOf('bad').bg,
+                border: `1px solid ${stateOf('bad').fg}55`,
+                fontSize: 12, color: stateOf('bad').fg,
+              }}>
+                <strong>Not trustworthy</strong>
+                <span style={{ color: C.textDim }}>
+                  {state.failure_reason || 'confidence check failed'}
+                </span>
+              </div>
+            )}
             <Scrubber state={state} act={act} />
           </div>
 
@@ -164,20 +183,14 @@ function Toolbar(props: any) {
 
       <span style={{ width: 1, height: 20, background: C.border, margin: '0 2px' }} />
 
-      <Labelled label="Bin">
-        <Chips options={BINS} value={props.bin} onChange={props.setBin}
-          disabled={state.busy} testId="motion-bin" />
-      </Labelled>
-      <Labelled label="Ref">
-        <select value={props.reference} data-testid="motion-ref"
-          onChange={(e) => props.setReference(e.target.value)}
-          disabled={state.busy}
-          style={{
-            padding: '4px 6px', background: C.ctl, border: `1px solid ${C.ctlLine}`,
-            borderRadius: 5, color: C.text, fontSize: 11.5, outline: 'none',
-          }}>
-          {REFERENCES.map((r) => <option key={r.key} value={r.key}>{r.label}</option>)}
-        </select>
+      <Labelled label="Mode">
+        <Segmented>
+          {MODES.map((m) => (
+            <SegBtn key={m.key} on={props.mode === m.key} disabled={state.busy}
+              testId={`motion-mode-${m.key}`} title={m.hint}
+              onClick={() => props.setMode(m.key)}>{m.label}</SegBtn>
+          ))}
+        </Segmented>
       </Labelled>
       <Labelled label="Throw">
         {/* Early frames carry the beam-induced initial burst and drag the whole
@@ -210,8 +223,7 @@ function Toolbar(props: any) {
       {state.busy && <Pill state="warn">WORKING</Pill>}
       <Btn tone="go" disabled={!state.loaded || state.busy} testId="motion-align"
         onClick={() => act('motion_align', {
-          bin_factor: Number(props.bin), reference: props.reference,
-          throw: props.throwN, local: props.local,
+          mode: props.mode, throw: props.throwN, local: props.local,
           patch_size: Number(props.patch),
         })}>▶ Align</Btn>
       <Btn disabled={!state.busy} testId="motion-stop"

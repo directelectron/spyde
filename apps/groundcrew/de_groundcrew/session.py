@@ -495,11 +495,12 @@ class GroundCrewSession(SessionBase):
     def _act_motion_align(self, payload: dict) -> None:
         try:
             self.motion.align(
-                bin_factor=int(payload.get("bin_factor", 2)),
-                reference=str(payload.get("reference", "central")),
+                mode=str(payload.get("mode", "fast")),
                 throw=int(payload.get("throw", 0)),
                 local=bool(payload.get("local", False)),
-                patch_size=int(payload.get("patch_size", 512)))
+                patch_size=int(payload.get("patch_size", 512)),
+                bin_factor=int(payload.get("bin_factor", 2)),
+                apix=float(payload.get("apix", 1.0)))
         except (TypeError, ValueError) as e:
             emit_error(f"Invalid alignment settings: {e}")
 
