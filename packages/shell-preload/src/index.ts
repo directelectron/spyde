@@ -17,6 +17,10 @@
  */
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
 
+/** An Electron dialog file filter, restated so the renderer need not depend on
+ *  electron's types. */
+export interface FileFilter { name: string; extensions: string[] }
+
 export interface ShellBridgeOptions {
   /** Matches @de/shell-main's `appId` — channels are `<appId>:<name>`. */
   appId: string
@@ -90,6 +94,19 @@ export function createShellBridge(opts: ShellBridgeOptions) {
         return null
       }
     },
+
+    /** Native open dialog. Resolves to a path, or null if cancelled.
+     *
+     *  `invoke`, not `send`: the caller needs the answer, and threading a
+     *  reply back through the message channel would mean correlating requests
+     *  by hand. Main owns the dialog because a sandboxed renderer cannot make
+     *  one, and because main is where the parent window is. */
+    openFile: (filters?: FileFilter[]): Promise<string | null> =>
+      ipcRenderer.invoke(channel('open-file'), filters),
+
+    /** Native save dialog. Resolves to a path, or null if cancelled. */
+    saveFile: (filters?: FileFilter[], defaultPath?: string): Promise<string | null> =>
+      ipcRenderer.invoke(channel('save-file'), filters, defaultPath),
 
     /** Escape hatch for an app's own channels, so it does not have to
      *  re-implement the disposer discipline above. */

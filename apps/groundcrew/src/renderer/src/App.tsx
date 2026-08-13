@@ -39,7 +39,9 @@ import {
 import { Histogram } from './Histogram'
 import { StatusMode } from './modes/Status'
 import type { StatusCard, StatusSummary } from './modes/Status'
-import { CalibrateMode, MotionMode } from './modes/Other'
+import { CalibrateMode } from './modes/Other'
+import { MOTION_INITIAL, MotionMode } from './modes/Motion'
+import type { MotionShifts, MotionState } from './modes/Motion'
 
 // ── Backend message shapes ────────────────────────────────────────────────────
 
@@ -112,6 +114,11 @@ interface AppState extends ShellState {
   props: Record<string, unknown>
   statusCards: StatusCard[]
   statusSummary: StatusSummary | null
+  /** Motion opens TWO figures (image and FFT), so the single-figure slot is
+   *  not enough — figures are keyed by the window id the backend minted. */
+  figures: Map<number, FigureMessage>
+  motion: MotionState
+  motionShifts: MotionShifts | null
   /** The last error, shown in the status bar until dismissed. App-level rather
    *  than shell-level: the shell's chrome slice has no dismissable error. */
   error: string | null
@@ -126,11 +133,21 @@ type AppAction =
   | { type: 'CONNECTION'; connection: Connection }
   | { type: 'PROPERTIES'; values: Record<string, unknown> }
   | { type: 'STATUS_REPORT'; cards: StatusCard[]; summary: StatusSummary }
+  | { type: 'MOTION_STATE'; state: MotionState }
+  | { type: 'MOTION_SHIFTS'; shifts: MotionShifts }
   | { type: 'APP_ERROR'; text: string | null }
 
 function appReducer(state: AppState, action: AppAction): AppState {
   switch (action.type) {
-    case 'FIGURE': return { ...state, figure: action.figure }
+    case 'FIGURE': {
+      const figures = new Map(state.figures)
+      figures.set(Number(action.figure.window_id), action.figure)
+      // `figure` stays the FIRST one: Imaging opened it and its pane still
+      // addresses it directly.
+      return { ...state, figures, figure: state.figure ?? action.figure }
+    }
+    case 'MOTION_STATE': return { ...state, motion: action.state }
+    case 'MOTION_SHIFTS': return { ...state, motionShifts: action.shifts }
     case 'FRAME_STATS': return { ...state, stats: action.stats }
     case 'ACQ_STATE':
       return { ...state, running: action.running, acqMode: action.mode }
@@ -151,6 +168,7 @@ const initialState: AppState = {
   ...shellInitialState,
   figure: null, stats: null, running: false, acqMode: null, colormap: 'gray',
   connection: null, props: {}, statusCards: [], statusSummary: null, error: null,
+  figures: new Map(), motion: MOTION_INITIAL, motionShifts: null,
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -161,7 +179,8 @@ export function App() {
   const [logOpen, setLogOpen] = useState(false)
   const bridge = useFigureBridge()
   const { figure, stats, running, acqMode, colormap, error, status, logEntries,
-          connection, props, statusCards, statusSummary } = state
+          connection, props, statusCards, statusSummary,
+          figures, motion, motionShifts } = state
 
   // The two side panels belong to an IMAGE. Status is a board about the
   // camera, so they are not merely empty there — they would be misleading.
@@ -202,6 +221,12 @@ export function App() {
             type: 'PROPERTIES',
             values: (msg.values ?? {}) as Record<string, unknown>,
           }); break
+        case 'motion_state':
+          dispatch({ type: 'MOTION_STATE',
+            state: msg as unknown as MotionState }); break
+        case 'motion_shifts':
+          dispatch({ type: 'MOTION_SHIFTS',
+            shifts: msg as unknown as MotionShifts }); break
         case 'status_report':
           dispatch({
             type: 'STATUS_REPORT',
@@ -234,6 +259,7 @@ export function App() {
   // nobody is looking at would contend with acquisition for nothing.
   useEffect(() => {
     if (mode === 'status' && connection?.connected) act('refresh_status')
+    if (mode === 'motion') act('motion_state')
   }, [mode, connection?.connected, act])
 
   return (
@@ -260,7 +286,10 @@ export function App() {
                 onStop={() => act('stop_acquisition')}
                 onSingle={() => act('single_acquisition')} />
             )}
-            {mode === 'motion' && <MotionMode />}
+            {mode === 'motion' && (
+              <MotionMode state={motion} shifts={motionShifts} figures={figures}
+                bridge={bridge} act={act} />
+            )}
             {mode === 'calibrate' && <CalibrateMode />}
             {mode === 'status' && (
               <StatusMode cards={statusCards} summary={statusSummary}

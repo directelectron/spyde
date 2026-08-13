@@ -13,7 +13,7 @@ import { app, ipcMain, Menu, nativeTheme } from 'electron'
 import {
   configureShell, createShellWindow,
   startBackend, stopBackend, sendAction, sendFigureEvent, sendResize,
-  resolvePythonEnv, type ShellWindow,
+  resolvePythonEnv, registerShellDialogs, type ShellWindow,
 } from '@de/shell-main'
 
 configureShell({
@@ -111,6 +111,11 @@ ipcMain.on('groundcrew:figure-event', (_e, figId: string, eventJson: string) =>
   sendFigureEvent(figId, eventJson))
 ipcMain.on('groundcrew:resize', (_e, figId: string, width: number, height: number) =>
   sendResize(figId, width, height))
+
+// Native open/save dialogs, on the shell's channel — Motion needs to load a
+// movie stack and write a corrected sum, and a sandboxed renderer cannot ask
+// for either by itself.
+registerShellDialogs()
 
 app.on('window-all-closed', () => {
   stopBackend()

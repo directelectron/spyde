@@ -322,6 +322,55 @@ test('a single exposure can be stopped', async () => {
   ctx.assertNoJsErrors()
 })
 
+test('motion correction aligns a movie end to end', async () => {
+  const { page } = ctx
+  await page.getByTestId('mode-motion').click()
+
+  // A synthetic stack with a KNOWN linear drift, built in the backend — no
+  // file dialog, no fixture on disk, and a correct alignment has to produce a
+  // straight trajectory rather than merely "some numbers".
+  await page.evaluate(() =>
+    (window as any).groundcrew.action('motion_load_test_stack',
+      { n_frames: 6, size: 128 }))
+
+  await expect(page.getByTestId('motion-frame-label'))
+    .toHaveText(/Frame 1\/6/, { timeout: 30_000 })
+  await expect(page.getByTestId('motion-image-frame')).toBeVisible()
+  await expect(page.getByTestId('motion-fft-frame')).toBeVisible()
+
+  // Scrub. The label is driven by the BACKEND's state echo, so this also
+  // proves the round trip rather than a local slider.
+  await page.getByTestId('motion-scrub').fill('3')
+  await expect(page.getByTestId('motion-frame-label')).toHaveText(/Frame 4\/6/)
+
+  await page.getByTestId('motion-align').click()
+  await expect(page.getByTestId('motion-drift')).toBeVisible({ timeout: 60_000 })
+
+  // The trajectory must be MONOTONIC and span several pixels — the drift put
+  // in was 1.5 px/frame in y. A run that "completed" with a flat trajectory is
+  // exactly the failure the CPU phase-ramp bug produced.
+  const rows = await page.locator('[data-testid="motion-table"] tbody tr').all()
+  expect(rows.length).toBe(6)
+  const dys: number[] = []
+  for (const r of rows) dys.push(Number((await r.locator('td').nth(2).innerText())))
+  const span = Math.max(...dys) - Math.min(...dys)
+  console.log('[groundcrew] dY trajectory =', dys.map((d) => d.toFixed(2)).join(' '))
+  expect(span, 'trajectory is flat — no drift was recovered').toBeGreaterThan(4)
+
+  // All three views must be offered once a result exists — raw frames stay
+  // reachable, and comparing the aligned sum against the unaligned one is the
+  // whole point of having run it.
+  for (const v of ['raw', 'unaligned', 'aligned']) {
+    await expect(page.getByTestId(`motion-view-${v}`),
+      `${v} view chip should be offered`).toBeVisible()
+  }
+  // Local was not requested, so its view must NOT be.
+  await expect(page.getByTestId('motion-view-corrected')).toHaveCount(0)
+  await page.getByTestId('motion-view-aligned').click()
+  await page.screenshot({ path: join(SHOTS, '07-motion.png') })
+  ctx.assertNoJsErrors()
+})
+
 test('every mode in the rail opens', async () => {
   const { page } = ctx
   for (const mode of ['imaging', 'motion', 'calibrate', 'status']) {

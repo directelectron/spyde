@@ -18,6 +18,9 @@ export {
   startBackend, stopBackend, sendAction, sendFigureEvent, sendResize,
 } from './backendProcess'
 
+export { registerShellDialogs } from './dialogs'
+export type { FileFilter } from './dialogs'
+
 export { createShellWindow } from './window'
 export type { ShellWindow, ShellWindowOptions } from './window'
 export type { BackendHandlers } from './backendProcess'

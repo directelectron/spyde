@@ -121,6 +121,8 @@ class GroundCrewSession(SessionBase):
         self._levels: tuple[float, float] | None = None
         #: True once the user typed a range; stops the histogram overriding it.
         self._clim_manual = False
+        #: Motion mode's controller — see the `motion` property.
+        self._motion = None
 
     # ── Startup ───────────────────────────────────────────────────────────────
 
@@ -442,6 +444,82 @@ class GroundCrewSession(SessionBase):
         timer.start()
         fut.add_done_callback(lambda _f: timer.cancel())
 
+    # ── Motion correction ─────────────────────────────────────────────────────
+
+    @property
+    def motion(self):
+        """The Motion controller, created on first use.
+
+        Lazy because it opens two figures and most sessions never leave
+        Imaging — building it at startup would put two empty panes into every
+        run and load numpy/scipy machinery nobody asked for.
+        """
+        if self._motion is None:
+            from de_groundcrew.motion_session import MotionController
+            self._motion = MotionController(self)
+        return self._motion
+
+    def _act_motion_state(self, payload: dict) -> None:
+        self.motion._emit_state()
+
+    def _act_motion_open_stack(self, payload: dict) -> None:
+        path = str(payload.get("path", ""))
+        if not path:
+            emit_error("No movie file given")
+            return
+        self.motion.open_stack(path)
+
+    def _act_motion_load_test_stack(self, payload: dict) -> None:
+        self.motion.load_test_stack(
+            n_frames=int(payload.get("n_frames", 6)),
+            size=int(payload.get("size", 128)))
+
+    def _act_motion_open_gain(self, payload: dict) -> None:
+        path = str(payload.get("path", ""))
+        if not path:
+            emit_error("No gain file given")
+            return
+        self.motion.open_gain(path)
+
+    def _act_motion_validate_gain(self, payload: dict) -> None:
+        self.motion.validate_gain()
+
+    def _act_motion_set_orientation(self, payload: dict) -> None:
+        try:
+            self.motion.orientation = int(payload["index"])
+        except (KeyError, TypeError, ValueError):
+            emit_error(f"Invalid gain orientation: {payload!r}")
+            return
+        self.motion._emit_state()
+
+    def _act_motion_align(self, payload: dict) -> None:
+        try:
+            self.motion.align(
+                bin_factor=int(payload.get("bin_factor", 2)),
+                reference=str(payload.get("reference", "central")),
+                throw=int(payload.get("throw", 0)),
+                local=bool(payload.get("local", False)),
+                patch_size=int(payload.get("patch_size", 512)))
+        except (TypeError, ValueError) as e:
+            emit_error(f"Invalid alignment settings: {e}")
+
+    def _act_motion_stop(self, payload: dict) -> None:
+        self.motion.cancel()
+        emit_status("Stopping…")
+
+    def _act_motion_save(self, payload: dict) -> None:
+        path = str(payload.get("path", ""))
+        if not path:
+            emit_error("No output path given")
+            return
+        self.motion.save(path)
+
+    def _act_motion_set_frame(self, payload: dict) -> None:
+        self.motion.set_frame(int(payload.get("frame", 0)))
+
+    def _act_motion_set_view(self, payload: dict) -> None:
+        self.motion.set_view(str(payload.get("view", "raw")))
+
     def _act_set_colormap(self, payload: dict) -> None:
         self._viewer.set_colormap(str(payload.get("name", "gray")))
 
@@ -498,6 +576,8 @@ class GroundCrewSession(SessionBase):
         self._live.clear()
         if self._live_thread is not None:
             self._live_thread.join(timeout=5)
+        if self._motion is not None:
+            self._motion.close()
         try:
             self._viewer.close()
         except Exception as e:
@@ -516,5 +596,16 @@ _ACTIONS = {
     "refresh_status": GroundCrewSession._act_refresh_status,
     "set_colormap": GroundCrewSession._act_set_colormap,
     "set_clim": GroundCrewSession._act_set_clim,
+    "motion_state": GroundCrewSession._act_motion_state,
+    "motion_open_stack": GroundCrewSession._act_motion_open_stack,
+    "motion_load_test_stack": GroundCrewSession._act_motion_load_test_stack,
+    "motion_open_gain": GroundCrewSession._act_motion_open_gain,
+    "motion_validate_gain": GroundCrewSession._act_motion_validate_gain,
+    "motion_set_orientation": GroundCrewSession._act_motion_set_orientation,
+    "motion_align": GroundCrewSession._act_motion_align,
+    "motion_stop": GroundCrewSession._act_motion_stop,
+    "motion_save": GroundCrewSession._act_motion_save,
+    "motion_set_frame": GroundCrewSession._act_motion_set_frame,
+    "motion_set_view": GroundCrewSession._act_motion_set_view,
     "auto_clim": GroundCrewSession._act_auto_clim,
 }
