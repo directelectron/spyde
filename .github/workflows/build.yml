@@ -336,12 +336,30 @@ jobs:
       # same way, e.g. hyperspy/.github's pooch-cache workflows). Keyed on
       # the lock so a pyxem bump re-saves; restore-keys keeps it warm across
       # unrelated dependency changes (pooch re-verifies checksums on load).
+      # ~/.cache/pooch is exspy's GOS databases (42 MB each, Zenodo) — building
+      # any EELSCLEdge fetches one on first use, which at Zenodo's ~700 kB/s
+      # blows straight through a spec's assertion timeout (eels_edge_component
+      # died at 78% of the download). v2 key: the entry now carries both dirs.
       - name: Cache example datasets (pooch)
         uses: actions/cache@v4
         with:
-          path: ~/.cache/pyxem
-          key: pooch-pyxem-${{ hashFiles('uv.lock') }}
-          restore-keys: pooch-pyxem-
+          path: |
+            ~/.cache/pyxem
+            ~/.cache/pooch
+          key: pooch2-pyxem-${{ hashFiles('uv.lock') }}
+          restore-keys: pooch2-pyxem-
+
+      # Pay the GOS download OUTSIDE any spec's timeout budget (no-op on a
+      # warm cache; pooch just re-verifies the hash). Reads the URLs/hashes
+      # from the installed exspy so a version bump can't leave this stale.
+      - name: Prefetch exspy GOS databases
+        run: |
+          uv run python -c "
+          from exspy._misc.eels import gosh_gos as g
+          import pooch
+          for src, spec in g._GOSH_SOURCES.items():
+              print(src, '->', pooch.retrieve(url=spec['URL'], known_hash=spec['KNOWN_HASH'], progressbar=False))
+          "
 
       - name: Run Electron e2e
         working-directory: electron
