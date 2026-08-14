@@ -115,9 +115,14 @@ export default defineConfig({
   globalTeardown: require.resolve('./tests/global-teardown.cjs'),
   timeout: 120_000,
   expect: { timeout: 15_000 },
-  // CI: 0 — a retry of a timed-out app boot doubles the damage (a 10-min hang
-  // became 20). Locally: 1, as before.
-  retries: process.env.CI ? 0 : 1,
+  // 1 everywhere. CI was 0 to stop a timed-out app boot doubling its damage
+  // (a 10-min hang became 20), but that predates the 120 s per-test timeout,
+  // which now caps a retried hang at ~2 extra minutes. What CI actually sees
+  // today is a singleton timing flake per run somewhere in ~380 specs
+  // (caret-restore poll, log-row count, a pixel-ratio probe — a different
+  // spec each run), and one retry absorbs those without hiding them: a
+  // retried pass is reported as "flaky", not green.
+  retries: 1,
   // line: one timestamped row per test WITH its duration (the dot reporter made
   // CI stalls unattributable — 9 silent minutes with no test name). html: the CI
   // workflow uploads playwright-report/ as an artifact; without an html reporter
