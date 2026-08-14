@@ -111,12 +111,13 @@ name = "pytorch-cu124"
 url = "https://download.pytorch.org/whl/cu124"
 explicit = true
 
-# This repo is a uv workspace root: the shared shell lives in packages/, and the
-# two non-SpyDE apps in apps/. SpyDE itself is still at the repo root rather than
-# apps/spyde — that move is a pure directory rename, deliberately kept out of the
-# extraction commit (see ARCHITECTURE-SPLIT.md, "Deferred on purpose").
+# This repo is a uv workspace root: packages/ holds SpyDE's own copy of the
+# shared shell. Ground Crew and Autopilot live in their own repos
+# (de_ground_crew, de_autopilot), each carrying its own shell copy — developed
+# independently until the copies converge into one de-shell repo
+# (see ARCHITECTURE-SPLIT.md, "Three copies of the shell").
 [tool.uv.workspace]
-members = ["packages/de-shell", "apps/groundcrew", "apps/autopilot"]
+members = ["packages/de-shell"]
 
 [tool.uv.sources]
 de-shell = { workspace = true }

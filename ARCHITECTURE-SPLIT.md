@@ -8,6 +8,44 @@ Three products share one substrate:
 | **de-groundcrew** | Fixed panes | Live camera/hardware control via the DE Server SDK (today: PySide6) |
 | **de-autopilot** | Fixed panes | Automated acquisition sequencing |
 
+## Three copies of the shell (August 2026 — the current arrangement)
+
+The monorepo phase below proved the boundary; the apps have since moved out.
+Each of the three repos now carries its **own copy** of `packages/` (the five
+shell packages), developed independently:
+
+| Repo | App | Shell copy |
+|---|---|---|
+| `spyde` (this repo) | `electron/` + `spyde/` | `packages/` — the original |
+| `~/PycharmProjects/de_ground_crew` | `electron/` + `de_groundcrew/` | seeded from here, then diverged |
+| `~/PycharmProjects/de_autopilot` | `electron/` + `de_autopilot/` | seeded from SpyDE's copy, Aug 2026 |
+
+The rules of the arrangement:
+
+- **Each app improves its copy freely** — no cross-repo coordination required to
+  ship. The boundary discipline still holds inside every copy (app code never
+  reaches into shell internals; `packages/de-shell/tests/test_boundary.py`
+  travels with each copy and keeps the shell free of the science stack).
+- **The copies converge later** into one `de-shell` repo, once the shell surface
+  has settled under three real apps. Until then, record anything worth porting
+  in the ledger below rather than relying on archaeology at merge time.
+
+**Divergence ledger** (what differs between the copies; update when you notice
+more, with a date):
+
+- *Aug 2026, Ground Crew ahead:* `de_shell/plotting/figure.py` and
+  `packages/de-shell/pyproject.toml`; `shell-renderer` `FigureFrame.tsx`,
+  `figureBridge.react.ts`, `index.ts` (figure **interaction-event forwarding**
+  — Ground Crew's calibrate mode needed clicks/drags on figures relayed to the
+  backend; SpyDE's copy predates it). `shell-main`, `shell-preload` and
+  `shell-testing` were identical at the time of the split.
+- *Aug 2026:* Autopilot's copy is byte-identical to SpyDE's (it was seeded the
+  day the repos separated).
+
+Everything below this section is the record of the extraction itself, kept
+because its reasoning (what moved, what stayed, and why) still governs where
+new code belongs.
+
 Ground Crew and Autopilot are **live, in-memory** applications. They must not pull
 in HyperSpy, Dask, RosettaSciIO, pyxem, or any of the lazy-read machinery. That is
 the single constraint that fixes the boundary.

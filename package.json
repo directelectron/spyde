@@ -1,19 +1,13 @@
 {
-  "name": "de-apps-root",
+  "name": "spyde-workspace",
   "private": true,
-  "description": "Monorepo root — shared shell in packages/, apps in apps/ (SpyDE still at electron/ + spyde/).",
+  "description": "SpyDE workspace — the app at electron/ + spyde/, its copy of the shared shell in packages/. Ground Crew and Autopilot live in their own repos (de_ground_crew, de_autopilot), each with its own shell copy.",
   "workspaces": [
     "packages/*",
-    "electron",
-    "apps/*"
+    "electron"
   ],
   "scripts": {
-    "_comment:dev": "Bare `dev`/`build`/`test` mean SPYDE, for continuity with before the split. The other two apps are named explicitly rather than folded in — running the wrong app is a confusing failure, and `dev:groundcrew` cannot be mistaken for anything.",
     "dev": "npm --workspace spyde-electron run dev",
-    "dev:groundcrew": "npm --workspace de-groundcrew run dev",
-    "dev:autopilot": "npm --workspace de-autopilot run dev",
-    "test:groundcrew": "npm --workspace de-groundcrew test",
-    "test:autopilot": "npm --workspace de-autopilot test",
     "build": "npm --workspace spyde-electron run build",
     "preview": "npm --workspace spyde-electron run preview",
     "test": "npm --workspace spyde-electron test",
