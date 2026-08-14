@@ -43,6 +43,14 @@ async function launchApp(opts) {
   if (!appDir || !appId) throw new Error('launchApp needs { appDir, appId }')
 
   const app = await electron.launch({
+    // Resolve Electron from the APP's tree, not Playwright's. Without an
+    // explicit path, playwright-core does a bare require('electron/index.js')
+    // from its own (usually root-hoisted) location — in a workspace layout
+    // that can find a DIFFERENT Electron than the one the app declares (an
+    // auto-installed peer once put 43 at the root while the app shipped 34,
+    // and every e2e silently tested the wrong Chromium). appDir is the
+    // directory holding the app's package.json, so its node_modules wins.
+    executablePath: require(require.resolve('electron/index.js', { paths: [appDir] })),
     args: [
       join(appDir, 'out', 'main', 'index.js'),
       `--user-data-dir=${mkdtempSync(join(tmpdir(), `${appId}-e2e-profile-`))}`,

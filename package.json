@@ -6,6 +6,10 @@
     "packages/*",
     "electron"
   ],
+  "//": "electron is declared HERE, at the workspace root, so every root-hoisted tool that resolves 'electron' from its own location (electron-vite's version sniff, playwright-core's bare require('electron/index.js')) finds the SAME version the app declares in electron/package.json. Without this, npm's auto-installed peer once put electron 43 at the root and every e2e silently ran the wrong Electron.",
+  "devDependencies": {
+    "electron": "^34.0.0"
+  },
   "scripts": {
     "dev": "npm --workspace spyde-electron run dev",
     "build": "npm --workspace spyde-electron run build",

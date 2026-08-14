@@ -65,6 +65,16 @@ function _seenSettingsDir() {
 async function launchApp(opts = {}) {
   const { dask = false, env = {} } = opts
   const app = await electron.launch({
+    // Resolve Electron from THIS app's tree, not Playwright's. Without an
+    // explicit path, playwright-core does a bare require('electron/index.js')
+    // from its own bundle — in the npm-workspace layout that walks up to the
+    // ROOT node_modules, where an auto-installed peer once put electron 43
+    // while the app ships 34: every e2e silently ran the wrong Electron
+    // (newer Chromium → different stderr log format defeating the
+    // backendErrorLines noise filter, different iframe hit-testing breaking
+    // caret clicks). Resolving from __dirname pins the binary the app
+    // actually declares in electron/package.json.
+    executablePath: require(require.resolve('electron/index.js', { paths: [__dirname] })),
     args: [
       join(__dirname, '..', 'out', 'main', 'index.js'),
       // ISOLATE Chromium's profile per launch.
@@ -516,7 +526,11 @@ function backendErrorLines(backend) {
     && !/Security Warning|Content.Security.Policy|Content Security/i.test(l)
     && !/willReadFrequently/i.test(l)
     && !/Failed to create WebGPU Context Provider/i.test(l)
-    && !/:(ERROR|FATAL):[a-z_0-9]+\.(cc|mm)\(\d+\)/.test(l))
+    // Both Chromium stderr shapes: older `bus.cc(405)` and the newer
+    // full-path colon form `dbus/bus.cc:405]` (format changed upstream, so an
+    // Electron bump must not silently turn infrastructure noise back into
+    // "backend errors").
+    && !/:(ERROR|FATAL):[a-z_0-9/]+\.(cc|mm)[(:]\d+[)\]]/.test(l))
 }
 
 /**

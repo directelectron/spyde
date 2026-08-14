@@ -41,6 +41,16 @@ more, with a date):
   `shell-testing` were identical at the time of the split.
 - *Aug 2026:* Autopilot's copy is byte-identical to SpyDE's (it was seeded the
   day the repos separated).
+- *Aug 2026, SpyDE ahead, ported to Autopilot, **Ground Crew pending**:*
+  `shell-testing/src/harness.cjs` passes an explicit `executablePath` resolved
+  from `appDir`, and `shell-main`/`shell-preload` mark their `electron` peer
+  optional (`peerDependenciesMeta`). Without both, npm auto-installs the peer
+  at the newest version satisfying `>=34` and Playwright's bare
+  `require('electron/index.js')` resolves THAT from the root — every e2e in
+  SpyDE's repo silently ran Electron 43 while the app shipped 34 (newer
+  Chromium stderr format broke the CI noise filter; changed iframe
+  hit-testing broke caret clicks). Ground Crew's copy predates the fix —
+  check `npm ls electron` there.
 
 Everything below this section is the record of the extraction itself, kept
 because its reasoning (what moved, what stayed, and why) still governs where

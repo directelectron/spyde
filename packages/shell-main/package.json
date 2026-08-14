@@ -17,6 +17,10 @@
     "electron": ">=34.0.0",
     "electron-updater": "^6.8.9"
   },
+  "peerDependenciesMeta": {
+    "electron": { "optional": true },
+    "electron-updater": { "optional": true }
+  },
   "devDependencies": {
     "@types/node": "^20.0.0",
     "typescript": "^5.4.0"
