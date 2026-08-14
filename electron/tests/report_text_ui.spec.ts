@@ -48,22 +48,25 @@ const textarea = () => ctx.page.locator('[data-testid^="report-cell-textarea-"]'
  *
  * A plain `setSelectionRange` races `ReportCell.runCommand`, which restores
  * focus+selection in a `requestAnimationFrame` after React re-renders the
- * controlled value — so a caret set between the re-render and that frame is
- * silently replaced. Polling re-applies until it sticks, which absorbs any
- * pending restore no matter when it lands.
+ * controlled value — a caret set before that frame is silently replaced.
+ *
+ * ORDER MATTERS: drain FIRST, then apply. runCommand schedules its restore
+ * rAF synchronously inside the click handler, so by the time the caller's
+ * post-click assertion has passed, the restore is already queued — two frames
+ * from here it has necessarily fired. Setting the caret after that cannot be
+ * clobbered (nothing else schedules restores). An earlier version applied
+ * first and then ASSERTED stability with a read-only poll — if the restore
+ * landed in between, the poll just watched the moved caret for 15 s (the CI
+ * flake "a pending selection restore moved the caret off the end").
  */
 async function setCaretToEnd() {
+  await textarea().evaluate(() => new Promise<void>((r) =>
+    requestAnimationFrame(() => requestAnimationFrame(() => r()))))
   await expect.poll(async () => await textarea().evaluate((el: HTMLTextAreaElement) => {
     const n = el.value.length
     el.focus(); el.setSelectionRange(n, n)
     return el.selectionStart === n && el.selectionEnd === n
   }), { message: 'the caret would not stay at the end of the editor' }).toBe(true)
-  // One more frame, so a restore scheduled by an earlier click cannot still be
-  // queued behind us when the next toolbar button reads the selection.
-  await textarea().evaluate(() => new Promise<void>((r) => requestAnimationFrame(() => r())))
-  await expect.poll(async () => await textarea().evaluate((el: HTMLTextAreaElement) =>
-    el.selectionStart === el.value.length && el.selectionEnd === el.value.length),
-    { message: 'a pending selection restore moved the caret off the end' }).toBe(true)
 }
 
 async function setCellSource(src: string) {

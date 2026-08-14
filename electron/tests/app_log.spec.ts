@@ -72,12 +72,20 @@ test('backfill replaces the visible history', async () => {
 
 test('clear hides current rows but keeps streaming new ones', async () => {
   await page.click('[data-testid="toggle-log"]')
+  // Scope by marker text, not bare row counts: this launch runs the REAL
+  // backend, and a late startup record can stream into the ring at any moment
+  // — CI once saw 2 rows here with only one injected. The clear contract is
+  // exactly "rows from before the click hide, rows from after it show", which
+  // the markers assert without racing unrelated traffic. (Same reason there is
+  // no log-empty check: a real record arriving after clear legitimately shows.)
+  const oldRow = page.locator('[data-testid="log-row"]', { hasText: 'old line' })
+  const freshRow = page.locator('[data-testid="log-row"]', { hasText: 'fresh line' })
   await inject(logMsg('INFO', 'spyde.x', 'old line', 100))   // ancient → cleared
-  await expect(page.locator('[data-testid="log-row"]')).toHaveCount(1)
+  await expect(oldRow).toHaveCount(1)
   await page.click('[data-testid="log-clear"]')
-  await expect(page.locator('[data-testid="log-empty"]')).toBeVisible()
+  await expect(oldRow).toHaveCount(0)
   await inject(logMsg('INFO', 'spyde.x', 'fresh line'))      // time≈now → shown
-  await expect(page.locator('[data-testid="log-row"]')).toHaveCount(1)
+  await expect(freshRow).toHaveCount(1)
   await expect(page.locator('[data-testid="log-body"]')).toContainText('fresh line')
 })
 

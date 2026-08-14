@@ -68,10 +68,17 @@ test('pointer + integrate render the DP from embedded points', async () => {
   expect(await page.locator('#vx-fig canvas').count()).toBeGreaterThan(0)
 
   // POINTER on cluster A (left nav half) → disks in the LEFT of the DP.
+  // The recompute is rAF-deferred, and the BOOT compute (the crosshair boots
+  // at nav CENTER — the right half) also publishes hit=3, so `hit` alone
+  // cannot tell "our pointer landed" from "the boot frame landed": a poll on
+  // hit that samples between the two computes reads cluster-B stats (the CI
+  // flake). Poll the actual condition — only a left-half compute can put the
+  // disks on the left.
   await page.evaluate(() => (window as any).__vx.setPointer({ ix: 1, iy: 0 }))
-  await expect.poll(async () => (await stats()).hit).toBe(3)
-  let s = await stats()
-  expect(s.leftMean).toBeGreaterThan(5 * Math.max(0.001, s.rightMean))
+  await expect.poll(async () => {
+    const s = await stats()
+    return s.hit === 3 && s.leftMean > 5 * Math.max(0.001, s.rightMean)
+  }, { message: 'the DP never showed cluster A (left) for a left-half pointer' }).toBe(true)
   // The DP canvas must actually light up (stats mirror the compute, but a broken
   // pixel push once left the canvas black while stats passed).
   await expect.poll(dpBrightness, { timeout: 5_000 }).toBeGreaterThan(5)
@@ -79,12 +86,13 @@ test('pointer + integrate render the DP from embedded points', async () => {
   await page.screenshot({ path: 'vectors_embed_shots/01-pointer-left.png' })
 
   // POINTER on cluster B (right nav half) → flips to the RIGHT of the DP.
+  // Same shape: poll the flipped condition itself, not an intermediate stat.
   await page.evaluate((nx) =>
     (window as any).__vx.setPointer({ ix: nx - 2, iy: 0 }), 16)
-  await expect.poll(async () => (await stats()).rightMean)
-    .toBeGreaterThan(0)
-  s = await stats()
-  expect(s.rightMean).toBeGreaterThan(5 * Math.max(0.001, s.leftMean))
+  await expect.poll(async () => {
+    const s = await stats()
+    return s.hit === 3 && s.rightMean > 5 * Math.max(0.001, s.leftMean)
+  }, { message: 'the DP never flipped to cluster B (right) for a right-half pointer' }).toBe(true)
   await page.screenshot({ path: 'vectors_embed_shots/02-pointer-right.png' })
 
   // INTEGRATE the whole LEFT nav half (8 x 16 positions x 3 vectors = 384).
