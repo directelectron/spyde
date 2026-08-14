@@ -349,16 +349,24 @@ jobs:
           key: pooch2-pyxem-${{ hashFiles('uv.lock') }}
           restore-keys: pooch2-pyxem-
 
-      # Pay the GOS download OUTSIDE any spec's timeout budget (no-op on a
-      # warm cache; pooch just re-verifies the hash). Reads the URLs/hashes
-      # from the installed exspy so a version bump can't leave this stale.
-      - name: Prefetch exspy GOS databases
+      # Pay the heavy Zenodo downloads OUTSIDE any spec's timeout budget
+      # (no-ops on a warm cache; pooch just re-verifies hashes). Two reasons
+      # this is a step of its own: (1) eels_edge_component died at 78% of a
+      # GOS download that started inside a 60 s assertion; (2) the dataset
+      # cache is saved by whichever shard FINISHES first — usually a fast
+      # shard that never loads sped_ag — and a cache key is immutable once
+      # saved, so unless every shard prefetches the full set before running,
+      # the saved entry is permanently missing the big file. GOS URLs/hashes
+      # are read from the installed exspy so a version bump can't go stale.
+      - name: Prefetch exspy GOS databases + sped_ag
         run: |
           uv run python -c "
           from exspy._misc.eels import gosh_gos as g
           import pooch
           for src, spec in g._GOSH_SOURCES.items():
               print(src, '->', pooch.retrieve(url=spec['URL'], known_hash=spec['KNOWN_HASH'], progressbar=False))
+          import pyxem.data as pxd
+          print('sped_ag ->', pxd.sped_ag(allow_download=True, lazy=True))
           "
 
       - name: Run Electron e2e
