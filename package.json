@@ -1,13 +1,22 @@
 {
-  "name": "spyde-root",
+  "name": "spyde-workspace",
   "private": true,
-  "description": "Root delegator — the Electron app lives in electron/.",
+  "description": "SpyDE workspace — the app at electron/ + spyde/, its copy of the shared shell in packages/. Ground Crew and Autopilot live in their own repos (de_ground_crew, de_autopilot), each with its own shell copy.",
+  "workspaces": [
+    "packages/*",
+    "electron"
+  ],
+  "//": "electron is declared HERE, at the workspace root, so every root-hoisted tool that resolves 'electron' from its own location (electron-vite's version sniff, playwright-core's bare require('electron/index.js')) finds the SAME version the app declares in electron/package.json. Without this, npm's auto-installed peer once put electron 43 at the root and every e2e silently ran the wrong Electron.",
+  "devDependencies": {
+    "electron": "^34.0.0"
+  },
   "scripts": {
-    "dev": "npm --prefix electron run dev",
-    "build": "npm --prefix electron run build",
-    "preview": "npm --prefix electron run preview",
-    "test": "npm --prefix electron test",
-    "install:electron": "npm --prefix electron install",
-    "postinstall": "npm --prefix electron install"
+    "dev": "npm --workspace spyde-electron run dev",
+    "build": "npm --workspace spyde-electron run build",
+    "preview": "npm --workspace spyde-electron run preview",
+    "test": "npm --workspace spyde-electron test",
+    "typecheck": "npm --workspace spyde-electron run typecheck",
+    "_comment:test:unit": "--if-present SKIPS a workspace with no test:unit script, so this reports success when it has run NOTHING — which it did until shell-main's script was named to match. If you rename a package's test script, check the run still reports the expected test count.",
+    "test:unit": "npm run --workspaces --if-present test:unit"
   }
 }

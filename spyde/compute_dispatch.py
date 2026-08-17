@@ -42,13 +42,11 @@ log = logging.getLogger(__name__)
 # (woken only by process I/O — timer coalescing of the hidden child process)
 # while `threading.Event.wait(timeout)` in the same process ticked exactly on
 # schedule 120/120 times. Poll loops that must make progress use this.
-_WAKE = threading.Event()
-
-
-def reliable_sleep(seconds: float) -> None:
-    """Sleep that keeps ticking on the throttled Electron-spawned backend
-    (Event.wait-based — see _WAKE). Use instead of time.sleep in poll loops."""
-    _WAKE.wait(seconds)
+# Moved to de_shell.timing — the throttled-timer pathology is a property of
+# being an Electron-spawned backend, not of anything SpyDE does, so every shell
+# app needs it. Re-exported here because this is where the codebase already
+# imports it from.
+from de_shell.timing import reliable_sleep  # noqa: E402,F401  (re-exported API)
 
 
 def split_workers_for_gpu(client, default_mode: str = "one") -> tuple:

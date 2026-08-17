@@ -9,7 +9,7 @@ class TestTemplateSkeletons:
     def test_imports_and_shapes(self):
         from spyde.actions import _template_action as t
         from spyde.actions.action import RegionAction, TransformAction
-        from spyde.actions.wizard import WizardController
+        from de_shell.actions.wizard import WizardController
 
         assert issubclass(t.TemplateTransformAction, TransformAction)
         assert issubclass(t.TemplateRegionAction, RegionAction)

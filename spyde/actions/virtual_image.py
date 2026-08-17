@@ -191,7 +191,7 @@ def add_virtual_image(ctx, action_name: str = "Add Virtual Image", **params):
     ROI on the diffraction pattern → its own output window that recomputes live.
     Each call cycles red→green→blue→yellow→cyan→magenta and is listed as a chip in
     the Virtual Imaging sub-toolbar (so you can add several and remove them)."""
-    from spyde.backend.ipc import emit
+    from de_shell.ipc import emit
 
     plot = ctx.plot
     session = ctx.session
@@ -234,7 +234,7 @@ def vi_commit(session, plot, payload) -> None:
     standard Commit door (same pattern as strain). The live VI window + ROI
     stay open for further tuning; the committed tree is an independent
     snapshot that survives deselecting the action."""
-    from spyde.backend.ipc import emit_error, emit_status
+    from de_shell.ipc import emit_error, emit_status
 
     name = (payload or {}).get("name")
     src_wid = (payload or {}).get("window_id")

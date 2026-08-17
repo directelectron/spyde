@@ -24,7 +24,7 @@ import hyperspy.api as hs
 
 log = logging.getLogger(__name__)
 
-from spyde.backend.ipc import emit, emit_status, emit_error
+from de_shell.ipc import emit, emit_status, emit_error
 from spyde.backend import test_hold as _hold
 from spyde.actions.context import src_plot_tree as _src_plot_tree
 from spyde.actions.find_vectors import _do_compute_vectors, _copy_nav_axes_to

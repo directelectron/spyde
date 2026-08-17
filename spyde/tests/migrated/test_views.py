@@ -36,7 +36,7 @@ class TestTiledViews:
         assert views.build_tiled_figure(987654, ["x"]) is None
 
     def test_tile_views_emits_one_tiled_figure(self, monkeypatch):
-        import spyde.backend.ipc as ipc
+        import de_shell.ipc as ipc
         captured = []
         monkeypatch.setattr(ipc, "emit", lambda m: captured.append(m))
         views.register_views(44, [
@@ -53,7 +53,7 @@ class TestTiledViews:
         assert figs[0]["window_id"] == 44
 
     def test_tile_views_skips_single_selection(self, monkeypatch):
-        import spyde.backend.ipc as ipc
+        import de_shell.ipc as ipc
         captured = []
         monkeypatch.setattr(ipc, "emit", lambda m: captured.append(m))
         views.register_views(45, [("a", np.zeros((4, 4)))])

@@ -43,7 +43,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from spyde.backend import ipc
+from de_shell import ipc
 
 log = logging.getLogger(__name__)
 

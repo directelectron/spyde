@@ -411,7 +411,7 @@ class MoviePlaybackController:
         """Tell the renderer the current play state so the toolbar can reflect it
         (the Play toggle + the Fast-Forward "×N" speed badge)."""
         try:
-            from spyde.backend.ipc import emit
+            from de_shell.ipc import emit
             emit({"type": "playback_state", "playing": self._playing,
                   "speed": int(self.speed), "loop": bool(self.loop)})
         except Exception as e:

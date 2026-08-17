@@ -315,14 +315,14 @@ def add_vector_virtual_image(ctx, action_name: str = "Add Vector Virtual Image",
     output window that recomputes live from the vectors as the ROI is dragged.
     Cycles red→…→magenta and is listed as a removable chip in the Vector Virtual
     Imaging sub-toolbar."""
-    from spyde.backend.ipc import emit
+    from de_shell.ipc import emit
 
     plot = ctx.plot
     session = ctx.session
     if getattr(getattr(plot, "signal_tree", None), "diffraction_vectors", None) is None:
         # Find Vectors may still be attaching (its batch finalizes on a worker
         # thread) — wait it out and re-dispatch instead of erroring in the gap.
-        from spyde.backend.ipc import emit_error
+        from de_shell.ipc import emit_error
         from spyde.actions.lifecycle import wait_for_vectors
         if wait_for_vectors(session, plot,
                             lambda: add_vector_virtual_image(

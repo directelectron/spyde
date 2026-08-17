@@ -20,10 +20,10 @@ def get_gpu_status(session, plot, payload) -> None:
     blocking-the-main-loop concern (see vector_orientation_gpu.select_device).
     """
     # Imported lazily (not at module scope) so `emit` is re-resolved against
-    # spyde.backend.ipc on every call — a module-level `from ipc import emit`
+    # de_shell.ipc on every call — a module-level `from ipc import emit`
     # binds once at first import, which is stale for any test that re-patches
     # ipc.emit per-fixture after this module is already cached in sys.modules.
-    from spyde.backend.ipc import emit
+    from de_shell.ipc import emit
     from spyde.actions.vector_orientation_gpu import (
         select_device, gpu_available, gpu_unavailable_reason, torch_available,
     )

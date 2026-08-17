@@ -72,9 +72,9 @@ class _FakeSession:
 @pytest.fixture()
 def emitted(monkeypatch):
     """Capture every `emit` the IPF modules make (they each import it lazily
-    from spyde.backend.ipc, so patching the source module is enough)."""
+    from de_shell.ipc, so patching the source module is enough)."""
     msgs: list[dict] = []
-    from spyde.backend import ipc
+    from de_shell import ipc
     monkeypatch.setattr(ipc, "emit", lambda m: msgs.append(m))
     return msgs
 

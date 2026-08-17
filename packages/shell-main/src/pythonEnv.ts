@@ -3,7 +3,7 @@
  *
  * The uv-managed distribution model: the installer ships a tiny
  * payload — the bundled `uv`, the project (`pyproject.toml` + `uv.lock`) and the
- * `spyde` source — under <resources>/python. On first launch we run
+ * app's Python source — under <resources>/python. On first launch we run
  * `uv sync` into a venv in the user's WRITABLE data dir (the app bundle is
  * read-only / code-signed), so the GPU-correct torch wheel is fetched per
  * machine and updates are a cheap incremental `uv sync`.
@@ -28,9 +28,10 @@ import { spawn } from 'child_process'
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'fs'
 import { createHash } from 'crypto'
 import { join } from 'path'
+import { shellConfig } from './config'
 
 export interface ResolvedPython {
-  cmd: string[]      // argv to spawn, e.g. [pythonExe, '-m', 'spyde']
+  cmd: string[]      // argv to spawn, e.g. [pythonExe, '-m', 'spyde']  (module from ShellConfig)
   cwd: string        // working directory for the spawn
 }
 
@@ -105,19 +106,20 @@ export function readLockedTorchVersion(projectDir: string): string | null {
   return pick.version.split('+')[0]   // "2.6.0+cu124" → "2.6.0"
 }
 
-/** Resolve the command to launch the SpyDE backend, creating the venv if needed. */
+/** Resolve the command to launch the app's backend, creating the venv if needed. */
 export async function resolvePythonEnv(opts: EnsureOptions): Promise<ResolvedPython> {
+  const cfg = shellConfig()
   const bundledProject = join(opts.resourcesPath, 'python')
   const bundledLock = join(bundledProject, 'uv.lock')
 
   // Development (or any build without the staged payload): use uv from PATH.
   if (!opts.isPackaged || !existsSync(bundledLock)) {
-    return { cmd: ['uv', 'run', 'python', '-m', 'spyde'], cwd: opts.projectRoot }
+    return { cmd: ['uv', 'run', 'python', '-m', cfg.pythonModule], cwd: opts.projectRoot }
   }
 
   const envDir = join(opts.userData, 'python-env')
   const pythonExe = venvPython(envDir)
-  const stampFile = join(envDir, '.spyde-lock-hash')
+  const stampFile = join(envDir, `.${cfg.appId}-lock-hash`)
   const lockHash = createHash('sha256').update(readFileSync(bundledLock)).digest('hex')
 
   // Skip the sync if the venv already matches the shipped lock.
@@ -127,14 +129,14 @@ export async function resolvePythonEnv(opts: EnsureOptions): Promise<ResolvedPyt
     readSafe(stampFile) === lockHash
 
   if (!upToDate) {
-    await setupEnv(bundledProject, envDir, readSpydeVersion(bundledProject), opts.onProgress)
+    await setupEnv(bundledProject, envDir, readAppVersion(bundledProject), opts.onProgress)
     try {
       mkdirSync(envDir, { recursive: true })
       writeFileSync(stampFile, lockHash, 'utf8')
     } catch { /* a missing stamp just forces a re-sync next launch */ }
   }
 
-  return { cmd: [pythonExe, '-m', 'spyde'], cwd: bundledProject }
+  return { cmd: [pythonExe, '-m', cfg.pythonModule], cwd: bundledProject }
 }
 
 function readSafe(p: string): string {
@@ -142,33 +144,38 @@ function readSafe(p: string): string {
 }
 
 /**
- * The version bundle-python.mjs baked into `<projectDir>/.spyde-version` (X.Y.Z,
- * resolved at CI bundle time when git history exists). Empty string in dev (no
- * marker) — the dev repo has `.git`, so setuptools_scm works normally there.
+ * The version bundle-python.mjs baked into `<projectDir>/.<appId>-version`
+ * (X.Y.Z, resolved at CI bundle time when git history exists). Empty string in
+ * dev (no marker) — the dev repo has `.git`, so setuptools_scm works normally.
  */
-function readSpydeVersion(projectDir: string): string {
-  return readSafe(join(projectDir, '.spyde-version'))
+function readAppVersion(projectDir: string): string {
+  return readSafe(join(projectDir, `.${shellConfig().appId}-version`))
 }
 
 /**
  * Build the env for a uv invocation against the managed env.
  *
- * `spydeVersion` (from the .spyde-version marker) is exported as
- * SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SPYDE so building the editable `spyde`
- * package succeeds even though the staged tree has NO `.git` — without it
+ * `appVersion` (from the .<appId>-version marker) is exported as
+ * SETUPTOOLS_SCM_PRETEND_VERSION_FOR_<DIST> so building the editable app package
+ * succeeds even though the staged tree has NO `.git` — without it
  * setuptools_scm raises `LookupError: unable to detect version` and `uv sync`
  * exits 1 (the first-launch crash). Absent in dev (marker not present) → the
  * env is unchanged and setuptools_scm resolves from the repo's git history.
  */
-function uvEnv(envDir: string, spydeVersion: string, projectDir?: string): NodeJS.ProcessEnv {
-  // Pretend-version env for setuptools_scm. The dist-name–scoped var
-  // (…_FOR_SPYDE — setuptools_scm normalises "spyde" to the env suffix "SPYDE")
-  // is the precise one; the plain SETUPTOOLS_SCM_PRETEND_VERSION is a harmless
+function uvEnv(envDir: string, appVersion: string, projectDir?: string): NodeJS.ProcessEnv {
+  // Pretend-version env for setuptools_scm. The dist-name–scoped var is the
+  // precise one; the plain SETUPTOOLS_SCM_PRETEND_VERSION is a harmless
   // belt-and-braces fallback in case the dist name ever changes.
-  const scmEnv: Record<string, string> = spydeVersion
+  //
+  // setuptools_scm normalises the dist name to the env-var suffix by
+  // uppercasing and replacing runs of non-alphanumerics with `_`
+  // ("de-shell" → "DE_SHELL", "spyde" → "SPYDE").
+  const scmSuffix = String(shellConfig().pythonDist)
+    .toUpperCase().replace(/[^A-Z0-9]+/g, '_')
+  const scmEnv: Record<string, string> = appVersion
     ? {
-        SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SPYDE: spydeVersion,
-        SETUPTOOLS_SCM_PRETEND_VERSION: spydeVersion,
+        [`SETUPTOOLS_SCM_PRETEND_VERSION_FOR_${scmSuffix}`]: appVersion,
+        SETUPTOOLS_SCM_PRETEND_VERSION: appVersion,
       }
     : {}
   // Put the vendored portable git (bundle-python.mjs staged it at
@@ -205,7 +212,7 @@ function runUv(
   projectDir: string,
   envDir: string,
   args: string[],
-  spydeVersion: string,
+  appVersion: string,
   onProgress?: (line: string) => void,
 ): Promise<void> {
   const uv = join(projectDir, uvBinaryName())
@@ -213,7 +220,7 @@ function runUv(
   return new Promise((resolve, reject) => {
     const proc = spawn(uvCmd, args, {
       cwd: projectDir,
-      env: uvEnv(envDir, spydeVersion, projectDir),
+      env: uvEnv(envDir, appVersion, projectDir),
       stdio: ['ignore', 'pipe', 'pipe'],
     })
     const relay = (b: Buffer) => onProgress?.(b.toString())
@@ -252,32 +259,41 @@ export function installTorchPerMachine(
   )
 }
 
-/** The pre-built spyde wheel staged by bundle-python.mjs at <projectDir>/wheels/
+/** The pre-built app wheel staged by bundle-python.mjs at <projectDir>/wheels/
  *  (a single py3-none-any .whl). Null in dev (no staged wheel) → the caller
- *  installs the project from source the old way (dev tree is writable). */
-function stagedSpydeWheel(projectDir: string): string | null {
+ *  installs the project from source the old way (dev tree is writable).
+ *
+ *  Matched by the DIST name with its separators normalised: a wheel filename
+ *  uses `_` where the dist name may use `-` ("de-shell" → "de_shell-0.1.0-…"). */
+function stagedAppWheel(projectDir: string): string | null {
   const dir = join(projectDir, 'wheels')
   if (!existsSync(dir)) return null
+  const prefix = String(shellConfig().pythonDist).replace(/-/g, '_').toLowerCase()
   try {
-    const whl = readdirSync(dir).find((f) => f.startsWith('spyde') && f.endsWith('.whl'))
+    const whl = readdirSync(dir).find(
+      (f) => f.toLowerCase().replace(/-/g, '_').startsWith(prefix) && f.endsWith('.whl'),
+    )
     return whl ? join(dir, whl) : null
   } catch { return null }
 }
 
 /**
- * Install the PRE-BUILT spyde wheel into the managed env with no dependency
+ * Install the PRE-BUILT app wheel into the managed env with no dependency
  * resolution (`--no-deps` — the sync already installed every dependency). This
- * is the whole reason the wheel exists: it avoids building spyde from the
+ * is the whole reason the wheel exists: it avoids building the app from the
  * read-only shipped source tree (setuptools' egg_info write → "Access is
  * denied", the rc.2/rc.3 first-launch crash). Throws on failure.
  */
-function installSpydeWheel(
+function installAppWheel(
   projectDir: string,
   envDir: string,
   wheel: string,
   onProgress?: (line: string) => void,
 ): Promise<void> {
-  onProgress?.(`[env-setup] installing spyde from wheel ${wheel.split(/[\\/]/).pop()}\n`)
+  onProgress?.(
+    `[env-setup] installing ${shellConfig().pythonDist} from wheel ` +
+    `${wheel.split(/[\\/]/).pop()}\n`,
+  )
   return runUv(
     projectDir, envDir,
     ['pip', 'install', '--no-deps', '--python', venvPython(envDir), wheel],
@@ -291,20 +307,20 @@ function installSpydeWheel(
  * macOS, or when the lock has no readable torch pin — the plain full
  * `uv sync --frozen --no-dev` (the original, known-good path) runs instead.
  *
- * When a pre-built spyde wheel is staged (the packaged app), the syncs use
- * `--no-install-project` (resolve + install DEPS only, never build spyde) and
- * spyde is installed from the wheel afterwards — so NOTHING is built from the
+ * When a pre-built app wheel is staged (the packaged app), the syncs use
+ * `--no-install-project` (resolve + install DEPS only, never build the app) and
+ * the app is installed from the wheel afterwards — so NOTHING is built from the
  * read-only source tree. In dev (no staged wheel) the project installs from
  * source as before. Logs which path ran to the progress stream.
  */
 async function setupEnv(
   projectDir: string,
   envDir: string,
-  spydeVersion: string,
+  appVersion: string,
   onProgress?: (line: string) => void,
 ): Promise<void> {
-  const wheel = stagedSpydeWheel(projectDir)
-  // With a staged wheel, tell uv sync NOT to touch the project (spyde builds
+  const wheel = stagedAppWheel(projectDir)
+  // With a staged wheel, tell uv sync NOT to touch the project (the app builds
   // from the read-only tree otherwise); we install the wheel separately.
   const projectArgs = wheel ? ['--no-install-project'] : ['--no-editable']
 
@@ -321,12 +337,12 @@ async function setupEnv(
       await runUv(
         projectDir, envDir,
         ['sync', '--frozen', '--no-dev', ...projectArgs, '--no-install-package', 'torch'],
-        spydeVersion, onProgress,
+        appVersion, onProgress,
       )
       // Step 2: torch resolved for this machine.
       await installTorchPerMachine(projectDir, envDir, onProgress)
-      // Step 3: spyde itself, from the pre-built wheel (packaged only).
-      if (wheel) await installSpydeWheel(projectDir, envDir, wheel, onProgress)
+      // Step 3: the app itself, from the pre-built wheel (packaged only).
+      if (wheel) await installAppWheel(projectDir, envDir, wheel, onProgress)
       onProgress?.('[env-setup] per-machine torch install complete\n')
       return
     } catch (err) {
@@ -337,6 +353,6 @@ async function setupEnv(
   }
 
   onProgress?.('[env-setup] running full locked uv sync\n')
-  await runUv(projectDir, envDir, ['sync', '--frozen', '--no-dev', ...projectArgs], spydeVersion, onProgress)
-  if (wheel) await installSpydeWheel(projectDir, envDir, wheel, onProgress)
+  await runUv(projectDir, envDir, ['sync', '--frozen', '--no-dev', ...projectArgs], appVersion, onProgress)
+  if (wheel) await installAppWheel(projectDir, envDir, wheel, onProgress)
 }

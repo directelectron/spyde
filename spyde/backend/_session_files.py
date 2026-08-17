@@ -20,8 +20,8 @@ import numpy as np
 import hyperspy.api as hs
 from hyperspy.signal import BaseSignal
 
-from spyde.backend import ipc
-from spyde.backend.ipc import emit, emit_status, emit_error
+from de_shell import ipc
+from de_shell.ipc import emit, emit_status, emit_error
 
 log = logging.getLogger(__name__)
 

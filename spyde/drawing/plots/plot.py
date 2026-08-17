@@ -20,7 +20,8 @@ import anyplotlib as apl
 import anyplotlib._electron as _electron
 from anyplotlib.embed import build_standalone_html
 
-from spyde.drawing.colormaps import COLORMAPS, DEFAULT_COLORMAP
+from de_shell.plotting.colormaps import COLORMAPS, DEFAULT_COLORMAP
+from de_shell.plotting.figure import fill_iframe_html, robust_levels
 
 if TYPE_CHECKING:
     from spyde.drawing.plots.plot_states import PlotState
@@ -105,7 +106,7 @@ import time as _time
 # update_functions so a "slow update" report shows the WHOLE pipeline (read +
 # paint). Toggle live from the Log panel's "Profile" button; state lives in
 # backend.debug_flags (read fresh each frame). No-op when off.
-from spyde.backend.debug_flags import nav_profile_on as _nav_profile_on
+from de_shell.debug_flags import nav_profile_on as _nav_profile_on
 
 
 _SUPERSCRIPTS = {
@@ -168,21 +169,16 @@ def _apply_figure_html_shell(html: str, fig_id) -> str:
     """SpyDE's dark-mode + fill-the-iframe + focus-relay post-processing, shared by
     the live and standalone figure-HTML paths.
 
-    The anyplotlib standalone template pins html/body to the figure's INITIAL px
-    size with overflow:hidden (sized for a fixed docs/notebook embed). SpyDE drives
-    the size live via resize_figure (fig_width/height → the panels re-layout), so
-    when the subwindow is dragged LARGER than that initial size the grown figure was
-    clipped to the old body box. Make html/body/#widget-root fill the iframe (100%)
-    so the figure always fills — and is never clipped by — the subwindow."""
-    dark = ("<style>html,body{background:#1e1e2e !important;color-scheme:dark;"
-            "width:100% !important;height:100% !important;overflow:hidden}"
-            "#widget-root{background:#1e1e2e !important;"
-            "width:100% !important;height:100% !important;display:block !important}"
-            "</style>")
+    The dark-mode + fill-the-iframe half is the shell's (`fill_iframe_html`) —
+    any app that drives figure size via resize_figure needs it, because the
+    anyplotlib standalone template pins html/body to the figure's INITIAL px size
+    with overflow:hidden and a grown figure is then clipped to the old body box.
+    SpyDE adds only the focus relay, which is about having an MDI to bring a
+    subwindow to the front of."""
     focus = ("<script>window.addEventListener('pointerdown',function(){"
              "try{window.parent.postMessage({type:'spyde_focus',figId:%r},'*');}"
              "catch(e){}},true);</script>" % str(fig_id))
-    return html.replace("<body>", dark + focus + "<body>", 1)
+    return fill_iframe_html(html, extra_head=focus)
 
 
 def finalize_figure_html(fig, fig_id, *, standalone: bool = False) -> str:
@@ -332,7 +328,7 @@ class Plot:
 
     def _ensure_figure(self, dims: int = 2) -> None:
         """Create (or recreate) the anyplotlib Figure for the given dimensionality."""
-        from spyde.backend.ipc import emit
+        from de_shell.ipc import emit
 
         if self._fig is not None:
             return  # already created
@@ -412,7 +408,7 @@ class Plot:
         """Tag this plot's figure as a named view (chip ``label`` + ``kind``) and
         RE-EMIT the figure message so the frontend's chip strip picks it up. The
         iframe is keyed by fig_id, so the metadata updates without a reload."""
-        from spyde.backend.ipc import emit
+        from de_shell.ipc import emit
         self.view_label = label
         self.view_kind = kind
         if self.fig_id is None or getattr(self, "_figure_html", None) is None:
@@ -759,7 +755,7 @@ class Plot:
                     from spyde.actions.overlay import drop_all_layers, _emit_layers_state
                     drop_all_layers(self)
                     _emit_layers_state(self)
-                    from spyde.backend.ipc import emit_status
+                    from de_shell.ipc import emit_status
                     emit_status("Overlay layers removed: image shape changed.")
                 except Exception as e:
                     logger.debug("layer drop on shape change failed: %s", e)
@@ -1011,7 +1007,7 @@ class Plot:
             # just no longer able to own the axis.
             counts, edges = np.histogram(np.clip(finite, lo, hi), bins=64,
                                          range=(lo, hi))
-            from spyde.backend.ipc import emit
+            from de_shell.ipc import emit
             msg = {
                 "type": "histogram",
                 "window_id": self.window_id,
@@ -1118,28 +1114,16 @@ class Plot:
         beam is orders of magnitude brighter than the diffraction spots, so a
         99.5% upper clip still saturates everything but the beam. Use a tighter
         2–99% band there so the faint spots are visible; navigator/VI images keep
-        the wide min–99.5% range (they have no saturating central spike)."""
-        try:
-            sy = max(1, img.shape[0] // 512)
-            sx = max(1, img.shape[1] // 512) if img.ndim > 1 else 1
-            data = np.asarray(img[::sy, ::sx] if img.ndim > 1 else img[::sy],
-                              dtype=np.float64)
-            data = data[np.isfinite(data)]
-            if data.size == 0:
-                return 0.0, 1.0
-            if signal:
-                mn = float(np.percentile(data, 2.0))
-                mx = float(np.percentile(data, 99.0))
-            else:
-                mn = float(data.min())
-                mx = float(np.percentile(data, 99.5))
-            if mx <= mn:
-                mx = float(data.max())
-            if mx <= mn:
-                mx = mn + 1.0
-            return mn, mx
-        except Exception:
-            return 0.0, 1.0
+        the wide min–99.5% range (they have no saturating central spike).
+
+        The mechanism — subsample, drop non-finite, percentile, fall back to the
+        max and then to a hair's width — is the shell's; SpyDE supplies only the
+        BANDS, which is the part that is about diffraction data."""
+        if signal:
+            return robust_levels(img, low=2.0, high=99.0)
+        # low=None means "use the true minimum": a navigator has no saturating
+        # spike, and clipping its floor throws away real dynamic range.
+        return robust_levels(img, low=None, high=99.5)
 
     def set_colormap(self, name: str) -> None:
         resolved = COLORMAPS.get(name, name)
@@ -1415,9 +1399,9 @@ class Plot:
                 logger.debug("dropping figure registry entry on close failed: %s", e)
 
     def hide(self) -> None:
-        from spyde.backend.ipc import emit
+        from de_shell.ipc import emit
         emit({"type": "window_visibility", "window_id": self.window_id, "visible": False})
 
     def show(self) -> None:
-        from spyde.backend.ipc import emit
+        from de_shell.ipc import emit
         emit({"type": "window_visibility", "window_id": self.window_id, "visible": True})

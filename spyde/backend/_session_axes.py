@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 import math
 
-from spyde.backend import ipc
+from de_shell import ipc
 
 log = logging.getLogger(__name__)
 

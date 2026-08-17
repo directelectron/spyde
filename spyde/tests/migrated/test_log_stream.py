@@ -1,17 +1,17 @@
-"""Tests for the app-log IPC stream (spyde.backend.log_stream)."""
+"""Tests for the app-log IPC stream (de_shell.log_stream)."""
 import logging
 
 import pytest
 
-from spyde.backend import log_stream
-from spyde.backend.log_stream import IPCLogHandler
+from de_shell import log_stream
+from de_shell.log_stream import IPCLogHandler
 
 
 @pytest.fixture
 def captured(monkeypatch):
     """Collect every message the handler emits over the IPC channel."""
     msgs = []
-    monkeypatch.setattr("spyde.backend.ipc.emit", lambda obj: msgs.append(obj))
+    monkeypatch.setattr("de_shell.ipc.emit", lambda obj: msgs.append(obj))
     return msgs
 
 
@@ -84,7 +84,7 @@ class TestIPCLogHandler:
         def _reentrant_emit(obj):
             calls["n"] += 1
             lg.error("logging from inside emit")   # would recurse without guard
-        monkeypatch.setattr("spyde.backend.ipc.emit", _reentrant_emit)
+        monkeypatch.setattr("de_shell.ipc.emit", _reentrant_emit)
         lg.info("trigger")
         assert calls["n"] == 1                     # exactly one emit, no recursion
 

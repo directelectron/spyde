@@ -16,6 +16,10 @@ classifiers = [
     "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
 ]
 dependencies = [
+    # The shared desktop-app shell (asyncio loop, PLOTAPP IPC, log streaming,
+    # window/figure registry, action + wizard framework, anyplotlib plotting).
+    # Resolved from packages/de-shell via the uv workspace below.
+    "de-shell",
     "numpy>=1.20.0",
     "pillow",
     "matplotlib",
@@ -107,7 +111,16 @@ name = "pytorch-cu124"
 url = "https://download.pytorch.org/whl/cu124"
 explicit = true
 
+# This repo is a uv workspace root: packages/ holds SpyDE's own copy of the
+# shared shell. Ground Crew and Autopilot live in their own repos
+# (de_ground_crew, de_autopilot), each carrying its own shell copy — developed
+# independently until the copies converge into one de-shell repo
+# (see ARCHITECTURE-SPLIT.md, "Three copies of the shell").
+[tool.uv.workspace]
+members = ["packages/de-shell"]
+
 [tool.uv.sources]
+de-shell = { workspace = true }
 torch = [
     { index = "pytorch-cu124", marker = "sys_platform == 'win32'" },
 ]
@@ -240,7 +253,10 @@ spyde = "spyde"
 # (The legacy pytest-qt tests were retired: the dead ones deleted, the unique
 # compute/contract nets consolidated here; sped_ag timing lives in benchmark_*.py,
 # run manually. The Playwright suite under electron/ covers the UI.)
-testpaths = ["spyde/tests/migrated"]
+# packages/de-shell/tests is the SHELL's own suite: it builds a Session with no
+# app around it and asserts the shell never acquires hyperspy/dask/pyxem. It has
+# to run somewhere, and it is far too fast to be worth a separate invocation.
+testpaths = ["spyde/tests/migrated", "packages/de-shell/tests"]
 addopts = "--strict-markers"
 markers = [
     "gpu: tests requiring a physical NVIDIA GPU",

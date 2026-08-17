@@ -19,8 +19,8 @@ import logging
 import os
 import threading
 
-from spyde.backend import ipc
-from spyde.backend.ipc import emit_error
+from de_shell import ipc
+from de_shell.ipc import emit_error
 from spyde.actions.registry import STAGED_HANDLERS, resolve_staged
 from spyde.backend.tutorial_data import TUTORIAL_LOADERS
 

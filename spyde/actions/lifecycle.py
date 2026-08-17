@@ -1,5 +1,5 @@
 """
-lifecycle.py — the shared basis set for interactive actions.
+lifecycle.py — SpyDE's lifecycle basis set for interactive actions.
 
 Every heavy action repeats the same lifecycle wiring: run the compute on a
 daemon thread and marshal the UI apply back to the asyncio main thread, guard
@@ -8,6 +8,15 @@ out the find-vectors attach gap, swap an overlay for a newer one, paint a
 result onto a tree's signal plots, narrate progress, and poll a progressive
 shared-memory fill. These helpers are the single implementation; actions must
 use them instead of re-rolling the idioms (see ``spyde/actions/README.md``).
+
+**Half of this module now lives in the shell.** The idioms that know nothing
+about the data — the worker marshal, the generation guard, attribute
+replacement, progress narration, the computing overlay — are
+``de_shell.actions.lifecycle``, shared with de-groundcrew and de-autopilot. They
+are RE-EXPORTED here, deliberately: this module is SpyDE's lifecycle API, and an
+action should import one module rather than having to know which half a given
+helper came from. What stays below is the part that is genuinely about
+diffraction vectors, signal trees and the progressive fill.
 
 THREADING CONTRACT (CLAUDE.md): UI/figure updates happen on the asyncio main
 thread only. Workers marshal via ``session._dispatch_to_main``; ``ipc.emit*``
@@ -22,70 +31,12 @@ from typing import Any, Callable, Sequence
 
 import numpy as np
 
+from de_shell.actions.lifecycle import (  # noqa: F401  (re-exported API)
+    run_on_worker, bump_generation, is_current, replace_tree_attr,
+    progress_emitter, window_computing,
+)
+
 log = logging.getLogger(__name__)
-
-
-# ── worker-thread marshal ─────────────────────────────────────────────────────
-
-def run_on_worker(session, work: Callable[[], Any], *, name: str,
-                  on_done: Callable[[Any], None] | None = None,
-                  on_error: Callable[[Exception], None] | None = None) -> None:
-    """Run ``work()`` on a daemon thread and marshal ``on_done(result)`` back
-    onto the asyncio main thread via ``session._dispatch_to_main``.
-
-    ``on_error(exc)`` runs on the worker thread (it typically just
-    ``emit_error``\\s, which is thread-safe). When *session* can't marshal
-    (``None`` or a bare test stub without ``_dispatch_to_main``) everything
-    runs inline synchronously, so handler tests see the result immediately.
-    """
-    dispatch = getattr(session, "_dispatch_to_main", None)
-    if dispatch is None:
-        try:
-            result = work()
-        except Exception as e:
-            log.exception("%s failed", name)
-            if on_error is not None:
-                on_error(e)
-            return
-        if on_done is not None:
-            on_done(result)
-        return
-
-    def _worker():
-        try:
-            result = work()
-        except Exception as e:
-            log.exception("%s failed", name)
-            if on_error is not None:
-                on_error(e)
-            return
-        if on_done is not None:
-            dispatch(lambda: on_done(result))
-
-    threading.Thread(target=_worker, daemon=True, name=name).start()
-
-
-# ── generation guard (latest-wins / StrictMode double-mount) ──────────────────
-
-def bump_generation(owner, key: str) -> int:
-    """Bump and return ``owner.<key>`` (an int generation counter).
-
-    The run/stop generation contract: a wizard's *open* handler bumps its
-    tree's ``_<key>_run_gen`` synchronously BEFORE spawning any worker, and
-    every deferred build checks ``is_current`` on arrival; the *close* handler
-    bumps unconditionally FIRST, cancelling any in-flight open. This closes the
-    React StrictMode mount→cleanup→remount race (open, close, open fired
-    synchronously before any worker lands) that otherwise builds two live
-    controllers. Also used per-controller for latest-wins recomputes.
-    """
-    gen = int(getattr(owner, key, 0)) + 1
-    setattr(owner, key, gen)
-    return gen
-
-
-def is_current(owner, key: str, gen: int) -> bool:
-    """True if *gen* is still ``owner.<key>``'s current generation."""
-    return getattr(owner, key, None) == gen
 
 
 # ── the find-vectors attach gap ───────────────────────────────────────────────
@@ -168,7 +119,7 @@ def wait_for_vectors(session, plot, then: Callable[[], None], *, what: str,
     False when there is no event loop to wait on (bare test stubs) — the
     caller should emit its own error then.
     """
-    from spyde.backend.ipc import emit_error, emit_status
+    from de_shell.ipc import emit_error, emit_status
     if getattr(session, "_dispatch_to_main", None) is None:
         return False
 
@@ -179,7 +130,7 @@ def wait_for_vectors(session, plot, then: Callable[[], None], *, what: str,
         return resolve_vectors(session, plot)[1]
 
     def _wait():
-        from spyde.compute_dispatch import reliable_sleep
+        from de_shell.timing import reliable_sleep
         waited = 0.0
         status_at = 0.0
         while True:
@@ -233,7 +184,7 @@ def wait_for_particles(session, plot, then: Callable[[], None], *, what: str,
     False when there is no event loop to wait on (bare test stubs) — the caller
     should emit its own error then.
     """
-    from spyde.backend.ipc import emit_error, emit_status
+    from de_shell.ipc import emit_error, emit_status
     if getattr(session, "_dispatch_to_main", None) is None:
         return False
 
@@ -241,7 +192,7 @@ def wait_for_particles(session, plot, then: Callable[[], None], *, what: str,
         return getattr(plot, "signal_tree", None) if plot is not None else None
 
     def _wait():
-        from spyde.compute_dispatch import reliable_sleep
+        from de_shell.timing import reliable_sleep
         waited = 0.0
         status_at = 0.0
         while True:
@@ -280,29 +231,6 @@ def seg_batch_running(session) -> bool:
 
 
 # ── overlays / painting ───────────────────────────────────────────────────────
-
-def replace_tree_attr(tree, attr: str, factory: Callable[[], Any] | None):
-    """Replace ``tree.<attr>`` (an overlay/controller) with ``factory()``,
-    removing the prior one first so re-running an action never stacks markers.
-    Pass ``factory=None`` to just remove. Returns the new value (None on a
-    failed attach — logged, not raised)."""
-    old = getattr(tree, attr, None)
-    if old is not None and hasattr(old, "remove"):
-        try:
-            old.remove()
-        except Exception as e:
-            log.debug("removing prior %s failed: %s", attr, e)
-    setattr(tree, attr, None)
-    if factory is None:
-        return None
-    try:
-        new = factory()
-    except Exception as e:
-        log.debug("attaching %s failed: %s", attr, e)
-        new = None
-    setattr(tree, attr, new)
-    return new
-
 
 def show_tree_node(plot, tree, new_signal) -> None:
     """Switch *plot* to display *new_signal* and re-slice from the navigator so
@@ -372,70 +300,6 @@ def paint_signal_plots(tree, data, *, levels: tuple[float, float] | None = None)
     return painted
 
 
-def progress_emitter(prefix: str, *, min_interval: float = 0.5) -> Callable[[int, int], None]:
-    """A throttled ``progress(done, total)`` callback that emits
-    ``"{prefix} {pct}%"`` status lines (always emits the 100% line)."""
-    from spyde.backend.ipc import emit_status
-    last = [0.0]
-
-    def progress(done, total):
-        if not total:
-            return
-        now = time.monotonic()
-        if done < total and now - last[0] < min_interval:
-            return
-        last[0] = now
-        emit_status(f"{prefix} {int(100 * done / total)}%")
-
-    return progress
-
-
-# ── per-window "Calculating…" overlay ─────────────────────────────────────────
-
-class window_computing:
-    """Context manager: emit ``window_computing`` start/stop around a long
-    compute that paints into ``window_id`` (the progressive navigator fill, a
-    streamed virtual image, …) — drives the renderer's floating translucent
-    "Calculating…" chip centered on that plot window.
-
-    ALWAYS emits the matching stop, even on exception — the ``__exit__`` runs
-    unconditionally (a bare ``try/finally`` underneath), so a cancelled or
-    failed compute cannot leave the overlay stuck. ``window_id=None`` is a
-    silent no-op both ways (mirrors ``emit_window_computing``'s own guard) so
-    call sites don't need to special-case an unattached plot.
-
-    Usage::
-
-        with window_computing(nav_plot.window_id):
-            ...long fill...
-
-    or, when the start/stop don't naturally bracket a single call (e.g. a
-    background thread that outlives this function), call ``.start()`` /
-    ``.stop()`` directly and put ``.stop()`` in the thread's own
-    ``try/finally``.
-    """
-
-    def __init__(self, window_id: int | None):
-        self.window_id = window_id
-
-    def start(self) -> None:
-        from spyde.backend.ipc import emit_window_computing
-        emit_window_computing(self.window_id, True)
-
-    def stop(self) -> None:
-        from spyde.backend.ipc import emit_window_computing
-        emit_window_computing(self.window_id, False)
-
-    def __enter__(self) -> "window_computing":
-        self.start()
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> bool:
-        self.stop()
-        return False
-
-
-
 # ── progressive shared-memory fill ────────────────────────────────────────────
 
 def live_fill_poller(shape: Sequence[int], shm_name: str | None,
@@ -455,7 +319,7 @@ def live_fill_poller(shape: Sequence[int], shm_name: str | None,
     if shm_name is None:
         return stop
 
-    from spyde.compute_dispatch import reliable_sleep
+    from de_shell.timing import reliable_sleep
     from spyde.drawing.update_functions import read_live_buffer
 
     def _poller():

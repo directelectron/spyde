@@ -847,7 +847,7 @@ class BaseSignalTree:
         try:
             from spyde.nav_sidecar import save_nav_sidecar
             if save_nav_sidecar(path, np.asarray(arr)):
-                from spyde.backend.ipc import emit_status
+                from de_shell.ipc import emit_status
                 emit_status("Navigator ready (cached for the next open)")
         except Exception as e:
             logger.debug("navigator sidecar save failed: %s", e)
@@ -861,7 +861,7 @@ class BaseSignalTree:
             last = getattr(self, "_nav_progress_pct", -5)
             if pct >= last + 5 or (pct >= 100 and last < 100):
                 self._nav_progress_pct = pct
-                from spyde.backend.ipc import emit_status
+                from de_shell.ipc import emit_status
                 emit_status(f"Computing navigator… {pct}%")
         except Exception as e:
             logger.debug("navigator progress emit failed: %s", e)
@@ -1096,7 +1096,7 @@ class BaseSignalTree:
         local: bool | None = None,
         **kwargs,
     ) -> BaseSignal | None:
-        from spyde.backend.ipc import emit_error
+        from de_shell.ipc import emit_error
 
         if method is not None:
             try:

@@ -17,7 +17,7 @@ import logging
 import numpy as np
 import hyperspy.api as hs
 
-from spyde.backend.ipc import emit, emit_status, emit_error
+from de_shell.ipc import emit, emit_status, emit_error
 from spyde.actions.context import src_plot_tree as _src_plot_tree
 from spyde.actions._common import reciprocal_radius as _reciprocal_radius
 
@@ -268,7 +268,7 @@ def _compute_with_live_ipf(session, src, src_tree, sim, params):
 # Compute Map. State lives on the source tree as `_om_wizard` (an OmWizard).
 # ─────────────────────────────────────────────────────────────────────────────
 
-from spyde.actions.wizard import WizardController
+from de_shell.actions.wizard import WizardController
 
 
 class OmWizard(WizardController):

@@ -57,7 +57,7 @@ def emit_strain_histogram(window_id, field: StrainField, component: str,
         return
     try:
         counts, edges = np.histogram(finite, bins=64)
-        from spyde.backend.ipc import emit
+        from de_shell.ipc import emit
         emit({
             "type": "histogram",
             "window_id": int(window_id),

@@ -34,7 +34,7 @@ os.environ.setdefault(
 @pytest.fixture
 def captured_messages(monkeypatch):
     """Capture both PLOTAPP channels (spyde.ipc and anyplotlib._electron)."""
-    import spyde.backend.ipc as ipc
+    import de_shell.ipc as ipc
     import anyplotlib._electron as ael
 
     msgs: list[dict] = []

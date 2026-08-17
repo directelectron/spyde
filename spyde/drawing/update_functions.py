@@ -76,7 +76,7 @@ _NAV_TIMING = _os.environ.get("SPYDE_NAV_TIMING") == "1"
 # from the Log panel's "Profile" button (or SPYDE_NAV_PROFILE=1 at startup) — the
 # state lives in backend.debug_flags.nav_profile_on(), read fresh each frame. Kept
 # separate from _NAV_TIMING (the noisy per-move index/cache trace). See NavProfile.
-from spyde.backend.debug_flags import nav_profile_on as _nav_profile_on
+from de_shell.debug_flags import nav_profile_on as _nav_profile_on
 
 
 class NavProfile:

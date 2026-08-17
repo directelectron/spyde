@@ -27,7 +27,7 @@ import logging
 
 import numpy as np
 
-from spyde.backend.ipc import emit_error, emit_status
+from de_shell.ipc import emit_error, emit_status
 
 log = logging.getLogger(__name__)
 

@@ -126,7 +126,7 @@ jobs:
         env:
           NUMBA_DISABLE_JIT: ${{ startsWith(matrix.os, 'macos') && '1' || '0' }}
         run: >
-          uv run pytest spyde/tests/migrated
+          uv run pytest spyde/tests/migrated packages/de-shell/tests
           ${{ matrix.group && format('--splits 2 --group {0} --durations-path spyde/tests/.test_durations', matrix.group) || '' }}
           ${{ (matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12') && '--cov=spyde --cov-report=xml' || '' }}
 
@@ -183,7 +183,7 @@ jobs:
 
       - name: Run tests (extras present)
         run: >
-          uv run pytest spyde/tests/migrated
+          uv run pytest spyde/tests/migrated packages/de-shell/tests
           ${{ matrix.group && format('--splits 2 --group {0} --durations-path spyde/tests/.test_durations', matrix.group) || '' }}
 
   # ── Renderer/main TypeScript typecheck ─────────────────────────────────────
@@ -201,10 +201,12 @@ jobs:
         with:
           node-version: "24"
           cache: npm
-          cache-dependency-path: electron/package-lock.json
+          cache-dependency-path: package-lock.json
 
+      # Root install: electron/ and packages/* are npm WORKSPACES, so the root
+      # lockfile is the authoritative one and installing here links the shared
+      # shell packages. Installing inside electron/ alone would miss them.
       - name: Install Electron dependencies
-        working-directory: electron
         run: npm ci
 
       - name: Typecheck (tsc --noEmit)
@@ -235,14 +237,17 @@ jobs:
         with:
           node-version: "24"
           cache: npm
-          cache-dependency-path: electron/package-lock.json
+          cache-dependency-path: package-lock.json
 
+      # Root install: electron/ and packages/* are npm WORKSPACES, so the root
+      # lockfile is the authoritative one and installing here links the shared
+      # shell packages. Installing inside electron/ alone would miss them.
       - name: Install Electron dependencies
-        working-directory: electron
         run: npm ci
 
+      # From the ROOT: the main-process units now live in packages/shell-main,
+      # and the root script fans out across workspaces.
       - name: Run main-process unit tests
-        working-directory: electron
         run: npm run test:unit
 
   # ── Electron e2e (Playwright) ──────────────────────────────────────────────
@@ -290,7 +295,7 @@ jobs:
         with:
           node-version: "24"
           cache: npm
-          cache-dependency-path: electron/package-lock.json
+          cache-dependency-path: package-lock.json
 
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
@@ -306,15 +311,17 @@ jobs:
       - name: Pre-sync the Python backend env
         run: uv sync --extra tests --extra all
 
+      # Root install: electron/ and packages/* are npm WORKSPACES, so the root
+      # lockfile is the authoritative one and installing here links the shared
+      # shell packages. Installing inside electron/ alone would miss them.
       - name: Install Electron dependencies
-        working-directory: electron
         run: npm ci
 
       - name: Cache Playwright browsers
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
-          key: pw-${{ runner.os }}-${{ hashFiles('electron/package-lock.json') }}
+          key: pw-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
 
       # Idempotent: on a cache hit the download is skipped; --with-deps still
       # apt-installs the shared libraries either way.
@@ -329,12 +336,38 @@ jobs:
       # same way, e.g. hyperspy/.github's pooch-cache workflows). Keyed on
       # the lock so a pyxem bump re-saves; restore-keys keeps it warm across
       # unrelated dependency changes (pooch re-verifies checksums on load).
+      # ~/.cache/pooch is exspy's GOS databases (42 MB each, Zenodo) — building
+      # any EELSCLEdge fetches one on first use, which at Zenodo's ~700 kB/s
+      # blows straight through a spec's assertion timeout (eels_edge_component
+      # died at 78% of the download). v2 key: the entry now carries both dirs.
       - name: Cache example datasets (pooch)
         uses: actions/cache@v4
         with:
-          path: ~/.cache/pyxem
-          key: pooch-pyxem-${{ hashFiles('uv.lock') }}
-          restore-keys: pooch-pyxem-
+          path: |
+            ~/.cache/pyxem
+            ~/.cache/pooch
+          key: pooch2-pyxem-${{ hashFiles('uv.lock') }}
+          restore-keys: pooch2-pyxem-
+
+      # Pay the heavy Zenodo downloads OUTSIDE any spec's timeout budget
+      # (no-ops on a warm cache; pooch just re-verifies hashes). Two reasons
+      # this is a step of its own: (1) eels_edge_component died at 78% of a
+      # GOS download that started inside a 60 s assertion; (2) the dataset
+      # cache is saved by whichever shard FINISHES first — usually a fast
+      # shard that never loads sped_ag — and a cache key is immutable once
+      # saved, so unless every shard prefetches the full set before running,
+      # the saved entry is permanently missing the big file. GOS URLs/hashes
+      # are read from the installed exspy so a version bump can't go stale.
+      - name: Prefetch exspy GOS databases + sped_ag
+        run: |
+          uv run python -c "
+          from exspy._misc.eels import gosh_gos as g
+          import pooch
+          for src, spec in g._GOSH_SOURCES.items():
+              print(src, '->', pooch.retrieve(url=spec['URL'], known_hash=spec['KNOWN_HASH'], progressbar=False))
+          import pyxem.data as pxd
+          print('sped_ag ->', pxd.sped_ag(allow_download=True, lazy=True))
+          "
 
       - name: Run Electron e2e
         working-directory: electron

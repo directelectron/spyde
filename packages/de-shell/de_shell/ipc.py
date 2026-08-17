@@ -8,13 +8,13 @@ Messages from Electron arrive on stdin as JSON lines (no prefix).
 
 Usage
 -----
-    from spyde.backend.ipc import emit, IPC
+    from de_shell.ipc import emit, read_messages
 
     # send a message to Electron
-    emit({"type": "status", "text": "Dask ready"})
+    emit({"type": "status", "text": "Cluster ready"})
 
     # read messages (async, called from the asyncio event loop)
-    async for msg in IPC.messages():
+    async for msg in read_messages(loop):
         handle(msg)
 """
 from __future__ import annotations
@@ -60,14 +60,14 @@ def _write_binary(frame: bytes) -> None:
 
 def redirect_stray_stdout() -> None:
     """Send all `print()` output to stderr so it can never interleave with the
-    PLOTAPP protocol on stdout, while keeping BOTH protocol emitters — spyde's
+    PLOTAPP protocol on stdout, while keeping BOTH protocol emitters — the shell's
     own ``emit`` and anyplotlib's ``_electron.emit`` — pointed at the real
     stdout protocol channel.
 
     anyplotlib._electron.emit writes to ``sys.stdout`` dynamically, so simply
     redirecting sys.stdout would send its state_update/event_json messages to
     stderr (where the runner never parses them). We therefore monkeypatch
-    anyplotlib's emit to share spyde's locked protocol channel, then redirect
+    anyplotlib's emit to share the shell's locked protocol channel, then redirect
     sys.stdout so stray prints go to stderr.
 
     Call once at backend startup, after _PROTOCOL_OUT is captured.
@@ -131,7 +131,7 @@ def emit_window_computing(window_id: int | None, computing: bool) -> None:
     early in construction) — silently a no-op rather than sending a malformed
     message. Callers MUST pair every ``True`` with a matching ``False`` in a
     ``finally`` block so a cancelled/failed compute still clears the overlay;
-    see ``spyde.actions.lifecycle.window_computing`` for the context-manager
+    see ``de_shell.actions.lifecycle.window_computing`` for the context-manager
     helper that guarantees this.
     """
     if window_id is None:
@@ -186,7 +186,7 @@ async def read_messages(loop: asyncio.AbstractEventLoop | None = None):
         finally:
             loop.call_soon_threadsafe(q.put_nowait, None)
 
-    threading.Thread(target=_pump, daemon=True, name="spyde-stdin-pump").start()
+    threading.Thread(target=_pump, daemon=True, name="de-shell-stdin-pump").start()
 
     while True:
         raw = await q.get()

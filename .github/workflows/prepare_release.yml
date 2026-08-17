@@ -192,7 +192,7 @@ jobs:
       - name: Commit release changes
         run: |
           git checkout -b "${{ steps.version.outputs.branch }}"
-          git add electron/package.json electron/package-lock.json \
+          git add electron/package.json package-lock.json \
                   README.md doc/user_guide/installing.rst
           git commit -m "chore: prepare release ${{ steps.version.outputs.tag }}"
           git push origin "${{ steps.version.outputs.branch }}"

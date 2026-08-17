@@ -107,7 +107,7 @@ def _compute_worker_plan(cpu_count: int, fraction: float | None = None) -> tuple
 
 
 async def _main() -> None:
-    from spyde.backend.ipc import read_messages, emit, emit_status, redirect_stray_stdout
+    from de_shell.ipc import read_messages, emit, emit_status, redirect_stray_stdout
     from spyde.backend.session import Session
 
     # Keep stdout exclusively for the PLOTAPP protocol; stray prints → stderr.
@@ -118,7 +118,7 @@ async def _main() -> None:
     # task delivery, poll loops) until I/O arrives — the "computes only finish
     # when you click" bug. See process_guard.unthrottle_windows_timers.
     try:
-        from spyde.backend.process_guard import unthrottle_windows_timers
+        from de_shell.process_guard import unthrottle_windows_timers
         unthrottle_windows_timers()
     except Exception as e:
         log.warning("timer unthrottle failed: %s", e)
@@ -131,7 +131,7 @@ async def _main() -> None:
     # Installed BEFORE the cluster starts so workers inherit the job. No-op /
     # best-effort off Windows — the graceful shutdown() path below still runs.
     try:
-        from spyde.backend.process_guard import install_kill_on_close
+        from de_shell.process_guard import install_kill_on_close
         install_kill_on_close()
     except Exception as e:
         log.debug("process guard install failed: %s", e)
@@ -139,7 +139,7 @@ async def _main() -> None:
     # Stream logging records to the Electron app-log panel (level switchable at
     # runtime from the frontend). Installed after stdout is the protocol channel.
     # SPYDE_LOG_LEVEL overrides the initial level (used by E2E tests / debugging).
-    from spyde.backend.log_stream import install as _install_log_stream
+    from de_shell.log_stream import install as _install_log_stream
     _init_level = os.environ.get("SPYDE_LOG_LEVEL", "INFO")
     _install_log_stream(level=_init_level)
 
@@ -206,7 +206,7 @@ async def _main() -> None:
             else:
                 log.warning("[backend] unknown message type: %s", msg_type)
         except Exception as e:
-            from spyde.backend.ipc import emit_error
+            from de_shell.ipc import emit_error
             emit_error(str(e))
 
     session.shutdown()

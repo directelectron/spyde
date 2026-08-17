@@ -3,7 +3,7 @@ Per-window "Calculating…" overlay lifecycle (laundry item #3).
 
 The backend brackets a long compute that paints into a plot window with
 ``window_computing`` start/stop messages (``spyde.actions.lifecycle.
-window_computing`` / ``spyde.backend.ipc.emit_window_computing``) — the
+window_computing`` / ``de_shell.ipc.emit_window_computing``) — the
 renderer uses these to show/hide a floating translucent chip centered on that
 plot (WindowContent.tsx). This suite pins the backend contract on the
 progressive navigator fill (``BaseSignalTree._start_progressive_nav_compute``,
@@ -156,7 +156,7 @@ class TestWindowComputingLifecycleHelper:
 
         calls = []
         monkeypatch.setattr(
-            "spyde.backend.ipc.emit_window_computing",
+            "de_shell.ipc.emit_window_computing",
             lambda window_id, computing: calls.append((window_id, computing)),
         )
 
@@ -169,7 +169,7 @@ class TestWindowComputingLifecycleHelper:
 
         calls = []
         monkeypatch.setattr(
-            "spyde.backend.ipc.emit_window_computing",
+            "de_shell.ipc.emit_window_computing",
             lambda window_id, computing: calls.append((window_id, computing)),
         )
 
@@ -183,7 +183,7 @@ class TestWindowComputingLifecycleHelper:
 
         calls = []
         monkeypatch.setattr(
-            "spyde.backend.ipc.emit_window_computing",
+            "de_shell.ipc.emit_window_computing",
             lambda window_id, computing: calls.append((window_id, computing)),
         )
 

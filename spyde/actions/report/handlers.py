@@ -24,8 +24,8 @@ import logging
 
 import numpy as np
 
-from spyde.backend import ipc
-from spyde.actions.figure_registry import keep_alive
+from de_shell import ipc
+from de_shell.actions.figure_registry import keep_alive
 from spyde.actions.report.figure_builder import (
     ReportFigureController, build_cell_figure,
 )

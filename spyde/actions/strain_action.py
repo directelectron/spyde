@@ -21,7 +21,7 @@ from spyde.actions.strain_mapping import (
     default_reference as _default_reference,
     zero_beam_filtered as _zero_beam_filtered,
 )
-from spyde.actions.wizard import WizardController
+from de_shell.actions.wizard import WizardController
 
 log = logging.getLogger(__name__)
 
@@ -185,7 +185,7 @@ class StrainController(WizardController):
         if plot is None or fig_id is None or html is None:
             return
         try:
-            from spyde.backend.ipc import emit
+            from de_shell.ipc import emit
             emit({"type": "figure", "fig_id": fig_id, "window_id": plot.window_id,
                   "html": html, "title": title, "is_navigator": False})
         except Exception as e:
@@ -197,7 +197,7 @@ class StrainController(WizardController):
         if plot is None:
             return
         try:
-            from spyde.backend.ipc import emit
+            from de_shell.ipc import emit
             emit({"type": "toolbar_config", "window_id": plot.window_id,
                   "plot_id": id(plot), "toolbar_actions": []})
             log.debug("[strain-ref] toolbar suppressed for window_id=%s", plot.window_id)
@@ -433,7 +433,7 @@ class StrainController(WizardController):
         re-entry (remove → _forget_window → close → remove) is a no-op.
         The user's main navigator/DP are left untouched — the reference
         selector was always a SEPARATE, additive crosshair."""
-        from spyde.backend.ipc import emit
+        from de_shell.ipc import emit
         if getattr(self, "_closed", False):
             return
         self._closed = True
@@ -515,7 +515,7 @@ def strain_open(session, plot, payload) -> None:
     The initial full-field fit (compute_strain_field) is a per-pixel scipy loop
     — run it on a worker thread and build/emit the window back on the main
     thread, so opening the action doesn't freeze the UI."""
-    from spyde.backend.ipc import emit, emit_error, emit_status
+    from de_shell.ipc import emit, emit_error, emit_status
     from spyde.actions.lifecycle import resolve_vectors, wait_for_vectors
     from spyde.actions.strain_mapping import compute_strain_field
     from spyde.actions.strain_display import build_strain_figure
@@ -564,7 +564,7 @@ def strain_open(session, plot, payload) -> None:
             return   # superseded by a strain_close or a newer strain_open
         _fig, fig_id, html, p = build_strain_figure(field, component="exx")
         wid = session.next_window_id()
-        from spyde.actions.figure_registry import keep_alive
+        from de_shell.actions.figure_registry import keep_alive
         keep_alive(int(wid), _fig)
         emit({"type": "figure", "fig_id": fig_id, "window_id": int(wid),
               "html": html, "title": "Strain (εxx)", "is_navigator": False,
@@ -613,7 +613,7 @@ def strain_set_method(session, plot, payload) -> None:
             from orix.crystal_map import Phase
             ctrl.set_cif_reference(Phase.from_cif(cif_path))
         except Exception as e:
-            from spyde.backend.ipc import emit_error
+            from de_shell.ipc import emit_error
             emit_error(f"Strain CIF reference failed: {e}")
     else:
         ry, rx = ctrl.ref_yx
@@ -642,7 +642,7 @@ def strain_commit(session, plot, payload) -> None:
     """Submit: freeze the current strain field as a new SignalTree."""
     ctrl = _ctrl_for(session, plot, payload)
     if ctrl is None:
-        from spyde.backend.ipc import emit_error
+        from de_shell.ipc import emit_error
         emit_error("No live strain field to submit.")
         return
     ctrl.commit()

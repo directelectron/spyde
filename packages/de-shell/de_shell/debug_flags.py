@@ -59,11 +59,11 @@ def set_debug_flag(session, plot, payload) -> None:
         # The [NAV/PAINT-PROFILE] lines log at INFO; ensure the handler forwards
         # INFO (the default is INFO, but a user may have raised it to WARNING).
         try:
-            from spyde.backend.log_stream import set_level
+            from de_shell.log_stream import set_level
             import logging
             if logging.getLogger().getEffectiveLevel() > logging.INFO:
                 set_level("INFO")
         except Exception as e:
             log.debug("raising log level to INFO for profiling failed: %s", e)
-    from spyde.backend.ipc import emit
+    from de_shell.ipc import emit
     emit({"type": "debug_flags", **get_flags()})

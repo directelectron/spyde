@@ -68,7 +68,7 @@ def emit_navigator_options(tree) -> None:
         return
     names = list(tree.navigator_signals.keys())
     try:
-        from spyde.backend.ipc import emit
+        from de_shell.ipc import emit
         for pw in mgr.plot_windows:
             plot = _nav_plot_for_window(mgr, pw)
             emit({
@@ -142,9 +142,9 @@ def _tile_navigators(session, plot, tree, names) -> None:
     import anyplotlib as apl
     import anyplotlib._electron as _electron
     from spyde.drawing.plots.plot import finalize_figure_html
-    from spyde.actions.figure_registry import keep_alive
+    from de_shell.actions.figure_registry import keep_alive
     from spyde.actions.views import _link_crosshairs, TILED_LABEL
-    from spyde.backend.ipc import emit
+    from de_shell.ipc import emit
 
     wid = getattr(plot, "window_id", None)
     if wid is None:
@@ -382,8 +382,8 @@ def _stack_navigators(session, plot, tree, names) -> None:
     import anyplotlib as apl
     import anyplotlib._electron as _electron
     from spyde.drawing.plots.plot import finalize_figure_html
-    from spyde.actions.figure_registry import keep_alive
-    from spyde.backend.ipc import emit
+    from de_shell.actions.figure_registry import keep_alive
+    from de_shell.ipc import emit
 
     wid = getattr(plot, "window_id", None)
     if wid is None:
@@ -451,7 +451,7 @@ def add_navigator_from_window(session, plot, payload) -> None:
     """Drop a signal window onto a navigator's top bar → add its displayed
     signal as a NAMED navigator of the navigator's tree (must be nav-shaped:
     ``_preprocess_navigator`` enforces the shape contract)."""
-    from spyde.backend.ipc import emit_error, emit_status
+    from de_shell.ipc import emit_error, emit_status
 
     tree = getattr(plot, "signal_tree", None) if plot is not None else None
     src_wid = (payload or {}).get("source_window_id")
@@ -490,7 +490,7 @@ def add_navigator_from_window(session, plot, payload) -> None:
 def extract_navigator(session, plot, payload) -> None:
     """Drag a navigator chip out to the MDI area → the named navigator becomes
     its OWN signal tree (a standalone image dataset)."""
-    from spyde.backend.ipc import emit_error, emit_status
+    from de_shell.ipc import emit_error, emit_status
 
     tree = getattr(plot, "signal_tree", None) if plot is not None else None
     name = (payload or {}).get("name")

@@ -26,7 +26,7 @@ from spyde.actions.ipf_view import _as_orientation_map
 
 # NB: named `logger` (not `log`) — build_ipf_density_figure has a `log: bool`
 # param for log-scale density that would otherwise shadow a module-level `log`.
-from spyde.actions.figure_registry import keep_alive
+from de_shell.actions.figure_registry import keep_alive
 
 logger = logging.getLogger(__name__)
 
@@ -193,7 +193,7 @@ def build_ipf_density_figure(result, direction: str = "z", *,
 def emit_ipf_density(window_id: int, result, direction: str = "z", **kw) -> bool:
     """Build + emit the IPDF heatmap as a ``view="density"`` figure for
     *window_id*. Returns True if a figure was emitted."""
-    from spyde.backend.ipc import emit
+    from de_shell.ipc import emit
     try:
         _fig, fig_id, html = build_ipf_density_figure(result, direction, **kw)
     except Exception as e:

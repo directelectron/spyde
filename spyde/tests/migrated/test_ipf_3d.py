@@ -122,7 +122,7 @@ class TestIpf3D:
         """The separate `view="ipf_key"` figure is gone — a regression here
         means two colour keys on screen, or a stray iframe with no renderer
         left to place it."""
-        import spyde.backend.ipc as ipc
+        import de_shell.ipc as ipc
         from spyde.actions.ipf_view import attach_ipf_3d
 
         class _Plot:
@@ -165,7 +165,7 @@ class TestIpf3D:
 
     def test_emit_3d_figure_message(self):
         # emit_ipf_3d posts a `figure` message tagged view="3d".
-        import spyde.backend.ipc as ipc
+        import de_shell.ipc as ipc
         captured = []
         orig = ipc.emit
         ipc.emit = lambda msg: captured.append(msg)

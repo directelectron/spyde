@@ -72,8 +72,8 @@ from spyde.actions.context import src_plot_tree as _src_plot_tree
 from spyde.actions.lifecycle import (
     bump_generation, is_current, run_on_worker, show_tree_node,
 )
-from spyde.actions.wizard import WizardController
-from spyde.backend.ipc import emit, emit_error, emit_progress, emit_status
+from de_shell.actions.wizard import WizardController
+from de_shell.ipc import emit, emit_error, emit_progress, emit_status
 
 log = logging.getLogger(__name__)
 
@@ -478,7 +478,7 @@ class DriftWizard(WizardController):
         """
         import anyplotlib as apl
         import anyplotlib._electron as _electron
-        from spyde.actions.figure_registry import keep_alive
+        from de_shell.actions.figure_registry import keep_alive
         from spyde.drawing.plots.plot import finalize_figure_html
 
         figsize, aspect = _figure_geometry()
@@ -566,7 +566,7 @@ class DriftWizard(WizardController):
             return
         import anyplotlib as apl
         import anyplotlib._electron as _electron
-        from spyde.actions.figure_registry import keep_alive
+        from de_shell.actions.figure_registry import keep_alive
         from spyde.drawing.plots.plot import finalize_figure_html
 
         figsize, aspect = _figure_geometry()

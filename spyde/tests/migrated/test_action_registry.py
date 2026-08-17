@@ -6,15 +6,18 @@ from __future__ import annotations
 
 import pytest
 
-from spyde.actions import figure_registry
+from de_shell.actions import figure_registry
 from spyde.actions.registry import STAGED_HANDLERS, register_staged, resolve_staged
 
 
 class TestStagedHandlersTable:
     def test_all_entries_are_dotted_paths(self):
+        # A handler lives either in SpyDE or in the shared shell (de_shell owns
+        # the app-agnostic ones, e.g. set_log_level). Anything else is a typo or
+        # a handler that leaked into a third-party module.
         for name, dotted in STAGED_HANDLERS.items():
             mod, _, attr = dotted.rpartition(".")
-            assert mod.startswith("spyde."), f"{name}: {dotted}"
+            assert mod.startswith(("spyde.", "de_shell.")), f"{name}: {dotted}"
             assert attr.isidentifier(), f"{name}: {dotted}"
 
     def test_resolve_staged_imports_handler(self):
@@ -26,7 +29,7 @@ class TestStagedHandlersTable:
         assert resolve_staged("no_such_action") is None
 
     def test_register_staged_adds_entry(self):
-        register_staged("_test_action_xyz", "spyde.backend.log_stream.set_log_level")
+        register_staged("_test_action_xyz", "de_shell.log_stream.set_log_level")
         try:
             assert callable(resolve_staged("_test_action_xyz"))
         finally:

@@ -48,7 +48,7 @@ def _as_snapshot_map(spec, snapshots):
 
 
 def _resolve_cmap(name):
-    from spyde.drawing.colormaps import COLORMAPS
+    from de_shell.plotting.colormaps import COLORMAPS
     return COLORMAPS.get(name, name)
 
 
@@ -985,7 +985,7 @@ class ReportFigureController:
         self._closed = True
         # Drop the figure keep-alive for this window.
         try:
-            from spyde.actions.figure_registry import forget_window
+            from de_shell.actions.figure_registry import forget_window
             forget_window(self.window_id)
         except Exception as e:
             log.debug("report figure controller keep-alive evict failed: %s", e)

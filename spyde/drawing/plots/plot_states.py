@@ -112,7 +112,7 @@ class PlotState:
         if window_id is None:
             return
         try:
-            from spyde.backend.ipc import emit
+            from de_shell.ipc import emit
             emit({
                 "type": "toolbar_config",
                 "window_id": window_id,
@@ -129,7 +129,7 @@ class PlotState:
         if window_id is None:
             return
         try:
-            from spyde.backend.ipc import emit
+            from de_shell.ipc import emit
             emit({"type": "toolbars_show", "window_id": window_id, "plot_id": id(self.plot)})
         except Exception as e:
             log.debug("emitting toolbars_show failed: %s", e)
@@ -139,7 +139,7 @@ class PlotState:
         if window_id is None:
             return
         try:
-            from spyde.backend.ipc import emit
+            from de_shell.ipc import emit
             emit({"type": "toolbars_hide", "window_id": window_id, "plot_id": id(self.plot)})
         except Exception as e:
             log.debug("emitting toolbars_hide failed: %s", e)

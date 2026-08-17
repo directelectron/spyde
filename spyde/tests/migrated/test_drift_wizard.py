@@ -40,7 +40,7 @@ from spyde.actions import drift_action as dr
 def _capture_module_emit(window, monkeypatch):
     """Route ``drift_action``'s own ``emit`` into the captured list.
 
-    The module does ``from spyde.backend.ipc import emit`` at import, so
+    The module does ``from de_shell.ipc import emit`` at import, so
     conftest's patch of ``ipc.emit`` never reaches that binding — the identical
     hazard conftest already documents for ``session.py``, and the identical fix.
     ``emit_status``/``emit_error`` need no patch: they resolve ``emit`` inside
@@ -164,7 +164,7 @@ class TestCheckWindow:
         dr.drift_close(session, plot, {})
         assert getattr(tree, "_drift_wizard", None) is None
         assert session.controller_by_window_id(wid) is None
-        from spyde.actions.figure_registry import _FIGS
+        from de_shell.actions.figure_registry import _FIGS
         assert wid not in _FIGS, "the check figure outlived its window"
 
     def test_the_summed_subset_is_bounded(self, window):
@@ -592,7 +592,7 @@ class TestTraceWindow:
         assert _wait(lambda: wiz.trace_window_id is not None)
         check, trace = wiz.window_id, wiz.trace_window_id
         dr.drift_close(session, plot, {})
-        from spyde.actions.figure_registry import _FIGS
+        from de_shell.actions.figure_registry import _FIGS
         for wid in (check, trace):
             assert session.controller_by_window_id(wid) is None
             assert wid not in _FIGS, f"figure {wid} outlived its window"

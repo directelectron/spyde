@@ -89,3 +89,6 @@ reports/
 .claude/
 tools/rcedit.exe
 spyde/*.svg.*.svg
+
+# Presentation source datasets — hundreds of MB, regenerable, never committed
+doc/presentations/

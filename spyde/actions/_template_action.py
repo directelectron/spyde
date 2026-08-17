@@ -48,7 +48,7 @@ from spyde.actions.action import RegionAction, TransformAction
 from spyde.actions.commit import commit_result_tree
 from spyde.actions.context import src_plot_tree as _src_plot_tree
 from spyde.actions.lifecycle import wait_for_vectors
-from spyde.actions.wizard import WizardController
+from de_shell.actions.wizard import WizardController
 
 log = logging.getLogger(__name__)
 
@@ -145,7 +145,7 @@ class TemplateWizard(WizardController):
 def mywiz_open(session, plot, payload) -> None:
     src, tree = _src_plot_tree(session, plot)
     if src is None or tree is None:
-        from spyde.backend.ipc import emit_error
+        from de_shell.ipc import emit_error
         emit_error("My Wizard: no active dataset")
         return
     if getattr(tree, "diffraction_vectors", None) is None:
@@ -183,7 +183,7 @@ def mywiz_commit(session, plot, payload) -> None:
     src, tree = _src_plot_tree(session, plot)
     wiz = getattr(tree, "_mywiz", None) if tree is not None else None
     if wiz is None:
-        from spyde.backend.ipc import emit_error
+        from de_shell.ipc import emit_error
         emit_error("My Wizard: nothing to commit")
         return
     wiz.commit()

@@ -1,13 +1,14 @@
 /**
- * runner.ts — SpyDE Python process manager.
+ * backendProcess.ts — the Python sidecar process manager.
  *
- * Spawns `uv run python -m spyde` (or a bundled python binary) and maintains
+ * Spawns the resolved backend command (see pythonEnv.ts) and maintains
  * the bidirectional PLOTAPP: JSON protocol over stdin/stdout.
  */
 import { spawn, ChildProcess } from 'child_process'
 import process from 'process'
+import { shellConfig } from './config'
 
-export interface SpyDEHandlers {
+export interface BackendHandlers {
   onMessage: (msg: Record<string, unknown>) => void
   onStream:  (text: string, kind: 'stdout' | 'stderr') => void
   // A raw PLOTBIN binary frame: the decoded header (fig_id/key/dims/…) plus the
@@ -22,15 +23,15 @@ const NL = 0x0a
 let proc: ChildProcess | null = null
 let tickTimer: ReturnType<typeof setInterval> | null = null
 
-export function startSpyDE(
+export function startBackend(
   pythonCmd: string[],
-  handlers: SpyDEHandlers,
+  handlers: BackendHandlers,
   cwd?: string,
 ): void {
-  stopping = false  // fresh process — allow a future stopSpyDE() to run
+  stopping = false  // fresh process — allow a future stopBackend() to run
   const [cmd, ...args] = pythonCmd
   proc = spawn(cmd, args, {
-    cwd,   // run from the repo root so `uv run` finds spyde's pyproject.toml
+    cwd,   // run from the project root so `uv run` finds the app's pyproject.toml
     // APL_BINARY_TRANSPORT=1: anyplotlib ships large image pixels as raw PLOTBIN
     // binary frames (no base64/JSON) which this runner demuxes — see the stdout
     // parser below. Verified end-to-end (pixel-correct via GPU readback); cuts the
@@ -47,7 +48,7 @@ export function startSpyDE(
   // Python child so aggressively that its timer waits (time.sleep,
   // Event.wait, event-loop timers — incl. dask's task-delivery flushes) can
   // freeze INDEFINITELY, waking only when process I/O arrives. Measured
-  // end-to-end (spyde/tests/repro_batch_stall.py + _probe_fv_stall.spec.ts):
+  // end-to-end (SpyDE: spyde/tests/repro_batch_stall.py + _probe_fv_stall.spec.ts):
   // distributed computes sat idle forever hands-off, and EVERY unstick
   // followed a stdin message within ~4 s — a user click "fixing" it was this
   // pipe write, not the click. Electron's own timers are healthy (foreground
@@ -114,7 +115,7 @@ export function startSpyDE(
 
   proc.on('close', (code) => {
     proc = null
-    handlers.onStream(`[SpyDE exited with code ${code}]\n`, 'stderr')
+    handlers.onStream(`[${shellConfig().appName} exited with code ${code}]\n`, 'stderr')
     // Surface the death to the renderer so the UI doesn't silently freeze —
     // every sendAction() after this no-ops (proc is null), so without this the
     // user gets no indication the analysis backend stopped. Routed through the
@@ -141,14 +142,14 @@ export function sendFigureEvent(figId: string, eventJson: string): void {
   proc.stdin.write(JSON.stringify({ type: 'figure_event', fig_id: figId, event_json: eventJson }) + '\n')
 }
 
-/** Notify Python of an MDI subwindow resize. */
+/** Notify Python that a figure's container resized. */
 export function sendResize(figId: string, width: number, height: number): void {
   if (!proc?.stdin) return
   proc.stdin.write(JSON.stringify({ type: 'resize', fig_id: figId, width, height }) + '\n')
 }
 
 /**
- * Stop the Python backend, leaving NO orphaned Dask worker subprocesses.
+ * Stop the Python backend, leaving NO orphaned worker subprocesses.
  *
  * Strategy:
  *  1. GRACEFUL: write `{type:'quit'}` to stdin. The backend's asyncio loop
@@ -172,7 +173,7 @@ export function sendResize(figId: string, width: number, height: number): void {
  * signal handler without double-killing.
  */
 let stopping = false
-export function stopSpyDE(): void {
+export function stopBackend(): void {
   const p = proc
   if (!p || stopping) {
     proc = null

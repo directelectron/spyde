@@ -30,7 +30,7 @@ import re
 
 import numpy as np
 
-from spyde.backend import ipc
+from de_shell import ipc
 from spyde.actions.report.handlers import _manager, _resolve_source_plot, _snapshot_plot
 from spyde.actions.report.model import (
     LayerSpec, PanelSpec, SignalRef, new_layer_id,

@@ -45,7 +45,7 @@ class TestComputeConfigure:
         for env in ("SPYDE_MEM_FRACTION", "SPYDE_COMPUTE_FRACTION", "SPYDE_FV_GPU"):
             monkeypatch.delenv(env, raising=False)
         statuses = []
-        import spyde.backend.ipc as ipc
+        import de_shell.ipc as ipc
         monkeypatch.setattr(ipc, "emit_status", lambda t: statuses.append(t))
 
         s = _FakeSession()
@@ -70,7 +70,7 @@ class TestComputeConfigure:
         import spyde.backend.compute_config as cc
         for env in ("SPYDE_MEM_FRACTION", "SPYDE_COMPUTE_FRACTION", "SPYDE_FV_GPU"):
             monkeypatch.delenv(env, raising=False)
-        import spyde.backend.ipc as ipc
+        import de_shell.ipc as ipc
         monkeypatch.setattr(ipc, "emit_status", lambda t: None)
 
         s = _FakeSession()

@@ -17,7 +17,7 @@ import logging
 
 import numpy as np
 
-from spyde.actions.figure_registry import keep_alive
+from de_shell.actions.figure_registry import keep_alive
 
 log = logging.getLogger(__name__)
 
@@ -141,7 +141,7 @@ def emit_ipf_3d(window_id: int, result, direction: str = "z",
     ``tree`` is given the live ``Plot3D`` is cached on ``tree._ipf_p3d`` so a later
     point-pick updates the highlight IN PLACE (camera preserved) instead of
     re-emitting. Returns True if a figure was emitted."""
-    from spyde.backend.ipc import emit
+    from de_shell.ipc import emit
 
     scene = ipf_scene_data(result, direction)
     if scene is None:

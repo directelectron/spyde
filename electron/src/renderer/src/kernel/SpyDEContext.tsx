@@ -7,6 +7,10 @@
 import React, {
   createContext, useCallback, useContext, useEffect, useReducer, useRef, useState,
 } from 'react'
+import { useFigureBridge, shellReducer, shellInitialState, LOG_MAX } from '@de/shell-renderer'
+import type {
+  ShellState, ShellAction, LogEntry, SubItem, EnvPhase, EnvSetupState,
+} from '@de/shell-renderer'
 import { asPlotAppMessage } from './protocol'
 import type { ReportDocState, ReportCell } from './protocol'
 import { WINDOW_DRAG_MIME, FIGURE_DRAG_MIME, stashWindowDrag } from './dnd'
@@ -112,26 +116,10 @@ export interface Histogram {
   clipped?: boolean           // bins are robust quantiles — end bins are overflow
 }
 
-/**
- * One application-log record streamed from the Python backend.
- *
- * `seq` is a renderer-assigned monotonic id, stamped once as the record enters
- * the buffer. It is the STABLE React key + height-cache key for the virtualised
- * log list: the buffer is a ring (old records drop off the front), so an array
- * INDEX identifies a different record after every shift, which would defeat both
- * row memoisation and the measured-height cache.
- */
-export interface LogEntry {
-  level: string
-  name: string
-  area?: string
-  msg: string
-  time: number
-  seq?: number
-}
-
-/** Max buffered log records (the renderer-side ring buffer). */
-export const LOG_MAX = 1000
+// LogEntry and LOG_MAX are the shell's (@de/shell-renderer/shellState) —
+// re-exported so the components that import them from here keep working.
+export type { LogEntry } from '@de/shell-renderer'
+export { LOG_MAX } from '@de/shell-renderer'
 
 /** A console_result/console_vars value description (shape × dtype badge). */
 export interface ConsoleVarKind {
@@ -204,7 +192,7 @@ export interface SelectorInfo {
 }
 /** The named navigators a navigator window offers (its top chip strip). */
 export interface NavigatorOptions { names: string[]; current?: string | null }
-export interface SubItem { name: string; color: string; vtype?: string; calculation?: string }
+export type { SubItem } from '@de/shell-renderer'
 export interface TreeNode { name: string; signal_id: number; children: TreeNode[] }
 export interface AxisRow {
   index: number
@@ -216,7 +204,10 @@ export interface AxisRow {
   navigate: boolean
 }
 
-interface State {
+// Extends the shell's chrome slice (status / logs / env setup / backend
+// death / computing overlays / toolbar action state) — see
+// @de/shell-renderer's shellState.ts. Only SpyDE's own fields are listed here.
+interface State extends ShellState {
   windows: Map<number, SpyDEWindow>
   figures: Map<string, SpyDEFigure>
   // Report figure cells' iframes — same SpyDEFigure shape + same figId-keyed
@@ -250,21 +241,10 @@ interface State {
   // reset it while the crosshair stayed on the plot.
   offsetPick: Map<number, boolean>
   composition: Map<number, Composition>     // windowId → sample elements + percentages
-  activeActions: Map<number, Set<string>>   // windowId → action names with live output
-  subItems: Map<number, Map<string, SubItem[]>>  // windowId → action → dynamic chips
-  computingWindows: Set<number>   // windowIds with a long compute in flight (→ floating overlay)
-  status: string
-  ready: boolean
   dashboardUrl: string | null
   activeWindowId: number | null
-  streamLines: Array<{ text: string; kind: 'stdout' | 'stderr' }>
-  logEntries: LogEntry[]          // application-log records (the log panel)
-  logLevel: string                // current backend verbosity (DEBUG…CRITICAL)
   navShapePrompt: NavShapePrompt | null   // pending scan-shape/step-size dialog
-  loading: { busy: boolean; text: string }   // long file-read busy indicator
   signalTypes: Map<number, { current: string; options: string[] }>   // windowId → signal-type info
-  backendExited: { code: number | null; reason?: string } | null   // set when the Python sidecar dies; surfaces a blocking banner
-  envSetup: EnvSetupState | null   // first-run `uv sync` progress; drives the floating setup overlay
   playback: { playing: boolean; speed: number; loop: boolean }   // movie playback clock (session-wide)
   consoleResult: ConsoleResult | null       // last-executed cell (the ConsoleBar echo strip)
   consoleVars: ConsoleVarEntry[]            // live variable table (chips + signal-ref resolution)
@@ -272,16 +252,8 @@ interface State {
   consolePreview: ConsolePreviewResult | null   // last live-preview reply (the eye-toggled slot)
 }
 
-// First-run environment setup progress (main-process `env_setup` events, parsed
-// from uv output in envProgress.ts). Drives the floating EnvSetupOverlay.
-export type EnvPhase =
-  | 'resolving' | 'downloading' | 'installing' | 'building' | 'torch' | 'working'
-export interface EnvSetupState {
-  phase: EnvPhase
-  step: string                 // friendly current-step headline
-  percent: number | null       // 0–100 for a download we can measure, else null
-  lines: string[]              // rolling raw uv output tail (bounded)
-}
+// First-run environment setup progress: the shell's, re-exported.
+export type { EnvPhase, EnvSetupState } from '@de/shell-renderer'
 
 // Backend `nav_shape_prompt`: confirm the scan grid + step size before opening a
 // navigated dataset (4D-STEM / stack). Mirrors NavShapeDialog's prop type.
@@ -295,14 +267,13 @@ export interface NavShapePrompt {
 }
 
 type Action =
+  | ShellAction
   | { type: 'READY'; dashboardUrl?: string }
-  | { type: 'STATUS'; text: string }
   | { type: 'FIGURE'; windowId: number; figId: string; fileUrl: string | null; title: string; isNavigator: boolean; aspect?: number; view?: string; viewLabel?: string; viewKind?: string; strainComponents?: string[] }
   | { type: 'WINDOW_TITLE'; windowId: number; title: string }
   | { type: 'TOOLBAR_CONFIG'; windowId: number; plotId: number; actions: ToolbarAction[] }
   | { type: 'WINDOW_VISIBILITY'; windowId: number; visible: boolean }
   | { type: 'WINDOW_CLOSED'; windowId: number }
-  | { type: 'WINDOW_COMPUTING'; windowId: number; computing: boolean }
   | { type: 'SET_ACTIVE'; windowId: number }
   | { type: 'METADATA'; windowIds: number[]; metadata: MetadataDict
       editable?: Record<string, Record<string, string>>; info?: MetadataInfo
@@ -310,24 +281,13 @@ type Action =
   | { type: 'COMPOSITION'; windowIds: number[]; composition: Composition }
   | { type: 'AXES'; windowIds: number[]; axes: AxisRow[] }
   | { type: 'OFFSET_PICK'; windowId: number; on: boolean }
-  | { type: 'ACTION_ACTIVE'; windowId: number; name: string; active: boolean }
-  | { type: 'SUB_ITEM'; windowId: number; action: string; name: string; color: string; vtype?: string; calculation?: string; active: boolean }
   | { type: 'HISTOGRAM'; windowId: number; histogram: Histogram }
   | { type: 'NAV_SHAPE_PROMPT'; prompt: NavShapePrompt | null }
-  | { type: 'LOADING'; busy: boolean; text: string }
   | { type: 'SIGNAL_TYPE'; windowIds: number[]; current: string; options: string[] }
   | { type: 'SELECTOR_INFO'; info: SelectorInfo }
   | { type: 'SELECTOR_REMOVED'; selectorId: number }
   | { type: 'SIGNAL_TREE'; windowId: number; tree: TreeNode; activeSignalId?: number }
   | { type: 'NAVIGATOR_OPTIONS'; windowId: number; names: string[]; current?: string | null }
-  | { type: 'STREAM'; text: string; kind: 'stdout' | 'stderr' }
-  | { type: 'LOG'; entries: LogEntry[] }
-  | { type: 'LOG_BACKFILL'; entries: LogEntry[] }
-  | { type: 'LOG_LEVEL'; level: string }
-  | { type: 'BACKEND_EXITED'; code: number | null; reason?: string }
-  | { type: 'ENV_SETUP_START' }
-  | { type: 'ENV_SETUP_PROGRESS'; phase?: EnvPhase; step?: string; percent: number | null; raw: string }
-  | { type: 'ENV_SETUP_DONE' }
   | { type: 'PLAYBACK'; playing: boolean; speed: number; loop: boolean }
   | { type: 'CONSOLE_RESULT'; result: ConsoleResult }
   | { type: 'CONSOLE_VARS'; vars: ConsoleVarEntry[] }
@@ -345,9 +305,6 @@ function spydeReducer(state: State, action: Action): State {
         dashboardUrl: action.dashboardUrl ?? null,
         status: 'Ready',
       }
-
-    case 'STATUS':
-      return { ...state, status: action.text }
 
     case 'FIGURE': {
       // The main process already wrote the HTML to disk and gave us a file:// URL.
@@ -444,15 +401,6 @@ function spydeReducer(state: State, action: Action): State {
       return { ...state, windows: newWindows }
     }
 
-    case 'WINDOW_COMPUTING': {
-      const has = state.computingWindows.has(action.windowId)
-      if (action.computing === has) return state   // no-op re-emit
-      const computingWindows = new Set(state.computingWindows)
-      if (action.computing) computingWindows.add(action.windowId)
-      else computingWindows.delete(action.windowId)
-      return { ...state, computingWindows }
-    }
-
     case 'WINDOW_CLOSED': {
       const newWindows = new Map(state.windows)
       newWindows.delete(action.windowId)
@@ -531,28 +479,6 @@ function spydeReducer(state: State, action: Action): State {
       const offsetPick = new Map(state.offsetPick)
       offsetPick.set(action.windowId, action.on)
       return { ...state, offsetPick }
-    }
-
-    case 'ACTION_ACTIVE': {
-      const activeActions = new Map(state.activeActions)
-      const set = new Set(activeActions.get(action.windowId) ?? [])
-      if (action.active) set.add(action.name)
-      else set.delete(action.name)
-      activeActions.set(action.windowId, set)
-      return { ...state, activeActions }
-    }
-
-    case 'SUB_ITEM': {
-      const subItems = new Map(state.subItems)
-      const byAction = new Map(subItems.get(action.windowId) ?? new Map<string, SubItem[]>())
-      const list = (byAction.get(action.action) ?? []).filter(i => i.name !== action.name)
-      if (action.active) list.push({
-        name: action.name, color: action.color,
-        vtype: action.vtype, calculation: action.calculation,
-      })
-      byAction.set(action.action, list)
-      subItems.set(action.windowId, byAction)
-      return { ...state, subItems }
     }
 
     case 'HISTOGRAM': {
@@ -661,34 +587,8 @@ function spydeReducer(state: State, action: Action): State {
       return { ...state, signalTrees, signalTreeActive, computingWindows }
     }
 
-    case 'STREAM':
-      return {
-        ...state,
-        streamLines: [...state.streamLines.slice(-500), { text: action.text, kind: action.kind }],
-      }
-
-    // A BATCH of records (coalesced per animation frame by `queueLog` below) —
-    // one array copy + one render for a whole burst, instead of one per line.
-    case 'LOG': {
-      if (action.entries.length === 0) return state
-      const merged = state.logEntries.concat(action.entries)
-      return {
-        ...state,
-        logEntries: merged.length > LOG_MAX ? merged.slice(-LOG_MAX) : merged,
-      }
-    }
-
-    case 'LOG_BACKFILL':
-      return { ...state, logEntries: action.entries.slice(-LOG_MAX) }
-
-    case 'LOG_LEVEL':
-      return { ...state, logLevel: action.level }
-
     case 'NAV_SHAPE_PROMPT':
       return { ...state, navShapePrompt: action.prompt }
-
-    case 'LOADING':
-      return { ...state, loading: { busy: action.busy, text: action.text } }
 
     case 'SIGNAL_TYPE': {
       const signalTypes = new Map(state.signalTypes)
@@ -697,46 +597,12 @@ function spydeReducer(state: State, action: Action): State {
       return { ...state, signalTypes }
     }
 
-    case 'BACKEND_EXITED':
-      return {
-        ...state,
-        backendExited: { code: action.code, reason: action.reason },
-        // A setup failure surfaces via BACKEND_EXITED — drop the setup overlay
-        // so the two don't stack.
-        envSetup: null,
-        ready: false,
-        status: 'Backend stopped',
-      }
-
-    case 'ENV_SETUP_START':
-      return {
-        ...state,
-        envSetup: { phase: 'resolving', step: 'Preparing the analysis environment', percent: null, lines: [] },
-        status: 'Setting up the analysis environment…',
-      }
-
-    case 'ENV_SETUP_PROGRESS': {
-      const prev = state.envSetup
-        ?? { phase: 'resolving' as EnvPhase, step: 'Preparing the analysis environment', percent: null, lines: [] }
-      // Keep the last meaningful step/phase when a noisy line parses to nothing;
-      // always append the raw line to the bounded tail so it visibly moves.
-      const lines = [...prev.lines, action.raw].slice(-200)
-      return {
-        ...state,
-        envSetup: {
-          phase: action.phase ?? prev.phase,
-          step: action.step ?? prev.step,
-          percent: action.percent,
-          lines,
-        },
-      }
-    }
-
-    case 'ENV_SETUP_DONE':
-      return { ...state, envSetup: null }
-
     default:
-      return state
+      // Not one of SpyDE's — hand it to the shell, which owns the chrome slice
+      // (status / logs / env setup / backend death / computing overlays /
+      // toolbar action state) and returns `state` untouched for anything it
+      // does not own either.
+      return shellReducer(state, action as ShellAction)
   }
 }
 
@@ -830,22 +696,20 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     consolePreview: null,
   })
 
-  const iframeRefs = useRef<Map<string, HTMLIFrameElement>>(new Map())
-  const latestStates = useRef<Map<string, Map<string, unknown>>>(new Map())
-  // Latest RAW BINARY frame per figure (key → {header, buffer}), mirroring
-  // latestStates but for PLOTBIN pushes. Without this, a figure whose FIRST
-  // real paint arrives as a binary frame before its iframe's onLoad fires (the
-  // common case for a console-created window, which — unlike a
-  // navigator-driven one — gets no organic second paint) stays permanently
-  // blank: postMessage to an unmounted iframe silently no-ops and, prior to
-  // this stash, replayState() had nothing to give it on load. Keeps only the
-  // LATEST frame per key (retained across postMessage's transfer, which
-  // detaches the original ArrayBuffer) — matches the "latest-wins" paint
-  // philosophy used throughout the nav/paint pipeline (see CLAUDE.md).
-  // figId → (`${geom}::${pixelField}` → the frame). Keyed per PANEL, not per
-  // pixel field — see the state_update_binary handler for why that matters.
-  const latestBinaryStates = useRef<Map<string, Map<string,
-    { key: string; header: unknown; buffer: Uint8Array }>>>(new Map())
+  // The figure bridge — iframe registry, state retention and replay — now lives
+  // in @de/shell-renderer, shared with de-groundcrew. It exposes its maps as
+  // `{current}` boxes, so `iframeRefs` / `latestStates` / `latestBinaryStates`
+  // keep the exact shape the components that read them already expect (a
+  // React.MutableRefObject<Map<…>>), and none of them needed changing.
+  //
+  // The three subtleties that used to live here — replay taking an explicit
+  // target so a doubly-mounted figure serves ITSELF, binary frames stashed per
+  // PANEL (`geom::pixelField`) rather than per pixel field, and replaying a COPY
+  // because postMessage transfers and detaches — are documented on the bridge.
+  const figureBridge = useFigureBridge(dlog)
+  const iframeRefs = figureBridge.iframes
+  const latestStates = figureBridge.states
+  const latestBinaryStates = figureBridge.binaryStates
   // Mirror reportFigures into a ref so the (stable-identity, deps-[]) message
   // effect below can read the LATEST cell→figure map synchronously — e.g. to
   // find a report cell's OLD figId before it's replaced, so its shadow state
@@ -865,52 +729,11 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
   const [gpuHelpDialogOpen, setGpuHelpDialogOpen] = useState(false)
   const [dragKind, setDragKind] = useState<'window' | null>(null)
 
-  // Post every stored state for a figure to its iframe (called on iframe load).
-  /**
-   * Re-send a figure's stashed state into an iframe.
-   *
-   * `target` names WHICH iframe. Load-bearing when a figure is mounted more
-   * than once — a report figure lives in the sidebar cell AND on its presented
-   * slide, and both register under the same figId in a Map that holds one
-   * element. Resolving the target from that map means whichever mounted LAST
-   * wins, so a freshly-loaded frame calling replayState would push its state
-   * into its SIBLING and receive nothing itself. Which mount won is a race, so
-   * the presented deck came up blank on some machines and not others.
-   *
-   * A frame that has just loaded passes itself here and is always served.
-   */
-  const replayState = (figId: string, target?: HTMLIFrameElement) => {
-    const iframe = target ?? iframeRefs.current.get(figId)
-    if (!iframe?.contentWindow) return
-    const states = latestStates.current.get(figId)
-    if (states) {
-      for (const [key, value] of states) {
-        iframe.contentWindow.postMessage({ type: 'awi_state', key, value }, '*')
-      }
-    }
-    const binStates = latestBinaryStates.current.get(figId)
-    if (binStates) {
-      // The MAP key is `geom::pixelField` (one entry per panel); the message
-      // must carry the original pixel-field `key` + its header, which is what
-      // the figure routes on.
-      for (const { key, header, buffer } of binStates.values()) {
-        // Send a COPY (transfer detaches the buffer) — the stash must survive
-        // a later iframe remount (e.g. window re-tile / dev StrictMode).
-        const copy = buffer.slice()
-        iframe.contentWindow.postMessage(
-          { type: 'awi_state_binary', key, header, buffer: copy },
-          '*',
-          [copy.buffer],
-        )
-      }
-    }
-    dlog('replayState', {
-      figId,
-      jsonKeys: states ? states.size : 0,
-      binaryKeys: binStates ? binStates.size : 0,
-      target: iframe.getAttribute('data-testid'),
-    })
-  }
+  // Replay is the bridge's; see @de/shell-renderer/figureBridge for why it
+  // takes an explicit target (a figure mounted in both the report sidebar and
+  // a presented slide registers twice under one figId, and a freshly-loaded
+  // frame must serve itself rather than whichever mount won the map).
+  const replayState = figureBridge.replay
 
   /**
    * What a figure would replay into a freshly-mounted iframe.
@@ -928,31 +751,16 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
    * `__spydeFigureDump()` in DevTools while the bad slide is up.
    */
   const figureDump = React.useCallback(() => {
-    const rows: Record<string, unknown>[] = []
-    const figIds = new Set<string>([
-      ...latestStates.current.keys(),
-      ...latestBinaryStates.current.keys(),
-      ...iframeRefs.current.keys(),
-    ])
-    for (const figId of figIds) {
-      const el = iframeRefs.current.get(figId)
-      const rect = el?.getBoundingClientRect()
-      const bin = latestBinaryStates.current.get(figId)
-      rows.push({
-        figId,
-        jsonKeys: latestStates.current.get(figId)?.size ?? 0,
-        binaryKeys: bin?.size ?? 0,
-        binaryKeyNames: bin ? Array.from(bin.keys()).join(',') : '',
-        registeredIn: el?.closest('[data-testid="present-slide"]') ? 'present-slide'
-          : el?.closest('[data-testid="report-sidebar"]') ? 'report-sidebar'
-            : el ? 'other' : 'NONE',
-        size: rect ? `${Math.round(rect.width)}x${Math.round(rect.height)}` : 'n/a',
-      })
-    }
+    // The classifier is SpyDE's: WHERE a figure is mounted is what makes this
+    // dump diagnostic, and only this app has a report sidebar and a slide deck.
+    const rows = figureBridge.dump((el) =>
+      el?.closest('[data-testid="present-slide"]') ? 'present-slide'
+        : el?.closest('[data-testid="report-sidebar"]') ? 'report-sidebar'
+          : el ? 'other' : 'NONE')
     // eslint-disable-next-line no-console
     console.table(rows)
     return rows
-  }, [])
+  }, [figureBridge])
 
   React.useEffect(() => {
     ;(window as unknown as Record<string, unknown>).__spydeFigureDump = figureDump
@@ -1097,9 +905,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
             // never touches an MDI figure's entry).
             const prev = reportFiguresRef.current.get(msg.cell_id)
             if (prev && prev.figId && prev.figId !== msg.fig_id) {
-              latestStates.current.delete(prev.figId)
-              latestBinaryStates.current.delete(prev.figId)
-              iframeRefs.current.delete(prev.figId)
+              figureBridge.evict(prev.figId)
             }
             dispatch({
               type: 'REPORT_FIGURE',
@@ -1170,73 +976,20 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
           break
 
         case 'state_update':
-          // Forward anyplotlib state to the iframe AND remember it, so it can
-          // be replayed if/when the iframe (re)loads after this arrived.
-          {
-            const figId = msg.fig_id
-            const key = msg.key
-            if (!latestStates.current.has(figId)) {
-              latestStates.current.set(figId, new Map())
-            }
-            latestStates.current.get(figId)!.set(key, msg.value)
-            const iframe = iframeRefs.current.get(figId)
-            iframe?.contentWindow?.postMessage(
-              { type: 'awi_state', key, value: msg.value },
-              '*',
-            )
-          }
+          // Forward to the iframe AND remember it, so it can be replayed if the
+          // iframe (re)loads after this arrived.
+          figureBridge.applyState(msg.fig_id, msg.key, msg.value)
           break
 
         case 'state_update_binary':
-          // A raw image frame (pixels as a Uint8Array, no base64). Post it to the
-          // iframe as `awi_state_binary`; the figure ESM uses the ArrayBuffer as
-          // the texture/ImageData bytes directly (no atob). ALSO stash a retained
-          // copy in latestBinaryStates (mirrors latestStates) so replayState() can
-          // recover a figure whose iframe wasn't mounted yet when this arrived —
-          // otherwise the postMessage below silently no-ops (no listener) and the
-          // frame is lost forever: a static (e.g. console-created) window that
-          // never repaints organically stayed permanently blank.
-          {
-            const figId = msg.fig_id
-            const key = msg.key
-            const bytes = msg.buffer as Uint8Array
-            if (bytes) {
-              if (!latestBinaryStates.current.has(figId)) {
-                latestBinaryStates.current.set(figId, new Map())
-              }
-              // STASH PER PANEL, not per pixel-field.
-              //
-              // `key` is the pixel FIELD ("image_b64" / "overlay_mask_b64" /
-              // "detail_b64") and is the SAME for every panel; the panel is
-              // identified by `header.geom`, the trait name anyplotlib routes
-              // the bytes back through (see _electron.py's emit_binary). Keying
-              // the stash by `key` alone therefore let each panel of a
-              // multi-panel figure OVERWRITE the previous one's pixels, leaving
-              // exactly one frame stashed however many panels the figure has.
-              //
-              // A figure only replays from this stash when it is mounted a
-              // SECOND time — which is what a presented slide is, the sidebar
-              // cell being the first. So a composed grid rendered correctly in
-              // the sidebar and then presented with every panel blank except
-              // the last one composed: no image, no ticks, no title, only the
-              // HTML scale-bar overlay, which is not part of the canvas.
-              // Single-panel cells (everything else in the app) push one frame
-              // and never noticed.
-              //
-              // Mirrors the figure ESM's own slot convention, `geom::pixelKey`.
-              const geom = (msg.header as { geom?: string } | undefined)?.geom
-              const stashKey = geom ? `${geom}::${key}` : key
-              latestBinaryStates.current.get(figId)!.set(
-                stashKey, { key, header: msg.header, buffer: bytes.slice() },
-              )
-            }
-            const iframe = iframeRefs.current.get(figId)
-            iframe?.contentWindow?.postMessage(
-              { type: 'awi_state_binary', key, header: msg.header, buffer: bytes },
-              '*',
-              bytes?.buffer ? [bytes.buffer] : [],   // TRANSFER the ArrayBuffer
-            )
-          }
+          // A raw image frame (pixels as a Uint8Array, no base64) — posted to
+          // the iframe AND retained, so a figure whose FIRST real paint arrives
+          // before its iframe's onLoad (the common case for a console-created
+          // window, which gets no organic second paint) can be replayed rather
+          // than staying permanently blank. The bridge stashes per PANEL and
+          // transfers the buffer; both are documented there.
+          figureBridge.applyBinary(
+            msg.fig_id, msg.key, msg.header, msg.buffer as Uint8Array)
           break
 
         case 'composition':
@@ -1463,9 +1216,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
             for (const [cellId, fig] of prevFigures) {
               if (!liveIds || !liveIds.has(cellId)) {
                 if (fig.figId) {
-                  latestStates.current.delete(fig.figId)
-                  latestBinaryStates.current.delete(fig.figId)
-                  iframeRefs.current.delete(fig.figId)
+                  figureBridge.evict(fig.figId)
                 }
               }
             }

@@ -10,6 +10,12 @@ resolution-markers = [
     "python_full_version < '3.11' and sys_platform != 'win32'",
 ]
 
+[manifest]
+members = [
+    "de-shell",
+    "spyde",
+]
+
 [[package]]
 name = "accessible-pygments"
 version = "0.0.5"
@@ -648,6 +654,33 @@ array = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
+
+[[package]]
+name = "de-shell"
+version = "0.1.0"
+source = { editable = "packages/de-shell" }
+dependencies = [
+    { name = "anyplotlib" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "pyyaml" },
+]
+
+[package.optional-dependencies]
+tests = [
+    { name = "pytest" },
+    { name = "pytest-timeout" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "anyplotlib", specifier = ">=0.7.1" },
+    { name = "numpy", specifier = ">=1.20.0" },
+    { name = "pytest", marker = "extra == 'tests'", specifier = ">=3.6" },
+    { name = "pytest-timeout", marker = "extra == 'tests'" },
+    { name = "pyyaml" },
+]
+provides-extras = ["tests"]
 
 [[package]]
 name = "decorator"
@@ -3568,6 +3601,7 @@ dependencies = [
     { name = "anyplotlib" },
     { name = "bokeh" },
     { name = "dask" },
+    { name = "de-shell" },
     { name = "distributed" },
     { name = "em-database", marker = "python_full_version >= '3.12'" },
     { name = "huggingface-hub" },
@@ -3639,6 +3673,7 @@ requires-dist = [
     { name = "atomap", marker = "extra == 'atoms'", specifier = ">=0.4.1" },
     { name = "bokeh" },
     { name = "dask" },
+    { name = "de-shell", editable = "packages/de-shell" },
     { name = "distributed" },
     { name = "em-database", marker = "python_full_version >= '3.12'", specifier = ">=0.2.0" },
     { name = "exspy", marker = "extra == 'eels'", specifier = ">=0.3.2" },

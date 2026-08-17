@@ -37,7 +37,7 @@ class TestSetMetadataAction:
             tree = plot.signal_tree
 
             captured = []
-            import spyde.backend.ipc as ipc_mod
+            import de_shell.ipc as ipc_mod
             orig = ipc_mod.emit
             ipc_mod.emit = lambda m: captured.append(m)
             try:
