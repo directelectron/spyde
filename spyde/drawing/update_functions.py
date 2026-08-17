@@ -1548,6 +1548,115 @@ class _AssembledFuture(_ProgressiveFuture):
         self.key = f"spyde-{label}-{next(_ASSEMBLED_SEQ)}"
 
 
+def _local_display_future(lazy_array, label: str = "display"):
+    """Compute *lazy_array* in THIS process, off-thread, into an
+    :class:`_AssembledFuture` — the same handle the cluster path hands back, so
+    everything downstream (PlotUpdateWorker poll → ``Session._on_plot_ready`` →
+    the ``window_computing`` stop) is identical either way."""
+    fut = _AssembledFuture(label)
+
+    def _run():
+        try:
+            fut._value = np.asarray(lazy_array.compute(scheduler="threads"))
+        except Exception as e:                     # delivered via result()
+            fut._error = e
+            log.exception("local display compute failed")
+        finally:
+            # LAST, always: _on_plot_ready is what stops the window's
+            # "Calculating…" overlay, and it only runs once this is set.
+            fut._done_evt.set()
+
+    threading.Thread(target=_run, daemon=True,
+                     name=f"display-{label}").start()
+    return fut
+
+
+def graph_can_reach_workers(lazy_array) -> bool:
+    """True if *lazy_array*'s graph can be sent to a distributed worker.
+
+    The verdict must come from **distributed's own serializer**, not from a
+    plain pickle: those two disagree, and on a real format. A lazy ``.hspy``
+    graph holds an h5py object that ``cloudpickle`` refuses outright, yet
+    ``distributed`` serializes it happily (it has handlers pickle does not) —
+    so an earlier cloudpickle-only version of this function answered False for
+    ``.hspy`` and would have pushed every HDF5 dataset off the cluster and into
+    this process for no reason. Measured verdicts:
+
+        format   cloudpickle   distributed   .. and in the app
+        .tif     False         False         was broken, now fixed
+        .hspy    False         True          always worked — must stay on the cluster
+        .zspy    True          True          always worked
+
+    ``cloudpickle`` is still asked FIRST, purely as a fast accept: it is the
+    cheaper call, it never says True where distributed says False (it is the
+    more permissive of the two only in the direction that matters here), and it
+    settles the common ``.zspy``/``.mrc`` case without touching the noisy path
+    below.
+
+    Probing at all — rather than catching a failed ``client.compute()`` — is
+    deliberate: that failure is not quiet. ``distributed.protocol.pickle`` logs
+    it at ERROR with three chained tracebacks BEFORE raising, so a try/except
+    cannot suppress it and every ``.tif`` open would spray tracebacks into the
+    user's Log panel. The same logger is why the probe silences it here: this
+    call is a QUESTION, not an error, and its answer is the return value.
+    """
+    try:
+        import cloudpickle
+        cloudpickle.dumps(lazy_array)
+        return True                       # fast accept: .zspy, .mrc, plain dask
+    except Exception:
+        pass
+
+    from distributed.protocol import serialize
+    from distributed.protocol.serialize import to_serialize
+    pickle_log = logging.getLogger("distributed.protocol.pickle")
+    prior = pickle_log.level
+    pickle_log.setLevel(logging.CRITICAL)
+    try:
+        serialize(to_serialize(lazy_array), on_error="raise")
+        return True                       # .hspy lands here
+    except Exception:
+        return False                      # .tif lands here
+    finally:
+        pickle_log.setLevel(prior)
+
+
+def compute_display_future(lazy_array, client, label: str = "display"):
+    """Compute a lazy array FOR DISPLAY, on the cluster when the graph can get
+    there and in this process when it cannot.
+
+    **Not every lazy graph is picklable, and a graph that is not cannot go to a
+    distributed worker at all.** Two of the formats SpyDE opens build exactly
+    such a graph: rosettasciio's lazy TIFF reader closes over an open
+    ``BufferedReader``, and an ``.hspy`` closes over an h5py object. Handing one
+    to ``client.compute()`` raises *at submit time* —
+
+        TypeError: Could not serialize object of type _HLGExprSequence
+        ... cannot pickle 'BufferedReader' instances
+
+    — and because that call sits between ``window_computing().start()`` and the
+    ``_on_plot_ready`` that stops it, the raise ALSO stranded the spinner: a
+    plain ``.tif`` opened as a permanently black window captioned
+    "Calculating…", with "Failed to load …" on the status bar. (Only ``.zspy``
+    is picklable, which is why the bug hid — that is the format the app writes
+    itself and the one every lazy test fixture uses.)
+
+    Computing it here instead is not a downgrade: this display path materialises
+    ONE image that has to reach this process to be painted anyway, so the cluster
+    buys a graph serialization and a result transfer and nothing else — the same
+    reasoning ``ComputeBackend.submit_graph`` documents for the navigator read.
+    The cluster is still preferred whenever the graph CAN go, because a lazy
+    display array may be the tip of a large reduction whose inputs should stay on
+    the workers.
+    """
+    if client is None or not graph_can_reach_workers(lazy_array):
+        if client is not None:
+            log.info("display graph holds an unpicklable handle (lazy .tif/.hspy "
+                     "hold an open file object); computing it in-process")
+        return _local_display_future(lazy_array, label)
+    return client.compute(lazy_array)
+
+
 class _StopFlag(list):
     """A ``[False]`` stopped_flag that ALSO reports a set ``threading.Event``.
 

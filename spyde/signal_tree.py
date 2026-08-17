@@ -245,7 +245,14 @@ class BaseSignalTree:
             # matching stop — see the finally there.
             from spyde.actions.lifecycle import window_computing
             window_computing(getattr(plot, "window_id", None)).start()
-            future = self.client.compute(signal.data)
+            # NOT a bare `client.compute`: a lazy .tif/.hspy graph holds an open
+            # file handle and cannot be pickled to a worker, so that raised here
+            # — between the start() above and the _on_plot_ready that stops it —
+            # and left the window black on a stuck "Calculating…". See
+            # compute_display_future.
+            from spyde.drawing.update_functions import compute_display_future
+            future = compute_display_future(signal.data, self.client,
+                                            label="signal")
             plot.update_data(future)
         else:
             plot.update()
@@ -317,6 +324,7 @@ class BaseSignalTree:
         from spyde.drawing.update_functions import (
             compute_with_live_buffer,
             ensure_live_buffer,
+            graph_can_reach_workers,
             read_live_buffer,
             _interactive_activity,
         )
@@ -362,10 +370,35 @@ class BaseSignalTree:
             deep = False
         nav_shape = tuple(nav_dask.shape)
 
+        # A lazy .tif/.hspy graph holds an open file handle, so it cannot be
+        # pickled to a worker at ALL (see update_functions.compute_display_future
+        # for the full story). Such a fill can only run in this process — which
+        # is exactly the threaded branch below, already the proven path for "the
+        # cluster isn't up yet".
+        #
+        # Memoised, because the handover check inside that loop asks the same
+        # question every chunk (and must, or it would hand the unsendable graph
+        # to the dispatcher the moment the cluster appears). Sendability is a
+        # property of the graph, so one probe answers for the whole fill; the
+        # LIVE `self.client is not None` half stays outside the memo, since a
+        # cluster arriving mid-fill is the case the handover exists for.
+        _sendable: list[bool] = []
+
+        def _graph_sendable(_dask=nav_dask) -> bool:
+            if not _sendable:
+                _sendable.append(graph_can_reach_workers(_dask))
+                if not _sendable[0]:
+                    logger.info("navigator fill: this graph cannot be serialized "
+                                "to the workers (lazy .tif/.hspy hold an open "
+                                "file handle) — filling in-process instead")
+            return _sendable[0]
+
+        can_distribute = self.client is not None and _graph_sendable()
+
         logger.debug(
             "NAV-DEBUG _start_progressive_nav_compute: path=%s deep=%s "
             "nav_shape=%s chunks=%s client=%s",
-            "THREADED (no client)" if self.client is None else "DISTRIBUTED",
+            "DISTRIBUTED" if can_distribute else "THREADED",
             deep, nav_shape, nav_dask.chunks, type(self.client).__name__,
         )
 
@@ -378,7 +411,7 @@ class BaseSignalTree:
         # PROGRESSIVELY (top-to-bottom) instead of staying blank until the whole
         # multi-GB sum finishes — that "blank navigator that never fills" was the
         # symptom on the large Windows scan.
-        if self.client is None:
+        if not can_distribute:
             import itertools
 
             if not deep:
@@ -393,7 +426,7 @@ class BaseSignalTree:
 
             def _bg_nav(_dask=nav_dask, _plot=nav_plot, _sig=nav_signals,
                         _shape=nav_shape, _stop=stop, _deep=deep,
-                        _targets=deep_targets):
+                        _targets=deep_targets, _sendable_probe=_graph_sendable):
                 # window_computing brackets the WHOLE fill (both early-return
                 # paths on _stop AND the exception handler below) so a
                 # cancelled/failed fill still clears the renderer's overlay —
@@ -441,7 +474,11 @@ class BaseSignalTree:
                         # painted are recomputed, which is why the threshold
                         # exists — a handover is only worth it with real work
                         # left, and this fires within the first few chunks.
+                        # `_sendable()` as well as a live client: a graph that
+                        # cannot be pickled to a worker must never be handed
+                        # over, however many workers turn up.
                         if (self.client is not None
+                                and _sendable_probe()
                                 and (total_chunks - done_chunks)
                                 > _NAV_HANDOVER_MIN_CHUNKS):
                             logger.info(
@@ -461,7 +498,17 @@ class BaseSignalTree:
                         _interactive_activity.wait_if_active(stop=_stop)
                         nav_slices = tuple(slice(s, s + n) for s, n in combo)
                         logger.debug("NAV-DEBUG threaded nav chunk %s computing", nav_slices)
-                        block = np.asarray(_dask[nav_slices].compute()).astype(np.float32)
+                        # scheduler="threads" EXPLICITLY. A bare .compute() uses
+                        # dask's default, and a live distributed Client registers
+                        # ITSELF as that default — so this "threaded" branch
+                        # silently shipped the chunk to the cluster whenever one
+                        # existed. Harmless while the branch only ran with no
+                        # client; now that an unsendable graph is routed here with
+                        # a cluster up, it is the difference between filling and
+                        # raising "cannot pickle 'BufferedReader'".
+                        block = np.asarray(
+                            _dask[nav_slices].compute(scheduler="threads")
+                        ).astype(np.float32)
                         acc[nav_slices] = block
                         done_chunks += 1
                         self._emit_nav_progress(done_chunks / max(1, total_chunks))
