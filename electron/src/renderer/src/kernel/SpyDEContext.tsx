@@ -1334,6 +1334,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'dpc_state':
         case 'dpc_estimate':
         case 'dpc_result':
+        case 'dpc_region':
         // Cluster telemetry — consumed by the StatusBar DaskMonitor HUD.
         case 'dask_stats':
         // Read-throughput readout — consumed by the StatusBar IoThroughput HUD.

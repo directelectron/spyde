@@ -392,6 +392,7 @@ def dpc_map(
     center: str = "corners",
     corner_fraction: float = 0.05,
     center_xy: Optional[tuple] = None,
+    beam_region: Optional[Union[dict, object]] = None,
     vacuum: Optional[object] = None,
     rotation: Optional[float] = None,
     flip: bool = False,
@@ -415,6 +416,14 @@ def dpc_map(
     ``"vacuum"`` (needs *vacuum*: a second signal, or a pre-measured
     ``(ny, nx, 2)`` shift array, acquired with the same scan settings).
 
+    ``beam_region`` restricts the centre of mass to a disc or annulus around
+    the direct beam — a :class:`~spyde.actions.dpc.BeamRegion`, or a dict like
+    ``{"shape": "ring", "cx": 128, "cy": 128, "r": 40, "r_inner": 12}``. Use a
+    disc to keep diffracted discs from dragging the centroid, and a ring when
+    the direct beam is saturated or beam-stopped so only its edge is usable.
+    With ``center="manual"`` and no ``center_xy``, the region's own centre
+    becomes the reference.
+
     ``rotation=None`` fits the scan↔detector rotation and handedness from the
     data (curl-free for electric, divergence-free for magnetic — see
     :func:`spyde.actions.dpc.estimate_rotation`); the fit is reported on
@@ -424,7 +433,10 @@ def dpc_map(
     is not given it reads from the signal's metadata; anything still missing
     leaves the result in raw pixels, flagged by ``result.units``.
     """
-    from spyde.actions.dpc import compute_dpc, measure_beam_shifts
+    from spyde.actions.dpc import BeamRegion, compute_dpc, measure_beam_shifts
+
+    region = (beam_region if isinstance(beam_region, BeamRegion)
+              else BeamRegion.from_dict(beam_region) if beam_region else None)
 
     vacuum_shifts = None
     if vacuum is not None:
@@ -432,15 +444,17 @@ def dpc_map(
                          if isinstance(vacuum, np.ndarray)
                          else measure_beam_shifts(
                              vacuum, method=method,
-                             half_square_width=half_square_width))
+                             half_square_width=half_square_width,
+                             region=region))
         center = "vacuum"
 
     result = compute_dpc(
         signal, mode=mode, method=method, half_square_width=half_square_width,
         center_mode=center, corner_fraction=corner_fraction,
-        center_xy=center_xy, vacuum_shifts=vacuum_shifts, rotation=rotation,
-        flip=flip, reverse=reverse, thickness_nm=thickness_nm,
-        beam_energy_kev=beam_energy_kv, mrad_per_px=mrad_per_px)
+        center_xy=center_xy, region=region, vacuum_shifts=vacuum_shifts,
+        rotation=rotation, flip=flip, reverse=reverse,
+        thickness_nm=thickness_nm, beam_energy_kev=beam_energy_kv,
+        mrad_per_px=mrad_per_px)
     result.provenance = _provenance("dpc_map", {
         "mode": mode, "method": method, "half_square_width": half_square_width,
         "center": center, "corner_fraction": corner_fraction,
@@ -448,6 +462,7 @@ def dpc_map(
         "rotation": result.rotation, "flip": result.flip, "reverse": reverse,
         "thickness_nm": thickness_nm, "beam_energy_kv": beam_energy_kv,
         "mrad_per_px": result.params.get("mrad_per_px"),
+        "beam_region": result.params.get("beam_region"),
         "units": result.units,
     })
     return result

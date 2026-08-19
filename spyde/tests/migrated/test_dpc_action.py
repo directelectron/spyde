@@ -218,23 +218,34 @@ class TestCentering:
 
     def test_switching_mode_takes_the_previous_furniture_away(self, window):
         """Overlays that outlive their mode are the classic version of this bug:
-        boxes still on screen describing a reference no longer in use."""
-        session, plot, _tree, wiz = _opened(window, center_mode="corners")
+        boxes still on screen describing a reference no longer in use.
+
+        The beam region is deliberately NOT mode-scoped — it defines the centre
+        of mass for every reference mode — so it must survive a mode switch that
+        clears the corner boxes.
+        """
+        session, plot, _tree, wiz = _opened(window, center_mode="corners",
+                                            beam_shape="circle")
         nav = _navigator_plot(session)
         assert "dpc_corners" in _markers(nav._plot2d)
+        assert wiz._beam_widget is not None
 
         dpca.dpc_set_center(session, plot, {"center_mode": "manual"})
         assert wiz._corner_mg is None
         assert "dpc_corners" not in _markers(nav._plot2d)
-        assert wiz._cross is not None, "Manual mode must offer a crosshair"
+        assert wiz._beam_widget is not None, \
+            "the beam region is not owned by a Center mode"
 
         dpca.dpc_set_center(session, plot, {"center_mode": "none"})
-        assert wiz._cross is None and wiz._corner_mg is None
+        assert wiz._corner_mg is None and wiz._beam_widget is not None
 
-    def test_picking_the_crosshair_sets_a_constant_reference(self, window):
-        session, plot, _tree, wiz = _opened(window, center_mode="manual")
-        assert wiz._cross is not None
-        wiz._cross.cx, wiz._cross.cy = 20.0, 12.0
+    def test_the_region_centre_becomes_the_manual_reference(self, window):
+        """Drag the region onto the beam and Manual is already answered — no
+        second marker to place, and no way for the two to disagree."""
+        session, plot, _tree, wiz = _opened(window, center_mode="manual",
+                                            beam_shape="circle")
+        assert wiz._beam_widget is not None
+        wiz.params.update({"beam_cx": 20.0, "beam_cy": 12.0, "beam_r": 6.0})
         dpca.dpc_pick_center(session, plot, {})
         assert wiz.params["cx"] == 20.0 and wiz.params["cy"] == 12.0
         ref = wiz.reference()
@@ -243,10 +254,20 @@ class TestCentering:
         assert ref[..., 0] == pytest.approx(32 / 2.0 - 20.0)
         assert ref[..., 1] == pytest.approx(32 / 2.0 - 12.0)
 
-    def test_picking_without_a_crosshair_errors_instead_of_guessing(self, window):
-        session, plot, _tree, wiz = _opened(window, center_mode="none")
+    def test_the_reference_follows_the_region_without_an_explicit_pick(self, window):
+        """`manual_center` falls back to the region, so a user who never presses
+        the button still gets the centre they dragged."""
+        session, plot, _tree, wiz = _opened(window, center_mode="manual",
+                                            beam_shape="circle")
+        wiz.params.update({"beam_cx": 18.0, "beam_cy": 14.0, "beam_r": 5.0})
+        assert wiz.manual_center() == (18.0, 14.0)
+        assert wiz.reference()[..., 0] == pytest.approx(16.0 - 18.0)
+
+    def test_picking_with_no_region_errors_instead_of_guessing(self, window):
+        session, plot, _tree, _wiz = _opened(window, center_mode="none",
+                                             beam_shape="off")
         dpca.dpc_pick_center(session, plot, {})
-        assert any("crosshair" in e for e in _errors(window["messages"]))
+        assert any("beam region" in e for e in _errors(window["messages"]))
 
     def test_a_vacuum_dataset_becomes_the_reference(self, window):
         """A second scan with no field is pure descan, so it IS the reference."""
@@ -274,6 +295,116 @@ class TestCentering:
         assert wiz.reference() is None
         assert wiz.result is not None
         assert not _errors(window["messages"])
+
+    def test_the_beam_region_widget_matches_the_shape(self, window):
+        """Circle and ring are different anyplotlib widget TYPES, so switching
+        rebuilds rather than mutates — and the widget on screen must be the one
+        the mask is computed from."""
+        session, plot, _tree, wiz = _opened(window, beam_shape="circle")
+        assert type(wiz._beam_widget).__name__ == "CircleWidget"
+        assert wiz.region().shape == "circle" and wiz.region().r > 0
+
+        dpca.dpc_set_beam(session, plot, {"beam_shape": "ring"})
+        assert _wait(lambda: type(wiz._beam_widget).__name__ == "AnnularWidget")
+        assert wiz.region().shape == "ring"
+        assert 0 < wiz.region().r_inner < wiz.region().r
+
+        dpca.dpc_set_beam(session, plot, {"beam_shape": "off"})
+        assert wiz._beam_widget is None and not wiz.region().active
+
+    def test_radii_are_filled_in_from_the_detector_size(self, window):
+        """They cannot be declared in DEFAULTS — a sensible radius is a fraction
+        of a detector whose size is unknown until a dataset is open."""
+        session, plot, _tree, wiz = _opened(window, beam_shape="off")
+        assert wiz.params["beam_r"] == 0.0
+        dpca.dpc_set_beam(session, plot, {"beam_shape": "circle"})
+        sy, sx = wiz._sig_shape()
+        assert wiz.params["beam_r"] == pytest.approx(0.25 * min(sy, sx))
+        assert (wiz.params["beam_cx"], wiz.params["beam_cy"]) == (sx / 2, sy / 2)
+
+    def test_dragging_the_region_does_not_re_measure_per_frame(self, window):
+        """The region changes the CENTRE OF MASS, so it can only take effect by
+        re-measuring the whole scan. Doing that per pointer frame would make the
+        widget unusable on any real dataset, so a drag debounces."""
+        from spyde.actions import dpc as _dpc
+        session, plot, _tree, wiz = _opened(window, beam_shape="circle")
+        calls = {"n": 0}
+        import spyde.actions.dpc as dpc_mod
+        real = _dpc.measure_beam_shifts
+        dpc_mod.measure_beam_shifts = lambda *a, **k: (calls.__setitem__("n", calls["n"] + 1)
+                                                       or real(*a, **k))
+        try:
+            for r in (8.0, 9.0, 10.0, 11.0):     # a drag, frame by frame
+                wiz._beam_widget.set(r=r)
+                wiz._on_region_drag()
+            assert calls["n"] == 0, "a drag frame re-measured the whole scan"
+            assert wiz.params["beam_r"] == pytest.approx(11.0)
+            assert _wait(lambda: calls["n"] >= 1, timeout=10.0), \
+                "the debounce never fired the re-measure"
+            assert calls["n"] == 1, "the settle should coalesce to ONE measure"
+        finally:
+            dpc_mod.measure_beam_shifts = real
+
+    def test_the_drag_debounce_cannot_fire_after_teardown(self, window):
+        """A timer that survives close would re-measure a torn-down wizard on a
+        worker thread."""
+        session, plot, _tree, wiz = _opened(window, beam_shape="circle")
+        wiz._on_region_drag()
+        assert wiz._settle_timer is not None
+        dpca.dpc_close(session, plot, {})
+        assert wiz._settle_timer is None and wiz._closed
+
+    def test_the_region_is_echoed_back_for_the_caret(self, window):
+        session, plot, _tree, wiz = _opened(window, beam_shape="circle")
+        wiz._on_region_drag()
+        msgs = _of_type(window["messages"], "dpc_region")
+        assert msgs, "no dpc_region echo reached the caret"
+        last = msgs[-1]
+        assert last["shape"] == "circle"
+        assert last["window_id"] == getattr(plot, "window_id", None), \
+            "must address the SOURCE window — useWizardEvent filters on it"
+        assert last["r"] == pytest.approx(wiz.params["beam_r"])
+
+    def test_a_region_off_the_beam_is_reported(self, window):
+        """A region on empty detector still returns a plausible centroid, so the
+        only way the user learns is if we say so.
+
+        The warning keys on BRIGHTNESS, not on whether the found beam is inside
+        the region — a disc always contains its own centroid, so that test is
+        vacuous for the commonest shape (see ``dpc.beam_inside_region``).
+        """
+        session, plot, _tree, wiz = _opened(window, beam_shape="circle")
+        # A corner of the frame: the synthetic beam sits at the centre, so this
+        # region is on the disc's faint tail and nothing else.
+        dpca.dpc_set_beam(session, plot, {"beam_shape": "circle", "beam_cx": 2.0,
+                                          "beam_cy": 2.0, "beam_r": 1.5})
+        assert _wait(lambda: any("not on the direct beam" in str(m.get("text", ""))
+                                 for m in window["messages"]
+                                 if isinstance(m, dict)
+                                 and m.get("type") in ("status", "error"))), \
+            [m.get("text") for m in window["messages"]
+             if isinstance(m, dict) and m.get("type") in ("status", "error")][-4:]
+        # Close before finishing. `dpc_action.emit` is re-bound to the NEXT
+        # test's capture list by the `_capture_module_emit` fixture, so a
+        # measure still in flight here would deliver THIS test's deliberate
+        # warning into that one's messages — which is exactly what made
+        # `test_a_well_placed_region_is_not_warned_about` fail, but only in
+        # some orderings.
+        dpca.dpc_close(session, plot, {})
+
+    def test_a_well_placed_region_is_not_warned_about(self, window):
+        """The warning has to be quiet when things are right, or it is noise."""
+        session, plot, _tree = _dataset(window)
+        # Count only what THIS wizard emits. A late emit from a previous test's
+        # session would otherwise be indistinguishable from a warning about
+        # this region (see the note in the test above).
+        start = len(window["messages"])
+        dpca.dpc_open(session, plot, {"beam_shape": "circle"})
+        wiz = _wait(lambda: getattr(plot.signal_tree, "_dpc_wizard", None)
+                    is not None) and plot.signal_tree._dpc_wizard
+        assert _wait(lambda: wiz.shifts is not None)
+        assert not any("not on the direct beam" in str(m.get("text", ""))
+                       for m in window["messages"][start:] if isinstance(m, dict))
 
     def test_the_corner_boxes_are_the_pixels_that_get_fitted(self, window):
         """The overlay is a claim about the fit. Check the claim, on the live
@@ -355,7 +486,10 @@ class TestLive:
         assert "dpc_wheel" in [k.name for k in wiz.plot.list_keys()]
         assert wiz.plot.get_key("dpc_wheel") is wiz.wheel
         d = wiz.wheel.to_dict()
-        assert d["hover_only"] is True, "the legend must stay out of the way"
+        # Shown ALWAYS, not on hover: a direction map's hues mean nothing
+        # without its key, so hiding the key until the pointer arrives hides
+        # what makes the picture readable.
+        assert d["hover_only"] is False, "the direction key must always be up"
         assert d["visible"] is True
         assert not hasattr(wiz.wheel, "imshow"), \
             "the wheel is a KeyOverlay, not a plot in an inset"

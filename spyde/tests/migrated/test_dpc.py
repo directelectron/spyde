@@ -309,6 +309,157 @@ class TestCornerGeometry:
 # Centering report + the other two references
 # ─────────────────────────────────────────────────────────────────────────────
 
+class TestBeamRegion:
+    """The shape the user drags onto the beam — one object, two jobs.
+
+    It picks WHICH PIXELS the centroid integrates and WHERE the undeflected
+    beam is. Both are load-bearing and both fail silently: a region on empty
+    detector still returns a centroid, and a centroid dragged by a diffracted
+    disc still returns a plausible field.
+    """
+
+    @staticmethod
+    def _scan(hollow_core=False):
+        """A beam off-centre, plus a bright blob that would drag an unmasked
+        centroid — the situation the region exists for."""
+        import pyxem as pxm
+        k = 64
+        gy, gx = np.mgrid[0:k, 0:k]
+        beam = (((gy - 36.0) ** 2 + (gx - 40.0) ** 2) < 36).astype(np.float32) * 100
+        if hollow_core:                      # a beam stop / saturated centre
+            beam[((gy - 36.0) ** 2 + (gx - 40.0) ** 2) < 9] = 0.0
+        junk = (((gy - 8.0) ** 2 + (gx - 8.0) ** 2) < 25).astype(np.float32) * 60
+        return pxm.signals.ElectronDiffraction2D(np.tile(beam + junk, (2, 3, 1, 1))), k
+
+    def test_circle_is_identical_to_pyxems_own_mask(self):
+        """One code path serves circle AND ring, because pyxem's ``mask=(x,y,r)``
+        covers only the disc. That is only safe if the disc case is provably the
+        same computation — so compare it, rather than assume it."""
+        s, _k = self._scan()
+        region = dpc.BeamRegion("circle", 40.0, 36.0, 12.0)
+        ours = dpc.measure_beam_shifts(s, region=region)
+        theirs = np.asarray(s.get_direct_beam_position(
+            method="center_of_mass", lazy_output=False,
+            mask=(40.0, 36.0, 12.0)).data)
+        assert np.array_equal(ours, theirs)
+        assert np.allclose(ours[0, 0], [-8.0, -4.0], atol=0.01)
+
+    def test_without_a_region_the_centroid_is_dragged_off(self):
+        """The motivation, as a test: this is what the circle is protecting."""
+        s, _k = self._scan()
+        unmasked = dpc.measure_beam_shifts(s)
+        assert not np.allclose(unmasked[0, 0], [-8.0, -4.0], atol=1.0)
+
+    def test_ring_finds_a_beam_with_a_blocked_core(self):
+        """A saturated or beam-stopped direct beam carries no usable centre, so
+        the centroid is taken over the disc EDGE — which is symmetric about the
+        true position, so it still lands on it."""
+        s, _k = self._scan(hollow_core=True)
+        got = dpc.measure_beam_shifts(
+            s, region=dpc.BeamRegion("ring", 40.0, 36.0, 12.0, 3.0))
+        assert np.allclose(got[0, 0], [-8.0, -4.0], atol=0.05)
+
+    def test_masks_are_the_shapes_they_claim(self):
+        circle = dpc.BeamRegion("circle", 32, 32, 10).mask((64, 64))
+        ring = dpc.BeamRegion("ring", 32, 32, 10, 5).mask((64, 64))
+        assert circle[32, 32] and not ring[32, 32]
+        assert ring[32, 39] and circle.sum() > ring.sum()
+        assert dpc.BeamRegion().mask((64, 64)) is None
+
+    def test_contains_agrees_with_the_mask(self):
+        """`contains` is what `beam_inside_region` judges by, so it must be the
+        same shape the centroid was actually taken over."""
+        region = dpc.BeamRegion("ring", 32, 32, 10, 5)
+        mask = region.mask((64, 64))
+        for x in range(18, 47):
+            for y in range(18, 47):
+                assert region.contains(x, y) == bool(mask[y, x])
+
+    def test_an_empty_region_gives_NaN_not_a_centred_reading(self):
+        s, _k = self._scan()
+        empty = dpc.measure_beam_shifts(s, region=dpc.BeamRegion("circle", 2, 2, 1.0))
+        assert np.isnan(empty).all(), "a silent 0 would read as a centred beam"
+
+    def test_a_slipped_region_still_returns_plausible_numbers(self):
+        """THE failure mode, stated as a test: a region on empty detector
+        returns the centroid of whatever is inside it — finite, plausible, and
+        wrong. Nothing in the result says so, which is why the caret has to."""
+        s, _k = self._scan()
+        slipped = dpc.measure_beam_shifts(
+            s, region=dpc.BeamRegion("circle", 12.0, 12.0, 8.0))
+        assert np.all(np.isfinite(slipped))
+        assert not np.allclose(slipped[0, 0], [-8.0, -4.0], atol=1.0)
+
+    def test_containment_cannot_catch_a_slipped_CIRCLE(self):
+        """A convex region always contains its own centroid, so this check is
+        vacuous for a disc — worth pinning so nobody later relies on it.
+
+        It is the reason the caret warns on BRIGHTNESS instead.
+        """
+        s, k = self._scan()
+        off = dpc.BeamRegion("circle", 12.0, 12.0, 8.0)
+        slipped = dpc.measure_beam_shifts(s, region=off)
+        assert dpc.beam_inside_region(slipped, off, (k, k)), \
+            "a disc trivially contains its own centroid — not a useful test"
+
+    def test_containment_DOES_catch_an_off_centre_ring(self):
+        """A ring is not convex, so its centroid can land in the hole — which is
+        exactly what an off-centre ring does, and is worth reporting."""
+        s, k = self._scan()
+        ring = dpc.BeamRegion("ring", 40.0, 36.0, 26.0, 14.0)
+        shifts = dpc.measure_beam_shifts(s, region=ring)
+        assert not dpc.beam_inside_region(shifts, ring, (k, k))
+
+    def test_brightness_is_scale_free(self):
+        """Density over the frame average, NOT captured fraction: the fraction
+        depends on how much else the pattern contains, so no threshold works
+        across datasets."""
+        s, _k = self._scan()
+        on = dpc.region_brightness(s, dpc.BeamRegion("circle", 40, 36, 12))
+        off = dpc.region_brightness(s, dpc.BeamRegion("circle", 5, 58, 6))
+        assert on > 2.0 > off
+        assert dpc.region_brightness(s, dpc.BeamRegion()) == float("inf")
+
+    def test_the_region_centre_serves_as_the_manual_reference(self):
+        """A shape already dragged onto the beam has answered "where is the
+        beam" — Manual must not demand a second marker saying the same thing."""
+        s, _k = self._scan()
+        r = dpc.compute_dpc(s, mode="magnetic", center_mode="manual",
+                            region=dpc.BeamRegion("circle", 40.0, 36.0, 12.0),
+                            rotation=0.0)
+        residual = r.raw_shifts - r.reference
+        assert abs(residual[..., 0].mean()) < 0.02
+        assert abs(residual[..., 1].mean()) < 0.02
+
+    def test_an_explicit_center_still_wins_over_the_region(self):
+        s, _k = self._scan()
+        r = dpc.compute_dpc(s, mode="magnetic", center_mode="manual",
+                            center_xy=(30.0, 30.0),
+                            region=dpc.BeamRegion("circle", 40.0, 36.0, 12.0),
+                            rotation=0.0)
+        assert r.reference[..., 0] == pytest.approx(32.0 - 30.0)
+
+    def test_region_round_trips_through_a_dict(self):
+        r = dpc.BeamRegion("ring", 1.5, 2.5, 9.0, 3.0)
+        assert dpc.BeamRegion.from_dict(r.as_dict()) == r
+        assert dpc.BeamRegion.from_dict(None).shape == "off"
+        assert dpc.BeamRegion.from_dict({"shape": "nonsense"}).shape == "off"
+
+    def test_default_region_is_a_sane_starting_point(self):
+        d = dpc.default_beam_region((256, 512))
+        assert (d.cx, d.cy) == (256.0, 128.0)      # centred on the DETECTOR
+        assert d.r == 64.0                          # a quarter of the short axis
+        assert 0 < d.r_inner < d.r
+        assert d.active
+
+    def test_the_region_lands_in_provenance(self):
+        s, _k = self._scan()
+        region = dpc.BeamRegion("ring", 40.0, 36.0, 12.0, 3.0)
+        r = dpc.compute_dpc(s, mode="magnetic", center_mode="none",
+                            region=region, rotation=0.0)
+        assert r.params["beam_region"] == region.as_dict()
+
+
 class TestCentering:
     def test_a_zero_field_is_centered(self):
         assert dpc.centering_report(np.zeros((20, 30, 2))).centered

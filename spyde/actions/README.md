@@ -165,10 +165,18 @@ map to read true) and derives its legend from the map's own colour rule rather
 than copying that offset.
 
 **Legends that float over a plot** — an IPF triangle, a DPC direction wheel —
-are `Plot2D.add_key` overlays (`hover_only=True`), NOT `Figure.add_inset`. An
-inset is a draggable window with a title bar and its own canvas stack: right for
-a live sub-plot, wrong for a legend, which should read as part of the figure the
-way a scale bar does. Keys are also included in a PNG export.
+are `Plot2D.add_key` overlays, NOT `Figure.add_inset`. An inset is a draggable
+window with a title bar and its own canvas stack: right for a live sub-plot,
+wrong for a legend, which should read as part of the figure the way a scale bar
+does. Keys are also included in a PNG export. `hover_only=True` suits a legend
+for a map that is readable without it (the IPF triangle); leave it False when
+the map is meaningless without its key (the DPC hue wheel).
+
+**Explanatory prose does not belong on a caret face.** Carets are ~240 px wide
+and every paragraph pushes a control off the visible area. Put the sentence
+behind an `ⓘ` — `DpcWizard.tsx`'s `Info` is a copyable one: a click-toggled
+popover, absolutely positioned so it costs no layout, and opting out of the
+`nowrap` that `Field` labels set.
 
 ## 5. The renderer side (wizard carets)
 

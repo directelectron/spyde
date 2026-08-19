@@ -979,6 +979,22 @@ export interface DpcEstimateMessage extends MsgBase {
   improvement: number
 }
 
+/** The beam region's live geometry, echoed while its widget is dragged.
+ *  `brightness` is the region's intensity density over the frame average —
+ *  scale-free, unlike a captured-intensity fraction. Null when the region is
+ *  off. */
+export interface DpcRegionMessage extends MsgBase {
+  type: 'dpc_region'
+  window_id: number | null
+  result_window_id: number | null
+  shape: string
+  cx: number
+  cy: number
+  r: number
+  r_inner: number
+  brightness: number | null
+}
+
 /** Stats of the derived field, re-sent on every live parameter change. */
 export interface DpcResultMessage extends MsgBase {
   type: 'dpc_result'
@@ -1130,6 +1146,7 @@ export type PlotAppMessage =
   | DpcStateMessage
   | DpcEstimateMessage
   | DpcResultMessage
+  | DpcRegionMessage
 
 /**
  * Narrow a raw incoming message (`Record<string, unknown>` from the IPC bridge)

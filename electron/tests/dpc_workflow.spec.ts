@@ -142,6 +142,59 @@ function dpcWindow(page: import('@playwright/test').Page) {
     .filter({ has: page.getByTestId('subwindow-title').filter({ hasText: DPC_TITLE }) })
 }
 
+/**
+ * The SOURCE diffraction-pattern window — the fixture's own signal window.
+ *
+ * NOT the harness's `sigWindow`, which takes the first window whose breadcrumb
+ * starts "S-". That is unambiguous only until DPC opens windows of its own:
+ * "S-DPC Field Map" and the committed "S-DPC (E)" also match, and `.first()`
+ * then silently returns whichever sorts first. It bit a pixel probe here — the
+ * map window's colour wheel is teal, the exact colour the beam-region check
+ * counts.
+ */
+function sourceWindow(page: import('@playwright/test').Page) {
+  return page.getByTestId('subwindow')
+    .filter({ has: page.getByTestId('subwindow-title').filter({ hasText: /S-Synthetic DPC$/ }) })
+    .first()
+}
+
+/** Count a widget's colour inside ONE window's figure frames. */
+async function colorPixelsIn(page: import('@playwright/test').Page,
+                             host: import('@playwright/test').Locator,
+                             match: (r: number, g: number, b: number) => boolean) {
+  const handle = await host.elementHandle()
+  if (!handle) return 0
+  let n = 0
+  for (const frame of page.frames()) {
+    const el = await frame.frameElement().catch(() => null)
+    if (!el) continue
+    if (!await handle.evaluate((w, f) => w.contains(f as Node), el).catch(() => false)) continue
+    n += await frame.evaluate((src) => {
+      // eslint-disable-next-line no-new-func
+      const test = new Function('r', 'g', 'b', `return (${src})(r,g,b)`)
+      let hits = 0
+      for (const c of Array.from(document.querySelectorAll('canvas'))) {
+        const g2 = (c as HTMLCanvasElement).getContext('2d')
+        if (!g2 || !(c as HTMLCanvasElement).width) continue
+        const d = g2.getImageData(0, 0, (c as HTMLCanvasElement).width,
+                                  (c as HTMLCanvasElement).height).data
+        for (let i = 0; i < d.length; i += 4) {
+          if (test(d[i], d[i + 1], d[i + 2])) hits++
+        }
+      }
+      return hits
+    }, match.toString()).catch(() => 0)
+  }
+  return n
+}
+
+/** #f9e2af — the four corner boxes. */
+const IS_CORNER = (r: number, g: number, b: number) =>
+  r > 200 && g > 180 && b > 120 && b < 215 && r - b > 40
+/** #94e2d5 — the beam region (circle / ring). */
+const IS_BEAM = (r: number, g: number, b: number) =>
+  g > 190 && b > 170 && r < 190 && g - r > 40
+
 test('DPC: centre, solve the rotation, read the field off the colour wheel', async () => {
   const { page } = ctx
   const sig = sigWindow(page)
@@ -169,33 +222,7 @@ test('DPC: centre, solve the rotation, read the field off the colour wheel', asy
   // the navigator specifically is what proves they did not land on the pattern.
   await expect(page.getByTestId('dpc-center-mode'))
     .toHaveAttribute('data-value', 'corners')
-  const cornerPixels = async () => {
-    let n = 0
-    for (const frame of page.frames()) {
-      const el = await frame.frameElement().catch(() => null)
-      const host = await nav.elementHandle().catch(() => null)
-      if (!el || !host) continue
-      const inside = await host.evaluate((w, f) => w.contains(f as Node), el)
-        .catch(() => false)
-      if (!inside) continue
-      n += await frame.evaluate(() => {
-        let hits = 0
-        for (const c of Array.from(document.querySelectorAll('canvas'))) {
-          const g = (c as HTMLCanvasElement).getContext('2d')
-          if (!g || !(c as HTMLCanvasElement).width) continue
-          const d = g.getImageData(0, 0, (c as HTMLCanvasElement).width,
-                                   (c as HTMLCanvasElement).height).data
-          // #f9e2af = (249, 226, 175): red high, green high, blue clearly lower.
-          for (let i = 0; i < d.length; i += 4) {
-            if (d[i] > 200 && d[i + 1] > 180 && d[i + 2] > 120 && d[i + 2] < 215
-                && d[i] - d[i + 2] > 40) hits++
-          }
-        }
-        return hits
-      }).catch(() => 0)
-    }
-    return n
-  }
+  const cornerPixels = () => colorPixelsIn(page, nav, IS_CORNER)
   await expect.poll(cornerPixels, {
     timeout: 30_000,
     message: 'the four corner boxes never appeared on the navigator',
@@ -210,12 +237,12 @@ test('DPC: centre, solve the rotation, read the field off the colour wheel', asy
     .toBeGreaterThan(0.02)
   await shot('03-direction-map')
 
-  // ── 3b. the direction legend appears ON HOVER and not before ──────────────
-  // It is an anyplotlib KEY (`Plot2D.add_key`, hover_only) — the same overlay
-  // primitive as the IPF colour triangle and the scale bar, not a floating
-  // inset panel. So it must be absent while the pointer is away and present
-  // when it is over the map; a key that never shows is indistinguishable from
-  // one that was never attached.
+  // ── 3b. the direction legend is up WITHOUT hovering ───────────────────────
+  // It is an anyplotlib KEY (`Plot2D.add_key`) — the same overlay primitive as
+  // the IPF colour triangle and the scale bar, not a floating inset panel — and
+  // it is shown always, because a direction map's hues are meaningless without
+  // it. Counting its saturated pixels with the pointer AWAY is what proves it
+  // is not hover-gated.
   // The key is drawn by anyplotlib's own overlay layer inside the figure
   // iframe, so this counts saturated pixels PER FRAME of the DPC window (the
   // top page has no canvases at all — a top-level probe silently reads zero).
@@ -244,15 +271,14 @@ test('DPC: centre, solve the rotation, read the field off the colour wheel', asy
     }
     return n
   }
-  const away = await keyPixels()
-  const mapFrame = dpcWindow(page).first().locator('iframe').first()
-  const box = await mapFrame.boundingBox()
-  expect(box, 'the DPC window has no figure iframe').not.toBeNull()
-  await page.mouse.move(box!.x + box!.width * 0.5, box!.y + box!.height * 0.5)
+  // Park the pointer well away from the map first, so nothing can be attributed
+  // to hover.
+  await page.mouse.move(5, 5)
   await expect.poll(keyPixels, {
-    timeout: 20_000, message: 'the colour-wheel key never appeared on hover',
-  }).toBeGreaterThan(away)
-  await shot('03b-wheel-on-hover')
+    timeout: 20_000,
+    message: 'the colour-wheel key is not visible without hovering the map',
+  }).toBeGreaterThan(0)
+  await shot('03b-wheel-always-on')
 
   // ── 4. Solve the rotation ─────────────────────────────────────────────────
   // The fixture's field is curl-free, so the ELECTRIC constraint is the one
@@ -331,53 +357,66 @@ test('DPC: centre, solve the rotation, read the field off the colour wheel', asy
 
 test('the Center tab offers all three references, each with its own furniture', async () => {
   const { page } = ctx
-  const sig = sigWindow(page)
+  const sig = sourceWindow(page)
   await sig.getByTestId('subwindow-title').click()
   // The caret is still open from the previous test, parked on its Map tab.
   await page.getByTestId('dpc-tab-Center').click()
 
-  // Manual — a crosshair on the DIFFRACTION PATTERN (it picks a detector
-  // position), and an explicit "use this" step. The teal #94e2d5 is unique to
-  // it; the navigator's crosshair is pure green and Center-Zero-Beam's is
-  // yellow, so a colour count here really does identify this widget.
+  // The beam region FIRST — Manual below depends on it being on, since the
+  // region's centre is what Manual adopts.
+  //
+  // One draggable shape that BOTH masks the centre of mass and marks the zero
+  // beam. Toggling Circle→Ring swaps the anyplotlib widget type, so this
+  // checks the shape actually changed on the PATTERN, not just in the caret.
+  const beamPixels = () => colorPixelsIn(page, sourceWindow(page), IS_BEAM)
+  expect(await beamPixels(), 'the region should start off').toBe(0)
+
+  await page.getByTestId('dpc-beam-circle').click()
+  await expect(page.getByTestId('dpc-beam-r')).toBeVisible()
+  await expect.poll(beamPixels, {
+    timeout: 30_000, message: 'the beam circle never appeared on the pattern',
+  }).toBeGreaterThan(0)
+  await expect(page.getByTestId('dpc-beam-readout'))
+    .toHaveAttribute('data-brightness', /\d/, { timeout: 30_000 })
+  await shot('10-beam-circle')
+
+  // Ring — an inner radius appears, and the widget becomes an annulus.
+  await page.getByTestId('dpc-beam-ring').click()
+  await expect(page.getByTestId('dpc-beam-r-inner')).toBeVisible()
+  await expect.poll(beamPixels, {
+    timeout: 30_000, message: 'the ring never replaced the circle',
+  }).toBeGreaterThan(0)
+  await shot('11-beam-ring')
+
+  // The ⓘ affordance: the explanation is available but costs one glyph until
+  // it is asked for. (The prose used to sit inline under every control.)
+  await expect(page.getByTestId('dpc-info-beam-text')).toHaveCount(0)
+  await page.getByTestId('dpc-info-beam').click()
+  await expect(page.getByTestId('dpc-info-beam-text')).toBeVisible()
+  await shot('12-info-expanded')
+  await page.getByTestId('dpc-info-beam').click()
+  await expect(page.getByTestId('dpc-info-beam-text')).toHaveCount(0)
+
+  await page.getByTestId('dpc-beam-off').click()
+  await expect.poll(beamPixels, {
+    timeout: 30_000, message: 'turning the region off left its widget behind',
+  }).toBe(0)
+
+  // Manual — the beam region IS the marker, so this is one click, not a
+  // separate crosshair to place. Turn the region back on so there is a centre
+  // to adopt.
+  await page.getByTestId('dpc-beam-circle').click()
+  await expect.poll(beamPixels, { timeout: 30_000 }).toBeGreaterThan(0)
   await page.getByTestId('dpc-center-mode').click()
   await page.getByTestId('dpc-center-mode-opt-manual').click()
   await expect(page.getByTestId('dpc-use-crosshair')).toBeVisible()
-  const tealOnPattern = async () => {
-    let n = 0
-    const host = await sig.elementHandle()
-    for (const frame of page.frames()) {
-      const el = await frame.frameElement().catch(() => null)
-      if (!el || !host) continue
-      if (!await host.evaluate((w, f) => w.contains(f as Node), el).catch(() => false)) continue
-      n += await frame.evaluate(() => {
-        let hits = 0
-        for (const c of Array.from(document.querySelectorAll('canvas'))) {
-          const g = (c as HTMLCanvasElement).getContext('2d')
-          if (!g || !(c as HTMLCanvasElement).width) continue
-          const d = g.getImageData(0, 0, (c as HTMLCanvasElement).width,
-                                   (c as HTMLCanvasElement).height).data
-          // #94e2d5 = (148, 226, 213): green highest, blue close behind, red low.
-          for (let i = 0; i < d.length; i += 4) {
-            if (d[i + 1] > 190 && d[i + 2] > 170 && d[i] < 190
-                && d[i + 1] - d[i] > 40) hits++
-          }
-        }
-        return hits
-      }).catch(() => 0)
-    }
-    return n
-  }
-  await expect.poll(tealOnPattern, {
-    timeout: 30_000, message: 'Manual mode drew no crosshair on the pattern',
-  }).toBeGreaterThan(0)
-  await shot('10-manual-crosshair')
-  // The BACKEND echoes the picked position back on `dpc_state`; the caret shows
-  // it. Asserting on the echo (not on the click) is what proves the pick
+  // The BACKEND echoes the adopted position back on `dpc_state`; the caret
+  // shows it. Asserting on the echo (not on the click) is what proves the pick
   // actually landed rather than that a button was pressed.
   await page.getByTestId('dpc-use-crosshair').click()
   await expect(page.getByTestId('dpc-center-xy'))
     .toContainText(/Centre: \(/, { timeout: 30_000 })
+  await shot('13-manual-from-region')
 
   // Vacuum — offers the OTHER open datasets plus a file picker. Load a second
   // scan through the test harness and check it turns up in the list.
@@ -405,7 +444,7 @@ test('the Center tab offers all three references, each with its own furniture', 
 
 test('closing the caret removes the DPC window and the corner boxes', async () => {
   const { page } = ctx
-  const sig = sigWindow(page)
+  const sig = sourceWindow(page)
   // Commit (previous test) opened a new window on top, so the source window has
   // to be RE-FOCUSED before its toolbar is reachable — a bare hover finds
   // nothing and times out.

@@ -65,12 +65,25 @@ const VIEW_OPTIONS: readonly { value: View; label: string }[] = [
   { value: 'curl', label: 'Curl' },
 ]
 
+/** `dpc.BEAM_SHAPES` — the beam region's shape, or off. */
+type BeamShape = 'off' | 'circle' | 'ring'
+const BEAM_SHAPES: readonly { value: BeamShape; label: string }[] = [
+  { value: 'off', label: 'Off' },
+  { value: 'circle', label: 'Circle' },
+  { value: 'ring', label: 'Ring' },
+]
+
 /** Mirrors `dpc_action.DEFAULTS` — key for key, value for value. */
 interface DpcSaved {
   method: string
   halfSquareWidth: number
   centerMode: CenterMode
   cornerFraction: number
+  beamShape: BeamShape
+  beamCx: number
+  beamCy: number
+  beamR: number
+  beamRInner: number
   mode: FieldMode
   rotation: number
   flip: boolean
@@ -86,6 +99,11 @@ const DEFAULTS: DpcSaved = {
   halfSquareWidth: 0,
   centerMode: 'corners',
   cornerFraction: 0.05,
+  beamShape: 'off',
+  beamCx: 0.0,
+  beamCy: 0.0,
+  beamR: 0.0,
+  beamRInner: 0.0,
   mode: 'magnetic',
   rotation: 0.0,
   flip: false,
@@ -110,6 +128,12 @@ interface Centering {
   tol_px: number
 }
 interface Dataset { index: number; title: string }
+interface Region {
+  shape: BeamShape
+  cx: number; cy: number; r: number; r_inner: number
+  /** Region intensity density over the frame average; null when off. */
+  brightness: number | null
+}
 interface State {
   measured: boolean
   navShape: number[] | null
@@ -151,6 +175,11 @@ export function DpcWizard({ caretPos, windowId, sendAction, onClose }: Props) {
   const [mradPerPx, setMradPerPx] = React.useState(saved.mradPerPx)
   const [view, setView] = React.useState<View>(saved.view)
   const [autolimSigma, setAutolimSigma] = React.useState(saved.autolimSigma)
+  const [beamShape, setBeamShape] = React.useState<BeamShape>(saved.beamShape)
+  const [beamCx, setBeamCx] = React.useState(saved.beamCx)
+  const [beamCy, setBeamCy] = React.useState(saved.beamCy)
+  const [beamR, setBeamR] = React.useState(saved.beamR)
+  const [beamRInner, setBeamRInner] = React.useState(saved.beamRInner)
 
   const [state, setState] = React.useState<State | null>(null)
   const [estimate, setEstimate] = React.useState<Estimate | null>(null)
@@ -158,11 +187,15 @@ export function DpcWizard({ caretPos, windowId, sendAction, onClose }: Props) {
   const [vacuumPick, setVacuumPick] = React.useState<string>('')
   /** The picked beam centre the BACKEND confirmed, echoed on `dpc_state`. */
   const [center, setCenter2] = React.useState<[number, number] | null>(null)
+  /** Live region geometry + brightness, echoed while the widget is dragged. */
+  const [region, setRegion] = React.useState<Region | null>(null)
   const [status, setStatus] = React.useState('Locating the direct beam…')
 
   const vals = React.useRef<DpcSaved>(saved)
   vals.current = {
-    method, halfSquareWidth, centerMode, cornerFraction, mode, rotation, flip,
+    method, halfSquareWidth, centerMode, cornerFraction,
+    beamShape, beamCx, beamCy, beamR, beamRInner,
+    mode, rotation, flip,
     reverse, thicknessNm, beamEnergyKv, mradPerPx, view, autolimSigma,
   }
   React.useEffect(() => { _dpcStore.set(windowId, vals.current) })
@@ -173,6 +206,8 @@ export function DpcWizard({ caretPos, windowId, sendAction, onClose }: Props) {
     return {
       method: v.method, half_square_width: v.halfSquareWidth,
       center_mode: v.centerMode, corner_fraction: v.cornerFraction,
+      beam_shape: v.beamShape, beam_cx: v.beamCx, beam_cy: v.beamCy,
+      beam_r: v.beamR, beam_r_inner: v.beamRInner,
       mode: v.mode, rotation: v.rotation, flip: v.flip, reverse: v.reverse,
       thickness_nm: v.thicknessNm, beam_energy_kv: v.beamEnergyKv,
       mrad_per_px: v.mradPerPx, view: v.view, autolim_sigma: v.autolimSigma,
@@ -219,6 +254,21 @@ export function DpcWizard({ caretPos, windowId, sendAction, onClose }: Props) {
         setCenterMode('none')
       }
     }
+  })
+
+  // The widget is the authority on its own geometry while it is being dragged,
+  // so the backend echoes it back here rather than the caret trying to predict
+  // it. Same shape as the Crop / Center-Zero-Beam drag→field round trip.
+  useWizardEvent('spyde:dpc_region', windowId, (d) => {
+    const r: Region = {
+      shape: String(d.shape ?? 'off') as BeamShape,
+      cx: Number(d.cx ?? 0), cy: Number(d.cy ?? 0),
+      r: Number(d.r ?? 0), r_inner: Number(d.r_inner ?? 0),
+      brightness: d.brightness == null ? null : Number(d.brightness),
+    }
+    setRegion(r)
+    setBeamShape(r.shape); setBeamCx(r.cx); setBeamCy(r.cy)
+    setBeamR(r.r); setBeamRInner(r.r_inner)
   })
 
   useWizardEvent('spyde:dpc_estimate', windowId, (d) => {
@@ -280,6 +330,17 @@ export function DpcWizard({ caretPos, windowId, sendAction, onClose }: Props) {
     setVacuumPick(v)
     if (v !== '') sendAction('dpc_load_vacuum', { tree_index: Number(v) }, windowId)
   }
+  /** Toggling the shape (or typing a radius) re-measures — the region changes
+   *  the centre of mass, so it cannot take effect any other way. A DRAG is
+   *  debounced on the backend instead. */
+  const setBeam = (patch: Partial<DpcSaved>) => {
+    Object.assign(vals.current, patch)
+    if (patch.beamShape !== undefined) setBeamShape(patch.beamShape)
+    if (patch.beamR !== undefined) setBeamR(patch.beamR)
+    if (patch.beamRInner !== undefined) setBeamRInner(patch.beamRInner)
+    sendAction('dpc_set_beam', params(), windowId)
+  }
+
   const changeView = (v: View) => {
     setView(v)
     vals.current = { ...vals.current, view: v }
@@ -309,25 +370,17 @@ export function DpcWizard({ caretPos, windowId, sendAction, onClose }: Props) {
           </Field>
 
           {centerMode === 'corners' && (
-            <>
-              <Field label="Box size">
-                <Slider testid="dpc-corner-fraction" value={cornerFraction}
-                  min={0.01} max={0.45} step={0.01}
-                  fmt={(n) => `${Math.round(n * 100)}%`}
-                  onChange={(n) => {
-                    setCornerFraction(n)
-                    vals.current = { ...vals.current, cornerFraction: n }
-                    sendAction('dpc_set_center', params(), windowId)
-                  }} />
-              </Field>
-              <div style={S.hint}>
-                {state?.navShape
-                  ? `${cornerBoxSize(state.navShape, cornerFraction)} per box — `
-                  : ''}
-                the plane is fitted to these four boxes only, so they must be
-                off the feature you are measuring.
-              </div>
-            </>
+            <Field label={`Box size${state?.navShape
+              ? ` (${cornerBoxSize(state.navShape, cornerFraction)})` : ''}`}>
+              <Slider testid="dpc-corner-fraction" value={cornerFraction}
+                min={0.01} max={0.45} step={0.01}
+                fmt={(n) => `${Math.round(n * 100)}%`}
+                onChange={(n) => {
+                  setCornerFraction(n)
+                  vals.current = { ...vals.current, cornerFraction: n }
+                  sendAction('dpc_set_center', params(), windowId)
+                }} />
+            </Field>
           )}
 
           {centerMode === 'vacuum' && (
@@ -338,43 +391,70 @@ export function DpcWizard({ caretPos, windowId, sendAction, onClose }: Props) {
               </Field>
               <button data-testid="dpc-vacuum-file" style={S.fileBtn}
                 onClick={loadVacuumFile}>＋ From file…</button>
-              <div data-testid="dpc-vacuum-label" style={S.hint}>
-                {state?.vacuum
-                  ? `Using ${state.vacuum}`
-                  : 'A scan of empty vacuum with the SAME scan settings.'}
-              </div>
+              {state?.vacuum && (
+                <div data-testid="dpc-vacuum-label" style={readoutStyle}>
+                  Using {state.vacuum}
+                </div>
+              )}
             </>
           )}
 
           {centerMode === 'manual' && (
             <>
-              <div style={S.hint}>
-                One centre for every pattern — removes a constant offset, not a
-                ramp.
-              </div>
               <button data-testid="dpc-use-crosshair" style={S.primary}
                 onClick={useCrosshair}>Use this centre</button>
               {/* The backend confirms the picked position on `dpc_state`.
                   Without this the button looked inert: its `emit_status` goes
                   to the app's status BAR, not to this caret. */}
-              <div data-testid="dpc-center-xy" style={S.hint}>
-                {center
-                  ? `Centre: (${center[0].toFixed(1)}, ${center[1].toFixed(1)}) px`
-                  : 'Drag the teal crosshair onto the undeflected beam.'}
-              </div>
+              {center && (
+                <div data-testid="dpc-center-xy" style={readoutStyle}>
+                  Centre: ({center[0].toFixed(1)}, {center[1].toFixed(1)}) px
+                </div>
+              )}
             </>
           )}
+
+          {/* The beam region. Deliberately OUTSIDE the centerMode branches: it
+              defines which pixels the centre of mass integrates, which matters
+              for every reference mode, not just Manual. */}
+          <div style={beamWrap}>
+            <Field label={<>Beam region <Info testid="dpc-info-beam" text={INFO.beam} /></>}>
+              <div style={{ display: 'flex', gap: 2 }}>
+                {BEAM_SHAPES.map(s => (
+                  <button key={s.value} data-testid={`dpc-beam-${s.value}`}
+                    style={s.value === beamShape ? shapeBtnActive : shapeBtn}
+                    onClick={() => setBeam({ beamShape: s.value })}>{s.label}</button>
+                ))}
+              </div>
+            </Field>
+            {beamShape !== 'off' && (
+              <>
+                <Field label="Radius (px)">
+                  <NumInput testid="dpc-beam-r" value={round1(beamR)} step="1"
+                    width={62} onChange={(n) => setBeam({ beamR: n })} />
+                </Field>
+                {beamShape === 'ring' && (
+                  <Field label="Inner (px)">
+                    <NumInput testid="dpc-beam-r-inner" value={round1(beamRInner)}
+                      step="1" width={62}
+                      onChange={(n) => setBeam({ beamRInner: n })} />
+                  </Field>
+                )}
+                <BeamReadout region={region} shape={beamShape} />
+              </>
+            )}
+          </div>
 
           <Advanced testid="dpc-advanced">
             <Field label="Beam finder">
               <Select testid="dpc-method" value={method} options={METHOD_OPTIONS}
                 onChange={setMethod} />
             </Field>
-            <Field label="Search window (px)">
+            <Field label={<>Search box (px) <Info testid="dpc-info-search"
+              text={INFO.search} /></>}>
               <NumInput testid="dpc-half-width" value={halfSquareWidth} step="1"
                 width={56} onChange={setHalfSquareWidth} />
             </Field>
-            <div style={S.hint}>0 searches the whole frame.</div>
             <button data-testid="dpc-remeasure" style={ghostStyle}
               onClick={remeasure}>Re-measure</button>
           </Advanced>
@@ -383,12 +463,11 @@ export function DpcWizard({ caretPos, windowId, sendAction, onClose }: Props) {
 
       {tab === 'Rotation' && (
         <div style={S.page}>
-          <div style={S.hint}>
-            The detector's x/y is rotated relative to the scan's. Solve it, then
-            check the colour wheel points the way the field really does.
+          <div style={rowStyle}>
+            <button data-testid="dpc-solve-rotation" style={S.primary}
+              onClick={solveRotation}>Solve rotation</button>
+            <Info testid="dpc-info-rotation" text={INFO.rotation} />
           </div>
-          <button data-testid="dpc-solve-rotation" style={S.primary}
-            onClick={solveRotation}>Solve rotation</button>
           <EstimateReadout estimate={estimate} />
           <Field label="Rotation">
             <Slider testid="dpc-rotation" value={rotation} min={0} max={360}
@@ -397,11 +476,10 @@ export function DpcWizard({ caretPos, windowId, sendAction, onClose }: Props) {
           </Field>
           <Check testid="dpc-flip" checked={flip} onChange={live(setFlip)}
             label="Flip handedness (swap x/y)" />
-          <Check testid="dpc-reverse" checked={reverse} onChange={live(setReverse)}
-            label="Reverse (+180°)" />
-          <div style={S.hint}>
-            The fit cannot tell 0° from 180° — that is physics, not a bug. Use
-            Reverse when you know which way the field should point.
+          <div style={rowStyle}>
+            <Check testid="dpc-reverse" checked={reverse}
+              onChange={live(setReverse)} label="Reverse (+180°)" />
+            <Info testid="dpc-info-reverse" text={INFO.reverse} />
           </div>
         </div>
       )}
@@ -426,15 +504,11 @@ export function DpcWizard({ caretPos, windowId, sendAction, onClose }: Props) {
               </Field>
             </>
           )}
-          <Field label="mrad / px">
+          <Field label={<>mrad / px <Info testid="dpc-info-scale"
+            text={INFO.scale} /></>}>
             <NumInput testid="dpc-mrad-per-px" value={mradPerPx} step="0.0001"
               width={74} onChange={live(setMradPerPx)} />
           </Field>
-          <div style={S.hint}>
-            {state?.mradPerPx
-              ? `Detector calibration read from the dataset (${state.mradPerPx.toFixed(4)}).`
-              : 'Not calibrated in the file — 0 leaves the map in pixels.'}
-          </div>
           <ResultReadout result={result} />
         </div>
       )}
@@ -445,14 +519,11 @@ export function DpcWizard({ caretPos, windowId, sendAction, onClose }: Props) {
             <Select testid="dpc-view" value={view} options={VIEW_OPTIONS}
               onChange={changeView} />
           </Field>
-          <Field label="Colour limit">
+          <Field label={<>Colour limit <Info testid="dpc-info-map"
+            text={INFO.map} /></>}>
             <Slider testid="dpc-autolim" value={autolimSigma} min={0.5} max={10}
               step={0.5} fmt={(n) => `${n}σ`} onChange={live(setAutolimSigma)} />
           </Field>
-          <div style={S.hint}>
-            The colour wheel is the legend for the direction map: find a colour
-            on it and it points the way the field does on screen.
-          </div>
           <ResultReadout result={result} />
           <CommitButton wizardKey="dpc" windowId={windowId}
             sendAction={sendAction} label="Commit to New Tree" />
@@ -481,6 +552,110 @@ function CenteringReadout({ centering }: { centering: Centering | null }) {
       </span>
     </div>
   )
+}
+
+/**
+ * The explanations, behind ⓘ.
+ *
+ * These used to sit inline under each control, and three sentences of prose per
+ * setting crowded out the controls in a caret this narrow. The knowledge is
+ * still worth having — most of it is the difference between a right DPC map and
+ * a plausible wrong one — so it moved behind a disclosure rather than being
+ * deleted.
+ */
+const INFO = {
+  beam: 'Restricts the centre of mass to this shape, and its centre is what '
+    + 'Manual centering uses. A circle keeps diffracted discs from dragging the '
+    + 'centroid; a ring works when the direct beam is saturated or blocked, by '
+    + 'using its edge instead. Drag it on the pattern.',
+  search: "pyxem's centred square, kept for the finders a region does not apply "
+    + 'to. 0 searches the whole frame. A beam region supersedes it.',
+  rotation: "The detector's x/y is rotated relative to the scan's, so every "
+    + 'direction on the map depends on getting this right. Solve fits it from '
+    + 'the data: an electric field must be curl-free, a magnetic deflection '
+    + 'divergence-free, so the correct angle is the one that drives the wrong '
+    + 'component to zero. The number beside it is how far that residual fell — '
+    + 'near 1× means the data did not single out an angle, so judge by eye.',
+  reverse: 'The fit cannot tell 0° from 180°: both give the same residual. That '
+    + 'is physics, not a bug. Use this when you know which way the field should '
+    + 'point — which side of a junction is positive, say.',
+  scale: 'Detector calibration. Read from the dataset when it carries one; 0 '
+    + 'leaves the map in raw pixels rather than mrad or MV/cm.',
+  map: 'The colour wheel on the map is its legend: find a colour on the wheel '
+    + 'and it points the way the field does on screen. Scalar views hide it.',
+}
+
+/**
+ * An ⓘ that opens its text as a popover.
+ *
+ * Not a hover tooltip: the text is a paragraph, and a paragraph that vanishes
+ * when the pointer moves cannot be read. Click to open, click (or Escape) to
+ * close.
+ *
+ * Absolutely positioned rather than expanded in place, for two reasons. It
+ * costs zero layout — the point of moving this text out of the caret was the
+ * real estate, and an inline block just moves the controls down instead. And
+ * these sit inside `Field` labels, which are `white-space: nowrap` so a control
+ * label never wraps mid-word; inline text inherited that and ran off the edge
+ * of the caret.
+ */
+function Info({ text, testid }: { text: string; testid: string }) {
+  const [open, setOpen] = React.useState(false)
+  React.useEffect(() => {
+    if (!open) return
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false) }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [open])
+  return (
+    <span style={{ position: 'relative', display: 'inline-flex' }}>
+      <button data-testid={testid} aria-expanded={open} title="More information"
+        style={infoBtn} onClick={() => setOpen(v => !v)}>ⓘ</button>
+      {open && (
+        <div data-testid={`${testid}-text`} style={infoText}
+          onClick={() => setOpen(false)}>{text}</div>
+      )}
+    </span>
+  )
+}
+
+/**
+ * Is the region actually on the beam?
+ *
+ * Shows its intensity density relative to the frame average, NOT the fraction
+ * of intensity it captures — that fraction depends on how much other intensity
+ * the pattern carries, so no single threshold means anything across datasets.
+ * Density is scale-free: many times 1 on the direct beam, below 1 off it.
+ *
+ * This is the live signal while dragging; the decisive check happens after the
+ * next measure, when the backend compares the beam it FOUND against the region
+ * that found it and warns in the status line if they disagree. That matters
+ * because a region sitting on empty detector still returns a plausible-looking
+ * centroid.
+ */
+function BeamReadout({ region, shape }: { region: Region | null; shape: BeamShape }) {
+  const b = region?.brightness
+  if (b == null || !Number.isFinite(b)) {
+    return (
+      <div data-testid="dpc-beam-readout" style={S.hint}>
+        Drag the {shape === 'ring' ? 'ring' : 'circle'} onto the direct beam.
+      </div>
+    )
+  }
+  const good = b >= 2
+  return (
+    <div data-testid="dpc-beam-readout" data-brightness={b.toFixed(2)}
+      style={{ ...readoutStyle, color: good ? '#a6e3a1' : '#f9e2af' }}>
+      {b.toFixed(1)}× frame average
+      <span style={S.hint}>
+        {good ? ' · on the beam' : ' · looks off the beam — drag it over'}
+      </span>
+    </div>
+  )
+}
+
+function round1(n: number): number {
+  return Math.round(n * 10) / 10
 }
 
 /**
@@ -555,6 +730,34 @@ function Advanced({ testid, children }: { testid: string; children: React.ReactN
 
 const readoutStyle: React.CSSProperties = {
   fontSize: 10, fontVariantNumeric: 'tabular-nums',
+}
+const rowStyle: React.CSSProperties = {
+  display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap',
+}
+const infoBtn: React.CSSProperties = {
+  background: 'none', border: 'none', color: '#6c7086', cursor: 'pointer',
+  fontSize: 11, padding: 0, lineHeight: 1, flex: '0 0 auto',
+}
+const infoText: React.CSSProperties = {
+  position: 'absolute', top: 'calc(100% + 4px)', left: -8,
+  width: 216, zIndex: 20,
+  fontSize: 10, color: '#cdd6f4', background: '#1e1e2e',
+  border: '1px solid #45475a', borderRadius: 5, padding: '6px 8px',
+  lineHeight: 1.45, boxShadow: '0 8px 20px rgba(0,0,0,0.55)',
+  // `S.lbl` is nowrap so control labels never break mid-word; this is a
+  // paragraph and must opt back out of that.
+  whiteSpace: 'normal', cursor: 'pointer',
+}
+const beamWrap: React.CSSProperties = {
+  borderTop: '1px solid #313244', paddingTop: 6,
+  display: 'flex', flexDirection: 'column', gap: 6,
+}
+const shapeBtn: React.CSSProperties = {
+  background: '#11111b', color: '#a6adc8', border: '1px solid #313244',
+  borderRadius: 4, padding: '3px 9px', fontSize: 11, cursor: 'pointer',
+}
+const shapeBtnActive: React.CSSProperties = {
+  ...shapeBtn, background: '#313244', color: '#cdd6f4', fontWeight: 600,
 }
 const ghostStyle: React.CSSProperties = {
   background: '#313244', color: '#cdd6f4', border: '1px solid #45475a',

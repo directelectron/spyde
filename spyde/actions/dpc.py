@@ -100,16 +100,136 @@ _UNSET: object = object()
 # 1. Measure
 # ─────────────────────────────────────────────────────────────────────────────
 
+#: Shapes the beam region can take. ``off`` searches the whole frame.
+BEAM_SHAPES: tuple[str, ...] = ("off", "circle", "ring")
+
+
+@dataclass
+class BeamRegion:
+    """Where the direct beam is, as a shape the user drags onto it.
+
+    It answers BOTH questions the Center step asks, which is why it is one
+    object and one widget rather than two:
+
+    * **which pixels the centre of mass integrates** (:meth:`mask`) — a
+      diffracted disc inside the search area pulls the centroid towards itself,
+      and on a strongly diffracting sample that drag is larger than the field
+      being measured;
+    * **where the undeflected beam is** (:attr:`center`) — the constant the
+      Manual reference subtracts.
+
+    ``ring`` exists for a beam-stopped or saturated direct beam: the core
+    carries no usable intensity gradient (or none at all), so the centroid is
+    taken over an annulus that captures the disc EDGE instead. The edge is
+    symmetric about the true centre, so its centroid is still the beam position.
+
+    Geometry is IMAGE PIXELS on the detector — the frame anyplotlib's 2-D
+    widgets report and the frame ``measure_beam_shifts`` works in. Do not add a
+    scale conversion.
+    """
+    shape: str = "off"
+    cx: float = 0.0
+    cy: float = 0.0
+    r: float = 0.0
+    r_inner: float = 0.0
+
+    @property
+    def center(self) -> tuple[float, float]:
+        return (float(self.cx), float(self.cy))
+
+    @property
+    def active(self) -> bool:
+        return self.shape in ("circle", "ring") and self.r > 0
+
+    def mask(self, sig_shape: tuple[int, int]) -> np.ndarray | None:
+        """Boolean keep-mask over the detector, or ``None`` when inactive."""
+        if not self.active:
+            return None
+        sy, sx = int(sig_shape[0]), int(sig_shape[1])
+        yy, xx = np.mgrid[0:sy, 0:sx]
+        rr = np.hypot(xx - float(self.cx), yy - float(self.cy))
+        keep = rr <= float(self.r)
+        if self.shape == "ring":
+            keep &= rr >= float(self.r_inner)
+        return keep
+
+    def contains(self, x: float, y: float) -> bool:
+        """Is this detector position inside the region? (Always True when off.)"""
+        if not self.active:
+            return True
+        rr = float(np.hypot(float(x) - self.cx, float(y) - self.cy))
+        if rr > float(self.r):
+            return False
+        return self.shape != "ring" or rr >= float(self.r_inner)
+
+    def as_dict(self) -> dict:
+        return {"shape": self.shape, "cx": float(self.cx), "cy": float(self.cy),
+                "r": float(self.r), "r_inner": float(self.r_inner)}
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> "BeamRegion":
+        d = d or {}
+        shape = str(d.get("shape", "off"))
+        return cls(shape=shape if shape in BEAM_SHAPES else "off",
+                   cx=float(d.get("cx") or 0.0), cy=float(d.get("cy") or 0.0),
+                   r=float(d.get("r") or 0.0),
+                   r_inner=float(d.get("r_inner") or 0.0))
+
+
+def default_beam_region(sig_shape: tuple[int, int], shape: str = "circle"
+                        ) -> BeamRegion:
+    """A region centred on the detector, generous enough to open on.
+
+    A quarter of the shorter detector axis: comfortably larger than a typical
+    direct-beam disc, small enough to exclude the first-order discs that would
+    otherwise drag the centroid. It is a STARTING point to drag, not a
+    calibration — the caret shows what fraction of the frame's intensity it
+    captures so an obviously wrong one is visible.
+    """
+    sy, sx = int(sig_shape[0]), int(sig_shape[1])
+    r = max(2.0, 0.25 * min(sy, sx))
+    return BeamRegion(shape=shape, cx=sx / 2.0, cy=sy / 2.0, r=r,
+                      r_inner=r * 0.35)
+
+
+def _com_shift_frame(frame, keep, cx0: float, cy0: float):
+    """One frame's ``centre − beam`` shift, over the kept pixels.
+
+    Deliberately the same arithmetic as pyxem's ``center_of_mass_from_image``
+    (multiply by the mask, then ``ndi.center_of_mass``, then x/y order), so a
+    circular region here and pyxem's own ``mask=(x, y, r)`` agree exactly —
+    ``test_dpc.py::TestBeamRegion`` asserts that rather than trusting it.
+    """
+    from scipy import ndimage as ndi
+    z = np.asarray(frame, dtype=np.float64)
+    if keep is not None:
+        z = z * keep
+    total = z.sum()
+    if not np.isfinite(total) or total <= 0:
+        # Nothing inside the region — a NaN says "no measurement here" and
+        # propagates visibly, where a silent 0 would read as a centred beam.
+        return np.array([np.nan, np.nan], dtype=np.float64)
+    com_y, com_x = ndi.center_of_mass(z)
+    return np.array([cx0 - com_x, cy0 - com_y], dtype=np.float64)
+
+
 def measure_beam_shifts(signal, *, method: str = "center_of_mass",
-                        half_square_width: int = 0) -> np.ndarray:
+                        half_square_width: int = 0,
+                        region: "BeamRegion | None" = None) -> np.ndarray:
     """Direct-beam position per scan point → ``(ny, nx, 2)`` float64, ``[x, y]``.
 
     pyxem's convention throughout: the value is ``centre − beam`` in detector
     PIXELS, ``[..., 0]`` horizontal (column) and ``[..., 1]`` vertical (row).
 
-    *half_square_width* restricts the search to a centred box of that half-width
-    (0 = the whole frame, and the kwarg is then omitted rather than passed as 0,
-    which pyxem reads as an empty window).
+    *region* restricts the centre of mass to a disc or annulus the user has
+    dragged onto the beam. pyxem's own ``mask=(x, y, r)`` covers the disc but
+    rejects an array mask, so BOTH shapes go through :func:`_com_shift_frame`
+    here — one code path, proven equal to pyxem's for the disc case, rather than
+    two that could drift.
+
+    *half_square_width* is pyxem's centred square, kept for the methods a region
+    does not apply to (0 = whole frame; the kwarg is omitted rather than passed
+    as 0, which pyxem reads as an empty window). A *region* supersedes it.
 
     This is a REDUCTION over the dataset, not a materialisation: a lazy signal
     streams through ``map`` and only the ``(ny, nx, 2)`` result is computed —
@@ -119,14 +239,90 @@ def measure_beam_shifts(signal, *, method: str = "center_of_mass",
         signal.set_signal_type("electron_diffraction")
     except Exception as e:                                   # pragma: no cover
         log.debug("set_signal_type(electron_diffraction) failed: %s", e)
-    kw: dict = {"method": str(method), "lazy_output": False}
-    hw = int(half_square_width or 0)
-    if hw > 0:
-        kw["half_square_width"] = hw
-    shifts = signal.get_direct_beam_position(**kw)
+
+    if region is not None and region.active and str(method) == "center_of_mass":
+        sig_shape = _sig_shape(signal)
+        keep = region.mask(sig_shape)
+        sy, sx = sig_shape
+        shifts = signal.map(_com_shift_frame, keep=keep,
+                            cx0=sx / 2.0, cy0=sy / 2.0,
+                            inplace=False, ragged=False, lazy_output=False,
+                            output_signal_size=(2,), output_dtype=float,
+                            show_progressbar=False)
+    else:
+        kw: dict = {"method": str(method), "lazy_output": False}
+        hw = int(half_square_width or 0)
+        if hw > 0:
+            kw["half_square_width"] = hw
+        shifts = signal.get_direct_beam_position(**kw)
     if getattr(shifts, "_lazy", False):
         shifts.compute()
     return np.asarray(shifts.data, dtype=np.float64)
+
+
+def region_brightness(signal, region: "BeamRegion | None", *, index=(0, 0)
+                      ) -> float:
+    """How many times brighter *region* is than the frame average — the live
+    "am I on the beam?" readout while dragging.
+
+    NOT the fraction of intensity captured, which was the obvious first choice
+    and is unusable: that fraction depends on how much OTHER intensity the
+    pattern carries, so a correctly-placed circle reads 0.7 on a weakly
+    diffracting sample and 0.2 on a strongly diffracting one, and no single
+    threshold means anything. Intensity DENSITY relative to the frame is
+    scale-free: on the direct beam it is many times 1, off it is below 1.
+
+    One frame, so it stays cheap enough to recompute on every drag settle. The
+    authoritative check is :func:`beam_inside_region` after a real measure.
+    """
+    if region is None or not region.active:
+        return float("inf")
+    try:
+        frame = np.asarray(signal.inav[int(index[1]), int(index[0])].data,
+                           dtype=np.float64)
+        keep = region.mask(frame.shape)
+        n_in = int(keep.sum())
+        if n_in == 0:
+            return 0.0
+        frame_mean = float(np.nanmean(frame))
+        if not np.isfinite(frame_mean) or frame_mean <= 0:
+            return 0.0
+        return float(np.nansum(frame * keep) / n_in / frame_mean)
+    except Exception as e:                                   # pragma: no cover
+        log.debug("region brightness probe failed: %s", e)
+        return float("inf")
+
+
+#: A region dimmer than this multiple of the frame average is not on the beam.
+#: 1.0 is "no brighter than average detector", which the direct beam never is.
+BEAM_DIM_THRESHOLD = 1.0
+
+
+def beam_inside_region(shifts: np.ndarray, region: "BeamRegion | None",
+                       sig_shape: tuple[int, int]) -> bool:
+    """Did the beam the measurement FOUND land inside the region?
+
+    **This cannot catch a slipped CIRCLE, and it is important to know why.** The
+    centroid of a non-negative distribution restricted to a CONVEX set always
+    lies inside that set — so a disc anywhere on the detector trivially
+    "contains" its own centroid, whether or not the beam is in it. Only a RING
+    can fail this check, by putting the centroid in its hole, which is a real
+    and useful signal that the ring is not concentric with the beam.
+
+    For the "is it on the beam at all?" question use :func:`region_brightness`;
+    the two together are what :func:`spyde.actions.dpc_action.DpcWizard.
+    _warn_if_region_missed` reports on.
+    """
+    if region is None or not region.active:
+        return True
+    s = np.asarray(shifts, dtype=np.float64)
+    finite = s[np.isfinite(s).all(axis=-1)]
+    if finite.size == 0:
+        return False
+    sy, sx = int(sig_shape[0]), int(sig_shape[1])
+    mean_shift = finite.reshape(-1, 2).mean(axis=0)
+    # shift = centre - beam, so beam = centre - shift.
+    return region.contains(sx / 2.0 - mean_shift[0], sy / 2.0 - mean_shift[1])
 
 
 def as_beam_shift(shifts: np.ndarray, *, like=None, units: str = "px"):
@@ -894,6 +1090,7 @@ def compute_dpc(signal, *, mode: str = "magnetic",
                 beam_energy_kev: float | None = None,
                 mrad_per_px: float | None = None,
                 autolim_sigma: float = 4.0,
+                region: "BeamRegion | None" = None,
                 shifts: np.ndarray | None = None,
                 reference: np.ndarray | None = _UNSET) -> DpcResult:
     """Run the whole DPC pipeline on *signal* and return a :class:`DpcResult`.
@@ -919,9 +1116,16 @@ def compute_dpc(signal, *, mode: str = "magnetic",
                          f"got {center_mode!r}")
     raw = (np.asarray(shifts, np.float64) if shifts is not None
            else measure_beam_shifts(signal, method=method,
-                                    half_square_width=half_square_width))
+                                    half_square_width=half_square_width,
+                                    region=region))
     report = centering_report(raw)
 
+    # A region dragged onto the beam already says where the beam is, so Manual
+    # needs no separate pick — the region's centre IS the reference. This is the
+    # whole point of one shape doing both jobs.
+    if (center_mode == "manual" and center_xy is None
+            and region is not None and region.active):
+        center_xy = region.center
     # `is _UNSET`, not `is None` — an explicit `reference=None` means "the
     # caller has decided there is no reference", which is exactly the wizard's
     # not-picked-yet state and must NOT fall back to deriving one.
@@ -967,7 +1171,9 @@ def compute_dpc(signal, *, mode: str = "magnetic",
         params={"method": method, "half_square_width": int(half_square_width),
                 "center_mode": center_mode, "corner_fraction": corner_fraction,
                 "thickness_nm": thickness_nm, "beam_energy_kev": beam_energy_kev,
-                "mrad_per_px": scale, "calibrated": calibrated},
+                "mrad_per_px": scale, "calibrated": calibrated,
+                "beam_region": (region.as_dict() if region is not None
+                                else BeamRegion().as_dict())},
     )
 
 

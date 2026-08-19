@@ -16,7 +16,14 @@ canvas stack — the right tool for a live sub-plot, and the wrong one for a
 legend: it sat on the map like a panel, and it was one more thing to keep
 painted. A key is a static picture that floats in screen space with no chrome,
 reads as part of the figure the way a scale bar does, and is included in a PNG
-export. ``hover_only`` keeps the map unobstructed until the pointer is over it.
+export.
+
+It is shown ALWAYS, not on hover. A direction map is unreadable without its
+key — the hues mean nothing on their own — so hiding it until the pointer
+arrives hides the thing that makes the picture interpretable. It costs a corner
+of a map whose corners carry no data anyway. (``hover_only`` is still what a
+dense, self-explanatory map like the IPF triangle's wants; this one is not
+that.)
 
 The wheel is built ONCE. The scan↔detector rotation is applied to the shift
 VECTORS before the field is coloured, so the colour→direction mapping is the
@@ -164,9 +171,9 @@ def build_dpc_figure(result: "_dpc.DpcResult", *, view: str = RGB_VIEW,
 
 
 def attach_wheel_key(plot2d, *, visible: bool = True):
-    """Pin the direction legend over *plot2d* as a hover key. ``None`` on an
-    anyplotlib without ``add_key`` (< 0.7.0), which is a missing legend, not a
-    broken window — so the caller carries on."""
+    """Pin the direction legend over *plot2d*. ``None`` on an anyplotlib without
+    ``add_key`` (< 0.7.0), which is a missing legend, not a broken window — so
+    the caller carries on."""
     add_key = getattr(plot2d, "add_key", None)
     if add_key is None:                                      # pragma: no cover
         logger.debug("this anyplotlib has no add_key; skipping the DPC wheel")
@@ -177,7 +184,7 @@ def attach_wheel_key(plot2d, *, visible: bool = True):
         return add_key(
             _dpc.color_wheel_rgba(WHEEL_PX, rotation=_dpc.DISPLAY_ROTATION),
             corner=WHEEL_CORNER, size=WHEEL_SIZE, bgcolor=WHEEL_BG,
-            hover_only=True, visible=bool(visible), labels=WHEEL_LABELS,
+            hover_only=False, visible=bool(visible), labels=WHEEL_LABELS,
             name="dpc_wheel")
     except Exception as e:                                   # pragma: no cover
         logger.debug("attaching the DPC colour-wheel key failed: %s", e)

@@ -83,6 +83,7 @@ _SPYDE_STAGED_HANDLERS: dict[str, str] = {
     "dpc_close":           "spyde.actions.dpc_action.dpc_close",
     "dpc_set_center":      "spyde.actions.dpc_action.dpc_set_center",
     "dpc_pick_center":     "spyde.actions.dpc_action.dpc_pick_center",
+    "dpc_set_beam":        "spyde.actions.dpc_action.dpc_set_beam",
     "dpc_load_vacuum":     "spyde.actions.dpc_action.dpc_load_vacuum",
     "dpc_auto_rotation":   "spyde.actions.dpc_action.dpc_auto_rotation",
     "dpc_tune":            "spyde.actions.dpc_action.dpc_tune",

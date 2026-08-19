@@ -10,7 +10,8 @@ maps that field. The physics is in :mod:`spyde.actions.dpc`; the figures in
                        result window, report whether centering is even needed
     dpc_close          caret unmounted → tear it all down
     dpc_set_center     Center tab: none | manual | vacuum | corners
-    dpc_pick_center    Manual tab: adopt the crosshair as the beam centre
+    dpc_set_beam       the beam region: off | circle | ring, and its geometry
+    dpc_pick_center    Manual: adopt the beam region's centre
     dpc_load_vacuum    Vacuum tab: measure a second (vacuum) dataset
     dpc_auto_rotation  solve the scan↔detector rotation from the data
     dpc_tune           any live parameter → re-derive and repaint (cheap)
@@ -32,8 +33,8 @@ against — and the instrument's own descan drifts across a scan, which looks
 exactly like a slowly varying field. The Center tab offers, in increasing order
 of trustworthiness:
 
-* **Manual** — one crosshair, one centre for every pattern. Removes a constant
-  offset, nothing else. Fine when the descan is already good.
+* **Manual** — one centre for every pattern, taken from the beam region below.
+  Removes a constant offset, nothing else. Fine when the descan is already good.
 * **Corners** — the beam centre is measured in four boxes at the corners of the
   scan and a plane is fitted through them. Assumes the corners are off the
   feature of interest. No extra data needed, and it removes a RAMP, not just an
@@ -46,6 +47,14 @@ of trustworthiness:
 and says when there is nothing to remove, so an already-centred dataset (Center
 Zero Beam has run, or the microscope was well set up) skips the step instead of
 having a correction applied to it for no reason.
+
+**The beam region is one shape doing two jobs**, and is deliberately not owned
+by any single Center mode. Its AREA is the centre-of-mass mask — a diffracted
+disc inside the search area drags the centroid, often by more than the field
+being measured — and its CENTRE is what Manual subtracts. Two separate controls
+for one physical question ("where is the direct beam?") could disagree with each
+other; one cannot. ``ring`` is for a saturated or beam-stopped beam, where the
+centroid has to come from the disc edge instead of its core.
 
 **Rotation is not cosmetic.** The detector's x/y and the scan's x/y are related
 by an unknown rotation — and possibly a handedness flip. Get it wrong and every
@@ -84,6 +93,15 @@ DEFAULTS: dict = {
     "half_square_width": 0,
     "center_mode": "corners",
     "corner_fraction": 0.05,
+    # The beam region (see BeamRegion): "off" | "circle" | "ring". It opens OFF
+    # so the measurement is byte-for-byte what it was before this control
+    # existed; the radii are filled in from the detector size the first time it
+    # is switched on, because a default in pixels cannot know the frame size.
+    "beam_shape": "off",
+    "beam_cx": 0.0,
+    "beam_cy": 0.0,
+    "beam_r": 0.0,
+    "beam_r_inner": 0.0,
     "mode": "magnetic",
     "rotation": 0.0,
     "flip": False,
@@ -99,7 +117,13 @@ DEFAULTS: dict = {
 #: crosshair and from Center Zero Beam's yellow, so two open carets never look
 #: like one.
 _CORNER_COLOR = "#f9e2af"      # the four corner boxes on the navigator
-_CROSS_COLOR = "#94e2d5"       # the manual beam-centre crosshair on the DP
+_BEAM_COLOR = "#94e2d5"        # the beam region (circle / ring) on the DP
+
+#: Re-measuring the whole scan is the one expensive step, so a DRAG must not
+#: trigger it per frame. The widget and the readouts follow the pointer live;
+#: the re-measure waits this long after motion stops. Same shape as the drift
+#: caret's ROI settle, for the same reason.
+_REGION_SETTLE_S = 0.45
 
 #: Bare-figure window geometry. A bare figure never receives ``resize_figure``,
 #: so its initial px size is the one it keeps and anything drawn outside is
@@ -136,6 +160,32 @@ class DpcWizard(WizardController):
             "name": "Corner box size", "type": "float",
             "default": DEFAULTS["corner_fraction"], "min": 0.01, "max": 0.45,
             "step": 0.01, "tab": "Center",
+        },
+        "beam_shape": {
+            "name": "Beam region", "type": "enum",
+            "default": DEFAULTS["beam_shape"], "choices": list(_dpc.BEAM_SHAPES),
+            "tab": "Center",
+        },
+        "beam_cx": {
+            "name": "Beam x (px)", "type": "float", "default": DEFAULTS["beam_cx"],
+            "min": 0.0, "max": 100000.0, "step": 0.5, "tab": "Center",
+            "display_condition": {"beam_shape": ["circle", "ring"]},
+        },
+        "beam_cy": {
+            "name": "Beam y (px)", "type": "float", "default": DEFAULTS["beam_cy"],
+            "min": 0.0, "max": 100000.0, "step": 0.5, "tab": "Center",
+            "display_condition": {"beam_shape": ["circle", "ring"]},
+        },
+        "beam_r": {
+            "name": "Radius (px)", "type": "float", "default": DEFAULTS["beam_r"],
+            "min": 0.0, "max": 100000.0, "step": 0.5, "tab": "Center",
+            "display_condition": {"beam_shape": ["circle", "ring"]},
+        },
+        "beam_r_inner": {
+            "name": "Inner radius (px)", "type": "float",
+            "default": DEFAULTS["beam_r_inner"], "min": 0.0, "max": 100000.0,
+            "step": 0.5, "tab": "Center",
+            "display_condition": {"beam_shape": "ring"},
         },
         "mode": {
             "name": "Field", "type": "enum", "default": DEFAULTS["mode"],
@@ -199,7 +249,10 @@ class DpcWizard(WizardController):
         self.clim: tuple[float, float] | None = None
         self.cmap: str | None = None
         self._corner_mg = None                      # navigator corner boxes
-        self._cross = None                          # manual centre crosshair
+        self._beam_widget = None                    # the circle/ring on the DP
+        self._beam_handler = None                   # kept alive (weak callback)
+        self._beam_dragging = False                 # re-entrancy guard
+        self._settle_timer = None                   # drag → debounced re-measure
 
     # ── the source signal ────────────────────────────────────────────────────
 
@@ -219,6 +272,15 @@ class DpcWizard(WizardController):
 
     # ── stage 1: measure (the only expensive step) ───────────────────────────
 
+    def region(self) -> _dpc.BeamRegion:
+        """The beam region the caret's parameters describe."""
+        p = self.params
+        return _dpc.BeamRegion(shape=str(p.get("beam_shape", "off")),
+                               cx=float(p.get("beam_cx") or 0.0),
+                               cy=float(p.get("beam_cy") or 0.0),
+                               r=float(p.get("beam_r") or 0.0),
+                               r_inner=float(p.get("beam_r_inner") or 0.0))
+
     def measure(self, *, on_done=None) -> None:
         """Measure the direct-beam position over the whole scan, off-thread."""
         signal = self.signal
@@ -227,18 +289,21 @@ class DpcWizard(WizardController):
             return
         method = str(self.params["method"])
         hw = int(self.params["half_square_width"] or 0)
+        region = self.region()
+        sig_shape = self._sig_shape()
         gen = self.guard()
         emit_status("DPC: locating the direct beam…")
 
         def _work():
             return _dpc.measure_beam_shifts(signal, method=method,
-                                            half_square_width=hw)
+                                            half_square_width=hw, region=region)
 
         def _apply(shifts):
             if not self.still(gen) or self._closed:
                 return
             self.shifts = shifts
             self.report = _dpc.centering_report(shifts)
+            self._warn_if_region_missed(shifts, region, sig_shape)
             self.emit_state()
             self.refresh()
             if on_done is not None:
@@ -248,13 +313,60 @@ class DpcWizard(WizardController):
                            on_error=lambda e: emit_error(f"DPC: locating the "
                                                          f"direct beam failed: {e}"))
 
+    def _warn_if_region_missed(self, shifts, region, sig_shape) -> None:
+        """Say so when the region is not actually on the beam.
+
+        This cannot be left to the numbers looking wrong, because they do not:
+        a region sitting on empty detector still returns the centroid of
+        whatever is inside it — a finite, plausible position — and every map
+        downstream is then confidently wrong.
+
+        BRIGHTNESS is the check that works. Containment does NOT: the centroid
+        of a non-negative distribution over a CONVEX region always lands inside
+        it, so a disc anywhere on the detector passes that test trivially (see
+        ``dpc.beam_inside_region``). Containment still earns its place for a
+        RING, where a centroid in the hole means it is not concentric with the
+        beam.
+        """
+        if not region.active:
+            return
+        if np.isnan(np.asarray(shifts)).all():
+            emit_error("DPC: the beam region captured no intensity anywhere — "
+                       "drag it onto the direct beam.")
+            return
+        brightness = _dpc.region_brightness(self.signal, region)
+        if np.isfinite(brightness) and brightness < _dpc.BEAM_DIM_THRESHOLD:
+            emit_status(
+                f"DPC: warning — the beam region is dimmer than the detector "
+                f"average ({brightness:.2f}×), so it is not on the direct beam. "
+                f"Drag it over, or widen it.")
+            return
+        if region.shape == "ring" and not _dpc.beam_inside_region(
+                shifts, region, sig_shape):
+            emit_status("DPC: warning — the beam was found in the ring's HOLE, "
+                        "so the ring is not centred on it.")
+
     # ── stage 2: derive (pure arithmetic on the cached shifts) ───────────────
+
+    def manual_center(self) -> tuple[float, float] | None:
+        """The Manual reference position: an explicit pick, else the region's
+        own centre.
+
+        A region the user has already dragged onto the beam HAS answered "where
+        is the undeflected beam" — asking them to place a second marker saying
+        the same thing would be busywork, and the two could then disagree.
+        """
+        cx, cy = self.params.get("cx"), self.params.get("cy")
+        if cx is not None and cy is not None:
+            return (float(cx), float(cy))
+        r = self.region()
+        return r.center if r.active else None
 
     def reference(self) -> np.ndarray | None:
         """The descan reference for the current Center mode, or ``None``.
 
-        ``strict=False``: a caret sitting on Manual before the crosshair has
-        been dragged, or on Vacuum before a dataset has been chosen, is
+        ``strict=False``: a caret sitting on Manual before a centre has been
+        placed, or on Vacuum before a dataset has been chosen, is
         mid-interaction — "no reference yet" is a valid state that must render,
         not an error that blanks the window.
         """
@@ -263,7 +375,7 @@ class DpcWizard(WizardController):
         return _dpc.resolve_reference(
             self.shifts, center_mode=str(self.params["center_mode"]),
             corner_fraction=float(self.params["corner_fraction"]),
-            center_xy=(self.params.get("cx"), self.params.get("cy")),
+            center_xy=self.manual_center(),
             vacuum_shifts=self.vacuum_shifts, sig_shape=self._sig_shape(),
             strict=False)
 
@@ -282,7 +394,11 @@ class DpcWizard(WizardController):
                 reverse=bool(p["reverse"]),
                 thickness_nm=float(p["thickness_nm"]),
                 beam_energy_kev=float(p["beam_energy_kv"]),
-                mrad_per_px=scale, autolim_sigma=float(p["autolim_sigma"]))
+                mrad_per_px=scale, autolim_sigma=float(p["autolim_sigma"]),
+                # Carried for provenance only — `shifts` is already measured, so
+                # this cannot change the numbers, but a committed tree should
+                # record which pixels the centroid was taken over.
+                region=self.region())
         except Exception as e:
             emit_error(f"DPC: {e}")
             log.exception("DPC derive failed")
@@ -436,42 +552,160 @@ class DpcWizard(WizardController):
                 log.debug("removing the DPC corner boxes failed: %s", e)
             self._corner_mg = None
 
-    def show_crosshair(self) -> None:
-        """Drop a draggable crosshair on the DP for the Manual centre."""
-        plot2d = getattr(self.src_plot, "_plot2d", None)
-        if plot2d is None or self._cross is not None:
-            return
-        sy, sx = self._sig_shape()
-        cx = float(self.params.get("cx") or sx / 2.0)
-        cy = float(self.params.get("cy") or sy / 2.0)
-        try:
-            self._cross = plot2d.add_crosshair_widget(cx=cx, cy=cy,
-                                                      color=_CROSS_COLOR)
-            emit_status("DPC: drag the crosshair onto the undeflected beam, "
-                        "then Use this centre.")
-        except Exception as e:                               # pragma: no cover
-            log.debug("adding the DPC crosshair failed: %s", e)
+    # ── the beam region (one shape, two jobs) ────────────────────────────────
 
-    def hide_crosshair(self) -> None:
+    def ensure_region_defaults(self) -> None:
+        """Fill in radii the first time the region is switched on.
+
+        They cannot be declared in ``DEFAULTS`` because a sensible radius is a
+        fraction of the DETECTOR, whose size is not known until a dataset is
+        open.
+        """
+        p = self.params
+        if str(p.get("beam_shape", "off")) == "off" or float(p.get("beam_r") or 0) > 0:
+            return
+        d = _dpc.default_beam_region(self._sig_shape(), str(p["beam_shape"]))
+        p["beam_cx"], p["beam_cy"] = d.cx, d.cy
+        p["beam_r"], p["beam_r_inner"] = d.r, d.r_inner
+
+    def show_beam_region(self) -> None:
+        """Draw (or reshape) the draggable circle / ring on the pattern.
+
+        The SAME widget answers both of the Center step's questions: its area is
+        the centre-of-mass mask, and its centre is the Manual reference. Two
+        separate controls for one physical thing (where is the beam?) is what
+        this replaces.
+
+        Switching shape rebuilds the widget — a circle and an annulus are
+        different anyplotlib widget types, so there is nothing to mutate.
+        """
+        plot2d = getattr(self.src_plot, "_plot2d", None)
+        shape = str(self.params.get("beam_shape", "off"))
+        if plot2d is None or shape == "off":
+            self.hide_beam_region()
+            return
+        self.ensure_region_defaults()
+        r = self.region()
+        if self._beam_widget is not None:
+            if getattr(self._beam_widget, "_dpc_shape", None) == shape:
+                try:
+                    kw = ({"cx": r.cx, "cy": r.cy, "r_outer": r.r,
+                           "r_inner": r.r_inner} if shape == "ring"
+                          else {"cx": r.cx, "cy": r.cy, "r": r.r})
+                    self._beam_widget.set(**kw)
+                    return
+                except Exception as e:                       # pragma: no cover
+                    log.debug("resizing the DPC beam region failed: %s", e)
+            self.hide_beam_region()
+        try:
+            if shape == "ring":
+                w = plot2d.add_annular_widget(cx=r.cx, cy=r.cy, r_outer=r.r,
+                                              r_inner=r.r_inner,
+                                              color=_BEAM_COLOR)
+            else:
+                w = plot2d.add_circle_widget(cx=r.cx, cy=r.cy, r=r.r,
+                                             color=_BEAM_COLOR)
+            w._dpc_shape = shape
+            from spyde.drawing.selectors.base_selector import event_handler_fn
+            handler = event_handler_fn(lambda event: self._on_region_drag())
+            w.add_event_handler(handler, "pointer_move", "pointer_up")
+            self._beam_widget, self._beam_handler = w, handler
+        except Exception as e:                               # pragma: no cover
+            log.debug("adding the DPC beam region failed: %s", e)
+
+    def hide_beam_region(self) -> None:
         """Widgets have no ``remove()``, only ``hide()`` (same as CZB's)."""
-        if self._cross is not None:
+        if self._beam_widget is not None:
             try:
-                self._cross.hide()
+                self._beam_widget.hide()
             except Exception as e:                           # pragma: no cover
-                log.debug("hiding the DPC crosshair failed: %s", e)
-            self._cross = None
+                log.debug("hiding the DPC beam region failed: %s", e)
+            self._beam_widget = self._beam_handler = None
+
+    def _on_region_drag(self) -> None:
+        """Read the widget back, echo it live, and arm the re-measure.
+
+        RE-ENTRANCY GUARD: anyplotlib ``Widget.set()`` fires ``pointer_move``
+        unconditionally — even on a no-change write — so anything here that
+        writes back to the widget re-invokes this handler synchronously. The
+        same recursion Crop and CZB both hit; compare-before-set is NOT enough.
+        """
+        w = self._beam_widget
+        if w is None or self._beam_dragging or self._closed:
+            return
+        self._beam_dragging = True
+        try:
+            self.params["beam_cx"] = float(w.cx)
+            self.params["beam_cy"] = float(w.cy)
+            if str(self.params.get("beam_shape")) == "ring":
+                self.params["beam_r"] = float(w.r_outer)
+                self.params["beam_r_inner"] = float(w.r_inner)
+            else:
+                self.params["beam_r"] = float(w.r)
+        except Exception as e:                               # pragma: no cover
+            log.debug("reading the DPC beam region failed: %s", e)
+        finally:
+            self._beam_dragging = False
+        self.emit_region()
+        self.arm_region_settle()
+
+    def arm_region_settle(self) -> None:
+        """(Re)start the debounce that re-measures once the drag stops.
+
+        The region changes the centre of mass, so it can only take effect by
+        re-measuring the whole scan — the one expensive step. Doing that per
+        drag frame would make the widget unusable on any real dataset, so the
+        widget and the brightness readout track the pointer and the measurement
+        follows once motion stops.
+        """
+        import threading
+        if self._settle_timer is not None:
+            try:
+                self._settle_timer.cancel()
+            except Exception as e:                           # pragma: no cover
+                log.debug("cancelling the DPC settle timer failed: %s", e)
+        if self._closed:
+            return
+
+        def _fire():
+            self._settle_timer = None
+            if self._closed:
+                return
+            dispatch = getattr(self.session, "_dispatch_to_main", None)
+            if dispatch is not None:
+                dispatch(self.measure)
+            else:
+                self.measure()
+
+        self._settle_timer = threading.Timer(_REGION_SETTLE_S, _fire)
+        self._settle_timer.daemon = True
+        self._settle_timer.start()
+
+    def emit_region(self) -> None:
+        """Live region geometry + how bright it is, for the caret's readout."""
+        region = self.region()
+        signal = self.signal
+        brightness = (_dpc.region_brightness(signal, region)
+                      if signal is not None else float("inf"))
+        emit({"type": "dpc_region", "window_id": self.caret_window_id,
+              "result_window_id": self.window_id,
+              **region.as_dict(),
+              "brightness": (None if not np.isfinite(brightness)
+                             else float(brightness))})
 
     def sync_overlays(self) -> None:
-        """Show exactly the furniture the current Center mode needs."""
+        """Show exactly the furniture the current state needs.
+
+        The corner boxes belong to one Center MODE; the beam region does not —
+        it defines the centre of mass for every mode, so it is shown whenever
+        it is switched on.
+        """
         mode = str(self.params["center_mode"])
         if mode == "corners":
             self.show_corner_boxes()
         else:
             self.hide_corner_boxes()
-        if mode == "manual":
-            self.show_crosshair()
-        else:
-            self.hide_crosshair()
+        self.show_beam_region()
 
     # ── rotation ─────────────────────────────────────────────────────────────
 
@@ -681,8 +915,16 @@ class DpcWizard(WizardController):
         if self._closed:
             return
         self._closed = True
+        # Cancel the drag debounce FIRST: a timer that fires after teardown
+        # would re-measure a torn-down wizard on a worker thread.
+        if self._settle_timer is not None:
+            try:
+                self._settle_timer.cancel()
+            except Exception as e:                           # pragma: no cover
+                log.debug("cancelling the DPC settle timer failed: %s", e)
+            self._settle_timer = None
         self.hide_corner_boxes()
-        self.hide_crosshair()
+        self.hide_beam_region()
         if self.window_id is not None:
             forget = getattr(self.session, "_forget_window", None)
             if forget is not None:
@@ -806,17 +1048,44 @@ def dpc_set_center(session, plot, payload) -> None:
     ctrl.refresh()
 
 
-def dpc_pick_center(session, plot, payload) -> None:
-    """Manual tab: adopt the crosshair's position as the beam centre."""
+def dpc_set_beam(session, plot, payload) -> None:
+    """Beam region: switch between off / circle / ring, or set its geometry.
+
+    Changing the region changes the CENTRE OF MASS, so it can only take effect
+    by re-measuring — which this does immediately for a discrete change (a
+    shape toggle, a typed radius). A DRAG goes through the debounce instead
+    (``_on_region_drag``), because the whole scan cannot be re-measured per
+    pointer frame.
+    """
     ctrl = _ctrl_for(session, plot, payload)
     if ctrl is None:
         return
-    cross = ctrl._cross
-    cx = float(cross.cx) if cross is not None else payload.get("cx")
-    cy = float(cross.cy) if cross is not None else payload.get("cy")
-    if cx is None or cy is None:
-        emit_error("DPC: place the crosshair on the undeflected beam first.")
+    before = ctrl.region().as_dict()
+    ctrl.params.update(_clean(payload))
+    ctrl.ensure_region_defaults()
+    ctrl.sync_overlays()
+    ctrl.emit_region()
+    if ctrl.region().as_dict() != before:
+        ctrl.measure()
+
+
+def dpc_pick_center(session, plot, payload) -> None:
+    """Manual mode: adopt the beam region's centre as the undeflected position.
+
+    The region has already been dragged onto the beam, so it IS the answer —
+    this just promotes it to the Manual reference (and accepts an explicit
+    ``cx``/``cy`` for scripted callers)."""
+    ctrl = _ctrl_for(session, plot, payload)
+    if ctrl is None:
         return
+    cx, cy = payload.get("cx"), payload.get("cy")
+    if cx is None or cy is None:
+        picked = ctrl.region().center if ctrl.region().active else None
+        if picked is None:
+            emit_error("DPC: turn on the beam region (circle or ring) and drag "
+                       "it onto the direct beam first.")
+            return
+        cx, cy = picked
     ctrl.params.update({"center_mode": "manual", "cx": float(cx), "cy": float(cy)})
     emit_status(f"DPC: beam centre set to ({cx:.1f}, {cy:.1f}) px.")
     ctrl.emit_state()
