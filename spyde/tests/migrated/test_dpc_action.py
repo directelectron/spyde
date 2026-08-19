@@ -44,9 +44,9 @@ from spyde.actions import dpc_action as dpca
 def _capture_module_emit(window, monkeypatch):
     """Route ``dpc_action``'s own ``emit`` into the captured list.
 
-    The module does ``from spyde.backend.ipc import emit`` at import, so
-    conftest's patch of ``ipc.emit`` never reaches that binding — the same hazard
-    conftest documents for ``session.py``, and the same fix.
+    The module does ``from de_shell.ipc import emit`` at import, so conftest's
+    patch of ``ipc.emit`` never reaches that binding — the same hazard conftest
+    documents for ``session.py``, and the same fix.
     """
     monkeypatch.setattr(dpca, "emit", window["messages"].append)
 
