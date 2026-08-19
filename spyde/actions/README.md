@@ -17,7 +17,7 @@ wizard parameter schemas via `registry.wizard_parameters(key)` — see
 | **View action** | one-shot UI command, no tree change | plain `fn(ctx, …)` | zoom, reset, `tile_views` |
 | **TransformAction** | signal + params → a **new node in the SAME tree** | `action.TransformAction` | Rebin (`Rebin2DAction`), CZB apply |
 | **RegionAction** | interactive ROI → a **linked live output plot** | `action.RegionAction` | Virtual Imaging, FFT, Line Profile, Vector VI |
-| **Wizard** | staged caret: open → tune → run → commit → close | `wizard.WizardController` + staged handlers | Find Vectors, Orientation, Vector-OM, EBSD, Strain, CZB |
+| **Wizard** | staged caret: open → tune → run → commit → close | `wizard.WizardController` + staged handlers | Find Vectors, Orientation, Vector-OM, EBSD, Strain, CZB, DPC |
 | **Commit** | promote a live/finished result to a **NEW SignalTree** | `commit.commit_result_tree` | strain Commit, VOM result windows |
 
 Deciding: does it need an ROI? → RegionAction. Does it produce a new node of
@@ -156,7 +156,19 @@ is a single 2-D plot); that is a documented no-op, not an error.
 **Compute-heavy actions**: keep the compute in its own module (or package —
 `find_vectors/` is the model: pure compute layers + `__init__` re-export;
 interactive wiring stays outside). NEVER `.compute()` the full dataset
-(CLAUDE.md memory-safety rule).
+(CLAUDE.md memory-safety rule). DPC is the small version of the same split:
+`dpc.py` (pure physics) / `dpc_display.py` (figures) / `dpc_action.py`
+(interaction). Read `dpc.py` before touching any beam-shift code — it documents
+the two conventions pyxem does not make obvious (a shift is `centre − beam`,
+i.e. the NEGATIVE of the deflection; and a colour wheel has to be 90° off its
+map to read true) and derives its legend from the map's own colour rule rather
+than copying that offset.
+
+**Legends that float over a plot** — an IPF triangle, a DPC direction wheel —
+are `Plot2D.add_key` overlays (`hover_only=True`), NOT `Figure.add_inset`. An
+inset is a draggable window with a title bar and its own canvas stack: right for
+a live sub-plot, wrong for a legend, which should read as part of the figure the
+way a scale bar does. Keys are also included in a PNG export.
 
 ## 5. The renderer side (wizard carets)
 

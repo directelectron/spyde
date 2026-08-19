@@ -40,7 +40,7 @@ class TestSchemaCompleteness:
 
 
 class TestSchemaValidity:
-    @pytest.mark.parametrize("key", ["fv", "om", "strain", "vom", "czb"])
+    @pytest.mark.parametrize("key", ["fv", "om", "strain", "vom", "czb", "dpc"])
     def test_entries_well_formed(self, key):
         schema = registry.wizard_parameters(key)
         for pname, spec in schema.items():
@@ -94,6 +94,22 @@ class TestSchemaBackendLockstep:
         schema = registry.wizard_parameters("vom")
         assert schema["strain_cap"]["default"] == FIT["strain_cap"]
         assert schema["sink_bw"]["default"] == FIT["sink_bw"]
+
+    def test_dpc_defaults(self):
+        from spyde.actions.dpc_action import DEFAULTS
+        schema = registry.wizard_parameters("dpc")
+        for k, v in DEFAULTS.items():
+            assert schema[k]["default"] == v, \
+                f"dpc schema/{k} drifted from dpc_action.DEFAULTS"
+
+    def test_dpc_enum_choices_come_from_the_compute_layer(self):
+        """The caret's choices must be the modes the physics actually implements
+        — a schema listing one the backend cannot dispatch is a dead control."""
+        from spyde.actions import dpc
+        schema = registry.wizard_parameters("dpc")
+        assert tuple(schema["center_mode"]["choices"]) == dpc.CENTER_MODES
+        assert tuple(schema["mode"]["choices"]) == dpc.FIELD_MODES
+        assert tuple(schema["method"]["choices"]) == dpc.BEAM_METHODS
 
     def test_strain_components(self):
         from spyde.actions._common import STRAIN_COMPONENTS
