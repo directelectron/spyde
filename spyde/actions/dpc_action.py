@@ -70,8 +70,8 @@ from spyde.actions import dpc as _dpc
 from spyde.actions import dpc_display as _display
 from spyde.actions.context import current_signal as _current_signal
 from spyde.actions.context import src_plot_tree as _src_plot_tree
-from spyde.actions.wizard import WizardController
-from spyde.backend.ipc import emit, emit_error, emit_status
+from de_shell.actions.wizard import WizardController
+from de_shell.ipc import emit, emit_error, emit_status
 
 log = logging.getLogger(__name__)
 
@@ -309,7 +309,7 @@ class DpcWizard(WizardController):
     # ── the result window ────────────────────────────────────────────────────
 
     def _open_window(self, result: _dpc.DpcResult) -> None:
-        from spyde.actions.figure_registry import keep_alive
+        from de_shell.actions.figure_registry import keep_alive
         try:
             fig, fig_id, html, plot, wheel = _display.build_dpc_figure(
                 result, view=str(self.params["view"]), title=self._title())

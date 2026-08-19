@@ -124,7 +124,7 @@ def emit_dpc_histogram(window_id, result: "_dpc.DpcResult", view: str,
     lo, hi = clim if clim is not None else _auto_clim(finite, view in _SIGNED)
     try:
         counts, edges = np.histogram(finite, bins=64)
-        from spyde.backend.ipc import emit
+        from de_shell.ipc import emit
         emit({"type": "histogram", "window_id": int(window_id),
               "counts": counts.astype(int).tolist(),
               "edges": [float(e) for e in edges],
