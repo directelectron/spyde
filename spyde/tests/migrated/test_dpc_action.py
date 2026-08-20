@@ -99,6 +99,21 @@ def _errors(messages):
     return [str(m.get("text", "")) for m in _of_type(messages, "error")]
 
 
+class _PointerEvent:
+    """What anyplotlib hands a widget handler. Only ``event_type`` is read."""
+
+    def __init__(self, event_type):
+        self.event_type = event_type
+
+
+def _drag_frame():
+    return _PointerEvent("pointer_move")
+
+
+def _release():
+    return _PointerEvent("pointer_up")
+
+
 def _markers(plot2d):
     """Marker-group NAMES on a plot (``list_markers`` returns descriptor dicts)."""
     try:
@@ -322,28 +337,44 @@ class TestCentering:
         assert wiz.params["beam_r"] == pytest.approx(0.25 * min(sy, sx))
         assert (wiz.params["beam_cx"], wiz.params["beam_cy"]) == (sx / 2, sy / 2)
 
-    def test_dragging_the_region_does_not_re_measure_per_frame(self, window):
-        """The region changes the CENTRE OF MASS, so it can only take effect by
-        re-measuring the whole scan. Doing that per pointer frame would make the
-        widget unusable on any real dataset, so a drag debounces."""
-        from spyde.actions import dpc as _dpc
+    def test_a_drag_frame_costs_nothing_and_the_release_pays(self, window):
+        """Every cost waits for ``pointer_up``.
+
+        Two of them. Re-measuring the scan is the obvious one. The other is the
+        brightness readout, which reads a frame — a dask compute on a lazy scan
+        — and firing one per pointer frame queues work faster than it drains,
+        so the caret's own radius keeps climbing after the pointer has stopped.
+        A drag frame must therefore do no reading at all, only echo geometry.
+        """
         session, plot, _tree, wiz = _opened(window, beam_shape="circle")
-        calls = {"n": 0}
+        measures = {"n": 0}
+        reads = {"n": 0}
         import spyde.actions.dpc as dpc_mod
-        real = _dpc.measure_beam_shifts
-        dpc_mod.measure_beam_shifts = lambda *a, **k: (calls.__setitem__("n", calls["n"] + 1)
-                                                       or real(*a, **k))
+        real_measure = dpc_mod.measure_beam_shifts
+        real_brightness = dpc_mod.region_brightness
+        dpc_mod.measure_beam_shifts = lambda *a, **k: (
+            measures.__setitem__("n", measures["n"] + 1) or real_measure(*a, **k))
+        dpc_mod.region_brightness = lambda *a, **k: (
+            reads.__setitem__("n", reads["n"] + 1) or real_brightness(*a, **k))
         try:
             for r in (8.0, 9.0, 10.0, 11.0):     # a drag, frame by frame
                 wiz._beam_widget.set(r=r)
-                wiz._on_region_drag()
-            assert calls["n"] == 0, "a drag frame re-measured the whole scan"
-            assert wiz.params["beam_r"] == pytest.approx(11.0)
-            assert _wait(lambda: calls["n"] >= 1, timeout=10.0), \
-                "the debounce never fired the re-measure"
-            assert calls["n"] == 1, "the settle should coalesce to ONE measure"
+                wiz._on_region_drag(_drag_frame())
+            assert measures["n"] == 0, "a drag frame re-measured the whole scan"
+            assert reads["n"] == 0, \
+                "a drag frame read a frame for the brightness readout"
+            assert wiz._settle_timer is None, "a drag frame armed the re-measure"
+            assert wiz.params["beam_r"] == pytest.approx(11.0), \
+                "the drag must still track the widget, it just must not read"
+
+            wiz._on_region_drag(_release())
+            assert reads["n"] == 1, "the release did not refresh the brightness"
+            assert _wait(lambda: measures["n"] >= 1, timeout=10.0), \
+                "the release never fired the re-measure"
+            assert measures["n"] == 1, "the settle should coalesce to ONE measure"
         finally:
-            dpc_mod.measure_beam_shifts = real
+            dpc_mod.measure_beam_shifts = real_measure
+            dpc_mod.region_brightness = real_brightness
 
     def test_a_measure_abandoned_by_close_does_not_shout(self, window):
         """Closing the caret mid-pass fails the measure on the way down (the
@@ -375,7 +406,7 @@ class TestCentering:
         """A timer that survives close would re-measure a torn-down wizard on a
         worker thread."""
         session, plot, _tree, wiz = _opened(window, beam_shape="circle")
-        wiz._on_region_drag()
+        wiz._on_region_drag(_release())
         assert wiz._settle_timer is not None
         dpca.dpc_close(session, plot, {})
         assert wiz._settle_timer is None and wiz._closed
