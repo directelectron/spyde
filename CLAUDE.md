@@ -38,6 +38,25 @@ Slow benchmarks live in `spyde/tests/benchmark_*.py` — run directly (`python -
 
 **Working notes and PR screenshots are NOT tracked:** plan / handoff / parity / checklist / architecture Markdown (`HANDOFF.md`, `docs/notes/*.md`, `OVERNIGHT.md`, `ARCHITECTURE-SPLIT.md`, and the like) is scratch belonging to ONE branch — do not `git add` it. A fact worth keeping goes in a test, a docstring, or the commit message, where it sits next to the code that makes it true and gets updated with it; a standalone note just rots into a confident description of an app that no longer exists, and a reader can't tell that from current guidance. Same for the PR screenshots under `docs/pr/**` — attach them to the GitHub PR or issue, which hosts uploads on its own CDN, rather than committing them. If such a file does get committed on a branch, **delete it as part of merging that branch** (or in a cleanup commit right after) — it must not survive into `main`. The only Markdown that belongs in the repo long-term is `README.md`, this file, `spyde/actions/README.md`, and `electron/tests/README.md`. (`.gitignore` covers the usual names, but it can't catch a new one — the rule is the thing.)
 
+## Code style
+
+Code is writing. The science here is genuinely complex, so anything the code or
+its comments add on top of that is cost paid by the next reader.
+
+- **Follow the Zen of Python** (`import this`) strictly. Simple beats complex,
+  explicit beats implicit, flat beats nested, readability counts.
+- **Do not abbreviate names.** Write `navigation_index`, not `nav_idx`;
+  `signal_tree`, not `st`. A name is the shortest documentation there is.
+- **Prefer general terms to package-specific ones** in names and comments.
+  Describe what is happening before reaching for a library's proper noun for it.
+  "Reads the whole block from disk to return one frame" is readable by anyone;
+  "the `CachedDaskArray` takes its synchronous branch" is readable only by
+  someone with that package already in their head. Name the specific API when it
+  is the subject, not as decoration.
+- **Comments say why, once.** No narrative, no history, no restating the line
+  below in prose. Contract docstrings are the place for behaviour a caller must
+  know.
+
 ## Dependencies
 
 Python deps are in `pyproject.toml`. Key non-PyPI deps from custom forks (check `pyproject.toml` for the exact pinned branch — they move):
