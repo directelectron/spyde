@@ -114,8 +114,8 @@ explicit = true
 # This repo is a uv workspace root: packages/ holds SpyDE's own copy of the
 # shared shell. Ground Crew and Autopilot live in their own repos
 # (de_ground_crew, de_autopilot), each carrying its own shell copy — developed
-# independently until the copies converge into one de-shell repo
-# (see ARCHITECTURE-SPLIT.md, "Three copies of the shell").
+# independently, and converging into one de-shell repo once the shell surface
+# has settled under all three apps.
 [tool.uv.workspace]
 members = ["packages/de-shell"]
 

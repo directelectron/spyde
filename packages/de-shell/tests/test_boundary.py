@@ -66,8 +66,9 @@ class TestShellStaysThin:
         """)
         assert result["leaked"] == [], (
             "de_shell pulled in " + ", ".join(result["leaked"]) +
-            " — see ARCHITECTURE-SPLIT.md; the shell must stay installable "
-            "without the science stack."
+            " — the shell must stay installable without the science stack, so "
+            "that the live, in-memory apps (de-groundcrew, de-autopilot) never "
+            "acquire it transitively. Put the offending code in the app."
         )
 
     def test_no_de_shell_module_imports_the_app(self):

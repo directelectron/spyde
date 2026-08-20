@@ -11,7 +11,10 @@ the anyplotlib plotting wrapper.
 It answers nothing about what the data IS. No HyperSpy, no Dask, no
 RosettaSciIO, no pyxem — de-groundcrew and de-autopilot are live, in-memory
 applications and must not acquire those dependencies transitively. That
-constraint is what fixes the boundary; see ARCHITECTURE-SPLIT.md.
+constraint is what fixes the boundary, and `tests/test_boundary.py` enforces
+it in a clean subprocess: anything that answers "what is the data and what do
+you do to it?" (the array-cache tiering, the signal tree, the navigator read
+path, the distributed compute branch, every action handler) stays in the app.
 """
 from __future__ import annotations
 

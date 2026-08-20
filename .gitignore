@@ -92,3 +92,15 @@ spyde/*.svg.*.svg
 
 # Presentation source datasets — hundreds of MB, regenerable, never committed
 doc/presentations/
+
+# Working notes — see CLAUDE.md, "Working notes and PR screenshots are NOT
+# tracked". Plan/handoff/architecture markdown belongs to one branch, not to
+# main. Anchored to the root (and to the one real directory) so an unrelated
+# nested file of the same name is not silently hidden — the `reports/` lesson
+# above. This list can only cover names we have already been bitten by; a new
+# note under a new name still needs the rule applied by hand.
+/HANDOFF.md
+/OVERNIGHT.md
+/PARITY.md
+/ARCHITECTURE-SPLIT.md
+/docs/notes/
