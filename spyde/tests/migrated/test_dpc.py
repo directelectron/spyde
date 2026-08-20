@@ -858,6 +858,101 @@ class TestGroundTruth:
 # Memory safety
 # ─────────────────────────────────────────────────────────────────────────────
 
+class TestLazy:
+    """The pass over a lazy dataset must stream, and must stream ALIGNED.
+
+    Live-Display §1: a 4D-STEM signal is chunked so each chunk holds whole
+    frames. If the beam-shift graph rechunked, the streaming granularity would
+    stop matching what the reader reads and every "chunk" would touch several
+    storage chunks — the shuffle that section exists to forbid.
+    """
+
+    @staticmethod
+    def _lazy(nav=16, sig=32, nav_chunk=8):
+        import dask.array as da
+        import hyperspy.api as hs
+        gy, gx = np.mgrid[0:sig, 0:sig].astype(np.float32)
+        frame = 1000.0 / (1 + np.exp((np.hypot(gx - (sig / 2 + 2),
+                                               gy - (sig / 2 - 2)) - sig * 0.2)
+                                     / 1.5))
+        arr = da.from_array(np.tile(frame, (nav, nav, 1, 1)),
+                            chunks=(nav_chunk, nav_chunk, sig, sig))
+        s = hs.signals.Signal2D(arr).as_lazy()
+        s.set_signal_type("electron_diffraction")
+        return s, arr
+
+    def test_the_graph_is_lazy_and_keeps_the_nav_chunking(self):
+        import dask.array as da
+        s, arr = self._lazy()
+        for region in (None, dpc.BeamRegion("circle", 18.0, 14.0, 8.0)):
+            graph = dpc.beam_shift_graph(s, region=region)
+            assert isinstance(graph, da.Array)
+            assert graph.chunks[:2] == arr.chunks[:2], \
+                "the nav chunking changed — streaming would stop matching storage"
+            assert not [k for k in graph.dask.layers
+                        if "rechunk" in str(k).lower()], "a rechunk crept in"
+
+    def test_eager_data_has_no_graph(self):
+        """`None` is the signal to the wizard that there is nothing to stream."""
+        import hyperspy.api as hs
+        s = hs.signals.Signal2D(np.zeros((4, 4, 8, 8), np.float32))
+        s.set_signal_type("electron_diffraction")
+        assert dpc.beam_shift_graph(s) is None
+
+    def test_the_kernel_only_ever_sees_one_frame(self):
+        """Streaming is per FRAME inside a chunk, so peak memory is a frame —
+        not a chunk, and certainly not the dataset."""
+        s, arr = self._lazy()
+        seen = {"max": 0, "n": 0}
+        real = dpc._com_shift_frame
+
+        def spy(frame, **kw):
+            seen["n"] += 1
+            seen["max"] = max(seen["max"], np.asarray(frame).nbytes)
+            return real(frame, **kw)
+
+        dpc._com_shift_frame = spy
+        try:
+            shifts = dpc.measure_beam_shifts(
+                s, region=dpc.BeamRegion("circle", 18.0, 14.0, 8.0))
+        finally:
+            dpc._com_shift_frame = real
+        one_frame = arr.shape[2] * arr.shape[3] * arr.dtype.itemsize
+        assert seen["n"] == arr.shape[0] * arr.shape[1]
+        assert seen["max"] <= one_frame * 1.01
+        assert shifts.shape == (arr.shape[0], arr.shape[1], 2)
+
+    def test_a_partial_field_survives_every_downstream_stage(self):
+        """The whole point of streaming: NaN where nothing has landed yet must
+        flow through centering, rotation and display without poisoning them."""
+        s, _arr = self._lazy()
+        partial = np.full((16, 16, 2), np.nan)
+        partial[:8, :8] = dpc.measure_beam_shifts(s)[:8, :8]   # one chunk in
+
+        report = dpc.centering_report(partial)
+        assert np.isfinite(report.worst)
+        ref = dpc.corner_reference(partial, 0.2)
+        assert np.isfinite(ref).all(), "the plane fit produced non-finite values"
+        est = dpc.estimate_rotation(dpc.apply_reference(partial, ref),
+                                    mode="electric")
+        assert np.isfinite(est.angle)
+        rgb = dpc.magnitude_phase_rgb(partial)
+        assert rgb.shape == (16, 16, 3) and rgb.dtype == np.uint8
+
+    def test_unmeasured_positions_paint_black_not_broken(self):
+        """A single NaN used to take out the whole map: `autolim` derives its
+        limits from a mean and a standard deviation."""
+        field = _curl_free_field(16) * 5.0
+        holed = field.copy()
+        holed[4:8, 4:8] = np.nan
+        rgb = dpc.magnitude_phase_rgb(holed)
+        assert rgb[6, 6].max() == 0, "unmeasured should read as zero field"
+        assert rgb[12, 12].max() > 0, "the measured part must still be coloured"
+        assert np.array_equal(dpc.magnitude_phase_rgb(field)[12, 12],
+                              rgb[12, 12]), \
+            "a hole must not change the colours elsewhere"
+
+
 class TestMemorySafety:
     def test_measuring_shifts_never_materialises_a_lazy_dataset(self):
         """``get_direct_beam_position`` is a REDUCTION — only the ``(ny, nx, 2)``

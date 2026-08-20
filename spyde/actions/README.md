@@ -153,6 +153,15 @@ is a single 2-D plot); that is a documented no-op, not an error.
    double-fire test (open, close, open → exactly one live controller — see
    `test_wizard_double_fire.py`).
 
+**A long pass over a lazy dataset should STREAM, not block.** Build the lazy
+graph, hand it to `ComputeBackend.compute_chunks_progressive(graph, nav_ndim,
+on_chunk_done)`, and repaint from the partial array as chunks land (`dpc_action.
+_measure_progressive` is a compact example; find-vectors is the large one). Two
+things make it work: the graph must keep the dataset's own nav chunking, so a
+streamed chunk is a STORAGE chunk (Live-Display §1) — check for `rechunk` layers
+if unsure; and every stage downstream must tolerate `NaN` for not-yet-computed
+positions, including the DISPLAY, or one unfilled pixel blanks the whole map.
+
 **Compute-heavy actions**: keep the compute in its own module (or package —
 `find_vectors/` is the model: pure compute layers + `__init__` re-export;
 interactive wiring stays outside). NEVER `.compute()` the full dataset

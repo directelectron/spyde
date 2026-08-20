@@ -106,15 +106,24 @@ def _auto_clim(arr: np.ndarray, signed: bool) -> tuple[float, float]:
 
 def view_array(result: "_dpc.DpcResult", view: str
                ) -> tuple[np.ndarray, tuple[float, float] | None, str]:
-    """``(image, clim, colormap)`` for *view* — RGB or a scalar component."""
+    """``(image, clim, colormap)`` for *view* — RGB or a scalar component.
+
+    Non-finite values are painted as 0 (the same choice ``strain_display``
+    makes for failed fits) but are EXCLUDED from the contrast, so positions
+    still streaming in during a progressive fill neither blank the map nor
+    stretch its scale.
+    """
     if view == RGB_VIEW:
         return result.rgb, None, "gray"
     arr = np.asarray(result.component(view), dtype=np.float32)
     signed = view in _SIGNED
+    clean = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
     cmap = "coolwarm" if signed else ("hsv" if view == "phase" else "viridis")
     if view == "phase":
-        return arr, (0.0, float(2 * np.pi)), cmap
-    return arr, _auto_clim(arr, signed), cmap
+        return clean, (0.0, float(2 * np.pi)), cmap
+    # Contrast from `arr` (non-finite excluded by `_auto_clim`), pixels from
+    # `clean` — so an unmeasured position is drawn, not scaled against.
+    return clean, _auto_clim(arr, signed), cmap
 
 
 def emit_dpc_histogram(window_id, result: "_dpc.DpcResult", view: str,

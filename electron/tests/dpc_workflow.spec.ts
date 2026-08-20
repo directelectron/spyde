@@ -442,6 +442,61 @@ test('the Center tab offers all three references, each with its own furniture', 
   ctx.assertNoJsErrors()
 })
 
+test('a lazy scan streams the beam-shift pass through the real cluster', async () => {
+  const { page } = ctx
+  // The threaded ComputeBackend and the DISTRIBUTED one take different branches
+  // of `compute_chunks_progressive`; the Python suite covers the threaded one,
+  // so this is the branch only the real app reaches. Storage-aligned chunks
+  // (whole signal frames per chunk) so a "chunk" here is a real storage chunk.
+  // Wait for the NEW windows specifically. A bare `count() > 2` is already true
+  // — several tests' windows are still open — so it returns instantly and every
+  // locator below then resolves against the OLD dataset.
+  const before = await page.getByTestId('subwindow')
+    .filter({ has: page.getByTestId('subwindow-title').filter({ hasText: /S-Synthetic DPC$/ }) })
+    .count()
+  await backendAction(page, 'load_test_data_dpc',
+                      { nav: 24, sig: 40, lazy: true, nav_chunk: 8 })
+  const lazySigAll = page.getByTestId('subwindow')
+    .filter({ has: page.getByTestId('subwindow-title').filter({ hasText: /S-Synthetic DPC$/ }) })
+  await expect.poll(() => lazySigAll.count(),
+    { timeout: 180_000, message: 'the lazy dataset never opened a window' })
+    .toBe(before + 1)
+  const lazySig = lazySigAll.last()
+  await lazySig.getByTestId('subwindow-title').click()
+  await lazySig.getByTestId('subwindow-titlebar').hover()
+  await lazySig.getByTestId('action-btn-DPC').click()
+  // Carets are parented to their own window, so with the earlier dataset's
+  // caret still open a page-wide `getByTestId('dpc-wizard')` matches two.
+  // Scope to this window.
+  await expect(lazySig.getByTestId('dpc-wizard')).toBeVisible()
+
+  // It has to actually finish and produce a field — a stream that dispatches
+  // but never assembles would leave the descan readout empty forever.
+  await expect.poll(
+    () => lazySig.getByTestId('dpc-centering').getAttribute('data-worst'),
+    { timeout: 180_000, message: 'the streamed pass never produced a field' })
+    .toMatch(/\d/)
+  await expect.poll(() => colourStats(page, DPC_TITLE).then(s => s.saturated),
+    { timeout: 60_000, message: 'the streamed pass painted no map' })
+    .toBeGreaterThan(0.02)
+  await shot('14-lazy-streamed')
+
+  // No NaN holes left behind: every scan position must have been written.
+  const stats = await colourStats(page, DPC_TITLE)
+  expect(stats.hueBins, 'the streamed field looks incomplete')
+    .toBeGreaterThan(4)
+
+  // Clean up after ourselves. The teardown test below asserts that closing a
+  // caret leaves NO live DPC window, which only holds if this one's is gone.
+  // Re-focus first: the result window opened on top, and a toolbar is only
+  // reachable on the focused window.
+  await lazySig.getByTestId('subwindow-title').click()
+  await lazySig.getByTestId('subwindow-titlebar').hover()
+  await lazySig.getByTestId('action-btn-DPC').click()
+  await expect(lazySig.getByTestId('dpc-wizard')).toHaveCount(0)
+  ctx.assertNoJsErrors()
+})
+
 test('closing the caret removes the DPC window and the corner boxes', async () => {
   const { page } = ctx
   const sig = sourceWindow(page)
@@ -451,7 +506,9 @@ test('closing the caret removes the DPC window and the corner boxes', async () =
   await sig.getByTestId('subwindow-title').click()
   await sig.getByTestId('subwindow-titlebar').hover()
   await sig.getByTestId('action-btn-DPC').click()      // toggle OFF
-  await expect(page.getByTestId('dpc-wizard')).toHaveCount(0)
+  // Scoped to THIS window: the lazy-streaming test above leaves its own caret
+  // open on a different window, and carets are per-window.
+  await expect(sig.getByTestId('dpc-wizard')).toHaveCount(0)
   // The LIVE window must go; the committed tree from the previous test must
   // STAY (a Commit that vanishes when the caret closes is worthless).
   await expect.poll(() => dpcWindow(page).count(),

@@ -343,7 +343,17 @@ class TestHarnessMixin:
                 # field comes back stair-stepped.
                 data[iy, ix] = 1000.0 / (1.0 + np.exp((r - radius) / edge))
 
-        s = hs.signals.Signal2D(data)
+        # `lazy` gives a storage-aligned dask version (chunks span whole signal
+        # frames, Live-Display §1) so the streamed per-nav-chunk beam-shift pass
+        # can be exercised against a REAL cluster — a different branch of
+        # ComputeBackend.compute_chunks_progressive than the threaded one.
+        if payload.get("lazy"):
+            import dask.array as da
+            nav_chunk = int(payload.get("nav_chunk", max(2, n // 3)))
+            s = hs.signals.Signal2D(
+                da.from_array(data, chunks=(nav_chunk, nav_chunk, k, k))).as_lazy()
+        else:
+            s = hs.signals.Signal2D(data)
         try:
             s.set_signal_type("electron_diffraction")
         except Exception as e:

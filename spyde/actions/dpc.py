@@ -213,6 +213,41 @@ def _com_shift_frame(frame, keep, cx0: float, cy0: float):
     return np.array([cx0 - com_x, cy0 - com_y], dtype=np.float64)
 
 
+def beam_shift_graph(signal, *, method: str = "center_of_mass",
+                     half_square_width: int = 0,
+                     region: "BeamRegion | None" = None):
+    """The LAZY ``(ny, nx, 2)`` beam-shift array, or ``None`` on eager data.
+
+    Split out from :func:`measure_beam_shifts` so a caller that wants the pass
+    to arrive progressively can hand the graph to
+    ``ComputeBackend.compute_chunks_progressive`` instead of blocking on it.
+    The nav chunking is preserved end to end (no rechunk layer), which is what
+    makes per-nav-chunk streaming line up with the storage — see Live-Display §1
+    in CLAUDE.md and ``test_dpc.py::TestLazy``.
+    """
+    if not getattr(signal, "_lazy", False):
+        return None
+    try:
+        signal.set_signal_type("electron_diffraction")
+    except Exception as e:                                   # pragma: no cover
+        log.debug("set_signal_type(electron_diffraction) failed: %s", e)
+    if region is not None and region.active and str(method) == "center_of_mass":
+        sy, sx = _sig_shape(signal)
+        out = signal.map(_com_shift_frame, keep=region.mask((sy, sx)),
+                         cx0=sx / 2.0, cy0=sy / 2.0,
+                         inplace=False, ragged=False, lazy_output=True,
+                         output_signal_size=(2,), output_dtype=float,
+                         show_progressbar=False)
+    else:
+        kw: dict = {"method": str(method), "lazy_output": True}
+        hw = int(half_square_width or 0)
+        if hw > 0:
+            kw["half_square_width"] = hw
+        out = signal.get_direct_beam_position(**kw)
+    data = getattr(out, "data", None)
+    return data if hasattr(data, "chunks") else None
+
+
 def measure_beam_shifts(signal, *, method: str = "center_of_mass",
                         half_square_width: int = 0,
                         region: "BeamRegion | None" = None) -> np.ndarray:
@@ -924,8 +959,15 @@ def magnitude_phase_rgb(shifts: np.ndarray, *, rotation: float | None = None,
 
     *only_phase* drops the magnitude weighting so every pixel shows its
     direction at full saturation; useful where the field is weak but ordered.
+
+    Non-finite positions render BLACK rather than poisoning the image. They are
+    real and mean "no measurement here": a scan position still streaming in
+    during a progressive fill, or one whose beam region captured nothing. Left
+    in, a single NaN takes out the whole map, because ``autolim`` derives the
+    magnitude limits from a mean and standard deviation.
     """
-    bs = as_beam_shift(shifts)
+    bs = as_beam_shift(np.nan_to_num(np.asarray(shifts, dtype=np.float64),
+                                     nan=0.0, posinf=0.0, neginf=0.0))
     kw: dict = {"rotation": rotation, "add_color_wheel_marker": False}
     if only_phase:
         s_rgb = bs.get_phase_signal(**kw)

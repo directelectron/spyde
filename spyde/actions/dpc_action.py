@@ -19,13 +19,28 @@ maps that field. The physics is in :mod:`spyde.actions.dpc`; the figures in
     dpc_run            re-measure with a different method / search window
     dpc_commit         freeze the field as a new SignalTree
 
-**Measure once, tune forever.** The only expensive step is
-``get_direct_beam_position``, a full pass over the dataset. It runs at open (and
-again only if the *method* or search window changes) and the ``(ny, nx, 2)``
-result is cached. Centering, rotation, handedness and calibration are then all
-pure arithmetic on that small array, which is what lets the rotation slider be
-genuinely live instead of a click-and-wait. Do not move the measure into
-``dpc_tune``.
+**Measure once, tune forever.** The only expensive step is the beam-shift pass
+over the dataset. It runs at open (and again only if the *method*, the search
+window or the beam region changes) and the ``(ny, nx, 2)`` result is cached.
+Centering, rotation, handedness and calibration are then all pure arithmetic on
+that small array, which is what lets the rotation slider be genuinely live
+instead of a click-and-wait. Do not move the measure into ``dpc_tune``.
+
+**That one pass STREAMS on lazy data.** It is dispatched per navigation chunk
+through ``ComputeBackend.compute_chunks_progressive`` and the map repaints as
+each chunk lands, so a scan that takes minutes shows a field filling in rather
+than a spinner. Two properties make that work and are worth not breaking:
+
+* the lazy graph keeps the dataset's own nav chunking (no rechunk layer), so a
+  streamed "chunk" is a STORAGE chunk and the dispatch granularity matches what
+  the reader actually reads — Live-Display §1;
+* partial state is ``NaN``, which every downstream stage already tolerates: the
+  plane fits mask on ``isfinite``, the rotation estimator drops non-finite
+  gradients, and the display paints non-finite black instead of letting one
+  poison the contrast. So the map genuinely fills in rather than appearing at
+  the end.
+
+Eager data (already in RAM) has nothing to stream and runs in one go.
 
 **The three ways to find zero.** A DPC map is a map of DIFFERENCES from the
 undeflected beam position, so it is only as good as the zero it is measured
@@ -80,7 +95,7 @@ from spyde.actions import dpc_display as _display
 from spyde.actions.context import current_signal as _current_signal
 from spyde.actions.context import src_plot_tree as _src_plot_tree
 from de_shell.actions.wizard import WizardController
-from de_shell.ipc import emit, emit_error, emit_status
+from de_shell.ipc import emit, emit_error, emit_progress, emit_status
 
 log = logging.getLogger(__name__)
 
@@ -282,7 +297,13 @@ class DpcWizard(WizardController):
                                r_inner=float(p.get("beam_r_inner") or 0.0))
 
     def measure(self, *, on_done=None) -> None:
-        """Measure the direct-beam position over the whole scan, off-thread."""
+        """Measure the direct-beam position over the whole scan, off-thread.
+
+        On a LAZY dataset this streams: the pass is dispatched per nav chunk and
+        the map is repainted as each lands, so a multi-minute scan shows a field
+        filling in rather than a spinner. On eager data (already in RAM) there
+        is nothing to stream and it runs in one go.
+        """
         signal = self.signal
         if signal is None:
             emit_error("DPC: no active dataset")
@@ -294,24 +315,114 @@ class DpcWizard(WizardController):
         gen = self.guard()
         emit_status("DPC: locating the direct beam…")
 
-        def _work():
-            return _dpc.measure_beam_shifts(signal, method=method,
-                                            half_square_width=hw, region=region)
-
-        def _apply(shifts):
+        def _finish(shifts):
             if not self.still(gen) or self._closed:
                 return
-            self.shifts = shifts
-            self.report = _dpc.centering_report(shifts)
-            self._warn_if_region_missed(shifts, region, sig_shape)
+            self.shifts = np.asarray(shifts, dtype=np.float64)
+            self.report = _dpc.centering_report(self.shifts)
+            self._warn_if_region_missed(self.shifts, region, sig_shape)
+            self._set_computing(False)
+            emit_progress(1, 1, "DPC")
             self.emit_state()
             self.refresh()
             if on_done is not None:
                 on_done()
 
-        self.run_on_worker(_work, name="dpc-measure", on_done=_apply,
+        if self._measure_progressive(signal, method, hw, region, gen, _finish):
+            return
+
+        def _work():
+            return _dpc.measure_beam_shifts(signal, method=method,
+                                            half_square_width=hw, region=region)
+
+        self.run_on_worker(_work, name="dpc-measure", on_done=_finish,
                            on_error=lambda e: emit_error(f"DPC: locating the "
                                                          f"direct beam failed: {e}"))
+
+    def _measure_progressive(self, signal, method, hw, region, gen, on_finish
+                             ) -> bool:
+        """Stream the beam-shift pass per nav chunk. False → not applicable.
+
+        Uses ``ComputeBackend.compute_chunks_progressive``, which dispatches one
+        task per nav chunk and calls back from a worker thread as each lands.
+        The lazy graph keeps the dataset's own nav chunking (no rechunk layer),
+        so a "chunk" here is a storage chunk — the streaming granularity matches
+        what the reader actually reads (Live-Display §1).
+
+        Partial state is NaN, which every stage downstream already tolerates:
+        the plane fits mask on ``isfinite``, the rotation estimator drops
+        non-finite gradients, and the display paints non-finite black rather
+        than letting one poison the contrast. So the map genuinely fills in.
+        """
+        backend = getattr(self.session, "compute_backend", None)
+        if backend is None or not hasattr(backend, "compute_chunks_progressive"):
+            return False
+        try:
+            graph = _dpc.beam_shift_graph(signal, method=method,
+                                          half_square_width=hw, region=region)
+        except Exception as e:
+            log.debug("building the DPC beam-shift graph failed: %s", e)
+            return False
+        if graph is None:                       # eager data — nothing to stream
+            return False
+
+        ny, nx = int(graph.shape[0]), int(graph.shape[1])
+        partial = np.full((ny, nx, 2), np.nan, dtype=np.float64)
+        total = max(1, len(graph.chunks[0]) * len(graph.chunks[1]))
+        done = [0]
+        self.shifts = partial
+        self._set_computing(True)
+
+        def _on_chunk(chunk, slices):
+            """Worker thread — marshal the paint onto the main loop."""
+            if self._closed or not self.still(gen):
+                return
+            try:
+                partial[slices] = np.asarray(chunk, dtype=np.float64)
+            except Exception as e:                           # pragma: no cover
+                log.debug("storing a DPC chunk failed: %s", e)
+                return
+            done[0] += 1
+            n = done[0]
+            dispatch = getattr(self.session, "_dispatch_to_main", None)
+            paint = lambda: self._on_partial(gen, n, total)   # noqa: E731
+            dispatch(paint) if dispatch is not None else paint()
+
+        try:
+            future = backend.compute_chunks_progressive(graph, 2, _on_chunk)
+        except Exception as e:
+            log.debug("progressive DPC dispatch failed (%s) — running in one "
+                      "pass instead", e)
+            return False
+
+        def _settled(fut):
+            try:
+                result = fut.result()
+            except Exception as e:
+                emit_error(f"DPC: locating the direct beam failed: {e}")
+                self._set_computing(False)
+                return
+            dispatch = getattr(self.session, "_dispatch_to_main", None)
+            finish = lambda: on_finish(result)                # noqa: E731
+            dispatch(finish) if dispatch is not None else finish()
+
+        future.add_done_callback(_settled)
+        return True
+
+    def _on_partial(self, gen: int, done: int, total: int) -> None:
+        """Repaint from what has landed so far (main thread)."""
+        if self._closed or not self.still(gen):
+            return
+        emit_progress(done, total, "DPC: locating the direct beam")
+        self.refresh()
+
+    def _set_computing(self, computing: bool) -> None:
+        """Drive the window's "Calculating…" overlay. Every True is paired."""
+        try:
+            from de_shell.ipc import emit_window_computing
+            emit_window_computing(self.window_id, bool(computing))
+        except Exception as e:                               # pragma: no cover
+            log.debug("DPC computing marker failed: %s", e)
 
     def _warn_if_region_missed(self, shifts, region, sig_shape) -> None:
         """Say so when the region is not actually on the beam.

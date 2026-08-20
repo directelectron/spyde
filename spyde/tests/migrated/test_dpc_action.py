@@ -448,6 +448,71 @@ class TestLive:
         assert calls["n"] == 0, "a live parameter change re-measured the dataset"
         assert wiz.params["rotation"] == 200.0 and wiz.params["flip"] is True
 
+    def test_a_lazy_scan_fills_in_progressively(self, window):
+        """On lazy data the pass streams per nav chunk and the map repaints as
+        each lands — the difference between a filling field and a spinner on a
+        scan that takes minutes.
+
+        Asserted on the PROGRESS stream and on partial state, not on timing: a
+        single final repaint would emit one progress message and never expose a
+        half-NaN field.
+        """
+        import dask.array as da
+        import hyperspy.api as hs
+        session = window["window"]
+        nav, sig, chunk = 16, 24, 8
+        gy, gx = np.mgrid[0:sig, 0:sig].astype(np.float32)
+        frame = 1000.0 / (1 + np.exp((np.hypot(gx - 14, gy - 10) - 5) / 1.5))
+        arr = da.from_array(np.tile(frame, (nav, nav, 1, 1)),
+                            chunks=(chunk, chunk, sig, sig))
+        s = hs.signals.Signal2D(arr).as_lazy()
+        s.set_signal_type("electron_diffraction")
+        session._add_signal(s)
+        assert _wait(lambda: _signal_plot(session) is not None)
+        plot = _signal_plot(session)
+
+        seen_partial = []
+        real_refresh = dpca.DpcWizard.refresh
+
+        def spy(self):
+            if self.shifts is not None:
+                finite = int(np.isfinite(self.shifts).all(axis=-1).sum())
+                seen_partial.append(finite)
+            return real_refresh(self)
+
+        dpca.DpcWizard.refresh = spy
+        try:
+            dpca.dpc_open(session, plot, {})
+            wiz = _wait(lambda: getattr(plot.signal_tree, "_dpc_wizard", None)
+                        is not None) and plot.signal_tree._dpc_wizard
+            assert _wait(lambda: wiz.shifts is not None
+                         and np.isfinite(wiz.shifts).all(), timeout=60.0), \
+                "the streamed pass never completed"
+        finally:
+            dpca.DpcWizard.refresh = real_refresh
+
+        total_positions = nav * nav
+        assert seen_partial, "the map was never repainted"
+        assert seen_partial[-1] == total_positions, "the final paint is partial"
+        # The whole claim: at least one repaint happened while the field was
+        # still incomplete.
+        assert any(0 < n < total_positions for n in seen_partial), \
+            f"no partial repaint — the map only appeared at the end: {seen_partial}"
+
+        progress = [m for m in window["messages"]
+                    if isinstance(m, dict) and m.get("type") == "progress"
+                    and "DPC" in str(m.get("label", ""))]
+        assert len(progress) >= 2, f"progress was not streamed: {progress}"
+        assert progress[0]["total"] == (nav // chunk) ** 2, \
+            "progress should count NAV CHUNKS, matching the storage layout"
+
+    def test_an_eager_scan_does_not_pretend_to_stream(self, window):
+        """Nothing to stream when the data is already in RAM — it runs in one
+        pass rather than through the chunk dispatcher."""
+        session, plot, _tree, wiz = _opened(window)
+        assert not getattr(wiz.signal, "_lazy", False)
+        assert wiz.shifts is not None and np.isfinite(wiz.shifts).all()
+
     def test_re_measure_is_the_only_thing_that_re_measures(self, window):
         session, plot, _tree, wiz = _opened(window)
         first = wiz.shifts.copy()
