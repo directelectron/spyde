@@ -36,6 +36,8 @@ Slow benchmarks live in `spyde/tests/benchmark_*.py` — run directly (`python -
 
 **Commits:** do NOT add Claude/AI as a co-author. Commit messages must not include a `Co-Authored-By: Claude …` (or `Claude-Session`) trailer. (Enforced via `includeCoAuthoredBy: false` + empty `attribution` in `~/.claude/settings.json`.)
 
+**Working notes are NOT tracked:** plan / handoff / parity / checklist Markdown (`HANDOFF.md`, `docs/notes/*.md`, `OVERNIGHT.md`, and the like) is scratch belonging to ONE branch — do not `git add` it. A fact worth keeping goes in a test, a docstring, or the commit message, where it stays true; a checklist file just rots into a description of an app that no longer exists. If such a file does get committed on a branch, **delete it as part of merging that branch** (or in a cleanup commit right after) — it must not survive into `main`. The only Markdown that belongs in the repo long-term is `README.md`, this file, `spyde/actions/README.md`, `electron/tests/README.md`, and `ARCHITECTURE-SPLIT.md` (a live cross-repo divergence ledger, cited from `packages/de-shell/de_shell/__init__.py`, `packages/de-shell/tests/test_boundary.py`, and `pyproject.toml`).
+
 ## Dependencies
 
 Python deps are in `pyproject.toml`. Key non-PyPI deps from custom forks (check `pyproject.toml` for the exact pinned branch — they move):
