@@ -86,12 +86,14 @@ def _integrator_for(plot):
 def _invalidate_integrator(plot) -> None:
     """Drop any running region sum on ``plot`` — call wherever the frame caches
     are cleared, since the sum was built out of those frames."""
-    integ = getattr(plot, "_region_integrator", None)
-    if integ is not None:
+    integrator = getattr(plot, "_region_integrator", None)
+    if integrator is not None:
         try:
-            integ.invalidate()
-        except Exception:
-            pass
+            integrator.invalidate()
+        except Exception as e:
+            # A sum that will not invalidate keeps serving frames that have
+            # already been dropped from the cache, so the region would go stale.
+            log.warning("invalidating the region sum failed: %s", e)
 
 
 def _try_per_frame_reader(plot, signal, data):

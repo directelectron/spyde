@@ -22,9 +22,13 @@ branch for a new backing, not any call site.
 """
 from __future__ import annotations
 
+import logging
+
 from .readers.binary import BinaryReader, find_memmap_source
 from .readers.local_transform import LocalTransformReader
 from .readers.source_array import SourceArrayReader, find_source_array
+
+log = logging.getLogger(__name__)
 
 
 def resolve_reader(signal, data, block_cache=None):
@@ -38,16 +42,31 @@ def resolve_reader(signal, data, block_cache=None):
         try:
             return BinaryReader(signal, data, kwargs)
         except Exception:
-            pass  # fall through to the next kind
+            # The finder matched, so this kind was expected to work. Falling
+            # through is correct, but it costs read speed for the life of the
+            # signal, so it must not happen quietly.
+            log.warning(
+                "BinaryReader matched but would not build; falling back to a "
+                "slower reader for this signal.", exc_info=True,
+            )
 
     source = find_source_array(data)
     if source is not None:
         try:
             return SourceArrayReader(signal, data, source, block_cache=block_cache)
         except Exception:
-            pass  # fall through to the universal reader
+            log.warning(
+                "SourceArrayReader matched but would not build; falling back to "
+                "the universal reader for this signal.", exc_info=True,
+            )
 
     try:
         return LocalTransformReader(signal, data, block_cache=block_cache)
     except Exception:
+        # No reader at all: every frame read for this signal now goes the slow
+        # way round, which looks like a mysterious performance cliff.
+        log.warning(
+            "No frame reader could be built; this signal will read without the "
+            "array cache.", exc_info=True,
+        )
         return None

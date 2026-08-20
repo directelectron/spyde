@@ -1216,7 +1216,7 @@ class Plot:
         try:
             cache.restore() if focused else cache.demote()
         except Exception as e:
-            log.debug("block cache focus resize failed: %s", e)
+            logger.debug("block cache focus resize failed: %s", e)
 
     def set_plot_state(self, signal) -> None:
         old_state = self.plot_state
@@ -1349,32 +1349,32 @@ class Plot:
         # Drop any held get_inds futures (let the scheduler release them).
         try:
             self._inflight_getinds.clear()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("releasing held get_inds futures on plot close failed: %s", e)
         # Cancel any in-flight expensive-tier navigator read.
-        nf = self._nav_future
-        if nf is not None:
+        nav_future = self._nav_future
+        if nav_future is not None:
             try:
-                nf.cancel()
-            except Exception:
-                pass
+                nav_future.cancel()
+            except Exception as e:
+                logger.debug("cancelling the navigator read on plot close failed: %s", e)
             self._nav_future = None
         # Release cached decoded frames and blocks.
         if self._array_cache is not None:
             try:
                 self._array_cache.clear()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("clearing the frame cache on plot close failed: %s", e)
         if self._block_cache is not None:
             try:
                 self._block_cache.clear()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("clearing the block cache on plot close failed: %s", e)
         try:
             from spyde.array_cache import close_all_readers
             close_all_readers(self)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("closing frame readers on plot close failed: %s", e)
         # Drop any MDI overlay layers ON this plot (their anyplotlib handles) AND
         # any layers on OTHER plots that source FROM this one — so closing either a
         # target or a source leaves no dangling handle / stale composited image.

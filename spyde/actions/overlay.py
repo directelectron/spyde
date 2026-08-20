@@ -266,7 +266,12 @@ def _read_source_frame(source_plot, indices, integrating=False, layer=None):
                 if isinstance(data[0], Future):
                     return None
             except Exception:
-                pass
+                # Distributed may not be installed, and indexing a placeholder
+                # array can fail; neither is a reason to stop reading.
+                log.debug(
+                    "Could not test the signal for a loading placeholder.",
+                    exc_info=True,
+                )
             nav_dim = current_signal.axes_manager.navigation_dimension
             frame_shape = data.shape[nav_dim:]
             frame_bytes = int(np.prod(frame_shape)) * data.dtype.itemsize
@@ -292,7 +297,15 @@ def _read_source_frame(source_plot, indices, integrating=False, layer=None):
                     try:
                         cached_arr._client = None
                     except Exception:
-                        pass
+                        # Failing here does not break the read, it makes it slow:
+                        # the cache keeps its client and every frame goes the
+                        # distributed way round. Debug rather than warning
+                        # because this sits on the per-frame path.
+                        log.debug(
+                            "Could not pin the frame cache to a synchronous read; "
+                            "this navigator will use the slower distributed path.",
+                            exc_info=True,
+                        )
                 frame = np.asarray(
                     current_signal._get_cache_dask_chunk(idx, get_result=True))
                 src_dtype = getattr(current_signal.data, "dtype", None)
