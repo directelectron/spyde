@@ -223,6 +223,33 @@ class TestCentering:
         assert "dpc_corners" not in _markers(plot._plot2d), \
             "the corner boxes belong on the navigator, not the pattern"
 
+    def test_the_drawn_boxes_cover_exactly_the_fitted_pixels(self, window):
+        """The overlay is a promise about WHICH scan positions the plane is
+        fitted through, so it has to be the same pixels, to the edge.
+
+        ``corner_boxes`` gives pixel INDICES; ``add_rectangles`` takes centres.
+        Pixel ``i`` covers ``[i - 0.5, i + 0.5]``, so a block over indices 0..1
+        spans ``[-0.5, 1.5]`` and is centred on 0.5 — not on ``x + w/2``, which
+        is 1.0. Getting that wrong shifts every box half a pixel toward the
+        bottom-right: a visible gap inside the top-left corner, an overhang past
+        the bottom-right edge, and boxes that no longer mark what is measured.
+        """
+        from spyde.actions import dpc as _dpc
+        session, plot, _tree, wiz = _opened(window, center_mode="corners")
+        drawn = wiz._corner_mg._data
+        got = sorted(
+            (float(cx) - float(w) / 2, float(cx) + float(w) / 2,
+             float(cy) - float(h) / 2, float(cy) + float(h) / 2)
+            for (cx, cy), w, h in zip(drawn["offsets"], drawn["widths"],
+                                      drawn["heights"]))
+        # The fit's own slices, converted to the pixel EDGES they cover.
+        want = sorted(
+            (cols.start - 0.5, cols.stop - 0.5, rows.start - 0.5, rows.stop - 0.5)
+            for rows, cols in _dpc.corner_slices(
+                wiz._nav_shape(), float(wiz.params["corner_fraction"])))
+        assert got == pytest.approx(want), \
+            "the drawn corner boxes do not cover the pixels the plane is fitted through"
+
     def test_the_box_size_slider_resizes_them_in_place(self, window):
         session, plot, _tree, wiz = _opened(window, center_mode="corners")
         first = wiz._corner_mg

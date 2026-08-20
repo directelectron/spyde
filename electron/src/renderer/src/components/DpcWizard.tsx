@@ -249,9 +249,15 @@ export function DpcWizard({ caretPos, windowId, sendAction, onClose }: Props) {
       setStatus(c.centered
         ? `Already centered (${c.worst.toFixed(2)} px residual) — skip to Rotation.`
         : `Descan: ${c.worst.toFixed(2)} px. Pick how to remove it.`)
-      // Nothing to remove → don't apply a correction for its own sake.
+      // Nothing to remove → don't apply a correction for its own sake. The
+      // backend has to be told: it opened on `corners`, so a caret that
+      // switched only its own state would show `none` while the result it
+      // displays and commits was still centred on the corner plane. Not
+      // `setCenter`, which would overwrite the status line just set above.
       if (c.centered && vals.current.centerMode === DEFAULTS.centerMode) {
         setCenterMode('none')
+        vals.current = { ...vals.current, centerMode: 'none' }
+        sendAction('dpc_set_center', params(), windowId)
       }
     }
   })

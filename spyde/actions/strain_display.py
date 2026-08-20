@@ -23,7 +23,7 @@ import logging
 import numpy as np
 
 from spyde.actions.strain_mapping import StrainField
-from spyde.actions._common import STRAIN_TITLES as _COMPONENTS
+from spyde.actions._common import STRAIN_TITLES as _COMPONENTS, robust_map_limits
 
 logger = logging.getLogger(__name__)
 
@@ -35,14 +35,8 @@ def _component_map(field: StrainField, component: str) -> np.ndarray:
 
 
 def _auto_clim(arr: np.ndarray) -> tuple[float, float]:
-    """Symmetric colour limits from the robust (98th-pct) magnitude of the FINITE
-    values (failed pixels are NaN and excluded, so they can't stretch the scale)."""
-    finite = arr[np.isfinite(arr)]
-    if finite.size == 0:
-        return (-1.0, 1.0)
-    v = float(np.percentile(np.abs(finite), 98))
-    v = v if v > 0 else 1.0
-    return (-v, v)
+    """Symmetric colour limits — every strain component's zero is meaningful."""
+    return robust_map_limits(arr, symmetric=True)
 
 
 def emit_strain_histogram(window_id, field: StrainField, component: str,
