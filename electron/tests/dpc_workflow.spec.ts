@@ -188,9 +188,13 @@ async function colorPixelsIn(page: import('@playwright/test').Page,
   return n
 }
 
-/** #f9e2af — the four corner boxes. */
+/**
+ * #ff3030 — the four corner boxes. Red, and deliberately not the teal beam
+ * region or Center Zero Beam's yellow: `r - g > 60` is what separates it from
+ * that yellow (#f9e2af sits at r - g = 23), so keep that clause if you retune.
+ */
 const IS_CORNER = (r: number, g: number, b: number) =>
-  r > 200 && g > 180 && b > 120 && b < 215 && r - b > 40
+  r > 200 && g < 190 && r - g > 60 && r - b > 40
 /** #94e2d5 — the beam region (circle / ring). */
 const IS_BEAM = (r: number, g: number, b: number) =>
   g > 190 && b > 170 && r < 190 && g - r > 40
@@ -218,8 +222,8 @@ test('DPC: centre, solve the rotation, read the field off the colour wheel', asy
 
   // ── 2. Corners mode draws four boxes on the NAVIGATOR ─────────────────────
   // They select SCAN positions, so the navigator is the only window they can
-  // mean anything on. #f9e2af is unique to them in this app, and counting it on
-  // the navigator specifically is what proves they did not land on the pattern.
+  // mean anything on. #ff3030 is unique to them here, and counting it on the
+  // navigator specifically is what proves they did not land on the pattern.
   await expect(page.getByTestId('dpc-center-mode'))
     .toHaveAttribute('data-value', 'corners')
   const cornerPixels = () => colorPixelsIn(page, nav, IS_CORNER)

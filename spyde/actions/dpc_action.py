@@ -131,8 +131,13 @@ DEFAULTS: dict = {
 #: Colours for the on-plot furniture. Distinct from the navigator's green
 #: crosshair and from Center Zero Beam's yellow, so two open carets never look
 #: like one.
-_CORNER_COLOR = "#f9e2af"      # the four corner boxes on the navigator
+_CORNER_COLOR = "#ff3030"      # the four corner boxes on the navigator (as
+                               # in vector_overlay — this repo's on-plot red)
 _BEAM_COLOR = "#94e2d5"        # the beam region (circle / ring) on the DP
+
+#: The corner boxes sit on a navigator that is usually busy, so they carry a
+#: heavier edge than the other furniture to stay findable against it.
+_CORNER_LINEWIDTH = 3.0
 
 #: Re-measuring the whole scan is the one expensive step, so a DRAG must not
 #: trigger it per frame. The widget and the readouts follow the pointer live;
@@ -268,6 +273,7 @@ class DpcWizard(WizardController):
         self._beam_handler = None                   # kept alive (weak callback)
         self._beam_dragging = False                 # re-entrancy guard
         self._settle_timer = None                   # drag → debounced re-measure
+        self._last_brightness = None                # re-sent during a drag
 
     # ── the source signal ────────────────────────────────────────────────────
 
@@ -665,7 +671,7 @@ class DpcWizard(WizardController):
             self._corner_mg = plot2d.add_rectangles(
                 offsets, widths, heights, name="dpc_corners",
                 edgecolors=_CORNER_COLOR, facecolors=_CORNER_COLOR,
-                linewidths=1.5, alpha=0.22)
+                linewidths=_CORNER_LINEWIDTH, alpha=0.22)
         except Exception as e:                               # pragma: no cover
             log.debug("drawing the DPC corner boxes failed: %s", e)
 
@@ -732,7 +738,7 @@ class DpcWizard(WizardController):
                                              color=_BEAM_COLOR)
             w._dpc_shape = shape
             from spyde.drawing.selectors.base_selector import event_handler_fn
-            handler = event_handler_fn(lambda event: self._on_region_drag())
+            handler = event_handler_fn(lambda event: self._on_region_drag(event))
             w.add_event_handler(handler, "pointer_move", "pointer_up")
             self._beam_widget, self._beam_handler = w, handler
         except Exception as e:                               # pragma: no cover
@@ -747,8 +753,18 @@ class DpcWizard(WizardController):
                 log.debug("hiding the DPC beam region failed: %s", e)
             self._beam_widget = self._beam_handler = None
 
-    def _on_region_drag(self) -> None:
-        """Read the widget back, echo it live, and arm the re-measure.
+    def _on_region_drag(self, event=None) -> None:
+        """Read the widget back, echo its geometry, and on RELEASE re-measure.
+
+        Everything expensive waits for ``pointer_up``. A drag frame only reads
+        the widget and echoes numbers the caret already has in hand.
+
+        The brightness readout is what makes this necessary. It reads a frame,
+        which on a lazy signal is a dask compute, and one per pointer frame
+        queues work faster than it drains — the caret's own radius then keeps
+        climbing for a while after the pointer stops, because the messages
+        behind it are still landing. Same reason the Fit caret sends its state
+        on release only (see ``background_action._on_window_drag``).
 
         RE-ENTRANCY GUARD: anyplotlib ``Widget.set()`` fires ``pointer_move``
         unconditionally — even on a no-change write — so anything here that
@@ -771,8 +787,10 @@ class DpcWizard(WizardController):
             log.debug("reading the DPC beam region failed: %s", e)
         finally:
             self._beam_dragging = False
-        self.emit_region()
-        self.arm_region_settle()
+        released = str(getattr(event, "event_type", "") or "") == "pointer_up"
+        self.emit_region(with_brightness=released)
+        if released:
+            self.arm_region_settle()
 
     def arm_region_settle(self) -> None:
         """(Re)start the debounce that re-measures once the drag stops.
@@ -806,17 +824,26 @@ class DpcWizard(WizardController):
         self._settle_timer.daemon = True
         self._settle_timer.start()
 
-    def emit_region(self) -> None:
-        """Live region geometry + how bright it is, for the caret's readout."""
+    def emit_region(self, with_brightness: bool = True) -> None:
+        """Live region geometry + how bright it is, for the caret's readout.
+
+        ``with_brightness=False`` re-sends the last measured value instead of
+        reading a frame for a new one. Mid-drag the geometry is what the caret
+        needs to track the pointer; the brightness costs a frame read and is
+        recomputed on release. Re-sending the last value rather than ``None``
+        keeps the readout from blanking on every drag.
+        """
         region = self.region()
         signal = self.signal
-        brightness = (_dpc.region_brightness(signal, region)
-                      if signal is not None else float("inf"))
+        if with_brightness:
+            brightness = (_dpc.region_brightness(signal, region)
+                          if signal is not None else float("inf"))
+            self._last_brightness = (None if not np.isfinite(brightness)
+                                     else float(brightness))
         emit({"type": "dpc_region", "window_id": self.caret_window_id,
               "result_window_id": self.window_id,
               **region.as_dict(),
-              "brightness": (None if not np.isfinite(brightness)
-                             else float(brightness))})
+              "brightness": self._last_brightness})
 
     def sync_overlays(self) -> None:
         """Show exactly the furniture the current state needs.
