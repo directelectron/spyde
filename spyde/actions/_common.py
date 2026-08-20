@@ -18,6 +18,35 @@ STRAIN_TITLES: dict[str, str] = {
 }
 
 
+def robust_map_limits(array: np.ndarray, *, symmetric: bool = False
+                      ) -> tuple[float, float]:
+    """Display limits for a per-position RESULT map, ignoring failed positions.
+
+    Percentiles rather than the extremes: a handful of failed fits or edge
+    positions otherwise stretch the scale until the real structure is one flat
+    mid-tone. Non-finite values are dropped, so a map still filling in during a
+    progressive pass neither blanks nor rescales.
+
+    ``symmetric`` is for a quantity whose ZERO means something — a strain
+    component, a field component, divergence, curl. Those want ``(-v, v)`` so
+    the midpoint of a diverging colormap lands on zero; an unsigned magnitude
+    wants the plain 2nd-to-98th spread.
+
+    Distinct from ``de_shell.plotting.figure.robust_levels``, which is for a
+    detector FRAME on the paint path: that one subsamples for speed and has no
+    notion of a signed quantity, because a frame's zero is just its floor.
+    """
+    finite = array[np.isfinite(array)]
+    if finite.size == 0:
+        return (-1.0, 1.0)
+    if symmetric:
+        magnitude = float(np.percentile(np.abs(finite), 98)) or 1.0
+        return (-magnitude, magnitude)
+    low = float(np.percentile(finite, 2))
+    high = float(np.percentile(finite, 98))
+    return (low, high) if high > low else (low, low + 1.0)
+
+
 def reciprocal_radius(signal) -> float:
     """Max reciprocal radius from the signal-axis calibration (Å⁻¹).
 

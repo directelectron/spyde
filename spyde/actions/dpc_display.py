@@ -1,41 +1,22 @@
 """
-dpc_display.py — the DPC result view: an RGB direction map with a circular
-phase-direction legend, plus the scalar component maps.
+dpc_display.py — the DPC result view.
 
-The window has two parts:
+The map is either the RGB direction image (hue = field direction, brightness =
+magnitude) or one scalar component (Ex, Ey, |E|, divergence, curl). Over it sits
+the colour wheel: the legend saying which hue means which direction.
 
-* the **map** — either the magnitude/phase RGB image (hue = field direction,
-  brightness = magnitude) or one scalar component (Ex, Ey, |E|, divergence,
-  curl) on a diverging colormap;
-* the **colour wheel** — the legend saying which hue means which direction,
-  pinned over the map as a native anyplotlib **key** (``Plot2D.add_key``), the
-  same primitive the IPF colour triangle uses.
+Three things here are deliberate and will look wrong to change:
 
-A key, not an inset. An inset is a floating window with a title bar and its own
-canvas stack — the right tool for a live sub-plot, and the wrong one for a
-legend: it sat on the map like a panel, and it was one more thing to keep
-painted. A key is a static picture that floats in screen space with no chrome,
-reads as part of the figure the way a scale bar does, and is included in a PNG
-export.
+* **The wheel is a key, not an inset.** A key is a static picture floating in
+  screen space with no chrome, like a scale bar, and it lands in a PNG export.
+  An inset is a window with a title bar and its own canvas to keep painted.
+* **The wheel is always shown, not on hover.** The hues mean nothing without it.
+* **The wheel is built ONCE**, at ``dpc.DISPLAY_ROTATION``. The rotation is
+  applied to the shift vectors before colouring, so the colour→direction mapping
+  never changes. Rebuilding it at ``result.rotation`` applies that angle twice
+  and points the legend away from the map it describes.
 
-It is shown ALWAYS, not on hover. A direction map is unreadable without its
-key — the hues mean nothing on their own — so hiding it until the pointer
-arrives hides the thing that makes the picture interpretable. It costs a corner
-of a map whose corners carry no data anyway. (``hover_only`` is still what a
-dense, self-explanatory map like the IPF triangle's wants; this one is not
-that.)
-
-The wheel is built ONCE. The scan↔detector rotation is applied to the shift
-VECTORS before the field is coloured, so the colour→direction mapping is the
-same at every rotation (``dpc.DISPLAY_ROTATION``). Re-rendering the legend at
-``result.rotation`` — the obvious-looking thing, and what an earlier version
-did — applies that angle a second time and leaves the legend pointing
-``rotation`` degrees away from the map it describes.
-
-Contrast follows the same rule as ``strain_display``: it belongs to the plot
-widget dock, not to the wizard. Scalar components emit the standard sidebar
-histogram and honour the dock's ``set_clim`` / ``set_colormap``. The RGB map has
-no scalar contrast to set, so it emits none.
+Contrast belongs to the plot dock, not the wizard — same as ``strain_display``.
 
 No Qt. Host-agnostic (Electron + Jupyter).
 """
@@ -46,6 +27,7 @@ import logging
 import numpy as np
 
 from spyde.actions import dpc as _dpc
+from spyde.actions._common import robust_map_limits
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +36,12 @@ logger = logging.getLogger(__name__)
 WHEEL_SIZE = 0.26
 WHEEL_CORNER = "bottom-right"
 WHEEL_PX = 192
+#: The scale caption is centred under the key and is WIDER than it, so it
+#: overhangs on both sides. At the default 10 px margin that overhang runs off
+#: the panel and the units get cut in half. Keep the gap bigger than the
+#: overhang, and keep the caption short — see `wheel_scale_label`.
+WHEEL_MARGIN = 16.0
+WHEEL_LABEL_SIZE = 8.0
 #: No card behind it — the wheel's own alpha makes it a disc on the map rather
 #: than a rectangle sitting on top of it.
 WHEEL_BG = "none"
@@ -64,11 +52,20 @@ WHEEL_BG = "none"
 #: on screen (image convention, the same direction the navigator's y axis
 #: increases), so a wheel labelled "up" would be describing −y — and a legend
 #: that needs a footnote is not a legend.
+#:
+#: Pulled INSIDE the disc rather than sitting on its edge, where they hung off
+#: the wheel and had the map behind them. Black, because the rim is bright and
+#: fully saturated at every angle — white reads on the blues and disappears on
+#: the yellows.
 WHEEL_LABELS = [
-    {"x": 0.5, "y": 0.045, "text": "−y", "size": 9, "align": "center"},
-    {"x": 0.5, "y": 0.985, "text": "+y", "size": 9, "align": "center"},
-    {"x": 0.02, "y": 0.53, "text": "−x", "size": 9, "align": "left"},
-    {"x": 0.98, "y": 0.53, "text": "+x", "size": 9, "align": "right"},
+    {"x": 0.50, "y": 0.15, "text": "−y", "size": 10, "color": "#000000",
+     "align": "center"},
+    {"x": 0.50, "y": 0.88, "text": "+y", "size": 10, "color": "#000000",
+     "align": "center"},
+    {"x": 0.13, "y": 0.54, "text": "−x", "size": 10, "color": "#000000",
+     "align": "left"},
+    {"x": 0.87, "y": 0.54, "text": "+x", "size": 10, "color": "#000000",
+     "align": "right"},
 ]
 
 #: The RGB direction map isn't one of `dpc.COMPONENTS` — it's the default view.
@@ -87,21 +84,8 @@ def view_titles(mode: str, units: str) -> dict[str, str]:
 
 
 def _auto_clim(arr: np.ndarray, signed: bool) -> tuple[float, float]:
-    """Robust display limits — symmetric about 0 for a signed component.
-
-    The 98th percentile of |value| rather than the extremes: a handful of
-    failed-fit or edge pixels otherwise stretch the scale until the real
-    structure is a flat mid-tone.
-    """
-    finite = arr[np.isfinite(arr)]
-    if finite.size == 0:
-        return (-1.0, 1.0)
-    if signed:
-        v = float(np.percentile(np.abs(finite), 98)) or 1.0
-        return (-v, v)
-    lo = float(np.percentile(finite, 2))
-    hi = float(np.percentile(finite, 98))
-    return (lo, hi) if hi > lo else (lo, lo + 1.0)
+    """Robust display limits — symmetric about 0 for a signed component."""
+    return robust_map_limits(arr, symmetric=signed)
 
 
 def view_array(result: "_dpc.DpcResult", view: str
@@ -172,14 +156,33 @@ def build_dpc_figure(result: "_dpc.DpcResult", *, view: str = RGB_VIEW,
         except Exception as e:                               # pragma: no cover
             logger.debug("set_clim on DPC map failed: %s", e)
 
-    wheel_key = attach_wheel_key(p, visible=(view == RGB_VIEW))
+    wheel_key = attach_wheel_key(p, visible=(view == RGB_VIEW),
+                                 scale=wheel_scale_label(result))
 
     fig_id = _electron.register(fig)
     html = finalize_figure_html(fig, fig_id)
     return fig, fig_id, html, p, wheel_key
 
 
-def attach_wheel_key(plot2d, *, visible: bool = True):
+def wheel_scale_label(result: "_dpc.DpcResult | None") -> str | None:
+    """Caption for the wheel: what its centre and rim are worth in real units.
+
+    Hue answers "which way"; without this the picture never answers "how much".
+    ``None`` when the ceiling cannot be derived — see ``dpc.magnitude_ceiling``.
+    """
+    if result is None:
+        return None
+    sigma = float((result.params or {}).get("autolim_sigma", 4.0))
+    ceiling = _dpc.magnitude_ceiling(result.field, autolim_sigma=sigma)
+    if ceiling is None:
+        return None
+    # Two significant figures, no spaces around the dash. The caption has to
+    # stay narrower than the key plus its margin or it is clipped by the panel
+    # edge, and a third figure on a display ceiling is false precision anyway.
+    return f"0–{ceiling:.2g} {result.units}"
+
+
+def attach_wheel_key(plot2d, *, visible: bool = True, scale: str | None = None):
     """Pin the direction legend over *plot2d*. ``None`` on an anyplotlib without
     ``add_key`` (< 0.7.0), which is a missing legend, not a broken window — so
     the caller carries on."""
@@ -193,11 +196,26 @@ def attach_wheel_key(plot2d, *, visible: bool = True):
         return add_key(
             _dpc.color_wheel_rgba(WHEEL_PX, rotation=_dpc.DISPLAY_ROTATION),
             corner=WHEEL_CORNER, size=WHEEL_SIZE, bgcolor=WHEEL_BG,
-            hover_only=False, visible=bool(visible), labels=WHEEL_LABELS,
+            margin=WHEEL_MARGIN, hover_only=False, visible=bool(visible),
+            labels=WHEEL_LABELS, label=scale, label_size=WHEEL_LABEL_SIZE,
             name="dpc_wheel")
     except Exception as e:                                   # pragma: no cover
         logger.debug("attaching the DPC colour-wheel key failed: %s", e)
         return None
+
+
+def attach_wheel_key_to_tree(tree, result: "_dpc.DpcResult") -> None:
+    """Put the legend on a COMMITTED tree's map as well as the live one.
+
+    A committed tree is the artefact that gets saved, exported and shown to
+    someone else, so it is the copy that most needs to say what its hues mean.
+    """
+    signal_plot = next(iter(getattr(tree, "signal_plots", []) or []), None)
+    plot2d = getattr(signal_plot, "_plot2d", None)
+    if plot2d is None:
+        logger.debug("committed DPC tree has no live 2-D plot; no wheel added")
+        return
+    attach_wheel_key(plot2d, visible=True, scale=wheel_scale_label(result))
 
 
 def update_dpc_view(plot2d, wheel_key, result: "_dpc.DpcResult", view: str,

@@ -241,14 +241,18 @@ class DpcWizard(WizardController):
             "name": "Reverse (+180°)", "type": "bool",
             "default": DEFAULTS["reverse"], "tab": "Rotation",
         },
+        # Both of these live on the Map tab in the caret. The schema is what a
+        # host that builds its own form reads (docs, notebook), so a tab here
+        # that disagrees with the caret puts the same control in two places
+        # depending on who renders it.
         "view": {
             "name": "Map", "type": "enum", "default": DEFAULTS["view"],
-            "choices": list(_display.VIEWS), "tab": "Rotation",
+            "choices": list(_display.VIEWS), "tab": "Map",
         },
         "autolim_sigma": {
             "name": "Colour limit (σ)", "type": "float",
             "default": DEFAULTS["autolim_sigma"], "min": 0.5, "max": 10.0,
-            "step": 0.5, "tab": "Rotation",
+            "step": 0.5, "tab": "Map",
         },
     }
 
@@ -656,8 +660,15 @@ class DpcWizard(WizardController):
             return
         boxes = _dpc.corner_boxes(self._nav_shape(),
                                   float(self.params["corner_fraction"]))
-        # add_rectangles takes CENTRES + sizes; corner_boxes gives (x, y, w, h).
-        offsets = [[x + w / 2.0, y + h / 2.0] for (x, y, w, h) in boxes]
+        # add_rectangles takes CENTRES + sizes; corner_boxes gives (x, y, w, h)
+        # where x and y are pixel INDICES. Pixel i covers [i - 0.5, i + 0.5], so
+        # a block over indices 0..1 spans [-0.5, 1.5] and is centred on 0.5 —
+        # not on x + w/2, which is 1.0. Without the half-pixel every box sits
+        # shifted toward the bottom-right: a gap inside the top-left corner, an
+        # overhang past the bottom-right edge, and the drawn box no longer
+        # covers the pixels the plane is actually fitted through.
+        offsets = [[x + w / 2.0 - 0.5, y + h / 2.0 - 0.5]
+                   for (x, y, w, h) in boxes]
         widths = [w for (_x, _y, w, _h) in boxes]
         heights = [h for (_x, _y, _w, h) in boxes]
         if self._corner_mg is not None:
@@ -1039,6 +1050,12 @@ class DpcWizard(WizardController):
         r = self.result
         titles = _dpc.component_titles(r.mode, r.units)
         sym = "E" if r.mode == "electric" else "B"
+
+        def _attach_wheel(tree):
+            # The committed tree is what gets saved and shown to someone else,
+            # so it is the copy that most needs to say what its hues mean.
+            _display.attach_wheel_key_to_tree(tree, r)
+
         return commit_result_tree(
             self.session, title=f"DPC ({sym})",
             # The primary is the RGB direction+magnitude image, so label it that
@@ -1057,6 +1074,7 @@ class DpcWizard(WizardController):
                            "vacuum_reference": self.vacuum_label or None},
                 "source_title": _tree_title(self.tree),
             },
+            on_tree=_attach_wheel,
         )
 
     # ── teardown ─────────────────────────────────────────────────────────────

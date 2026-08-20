@@ -371,9 +371,7 @@ def _wait(pred, timeout=30.0):
 
 def _open_wizard(session, key, spec):
     """Load the fixture, open the wizard, return its (plot, controller)."""
-    getattr(session, spec["loader"])(**(spec["kwargs"] or {}) or None
-                                     if spec["kwargs"] else None) \
-        if False else _call_loader(session, spec)
+    _call_loader(session, spec)
     assert _wait(lambda: _signal_plot(session) is not None), \
         f"{key}: the fixture never produced a signal plot"
     plot = _signal_plot(session)

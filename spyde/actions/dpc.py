@@ -983,6 +983,37 @@ def magnitude_phase_rgb(shifts: np.ndarray, *, rotation: float | None = None,
     return (arr[..., :3] >> 8).astype(np.uint8)
 
 
+def magnitude_ceiling(field: np.ndarray, *, autolim_sigma: float = 4.0
+                      ) -> float | None:
+    """The field magnitude the colour wheel's RIM stands for, in the field's own
+    units. The wheel's centre is 0, so this is the other end of its scale.
+
+    :func:`magnitude_phase_rgb` lets pyxem's autolim choose the display ceiling,
+    so the only number that cannot disagree with the picture is the one pyxem
+    itself computed. This makes the same call on the same array — ``nan_to_num``
+    first, exactly as the map does.
+
+    ``None`` if pyxem's helper moves. A legend with no scale on it is a small
+    loss; a legend with the WRONG scale on it is a wrong measurement, and it
+    would be believed.
+    """
+    try:
+        from pyxem.utils._beam_shift_tools import _get_limits_from_array
+    except Exception as e:                                   # pragma: no cover
+        log.debug("pyxem's magnitude-limit helper is not importable, so the "
+                  "colour wheel goes without a scale: %s", e)
+        return None
+    try:
+        clean = np.nan_to_num(np.asarray(field, dtype=np.float64),
+                              nan=0.0, posinf=0.0, neginf=0.0)
+        ceiling = float(_get_limits_from_array(
+            magnitude(clean), sigma=float(autolim_sigma))[1])
+    except Exception as e:                                   # pragma: no cover
+        log.debug("deriving the colour-wheel scale failed: %s", e)
+        return None
+    return ceiling if np.isfinite(ceiling) and ceiling > 0 else None
+
+
 def color_wheel_rgba(size: int = 192, *, rotation: float | None = None,
                      only_phase: bool = False) -> np.ndarray:
     """The circular phase-direction legend → ``(size, size, 4)`` uint8 RGBA.
@@ -1214,6 +1245,10 @@ def compute_dpc(signal, *, mode: str = "magnetic",
                 "center_mode": center_mode, "corner_fraction": corner_fraction,
                 "thickness_nm": thickness_nm, "beam_energy_kev": beam_energy_kev,
                 "mrad_per_px": scale, "calibrated": calibrated,
+                # Recorded because it sets the RGB's display ceiling, which is
+                # what the colour wheel's rim stands for. Without it the result
+                # cannot say what its own picture is scaled to.
+                "autolim_sigma": float(autolim_sigma),
                 "beam_region": (region.as_dict() if region is not None
                                 else BeamRegion().as_dict())},
     )
