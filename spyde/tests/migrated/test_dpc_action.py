@@ -345,6 +345,32 @@ class TestCentering:
         finally:
             dpc_mod.measure_beam_shifts = real
 
+    def test_a_measure_abandoned_by_close_does_not_shout(self, window):
+        """Closing the caret mid-pass fails the measure on the way down (the
+        executor it submits into is gone). Reporting that tells the user
+        "locating the direct beam failed" for something they did on purpose and
+        that has no consequence."""
+        session, plot, _tree, wiz = _opened(window)
+        gen = wiz.guard()
+        wiz._measure_failed(gen, RuntimeError("still live — should report"))
+        assert any("locating the direct beam failed" in e
+                   for e in _errors(window["messages"]))
+
+        before = len(_errors(window["messages"]))
+        wiz.remove()
+        wiz._measure_failed(gen, RuntimeError("cannot schedule new futures"))
+        assert len(_errors(window["messages"])) == before, \
+            "a measure abandoned by close reported an error to the user"
+
+    def test_a_superseded_measure_does_not_shout(self, window):
+        """Same for a run replaced by a newer one — nobody is waiting for it."""
+        session, plot, _tree, wiz = _opened(window)
+        stale = wiz.guard()
+        wiz.guard()                      # a newer run supersedes it
+        before = len(_errors(window["messages"]))
+        wiz._measure_failed(stale, RuntimeError("boom"))
+        assert len(_errors(window["messages"])) == before
+
     def test_the_drag_debounce_cannot_fire_after_teardown(self, window):
         """A timer that survives close would re-measure a torn-down wizard on a
         worker thread."""

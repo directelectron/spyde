@@ -336,8 +336,22 @@ class DpcWizard(WizardController):
                                             half_square_width=hw, region=region)
 
         self.run_on_worker(_work, name="dpc-measure", on_done=_finish,
-                           on_error=lambda e: emit_error(f"DPC: locating the "
-                                                         f"direct beam failed: {e}"))
+                           on_error=lambda e: self._measure_failed(gen, e))
+
+    def _measure_failed(self, gen: int, exc: Exception) -> None:
+        """Report a failed pass — unless nobody is waiting for it any more.
+
+        A measure that is still running when the caret closes (or the app quits)
+        fails on the way down: the executor it is submitting into is already
+        shut down. Reporting that shows the user "locating the direct beam
+        failed" for something they caused deliberately and that has no
+        consequence. A superseded run is the same story — a newer measure has
+        already replaced it.
+        """
+        if self._closed or not self.still(gen):
+            log.debug("DPC measure abandoned after close/supersede: %s", exc)
+            return
+        emit_error(f"DPC: locating the direct beam failed: {exc}")
 
     def _measure_progressive(self, signal, method, hw, region, gen, on_finish
                              ) -> bool:
@@ -399,7 +413,7 @@ class DpcWizard(WizardController):
             try:
                 result = fut.result()
             except Exception as e:
-                emit_error(f"DPC: locating the direct beam failed: {e}")
+                self._measure_failed(gen, e)
                 self._set_computing(False)
                 return
             dispatch = getattr(self.session, "_dispatch_to_main", None)

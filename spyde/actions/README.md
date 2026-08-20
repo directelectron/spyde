@@ -238,6 +238,26 @@ teardown (`_forget_window`), and when a dispatched action raises.
 
 ## 7. Testing your action
 
+**Start with `test_action_conformance.py` — it already covers your action.** It
+is driven by the registry, not a hand-written list, so a new staged action is
+checked the moment it registers. It enforces the seams that fail SILENTLY:
+handlers resolve and take `(session, plot, payload)`; `_open` and `_close` come
+as a pair; the schema is well formed and matches the module `DEFAULTS`; the
+caret is in `WIZARD_ACTIONS`, rendered in the switch, and named in
+toolbars.yaml; every `useWizardEvent('spyde:X')` has a re-broadcast case; caret
+`DEFAULTS` match the backend's; and — at runtime — messages are addressed to the
+CARET's window, open/close/open leaves one controller, and close leaves nothing
+registered.
+
+Add your wizard to `RUNTIME_FIXTURES` (a loader + an open payload) to get the
+runtime contracts, or to `RUNTIME_EXEMPT` with a reason if opening it needs a
+CIF/library/movie. `test_every_wizard_is_either_covered_or_exempt` fails if you
+do neither, so the gap cannot go unnoticed.
+
+When it fails for a new action, wire the seam it names — don't add an exemption.
+
+
+
 - Fixtures: `spyde/tests/migrated/conftest.py` (`window`, `tem_2d_dataset`,
   `stem_4d_dataset`) — real Qt-free `Session`s with captured `messages`.
 - Staged handlers: call directly, poll with `_wait(pred)`.
