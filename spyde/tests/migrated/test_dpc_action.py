@@ -564,20 +564,25 @@ class TestLive:
                 seen_partial.append(finite)
             return real_refresh(self)
 
+        total_positions = nav * nav
         dpca.DpcWizard.refresh = spy
         try:
             dpca.dpc_open(session, plot, {})
-            wiz = _wait(lambda: getattr(plot.signal_tree, "_dpc_wizard", None)
-                        is not None) and plot.signal_tree._dpc_wizard
-            assert _wait(lambda: wiz.shifts is not None
-                         and np.isfinite(wiz.shifts).all(), timeout=60.0), \
-                "the streamed pass never completed"
+            _wait(lambda: getattr(plot.signal_tree, "_dpc_wizard", None)
+                  is not None)
+            # Wait on the recorded PAINT, not on `wiz.shifts`: `_finish` assigns
+            # the shifts and only THEN calls `refresh`, so a wait on the array
+            # can return between the two — leaving the last entry in
+            # `seen_partial` a partial paint, and restoring the spy in `finally`
+            # before the full one was ever recorded.
+            assert _wait(lambda: seen_partial
+                         and seen_partial[-1] == total_positions,
+                         timeout=60.0), \
+                f"the streamed pass never completed: {seen_partial}"
         finally:
             dpca.DpcWizard.refresh = real_refresh
 
-        total_positions = nav * nav
         assert seen_partial, "the map was never repainted"
-        assert seen_partial[-1] == total_positions, "the final paint is partial"
         # The whole claim: at least one repaint happened while the field was
         # still incomplete.
         assert any(0 < n < total_positions for n in seen_partial), \
