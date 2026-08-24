@@ -86,6 +86,7 @@ registers a controller via ``own_window`` and keeps its figure referenced with
 """
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 
 import numpy as np
@@ -277,6 +278,8 @@ class DpcWizard(WizardController):
         self._beam_handler = None                   # kept alive (weak callback)
         self._beam_dragging = False                 # re-entrancy guard
         self._settle_timer = None                   # drag → debounced re-measure
+        self._measure_stop: list | None = None      # in-flight pass's cancel token
+        self._measure_future = None                 # …and its future, if any
         self._last_brightness = None                # re-sent during a drag
 
     # ── the source signal ────────────────────────────────────────────────────
@@ -317,21 +320,30 @@ class DpcWizard(WizardController):
         if self.signal is None:
             emit_error("DPC: no active dataset")
             return
+        # A superseded pass is CANCELLED, not left running to have its result
+        # discarded — a beam-shift pass reads the whole scan, so one nobody is
+        # waiting for costs the cluster the entire dataset. Same contract as
+        # virtual_image (cancel prior → unregister → register new).
+        self._cancel_measure()
         # A pass gets its OWN signal object, taken here on the dispatch thread.
-        # The worker below runs hyperspy `map` on it, and two passes overlap
-        # routinely — StrictMode's open/close/open starts a second measure while
-        # the first is still running, because the generation guard drops the
-        # superseded RESULT and not the superseded WORK. See dpc.private_view.
+        # The worker below runs hyperspy `map` on it, and a new pass can still
+        # overlap the TAIL of the one it cancels: a queued future cancels
+        # cleanly, one already inside `map` does not. See dpc.private_view.
         signal = _dpc.private_view(self.signal)
         method = str(self.params["method"])
         hw = int(self.params["half_square_width"] or 0)
         region = self.region()
         sig_shape = self._sig_shape()
         gen = self.guard()
+        # Only the EAGER branch below uses this one; the progressive branch owns
+        # its own token, because that is where a pass can actually be stopped
+        # part-way (see _measure_progressive).
+        eager_stop: list = [False]
         emit_status("DPC: locating the direct beam…")
 
         def _finish(shifts):
-            if not self.still(gen) or self._closed:
+            self._retire_measure(eager_stop)
+            if eager_stop[0] or not self.still(gen) or self._closed:
                 return
             self.shifts = np.asarray(shifts, dtype=np.float64)
             self.report = _dpc.centering_report(self.shifts)
@@ -346,12 +358,77 @@ class DpcWizard(WizardController):
         if self._measure_progressive(signal, method, hw, region, gen, _finish):
             return
 
+        # Eager data: ONE hyperspy `map` over an array already in RAM. There is
+        # no interruption point inside it, so the token can only stop the pass
+        # BEFORE it starts and drop the result if it lands late — which is also
+        # all `virtual_image` does for eager data. Registering it still matters:
+        # closing the tree flips it, so a pass in the queue never begins.
+        self._track_measure(eager_stop)
+
         def _work():
+            if eager_stop[0]:
+                return None
             return _dpc.measure_beam_shifts(signal, method=method,
                                             half_square_width=hw, region=region)
 
-        self.run_on_worker(_work, name="dpc-measure", on_done=_finish,
+        def _done(shifts):
+            if shifts is not None:
+                _finish(shifts)
+
+        self.run_on_worker(_work, name="dpc-measure", on_done=_done,
                            on_error=lambda e: self._measure_failed(gen, e))
+
+    def _track_measure(self, stop: list, future=None) -> None:
+        """Adopt *stop*/*future* as the in-flight pass and register them on the
+        tree, so closing the tree mid-pass stops it (``register_cancel``)."""
+        self._measure_stop, self._measure_future = stop, future
+        tree = self.tree
+        reg = getattr(tree, "register_cancel", None)
+        if reg is not None:
+            reg(flag=stop, future=future)
+
+    def _retire_measure(self, stop: list) -> None:
+        """Drop a FINISHED pass's token. Without this the tree's cancel registry
+        gains an entry per measure — and every drag settle is a measure."""
+        if self._measure_stop is not stop:
+            return                      # already superseded; not ours to drop
+        future = self._measure_future
+        self._measure_stop = self._measure_future = None
+        unreg = getattr(self.tree, "unregister_cancel", None)
+        if unreg is not None:
+            try:
+                unreg(flag=stop, future=future)
+            except Exception as e:                           # pragma: no cover
+                log.debug("retiring the DPC measure token failed: %s", e)
+
+    def _cancel_measure(self) -> None:
+        """Stop the in-flight beam-shift pass, if any.
+
+        Setting the flag is what actually stops it: the progressive path checks
+        it before each chunk submit and inside each chunk task, so a superseded
+        pass stops dispatching instead of computing a result nobody reads.
+        Cancelling the future kills one still queued; one already running ends
+        at its next flag check. Then unregister both, or the tree's cancel list
+        grows by one entry per drag.
+        """
+        stop, future = self._measure_stop, self._measure_future
+        self._measure_stop = self._measure_future = None
+        if stop is None and future is None:
+            return
+        if stop is not None:
+            stop[0] = True
+        if future is not None:
+            try:
+                if not future.done():
+                    future.cancel()
+            except Exception as e:
+                log.debug("cancelling the prior DPC measure failed: %s", e)
+        unreg = getattr(self.tree, "unregister_cancel", None)
+        if unreg is not None:
+            try:
+                unreg(flag=stop, future=future)
+            except Exception as e:                           # pragma: no cover
+                log.debug("unregistering the prior DPC measure failed: %s", e)
 
     def _measure_failed(self, gen: int, exc: Exception) -> None:
         """Report a failed pass — unless nobody is waiting for it any more.
@@ -399,12 +476,16 @@ class DpcWizard(WizardController):
         partial = np.full((ny, nx, 2), np.nan, dtype=np.float64)
         total = max(1, len(graph.chunks[0]) * len(graph.chunks[1]))
         done = [0]
+        # The cancel token travels WITH the dispatch: the backend checks it
+        # before each chunk submit and inside each chunk task, so superseding
+        # this pass stops it rather than letting it finish unread.
+        stop: list = [False]
         self.shifts = partial
         self._set_computing(True)
 
         def _on_chunk(chunk, slices):
             """Worker thread — marshal the paint onto the main loop."""
-            if self._closed or not self.still(gen):
+            if stop[0] or self._closed or not self.still(gen):
                 return
             try:
                 partial[slices] = np.asarray(chunk, dtype=np.float64)
@@ -418,16 +499,27 @@ class DpcWizard(WizardController):
             dispatch(paint) if dispatch is not None else paint()
 
         try:
-            future = backend.compute_chunks_progressive(graph, 2, _on_chunk)
+            future = backend.compute_chunks_progressive(graph, 2, _on_chunk,
+                                                        stopped_flag=stop)
         except Exception as e:
             log.debug("progressive DPC dispatch failed (%s) — running in one "
                       "pass instead", e)
             return False
+        self._track_measure(stop, future)
 
         def _settled(fut):
+            self._retire_measure(stop)
             try:
                 result = fut.result()
+            except concurrent.futures.CancelledError:
+                # Cancelled deliberately (superseded, or the caret/tree closed).
+                # Not a failure and not the user's problem — say nothing.
+                self._set_computing(False)
+                return
             except Exception as e:
+                if stop[0]:              # torn down mid-pass; same story
+                    self._set_computing(False)
+                    return
                 self._measure_failed(gen, e)
                 self._set_computing(False)
                 return
@@ -1090,6 +1182,10 @@ class DpcWizard(WizardController):
         if self._closed:
             return
         self._closed = True
+        # Stop the in-flight pass. Closing the caret is the clearest case of
+        # "nobody is waiting for this any more", and a beam-shift pass reads the
+        # whole scan — it must not keep running for a wizard that is gone.
+        self._cancel_measure()
         # Cancel the drag debounce FIRST: a timer that fires after teardown
         # would re-measure a torn-down wizard on a worker thread.
         if self._settle_timer is not None:

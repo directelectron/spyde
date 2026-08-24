@@ -500,6 +500,197 @@ class TestWizardRuntimeConformance:
                 f"{key}: a live controller survived close"
 
 
+#: Wizards whose OPEN starts no dataset-wide compute, so there is nothing for
+#: :class:`TestComputeCancellation` to cancel. Explicit, for the same reason
+#: ``RUNTIME_EXEMPT`` is: "nothing to cancel" must be a decision on the record,
+#: not an action that quietly forgot to register.
+NO_COMPUTE_ON_OPEN: dict[str, str] = {
+    "crop": "opening only draws an ROI; the crop happens on commit",
+    "czb":  "opening only draws the search region; the pass is czb_run",
+}
+
+
+def _cancel_tokens(tree) -> list:
+    """Everything registered on *tree* for cancellation — ``[False]`` stop flags
+    and ``.cancel()``-able futures alike (``BaseSignalTree.register_cancel``)."""
+    return (list(getattr(tree, "_cancel_flags", None) or [])
+            + list(getattr(tree, "_cancel_futures", None) or []))
+
+
+def _is_cancelled(token) -> bool:
+    """True if *token* has been asked to stop — flag set, or future cancelled
+    (a future that finished before the supersede landed also counts: there is
+    no longer a running compute, which is the property under test)."""
+    if isinstance(token, list):
+        return bool(token) and bool(token[0])
+    for probe in ("cancelled", "done"):
+        fn = getattr(token, probe, None)
+        if callable(fn):
+            try:
+                if fn():
+                    return True
+            except Exception:
+                pass
+    return False
+
+
+class TestComputeCancellation:
+    """A superseded or abandoned compute must be **cancelled**, not left to
+    finish so its result can be thrown away.
+
+    A pass over the dataset is the most expensive thing the app does. One that
+    nobody is waiting for still costs the cluster the whole scan, and they pile
+    up: every drag of an ROI, every StrictMode double-mount, starts another.
+    Dropping the RESULT is not cancelling the WORK.
+
+    The contract — ``virtual_image.py`` is the reference implementation:
+
+    * **register** the in-flight compute on the tree, ``register_cancel(flag=…)``
+      for a chunk loop or ``register_cancel(future=…)`` for a single future, so
+      closing the tree stops it;
+    * **cancel the previous one** before starting a new one, and
+      ``unregister_cancel`` it, so the registry does not grow one entry per
+      interaction.
+
+    DPC shipped without any of this: a superseded measure ran to completion on
+    every double-mount, and two of them racing on one hyperspy signal is what
+    made ``test_open_close_open_leaves_exactly_one_wizard`` fail on CI. This
+    gate is registry-driven so the next action cannot repeat it silently — a
+    new wizard either registers a token or names itself in
+    :data:`NO_COMPUTE_ON_OPEN`.
+    """
+
+    @pytest.mark.parametrize("key", sorted(RUNTIME_FIXTURES))
+    def test_an_open_compute_is_registered_for_tree_close(
+            self, key, window, monkeypatch):
+        if key in NO_COMPUTE_ON_OPEN:
+            pytest.skip(NO_COMPUTE_ON_OPEN[key])
+        session = window["window"]
+        _patch_module_emit(monkeypatch, key, window["messages"])
+        spec = RUNTIME_FIXTURES[key]
+        _call_loader(session, spec)
+        assert _wait(lambda: _signal_plot(session) is not None)
+        plot = _signal_plot(session)
+        tree = plot.signal_tree
+        # Only tokens this OPEN adds count — the tree already carries the
+        # navigator fill's own.
+        before = {id(t) for t in _cancel_tokens(tree)}
+        registry.resolve_staged(f"{key}_open")(session, plot,
+                                               dict(spec["payload"]))
+        added = [t for t in _cancel_tokens(tree) if id(t) not in before]
+        assert added, (
+            f"{key}: opening started a compute but registered nothing on the "
+            f"tree, so closing the tree cannot stop it. Call "
+            f"tree.register_cancel(flag=…) or (future=…) — see virtual_image.py "
+            f"— or add {key!r} to NO_COMPUTE_ON_OPEN with a reason.")
+
+    #: Action modules that dispatch a compute without registering a cancel
+    #: token. Pre-existing and GRANDFATHERED so the gate can go in — not an
+    #: endorsement. Some are legitimate (``find_vectors/orchestrate`` is handed
+    #: a flag by its caller rather than owning one); the rest are the same gap
+    #: DPC had. **Do not add to this list** — wire the token instead. Shrinking
+    #: it is the follow-up.
+    _UNREGISTERED_DISPATCH: frozenset = frozenset({
+        "background_action.py", "center_zero_beam.py", "composition.py",
+        "csb_to_frames.py", "orchestrate.py", "fit_action.py",
+        "orientation_compute.py", "strain_action.py",
+    })
+
+    def test_a_dispatched_compute_registers_a_cancel_token(self):
+        """STATIC: dispatching a dataset-wide compute obliges you to register a
+        cancel token, so closing the tree can stop it.
+
+        The runtime checks above only reach wizards that have a fixture, and
+        most actions never will — this one reaches every module.
+        """
+        import re
+        from pathlib import Path
+        actions = Path(__file__).resolve().parents[2] / "actions"
+        dispatch = re.compile(r"\b(run_on_worker|compute_chunks_progressive"
+                              r"|client\.compute|submit_graph)\s*\(")
+        # A bare token, not a call: the registration is often reached through
+        # `getattr(tree, "register_cancel", None)`, which a `\(` pattern misses
+        # — as an earlier version of this guard did, on this very file.
+        registers = re.compile(r"\bregister_cancel\b")
+        offenders = sorted(
+            p.name for p in actions.rglob("*.py")
+            if dispatch.search(p.read_text(encoding="utf-8"))
+            and not registers.search(p.read_text(encoding="utf-8"))
+            and p.name not in self._UNREGISTERED_DISPATCH)
+        assert not offenders, (
+            f"{offenders} dispatch a compute but register no cancel token, so "
+            f"closing the tree cannot stop it and a superseded pass runs to "
+            f"completion. Call tree.register_cancel(flag=…) for a chunk loop or "
+            f"(future=…) for a single future — see virtual_image.py and "
+            f"DpcWizard._track_measure.")
+
+    def test_the_dispatch_guard_would_catch_a_regression(self):
+        """The guard above is only worth having if it fails on the real thing.
+        DPC before the fix: a compute dispatched, nothing registered."""
+        import re
+        dispatch = re.compile(r"\b(run_on_worker|compute_chunks_progressive"
+                              r"|client\.compute|submit_graph)\s*\(")
+        registers = re.compile(r"\bregister_cancel\b")
+        pre_fix = ("def measure(self):\n"
+                   "    self.run_on_worker(_work, name='dpc-measure')\n")
+        assert dispatch.search(pre_fix) and not registers.search(pre_fix)
+
+    def test_a_registered_compute_has_a_cancel_path(self):
+        """STATIC half of the gate: any action that registers a cancel token
+        must also, in the same module, cancel or unregister one.
+
+        Registering only wires up TREE CLOSE. Superseding — a re-measure, an ROI
+        drag, a StrictMode remount — is the common case, and an action that
+        never calls ``unregister_cancel`` or ``.cancel()`` leaves every prior
+        pass running and its registry growing one entry per interaction.
+
+        This is lexical on purpose, like ``test_chunk_dispatch_guard``: the
+        runtime checks above can only reach the wizards that have a fixture, and
+        most actions never will. This one reaches all of them.
+        """
+        import re
+        from pathlib import Path
+        actions = Path(__file__).resolve().parents[2] / "actions"
+        offenders = []
+        for path in sorted(actions.rglob("*.py")):
+            src = path.read_text(encoding="utf-8")
+            if not re.search(r"\bregister_cancel\s*\(", src):
+                continue
+            if re.search(r"\bunregister_cancel\s*\(", src) or \
+                    re.search(r"\.cancel\s*\(\s*\)", src):
+                continue
+            offenders.append(path.name)
+        assert not offenders, (
+            f"{offenders} register a compute for cancellation but never cancel "
+            f"or unregister one. Registering only covers TREE CLOSE; a "
+            f"superseded pass must be cancelled too, or it runs to completion "
+            f"and its result is discarded. See virtual_image.py "
+            f"(cancel prior → unregister → register new).")
+
+    @pytest.mark.parametrize("key", sorted(RUNTIME_FIXTURES))
+    def test_close_cancels_the_in_flight_compute(self, key, window, monkeypatch):
+        """Closing the caret is the clearest "nobody is waiting for this"."""
+        if key in NO_COMPUTE_ON_OPEN:
+            pytest.skip(NO_COMPUTE_ON_OPEN[key])
+        session = window["window"]
+        _patch_module_emit(monkeypatch, key, window["messages"])
+        spec = RUNTIME_FIXTURES[key]
+        _call_loader(session, spec)
+        assert _wait(lambda: _signal_plot(session) is not None)
+        plot = _signal_plot(session)
+        tree = plot.signal_tree
+        before = {id(t) for t in _cancel_tokens(tree)}
+        registry.resolve_staged(f"{key}_open")(session, plot,
+                                               dict(spec["payload"]))
+        mine = [t for t in _cancel_tokens(tree) if id(t) not in before]
+        registry.resolve_staged(f"{key}_close")(session, plot, {})
+        left = {id(t) for t in _cancel_tokens(tree)}
+        for token in mine:
+            assert _is_cancelled(token) or id(token) not in left, (
+                f"{key}: close left a compute running. Cancel it in the "
+                f"wizard's teardown (see DpcWizard.remove).")
+
+
 def _live_controllers(tree, key) -> list:
     """Controllers this wizard parks on a tree (`_<key>_wizard`, `_<key>_controller`)."""
     out = []

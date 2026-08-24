@@ -101,6 +101,11 @@ class TemplateRegionAction(RegionAction):
 #      erroring in the find-vectors attach gap.
 #    * heavy compute runs via run_on_worker; UI applies happen in on_done
 #      (marshalled to the asyncio main thread) — never on the worker.
+#    * heavy compute is CANCELLED when superseded or closed — not left to run
+#      so its result can be discarded. Register the token on the tree, and
+#      cancel the previous one before starting the next. The generation guard
+#      is NOT this: it drops the RESULT, the pass keeps reading the dataset.
+#      Gated by test_action_conformance.TestComputeCancellation.
 #    * any bare-figure window the wizard opens calls own_window(wid) so ✕ and
 #      teardown reach it; remove() must be idempotent (self._closed).
 #    * Commit promotes the live result via commit_result_tree (provenance!).
@@ -167,8 +172,29 @@ def mywiz_open(session, plot, payload) -> None:
         tree._mywiz = wiz
         # open result windows here; wiz.own_window(wid) for bare figures
 
+    # Cancellation, in the order that matters. `stopped` is the codebase's
+    # token: a [False] the compute polls. Registering it means closing the tree
+    # stops the pass; cancelling the PRIOR one before starting this one means a
+    # supersede (re-run, ROI drag, StrictMode remount) does too. Retire it when
+    # the pass finishes, or the registry grows an entry per interaction.
+    _cancel_prior(wiz, tree)
+    stopped = tree.register_cancel() if hasattr(tree, "register_cancel") \
+        else [False]
+    wiz._stopped = stopped
+
     wiz.run_on_worker(lambda: np.zeros((8, 8), np.float32),
                       name="mywiz-open", on_done=_build)
+
+
+def _cancel_prior(wiz, tree) -> None:
+    """Stop the wizard's previous pass and drop it from the tree's registry."""
+    prior = getattr(wiz, "_stopped", None)
+    if prior is None:
+        return
+    prior[0] = True
+    wiz._stopped = None
+    if hasattr(tree, "unregister_cancel"):
+        tree.unregister_cancel(flag=prior)
 
 
 def mywiz_close(session, plot, payload=None) -> None:
