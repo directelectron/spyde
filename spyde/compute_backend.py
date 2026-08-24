@@ -228,6 +228,7 @@ class ComputeBackend:
         result_array: da.Array,
         nav_ndim: int,
         on_chunk_done: Callable | None,
+        stopped_flag: "list | None" = None,
     ) -> concurrent.futures.Future:
         """
         Submit per-nav-chunk computations; call on_chunk_done(chunk, slices)
@@ -235,6 +236,20 @@ class ComputeBackend:
 
         Returns a Future that resolves to the full result array — ASSEMBLED
         from the chunks, not recomputed as a second whole-array graph.
+
+        *stopped_flag* is the codebase's cancellation token: a 1-element
+        ``[False]`` list, registered on the tree via ``register_cancel(flag=…)``
+        and set to ``True`` to stop the pass. **A superseded compute is
+        CANCELLED, not left to finish and have its result thrown away** — a pass
+        over a whole scan is the most expensive thing the app does, and running
+        one nobody is waiting for costs the cluster (or the pool) the entire
+        dataset. Both modes honour it: distributed hands it to
+        ``dispatch_chunks``, threaded checks it before each submit AND inside
+        each chunk task, because the pool queues them all up front and most are
+        still waiting when a supersede lands.
+
+        Passing ``None`` keeps the old behaviour (nothing can stop the pass), so
+        this is only safe for a compute that genuinely cannot be superseded.
 
         The distributed mode routes through ``compute_dispatch.dispatch_chunks``
         (the one dispatcher: batched submit, bounded in-flight window, stall
@@ -247,6 +262,12 @@ class ComputeBackend:
 
         nav_chunks = result_array.chunks[:nav_ndim]
         trailing = (slice(None),) * (result_array.ndim - nav_ndim)
+
+        def _stopped() -> bool:
+            try:
+                return stopped_flag is not None and bool(stopped_flag[0])
+            except Exception:      # a malformed token must not kill the pass
+                return False
 
         if self._executor is None:
             from spyde.compute_dispatch import dispatch_chunks
@@ -271,6 +292,7 @@ class ComputeBackend:
                 try:
                     out.set_result(dispatch_chunks(
                         self._client, result_array, nav_ndim, [], None,
+                        stopped_flag=stopped_flag,
                         assemble=_assemble, fill_value=fill,
                         on_chunk_done=_chunk_done, label="chunks-progressive",
                         lane_default_mode="off",
@@ -292,15 +314,30 @@ class ComputeBackend:
                 start += size
             axes_ranges.append(positions)
 
+        def _chunk_work(chunk_da):
+            # Checked HERE and not only at submit time: this loop queues every
+            # chunk up front, so when a supersede lands most of them are still
+            # waiting in the pool. Raising is what makes the pass STOP rather
+            # than compute a result nobody reads.
+            if _stopped():
+                raise concurrent.futures.CancelledError("superseded")
+            return chunk_da.compute(scheduler="threads")
+
         for combo in itertools.product(*axes_ranges):
+            if _stopped():
+                break
             slices = tuple(slice(s, s + n) for s, n in combo)
-            chunk_da = result_array[slices + trailing]
-            fut = self._executor.submit(chunk_da.compute, scheduler="threads")
+            fut = self._executor.submit(_chunk_work,
+                                        result_array[slices + trailing])
             if on_chunk_done is not None:
                 def _make_cb(nav_slices):
                     def _cb(f):
+                        if _stopped() or f.cancelled():
+                            return
                         try:
                             on_chunk_done(f.result(), nav_slices)
+                        except concurrent.futures.CancelledError:
+                            pass
                         except Exception as e:
                             # Live-preview callback; the whole-array future
                             # re-raises a genuine chunk error on the commit path.
@@ -308,4 +345,9 @@ class ComputeBackend:
                     return _cb
                 fut.add_done_callback(_make_cb(slices))
 
-        return self._executor.submit(result_array.compute, scheduler="threads")
+        def _assemble_all():
+            if _stopped():
+                raise concurrent.futures.CancelledError("superseded")
+            return result_array.compute(scheduler="threads")
+
+        return self._executor.submit(_assemble_all)

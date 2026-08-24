@@ -230,9 +230,15 @@ def private_view(signal):
     a rare one — it reproduces on a 4-core runner and hides on a many-core box,
     because the interleaving is what changes, not the code.
 
-    Giving each pass its own wrapper makes overlapping passes harmless, which is
-    the property actually wanted: a superseded measure is allowed to run to
-    completion and have its result dropped.
+    **A superseded measure is CANCELLED, not left to finish** — see
+    ``DpcWizard._cancel_measure``, which follows the same contract as
+    ``virtual_image`` (cancel the prior future, unregister it, register the new
+    one so closing the tree stops it). This view is not a licence to let stale
+    passes run; it exists because cancellation cannot be instantaneous. A queued
+    future cancels cleanly, but one already inside ``map`` runs to its end
+    (``ComputeBackend.submit_graph`` documents the same contract), so the new
+    pass can still overlap the tail of the old one. It also keeps the worker's
+    ``set_signal_type`` off the tree's signal.
 
     Only the wrapper is duplicated — ``data`` is the same object, not a copy —
     so this stays cheap on a multi-GB lazy scan.
