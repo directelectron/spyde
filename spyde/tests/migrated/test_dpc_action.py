@@ -786,6 +786,48 @@ class TestTeardown:
 
 
 @pytest.mark.usefixtures("_capture_module_emit")
+class TestMeasureIsolation:
+    """A measure runs hyperspy ``map`` on a worker thread, and two measures
+    overlap whenever a second open lands before the first pass finishes. They
+    must not share a signal object — hyperspy mutates the one it is called on
+    (``dpc.private_view``)."""
+
+    def _measured_signals(self, window, opens=1):
+        session, plot, tree = _dataset(window)
+        seen = []
+        real = dpca._dpc.measure_beam_shifts
+
+        def spy(signal, **kw):
+            seen.append(signal)
+            return real(signal, **kw)
+
+        dpca._dpc.measure_beam_shifts = spy
+        try:
+            for _ in range(opens):
+                dpca.dpc_open(session, plot, {})
+                if opens > 1:
+                    dpca.dpc_close(session, plot, {})
+            _wait(lambda: len(seen) >= opens, timeout=30.0)
+        finally:
+            dpca._dpc.measure_beam_shifts = real
+        return tree, seen
+
+    def test_the_worker_never_gets_the_trees_own_signal(self, window):
+        tree, seen = self._measured_signals(window)
+        assert seen, "the measure never ran"
+        live = dpca._current_signal(_signal_plot(window["window"]))
+        assert seen[0] is not live, \
+            "the worker was handed the tree's live signal — two passes would race"
+        assert seen[0].data is live.data, "the view must share the data buffer"
+
+    def test_overlapping_passes_get_separate_objects(self, window):
+        _tree, seen = self._measured_signals(window, opens=3)
+        assert len(seen) >= 2
+        assert len({id(s) for s in seen}) == len(seen), \
+            "two measures shared one signal object"
+
+
+@pytest.mark.usefixtures("_capture_module_emit")
 class TestDoubleFire:
     def test_open_close_open_leaves_exactly_one_wizard(self, window):
         """React StrictMode fires the three synchronously, before the first

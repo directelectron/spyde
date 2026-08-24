@@ -984,6 +984,75 @@ class TestMemorySafety:
         assert shifts.shape == (n, n, 2)
 
 
+class TestPrivateView:
+    """Two DPC passes overlap routinely — StrictMode's open/close/open starts a
+    second measure while the first is still on a worker, because the generation
+    guard drops the superseded RESULT and not the superseded WORK. Both then run
+    hyperspy ``map``, and hyperspy mutates the signal a method is called on."""
+
+    def _signal(self):
+        import hyperspy.api as hs
+        s = hs.signals.Signal2D(np.zeros((4, 4, 8, 8), dtype=np.float32))
+        s.axes_manager.signal_axes[0].scale = 0.25
+        s.axes_manager.signal_axes[0].units = "mrad"
+        s.metadata.set_item("Acquisition_instrument.TEM.beam_energy", 200.0)
+        return s
+
+    def test_the_view_is_a_different_object_over_the_same_buffer(self):
+        s = self._signal()
+        view = dpc.private_view(s)
+        assert view is not s
+        assert view.data is s.data, "the data buffer must be shared, not copied"
+
+    def test_the_view_keeps_what_the_pipeline_reads(self):
+        s = self._signal()
+        view = dpc.private_view(s)
+        assert view.axes_manager.signal_axes[0].scale == 0.25
+        assert view.axes_manager.signal_axes[0].units == "mrad"
+        assert dpc.beam_energy_kv(view) == 200.0
+        assert view.axes_manager.navigation_shape == \
+            s.axes_manager.navigation_shape
+
+    def test_a_lazy_signal_stays_lazy(self):
+        import dask.array as da
+        import hyperspy.api as hs
+        s = hs.signals.Signal2D(
+            da.zeros((4, 4, 8, 8), chunks=(2, 2, 8, 8))).as_lazy()
+        view = dpc.private_view(s)
+        assert view._lazy and hasattr(view.data, "chunks")
+
+    def test_setting_the_signal_type_does_not_touch_the_original(self):
+        """``measure_beam_shifts`` calls ``set_signal_type`` on what it is
+        given. On the shared object that is a worker thread mutating the tree's
+        signal out from under the main thread."""
+        s = self._signal()
+        before = s.__class__
+        dpc.measure_beam_shifts(dpc.private_view(s))
+        assert s.__class__ is before
+
+    def test_a_deepcopy_transiently_publishes_a_placeholder(self):
+        """WHY the view exists, pinned so the reasoning cannot rot.
+
+        ``_deepcopy_with_new_data`` sets ``self.data = None`` on the LIVE object
+        while it copies the wrapper; hyperspy's setter stores that as a length-1
+        OBJECT array. A concurrent ``map`` reading it there dies with "Chunks do
+        not add up to shape ... shape=(1,)" — the CI failure this fixes."""
+        from unittest.mock import patch
+        s = self._signal()
+        seen = []
+        real = type(s).deepcopy
+
+        def spy(self, *a, **kw):
+            seen.append(getattr(self.data, "shape", None))
+            return real(self, *a, **kw)
+
+        with patch.object(type(s), "deepcopy", spy):
+            s._deepcopy_with_new_data(s.data)
+        assert seen == [(1,)], \
+            f"expected the (1,) placeholder mid-copy, saw {seen}"
+        assert s.data.shape == (4, 4, 8, 8), "the original must be restored"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Host parity: the schema, the caret defaults, the api wrapper
 # ─────────────────────────────────────────────────────────────────────────────

@@ -314,10 +314,15 @@ class DpcWizard(WizardController):
         filling in rather than a spinner. On eager data (already in RAM) there
         is nothing to stream and it runs in one go.
         """
-        signal = self.signal
-        if signal is None:
+        if self.signal is None:
             emit_error("DPC: no active dataset")
             return
+        # A pass gets its OWN signal object, taken here on the dispatch thread.
+        # The worker below runs hyperspy `map` on it, and two passes overlap
+        # routinely — StrictMode's open/close/open starts a second measure while
+        # the first is still running, because the generation guard drops the
+        # superseded RESULT and not the superseded WORK. See dpc.private_view.
+        signal = _dpc.private_view(self.signal)
         method = str(self.params["method"])
         hw = int(self.params["half_square_width"] or 0)
         region = self.region()
