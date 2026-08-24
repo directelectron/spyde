@@ -213,6 +213,42 @@ def _com_shift_frame(frame, keep, cx0: float, cy0: float):
     return np.array([cx0 - com_x, cy0 - com_y], dtype=np.float64)
 
 
+def private_view(signal):
+    """A signal object the caller owns exclusively, over the SAME data buffer.
+
+    hyperspy mutates the signal a method is called on. ``map`` — which every
+    measure here goes through — reaches ``_deepcopy_with_new_data``, and that
+    helper sets ``self.data = None`` on the LIVE object before deep-copying the
+    wrapper, restoring it in a ``finally``. hyperspy's data setter turns that
+    ``None`` into a length-1 OBJECT array, so for the width of the copy the
+    signal publicly has ``data.shape == (1,)`` (``learning_results``, ``_plot``
+    and the models dict are unset over the same window).
+
+    Two threads calling ``map`` on ONE signal therefore race: the second reads
+    the first's placeholder and dies with ``ValueError: Chunks do not add up to
+    shape. Got chunks=((3, 3, -1, -1),), shape=(1,)``. It is a genuine race, not
+    a rare one — it reproduces on a 4-core runner and hides on a many-core box,
+    because the interleaving is what changes, not the code.
+
+    Giving each pass its own wrapper makes overlapping passes harmless, which is
+    the property actually wanted: a superseded measure is allowed to run to
+    completion and have its result dropped.
+
+    Only the wrapper is duplicated — ``data`` is the same object, not a copy —
+    so this stays cheap on a multi-GB lazy scan.
+
+    Call it on the DISPATCH thread, before handing the result to a worker: the
+    copy is itself a ``_deepcopy_with_new_data``, so it must not overlap another
+    operation on the signal it is copying.
+    """
+    try:
+        return signal._deepcopy_with_new_data(signal.data)
+    except Exception as e:
+        # Worse to refuse to measure than to measure on the shared object.
+        log.debug("private signal view failed (%s); using the live signal", e)
+        return signal
+
+
 def beam_shift_graph(signal, *, method: str = "center_of_mass",
                      half_square_width: int = 0,
                      region: "BeamRegion | None" = None):
