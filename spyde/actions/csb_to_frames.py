@@ -89,12 +89,20 @@ def csb_to_frames(ctx, action_name: str = "To Frames", **params):
         emit_error("To Frames only applies to a CSB event stream")
         return None
 
+    from spyde.actions.lifecycle import supersede
+    handle = supersede(getattr(tree, "_to_frames_handle", None), tree)
+    tree._to_frames_handle = handle
+
     def _work():
+        if handle.stopped:
+            return
         try:
             _rebuild(session, tree, src, path, params)
         except Exception as e:
             emit_error(f"To Frames failed: {e}")
             log.exception("To Frames failed")
+        finally:
+            handle.retire()
 
     from spyde.actions.lifecycle import run_on_worker
     run_on_worker(session, _work, name="csb-to-frames")

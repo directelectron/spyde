@@ -1839,8 +1839,13 @@ def fit_run(session, plot, payload=None) -> None:
                                       converged=res.converged)
         return res
 
+    from spyde.actions.lifecycle import supersede
+    handle = supersede(getattr(wiz, "_fit_handle", None), tree)
+    wiz._fit_handle = handle
+
     def _done(result):
-        if not wiz.still(gen) or wiz._closed:
+        handle.retire()
+        if handle.stopped or not wiz.still(gen) or wiz._closed:
             return
         wiz.result = result
         wiz.spec = spec
@@ -1946,7 +1951,7 @@ def fit_refit_poor(session, plot, payload=None) -> None:
     Run automatically at the end of `fit_run`; this is the button for doing it
     again after changing the model, or for pushing harder on what is left.
     """
-    wiz, _tree = _wizard(session, plot)
+    wiz, tree = _wizard(session, plot)
     if wiz is None or wiz.result is None:
         ipc.emit_error("Fit: fit all spectra before refitting the poor ones")
         return
@@ -1962,7 +1967,13 @@ def fit_refit_poor(session, plot, payload=None) -> None:
     factor = float((payload or {}).get("factor", 1.5))
     gen = wiz.guard()
 
+    from spyde.actions.lifecycle import supersede
+    handle = supersede(getattr(wiz, "_fit_handle", None), tree)
+    wiz._fit_handle = handle
+
     def _work():
+        if handle.stopped:
+            return None
         from spyde.fitting.polish import polish_scan
         from spyde.fitting.relabel import relabel_scan
         res = polish_scan(spec, data, x, result, nav_shape=nav_shape,
@@ -1972,7 +1983,9 @@ def fit_refit_poor(session, plot, payload=None) -> None:
         return res
 
     def _done(res):
-        if not wiz.still(gen) or wiz._closed:
+        handle.retire()
+        if (res is None or handle.stopped or not wiz.still(gen)
+                or wiz._closed):
             return
         wiz.result = res
         wiz.record_run(res, nav_shape)
