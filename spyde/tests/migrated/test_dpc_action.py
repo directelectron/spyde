@@ -841,9 +841,11 @@ class TestMeasureIsolation:
 @pytest.mark.usefixtures("_capture_module_emit")
 class TestDoubleFire:
     def test_open_close_open_leaves_exactly_one_wizard(self, window):
-        """React StrictMode fires the three synchronously, before the first
-        measure lands — so the idempotence check cannot see the in-flight call
-        and the generation guard has to."""
+        """React StrictMode fires the three synchronously. Whether the first
+        measure lands before or after the close is a race, and both orderings
+        must leave exactly one live wizard and one open window: land late and
+        the generation guard stops the window ever opening; land early and it
+        opens, then teardown closes it."""
         session, plot, tree = _dataset(window)
         dpca.dpc_open(session, plot, {})
         dpca.dpc_close(session, plot, {})
@@ -854,9 +856,16 @@ class TestDoubleFire:
         wizards = [t for t in session.signal_trees
                    if getattr(t, "_dpc_wizard", None) is not None]
         assert len(wizards) == 1
-        dpc_windows = {m["window_id"] for m in _of_type(window["messages"], "figure")
-                       if str(m.get("title", "")).startswith("DPC")}
-        assert len(dpc_windows) == 1, f"{len(dpc_windows)} DPC windows opened"
+        # Count what is still OPEN, not what was ever emitted: a window the
+        # early-landing measure opened is matched by a window_closed from
+        # teardown, and counting opens alone reads that as a leak.
+        opened = {m["window_id"] for m in _of_type(window["messages"], "figure")
+                  if str(m.get("title", "")).startswith("DPC")}
+        closed = {m["window_id"] for m in _of_type(window["messages"],
+                                                   "window_closed")}
+        assert len(opened - closed) == 1, (
+            f"{len(opened - closed)} DPC windows left open "
+            f"(opened {sorted(opened)}, closed {sorted(closed)})")
 
     def test_re_opening_a_live_wizard_does_not_build_a_second(self, window):
         session, plot, tree, wiz = _opened(window)
