@@ -276,7 +276,18 @@ class StrainController(WizardController):
         log.debug("[strain-ref] _recompute gen=%d n_ref_vectors=%d component=%s",
                   gen, len(ref), self.component)
 
+        # Every reference / ring / CIF interaction lands here, so a superseded
+        # fit must STOP, not merely have its result dropped by the generation
+        # guard below — the fits are seconds each and would otherwise pile up.
+        from spyde.actions.lifecycle import supersede
+        handle = supersede(getattr(self, "_recompute_handle", None),
+                           self.src_tree)
+        self._recompute_handle = handle
+
         def _apply(field):
+            handle.retire()
+            if handle.stopped:
+                return
             # Drop a stale result superseded by a newer interaction.
             if not is_current(self, "_recompute_gen", gen):
                 log.debug("[strain-ref] _recompute gen=%d SUPERSEDED (current=%d) — dropped",
@@ -583,10 +594,19 @@ def strain_open(session, plot, payload) -> None:
 
     if getattr(session, "_dispatch_to_main", None) is not None:
         emit_status("Computing strain field…")
+    from spyde.actions.lifecycle import supersede
+    handle = supersede(getattr(tree, "_strain_run_handle", None), tree)
+    tree._strain_run_handle = handle
+
+    def _finished(field):
+        handle.retire()
+        if not handle.stopped:
+            _build_window(field)
+
     run_on_worker(
         session, lambda: compute_strain_field(vecs, ref_yx, min_matches=min_matches,
                                               ref_radius=ref_radius),
-        name="strain-run", on_done=_build_window,
+        name="strain-run", on_done=_finished,
         on_error=lambda e: emit_error(f"Strain mapping failed: {e}"),
     )
 

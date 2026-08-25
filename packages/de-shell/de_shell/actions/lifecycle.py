@@ -67,6 +67,82 @@ def run_on_worker(session, work: Callable[[], Any], *, name: str,
     threading.Thread(target=_worker, daemon=True, name=name).start()
 
 
+# ── cancellation (a superseded compute is stopped, not ignored) ───────────────
+
+class ComputeHandle:
+    """The cancellation handle for one dispatched compute.
+
+    ``flag`` is the ``[False]`` stop token the work polls; ``future`` is the
+    future it runs as, when there is one. Constructing a handle registers both
+    on the signal tree, so closing the tree stops the compute.
+
+    A superseded or abandoned compute must be CANCELLED, not left running so its
+    result can be discarded. The generation guard is not a substitute: it drops
+    the result on arrival while the pass keeps reading the dataset, and a pass
+    over the dataset is the most expensive thing the app does.
+
+    A compute with no interruption point — one library call over an array
+    already in memory — can still take a handle. The flag then stops it before
+    it starts and drops a late result, which is all that is available.
+    """
+
+    __slots__ = ("flag", "future", "_tree")
+
+    def __init__(self, tree, future=None):
+        self.flag: list = [False]
+        self.future = future
+        self._tree = tree
+        register = getattr(tree, "register_cancel", None)
+        if register is not None:
+            register(flag=self.flag, future=future)
+
+    @property
+    def stopped(self) -> bool:
+        return bool(self.flag[0])
+
+    def attach(self, future) -> None:
+        """Adopt a future created after the handle, registering it too."""
+        self.future = future
+        register = getattr(self._tree, "register_cancel", None)
+        if register is not None and future is not None:
+            register(future=future)
+
+    def cancel(self) -> None:
+        """Stop the compute and drop it from the tree's registry."""
+        self.flag[0] = True
+        if self.future is not None:
+            try:
+                if not self.future.done():
+                    self.future.cancel()
+            except Exception as e:
+                log.debug("cancelling a superseded compute failed: %s", e)
+        self._unregister()
+
+    def retire(self) -> None:
+        """Drop a finished compute's registration, without marking it stopped.
+
+        Required, or the registry gains an entry per run and a long-lived tree
+        accumulates one for every interaction.
+        """
+        self._unregister()
+
+    def _unregister(self) -> None:
+        unregister = getattr(self._tree, "unregister_cancel", None)
+        if unregister is None:
+            return
+        try:
+            unregister(flag=self.flag, future=self.future)
+        except Exception as e:                               # pragma: no cover
+            log.debug("unregistering a compute failed: %s", e)
+
+
+def supersede(prior: "ComputeHandle | None", tree, future=None) -> ComputeHandle:
+    """Cancel *prior* and return the handle for the compute replacing it."""
+    if prior is not None:
+        prior.cancel()
+    return ComputeHandle(tree, future)
+
+
 # ── generation guard (latest-wins / StrictMode double-mount) ──────────────────
 
 def bump_generation(owner, key: str) -> int:

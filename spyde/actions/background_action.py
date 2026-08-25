@@ -303,13 +303,20 @@ def bg_apply(session, plot, payload=None) -> None:
         ipc.emit_error("Remove Background: open the tool first")
         return
 
+    from spyde.actions.lifecycle import supersede
+    handle = supersede(getattr(wiz, "_apply_compute", None), tree)
+    wiz._apply_compute = handle
+
     def _work():
+        if handle.stopped:
+            return None
         _spec, result, curve = wiz.fit_background(whole_scan=True)
         data = np.asarray(wiz.signal.data, float)
         return data - curve.reshape(data.shape), result
 
     def _done(out):
-        if wiz._closed:
+        handle.retire()
+        if out is None or handle.stopped or wiz._closed:
             return
         subtracted, result = out
         try:
