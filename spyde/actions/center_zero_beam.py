@@ -238,7 +238,13 @@ def czb_run(session, plot, payload) -> None:
     flat = bool(payload.get("make_flat_field", False))
     emit_status("Centering zero beam…")
 
+    from spyde.actions.lifecycle import supersede
+    handle = supersede(getattr(tree, "_czb_compute", None), tree)
+    tree._czb_compute = handle
+
     def _work():
+        if handle.stopped:
+            return
         try:
             try:
                 signal.set_signal_type("electron_diffraction")
@@ -285,6 +291,8 @@ def czb_run(session, plot, payload) -> None:
         except Exception as e:
             emit_error(f"Center Zero Beam (auto) failed: {e}")
             log.exception("Center Zero Beam (auto) failed")
+        finally:
+            handle.retire()
 
     from spyde.actions.lifecycle import run_on_worker
     run_on_worker(session, _work, name="czb-auto")
@@ -355,7 +363,13 @@ def czb_pick(session, plot, payload) -> None:
         emit_error("Center Zero Beam: place the crosshair first")
         return
 
+    from spyde.actions.lifecycle import supersede
+    handle = supersede(getattr(tree, "_czb_compute", None), tree)
+    tree._czb_compute = handle
+
     def _work():
+        if handle.stopped:
+            return
         try:
             import hyperspy.api as hs
             try:
@@ -395,6 +409,8 @@ def czb_pick(session, plot, payload) -> None:
         except Exception as e:
             emit_error(f"Center Zero Beam (manual) failed: {e}")
             log.exception("Center Zero Beam (manual) failed")
+        finally:
+            handle.retire()
 
     from spyde.actions.lifecycle import run_on_worker
     run_on_worker(session, _work, name="czb-manual")

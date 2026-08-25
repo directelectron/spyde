@@ -584,17 +584,19 @@ class TestComputeCancellation:
             f"tree.register_cancel(flag=…) or (future=…) — see virtual_image.py "
             f"— or add {key!r} to NO_COMPUTE_ON_OPEN with a reason.")
 
-    #: Action modules that dispatch a compute without registering a cancel
-    #: token. Pre-existing and GRANDFATHERED so the gate can go in — not an
-    #: endorsement. Some are legitimate (``find_vectors/orchestrate`` is handed
-    #: a flag by its caller rather than owning one); the rest are the same gap
-    #: DPC had. **Do not add to this list** — wire the token instead. Shrinking
-    #: it is the follow-up.
-    _UNREGISTERED_DISPATCH: frozenset = frozenset({
-        "background_action.py", "center_zero_beam.py", "composition.py",
-        "csb_to_frames.py", "orchestrate.py", "fit_action.py",
-        "orientation_compute.py", "strain_action.py",
-    })
+    #: Modules that dispatch work but own no cancel token, with the reason.
+    #: A compute CORE is handed a ``stopped_flag`` by the action that owns it,
+    #: and work that never reads the dataset has nothing worth cancelling.
+    #: Anything else belongs in the gate, not here.
+    _NO_TOKEN_OF_THEIR_OWN: dict = {
+        "orchestrate.py": "find-vectors compute core; find_vectors_action owns "
+                          "the flag and passes it in",
+        "orientation_compute.py": "orientation compute core; it already polls "
+                                  "the caller's stopped_flag and cancels its "
+                                  "own future — orientation_action registers it",
+        "composition.py": "queries the structure database over the network; no "
+                          "signal tree in scope and no dataset is read",
+    }
 
     def test_a_dispatched_compute_registers_a_cancel_token(self):
         """STATIC: dispatching a dataset-wide compute obliges you to register a
@@ -608,15 +610,17 @@ class TestComputeCancellation:
         actions = Path(__file__).resolve().parents[2] / "actions"
         dispatch = re.compile(r"\b(run_on_worker|compute_chunks_progressive"
                               r"|client\.compute|submit_graph)\s*\(")
-        # A bare token, not a call: the registration is often reached through
+        # Bare tokens, not calls: the registration is often reached through
         # `getattr(tree, "register_cancel", None)`, which a `\(` pattern misses
         # — as an earlier version of this guard did, on this very file.
-        registers = re.compile(r"\bregister_cancel\b")
+        # `supersede`/`ComputeHandle` are the shared helper, which registers
+        # for you; a module using it never names register_cancel itself.
+        registers = re.compile(r"\b(register_cancel|supersede|ComputeHandle)\b")
         offenders = sorted(
             p.name for p in actions.rglob("*.py")
             if dispatch.search(p.read_text(encoding="utf-8"))
             and not registers.search(p.read_text(encoding="utf-8"))
-            and p.name not in self._UNREGISTERED_DISPATCH)
+            and p.name not in self._NO_TOKEN_OF_THEIR_OWN)
         assert not offenders, (
             f"{offenders} dispatch a compute but register no cancel token, so "
             f"closing the tree cannot stop it and a superseded pass runs to "
@@ -630,10 +634,16 @@ class TestComputeCancellation:
         import re
         dispatch = re.compile(r"\b(run_on_worker|compute_chunks_progressive"
                               r"|client\.compute|submit_graph)\s*\(")
-        registers = re.compile(r"\bregister_cancel\b")
+        registers = re.compile(
+            r"\b(register_cancel|supersede|ComputeHandle)\b")
         pre_fix = ("def measure(self):\n"
                    "    self.run_on_worker(_work, name='dpc-measure')\n")
         assert dispatch.search(pre_fix) and not registers.search(pre_fix)
+        # …and passes once the token is wired, so it gates rather than blocks.
+        fixed = ("def measure(self):\n"
+                 "    handle = supersede(self._handle, tree)\n"
+                 "    self.run_on_worker(_work, name='dpc-measure')\n")
+        assert registers.search(fixed)
 
     def test_a_registered_compute_has_a_cancel_path(self):
         """STATIC half of the gate: any action that registers a cancel token

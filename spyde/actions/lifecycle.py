@@ -33,7 +33,7 @@ import numpy as np
 
 from de_shell.actions.lifecycle import (  # noqa: F401  (re-exported API)
     run_on_worker, bump_generation, is_current, replace_tree_attr,
-    progress_emitter, window_computing,
+    progress_emitter, window_computing, ComputeHandle, supersede,
 )
 
 log = logging.getLogger(__name__)
