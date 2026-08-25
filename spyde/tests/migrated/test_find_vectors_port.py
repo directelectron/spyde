@@ -89,12 +89,26 @@ class TestFindVectorsPort:
             sp = vtree.signal_plots[0]
             sel = next(s for s in vtree.navigator_plot_manager.all_navigation_selectors
                        if sp in s.children)
+            def _peak(rendered) -> float:
+                """Brightest pixel, or -1 while there is nothing to read yet.
+
+                The read can land before the frame resolves, and an unresolved
+                one is not an array of numbers — `None`, or the length-1 object
+                array hyperspy wraps it in. `max()` then returns None and
+                `float()` raises, failing the test for the one reason it is
+                waiting to pass.
+                """
+                try:
+                    return float(np.asarray(rendered, dtype=float).max())
+                except (TypeError, ValueError):
+                    return -1.0
+
             deadline = time.time() + 30.0    # render wiring installs async
             frame = sel.children[sp](sel, sp, np.array([[ix, iy]]))
-            while float(np.asarray(frame).max()) <= 0 and time.time() < deadline:
+            while _peak(frame) <= 0 and time.time() < deadline:
                 time.sleep(0.1)
                 frame = sel.children[sp](sel, sp, np.array([[ix, iy]]))
-            assert float(np.asarray(frame).max()) > 0, "result window still renders zeros"
+            assert _peak(frame) > 0, "result window still renders zeros"
 
             # (b) A found-vectors overlay is attached to the result window and
             # yields markers at a position that actually has vectors.

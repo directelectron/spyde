@@ -25,6 +25,7 @@ from spyde.actions.find_vectors import (
     _nav_chunk_size,
 )
 from spyde.signals.diffraction_vectors import SpyDEDiffractionVectors
+from spyde.tests.migrated._perf import budget_ms
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -254,7 +255,9 @@ def test_nav_blur_cache_warm_speed():
     for _ in range(N):
         cache.get_blurred(8, 8, raw_pattern)
     avg_ms = (time.perf_counter() - t0) / N * 1000
-    assert avg_ms < 1.0, f"Warm cache too slow: {avg_ms:.2f}ms"
+    ceiling = budget_ms(1.0)
+    assert avg_ms < ceiling, (
+        f"Warm cache too slow: {avg_ms:.2f}ms (ceiling {ceiling:.2f}ms)")
 
 
 # ── Chunk size ────────────────────────────────────────────────────────────────
@@ -425,7 +428,9 @@ def test_single_frame_pipeline_under_20ms():
     for _ in range(10):
         _find_vectors_single_frame(frame, 12, 0.3, 10)
     avg_ms = (time.perf_counter() - t0) / 10 * 1000
-    assert avg_ms < 20, f"Pipeline too slow: {avg_ms:.1f}ms (limit 20ms)"
+    ceiling = budget_ms(20)
+    assert avg_ms < ceiling, (
+        f"Pipeline too slow: {avg_ms:.1f}ms (ceiling {ceiling:.0f}ms)")
 
 
 # ── Peak intensity robustness (no per-frame banding) ──────────────────────────

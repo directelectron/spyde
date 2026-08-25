@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 
 from spyde.signals.diffraction_vectors import SpyDEDiffractionVectors
+from spyde.tests.migrated._perf import budget_ms, budget_s
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -330,7 +331,9 @@ def test_direct_roi_performance():
         vecs.virtual_image_from_roi(0.0, 0.0, r_outer=0.5)
     avg_ms = (time.perf_counter() - t0) / 10 * 1000
 
-    assert avg_ms < 100, f"Direct ROI too slow: {avg_ms:.1f} ms (limit 100 ms)"
+    ceiling = budget_ms(100)
+    assert avg_ms < ceiling, (
+        f"Direct ROI too slow: {avg_ms:.1f} ms (ceiling {ceiling:.0f} ms)")
 
 
 def test_kdtree_build_performance():
@@ -339,7 +342,9 @@ def test_kdtree_build_performance():
     t0 = time.perf_counter()
     vecs.build_kdtree()
     elapsed_s = time.perf_counter() - t0
-    assert elapsed_s < 2.0, f"KDTree build too slow: {elapsed_s:.2f}s"
+    ceiling = budget_s(2.0)
+    assert elapsed_s < ceiling, (
+        f"KDTree build too slow: {elapsed_s:.2f}s (ceiling {ceiling:.1f}s)")
 
 
 def test_kdtree_query_performance():
@@ -357,7 +362,9 @@ def test_kdtree_query_performance():
         vecs.virtual_image_from_kdtree(0.0, 0.0, r_outer=0.1)
     avg_ms = (time.perf_counter() - t0) / 10 * 1000
 
-    assert avg_ms < 100, f"KDTree query too slow: {avg_ms:.1f} ms (limit 100 ms)"
+    ceiling = budget_ms(100)
+    assert avg_ms < ceiling, (
+        f"KDTree query too slow: {avg_ms:.1f} ms (ceiling {ceiling:.0f} ms)")
 
 
 def test_large_dataset_direct_roi_under_budget():
@@ -373,9 +380,10 @@ def test_large_dataset_direct_roi_under_budget():
     vecs.virtual_image_from_roi(0.0, 0.0, r_outer=0.5)
     elapsed_ms = (time.perf_counter() - t0) * 1000
 
-    assert elapsed_ms < 100, (
-        f"Direct ROI on 256x256 nav too slow: {elapsed_ms:.1f} ms (limit 100 ms). "
-        f"This will cause lag on live drag."
+    ceiling = budget_ms(100)
+    assert elapsed_ms < ceiling, (
+        f"Direct ROI on 256x256 nav too slow: {elapsed_ms:.1f} ms "
+        f"(ceiling {ceiling:.0f} ms). This will cause lag on live drag."
     )
 
 
@@ -506,7 +514,10 @@ def test_5d_virtual_image_series_performance():
     vecs.virtual_image_series(0.0, 0.0, r_outer=5.0)
     elapsed_ms = (time.perf_counter() - t0) * 1000
 
-    assert elapsed_ms < 500, f"virtual_image_series too slow: {elapsed_ms:.1f} ms"
+    ceiling = budget_ms(500)
+    assert elapsed_ms < ceiling, (
+        f"virtual_image_series too slow: {elapsed_ms:.1f} ms "
+        f"(ceiling {ceiling:.0f} ms)")
 
 
 def test_5d_per_frame_roi_performance():
@@ -551,7 +562,8 @@ def test_5d_per_frame_roi_performance():
         vecs.virtual_image_from_roi(0.0, 0.0, r_outer=0.5, t=250)
     avg_ms = (time.perf_counter() - t0) / 5 * 1000
 
-    assert avg_ms < 100, (
-        f"Per-frame VVI on 64x64x500 too slow: {avg_ms:.1f} ms (limit 100 ms). "
-        f"Live time-scrubbing will lag."
+    ceiling = budget_ms(100)
+    assert avg_ms < ceiling, (
+        f"Per-frame VVI on 64x64x500 too slow: {avg_ms:.1f} ms "
+        f"(ceiling {ceiling:.0f} ms). Live time-scrubbing will lag."
     )
