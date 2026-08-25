@@ -12,6 +12,21 @@ Earlier releases are described by their GitHub release notes and tags.
 
 .. towncrier release notes start
 
+0.4.1 (2026-08-25)
+==================
+
+Bug Fixes
+---------
+
+- The 0.4.0 release build could not be packaged: electron-builder refused the
+  ``^34.0.0`` Electron range because it could no longer resolve the installed
+  version. Making the repository an npm workspace hoisted ``electron`` out of
+  ``electron/node_modules``, and electron-builder resolves from the project
+  directory. Nothing but a tag build runs electron-builder, so it did not
+  surface until the release. The version is now pinned exactly, in both
+  ``package.json`` files.
+
+
 0.4.0 (2026-08-25)
 ==================
 

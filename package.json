@@ -6,9 +6,9 @@
     "packages/*",
     "electron"
   ],
-  "//": "electron is declared HERE, at the workspace root, so every root-hoisted tool that resolves 'electron' from its own location (electron-vite's version sniff, playwright-core's bare require('electron/index.js')) finds the SAME version the app declares in electron/package.json. Without this, npm's auto-installed peer once put electron 43 at the root and every e2e silently ran the wrong Electron.",
+  "//": "electron is declared HERE, at the workspace root, so every root-hoisted tool that resolves 'electron' from its own location (electron-vite's version sniff, playwright-core's bare require('electron/index.js')) finds the SAME version the app declares in electron/package.json. Without this, npm's auto-installed peer once put electron 43 at the root and every e2e silently ran the wrong Electron. EXACT, not a range, and it must match electron/package.json: making this a workspace hoisted electron out of electron/node_modules, and electron-builder resolves the installed version from the project dir — it cannot, so it falls back to parsing this spec and REFUSES a range. That is a release-only failure (nothing else runs electron-builder), so it does not show up until the tag build.",
   "devDependencies": {
-    "electron": "^34.0.0"
+    "electron": "34.5.8"
   },
   "scripts": {
     "dev": "npm --workspace spyde-electron run dev",
