@@ -793,12 +793,22 @@ class TestMeasureIsolation:
     (``dpc.private_view``)."""
 
     def _measured_signals(self, window, opens=1):
+        """``(tree, seen)``, each ``seen`` entry the ``(signal, data)`` handed to
+        the worker, recorded AT CALL TIME.
+
+        The buffer is recorded in the spy rather than read back afterwards. The
+        wait below only catches the measure STARTING, so a later read races a
+        pass that is still running and rebinding ``.data`` as it goes — which
+        made this assertion fail on macOS and Windows CI while passing
+        everywhere else. What the contract is about is the object handed over,
+        and that is knowable exactly once: at the call.
+        """
         session, plot, tree = _dataset(window)
         seen = []
         real = dpca._dpc.measure_beam_shifts
 
         def spy(signal, **kw):
-            seen.append(signal)
+            seen.append((signal, signal.data))
             return real(signal, **kw)
 
         dpca._dpc.measure_beam_shifts = spy
@@ -815,15 +825,16 @@ class TestMeasureIsolation:
     def test_the_worker_never_gets_the_trees_own_signal(self, window):
         tree, seen = self._measured_signals(window)
         assert seen, "the measure never ran"
+        handed, handed_data = seen[0]
         live = dpca._current_signal(_signal_plot(window["window"]))
-        assert seen[0] is not live, \
+        assert handed is not live, \
             "the worker was handed the tree's live signal — two passes would race"
-        assert seen[0].data is live.data, "the view must share the data buffer"
+        assert handed_data is live.data, "the view must share the data buffer"
 
     def test_overlapping_passes_get_separate_objects(self, window):
         _tree, seen = self._measured_signals(window, opens=3)
         assert len(seen) >= 2
-        assert len({id(s) for s in seen}) == len(seen), \
+        assert len({id(signal) for signal, _data in seen}) == len(seen), \
             "two measures shared one signal object"
 
 
