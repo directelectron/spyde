@@ -18,15 +18,15 @@ Download
      (scripts/update-download-links.mjs) — edit the markers, not the table. -->
 <!-- spyde:download-table:start -->
 
-**[⬇ Download SpyDE v0.3.0](https://github.com/CSSFrancis/spyde/releases/tag/v0.3.0)** — pick your platform:
+**[⬇ Download SpyDE v0.4.0](https://github.com/directelectron/spyde/releases/tag/v0.4.0)** — pick your platform:
 
 | Platform | Download |
 |----------|----------|
-| **Windows** | [SpyDE-Setup-0.3.0.exe](https://github.com/CSSFrancis/spyde/releases/download/v0.3.0/SpyDE-Setup-0.3.0.exe) |
-| **macOS** (Apple Silicon) | [SpyDE-0.3.0-arm64-mac.zip](https://github.com/CSSFrancis/spyde/releases/download/v0.3.0/SpyDE-0.3.0-arm64-mac.zip) |
-| **Linux** | [SpyDE-0.3.0.AppImage](https://github.com/CSSFrancis/spyde/releases/download/v0.3.0/SpyDE-0.3.0.AppImage) |
+| **Windows** | [SpyDE-Setup-0.4.0.exe](https://github.com/directelectron/spyde/releases/download/v0.4.0/SpyDE-Setup-0.4.0.exe) |
+| **macOS** (Apple Silicon) | [SpyDE-0.4.0-arm64-mac.zip](https://github.com/directelectron/spyde/releases/download/v0.4.0/SpyDE-0.4.0-arm64-mac.zip) |
+| **Linux** | [SpyDE-0.4.0.AppImage](https://github.com/directelectron/spyde/releases/download/v0.4.0/SpyDE-0.4.0.AppImage) |
 
-All releases: <https://github.com/CSSFrancis/spyde/releases>
+All releases: <https://github.com/directelectron/spyde/releases>
 
 <!-- spyde:download-table:end -->
 
