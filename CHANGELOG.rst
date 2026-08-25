@@ -12,6 +12,20 @@ Earlier releases are described by their GitHub release notes and tags.
 
 .. towncrier release notes start
 
+0.4.2 (2026-08-25)
+==================
+
+Bug Fixes
+---------
+
+- The installed app could not start: first launch failed with ``Distribution
+  not found at: .../resources/python/packages/de-shell``. Extracting the shell
+  made this a uv workspace, and the installer payload shipped the lock that
+  refers to the ``de-shell`` member without shipping the member. Both workspace
+  wheels are now built and installed, and the sync no longer tries to build
+  either from the read-only payload.
+
+
 0.4.1 (2026-08-25)
 ==================
 

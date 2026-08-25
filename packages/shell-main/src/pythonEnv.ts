@@ -278,6 +278,36 @@ function stagedAppWheel(projectDir: string): string | null {
 }
 
 /**
+ * Every wheel staged beside the app's own — the workspace MEMBERS.
+ *
+ * The app is one package in a uv workspace, and its siblings are path
+ * dependencies. They cannot be built on the user's machine for the same reason
+ * the app cannot (setuptools' egg_info writes into a read-only tree), so
+ * `bundle-python.mjs` builds them all with `uv build --all-packages` and they
+ * are installed from wheels here.
+ */
+function stagedMemberWheels(projectDir: string, appWheel: string | null): string[] {
+  const dir = join(projectDir, 'wheels')
+  if (!existsSync(dir)) return []
+  try {
+    return readdirSync(dir)
+      .filter((f) => f.endsWith('.whl'))
+      .map((f) => join(dir, f))
+      .filter((f) => f !== appWheel)
+  } catch { return []; }
+}
+
+/**
+ * The distribution name a wheel file installs, from its filename.
+ *
+ * Wheel names are `{name}-{version}-…`, and the name has `-` normalised to `_`.
+ * uv accepts either spelling for `--no-install-package`.
+ */
+function wheelPackageName(wheel: string): string {
+  return (wheel.split(/[\\/]/).pop() || '').split('-')[0]
+}
+
+/**
  * Install the PRE-BUILT app wheel into the managed env with no dependency
  * resolution (`--no-deps` — the sync already installed every dependency). This
  * is the whole reason the wheel exists: it avoids building the app from the
@@ -320,9 +350,19 @@ async function setupEnv(
   onProgress?: (line: string) => void,
 ): Promise<void> {
   const wheel = stagedAppWheel(projectDir)
+  const memberWheels = stagedMemberWheels(projectDir, wheel)
   // With a staged wheel, tell uv sync NOT to touch the project (the app builds
   // from the read-only tree otherwise); we install the wheel separately.
+  //
+  // `--no-install-project` covers the ROOT project only, so every workspace
+  // MEMBER needs excluding by name as well. Without that, uv tries to build
+  // them from the payload — which carries their pyproject.toml for workspace
+  // discovery and nothing else — and first launch dies before installing
+  // anything ("Distribution not found at: file:///…/packages/de-shell").
   const projectArgs = wheel ? ['--no-install-project'] : ['--no-editable']
+  for (const memberWheel of memberWheels) {
+    projectArgs.push('--no-install-package', wheelPackageName(memberWheel))
+  }
 
   const twoStep =
     (process.platform === 'win32' || process.platform === 'linux') &&
@@ -341,7 +381,12 @@ async function setupEnv(
       )
       // Step 2: torch resolved for this machine.
       await installTorchPerMachine(projectDir, envDir, onProgress)
-      // Step 3: the app itself, from the pre-built wheel (packaged only).
+      // Step 3: the workspace members, then the app — all from pre-built
+      // wheels (packaged only). Members first: the app wheel depends on them
+      // and `--no-deps` means nothing else will pull them in.
+      for (const memberWheel of memberWheels) {
+        await installAppWheel(projectDir, envDir, memberWheel, onProgress)
+      }
       if (wheel) await installAppWheel(projectDir, envDir, wheel, onProgress)
       onProgress?.('[env-setup] per-machine torch install complete\n')
       return
@@ -354,5 +399,8 @@ async function setupEnv(
 
   onProgress?.('[env-setup] running full locked uv sync\n')
   await runUv(projectDir, envDir, ['sync', '--frozen', '--no-dev', ...projectArgs], appVersion, onProgress)
+  for (const memberWheel of memberWheels) {
+    await installAppWheel(projectDir, envDir, memberWheel, onProgress)
+  }
   if (wheel) await installAppWheel(projectDir, envDir, wheel, onProgress)
 }

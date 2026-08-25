@@ -60,6 +60,25 @@ function resolveSpydeVersion() {
   return null
 }
 
+/**
+ * The `[tool.uv.workspace] members` of a pyproject, as plain relative paths.
+ *
+ * Deliberately a small regex rather than a TOML parser: this script has no
+ * dependencies, and the list is a literal array of quoted paths. A member the
+ * regex misses fails loudly at the copy below, not silently at the user's
+ * first launch.
+ */
+function workspaceMembers(pyprojectPath) {
+  const text = readFileSync(pyprojectPath, 'utf8')
+  // Up to the next section HEADER — a `[` at the start of a line. `[^[]*`
+  // stops at the `[` of the members ARRAY, which silently yields nothing.
+  const section = text.match(/\[tool\.uv\.workspace\][\s\S]*?(?=\r?\n\[|$)/)
+  if (!section) return []
+  const members = section[0].match(/members\s*=\s*\[([^\]]*)\]/)
+  if (!members) return []
+  return [...members[1].matchAll(/["']([^"']+)["']/g)].map((m) => m[1])
+}
+
 // Fresh staging dir.
 rmSync(outDir, { recursive: true, force: true })
 mkdirSync(outDir, { recursive: true })
@@ -104,12 +123,39 @@ const scmEnv = wheelVersion
   ? { ...process.env, SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SPYDE: wheelVersion,
       SETUPTOOLS_SCM_PRETEND_VERSION: wheelVersion }
   : process.env
-execSync(`uv build --wheel --out-dir "${wheelsDir}"`, {
+//
+//    --all-packages, because this repo is a uv WORKSPACE: `packages/de-shell`
+//    is a member and a path dependency of spyde. Building only the root project
+//    shipped a lock that points at a directory the payload does not contain, so
+//    first launch died before installing anything:
+//
+//      error: Failed to determine installation plan
+//        Caused by: Distribution not found at: file:///…/packages/de-shell
+//
+//    de-shell is a setuptools project too, so it cannot be built on the user's
+//    machine for exactly the reason spyde cannot — it ships as a wheel or not
+//    at all.
+execSync(`uv build --wheel --all-packages --out-dir "${wheelsDir}"`, {
   cwd: repoRoot, stdio: 'inherit', env: scmEnv,
 })
-const builtWheel = readdirSync(wheelsDir).find((f) => f.endsWith('.whl'))
-if (!builtWheel) throw new Error('uv build produced no spyde wheel')
-log(`staged spyde wheel: ${builtWheel}`)
+const builtWheels = readdirSync(wheelsDir).filter((f) => f.endsWith('.whl'))
+if (!builtWheels.length) throw new Error('uv build produced no wheels')
+log(`staged ${builtWheels.length} wheel(s): ${builtWheels.join(', ')}`)
+
+// 2b. The workspace members' own metadata. `uv sync` reads the workspace from
+//     the staged pyproject.toml, so every declared member directory has to
+//     EXIST even though nothing is built from it (the wheels above are
+//     installed instead). Only pyproject.toml is needed for discovery; the
+//     source is not staged, which also keeps it from being built by accident.
+for (const member of workspaceMembers(join(repoRoot, 'pyproject.toml'))) {
+  const src = join(repoRoot, member, 'pyproject.toml')
+  if (!existsSync(src)) {
+    throw new Error(`workspace member ${member} has no pyproject.toml`)
+  }
+  mkdirSync(join(outDir, member), { recursive: true })
+  copyFileSync(src, join(outDir, member, 'pyproject.toml'))
+  log(`staged workspace member: ${member}`)
+}
 
 // 3. The uv binary.
 const vendored = join(__dirname, '..', 'vendor', 'uv', process.platform, uvName)
