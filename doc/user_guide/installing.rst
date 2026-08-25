@@ -15,7 +15,7 @@ Download
 
 .. spyde:download-table:start
 
-**Download SpyDE v0.3.0:** `all releases <https://github.com/CSSFrancis/spyde/releases>`__
+**Download SpyDE v0.4.0:** `all releases <https://github.com/directelectron/spyde/releases>`__
 
 .. list-table::
    :header-rows: 1
@@ -24,11 +24,11 @@ Download
    * - Platform
      - Download
    * - **Windows**
-     - `SpyDE-Setup-0.3.0.exe <https://github.com/CSSFrancis/spyde/releases/download/v0.3.0/SpyDE-Setup-0.3.0.exe>`__
+     - `SpyDE-Setup-0.4.0.exe <https://github.com/directelectron/spyde/releases/download/v0.4.0/SpyDE-Setup-0.4.0.exe>`__
    * - **macOS** (Apple Silicon)
-     - `SpyDE-0.3.0-arm64-mac.zip <https://github.com/CSSFrancis/spyde/releases/download/v0.3.0/SpyDE-0.3.0-arm64-mac.zip>`__
+     - `SpyDE-0.4.0-arm64-mac.zip <https://github.com/directelectron/spyde/releases/download/v0.4.0/SpyDE-0.4.0-arm64-mac.zip>`__
    * - **Linux**
-     - `SpyDE-0.3.0.AppImage <https://github.com/CSSFrancis/spyde/releases/download/v0.3.0/SpyDE-0.3.0.AppImage>`__
+     - `SpyDE-0.4.0.AppImage <https://github.com/directelectron/spyde/releases/download/v0.4.0/SpyDE-0.4.0.AppImage>`__
 
 .. spyde:download-table:end
 
