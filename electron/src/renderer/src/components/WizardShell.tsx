@@ -61,9 +61,23 @@ export function TabRow<T extends string>({ tabs, active, onSelect, locked, testi
   )
 }
 
-/** A label + control field row. */
-export function Field({ label, children }: { label: string; children: React.ReactNode }) {
-  return <div style={S.fieldRow}><label style={S.lbl}>{label}</label>{children}</div>
+/** A label + control field row.
+ *
+ *  `label` takes a node, not just a string, so a caret can hang an affordance
+ *  off it — an ⓘ disclosure, a unit badge — without a second row. The row wraps
+ *  so an expanded disclosure flows underneath instead of squeezing the control.
+ */
+export function Field({ label, children }: {
+  label: React.ReactNode; children: React.ReactNode
+}) {
+  return (
+    <div style={S.fieldRow}>
+      <span style={{ ...S.lbl, display: 'flex', alignItems: 'center', gap: 4 }}>
+        {label}
+      </span>
+      {children}
+    </div>
+  )
 }
 
 export function NumInput({ value, onChange, step = 'any', width = 64, testid }: {
@@ -144,7 +158,9 @@ export const S: Record<string, React.CSSProperties> = {
   tabActive: { background: '#313244', border: 'none', color: '#cdd6f4', cursor: 'pointer', fontSize: 11, padding: '2px 7px', borderRadius: 4, fontWeight: 600 },
   tabLocked: { background: 'none', border: 'none', color: '#494d64', cursor: 'not-allowed', fontSize: 11, padding: '2px 7px', borderRadius: 4 },
   page: { display: 'flex', flexDirection: 'column', gap: 6, paddingTop: 2 },
-  fieldRow: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6 },
+  // `flexWrap` so an expanded ⓘ disclosure (width:100%) drops to its own line
+  // rather than crushing the control beside it.
+  fieldRow: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6, flexWrap: 'wrap' },
   lbl: { fontSize: 10, color: '#a6adc8', whiteSpace: 'nowrap' },
   num: { background: '#11111b', color: '#cdd6f4', border: '1px solid #313244', borderRadius: 4, padding: '3px 5px', fontSize: 11 },
   sel: { background: '#11111b', color: '#cdd6f4', border: '1px solid #313244', borderRadius: 4, padding: '3px 5px', fontSize: 11 },

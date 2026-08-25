@@ -935,6 +935,84 @@ export interface DriftResultMessage extends MsgBase {
   cancelled: boolean
 }
 
+/** DPC caret state: what the beam-shift pass found, and what it can be
+ *  referenced against. `centering` is the residual descan, which is how the
+ *  caret decides whether the Center step is needed at all. */
+export interface DpcStateMessage extends MsgBase {
+  type: 'dpc_state'
+  window_id: number | null
+  /** The bare-figure result window, if one is open. `window_id` above is the
+   *  SOURCE window the caret is mounted on — `useWizardEvent` filters on it,
+   *  so the two are NOT interchangeable. */
+  result_window_id: number | null
+  measured: boolean
+  nav_shape: number[] | null
+  centering: {
+    offset: number[]
+    ramp: number[]
+    worst: number
+    centered: boolean
+    tol_px: number
+  } | null
+  /** Detector calibration read from the dataset, or null if it carries none. */
+  mrad_per_px: number | null
+  beam_energy_kv: number | null
+  /** Label of the loaded vacuum reference, or null. */
+  vacuum: string | null
+  /** Open datasets that could serve as the vacuum reference. */
+  datasets: { index: number; title: string }[]
+  params: Record<string, unknown>
+}
+
+/** The fitted scan↔detector rotation. `improvement` is how far the
+ *  wrong-symmetry residual (curl for electric, divergence for magnetic) fell —
+ *  near 1 means the data did not single out an angle. */
+export interface DpcEstimateMessage extends MsgBase {
+  type: 'dpc_estimate'
+  window_id: number | null
+  result_window_id: number | null
+  angle: number
+  flip: boolean
+  mode: string
+  score: number
+  baseline: number
+  improvement: number
+}
+
+/** The beam region's live geometry, echoed while its widget is dragged.
+ *  `brightness` is the region's intensity density over the frame average —
+ *  scale-free, unlike a captured-intensity fraction. Null when the region is
+ *  off. */
+export interface DpcRegionMessage extends MsgBase {
+  type: 'dpc_region'
+  window_id: number | null
+  result_window_id: number | null
+  shape: string
+  cx: number
+  cy: number
+  r: number
+  r_inner: number
+  brightness: number | null
+}
+
+/** Stats of the derived field, re-sent on every live parameter change. */
+export interface DpcResultMessage extends MsgBase {
+  type: 'dpc_result'
+  window_id: number | null
+  result_window_id: number | null
+  /** "MV/cm" (calibrated electric), "mrad" (calibrated magnetic), or "px". */
+  units: string
+  mode: string
+  rotation: number
+  flip: boolean
+  reverse: boolean
+  calibrated: boolean
+  max: number
+  mean: number
+  divergence: number
+  curl: number
+}
+
 /**
  * Wizard-scoped events re-broadcast verbatim as DOM CustomEvents (the caret
  * components subscribe directly). The payload beyond `type` is consumer-defined,
@@ -1065,6 +1143,10 @@ export type PlotAppMessage =
   | DriftTraceMessage
   | DriftProgressMessage
   | DriftResultMessage
+  | DpcStateMessage
+  | DpcEstimateMessage
+  | DpcResultMessage
+  | DpcRegionMessage
 
 /**
  * Narrow a raw incoming message (`Record<string, unknown>` from the IPC bridge)

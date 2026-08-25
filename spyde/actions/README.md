@@ -17,7 +17,7 @@ wizard parameter schemas via `registry.wizard_parameters(key)` — see
 | **View action** | one-shot UI command, no tree change | plain `fn(ctx, …)` | zoom, reset, `tile_views` |
 | **TransformAction** | signal + params → a **new node in the SAME tree** | `action.TransformAction` | Rebin (`Rebin2DAction`), CZB apply |
 | **RegionAction** | interactive ROI → a **linked live output plot** | `action.RegionAction` | Virtual Imaging, FFT, Line Profile, Vector VI |
-| **Wizard** | staged caret: open → tune → run → commit → close | `wizard.WizardController` + staged handlers | Find Vectors, Orientation, Vector-OM, EBSD, Strain, CZB |
+| **Wizard** | staged caret: open → tune → run → commit → close | `wizard.WizardController` + staged handlers | Find Vectors, Orientation, Vector-OM, EBSD, Strain, CZB, DPC |
 | **Commit** | promote a live/finished result to a **NEW SignalTree** | `commit.commit_result_tree` | strain Commit, VOM result windows |
 
 Deciding: does it need an ROI? → RegionAction. Does it produce a new node of
@@ -153,10 +153,39 @@ is a single 2-D plot); that is a documented no-op, not an error.
    double-fire test (open, close, open → exactly one live controller — see
    `test_wizard_double_fire.py`).
 
+**A long pass over a lazy dataset should STREAM, not block.** Build the lazy
+graph, hand it to `ComputeBackend.compute_chunks_progressive(graph, nav_ndim,
+on_chunk_done)`, and repaint from the partial array as chunks land (`dpc_action.
+_measure_progressive` is a compact example; find-vectors is the large one). Two
+things make it work: the graph must keep the dataset's own nav chunking, so a
+streamed chunk is a STORAGE chunk (Live-Display §1) — check for `rechunk` layers
+if unsure; and every stage downstream must tolerate `NaN` for not-yet-computed
+positions, including the DISPLAY, or one unfilled pixel blanks the whole map.
+
 **Compute-heavy actions**: keep the compute in its own module (or package —
 `find_vectors/` is the model: pure compute layers + `__init__` re-export;
 interactive wiring stays outside). NEVER `.compute()` the full dataset
-(CLAUDE.md memory-safety rule).
+(CLAUDE.md memory-safety rule). DPC is the small version of the same split:
+`dpc.py` (pure physics) / `dpc_display.py` (figures) / `dpc_action.py`
+(interaction). Read `dpc.py` before touching any beam-shift code — it documents
+the two conventions pyxem does not make obvious (a shift is `centre − beam`,
+i.e. the NEGATIVE of the deflection; and a colour wheel has to be 90° off its
+map to read true) and derives its legend from the map's own colour rule rather
+than copying that offset.
+
+**Legends that float over a plot** — an IPF triangle, a DPC direction wheel —
+are `Plot2D.add_key` overlays, NOT `Figure.add_inset`. An inset is a draggable
+window with a title bar and its own canvas stack: right for a live sub-plot,
+wrong for a legend, which should read as part of the figure the way a scale bar
+does. Keys are also included in a PNG export. `hover_only=True` suits a legend
+for a map that is readable without it (the IPF triangle); leave it False when
+the map is meaningless without its key (the DPC hue wheel).
+
+**Explanatory prose does not belong on a caret face.** Carets are ~240 px wide
+and every paragraph pushes a control off the visible area. Put the sentence
+behind an `ⓘ` — `DpcWizard.tsx`'s `Info` is a copyable one: a click-toggled
+popover, absolutely positioned so it costs no layout, and opting out of the
+`nowrap` that `Field` labels set.
 
 ## 5. The renderer side (wizard carets)
 
@@ -208,6 +237,26 @@ teardown (`_forget_window`), and when a dispatched action raises.
   chunking) — see CLAUDE.md; actions call it, never restructure it.
 
 ## 7. Testing your action
+
+**Start with `test_action_conformance.py` — it already covers your action.** It
+is driven by the registry, not a hand-written list, so a new staged action is
+checked the moment it registers. It enforces the seams that fail SILENTLY:
+handlers resolve and take `(session, plot, payload)`; `_open` and `_close` come
+as a pair; the schema is well formed and matches the module `DEFAULTS`; the
+caret is in `WIZARD_ACTIONS`, rendered in the switch, and named in
+toolbars.yaml; every `useWizardEvent('spyde:X')` has a re-broadcast case; caret
+`DEFAULTS` match the backend's; and — at runtime — messages are addressed to the
+CARET's window, open/close/open leaves one controller, and close leaves nothing
+registered.
+
+Add your wizard to `RUNTIME_FIXTURES` (a loader + an open payload) to get the
+runtime contracts, or to `RUNTIME_EXEMPT` with a reason if opening it needs a
+CIF/library/movie. `test_every_wizard_is_either_covered_or_exempt` fails if you
+do neither, so the gap cannot go unnoticed.
+
+When it fails for a new action, wire the seam it names — don't add an exemption.
+
+
 
 - Fixtures: `spyde/tests/migrated/conftest.py` (`window`, `tem_2d_dataset`,
   `stem_4d_dataset`) — real Qt-free `Session`s with captured `messages`.

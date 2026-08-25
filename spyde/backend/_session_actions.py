@@ -38,7 +38,7 @@ _TEST_ACTIONS = frozenset({
     "load_test_data_si_grains", "load_test_data_sped_ag",
     "load_test_data_eels", "load_test_data_eds", "load_test_data_ebsd",
     "load_test_data_line", "load_test_data_movie", "load_test_data_5d",
-    "load_test_data_particles",
+    "load_test_data_particles", "load_test_data_dpc",
     "test_nav_drag",
     "test_region_scrub", "test_add_second_navigator",
     "load_test_vectors", "run_test_orientation", "dump_dask_state",
@@ -151,6 +151,8 @@ class ActionRouterMixin:
             self._load_test_data_5d(payload)
         elif action == "load_test_data_particles":
             self._load_test_data_particles(payload)
+        elif action == "load_test_data_dpc":
+            self._load_test_data_dpc(payload)
         elif action == "test_add_second_navigator":
             self._test_add_second_navigator()
         elif action == "test_nav_drag":

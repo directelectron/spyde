@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- DPC: the direct beam deflected away from the undeflected centre, with the
+     four corner reference boxes the descan plane is fitted through. White on
+     transparent, 512x512, matching the other toolbar icons. -->
+<svg
+   width="512"
+   height="512"
+   viewBox="0 0 512 512"
+   version="1.1"
+   id="svg-dpc"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <defs id="defs-dpc">
+    <marker
+       id="dpc-arrow"
+       style="overflow:visible"
+       refX="0" refY="0"
+       orient="auto-start-reverse"
+       markerWidth="0.6" markerHeight="0.6"
+       viewBox="0 0 1 1"
+       preserveAspectRatio="xMidYMid">
+      <path
+         transform="scale(0.5)"
+         style="fill:context-stroke;fill-rule:evenodd;stroke:context-stroke;stroke-width:1pt"
+         d="M 5.77,0 -2.88,5 V -5 Z"
+         id="dpc-arrow-head" />
+    </marker>
+  </defs>
+  <g id="dpc-layer">
+    <!-- the four corner reference boxes -->
+    <g style="fill:none;stroke:#ffffff;stroke-width:18;stroke-linejoin:round;opacity:0.45">
+      <rect x="36"  y="36"  width="86" height="86" id="dpc-corner-tl" />
+      <rect x="390" y="36"  width="86" height="86" id="dpc-corner-tr" />
+      <rect x="36"  y="390" width="86" height="86" id="dpc-corner-bl" />
+      <rect x="390" y="390" width="86" height="86" id="dpc-corner-br" />
+    </g>
+    <!-- the undeflected centre -->
+    <g style="fill:none;stroke:#ffffff;stroke-width:18;stroke-linecap:round;opacity:0.55">
+      <path d="M 186,256 H 246" id="dpc-cross-l" />
+      <path d="M 266,256 H 326" id="dpc-cross-r" />
+      <path d="M 256,186 V 246" id="dpc-cross-t" />
+      <path d="M 256,266 V 326" id="dpc-cross-b" />
+    </g>
+    <!-- the deflection -->
+    <path
+       d="M 256,256 L 322,190"
+       id="dpc-shift"
+       style="fill:none;stroke:#ffffff;stroke-width:26;stroke-linecap:round;marker-end:url(#dpc-arrow)" />
+    <!-- the deflected direct beam -->
+    <circle
+       cx="352" cy="160" r="62"
+       id="dpc-beam"
+       style="fill:#ffffff;stroke:none" />
+  </g>
+</svg>

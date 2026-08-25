@@ -107,6 +107,20 @@ functions:
     toolbar_side: bottom
     navigation: False
     toggle: True
+  DPC:
+    description: >-
+      Map the electric or magnetic field from how far the direct beam is
+      deflected at each scan point. Center the zero beam (manually, from a
+      vacuum scan, or from a plane through four corner boxes), solve the
+      scan-vs-detector rotation, and read direction off the colour wheel.
+    icon: drawing/toolbars/icons/dpc.svg
+    function: spyde.actions.dpc_action.dpc
+    signal_class: pyxem.signals.Diffraction2D
+    exclude_signal_types: [spyde_diffraction_vectors_image]
+    plot_dim: [ 2 ]
+    toolbar_side: bottom
+    navigation: False
+    toggle: True
   Virtual Imaging:
     description: Creates virtual images from the 4D-STEM data. Add multiple with +.
     icon: drawing/toolbars/icons/virtual_image_color.svg
@@ -180,7 +194,11 @@ functions:
       gamma:
         name: Gamma
         type: float
-        default: 0.5
+        # 1.0, matching orientation_action.DEFAULTS and OrientationWizard.tsx.
+        # This said 0.5, so a host that rendered from the schema (a notebook
+        # form, generated docs) disagreed with both the caret and the backend
+        # fallback. Found by test_action_conformance.
+        default: 1.0
         min: 0.1
         max: 1.5
         step: 0.05

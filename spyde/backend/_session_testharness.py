@@ -268,6 +268,110 @@ class TestHarnessMixin:
         tax.name, tax.units, tax.scale = "time", "s", 1.0
         self._add_signal(s, source_path="test_data_5d")
 
+    def _load_test_data_dpc(self, payload: dict | None = None) -> None:
+        """Test-only: BUNDLED synthetic DPC 4-D STEM with GROUND TRUTH. No file,
+        no download, no dask (32×32 nav × 48×48 signal, ~9 MB float32).
+
+        The direct beam is a disk displaced at every scan point by a KNOWN field,
+        so a DPC result can be scored rather than eyeballed. The field is the
+        gradient of two Gaussian charges of opposite sign — genuinely CURL-FREE,
+        which is the symmetry ``dpc.estimate_rotation`` solves against, and
+        strongly ASYMMETRIC left-to-right and top-to-bottom, which is what makes
+        a wrong x/y assignment or a mirrored map visible instead of plausible.
+        A uniform or centro-symmetric field would hide exactly the bug this
+        fixture exists to catch.
+
+        Three deliberate contaminations, each reproducing a real acquisition
+        problem the Center tab has to remove:
+
+        * a constant descan OFFSET (the Manual tab's job),
+        * a linear descan RAMP across the scan (the Corners tab's job — the
+          corners carry only the ramp, since the field is negligible there),
+        * a scan↔detector ROTATION of :data:`_DPC_TRUTH`'s ``rotation``, so an
+          uncorrected map points the wrong way.
+
+        Ground truth lands on ``metadata.Spyde.dpc_truth`` for tests to read.
+        ``shift_field`` is the BEAM-SHIFT field in the scan frame — pyxem's
+        ``centre − beam`` quantity, which is what ``mode="magnetic"`` returns
+        (up to the mrad scale). ``mode="electric"`` is ANTI-parallel to it,
+        because ``calibrate_electric_shifts`` divides by ``-e``; that is pyxem's
+        published convention and ``test_dpc.py`` pins both directions so the
+        relationship can never drift unnoticed.
+        """
+        import numpy as np
+        from spyde.backend.heavy_imports import ensure_heavy_imports
+        ensure_heavy_imports()   # see _load_test_data — don't race the prewarm
+        payload = payload or {}
+        n = int(payload.get("nav", 32))
+        k = int(payload.get("sig", 48))
+        rotation = float(payload.get("rotation", 25.0))
+        offset = (float(payload.get("offset_x", 1.5)),
+                  float(payload.get("offset_y", -1.0)))
+        ramp = (float(payload.get("ramp_x", 2.0)),
+                float(payload.get("ramp_y", -1.5)))
+        amp = float(payload.get("amplitude", 3.0))
+
+        # ── the true in-plane field: −∇V of two opposite Gaussian charges ──
+        yy, xx = np.mgrid[0:n, 0:n] / (n - 1.0)          # 0..1 across the scan
+        V = (np.exp(-(((xx - 0.35) ** 2 + (yy - 0.40) ** 2) / 0.018))
+             - np.exp(-(((xx - 0.68) ** 2 + (yy - 0.62) ** 2) / 0.012)))
+        fy, fx = np.gradient(-V)
+        peak = float(np.hypot(fx, fy).max()) or 1.0
+        true_field = np.stack([fx, fy], axis=-1) * (amp / peak)
+
+        # ── what the detector actually sees ────────────────────────────────
+        # rotate_shifts(θ) undoes a detector rotation of θ, so bake in −θ here.
+        from spyde.actions.dpc import rotate_shifts
+        observed = rotate_shifts(true_field, -rotation)
+        observed[..., 0] += offset[0] + ramp[0] * (xx - 0.5)
+        observed[..., 1] += offset[1] + ramp[1] * (yy - 0.5)
+
+        # get_direct_beam_position reports (centre − beam), so the BEAM sits at
+        # centre − shift. Build the patterns from that, and the measured shifts
+        # come back equal to `observed` — the fixture and the reader agree by
+        # construction rather than by a sign convention nobody re-derives.
+        gy, gx = np.mgrid[0:k, 0:k].astype(np.float32)
+        radius, edge = k * 0.22, k * 0.05
+        data = np.empty((n, n, k, k), dtype=np.float32)
+        for iy in range(n):
+            for ix in range(n):
+                bx = k / 2.0 - observed[iy, ix, 0]
+                by = k / 2.0 - observed[iy, ix, 1]
+                r = np.hypot(gx - bx, gy - by)
+                # A soft edge keeps the centre-of-mass sub-pixel accurate; a
+                # hard-edged disk quantises to whole pixels and the recovered
+                # field comes back stair-stepped.
+                data[iy, ix] = 1000.0 / (1.0 + np.exp((r - radius) / edge))
+
+        # `lazy` gives a storage-aligned dask version (chunks span whole signal
+        # frames, Live-Display §1) so the streamed per-nav-chunk beam-shift pass
+        # can be exercised against a REAL cluster — a different branch of
+        # ComputeBackend.compute_chunks_progressive than the threaded one.
+        if payload.get("lazy"):
+            import dask.array as da
+            nav_chunk = int(payload.get("nav_chunk", max(2, n // 3)))
+            s = hs.signals.Signal2D(
+                da.from_array(data, chunks=(nav_chunk, nav_chunk, k, k))).as_lazy()
+        else:
+            s = hs.signals.Signal2D(data)
+        try:
+            s.set_signal_type("electron_diffraction")
+        except Exception as e:
+            log.debug("set_signal_type on DPC test data failed: %s", e)
+        for ax, name in zip(s.axes_manager.navigation_axes, ("x", "y")):
+            ax.scale, ax.units, ax.name = 1.0, "nm", name
+        for ax, name in zip(s.axes_manager.signal_axes, ("kx", "ky")):
+            ax.scale, ax.units, ax.name = 0.002, "nm^-1", name
+            ax.offset = -(ax.size / 2.0) * float(ax.scale)
+        s.metadata.General.title = "Synthetic DPC"
+        s.metadata.set_item("Acquisition_instrument.TEM.beam_energy", 200)
+        s.metadata.set_item("Spyde.dpc_truth", {
+            "shift_field": true_field, "observed_shifts": observed,
+            "rotation": rotation, "offset": list(offset), "ramp": list(ramp),
+            "amplitude": amp,
+        })
+        self._add_signal(s, source_path="test_data_dpc")
+
     def _load_test_data_si_grains(self) -> None:
         """Test-only: BUNDLED synthetic Si-grains 4-D STEM (pyxem.data.si_grains —
         6×6 nav × 128×128 signal, generated on the fly, NO download). Unlike the

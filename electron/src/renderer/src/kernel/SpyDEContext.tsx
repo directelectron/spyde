@@ -1327,6 +1327,14 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'drift_trace':
         case 'drift_progress':
         case 'drift_result':
+        // DPC caret (spyde/actions/dpc_action.py) — the measured descan +
+        // available vacuum datasets, the fitted scan/detector rotation, and the
+        // derived field's stats. Consumed by DpcWizard; the map itself is a
+        // backend-painted figure window.
+        case 'dpc_state':
+        case 'dpc_estimate':
+        case 'dpc_result':
+        case 'dpc_region':
         // Cluster telemetry — consumed by the StatusBar DaskMonitor HUD.
         case 'dask_stats':
         // Read-throughput readout — consumed by the StatusBar IoThroughput HUD.
