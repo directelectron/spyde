@@ -31,6 +31,11 @@ jobs:
       test: ${{ steps.emit.outputs.test }}
       extras: ${{ steps.emit.outputs.extras }}
     steps:
+      # Two tiers: a PR runs a sharded subset, main runs the full cross
+      # product. The subset must still cover BOTH non-Linux platforms on an
+      # OLD and a NEW Python — a green PR that reddens main on merge is worse
+      # than a slower PR, and windows-py3.13 and macos-py3.11 are the legs that
+      # have actually caught platform-specific failures the others missed.
       - id: emit
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
@@ -47,6 +52,10 @@ jobs:
             {"os":"ubuntu-latest","python-version":"3.13","group":2},
             {"os":"windows-latest","python-version":"3.12","group":1},
             {"os":"windows-latest","python-version":"3.12","group":2},
+            {"os":"windows-latest","python-version":"3.13","group":1},
+            {"os":"windows-latest","python-version":"3.13","group":2},
+            {"os":"macos-latest","python-version":"3.11","group":1},
+            {"os":"macos-latest","python-version":"3.11","group":2},
             {"os":"macos-latest","python-version":"3.13","group":1},
             {"os":"macos-latest","python-version":"3.13","group":2}
           ]}
