@@ -263,3 +263,62 @@ markers = [
     "slow: slow tests (e.g. real template-library generation)",
     "network: tests that make a live network request (e.g. COD lookup)",
 ]
+
+# ── Changelog ─────────────────────────────────────────────────────────────────
+# towncrier assembles CHANGELOG.rst from one fragment file per PR, written while
+# the change is fresh. The alternative — deriving notes from commit subjects at
+# release time — reads like a commit log, because that is what it is: it cannot
+# say what a change means to someone upgrading, only what the author was doing.
+#
+# `package` is deliberately unset: this repo's version of record is
+# electron/package.json (see prepare_release.yml), not a Python __version__, so
+# the version is passed to `towncrier build` explicitly.
+[tool.towncrier]
+directory        = "upcoming_changes"
+filename         = "CHANGELOG.rst"
+start_string     = ".. towncrier release notes start\n"
+issue_format     = "`#{issue} <https://github.com/directelectron/spyde/pull/{issue}>`_"
+title_format     = "{version} ({project_date})"
+underlines       = ["=", "-", "~"]
+
+# Behaviour changes lead the notes: they are the entries a reader upgrading has
+# to ACT on, and they are easy to miss filed under "Bug Fixes".
+[[tool.towncrier.type]]
+directory    = "api_change"
+name         = "API and Behaviour Changes"
+showcontent  = true
+
+[[tool.towncrier.type]]
+directory    = "new_feature"
+name         = "New Features"
+showcontent  = true
+
+[[tool.towncrier.type]]
+directory    = "bugfix"
+name         = "Bug Fixes"
+showcontent  = true
+
+[[tool.towncrier.type]]
+directory    = "performance"
+name         = "Performance"
+showcontent  = true
+
+[[tool.towncrier.type]]
+directory    = "deprecation"
+name         = "Deprecations"
+showcontent  = true
+
+[[tool.towncrier.type]]
+directory    = "removal"
+name         = "Removals"
+showcontent  = true
+
+[[tool.towncrier.type]]
+directory    = "doc"
+name         = "Documentation"
+showcontent  = true
+
+[[tool.towncrier.type]]
+directory    = "maintenance"
+name         = "Maintenance"
+showcontent  = true

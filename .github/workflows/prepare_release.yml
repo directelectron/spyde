@@ -183,6 +183,28 @@ jobs:
       - name: Update download links (README + docs)
         run: node scripts/update-download-links.mjs "${{ steps.version.outputs.new_version }}" "${{ github.repository }}"
 
+      # Assemble CHANGELOG.rst from the per-PR fragments in upcoming_changes/
+      # and delete them. --yes skips the interactive confirm; the version is
+      # passed explicitly because this repo's version of record is
+      # electron/package.json, not a Python __version__ towncrier could read.
+      #
+      # Not fatal when there are no fragments: a release can legitimately carry
+      # none (a re-cut, or an rc bump with nothing new), and failing the whole
+      # prepare run over a missing news file would be worse than release notes
+      # that say nothing.
+      - name: Assemble the changelog
+        env:
+          V: ${{ steps.version.outputs.new_version }}
+        run: |
+          if ls upcoming_changes/*.rst 2>/dev/null | grep -qv README; then
+            # --draft first, into a temp file, so the PR body can quote the notes
+            # after `build` has consumed the fragments they came from.
+            uvx towncrier build --draft --version "$V" > "${RUNNER_TEMP}/release-notes.rst"
+            uvx towncrier build --yes   --version "$V"
+          else
+            echo "no changelog fragments — skipping towncrier"
+          fi
+
       # ── Commit and push ──────────────────────────────────────────────────
       - name: Configure git
         run: |
@@ -194,6 +216,10 @@ jobs:
           git checkout -b "${{ steps.version.outputs.branch }}"
           git add electron/package.json package-lock.json \
                   README.md doc/user_guide/installing.rst
+          # -A, because towncrier DELETES the fragments it consumed: a plain
+          # `git add <path>` stages the new CHANGELOG.rst but leaves the
+          # deletions unstaged, and the next release re-publishes them.
+          git add -A CHANGELOG.rst upcoming_changes
           git commit -m "chore: prepare release ${{ steps.version.outputs.tag }}"
           git push origin "${{ steps.version.outputs.branch }}"
 
@@ -217,6 +243,14 @@ jobs:
             version electron-builder/electron-updater use, and \`release.yml\` refuses
             to build a tag that doesn't match it
           - Pre-flight checks passed: \`uv lock --check\`, git deps pinned to SHAs/tags
+          - \`CHANGELOG.rst\` assembled from the fragments in \`upcoming_changes/\`
+
+          <details><summary><b>Release notes</b> (as they will appear in \`CHANGELOG.rst\`)</summary>
+
+          \`\`\`rst
+          $(cat "${RUNNER_TEMP}/release-notes.rst" 2>/dev/null || echo 'No changelog fragments were filed for this release.')
+          \`\`\`
+          </details>
 
           ### Review checklist
           - [ ] Version is correct in \`electron/package.json\`
