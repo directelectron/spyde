@@ -65,10 +65,10 @@ const VIEW_OPTIONS: readonly { value: View; label: string }[] = [
   { value: 'curl', label: 'Curl' },
 ]
 
-/** `dpc.BEAM_SHAPES` — the beam region's shape, or off. */
-type BeamShape = 'off' | 'circle' | 'ring'
+/** `dpc.BEAM_SHAPES`. There is no "off": the region is always on the pattern,
+ *  because it IS what the centre of mass is taken over. */
+type BeamShape = 'circle' | 'ring'
 const BEAM_SHAPES: readonly { value: BeamShape; label: string }[] = [
-  { value: 'off', label: 'Off' },
   { value: 'circle', label: 'Circle' },
   { value: 'ring', label: 'Ring' },
 ]
@@ -99,7 +99,7 @@ const DEFAULTS: DpcSaved = {
   halfSquareWidth: 0,
   centerMode: 'corners',
   cornerFraction: 0.05,
-  beamShape: 'off',
+  beamShape: 'circle',
   beamCx: 0.0,
   beamCy: 0.0,
   beamR: 0.0,
@@ -267,7 +267,7 @@ export function DpcWizard({ caretPos, windowId, sendAction, onClose }: Props) {
   // it. Same shape as the Crop / Center-Zero-Beam drag→field round trip.
   useWizardEvent('spyde:dpc_region', windowId, (d) => {
     const r: Region = {
-      shape: String(d.shape ?? 'off') as BeamShape,
+      shape: String(d.shape ?? 'circle') as BeamShape,
       cx: Number(d.cx ?? 0), cy: Number(d.cy ?? 0),
       r: Number(d.r ?? 0), r_inner: Number(d.r_inner ?? 0),
       brightness: d.brightness == null ? null : Number(d.brightness),
@@ -433,7 +433,8 @@ export function DpcWizard({ caretPos, windowId, sendAction, onClose }: Props) {
                 ))}
               </div>
             </Field>
-            {beamShape !== 'off' && (
+            {/* Always rendered: there is no shape that hides these. */}
+            {(
               <>
                 <Field label="Radius (px)">
                   <NumInput testid="dpc-beam-r" value={round1(beamR)} step="1"

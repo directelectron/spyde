@@ -442,15 +442,38 @@ class TestBeamRegion:
     def test_region_round_trips_through_a_dict(self):
         r = dpc.BeamRegion("ring", 1.5, 2.5, 9.0, 3.0)
         assert dpc.BeamRegion.from_dict(r.as_dict()) == r
-        assert dpc.BeamRegion.from_dict(None).shape == "off"
-        assert dpc.BeamRegion.from_dict({"shape": "nonsense"}).shape == "off"
+        assert dpc.BeamRegion.from_dict(None).shape == "circle"
+        assert dpc.BeamRegion.from_dict({"shape": "nonsense"}).shape == "circle"
+        assert dpc.BeamRegion.from_dict({"shape": "off"}).shape == "circle", \
+            "a saved report from before the region was always-on must still load"
 
-    def test_default_region_is_a_sane_starting_point(self):
+    def test_default_region_is_the_largest_that_fits(self):
+        """It must not CLIP the beam. The region is always on the pattern, so
+        this default is what an unattended scan is measured with, and a smaller
+        circle pulls the centroid towards its own centre — see
+        ``default_beam_region`` for the measured under-read."""
         d = dpc.default_beam_region((256, 512))
         assert (d.cx, d.cy) == (256.0, 128.0)      # centred on the DETECTOR
-        assert d.r == 64.0                          # a quarter of the short axis
+        assert d.r == 128.0                         # HALF the short axis
         assert 0 < d.r_inner < d.r
         assert d.active
+
+    def test_the_default_region_does_not_bias_the_shift(self):
+        """The claim the radius rests on, checked rather than asserted: on a
+        centred disc displaced by a known amount, the default region returns the
+        SAME shift the whole frame does."""
+        from scipy import ndimage as ndi
+        k = 32
+        gy, gx = np.mgrid[0:k, 0:k].astype(np.float32)
+        region = dpc.default_beam_region((k, k))
+        keep = region.mask((k, k))
+        for true_shift in (1.5, 3.0, 4.5):
+            r = np.hypot(gx - (k / 2 - true_shift), gy - k / 2)
+            frame = np.clip((k * 0.22 - r) / (k * 0.05) + 0.5, 0, 1)
+            masked = dpc._com_shift_frame(frame, keep, k / 2, k / 2)
+            whole_cy, whole_cx = ndi.center_of_mass(frame)
+            assert masked[0] == pytest.approx(k / 2 - whole_cx, abs=0.02)
+            assert masked[0] == pytest.approx(true_shift, abs=0.05)
 
     def test_the_region_lands_in_provenance(self):
         s, _k = self._scan()
@@ -899,28 +922,86 @@ class TestLazy:
         s.set_signal_type("electron_diffraction")
         assert dpc.beam_shift_graph(s) is None
 
-    def test_the_kernel_only_ever_sees_one_frame(self):
-        """Streaming is per FRAME inside a chunk, so peak memory is a frame —
-        not a chunk, and certainly not the dataset."""
+    def test_the_kernel_sees_one_chunk_and_allocates_only_the_result(self):
+        """Peak memory is a chunk — never the dataset — and the kernel is
+        VECTORISED over that chunk rather than called per frame.
+
+        It used to be a Python call per frame with a ``scipy.ndimage`` call
+        inside it, which is why a pass over a real scan took most of a minute:
+        at tens of thousands of frames the per-call overhead IS the runtime.
+        One ``einsum`` per chunk measured 37x faster on a 64x64x64x64 scan and
+        returns bit-identical numbers (see
+        ``test_the_vectorised_kernel_matches_the_per_frame_reference``).
+
+        What still has to hold is the memory rule: the kernel must not
+        materialise a float64 copy of the block it is handed. It contracts the
+        block against detector-sized weights instead, so the only thing it
+        allocates is the nav-sized result.
+        """
         s, arr = self._lazy()
-        seen = {"max": 0, "n": 0}
-        real = dpc._com_shift_frame
+        seen = {"blocks": [], "n": 0}
+        real = dpc._com_shift_blocks
 
-        def spy(frame, **kw):
+        def spy(block, *a, **kw):
             seen["n"] += 1
-            seen["max"] = max(seen["max"], np.asarray(frame).nbytes)
-            return real(frame, **kw)
+            seen["blocks"].append(np.asarray(block).nbytes)
+            out = real(block, *a, **kw)
+            assert out.nbytes < np.asarray(block).nbytes, \
+                "the kernel returned something the size of its input"
+            return out
 
-        dpc._com_shift_frame = spy
+        dpc._com_shift_blocks = spy
         try:
             shifts = dpc.measure_beam_shifts(
                 s, region=dpc.BeamRegion("circle", 18.0, 14.0, 8.0))
         finally:
-            dpc._com_shift_frame = real
-        one_frame = arr.shape[2] * arr.shape[3] * arr.dtype.itemsize
-        assert seen["n"] == arr.shape[0] * arr.shape[1]
-        assert seen["max"] <= one_frame * 1.01
+            dpc._com_shift_blocks = real
+
+        chunk_bytes = max(
+            np.prod([c[0] for c in arr.chunks]) * arr.dtype.itemsize, 1)
+        assert seen["n"] == len(arr.chunks[0]) * len(arr.chunks[1]), \
+            "the kernel ran per frame, not per chunk"
+        assert max(seen["blocks"]) <= chunk_bytes * 1.01, \
+            "the kernel was handed more than one chunk"
         assert shifts.shape == (arr.shape[0], arr.shape[1], 2)
+
+    def test_the_vectorised_kernel_matches_the_per_frame_reference(self):
+        """The fast path and the reference must agree EXACTLY, not closely.
+
+        ``_com_shift_frame`` is the documented equivalence to pyxem's
+        ``center_of_mass_from_image`` (``TestBeamRegion`` pins that), so the
+        vectorised kernel inherits that guarantee only for as long as the two
+        return the same bits. ``allclose`` would let a real drift through.
+        """
+        rng = np.random.default_rng(0)
+        k = 16
+        block = (rng.random((3, 4, k, k)) * 1000).astype(np.uint16)
+        region = dpc.BeamRegion("circle", k / 2, k / 2, k * 0.4)
+        keep = region.mask((k, k))
+
+        fast = dpc._com_shift_blocks(
+            block, dpc._region_weights(keep, (k, k)), k / 2, k / 2)
+        for iy in range(block.shape[0]):
+            for ix in range(block.shape[1]):
+                one = dpc._com_shift_frame(block[iy, ix], keep, k / 2, k / 2)
+                assert np.array_equal(fast[iy, ix], one), (iy, ix)
+
+    def test_an_empty_region_reads_as_no_measurement(self):
+        """A region with nothing under it yields NaN, not a centred beam.
+
+        Zero is the dangerous answer: it is exactly what an undeflected beam
+        looks like, so it would show as a real measurement of no field.
+        """
+        k = 16
+        block = np.zeros((2, 2, k, k), dtype=np.uint16)
+        block[1, 1, k // 2, k // 2] = 500          # one frame has signal
+        region = dpc.BeamRegion("circle", k / 2, k / 2, k * 0.4)
+        out = dpc._com_shift_blocks(
+            block, dpc._region_weights(region.mask((k, k)), (k, k)),
+            k / 2, k / 2)
+        assert np.isnan(out[0, 0]).all(), "an empty region reported a position"
+        assert np.isfinite(out[1, 1]).all(), "a real frame was dropped"
+
 
     def test_a_partial_field_survives_every_downstream_stage(self):
         """The whole point of streaming: NaN where nothing has landed yet must

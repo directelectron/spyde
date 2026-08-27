@@ -270,23 +270,23 @@ class TestCentering:
                                             beam_shape="circle")
         nav = _navigator_plot(session)
         assert "dpc_corners" in _markers(nav._plot2d)
-        assert wiz._beam_widget is not None
+        assert wiz._beam_selector.roi is not None
 
         dpca.dpc_set_center(session, plot, {"center_mode": "manual"})
         assert wiz._corner_mg is None
         assert "dpc_corners" not in _markers(nav._plot2d)
-        assert wiz._beam_widget is not None, \
+        assert wiz._beam_selector.roi is not None, \
             "the beam region is not owned by a Center mode"
 
         dpca.dpc_set_center(session, plot, {"center_mode": "none"})
-        assert wiz._corner_mg is None and wiz._beam_widget is not None
+        assert wiz._corner_mg is None and wiz._beam_selector.roi is not None
 
     def test_the_region_centre_becomes_the_manual_reference(self, window):
         """Drag the region onto the beam and Manual is already answered — no
         second marker to place, and no way for the two to disagree."""
         session, plot, _tree, wiz = _opened(window, center_mode="manual",
                                             beam_shape="circle")
-        assert wiz._beam_widget is not None
+        assert wiz._beam_selector.roi is not None
         wiz.params.update({"beam_cx": 20.0, "beam_cy": 12.0, "beam_r": 6.0})
         dpca.dpc_pick_center(session, plot, {})
         assert wiz.params["cx"] == 20.0 and wiz.params["cy"] == 12.0
@@ -305,9 +305,12 @@ class TestCentering:
         assert wiz.manual_center() == (18.0, 14.0)
         assert wiz.reference()[..., 0] == pytest.approx(16.0 - 18.0)
 
-    def test_picking_with_no_region_errors_instead_of_guessing(self, window):
-        session, plot, _tree, _wiz = _opened(window, center_mode="none",
-                                             beam_shape="off")
+    def test_picking_before_the_region_has_a_radius_errors(self, window):
+        """There is no "off" shape any more, so the only way to have no usable
+        region is the moment before the detector size has filled the radii in —
+        which is what ``BeamRegion.active`` still guards."""
+        session, plot, _tree, wiz = _opened(window, center_mode="none")
+        wiz.params["beam_r"] = 0.0
         dpca.dpc_pick_center(session, plot, {})
         assert any("beam region" in e for e in _errors(window["messages"]))
 
@@ -338,69 +341,124 @@ class TestCentering:
         assert wiz.result is not None
         assert not _errors(window["messages"])
 
-    def test_the_beam_region_widget_matches_the_shape(self, window):
+    def test_the_beam_region_selector_matches_the_shape(self, window):
         """Circle and ring are different anyplotlib widget TYPES, so switching
-        rebuilds rather than mutates — and the widget on screen must be the one
-        the mask is computed from."""
+        rebuilds the SELECTOR rather than mutating it — and the widget on screen
+        must be the one the mask is computed from.
+
+        The region is a real ``BaseSelector`` (the same one a virtual image puts
+        on this plot), which is what gives it the navigator's latest-wins
+        dispatch and settle re-fire instead of a hand-rolled debounce.
+        """
+        from spyde.drawing.selectors import AnnularSelector, CircleSelector
+
         session, plot, _tree, wiz = _opened(window, beam_shape="circle")
-        assert type(wiz._beam_widget).__name__ == "CircleWidget"
+        assert isinstance(wiz._beam_selector, CircleSelector)
+        assert type(wiz._beam_selector.roi).__name__ == "CircleWidget"
         assert wiz.region().shape == "circle" and wiz.region().r > 0
 
         dpca.dpc_set_beam(session, plot, {"beam_shape": "ring"})
-        assert _wait(lambda: type(wiz._beam_widget).__name__ == "AnnularWidget")
+        assert _wait(lambda: isinstance(wiz._beam_selector, AnnularSelector))
+        assert type(wiz._beam_selector.roi).__name__ == "AnnularWidget"
         assert wiz.region().shape == "ring"
         assert 0 < wiz.region().r_inner < wiz.region().r
 
-        dpca.dpc_set_beam(session, plot, {"beam_shape": "off"})
-        assert wiz._beam_widget is None and not wiz.region().active
+    def test_the_region_is_always_on_the_pattern(self, window):
+        """There is no "off". The region IS what the centre of mass is taken
+        over, so switching it off only meant taking the whole frame with no
+        handle to grab — a control whose useful setting was "not that one"."""
+        session, _plot, _tree, wiz = _opened(window)
+        assert wiz._beam_selector is not None
+        assert wiz.region().active, "the region opened without a usable radius"
+        assert "off" not in dpca._dpc.BEAM_SHAPES
+        assert dpca.DEFAULTS["beam_shape"] in dpca._dpc.BEAM_SHAPES
 
     def test_radii_are_filled_in_from_the_detector_size(self, window):
         """They cannot be declared in DEFAULTS — a sensible radius is a fraction
-        of a detector whose size is unknown until a dataset is open."""
-        session, plot, _tree, wiz = _opened(window, beam_shape="off")
-        assert wiz.params["beam_r"] == 0.0
-        dpca.dpc_set_beam(session, plot, {"beam_shape": "circle"})
+        of a detector whose size is unknown until a dataset is open. Opening the
+        wizard is therefore what fills them in, since the region is always on."""
+        session, plot, _tree, wiz = _opened(window)
         sy, sx = wiz._sig_shape()
-        assert wiz.params["beam_r"] == pytest.approx(0.25 * min(sy, sx))
+        # The INSCRIBED circle: the region is always on, so its default is what
+        # an unattended scan is measured with, and a smaller one clips the beam
+        # and under-reads the shift. See dpc.default_beam_region for the numbers.
+        assert wiz.params["beam_r"] == pytest.approx(0.5 * min(sy, sx))
         assert (wiz.params["beam_cx"], wiz.params["beam_cy"]) == (sx / 2, sy / 2)
 
-    def test_a_drag_frame_costs_nothing_and_the_release_pays(self, window):
-        """Every cost waits for ``pointer_up``.
+    def test_a_moved_region_re_measures_through_the_selector(self, window):
+        """The map tracks the region as it moves, the way a virtual image tracks
+        its detector ROI — and for the same reason: the region IS a
+        ``BaseSelector``, so every move goes through the navigator's serial
+        latest-wins dispatcher and cancels the compute it replaces.
 
-        Two of them. Re-measuring the scan is the obvious one. The other is the
-        brightness readout, which reads a frame — a dask compute on a lazy scan
-        — and firing one per pointer frame queues work faster than it drains,
-        so the caret's own radius keeps climbing after the pointer has stopped.
-        A drag frame must therefore do no reading at all, only echo geometry.
+        Waiting for ``pointer_up`` left the map frozen for the whole gesture
+        (measured in the real app: zero repaints across a 6.4 s drag).
         """
         session, plot, _tree, wiz = _opened(window, beam_shape="circle")
-        measures = {"n": 0}
-        reads = {"n": 0}
-        import spyde.actions.dpc as dpc_mod
-        real_measure = dpc_mod.measure_beam_shifts
-        real_brightness = dpc_mod.region_brightness
-        dpc_mod.measure_beam_shifts = lambda *a, **k: (
-            measures.__setitem__("n", measures["n"] + 1) or real_measure(*a, **k))
-        dpc_mod.region_brightness = lambda *a, **k: (
-            reads.__setitem__("n", reads["n"] + 1) or real_brightness(*a, **k))
-        try:
-            for r in (8.0, 9.0, 10.0, 11.0):     # a drag, frame by frame
-                wiz._beam_widget.set(r=r)
-                wiz._on_region_drag(_drag_frame())
-            assert measures["n"] == 0, "a drag frame re-measured the whole scan"
-            assert reads["n"] == 0, \
-                "a drag frame read a frame for the brightness readout"
-            assert wiz._settle_timer is None, "a drag frame armed the re-measure"
-            assert wiz.params["beam_r"] == pytest.approx(11.0), \
-                "the drag must still track the widget, it just must not read"
+        passes: list = []
+        wiz.measure = lambda **kwargs: passes.append(wiz.region().r)
 
-            wiz._on_region_drag(_release())
-            assert reads["n"] == 1, "the release did not refresh the brightness"
-            assert _wait(lambda: measures["n"] >= 1, timeout=10.0), \
-                "the release never fired the re-measure"
-            assert measures["n"] == 1, "the settle should coalesce to ONE measure"
+        # Driven by moving the WIDGET, not by calling the hook: what is under
+        # test is that the selector carries a move all the way to a re-measure
+        # on its own, which is the whole point of it being a BaseSelector.
+        for r in (8.0, 9.0, 10.0, 11.0):         # a drag, frame by frame
+            before = len(passes)
+            wiz._beam_selector.roi.set(r=r)
+            assert _wait(lambda: len(passes) > before, timeout=10.0), \
+                f"moving the region to r={r} never re-measured"
+
+        assert passes[-1] == pytest.approx(11.0), \
+            "the last pass measured a region the widget had already moved off"
+        assert wiz.params["beam_r"] == pytest.approx(11.0), \
+            "the widget geometry must track the pointer every frame"
+
+    def test_a_superseded_pass_is_cancelled_not_left_to_finish(self, window):
+        """Each move cancels the pass it replaces. A beam-shift pass reads the
+        whole scan, so one nobody is waiting for costs the cluster the entire
+        dataset — the same contract ``virtual_image`` keeps."""
+        session, plot, _tree, wiz = _opened(window, beam_shape="circle")
+        first = [False]
+        wiz._track_measure(first)
+        assert wiz._measure_stop is first
+
+        wiz._beam_selector.roi.set(r=9.0)
+        assert _wait(lambda: first[0], timeout=10.0), \
+            "moving the region left the previous pass running"
+        assert wiz._measure_stop is not first, \
+            "the new pass did not take the slot from the one it superseded"
+
+
+    def test_moving_the_region_does_not_read_a_frame_for_the_brightness(self, window):
+        """The brightness readout reads a FRAME — a dask compute on a lazy scan
+        — so one per pointer frame queues work faster than it drains, and the
+        caret's own radius keeps climbing after the pointer stops. Re-measuring
+        has no such problem (it dispatches and returns, and a superseded pass is
+        cancelled), which is why the two are not on the same cadence: the
+        readout refreshes when a pass LANDS.
+        """
+        import threading
+
+        import spyde.actions.dpc as dpc_mod
+        reads: list = []
+        real_brightness = dpc_mod.region_brightness
+        dpc_mod.region_brightness = lambda *a, **k: (
+            reads.append(threading.current_thread()) or real_brightness(*a, **k))
+        try:
+            session, plot, _tree, wiz = _opened(window, beam_shape="circle")
+            wiz.measure = lambda **kwargs: None      # not what this test is about
+            reads.clear()
+            for r in (8.0, 9.0, 10.0, 11.0):
+                wiz._beam_selector.roi.set(r=r)
+                wiz._on_region_moved()
+            assert reads == [], \
+                "moving the region read a frame for the brightness readout"
+
+            wiz.emit_region(with_brightness=True)    # what a landed pass does
+            assert _wait(lambda: len(reads) >= 1, timeout=10.0), \
+                "a landed pass never refreshed the brightness"
+            assert reads[0] is not threading.current_thread(), \
+                "the brightness probe ran on the caller's thread, stalling the drag"
         finally:
-            dpc_mod.measure_beam_shifts = real_measure
             dpc_mod.region_brightness = real_brightness
 
     def test_a_measure_abandoned_by_close_does_not_shout(self, window):
@@ -429,18 +487,22 @@ class TestCentering:
         wiz._measure_failed(stale, RuntimeError("boom"))
         assert len(_errors(window["messages"])) == before
 
-    def test_the_drag_debounce_cannot_fire_after_teardown(self, window):
+    def test_the_settle_re_fire_cannot_fire_after_teardown(self, window):
         """A timer that survives close would re-measure a torn-down wizard on a
-        worker thread."""
+        worker thread. The timer belongs to the SELECTOR now, so closing the
+        wizard has to close the selector — which is the one thing that could
+        quietly stop happening when the region stopped being a raw widget."""
         session, plot, _tree, wiz = _opened(window, beam_shape="circle")
-        wiz._on_region_drag(_release())
-        assert wiz._settle_timer is not None
+        selector = wiz._beam_selector
+        selector.update_data()                       # arms the settle re-fire
+        assert _wait(lambda: selector._settle_timer is not None, timeout=5.0)
         dpca.dpc_close(session, plot, {})
-        assert wiz._settle_timer is None and wiz._closed
+        assert selector._settle_timer is None and wiz._closed
+        assert wiz._beam_selector is None
 
     def test_the_region_is_echoed_back_for_the_caret(self, window):
         session, plot, _tree, wiz = _opened(window, beam_shape="circle")
-        wiz._on_region_drag()
+        wiz._on_region_moved()
         msgs = _of_type(window["messages"], "dpc_region")
         assert msgs, "no dpc_region echo reached the caret"
         last = msgs[-1]
@@ -537,9 +599,13 @@ class TestLive:
         each lands — the difference between a filling field and a spinner on a
         scan that takes minutes.
 
-        Asserted on the PROGRESS stream and on partial state, not on timing: a
-        single final repaint would emit one progress message and never expose a
-        half-NaN field.
+        Asserted on the PROGRESS stream, which reports what each landing chunk
+        triggered. NOT on how much of the field was finite when a repaint ran:
+        the repaints are marshalled to the event loop and the pass now finishes
+        in milliseconds, so every one of them can legitimately see a complete
+        field and still have been driven by a separate chunk. That is the
+        compute being fast, not the stream having collapsed — measuring it that
+        way made this test fail on a 37x speedup.
         """
         import dask.array as da
         import hyperspy.api as hs
@@ -583,16 +649,21 @@ class TestLive:
             dpca.DpcWizard.refresh = real_refresh
 
         assert seen_partial, "the map was never repainted"
-        # The whole claim: at least one repaint happened while the field was
-        # still incomplete.
-        assert any(0 < n < total_positions for n in seen_partial), \
-            f"no partial repaint — the map only appeared at the end: {seen_partial}"
+        assert seen_partial[-1] == total_positions, \
+            f"the streamed pass left holes in the field: {seen_partial}"
 
-        progress = [m for m in window["messages"]
+        # The whole claim: the map was repainted MORE THAN ONCE, once per nav
+        # chunk that landed, rather than a single paint at the end.
+        chunks = (nav // chunk) ** 2
+        streamed = [m for m in window["messages"]
                     if isinstance(m, dict) and m.get("type") == "progress"
-                    and "DPC" in str(m.get("label", ""))]
-        assert len(progress) >= 2, f"progress was not streamed: {progress}"
-        assert progress[0]["total"] == (nav // chunk) ** 2, \
+                    and "DPC" in str(m.get("label", ""))
+                    and m.get("total") == chunks]
+        assert len(streamed) >= 2, \
+            f"the pass did not stream — one paint at the end: {streamed}"
+        assert any(0 < m["done"] < chunks for m in streamed), \
+            f"no chunk reported partial progress: {streamed}"
+        assert streamed[0]["total"] == chunks, \
             "progress should count NAV CHUNKS, matching the storage layout"
 
     def test_an_eager_scan_does_not_pretend_to_stream(self, window):
@@ -831,11 +902,44 @@ class TestMeasureIsolation:
             "the worker was handed the tree's live signal — two passes would race"
         assert handed_data is live.data, "the view must share the data buffer"
 
-    def test_overlapping_passes_get_separate_objects(self, window):
-        _tree, seen = self._measured_signals(window, opens=3)
-        assert len(seen) >= 2
-        assert len({id(signal) for signal, _data in seen}) == len(seen), \
+    def test_every_pass_gets_its_own_object_and_they_cannot_overlap(self, window):
+        """Two guarantees, and the second is what makes the first sufficient.
+
+        Each pass is handed its own view, so two of them cannot read each
+        other's state. And they are set up on a SINGLE-thread lane, so two
+        set-ups never run at once — which is the stronger property, because
+        ``private_view`` is itself the operation that is unsafe to overlap
+        (hyperspy parks a length-1 placeholder on ``.data`` while it copies).
+
+        Passes are run sequentially here rather than raced: a superseded pass is
+        now cancelled before the lane ever picks it up, so open/close/open no
+        longer produces two calls to compare.
+        """
+        session, plot, _tree, wiz = _opened(window)
+        seen = []
+        real = dpca._dpc.measure_beam_shifts
+
+        def spy(signal, **kw):
+            seen.append(signal)
+            return real(signal, **kw)
+
+        dpca._dpc.measure_beam_shifts = spy
+        try:
+            for _ in range(3):
+                before = len(seen)
+                wiz.measure()
+                assert _wait(lambda: len(seen) > before, timeout=30.0), \
+                    "a measure never reached the worker"
+        finally:
+            dpca._dpc.measure_beam_shifts = real
+
+        live = dpca._current_signal(_signal_plot(session))
+        assert all(s is not live for s in seen), \
+            "a pass was handed the tree's live signal — two would race"
+        assert len({id(s) for s in seen}) == len(seen), \
             "two measures shared one signal object"
+        assert wiz._pass_lane()._max_workers == 1, \
+            "the pass lane must be serial — private_view cannot overlap itself"
 
 
 @pytest.mark.usefixtures("_capture_module_emit")
