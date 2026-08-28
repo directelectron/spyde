@@ -43,13 +43,31 @@ async function texts(page: any): Promise<string[]> {
     .allInnerTexts().then((t: string[]) => t.map(s => s.trim()))
 }
 
+/**
+ * Add a cell and commit `body` into it.
+ *
+ * Every step waits for the state the NEXT one reaches for, because each step
+ * addresses "the last cell" and is therefore wrong the moment it runs early:
+ * dblclick before the new cell mounts opens the PREVIOUS cell's editor, and
+ * returning before the commit renders means the following call races it. That
+ * happened to hold together on Electron 34 and stopped doing so on 44 — the
+ * cells came back as ['Beta', empty, empty]. The app was never at fault; the
+ * assumption that a click had landed by the next line was.
+ */
 async function addText(page: any, body: string) {
+  const before = await page.locator('[data-testid^="report-cell-rendered-"]').count()
   await page.getByTestId('report-add-text').click()
-  const last = page.locator('[data-testid^="report-cell-rendered-"]').last()
-  await last.dblclick()
+  await expect
+    .poll(async () => page.locator('[data-testid^="report-cell-rendered-"]').count())
+    .toBeGreaterThan(before)
+
+  await page.locator('[data-testid^="report-cell-rendered-"]').last().dblclick()
   const ta = page.locator('[data-testid^="report-cell-textarea-"]').last()
+  await expect(ta).toBeVisible()
   await ta.fill(body)
   await ta.press('Control+Enter')
+  await expect(page.locator('[data-testid^="report-cell-rendered-"]').last())
+    .toHaveText(body, { timeout: 10_000 })
 }
 
 test('1) a report with three text cells', async () => {
