@@ -641,6 +641,9 @@ interface SpyDEContextValue {
   gpuHelpDialogOpen: boolean
   openGpuHelpDialog: () => void
   closeGpuHelpDialog: () => void
+  reportDialogOpen: boolean
+  openReportDialog: () => void
+  closeReportDialog: () => void
   // MDIArea registers its tile-all-windows function here so StatusBar's
   // "Tile" button can trigger it without threading window-layout state (which
   // lives in MDIArea's local refs) through the shared context.
@@ -727,6 +730,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
   const [updateDialogOpen, setUpdateDialogOpen] = useState(false)
   const [gpuStatusDialogOpen, setGpuStatusDialogOpen] = useState(false)
   const [gpuHelpDialogOpen, setGpuHelpDialogOpen] = useState(false)
+  const [reportDialogOpen, setReportDialogOpen] = useState(false)
   const [dragKind, setDragKind] = useState<'window' | null>(null)
 
   // Replay is the bridge's; see @de/shell-renderer/figureBridge for why it
@@ -1462,6 +1466,9 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     const disposeGpuHelpDialog = window.electron.onOpenGpuHelpDialog(() =>
       setGpuHelpDialogOpen(true),
     )
+    const disposeReportDialog = window.electron.onOpenReportDialog(() =>
+      setReportDialogOpen(true),
+    )
 
     // Forward iframe events to Python
     const onMessage = (e: MessageEvent) => {
@@ -1496,6 +1503,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
       disposeUpdateDialog?.()
       disposeGpuStatusDialog?.()
       disposeGpuHelpDialog?.()
+      disposeReportDialog?.()
       window.removeEventListener('message', onMessage)
       if (testHooksEnabled) {
         delete window._spyde_test_inject
@@ -1668,6 +1676,8 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
   const closeGpuStatusDialog = () => setGpuStatusDialogOpen(false)
   const openGpuHelpDialog = () => setGpuHelpDialogOpen(true)
   const closeGpuHelpDialog = () => setGpuHelpDialogOpen(false)
+  const openReportDialog = () => setReportDialogOpen(true)
+  const closeReportDialog = () => setReportDialogOpen(false)
 
   return (
     <SpyDEContext.Provider value={{
@@ -1677,6 +1687,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
       updateDialogOpen, openUpdateDialog, closeUpdateDialog,
       gpuStatusDialogOpen, openGpuStatusDialog, closeGpuStatusDialog,
       gpuHelpDialogOpen, openGpuHelpDialog, closeGpuHelpDialog,
+      reportDialogOpen, openReportDialog, closeReportDialog,
       tileWindowsRef, dragKind,
     }}>
       {children}

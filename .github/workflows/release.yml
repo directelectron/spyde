@@ -323,6 +323,13 @@ jobs:
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Where Help → Report a Problem sends reports. A Sentry DSN is a
+          # write-only public key, so baking it into the build is how Sentry is
+          # meant to be used — it lives in the repo secrets rather than the
+          # source so it can be rotated without a release, and so a fork builds
+          # with reporting simply off. Absent, reports are written to the user's
+          # data directory instead of sent, and the dialog says so.
+          SPYDE_SENTRY_DSN: ${{ secrets.SPYDE_SENTRY_DSN }}
           # macOS notarization (electron-builder's notarize:true reads these). Empty
           # on non-mac legs / secret-less runs → notarization is simply skipped there.
           # APPLE_API_KEY is a PATH, set by the "Stage notarization API key" step.

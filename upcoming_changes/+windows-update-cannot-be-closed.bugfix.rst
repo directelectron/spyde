@@ -1,0 +1,1 @@
+Updating on Windows no longer dead-ends in "SpyDE cannot be closed. Please close it manually and click Retry": the app now shuts its analysis backend down before handing off to the installer, and the installer waits for whole process trees to exit instead of giving up after two rounds.

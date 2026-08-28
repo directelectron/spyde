@@ -16,7 +16,18 @@ export type { ShellConfig } from './config'
 
 export {
   startBackend, stopBackend, sendAction, sendFigureEvent, sendResize,
+  recentBackendOutput,
 } from './backendProcess'
+
+export { recordProblem, recordedProblems } from './problemLog'
+export type { Problem } from './problemLog'
+
+export {
+  initErrorReporting, reportingConfigured, collectDiagnostics, submitReport,
+} from './errorReport'
+export type { Diagnostics, ReportResult } from './errorReport'
+
+export { parseSentryDsn } from './sentryEnvelope'
 
 export { registerShellDialogs } from './dialogs'
 export type { FileFilter } from './dialogs'

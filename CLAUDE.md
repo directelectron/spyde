@@ -135,6 +135,15 @@ A Direct Electron `.csb` file is a **sparse event stream, not a frame stack** �
 - `log_stream.py`: tags each log record with a subsystem `area` (`_area_for` / `_AREA_RULES`) and streams it to the renderer's Log panel (which has search + area filter).
 - `process_guard.py`: reaps orphaned Dask worker subprocesses on exit (Windows Job Object).
 
+### Update handoff + problem reports (`packages/shell-main/`)
+Both live in the shared shell, so all three DE apps get them.
+
+**The update handoff is a race, and losing it strands the user.** electron-updater spawns the installer FIRST and only then asks the app to quit, so for a second or two both are alive — and the Windows installer opens by refusing to touch a directory anything is still running out of. Two halves keep that from dead-ending in "SpyDE cannot be closed. Please close it manually and click Retry" (whose Retry re-runs the identical check, so the only way out was uninstalling by hand):
+- `updater.ts` `quitAndInstall()` tree-kills the Python sidecar **synchronously** (`stopBackend({immediate: true})` — the ordinary path arms a 1.5 s timer that an exiting process never lives to fire) and force-exits after the handoff rather than trusting Electron's graceful quit to win.
+- `electron/build/installer.nsh` replaces electron-builder's stock app-running check via the `customCheckAppRunning` macro — kills whole process **trees** by pid, waits between rounds, and gives the app several seconds before asking the user anything. **Do not delete this file**: electron-builder picks it up silently as the `nsis.include` default, so removing it restores the stock behaviour with no build error.
+
+**Problem reports are user-initiated and go to Sentry.** `errorReport.ts` collects OS / app + runtime versions / GPU / managed-Python-env state / the last updater status / the tail of the backend's output, and posts it as a Sentry envelope written against the ingest protocol directly (`sentryEnvelope.ts`, unit-tested) rather than via `@sentry/electron` — the SDK's value is automatic crash capture, which the "nothing without a click" decision rules out anyway, and skipping it keeps a native crash handler out of the notarized macOS build. `problemLog.ts` is the bounded ring of failures recorded as they happen (its own module purely to keep `updater.ts` → ring → `errorReport.ts` → `updater.ts` from being a cycle); it never leaves the machine on its own. The DSN comes from `SPYDE_SENTRY_DSN` at build time (repo secret → `electron.vite.config.ts` `define`); with none, reports are still written to `<userData>/reports/` and the dialog says so — that is the offline instrument-PC path, not a degraded one.
+
 ## Testing
 
 Tests are **Qt-free** (no `pytest-qt`, no `QApplication`). They build a real `Session` (with a 1-worker Dask cluster) and assert on the JSON messages it emits + the signal-tree/plot state. Fixtures live in `spyde/tests/migrated/conftest.py`:

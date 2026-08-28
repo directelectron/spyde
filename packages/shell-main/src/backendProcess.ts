@@ -4,7 +4,7 @@
  * Spawns the resolved backend command (see pythonEnv.ts) and maintains
  * the bidirectional PLOTAPP: JSON protocol over stdin/stdout.
  */
-import { spawn, ChildProcess } from 'child_process'
+import { spawn, spawnSync, ChildProcess } from 'child_process'
 import process from 'process'
 import { shellConfig } from './config'
 
@@ -22,6 +22,33 @@ const NL = 0x0a
 
 let proc: ChildProcess | null = null
 let tickTimer: ReturnType<typeof setInterval> | null = null
+
+/**
+ * The sidecar's last few hundred output lines, for a problem report.
+ *
+ * The renderer's log panel has the same text, but it lives in a window that a
+ * crash may have taken down, and it is not reachable from the main process
+ * where a report is assembled. Bounded so a chatty run cannot grow it without
+ * limit; long lines are clipped because a report is meant to be read.
+ */
+const MAX_OUTPUT_LINES = 300
+const MAX_OUTPUT_LINE_CHARS = 1000
+const backendOutput: string[] = []
+
+function rememberOutput(text: string): void {
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue
+    backendOutput.push(line.slice(0, MAX_OUTPUT_LINE_CHARS))
+  }
+  if (backendOutput.length > MAX_OUTPUT_LINES) {
+    backendOutput.splice(0, backendOutput.length - MAX_OUTPUT_LINES)
+  }
+}
+
+/** The sidecar's recent output, oldest first. */
+export function recentBackendOutput(): string[] {
+  return [...backendOutput]
+}
 
 export function startBackend(
   pythonCmd: string[],
@@ -104,17 +131,20 @@ export function startBackend(
           handlers.onMessage(JSON.parse(line.slice(8)) as Record<string, unknown>)
         } catch { /* malformed line — ignore */ }
       } else if (line.trim()) {
+        rememberOutput(line)
         handlers.onStream(line + '\n', 'stdout')
       }
     }
   })
 
-  proc.stderr!.on('data', (d: Buffer) =>
+  proc.stderr!.on('data', (d: Buffer) => {
+    rememberOutput(d.toString())
     handlers.onStream(d.toString(), 'stderr')
-  )
+  })
 
   proc.on('close', (code) => {
     proc = null
+    rememberOutput(`[exited with code ${code}]`)
     handlers.onStream(`[${shellConfig().appName} exited with code ${code}]\n`, 'stderr')
     // Surface the death to the renderer so the UI doesn't silently freeze —
     // every sendAction() after this no-ops (proc is null), so without this the
@@ -171,9 +201,17 @@ export function sendResize(figId: string, width: number, height: number): void {
  *
  * Idempotent and null-safe: callable from window-all-closed, before-quit, and a
  * signal handler without double-killing.
+ *
+ * `immediate` skips the grace period and tree-kills BEFORE returning. Step 2's
+ * timers only fire while this process is still alive, so a caller that is about
+ * to end the process (the update handoff — see updater.ts) would otherwise leave
+ * the sidecar and its Dask workers running: the graceful `quit` is written, the
+ * timer is armed, and Electron exits before it can fire. The Windows installer
+ * that starts moments later then finds processes still holding the install
+ * directory and refuses to continue.
  */
 let stopping = false
-export function stopBackend(): void {
+export function stopBackend(options: { immediate?: boolean } = {}): void {
   const p = proc
   if (!p || stopping) {
     proc = null
@@ -202,6 +240,10 @@ export function stopBackend(): void {
 
   // 2. Backstop: if it hasn't exited shortly, kill the whole process tree so no
   //    Dask worker/nanny grandchildren are left behind.
+  if (options.immediate) {
+    killTreeNow(p, pid)
+    return
+  }
   if (process.platform === 'win32') {
     if (pid !== undefined) {
       setTimeout(() => {
@@ -222,5 +264,30 @@ export function stopBackend(): void {
         try { p.kill('SIGKILL') } catch { /* */ }
       }, 1500)
     }, 1500)
+  }
+}
+
+/**
+ * Kill the sidecar's whole process tree and return once the request has been
+ * made — no timers, so it still runs when the caller is about to end this
+ * process. `spawnSync` is the point: a detached `spawn` would only be queued.
+ */
+function killTreeNow(p: ChildProcess, pid: number | undefined): void {
+  if (p.exitCode !== null || p.signalCode !== null) return
+  if (process.platform === 'win32') {
+    if (pid !== undefined) {
+      try {
+        spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore' })
+        return
+      } catch { /* fall through to the direct kill */ }
+    }
+    try { p.kill() } catch { /* nothing else to do */ }
+    return
+  }
+  try { p.kill('SIGKILL') } catch { /* nothing else to do */ }
+  // The workers are grandchildren, so also target the child's process group
+  // when it leads one. A pid that leads no group simply has no group to match.
+  if (pid !== undefined) {
+    try { process.kill(-pid, 'SIGKILL') } catch { /* no such group */ }
   }
 }

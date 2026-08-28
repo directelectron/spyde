@@ -13,6 +13,7 @@ declare global {
       onOpenUpdateDialog: (cb: () => void) => () => void
       onOpenGpuStatusDialog: (cb: () => void) => () => void
       onOpenGpuHelpDialog: (cb: () => void) => () => void
+      onOpenReportDialog: (cb: () => void) => () => void
       onUpdateStatus: (cb: (status: Record<string, unknown>) => void) => () => void
       action: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
       openFile: () => Promise<void>
@@ -51,6 +52,16 @@ declare global {
         busy: boolean
       }>
       gpuFixTorch: () => Promise<{ ok: boolean; error?: string }>
+      reportDiagnostics: () => Promise<{
+        canSend: boolean
+        diagnostics: Record<string, unknown>
+      }>
+      submitReport: (input: { message: string; contact?: string }) => Promise<{
+        sent: boolean
+        eventId?: string
+        bundlePath?: string
+        error?: string
+      }>
     }
 
     // Test-only hooks attached by the renderer for Playwright e2e (DEV /
