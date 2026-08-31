@@ -565,7 +565,16 @@ function backendErrorLines(backendOrLines) {
  * landing inside its own window.
  */
 async function raiseWindow(win) {
-  await win.getByTestId('subwindow-title').click()
+  // DISPATCH rather than click. A real click has to win hit-testing, and the
+  // whole reason we are raising is that something is on top — including,
+  // sometimes, the titlebar itself, which left the raise timing out with the
+  // very "iframe ... intercepts pointer events" it was added to avoid.
+  // SubWindow raises on mousedown on its root (`onMouseDown={() => onFocus(id)}`),
+  // so dispatching there fires the same handler whatever is above it.
+  //
+  // This is a SETUP step, not the thing under test: whatever the spec does
+  // next is still a real, hit-tested click, so nothing is being papered over.
+  await win.dispatchEvent('mousedown')
   return win
 }
 
