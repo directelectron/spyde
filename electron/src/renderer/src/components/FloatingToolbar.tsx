@@ -97,6 +97,9 @@ interface Props {
   /** True when the bar should sit INSIDE the window's bottom edge (maximized /
    *  no room below the window). */
   inside?: boolean
+  /** Fires whenever a caret opens or closes. MDIArea keeps the owning window on
+   *  top while one is open — see MDI_Z_CEILING. */
+  onCaretOpenChange?: (open: boolean) => void
 }
 
 function defaultsOf(parameters: Record<string, ParamSpec>): Record<string, unknown> {
@@ -112,7 +115,7 @@ const hasPopout = (a: ToolbarAction) => hasParams(a) || hasSubs(a)
 
 export function FloatingToolbar({
   actions, windowId, onAction, visible = true, onHoverShow, onHoverHide,
-  winRect, areaSize, inside = false,
+  winRect, areaSize, inside = false, onCaretOpenChange,
 }: Props) {
   const { state, sendAction } = useSpyDE()
   const [openName, setOpenName] = React.useState<string | null>(null)
@@ -126,6 +129,14 @@ export function FloatingToolbar({
    *  re-runs when a caret changes width without changing placement. */
   const [caretW, setCaretW] = React.useState(240)
   const live = state.activeActions.get(windowId) ?? EMPTY
+
+  // Tell MDIArea while a caret is open. The caret is rendered INSIDE this
+  // window, whose root carries a z-index and so forms a stacking context — no
+  // z-index the caret gives itself can lift it above a sibling window. Keeping
+  // the owning window on top is what actually keeps the caret reachable.
+  React.useEffect(() => {
+    onCaretOpenChange?.(openName !== null)
+  }, [openName, onCaretOpenChange])
 
   // Keep the toolbar shown while a popout/caret is open or an action is live —
   // otherwise reveal only on hover (over the window or the toolbar).

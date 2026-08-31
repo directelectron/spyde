@@ -191,7 +191,25 @@ export function MDIArea() {
     setActiveWindow(parseInt(id, 10))
   }, [setActiveWindow])
 
+  // Windows with an open caret. Their caret renders inside the window, whose
+  // root forms a stacking context, so the caret cannot paint above a sibling
+  // window however high its own z-index goes (measured: a caret at z-index 1002
+  // lost to a window at 11). Keeping the owning window on top is the only thing
+  // that keeps the caret reachable — otherwise a result window opened by the
+  // very action the caret is running lands over it and its figure iframe eats
+  // every click. See caret_above_windows.spec.ts.
+  const [caretWindows, setCaretWindows] = useState<ReadonlySet<string>>(new Set())
+  const setCaretOpen = React.useCallback((id: string, open: boolean) => {
+    setCaretWindows((prev) => {
+      if (prev.has(id) === open) return prev
+      const next = new Set(prev)
+      if (open) next.add(id); else next.delete(id)
+      return next
+    })
+  }, [])
+
   const getZ = (id: string) => {
+    if (caretWindows.has(id)) return MDI_Z_CEILING
     // Unfocused windows sit at a low base; focused windows are always above,
     // most-recently-focused highest. (A single focused window must beat
     // unfocused ones — `10 + 0` == base was the bug.)
@@ -499,6 +517,7 @@ export function MDIArea() {
               onResize={handleResize}
               onAction={handleAction}
               zIndex={getZ(id)}
+              onCaretOpenChange={(open: boolean) => setCaretOpen(id, open)}
               hidden={minimized.has(id)}
               acceptSignalDrop={win.isNavigator}
               onSignalDrop={(srcId) =>
