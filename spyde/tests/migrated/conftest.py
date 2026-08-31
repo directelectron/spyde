@@ -9,8 +9,10 @@ fixtures' shape: ``window`` (the Session), ``signal_trees``, ``plots``, and
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
+import threading
 import time
 from typing import Iterator
 
@@ -54,7 +56,71 @@ def captured_messages(monkeypatch):
 
 def _make_session():
     from spyde.backend.session import Session
-    return Session(n_workers=1, threads_per_worker=1)
+    session = Session(n_workers=1, threads_per_worker=1)
+    _attach_main_loop(session)
+    return session
+
+
+def _attach_main_loop(session) -> None:
+    """Give the session the asyncio loop the real app gives it.
+
+    Without one, ``Session._dispatch_to_main`` falls back to running the
+    callback INLINE — on whichever worker thread produced the result. The app
+    never does that: ``backend/app.py`` registers a loop, so every worker
+    result is ``call_soon_threadsafe``'d and they run one at a time, on one
+    thread, interleaved with nothing.
+
+    So a suite with no loop does not test the app's concurrency; it tests a
+    more concurrent program that does not exist. Two callbacks that can only
+    run in sequence in the app run simultaneously here, and a callback races
+    the test body itself. That has cost real time in both directions: races
+    reported as failures that no user could hit, and — the expensive
+    direction — a genuine race that only reproduces on a loaded CI runner,
+    where the reflex is to call it flaky.
+
+    The loop runs on its own thread because the test body owns the main one.
+    That leaves ONE difference from the app: a test calls action handlers
+    directly rather than through the loop, so handler-vs-callback interleaving
+    is still possible where the app has none. Closing that would mean routing
+    every call site through the loop; the win here is removing the
+    callback-vs-callback concurrency, which is what actually bit.
+    """
+    loop = asyncio.new_event_loop()
+    running = threading.Event()
+
+    def _run():
+        asyncio.set_event_loop(loop)
+        loop.call_soon(running.set)
+        loop.run_forever()
+
+    thread = threading.Thread(target=_run, name="spyde-test-loop", daemon=True)
+    thread.start()
+    if not running.wait(10.0):
+        raise RuntimeError("the test event loop never started")
+    session.set_main_loop(loop)
+    session._test_loop, session._test_loop_thread = loop, thread
+
+
+def _teardown(session) -> None:
+    """Shut the session down, then the loop it marshals onto — in that order.
+
+    Backwards, and ``shutdown``'s own callbacks land on a dead loop: they
+    raise inside ``_dispatch_to_main``, which swallows them and runs the work
+    inline instead, back on the very thread this exists to keep work off.
+    """
+    from spyde.tests.migrated._async import drain_loop
+
+    session.shutdown()
+    drain_loop(session, timeout=5.0)
+    loop = getattr(session, "_test_loop", None)
+    thread = getattr(session, "_test_loop_thread", None)
+    if loop is None:
+        return
+    session._main_loop = None
+    loop.call_soon_threadsafe(loop.stop)
+    if thread is not None:
+        thread.join(timeout=5.0)
+    loop.close()
 
 
 def _settled(session) -> bool:
@@ -121,7 +187,7 @@ def window(captured_messages):
     session = _make_session()
     yield {"window": session, "signal_trees": session.signal_trees,
            "plots": session._plots, "messages": captured_messages}
-    session.shutdown()
+    _teardown(session)
 
 
 @pytest.fixture
@@ -132,7 +198,7 @@ def tem_2d_dataset(captured_messages):
     _load(session, s)
     yield {"window": session, "signal_trees": session.signal_trees,
            "plots": session._plots, "messages": captured_messages}
-    session.shutdown()
+    _teardown(session)
 
 
 @pytest.fixture
@@ -144,7 +210,7 @@ def stem_4d_dataset(captured_messages):
     _load(session, s)
     yield {"window": session, "signal_trees": session.signal_trees,
            "plots": session._plots, "messages": captured_messages}
-    session.shutdown()
+    _teardown(session)
 
 
 def _movie_stack(n_frames=8, frame=(32, 32)):
@@ -172,4 +238,4 @@ def movie_dataset(captured_messages):
     _load(session, s)
     yield {"window": session, "signal_trees": session.signal_trees,
            "plots": session._plots, "messages": captured_messages}
-    session.shutdown()
+    _teardown(session)

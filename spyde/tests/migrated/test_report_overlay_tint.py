@@ -27,6 +27,7 @@ from spyde.actions.report import compose as cx
 from spyde.actions.report import export_html as ex
 from spyde.actions.report import handlers as h
 from spyde.actions.report.model import FigureSpec, LayerSpec, PanelSpec, SignalRef
+from spyde.tests.migrated._report import answer_harvest
 
 
 # ── helpers (mirrors test_report_compose) ──────────────────────────────────────
@@ -322,6 +323,7 @@ class TestInteractiveExportBlender:
         path = str(tmp_path / "tinted.html")
         messages.clear()
         ex.report_export_html(session, None, {"mode": "interactive", "path": path})
+        answer_harvest(session, messages)
         exported = [m for m in messages if m.get("type") == "report_exported"]
         assert exported and exported[0]["kind"] == "html-interactive"
 
@@ -342,6 +344,7 @@ class TestInteractiveExportBlender:
             "cell_id": cid, "panel_id": pid, "layer_id": lids[1], "tint": None})
         path = str(tmp_path / "untinted.html")
         ex.report_export_html(session, None, {"mode": "interactive", "path": path})
+        answer_harvest(session, messages)
         html = open(path, encoding="utf-8").read()
         assert "ovb-root" not in html
         assert "<iframe sandbox=\"allow-scripts\" srcdoc=" in html

@@ -17,6 +17,12 @@ import numpy as np
 import hyperspy.api as hs
 
 from spyde.tests.migrated.conftest import _settle
+from spyde.tests.migrated._async import quiesce, why_busy
+from spyde.tests.migrated._async import wait_until
+
+
+def _wait(pred, timeout=30.0):
+    return wait_until(pred, timeout)
 
 CIF = os.path.join(os.path.dirname(__file__), "..", "Silver__0011135.cif")
 
@@ -24,15 +30,6 @@ CIF = os.path.join(os.path.dirname(__file__), "..", "Silver__0011135.cif")
 def _signal_plot(session):
     return next((p for p in session._plots
                  if not p.is_navigator and p.plot_state is not None), None)
-
-
-def _wait(pred, timeout=30.0):
-    end = time.time() + timeout
-    while time.time() < end:
-        if pred():
-            return True
-        time.sleep(0.1)
-    return False
 
 
 def _calibrated_4d(nav=(3, 3), sig=(64, 64), scale=0.0134):
@@ -63,7 +60,7 @@ class TestOrientationWizard:
             #    gracefully — no new tree ──────────────────────────────────────
             before = len(session.signal_trees)
             om_run(session, src, {"n_best": 3})   # no library generated
-            time.sleep(0.3)
+            assert quiesce(session), why_busy(session)
             assert len(session.signal_trees) == before   # nothing created
 
             # ── Generate Library (coarse resolution → quick) ─────────────────

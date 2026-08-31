@@ -69,6 +69,7 @@ class _NavDispatcher:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._pending: "dict[int, tuple]" = {}   # selector id -> (selector, kwargs)
+        self._running = 0                        # jobs currently being run
         self._wake = threading.Event()
         self._thread = threading.Thread(
             target=self._run, name="nav-dispatch", daemon=True
@@ -81,20 +82,38 @@ class _NavDispatcher:
             self._pending[id(selector)] = (selector, kwargs)
         self._wake.set()
 
+    def idle(self) -> bool:
+        """Nothing queued AND nothing being run.
+
+        Both halves are needed and only the first used to be visible. A caller
+        asking "has the navigator caught up?" that looks at the queue alone gets
+        ``True`` for the whole of an update that is running right now — which is
+        the longest part. Anything deciding it can read the result (a test, a
+        busy indicator) then reads it one update too early.
+        """
+        with self._lock:
+            return not self._pending and self._running == 0
+
     def _run(self) -> None:
         while True:
             self._wake.wait()
             # Drain everything currently pending; new submissions that arrive
             # while we run are picked up on the next loop (their wake re-fires).
+            # Count the batch as running BEFORE releasing the lock, or `idle`
+            # reports true in the gap between clearing the queue and starting.
             with self._lock:
                 jobs = list(self._pending.values())
                 self._pending.clear()
                 self._wake.clear()
+                self._running += len(jobs)
             for selector, kwargs in jobs:
                 try:
                     selector._run_update(**kwargs)
                 except Exception as e:
                     logger.debug("nav dispatch update failed: %s", e)
+                finally:
+                    with self._lock:
+                        self._running -= 1
 
 
 # One dispatcher for the whole process — the single serial lane all navigator

@@ -24,6 +24,7 @@ import numpy as np
 from spyde.actions.report import export_html as ex
 from spyde.actions.report import handlers as h
 from spyde.actions.report import model as m
+from spyde.tests.migrated._report import answer_harvest
 
 
 # ── helpers (mirror test_report_present) ───────────────────────────────────────
@@ -287,6 +288,7 @@ class TestSlidesExportStyling:
         path = str(tmp_path / "deck.html")
         messages.clear()
         ex.report_export_html(session, None, {"mode": "slides", "path": path})
+        answer_harvest(session, messages)
         exp = _exported(messages)
         assert exp and exp[0]["kind"] == "html-slides"
         assert not _errors(messages)
@@ -308,6 +310,7 @@ class TestSlidesExportStyling:
             "html": "<h1>Cover</h1>", "slide_style": "accent"})
         path = str(tmp_path / "styled.html")
         ex.report_export_html(session, None, {"mode": "slides", "path": path})
+        answer_harvest(session, messages)
         html = open(path, encoding="utf-8").read()
         assert 'class="slide slide-style-accent"' in html
         assert ".slide-style-accent" in html          # the CSS rule
@@ -330,6 +333,7 @@ class TestSlidesExportStyling:
         path = str(tmp_path / "cap_deck.html")
         messages.clear()
         ex.report_export_html(session, None, {"mode": "slides", "path": path})
+        answer_harvest(session, messages)
         assert not _errors(messages)
         html = open(path, encoding="utf-8").read()
         # The caption text is present, and the figcaption styling rule too.

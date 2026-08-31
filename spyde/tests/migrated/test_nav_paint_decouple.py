@@ -10,6 +10,11 @@ import time
 import numpy as np
 
 from spyde.drawing.plots.plot import _nav_painter, _NavPainter
+from spyde.tests.migrated._async import wait_until
+
+
+def _wait(pred, timeout=3.0):
+    return wait_until(pred, timeout)
 
 
 class _RecorderPlot:
@@ -25,13 +30,6 @@ class _RecorderPlot:
             time.sleep(self._paint_delay)
         with self._lock:
             self.painted.append(np.asarray(data).copy())
-
-
-def _wait(cond, timeout=3.0):
-    end = time.monotonic() + timeout
-    while time.monotonic() < end and not cond():
-        time.sleep(0.01)
-    return cond()
 
 
 class TestNavPainter:

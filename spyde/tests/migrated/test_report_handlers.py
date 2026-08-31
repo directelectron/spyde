@@ -13,6 +13,8 @@ import numpy as np
 
 from spyde.actions.report import compose as cx
 from spyde.actions.report import handlers as h
+from spyde.tests.migrated._async import call_on_loop, wait_until
+from spyde.tests.migrated._report import answer_harvest
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -521,7 +523,8 @@ class TestPanelRefresh:
 
 
 class TestReportSave:
-    def test_save_with_no_renderer_reply_bakes_png(self, tem_2d_dataset, tmp_path):
+    def test_save_with_no_renderer_reply_bakes_png(self, tem_2d_dataset, tmp_path,
+                                                   monkeypatch):
         session = tem_2d_dataset["window"]
         messages = tem_2d_dataset["messages"]
         _prime_plot_data(session)
@@ -532,9 +535,21 @@ class TestReportSave:
 
         path = str(tmp_path / "out.spyde-report")
         messages.clear()
-        # No _main_loop registered (test Session) → bakes straight from snapshots.
-        h.report_save(session, None, {"path": path})
+        # THE point of this test: the renderer never answers the harvest, so the
+        # save has to fall back to baked pixels on its own. It used to reach
+        # that by accident — a session with no event loop skips the handshake
+        # entirely (`harvest_snapshots`), so "no reply" was never actually
+        # exercised, only "never asked". With a loop it asks and waits, which is
+        # what a user gets when the renderer is wedged. Shorten the wait rather
+        # than sit out the real 3 s.
+        monkeypatch.setattr(h, "_SNAPSHOT_TIMEOUT_S", 0.1)
+        # On the LOOP, as the app dispatches it: the fallback is armed with
+        # `loop.call_later`, which does nothing useful from another thread.
+        call_on_loop(session, lambda: h.report_save(session, None, {"path": path}))
 
+        assert wait_until(
+            lambda: any(m.get("type") == "report_saved" for m in messages),
+            timeout=10.0), "the save never fell back after the missing reply"
         saved = [m for m in messages if m.get("type") == "report_saved"]
         assert saved and saved[0]["path"] == path
 
@@ -554,9 +569,11 @@ class TestReportSave:
         h.report_add_cell(session, None, {"cell_type": "markdown", "source": "x"})
         path = str(tmp_path / "r.spyde-report")
         h.report_save(session, None, {"path": path})
+        answer_harvest(session, messages)
         # A second save with no path uses the remembered one.
         messages.clear()
         h.report_save(session, None, {})
+        answer_harvest(session, messages)
         saved = [m for m in messages if m.get("type") == "report_saved"]
         assert saved and saved[0]["path"] == path
 
@@ -708,6 +725,7 @@ class TestReportOpenRebind:
         h.report_add_figure(session, None, {"source_window_id": wid, "caption": "DP"})
         path = str(tmp_path / "rt.spyde-report")
         h.report_save(session, None, {"path": path})
+        answer_harvest(session, messages)
 
         # Close, then reopen in the SAME session (the source tree is still open).
         h.report_close(session, None, {})
@@ -736,6 +754,7 @@ class TestReportOpenRebind:
         h.report_add_figure(session, None, {"source_window_id": wid, "caption": "DP"})
         path = str(tmp_path / "off.spyde-report")
         h.report_save(session, None, {"path": path})
+        answer_harvest(session, messages)
 
         # Break the rebind: clear the session's plots so nothing resolves.
         session._plots = []

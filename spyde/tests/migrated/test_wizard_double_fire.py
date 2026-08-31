@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import threading
 import time
+from spyde.tests.migrated._async import quiesce, why_busy
 
 
 def _signal_plot(session):
@@ -67,7 +68,7 @@ class TestFindVectorsPreviewDoubleFire:
         fva.fv_close(session, plot, {})
         fva.fv_open(session, plot, {})
         _join_threads("fv-preview")
-        time.sleep(0.2)
+        assert quiesce(session), why_busy(session)
 
         alive = [ov for ov in returned if not ov._test_removed]
         assert len(alive) == 1, (
