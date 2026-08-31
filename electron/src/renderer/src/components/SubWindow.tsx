@@ -42,8 +42,9 @@ interface Props {
   // Bumped by MDIArea's Tile action: a new `gen` forces this rect to be
   // adopted even if the user had manually moved/resized the window.
   forced?: { gen: number; rect: Rect }
-  /** Relayed from FloatingToolbar: a caret is open on this window. */
-  onCaretOpenChange?: (open: boolean) => void
+  /** Relayed from FloatingToolbar: where this window's open caret sits, so new
+   *  windows are not PLACED on top of it. */
+  onCaretRectChange?: (rect: Rect | null) => void
 }
 
 export interface Rect { x: number; y: number; w: number; h: number }
@@ -137,7 +138,7 @@ export function SubWindow({
   toolbarActions, onClose, onFocus, onMinimize, onResize, onAction,
   zIndex, windowId, children, hidden = false,
   acceptSignalDrop = false, onSignalDrop,
-  areaSize, otherRects, onLiveRect, forced, onCaretOpenChange,
+  areaSize, otherRects, onLiveRect, forced, onCaretRectChange,
 }: Props) {
   const [maximized, setMaximized] = useState(false)
   const [dropHover, setDropHover] = useState(false)
@@ -397,7 +398,7 @@ export function SubWindow({
           winRect={rect}
           areaSize={{ w: areaW, h: areaH }}
           inside={barInside}
-          onCaretOpenChange={onCaretOpenChange}
+          onCaretRectChange={onCaretRectChange}
         />
       )}
 

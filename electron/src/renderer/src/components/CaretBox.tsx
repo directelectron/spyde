@@ -13,7 +13,6 @@
  * why this is not a modal.)
  */
 import React from 'react'
-import { CHROME_Z } from './WizardShell'
 
 export function CaretBox({ anchor, el, width = 236, testid, onClose, children }: {
   /** Anchor rect, captured at click time. */
@@ -54,7 +53,7 @@ export function CaretBox({ anchor, el, width = 236, testid, onClose, children }:
 
 const S: Record<string, React.CSSProperties> = {
   pop: {
-    position: 'fixed', zIndex: CHROME_Z + 40,
+    position: 'fixed', zIndex: 40,
     background: '#181825', border: '1px solid #45475a', borderRadius: 6,
     boxShadow: '0 6px 20px rgba(0,0,0,0.45)', padding: '8px 10px',
   },

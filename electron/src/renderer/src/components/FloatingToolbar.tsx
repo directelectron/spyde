@@ -20,7 +20,6 @@
  */
 import React from 'react'
 import { useSpyDE } from '../kernel/SpyDEContext'
-import { CHROME_Z } from './WizardShell'
 import type { ToolbarAction, ParamSpec, SubAction } from '../kernel/SpyDEContext'
 import { OrientationWizard } from './OrientationWizard'
 import { FindVectorsWizard } from './FindVectorsWizard'
@@ -66,6 +65,8 @@ const HIDDEN_ACTIONS = new Set(['Reset', 'Zoom In', 'Zoom Out'])
 
 export const BAR_H = 38     // bar box height (30px buttons + 2×3px padding + border)
 export const BAR_GAP = 6    // gap between the window's bottom edge and the bar
+export type Rect = { x: number; y: number; w: number; h: number }
+
 const CARET_GAP = 10        // gap between the bar/window edge and an open caret
 type CaretPlacement = 'below' | 'right' | 'left'
 
@@ -97,9 +98,11 @@ interface Props {
   /** True when the bar should sit INSIDE the window's bottom edge (maximized /
    *  no room below the window). */
   inside?: boolean
-  /** Fires whenever a caret opens or closes. MDIArea keeps the owning window on
-   *  top while one is open — see MDI_Z_CEILING. */
-  onCaretOpenChange?: (open: boolean) => void
+  /** The open caret's rect in MDI-area coords, or null when none is open, so
+   *  MDIArea can keep a NEW window from being placed on top of it. Nothing
+   *  about z-order changes: a window still comes to the front over the caret
+   *  when it overlaps one, it just does not spawn there. */
+  onCaretRectChange?: (rect: Rect | null) => void
 }
 
 function defaultsOf(parameters: Record<string, ParamSpec>): Record<string, unknown> {
@@ -115,7 +118,7 @@ const hasPopout = (a: ToolbarAction) => hasParams(a) || hasSubs(a)
 
 export function FloatingToolbar({
   actions, windowId, onAction, visible = true, onHoverShow, onHoverHide,
-  winRect, areaSize, inside = false, onCaretOpenChange,
+  winRect, areaSize, inside = false, onCaretRectChange,
 }: Props) {
   const { state, sendAction } = useSpyDE()
   const [openName, setOpenName] = React.useState<string | null>(null)
@@ -129,14 +132,6 @@ export function FloatingToolbar({
    *  re-runs when a caret changes width without changing placement. */
   const [caretW, setCaretW] = React.useState(240)
   const live = state.activeActions.get(windowId) ?? EMPTY
-
-  // Tell MDIArea while a caret is open. The caret is rendered INSIDE this
-  // window, whose root carries a z-index and so forms a stacking context — no
-  // z-index the caret gives itself can lift it above a sibling window. Keeping
-  // the owning window on top is what actually keeps the caret reachable.
-  React.useEffect(() => {
-    onCaretOpenChange?.(openName !== null)
-  }, [openName, onCaretOpenChange])
 
   // Keep the toolbar shown while a popout/caret is open or an action is live —
   // otherwise reveal only on hover (over the window or the toolbar).
@@ -153,9 +148,25 @@ export function FloatingToolbar({
   const area = areaSize ?? { w: 100000, h: 100000 }
   // Held in a ref so the ResizeObserver below always runs the LATEST closure —
   // `wr`/`area` change on every window move and resize.
+  // Last rect handed to MDIArea. Reported through a ref + a tolerance so the
+  // sub-pixel churn of a live drag doesn't re-render the whole MDI area.
+  const lastCaretRect = React.useRef<Rect | null>(null)
+  const reportCaretRect = (r: Rect | null) => {
+    const prev = lastCaretRect.current
+    if (!r && !prev) return
+    if (r && prev
+      && Math.abs(r.x - prev.x) < 2 && Math.abs(r.y - prev.y) < 2
+      && Math.abs(r.w - prev.w) < 2 && Math.abs(r.h - prev.h) < 2) return
+    lastCaretRect.current = r
+    onCaretRectChange?.(r)
+  }
+  // Report null on unmount too — a window closed with its caret open would
+  // otherwise leave a phantom no-go area behind.
+  React.useEffect(() => () => { if (lastCaretRect.current) onCaretRectChange?.(null) }, [])
+
   const place = React.useRef<() => void>(() => {})
   place.current = () => {
-    if (!openName) return
+    if (!openName) { reportCaretRect(null); return }
     const el = caretWrapRef.current?.firstElementChild as HTMLElement | null
     if (el) {
       const r = el.getBoundingClientRect()
@@ -169,6 +180,19 @@ export function FloatingToolbar({
       next = wr.x + wr.w + CARET_GAP + cw <= area.w ? 'right' : 'left'
     }
     setPlacement(p => (p === next ? p : next))
+    // Mirror the placement the CSS above produces, so the MDI area knows which
+    // patch of itself the caret occupies. Approximate for the side placements
+    // (they anchor near the window's top) — it only has to be good enough to
+    // steer a new window's first-fit search away, and erring large is safe.
+    reportCaretRect(
+      next === 'below'
+        ? { x: Math.round(wr.x + wr.w / 2 - cw / 2), y: Math.round(belowTop),
+            w: Math.round(cw), h: Math.round(ch) }
+        : next === 'right'
+          ? { x: Math.round(wr.x + wr.w + CARET_GAP), y: Math.round(wr.y),
+              w: Math.round(cw), h: Math.round(ch) }
+          : { x: Math.round(wr.x - CARET_GAP - cw), y: Math.round(wr.y),
+              w: Math.round(cw), h: Math.round(ch) })
     // The WIDTH has to be state, not just the ref: the side placements clamp
     // with it (see `caretPos`), and the ref is written in a layout effect. If
     // the placement itself does not change there is no re-render, so the
@@ -670,7 +694,7 @@ const caret = (dir: 'up' | 'down', bg: string): React.CSSProperties => ({
 const popBase: React.CSSProperties = {
   position: 'absolute', left: '50%', transform: 'translateX(-50%)',
   background: POP_BG, border: '1px solid #313244', borderRadius: 8,
-  padding: '6px 8px', zIndex: CHROME_Z + 1, color: '#cdd6f4',
+  padding: '6px 8px', zIndex: 13, color: '#cdd6f4',
   boxShadow: '0 8px 24px rgba(0,0,0,0.55)',
   // Lay out as ONE wide row (max-content), but cap the width so a long action
   // (e.g. Find Vectors' 5 params) WRAPS to a second row instead of getting
@@ -684,7 +708,7 @@ const subBase: React.CSSProperties = {
   position: 'absolute', left: '50%', transform: 'translateX(-50%)',
   display: 'flex', alignItems: 'center', gap: 2,
   background: SUB_BG, border: '1px solid #313244', borderRadius: 10,
-  padding: '3px 5px', zIndex: CHROME_Z + 1, boxShadow: '0 6px 20px rgba(0,0,0,0.5)',
+  padding: '3px 5px', zIndex: 13, boxShadow: '0 6px 20px rgba(0,0,0,0.5)',
 }
 
 const styles: Record<string, React.CSSProperties> = {
@@ -700,7 +724,7 @@ const styles: Record<string, React.CSSProperties> = {
     transform: 'translateX(-50%)',
     display: 'flex', alignItems: 'center', gap: 2,
     background: 'rgba(24,24,37,0.92)', border: '1px solid #313244',
-    borderRadius: 10, padding: '3px 5px', zIndex: CHROME_Z,
+    borderRadius: 10, padding: '3px 5px', zIndex: 12,
     boxShadow: '0 6px 20px rgba(0,0,0,0.5)',
   },
   btnActive: {
@@ -771,7 +795,7 @@ const styles: Record<string, React.CSSProperties> = {
     position: 'absolute', top: '100%', left: '50%', transform: 'translateX(-50%)',
     marginTop: 10, width: 200, maxWidth: '90vw',
     background: POP_BG, border: '1px solid #313244', borderRadius: 8,
-    padding: 8, zIndex: CHROME_Z + 2, color: '#cdd6f4',
+    padding: 8, zIndex: 14, color: '#cdd6f4',
     boxShadow: '0 8px 24px rgba(0,0,0,0.55)',
     display: 'flex', flexDirection: 'column', gap: 6,
     animation: 'spyde-pop 130ms ease-out',

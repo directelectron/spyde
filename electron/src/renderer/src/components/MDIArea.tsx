@@ -53,10 +53,6 @@ function tileGrid(n: number, areaW: number, areaH: number): { cols: number; rows
   return { cols, rows }
 }
 
-/** Highest z-index an MDI window may take. Everything that must float above
- *  the windows lives at CHROME_Z and up (WizardShell.tsx). */
-export const MDI_Z_CEILING = 899
-
 // The initial size a window opens at — square-ish by default, or matched to the
 // backend-reported image aspect so the figure fills it (no letterbox). Kept
 // deliberately compact so more windows fit on screen before overlapping.
@@ -191,37 +187,25 @@ export function MDIArea() {
     setActiveWindow(parseInt(id, 10))
   }, [setActiveWindow])
 
-  // Windows with an open caret. Their caret renders inside the window, whose
-  // root forms a stacking context, so the caret cannot paint above a sibling
-  // window however high its own z-index goes (measured: a caret at z-index 1002
-  // lost to a window at 11). Keeping the owning window on top is the only thing
-  // that keeps the caret reachable — otherwise a result window opened by the
-  // very action the caret is running lands over it and its figure iframe eats
-  // every click. See caret_above_windows.spec.ts.
-  const [caretWindows, setCaretWindows] = useState<ReadonlySet<string>>(new Set())
-  const setCaretOpen = React.useCallback((id: string, open: boolean) => {
-    setCaretWindows((prev) => {
-      if (prev.has(id) === open) return prev
-      const next = new Set(prev)
-      if (open) next.add(id); else next.delete(id)
-      return next
-    })
+  // Where each window's OPEN caret currently sits, in area coords. A new
+  // window's first-fit search treats these as occupied, so an action's own
+  // result windows stop landing on the panel that launched them. Z-order is
+  // untouched: a window still comes to the front over a caret it overlaps —
+  // it just is not PLACED there. Kept in a ref because it only ever feeds the
+  // placement pass below, which already runs on every render; putting it in
+  // state would re-render the whole area on each caret resize for nothing.
+  const caretRectsRef = useRef<Map<string, Rect>>(new Map())
+  const setCaretRect = useCallback((id: string, rect: Rect | null) => {
+    if (rect) caretRectsRef.current.set(id, rect)
+    else caretRectsRef.current.delete(id)
   }, [])
 
   const getZ = (id: string) => {
-    if (caretWindows.has(id)) return MDI_Z_CEILING
     // Unfocused windows sit at a low base; focused windows are always above,
     // most-recently-focused highest. (A single focused window must beat
     // unfocused ones — `10 + 0` == base was the bug.)
-    //
-    // CLAMPED, because this grows with the number of windows and the floating
-    // chrome above it does not. At five windows a focused one reached 14 —
-    // the wizard panel's own z-index — and started painting over the caret the
-    // user was mid-way through using; its figure iframe then swallowed the
-    // clicks. Windows own 1..MDI_Z_CEILING and nothing else may enter that
-    // range; see CHROME_Z in WizardShell.tsx for the layer above.
     const i = focusOrder.indexOf(id)
-    return i === -1 ? 1 : Math.min(10 + i, MDI_Z_CEILING)
+    return i === -1 ? 1 : 10 + i
   }
 
   // Clicking the figure raises its window. The out-of-process iframe swallows the
@@ -434,6 +418,10 @@ export function MDIArea() {
     taken.push({ x: placed.x, y: placed.y, w, h })
     placements.set(id, placed)
   }
+  // Open carets are obstacles too. Without this a fit/DPC/strain run drops its
+  // own result window straight onto the caret that started it, and the window's
+  // figure iframe then swallows every click meant for the panel.
+  for (const caret of caretRectsRef.current.values()) taken.push(caret)
   // Read the LIVE area size (the `areaSize` state can still be the default when
   // the first windows arrive); `areaSize` just forces a re-render on resize.
   const areaW = areaRef.current?.clientWidth || areaSize.w
@@ -517,7 +505,7 @@ export function MDIArea() {
               onResize={handleResize}
               onAction={handleAction}
               zIndex={getZ(id)}
-              onCaretOpenChange={(open: boolean) => setCaretOpen(id, open)}
+              onCaretRectChange={(r: Rect | null) => setCaretRect(id, r)}
               hidden={minimized.has(id)}
               acceptSignalDrop={win.isNavigator}
               onSignalDrop={(srcId) =>
