@@ -32,6 +32,7 @@ where a green unit suite proves nothing:
 """
 from __future__ import annotations
 
+import threading
 import time
 
 import numpy as np
@@ -1022,6 +1023,43 @@ class TestDoubleFire:
         assert len(opened - closed) == 1, (
             f"{len(opened - closed)} DPC windows left open "
             f"(opened {sorted(opened)}, closed {sorted(closed)})")
+
+    def test_a_close_mid_pass_leaves_no_window_behind(self, window):
+        """A pass that has already cleared its ``_closed`` check must not go on
+        to open a window for a wizard that is gone by the time it gets there.
+
+        ``_finish`` runs wherever the pass landed and ``dpc_close`` on the
+        caller's thread, so the two interleave. ``remove`` closes the window it
+        can SEE — and it sees none, because the pass opens it a moment later.
+        Nothing owns that window afterwards and nothing ever closes it. This is
+        the StrictMode open/close/open sequence with the timing pinned instead
+        of raced, which is what made it a failure on some machines only.
+        """
+        session, plot, tree = _dataset(window)
+        entered, go = threading.Event(), threading.Event()
+        real_derive = dpca.DpcWizard.derive
+
+        def gated_derive(self):
+            entered.set()
+            go.wait(30.0)
+            return real_derive(self)
+
+        dpca.DpcWizard.derive = gated_derive
+        try:
+            dpca.dpc_open(session, plot, {})
+            assert entered.wait(30.0), "the pass never reached the map"
+            dpca.dpc_close(session, plot, {})
+        finally:
+            go.set()
+            dpca.DpcWizard.derive = real_derive
+        time.sleep(0.5)          # let the released pass finish whatever it does
+
+        opened = {m["window_id"] for m in _of_type(window["messages"], "figure")
+                  if str(m.get("title", "")).startswith("DPC")}
+        closed = {m["window_id"] for m in _of_type(window["messages"],
+                                                   "window_closed")}
+        assert not (opened - closed), \
+            f"orphan DPC window(s) {sorted(opened - closed)} — closed already ran"
 
     def test_re_opening_a_live_wizard_does_not_build_a_second(self, window):
         session, plot, tree, wiz = _opened(window)

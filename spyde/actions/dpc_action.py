@@ -89,6 +89,7 @@ from __future__ import annotations
 import concurrent.futures
 import logging
 import os
+import threading
 import time
 
 import numpy as np
@@ -278,6 +279,13 @@ class DpcWizard(WizardController):
         self._measured_region = None                # the region a pass last ran
         self._measure_event = None                  # …and what the stream waits on
         self._last_brightness = None                # re-sent during a drag
+        # Guards the one hand-off `remove` and `_open_window` both reach for:
+        # whether this wizard is still open, and which window is its. They run
+        # on different threads (`_finish` lands wherever the pass did), so
+        # without it a pass that has already cleared its `_closed` check can
+        # publish a window a moment AFTER the close that was meant to prevent
+        # it — and `remove` has been and gone, so nothing ever closes it.
+        self._window_lock = threading.Lock()
 
     # ── the source signal ────────────────────────────────────────────────────
 
@@ -776,6 +784,8 @@ class DpcWizard(WizardController):
 
     def refresh(self) -> None:
         """Derive and repaint the map (opening the window on the first call)."""
+        if self._closed:
+            return
         result = self.derive()
         if result is None:
             return
@@ -799,12 +809,17 @@ class DpcWizard(WizardController):
             emit_error(f"DPC: building the result window failed: {e}")
             log.exception("DPC window build failed")
             return
-        wid = int(self.session.next_window_id())
-        keep_alive(wid, fig)
-        self.window_id, self.plot, self.wheel = wid, plot, wheel
-        emit({"type": "figure", "fig_id": fig_id, "window_id": wid,
-              "html": html, "title": self._title(), "is_navigator": False,
-              "aspect": _FIG_WIDTH / float(_FIG_HEIGHT)})
+        # Claim and publish together: `remove` may have run while the figure
+        # was being built, and a window emitted after it is one nobody owns.
+        with self._window_lock:
+            if self._closed:
+                return
+            wid = int(self.session.next_window_id())
+            keep_alive(wid, fig)
+            self.window_id, self.plot, self.wheel = wid, plot, wheel
+            emit({"type": "figure", "fig_id": fig_id, "window_id": wid,
+                  "html": html, "title": self._title(), "is_navigator": False,
+                  "aspect": _FIG_WIDTH / float(_FIG_HEIGHT)})
         self.own_window(wid)
 
     #: The live window's title. Deliberately does NOT name the field type.
@@ -1343,9 +1358,16 @@ class DpcWizard(WizardController):
     def remove(self) -> None:
         """Tear down everything the wizard added. Idempotent — re-entry through
         remove → _forget_window → close → remove is a no-op."""
-        if self._closed:
-            return
-        self._closed = True
+        # Claim the close and TAKE the window in one step, under the lock
+        # `_open_window` publishes through: a pass landing on another thread
+        # either sees the close and opens nothing, or gets in first and leaves
+        # a `window_id` here to be closed. Nothing between the two.
+        with self._window_lock:
+            if self._closed:
+                return
+            self._closed = True
+            window_id = self.window_id
+            self.window_id = self.plot = self.wheel = None
         # Stop the in-flight pass. Closing the caret is the clearest case of
         # "nobody is waiting for this any more", and a beam-shift pass reads the
         # whole scan — it must not keep running for a wizard that is gone.
@@ -1355,19 +1377,18 @@ class DpcWizard(WizardController):
         # fires in the meantime bails out on its own.
         self.hide_corner_boxes()
         self.hide_beam_region()
-        if self.window_id is not None:
+        if window_id is not None:
             forget = getattr(self.session, "_forget_window", None)
             if forget is not None:
                 try:
-                    forget(int(self.window_id))
+                    forget(int(window_id))
                 except Exception as e:                       # pragma: no cover
                     log.debug("forgetting the DPC window failed: %s", e)
             else:                                            # pragma: no cover
-                emit({"type": "window_closed", "window_id": int(self.window_id)})
+                emit({"type": "window_closed", "window_id": int(window_id)})
                 reg = getattr(self.session, "_window_controllers", None)
                 if isinstance(reg, dict):
-                    reg.pop(int(self.window_id), None)
-        self.window_id = self.plot = self.wheel = None
+                    reg.pop(int(window_id), None)
         if getattr(self.tree, "_dpc_wizard", None) is self:
             self.tree._dpc_wizard = None
         # Last, and without waiting: a job still on the lane has already been
