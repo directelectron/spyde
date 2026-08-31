@@ -34,7 +34,7 @@ import numpy as np
 import pytest
 
 from spyde.actions import drift_action as dr
-from spyde.tests.migrated._async import wait_until
+from spyde.tests.migrated._async import quiesce, wait_until, why_busy
 
 
 def _wait(pred, timeout=30.0):
@@ -83,6 +83,14 @@ def _opened(window, frames: int = N_FRAMES, **params):
     assert _wait(lambda: getattr(tree, "_drift_wizard", None) is not None
                  and tree._drift_wizard.window_id is not None), \
         "the Drift Check window never opened"
+    # The window exists well before the caret has finished opening: `drift_open`
+    # also runs the FIRST discovery preview, of the DEFAULT box, on a worker.
+    # A test that clears the message list here and then tunes gets whichever
+    # preview lands first — and the opening one started earlier, so it usually
+    # wins, leaving the assertion reading the default box's result. That is
+    # `[24, 28, 48, 56]` on this fixture: the centred half-frame default, not
+    # the box the test set. Settle before handing the caret over.
+    assert quiesce(session), why_busy(session)
     return session, plot, tree, tree._drift_wizard
 
 
