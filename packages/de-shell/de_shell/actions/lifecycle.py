@@ -29,6 +29,38 @@ log = logging.getLogger(__name__)
 
 # ── worker-thread marshal ─────────────────────────────────────────────────────
 
+#: Guards the per-session in-flight tally below. One lock for the process: the
+#: critical section is an integer add.
+_WORKER_COUNT_LOCK = threading.Lock()
+
+
+def _count_worker(session, delta: int) -> None:
+    with _WORKER_COUNT_LOCK:
+        try:
+            session._inflight_workers = getattr(
+                session, "_inflight_workers", 0) + delta
+        except Exception:      # a bare stub session that refuses attributes
+            pass
+
+
+def inflight_workers(session) -> int:
+    """How many :func:`run_on_worker` jobs are still running for *session*.
+
+    Background work started here was otherwise invisible: it is a bare daemon
+    thread with no pool and no registry, so nothing could answer "is anything
+    still running?". Anyone needing to know had to pick some VISIBLE side
+    effect of the work and wait for that instead — a proxy that is right until
+    the day the value it watches is set somewhere else too, or set before the
+    work is really done.
+
+    Zero means every job has finished AND handed its ``on_done`` to the
+    dispatcher; it does NOT mean those callbacks have run. Pair it with a
+    round-trip through the loop for that.
+    """
+    with _WORKER_COUNT_LOCK:
+        return int(getattr(session, "_inflight_workers", 0) or 0)
+
+
 def run_on_worker(session, work: Callable[[], Any], *, name: str,
                   on_done: Callable[[Any], None] | None = None,
                   on_error: Callable[[Exception], None] | None = None) -> None:
@@ -55,15 +87,23 @@ def run_on_worker(session, work: Callable[[], Any], *, name: str,
 
     def _worker():
         try:
-            result = work()
-        except Exception as e:
-            log.exception("%s failed", name)
-            if on_error is not None:
-                on_error(e)
-            return
-        if on_done is not None:
-            dispatch(lambda: on_done(result))
+            try:
+                result = work()
+            except Exception as e:
+                log.exception("%s failed", name)
+                if on_error is not None:
+                    on_error(e)
+                return
+            if on_done is not None:
+                dispatch(lambda: on_done(result))
+        finally:
+            # AFTER the dispatch, deliberately: a caller that sees the count
+            # reach zero has to be able to conclude the completion callback is
+            # at least QUEUED. Decrementing first would let it conclude that
+            # while `on_done` is still to be handed to the loop.
+            _count_worker(session, -1)
 
+    _count_worker(session, +1)
     threading.Thread(target=_worker, daemon=True, name=name).start()
 
 
