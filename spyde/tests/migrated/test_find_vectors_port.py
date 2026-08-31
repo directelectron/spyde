@@ -11,8 +11,6 @@ The compute is memory-safe (map_overlap, never .compute() on the full dataset).
 """
 from __future__ import annotations
 
-import time
-
 import numpy as np
 import hyperspy.api as hs
 from spyde.tests.migrated.conftest import _settle
@@ -42,7 +40,7 @@ def _diffraction_4d():
 
 
 class TestFindVectorsPort:
-    def test_find_vectors_creates_attached_vectors_tree(self):
+    def test_find_vectors_creates_attached_vectors_tree(self, captured_messages):
         from spyde.backend.session import Session
         session = Session(n_workers=1, threads_per_worker=1)
         try:
@@ -86,25 +84,34 @@ class TestFindVectorsPort:
             sel = next(s for s in vtree.navigator_plot_manager.all_navigation_selectors
                        if sp in s.children)
             def _peak(rendered) -> float:
-                """Brightest pixel, or -1 while there is nothing to read yet.
-
-                The read can land before the frame resolves, and an unresolved
-                one is not an array of numbers — `None`, or the length-1 object
-                array hyperspy wraps it in. `max()` then returns None and
-                `float()` raises, failing the test for the one reason it is
-                waiting to pass.
-                """
+                """Brightest pixel, or -1 for anything that is not an array of
+                numbers — `None`, or the length-1 object array hyperspy wraps an
+                unresolved frame in, either of which would raise in `float()`
+                and report as the wrong failure."""
                 try:
                     return float(np.asarray(rendered, dtype=float).max())
                 except (TypeError, ValueError):
                     return -1.0
 
-            deadline = time.time() + 30.0    # render wiring installs async
+            # Wait for the batch to say it FINISHED, not for the container to
+            # appear. `_finalize` attaches the container and only ~75 lines
+            # later installs the render wiring, emitting "Found N…" last of all
+            # — so `diffraction_vectors is not None` is true well before the
+            # result window can draw anything, and reading pixels off the back
+            # of it reads across that gap. This used to be covered by polling
+            # the pixels for 30 s, which on a loaded runner was not always long
+            # enough: "result window still renders zeros", #149 ubuntu-py3.11.
+            assert _wait(lambda: any(
+                isinstance(m, dict)
+                and "diffraction vectors" in str(m.get("text", ""))
+                for m in captured_messages)), \
+                "the batch never reported that it had finished"
+            # Which makes the two halves separable: is the renderer installed,
+            # and does it draw? A pixel poll could not tell those apart.
+            assert sel.children.get(sp) is getattr(vtree, "_render_frame_fn", None), \
+                "the result window's renderer was never installed"
             frame = sel.children[sp](sel, sp, np.array([[ix, iy]]))
-            while _peak(frame) <= 0 and time.time() < deadline:
-                time.sleep(0.1)
-                frame = sel.children[sp](sel, sp, np.array([[ix, iy]]))
-            assert _peak(frame) > 0, "result window still renders zeros"
+            assert _peak(frame) > 0, "the installed renderer still draws zeros"
 
             # (b) A found-vectors overlay is attached to the result window and
             # yields markers at a position that actually has vectors.
