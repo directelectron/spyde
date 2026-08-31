@@ -47,10 +47,19 @@ const shellPreload = resolve(
 const shellRenderer = resolve(
   __dirname, '..', 'packages', 'shell-renderer', 'src', 'index.ts')
 
+// Where Help -> Report a Problem sends reports. A Sentry DSN is a write-only
+// public key, so baking it into the build is how Sentry is meant to be used —
+// but it comes from CI's environment rather than the repo so it can be rotated
+// without a code change, and so a fork builds with reporting simply switched
+// off. Absent, reports are written to the user's data directory instead of
+// being sent (packages/shell-main/src/errorReport.ts).
+const sentryDsn = process.env.SPYDE_SENTRY_DSN ?? ''
+
 export default defineConfig({
   main: {
     build: { outDir: 'out/main', rollupOptions: { input: 'src/main/index.ts' } },
     resolve: { alias: { '@de/shell-main': shellMain } },
+    define: { SENTRY_DSN: JSON.stringify(sentryDsn) },
   },
   preload: {
     build: { outDir: 'out/preload', rollupOptions: { input: 'src/preload/index.ts' } },

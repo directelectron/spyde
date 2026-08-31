@@ -98,7 +98,7 @@ export function MenuBar({ onStartGuide, onShowInfo }: {
   /** Help → <technique> → Info… — opens GuideInfoDialog for that technique. */
   onShowInfo: (g: Guide) => void
 }) {
-  const { sendAction, openStackDialog, openUpdateDialog, openGpuStatusDialog, openGpuHelpDialog, state } = useSpyDE()
+  const { sendAction, openStackDialog, openUpdateDialog, openGpuStatusDialog, openGpuHelpDialog, openReportDialog, state } = useSpyDE()
   const [open, setOpen] = useState<string | null>(null)
   const barRef = useRef<HTMLDivElement>(null)
   const [exampleGroups, setExampleGroups] = useState<ExampleGroup[]>([])
@@ -273,6 +273,8 @@ export function MenuBar({ onStartGuide, onShowInfo }: {
       { label: 'Check for Updates…', onClick: () => openUpdateDialog() },
       { label: 'GPU & CUDA', onClick: () => openGpuHelpDialog() },
       { label: 'GPU Status…', onClick: () => openGpuStatusDialog() },
+      { separator: true },
+      { label: 'Report a Problem…', onClick: () => openReportDialog() },
     ],
   }
 

@@ -17,6 +17,8 @@ import {
   parseUvLine,
   initUpdater, checkForUpdates, downloadUpdate, quitAndInstall,
   readUpdateChannel, setUpdateChannel, getLastUpdateStatus, updatesSupported,
+  initErrorReporting, reportingConfigured, recordProblem, submitReport,
+  collectDiagnostics,
 } from '@de/shell-main'
 
 // Tell the shell who we are. MUST run before any other @de/shell-main call:
@@ -30,6 +32,9 @@ configureShell({
   pythonModule: 'spyde',
   pythonDist: 'spyde',
 })
+
+/** Baked in at build time by electron.vite.config.ts — '' when unconfigured. */
+declare const SENTRY_DSN: string
 
 let win: BrowserWindow | null = null
 
@@ -47,6 +52,10 @@ let win: BrowserWindow | null = null
 function surfaceMainProcessCrash(kind: string, err: unknown): void {
   const detail = (err as Error)?.stack ?? (err as Error)?.message ?? String(err)
   process.stderr.write(`[spyde main] ${kind}: ${detail}\n`)
+  // Keep it for a problem report the user may write later. Recording is local
+  // and unconditional; nothing is sent unless they open Help -> Report a
+  // Problem and press Send.
+  recordProblem(kind, detail)
   try {
     if (win && !win.isDestroyed() && !win.webContents.isDestroyed()) {
       win.webContents.send('spyde:message', {
@@ -426,6 +435,25 @@ app.whenReady().then(async () => {
   // doesn't compete with the Python sidecar coming up.
   initUpdater(win!, app.getPath('userData'))
 
+  // Problem reporting. The DSN is baked in at build time from the CI
+  // environment (see electron.vite.config.ts) so it can be rotated without a
+  // code change; SPYDE_SENTRY_DSN overrides it for a local test. With neither,
+  // reports are still written to <userData>/reports and the dialog says so.
+  initErrorReporting({
+    dsn: process.env.SPYDE_SENTRY_DSN ?? SENTRY_DSN,
+    collectHostDiagnostics: async () => {
+      const env = managedEnvPaths(process.resourcesPath, app.getPath('userData'))
+      return {
+        nvidia: await probeNvidiaSmi(),
+        pythonEnv: {
+          bundled: env.bundled,
+          envExists: env.envExists,
+          lockedTorch: env.bundled ? readLockedTorchVersion(env.projectDir) : null,
+        },
+      }
+    },
+  })
+
   // Resolve (and on first packaged run, create via `uv sync`) the Python
   // sidecar env, then start the backend.
   // __dirname is electron/out/main → three levels up is the repo root (dev),
@@ -534,6 +562,13 @@ app.whenReady().then(async () => {
       // visible without opening devtools.
       if (msg.type === 'ready' || msg.type === 'dask_ready' || msg.type === 'error') {
         console.log(`[spyde backend] ${msg.type}: ${msg.text ?? msg.dashboard ?? ''}`)
+      }
+      // The two things worth having in a problem report written after the fact:
+      // the backend dying, and whatever it said before it did.
+      if (msg.type === 'backend_exited') {
+        recordProblem('backend', `Analysis backend exited (code ${String(msg.code)})`)
+      } else if (msg.type === 'error' && msg.text) {
+        recordProblem('backend', String(msg.text))
       }
       sendToRenderer(msg)
     },
@@ -732,6 +767,11 @@ function buildMenu(): void {
         {
           label: 'GPU Status…',
           click: () => win?.webContents.send('spyde:open_gpu_status_dialog'),
+        },
+        { type: 'separator' },
+        {
+          label: 'Report a Problem…',
+          click: () => win?.webContents.send('spyde:open_report_dialog'),
         },
       ],
     },
@@ -1052,6 +1092,23 @@ ipcMain.handle('spyde:get-update-info', () => ({
   status: getLastUpdateStatus(),
   appVersion: app.getVersion(),
 }))
+
+// ── Problem reporting (Help → Report a Problem) ───────────────────────────────
+
+/** What the dialog shows before the user writes anything: whether a report can
+ *  be sent at all, and the machine facts they are about to include. Reading
+ *  them is free of side effects — nothing is sent by opening the dialog. */
+ipcMain.handle('spyde:report-diagnostics', async () => ({
+  canSend: reportingConfigured(),
+  diagnostics: await collectDiagnostics(),
+}))
+
+/** The user pressed Send. Writes the report locally either way, and sends it
+ *  when a reporting service is configured and reachable. */
+ipcMain.handle(
+  'spyde:submit-report',
+  (_, input: { message: string; contact?: string }) => submitReport(input),
+)
 
 /** Channel radio in the update dialog — persisted Electron-side (updater.ts)
  *  AND mirrored into ~/.spyde/settings.json via the Python action so it's

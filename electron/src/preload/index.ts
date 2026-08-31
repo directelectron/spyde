@@ -41,6 +41,9 @@ contextBridge.exposeInMainWorld('electron', {
   /** Open the "GPU & CUDA" help dialog (from the Help menu). Returns an unsubscribe fn. */
   onOpenGpuHelpDialog: (cb: () => void) => onEvent('spyde:open_gpu_help_dialog', cb),
 
+  /** Open the "Report a Problem" dialog (from the Help menu). Returns an unsubscribe fn. */
+  onOpenReportDialog: (cb: () => void) => onEvent('spyde:open_report_dialog', cb),
+
   /** electron-updater's check/download/install progress. Returns an unsubscribe fn. */
   onUpdateStatus: (cb: (v: Record<string, unknown>) => void) => onEvent<[Record<string, unknown>]>('spyde:update-status', cb),
 
@@ -121,6 +124,25 @@ contextBridge.exposeInMainWorld('electron', {
 
   /** Flip the update channel (stable/beta). */
   setUpdateChannel: (channel: 'stable' | 'beta') => ipcRenderer.send('spyde:set-update-channel', channel),
+
+  // ── Problem reporting ─────────────────────────────────────────────────────
+
+  /** What the Report a Problem dialog shows before anything is written: whether
+   *  a report can be sent at all, and the machine facts it would include.
+   *  Reading this sends nothing. */
+  reportDiagnostics: (): Promise<{
+    canSend: boolean
+    diagnostics: Record<string, unknown>
+  }> => ipcRenderer.invoke('spyde:report-diagnostics'),
+
+  /** Send the report. Always saves a copy locally; `sent` says whether it also
+   *  reached the maintainers. */
+  submitReport: (input: { message: string; contact?: string }): Promise<{
+    sent: boolean
+    eventId?: string
+    bundlePath?: string
+    error?: string
+  }> => ipcRenderer.invoke('spyde:submit-report', input),
 
   /** GPU triage probe (Help → GPU & CUDA): nvidia-smi result + managed-env
    *  facts. torch-side facts come from the backend's get_gpu_status. */

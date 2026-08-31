@@ -74,6 +74,12 @@ win:
 
 # Per-user NSIS installer: no admin, Start-Menu + desktop shortcuts, uninstaller,
 # user-chosen install dir.
+#
+# build/installer.nsh is picked up automatically (it is the `nsis.include`
+# default) and replaces the stock "is the app still running?" check, whose
+# single-process kill and instant re-check dead-ended a Windows auto-update in
+# "SpyDE cannot be closed. Please close it manually and click Retry". Read that
+# file before changing anything about how the app shuts down.
 nsis:
   oneClick: false
   perMachine: false

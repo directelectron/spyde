@@ -12,6 +12,7 @@ import { StackGate } from './components/StackGate'
 import { UpdateGate } from './components/UpdateGate'
 import { GpuStatusGate } from './components/GpuStatusGate'
 import { GpuHelpGate } from './components/GpuHelpGate'
+import { ReportProblemGate } from './components/ReportProblemGate'
 import { UpdateCard } from './components/UpdateCard'
 import { MenuBar } from './components/MenuBar'
 import { DownloadToasts } from './components/DownloadToasts'
@@ -105,6 +106,7 @@ export function App() {
       <UpdateGate />
       <GpuStatusGate />
       <GpuHelpGate />
+      <ReportProblemGate />
       {/* First-run welcome walkthrough (docs overhaul Phase 4): auto-opens the
           "First Steps" tour exactly once, tracked by the tutorial_seen settings
           flag. Always re-launchable afterwards from Help → First Steps. */}

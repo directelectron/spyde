@@ -37,6 +37,8 @@ import { join } from 'path'
 import { autoUpdater } from 'electron-updater'
 import { friendlyError, defaultChannelForVersion } from './updaterErrors'
 import { channel } from './config'
+import { stopBackend } from './backendProcess'
+import { recordProblem } from './problemLog'
 
 export type UpdateChannel = 'stable' | 'beta'
 
@@ -86,6 +88,7 @@ export { friendlyError } from './updaterErrors'
 /** Every error/timeout path funnels through here so state stays consistent:
  *  friendly text out, in-flight guard + timers cleared so a retry works. */
 function reportError(rawMessage: string): void {
+  recordProblem('updater', rawMessage)
   checkInFlight = false
   clearCheckTimer()
   clearDownloadStallTimer()
@@ -274,13 +277,39 @@ export function downloadUpdate(): void {
   autoUpdater.downloadUpdate().catch((err) => reportError(err?.message ?? String(err)))
 }
 
+/**
+ * Hand off to the downloaded installer.
+ *
+ * The handoff is a RACE, and losing it is what produced the Windows
+ * "SpyDE cannot be closed. Please close it manually and click Retry" dead end:
+ * electron-updater spawns the installer FIRST and only then asks the app to
+ * quit, so for a second or two both are alive. The installer opens by refusing
+ * to touch a directory anything is still running out of — and it counts the
+ * Python sidecar and its Dask workers, not just the app window. Electron's own
+ * quit is too slow and too conditional to win that race on its own, and the
+ * sidecar's tree-kill backstop is on a timer that an exiting process never
+ * lives long enough to fire.
+ *
+ * So: kill the sidecar tree synchronously, hand off, then guarantee this
+ * process is gone whether or not the graceful quit completes. There is nothing
+ * left to save past this point — the user asked to restart into an installer.
+ */
+const HANDOFF_EXIT_MS = 1500
+
 export function quitAndInstall(): void {
   // The one call that used to be able to throw the process down. If the installer
   // handoff fails (missing/locked installer, permissions), surface a friendly
   // recoverable error instead of an uncaught exception crashing the app.
   try {
     clearDownloadStallTimer()
+    // Order matters: quitAndInstall() spawns the installer synchronously, so a
+    // throw here means the handoff never started and the app has to keep
+    // running — killing the sidecar first would leave it alive but useless.
+    // Everything after this line happens within microseconds of the spawn,
+    // whole seconds before the installer gets as far as looking for us.
     autoUpdater.quitAndInstall()
+    stopBackend({ immediate: true })
+    setTimeout(() => { try { app.exit(0) } catch { /* already gone */ } }, HANDOFF_EXIT_MS)
   } catch (err) {
     reportError(`Couldn't start the installer — please download manually. (${(err as Error)?.message ?? String(err)})`)
   }
