@@ -366,20 +366,22 @@ test('the Center tab offers all three references, each with its own furniture', 
   // The caret is still open from the previous test, parked on its Map tab.
   await page.getByTestId('dpc-tab-Center').click()
 
-  // The beam region FIRST — Manual below depends on it being on, since the
-  // region's centre is what Manual adopts.
+  // The beam region FIRST — Manual below depends on it, since the region's
+  // centre is what Manual adopts.
   //
   // One draggable shape that BOTH masks the centre of mass and marks the zero
-  // beam. Toggling Circle→Ring swaps the anyplotlib widget type, so this
-  // checks the shape actually changed on the PATTERN, not just in the caret.
+  // beam. It is ALWAYS on the pattern: there is no "off", because the region
+  // is what the centre of mass is taken over, and switching it off only meant
+  // taking the whole frame with no handle to grab. Toggling Circle→Ring swaps
+  // the anyplotlib widget type, so this checks the shape actually changed on
+  // the PATTERN, not just in the caret.
   const beamPixels = () => colorPixelsIn(page, sourceWindow(page), IS_BEAM)
-  expect(await beamPixels(), 'the region should start off').toBe(0)
+  await expect.poll(beamPixels, {
+    timeout: 30_000, message: 'the beam region was not on the pattern at open',
+  }).toBeGreaterThan(0)
 
   await page.getByTestId('dpc-beam-circle').click()
   await expect(page.getByTestId('dpc-beam-r')).toBeVisible()
-  await expect.poll(beamPixels, {
-    timeout: 30_000, message: 'the beam circle never appeared on the pattern',
-  }).toBeGreaterThan(0)
   await expect(page.getByTestId('dpc-beam-readout'))
     .toHaveAttribute('data-brightness', /\d/, { timeout: 30_000 })
   await shot('10-beam-circle')
@@ -401,14 +403,8 @@ test('the Center tab offers all three references, each with its own furniture', 
   await page.getByTestId('dpc-info-beam').click()
   await expect(page.getByTestId('dpc-info-beam-text')).toHaveCount(0)
 
-  await page.getByTestId('dpc-beam-off').click()
-  await expect.poll(beamPixels, {
-    timeout: 30_000, message: 'turning the region off left its widget behind',
-  }).toBe(0)
-
   // Manual — the beam region IS the marker, so this is one click, not a
-  // separate crosshair to place. Turn the region back on so there is a centre
-  // to adopt.
+  // separate crosshair to place. Back to a circle for it.
   await page.getByTestId('dpc-beam-circle').click()
   await expect.poll(beamPixels, { timeout: 30_000 }).toBeGreaterThan(0)
   await page.getByTestId('dpc-center-mode').click()

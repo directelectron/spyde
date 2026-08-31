@@ -27,7 +27,7 @@ that small array, which is what lets the rotation slider be genuinely live
 instead of a click-and-wait. Do not move the measure into ``dpc_tune``.
 
 **That one pass STREAMS on lazy data.** It is dispatched per navigation chunk
-through ``ComputeBackend.compute_chunks_progressive`` and the map repaints as
+as ONE cancellable ``client.compute`` future, and the map repaints as
 each chunk lands, so a scan that takes minutes shows a field filling in rather
 than a spinner. Two properties make that work and are worth not breaking:
 
@@ -88,6 +88,9 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
+import os
+import threading
+import time
 
 import numpy as np
 
@@ -109,11 +112,12 @@ DEFAULTS: dict = {
     "half_square_width": 0,
     "center_mode": "corners",
     "corner_fraction": 0.05,
-    # The beam region (see BeamRegion): "off" | "circle" | "ring". It opens OFF
-    # so the measurement is byte-for-byte what it was before this control
-    # existed; the radii are filled in from the detector size the first time it
-    # is switched on, because a default in pixels cannot know the frame size.
-    "beam_shape": "off",
+    # The beam region (see BeamRegion): "circle" | "ring". There is no "off" —
+    # the region is what the centre of mass is taken over, so a pattern without
+    # one is just a region the size of the whole frame, drawn nowhere the user
+    # can grab it. The radii are filled in from the detector size once a dataset
+    # is open, because a default in pixels cannot know the frame size.
+    "beam_shape": "circle",
     "beam_cx": 0.0,
     "beam_cy": 0.0,
     "beam_r": 0.0,
@@ -139,12 +143,6 @@ _BEAM_COLOR = "#94e2d5"        # the beam region (circle / ring) on the DP
 #: The corner boxes sit on a navigator that is usually busy, so they carry a
 #: heavier edge than the other furniture to stay findable against it.
 _CORNER_LINEWIDTH = 3.0
-
-#: Re-measuring the whole scan is the one expensive step, so a DRAG must not
-#: trigger it per frame. The widget and the readouts follow the pointer live;
-#: the re-measure waits this long after motion stops. Same shape as the drift
-#: caret's ROI settle, for the same reason.
-_REGION_SETTLE_S = 0.45
 
 #: Bare-figure window geometry. A bare figure never receives ``resize_figure``,
 #: so its initial px size is the one it keeps and anything drawn outside is
@@ -274,13 +272,20 @@ class DpcWizard(WizardController):
         self.clim: tuple[float, float] | None = None
         self.cmap: str | None = None
         self._corner_mg = None                      # navigator corner boxes
-        self._beam_widget = None                    # the circle/ring on the DP
-        self._beam_handler = None                   # kept alive (weak callback)
-        self._beam_dragging = False                 # re-entrancy guard
-        self._settle_timer = None                   # drag → debounced re-measure
+        self._beam_selector = None                  # the circle/ring on the DP
+        self._lane = None                           # the serial pass-setup lane
         self._measure_stop: list | None = None      # in-flight pass's cancel token
         self._measure_future = None                 # …and its future, if any
+        self._measured_region = None                # the region a pass last ran
+        self._measure_event = None                  # …and what the stream waits on
         self._last_brightness = None                # re-sent during a drag
+        # Guards the one hand-off `remove` and `_open_window` both reach for:
+        # whether this wizard is still open, and which window is its. They run
+        # on different threads (`_finish` lands wherever the pass did), so
+        # without it a pass that has already cleared its `_closed` check can
+        # publish a window a moment AFTER the close that was meant to prevent
+        # it — and `remove` has been and gone, so nothing ever closes it.
+        self._window_lock = threading.Lock()
 
     # ── the source signal ────────────────────────────────────────────────────
 
@@ -303,7 +308,7 @@ class DpcWizard(WizardController):
     def region(self) -> _dpc.BeamRegion:
         """The beam region the caret's parameters describe."""
         p = self.params
-        return _dpc.BeamRegion(shape=str(p.get("beam_shape", "off")),
+        return _dpc.BeamRegion(shape=str(p.get("beam_shape", "circle")),
                                cx=float(p.get("beam_cx") or 0.0),
                                cy=float(p.get("beam_cy") or 0.0),
                                r=float(p.get("beam_r") or 0.0),
@@ -316,6 +321,15 @@ class DpcWizard(WizardController):
         the map is repainted as each lands, so a multi-minute scan shows a field
         filling in rather than a spinner. On eager data (already in RAM) there
         is nothing to stream and it runs in one go.
+
+        Only the BOOKKEEPING happens on the caller's thread: cancel the pass
+        this one replaces, take the parameters it will run with, and adopt its
+        cancel token so a supersede arriving a moment later still stops it.
+        Everything after that — copying the signal, building the graph, handing
+        the chunks to the backend — runs on :meth:`_pass_lane`. Measured, that
+        part costs 13-33 ms (hyperspy's ``map`` / ``get_direct_beam_position``
+        graph build dominates), and a dragged region runs it several times a
+        second: inline, it stuttered the very gesture it exists to serve.
         """
         if self.signal is None:
             emit_error("DPC: no active dataset")
@@ -325,25 +339,23 @@ class DpcWizard(WizardController):
         # waiting for costs the cluster the entire dataset. Same contract as
         # virtual_image (cancel prior → unregister → register new).
         self._cancel_measure()
-        # A pass gets its OWN signal object, taken here on the dispatch thread.
-        # The worker below runs hyperspy `map` on it, and a new pass can still
-        # overlap the TAIL of the one it cancels: a queued future cancels
-        # cleanly, one already inside `map` does not. See dpc.private_view.
-        signal = _dpc.private_view(self.signal)
         method = str(self.params["method"])
         hw = int(self.params["half_square_width"] or 0)
         region = self.region()
         sig_shape = self._sig_shape()
         gen = self.guard()
-        # Only the EAGER branch below uses this one; the progressive branch owns
-        # its own token, because that is where a pass can actually be stopped
-        # part-way (see _measure_progressive).
-        eager_stop: list = [False]
+        # Adopted BEFORE the lane picks the pass up, so a supersede that lands
+        # while it is still queued stops it before it costs anything: the lane
+        # checks the token first and drops the job. During a drag that is most
+        # of them.
+        stop: list = [False]
+        self._track_measure(stop)
+        self._measured_region = region.as_dict()
         emit_status("DPC: locating the direct beam…")
 
         def _finish(shifts):
-            self._retire_measure(eager_stop)
-            if eager_stop[0] or not self.still(gen) or self._closed:
+            self._retire_measure(stop)
+            if stop[0] or not self.still(gen) or self._closed:
                 return
             self.shifts = np.asarray(shifts, dtype=np.float64)
             self.report = _dpc.centering_report(self.shifts)
@@ -352,31 +364,218 @@ class DpcWizard(WizardController):
             emit_progress(1, 1, "DPC")
             self.emit_state()
             self.refresh()
+            # Now, not per pointer frame: this reads a frame off the dataset.
+            self.emit_region(with_brightness=True)
             if on_done is not None:
                 on_done()
 
-        if self._measure_progressive(signal, method, hw, region, gen, _finish):
+        try:
+            self._pass_lane().submit(self._begin_pass, stop, gen, method, hw,
+                                     region, _finish)
+        except RuntimeError as e:       # lane shut down under a closing wizard
+            log.debug("DPC pass lane refused the job: %s", e)
+            self._retire_measure(stop)
+
+    def _pass_lane(self):
+        """The ONE thread every beam-shift pass is set up on.
+
+        Serial for the reason :func:`dpc.private_view` gives: hyperspy parks a
+        length-1 placeholder on ``data`` for the width of the copy, so two
+        threads setting a pass up on the same signal read each other's
+        placeholder. One lane means the copy, and the graph build after it, can
+        never overlap another pass's — however fast the region is dragged.
+
+        A superseded job drops itself at the top of :meth:`_begin_pass`, so what
+        queues behind a slow set-up is no-ops, not stacked passes.
+        """
+        if self._lane is None:
+            self._lane = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="dpc-pass")
+        return self._lane
+
+    def _begin_pass(self, stop, gen, method, hw, region, on_finish) -> None:
+        """Set the pass up and hand it to the cluster — on the pass lane.
+
+        ONE handle, kept on ``_measure_future`` so the next move can cancel it,
+        and the chunks paint into the display array as they land. Both come from
+        ``compute_with_live_buffer``, which is what the virtual-image stream
+        uses: a superseded whole-scan reduction has to be CANCELLED (its
+        ``cancel`` stops outstanding work through the dispatcher's ``on_start``
+        hook, not on a 0.5 s poll), and a scan big enough to be worth cancelling
+        is big enough that the user should watch it fill in.
+
+        Data already in RAM has no graph and so no handle, and runs to the end
+        uninterrupted — the token can only drop its result. That is fine now
+        and was not before: the centre of mass is one vectorised contraction
+        per block rather than a Python call per frame, which measured 1429 ms →
+        38 ms on a 64x64 scan of 64x64 frames. A pass that finishes in the time
+        of two pointer frames does not need stopping.
+        """
+        if stop[0] or self._closed:
+            return
+        live = self.signal
+        if live is None:
+            return
+        try:
+            # Its OWN signal object: the graph runs hyperspy `map` on it, and a
+            # new pass can still overlap the TAIL of the one it cancels.
+            signal = _dpc.private_view(live)
+            graph = _dpc.beam_shift_graph(signal, method=method,
+                                          half_square_width=hw, region=region)
+        except Exception as e:
+            self._retire_measure(stop)
+            self._measure_failed(gen, e)
+            self._set_computing(False)
+            return
+        if stop[0] or self._closed:
             return
 
-        # Eager data: ONE hyperspy `map` over an array already in RAM. There is
-        # no interruption point inside it, so the token can only stop the pass
-        # BEFORE it starts and drop the result if it lands late — which is also
-        # all `virtual_image` does for eager data. Registering it still matters:
-        # closing the tree flips it, so a pass in the queue never begins.
-        self._track_measure(eager_stop)
+        client = getattr(self.tree, "client", None)
+        backend = getattr(self.session, "compute_backend", None)
+        if graph is None or (client is None and backend is None):
+            # Nothing to chunk and so nothing to cancel: the data is already in
+            # RAM, or there is neither a cluster nor a compute backend to hand
+            # the chunks to. The token can only drop the result.
+            try:
+                shifts = _dpc.measure_beam_shifts(signal, method=method,
+                                                  half_square_width=hw,
+                                                  region=region)
+            except Exception as e:
+                self._retire_measure(stop)
+                self._measure_failed(gen, e)
+                self._set_computing(False)
+                return
+            self._dispatch(lambda: on_finish(shifts))
+            return
 
-        def _work():
-            if eager_stop[0]:
-                return None
-            return _dpc.measure_beam_shifts(signal, method=method,
-                                            half_square_width=hw, region=region)
+        ny, nx = int(graph.shape[0]), int(graph.shape[1])
+        field = self._display_field(signal, (ny, nx), method, hw, region, gen)
+        if stop[0] or self._closed:
+            return
+        self.shifts = field
+        self._set_computing(True)
+        total = max(1, len(graph.chunks[0]) * len(graph.chunks[1]))
+        landed = [0]
+        # The cluster stream waits on an Event; the backend and the tree's
+        # cancel registry work in `[False]` tokens. Both are set by the same
+        # _cancel_measure, so there is one decision and two ways of hearing it.
+        import threading
+        event = threading.Event()
+        # Chunks land on several pool threads at once, so the tally is taken
+        # under a lock: `landed[0] += 1` is three bytecodes, and a lost update
+        # means the count never reaches `total` — the pass then has no finish at
+        # all, leaving the token registered and "Calculating…" up for good.
+        counted = threading.Lock()
 
-        def _done(shifts):
-            if shifts is not None:
-                _finish(shifts)
+        def _on_chunk(chunk, slices):
+            """A dask callback thread — store, then marshal the repaint."""
+            if stop[0] or self._closed or not self.still(gen):
+                return
+            try:
+                field[slices] = np.asarray(chunk, dtype=np.float64)
+            except Exception as e:                           # pragma: no cover
+                log.debug("storing a DPC chunk failed: %s", e)
+                return
+            with counted:
+                landed[0] += 1
+                n = landed[0]
+            if n >= total:
+                # The last chunk IS the completed pass. Counting them is how the
+                # finish is known: the handle's value is assembled client-side
+                # from these same chunks, so waiting on it as well would only
+                # add a hop.
+                self._dispatch(lambda: on_finish(field))
+                return
+            self._dispatch(lambda: self._on_partial(gen, n, total))
 
-        self.run_on_worker(_work, name="dpc-measure", on_done=_done,
-                           on_error=lambda e: self._measure_failed(gen, e))
+        try:
+            if client is not None:
+                # The cluster path, and the virtual-image stream's own call:
+                # ONE handle, per-chunk callbacks, and a `cancel` that stops
+                # outstanding work through the dispatcher's `on_start` hook
+                # rather than on its next 0.5 s poll.
+                from spyde.drawing.update_functions import (
+                    compute_with_live_buffer)
+                handle = compute_with_live_buffer(
+                    graph, (ny, nx), client, "", on_chunk_done=_on_chunk,
+                    windowed=True, stop_event=event)
+            else:
+                # No cluster (it takes ~10 s to come up, and a scan can be open
+                # sooner; tests run with SPYDE_NO_DASK). The backend still
+                # chunks and still stops — the threaded mode checks the token
+                # before each submit AND inside each chunk task. Routing this
+                # through a plain blocking compute instead is what made a
+                # superseded pass run to the end.
+                handle = backend.compute_chunks_progressive(
+                    graph, 2, _on_chunk, stopped_flag=stop)
+        except Exception as e:
+            self._retire_measure(stop)
+            self._measure_failed(gen, e)
+            self._set_computing(False)
+            return
+        if self._measure_stop is stop:
+            self._measure_event = event
+        self._attach_future(stop, handle)
+
+    def _display_field(self, signal, nav_shape, method, hw, region, gen):
+        """The ``(ny, nx, 2)`` array the pass paints into.
+
+        BLANK, deliberately, and this is the visible half of cancellation: the
+        map goes dark the instant a new pass starts and fills back in as its
+        chunks land, so stopping one pass and starting another is something you
+        can SEE rather than something you have to trust. It is what the virtual
+        image does, and it is the reason a superseded compute there is never in
+        doubt. Carrying the previous field over instead looks smoother and
+        hides exactly the thing worth showing.
+
+        The FIRST pass after the caret opens is the exception: there is nothing
+        to supersede and nothing on screen, so it seeds from the CORNERS. Those
+        are a few percent of the scan, so they measure in a fraction of the time
+        the full pass takes, and the plane through them is the descan ramp — a
+        real map immediately, rather than an empty window with a spinner.
+        """
+        ny, nx = int(nav_shape[0]), int(nav_shape[1])
+        field = np.full((ny, nx, 2), np.nan, dtype=np.float64)
+        if self.shifts is not None:
+            return field                 # a supersede: go dark and refill
+        try:
+            corners = self._measure_corners(signal, (ny, nx), method, hw, region)
+        except Exception as e:
+            log.debug("the DPC corner seed failed: %s", e)
+            return field
+        if corners is not None and self.still(gen):
+            field[:] = corners
+        return field
+
+    def _measure_corners(self, signal, nav_shape, method, hw, region):
+        """A whole-field plane fitted through the four scan corners only.
+
+        The corners carry the instrument descan and (by assumption) none of the
+        sample's field, which is what makes them both cheap to measure and worth
+        showing on their own.
+        """
+        fraction = float(self.params["corner_fraction"])
+        sparse = np.full((int(nav_shape[0]), int(nav_shape[1]), 2), np.nan,
+                         dtype=np.float64)
+        for rows, cols in _dpc.corner_slices(nav_shape, fraction):
+            block = _dpc.measure_beam_shifts(signal.inav[cols, rows],
+                                             method=method,
+                                             half_square_width=hw, region=region)
+            sparse[rows, cols] = block
+        return _dpc.corner_reference(sparse, fraction)
+
+    def _dispatch(self, fn) -> None:
+        """Run *fn* on the event loop — figures and IPC belong there."""
+        dispatch = getattr(self.session, "_dispatch_to_main", None)
+        dispatch(fn) if dispatch is not None else fn()
+
+    def _on_partial(self, gen: int, done: int, total: int) -> None:
+        """Repaint from what has landed so far (event loop)."""
+        if self._closed or not self.still(gen):
+            return
+        emit_progress(done, total, "DPC: locating the direct beam")
+        self.refresh()
+
 
     def _track_measure(self, stop: list, future=None) -> None:
         """Adopt *stop*/*future* as the in-flight pass and register them on the
@@ -387,13 +586,34 @@ class DpcWizard(WizardController):
         if reg is not None:
             reg(flag=stop, future=future)
 
+    def _attach_future(self, stop: list, future) -> None:
+        """Add the backend future to an ALREADY-adopted token.
+
+        The token is adopted on the caller's thread; the future only exists once
+        the pass has been set up on the lane, by which time a newer pass may own
+        the slot. Attaching to a token that is no longer current would make the
+        next ``_cancel_measure`` cancel the WRONG pass — so if this one has been
+        superseded, cancel its future here instead.
+        """
+        if self._measure_stop is not stop:
+            try:
+                if not future.done():
+                    future.cancel()
+            except Exception as e:                           # pragma: no cover
+                log.debug("cancelling a superseded DPC future failed: %s", e)
+            return
+        self._measure_future = future
+        reg = getattr(self.tree, "register_cancel", None)
+        if reg is not None:
+            reg(flag=stop, future=future)
+
     def _retire_measure(self, stop: list) -> None:
         """Drop a FINISHED pass's token. Without this the tree's cancel registry
         gains an entry per measure — and every drag settle is a measure."""
         if self._measure_stop is not stop:
             return                      # already superseded; not ours to drop
         future = self._measure_future
-        self._measure_stop = self._measure_future = None
+        self._measure_stop = self._measure_future = self._measure_event = None
         unreg = getattr(self.tree, "unregister_cancel", None)
         if unreg is not None:
             try:
@@ -404,19 +624,30 @@ class DpcWizard(WizardController):
     def _cancel_measure(self) -> None:
         """Stop the in-flight beam-shift pass, if any.
 
-        Setting the flag is what actually stops it: the progressive path checks
-        it before each chunk submit and inside each chunk task, so a superseded
-        pass stops dispatching instead of computing a result nobody reads.
-        Cancelling the future kills one still queued; one already running ends
-        at its next flag check. Then unregister both, or the tree's cancel list
-        grows by one entry per drag.
+        **Cancelling the future is what stops it.** The pass is ONE
+        ``client.compute`` graph, so this is the same cancellation
+        ``virtual_image`` uses and the scheduler drops the tasks. The token
+        beside it covers only the window BEFORE that future exists — the graph
+        is built on the pass lane, and a move can land while it is — and stops a
+        late result being painted. Unregister both afterwards, or the tree's
+        cancel list grows by one entry per drag.
         """
         stop, future = self._measure_stop, self._measure_future
-        self._measure_stop = self._measure_future = None
+        event = self._measure_event
+        self._measure_stop = self._measure_future = self._measure_event = None
         if stop is None and future is None:
             return
         if stop is not None:
             stop[0] = True
+        # The stream waits on the Event, so setting it is what stops the
+        # dispatcher NOW rather than on its next 0.5 s poll.
+        if event is not None:
+            event.set()
+        # At INFO because "is it actually cancelling, or just restarting after
+        # it finishes?" is the one question this path raises and the one the
+        # code cannot answer by inspection.
+        log.info("DPC: cancelled the in-flight beam-shift pass")
+
         if future is not None:
             try:
                 if not future.done():
@@ -443,99 +674,10 @@ class DpcWizard(WizardController):
         if self._closed or not self.still(gen):
             log.debug("DPC measure abandoned after close/supersede: %s", exc)
             return
+        # With the traceback: the message alone names a symptom, and the pass
+        # runs on a worker, so the frames are gone by the time anyone looks.
+        log.exception("DPC beam-shift pass failed", exc_info=exc)
         emit_error(f"DPC: locating the direct beam failed: {exc}")
-
-    def _measure_progressive(self, signal, method, hw, region, gen, on_finish
-                             ) -> bool:
-        """Stream the beam-shift pass per nav chunk. False → not applicable.
-
-        Uses ``ComputeBackend.compute_chunks_progressive``, which dispatches one
-        task per nav chunk and calls back from a worker thread as each lands.
-        The lazy graph keeps the dataset's own nav chunking (no rechunk layer),
-        so a "chunk" here is a storage chunk — the streaming granularity matches
-        what the reader actually reads (Live-Display §1).
-
-        Partial state is NaN, which every stage downstream already tolerates:
-        the plane fits mask on ``isfinite``, the rotation estimator drops
-        non-finite gradients, and the display paints non-finite black rather
-        than letting one poison the contrast. So the map genuinely fills in.
-        """
-        backend = getattr(self.session, "compute_backend", None)
-        if backend is None or not hasattr(backend, "compute_chunks_progressive"):
-            return False
-        try:
-            graph = _dpc.beam_shift_graph(signal, method=method,
-                                          half_square_width=hw, region=region)
-        except Exception as e:
-            log.debug("building the DPC beam-shift graph failed: %s", e)
-            return False
-        if graph is None:                       # eager data — nothing to stream
-            return False
-
-        ny, nx = int(graph.shape[0]), int(graph.shape[1])
-        partial = np.full((ny, nx, 2), np.nan, dtype=np.float64)
-        total = max(1, len(graph.chunks[0]) * len(graph.chunks[1]))
-        done = [0]
-        # The cancel token travels WITH the dispatch: the backend checks it
-        # before each chunk submit and inside each chunk task, so superseding
-        # this pass stops it rather than letting it finish unread.
-        stop: list = [False]
-        self.shifts = partial
-        self._set_computing(True)
-
-        def _on_chunk(chunk, slices):
-            """Worker thread — marshal the paint onto the main loop."""
-            if stop[0] or self._closed or not self.still(gen):
-                return
-            try:
-                partial[slices] = np.asarray(chunk, dtype=np.float64)
-            except Exception as e:                           # pragma: no cover
-                log.debug("storing a DPC chunk failed: %s", e)
-                return
-            done[0] += 1
-            n = done[0]
-            dispatch = getattr(self.session, "_dispatch_to_main", None)
-            paint = lambda: self._on_partial(gen, n, total)   # noqa: E731
-            dispatch(paint) if dispatch is not None else paint()
-
-        try:
-            future = backend.compute_chunks_progressive(graph, 2, _on_chunk,
-                                                        stopped_flag=stop)
-        except Exception as e:
-            log.debug("progressive DPC dispatch failed (%s) — running in one "
-                      "pass instead", e)
-            return False
-        self._track_measure(stop, future)
-
-        def _settled(fut):
-            self._retire_measure(stop)
-            try:
-                result = fut.result()
-            except concurrent.futures.CancelledError:
-                # Cancelled deliberately (superseded, or the caret/tree closed).
-                # Not a failure and not the user's problem — say nothing.
-                self._set_computing(False)
-                return
-            except Exception as e:
-                if stop[0]:              # torn down mid-pass; same story
-                    self._set_computing(False)
-                    return
-                self._measure_failed(gen, e)
-                self._set_computing(False)
-                return
-            dispatch = getattr(self.session, "_dispatch_to_main", None)
-            finish = lambda: on_finish(result)                # noqa: E731
-            dispatch(finish) if dispatch is not None else finish()
-
-        future.add_done_callback(_settled)
-        return True
-
-    def _on_partial(self, gen: int, done: int, total: int) -> None:
-        """Repaint from what has landed so far (main thread)."""
-        if self._closed or not self.still(gen):
-            return
-        emit_progress(done, total, "DPC: locating the direct beam")
-        self.refresh()
 
     def _set_computing(self, computing: bool) -> None:
         """Drive the window's "Calculating…" overlay. Every True is paired."""
@@ -642,6 +784,8 @@ class DpcWizard(WizardController):
 
     def refresh(self) -> None:
         """Derive and repaint the map (opening the window on the first call)."""
+        if self._closed:
+            return
         result = self.derive()
         if result is None:
             return
@@ -665,12 +809,17 @@ class DpcWizard(WizardController):
             emit_error(f"DPC: building the result window failed: {e}")
             log.exception("DPC window build failed")
             return
-        wid = int(self.session.next_window_id())
-        keep_alive(wid, fig)
-        self.window_id, self.plot, self.wheel = wid, plot, wheel
-        emit({"type": "figure", "fig_id": fig_id, "window_id": wid,
-              "html": html, "title": self._title(), "is_navigator": False,
-              "aspect": _FIG_WIDTH / float(_FIG_HEIGHT)})
+        # Claim and publish together: `remove` may have run while the figure
+        # was being built, and a window emitted after it is one nobody owns.
+        with self._window_lock:
+            if self._closed:
+                return
+            wid = int(self.session.next_window_id())
+            keep_alive(wid, fig)
+            self.window_id, self.plot, self.wheel = wid, plot, wheel
+            emit({"type": "figure", "fig_id": fig_id, "window_id": wid,
+                  "html": html, "title": self._title(), "is_navigator": False,
+                  "aspect": _FIG_WIDTH / float(_FIG_HEIGHT)})
         self.own_window(wid)
 
     #: The live window's title. Deliberately does NOT name the field type.
@@ -794,160 +943,191 @@ class DpcWizard(WizardController):
     # ── the beam region (one shape, two jobs) ────────────────────────────────
 
     def ensure_region_defaults(self) -> None:
-        """Fill in radii the first time the region is switched on.
+        """Fill in the radii the first time a dataset is open.
 
         They cannot be declared in ``DEFAULTS`` because a sensible radius is a
-        fraction of the DETECTOR, whose size is not known until a dataset is
-        open.
+        fraction of the DETECTOR, whose size is not known until then — which is
+        also why ``BeamRegion.active`` still exists with the "off" shape gone.
         """
         p = self.params
-        if str(p.get("beam_shape", "off")) == "off" or float(p.get("beam_r") or 0) > 0:
+        if float(p.get("beam_r") or 0) > 0:
             return
         d = _dpc.default_beam_region(self._sig_shape(), str(p["beam_shape"]))
         p["beam_cx"], p["beam_cy"] = d.cx, d.cy
         p["beam_r"], p["beam_r_inner"] = d.r, d.r_inner
 
-    def show_beam_region(self) -> None:
-        """Draw (or reshape) the draggable circle / ring on the pattern.
+    def sync_beam_region(self) -> None:
+        """Put the selector for the current shape on the pattern.
 
-        The SAME widget answers both of the Center step's questions: its area is
-        the centre-of-mass mask, and its centre is the Manual reference. Two
-        separate controls for one physical thing (where is the beam?) is what
-        this replaces.
+        The beam region is a :class:`~spyde.drawing.selectors.CircleSelector` /
+        :class:`~spyde.drawing.selectors.AnnularSelector` — the same selectors a
+        virtual image puts on the same plot — so it inherits the whole live
+        path: every pointer frame submits to the one serial navigator
+        dispatcher, a newer position replaces a still-queued older one, and a
+        trailing settle re-fires once motion stops. It used to be a raw widget
+        with a hand-rolled debounce, which is the only reason the map did not
+        track the region the way a virtual image tracks its detector ROI.
 
-        Switching shape rebuilds the widget — a circle and an annulus are
-        different anyplotlib widget types, so there is nothing to mutate.
+        Switching shape REBUILDS it — a circle and an annulus are different
+        anyplotlib widget types, so there is nothing to mutate.
         """
-        plot2d = getattr(self.src_plot, "_plot2d", None)
-        shape = str(self.params.get("beam_shape", "off"))
-        if plot2d is None or shape == "off":
-            self.hide_beam_region()
+        from spyde.drawing.selectors import AnnularSelector, CircleSelector
+
+        if self._closed or getattr(self.src_plot, "_plot2d", None) is None:
             return
         self.ensure_region_defaults()
-        r = self.region()
-        if self._beam_widget is not None:
-            if getattr(self._beam_widget, "_dpc_shape", None) == shape:
-                try:
-                    kw = ({"cx": r.cx, "cy": r.cy, "r_outer": r.r,
-                           "r_inner": r.r_inner} if shape == "ring"
-                          else {"cx": r.cx, "cy": r.cy, "r": r.r})
-                    self._beam_widget.set(**kw)
-                    return
-                except Exception as e:                       # pragma: no cover
-                    log.debug("resizing the DPC beam region failed: %s", e)
+        region = self.region()
+        shape = region.shape
+        selector = self._beam_selector
+        if selector is not None and getattr(selector, "_dpc_shape", "") != shape:
             self.hide_beam_region()
+            selector = None
+        if selector is None:
+            cls = AnnularSelector if shape == "ring" else CircleSelector
+            try:
+                # No children: this selector drives a whole-scan re-measure, not
+                # a sliced child plot, so the work hangs off `index_hooks` — the
+                # same seam the vector overlays use. `_run_update`'s child loop
+                # is then a no-op and its geometry de-duplication still applies.
+                selector = cls(parent=self.src_plot, children=[],
+                               update_function=[], color=_BEAM_COLOR)
+            except Exception as e:                           # pragma: no cover
+                log.debug("building the DPC beam selector failed: %s", e)
+                return
+            selector._dpc_shape = shape
+            selector.index_hooks.append(self._on_region_moved)
+            self._beam_selector = selector
+        self._write_region_to_widget(region)
+
+    def _write_region_to_widget(self, region) -> None:
+        """Push *region* onto the widget (a typed radius, a shape rebuild).
+
+        Safe to call from anywhere: unlike the old raw widget this does NOT
+        re-enter synchronously. ``set`` fires ``pointer_move``, but the selector
+        answers that by submitting to the dispatcher, so the read-back lands on
+        another thread and one write cannot recurse into another.
+
+        Then push the PANEL as well, which is not redundant. ``set`` reaches the
+        figure as a targeted widget message and deliberately never rewrites the
+        panel's own state (anyplotlib says so on ``Figure._push_widget``, and
+        reconciles the same divergence in ``_sync_for_export`` before any
+        snapshot). The renderer RETAINS the last panel state per figure and
+        re-applies it — so until something else repaints this plot, the geometry
+        the figure falls back to is the one the widget was BORN with. For the
+        beam region that is ``image_width * 0.1``, a fifth of the radius it
+        opens at: the circle silently collapsed to it the first time the pointer
+        entered the pattern, and the drag that followed moved that collapsed
+        circle. Pushing here makes the panel state agree with the widget, so
+        there is nothing stale to fall back to.
+        """
+        widget = getattr(self._beam_selector, "roi", None)
+        if widget is None:
+            return
         try:
-            if shape == "ring":
-                w = plot2d.add_annular_widget(cx=r.cx, cy=r.cy, r_outer=r.r,
-                                              r_inner=r.r_inner,
-                                              color=_BEAM_COLOR)
-            else:
-                w = plot2d.add_circle_widget(cx=r.cx, cy=r.cy, r=r.r,
-                                             color=_BEAM_COLOR)
-            w._dpc_shape = shape
-            from spyde.drawing.selectors.base_selector import event_handler_fn
-            handler = event_handler_fn(lambda event: self._on_region_drag(event))
-            w.add_event_handler(handler, "pointer_move", "pointer_up")
-            self._beam_widget, self._beam_handler = w, handler
+            widget.set(**({"cx": region.cx, "cy": region.cy,
+                           "r_outer": region.r, "r_inner": region.r_inner}
+                          if region.shape == "ring"
+                          else {"cx": region.cx, "cy": region.cy, "r": region.r}))
+            plot2d = getattr(widget, "_plot", None)
+            if plot2d is not None:
+                plot2d._push()
         except Exception as e:                               # pragma: no cover
-            log.debug("adding the DPC beam region failed: %s", e)
+            log.debug("writing the DPC beam region to its widget failed: %s", e)
 
     def hide_beam_region(self) -> None:
-        """Widgets have no ``remove()``, only ``hide()`` (same as CZB's)."""
-        if self._beam_widget is not None:
-            try:
-                self._beam_widget.hide()
-            except Exception as e:                           # pragma: no cover
-                log.debug("hiding the DPC beam region failed: %s", e)
-            self._beam_widget = self._beam_handler = None
-
-    def _on_region_drag(self, event=None) -> None:
-        """Read the widget back, echo its geometry, and on RELEASE re-measure.
-
-        Everything expensive waits for ``pointer_up``. A drag frame only reads
-        the widget and echoes numbers the caret already has in hand.
-
-        The brightness readout is what makes this necessary. It reads a frame,
-        which on a lazy signal is a dask compute, and one per pointer frame
-        queues work faster than it drains — the caret's own radius then keeps
-        climbing for a while after the pointer stops, because the messages
-        behind it are still landing. Same reason the Fit caret sends its state
-        on release only (see ``background_action._on_window_drag``).
-
-        RE-ENTRANCY GUARD: anyplotlib ``Widget.set()`` fires ``pointer_move``
-        unconditionally — even on a no-change write — so anything here that
-        writes back to the widget re-invokes this handler synchronously. The
-        same recursion Crop and CZB both hit; compare-before-set is NOT enough.
-        """
-        w = self._beam_widget
-        if w is None or self._beam_dragging or self._closed:
+        """Take the selector off the pattern (shape change, or teardown)."""
+        selector = self._beam_selector
+        self._beam_selector = None
+        if selector is None:
             return
-        self._beam_dragging = True
         try:
-            self.params["beam_cx"] = float(w.cx)
-            self.params["beam_cy"] = float(w.cy)
-            if str(self.params.get("beam_shape")) == "ring":
-                self.params["beam_r"] = float(w.r_outer)
-                self.params["beam_r_inner"] = float(w.r_inner)
-            else:
-                self.params["beam_r"] = float(w.r)
+            selector.close()
         except Exception as e:                               # pragma: no cover
-            log.debug("reading the DPC beam region failed: %s", e)
-        finally:
-            self._beam_dragging = False
-        released = str(getattr(event, "event_type", "") or "") == "pointer_up"
-        self.emit_region(with_brightness=released)
-        if released:
-            self.arm_region_settle()
+            log.debug("closing the DPC beam selector failed: %s", e)
 
-    def arm_region_settle(self) -> None:
-        """(Re)start the debounce that re-measures once the drag stops.
+    def _on_region_moved(self, indices=None) -> None:
+        """The region moved — track it and re-measure. On the dispatcher thread.
 
-        The region changes the centre of mass, so it can only take effect by
-        re-measuring the whole scan — the one expensive step. Doing that per
-        drag frame would make the widget unusable on any real dataset, so the
-        widget and the brightness readout track the pointer and the measurement
-        follows once motion stops.
+        This is the virtual-image update function's job, in the virtual-image
+        update function's place: the selector fires it once per COMMITTED
+        position (repeats at the same geometry are de-duplicated, and a
+        superseded position was dropped from the pending slot before it ever
+        ran), and it cancels the compute it replaces and starts a new one.
+        There is no pacing on top of that — the dispatcher's latest-wins
+        coalescing IS the pacing, exactly as it is for a virtual image.
         """
-        import threading
-        if self._settle_timer is not None:
-            try:
-                self._settle_timer.cancel()
-            except Exception as e:                           # pragma: no cover
-                log.debug("cancelling the DPC settle timer failed: %s", e)
         if self._closed:
             return
-
-        def _fire():
-            self._settle_timer = None
-            if self._closed:
-                return
-            dispatch = getattr(self.session, "_dispatch_to_main", None)
-            if dispatch is not None:
-                dispatch(self.measure)
+        widget = getattr(self._beam_selector, "roi", None)
+        if widget is None:
+            return
+        try:
+            self.params["beam_cx"] = float(widget.cx)
+            self.params["beam_cy"] = float(widget.cy)
+            if str(self.params.get("beam_shape")) == "ring":
+                self.params["beam_r"] = float(widget.r_outer)
+                self.params["beam_r_inner"] = float(widget.r_inner)
             else:
-                self.measure()
-
-        self._settle_timer = threading.Timer(_REGION_SETTLE_S, _fire)
-        self._settle_timer.daemon = True
-        self._settle_timer.start()
+                self.params["beam_r"] = float(widget.r)
+        except Exception as e:                               # pragma: no cover
+            log.debug("reading the DPC beam region failed: %s", e)
+            return
+        # Geometry only: the brightness readout reads a FRAME, and one dask
+        # compute per pointer frame queues work faster than it drains however
+        # far off-thread it runs. It is refreshed when the pass lands.
+        self.emit_region(with_brightness=False)
+        if self.region().as_dict() == self._measured_region:
+            # The region the running (or last) pass already used. Reached on
+            # every OPEN, because placing the selector writes its geometry and
+            # the widget reports that write as a move — which superseded the
+            # opening pass with an identical one, throwing away a whole scan's
+            # work and the progressive fill with it. Also covers a drag that
+            # returns to where it started.
+            return
+        self.measure()
 
     def emit_region(self, with_brightness: bool = True) -> None:
         """Live region geometry + how bright it is, for the caret's readout.
 
-        ``with_brightness=False`` re-sends the last measured value instead of
-        reading a frame for a new one. Mid-drag the geometry is what the caret
-        needs to track the pointer; the brightness costs a frame read and is
-        recomputed on release. Re-sending the last value rather than ``None``
-        keeps the readout from blanking on every drag.
+        The geometry goes out NOW, carrying whatever brightness was last
+        measured — the caret has to track the pointer, and re-sending the last
+        value rather than ``None`` keeps the readout from blanking on every
+        drag. ``with_brightness`` additionally asks for a fresh reading, which
+        costs a frame read (a dask compute on a lazy signal), so it happens on a
+        worker and lands in a second message. Doing it inline stalled the event
+        loop on exactly the gesture that must not stall.
         """
         region = self.region()
+        self._send_region(region)
         signal = self.signal
-        if with_brightness:
-            brightness = (_dpc.region_brightness(signal, region)
-                          if signal is not None else float("inf"))
+        if not with_brightness or signal is None:
+            return
+        # Its OWN view, for the reason `private_view` gives: the probe reads one
+        # frame with `inav`, and hyperspy takes an `inav` slice by deep-copying
+        # the signal it slices. Probing the LIVE signal on a worker therefore
+        # races the pass lane copying that same signal — and the loser of that
+        # race falls back to measuring on the shared object.
+        probe = _dpc.private_view(signal)
+
+        def _work():
+            return _dpc.region_brightness(probe, region)
+
+        def _done(brightness):
+            # Drop a reading for a region the user has already moved on from —
+            # a stale multiplier next to a region it does not describe reads as
+            # a wrong answer, not a late one.
+            if self._closed or self.region().as_dict() != region.as_dict():
+                return
             self._last_brightness = (None if not np.isfinite(brightness)
                                      else float(brightness))
+            self._send_region(region)
+
+        self.run_on_worker(_work, name="dpc-brightness", on_done=_done,
+                           on_error=lambda e: log.debug(
+                               "the DPC brightness probe failed: %s", e))
+
+    def _send_region(self, region) -> None:
+        """One ``dpc_region`` message for *region* + the last known brightness."""
         emit({"type": "dpc_region", "window_id": self.caret_window_id,
               "result_window_id": self.window_id,
               **region.as_dict(),
@@ -957,15 +1137,14 @@ class DpcWizard(WizardController):
         """Show exactly the furniture the current state needs.
 
         The corner boxes belong to one Center MODE; the beam region does not —
-        it defines the centre of mass for every mode, so it is shown whenever
-        it is switched on.
+        it defines the centre of mass for every mode, so it is always there.
         """
         mode = str(self.params["center_mode"])
         if mode == "corners":
             self.show_corner_boxes()
         else:
             self.hide_corner_boxes()
-        self.show_beam_region()
+        self.sync_beam_region()
 
     # ── rotation ─────────────────────────────────────────────────────────────
 
@@ -1156,7 +1335,7 @@ class DpcWizard(WizardController):
         return commit_result_tree(
             self.session, title=f"DPC ({sym})",
             # The primary is the RGB direction+magnitude image, so label it that
-            # way — calling it "Ex" put a chip next to the real "Ex (MV/cm)"
+            # way â€” calling it "Ex" put a chip next to the real "Ex (MV/cm)"
             # view claiming to be the same map.
             primary=r.rgb, primary_label=f"{sym} direction",
             views=[(titles[c], r.component(c)) for c in _dpc.COMPONENTS],
@@ -1174,43 +1353,50 @@ class DpcWizard(WizardController):
             on_tree=_attach_wheel,
         )
 
-    # ── teardown ─────────────────────────────────────────────────────────────
+    # â”€â”€ teardown â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def remove(self) -> None:
         """Tear down everything the wizard added. Idempotent — re-entry through
         remove → _forget_window → close → remove is a no-op."""
-        if self._closed:
-            return
-        self._closed = True
+        # Claim the close and TAKE the window in one step, under the lock
+        # `_open_window` publishes through: a pass landing on another thread
+        # either sees the close and opens nothing, or gets in first and leaves
+        # a `window_id` here to be closed. Nothing between the two.
+        with self._window_lock:
+            if self._closed:
+                return
+            self._closed = True
+            window_id = self.window_id
+            self.window_id = self.plot = self.wheel = None
         # Stop the in-flight pass. Closing the caret is the clearest case of
         # "nobody is waiting for this any more", and a beam-shift pass reads the
         # whole scan — it must not keep running for a wizard that is gone.
         self._cancel_measure()
-        # Cancel the drag debounce FIRST: a timer that fires after teardown
-        # would re-measure a torn-down wizard on a worker thread.
-        if self._settle_timer is not None:
-            try:
-                self._settle_timer.cancel()
-            except Exception as e:                           # pragma: no cover
-                log.debug("cancelling the DPC settle timer failed: %s", e)
-            self._settle_timer = None
+        # The selector owns the only remaining drag timer (its settle re-fire)
+        # and cancels it in `close`; `_closed` is already True, so a hook that
+        # fires in the meantime bails out on its own.
         self.hide_corner_boxes()
         self.hide_beam_region()
-        if self.window_id is not None:
+        if window_id is not None:
             forget = getattr(self.session, "_forget_window", None)
             if forget is not None:
                 try:
-                    forget(int(self.window_id))
+                    forget(int(window_id))
                 except Exception as e:                       # pragma: no cover
                     log.debug("forgetting the DPC window failed: %s", e)
             else:                                            # pragma: no cover
-                emit({"type": "window_closed", "window_id": int(self.window_id)})
+                emit({"type": "window_closed", "window_id": int(window_id)})
                 reg = getattr(self.session, "_window_controllers", None)
                 if isinstance(reg, dict):
-                    reg.pop(int(self.window_id), None)
-        self.window_id = self.plot = self.wheel = None
+                    reg.pop(int(window_id), None)
         if getattr(self.tree, "_dpc_wizard", None) is self:
             self.tree._dpc_wizard = None
+        # Last, and without waiting: a job still on the lane has already been
+        # stopped by the cancel above and returns on its next token check, but
+        # `remove` runs on the event loop and must not block on it.
+        lane, self._lane = self._lane, None
+        if lane is not None:
+            lane.shutdown(wait=False)
 
 
 def _tree_title(tree) -> str:
@@ -1218,8 +1404,6 @@ def _tree_title(tree) -> str:
         return str(tree.root.metadata.General.title) or "untitled"
     except Exception:                                        # pragma: no cover
         return "untitled"
-
-
 # ── toolbar entry (ActionContext convention: fn(ctx, ...)) ────────────────────
 
 def dpc(ctx, action_name: str = "DPC", **params) -> None:
@@ -1320,24 +1504,21 @@ def dpc_set_center(session, plot, payload) -> None:
 
 
 def dpc_set_beam(session, plot, payload) -> None:
-    """Beam region: switch between off / circle / ring, or set its geometry.
+    """Beam region: switch circle/ring, or type a radius.
 
-    Changing the region changes the CENTRE OF MASS, so it can only take effect
-    by re-measuring — which this does immediately for a discrete change (a
-    shape toggle, a typed radius). A DRAG goes through the debounce instead
-    (``_on_region_drag``), because the whole scan cannot be re-measured per
-    pointer frame.
+    This only writes the geometry onto the widget. The re-measure follows from
+    the widget the same way it does for a drag — ``sync_beam_region`` pushes the
+    value, the selector reports the move, and ``_on_region_moved`` decides. One
+    path for "the region changed", whether a pointer or a number moved it;
+    measuring here as well would run the pass twice for every typed radius.
     """
     ctrl = _ctrl_for(session, plot, payload)
     if ctrl is None:
         return
-    before = ctrl.region().as_dict()
     ctrl.params.update(_clean(payload))
     ctrl.ensure_region_defaults()
     ctrl.sync_overlays()
-    ctrl.emit_region()
-    if ctrl.region().as_dict() != before:
-        ctrl.measure()
+    ctrl.emit_region(with_brightness=False)
 
 
 def dpc_pick_center(session, plot, payload) -> None:

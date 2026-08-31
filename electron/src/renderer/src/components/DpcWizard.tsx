@@ -65,10 +65,10 @@ const VIEW_OPTIONS: readonly { value: View; label: string }[] = [
   { value: 'curl', label: 'Curl' },
 ]
 
-/** `dpc.BEAM_SHAPES` — the beam region's shape, or off. */
-type BeamShape = 'off' | 'circle' | 'ring'
+/** `dpc.BEAM_SHAPES`. There is no "off": the region is always on the pattern,
+ *  because it IS what the centre of mass is taken over. */
+type BeamShape = 'circle' | 'ring'
 const BEAM_SHAPES: readonly { value: BeamShape; label: string }[] = [
-  { value: 'off', label: 'Off' },
   { value: 'circle', label: 'Circle' },
   { value: 'ring', label: 'Ring' },
 ]
@@ -99,7 +99,7 @@ const DEFAULTS: DpcSaved = {
   halfSquareWidth: 0,
   centerMode: 'corners',
   cornerFraction: 0.05,
-  beamShape: 'off',
+  beamShape: 'circle',
   beamCx: 0.0,
   beamCy: 0.0,
   beamR: 0.0,
@@ -267,7 +267,7 @@ export function DpcWizard({ caretPos, windowId, sendAction, onClose }: Props) {
   // it. Same shape as the Crop / Center-Zero-Beam drag→field round trip.
   useWizardEvent('spyde:dpc_region', windowId, (d) => {
     const r: Region = {
-      shape: String(d.shape ?? 'off') as BeamShape,
+      shape: String(d.shape ?? 'circle') as BeamShape,
       cx: Number(d.cx ?? 0), cy: Number(d.cy ?? 0),
       r: Number(d.r ?? 0), r_inner: Number(d.r_inner ?? 0),
       brightness: d.brightness == null ? null : Number(d.brightness),
@@ -433,7 +433,8 @@ export function DpcWizard({ caretPos, windowId, sendAction, onClose }: Props) {
                 ))}
               </div>
             </Field>
-            {beamShape !== 'off' && (
+            {/* Always rendered: there is no shape that hides these. */}
+            {(
               <>
                 <Field label="Radius (px)">
                   <NumInput testid="dpc-beam-r" value={round1(beamR)} step="1"
@@ -641,16 +642,25 @@ function Info({ text, testid }: { text: string; testid: string }) {
  */
 function BeamReadout({ region, shape }: { region: Region | null; shape: BeamShape }) {
   const b = region?.brightness
+  // The region's geometry, as the BACKEND currently holds it. Not shown — it is
+  // already drawn on the pattern — but a drag test has no other truthful source
+  // for it: read off the figure's pixels, a circle that runs to the edge of the
+  // frame is clipped, and the centroid of what is left moves the wrong way.
+  const geom = {
+    'data-cx': region ? region.cx.toFixed(3) : undefined,
+    'data-cy': region ? region.cy.toFixed(3) : undefined,
+    'data-r': region ? region.r.toFixed(3) : undefined,
+  }
   if (b == null || !Number.isFinite(b)) {
     return (
-      <div data-testid="dpc-beam-readout" style={S.hint}>
+      <div data-testid="dpc-beam-readout" {...geom} style={S.hint}>
         Drag the {shape === 'ring' ? 'ring' : 'circle'} onto the direct beam.
       </div>
     )
   }
   const good = b >= 2
   return (
-    <div data-testid="dpc-beam-readout" data-brightness={b.toFixed(2)}
+    <div data-testid="dpc-beam-readout" data-brightness={b.toFixed(2)} {...geom}
       style={{ ...readoutStyle, color: good ? '#a6e3a1' : '#f9e2af' }}>
       {b.toFixed(1)}× frame average
       <span style={S.hint}>
