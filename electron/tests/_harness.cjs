@@ -524,8 +524,16 @@ function navWindows(page) {
  *    must not turn a missing GPU back into a fake backend error, which is
  *    exactly how the 34 -> 44 upgrade first reddened these audits.
  */
-function backendErrorLines(backend) {
-  return backend.logBuffer.filter((l) =>
+function backendErrorLines(backendOrLines) {
+  // Accepts the backend or a plain array of lines, so a spec holding its own
+  // snapshot can still use THIS filter instead of copying it. ipf_perf kept a
+  // copy and it went stale exactly as you would expect: it knew only the old
+  // `bus.cc(406)` shape and the old WebGPU wording, so the Electron 44 bump
+  // turned dbus noise back into "backend errors during IPF render".
+  const lines = Array.isArray(backendOrLines)
+    ? backendOrLines
+    : backendOrLines.logBuffer
+  return lines.filter((l) =>
     /ERROR|Traceback/i.test(l)
     && !/Security Warning|Content.Security.Policy|Content Security/i.test(l)
     && !/willReadFrequently/i.test(l)
