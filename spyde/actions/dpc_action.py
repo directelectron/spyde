@@ -453,6 +453,11 @@ class DpcWizard(WizardController):
         # _cancel_measure, so there is one decision and two ways of hearing it.
         import threading
         event = threading.Event()
+        # Chunks land on several pool threads at once, so the tally is taken
+        # under a lock: `landed[0] += 1` is three bytecodes, and a lost update
+        # means the count never reaches `total` — the pass then has no finish at
+        # all, leaving the token registered and "Calculating…" up for good.
+        counted = threading.Lock()
 
         def _on_chunk(chunk, slices):
             """A dask callback thread — store, then marshal the repaint."""
@@ -463,8 +468,9 @@ class DpcWizard(WizardController):
             except Exception as e:                           # pragma: no cover
                 log.debug("storing a DPC chunk failed: %s", e)
                 return
-            landed[0] += 1
-            n = landed[0]
+            with counted:
+                landed[0] += 1
+                n = landed[0]
             if n >= total:
                 # The last chunk IS the completed pass. Counting them is how the
                 # finish is known: the handle's value is assembled client-side
@@ -985,6 +991,19 @@ class DpcWizard(WizardController):
         re-enter synchronously. ``set`` fires ``pointer_move``, but the selector
         answers that by submitting to the dispatcher, so the read-back lands on
         another thread and one write cannot recurse into another.
+
+        Then push the PANEL as well, which is not redundant. ``set`` reaches the
+        figure as a targeted widget message and deliberately never rewrites the
+        panel's own state (anyplotlib says so on ``Figure._push_widget``, and
+        reconciles the same divergence in ``_sync_for_export`` before any
+        snapshot). The renderer RETAINS the last panel state per figure and
+        re-applies it — so until something else repaints this plot, the geometry
+        the figure falls back to is the one the widget was BORN with. For the
+        beam region that is ``image_width * 0.1``, a fifth of the radius it
+        opens at: the circle silently collapsed to it the first time the pointer
+        entered the pattern, and the drag that followed moved that collapsed
+        circle. Pushing here makes the panel state agree with the widget, so
+        there is nothing stale to fall back to.
         """
         widget = getattr(self._beam_selector, "roi", None)
         if widget is None:
@@ -994,6 +1013,9 @@ class DpcWizard(WizardController):
                            "r_outer": region.r, "r_inner": region.r_inner}
                           if region.shape == "ring"
                           else {"cx": region.cx, "cy": region.cy, "r": region.r}))
+            plot2d = getattr(widget, "_plot", None)
+            if plot2d is not None:
+                plot2d._push()
         except Exception as e:                               # pragma: no cover
             log.debug("writing the DPC beam region to its widget failed: %s", e)
 
@@ -1065,9 +1087,15 @@ class DpcWizard(WizardController):
         signal = self.signal
         if not with_brightness or signal is None:
             return
+        # Its OWN view, for the reason `private_view` gives: the probe reads one
+        # frame with `inav`, and hyperspy takes an `inav` slice by deep-copying
+        # the signal it slices. Probing the LIVE signal on a worker therefore
+        # races the pass lane copying that same signal — and the loser of that
+        # race falls back to measuring on the shared object.
+        probe = _dpc.private_view(signal)
 
         def _work():
-            return _dpc.region_brightness(signal, region)
+            return _dpc.region_brightness(probe, region)
 
         def _done(brightness):
             # Drop a reading for a region the user has already moved on from —

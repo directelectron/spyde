@@ -542,7 +542,15 @@ function backendErrorLines(backendOrLines) {
     // full-path colon form `dbus/bus.cc:405]` (format changed upstream, so an
     // Electron bump must not silently turn infrastructure noise back into
     // "backend errors").
-    && !/:(ERROR|FATAL):[a-z_0-9/]+\.(cc|mm)[(:]\d+[)\]]/.test(l))
+    && !/:(ERROR|FATAL):[a-z_0-9/]+\.(cc|mm)[(:]\d+[)\]]/.test(l)
+    // A CANCELLED compute, reported by the scheduler at ERROR. Any spec that
+    // supersedes a whole-scan pass mid-flight (drag a virtual detector, drag
+    // the DPC beam region) produces one per superseded pass: the client is
+    // still gathering the result of a graph whose keys the scheduler has just
+    // forgotten. It is the cancellation WORKING — the alternative, letting the
+    // pass run to the end, is the bug. Deliberately narrow: only the gather of
+    // a key in a released state, so a genuine worker loss still fails the spec.
+    && !/Couldn't gather keys.*'(forgotten|cancelled|released)'/.test(l))
 }
 
 /**

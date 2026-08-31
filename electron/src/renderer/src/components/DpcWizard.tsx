@@ -642,16 +642,25 @@ function Info({ text, testid }: { text: string; testid: string }) {
  */
 function BeamReadout({ region, shape }: { region: Region | null; shape: BeamShape }) {
   const b = region?.brightness
+  // The region's geometry, as the BACKEND currently holds it. Not shown — it is
+  // already drawn on the pattern — but a drag test has no other truthful source
+  // for it: read off the figure's pixels, a circle that runs to the edge of the
+  // frame is clipped, and the centroid of what is left moves the wrong way.
+  const geom = {
+    'data-cx': region ? region.cx.toFixed(3) : undefined,
+    'data-cy': region ? region.cy.toFixed(3) : undefined,
+    'data-r': region ? region.r.toFixed(3) : undefined,
+  }
   if (b == null || !Number.isFinite(b)) {
     return (
-      <div data-testid="dpc-beam-readout" style={S.hint}>
+      <div data-testid="dpc-beam-readout" {...geom} style={S.hint}>
         Drag the {shape === 'ring' ? 'ring' : 'circle'} onto the direct beam.
       </div>
     )
   }
   const good = b >= 2
   return (
-    <div data-testid="dpc-beam-readout" data-brightness={b.toFixed(2)}
+    <div data-testid="dpc-beam-readout" data-brightness={b.toFixed(2)} {...geom}
       style={{ ...readoutStyle, color: good ? '#a6e3a1' : '#f9e2af' }}>
       {b.toFixed(1)}× frame average
       <span style={S.hint}>

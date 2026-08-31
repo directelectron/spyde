@@ -363,6 +363,37 @@ class TestCentering:
         assert wiz.region().shape == "ring"
         assert 0 < wiz.region().r_inner < wiz.region().r
 
+    def test_writing_the_region_also_refreshes_the_panel(self, window):
+        """A geometry write from Python must leave the FIGURE's own state
+        agreeing with the widget, not just the widget.
+
+        ``Widget.set`` reaches the figure as a targeted message and deliberately
+        never rewrites the panel state — and the renderer retains that state and
+        re-applies it, so whatever the panel still holds is what the figure falls
+        back to. What it held was the geometry the widget was BORN with
+        (``image_width * 0.1``, a fifth of the radius the region opens at), and
+        the circle collapsed to it the moment the pointer entered the pattern.
+        Dragging the collapsed circle then measured a region a few pixels wide.
+        """
+        _session, _plot, _tree, wiz = _opened(window, beam_shape="circle")
+        widget = wiz._beam_selector.roi
+        plot2d = widget._plot
+        pushes = []
+        real_push = plot2d._push
+
+        def counted_push():
+            pushes.append(1)
+            real_push()
+
+        plot2d._push = counted_push
+        try:
+            wiz._write_region_to_widget(wiz.region())
+        finally:
+            del plot2d._push
+        assert pushes, "the panel kept the widget's birth geometry"
+        drawn = plot2d.to_state_dict()["overlay_widgets"]
+        assert [w["r"] for w in drawn] == [wiz.region().r]
+
     def test_the_region_is_always_on_the_pattern(self, window):
         """There is no "off". The region IS what the centre of mass is taken
         over, so switching it off only meant taking the whole frame with no
@@ -631,20 +662,45 @@ class TestLive:
             return real_refresh(self)
 
         total_positions = nav * nav
+        chunks = (nav // chunk) ** 2
+
+        def streamed():
+            """The progress a LANDING CHUNK reported, one message each."""
+            return [m for m in window["messages"]
+                    if isinstance(m, dict) and m.get("type") == "progress"
+                    and "DPC" in str(m.get("label", ""))
+                    and m.get("total") == chunks]
+
+        def finished():
+            """`_finish` is the only thing that emits a bare ``"DPC"``
+            progress, and it runs only once the LAST chunk is in."""
+            return any(isinstance(m, dict) and m.get("type") == "progress"
+                       and m.get("label") == "DPC" and m.get("total") == 1
+                       for m in window["messages"])
+
         dpca.DpcWizard.refresh = spy
         try:
             dpca.dpc_open(session, plot, {})
             _wait(lambda: getattr(plot.signal_tree, "_dpc_wizard", None)
                   is not None)
-            # Wait on the recorded PAINT, not on `wiz.shifts`: `_finish` assigns
-            # the shifts and only THEN calls `refresh`, so a wait on the array
-            # can return between the two — leaving the last entry in
-            # `seen_partial` a partial paint, and restoring the spy in `finally`
-            # before the full one was ever recorded.
+            # Wait for the PASS TO FINISH — not for the field to be complete.
+            # The opening pass seeds the whole field from the scan corners
+            # before a single chunk has landed, so "every position is finite"
+            # is already true at the FIRST repaint: waiting on it returned
+            # after one chunk of four and then read a progress stream three
+            # messages short of what the pass went on to emit.
+            assert _wait(finished, timeout=60.0), \
+                f"the streamed pass never completed: {streamed()}"
+            # Every chunk but the last reports progress; the last one IS the
+            # finish. Both emits happen on their own chunk's callback thread,
+            # so the finish can be recorded a moment before the partial that
+            # precedes it — hence a wait rather than a bare read.
+            _wait(lambda: len(streamed()) >= chunks - 1, timeout=5.0)
+            # Only now is the last recorded paint the completed field.
             assert _wait(lambda: seen_partial
                          and seen_partial[-1] == total_positions,
-                         timeout=60.0), \
-                f"the streamed pass never completed: {seen_partial}"
+                         timeout=10.0), \
+                f"the finished pass never repainted the whole field: {seen_partial}"
         finally:
             dpca.DpcWizard.refresh = real_refresh
 
@@ -654,16 +710,12 @@ class TestLive:
 
         # The whole claim: the map was repainted MORE THAN ONCE, once per nav
         # chunk that landed, rather than a single paint at the end.
-        chunks = (nav // chunk) ** 2
-        streamed = [m for m in window["messages"]
-                    if isinstance(m, dict) and m.get("type") == "progress"
-                    and "DPC" in str(m.get("label", ""))
-                    and m.get("total") == chunks]
-        assert len(streamed) >= 2, \
-            f"the pass did not stream — one paint at the end: {streamed}"
-        assert any(0 < m["done"] < chunks for m in streamed), \
-            f"no chunk reported partial progress: {streamed}"
-        assert streamed[0]["total"] == chunks, \
+        landed = streamed()
+        assert len(landed) >= 2, \
+            f"the pass did not stream — one paint at the end: {landed}"
+        assert any(0 < m["done"] < chunks for m in landed), \
+            f"no chunk reported partial progress: {landed}"
+        assert landed[0]["total"] == chunks, \
             "progress should count NAV CHUNKS, matching the storage layout"
 
     def test_an_eager_scan_does_not_pretend_to_stream(self, window):

@@ -119,17 +119,18 @@ test('the DPC field map tracks the beam region while it is dragged', async () =>
       return parts.join('|')
     }
 
-    /**
-     * Where the beam circle is on screen, from its colour (#94e2d5).
-     *
-     * The ring is symmetric, so the centroid of its teal pixels IS its centre —
-     * which is where the drag handle sits. Guessing a point inside the circle
-     * instead grabs nothing: the cursor readout still tracks, so the figure
-     * looks driven while the circle stays put, and the run reports "0 frames"
-     * for a drag that never happened. That is indistinguishable from the bug,
-     * which is why the grab below is verified rather than assumed.
-     */
-    const beamCentre = async () => {
+    /** Where the region IS, as the backend holds it — echoed to the caret on
+     *  every committed move. */
+    const regionGeometry = async () => {
+      const el = sig.getByTestId('dpc-beam-readout')
+      const [cx, cy] = await Promise.all([
+        el.getAttribute('data-cx'), el.getAttribute('data-cy'),
+      ])
+      return cx == null || cy == null
+        ? null : { cx: Number(cx), cy: Number(cy) }
+    }
+
+    const figureFrame = async () => {
       const host = await sig.elementHandle()
       if (!host) return null
       for (const frame of page.frames()) {
@@ -138,45 +139,77 @@ test('the DPC field map tracks the beam region while it is dragged', async () =>
         const inside = await host.evaluate(
           (w, f) => w.contains(f as Node), el).catch(() => false)
         if (!inside) continue
-        const hit = await frame.evaluate(() => {
-          let sx = 0, sy = 0, n = 0
-          for (const c of Array.from(document.querySelectorAll('canvas'))) {
-            const cv = c as HTMLCanvasElement
-            const g = cv.getContext('2d')
-            if (!g || !cv.width) continue
-            const d = g.getImageData(0, 0, cv.width, cv.height).data
-            const box = cv.getBoundingClientRect()
-            const kx = box.width / cv.width, ky = box.height / cv.height
-            for (let i = 0; i < d.length; i += 4) {
-              const r = d[i], gg = d[i + 1], b = d[i + 2]
-              if (!(r > 110 && r < 175 && gg > 200 && b > 185 && b < 240)) continue
-              const px = (i / 4) % cv.width, py = Math.floor((i / 4) / cv.width)
-              sx += box.left + px * kx; sy += box.top + py * ky; n++
-            }
-          }
-          return n > 8 ? { x: sx / n, y: sy / n } : null
-        }).catch(() => null)
-        if (hit) {
-          const fb = await el.boundingBox()
-          return { x: (fb?.x ?? 0) + hit.x, y: (fb?.y ?? 0) + hit.y }
-        }
+        const ok = await frame.evaluate(
+          () => !!(window as any).__apl_imgToCanvas
+            && !!(window as any)._aplTiming).catch(() => false)
+        if (ok) return { frame, el }
       }
       return null
     }
 
-    const sigBox = await sig.boundingBox()
-    const start = await beamCentre()
-    if (!sigBox || !start) throw new Error('could not find the beam circle')
+    /**
+     * The region's centre, in PAGE coordinates.
+     *
+     * Both halves come from something authoritative rather than from the
+     * picture: the geometry is the backend's own and the image→canvas transform
+     * is anyplotlib's own (`__apl_imgToCanvas`, published for exactly this).
+     *
+     * NOT the centroid of the circle's teal pixels, which is what this did
+     * first. The region opens as the INSCRIBED circle, so a nudge in any
+     * direction runs it off the frame; the visible arc is then clipped on that
+     * side and its centroid moves the OTHER way. A grab check built on it reads
+     * "never moved" for a drag that moved perfectly well — indistinguishable
+     * from the bug this spec exists to catch. And aiming has to be exact
+     * either way: the centre hot-spot is 9 px, and a miss lands on the radius
+     * handle or on nothing.
+     */
+    const centrePoint = async () => {
+      const g = await regionGeometry()
+      const f = await figureFrame()
+      if (!g || !f) return null
+      const hit = await f.frame.evaluate(([x, y]: number[]) => {
+        const w: any = window
+        for (const id of Object.keys(w._aplTiming || {})) {
+          const c = w.__apl_imgToCanvas(id, x, y)
+          if (!c) continue
+          // The panel's own canvas — the biggest one, since the axis strips,
+          // the colour bar and the status line are canvases too. The image,
+          // overlay and marker layers share its box, which is the box
+          // `__apl_imgToCanvas` returns coordinates in.
+          const cv = Array.from(document.querySelectorAll('canvas'))
+            .map((c2) => (c2 as HTMLCanvasElement).getBoundingClientRect())
+            .sort((a, b) => b.width * b.height - a.width * a.height)[0]
+          if (!cv) return null
+          return { x: cv.left + c[0], y: cv.top + c[1] }
+        }
+        return null
+      }, [g.cx, g.cy]).catch(() => null)
+      if (!hit) return null
+      const fb = await f.el.boundingBox()
+      return { x: (fb?.x ?? 0) + hit.x, y: (fb?.y ?? 0) + hit.y }
+    }
 
-    // Prove the grab took before measuring anything (see beamCentre).
+    const sigBox = await sig.boundingBox()
+    const before = await regionGeometry()
+    // `_aplTiming` gains a panel's entry only once that panel has drawn twice,
+    // so on a slow machine the transform can simply not be there yet. Wait for
+    // it rather than reporting it as a missing circle.
+    let start = await centrePoint()
+    for (let i = 0; i < 40 && !start; i++) {
+      await page.waitForTimeout(500)
+      start = await centrePoint()
+    }
+    if (!sigBox || !before || !start) throw new Error('could not find the beam circle')
+
+    // Prove the grab took before measuring anything (see centrePoint).
     let grabbed = false
     for (let attempt = 0; attempt < 4 && !grabbed; attempt++) {
       await page.mouse.move(start.x, start.y)
       await page.mouse.down()
       await page.mouse.move(start.x, start.y + 12)
-      await page.waitForTimeout(250)
-      const now = await beamCentre()
-      grabbed = !!now && Math.abs(now.y - start.y) > 3
+      await page.waitForTimeout(400)
+      const now = await regionGeometry()
+      grabbed = !!now && Math.abs(now.cy - before.cy) > 0.5
       if (!grabbed) {
         await page.mouse.up()
         await page.waitForTimeout(400)
