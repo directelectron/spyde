@@ -100,8 +100,15 @@ class TestFindVectorsPort:
             # of it reads across that gap. This used to be covered by polling
             # the pixels for 30 s, which on a loaded runner was not always long
             # enough: "result window still renders zeros", #149 ubuntu-py3.11.
+            # "Found N diffraction vectors" — the FINISH. Note the `Found`:
+            # the batch also emits "Finding diffraction vectors…" when it
+            # STARTS, so matching the substring alone matches the start message
+            # and waits for nothing at all. (It did: this assertion then fired
+            # on windows-py3.13 with the live preview's slice function still
+            # installed, which is exactly right for mid-compute.)
             assert _wait(lambda: any(
                 isinstance(m, dict)
+                and str(m.get("text", "")).startswith("Found ")
                 and "diffraction vectors" in str(m.get("text", ""))
                 for m in captured_messages)), \
                 "the batch never reported that it had finished"
