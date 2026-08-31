@@ -20,6 +20,7 @@ import numpy as np
 
 from spyde.actions import overlay as ov
 from spyde.tests.migrated.conftest import _settle
+from spyde.tests.migrated._async import quiesce, why_busy
 
 
 # ── setup helpers ───────────────────────────────────────────────────────────────
@@ -229,7 +230,7 @@ class TestLiveNavRefresh:
         import spyde.actions.overlay as ovmod
         monkeypatch.setattr(ovmod, "_read_source_frame", lambda *a, **k: None)
         ov.refresh_plot_layers(tgt, np.array([[1, 1]]))
-        time.sleep(0.2)
+        assert quiesce(session), why_busy(session)
         assert pushed == [], "layer refreshed on an expensive-tier (skipped) read"
 
 
@@ -469,7 +470,7 @@ class TestDeadLayerSkip:
         # A source that would RAISE if dereferenced — proves we short-circuit early.
         layer.source_plot = None
         ov.refresh_plot_layers(tgt, np.array([1]))
-        time.sleep(0.15)
+        assert quiesce(session), why_busy(session)
         assert pushed == [], "a dead layer was still read/painted"
 
 

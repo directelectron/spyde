@@ -23,6 +23,7 @@ from spyde.array_cache.readers.local_transform import (
     nav_chunk_span,
 )
 from spyde.array_cache import ArrayCache, BlockCache, get_local_frame
+from spyde.tests.migrated._async import quiesce, why_busy
 
 
 class _AxesManager:
@@ -325,7 +326,7 @@ class TestDirectReadFrameLocalityGating:
         # add_node with no local= kwarg -> defaults to None -> resolves opaque.
         rebinned = root.rebin(scale=[1, 2, 2])
         tree.add_node(root, rebinned, "UntaggedRebin")  # local defaults to None
-        time.sleep(0.1)
+        assert quiesce(session), why_busy(session)
 
         prof = NavProfile("TEST", np.array([0]))
         frame = _direct_read_frame(rebinned, None, np.array([0]), prof, child=plot)

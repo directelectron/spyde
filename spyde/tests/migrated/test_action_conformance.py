@@ -34,12 +34,19 @@ from __future__ import annotations
 import inspect
 import re
 import time
+
 from pathlib import Path
 
 import numpy as np
 import pytest
 
 from spyde.actions import registry
+from spyde.tests.migrated._async import quiesce, why_busy
+from spyde.tests.migrated._async import wait_until
+
+
+def _wait(pred, timeout=30.0):
+    return wait_until(pred, timeout)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Where the renderer lives (skip cleanly in a backend-only checkout)
@@ -360,15 +367,6 @@ WIZARD_KEYS = sorted(k for k in STAGED_KEYS
                      and k not in _NON_WIZARD_KEYS)
 
 
-def _wait(pred, timeout=30.0):
-    end = time.time() + timeout
-    while time.time() < end:
-        if pred():
-            return True
-        time.sleep(0.05)
-    return False
-
-
 def _open_wizard(session, key, spec):
     """Load the fixture, open the wizard, return its (plot, controller)."""
     _call_loader(session, spec)
@@ -475,7 +473,7 @@ class TestWizardRuntimeConformance:
         open_ = registry.resolve_staged(f"{key}_open")
         close(session, plot, {})
         open_(session, plot, dict(spec["payload"]))
-        time.sleep(0.6)          # let any superseded worker land and be dropped
+        assert quiesce(session), why_busy(session)   # superseded work lands, then is dropped
 
         live = [t for t in session.signal_trees
                 if _live_controllers(t, key)]

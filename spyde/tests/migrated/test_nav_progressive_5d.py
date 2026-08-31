@@ -31,6 +31,11 @@ import numpy as np
 import dask.array as da
 import hyperspy.api as hs
 import pytest
+from spyde.tests.migrated._async import wait_until
+
+
+def _wait(pred, timeout=20.0):
+    return wait_until(pred, timeout)
 
 
 def _make_session():
@@ -49,15 +54,6 @@ def _stack_5d(nt=3, ny=8, nx=8, ky=4, kx=4, chunk_nav=4):
     s = hs.signals.Signal2D(arr).as_lazy()
     s.set_signal_type("electron_diffraction")
     return s, base
-
-
-def _wait(pred, timeout=20.0):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if pred():
-            return True
-        time.sleep(0.05)
-    return False
 
 
 @pytest.fixture

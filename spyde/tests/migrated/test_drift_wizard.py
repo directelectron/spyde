@@ -34,6 +34,11 @@ import numpy as np
 import pytest
 
 from spyde.actions import drift_action as dr
+from spyde.tests.migrated._async import wait_until
+
+
+def _wait(pred, timeout=30.0):
+    return wait_until(pred, timeout)
 
 
 @pytest.fixture
@@ -62,15 +67,6 @@ N_FRAMES = 8
 def _signal_plot(session):
     return next((p for p in session._plots
                  if not p.is_navigator and p.plot_state is not None), None)
-
-
-def _wait(pred, timeout=30.0):
-    end = time.time() + timeout
-    while time.time() < end:
-        if pred():
-            return True
-        time.sleep(0.05)
-    return False
 
 
 def _movie(window, frames: int = N_FRAMES):

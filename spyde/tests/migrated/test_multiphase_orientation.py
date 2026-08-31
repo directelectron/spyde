@@ -15,6 +15,11 @@ import time
 import numpy as np
 import hyperspy.api as hs
 from spyde.tests.migrated.conftest import _settle
+from spyde.tests.migrated._async import wait_until
+
+
+def _wait(pred, timeout=40.0):
+    return wait_until(pred, timeout)
 
 CIF = os.path.join(os.path.dirname(__file__), "..", "Silver__0011135.cif")
 
@@ -23,15 +28,6 @@ def _signal_plot(session, tree=None):
     return next((p for p in session._plots
                  if not p.is_navigator and p.plot_state is not None
                  and (tree is None or getattr(p, "signal_tree", None) is tree)), None)
-
-
-def _wait(pred, timeout=40.0):
-    end = time.time() + timeout
-    while time.time() < end:
-        if pred():
-            return True
-        time.sleep(0.1)
-    return False
 
 
 def _two_phases():

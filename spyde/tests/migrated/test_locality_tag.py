@@ -18,6 +18,11 @@ import hyperspy.api as hs
 from spyde.signal_node import SignalNode
 from spyde.array_cache.locality import resolve_locality
 from spyde.tests.migrated.conftest import _settle
+from spyde.tests.migrated._async import wait_until
+
+
+def _wait(pred, timeout=25.0):
+    return wait_until(pred, timeout)
 
 
 def _node(name, parent, local=None):
@@ -113,15 +118,6 @@ def _off_center_4d(nav=(3, 3), sig=(32, 32), beam=(18, 14)):
 def _signal_plot(session):
     return next((p for p in session._plots
                  if not p.is_navigator and p.plot_state is not None), None)
-
-
-def _wait(pred, timeout=25.0):
-    end = time.time() + timeout
-    while time.time() < end:
-        if pred():
-            return True
-        time.sleep(0.1)
-    return False
 
 
 class TestLocalityThroughCZB:

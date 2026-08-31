@@ -38,6 +38,11 @@ import numpy as np
 import pytest
 
 from spyde.actions import dpc_action as dpca
+from spyde.tests.migrated._async import wait_until
+
+
+def _wait(pred, timeout=60.0):
+    return wait_until(pred, timeout)
 
 
 @pytest.fixture
@@ -49,15 +54,6 @@ def _capture_module_emit(window, monkeypatch):
     documents for ``session.py``, and the same fix.
     """
     monkeypatch.setattr(dpca, "emit", window["messages"].append)
-
-
-def _wait(pred, timeout=60.0):
-    end = time.time() + timeout
-    while time.time() < end:
-        if pred():
-            return True
-        time.sleep(0.05)
-    return False
 
 
 def _signal_plot(session):

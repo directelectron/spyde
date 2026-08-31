@@ -20,20 +20,17 @@ import time
 
 import numpy as np
 import hyperspy.api as hs
+from spyde.tests.migrated._async import quiesce, why_busy
+from spyde.tests.migrated._async import wait_until
+
+
+def _wait(pred, timeout=25.0):
+    return wait_until(pred, timeout)
 
 
 def _signal_plot(session):
     return next((p for p in session._plots
                  if not p.is_navigator and p.plot_state is not None), None)
-
-
-def _wait(pred, timeout=25.0):
-    end = time.time() + timeout
-    while time.time() < end:
-        if pred():
-            return True
-        time.sleep(0.1)
-    return False
 
 
 def _calibrated_diffraction_4d(nav=(4, 5), sig=(24, 24), scale=0.1):
@@ -62,7 +59,7 @@ class TestFindVectorsWizard:
         session = Session(n_workers=1, threads_per_worker=1)
         try:
             session._add_signal(_calibrated_diffraction_4d(scale=0.1))
-            time.sleep(0.4)
+            assert quiesce(session), why_busy(session)
             src = _signal_plot(session)
             tree = src.signal_tree
 
@@ -116,7 +113,7 @@ class TestFindVectorsWizard:
         session = Session(n_workers=1, threads_per_worker=1)
         try:
             session._add_signal(_calibrated_diffraction_4d(scale=0.1))
-            time.sleep(0.4)
+            assert quiesce(session), why_busy(session)
             src = _signal_plot(session)
             tree = src.signal_tree
 
