@@ -1,1 +1,0 @@
-Help → Report a Problem… sends a description of what went wrong together with the machine's OS, app and runtime versions, GPU, Python-environment state and the backend's recent output — shown in full before anything is sent, and saved to a file when the machine is offline.
