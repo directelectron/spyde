@@ -20,13 +20,13 @@ import os
 import numpy as np
 import hyperspy.api as hs
 import pytest
+from spyde.tests.migrated.conftest import make_session
 
 
 @pytest.fixture
 def stack_5d_session():
     os.environ["SPYDE_NO_DASK"] = "1"
-    from spyde.backend.session import Session
-    sess = Session(n_workers=1, threads_per_worker=1)
+    sess = make_session()
     s = hs.signals.Signal2D(np.random.rand(2, 4, 5, 8, 8).astype(np.float32))
     s.set_signal_type("electron_diffraction")
     sess._add_signal(s, source_path=None)

@@ -17,7 +17,7 @@ import hyperspy.api as hs
 
 from spyde.signal_node import SignalNode
 from spyde.array_cache.locality import resolve_locality
-from spyde.tests.migrated.conftest import _settle
+from spyde.tests.migrated.conftest import _settle, close_session, make_session
 from spyde.tests.migrated._async import wait_until
 
 
@@ -122,10 +122,9 @@ def _signal_plot(session):
 
 class TestLocalityThroughCZB:
     def test_auto_per_pattern_resolves_local(self):
-        from spyde.backend.session import Session
         from spyde.actions.center_zero_beam import czb_run
 
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             session._add_signal(_off_center_4d())
             _settle(session)
@@ -136,13 +135,12 @@ class TestLocalityThroughCZB:
             tree = session.signal_trees[0]
             assert tree.resolve_locality(src.plot_state.current_signal) is True
         finally:
-            session.shutdown()
+            close_session(session)
 
     def test_auto_flat_field_resolves_opaque(self):
-        from spyde.backend.session import Session
         from spyde.actions.center_zero_beam import czb_run
 
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             session._add_signal(_off_center_4d())
             _settle(session)
@@ -155,13 +153,12 @@ class TestLocalityThroughCZB:
             # this specific run must resolve opaque even though CZB is usually local.
             assert tree.resolve_locality(src.plot_state.current_signal) is False
         finally:
-            session.shutdown()
+            close_session(session)
 
     def test_manual_constant_shift_resolves_local(self):
-        from spyde.backend.session import Session
         from spyde.actions.center_zero_beam import czb_open, czb_pick
 
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             session._add_signal(_off_center_4d())
             _settle(session)
@@ -175,4 +172,4 @@ class TestLocalityThroughCZB:
             assert _wait(lambda: src.plot_state.current_signal is not before)
             assert tree.resolve_locality(src.plot_state.current_signal) is True
         finally:
-            session.shutdown()
+            close_session(session)

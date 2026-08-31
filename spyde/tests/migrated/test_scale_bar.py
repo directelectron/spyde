@@ -5,7 +5,7 @@ import time
 
 import numpy as np
 import hyperspy.api as hs
-from spyde.tests.migrated.conftest import _settle
+from spyde.tests.migrated.conftest import _settle, make_session
 
 
 def _panel_units(messages):
@@ -21,14 +21,13 @@ def _panel_units(messages):
 
 class TestScaleBar:
     def test_physical_units_reach_panel_state(self, captured_messages):
-        from spyde.backend.session import Session
 
         # 2-D image whose axes are calibrated in nm.
         s = hs.signals.Signal2D(np.random.RandomState(0).rand(32, 32).astype(np.float32))
         for ax in s.axes_manager.signal_axes:
             ax.units = "nm"
             ax.scale = 0.5
-        sess = Session(n_workers=1, threads_per_worker=1)
+        sess = make_session()
         sess._add_signal(s, source_path=None)
         _settle(sess)
         sess.shutdown()
@@ -39,11 +38,10 @@ class TestScaleBar:
             f"no calibrated panel push; got {set(units)}"
 
     def test_pixel_units_give_no_scale(self, captured_messages):
-        from spyde.backend.session import Session
 
         # Uncalibrated image → units stay 'px' → no scale bar (correct).
         s = hs.signals.Signal2D(np.random.RandomState(1).rand(16, 16).astype(np.float32))
-        sess = Session(n_workers=1, threads_per_worker=1)
+        sess = make_session()
         sess._add_signal(s, source_path=None)
         _settle(sess)
         sess.shutdown()

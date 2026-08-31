@@ -25,11 +25,11 @@ import numpy as np
 import dask.array as da
 import hyperspy.api as hs
 import pytest
+from spyde.tests.migrated.conftest import make_session
 
 
 def _make_session():
-    from spyde.backend.session import Session
-    return Session(n_workers=1, threads_per_worker=1)
+    return make_session()
 
 
 # A blocking gate the fake navigator compute waits on, so the test controls

@@ -11,6 +11,7 @@ import json
 import os
 
 from spyde.actions.registry import STAGED_HANDLERS
+from spyde.tests.migrated.conftest import make_session, close_session
 
 
 def _isolate_settings(session, tmp_path):
@@ -63,11 +64,11 @@ class TestFirstRunFlag:
         # conftest sets session-wide) rather than patching expanduser — the env
         # var takes precedence in Session, so a patched HOME would be ignored.
         monkeypatch.setenv("SPYDE_SETTINGS_DIR", os.path.dirname(settings_path))
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             assert session.first_run is False
         finally:
-            session.shutdown()
+            close_session(session)
 
     def test_dispatch_mark_tutorial_seen_routes(self, window, tmp_path):
         """The renderer sends {action: 'mark_tutorial_seen'} when it auto-opens

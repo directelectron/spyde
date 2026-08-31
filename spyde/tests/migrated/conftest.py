@@ -54,7 +54,15 @@ def captured_messages(monkeypatch):
     return msgs
 
 
-def _make_session():
+def make_session():
+    """A Session wired the way the app wires one — the loop included.
+
+    Public because a test that builds its own Session should not get a
+    DIFFERENT program from one that takes a fixture. Constructing `Session`
+    directly leaves `_main_loop` unset, and `_dispatch_to_main` then runs every
+    worker callback inline on the worker thread, which is not what the app
+    does (see `_attach_main_loop`). Pair with `close_session`.
+    """
     from spyde.backend.session import Session
     session = Session(n_workers=1, threads_per_worker=1)
     _attach_main_loop(session)
@@ -101,12 +109,16 @@ def _attach_main_loop(session) -> None:
     session._test_loop, session._test_loop_thread = loop, thread
 
 
-def _teardown(session) -> None:
+def close_session(session) -> None:
     """Shut the session down, then the loop it marshals onto — in that order.
 
     Backwards, and ``shutdown``'s own callbacks land on a dead loop: they
     raise inside ``_dispatch_to_main``, which swallows them and runs the work
     inline instead, back on the very thread this exists to keep work off.
+
+    IDEMPOTENT. A test may close its session itself and the fixture will close
+    it again on the way out; a second call must not raise, and
+    ``call_soon_threadsafe`` on a closed loop does.
     """
     from spyde.tests.migrated._async import drain_loop
 
@@ -117,7 +129,11 @@ def _teardown(session) -> None:
     if loop is None:
         return
     session._main_loop = None
-    loop.call_soon_threadsafe(loop.stop)
+    session._test_loop = session._test_loop_thread = None
+    try:
+        loop.call_soon_threadsafe(loop.stop)
+    except RuntimeError:            # already stopped and closed
+        return
     if thread is not None:
         thread.join(timeout=5.0)
     loop.close()
@@ -184,33 +200,33 @@ def _bright_disk_4d(nav, sig=(16, 16)):
 @pytest.fixture
 def window(captured_messages):
     """Empty session — no data loaded."""
-    session = _make_session()
+    session = make_session()
     yield {"window": session, "signal_trees": session.signal_trees,
            "plots": session._plots, "messages": captured_messages}
-    _teardown(session)
+    close_session(session)
 
 
 @pytest.fixture
 def tem_2d_dataset(captured_messages):
     """2-D image (no navigation) → one signal window."""
-    session = _make_session()
+    session = make_session()
     s = hs.signals.Signal2D(np.random.RandomState(0).rand(32, 32).astype(np.float32))
     _load(session, s)
     yield {"window": session, "signal_trees": session.signal_trees,
            "plots": session._plots, "messages": captured_messages}
-    _teardown(session)
+    close_session(session)
 
 
 @pytest.fixture
 def stem_4d_dataset(captured_messages):
     """4-D STEM (2-D nav, 2-D signal) → navigator + signal windows."""
-    session = _make_session()
+    session = make_session()
     s = hs.signals.Signal2D(_bright_disk_4d((4, 5)))
     s.set_signal_type("electron_diffraction")
     _load(session, s)
     yield {"window": session, "signal_trees": session.signal_trees,
            "plots": session._plots, "messages": captured_messages}
-    _teardown(session)
+    close_session(session)
 
 
 def _movie_stack(n_frames=8, frame=(32, 32)):
@@ -229,7 +245,7 @@ def _movie_stack(n_frames=8, frame=(32, 32)):
 @pytest.fixture
 def movie_dataset(captured_messages):
     """In-situ movie: nav-dim 1 (time), 2-D image signal → 1-D time navigator."""
-    session = _make_session()
+    session = make_session()
     s = hs.signals.Signal2D(_movie_stack()).as_lazy()
     # A calibrated time axis (what the DE-MRC reader gives an in-situ movie).
     tax = s.axes_manager.navigation_axes[0]
@@ -238,4 +254,4 @@ def movie_dataset(captured_messages):
     _load(session, s)
     yield {"window": session, "signal_trees": session.signal_trees,
            "plots": session._plots, "messages": captured_messages}
-    _teardown(session)
+    close_session(session)

@@ -15,7 +15,7 @@ import time
 
 import numpy as np
 import hyperspy.api as hs
-from spyde.tests.migrated.conftest import _settle
+from spyde.tests.migrated.conftest import _settle, close_session, make_session
 
 
 def _signal_plot(session):
@@ -26,8 +26,7 @@ def _signal_plot(session):
 class TestSetMetadataAction:
     def test_set_metadata_float_writes_back_and_re_emits(self):
         import spyde.backend.session as sess_mod
-        from spyde.backend.session import Session
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             s = hs.signals.Signal2D(np.zeros((4, 5, 24, 24), np.float32))
             s.set_signal_type("electron_diffraction")
@@ -57,11 +56,10 @@ class TestSetMetadataAction:
             assert md_msgs
             assert md_msgs[-1]["metadata"]["Instrument Metadata"]["Mag"] == "12000.5 x"
         finally:
-            session.shutdown()
+            close_session(session)
 
     def test_set_metadata_string_field(self):
-        from spyde.backend.session import Session
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             s = hs.signals.Signal2D(np.zeros((8, 8), np.float32))
             session._add_signal(s)
@@ -75,14 +73,13 @@ class TestSetMetadataAction:
             )
             assert tree.root.metadata.get_item("General.title") == "My Experiment"
         finally:
-            session.shutdown()
+            close_session(session)
 
     def test_set_metadata_invalid_number_ignored(self):
         """Unparsable numeric input (mid-typing junk) must not write NaN/0 —
         it's silently ignored so the field reverts on the next re-render,
         matching _set_axis's non-numeric-input guard."""
-        from spyde.backend.session import Session
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             s = hs.signals.Signal2D(np.zeros((8, 8), np.float32))
             s.metadata.set_item("Acquisition_instrument.TEM.magnification", 5000.0)
@@ -98,7 +95,7 @@ class TestSetMetadataAction:
             assert tree.root.metadata.get_item(
                 "Acquisition_instrument.TEM.magnification") == 5000.0
         finally:
-            session.shutdown()
+            close_session(session)
 
     def test_units_suffixed_display_string_rejected(self):
         """Regression lock for the units-in-pre-fill bug: the panel DISPLAYS
@@ -106,8 +103,7 @@ class TestSetMetadataAction:
         display string again, a natural edit would commit "13000 x" — which
         must NOT write (float() fails → silent revert), so the raw/display
         split in the renderer is the only way a numeric edit can land."""
-        from spyde.backend.session import Session
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             s = hs.signals.Signal2D(np.zeros((8, 8), np.float32))
             s.metadata.set_item("Acquisition_instrument.TEM.magnification", 5000.0)
@@ -129,14 +125,13 @@ class TestSetMetadataAction:
             assert tree.root.metadata.get_item(
                 "Acquisition_instrument.TEM.magnification") == 13000.0
         finally:
-            session.shutdown()
+            close_session(session)
 
     def test_non_finite_numbers_rejected(self):
         """float() happily parses 'nan'/'inf' (and '1e400' overflows to inf)
         without raising — without an explicit isfinite guard they'd write and
         even round-trip to .zspy as garbage calibration."""
-        from spyde.backend.session import Session
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             s = hs.signals.Signal2D(np.zeros((8, 8), np.float32))
             s.metadata.set_item("Acquisition_instrument.TEM.magnification", 5000.0)
@@ -152,14 +147,13 @@ class TestSetMetadataAction:
                 assert tree.root.metadata.get_item(
                     "Acquisition_instrument.TEM.magnification") == 5000.0, bad
         finally:
-            session.shutdown()
+            close_session(session)
 
     def test_set_metadata_readonly_derived_field_ignored(self):
         """Dtype/Dim. are `attr`/`function` derived config entries with no
         writable `key` — editing them must be a no-op: no raise, and no
         metadata mutation at all (no bogus key created anywhere)."""
-        from spyde.backend.session import Session
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             s = hs.signals.Signal2D(np.zeros((8, 8), np.float32))
             session._add_signal(s)
@@ -174,11 +168,10 @@ class TestSetMetadataAction:
             # The whole metadata tree is bit-identical — nothing was written.
             assert tree.root.metadata.as_dictionary() == before
         finally:
-            session.shutdown()
+            close_session(session)
 
     def test_set_metadata_unknown_cell_ignored(self):
-        from spyde.backend.session import Session
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             s = hs.signals.Signal2D(np.zeros((8, 8), np.float32))
             session._add_signal(s)
@@ -188,7 +181,7 @@ class TestSetMetadataAction:
                 plot, {"group": "Nonexistent Group", "prop": "Nope", "value": "1"}
             )
         finally:
-            session.shutdown()
+            close_session(session)
 
     def test_set_metadata_no_plot_is_noop(self, window):
         session = window["window"]

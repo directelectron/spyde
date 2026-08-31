@@ -17,7 +17,7 @@ import time
 import numpy as np
 import hyperspy.api as hs
 
-from spyde.tests.migrated.conftest import _settle
+from spyde.tests.migrated.conftest import _settle, close_session, make_session
 from spyde.tests.migrated._async import wait_until
 
 
@@ -70,7 +70,6 @@ def _make_vectors_tree(session):
 
 class TestVectorOrientationOM:
     def test_generate_then_run(self, monkeypatch):
-        from spyde.backend.session import Session
         from spyde.actions.vector_orientation_om import vom_generate_library, vom_run
         # Force the CPU fit path: this exercises the WIRING (handlers → result →
         # windows). The batched-torch GPU path is validated separately (subprocess
@@ -78,7 +77,7 @@ class TestVectorOrientationOM:
         # is slow (cold JIT) and segfaults on Windows+CUDA.
         import spyde.actions.vector_orientation_gpu as _gpu
         monkeypatch.setattr(_gpu, "select_device", lambda: None)
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             vtree = _make_vectors_tree(session)
             vplot = _signal_plot(session, vtree)
@@ -164,7 +163,7 @@ class TestVectorOrientationOM:
             assert _wait(lambda: getattr(_strain_sp(), "view_label", None) == "εxx",
                          timeout=90), "Strain window εxx view never tagged"
         finally:
-            session.shutdown()
+            close_session(session)
 
     # test_generate_activates_live_refine_overlay and
     # test_run_without_library_errors_gracefully were folded into

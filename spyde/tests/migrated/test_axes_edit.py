@@ -11,7 +11,7 @@ import time
 
 import numpy as np
 import hyperspy.api as hs
-from spyde.tests.migrated.conftest import _settle
+from spyde.tests.migrated.conftest import _settle, close_session, make_session
 
 
 def _signal_plot(session):
@@ -22,8 +22,7 @@ def _signal_plot(session):
 class TestAxesEdit:
     def test_set_axis_writes_back_and_re_emits(self):
         import spyde.backend.session as sess_mod
-        from spyde.backend.session import Session
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             s = hs.signals.Signal2D(np.zeros((4, 5, 24, 24), np.float32))
             s.set_signal_type("electron_diffraction")
@@ -56,15 +55,14 @@ class TestAxesEdit:
             assert md and "Dataset" in md[-1]["metadata"]
             assert "Shape" in md[-1]["metadata"]["Dataset"]
         finally:
-            session.shutdown()
+            close_session(session)
 
     def test_scale_edit_preserves_origin_pixel(self):
         """Changing scale rescales the offset so the (0,0) data point stays on
         the SAME pixel — recalibrating pixel size must not move the marked
         origin / crosshair centre."""
         import hyperspy.api as hs
-        from spyde.backend.session import Session
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             s = hs.signals.Signal2D(np.zeros((4, 5, 20, 20), np.float32))
             s.set_signal_type("electron_diffraction")
@@ -86,4 +84,4 @@ class TestAxesEdit:
             new_origin_px = -float(axx.offset) / float(axx.scale)
             assert abs(new_origin_px - origin_px) < 1e-9
         finally:
-            session.shutdown()
+            close_session(session)

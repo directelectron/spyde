@@ -32,6 +32,7 @@ import dask.array as da
 import hyperspy.api as hs
 import pytest
 from spyde.tests.migrated._async import wait_until
+from spyde.tests.migrated.conftest import make_session
 
 
 def _wait(pred, timeout=20.0):
@@ -39,8 +40,7 @@ def _wait(pred, timeout=20.0):
 
 
 def _make_session():
-    from spyde.backend.session import Session
-    return Session(n_workers=1, threads_per_worker=1)
+    return make_session()
 
 
 def _stack_5d(nt=3, ny=8, nx=8, ky=4, kx=4, chunk_nav=4):

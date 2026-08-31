@@ -19,7 +19,7 @@ import time
 
 import numpy as np
 import hyperspy.api as hs
-from spyde.tests.migrated.conftest import _settle
+from spyde.tests.migrated.conftest import _settle, close_session, make_session
 from spyde.tests.migrated._async import wait_until
 
 
@@ -50,8 +50,7 @@ def _calibrated_diffraction_4d(scale=0.1):
 
 class TestVectorOverlay:
     def test_overlay_attached_with_pixel_offsets(self):
-        from spyde.backend.session import Session
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             session._add_signal(_calibrated_diffraction_4d(scale=0.1), source_path=None)
             _settle(session)
@@ -93,11 +92,10 @@ class TestVectorOverlay:
             assert abs(offsets[:, 0].mean() - 12) < 3
             assert abs(offsets[:, 1].mean() - 12) < 3
         finally:
-            session.shutdown()
+            close_session(session)
 
     def test_overlay_updates_when_navigator_moves(self):
-        from spyde.backend.session import Session
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             session._add_signal(_calibrated_diffraction_4d(scale=0.1), source_path=None)
             _settle(session)
@@ -127,4 +125,4 @@ class TestVectorOverlay:
                 pushed = np.asarray(overlay._mg._data["offsets"])
                 assert len(pushed) == int(cm[iy, ix])
         finally:
-            session.shutdown()
+            close_session(session)

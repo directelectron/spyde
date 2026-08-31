@@ -13,7 +13,7 @@ import pytest
 
 from spyde.drawing.selectors.base_selector import MAX_REGION_EXTENT_PER_DIM
 from spyde.drawing.selectors.roi_trace import RoiTrace
-from spyde.tests.migrated.conftest import _settle
+from spyde.tests.migrated.conftest import _settle, make_session
 
 
 def _jump_records(caplog):
@@ -163,13 +163,12 @@ class TestWiredIntoTheSelectors:
     def _movie_session():
         import time
         import hyperspy.api as hs
-        from spyde.backend.session import Session
 
         s = hs.signals.Signal2D(
             np.random.RandomState(1).rand(64, 8, 8).astype(np.float32))
         tax = s.axes_manager.navigation_axes[0]
         tax.name, tax.units, tax.scale = "time", "s", 0.05
-        sess = Session(n_workers=1, threads_per_worker=1)
+        sess = make_session()
         sess._add_signal(s, source_path=None)
         _settle(sess)
         return sess

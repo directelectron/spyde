@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import numpy as np
 import hyperspy.api as hs
-from spyde.tests.migrated.conftest import _settle
+from spyde.tests.migrated.conftest import _settle, close_session, make_session
 from spyde.tests.migrated._async import wait_until
 
 
@@ -41,8 +41,7 @@ def _diffraction_4d():
 
 class TestFindVectorsPort:
     def test_find_vectors_creates_attached_vectors_tree(self, captured_messages):
-        from spyde.backend.session import Session
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             session._add_signal(_diffraction_4d(), source_path=None)
             _settle(session)
@@ -101,8 +100,15 @@ class TestFindVectorsPort:
             # of it reads across that gap. This used to be covered by polling
             # the pixels for 30 s, which on a loaded runner was not always long
             # enough: "result window still renders zeros", #149 ubuntu-py3.11.
+            # "Found N diffraction vectors" — the FINISH. Note the `Found`:
+            # the batch also emits "Finding diffraction vectors…" when it
+            # STARTS, so matching the substring alone matches the start message
+            # and waits for nothing at all. (It did: this assertion then fired
+            # on windows-py3.13 with the live preview's slice function still
+            # installed, which is exactly right for mid-compute.)
             assert _wait(lambda: any(
                 isinstance(m, dict)
+                and str(m.get("text", "")).startswith("Found ")
                 and "diffraction vectors" in str(m.get("text", ""))
                 for m in captured_messages)), \
                 "the batch never reported that it had finished"
@@ -125,12 +131,11 @@ class TestFindVectorsPort:
             assert offs[:, 0].max() <= W + 8 and offs[:, 1].max() <= H + 8
             assert offs[:, 0].min() >= -8 and offs[:, 1].min() >= -8
         finally:
-            session.shutdown()
+            close_session(session)
 
     def test_rejects_non_4d_dataset(self):
-        from spyde.backend.session import Session
         from spyde.actions.context import ActionContext
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             s = hs.signals.Signal2D(np.random.RandomState(0).rand(16, 16).astype(np.float32))
             session._add_signal(s, source_path=None)
@@ -142,4 +147,4 @@ class TestFindVectorsPort:
             # No vectors tree created for a 2-D image.
             assert len(session.signal_trees) == before
         finally:
-            session.shutdown()
+            close_session(session)

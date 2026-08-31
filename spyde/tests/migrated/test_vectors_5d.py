@@ -14,6 +14,7 @@ from spyde.signals.diffraction_vectors import (
     SpyDEDiffractionVectors, N_COLS, COL_NAV_X, COL_NAV_Y, COL_KX, COL_KY,
     COL_TIME, COL_INTENSITY,
 )
+from spyde.tests.migrated.conftest import make_session
 
 
 class _Ax:
@@ -250,8 +251,7 @@ class TestFiveDResultWiringOnARealTree:
 
     def _session_with_5d(self):
         import hyperspy.api as hs
-        from spyde.backend.session import Session
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         data = np.zeros((2, 2, 3, 8, 8), dtype=np.float32)
         data[..., 4, 4] = 100.0
         s = hs.signals.Signal2D(data)
