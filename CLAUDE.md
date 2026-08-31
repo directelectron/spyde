@@ -67,6 +67,8 @@ Python deps are in `pyproject.toml`. Key non-PyPI deps from custom forks (check 
 
 Frontend deps (Electron, React, electron-vite, Playwright) are in `electron/package.json`.
 
+**Electron is pinned EXACTLY, in `package.json` AND `electron/package.json`, and the two must agree.** This repo is an npm workspace, so `electron` hoists to the root and `electron/node_modules/electron` no longer exists; electron-builder then cannot read the installed version and falls back to parsing the spec, which it *refuses* if it is a range. That failure is release-only (nothing else runs electron-builder), so a widened range passes typecheck, unit and e2e and only breaks the tag build. Since Electron 42 there is also **no postinstall binary download** — `npm ci` leaves `node_modules/electron/dist` empty and the ~100 MB fetch happens lazily on the first `require('electron')`. CI pulls it explicitly (`npx install-electron`) so a failed download is an install error rather than a mystery test timeout.
+
 Supported file extensions: `.hspy`, `.zspy`, `.mrc`, `.tif`, `.tiff`, `.de5`, `.csb` (see `SUPPORTED_EXTS` in `backend/_session_files.py`, re-exported from `session.py`). Adding one means updating that tuple **and** the Open-dialog `filters` in `electron/src/main/index.ts` (two places: the File menu and the `spyde:open-file` IPC handler) — the dialog will not offer an extension the tuple accepts.
 
 ## Architecture

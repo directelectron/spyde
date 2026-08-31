@@ -24,7 +24,7 @@
  */
 import { test, expect } from '@playwright/test'
 const {
-  launchApp, backendAction, waitForSubwindowCount, dragCrosshair,
+  launchApp, raiseWindow, backendAction, waitForSubwindowCount, dragCrosshair,
 } = require('./_harness.cjs')
 
 let ctx: Awaited<ReturnType<typeof launchApp>>
@@ -101,6 +101,9 @@ test('5-D: the DP repaints when the scan position moves', async () => {
     .filter({ hasText: 'Vectors' }).last()
 
   const h0 = await frameHash(resSig)
+  // Raise it first: a drag gets no actionability check, so a navigator sitting
+  // under another window yields "moved 0" rather than a timeout.
+  await raiseWindow(nav2d)
   const d = await dragCrosshair(page, nav2d, { dx: 46, dy: 34, steps: 4,
                                                settleMs: 500 })
   expect(d.moved, 'the 2-D navigator crosshair never moved').toBeGreaterThan(5)

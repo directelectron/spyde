@@ -3,7 +3,7 @@
  */
 import {
   app, BrowserWindow, dialog, ipcMain, Menu, shell, nativeTheme, net, protocol,
-  clipboard, nativeImage, powerMonitor,
+  clipboard, ClipboardItem, nativeImage, powerMonitor,
 } from 'electron'
 import { join, basename, resolve } from 'path'
 import { pathToFileURL } from 'url'
@@ -237,9 +237,14 @@ function createWindow(): BrowserWindow {
 
   // Tee renderer + figure-IFRAME console messages to THIS terminal so a JS error
   // (or a [TILEDBG-JS] tile-render log) is visible without opening DevTools and
-  // switching frame context. level: 0=log 1=warning 2=error 3=info. We surface
+  // switching frame context. level: 0=verbose 1=info 2=warning 3=error. We surface
   // warnings/errors always, and any message tagged [TILEDBG] so the tile diagnostics
   // come through. `line`/`sourceId` pinpoint where a JS error was thrown.
+  //
+  // The positional arguments are deprecated in favour of the event object but are
+  // still emitted; the shell's own tee (packages/shell-main/src/window.ts) reads
+  // whichever shape it is handed, because when this goes wrong it fails SILENTLY —
+  // the tee just stops teeing.
   win.webContents.on('console-message', (_e, level, message, line, sourceId) => {
     const isTag = message.includes('[TILEDBG')
     // A genuine JS error is level>=2 AND not one of our own [TILEDBG] warns (which
@@ -957,10 +962,11 @@ ipcMain.handle('report:export-pdf', async (_e, htmlPath: string, pdfPath: string
       // Let images/fonts referenced by the report settle before rasterizing.
       await new Promise((resolve) => setTimeout(resolve, 250))
 
+      // No `margins`: Electron 44 dropped `marginType`, and the 'default' it
+      // named is now what you get by omitting the key — 1cm on every side.
       const pdfBuffer = await pdfWin!.webContents.printToPDF({
         printBackground: true,
         pageSize: 'A4',
-        margins: { marginType: 'default' },
       })
       writeFileSync(pdfPath, pdfBuffer)
       return { ok: true as const }
@@ -991,7 +997,7 @@ const CLIPBOARD_PNG_MAX_DATA_URL_LEN = Math.ceil((CLIPBOARD_PNG_MAX_BYTES * 4) /
  *  images up front — `nativeImage.createFromDataURL` decodes synchronously on
  *  the main process's only thread, so an unbounded image would block the
  *  whole app (every window, every IPC reply) for however long the decode takes. */
-ipcMain.handle('clipboard:write-png', (_e, dataUrl: string) => {
+ipcMain.handle('clipboard:write-png', async (_e, dataUrl: string) => {
   if (typeof dataUrl !== 'string' || !dataUrl.startsWith('data:image/png')) {
     return { ok: false, error: 'expected a data:image/png URL' }
   }
@@ -1001,7 +1007,13 @@ ipcMain.handle('clipboard:write-png', (_e, dataUrl: string) => {
   try {
     const image = nativeImage.createFromDataURL(dataUrl)
     if (image.isEmpty()) return { ok: false, error: 'failed to decode PNG data URL' }
-    clipboard.writeImage(image)
+    // Electron 44 replaced writeImage with the W3C shape: MIME-typed items,
+    // async. The decode above still earns its place as the validity check —
+    // it is what rejects a well-formed URL carrying junk before the junk
+    // reaches the user's clipboard.
+    await clipboard.write([
+      new ClipboardItem({ 'image/png': new Blob([image.toPNG()], { type: 'image/png' }) }),
+    ])
     return { ok: true }
   } catch (err) {
     return { ok: false, error: (err as Error)?.message ?? String(err) }

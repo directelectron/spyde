@@ -21,6 +21,8 @@
 import { test, expect, _electron as electron, ElectronApplication, Page } from '@playwright/test'
 import { join } from 'path'
 import { mkdirSync } from 'fs'
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const { backendErrorLines } = require('./_harness.cjs')
 
 const CIF = join(__dirname, '..', '..', 'spyde', 'tests', 'Silver__0011135.cif')
 const SHOTS = join(__dirname, '..', 'ipf_perf_shots')
@@ -349,12 +351,10 @@ test('IPF raster/GPU render paths render correctly in the real app', async () =>
   // Scan the backend log for gpu/webgpu lines (secondary evidence) and for any
   // Python traceback (a real backend error while building the rasters/3-D).
   const gpuLogLines = backendLog.filter((l) => /gpu|webgpu|scatter3d/i.test(l))
-  const tbLines = backendLog.filter((l) =>
-    /Traceback|ERROR/.test(l) && !/Security Warning|willReadFrequently/.test(l)
-    // Benign on adapter-less CI runners — anyplotlib falls back to Canvas2D and
-    // the render is still correct (see backendErrorLines in _harness.cjs).
-    && !/Failed to create WebGPU Context Provider/i.test(l)
-    && !/:(ERROR|FATAL):[a-z_0-9]+\.(cc|mm)\(\d+\)/.test(l))
+  // Use the SHARED filter, never a local copy — the copy that used to live here
+  // knew only the old dbus/WebGPU wordings and reddened this spec on an
+  // Electron bump.
+  const tbLines = backendErrorLines(backendLog)
   console.log('[ipf_perf] renderer gpu warnings:',
     gpuWarns.slice(-8).join(' | ') || '(none)')
   console.log('[ipf_perf] backend gpu log lines:',

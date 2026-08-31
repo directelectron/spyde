@@ -20,7 +20,7 @@
 import { test, expect } from '@playwright/test'
 import { join } from 'path'
 import { mkdirSync } from 'fs'
-const { launchApp, backendAction, waitForSubwindowCount } = require('./_harness.cjs')
+const { launchApp, raiseWindow, backendAction, waitForSubwindowCount } = require('./_harness.cjs')
 
 const SHOTS = join(__dirname, '..', 'ipf_two_window_shots')
 
@@ -142,6 +142,9 @@ test('2) window 1 shows the X, Y and Z projections', async () => {
   for (const d of ['X', 'Y', 'Z']) {
     await expect(page.getByTestId(`view-chip-IPF-${d}-${mapId}`)).toBeVisible()
   }
+  // Another window may have opened over this one since the chips appeared;
+  // raise it so the chip clicks land (see raiseWindow).
+  await raiseWindow(mapWin)
   // Each projection on its own …
   for (const d of ['X', 'Y', 'Z']) {
     await page.getByTestId(`view-chip-IPF-${d}-${mapId}`).click()

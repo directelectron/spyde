@@ -326,6 +326,15 @@ jobs:
       - name: Install Electron dependencies
         run: npm ci
 
+      # Electron 42 dropped the postinstall binary download: `npm ci` now leaves
+      # node_modules/electron/dist empty and the ~100 MB fetch happens lazily on
+      # the first `require('electron')` — which, here, is inside the first spec
+      # that launches the app. A slow or failed download would surface as a
+      # mystery test timeout instead of an install failure, so pull it here where
+      # it can fail loudly on its own line.
+      - name: Install the Electron binary
+        run: npx install-electron
+
       - name: Cache Playwright browsers
         uses: actions/cache@v4
         with:

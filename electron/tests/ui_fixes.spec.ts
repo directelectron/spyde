@@ -18,7 +18,7 @@
 import { test, expect, Page } from '@playwright/test'
 import { join } from 'path'
 // eslint-disable-next-line @typescript-eslint/no-var-requires
-const { launchApp, backendAction, waitForSubwindowCount } = require('./_harness.cjs')
+const { launchApp, raiseWindow, backendAction, waitForSubwindowCount } = require('./_harness.cjs')
 
 const SHOTS = join(__dirname, '..', 'ui_fixes_shots')
 let ctx: Awaited<ReturnType<typeof launchApp>>
@@ -157,6 +157,7 @@ test('6: Rebin repaints the DP immediately and adds the Binned node', async () =
   const sigBefore = await page.evaluate((id) => window._spyde_test_image_sig?.(id), figId)
 
   await win.getByTestId('subwindow-titlebar').hover()
+  await raiseWindow(win)
   await win.getByTestId('action-btn-Rebin').click()
   await page.getByTestId('action-run').click()
 

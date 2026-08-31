@@ -19,7 +19,7 @@
  */
 import { test, expect } from '@playwright/test'
 const {
-  launchApp, backendAction, waitForSubwindowCount, sigWindow,
+  launchApp, raiseWindowOwning, backendAction, waitForSubwindowCount, sigWindow,
 } = require('./_harness.cjs')
 
 test('the fit keeps up with a navigator drag', async () => {
@@ -54,6 +54,9 @@ test('the fit keeps up with a navigator drag', async () => {
       await page.locator('[data-testid="fit-add-Gaussian"]').click()
       await page.waitForTimeout(800)
     }
+    // The live-preview window opened by adding components can sit over the caret
+    // by now; raise its own window first (the click a user makes without noticing).
+    await raiseWindowOwning(page, "fit-wizard")
     await page.getByTestId('fit-tab-Run').click()
     await page.locator('[data-testid="fit-run"]').click()
     await expect(page.locator('[data-testid="fit-status"]'))

@@ -513,24 +513,81 @@ function navWindows(page) {
  *    viz_main_impl.cc "Exiting GPU process", command_buffer_proxy_impl.cc)
  *    and is infrastructure noise, not a SpyDE error. Python backend lines
  *    never match that shape, so real errors still fail the audit.
- *  - "Failed to create WebGPU Context Provider" — Chromium emits this from the
- *    figure iframe whenever the runner has no usable WebGPU adapter (every
- *    hosted CI runner under xvfb). anyplotlib falls back to Canvas2D and the
- *    render is still correct (the GPU render math is covered separately in
- *    anyplotlib's own --enable-unsafe-webgpu suite), so it is benign here. A
- *    real backend error is a Python traceback, never this renderer line.
+ *  - NO USABLE WebGPU ADAPTER, in either wording. Chromium emits this from the
+ *    figure iframe on every hosted CI runner under xvfb. anyplotlib falls back
+ *    to Canvas2D and the render is still correct (the GPU render math is
+ *    covered separately in anyplotlib's own --enable-unsafe-webgpu suite), so
+ *    it is benign here. A real backend error is a Python traceback, never this
+ *    renderer line. The wording is version-dependent and has already changed
+ *    once: Chromium 132 said "Failed to create WebGPU Context Provider",
+ *    Chromium 152 says "No available adapters". Match BOTH — an Electron bump
+ *    must not turn a missing GPU back into a fake backend error, which is
+ *    exactly how the 34 -> 44 upgrade first reddened these audits.
  */
-function backendErrorLines(backend) {
-  return backend.logBuffer.filter((l) =>
+function backendErrorLines(backendOrLines) {
+  // Accepts the backend or a plain array of lines, so a spec holding its own
+  // snapshot can still use THIS filter instead of copying it. ipf_perf kept a
+  // copy and it went stale exactly as you would expect: it knew only the old
+  // `bus.cc(406)` shape and the old WebGPU wording, so the Electron 44 bump
+  // turned dbus noise back into "backend errors during IPF render".
+  const lines = Array.isArray(backendOrLines)
+    ? backendOrLines
+    : backendOrLines.logBuffer
+  return lines.filter((l) =>
     /ERROR|Traceback/i.test(l)
     && !/Security Warning|Content.Security.Policy|Content Security/i.test(l)
     && !/willReadFrequently/i.test(l)
-    && !/Failed to create WebGPU Context Provider/i.test(l)
+    && !/Failed to create WebGPU Context Provider|No available adapters/i.test(l)
     // Both Chromium stderr shapes: older `bus.cc(405)` and the newer
     // full-path colon form `dbus/bus.cc:405]` (format changed upstream, so an
     // Electron bump must not silently turn infrastructure noise back into
     // "backend errors").
     && !/:(ERROR|FATAL):[a-z_0-9/]+\.(cc|mm)[(:]\d+[)\]]/.test(l))
+}
+
+/**
+ * Bring `win` to the front, the way a user does without thinking about it.
+ *
+ * MDI windows overlap, and a window opened later sits ABOVE an earlier one --
+ * over its toolbar, its open caret and its view chips. That is deliberate:
+ * a result window should come to the front. A person then clicks the window
+ * they want and carries on, so the covering never registers as a problem. A
+ * spec has no such reflex; it keeps clicking a point that is now behind
+ * another window until it times out, reporting "<iframe ...> intercepts
+ * pointer events".
+ *
+ * Call this before driving a window whose chrome another window may have
+ * covered. It is idempotent -- raising the top window changes nothing -- so it
+ * is safe to add defensively.
+ *
+ * It does NOT close an open caret: FloatingToolbar's outside-click handler
+ * returns early for WIZARD_ACTIONS, and for every caret it ignores clicks
+ * landing inside its own window.
+ */
+async function raiseWindow(win) {
+  // DISPATCH rather than click. A real click has to win hit-testing, and the
+  // whole reason we are raising is that something is on top — including,
+  // sometimes, the titlebar itself, which left the raise timing out with the
+  // very "iframe ... intercepts pointer events" it was added to avoid.
+  // SubWindow raises on mousedown on its root (`onMouseDown={() => onFocus(id)}`),
+  // so dispatching there fires the same handler whatever is above it.
+  //
+  // This is a SETUP step, not the thing under test: whatever the spec does
+  // next is still a real, hit-tested click, so nothing is being papered over.
+  await win.dispatchEvent('mousedown')
+  return win
+}
+
+/**
+ * Raise whichever window OWNS `testid` — an open caret, a view chip, a toolbar
+ * button. Saves each spec from re-deriving its own window locator, and is a
+ * no-op when nothing matches, so it never turns a missing element into a
+ * confusing failure somewhere else.
+ */
+async function raiseWindowOwning(page, testid) {
+  const win = page.getByTestId('subwindow')
+    .filter({ has: page.getByTestId(testid) }).first()
+  if (await win.count()) await raiseWindow(win)
 }
 
 /**
@@ -568,5 +625,7 @@ module.exports = {
   navWindow,
   navWindows,
   titlebarGrabPoint,
+  raiseWindow,
+  raiseWindowOwning,
   backendErrorLines,
 }

@@ -21,7 +21,7 @@ import { test, expect } from '@playwright/test'
 import { mkdirSync } from 'fs'
 import { join } from 'path'
 const {
-  launchApp, backendAction, waitForSubwindowCount, sigWindow, navWindows,
+  launchApp, raiseWindow, backendAction, waitForSubwindowCount, sigWindow, navWindows,
   dragCrosshair,
 } = require('./_harness.cjs')
 
@@ -135,6 +135,9 @@ test('5-D result: real-space navigator shows the count map, stack nav fills', as
   // A 1-D navigator's marker is a VLine: it must be DRAGGED, not clicked (a
   // bare click only focuses the window — the readout updates, the marker does
   // not). dragCrosshair grabs the green marker and moves it.
+  // Raise it first: a drag gets no actionability check, so a navigator sitting
+  // under another window yields a short/zero move rather than a timeout.
+  await raiseWindow(resultNav1d)
   const drag = await dragCrosshair(page, resultNav1d,
                                    { dx: 120, dy: 0, steps: 4, settleMs: 350 })
   expect(drag.moved, 'the stack marker never moved').toBeGreaterThan(10)

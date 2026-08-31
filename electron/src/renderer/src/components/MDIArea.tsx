@@ -187,6 +187,19 @@ export function MDIArea() {
     setActiveWindow(parseInt(id, 10))
   }, [setActiveWindow])
 
+  // Where each window's OPEN caret currently sits, in area coords. A new
+  // window's first-fit search treats these as occupied, so an action's own
+  // result windows stop landing on the panel that launched them. Z-order is
+  // untouched: a window still comes to the front over a caret it overlaps —
+  // it just is not PLACED there. Kept in a ref because it only ever feeds the
+  // placement pass below, which already runs on every render; putting it in
+  // state would re-render the whole area on each caret resize for nothing.
+  const caretRectsRef = useRef<Map<string, Rect>>(new Map())
+  const setCaretRect = useCallback((id: string, rect: Rect | null) => {
+    if (rect) caretRectsRef.current.set(id, rect)
+    else caretRectsRef.current.delete(id)
+  }, [])
+
   const getZ = (id: string) => {
     // Unfocused windows sit at a low base; focused windows are always above,
     // most-recently-focused highest. (A single focused window must beat
@@ -405,6 +418,10 @@ export function MDIArea() {
     taken.push({ x: placed.x, y: placed.y, w, h })
     placements.set(id, placed)
   }
+  // Open carets are obstacles too. Without this a fit/DPC/strain run drops its
+  // own result window straight onto the caret that started it, and the window's
+  // figure iframe then swallows every click meant for the panel.
+  for (const caret of caretRectsRef.current.values()) taken.push(caret)
   // Read the LIVE area size (the `areaSize` state can still be the default when
   // the first windows arrive); `areaSize` just forces a re-render on resize.
   const areaW = areaRef.current?.clientWidth || areaSize.w
@@ -488,6 +505,7 @@ export function MDIArea() {
               onResize={handleResize}
               onAction={handleAction}
               zIndex={getZ(id)}
+              onCaretRectChange={(r: Rect | null) => setCaretRect(id, r)}
               hidden={minimized.has(id)}
               acceptSignalDrop={win.isNavigator}
               onSignalDrop={(srcId) =>

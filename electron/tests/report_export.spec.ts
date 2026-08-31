@@ -461,9 +461,20 @@ test('6) figure Copy → Paste appends a live cell; markdown Duplicate; OS clipb
   await copyBtn.click()
   await page.screenshot({ path: join(SHOTS, '06a-after-copy.png') })
 
-  // OS clipboard now holds a real PNG (isEmpty() === false).
-  const clipEmpty = await ctx.app.evaluate(({ clipboard }) => clipboard.readImage().isEmpty())
-  expect(clipEmpty, 'OS clipboard image is empty after figure Copy').toBe(false)
+  // OS clipboard now holds a real PNG. Electron 44 replaced readImage/writeImage
+  // with the W3C shape — MIME-typed items, async — so ask the clipboard whether
+  // it holds image/png and that the bytes are non-empty, which is what
+  // readImage().isEmpty() stood in for.
+  const clipPngBytes = await ctx.app.evaluate(async ({ clipboard }) => {
+    if (!(await clipboard.has('image/png'))) return 0
+    for (const item of await clipboard.read()) {
+      if (!item.types.includes('image/png')) continue
+      const blob = await item.getType('image/png')
+      return (blob as Blob).size ?? 0
+    }
+    return 0
+  })
+  expect(clipPngBytes, 'OS clipboard holds no PNG after figure Copy').toBeGreaterThan(0)
 
   // The per-cell ＋ is no longer "Duplicate cell" — duplicating a slide's cell
   // was a verb nobody reached for, while COMBINING two figures into a subplot
