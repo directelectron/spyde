@@ -24,6 +24,7 @@ import numpy as np
 from spyde.actions.report import export_html as ex
 from spyde.actions.report import handlers as h
 from spyde.actions.report.model import bake_fallback_png
+from spyde.tests.migrated._report import answer_harvest
 
 
 # ── helpers (mirrors test_report_handlers) ─────────────────────────────────────
@@ -39,7 +40,16 @@ def _last_state(messages):
     return st[-1]["report"]
 
 
-def _exported(messages):
+def _exported(messages, session=None):
+    """The export replies — answering the snapshot handshake first.
+
+    A report with live figure cells does not write inline any more: it asks the
+    renderer for fresh PNGs and waits. Pass the session so this answers that
+    request the way the renderer does; without one it is the plain filter it
+    always was (fine for a report with nothing live to harvest).
+    """
+    if session is not None:
+                answer_harvest(session, messages)
     return [m for m in messages if m.get("type") == "report_exported"]
 
 
@@ -106,7 +116,7 @@ class TestStaticExport:
         messages.clear()
         ex.report_export_html(session, None, {"mode": "static", "path": path})
 
-        exp = _exported(messages)
+        exp = _exported(messages, session)
         assert exp and exp[0]["kind"] == "html-static"
         assert exp[0]["path"] == path
         assert not _errors(messages)
@@ -173,7 +183,7 @@ class TestStaticExport:
         # No `path` — the temp branch generates its own.
         ex.report_export_html(session, None, {"mode": "static", "temp": True})
 
-        exp = _exported(messages)
+        exp = _exported(messages, session)
         assert exp and exp[0]["kind"] == "html-static"
         assert not _errors(messages)
         out = exp[0]["path"]
@@ -218,7 +228,7 @@ class TestInteractiveExport:
         messages.clear()
         ex.report_export_html(session, None, {"mode": "interactive", "path": path})
 
-        exp = _exported(messages)
+        exp = _exported(messages, session)
         assert exp and exp[0]["kind"] == "html-interactive"
         assert not _errors(messages)
 
@@ -250,6 +260,10 @@ class TestInteractiveExport:
 
         path = str(tmp_path / "offline_interactive.html")
         ex.report_export_html(session, None, {"mode": "interactive", "path": path})
+        # The cell is still MOUNTED (only its snapshot was dropped), so the
+        # export asks the renderer for pixels before it writes. Answer, or the
+        # file does not exist until the 3 s fallback fires.
+        answer_harvest(session, messages)
 
         html = open(path, encoding="utf-8").read()
         assert "<iframe" not in html
@@ -276,7 +290,7 @@ class TestMarkdownFolderExport:
         messages.clear()
         ex.report_export_markdown(session, None, {"path": out})
 
-        exp = _exported(messages)
+        exp = _exported(messages, session)
         assert exp and exp[0]["kind"] == "markdown-folder"
         assert exp[0]["path"] == out
         assert not _errors(messages)
@@ -311,7 +325,7 @@ class TestMarkdownFolderExport:
         messages.clear()
         # Second export into the same dir — no refusal.
         ex.report_export_markdown(session, None, {"path": out})
-        assert _exported(messages) and not _errors(messages)
+        assert _exported(messages, session) and not _errors(messages)
 
     def test_refuses_non_empty_foreign_dir(self, tem_2d_dataset, tmp_path):
         session = tem_2d_dataset["window"]
@@ -327,7 +341,7 @@ class TestMarkdownFolderExport:
         messages.clear()
         ex.report_export_markdown(session, None, {"path": str(out)})
 
-        assert not _exported(messages)
+        assert not _exported(messages, session)
         assert _errors(messages)
         # The foreign file is untouched.
         assert (out / "important.txt").read_text() == "do not clobber"
@@ -444,7 +458,7 @@ class TestExportToken:
         messages.clear()
         ex.report_export_html(session, None, {
             "mode": "static", "path": path, "token": "req-42"})
-        exp = _exported(messages)
+        exp = _exported(messages, session)
         assert exp and exp[0]["kind"] == "html-static"
         assert exp[0]["path"] == path
         # The token rides back VERBATIM.
@@ -462,7 +476,7 @@ class TestExportToken:
         path = str(tmp_path / "notok.html")
         messages.clear()
         ex.report_export_html(session, None, {"mode": "static", "path": path})
-        exp = _exported(messages)
+        exp = _exported(messages, session)
         assert exp and "token" not in exp[0]
 
     def test_markdown_export_echoes_token_verbatim(self, tem_2d_dataset, tmp_path):
@@ -476,7 +490,7 @@ class TestExportToken:
         out = str(tmp_path / "tok_dir")
         messages.clear()
         ex.report_export_markdown(session, None, {"path": out, "token": "md-tok-7"})
-        exp = _exported(messages)
+        exp = _exported(messages, session)
         assert exp and exp[0]["kind"] == "markdown-folder"
         assert exp[0]["token"] == "md-tok-7"
 
@@ -491,5 +505,5 @@ class TestExportToken:
         out = str(tmp_path / "notok_dir")
         messages.clear()
         ex.report_export_markdown(session, None, {"path": out})
-        exp = _exported(messages)
+        exp = _exported(messages, session)
         assert exp and "token" not in exp[0]

@@ -21,6 +21,7 @@ import pytest
 from spyde.actions.report import compose as cx
 from spyde.actions.report import handlers as h
 from spyde.actions.report.model import FigureSpec, LayerSpec, PanelSpec
+from spyde.tests.migrated._report import answer_harvest
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -251,6 +252,7 @@ class TestScene3DReopen:
         # scene3d cell gets NO baked asset (the Agg bake can't render it) and
         # that must not crash the save.
         h.report_save(session, None, {"path": path})
+        answer_harvest(session, messages)
         assert os.path.exists(path)
 
         h.report_close(session, None, {})
@@ -272,6 +274,7 @@ class TestScene3DReopen:
         cid, tree = _drop_3d(session, messages)
         path = os.path.join(str(tmp_path), "scene-offline.spyde-report")
         h.report_save(session, None, {"path": path})
+        answer_harvest(session, messages)
         h.report_close(session, None, {})
 
         # The orientation result is gone (e.g. a fresh session where OM was

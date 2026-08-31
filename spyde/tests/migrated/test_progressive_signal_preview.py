@@ -26,6 +26,7 @@ from spyde.actions.live_signal import (
     ProgressiveSignalPreview, _block_sample_index, attach_signal_preview,
 )
 from spyde.signals.diffraction_vectors import SpyDEDiffractionVectors, _AxisLite
+from spyde.tests.migrated._async import drain_loop, quiesce, why_busy
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -259,9 +260,11 @@ class TestProgressiveSignalPreview:
     # not land left `frames_painted == 1` asserting fine and
     # `current_data.max() == 0` failing.  paint_signal_plots now RETURNS the
     # success count and the preview records it as `frames_landed`, so the test
-    # asserts the paint actually landed (deterministic: the paint runs inline
-    # in tests — no loop is registered) instead of inferring it from pixels a
-    # concurrent navigator repaint can race.
+    # asserts the paint actually landed instead of inferring it from pixels a
+    # concurrent navigator repaint can race. The paint is MARSHALLED (the
+    # fixtures register a loop, as the app does), so wait for it rather than
+    # reading the counter on the line after — it used to be readable there only
+    # because a session with no loop ran the callback inline.
     def test_block_paints_a_sample_frame(self, window):
         """(a) — a landing block puts a frame on the signal plot."""
         session = window["window"]
@@ -279,6 +282,7 @@ class TestProgressiveSignalPreview:
 
         assert preview.frames_painted == 1
         assert preview.blocks_seen == 1
+        assert quiesce(session), why_busy(session)
         assert preview.frames_landed == 1, \
             "the sample paint's set_data did not land on the signal plot"
         assert tree.signal_plots[0].current_data is not None
@@ -421,6 +425,12 @@ class TestFindVectorsWiring:
             blk = np.full((nav[0] - 1, nav[1], 4, 3), np.nan, dtype=np.float32)
             blk[..., 0, :] = (2.0, 3.0, 5.0)         # ky=2, kx=3, intensity=5
             on_block((slice(1, nav[0]), slice(0, nav[1])), blk)
+            # The paint is marshalled onto the loop, and everything below reads
+            # counters the paint updates — so drain before reading, or `landed`
+            # is captured before the paint has run. `drain_loop`, not `quiesce`:
+            # this IS the batch worker, so the in-flight count can never be zero
+            # from in here.
+            drain_loop(session)
             captured["ready"] = preview.ready_count
             captured["frame"] = preview.slice_fn(None, None, [[1, 1]])
             captured["painted"] = preview.frames_painted

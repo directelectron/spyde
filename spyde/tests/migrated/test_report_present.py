@@ -20,6 +20,7 @@ import numpy as np
 from spyde.actions.report import export_html as ex
 from spyde.actions.report import handlers as h
 from spyde.actions.report import model as m
+from spyde.tests.migrated._report import answer_harvest
 
 
 # ── helpers (mirror test_report_export / test_report_model) ────────────────────
@@ -277,6 +278,7 @@ class TestSlidesExport:
         path = str(tmp_path / "deck.html")
         messages.clear()
         ex.report_export_html(session, None, {"mode": "slides", "path": path})
+        answer_harvest(session, messages)
 
         exp = _exported(messages)
         assert exp and exp[0]["kind"] == "html-slides"
@@ -310,6 +312,7 @@ class TestSlidesExport:
             "html": "<p>subtitle body</p>"})
         path = str(tmp_path / "one_slide.html")
         ex.report_export_html(session, None, {"mode": "slides", "path": path})
+        answer_harvest(session, messages)
         html = open(path, encoding="utf-8").read()
         # One slide, both cells inside it.
         assert html.count('<section class="slide">') == 1
@@ -338,6 +341,7 @@ class TestSlidesExport:
         path = str(tmp_path / "fig_deck.html")
         messages.clear()
         ex.report_export_html(session, None, {"mode": "slides", "path": path})
+        answer_harvest(session, messages)
         assert not _errors(messages)
         html = open(path, encoding="utf-8").read()
         assert html.count('<section class="slide">') == 2
@@ -350,6 +354,7 @@ class TestSlidesExport:
     def test_slides_export_no_open_report_errors(self, window):
         session, messages = window["window"], window["messages"]
         ex.report_export_html(session, None, {"mode": "slides", "path": "x.html"})
+        answer_harvest(session, messages)
         assert _errors(messages)
 
     def test_slides_export_empty_slide_dropped(self, window, tmp_path):
