@@ -15,7 +15,7 @@
  */
 import { test, expect } from '@playwright/test'
 const {
-  launchApp, backendAction, waitForSubwindowCount, sigWindow,
+  launchApp, raiseWindowOwning, backendAction, waitForSubwindowCount, sigWindow,
 } = require('./_harness.cjs')
 
 const SHOTS = 'fit_quality_shots'
@@ -138,6 +138,12 @@ test('the fitted model matches the spectrum on screen', async () => {
       await page.locator('[data-testid="fit-add-Gaussian"]').click()
       await page.waitForTimeout(800)
     }
+
+    // The live-preview window opened by adding components can sit over the caret
+
+    // by now; raise its own window first (the click a user makes without noticing).
+
+    await raiseWindowOwning(page, "fit-wizard")
 
     await page.getByTestId('fit-tab-Run').click()
     await page.locator('[data-testid="fit-run"]').click()

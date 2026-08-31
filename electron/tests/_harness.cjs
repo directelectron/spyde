@@ -546,6 +546,42 @@ function backendErrorLines(backendOrLines) {
 }
 
 /**
+ * Bring `win` to the front, the way a user does without thinking about it.
+ *
+ * MDI windows overlap, and a window opened later sits ABOVE an earlier one --
+ * over its toolbar, its open caret and its view chips. That is deliberate:
+ * a result window should come to the front. A person then clicks the window
+ * they want and carries on, so the covering never registers as a problem. A
+ * spec has no such reflex; it keeps clicking a point that is now behind
+ * another window until it times out, reporting "<iframe ...> intercepts
+ * pointer events".
+ *
+ * Call this before driving a window whose chrome another window may have
+ * covered. It is idempotent -- raising the top window changes nothing -- so it
+ * is safe to add defensively.
+ *
+ * It does NOT close an open caret: FloatingToolbar's outside-click handler
+ * returns early for WIZARD_ACTIONS, and for every caret it ignores clicks
+ * landing inside its own window.
+ */
+async function raiseWindow(win) {
+  await win.getByTestId('subwindow-title').click()
+  return win
+}
+
+/**
+ * Raise whichever window OWNS `testid` — an open caret, a view chip, a toolbar
+ * button. Saves each spec from re-deriving its own window locator, and is a
+ * no-op when nothing matches, so it never turns a missing element into a
+ * confusing failure somewhere else.
+ */
+async function raiseWindowOwning(page, testid) {
+  const win = page.getByTestId('subwindow')
+    .filter({ has: page.getByTestId(testid) }).first()
+  if (await win.count()) await raiseWindow(win)
+}
+
+/**
  * A safe point to GRAB the titlebar for a WINDOW-MOVE drag. The breadcrumb
  * pill (left side) is an HTML5 drag SOURCE that stops pointerdown — grabbing
  * it starts a DnD payload drag, NOT a window move. The window controls
@@ -580,5 +616,7 @@ module.exports = {
   navWindow,
   navWindows,
   titlebarGrabPoint,
+  raiseWindow,
+  raiseWindowOwning,
   backendErrorLines,
 }

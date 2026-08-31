@@ -17,7 +17,7 @@
  */
 import { test, expect } from '@playwright/test'
 const {
-  launchApp, backendAction, waitForSubwindowCount, sigWindow,
+  launchApp, raiseWindowOwning, backendAction, waitForSubwindowCount, sigWindow,
 } = require('./_harness.cjs')
 
 const SHOTS = 'fit_all_spectra_shots'
@@ -62,6 +62,9 @@ test('Fit all Spectra fits everything, plots the maps, and can refit the poor', 
     ).toMatch(/Gaussian/)
 
     // ── 1. the name ──────────────────────────────────────────────────────
+    // The live-preview window opened by adding components can sit over the caret
+    // by now; raise its own window first (the click a user makes without noticing).
+    await raiseWindowOwning(page, "fit-wizard")
     await page.getByTestId('fit-tab-Run').click()
     await expect(page.locator('[data-testid="fit-run"]')).toHaveText(/Fit all Spectra/i)
     await page.screenshot({ path: `${SHOTS}/01-run-tab.png`, fullPage: true })
@@ -98,6 +101,9 @@ test('Fit all Spectra fits everything, plots the maps, and can refit the poor', 
     console.log(`coverage after the run: ${done}/${total}`)
 
     // ── 4. refit the poor ────────────────────────────────────────────────
+    // The live-preview window opened by adding components can sit over the caret
+    // by now; raise its own window first (the click a user makes without noticing).
+    await raiseWindowOwning(page, "fit-wizard")
     await page.getByTestId('fit-tab-Run').click()
     const refit = page.locator('[data-testid="fit-refit-poor"]')
     await expect(refit).toBeVisible()

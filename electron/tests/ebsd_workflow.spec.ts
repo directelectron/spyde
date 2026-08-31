@@ -13,7 +13,7 @@
  */
 import { test, expect } from '@playwright/test'
 const {
-  launchApp, backendAction, waitForSubwindowCount, countColorPixels, sigWindow,
+  launchApp, raiseWindow, backendAction, waitForSubwindowCount, countColorPixels, sigWindow,
 } = require('./_harness.cjs')
 
 const SHOTS = 'ebsd_shots'
@@ -178,6 +178,7 @@ test('the quality maps ride along as chip views on the IPF window', async () => 
       `the ${label} map was not registered as a view`)
       .toBeVisible({ timeout: 15_000 })
   }
+  await raiseWindow(ipf)
   await ipf.getByTestId(/^view-chip-Similarity-/).click()
   await expect.poll(() => countColorPixels(page, 'bright'), {
     timeout: 30_000, message: 'the Similarity view painted nothing',

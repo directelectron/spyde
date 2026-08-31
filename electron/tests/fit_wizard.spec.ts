@@ -16,7 +16,7 @@
  */
 import { test, expect } from '@playwright/test'
 const {
-  launchApp, backendAction, waitForSubwindowCount, sigWindow,
+  launchApp, raiseWindowOwning, backendAction, waitForSubwindowCount, sigWindow,
 } = require('./_harness.cjs')
 
 const SHOTS = 'fit_wizard_shots'
@@ -139,6 +139,9 @@ test('Fit caret: build a model, run it, commit component maps', async () => {
     await page.screenshot({ path: `${SHOTS}/06b-model-restored.png`, fullPage: true })
 
     // ── run the fit (second tab) ─────────────────────────────────────────
+    // The live-preview window opened by adding components can sit over the caret
+    // by now; raise its own window first (the click a user makes without noticing).
+    await raiseWindowOwning(page, "fit-wizard")
     await page.locator('[data-testid="fit-tab-Run"]').click()
     await expect(page.locator('[data-testid="fit-run"]')).toBeVisible({ timeout: 10_000 })
     await caretSettled()
