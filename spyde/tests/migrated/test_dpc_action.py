@@ -478,6 +478,18 @@ class TestCentering:
         try:
             session, plot, _tree, wiz = _opened(window, beam_shape="circle")
             wiz.measure = lambda **kwargs: None      # not what this test is about
+            # The OPENING pass ends with a brightness read of ITS own, on a
+            # worker — and `_opened` returns from the line before it is
+            # submitted (`window_id` is set by the `refresh` just above it). So
+            # wait for that read to land and go quiet; clearing straight away
+            # leaves it to arrive inside the window measured below, where it is
+            # indistinguishable from a drag having read a frame.
+            assert _wait(lambda: reads, timeout=30.0), \
+                "the opening pass never read the brightness"
+            settled = -1
+            while settled != len(reads):
+                settled = len(reads)
+                time.sleep(0.2)
             reads.clear()
             for r in (8.0, 9.0, 10.0, 11.0):
                 wiz._beam_selector.roi.set(r=r)
