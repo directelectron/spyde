@@ -13,7 +13,7 @@ import time
 
 import numpy as np
 import hyperspy.api as hs
-from spyde.tests.migrated.conftest import _settle
+from spyde.tests.migrated.conftest import _settle, close_session, make_session
 from spyde.tests.migrated._async import wait_until
 
 
@@ -43,8 +43,7 @@ def _calibrated_diffraction_4d(nav=(4, 5), sig=(24, 24), scale=0.1):
 
 class TestOverlayVisibility:
     def test_found_vectors_overlay_hides_on_deselect(self):
-        from spyde.backend.session import Session
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             session._add_signal(_calibrated_diffraction_4d(scale=0.1))
             _settle(session)
@@ -86,11 +85,10 @@ class TestOverlayVisibility:
             assert overlay._hidden is False
             assert pushed and pushed[-1].shape[0] > 0
         finally:
-            session.shutdown()
+            close_session(session)
 
     def test_set_overlay_unknown_is_noop(self):
-        from spyde.backend.session import Session
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             session._add_signal(_calibrated_diffraction_4d(scale=0.1))
             _settle(session)
@@ -100,4 +98,4 @@ class TestOverlayVisibility:
             session._set_overlay(src_plot, "Nonexistent", True)
             session._set_overlay(None, "Find Diffraction Vectors", True)
         finally:
-            session.shutdown()
+            close_session(session)

@@ -22,12 +22,11 @@ import time
 import numpy as np
 import hyperspy.api as hs
 import pytest
-from spyde.tests.migrated.conftest import _settle
+from spyde.tests.migrated.conftest import _settle, make_session
 
 
 def _make_session():
-    from spyde.backend.session import Session
-    return Session(n_workers=1, threads_per_worker=1)
+    return make_session()
 
 
 def _ramp_4d(nav, sig=(8, 8), scale=1.0, offset=0.0, units="nm"):

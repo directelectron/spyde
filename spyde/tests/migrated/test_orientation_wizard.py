@@ -16,7 +16,7 @@ import time
 import numpy as np
 import hyperspy.api as hs
 
-from spyde.tests.migrated.conftest import _settle
+from spyde.tests.migrated.conftest import _settle, close_session, make_session
 from spyde.tests.migrated._async import quiesce, why_busy
 from spyde.tests.migrated._async import wait_until
 
@@ -45,11 +45,10 @@ def _calibrated_4d(nav=(3, 3), sig=(64, 64), scale=0.0134):
 
 class TestOrientationWizard:
     def test_generate_refine_run(self):
-        from spyde.backend.session import Session
         from spyde.actions.orientation_action import (
             om_generate_library, om_refine, om_run,
         )
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             session._add_signal(_calibrated_4d())
             _settle(session)
@@ -97,7 +96,7 @@ class TestOrientationWizard:
             assert _wait(lambda: getattr(otree, "orientation_map", None) is not None,
                          timeout=60), "orientation map never attached"
         finally:
-            session.shutdown()
+            close_session(session)
 
     # test_run_without_library_errors_gracefully was folded into
     # test_generate_refine_run as its pre-generate stage: same session build,

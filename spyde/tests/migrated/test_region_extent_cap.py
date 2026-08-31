@@ -13,17 +13,16 @@ import hyperspy.api as hs
 from spyde.drawing.selectors.base_selector import (
     DEFAULT_REGION_EXTENT_PER_DIM, MAX_REGION_EXTENT_PER_DIM,
 )
-from spyde.tests.migrated.conftest import _settle
+from spyde.tests.migrated.conftest import _settle, make_session
 
 
 def _make_4d_session():
     """A 4-D STEM scan → 2-D nav → the navigator's composite exposes a rectangle."""
-    from spyde.backend.session import Session
     # Nav big enough (32x32) that a >16 rectangle is possible.
     s = hs.signals.Signal2D(
         np.random.RandomState(0).rand(32, 32, 8, 8).astype(np.float32))
     s.set_signal_type("electron_diffraction")
-    sess = Session(n_workers=1, threads_per_worker=1)
+    sess = make_session()
     sess._add_signal(s, source_path=None)
     _settle(sess)
     return sess
@@ -31,10 +30,9 @@ def _make_4d_session():
 
 def _make_movie_session():
     """A 3-D in-situ movie → 1-D time nav → composite exposes a linear span."""
-    from spyde.backend.session import Session
     s = hs.signals.Signal2D(
         np.random.RandomState(1).rand(64, 8, 8).astype(np.float32))
-    sess = Session(n_workers=1, threads_per_worker=1)
+    sess = make_session()
     sess._add_signal(s, source_path=None)
     _settle(sess)
     return sess
@@ -134,12 +132,11 @@ class TestDefaultSpanOnFirstIntegrate:
 
     @staticmethod
     def _movie_session(scale=0.05, n=80):
-        from spyde.backend.session import Session
         s = hs.signals.Signal2D(
             np.random.RandomState(2).rand(n, 8, 8).astype(np.float32))
         tax = s.axes_manager.navigation_axes[0]
         tax.name, tax.units, tax.scale = "time", "s", scale
-        sess = Session(n_workers=1, threads_per_worker=1)
+        sess = make_session()
         sess._add_signal(s, source_path=None)
         _settle(sess)
         return sess

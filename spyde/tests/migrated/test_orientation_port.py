@@ -14,7 +14,7 @@ import numpy as np
 import hyperspy.api as hs
 
 import pytest
-from spyde.tests.migrated.conftest import _settle
+from spyde.tests.migrated.conftest import _settle, close_session, make_session
 
 
 def _make_phase():
@@ -39,9 +39,8 @@ def _diffraction_4d(nav=(3, 4), sig=(32, 32)):
 
 class TestOrientationPort:
     def test_orientation_builds_ipf_window_and_attaches_map(self):
-        from spyde.backend.session import Session
         from spyde.actions.orientation_action import run_orientation
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             session._add_signal(_diffraction_4d())
             _settle(session)
@@ -66,7 +65,7 @@ class TestOrientationPort:
             assert isinstance(sp.current_data, np.ndarray)
             assert sp.current_data.shape == (3, 4, 3)   # RGB displayed
         finally:
-            session.shutdown()
+            close_session(session)
 
     def test_source_overlay_attaches_before_the_batch(self, monkeypatch):
         """The source DP's matched-template overlay must be wired BEFORE the
@@ -80,9 +79,8 @@ class TestOrientationPort:
         whole (minutes-long) fill navigable instead of leaving the source inert
         until the map lands. The staged wizard path already worked this way.
         """
-        from spyde.backend.session import Session
         import spyde.actions.orientation_action as oa
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             session._add_signal(_diffraction_4d())
             _settle(session)
@@ -103,13 +101,12 @@ class TestOrientationPort:
             )
             assert order == ["overlay", "compute"], order
         finally:
-            session.shutdown()
+            close_session(session)
 
     def test_entry_rejects_missing_cif(self):
-        from spyde.backend.session import Session
         from spyde.actions.context import ActionContext
         from spyde.actions.orientation_action import orientation_mapping
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             session._add_signal(_diffraction_4d())
             _settle(session)
@@ -121,7 +118,7 @@ class TestOrientationPort:
             _settle(session)
             assert len(session.signal_trees) == before   # nothing created
         finally:
-            session.shutdown()
+            close_session(session)
 
 
 def test_plot_renders_rgb_image():

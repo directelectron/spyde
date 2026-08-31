@@ -22,6 +22,7 @@ import numpy as np
 import hyperspy.api as hs
 from spyde.tests.migrated._async import quiesce, why_busy
 from spyde.tests.migrated._async import wait_until
+from spyde.tests.migrated.conftest import make_session, close_session
 
 
 def _wait(pred, timeout=25.0):
@@ -52,11 +53,10 @@ def _calibrated_diffraction_4d(nav=(4, 5), sig=(24, 24), scale=0.1):
 
 class TestFindVectorsWizard:
     def test_preview_tune_run(self):
-        from spyde.backend.session import Session
         from spyde.actions.find_vectors_action import (
             fv_open, fv_tune, fv_run, fv_close,
         )
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             session._add_signal(_calibrated_diffraction_4d(scale=0.1))
             assert quiesce(session), why_busy(session)
@@ -105,12 +105,11 @@ class TestFindVectorsWizard:
             # …and attaches the persistent found-vector overlay on the source DP.
             assert _wait(lambda: getattr(tree, "_vector_overlay", None) is not None)
         finally:
-            session.shutdown()
+            close_session(session)
 
     def test_stop_removes_preview(self):
-        from spyde.backend.session import Session
         from spyde.actions.find_vectors_action import fv_open, fv_close
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             session._add_signal(_calibrated_diffraction_4d(scale=0.1))
             assert quiesce(session), why_busy(session)
@@ -127,7 +126,7 @@ class TestFindVectorsWizard:
             assert _wait(lambda: getattr(tree, "_fv_preview", None) is None)
             assert prev._mg is None                  # marker group removed
         finally:
-            session.shutdown()
+            close_session(session)
 
 
 class TestPreviewBeamstopToggle:

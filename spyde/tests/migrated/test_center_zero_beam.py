@@ -13,7 +13,7 @@ import time
 
 import numpy as np
 import hyperspy.api as hs
-from spyde.tests.migrated.conftest import _settle
+from spyde.tests.migrated.conftest import _settle, close_session, make_session
 from spyde.tests.migrated._async import wait_until
 
 
@@ -47,9 +47,8 @@ def _com(frame):
 
 class TestCenterZeroBeam:
     def test_auto_centers_beam(self):
-        from spyde.backend.session import Session
         from spyde.actions.center_zero_beam import czb_run
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             session._add_signal(_off_center_4d(beam=(18, 14)))
             _settle(session)
@@ -69,7 +68,7 @@ class TestCenterZeroBeam:
             node = session.signal_trees[0].get_node(before)
             assert any("Centered" in k for k in node.children)
         finally:
-            session.shutdown()
+            close_session(session)
 
     def test_auto_region_shows_draggable_widget_and_run_uses_it(self):
         # The Automatic tab's search-window box must be a DRAGGABLE
@@ -77,9 +76,8 @@ class TestCenterZeroBeam:
         # add_squares bug: no drag handles, geometry never fed back into the
         # search). czb_set_region opens it; resizing it changes the region
         # czb_run actually searches.
-        from spyde.backend.session import Session
         from spyde.actions.center_zero_beam import czb_set_region, czb_run, czb_close
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             session._add_signal(_off_center_4d(sig=(64, 64), beam=(18, 14)))
             _settle(session)
@@ -111,12 +109,11 @@ class TestCenterZeroBeam:
             czb_close(session, src, {})
             assert getattr(tree, "_czb_region_mg", None) is None
         finally:
-            session.shutdown()
+            close_session(session)
 
     def test_region_widget_torn_down_on_close(self):
-        from spyde.backend.session import Session
         from spyde.actions.center_zero_beam import czb_set_region, czb_close
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             session._add_signal(_off_center_4d(sig=(32, 32)))
             _settle(session)
@@ -145,16 +142,15 @@ class TestCenterZeroBeam:
             czb_close(session, src, {})
             assert getattr(tree, "_czb_region_mg", None) is None
         finally:
-            session.shutdown()
+            close_session(session)
 
     def test_activating_automatic_tab_shows_full_frame_box_immediately(self):
         # Opening the Automatic tab (half_square_width defaults to 0, "full
         # frame") must show the box right away, not require the user to first
         # type a nonzero half-width — this was the actual #10 bug (the box
         # either never appeared or wasn't interactive).
-        from spyde.backend.session import Session
         from spyde.actions.center_zero_beam import czb_set_region
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             session._add_signal(_off_center_4d(sig=(48, 32)))
             _settle(session)
@@ -166,7 +162,7 @@ class TestCenterZeroBeam:
             assert widget is not None, "the search box must appear on open, at half_square_width=0"
             assert (float(widget.w), float(widget.h)) == (32.0, 32.0)
         finally:
-            session.shutdown()
+            close_session(session)
 
     def test_region_drag_handler_runs_once_per_event(self):
         # REGRESSION (reviewer repro): Widget.set() fires pointer_move
@@ -174,9 +170,8 @@ class TestCenterZeroBeam:
         # re-enter itself recursively (~2000 deep on ONE JS drag frame,
         # surviving only via recursionlimit + swallowed RecursionError).
         # Drive the REAL JS→Python path and count the handler's set().
-        from spyde.backend.session import Session
         from spyde.actions.center_zero_beam import czb_set_region
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             session._add_signal(_off_center_4d(sig=(32, 32)))
             _settle(session)
@@ -205,7 +200,7 @@ class TestCenterZeroBeam:
             assert abs(float(widget.x) - (32 - 9) / 2.0) < 1e-6
             assert abs(float(widget.y) - (32 - 9) / 2.0) < 1e-6
         finally:
-            session.shutdown()
+            close_session(session)
 
     def test_node_switch_tears_down_region_and_markers(self):
         # A node switch (show_tree_node — any transform / Workflow click)
@@ -213,10 +208,9 @@ class TestCenterZeroBeam:
         # crosshair and found markers must be swept there instead of staying
         # painted over the new node. (czb_run/czb_pick add their found markers
         # AFTER _display, so the post-run markers are unaffected.)
-        from spyde.backend.session import Session
         from spyde.actions.center_zero_beam import czb_set_region, czb_open
         from spyde.actions.lifecycle import show_tree_node
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             session._add_signal(_off_center_4d())
             _settle(session)
@@ -236,14 +230,13 @@ class TestCenterZeroBeam:
             assert getattr(tree, "_czb_found_mgs", None) is None
             assert region.visible is False
         finally:
-            session.shutdown()
+            close_session(session)
 
     def test_tree_close_tears_down_region_widgets(self):
         # BaseSignalTree.close() must sweep the CZB widget attrs (they were
         # missing from its hard-coded teardown list).
-        from spyde.backend.session import Session
         from spyde.actions.center_zero_beam import czb_set_region, czb_open
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             session._add_signal(_off_center_4d())
             _settle(session)
@@ -261,12 +254,11 @@ class TestCenterZeroBeam:
             assert region.visible is False
             assert cross.visible is False
         finally:
-            session.shutdown()
+            close_session(session)
 
     def test_manual_center_from_crosshair(self):
-        from spyde.backend.session import Session
         from spyde.actions.center_zero_beam import czb_open, czb_pick
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             session._add_signal(_off_center_4d(beam=(18, 14)))
             _settle(session)
@@ -291,4 +283,4 @@ class TestCenterZeroBeam:
             # Crosshair is cleared after applying.
             assert getattr(tree, "_czb_cross", None) is None
         finally:
-            session.shutdown()
+            close_session(session)

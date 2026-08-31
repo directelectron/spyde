@@ -24,6 +24,7 @@ import time
 import numpy as np
 import hyperspy.api as hs
 from spyde.tests.migrated._async import wait_until
+from spyde.tests.migrated.conftest import make_session, close_session
 
 
 def _wait(pred, timeout=40.0):
@@ -624,11 +625,9 @@ class TestFindVectorsNeural:
         # Force the CPU branch — deterministic, and no torch-CUDA under pytest.
         import spyde.actions.find_vectors_torch as fvt
         monkeypatch.setattr(fvt, "torch_gpu_device", lambda: None)
-
-        from spyde.backend.session import Session
         from spyde.actions.find_vectors_action import fv_run
 
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             session._add_signal(_diffraction_4d())
             time.sleep(0.4)
@@ -653,4 +652,4 @@ class TestFindVectorsNeural:
             cm = vtree.diffraction_vectors.count_map()
             assert cm.shape == (4, 5)
         finally:
-            session.shutdown()
+            close_session(session)

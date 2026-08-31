@@ -25,7 +25,7 @@ import pytest
 from spyde.actions.report import compose as cx
 from spyde.actions.report import handlers as h
 from spyde.actions.report.model import FigureSpec
-from spyde.tests.migrated.conftest import _settle
+from spyde.tests.migrated.conftest import _settle, make_session
 
 
 # ── local fixture: a 1-D signal (no navigation) → one signal window ────────────
@@ -33,7 +33,7 @@ from spyde.tests.migrated.conftest import _settle
 
 def _make_session():
     from spyde.backend.session import Session
-    return Session(n_workers=1, threads_per_worker=1)
+    return make_session()
 
 
 @pytest.fixture

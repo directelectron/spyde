@@ -10,6 +10,7 @@ import os
 import pytest
 
 from spyde.actions.registry import STAGED_HANDLERS
+from spyde.tests.migrated.conftest import make_session, close_session
 
 
 def _isolate_settings(session, tmp_path):
@@ -66,11 +67,11 @@ class TestUpdateChannelSettings:
         # conftest sets session-wide) rather than patching expanduser — the env
         # var takes precedence in Session, so a patched HOME would be ignored.
         monkeypatch.setenv("SPYDE_SETTINGS_DIR", os.path.dirname(settings_path))
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             assert session._update_channel == "beta"
         finally:
-            session.shutdown()
+            close_session(session)
 
 
 class TestGpuStatusAction:

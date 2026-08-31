@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import numpy as np
 import hyperspy.api as hs
-from spyde.tests.migrated.conftest import _settle
+from spyde.tests.migrated.conftest import _settle, close_session, make_session
 from spyde.tests.migrated._async import wait_until
 
 
@@ -41,8 +41,7 @@ def _diffraction_4d():
 
 class TestFindVectorsPort:
     def test_find_vectors_creates_attached_vectors_tree(self, captured_messages):
-        from spyde.backend.session import Session
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             session._add_signal(_diffraction_4d(), source_path=None)
             _settle(session)
@@ -125,12 +124,11 @@ class TestFindVectorsPort:
             assert offs[:, 0].max() <= W + 8 and offs[:, 1].max() <= H + 8
             assert offs[:, 0].min() >= -8 and offs[:, 1].min() >= -8
         finally:
-            session.shutdown()
+            close_session(session)
 
     def test_rejects_non_4d_dataset(self):
-        from spyde.backend.session import Session
         from spyde.actions.context import ActionContext
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             s = hs.signals.Signal2D(np.random.RandomState(0).rand(16, 16).astype(np.float32))
             session._add_signal(s, source_path=None)
@@ -142,4 +140,4 @@ class TestFindVectorsPort:
             # No vectors tree created for a 2-D image.
             assert len(session.signal_trees) == before
         finally:
-            session.shutdown()
+            close_session(session)

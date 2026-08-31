@@ -15,7 +15,7 @@ from __future__ import annotations
 import numpy as np
 import hyperspy.api as hs
 
-from spyde.tests.migrated.conftest import _settle
+from spyde.tests.migrated.conftest import _settle, close_session, make_session
 
 
 def _signal_plot(session):
@@ -46,9 +46,8 @@ def _centered_diffraction_4d(nav=(3, 4), sig=(32, 32), scale=0.1):
 
 class TestOrientationOverlay:
     def test_overlay_attaches_and_draws_template_spots(self):
-        from spyde.backend.session import Session
         from spyde.actions.orientation_action import run_orientation
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             session._add_signal(_centered_diffraction_4d())
             _settle(session)
@@ -91,14 +90,13 @@ class TestOrientationOverlay:
                 if len(off):
                     assert off.min() >= -0.5 and off.max() <= 32.5
         finally:
-            session.shutdown()
+            close_session(session)
 
     def test_orientation_end_to_end_on_lazy_data(self):
         """The full OM workflow must run on a LAZY signal: compute → IPF-Z window
         + attached map → live template overlay on the source DP."""
-        from spyde.backend.session import Session
         from spyde.actions.orientation_action import run_orientation
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             session._add_signal(_centered_diffraction_4d().as_lazy())
             _settle(session)
@@ -118,7 +116,7 @@ class TestOrientationOverlay:
             assert getattr(otree, "orientation_map", None) is om
             assert getattr(src_tree, "_orientation_overlay", None) is not None
         finally:
-            session.shutdown()
+            close_session(session)
 
     # test_overlay_hook_registered_and_updates was folded into
     # test_overlay_attaches_and_draws_template_spots: identical eager session +

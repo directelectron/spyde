@@ -14,7 +14,7 @@ import time
 
 import numpy as np
 import hyperspy.api as hs
-from spyde.tests.migrated.conftest import _settle
+from spyde.tests.migrated.conftest import _settle, close_session, make_session
 from spyde.tests.migrated._async import wait_until
 
 
@@ -53,9 +53,8 @@ def _diffraction_4d(nav=(3, 3), sig=(64, 64), scale=0.03):
 
 class TestMultiPhaseOrientation:
     def test_two_phase_map_and_2d_ipf(self):
-        from spyde.backend.session import Session
         from spyde.actions.orientation_action import run_orientation
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             session._add_signal(_diffraction_4d())
             _settle(session)
@@ -80,12 +79,11 @@ class TestMultiPhaseOrientation:
             assert rgb.shape == tuple(om.nav_shape) + (3,) and rgb.dtype == np.uint8
             assert (rgb.sum(-1) > 0).all()
         finally:
-            session.shutdown()
+            close_session(session)
 
     def test_generate_library_accepts_multiple_cifs(self):
-        from spyde.backend.session import Session
         from spyde.actions.orientation_action import om_generate_library
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             session._add_signal(_diffraction_4d())
             _settle(session)
@@ -103,4 +101,4 @@ class TestMultiPhaseOrientation:
             # Live refine overlay is single-phase only → skipped for multi-phase.
             assert wiz.overlay is None
         finally:
-            session.shutdown()
+            close_session(session)

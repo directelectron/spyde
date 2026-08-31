@@ -18,7 +18,7 @@ import numpy as np
 import hyperspy.api as hs
 
 from spyde.drawing.update_functions import update_from_navigation_selection
-from spyde.tests.migrated.conftest import _settle
+from spyde.tests.migrated.conftest import _settle, close_session, make_session
 
 
 def _encoded_4d(nav=(3, 5), sig=(4, 4)):
@@ -35,8 +35,7 @@ def _encoded_4d(nav=(3, 5), sig=(4, 4)):
 
 class TestNavOrientation:
     def test_crosshair_selects_data_iy_ix(self):
-        from spyde.backend.session import Session
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             session._add_signal(_encoded_4d(), source_path=None)
             _settle(session)
@@ -61,4 +60,4 @@ class TestNavOrientation:
             assert float(img[0, 0]) == 200.0, \
                 f"expected DP at iy=2,ix=0 (=200), got {img[0, 0]}"
         finally:
-            session.shutdown()
+            close_session(session)

@@ -16,7 +16,7 @@ import time
 
 import numpy as np
 import hyperspy.api as hs
-from spyde.tests.migrated.conftest import _settle
+from spyde.tests.migrated.conftest import _settle, close_session, make_session
 from spyde.tests.migrated._async import wait_until
 
 
@@ -63,8 +63,7 @@ def _make_vectors_tree(session):
 
 class TestVectorVirtualImaging:
     def test_add_vector_vi_computes_from_vectors(self):
-        from spyde.backend.session import Session
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             vtree = _make_vectors_tree(session)
             vplot = _signal_plot(session, vtree)
@@ -93,11 +92,10 @@ class TestVectorVirtualImaging:
             img = np.asarray(out_plot.current_data)
             assert img.shape == tuple(vtree.diffraction_vectors.nav_shape)
         finally:
-            session.shutdown()
+            close_session(session)
 
     def test_count_vs_intensity_and_shape_change(self):
-        from spyde.backend.session import Session
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             vtree = _make_vectors_tree(session)
             vplot = _signal_plot(session, vtree)
@@ -117,4 +115,4 @@ class TestVectorVirtualImaging:
             assert _wait(lambda: isinstance(getattr(act, "_selector", None), RectangleSelector)), \
                 "shape change did not rebuild the selector as a rectangle"
         finally:
-            session.shutdown()
+            close_session(session)

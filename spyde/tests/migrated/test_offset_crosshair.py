@@ -12,7 +12,7 @@ import time
 
 import numpy as np
 import hyperspy.api as hs
-from spyde.tests.migrated.conftest import _settle
+from spyde.tests.migrated.conftest import _settle, close_session, make_session
 
 
 def _signal_plot(session):
@@ -55,8 +55,7 @@ class _FakePlot2D:
 
 class TestOffsetCrosshair:
     def _session_with_plot(self):
-        from spyde.backend.session import Session
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         s = hs.signals.Signal2D(np.zeros((4, 5, 20, 20), np.float32))
         s.set_signal_type("electron_diffraction")
         # known calibration: scale 0.1, offset 0 on both signal axes
@@ -147,9 +146,8 @@ class TestOffsetCrosshair:
     def test_navigator_plot_edits_navigation_axes(self):
         """On a navigator plot the tool must edit the NAVIGATION axes, leaving
         the signal axes untouched (signal->signal, nav->nav)."""
-        from spyde.backend.session import Session
         import hyperspy.api as hs
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         try:
             s = hs.signals.Signal2D(np.zeros((6, 6, 12, 12), np.float32))
             s.set_signal_type("electron_diffraction")
@@ -173,7 +171,7 @@ class TestOffsetCrosshair:
             assert abs(float(sig[0].offset)) < 1e-9
             assert abs(float(sig[1].offset)) < 1e-9
         finally:
-            session.shutdown()
+            close_session(session)
 
     # ── the "+" toggle is BACKEND-owned: button ON ⟺ crosshair alive ────────
     #

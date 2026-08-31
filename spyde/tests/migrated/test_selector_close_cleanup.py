@@ -14,7 +14,7 @@ import time
 
 import numpy as np
 import hyperspy.api as hs
-from spyde.tests.migrated.conftest import _settle
+from spyde.tests.migrated.conftest import _settle, make_session
 
 
 def _nav_wid(session):
@@ -207,11 +207,10 @@ class TestSelectorCloseCleanup:
 def _make_5d_session():
     """5-D stack (time → spatial → DP): a 2-level navigator chain whose DP is
     driven by a COMPOSITE (IntegratingSSelector2D). Mirrors test_nav_chain_5d."""
-    from spyde.backend.session import Session
     s = hs.signals.Signal2D(
         np.random.RandomState(0).rand(2, 4, 5, 8, 8).astype(np.float32))
     s.set_signal_type("electron_diffraction")
-    sess = Session(n_workers=1, threads_per_worker=1)
+    sess = make_session()
     sess._add_signal(s, source_path=None)
     _settle(sess)
     return sess

@@ -15,6 +15,7 @@ import dask.array as da
 
 from spyde.compute_backend import ComputeBackend
 from spyde.drawing.update_functions import _submit_async_nav_read
+from spyde.tests.migrated.conftest import make_session
 
 
 class _FakeAxesManager:
@@ -254,7 +255,7 @@ class TestComputeBackendShutdownGuard:
         import os
         os.environ.setdefault("SPYDE_NO_DASK", "1")
         from spyde.backend.session import Session
-        sess = Session(n_workers=1, threads_per_worker=1)
+        sess = make_session()
         # Touch the property so the threaded executor is created (no cluster).
         be = sess.compute_backend
         assert be is not None

@@ -22,7 +22,7 @@ from spyde.actions.ebsd_action import (
     DEFAULTS, EbsdWizard, ebsd_build_dictionary, ebsd_refine, ebsd_run,
 )
 from spyde.data import ebsd_patterns, ground_truth
-from spyde.tests.migrated.conftest import _settle
+from spyde.tests.migrated.conftest import _settle, close_session, make_session
 
 
 @pytest.fixture(autouse=True)
@@ -74,14 +74,14 @@ def ebsd_session(captured_messages, monkeypatch):
     # already covered.
     monkeypatch.setattr(ebsd_mod, "emit", captured_messages.append)
 
-    session = Session(n_workers=1, threads_per_worker=1)
+    session = make_session()
     s = ebsd_patterns(nav=(8, 8), detector=(40, 40))
     session._add_signal(s, source_path=None)
     _settle(session)            # let the selector debounce timers fire
     yield {"session": session, "signal": s, "truth": ground_truth(s),
            "messages": captured_messages,
            "trees": session.signal_trees, "plots": session._plots}
-    session.shutdown()
+    close_session(session)
 
 
 def _signal_plot(session):
@@ -285,7 +285,7 @@ class TestNeverMaterialisesTheScan:
 
         monkeypatch.setattr(ebsd_mod, "emit", captured_messages.append)
 
-        session = Session(n_workers=1, threads_per_worker=1)
+        session = make_session()
         s = ebsd_patterns(nav=self.NAV, detector=self.DET).as_lazy()
         # Several nav chunks, so a correct implementation never asks for a
         # slice the shape of the whole scan (which on a single-chunk 8-row scan
@@ -295,7 +295,7 @@ class TestNeverMaterialisesTheScan:
         _settle(session)
         yield {"session": session, "signal": s, "messages": captured_messages,
                "trees": session.signal_trees, "plots": session._plots}
-        session.shutdown()
+        close_session(session)
 
     @pytest.fixture
     def no_full_compute(self, monkeypatch):
