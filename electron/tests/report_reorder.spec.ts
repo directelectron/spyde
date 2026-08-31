@@ -81,12 +81,18 @@ test('1) build [md, figure, md]', async () => {
   await backendAction(page, 'report_new', {})
   await expect(page.getByTestId('report-body')).toBeVisible()
 
-  // md "Alpha"
+  // md "Alpha". Each step waits for the state the next one reaches for: a
+  // dblclick before the cell mounts, or a read before the commit renders, is a
+  // race that only looks stable until a Chromium bump shifts the timing.
   await page.getByTestId('report-add-text').click()
+  const rendered = page.locator('[data-testid^="report-cell-rendered-"]')
+  await expect.poll(async () => rendered.count()).toBeGreaterThan(0)
   const ta = () => page.locator('[data-testid^="report-cell-textarea-"]').first()
-  await page.locator('[data-testid^="report-cell-rendered-"]').first().dblclick()
+  await rendered.first().dblclick()
+  await expect(ta()).toBeVisible()
   await ta().fill('Alpha')
   await ta().press('Control+Enter')
+  await expect(rendered.first()).toHaveText('Alpha', { timeout: 10_000 })
 
   // figure from the signal window pill
   const sigWin = page.getByTestId('subwindow')
@@ -100,11 +106,15 @@ test('1) build [md, figure, md]', async () => {
     .toBeVisible({ timeout: 15_000 })
 
   // md "Beta"
+  const renderedBefore = await rendered.count()
   await page.getByTestId('report-add-text').click()
-  const beta = page.locator('[data-testid^="report-cell-rendered-"]').last()
-  await beta.dblclick()
-  await page.locator('[data-testid^="report-cell-textarea-"]').last().fill('Beta')
-  await page.locator('[data-testid^="report-cell-textarea-"]').last().press('Control+Enter')
+  await expect.poll(async () => rendered.count()).toBeGreaterThan(renderedBefore)
+  await rendered.last().dblclick()
+  const betaTa = page.locator('[data-testid^="report-cell-textarea-"]').last()
+  await expect(betaTa).toBeVisible()
+  await betaTa.fill('Beta')
+  await betaTa.press('Control+Enter')
+  await expect(rendered.last()).toHaveText('Beta', { timeout: 10_000 })
 
   expect(await cellOrder(page)).toEqual(['md:Alpha', 'fig', 'md:Beta'])
   await page.screenshot({ path: join(SHOTS, '01-before-reorder.png') })

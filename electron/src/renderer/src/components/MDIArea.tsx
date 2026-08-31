@@ -53,6 +53,10 @@ function tileGrid(n: number, areaW: number, areaH: number): { cols: number; rows
   return { cols, rows }
 }
 
+/** Highest z-index an MDI window may take. Everything that must float above
+ *  the windows lives at CHROME_Z and up (WizardShell.tsx). */
+export const MDI_Z_CEILING = 899
+
 // The initial size a window opens at — square-ish by default, or matched to the
 // backend-reported image aspect so the figure fills it (no letterbox). Kept
 // deliberately compact so more windows fit on screen before overlapping.
@@ -191,8 +195,15 @@ export function MDIArea() {
     // Unfocused windows sit at a low base; focused windows are always above,
     // most-recently-focused highest. (A single focused window must beat
     // unfocused ones — `10 + 0` == base was the bug.)
+    //
+    // CLAMPED, because this grows with the number of windows and the floating
+    // chrome above it does not. At five windows a focused one reached 14 —
+    // the wizard panel's own z-index — and started painting over the caret the
+    // user was mid-way through using; its figure iframe then swallowed the
+    // clicks. Windows own 1..MDI_Z_CEILING and nothing else may enter that
+    // range; see CHROME_Z in WizardShell.tsx for the layer above.
     const i = focusOrder.indexOf(id)
-    return i === -1 ? 1 : 10 + i
+    return i === -1 ? 1 : Math.min(10 + i, MDI_Z_CEILING)
   }
 
   // Clicking the figure raises its window. The out-of-process iframe swallows the

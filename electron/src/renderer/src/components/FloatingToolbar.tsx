@@ -20,6 +20,7 @@
  */
 import React from 'react'
 import { useSpyDE } from '../kernel/SpyDEContext'
+import { CHROME_Z } from './WizardShell'
 import type { ToolbarAction, ParamSpec, SubAction } from '../kernel/SpyDEContext'
 import { OrientationWizard } from './OrientationWizard'
 import { FindVectorsWizard } from './FindVectorsWizard'
@@ -658,7 +659,7 @@ const caret = (dir: 'up' | 'down', bg: string): React.CSSProperties => ({
 const popBase: React.CSSProperties = {
   position: 'absolute', left: '50%', transform: 'translateX(-50%)',
   background: POP_BG, border: '1px solid #313244', borderRadius: 8,
-  padding: '6px 8px', zIndex: 13, color: '#cdd6f4',
+  padding: '6px 8px', zIndex: CHROME_Z + 1, color: '#cdd6f4',
   boxShadow: '0 8px 24px rgba(0,0,0,0.55)',
   // Lay out as ONE wide row (max-content), but cap the width so a long action
   // (e.g. Find Vectors' 5 params) WRAPS to a second row instead of getting
@@ -672,7 +673,7 @@ const subBase: React.CSSProperties = {
   position: 'absolute', left: '50%', transform: 'translateX(-50%)',
   display: 'flex', alignItems: 'center', gap: 2,
   background: SUB_BG, border: '1px solid #313244', borderRadius: 10,
-  padding: '3px 5px', zIndex: 13, boxShadow: '0 6px 20px rgba(0,0,0,0.5)',
+  padding: '3px 5px', zIndex: CHROME_Z + 1, boxShadow: '0 6px 20px rgba(0,0,0,0.5)',
 }
 
 const styles: Record<string, React.CSSProperties> = {
@@ -688,7 +689,7 @@ const styles: Record<string, React.CSSProperties> = {
     transform: 'translateX(-50%)',
     display: 'flex', alignItems: 'center', gap: 2,
     background: 'rgba(24,24,37,0.92)', border: '1px solid #313244',
-    borderRadius: 10, padding: '3px 5px', zIndex: 12,
+    borderRadius: 10, padding: '3px 5px', zIndex: CHROME_Z,
     boxShadow: '0 6px 20px rgba(0,0,0,0.5)',
   },
   btnActive: {
@@ -759,7 +760,7 @@ const styles: Record<string, React.CSSProperties> = {
     position: 'absolute', top: '100%', left: '50%', transform: 'translateX(-50%)',
     marginTop: 10, width: 200, maxWidth: '90vw',
     background: POP_BG, border: '1px solid #313244', borderRadius: 8,
-    padding: 8, zIndex: 14, color: '#cdd6f4',
+    padding: 8, zIndex: CHROME_Z + 2, color: '#cdd6f4',
     boxShadow: '0 8px 24px rgba(0,0,0,0.55)',
     display: 'flex', flexDirection: 'column', gap: 6,
     animation: 'spyde-pop 130ms ease-out',

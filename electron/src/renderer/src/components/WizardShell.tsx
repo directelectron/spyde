@@ -144,10 +144,23 @@ export function Check({ checked, onChange, label, testid }: {
 }
 
 const POP_BG = '#1e1e2e'
+
+/**
+ * The floor of the floating-chrome layer: carets, wizards and hover toolbars,
+ * everything that must stay reachable ON TOP of the MDI windows it describes.
+ *
+ * It has to clear `MDI_Z_CEILING` (MDIArea.tsx), because a window's z-index
+ * counts up with the focus order while a panel's is fixed. At z-index 14 the
+ * wizard tied with the fifth focused window and lost — the window's figure
+ * iframe covered the panel and ate every click aimed at it, which is a bug for
+ * anyone with five windows open, not only for a test.
+ */
+export const CHROME_Z = 1000
+
 export const S: Record<string, React.CSSProperties> = {
   box: {
     background: POP_BG, border: '1px solid #313244', borderRadius: 8, padding: 8,
-    width: 240, zIndex: 14, color: '#cdd6f4', boxShadow: '0 8px 24px rgba(0,0,0,0.55)',
+    width: 240, zIndex: CHROME_Z + 2, color: '#cdd6f4', boxShadow: '0 8px 24px rgba(0,0,0,0.55)',
     display: 'flex', flexDirection: 'column', gap: 6,
   },
   head: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' },
