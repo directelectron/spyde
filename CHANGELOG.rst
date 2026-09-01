@@ -12,6 +12,45 @@ Earlier releases are described by their GitHub release notes and tags.
 
 .. towncrier release notes start
 
+0.4.3 (2026-08-31)
+==================
+
+API and Behaviour Changes
+-------------------------
+
+- The DPC beam region no longer has an "off" setting — it is what the centre of
+  mass is taken over, so it is always on the pattern. Its default radius is now
+  half the shorter detector axis rather than a quarter: with the region always
+  on, a smaller default clipped the beam and under-read every field.
+
+
+New Features
+------------
+
+- Help → Report a Problem… sends a description of what went wrong together with the machine's OS, app and runtime versions, GPU, Python-environment state and the backend's recent output — shown in full before anything is sent, and saved to a file when the machine is offline.
+
+
+Bug Fixes
+---------
+
+- The DPC beam region no longer collapses the moment the pointer enters the
+  diffraction pattern. Its radius was being written to the widget alone, while
+  the figure's own state kept the radius the widget was created with — a fifth
+  as large — and reverted to it on the next redraw, so the region that was
+  actually measured was a few pixels wide and dragging it moved that.
+- The DPC field map now recomputes as the beam region is dragged, instead of
+  staying frozen until the pass before it had finished. The beam region is a
+  real selector, so a superseded measurement is cancelled rather than left to
+  run, and the centre of mass is ~37x faster.
+- Updating on Windows no longer dead-ends in "SpyDE cannot be closed. Please close it manually and click Retry": the app now shuts its analysis backend down before handing off to the installer, and the installer waits for whole process trees to exit instead of giving up after two rounds.
+
+
+Maintenance
+-----------
+
+- The desktop shell moved from Electron 34 to Electron 44 (Chromium 132 to 152, Node 20 to 24), returning SpyDE to a supported Electron line that still receives security fixes.
+
+
 0.4.2 (2026-08-25)
 ==================
 
