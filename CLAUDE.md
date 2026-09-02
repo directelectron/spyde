@@ -139,7 +139,7 @@ A Direct Electron `.csb` file is a **sparse event stream, not a frame stack** â€
 
 ### Update handoff + problem reports (the shell's `main/`)
 Both live in the shared shell, so all three DE apps get them. The shell is the
-`de-shell` package on PyPI (github.com/CSSFrancis/de-shell): the Python
+`de-shell` package on PyPI (github.com/directelectron/de-shell): the Python
 `de_shell` and, inside it, the TypeScript at `de_shell/js` â€” linked into this
 repo at `electron/shell` by `electron/scripts/shell-link.mjs` (postinstall,
 `npm run shell:link`, and the vite config on every build). A shell fix is made
